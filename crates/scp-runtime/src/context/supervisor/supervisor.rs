@@ -2514,7 +2514,7 @@ impl Supervisor {
             return Ok(Box::pin(self.dispatch_lifecycle_direct(cmd)).await);
         }
         // Per-context variants (Join / Leave / Close / Export +
-        // access-key generate / revoke / restore + Placeholder) all
+        // access-key generate / revoke / restore) all
         // carry a `context_id` and have a registered actor after
         // bootstrap spawn. Mailbox-first routes to the actor's
         // `dispatch_state` loop which executes the actor-shape handler.
@@ -2569,12 +2569,6 @@ impl Supervisor {
         const LIFECYCLE_TIMEOUT: std::time::Duration = Supervisor::LIFECYCLE_TIMEOUT;
 
         match cmd {
-            LifecycleCommand::Placeholder { reply } => {
-                const MSG: &str =
-                    "LifecycleCommand::Placeholder — handshake target; no production work";
-                let _ = reply.send(Err(ContextError::NotImplemented(MSG.to_owned())));
-                Outcome::err(ContextError::NotImplemented(MSG.to_owned()))
-            }
             LifecycleCommand::CreateContext { payload, reply } => {
                 let p = *payload;
                 let context_id = p.context_id.clone();
@@ -2992,7 +2986,7 @@ impl Supervisor {
         let Some(ctx_id) = Self::ttl_close_command_context_id(&cmd) else {
             return Err(ContextError::ContextNotRegistered(
                 "dispatch_ttl_close_command — variant has no per-context routing target \
-                 (Placeholder); mailbox-only after Phase 2A finalization"
+                 (FireTimer resolves its own actor); mailbox-only after Phase 2A finalization"
                     .to_owned(),
             ));
         };
@@ -3018,11 +3012,10 @@ impl Supervisor {
     /// mailbox via [`Self::dispatch_via_mailbox`]. The actor's `run()`
     /// loop pulls the command, dispatches it through the actor-shape
     /// `dispatch(state, deps, cmd)` entry point, and writes the typed
-    /// reply on the command's embedded oneshot. The `Placeholder`
-    /// variant (mailbox handshake target — no `context_id`) returns
-    /// [`ContextError::ContextNotRegistered`] from this method when no
-    /// per-context routing target exists; the no-op reply is otherwise
-    /// produced by the actor-side `dispatch_state` arm.
+    /// reply on the command's embedded oneshot. Sweep / timeout-task
+    /// variants carry no `context_id` and are dispatched per-actor by
+    /// the iterating helpers rather than this routed entry point; they
+    /// return [`ContextError::ContextNotRegistered`] from this method.
     ///
     /// # Errors
     ///
@@ -3050,7 +3043,7 @@ impl Supervisor {
         let Some(ctx_id) = Self::governance_command_context_id(&cmd) else {
             return Err(ContextError::ContextNotRegistered(
                 "dispatch_governance_command — variant has no per-context routing target \
-                 (Placeholder / cross-context); mailbox-only after Phase 2A finalization"
+                 (sweep / timeout-task use the iterating helpers); mailbox-only after Phase 2A finalization"
                     .to_owned(),
             ));
         };
@@ -3129,14 +3122,12 @@ impl Supervisor {
     /// [`EconomyCommand::VerifyPaymentReceipts`] batch carries the same
     /// `Some(context_id)`. Returns `None` for:
     ///
-    /// - [`EconomyCommand::Placeholder`] (no target).
     /// - Empty receipt batches (no target).
     /// - Heterogeneous batches whose receipts straddle multiple contexts
     ///   (no single owning actor).
     /// - Batches containing any relay-level receipt (`context_id == None`).
     fn economy_command_context_id(cmd: &EconomyCommand) -> Option<&str> {
         match cmd {
-            EconomyCommand::Placeholder { .. } => None,
             EconomyCommand::VerifyPaymentReceipts { receipts, .. } => {
                 let mut iter = receipts.iter();
                 let first = iter.next()?.context_id.as_ref()?;
@@ -3180,12 +3171,6 @@ impl Supervisor {
         const ECONOMY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
         match cmd {
-            EconomyCommand::Placeholder { reply } => {
-                const MSG: &str =
-                    "EconomyCommand::Placeholder — mailbox-pipe smoke target; no production work";
-                let _ = reply.send(Err(ContextError::NotImplemented(MSG.to_owned())));
-                Outcome::err(ContextError::NotImplemented(MSG.to_owned()))
-            }
             EconomyCommand::VerifyPaymentReceipts { receipts, reply } => {
                 let receipts = *receipts;
                 let verify_fut = async {
@@ -3273,11 +3258,10 @@ impl Supervisor {
     /// Extract the `context_id` borrow from a [`TrustRecoveryCommand`]
     /// when one is present. Returns `None` for variants that cannot be
     /// routed through a per-context actor mailbox
-    /// (`Placeholder`, `RecoveryNotifyContact`).
+    /// (`RecoveryNotifyContact`).
     fn trust_recovery_command_context_id(cmd: &TrustRecoveryCommand) -> Option<&str> {
         match cmd {
-            TrustRecoveryCommand::Placeholder { .. }
-            | TrustRecoveryCommand::RecoveryNotifyContact { .. } => None,
+            TrustRecoveryCommand::RecoveryNotifyContact { .. } => None,
             TrustRecoveryCommand::CreateGovernanceCheckpoint { payload, .. } => {
                 Some(payload.context_id.as_str())
             }
@@ -3386,8 +3370,8 @@ impl Supervisor {
     }
 
     /// Direct supervisor-scoped dispatch for [`TrustRecoveryCommand`]
-    /// variants that have no per-context actor target (`Placeholder`,
-    /// `RecoveryNotifyContact`) or whose actor is not registered
+    /// variants that have no per-context actor target
+    /// (`RecoveryNotifyContact`) or whose actor is not registered
     /// (`CreateGovernanceCheckpoint` / `AddCheckpointCosignature` /
     /// `RecoveryAdvanceEpoch` / `RecoverySendNotification` —
     /// unregistered-context fallback).
@@ -3423,12 +3407,6 @@ impl Supervisor {
         const TRUST_RECOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
         match cmd {
-            TrustRecoveryCommand::Placeholder { reply } => {
-                const MSG: &str = "TrustRecoveryCommand::Placeholder — mailbox-pipe smoke target; \
-                                   no production work";
-                let _ = reply.send(Err(ContextError::NotImplemented(MSG.to_owned())));
-                Outcome::err(ContextError::NotImplemented(MSG.to_owned()))
-            }
             TrustRecoveryCommand::RecoveryNotifyContact { payload, reply } => {
                 let recovering_did = payload.recovering_did.clone();
                 let signing_key = payload.signing_key.to_signing_key();
@@ -3822,14 +3800,13 @@ impl Supervisor {
             self.actors.insert(ctx_id.clone(), handle.clone());
         }
 
-        // Spawn the actor's dispatch loop. During the 12b.2a → 12b.2b
-        // window the existing no-state `spawn_actor` signature routes
-        // through [`ContextActor::new_skeleton`] — the state still
-        // lives on `ContextManager`, and the shim dispatch (see
-        // [`Self::dispatch_command`] family) continues to delegate
-        // there. [`Self::spawn_actor_with_state`] is the post-12b.2a
-        // path that takes owned state + deps and constructs a
-        // state-carrying actor via [`ContextActor::new`].
+        // Spawn the actor's dispatch loop. This state-less `spawn_actor`
+        // path constructs the actor via [`ContextActor::new_skeleton`],
+        // whose `run()` loop ACKs every command through
+        // `skeleton_dispatch`. It is dead-code / test-only: production
+        // bootstrap spawns state-owning actors via
+        // [`Self::spawn_actor_with_state`] (constructed via
+        // [`ContextActor::new`]), which own their context state directly.
         let inbox = rx;
         tokio::spawn(async move {
             Box::pin(crate::context::actor::ContextActor::new_skeleton(ctx_id, inbox).run()).await;
@@ -4699,7 +4676,7 @@ impl Supervisor {
     /// row 11).
     ///
     /// Same shape as [`Self::dispatch_governance_command`]. Covers the
-    /// contact-graph (standing context) paths from spec §5.12.4.
+    /// contact-graph (standing context) paths from spec §5.12.6.
     ///
     /// # Errors
     ///
@@ -4741,12 +4718,6 @@ impl Supervisor {
         const STANDING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
         match cmd {
-            StandingCommand::Placeholder { reply } => {
-                const MSG: &str =
-                    "StandingCommand::Placeholder — handshake target; no production work";
-                let _ = reply.send(Err(ContextError::NotImplemented(MSG.to_owned())));
-                Outcome::err(ContextError::NotImplemented(MSG.to_owned()))
-            }
             StandingCommand::StandingContext {
                 local_did,
                 peer_did,
@@ -4855,9 +4826,7 @@ impl Supervisor {
         // on the actor. Reaching the fallback means no actor is
         // registered for the target context — surface a typed
         // `ContextNotRegistered` on the command's reply oneshot.
-        if let Some(ctx_id) = Self::tools_command_context_id(&cmd)
-            && let Some(actor) = self.lookup(ctx_id)
-        {
+        if let Some(actor) = self.lookup(Self::tools_command_context_id(&cmd)) {
             return Self::dispatch_via_mailbox(&actor, ContextCommand::Tools(cmd)).await;
         }
 
@@ -4906,16 +4875,9 @@ impl Supervisor {
 
     /// Reply to a [`ToolsCommand`] whose target context has no registered
     /// actor with a typed [`ContextError::ContextNotRegistered`] on the
-    /// variant's reply oneshot. The placeholder variant keeps its own typed
-    /// reply.
+    /// variant's reply oneshot.
     fn reply_tools_not_registered(cmd: ToolsCommand) -> Outcome<()> {
         match cmd {
-            ToolsCommand::Placeholder { reply } => {
-                const MSG: &str =
-                    "ToolsCommand::Placeholder — handshake target; no production work";
-                let _ = reply.send(Err(ContextError::NotImplemented(MSG.to_owned())));
-                Outcome::err(ContextError::NotImplemented(MSG.to_owned()))
-            }
             ToolsCommand::TryConsumeHardRateLimit {
                 context_id, reply, ..
             } => {
@@ -4966,18 +4928,12 @@ impl Supervisor {
     ///
     /// Per-context variants (subscribe/unsubscribe/block/unblock/key
     /// request/queries) get a typed [`ContextError::ContextNotRegistered`]
-    /// on their reply oneshot. The custody-bound publish variants, the
-    /// two-phase reserve/apply/release variants, and the placeholder keep
-    /// their own typed replies (these never reach a per-context actor
-    /// through this no-custody router).
+    /// on their reply oneshot. The custody-bound publish variants and the
+    /// two-phase reserve/apply/release variants keep their own typed
+    /// replies (these never reach a per-context actor through this
+    /// no-custody router).
     fn reply_broadcast_not_registered(cmd: BroadcastCommand) -> Outcome<()> {
         match cmd {
-            BroadcastCommand::Placeholder { reply } => {
-                const MSG: &str =
-                    "BroadcastCommand::Placeholder — handshake target; no production work";
-                let _ = reply.send(Err(ContextError::NotImplemented(MSG.to_owned())));
-                Outcome::err(ContextError::NotImplemented(MSG.to_owned()))
-            }
             BroadcastCommand::SubscribeBroadcast { payload, reply } => {
                 let err = ContextError::ContextNotRegistered(payload.context_id.clone());
                 let sketch = standing_outcome_error_sketch(&err);
@@ -5482,8 +5438,10 @@ impl Supervisor {
     /// "channel-authenticated identity" requirement, before any value is passed
     /// into this entry point. This is a forward obligation tied to the deferred
     /// FFI surface (mirroring the ADR-049 §3a forward-obligation discipline and
-    /// the CLAUDE.md integration checklist: function → ContextManager → FFI →
-    /// SDK → `pipeline_wiring` assertion). It is recorded here as the upstream
+    /// the CLAUDE.md integration checklist: function → manager-surface method —
+    /// today the `Supervisor`, the checklist's wording predating the
+    /// `ContextManager` deletion — → FFI → SDK → `pipeline_wiring` assertion).
+    /// It is recorded here as the upstream
     /// anchor; the co-resident core path does not yet have an untrusted leg, so
     /// the obligation lands with the wiring, not in this function.
     ///
@@ -9751,12 +9709,13 @@ impl Supervisor {
     /// receive buffer via the actor mailbox, leaving every other buffered
     /// event in place and in order.
     ///
-    /// The reconnection driver uses this instead of [`drain_events`] so
-    /// that application traffic (messages, membership changes) buffered
-    /// during catch-up is preserved for the SDK's normal receive polling
-    /// rather than being silently discarded. Same soft-default contract as
-    /// [`drain_events`]: returns an empty `Vec` on unknown context, mailbox
-    /// enqueue failure, or dropped reply channel.
+    /// The reconnection driver uses this instead of
+    /// [`Self::drain_events`] so that application traffic (messages,
+    /// membership changes) buffered during catch-up is preserved for
+    /// the SDK's normal receive polling rather than being silently
+    /// discarded. Same soft-default contract as [`Self::drain_events`]:
+    /// returns an empty `Vec` on unknown context, mailbox enqueue
+    /// failure, or dropped reply channel.
     #[must_use]
     pub async fn drain_equivocation_alerts(&self, context_id: &str) -> Vec<ContextEvent> {
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -10883,8 +10842,7 @@ impl Supervisor {
 
     /// Extract the target context_id from a [`LifecycleCommand`].
     ///
-    /// Returns `None` for [`LifecycleCommand::Placeholder`] (no target)
-    /// and [`LifecycleCommand::ImportContext`] (the export envelope
+    /// Returns `None` for [`LifecycleCommand::ImportContext`] (the export envelope
     /// carries the canonical 32-byte hash, not a string context_id —
     /// the legacy `import_context` derives the string from the
     /// envelope's params; until the lifecycle handler is rewritten to
@@ -10917,13 +10875,12 @@ impl Supervisor {
             // `import_context` helper derives it from the envelope's
             // params. The dispatch helper routes ImportContext through
             // the direct-shim path until the lifecycle handler is
-            // rewritten to surface that derivation. Placeholder has no
-            // target at all. Sweep commands (`FlushSnapshot`,
-            // `ShutdownSelf`) are dispatched per-actor by the
-            // supervisor's iterating entry points in `lifecycle_helpers`;
-            // routing target is decided at the iteration site.
+            // rewritten to surface that derivation. Sweep commands
+            // (`FlushSnapshot`, `ShutdownSelf`) are dispatched per-actor
+            // by the supervisor's iterating entry points in
+            // `lifecycle_helpers`; routing target is decided at the
+            // iteration site.
             LifecycleCommand::ImportContext { .. }
-            | LifecycleCommand::Placeholder { .. }
             | LifecycleCommand::FlushSnapshot { .. }
             | LifecycleCommand::ShutdownSelf { .. }
             | LifecycleCommand::ReportBufferLen { .. } => None,
@@ -10961,8 +10918,8 @@ impl Supervisor {
                 Some(payload.context_id.as_str())
             }
             // PublishBroadcast / PublishBroadcastContent need
-            // KeyCustody on the shim; Placeholder has no string target
-            // for this router.
+            // KeyCustody on the shim, so they have no string target for
+            // this custody-free router.
             _ => None,
         }
     }
@@ -10973,8 +10930,9 @@ impl Supervisor {
     /// helper can route through the per-context actor's mailbox. The
     /// boxed-payload variants (`StartTtlTimer` / `ResetTtlTimer` /
     /// `ExecuteTtlClose` / `FinalizeClose`) destructure their payloads to
-    /// expose the embedded `context_id`. Only [`TtlCloseCommand::Placeholder`]
-    /// returns `None` (no target).
+    /// expose the embedded `context_id`. Only [`TtlCloseCommand::FireTimer`]
+    /// returns `None` (it resolves its own actor and has no routable
+    /// `context_id` field).
     const fn ttl_close_command_context_id(cmd: &TtlCloseCommand) -> Option<&str> {
         match cmd {
             TtlCloseCommand::ExtendTtl { context_id, .. } => Some(context_id.as_str()),
@@ -10986,8 +10944,8 @@ impl Supervisor {
             // TTL timer task resolves the actor itself via
             // [`Self::lookup`] and mailboxes the command through the
             // returned handle, so it never routes through
-            // `dispatch_ttl_close_command`. `Placeholder` has no target.
-            TtlCloseCommand::FireTimer { .. } | TtlCloseCommand::Placeholder { .. } => None,
+            // `dispatch_ttl_close_command`.
+            TtlCloseCommand::FireTimer { .. } => None,
         }
     }
 
@@ -10996,8 +10954,8 @@ impl Supervisor {
     /// Every per-context variant — including the boxed-payload propose
     /// / vote / execute variants — surfaces its `context_id` so the
     /// dispatch helper can route through the per-context actor's
-    /// mailbox. Only [`GovernanceCommand::Placeholder`] returns `None`
-    /// (no target).
+    /// mailbox. The sweep / timeout-task variants return `None` (no
+    /// routable target — see the arm comment).
     fn governance_command_context_id(cmd: &GovernanceCommand) -> Option<&str> {
         match cmd {
             GovernanceCommand::GetProposal { context_id, .. }
@@ -11028,8 +10986,7 @@ impl Supervisor {
             // decided at the iteration site (one command per known
             // actor). Returning `None` here keeps `dispatch_governance_command`
             // from accepting them — sweeps must use the iterating helpers.
-            GovernanceCommand::Placeholder { .. }
-            | GovernanceCommand::EvaluatePeriodicConsequences { .. }
+            GovernanceCommand::EvaluatePeriodicConsequences { .. }
             | GovernanceCommand::ProcessPendingCommits { .. }
             | GovernanceCommand::EvaluateTimeouts { .. }
             // `StartTimeoutTask` is dispatched directly to the owning
@@ -11043,7 +11000,7 @@ impl Supervisor {
     /// Extract the target context_id from a [`StandingCommand`].
     ///
     /// Every current variant is supervisor-scoped (get-or-create / count /
-    /// has / register / reconnect-all / placeholder): they touch the
+    /// has / register / reconnect-all): they touch the
     /// supervisor's standing index or the get-or-create path directly, not a
     /// pre-existing per-context actor's state, so they return `None` and
     /// dispatch routes them to the SupervisorHandle.
@@ -11067,7 +11024,6 @@ impl Supervisor {
             // exactly like the other supervisor-scoped standing-index
             // variants below.
             StandingCommand::StandingContext { .. }
-            | StandingCommand::Placeholder { .. }
             | StandingCommand::StandingContextCount { .. }
             | StandingCommand::HasStandingContext { .. }
             | StandingCommand::RegisterStandingContext { .. }
@@ -11076,13 +11032,12 @@ impl Supervisor {
     }
 
     /// Extract the target context_id from a [`ToolsCommand`].
-    const fn tools_command_context_id(cmd: &ToolsCommand) -> Option<&str> {
+    const fn tools_command_context_id(cmd: &ToolsCommand) -> &str {
         match cmd {
             ToolsCommand::TryConsumeHardRateLimit { context_id, .. }
             | ToolsCommand::RefundHardRateLimit { context_id, .. }
             | ToolsCommand::ReserveToolEconomy { context_id, .. }
-            | ToolsCommand::SettleToolEconomy { context_id, .. } => Some(context_id.as_str()),
-            ToolsCommand::Placeholder { .. } => None,
+            | ToolsCommand::SettleToolEconomy { context_id, .. } => context_id.as_str(),
         }
     }
 
@@ -12068,15 +12023,28 @@ mod tests {
             "actor must be registered under hex-encoded context id"
         );
 
-        // Handle is alive — send a placeholder messaging command and
-        // observe the skeleton dispatch's `NotImplemented` ack. This
-        // exercises both the mpsc plumbing and the
-        // `ContextActor::new` + `run()` happy path.
-        let err = handle
-            .send(|reply| ContextCommand::Messaging(MessagingCommand::Placeholder { reply }))
+        // Handle is alive — send a read-only member-count query and
+        // observe the actor answer it. This exercises both the mpsc
+        // plumbing and the `ContextActor::new` + `run()` happy path.
+        let count = handle
+            .send(|reply| {
+                ContextCommand::Queries(QueriesCommand::MemberCount {
+                    context_id: expected_ctx_key.clone(),
+                    reply,
+                })
+            })
             .await
-            .expect_err("skeleton dispatch still ACKs NotImplemented in 12b.2a");
-        assert!(matches!(err, ContextError::NotImplemented(_)));
+            .expect("member-count query round-trips through the live actor");
+        // The test fixture (`new_for_test_encrypted`) seeds the admin DID into
+        // `governance`, not into `membership`, so the roster is empty and
+        // `MemberCount` (which reads `state.membership.count()`) answers the
+        // exact count 0 — not merely "some" count.
+        assert_eq!(
+            count,
+            Some(0),
+            "the owning actor answers MemberCount with the exact roster count \
+             (empty test fixture ⇒ 0)"
+        );
 
         // Cleanly shut down.
         handle.send_shutdown().await.unwrap();
@@ -12425,10 +12393,15 @@ mod tests {
         );
 
         // The actor must still be alive after the reject — prove it by
-        // issuing a follow-up command and observing a reply (not an
-        // ActorBusy/closed-inbox error).
-        let followup: Result<(), ContextError> = handle
-            .send(|reply| ContextCommand::Messaging(MessagingCommand::Placeholder { reply }))
+        // issuing a follow-up read-only query and observing a reply (not
+        // an ActorBusy/closed-inbox error).
+        let followup: Result<Option<usize>, ContextError> = handle
+            .send(|reply| {
+                ContextCommand::Queries(QueriesCommand::MemberCount {
+                    context_id: hex::encode(ctx_id_bytes),
+                    reply,
+                })
+            })
             .await;
         assert!(
             !matches!(followup, Err(ContextError::ActorBusy(_))),
@@ -12486,8 +12459,13 @@ mod tests {
         // The actor claimed itself terminal and exits — a follow-up send
         // must observe the closed inbox. (The supervisor despawns the
         // dead handle in the import path; here we just prove termination.)
-        let followup: Result<(), ContextError> = handle
-            .send(|reply| ContextCommand::Messaging(MessagingCommand::Placeholder { reply }))
+        let followup: Result<Option<usize>, ContextError> = handle
+            .send(|reply| {
+                ContextCommand::Queries(QueriesCommand::MemberCount {
+                    context_id: ctx_key.clone(),
+                    reply,
+                })
+            })
             .await;
         assert!(
             matches!(followup, Err(ContextError::ActorBusy(_))),
@@ -13857,7 +13835,8 @@ mod tests {
         let result = sup
             .dispatch_command(
                 &ctx_key,
-                crate::context::actor::commands::MessagingCommand::Placeholder {
+                crate::context::actor::commands::MessagingCommand::DrainEvents {
+                    context_id: ctx_key.clone(),
                     reply: tokio::sync::oneshot::channel().0,
                 },
             )
@@ -13937,7 +13916,8 @@ mod tests {
         let result = sup
             .dispatch_command(
                 &ctx_key,
-                crate::context::actor::commands::MessagingCommand::Placeholder {
+                crate::context::actor::commands::MessagingCommand::DrainEvents {
+                    context_id: ctx_key.clone(),
                     reply: tokio::sync::oneshot::channel().0,
                 },
             )

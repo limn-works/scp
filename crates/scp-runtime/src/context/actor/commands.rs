@@ -22,15 +22,17 @@
 //! vector (drop-the-receiver = discard the outcome without rolling back
 //! committed state — see plan §"Cancel-safety check").
 //!
-//! # Minimal variant surface (this commit)
+//! # Variant surface
 //!
-//! Commit 6 lands the enum SHAPE. Each sub-enum carries one or two
-//! placeholder variants whose handlers return
-//! `ContextError::NotImplemented(..)` via
-//! [`Outcome::err`](crate::context::actor::Outcome::err). Commits 7-11
-//! extend each sub-enum with real variants as the corresponding handler
-//! migrates off the legacy `ContextManager`; the dispatch loop shape is
-//! stable from this commit forward.
+//! Each sub-enum carries its real, domain-specific command variants;
+//! there are no placeholder variants. The actor mailbox has no
+//! `NotImplemented` scaffolding on the live dispatch path — the
+//! state-owning [`ContextActor`](crate::context::actor::ContextActor)
+//! routes every command through `dispatch_state` to its real handler.
+//! The only remaining `ContextError::NotImplemented(..)` producer is the
+//! test-only `skeleton_dispatch` path, which acks the mailbox contract
+//! for state-less skeleton actors and returns
+//! [`Outcome::err`](crate::context::actor::Outcome::err).
 //!
 //! # Naming
 //!
@@ -69,7 +71,7 @@ pub type DeliverIncomingReply = oneshot::Sender<Result<DeliverOutcome, ContextEr
 /// Reply-channel type alias for [`MessagingCommand::DrainEvents`]. The
 /// reply carries the drained `ContextEvent` vector — empty iff the
 /// context is unknown (matches the legacy
-/// [`ContextManager::drain_events`](crate::context::supervisor::Supervisor::drain_events)
+/// [`Supervisor::drain_events`](crate::context::supervisor::Supervisor::drain_events)
 /// "soft-default on unknown context" contract). Factored out to satisfy
 /// `clippy::type_complexity`.
 pub type DrainEventsReply =
@@ -124,7 +126,7 @@ pub enum ContextCommand {
 }
 
 // ---------------------------------------------------------------------------
-// Placeholder sub-enums
+// Command sub-enums
 // ---------------------------------------------------------------------------
 
 /// Payload for [`MessagingCommand::SendMessage`]. Boxed inside the
@@ -172,26 +174,18 @@ pub struct SendMessagePayload {
 /// the ADR-049 commit ladder (see `handlers/messaging.rs`). Variants
 /// cover the hot-path send + deliver operations; sender-key rotation,
 /// distribute/remove, sender-key request handling, and sender-key
-/// management messages all stay on the legacy `ContextManager` surface
-/// until commits 10-11 per the plan row-6 scope.
+/// management messages are served directly by the crypto provider —
+/// `crypto/mls/provider.rs` methods (invoked internally by the runtime's
+/// lifecycle/governance/blocking helpers) plus
+/// `crypto/sender_keys/key_protocol.rs` free functions (additionally
+/// re-exported to the FFI boundary via `scp-core`), not command variants
+/// traversing the command-dispatch shim — until they migrate to
+/// `MessagingCommand` variants in commits 10-11 per the plan row-6 scope.
 pub enum MessagingCommand {
-    /// Placeholder — reserved for Phase 2 actor-mailbox wiring of
-    /// ADR-049 (post-review-round-1 plan). Used by the actor's
-    /// `run()` skeleton dispatch as a no-op handshake target so the
-    /// mailbox machinery exercises end-to-end without a real
-    /// command. Handler replies
-    /// [`ContextError::NotImplemented`](scp_protocol::context::ContextError::NotImplemented)
-    /// and returns `Outcome::err`.
-    Placeholder {
-        /// Oneshot reply channel. Handler stub sends
-        /// `Err(ContextError::NotImplemented(..))` back.
-        reply: oneshot::Sender<Result<(), ContextError>>,
-    },
-
     /// Encrypts and transmits a message within an active context.
     ///
     /// Mirrors the legacy
-    /// [`ContextManager::send_message`](crate::context::supervisor::Supervisor::send_message)
+    /// [`Supervisor::send_message`](crate::context::supervisor::Supervisor::send_message)
     /// signature exactly: the handler delegates to that method for
     /// byte-identical envelope construction, inner-signature signing,
     /// sender-key sealing, MLS encryption, and transport fan-out.
@@ -228,7 +222,7 @@ pub enum MessagingCommand {
     /// management message.
     ///
     /// Mirrors the legacy
-    /// [`ContextManager::deliver_incoming`](crate::context::messaging_helpers::deliver_incoming)
+    /// [`messaging_helpers::deliver_incoming`](crate::context::messaging_helpers::deliver_incoming)
     /// signature. Used by the relay subscription loop; the return type
     /// matches the bridge's per-event dispatch pattern.
     ///
@@ -257,7 +251,7 @@ pub enum MessagingCommand {
     /// Drain the per-context receive buffer.
     ///
     /// Mirrors the legacy
-    /// [`ContextManager::drain_events`](crate::context::supervisor::Supervisor::drain_events)
+    /// [`Supervisor::drain_events`](crate::context::supervisor::Supervisor::drain_events)
     /// signature: empties the receive buffer and returns the drained
     /// events. The legacy method returns an empty `Vec` on unknown
     /// context; the dispatch shim preserves that contract by surfacing
@@ -309,7 +303,7 @@ pub enum MessagingCommand {
     /// other members of a context.
     ///
     /// Mirrors the legacy
-    /// [`ContextManager::send_pseudonym_announcement`](crate::context::messaging_helpers::send_pseudonym_announcement)
+    /// [`messaging_helpers::send_pseudonym_announcement`](crate::context::messaging_helpers::send_pseudonym_announcement)
     /// signature exactly: the handler delegates to that method which
     /// in turn wraps the announcement payload and routes it through
     /// `send_message`. Best-effort — the legacy method returns no
@@ -383,7 +377,7 @@ pub enum MessagingCommand {
     /// broadcast channel).
     ///
     /// Mirrors the legacy
-    /// [`ContextManager::report_degraded_mode`](crate::context::supervisor::Supervisor::report_degraded_mode)
+    /// [`Supervisor::report_degraded_mode`](crate::context::supervisor::Supervisor::report_degraded_mode)
     /// signature: a fire-and-forget side-effect on the messaging path's
     /// receive-buffer state. The reply channel carries `Ok(())` once the
     /// emit completes (or no-ops on `Match` / `IncompatibleMajor`
@@ -595,9 +589,8 @@ pub type ImportContextReply = oneshot::Sender<Result<crate::context::ContextHand
 /// [`ContextParams`](scp_protocol::context::params::ContextParams)
 /// being ~1KB.
 pub struct CreateContextPayload {
-    /// Context identifier (plain string; the legacy
-    /// `ContextManager::create_context` derives the 32-byte hash
-    /// internally).
+    /// Context identifier (plain string; the `Supervisor::create_context`
+    /// entry point derives the 32-byte hash internally).
     pub context_id: String,
     /// Creation-time parameters — governance model, ceiling, TTL,
     /// economic policy, etc.
@@ -681,28 +674,15 @@ pub struct RestoreContextPayload {
 /// [`PerContextState`](crate::context::actor::state::PerContextState).
 ///
 /// **Create / join.** `CreateContext` / `JoinContext` route directly through
-/// [`ContextManager::create_context`](crate::context::supervisor::Supervisor::create_context)
-/// / [`ContextManager::join_context`](crate::context::supervisor::Supervisor::join_context).
+/// [`Supervisor::create_context`](crate::context::supervisor::Supervisor::create_context)
+/// / [`Supervisor::join_context`](crate::context::supervisor::Supervisor::join_context).
 /// Neither is a saga entry point: standing-pair creation is single-context
 /// async creation (not a 2-phase saga; spec §5.15.8), and cross-identity
 /// context migration was withdrawn (ADR-049 §4). The sole cross-context saga
 /// is tool invocation (§6.2.4), driven from the supervisor, not this enum.
 pub enum LifecycleCommand {
-    /// Placeholder — reserved for Phase 2 actor-mailbox wiring of
-    /// ADR-049 (post-review-round-1 plan). Used by the actor's
-    /// `run()` skeleton dispatch as a no-op handshake target so the
-    /// mailbox machinery exercises end-to-end without a real
-    /// command. Handler replies
-    /// [`ContextError::NotImplemented`](scp_protocol::context::ContextError::NotImplemented)
-    /// and returns `Outcome::err`.
-    Placeholder {
-        /// Oneshot reply channel. Handler stub sends
-        /// `Err(ContextError::NotImplemented(..))` back.
-        reply: oneshot::Sender<Result<(), ContextError>>,
-    },
-
     /// Creates a new MLS-backed (or broadcast-mode) context. Mirrors
-    /// [`ContextManager::create_context`](crate::context::supervisor::Supervisor::create_context).
+    /// [`Supervisor::create_context`](crate::context::supervisor::Supervisor::create_context).
     ///
     /// Standing-pair creation also routes through `create_context` — it is
     /// single-context async creation (not a saga-prepare flow; spec §5.15.8),
@@ -719,7 +699,7 @@ pub enum LifecycleCommand {
     },
 
     /// Joins an existing context. Mirrors
-    /// [`ContextManager::join_context`](crate::context::supervisor::Supervisor::join_context).
+    /// [`Supervisor::join_context`](crate::context::supervisor::Supervisor::join_context).
     ///
     /// The caller is the MLS `KeyPackage` owner (`key_package.owner_did`).
     /// `spending_ucan` is the optional UCAN for the economy layer's
@@ -735,7 +715,7 @@ pub enum LifecycleCommand {
     },
 
     /// Removes a member from an active context. Mirrors
-    /// [`ContextManager::leave_context`](crate::context::supervisor::Supervisor::leave_context).
+    /// [`Supervisor::leave_context`](crate::context::supervisor::Supervisor::leave_context).
     ///
     /// Self-removal (`caller_did == member_did`) is always permitted;
     /// removing another member requires the `MemberRemove` capability
@@ -748,7 +728,7 @@ pub enum LifecycleCommand {
     },
 
     /// Initiates cooperative context closure. Mirrors
-    /// [`ContextManager::close_context`](crate::context::lifecycle_helpers::close_context)
+    /// [`lifecycle_helpers::close_context`](crate::context::lifecycle_helpers::close_context)
     /// (not `close_context_with_key` — the latter is an internal
     /// optimization for checkpoint generation; commit 9 exposes the
     /// public surface through the command enum).
@@ -833,7 +813,7 @@ pub enum LifecycleCommand {
 
     /// Generate and store a per-member access key for explicit
     /// lifecycle management (§9.17.2 step 1). Mirrors
-    /// [`ContextManager::generate_context_access_key`](crate::context::queries_helpers::generate_context_access_key).
+    /// [`queries_helpers::generate_context_access_key`](crate::context::queries_helpers::generate_context_access_key).
     ///
     /// Requires `ContextClose` capability on the caller. Overwrites any
     /// existing key for the same `(context_id, member_did)` pair.
@@ -850,7 +830,7 @@ pub enum LifecycleCommand {
 
     /// Revoke (remove) a member's access key from the context's
     /// access key store (§9.17.2 step 3, ADR-038). Mirrors
-    /// [`ContextManager::revoke_context_access_key`](crate::context::queries_helpers::revoke_context_access_key).
+    /// [`queries_helpers::revoke_context_access_key`](crate::context::queries_helpers::revoke_context_access_key).
     ///
     /// Requires `ContextClose` capability on the caller.
     RevokeContextAccessKey {
@@ -896,8 +876,8 @@ pub enum LifecycleCommand {
     ///
     /// Mirrors the per-context body of the legacy
     /// `flush_all_contexts_legacy` (which iterated the supervisor's
-    /// `contexts` DashMap and took a per-context lock with
-    /// [`FLUSH_LOCK_BUDGET`](crate::context::lifecycle_helpers::FLUSH_LOCK_BUDGET)).
+    /// `contexts` DashMap and took a per-context lock with the
+    /// since-deleted `FLUSH_LOCK_BUDGET`).
     /// The actor path needs no separate lock budget — the actor's own
     /// dispatch loop serializes by construction, so the command sits in
     /// the mailbox until the actor is idle. The handler builds a snapshot
@@ -960,7 +940,8 @@ pub enum LifecycleCommand {
     /// removal). The actor owns its state, so the handler reads
     /// `state.receive_buffer.len()` directly with no cross-actor lock.
     ///
-    /// Read-only: the handler returns an [`Outcome`] with `mutated =
+    /// Read-only: the handler returns an
+    /// [`Outcome`](crate::context::actor::Outcome) with `mutated =
     /// false`.
     ReportBufferLen {
         /// Oneshot reply channel carrying this actor's receive-buffer
@@ -1107,18 +1088,8 @@ pub struct ExecuteGovernanceActionPayload {
 /// mirrors the manager methods that accept them, not the actions
 /// themselves.
 pub enum GovernanceCommand {
-    /// Placeholder — reserved for Phase 2 actor-mailbox wiring of
-    /// ADR-049 (post-review-round-1 plan). Used as a no-op
-    /// handshake target by mailbox tests so the end-to-end dispatch
-    /// pipe is exercised without a real command. Handler replies
-    /// [`ContextError::NotImplemented`](scp_protocol::context::ContextError::NotImplemented).
-    Placeholder {
-        /// Oneshot reply channel.
-        reply: oneshot::Sender<Result<(), ContextError>>,
-    },
-
     /// Submits a governance proposal — unchecked variant. Mirrors
-    /// [`ContextManager::propose_governance_action`](crate::context::supervisor::Supervisor::propose_governance_action).
+    /// [`Supervisor::propose_governance_action`](crate::context::supervisor::Supervisor::propose_governance_action).
     /// Accepts the proposer DID + action + signing key without a
     /// capability pre-check (the governance engine enforces eligibility
     /// internally). For `SingleAdmin` contexts the proposal is auto-
@@ -1133,7 +1104,7 @@ pub enum GovernanceCommand {
     },
 
     /// Submits a governance proposal — checked variant. Mirrors
-    /// [`ContextManager::propose_governance_action_checked`](crate::context::supervisor::Supervisor::propose_governance_action_checked).
+    /// [`Supervisor::propose_governance_action_checked`](crate::context::supervisor::Supervisor::propose_governance_action_checked).
     /// Validates the proposer's `GovernancePropose` capability inside
     /// the same lock as the proposal submission (no TOCTOU).
     ProposeGovernanceActionChecked {
@@ -1145,7 +1116,7 @@ pub enum GovernanceCommand {
     },
 
     /// Casts a vote on a pending proposal. Mirrors
-    /// [`ContextManager::vote_on_proposal`](crate::context::supervisor::Supervisor::vote_on_proposal).
+    /// [`Supervisor::vote_on_proposal`](crate::context::supervisor::Supervisor::vote_on_proposal).
     /// `approve == true` is an approval vote; `false` is rejection.
     VoteOnProposal {
         /// Boxed owned payload.
@@ -1159,7 +1130,7 @@ pub enum GovernanceCommand {
     },
 
     /// Casts an approval vote with explicit capability pre-check.
-    /// Mirrors [`ContextManager::approve_governance_proposal`](crate::context::governance_helpers::approve_governance_proposal).
+    /// Mirrors [`governance_helpers::approve_governance_proposal`](crate::context::governance_helpers::approve_governance_proposal).
     /// The reply carries only the resulting status (the legacy method
     /// discards the event list by convention — see its implementation).
     ApproveGovernanceProposal {
@@ -1172,7 +1143,7 @@ pub enum GovernanceCommand {
     },
 
     /// Casts a rejection vote with explicit capability pre-check.
-    /// Mirrors [`ContextManager::reject_governance_proposal`](crate::context::governance_helpers::reject_governance_proposal).
+    /// Mirrors [`governance_helpers::reject_governance_proposal`](crate::context::governance_helpers::reject_governance_proposal).
     RejectGovernanceProposal {
         /// Boxed owned payload.
         payload: Box<VoteOnProposalPayload>,
@@ -1183,7 +1154,7 @@ pub enum GovernanceCommand {
     },
 
     /// Withdraws a previously cast vote. Mirrors
-    /// [`ContextManager::withdraw_governance_vote`](crate::context::supervisor::Supervisor::withdraw_governance_vote).
+    /// [`Supervisor::withdraw_governance_vote`](crate::context::supervisor::Supervisor::withdraw_governance_vote).
     /// No signing key — withdrawal is the voter's privileged operation
     /// on their own vote per the governance engine's trait contract.
     WithdrawGovernanceVote {
@@ -1200,7 +1171,7 @@ pub enum GovernanceCommand {
     },
 
     /// Executes an already-approved governance proposal. Mirrors
-    /// [`ContextManager::execute_governance_action`](crate::context::governance_helpers::execute_governance_action).
+    /// [`governance_helpers::execute_governance_action`](crate::context::governance_helpers::execute_governance_action).
     /// Caller MUST pass a proposal whose status is
     /// [`ProposalStatus::Approved`](scp_protocol::context::governance::ProposalStatus);
     /// the legacy method enforces the gate.
@@ -1213,7 +1184,7 @@ pub enum GovernanceCommand {
     },
 
     /// Reads a single proposal by ID. Mirrors
-    /// [`ContextManager::get_proposal`](crate::context::supervisor::Supervisor::get_proposal).
+    /// [`Supervisor::get_proposal`](crate::context::supervisor::Supervisor::get_proposal).
     GetProposal {
         /// Context identifier string.
         context_id: String,
@@ -1226,7 +1197,7 @@ pub enum GovernanceCommand {
     },
 
     /// Lists all proposals for a context. Mirrors
-    /// [`ContextManager::list_proposals`](crate::context::supervisor::Supervisor::list_proposals).
+    /// [`Supervisor::list_proposals`](crate::context::supervisor::Supervisor::list_proposals).
     ListProposals {
         /// Context identifier string.
         context_id: String,
@@ -1238,7 +1209,7 @@ pub enum GovernanceCommand {
 
     /// Applies a pending ceiling modification whose notification period
     /// has expired. Mirrors
-    /// [`ContextManager::apply_pending_ceiling_modification`](crate::context::governance_helpers::apply_pending_ceiling_modification).
+    /// [`governance_helpers::apply_pending_ceiling_modification`](crate::context::governance_helpers::apply_pending_ceiling_modification).
     /// Returns `true` iff a pending modification was applied.
     ApplyPendingCeilingModification {
         /// Context identifier string.
@@ -1252,7 +1223,7 @@ pub enum GovernanceCommand {
 
     /// Applies a pending economic-policy change whose notification
     /// period has expired. Mirrors
-    /// [`ContextManager::apply_pending_economic_policy_change`](crate::context::governance_helpers::apply_pending_economic_policy_change).
+    /// [`governance_helpers::apply_pending_economic_policy_change`](crate::context::governance_helpers::apply_pending_economic_policy_change).
     /// Returns `true` iff a pending change was applied.
     ApplyPendingEconomicPolicyChange {
         /// Context identifier string.
@@ -1265,7 +1236,7 @@ pub enum GovernanceCommand {
 
     /// Tombstones a migrated context after the grace period expires.
     /// Mirrors
-    /// [`ContextManager::tombstone_migrated_context`](crate::context::governance_helpers::tombstone_migrated_context).
+    /// [`governance_helpers::tombstone_migrated_context`](crate::context::governance_helpers::tombstone_migrated_context).
     TombstoneMigratedContext {
         /// Context identifier string.
         context_id: String,
@@ -1274,7 +1245,7 @@ pub enum GovernanceCommand {
     },
 
     /// Returns the migration state for a context if one exists. Mirrors
-    /// [`ContextManager::migration_state`](crate::context::governance_helpers::migration_state).
+    /// [`governance_helpers::migration_state`](crate::context::governance_helpers::migration_state).
     ///
     /// This is read-only; the handler returns
     /// [`Outcome::ok`](crate::context::actor::Outcome::ok) and reports
@@ -1289,7 +1260,7 @@ pub enum GovernanceCommand {
 
     /// Acknowledges and clears a commit-fault marker for a context
     /// (PR #1606 C6). Mirrors
-    /// [`ContextManager::acknowledge_commit_fault`](crate::context::governance_helpers::acknowledge_commit_fault).
+    /// [`governance_helpers::acknowledge_commit_fault`](crate::context::governance_helpers::acknowledge_commit_fault).
     AcknowledgeCommitFault {
         /// Context identifier string.
         context_id: String,
@@ -1476,23 +1447,25 @@ pub struct UnsubscribeBroadcastPayload {
 ///
 /// # KeyCustody plumbing
 ///
-/// The legacy
-/// [`ContextManager::publish_broadcast`](crate::context::broadcast_helpers::publish_broadcast)
-/// takes a `custody: &impl KeyCustody + &KeyHandle` pair; the
-/// [`KeyCustody`](scp_platform::KeyCustody) trait uses RPITIT and is
-/// NOT `dyn`-safe, so it cannot cross the actor mailbox. Instead:
+/// Signing a broadcast envelope needs the caller's
+/// [`KeyCustody`](scp_platform::KeyCustody) backend; the trait uses
+/// RPITIT and is NOT `dyn`-safe, so it cannot cross the actor mailbox.
+/// Instead:
 ///
 /// - The command carries only the
 ///   [`KeyHandle`](scp_platform::KeyHandle) (an opaque reference that
 ///   IS `Send + Sync + Clone`).
-/// - The shim-dispatch entry point
-///   [`Supervisor::dispatch_broadcast_command`](crate::context::supervisor::supervisor::Supervisor::dispatch_broadcast_command)
-///   is generic over the concrete custody type, and the shim extracts
-///   the `KeyHandle` from the command and passes both to
-///   [`ContextManager::publish_broadcast`](crate::context::broadcast_helpers::publish_broadcast).
-/// - For the post-refactor actor loop (commit 12+), the custody is
-///   available via the actor's bridge-instance reference; the actor
-///   body resolves the custody from the instance and signs inline.
+/// - The custody-generic entry point
+///   [`Supervisor::dispatch_broadcast_command_with_custody`](crate::context::supervisor::supervisor::Supervisor::dispatch_broadcast_command_with_custody)
+///   drives the two-phase publish path: the actor reserves the
+///   sequence via
+///   [`broadcast_helpers::reserve_broadcast_publish`](crate::context::broadcast_helpers::reserve_broadcast_publish)
+///   and returns the signing-payload digest, the supervisor signs with
+///   the caller's custody OUTSIDE the actor, then the actor seals via
+///   [`broadcast_helpers::apply_broadcast_publish`](crate::context::broadcast_helpers::apply_broadcast_publish).
+/// - Dispatching this variant directly on the actor mailbox is
+///   rejected with a typed error pointing at the custody-generic
+///   entry point (see `handlers/broadcast.rs`).
 pub struct PublishBroadcastPayload {
     /// Context identifier string.
     pub context_id: String,
@@ -1579,26 +1552,19 @@ pub struct BroadcastBlockPayload {
 /// `PublishBroadcast` / `PublishBroadcastContent` each require the
 /// caller's [`KeyCustody`](scp_platform::KeyCustody) backend to sign the
 /// broadcast envelope — the custody trait uses RPITIT and cannot cross
-/// an actor mailbox. For commit 11 the non-saga variants store only the
-/// [`KeyHandle`](scp_platform::KeyHandle); the handler reaches back to
-/// the attached [`Supervisor`](crate::context::supervisor::Supervisor)
-/// for the custody reference, matching the bridge-level wiring the
-/// legacy method uses today.
+/// an actor mailbox. The variants store only the
+/// [`KeyHandle`](scp_platform::KeyHandle) and are dispatched through
+/// the custody-generic
+/// [`Supervisor::dispatch_broadcast_command_with_custody`](crate::context::supervisor::supervisor::Supervisor::dispatch_broadcast_command_with_custody),
+/// which drives the custody-free two-phase
+/// `ReserveBroadcastPublish` / `ApplyBroadcastPublish` mailbox commands
+/// and signs with the caller's custody between the two phases, outside
+/// the actor.
 pub enum BroadcastCommand {
-    /// Placeholder — reserved for Phase 2 actor-mailbox wiring of
-    /// ADR-049 (post-review-round-1 plan). Used as a no-op
-    /// handshake target by mailbox tests so the end-to-end dispatch
-    /// pipe is exercised without a real command. Handler replies
-    /// [`ContextError::NotImplemented`](scp_protocol::context::ContextError::NotImplemented).
-    Placeholder {
-        /// Oneshot reply channel.
-        reply: oneshot::Sender<Result<(), ContextError>>,
-    },
-
     /// Subscribe a DID to a broadcast context. Mirrors
-    /// [`ContextManager::subscribe_broadcast`](crate::context::broadcast_helpers::subscribe_broadcast).
+    /// [`broadcast_helpers::subscribe_broadcast`](crate::context::broadcast_helpers::subscribe_broadcast).
     ///
-    /// The validation-context-generic variant on `ContextManager` carries
+    /// The validation-context-generic form of that helper carries
     /// a `ValidationContext<'_, D, N, R, P, S>` parameter; the actor
     /// command surface passes `None` for that slot to match the default
     /// unvalidated path. Gated contexts with a UCAN still route through
@@ -1611,7 +1577,7 @@ pub enum BroadcastCommand {
     },
 
     /// Unsubscribe a DID from a broadcast context. Mirrors
-    /// [`ContextManager::unsubscribe_broadcast`](crate::context::broadcast_helpers::unsubscribe_broadcast).
+    /// [`broadcast_helpers::unsubscribe_broadcast`](crate::context::broadcast_helpers::unsubscribe_broadcast).
     UnsubscribeBroadcast {
         /// Boxed owned payload.
         payload: Box<UnsubscribeBroadcastPayload>,
@@ -1619,8 +1585,11 @@ pub enum BroadcastCommand {
         reply: UnsubscribeBroadcastReply,
     },
 
-    /// Publish raw bytes to a broadcast context. Mirrors
-    /// [`ContextManager::publish_broadcast`](crate::context::broadcast_helpers::publish_broadcast).
+    /// Publish raw bytes to a broadcast context. Dispatched via the
+    /// custody-generic supervisor path, which drives the two-phase
+    /// [`broadcast_helpers::reserve_broadcast_publish`](crate::context::broadcast_helpers::reserve_broadcast_publish)
+    /// / [`broadcast_helpers::apply_broadcast_publish`](crate::context::broadcast_helpers::apply_broadcast_publish)
+    /// pair — see the enum-level key-custody handoff docs.
     PublishBroadcast {
         /// Boxed owned payload.
         payload: Box<PublishBroadcastPayload>,
@@ -1629,8 +1598,11 @@ pub enum BroadcastCommand {
     },
 
     /// Publish structured [`BroadcastContent`](scp_protocol::context::broadcast_content::BroadcastContent)
-    /// to a broadcast context. Mirrors
-    /// [`ContextManager::publish_broadcast_content`](crate::context::broadcast_helpers::publish_broadcast_content).
+    /// to a broadcast context. Serializes the content, then follows the
+    /// same custody-generic two-phase
+    /// [`broadcast_helpers::reserve_broadcast_publish`](crate::context::broadcast_helpers::reserve_broadcast_publish)
+    /// / [`broadcast_helpers::apply_broadcast_publish`](crate::context::broadcast_helpers::apply_broadcast_publish)
+    /// path as [`Self::PublishBroadcast`].
     PublishBroadcastContent {
         /// Boxed owned payload.
         payload: Box<PublishBroadcastContentPayload>,
@@ -1673,7 +1645,7 @@ pub enum BroadcastCommand {
 
     /// Block a subscriber from receiving future broadcasts from a
     /// specific author. Mirrors
-    /// [`ContextManager::block_broadcast_subscriber`](crate::context::broadcast_helpers::block_broadcast_subscriber).
+    /// [`broadcast_helpers::block_broadcast_subscriber`](crate::context::broadcast_helpers::block_broadcast_subscriber).
     BlockBroadcastSubscriber {
         /// Boxed owned payload.
         payload: Box<BroadcastBlockPayload>,
@@ -1682,7 +1654,7 @@ pub enum BroadcastCommand {
     },
 
     /// Unblock a previously blocked subscriber. Mirrors
-    /// [`ContextManager::unblock_broadcast_subscriber`](crate::context::broadcast_helpers::unblock_broadcast_subscriber).
+    /// [`broadcast_helpers::unblock_broadcast_subscriber`](crate::context::broadcast_helpers::unblock_broadcast_subscriber).
     UnblockBroadcastSubscriber {
         /// Boxed owned payload.
         payload: Box<BroadcastBlockPayload>,
@@ -1691,7 +1663,7 @@ pub enum BroadcastCommand {
     },
 
     /// Evaluate a subscriber's broadcast-key request. Mirrors
-    /// [`ContextManager::handle_broadcast_key_request`](crate::context::broadcast_helpers::handle_broadcast_key_request).
+    /// [`broadcast_helpers::handle_broadcast_key_request`](crate::context::broadcast_helpers::handle_broadcast_key_request).
     ///
     /// Read-mostly (no per-context mutation) — handler reports
     /// `mutated: false`.
@@ -1712,7 +1684,7 @@ pub enum BroadcastCommand {
     },
 
     /// Return the subscriber count for a broadcast context. Mirrors
-    /// [`ContextManager::broadcast_subscriber_count`](crate::context::broadcast_helpers::broadcast_subscriber_count).
+    /// [`broadcast_helpers::broadcast_subscriber_count`](crate::context::broadcast_helpers::broadcast_subscriber_count).
     /// Read-only. `Ok(None)` iff the context is unknown or not broadcast.
     BroadcastSubscriberCount {
         /// Context identifier string.
@@ -1722,7 +1694,7 @@ pub enum BroadcastCommand {
     },
 
     /// Membership predicate — `true` iff `did` is a subscriber. Mirrors
-    /// [`ContextManager::is_broadcast_subscriber`](crate::context::broadcast_helpers::is_broadcast_subscriber).
+    /// [`broadcast_helpers::is_broadcast_subscriber`](crate::context::broadcast_helpers::is_broadcast_subscriber).
     /// Read-only.
     IsBroadcastSubscriber {
         /// Context identifier string.
@@ -1734,7 +1706,7 @@ pub enum BroadcastCommand {
     },
 
     /// Return the broadcast context's admission policy. Mirrors
-    /// [`ContextManager::broadcast_admission`](crate::context::broadcast_helpers::broadcast_admission).
+    /// [`broadcast_helpers::broadcast_admission`](crate::context::broadcast_helpers::broadcast_admission).
     /// Read-only. `Ok(None)` iff the context is unknown or not broadcast.
     BroadcastAdmission {
         /// Context identifier string.
@@ -1768,19 +1740,9 @@ pub type VerifyPaymentReceiptsReply = oneshot::Sender<
 /// internally rather than calling the helpers directly; commit 10
 /// lands only the public surface.
 pub enum EconomyCommand {
-    /// Placeholder — reserved for Phase 2 actor-mailbox wiring of
-    /// ADR-049 (post-review-round-1 plan). Used as a no-op
-    /// handshake target by mailbox tests so the end-to-end dispatch
-    /// pipe is exercised without a real command. Handler replies
-    /// [`ContextError::NotImplemented`](scp_protocol::context::ContextError::NotImplemented).
-    Placeholder {
-        /// Oneshot reply channel.
-        reply: oneshot::Sender<Result<(), ContextError>>,
-    },
-
     /// Verifies a batch of payment receipts against the configured
     /// payment adapter. Mirrors
-    /// [`ContextManager::verify_payment_receipts`](crate::context::economy_helpers::verify_payment_receipts).
+    /// [`economy_helpers::verify_payment_receipts`](crate::context::economy_helpers::verify_payment_receipts).
     ///
     /// Read-only — the handler returns
     /// [`Outcome::ok`](crate::context::actor::Outcome::ok) and reports
@@ -1863,18 +1825,8 @@ pub struct RecoveryNotifyContactPayload {
 /// checkpoints + cosignatures, compromise-recovery epoch advance, and
 /// recovery notifications (spec §9.12).
 pub enum TrustRecoveryCommand {
-    /// Placeholder — reserved for Phase 2 actor-mailbox wiring of
-    /// ADR-049 (post-review-round-1 plan). Used as a no-op
-    /// handshake target by mailbox tests so the end-to-end dispatch
-    /// pipe is exercised without a real command. Handler replies
-    /// [`ContextError::NotImplemented`](scp_protocol::context::ContextError::NotImplemented).
-    Placeholder {
-        /// Oneshot reply channel.
-        reply: oneshot::Sender<Result<(), ContextError>>,
-    },
-
     /// Creates a governance-aware checkpoint for a context. Mirrors
-    /// [`ContextManager::create_governance_checkpoint`](crate::context::trust_recovery_helpers::create_governance_checkpoint).
+    /// [`trust_recovery_helpers::create_governance_checkpoint`](crate::context::trust_recovery_helpers::create_governance_checkpoint).
     CreateGovernanceCheckpoint {
         /// Boxed owned payload.
         payload: Box<CreateGovernanceCheckpointPayload>,
@@ -1886,7 +1838,7 @@ pub enum TrustRecoveryCommand {
 
     /// Adds a cosignature to an existing checkpoint and re-evaluates
     /// attestation status. Mirrors
-    /// [`ContextManager::add_checkpoint_cosignature`](crate::context::trust_recovery_helpers::add_checkpoint_cosignature).
+    /// [`trust_recovery_helpers::add_checkpoint_cosignature`](crate::context::trust_recovery_helpers::add_checkpoint_cosignature).
     ///
     /// The caller supplies a mutable checkpoint (by owned value) and
     /// the cosignature; the handler applies the cosignature on success
@@ -1916,7 +1868,7 @@ pub enum TrustRecoveryCommand {
 
     /// Advances the MLS epoch for a context as part of compromise
     /// recovery (spec §9.12 step 2). Mirrors
-    /// [`ContextManager::recovery_advance_epoch`](crate::context::trust_recovery_helpers::recovery_advance_epoch).
+    /// [`trust_recovery_helpers::recovery_advance_epoch`](crate::context::trust_recovery_helpers::recovery_advance_epoch).
     RecoveryAdvanceEpoch {
         /// Context identifier string.
         context_id: String,
@@ -1926,7 +1878,7 @@ pub enum TrustRecoveryCommand {
 
     /// Sends a recovery notification directly through a named context
     /// (spec §9.12 step 5 — context already known). Mirrors
-    /// [`ContextManager::recovery_send_notification`](crate::context::trust_recovery_helpers::recovery_send_notification).
+    /// [`trust_recovery_helpers::recovery_send_notification`](crate::context::trust_recovery_helpers::recovery_send_notification).
     RecoverySendNotification {
         /// Boxed owned payload (carries the signing key bytes).
         payload: Box<RecoverySendNotificationPayload>,
@@ -1936,7 +1888,7 @@ pub enum TrustRecoveryCommand {
 
     /// Sends a recovery notification to a contact DID by finding a
     /// shared context. Mirrors
-    /// [`ContextManager::recovery_notify_contact`](crate::context::trust_recovery_helpers::recovery_notify_contact).
+    /// [`trust_recovery_helpers::recovery_notify_contact`](crate::context::trust_recovery_helpers::recovery_notify_contact).
     RecoveryNotifyContact {
         /// Boxed owned payload (carries the signing key bytes).
         payload: Box<RecoveryNotifyContactPayload>,
@@ -1948,28 +1900,18 @@ pub enum TrustRecoveryCommand {
 /// See [`ContextCommand::Standing`]. Real variants cover the public
 /// methods on [`crate::context::standing_helpers`].
 pub enum StandingCommand {
-    /// Placeholder — reserved for Phase 2 actor-mailbox wiring of
-    /// ADR-049 (post-review-round-1 plan). Used as a no-op
-    /// handshake target by mailbox tests so the end-to-end dispatch
-    /// pipe is exercised without a real command. Handler replies
-    /// [`ContextError::NotImplemented`](scp_protocol::context::ContextError::NotImplemented).
-    Placeholder {
-        /// Oneshot reply channel.
-        reply: oneshot::Sender<Result<(), ContextError>>,
-    },
-
     /// Get-or-create a standing bilateral context between two identities
-    /// (spec §5.12.4 — contact graph). Mirrors
-    /// [`ContextManager::standing_context`](crate::context::standing_helpers::standing_context).
+    /// (spec §5.12.6 — contact graph). Mirrors the supervisor's
+    /// `Supervisor::standing_context` get-or-create method.
     ///
-    /// Idempotent at the legacy-method level — a concurrent call
+    /// Idempotent at the underlying-method level — a concurrent call
     /// returning `Active` or `Creating` surfaces the same context ID
     /// without error.
     ///
     /// # Not a saga
     ///
     /// The method internally calls
-    /// [`ContextManager::create_context`](crate::context::supervisor::Supervisor::create_context).
+    /// [`Supervisor::create_context`](crate::context::supervisor::Supervisor::create_context).
     /// Standing-pair creation is single-context async creation (create +
     /// add_member + Welcome + consent-on-receipt; spec §5.15.8) routed
     /// directly through that path — NOT a 2-phase-commit saga FSM.
@@ -1979,14 +1921,14 @@ pub enum StandingCommand {
         /// Remote peer DID.
         peer_did: scp_identity::DID,
         /// Oneshot reply channel. `Ok(String)` carries the
-        /// deterministic standing context ID; the legacy method returns
-        /// the same ID whether the context already existed or was
-        /// freshly created.
+        /// deterministic standing context ID; the underlying method
+        /// returns the same ID whether the context already existed or
+        /// was freshly created.
         reply: oneshot::Sender<Result<String, ContextError>>,
     },
 
     /// Returns the number of tracked standing contexts. Mirrors
-    /// [`ContextManager::standing_context_count`](crate::context::standing_helpers::standing_context_count).
+    /// [`standing_helpers::standing_context_count`](crate::context::standing_helpers::standing_context_count).
     /// Read-only.
     StandingContextCount {
         /// Oneshot reply channel.
@@ -1995,7 +1937,7 @@ pub enum StandingCommand {
 
     /// Returns `true` iff a standing context exists for the given peer.
     /// Mirrors
-    /// [`ContextManager::has_standing_context`](crate::context::standing_helpers::has_standing_context).
+    /// [`standing_helpers::has_standing_context`](crate::context::standing_helpers::has_standing_context).
     /// Read-only.
     HasStandingContext {
         /// Candidate peer DID.
@@ -2005,7 +1947,7 @@ pub enum StandingCommand {
     },
 
     /// Registers an existing context as a standing context. Mirrors
-    /// [`ContextManager::register_standing_context`](crate::context::standing_helpers::register_standing_context).
+    /// [`standing_helpers::register_standing_context`](crate::context::standing_helpers::register_standing_context).
     /// Called during SDK init to restore the contact-graph index from a
     /// persisted snapshot.
     RegisterStandingContext {
@@ -2016,7 +1958,7 @@ pub enum StandingCommand {
     },
 
     /// Reconnects transport for every standing context. Mirrors
-    /// [`ContextManager::reconnect_all_standing`](crate::context::standing_helpers::reconnect_all_standing).
+    /// [`standing_helpers::reconnect_all_standing`](crate::context::standing_helpers::reconnect_all_standing).
     /// Returns the number of contexts that were successfully
     /// reconnected.
     ReconnectAllStanding {
@@ -2085,19 +2027,6 @@ pub struct TtlTimerPayload {
 /// synchronously. Full timer-owning actor logic migrates with plan row
 /// 11.
 pub enum TtlCloseCommand {
-    /// Placeholder — reserved for Phase 2 actor-mailbox wiring of
-    /// ADR-049 (post-review-round-1 plan). Used by the actor's
-    /// `run()` skeleton dispatch as a no-op handshake target so the
-    /// mailbox machinery exercises end-to-end without a real
-    /// command. Handler replies
-    /// [`ContextError::NotImplemented`](scp_protocol::context::ContextError::NotImplemented)
-    /// and returns `Outcome::err`.
-    Placeholder {
-        /// Oneshot reply channel. Handler stub sends
-        /// `Err(ContextError::NotImplemented(..))` back.
-        reply: oneshot::Sender<Result<(), ContextError>>,
-    },
-
     /// Fires a single TTL tick on THIS actor: evaluate whether the
     /// context's TTL has elapsed and, if so, run the close pipeline on the
     /// actor-owned state.
@@ -2193,7 +2122,7 @@ pub enum TtlCloseCommand {
 
 /// See [`ContextCommand::Tools`]. Real variants cover every public
 /// method on [`crate::context::tools_helpers`] EXCEPT
-/// [`ContextManager::invoke_tool_with_economy`](crate::context::supervisor::Supervisor::invoke_tool_with_economy)
+/// [`Supervisor::invoke_tool_with_economy`](crate::context::supervisor::Supervisor::invoke_tool_with_economy)
 /// — that method is the cross-context tool-invocation entry and carries
 /// a generic executor closure `F: FnOnce(Value) -> Fut` which cannot
 /// cross the actor mailbox. The cross-context saga itself is wired (§6.2.4,
@@ -2210,19 +2139,9 @@ pub enum TtlCloseCommand {
 /// [`crate::context::tools_helpers`] migrate here because they are the
 /// supervisor-observable tool surface.
 pub enum ToolsCommand {
-    /// Placeholder — reserved for Phase 2 actor-mailbox wiring of
-    /// ADR-049 (post-review-round-1 plan). Used as a no-op
-    /// handshake target by mailbox tests so the end-to-end dispatch
-    /// pipe is exercised without a real command. Handler replies
-    /// [`ContextError::NotImplemented`](scp_protocol::context::ContextError::NotImplemented).
-    Placeholder {
-        /// Oneshot reply channel.
-        reply: oneshot::Sender<Result<(), ContextError>>,
-    },
-
     /// Try to consume one hard-rate-limit token for the given
     /// `(context_id, did)` pair (async variant). Mirrors
-    /// [`ContextManager::try_consume_hard_rate_limit`](crate::context::tools_helpers::try_consume_hard_rate_limit).
+    /// [`tools_helpers::try_consume_hard_rate_limit`](crate::context::tools_helpers::try_consume_hard_rate_limit).
     ///
     /// Reply carries `Ok(true)` iff a token was consumed or the context
     /// is unknown (pass-through contract on unknown contexts — matches
@@ -2240,7 +2159,7 @@ pub enum ToolsCommand {
     },
 
     /// Refund one hard-rate-limit token (async variant). Mirrors
-    /// [`ContextManager::refund_hard_rate_limit`](crate::context::tools_helpers::refund_hard_rate_limit).
+    /// [`tools_helpers::refund_hard_rate_limit`](crate::context::tools_helpers::refund_hard_rate_limit).
     /// No-op on unknown context.
     RefundHardRateLimit {
         /// Context identifier string.
@@ -2308,11 +2227,14 @@ pub enum ToolsCommand {
 /// Commit 7 lands the real read variants. Commit 12c.7 deletes the
 /// transitional `QueryStateView` borrow adapter and routes the
 /// `&PerContextState` + shared event-log provider directly into the
-/// query handler. Variants that mutate state (even if they live in
-/// `manager/queries.rs` today — `drain_events`, access-key management,
-/// `compare_remote_checkpoint`, `prove_event_*`, etc.) are NOT migrated
-/// here and continue to route through the legacy `ContextManager` until
-/// their respective handler commits (8-11).
+/// query handler. Variants that mutate state (`drain_events`, access-key
+/// management, `compare_remote_checkpoint`, etc.) are NOT migrated here —
+/// they are carried by their own command families
+/// (`MessagingCommand::DrainEvents` / `::CompareRemoteCheckpoint`, the
+/// `LifecycleCommand` access-key variants) and reach the runtime through
+/// the command-dispatch shim. Read-only Merkle proofs (`prove_event_*`)
+/// are NOT commands at all: they are served directly by free functions in
+/// `queries_helpers` (provider-backed), with no command variant.
 pub enum QueriesCommand {
     /// Current lifecycle [`ContextState`](scp_protocol::context::ContextState)
     /// for this actor's context. Read-only — the handler reads the
@@ -2367,7 +2289,7 @@ pub enum QueriesCommand {
         /// Context identifier string.
         context_id: String,
         /// Oneshot reply channel. `Ok(None)` iff the context is unknown
-        /// (matches the legacy `ContextManager::member_count` contract).
+        /// (matches the `Supervisor::member_count` contract).
         reply: oneshot::Sender<Result<Option<usize>, ContextError>>,
     },
     /// Membership predicate — `true` iff `did` is currently a member.
@@ -2582,8 +2504,9 @@ pub enum QueriesCommand {
 ///
 /// Carries the `Send` reservation handles the caller-context actor staged but
 /// did NOT apply: the escrow + outbound rate-limit reservation rolled into the
-/// existing [`ToolEconomyReservation`]. The supervisor FSM (slice 5) holds this
-/// across the saga; the [`ToolEconomyReservation`]'s
+/// existing [`ToolEconomyReservation`](crate::context::tools_helpers::ToolEconomyReservation).
+/// The supervisor FSM (slice 5) holds this across the saga; the
+/// [`ToolEconomyReservation`](crate::context::tools_helpers::ToolEconomyReservation)'s
 /// `#[must_use]` drop guard releases the held escrow/rate-limit on every
 /// terminal non-commit path (abort, timeout, panic — spec §6.2.4 "Reservation
 /// release on every terminal path"). On Commit-A the FSM settles it.
@@ -2787,7 +2710,8 @@ pub enum CommitBReserveOutcome {
     /// receipt are re-emitted verbatim. The FSM skips the executor and treats
     /// this as a Commit-B success.
     AlreadyCommitted {
-        /// The original signed receipt bytes (JCS of [`CrossContextToolReceipt`]).
+        /// The original signed receipt bytes (JCS of
+        /// [`CrossContextToolReceipt`](scp_protocol::context::tools::CrossContextToolReceipt)).
         receipt: Vec<u8>,
         /// The captured tool output bytes (the receipt's `output_jcs`).
         output_bytes: Vec<u8>,
@@ -2805,7 +2729,8 @@ pub enum CommitBReserveOutcome {
 /// `tool_invoked_event_id` — and the tool is NOT re-invoked.
 #[derive(Debug)]
 pub struct CommitBSettleOutcome {
-    /// The target's signed receipt bytes (JCS of [`CrossContextToolReceipt`]).
+    /// The target's signed receipt bytes (JCS of
+    /// [`CrossContextToolReceipt`](scp_protocol::context::tools::CrossContextToolReceipt)).
     pub receipt: Vec<u8>,
     /// The captured tool output bytes the FSM forwards to Commit-A.
     pub output_bytes: Vec<u8>,
@@ -2934,7 +2859,9 @@ pub enum SagaPhaseMessage {
     ///
     /// Durably captures the output keyed by `SagaId` (so a later replay
     /// re-emits it), `SagaId`-idempotently appends `ToolInvoked` → a stable
-    /// `tool_invoked_event_id`, signs the [`CrossContextToolReceipt`] over the
+    /// `tool_invoked_event_id`, signs the
+    /// [`CrossContextToolReceipt`](scp_protocol::context::tools::CrossContextToolReceipt)
+    /// over the
     /// staged `recorded_nonce` / `recorded_chain_depth` / `recorded_timestamp_ms`
     /// plus `output_hash` plus the event id using `target_signing_key`, Class-S
     /// sync-persists fail-closed, and replies the receipt + output bytes. A
@@ -3174,16 +3101,10 @@ mod tests {
         assert!(!cmd.is_shutdown());
 
         let (tx, _rx) = oneshot::channel();
-        let cmd = ContextCommand::Messaging(MessagingCommand::Placeholder { reply: tx });
+        let cmd = ContextCommand::Queries(QueriesCommand::MemberCount {
+            context_id: "ctx".to_owned(),
+            reply: tx,
+        });
         assert!(!cmd.is_shutdown());
-    }
-
-    #[test]
-    fn sub_enum_placeholders_carry_reply_channels() {
-        // Compile-time witness: every placeholder variant carries a
-        // oneshot reply channel with the expected type.
-        let (tx, rx) = oneshot::channel::<Result<(), ContextError>>();
-        let _ = ContextCommand::Messaging(MessagingCommand::Placeholder { reply: tx });
-        drop(rx);
     }
 }

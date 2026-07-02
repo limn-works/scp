@@ -8,18 +8,18 @@
 //! plan section titles in quoted form.
 #![allow(clippy::doc_markdown, clippy::too_long_first_doc_paragraph)]
 //!
-//! These handlers respond to supervisor-originated Pause / Resume /
-//! Shutdown / PersistSync commands. Commit 6 lands the dispatch stub
-//! that ACKS with `Ok(())` for the lifecycle control commands — the
-//! `BridgeInstanceCore::suspend()` default trait method sends `Pause`
-//! and `PersistSync` against the actor handle and expects an ack so
-//! the suspend flow completes.
+//! These handlers respond to supervisor-originated Pause / Shutdown /
+//! PersistSync / PrepareForReplace commands, running on actor-owned
+//! state: `Pause` flips `lifecycle_state` to `Closing` and `Shutdown`
+//! flips it to `Closed` through the actor's Class-C view (ADR-049 §9).
 //!
-//! The ack-with-`Ok` (rather than `NotImplemented`) keeps the suspend
-//! path from erroring out during commit 6. Actual persist-sync logic
-//! migrates in commit 11; before that, the handler has no persist
-//! buffer to flush because no state mutation has happened through the
-//! actor path yet.
+//! `PersistSync` acks with `Ok(())` (rather than `NotImplemented`) so
+//! the `BridgeInstanceCore::suspend()` default trait method — which
+//! sends `Pause` then `PersistSync` against the actor handle and
+//! expects acks — can complete its suspend sequence. That arm is a
+//! no-op today: handler mutations persist synchronously through the
+//! per-handler persistence helpers, so there is no separate actor-side
+//! persist buffer for `PersistSync` to flush.
 
 use scp_protocol::context::{ContextError, ContextState};
 
@@ -31,10 +31,10 @@ use crate::context::actor::state::ContextLifecycleState;
 
 /// Dispatch a [`LifecycleControlCommand`] against actor state.
 ///
-/// Commit 6 handles lifecycle control commands synchronously and with
-/// an `Ok` reply so the bridge's `suspend()` default body can complete.
-/// The state mutations (e.g. flipping `lifecycle_state` to `Closing`)
-/// are minimal and locally-owned — no persistence, no transport.
+/// Handles lifecycle control commands synchronously and with an `Ok`
+/// reply so the bridge's `suspend()` default body can complete. The
+/// state mutations (e.g. flipping `lifecycle_state` to `Closing`) are
+/// minimal and locally-owned — no persistence, no transport.
 pub(crate) async fn dispatch(
     cell: &mut ClassSCell,
     deps: &ActorDeps,
@@ -50,9 +50,10 @@ pub(crate) async fn dispatch(
             Outcome::ok_mutated(())
         }
         LifecycleControlCommand::PersistSync { reply } => {
-            // Commit 6: nothing to persist through the actor path yet
-            // because the legacy `ContextManager` still owns mutating
-            // paths. Acking with Ok matches the eventual semantics —
+            // Nothing to persist through a dedicated actor-side buffer:
+            // handler mutations persist synchronously via the
+            // per-handler persistence helpers, so no pending buffer
+            // remains to flush. Acking with Ok matches the semantics —
             // "persist buffer is empty, sync returns immediately".
             let _ = reply.send(Ok(()));
             Outcome::ok(())

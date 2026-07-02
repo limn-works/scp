@@ -5,31 +5,31 @@
 //!
 //! # Phase 2A.7 — actor-shape dispatch
 //!
-//! The handler's primary entry point [`dispatch`] takes
-//! `(&mut PerContextState, &ActorDeps, &mut SendSequenceTracker,
-//! MessagingCommand)` and routes every variant through
-//! [`crate::context::messaging_helpers`] (the actor-shape messaging
-//! helpers). The shim entry point [`dispatch_from_shim`] remains during
-//! Phase 2A and routes through [`crate::context::messaging_helpers_legacy`]
-//! for callers that arrive via the supervisor mailbox-fallback path
-//! before a per-context actor exists.
+//! The handler's sole entry point [`dispatch`] takes
+//! `(&mut ClassSCell, &ActorDeps, MessagingCommand)` and routes every
+//! variant through [`crate::context::messaging_helpers`] (the
+//! actor-shape messaging helpers). The migration-window shim entry
+//! point (`dispatch_from_shim`) and the `messaging_helpers_legacy`
+//! module it routed through were deleted in Phase 2A finalization —
+//! `Supervisor::dispatch_command` is mailbox-only, and a missing actor
+//! surfaces a typed lookup-miss error.
 //!
 //! # Send-sequence tracker
 //!
-//! `send_tracker` is the actor-owned RAII rollback mechanism for
+//! `state.send_tracker` is the actor-owned RAII rollback mechanism for
 //! sequence reservations
 //! ([`SequenceReservation`](crate::context::actor::SequenceReservation)).
 //! The wire sequence is still driven by
-//! `MembershipState::next_sequence_number` inside the helper body
-//! during Phase 2A — `send_tracker` runs in parallel and rolls back
-//! on early `?` returns, transport timeouts, and crypto errors.
-//! Phase 2A finalization rewires the wire sequence onto `send_tracker`
+//! `MembershipState::next_sequence_number` inside the helper body —
+//! `send_tracker` runs in parallel and rolls back on early `?`
+//! returns, transport timeouts, and crypto errors. A follow-on Phase 2
+//! sub-chunk rewires the wire sequence onto `send_tracker`
 //! exclusively.
 //!
 //! # Transport-timeout budget
 //!
-//! [`HANDLER_TIMEOUT`] is the handler-level budget. The legacy
-//! `ContextManager` methods do not carry their own deadline — this is
+//! [`HANDLER_TIMEOUT`] is the handler-level budget. The predecessor
+//! monolithic context methods did not carry their own deadline — this is
 //! the new behaviour introduced by ADR-049 §7. 30 seconds matches the
 //! plan's "every transport and storage call inside a handler wraps
 //! `tokio::time::timeout(30s, ...)`" contract.
@@ -66,7 +66,6 @@ pub(crate) async fn dispatch(
     cmd: MessagingCommand,
 ) -> Outcome<()> {
     match cmd {
-        MessagingCommand::Placeholder { reply } => reply_not_implemented(reply),
         MessagingCommand::SendMessage { payload, reply } => {
             let p = *payload;
             // SendMessage reaches the spending-nonce leaf
@@ -271,10 +270,10 @@ async fn handle_send_message(
     // before the cell-taking `send_message` call.
     let mut view = cell.class_c_view();
     // Step 1: reserve + commit a sequence number against the
-    // actor-owned tracker. The Phase 2A wire sequence is still driven
-    // by `MembershipState::next_sequence_number` inside the helper —
+    // actor-owned tracker. The wire sequence is still driven by
+    // `MembershipState::next_sequence_number` inside the helper —
     // `send_tracker` is the actor-shape parallel that becomes
-    // authoritative in Phase 2A finalization. We commit the
+    // authoritative in a follow-on Phase 2 sub-chunk. We commit the
     // reservation BEFORE the helper call (not after) because the
     // helper takes `&mut state` which would conflict with an active
     // `&mut state.send_tracker` reservation guard. On failure we
@@ -752,13 +751,4 @@ fn outcome_error_sketch(err: &ContextError) -> ContextError {
         ContextError::ContextNotActive => ContextError::ContextNotActive,
         other => ContextError::CryptoFailed(format!("{other}")),
     }
-}
-
-fn reply_not_implemented(reply: oneshot::Sender<Result<(), ContextError>>) -> Outcome<()> {
-    const MSG: &str = "MessagingCommand::Placeholder — real variants \
-                       SendMessage/DeliverIncoming land in commit 8 of ADR-049; \
-                       Placeholder retained for commit-6 compile stability and \
-                       deleted in commit 12 with the shim";
-    let _ = reply.send(Err(ContextError::NotImplemented(MSG.to_owned())));
-    Outcome::err(ContextError::NotImplemented(MSG.to_owned()))
 }

@@ -18,8 +18,6 @@ use crate::context::actor::commands::EconomyCommand;
 use crate::context::actor::deps::ActorDeps;
 use crate::context::actor::outcome::Outcome;
 use crate::economy::receipt::ReceiptVerificationError;
-use scp_protocol::context::ContextError;
-use tokio::sync::oneshot;
 
 /// Per-call transport budget for economy handlers. Plan §"Transport
 /// timeouts inside actor handlers": 30 seconds.
@@ -47,7 +45,6 @@ pub(crate) async fn dispatch(
 
 async fn dispatch_inner(deps: &ActorDeps, cmd: EconomyCommand) -> Outcome<()> {
     match cmd {
-        EconomyCommand::Placeholder { reply } => reply_not_implemented(reply),
         EconomyCommand::VerifyPaymentReceipts { receipts, reply } => {
             handle_verify_payment_receipts(deps, *receipts, reply).await
         }
@@ -90,11 +87,4 @@ async fn handle_verify_payment_receipts(
     let _ = reply.send(results);
     // Verify payment receipts is a pure read — mutated=false.
     Outcome::ok(())
-}
-
-fn reply_not_implemented(reply: oneshot::Sender<Result<(), ContextError>>) -> Outcome<()> {
-    const MSG: &str = "EconomyCommand::Placeholder — mailbox-pipe smoke target; \
-                       no real work performed";
-    let _ = reply.send(Err(ContextError::NotImplemented(MSG.to_owned())));
-    Outcome::err(ContextError::NotImplemented(MSG.to_owned()))
 }

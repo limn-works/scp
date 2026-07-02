@@ -20,28 +20,28 @@
 //! # Commit 12a.5 expansion
 //!
 //! Commit 12a.5 of ADR-049 (pre-work for handler body migration)
-//! extends the bundle with every cross-cutting collaborator the legacy
-//! `ContextManager` handler submodules reach via `self.X`:
+//! extended the bundle with every cross-cutting collaborator the
+//! deleted `ContextManager` handler submodules reached via `self.X`:
 //!
-//! - `clock` — wall-clock source. Legacy: `ContextManager::clock`.
+//! - `clock` — wall-clock source. Formerly `ContextManager::clock`.
 //! - `event_tx` — optional fan-out channel for external `ContextEvent`
-//!   subscribers (webhook dispatcher in `scp-node`). Legacy:
+//!   subscribers (webhook dispatcher in `scp-node`). Formerly
 //!   `ContextManager::event_tx`. `Option` because not every embedder
-//!   wires a subscriber; legacy treats `None` as "drop silently."
+//!   wires a subscriber; the legacy handler treated `None` as "drop silently."
 //! - `key_resolver` — DID → Ed25519 verifying-key map used by UCAN /
-//!   governance vote verification. Legacy: `ContextManager::key_resolver`.
+//!   governance vote verification. Formerly `ContextManager::key_resolver`.
 //! - `payment_adapter` — optional economy adapter for the 9-step paid
-//!   action flow (spec §19.2.2). Legacy:
+//!   action flow (spec §19.2.2). Formerly
 //!   `ContextManager::payment_adapter`. `Option` because "free context"
 //!   is a valid configuration.
 //!
 //! # Commit 12b.2a expansion
 //!
 //! Commit 12b.2a of ADR-049 (actor-owned-state infrastructure) adds one
-//! additional cross-cutting collaborator that handler bodies need once
-//! they stop delegating to `ContextManager`:
+//! additional cross-cutting collaborator that handler bodies needed once
+//! they stopped delegating to the legacy manager:
 //!
-//! - `local_dids` — `Arc<ArcSwap<HashSet<DID>>>`. Legacy:
+//! - `local_dids` — `Arc<ArcSwap<HashSet<DID>>>`. Formerly
 //!   `ContextManager::local_dids` (`RwLock<HashSet<DID>>`). Rewritten to
 //!   `ArcSwap` here because the read path is on the hot path of every
 //!   `deliver_incoming` (resolve local member for sender-key layer) —
@@ -77,15 +77,15 @@
 //!   directly"). Cross-context work goes through
 //!   `SupervisorHandle::start_saga`.
 //! - `task_set` / `next_generation` — supervisor-scoped lifecycle
-//!   state that migrates with the actor run-loop in commit 12b/c.
+//!   state, held on the supervisor side.
 //! - `consequence_rules` — per-context state stored in `PerContextState`,
 //!   not a cross-cutting dep.
 //!
-//! The new fields are wired on the supervisor side at actor-spawn time
-//! (shim wiring lives behind the `testing` feature until the legacy
-//! manager is deleted in commit 12). Handler bodies do not yet read the
-//! new fields — 12b+ performs the mechanical migration from
-//! `view.manager().foo` → `deps.foo`.
+//! These `ActorDeps` fields are wired on the supervisor side at
+//! actor-spawn time and read directly by the handler bodies — e.g.
+//! `deps.event_tx` in governance, `deps.payment_adapter` in saga, and
+//! `deps.local_dids` in queries. The former `view.manager().foo`
+//! indirection and the legacy manager it reached through are gone.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -125,7 +125,7 @@ use crate::economy::adapter::PaymentAdapterDyn;
 /// hold its own clones of the individual handles.
 pub struct ActorDeps {
     /// MLS crypto provider — owns the per-context MLS group + sender-key
-    /// state map. Legacy: `ContextManager::crypto`. Held on
+    /// state map. Formerly `ContextManager::crypto`. Held on
     /// [`Supervisor`](crate::context::supervisor::Supervisor) directly
     /// during the helper-migration window; cloned into each actor's
     /// `ActorDeps` at spawn time so handler bodies can call
@@ -162,7 +162,7 @@ pub struct ActorDeps {
     /// actor's `OpenMlsBackend` is per-actor but reads/writes the same
     /// underlying KV via this adapter).
     pub mls_storage: Arc<dyn OpenMlsStorageAdapter>,
-    /// Wall-clock source. Legacy: `ContextManager::clock`
+    /// Wall-clock source. Formerly `ContextManager::clock`
     /// (`Arc<dyn scp_primitives::Clock>`, default
     /// [`scp_primitives::SystemClock`]). Every handler that computes
     /// pricing windows, velocity tracking, TTL comparisons, UCAN expiry
@@ -172,36 +172,37 @@ pub struct ActorDeps {
     pub clock: Arc<dyn Clock>,
     /// Optional fan-out channel for `(context_id, ContextEvent)` pairs
     /// sent to external subscribers (the webhook dispatcher in
-    /// `scp-node`, SDK event streams). Legacy:
+    /// `scp-node`, SDK event streams). Formerly
     /// `ContextManager::event_tx`. `None` in embedders that do not
     /// subscribe to context events — handlers check `Option::is_some`
-    /// before sending and drop silently otherwise, matching legacy.
+    /// before sending and drop silently otherwise, matching the legacy behavior.
     ///
     /// Lagging receivers lose events (bounded channel) — delivery is
     /// best-effort.
     pub event_tx: Option<tokio::sync::broadcast::Sender<(String, ContextEvent)>>,
     /// DID → Ed25519 verifying-key resolver used by governance vote
     /// verification (spec §5.9, ADR-031) and UCAN proof validation.
-    /// Legacy: `ContextManager::key_resolver` (typealias
+    /// Formerly `ContextManager::key_resolver` (typealias
     /// `Arc<dyn Fn(&DID) -> Option<VerifyingKey> + Send + Sync>`).
     pub key_resolver: KeyResolver,
     /// Optional economy adapter for the 9-step paid action flow
-    /// (spec §19.2.2). Legacy: `ContextManager::payment_adapter`.
+    /// (spec §19.2.2). Formerly `ContextManager::payment_adapter`.
     /// `None` for "free context" configurations — handlers skip the
     /// escrow path and fall through to budget-only enforcement.
     pub payment_adapter: Option<Arc<dyn PaymentAdapterDyn>>,
     /// DIDs controlled by the local node/SDK. `ArcSwap` for lock-free
-    /// reads on every `deliver_incoming` (resolve local member). Legacy:
-    /// [`crate::context::supervisor::Supervisor::local_dids`]
-    /// (`RwLock<HashSet<DID>>`). The actor model hoists this to the
-    /// supervisor so every actor shares the same snapshot without each
-    /// one carrying its own `RwLock` — the `Arc<ArcSwap<_>>` is
-    /// clone-cheap and every actor gets a snapshot reference at spawn
-    /// time.
+    /// reads on every `deliver_incoming` (resolve local member).
+    /// Sourced from
+    /// [`crate::context::supervisor::Supervisor::local_dids`]: the
+    /// actor model hoists this set to the supervisor (it was a
+    /// per-manager `RwLock<HashSet<DID>>` before the actor refactor)
+    /// so every actor shares the same snapshot without each one
+    /// carrying its own lock — the `Arc<ArcSwap<_>>` is clone-cheap
+    /// and every actor gets a snapshot reference at spawn time.
     ///
     /// Added in commit 12b.2a of ADR-049. Read by the messaging
-    /// handler's `deliver_incoming` body (landing 12b.2b) to resolve
-    /// which local DID the incoming envelope addresses.
+    /// handler's `deliver_incoming` body to resolve which local DID
+    /// the incoming envelope addresses.
     pub local_dids: Arc<ArcSwap<HashSet<DID>>>,
     /// Unforgeable capability token proving which identity owns this
     /// actor (ADR-049 §5). Minted fresh per-actor at spawn time in

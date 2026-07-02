@@ -32,8 +32,9 @@
 //!   mailbox wrapper.
 //! - [`deps::ActorDeps`] — capability-reduced dependency bundle.
 //! - [`state::PerContextState`] — the owned state payload.
-//! - [`handlers`] — per-domain dispatch stubs (commits 7-11 migrate the
-//!   real handlers off `ContextManager`).
+//! - [`handlers`] — per-domain dispatch handlers. Each owns the real
+//!   actor-shape dispatch for its domain, operating on the actor's owned
+//!   state (`&mut ClassSCell`) and capability-reduced [`deps::ActorDeps`].
 
 pub mod class_s;
 pub mod commands;
@@ -80,9 +81,9 @@ use tokio::sync::mpsc;
 const COALESCE_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Encode a 32-byte context ID as lowercase hex. Matches the string
-/// form used throughout the legacy `ContextManager` shim so the
-/// actor's `context_id` field is interchangeable with the shim's
-/// `ctx_id: &str` parameter.
+/// form used throughout the supervisor-side dispatch shim
+/// (`Supervisor::dispatch_*_command`) so the actor's `context_id`
+/// field is interchangeable with the shim's `ctx_id: &str` argument.
 fn hex_encode_context_id(id: &[u8; 32]) -> String {
     let mut s = String::with_capacity(64);
     for byte in id {
@@ -96,11 +97,14 @@ fn hex_encode_context_id(id: &[u8; 32]) -> String {
 /// Per-context actor. Owns one [`PerContextState`] by move and processes
 /// commands from its inbox one at a time.
 ///
-/// See plan §"ContextActor" for the full shape. Commit 6 lands the
-/// skeleton — the `run()` loop compiles and dispatches to the handler
-/// stubs; the real timer arms, persistence coalescing, and governance
-/// timeout fire-and-forget work lands alongside the handler migrations
-/// in commits 7-11.
+/// See plan §"ContextActor" for the full shape. The `run()` loop
+/// dispatches state-bearing commands through `dispatch_state` to the
+/// real per-domain handlers. Some run-loop arms remain no-ops pending
+/// the Phase 2 finalization sub-chunks that retire the supervisor-side
+/// timer/persistence paths — TTL expiry and governance timeouts are
+/// driven by the supervisor's timer `task_set`, and persistence flows
+/// through the per-handler persistence helpers, until those paths
+/// migrate onto the actor's owned state.
 pub struct ContextActor {
     /// Stable context identifier. Kept as a `String` alongside
     /// [`PerContextState::context_id`] for tracing / logging — the
@@ -111,66 +115,67 @@ pub struct ContextActor {
     /// [`ContextActorHandle`].
     inbox: mpsc::Receiver<ContextCommand>,
     /// Owned per-context state. `Some` for actors constructed via
-    /// [`Self::new`] with a full state payload (12b.2a infrastructure
-    /// path, exercised by 12b.2b handlers). `None` for skeleton actors
-    /// constructed via [`Self::new_skeleton`] — these are the pre-
-    /// 12b.2a test fixtures and the shim-era `spawn_actor` path whose
-    /// dispatch continues to route through
-    /// [`crate::context::supervisor::supervisor::Supervisor::dispatch_command`]
-    /// against the legacy `ContextManager`.
+    /// [`Self::new`] with a full state payload — the production path:
+    /// every production spawn
+    /// ([`crate::context::supervisor::supervisor::Supervisor::spawn_actor_with_state`])
+    /// carries `Some(state)`. `None` only for skeleton actors
+    /// constructed via the test-only [`Self::new_skeleton`].
     ///
-    /// Two-mode is bounded: once 12b.2b flips all handler dispatch to
-    /// the actor path, every spawn carries `Some(state)` and this
-    /// field becomes non-`Option`.
+    /// State-owning actors consume the state on every command: the
+    /// run-loop's `dispatch` threads it as `&mut ClassSCell` through
+    /// `dispatch_state` into the real per-domain handler. Only
+    /// skeleton actors (state = `None`) fall through to
+    /// `skeleton_dispatch`, the sole surviving `NotImplemented`
+    /// producer.
     ///
-    /// Read into handler bodies as `&mut self.state` in 12b.2b+. The
-    /// 12b.2a dispatch loop does not yet consume the state — it still
-    /// ACKs with `Err(NotImplemented)` via the skeleton dispatch —
-    /// because migrating one handler without the others silently
-    /// breaks the nine remaining shim handlers (see
-    /// `.docs/adrs/ADR-049-actor-per-context.md` §Commit ladder
-    /// row 12b.2a rationale).
-    #[allow(dead_code)] // read by 12b.2b handler bodies
+    /// Two-mode is bounded: this field becomes non-`Option` when the
+    /// test-only skeleton apparatus is retired in a follow-on chunk.
+    // read by the run-loop's dispatch/dispatch_state path
     state: Option<class_s::ClassSCell>,
     /// Owned dependency bundle. `Some` / `None` mirrors [`Self::state`]
     /// — the two are always both `Some` or both `None`. Two-mode is
     /// bounded identically.
-    #[allow(dead_code)] // read by 12b.2b handler bodies
+    // read by the run-loop's dispatch/dispatch_state path
     deps: Option<deps::ActorDeps>,
-    /// TTL expiry interval timer. Armed at actor construction when the
-    /// context's TTL configuration demands it; `None` for contexts
-    /// without TTL and for skeleton-mode actors. Drives the
-    /// `handlers/ttl_close.rs` expiry path once the run-loop grows a
-    /// `select!` TTL arm in 12b.2b+.
-    #[allow(dead_code)] // read by 12b.2b+ run-loop
+    /// TTL expiry interval timer. `None` until the supervisor-side TTL
+    /// timer path (`task_set`-spawned timers that mailbox
+    /// `TtlCloseCommand::FireTimer`) migrates onto the run-loop's
+    /// `select!` TTL arm in a follow-on Phase 2 sub-chunk; the arm and
+    /// its no-op `on_ttl_tick` body exist so that migration is purely
+    /// additive.
+    // read by the run-loop's TTL select! arm
     ttl_timer: Option<tokio::time::Interval>,
-    /// Governance proposal timeout deadline. Armed on governance
-    /// proposal creation; fires once and is rearmed if a subsequent
-    /// proposal lands. Driven by the handler migration in 12b.2b+.
+    /// Governance proposal timeout deadline. `None` until the
+    /// supervisor-side governance timeout path migrates onto the
+    /// run-loop's `select!` arm in a follow-on Phase 2 sub-chunk (the
+    /// arm and its no-op `on_governance_timeout` body exist so that
+    /// migration is purely additive).
     ///
     /// Note — `tokio::time::Sleep` is `!Unpin` so the field holds a
     /// pinned box. Constructing the future upfront (even unused)
     /// keeps the run-loop's `select!` arm shape stable as the
     /// migration lands.
-    #[allow(dead_code)] // read by 12b.2b+ run-loop
+    // read by the run-loop's governance select! arm
     governance_timeout: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
     /// Unix-ms instant of the last successful coalesced persist. The
     /// run-loop's persistence arm compares `now() - last_persisted_at`
     /// against the coalescing window (250 ms per plan
     /// §"Persistence coalescing") before issuing a snapshot write.
     /// Initialized to "now" at actor construction.
-    #[allow(dead_code)] // read by 12b.2b+ run-loop
+    // read by the run-loop's persistence coalesce arm
     last_persisted_at: std::time::Instant,
     /// Dirty flag set when any handler's [`outcome::Outcome`] carries
     /// `mutated: true`. Cleared after a successful coalesced persist.
     /// Initialized `false` at actor construction.
-    #[allow(dead_code)] // read by 12b.2b+ run-loop
+    // read by the run-loop's persistence coalesce arm
     dirty: bool,
-    /// **TRANSITIONAL — Phase 2A shim dispatch period.** Held so the
-    /// actor's `run()` loop can route commands through the
-    /// per-handler `dispatch_from_shim` entry points which still take
-    /// `&Supervisor`. Removed when handler bodies migrate to the
-    /// `(&mut PerContextState, &ActorDeps)` signature in Phase 2B-2I.
+    /// Full-supervisor pointer captured at construction. Today its
+    /// only read is the `dispatch` pre-check that partitions
+    /// state-owning actors from skeleton actors — handler bodies reach
+    /// the supervisor through the capability-reduced
+    /// [`deps::ActorDeps::supervisor`] handle instead. Removed when
+    /// the test-only skeleton apparatus is retired in a follow-on
+    /// chunk.
     ///
     /// Sourced from [`deps::ActorDeps::supervisor`] via
     /// [`crate::context::supervisor::SupervisorHandle::shim_supervisor`]
@@ -183,14 +188,12 @@ pub struct ContextActor {
 
 impl ContextActor {
     /// Construct a fresh actor that owns [`PerContextState`] and
-    /// [`ActorDeps`] directly (ADR-049 commit 12b.2a infrastructure
-    /// path).
+    /// [`ActorDeps`] directly (introduced by ADR-049 commit 12b.2a).
     ///
-    /// This is the production constructor — every
-    /// [`crate::context::supervisor::supervisor::Supervisor::spawn_actor`]
-    /// call that migrates state out of the legacy `ContextManager` /
-    /// `MlsCryptoProvider` uses this constructor to hand the drained
-    /// state into the actor task.
+    /// This is the production constructor. The owned-state spawn path
+    /// [`crate::context::supervisor::supervisor::Supervisor::spawn_actor_with_state`]
+    /// uses it to hand drained `PerContextState` + `ActorDeps` into the
+    /// actor task, making the actor their sole owner.
     ///
     /// Visibility is `pub(in crate::context)` — only
     /// `crate::context::supervisor::supervisor` constructs actors
@@ -212,10 +215,10 @@ impl ContextActor {
     /// The canonical context ID lives on `state.context_id` as
     /// `[u8; 32]`. The actor's `String` copy is derived at
     /// construction-time by hex-encoding the 32-byte hash, which
-    /// matches the string form `ContextManager` uses throughout the
-    /// shim. Callers therefore do not need to pass `context_id`
+    /// matches the string form used throughout the supervisor-side
+    /// dispatch shim. Callers therefore do not need to pass `context_id`
     /// separately — it is sourced from the state payload.
-    #[allow(dead_code)] // first production caller is 12b.2b
+    #[allow(dead_code)] // production caller: Supervisor::spawn_actor_with_state
     pub(in crate::context) fn new(
         state: state::PerContextState,
         deps: deps::ActorDeps,
@@ -223,9 +226,8 @@ impl ContextActor {
     ) -> Self {
         let context_id = hex_encode_context_id(&state.context_id);
         // Capture the shim-supervisor pointer before moving `deps` into
-        // the actor: the run loop's transitional handler dispatch needs
-        // an `Arc<Supervisor>` it can pass into the per-handler
-        // `dispatch_from_shim` entry points.
+        // the actor: `dispatch` reads its presence to partition
+        // state-owning actors from skeleton actors.
         let shim_supervisor = Some(deps.supervisor.shim_supervisor());
         Self {
             context_id,
@@ -245,27 +247,22 @@ impl ContextActor {
     }
 
     /// Construct a skeleton actor without state or deps. Used by the
-    /// pre-12b.2a test fixtures and by
+    /// module's unit-test fixtures and by the dead-code / test-only
     /// [`crate::context::supervisor::supervisor::Supervisor::spawn_actor`]
-    /// for contexts whose state still lives on the legacy
-    /// `ContextManager` (every production context during the
-    /// 12b.2a → 12b.2b window).
+    /// path. No production context uses the skeleton — production spawns
+    /// state-owning actors via [`Self::new`].
     ///
     /// The skeleton's `run()` loop drains commands from the inbox and
-    /// ACKs each with the same `Err(NotImplemented)` response the
-    /// pre-12b.2a dispatch produced. This is deliberate: flipping the
-    /// dispatch path for one handler while state still lives on the
-    /// manager would silently break the other nine shim handlers. See
-    /// `.docs/adrs/ADR-049-actor-per-context.md` §Commit ladder row
-    /// 12b.2b for the atomic migration plan.
+    /// ACKs each with `Err(NotImplemented)` via `skeleton_dispatch` —
+    /// the sole surviving `NotImplemented` producer, since a skeleton
+    /// actor carries no state for the real handlers to operate on.
     ///
     /// Visibility matches [`Self::new`]: `pub(in crate::context)`.
     ///
-    /// `dead_code` allow: the first production caller is 12b.2b's
-    /// atomic messaging migration, which deletes the skeleton path
-    /// and routes every spawn through [`Self::new`] with real state.
-    /// Until then this constructor is test-only for the module's
-    /// existing unit tests.
+    /// `dead_code` allow: no production caller. Production spawns
+    /// state-owning actors via [`Self::new`]; this skeleton constructor
+    /// is exercised only by the module's existing unit tests, pending
+    /// removal of the skeleton apparatus in a follow-on chunk.
     #[allow(dead_code)]
     pub(in crate::context) fn new_skeleton(
         context_id: String,
@@ -280,9 +277,8 @@ impl ContextActor {
             governance_timeout: None,
             // `Instant::now()` initializes the coalescing window even
             // though the skeleton dispatch never reads it — avoids
-            // carrying a magic-value sentinel. When 12b.2b removes the
-            // skeleton path this field is populated identically via
-            // [`Self::new`].
+            // carrying a magic-value sentinel. State-owning actors
+            // populate this field identically via [`Self::new`].
             last_persisted_at: Instant::now(),
             dirty: false,
             shim_supervisor: None,
@@ -303,21 +299,19 @@ impl ContextActor {
     ///
     /// # State-owning vs. skeleton-mode actors
     ///
-    /// State-owning actors (constructed via [`Self::new`]) carry both
-    /// `state` and `deps`. The dispatch routes each command to the
-    /// matching handler module's transitional `dispatch_from_shim` entry
-    /// point — those still take `&Supervisor`, sourced from
-    /// `deps.supervisor.shim_supervisor()` at construction. Phase 2B-2I
-    /// migrates each handler to the
-    /// `(&mut PerContextState, &ActorDeps)` signature; when a domain
-    /// migrates, its arm in `dispatch_state` flips to call the
-    /// state-owning `dispatch` entry point.
+    /// State-owning actors (constructed via [`Self::new`] — the
+    /// production shape) carry both `state` and `deps`. The dispatch
+    /// routes each command through `dispatch_state` into the matching
+    /// handler module's actor-shape `dispatch` entry point, which
+    /// operates on the actor-owned state cell and the
+    /// capability-reduced deps.
     ///
-    /// Skeleton-mode actors (constructed via [`Self::new_skeleton`])
-    /// carry no state or deps — they fall through to the synchronous
-    /// `skeleton_dispatch` path that ACKs every command with
-    /// `NotImplemented`. This preserves the pre-Phase-2A test fixtures'
-    /// behaviour while the production path migrates.
+    /// Skeleton-mode actors (constructed via the test-only
+    /// [`Self::new_skeleton`]) carry no state or deps — they fall
+    /// through to the synchronous `skeleton_dispatch` path that ACKs
+    /// every command with `NotImplemented`. This preserves the
+    /// pre-Phase-2A test fixtures' behaviour; no production spawn uses
+    /// it.
     pub async fn run(mut self) {
         // Kick the persistence coalesce timer off the floor: the first
         // mutation will set `dirty = true`, then the `select!` arm
@@ -423,13 +417,10 @@ impl ContextActor {
         }
     }
 
-    /// Dispatch a single command to its matching handler. The
-    /// transitional implementation routes through
-    /// `handlers::X::dispatch_from_shim` for handlers that have not
-    /// yet migrated to the `(&mut PerContextState, &ActorDeps)`
-    /// signature; the few that have migrated
-    /// (`lifecycle_control`, `saga`) take the actor-owned state
-    /// directly.
+    /// Dispatch a single command to its matching handler: takes the
+    /// actor-owned state/deps and threads them through
+    /// `dispatch_state` into the per-domain actor-shape `dispatch`
+    /// entry points.
     ///
     /// Skeleton-mode actors (no state/deps) fall through to
     /// `skeleton_dispatch` and ACK every variant with
@@ -449,12 +440,10 @@ impl ContextActor {
         // missing field after that point is an internal invariant
         // violation and should fail loudly, not degrade to skeleton
         // dispatch. The `shim_supervisor` field is not consumed here —
-        // every handler reaches the supervisor through
-        // `deps.supervisor` (the capability-reduced
-        // [`SupervisorHandle`](crate::context::supervisor::SupervisorHandle))
-        // and individual handler bodies call `shim_supervisor()` on the
-        // handle when they need the legacy `Arc<Supervisor>` for
-        // unmigrated paths.
+        // its presence was checked above, and every handler reaches
+        // the supervisor through `deps.supervisor` (the
+        // capability-reduced
+        // [`SupervisorHandle`](crate::context::supervisor::SupervisorHandle)).
         let (mut cell, deps) = {
             #[allow(clippy::expect_used)]
             (
@@ -502,10 +491,9 @@ impl ContextActor {
         match cmd {
             ContextCommand::Messaging(sub) => {
                 // Phase 2A.7 — messaging domain migrated to the
-                // actor-shape handler. Supervisor dispatch still falls
-                // back to `dispatch_from_shim` when no per-context
-                // actor exists for the target context during the
-                // migration window. The send-sequence tracker
+                // actor-shape handler. `Supervisor::dispatch_command`
+                // is mailbox-only: a missing actor surfaces a typed
+                // lookup-miss error. The send-sequence tracker
                 // (`state.send_tracker`) is reserved internally inside
                 // the handler.
                 handlers::messaging::dispatch(cell, deps, sub).await
@@ -513,26 +501,24 @@ impl ContextActor {
             ContextCommand::Lifecycle(sub) => {
                 // Phase 2A.9 — lifecycle domain migrated to actor-shape
                 // for per-context commands (`JoinContext`,
-                // `LeaveContext`, `CloseContext`, `ExportContext`).
-                // Bootstrap commands (`CreateContext`, `RestoreContext`,
-                // `ImportContext`) and access-key commands stay on the
-                // shim path inside `handlers::lifecycle::dispatch`
-                // because they construct fresh state or live in
-                // queries_helpers. `_supervisor` is unused on this arm
-                // because the shim escape happens through the
-                // capability-reduced handle inside the dispatch body.
+                // `LeaveContext`, `CloseContext`, `ExportContext`) and
+                // access-key commands (actor-shape helpers in
+                // queries_helpers). Bootstrap commands (`CreateContext`,
+                // `RestoreContext`, `ImportContext`) construct fresh
+                // state and are handled supervisor-side by
+                // `Supervisor::dispatch_lifecycle_direct` before any
+                // actor exists; reaching this arm with one (an actor
+                // already registered — a re-create attempt) surfaces a
+                // typed `InvalidState` inside the handler.
                 Box::pin(handlers::lifecycle::dispatch(cell, deps, sub)).await
             }
             ContextCommand::Governance(sub) => {
-                // Phase 2A.8 — governance domain partially migrated to
-                // actor-shape. Migrated variants take the actor-shape
-                // path off `state` + `deps`; unmigrated variants fall
-                // through to the legacy lock-and-call path via
-                // `deps.supervisor.shim_supervisor()` inside the
-                // handler. `_supervisor` is unused on this arm because
-                // the escape happens through the capability-reduced
-                // handle. Removed in Phase 2A finalization with the
-                // rest of the supervisor shim.
+                // Phase 2A.8 — governance domain fully migrated to
+                // actor-shape: every variant reads/mutates
+                // `state.governance` through the actor-shape helpers.
+                // `Supervisor::dispatch_governance_command` is
+                // mailbox-only (typed `ContextNotRegistered` when no
+                // actor is registered).
                 Box::pin(handlers::governance::dispatch(cell, deps, sub)).await
             }
             ContextCommand::Broadcast(sub) => {
@@ -544,10 +530,10 @@ impl ContextActor {
             }
             ContextCommand::Economy(sub) => {
                 // Phase 2A.3 — economy domain migrated to the
-                // actor-shape handler. Supervisor dispatch still falls
-                // back to `dispatch_from_shim` for callers that do not
-                // have a target context actor during the migration
-                // window.
+                // actor-shape handler. Supervisor dispatch falls
+                // through to its supervisor-side
+                // `dispatch_economy_direct` when a receipt batch has
+                // no single owning context actor.
                 handlers::economy::dispatch(cell, deps, sub).await
             }
             ContextCommand::TrustRecovery(sub) => {
@@ -562,26 +548,26 @@ impl ContextActor {
             }
             ContextCommand::Standing(sub) => {
                 // Phase 2A.2 — standing domain migrated to the
-                // actor-shape handler. Supervisor dispatch still falls
-                // back to `dispatch_from_shim` when a standing command
-                // has no target context actor during the migration
-                // window.
+                // actor-shape handler. Supervisor-scoped variants (and
+                // commands with no registered target actor) route
+                // through the supervisor-side
+                // `dispatch_standing_direct` instead of this arm.
                 Box::pin(handlers::standing::dispatch(deps, sub)).await
             }
             ContextCommand::TtlClose(sub) => {
                 // Phase 2A.6 — TTL-close domain migrated to the
-                // actor-shape handler. Supervisor dispatch still falls
-                // back to `dispatch_from_shim` when no per-context
-                // actor exists for the target context during the
-                // migration window.
+                // actor-shape handler.
+                // `Supervisor::dispatch_ttl_close_command` is
+                // mailbox-only: a missing actor surfaces a typed
+                // lookup-miss error.
                 handlers::ttl_close::dispatch(cell, deps, sub).await
             }
             ContextCommand::Tools(sub) => {
                 // Phase 2A.4 -- tools domain migrated to the
                 // actor-shape handler for mailbox-routed hard-rate
-                // helpers. Supervisor dispatch still falls back to
-                // `dispatch_from_shim` for missing actors during the
-                // migration window.
+                // helpers. `Supervisor::dispatch_tools_command` is
+                // mailbox-first: a missing actor surfaces a typed
+                // error on the command's reply oneshot.
                 handlers::tools::dispatch(cell, deps, sub).await
             }
             // Phase 2A.10 — queries domain migrated to the actor-shape
@@ -621,11 +607,13 @@ impl ContextActor {
         }
     }
 
-    /// Drive the TTL-timer arm. Phase 2A leaves the body empty: the
-    /// legacy `ContextManager` continues to drive TTL expiry through
-    /// its own spawned timer until a future Phase 2 sub-chunk migrates
-    /// the timer onto the actor's owned state. The arm exists here so
-    /// future migration is purely additive.
+    /// Drive the TTL-timer arm. Phase 2A leaves the body empty: TTL
+    /// expiry is driven by the supervisor's timer `task_set`, which
+    /// spawns a per-context TTL timer that mailboxes
+    /// `TtlCloseCommand::FireTimer` to this actor — until a future
+    /// Phase 2 sub-chunk moves the timer onto the actor's own
+    /// `ttl_timer` arm. The arm exists here so that migration is purely
+    /// additive.
     ///
     /// `_state`/`_deps` allow: future migrations read them; for now the
     /// method is a no-op.
@@ -644,31 +632,34 @@ impl ContextActor {
         // actor's owned state in a follow-on Phase 2 sub-chunk.
     }
 
-    /// Persistence coalesce: write the current state's snapshot.
-    /// Phase 2A delegates to the supervisor's persistence backend if
-    /// the actor owns deps; skeleton-mode is a no-op.
+    /// Persistence coalesce arm. Phase 2A no-op: durable writes still
+    /// flow through the per-handler persistence helpers, so this arm
+    /// only clears the `dirty` flag (see body).
     #[allow(clippy::unused_async, clippy::needless_pass_by_ref_mut)]
     async fn persist_snapshot(&mut self) {
         // The state-owning persist path is wired in a follow-on Phase 2
         // sub-chunk together with the snapshot-shape contract on
         // `PerContextState`. For Phase 2A the run loop's coalesce arm
         // simply clears `dirty` so the loop does not spin; durable
-        // writes continue to flow through the legacy
-        // `ContextManager::persist_context_snapshot` path until the
-        // migration completes.
+        // writes flow through the per-handler persistence helpers
+        // (writing to the injected `ContextPersistence` provider
+        // synchronously within each handler) until the migration
+        // completes.
     }
 
-    /// Skeleton dispatch — matches every variant and ACKs via the
-    /// embedded `oneshot::Sender`. Commits 7-11 replace this with the
-    /// real four-arm `tokio::select!` dispatch described in plan
-    /// §"ContextActor".
+    /// Skeleton dispatch — the test-only path for state-less skeleton
+    /// actors. Matches every variant and ACKs via the embedded
+    /// `oneshot::Sender`. The real, state-owning actor does not use this:
+    /// its `run()` loop routes commands through `dispatch_state` to the
+    /// per-domain handlers described in plan §"ContextActor".
     ///
     /// The function body is a flat `match` on the outer
-    /// [`ContextCommand`] variants. Each arm routes to the matching
-    /// handler stub's dispatch path, which replies `NotImplemented` and
-    /// returns `Outcome::err`. Taking `Outcome` and ignoring it is fine
-    /// for the skeleton — the real actor (commits 7-11) uses the
-    /// `Outcome::mutated` flag to flip `self.dirty`.
+    /// [`ContextCommand`] variants. Each arm replies `NotImplemented` and
+    /// returns `Outcome::err`, since a skeleton actor carries no
+    /// `&mut PerContextState` for the real handlers to operate on.
+    /// Discarding the `Outcome` is fine for the skeleton — only the real
+    /// `dispatch_state` path reads the `Outcome::mutated` flag to flip
+    /// `self.dirty`.
     ///
     /// Lifecycle-control commands use a dedicated fast path that acks
     /// with `Ok(())` so the bridge's `BridgeInstanceCore::suspend()`
@@ -678,12 +669,13 @@ impl ContextActor {
     #[allow(clippy::needless_pass_by_value)] // consumed by the dispatch
     fn skeleton_dispatch(cmd: ContextCommand) {
         // Route every variant to its matching handler's oneshot-ack so
-        // callers learn the outcome even while the real state is owned
-        // by the legacy `ContextManager`. We MUST route the oneshot
-        // sender out of the variant — synchronously, in this function
-        // — because the real handler modules take a
+        // callers learn the outcome even though a skeleton actor owns no
+        // state (commands for such contexts are handled by the
+        // supervisor-side dispatch shim, not the actor). We MUST route
+        // the oneshot sender out of the variant — synchronously, in
+        // this function — because the real handler modules take a
         // `&mut PerContextState` which the skeleton actor does not
-        // carry yet. Reproducing the ack shape inline keeps the
+        // carry. Reproducing the ack shape inline keeps the
         // skeleton's mailbox contract (`send -> ack`) intact.
         fn ack_not_impl<T>(
             reply: tokio::sync::oneshot::Sender<Result<T, ContextError>>,
@@ -712,8 +704,8 @@ impl ContextActor {
             // immediately that the actor did not own the state to
             // answer. The real answer path lives on
             // `Supervisor::dispatch_query`, which bypasses this skeleton
-            // by talking to the legacy `ContextManager` under the query
-            // shim. The skeleton only sees query commands if a caller
+            // and resolves the query on the supervisor side under the
+            // query shim. The skeleton only sees query commands if a caller
             // mistakenly routes through the actor's mailbox — the real
             // FFI dispatch goes through `Supervisor::dispatch_query`.
             ContextCommand::Queries(q) => Self::skeleton_dispatch_queries(q),
@@ -759,9 +751,8 @@ impl ContextActor {
                 ack_ok(reply);
             }
             ContextCommand::LifecycleControl(LifecycleControlCommand::PersistSync { reply }) => {
-                // Ack Ok — nothing to persist through the actor path
-                // yet (the legacy `ContextManager` still owns mutating
-                // paths until commit 12). Semantically equivalent to
+                // Ack Ok — a skeleton actor owns no state, so there is
+                // nothing to persist. Semantically equivalent to
                 // "flush buffer is empty, nothing to write".
                 ack_ok(reply);
             }
@@ -808,7 +799,6 @@ impl ContextActor {
             ))));
         }
         match sub {
-            MessagingCommand::Placeholder { reply } => ack_not_impl(reply, "messaging"),
             MessagingCommand::SendMessage { reply, .. } => {
                 ack_not_impl(
                     reply,
@@ -980,7 +970,6 @@ impl ContextActor {
             ))));
         }
         match sub {
-            LifecycleCommand::Placeholder { reply } => ack_not_impl(reply, "lifecycle"),
             // `CreateContext` carries a `ContextCreationError` reply
             // (not `ContextError`); surface an equivalent
             // `CreationFailed` stub so the typed result's error
@@ -1080,7 +1069,6 @@ impl ContextActor {
             ))));
         }
         match sub {
-            GovernanceCommand::Placeholder { reply } => ack_not_impl(reply, "governance"),
             GovernanceCommand::ProposeGovernanceAction { reply, .. } => ack_not_impl(
                 reply,
                 "governance::propose_governance_action (use Supervisor::dispatch_governance_command during commits 10-11)",
@@ -1171,16 +1159,7 @@ impl ContextActor {
     /// [`crate::context::supervisor::supervisor::Supervisor::dispatch_economy_command`]
     /// (ADR-049 commit 10).
     fn skeleton_dispatch_economy(sub: EconomyCommand) {
-        fn ack_not_impl<T>(
-            reply: tokio::sync::oneshot::Sender<Result<T, ContextError>>,
-            which: &'static str,
-        ) {
-            let _ = reply.send(Err(ContextError::NotImplemented(format!(
-                "{which} — migrates in the matching handler commit of ADR-049"
-            ))));
-        }
         match sub {
-            EconomyCommand::Placeholder { reply } => ack_not_impl(reply, "economy"),
             // `VerifyPaymentReceipts` carries a `Vec<Result<..>>` reply
             // (not `Result<.., ContextError>`); synthesize an empty
             // reply so the mailbox contract is preserved even for the
@@ -1212,7 +1191,6 @@ impl ContextActor {
             ))));
         }
         match sub {
-            TrustRecoveryCommand::Placeholder { reply } => ack_not_impl(reply, "trust_recovery"),
             TrustRecoveryCommand::CreateGovernanceCheckpoint { reply, .. } => ack_not_impl(
                 reply,
                 "trust_recovery::create_governance_checkpoint (use Supervisor::dispatch_trust_recovery_command during commits 10-11)",
@@ -1254,7 +1232,6 @@ impl ContextActor {
             ))));
         }
         match sub {
-            TtlCloseCommand::Placeholder { reply } => ack_not_impl(reply, "ttl_close"),
             TtlCloseCommand::FireTimer { reply } => ack_not_impl(
                 reply,
                 "ttl_close::fire_timer (use Supervisor::dispatch_ttl_close_command)",
@@ -1299,7 +1276,6 @@ impl ContextActor {
             ))));
         }
         match sub {
-            StandingCommand::Placeholder { reply } => ack_not_impl(reply, "standing"),
             StandingCommand::StandingContext { reply, .. } => ack_not_impl(
                 reply,
                 "standing::standing_context (use Supervisor::dispatch_standing_command during commit 11)",
@@ -1339,7 +1315,6 @@ impl ContextActor {
             ))));
         }
         match sub {
-            ToolsCommand::Placeholder { reply } => ack_not_impl(reply, "tools"),
             ToolsCommand::TryConsumeHardRateLimit { reply, .. } => ack_not_impl(
                 reply,
                 "tools::try_consume_hard_rate_limit (use Supervisor::dispatch_tools_command during commit 11)",
@@ -1375,7 +1350,6 @@ impl ContextActor {
             ))));
         }
         match sub {
-            BroadcastCommand::Placeholder { reply } => ack_not_impl(reply, "broadcast"),
             BroadcastCommand::SubscribeBroadcast { reply, .. } => ack_not_impl(
                 reply,
                 "broadcast::subscribe_broadcast (use Supervisor::dispatch_broadcast_command during commit 11)",
@@ -1443,14 +1417,22 @@ mod tests {
     use tokio::sync::mpsc;
 
     #[tokio::test]
-    async fn actor_acks_placeholder_command_with_not_implemented() {
+    async fn skeleton_actor_acks_query_with_not_implemented() {
         let (tx, rx) = mpsc::channel::<ContextCommand>(1);
         let actor = ContextActor::new_skeleton("ctx-42".to_owned(), rx);
         let actor_handle = tokio::spawn(actor.run());
 
         let handle = ContextActorHandle::from_sender(tx);
+        // A skeleton actor owns no state, so every command — including a
+        // read-only query — acks `NotImplemented` through the synchronous
+        // skeleton-dispatch path.
         let err = handle
-            .send(|reply| ContextCommand::Messaging(MessagingCommand::Placeholder { reply }))
+            .send(|reply| {
+                ContextCommand::Queries(QueriesCommand::MemberCount {
+                    context_id: "ctx-42".to_owned(),
+                    reply,
+                })
+            })
             .await
             .unwrap_err();
         assert!(matches!(err, ContextError::NotImplemented(_)));
@@ -1487,7 +1469,12 @@ mod tests {
         handle.send_pause().await.unwrap();
         // Actor is still running; a subsequent command is processed.
         let err = handle
-            .send(|reply| ContextCommand::Messaging(MessagingCommand::Placeholder { reply }))
+            .send(|reply| {
+                ContextCommand::Queries(QueriesCommand::MemberCount {
+                    context_id: "ctx-1".to_owned(),
+                    reply,
+                })
+            })
             .await
             .unwrap_err();
         assert!(matches!(err, ContextError::NotImplemented(_)));
@@ -1591,10 +1578,10 @@ mod tests {
         }
     }
 
-    /// Assemble a supervisor-backed `ActorDeps` bundle for the
-    /// `actor_with_state_acks_placeholder_with_not_implemented` test.
-    /// Extracted so the test function stays below the `too_many_lines`
-    /// clippy threshold.
+    /// Assemble a supervisor-backed `ActorDeps` bundle shared by the
+    /// state-bearing actor tests (the four `direct_*` announcement tests
+    /// and `actor_with_state_answers_read_query`). Extracted so each test
+    /// function stays below the `too_many_lines` clippy threshold.
     async fn new_test_deps() -> deps::ActorDeps {
         use crate::context::supervisor::supervisor::Supervisor;
         use scp_identity::DID;
@@ -1870,10 +1857,10 @@ mod tests {
     }
 
     /// `ContextActor::new` constructs an actor that owns `PerContextState`
-    /// + `ActorDeps` directly (12b.2a infrastructure path). The dispatch
-    /// loop's behaviour is unchanged in 12b.2a (still ACKs
-    /// `NotImplemented`); this test just asserts the struct is
-    /// constructible and the run-loop processes commands.
+    /// + `ActorDeps` directly and routes commands through the state-owning
+    /// `dispatch_state` path. This test asserts the struct is constructible
+    /// and the run-loop processes commands by round-tripping a read-only
+    /// member-count query and observing a concrete answer.
     ///
     /// Integration-level coverage of the full
     /// `build_actor_deps_from_attached` path lives in
@@ -1882,7 +1869,7 @@ mod tests {
     /// `crates/scp-runtime/src/context/supervisor/supervisor.rs`; this
     /// unit test focuses on the actor struct's constructor + run-loop.
     #[tokio::test]
-    async fn actor_with_state_acks_placeholder_with_not_implemented() {
+    async fn actor_with_state_answers_read_query() {
         let deps = new_test_deps().await;
         let state = state::PerContextState::new_for_test_encrypted(
             [0x42u8; 32],
@@ -1895,15 +1882,28 @@ mod tests {
         let actor_task = tokio::spawn(actor.run());
 
         let handle = ContextActorHandle::from_sender(tx);
-        // Skeleton dispatch still fires in 12b.2a — actor owns state
-        // + deps, but the run loop has not yet been rewired to read
-        // them. Assert the `NotImplemented` ACK proves the loop picks
-        // up commands from the inbox.
-        let err = handle
-            .send(|reply| ContextCommand::Messaging(MessagingCommand::Placeholder { reply }))
+        // The state-owning actor answers a read-only query on owned state,
+        // proving the run loop picks commands up from the inbox and routes
+        // them through the actor-shape queries handler.
+        let count = handle
+            .send(|reply| {
+                ContextCommand::Queries(QueriesCommand::MemberCount {
+                    context_id: hex_encode_context_id(&[0x42u8; 32]),
+                    reply,
+                })
+            })
             .await
-            .unwrap_err();
-        assert!(matches!(err, ContextError::NotImplemented(_)));
+            .expect("member-count query round-trips through the state-owning actor");
+        // The test fixture (`new_for_test_encrypted`) seeds the admin DID into
+        // `governance`, not into `membership`, so the roster is empty and
+        // `MemberCount` (which reads `state.membership.count()`) answers the
+        // exact count 0 — not merely "some" count.
+        assert_eq!(
+            count,
+            Some(0),
+            "the owning actor answers MemberCount with the exact roster count \
+             (empty test fixture ⇒ 0)"
+        );
 
         handle.send_shutdown().await.unwrap();
         actor_task.await.unwrap();
