@@ -233,8 +233,9 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use scp_clock::SystemClock;
     use scp_identity::DidDht;
-    use scp_identity::cache::{DidCache, SystemClock};
+    use scp_identity::cache::DidCache;
     use scp_identity::dht_client::InMemoryDhtClient;
 
     use scp_platform::testing::{InMemoryKeyCustody, InMemoryPreRotationCustody};

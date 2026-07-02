@@ -65,7 +65,12 @@ scp-transport                ──→     (depends on SDK
 scp-platform                 ──→      crates; dependency
 scp-identity                          flows one way)
 scp-event-log
-scp-primitives
+scp-clock
+scp-crypto
+scp-did
+scp-mls
+scp-client
+scp-client-wasm
 scp-ffi (PyO3, UniFFI, napi)
 scp-mcp
 scp-media

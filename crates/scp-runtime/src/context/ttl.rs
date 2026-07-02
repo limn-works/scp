@@ -1297,7 +1297,7 @@ pub const fn expiry_notification() -> ContextEvent {
 )]
 mod tests {
     use super::*;
-    use scp_identity::cache::TestClock;
+    use scp_clock::TestClock;
     use scp_protocol::context::params::ContextParams;
     use scp_protocol::context::roles::{Capability, CapabilityCeiling, ContextRoleState};
     use std::time::Duration;

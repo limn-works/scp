@@ -230,9 +230,8 @@ async fn run_migrate_publish<C>(
 where
     C: KeyCustody + Send + Sync + 'static,
 {
-    let sign_fn = DidDht::<InMemoryDhtClient, scp_identity::cache::SystemClock>::make_sign_fn(
-        Arc::clone(key_custody),
-    );
+    let sign_fn =
+        DidDht::<InMemoryDhtClient, scp_clock::SystemClock>::make_sign_fn(Arc::clone(key_custody));
     let publish_client = rotation_publish_client(bi);
     let did_method =
         DidDht::with_client_and_signer(publish_client, Arc::new(DidCache::new()), sign_fn);
@@ -1490,7 +1489,7 @@ impl crate::scp::PyScp {
         let result: Result<PyIdentity, ScpPyError> = py.allow_threads(|| {
             crate::runtime::with_identity_mut(&bi_arc, &did, |entry| {
                 let sign_fn =
-                    DidDht::<InMemoryDhtClient, scp_identity::cache::SystemClock>::make_sign_fn(
+                    DidDht::<InMemoryDhtClient, scp_clock::SystemClock>::make_sign_fn(
                         Arc::clone(&entry.custody),
                     );
                 // Publish the rotated document into the SHARED resolver DHT
@@ -1585,7 +1584,7 @@ impl crate::scp::PyScp {
         let result: Result<PyIdentity, ScpPyError> = py.allow_threads(|| {
             crate::runtime::with_identity_mut(&bi_arc, &did, |entry| {
                 let sign_fn =
-                    DidDht::<InMemoryDhtClient, scp_identity::cache::SystemClock>::make_sign_fn(
+                    DidDht::<InMemoryDhtClient, scp_clock::SystemClock>::make_sign_fn(
                         Arc::clone(&entry.custody),
                     );
                 // Publish the agent-key-bearing document into the SHARED
@@ -1677,7 +1676,7 @@ impl crate::scp::PyScp {
         let result: Result<PyIdentity, ScpPyError> = py.allow_threads(|| {
             crate::runtime::with_identity_mut(&bi_arc, &did, |entry| {
                 let sign_fn =
-                    DidDht::<InMemoryDhtClient, scp_identity::cache::SystemClock>::make_sign_fn(
+                    DidDht::<InMemoryDhtClient, scp_clock::SystemClock>::make_sign_fn(
                         Arc::clone(&entry.custody),
                     );
                 // Publish the rotated-agent-key document into the SHARED
@@ -1768,7 +1767,7 @@ impl crate::scp::PyScp {
         let result: Result<PyIdentity, ScpPyError> = py.allow_threads(|| {
             crate::runtime::with_identity_mut(&bi_arc, &did, |entry| {
                 let sign_fn =
-                    DidDht::<InMemoryDhtClient, scp_identity::cache::SystemClock>::make_sign_fn(
+                    DidDht::<InMemoryDhtClient, scp_clock::SystemClock>::make_sign_fn(
                         Arc::clone(&entry.custody),
                     );
                 // Publish the agent-key-removed document into the SHARED

@@ -77,10 +77,7 @@ struct CacheEntry {
     active: bool,
 }
 
-// Re-export the canonical Clock types from scp-primitives so that existing
-// `use scp_identity::cache::{Clock, SystemClock, TestClock}` imports continue
-// to compile (soft migration).
-pub use scp_clock::{Clock, SystemClock, TestClock};
+use scp_clock::{Clock, SystemClock};
 
 /// TTL-based cache for resolved DID documents.
 ///
@@ -283,6 +280,8 @@ impl<C: Clock> DidCache<C> {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use std::sync::Arc;
+
+    use scp_clock::TestClock;
 
     use super::*;
 

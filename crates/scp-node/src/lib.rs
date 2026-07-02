@@ -1516,9 +1516,9 @@ impl ApplicationNode<scp_platform::testing::InMemoryStorage> {
     /// Returns [`NodeError`] if relay binding, identity generation, or TLS
     /// provisioning fails.
     pub async fn dev(port: u16) -> Result<Self, NodeError> {
+        use scp_clock::SystemClock;
         use scp_identity::DidCache;
         use scp_identity::InMemoryDhtClient;
-        use scp_identity::cache::SystemClock;
         use scp_identity::dht::DidDht;
         use scp_platform::testing::{InMemoryKeyCustody, InMemoryStorage};
 
@@ -3549,8 +3549,8 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    use scp_clock::SystemClock;
     use scp_identity::DidCache;
-    use scp_identity::cache::SystemClock;
     use scp_identity::dht::DidDht;
     use scp_identity::dht_client::InMemoryDhtClient;
     use scp_platform::testing::{InMemoryKeyCustody, InMemoryStorage};

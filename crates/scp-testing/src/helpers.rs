@@ -19,9 +19,9 @@
 
 use std::sync::Arc;
 
+use scp_clock::SystemClock;
 use scp_did::DidDocument;
 use scp_identity::ScpIdentity;
-use scp_identity::cache::SystemClock;
 use scp_identity::dht::DidDht;
 use scp_identity::dht_client::InMemoryDhtClient;
 use scp_node::tls;

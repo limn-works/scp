@@ -107,7 +107,7 @@ pub fn py_trust_verify_attestation(py: Python<'_>, attestation_json: &str) -> Py
         })?;
 
     let resolver = scp_core::trust::IdentityDidPublicKeyResolver;
-    let clock = scp_identity::cache::SystemClock;
+    let clock = scp_clock::SystemClock;
 
     let dict = PyDict::new(py);
     match scp_core::trust::verify_attestation(&attestation, &resolver, &clock) {
@@ -216,7 +216,7 @@ pub fn py_trust_verify_response(challenge_json: &str, response_json: &str) -> Py
         })?;
 
     let resolver = scp_core::trust::IdentityDidPublicKeyResolver;
-    let clock = scp_identity::cache::SystemClock;
+    let clock = scp_clock::SystemClock;
 
     struct EphemeralVerifierSigner(ed25519_dalek::SigningKey);
     impl scp_core::trust::ChallengeSigner for EphemeralVerifierSigner {

@@ -27,7 +27,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ed25519_dalek::{Signer, SigningKey};
 use libfuzzer_sys::fuzz_target;
 use scp_fuzz::FixedClock;
-use scp_primitives::Clock;
+use scp_clock::Clock;
 use scp_protocol::crypto::ucan::capability::CapabilityUri;
 use scp_protocol::crypto::ucan::revoke::compute_revocation_cid;
 use scp_protocol::crypto::ucan::validate::{
@@ -97,7 +97,7 @@ fn build_signed_token(
 
     // Pin `now_secs` to real wall time so the nonce freshness check passes.
     // (InMemoryNonceTracker uses SystemClock internally.)
-    let now_secs = scp_primitives::SystemClock.now_secs();
+    let now_secs = scp_clock::SystemClock.now_secs();
 
     let exp = if expired {
         // Must satisfy `exp + DEFAULT_CLOCK_SKEW_TOLERANCE_SECS <= now_secs`
@@ -116,7 +116,7 @@ fn build_signed_token(
     // the freshness window in `check_replay` is satisfied.
     let nonce = format!(
         "{}-deadbeefcafe1234deadbeefcafe1234",
-        scp_primitives::SystemClock.now_millis()
+        scp_clock::SystemClock.now_millis()
     );
 
     let payload = UcanPayload {
@@ -163,7 +163,7 @@ fuzz_target!(|input: FuzzValidationInput| {
 
     // Clock used by the ValidationContext. Pinned to real wall time so that
     // the expiry check (`exp + tolerance <= now`) sees a stable `now`.
-    let now_secs = scp_primitives::SystemClock.now_secs();
+    let now_secs = scp_clock::SystemClock.now_secs();
     let clock = FixedClock(now_secs);
 
     let token = build_signed_token(&signing_key, input.expired, lifetime_secs);

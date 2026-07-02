@@ -284,7 +284,7 @@ async fn snapshot_verifying_key_hex<C: KeyCustody>(custody: &C, key: &KeyHandle)
 #[allow(clippy::type_complexity)]
 fn make_dht_with_signer<C: KeyCustody + Send + Sync + 'static>(
     custody: &Arc<C>,
-) -> Result<DidDht<FfiDhtClient, scp_identity::cache::SystemClock>, IdentityError> {
+) -> Result<DidDht<FfiDhtClient, scp_clock::SystemClock>, IdentityError> {
     let custody_clone = Arc::clone(custody);
     let sign_fn: Arc<
         dyn Fn(
@@ -6231,7 +6231,7 @@ pub fn trust_verify_attestation(
         })?;
 
     let resolver = scp_core::trust::IdentityDidPublicKeyResolver;
-    let clock = scp_identity::cache::SystemClock;
+    let clock = scp_clock::SystemClock;
 
     match scp_core::trust::verify_attestation(&attestation, &resolver, &clock) {
         Ok(()) => Ok(AttestationVerificationResult {
@@ -6317,7 +6317,7 @@ pub fn trust_verify_response(
         })?;
 
     let resolver = scp_core::trust::IdentityDidPublicKeyResolver;
-    let clock = scp_identity::cache::SystemClock;
+    let clock = scp_clock::SystemClock;
 
     struct EphemeralVerifySigner(ed25519_dalek::SigningKey);
     impl scp_core::trust::ChallengeSigner for EphemeralVerifySigner {
@@ -15186,7 +15186,7 @@ impl Scp {
             })?;
 
         let resolver = scp_core::trust::IdentityDidPublicKeyResolver;
-        let clock = scp_identity::cache::SystemClock;
+        let clock = scp_clock::SystemClock;
 
         struct EphemeralVerifySigner(ed25519_dalek::SigningKey);
         impl scp_core::trust::ChallengeSigner for EphemeralVerifySigner {
@@ -18678,7 +18678,7 @@ mod tests {
 
         // Create a DidDht with a signer so we can publish the DID document.
         let sign_fn =
-            scp_identity::DidDht::<InMemoryDhtClient, scp_identity::cache::SystemClock>::make_sign_fn(
+            scp_identity::DidDht::<InMemoryDhtClient, scp_clock::SystemClock>::make_sign_fn(
                 Arc::clone(&custody),
             );
         let dht = scp_identity::DidDht::with_client_and_signer(

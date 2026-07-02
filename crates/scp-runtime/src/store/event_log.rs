@@ -889,7 +889,7 @@ mod tests {
     ) -> scp_event_log::Event {
         scp_event_log::Event {
             event_type,
-            actor_did: scp_event_log::DID(actor.to_owned()),
+            actor_did: scp_did::DID(actor.to_owned()),
             timestamp: 1_700_000_000 + seq,
             sequence: seq,
             payload: scp_event_log::EventPayload {
@@ -1223,7 +1223,7 @@ mod tests {
         let store = make_store();
         let entry = scp_event_log::Event {
             event_type: scp_event_log::EventType::ContextCreated,
-            actor_did: scp_event_log::DID(String::new()),
+            actor_did: scp_did::DID(String::new()),
             timestamp: 1_700_000_000,
             sequence: 0,
             payload: scp_event_log::EventPayload::default(),
@@ -1255,7 +1255,7 @@ mod tests {
         let entries = vec![
             scp_event_log::Event {
                 event_type: scp_event_log::EventType::ContextCreated,
-                actor_did: scp_event_log::DID(String::new()),
+                actor_did: scp_did::DID(String::new()),
                 timestamp: 1_700_000_000,
                 sequence: 0,
                 payload: scp_event_log::EventPayload::default(),
@@ -1264,7 +1264,7 @@ mod tests {
             },
             scp_event_log::Event {
                 event_type: scp_event_log::EventType::MemberJoined,
-                actor_did: scp_event_log::DID(String::new()),
+                actor_did: scp_did::DID(String::new()),
                 timestamp: 1_700_000_001,
                 sequence: 0,
                 payload: scp_event_log::EventPayload::default(),
@@ -1307,7 +1307,7 @@ mod tests {
         let store = make_store();
         let entries = vec![scp_event_log::Event {
             event_type: scp_event_log::EventType::ContextCreated,
-            actor_did: scp_event_log::DID(String::new()),
+            actor_did: scp_did::DID(String::new()),
             timestamp: 1_700_000_000,
             sequence: 0,
             payload: scp_event_log::EventPayload::default(),
@@ -1352,7 +1352,7 @@ mod tests {
         for i in 0..5u8 {
             let entry = scp_event_log::Event {
                 event_type: scp_event_log::EventType::MessageSent,
-                actor_did: scp_event_log::DID(String::new()),
+                actor_did: scp_did::DID(String::new()),
                 timestamp: u64::from(i),
                 sequence: u64::from(i),
                 payload: scp_event_log::EventPayload::default(),
@@ -1369,7 +1369,7 @@ mod tests {
         let pruned = vec![
             scp_event_log::Event {
                 event_type: scp_event_log::EventType::MessageSent,
-                actor_did: scp_event_log::DID(String::new()),
+                actor_did: scp_did::DID(String::new()),
                 timestamp: 3,
                 sequence: 0,
                 payload: scp_event_log::EventPayload::default(),
@@ -1378,7 +1378,7 @@ mod tests {
             },
             scp_event_log::Event {
                 event_type: scp_event_log::EventType::MessageSent,
-                actor_did: scp_event_log::DID(String::new()),
+                actor_did: scp_did::DID(String::new()),
                 timestamp: 4,
                 sequence: 1,
                 payload: scp_event_log::EventPayload::default(),

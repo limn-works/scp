@@ -75,10 +75,10 @@ use scp_ffi_common::bridge_instance::BridgeInstanceCore;
 // `pyscp_check_handle!` macro can refer to it as
 // `$crate::runtime::CoreFields`.
 use scp_clock::Clock;
+use scp_clock::SystemClock;
 use scp_did::DidDocument;
 pub use scp_ffi_common::bridge_instance::CoreFields;
 use scp_identity::ScpIdentity;
-use scp_identity::cache::SystemClock;
 use scp_platform::PlatformError;
 use scp_platform::encrypting_adapter::EncryptingAdapter;
 use scp_platform::sqlite::SqliteStorage;

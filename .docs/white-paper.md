@@ -717,7 +717,7 @@ The reference implementation is in Rust, organized as a cargo workspace:
 - **scp-ffi:** FFI bridge layer — PyO3 (Python), UniFFI (Swift, Kotlin), napi-rs (TypeScript).
 - **scp-node:** Full protocol node combining core, transport, and platform.
 
-The workspace includes six additional crates: scp-event-log (Merkle log), scp-media (media key derivation), scp-relay (standalone relay binary), scp-testing (conformance macros), scp-primitives (shared types), and scp-mcp (MCP integration).
+The workspace includes eleven additional crates: scp-event-log (Merkle log), scp-media (media key derivation), scp-relay (standalone relay binary), scp-testing (conformance macros), scp-mcp (MCP integration), scp-clock (wall-clock port), scp-crypto (Ed25519 verification), scp-did (DID data model), scp-mls (synchronous MLS state machine), scp-client (in-browser participant driver), and scp-client-wasm (wasm-bindgen browser surface).
 
 Language bindings: Python (PyO3), Swift (UniFFI), Kotlin (UniFFI), TypeScript (napi-rs).
 

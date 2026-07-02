@@ -13,7 +13,7 @@
 
 use arbitrary::Arbitrary;
 use scp_event_log::proof::{Direction, InclusionProof, ProofStep};
-use scp_primitives::Clock;
+use scp_clock::Clock;
 use scp_protocol::envelope::MessageType;
 
 // ---------------------------------------------------------------------------

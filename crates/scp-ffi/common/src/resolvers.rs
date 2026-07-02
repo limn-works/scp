@@ -861,7 +861,7 @@ impl scp_core::crypto::ucan::revoke::RevocationEventLogger for BridgeRevocationE
 
         let event = scp_event_log::Event {
             event_type: scp_event_log::EventType::TokenRevoked,
-            actor_did: scp_event_log::DID(revoker_did.to_owned()),
+            actor_did: scp_did::DID(revoker_did.to_owned()),
             timestamp,
             sequence,
             payload: scp_event_log::EventPayload { data: payload_data },

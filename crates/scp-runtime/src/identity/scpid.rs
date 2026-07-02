@@ -15,8 +15,7 @@ use rand::RngCore;
 use subtle::ConstantTimeEq;
 
 use scp_crypto::verify_ed25519_signature;
-use scp_did::SigningKeyId;
-use scp_did::decode_multibase_key;
+use scp_did::{SigningKeyId, decode_multibase_key};
 use scp_identity::resolver::DidResolver;
 use scp_platform::traits::{KeyCustody, KeyHandle};
 use scp_protocol::crypto::canonical::{CanonicalField, canonical_hash};

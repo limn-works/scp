@@ -273,7 +273,7 @@ pub fn populate_and_aggregate<S: TrustProtocolRepository>(
 ) -> Result<String, TrustError> {
     let cache = scp_core::trust::aggregate::AttestationCache::new(store);
     let resolver = scp_core::trust::IdentityDidPublicKeyResolver;
-    let clock = scp_identity::cache::SystemClock;
+    let clock = scp_clock::SystemClock;
 
     // Verify-on-ingest for caller-supplied attestations (see helper for the
     // SECURITY rationale).
@@ -592,13 +592,13 @@ mod tests {
     /// consequence rules — verifying the aggregated `TrustInput` output.
     #[test]
     fn aggregate_pipeline_with_populated_store() {
+        use scp_clock::TestClock;
         use scp_core::context::roles::Capability;
         use scp_core::trust::ConsequenceRule;
         use scp_core::trust::aggregate::{AggregationContext, AttestationCache};
         use scp_core::trust::consequence::{
             ConsequenceAction, ConsequenceTrigger, EnforcementSeverity,
         };
-        use scp_identity::cache::TestClock;
 
         let context_id = "ctx-integration";
         let subject_did = "did:key:alice";

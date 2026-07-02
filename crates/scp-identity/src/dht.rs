@@ -31,9 +31,10 @@ use sha2::{Digest, Sha256};
 
 use scp_platform::traits::{KeyCustody, KeyType, PreRotationCustody, PreRotationKeyHandle};
 
-use super::cache::{Clock, DidCache, DidResolutionResult, Staleness, SystemClock};
+use super::cache::{DidCache, DidResolutionResult, Staleness};
 use super::dht_client::{DhtClient, InMemoryDhtClient};
 use super::{DidMethod, IdentityError, ScpIdentity};
+use scp_clock::{Clock, SystemClock};
 use scp_did::{
     DidDocument, DidRotationEvent, MigrationProof, PreRotationProof, decode_multibase_key,
 };
@@ -2765,8 +2766,8 @@ mod tests {
     use scp_platform::testing::InMemoryKeyCustody;
 
     use super::*;
-    use crate::cache::TestClock;
     use crate::dht_client::InMemoryDhtClient;
+    use scp_clock::TestClock;
 
     /// Helper to create a fully-configured `DidDht` for testing.
     fn make_dht_with_custody(

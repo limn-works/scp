@@ -6,10 +6,9 @@
 //! an MLS `BasicCredential` identity payload. See ADR-001 and spec section
 //! 9.7.1 for the credential design, and ADR-039 for the signing key model.
 
-// DID-document types come from `scp-protocol` directly (Slice 1a moved them
-// there for wasm32-safety), NOT from the tokio-coupled `scp-identity` — keeping
-// `scp-mls` inside the ADR-057 mechanical fence. `SigningKeyId` is hosted in
-// `scp-primitives`.
+// The DID data model — DID-document types and `SigningKeyId` — comes from the
+// wasm-safe `scp-did` crate, NOT from the tokio-coupled `scp-identity`, keeping
+// `scp-mls` inside the ADR-057 mechanical fence.
 use scp_did::SigningKeyId;
 use scp_did::{DidDocument, decode_multibase_key};
 use serde::{Deserialize, Serialize};

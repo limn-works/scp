@@ -24,8 +24,7 @@ use scp_core::discovery::{
     ScopeDeregisterParams, ScopeLookupParams, ScopeRegisterParams, ScopeRegisterStatus,
     ScopeRegistry, ScopeTarget, validate_scope_name,
 };
-use scp_did::DID;
-use scp_did::DidDocument;
+use scp_did::{DID, DidDocument};
 use scp_identity::{DidDht, DidMethod};
 use scp_platform::testing::InMemoryKeyCustody;
 

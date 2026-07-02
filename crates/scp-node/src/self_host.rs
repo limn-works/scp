@@ -34,7 +34,7 @@ use std::time::Duration;
 
 use zeroize::Zeroizing;
 
-use scp_identity::cache::SystemClock;
+use scp_clock::SystemClock;
 use scp_identity::dht::SequenceStore;
 use scp_identity::{DidCache, DidDht, IdentityError, InMemoryDhtClient, PkarrDhtClient};
 use scp_platform::KeyCustody;

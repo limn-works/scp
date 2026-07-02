@@ -16,8 +16,7 @@
 use scp_core::crypto::key_continuity::{
     KeyContinuityParty, compute_key_continuity_fingerprint, fingerprint_to_decimal,
 };
-use scp_did::DidDocument;
-use scp_did::SigningKeyId;
+use scp_did::{DidDocument, SigningKeyId};
 use scp_identity::{DidDht, DidMethod, ScpIdentity};
 use scp_platform::testing::InMemoryKeyCustody;
 use scp_platform::traits::{KeyCustody, KeyType};

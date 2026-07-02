@@ -166,7 +166,7 @@ pub(crate) fn trust_verify_attestation_on(
         .map_err(|e| validation_error(&format!("failed to parse attestation JSON: {e}")))?;
 
     let resolver = scp_core::trust::IdentityDidPublicKeyResolver;
-    let clock = scp_identity::cache::SystemClock;
+    let clock = scp_clock::SystemClock;
 
     match scp_core::trust::verify_attestation(&attestation, &resolver, &clock) {
         Ok(()) => Ok(NapiAttestationVerificationResult {
@@ -242,7 +242,7 @@ pub(crate) fn trust_verify_response_on(
         .map_err(|e| validation_error(&format!("failed to parse response JSON: {e}")))?;
 
     let resolver = scp_core::trust::IdentityDidPublicKeyResolver;
-    let clock = scp_identity::cache::SystemClock;
+    let clock = scp_clock::SystemClock;
 
     struct EphemeralSigner(ed25519_dalek::SigningKey);
     impl scp_core::trust::ChallengeSigner for EphemeralSigner {

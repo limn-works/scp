@@ -18,8 +18,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use scp_did::DID;
-use scp_did::SigningKeyId;
+use scp_did::{DID, SigningKeyId};
 use scp_protocol::context::ContextError;
 use scp_protocol::context::governance::KeyResolver;
 use scp_protocol::crypto::ucan::UcanError;

@@ -1510,7 +1510,7 @@ mod tests {
 
         let entry0 = scp_event_log::Event {
             event_type: scp_event_log::EventType::ContextCreated,
-            actor_did: scp_event_log::DID(String::new()),
+            actor_did: scp_did::DID(String::new()),
             timestamp: 1_700_000_000,
             sequence: 0,
             payload: scp_event_log::EventPayload::default(),
@@ -1519,7 +1519,7 @@ mod tests {
         };
         let entry1 = scp_event_log::Event {
             event_type: scp_event_log::EventType::MemberJoined,
-            actor_did: scp_event_log::DID(String::new()),
+            actor_did: scp_did::DID(String::new()),
             timestamp: 1_700_000_001,
             sequence: 1,
             payload: scp_event_log::EventPayload::default(),
@@ -1553,7 +1553,7 @@ mod tests {
         let entries = vec![
             scp_event_log::Event {
                 event_type: scp_event_log::EventType::ContextCreated,
-                actor_did: scp_event_log::DID(String::new()),
+                actor_did: scp_did::DID(String::new()),
                 timestamp: 1_700_000_000,
                 sequence: 0,
                 payload: scp_event_log::EventPayload::default(),
@@ -1562,7 +1562,7 @@ mod tests {
             },
             scp_event_log::Event {
                 event_type: scp_event_log::EventType::MemberJoined,
-                actor_did: scp_event_log::DID(String::new()),
+                actor_did: scp_did::DID(String::new()),
                 timestamp: 1_700_000_001,
                 sequence: 1,
                 payload: scp_event_log::EventPayload::default(),

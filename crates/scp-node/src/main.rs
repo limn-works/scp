@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use zeroize::Zeroizing;
 
-use scp_identity::cache::SystemClock;
+use scp_clock::SystemClock;
 use scp_identity::dht::SequenceStore;
 use scp_identity::{DidCache, DidDht, InMemoryDhtClient, InMemorySequenceStore};
 use scp_node::{DhtMode, IdentitySource, Node, NodeConfig, Reach, TlsMode};

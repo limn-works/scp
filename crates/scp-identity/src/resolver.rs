@@ -34,11 +34,12 @@ use std::time::Duration;
 use tracing::{debug, info, warn};
 
 use crate::IdentityError;
-use crate::cache::{Clock, DidCache, SystemClock};
+use crate::cache::DidCache;
 use crate::dht::{extract_public_key, verify_bep44_signature, verify_self_certification};
 use crate::dht_client::{DhtClient, DhtRecord};
 use crate::republish::RelayPublisher;
 use crate::resolution::did_routing_id;
+use scp_clock::{Clock, SystemClock};
 use scp_did::{DidDocument, decode_multibase_key};
 
 // ---------------------------------------------------------------------------
@@ -869,12 +870,12 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use super::*;
-    use crate::cache::{DidCache, TestClock};
+    use crate::cache::DidCache;
     use crate::dht::bep44_signable;
     use crate::dht_client::{DhtRecord, InMemoryDhtClient};
     use crate::resolution::did_routing_id;
-    use scp_did::DidDocument;
-    use scp_did::SigningKeyId;
+    use scp_clock::TestClock;
+    use scp_did::{DidDocument, SigningKeyId};
 
     // -----------------------------------------------------------------------
     // Test helpers

@@ -629,7 +629,7 @@ pub struct IdentityDidPublicKeyResolver;
 
 impl DidPublicKeyResolver for IdentityDidPublicKeyResolver {
     fn resolve_public_key(&self, did: &str) -> Result<Vec<u8>, TrustError> {
-        // Delegates to the canonical implementation in scp-primitives which
+        // Delegates to the canonical implementation in scp-did which
         // supports did:dht:z (production) and did:key:{hex} (testing only,
         // gated behind #[cfg(test)] / feature = "testing"). See issue #128.
         let key = scp_did::extract_public_key_from_did(did).map_err(|e| {

@@ -22,8 +22,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use scp_did::DID;
-use scp_did::SigningKeyId;
+use scp_did::{DID, SigningKeyId};
 use scp_platform::testing::InMemoryKeyCustody;
 use scp_platform::traits::{KeyCustody, KeyType};
 use scp_protocol::context::ContextError;

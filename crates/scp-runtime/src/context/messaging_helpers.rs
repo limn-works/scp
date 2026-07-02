@@ -55,8 +55,7 @@ use sha2::Digest;
 use subtle::ConstantTimeEq;
 
 use scp_clock::Clock;
-use scp_did::DID;
-use scp_did::SigningKeyId;
+use scp_did::{DID, SigningKeyId};
 use scp_protocol::context::ContextError;
 use scp_protocol::context::governance::KeyResolver;
 use scp_protocol::context::membership::ContextEvent;

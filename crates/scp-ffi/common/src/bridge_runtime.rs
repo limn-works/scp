@@ -441,8 +441,7 @@ pub struct UcanContextStateCore {
     /// UCAN revocation list for this context.
     pub revocation_list: scp_core::crypto::ucan::revoke::RevocationList,
     /// UCAN nonce tracker for replay prevention (ADR-016 step 9).
-    pub nonce_tracker:
-        scp_core::crypto::ucan::nonce::NonceTracker<scp_identity::cache::SystemClock>,
+    pub nonce_tracker: scp_core::crypto::ucan::nonce::NonceTracker<scp_clock::SystemClock>,
     /// Capability ceiling as a set of `{resource}:{action}` strings for
     /// UCAN validation (ADR-016 step 8).
     pub ceiling_strings: std::collections::HashSet<String>,

@@ -279,7 +279,7 @@ fn conf_004_agent_binding_attestation() {
         signature: signature.to_bytes().to_vec(),
     };
     let resolver = scp_core::trust::IdentityDidPublicKeyResolver;
-    let clock = scp_identity::cache::TestClock::new(1_700_000_000);
+    let clock = scp_clock::TestClock::new(1_700_000_000);
     scp_core::trust::verify_attestation(&attestation, &resolver, &clock)
         .expect("cross-verification: manual bytes must match canonical_attestation_bytes()");
 

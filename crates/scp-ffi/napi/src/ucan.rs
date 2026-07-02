@@ -915,7 +915,7 @@ mod tests {
 
     #[test]
     fn bridge_nonce_tracker_delegates_to_inner() {
-        use scp_identity::cache::SystemClock;
+        use scp_clock::SystemClock;
 
         let mut tracker =
             scp_core::crypto::ucan::nonce::NonceTracker::new("ctx-test".to_owned(), SystemClock);

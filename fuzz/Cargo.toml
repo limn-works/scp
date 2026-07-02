@@ -29,7 +29,9 @@ scp-protocol = { path = "../crates/scp-protocol", features = ["testing"] }
 scp-transport = { path = "../crates/scp-transport" }
 scp-runtime = { path = "../crates/scp-runtime", features = ["testing"] }
 scp-event-log = { path = "../crates/scp-event-log" }
-scp-primitives = { path = "../crates/scp-primitives" }
+scp-clock = { path = "../crates/scp-clock" }
+scp-did = { path = "../crates/scp-did" }
+scp-mls = { path = "../crates/scp-mls" }
 
 # Tier 1 — Wire Format Parsers
 [[bin]]

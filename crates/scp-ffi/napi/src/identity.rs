@@ -221,7 +221,7 @@ impl fmt::Debug for OpaqueInMemoryKeyCustody {
 #[allow(clippy::type_complexity)]
 fn make_dht_with_signer(
     custody: &Arc<crate::custody::NapiKeyCustody>,
-) -> DidDht<InMemoryDhtClient, scp_identity::cache::SystemClock> {
+) -> DidDht<InMemoryDhtClient, scp_clock::SystemClock> {
     use scp_platform::traits::KeyCustody as _;
     let custody_clone = Arc::clone(custody);
     let sign_fn: Arc<

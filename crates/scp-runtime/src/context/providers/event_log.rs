@@ -45,7 +45,8 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use scp_event_log::{DID, Event, EventLog, EventPayload, EventType};
+use scp_did::DID;
+use scp_event_log::{Event, EventLog, EventPayload, EventType};
 
 use crate::context::builder::ContextEventLogProvider;
 use scp_protocol::context::builder::ContextCreationError;
