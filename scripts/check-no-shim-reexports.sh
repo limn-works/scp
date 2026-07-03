@@ -82,12 +82,9 @@ for mod in "${crates[@]}"; do
         # whitespace. One bounded comment filter — not an expanding denylist of
         # laundering spellings.
         #
-        # The `*/` guard closes a block-comment evasion: a line such as
-        # `// */ pub use scp_did::DID as X;` opens with `//` yet the ` */`
-        # terminates a block comment begun on a PREVIOUS line, leaving the
-        # `pub use` as LIVE code. So a `//`-prefixed line is only skipped when it
-        # does NOT contain `*/`. This is the single bounded exception — not the
-        # start of open-ended block-comment parsing.
+        # The `*/` guard keeps that `//`-skip sound: a `//`-prefixed line can only
+        # be live code if a block comment closes (`*/`) on it, so skip it only when
+        # it has no `*/`. All other deliberate laundering remains audit-policed.
         content="${line#*:}"
         content="${content#*:}"
         trimmed="${content#"${content%%[![:space:]]*}"}"

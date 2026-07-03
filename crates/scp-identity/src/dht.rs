@@ -3337,6 +3337,67 @@ mod tests {
         }
     }
 
+    /// Cross-parser agreement: the native DID-method parser
+    /// (`DidDht::extract_public_key`) and the wasm-safe data-model parser
+    /// (`scp_did::extract_public_key_from_did`) — the one the browser/event-log
+    /// signature-verify path reaches — MUST agree on canonicality. This test
+    /// feeds the *same* non-canonical `did:dht:z…` fixture to both and asserts
+    /// both reject it (and both accept the canonical spelling), pinning the
+    /// security-parity invariant from ADR-057's T1c passage: the browser path
+    /// must never verify against a key native would reject as non-canonical.
+    #[test]
+    fn native_and_scp_did_parsers_agree_on_canonicality() {
+        const ALPHABET: &[u8; 32] = b"ybndrfg8ejkmcpqxot1uwisza345h769";
+
+        let key = [42u8; 32];
+        let canonical_encoded = zbase32::encode(&key);
+        let canonical_did = format!("did:dht:z{canonical_encoded}");
+
+        // Both parsers accept the canonical spelling and yield the same key.
+        assert_eq!(
+            DidDht::<InMemoryDhtClient>::extract_public_key(&canonical_did).unwrap(),
+            key
+        );
+        assert_eq!(
+            scp_did::extract_public_key_from_did(&canonical_did).unwrap(),
+            key
+        );
+
+        // Construct the same non-canonical alternate used in the native
+        // regression test above (toggle a trailing padding bit).
+        let last_char = canonical_encoded.as_bytes()[canonical_encoded.len() - 1];
+        let last_idx = ALPHABET
+            .iter()
+            .position(|&c| c == last_char)
+            .expect("canonical char must be in alphabet");
+        let mutated_idx = last_idx ^ 1;
+        let mut mutated_bytes = canonical_encoded.as_bytes().to_vec();
+        let last_pos = mutated_bytes.len() - 1;
+        mutated_bytes[last_pos] = ALPHABET[mutated_idx];
+        let mutated_encoded =
+            String::from_utf8(mutated_bytes).expect("z-base-32 alphabet is ASCII");
+        let mutated_did = format!("did:dht:z{mutated_encoded}");
+
+        // Sanity: the alternate decodes to the same 32 bytes on both sides.
+        assert_eq!(
+            zbase32::decode(&mutated_encoded)
+                .expect("alternate decodes")
+                .as_slice(),
+            &key[..]
+        );
+
+        // Both parsers MUST reject the non-canonical input — identical inputs,
+        // identical rejection.
+        assert!(
+            DidDht::<InMemoryDhtClient>::extract_public_key(&mutated_did).is_err(),
+            "native parser must reject non-canonical did:dht"
+        );
+        assert!(
+            scp_did::extract_public_key_from_did(&mutated_did).is_err(),
+            "scp-did parser must reject non-canonical did:dht"
+        );
+    }
+
     /// Helper that creates an identity with a fresh
     /// [`InMemoryPreRotationCustody`]. Returns the identity, document, the
     /// pre-rotation handle (so migration tests can present it back), and
