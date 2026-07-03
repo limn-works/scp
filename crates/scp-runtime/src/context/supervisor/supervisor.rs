@@ -9782,6 +9782,107 @@ impl Supervisor {
         event_log.event_log_entries(context_id_bytes)
     }
 
+    /// Computes the participation record (§7.3.2) for `subject_did` in
+    /// `context_id` from the context's FULL event log.
+    ///
+    /// Gathers the context's UNFILTERED Merkle-log events and the log's Merkle
+    /// root from the supervisor's shared event-log provider, then delegates to
+    /// the pure-core
+    /// [`compute_participation_record`](scp_protocol::trust::compute_participation_record).
+    /// The full event set is required because
+    /// `governance_actions_against` counts events where the subject is the
+    /// projected TARGET (not the actor), so a query filtered to the subject's
+    /// own events would undercount.
+    ///
+    /// # Attestation source (`accessible_attestations`)
+    ///
+    /// `attestation_count` is a credential-layer fact (§7.4) and is the one
+    /// fact NOT derivable from the event log. The supervisor does NOT hold the
+    /// trust [`AttestationCache`](scp_protocol::trust::aggregate::AttestationCache)
+    /// / [`TrustProtocolRepository`](scp_protocol::trust::aggregate::TrustProtocolRepository):
+    /// the raw `Storage` handle is consumed into the durable-providers pair at
+    /// construction and is not re-exposed (ADR-049). The trust store is
+    /// reconstructed at the FFI bridge layer (each bridge owns its
+    /// `ProtocolRepository`), exactly as `aggregate_trust_input` does. The
+    /// caller therefore threads the subject's accessible, currently-valid
+    /// attestations IN — the bridge sources them from its own
+    /// `AttestationCache::get_verified_attestations`. A caller with no
+    /// attestation access honestly passes an empty slice (count 0,
+    /// verifier-relative per §7.3.2), but this method itself never fabricates an
+    /// empty set — it forwards whatever the caller supplies.
+    ///
+    /// Synchronous — reads the shared provider directly without a per-context
+    /// lock or actor mailbox (stateless w.r.t. per-context state), mirroring
+    /// [`Self::event_log_entries`]; the FFI sync paths that call it cannot
+    /// `.await`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::NotInitialized`] if the event-log provider or
+    /// clock is not configured, [`ContextError`] if the provider fails, and
+    /// surfaces [`TrustError`](scp_protocol::trust::TrustError) (e.g.
+    /// `EmptyEventLog`) from the core computation as
+    /// [`ContextError::InvalidState`].
+    pub fn participation_record(
+        &self,
+        context_id: &str,
+        subject_did: &str,
+        accessible_attestations: &[scp_protocol::trust::attestation::Attestation],
+    ) -> Result<scp_protocol::trust::ParticipationRecord, ContextError> {
+        let event_log = self.event_log_ref().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "Supervisor::participation_record — event_log provider not configured".to_owned(),
+            )
+        })?;
+        let now_secs = self
+            .clock_ref()
+            .ok_or_else(|| {
+                ContextError::NotInitialized(
+                    "Supervisor::participation_record — clock not configured".to_owned(),
+                )
+            })?
+            .now_secs();
+
+        let context_id_bytes = crate::context::state::context_id_to_bytes(context_id);
+        // FULL, unfiltered event set — `governance_actions_against` needs
+        // events where the subject is the projected target, not the actor.
+        let events = event_log
+            .event_log_entries(&context_id_bytes)?
+            .unwrap_or_default();
+        // FAIL CLOSED on the Merkle root (white-hat P2). A log that HAS events
+        // must carry a real root: substituting `[0u8; 32]` would emit a record
+        // with real participation facts bound to a zero root, which a verifier
+        // could not distinguish from a genuinely-empty log. Only an empty log
+        // tolerates an absent root — the core computation returns `EmptyEventLog`
+        // for it below regardless, so the substituted zero root is never observed.
+        let merkle_root = match event_log.event_log_merkle_root(&context_id_bytes) {
+            Ok(root) => root,
+            Err(_) if events.is_empty() => [0u8; 32],
+            Err(e) => return Err(e),
+        };
+
+        scp_protocol::trust::compute_participation_record(
+            &events,
+            subject_did,
+            context_id,
+            merkle_root,
+            now_secs,
+            accessible_attestations,
+        )
+        .map_err(|e| match e {
+            // Empty event log → distinct, machine-detectable variant so the FFI
+            // bridges can surface a stable, dedicated error code instead of
+            // collapsing it with genuine failures (Finding 3). A subject with no
+            // recorded participation facts is a normal, branchable outcome.
+            scp_protocol::trust::TrustError::EmptyEventLog => ContextError::NoParticipationFacts {
+                subject_did: subject_did.to_owned(),
+            },
+            other => ContextError::InvalidState(format!(
+                "participation record computation failed for {subject_did}: {other}"
+            )),
+        })
+    }
+
     /// Returns the broadcast sender key + epoch for `author_did` in
     /// `context_id` via the actor mailbox.
     ///
@@ -11083,6 +11184,50 @@ impl Supervisor {
                 "Supervisor::test_insert_member — actor reply channel closed".to_owned(),
             )
         })?
+    }
+
+    /// Appends a typed event directly to the supervisor-owned event-log
+    /// provider for `context_id` — test-only.
+    ///
+    /// The provider's `event_log_entries` (read by the FFI `event_log_query`
+    /// manager path) is the same store this writes to, so a leaf appended here
+    /// is observable on the manager path without driving a full governance
+    /// round-trip. Used by the NAPI bridge's manager-path projection tests to
+    /// seed a `RoleAssigned`/`GovernanceActionExecuted` leaf carrying a typed
+    /// payload. Synchronous — the provider's `append_event` mutates its own
+    /// shared store and needs no actor mailbox.
+    ///
+    /// Gated behind the `testing` feature — never compiled into production
+    /// builds, never reachable from any FFI bridge.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::NotInitialized`] if no event-log provider is wired.
+    /// - [`ContextError::EventLogFailed`] if the provider has no log for the
+    ///   context or the append fails.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn test_append_event_log(
+        &self,
+        context_id_bytes: &[u8; 32],
+        event_type: scp_event_log::EventType,
+        actor_did: &str,
+        payload: scp_event_log::EventPayload,
+        timestamp_secs: u64,
+    ) -> Result<(), ContextError> {
+        let event_log = self.event_log_ref().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "Supervisor::test_append_event_log — event_log provider not configured".to_owned(),
+            )
+        })?;
+        event_log
+            .append_event(
+                context_id_bytes,
+                event_type,
+                actor_did,
+                payload,
+                timestamp_secs,
+            )
+            .map_err(|e| ContextError::EventLogFailed(e.to_string()))
     }
 
     /// Lists every governance proposal currently tracked by the

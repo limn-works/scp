@@ -101,6 +101,42 @@ def normalize_address(address: str) -> str:
     return bridge.discovery_normalize_address(address)
 
 
+def discover(query: str) -> list[dict[str, Any]]:
+    """Discover contexts from a DID or an ``scp://`` URI.
+
+    Delegates to the ``_scp_core`` ``context_discover`` bridge op, which
+    combines client-side sources (local runtime registry, known-contexts
+    registry, and an optional relay probe when a transport is connected)
+    and deduplicates by context ID. The relay is a dumb blob store with no
+    identity-to-context mapping; discovery is purely client-side (see
+    spec §5.14.11, §18.2.2, §18.4).
+
+    Args:
+        query: Either a DID (``did:...``) to resolve the contexts a member
+            participates in, or an ``scp://`` URI to resolve directly.
+
+    Returns:
+        A list of result dicts. Each contains ``context_id`` and ``source``
+        (``"local"`` / ``"relay"`` / ``"local+relay"``), ``relay_active``,
+        plus optional ``creator_did`` / ``member_count`` / ``tool_count``.
+
+    Raises:
+        ValidationError: If the query is neither a DID nor an ``scp://`` URI.
+        ContextError: If DID resolution or URI parsing fails.
+    """
+    bridge = _bridge()
+    results = bridge.context_discover(query)
+    return [dict(r) for r in results]
+
+
+def discover_contexts(query: str) -> list[dict[str, Any]]:
+    """Alias for :func:`discover` matching the cross-SDK ``discover_contexts``
+    capability name (TypeScript ``discoverContexts``); both spellings refer to
+    the same client-side context discovery op.
+    """
+    return discover(query)
+
+
 # ---------------------------------------------------------------------------
 # Petname operations (spec section 22.4)
 # ---------------------------------------------------------------------------
@@ -123,6 +159,8 @@ def normalize_address(address: str) -> str:
 
 __all__ = [
     "create_query",
+    "discover",
+    "discover_contexts",
     "normalize_address",
     "parse_address",
 ]

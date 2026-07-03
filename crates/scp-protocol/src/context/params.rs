@@ -756,6 +756,16 @@ pub struct ContextParams {
     /// When non-empty, joining members must present [`crate::trust::participation::ParticipationProfile`]
     /// attestations satisfying every entry. Empty means no participation
     /// requirements (the default).
+    ///
+    /// SECURITY (issuer legitimacy): a
+    /// [`ParticipationFact::AttestationCount`](crate::trust::ParticipationFact::AttestationCount)
+    /// requirement gates on a raw count of authentic-but-self-issuable
+    /// endorsements with NO issuer-independence / Sybil guarantee — an issuer is
+    /// self-certifying, so a joining subject can mint endorsements from DIDs it
+    /// controls to clear the threshold. A context that needs Sybil-resistant
+    /// admission MUST instead configure `sybil_policy` (the independence-scored
+    /// threshold path), not rely on an `AttestationCount` participation
+    /// requirement.
     #[serde(default)]
     pub participation_requirements: Vec<RequireParticipation>,
 

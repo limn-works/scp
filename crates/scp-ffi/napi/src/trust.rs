@@ -1,9 +1,8 @@
 //! napi-rs bridge for trust engine operations.
 //!
 //! Per-bridge-instance (`_on`) implementations consumed by the corresponding
-//! methods on [`crate::scp::Scp`]. Phase D (#1695) deleted the
-//! free-function wrappers that routed through the process-global default
-//! bridge instance.
+//! methods on [`crate::scp::Scp`]. The free-function wrappers that routed
+//! through the process-global default bridge instance were deleted.
 //!
 //! See ADR-017 in `.docs/adrs/phase-4.md`.
 
@@ -48,6 +47,68 @@ pub struct NapiChallengeResult {
     pub challenge_id: String,
     /// The serialized challenge request (JSON).
     pub challenge_json: String,
+}
+
+/// Structured participation facts (§7.3.2) for a subject DID in a context.
+///
+/// The scalar projection of scp-core's `ParticipationRecord`, produced by
+/// `Scp.participationRecord`. Counts are flattened ONCE in the shared Rust core
+/// (`ParticipationFacts`) so TypeScript RECEIVES the facts rather than
+/// re-aggregating event-log collections — eliminating cross-binding divergence
+/// by construction. `u64` counts/timestamps are surfaced as napi `i64` (JS
+/// number; lossless for these ranges, matching `NapiTrustScoreResult`);
+/// booleans/strings map directly. See ADR-017.
+#[napi(object)]
+pub struct NapiParticipationRecord {
+    /// The DID whose participation is summarized.
+    pub subject_did: String,
+    /// Total seconds of context participation (§7.3.2).
+    pub participation_duration_secs: i64,
+    /// Count of governance actions taken against this identity.
+    pub governance_actions_against: i64,
+    /// Count of governance actions initiated by this identity.
+    pub governance_actions_by: i64,
+    /// Total tool invocations across all tool types.
+    pub tool_invocation_count: i64,
+    /// Whether `tool_invocation_count` is anchored in the canonical Merkle log
+    /// (`false` until ADR-051; consumers MUST NOT treat it as Merkle-proven).
+    pub tool_invocation_count_anchored: bool,
+    /// Number of contexts created by the subject.
+    pub context_creation_count: i64,
+    /// Number of role transitions for the subject.
+    pub role_progression_count: i64,
+    /// Number of accessible, currently-valid credential-layer attestations
+    /// (§7.4) for the subject. Verifier-relative.
+    pub attestation_count: i64,
+    /// Whether `attestation_count` is anchored in / verifiable against a context
+    /// Merkle root. Always `false` — credential-layer, verifier-relative (§7.4),
+    /// never a context-event-log count (§7.3.2). Parallel of
+    /// `tool_invocation_count_anchored`.
+    pub attestation_count_anchored: bool,
+    /// Unix timestamp (seconds) when the record was computed.
+    pub computed_at: i64,
+    /// Merkle root (hex) of the event log at computation time.
+    pub event_log_root: String,
+}
+
+impl From<&scp_core::trust::ParticipationFacts> for NapiParticipationRecord {
+    #[allow(clippy::cast_possible_wrap)] // counts/timestamps are well within i64::MAX; documented
+    fn from(f: &scp_core::trust::ParticipationFacts) -> Self {
+        Self {
+            subject_did: f.subject_did.to_string(),
+            participation_duration_secs: f.participation_duration_secs as i64,
+            governance_actions_against: f.governance_actions_against as i64,
+            governance_actions_by: f.governance_actions_by as i64,
+            tool_invocation_count: f.tool_invocation_count as i64,
+            tool_invocation_count_anchored: f.tool_invocation_count_anchored,
+            context_creation_count: f.context_creation_count as i64,
+            role_progression_count: f.role_progression_count as i64,
+            attestation_count: f.attestation_count as i64,
+            attestation_count_anchored: f.attestation_count_anchored,
+            computed_at: f.computed_at as i64,
+            event_log_root: hex::encode(f.event_log_root),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -209,15 +270,20 @@ pub(crate) fn trust_verify_response_on(
 ///
 /// Pure verification — the bridge instance is unused but accepted for API
 /// symmetry with the other `_on` helpers in this module.
+///
+/// `expected_subject` is the DID of the agent being admitted: only profiles
+/// whose signed `subject_did` equals it contribute to any accounting, closing
+/// cross-subject participation-profile replay.
 pub(crate) fn verify_participation_requirements_on(
     _bi: &NapiBridgeInstance,
-    profile_json: String,
+    expected_subject: String,
     requirements_json: String,
-) -> napi::Result<bool> {
-    let profiles: Vec<scp_core::trust::ParticipationProfile> = serde_json::from_str(&profile_json)
-        .map_err(|e| {
-            validation_error(&format!("failed to parse participation profiles JSON: {e}"))
-        })?;
+    profile_json: String,
+) -> napi::Result<()> {
+    // Full DID-format validation (matching the PyO3 reference bridge), not just a
+    // non-empty check, so all native bridges reject malformed ids identically.
+    scp_ffi_common::validate::validate_did(&expected_subject)
+        .map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
 
     let requirements: Vec<scp_core::trust::RequireParticipation> =
         serde_json::from_str(&requirements_json).map_err(|e| {
@@ -226,16 +292,26 @@ pub(crate) fn verify_participation_requirements_on(
             ))
         })?;
 
-    let current_time = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
-
-    scp_core::trust::verify_participation_requirements(current_time, &requirements, &profiles)
+    let profiles: Vec<scp_core::trust::ParticipationProfile> = serde_json::from_str(&profile_json)
         .map_err(|e| {
-            validation_error(&format!("participation admission verification failed: {e}"))
+            validation_error(&format!("failed to parse participation profiles JSON: {e}"))
         })?;
 
-    Ok(true)
+    // Fail-closed clock: a pre-epoch host clock is an unrecoverable environment
+    // failure and must not silently read as time 0, which would make every
+    // participation statement appear maximally fresh and bypass `max_age_secs`.
+    // Matches the SystemClock invariant used on the verify-on-ingest path.
+    let current_time = scp_primitives::Clock::now_secs(&scp_primitives::SystemClock);
+
+    scp_core::trust::verify_participation_requirements(
+        current_time,
+        &expected_subject,
+        &requirements,
+        &profiles,
+    )
+    .map_err(|e| validation_error(&format!("participation admission verification failed: {e}")))?;
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -311,7 +387,7 @@ pub(crate) fn aggregate_trust_input_on(
     // the split-brain failure mode main's `Option` guarded against
     // (trust writes silently landing in an ephemeral store while
     // context/event-log writes landed in SQLCipher) is structurally
-    // unreachable. See issue #502.
+    // unreachable.
     match crate::runtime::protocol_repository(bi) {
         crate::runtime::ProtocolRepoVariant::InMemory(repo) => {
             let handle = crate::runtime().handle().clone();
@@ -350,6 +426,101 @@ pub(crate) fn aggregate_trust_input_on(
             .map_err(|e| validation_error(&e.to_string()))
         }
     }
+}
+
+/// Per-instance participation-record computation (§7.3.2) for `subject_did` in
+/// `context_id`.
+///
+/// Sources the subject's accessible, currently-valid attestations from THIS
+/// instance's `ProtocolRepository` variant (populating any caller-supplied
+/// `cached_attestations_json` first, exactly as `aggregate_trust_input_on`
+/// does) — the REAL credential-layer source, not `&[]`. The shared Supervisor
+/// gathers the FULL event log + Merkle root for every other fact. Returns the
+/// flattened typed record so the SDK never re-aggregates.
+/// Builds a `ProtocolRepositoryTrustBridge` over the concrete backend behind a
+/// [`ProtocolRepoVariant`] arm and reads back the subject's verified
+/// attestations. Single source of truth for the per-backend
+/// attestation-sourcing path: both `ProtocolRepoVariant` arms route through this
+/// one generic body (mirroring the `PyO3` bridge's `run_verified_attestations`).
+/// The match remains pure type dispatch because each variant holds a distinct
+/// concrete `ProtocolRepository<S>`.
+fn run_verified_attestations<S: scp_platform::traits::Storage + 'static>(
+    repo: &Arc<scp_core::store::ProtocolRepository<S>>,
+    context_id: &str,
+    subject_did: &str,
+    cached_attestations: Vec<scp_core::trust::aggregate::CachedAttestation>,
+) -> Result<Vec<scp_core::trust::attestation::Attestation>, scp_core::trust::TrustError> {
+    let handle = crate::runtime().handle().clone();
+    let bridge = scp_core::trust::ProtocolRepositoryTrustBridge::new(Arc::clone(repo), handle);
+    scp_ffi_common::trust_store::verified_attestations(
+        bridge,
+        context_id,
+        subject_did,
+        cached_attestations,
+    )
+}
+
+pub(crate) fn participation_record_on(
+    bi: &NapiBridgeInstance,
+    context_id: String,
+    subject_did: String,
+    cached_attestations_json: String,
+) -> napi::Result<NapiParticipationRecord> {
+    // Full format validation (matching the PyO3 reference bridge), not just a
+    // non-empty check, so all native bridges reject malformed ids identically.
+    scp_ffi_common::validate::validate_context_id(&context_id)
+        .map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+    scp_ffi_common::validate::validate_did(&subject_did)
+        .map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+
+    let cached_attestations: Vec<scp_core::trust::aggregate::CachedAttestation> =
+        serde_json::from_str(&cached_attestations_json).map_err(|e| {
+            napi::Error::from(ScpNapiError::Validation {
+                message: format!("failed to parse cached_attestations JSON: {e}"),
+                code: codes::VALID_7059.to_owned(),
+            })
+        })?;
+
+    // Source verified attestations from this instance's `ProtocolRepository`
+    // (same backend as context/event-log writes). Both variants route through
+    // the single generic `run_verified_attestations` helper.
+    let verified = match crate::runtime::protocol_repository(bi) {
+        crate::runtime::ProtocolRepoVariant::InMemory(repo) => {
+            run_verified_attestations(repo, &context_id, &subject_did, cached_attestations)
+        }
+        crate::runtime::ProtocolRepoVariant::Sqlite(repo) => {
+            run_verified_attestations(repo, &context_id, &subject_did, cached_attestations)
+        }
+    }
+    // An error from `verified_attestations` is an INFRA fault (trust-store read,
+    // signature-verification infrastructure) — NOT caller-input validation. Code
+    // it as a context-layer fault (CTX_2000), consistent with the generic-failure
+    // arm of `participation_record` below, and keep it propagating (fail-closed):
+    // it must never be folded into the empty-log CTX_2076 path.
+    .map_err(|e| {
+        napi::Error::from(ScpNapiError::Context {
+            message: e.to_string(),
+            code: codes::CTX_2000.to_owned(),
+        })
+    })?;
+
+    let record = crate::runtime::supervisor(bi)?
+        .participation_record(&context_id, &subject_did, &verified)
+        .map_err(|e| {
+            // Empty-log → dedicated CTX_2076 so SDKs branch on the code, not the
+            // message; genuine failures stay on the generic CTX_2000.
+            let code = match e {
+                scp_core::context::ContextError::NoParticipationFacts { .. } => codes::CTX_2076,
+                _ => codes::CTX_2000,
+            };
+            napi::Error::from(ScpNapiError::Context {
+                message: e.to_string(),
+                code: code.to_owned(),
+            })
+        })?;
+
+    let facts = scp_core::trust::ParticipationFacts::from(&record);
+    Ok(NapiParticipationRecord::from(&facts))
 }
 
 // ---------------------------------------------------------------------------
@@ -424,26 +595,66 @@ mod tests {
 
     #[test]
     fn verify_participation_requirements_rejects_invalid_profile_json() {
+        // Malformed JSON in the PROFILE position (now the 3rd arg).
         let bi = test_bi();
-        let result =
-            verify_participation_requirements_on(&bi, "not json".to_owned(), "[]".to_owned());
+        let result = verify_participation_requirements_on(
+            &bi,
+            "did:key:alice".to_owned(),
+            "[]".to_owned(),
+            "not json".to_owned(),
+        );
         assert!(result.is_err());
     }
 
     #[test]
     fn verify_participation_requirements_rejects_invalid_requirements_json() {
+        // Malformed JSON in the REQUIREMENTS position (now the 2nd arg).
         let bi = test_bi();
-        let result =
-            verify_participation_requirements_on(&bi, "[]".to_owned(), "not json".to_owned());
+        let result = verify_participation_requirements_on(
+            &bi,
+            "did:key:alice".to_owned(),
+            "not json".to_owned(),
+            "[]".to_owned(),
+        );
         assert!(result.is_err());
     }
 
     #[test]
     fn verify_participation_requirements_empty_inputs_succeeds() {
         let bi = test_bi();
-        let result = verify_participation_requirements_on(&bi, "[]".to_owned(), "[]".to_owned());
+        let result = verify_participation_requirements_on(
+            &bi,
+            "did:key:alice".to_owned(),
+            "[]".to_owned(),
+            "[]".to_owned(),
+        );
         assert!(result.is_ok());
-        assert!(result.unwrap());
+    }
+
+    #[test]
+    fn verify_participation_requirements_rejects_empty_subject() {
+        let bi = test_bi();
+        let result = verify_participation_requirements_on(
+            &bi,
+            String::new(),
+            "[]".to_owned(),
+            "[]".to_owned(),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn verify_participation_requirements_rejects_malformed_subject() {
+        // Parity with the PyO3 reference bridge: `expected_subject` gets full
+        // DID-format validation, not just a non-empty check.
+        let bi = test_bi();
+        let result = verify_participation_requirements_on(
+            &bi,
+            "not-a-did".to_owned(),
+            "[]".to_owned(),
+            "[]".to_owned(),
+        );
+        assert!(result.is_err());
     }
 
     #[test]
@@ -480,5 +691,85 @@ mod tests {
             "[]".to_owned(),
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn participation_record_rejects_empty_context() {
+        let bi = test_bi();
+        let result = participation_record_on(
+            &bi,
+            String::new(),
+            "did:key:test".to_owned(),
+            "[]".to_owned(),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn participation_record_rejects_empty_did() {
+        let bi = test_bi();
+        let result =
+            participation_record_on(&bi, "ctx-1".to_owned(), String::new(), "[]".to_owned());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn participation_record_rejects_invalid_attestations_json() {
+        let bi = test_bi();
+        let result = participation_record_on(
+            &bi,
+            "ctx-1".to_owned(),
+            "did:key:test".to_owned(),
+            "not json".to_owned(),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn participation_record_rejects_malformed_did() {
+        // Format validation (not just non-empty) matches the PyO3 reference
+        // bridge: a non-empty but malformed DID is rejected.
+        let bi = test_bi();
+        let result = participation_record_on(
+            &bi,
+            "ctx-1".to_owned(),
+            "not-a-did".to_owned(),
+            "[]".to_owned(),
+        );
+        assert!(result.is_err());
+    }
+
+    /// The typed `NapiParticipationRecord` surfaces every flattened fact from
+    /// the shared `ParticipationFacts` projection (i64-widened) with identical
+    /// values.
+    #[test]
+    fn participation_record_view_exposes_all_facts() {
+        let facts = scp_core::trust::ParticipationFacts {
+            subject_did: "did:key:bob".into(),
+            participation_duration_secs: 300,
+            governance_actions_against: 1,
+            governance_actions_by: 2,
+            tool_invocation_count: 5,
+            tool_invocation_count_anchored: false,
+            context_creation_count: 1,
+            role_progression_count: 3,
+            attestation_count: 2,
+            attestation_count_anchored: false,
+            computed_at: 42,
+            event_log_root: [7u8; 32],
+        };
+        let view = NapiParticipationRecord::from(&facts);
+        assert_eq!(view.subject_did, "did:key:bob");
+        assert_eq!(view.participation_duration_secs, 300);
+        assert_eq!(view.governance_actions_against, 1);
+        assert_eq!(view.governance_actions_by, 2);
+        assert_eq!(view.tool_invocation_count, 5);
+        assert!(!view.tool_invocation_count_anchored);
+        assert_eq!(view.context_creation_count, 1);
+        assert_eq!(view.role_progression_count, 3);
+        assert_eq!(view.attestation_count, 2);
+        assert!(!view.attestation_count_anchored);
+        assert_eq!(view.computed_at, 42);
+        assert_eq!(view.event_log_root, hex::encode([7u8; 32]));
     }
 }

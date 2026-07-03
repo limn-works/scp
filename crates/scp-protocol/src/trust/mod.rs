@@ -18,21 +18,23 @@ pub mod sybil;
 // Re-exports for backward compatibility.
 pub use attestation::{
     Attestation, AttestationEvidence, DidPublicKeyResolver, IdentityDidPublicKeyResolver,
-    RevocationStatus, verify_attestation, verify_attestation_with_revocation,
+    RevocationStatus, canonical_attestation_bytes, verify_attestation,
+    verify_attestation_with_revocation,
 };
 pub use capability_uri::{CapabilityUri, CapabilityUriError};
 pub use challenge::{
     ChallengeRequest, ChallengeResponse, ChallengeSigner, ChallengeType, ChallengeVerification,
-    issue_challenge, verify_challenge_response,
+    canonical_challenge_verification_bytes, issue_challenge, verify_challenge_response,
+    verify_challenge_verification,
 };
 pub use custody_violation::{
     ActionCategory, CounterAttestation, CustodyViolationError, CustodyViolationType,
     ScpCustodyViolationAttestation, classify_action, enforce_category_a,
 };
 pub use participation::{
-    ParticipationFact, ParticipationInput, ParticipationProfile, ParticipationRecord,
-    ParticipationThreshold, RequireParticipation, compute_participation_record,
-    produce_participation_profile,
+    ParticipationFact, ParticipationFacts, ParticipationInput, ParticipationProfile,
+    ParticipationRecord, ParticipationThreshold, RequireParticipation,
+    compute_participation_record, produce_participation_profile,
 };
 pub use sybil::{
     EarnedCapacityLevel, FreshnessWeight, IdentityDepthAssessment, TrustSignal,
@@ -151,9 +153,11 @@ pub enum TrustError {
         got: String,
     },
 
-    /// The challenge response was completed after the timeout window.
+    /// The challenge response's `completed_at` falls outside the acceptable
+    /// freshness window: either older than the timeout, or implausibly far in
+    /// the future relative to the verifier's clock (clock-skew bound).
     #[error(
-        "challenge {challenge_id}: timed out (timeout {timeout_secs}s, completed at \
+        "challenge {challenge_id}: outside freshness window (timeout {timeout_secs}s, completed at \
          {completed_at})"
     )]
     ChallengeTimeout {
@@ -177,6 +181,25 @@ pub enum TrustError {
     /// Signing a challenge request failed.
     #[error("challenge signing failed: {reason}")]
     ChallengeSigningFailed {
+        /// Human-readable description of the failure.
+        reason: String,
+    },
+
+    /// Constructing the canonical signing/verification bytes for a
+    /// caller-supplied credential failed (e.g. evidence / claim / revocation
+    /// serialization or the canonical hash itself).
+    ///
+    /// Purpose-built so the verify-on-ingest rejection allowlist
+    /// (`is_verification_rejection`) can be keyed on a variant that NO
+    /// infrastructure path ever produces — a credential whose own bytes cannot
+    /// be canonicalized cannot be authenticated, so it is a REJECTION of that one
+    /// entry (drop it), never a transient backend fault (which uses
+    /// [`TrustError::StoreError`]). Keeping this distinct from
+    /// [`TrustError::InvalidEventData`] / [`TrustError::ChallengeSigningFailed`]
+    /// makes the rejection set closed by construction: those variants are no
+    /// longer overloaded to mean "drop one entry".
+    #[error("canonicalization failed: {reason}")]
+    CanonicalizationFailed {
         /// Human-readable description of the failure.
         reason: String,
     },
@@ -216,6 +239,68 @@ pub enum TrustError {
     ChallengeRequestSignatureInvalid {
         /// Human-readable description of the failure.
         reason: String,
+    },
+
+    /// The challenge verification record's verifier Ed25519 signature is
+    /// invalid, indicating a forged or tampered `passed`/`score` trust signal.
+    /// The verifier signature binds every consumed field (`passed`, `score`,
+    /// `expires_at`, `subject_did`, `verifier_did`, `capability_uri`), so a
+    /// failure here means the record cannot be trusted as a verifier's claim.
+    #[error("challenge verification {verification_id}: verifier signature invalid: {reason}")]
+    ChallengeVerificationSignatureInvalid {
+        /// The verification record ID.
+        verification_id: String,
+        /// Human-readable description of the failure.
+        reason: String,
+    },
+
+    /// The challenge verification record has expired (`expires_at <= now`).
+    /// Challenges are repeatable (spec §7.3.4); an expired verification must be
+    /// re-challenged and MUST NOT be consumed as a current trust signal.
+    #[error("challenge verification {verification_id}: expired at {expires_at} (now {now})")]
+    ChallengeVerificationExpired {
+        /// The verification record ID.
+        verification_id: String,
+        /// The Unix timestamp (seconds) at which the verification expired.
+        expires_at: u64,
+        /// The current Unix timestamp (seconds) at evaluation.
+        now: u64,
+    },
+
+    /// The challenge verification record is not bound to the context it is being
+    /// ingested/consumed under. A verifier-signed result for context A (or a
+    /// context-agnostic `None` result) MUST NOT be replayed into context B's
+    /// aggregation — `context_id` is a signed field, so the binding is
+    /// cryptographically authentic but must still match the target context.
+    #[error(
+        "challenge verification {verification_id}: context mismatch (record {record_context:?}, expected {expected_context})"
+    )]
+    ChallengeContextMismatch {
+        /// The verification record ID.
+        verification_id: String,
+        /// The `context_id` carried by the record (`None` if context-agnostic).
+        record_context: Option<String>,
+        /// The target context the record is being consumed under.
+        expected_context: String,
+    },
+
+    /// The challenge verification record's signed `subject_did` does not match
+    /// the subject it is being aggregated/checked for. `subject_did` is part of
+    /// the canonical preimage, so the binding is cryptographically authentic; a
+    /// genuine, in-context, unexpired result minted for subject A MUST NOT be
+    /// counted toward subject B's trust signal or admission. This closes
+    /// cross-subject attribution by construction at the verify site, rather than
+    /// relying on the store key alone.
+    #[error(
+        "challenge verification {verification_id}: subject mismatch (record {record_subject}, expected {expected_subject})"
+    )]
+    ChallengeSubjectMismatch {
+        /// The verification record ID.
+        verification_id: String,
+        /// The signed `subject_did` carried by the record.
+        record_subject: String,
+        /// The subject the record is being consumed for.
+        expected_subject: String,
     },
 
     /// The requested DID is not a member of the context.
@@ -308,14 +393,21 @@ pub struct RoleTransition {
     pub assigned_by: DID,
 }
 
-/// Reference to an attestation event in the log.
+/// Reference to a credential-layer attestation (§7.4) for a subject.
+///
+/// NOT an event-log entry: there is no attestation event type and attestations
+/// are never context-log leaves (§7.3.2). This references the credential-layer
+/// artifact, sourced from the subject's accessible attestations, not the Merkle
+/// log — so `event_sequence` carries no log position.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttestationReference {
-    /// Unix timestamp (seconds) when the attestation was recorded.
+    /// Unix timestamp (seconds) when the attestation was issued (or last
+    /// renewed).
     pub timestamp: u64,
-    /// The sequence number of the event in the log.
+    /// Always `0`: attestations are credential-layer artifacts, not event-log
+    /// leaves, so they carry no log sequence number.
     pub event_sequence: u64,
-    /// The DID of the actor who created the attestation event.
+    /// The DID of the attestation issuer (§7.4).
     pub actor_did: DID,
 }
 

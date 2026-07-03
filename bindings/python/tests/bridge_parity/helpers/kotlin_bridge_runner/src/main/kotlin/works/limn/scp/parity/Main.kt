@@ -400,7 +400,9 @@ private suspend fun opUcanValidateMalformed(args: JsonObject): JsonObject =
                 handle,
                 "not.a.jwt",
                 "scp:ctx:any/messages:read",
-                null,
+                // Fail-closed presenting-agent gate: supply one so the malformed
+                // JWT is rejected at PARSE (the behavior under test).
+                identity.did(),
                 null
             )
             buildJsonObject {
@@ -440,7 +442,9 @@ private suspend fun opUcanEvaluateMalformed(args: JsonObject): JsonObject =
                 handle,
                 "not.a.jwt",
                 "scp:ctx:any/messages:read",
-                null,
+                // Fail-closed presenting-agent gate: supply one so the malformed
+                // JWT is rejected at PARSE (the behavior under test).
+                identity.did(),
                 null
             )
             buildJsonObject {
@@ -484,7 +488,7 @@ private suspend fun opUcanEvaluateStructured(args: JsonObject): JsonObject =
         val handle = scp.contextCreate(identity, buildContextParams(ceiling))
         val token = scp.ucanMint(handle, memberDid, capabilities, null)
         val required = "scp:ctx:${handle.contextId()}/$requiredCap"
-        val result = scp.ucanEvaluate(handle, token.encoded(), required, null, null)
+        val result = scp.ucanEvaluate(handle, token.encoded(), required, memberDid, null)
         buildJsonObject {
             put("tokens_valid", JsonPrimitive(result.tokensValid))
             put("signatures_valid", JsonPrimitive(result.signaturesValid))

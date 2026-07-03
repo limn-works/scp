@@ -21,7 +21,7 @@
 //!   evaluation.
 //!
 //! Migrated from flat `#[pyfunction]` exports to `#[pymethods] impl PyScp`
-//! methods in Phase 4 PR 4 sub-slice E (#1549).
+//! methods in Phase 4 PR 4 sub-slice E.
 //!
 //! The trust engine does not produce trust "scores" — it provides verifiable
 //! facts (participation records, attestation verification results, challenge
@@ -37,6 +37,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
 use crate::runtime::PyBridgeInstance;
+use crate::types::encode_hex;
 use crate::validate;
 
 // ---------------------------------------------------------------------------
@@ -243,16 +244,21 @@ pub fn py_trust_verify_response(challenge_json: &str, response_json: &str) -> Py
 // verify_participation_requirements (SCP-BA-004)
 // ---------------------------------------------------------------------------
 
-/// Verifies participation profiles against admission requirements.
+/// Verifies participation profiles against admission requirements, bound to the
+/// agent being admitted.
 ///
-/// Both inputs are JSON strings:
-/// - `profile_json`: JSON array of `ParticipationProfile` objects.
+/// Inputs:
+/// - `expected_subject`: the DID of the agent being admitted. Only profiles
+///   whose signed `subject_did` equals this value contribute to any threshold,
+///   freshness, or distinct-signer accounting — a victim's genuine profiles
+///   cannot be replayed to admit a different agent (cross-subject replay).
 /// - `requirements_json`: JSON array of `RequireParticipation` objects.
+/// - `profile_json`: JSON array of `ParticipationProfile` objects.
 ///
-/// Uses the current system time for freshness checks. Returns `Ok(true)` on
-/// success. The Python SDK wrapper discards the return value — success is
-/// indicated by returning without exception. Raises `ScpError` with a
-/// diagnostic message if any requirement fails or if the JSON is malformed.
+/// Uses the current system time for freshness checks. Returns `Ok(())` on
+/// success — success is indicated by returning without exception. Raises
+/// `ScpError` with a diagnostic message if any requirement fails or if the JSON
+/// is malformed.
 ///
 /// See §7.3.2.1.
 ///
@@ -264,15 +270,11 @@ pub fn py_trust_verify_response(challenge_json: &str, response_json: &str) -> Py
 #[pyfunction]
 #[pyo3(name = "verify_participation_requirements")]
 pub fn py_verify_participation_requirements(
-    profile_json: &str,
+    expected_subject: &str,
     requirements_json: &str,
-) -> PyResult<bool> {
-    let profiles: Vec<scp_core::trust::ParticipationProfile> = serde_json::from_str(profile_json)
-        .map_err(|e| {
-        pyo3::exceptions::PyValueError::new_err(format!(
-            "failed to parse participation profiles JSON: {e}"
-        ))
-    })?;
+    profile_json: &str,
+) -> PyResult<()> {
+    validate::validate_did(expected_subject)?;
 
     let requirements: Vec<scp_core::trust::RequireParticipation> =
         serde_json::from_str(requirements_json).map_err(|e| {
@@ -281,18 +283,32 @@ pub fn py_verify_participation_requirements(
             ))
         })?;
 
-    let current_time = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
-
-    scp_core::trust::verify_participation_requirements(current_time, &requirements, &profiles)
+    let profiles: Vec<scp_core::trust::ParticipationProfile> = serde_json::from_str(profile_json)
         .map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "participation admission verification failed: {e}"
-            ))
-        })?;
+        pyo3::exceptions::PyValueError::new_err(format!(
+            "failed to parse participation profiles JSON: {e}"
+        ))
+    })?;
 
-    Ok(true)
+    // Fail-closed clock: a pre-epoch host clock is an unrecoverable environment
+    // failure and must not silently read as time 0, which would make every
+    // participation statement appear maximally fresh and bypass `max_age_secs`.
+    // Matches the SystemClock invariant used on the verify-on-ingest path.
+    let current_time = scp_primitives::Clock::now_secs(&scp_primitives::SystemClock);
+
+    scp_core::trust::verify_participation_requirements(
+        current_time,
+        expected_subject,
+        &requirements,
+        &profiles,
+    )
+    .map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "participation admission verification failed: {e}"
+        ))
+    })?;
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -305,7 +321,7 @@ pub fn py_verify_participation_requirements(
 /// Accepts all inputs as JSON strings and returns the aggregated `TrustInput`
 /// as a JSON string. Uses the `BridgeInstance` storage provider for persistent
 /// trust data when initialized (trust data survives across calls and restarts);
-/// falls back to an ephemeral in-memory store otherwise. See issue #502.
+/// falls back to an ephemeral in-memory store otherwise.
 ///
 /// # Errors
 ///
@@ -399,7 +415,7 @@ fn aggregate_trust_input_impl(
 /// If the `BridgeInstance` storage provider is initialized, builds a
 /// `ProtocolRepositoryTrustBridge` over the concrete storage backend
 /// (`InMemoryEncrypted` or `Sqlite`) so cached attestations, revocation
-/// states, and challenge results survive process restarts (issue #502).
+/// states, and challenge results survive process restarts.
 /// Otherwise falls back to an ephemeral in-memory store.
 #[allow(clippy::too_many_arguments)]
 fn aggregate_with_storage(
@@ -425,7 +441,7 @@ fn aggregate_with_storage(
     // The former path swapped in an ephemeral `InMemoryFfiTrustStore` so
     // aggregations against a `SCP({storage: sqlite})` caller's configured
     // SQLCipher store invisibly landed in an empty ephemeral store. See
-    // `with_storage_py` / PR #1690 review.
+    // `with_storage_py`.
     let provider = crate::runtime::get_storage(bi).map_err(|_| {
         pyo3::exceptions::PyValueError::new_err(format!(
             "{}: bridge storage not initialized — trust aggregation is \
@@ -435,50 +451,292 @@ fn aggregate_with_storage(
         ))
     })?;
     let handle = crate::runtime()?.handle().clone();
-    match provider {
+    // The aggregation logic lives ONCE in `run_aggregation` (generic over the
+    // concrete `EncryptedStorage` backend). The match is pure type dispatch: the
+    // sealed `EncryptedStorage` bound on `ProtocolRepository::new` cannot be
+    // satisfied by the `StorageProvider` enum itself (the marker trait lives in
+    // `scp-platform`), so the concrete `Arc<S>` must be recovered per variant.
+    // Both arms route through the single generic body — no duplicated logic.
+    let inputs = AggregationInputs {
+        context_id,
+        subject_did,
+        cached_attestations,
+        challenge_results,
+        events,
+        merkle_root,
+        consequence_rules,
+        threshold_requirements,
+        attestor_sets,
+    };
+    let result = match provider {
         StorageProvider::InMemoryEncrypted(storage) => {
-            let repo = Arc::new(scp_core::store::ProtocolRepository::new(Arc::clone(
-                storage,
-            )));
-            let bridge = scp_core::trust::ProtocolRepositoryTrustBridge::new(repo, handle);
-            scp_ffi_common::trust_store::populate_and_aggregate(
-                bridge,
-                context_id,
-                subject_did,
-                cached_attestations,
-                challenge_results,
-                events,
-                merkle_root,
-                consequence_rules,
-                threshold_requirements,
-                attestor_sets,
-            )
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+            run_aggregation(Arc::clone(storage), handle, inputs)
         }
-        StorageProvider::Sqlite(storage) => {
-            let repo = Arc::new(scp_core::store::ProtocolRepository::new(Arc::clone(
-                storage,
-            )));
-            let bridge = scp_core::trust::ProtocolRepositoryTrustBridge::new(repo, handle);
-            scp_ffi_common::trust_store::populate_and_aggregate(
-                bridge,
-                context_id,
-                subject_did,
-                cached_attestations,
-                challenge_results,
-                events,
-                merkle_root,
-                consequence_rules,
-                threshold_requirements,
-                attestor_sets,
-            )
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+        StorageProvider::Sqlite(storage) => run_aggregation(Arc::clone(storage), handle, inputs),
+    };
+    result.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+}
+
+/// Owned + borrowed inputs for [`run_aggregation`], grouped to keep the generic
+/// helper's signature manageable.
+struct AggregationInputs<'a> {
+    context_id: &'a str,
+    subject_did: &'a str,
+    cached_attestations: Vec<scp_core::trust::aggregate::CachedAttestation>,
+    challenge_results: &'a [scp_core::trust::ChallengeVerification],
+    events: &'a [scp_event_log::Event],
+    merkle_root: [u8; 32],
+    consequence_rules: &'a [scp_core::trust::ConsequenceRule],
+    threshold_requirements: &'a std::collections::HashMap<
+        scp_core::trust::AttestationType,
+        scp_core::trust::ThresholdRequirement,
+    >,
+    attestor_sets: &'a std::collections::HashMap<
+        scp_core::trust::AttestationType,
+        Vec<scp_core::trust::AttestorInfo>,
+    >,
+}
+
+/// Builds a `ProtocolRepositoryTrustBridge` over the concrete encrypted backend
+/// and runs `populate_and_aggregate`. Single source of truth for the per-backend
+/// aggregation path (both `StorageProvider` variants route through this).
+fn run_aggregation<S: scp_platform::EncryptedStorage + 'static>(
+    storage: Arc<S>,
+    handle: tokio::runtime::Handle,
+    inputs: AggregationInputs<'_>,
+) -> Result<String, scp_core::trust::TrustError> {
+    let repo = Arc::new(scp_core::store::ProtocolRepository::new(storage));
+    let bridge = scp_core::trust::ProtocolRepositoryTrustBridge::new(repo, handle);
+    scp_ffi_common::trust_store::populate_and_aggregate(
+        bridge,
+        inputs.context_id,
+        inputs.subject_did,
+        inputs.cached_attestations,
+        inputs.challenge_results,
+        inputs.events,
+        inputs.merkle_root,
+        inputs.consequence_rules,
+        inputs.threshold_requirements,
+        inputs.attestor_sets,
+    )
+}
+
+// ---------------------------------------------------------------------------
+// PyParticipationRecord
+// ---------------------------------------------------------------------------
+
+/// Structured participation facts (§7.3.2) for a subject DID in a context.
+///
+/// The scalar projection of scp-core's
+/// [`ParticipationRecord`](scp_core::trust::ParticipationRecord), produced by
+/// [`PyScp::participation_record`]. Counts are flattened ONCE in the shared Rust
+/// core (`ParticipationFacts`) so Python RECEIVES the facts rather than
+/// re-aggregating event-log collections — eliminating cross-binding divergence
+/// by construction.
+///
+/// See `scp_core::trust::ParticipationFacts` and ADR-017.
+#[pyclass(name = "ParticipationRecord")]
+#[derive(Debug, Clone)]
+pub struct PyParticipationRecord {
+    /// The DID whose participation is summarized.
+    #[pyo3(get)]
+    pub subject_did: String,
+    /// Total seconds of context participation (§7.3.2).
+    #[pyo3(get)]
+    pub participation_duration_secs: u64,
+    /// Count of governance actions taken against this identity (projected
+    /// `target_did` is the subject).
+    #[pyo3(get)]
+    pub governance_actions_against: u64,
+    /// Count of governance actions initiated by this identity.
+    #[pyo3(get)]
+    pub governance_actions_by: u64,
+    /// Total tool invocations across all tool types.
+    #[pyo3(get)]
+    pub tool_invocation_count: u64,
+    /// Whether `tool_invocation_count` is anchored in the canonical Merkle log.
+    /// `false` until ADR-051 makes `ToolInvoked` a convergent leaf (§7.3.2) —
+    /// consumers MUST NOT treat the count as Merkle-proven while this is `false`.
+    #[pyo3(get)]
+    pub tool_invocation_count_anchored: bool,
+    /// Number of contexts created by the subject (`ChildContextCreated`).
+    #[pyo3(get)]
+    pub context_creation_count: u64,
+    /// Number of role transitions for the subject.
+    #[pyo3(get)]
+    pub role_progression_count: u64,
+    /// Number of accessible, currently-valid credential-layer attestations
+    /// (§7.4) for the subject. Verifier-relative.
+    #[pyo3(get)]
+    pub attestation_count: u64,
+    /// Whether `attestation_count` is anchored in / verifiable against a context
+    /// Merkle root. Always `false` — it is a credential-layer, verifier-relative
+    /// fact (§7.4), never a context-event-log count (§7.3.2). The parallel of
+    /// `tool_invocation_count_anchored`, surfaced so the non-anchored nature is
+    /// mechanically visible.
+    #[pyo3(get)]
+    pub attestation_count_anchored: bool,
+    /// Unix timestamp (seconds) when the record was computed.
+    #[pyo3(get)]
+    pub computed_at: u64,
+    /// Merkle root (hex) of the event log at computation time.
+    #[pyo3(get)]
+    pub event_log_root: String,
+}
+
+impl From<&scp_core::trust::ParticipationFacts> for PyParticipationRecord {
+    fn from(f: &scp_core::trust::ParticipationFacts) -> Self {
+        Self {
+            subject_did: f.subject_did.to_string(),
+            participation_duration_secs: f.participation_duration_secs,
+            governance_actions_against: f.governance_actions_against,
+            governance_actions_by: f.governance_actions_by,
+            tool_invocation_count: f.tool_invocation_count,
+            tool_invocation_count_anchored: f.tool_invocation_count_anchored,
+            context_creation_count: f.context_creation_count,
+            role_progression_count: f.role_progression_count,
+            attestation_count: f.attestation_count,
+            attestation_count_anchored: f.attestation_count_anchored,
+            computed_at: f.computed_at,
+            event_log_root: encode_hex(&f.event_log_root),
         }
     }
 }
 
+#[pymethods]
+impl PyParticipationRecord {
+    fn __repr__(&self) -> String {
+        format!(
+            "ParticipationRecord(subject_did={}, participation_duration_secs={}, \
+             governance_actions_against={}, governance_actions_by={}, \
+             tool_invocation_count={}, tool_invocation_count_anchored={}, \
+             context_creation_count={}, role_progression_count={}, \
+             attestation_count={}, attestation_count_anchored={})",
+            self.subject_did,
+            self.participation_duration_secs,
+            self.governance_actions_against,
+            self.governance_actions_by,
+            self.tool_invocation_count,
+            self.tool_invocation_count_anchored,
+            self.context_creation_count,
+            self.role_progression_count,
+            self.attestation_count,
+            self.attestation_count_anchored,
+        )
+    }
+}
+
+/// Sources the subject's verified attestations from this bridge instance's
+/// persistent trust store, then computes the participation record via the
+/// shared Supervisor.
+///
+/// Mirrors `aggregate_with_storage`'s attestation handling: caller-supplied
+/// `cached_attestations` are populated into the bridge's
+/// `ProtocolRepositoryTrustBridge` over the concrete storage backend, and the
+/// subject's accessible, currently-valid attestations are read back via
+/// `get_verified_attestations` — the REAL credential-layer source, not `&[]`.
+/// Those attestations feed `attestation_count` (§7.4); the Supervisor gathers
+/// the full event log + Merkle root for every other fact.
+fn participation_record_impl(
+    bi: &crate::runtime::PyBridgeInstance,
+    context_id: &str,
+    subject_did: &str,
+    cached_attestations_json: &str,
+) -> PyResult<PyParticipationRecord> {
+    use crate::runtime::StorageProvider;
+
+    validate::validate_context_id(context_id)?;
+    validate::validate_did(subject_did)?;
+
+    let cached_attestations: Vec<scp_core::trust::aggregate::CachedAttestation> =
+        serde_json::from_str(cached_attestations_json).map_err(|e| {
+            crate::error::ScpPyError::ValidationError {
+                message: format!("failed to parse cached_attestations JSON: {e}"),
+                code: scp_ffi_common::error_codes::VALID_7059.to_owned(),
+            }
+        })?;
+
+    // Source verified attestations from this instance's persistent trust store
+    // (same backend as context/event-log writes). The sourcing
+    // logic lives ONCE in `run_verified_attestations` (generic over the concrete
+    // `EncryptedStorage` backend); the match is pure type dispatch because the
+    // sealed `EncryptedStorage` bound cannot be satisfied by the `StorageProvider`
+    // enum itself. Both arms route through the single generic body.
+    let provider = crate::runtime::get_storage(bi)?;
+    let handle = crate::runtime()?.handle().clone();
+    let verified = match provider {
+        StorageProvider::InMemoryEncrypted(storage) => run_verified_attestations(
+            Arc::clone(storage),
+            handle,
+            context_id,
+            subject_did,
+            cached_attestations,
+        ),
+        StorageProvider::Sqlite(storage) => run_verified_attestations(
+            Arc::clone(storage),
+            handle,
+            context_id,
+            subject_did,
+            cached_attestations,
+        ),
+    }
+    // An error from `verified_attestations` is an INFRA fault (trust-store read,
+    // signature-verification infrastructure) — NOT a caller-input validation
+    // error. Code it as a context-layer fault (CTX_2000), consistent with the
+    // generic-failure arm of `participation_record` below, and keep it propagating
+    // (fail-closed): it must never be folded into the empty-log CTX_2076 path.
+    .map_err(|e| crate::error::ScpPyError::ContextError {
+        message: e.to_string(),
+        code: scp_ffi_common::error_codes::CTX_2000.to_owned(),
+    })?;
+
+    let record = crate::runtime::supervisor(bi)?
+        .participation_record(context_id, subject_did, &verified)
+        // Map the empty-log condition to its dedicated, stable code (CTX_2076) so
+        // SDKs can branch on "no recorded participation facts" without string-
+        // matching; genuine failures stay on the generic context code (CTX_2000),
+        // matching NAPI/UniFFI. `ScpPyError::context` would emit CTX_2001,
+        // diverging from the other bridges for the same condition.
+        .map_err(|e| {
+            let code = match e {
+                scp_core::context::ContextError::NoParticipationFacts { .. } => {
+                    scp_ffi_common::error_codes::CTX_2076
+                }
+                _ => scp_ffi_common::error_codes::CTX_2000,
+            };
+            crate::error::ScpPyError::ContextError {
+                message: e.to_string(),
+                code: code.to_owned(),
+            }
+        })?;
+
+    let facts = scp_core::trust::ParticipationFacts::from(&record);
+    Ok(PyParticipationRecord::from(&facts))
+}
+
+/// Builds a `ProtocolRepositoryTrustBridge` over the concrete encrypted backend
+/// and reads back the subject's verified attestations. Single source of truth for
+/// the per-backend attestation-sourcing path (both `StorageProvider` variants
+/// route through this).
+fn run_verified_attestations<S: scp_platform::EncryptedStorage + 'static>(
+    storage: Arc<S>,
+    handle: tokio::runtime::Handle,
+    context_id: &str,
+    subject_did: &str,
+    cached_attestations: Vec<scp_core::trust::aggregate::CachedAttestation>,
+) -> Result<Vec<scp_core::trust::attestation::Attestation>, scp_core::trust::TrustError> {
+    let repo = Arc::new(scp_core::store::ProtocolRepository::new(storage));
+    let bridge = scp_core::trust::ProtocolRepositoryTrustBridge::new(repo, handle);
+    scp_ffi_common::trust_store::verified_attestations(
+        bridge,
+        context_id,
+        subject_did,
+        cached_attestations,
+    )
+}
+
 // ---------------------------------------------------------------------------
-// PyScp methods — migrated from #[pyfunction] exports (Phase 4 PR 4, #1549).
+// PyScp methods — migrated from #[pyfunction] exports (Phase 4 PR 4).
 // ---------------------------------------------------------------------------
 
 #[pymethods]
@@ -516,7 +774,7 @@ impl crate::scp::PyScp {
     /// Accepts all inputs as JSON strings and returns the aggregated `TrustInput`
     /// as a JSON string. Uses the `BridgeInstance` storage provider for persistent
     /// trust data when initialized (trust data survives across calls and restarts);
-    /// falls back to an ephemeral in-memory store otherwise. See issue #502.
+    /// falls back to an ephemeral in-memory store otherwise.
     ///
     /// # Errors
     ///
@@ -551,6 +809,35 @@ impl crate::scp::PyScp {
             challenge_results_json,
         )
     }
+
+    /// Computes the structured participation record (§7.3.2) for `subject_did`
+    /// in `context_id`.
+    ///
+    /// The bridge sources the subject's accessible, currently-valid attestations
+    /// from this instance's persistent trust store (populating any
+    /// caller-supplied `cached_attestations_json` first, exactly as
+    /// `aggregate_trust_input` does), and the shared Supervisor gathers the FULL
+    /// event log to derive every other fact. Returns a typed
+    /// [`PyParticipationRecord`] — the SDK receives the flattened facts and never
+    /// re-aggregates event-log collections.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ScpError` if validation fails, `cached_attestations_json` is
+    /// malformed, storage is uninitialized, or the record computation fails
+    /// (e.g. an empty event log).
+    ///
+    /// See ADR-017 and spec §7.3.2.
+    #[pyo3(name = "participation_record", signature = (context_id, subject_did, cached_attestations_json="[]"))]
+    pub fn participation_record(
+        &self,
+        context_id: &str,
+        subject_did: &str,
+        cached_attestations_json: &str,
+    ) -> PyResult<PyParticipationRecord> {
+        let bi = &*self.inner;
+        participation_record_impl(bi, context_id, subject_did, cached_attestations_json)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -565,6 +852,7 @@ impl crate::scp::PyScp {
 /// response verification, participation requirement verification) remain as
 /// free `#[pyfunction]` exports.
 pub fn register_trust(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<PyParticipationRecord>()?;
     m.add_function(wrap_pyfunction!(py_trust_verify_attestation, m)?)?;
     m.add_function(wrap_pyfunction!(py_trust_create_challenge, m)?)?;
     m.add_function(wrap_pyfunction!(py_trust_verify_response, m)?)?;
@@ -658,22 +946,30 @@ mod tests {
 
     #[test]
     fn verify_participation_requirements_rejects_invalid_profile_json() {
-        let result = py_verify_participation_requirements("not json", "[]");
+        // Malformed JSON in the PROFILE position (now the 3rd arg).
+        let result = py_verify_participation_requirements("did:key:alice", "[]", "not json");
         assert!(result.is_err());
     }
 
     #[test]
     fn verify_participation_requirements_rejects_invalid_requirements_json() {
-        let result = py_verify_participation_requirements("[]", "not json");
+        // Malformed JSON in the REQUIREMENTS position (now the 2nd arg).
+        let result = py_verify_participation_requirements("did:key:alice", "not json", "[]");
         assert!(result.is_err());
     }
 
     #[test]
     fn verify_participation_requirements_empty_inputs_succeeds() {
         // Empty requirements = no constraints = always passes.
-        let result = py_verify_participation_requirements("[]", "[]");
+        let result = py_verify_participation_requirements("did:key:alice", "[]", "[]");
         assert!(result.is_ok());
-        assert!(result.unwrap());
+    }
+
+    #[test]
+    fn verify_participation_requirements_rejects_invalid_subject() {
+        // A malformed subject DID is rejected at the FFI boundary.
+        let result = py_verify_participation_requirements("not-a-did", "[]", "[]");
+        assert!(result.is_err());
     }
 
     #[test]
@@ -722,5 +1018,56 @@ mod tests {
             "[]",
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn participation_record_validates_context_id() {
+        let result = default_scp().participation_record("", "did:key:test", "[]");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn participation_record_validates_did() {
+        let result = default_scp().participation_record("ctx-1", "not-a-did", "[]");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn participation_record_rejects_invalid_attestations_json() {
+        let result = default_scp().participation_record("ctx-1", "did:key:test", "not json");
+        assert!(result.is_err());
+    }
+
+    /// The typed `PyParticipationRecord` surfaces every flattened fact from the
+    /// shared `ParticipationFacts` projection with byte-identical values.
+    #[test]
+    fn participation_record_view_exposes_all_facts() {
+        let facts = scp_core::trust::ParticipationFacts {
+            subject_did: "did:key:bob".into(),
+            participation_duration_secs: 300,
+            governance_actions_against: 1,
+            governance_actions_by: 2,
+            tool_invocation_count: 5,
+            tool_invocation_count_anchored: false,
+            context_creation_count: 1,
+            role_progression_count: 3,
+            attestation_count: 2,
+            attestation_count_anchored: false,
+            computed_at: 42,
+            event_log_root: [7u8; 32],
+        };
+        let view = PyParticipationRecord::from(&facts);
+        assert_eq!(view.subject_did, "did:key:bob");
+        assert_eq!(view.participation_duration_secs, 300);
+        assert_eq!(view.governance_actions_against, 1);
+        assert_eq!(view.governance_actions_by, 2);
+        assert_eq!(view.tool_invocation_count, 5);
+        assert!(!view.tool_invocation_count_anchored);
+        assert_eq!(view.context_creation_count, 1);
+        assert_eq!(view.role_progression_count, 3);
+        assert_eq!(view.attestation_count, 2);
+        assert!(!view.attestation_count_anchored);
+        assert_eq!(view.computed_at, 42);
+        assert_eq!(view.event_log_root, encode_hex(&[7u8; 32]));
     }
 }

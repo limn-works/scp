@@ -612,7 +612,9 @@ async function opUcanValidateMalformed(
       identity,
       JSON.stringify(params),
     );
-    await scp.ucanValidate(handle, badToken, capability);
+    // Fail-closed presenting-agent gate: supply one so the malformed JWT is
+    // rejected at PARSE (the behavior under test), not short-circuited.
+    await scp.ucanValidate(handle, badToken, capability, identity.did);
   } catch (err: unknown) {
     if (err instanceof Error) {
       const codeMatch = err.message.match(/SCP-[A-Z]+-\d+/);
@@ -643,7 +645,9 @@ async function opUcanEvaluateMalformed(
       identity,
       JSON.stringify(params),
     );
-    await scp.ucanEvaluate(handle, badToken, capability);
+    // Fail-closed presenting-agent gate: supply one so the malformed JWT is
+    // rejected at PARSE (the behavior under test), not short-circuited.
+    await scp.ucanEvaluate(handle, badToken, capability, identity.did);
   } catch (err: unknown) {
     if (err instanceof Error) {
       const codeMatch = err.message.match(/SCP-[A-Z]+-\d+/);
@@ -678,7 +682,10 @@ async function opUcanEvaluateStructured(
   const handle = await scp.contextCreate(identity, JSON.stringify(params));
   const token = await scp.ucanMint(handle, memberDid, capabilities);
   const required = `scp:ctx:${handle.contextId}/${requiredCap}`;
-  const result = await scp.ucanEvaluate(handle, token.encoded, required);
+  // Presenting agent is REQUIRED (fail-closed): pass the token's audience (the
+  // minted member DID) so the step-5 audience check passes and the failing
+  // stage is purely the grant-match, identical across bridges.
+  const result = await scp.ucanEvaluate(handle, token.encoded, required, memberDid);
   return {
     tokens_valid: result.tokensValid,
     signatures_valid: result.signaturesValid,

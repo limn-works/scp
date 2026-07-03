@@ -10,11 +10,19 @@ an SCP context.  Trust evaluation is a four-layer model:
    (participation history, governance actions, tool usage).
 3. **Attestation Authenticity** -- verified signatures and evidence
    freshness from attestations.
-4. **Trust Evaluation Inputs** -- endorsements, challenge results,
-   and consequence structures for agent judgment.
+
+:func:`evaluate_trust` returns these first three layers as a
+:class:`TrustEvaluation` (the same shape across all four SDKs). The Layer-4
+trust-evaluation inputs (endorsements, challenge results, consequence
+structures) are gathered separately via :func:`aggregate_trust_input`.
 
 See ``.docs/sketch.md`` section ``SCP.Trust.evaluate`` and
-``.docs/adrs/phase-3.md`` ADR-014 for the SDK design.
+``.docs/adrs/phase-3.md`` ADR-014 for the SDK design. The structured
+``ucan_evaluate`` consumption (Layer 1 / :class:`CapabilityValidation`) is
+governed by ``.docs/adrs/phase-2.md`` ADR-057 and
+``.docs/specs/07-trust-validation-and-capabilities.md`` §7.2.4: the SDK
+consumes the typed per-stage result and never reverse-engineers which check
+failed by parsing error prose.
 """
 
 from __future__ import annotations
@@ -22,15 +30,46 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypedDict
 
-from scp_sdk.errors import ContextError, ScpError
+from scp_sdk.errors import BRIDGE_ERROR_MAP, ContextError, ScpError
 
 if TYPE_CHECKING:
     from scp_sdk.scp import SCP
 
 logger = logging.getLogger("scp_sdk")
+
+#: Stable error code (spec §7.3.2) the core surfaces when a context has no
+#: recorded participation facts yet (an empty event log). :func:`evaluate_trust`
+#: branches Layer 2 on this STRUCTURED code — never on error prose — folding
+#: "no facts yet" into a zeroed behavioral record while letting every other
+#: failure propagate. Maps from ``ContextError::NoParticipationFacts``.
+NO_PARTICIPATION_FACTS_CODE = "SCP-CTX-2076"
+
+#: Extracts a ``[SCP-CAT-NNNN]`` code from a bridge exception's string form. The
+#: PyO3 bridge formats native exceptions as ``[{code}] {category} error: ...``.
+_SCP_CODE_RE = re.compile(r"\[(SCP-[A-Z]+-\d+)\]")
+
+
+def _coded_bridge_error(exc: Exception) -> ScpError:
+    """Translate a native ``_scp_core`` exception into a coded SDK exception.
+
+    Looks up the SDK class by the bridge exception's class name (via
+    :data:`~scp_sdk.errors.BRIDGE_ERROR_MAP`, defaulting to
+    :class:`~scp_sdk.errors.ContextError`) and recovers the structured
+    ``SCP-CAT-NNNN`` code from the message so callers can branch on
+    ``exc.code`` rather than parsing prose. An already-typed
+    :class:`~scp_sdk.errors.ScpError` is returned unchanged.
+    """
+    if isinstance(exc, ScpError):
+        return exc
+    sdk_cls = BRIDGE_ERROR_MAP.get(type(exc).__name__, ContextError)
+    match = _SCP_CODE_RE.search(str(exc))
+    code = match.group(1) if match is not None else None
+    return sdk_cls(str(exc), code=code)
+
 
 # ---------------------------------------------------------------------------
 # Lazy bridge import helper
@@ -52,203 +91,6 @@ def _bridge() -> Any:
 
 
 # ---------------------------------------------------------------------------
-# UCAN error classification for Layer 1 independent checks
-# ---------------------------------------------------------------------------
-
-# Error message prefixes that indicate an early token structure failure.
-# Maps to CapabilityValidation.tokens_valid.
-# Pipeline step 1 (parse/header validation) — fails before any other
-# check has run.
-#
-# NOTE: More specific "malformed token:" sub-patterns (e.g. DID errors,
-# capability URI errors) are matched BEFORE this list in _classify_ucan_error
-# so they route to the correct pipeline stage.
-_TOKEN_PARSE_PREFIXES: tuple[str, ...] = (
-    "malformed token:",
-    "deserialization failed:",
-    "unsupported algorithm:",
-    "unsupported UCAN version:",
-)
-
-# Error message prefixes that indicate a signature/chain integrity failure.
-# Maps to CapabilityValidation.signatures_valid.
-# Pipeline steps: 2 (signature), 3 (chain), 4 (root issuer),
-#   5 (audience), 5a/5b (key scope), 6b (category A), 7 (attenuation).
-# Also includes DID resolution failures (step 2) that the Rust bridge
-# wraps as MalformedToken.
-#
-# Parent-token expiry/revocation in the delegation chain is also wrapped
-# as DelegationChainBroken by the Rust bridge (issue #1026), so those
-# errors match "delegation chain broken:" and classify conservatively
-# as "signatures" → _PASSED_BEFORE = {tokens_valid} only.  This avoids
-# optimistically reporting True for checks that never ran on the leaf.
-_SIGNATURE_CHAIN_PREFIXES: tuple[str, ...] = (
-    "signature verification failed",
-    "invalid issuer:",
-    "audience mismatch:",
-    "delegation chain broken:",
-    "circular delegation detected:",
-    "attenuation violation:",
-    "key scope mismatch:",
-    "self-delegation",
-    "Category A violation:",
-    # DID resolution failures (step 2) — all ResolutionError variants become
-    # MalformedToken("...") via From<ResolutionError> for UcanError.
-    # See crates/scp-ffi/common/src/resolvers.rs.
-    "malformed token: DID not found",
-    "malformed token: invalid DID document",
-    "malformed token: network unavailable",
-    "malformed token: DID revoked/downgraded",
-    # Runtime MalformedToken(format!(...)) constructions from validate.rs
-    # that represent signature/DID resolution failures (step 2).
-    "malformed token: verification method",
-    "malformed token: unrecognized signing key ID",
-    # Runtime MalformedToken(format!(...)) constructions from resolvers.rs
-    # BridgeDidResolver — DID decode/resolution failures (step 2).
-    "malformed token: z-base-32 decode failed",
-    "malformed token: DID public key must be 32 bytes",
-    "malformed token: hex decode failed",
-    "malformed token: unsupported DID method",
-)
-
-# Error message prefixes that indicate a capability ceiling/scope failure.
-# Maps to CapabilityValidation.within_ceiling.
-# Pipeline steps: 6 (capability match), 8 (ceiling compliance).
-# Also includes capability URI parse failures (step 6) that the Rust bridge
-# wraps as MalformedToken.
-_CAPABILITY_CEILING_PREFIXES: tuple[str, ...] = (
-    "capability outside ceiling:",
-    "capability not granted:",
-    "malformed token: unparseable capability",
-)
-
-# Error message prefixes for nonce failures (step 9).
-# By step 9, parse, signature, and ceiling checks have already passed.
-_NONCE_PREFIXES: tuple[str, ...] = (
-    "nonce reused:",
-    "nonce too old:",
-    "nonce from the future:",
-    "invalid nonce format:",
-    "nonce tracker full:",
-)
-
-# Error message prefixes that indicate a revocation failure.
-# Maps to CapabilityValidation.not_revoked.
-# Pipeline step: 10 (revocation check).
-_REVOCATION_PREFIXES: tuple[str, ...] = ("token revoked:",)
-
-# Error message prefixes for expiry/time-bounds failures (step 11).
-# By step 11, all other checks (parse, sig, ceiling, nonce, revocation) passed.
-_EXPIRY_PREFIXES: tuple[str, ...] = (
-    "token expired",
-    "token not yet valid",
-    "invalid time range:",
-    "expiry too far in the future:",
-)
-
-
-def _extract_core_error(error_message: str) -> str:
-    """Extract the core UcanError Display text from a bridge error message.
-
-    The Rust bridge formats UCAN errors as::
-
-        [SCP-PERM-3001] permission error: <UcanError Display> \u2014 <advice>
-
-    This strips the code prefix and trailing advice to yield the raw
-    ``UcanError`` Display text for prefix matching.
-    """
-    core = error_message
-    if "] permission error: " in core:
-        core = core.split("] permission error: ", 1)[1]
-    # Strip the trailing advice suffix added by the Rust From<UcanError> impl.
-    if " \u2014 " in core:
-        core = core.split(" \u2014 ", 1)[0]
-    return core
-
-
-def _classify_ucan_error(error_message: str) -> str:
-    """Classify a UCAN validation error into a fine-grained pipeline stage.
-
-    Returns one of:
-    - ``"token_parse"`` — step 1 (parse/header) failed
-    - ``"signatures"`` — steps 2-7 (signature, chain, issuer, audience,
-      key scope, attenuation) failed
-    - ``"ceiling"`` — steps 6/8 (capability match, ceiling) failed
-    - ``"nonce"`` — step 9 (nonce validation) failed
-    - ``"revoked"`` — step 10 (revocation check) failed
-    - ``"expiry"`` — step 11 (time bounds) failed
-    - ``"unknown"`` — unrecognized error
-    """
-    core = _extract_core_error(error_message)
-
-    # Check more-specific "malformed token:" sub-patterns BEFORE the
-    # generic _TOKEN_PARSE_PREFIXES catch-all, so that e.g.
-    # "malformed token: DID not found" → "signatures" (step 2) and
-    # "malformed token: unparseable capability" → "ceiling" (step 6)
-    # instead of falling through to "token_parse" (step 1).
-    for prefix in _SIGNATURE_CHAIN_PREFIXES:
-        if core.startswith(prefix):
-            return "signatures"
-
-    for prefix in _CAPABILITY_CEILING_PREFIXES:
-        if core.startswith(prefix):
-            return "ceiling"
-
-    for prefix in _TOKEN_PARSE_PREFIXES:
-        if core.startswith(prefix):
-            return "token_parse"
-
-    for prefix in _NONCE_PREFIXES:
-        if core.startswith(prefix):
-            return "nonce"
-
-    for prefix in _REVOCATION_PREFIXES:
-        if core.startswith(prefix):
-            return "revoked"
-
-    for prefix in _EXPIRY_PREFIXES:
-        if core.startswith(prefix):
-            return "expiry"
-
-    return "unknown"
-
-
-# Maps pipeline stages to which CapabilityValidation fields are known
-# to have passed when that stage fails, based on the 11-step sequential
-# pipeline in validate.rs:
-#
-#   parse(1) → sig(2) → chain(3-5) → key_scope(5a/b) → cap_match(6)
-#   → cat_A(6b) → attenuation(7) → ceiling(8) → nonce(9)
-#   → revocation(10) → expiry(11)
-#
-# Each value lists the fields that PASSED before the failure point.
-# The failing field is NOT in the set — it will be set to False.
-# Fields after the failure are also not in the set (never ran).
-_PASSED_BEFORE: dict[str, set[str]] = {
-    # Step 1: parse fails — nothing passed.
-    "token_parse": set(),
-    # Steps 2-7: signature/chain fails — parse passed.
-    "signatures": {"tokens_valid"},
-    # Steps 6/8: capability/ceiling fails — parse + sig passed.
-    "ceiling": {"tokens_valid", "signatures_valid"},
-    # Step 9: nonce fails — parse + sig + ceiling all passed.
-    "nonce": {"tokens_valid", "signatures_valid", "within_ceiling"},
-    # Step 10: revocation fails — parse + sig + ceiling + nonce passed.
-    "revoked": {"tokens_valid", "signatures_valid", "within_ceiling", "nonce_valid"},
-    # Step 11: expiry fails — parse + sig + ceiling + nonce + revocation passed.
-    "expiry": {
-        "tokens_valid",
-        "signatures_valid",
-        "within_ceiling",
-        "nonce_valid",
-        "not_revoked",
-    },
-    # Unknown: conservatively nothing passed.
-    "unknown": set(),
-}
-
-
-# ---------------------------------------------------------------------------
 # Dataclasses
 # ---------------------------------------------------------------------------
 
@@ -259,109 +101,183 @@ class CapabilityValidation:
 
     All fields must be ``True`` for the subject to be considered
     protocol-compliant.
+
+    These six per-stage booleans are the canonical structured result of
+    the read-only ``ucan_evaluate`` diagnostic (spec §7.2.4, ADR-057):
+    one boolean per pipeline-stage group of the 11-step ADR-016 pipeline.
+    They are populated directly from the bridge's structured result --
+    never reverse-engineered by parsing error prose. The result is
+    strictly ordered and short-circuiting: a field is ``True`` only if its
+    stage ran *and* passed, so the first failing stage and every later
+    stage are ``False``.
     """
 
-    #: UCAN tokens parse and have valid structure.
+    #: UCAN tokens parse and have valid structure (step 1).
     tokens_valid: bool = False
 
-    #: All signatures verify against the claimed DIDs.
+    #: Signatures, the full delegation chain, root issuer, audience, key
+    #: scope, Category-A enforcement, and attenuation verify (steps 2-7). The
+    #: invoked-capability grant-match (step 6) is included ONLY when a
+    #: challenge capability is supplied; in the diagnostic's intrinsic-validity
+    #: mode (the mode :func:`evaluate_trust` uses — no challenge), step 6 is
+    #: SKIPPED and this field reflects only the structural checks, not
+    #: grant-match.
     signatures_valid: bool = False
 
-    #: Requested capabilities are within the context's ceiling.
+    #: Requested capabilities are within the context's ceiling (step 8).
     within_ceiling: bool = False
 
     #: Nonce validation passed (step 9: no reuse, not stale, valid format).
+    #: Probed read-only by the diagnostic -- the nonce is NOT recorded.
     nonce_valid: bool = False
 
-    #: No tokens have been revoked.
+    #: No tokens have been revoked (step 10).
     not_revoked: bool = False
 
-    #: Token time bounds are valid (not expired, not pre-dated, valid range).
+    #: Token time bounds are valid (step 11: not expired, not pre-dated,
+    #: valid range).
     time_bounds_valid: bool = False
+
+    @property
+    def all_valid(self) -> bool:
+        """``True`` iff every per-stage check passed.
+
+        The one obvious correct happy-path call: collapses the six per-stage
+        booleans with a logical AND so consumers do not hand-roll the
+        conjunction (and cannot silently omit a field when a new stage is
+        added). A token is protocol-compliant only when all six are ``True``.
+
+        SECURITY: this is a DIAGNOSTIC, NEVER an authorization decision. It
+        reports that the UCAN tokens are *intrinsically well-formed and valid*;
+        it does NOT authorize any action. In intrinsic mode (capability =
+        ``None`` — no challenge capability supplied, the mode
+        :func:`evaluate_trust` uses), the invoked-capability grant-match
+        (step 6) is SKIPPED, so ``all_valid`` (and ``signatures_valid`` /
+        ``within_ceiling``) being ``True`` does NOT assert that any specific
+        capability is granted. The diagnostic is also read-only: the nonce is
+        probed but NOT consumed, so the evaluated tokens remain replayable
+        against the enforcing path — another reason this is never an
+        authorization decision. To gate an action, pass the concrete capability
+        to ``ucan_evaluate`` (which then includes grant-match in
+        ``signatures_valid``) — or use the enforcing UCAN validation path
+        (which consumes the nonce). Treating ``all_valid`` as "the agent may
+        do X" is a security error.
+        """
+        return (
+            self.tokens_valid
+            and self.signatures_valid
+            and self.within_ceiling
+            and self.nonce_valid
+            and self.not_revoked
+            and self.time_bounds_valid
+        )
 
 
 @dataclass
 class BehavioralRecord:
-    """Layer 2: Behavioral validation (verified facts from event log)."""
+    """Layer 2: the participation facts (§7.3.2) for a subject in a context.
 
-    #: Number of contexts the subject has participated in.
-    contexts_participated: int = 0
+    The scalar projection of scp-core's ``ParticipationRecord``, computed
+    ONCE in the shared Rust core and surfaced through the PyO3
+    ``participation_record`` op (``_scp_core.SCP.participation_record`` →
+    ``PyParticipationRecord``). The SDK RECEIVES these facts rather than
+    re-aggregating event-log collections client-side — eliminating
+    cross-binding divergence by construction. Mirrors the TypeScript SDK
+    ``BehavioralRecord`` interface and the Rust ``ParticipationFacts`` 1:1.
 
-    #: Total participation duration in seconds.
-    total_duration: float = 0.0
+    The six leaf-derived facts (participation duration, governance actions
+    against/by, context creation, role progression, tool invocation count)
+    come from the context's convergent Merkle event log.
+    ``attestation_count`` is the one exception: it is a credential-layer fact
+    (§7.4), NOT event-log-derived and NOT covered by ``event_log_root``, and
+    is **verifier-relative** (two agents may compute different counts from
+    different accessible attestation sets). ``tool_invocation_count_anchored``
+    stays ``False`` until ADR-051 makes ``ToolInvoked`` a convergent leaf.
+    """
 
-    #: Number of governance actions taken against the subject.
+    #: The DID whose participation is summarized.
+    subject_did: str = ""
+
+    #: Total seconds of context participation (§7.3.2).
+    participation_duration_secs: int = 0
+
+    #: Count of governance actions taken against this identity (the subject is
+    #: the projected target).
     governance_actions_against: int = 0
 
-    #: Tool invocation history as list of ``{"type": str, "count": int}``.
-    tool_invocations: list[dict[str, Any]] = field(default_factory=list)
+    #: Count of governance actions initiated by this identity.
+    governance_actions_by: int = 0
 
-    #: Role change history.
-    role_history: list[dict[str, Any]] = field(default_factory=list)
+    #: Total tool invocations across all tool types.
+    tool_invocation_count: int = 0
 
-    #: Endorsement accuracy score (0.0--1.0), if available.
-    endorsement_accuracy: float | None = None
+    #: Whether ``tool_invocation_count`` is anchored in the canonical Merkle
+    #: log. ``False`` until ADR-051 makes ``ToolInvoked`` a convergent leaf —
+    #: consumers MUST NOT treat the count as Merkle-proven while this is
+    #: ``False``.
+    tool_invocation_count_anchored: bool = False
+
+    #: Number of contexts created by the subject (``ChildContextCreated``).
+    context_creation_count: int = 0
+
+    #: Number of role transitions for the subject (``RoleAssigned``).
+    role_progression_count: int = 0
+
+    #: Number of accessible, currently-valid credential-layer attestations
+    #: (§7.4) for the subject. Verifier-relative; NOT a context-event count.
+    attestation_count: int = 0
+
+    #: Whether ``attestation_count`` is anchored in / verifiable against a
+    #: context Merkle root. Always ``False``: it is a credential-layer,
+    #: verifier-relative fact (§7.4), never a context-event-log count (§7.3.2).
+    #: The parallel of ``tool_invocation_count_anchored`` — consumers MUST NOT
+    #: treat the count as Merkle-proven while this is ``False``.
+    attestation_count_anchored: bool = False
+
+    #: Unix timestamp (seconds) when the record was computed.
+    computed_at: int = 0
+
+    #: Merkle root (hex) of the event log at computation time.
+    event_log_root: str = ""
 
 
 @dataclass
-class Attestation:
-    """Layer 3: A single verified attestation."""
+class AttestationSummary:
+    """Layer 3: A summary of an attestation for the subject.
 
-    #: Attestation type identifier.
+    The canonical 4-field shape shared 1:1 with the TypeScript, Swift, and
+    Kotlin SDKs' ``AttestationSummary`` — identical across all four bindings
+    (Agent-first API design tenet).
+    """
+
+    #: Attestation type.
     type: str
 
-    #: Whether the attestation signature is valid.
-    signature_valid: bool
+    #: Issuer DID.
+    issuer: str
 
-    #: Whether the evidence is valid (if applicable).
-    evidence_valid: bool | None = None
+    #: Whether the attestation is currently valid.
+    valid: bool
 
-    #: Whether the attestation is within its renewal interval.
-    fresh: bool = False
-
-    #: DID of the attestation issuer.
-    issuer: str = ""
-
-    #: The claim content.
-    claim: dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass
-class Endorsement:
-    """Layer 4: An endorsement from another participant."""
-
-    #: DID of the endorser.
-    from_did: str
-
-    #: The capability being endorsed.
-    capability: str
-
-    #: Behavioral summary of the endorser.
-    endorser_behavioral_record: dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass
-class ChallengeResult:
-    """Layer 4: Result of a capability challenge."""
-
-    #: The capability that was challenged.
-    capability: str
-
-    #: Whether the challenge was passed.
-    passed: bool
-
-    #: ISO 8601 timestamp when the challenge was verified.
-    verified_at: str = ""
+    #: Whether the attestation has been revoked.
+    revoked: bool
 
 
 @dataclass
 class TrustEvaluation:
     """Complete trust evaluation result for a subject in a context.
 
-    Contains the four-layer trust model: protocol enforcement,
-    behavioral validation, attestation authenticity, and trust
-    evaluation inputs.  The agent/client decides what to do with this
-    information -- the protocol provides the data, not the verdict.
+    Surfaces the first three layers of the trust model: protocol enforcement
+    (Layer 1), behavioral validation (Layer 2), and attestation authenticity
+    (Layer 3). The agent/client decides what to do with this information — the
+    protocol provides the data, not the verdict. This shape is identical across
+    all four SDKs (Python/TypeScript/Swift/Kotlin) for the ``evaluate_trust``
+    op (Agent-first API design tenet).
+
+    The Layer-4 trust-evaluation inputs (endorsements, challenge results,
+    consequence structures) are NOT part of this op's result — they are gathered
+    separately via :func:`aggregate_trust_input`, which returns the raw
+    ``TrustInput`` the core aggregates.
 
     See ``.docs/sketch.md`` section ``SCP.Trust.evaluate``.
     """
@@ -377,20 +293,15 @@ class TrustEvaluation:
         default_factory=CapabilityValidation,
     )
 
-    #: Layer 2: Behavioral validation (verified facts).
-    behavioral_record: BehavioralRecord | None = None
+    #: Layer 2: Behavioral validation (verified facts). Always a record, never
+    #: ``None`` — a context with no recorded participation facts yet (an empty
+    #: event log) yields a zeroed :class:`BehavioralRecord` (all counts 0,
+    #: ``*_anchored`` ``False``), so this field is non-null and identical in
+    #: shape to the TypeScript SDK's ``behavioralRecord``.
+    behavioral_record: BehavioralRecord = field(default_factory=BehavioralRecord)
 
     #: Layer 3: Attestation authenticity (verified signatures).
-    attestations: list[Attestation] = field(default_factory=list)
-
-    #: Layer 4: Endorsements from other participants.
-    endorsements: list[Endorsement] = field(default_factory=list)
-
-    #: Layer 4: Challenge results.
-    challenge_results: list[ChallengeResult] = field(default_factory=list)
-
-    #: Layer 4: Consequence rules defined by the context.
-    consequence_structure: list[dict[str, Any]] | None = None
+    attestations: list[AttestationSummary] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -691,42 +602,78 @@ class RequireParticipation:
         }
 
 
+def structured_to_capability_validation(result: Any) -> CapabilityValidation:
+    """Map a bridge ``CapabilityValidation`` record onto the SDK dataclass.
+
+    The bridge's structured ``ucan_evaluate`` result (PyO3
+    ``PyCapabilityValidation``) exposes the same six snake_case booleans as
+    the SDK :class:`CapabilityValidation`. This reads them directly -- the
+    per-check breakdown comes from the structured record, never from parsing
+    error prose (spec §7.2.4, ADR-057 Decision 3).
+    """
+    return CapabilityValidation(
+        tokens_valid=bool(result.tokens_valid),
+        signatures_valid=bool(result.signatures_valid),
+        within_ceiling=bool(result.within_ceiling),
+        nonce_valid=bool(result.nonce_valid),
+        not_revoked=bool(result.not_revoked),
+        time_bounds_valid=bool(result.time_bounds_valid),
+    )
+
+
 async def evaluate_trust(
     scp: SCP,
-    subject_did: str,
     context_id: str,
+    subject_did: str,
     capability_tokens: list[str] | None = None,
 ) -> TrustEvaluation:
     """Evaluate the trustworthiness of a participant in a context.
 
     Performs the four-layer trust evaluation model:
 
-    1. **Protocol enforcement** — validates UCAN tokens, signatures,
-       capability ceiling compliance, nonce, revocation, and expiry.
+    1. **Protocol enforcement** — evaluates each UCAN token via the
+       read-only, structured ``ucan_evaluate`` diagnostic (spec §7.2.4):
+       it returns a :class:`CapabilityValidation` of six per-stage
+       booleans without throwing on capability outcomes and without
+       recording nonce state. The six fields are AND-combined across the
+       token set, so a single token failing a stage makes that aggregate
+       field ``False``.
     2. **Behavioral validation** — queries the event log for the
        subject's participation history.
     3. **Attestation authenticity** — verifies signatures and evidence
        freshness for any attestations the subject presents.
-    4. **Trust evaluation inputs** — gathers endorsements, challenge
-       results, and consequence structures.
 
-    Phase 4 PR 5 Agent B+C (#1549) retained this module-level function:
-    it consumes the :class:`SCP` instance to dispatch ``ucan_validate``
-    and ``event_log_query`` bridge calls, then classifies the resulting
-    errors into the independent Layer 1 fields. Moving the logic into a
-    :class:`SCP` method would just add a layer of indirection; the
-    callers already receive the :class:`SCP` instance by value (matching
-    the ADR-048 explicit-instance pattern).
+    The returned :class:`TrustEvaluation` surfaces these three layers (the
+    same shape across all four SDKs). The Layer-4 trust-evaluation inputs
+    (endorsements, challenge results, consequence structures) are gathered
+    separately via :func:`aggregate_trust_input`.
+
+    SECURITY: the behavioral record's ``attestation_count`` (and challenge
+    results, where consumed) are authentic-but-self-mintable signals — an
+    issuer/verifier is self-certifying, so a subject can mint them from DIDs it
+    controls. They MUST NOT be a sole trust or admission factor; use the
+    threshold/independence path (§7.3.5) for Sybil resistance.
+
+    Layer 1 consumes the structured bridge result directly (ADR-057): it
+    does not reverse-engineer *which* check failed by parsing error prose.
+    The diagnostic is non-throwing for capability outcomes; it raises only
+    for malformed FFI inputs (e.g. a ``context_id`` with control
+    characters), which propagate to the caller.
+
+    This module-level function consumes the :class:`SCP` instance to
+    dispatch the ``ucan_evaluate`` (Layer 1) and ``participation_record``
+    (Layer 2) bridge calls. The callers already receive the :class:`SCP`
+    instance by value (matching the ADR-048 explicit-instance pattern).
 
     Args:
         scp: The :class:`~scp_sdk.SCP` instance to dispatch bridge calls on.
-        subject_did: The DID of the participant to evaluate.
         context_id: The ID of the context to evaluate trust within.
+        subject_did: The DID of the participant to evaluate.
         capability_tokens: Optional list of UCAN token strings to
-            validate as part of the evaluation.
+            evaluate as part of the evaluation.
 
     Returns:
-        A :class:`TrustEvaluation` with all four layers populated.
+        A :class:`TrustEvaluation` with Layers 1-3 populated.
     """
     logger.debug(
         "Evaluating trust for %s in context %s",
@@ -736,20 +683,23 @@ async def evaluate_trust(
 
     bridge = _bridge()
     # `_bridge()` is the seam tests use to inject a mock — patching
-    # `scp_sdk.trust._bridge` returns a mock whose `ucan_validate` /
-    # `event_log_query` / `UcanError` attributes stand in for the live
-    # bridge. In production `_bridge()` returns the real `_scp_core`
-    # module (which no longer exposes those free functions after Phase
-    # 4 PR 4), so we route through the :class:`SCP` instance.
+    # `scp_sdk.trust._bridge` returns a mock whose `ucan_evaluate` /
+    # `participation_record` attributes stand in for the live bridge. In
+    # production `_bridge()` returns the real `_scp_core` module (which no
+    # longer exposes those free functions after Phase 4 PR 4), so we route
+    # through the :class:`SCP` instance.
     if hasattr(bridge, "_mock_name"):
         instance: Any = bridge
     else:
         instance = scp._native
 
-    # Layer 1: validate capability tokens if provided.
+    # Layer 1: evaluate capability tokens if provided.
     cap_validation = CapabilityValidation()
     if capability_tokens:
-        # Start optimistic: assume all pass until a failure proves otherwise.
+        # Start from the all-True identity element for the boolean AND, then
+        # conjoin each token's structured result. An empty token list keeps
+        # the dataclass default (all False); a non-empty list begins all-True
+        # because no failing stage has been observed yet.
         cap_validation.tokens_valid = True
         cap_validation.signatures_valid = True
         cap_validation.within_ceiling = True
@@ -758,40 +708,70 @@ async def evaluate_trust(
         cap_validation.time_bounds_valid = True
 
         for token in capability_tokens:
-            try:
-                await asyncio.to_thread(instance.ucan_validate, context_id, token, "*")
-            except bridge.UcanError as exc:
-                error_msg = str(exc)
-                failed_category = _classify_ucan_error(error_msg)
-                passed = _PASSED_BEFORE.get(failed_category, set())
+            # The structured diagnostic reads bools; it does NOT throw on
+            # capability outcomes. Malformed FFI input (bad context_id /
+            # token) still raises and propagates.
+            #
+            # No challenge capability is supplied: trust evaluation assesses
+            # each token's GENERAL (intrinsic) validity — signatures, ceiling,
+            # nonce, revocation, time bounds — not whether it grants one
+            # specific capability. Passing a concrete URI here (or the old
+            # ``"*"`` sentinel, which the real bridge rejects) would wrongly
+            # impose an invoked-capability grant-match the caller never asked
+            # for. See ADR-057 / spec §7.2.4: the diagnostic's challenge
+            # capability is optional, and ``None`` means intrinsic-validity.
+            #
+            # ``subject_did`` is passed as the presenting agent so the step-5
+            # audience check evaluates the token against the DID under
+            # assessment. ``presenting_agent_did`` is REQUIRED and fail-closed:
+            # the bridge REJECTS an absent or empty value with a validation error
+            # rather than defaulting to the token's OWN ``aud``
+            # (crates/scp-ffi/src/ucan.rs). Defaulting would turn the audience
+            # check into the tautology ``aud == aud`` — reporting
+            # ``signatures_valid`` for a token addressed to someone else (trust
+            # inflation) — so the bridge refuses to assume it. The TS canonical
+            # API passes the subject the same way; this keeps an identical shape
+            # across bindings (Agent-first API design tenet).
+            result = await asyncio.to_thread(
+                instance.ucan_evaluate, context_id, token, None, subject_did
+            )
+            per_token = structured_to_capability_validation(result)
+            cap_validation.tokens_valid &= per_token.tokens_valid
+            cap_validation.signatures_valid &= per_token.signatures_valid
+            cap_validation.within_ceiling &= per_token.within_ceiling
+            cap_validation.nonce_valid &= per_token.nonce_valid
+            cap_validation.not_revoked &= per_token.not_revoked
+            cap_validation.time_bounds_valid &= per_token.time_bounds_valid
 
-                cap_validation.tokens_valid = "tokens_valid" in passed
-                cap_validation.signatures_valid = "signatures_valid" in passed
-                cap_validation.within_ceiling = "within_ceiling" in passed
-                cap_validation.nonce_valid = "nonce_valid" in passed
-                cap_validation.not_revoked = "not_revoked" in passed
-                cap_validation.time_bounds_valid = "time_bounds_valid" in passed
-                break
-
-    # Layer 2: query behavioral record from the event log.
-    behavioral: BehavioralRecord | None = None
+    # Layer 2: RECEIVE the behavioral record from the shared Rust core. The
+    # core gathers the FULL event log and flattens the participation facts
+    # (§7.3.2) ONCE in `Supervisor::participation_record`; the SDK never
+    # re-aggregates event-log collections, so every binding observes identical
+    # facts for the same context/subject (the divergence the old client-side
+    # classify suffered).
+    #
+    # No cached attestations are supplied: `evaluate_trust` takes no attestation
+    # set, so `attestation_count` reflects only what the bridge can source from
+    # its own persistent trust store (verifier-relative, §7.3.2). This honestly
+    # passes nothing rather than fabricating attestations.
+    #
+    # A context with no convergent events yet makes the core surface
+    # `NoParticipationFacts` as a `ContextError` carrying the dedicated
+    # `SCP-CTX-2076` code. That is not a failure for a trust evaluation (it means
+    # "no recorded facts"), so it is folded into a ZEROED behavioral record —
+    # branching on the STRUCTURED code, never on error prose (ADR-057). Any other
+    # error (NotInitialized, a provider failure, malformed input) is genuine and
+    # MUST propagate — the prior blanket `except ContextError` masked them.
     try:
-        events = await asyncio.to_thread(
-            instance.event_log_query,
-            context_id,
-            {"actor_did": subject_did},
-        )
-        behavioral = BehavioralRecord(
-            contexts_participated=1,
-            tool_invocations=[
-                {"type": e.event_type, "count": 1} for e in events if e.event_type == "ToolInvoked"
-            ],
-        )
-    except ContextError:
+        behavioral = _participation_record_from(instance, context_id, subject_did, "[]")
+    except ContextError as exc:
+        if exc.code != NO_PARTICIPATION_FACTS_CODE:
+            raise
         logger.debug(
-            "Could not retrieve behavioral record for %s",
+            "No recorded participation facts for %s; using a zeroed behavioral record",
             subject_did,
         )
+        behavioral = BehavioralRecord(subject_did=subject_did)
 
     return TrustEvaluation(
         subject_did=subject_did,
@@ -799,6 +779,172 @@ async def evaluate_trust(
         capability_validation=cap_validation,
         behavioral_record=behavioral,
     )
+
+
+# ---------------------------------------------------------------------------
+# Cached-attestation wire DTOs (ADR-017 §7.4.1)
+#
+# Pass-through input types for seeding the bridge's trust store. Unlike the
+# modeled OUTPUT dataclasses above (camelCase-modeled, projected FROM the
+# bridge), these mirror the serde-canonical snake_case the Rust core
+# deserializes. They are TypedDicts — dicts at runtime — so they
+# ``json.dumps`` straight onto the wire and a raw ``dict`` literal still
+# satisfies the same shape. This is the Python analogue of the TypeScript
+# SDK's ``CachedAttestation`` / ``CachedAttestationEnvelope`` interfaces, so
+# the typed input is identical across bindings (Agent-first API design tenet).
+# ---------------------------------------------------------------------------
+
+
+class _CachedAttestationEnvelopeRequired(TypedDict):
+    """Required fields of a wire-format attestation envelope."""
+
+    #: Unique attestation identifier.
+    id: str
+    #: Attestation type (serde tag, e.g. ``"IdentityLink"``).
+    attestation_type: str
+    #: DID of the attestation issuer.
+    issuer: str
+    #: DID of the attestation subject.
+    subject: str
+    #: Type-specific claim data.
+    claim: Any
+    #: Unix timestamp (seconds) when the attestation was issued.
+    issued_at: int
+    #: Current revocation status (serde-tagged).
+    revocation_status: Any
+    #: Ed25519 signature over the attestation content (64 bytes as ints).
+    signature: list[int]
+
+
+class CachedAttestationEnvelope(_CachedAttestationEnvelopeRequired, total=False):
+    """Wire-format attestation envelope (ADR-017 §7.4.1).
+
+    A pass-through DTO whose field names are the serde-canonical snake_case the
+    Rust core deserializes, NOT the camelCase the SDK uses for core-modeled
+    types. Mirrors the TypeScript SDK ``CachedAttestationEnvelope`` 1:1.
+    """
+
+    #: Optional evidence supporting the attestation
+    #: (``{"evidence_type": str, "data": Any}``).
+    evidence: dict[str, Any] | None
+    #: Optional expiry timestamp (seconds).
+    expires_at: int | None
+    #: Optional renewal interval (``std::time::Duration`` → ``{secs, nanos}``).
+    renewal_interval: dict[str, int] | None
+    #: Timestamp (seconds) of the last renewal, if renewable.
+    renewed_at: int | None
+
+
+class CachedAttestation(TypedDict):
+    """A verified attestation with cache TTL metadata (ADR-017).
+
+    Pass a list of these to :func:`participation_record` (or
+    :func:`aggregate_trust_input`) to seed the bridge's trust store before it
+    sources the subject's verified set. Mirrors the Rust ``CachedAttestation``
+    and the TypeScript SDK ``CachedAttestation`` 1:1. A raw ``dict`` of the
+    same shape is also accepted (a ``TypedDict`` is a ``dict`` at runtime).
+    """
+
+    #: The verified attestation envelope.
+    attestation: CachedAttestationEnvelope
+    #: Unix timestamp (seconds) when the attestation was last verified.
+    verified_at: int
+    #: Time-to-live in seconds for the cache entry.
+    ttl_secs: int
+
+
+def _participation_record_from(
+    instance: Any,
+    context_id: str,
+    subject_did: str,
+    cached_attestations_json: str,
+) -> BehavioralRecord:
+    """Call the bridge ``participation_record`` op and project the typed result.
+
+    Shared by :func:`participation_record` and :func:`evaluate_trust` so the
+    PyParticipationRecord → :class:`BehavioralRecord` projection lives in ONE
+    place. ``instance`` is the resolved bridge handle (the mock seam in tests
+    or ``scp._native`` in production).
+    """
+    try:
+        record = instance.participation_record(context_id, subject_did, cached_attestations_json)
+    except Exception as exc:  # PyO3 raises native Scp*Error; mock seam may raise SDK errors
+        # Re-raise as a coded SDK exception so callers (and :func:`evaluate_trust`)
+        # branch on the STRUCTURED ``.code`` — e.g. the empty-log
+        # ``SCP-CTX-2076`` — never on error prose.
+        raise _coded_bridge_error(exc) from exc
+    return BehavioralRecord(
+        subject_did=record.subject_did,
+        participation_duration_secs=record.participation_duration_secs,
+        governance_actions_against=record.governance_actions_against,
+        governance_actions_by=record.governance_actions_by,
+        tool_invocation_count=record.tool_invocation_count,
+        tool_invocation_count_anchored=record.tool_invocation_count_anchored,
+        context_creation_count=record.context_creation_count,
+        role_progression_count=record.role_progression_count,
+        attestation_count=record.attestation_count,
+        attestation_count_anchored=record.attestation_count_anchored,
+        computed_at=record.computed_at,
+        event_log_root=record.event_log_root,
+    )
+
+
+def participation_record(
+    scp: SCP,
+    context_id: str,
+    subject_did: str,
+    cached_attestations: list[CachedAttestation] | list[dict[str, Any]] | None = None,
+) -> BehavioralRecord:
+    """Compute the participation record (§7.3.2) for a subject in a context.
+
+    The shared Rust core gathers the FULL context event log and flattens the
+    participation facts ONCE (``Supervisor::participation_record``), and the
+    PyO3 bridge sources the subject's accessible, currently-valid attestations
+    from its own persistent trust store (seeded by ``cached_attestations``).
+    The SDK RECEIVES the flattened :class:`BehavioralRecord` — it never
+    re-aggregates event-log collections, so every binding observes identical
+    facts for the same context/subject.
+
+    ``attestation_count`` is a credential-layer fact (§7.4): it is NOT a
+    context-event count and NOT Merkle-anchored, and is verifier-relative
+    (computed from the attestations the bridge can access). Pass the subject's
+    accessible attestations as ``cached_attestations`` to populate it; the
+    default (``None`` → ``"[]"``) honestly reports only what the bridge's trust
+    store already holds — it never fabricates attestations.
+
+    THREAT MODEL: ``attestation_count`` is Sybil-inflatable by self-issuance —
+    one operator can self-issue (or co-issue across DIDs it controls)
+    arbitrarily many *authentic* attestations. It is a credential-layer claim
+    count, NOT a standalone trust score; Sybil resistance comes from the
+    threshold/independence path (§7.3.5) and DeviceAttestation binding (§9.3),
+    not the count itself. Separately, the membership/role-derived facts
+    (participation duration, governance actions, role progression) are
+    committer-local — verifier-relative, not independently Merkle-verifiable —
+    until ADR-051 receive-side replication lands. In particular,
+    ``participation_duration_secs`` for the context creator (founder) is
+    derived from the creator-assigned context-creation timestamp — it is
+    creator-timestamp-trusting and committer-local until that replication
+    lands (no independent receiver corroborates the creator's clock).
+
+    Args:
+        scp: The :class:`~scp_sdk.SCP` instance to dispatch the bridge call on.
+        context_id: The context the participation is scoped to.
+        subject_did: The DID whose participation facts are computed.
+        cached_attestations: Optional list of :class:`CachedAttestation` (typed)
+            or raw equivalently-shaped dicts to seed the bridge's trust store
+            before sourcing the subject's verified set.
+
+    Returns:
+        The flattened participation facts as a :class:`BehavioralRecord`.
+
+    Raises:
+        ScpError: On malformed FFI input or a behavioral compute failure (e.g.
+            an empty event log, surfaced as a :class:`ContextError`).
+    """
+    bridge = _bridge()
+    instance: Any = bridge if hasattr(bridge, "_mock_name") else scp._native
+    cached_json = json.dumps(cached_attestations if cached_attestations is not None else [])
+    return _participation_record_from(instance, context_id, subject_did, cached_json)
 
 
 def aggregate_trust_input(
@@ -810,18 +956,17 @@ def aggregate_trust_input(
     consequence_rules: list[dict[str, Any]] | None = None,
     threshold_requirements: dict[str, Any] | None = None,
     attestor_sets: dict[str, Any] | None = None,
-    cached_attestations: list[dict[str, Any]] | None = None,
+    cached_attestations: list[CachedAttestation] | list[dict[str, Any]] | None = None,
     challenge_results: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Aggregate all trust engine layers into a single TrustInput.
 
-    Phase 4 PR 5 Agent B+C (#1549) retained this module-level helper
-    because it is a pure serialization layer over
-    :meth:`scp_sdk.SCP.aggregate_trust_input` — it takes the
-    caller-friendly Python types (lists/dicts of ``Any``) and produces
-    the ``json.dumps``-serialized strings the bridge expects. Using ``is
-    not None`` (never a falsy check) keeps the distinction between an
-    explicit empty collection and an absent parameter — empty means
+    Phase 4 PR 5 Agent B+C retained this module-level helper because it is
+    a pure serialization layer over :meth:`scp_sdk.SCP.aggregate_trust_input`
+    -- it takes the caller-friendly Python types (lists/dicts of ``Any``)
+    and produces the ``json.dumps``-serialized strings the bridge expects.
+    Using ``is not None`` (never a falsy check) keeps the distinction between
+    an explicit empty collection and an absent parameter — empty means
     "no rules apply", absent means "use protocol defaults".
 
     Args:
@@ -835,8 +980,9 @@ def aggregate_trust_input(
             names to threshold requirement dicts.
         attestor_sets: Optional mapping of attestation type names to
             lists of attestor info dicts.
-        cached_attestations: Optional list of cached attestation dicts
-            to pre-populate the in-memory trust store.
+        cached_attestations: Optional list of :class:`CachedAttestation`
+            (typed) or raw equivalently-shaped dicts to pre-populate the
+            in-memory trust store.
         challenge_results: Optional list of challenge verification
             dicts to pre-populate the in-memory trust store.
 
@@ -893,6 +1039,7 @@ def aggregate_trust_input(
 
 
 def verify_participation_requirements(
+    expected_subject: str,
     requirements: list[RequireParticipation],
     profiles: list[ParticipationProfile],
 ) -> None:
@@ -901,18 +1048,35 @@ def verify_participation_requirements(
     Delegates to the Rust ``scp-core`` implementation via the PyO3
     bridge, which performs the full verification including:
 
-    1. Signature verification on all participation profiles.
-    2. Freshness/staleness checking (``max_age_secs``).
-    3. Distinct signer counting (``min_contexts``).
-    4. Threshold operator semantics (``ParticipationThreshold``).
-    5. Diagnostic error reporting (``ParticipationAdmissionError``).
-    6. Typed field extraction (``ParticipationFact.extract_value``).
+    1. Subject binding: only profiles whose signed ``subject_did`` equals
+       ``expected_subject`` contribute to any threshold, freshness, or
+       distinct-signer accounting. Participation profiles are public and
+       signed by the *context*, not the subject, so without this binding a
+       victim's genuine high-standing profiles could be replayed to admit a
+       different agent (cross-subject participation-profile replay).
+    2. Signature verification on subject-matching participation profiles.
+    3. Freshness/staleness checking (``max_age_secs``).
+    4. Distinct signer counting (``min_contexts``).
+    5. Threshold operator semantics (``ParticipationThreshold``).
+    6. Diagnostic error reporting (``ParticipationAdmissionError``).
+    7. Typed field extraction (``ParticipationFact.extract_value``).
+
+    Security caveat — authenticity is not authorization: this verifies that
+    each profile is genuinely signed over its subject binding, NOT that the
+    signer is trusted. ``signer_public_key`` is self-certifying, so a subject
+    can present genuinely-signed profiles from signers it controls, inflating
+    ``min_contexts``. Consumers MUST establish signer legitimacy separately
+    (a trusted-signer set, a context-membership proof, or the §7.3.5
+    threshold/independence path) and MUST NOT treat a passing check as an
+    authorization decision.
 
     Success is indicated by returning without exception. Verification
     failures raise ``RuntimeError`` with diagnostic details from the
     Rust bridge.
 
     Args:
+        expected_subject: The DID of the agent being admitted. Profiles for
+            any other subject are ignored (fail-closed).
         requirements: The participation requirements to verify against.
         profiles: The participation profiles to evaluate.
 
@@ -927,17 +1091,17 @@ def verify_participation_requirements(
     profile_json = json.dumps([p._to_bridge_dict() for p in profiles])
     requirements_json = json.dumps([r._to_bridge_dict() for r in requirements])
 
-    bridge.verify_participation_requirements(profile_json, requirements_json)
+    bridge.verify_participation_requirements(expected_subject, requirements_json, profile_json)
 
 
 __all__ = [
     "PARTICIPATION_FACT_VARIANTS",
     "PARTICIPATION_THRESHOLD_OPERATORS",
-    "Attestation",
+    "AttestationSummary",
     "BehavioralRecord",
+    "CachedAttestation",
+    "CachedAttestationEnvelope",
     "CapabilityValidation",
-    "ChallengeResult",
-    "Endorsement",
     "ParticipationFact",
     "ParticipationProfile",
     "ParticipationThreshold",
@@ -945,5 +1109,6 @@ __all__ = [
     "TrustEvaluation",
     "aggregate_trust_input",
     "evaluate_trust",
+    "participation_record",
     "verify_participation_requirements",
 ]

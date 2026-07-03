@@ -806,30 +806,295 @@ export interface EventClaim {
 // Trust
 // ---------------------------------------------------------------------------
 
+/**
+ * Layer 1 of the trust model: protocol-enforcement results (mechanical,
+ * pass/fail). Each field is one stage of the 11-step ADR-016 UCAN
+ * validation pipeline, surfaced by the read-only `ucanEvaluate` diagnostic
+ * (spec §7.2.4, ADR-057 Decision 3).
+ *
+ * The six booleans cross the FFI already camelCased (the NAPI
+ * `NapiCapabilityValidation` `#[napi(object)]`), so the SDK consumes them
+ * directly and never reverse-engineers *which* check failed by parsing
+ * human-readable error prose. All fields must be `true` for the subject to be
+ * considered protocol-compliant.
+ */
+export interface CapabilityValidation {
+  /** Step 1: UCAN tokens parse and have valid structure. */
+  readonly tokensValid: boolean;
+  /**
+   * Steps 2-7: signatures, the full delegation chain, root issuer, audience,
+   * key scope, Category-A enforcement, and attenuation verify. The
+   * invoked-capability grant-match (step 6) is included ONLY when a challenge
+   * capability is supplied; in the diagnostic's intrinsic-validity mode
+   * (`evaluateTrust`'s mode — no challenge), step 6 is SKIPPED and this field
+   * reflects only the structural checks, not grant-match.
+   */
+  readonly signaturesValid: boolean;
+  /** Step 8: every granted capability is within the context's ceiling. */
+  readonly withinCeiling: boolean;
+  /** Step 9: nonce format, freshness, and uniqueness passed (probed read-only — the nonce is NOT recorded). */
+  readonly nonceValid: boolean;
+  /** Step 10: no token's revocation CID is on the revocation list. */
+  readonly notRevoked: boolean;
+  /** Step 11: `exp`/`nbf` time bounds are valid (within clock-skew tolerance). */
+  readonly timeBoundsValid: boolean;
+}
+
+/**
+ * `true` iff every per-stage check in `v` passed.
+ *
+ * The one obvious correct happy-path call: collapses the six per-stage booleans
+ * of {@link CapabilityValidation} with a logical AND so consumers do not
+ * hand-roll the conjunction (and cannot silently omit a field when a new stage
+ * is added). A token is protocol-compliant only when all six are `true`.
+ * Mirrors the Python `CapabilityValidation.all_valid` accessor.
+ *
+ * SECURITY: this is a DIAGNOSTIC, NEVER an authorization decision. It reports
+ * that the UCAN tokens are *intrinsically well-formed and valid*; it does NOT
+ * authorize any action. In intrinsic mode (capability = `null`/none — no
+ * challenge capability supplied, the mode `evaluateTrust` uses), the
+ * invoked-capability grant-match (step 6) is SKIPPED, so `allValid` (and
+ * `signaturesValid` / `withinCeiling`) returning `true` does NOT assert that any
+ * specific capability is granted. The diagnostic is also read-only: the nonce is
+ * probed but NOT consumed, so the evaluated tokens remain replayable against the
+ * enforcing path — another reason this is never an authorization decision. To
+ * gate an action, pass the concrete capability to `ucanEvaluate` (which then
+ * includes grant-match in `signaturesValid`) — or use the enforcing UCAN
+ * validation path (which consumes the nonce). Treating `allValid` as "the agent
+ * may do X" is a security error.
+ */
+export function allValid(v: CapabilityValidation): boolean {
+  return (
+    v.tokensValid &&
+    v.signaturesValid &&
+    v.withinCeiling &&
+    v.nonceValid &&
+    v.notRevoked &&
+    v.timeBoundsValid
+  );
+}
+
 /** Trust evaluation input for a participant. */
 export interface TrustEvaluation {
   /** The subject DID being evaluated. */
   readonly subjectDid: string;
   /** The context ID in which trust is being evaluated. */
   readonly contextId: string;
-  /** Behavioral record computed from the event log. */
+  /**
+   * Layer 1: protocol enforcement (mechanical pass/fail). The six per-stage
+   * booleans are AND-combined across the evaluated capability-token set, so a
+   * single token failing a stage makes that aggregate field `false`. When no
+   * tokens were supplied every field is `false` (no stage was observed to
+   * pass).
+   */
+  readonly capabilityValidation: CapabilityValidation;
+  /**
+   * Layer 2: behavioral record. The Rust-computed participation facts
+   * (§7.3.2), RECEIVED from the core via {@link "./scp".SCP.participationRecord}
+   * — never recomputed client-side, so every binding observes the identical
+   * facts for the same context/subject.
+   */
   readonly behavioralRecord: BehavioralRecord;
-  /** Attestations for the subject. */
+  /** Layer 3: attestations for the subject. */
   readonly attestations: readonly AttestationSummary[];
 }
 
-/** Behavioral record computed from a context event log. */
+/**
+ * The participation facts (§7.3.2) for a subject DID in a context.
+ *
+ * The scalar projection of scp-core's `ParticipationRecord`, computed ONCE in
+ * the shared Rust core and surfaced through the NAPI `participationRecord` op
+ * (`NapiParticipationRecord`). The SDK RECEIVES these facts rather than
+ * re-aggregating event-log collections — eliminating cross-binding divergence
+ * by construction. Mirrors the Python SDK `BehavioralRecord` shape and the
+ * Rust `ParticipationFacts` 1:1.
+ */
 export interface BehavioralRecord {
-  /** Number of messages sent or actions taken. */
-  readonly participationCount: number;
-  /** Duration of participation in seconds. */
-  readonly participationDurationSeconds: number;
-  /** Tool invocations keyed by tool ID. */
-  readonly toolInvocations: Readonly<Record<string, number>>;
-  /** Governance actions initiated by this participant. */
-  readonly governanceActionsBy: number;
-  /** Governance actions targeting this participant. */
+  /** The DID whose participation is summarized. */
+  readonly subjectDid: string;
+  /** Total seconds of context participation (§7.3.2). */
+  readonly participationDurationSecs: number;
+  /** Count of governance actions taken against this identity. */
   readonly governanceActionsAgainst: number;
+  /** Count of governance actions initiated by this identity. */
+  readonly governanceActionsBy: number;
+  /** Total tool invocations across all tool types. */
+  readonly toolInvocationCount: number;
+  /**
+   * Whether {@link toolInvocationCount} is anchored in the canonical Merkle
+   * log. `false` until ADR-051 makes `ToolInvoked` a convergent leaf
+   * (§7.3.2; ADR-011 amendment exclusion taxonomy §2). Consumers MUST NOT
+   * treat the count as Merkle-proven while this is `false`.
+   */
+  readonly toolInvocationCountAnchored: boolean;
+  /** Number of contexts created by the subject (`ChildContextCreated`). */
+  readonly contextCreationCount: number;
+  /** Number of role transitions for the subject (`RoleAssigned`). */
+  readonly roleProgressionCount: number;
+  /**
+   * Number of accessible, currently-valid credential-layer attestations
+   * (§7.4) for the subject. A credential-layer fact, NOT a context-event
+   * count and NOT Merkle-anchored — verifier-relative (two agents may
+   * compute different counts from different accessible attestation sets).
+   */
+  readonly attestationCount: number;
+  /**
+   * Whether {@link attestationCount} is anchored in / verifiable against a
+   * context Merkle root. Always `false`: it is a credential-layer,
+   * verifier-relative fact (§7.4), never a context-event-log count (§7.3.2).
+   * The parallel of {@link toolInvocationCountAnchored}; consumers MUST NOT
+   * treat the count as Merkle-proven while this is `false`.
+   */
+  readonly attestationCountAnchored: boolean;
+  /** Unix timestamp (seconds) when the record was computed. */
+  readonly computedAt: number;
+  /** Merkle root (hex) of the event log at computation time. */
+  readonly eventLogRoot: string;
+}
+
+/**
+ * Optional evidence supporting a {@link CachedAttestationEnvelope}.
+ *
+ * Developer-facing fields are camelCase, matching the Swift
+ * `CachedAttestationEvidence` and Kotlin convention. {@link encodeCachedAttestations}
+ * maps `evidenceType` to the serde-canonical `evidence_type` on the wire.
+ */
+export interface CachedAttestationEvidence {
+  /** The evidence type discriminator. */
+  readonly evidenceType: string;
+  /** Type-specific evidence data. */
+  readonly data: unknown;
+}
+
+/**
+ * A `std::time::Duration` as the Rust core's serde representation
+ * (`{ secs, nanos }`), used for a renewable attestation's renewal interval.
+ * `secs`/`nanos` are the Rust field names and are identical on the wire.
+ */
+export interface CachedAttestationDuration {
+  /** Whole seconds. */
+  readonly secs: number;
+  /** Sub-second nanoseconds. */
+  readonly nanos: number;
+}
+
+/**
+ * Attestation envelope (ADR-017 §7.4.1).
+ *
+ * Developer-facing fields are camelCase, matching the other typed SDK output
+ * types ({@link BehavioralRecord}, {@link CapabilityValidation}) and the Swift
+ * `CachedAttestationEnvelope` `CodingKeys` / Kotlin convention. The wire format
+ * the Rust bridge deserializes is serde-canonical snake_case;
+ * {@link encodeCachedAttestations} performs the camelCase → snake_case mapping
+ * at the serialization boundary.
+ */
+export interface CachedAttestationEnvelope {
+  /** Unique attestation identifier. */
+  readonly id: string;
+  /** Attestation type (serde tag, e.g. `"IdentityLink"`). */
+  readonly attestationType: string;
+  /** DID of the attestation issuer. */
+  readonly issuer: string;
+  /** DID of the attestation subject. */
+  readonly subject: string;
+  /** Type-specific claim data. */
+  readonly claim: unknown;
+  /** Optional evidence supporting the attestation. */
+  readonly evidence?: CachedAttestationEvidence | null;
+  /** Unix timestamp (seconds) when the attestation was issued. */
+  readonly issuedAt: number;
+  /** Optional expiry timestamp (seconds). */
+  readonly expiresAt?: number | null;
+  /** Optional renewal interval (`std::time::Duration` → `{ secs, nanos }`). */
+  readonly renewalInterval?: CachedAttestationDuration | null;
+  /** Timestamp (seconds) of the last renewal, if renewable. */
+  readonly renewedAt?: number | null;
+  /** Current revocation status (serde-tagged). */
+  readonly revocationStatus: unknown;
+  /** Ed25519 signature over the attestation content (64 bytes). */
+  readonly signature: readonly number[];
+}
+
+/**
+ * A verified attestation with cache TTL metadata (ADR-017).
+ *
+ * Pass an array of these to {@link SCP.participationRecord} to seed the
+ * bridge's trust store before it sources the subject's verified set. Mirrors
+ * the Rust `CachedAttestation` and the Swift/Kotlin `CachedAttestation` types
+ * 1:1 (camelCase developer-facing fields; {@link encodeCachedAttestations}
+ * serializes to the snake_case wire shape). An empty array (the default) seeds
+ * nothing — the bridge reports only what it already holds (verifier-relative,
+ * §7.4).
+ */
+export interface CachedAttestation {
+  /** The verified attestation envelope. */
+  readonly attestation: CachedAttestationEnvelope;
+  /** Unix timestamp (seconds) when the attestation was last verified. */
+  readonly verifiedAt: number;
+  /** Time-to-live in seconds for the cache entry. */
+  readonly ttlSecs: number;
+}
+
+/**
+ * Encodes a typed {@link CachedAttestation} array to the JSON wire shape the
+ * Rust bridge deserializes.
+ *
+ * The developer-facing types are camelCase (matching the other typed SDK types
+ * and the Swift/Kotlin SDKs), but the bridge expects serde-canonical
+ * snake_case. This maps `attestationType → attestation_type`,
+ * `issuedAt → issued_at`, `verifiedAt → verified_at`, etc., mirroring the Swift
+ * `CodingKeys` and Kotlin `buildJsonObject` mappings. The `renewalInterval`
+ * `{ secs, nanos }` shape is identical on the wire (Rust `Duration` field
+ * names), so it passes through unchanged.
+ *
+ * Public for SDK call sites that serialize cached attestations onto the wire
+ * (e.g. {@link SCP.participationRecord}) and for tests that pin the wire shape
+ * against the Rust serde format.
+ */
+export function encodeCachedAttestations(cachedAttestations: readonly CachedAttestation[]): string {
+  return JSON.stringify(cachedAttestations.map(encodeCachedAttestation));
+}
+
+function encodeCachedAttestation(cached: CachedAttestation): Record<string, unknown> {
+  return {
+    attestation: encodeCachedAttestationEnvelope(cached.attestation),
+    verified_at: cached.verifiedAt,
+    ttl_secs: cached.ttlSecs,
+  };
+}
+
+function encodeCachedAttestationEnvelope(
+  envelope: CachedAttestationEnvelope,
+): Record<string, unknown> {
+  const wire: Record<string, unknown> = {
+    id: envelope.id,
+    attestation_type: envelope.attestationType,
+    issuer: envelope.issuer,
+    subject: envelope.subject,
+    claim: envelope.claim,
+    issued_at: envelope.issuedAt,
+    revocation_status: envelope.revocationStatus,
+    signature: envelope.signature,
+  };
+  if (envelope.evidence != null) {
+    wire.evidence = {
+      evidence_type: envelope.evidence.evidenceType,
+      data: envelope.evidence.data,
+    };
+  }
+  if (envelope.expiresAt != null) {
+    wire.expires_at = envelope.expiresAt;
+  }
+  if (envelope.renewalInterval != null) {
+    wire.renewal_interval = {
+      secs: envelope.renewalInterval.secs,
+      nanos: envelope.renewalInterval.nanos,
+    };
+  }
+  if (envelope.renewedAt != null) {
+    wire.renewed_at = envelope.renewedAt;
+  }
+  return wire;
 }
 
 /** Summary of an attestation. */

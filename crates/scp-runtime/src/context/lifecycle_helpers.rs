@@ -323,6 +323,17 @@ pub async fn leave_context(
             }
         }
 
+        // Capture the leaving member's role name BEFORE the membership/role
+        // strip below — the role held at departure, carried into the
+        // subject-bearing MemberLeft leaf (ADR-011 amendment) so the
+        // participation record (§7.3.2) attributes the self-leave to this
+        // member with its role context.
+        let left_role_name = state
+            .membership
+            .get(member_did.as_ref())
+            .map(|info| info.role_name.clone())
+            .unwrap_or_default();
+
         if !state.membership.remove_member(member_did) {
             return Err(ContextError::MemberNotFound(member_did.to_string()));
         }
@@ -367,18 +378,25 @@ pub async fn leave_context(
 
         let should_close = state.membership.count() == 0;
 
-        // Append MemberLeft event to event log.
-        deps.event_log.append_context_event(
+        // Append MemberLeft event to event log. Subject-bearing leaf (ADR-011
+        // amendment): the payload carries the affected member (`member_did`,
+        // which on a self-leave already equals `actor_did`) and its role at
+        // departure, so the leaf shape is uniform with admin-driven removals and
+        // the SDK reads `subject_did` consistently.
+        //
+        // Committer-assigned: the leaving member's clock — the source of the
+        // `created_at` on its outgoing leave commit. This is the
+        // convergent-by-construction value WHEN cross-member leaf replication
+        // lands: the receive-side append path is currently dormant, so this
+        // leaf is committer-appended-only and is NOT yet replicated to other
+        // members. Cross-member convergence of membership leaves is the forward
+        // step under ADR-051 (§7.3.1, §9.9.3).
+        deps.event_log.append_membership_change_leaf(
             &context_id_bytes,
             scp_event_log::EventType::MemberLeft,
             member_did.as_ref(),
-            // Committer-assigned: the leaving member's clock — the source of the
-            // `created_at` on its outgoing leave commit. This is the
-            // convergent-by-construction value WHEN cross-member leaf replication
-            // lands: the receive-side append path is currently dormant, so this
-            // leaf is committer-appended-only and is NOT yet replicated to other
-            // members. Cross-member convergence of membership leaves is the
-            // forward step under ADR-051 (§7.3.1, §9.9.3).
+            member_did.as_ref(),
+            &left_role_name,
             deps.clock.now_secs(),
         )?;
         state.checkpoint_events_since += 1;
@@ -993,17 +1011,28 @@ pub async fn join_context(
     // joiner for an unacknowledged join. VOID the escrow here (gated on
     // `auth.is_some()`) before returning — mirroring the money-ordering rule the
     // persist-failure branch below already follows.
-    if let Err(e) = deps.event_log.append_context_event(
+    // Subject-bearing leaf (ADR-011 amendment): carry the joining member
+    // (`member_did`, which on a self-join already equals `actor_did`) and the
+    // default "member" role, so the leaf shape is uniform with admin-driven
+    // adds and the SDK reads `subject_did` consistently. The participation
+    // record (§7.3.2) attributes the join interval to this subject. A payload
+    // encoding failure is folded into the same `ContextError::EventLogFailed`
+    // the append would raise, so the fail-closed nonce/escrow handling below
+    // covers it identically.
+    //
+    // Committer-assigned: the joining member's clock (captured once above as
+    // `now_secs`) — the source of the `created_at` on its outgoing join commit.
+    // Convergent-by-construction WHEN cross-member leaf replication lands; the
+    // receive-side append path is currently dormant, so this leaf is
+    // committer-appended-only and is NOT yet replicated to other members.
+    // Cross-member convergence is the forward step under ADR-051 (§7.3.1,
+    // §9.9.3).
+    if let Err(e) = deps.event_log.append_membership_change_leaf(
         &context_id_bytes,
         scp_event_log::EventType::MemberJoined,
         member_did.as_ref(),
-        // Committer-assigned: the joining member's clock (captured once above as
-        // `now_secs`) — the source of the `created_at` on its outgoing join
-        // commit. Convergent-by-construction WHEN cross-member leaf replication
-        // lands; the receive-side append path is currently dormant, so this
-        // leaf is committer-appended-only and is NOT yet replicated to other
-        // members. Cross-member convergence is the forward step under ADR-051
-        // (§7.3.1, §9.9.3).
+        member_did.as_ref(),
+        "member",
         now_secs,
     ) {
         // Keep-direction (ADR-049 §9): persist the burned nonce fail-closed

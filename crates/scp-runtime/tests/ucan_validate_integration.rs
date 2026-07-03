@@ -2080,8 +2080,8 @@ async fn evaluate_ucan_does_not_consume_nonce_but_validate_does() {
             &issuer_did,
             "did:dht:z6MkMember",
         );
-        let first = evaluate_ucan(&token, &required_cap, &ctx);
-        let second = evaluate_ucan(&token, &required_cap, &ctx);
+        let first = evaluate_ucan(&token, Some(&required_cap), &ctx);
+        let second = evaluate_ucan(&token, Some(&required_cap), &ctx);
         assert!(
             first.nonce_valid && second.nonce_valid,
             "evaluate_ucan must not consume the nonce: {first:?} {second:?}"
@@ -2186,7 +2186,7 @@ async fn evaluate_ucan_reports_bad_signature() {
         "did:dht:z6MkMember",
     );
 
-    let result = evaluate_ucan(&token, &required_cap, &ctx);
+    let result = evaluate_ucan(&token, Some(&required_cap), &ctx);
     assert_eq!(
         result,
         CapabilityValidation {
@@ -2251,7 +2251,7 @@ async fn evaluate_ucan_reports_out_of_ceiling_attestation() {
         "did:dht:z6MkMember",
     );
 
-    let result = evaluate_ucan(&token, &required_cap, &ctx);
+    let result = evaluate_ucan(&token, Some(&required_cap), &ctx);
     assert_eq!(
         result,
         CapabilityValidation {
@@ -2320,7 +2320,7 @@ async fn evaluate_ucan_reports_revoked_token() {
         "did:dht:z6MkMember",
     );
 
-    let result = evaluate_ucan(&token, &required_cap, &ctx);
+    let result = evaluate_ucan(&token, Some(&required_cap), &ctx);
     assert_eq!(
         result,
         CapabilityValidation {
@@ -2389,7 +2389,7 @@ async fn evaluate_ucan_reports_expired_token() {
     // Use zero tolerance so the 2-second expiry is detected.
     ctx.clock_skew_tolerance_secs = 0;
 
-    let result = evaluate_ucan(&token, &required_cap, &ctx);
+    let result = evaluate_ucan(&token, Some(&required_cap), &ctx);
     assert_eq!(
         result,
         CapabilityValidation {
@@ -2485,8 +2485,8 @@ async fn evaluate_ucan_partial_struct_for_ungranted_capability_is_stable() {
         time_bounds_valid: false,
     };
 
-    let first = evaluate_ucan(&token, &required_cap, &ctx);
-    let second = evaluate_ucan(&token, &required_cap, &ctx);
+    let first = evaluate_ucan(&token, Some(&required_cap), &ctx);
+    let second = evaluate_ucan(&token, Some(&required_cap), &ctx);
 
     assert_eq!(
         first, expected,
@@ -2497,5 +2497,231 @@ async fn evaluate_ucan_partial_struct_for_ungranted_capability_is_stable() {
         first, second,
         "evaluate_ucan must be deterministic / side-effect-free across repeated \
          calls on a mid-pipeline failure: {first:?} {second:?}"
+    );
+}
+
+/// `evaluate_ucan` with `None` (intrinsic-validity diagnostic) on a fully valid
+/// token reports all six fields `true` — identical to the `Some(granted-cap)`
+/// path. `None` simply omits the invoked-capability grant-match; it must NEVER
+/// flip a field that another check would have set.
+#[tokio::test]
+async fn evaluate_ucan_none_capability_valid_token_all_true() {
+    let (custody, key_handle, issuer_did, pk_bytes) = setup_identity().await;
+    let caps = vec!["messages:write".to_owned()];
+
+    let params = MintParams {
+        issuer_did: &issuer_did,
+        issuer_key: &key_handle,
+        audience_did: "did:dht:z6MkMember",
+        context_id: "ctx-eval-none-valid",
+        capabilities: &caps,
+        lifetime_secs: 3600,
+        not_before: None,
+        proofs: vec![],
+        facts: None,
+        key_scope: None,
+        signing_key_id: None,
+        ceiling: None,
+    };
+
+    let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        .await
+        .unwrap();
+
+    let resolver = InMemoryDidResolver {
+        keys: std::iter::once((issuer_did.clone(), pk_bytes)).collect(),
+        kid_keys: std::collections::HashMap::new(),
+    };
+    let mut nonce_tracker = InMemoryNonceTracker::new();
+    let revocation_checker = InMemoryRevocationChecker::new();
+    let proof_resolver = InMemoryProofResolver::new();
+    let ceiling = default_ceiling();
+
+    let ctx = build_context(
+        &resolver,
+        &mut nonce_tracker,
+        &revocation_checker,
+        &proof_resolver,
+        &ceiling,
+        &issuer_did,
+        "did:dht:z6MkMember",
+    );
+
+    // No challenge capability — intrinsic-validity mode.
+    let result = evaluate_ucan(&token, None, &ctx);
+    assert_eq!(
+        result,
+        CapabilityValidation {
+            tokens_valid: true,
+            signatures_valid: true,
+            within_ceiling: true,
+            nonce_valid: true,
+            not_revoked: true,
+            time_bounds_valid: true,
+        },
+        "None (intrinsic) on a valid token must be all-true: {result:?}"
+    );
+}
+
+/// `evaluate_ucan` with `None` still enforces the all-attestation ceiling
+/// (step 8) over the token's OWN `att` set — that check is independent of any
+/// challenge capability. A token whose granted caps exceed the context ceiling
+/// reports `within_ceiling: false` even in intrinsic-validity mode, proving
+/// `None` is fail-closed and does not disable ceiling enforcement.
+#[tokio::test]
+async fn evaluate_ucan_none_capability_out_of_ceiling_reports_false() {
+    let (custody, key_handle, issuer_did, pk_bytes) = setup_identity().await;
+
+    let caps = vec!["messages:write".to_owned(), "role:assign".to_owned()];
+    let mint_ceiling: HashSet<String> = ["messages:write".to_owned(), "role:assign".to_owned()]
+        .into_iter()
+        .collect();
+
+    let params = MintParams {
+        issuer_did: &issuer_did,
+        issuer_key: &key_handle,
+        audience_did: "did:dht:z6MkMember",
+        context_id: "ctx-eval-none-ceiling",
+        capabilities: &caps,
+        lifetime_secs: 3600,
+        not_before: None,
+        proofs: vec![],
+        facts: None,
+        key_scope: None,
+        signing_key_id: None,
+        ceiling: Some(mint_ceiling),
+    };
+
+    let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        .await
+        .unwrap();
+
+    let resolver = InMemoryDidResolver {
+        keys: std::iter::once((issuer_did.clone(), pk_bytes)).collect(),
+        kid_keys: std::collections::HashMap::new(),
+    };
+    let mut nonce_tracker = InMemoryNonceTracker::new();
+    let revocation_checker = InMemoryRevocationChecker::new();
+    let proof_resolver = InMemoryProofResolver::new();
+    // Context ceiling permits only messages:write, so the token's role:assign
+    // attestation exceeds it.
+    let ceiling: HashSet<String> = std::iter::once("messages:write".to_owned()).collect();
+
+    let ctx = build_context(
+        &resolver,
+        &mut nonce_tracker,
+        &revocation_checker,
+        &proof_resolver,
+        &ceiling,
+        &issuer_did,
+        "did:dht:z6MkMember",
+    );
+
+    let result = evaluate_ucan(&token, None, &ctx);
+    assert_eq!(
+        result,
+        CapabilityValidation {
+            tokens_valid: true,
+            // signatures_valid is true: grant-match is skipped in None mode, and
+            // every structural check (sig/chain/issuer/aud/key-scope/cat-A/atten)
+            // passes; the divergence is purely the all-att ceiling (step 8).
+            signatures_valid: true,
+            within_ceiling: false,
+            nonce_valid: false,
+            not_revoked: false,
+            time_bounds_valid: false,
+        },
+        "None must still enforce the all-attestation ceiling: {result:?}"
+    );
+}
+
+/// The defining contrast that proves `None` omits the grant-match concern
+/// WITHOUT falsely failing a bool: a token that grants ONLY `messages:read`,
+/// evaluated against a `messages:write` challenge.
+///
+/// - With `Some(messages:write)`: the step-6 invoked-capability grant-match
+///   fails, so `signatures_valid: false` (and every later field false) — the
+///   historical mandatory-capability behavior, UNCHANGED.
+/// - With `None`: grant-match is skipped, so the token's intrinsic validity is
+///   assessed and `signatures_valid: true` (plus all later checks pass) — the
+///   read-only general-validity signal the SDK `evaluate_trust` consumes.
+///
+/// Both calls are on the SAME token and context; only the challenge differs.
+#[tokio::test]
+async fn evaluate_ucan_none_vs_some_for_ungranted_invoked_capability() {
+    let (custody, key_handle, issuer_did, pk_bytes) = setup_identity().await;
+    // Token grants ONLY messages:read.
+    let caps = vec!["messages:read".to_owned()];
+
+    let params = MintParams {
+        issuer_did: &issuer_did,
+        issuer_key: &key_handle,
+        audience_did: "did:dht:z6MkMember",
+        context_id: "ctx-eval-none-vs-some",
+        capabilities: &caps,
+        lifetime_secs: 3600,
+        not_before: None,
+        proofs: vec![],
+        facts: None,
+        key_scope: None,
+        signing_key_id: None,
+        ceiling: None,
+    };
+
+    let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        .await
+        .unwrap();
+
+    let resolver = InMemoryDidResolver {
+        keys: std::iter::once((issuer_did.clone(), pk_bytes)).collect(),
+        kid_keys: std::collections::HashMap::new(),
+    };
+    let mut nonce_tracker = InMemoryNonceTracker::new();
+    let revocation_checker = InMemoryRevocationChecker::new();
+    let proof_resolver = InMemoryProofResolver::new();
+    // Ceiling permits messages:read so the ONLY divergence is the ungranted
+    // INVOKED capability under Some, not the ceiling check.
+    let ceiling: HashSet<String> = std::iter::once("messages:read".to_owned()).collect();
+    // Challenge a capability the token does NOT grant.
+    let required_cap = CapabilityUri::new("ctx-eval-none-vs-some", "messages", "write");
+
+    let ctx = build_context(
+        &resolver,
+        &mut nonce_tracker,
+        &revocation_checker,
+        &proof_resolver,
+        &ceiling,
+        &issuer_did,
+        "did:dht:z6MkMember",
+    );
+
+    // Some(ungranted cap): grant-match fails -> signatures_valid false.
+    let with_some = evaluate_ucan(&token, Some(&required_cap), &ctx);
+    assert_eq!(
+        with_some,
+        CapabilityValidation {
+            tokens_valid: true,
+            signatures_valid: false,
+            within_ceiling: false,
+            nonce_valid: false,
+            not_revoked: false,
+            time_bounds_valid: false,
+        },
+        "Some(ungranted) must fail grant-match (unchanged behavior): {with_some:?}"
+    );
+
+    // None: grant-match skipped -> intrinsic validity all-true.
+    let with_none = evaluate_ucan(&token, None, &ctx);
+    assert_eq!(
+        with_none,
+        CapabilityValidation {
+            tokens_valid: true,
+            signatures_valid: true,
+            within_ceiling: true,
+            nonce_valid: true,
+            not_revoked: true,
+            time_bounds_valid: true,
+        },
+        "None must skip grant-match and report intrinsic validity: {with_none:?}"
     );
 }

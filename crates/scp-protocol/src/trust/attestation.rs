@@ -1076,11 +1076,10 @@ pub fn check_threshold_attestation(
 ///
 /// # Errors
 ///
-/// Returns [`TrustError::InvalidEventData`] if evidence or revocation
-/// status serialization fails.
-pub(crate) fn canonical_attestation_bytes(
-    attestation: &Attestation,
-) -> Result<Vec<u8>, TrustError> {
+/// Returns [`TrustError::CanonicalizationFailed`] if evidence, claim, or
+/// revocation-status serialization fails, or if the canonical hash cannot be
+/// constructed.
+pub fn canonical_attestation_bytes(attestation: &Attestation) -> Result<Vec<u8>, TrustError> {
     use crate::crypto::canonical::{CanonicalField, canonical_hash};
 
     // Serialize evidence as MessagePack bytes (named/sorted keys) if present.
@@ -1088,8 +1087,7 @@ pub(crate) fn canonical_attestation_bytes(
         .evidence
         .as_ref()
         .map(|e| {
-            rmp_serde::to_vec_named(e).map_err(|err| TrustError::InvalidEventData {
-                sequence: 0,
+            rmp_serde::to_vec_named(e).map_err(|err| TrustError::CanonicalizationFailed {
                 reason: format!("evidence serialization failed: {err}"),
             })
         })
@@ -1098,8 +1096,7 @@ pub(crate) fn canonical_attestation_bytes(
     // Serialize revocation_status as MessagePack bytes (named/sorted keys).
     let revocation_bytes =
         rmp_serde::to_vec_named(&attestation.revocation_status).map_err(|err| {
-            TrustError::InvalidEventData {
-                sequence: 0,
+            TrustError::CanonicalizationFailed {
                 reason: format!("revocation_status serialization failed: {err}"),
             }
         })?;
@@ -1113,8 +1110,7 @@ pub(crate) fn canonical_attestation_bytes(
     // `IdentityLinkAttestation::canonical_signing_bytes` which also uses
     // `rmp_serde::to_vec_named`.
     let claim_bytes = rmp_serde::to_vec_named(&attestation.claim).map_err(|err| {
-        TrustError::InvalidEventData {
-            sequence: 0,
+        TrustError::CanonicalizationFailed {
             reason: format!("claim serialization failed: {err}"),
         }
     })?;
@@ -1136,8 +1132,7 @@ pub(crate) fn canonical_attestation_bytes(
             CanonicalField::VarBytes(&revocation_bytes),
         ],
     )
-    .map_err(|e| TrustError::InvalidEventData {
-        sequence: 0,
+    .map_err(|e| TrustError::CanonicalizationFailed {
         reason: format!("canonical hash failed: {e}"),
     })?
     .to_vec())

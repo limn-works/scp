@@ -47,7 +47,7 @@ from scp_sdk.auth import (
     ScpIdResponse,
 )
 from scp_sdk.bridge import (
-    evaluate_trust as bridge_evaluate_trust,
+    bridge_provenance_tier,
 )
 from scp_sdk.bridge import (
     register as bridge_register,
@@ -62,7 +62,13 @@ from scp_sdk.context import (
     validate_admission,
     validate_broadcast_key_hex,
 )
-from scp_sdk.discovery import create_query, normalize_address, parse_address
+from scp_sdk.discovery import (
+    create_query,
+    discover,
+    discover_contexts,
+    normalize_address,
+    parse_address,
+)
 from scp_sdk.economy import (
     auto_accept_blocked,
     check_policy_lock,
@@ -70,6 +76,7 @@ from scp_sdk.economy import (
     evaluate_formula,
     policy_requires_payment,
     validate_policy_change,
+    verify_payment_receipts,
 )
 from scp_sdk.errors import (
     BRIDGE_ERROR_MAP,
@@ -148,16 +155,17 @@ from scp_sdk.transport import TransportConfig, TransportStatus
 from scp_sdk.trust import (
     PARTICIPATION_FACT_VARIANTS,
     PARTICIPATION_THRESHOLD_OPERATORS,
-    Attestation,
+    AttestationSummary,
     BehavioralRecord,
+    CachedAttestation,
+    CachedAttestationEnvelope,
     CapabilityValidation,
-    ChallengeResult,
-    Endorsement,
     ParticipationFact,
     ParticipationProfile,
     ParticipationThreshold,
     RequireParticipation,
     TrustEvaluation,
+    evaluate_trust,
     verify_participation_requirements,
 )
 from scp_sdk.types import (
@@ -186,14 +194,15 @@ __all__ = [
     "PARTICIPATION_THRESHOLD_OPERATORS",
     "SCP",
     "AssetEntry",
-    "Attestation",
+    "AttestationSummary",
     "BatchPublishResult",
     "BehavioralRecord",
     "BridgeMode",
+    "CachedAttestation",
+    "CachedAttestationEnvelope",
     "Capability",
     "CapabilityValidation",
     "CeilingPolicy",
-    "ChallengeResult",
     "Checkpoint",
     "Context",
     "ContextError",
@@ -202,7 +211,6 @@ __all__ = [
     "CustodyType",
     "DIDDocument",
     "DiscoveryMethod",
-    "Endorsement",
     "Event",
     "GovernanceActionResult",
     "Identity",
@@ -259,14 +267,17 @@ __all__ = [
     "ValidationError",
     "__version__",
     "auto_accept_blocked",
-    "bridge_evaluate_trust",
+    "bridge_provenance_tier",
     "bridge_register",
     "check_media_capability",
     "check_policy_lock",
     "classify_offline",
     "create_query",
+    "discover",
+    "discover_contexts",
     "estimate_cost",
     "evaluate_formula",
+    "evaluate_trust",
     "get_policy",
     "media_activate_session",
     "media_create_answer",
@@ -286,4 +297,5 @@ __all__ = [
     "validate_broadcast_key_hex",
     "validate_policy_change",
     "verify_participation_requirements",
+    "verify_payment_receipts",
 ]

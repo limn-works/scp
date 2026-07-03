@@ -148,15 +148,27 @@ pub(crate) async fn event_log_query_on(
                     code: codes::CTX_2000.to_owned(),
                 })
             })?;
+            // Project the typed payload's bridge-facing fields (e.g.
+            // `target_did` for governance/access-revocation events,
+            // `subject_did` for role/membership events) through the single
+            // shared `scp_event_log::payload::project_payload` decoder (via the
+            // `inject_projection` helper) so all three native bridges surface
+            // byte-identical values. Each key is omitted when the projection
+            // yields `None`.
+            let mut payload_value = serde_json::json!({
+                "hash": hex::encode(leaf_hash),
+            });
+            scp_ffi_common::event_log::inject_projection(
+                &mut payload_value,
+                &entry.event_type,
+                &entry.payload,
+            );
             #[allow(clippy::cast_precision_loss)]
             events.push(NapiEvent {
                 event_type: scp_ffi_common::event_log::event_type_label(&entry.event_type),
                 actor_did: entry.actor_did.0.clone(),
                 timestamp: entry.timestamp as f64,
-                payload_json: serde_json::json!({
-                    "hash": hex::encode(leaf_hash),
-                })
-                .to_string(),
+                payload_json: payload_value.to_string(),
                 sequence: seq as f64,
             });
         }

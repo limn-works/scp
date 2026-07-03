@@ -462,11 +462,13 @@ func opUcanValidateMalformed(_ req: BridgeRequest) async throws -> [String: JSON
         identity: identity, params: buildContextParams(ceiling: ceiling)
     )
     do {
+        // Fail-closed presenting-agent gate: supply one so the malformed JWT is
+        // rejected at PARSE (the behavior under test).
         try await scp.ucanValidate(
             handle: handle,
             token: "not.a.jwt",
             capability: "scp:ctx:any/messages:read",
-            presentingAgentDid: nil,
+            presentingAgentDid: identity.did(),
             proofTokens: nil
         )
         return [
@@ -500,11 +502,13 @@ func opUcanEvaluateMalformed(_ req: BridgeRequest) async throws -> [String: JSON
         identity: identity, params: buildContextParams(ceiling: ceiling)
     )
     do {
+        // Fail-closed presenting-agent gate: supply one so the malformed JWT is
+        // rejected at PARSE (the behavior under test).
         _ = try await scp.ucanEvaluate(
             handle: handle,
             token: "not.a.jwt",
             capability: "scp:ctx:any/messages:read",
-            presentingAgentDid: nil,
+            presentingAgentDid: identity.did(),
             proofTokens: nil
         )
         return [
@@ -558,7 +562,7 @@ func opUcanEvaluateStructured(_ req: BridgeRequest) async throws -> [String: JSO
         handle: handle,
         token: token.encoded(),
         capability: required,
-        presentingAgentDid: nil,
+        presentingAgentDid: memberDid,
         proofTokens: nil
     )
     return [

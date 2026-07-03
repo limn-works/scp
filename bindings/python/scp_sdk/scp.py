@@ -52,6 +52,18 @@ from scp_sdk.types import CustodyType
 if TYPE_CHECKING:
     from scp_sdk.tools import SagaResult
 
+    # Imported under TYPE_CHECKING only to annotate ``ucan_evaluate`` /
+    # ``participation_record`` return types without a runtime circular import
+    # (trust.py imports SCP). With ``from __future__ import annotations`` the
+    # annotation is a lazy string, so the name need only resolve for type
+    # checkers, not at import time.
+    from scp_sdk.trust import (
+        BehavioralRecord,
+        CachedAttestation,
+        CapabilityValidation,
+        TrustEvaluation,
+    )
+
 logger = logging.getLogger("scp_sdk")
 
 __all__ = [
@@ -1087,10 +1099,17 @@ class SCP:
         context_id: str,
         token: str,
         capability: str,
-        presenting_agent_did: str | None = None,
+        presenting_agent_did: str,
         proof_tokens: list[str] | None = None,
-    ) -> Any:
-        """Delegate to ``_scp_core.SCP.ucan_validate``."""
+    ) -> None:
+        """Delegate to ``_scp_core.SCP.ucan_validate``.
+
+        ``presenting_agent_did`` is REQUIRED (no silent security default): the
+        bridge rejects an absent or empty value rather than defaulting the
+        presenting agent to the token's own ``aud`` (which would make the
+        step-5 audience check the tautology ``aud == aud`` and inflate trust).
+        Pass the DID the token must be addressed to.
+        """
         return await asyncio.to_thread(
             self._native.ucan_validate,
             context_id,
@@ -1099,6 +1118,66 @@ class SCP:
             presenting_agent_did,
             proof_tokens,
         )
+
+    async def ucan_evaluate(
+        self,
+        context_id: str,
+        token: str,
+        presenting_agent_did: str,
+        capability: str | None = None,
+        proof_tokens: list[str] | None = None,
+    ) -> CapabilityValidation:
+        """Evaluate a UCAN token and return the structured per-stage result.
+
+        Delegate to ``_scp_core.SCP.ucan_evaluate``, the read-only,
+        side-effect-free diagnostic counterpart to :meth:`ucan_validate`
+        (spec §7.2.4, ADR-057). It runs the same 11-step ADR-016 pipeline
+        but returns a :class:`~scp_sdk.trust.CapabilityValidation` of six
+        per-stage booleans instead of throwing at the first failure, and
+        probes the nonce read-only (never recording it), so it is safe to
+        call repeatedly on the same token. The result is a point-in-time
+        diagnostic snapshot, not a promise that a later ``ucan_validate``
+        will accept the token.
+
+        NOT AN AUTHORIZATION DECISION: this is a diagnostic, never a gate.
+        Only :meth:`ucan_validate` (with its mandatory challenge capability)
+        authorizes an action. A no-capability (intrinsic-validity) result skips
+        the invoked-capability grant-match, so an all-``True`` result does NOT
+        establish the token grants any particular capability — re-run
+        :meth:`ucan_validate` with the concrete capability to authorize.
+
+        ``presenting_agent_did`` is REQUIRED (no silent security default): the
+        bridge rejects an absent or empty value rather than defaulting the
+        presenting agent to the token's own ``aud`` (which would make the
+        step-5 audience check the tautology ``aud == aud`` and inflate trust).
+        It precedes ``capability`` in the signature because it is mandatory
+        while ``capability`` is optional. Pass the DID under assessment.
+
+        ``capability`` is OPTIONAL. Omit it (or pass ``None``) to evaluate the
+        token's INTRINSIC validity — signatures, ceiling, nonce, revocation,
+        time bounds — with no invoked-capability grant-match challenge. This is
+        the mode :func:`scp_sdk.trust.evaluate_trust` uses. Pass a concrete
+        capability URI to additionally require the token grants it. (The
+        enforcing :meth:`ucan_validate` gate keeps a mandatory capability.)
+
+        Raises ``ValidationError`` only for malformed FFI input
+        (e.g. an invalid ``context_id`` / ``token`` / ``capability`` /
+        ``did``); capability/signature/expiry outcomes are reported via the
+        returned booleans, never as exceptions.
+        """
+        from scp_sdk.trust import structured_to_capability_validation
+
+        raw = await asyncio.to_thread(
+            self._native.ucan_evaluate,
+            context_id,
+            token,
+            capability,
+            presenting_agent_did,
+            proof_tokens,
+        )
+        # Shared six-field projection — pins the canonical CapabilityValidation
+        # shape in one place (the same helper Layer 1 of ``evaluate_trust`` uses).
+        return structured_to_capability_validation(raw)
 
     # endregion UCAN
 
@@ -1799,6 +1878,51 @@ class SCP:
     async def trust_query_score(self, did: str, context_id: str) -> Any:
         """Delegate to ``_scp_core.SCP.trust_query_score``."""
         return await asyncio.to_thread(self._native.trust_query_score, did, context_id)
+
+    async def evaluate_trust(
+        self,
+        context_id: str,
+        subject_did: str,
+        capability_tokens: list[str] | None = None,
+    ) -> TrustEvaluation:
+        """Evaluate the trustworthiness of a participant in a context.
+
+        Delegates to :func:`scp_sdk.trust.evaluate_trust` (the canonical
+        four-layer trust evaluation), so Python matches the TypeScript, Swift,
+        and Kotlin SDKs, which all expose ``scp.evaluateTrust(...)``. The
+        module-level function remains the implementation.
+
+        SECURITY: the result is data for the caller's judgment, NEVER an
+        authorization verdict. The behavioral record's ``attestation_count``
+        (and any challenge results) are authentic-but-self-mintable and MUST
+        NOT be a sole trust or admission factor (use the threshold/independence
+        path, §7.3.5).
+        """
+        from scp_sdk.trust import evaluate_trust as _evaluate_trust
+
+        return await _evaluate_trust(self, context_id, subject_did, capability_tokens)
+
+    async def participation_record(
+        self,
+        context_id: str,
+        subject_did: str,
+        cached_attestations: list[CachedAttestation] | list[dict[str, Any]] | None = None,
+    ) -> BehavioralRecord:
+        """Compute the participation record (§7.3.2) for a subject in a context.
+
+        Delegates to :func:`scp_sdk.trust.participation_record`, which calls the
+        typed PyO3 ``participation_record`` op and returns a
+        :class:`~scp_sdk.trust.BehavioralRecord` of the twelve flattened facts.
+        The shared Rust core gathers the full event log and computes the record
+        ONCE; the SDK RECEIVES it rather than recomputing Layer 2 client-side.
+        ``attestation_count`` is a credential-layer fact (§7.4), verifier-
+        relative; pass ``cached_attestations`` to populate it (default: none).
+        """
+        from scp_sdk.trust import participation_record as _participation_record
+
+        return await asyncio.to_thread(
+            _participation_record, self, context_id, subject_did, cached_attestations
+        )
 
     # endregion Trust
 

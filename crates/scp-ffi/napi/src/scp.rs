@@ -3121,12 +3121,18 @@ impl Scp {
     /// but returns a structured `NapiCapabilityValidation` (six booleans,
     /// camelCased for JS) instead of throwing, and never records the token's
     /// nonce.
+    ///
+    /// `capability` is OPTIONAL: omit it (or pass `null`/empty) to evaluate the
+    /// token's intrinsic validity with no invoked-capability grant-match
+    /// challenge — the mode the SDK trust signal uses. Pass a capability to
+    /// additionally require the token grants it. (The enforcing `ucanValidate`
+    /// gate keeps a mandatory capability.)
     #[napi(js_name = "ucanEvaluate")]
     pub async fn ucan_evaluate(
         &self,
         handle: &NapiContextHandle,
         token: String,
-        capability: String,
+        capability: Option<String>,
         presenting_agent_did: Option<String>,
         proof_tokens: Option<Vec<String>>,
     ) -> napi::Result<crate::ucan::NapiCapabilityValidation> {
@@ -3502,13 +3508,15 @@ impl Scp {
     #[napi(js_name = "verifyParticipationRequirements")]
     pub fn verify_participation_requirements(
         &self,
-        profile_json: String,
+        expected_subject: String,
         requirements_json: String,
-    ) -> napi::Result<bool> {
+        profile_json: String,
+    ) -> napi::Result<()> {
         crate::trust::verify_participation_requirements_on(
             &self.inner,
-            profile_json,
+            expected_subject,
             requirements_json,
+            profile_json,
         )
     }
 
@@ -3538,6 +3546,30 @@ impl Scp {
             attestor_sets_json,
             cached_attestations_json,
             challenge_results_json,
+        )
+    }
+
+    /// Computes the structured participation record (§7.3.2) for `subjectDid`
+    /// in `contextId`.
+    ///
+    /// The bridge sources the subject's accessible, currently-valid attestations
+    /// from this instance's persistent trust store (populating any
+    /// caller-supplied `cachedAttestationsJson` first), and the shared
+    /// Supervisor gathers the FULL event log to derive every other fact. Returns
+    /// a typed `NapiParticipationRecord` — the SDK receives the flattened facts
+    /// and never re-aggregates event-log collections. See ADR-017, spec §7.3.2.
+    #[napi(js_name = "participationRecord")]
+    pub fn participation_record(
+        &self,
+        context_id: String,
+        subject_did: String,
+        cached_attestations_json: String,
+    ) -> napi::Result<crate::trust::NapiParticipationRecord> {
+        crate::trust::participation_record_on(
+            &self.inner,
+            context_id,
+            subject_did,
+            cached_attestations_json,
         )
     }
 

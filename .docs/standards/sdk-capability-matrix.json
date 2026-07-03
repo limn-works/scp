@@ -28,11 +28,10 @@
         {
           "name": "rotate_key",
           "python": true,
-          "typescript": false,
+          "typescript": true,
           "kotlin": false,
           "swift": false,
           "exemptions": {
-            "typescript": "Bridge plumbing exists (internal/native.ts identity_rotate_key) but no public SDK wrapper on the Identity class yet; the named public rotateKey() wrapper lands in the SDK-parity PR carved from the same bundled branch.",
             "kotlin": "UniFFI bridge exports rotate_key; Kotlin SDK has no idiomatic wrapper exposing it yet",
             "swift": "UniFFI bridge exports rotate_key (ScpBindings.swift open func rotateKey()); no public SDK wrapper written yet"
           }
@@ -54,32 +53,23 @@
         {
           "name": "add_agent_key",
           "python": true,
-          "typescript": false,
+          "typescript": true,
           "kotlin": true,
-          "swift": true,
-          "exemptions": {
-            "typescript": "Bridge plumbing exists (internal/native.ts addAgentKey) but no public SDK wrapper on the Identity class yet; the named public addAgentKey() wrapper lands in the SDK-parity PR carved from the same bundled branch."
-          }
+          "swift": true
         },
         {
           "name": "rotate_agent_key",
           "python": true,
-          "typescript": false,
+          "typescript": true,
           "kotlin": true,
-          "swift": true,
-          "exemptions": {
-            "typescript": "Bridge plumbing exists (internal/native.ts rotateAgentKey) but no public SDK wrapper on the Identity class yet; the named public rotateAgentKey() wrapper lands in the SDK-parity PR carved from the same bundled branch."
-          }
+          "swift": true
         },
         {
           "name": "remove_agent_key",
           "python": true,
-          "typescript": false,
+          "typescript": true,
           "kotlin": true,
-          "swift": true,
-          "exemptions": {
-            "typescript": "Bridge plumbing exists (internal/native.ts removeAgentKey) but no public SDK wrapper on the Identity class yet; the named public removeAgentKey() wrapper lands in the SDK-parity PR carved from the same bundled branch."
-          }
+          "swift": true
         },
         {
           "name": "identity_remove",
@@ -100,12 +90,9 @@
         {
           "name": "migrate",
           "python": true,
-          "typescript": false,
+          "typescript": true,
           "kotlin": true,
-          "swift": true,
-          "exemptions": {
-            "typescript": "Bridge plumbing exists (internal/native.ts migrate) but no public SDK wrapper on the Identity class yet; the named public migrate() wrapper lands in the SDK-parity PR carved from the same bundled branch."
-          }
+          "swift": true
         },
         {
           "name": "resume_migration_publish",
@@ -640,13 +627,10 @@
         {
           "name": "evaluate_trust",
           "python": true,
-          "typescript": false,
-          "kotlin": false,
+          "typescript": true,
+          "kotlin": true,
           "swift": true,
-          "exemptions": {
-            "typescript": "The public TS surface exposes verifyParticipationRequirements (scp.ts), not a named evaluateTrust wrapper; the named evaluateTrust() sugar lands in the SDK-parity PR carved from the same bundled branch.",
-            "kotlin": "SDK does not expose evaluate_trust wrapper, only aggregate_trust_input"
-          }
+          "notes": "All four SDKs expose an idiomatic evaluate_trust/evaluateTrust wrapper composing the structured Layer-1 (ucan_evaluate) and Layer-2 (participation_record) results: Python scp_sdk.trust.evaluate_trust, TypeScript SCP.evaluateTrust, Kotlin SCP.evaluateTrust, Swift SCP.evaluateTrust."
         },
         {
           "name": "aggregate_trust_input",
@@ -661,6 +645,14 @@
           "typescript": true,
           "kotlin": true,
           "swift": true
+        },
+        {
+          "name": "participation_record",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true,
+          "notes": "Typed participation-record op (§7.3.2): the PyO3, NAPI, and UniFFI bridges export a typed structured result (PyParticipationRecord / NapiParticipationRecord / ParticipationRecordView) mirroring scp-core's ParticipationFacts; the shared Supervisor::participation_record gathers the full event log and the bridge sources verified attestations from its ProtocolRepository. All four SDKs expose idiomatic wrappers (Python scp_sdk participation_record, TypeScript SCP.participationRecord, Kotlin SCP.participationRecord, Swift SCP.participationRecord) returning the twelve-field BehavioralRecord and feed evaluate_trust/evaluateTrust Layer 2 from the Rust-computed record."
         },
         {
           "name": "consequence_rule_validate",
@@ -1164,13 +1156,10 @@
         },
         {
           "name": "discover",
-          "python": false,
+          "python": true,
           "typescript": true,
           "kotlin": true,
-          "swift": true,
-          "exemptions": {
-            "python": "discovery.py exposes parse_address / create_query / normalize_address only; no named discover / discover_contexts / context_discover public function yet. The Python discovery wrapper lands in the SDK-parity PR carved from the same bundled branch."
-          }
+          "swift": true
         },
         {
           "name": "address_resolve",
@@ -1312,16 +1301,11 @@
         },
         {
           "name": "evaluate",
-          "python": false,
-          "typescript": false,
-          "kotlin": false,
-          "swift": false,
-          "exemptions": {
-            "python": "Bridge plumbing exists (scp-ffi PyScp.ucan_evaluate returning CapabilityValidation, the read-only structured diagnostic counterpart to ucan_validate) but no public SDK wrapper yet; the named public evaluate()/evaluateTrust() wrapper lands in the C3c SDK-parity follow-up that rebuilds the trust-signal consumer on top of this bridge op.",
-            "typescript": "Bridge plumbing exists (NAPI ucanEvaluate returning a structured CapabilityValidation) but no public SDK wrapper yet; the named public evaluate() wrapper lands in the C3c SDK-parity follow-up.",
-            "kotlin": "UniFFI bridge exports ucan_evaluate (CapabilityValidationRecord); the Kotlin SDK has no idiomatic public wrapper exposing it yet — lands in the C3c SDK-parity follow-up.",
-            "swift": "UniFFI bridge exports ucan_evaluate (CapabilityValidationRecord); the Swift SDK has no idiomatic public wrapper exposing it yet — lands in the C3c SDK-parity follow-up."
-          }
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true,
+          "notes": "Structured read-only diagnostic (ADR-057, §7.2.4). All four bindings expose an idiomatic wrapper over the typed CapabilityValidationRecord: Python SCP.ucan_evaluate / evaluate_trust, TypeScript SCP.ucanEvaluate / evaluateTrust, Kotlin SCP.ucanEvaluate / evaluateTrust (Scp.kt, types in Trust.kt), Swift SCP.ucanEvaluate / evaluateTrust (Trust.swift). Per the per-SDK-idiom lesson the record SHAPE is identical (only casing differs); the wrappers are language-idiomatic."
         },
         {
           "name": "mint",
@@ -1435,14 +1419,11 @@
         },
         {
           "name": "verify_payment_receipts",
-          "python": false,
+          "python": true,
           "typescript": true,
           "kotlin": true,
           "swift": true,
-          "notes": "Verifies payment receipts against the configured runtime payment adapter (verify_dyn per receipt) via EconomyCommand::VerifyPaymentReceipts. Implemented in pyo3/napi/uniffi + TypeScript/Kotlin/Swift SDKs.",
-          "exemptions": {
-            "python": "economy.py exposes estimate_cost / policy helpers / evaluate_formula only; no named verify_payment_receipts public function yet. The Python verify_payment_receipts wrapper lands in the SDK-parity PR carved from the same bundled branch."
-          }
+          "notes": "Verifies payment receipts against the configured runtime payment adapter (verify_dyn per receipt) via EconomyCommand::VerifyPaymentReceipts. Implemented in pyo3/napi/uniffi + TypeScript/Kotlin/Swift SDKs."
         },
         {
           "name": "enforce_economy_send_path",
@@ -1777,22 +1758,16 @@
         {
           "name": "register",
           "python": true,
-          "typescript": false,
+          "typescript": true,
           "kotlin": true,
-          "swift": true,
-          "exemptions": {
-            "typescript": "bridge_register is an internal Bridge interface method (bridgeRegister on the internal Bridge interface in bindings/typescript/src/internal/bridge.ts); it is not exposed as a named public SDK function — registration is handled at the FFI layer directly via the NAPI addon"
-          }
+          "swift": true
         },
         {
           "name": "evaluate_trust",
           "python": true,
-          "typescript": false,
+          "typescript": true,
           "kotlin": true,
-          "swift": true,
-          "exemptions": {
-            "typescript": "The public TS surface exposes verifyParticipationRequirements (scp.ts), not a named evaluateTrust wrapper; the named evaluateTrust() sugar lands in the SDK-parity PR carved from the same bundled branch."
-          }
+          "swift": true
         },
         {
           "name": "create_shadow",

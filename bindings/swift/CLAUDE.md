@@ -27,9 +27,13 @@ internal enum ToolBridge {
 public func invokeTool(..., invokeFn: ToolBridge.InvokeFn = ToolBridge.defaultInvoke) async throws -> ToolInvocationResult
 ```
 
+### Trust delegation
+
+Trust is wired to the UniFFI bridge: `Trust.swift` delegates to the generated `inner` (e.g. `ucanEvaluate`, `participationRecord`) exactly like every other module — `evaluateTrust` composes those bridge calls (Layer 1 + Layer 2) and resolves the context id from `handle.contextId()`; zero protocol logic lives in Swift. Tests still use the injectable `*Bridge` closures to stand in for the bridge.
+
 ### Modules without UniFFI exports
 
-Trust and MCP do not have Rust bridge function exports yet. Their `*Bridge` defaults either construct data locally (Trust) or throw descriptive errors (MCP). These are NOT "not yet available" placeholders -- they are injectable stubs that will be replaced when Rust exports land.
+MCP does not have Rust bridge function exports yet. Its `*Bridge` defaults throw descriptive errors. These are NOT "not yet available" placeholders -- they are injectable stubs that will be replaced when Rust exports land.
 
 ## Gotchas
 

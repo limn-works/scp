@@ -37,11 +37,29 @@
 // methods via dynamic `import()` calls.
 import type { BridgeCredential } from "./bridge";
 import type { Context } from "./context";
-import { mapSagaError, ValidationError } from "./errors";
+import { ContextError, mapBridgeError, mapSagaError, ValidationError } from "./errors";
 import type { Identity } from "./identity";
+import { toCapabilityValidation } from "./internal/bridge";
 import { loadNativeAddon, type NativeAddon as RawNativeAddon } from "./internal/native";
 import type { Node, Relay } from "./server";
-import type { SagaResult } from "./types";
+import type {
+  BehavioralRecord,
+  CachedAttestation,
+  CapabilityValidation,
+  SagaResult,
+  TrustEvaluation,
+} from "./types";
+import { encodeCachedAttestations } from "./types";
+
+/**
+ * Stable error code (spec §7.3.2) the core surfaces when a context has no
+ * recorded participation facts yet (an empty event log). {@link
+ * SCP.evaluateTrust} branches Layer 2 on this structured code — NOT on error
+ * prose — folding "no facts yet" into a zeroed behavioral record while letting
+ * every other failure propagate. Maps from `ContextError::NoParticipationFacts`
+ * across all bridges.
+ */
+const NO_PARTICIPATION_FACTS_CODE = "SCP-CTX-2076";
 
 /**
  * Refined view of the native addon used by this module. The shared
@@ -721,6 +739,84 @@ export class SCP {
 
   async identityLoad(did: string): Promise<Identity> {
     const raw = await (this.#native.identityLoad as (d: string) => Promise<unknown>)(did);
+    const { Identity: IdentityCls } = await import("./identity");
+    return IdentityCls._fromHandle(this, raw);
+  }
+
+  /**
+   * Rotate the identity's active signing key (spec §9.12, ADR-003).
+   *
+   * The rotate/agent-key/migrate operations dispatch through methods on the
+   * native identity handle itself (not the per-instance `#native` SCP handle),
+   * preserving handle affinity. The returned {@link Identity} wraps the fresh
+   * native handle.
+   *
+   * @param identity The identity whose active key should be rotated.
+   * @returns A new {@link Identity} reflecting the rotated key state.
+   */
+  async identityRotateKey(identity: Identity): Promise<Identity> {
+    const raw = await (
+      identity._rawHandle as unknown as { rotateKey(): Promise<unknown> }
+    ).rotateKey();
+    const { Identity: IdentityCls } = await import("./identity");
+    return IdentityCls._fromHandle(this, raw);
+  }
+
+  /**
+   * Add an agent key to the identity's DID document (spec §3.4, ADR-003).
+   *
+   * @param identity The identity to add an agent key to.
+   * @returns A new {@link Identity} reflecting the added agent key.
+   */
+  async identityAddAgentKey(identity: Identity): Promise<Identity> {
+    const raw = await (
+      identity._rawHandle as unknown as { addAgentKey(): Promise<unknown> }
+    ).addAgentKey();
+    const { Identity: IdentityCls } = await import("./identity");
+    return IdentityCls._fromHandle(this, raw);
+  }
+
+  /**
+   * Rotate the identity's agent key (spec §3.4, ADR-003).
+   *
+   * @param identity The identity whose agent key should be rotated.
+   * @returns A new {@link Identity} reflecting the rotated agent key.
+   */
+  async identityRotateAgentKey(identity: Identity): Promise<Identity> {
+    const raw = await (
+      identity._rawHandle as unknown as { rotateAgentKey(): Promise<unknown> }
+    ).rotateAgentKey();
+    const { Identity: IdentityCls } = await import("./identity");
+    return IdentityCls._fromHandle(this, raw);
+  }
+
+  /**
+   * Remove the identity's agent key (spec §3.4, ADR-003).
+   *
+   * @param identity The identity whose agent key should be removed.
+   * @returns A new {@link Identity} reflecting the removed agent key.
+   */
+  async identityRemoveAgentKey(identity: Identity): Promise<Identity> {
+    const raw = await (
+      identity._rawHandle as unknown as { removeAgentKey(): Promise<unknown> }
+    ).removeAgentKey();
+    const { Identity: IdentityCls } = await import("./identity");
+    return IdentityCls._fromHandle(this, raw);
+  }
+
+  /**
+   * Migrate the identity to a new key, producing a `DidRotationEvent`
+   * (spec §9.12, ADR-003 §4b/4c).
+   *
+   * The returned {@link Identity} preserves the live native handle, whose
+   * `rotationEventJson` getter exposes the JSON-serialized rotation event for
+   * publication.
+   *
+   * @param identity The identity to migrate.
+   * @returns A new {@link Identity} reflecting the migrated key state.
+   */
+  async identityMigrate(identity: Identity): Promise<Identity> {
+    const raw = await (identity._rawHandle as unknown as { migrate(): Promise<unknown> }).migrate();
     const { Identity: IdentityCls } = await import("./identity");
     return IdentityCls._fromHandle(this, raw);
   }
@@ -1906,11 +2002,30 @@ export class SCP {
   // Domain: UCAN
   // ───────────────────────────────────────────────────────────────────────
 
+  /**
+   * Enforcing UCAN gate: runs the full 11-step ADR-016 pipeline and throws a
+   * typed {@link "./errors".ScpError} at the first failing stage (use
+   * {@link ucanEvaluate} for the non-throwing diagnostic).
+   *
+   * FAIL CLOSED: `presentingAgentDid` is required by the bridge (no silent
+   * security default). Omitting it makes the bridge reject the call rather than
+   * defaulting the presenting agent to the token's own `aud` — defaulting would
+   * make the step-5 audience check a tautology (`aud == aud`) that does NOT bind
+   * the token to any external subject, passing a token addressed to someone else
+   * (trust inflation). Pass the agent the token must be addressed to.
+   *
+   * @param handle The context handle to validate against.
+   * @param token The UCAN token string to validate.
+   * @param capability The required capability URI (mandatory on this gate).
+   * @param presentingAgentDid The DID the token must be addressed to. Required —
+   *   an absent or empty value is rejected by the bridge.
+   * @param proofTokens Optional delegation-chain proof tokens.
+   */
   async ucanValidate(
     handle: unknown,
     token: string,
     capability: string,
-    presentingAgentDid?: string,
+    presentingAgentDid: string,
     proofTokens?: readonly string[],
   ): Promise<void> {
     await (
@@ -1918,10 +2033,82 @@ export class SCP {
         h: unknown,
         t: string,
         c: string,
-        pa: string | undefined,
+        pa: string,
         pt: readonly string[] | undefined,
       ) => Promise<void>
     )(handle, token, capability, presentingAgentDid, proofTokens);
+  }
+
+  /**
+   * Read-only, structured counterpart to {@link ucanValidate}.
+   *
+   * Runs the same 11-step ADR-016 validation pipeline but, instead of
+   * throwing at the first failing stage, resolves to a
+   * {@link CapabilityValidation} of six per-stage booleans (spec §7.2.4,
+   * ADR-057). The probe never records the token's nonce, so calling it does
+   * not consume the token. Capability/signature/expiry outcomes are reported
+   * via the booleans; only malformed FFI inputs (bad handle / token /
+   * capability) reject.
+   *
+   * The six booleans cross the FFI already camelCased, so consumers read the
+   * per-check breakdown directly and never reverse-engineer *which* check
+   * failed by parsing error prose.
+   *
+   * NOT AN AUTHORIZATION DECISION: this is a diagnostic, never a gate. Only
+   * {@link ucanValidate} (with its mandatory challenge capability) authorizes
+   * an action. A no-capability (intrinsic-validity) result skips the
+   * invoked-capability grant-match, so an all-`true` result does NOT establish
+   * the token grants any particular capability — re-run {@link ucanValidate}
+   * with the concrete capability to authorize (spec §7.2.4).
+   *
+   * FAIL CLOSED: `presentingAgentDid` is required by the bridge (no silent
+   * security default). Omitting it makes the bridge reject the call rather than
+   * defaulting the presenting agent to the token's own `aud` — defaulting would
+   * make the step-5 audience check a tautology (`aud == aud`) that inflates
+   * trust. It precedes `capability` in the signature because it is mandatory
+   * while `capability` is optional.
+   *
+   * @param handle The context handle to evaluate against.
+   * @param token The UCAN token string to evaluate.
+   * @param presentingAgentDid The DID under assessment — the agent the token
+   *   must be addressed to. Required; an absent or empty value is rejected by
+   *   the bridge.
+   * @param capability Optional challenge capability URI. Omit it (or pass
+   *   `null`/`undefined`) to evaluate the token's INTRINSIC validity with no
+   *   invoked-capability grant-match challenge — the mode {@link evaluateTrust}
+   *   uses. Pass a capability to additionally require the token grants it. (The
+   *   enforcing {@link ucanValidate} gate keeps a mandatory capability.)
+   * @param proofTokens Optional delegation-chain proof tokens.
+   */
+  async ucanEvaluate(
+    handle: unknown,
+    token: string,
+    presentingAgentDid: string,
+    capability?: string | null,
+    proofTokens?: readonly string[],
+  ): Promise<CapabilityValidation> {
+    // Route the native dispatch through the single error chokepoint
+    // (`mapBridgeError`) so a raw NAPI throw or rejection surfaces as a
+    // typed `ScpError` keyed on its `[SCP-CAT-NNNN]` code, per ADR-057
+    // Decision 4 (error typing routes through one mapping site, not per-call
+    // prose inspection). `mapBridgeError` is idempotent on already-typed errors.
+    let raw: CapabilityValidation;
+    try {
+      raw = await (
+        this.#native.ucanEvaluate as (
+          h: unknown,
+          t: string,
+          c: string | null,
+          pa: string,
+          pt: readonly string[] | null,
+        ) => Promise<CapabilityValidation>
+      )(handle, token, capability ?? null, presentingAgentDid, proofTokens ?? null);
+    } catch (error) {
+      throw mapBridgeError(error);
+    }
+    // Shared six-field projection — pins the canonical CapabilityValidation
+    // shape in one place (mirrors the same call in `internal/native.ts`).
+    return toCapabilityValidation(raw);
   }
 
   async ucanMint(
@@ -2184,11 +2371,278 @@ export class SCP {
     );
   }
 
-  verifyParticipationRequirements(profileJson: string, requirementsJson: string): boolean {
-    return (this.#native.verifyParticipationRequirements as (p: string, r: string) => boolean)(
-      profileJson,
+  /**
+   * Verify participation profiles against admission requirements.
+   *
+   * Returns normally when all requirements are satisfied; throws on any
+   * failed requirement or malformed JSON.
+   *
+   * Security caveat — authenticity is not authorization: this verifies
+   * signatures over the subject binding, not signer *legitimacy*. Because
+   * `signerPublicKey` is self-certifying, a subject can present
+   * genuinely-signed profiles from signers it controls (inflating
+   * `minContexts`). Callers MUST establish signer legitimacy separately
+   * (a trusted-signer set, a context-membership proof, or the §7.3.5
+   * threshold/independence path) and MUST NOT treat success as authorization.
+   */
+  verifyParticipationRequirements(
+    expectedSubject: string,
+    requirementsJson: string,
+    profileJson: string,
+  ): void {
+    (this.#native.verifyParticipationRequirements as (s: string, r: string, p: string) => void)(
+      expectedSubject,
       requirementsJson,
+      profileJson,
     );
+  }
+
+  /**
+   * Evaluate the trustworthiness of a participant within a context.
+   *
+   * Composes the structured trust model (spec §7.2.4, ADR-057). The protocol
+   * provides the data, not the verdict — the caller decides what to do with it:
+   *
+   * - **Layer 1 — protocol enforcement.** Each supplied capability token is run
+   *   through the read-only {@link ucanEvaluate} diagnostic, yielding six
+   *   per-stage booleans. The booleans are AND-combined across the token set,
+   *   so one token failing a stage makes that aggregate field `false`. This
+   *   never inspects error prose — it reads the structured
+   *   {@link CapabilityValidation} directly. With no tokens supplied, every
+   *   field stays `false` (no stage was observed to pass).
+   * - **Layer 2 — behavioral validation.** RECEIVES the subject's verifiable
+   *   participation facts (§7.3.2) from the shared Rust core via
+   *   {@link participationRecord} — the core gathers the full event log and
+   *   flattens the facts ONCE, so the SDK never re-aggregates event-log
+   *   collections (no cross-binding divergence). A context with no convergent
+   *   events yet (an empty event log) is not an error here: the behavioral
+   *   record is reported with all counts zeroed (the subject simply has no
+   *   recorded facts), so a Layer-1-only caller never has to populate the log
+   *   first. Use {@link participationRecord} directly when the empty-log case
+   *   should surface as an error instead.
+   *
+   * The capability outcome is non-throwing (it reads booleans); only malformed
+   * FFI inputs (bad context handle / token / capability) propagate as a typed
+   * {@link "./errors".ScpError}.
+   *
+   * SECURITY: the behavioral record's `attestationCount` (and any challenge
+   * results, where consumed) are authentic-but-self-mintable signals — an
+   * issuer/verifier is self-certifying, so a subject can mint them from DIDs it
+   * controls. They MUST NOT be a sole trust or admission factor; use the
+   * threshold/independence path (§7.3.5) for Sybil resistance.
+   *
+   * The evaluation is labeled with — and the Layer-2 lookup is keyed by — the
+   * context the `handle` resolves to (`handle.contextId`), so the result is
+   * never silently mislabeled. There is no separate context-id argument
+   * (matching the Swift and Kotlin SDKs, which resolve from the handle).
+   *
+   * @param handle The context handle to evaluate within.
+   * @param subjectDid The DID of the participant being evaluated.
+   * @param capabilityTokens Optional UCAN token strings to evaluate for Layer 1.
+   * @returns A structured {@link TrustEvaluation} with Layers 1 and 2 populated.
+   */
+  async evaluateTrust(
+    handle: unknown,
+    subjectDid: string,
+    capabilityTokens?: readonly string[],
+  ): Promise<TrustEvaluation> {
+    // Layer 1: AND-combine the structured per-stage booleans across tokens.
+    // Start from the all-true identity element of the boolean AND when at least
+    // one token is present; with no tokens, every field stays false (the
+    // dataclass default — no stage was observed to pass).
+    let capabilityValidation: CapabilityValidation = {
+      tokensValid: false,
+      signaturesValid: false,
+      withinCeiling: false,
+      nonceValid: false,
+      notRevoked: false,
+      timeBoundsValid: false,
+    };
+    if (capabilityTokens !== undefined && capabilityTokens.length > 0) {
+      let tokensValid = true;
+      let signaturesValid = true;
+      let withinCeiling = true;
+      let nonceValid = true;
+      let notRevoked = true;
+      let timeBoundsValid = true;
+      for (const token of capabilityTokens) {
+        // Read-only diagnostic — does NOT throw on capability outcomes; only
+        // malformed FFI input rejects (and propagates). Pass the subject as the
+        // presenting agent so the audience check evaluates against the DID under
+        // assessment.
+        //
+        // No challenge capability is supplied: trust evaluation assesses each
+        // token's GENERAL (intrinsic) validity — signatures, ceiling, nonce,
+        // revocation, time bounds — not whether it grants one specific
+        // capability. Passing a concrete URI (or the old `"*"` sentinel, which
+        // the real bridge rejects) would wrongly impose an invoked-capability
+        // grant-match the caller never asked for. See ADR-057 / spec §7.2.4:
+        // the diagnostic's challenge capability is optional, and omitting it
+        // means intrinsic-validity.
+        const perToken = await this.ucanEvaluate(handle, token, subjectDid);
+        tokensValid &&= perToken.tokensValid;
+        signaturesValid &&= perToken.signaturesValid;
+        withinCeiling &&= perToken.withinCeiling;
+        nonceValid &&= perToken.nonceValid;
+        notRevoked &&= perToken.notRevoked;
+        timeBoundsValid &&= perToken.timeBoundsValid;
+      }
+      // This is a per-FIELD AND ACROSS tokens (every token must pass each
+      // stage), NOT the six-field collapse the `allValid` accessor performs on a
+      // single record — so the accessor does not apply here. Consumers call
+      // `allValid(capabilityValidation)` afterward to collapse the result.
+      capabilityValidation = {
+        tokensValid,
+        signaturesValid,
+        withinCeiling,
+        nonceValid,
+        notRevoked,
+        timeBoundsValid,
+      };
+    }
+
+    // Layer 2: behavioral record RECEIVED from the shared Rust core. The core
+    // gathers the FULL event log and flattens the participation facts (§7.3.2)
+    // ONCE in `Supervisor::participation_record`; the SDK never re-aggregates
+    // event-log collections, so every binding observes identical facts for the
+    // same context/subject (the divergence the old client-side classify
+    // suffered).
+    //
+    // No cached attestations are supplied: `evaluateTrust` takes no attestation
+    // set, so `attestationCount` reflects only what the bridge can source from
+    // its own persistent trust store (verifier-relative, §7.3.2). This honestly
+    // passes nothing rather than fabricating attestations.
+    //
+    // A context with no convergent events yet makes the core return
+    // `NoParticipationFacts` (surfaced as a `ContextError` with the structured
+    // code `SCP-CTX-2076`). That is not a failure for
+    // a trust evaluation — it means "no recorded facts" — so it is folded into a
+    // zeroed behavioral record rather than thrown, keeping `evaluateTrust`
+    // usable on activity-free contexts (e.g. a Layer-1-only check). Any other
+    // error (malformed input, provider failure) still propagates.
+    // The native participation-record op keys the event log by the context's
+    // canonical id — the 64-char hex `contextId` the handle carries, the same
+    // value `eventLogQuery` derives from the handle. Resolve it from the handle
+    // (matching Swift/Kotlin, which read `handle.contextId()`), so both the
+    // Layer-2 lookup and the returned label come from the one authoritative
+    // source and can never disagree.
+    const resolvedContextId = (handle as { readonly contextId: string }).contextId;
+    let behavioralRecord: BehavioralRecord;
+    try {
+      behavioralRecord = await this.participationRecord(resolvedContextId, subjectDid);
+    } catch (error) {
+      // Branch on the STRUCTURED code (`SCP-CTX-2076`), never error prose: the
+      // typed `ContextError` carries the stable code the core assigned to
+      // `NoParticipationFacts` (ADR-057 — structured, not prose, classification).
+      // Anything else (NotInitialized, a provider failure, malformed input) is a
+      // genuine error and propagates unchanged.
+      if (error instanceof ContextError && error.code === NO_PARTICIPATION_FACTS_CODE) {
+        behavioralRecord = {
+          subjectDid,
+          participationDurationSecs: 0,
+          governanceActionsAgainst: 0,
+          governanceActionsBy: 0,
+          toolInvocationCount: 0,
+          toolInvocationCountAnchored: false,
+          contextCreationCount: 0,
+          roleProgressionCount: 0,
+          attestationCount: 0,
+          attestationCountAnchored: false,
+          computedAt: 0,
+          eventLogRoot: "",
+        };
+      } else {
+        throw error;
+      }
+    }
+
+    return {
+      subjectDid,
+      // Label the evaluation with the SAME context the layers were computed
+      // against (the handle's resolved context id) — the single source of truth.
+      contextId: resolvedContextId,
+      capabilityValidation,
+      behavioralRecord,
+      attestations: [],
+    };
+  }
+
+  /**
+   * Computes the structured participation record (§7.3.2) for `subjectDid` in
+   * `contextId`.
+   *
+   * The shared Rust core gathers the FULL context event log and flattens the
+   * participation facts ONCE (`Supervisor::participation_record`), and the NAPI
+   * bridge sources the subject's accessible, currently-valid attestations from
+   * its own persistent trust store (seeded by `cachedAttestations`). The
+   * SDK RECEIVES the flattened {@link BehavioralRecord} — it never re-aggregates
+   * event-log collections, so every binding observes identical facts for the
+   * same context/subject.
+   *
+   * `attestationCount` is a credential-layer fact (§7.4): it is NOT a
+   * context-event count and NOT Merkle-anchored, and is verifier-relative
+   * (computed from the attestations the bridge can access). Pass the subject's
+   * accessible attestations as `cachedAttestations` to populate it; the default
+   * `[]` honestly reports only what the bridge's trust store already holds.
+   *
+   * THREAT MODEL: `attestationCount` is Sybil-inflatable by self-issuance — one
+   * operator can self-issue (or co-issue across DIDs it controls) arbitrarily
+   * many *authentic* attestations. It is a credential-layer claim count, NOT a
+   * standalone trust score; Sybil resistance comes from the threshold/
+   * independence path (§7.3.5) and DeviceAttestation binding (§9.3), not the
+   * count itself. Separately, the membership/role-derived facts (participation
+   * duration, governance actions, role progression) are committer-local —
+   * verifier-relative, not independently Merkle-verifiable — until ADR-051
+   * receive-side replication lands. In particular, `participationDurationSecs`
+   * for the context creator (founder) is derived from the creator-assigned
+   * context-creation timestamp — it is creator-timestamp-trusting and
+   * committer-local until that replication lands (no independent receiver
+   * corroborates the creator's clock).
+   *
+   * @param contextId The context the participation is scoped to.
+   * @param subjectDid The DID whose participation facts are computed.
+   * @param cachedAttestations Typed cached attestations to seed the bridge's
+   *   trust store before sourcing the subject's verified set. Serialized to JSON
+   *   internally — matching the Python SDK's `cached_attestations: list[dict]`.
+   *   Defaults to `[]` (source only what is already persisted).
+   * @returns The flattened participation facts as a {@link BehavioralRecord}.
+   * @throws {@link "./errors".ScpError} on malformed FFI input or a behavioral
+   *   compute failure (e.g. an empty event log → `SCP-CTX-2076`).
+   */
+  async participationRecord(
+    contextId: string,
+    subjectDid: string,
+    cachedAttestations: readonly CachedAttestation[] = [],
+  ): Promise<BehavioralRecord> {
+    let record: BehavioralRecord;
+    try {
+      record = (
+        this.#native.participationRecord as (
+          ctx: string,
+          subj: string,
+          ca: string,
+        ) => BehavioralRecord
+      )(contextId, subjectDid, encodeCachedAttestations(cachedAttestations));
+    } catch (error) {
+      throw mapBridgeError(error);
+    }
+    // Project an explicit, documented SDK shape rather than passing the native
+    // object through — the field set is stable and matches the Python SDK /
+    // Rust `ParticipationFacts` 1:1.
+    return {
+      subjectDid: record.subjectDid,
+      participationDurationSecs: record.participationDurationSecs,
+      governanceActionsAgainst: record.governanceActionsAgainst,
+      governanceActionsBy: record.governanceActionsBy,
+      toolInvocationCount: record.toolInvocationCount,
+      toolInvocationCountAnchored: record.toolInvocationCountAnchored,
+      contextCreationCount: record.contextCreationCount,
+      roleProgressionCount: record.roleProgressionCount,
+      attestationCount: record.attestationCount,
+      attestationCountAnchored: record.attestationCountAnchored,
+      computedAt: record.computedAt,
+      eventLogRoot: record.eventLogRoot,
+    };
   }
 
   aggregateTrustInput(

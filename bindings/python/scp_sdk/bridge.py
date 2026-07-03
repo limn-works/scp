@@ -24,7 +24,7 @@ def _bridge() -> Any:
     """Return the ``_scp_core`` extension module, imported lazily.
 
     Used for the pure-function bridge operations (``bridge_register``,
-    ``bridge_evaluate_trust``) that do not require an :class:`SCP`
+    ``bridge_provenance_tier``) that do not require an :class:`SCP`
     instance. See :func:`create_shadow` for the stateful variant.
     """
     try:
@@ -78,15 +78,17 @@ def register(
     )
 
 
-def evaluate_trust(
+def bridge_provenance_tier(
     *,
     is_bridged: bool = False,
     is_native_transport: bool = True,
     shadow_status: ShadowStatus | str = ShadowStatus.SHADOW,
 ) -> int:
-    """Evaluate the trust level for an action based on bridge provenance.
+    """Evaluate the bridge-provenance trust tier for an action.
 
-    Returns an integer (0--3) representing the trust tier:
+    This is the bridge-provenance signal (spec §12 / ADR-023), distinct from
+    the four-layer trust evaluation :func:`scp_sdk.trust.evaluate_trust`. It
+    returns an integer (0--3) representing the trust tier:
 
     - ``0`` -- ``ShadowBridged`` (weakest).
     - ``1`` -- ``ClaimedBridged``.
@@ -113,6 +115,6 @@ def evaluate_trust(
 
 
 __all__ = [
-    "evaluate_trust",
+    "bridge_provenance_tier",
     "register",
 ]

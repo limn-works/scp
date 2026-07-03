@@ -222,6 +222,81 @@ pub trait ContextEventLogProvider: Send + Sync {
             .map_err(|e| ContextError::EventLogFailed(e.to_string()))
     }
 
+    /// Appends a `MemberJoined` / `MemberLeft` leaf carrying a subject-bearing
+    /// [`MembershipChangePayload`](scp_event_log::payload::MembershipChangePayload).
+    ///
+    /// `subject_did` is the *affected member* (joined/left) — NOT the governance
+    /// actor (`actor_did`), which on admin-driven membership changes is the
+    /// executing admin. `role_name` is the role the member holds at the
+    /// membership change. The leaf is convergent (ADR-011 amendment); the
+    /// participation record (§7.3.2) attributes the join/leave interval to
+    /// `subject_did`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::EventLogFailed`] if payload encoding or the
+    /// append fails.
+    fn append_membership_change_leaf(
+        &self,
+        context_id: &[u8; 32],
+        event_type: scp_event_log::EventType,
+        actor_did: &str,
+        subject_did: &str,
+        role_name: &str,
+        timestamp_secs: u64,
+    ) -> Result<(), ContextError> {
+        let payload = scp_event_log::payload::encode_payload(
+            &scp_event_log::payload::MembershipChangePayload {
+                subject_did: subject_did.to_owned(),
+                role_name: role_name.to_owned(),
+            },
+        )
+        .map_err(|e| ContextError::EventLogFailed(e.to_string()))?;
+        self.append_context_event_with_payload(
+            context_id,
+            event_type,
+            actor_did,
+            payload,
+            timestamp_secs,
+        )
+    }
+
+    /// Appends a `RoleAssigned` leaf carrying a subject-bearing
+    /// [`RoleAssignedPayload`](scp_event_log::payload::RoleAssignedPayload).
+    ///
+    /// `subject_did` is the *affected member* whose role changed — NOT the
+    /// governance actor (`actor_did`). `role` is the newly-assigned role. The
+    /// leaf is convergent (ADR-011 amendment); the participation record (§7.3.2)
+    /// attributes the role transition (`role_progression_count`) to
+    /// `subject_did`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::EventLogFailed`] if payload encoding or the
+    /// append fails.
+    fn append_role_assigned_leaf(
+        &self,
+        context_id: &[u8; 32],
+        actor_did: &str,
+        subject_did: &str,
+        role: &str,
+        timestamp_secs: u64,
+    ) -> Result<(), ContextError> {
+        let payload =
+            scp_event_log::payload::encode_payload(&scp_event_log::payload::RoleAssignedPayload {
+                subject_did: subject_did.to_owned(),
+                role: role.to_owned(),
+            })
+            .map_err(|e| ContextError::EventLogFailed(e.to_string()))?;
+        self.append_context_event_with_payload(
+            context_id,
+            scp_event_log::EventType::RoleAssigned,
+            actor_did,
+            payload,
+            timestamp_secs,
+        )
+    }
+
     // -- Entry reading (symmetric with append) --------------------------------
 
     /// Returns the event log entries for a context.
@@ -849,7 +924,32 @@ pub async fn create_context(
         return Err(e);
     }
 
-    // Step 8: Return the handle.
+    // Step 8: Append the founder's `MemberJoined` leaf.
+    //
+    // The creation flow emits only `ContextCreated` for the creator; without a
+    // `MemberJoined` leaf the membership-interval participation model has no
+    // join event to open the founder's interval, so the founder's
+    // `participation_duration_secs` computes as 0 even after they participate.
+    // Append a subject-bearing join leaf for the founder (actor == subject ==
+    // creator) at the SAME creator-assigned creation timestamp as
+    // `ContextCreated`, so it is convergent-by-construction (not each member's
+    // local `now()`; §7.3.1, §9.9.3). The creator's initial role is `admin`,
+    // mirroring the supervisor's creator membership in
+    // `lifecycle_helpers::create_context`. Rolls back the whole creation on
+    // failure, exactly like the `ContextCreated` append above.
+    if let Err(e) = event_log_provider.append_membership_change_leaf(
+        &id_bytes,
+        scp_event_log::EventType::MemberJoined,
+        creator_did,
+        creator_did,
+        "admin",
+        creation_timestamp_secs,
+    ) {
+        receipt.rollback(&id_bytes, crypto, transport, event_log_provider);
+        return Err(e.into());
+    }
+
+    // Step 9: Return the handle.
     Ok(handle)
 }
 
@@ -1027,6 +1127,95 @@ mod tests {
             under_sha256.is_empty(),
             "crypto state MUST NOT be keyed under SHA-256(id) — that would be the \
              pre-ADR-056 double-hash, diverging from state.context_id and the §6.2.4 wire digest"
+        );
+    }
+
+    /// The creation flow must emit a founder `MemberJoined` leaf so the
+    /// membership-interval participation model can attribute a join time to the
+    /// creator. Without it the founder's `participation_duration_secs` computes
+    /// as 0 even after they participate (no `MemberJoined` to open the
+    /// interval). Here the founder creates a context at t=1000 and participates
+    /// at t=1300; the participation record must report the 300s span (the
+    /// interval, still open, runs to the latest event), not 0.
+    #[tokio::test]
+    async fn founder_membership_leaf_yields_nonzero_participation_duration() {
+        use crate::context::providers::MerkleEventLogProvider;
+        use scp_protocol::trust::participation::compute_participation_record;
+
+        const CREATION_TS: u64 = 1_000;
+        const SEND_TS: u64 = 1_300;
+
+        // A real 64-hex context id (the shape `generate_context_id` emits).
+        let id = hex::encode([0x2au8; 32]);
+        let id_bytes = context_id_bytes(&id);
+        let crypto = MlsCryptoProvider::new(TEST_DID.to_owned());
+        let provider = MerkleEventLogProvider::new();
+
+        create_context(
+            id.clone(),
+            ContextParams::default(),
+            &crypto,
+            &TestTransport,
+            &provider,
+            TEST_DID,
+            CREATION_TS,
+        )
+        .await
+        .expect("create_context should succeed");
+
+        // The founder participates after creation; a later subject event extends
+        // the still-open membership interval to `SEND_TS`.
+        provider
+            .append_event(
+                &id_bytes,
+                scp_event_log::EventType::MessageSent,
+                TEST_DID,
+                scp_event_log::EventPayload::default(),
+                SEND_TS,
+            )
+            .expect("append founder MessageSent");
+
+        let entries = provider
+            .event_log_entries(&id_bytes)
+            .expect("entries readable")
+            .expect("log exists");
+
+        // Load-bearing fix: the creation stream carries the founder's
+        // `MemberJoined` leaf (actor == subject == creator) at the convergent
+        // creation timestamp, projecting the creator as the affected subject.
+        let founder_join = entries
+            .iter()
+            .find(|e| {
+                e.event_type == scp_event_log::EventType::MemberJoined
+                    && e.actor_did.0.as_str() == TEST_DID
+            })
+            .expect("founder MemberJoined leaf must be emitted on create");
+        assert_eq!(
+            founder_join.timestamp, CREATION_TS,
+            "founder join must carry the convergent creation timestamp"
+        );
+        assert_eq!(
+            scp_event_log::payload::project_payload(
+                &founder_join.event_type,
+                &founder_join.payload
+            )
+            .subject_did
+            .as_deref(),
+            Some(TEST_DID),
+            "founder join leaf must project the creator as the affected subject"
+        );
+
+        let record = compute_participation_record(&entries, TEST_DID, &id, [0u8; 32], 2_000, &[])
+            .expect("participation record computes");
+
+        assert_eq!(
+            record.participation_duration_seconds,
+            SEND_TS - CREATION_TS,
+            "founder duration must span the join (creation) to the latest event"
+        );
+        assert!(
+            record.participation_duration_seconds > 0,
+            "a founder who participated must have non-zero participation duration"
         );
     }
 }

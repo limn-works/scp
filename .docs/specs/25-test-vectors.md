@@ -403,8 +403,17 @@ Events (append order; each prev_hash = previous leaf hash, genesis = [0u8;32]):
          payload = b"operation=join;attempts=3"
          leaf = 0x87e3cde25168f4af4328f010369313e28fde305dbc6f706be3392fdf7b8e7f3c
 
-RFC 6962 tree::root over the 7 leaves:
-  0x39e50b879956255f4fd28b2c6f03995e759919e07166c232dd61ed321b54d40d
+  seq 7  RoleAssigned             ts 1700000007
+         payload = rmp(RoleAssignedPayload{ subject_did:"did:key:carol", role:"admin" })
+         leaf = 0x9455cca66b6528ff7061d27b70ddab795ffff1e790fc1f797f22e21687e5f449
+
+  seq 8  MemberJoined             ts 1700000008
+         payload = rmp(MembershipChangePayload{ subject_did:"did:key:dave",
+                       role_name:"member" })
+         leaf = 0x28860f95688e8b0604db7349fd79deed13d3b9a10198a9623ea288a6eeea58f2
+
+RFC 6962 tree::root over the 9 leaves:
+  0x0c6f6a09ecdda29319880ca609060ec15aa8055ee9fbc85099e5f6e8b1ba4117
 ```
 
 ### Vector 33: Checkpoint Root KAT (§23.16.1)
@@ -413,8 +422,8 @@ A `ConsistencyCheckpoint` generated over the Vector 32 log MUST carry `merkle_ro
 
 ```
 checkpoint.merkle_root == tree::root (Vector 32)
-  = 0x39e50b879956255f4fd28b2c6f03995e759919e07166c232dd61ed321b54d40d
-checkpoint.event_count == 7
+  = 0x0c6f6a09ecdda29319880ca609060ec15aa8055ee9fbc85099e5f6e8b1ba4117
+checkpoint.event_count == 9
 ```
 
 Reference implementation and assertions: `crates/scp-event-log/tests/test_vectors.rs` (`vector_32_typed_leaf_and_checkpoint_kat`, `vector_33_checkpoint_root_equals_tree_root_kat`). Regenerate with `cargo test -p scp-event-log --test test_vectors -- --nocapture`.

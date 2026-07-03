@@ -1278,6 +1278,7 @@ async fn forged_participation_profile_signature_rejected() {
             is_member: true,
             is_opted_in: true,
             current_time: 3000,
+            accessible_attestations: &[],
         },
     )
     .unwrap();
@@ -1330,6 +1331,7 @@ async fn stale_participation_profile_rejected() {
             is_member: true,
             is_opted_in: true,
             current_time: 3000, // profile created at time 3000
+            accessible_attestations: &[],
         },
     )
     .unwrap();
@@ -1343,7 +1345,7 @@ async fn stale_participation_profile_rejected() {
     }];
 
     // Verify at time 4000 (profile is 1000 seconds old, exceeds 60s max_age).
-    let result = verify_participation_requirements(4000, &requirements, &[profile]);
+    let result = verify_participation_requirements(4000, alice_did, &requirements, &[profile]);
     assert!(
         result.is_err(),
         "stale participation profile (1000s old, max 60s) must be rejected"

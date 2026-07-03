@@ -1734,6 +1734,66 @@ impl From<scp_core::crypto::ucan::validate::CapabilityValidation> for Capability
     }
 }
 
+/// Structured participation facts (§7.3.2) for a subject DID in a context.
+///
+/// The scalar projection of scp-core's `ParticipationRecord`, produced by
+/// `aggregate.participation_record`. Counts are flattened ONCE in the shared
+/// Rust core (`ParticipationFacts`) so the Swift/Kotlin SDKs RECEIVE the facts
+/// rather than re-aggregating event-log collections — eliminating cross-binding
+/// divergence by construction. See ADR-017.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ParticipationRecordView {
+    /// The DID whose participation is summarized.
+    pub subject_did: String,
+    /// Total seconds of context participation (§7.3.2).
+    pub participation_duration_secs: u64,
+    /// Count of governance actions taken against this identity (projected
+    /// `target_did` is the subject).
+    pub governance_actions_against: u64,
+    /// Count of governance actions initiated by this identity.
+    pub governance_actions_by: u64,
+    /// Total tool invocations across all tool types.
+    pub tool_invocation_count: u64,
+    /// Whether `tool_invocation_count` is anchored in the canonical Merkle log
+    /// (`false` until ADR-051; consumers MUST NOT treat it as Merkle-proven).
+    pub tool_invocation_count_anchored: bool,
+    /// Number of contexts created by the subject (`ChildContextCreated`).
+    pub context_creation_count: u64,
+    /// Number of role transitions for the subject.
+    pub role_progression_count: u64,
+    /// Number of accessible, currently-valid credential-layer attestations
+    /// (§7.4) for the subject. Verifier-relative.
+    pub attestation_count: u64,
+    /// Whether `attestation_count` is anchored in / verifiable against a context
+    /// Merkle root. Always `false` — credential-layer, verifier-relative (§7.4),
+    /// never a context-event-log count (§7.3.2). Parallel of
+    /// `tool_invocation_count_anchored`.
+    pub attestation_count_anchored: bool,
+    /// Unix timestamp (seconds) when the record was computed.
+    pub computed_at: u64,
+    /// Merkle root (hex) of the event log at computation time.
+    pub event_log_root: String,
+}
+
+impl From<&scp_core::trust::ParticipationFacts> for ParticipationRecordView {
+    fn from(f: &scp_core::trust::ParticipationFacts) -> Self {
+        Self {
+            subject_did: f.subject_did.to_string(),
+            participation_duration_secs: f.participation_duration_secs,
+            governance_actions_against: f.governance_actions_against,
+            governance_actions_by: f.governance_actions_by,
+            tool_invocation_count: f.tool_invocation_count,
+            tool_invocation_count_anchored: f.tool_invocation_count_anchored,
+            context_creation_count: f.context_creation_count,
+            role_progression_count: f.role_progression_count,
+            attestation_count: f.attestation_count,
+            attestation_count_anchored: f.attestation_count_anchored,
+            computed_at: f.computed_at,
+            event_log_root: hex::encode(f.event_log_root),
+        }
+    }
+}
+
 /// Current data availability status of the source context (spec §24.2.2).
 ///
 /// Reflects operational state, not creation-time memory scope. A persistent
@@ -6286,27 +6346,31 @@ pub fn trust_verify_response(
 // verify_participation_requirements (SCP-BA-004)
 // ---------------------------------------------------------------------------
 
-/// Verifies participation profiles against admission requirements.
+/// Verifies participation profiles against admission requirements, bound to the
+/// agent being admitted.
 ///
-/// Both inputs are JSON strings:
-/// - `profile_json`: JSON array of `ParticipationProfile` objects.
+/// Inputs:
+/// - `expected_subject`: the DID of the agent being admitted. Only profiles
+///   whose signed `subject_did` equals this value contribute to any threshold,
+///   freshness, or distinct-signer accounting — a victim's genuine profiles
+///   cannot be replayed to admit a different agent (cross-subject replay).
 /// - `requirements_json`: JSON array of `RequireParticipation` objects.
+/// - `profile_json`: JSON array of `ParticipationProfile` objects.
 ///
-/// Uses the current system time for freshness checks. Returns `true` if all
-/// requirements are satisfied, throws `ScpError` with a diagnostic message
-/// if any requirement fails or if the JSON is malformed.
+/// Uses the current system time for freshness checks. Returns without error
+/// (unit) if all requirements are satisfied, throws `ScpError` with a
+/// diagnostic message if any requirement fails or if the JSON is malformed.
 ///
 /// See §7.3.2.1.
 #[uniffi::export]
 pub fn verify_participation_requirements(
-    profile_json: String,
+    expected_subject: String,
     requirements_json: String,
-) -> Result<bool, ScpError> {
-    let profiles: Vec<scp_core::trust::ParticipationProfile> = serde_json::from_str(&profile_json)
-        .map_err(|e| ScpError::Validation {
-            msg: format!("failed to parse participation profiles JSON: {e}"),
-            code: codes::VALID_7030.to_owned(),
-        })?;
+    profile_json: String,
+) -> Result<(), ScpError> {
+    // Full DID-format validation (matching the PyO3 reference bridge), not just a
+    // non-empty check, so all native bridges reject malformed ids identically.
+    validate_did(&expected_subject)?;
 
     let requirements: Vec<scp_core::trust::RequireParticipation> =
         serde_json::from_str(&requirements_json).map_err(|e| ScpError::Validation {
@@ -6314,17 +6378,54 @@ pub fn verify_participation_requirements(
             code: codes::VALID_7031.to_owned(),
         })?;
 
-    let current_time = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
-
-    scp_core::trust::verify_participation_requirements(current_time, &requirements, &profiles)
+    let profiles: Vec<scp_core::trust::ParticipationProfile> = serde_json::from_str(&profile_json)
         .map_err(|e| ScpError::Validation {
-            msg: format!("participation admission verification failed: {e}"),
-            code: codes::VALID_7032.to_owned(),
+            msg: format!("failed to parse participation profiles JSON: {e}"),
+            code: codes::VALID_7030.to_owned(),
         })?;
 
-    Ok(true)
+    // Fail-closed clock: a pre-epoch host clock is an unrecoverable environment
+    // failure and must not silently read as time 0, which would make every
+    // participation statement appear maximally fresh and bypass `max_age_secs`.
+    // Matches the SystemClock invariant used on the verify-on-ingest path.
+    let current_time = scp_primitives::Clock::now_secs(&scp_primitives::SystemClock);
+
+    scp_core::trust::verify_participation_requirements(
+        current_time,
+        &expected_subject,
+        &requirements,
+        &profiles,
+    )
+    .map_err(|e| ScpError::Validation {
+        msg: format!("participation admission verification failed: {e}"),
+        code: codes::VALID_7032.to_owned(),
+    })?;
+
+    Ok(())
+}
+
+/// Builds a `ProtocolRepositoryTrustBridge` over the concrete backend behind a
+/// [`ProtocolRepoVariant`] arm and reads back the subject's verified
+/// attestations. Single source of truth for the per-backend
+/// attestation-sourcing path: both `ProtocolRepoVariant` arms route through this
+/// one generic body (mirroring the `PyO3` bridge's `run_verified_attestations`).
+/// The match remains pure type dispatch because each variant holds a distinct
+/// concrete `ProtocolRepository<S>`.
+fn run_verified_attestations<S: scp_platform::traits::Storage + 'static>(
+    repo: &std::sync::Arc<scp_core::store::ProtocolRepository<S>>,
+    context_id: &str,
+    subject_did: &str,
+    cached_attestations: Vec<scp_core::trust::aggregate::CachedAttestation>,
+) -> Result<Vec<scp_core::trust::attestation::Attestation>, scp_core::trust::TrustError> {
+    let handle = runtime().handle().clone();
+    let bridge =
+        scp_core::trust::ProtocolRepositoryTrustBridge::new(std::sync::Arc::clone(repo), handle);
+    scp_ffi_common::trust_store::verified_attestations(
+        bridge,
+        context_id,
+        subject_did,
+        cached_attestations,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -13274,16 +13375,27 @@ impl Scp {
                                     code: codes::CTX_2000.to_owned(),
                                 }
                             })?;
+                            // Project the typed payload's bridge-facing fields
+                            // (e.g. `target_did` for governance/access-revocation
+                            // events, `subject_did` for role/membership events)
+                            // through the single shared helper so all bridges
+                            // surface byte-identical values. Each key is omitted
+                            // when the projection yields `None`.
+                            let mut payload_value = serde_json::json!({
+                                "hash": hex::encode(leaf_hash),
+                            });
+                            scp_ffi_common::event_log::inject_projection(
+                                &mut payload_value,
+                                &entry.event_type,
+                                &entry.payload,
+                            );
                             manager_events.push(Event {
                                 event_type: scp_ffi_common::event_log::event_type_label(
                                     &entry.event_type,
                                 ),
                                 actor_did: entry.actor_did.0.clone(),
                                 timestamp: entry.timestamp,
-                                payload_json: serde_json::json!({
-                                    "hash": hex::encode(leaf_hash),
-                                })
-                                .to_string(),
+                                payload_json: payload_value.to_string(),
                                 sequence: seq,
                             });
                         }
@@ -13342,20 +13454,29 @@ impl Scp {
 
                                 // Try to interpret payload bytes as UTF-8 JSON; fall
                                 // back to hex encoding for binary payloads.
-                                let payload_json = std::str::from_utf8(&evt.payload.data)
-                                    .ok()
-                                    .filter(|s| {
-                                        serde_json::from_str::<serde_json::Value>(s).is_ok()
-                                    })
-                                    .map_or_else(
-                                        || {
+                                let mut payload_value: serde_json::Value =
+                                    std::str::from_utf8(&evt.payload.data)
+                                        .ok()
+                                        .and_then(|s| {
+                                            serde_json::from_str::<serde_json::Value>(s).ok()
+                                        })
+                                        .unwrap_or_else(|| {
                                             serde_json::json!({
                                                 "hex": hex::encode(&evt.payload.data),
                                             })
-                                            .to_string()
-                                        },
-                                        str::to_owned,
-                                    );
+                                        });
+                                // Project the typed payload's bridge-facing fields
+                                // (`target_did`, `subject_did`) through the single
+                                // shared helper, agreeing with the manager-path
+                                // projection above. Each key is injected only when
+                                // the surfaced payload is a JSON object and the
+                                // projection yields a value.
+                                scp_ffi_common::event_log::inject_projection(
+                                    &mut payload_value,
+                                    &evt.event_type,
+                                    &evt.payload,
+                                );
+                                let payload_json = payload_value.to_string();
 
                                 results.push(Event {
                                     event_type: format!("{:?}", evt.event_type),
@@ -13653,6 +13774,13 @@ impl Scp {
 
     /// Per-instance equivalent of the free-function `ucan_validate`.
     ///
+    /// FAIL CLOSED: `presenting_agent_did` is required (no silent security
+    /// default). When it is `None` or empty this returns a validation error
+    /// rather than defaulting to the token's own `aud` — defaulting would make
+    /// the step-5 audience check a tautological self-check (`aud == aud`) that
+    /// does NOT bind the token to any external subject (trust inflation). Mirrors
+    /// the diagnostic `ucan_evaluate` gate.
+    ///
     /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
     /// `instance_id` does not match this `SCP`'s.
     pub async fn ucan_validate(
@@ -13660,7 +13788,7 @@ impl Scp {
         handle: Arc<ContextHandle>,
         token: String,
         capability: String,
-        presenting_agent_did: Option<String>,
+        presenting_agent_did: String,
         proof_tokens: Option<Vec<String>>,
     ) -> Result<(), ScpError> {
         self.inner
@@ -13672,6 +13800,30 @@ impl Scp {
             .spawn(async move {
                 validate_ucan_token(&token)?;
                 validate_capability_uri(&capability)?;
+
+                // FAIL CLOSED (no silent security default): `presenting_agent_did`
+                // is a REQUIRED non-empty value (typed `String`, so Swift/Kotlin
+                // surface it as non-nullable). An empty/whitespace value is
+                // rejected rather than defaulting to the token's own `aud` (which
+                // would make the step-5 audience check tautological and inflate
+                // trust). Validated as a pure input before token parse — mirrors
+                // `ucan_evaluate`.
+                let agent_did = {
+                    let trimmed = presenting_agent_did.trim();
+                    if trimmed.is_empty() {
+                        return Err(ScpError::Validation {
+                            msg: "presenting_agent_did is required: ucan_validate will not \
+                                  default to the token's audience"
+                                .to_owned(),
+                            code: codes::VALID_7010.to_owned(),
+                        });
+                    }
+                    trimmed
+                };
+                // Input hygiene parity with the PyO3 reference: validate the
+                // trimmed presenting agent DID before any token parse / state
+                // lookup.
+                validate_did(agent_did)?;
 
                 use scp_core::crypto::ucan::capability::CapabilityUri;
                 use scp_core::crypto::ucan::validate::{
@@ -13692,11 +13844,6 @@ impl Scp {
                 let required_cap: CapabilityUri = capability
                     .parse()
                     .map_err(|e: scp_core::crypto::ucan::UcanError| ScpError::from(e))?;
-
-                // Determine the presenting agent DID: explicit parameter or token audience.
-                let agent_did = presenting_agent_did
-                    .as_deref()
-                    .unwrap_or(&parsed_token.payload.aud);
 
                 // Build proof resolver from optional proof tokens. Parse errors
                 // use the same shared classification as the root token above.
@@ -13772,14 +13919,29 @@ impl Scp {
     /// [`CapabilityValidationRecord`] (six booleans) instead of failing at the
     /// first error, and never records the token's nonce (read-only probe).
     ///
+    /// `capability` is OPTIONAL: omit it (or pass an empty string) to evaluate
+    /// the token's intrinsic validity with no invoked-capability grant-match
+    /// challenge — the mode the SDK trust signal uses. Supply a capability to
+    /// additionally require the token grants it. (The enforcing `ucan_validate`
+    /// gate keeps a mandatory capability.)
+    ///
+    /// FAIL CLOSED: `presenting_agent_did` is required (no silent security
+    /// default). When it is `None` or empty this returns a validation error
+    /// rather than defaulting to the token's own `aud` — defaulting would make the
+    /// step-5 audience check a tautological self-check (`aud == aud`) that does NOT
+    /// bind the token to any external subject, so a token addressed to someone
+    /// else would report `signatures_valid` (trust inflation). The SDK trust path
+    /// always passes the subject; raw diagnostic callers must now pass an explicit
+    /// presenting agent.
+    ///
     /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
     /// `instance_id` does not match this `SCP`'s.
     pub async fn ucan_evaluate(
         &self,
         handle: Arc<ContextHandle>,
         token: String,
-        capability: String,
-        presenting_agent_did: Option<String>,
+        capability: Option<String>,
+        presenting_agent_did: String,
         proof_tokens: Option<Vec<String>>,
     ) -> Result<CapabilityValidationRecord, ScpError> {
         self.inner
@@ -13790,7 +13952,35 @@ impl Scp {
         runtime()
             .spawn(async move {
                 validate_ucan_token(&token)?;
-                validate_capability_uri(&capability)?;
+                // An empty/whitespace-only capability means "no challenge" —
+                // treat it as absent rather than validating it as a URI.
+                let capability = capability.filter(|c| !c.trim().is_empty());
+                if let Some(ref cap) = capability {
+                    validate_capability_uri(cap)?;
+                }
+
+                // FAIL CLOSED (no silent security default): `presenting_agent_did`
+                // is a REQUIRED non-empty value (typed `String`, so Swift/Kotlin
+                // surface it as non-nullable). An empty/whitespace value is
+                // rejected rather than defaulting to the token's own `aud` (which
+                // would make the step-5 audience check tautological and inflate
+                // trust). Validated as a pure input before parse.
+                let agent_did = {
+                    let trimmed = presenting_agent_did.trim();
+                    if trimmed.is_empty() {
+                        return Err(ScpError::Validation {
+                            msg: "presenting_agent_did is required: ucan_evaluate will not \
+                                  default to the token's audience"
+                                .to_owned(),
+                            code: codes::VALID_7010.to_owned(),
+                        });
+                    }
+                    trimmed
+                };
+                // Input hygiene parity with the PyO3 reference: validate the
+                // trimmed presenting agent DID before any token parse / state
+                // lookup.
+                validate_did(agent_did)?;
 
                 use scp_core::crypto::ucan::capability::CapabilityUri;
                 use scp_core::crypto::ucan::validate::{
@@ -13802,15 +13992,15 @@ impl Scp {
                 // error code as every other bridge.
                 let parsed_token = parse_ucan(&token).map_err(ScpError::from)?;
 
-                // Parse the required capability URI.
-                let required_cap: CapabilityUri = capability
-                    .parse()
-                    .map_err(|e: scp_core::crypto::ucan::UcanError| ScpError::from(e))?;
-
-                // Determine the presenting agent DID: explicit parameter or token audience.
-                let agent_did = presenting_agent_did
+                // Parse the optional required capability URI. `None` =>
+                // intrinsic-validity diagnostic (no grant-match challenge).
+                let required_cap: Option<CapabilityUri> = capability
                     .as_deref()
-                    .unwrap_or(&parsed_token.payload.aud);
+                    .map(|cap| {
+                        cap.parse::<CapabilityUri>()
+                            .map_err(|e: scp_core::crypto::ucan::UcanError| ScpError::from(e))
+                    })
+                    .transpose()?;
 
                 // Build proof resolver from optional proof tokens.
                 let mut proofs = std::collections::HashMap::new();
@@ -13858,7 +14048,7 @@ impl Scp {
                             clock: &scp_primitives::SystemClock,
                         };
 
-                        evaluate_ucan(&parsed_token, &required_cap, &ctx)
+                        evaluate_ucan(&parsed_token, required_cap.as_ref(), &ctx)
                     })
                     .ok_or_else(|| ScpError::Permission {
                         msg: format!("context '{}' not found in UCAN registry", handle.context_id),
@@ -15162,6 +15352,83 @@ impl Scp {
                 })
             }
         }
+    }
+
+    /// Computes the structured participation record (§7.3.2) for `subject_did`
+    /// in `context_id`.
+    ///
+    /// Sources the subject's accessible, currently-valid attestations from THIS
+    /// instance's `ProtocolRepository` variant (populating any caller-supplied
+    /// `cached_attestations_json` first, exactly as `aggregate_trust_input`
+    /// does) — the REAL credential-layer source, not `&[]`. The shared
+    /// Supervisor gathers the FULL event log + Merkle root for every other fact.
+    /// Returns the flattened typed [`ParticipationRecordView`] so the
+    /// Swift/Kotlin SDKs never re-aggregate. See ADR-017, spec §7.3.2.
+    pub fn participation_record(
+        &self,
+        context_id: String,
+        subject_did: String,
+        cached_attestations_json: String,
+    ) -> Result<ParticipationRecordView, ScpError> {
+        // Full format validation (matching the PyO3 reference bridge), not just
+        // a non-empty check, so all native bridges reject malformed ids
+        // identically.
+        validate_context_id(&context_id)?;
+        validate_did(&subject_did)?;
+
+        let cached_attestations: Vec<scp_core::trust::aggregate::CachedAttestation> =
+            serde_json::from_str(&cached_attestations_json).map_err(|e| ScpError::Validation {
+                msg: format!("failed to parse cached_attestations JSON: {e}"),
+                code: codes::VALID_7059.to_owned(),
+            })?;
+
+        // Source verified attestations from this instance's `ProtocolRepository`
+        // (same backend as context/event-log writes). Both variants route
+        // through the single generic `run_verified_attestations` helper.
+        let verified = match self.inner.protocol_repository() {
+            crate::runtime::ProtocolRepoVariant::InMemory(repo) => {
+                run_verified_attestations(repo, &context_id, &subject_did, cached_attestations)
+            }
+            crate::runtime::ProtocolRepoVariant::Sqlite(repo) => {
+                run_verified_attestations(repo, &context_id, &subject_did, cached_attestations)
+            }
+        }
+        // An error from `verified_attestations` is an INFRA fault (trust-store
+        // read, signature-verification infrastructure) — NOT caller-input
+        // validation. Code it as a context-layer fault (CTX_2000), consistent
+        // with the generic-failure arm of `participation_record` below, and keep
+        // it propagating (fail-closed): it must never be folded into the empty-log
+        // CTX_2076 path.
+        .map_err(|e| ScpError::Context {
+            msg: e.to_string(),
+            code: codes::CTX_2000.to_owned(),
+        })?;
+
+        let supervisor = self
+            .inner
+            .core
+            .supervisor()
+            .ok_or_else(|| ScpError::Context {
+                msg: "supervisor not initialized — cannot compute participation record".to_owned(),
+                code: codes::CTX_2000.to_owned(),
+            })?;
+        let record = supervisor
+            .participation_record(&context_id, &subject_did, &verified)
+            .map_err(|e| {
+                // Empty-log → dedicated CTX_2076 so SDKs branch on the code, not
+                // the message; genuine failures stay on the generic CTX_2000.
+                let code = match e {
+                    scp_core::context::ContextError::NoParticipationFacts { .. } => codes::CTX_2076,
+                    _ => codes::CTX_2000,
+                };
+                ScpError::Context {
+                    msg: e.to_string(),
+                    code: code.to_owned(),
+                }
+            })?;
+
+        let facts = scp_core::trust::ParticipationFacts::from(&record);
+        Ok(ParticipationRecordView::from(&facts))
     }
 
     // ===== State-touching operations — per-instance methods on `Scp` =====
@@ -17030,6 +17297,94 @@ mod tests {
         crate::scp::Scp::new_in_memory_for_test()
     }
 
+    #[test]
+    fn participation_record_rejects_empty_context() {
+        let scp = scp_test();
+        let result =
+            scp.participation_record(String::new(), "did:key:test".to_owned(), "[]".to_owned());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn participation_record_rejects_empty_did() {
+        let scp = scp_test();
+        let result = scp.participation_record("ctx-1".to_owned(), String::new(), "[]".to_owned());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn participation_record_rejects_invalid_attestations_json() {
+        let scp = scp_test();
+        let result = scp.participation_record(
+            "ctx-1".to_owned(),
+            "did:key:test".to_owned(),
+            "not json".to_owned(),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn participation_record_rejects_malformed_did() {
+        // Format validation (not just non-empty) matches the PyO3 reference
+        // bridge: a non-empty but malformed DID is rejected.
+        let scp = scp_test();
+        let result =
+            scp.participation_record("ctx-1".to_owned(), "not-a-did".to_owned(), "[]".to_owned());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn verify_participation_requirements_rejects_empty_subject() {
+        let result =
+            verify_participation_requirements(String::new(), "[]".to_owned(), "[]".to_owned());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn verify_participation_requirements_rejects_malformed_subject() {
+        // Parity with the PyO3 reference bridge: `expected_subject` gets full
+        // DID-format validation, not just a non-empty check.
+        let result = verify_participation_requirements(
+            "not-a-did".to_owned(),
+            "[]".to_owned(),
+            "[]".to_owned(),
+        );
+        assert!(result.is_err());
+    }
+
+    /// The typed `ParticipationRecordView` surfaces every flattened fact from
+    /// the shared `ParticipationFacts` projection with identical values.
+    #[test]
+    fn participation_record_view_exposes_all_facts() {
+        let facts = scp_core::trust::ParticipationFacts {
+            subject_did: "did:key:bob".into(),
+            participation_duration_secs: 300,
+            governance_actions_against: 1,
+            governance_actions_by: 2,
+            tool_invocation_count: 5,
+            tool_invocation_count_anchored: false,
+            context_creation_count: 1,
+            role_progression_count: 3,
+            attestation_count: 2,
+            attestation_count_anchored: false,
+            computed_at: 42,
+            event_log_root: [7u8; 32],
+        };
+        let view = ParticipationRecordView::from(&facts);
+        assert_eq!(view.subject_did, "did:key:bob");
+        assert_eq!(view.participation_duration_secs, 300);
+        assert_eq!(view.governance_actions_against, 1);
+        assert_eq!(view.governance_actions_by, 2);
+        assert_eq!(view.tool_invocation_count, 5);
+        assert!(!view.tool_invocation_count_anchored);
+        assert_eq!(view.context_creation_count, 1);
+        assert_eq!(view.role_progression_count, 3);
+        assert_eq!(view.attestation_count, 2);
+        assert!(!view.attestation_count_anchored);
+        assert_eq!(view.computed_at, 42);
+        assert_eq!(view.event_log_root, hex::encode([7u8; 32]));
+    }
+
     /// Builds a synthetic `ContextHandle` stamped with `scp`'s own
     /// `instance_id` so the per-instance handle-affinity check accepts
     /// it. Phase D (#1695): replaces the old `UNSET_INSTANCE_ID` stamp
@@ -17077,6 +17432,58 @@ mod tests {
             pre_rotation_handle: scp_platform::PreRotationKeyHandle::new(0),
             pre_rotation_custody,
         })
+    }
+
+    /// SECURITY (Finding 2). `ucan_evaluate` MUST reject an empty/whitespace
+    /// `presenting_agent_did` rather than defaulting to the token's own `aud`
+    /// (which would make the step-5 audience check tautological and inflate
+    /// trust). OMISSION is now a COMPILE error — the parameter is a required
+    /// `String`, not `Option<String>` — so only the empty-value runtime gate is
+    /// testable here. The check is a pure-input gate after handle-affinity and
+    /// before token parse, so a dummy token suffices.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ucan_evaluate_requires_presenting_agent_did() {
+        let scp = scp_test();
+        let handle = test_handle_for(&scp);
+
+        let empty = scp
+            .ucan_evaluate(
+                handle,
+                "header.payload.sig".to_owned(),
+                None,
+                "   ".to_owned(),
+                None,
+            )
+            .await;
+        assert!(
+            empty.is_err(),
+            "ucan_evaluate must fail closed when presenting_agent_did is empty"
+        );
+    }
+
+    /// SECURITY (symmetric gate hardening). The ENFORCING `ucan_validate` gate
+    /// MUST reject an empty/whitespace `presenting_agent_did` rather than
+    /// defaulting to the token's own `aud`. OMISSION is now a COMPILE error (the
+    /// parameter is a required `String`), so only the empty-value runtime gate is
+    /// testable. Pure-input gate before token parse, so a dummy token suffices.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ucan_validate_requires_presenting_agent_did() {
+        let scp = scp_test();
+        let handle = test_handle_for(&scp);
+
+        let empty = scp
+            .ucan_validate(
+                handle,
+                "header.payload.sig".to_owned(),
+                "messages:write".to_owned(),
+                "   ".to_owned(),
+                None,
+            )
+            .await;
+        assert!(
+            empty.is_err(),
+            "ucan_validate must fail closed when presenting_agent_did is empty"
+        );
     }
 
     // ----- Context export signing via sign-only custody (§23.16.8) -----
@@ -17230,6 +17637,114 @@ mod tests {
             ScpError::Context { ref code, .. } => assert_eq!(code, codes::CTX_2040),
             other => panic!("expected ScpError::Context CTX-2040, got {other:?}"),
         }
+    }
+
+    /// `event_log_query` must project a `GovernanceActionExecuted` leaf's
+    /// `target_did` into the returned event's `payload_json`, decoded through the
+    /// shared `scp_event_log::payload::project_payload` so the value is
+    /// byte-identical across the three native bridges.
+    #[tokio::test]
+    async fn event_log_query_projects_governance_target_did() {
+        let scp = scp_test();
+        let handle = test_handle_for(&scp);
+        let bi = Arc::clone(&scp.inner);
+        let target_did = "did:dht:z6MkTargetMember";
+
+        // Register UCAN state and append a GovernanceActionExecuted leaf to the
+        // per-context event log (the fallback path event_log_query reads).
+        bi.ensure_ucan_registered(&handle.context_id, &handle.creator_did, &[]);
+        let append = bi.with_ucan_state(&handle.context_id, |ucan_state| {
+            let payload = scp_event_log::payload::encode_payload(
+                &scp_event_log::payload::GovernanceActionExecutedPayload {
+                    target_did: target_did.to_owned(),
+                    action_type: "RemoveMember".to_owned(),
+                },
+            )
+            .expect("governance payload encodes");
+            let event = scp_event_log::Event {
+                event_type: scp_event_log::EventType::GovernanceActionExecuted,
+                actor_did: handle.creator_did.clone().into(),
+                timestamp: 1_700_000_000,
+                sequence: scp_event_log::tree::event_count(&ucan_state.event_log),
+                payload,
+                prev_hash: scp_event_log::tree::GENESIS_PREV_HASH,
+                signature: Vec::new(),
+            };
+            scp_event_log::tree::append_unsigned_event(&mut ucan_state.event_log, &event)
+                .expect("append succeeds");
+        });
+        assert!(append.is_some(), "ucan state must be registered for append");
+
+        let events = scp
+            .event_log_query(Arc::clone(&handle), None)
+            .await
+            .expect("query succeeds");
+        assert_eq!(events.len(), 1, "exactly one event was appended");
+
+        let payload_json: serde_json::Value =
+            serde_json::from_str(&events[0].payload_json).expect("payload_json is a JSON object");
+        assert_eq!(
+            payload_json["target_did"].as_str(),
+            Some(target_did),
+            "GovernanceActionExecuted leaf projects its target_did"
+        );
+    }
+
+    /// `event_log_query` must project a `RoleAssigned` leaf's `subject_did` (the
+    /// affected member, NOT the governance actor) into the returned event's
+    /// `payload_json`, decoded through the shared
+    /// `scp_event_log::payload::project_payload` so the value is byte-identical
+    /// across the three native bridges.
+    #[tokio::test]
+    async fn event_log_query_projects_role_assigned_subject_did() {
+        let scp = scp_test();
+        let handle = test_handle_for(&scp);
+        let bi = Arc::clone(&scp.inner);
+        let subject_did = "did:dht:z6MkSubjectMember";
+
+        // Register UCAN state and append a RoleAssigned leaf to the per-context
+        // event log (the fallback path event_log_query reads).
+        bi.ensure_ucan_registered(&handle.context_id, &handle.creator_did, &[]);
+        let append = bi.with_ucan_state(&handle.context_id, |ucan_state| {
+            let payload = scp_event_log::payload::encode_payload(
+                &scp_event_log::payload::RoleAssignedPayload {
+                    subject_did: subject_did.to_owned(),
+                    role: "moderator".to_owned(),
+                },
+            )
+            .expect("role payload encodes");
+            let event = scp_event_log::Event {
+                event_type: scp_event_log::EventType::RoleAssigned,
+                actor_did: handle.creator_did.clone().into(),
+                timestamp: 1_700_000_000,
+                sequence: scp_event_log::tree::event_count(&ucan_state.event_log),
+                payload,
+                prev_hash: scp_event_log::tree::GENESIS_PREV_HASH,
+                signature: Vec::new(),
+            };
+            scp_event_log::tree::append_unsigned_event(&mut ucan_state.event_log, &event)
+                .expect("append succeeds");
+        });
+        assert!(append.is_some(), "ucan state must be registered for append");
+
+        let events = scp
+            .event_log_query(Arc::clone(&handle), None)
+            .await
+            .expect("query succeeds");
+        assert_eq!(events.len(), 1, "exactly one event was appended");
+
+        let payload_json: serde_json::Value =
+            serde_json::from_str(&events[0].payload_json).expect("payload_json is a JSON object");
+        assert_eq!(
+            payload_json["subject_did"].as_str(),
+            Some(subject_did),
+            "RoleAssigned leaf projects its subject_did"
+        );
+        // A subject-bearing leaf must NOT surface a target_did key.
+        assert!(
+            payload_json.get("target_did").is_none(),
+            "RoleAssigned leaf carries a subject, not a target"
+        );
     }
 
     /// `UniFFI` `tool_invoke` must reject `None` `ucan_token` with a

@@ -288,7 +288,7 @@ class CoroutineBridgeTest {
         @Test
         fun `ucanValidate dispatches on IO`() =
             runTest(ioDispatcher) {
-                bridge.ucan.validate(10L, "token", "read")
+                bridge.ucan.validate(10L, "token", "read", "did:example:presenter")
                 assertTrue(stubBindings.ucanValidateCalled)
             }
 
@@ -1404,7 +1404,7 @@ class StubNativeBindings : NativeBindings {
         contextHandle: Long,
         token: String,
         capability: String,
-        presentingAgentDid: String?,
+        presentingAgentDid: String,
         proofTokens: List<String>?,
     ) {
         ucanValidateCalled = true

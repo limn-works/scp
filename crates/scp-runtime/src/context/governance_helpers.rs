@@ -1203,10 +1203,16 @@ pub fn execute_add_member(
         }
     });
 
-    deps.event_log.append_context_event(
+    // Subject-bearing leaf (ADR-011 amendment): carry the *affected member*
+    // (`did`) in the payload, not just `actor_did` (which on this admin-driven
+    // add is the executing admin). Participation `participation_duration_secs`
+    // (§7.3.2) attributes the join interval to this subject.
+    deps.event_log.append_membership_change_leaf(
         &context_id_bytes,
         scp_event_log::EventType::MemberJoined,
         actor_did,
+        did.as_ref(),
+        role,
         timestamp_secs,
     )?;
     *cell.class_c_view().checkpoint_events_since_mut() += 1;
@@ -1241,7 +1247,7 @@ pub fn execute_remove_member(
     // where the fail-close `commit_fault` marker is set but NOT persisted before
     // the early return). All structural mutations + emit + broadcast + sender-
     // key drain ride the SAME fail-closed persist via `view.rest_mut()`.
-    cell.commit_class_s_keep(deps, context_id, |mut view| {
+    let removed_role_name = cell.commit_class_s_keep(deps, context_id, |mut view| {
         let state = view.rest_mut();
 
         require_active(&state.handle)?;
@@ -1249,6 +1255,13 @@ pub fn execute_remove_member(
         if !state.membership.contains(did) {
             return Err(ContextError::MemberNotFound(did.to_string()));
         }
+
+        // Role at departure, captured BEFORE the strip below for the
+        // subject-bearing MemberLeft leaf (ADR-011 amendment; §7.3.2).
+        let removed_role_name = state
+            .membership
+            .get(did.as_ref())
+            .map_or_else(String::new, |info| info.role_name.clone());
 
         // H9: MLS group removal FIRST (hard security boundary).
         let remove_output = deps
@@ -1267,7 +1280,8 @@ pub fn execute_remove_member(
                 did,
                 "remove_member_sender_key",
                 &e.to_string(),
-            );
+            )
+            .map(|()| String::new());
         }
 
         if let Err(e) = deps.crypto.rotate_sender_key(&context_id_bytes) {
@@ -1278,7 +1292,8 @@ pub fn execute_remove_member(
                 did,
                 "rotate_sender_key",
                 &e.to_string(),
-            );
+            )
+            .map(|()| String::new());
         }
 
         state.membership.remove_member(did);
@@ -1342,12 +1357,18 @@ pub fn execute_remove_member(
                 "failed to deliver rotated sender keys after member removal"
             );
         }
-        Ok(())
+        Ok(removed_role_name)
     })?;
-    deps.event_log.append_context_event(
+    // Subject-bearing leaf (ADR-011 amendment): carry the *affected member*
+    // (`did`) and the role it held at departure, not just `actor_did` (the
+    // executing admin). Participation `participation_duration_secs` (§7.3.2)
+    // attributes the leave interval to this subject.
+    deps.event_log.append_membership_change_leaf(
         &context_id_bytes,
         scp_event_log::EventType::MemberLeft,
         actor_did,
+        did.as_ref(),
+        &removed_role_name,
         timestamp_secs,
     )?;
     *cell.class_c_view().checkpoint_events_since_mut() += 1;
@@ -1397,10 +1418,16 @@ pub fn execute_change_role(
         }
         Ok(())
     })?;
-    deps.event_log.append_context_event(
+    // Subject-bearing leaf (ADR-011 amendment): carry the *affected member*
+    // (`did`) and the newly-assigned role, not just `actor_did` (which on this
+    // admin-driven change is the executing admin). Participation
+    // `role_progression_count` (§7.3.2) attributes the role transition to this
+    // subject.
+    deps.event_log.append_role_assigned_leaf(
         &context_id_bytes,
-        scp_event_log::EventType::RoleAssigned,
         actor_did,
+        did.as_ref(),
+        new_role,
         timestamp_secs,
     )?;
     *cell.class_c_view().checkpoint_events_since_mut() += 1;
@@ -3525,6 +3552,12 @@ fn actor_check_proposer_eligibility(
                 &context_id,
                 merkle_root,
                 now,
+                // attestation_count is a credential-layer, verifier-relative
+                // fact (§7.3.2); proposer eligibility gates only on
+                // participation_count and has no attestation-cache access, so it
+                // passes an empty accessible-attestation set (count 0) by
+                // design — NOT a stub.
+                &[],
             ) {
                 Err(e) => {
                     tracing::warn!(
@@ -4798,6 +4831,12 @@ pub fn finalize_governance_action(
                 context_id,
                 gov_merkle,
                 now,
+                // attestation_count is a credential-layer, verifier-relative
+                // fact (§7.3.2); proposer eligibility gates only on
+                // participation_count and has no attestation-cache access, so it
+                // passes an empty accessible-attestation set (count 0) by
+                // design — NOT a stub.
+                &[],
             )
             && record.participation_count > 0
         {

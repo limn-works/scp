@@ -508,17 +508,22 @@ fn event_log_query_empty_returns_empty() {
         let did = create_test_identity(scp.bridge_instance());
         let ctx_id = create_test_context(scp.bridge_instance(), &did);
 
-        // Per commit a5b4cc8ec ("fix: emit ContextCreated on context
-        // create"), the PyO3 bridge now wires a MerkleEventLogProvider
-        // (matching NAPI/UniFFI). `ContextManager::create_context`
-        // appends exactly one `ContextCreated` event at sequence 0, so a
-        // fresh context has event_count = 1 across all bridges.
-        // This test pins the post-alignment invariant.
+        // A fresh context's creation stream is two leaves: `ContextCreated`
+        // (sequence 0) followed by the founder's `MemberJoined` (sequence 1).
+        // The founder join leaf is what gives the creator a non-zero
+        // participation duration — without it the membership-interval model has
+        // no join event to open the creator's interval. The shape is identical
+        // across the native bridges (PyO3/NAPI/UniFFI).
         let events = scp.event_log_query(py, &ctx_id, None).unwrap();
         assert_eq!(
             events.len(),
-            1,
-            "expected exactly one ContextCreated event on a fresh context"
+            2,
+            "expected ContextCreated + founder MemberJoined on a fresh context"
+        );
+        assert_eq!(events[0].event_type, "ContextCreated");
+        assert_eq!(
+            events[1].event_type, "MemberJoined",
+            "the founder's MemberJoined leaf must follow ContextCreated"
         );
     });
 }
@@ -568,6 +573,150 @@ fn event_log_query_with_filter() {
             .event_log_query(py, &ctx_id, Some(&filter.as_borrowed()))
             .unwrap();
         assert!(events.len() <= 1);
+    });
+}
+
+#[test]
+fn event_log_query_projects_governance_target_did_from_storage() {
+    // Drives the storage-fallback path of `event_log_query`: register FFI state
+    // WITHOUT a supervisor `create_context` (so the manager path returns None),
+    // append one event to the per-context log so `event_count > 0`, then write a
+    // `GovernanceActionExecuted` event to storage. The query must project the
+    // event's `target_did` into `payload_json` via the shared `project_payload`
+    // decoder, agreeing byte-for-byte with the other three bridges.
+    use scp_platform::Storage as _;
+    Python::with_gil(|py| {
+        setup();
+        let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
+        let bi = scp.bridge_instance();
+        let did = create_test_identity(bi);
+        let ctx_id = random_context_id();
+        // FFI state only — no supervisor entry, so the manager path is empty.
+        runtime::register_context(bi, &ctx_id, &did, &[]).unwrap();
+
+        let target_did = "did:key:target-member";
+        let governance_event = scp_event_log::Event {
+            event_type: scp_event_log::EventType::GovernanceActionExecuted,
+            actor_did: scp_identity::DID(did),
+            timestamp: 1_700_000_000,
+            sequence: 0,
+            payload: scp_event_log::payload::encode_payload(
+                &scp_event_log::payload::GovernanceActionExecutedPayload {
+                    target_did: target_did.to_owned(),
+                    action_type: "RemoveMember".to_owned(),
+                },
+            )
+            .unwrap(),
+            prev_hash: [0u8; 32],
+            signature: vec![],
+        };
+
+        // Per-context log must be non-empty so the fallback does not early-return.
+        runtime::with_context(bi, &ctx_id, |rt| {
+            scp_event_log::tree::append_unsigned_event(&mut rt.event_log, &governance_event)
+                .unwrap();
+            Ok(())
+        })
+        .unwrap();
+
+        // Persist the full typed event under the ProtocolRepository key format.
+        let storage = runtime::get_storage(bi).unwrap();
+        let key = format!("context/{ctx_id}/event_data/{:020}", 0u64);
+        let bytes = rmp_serde::to_vec(&governance_event).unwrap();
+        test_runtime()
+            .block_on(storage.store(&key, &bytes))
+            .unwrap();
+
+        let events = scp.event_log_query(py, &ctx_id, None).unwrap();
+        assert_eq!(events.len(), 1, "the stored governance event is returned");
+
+        let payload = events[0].payload.bind(py);
+        let projected: String = payload
+            .get_item("target_did")
+            .expect("target_did key present in projected payload")
+            .extract()
+            .unwrap();
+        assert_eq!(
+            projected, target_did,
+            "GovernanceActionExecuted leaf projects its target_did"
+        );
+    });
+}
+
+#[test]
+fn event_log_query_projects_role_assigned_subject_did_from_storage() {
+    // Drives the storage-fallback path of `event_log_query`: register FFI state
+    // WITHOUT a supervisor `create_context` (so the manager path returns None),
+    // append one `RoleAssigned` event to the per-context log so `event_count > 0`,
+    // then write the same event to storage. The query must project the event's
+    // `subject_did` (the affected member, NOT the governance actor) into
+    // `payload_json` via the shared `project_payload` decoder, agreeing
+    // byte-for-byte with the other three bridges.
+    use scp_platform::Storage as _;
+    Python::with_gil(|py| {
+        setup();
+        let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
+        let bi = scp.bridge_instance();
+        let did = create_test_identity(bi);
+        let ctx_id = random_context_id();
+        // FFI state only — no supervisor entry, so the manager path is empty.
+        runtime::register_context(bi, &ctx_id, &did, &[]).unwrap();
+
+        let subject_did = "did:key:subject-member";
+        let role_event = scp_event_log::Event {
+            event_type: scp_event_log::EventType::RoleAssigned,
+            actor_did: scp_identity::DID(did),
+            timestamp: 1_700_000_000,
+            sequence: 0,
+            payload: scp_event_log::payload::encode_payload(
+                &scp_event_log::payload::RoleAssignedPayload {
+                    subject_did: subject_did.to_owned(),
+                    role: "moderator".to_owned(),
+                },
+            )
+            .unwrap(),
+            prev_hash: [0u8; 32],
+            signature: vec![],
+        };
+
+        // Per-context log must be non-empty so the fallback does not early-return.
+        runtime::with_context(bi, &ctx_id, |rt| {
+            scp_event_log::tree::append_unsigned_event(&mut rt.event_log, &role_event).unwrap();
+            Ok(())
+        })
+        .unwrap();
+
+        // Persist the full typed event under the ProtocolRepository key format.
+        let storage = runtime::get_storage(bi).unwrap();
+        let key = format!("context/{ctx_id}/event_data/{:020}", 0u64);
+        let bytes = rmp_serde::to_vec(&role_event).unwrap();
+        test_runtime()
+            .block_on(storage.store(&key, &bytes))
+            .unwrap();
+
+        let events = scp.event_log_query(py, &ctx_id, None).unwrap();
+        assert_eq!(
+            events.len(),
+            1,
+            "the stored role-assigned event is returned"
+        );
+
+        let payload = events[0].payload.bind(py);
+        let projected: String = payload
+            .get_item("subject_did")
+            .expect("subject_did key present in projected payload")
+            .extract()
+            .unwrap();
+        assert_eq!(
+            projected, subject_did,
+            "RoleAssigned leaf projects its subject_did"
+        );
+        // A subject-bearing leaf must NOT surface a target_did key — a missing
+        // key raises KeyError (an Err) from PyDict::get_item.
+        assert!(
+            payload.get_item("target_did").is_err(),
+            "RoleAssigned leaf carries a subject, not a target"
+        );
     });
 }
 
@@ -1139,7 +1288,9 @@ fn trust_verify_response_rejects_invalid_json() {
 #[test]
 fn verify_participation_requirements_empty_passes() {
     setup();
-    assert!(_scp_core::trust::py_verify_participation_requirements("[]", "[]").unwrap());
+    assert!(
+        _scp_core::trust::py_verify_participation_requirements("did:key:alice", "[]", "[]").is_ok()
+    );
 }
 
 // ============================================================================

@@ -127,6 +127,17 @@ pub fn extract_public_key_from_did(did: &str) -> Result<[u8; 32], String> {
     Err(format!("unsupported DID format: {did}"))
 }
 
+/// Constructs a `did:dht:z<z-base-32>` DID from a 32-byte Ed25519 public key.
+///
+/// This is the inverse of [`extract_public_key_from_did`] for the `did:dht`
+/// method and the single canonical place to encode a `did:dht` from a raw key,
+/// replacing ad-hoc `format!("did:dht:z{}", zbase32::encode(..))` call sites.
+/// It is the production encoding and needs no feature gate.
+#[must_use]
+pub fn did_dht_from_public_key(public_key: &[u8; 32]) -> DID {
+    DID(format!("did:dht:z{}", zbase32::encode(public_key)))
+}
+
 // ---------------------------------------------------------------------------
 // SigningKeyId (ADR-039)
 // ---------------------------------------------------------------------------

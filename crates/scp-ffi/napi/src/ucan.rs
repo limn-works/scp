@@ -258,6 +258,27 @@ pub(crate) async fn ucan_validate_on(
     validate_ucan_token(&token).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     validate_capability_uri(&capability).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
 
+    // FAIL CLOSED (no silent security default): require an explicit presenting
+    // agent DID instead of defaulting to the token's own `aud` (which would make
+    // the step-5 audience check tautological and inflate trust). Validated as a
+    // pure input before any state lookup / token parse — mirrors
+    // `ucan_evaluate_on`.
+    let agent_did = presenting_agent_did
+        .as_deref()
+        .map(str::trim)
+        .filter(|did| !did.is_empty())
+        .ok_or_else(|| {
+            napi::Error::from(ScpNapiError::Validation {
+                message: "presenting_agent_did is required: ucan_validate will not default to \
+                          the token's audience"
+                    .to_owned(),
+                code: codes::VALID_7010.to_owned(),
+            })
+        })?;
+    // Input hygiene parity with the PyO3 reference: validate the trimmed
+    // presenting agent DID before any state lookup / token parse.
+    validate_did(agent_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+
     // Ensure the context's persistent runtime state (RevocationList, NonceTracker)
     // is registered. Uses the same registry as event_log and ucan_revoke.
     crate::runtime::ensure_registered(bi, handle).map_err(napi::Error::from)?;
@@ -273,11 +294,6 @@ pub(crate) async fn ucan_validate_on(
                 message: format!("invalid capability URI '{capability}': {e}"),
                 code: codes::PERM_3001.to_owned(),
             })?;
-
-    // Determine the presenting agent DID: explicit parameter or token audience.
-    let agent_did = presenting_agent_did
-        .as_deref()
-        .unwrap_or(&parsed_token.payload.aud);
 
     // Build proof resolver from optional proof tokens.
     // Uses compute_cid (SHA-256 of encoded JWT) — NOT compute_revocation_cid
@@ -332,19 +348,56 @@ pub(crate) async fn ucan_validate_on(
 /// the same 11-step ADR-016 pipeline via `evaluate_ucan` but returns a
 /// structured [`NapiCapabilityValidation`] instead of throwing, and never
 /// records the token's nonce (read-only probe).
+///
+/// `capability` is OPTIONAL: `None` (or empty) evaluates the token's intrinsic
+/// validity with no invoked-capability grant-match challenge (mirroring
+/// `evaluate_ucan(None, ..)`); `Some` additionally requires the token grants it.
+///
+/// FAIL CLOSED: `presenting_agent_did` is required (no silent security default).
+/// When it is `None` or empty this returns a validation error rather than
+/// defaulting to the token's own `aud` — defaulting would make the step-5
+/// audience check a tautological self-check (`aud == aud`) that does NOT bind the
+/// token to any external subject, so a token addressed to someone else would
+/// report `signatures_valid` (trust inflation). The SDK trust path always passes
+/// the subject; raw diagnostic callers must now pass an explicit presenting agent.
 #[allow(clippy::unused_async)] // napi-rs requires async for Promise return
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String/Option<Vec>
 pub(crate) async fn ucan_evaluate_on(
     bi: &NapiBridgeInstance,
     handle: &NapiContextHandle,
     token: String,
-    capability: String,
+    capability: Option<String>,
     presenting_agent_did: Option<String>,
     proof_tokens: Option<Vec<String>>,
 ) -> napi::Result<NapiCapabilityValidation> {
     crate::napi_check_handle!(&bi.core, handle);
     validate_ucan_token(&token).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
-    validate_capability_uri(&capability).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+    // An empty/whitespace-only capability means "no challenge" — treat it as
+    // absent rather than validating it as a (non-empty) URI.
+    let capability = capability.filter(|c| !c.trim().is_empty());
+    if let Some(ref cap) = capability {
+        validate_capability_uri(cap).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+    }
+
+    // FAIL CLOSED (no silent security default): require an explicit presenting
+    // agent DID instead of defaulting to the token's own `aud` (which would make
+    // the step-5 audience check tautological and inflate trust). Validated as a
+    // pure input before any state lookup.
+    let agent_did = presenting_agent_did
+        .as_deref()
+        .map(str::trim)
+        .filter(|did| !did.is_empty())
+        .ok_or_else(|| {
+            napi::Error::from(ScpNapiError::Validation {
+                message: "presenting_agent_did is required: ucan_evaluate will not default to \
+                          the token's audience"
+                    .to_owned(),
+                code: codes::VALID_7010.to_owned(),
+            })
+        })?;
+    // Input hygiene parity with the PyO3 reference: validate the trimmed
+    // presenting agent DID before any state lookup / token parse.
+    validate_did(agent_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
 
     // Ensure the context's persistent runtime state (RevocationList, NonceTracker)
     // is registered. Uses the same registry as event_log and ucan_revoke.
@@ -353,19 +406,18 @@ pub(crate) async fn ucan_evaluate_on(
     // Step 1: Parse the UCAN token using scp-core's parser.
     let parsed_token = parse_ucan(&token).map_err(ScpNapiError::from)?;
 
-    // Parse the required capability URI.
-    let required_cap: CapabilityUri =
-        capability
-            .parse()
-            .map_err(|e: CoreUcanError| ScpNapiError::Permission {
-                message: format!("invalid capability URI '{capability}': {e}"),
-                code: codes::PERM_3001.to_owned(),
-            })?;
-
-    // Determine the presenting agent DID: explicit parameter or token audience.
-    let agent_did = presenting_agent_did
+    // Parse the optional required capability URI. `None` => intrinsic-validity
+    // diagnostic (no invoked-capability grant-match challenge).
+    let required_cap: Option<CapabilityUri> = capability
         .as_deref()
-        .unwrap_or(&parsed_token.payload.aud);
+        .map(|cap| {
+            cap.parse::<CapabilityUri>()
+                .map_err(|e: CoreUcanError| ScpNapiError::Permission {
+                    message: format!("invalid capability URI '{cap}': {e}"),
+                    code: codes::PERM_3001.to_owned(),
+                })
+        })
+        .transpose()?;
 
     // Build proof resolver from optional proof tokens.
     let proof_resolver = build_proof_resolver(proof_tokens.as_deref())?;
@@ -398,7 +450,7 @@ pub(crate) async fn ucan_evaluate_on(
             clock: &scp_primitives::SystemClock,
         };
 
-        Ok(evaluate_ucan(&parsed_token, &required_cap, &ctx))
+        Ok(evaluate_ucan(&parsed_token, required_cap.as_ref(), &ctx))
     })
     .map_err(napi::Error::from)?;
 
@@ -1442,6 +1494,90 @@ mod tests {
         assert!(
             reason.contains("SCP-IDENT-1017"),
             "expected SCP-IDENT-1017, got: {reason}"
+        );
+    }
+
+    /// SECURITY (Finding 2). `ucan_evaluate` MUST reject an omitted
+    /// `presenting_agent_did` rather than defaulting to the token's own `aud`.
+    /// The check is a pure-input gate before context lookup / token parse, so a
+    /// dummy token suffices.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ucan_evaluate_requires_presenting_agent_did() {
+        let bi = std::sync::Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
+        let handle = crate::context::NapiContextHandle::test_active_on(
+            &bi,
+            "ctx-eval-fail-closed".to_owned(),
+            "did:dht:z6MkCreator".to_owned(),
+        );
+
+        let omitted = ucan_evaluate_on(
+            &bi,
+            &handle,
+            "header.payload.sig".to_owned(),
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(
+            omitted.is_err(),
+            "ucan_evaluate must fail closed when presenting_agent_did is omitted"
+        );
+
+        let empty = ucan_evaluate_on(
+            &bi,
+            &handle,
+            "header.payload.sig".to_owned(),
+            None,
+            Some("   ".to_owned()),
+            None,
+        )
+        .await;
+        assert!(
+            empty.is_err(),
+            "ucan_evaluate must fail closed when presenting_agent_did is empty"
+        );
+    }
+
+    /// SECURITY (symmetric gate hardening). The ENFORCING `ucan_validate` gate
+    /// MUST reject an omitted / empty `presenting_agent_did` rather than
+    /// defaulting to the token's own `aud`. Pure-input gate before context
+    /// lookup / token parse, so a dummy token suffices.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ucan_validate_requires_presenting_agent_did() {
+        let bi = std::sync::Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
+        let handle = crate::context::NapiContextHandle::test_active_on(
+            &bi,
+            "ctx-validate-fail-closed".to_owned(),
+            "did:dht:z6MkCreator".to_owned(),
+        );
+
+        let omitted = ucan_validate_on(
+            &bi,
+            &handle,
+            "header.payload.sig".to_owned(),
+            "messages:write".to_owned(),
+            None,
+            None,
+        )
+        .await;
+        assert!(
+            omitted.is_err(),
+            "ucan_validate must fail closed when presenting_agent_did is omitted"
+        );
+
+        let empty = ucan_validate_on(
+            &bi,
+            &handle,
+            "header.payload.sig".to_owned(),
+            "messages:write".to_owned(),
+            Some("   ".to_owned()),
+            None,
+        )
+        .await;
+        assert!(
+            empty.is_err(),
+            "ucan_validate must fail closed when presenting_agent_did is empty"
         );
     }
 }

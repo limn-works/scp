@@ -456,7 +456,7 @@ class ConformanceStubBindings : NativeBindings {
         contextHandle: Long,
         token: String,
         capability: String,
-        presentingAgentDid: String?,
+        presentingAgentDid: String,
         proofTokens: List<String>?,
     ) {
         ucanValidateError?.let { throw it }

@@ -1720,6 +1720,183 @@ class SCP internal constructor(
             responseJson = responseJson,
         )
 
+    /**
+     * Read-only, structured counterpart to [ucanValidate].
+     *
+     * Runs the same 11-step ADR-016 validation pipeline but, instead of throwing
+     * at the first failing stage, returns a [CapabilityValidation] of six
+     * per-stage booleans (spec §7.2.4, ADR-057). The probe never records the
+     * token's nonce, so calling it does not consume the token.
+     * Capability/signature/expiry outcomes are reported via the booleans; only
+     * malformed FFI inputs (bad handle / token / capability) throw.
+     *
+     * NOT AN AUTHORIZATION DECISION: this is a diagnostic, never a gate. A
+     * no-capability (intrinsic-validity) result skips the invoked-capability
+     * grant-match, so [CapabilityValidation.allValid] returning `true` does NOT
+     * establish the token grants any particular capability.
+     *
+     * FAIL CLOSED: [presentingAgentDid] is required by the bridge (no silent
+     * security default). Omitting it makes the bridge reject the call rather than
+     * defaulting the presenting agent to the token's own `aud` — which would make
+     * the step-5 audience check the tautology `aud == aud` and inflate trust. It
+     * precedes [capability] because it is mandatory while [capability] is optional.
+     *
+     * @param capability Optional challenge capability URI. Omit it (or pass
+     *   `null`) to evaluate the token's INTRINSIC validity with no
+     *   invoked-capability grant-match challenge — the mode [evaluateTrust] uses.
+     */
+    suspend fun ucanEvaluate(
+        handle: ContextHandle,
+        token: String,
+        presentingAgentDid: String,
+        capability: String? = null,
+        proofTokens: List<String>? = null,
+    ): CapabilityValidation =
+        CapabilityValidation.fromRecord(
+            inner.ucanEvaluate(
+                handle = handle,
+                token = token,
+                capability = capability,
+                presentingAgentDid = presentingAgentDid,
+                proofTokens = proofTokens,
+            ),
+        )
+
+    /**
+     * Computes the participation record (§7.3.2) for a subject in a context.
+     *
+     * The shared Rust core gathers the FULL context event log and flattens the
+     * participation facts ONCE (`Supervisor::participation_record`), and the
+     * UniFFI bridge sources the subject's accessible, currently-valid
+     * attestations from its own persistent trust store (seeded by
+     * [cachedAttestations]). The SDK RECEIVES the flattened [BehavioralRecord] —
+     * it never re-aggregates event-log collections, so every binding observes
+     * identical facts for the same context/subject.
+     *
+     * `attestationCount` is a credential-layer fact (§7.4): NOT a context-event
+     * count, NOT Merkle-anchored, and verifier-relative. Pass the subject's
+     * accessible attestations as [cachedAttestations] to populate it; the default
+     * (empty) honestly reports only what the bridge's trust store already holds.
+     *
+     * SECURITY: `attestationCount` is authentic-but-self-mintable — an issuer is
+     * self-certifying, so a subject can mint endorsements from DIDs it controls.
+     * It MUST NOT be a sole trust or admission factor; use the
+     * threshold/independence path (§7.3.5) for Sybil resistance.
+     *
+     * An empty event log surfaces as [uniffi.scp.ScpException.Context] carrying
+     * [NO_PARTICIPATION_FACTS_CODE]; callers wanting the empty-log case as a
+     * zeroed record (rather than an exception) should use [evaluateTrust].
+     */
+    fun participationRecord(
+        contextId: String,
+        subjectDid: String,
+        cachedAttestations: List<CachedAttestation> = emptyList(),
+    ): BehavioralRecord =
+        BehavioralRecord.fromView(
+            inner.participationRecord(
+                contextId = contextId,
+                subjectDid = subjectDid,
+                cachedAttestationsJson = encodeCachedAttestationsJson(cachedAttestations),
+            ),
+        )
+
+    /**
+     * Evaluate the trustworthiness of a participant within a context
+     * (spec §7.2.4, ADR-057). The protocol provides the data, not the verdict.
+     *
+     * - Layer 1 — protocol enforcement: each supplied capability token is run
+     *   through the read-only [ucanEvaluate] diagnostic, yielding six per-stage
+     *   booleans AND-combined across the token set (one token failing a stage
+     *   makes that aggregate field `false`). This never inspects error prose. The
+     *   subject is passed as the presenting agent (audience check against the DID
+     *   under assessment) with no challenge capability (intrinsic-validity mode).
+     *   With no tokens supplied, every field stays `false`.
+     * - Layer 2 — behavioral validation: RECEIVES the subject's participation
+     *   facts (§7.3.2) from the shared Rust core via [participationRecord]. A
+     *   context with no convergent events yet (an empty event log) is folded into
+     *   a zeroed [BehavioralRecord], branching on the STRUCTURED
+     *   [NO_PARTICIPATION_FACTS_CODE] — never on error prose. Any other error
+     *   propagates.
+     *
+     * The evaluation is labeled with the context the layers were computed against
+     * — the handle's resolved [ContextHandle.contextId] — so it is never silently
+     * mislabeled.
+     *
+     * SECURITY: the behavioral record's `attestationCount` (and any challenge
+     * results, where consumed) are authentic-but-self-mintable signals — an
+     * issuer/verifier is self-certifying, so a subject can mint them from DIDs it
+     * controls. They MUST NOT be a sole trust or admission factor; use the
+     * threshold/independence path (§7.3.5) for Sybil resistance.
+     */
+    suspend fun evaluateTrust(
+        handle: ContextHandle,
+        subjectDid: String,
+        capabilityTokens: List<String> = emptyList(),
+    ): TrustEvaluation {
+        // Layer 1: AND-combine the structured per-stage booleans across tokens.
+        // With no tokens every field stays false (no stage was observed to pass).
+        var capabilityValidation =
+            CapabilityValidation(
+                tokensValid = false,
+                signaturesValid = false,
+                withinCeiling = false,
+                nonceValid = false,
+                notRevoked = false,
+                timeBoundsValid = false,
+            )
+        if (capabilityTokens.isNotEmpty()) {
+            var tokensValid = true
+            var signaturesValid = true
+            var withinCeiling = true
+            var nonceValid = true
+            var notRevoked = true
+            var timeBoundsValid = true
+            for (token in capabilityTokens) {
+                val perToken = ucanEvaluate(handle = handle, token = token, presentingAgentDid = subjectDid)
+                tokensValid = tokensValid && perToken.tokensValid
+                signaturesValid = signaturesValid && perToken.signaturesValid
+                withinCeiling = withinCeiling && perToken.withinCeiling
+                nonceValid = nonceValid && perToken.nonceValid
+                notRevoked = notRevoked && perToken.notRevoked
+                timeBoundsValid = timeBoundsValid && perToken.timeBoundsValid
+            }
+            capabilityValidation =
+                CapabilityValidation(
+                    tokensValid = tokensValid,
+                    signaturesValid = signaturesValid,
+                    withinCeiling = withinCeiling,
+                    nonceValid = nonceValid,
+                    notRevoked = notRevoked,
+                    timeBoundsValid = timeBoundsValid,
+                )
+        }
+
+        // Label the evaluation with the SAME context the layers were computed
+        // against (the handle's canonical id), and key the participation-record
+        // lookup off it too.
+        val resolvedContextId = handle.contextId()
+
+        // Layer 2: behavioral record RECEIVED from the shared Rust core. An empty
+        // event log (SCP-CTX-2076) is folded into a zeroed record — branching on
+        // the STRUCTURED code, never error prose. No cached attestations are
+        // supplied, so attestationCount reflects only the bridge's own trust
+        // store (verifier-relative, §7.4).
+        val behavioralRecord =
+            try {
+                participationRecord(contextId = resolvedContextId, subjectDid = subjectDid)
+            } catch (e: uniffi.scp.ScpException.Context) {
+                if (e.code != NO_PARTICIPATION_FACTS_CODE) throw e
+                BehavioralRecord.zeroed(subjectDid = subjectDid)
+            }
+
+        return TrustEvaluation(
+            subjectDid = subjectDid,
+            contextId = resolvedContextId,
+            capabilityValidation = capabilityValidation,
+            behavioralRecord = behavioralRecord,
+        )
+    }
+
     /** Forwards to [NativeScp.ucanDelegate] on [inner]. */
     suspend fun ucanDelegate(
         handle: ContextHandle,
@@ -1761,12 +1938,18 @@ class SCP internal constructor(
         revokerDid = revokerDid,
     )
 
-    /** Forwards to [NativeScp.ucanValidate] on [inner]. */
+    /**
+     * Forwards to [NativeScp.ucanValidate] on [inner].
+     *
+     * [presentingAgentDid] is REQUIRED: the bridge fails closed on an absent
+     * presenter rather than defaulting to the token's own `aud` (which would
+     * make the audience check the tautology `aud == aud` and inflate trust).
+     */
     suspend fun ucanValidate(
         handle: ContextHandle,
         token: String,
         capability: String,
-        presentingAgentDid: String?,
+        presentingAgentDid: String,
         proofTokens: List<String>?,
     ) = inner.ucanValidate(
         handle = handle,
@@ -1780,15 +1963,34 @@ class SCP internal constructor(
      * Routes through the UniFFI-generated free function
      * [uniffi.scp.verifyParticipationRequirements]. ADR-048 §1 + §7
      * Kotlin bullet.
+     *
+     * [expectedSubject] is the DID of the agent being admitted: only
+     * profiles whose signed `subject_did` equals it contribute to any
+     * threshold, freshness, or distinct-signer accounting, closing
+     * cross-subject participation-profile replay.
+     *
+     * Returns normally when all requirements are satisfied; the bridge
+     * throws on any failed requirement or malformed JSON.
+     *
+     * Security caveat — authenticity is not authorization: this verifies
+     * signatures over the subject binding, not signer *legitimacy*. Because
+     * `signer_public_key` is self-certifying, a subject can present
+     * genuinely-signed profiles from signers it controls (inflating
+     * `min_contexts`). Callers MUST establish signer legitimacy separately
+     * (trusted-signer set, context-membership proof, or the §7.3.5
+     * threshold/independence path) and MUST NOT treat success as authorization.
      */
     fun verifyParticipationRequirements(
-        profileJson: String,
+        expectedSubject: String,
         requirementsJson: String,
-    ): Boolean =
+        profileJson: String,
+    ) {
         uniffi.scp.verifyParticipationRequirements(
-            profileJson = profileJson,
+            expectedSubject = expectedSubject,
             requirementsJson = requirementsJson,
+            profileJson = profileJson,
         )
+    }
 
     companion object {
         /**

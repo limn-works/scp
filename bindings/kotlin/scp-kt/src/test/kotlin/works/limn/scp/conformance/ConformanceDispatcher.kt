@@ -162,7 +162,10 @@ class ConformanceDispatcher(
             val contextHandle = input["context_handle"]?.toLongOrNull() ?: 0L
             val token = input["encoded"] ?: input["token"] ?: ""
             val capability = input["capability"] ?: ""
-            val presentingAgentDid = input["presenting_agent_did"]
+            // `presenting_agent_did` is required by the bridge (no silent
+            // security default); default to empty so a fixture that omits it
+            // exercises the fail-closed path rather than failing to compile.
+            val presentingAgentDid = input["presenting_agent_did"] ?: ""
             val proofTokens = input["proof_tokens"]?.let { listOf(it) }
             bridge.ucan.validate(contextHandle, token, capability, presentingAgentDid, proofTokens)
             mapOf("status" to "valid")

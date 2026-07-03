@@ -20,8 +20,11 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { generateKeyPairSync } from "node:crypto";
 import { createRequire } from "node:module";
 import type { BridgeMode } from "../src/bridge";
+import { ContextError } from "../src/errors";
 import { __getNativeScp, SCP } from "../src/scp";
 import type { Relay } from "../src/server";
+import type { BehavioralRecord } from "../src/types";
+import { allValid } from "../src/types";
 
 /**
  * Generates a raw X25519 keypair (32-byte secret + 32-byte public key) for
@@ -623,7 +626,9 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       // NAPI bridge requires full capability URI with scp:ctx:{contextId}/ prefix.
       const fullUri = token.capabilities[0];
       expect(fullUri).toBeDefined();
-      await napi.ucanValidate(ctx, token.encoded, fullUri as string);
+      // The enforcing gate fails closed without a presenting agent — pass the
+      // subject the token was minted for (its `aud`).
+      await napi.ucanValidate(ctx, token.encoded, fullUri as string, member.did);
     });
 
     test("rejects validation for an ungranted capability", async () => {
@@ -632,7 +637,27 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       const ctx = await napi.contextCreate(admin, JSON.stringify({ ceiling: ["messages:read"] }));
 
       const token = await napi.ucanMint(ctx, member.did, ["messages:read"]);
-      await expect(napi.ucanValidate(ctx, token.encoded, "messages:write")).rejects.toThrow();
+      await expect(
+        napi.ucanValidate(ctx, token.encoded, "messages:write", member.did),
+      ).rejects.toThrow();
+    });
+
+    test("ucanValidate fails closed when no presenting agent is supplied", async () => {
+      const admin = await napi.identityCreate("in_memory");
+      const member = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(admin, JSON.stringify({ ceiling: ["messages:read"] }));
+
+      const token = await napi.ucanMint(ctx, member.did, ["messages:read"]);
+      const fullUri = token.capabilities[0] as string;
+
+      // No presenting agent → the gate MUST reject rather than default the
+      // audience check to the token's own `aud` (which would be a tautology that
+      // inflates trust). The fail-closed check fires before nonce recording, so
+      // the token's nonce is NOT consumed and the control call below still works.
+      await expect(napi.ucanValidate(ctx, token.encoded, fullUri)).rejects.toThrow();
+
+      // Control: supplying the subject (the token's audience) passes.
+      await napi.ucanValidate(ctx, token.encoded, fullUri, member.did);
     });
 
     test("revokes a token", async () => {
@@ -643,6 +668,510 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       const token = await napi.ucanMint(ctx, member.did, ["messages:read"]);
       // Revocation by the context creator should not throw.
       await napi.ucanRevoke(ctx, token.encoded, admin.did);
+    });
+
+    // C3c (ADR-057, §7.2.4): structured read-only diagnostic.
+    test("ucanEvaluate returns all-true for a valid token on a granted capability", async () => {
+      const admin = await napi.identityCreate("in_memory");
+      const member = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(admin, JSON.stringify({ ceiling: ["messages:read"] }));
+
+      const token = await napi.ucanMint(ctx, member.did, ["messages:read"]);
+      const fullUri = token.capabilities[0] as string;
+      const result = await napi.ucanEvaluate(ctx, token.encoded, fullUri, member.did);
+      expect(result).toEqual({
+        tokensValid: true,
+        signaturesValid: true,
+        withinCeiling: true,
+        nonceValid: true,
+        notRevoked: true,
+        timeBoundsValid: true,
+      });
+    });
+
+    test("ucanEvaluate reports signaturesValid:false for a forged-signature token (no throw)", async () => {
+      const admin = await napi.identityCreate("in_memory");
+      const member = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(admin, JSON.stringify({ ceiling: ["messages:read"] }));
+
+      const token = await napi.ucanMint(ctx, member.did, ["messages:read"]);
+      const fullUri = token.capabilities[0] as string;
+
+      // Forge the signature: a UCAN is `header.payload.signature` (base64url).
+      // Replace ONLY the signature segment so the token still PARSES
+      // (tokensValid stays true) but signature verification fails.
+      const parts = token.encoded.split(".");
+      expect(parts.length).toBe(3);
+      // A different, structurally-valid base64url signature segment.
+      const forgedSig = "A".repeat((parts[2] as string).length);
+      const forged = `${parts[0]}.${parts[1]}.${forgedSig}`;
+
+      // Read-only diagnostic: must NOT throw — it reports the failure as bools.
+      const result = await napi.ucanEvaluate(ctx, forged, fullUri, member.did);
+      expect(result.tokensValid).toBe(true);
+      expect(result.signaturesValid).toBe(false);
+      // Everything downstream of the signature stage never ran → false.
+      expect(result.withinCeiling).toBe(false);
+      expect(result.nonceValid).toBe(false);
+      expect(result.notRevoked).toBe(false);
+      expect(result.timeBoundsValid).toBe(false);
+    });
+
+    test("ucanEvaluate is read-only: re-evaluating the same token keeps nonceValid:true", async () => {
+      const admin = await napi.identityCreate("in_memory");
+      const member = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(admin, JSON.stringify({ ceiling: ["messages:read"] }));
+
+      const token = await napi.ucanMint(ctx, member.did, ["messages:read"]);
+      const fullUri = token.capabilities[0] as string;
+
+      const first = await napi.ucanEvaluate(ctx, token.encoded, fullUri, member.did);
+      const second = await napi.ucanEvaluate(ctx, token.encoded, fullUri, member.did);
+      // The probe never records the nonce, so the second evaluation is NOT a
+      // replay — nonceValid stays true (unlike ucanValidate, which would
+      // consume the nonce and reject the second call).
+      expect(first.nonceValid).toBe(true);
+      expect(second.nonceValid).toBe(true);
+      expect(second).toEqual(first);
+    });
+
+    // Cross-bridge parity (Finding K): every bridge applies
+    // `capability.filter(|c| !c.trim().is_empty())`, so an empty/whitespace
+    // capability is coerced to "no challenge" — identical to omitting it
+    // (None). Sibling of the PyO3 test_ucan_evaluate_empty_capability_coerced
+    // _to_no_challenge test; the two assert the SAME coercion so a future edit
+    // to one bridge cannot silently diverge. A bare "*" is NOT this (it is a
+    // malformed URI the bridge rejects); absence is emptiness/omission only.
+    test("ucanEvaluate empty/whitespace capability coerces to no-challenge (NAPI parity)", async () => {
+      const admin = await napi.identityCreate("in_memory");
+      const member = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(admin, JSON.stringify({ ceiling: ["messages:read"] }));
+
+      const token = await napi.ucanMint(ctx, member.did, ["messages:read"]);
+
+      // Presenting agent fixed to the token audience so the only variable is
+      // the capability argument's emptiness.
+      const omitted = await napi.ucanEvaluate(ctx, token.encoded, null, member.did);
+      const empty = await napi.ucanEvaluate(ctx, token.encoded, "", member.did);
+      const whitespace = await napi.ucanEvaluate(ctx, token.encoded, "   ", member.did);
+
+      // Empty / whitespace capability == omitted capability: identical record.
+      expect(empty).toEqual(omitted);
+      expect(whitespace).toEqual(omitted);
+      // A fresh, in-ceiling token is intrinsically valid on every stage.
+      expect(allValid(omitted)).toBe(true);
+    });
+
+    // C3c (ADR-057 / §7.2.4): evaluateTrust assesses each token's GENERAL
+    // (intrinsic) validity — it must NOT impose an invoked-capability
+    // grant-match. The previous implementation passed a `"*"` sentinel that the
+    // real bridge rejects ("missing scp:ctx: prefix"); the fix passes no
+    // challenge capability (intrinsic-validity mode). A single valid, in-ceiling
+    // token must therefore report all six checks true — this case would have
+    // FAILED under the old `"*"` behavior (grant-match against `*` never
+    // matches), so it is the regression guard for the actual bug.
+    test("evaluateTrust reports a single valid token as intrinsically valid (real SCP method)", async () => {
+      const admin = await napi.identityCreate("in_memory");
+      const member = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(admin, JSON.stringify({ ceiling: ["messages:read"] }));
+
+      const good = await napi.ucanMint(ctx, member.did, ["messages:read"]);
+
+      const result = await scpInstance.evaluateTrust(ctx, member.did, [good.encoded]);
+      // No grant-match challenge: a fresh, well-signed, in-ceiling token is
+      // intrinsically valid on every stage.
+      expect(result.capabilityValidation.tokensValid).toBe(true);
+      expect(result.capabilityValidation.signaturesValid).toBe(true);
+      expect(result.capabilityValidation.withinCeiling).toBe(true);
+      expect(result.capabilityValidation.nonceValid).toBe(true);
+      expect(result.capabilityValidation.notRevoked).toBe(true);
+      expect(result.capabilityValidation.timeBoundsValid).toBe(true);
+      // The derived happy-path accessor collapses the six fields: all true.
+      expect(allValid(result.capabilityValidation)).toBe(true);
+      expect(result.subjectDid).toBe(member.did);
+      // The evaluation is labeled with the context the handle RESOLVES to (the
+      // canonical id the layers were computed against), not the bare label arg
+      // ("ctx-real") — the handle carries a real `contextId`, so a mismatched
+      // label does not relabel the result.
+      expect(result.contextId).toBe(ctx.contextId);
+    });
+
+    test("evaluateTrust AND-combines per-token validations (real SCP method)", async () => {
+      const admin = await napi.identityCreate("in_memory");
+      const member = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(admin, JSON.stringify({ ceiling: ["messages:read"] }));
+
+      const good = await napi.ucanMint(ctx, member.did, ["messages:read"]);
+      // Forge a second token whose signature is invalid.
+      const parts = good.encoded.split(".");
+      const forged = `${parts[0]}.${parts[1]}.${"A".repeat((parts[2] as string).length)}`;
+
+      const result = await scpInstance.evaluateTrust(ctx, member.did, [good.encoded, forged]);
+      // Intrinsic validity per token, AND-combined: the good token passes every
+      // stage; the forged one fails signatures — so the AND is false there while
+      // tokensValid (both parse) stays true.
+      expect(result.capabilityValidation.tokensValid).toBe(true);
+      expect(result.capabilityValidation.signaturesValid).toBe(false);
+      // A single failing stage makes the derived accessor false.
+      expect(allValid(result.capabilityValidation)).toBe(false);
+      expect(result.subjectDid).toBe(member.did);
+      // Labeled with the handle-resolved context id, not the bare label arg.
+      expect(result.contextId).toBe(ctx.contextId);
+      // Layer 2 behavioral record is present (event-log query succeeded).
+      expect(result.behavioralRecord).toBeDefined();
+    });
+
+    // C3c (Phase 2C-2): the Layer-2 behavioral record is now the TYPED
+    // participation record (§7.3.2) RECEIVED from the shared Rust core via
+    // `participationRecord` — the SDK no longer classifies raw events
+    // client-side, so the divergence-prone per-binding `toolInvocations` map is
+    // gone. The record exposes the flattened `ParticipationFacts` 1:1.
+    //
+    // After create+join the context's supervisor Merkle log holds convergent
+    // leaves (the `eventLogRoot` is a real, non-zero hash that advances with
+    // each lifecycle op), so `participationRecord` RETURNS a typed record — it
+    // does NOT throw. This test pins the baseline record SHAPE on a context with
+    // no governance activity yet: a real Merkle root, a real `computedAt`,
+    // `attestationCount == 0` (no attestations supplied — credential-layer, §7.4),
+    // `toolInvocationCountAnchored == false` (ADR-051), and the obsolete
+    // client-side fields absent. The per-fact governance/role COUNTS being
+    // exercised live (and asserted non-zero) is the job of the affirmative test
+    // below — the runtime DOES populate the ADR-011-amendment subject-bearing
+    // payloads on the live NAPI governance path, so those counts move with
+    // activity. This test deliberately does not assert them, since no governance
+    // action has occurred at this point.
+    test("participationRecord returns a typed record with a real Merkle root (real SCP method)", async () => {
+      const admin = await napi.identityCreate("in_memory");
+      const member = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(
+        admin,
+        JSON.stringify({ ceiling: ["messages:read"], governance: "single_admin" }),
+      );
+      await napi.contextJoin(ctx, member.did);
+
+      // Key the lookup by the context's canonical id (the 64-char hex the handle
+      // carries) — the same value `evaluateTrust` resolves from the handle — so
+      // the lookup hits the context's REAL supervisor log.
+      const realContextId = (ctx as { readonly contextId: string }).contextId;
+      const record = await scpInstance.participationRecord(realContextId, member.did);
+
+      expect(record.subjectDid).toBe(member.did);
+      // The log is non-empty: a real 32-byte Merkle root (64 hex chars), not the
+      // all-zero placeholder of an absent root.
+      expect(record.eventLogRoot).toMatch(/^[0-9a-f]{64}$/);
+      expect(record.eventLogRoot).not.toBe("0".repeat(64));
+      expect(record.computedAt).toBeGreaterThan(0);
+      // `tool_invocation_count` is never Merkle-anchored until ADR-051 (§7.3.2).
+      expect(record.toolInvocationCountAnchored).toBe(false);
+      // No cached attestations supplied → credential-layer count is 0 (§7.4),
+      // honest and verifier-relative — the SDK fabricates none.
+      expect(record.attestationCount).toBe(0);
+      // The obsolete client-side fields are gone from the typed shape.
+      expect((record as unknown as Record<string, unknown>).toolInvocations).toBeUndefined();
+      expect((record as unknown as Record<string, unknown>).participationCount).toBeUndefined();
+    });
+
+    // C3c (Phase 2C-2): the leaf-derived participation facts (§7.3.2) MOVE in
+    // response to real governance activity. A `single_admin` context whose
+    // ceiling carries the governance capabilities auto-executes each proposal
+    // on `propose` (ADR-031), appending convergent `GovernanceActionExecuted` /
+    // `RoleAssigned` / `ChildContextCreated` leaves to the supervisor's Merkle
+    // log. The typed `participationRecord` then RECEIVES non-zero counts
+    // attributed by the subject-bearing payloads (ADR-011 amendment): the actor
+    // for `governance_actions_by` / `context_creation_count`, and the projected
+    // member for `role_progression_count` / `governance_actions_against`. This
+    // is the affirmative counterpart to the create+join-only test above — it
+    // proves the facts are real, not perpetually zero.
+    test("participationRecord reflects real governance activity (real SCP method)", async () => {
+      const admin = await napi.identityCreate("in_memory");
+      const member = await napi.identityCreate("in_memory");
+      // The ceiling MUST carry the governance + child-creation capabilities, or
+      // the proposer (creator) lacks `governance:propose` / the child-creation
+      // capability and the proposal is permission-denied.
+      const ctx = await napi.contextCreate(
+        admin,
+        JSON.stringify({
+          ceiling: [
+            "messages:read",
+            "messages:write",
+            "role:assign",
+            "governance:propose",
+            "governance:vote",
+            "context:close",
+            "context:child:create",
+          ],
+          governance: "single_admin",
+        }),
+      );
+      const realContextId = (ctx as { readonly contextId: string }).contextId;
+      await napi.contextJoin(ctx, member.did);
+
+      // 1. ChangeRole(member → moderator): a RoleAssigned leaf projected to the
+      //    member + a GovernanceActionExecuted leaf actored by the admin.
+      await napi.contextGovernancePropose(
+        ctx,
+        JSON.stringify({ ChangeRole: { did: member.did, new_role: "moderator" } }),
+        admin.did,
+      );
+      // 2. RemoveMember(member): an adverse action → governance_actions_against
+      //    the member + another GovernanceActionExecuted by the admin.
+      await napi.contextGovernancePropose(
+        ctx,
+        JSON.stringify({ RemoveMember: { did: member.did, reason: "participation-test" } }),
+        admin.did,
+      );
+      // 3. CreateChildContext: a ChildContextCreated leaf actored by the admin →
+      //    the admin's context_creation_count increments by one.
+      await napi.contextGovernancePropose(
+        ctx,
+        JSON.stringify({
+          CreateChildContext: {
+            params: {
+              mode: "Encrypted",
+              ceiling: [],
+              ceiling_policy: "Immutable",
+              promotion_policy: "NoPromotion",
+              roles: [],
+              tools: [],
+              ttl: null,
+              memory_scope: "Ephemeral",
+              governance: "SingleAdmin",
+              template_id: null,
+            },
+          },
+        }),
+        admin.did,
+      );
+
+      const adminRecord = await scpInstance.participationRecord(realContextId, admin.did);
+      const memberRecord = await scpInstance.participationRecord(realContextId, member.did);
+
+      // Admin INITIATED all three governance actions and created one child.
+      expect(adminRecord.governanceActionsBy).toBe(3);
+      expect(adminRecord.governanceActionsAgainst).toBe(0);
+      expect(adminRecord.contextCreationCount).toBe(1);
+      expect(adminRecord.roleProgressionCount).toBe(0);
+      // Member was the TARGET of one role change and one (adverse) removal.
+      expect(memberRecord.roleProgressionCount).toBe(1);
+      expect(memberRecord.governanceActionsAgainst).toBe(1);
+      expect(memberRecord.governanceActionsBy).toBe(0);
+      expect(memberRecord.contextCreationCount).toBe(0);
+      // Credential-layer / anchoring invariants hold for both subjects.
+      expect(adminRecord.attestationCount).toBe(0);
+      expect(memberRecord.attestationCount).toBe(0);
+      expect(adminRecord.toolInvocationCountAnchored).toBe(false);
+      expect(memberRecord.toolInvocationCountAnchored).toBe(false);
+      // Real Merkle root over the convergent governance leaves.
+      expect(adminRecord.eventLogRoot).toMatch(/^[0-9a-f]{64}$/);
+      expect(adminRecord.eventLogRoot).not.toBe("0".repeat(64));
+
+      // evaluateTrust (handle-resolved contextId) RECEIVES the SAME record the
+      // direct op returns — no client-side recomputation, no divergence.
+      const evaluated = await scpInstance.evaluateTrust(ctx, admin.did);
+      expect(evaluated.behavioralRecord).toEqual(adminRecord);
+    });
+
+    // CROSS-SDK PARITY (the divergence-killer). Because both SDKs now RECEIVE
+    // the identical Rust-computed `ParticipationFacts` rather than each
+    // recomputing Layer 2, the SAME governance scenario MUST yield the SAME
+    // per-fact counts in TypeScript and Python. This test pins the canonical
+    // expected counts for the scenario; the Python sibling
+    // `test_participation_record_reflects_governance_real_ffi`
+    // (bindings/python/tests/test_real_ffi.py) asserts the IDENTICAL counts for
+    // the IDENTICAL scenario — so a divergence between the two bindings is a
+    // CI-visible test failure on one side, by construction. (DIDs and the
+    // Merkle root vary per run and are excluded from the parity tuple; the
+    // leaf-derived/credential counts are deterministic for the scenario.)
+    test("participation facts match the canonical cross-SDK counts (real SCP method)", async () => {
+      const admin = await napi.identityCreate("in_memory");
+      const member = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(
+        admin,
+        JSON.stringify({
+          ceiling: [
+            "messages:read",
+            "messages:write",
+            "role:assign",
+            "governance:propose",
+            "governance:vote",
+            "context:close",
+            "context:child:create",
+          ],
+          governance: "single_admin",
+        }),
+      );
+      const realContextId = (ctx as { readonly contextId: string }).contextId;
+      await napi.contextJoin(ctx, member.did);
+      await napi.contextGovernancePropose(
+        ctx,
+        JSON.stringify({ ChangeRole: { did: member.did, new_role: "moderator" } }),
+        admin.did,
+      );
+      await napi.contextGovernancePropose(
+        ctx,
+        JSON.stringify({ RemoveMember: { did: member.did, reason: "parity" } }),
+        admin.did,
+      );
+      await napi.contextGovernancePropose(
+        ctx,
+        JSON.stringify({
+          CreateChildContext: {
+            params: {
+              mode: "Encrypted",
+              ceiling: [],
+              ceiling_policy: "Immutable",
+              promotion_policy: "NoPromotion",
+              roles: [],
+              tools: [],
+              ttl: null,
+              memory_scope: "Ephemeral",
+              governance: "SingleAdmin",
+              template_id: null,
+            },
+          },
+        }),
+        admin.did,
+      );
+
+      const adminRec = await scpInstance.participationRecord(realContextId, admin.did);
+      const memberRec = await scpInstance.participationRecord(realContextId, member.did);
+
+      // The CANONICAL counts the Python sibling test asserts verbatim. Keys are
+      // the deterministic, DID-independent facts (the Merkle root + subject_did
+      // are excluded since they vary per run).
+      const counts = (r: BehavioralRecord) => ({
+        governanceActionsAgainst: r.governanceActionsAgainst,
+        governanceActionsBy: r.governanceActionsBy,
+        toolInvocationCount: r.toolInvocationCount,
+        toolInvocationCountAnchored: r.toolInvocationCountAnchored,
+        contextCreationCount: r.contextCreationCount,
+        roleProgressionCount: r.roleProgressionCount,
+        attestationCount: r.attestationCount,
+        participationDurationSecs: r.participationDurationSecs,
+      });
+      expect(counts(adminRec)).toEqual({
+        governanceActionsAgainst: 0,
+        governanceActionsBy: 3,
+        toolInvocationCount: 0,
+        toolInvocationCountAnchored: false,
+        contextCreationCount: 1,
+        roleProgressionCount: 0,
+        attestationCount: 0,
+        participationDurationSecs: 0,
+      });
+      expect(counts(memberRec)).toEqual({
+        governanceActionsAgainst: 1,
+        governanceActionsBy: 0,
+        toolInvocationCount: 0,
+        toolInvocationCountAnchored: false,
+        contextCreationCount: 0,
+        roleProgressionCount: 1,
+        attestationCount: 0,
+        participationDurationSecs: 0,
+      });
+    });
+
+    // `evaluateTrust` must remain usable on a context with NO convergent leaves
+    // (the EmptyEventLog case): the core returns `EmptyEventLog`, which the SDK
+    // folds into a zeroed behavioral record rather than throwing, so a
+    // Layer-1-only trust check never has to populate the log first. Drive the
+    // genuinely-empty case by keying the (handle-resolved) lookup at a context
+    // label the supervisor has never seen, so the core's event-log lookup is
+    // empty and the graceful fold is exercised end-to-end against the real
+    // bridge. `participationRecord` on the same empty context propagates instead.
+    test("evaluateTrust folds an empty event log into a zeroed behavioral record (real SCP method)", async () => {
+      const member = await napi.identityCreate("in_memory");
+      // A handle whose resolved contextId is a never-created label → empty log.
+      const emptyHandle = { contextId: "ctx-never-created-empty-log" };
+
+      // Direct record request on the empty context → typed ContextError keyed
+      // on the dedicated, machine-detectable SCP-CTX-2076 code (the SDK branches
+      // on the code, not error prose).
+      const directError = await scpInstance
+        .participationRecord(emptyHandle.contextId, member.did)
+        .then(
+          () => undefined,
+          (err: unknown) => err,
+        );
+      expect(directError).toBeInstanceOf(ContextError);
+      expect((directError as ContextError).code).toBe("SCP-CTX-2076");
+
+      // evaluateTrust on the same empty context (no Layer-1 tokens, so only the
+      // Layer-2 empty-log fold is exercised) → graceful zeroed record.
+      const result = await scpInstance.evaluateTrust(emptyHandle, member.did);
+      const record = result.behavioralRecord;
+      expect(record.subjectDid).toBe(member.did);
+      expect(record.participationDurationSecs).toBe(0);
+      expect(record.governanceActionsAgainst).toBe(0);
+      expect(record.governanceActionsBy).toBe(0);
+      expect(record.toolInvocationCount).toBe(0);
+      expect(record.toolInvocationCountAnchored).toBe(false);
+      expect(record.contextCreationCount).toBe(0);
+      expect(record.roleProgressionCount).toBe(0);
+      expect(record.attestationCount).toBe(0);
+      // attestationCount is credential-layer, never Merkle-anchored.
+      expect(record.attestationCountAnchored).toBe(false);
+      // Empty-log fold uses the all-zero root placeholder, not a real hash.
+      expect(record.eventLogRoot).toBe("");
+    });
+
+    // Finding O: audience-mismatch trust-inflation regression (TS sibling of
+    // the PyO3 `test_evaluate_trust_audience_mismatch_real_ffi`). A token whose
+    // `aud` differs from the evaluated subject must report `signaturesValid:
+    // false` — `evaluateTrust` passes `subjectDid` as the presenting agent so
+    // the step-5 audience check evaluates against the DID under assessment.
+    // `presentingAgentDid` is fail-closed: the bridge REJECTS an absent or empty
+    // value rather than defaulting the presenting agent to the token's OWN `aud`
+    // (which would make `aud == aud` always true, inflating trust for a token
+    // addressed to someone else). This guards a future edit that drops
+    // `subjectDid` from `evaluateTrust` (ADR-057 / §7.2.4).
+    test("evaluateTrust reports signaturesValid:false for an audience-mismatched token", async () => {
+      const admin = await napi.identityCreate("in_memory");
+      const bob = await napi.identityCreate("in_memory");
+      const carol = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(admin, JSON.stringify({ ceiling: ["messages:read"] }));
+
+      // Token audience is Bob.
+      const tokenForBob = await napi.ucanMint(ctx, bob.did, ["messages:read"]);
+
+      // Evaluate trust for Carol (a DIFFERENT subject than the token audience):
+      // the audience check fails, so the structural-checks field is false.
+      const mismatch = await scpInstance.evaluateTrust(ctx, carol.did, [tokenForBob.encoded]);
+      expect(mismatch.capabilityValidation.signaturesValid).toBe(false);
+
+      // Control: evaluating the SAME token for its true audience (Bob) passes
+      // the audience check — proving the false above is the mismatch, not an
+      // unrelated failure.
+      const control = await scpInstance.evaluateTrust(ctx, bob.did, [tokenForBob.encoded]);
+      expect(control.capabilityValidation.signaturesValid).toBe(true);
+    });
+
+    // Finding P: empty/whitespace capability coercion must NOT bypass a failing
+    // stage. The intrinsic-validity coercion (`capability=""` → no challenge) is
+    // a no-CHALLENGE switch, not a no-CHECK switch — a forged-signature token
+    // with an empty capability must still report `signaturesValid: false`. The
+    // existing coercion parity test only covered a VALID token; this pins the
+    // INVALID case so coercion cannot be mistaken for a validity shortcut. PyO3
+    // sibling: test_ucan_evaluate_empty_capability_invalid_token_still_fails.
+    test("ucanEvaluate empty capability on a forged token still reports signaturesValid:false", async () => {
+      const admin = await napi.identityCreate("in_memory");
+      const member = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(admin, JSON.stringify({ ceiling: ["messages:read"] }));
+
+      const token = await napi.ucanMint(ctx, member.did, ["messages:read"]);
+      // Forge the signature segment so signature verification fails.
+      const parts = token.encoded.split(".");
+      expect(parts.length).toBe(3);
+      const forged = `${parts[0]}.${parts[1]}.${"A".repeat((parts[2] as string).length)}`;
+
+      // Empty capability == no challenge — but the failing signature stage must
+      // STILL be reported, never bypassed by the coercion.
+      const empty = await napi.ucanEvaluate(ctx, forged, "", member.did);
+      expect(empty.tokensValid).toBe(true);
+      expect(empty.signaturesValid).toBe(false);
+      // Equivalent to omitting the capability entirely: same failing record.
+      const omitted = await napi.ucanEvaluate(ctx, forged, null, member.did);
+      expect(empty).toEqual(omitted);
     });
   });
 
@@ -1229,15 +1758,18 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       const writeCap = writeToken.capabilities[0] as string;
       expect(writeCap).toBeDefined();
 
-      // Validate both capabilities (separate tokens, separate nonces).
-      await napi.ucanValidate(ctx, readToken.encoded, readCap);
-      await napi.ucanValidate(ctx, writeToken.encoded, writeCap);
+      // Validate both capabilities (separate tokens, separate nonces). The
+      // enforcing gate requires the presenting agent (the token's audience).
+      await napi.ucanValidate(ctx, readToken.encoded, readCap, member.did);
+      await napi.ucanValidate(ctx, writeToken.encoded, writeCap, member.did);
 
       // Revoke the read token (revoker is the admin/context creator).
       await napi.ucanRevoke(ctx, readToken.encoded, admin.did);
 
       // Verify the revoked token is rejected.
-      await expect(napi.ucanValidate(ctx, readToken.encoded, readCap)).rejects.toThrow();
+      await expect(
+        napi.ucanValidate(ctx, readToken.encoded, readCap, member.did),
+      ).rejects.toThrow();
 
       // Mint a fresh write token to verify non-revoked capabilities still work.
       // The original writeToken's nonce was already consumed at line 927, so
@@ -1245,7 +1777,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       // the revocation check is reached.
       const freshWriteToken = await napi.ucanMint(ctx, member.did, ["messages:write"]);
       const freshWriteCap = freshWriteToken.capabilities[0] as string;
-      await napi.ucanValidate(ctx, freshWriteToken.encoded, freshWriteCap);
+      await napi.ucanValidate(ctx, freshWriteToken.encoded, freshWriteCap, member.did);
     });
   });
 

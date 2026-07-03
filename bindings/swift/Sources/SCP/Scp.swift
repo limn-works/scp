@@ -1124,12 +1124,26 @@ public extension SCP {
     }
 
     /// Forwards to ``Scp/ucanValidate`` on ``inner``.
-    func ucanValidate(handle: ContextHandle, token: String, capability: String, presentingAgentDid: String?, proofTokens: [String]?) async throws {
+    ///
+    /// `presentingAgentDid` is REQUIRED: the bridge fails closed on an absent
+    /// presenter rather than defaulting to the token's own `aud` (which would
+    /// make the audience check the tautology `aud == aud` and inflate trust).
+    func ucanValidate(handle: ContextHandle, token: String, capability: String, presentingAgentDid: String, proofTokens: [String]?) async throws {
         try await inner.ucanValidate(handle: handle, token: token, capability: capability, presentingAgentDid: presentingAgentDid, proofTokens: proofTokens)
     }
 
     // `verifyParticipationRequirements` moved to a UniFFI-generated free
     // top-level function under ADR-048 §1 + §7 Swift bullet. Call it
-    // directly:
-    //   `try verifyParticipationRequirements(profileJson:requirementsJson:)`
+    // directly (`expectedSubject` is the security-critical DID of the agent
+    // being admitted — only profiles whose signed `subject_did` equals it
+    // contribute to any accounting):
+    //   `try verifyParticipationRequirements(expectedSubject:requirementsJson:profileJson:)`
+    //
+    // Security caveat — authenticity is not authorization: this verifies
+    // signatures over the subject binding, not signer legitimacy
+    // (`signerPublicKey` is self-certifying; a subject can present
+    // genuinely-signed profiles from signers it controls, inflating
+    // `minContexts`). Establish signer legitimacy separately (trusted-signer
+    // set, context-membership proof, or the §7.3.5 threshold/independence
+    // path); do not treat success as an authorization decision.
 }

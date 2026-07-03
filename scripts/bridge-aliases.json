@@ -2713,6 +2713,19 @@
       "napi": [
         "transport_reliability"
       ]
+    },
+    {
+      "canonical": "participation_record",
+      "category": "trust",
+      "pyo3": [
+        "participation_record"
+      ],
+      "uniffi": [
+        "participation_record"
+      ],
+      "napi": [
+        "participation_record"
+      ]
     }
   ],
   "exemptions": {

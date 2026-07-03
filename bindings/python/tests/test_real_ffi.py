@@ -600,6 +600,245 @@ class TestUcan:
         except Exception:
             pass  # May fail depending on implementation state
 
+    async def test_ucan_validate_fails_closed_without_presenting_agent(self, scp: SCP):
+        """The ENFORCING ucan_validate gate rejects an absent presenting agent.
+
+        Symmetric with the diagnostic ucan_evaluate gate: defaulting the
+        presenting agent to the token's own ``aud`` would make the step-5
+        audience check a tautology and inflate trust. The fail-closed check fires
+        before token parse, so any well-formed token string reaches it.
+        """
+        alice = await scp.identity_create(CustodyType.IN_MEMORY)
+        handle = scp._native.context_create(
+            alice.did,
+            {
+                "ceiling": ["messages:read"],
+                "memory_scope": "ephemeral",
+                "governance": "single_admin",
+            },
+        )
+        # Omitted presenting agent → rejected.
+        with pytest.raises(Exception, match="presenting_agent_did is required"):
+            scp._native.ucan_validate(handle.context_id, "header.payload.sig", "messages:read")
+        # Empty / whitespace presenting agent → also rejected.
+        with pytest.raises(Exception, match="presenting_agent_did is required"):
+            scp._native.ucan_validate(
+                handle.context_id, "header.payload.sig", "messages:read", "   "
+            )
+
+    async def test_evaluate_trust_end_to_end_real_ffi(self, scp: SCP):
+        """Exercise ``evaluate_trust`` against the real ``_scp_core`` bridge.
+
+        Closes the coverage gap where only mocks exercised ``evaluate_trust``.
+        Mints a valid token, then runs ``evaluate_trust`` (which drives the
+        read-only ``ucan_evaluate`` diagnostic with NO challenge capability —
+        intrinsic-validity mode, ADR-057 / §7.2.4) and asserts the structured
+        Layer-1 booleans. A freshly minted, well-signed, in-ceiling token must
+        report all six per-stage checks ``True``.
+        """
+        from scp_sdk.trust import evaluate_trust
+
+        alice = await scp.identity_create(CustodyType.IN_MEMORY)
+        bob = await scp.identity_create(CustodyType.IN_MEMORY)
+        handle = scp._native.context_create(
+            alice.did,
+            {
+                "ceiling": ["messages:read", "messages:write"],
+                "memory_scope": "ephemeral",
+                "governance": "single_admin",
+            },
+        )
+        token = await scp.ucan_mint(handle.context_id, bob.did, ["messages:read"])
+        assert token.encoded, "minted token must expose its encoded JWT"
+
+        evaluation = await evaluate_trust(
+            scp=scp,
+            subject_did=bob.did,
+            context_id=handle.context_id,
+            capability_tokens=[token.encoded],
+        )
+
+        cv = evaluation.capability_validation
+        # Intrinsic validity of a fresh, in-ceiling, well-signed token: all true.
+        # The grant-match step is SKIPPED (no challenge), and read-only nonce
+        # probing means re-evaluation does not consume the nonce.
+        assert cv.tokens_valid is True
+        assert cv.signatures_valid is True
+        assert cv.within_ceiling is True
+        assert cv.nonce_valid is True
+        assert cv.not_revoked is True
+        assert cv.time_bounds_valid is True
+
+        # Read-only: a second evaluation yields the same all-true result (the
+        # diagnostic must never record the nonce).
+        again = await evaluate_trust(
+            scp=scp,
+            subject_did=bob.did,
+            context_id=handle.context_id,
+            capability_tokens=[token.encoded],
+        )
+        cv2 = again.capability_validation
+        assert cv2.nonce_valid is True
+        assert cv2.tokens_valid is True
+        assert cv2.signatures_valid is True
+
+    async def test_evaluate_trust_audience_mismatch_real_ffi(self, scp: SCP):
+        """A token whose ``aud`` differs from the evaluated subject is rejected.
+
+        Regression guard for the audience tautology: ``evaluate_trust`` must
+        pass the ``subject_did`` to the diagnostic as the presenting agent so
+        the step-5 audience check evaluates against the DID under assessment.
+        ``presenting_agent_did`` is fail-closed: the bridge REJECTS an absent or
+        empty value rather than defaulting the presenting agent to the token's
+        OWN ``aud`` (which would make ``aud == aud`` always true, reporting
+        ``signatures_valid`` for a token addressed to someone else — trust
+        inflation). Mints a token for Bob, then evaluates trust for Carol
+        against that token and asserts the structured ``signatures_valid`` is
+        False (ADR-057 / §7.2.4).
+        """
+        from scp_sdk.trust import evaluate_trust
+
+        alice = await scp.identity_create(CustodyType.IN_MEMORY)
+        bob = await scp.identity_create(CustodyType.IN_MEMORY)
+        carol = await scp.identity_create(CustodyType.IN_MEMORY)
+        handle = scp._native.context_create(
+            alice.did,
+            {
+                "ceiling": ["messages:read", "messages:write"],
+                "memory_scope": "ephemeral",
+                "governance": "single_admin",
+            },
+        )
+        # Token audience is Bob.
+        token = await scp.ucan_mint(handle.context_id, bob.did, ["messages:read"])
+        assert token.encoded, "minted token must expose its encoded JWT"
+
+        # Evaluate trust for Carol (the relying party named a different subject
+        # than the token's audience): the audience check fails, so the
+        # structural-checks field is False.
+        evaluation = await evaluate_trust(
+            scp=scp,
+            subject_did=carol.did,
+            context_id=handle.context_id,
+            capability_tokens=[token.encoded],
+        )
+
+        cv = evaluation.capability_validation
+        assert cv.signatures_valid is False, (
+            "a token whose aud != the evaluated subject must NOT report "
+            "signatures_valid — the audience check must run against the subject "
+            "DID, not the token's own audience"
+        )
+
+        # Control: evaluating the same token for its true audience (Bob) passes
+        # the audience check — proving the False above is the mismatch, not an
+        # unrelated failure.
+        control = await evaluate_trust(
+            scp=scp,
+            subject_did=bob.did,
+            context_id=handle.context_id,
+            capability_tokens=[token.encoded],
+        )
+        assert control.capability_validation.signatures_valid is True
+
+    async def test_ucan_evaluate_empty_capability_coerced_to_no_challenge(self, scp: SCP):
+        """An empty/whitespace capability is coerced to no-challenge (None).
+
+        Every bridge applies ``capability.filter(|c| !c.trim().is_empty())``
+        before the core diagnostic, so an empty or whitespace-only capability
+        string is treated as "no challenge" — identical to omitting it. A bare
+        ``"*"`` is NOT this (it is a malformed capability URI the bridge
+        rejects); absence is expressed by emptiness/omission only (ADR-057 /
+        §7.2.4). This pins the PyO3 bridge's coercion so the cross-bridge
+        parity test (TS real-napi sibling) and this one cannot diverge.
+        """
+        alice = await scp.identity_create(CustodyType.IN_MEMORY)
+        bob = await scp.identity_create(CustodyType.IN_MEMORY)
+        handle = scp._native.context_create(
+            alice.did,
+            {
+                "ceiling": ["messages:read"],
+                "memory_scope": "ephemeral",
+                "governance": "single_admin",
+            },
+        )
+        token = await scp.ucan_mint(handle.context_id, bob.did, ["messages:read"])
+        assert token.encoded, "minted token must expose its encoded JWT"
+
+        def booleans(raw: object) -> tuple[bool, ...]:
+            return (
+                bool(raw.tokens_valid),  # type: ignore[attr-defined]
+                bool(raw.signatures_valid),  # type: ignore[attr-defined]
+                bool(raw.within_ceiling),  # type: ignore[attr-defined]
+                bool(raw.nonce_valid),  # type: ignore[attr-defined]
+                bool(raw.not_revoked),  # type: ignore[attr-defined]
+                bool(raw.time_bounds_valid),  # type: ignore[attr-defined]
+            )
+
+        # Presenting agent fixed to the token audience so the only variable is
+        # the capability argument's emptiness.
+        omitted = booleans(
+            scp._native.ucan_evaluate(handle.context_id, token.encoded, None, bob.did)
+        )
+        empty = booleans(scp._native.ucan_evaluate(handle.context_id, token.encoded, "", bob.did))
+        whitespace = booleans(
+            scp._native.ucan_evaluate(handle.context_id, token.encoded, "   ", bob.did)
+        )
+
+        # Empty / whitespace capability == omitted capability: same six booleans.
+        assert empty == omitted, (
+            f"empty-string capability must coerce to no-challenge: {empty} != {omitted}"
+        )
+        assert whitespace == omitted, (
+            f"whitespace capability must coerce to no-challenge: {whitespace} != {omitted}"
+        )
+        # A fresh, in-ceiling token is intrinsically valid on every stage.
+        assert omitted == (True, True, True, True, True, True)
+
+    async def test_ucan_evaluate_empty_capability_invalid_token_still_fails(self, scp: SCP):
+        """Empty-capability coercion must NOT bypass a failing stage.
+
+        The intrinsic-validity coercion (``capability=""`` -> no challenge) is a
+        no-CHALLENGE switch, not a no-CHECK switch. A forged-signature token with
+        an empty capability must STILL report ``signatures_valid`` False --
+        coercion to no-challenge cannot be mistaken for a validity shortcut. The
+        sibling parity test only covered a VALID token; this pins the INVALID
+        case (ADR-057 / §7.2.4). TS sibling: the real-napi forged-token coercion
+        test.
+        """
+        alice = await scp.identity_create(CustodyType.IN_MEMORY)
+        bob = await scp.identity_create(CustodyType.IN_MEMORY)
+        handle = scp._native.context_create(
+            alice.did,
+            {
+                "ceiling": ["messages:read"],
+                "memory_scope": "ephemeral",
+                "governance": "single_admin",
+            },
+        )
+        token = await scp.ucan_mint(handle.context_id, bob.did, ["messages:read"])
+        assert token.encoded, "minted token must expose its encoded JWT"
+
+        # Forge the signature segment so signature verification fails.
+        parts = token.encoded.split(".")
+        assert len(parts) == 3
+        forged = f"{parts[0]}.{parts[1]}.{'A' * len(parts[2])}"
+
+        # Empty capability == no challenge — but the failing signature stage
+        # must STILL be reported, never bypassed by the coercion.
+        empty = scp._native.ucan_evaluate(handle.context_id, forged, "", bob.did)
+        assert bool(empty.tokens_valid) is True
+        assert bool(empty.signatures_valid) is False, (
+            "empty-capability coercion must NOT bypass the failing signature "
+            "stage of a forged token"
+        )
+
+        # Equivalent to omitting the capability entirely: same failing record.
+        omitted = scp._native.ucan_evaluate(handle.context_id, forged, None, bob.did)
+        assert bool(omitted.signatures_valid) is False
+        assert bool(empty.signatures_valid) == bool(omitted.signatures_valid)
+        assert bool(empty.tokens_valid) == bool(omitted.tokens_valid)
+
 
 # ---------------------------------------------------------------------------
 # Event Log
@@ -720,6 +959,152 @@ class TestTrust:
             assert result is not None
         except Exception:
             pass  # Expected without attestation infrastructure
+
+    async def test_participation_record_reflects_governance_real_ffi(self, scp: SCP):
+        """The typed participation record (§7.3.2) RECEIVES real leaf-derived facts.
+
+        A ``single_admin`` context whose ceiling carries the governance +
+        child-creation capabilities auto-executes each proposal on
+        ``governance_propose`` (ADR-031), appending convergent
+        ``GovernanceActionExecuted`` / ``RoleAssigned`` / ``ChildContextCreated``
+        leaves to the supervisor's Merkle log. The typed ``participation_record``
+        then RECEIVES non-zero counts attributed by the subject-bearing payloads
+        (ADR-011 amendment): the actor for ``governance_actions_by`` /
+        ``context_creation_count``, the projected member for
+        ``role_progression_count`` / ``governance_actions_against``. This proves
+        the SDK consumes the Rust-computed record instead of recomputing Layer 2,
+        and is the Python sibling of the TS ``real-napi`` governance test — both
+        assert the identical field values (the cross-SDK divergence-killer).
+        """
+        from scp_sdk.trust import participation_record
+
+        admin = await scp.identity_create(CustodyType.IN_MEMORY)
+        member = await scp.identity_create(CustodyType.IN_MEMORY)
+        # The ceiling MUST carry the governance + child-creation capabilities, or
+        # the proposer (creator) lacks governance:propose / the child-creation
+        # capability and the proposal is permission-denied.
+        handle = scp._native.context_create(
+            admin.did,
+            {
+                "ceiling": [
+                    "messages:read",
+                    "messages:write",
+                    "role:assign",
+                    "governance:propose",
+                    "governance:vote",
+                    "context:close",
+                    "context:child:create",
+                ],
+                "memory_scope": "ephemeral",
+                "governance": "single_admin",
+            },
+        )
+        context_id = handle.context_id
+        scp._native.context_join(handle, member.did)
+
+        # 1. ChangeRole(member -> moderator): a RoleAssigned leaf projected to the
+        #    member + a GovernanceActionExecuted leaf actored by the admin.
+        scp._native.governance_propose(
+            handle,
+            admin.did,
+            json.dumps({"ChangeRole": {"did": member.did, "new_role": "moderator"}}),
+        )
+        # 2. RemoveMember(member): an adverse action -> governance_actions_against
+        #    the member + another GovernanceActionExecuted by the admin.
+        scp._native.governance_propose(
+            handle,
+            admin.did,
+            json.dumps({"RemoveMember": {"did": member.did, "reason": "participation-test"}}),
+        )
+        # 3. CreateChildContext: a ChildContextCreated leaf actored by the admin ->
+        #    the admin's context_creation_count increments by one.
+        child_params = {
+            "mode": "Encrypted",
+            "ceiling": [],
+            "ceiling_policy": "Immutable",
+            "promotion_policy": "NoPromotion",
+            "roles": [],
+            "tools": [],
+            "ttl": None,
+            "memory_scope": "Ephemeral",
+            "governance": "SingleAdmin",
+            "template_id": None,
+        }
+        scp._native.governance_propose(
+            handle,
+            admin.did,
+            json.dumps({"CreateChildContext": {"params": child_params}}),
+        )
+
+        admin_record = participation_record(scp, context_id, admin.did)
+        member_record = participation_record(scp, context_id, member.did)
+
+        # Admin INITIATED all three governance actions and created one child.
+        assert admin_record.governance_actions_by == 3
+        assert admin_record.governance_actions_against == 0
+        assert admin_record.context_creation_count == 1
+        assert admin_record.role_progression_count == 0
+        # Member was the TARGET of one role change and one (adverse) removal.
+        assert member_record.role_progression_count == 1
+        assert member_record.governance_actions_against == 1
+        assert member_record.governance_actions_by == 0
+        assert member_record.context_creation_count == 0
+        # Credential-layer / anchoring invariants hold for both subjects.
+        assert admin_record.attestation_count == 0
+        assert member_record.attestation_count == 0
+        assert admin_record.tool_invocation_count_anchored is False
+        assert member_record.tool_invocation_count_anchored is False
+        # attestation_count is credential-layer (§7.4), never Merkle-anchored.
+        assert admin_record.attestation_count_anchored is False
+        assert member_record.attestation_count_anchored is False
+        # Real Merkle root over the convergent governance leaves (64 hex chars).
+        assert len(admin_record.event_log_root) == 64
+        assert admin_record.event_log_root != "0" * 64
+
+        # evaluate_trust RECEIVES the SAME record the direct op returns — no
+        # client-side recomputation, no divergence.
+        from scp_sdk.trust import evaluate_trust
+
+        evaluation = await evaluate_trust(scp=scp, subject_did=admin.did, context_id=context_id)
+        assert evaluation.behavioral_record == admin_record
+
+    async def test_evaluate_trust_no_attestations_zero_count_real_ffi(self, scp: SCP):
+        """``evaluate_trust`` passes no cached attestations -> attestation_count 0.
+
+        ``attestation_count`` is a credential-layer fact (§7.4), verifier-
+        relative. ``evaluate_trust`` has no attestation set in its inputs, so it
+        honestly passes an empty set — the SDK never fabricates attestations.
+        """
+        from scp_sdk.trust import evaluate_trust
+
+        admin = await scp.identity_create(CustodyType.IN_MEMORY)
+        member = await scp.identity_create(CustodyType.IN_MEMORY)
+        handle = scp._native.context_create(
+            admin.did,
+            {
+                "ceiling": [
+                    "messages:read",
+                    "role:assign",
+                    "governance:propose",
+                    "governance:vote",
+                ],
+                "memory_scope": "ephemeral",
+                "governance": "single_admin",
+            },
+        )
+        scp._native.context_join(handle, member.did)
+        scp._native.governance_propose(
+            handle,
+            admin.did,
+            json.dumps({"ChangeRole": {"did": member.did, "new_role": "moderator"}}),
+        )
+
+        evaluation = await evaluate_trust(
+            scp=scp, subject_did=member.did, context_id=handle.context_id
+        )
+        assert evaluation.behavioral_record is not None
+        assert evaluation.behavioral_record.attestation_count == 0
+        assert evaluation.behavioral_record.role_progression_count == 1
 
 
 # ---------------------------------------------------------------------------

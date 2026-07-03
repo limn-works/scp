@@ -1027,8 +1027,10 @@ interface UcanBindings {
      * @param token The UCAN token string (JWT-encoded).
      * @param capability The capability URI to validate against (e.g.,
      *   `"scp:ctx:abc123/messages:write"`).
-     * @param presentingAgentDid Optional DID of the presenting agent
-     *   for delegation chain verification.
+     * @param presentingAgentDid DID of the presenting agent for delegation
+     *   chain verification. REQUIRED: the bridge fails closed on an absent
+     *   presenter rather than defaulting to the token's own `aud` (which would
+     *   make the audience check the tautology `aud == aud` and inflate trust).
      * @param proofTokens Optional list of encoded parent UCAN tokens
      *   for delegation chain traversal (ADR-016 step 3).
      * @throws BridgeException with `SCP-PERM-3002` if validation fails
@@ -1039,7 +1041,7 @@ interface UcanBindings {
         contextHandle: Long,
         token: String,
         capability: String,
-        presentingAgentDid: String?,
+        presentingAgentDid: String,
         proofTokens: List<String>?,
     )
 
@@ -2016,7 +2018,10 @@ class UcanBridge internal constructor(
      * @param contextHandle Handle from context create or join.
      * @param token The UCAN token string.
      * @param capability The capability to validate.
-     * @param presentingAgentDid Optional DID of the presenting agent.
+     * @param presentingAgentDid DID of the presenting agent. REQUIRED: the
+     *   bridge fails closed on an absent presenter rather than defaulting to
+     *   the token's own `aud` (which would make the audience check the tautology
+     *   `aud == aud` and inflate trust).
      * @param proofTokens Optional parent UCAN tokens for delegation chain.
      * @throws BridgeException if validation fails.
      */
@@ -2024,7 +2029,7 @@ class UcanBridge internal constructor(
         contextHandle: Long,
         token: String,
         capability: String,
-        presentingAgentDid: String? = null,
+        presentingAgentDid: String,
         proofTokens: List<String>? = null,
     ): Unit =
         bridge.ffiCall {

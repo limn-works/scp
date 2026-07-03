@@ -149,6 +149,17 @@ const PYO3_UCAN_SRC: &str = include_str!("../../../../crates/scp-ffi/src/ucan.rs
 // lives in the `ucan_evaluate` bridge method.
 const NAPI_UCAN_SRC: &str = include_str!("../../../../crates/scp-ffi/napi/src/ucan.rs");
 
+// Trust-engine bridge sources for the typed `participation_record` op (§7.3.2).
+// Each native bridge owns its own participation entry point and MUST route to
+// the shared `Supervisor::participation_record` (which itself calls core
+// `compute_participation_record`) rather than re-deriving facts locally — that
+// is the whole point of the typed op: SDKs RECEIVE the facts, never recompute
+// them. PyO3's body lives in `participation_record_impl`, NAPI's in
+// `participation_record_on`, UniFFI's in the `participation_record` bridge
+// method.
+const PYO3_TRUST_SRC: &str = include_str!("../../../../crates/scp-ffi/src/trust.rs");
+const NAPI_TRUST_SRC: &str = include_str!("../../../../crates/scp-ffi/napi/src/trust.rs");
+
 // =========================================================================
 // RATCHET CONSTANTS — may only increase
 // Any decrease requires human approval
@@ -170,7 +181,11 @@ const NAPI_UCAN_SRC: &str = include_str!("../../../../crates/scp-ffi/napi/src/uc
 // caller-principal binding, the ADR-056 `context_id_to_bytes` keying chokepoint,
 // AND the `start_cross_context_tool_invocation_saga` producer. Pure coverage
 // expansion locking the new export wiring into the ratchet floor.
-const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 44;
+// Raised 44 -> 48 when the typed `participation_record` op (§7.3.2) added four
+// routing assertions: `Supervisor::participation_record` → core
+// `compute_participation_record`, plus PyO3/NAPI/UniFFI bridge ops → the shared
+// `Supervisor::participation_record` (Phase 2C-1).
+const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 48;
 
 // ---------------------------------------------------------------------------
 // Function body extraction — brace-matching parser
@@ -2285,6 +2300,77 @@ fn uniffi_ucan_evaluate_routes_to_core_evaluate_ucan() {
         fn_body_contains(UNIFFI_BRIDGE_SRC, "ucan_evaluate", "evaluate_ucan("),
         "UniFFI ucan_evaluate must call the shared core evaluate_ucan pipeline, \
          not re-implement capability evaluation locally"
+    );
+}
+
+/// The shared `Supervisor::participation_record` method MUST derive the record
+/// via the pure-core `compute_participation_record` over the FULL event log —
+/// not re-implement participation accounting in the runtime. This is the
+/// single source the three bridges route through; if it forked, every binding's
+/// participation facts would silently diverge from the protocol definition.
+#[test]
+fn supervisor_participation_record_routes_to_core_compute() {
+    assert!(
+        fn_body_contains(
+            SUPERVISOR_SRC,
+            "participation_record",
+            "compute_participation_record("
+        ),
+        "Supervisor::participation_record must call core compute_participation_record \
+         over the full event log, not re-derive participation facts locally"
+    );
+}
+
+/// The PyO3 `participation_record` bridge op must route to the shared
+/// `Supervisor::participation_record`, so Python RECEIVES the flattened facts
+/// rather than recomputing them from event-log collections.
+#[test]
+fn pyo3_participation_record_routes_to_supervisor() {
+    assert!(
+        fn_body_contains(
+            PYO3_TRUST_SRC,
+            "participation_record_impl",
+            ".participation_record("
+        ),
+        "PyO3 participation_record_impl must call Supervisor::participation_record, \
+         not re-aggregate participation facts in the bridge"
+    );
+}
+
+/// The NAPI `participation_record` bridge op (body in `participation_record_on`)
+/// must route to the shared `Supervisor::participation_record`.
+#[test]
+fn napi_participation_record_routes_to_supervisor() {
+    assert!(
+        fn_body_contains(
+            NAPI_TRUST_SRC,
+            "participation_record_on",
+            ".participation_record("
+        ),
+        "NAPI participation_record_on must call Supervisor::participation_record, \
+         not re-aggregate participation facts in the bridge"
+    );
+}
+
+/// The UniFFI `participation_record` bridge method must route to the shared
+/// `Supervisor::participation_record`.
+///
+/// The UniFFI bridge method shares its leaf name (`participation_record`) with
+/// the supervisor method it calls, so a single `.participation_record(`
+/// substring check would be self-satisfying. Pin BOTH the `supervisor` binding
+/// (proving the call targets the runtime, not a bridge-local re-aggregation)
+/// AND the `.participation_record(` call, so a bare self-mention cannot pass.
+#[test]
+fn uniffi_participation_record_routes_to_supervisor() {
+    assert!(
+        fn_body_contains(UNIFFI_BRIDGE_SRC, "participation_record", "supervisor")
+            && fn_body_contains(
+                UNIFFI_BRIDGE_SRC,
+                "participation_record",
+                ".participation_record("
+            ),
+        "UniFFI participation_record must call Supervisor::participation_record, \
+         not re-aggregate participation facts in the bridge"
     );
 }
 

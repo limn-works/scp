@@ -888,6 +888,28 @@ pub enum EventType {
    events; per-member-observed emissions are kept out of it (see the convergence
    model and exclusion taxonomy below).
 
+   **Subject-bearing leaf payloads (participation-fact attribution).** The
+   participation facts derived from convergent events (§7.3.2) attribute role
+   progression and participation duration to the *affected member*, not to the
+   governance actor who executed the change. The affected member is therefore
+   carried in the leaf `EventPayload`, not inferred from `actor_did` (which, for
+   admin-driven joins/removals/assignments, is the admin):
+
+   - `RoleAssigned` carries `RoleAssignedPayload { subject_did: DID, role: RoleName }`.
+   - `MemberJoined` / `MemberLeft` carry a membership-change payload
+     `{ subject_did: DID, role_name: RoleName }`.
+
+   These three leaves were previously empty-payload leaves. Adding the payload
+   changes their leaf preimage (`SHA-256(0x00 ‖ rmp_serde(Event))`) and therefore
+   their leaf hash and the resulting Merkle root. This is a **one-way pre-release
+   protocol bump** — SCP has no deployed data, so there is no migration: the
+   correct end state (subject-bearing payloads) is the only state. The
+   `project_payload` projection (in `scp-event-log`) is extended to surface
+   `subject_did` from these payloads; any historical empty-payload leaf projects
+   `subject_did = None`. No `EventType` variant is added or removed by this change —
+   the variant count is unchanged; only the payload contents of three existing
+   variants gain a subject DID.
+
    > **Amendment (native↔WASM event-log unification).** `EventType` is the single
    > canonical event taxonomy across all implementations. The `scp-runtime`
    > provider MUST construct `scp_event_log::Event` values with a typed
@@ -904,9 +926,12 @@ pub enum EventType {
    > DAG-ordered application leaves, per ADR-051 §5). The log therefore
    > MUST contain **only convergent events** — those every honest member appends
    > identically and in the same order, i.e. the MLS-commit-ordered stream
-   > (governance, membership, lifecycle, role, access, attestation, provenance,
+   > (governance, membership, lifecycle, role, access, provenance,
    > economic *governance actions* — policy changes, spending-UCAN grants/revocations,
-   > compromise recovery, app-binding). Per-member-observed
+   > compromise recovery, app-binding). Attestations are NOT in this stream — they
+   > are credential-layer artifacts (§7.4), not context-log leaves, and there is no
+   > `AttestationPublished`/`AttestationRevoked` `EventType` variant.
+   > Per-member-observed
    > emissions do not converge and are excluded. The governing rule for the whole
    > trust subsystem: **a derived record is automatic *and* convergent iff its
    > trigger input is convergent.**
@@ -1930,4 +1955,71 @@ The relay's `/scp/v1` route is served on the node's existing TLS-terminated **Fu
 - **ADR-049 (actor-per-context / `Supervisor`):** the one participant engine. The co-located and external clients are both `Supervisor` instances.
 - **ADR-042 (Broadcast Content Delivery):** the publish path the BUNDLED participant drives.
 - **ADR-052 (Unified Construction Pattern):** the participant and node are both constructed via flat config; a node config never carries "participate as self" — participation is always a separate `Supervisor` construction.
+
+## ADR-057: Structured Capability/Trust Validation Across the FFI; SDKs Consume Typed Results, Not Prose
+
+> **Note:** ADR-057 is numbered sequentially after ADR-056 but, like ADR-032/035/042/052/053, lives in the Phase 2 document by *subject*, not by number: it governs the capability/trust-validation surface (§7.2, Phase 2 — Context + Transport) as it crosses the FFI bridges into the language SDKs. Its scope is cross-cutting — it constrains every bridge that returns a validation outcome and every SDK that consumes one.
+
+**Status:** Decided
+
+### Context
+
+UCAN capability validation has two distinct consumers with two distinct needs (§7.2.1):
+
+- An **enforcement gate** that must fail closed at a token-presentation boundary (cross-context tool invocation, broadcast admission, role assignment). This is `validate_ucan` (`crates/scp-protocol/src/crypto/ucan/validate.rs`): the 11-step Tier-1 pipeline that returns `Ok(())` or a specific `UcanError`, and — critically — **records the nonce** (step 9, `NonceTracker::check_and_record`) as a side effect, consuming it for replay defense.
+- A **diagnostic** that must report *which* checks passed without enforcing anything and without mutating state — for a trust signal an SDK surfaces to a caller deciding whether to proceed. This is `evaluate_ucan` (same file): it runs the identical sub-checks but returns a structured `CapabilityValidation` record of six per-stage booleans (`tokens_valid`, `signatures_valid`, `within_ceiling`, `nonce_valid`, `not_revoked`, `time_bounds_valid`), never throws, and probes the nonce **read-only** (`NonceTracker::check_replay`, never `record`), so it is safe to call repeatedly on the same token without burning its nonce.
+
+The Rust core plus all three FFI bridges already expose `evaluate_ucan` as the structured op `ucan_evaluate` returning `CapabilityValidation` (PyO3 `crates/scp-ffi/src/ucan.rs`; NAPI `crates/scp-ffi/napi/src/ucan.rs` + `scp.rs`; UniFFI `CapabilityValidationRecord`; the WASM bridge was removed per ADR-055 (`.docs/adrs/phase-4.md`)). The structured substrate exists at every layer below the SDK wrapper. At the time this ADR was written, the capability matrix (`.docs/standards/sdk-capability-matrix.json`, `UCAN.evaluate`) recorded this as bridge-present, SDK-wrapper-pending, with exemptions explicitly naming "the C3c SDK-parity follow-up."
+
+What is **wrong** today is how the SDKs consume validation outcomes. A first-principles audit of the trust/capability SDK surface found the Python SDK reverse-engineering the per-check breakdown by **string-matching the human-readable error prose** the throwing gate emits — parsing strings like `[SCP-PERM-3001] permission error: …` in `trust.py` to reconstruct *which* of the six checks failed. This is an antipattern on two independent grounds:
+
+1. **It is brittle by construction.** It couples the SDK to the exact wording of error messages — a denylist of prose spellings that grows every time the core rephrases a message, and silently mis-classifies the moment the wording drifts. The structured truth (`CapabilityValidation`) was discarded and then guessed back from a lossy projection (a flattened error string).
+2. **It masked a real security defect.** Because the test mocks emitted prose without modeling nonce *state*, a multi-attestation nonce bug went undetected: the prose-reconstruction reported `nonce_valid` from a string that the mock produced unconditionally, so the suite never exercised the path where the nonce check actually consumes/observes state across multiple attestations. A typed result whose mocks must model nonce state would have surfaced it.
+
+The structured op was built precisely to retire this antipattern. This ADR records the decision the C3c SDK rebuild rests on.
+
+### Decision
+
+1. **Capability/trust validation results cross the FFI as typed, structured records — never as prose to be parsed back.** The canonical structured result is `CapabilityValidation`: the six explicit per-stage booleans defined in `validate.rs`. The record has an **identical shape across every binding** (per the Agent-first API design tenet): snake_case fields in Rust and PyO3, camelCase under the NAPI serde projection, and a UniFFI `Record` (`CapabilityValidationRecord`) for Swift/Kotlin. The field *set* and *meaning* are identical everywhere; only the per-language casing differs.
+
+2. **The throwing gate and the diagnostic are two distinct operations and stay distinct.** `ucan_validate` is the enforcement GATE: fail-closed, side-effecting (records the nonce), the only thing permitted at a token-presentation boundary. `ucan_evaluate` is the read-only DIAGNOSTIC: returns the structured `CapabilityValidation` without throwing and **without recording nonce state** (read-only `check_replay`). The diagnostic is a point-in-time snapshot, not a pre-flight guarantee that a subsequent `ucan_validate` will accept the token (the nonce may be recorded, or the token revoked, between the two calls). Neither operation is reconstructable from the other's output: a caller wanting the per-check breakdown calls `ucan_evaluate`; a caller enforcing at a boundary calls `ucan_validate`.
+
+   2a. **The diagnostic's challenge capability is OPTIONAL; the gate's is MANDATORY.** `ucan_validate` always requires a concrete `required_capability` — enforcement at a presentation boundary is always *for* a specific invoked capability. `ucan_evaluate` makes the challenge capability optional: with **no challenge** it evaluates the token's INTRINSIC validity (signature/chain/issuer/audience/key-scope/Category-A/attenuation, all-attestation ceiling over the token's own `att`, nonce, revocation, time bounds) and SKIPS the invoked-capability grant-match entirely; with a challenge supplied it additionally requires the token grants that capability. Omitting the challenge never flips any `CapabilityValidation` field to `true` that another check would set `false` — every other stage still runs and `within_ceiling` still enforces the all-attestation ceiling — so the diagnostic stays fail-closed in both modes. The intrinsic mode is the one a trust signal uses: a participant's tokens are assessed for general validity when there is no specific capability to challenge. (Passing a bare `*` "match anything" sentinel is NOT this — the gate rejects it as a malformed capability URI; the absence of a challenge is expressed by *omitting* the capability, not by a wildcard string.)
+
+3. **SDKs MUST consume the structured result and MUST NOT parse prose error strings to infer validation outcomes.** Reconstructing *which check failed* by matching error message text is forbidden. The per-check breakdown comes from `CapabilityValidation`; nothing else.
+
+4. **SDK error *typing* derives from the bridge error-code taxonomy, surfaced through a single mapping chokepoint — not per-call string classification.** Where an SDK must classify a thrown error (e.g. mapping a gate rejection to a typed SDK exception), it maps on the structured `[SCP-CAT-NNNN]` error *code* the bridge attaches (where `CAT` is a placeholder for the relevant allocated category prefix — `IDENT`/`CTX`/`PERM`/`CRYPTO`/… per `scripts/check-error-codes.sh` — not a literal `CAT` prefix), at **one** mapping site, not with a try/catch ladder of `if message.contains(...)` at each call site. One chokepoint (e.g. a Proxy/wrapper that maps code → typed error) keeps the mapping closed and auditable; scattered string classification is the same brittle denylist this ADR is retiring, in a second location.
+
+5. **Every binding exposes an idiomatic wrapper; only the idiom differs.** All four SDKs (Python, TypeScript, Swift, Kotlin) MUST expose the structured result through a public wrapper — the wrapper's *existence* is non-optional in every binding, per the Agent-first API design tenet's identical-shape requirement. What this decision does NOT dictate is that the wrapper be identically-*named* or identically-*shaped* across languages: each SDK exposes the structured result through its own idiomatic surface (language-native types, naming, async style), and one binding's wrapper shape is not propagated onto another (per the per-SDK-idiom lesson, `.docs/lessons/per-sdk-idiom-not-cross-language-dogma.md`). The per-SDK-idiom lesson governs HOW each binding exposes the op, never WHETHER it does — omitting the wrapper in any binding violates the identical-shape tenet and the project's completeness baseline.
+
+### Rationale
+
+- **Eliminates phantom provenance at the SDK boundary.** Prose-parsing makes the SDK's notion of "which check failed" a *guess* about the core's behavior, decoupled from the core's actual result. Consuming the typed record makes the SDK's view exactly the core's view — the structured truth flows down unaltered (artifact-flow / CLAUDE.md "code does not inform specs").
+- **Closed, not open.** A typed six-field record is closed by construction: a new failure mode either maps to an existing stage boundary or forces an explicit, reviewed change to the record. A prose denylist is open-ended — it chases "one more spelling" forever (CLAUDE.md "Guard against … non-convergent enforcement").
+- **Gate vs. diagnostic separation is a security property, not ergonomics.** Folding structure into the throwing gate would either make the gate non-throwing (defeating fail-closed enforcement) or make the diagnostic side-effecting (consuming the nonce on every trust-signal probe — a nonce-burn DoS and a correctness hazard). Keeping them separate keeps each sound.
+- **Mocks that must model nonce state catch nonce bugs.** Consuming the typed result forces test doubles to populate real per-stage outcomes — including nonce state — rather than emitting unconditional prose. The masked multi-attestation nonce bug is exactly the class this surfaces.
+
+### Consequences
+
+- **The C3c SDK rebuild** (downstream code work, governed by this ADR and §7.2.4): delete the Python prose-parser in `trust.py`; add the TypeScript public wrapper(s) over `ucanEvaluate`/the trust-signal consumer; route SDK error typing through a single mapping chokepoint keyed on `[SCP-CAT-NNNN]` codes; and rebuild the test mocks to model nonce state rather than emit prose.
+- **All four bindings expose idiomatic wrappers.** Per the Agent-first API design tenet's identical-shape requirement, the structured op is surfaced in every SDK — Python (`ucan_evaluate`/`evaluate_trust`), TypeScript (`ucanEvaluate`/`evaluateTrust`), Kotlin (`SCP.ucanEvaluate`/`evaluateTrust`, types in `Trust.kt`), and Swift (`SCP.ucanEvaluate`/`evaluateTrust`, `Trust.swift`). The structured record SHAPE is identical across bindings (Decision 1); per Decision 5 only the per-SDK *wrapper* idiom (naming, language-native types) differs — the wrapper's existence is NOT optional in any binding.
+- **Capability-matrix cells flip true** as each SDK's idiomatic wrapper lands: the `UCAN.evaluate` row's per-SDK `false` entries are cleared SDK-by-SDK. The Python and TypeScript wrappers landed in the C3c rebuild; the Kotlin and Swift idiomatic wrappers land alongside them (the UniFFI bridge already exports `CapabilityValidationRecord` and `ParticipationRecordView`; the idiomatic SDK sugar is written on top), so every `UCAN.evaluate` cell is `true` with no exemption.
+- **One narrow core change: the diagnostic's challenge capability becomes optional (Decision 2a).** `validate_ucan`/`evaluate_ucan`/`CapabilityValidation` and the three bridge exports already exist; this ADR records the consumption contract and does NOT add a new protocol operation. The only signature change is `evaluate_ucan`'s `required_capability` going from mandatory to optional (`Option`), with the corresponding bridge `ucan_evaluate` capability argument becoming optional. The enforcing gate `ucan_validate` is UNCHANGED — its `required_capability` stays mandatory. This was driven by the C3c trust-signal consumer, which has no specific capability to challenge and previously passed a `*` sentinel the real bridge rejected (see Decision 2a and §7.2.4).
+- **Freshness enforcement fails closed on a broken host clock, and that relies on unwind semantics.** The three `verify_participation_requirements` bridge exports read the current time via `scp_primitives::SystemClock`, which panics — rather than silently reading time `0` — on a pre-epoch/unavailable clock (a `0` would make every participation statement read as maximally fresh and bypass `max_age_secs`). The panic is *caught at the FFI boundary* (PyO3 `PanicException`, napi-rs thrown `Error`, UniFFI internal error), so it surfaces as a language exception rather than a process abort — which holds ONLY under `panic = "unwind"`. The FFI cdylib crates MUST NOT be built with `panic = "abort"`, or a pre-epoch clock would escalate from "this one trust check throws" to "the host process aborts."
+
+### Rejected Alternatives
+
+1. **Keep parsing prose error strings (the status quo, rejected).** Reconstruct the per-check breakdown by string-matching `[SCP-PERM-3001] …`-style messages. **Rejected:** this is the audit's root cause. It is brittle (a prose denylist that breaks on rewording), lossy (a structured truth flattened to a string and guessed back), and it actively masked a nonce bug because the mocks emitted prose without modeling state. A structured record already exists at every layer; discarding it to re-parse a string is negative value.
+2. **Overload the throwing `ucan_validate` to also return structure (rejected).** Make the single gate return both an outcome and the per-stage breakdown. **Rejected:** it conflates the enforcement gate with the diagnostic. To return structure on the failure path the gate would have to stop throwing (losing fail-closed enforcement at presentation boundaries), and to produce the breakdown it would have to run all stages — including recording the nonce — turning every diagnostic probe into a nonce-consuming side effect (nonce-burn DoS). The gate must stay fail-closed and side-effecting; the diagnostic must stay non-throwing and read-only. Two operations, two contracts.
+3. **Per-call try/catch classification in the SDK (rejected).** Instead of one chokepoint, classify each thrown error at each call site with a local `catch` that inspects the error. **Rejected:** it scatters the (already-rejected) string/denylist logic across every call site and re-creates the unbounded-denylist problem in N places. A single mapping chokepoint keyed on the structured `[SCP-CAT-NNNN]` code is closed and auditable; per-call classification is neither.
+
+### Dependencies
+
+- **Spec §7.2 (Layer 1: Protocol Enforcement), §7.2.1 (Tier 1 full UCAN validation), and §7.2.4 (Structured capability evaluation):** the normative prose this ADR enacts. §7.2.4 defines the structured-evaluation result and the gate-vs-diagnostic distinction at protocol level.
+- **ADR-016 (11-step UCAN validation pipeline, `.docs/adrs/phase-3.md`):** the gate `ucan_validate` enacts; `evaluate_ucan` mirrors its stage boundaries exactly.
+- **ADR-009 (Role Assignment and Capability Ceiling Enforcement):** the `NonceTracker` foundation — its acceptance criteria define the `NonceTracker` struct and the `check_and_record` (gate) / `check_replay` (diagnostic) operations whose differing nonce side effect distinguishes the gate (records) from the diagnostic (read-only probe). ADR-016 (cited above) is the normative nonce-validation pipeline (format, freshness, replay window).
+- **ADR-039 (shared-DID key scope, Category-A enforcement):** sub-checks inside the `signatures_valid` stage of `CapabilityValidation`.
+- **Agent-first API design tenet (CLAUDE.md) + per-SDK idiom lesson (`.docs/lessons/per-sdk-idiom-not-cross-language-dogma.md`):** identical record *shape* across bindings, but per-SDK idiomatic wrappers — not a single shape forced onto every language.
+- **Lesson `.docs/lessons/sdk-consume-structured-ffi-results-not-error-prose.md`:** why prose-parsing of FFI error strings is a recurring failure mode (it masked the multi-attestation nonce defect), and the structural prevention this ADR rests on — SDKs consume the typed `CapabilityValidation`/structured result, never reconstruct per-check outcomes from message text.
+- **Bridge error-code taxonomy (`[SCP-CAT-NNNN]` codes, `scripts/check-error-codes.sh`):** the source of SDK error typing, surfaced via one mapping chokepoint.
 

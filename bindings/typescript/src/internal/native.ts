@@ -27,6 +27,7 @@ import { TransportError } from "../errors";
 import { __getNativeScp, type SCP } from "../scp";
 import type {
   BroadcastAdmissionPolicy,
+  CapabilityValidation,
   Checkpoint,
   DIDDocument,
   Event,
@@ -48,6 +49,7 @@ import type {
   BridgeTransportHandle,
   MessageCallback,
 } from "./bridge";
+import { toCapabilityValidation, wrapBridgeErrors } from "./bridge";
 import { safeJsonParse } from "./json-utils";
 
 // ---------------------------------------------------------------------------
@@ -190,7 +192,7 @@ export function createNativeBridge(scp: SCP): Bridge {
   // the wrong handle.
   const native = __getNativeScp(scp) as unknown as Record<string, (...args: never[]) => unknown>;
 
-  return {
+  const bridge: Bridge = {
     // Identity
     async identityCreate(custody: string): Promise<BridgeIdentityHandle> {
       const handle = await (native.identityCreate as (c: string) => Promise<BridgeIdentityHandle>)(
@@ -1020,10 +1022,47 @@ export function createNativeBridge(scp: SCP): Bridge {
       handle: BridgeContextHandle,
       token: string,
       capability: string,
+      presentingAgentDid?: string,
+      proofTokens?: readonly string[],
     ): Promise<void> {
+      // FAIL CLOSED on the enforcing gate: `presentingAgentDid` is required by
+      // the bridge (it will not default to the token's own `aud`). Forward it
+      // (and the optional proof chain) so a facade caller can satisfy the gate;
+      // omitted optionals normalize to `null` for the napi-rs `Option<…>` shape.
       await (
-        native.ucanValidate as (h: BridgeContextHandle, t: string, c: string) => Promise<void>
-      )(handle, token, capability);
+        native.ucanValidate as (
+          h: BridgeContextHandle,
+          t: string,
+          c: string,
+          pa: string | null,
+          pt: readonly string[] | null,
+        ) => Promise<void>
+      )(handle, token, capability, presentingAgentDid ?? null, proofTokens ?? null);
+    },
+
+    async ucanEvaluate(
+      handle: BridgeContextHandle,
+      token: string,
+      capability?: string | null,
+      presentingAgentDid?: string,
+      proofTokens?: readonly string[],
+    ): Promise<CapabilityValidation> {
+      // NAPI `ucanEvaluate` (scp.rs) returns a NapiCapabilityValidation
+      // #[napi(object)] whose fields are already camelCased — no remap. The
+      // optional params map to `null` for the napi-rs `Option<…>` signature;
+      // a `null` capability runs the intrinsic-validity diagnostic (no
+      // invoked-capability grant-match challenge).
+      const raw = await (
+        native.ucanEvaluate as (
+          h: BridgeContextHandle,
+          t: string,
+          c: string | null,
+          pa: string | null,
+          pt: readonly string[] | null,
+        ) => Promise<CapabilityValidation>
+      )(handle, token, capability ?? null, presentingAgentDid ?? null, proofTokens ?? null);
+      // Shared six-field projection — pins the canonical shape in one place.
+      return toCapabilityValidation(raw);
     },
 
     async ucanMint(
@@ -1998,10 +2037,15 @@ export function createNativeBridge(scp: SCP): Bridge {
     },
 
     // Trust — participation verification (SCP-BA-004, §7.3.2.1)
-    verifyParticipationRequirements(profileJson: string, requirementsJson: string): boolean {
-      return (native.verifyParticipationRequirements as (p: string, r: string) => boolean)(
-        profileJson,
+    verifyParticipationRequirements(
+      expectedSubject: string,
+      requirementsJson: string,
+      profileJson: string,
+    ): void {
+      (native.verifyParticipationRequirements as (s: string, r: string, p: string) => void)(
+        expectedSubject,
         requirementsJson,
+        profileJson,
       );
     },
 
@@ -2039,4 +2083,7 @@ export function createNativeBridge(scp: SCP): Bridge {
       return (native.resume as () => Promise<void>)();
     },
   };
+  // Single error chokepoint: convert raw FFI errors thrown by any bridge
+  // method into typed ScpError subclasses at exactly one site (ADR-057).
+  return wrapBridgeErrors(bridge);
 }
