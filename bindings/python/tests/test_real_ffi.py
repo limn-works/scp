@@ -601,12 +601,13 @@ class TestUcan:
             pass  # May fail depending on implementation state
 
     async def test_ucan_validate_fails_closed_without_presenting_agent(self, scp: SCP):
-        """The ENFORCING ucan_validate gate rejects an absent presenting agent.
+        """The ENFORCING ucan_validate gate requires a presenting agent.
 
-        Symmetric with the diagnostic ucan_evaluate gate: defaulting the
-        presenting agent to the token's own ``aud`` would make the step-5
-        audience check a tautology and inflate trust. The fail-closed check fires
-        before token parse, so any well-formed token string reaches it.
+        ``presenting_agent_did`` is a REQUIRED (non-optional) parameter: it is
+        never defaulted to the token's own ``aud`` (which would make the step-5
+        audience check a tautology and inflate trust). Omitting it is a
+        ``TypeError`` at the PyO3 boundary; an empty/whitespace value is trimmed
+        and rejected by ``validate_did`` as an invalid DID before token parse.
         """
         alice = await scp.identity_create(CustodyType.IN_MEMORY)
         handle = scp._native.context_create(
@@ -617,11 +618,13 @@ class TestUcan:
                 "governance": "single_admin",
             },
         )
-        # Omitted presenting agent → rejected.
-        with pytest.raises(Exception, match="presenting_agent_did is required"):
+        # Omitted presenting agent → the parameter is required, so PyO3 raises
+        # TypeError for the missing positional argument (no silent aud default).
+        with pytest.raises(TypeError):
             scp._native.ucan_validate(handle.context_id, "header.payload.sig", "messages:read")
-        # Empty / whitespace presenting agent → also rejected.
-        with pytest.raises(Exception, match="presenting_agent_did is required"):
+        # Empty / whitespace presenting agent → trimmed, then rejected as an
+        # invalid DID (empty after trim).
+        with pytest.raises(Exception, match="DID"):
             scp._native.ucan_validate(
                 handle.context_id, "header.payload.sig", "messages:read", "   "
             )

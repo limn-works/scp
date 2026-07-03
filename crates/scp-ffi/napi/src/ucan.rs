@@ -251,32 +251,19 @@ pub(crate) async fn ucan_validate_on(
     handle: &NapiContextHandle,
     token: String,
     capability: String,
-    presenting_agent_did: Option<String>,
+    presenting_agent_did: String,
     proof_tokens: Option<Vec<String>>,
 ) -> napi::Result<()> {
     crate::napi_check_handle!(&bi.core, handle);
     validate_ucan_token(&token).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     validate_capability_uri(&capability).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
 
-    // FAIL CLOSED (no silent security default): require an explicit presenting
-    // agent DID instead of defaulting to the token's own `aud` (which would make
-    // the step-5 audience check tautological and inflate trust). Validated as a
-    // pure input before any state lookup / token parse — mirrors
-    // `ucan_evaluate_on`.
-    let agent_did = presenting_agent_did
-        .as_deref()
-        .map(str::trim)
-        .filter(|did| !did.is_empty())
-        .ok_or_else(|| {
-            napi::Error::from(ScpNapiError::Validation {
-                message: "presenting_agent_did is required: ucan_validate will not default to \
-                          the token's audience"
-                    .to_owned(),
-                code: codes::VALID_7010.to_owned(),
-            })
-        })?;
-    // Input hygiene parity with the PyO3 reference: validate the trimmed
-    // presenting agent DID before any state lookup / token parse.
+    // FAIL CLOSED (no silent security default): `presenting_agent_did` is a
+    // REQUIRED parameter — never defaulted to the token's own `aud` (which would
+    // make the step-5 audience check tautological and inflate trust). Validated as
+    // a pure input before any state lookup / token parse — mirrors
+    // `ucan_evaluate_on`. `validate_did` rejects an empty/whitespace value.
+    let agent_did = presenting_agent_did.trim();
     validate_did(agent_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
 
     // Ensure the context's persistent runtime state (RevocationList, NonceTracker)
@@ -353,13 +340,13 @@ pub(crate) async fn ucan_validate_on(
 /// validity with no invoked-capability grant-match challenge (mirroring
 /// `evaluate_ucan(None, ..)`); `Some` additionally requires the token grants it.
 ///
-/// FAIL CLOSED: `presenting_agent_did` is required (no silent security default).
-/// When it is `None` or empty this returns a validation error rather than
-/// defaulting to the token's own `aud` — defaulting would make the step-5
-/// audience check a tautological self-check (`aud == aud`) that does NOT bind the
-/// token to any external subject, so a token addressed to someone else would
-/// report `signatures_valid` (trust inflation). The SDK trust path always passes
-/// the subject; raw diagnostic callers must now pass an explicit presenting agent.
+/// FAIL CLOSED: `presenting_agent_did` is a REQUIRED (non-optional) parameter (no
+/// silent security default). It is never defaulted to the token's own `aud` —
+/// defaulting would make the step-5 audience check a tautological self-check
+/// (`aud == aud`) that does NOT bind the token to any external subject, so a token
+/// addressed to someone else would report `signatures_valid` (trust inflation). An
+/// empty/whitespace value is rejected by `validate_did`. The SDK trust path always
+/// passes the subject; raw diagnostic callers must pass an explicit presenting agent.
 #[allow(clippy::unused_async)] // napi-rs requires async for Promise return
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String/Option<Vec>
 pub(crate) async fn ucan_evaluate_on(
@@ -367,7 +354,7 @@ pub(crate) async fn ucan_evaluate_on(
     handle: &NapiContextHandle,
     token: String,
     capability: Option<String>,
-    presenting_agent_did: Option<String>,
+    presenting_agent_did: String,
     proof_tokens: Option<Vec<String>>,
 ) -> napi::Result<NapiCapabilityValidation> {
     crate::napi_check_handle!(&bi.core, handle);
@@ -379,24 +366,12 @@ pub(crate) async fn ucan_evaluate_on(
         validate_capability_uri(cap).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     }
 
-    // FAIL CLOSED (no silent security default): require an explicit presenting
-    // agent DID instead of defaulting to the token's own `aud` (which would make
-    // the step-5 audience check tautological and inflate trust). Validated as a
-    // pure input before any state lookup.
-    let agent_did = presenting_agent_did
-        .as_deref()
-        .map(str::trim)
-        .filter(|did| !did.is_empty())
-        .ok_or_else(|| {
-            napi::Error::from(ScpNapiError::Validation {
-                message: "presenting_agent_did is required: ucan_evaluate will not default to \
-                          the token's audience"
-                    .to_owned(),
-                code: codes::VALID_7010.to_owned(),
-            })
-        })?;
-    // Input hygiene parity with the PyO3 reference: validate the trimmed
-    // presenting agent DID before any state lookup / token parse.
+    // FAIL CLOSED (no silent security default): `presenting_agent_did` is a
+    // REQUIRED parameter — never defaulted to the token's own `aud` (which would
+    // make the step-5 audience check tautological and inflate trust). Validated as
+    // a pure input before any state lookup. `validate_did` rejects an
+    // empty/whitespace value.
+    let agent_did = presenting_agent_did.trim();
     validate_did(agent_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
 
     // Ensure the context's persistent runtime state (RevocationList, NonceTracker)
@@ -1497,12 +1472,13 @@ mod tests {
         );
     }
 
-    /// SECURITY (Finding 2). `ucan_evaluate` MUST reject an omitted
+    /// SECURITY (Finding 2). `ucan_evaluate` MUST reject an empty/whitespace
     /// `presenting_agent_did` rather than defaulting to the token's own `aud`.
-    /// The check is a pure-input gate before context lookup / token parse, so a
-    /// dummy token suffices.
+    /// Omission is impossible — the parameter is a required non-`Option` `String`,
+    /// so the type system enforces presence. The check is a pure-input gate before
+    /// context lookup / token parse, so a dummy token suffices.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn ucan_evaluate_requires_presenting_agent_did() {
+    async fn ucan_evaluate_rejects_empty_presenting_agent_did() {
         let bi = std::sync::Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
         let handle = crate::context::NapiContextHandle::test_active_on(
             &bi,
@@ -1510,26 +1486,12 @@ mod tests {
             "did:dht:z6MkCreator".to_owned(),
         );
 
-        let omitted = ucan_evaluate_on(
-            &bi,
-            &handle,
-            "header.payload.sig".to_owned(),
-            None,
-            None,
-            None,
-        )
-        .await;
-        assert!(
-            omitted.is_err(),
-            "ucan_evaluate must fail closed when presenting_agent_did is omitted"
-        );
-
         let empty = ucan_evaluate_on(
             &bi,
             &handle,
             "header.payload.sig".to_owned(),
             None,
-            Some("   ".to_owned()),
+            "   ".to_owned(),
             None,
         )
         .await;
@@ -1540,11 +1502,13 @@ mod tests {
     }
 
     /// SECURITY (symmetric gate hardening). The ENFORCING `ucan_validate` gate
-    /// MUST reject an omitted / empty `presenting_agent_did` rather than
-    /// defaulting to the token's own `aud`. Pure-input gate before context
-    /// lookup / token parse, so a dummy token suffices.
+    /// MUST reject an empty/whitespace `presenting_agent_did` rather than
+    /// defaulting to the token's own `aud`. Omission is impossible — the parameter
+    /// is a required non-`Option` `String`, so the type system enforces presence.
+    /// Pure-input gate before context lookup / token parse, so a dummy token
+    /// suffices.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn ucan_validate_requires_presenting_agent_did() {
+    async fn ucan_validate_rejects_empty_presenting_agent_did() {
         let bi = std::sync::Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
         let handle = crate::context::NapiContextHandle::test_active_on(
             &bi,
@@ -1552,26 +1516,12 @@ mod tests {
             "did:dht:z6MkCreator".to_owned(),
         );
 
-        let omitted = ucan_validate_on(
-            &bi,
-            &handle,
-            "header.payload.sig".to_owned(),
-            "messages:write".to_owned(),
-            None,
-            None,
-        )
-        .await;
-        assert!(
-            omitted.is_err(),
-            "ucan_validate must fail closed when presenting_agent_did is omitted"
-        );
-
         let empty = ucan_validate_on(
             &bi,
             &handle,
             "header.payload.sig".to_owned(),
             "messages:write".to_owned(),
-            Some("   ".to_owned()),
+            "   ".to_owned(),
             None,
         )
         .await;

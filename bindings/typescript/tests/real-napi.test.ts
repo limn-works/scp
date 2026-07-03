@@ -650,11 +650,13 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       const token = await napi.ucanMint(ctx, member.did, ["messages:read"]);
       const fullUri = token.capabilities[0] as string;
 
-      // No presenting agent → the gate MUST reject rather than default the
+      // Empty presenting agent → the gate MUST reject rather than default the
       // audience check to the token's own `aud` (which would be a tautology that
-      // inflates trust). The fail-closed check fires before nonce recording, so
-      // the token's nonce is NOT consumed and the control call below still works.
-      await expect(napi.ucanValidate(ctx, token.encoded, fullUri)).rejects.toThrow();
+      // inflates trust). presenting_agent_did is a required (non-optional)
+      // parameter; an empty string is rejected by validate_did. The fail-closed
+      // check fires before nonce recording, so the token's nonce is NOT consumed
+      // and the control call below still works.
+      await expect(napi.ucanValidate(ctx, token.encoded, fullUri, "")).rejects.toThrow();
 
       // Control: supplying the subject (the token's audience) passes.
       await napi.ucanValidate(ctx, token.encoded, fullUri, member.did);

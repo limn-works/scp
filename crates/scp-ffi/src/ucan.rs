@@ -246,13 +246,14 @@ impl crate::scp::PyScp {
     /// * `token` -- The encoded UCAN token string (JWT format).
     /// * `capability` -- The required capability URI (e.g.,
     ///   `"scp:ctx:abc123/messages:write"`).
-    /// * `presenting_agent_did` -- REQUIRED. The DID of the agent presenting the
-    ///   token. FAIL CLOSED (no silent security default): when it is absent or
-    ///   empty this method returns a validation error rather than defaulting to
+    /// * `presenting_agent_did` -- REQUIRED (non-optional). The DID of the agent
+    ///   presenting the token. It is a required parameter — never defaulted to
     ///   the token's own `aud`. Defaulting would make the step-5 audience check a
     ///   tautological self-check (`aud == aud`) that does NOT bind the token to
     ///   any external subject, so a token addressed to someone else would pass
-    ///   (trust inflation). Mirrors the diagnostic `ucan_evaluate` gate.
+    ///   (trust inflation). An empty/whitespace value is rejected by
+    ///   `validate_did` (it is not a valid `did:` string). Mirrors the diagnostic
+    ///   `ucan_evaluate` gate.
     /// * `proof_tokens` -- Optional. List of encoded parent UCAN token strings
     ///   for delegation chain verification. Required when validating delegated
     ///   tokens with non-empty proof chains.
@@ -264,33 +265,28 @@ impl crate::scp::PyScp {
     /// insufficient capabilities, revoked token, nonce replay, etc.
     ///
     /// See ADR-016 §5 for the full 11-step validation specification.
-    #[pyo3(signature = (context_id, token, capability, presenting_agent_did=None, proof_tokens=None))]
+    #[pyo3(signature = (context_id, token, capability, presenting_agent_did, proof_tokens=None))]
     #[allow(clippy::needless_pass_by_value)] // PyO3 requires owned Option<Vec<String>> for method arguments.
     pub fn ucan_validate(
         &self,
         context_id: &str,
         token: &str,
         capability: &str,
-        presenting_agent_did: Option<&str>,
+        presenting_agent_did: &str,
         proof_tokens: Option<Vec<String>>,
     ) -> PyResult<()> {
         let bi = &*self.inner;
         validate::validate_context_id(context_id)?;
         validate::validate_ucan_token(token)?;
         validate::validate_capability_uri(capability)?;
-        // FAIL CLOSED (no silent security default): the presenting agent DID must
-        // be supplied explicitly. Defaulting to the token's own `aud` would make
-        // the step-5 audience check tautological (`aud == aud`), inflating trust
-        // for a token addressed to someone else. Mirrors `ucan_evaluate`.
-        let presenting_agent_did = presenting_agent_did
-            .map(str::trim)
-            .filter(|did| !did.is_empty())
-            .ok_or_else(|| {
-                ScpPyError::validation(
-                    "presenting_agent_did is required: ucan_validate will not default to the \
-                     token's audience",
-                )
-            })?;
+        // FAIL CLOSED (no silent security default): the presenting agent DID is a
+        // REQUIRED parameter (never defaulted to the token's own `aud`, which
+        // would make the step-5 audience check tautological and inflate trust for
+        // a token addressed to someone else). Trimmed for input hygiene (parity
+        // with `ucan_evaluate_on`/NAPI); `validate_did` then rejects an empty or
+        // whitespace-only value (not a valid `did:` string). Mirrors
+        // `ucan_evaluate`.
+        let presenting_agent_did = presenting_agent_did.trim();
         validate::validate_did(presenting_agent_did)?;
         if let Some(ref tokens) = proof_tokens {
             for t in tokens {
@@ -305,7 +301,7 @@ impl crate::scp::PyScp {
             ScpPyError::ucan(format!("invalid capability URI '{capability}': {e}"))
         })?;
 
-        // Presenting agent DID is required (fail-closed above) — never the token aud.
+        // Presenting agent DID is a required parameter — never the token aud.
         let agent_did = presenting_agent_did;
 
         // Build proof resolver from optional proof tokens.
@@ -360,14 +356,14 @@ impl crate::scp::PyScp {
     /// `context_id`, `token`, optional `capability`, REQUIRED
     /// `presenting_agent_did`, and optional `proof_tokens` for delegation chains.
     ///
-    /// FAIL CLOSED: `presenting_agent_did` is required (no silent security
-    /// default). When it is absent or empty this method returns a validation
-    /// error rather than defaulting to the token's own `aud` — defaulting would
-    /// make the step-5 audience check a tautological self-check (`aud == aud`)
-    /// that does NOT bind the token to any external subject, so a token addressed
-    /// to someone else would report `signatures_valid` (trust inflation). The SDK
-    /// trust path always passes the subject; raw diagnostic callers must now pass
-    /// an explicit presenting agent.
+    /// FAIL CLOSED: `presenting_agent_did` is a REQUIRED (non-optional) parameter
+    /// (no silent security default). It is never defaulted to the token's own
+    /// `aud` — defaulting would make the step-5 audience check a tautological
+    /// self-check (`aud == aud`) that does NOT bind the token to any external
+    /// subject, so a token addressed to someone else would report
+    /// `signatures_valid` (trust inflation). An empty/whitespace value is rejected
+    /// by `validate_did`. The SDK trust path always passes the subject; raw
+    /// diagnostic callers must pass an explicit presenting agent.
     ///
     /// `capability` is OPTIONAL. When omitted (or empty), the token is evaluated
     /// for INTRINSIC validity only — no specific capability is challenged, so the
@@ -390,14 +386,14 @@ impl crate::scp::PyScp {
     /// reported via the returned booleans, not as exceptions.
     ///
     /// See ADR-016 §5 and `CapabilityValidation` in scp-core.
-    #[pyo3(signature = (context_id, token, capability=None, presenting_agent_did=None, proof_tokens=None))]
+    #[pyo3(signature = (context_id, token, capability, presenting_agent_did, proof_tokens=None))]
     #[allow(clippy::needless_pass_by_value)] // PyO3 requires owned Option<Vec<String>> for method arguments.
     pub fn ucan_evaluate(
         &self,
         context_id: &str,
         token: &str,
         capability: Option<&str>,
-        presenting_agent_did: Option<&str>,
+        presenting_agent_did: &str,
         proof_tokens: Option<Vec<String>>,
     ) -> PyResult<PyCapabilityValidation> {
         let bi = &*self.inner;
@@ -409,19 +405,13 @@ impl crate::scp::PyScp {
         if let Some(cap) = capability {
             validate::validate_capability_uri(cap)?;
         }
-        // FAIL CLOSED (no silent security default): the presenting agent DID must
-        // be supplied explicitly. Defaulting to the token's own `aud` would make
-        // the step-5 audience check tautological (`aud == aud`), inflating trust
-        // for a token addressed to someone else.
-        let presenting_agent_did = presenting_agent_did
-            .map(str::trim)
-            .filter(|did| !did.is_empty())
-            .ok_or_else(|| {
-                ScpPyError::validation(
-                    "presenting_agent_did is required: ucan_evaluate will not default to the \
-                     token's audience",
-                )
-            })?;
+        // FAIL CLOSED (no silent security default): the presenting agent DID is a
+        // REQUIRED parameter (never defaulted to the token's own `aud`, which
+        // would make the step-5 audience check tautological and inflate trust for
+        // a token addressed to someone else). Trimmed for input hygiene (parity
+        // with NAPI); `validate_did` then rejects an empty or whitespace-only
+        // value (not a valid `did:` string).
+        let presenting_agent_did = presenting_agent_did.trim();
         validate::validate_did(presenting_agent_did)?;
         if let Some(ref tokens) = proof_tokens {
             for t in tokens {
@@ -441,7 +431,7 @@ impl crate::scp::PyScp {
             })
             .transpose()?;
 
-        // The presenting agent DID was validated and required above (fail-closed).
+        // The presenting agent DID is a required parameter, validated above.
         let agent_did = presenting_agent_did;
 
         // Build proof resolver from optional proof tokens.
@@ -1055,26 +1045,14 @@ mod tests {
     // ucan_evaluate fail-closed audience (no silent self-default)
     // -----------------------------------------------------------------------
 
-    /// SECURITY (Finding 2). `ucan_evaluate` MUST reject an omitted
-    /// `presenting_agent_did` rather than defaulting to the token's own `aud`
-    /// (which would make the audience check tautological and inflate trust). The
-    /// check fires before context lookup, so no registered context is needed.
-    #[test]
-    fn ucan_evaluate_requires_presenting_agent_did() {
-        let scp = crate::scp::PyScp::new_in_memory_for_test();
-        let result = scp.ucan_evaluate("ctx-1", "header.payload.sig", None, None, None);
-        assert!(
-            result.is_err(),
-            "ucan_evaluate must fail closed when presenting_agent_did is omitted"
-        );
-    }
-
-    /// An empty/whitespace `presenting_agent_did` is treated as absent and also
-    /// fails closed.
+    /// An empty/whitespace `presenting_agent_did` is rejected by `validate_did`
+    /// (it is not a valid `did:` string). Omission is impossible — the parameter
+    /// is a required non-`Option` `&str`, so the type system enforces presence.
+    /// The check fires before context lookup, so no registered context is needed.
     #[test]
     fn ucan_evaluate_rejects_empty_presenting_agent_did() {
         let scp = crate::scp::PyScp::new_in_memory_for_test();
-        let result = scp.ucan_evaluate("ctx-1", "header.payload.sig", None, Some("   "), None);
+        let result = scp.ucan_evaluate("ctx-1", "header.payload.sig", None, "   ", None);
         assert!(
             result.is_err(),
             "ucan_evaluate must fail closed when presenting_agent_did is empty"
@@ -1086,33 +1064,14 @@ mod tests {
     // with the diagnostic `ucan_evaluate` gate above.
     // -----------------------------------------------------------------------
 
-    /// SECURITY. The ENFORCING `ucan_validate` gate MUST reject an omitted
-    /// `presenting_agent_did` rather than defaulting to the token's own `aud`
-    /// (which would make the step-5 audience check tautological and inflate
-    /// trust). The check fires before context lookup, so no registered context is
-    /// needed.
-    #[test]
-    fn ucan_validate_requires_presenting_agent_did() {
-        let scp = crate::scp::PyScp::new_in_memory_for_test();
-        let result = scp.ucan_validate("ctx-1", "header.payload.sig", "messages:write", None, None);
-        assert!(
-            result.is_err(),
-            "ucan_validate must fail closed when presenting_agent_did is omitted"
-        );
-    }
-
-    /// An empty/whitespace `presenting_agent_did` is treated as absent and also
-    /// fails closed on the enforcing gate.
+    /// An empty/whitespace `presenting_agent_did` is rejected by `validate_did`
+    /// on the enforcing gate. Omission is impossible — the parameter is a required
+    /// non-`Option` `&str`, so the type system enforces presence.
     #[test]
     fn ucan_validate_rejects_empty_presenting_agent_did() {
         let scp = crate::scp::PyScp::new_in_memory_for_test();
-        let result = scp.ucan_validate(
-            "ctx-1",
-            "header.payload.sig",
-            "messages:write",
-            Some("   "),
-            None,
-        );
+        let result =
+            scp.ucan_validate("ctx-1", "header.payload.sig", "messages:write", "   ", None);
         assert!(
             result.is_err(),
             "ucan_validate must fail closed when presenting_agent_did is empty"
