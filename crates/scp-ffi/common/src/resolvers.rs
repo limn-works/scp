@@ -44,39 +44,18 @@ pub struct BridgeDidResolver;
 
 impl DidResolver for BridgeDidResolver {
     fn resolve_public_key(&self, did: &str) -> Result<[u8; 32], CoreUcanError> {
-        if let Some(suffix) = did.strip_prefix("did:dht:z") {
-            let decoded = zbase32::decode(suffix).map_err(|_| {
-                CoreUcanError::MalformedToken(format!("z-base-32 decode failed for DID: {did}"))
-            })?;
-            let bytes: [u8; 32] = decoded.try_into().map_err(|v: Vec<u8>| {
-                CoreUcanError::MalformedToken(format!(
-                    "DID public key must be 32 bytes, got {}",
-                    v.len()
-                ))
-            })?;
-            return Ok(bytes);
-        }
-
-        // did:key:{hex} is a non-standard test convenience. Gated behind the
-        // `testing` feature (or #[cfg(test)]) to prevent acceptance in release
-        // builds. See: https://github.com/limn-works/scp/issues/128
-        #[cfg(any(test, feature = "testing"))]
-        if let Some(hex_str) = did.strip_prefix("did:key:") {
-            let bytes = hex::decode(hex_str).map_err(|e| {
-                CoreUcanError::MalformedToken(format!("hex decode failed for did:key DID: {e}"))
-            })?;
-            let pk: [u8; 32] = bytes.try_into().map_err(|v: Vec<u8>| {
-                CoreUcanError::MalformedToken(format!(
-                    "DID public key must be 32 bytes, got {}",
-                    v.len()
-                ))
-            })?;
-            return Ok(pk);
-        }
-
-        Err(CoreUcanError::MalformedToken(format!(
-            "unsupported DID method: {did} (expected did:dht:)"
-        )))
+        // Delegate to the single hardened `scp-did` parser rather than a
+        // hand-rolled decode. This gives this UCAN-validation path the same
+        // did:dht:z z-base-32 **canonicality** guard as every other native
+        // did:dht decoder: the parser re-encodes the decoded 32-byte key and
+        // rejects any input that does not round-trip to the canonical
+        // encoding, so a non-canonical spelling of a valid key can never
+        // resolve here (closing the trailing-bit-padding non-injectivity that
+        // would otherwise let two DID strings resolve to the same key). The
+        // did:key:{hex} test-convenience branch also comes from that one parser
+        // (gated by `scp-did/testing`, forwarded from this crate's `testing`
+        // feature), so there is exactly one parser and no drift.
+        scp_did::extract_public_key_from_did(did).map_err(CoreUcanError::MalformedToken)
     }
 }
 
@@ -1079,6 +1058,53 @@ mod tests {
     fn bridge_resolver_rejects_unknown_method() {
         let result = CoreDidResolver::resolve_public_key(&BridgeDidResolver, "did:web:example.com");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn bridge_resolver_rejects_non_canonical_zbase32() {
+        // The UCAN-validation resolver MUST reject a non-canonical z-base-32
+        // spelling of a valid key: z-base-32 of a 32-byte payload is not
+        // injective on its trailing bit-padding (the 52nd char carries 1
+        // payload bit + 4 padding bits → 16 alternate encodings decode to the
+        // same key). Two distinct DID strings resolving to the same key would
+        // otherwise enable petname squatting / log-spoofing. This mirrors the
+        // native `scp_identity::dht::extract_public_key` and `scp_did` parser
+        // tests, pinning single-parser parity across the UCAN path.
+        const ALPHABET: &[u8; 32] = b"ybndrfg8ejkmcpqxot1uwisza345h769";
+
+        let pk: [u8; 32] = [0xAB; 32];
+        let canonical_encoded = zbase32::encode(&pk);
+        let canonical_did = format!("did:dht:z{canonical_encoded}");
+
+        // Canonical form is accepted and yields the key.
+        let ok = CoreDidResolver::resolve_public_key(&BridgeDidResolver, &canonical_did).unwrap();
+        assert_eq!(ok, pk);
+
+        // Build a non-canonical alternate by toggling a padding bit of the
+        // trailing char.
+        let last_char = canonical_encoded.as_bytes()[canonical_encoded.len() - 1];
+        let last_idx = ALPHABET
+            .iter()
+            .position(|&c| c == last_char)
+            .expect("canonical char must be in alphabet");
+        let mut mutated_bytes = canonical_encoded.as_bytes().to_vec();
+        let last_pos = mutated_bytes.len() - 1;
+        mutated_bytes[last_pos] = ALPHABET[last_idx ^ 1];
+        let mutated_encoded =
+            String::from_utf8(mutated_bytes).expect("z-base-32 alphabet is ASCII");
+        let mutated_did = format!("did:dht:z{mutated_encoded}");
+
+        // Sanity: the mutated input still decodes to the same 32 bytes (a real
+        // non-canonical alternate, not a typo).
+        let raw_decoded = zbase32::decode(&mutated_encoded).expect("alternate decodes");
+        assert_eq!(raw_decoded.as_slice(), &pk[..]);
+
+        // The canonicality guard MUST reject it.
+        let err = CoreDidResolver::resolve_public_key(&BridgeDidResolver, &mutated_did);
+        assert!(
+            err.is_err(),
+            "non-canonical did:dht spelling must be rejected by the UCAN resolver"
+        );
     }
 
     // -----------------------------------------------------------------------

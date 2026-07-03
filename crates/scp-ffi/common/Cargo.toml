@@ -14,7 +14,10 @@ default = ["resolvers"]
 resolvers = ["dep:scp-core", "dep:scp-identity", "dep:scp-event-log", "dep:scp-transport", "dep:scp-platform", "dep:scp-mcp", "dep:tokio", "dep:tokio-util", "dep:async-trait", "dep:thiserror", "dep:tracing", "dep:rand", "dep:ed25519-dalek"]
 # Enables the did:key:{hex} DID format in BridgeDidResolver. This is a
 # non-standard test convenience — production builds must resolve via did:dht:z.
-testing = ["resolvers"]
+# BridgeDidResolver delegates decoding to `scp_did::extract_public_key_from_did`,
+# whose did:key:{hex} branch is itself gated behind `scp-did/testing`; forward
+# the flag so the single shared parser still accepts did:key in test builds.
+testing = ["resolvers", "scp-did/testing"]
 # Shared callback-custody byte/string parsing helpers (custody_parse module).
 # Requires only scp-platform for the typed return values (KeyHandle,
 # PseudonymKeypair, PublicKey, PlatformError). Deliberately NOT folded into

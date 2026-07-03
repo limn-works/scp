@@ -900,22 +900,16 @@ fn canonical_json_bytes(value: &serde_json::Value) -> Result<Vec<u8>, SandboxErr
 fn extract_ed25519_pubkey_from_did(did: &DID) -> Result<[u8; 32], SandboxError> {
     let did_str = did.as_ref();
 
-    if let Some(id_part) = did_str.strip_prefix("did:dht:") {
-        // did:dht uses z-base-32 encoding of the Ed25519 public key.
-        let decoded = zbase32::decode(id_part).map_err(|_| {
-            SandboxError::InvalidDeclaration(format!(
-                "failed to decode z-base-32 from did:dht: {did_str}"
-            ))
-        })?;
-        if decoded.len() != 32 {
-            return Err(SandboxError::InvalidDeclaration(format!(
-                "did:dht key is {} bytes, expected 32",
-                decoded.len()
-            )));
-        }
-        let mut key = [0u8; 32];
-        key.copy_from_slice(&decoded);
-        Ok(key)
+    if did_str.starts_with("did:dht:") {
+        // did:dht encodes the Ed25519 public key as z-base-32 in the DID
+        // suffix (`did:dht:z<z-base-32>`). Delegate to the single hardened
+        // `scp-did` parser so prefix handling, the 32-byte length check, AND
+        // z-base-32 canonicality all come from ONE place, identical to the
+        // native identity/FFI decoders (single-parser parity). The prior inline
+        // code stripped only "did:dht:" (not the multibase 'z'), leaving the 'z'
+        // in the decoded payload → 33 bytes → it rejected EVERY valid did:dht
+        // DID; delegation fixes that and adds the canonicality guard.
+        scp_did::extract_public_key_from_did(did_str).map_err(SandboxError::InvalidDeclaration)
     } else if let Some(id_part) = did_str.strip_prefix("did:key:z") {
         // did:key uses base58btc encoding with a multicodec prefix.
         // Ed25519 multicodec prefix is 0xed01.
@@ -2123,6 +2117,65 @@ mod tests {
         let did = DID::from("did:web:example.com");
         let result = extract_ed25519_pubkey_from_did(&did);
         assert!(matches!(result, Err(SandboxError::InvalidDeclaration(_))));
+    }
+
+    #[test]
+    fn extract_pubkey_from_canonical_did_dht() {
+        // Regression: the inline decoder stripped only "did:dht:" (not the
+        // multibase 'z'), so the 'z' stayed in the z-base-32 payload → 33 bytes
+        // → it rejected EVERY valid did:dht DID. Delegation to the hardened
+        // scp-did parser fixes the prefix handling: a canonical did:dht:z DID
+        // now resolves to the correct 32-byte Ed25519 key.
+        let pubkey_bytes: [u8; 32] = [0x37; 32];
+        let did = DID::from(format!("did:dht:z{}", zbase32::encode(&pubkey_bytes)));
+
+        let result = extract_ed25519_pubkey_from_did(&did)
+            .expect("a canonical did:dht DID must resolve to its Ed25519 key");
+        assert_eq!(
+            result, pubkey_bytes,
+            "extracted key must equal the encoded public key"
+        );
+    }
+
+    #[test]
+    fn extract_pubkey_rejects_non_canonical_did_dht() {
+        // The delegated scp-did parser enforces z-base-32 canonicality: a
+        // non-canonical spelling of a valid key (differing only in the
+        // trailing padding bits) MUST be rejected, so two DID strings can never
+        // resolve to the same app-declaration signing key.
+        const ALPHABET: &[u8; 32] = b"ybndrfg8ejkmcpqxot1uwisza345h769";
+
+        let pubkey_bytes: [u8; 32] = [0x37; 32];
+        let canonical_encoded = zbase32::encode(&pubkey_bytes);
+
+        // Build a non-canonical alternate by toggling a padding bit of the
+        // trailing char.
+        let last_char = canonical_encoded.as_bytes()[canonical_encoded.len() - 1];
+        let last_idx = ALPHABET
+            .iter()
+            .position(|&c| c == last_char)
+            .expect("canonical char must be in alphabet");
+        let mut mutated_bytes = canonical_encoded.as_bytes().to_vec();
+        let last_pos = mutated_bytes.len() - 1;
+        mutated_bytes[last_pos] = ALPHABET[last_idx ^ 1];
+        let mutated_encoded =
+            String::from_utf8(mutated_bytes).expect("z-base-32 alphabet is ASCII");
+
+        // Sanity: the mutated spelling still decodes to the same 32 bytes.
+        assert_eq!(
+            zbase32::decode(&mutated_encoded)
+                .expect("alternate decodes")
+                .as_slice(),
+            &pubkey_bytes[..],
+            "the mutated spelling must be a real non-canonical alternate of the same key"
+        );
+
+        let did = DID::from(format!("did:dht:z{mutated_encoded}"));
+        let result = extract_ed25519_pubkey_from_did(&did);
+        assert!(
+            matches!(result, Err(SandboxError::InvalidDeclaration(_))),
+            "non-canonical did:dht spelling must be rejected"
+        );
     }
 
     // -----------------------------------------------------------------------
