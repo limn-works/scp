@@ -380,7 +380,7 @@ pub(crate) fn check_capability_requirements_on(
         })?;
 
     let resolver = scp_core::trust::IdentityDidPublicKeyResolver;
-    let clock = scp_identity::cache::SystemClock;
+    let clock = scp_clock::SystemClock;
 
     scp_core::trust::check_capability_requirements(
         &requirements,
@@ -393,7 +393,7 @@ pub(crate) fn check_capability_requirements_on(
     )
     .map_err(|e| {
         // Mirror the UniFFI bridge's per-variant code mapping so all native
-        // bridges surface an identical `SCP-VALID-707x` for the same failure
+        // bridges surface identical per-variant 707x codes for the same failure
         // case: empty subject → 7077; missing capability / verification-required
         // → 7076.
         let code = match e {
@@ -901,7 +901,7 @@ mod tests {
 
         let verifier_key = SigningKey::from_bytes(&[9u8; 32]);
         let verifier_pub = verifier_key.verifying_key().to_bytes();
-        let verifier_did = scp_primitives::did_dht_from_public_key(&verifier_pub);
+        let verifier_did = scp_did::did_dht_from_public_key(&verifier_pub);
         let cap: scp_core::trust::CapabilityUri = uri.parse().unwrap();
 
         let mut cv = scp_core::trust::ChallengeVerification {

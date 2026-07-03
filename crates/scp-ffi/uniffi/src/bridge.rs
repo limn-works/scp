@@ -6466,7 +6466,7 @@ pub fn check_capability_requirements(
         })?;
 
     let resolver = scp_core::trust::IdentityDidPublicKeyResolver;
-    let clock = scp_identity::cache::SystemClock;
+    let clock = scp_clock::SystemClock;
 
     scp_core::trust::check_capability_requirements(
         &requirements,
@@ -17547,7 +17547,7 @@ mod tests {
 
         let verifier_key = SigningKey::from_bytes(&[9u8; 32]);
         let verifier_pub = verifier_key.verifying_key().to_bytes();
-        let verifier_did = scp_primitives::did_dht_from_public_key(&verifier_pub);
+        let verifier_did = scp_did::did_dht_from_public_key(&verifier_pub);
         let cap: scp_core::trust::CapabilityUri = uri.parse().unwrap();
 
         let mut cv = scp_core::trust::ChallengeVerification {

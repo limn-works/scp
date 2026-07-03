@@ -968,7 +968,8 @@ pub enum ParticipationAdmissionError {
 ///    high-standing profiles and be admitted on the victim's reputation
 ///    (cross-subject profile replay). Statements for any other subject are
 ///    silently skipped — they never contribute (fail-closed). This mirrors the
-///    subject binding in [`check_capability_requirements`].
+///    subject binding in
+///    [`check_capability_requirements`](crate::trust::check_capability_requirements).
 /// 2. AUTHENTICITY. For the subject-matching statements, this verifies the
 ///    AUTHENTICITY of each — its Ed25519 signature over `signable_bytes` against
 ///    the `signer_public_key` carried IN the profile. The signer key is
