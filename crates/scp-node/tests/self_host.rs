@@ -36,9 +36,9 @@ use tower::ServiceExt;
 use zeroize::Zeroizing;
 
 use scp_clock::SystemClock;
+use scp_dht::InMemoryDhtClient;
 use scp_identity::DidCache;
 use scp_identity::dht::DidDht;
-use scp_identity::dht_client::InMemoryDhtClient;
 use scp_node::{
     ApplicationNode, DeploySiteParams, DhtMode, IdentitySource, NatSlot, NatStrategy, Node,
     NodeConfig, NodeError, Reach, ReachabilityTier,

@@ -1491,7 +1491,7 @@ impl ApplicationNode<scp_platform::testing::InMemoryStorage> {
     /// Auto-wires:
     /// - [`InMemoryKeyCustody`](scp_platform::testing::InMemoryKeyCustody)
     /// - [`InMemoryStorage`](scp_platform::testing::InMemoryStorage)
-    /// - [`InMemoryDhtClient`](scp_identity::InMemoryDhtClient) (no real DHT network)
+    /// - [`InMemoryDhtClient`](scp_dht::InMemoryDhtClient) (no real DHT network)
     /// - [`SelfSignedTlsProvider`] (self-signed TLS certificate for `localhost`)
     /// - Relay bound to `127.0.0.1:<port>`
     /// - Domain set to `localhost`
@@ -1517,8 +1517,8 @@ impl ApplicationNode<scp_platform::testing::InMemoryStorage> {
     /// provisioning fails.
     pub async fn dev(port: u16) -> Result<Self, NodeError> {
         use scp_clock::SystemClock;
+        use scp_dht::InMemoryDhtClient;
         use scp_identity::DidCache;
-        use scp_identity::InMemoryDhtClient;
         use scp_identity::dht::DidDht;
         use scp_platform::testing::{InMemoryKeyCustody, InMemoryStorage};
 
@@ -3550,9 +3550,9 @@ mod tests {
     use std::sync::Arc;
 
     use scp_clock::SystemClock;
+    use scp_dht::InMemoryDhtClient;
     use scp_identity::DidCache;
     use scp_identity::dht::DidDht;
-    use scp_identity::dht_client::InMemoryDhtClient;
     use scp_platform::testing::{InMemoryKeyCustody, InMemoryStorage};
 
     /// The concrete `DidDht` type used in tests (with in-memory DHT and system clock).

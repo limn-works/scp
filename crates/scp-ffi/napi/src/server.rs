@@ -513,7 +513,8 @@ impl Drop for NapiNodeHandle {
 fn build_node_identity(bi: &NapiBridgeInstance, did: &str) -> napi::Result<NodeIdentity> {
     use std::sync::Arc;
 
-    use scp_identity::{DidCache, InMemoryDhtClient};
+    use scp_dht::InMemoryDhtClient;
+    use scp_identity::DidCache;
     use scp_platform::traits::KeyCustody;
 
     crate::runtime::with_identity(bi, did, |entry| {

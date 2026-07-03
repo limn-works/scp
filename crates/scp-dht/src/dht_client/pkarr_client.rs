@@ -19,7 +19,7 @@ use mainline::{Dht, MutableItem};
 use tracing::{debug, info, warn};
 
 use super::{DhtClient, DhtRecord};
-use crate::IdentityError;
+use crate::DhtError;
 
 /// Default timeout for DHT operations.
 const DHT_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
@@ -89,9 +89,9 @@ impl PkarrDhtClient {
     ///
     /// # Errors
     ///
-    /// Returns [`IdentityError::DhtPublishFailed`] if the DHT client cannot
+    /// Returns [`DhtError::DhtPublishFailed`] if the DHT client cannot
     /// be created (e.g., socket binding failure).
-    pub fn new() -> Result<Self, IdentityError> {
+    pub fn new() -> Result<Self, DhtError> {
         Self::builder().build()
     }
 
@@ -114,7 +114,7 @@ impl PkarrDhtClient {
     async fn resolve_via_gateway(
         &self,
         public_key: &[u8; 32],
-    ) -> Result<Option<DhtRecord>, IdentityError> {
+    ) -> Result<Option<DhtRecord>, DhtError> {
         let Some(http_client) = &self.http_client else {
             return Ok(None);
         };
@@ -163,7 +163,7 @@ impl PkarrDhtClient {
                             signature.copy_from_slice(&body[..64]);
 
                             let seq_bytes: [u8; 8] = body[64..72].try_into().map_err(|_| {
-                                IdentityError::DhtResolveFailed(
+                                DhtError::DhtResolveFailed(
                                     "invalid sequence bytes in gateway response".to_owned(),
                                 )
                             })?;
@@ -178,9 +178,9 @@ impl PkarrDhtClient {
                             // the gateway response. Without this, a malicious
                             // gateway could inject inflated sequence numbers
                             // (poisoning initialize_sequence) or fake documents.
-                            if let Err(e) = crate::dht::verify_bep44_signature(
-                                public_key, &signature, &value, seq,
-                            ) {
+                            if let Err(e) =
+                                crate::verify_bep44_signature(public_key, &signature, &value, seq)
+                            {
                                 warn!(
                                     gateway = %gateway_url,
                                     error = %e,
@@ -236,7 +236,7 @@ impl DhtClient for PkarrDhtClient {
         signature: &[u8; 64],
         value: &[u8],
         seq: u64,
-    ) -> impl Future<Output = Result<(), IdentityError>> + Send {
+    ) -> impl Future<Output = Result<(), DhtError>> + Send {
         async move {
             // BEP44 uses i64 for sequence numbers. Saturate at i64::MAX
             // (which is ~9.2e18 — far beyond any realistic sequence).
@@ -279,10 +279,10 @@ impl DhtClient for PkarrDhtClient {
                     );
                     Ok(())
                 }
-                Ok(Err(e)) => Err(IdentityError::DhtPublishFailed(format!(
+                Ok(Err(e)) => Err(DhtError::DhtPublishFailed(format!(
                     "Mainline DHT put_mutable failed: {e}"
                 ))),
-                Err(_elapsed) => Err(IdentityError::DhtPublishFailed(format!(
+                Err(_elapsed) => Err(DhtError::DhtPublishFailed(format!(
                     "Mainline DHT put_mutable timed out after {}s",
                     self.dht_timeout.as_secs()
                 ))),
@@ -293,7 +293,7 @@ impl DhtClient for PkarrDhtClient {
     fn resolve(
         &self,
         public_key: &[u8; 32],
-    ) -> impl Future<Output = Result<Option<DhtRecord>, IdentityError>> + Send {
+    ) -> impl Future<Output = Result<Option<DhtRecord>, DhtError>> + Send {
         async move {
             debug!("resolving BEP44 mutable item from Mainline DHT");
 
@@ -409,14 +409,14 @@ impl PkarrDhtClientBuilder {
     ///
     /// # Errors
     ///
-    /// Returns [`IdentityError::DhtPublishFailed`] if the Mainline DHT
+    /// Returns [`DhtError::DhtPublishFailed`] if the Mainline DHT
     /// client cannot be created (e.g., socket binding failure).
-    pub fn build(self) -> Result<PkarrDhtClient, IdentityError> {
+    pub fn build(self) -> Result<PkarrDhtClient, DhtError> {
         // Create the Mainline DHT client in client mode (not server).
         // Client mode participates in the DHT for lookups and stores
         // without serving as a long-running DHT node.
         let dht = Dht::client().map_err(|e| {
-            IdentityError::DhtPublishFailed(format!("failed to create Mainline DHT client: {e}"))
+            DhtError::DhtPublishFailed(format!("failed to create Mainline DHT client: {e}"))
         })?;
 
         let async_dht = dht.as_async();
@@ -430,7 +430,7 @@ impl PkarrDhtClientBuilder {
                 .user_agent("scp-identity/0.1.0")
                 .build()
                 .map_err(|e| {
-                    IdentityError::DhtPublishFailed(format!(
+                    DhtError::DhtPublishFailed(format!(
                         "failed to create HTTP client for gateway fallback: {e}"
                     ))
                 })?;

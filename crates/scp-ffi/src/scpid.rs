@@ -300,8 +300,9 @@ mod tests {
     use scp_ffi_common::error_codes as codes;
     use std::sync::Arc;
 
+    use scp_dht::InMemoryDhtClient;
     use scp_identity::resolver::DualLayerResolver;
-    use scp_identity::{DidCache, InMemoryDhtClient, NoOpRelayQuerier};
+    use scp_identity::{DidCache, NoOpRelayQuerier};
 
     fn default_scp() -> crate::scp::PyScp {
         crate::scp::PyScp::new_in_memory_for_test()

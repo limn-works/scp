@@ -35,8 +35,9 @@ use std::time::Duration;
 use zeroize::Zeroizing;
 
 use scp_clock::SystemClock;
+use scp_dht::{InMemoryDhtClient, PkarrDhtClient};
 use scp_identity::dht::SequenceStore;
-use scp_identity::{DidCache, DidDht, IdentityError, InMemoryDhtClient, PkarrDhtClient};
+use scp_identity::{DidCache, DidDht, IdentityError};
 use scp_platform::KeyCustody;
 use scp_platform::sqlite::{SqliteKeyCustody, SqliteStorage};
 use scp_platform::traits::Storage;
@@ -1331,7 +1332,7 @@ where
 /// [`NoOpRelayQuerier`](scp_identity::resolver::NoOpRelayQuerier): the node's own
 /// loopback relay is a protocol-unaware blob pipe (§10.4), not a DID-document
 /// QUERY source, so DID resolution flows through the DHT layer (and cache).
-fn build_shared_cache_key_resolver<D: scp_identity::dht_client::DhtClient + 'static>(
+fn build_shared_cache_key_resolver<D: scp_dht::DhtClient + 'static>(
     dht_client: Arc<D>,
     cache: Arc<DidCache>,
     handle: tokio::runtime::Handle,
@@ -1858,7 +1859,7 @@ impl<S: Storage + 'static> SequenceStore for StorageSequenceStore<S> {
 
 /// Creates a BEP44 sequence-initialization callback for a `DidDht` method.
 #[must_use]
-pub fn make_seq_init<D: scp_identity::DhtClient + 'static>(
+pub fn make_seq_init<D: scp_dht::DhtClient + 'static>(
     did_method: Arc<DidDht<D, SystemClock>>,
 ) -> SeqInitFn {
     Box::new(move |did| Box::pin(async move { did_method.initialize_sequence(&did).await }))
@@ -2634,7 +2635,7 @@ mod tests {
         dht: &InMemoryDhtClient,
     ) -> (String, ed25519_dalek::VerifyingKey) {
         use ed25519_dalek::{Signer, SigningKey};
-        use scp_identity::DhtClient;
+        use scp_dht::DhtClient;
 
         // Distinct identity (#0) and active (#active) keys.
         let identity_signing = SigningKey::from_bytes(&[11u8; 32]);
@@ -2661,7 +2662,7 @@ mod tests {
 
         // BEP44-sign the serialized document with the identity key (seq = 1).
         let value = doc.to_json().expect("doc serializes").into_bytes();
-        let signable = scp_identity::dht::bep44_signable(&value, 1);
+        let signable = scp_dht::bep44_signable(&value, 1);
         let signature: [u8; 64] = identity_signing.sign(&signable).to_bytes();
         dht.publish(identity_public.as_bytes(), &signature, &value, 1)
             .await

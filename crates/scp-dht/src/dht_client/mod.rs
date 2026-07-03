@@ -16,7 +16,7 @@ use std::collections::HashMap;
 
 use tokio::sync::Mutex;
 
-use super::IdentityError;
+use crate::DhtError;
 
 /// Abstraction over BEP44 signed mutable item operations on a DHT.
 ///
@@ -41,14 +41,14 @@ pub trait DhtClient: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns [`IdentityError::DhtPublishFailed`] if the publish operation fails.
+    /// Returns [`DhtError::DhtPublishFailed`] if the publish operation fails.
     fn publish(
         &self,
         public_key: &[u8; 32],
         signature: &[u8; 64],
         value: &[u8],
         seq: u64,
-    ) -> impl Future<Output = Result<(), IdentityError>> + Send;
+    ) -> impl Future<Output = Result<(), DhtError>> + Send;
 
     /// Resolves a BEP44 signed mutable item from the DHT.
     ///
@@ -63,11 +63,11 @@ pub trait DhtClient: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns [`IdentityError::DhtResolveFailed`] if the lookup operation fails.
+    /// Returns [`DhtError::DhtResolveFailed`] if the lookup operation fails.
     fn resolve(
         &self,
         public_key: &[u8; 32],
-    ) -> impl Future<Output = Result<Option<DhtRecord>, IdentityError>> + Send;
+    ) -> impl Future<Output = Result<Option<DhtRecord>, DhtError>> + Send;
 }
 
 /// A BEP44 record retrieved from the DHT.
@@ -129,7 +129,7 @@ impl DhtClient for InMemoryDhtClient {
         signature: &[u8; 64],
         value: &[u8],
         seq: u64,
-    ) -> impl Future<Output = Result<(), IdentityError>> + Send {
+    ) -> impl Future<Output = Result<(), DhtError>> + Send {
         async move {
             let mut items = self.items.lock().await;
             let key = *public_key;
@@ -159,7 +159,7 @@ impl DhtClient for InMemoryDhtClient {
     fn resolve(
         &self,
         public_key: &[u8; 32],
-    ) -> impl Future<Output = Result<Option<DhtRecord>, IdentityError>> + Send {
+    ) -> impl Future<Output = Result<Option<DhtRecord>, DhtError>> + Send {
         async move {
             let items = self.items.lock().await;
             let record = items.get(public_key).map(|item| DhtRecord {

@@ -23,10 +23,11 @@ use std::sync::Arc;
 use pyo3::prelude::*;
 use zeroize::Zeroizing;
 
+use scp_dht::InMemoryDhtClient;
 use scp_ffi_common::server::{
     self, ConcreteDidMethod, NodeIdentity, RunningNode, RunningRelay, ServerError,
 };
-use scp_identity::{DidCache, InMemoryDhtClient};
+use scp_identity::DidCache;
 use scp_node::NodeError;
 use scp_transport::relay::connection::{RelayUrlSource, SourcedRelayUrl};
 

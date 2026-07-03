@@ -234,9 +234,10 @@ mod tests {
     // In-memory-custody-only helpers — used solely by the feature-gated
     // `scpid_sign` tests that register an identity via the in-memory backend.
     #[cfg(feature = "allow_in_memory_custody")]
-    use scp_identity::resolver::DualLayerResolver;
+    use scp_dht::InMemoryDhtClient;
     #[cfg(feature = "allow_in_memory_custody")]
-    use scp_identity::{DidCache, InMemoryDhtClient, NoOpRelayQuerier};
+    use scp_identity::resolver::DualLayerResolver;
+    use scp_identity::{DidCache, NoOpRelayQuerier};
     #[cfg(feature = "allow_in_memory_custody")]
     use std::sync::Arc;
 

@@ -36,7 +36,6 @@
 pub mod cache;
 pub mod config;
 pub mod dht;
-pub mod dht_client;
 pub mod republish;
 pub mod resolution;
 pub mod resolver;
@@ -46,11 +45,8 @@ pub use config::{CreatedIdentity, Identity, IdentityConfig, NoPersistence};
 pub use dht::{
     DidDht, InMemorySequenceStore, MigrationOutcome, MigrationPartialState, MigrationResumePhase,
     PostResolveHook, SequenceStore, did_from_ed25519_public_key, extract_public_key,
-    verify_bep44_signature, verify_migration, verify_self_certification,
+    verify_migration, verify_self_certification,
 };
-pub use dht_client::{DhtClient, InMemoryDhtClient};
-#[cfg(feature = "production-dht")]
-pub use dht_client::{PkarrDhtClient, PkarrDhtClientBuilder};
 pub use republish::RepublishManager;
 pub use resolution::{
     InMemoryRelayQuerier, RelayQuerier, RelayQueryRecord, RelayResolveResult, did_routing_id,
@@ -287,6 +283,23 @@ pub enum IdentityError {
         #[source]
         source: Box<Self>,
     },
+}
+
+/// Maps the DHT transport-layer error ([`scp_dht::DhtError`]) into the
+/// identically-named [`IdentityError`] variant, preserving the message.
+///
+/// This is the one-way seam that lets the DID-method layer here depend on the
+/// transport crate (`scp-identity` → `scp-dht`) while surfacing a single error
+/// taxonomy to its own callers. The `?` operator in this crate's DHT
+/// publish/resolve paths relies on it (ADR-057 T1c).
+impl From<scp_dht::DhtError> for IdentityError {
+    fn from(err: scp_dht::DhtError) -> Self {
+        match err {
+            scp_dht::DhtError::DhtPublishFailed(msg) => Self::DhtPublishFailed(msg),
+            scp_dht::DhtError::DhtResolveFailed(msg) => Self::DhtResolveFailed(msg),
+            scp_dht::DhtError::Bep44SignatureInvalid(msg) => Self::Bep44SignatureInvalid(msg),
+        }
+    }
 }
 
 impl IdentityError {

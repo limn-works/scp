@@ -42,6 +42,7 @@ scp-media = { path = "../../scp-media" }
 scp-clock = { path = "../../scp-clock" }
 scp-did = { path = "../../scp-did" }
 scp-identity = { path = "../../scp-identity" }
+scp-dht = { path = "../../scp-dht" }
 scp-event-log = { path = "../../scp-event-log" }
 scp-ffi-common = { path = "../common", features = ["custody"] }
 scp-node = { path = "../../scp-node", features = ["allow_unencrypted_storage"], optional = true }

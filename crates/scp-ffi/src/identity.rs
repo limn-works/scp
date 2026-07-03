@@ -44,11 +44,9 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
 use scp_clock::Clock;
+use scp_dht::InMemoryDhtClient;
 use scp_did::DidDocument;
-use scp_identity::{
-    DidCache, DidDht, DidMethod, DualLayerResolver, InMemoryDhtClient, NoOpRelayQuerier,
-    ScpIdentity,
-};
+use scp_identity::{DidCache, DidDht, DidMethod, DualLayerResolver, NoOpRelayQuerier, ScpIdentity};
 use scp_platform::file::FileKeyCustody;
 #[cfg(feature = "allow_in_memory_custody")]
 use scp_platform::testing::InMemoryKeyCustody;
@@ -114,7 +112,7 @@ fn ensure_did_resolver_initialized_on(bi: &PyBridgeInstance, handle: tokio::runt
 ///
 /// Constructs a BEP44 signed mutable item (32-byte public key, 64-byte
 /// signature, document JSON, sequence number 1) and calls
-/// [`scp_identity::dht_client::DhtClient::publish`]. Best-effort: errors are
+/// [`scp_dht::DhtClient::publish`]. Best-effort: errors are
 /// logged but never fail identity creation (the document is still registered
 /// locally; only resolver discoverability is affected).
 ///
@@ -133,7 +131,7 @@ async fn publish_to_resolver_dht_for(
     document: &DidDocument,
     custody: &FfiKeyCustody,
 ) {
-    use scp_identity::dht_client::DhtClient as _;
+    use scp_dht::DhtClient as _;
 
     let Some(dht_client) = crate::runtime::resolver_dht_client(bi) else {
         // Resolver not initialized on this instance; nothing to seed.
@@ -161,7 +159,7 @@ async fn publish_to_resolver_dht_for(
 
     // Build the BEP44 signable payload and sign it with the identity key.
     let seq: u64 = 1;
-    let signable = scp_identity::dht::bep44_signable(value, seq);
+    let signable = scp_dht::bep44_signable(value, seq);
     let sig_bytes = match custody.sign(&identity.identity_key, &signable).await {
         Ok(sig) => sig.into_bytes(),
         Err(e) => {

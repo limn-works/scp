@@ -30,8 +30,8 @@ use scp_transport::quic::listener::SCP_ALPN;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use scp_clock::SystemClock;
+use scp_dht::InMemoryDhtClient;
 use scp_identity::DidCache;
-use scp_identity::InMemoryDhtClient;
 use scp_identity::dht::DidDht;
 use scp_node::{ApplicationNode, DhtMode, IdentitySource, Node, NodeConfig, Reach};
 use scp_platform::testing::{InMemoryKeyCustody, InMemoryStorage};

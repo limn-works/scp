@@ -1290,7 +1290,7 @@ where
 /// into the same client the resolver reads from, so the DID resolves for
 /// signature verification (UCAN validation, governance vote verification).
 #[must_use]
-pub fn resolver_dht_client(bi: &PyBridgeInstance) -> Option<Arc<scp_identity::InMemoryDhtClient>> {
+pub fn resolver_dht_client(bi: &PyBridgeInstance) -> Option<Arc<scp_dht::InMemoryDhtClient>> {
     bi.core.dht_client().map(Arc::clone)
 }
 
@@ -1298,10 +1298,7 @@ pub fn resolver_dht_client(bi: &PyBridgeInstance) -> Option<Arc<scp_identity::In
 ///
 /// Called once during resolver initialization with the SAME `InMemoryDhtClient`
 /// `Arc` the resolver was built over. Subsequent calls are no-ops.
-pub fn set_resolver_dht_client(
-    bi: &PyBridgeInstance,
-    client: Arc<scp_identity::InMemoryDhtClient>,
-) {
+pub fn set_resolver_dht_client(bi: &PyBridgeInstance, client: Arc<scp_dht::InMemoryDhtClient>) {
     bi.core.set_dht_client(client);
 }
 

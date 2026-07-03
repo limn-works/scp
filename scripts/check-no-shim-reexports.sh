@@ -5,14 +5,14 @@
 # a moved or dissolved capability crate as a shim standing in for a real import
 # update. Every consumer must import the owning crate directly
 # (`use scp_clock::Clock`, `use scp_crypto::verify_ed25519_signature`,
-# `use scp_did::DID`, `use scp_mls::…`). The ONLY sanctioned aggregation surface
+# `use scp_did::DID`, `use scp_dht::DhtClient`, `use scp_mls::…`). The ONLY sanctioned aggregation surface
 # is the `scp-core` facade.
 #
 # Scope of this check — the canonical `pub use` shim spellings only. It matches
-# `pub use [::]scp_{clock,crypto,did,mls}` in whole-crate, path (`::Item`), and
+# `pub use [::]scp_{clock,crypto,did,dht,mls}` in whole-crate, path (`::Item`), and
 # `as`-rename forms, over EVERY `src/` tree under `crates/` (including nested
 # workspace members like `crates/scp-ffi/{common,napi,uniffi}/src/`). It is a
-# positive, closed check over exactly the four moved/dissolved capability crates
+# positive, closed check over exactly the five moved/split capability crates
 # — NOT an open-ended denylist chasing spellings.
 #
 # Deliberately OUT of scope (audit-policed, not gated): exotic laundering such
@@ -30,7 +30,7 @@
 # a `pub use` quoted wholly inside such a block is not distinguished from code.
 #
 # Implicit coupling (documented so it is revisited, not silently relied on):
-# the canonical single-line `pub use …scp_{clock,crypto,did,mls}…` form this
+# the canonical single-line `pub use …scp_{clock,crypto,did,dht,mls}…` form this
 # gate matches is guaranteed by the rustfmt CI job — rustfmt normalizes
 # `pub use ::scp_x` and multi-line `pub use scp_x::{\n  …\n}` splits back into
 # the single-line, matchable form this grep expects. If the fmt gate is ever
@@ -44,7 +44,7 @@ cd "$(git rev-parse --show-toplevel)"
 echo "Checking for forbidden shim re-exports (ADR-057 Amendment)..."
 
 # Closed set of moved/dissolved capability crates whose re-export is a shim.
-crates=(scp_clock scp_crypto scp_did scp_mls)
+crates=(scp_clock scp_crypto scp_did scp_dht scp_mls)
 
 # Rust module name -> owning source directory (self re-exports are allowed).
 owning_dir() {
@@ -52,6 +52,7 @@ owning_dir() {
         scp_clock)  echo "crates/scp-clock/src/" ;;
         scp_crypto) echo "crates/scp-crypto/src/" ;;
         scp_did)    echo "crates/scp-did/src/" ;;
+        scp_dht)    echo "crates/scp-dht/src/" ;;
         scp_mls)    echo "crates/scp-mls/src/" ;;
     esac
 }
@@ -113,4 +114,4 @@ if [ "$violations" -ne 0 ]; then
     exit 1
 fi
 
-echo "no-shim-reexports check passed: no forbidden \`pub use\` shims of scp_clock/scp_crypto/scp_did/scp_mls."
+echo "no-shim-reexports check passed: no forbidden \`pub use\` shims of scp_clock/scp_crypto/scp_did/scp_dht/scp_mls."

@@ -25,8 +25,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use scp_dht::DhtClient;
 use scp_did::DID;
-use scp_identity::dht_client::DhtClient;
 use scp_identity::{DidDht, DidMethod};
 
 use scp_protocol::discovery::DiscoveryError;
@@ -234,9 +234,9 @@ mod tests {
 
     use super::*;
     use scp_clock::SystemClock;
+    use scp_dht::InMemoryDhtClient;
     use scp_identity::DidDht;
     use scp_identity::cache::DidCache;
-    use scp_identity::dht_client::InMemoryDhtClient;
 
     use scp_platform::testing::{InMemoryKeyCustody, InMemoryPreRotationCustody};
 
