@@ -1391,6 +1391,24 @@ fn derive_member_pseudonym(
     })
 }
 
+/// Bridge-level local-custody gate for the bare-`DID` join-side bootstraps
+/// ([`crate::scp::PyScp::reserve_key_package`] /
+/// [`crate::scp::PyScp::context_join_from_welcome`]), mirroring the trust model
+/// of `context_create`: a node-level bootstrap only runs on behalf of an
+/// identity this bridge locally custodies.
+///
+/// Presence in the identity registry is exactly the local-custody signal
+/// `context_create` relies on — its pseudonym derivation touches the same
+/// registry entry's custody provider (see [`derive_member_pseudonym`]). Reserve
+/// derives no pseudonym, so it needs this explicit up-front check; the
+/// Welcome-join path enforces the identical gate implicitly via
+/// `derive_member_pseudonym`. Fails closed with the identity-not-found error
+/// when the DID is not a locally-custodied identity.
+fn ensure_local_custody(bi: &crate::runtime::PyBridgeInstance, did: &str) -> PyResult<()> {
+    crate::runtime::with_identity(bi, did, |_| Ok(()))
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+}
+
 /// Validates all user-controlled string fields on a governance action.
 #[cfg(test)]
 fn validate_governance_action_strings(
@@ -2268,6 +2286,195 @@ impl crate::scp::PyScp {
         }
 
         Ok(())
+    }
+
+    /// Reserves one of the owning identity's pooled MLS `KeyPackage`s for a
+    /// spawn-from-Welcome join, returning the opaque `(reservation_id,
+    /// key_package_public_bytes)` pair.
+    ///
+    /// The join-side peer of [`context_create`](Self::context_create): a node
+    /// that intends to JOIN a context by receiving a Welcome first reserves a
+    /// single-use `KeyPackage` under its own identity. The returned PUBLIC
+    /// `KeyPackage` bytes are handed to the context creator (out of band), who
+    /// adds them to its MLS group to mint a Welcome addressed to this
+    /// reservation; the returned `reservation_id` is passed back to
+    /// [`context_join_from_welcome`](Self::context_join_from_welcome) so the
+    /// fused consume can match the join. The private signer state never leaves
+    /// the node's `KeyPackage` actor — only PUBLIC bytes cross the FFI boundary.
+    ///
+    /// Local-identity custody is enforced at the bridge (the same trust model as
+    /// `context_create`): `owning_did` MUST be a locally-custodied identity.
+    ///
+    /// # Arguments
+    ///
+    /// * `owning_did` -- DID of the LOCAL identity reserving the `KeyPackage`.
+    ///
+    /// # Returns
+    ///
+    /// `(reservation_id, key_package_public_bytes)` -- an opaque reservation id
+    /// string and the PUBLIC MLS `KeyPackage` bytes (Python `(str, bytes)`).
+    ///
+    /// # Errors
+    ///
+    /// Returns `RuntimeError` if `owning_did` is not a locally-custodied
+    /// identity, or if the reservation fails (providers not wired, empty pool).
+    #[pyo3(name = "reserve_key_package", signature = (owning_did))]
+    pub fn reserve_key_package(&self, owning_did: &str) -> PyResult<(String, Vec<u8>)> {
+        let bi = &*self.inner;
+        validate::validate_did(owning_did)?;
+        // Local-custody gate — same trust model as context_create.
+        ensure_local_custody(bi, owning_did)?;
+
+        // reserve_key_package can be a node's FIRST context op (it joins before
+        // it ever creates), so ensure the supervisor is attached first — the
+        // same idempotent init context_join performs.
+        #[cfg(test)]
+        crate::runtime::init_context_manager_for_test(bi);
+        #[cfg(not(test))]
+        crate::runtime::init_context_manager(bi, owning_did);
+
+        let rt = crate::runtime()?;
+        let sup =
+            crate::runtime::supervisor(bi).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let sup = Arc::clone(sup);
+        let owning = scp_identity::DID(owning_did.to_owned());
+        let (reservation_id, kp_public) = rt
+            .block_on(async move { sup.reserve_key_package(owning).await })
+            .map_err(|e| PyRuntimeError::new_err(format!("reserve_key_package failed: {e}")))?;
+        Ok((reservation_id.to_string(), kp_public))
+    }
+
+    /// Joins an existing SCP context by processing a received MLS Welcome,
+    /// standing the local (joiner) identity up as a send-capable participant.
+    ///
+    /// Completes the reserve → Welcome → join handshake begun by
+    /// [`reserve_key_package`](Self::reserve_key_package): given the Welcome the
+    /// context creator minted for a previously-reserved `KeyPackage`, this installs
+    /// the joined MLS group, derives the joiner's §9.10.4 routing pseudonym,
+    /// persists the initial keyed snapshot fail-closed, and registers a context
+    /// actor. Without it a Welcome-joined node can DECRYPT but cannot SEND (no
+    /// actor-backed handle).
+    ///
+    /// Local-identity custody of the JOINER (`owning_did`) is enforced at the
+    /// bridge exactly as `context_create` enforces it for the creator: the
+    /// joiner's routing pseudonym is DERIVED from its locally-custodied identity
+    /// (never caller-supplied), so a non-custodied joiner hard-fails at the
+    /// derivation seam with the canonical `SCP-IDENT-1054` before the single-use
+    /// `KeyPackage` is consumed.
+    ///
+    /// # Arguments
+    ///
+    /// * `owning_did` -- DID of the LOCAL (joiner) identity. Its custody derives
+    ///   the routing pseudonym; passed separately from `creator_did` so the two
+    ///   cannot be transposed.
+    /// * `creator_did` -- DID of the context creator / admin (from the legible
+    ///   params).
+    /// * `context_id` -- Canonical 64-hex context id (ADR-056).
+    /// * `params` -- Legible context parameters (a Python dict; see
+    ///   [`PyContextParams`]).
+    /// * `reservation_id` -- The opaque reservation id string returned by
+    ///   `reserve_key_package` for the `KeyPackage` this Welcome addresses.
+    /// * `welcome_bytes` -- The TLS-serialized MLS Welcome message (Python
+    ///   `bytes`).
+    ///
+    /// # Returns
+    ///
+    /// A [`PyContextHandle`] in the "active" state for the joined context.
+    ///
+    /// # Errors
+    ///
+    /// Returns `RuntimeError` if the joiner is not locally custodied, the params
+    /// are invalid, the reservation id is malformed, or the spawn fails
+    /// (bad/duplicate Welcome, single-use replay, first-writer-wins collision,
+    /// or fail-closed persist failure).
+    #[pyo3(
+        name = "context_join_from_welcome",
+        signature = (owning_did, creator_did, context_id, params, reservation_id, welcome_bytes)
+    )]
+    pub fn context_join_from_welcome(
+        &self,
+        owning_did: &str,
+        creator_did: &str,
+        context_id: &str,
+        params: &Bound<'_, PyDict>,
+        reservation_id: &str,
+        welcome_bytes: &[u8],
+    ) -> PyResult<PyContextHandle> {
+        let bi = &*self.inner;
+        validate::validate_did(owning_did)?;
+        validate::validate_did(creator_did)?;
+        validate::validate_context_id(context_id)?;
+
+        // Parse legible params eagerly (before any async work).
+        let parsed = PyContextParams::from_py_dict(params)?;
+        let core_params = build_core_context_params(&parsed)?;
+
+        // spawn-from-Welcome always stands up an ENCRYPTED context; ensure the
+        // node's supervisor is attached first (this may be the joiner's first
+        // context op — the same idempotent init context_join performs).
+        #[cfg(test)]
+        crate::runtime::init_context_manager_for_test(bi);
+        #[cfg(not(test))]
+        crate::runtime::init_context_manager(bi, owning_did);
+
+        // §9.10.4 + local-custody enforcement: DERIVE the joiner's routing
+        // pseudonym from its locally-custodied identity — never caller-supplied.
+        // This is the SAME custody gate context_create uses; a non-custodied
+        // joiner hard-fails here with SCP-IDENT-1054 before the single-use
+        // KeyPackage is consumed.
+        let local_pseudonym = derive_member_pseudonym(bi, owning_did, context_id)?;
+
+        // Reconstruct the opaque reservation id via its sanctioned transparent
+        // serde form (a bare string): the id round-trips through the FFI as a
+        // string. It is a lookup key, not a capability — a bogus id simply fails
+        // the fused consume match downstream, it grants nothing.
+        let reservation: scp_core::context::supervisor::ReservationId =
+            serde_json::from_value(serde_json::Value::String(reservation_id.to_owned()))
+                .map_err(|e| PyRuntimeError::new_err(format!("invalid reservation id: {e}")))?;
+
+        let rt = crate::runtime()?;
+        let sup =
+            crate::runtime::supervisor(bi).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let sup = Arc::clone(sup);
+
+        let owning = scp_identity::DID(owning_did.to_owned());
+        let req = scp_core::context::supervisor::WelcomeJoinRequest {
+            creator_did: scp_identity::DID(creator_did.to_owned()),
+            context_id: context_id.to_owned(),
+            params: core_params,
+            reservation_id: reservation,
+            welcome_bytes: welcome_bytes.to_vec(),
+            local_pseudonym: Some(local_pseudonym),
+        };
+        rt.block_on(async move { sup.spawn_actor_from_welcome(owning, req).await })
+            .map_err(|e| {
+                PyRuntimeError::new_err(format!("context_join_from_welcome failed: {e}"))
+            })?;
+
+        // Register the bridge-side FFI state (ToolRegistry / EventLog / RoleState)
+        // so tool/UCAN/event_log bridge ops can resolve the joined context. The
+        // creator is the role-state admin (Welcome-derived); the joiner is added
+        // as a member. Mirrors context_create's registration plus context_join's
+        // member insertion.
+        crate::runtime::register_ffi_state(bi, context_id, creator_did, &parsed.ceiling).map_err(
+            |e| PyRuntimeError::new_err(format!("failed to register context state: {e}")),
+        )?;
+        crate::runtime::with_ffi_state(bi, context_id, |st| {
+            st.role_state.members.insert(owning_did.to_owned());
+            Ok(())
+        })
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+        let handle =
+            PyContextHandle::new(bi, context_id.to_owned(), creator_did.to_owned(), parsed);
+        {
+            let mut guard = handle
+                .state
+                .lock()
+                .map_err(|_| PyRuntimeError::new_err("context state lock is poisoned"))?;
+            "active".clone_into(&mut guard);
+        }
+        Ok(handle)
     }
 
     /// Test-only: seed a peer's per-context pseudonym routing ID (§9.10.4)
@@ -5577,6 +5784,76 @@ mod tests {
             "broadcast create yields an active context handle"
         );
         assert_eq!(handle.mode(), "broadcast", "handle reflects broadcast mode");
+    }
+
+    /// ADR-049 Phase 2J: `reserve_key_package` enforces local custody at the
+    /// bridge — a non-locally-custodied `owning_did` is rejected BEFORE any
+    /// supervisor work (no `KeyPackage` pool is touched).
+    ///
+    /// Drives the REAL `reserve_key_package` entry point with an unregistered
+    /// DID. The bridge's `ensure_local_custody` gate (the same trust model as
+    /// `context_create`, which relies on identity-registry membership) fails
+    /// closed with the identity-not-found error. This pins the bridge-side
+    /// custody enforcement that guards the bare-`DID` join-side bootstrap. The
+    /// end-to-end reserve→spawn happy path (which needs wired MLS providers and
+    /// a real creator-minted Welcome) is covered at the runtime layer by
+    /// `spawn_from_welcome_tests.rs` and by the Python E2E harness.
+    #[test]
+    fn reserve_key_package_rejects_non_locally_custodied_identity() {
+        crate::init_runtime().ok();
+        let bi_arc = __bi();
+        let scp = crate::scp::PyScp {
+            inner: std::sync::Arc::clone(&bi_arc),
+        };
+        let err = scp
+            .reserve_key_package("did:dht:z6MkNoSuchReserveIdentity")
+            .expect_err("reserve for a non-locally-custodied identity must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not found in registry"),
+            "expected local-custody rejection (identity not found in registry), got: {msg}"
+        );
+    }
+
+    /// ADR-049 Phase 2J: `context_join_from_welcome` enforces local custody of
+    /// the JOINER at the bridge — a non-locally-custodied `owning_did`
+    /// hard-fails at the pseudonym-derivation seam (the SAME custody gate
+    /// `context_create` uses) BEFORE the single-use `KeyPackage` is consumed.
+    ///
+    /// Drives the REAL `context_join_from_welcome` entry point with an
+    /// unregistered joiner. Because the joiner's routing pseudonym is DERIVED
+    /// from its locally-custodied identity (never caller-supplied), the registry
+    /// miss is remapped to the canonical `SCP-IDENT-1054`, exactly as the
+    /// encrypted `context_create` / `context_join` paths do. The `reservation_id`
+    /// and `welcome_bytes` are dummies here — derivation runs before either is
+    /// touched, so this is not false-green: were the custody gate removed, the
+    /// call would proceed past derivation and fail later for an unrelated reason
+    /// (a bogus reservation / Welcome), not with `SCP-IDENT-1054`.
+    #[test]
+    fn context_join_from_welcome_rejects_non_locally_custodied_joiner() {
+        crate::init_runtime().ok();
+        let bi_arc = __bi();
+        let scp = crate::scp::PyScp {
+            inner: std::sync::Arc::clone(&bi_arc),
+        };
+        let err = Python::with_gil(|py| {
+            let params = PyDict::new(py);
+            params.set_item("mode", "encrypted").unwrap();
+            scp.context_join_from_welcome(
+                "did:dht:z6MkNoSuchJoinFromWelcomeJoiner",
+                "did:dht:z6MkSomeCreator",
+                &"0".repeat(64),
+                &params,
+                "not-a-real-reservation",
+                b"not-a-real-welcome",
+            )
+            .expect_err("join-from-Welcome for a non-locally-custodied joiner must be rejected")
+            .to_string()
+        });
+        assert!(
+            err.contains("SCP-IDENT-1054"),
+            "expected joiner local-custody hard-fail SCP-IDENT-1054, got: {err}"
+        );
     }
 
     /// Test helper: execute a governance action through the GENUINE
