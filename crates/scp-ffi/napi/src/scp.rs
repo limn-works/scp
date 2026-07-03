@@ -3100,7 +3100,7 @@ impl Scp {
         handle: &NapiContextHandle,
         token: String,
         capability: String,
-        presenting_agent_did: Option<String>,
+        presenting_agent_did: String,
         proof_tokens: Option<Vec<String>>,
     ) -> napi::Result<()> {
         crate::napi_check_handle!(&self.inner.core, handle);
@@ -3133,7 +3133,7 @@ impl Scp {
         handle: &NapiContextHandle,
         token: String,
         capability: Option<String>,
-        presenting_agent_did: Option<String>,
+        presenting_agent_did: String,
         proof_tokens: Option<Vec<String>>,
     ) -> napi::Result<crate::ucan::NapiCapabilityValidation> {
         crate::napi_check_handle!(&self.inner.core, handle);
