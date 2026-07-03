@@ -561,8 +561,8 @@ func opUcanEvaluateStructured(_ req: BridgeRequest) async throws -> [String: JSO
     let result = try await scp.ucanEvaluate(
         handle: handle,
         token: token.encoded(),
+        presentingAgentDid: memberDid,
         capability: required,
-        presentingAgentDid: nil,
         proofTokens: nil
     )
     return [

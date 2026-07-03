@@ -488,7 +488,7 @@ private suspend fun opUcanEvaluateStructured(args: JsonObject): JsonObject =
         val handle = scp.contextCreate(identity, buildContextParams(ceiling))
         val token = scp.ucanMint(handle, memberDid, capabilities, null)
         val required = "scp:ctx:${handle.contextId()}/$requiredCap"
-        val result = scp.ucanEvaluate(handle, token.encoded(), required, null, null)
+        val result = scp.ucanEvaluate(handle, token.encoded(), memberDid, required, null)
         buildJsonObject {
             put("tokens_valid", JsonPrimitive(result.tokensValid))
             put("signatures_valid", JsonPrimitive(result.signaturesValid))

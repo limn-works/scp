@@ -129,10 +129,12 @@ def discover(query: str) -> list[dict[str, Any]]:
     return [dict(r) for r in results]
 
 
-#: Alias for :func:`discover` matching the cross-SDK ``discover_contexts``
-#: capability name (TypeScript ``discoverContexts``); both spellings refer to
-#: the same client-side context discovery op.
-discover_contexts = discover
+def discover_contexts(query: str) -> list[dict[str, Any]]:
+    """Alias for :func:`discover` matching the cross-SDK ``discover_contexts``
+    capability name (TypeScript ``discoverContexts``); both spellings refer to
+    the same client-side context discovery op.
+    """
+    return discover(query)
 
 
 # ---------------------------------------------------------------------------
