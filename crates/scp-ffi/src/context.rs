@@ -2351,9 +2351,16 @@ impl crate::scp::PyScp {
     /// [`reserve_key_package`](Self::reserve_key_package): given the Welcome the
     /// context creator minted for a previously-reserved `KeyPackage`, this installs
     /// the joined MLS group, derives the joiner's §9.10.4 routing pseudonym,
-    /// persists the initial keyed snapshot fail-closed, and registers a context
-    /// actor. Without it a Welcome-joined node can DECRYPT but cannot SEND (no
-    /// actor-backed handle).
+    /// persists the initial keyed snapshot fail-closed, registers a context
+    /// actor, and records the joined context in the known-contexts discovery
+    /// registry (so `py_mcp_load_contexts` surfaces it, exactly as
+    /// [`context_create`](Self::context_create) does). Without it a Welcome-joined
+    /// node can DECRYPT but cannot SEND (no actor-backed handle).
+    ///
+    /// The bridge-side FFI state is registered as a REVERSIBLE precheck BEFORE
+    /// the irreversible runtime join and rolled back on failure, mirroring
+    /// `context_create`: there is no path where the runtime join commits but
+    /// bridge state errors, and no leaked FFI/discovery state when the join fails.
     ///
     /// Local-identity custody of the JOINER (`owning_did`) is enforced at the
     /// bridge exactly as `context_create` enforces it for the creator: the
@@ -2427,10 +2434,41 @@ impl crate::scp::PyScp {
         // Reconstruct the opaque reservation id via its sanctioned transparent
         // serde form (a bare string): the id round-trips through the FFI as a
         // string. It is a lookup key, not a capability — a bogus id simply fails
-        // the fused consume match downstream, it grants nothing.
+        // the fused consume match downstream, it grants nothing. Parsed BEFORE
+        // any registry mutation so a malformed id can't leave orphaned state.
         let reservation: scp_core::context::supervisor::ReservationId =
             serde_json::from_value(serde_json::Value::String(reservation_id.to_owned()))
                 .map_err(|e| PyRuntimeError::new_err(format!("invalid reservation id: {e}")))?;
+
+        // Register the bridge-side FFI state (ToolRegistry / EventLog / RoleState)
+        // as a REVERSIBLE precheck BEFORE the irreversible runtime join. Mirrors
+        // `context_create`, which registers FFI state first and rolls it back via
+        // `remove_context` if the runtime step fails. The creator is the
+        // role-state admin (Welcome-derived); the joiner is added as a member
+        // below.
+        //
+        // Ordering matters for two reasons:
+        //   1. `register_ffi_state` hard-errors on an already-registered context
+        //      (`Entry::Occupied`) — that collision fails the join HERE, BEFORE
+        //      `spawn_actor_from_welcome` consumes the single-use `KeyPackage`,
+        //      and leaves any pre-existing entry untouched (we must NOT roll back
+        //      state we did not create).
+        //   2. If the runtime join later fails, we roll THIS state back, so there
+        //      is no path where the join commits but bridge state errors, and no
+        //      leaked FFI state when the join fails.
+        crate::runtime::register_ffi_state(bi, context_id, creator_did, &parsed.ceiling).map_err(
+            |e| PyRuntimeError::new_err(format!("failed to register context state: {e}")),
+        )?;
+        // Insert the joiner as a member of the freshly-registered role state. On
+        // the (practically unreachable) failure of this insert into state we just
+        // created, roll it back so a failed join leaves nothing behind.
+        if let Err(e) = crate::runtime::with_ffi_state(bi, context_id, |st| {
+            st.role_state.members.insert(owning_did.to_owned());
+            Ok(())
+        }) {
+            crate::runtime::remove_context(bi, context_id);
+            return Err(PyRuntimeError::new_err(e.to_string()));
+        }
 
         let rt = crate::runtime()?;
         let sup =
@@ -2446,24 +2484,48 @@ impl crate::scp::PyScp {
             welcome_bytes: welcome_bytes.to_vec(),
             local_pseudonym: Some(local_pseudonym),
         };
-        rt.block_on(async move { sup.spawn_actor_from_welcome(owning, req).await })
-            .map_err(|e| {
-                PyRuntimeError::new_err(format!("context_join_from_welcome failed: {e}"))
-            })?;
+        // Irreversible: consume the KeyPackage, install the joined MLS group,
+        // persist the keyed snapshot, register the context actor. On failure,
+        // roll the reversible FFI state (and — via `remove_context` →
+        // `remove_ffi_state` — any known-context discovery entry) back so an
+        // errored join leaves no orphaned bridge state beside a runtime that
+        // never committed.
+        if let Err(e) = rt.block_on(async move { sup.spawn_actor_from_welcome(owning, req).await })
+        {
+            crate::runtime::remove_context(bi, context_id);
+            return Err(PyRuntimeError::new_err(format!(
+                "context_join_from_welcome failed: {e}"
+            )));
+        }
 
-        // Register the bridge-side FFI state (ToolRegistry / EventLog / RoleState)
-        // so tool/UCAN/event_log bridge ops can resolve the joined context. The
-        // creator is the role-state admin (Welcome-derived); the joiner is added
-        // as a member. Mirrors context_create's registration plus context_join's
-        // member insertion.
-        crate::runtime::register_ffi_state(bi, context_id, creator_did, &parsed.ceiling).map_err(
-            |e| PyRuntimeError::new_err(format!("failed to register context state: {e}")),
-        )?;
-        crate::runtime::with_ffi_state(bi, context_id, |st| {
-            st.role_state.members.insert(owning_did.to_owned());
-            Ok(())
-        })
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        // Runtime join committed. Register the context in the known-contexts
+        // discovery registry so a Welcome-joined context is surfaced by
+        // `py_mcp_load_contexts`, exactly as `context_create` does post-create.
+        // Mirrors `context_create`'s POST-success registration: infallible and
+        // idempotent (overwrites), so it is safe after the irreversible commit
+        // and needs no rollback. spawn-from-Welcome always stands up an ENCRYPTED
+        // context, so the routing id is the joiner's derived §9.10.4 pseudonym
+        // (`local_pseudonym` is `Copy`, still valid after the request move). The
+        // member is the JOINER (`owning_did`), matching the role-state member
+        // inserted above so `context_ids_for_member` / discovery agree.
+        {
+            let relay_url = match self.transport_status() {
+                Ok(status) => status.relay_url,
+                Err(e) => {
+                    tracing::warn!(
+                        "failed to query transport status during join registration: {e}"
+                    );
+                    None
+                }
+            };
+            let known = crate::runtime::KnownContext {
+                routing_id: local_pseudonym,
+                relay_url,
+                member_did: owning_did.to_owned(),
+                last_seen: scp_primitives::SystemClock.now_secs(),
+            };
+            crate::runtime::register_known_context_on(bi, context_id, known);
+        }
 
         let handle =
             PyContextHandle::new(bi, context_id.to_owned(), creator_did.to_owned(), parsed);
@@ -5854,6 +5916,137 @@ mod tests {
             err.contains("SCP-IDENT-1054"),
             "expected joiner local-custody hard-fail SCP-IDENT-1054, got: {err}"
         );
+    }
+
+    /// ADR-049 Phase 2J (orphaned-success fix): `context_join_from_welcome`
+    /// registers the bridge-side FFI state as a REVERSIBLE precheck BEFORE the
+    /// irreversible runtime join, and ROLLS IT BACK when the runtime join fails —
+    /// so a failed join leaves NO FFI state and NO known-context discovery entry
+    /// behind.
+    ///
+    /// Drives the REAL entry point with a locally-custodied joiner, so the
+    /// custody / pseudonym-derivation gate SUCCEEDS and control reaches the
+    /// register -> spawn seam, but with a bogus reservation + Welcome so
+    /// `spawn_actor_from_welcome` fails at the runtime layer (the joiner reserved
+    /// nothing, so the fused consume finds no matching reservation). The
+    /// assertion is on the observable post-condition: after the error, BOTH the
+    /// FFI state registry and the known-contexts registry are empty for the
+    /// context.
+    ///
+    /// Not false-green: custody SUCCEEDS here (real in-memory identity), so the
+    /// failure is the runtime join itself — exactly the path the rollback guards.
+    /// The explicit "no `SCP-IDENT-1054`" check pins that the register -> spawn
+    /// seam was actually exercised (not short-circuited at the upstream custody
+    /// gate). Were the rollback removed, the freshly-registered `FfiBridgeState`
+    /// would leak beside a runtime that never committed.
+    #[test]
+    #[cfg(feature = "allow_in_memory_custody")]
+    fn join_from_welcome_rolls_back_ffi_state_when_runtime_join_fails() {
+        pyo3::prepare_freethreaded_python();
+        crate::init_runtime().ok();
+        Python::with_gil(|py| {
+            let scp = crate::scp::PyScp::new_in_memory_for_test();
+            let bi = Arc::clone(&scp.inner);
+
+            // Locally-custodied joiner so the pseudonym-derivation custody gate
+            // passes and control reaches the register -> spawn seam.
+            let joiner = scp.identity_create(py, "in_memory", None).unwrap();
+            let joiner_did = joiner.did().to_owned();
+
+            let ctx_id = "a".repeat(64);
+            let params = PyDict::new(py);
+            params.set_item("mode", "encrypted").unwrap();
+
+            let err = scp
+                .context_join_from_welcome(
+                    &joiner_did,
+                    "did:dht:z6MkRollbackCreator",
+                    &ctx_id,
+                    &params,
+                    "bogus-reservation-id",
+                    b"bogus-welcome-bytes",
+                )
+                .expect_err("join with a bogus Welcome must fail at the runtime layer");
+            let msg = err.to_string();
+            assert!(
+                !msg.contains("SCP-IDENT-1054"),
+                "custody must have SUCCEEDED so the register -> spawn seam is exercised; \
+                 got a derivation error instead: {msg}"
+            );
+
+            // Post-condition: the reversible FFI state was rolled back — no
+            // orphaned bridge state, and no known-context discovery entry.
+            assert!(
+                crate::runtime::with_ffi_state(&bi, &ctx_id, |_| Ok(())).is_err(),
+                "FFI state must NOT survive a failed join"
+            );
+            let stats = crate::runtime::registry_stats(&bi);
+            assert_eq!(
+                stats.contexts, 0,
+                "no FFI context state may leak after a failed join"
+            );
+            assert_eq!(
+                stats.known_contexts, 0,
+                "no known-context discovery entry may leak after a failed join"
+            );
+        });
+    }
+
+    /// ADR-049 Phase 2J (orphaned-success fix): a pre-existing (`Occupied`)
+    /// FFI-state entry fails `context_join_from_welcome` at the
+    /// `register_ffi_state` precheck — which runs BEFORE
+    /// `spawn_actor_from_welcome` consumes the single-use `KeyPackage` — and does
+    /// NOT roll back the pre-existing entry (the bridge must never delete state
+    /// it did not create).
+    ///
+    /// Drives the REAL entry with a locally-custodied joiner (custody gate
+    /// passes) against a context whose FFI state is already registered. The
+    /// register-first ordering surfaces the collision as an `already registered`
+    /// error at the precheck, with the `KeyPackage` untouched; the pre-existing
+    /// entry SURVIVES the failed join.
+    #[test]
+    #[cfg(feature = "allow_in_memory_custody")]
+    fn join_from_welcome_occupied_ffi_state_fails_before_keypackage_consumption() {
+        pyo3::prepare_freethreaded_python();
+        crate::init_runtime().ok();
+        Python::with_gil(|py| {
+            let scp = crate::scp::PyScp::new_in_memory_for_test();
+            let bi = Arc::clone(&scp.inner);
+
+            let joiner = scp.identity_create(py, "in_memory", None).unwrap();
+            let joiner_did = joiner.did().to_owned();
+
+            let ctx_id = "b".repeat(64);
+            // Pre-occupy the FFI-state slot for this context id.
+            crate::runtime::register_context(&bi, &ctx_id, "did:dht:z6MkOccupiedCreator", &[])
+                .unwrap();
+
+            let params = PyDict::new(py);
+            params.set_item("mode", "encrypted").unwrap();
+
+            let err = scp
+                .context_join_from_welcome(
+                    &joiner_did,
+                    "did:dht:z6MkOccupiedCreator",
+                    &ctx_id,
+                    &params,
+                    "bogus-reservation-id",
+                    b"bogus-welcome-bytes",
+                )
+                .expect_err("join into an already-registered context must be rejected");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("already registered"),
+                "expected an Occupied-precheck rejection before KeyPackage consumption, got: {msg}"
+            );
+
+            // The PRE-EXISTING entry must SURVIVE — the failing join must not roll
+            // back state it did not create.
+            assert!(
+                crate::runtime::with_ffi_state(&bi, &ctx_id, |_| Ok(())).is_ok(),
+                "the pre-existing FFI state must be preserved on an Occupied-precheck failure"
+            );
+        });
     }
 
     /// Test helper: execute a governance action through the GENUINE
