@@ -2283,6 +2283,45 @@ impl crate::scp::PyScp {
             // Bridge: drain events (MemberJoined) from ContextManager's receive
             // buffer and deliver to the FFI receive channel (#332).
             drain_and_deliver(bi, &context_id);
+
+            // Register the joined context in the known-contexts registry so the
+            // JOINER surfaces its own plain-joined context via
+            // py_mcp_load_contexts, closing the discovery asymmetry with
+            // context_create and context_join_from_welcome (both of which
+            // register post-commit). Reuse the joiner's derived §9.10.4 pseudonym
+            // as the routing ID for encrypted contexts; fall back to
+            // broadcast_routing_id (plain SHA-256, matching the send path) for
+            // broadcast contexts, which carry no per-member pseudonym. Post-commit
+            // and infallible/idempotent (overwrites), mirroring context_create's
+            // POST-success registration — safe after the committed join, needs no
+            // rollback.
+            {
+                let routing_id = local_pseudonym.unwrap_or_else(|| {
+                    if join_is_broadcast {
+                        scp_core::context::broadcast_routing_id(&context_id)
+                    } else {
+                        scp_core::context::context_routing_id(&context_id)
+                    }
+                });
+
+                let relay_url = match self.transport_status() {
+                    Ok(status) => status.relay_url,
+                    Err(e) => {
+                        tracing::warn!(
+                            "failed to query transport status during context join registration: {e}"
+                        );
+                        None
+                    }
+                };
+
+                let known = crate::runtime::KnownContext {
+                    routing_id,
+                    relay_url,
+                    member_did,
+                    last_seen: scp_primitives::SystemClock.now_secs(),
+                };
+                crate::runtime::register_known_context_on(bi, &context_id, known);
+            }
         }
 
         Ok(())
@@ -6045,6 +6084,56 @@ mod tests {
             assert!(
                 crate::runtime::with_ffi_state(&bi, &ctx_id, |_| Ok(())).is_ok(),
                 "the pre-existing FFI state must be preserved on an Occupied-precheck failure"
+            );
+        });
+    }
+
+    /// ADR-049 Phase 2J (plain-join discovery symmetry): a successful plain
+    /// `context_join` registers the JOINER's context in the known-contexts
+    /// discovery registry, exactly as `context_create` and
+    /// `context_join_from_welcome` already do — so a plain-joined node can
+    /// surface its own joined context via `py_mcp_load_contexts`. Before the fix
+    /// the plain join was the only membership entry point that skipped
+    /// registration (a cross-bridge / cross-path asymmetry).
+    ///
+    /// Drives the REAL public entry points with two locally-custodied identities
+    /// so the encrypted create + join both commit; then asserts the joiner's own
+    /// entry exists in the registry, keyed to the joined context. Were the
+    /// post-commit registration removed, `known_contexts_for_member_on` would
+    /// return nothing for the joiner and the assertion would fail.
+    #[test]
+    #[cfg(feature = "allow_in_memory_custody")]
+    fn plain_join_registers_known_context_for_joiner() {
+        pyo3::prepare_freethreaded_python();
+        crate::init_runtime().ok();
+        Python::with_gil(|py| {
+            let scp = crate::scp::PyScp::new_in_memory_for_test();
+            let bi = Arc::clone(&scp.inner);
+
+            // Two locally-custodied identities: the creator's custody lets the
+            // encrypted create derive its §9.10.4 pseudonym; the joiner's lets
+            // the plain join derive its own and reach the registration seam.
+            let creator = scp.identity_create(py, "in_memory", None).unwrap();
+            let creator_did = creator.did().to_owned();
+            let joiner = scp.identity_create(py, "in_memory", None).unwrap();
+            let joiner_did = joiner.did().to_owned();
+
+            let params = PyDict::new(py);
+            params.set_item("mode", "encrypted").unwrap();
+            let handle = scp
+                .context_create(&creator_did, &params)
+                .expect("encrypted context_create with a custodied creator succeeds");
+            let ctx_id = handle.context_id.clone();
+
+            scp.context_join(&handle, &joiner_did, None)
+                .expect("plain encrypted join with a custodied joiner succeeds");
+
+            // The joiner's own known-context discovery entry now exists, keyed to
+            // the joined context — the post-commit registration fired.
+            let for_joiner = crate::runtime::known_contexts_for_member_on(&bi, &joiner_did);
+            assert!(
+                for_joiner.iter().any(|(cid, _)| cid == &ctx_id),
+                "plain join must register the joiner's known-context entry for discovery"
             );
         });
     }

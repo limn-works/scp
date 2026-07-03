@@ -940,6 +940,44 @@ pub(crate) async fn context_join_on(
         .await;
     }
 
+    // Register the joined context in the known-contexts discovery registry so the
+    // JOINER surfaces its own plain-joined context, closing the discovery
+    // asymmetry with context_join_from_welcome (which registers post-commit).
+    // Reuse the joiner's derived §9.10.4 pseudonym as the routing id for
+    // encrypted contexts; fall back to broadcast_routing_id (plain SHA-256,
+    // matching the send path) for broadcast contexts, which carry no per-member
+    // pseudonym. Infallible and idempotent (overwrites), so it is safe after the
+    // committed join and needs no rollback.
+    //
+    // The relay URL comes from the handleless transport probe. On the NAPI bridge
+    // the relay URL lives on a `NapiTransportManager` handle, so the honest value
+    // here is whatever `transport_status_on` surfaces (never a fabricated URL).
+    let routing_id = local_pseudonym.unwrap_or_else(|| {
+        if join_is_broadcast {
+            scp_core::context::broadcast_routing_id(&context_id)
+        } else {
+            scp_core::context::context_routing_id(&context_id)
+        }
+    });
+    let relay_url = match crate::transport::transport_status_on(bi, None).await {
+        Ok(status) => status.relay_url,
+        Err(e) => {
+            tracing::warn!(
+                "failed to query transport status during context join registration: {e}"
+            );
+            None
+        }
+    };
+    bi.core.register_known_context(
+        &context_id,
+        scp_ffi_common::bridge_instance::KnownContext {
+            routing_id,
+            relay_url,
+            member_did: identity_did.clone(),
+            last_seen: scp_primitives::SystemClock.now_secs(),
+        },
+    );
+
     Ok(())
 }
 
@@ -5981,6 +6019,56 @@ mod tests {
                 "None spending_ucan_jwt must not trigger UCAN parse errors, got: {msg}"
             );
         }
+    }
+
+    /// ADR-049 Phase 2J (plain-join discovery symmetry): a successful plain
+    /// `context_join` registers the JOINER's context in the known-contexts
+    /// discovery registry, closing the asymmetry with `context_join_from_welcome`
+    /// (which registers post-commit). A plain-joined node must be able to surface
+    /// its own joined context via discovery.
+    ///
+    /// Drives the REAL entry points: a custodied creator creates an encrypted
+    /// context, a DISTINCT custodied joiner plain-joins, and the joiner's own
+    /// known-context entry is asserted present. Were the post-commit registration
+    /// removed, `known_contexts_for_member` would return nothing for the joiner.
+    #[cfg(feature = "allow_in_memory_custody")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn plain_join_registers_known_context_for_joiner() {
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let bi = std::sync::Arc::clone(&scp.inner);
+
+        let creator = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create should succeed");
+        let joiner = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create should succeed");
+
+        let params_json = serde_json::json!({
+            "mode": "encrypted",
+            "ceiling": ["messages:read"],
+            "memoryScope": "ephemeral",
+            "governance": "single_admin",
+        })
+        .to_string();
+        let handle = super::context_create_on(&bi, &creator, params_json)
+            .await
+            .expect("context_create should succeed");
+        let ctx_id = handle.context_id.clone();
+
+        super::context_join_on(&bi, &handle, joiner.inner.did.clone(), None)
+            .await
+            .expect("plain encrypted join with a custodied joiner succeeds");
+
+        // The joiner's own known-context discovery entry now exists, keyed to the
+        // joined context — the post-commit registration fired.
+        let for_joiner = bi.core.known_contexts_for_member(&joiner.inner.did);
+        assert!(
+            for_joiner.iter().any(|(cid, _)| cid == &ctx_id),
+            "plain join must register the joiner's known-context entry for discovery"
+        );
     }
 
     // -----------------------------------------------------------------------
