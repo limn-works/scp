@@ -2872,7 +2872,7 @@ mod tests {
         // Use LocalTransportProvider (silently succeeds) for tests.
         // Key resolver returns None — no signature verification in tests.
         let key_resolver: scp_core::context::governance::KeyResolver =
-            Arc::new(|_: &scp_identity::DID, _: scp_identity::SigningKeyId| None);
+            Arc::new(|_: &scp_did::DID, _: scp_did::SigningKeyId| None);
         let test_did = "did:test:bridge-instance-test".to_owned();
         Supervisor::with_providers(
             Arc::new(MlsCryptoProvider::new(test_did)),
@@ -3629,7 +3629,7 @@ mod tests {
     fn economy_budget_creates_default_on_first_access() {
         let instance = CoreFields::with_supervisor(test_supervisor());
         let remaining = instance.with_economy_budget("ctx-1", |tracker| {
-            tracker.remaining(&scp_primitives::DID::from("did:dht:zalice"))
+            tracker.remaining(&scp_did::DID::from("did:dht:zalice"))
         });
         assert_eq!(remaining.value(), 0);
     }
@@ -3637,7 +3637,7 @@ mod tests {
     #[test]
     fn economy_budget_mut_grants_and_reads() {
         let instance = CoreFields::with_supervisor(test_supervisor());
-        let did = scp_primitives::DID::from("did:dht:zalice");
+        let did = scp_did::DID::from("did:dht:zalice");
         instance.with_economy_budget_mut("ctx-eco", |tracker| {
             tracker.grant(&did, scp_protocol::economy::Amount::new(500));
         });
@@ -3648,7 +3648,7 @@ mod tests {
     #[test]
     fn economy_antispam_creates_default_on_first_access() {
         let instance = CoreFields::with_supervisor(test_supervisor());
-        let did = scp_primitives::DID::from("did:dht:zbob");
+        let did = scp_did::DID::from("did:dht:zbob");
         let velocity =
             instance.with_economy_antispam("ctx-spam", |tracker| tracker.get_velocity(&did, 1000));
         assert_eq!(velocity, 0);
@@ -3657,7 +3657,7 @@ mod tests {
     #[test]
     fn remove_economy_state_clears_both() {
         let instance = CoreFields::with_supervisor(test_supervisor());
-        let did = scp_primitives::DID::from("did:dht:zalice");
+        let did = scp_did::DID::from("did:dht:zalice");
         instance.with_economy_budget_mut("ctx-rm", |tracker| {
             tracker.grant(&did, scp_protocol::economy::Amount::new(100));
         });
@@ -3675,7 +3675,7 @@ mod tests {
     #[test]
     fn economy_existing_context_id_bypasses_capacity_check() {
         let instance = CoreFields::with_supervisor(test_supervisor());
-        let did = scp_primitives::DID::from("did:dht:zalice");
+        let did = scp_did::DID::from("did:dht:zalice");
 
         // Create one entry.
         instance.with_economy_budget_mut("ctx-exist", |tracker| {
@@ -3696,7 +3696,7 @@ mod tests {
     #[test]
     fn economy_accessors_use_ephemeral_after_shutdown() {
         let instance = CoreFields::with_supervisor(test_supervisor());
-        let did = scp_primitives::DID::from("did:dht:zalice");
+        let did = scp_did::DID::from("did:dht:zalice");
 
         // Grant a budget before shutdown.
         instance.with_economy_budget_mut("ctx-sd", |tracker| {
@@ -3789,7 +3789,7 @@ mod tests {
         let instance = CoreFields::with_supervisor(test_supervisor());
 
         // Populate economy
-        let did = scp_primitives::DID::from("did:dht:zalice");
+        let did = scp_did::DID::from("did:dht:zalice");
         instance.with_economy_budget_mut("ctx-sd", |tracker| {
             tracker.grant(&did, scp_protocol::economy::Amount::new(100));
         });
@@ -4257,7 +4257,7 @@ mod tests {
         // `ContextManager`). The supervisor populates its lifted-
         // provider slots and the manager attachment internally.
         let key_resolver: scp_core::context::governance::KeyResolver =
-            Arc::new(|_: &scp_identity::DID, _: scp_identity::SigningKeyId| None);
+            Arc::new(|_: &scp_did::DID, _: scp_did::SigningKeyId| None);
         let supervisor = Supervisor::with_providers(
             Arc::new(MlsCryptoProvider::new("did:test:suspend-flush".to_owned())),
             Box::new(scp_core::context::LocalTransportProvider),

@@ -166,7 +166,7 @@ pub(crate) fn trust_verify_attestation_on(
         .map_err(|e| validation_error(&format!("failed to parse attestation JSON: {e}")))?;
 
     let resolver = scp_core::trust::IdentityDidPublicKeyResolver;
-    let clock = scp_identity::cache::SystemClock;
+    let clock = scp_clock::SystemClock;
 
     match scp_core::trust::verify_attestation(&attestation, &resolver, &clock) {
         Ok(()) => Ok(NapiAttestationVerificationResult {
@@ -242,7 +242,7 @@ pub(crate) fn trust_verify_response_on(
         .map_err(|e| validation_error(&format!("failed to parse response JSON: {e}")))?;
 
     let resolver = scp_core::trust::IdentityDidPublicKeyResolver;
-    let clock = scp_identity::cache::SystemClock;
+    let clock = scp_clock::SystemClock;
 
     struct EphemeralSigner(ed25519_dalek::SigningKey);
     impl scp_core::trust::ChallengeSigner for EphemeralSigner {
@@ -301,7 +301,7 @@ pub(crate) fn verify_participation_requirements_on(
     // failure and must not silently read as time 0, which would make every
     // participation statement appear maximally fresh and bypass `max_age_secs`.
     // Matches the SystemClock invariant used on the verify-on-ingest path.
-    let current_time = scp_primitives::Clock::now_secs(&scp_primitives::SystemClock);
+    let current_time = scp_clock::Clock::now_secs(&scp_clock::SystemClock);
 
     scp_core::trust::verify_participation_requirements(
         current_time,

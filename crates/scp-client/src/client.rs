@@ -27,13 +27,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use openmls::prelude::{KeyPackageBundle, KeyPackageIn, MlsMessageOut, ProtocolVersion};
+use scp_clock::Clock;
 use scp_event_log::{Event, EventType};
 use scp_mls::group::{
     add_member, create_group, destroy_group, generate_key_package, join_group_from_bytes,
     key_package_in_did,
 };
 use scp_mls::{InMemoryMlsProvider, ScpCredential, SignatureKeyPair};
-use scp_primitives::Clock;
 use scp_protocol::context::membership::ContextEvent;
 use scp_protocol::crypto::sender_keys::SenderKey;
 use tls_codec::{Deserialize as TlsDeserialize, Serialize as TlsSerialize};

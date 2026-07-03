@@ -2,7 +2,7 @@
 //!
 //! Bridge ID per spec section 12.2.1: `SHA-256(context_id || operator_did || platform || timestamp)`.
 
-use scp_primitives::Clock;
+use scp_clock::Clock;
 use sha2::{Digest, Sha256};
 
 /// Generates a bridge ID per spec section 12.2.1.
@@ -22,7 +22,7 @@ use sha2::{Digest, Sha256};
 /// timestamp for `BridgeRegistrationRequest::requested_at`.
 #[must_use]
 pub fn generate_bridge_id(context_id: &str, operator_did: &str, platform: &str) -> (String, u64) {
-    let now_secs = scp_primitives::SystemClock.now_secs();
+    let now_secs = scp_clock::SystemClock.now_secs();
 
     let mut hasher = Sha256::new();
     hasher.update(context_id.as_bytes());

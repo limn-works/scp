@@ -14,7 +14,7 @@ use scp_core::identity::scpid_sign as core_sign;
 use scp_core::identity::{
     ScpIdChallenge, ScpIdResponse, scpid_challenge as core_challenge, scpid_verify as core_verify,
 };
-use scp_identity::SigningKeyId;
+use scp_did::SigningKeyId;
 
 use crate::error::ScpNapiError;
 use crate::runtime::NapiBridgeInstance;
@@ -393,7 +393,10 @@ mod tests {
             Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
 
         // Create a DidDht with a signer so we can publish the DID document.
-        let sign_fn = scp_identity::DidDht::<InMemoryDhtClient, scp_identity::cache::SystemClock>::make_sign_fn(Arc::clone(&custody));
+        let sign_fn =
+            scp_identity::DidDht::<InMemoryDhtClient, scp_clock::SystemClock>::make_sign_fn(
+                Arc::clone(&custody),
+            );
         let dht = scp_identity::DidDht::with_client_and_signer(
             Arc::clone(&dht_client),
             Arc::new(DidCache::new()),

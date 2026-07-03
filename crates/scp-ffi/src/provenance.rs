@@ -68,7 +68,7 @@ pub fn evaluate_provenance_quality(
         counterparties: counterparties
             .unwrap_or_default()
             .into_iter()
-            .map(scp_identity::DID::from)
+            .map(scp_did::DID::from)
             .collect(),
         purpose: None,
         discovery_method: DiscoveryMethod::OutOfBand,
@@ -251,7 +251,7 @@ impl crate::scp::PyScp {
             context_id: source_context_id.clone(),
             source_type: st,
             memory_scope: ms,
-            members: members.into_iter().map(scp_identity::DID::from).collect(),
+            members: members.into_iter().map(scp_did::DID::from).collect(),
             discovery_method: DiscoveryMethod::OutOfBand,
             data_age: std::time::Duration::from_secs(0),
             purpose: None,
@@ -355,7 +355,7 @@ fn append_provenance_event(
 
         let event = scp_event_log::Event {
             event_type,
-            actor_did: scp_identity::DID::from(actor_did.to_owned()),
+            actor_did: scp_did::DID::from(actor_did.to_owned()),
             timestamp,
             sequence,
             payload: scp_event_log::EventPayload {

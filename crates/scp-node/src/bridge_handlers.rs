@@ -1030,7 +1030,7 @@ mod tests {
             claims: test_claims(),
             bridge: BridgeConnector {
                 bridge_id: "bridge-test-001".to_owned(),
-                operator_did: scp_identity::DID("did:dht:z6MkTestOperator".to_owned()),
+                operator_did: scp_did::DID("did:dht:z6MkTestOperator".to_owned()),
                 platform: "discord".to_owned(),
                 mode: BridgeMode::Relay,
                 status: BridgeStatus::Active,

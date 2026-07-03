@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 
 use super::memory_scope::{BlobId, ContextId, KeyDestructionLevel, KeyDestructionResult};
 use super::{ContextError, MemoryScope};
-use scp_primitives::DID;
+use scp_did::DID;
 
 // ---------------------------------------------------------------------------
 // IncompleteVerificationPolicy

@@ -340,7 +340,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use scp_identity::document::{DidDocument, Service};
+    use scp_did::{DidDocument, Service};
     use scp_identity::{DidMethod, IdentityError, ScpIdentity};
 
     use scp_platform::PreRotationKeyHandle;

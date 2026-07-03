@@ -38,7 +38,7 @@
 
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
-use scp_primitives::Clock as _;
+use scp_clock::Clock as _;
 use scp_protocol::crypto::ucan::validate::{InMemoryNonceTracker, NonceTracker};
 
 /// One nonce operation in the fuzz sequence.
@@ -58,7 +58,7 @@ fuzz_target!(|ops: [NonceOp; 8]| {
     let mut tracker = InMemoryNonceTracker::new();
     let mut accepted: Vec<String> = Vec::new();
 
-    let now_millis = scp_primitives::SystemClock.now_millis();
+    let now_millis = scp_clock::SystemClock.now_millis();
 
     for op in &ops {
         // --- Mode: replay previously-accepted nonce ---

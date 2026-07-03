@@ -22,8 +22,8 @@
 
 use std::collections::HashMap;
 
+use scp_clock::Clock;
 use scp_event_log::Event;
-use scp_primitives::Clock;
 
 use super::attestation::{
     Attestation, AttestationRevocationChecker, AttestorInfo, DidPublicKeyResolver, FreshnessStatus,
@@ -149,7 +149,7 @@ struct RevocationMapChecker<'a> {
 }
 
 impl AttestationRevocationChecker for RevocationMapChecker<'_> {
-    fn check_revocation(&self, attestation_id: &str, _issuer: &scp_primitives::DID) -> Option<u64> {
+    fn check_revocation(&self, attestation_id: &str, _issuer: &scp_did::DID) -> Option<u64> {
         // The list stores only a boolean per id (no timestamp); report `0` as the
         // revocation time when listed. That value only populates a dropped-entry
         // log line, not a user-facing field.
@@ -629,8 +629,8 @@ mod tests {
 
     use super::*;
     use crate::trust::attestation::RevocationStatus;
+    use scp_clock::TestClock;
     use scp_event_log::{EventPayload, EventType};
-    use scp_primitives::TestClock;
 
     // -----------------------------------------------------------------------
     // Test helpers: InMemoryTrustStore
@@ -852,7 +852,7 @@ mod tests {
 
         let verifier_key = challenge_verifier_key();
         let verifier_pub = verifier_key.verifying_key().to_bytes();
-        let verifier_did = scp_primitives::did_dht_from_public_key(&verifier_pub);
+        let verifier_did = scp_did::did_dht_from_public_key(&verifier_pub);
 
         let mut cv = ChallengeVerification {
             verification_id: challenge_id.to_owned(),
@@ -884,7 +884,7 @@ mod tests {
     /// verifies on the challenge read path.
     fn seed_challenge_verifier(resolver: &mut TestResolver) {
         let verifier_pub = challenge_verifier_key().verifying_key().to_bytes();
-        let verifier_did = scp_primitives::did_dht_from_public_key(&verifier_pub).to_string();
+        let verifier_did = scp_did::did_dht_from_public_key(&verifier_pub).to_string();
         resolver.keys.insert(verifier_did, verifier_pub.to_vec());
     }
 

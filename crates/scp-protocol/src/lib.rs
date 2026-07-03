@@ -14,6 +14,5 @@ pub mod jcs;
 pub mod provenance;
 pub mod serde_util;
 pub mod sync;
-pub mod time;
 pub mod trust;
 pub mod uri;

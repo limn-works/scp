@@ -33,7 +33,7 @@ use subtle::ConstantTimeEq;
 
 use super::ContextId;
 use crate::context::governance::{GovernanceAction, GovernanceModelConfig, ProposalId};
-use scp_primitives::DID;
+use scp_did::DID;
 
 // ---------------------------------------------------------------------------
 // MerkleRoot type alias

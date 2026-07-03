@@ -10,6 +10,7 @@ homepage.workspace = true
 [dependencies]
 scp-protocol = { path = "../scp-protocol", version = "=0.1.0-beta.2" }
 scp-runtime = { path = "../scp-runtime", version = "=0.1.0-beta.2" }
+scp-mls = { path = "../scp-mls", version = "=0.1.0-beta.2" }
 
 [features]
 testing = ["scp-runtime/testing"]

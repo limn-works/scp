@@ -333,7 +333,7 @@ impl crate::scp::PyScp {
                 context_creator_did: &rt.creator_did,
                 presenting_agent_did: agent_did,
                 clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
-                clock: &scp_primitives::SystemClock,
+                clock: &scp_clock::SystemClock,
             };
 
             validate_ucan(&parsed_token, &required_cap, &mut ctx).map_err(ScpPyError::from)
@@ -470,7 +470,7 @@ impl crate::scp::PyScp {
                 context_creator_did: &rt.creator_did,
                 presenting_agent_did: agent_did,
                 clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
-                clock: &scp_primitives::SystemClock,
+                clock: &scp_clock::SystemClock,
             };
 
             Ok(evaluate_ucan(&parsed_token, required_cap.as_ref(), &ctx))
@@ -533,7 +533,7 @@ impl crate::scp::PyScp {
 
         let rt = crate::runtime()?;
         let context_id_owned = context_id.to_owned();
-        let _nonce = scp_core::crypto::ucan::nonce::generate_nonce(&scp_primitives::SystemClock);
+        let _nonce = scp_core::crypto::ucan::nonce::generate_nonce(&scp_clock::SystemClock);
 
         // Mint using real scp_core::mint_ucan with Ed25519 signing via
         // the retained KeyCustody. See SCP-214 criterion 7.
@@ -559,12 +559,7 @@ impl crate::scp::PyScp {
             };
 
             let result = rt.block_on(async {
-                mint_ucan(
-                    &params,
-                    entry.custody.as_ref(),
-                    &scp_primitives::SystemClock,
-                )
-                .await
+                mint_ucan(&params, entry.custody.as_ref(), &scp_clock::SystemClock).await
             });
             result.map_err(ScpPyError::from)
         })?;
@@ -685,12 +680,7 @@ impl crate::scp::PyScp {
             };
 
             let result = rt.block_on(async {
-                delegate_ucan(
-                    &params,
-                    entry.custody.as_ref(),
-                    &scp_primitives::SystemClock,
-                )
-                .await
+                delegate_ucan(&params, entry.custody.as_ref(), &scp_clock::SystemClock).await
             });
             result.map_err(ScpPyError::from)
         })?;
@@ -869,12 +859,12 @@ pub fn register_ucan(m: &Bound<'_, PyModule>) -> PyResult<()> {
 mod tests {
     use super::*;
 
+    use scp_clock::Clock;
     use scp_core::crypto::ucan::UcanToken;
     use scp_core::crypto::ucan::validate::{
         DidResolver, NonceTracker as NonceTrackerTrait, ProofResolver, RevocationChecker,
     };
     use scp_ffi_common::BridgeDidResolver;
-    use scp_primitives::Clock;
 
     // -----------------------------------------------------------------------
     // BridgeDidResolver
@@ -988,12 +978,12 @@ mod tests {
 
     #[test]
     fn bridge_nonce_tracker_delegates_to_inner() {
-        use scp_identity::cache::SystemClock;
+        use scp_clock::SystemClock;
 
         let mut tracker =
             scp_core::crypto::ucan::nonce::NonceTracker::new("ctx-test".to_owned(), SystemClock);
 
-        let now_millis = scp_primitives::SystemClock.now_millis();
+        let now_millis = scp_clock::SystemClock.now_millis();
         let now_secs = now_millis / 1000;
         let nonce = format!("{now_millis}-aabbccdd11223344aabbccdd11223344");
         let expiry = now_secs + 3600;

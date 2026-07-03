@@ -20,8 +20,8 @@ use zeroize::Zeroizing;
 
 use scp_platform::traits::{KeyCustody, KeyHandle, KeyType};
 
+use scp_did::SigningKeyId;
 use scp_protocol::crypto::sender_keys::{SenderKey, SenderKeyError, generate_sender_key};
-use scp_protocol::identity::SigningKeyId;
 
 // ---------------------------------------------------------------------------
 // SenderKeyRequestResult — holds KeyHandle from scp-platform
@@ -105,7 +105,7 @@ pub async fn request_sender_key(
     requester_did: &str,
     sender_did: &str,
     epoch: u64,
-    clock: &dyn scp_primitives::Clock,
+    clock: &dyn scp_clock::Clock,
 ) -> Result<SenderKeyRequestResult, SenderKeyError> {
     // Generate fresh X25519 wrapping keypair.
     let wrapping_key_handle = key_custody
@@ -405,7 +405,7 @@ pub async fn send_block_notification(
     blocker_did: &str,
     blocked_did: &str,
     signing_key_id: SigningKeyId,
-    clock: &dyn scp_primitives::Clock,
+    clock: &dyn scp_clock::Clock,
 ) -> Result<Vec<u8>, SenderKeyError> {
     let timestamp = clock.now_millis();
 
@@ -506,9 +506,9 @@ pub async fn rotate_sender_key_for_block<S: BuildHasher + Send + Sync>(
 mod tests {
     use std::collections::HashSet;
 
+    use scp_clock::Clock;
     use scp_platform::testing::InMemoryKeyCustody;
     use scp_platform::traits::{KeyCustody, KeyType};
-    use scp_primitives::Clock;
 
     use super::*;
     use scp_protocol::crypto::sender_keys::key_protocol_verify::{
@@ -730,7 +730,7 @@ mod tests {
         let sender_key_bytes = *sender_key.as_bytes();
 
         // Bob creates a request for Alice's key.
-        let clock = scp_primitives::SystemClock;
+        let clock = scp_clock::SystemClock;
         let request_result = request_sender_key(
             &bob_custody,
             &bob_signing_key,
@@ -796,7 +796,7 @@ mod tests {
         let (custody, signing_key) = setup().await;
         let pubkey = custody.public_key(&signing_key).await.unwrap();
 
-        let clock = scp_primitives::SystemClock;
+        let clock = scp_clock::SystemClock;
         let result = request_sender_key(
             &custody,
             &signing_key,
@@ -821,7 +821,7 @@ mod tests {
         let other_key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
         let wrong_pubkey = custody.public_key(&other_key).await.unwrap();
 
-        let clock = scp_primitives::SystemClock;
+        let clock = scp_clock::SystemClock;
         let result = request_sender_key(
             &custody,
             &signing_key,
@@ -855,7 +855,7 @@ mod tests {
         let sender_key = generate_sender_key();
 
         // Bob creates a request.
-        let clock = scp_primitives::SystemClock;
+        let clock = scp_clock::SystemClock;
         let request_result = request_sender_key(
             &bob_custody,
             &bob_signing_key,
@@ -909,7 +909,7 @@ mod tests {
 
         let sender_key = generate_sender_key();
 
-        let clock = scp_primitives::SystemClock;
+        let clock = scp_clock::SystemClock;
         let request_result = request_sender_key(
             &bob_custody,
             &bob_signing_key,
@@ -968,7 +968,7 @@ mod tests {
         let sender_key = generate_sender_key();
 
         // Sybil identity creates a request.
-        let clock = scp_primitives::SystemClock;
+        let clock = scp_clock::SystemClock;
         let request_result = request_sender_key(
             &sybil_custody,
             &sybil_signing_key,
@@ -1024,7 +1024,7 @@ mod tests {
 
         let sender_key = generate_sender_key();
 
-        let clock = scp_primitives::SystemClock;
+        let clock = scp_clock::SystemClock;
         let request_result = request_sender_key(
             &bob_custody,
             &bob_signing_key,
@@ -1088,7 +1088,7 @@ mod tests {
         let sender_key = generate_sender_key();
 
         // Sybil identity requests the key.
-        let clock = scp_primitives::SystemClock;
+        let clock = scp_clock::SystemClock;
         let request_result = request_sender_key(
             &sybil_custody,
             &sybil_signing_key,
@@ -1149,7 +1149,7 @@ mod tests {
         let (custody, signing_key) = setup().await;
         let pubkey = custody.public_key(&signing_key).await.unwrap();
 
-        let clock = scp_primitives::SystemClock;
+        let clock = scp_clock::SystemClock;
         let message = send_block_notification(
             &custody,
             &signing_key,
@@ -1178,7 +1178,7 @@ mod tests {
         let (custody, signing_key) = setup().await;
         let pubkey = custody.public_key(&signing_key).await.unwrap();
 
-        let clock = scp_primitives::SystemClock;
+        let clock = scp_clock::SystemClock;
         let message = send_block_notification(
             &custody,
             &signing_key,
@@ -1203,7 +1203,7 @@ mod tests {
         let other_key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
         let wrong_pubkey = custody.public_key(&other_key).await.unwrap();
 
-        let clock = scp_primitives::SystemClock;
+        let clock = scp_clock::SystemClock;
         let message = send_block_notification(
             &custody,
             &signing_key,
@@ -1348,7 +1348,7 @@ mod tests {
         .unwrap();
 
         // Dave tries to request the new key.
-        let clock = scp_primitives::SystemClock;
+        let clock = scp_clock::SystemClock;
         let request_result = request_sender_key(
             &dave_custody,
             &dave_signing_key,
@@ -1424,7 +1424,7 @@ mod tests {
     #[tokio::test]
     async fn fresh_block_notification_passes_freshness_check() {
         let (custody, signing_key) = setup().await;
-        let clock = scp_primitives::SystemClock;
+        let clock = scp_clock::SystemClock;
         let msg = send_block_notification(
             &custody,
             &signing_key,
@@ -1449,7 +1449,7 @@ mod tests {
     #[tokio::test]
     async fn stale_block_notification_rejected() {
         let (custody, signing_key) = setup().await;
-        let clock = scp_primitives::SystemClock;
+        let clock = scp_clock::SystemClock;
         let msg = send_block_notification(
             &custody,
             &signing_key,
@@ -1475,7 +1475,7 @@ mod tests {
     #[tokio::test]
     async fn future_timestamp_block_notification_rejected() {
         let (custody, signing_key) = setup().await;
-        let clock = scp_primitives::SystemClock;
+        let clock = scp_clock::SystemClock;
         let msg = send_block_notification(
             &custody,
             &signing_key,
@@ -1521,7 +1521,7 @@ mod tests {
 
         let sender_key = generate_sender_key();
         let block_list: HashSet<String> = HashSet::new();
-        let clock = scp_primitives::SystemClock;
+        let clock = scp_clock::SystemClock;
 
         let result = request_sender_key(
             &requester_custody,
@@ -1572,7 +1572,7 @@ mod tests {
         let (bob_custody, bob_signing_key, bob_pubkey, sender_key) =
             setup_request_test_fixtures().await;
 
-        let clock = scp_primitives::SystemClock;
+        let clock = scp_clock::SystemClock;
         let request_result = request_sender_key(
             &bob_custody,
             &bob_signing_key,
@@ -1618,7 +1618,7 @@ mod tests {
         let (bob_custody, bob_signing_key, bob_pubkey, sender_key) =
             setup_request_test_fixtures().await;
 
-        let clock = scp_primitives::SystemClock;
+        let clock = scp_clock::SystemClock;
         let request_result = request_sender_key(
             &bob_custody,
             &bob_signing_key,

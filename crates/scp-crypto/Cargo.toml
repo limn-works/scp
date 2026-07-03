@@ -1,0 +1,20 @@
+[package]
+name = "scp-crypto"
+version = "0.1.0-beta.2"
+description = "Low-level cryptographic anchor (Ed25519 verification) for SCP (Shared Context Protocol)"
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["protocol", "cryptography", "ed25519"]
+categories = ["cryptography"]
+
+[dependencies]
+ed25519-dalek = { workspace = true }
+
+[dev-dependencies]
+rand = { workspace = true }
+
+[lints]
+workspace = true

@@ -35,7 +35,7 @@
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
-use scp_primitives::Clock;
+use scp_clock::Clock;
 
 use super::{ContextId, DID, Ed25519Signature, EventLog, EventLogError, EventLogSigner};
 use crate::proof::{self, Direction, InclusionProof, ProofStep};
@@ -1174,9 +1174,9 @@ pub fn compute_checkpoint_canonical_hash(
     hasher.finalize().to_vec()
 }
 
-/// Returns the current Unix timestamp in seconds using [`scp_primitives::SystemClock`].
+/// Returns the current Unix timestamp in seconds using [`scp_clock::SystemClock`].
 fn current_timestamp() -> u64 {
-    scp_primitives::SystemClock.now_secs()
+    scp_clock::SystemClock.now_secs()
 }
 
 // ---------------------------------------------------------------------------

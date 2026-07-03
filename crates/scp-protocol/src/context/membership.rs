@@ -40,7 +40,7 @@ pub const MAX_BUFFER_CAPACITY: usize = 10_000;
 // DID (re-exported from identity module -- SCP-187)
 // ---------------------------------------------------------------------------
 
-use scp_primitives::DID;
+use scp_did::DID;
 
 // ---------------------------------------------------------------------------
 // KeyPackage (stub)

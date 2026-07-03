@@ -14,7 +14,10 @@ default = ["resolvers"]
 resolvers = ["dep:scp-core", "dep:scp-identity", "dep:scp-event-log", "dep:scp-transport", "dep:scp-platform", "dep:scp-mcp", "dep:tokio", "dep:tokio-util", "dep:async-trait", "dep:thiserror", "dep:tracing", "dep:rand", "dep:ed25519-dalek"]
 # Enables the did:key:{hex} DID format in BridgeDidResolver. This is a
 # non-standard test convenience — production builds must resolve via did:dht:z.
-testing = ["resolvers"]
+# BridgeDidResolver delegates decoding to `scp_did::extract_public_key_from_did`,
+# whose did:key:{hex} branch is itself gated behind `scp-did/testing`; forward
+# the flag so the single shared parser still accepts did:key in test builds.
+testing = ["resolvers", "scp-did/testing"]
 # Shared callback-custody byte/string parsing helpers (custody_parse module).
 # Requires only scp-platform for the typed return values (KeyHandle,
 # PseudonymKeypair, PublicKey, PlatformError). Deliberately NOT folded into
@@ -30,7 +33,8 @@ server = ["dep:scp-transport", "dep:scp-node", "dep:scp-platform", "scp-platform
 scp-core = { path = "../../scp-core", optional = true }
 scp-mcp = { path = "../../scp-mcp", optional = true }
 scp-protocol = { path = "../../scp-protocol" }
-scp-primitives = { path = "../../scp-primitives" }
+scp-clock = { path = "../../scp-clock" }
+scp-did = { path = "../../scp-did" }
 scp-event-log = { path = "../../scp-event-log", optional = true }
 scp-identity = { path = "../../scp-identity", optional = true }
 scp-transport = { path = "../../scp-transport", features = ["redb-blob"], optional = true }
@@ -42,7 +46,6 @@ zeroize = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
-z-base-32 = { workspace = true }
 ed25519-dalek = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
 # `rand_core` with `getrandom` is used by the always-on
@@ -68,6 +71,11 @@ tokio = { workspace = true, features = ["test-util", "macros", "rt"] }
 # key seal/open round-trip tests (src/broadcast.rs). Production code never needs
 # X25519 here — the protocol layer owns the HPKE seal/open.
 x25519-dalek = { workspace = true }
+# Test-only: z-base-32 encode/decode for the resolver unit tests (building
+# did:dht:z fixtures + the non-canonical-padding regression). Production
+# DID→key extraction is delegated to `scp_did::extract_public_key_from_did`,
+# so no production code path in this crate touches z-base-32 directly.
+z-base-32 = { workspace = true }
 
 [lints]
 workspace = true

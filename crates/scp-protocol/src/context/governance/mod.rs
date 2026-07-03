@@ -60,8 +60,8 @@ use super::roles::ToolId;
 use super::tools::interface::ToolInterface;
 use crate::economy::antispam::HardRateLimitConfig;
 use crate::economy::types::{Amount, EconomicPolicy};
+use scp_did::{DID, SigningKeyId};
 use scp_event_log::{ContextId, Ed25519Signature};
-use scp_primitives::{DID, SigningKeyId};
 
 // ---------------------------------------------------------------------------
 // KeyResolver

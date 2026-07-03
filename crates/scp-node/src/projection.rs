@@ -1107,18 +1107,16 @@ fn validate_projection_ucan(
             Box::new(ApiError::unauthorized_with("malformed UCAN token").into_response())
         })?;
 
-    scp_core::crypto::ed25519::verify_ed25519_signature(
-        &pk_bytes,
-        signing_input.as_bytes(),
-        &ucan.signature,
-    )
-    .map_err(|_| {
-        tracing::debug!(
-            issuer = %ucan.payload.iss,
-            "UCAN signature verification failed for projection auth"
-        );
-        Box::new(ApiError::unauthorized_with("UCAN signature verification failed").into_response())
-    })?;
+    scp_crypto::verify_ed25519_signature(&pk_bytes, signing_input.as_bytes(), &ucan.signature)
+        .map_err(|_| {
+            tracing::debug!(
+                issuer = %ucan.payload.iss,
+                "UCAN signature verification failed for projection auth"
+            );
+            Box::new(
+                ApiError::unauthorized_with("UCAN signature verification failed").into_response(),
+            )
+        })?;
 
     // Step 6: Revocation check.
     if validation_state.revoked_tokens.contains(&token_cid) {
@@ -2812,7 +2810,7 @@ mod tests {
             projection_ucan_cache: std::sync::RwLock::new(ProjectionUcanCache::new()),
             tls_config: None,
             cert_resolver: None,
-            did_document: scp_identity::document::DidDocument {
+            did_document: scp_did::DidDocument {
                 context: vec!["https://www.w3.org/ns/did/v1".to_owned()],
                 id: "did:dht:test".to_owned(),
                 verification_method: vec![],
@@ -4077,7 +4075,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     use scp_core::context::params::{ProjectionOverride, ProjectionPolicy, ProjectionRule};
-    use scp_identity::DID;
+    use scp_did::DID;
 
     #[tokio::test]
     async fn feed_open_context_serves_without_auth() {

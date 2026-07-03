@@ -130,10 +130,7 @@ pub(crate) fn media_initiate_session_on(
         context_id,
         &param_caps,
         caps,
-        participants
-            .into_iter()
-            .map(scp_identity::DID::from)
-            .collect(),
+        participants.into_iter().map(scp_did::DID::from).collect(),
         ts,
     )
     .map_err(media_error_to_napi)?;

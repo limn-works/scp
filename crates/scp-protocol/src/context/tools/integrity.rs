@@ -17,8 +17,8 @@ use serde_json::Value;
 
 use super::{ToolError, ToolId, ToolRegistry, ToolVerificationResult, VectorResult};
 use crate::trust::challenge::{ChallengeType, ChallengeVerification, VerificationMethod};
-use scp_primitives::Clock;
-use scp_primitives::DID;
+use scp_clock::Clock;
+use scp_did::DID;
 
 // ---------------------------------------------------------------------------
 // Schema compatibility checking
@@ -344,7 +344,7 @@ impl VerificationScheduler {
 mod tests {
     use super::*;
     use crate::context::tools::registry::{TestVector, ToolRegistration, ToolSchema};
-    use scp_primitives::Clock;
+    use scp_clock::Clock;
     use serde_json::json;
 
     fn make_registry(tool_id: &str, test_vectors: Vec<TestVector>) -> ToolRegistry {
@@ -442,7 +442,7 @@ mod tests {
         let registry = make_registry("calc", vectors);
         let verifier = DID::from("did:dht:verifier");
 
-        let clock = scp_primitives::SystemClock;
+        let clock = scp_clock::SystemClock;
         let (verification, result) = verify_tool_integrity(
             &registry,
             "calc",
@@ -473,7 +473,7 @@ mod tests {
         let registry = make_registry("calc", vectors);
         let verifier = DID::from("did:dht:verifier");
 
-        let clock = scp_primitives::SystemClock;
+        let clock = scp_clock::SystemClock;
         let (verification, result) = verify_tool_integrity(
             &registry,
             "calc",
@@ -501,7 +501,7 @@ mod tests {
         let registry = ToolRegistry::new();
         let verifier = DID::from("did:dht:verifier");
 
-        let clock = scp_primitives::SystemClock;
+        let clock = scp_clock::SystemClock;
         let err = verify_tool_integrity(&registry, "missing", &verifier, &clock, |_| json!({}))
             .unwrap_err();
 
@@ -528,7 +528,7 @@ mod tests {
         let registry = make_registry("multi", vectors);
         let verifier = DID::from("did:dht:v");
 
-        let clock = scp_primitives::SystemClock;
+        let clock = scp_clock::SystemClock;
         let (_, result) =
             verify_tool_integrity(&registry, "multi", &verifier, &clock, |_| json!({"a": 1}))
                 .unwrap();
@@ -566,7 +566,7 @@ mod tests {
 
     #[test]
     fn schedule_and_check_due() {
-        let clock = scp_primitives::SystemClock;
+        let clock = scp_clock::SystemClock;
         let mut scheduler = VerificationScheduler::new();
         assert!(scheduler.is_empty());
 
@@ -583,7 +583,7 @@ mod tests {
 
     #[test]
     fn record_verification_advances_schedule() {
-        let clock = scp_primitives::SystemClock;
+        let clock = scp_clock::SystemClock;
         let mut scheduler = VerificationScheduler::new();
         scheduler.schedule_tool_verification("tool-b", 600, &clock);
 
@@ -603,7 +603,7 @@ mod tests {
 
     #[test]
     fn unschedule_removes_entry() {
-        let clock = scp_primitives::SystemClock;
+        let clock = scp_clock::SystemClock;
         let mut scheduler = VerificationScheduler::new();
         scheduler.schedule_tool_verification("tool-c", 100, &clock);
         assert_eq!(scheduler.len(), 1);
@@ -615,7 +615,7 @@ mod tests {
 
     #[test]
     fn reschedule_replaces_existing() {
-        let clock = scp_primitives::SystemClock;
+        let clock = scp_clock::SystemClock;
         let mut scheduler = VerificationScheduler::new();
         scheduler.schedule_tool_verification("tool-d", 100, &clock);
         scheduler.schedule_tool_verification("tool-d", 500, &clock);
@@ -627,7 +627,7 @@ mod tests {
 
     #[test]
     fn multiple_tools_due() {
-        let clock = scp_primitives::SystemClock;
+        let clock = scp_clock::SystemClock;
         let mut scheduler = VerificationScheduler::new();
         scheduler.schedule_tool_verification("t1", 100, &clock);
         scheduler.schedule_tool_verification("t2", 200, &clock);

@@ -24,10 +24,10 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use rand::RngCore;
-use scp_identity::SigningKeyId;
+use scp_did::SigningKeyId;
+use scp_mls::credential::ScpCredential;
 use scp_platform::testing::InMemoryStorage;
 use scp_runtime::crypto::mls::backend::MlsBackend;
-use scp_runtime::crypto::mls::credential::ScpCredential;
 use scp_runtime::crypto::mls::production_backend::ProductionMlsBackend;
 use scp_runtime::crypto::mls::storage_adapter::{
     OpenMlsStorageAdapter, SpawnBlockingStorageAdapter,

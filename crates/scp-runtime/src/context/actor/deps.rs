@@ -91,8 +91,8 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use scp_identity::DID;
-use scp_primitives::Clock;
+use scp_clock::Clock;
+use scp_did::DID;
 use scp_protocol::context::governance::KeyResolver;
 use scp_protocol::context::membership::ContextEvent;
 
@@ -163,8 +163,8 @@ pub struct ActorDeps {
     /// underlying KV via this adapter).
     pub mls_storage: Arc<dyn OpenMlsStorageAdapter>,
     /// Wall-clock source. Formerly `ContextManager::clock`
-    /// (`Arc<dyn scp_primitives::Clock>`, default
-    /// [`scp_primitives::SystemClock`]). Every handler that computes
+    /// (`Arc<dyn scp_clock::Clock>`, default
+    /// [`scp_clock::SystemClock`]). Every handler that computes
     /// pricing windows, velocity tracking, TTL comparisons, UCAN expiry
     /// checks, or rate-limit buckets reads the clock — concentrating it
     /// in `ActorDeps` removes the per-handler plumbing required if each

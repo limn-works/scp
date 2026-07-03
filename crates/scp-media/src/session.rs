@@ -35,7 +35,7 @@ use sha2::{Digest, Sha256};
 
 use crate::keys::MediaError;
 
-use scp_identity::DID;
+use scp_did::DID;
 
 /// A context identifier string.
 pub type ContextId = String;

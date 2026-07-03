@@ -70,7 +70,7 @@ where
 
 /// Returns a permissive key resolver that always returns `None`.
 fn permissive_key_resolver() -> KeyResolver {
-    Arc::new(|_did: &scp_identity::DID, _kid: scp_identity::SigningKeyId| None)
+    Arc::new(|_did: &scp_did::DID, _kid: scp_did::SigningKeyId| None)
 }
 
 // ---------------------------------------------------------------------------
@@ -405,7 +405,7 @@ fn fullstack_remove_member_impl(
     rt.block_on(node.inner.manager.leave_context(
         &handle,
         &node.inner.did,
-        &scp_identity::DID::from(member_did.as_str()),
+        &scp_did::DID::from(member_did.as_str()),
     ))
     .map_err(|e| {
         pyo3::exceptions::PyRuntimeError::new_err(format!("failed to remove member: {e}"))
@@ -451,7 +451,7 @@ fn fullstack_seed_peer_pseudonym_impl(
     let rt = crate::runtime()?;
     rt.block_on(node.inner.manager.seed_peer_pseudonym(
         &context_id,
-        scp_identity::DID::from(peer_did.as_str()),
+        scp_did::DID::from(peer_did.as_str()),
         arr,
     ))
     .map_err(|e| {

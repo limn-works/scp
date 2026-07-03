@@ -35,8 +35,8 @@ use hyper::Request;
 use tower::ServiceExt;
 use zeroize::Zeroizing;
 
+use scp_clock::SystemClock;
 use scp_identity::DidCache;
-use scp_identity::cache::SystemClock;
 use scp_identity::dht::DidDht;
 use scp_identity::dht_client::InMemoryDhtClient;
 use scp_node::{

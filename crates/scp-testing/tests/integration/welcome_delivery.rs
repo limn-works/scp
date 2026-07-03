@@ -107,7 +107,7 @@ fn cross_process_welcome_delivery() {
         message_type: scp_core::envelope::inner::MessageType::Content,
         payload: plaintext,
         provenance: None,
-        signing_key_id: scp_identity::SigningKeyId::Active,
+        signing_key_id: scp_did::SigningKeyId::Active,
     };
     let inner = scp_core::envelope::inner::sign::create_inner_envelope_raw(&params, &sk).unwrap();
     let routing_id = scp_core::context::context_routing_id(context_id_str);

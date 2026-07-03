@@ -33,7 +33,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ed25519_dalek::{Signature, VerifyingKey};
 use scp_core::bridge::{BridgeConnector, BridgeStatus};
 use scp_core::store::ProtocolRepository;
-use scp_identity::document::{DidDocument, decode_multibase_key};
+use scp_did::{DidDocument, decode_multibase_key};
 use scp_platform::traits::Storage;
 use serde::{Deserialize, Serialize};
 
@@ -1109,7 +1109,7 @@ mod tests {
     use http_body_util::BodyExt;
     use rand::rngs::OsRng;
     use scp_core::bridge::{BridgeConnector, BridgeMode, BridgeStatus};
-    use scp_identity::document::{DidDocument, VerificationMethod};
+    use scp_did::{DidDocument, VerificationMethod};
     use tower::ServiceExt;
 
     // -----------------------------------------------------------------------

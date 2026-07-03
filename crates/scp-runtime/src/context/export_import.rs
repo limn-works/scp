@@ -15,14 +15,14 @@
 //!
 //! See GitHub issue #363.
 
-use scp_primitives::Clock;
+use scp_clock::Clock;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
 use super::state::ContextSnapshot;
 use crate::store::StoredValue;
-use scp_identity::DID;
+use scp_did::DID;
 use scp_protocol::context::ContextError;
 
 // ---------------------------------------------------------------------------
@@ -700,7 +700,7 @@ fn strip_snapshot_for_public(snapshot: &ContextSnapshot) -> Result<ContextSnapsh
         snapshot.role_state.creator_did.as_str(),
         ceiling,
         Vec::new(),
-        &scp_primitives::SystemClock,
+        &scp_clock::SystemClock,
     )
     .map_err(|e| {
         ContextError::MembershipFailed(format!(
@@ -945,7 +945,7 @@ mod tests {
             TEST_CREATOR_DID,
             ceiling,
             vec![],
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
 
@@ -1012,7 +1012,7 @@ mod tests {
 
     #[test]
     fn ensure_importer_is_member_accepts_members_rejects_non_members() {
-        use scp_identity::DID;
+        use scp_did::DID;
 
         let mut snapshot = test_snapshot("member-check-ctx");
         // A real snapshot carries the creator in its membership; mirror that, plus
@@ -1172,7 +1172,7 @@ mod tests {
             Vec::new(),
             DID::from(TEST_CREATOR_DID),
             ExportScope::Full,
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
             sign_with_test_key,
         )
         .unwrap();
@@ -1208,7 +1208,7 @@ mod tests {
             event_log_data,
             DID::from(TEST_CREATOR_DID),
             ExportScope::Full,
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
             sign_with_test_key,
         )
         .unwrap();
@@ -1242,7 +1242,7 @@ mod tests {
             event_log_data,
             DID::from(TEST_CREATOR_DID),
             ExportScope::Full,
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
             sign_with_test_key,
         )
         .unwrap();
@@ -1396,7 +1396,7 @@ mod tests {
             event_log_data,
             DID::from(TEST_CREATOR_DID),
             ExportScope::Full,
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
             sign_with_test_key,
         )
         .unwrap();
@@ -1441,7 +1441,7 @@ mod tests {
             real_log,
             DID::from(TEST_CREATOR_DID),
             ExportScope::Full,
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
             sign_with_test_key,
         )
         .unwrap();
@@ -1492,7 +1492,7 @@ mod tests {
             event_log_data,
             DID::from(TEST_CREATOR_DID),
             ExportScope::Full,
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
             sign_with_test_key,
         )
         .unwrap();
@@ -1699,7 +1699,7 @@ mod tests {
             full_data,
             DID::from(TEST_CREATOR_DID),
             ExportScope::Full,
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
             sign_with_test_key,
         )
         .unwrap();
@@ -1735,7 +1735,7 @@ mod tests {
             Vec::new(),
             DID::from(TEST_CREATOR_DID),
             ExportScope::Public,
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
             sign_with_test_key,
         )
         .unwrap();
@@ -1763,7 +1763,7 @@ mod tests {
             event_log_data,
             DID::from(TEST_CREATOR_DID),
             ExportScope::Full,
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
             sign_with_test_key,
         )
         .unwrap();
@@ -1798,7 +1798,7 @@ mod tests {
             event_log_data,
             DID::from(TEST_CREATOR_DID),
             ExportScope::Full,
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
             sign_with_test_key,
         )
         .unwrap();
@@ -1830,7 +1830,7 @@ mod tests {
             Vec::new(),
             DID::from(TEST_CREATOR_DID),
             ExportScope::Full,
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
             sign_with_test_key,
         )
         .unwrap();
@@ -1909,7 +1909,7 @@ mod tests {
             event_log_data,
             DID::from(TEST_CREATOR_DID),
             ExportScope::Full,
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
             sign_with_test_key,
         )
         .unwrap();
@@ -1958,7 +1958,7 @@ mod tests {
                 event_log_data,
                 DID::from(TEST_CREATOR_DID),
                 original,
-                &scp_primitives::SystemClock,
+                &scp_clock::SystemClock,
                 sign_with_test_key,
             )
             .unwrap();
@@ -2015,7 +2015,7 @@ mod tests {
                 Vec::new(),
                 DID::from(TEST_CREATOR_DID),
                 scope,
-                &scp_primitives::SystemClock,
+                &scp_clock::SystemClock,
                 sign_with_test_key,
             )
             .unwrap();
@@ -2037,7 +2037,7 @@ mod tests {
             Vec::new(),
             DID::from(TEST_CREATOR_DID),
             ExportScope::Full,
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
             sign_with_test_key,
         )
         .unwrap();
@@ -2154,7 +2154,7 @@ mod tests {
             data.clone(),
             DID::from(TEST_CREATOR_DID),
             ExportScope::Full,
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
             sign_with_test_key,
         )
         .unwrap();
@@ -2225,7 +2225,7 @@ mod tests {
             Vec::new(),
             DID::from(TEST_CREATOR_DID),
             ExportScope::Full,
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
             sign_with_test_key,
         )
         .unwrap();
@@ -2262,7 +2262,7 @@ mod tests {
             Vec::new(),
             DID::from(TEST_CREATOR_DID),
             ExportScope::Full,
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
             sign_with_test_key,
         )
         .unwrap();
@@ -2361,7 +2361,7 @@ mod tests {
             Vec::new(),
             DID::from(TEST_CREATOR_DID),
             ExportScope::Full,
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
             sign,
         )
         .unwrap();
@@ -2370,7 +2370,7 @@ mod tests {
             Vec::new(),
             DID::from(TEST_CREATOR_DID),
             ExportScope::Full,
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
             sign,
         )
         .unwrap();
@@ -2398,7 +2398,7 @@ mod tests {
             Vec::new(),
             DID::from("did:key:not-the-creator"),
             ExportScope::Full,
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
             sign_with_test_key,
         )
         .unwrap();
@@ -2430,7 +2430,7 @@ mod tests {
             Vec::new(),
             DID::from(TEST_CREATOR_DID),
             ExportScope::Full,
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
             sign_with_test_key,
         )
         .unwrap();
@@ -2470,7 +2470,7 @@ mod tests {
             Vec::new(),
             DID::from(TEST_CREATOR_DID),
             ExportScope::Full,
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
             sign_with_test_key,
         )
         .unwrap();
@@ -2690,7 +2690,7 @@ mod tests {
             Vec::new(),
             DID::from(TEST_CREATOR_DID),
             ExportScope::Full,
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
             sign_with_test_key,
         )
         .unwrap();

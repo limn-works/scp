@@ -19,9 +19,9 @@ use std::time::Duration;
 
 use rustls::server::ResolvesServerCert;
 use rustls::sign::CertifiedKey;
+use scp_clock::Clock;
 use scp_core::store::ProtocolRepository;
 use scp_platform::traits::Storage;
-use scp_primitives::Clock;
 use tokio::sync::RwLock;
 use zeroize::Zeroizing;
 
@@ -158,7 +158,7 @@ impl CertificateData {
     pub fn needs_renewal(&self) -> Result<bool, TlsError> {
         let expiry = self.expiry_timestamp()?;
         #[allow(clippy::cast_possible_wrap)] // Unix timestamp won't exceed i64::MAX for centuries
-        let now = scp_primitives::SystemClock.now_secs() as i64;
+        let now = scp_clock::SystemClock.now_secs() as i64;
 
         let threshold = RENEWAL_THRESHOLD_DAYS * 24 * 60 * 60;
         Ok(expiry - now < threshold)
@@ -937,8 +937,8 @@ pub fn generate_self_signed_multi(
 )]
 mod tests {
     use super::*;
+    use scp_clock::Clock;
     use scp_platform::testing::InMemoryStorage;
-    use scp_primitives::Clock;
 
     // -- Self-signed generation --
 
@@ -1078,7 +1078,7 @@ mod tests {
     fn expiry_timestamp_is_in_future() {
         let cert = generate_self_signed("test.example.com").unwrap();
         let expiry = cert.expiry_timestamp().unwrap();
-        let now = scp_primitives::SystemClock.now_secs() as i64;
+        let now = scp_clock::SystemClock.now_secs() as i64;
         assert!(expiry > now, "self-signed cert should expire in the future");
     }
 

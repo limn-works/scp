@@ -16,9 +16,9 @@ use std::collections::HashSet;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
+use scp_clock::Clock;
 use scp_platform::testing::InMemoryKeyCustody;
 use scp_platform::traits::{KeyCustody, KeyType};
-use scp_primitives::Clock;
 
 use scp_protocol::crypto::ucan::capability::CapabilityUri;
 use scp_protocol::crypto::ucan::nonce;
@@ -53,7 +53,7 @@ async fn setup_identity() -> (
 }
 
 /// Production system clock for tests that validate against real time.
-static SYSTEM_CLOCK: scp_primitives::SystemClock = scp_primitives::SystemClock;
+static SYSTEM_CLOCK: scp_clock::SystemClock = scp_clock::SystemClock;
 
 /// Build a [`ValidationContext`] with in-memory implementations.
 fn build_context<'a, S: std::hash::BuildHasher>(
@@ -144,7 +144,7 @@ async fn validate_ucan_accepts_valid_token() {
         ceiling: None,
     };
 
-    let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+    let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
         .await
         .unwrap();
 
@@ -193,7 +193,7 @@ async fn validate_ucan_rejects_tampered_signature() {
         ceiling: None,
     };
 
-    let mut token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+    let mut token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
         .await
         .unwrap();
 
@@ -264,7 +264,7 @@ async fn validate_ucan_accepts_delegated_token() {
             ceiling: None,
         },
         &custody_creator,
-        &scp_primitives::SystemClock,
+        &scp_clock::SystemClock,
     )
     .await
     .unwrap();
@@ -289,7 +289,7 @@ async fn validate_ucan_accepts_delegated_token() {
             ceiling: None,
         },
         &custody_delegator,
-        &scp_primitives::SystemClock,
+        &scp_clock::SystemClock,
     )
     .await
     .unwrap();
@@ -357,7 +357,7 @@ async fn validate_ucan_rejects_broken_chain_aud_iss_mismatch() {
             ceiling: None,
         },
         &custody_creator,
-        &scp_primitives::SystemClock,
+        &scp_clock::SystemClock,
     )
     .await
     .unwrap();
@@ -382,7 +382,7 @@ async fn validate_ucan_rejects_broken_chain_aud_iss_mismatch() {
             ceiling: None,
         },
         &custody_b,
-        &scp_primitives::SystemClock,
+        &scp_clock::SystemClock,
     )
     .await
     .unwrap();
@@ -442,7 +442,7 @@ async fn validate_ucan_rejects_unresolvable_proof() {
             ceiling: None,
         },
         &custody,
-        &scp_primitives::SystemClock,
+        &scp_clock::SystemClock,
     )
     .await
     .unwrap();
@@ -500,7 +500,7 @@ async fn validate_ucan_rejects_wrong_issuer() {
         ceiling: None,
     };
 
-    let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+    let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
         .await
         .unwrap();
 
@@ -560,7 +560,7 @@ async fn validate_ucan_rejects_wrong_root_issuer_in_chain() {
             ceiling: None,
         },
         &custody_non_creator,
-        &scp_primitives::SystemClock,
+        &scp_clock::SystemClock,
     )
     .await
     .unwrap();
@@ -585,7 +585,7 @@ async fn validate_ucan_rejects_wrong_root_issuer_in_chain() {
             ceiling: None,
         },
         &custody_delegator,
-        &scp_primitives::SystemClock,
+        &scp_clock::SystemClock,
     )
     .await
     .unwrap();
@@ -651,7 +651,7 @@ async fn validate_ucan_rejects_audience_mismatch() {
         ceiling: None,
     };
 
-    let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+    let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
         .await
         .unwrap();
 
@@ -708,7 +708,7 @@ async fn validate_ucan_rejects_missing_capability() {
         ceiling: None,
     };
 
-    let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+    let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
         .await
         .unwrap();
 
@@ -762,7 +762,7 @@ async fn validate_ucan_accepts_wildcard_capability_grant() {
         ceiling: None,
     };
 
-    let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+    let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
         .await
         .unwrap();
 
@@ -828,7 +828,7 @@ async fn validate_ucan_rejects_widened_capabilities_in_delegation() {
             ceiling: None,
         },
         &custody_creator,
-        &scp_primitives::SystemClock,
+        &scp_clock::SystemClock,
     )
     .await
     .unwrap();
@@ -853,7 +853,7 @@ async fn validate_ucan_rejects_widened_capabilities_in_delegation() {
             ceiling: None,
         },
         &custody_delegator,
-        &scp_primitives::SystemClock,
+        &scp_clock::SystemClock,
     )
     .await
     .unwrap();
@@ -918,7 +918,7 @@ async fn validate_ucan_rejects_capability_outside_ceiling() {
         ceiling: None,
     };
 
-    let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+    let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
         .await
         .unwrap();
 
@@ -978,7 +978,7 @@ async fn validate_ucan_rejects_nonce_replay() {
         ceiling: None,
     };
 
-    let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+    let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
         .await
         .unwrap();
 
@@ -1046,7 +1046,7 @@ async fn validate_ucan_rejects_revoked_token() {
         ceiling: None,
     };
 
-    let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+    let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
         .await
         .unwrap();
 
@@ -1104,7 +1104,7 @@ async fn validate_ucan_revocation_uses_content_hash_cid() {
         ceiling: None,
     };
 
-    let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+    let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
         .await
         .unwrap();
     let revocation_cid = compute_revocation_cid(&token.encoded);
@@ -1164,7 +1164,7 @@ async fn validate_ucan_rejects_expired_token() {
         ceiling: None,
     };
 
-    let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+    let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
         .await
         .unwrap();
 
@@ -1208,10 +1208,10 @@ async fn validate_ucan_rejects_expired_token() {
 #[test]
 fn nonce_tracker_rejects_reused_nonce() {
     let mut tracker = InMemoryNonceTracker::new();
-    let now_millis = scp_primitives::SystemClock.now_millis();
+    let now_millis = scp_clock::SystemClock.now_millis();
 
     let nonce = format!("{now_millis}-aabbccdd11223344aabbccdd11223344");
-    let expiry = scp_primitives::SystemClock.now_secs() + 3600;
+    let expiry = scp_clock::SystemClock.now_secs() + 3600;
 
     assert!(tracker.check_and_record(&nonce, expiry).is_ok());
     let result = tracker.check_and_record(&nonce, expiry);
@@ -1224,7 +1224,7 @@ fn nonce_tracker_rejects_reused_nonce() {
 #[test]
 fn nonce_tracker_rejects_malformed_nonce() {
     let mut tracker = InMemoryNonceTracker::new();
-    let expiry = scp_primitives::SystemClock.now_secs() + 3600;
+    let expiry = scp_clock::SystemClock.now_secs() + 3600;
 
     // No separator.
     let result = tracker.check_and_record("nohyphen", expiry);
@@ -1235,7 +1235,7 @@ fn nonce_tracker_rejects_malformed_nonce() {
     assert!(matches!(result, Err(UcanError::NonceFormatInvalid(_))));
 
     // Hex suffix too short.
-    let now_millis = scp_primitives::SystemClock.now_millis();
+    let now_millis = scp_clock::SystemClock.now_millis();
     let result = tracker.check_and_record(&format!("{now_millis}-aabb"), expiry);
     assert!(matches!(result, Err(UcanError::NonceFormatInvalid(_))));
 }
@@ -1264,7 +1264,7 @@ async fn parse_and_validate_roundtrip() {
         ceiling: None,
     };
 
-    let minted = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+    let minted = mint_ucan(&params, &custody, &scp_clock::SystemClock)
         .await
         .unwrap();
 
@@ -1331,7 +1331,7 @@ async fn full_pipeline_mint_delegate_parse_validate() {
             ceiling: None,
         },
         &custody_creator,
-        &scp_primitives::SystemClock,
+        &scp_clock::SystemClock,
     )
     .await
     .unwrap();
@@ -1362,7 +1362,7 @@ async fn full_pipeline_mint_delegate_parse_validate() {
             ceiling: None,
         },
         &custody_delegator,
-        &scp_primitives::SystemClock,
+        &scp_clock::SystemClock,
     )
     .await
     .unwrap();
@@ -1459,14 +1459,14 @@ async fn validate_ucan_rejects_self_delegation_without_key_scope() {
     // invalid token manually to verify the validation layer independently.
     let (custody, key_handle, issuer_did, pk_bytes) = setup_identity().await;
 
-    let now = scp_primitives::SystemClock.now_secs();
+    let now = scp_clock::SystemClock.now_secs();
     let header = UcanHeader::new();
     let payload = UcanPayload {
         iss: issuer_did.clone(),
         aud: issuer_did.clone(),
         exp: now + 3600,
         nbf: None,
-        nnc: nonce::generate_nonce(&scp_primitives::SystemClock),
+        nnc: nonce::generate_nonce(&scp_clock::SystemClock),
         att: vec![Attenuation {
             with: "scp:ctx:ctx-self/messages:write".to_owned(),
             can: "write".to_owned(),
@@ -1542,7 +1542,7 @@ async fn validate_ucan_accepts_self_delegation_with_key_scope() {
         ceiling: None,
     };
 
-    let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+    let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
         .await
         .unwrap();
 
@@ -1608,7 +1608,7 @@ async fn validate_ucan_accepts_matching_key_scope() {
         ceiling: None,
     };
 
-    let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+    let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
         .await
         .unwrap();
 
@@ -1671,7 +1671,7 @@ async fn validate_ucan_rejects_mismatched_key_scope() {
         ceiling: None,
     };
 
-    let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+    let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
         .await
         .unwrap();
 
@@ -1730,7 +1730,7 @@ async fn validate_ucan_skips_key_scope_check_when_absent() {
         ceiling: None,
     };
 
-    let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+    let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
         .await
         .unwrap();
 
@@ -1789,7 +1789,7 @@ async fn validate_ucan_scoped_ucan_cannot_be_exercised_by_wrong_key() {
         ceiling: None,
     };
 
-    let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+    let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
         .await
         .unwrap();
 
@@ -1865,7 +1865,7 @@ async fn validate_ucan_step8_rejects_smuggled_out_of_ceiling_attestation() {
         ceiling: Some(mint_ceiling),
     };
 
-    let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+    let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
         .await
         .unwrap();
 
@@ -1924,7 +1924,7 @@ async fn validate_ucan_step8_accepts_multi_attestation_all_in_ceiling() {
         ceiling: None,
     };
 
-    let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+    let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
         .await
         .unwrap();
 
@@ -1984,7 +1984,7 @@ async fn validate_ucan_ceiling_violation_does_not_consume_nonce() {
         ceiling: Some(mint_ceiling),
     };
 
-    let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+    let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
         .await
         .unwrap();
 
@@ -2055,7 +2055,7 @@ async fn evaluate_ucan_does_not_consume_nonce_but_validate_does() {
         ceiling: None,
     };
 
-    let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+    let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
         .await
         .unwrap();
 
@@ -2159,7 +2159,7 @@ async fn evaluate_ucan_reports_bad_signature() {
         ceiling: None,
     };
 
-    let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+    let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
         .await
         .unwrap();
 
@@ -2227,7 +2227,7 @@ async fn evaluate_ucan_reports_out_of_ceiling_attestation() {
         ceiling: Some(mint_ceiling),
     };
 
-    let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+    let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
         .await
         .unwrap();
 
@@ -2292,7 +2292,7 @@ async fn evaluate_ucan_reports_revoked_token() {
         ceiling: None,
     };
 
-    let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+    let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
         .await
         .unwrap();
 
@@ -2360,7 +2360,7 @@ async fn evaluate_ucan_reports_expired_token() {
         ceiling: None,
     };
 
-    let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+    let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
         .await
         .unwrap();
 
@@ -2446,7 +2446,7 @@ async fn evaluate_ucan_partial_struct_for_ungranted_capability_is_stable() {
         ceiling: None,
     };
 
-    let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+    let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
         .await
         .unwrap();
 
@@ -2524,7 +2524,7 @@ async fn evaluate_ucan_none_capability_valid_token_all_true() {
         ceiling: None,
     };
 
-    let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+    let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
         .await
         .unwrap();
 
@@ -2592,7 +2592,7 @@ async fn evaluate_ucan_none_capability_out_of_ceiling_reports_false() {
         ceiling: Some(mint_ceiling),
     };
 
-    let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+    let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
         .await
         .unwrap();
 
@@ -2668,7 +2668,7 @@ async fn evaluate_ucan_none_vs_some_for_ungranted_invoked_capability() {
         ceiling: None,
     };
 
-    let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+    let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
         .await
         .unwrap();
 

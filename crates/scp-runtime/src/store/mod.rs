@@ -856,7 +856,7 @@ mod tests {
     async fn identity_store_rejects_traversal_did() {
         let store =
             ProtocolRepository::new_for_testing(scp_platform::testing::InMemoryStorage::new());
-        let malicious_did = scp_identity::DID::from("../context/victim");
+        let malicious_did = scp_did::DID::from("../context/victim");
         let result = store.store_identity_document(&malicious_did, b"bad").await;
         assert!(result.is_err());
     }
@@ -865,7 +865,7 @@ mod tests {
     async fn identity_store_rejects_backslash_did() {
         let store =
             ProtocolRepository::new_for_testing(scp_platform::testing::InMemoryStorage::new());
-        let malicious_did = scp_identity::DID::from("evil\\did");
+        let malicious_did = scp_did::DID::from("evil\\did");
         let result = store.store_identity_document(&malicious_did, b"bad").await;
         assert!(result.is_err());
     }
@@ -892,7 +892,7 @@ mod tests {
     async fn economy_store_rejects_traversal_adapter_id() {
         let store =
             ProtocolRepository::new_for_testing(scp_platform::testing::InMemoryStorage::new());
-        let did = scp_identity::DID::from("did:dht:z6MkTest");
+        let did = scp_did::DID::from("did:dht:z6MkTest");
         let result = store
             .store_adapter_credentials(&did, "../document", b"bad")
             .await;
@@ -913,7 +913,7 @@ mod tests {
     async fn well_formed_identifiers_succeed_across_all_domains() {
         let store =
             ProtocolRepository::new_for_testing(scp_platform::testing::InMemoryStorage::new());
-        let did = scp_identity::DID::from("did:dht:z6MkTest");
+        let did = scp_did::DID::from("did:dht:z6MkTest");
 
         // Context domain
         store

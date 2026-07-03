@@ -28,7 +28,7 @@
 
 use std::sync::Arc;
 
-use scp_identity::{DID, SigningKeyId};
+use scp_did::{DID, SigningKeyId};
 use scp_platform::testing::InMemoryStorage;
 use scp_protocol::context::builder::OpenResult;
 use scp_protocol::context::governance::KeyResolver;

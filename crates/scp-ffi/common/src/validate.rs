@@ -1551,7 +1551,7 @@ mod tests {
                 },
                 implementation_hash: [0u8; 32],
                 test_vectors: vec![],
-                operator_did: scp_primitives::DID("did:dht:z6MkTest".to_owned()),
+                operator_did: scp_did::DID("did:dht:z6MkTest".to_owned()),
                 cost: None,
                 registered_at: 0,
                 signature: vec![],
@@ -1577,7 +1577,7 @@ mod tests {
                 },
                 implementation_hash: [0u8; 32],
                 test_vectors: vec![],
-                operator_did: scp_primitives::DID("did:dht:z6MkTest".to_owned()),
+                operator_did: scp_did::DID("did:dht:z6MkTest".to_owned()),
                 cost: None,
                 registered_at: 0,
                 signature: vec![],
@@ -1592,7 +1592,7 @@ mod tests {
         use scp_protocol::context::governance::GovernanceAction;
 
         let action = GovernanceAction::AddMember {
-            did: scp_primitives::DID("did:dht:z6MkTest".to_owned()),
+            did: scp_did::DID("did:dht:z6MkTest".to_owned()),
             role: "moderator".to_owned(),
         };
         assert!(validate_governance_action_strings(&action).is_ok());
@@ -1603,7 +1603,7 @@ mod tests {
         use scp_protocol::context::governance::GovernanceAction;
 
         let action = GovernanceAction::AddMember {
-            did: scp_primitives::DID("did:dht:z6MkTest".to_owned()),
+            did: scp_did::DID("did:dht:z6MkTest".to_owned()),
             role: "<admin>".to_owned(),
         };
         let err = validate_governance_action_strings(&action).unwrap_err();
@@ -1615,7 +1615,7 @@ mod tests {
         use scp_protocol::context::governance::GovernanceAction;
 
         let action = GovernanceAction::RemoveMember {
-            did: scp_primitives::DID("did:dht:z6MkTest".to_owned()),
+            did: scp_did::DID("did:dht:z6MkTest".to_owned()),
             reason: None,
         };
         assert!(validate_governance_action_strings(&action).is_ok());
@@ -1626,7 +1626,7 @@ mod tests {
         use scp_protocol::context::governance::GovernanceAction;
 
         let action = GovernanceAction::RemoveMember {
-            did: scp_primitives::DID("did:dht:z6MkTest".to_owned()),
+            did: scp_did::DID("did:dht:z6MkTest".to_owned()),
             reason: Some(String::new()),
         };
         assert!(validate_governance_action_strings(&action).is_ok());
@@ -1637,7 +1637,7 @@ mod tests {
         use scp_protocol::context::governance::GovernanceAction;
 
         let action = GovernanceAction::RemoveMember {
-            did: scp_primitives::DID("did:dht:z6MkTest".to_owned()),
+            did: scp_did::DID("did:dht:z6MkTest".to_owned()),
             reason: Some("   ".to_owned()),
         };
         assert!(validate_governance_action_strings(&action).is_err());
@@ -1648,7 +1648,7 @@ mod tests {
         use scp_protocol::context::governance::GovernanceAction;
 
         let action = GovernanceAction::RemoveMember {
-            did: scp_primitives::DID("did:dht:z6MkTest".to_owned()),
+            did: scp_did::DID("did:dht:z6MkTest".to_owned()),
             reason: Some("\t".to_owned()),
         };
         assert!(validate_governance_action_strings(&action).is_err());
@@ -1679,7 +1679,7 @@ mod tests {
         use scp_protocol::context::governance::GovernanceAction;
 
         let action = GovernanceAction::RemoveMember {
-            did: scp_primitives::DID("did:dht:z6MkTest".to_owned()),
+            did: scp_did::DID("did:dht:z6MkTest".to_owned()),
             reason: Some("bad\0actor".to_owned()),
         };
         let err = validate_governance_action_strings(&action).unwrap_err();

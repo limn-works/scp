@@ -49,7 +49,7 @@ pub mod time;
 use std::sync::Arc;
 
 use scp_client::{ScpClient, Signer, Storage};
-use scp_primitives::Clock;
+use scp_clock::Clock;
 use wasm_bindgen::prelude::*;
 
 use crate::error::map_err;

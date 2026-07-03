@@ -21,9 +21,9 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use scp_did::DID;
 use scp_event_log::payload::{GovernanceActionExecutedPayload, decode_payload, project_payload};
 use scp_event_log::{ContextId, Event, EventType};
-use scp_primitives::DID;
 
 use super::attestation::{Attestation, RevocationStatus};
 use super::{AttestationReference, GovernanceActionSummary, RoleTransition, ToolId, TrustError};
@@ -1278,7 +1278,7 @@ pub fn produce_participation_profile(
 pub const PARTICIPATION_STATEMENTS_SERVICE_TYPE: &str = "ScpParticipationStatements";
 
 // NOTE: The following functions were moved to scp-runtime::trust::participation_service
-// because they depend on `scp_identity::document::DidDocument`, which would pull
+// because they depend on `scp_did::DidDocument`, which would pull
 // tokio into scp-protocol's dependency tree:
 //   - add_participation_service()
 //   - remove_participation_service()
@@ -3273,7 +3273,7 @@ mod tests {
     }
 
     // SCP-BA-006 tests moved to scp-runtime::trust::participation_service (they
-    // depend on scp_identity::document::DidDocument).
+    // depend on scp_did::DidDocument).
 
     // -----------------------------------------------------------------------
     // Canonical subject-bearing payload tests
@@ -3500,7 +3500,7 @@ mod tests {
         // constructs every adverse variant and asserts the correspondence in
         // both directions.
         use crate::context::governance::{AccessScope, GovernanceAction};
-        use scp_primitives::DID;
+        use scp_did::DID;
 
         let target = || DID::from("did:dht:z6MkAdverseTarget");
 

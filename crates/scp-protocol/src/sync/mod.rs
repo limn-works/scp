@@ -40,7 +40,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use scp_primitives::DID;
+use scp_did::DID;
 
 // ---------------------------------------------------------------------------
 // Type aliases for domain clarity

@@ -18,7 +18,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use scp_identity::DID;
+use scp_did::{DID, SigningKeyId};
 use scp_protocol::context::ContextError;
 use scp_protocol::context::governance::KeyResolver;
 use scp_protocol::crypto::ucan::UcanError;
@@ -28,7 +28,6 @@ use scp_protocol::crypto::ucan::validate::{
 };
 use scp_protocol::economy::policy::ObservableMetrics;
 use scp_protocol::economy::types::PaidActionType;
-use scp_protocol::identity::SigningKeyId;
 
 use crate::economy::adapter::{PaymentAdapterDyn, PaymentReceipt};
 use crate::economy::integration::{self, IntegrationError};
@@ -79,7 +78,7 @@ impl DidResolver for KeyResolverDidResolver<'_> {
     fn resolve_public_key(&self, did: &str) -> Result<[u8; 32], UcanError> {
         // No `kid` in the header: resolve the default verification method
         // (`#active`, the human signing key).
-        let did_owned = scp_identity::DID::from(did.to_owned());
+        let did_owned = scp_did::DID::from(did.to_owned());
         (self.key_resolver)(&did_owned, SigningKeyId::Active)
             .map(|vk| vk.to_bytes())
             .ok_or_else(|| {
@@ -101,7 +100,7 @@ impl DidResolver for KeyResolverDidResolver<'_> {
                  (expected \"#active\" or \"#agent\") for DID '{did}'"
             ))
         })?;
-        let did_owned = scp_identity::DID::from(did.to_owned());
+        let did_owned = scp_did::DID::from(did.to_owned());
         (self.key_resolver)(&did_owned, signing_key_id)
             .map(|vk| vk.to_bytes())
             .ok_or_else(|| {
@@ -156,12 +155,10 @@ pub fn validate_spending_ucan_or_error(
     spending: &scp_protocol::crypto::ucan::UcanToken,
     actor_did: &DID,
     context_id: &str,
-    nonce_tracker: &mut scp_protocol::crypto::ucan::nonce::NonceTracker<
-        Arc<dyn scp_primitives::Clock>,
-    >,
+    nonce_tracker: &mut scp_protocol::crypto::ucan::nonce::NonceTracker<Arc<dyn scp_clock::Clock>>,
     revoked_cids: &HashSet<String>,
     key_resolver: &KeyResolver,
-    clock: &dyn scp_primitives::Clock,
+    clock: &dyn scp_clock::Clock,
 ) -> Result<(), ContextError> {
     let did_resolver = KeyResolverDidResolver::new(key_resolver);
     let revocation_checker = ContextRevocationChecker { revoked_cids };
@@ -304,12 +301,12 @@ pub struct EnforceEconomyRequest<'a> {
     /// Context ID the spending UCAN must scope to.
     pub context_id: &'a str,
     /// Clock used for UCAN expiry validation.
-    pub clock: &'a dyn scp_primitives::Clock,
+    pub clock: &'a dyn scp_clock::Clock,
     /// Per-context pricing configuration (escalation curve, floor, cap).
     pub pricing: &'a scp_protocol::economy::antispam::ContextMessagePricingConfig,
     /// Per-context nonce tracker for spending-UCAN replay prevention.
     pub nonce_tracker: &'a mut scp_protocol::crypto::ucan::nonce::NonceTracker<
-        std::sync::Arc<dyn scp_primitives::Clock>,
+        std::sync::Arc<dyn scp_clock::Clock>,
     >,
     /// Per-context revoked spending-UCAN CIDs (C1, PR #1606).
     ///

@@ -1,3 +1,7 @@
+#![doc = include_str!("../README.md")]
+#![warn(missing_docs)]
+#![forbid(unsafe_code)]
+
 //! Clock utilities with proper error handling.
 //!
 //! The public API is the [`Clock`] trait with two implementations:

@@ -33,7 +33,7 @@ use std::sync::{Arc, Mutex};
 
 use scp_core::crypto::access_keys::{AccessKey, AccessKeyStore};
 use scp_core::crypto::mls::provider::MlsCryptoProvider;
-use scp_identity::DID;
+use scp_did::DID;
 
 use super::exchange::KeyExchange;
 

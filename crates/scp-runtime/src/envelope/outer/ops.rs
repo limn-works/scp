@@ -8,9 +8,9 @@
 use sha2::{Digest, Sha256};
 
 use super::{OuterEnvelope, create_outer_envelope};
-use crate::crypto::mls::encrypt::{decrypt_with_sender_key, encrypt, serialize_ciphertext};
-use crate::crypto::mls::group::ScpMlsGroup;
 use crate::envelope::inner::{InnerEnvelope, verify_inner_signature};
+use scp_mls::encrypt::{decrypt_with_sender_key, encrypt, serialize_ciphertext};
+use scp_mls::group::ScpMlsGroup;
 use scp_protocol::crypto::sender_keys::SenderKey;
 use scp_protocol::crypto::sender_keys::encrypt::{decrypt_sender_layer, encrypt_sender_layer};
 use scp_protocol::envelope::EnvelopeError;
@@ -225,8 +225,8 @@ pub fn open_envelope(
 /// Returns [`EnvelopeError::UnknownSender`] if no member's credential
 /// contains the given DID.
 fn verify_sender_in_group(group: &ScpMlsGroup, sender_did: &str) -> Result<(), EnvelopeError> {
-    use crate::crypto::mls::credential::ScpCredential;
     use openmls::prelude::BasicCredential;
+    use scp_mls::credential::ScpCredential;
 
     let members = group
         .members()
@@ -258,20 +258,20 @@ mod seal_open_tests {
     use sha2::{Digest, Sha256};
 
     use super::*;
-    use crate::crypto::mls::credential::ScpCredential;
-    use crate::crypto::mls::group::{add_member, create_group, generate_key_package, join_group};
     use crate::envelope::inner::sign::create_inner_envelope;
     use crate::envelope::inner::{InnerEnvelopeParams, MessageType, Provenance};
+    use scp_did::SigningKeyId;
+    use scp_mls::credential::ScpCredential;
+    use scp_mls::group::{add_member, create_group, generate_key_package, join_group};
     use scp_protocol::crypto::sender_keys::generate_sender_key;
     use scp_protocol::envelope::padding::strip_padding;
-    use scp_protocol::identity::SigningKeyId;
 
     #[allow(clippy::unwrap_used)]
     fn test_credential(name: &str) -> ScpCredential {
         ScpCredential::new(
             format!("did:dht:z6Mk{name}"),
             None,
-            scp_identity::SigningKeyId::Active,
+            scp_did::SigningKeyId::Active,
         )
         .unwrap()
     }
@@ -1023,9 +1023,7 @@ mod seal_open_tests {
     /// MLS encrypt).
     #[tokio::test]
     async fn open_envelope_rejects_tampered_sender_key_ciphertext() {
-        use crate::crypto::mls::encrypt::{
-            encrypt as mls_encrypt, serialize_ciphertext as mls_serialize,
-        };
+        use scp_mls::encrypt::{encrypt as mls_encrypt, serialize_ciphertext as mls_serialize};
         use scp_protocol::crypto::sender_keys::encrypt::encrypt_sender_layer;
 
         let (mut alice_group, mut bob_group) = setup_mls_groups();

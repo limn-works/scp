@@ -144,7 +144,7 @@ struct RevocationStateChecker<'a> {
 }
 
 impl AttestationRevocationChecker for RevocationStateChecker<'_> {
-    fn check_revocation(&self, attestation_id: &str, _issuer: &scp_primitives::DID) -> Option<u64> {
+    fn check_revocation(&self, attestation_id: &str, _issuer: &scp_did::DID) -> Option<u64> {
         // The context revocation list stores only a boolean per attestation id
         // (no timestamp); report `0` as the revocation time when an id is
         // listed. That value only ever populates the dropped-entry log line, not
@@ -214,7 +214,7 @@ fn verify_and_cache_attestations<S: TrustProtocolRepository>(
     cache: &scp_core::trust::aggregate::AttestationCache<S>,
     context_id: &str,
     resolver: &scp_core::trust::IdentityDidPublicKeyResolver,
-    clock: &scp_identity::cache::SystemClock,
+    clock: &scp_clock::SystemClock,
     entries: Vec<CachedAttestation>,
 ) -> Result<(), TrustError> {
     let revoked = cache.store().get_revocation_state(context_id)?;
@@ -273,7 +273,7 @@ pub fn populate_and_aggregate<S: TrustProtocolRepository>(
 ) -> Result<String, TrustError> {
     let cache = scp_core::trust::aggregate::AttestationCache::new(store);
     let resolver = scp_core::trust::IdentityDidPublicKeyResolver;
-    let clock = scp_identity::cache::SystemClock;
+    let clock = scp_clock::SystemClock;
 
     // Verify-on-ingest for caller-supplied attestations (see helper for the
     // SECURITY rationale).
@@ -334,7 +334,7 @@ pub fn populate_and_aggregate<S: TrustProtocolRepository>(
 /// `attestation_count` input (§7.4) WITHOUT running the full trust aggregation.
 /// It uses the SAME `AttestationCache` /
 /// [`IdentityDidPublicKeyResolver`](scp_core::trust::IdentityDidPublicKeyResolver) /
-/// [`SystemClock`](scp_identity::cache::SystemClock) wiring as
+/// [`SystemClock`](scp_clock::SystemClock) wiring as
 /// `aggregate_trust_input`, so the participation `attestation_count` and the
 /// aggregation's `verified_attestations` agree by construction.
 ///
@@ -356,7 +356,7 @@ pub fn verified_attestations<S: TrustProtocolRepository>(
 ) -> Result<Vec<scp_core::trust::attestation::Attestation>, TrustError> {
     let cache = scp_core::trust::aggregate::AttestationCache::new(store);
     let resolver = scp_core::trust::IdentityDidPublicKeyResolver;
-    let clock = scp_identity::cache::SystemClock;
+    let clock = scp_clock::SystemClock;
 
     // Verify-on-ingest for caller-supplied attestations (see helper for the
     // SECURITY rationale). A REJECTION drops the entry so a caller can never
@@ -474,7 +474,7 @@ mod tests {
         let verifier_pub = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32])
             .verifying_key()
             .to_bytes();
-        let verifier_did = scp_primitives::did_dht_from_public_key(&verifier_pub);
+        let verifier_did = scp_did::did_dht_from_public_key(&verifier_pub);
         ChallengeVerification {
             verification_id: id.to_owned(),
             verifier_did,
@@ -515,7 +515,7 @@ mod tests {
 
         let verifier_key = ed25519_dalek::SigningKey::from_bytes(&[3u8; 32]);
         let verifier_pub: [u8; 32] = verifier_key.verifying_key().to_bytes();
-        let verifier_did = scp_primitives::did_dht_from_public_key(&verifier_pub);
+        let verifier_did = scp_did::did_dht_from_public_key(&verifier_pub);
 
         let mut cv = ChallengeVerification {
             verification_id: "genuine-cv-1".to_owned(),
@@ -592,13 +592,13 @@ mod tests {
     /// consequence rules — verifying the aggregated `TrustInput` output.
     #[test]
     fn aggregate_pipeline_with_populated_store() {
+        use scp_clock::TestClock;
         use scp_core::context::roles::Capability;
         use scp_core::trust::ConsequenceRule;
         use scp_core::trust::aggregate::{AggregationContext, AttestationCache};
         use scp_core::trust::consequence::{
             ConsequenceAction, ConsequenceTrigger, EnforcementSeverity,
         };
-        use scp_identity::cache::TestClock;
 
         let context_id = "ctx-integration";
         let subject_did = "did:key:alice";
@@ -812,7 +812,7 @@ mod tests {
     ) -> scp_core::trust::Attestation {
         use ed25519_dalek::Signer;
         let pubkey: [u8; 32] = signing_key.verifying_key().to_bytes();
-        let issuer = scp_primitives::did_dht_from_public_key(&pubkey);
+        let issuer = scp_did::did_dht_from_public_key(&pubkey);
         let mut att = scp_core::trust::Attestation {
             id: id.to_owned(),
             attestation_type: AttestationType::Endorsement,
@@ -1109,7 +1109,7 @@ mod tests {
     /// and returned, so the exclusion is attributable to revocation alone.
     #[test]
     fn context_revoked_fresh_attestation_excluded_from_read_path() {
-        use scp_identity::cache::TestClock;
+        use scp_clock::TestClock;
 
         let context_id = "ctx-revoke-read";
         let subject_did = "did:key:alice-revoke";

@@ -11,7 +11,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use scp_primitives::DID;
+use scp_did::DID;
 
 // ---------------------------------------------------------------------------
 // Type aliases (match codebase pattern)

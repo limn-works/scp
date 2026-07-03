@@ -14,6 +14,7 @@ categories = ["multimedia", "cryptography"]
 serde = { workspace = true }
 serde_json = { workspace = true }
 scp-core = { path = "../scp-core", version = "=0.1.0-beta.2" }
+scp-did = { path = "../scp-did", version = "=0.1.0-beta.2" }
 scp-identity = { path = "../scp-identity", version = "=0.1.0-beta.2" }
 openmls_traits = { workspace = true }
 thiserror = { workspace = true }

@@ -39,7 +39,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
-use scp_identity::DID;
+use scp_did::DID;
 use scp_protocol::crypto::canonical::{CanonicalField, canonical_hash};
 use scp_protocol::sync::{
     ContextId, Ed25519Signature, EquivocationAlert, SyncError, SyncEvent, SyncOutcome, SyncPolicy,
