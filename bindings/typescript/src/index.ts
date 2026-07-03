@@ -197,6 +197,7 @@ export { Node, Relay } from "./server";
 export type {
   ContextReconnectResult,
   KeyCustodyProvider,
+  KeyPackageReservation,
   ReconnectReport,
   ScpOptions,
   StorageConfig,

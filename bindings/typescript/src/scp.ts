@@ -398,6 +398,30 @@ export interface ReconnectReport {
 }
 
 /**
+ * The opaque `(reservationId, keyPackagePublic)` pair returned by
+ * {@link SCP.reserveKeyPackage} (ADR-049 Phase 2J).
+ *
+ * The joiner's private signer state never leaves the native core — only the
+ * PUBLIC `KeyPackage` bytes cross the FFI boundary. Hand `keyPackagePublic` to
+ * the context creator (out of band) so it can mint a Welcome addressed to this
+ * reservation, then pass `reservationId` back to
+ * {@link SCP.contextJoinFromWelcome}.
+ */
+export interface KeyPackageReservation {
+  /**
+   * Opaque reservation id — a lookup key, not a capability. Pass back to
+   * {@link SCP.contextJoinFromWelcome} for the Welcome this `KeyPackage`
+   * addresses.
+   */
+  readonly reservationId: string;
+  /**
+   * PUBLIC MLS `KeyPackage` bytes to hand (out of band) to the context creator,
+   * who adds them to its MLS group to mint the addressed Welcome.
+   */
+  readonly keyPackagePublic: Uint8Array;
+}
+
+/**
  * Caller-supplied custody backend for {@link SCP.identityCreateWithCustody}.
  *
  * Implement this to back a DID's key material with a platform keystore (OS
@@ -1068,6 +1092,105 @@ export class SCP {
     );
     const { Context: ContextCls } = await import("./context");
     return ContextCls._fromHandle(this, raw as never, identity.did);
+  }
+
+  /**
+   * Reserves a pooled MLS `KeyPackage` under the joiner's own identity for a
+   * spawn-from-Welcome join (ADR-049 Phase 2J).
+   *
+   * The join-side peer of {@link contextCreate}: a node that intends to JOIN by
+   * receiving a Welcome first reserves a single-use `KeyPackage` under its own
+   * identity. The returned PUBLIC bytes are handed (out of band) to the context
+   * creator, who mints a Welcome addressed to this reservation; the
+   * `reservationId` is passed back to {@link contextJoinFromWelcome}. The
+   * joiner's private signer state never leaves the native core.
+   *
+   * @param owningDid The joiner's own DID. MUST be a locally-custodied identity
+   *   (same trust model as {@link contextCreate}); a non-custodied DID fails
+   *   closed with `SCP-IDENT-1001`.
+   * @returns The opaque `{ reservationId, keyPackagePublic }` pair.
+   *
+   * @example
+   * const reservation = await scp.reserveKeyPackage(joiner.did);
+   * // Hand reservation.keyPackagePublic to the creator out of band; it mints a
+   * // Welcome addressed to this reservation, which you then process:
+   * const ctx = await scp.contextJoinFromWelcome(
+   *   joiner.did,
+   *   creator.did,
+   *   contextId,
+   *   JSON.stringify({ ceiling: ["messages:read"], memoryScope: "ephemeral" }),
+   *   reservation.reservationId,
+   *   welcomeBytes,
+   * );
+   */
+  async reserveKeyPackage(owningDid: string): Promise<KeyPackageReservation> {
+    const raw = await (
+      this.#native.reserveKeyPackage as (
+        d: string,
+      ) => Promise<{ reservationId: string; keyPackagePublic: ArrayLike<number> }>
+    )(owningDid);
+    return {
+      reservationId: raw.reservationId,
+      keyPackagePublic: new Uint8Array(raw.keyPackagePublic),
+    };
+  }
+
+  /**
+   * Joins an existing SCP context by processing a received MLS Welcome, standing
+   * the local (joiner) identity up as a send-capable participant (ADR-049 Phase
+   * 2J).
+   *
+   * Completes the reserve → Welcome → join handshake begun by
+   * {@link reserveKeyPackage}: given the Welcome the creator minted for a
+   * previously-reserved `KeyPackage`, this installs the joined MLS group, derives
+   * the joiner's §9.10.4 routing pseudonym from its locally-custodied identity
+   * (never caller-supplied), and returns an active {@link Context}. Without it a
+   * Welcome-joined node can DECRYPT but cannot SEND. A non-custodied joiner
+   * hard-fails before the single-use `KeyPackage` is consumed.
+   *
+   * @param owningDid The joiner's own DID (the reservation holder).
+   * @param creatorDid DID of the context creator that minted the Welcome.
+   * @param contextId The context being joined.
+   * @param paramsJson Legible context parameters as a JSON string — the SAME
+   *   shape {@link contextCreate} takes.
+   * @param reservationId The id returned by {@link reserveKeyPackage} for the
+   *   `KeyPackage` this Welcome addresses.
+   * @param welcomeBytes The TLS-serialized MLS Welcome message.
+   * @returns An active {@link Context} for the joined context.
+   *
+   * @example
+   * const ctx = await scp.contextJoinFromWelcome(
+   *   joiner.did,
+   *   creator.did,
+   *   "ctx-abc",
+   *   JSON.stringify({ ceiling: ["messages:read"], memoryScope: "ephemeral" }),
+   *   reservation.reservationId,
+   *   welcomeBytes,
+   * );
+   */
+  async contextJoinFromWelcome(
+    owningDid: string,
+    creatorDid: string,
+    contextId: string,
+    paramsJson: string,
+    reservationId: string,
+    welcomeBytes: Uint8Array | readonly number[],
+  ): Promise<Context> {
+    const welcomeArray = ArrayBuffer.isView(welcomeBytes)
+      ? Array.from(welcomeBytes as Uint8Array)
+      : (welcomeBytes as readonly number[]);
+    const raw = await (
+      this.#native.contextJoinFromWelcome as (
+        o: string,
+        c: string,
+        ctx: string,
+        p: string,
+        r: string,
+        w: readonly number[],
+      ) => Promise<unknown>
+    )(owningDid, creatorDid, contextId, paramsJson, reservationId, welcomeArray);
+    const { Context: ContextCls } = await import("./context");
+    return ContextCls._fromHandle(this, raw as never, owningDid);
   }
 
   async contextJoin(
