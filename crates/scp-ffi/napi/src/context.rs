@@ -783,6 +783,45 @@ pub(crate) async fn context_create_on(
             })
         })?;
 
+    // Register the created context in the known-contexts discovery registry so
+    // the CREATOR surfaces its own context, closing the last cell of the
+    // 3-bridges × 3-ops discovery matrix (PyO3 and UniFFI already register on
+    // create; napi already registers on join and join_from_welcome). Reuse the
+    // creator's derived §9.10.4 pseudonym as the routing id for encrypted
+    // contexts; fall back to broadcast_routing_id (plain SHA-256, matching the
+    // send path) for broadcast contexts, which carry no per-member pseudonym.
+    // Infallible and idempotent (overwrites), so it is safe after the committed
+    // create and needs no rollback.
+    //
+    // The relay URL comes from the handleless transport probe. On the NAPI bridge
+    // the relay URL lives on a `NapiTransportManager` handle, so the honest value
+    // here is whatever `transport_status_on` surfaces (never a fabricated URL).
+    let routing_id = local_pseudonym.unwrap_or_else(|| {
+        if create_is_broadcast {
+            scp_core::context::broadcast_routing_id(&context_id)
+        } else {
+            scp_core::context::context_routing_id(&context_id)
+        }
+    });
+    let relay_url = match crate::transport::transport_status_on(bi, None).await {
+        Ok(status) => status.relay_url,
+        Err(e) => {
+            tracing::warn!(
+                "failed to query transport status during context create registration: {e}"
+            );
+            None
+        }
+    };
+    bi.core.register_known_context(
+        &context_id,
+        scp_ffi_common::bridge_instance::KnownContext {
+            routing_id,
+            relay_url,
+            member_did: creator_did.clone(),
+            last_seen: scp_primitives::SystemClock.now_secs(),
+        },
+    );
+
     // §9.10.4: a freshly created context has exactly one member, so the
     // pseudonym routing-ID announcement has no recipients and is a guaranteed
     // no-op on create. The routing ID is already registered with the
@@ -6068,6 +6107,71 @@ mod tests {
         assert!(
             for_joiner.iter().any(|(cid, _)| cid == &ctx_id),
             "plain join must register the joiner's known-context entry for discovery"
+        );
+    }
+
+    /// ADR-049 Phase 2J (create-path discovery symmetry): a successful
+    /// `context_create` registers the CREATOR's context in the known-contexts
+    /// discovery registry, closing the last cell of the 3-bridges × 3-ops
+    /// discovery matrix (`PyO3` and `UniFFI` already register on create; napi
+    /// already registers on join and `join_from_welcome`). A creating node must
+    /// be able to surface its own context via discovery.
+    ///
+    /// Drives the REAL entry point with a custodied creator for BOTH branches:
+    /// the encrypted branch (routing id is the creator's derived §9.10.4
+    /// pseudonym) and the broadcast branch (routing id falls back to
+    /// `broadcast_routing_id` — broadcast contexts carry no per-member
+    /// pseudonym).
+    /// Asserts the creator's own known-context entry is present for each. Were
+    /// the post-commit registration removed, `known_contexts_for_member` would
+    /// return nothing for the creator.
+    #[cfg(feature = "allow_in_memory_custody")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_registers_known_context_for_creator() {
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let bi = std::sync::Arc::clone(&scp.inner);
+
+        let creator = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create should succeed");
+
+        // Encrypted: routing_id is the creator's derived §9.10.4 pseudonym.
+        let enc_params = serde_json::json!({
+            "mode": "encrypted",
+            "ceiling": ["messages:read"],
+            "memoryScope": "ephemeral",
+            "governance": "single_admin",
+        })
+        .to_string();
+        let enc_handle = super::context_create_on(&bi, &creator, enc_params)
+            .await
+            .expect("encrypted context_create should succeed");
+        let enc_ctx = enc_handle.context_id.clone();
+
+        // Broadcast: routing_id falls back to broadcast_routing_id (no pseudonym).
+        // Broadcast contexts require MemoryScope::Full (spec §5.14).
+        let bcast_params = serde_json::json!({
+            "mode": "broadcast",
+            "ceiling": ["messages:read"],
+            "memoryScope": "full",
+            "governance": "single_admin",
+        })
+        .to_string();
+        let bcast_handle = super::context_create_on(&bi, &creator, bcast_params)
+            .await
+            .expect("broadcast context_create should succeed");
+        let bcast_ctx = bcast_handle.context_id.clone();
+
+        // Both created contexts now carry the creator's own discovery entry.
+        let for_creator = bi.core.known_contexts_for_member(&creator.inner.did);
+        assert!(
+            for_creator.iter().any(|(cid, _)| cid == &enc_ctx),
+            "encrypted create must register the creator's known-context entry"
+        );
+        assert!(
+            for_creator.iter().any(|(cid, _)| cid == &bcast_ctx),
+            "broadcast create must register the creator's known-context entry"
         );
     }
 
