@@ -9259,6 +9259,34 @@ impl Scp {
                 // context ID.
                 register_context_handle(&bi, &handle);
                 increment_handle_count();
+
+                // Post-commit discovery registration (mirrors
+                // `context_join_from_welcome`). Reuse the pre-derived §9.10.4
+                // routing pseudonym as the discovery routing id; ENCRYPTED
+                // creates always carry a real pseudonym (derivation hard-fails
+                // otherwise), and BROADCAST creates (which carry no per-member
+                // pseudonym) fall back to the mode-appropriate deterministic
+                // routing id — `broadcast_routing_id` for broadcast,
+                // `context_routing_id` otherwise — matching the PyO3 reference.
+                // `relay_url` is `None`: the connected relay lives on the
+                // caller-held `TransportManager` handle, not on the bridge
+                // instance. Infallible + idempotent, so it is safe after the
+                // irreversible runtime commit and needs no rollback.
+                let routing_id = local_pseudonym.unwrap_or_else(|| {
+                    if create_is_broadcast {
+                        scp_core::context::broadcast_routing_id(&handle.context_id)
+                    } else {
+                        scp_core::context::context_routing_id(&handle.context_id)
+                    }
+                });
+                let known = scp_ffi_common::bridge_instance::KnownContext {
+                    routing_id,
+                    relay_url: None,
+                    member_did: identity.did.clone(),
+                    last_seen: scp_primitives::Clock::now_secs(&scp_primitives::SystemClock),
+                };
+                bi.core.register_known_context(&handle.context_id, known);
+
                 Ok(handle)
             })
             .await
@@ -9704,6 +9732,31 @@ impl Scp {
                     )
                     .await;
                 }
+
+                // Post-commit discovery registration (mirrors
+                // `context_join_from_welcome` and `context_create`): a joined
+                // context must be discoverable just like a created one. Routing
+                // id is the joiner's pre-derived §9.10.4 pseudonym; BROADCAST
+                // joins (which carry no per-member pseudonym) fall back to the
+                // mode-appropriate deterministic routing id. `relay_url` is
+                // `None` — the connected relay lives on the caller-held
+                // `TransportManager` handle, not the bridge instance. Infallible
+                // + idempotent, so it is safe after the irreversible runtime
+                // commit and needs no rollback.
+                let routing_id = local_pseudonym.unwrap_or_else(|| {
+                    if join_is_broadcast {
+                        scp_core::context::broadcast_routing_id(&handle.context_id)
+                    } else {
+                        scp_core::context::context_routing_id(&handle.context_id)
+                    }
+                });
+                let known = scp_ffi_common::bridge_instance::KnownContext {
+                    routing_id,
+                    relay_url: None,
+                    member_did: identity.did.clone(),
+                    last_seen: scp_primitives::Clock::now_secs(&scp_primitives::SystemClock),
+                };
+                bi.core.register_known_context(&handle.context_id, known);
 
                 Ok(())
             })
@@ -17802,6 +17855,162 @@ mod tests {
         assert!(
             context_handle_registry(&scp.inner).contains_key(&context_id),
             "the pre-existing context handle must survive an Occupied-rejected join"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Discovery `KnownContext` registration on context-standing-up ops.
+    // Parity with the PyO3 reference bridge (`context_create` +
+    // `context_join_from_welcome` register post-commit).
+    // -----------------------------------------------------------------------
+
+    /// Helper: fetch the `KnownContext` discovery entry for a context id.
+    #[cfg(feature = "allow_in_memory_custody")]
+    fn known_context_entry(
+        scp: &crate::scp::Scp,
+        context_id: &str,
+    ) -> Option<scp_ffi_common::bridge_instance::KnownContext> {
+        scp.inner
+            .core
+            .all_known_contexts()
+            .into_iter()
+            .find(|(id, _)| id == context_id)
+            .map(|(_, k)| k)
+    }
+
+    /// ENCRYPTED `context_create` registers a discovery `KnownContext` whose
+    /// routing id is the creator's derived §9.10.4 pseudonym (NOT the
+    /// deterministic `context_routing_id` fallback), member is the creator, and
+    /// `relay_url` is `None`.
+    #[test]
+    #[cfg(feature = "allow_in_memory_custody")]
+    fn context_create_registers_encrypted_known_context() {
+        let rt = runtime();
+        let scp = scp_test();
+        let identity = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed");
+        let creator_did = identity.did();
+
+        assert_eq!(
+            scp.inner.core.known_context_count(),
+            0,
+            "a fresh instance has no known contexts"
+        );
+
+        let handle = rt
+            .block_on(scp.context_create(Arc::clone(&identity), encrypted_join_test_params()))
+            .expect("context_create should succeed");
+        let context_id = handle.context_id();
+
+        assert!(
+            scp.inner.core.has_known_context(&context_id),
+            "context_create must register a discovery KnownContext"
+        );
+        let entry = known_context_entry(&scp, &context_id)
+            .expect("created context must be in the discovery registry");
+        assert_eq!(
+            entry.member_did, creator_did,
+            "member_did must be the creator"
+        );
+        assert!(
+            entry.relay_url.is_none(),
+            "relay_url must be None on the UniFFI bridge"
+        );
+        assert_ne!(
+            entry.routing_id, [0u8; 32],
+            "encrypted routing id must be a real derived pseudonym, not the zero sentinel"
+        );
+        assert_ne!(
+            entry.routing_id,
+            scp_core::context::context_routing_id(&context_id),
+            "encrypted routing id must be the derived pseudonym, not the context_routing_id fallback"
+        );
+    }
+
+    /// BROADCAST `context_create` registers a `KnownContext` whose routing id is
+    /// the deterministic `broadcast_routing_id` (broadcast contexts carry no
+    /// per-member pseudonym, so the mode-appropriate fallback is used — matching
+    /// the `PyO3` reference).
+    #[test]
+    #[cfg(feature = "allow_in_memory_custody")]
+    fn context_create_registers_broadcast_known_context() {
+        let rt = runtime();
+        let scp = scp_test();
+        let identity = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed");
+        let creator_did = identity.did();
+
+        let params = ContextParams {
+            mode: ContextMode::Broadcast,
+            // Broadcast contexts require MemoryScope::Full (spec §5.14).
+            memory_scope: MemoryScope::Full,
+            ..encrypted_join_test_params()
+        };
+        let handle = rt
+            .block_on(scp.context_create(Arc::clone(&identity), params))
+            .expect("broadcast context_create should succeed");
+        let context_id = handle.context_id();
+
+        let entry = known_context_entry(&scp, &context_id)
+            .expect("created broadcast context must be in the discovery registry");
+        assert_eq!(
+            entry.routing_id,
+            scp_core::context::broadcast_routing_id(&context_id),
+            "broadcast create must register the deterministic broadcast_routing_id"
+        );
+        assert_eq!(
+            entry.member_did, creator_did,
+            "member_did must be the creator"
+        );
+        assert!(entry.relay_url.is_none(), "relay_url must be None");
+    }
+
+    /// Plain `context_join` registers a discovery `KnownContext` post-commit
+    /// (parity with `context_create`), so a joined context is discoverable just
+    /// like a created one. The context is created first (which registers its own
+    /// entry); that entry is cleared, then the creator re-joins — proving the
+    /// JOIN path re-registers, not merely create's prior entry.
+    #[test]
+    #[cfg(feature = "allow_in_memory_custody")]
+    fn context_join_registers_known_context() {
+        let rt = runtime();
+        let scp = scp_test();
+        let identity = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed");
+        let handle = rt
+            .block_on(scp.context_create(Arc::clone(&identity), encrypted_join_test_params()))
+            .expect("context_create should succeed");
+        let context_id = handle.context_id();
+
+        // Clear the create-time discovery entry so the assertion below can only
+        // pass if the JOIN path registers it anew.
+        scp.inner.core.remove_known_context(&context_id);
+        assert!(
+            !scp.inner.core.has_known_context(&context_id),
+            "discovery entry must be cleared before the join"
+        );
+
+        let join = rt.block_on(scp.context_join(Arc::clone(&handle), Arc::clone(&identity), None));
+        assert!(join.is_ok(), "context_join should succeed, got: {join:?}");
+
+        assert!(
+            scp.inner.core.has_known_context(&context_id),
+            "context_join must register a discovery KnownContext"
+        );
+        let entry = known_context_entry(&scp, &context_id)
+            .expect("joined context must be in the discovery registry");
+        assert_eq!(
+            entry.member_did,
+            identity.did(),
+            "member_did must be the joiner"
+        );
+        assert!(entry.relay_url.is_none(), "relay_url must be None");
+        assert_ne!(
+            entry.routing_id, [0u8; 32],
+            "encrypted join routing id must be a real derived pseudonym"
         );
     }
 
