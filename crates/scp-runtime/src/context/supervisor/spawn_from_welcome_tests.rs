@@ -35,9 +35,7 @@ use scp_protocol::context::governance::KeyResolver;
 use scp_protocol::context::roles::Capability;
 use scp_protocol::context::{ContextMode, ContextParams};
 
-use super::handle::SupervisorHandle;
-use super::identity_capability::OwnedIdentityDid;
-use super::key_package_actor::{KeyPackageCommand, ReservationId};
+use super::key_package_actor::KeyPackageCommand;
 use super::{Supervisor, WelcomeJoinRequest};
 use crate::context::builder::{
     ContextEventLogProvider, ContextTransportProvider, NotConfiguredTransportProvider,
@@ -1170,44 +1168,45 @@ async fn slow_confirm_consume_times_out_rolls_back_and_releases_the_lock() {
 }
 
 // ---------------------------------------------------------------------------
-// Test K — the PUBLIC `SupervisorHandle` joiner seam (ADR-049 Phase 2J FFI
-// follow-on): reserve → spawn round trip driven ENTIRELY through the
-// capability-gated handle methods, not the raw `Supervisor` entrypoint.
+// The PUBLIC bare-`DID` `Supervisor` joiner entrypoints (ADR-049 Phase 2J):
+// `reserve_key_package` + `spawn_actor_from_welcome` are bridge-initiated
+// node-level bootstraps (custody enforced at the FFI bridge layer, the same
+// trust model as `create_context`), NOT actor-internal `OwnedIdentityDid`-gated
+// methods. These exercise the reserve→spawn round trip and the store-binding
+// fail-closed path through those public methods.
 // ---------------------------------------------------------------------------
 
-/// A `&OwnedIdentityDid`-holding caller reserves one of the joiner's own
-/// key packages and fuses the creator's Welcome into a live send-capable actor
-/// — all through the two PUBLIC `SupervisorHandle` methods
-/// (`reserve_key_package` + `spawn_actor_from_welcome`), which are the seam the
-/// FFI follow-on slice drives. The handle-minted reservation feeds straight
-/// into the handle spawn, the joiner comes up registered (`member_count` is
-/// `Some(2)`, the live-actor discriminator), and the installed group is
-/// bidirectionally functional (bob encrypts through it, alice decrypts).
+/// The two PUBLIC bare-`DID` `Supervisor` bootstrap entrypoints compose into a
+/// working join: `reserve_key_package` reserves one of the joiner's own pooled
+/// `KeyPackages`, the creator builds a Welcome addressed to it, and
+/// `spawn_actor_from_welcome` fuses that Welcome into a live, send-capable
+/// actor. The joiner comes up registered (`member_count` is `Some(2)`, the
+/// live-actor discriminator) and the installed group is bidirectionally
+/// functional (bob encrypts through it, alice decrypts).
 #[tokio::test]
-async fn handle_reserve_then_spawn_yields_a_live_send_capable_actor() {
+async fn reserve_then_spawn_via_supervisor_yields_a_live_send_capable_actor() {
     let bob = DID::from(BOB_DID);
     let ctx_id = ctx_hex(0xb1);
     let ctx_bytes = context_id_to_bytes(&ctx_id);
 
     let (sup, bob_crypto) = bob_supervisor(None);
-    let handle = SupervisorHandle::wrap(Arc::clone(&sup));
-    let bob_token = OwnedIdentityDid::issue_for_actor(bob.clone());
 
-    // Reserve via the PUBLIC handle method (get-or-spawn bob's store, replenish
-    // barrier, list, reserve) — not the raw KeyPackage store.
-    let (reservation_id, kp_public_bytes) = handle
-        .reserve_key_package(&bob_token)
+    // Reserve via the PUBLIC `Supervisor` entrypoint (get-or-spawn bob's store,
+    // replenish barrier, list, reserve) — bare DID; in production the FFI bridge
+    // enforces that the DID is locally custodied.
+    let (reservation_id, kp_public_bytes) = sup
+        .reserve_key_package(bob.clone())
         .await
-        .expect("reserve_key_package yields a reservation for the owned identity");
+        .expect("reserve_key_package yields a reservation for the identity");
 
     // Alice (bare creator provider) adds the reserved KP → the real Welcome.
     let (alice_crypto, welcome) = alice_welcome_for(&ctx_bytes, &kp_public_bytes);
 
-    // Spawn via the PUBLIC handle method — the handle-minted reservation feeds
+    // Spawn via the PUBLIC `Supervisor` entrypoint — the reservation feeds
     // straight in.
-    let joined = handle
+    let joined = sup
         .spawn_actor_from_welcome(
-            &bob_token,
+            bob.clone(),
             WelcomeJoinRequest {
                 creator_did: DID::from(ALICE_DID),
                 context_id: ctx_id.clone(),
@@ -1218,26 +1217,26 @@ async fn handle_reserve_then_spawn_yields_a_live_send_capable_actor() {
             },
         )
         .await
-        .expect("spawn_actor_from_welcome via the handle stands up the joiner actor");
+        .expect("spawn_actor_from_welcome stands up the joiner actor");
     assert_eq!(joined.context_id(), ctx_id);
 
     // Live-actor discriminator: `Some(2)` (vs the unregistered `None`).
     assert_eq!(
         sup.member_count(&ctx_id).await,
         Some(2),
-        "the handle-driven join stands up a registered, send-capable actor"
+        "the reserve->spawn join stands up a registered, send-capable actor"
     );
     assert!(
         sup.lookup(&ctx_id).is_some(),
-        "a context actor handle is registered for the handle-driven joiner"
+        "a context actor handle is registered for the joiner"
     );
 
     // The installed group is real: bob encrypts through it, alice decrypts.
     let routing_id = scp_protocol::context::context_routing_id(&hex::encode(ctx_bytes));
-    let from_bob = b"handle-seam-payload-from-bob";
+    let from_bob = b"supervisor-seam-payload-from-bob";
     let wrapped_bob = bob_crypto
         .mls_encrypt_management(&ctx_bytes, from_bob, &routing_id, 3600)
-        .expect("bob encrypts a management message through the handle-installed group");
+        .expect("bob encrypts a management message through the installed group");
     let opened = alice_crypto
         .open(&ctx_bytes, &ctx_id, &wrapped_bob)
         .expect("alice opens bob's message");
@@ -1246,49 +1245,34 @@ async fn handle_reserve_then_spawn_yields_a_live_send_capable_actor() {
             &opened,
             OpenResult::Management { payload, .. } if payload.as_slice() == from_bob.as_slice()
         ),
-        "creator decrypts joiner traffic through the handle-installed group; \
+        "creator decrypts joiner traffic through the installed group; \
          expected Management({from_bob:?}), got {opened:?}"
     );
 }
 
-// ---------------------------------------------------------------------------
-// Test L — the handle seam binds the owning identity: a reservation minted for
-// one owned identity CANNOT be consumed under a different owned identity's
-// token (the capability is not a bearer credential for someone else's KP).
-// ---------------------------------------------------------------------------
-
-/// The `&OwnedIdentityDid` token binds the join to the identity it names.
-/// `reserve_key_package(&bob_token)` reserves in BOB's `KeyPackageStoreActor`;
-/// `spawn_actor_from_welcome(&charlie_token, ..)` consumes against CHARLIE's
-/// OWN (fresh) store — which holds no such reservation — so the fused
-/// `ConfirmConsume` fails closed with `InvalidState` and NO actor stands up.
-///
-/// Non-vacuity: the SAME reservation + Welcome, retried under BOB's token, then
-/// succeeds — proving Charlie's rejected attempt neither burned the KP nor
-/// stood up the context, and the reservation stayed bound to bob. (The
-/// capability itself is unforgeable by construction — `OwnedIdentityDid` is
-/// mintable only in supervisor-module code — so this exercises the RUNTIME
-/// per-identity binding the token enforces, not a forgeable-token path.)
+/// The join binds to the identity whose `KeyPackageStoreActor` holds the
+/// reservation. A reservation minted for BOB is consumed under CHARLIE — whose
+/// OWN (fresh) store never held it — so the fused `ConfirmConsume` fails closed
+/// with `InvalidState` and NO actor stands up. Non-vacuity: the SAME
+/// reservation + Welcome, retried under BOB, then succeeds — proving Charlie's
+/// rejected attempt neither burned the KP nor stood up the context.
 #[tokio::test]
-async fn handle_spawn_under_a_different_identity_token_is_rejected() {
+async fn spawn_under_a_different_did_is_rejected() {
     let bob = DID::from(BOB_DID);
     let charlie = DID::from("did:dht:z6MkCharlieNotTheJoinerSpawnFromWelcome");
     let ctx_id = ctx_hex(0xb2);
     let ctx_bytes = context_id_to_bytes(&ctx_id);
 
     let (sup, _bob_crypto) = bob_supervisor(None);
-    let handle = SupervisorHandle::wrap(Arc::clone(&sup));
-    let bob_token = OwnedIdentityDid::issue_for_actor(bob.clone());
-    let charlie_token = OwnedIdentityDid::issue_for_actor(charlie);
 
-    // Bob reserves under HIS token; Alice builds the Welcome for that KP.
-    let (reservation_id, kp_public_bytes) = handle
-        .reserve_key_package(&bob_token)
+    // Bob reserves under HIS OWN DID; Alice builds the Welcome for that KP.
+    let (reservation_id, kp_public_bytes) = sup
+        .reserve_key_package(bob.clone())
         .await
-        .expect("bob reserves a KP under his own token");
+        .expect("bob reserves a KP under his own DID");
     let (_alice, welcome) = alice_welcome_for(&ctx_bytes, &kp_public_bytes);
 
-    let make_req = |reservation_id: ReservationId, welcome_bytes: Vec<u8>| WelcomeJoinRequest {
+    let make_req = |reservation_id, welcome_bytes| WelcomeJoinRequest {
         creator_did: DID::from(ALICE_DID),
         context_id: ctx_id.clone(),
         params: joiner_params(),
@@ -1297,31 +1281,27 @@ async fn handle_spawn_under_a_different_identity_token_is_rejected() {
         local_pseudonym: some_pseudonym(),
     };
 
-    // Spawn under CHARLIE's token: `build_actor_deps(&charlie)` threads
-    // Charlie's OWN fresh KeyPackage store, which never held bob's reservation,
-    // so the fused `ConfirmConsume` finds no live reservation → fail closed.
-    let err = handle
-        .spawn_actor_from_welcome(
-            &charlie_token,
-            make_req(reservation_id.clone(), welcome.clone()),
-        )
+    // Spawn under CHARLIE: `spawn_actor_from_welcome` resolves Charlie's OWN
+    // fresh KeyPackage store, which never held bob's reservation, so the fused
+    // `ConfirmConsume` finds no live reservation and fails closed.
+    let err = sup
+        .spawn_actor_from_welcome(charlie, make_req(reservation_id.clone(), welcome.clone()))
         .await
-        .expect_err("a reservation bound to bob must not consume under charlie's token");
+        .expect_err("a reservation bound to bob must not consume under a different DID");
     assert!(
         matches!(err, crate::context::ContextError::InvalidState(_)),
-        "expected InvalidState for a cross-identity reservation, got {err:?}"
+        "expected InvalidState for an absent (cross-identity) reservation, got {err:?}"
     );
     assert!(
         sup.lookup(&ctx_id).is_none(),
-        "no actor may stand up under the wrong identity token"
+        "no actor may stand up under the wrong identity"
     );
 
-    // Non-vacuity: bob's OWN token now spawns the joiner with the same
-    // reservation + Welcome — Charlie's rejected attempt burned nothing.
-    handle
-        .spawn_actor_from_welcome(&bob_token, make_req(reservation_id, welcome))
+    // Non-vacuity: bob's OWN DID now spawns the joiner with the same reservation
+    // + Welcome — Charlie's rejected attempt burned nothing.
+    sup.spawn_actor_from_welcome(bob, make_req(reservation_id, welcome))
         .await
-        .expect("bob's own token spawns the joiner — the reservation stayed bound to him");
+        .expect("bob's own DID spawns the joiner — the reservation stayed bound to him");
     assert_eq!(
         sup.member_count(&ctx_id).await,
         Some(2),
