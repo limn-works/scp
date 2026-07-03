@@ -226,9 +226,14 @@ const KP_INDEX_PREFIX: &str = "scp-kp-index";
 pub struct ReservationId(String);
 
 impl ReservationId {
-    /// Mint a fresh random reservation id (UUIDv4). The ONLY non-test
-    /// constructor — a `ReservationId` is always supervisor-minted, never
-    /// caller-supplied, so there is no public string constructor to forge one.
+    /// Mint a fresh random reservation id (UUIDv4). This is the only *minting*
+    /// constructor, but not the only way to obtain a `ReservationId`: the type
+    /// is reconstructible from a string via its `#[serde(transparent)]`
+    /// `Deserialize` — the sanctioned path the FFI bridges use to round-trip the
+    /// id back across the boundary. That reconstruction grants nothing: a
+    /// `ReservationId` is a LOOKUP KEY scoped to the caller's own per-identity
+    /// KeyPackage actor, so a forged or foreign id simply matches no reservation
+    /// and is rejected.
     #[must_use]
     pub fn new_random() -> Self {
         Self(uuid::Uuid::new_v4().to_string())

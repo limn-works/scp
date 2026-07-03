@@ -9385,12 +9385,14 @@ impl Scp {
     /// discovery registry. Without it a Welcome-joined node can DECRYPT but
     /// cannot SEND (no handle-backed context).
     ///
-    /// The bridge-side UCAN validation state is registered as a REVERSIBLE
-    /// precheck BEFORE the irreversible runtime join and rolled back on failure:
-    /// there is no path where the runtime join commits but bridge state errors,
-    /// and no leaked bridge/discovery state when the join fails. A context id
-    /// already active on this instance collides at the Occupied precheck BEFORE
-    /// the single-use `KeyPackage` is consumed.
+    /// The bridge-side UCAN validation state is registered via an ATOMIC
+    /// `Entry::Occupied`/`Vacant` occupy BEFORE the irreversible runtime join
+    /// and rolled back on failure: there is no path where the runtime join
+    /// commits but bridge state errors, and no leaked bridge/discovery state
+    /// when the join fails. A context id already active on this instance
+    /// collides at that atomic occupy BEFORE the single-use `KeyPackage` is
+    /// consumed; a losing concurrent same-id join errors at the same gate and
+    /// never rolls back state it did not create.
     ///
     /// Local-identity custody of the JOINER (`identity`) is enforced at the
     /// bridge exactly as `context_create` enforces it for the creator: the
@@ -9474,35 +9476,32 @@ impl Scp {
                             code: codes::CTX_2014.to_owned(),
                         })?;
 
-                // Occupied precheck — fail closed BEFORE `spawn_actor_from_welcome`
-                // consumes the single-use KeyPackage. Mirrors the PyO3 reference's
-                // `register_ffi_state` Entry::Occupied hard-error: a context
-                // already active on THIS instance collides here, leaving the
-                // pre-existing entry untouched (we must NOT roll back state we did
-                // not create). True concurrent races for the same id are resolved
-                // authoritatively by the supervisor's first-writer-wins spawn lock
-                // below.
-                if context_handle_registry(&bi).contains_key(&context_id) {
-                    return Err(ScpError::Context {
-                        msg: format!("context {context_id} is already registered on this instance"),
-                        code: codes::CTX_2014.to_owned(),
-                    });
-                }
-
-                // Register the bridge-side UCAN validation state (revocation list,
-                // nonce tracker, event log, ceiling) REVERSIBLY BEFORE the
-                // irreversible runtime join, mirroring the PyO3 reference's
-                // `register_ffi_state`. Capture whether it pre-existed so a
-                // rollback removes ONLY the state we created (never state we did
-                // not).
-                let ucan_preexisted = bi.with_ucan_state(&context_id, |_| ()).is_some();
-                bi.ensure_ucan_registered(&context_id, &creator_did, &params.ceiling);
+                // Atomic occupy — register the bridge-side UCAN validation state
+                // (revocation list, nonce tracker, event log, ceiling) and gate on
+                // collision in ONE indivisible step, fail-closed BEFORE
+                // `spawn_actor_from_welcome` consumes the single-use KeyPackage.
+                // Mirrors the PyO3/napi reference bridges' `register_ffi_state`
+                // Entry::Occupied hard-error: because the DashMap Vacant/Occupied
+                // decision and the insert are atomic, exactly one caller can occupy
+                // the slot for this id. A losing concurrent same-id join errors HERE
+                // — before consuming the KeyPackage — and never reaches the rollback
+                // below, so it can never delete the winner's shared UCAN state. The
+                // prior non-atomic `context_handle_registry` precheck plus a
+                // separate `ucan_preexisted` read could let a loser mis-classify the
+                // entry as its own and roll back the winner's state (the handle
+                // registers only POST-commit, so the precheck never excluded a
+                // concurrent joiner). Cross-instance / cross-node races remain
+                // resolved authoritatively by the supervisor's first-writer-wins
+                // spawn lock below.
+                bi.register_ucan_occupied(&context_id, &creator_did, &params.ceiling)?;
 
                 // Irreversible: consume the KeyPackage, install the joined MLS
                 // group, persist the keyed snapshot, register the context actor. On
-                // failure, roll the reversible UCAN state back so an errored join
-                // leaves no orphaned bridge state beside a runtime that never
-                // committed.
+                // failure, roll back the UCAN state THIS call just created (we are
+                // the caller that occupied the vacant slot above, so this removes
+                // only our own state — never an entry another caller owns) so an
+                // errored join leaves no orphaned bridge state beside a runtime that
+                // never committed.
                 let sup = bi.context_manager_or_error()?;
                 let owning = scp_identity::DID(identity.did.clone());
                 let req = scp_core::context::supervisor::WelcomeJoinRequest {
@@ -9514,9 +9513,7 @@ impl Scp {
                     local_pseudonym: Some(local_pseudonym),
                 };
                 if let Err(e) = sup.spawn_actor_from_welcome(owning, req).await {
-                    if !ucan_preexisted {
-                        bi.remove_ucan_state(&context_id);
-                    }
+                    bi.remove_ucan_state(&context_id);
                     return Err(ScpError::from(e));
                 }
 
@@ -17811,8 +17808,8 @@ mod tests {
         );
     }
 
-    /// A context already active on this instance collides at the Occupied
-    /// precheck — the join fails BEFORE the single-use `KeyPackage` is consumed,
+    /// A context already active on this instance collides at the atomic UCAN
+    /// occupy — the join fails BEFORE the single-use `KeyPackage` is consumed,
     /// leaving the pre-existing handle untouched.
     #[test]
     #[cfg(feature = "allow_in_memory_custody")]
@@ -17834,7 +17831,7 @@ mod tests {
             "created context must be registered"
         );
 
-        // Joining-from-Welcome the SAME id must fail at the Occupied precheck.
+        // Joining-from-Welcome the SAME id must fail at the atomic occupy.
         let result = rt.block_on(scp.context_join_from_welcome(
             identity,
             creator_did,
@@ -17855,6 +17852,88 @@ mod tests {
         assert!(
             context_handle_registry(&scp.inner).contains_key(&context_id),
             "the pre-existing context handle must survive an Occupied-rejected join"
+        );
+    }
+
+    /// CLOBBER REGRESSION: a losing same-id join must NOT delete the WINNER's
+    /// shared UCAN / discovery state.
+    ///
+    /// The bug: the join path registered its reversible UCAN state via a
+    /// separate non-atomic `ucan_preexisted` read, so a caller that lost the
+    /// spawn race could mis-classify the single shared `ucan_registry` entry as
+    /// its own and, on rollback, delete the WINNER's UCAN nonce-tracker /
+    /// revocation / ceiling state plus its `KnownContext`. The atomic
+    /// `Entry::Occupied`/`Vacant` occupy fixes this: the loser errors at the
+    /// gate BEFORE consuming the `KeyPackage` and never runs a rollback.
+    ///
+    /// Sequential model of the race: `context_create` stands up the WINNER's
+    /// full FFI state (handle + UCAN state + discovery entry); a second
+    /// `context_join_from_welcome` for the SAME id is the loser. It must fail
+    /// with the "already registered" class BEFORE any consume, and every piece
+    /// of the winner's state must survive.
+    #[test]
+    #[cfg(feature = "allow_in_memory_custody")]
+    fn context_join_from_welcome_loser_preserves_winner_ffi_state() {
+        let rt = runtime();
+        let scp = scp_test();
+        let identity = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed");
+        let creator_did = identity.did();
+
+        // WINNER: a live context registers handle + UCAN state + discovery entry.
+        let handle = rt
+            .block_on(scp.context_create(Arc::clone(&identity), encrypted_join_test_params()))
+            .expect("context_create should succeed");
+        let context_id = handle.context_id();
+        assert!(
+            scp.inner.with_ucan_state(&context_id, |_| ()).is_some(),
+            "winner's UCAN state must be registered after create"
+        );
+        assert!(
+            scp.inner.core.has_known_context(&context_id),
+            "winner's discovery entry must be registered after create"
+        );
+        let winner_routing_id = known_context_entry(&scp, &context_id)
+            .expect("winner must be in the discovery registry")
+            .routing_id;
+
+        // LOSER: joining-from-Welcome the SAME id fails at the atomic occupy
+        // BEFORE the bogus Welcome is consumed (a consume/spawn error would
+        // carry a different code — CTX_2014 "already registered" proves the
+        // occupy short-circuited first).
+        let result = rt.block_on(scp.context_join_from_welcome(
+            identity,
+            creator_did,
+            context_id.clone(),
+            encrypted_join_test_params(),
+            "bogus-reservation".to_owned(),
+            b"bogus-welcome".to_vec(),
+        ));
+        assert!(
+            matches!(
+                &result,
+                Err(ScpError::Context { code, msg })
+                    if code == codes::CTX_2014 && msg.contains("already registered")
+            ),
+            "loser must fail with the already-registered class before consume, got: {result:?}"
+        );
+
+        // The winner's UCAN state, discovery entry, and handle all SURVIVE the
+        // loser's failure — the clobber can no longer happen.
+        assert!(
+            scp.inner.with_ucan_state(&context_id, |_| ()).is_some(),
+            "winner's UCAN state must survive the loser's rejected join (clobber regression)"
+        );
+        assert!(
+            context_handle_registry(&scp.inner).contains_key(&context_id),
+            "winner's context handle must survive the loser's rejected join"
+        );
+        let surviving = known_context_entry(&scp, &context_id)
+            .expect("winner's discovery entry must survive the loser's rejected join");
+        assert_eq!(
+            surviving.routing_id, winner_routing_id,
+            "winner's discovery routing id must be unchanged by the loser's rejected join"
         );
     }
 
