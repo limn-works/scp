@@ -24,6 +24,11 @@
 # rules by `scripts/check-protocol-deps.sh`. This gate catches the obvious,
 # common shim spellings early; it is defense-in-depth, not the guarantee.
 #
+# Known limitation: the line-comment filter special-cases only `//`-prefixed
+# lines (guarded so a trailing `*/` that closes a prior block comment does not
+# hide live code); it does not parse `/* … */` block comments spanning lines, so
+# a `pub use` quoted wholly inside such a block is not distinguished from code.
+#
 # Implicit coupling (documented so it is revisited, not silently relied on):
 # the canonical single-line `pub use …scp_{clock,crypto,did,mls}…` form this
 # gate matches is guaranteed by the rustfmt CI job — rustfmt normalizes
@@ -76,11 +81,18 @@ for mod in "${crates[@]}"; do
         # a real re-export. Covers `//`, `///`, and `//!` after optional leading
         # whitespace. One bounded comment filter — not an expanding denylist of
         # laundering spellings.
+        #
+        # The `*/` guard closes a block-comment evasion: a line such as
+        # `// */ pub use scp_did::DID as X;` opens with `//` yet the ` */`
+        # terminates a block comment begun on a PREVIOUS line, leaving the
+        # `pub use` as LIVE code. So a `//`-prefixed line is only skipped when it
+        # does NOT contain `*/`. This is the single bounded exception — not the
+        # start of open-ended block-comment parsing.
         content="${line#*:}"
         content="${content#*:}"
         trimmed="${content#"${content%%[![:space:]]*}"}"
         case "$trimmed" in
-            //*) continue ;;
+            //*) [[ "$trimmed" == *'*/'* ]] || continue ;;
         esac
         # Allowed only in the owning crate and the scp-core facade.
         case "$file" in

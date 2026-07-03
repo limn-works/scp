@@ -174,7 +174,6 @@ jobs:
             "scp-identity@${{ env.VERSION }}"
             "scp-mls@${{ env.VERSION }}"
             "scp-client@${{ env.VERSION }}"
-            "scp-client-wasm@${{ env.VERSION }}"
             "scp-runtime@${{ env.VERSION }}"
             "scp-core@${{ env.VERSION }}"
             "scp-transport@${{ env.VERSION }}"
@@ -429,14 +428,6 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
         run: cargo publish -p scp-client --allow-dirty
-
-      - name: Wait for crates.io index
-        run: sleep 60
-
-      - name: Publish scp-client-wasm
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
-        run: cargo publish -p scp-client-wasm --allow-dirty
 
       - name: Wait for crates.io index
         run: sleep 60
@@ -869,7 +860,7 @@ jobs:
           done
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Registries that would be published to:" >> $GITHUB_STEP_SUMMARY
-          echo "- crates.io: scp-clock, scp-crypto, scp-did, scp-platform, scp-event-log, scp-protocol, scp-identity, scp-mls, scp-client, scp-client-wasm, scp-runtime, scp-core, scp-transport, scp-mcp, scp-media, scp-node, scp-relay" >> $GITHUB_STEP_SUMMARY
+          echo "- crates.io: scp-clock, scp-crypto, scp-did, scp-platform, scp-event-log, scp-protocol, scp-identity, scp-mls, scp-client, scp-runtime, scp-core, scp-transport, scp-mcp, scp-media, scp-node, scp-relay" >> $GITHUB_STEP_SUMMARY
           echo "- PyPI: scp-python" >> $GITHUB_STEP_SUMMARY
           echo "- npm: @limn-works/scp-ts + @limn-works/scp-ts-napi-{linux-x64-gnu,linux-arm64-gnu,darwin-x64,darwin-arm64,win32-x64-msvc}" >> $GITHUB_STEP_SUMMARY
           echo "- Maven Central: works.limn:scp-kt, works.limn:scp-kt-android" >> $GITHUB_STEP_SUMMARY
