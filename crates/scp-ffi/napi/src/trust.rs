@@ -122,6 +122,17 @@ fn validation_error(msg: &str) -> napi::Error {
     })
 }
 
+/// Like [`validation_error`] but carries an explicit `SCP-VALID-*` code so a
+/// caller can surface the same specific code the UniFFI/PyO3 bridges emit for a
+/// given failure case (e.g. the per-case `check_capability_requirements` codes
+/// `SCP-VALID-7073`..=`SCP-VALID-7077`).
+fn coded_validation_error(msg: &str, code: &str) -> napi::Error {
+    napi::Error::from(ScpNapiError::Validation {
+        message: msg.to_owned(),
+        code: code.to_owned(),
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Bridge functions
 // ---------------------------------------------------------------------------
@@ -346,21 +357,26 @@ pub(crate) fn check_capability_requirements_on(
 
     let requirements: Vec<scp_core::trust::CapabilityRequirement> =
         serde_json::from_str(&requirements_json).map_err(|e| {
-            validation_error(&format!(
-                "failed to parse capability requirements JSON: {e}"
-            ))
+            coded_validation_error(
+                &format!("failed to parse capability requirements JSON: {e}"),
+                codes::VALID_7073,
+            )
         })?;
 
     let agent_capabilities: Vec<scp_core::trust::CapabilityUri> =
         serde_json::from_str(&agent_capabilities_json).map_err(|e| {
-            validation_error(&format!("failed to parse agent capabilities JSON: {e}"))
+            coded_validation_error(
+                &format!("failed to parse agent capabilities JSON: {e}"),
+                codes::VALID_7074,
+            )
         })?;
 
     let challenge_verifications: Vec<scp_core::trust::ChallengeVerification> =
         serde_json::from_str(&challenge_verifications_json).map_err(|e| {
-            validation_error(&format!(
-                "failed to parse challenge verifications JSON: {e}"
-            ))
+            coded_validation_error(
+                &format!("failed to parse challenge verifications JSON: {e}"),
+                codes::VALID_7075,
+            )
         })?;
 
     let resolver = scp_core::trust::IdentityDidPublicKeyResolver;
@@ -375,7 +391,21 @@ pub(crate) fn check_capability_requirements_on(
         &resolver,
         &clock,
     )
-    .map_err(|e| validation_error(&format!("capability admission verification failed: {e}")))?;
+    .map_err(|e| {
+        // Mirror the UniFFI bridge's per-variant code mapping so all native
+        // bridges surface an identical `SCP-VALID-707x` for the same failure
+        // case: empty subject → 7077; missing capability / verification-required
+        // → 7076.
+        let code = match e {
+            scp_core::trust::AdmissionError::EmptySubjectDid => codes::VALID_7077,
+            scp_core::trust::AdmissionError::MissingCapability { .. }
+            | scp_core::trust::AdmissionError::VerificationRequired { .. } => codes::VALID_7076,
+        };
+        coded_validation_error(
+            &format!("capability admission verification failed: {e}"),
+            code,
+        )
+    })?;
 
     Ok(())
 }
@@ -737,6 +767,11 @@ mod tests {
             "[]".to_owned(),
         );
         assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains(codes::VALID_7073),
+            "error should contain SCP-VALID-7073, got: {msg}"
+        );
     }
 
     #[test]
@@ -751,6 +786,11 @@ mod tests {
             "[]".to_owned(),
         );
         assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains(codes::VALID_7074),
+            "error should contain SCP-VALID-7074, got: {msg}"
+        );
     }
 
     #[test]
@@ -765,6 +805,11 @@ mod tests {
             "not json".to_owned(),
         );
         assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains(codes::VALID_7075),
+            "error should contain SCP-VALID-7075, got: {msg}"
+        );
     }
 
     #[test]
@@ -840,6 +885,11 @@ mod tests {
             "[]".to_owned(),
         );
         assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains(codes::VALID_7076),
+            "error should contain SCP-VALID-7076, got: {msg}"
+        );
     }
 
     /// Builds a genuinely verifier-signed `ChallengeVerification` JSON array

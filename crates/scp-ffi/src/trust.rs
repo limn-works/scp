@@ -364,23 +364,26 @@ pub fn py_check_capability_requirements(
 
     let requirements: Vec<scp_core::trust::CapabilityRequirement> =
         serde_json::from_str(requirements_json).map_err(|e| {
-            pyo3::exceptions::PyValueError::new_err(format!(
-                "failed to parse capability requirements JSON: {e}"
-            ))
+            crate::error::ScpPyError::ValidationError {
+                message: format!("failed to parse capability requirements JSON: {e}"),
+                code: scp_ffi_common::error_codes::VALID_7073.to_owned(),
+            }
         })?;
 
     let agent_capabilities: Vec<scp_core::trust::CapabilityUri> =
         serde_json::from_str(agent_capabilities_json).map_err(|e| {
-            pyo3::exceptions::PyValueError::new_err(format!(
-                "failed to parse agent capabilities JSON: {e}"
-            ))
+            crate::error::ScpPyError::ValidationError {
+                message: format!("failed to parse agent capabilities JSON: {e}"),
+                code: scp_ffi_common::error_codes::VALID_7074.to_owned(),
+            }
         })?;
 
     let challenge_verifications: Vec<scp_core::trust::ChallengeVerification> =
         serde_json::from_str(challenge_verifications_json).map_err(|e| {
-            pyo3::exceptions::PyValueError::new_err(format!(
-                "failed to parse challenge verifications JSON: {e}"
-            ))
+            crate::error::ScpPyError::ValidationError {
+                message: format!("failed to parse challenge verifications JSON: {e}"),
+                code: scp_ffi_common::error_codes::VALID_7075.to_owned(),
+            }
         })?;
 
     let resolver = scp_core::trust::IdentityDidPublicKeyResolver;
@@ -396,9 +399,23 @@ pub fn py_check_capability_requirements(
         &clock,
     )
     .map_err(|e| {
-        pyo3::exceptions::PyRuntimeError::new_err(format!(
-            "capability admission verification failed: {e}"
-        ))
+        // Mirror the UniFFI/NAPI bridges' per-variant code mapping so every
+        // native bridge surfaces an identical `SCP-VALID-707x` for the same
+        // failure case: empty subject → 7077; missing capability /
+        // verification-required → 7076.
+        let code = match e {
+            scp_core::trust::AdmissionError::EmptySubjectDid => {
+                scp_ffi_common::error_codes::VALID_7077
+            }
+            scp_core::trust::AdmissionError::MissingCapability { .. }
+            | scp_core::trust::AdmissionError::VerificationRequired { .. } => {
+                scp_ffi_common::error_codes::VALID_7076
+            }
+        };
+        crate::error::ScpPyError::ValidationError {
+            message: format!("capability admission verification failed: {e}"),
+            code: code.to_owned(),
+        }
     })?;
 
     Ok(())
@@ -1070,23 +1087,44 @@ mod tests {
 
     #[test]
     fn check_capability_requirements_rejects_invalid_requirements_json() {
-        let result =
-            py_check_capability_requirements("ctx-1", "did:key:alice", "not json", "[]", "[]");
-        assert!(result.is_err());
+        Python::with_gil(|_py| {
+            let result =
+                py_check_capability_requirements("ctx-1", "did:key:alice", "not json", "[]", "[]");
+            assert!(result.is_err());
+            let err_str = format!("{}", result.unwrap_err());
+            assert!(
+                err_str.contains(scp_ffi_common::error_codes::VALID_7073),
+                "error should contain SCP-VALID-7073, got: {err_str}"
+            );
+        });
     }
 
     #[test]
     fn check_capability_requirements_rejects_invalid_capabilities_json() {
-        let result =
-            py_check_capability_requirements("ctx-1", "did:key:alice", "[]", "not json", "[]");
-        assert!(result.is_err());
+        Python::with_gil(|_py| {
+            let result =
+                py_check_capability_requirements("ctx-1", "did:key:alice", "[]", "not json", "[]");
+            assert!(result.is_err());
+            let err_str = format!("{}", result.unwrap_err());
+            assert!(
+                err_str.contains(scp_ffi_common::error_codes::VALID_7074),
+                "error should contain SCP-VALID-7074, got: {err_str}"
+            );
+        });
     }
 
     #[test]
     fn check_capability_requirements_rejects_invalid_verifications_json() {
-        let result =
-            py_check_capability_requirements("ctx-1", "did:key:alice", "[]", "[]", "not json");
-        assert!(result.is_err());
+        Python::with_gil(|_py| {
+            let result =
+                py_check_capability_requirements("ctx-1", "did:key:alice", "[]", "[]", "not json");
+            assert!(result.is_err());
+            let err_str = format!("{}", result.unwrap_err());
+            assert!(
+                err_str.contains(scp_ffi_common::error_codes::VALID_7075),
+                "error should contain SCP-VALID-7075, got: {err_str}"
+            );
+        });
     }
 
     #[test]
@@ -1130,9 +1168,21 @@ mod tests {
         // A SelfAttested requirement with no matching declared capability and no
         // verification record fails as an admission (runtime) error.
         let requirements = r#"[{"capability":"scp:capability:schema-validation/v1","verification_level":"SelfAttested"}]"#;
-        let result =
-            py_check_capability_requirements("ctx-1", "did:key:alice", requirements, "[]", "[]");
-        assert!(result.is_err());
+        Python::with_gil(|_py| {
+            let result = py_check_capability_requirements(
+                "ctx-1",
+                "did:key:alice",
+                requirements,
+                "[]",
+                "[]",
+            );
+            assert!(result.is_err());
+            let err_str = format!("{}", result.unwrap_err());
+            assert!(
+                err_str.contains(scp_ffi_common::error_codes::VALID_7076),
+                "error should contain SCP-VALID-7076, got: {err_str}"
+            );
+        });
     }
 
     /// Builds a genuinely verifier-signed `ChallengeVerification` JSON array
