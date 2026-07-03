@@ -20,10 +20,10 @@ use std::time::Duration;
 use napi::Env;
 use napi::Error as NapiError;
 use napi_derive::napi;
+use scp_clock::Clock as _;
 use scp_ffi_common::bridge_instance::BridgeInstanceCore as _;
 use scp_ffi_common::error_codes as codes;
 use scp_identity::DidMethod as _;
-use scp_primitives::Clock as _;
 
 // `Buffer` is referenced only by the in-memory-custody-gated full-stack test
 // methods (`fullstackSendMessage` / `fullstackDecryptMessage`); production
@@ -1080,8 +1080,8 @@ impl Scp {
             RecoveryBackend, RecoveryStepError, active_key_rotation_outcome,
             agent_key_rotation_outcome,
         };
+        use scp_did::DID;
         use scp_ffi_common::validate::validate_did;
-        use scp_identity::DID;
 
         validate_did(&did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
 
@@ -1156,7 +1156,7 @@ impl Scp {
             }
         };
 
-        let now_ms = scp_primitives::SystemClock.now_millis();
+        let now_ms = scp_clock::SystemClock.now_millis();
         let key_rotation = match compromise_tier {
             CompromiseTier::Agent => agent_key_rotation_outcome(&did_val, now_ms),
             CompromiseTier::ActiveSigning => active_key_rotation_outcome(&did_val, now_ms),
@@ -1221,7 +1221,7 @@ impl Scp {
                 &contacts,
                 None,
                 &backend,
-                &scp_primitives::SystemClock,
+                &scp_clock::SystemClock,
             ))
             .map_err(|e| {
                 NapiError::from(ScpNapiError::Identity {
@@ -1260,8 +1260,8 @@ impl Scp {
             CustodyMigrationBackend, CustodyMigrationOrchestrator, CustodyMigrationRequest,
             CustodyMigrationTarget,
         };
+        use scp_did::DID;
         use scp_ffi_common::validate::validate_did;
-        use scp_identity::DID;
 
         validate_did(&did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
 
@@ -1384,7 +1384,7 @@ impl Scp {
         // the napi-rs worker thread has no tokio context (round-2
         // bug-catcher finding).
         let result = crate::runtime()
-            .block_on(orchestrator.execute(&backend, &scp_primitives::SystemClock))
+            .block_on(orchestrator.execute(&backend, &scp_clock::SystemClock))
             .map_err(|e| {
                 NapiError::from(ScpNapiError::Identity {
                     message: format!("custody migration failed: {e}"),
@@ -1418,7 +1418,7 @@ impl Scp {
         target_did: String,
         name: String,
     ) -> napi::Result<()> {
-        use scp_identity::DID;
+        use scp_did::DID;
 
         scp_ffi_common::validate::validate_did(&owner_did)
             .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
@@ -1442,7 +1442,7 @@ impl Scp {
     /// Per-instance equivalent of `petname_remove`.
     #[napi(js_name = "petnameRemove")]
     pub fn petname_remove(&self, owner_did: String, target_did: String) -> napi::Result<()> {
-        use scp_identity::DID;
+        use scp_did::DID;
 
         scp_ffi_common::validate::validate_did(&owner_did)
             .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
@@ -1564,7 +1564,7 @@ impl Scp {
         owner_did: String,
         target_did: String,
     ) -> napi::Result<Option<String>> {
-        use scp_identity::DID;
+        use scp_did::DID;
 
         scp_ffi_common::validate::validate_did(&owner_did)
             .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
@@ -1689,7 +1689,7 @@ impl Scp {
         tags: Option<Vec<String>>,
     ) -> napi::Result<String> {
         use scp_core::discovery::handles::{HandleMetadata, HandleRegisterParams, HandleRegistry};
-        use scp_identity::DID;
+        use scp_did::DID;
 
         let target =
             scp_ffi_common::petname_helpers::parse_handle_target(&target_json).map_err(|e| {
@@ -1715,7 +1715,7 @@ impl Scp {
         let result = registry.register(
             &params,
             &DID::from(registrant_did.as_str()),
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         );
         serde_json::to_string(&result).map_err(|e| {
             NapiError::from(ScpNapiError::Validation {
@@ -1782,7 +1782,7 @@ impl Scp {
         did: String,
     ) -> napi::Result<String> {
         use scp_core::discovery::handles::HandleDeregisterParams;
-        use scp_identity::DID;
+        use scp_did::DID;
 
         let mut guard = self.inner.core.handle_registries().lock().map_err(|e| {
             NapiError::from(ScpNapiError::Validation {
@@ -1820,7 +1820,7 @@ impl Scp {
         description: Option<String>,
         tags: Option<Vec<String>>,
     ) -> napi::Result<String> {
-        use scp_identity::DID;
+        use scp_did::DID;
 
         scp_ffi_common::validate::validate_context_id(&scope_context_id)
             .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
@@ -1865,7 +1865,7 @@ impl Scp {
             .register(
                 &params,
                 &DID::from(registrant_did.as_str()),
-                &scp_primitives::SystemClock,
+                &scp_clock::SystemClock,
             )
             .map_err(|e| {
                 NapiError::from(ScpNapiError::Validation {
@@ -1925,7 +1925,7 @@ impl Scp {
         name: String,
         did: String,
     ) -> napi::Result<String> {
-        use scp_identity::DID;
+        use scp_did::DID;
 
         scp_ffi_common::validate::validate_context_id(&scope_context_id)
             .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
@@ -2022,7 +2022,7 @@ impl Scp {
                 &querier,
                 &known_contexts,
                 &known_domains,
-                &scp_primitives::SystemClock,
+                &scp_clock::SystemClock,
             )
             .await
             .map_err(|e| {
@@ -3100,7 +3100,7 @@ impl Scp {
         handle: &NapiContextHandle,
         token: String,
         capability: String,
-        presenting_agent_did: Option<String>,
+        presenting_agent_did: String,
         proof_tokens: Option<Vec<String>>,
     ) -> napi::Result<()> {
         crate::napi_check_handle!(&self.inner.core, handle);
@@ -3133,7 +3133,7 @@ impl Scp {
         handle: &NapiContextHandle,
         token: String,
         capability: Option<String>,
-        presenting_agent_did: Option<String>,
+        presenting_agent_did: String,
         proof_tokens: Option<Vec<String>>,
     ) -> napi::Result<crate::ucan::NapiCapabilityValidation> {
         crate::napi_check_handle!(&self.inner.core, handle);

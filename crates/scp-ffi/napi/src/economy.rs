@@ -184,7 +184,7 @@ pub(crate) fn economy_budget_remaining_on(
     if did.is_empty() {
         return Err(validation_error("DID must not be empty"));
     }
-    let member_did = scp_identity::DID::from(did.as_str());
+    let member_did = scp_did::DID::from(did.as_str());
     let remaining = bi
         .core
         .with_economy_budget(&context_id, |tracker| tracker.remaining(&member_did));
@@ -211,7 +211,7 @@ pub(crate) fn economy_budget_grant_on(
             code: codes::VALID_7001.to_owned(),
         }));
     }
-    let member_did = scp_identity::DID::from(did.as_str());
+    let member_did = scp_did::DID::from(did.as_str());
     bi.core.with_economy_budget_mut(&context_id, |tracker| {
         tracker.grant(
             &member_did,
@@ -240,7 +240,7 @@ pub(crate) fn economy_budget_record_spend_on(
             code: codes::VALID_7001.to_owned(),
         }));
     }
-    let member_did = scp_identity::DID::from(did.as_str());
+    let member_did = scp_did::DID::from(did.as_str());
     bi.core.with_economy_budget_mut(&context_id, |tracker| {
         tracker
             .record_spend(
@@ -270,7 +270,7 @@ pub(crate) fn economy_antispam_record_on(
             code: codes::VALID_7001.to_owned(),
         }));
     }
-    let did = scp_identity::DID::from(sender_did.as_str());
+    let did = scp_did::DID::from(sender_did.as_str());
     bi.core.with_economy_antispam(&context_id, |tracker| {
         tracker.record_message(&did, timestamp.cast_unsigned());
     });
@@ -296,7 +296,7 @@ pub(crate) fn economy_antispam_velocity_on(
             code: codes::VALID_7001.to_owned(),
         }));
     }
-    let did = scp_identity::DID::from(sender_did.as_str());
+    let did = scp_did::DID::from(sender_did.as_str());
     #[allow(clippy::cast_possible_wrap)]
     let velocity = bi.core.with_economy_antispam(&context_id, |tracker| {
         tracker.get_velocity(&did, now.cast_unsigned())
@@ -364,7 +364,7 @@ pub(crate) fn economy_antispam_escalated_cost_on(
             .collect(),
     };
 
-    let did = scp_identity::DID::from(sender_did.as_str());
+    let did = scp_did::DID::from(sender_did.as_str());
     let cost = bi.core.with_economy_antispam(&context_id, |tracker| {
         tracker.compute_escalated_cost(
             &did,
@@ -610,7 +610,7 @@ mod tests {
         use scp_core::economy::{
             Amount, CurrencyCode, MAX_RECEIPT_BATCH, PaidActionType, PaymentReceipt,
         };
-        use scp_identity::DID;
+        use scp_did::DID;
 
         // Build one more than the cap of minimal-but-valid receipts. The cap
         // check runs before any supervisor lookup, so a bare `new_napi()`

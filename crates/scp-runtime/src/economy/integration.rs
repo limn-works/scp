@@ -21,7 +21,7 @@ use super::adapter::{
     ContextId, PaymentAdapterDyn, PaymentAuthorization, PaymentError, PaymentMetadata,
     PaymentReceipt,
 };
-use scp_identity::DID;
+use scp_did::DID;
 use scp_protocol::economy::policy::{ObservableMetrics, evaluate_cost, verify_cost_sufficiency};
 use scp_protocol::economy::types::{Amount, EconomicPolicy, PaidActionType};
 

@@ -18,7 +18,7 @@
 //! See `.docs/standards/sdk-common.md` section "Auto-Accept Policies" and
 //! "Auto-accept persistence".
 
-use scp_identity::DID;
+use scp_did::DID;
 use scp_platform::PlatformError;
 use scp_platform::traits::Storage;
 

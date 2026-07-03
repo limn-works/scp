@@ -46,7 +46,7 @@ use scp_core::discovery::handles::{
 };
 use scp_core::discovery::petnames::PetnameEvent;
 use scp_core::discovery::{DiscoveryQuery, normalize_address, parse_address};
-use scp_identity::DID;
+use scp_did::DID;
 
 use scp_ffi_common::petname_helpers::{self, LocalHandleQuerier, address_resolution_to_json};
 
@@ -789,11 +789,8 @@ impl crate::scp::PyScp {
             .entry(discovery_context_id.to_owned())
             .or_insert_with(|| HandleRegistry::new(discovery_context_id.to_owned()));
 
-        let result = registry.register(
-            &params,
-            &DID::from(registrant_did),
-            &scp_primitives::SystemClock,
-        );
+        let result =
+            registry.register(&params, &DID::from(registrant_did), &scp_clock::SystemClock);
 
         serde_json::to_string(&result).map_err(|e| {
             ScpPyError::ValidationError {
@@ -1018,11 +1015,7 @@ impl crate::scp::PyScp {
         });
 
         let result = registry
-            .register(
-                &params,
-                &DID::from(registrant_did),
-                &scp_primitives::SystemClock,
-            )
+            .register(&params, &DID::from(registrant_did), &scp_clock::SystemClock)
             .map_err(|e| ScpPyError::ValidationError {
                 message: format!("scope registration failed: {e}"),
                 code: codes::VALID_7131.to_owned(),
@@ -1236,7 +1229,7 @@ impl crate::scp::PyScp {
                     &querier,
                     &known_contexts,
                     &known_domains,
-                    &scp_primitives::SystemClock,
+                    &scp_clock::SystemClock,
                 )
                 .await
                 .map_err(|e| ScpPyError::ValidationError {

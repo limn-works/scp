@@ -19,8 +19,8 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
 use super::{Event, EventLog, EventLogError, EventType};
-use crate::crypto::verify_ed25519_signature;
-use scp_primitives::extract_public_key_from_did;
+use scp_crypto::verify_ed25519_signature;
+use scp_did::extract_public_key_from_did;
 
 /// The genesis sentinel hash used as `prev_hash` for the first event.
 ///

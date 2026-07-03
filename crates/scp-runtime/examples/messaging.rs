@@ -12,7 +12,7 @@
 
 use std::sync::Arc;
 
-use scp_identity::DID;
+use scp_did::DID;
 use scp_protocol::context::governance::KeyResolver;
 use scp_protocol::context::membership::KeyPackage;
 use scp_protocol::context::{Capability, ContextMode, ContextParams};
@@ -23,7 +23,7 @@ mod support;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 1. Build a Supervisor with mock providers.
-    let key_resolver: KeyResolver = Arc::new(|_did: &DID, _kid: scp_identity::SigningKeyId| None);
+    let key_resolver: KeyResolver = Arc::new(|_did: &DID, _kid: scp_did::SigningKeyId| None);
     let manager = Supervisor::with_providers(
         support::example_crypto("did:dht:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK"),
         Box::new(support::MockTransport),

@@ -1291,7 +1291,7 @@ mod tests {
     fn map_context_event_message_received() {
         use scp_core::context::membership::ContextEvent;
         let event = ContextEvent::MessageReceived {
-            sender_did: scp_identity::DID::from("did:key:alice"),
+            sender_did: scp_did::DID::from("did:key:alice"),
             payload: vec![1, 2, 3],
         };
         let (event_type, payload) = super::map_context_event(&event);
@@ -1306,7 +1306,7 @@ mod tests {
     fn map_context_event_message_sent() {
         use scp_core::context::membership::ContextEvent;
         let event = ContextEvent::MessageSent {
-            sender_did: scp_identity::DID::from("did:key:bob"),
+            sender_did: scp_did::DID::from("did:key:bob"),
             sequence_number: 42,
             payload: vec![0; 100],
         };
@@ -1320,7 +1320,7 @@ mod tests {
     fn map_context_event_member_joined() {
         use scp_core::context::membership::ContextEvent;
         let event = ContextEvent::MemberJoined {
-            member_did: scp_identity::DID::from("did:key:carol"),
+            member_did: scp_did::DID::from("did:key:carol"),
             role_name: "admin".to_owned(),
         };
         let (event_type, payload) = super::map_context_event(&event);
@@ -1333,7 +1333,7 @@ mod tests {
     fn map_context_event_member_left() {
         use scp_core::context::membership::ContextEvent;
         let event = ContextEvent::MemberLeft {
-            member_did: scp_identity::DID::from("did:key:dave"),
+            member_did: scp_did::DID::from("did:key:dave"),
         };
         let (event_type, payload) = super::map_context_event(&event);
         assert_eq!(event_type, "member.left");
@@ -1346,9 +1346,9 @@ mod tests {
         let event = ContextEvent::GovernanceActionExecuted {
             proposal_id: [0xAB; 32],
             action_summary: "AddMember".to_owned(),
-            executor_did: scp_identity::DID::from("did:key:admin"),
+            executor_did: scp_did::DID::from("did:key:admin"),
             resulting_epoch: Some(5),
-            target_did: Some(scp_identity::DID::from("did:key:new")),
+            target_did: Some(scp_did::DID::from("did:key:new")),
         };
         let (event_type, payload) = super::map_context_event(&event);
         assert_eq!(event_type, "governance.action");
@@ -1370,7 +1370,7 @@ mod tests {
     fn map_context_event_system_close_is_generic() {
         use scp_core::context::membership::ContextEvent;
         let event = ContextEvent::SystemClose {
-            initiator_did: scp_identity::DID::from("did:key:closer"),
+            initiator_did: scp_did::DID::from("did:key:closer"),
         };
         let (event_type, payload) = super::map_context_event(&event);
         assert_eq!(event_type, "context.event");

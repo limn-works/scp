@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::EnvelopeError;
-use crate::identity::SigningKeyId;
+use scp_did::SigningKeyId;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -378,11 +378,8 @@ pub fn verify_inner_signature(
         .map_err(|e| EnvelopeError::VerificationFailed(e.to_string()))?;
 
     // Verify using strict mode (rejects small-order points).
-    match crate::crypto::ed25519::verify_ed25519_signature(
-        sender_public_key,
-        &canonical_hash,
-        &inner.signature,
-    ) {
+    match scp_crypto::verify_ed25519_signature(sender_public_key, &canonical_hash, &inner.signature)
+    {
         Ok(()) => Ok(true),
         Err(reason) => {
             // Signature mismatch -> Ok(false). Malformed inputs -> Err.

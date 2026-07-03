@@ -99,7 +99,7 @@ async fn handle_standing_context_count(
 /// Handle [`StandingCommand::HasStandingContext`] — read-only.
 async fn handle_has_standing_context(
     deps: &ActorDeps,
-    peer_did: scp_identity::DID,
+    peer_did: scp_did::DID,
     reply: oneshot::Sender<Result<bool, ContextError>>,
 ) -> Outcome<()> {
     let has_fut = async { crate::context::standing_helpers::has_standing_context(deps, &peer_did) };
@@ -124,7 +124,7 @@ async fn handle_has_standing_context(
 /// under a 30s timeout. Always mutating.
 async fn handle_register_standing_context(
     deps: &ActorDeps,
-    peer_did: scp_identity::DID,
+    peer_did: scp_did::DID,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
     let register_fut =

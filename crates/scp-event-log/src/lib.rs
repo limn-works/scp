@@ -10,7 +10,7 @@
 //! nodes are SHA-256 hashes of their children's concatenated hashes.
 //!
 //! This crate is the standalone extraction of the event log subsystem from
-//! `scp-core`. It depends on `scp-primitives` for the [`DID`] newtype and
+//! `scp-core`. It depends on `scp-did` for the [`DID`] newtype and
 //! defines an [`EventLogSigner`] trait to abstract signing, removing the
 //! direct dependency on `scp-platform`'s `KeyCustody`/`KeyHandle`.
 //!
@@ -32,14 +32,12 @@
 //! - [`tree::event_count`] -- Get the number of events in the log.
 
 pub mod checkpoint;
-pub mod crypto;
 pub mod metrics;
 pub mod payload;
 pub mod proof;
 pub mod pruning;
 pub mod system_actors;
 pub mod tiered_storage;
-pub mod time;
 pub mod tree;
 
 #[cfg(any(test, feature = "testing"))]
@@ -50,8 +48,7 @@ use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
-// Re-export DID from scp-primitives -- single type across the workspace.
-pub use scp_primitives::DID;
+use scp_did::DID;
 
 /// A context identifier string.
 ///

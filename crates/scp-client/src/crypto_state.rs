@@ -386,9 +386,9 @@ impl ContextCryptoState {
 mod tests {
     use super::*;
     use openmls::prelude::KeyPackageIn;
+    use scp_did::SigningKeyId;
     use scp_mls::group::{add_member, create_group, generate_key_package, join_group};
     use scp_mls::{ScpCredential, SignatureKeyPair};
-    use scp_primitives::SigningKeyId;
     use tls_codec::{Deserialize as TlsDeserialize, Serialize as TlsSerialize};
 
     const CTX: &str = "ctx-crypto-state-unit";

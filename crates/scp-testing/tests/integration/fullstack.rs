@@ -25,7 +25,7 @@ use scp_core::context::{
     Capability, ContextMode, ContextParams, ContextState, context_id_bytes, context_routing_id,
 };
 use scp_core::envelope::outer::create_outer_envelope;
-use scp_identity::DID;
+use scp_did::DID;
 use scp_testing::fullstack::FullStackNetwork;
 use scp_transport::native::adapter::NativeRelayAdapter;
 use scp_transport::native::server::{RelayConfig, RelayServer, ShutdownHandle};
@@ -44,7 +44,7 @@ const CAROL_DID: &str = "did:dht:z6MkCarolFullStack";
 /// Returns a key resolver that always resolves (tests don't verify governance
 /// vote signatures — that's covered by `governance_integration.rs`).
 fn permissive_key_resolver() -> KeyResolver {
-    Arc::new(|_did: &DID, _kid: scp_identity::SigningKeyId| {
+    Arc::new(|_did: &DID, _kid: scp_did::SigningKeyId| {
         // Return a deterministic key derived from the DID string so
         // governance operations that require signature verification can
         // proceed (even though we don't exercise that path here).
@@ -1228,7 +1228,7 @@ fn shared_key_resolver(
         std::sync::Mutex<std::collections::HashMap<String, ed25519_dalek::VerifyingKey>>,
     >,
 ) -> scp_core::context::governance::KeyResolver {
-    std::sync::Arc::new(move |did: &DID, _kid: scp_identity::SigningKeyId| {
+    std::sync::Arc::new(move |did: &DID, _kid: scp_did::SigningKeyId| {
         keys.lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(did.as_ref())

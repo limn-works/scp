@@ -33,7 +33,7 @@ use super::{
     KeyResolver, ProposalId, ProposalStatus, RejectionReason, VoteType, compute_proposal_id,
     sign_vote, verify_vote,
 };
-use scp_primitives::{DID, SigningKeyId};
+use scp_did::{DID, SigningKeyId};
 
 // ---------------------------------------------------------------------------
 // UnanimityEngine

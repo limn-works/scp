@@ -13,7 +13,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use scp_primitives::SigningKeyId;
+use scp_did::SigningKeyId;
 
 // ---------------------------------------------------------------------------
 // Protocol-field deserialization validator

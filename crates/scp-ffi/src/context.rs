@@ -31,8 +31,8 @@ use std::sync::{Arc, Mutex};
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
+use scp_clock::Clock;
 use scp_platform::traits::KeyCustody;
-use scp_primitives::Clock;
 use tokio::sync::mpsc;
 
 use scp_ffi_common::error_codes as codes;
@@ -899,8 +899,8 @@ fn generate_mls_key_package_bytes(did: &str) -> Result<Vec<u8>, crate::error::Sc
     use scp_core::crypto::mls::group::generate_key_package;
     use tls_codec::Serialize as TlsSerializeTrait;
 
-    let cred = ScpCredential::new(did.to_owned(), None, scp_identity::SigningKeyId::Active)
-        .map_err(|e| {
+    let cred =
+        ScpCredential::new(did.to_owned(), None, scp_did::SigningKeyId::Active).map_err(|e| {
             crate::error::ScpPyError::crypto(format!(
                 "failed to create SCP credential for MLS key package: {e}"
             ))
@@ -958,7 +958,7 @@ fn convert_context_event(
     event: scp_core::context::membership::ContextEvent,
 ) -> (String, Vec<u8>, f64) {
     use scp_core::context::membership::ContextEvent::{ConsequenceEnforced, ConsequenceTriggered};
-    let ts = scp_primitives::SystemClock.now_secs() as f64;
+    let ts = scp_clock::SystemClock.now_secs() as f64;
     match event {
         scp_core::context::membership::ContextEvent::MessageSent {
             sender_did,
@@ -1577,7 +1577,7 @@ struct FfiBridgeTrustOracle;
 impl scp_core::context::invitation::TrustOracle for FfiBridgeTrustOracle {
     fn satisfies_trust(
         &self,
-        inviter: &scp_identity::DID,
+        inviter: &scp_did::DID,
         requirement: &scp_core::context::policy::TrustRequirement,
     ) -> bool {
         match requirement {
@@ -1649,7 +1649,7 @@ pub fn py_metadata_record_to_json(
     let record = MetadataRecord {
         context_id,
         sequence,
-        signer_did: scp_identity::DID::from(signer_did),
+        signer_did: scp_did::DID::from(signer_did),
         timestamp,
         structural,
         operational,
@@ -1992,13 +1992,13 @@ impl crate::scp::PyScp {
 
         // Create the context via the shared ContextManager.
         {
-            let creator_did_owned = scp_identity::DID(identity_did.to_owned());
+            let creator_did_owned = scp_did::DID(identity_did.to_owned());
             let rt = crate::runtime()?;
             let sup = crate::runtime::supervisor(bi)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
             let sup = sup.clone();
             let ctx_id = context_id.clone();
-            let creator_did_for_register = scp_identity::DID(identity_did.to_owned());
+            let creator_did_for_register = scp_did::DID(identity_did.to_owned());
             rt.block_on(async move {
                 sup.create_context(ctx_id, core_params, creator_did_owned, local_pseudonym)
                     .await
@@ -2037,7 +2037,7 @@ impl crate::scp::PyScp {
             use scp_core::context::actor::commands::{
                 MessagingCommand, SendPseudonymAnnouncementPayload, SigningKeyBytes,
             };
-            let sender_did = scp_identity::DID(identity_did.to_owned());
+            let sender_did = scp_did::DID(identity_did.to_owned());
             let core_params = build_core_context_params(&handle.params)?;
             let ann_ctx_id = context_id.clone();
             rt.block_on(async move {
@@ -2083,7 +2083,7 @@ impl crate::scp::PyScp {
                 }
             };
 
-            let last_seen = scp_primitives::SystemClock.now_secs();
+            let last_seen = scp_clock::SystemClock.now_secs();
 
             let known = crate::runtime::KnownContext {
                 routing_id,
@@ -2175,7 +2175,7 @@ impl crate::scp::PyScp {
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
             let key_package = scp_core::context::membership::KeyPackage {
-                owner_did: scp_identity::DID(member_did.clone()),
+                owner_did: scp_did::DID(member_did.clone()),
                 mls_key_package_bytes: Some(kp_bytes),
             };
 
@@ -2235,7 +2235,7 @@ impl crate::scp::PyScp {
                 use scp_core::context::actor::commands::{
                     MessagingCommand, SendPseudonymAnnouncementPayload, SigningKeyBytes,
                 };
-                let sender_did = scp_identity::DID(member_did.clone());
+                let sender_did = scp_did::DID(member_did.clone());
                 let ann_ctx_id = context_id.clone();
                 let core_params = build_core_context_params(&handle.params)?;
                 rt.block_on(async move {
@@ -2317,7 +2317,7 @@ impl crate::scp::PyScp {
         rt.block_on(async move {
             sup.seed_peer_pseudonym(
                 &context_id,
-                scp_identity::DID::from(peer_did_owned.as_str()),
+                scp_did::DID::from(peer_did_owned.as_str()),
                 arr,
             )
             .await
@@ -2359,7 +2359,7 @@ impl crate::scp::PyScp {
         // Delegate leave to the shared ContextManager for membership tracking.
         {
             let context_id = handle.context_id.clone();
-            let member_did = scp_identity::DID(identity_did.to_owned());
+            let member_did = scp_did::DID(identity_did.to_owned());
             let rt = crate::runtime()?;
             let sup = crate::runtime::supervisor(bi)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
@@ -2477,7 +2477,7 @@ impl crate::scp::PyScp {
         // authorization (and any other precondition) is honored before the
         // FFI bridge state is touched.
         {
-            let initiator_did = scp_identity::DID(identity_did.to_owned());
+            let initiator_did = scp_did::DID(identity_did.to_owned());
             let rt = crate::runtime()?;
             let sup = crate::runtime::supervisor(bi)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
@@ -2614,7 +2614,7 @@ impl crate::scp::PyScp {
         // Delegate to ContextManager for message delivery through the transport.
         let context_id_for_drain = context_id.clone();
         {
-            let sender_did = scp_identity::DID(identity_did_owned);
+            let sender_did = scp_did::DID(identity_did_owned);
             let sup = crate::runtime::supervisor(bi)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
             let sup = sup.clone();
@@ -2768,7 +2768,7 @@ impl crate::scp::PyScp {
         // role state — never a nondeterministic membership-map iteration.
         let exporter_did = rt
             .block_on(async { sup.get_role_state(&ctx_id).await })
-            .map(|role_state| scp_identity::DID::from(role_state.creator_did))
+            .map(|role_state| scp_did::DID::from(role_state.creator_did))
             .ok_or_else(|| {
                 PyRuntimeError::new_err(format!(
                     "context export failed: context '{ctx_id}' not found"
@@ -2979,7 +2979,7 @@ impl crate::scp::PyScp {
                 use scp_core::context::actor::commands::{
                     MessagingCommand, SendPseudonymAnnouncementPayload, SigningKeyBytes,
                 };
-                let sender_did = scp_identity::DID(importer_did.to_owned());
+                let sender_did = scp_did::DID(importer_did.to_owned());
                 let ann_ctx_id = context_id_for_announce.clone();
                 let (atx, arx) = tokio::sync::oneshot::channel();
                 let ann_cmd = MessagingCommand::SendPseudonymAnnouncement {
@@ -3319,7 +3319,7 @@ impl crate::scp::PyScp {
         let context_id = handle.context_id.clone();
         let action_json_owned = action_json.to_owned();
         let signing_key = resolve_signing_key(bi, identity_did)?;
-        let proposer_did = scp_identity::DID(identity_did.to_owned());
+        let proposer_did = scp_did::DID(identity_did.to_owned());
 
         rt.block_on(async move {
             let action: scp_core::context::governance::GovernanceAction =
@@ -3404,7 +3404,7 @@ impl crate::scp::PyScp {
         let sup = sup.clone();
         let context_id = handle.context_id.clone();
         let signing_key = resolve_signing_key(bi, identity_did)?;
-        let voter_did = scp_identity::DID(identity_did.to_owned());
+        let voter_did = scp_did::DID(identity_did.to_owned());
         let proposal_id = parse_proposal_id(proposal_id_hex)?;
 
         rt.block_on(async move {
@@ -3488,7 +3488,7 @@ impl crate::scp::PyScp {
         let sup = sup.clone();
         let context_id = handle.context_id.clone();
         let signing_key = resolve_signing_key(bi, identity_did)?;
-        let voter_did = scp_identity::DID(identity_did.to_owned());
+        let voter_did = scp_did::DID(identity_did.to_owned());
         let proposal_id = parse_proposal_id(proposal_id_hex)?;
 
         rt.block_on(async move {
@@ -3571,7 +3571,7 @@ impl crate::scp::PyScp {
             crate::runtime::supervisor(bi).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let sup = sup.clone();
         let context_id = handle.context_id.clone();
-        let voter_did = scp_identity::DID(identity_did.to_owned());
+        let voter_did = scp_did::DID(identity_did.to_owned());
         let proposal_id = parse_proposal_id(proposal_id_hex)?;
 
         rt.block_on(async move {
@@ -3829,7 +3829,7 @@ impl crate::scp::PyScp {
         let creator_signature = hex::decode(creator_signature_hex).map_err(|e| {
             PyValueError::new_err(format!("SCP-CTX-2062: invalid creator_signature hex: {e}"))
         })?;
-        let did = scp_identity::DID(creator_did.to_owned());
+        let did = scp_did::DID(creator_did.to_owned());
 
         rt.block_on(async move {
             use scp_core::context::actor::commands::{
@@ -3919,7 +3919,7 @@ impl crate::scp::PyScp {
         })?;
 
         let cosignature = scp_core::context::governance::CosignedCheckpoint {
-            signer_did: scp_identity::DID(signer_did.to_owned()),
+            signer_did: scp_did::DID(signer_did.to_owned()),
             signature,
         };
 
@@ -4073,7 +4073,7 @@ impl crate::scp::PyScp {
             crate::runtime::supervisor(bi).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let sup = sup.clone();
         let context_id = handle.context_id.clone();
-        let did: scp_identity::DID = subscriber_did.to_owned().into();
+        let did: scp_did::DID = subscriber_did.to_owned().into();
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -4123,7 +4123,7 @@ impl crate::scp::PyScp {
             crate::runtime::supervisor(bi).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let sup = sup.clone();
         let context_id = handle.context_id.clone();
-        let did: scp_identity::DID = subscriber_did.to_owned().into();
+        let did: scp_did::DID = subscriber_did.to_owned().into();
 
         rt.block_on(async move {
             use scp_core::context::actor::commands::{
@@ -4183,7 +4183,7 @@ impl crate::scp::PyScp {
         crate::runtime::with_identity(bi, &author_did_owned, |entry| {
             let custody = entry.custody.clone();
             let signing_key_handle = entry.identity.active_signing_key;
-            let did: scp_identity::DID = author_did_owned.clone().into();
+            let did: scp_did::DID = author_did_owned.clone().into();
 
             rt.block_on(async move {
                 let (tx, rx) = tokio::sync::oneshot::channel();
@@ -4275,7 +4275,7 @@ impl crate::scp::PyScp {
         crate::runtime::with_identity(bi, &author_did_owned, |entry| {
             let custody = entry.custody.clone();
             let signing_key_handle = entry.identity.active_signing_key;
-            let did: scp_identity::DID = author_did_owned.clone().into();
+            let did: scp_did::DID = author_did_owned.clone().into();
 
             // Validate and construct BroadcastContent.
             let content_path = scp_core::context::ContentPath::new(path_owned)
@@ -4420,7 +4420,7 @@ impl crate::scp::PyScp {
         crate::runtime::with_identity(bi, &author_did_owned, |entry| {
             let custody = entry.custody.clone();
             let signing_key_handle = entry.identity.active_signing_key;
-            let did: scp_identity::DID = author_did_owned.clone().into();
+            let did: scp_did::DID = author_did_owned.clone().into();
 
             rt.block_on(async move {
                 let mut results = Vec::with_capacity(assets.len());
@@ -4520,8 +4520,8 @@ impl crate::scp::PyScp {
             crate::runtime::supervisor(bi).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let sup = sup.clone();
         let context_id = handle.context_id.clone();
-        let subscriber: scp_identity::DID = subscriber_did.to_owned().into();
-        let blocker: scp_identity::DID = blocker_did.to_owned().into();
+        let subscriber: scp_did::DID = subscriber_did.to_owned().into();
+        let blocker: scp_did::DID = blocker_did.to_owned().into();
 
         rt.block_on(async move {
             use scp_core::context::actor::commands::{BroadcastBlockPayload, BroadcastCommand};
@@ -4570,8 +4570,8 @@ impl crate::scp::PyScp {
             crate::runtime::supervisor(bi).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let sup = sup.clone();
         let context_id = handle.context_id.clone();
-        let subscriber: scp_identity::DID = subscriber_did.to_owned().into();
-        let unblocker: scp_identity::DID = unblocker_did.to_owned().into();
+        let subscriber: scp_did::DID = subscriber_did.to_owned().into();
+        let unblocker: scp_did::DID = unblocker_did.to_owned().into();
 
         rt.block_on(async move {
             use scp_core::context::actor::commands::{BroadcastBlockPayload, BroadcastCommand};
@@ -4638,8 +4638,8 @@ impl crate::scp::PyScp {
         let context_id = handle.context_id.clone();
         let context_id_for_seal = context_id.clone();
         let author_did_owned = author_did.to_owned();
-        let author: scp_identity::DID = author_did.to_owned().into();
-        let requester: scp_identity::DID = requester_did.to_owned().into();
+        let author: scp_did::DID = author_did.to_owned().into();
+        let requester: scp_did::DID = requester_did.to_owned().into();
 
         rt.block_on(async move {
             use scp_core::context::actor::commands::BroadcastCommand;
@@ -4856,12 +4856,12 @@ impl crate::scp::PyScp {
         let signing_key_bytes = zeroize::Zeroizing::new(signing_key.to_bytes());
 
         let contacts = last_relay_contacts.unwrap_or_default();
-        let now = scp_primitives::SystemClock.now_secs();
+        let now = scp_clock::SystemClock.now_secs();
 
         let report = rt.block_on(scp_ffi_common::reconnect::reconnect_contexts_no_drain(
             &transport,
             sup,
-            scp_identity::DID(identity_did.to_owned()),
+            scp_did::DID(identity_did.to_owned()),
             signing_key_bytes,
             context_ids,
             contacts,
@@ -5009,7 +5009,7 @@ impl crate::scp::PyScp {
             crate::runtime::supervisor(bi).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let sup = sup.clone();
         let context_id = handle.context_id.clone();
-        let did: scp_identity::DID = member_did.to_owned().into();
+        let did: scp_did::DID = member_did.to_owned().into();
         let duration = std::time::Duration::from_secs(proposed_seconds);
 
         rt.block_on(async move {
@@ -5164,7 +5164,7 @@ impl crate::scp::PyScp {
         };
 
         let oracle = FfiBridgeTrustOracle;
-        let inviter = scp_identity::DID::from(inviter_did);
+        let inviter = scp_did::DID::from(inviter_did);
 
         // Route the rate-limit tracker through this instance's core
         // (PyScp method — #1549 Phase 4 PR 4). Pre-migration this called
@@ -5179,7 +5179,7 @@ impl crate::scp::PyScp {
                 spending.as_ref(),
                 &oracle,
                 tracker,
-                &scp_core::time::SystemClock,
+                &scp_clock::SystemClock,
             )
         });
 
@@ -5657,7 +5657,7 @@ mod tests {
         rt.block_on(sup.create_context(
             ctx_id.clone(),
             params,
-            scp_identity::DID(creator.to_owned()),
+            scp_did::DID(creator.to_owned()),
             None,
         ))
         .unwrap();
@@ -6387,7 +6387,7 @@ mod tests {
         rt.block_on(sup.create_context(
             ctx_id.clone(),
             scp_core::context::ContextParams::default(),
-            scp_identity::DID(creator.to_owned()),
+            scp_did::DID(creator.to_owned()),
             None,
         ))
         .unwrap();
@@ -6486,7 +6486,7 @@ mod tests {
     #[test]
     fn governance_action_script_tag_in_role_name_rejected() {
         let action = scp_core::context::governance::GovernanceAction::AddMember {
-            did: scp_identity::DID("did:dht:z6MkTest".to_owned()),
+            did: scp_did::DID("did:dht:z6MkTest".to_owned()),
             role: "<script>alert('xss')</script>".to_owned(),
         };
         let err = validate_governance_action_strings(&action).unwrap_err();
@@ -6506,7 +6506,7 @@ mod tests {
 
         let event = ContextEvent::ConsequenceTriggered {
             context_id: "ctx-test-123".to_owned(),
-            member_did: scp_identity::DID("did:dht:z6MkBob".to_owned()),
+            member_did: scp_did::DID("did:dht:z6MkBob".to_owned()),
             rule_index: 2,
             trigger_type: "velocity".to_owned(),
             action_type: "mute".to_owned(),
@@ -6546,7 +6546,7 @@ mod tests {
     #[test]
     fn governance_action_control_chars_in_reason_rejected() {
         let action = scp_core::context::governance::GovernanceAction::RemoveMember {
-            did: scp_identity::DID("did:dht:z6MkTest".to_owned()),
+            did: scp_did::DID("did:dht:z6MkTest".to_owned()),
             reason: Some("bad\0actor".to_owned()),
         };
         let err = validate_governance_action_strings(&action).unwrap_err();
@@ -6562,7 +6562,7 @@ mod tests {
 
         let event = ContextEvent::ConsequenceEnforced {
             context_id: "ctx-test-456".to_owned(),
-            member_did: scp_identity::DID("did:dht:z6MkAlice".to_owned()),
+            member_did: scp_did::DID("did:dht:z6MkAlice".to_owned()),
             action_type: "restrict_write".to_owned(),
             success: true,
         };
@@ -6617,7 +6617,7 @@ mod tests {
     #[test]
     fn governance_action_valid_role_accepted() {
         let action = scp_core::context::governance::GovernanceAction::AddMember {
-            did: scp_identity::DID("did:dht:z6MkTest".to_owned()),
+            did: scp_did::DID("did:dht:z6MkTest".to_owned()),
             role: "moderator".to_owned(),
         };
         assert!(validate_governance_action_strings(&action).is_ok());
@@ -6626,7 +6626,7 @@ mod tests {
     #[test]
     fn governance_action_html_in_change_role_rejected() {
         let action = scp_core::context::governance::GovernanceAction::ChangeRole {
-            did: scp_identity::DID("did:dht:z6MkTest".to_owned()),
+            did: scp_did::DID("did:dht:z6MkTest".to_owned()),
             new_role: "admin&owner".to_owned(),
         };
         let err = validate_governance_action_strings(&action).unwrap_err();
@@ -6651,7 +6651,7 @@ mod tests {
     #[test]
     fn governance_action_none_reason_accepted() {
         let action = scp_core::context::governance::GovernanceAction::RemoveMember {
-            did: scp_identity::DID("did:dht:z6MkTest".to_owned()),
+            did: scp_did::DID("did:dht:z6MkTest".to_owned()),
             reason: None,
         };
         assert!(validate_governance_action_strings(&action).is_ok());
@@ -6904,7 +6904,7 @@ mod tests {
             rt.block_on(sup.create_context(
                 ctx_id.clone(),
                 params,
-                scp_identity::DID(creator.clone()),
+                scp_did::DID(creator.clone()),
                 None,
             ))
             .unwrap();
@@ -6924,7 +6924,7 @@ mod tests {
             let second_member = "did:key:z6MkExportSecondMember";
             rt.block_on(sup.test_insert_member(
                 &ctx_id,
-                scp_identity::DID(second_member.to_owned()),
+                scp_did::DID(second_member.to_owned()),
                 "member",
             ))
             .expect("test_insert_member must record the second member");
@@ -7172,7 +7172,7 @@ class SignOnlyCustody:
             rt.block_on(sup.create_context(
                 ctx_id.clone(),
                 scp_core::context::ContextParams::default(),
-                scp_identity::DID(creator.clone()),
+                scp_did::DID(creator.clone()),
                 None,
             ))
             .unwrap();

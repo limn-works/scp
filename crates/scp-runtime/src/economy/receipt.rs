@@ -450,8 +450,8 @@ where
 )]
 mod tests {
     use super::*;
+    use scp_did::DID;
     use scp_event_log::EventType;
-    use scp_identity::DID;
     use scp_protocol::economy::types::{Amount, CurrencyCode, PaidActionType};
 
     /// Creates a test `PaymentReceipt` with a configurable `receipt_id`.

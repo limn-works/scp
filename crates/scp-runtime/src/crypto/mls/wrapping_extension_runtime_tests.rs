@@ -20,7 +20,7 @@ fn test_credential(name: &str) -> scp_mls::ScpCredential {
     scp_mls::ScpCredential::new(
         format!("did:dht:z6Mk{name}"),
         None,
-        scp_primitives::SigningKeyId::Active,
+        scp_did::SigningKeyId::Active,
     )
     .unwrap()
 }
@@ -70,7 +70,7 @@ async fn sender_key_request_response_with_wrapping_key() {
     let bob_pubkey = custody.public_key(&bob_signing).await.unwrap();
 
     // Bob creates a request with an ephemeral wrapping key.
-    let clock = scp_primitives::SystemClock;
+    let clock = scp_clock::SystemClock;
     let request_result = request_sender_key(
         &custody,
         &bob_signing,
@@ -148,7 +148,7 @@ async fn tampered_wrapping_key_prevents_decryption() {
     let bob_signing = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
     let bob_pubkey = custody.public_key(&bob_signing).await.unwrap();
 
-    let clock = scp_primitives::SystemClock;
+    let clock = scp_clock::SystemClock;
     let request_result = request_sender_key(
         &custody,
         &bob_signing,

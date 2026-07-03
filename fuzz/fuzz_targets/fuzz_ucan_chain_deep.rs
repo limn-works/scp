@@ -53,7 +53,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ed25519_dalek::{Signer, SigningKey};
 use libfuzzer_sys::fuzz_target;
 use scp_fuzz::FixedClock;
-use scp_primitives::Clock as _;
+use scp_clock::Clock as _;
 use sha2::{Digest, Sha256};
 use scp_protocol::crypto::ucan::capability::CapabilityUri;
 use scp_protocol::crypto::ucan::validate::{
@@ -99,7 +99,7 @@ fn build_token(
     let signing_key = SigningKey::from_bytes(&SEEDS[issuer_idx % SEEDS.len()]);
     let issuer_did = did_for(issuer_idx);
 
-    let now_secs = scp_primitives::SystemClock.now_secs();
+    let now_secs = scp_clock::SystemClock.now_secs();
     let exp = if expired {
         now_secs.saturating_sub(DEFAULT_CLOCK_SKEW_TOLERANCE_SECS + 1)
     } else {
@@ -108,7 +108,7 @@ fn build_token(
 
     let nonce = format!(
         "{}-deadbeefcafe1234deadbeefcafe1234",
-        scp_primitives::SystemClock.now_millis()
+        scp_clock::SystemClock.now_millis()
     );
 
     let payload = UcanPayload {
@@ -245,7 +245,7 @@ fuzz_target!(|input: FuzzChainInput| {
         false, // leaf never expired
     );
 
-    let now_secs = scp_primitives::SystemClock.now_secs();
+    let now_secs = scp_clock::SystemClock.now_secs();
     let clock = FixedClock(now_secs);
     let mut nonce_tracker = InMemoryNonceTracker::new();
     let rev_checker = InMemoryRevocationChecker::new();

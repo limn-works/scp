@@ -34,12 +34,13 @@ use std::time::Duration;
 use tracing::{debug, info, warn};
 
 use crate::IdentityError;
-use crate::cache::{Clock, DidCache, SystemClock};
+use crate::cache::DidCache;
 use crate::dht::{extract_public_key, verify_bep44_signature, verify_self_certification};
 use crate::dht_client::{DhtClient, DhtRecord};
-use crate::document::{DidDocument, decode_multibase_key};
 use crate::republish::RelayPublisher;
 use crate::resolution::did_routing_id;
+use scp_clock::{Clock, SystemClock};
+use scp_did::{DidDocument, decode_multibase_key};
 
 // ---------------------------------------------------------------------------
 // Core types (§3.10.10)
@@ -794,7 +795,7 @@ fn validate_dht_result(
 // ---------------------------------------------------------------------------
 
 /// Extracts the Ed25519 verifying key for a specific signing key from a resolved
-/// DID document, keyed by the requested [`SigningKeyId`](scp_primitives::SigningKeyId).
+/// DID document, keyed by the requested [`SigningKeyId`](scp_did::SigningKeyId).
 ///
 /// This is the single, pure, sync document→key extraction shared by every
 /// participant that verifies governance vote signatures against a voter's
@@ -817,9 +818,9 @@ fn validate_dht_result(
 /// call the bridge copy without a crate cycle; hoisting the pure extraction here
 /// breaks that cycle.
 ///
-/// The lookup is keyed by [`SigningKeyId::fragment`](scp_primitives::SigningKeyId::fragment)
+/// The lookup is keyed by [`SigningKeyId::fragment`](scp_did::SigningKeyId::fragment)
 /// (`"active"` / `"agent"`) — the `SigningKeyId` is honored, never ignored:
-/// resolving [`SigningKeyId::Agent`](scp_primitives::SigningKeyId::Agent) returns
+/// resolving [`SigningKeyId::Agent`](scp_did::SigningKeyId::Agent) returns
 /// the document's distinct `#agent` key, not the `#active` key.
 ///
 /// # Purity and downgrade protection
@@ -841,7 +842,7 @@ fn validate_dht_result(
 #[must_use]
 pub fn verifying_key_from_document(
     document: &DidDocument,
-    kid: scp_primitives::SigningKeyId,
+    kid: scp_did::SigningKeyId,
 ) -> Option<ed25519_dalek::VerifyingKey> {
     let vm = document.verification_method_by_fragment(kid.fragment())?;
     let bytes = decode_multibase_key(&vm.public_key_multibase).ok()?;
@@ -869,12 +870,12 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use super::*;
-    use crate::SigningKeyId;
-    use crate::cache::{DidCache, TestClock};
+    use crate::cache::DidCache;
     use crate::dht::bep44_signable;
     use crate::dht_client::{DhtRecord, InMemoryDhtClient};
-    use crate::document::DidDocument;
     use crate::resolution::did_routing_id;
+    use scp_clock::TestClock;
+    use scp_did::{DidDocument, SigningKeyId};
 
     // -----------------------------------------------------------------------
     // Test helpers

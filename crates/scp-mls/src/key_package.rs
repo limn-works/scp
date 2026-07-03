@@ -193,7 +193,7 @@ mod tests {
         ScpCredential::new(
             format!("did:dht:z6Mk{name}"),
             None,
-            scp_primitives::SigningKeyId::Active,
+            scp_did::SigningKeyId::Active,
         )
         .unwrap()
     }

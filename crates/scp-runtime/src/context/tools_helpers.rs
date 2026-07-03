@@ -55,7 +55,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 
-use scp_identity::DID;
+use scp_did::DID;
 use scp_protocol::context::ContextError;
 use scp_protocol::context::roles::ContextRoleState;
 use scp_protocol::context::tools::ToolId;
@@ -1494,7 +1494,7 @@ mod tests {
         use std::sync::Arc;
         use std::time::Duration;
 
-        use scp_identity::DID;
+        use scp_did::DID;
         use scp_protocol::context::params::Capability;
         use scp_protocol::economy::types::{CostSchedule, EconomicPolicy};
         use scp_protocol::trust::consequence::{
@@ -1671,8 +1671,8 @@ mod tests {
                         Arc::new(InMemoryStorage::new()),
                     ),
                 );
-            let clock: Arc<dyn scp_primitives::Clock> =
-                Arc::new(scp_primitives::TestClock::new(1_700_000_000));
+            let clock: Arc<dyn scp_clock::Clock> =
+                Arc::new(scp_clock::TestClock::new(1_700_000_000));
             let payment_adapter: Arc<dyn crate::economy::adapter::PaymentAdapterDyn> =
                 Arc::new(FailingCaptureAdapter);
             let supervisor = Supervisor::with_providers(

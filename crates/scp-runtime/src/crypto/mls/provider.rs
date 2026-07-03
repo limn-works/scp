@@ -38,18 +38,18 @@ use dashmap::{DashMap, DashSet};
 use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_traits::OpenMlsProvider;
-use scp_identity::SigningKeyId;
-use scp_primitives::Clock;
+use scp_clock::Clock;
+use scp_did::SigningKeyId;
 use serde::{Deserialize, Serialize};
 use tls_codec::Deserialize as TlsDeserializeTrait;
 use zeroize::{Zeroize, Zeroizing};
 
 use super::backend::MlsBackend;
-use super::credential::ScpCredential;
-use super::encrypt::{DecryptedContent, decrypt_with_sender_did};
-use super::group::{self, SCP_CIPHERSUITE, ScpMlsGroup};
 use super::production_backend::ProductionMlsBackend;
 use crate::crypto::hpke_backend::{HpkeBackend, ProductionHpkeBackend};
+use scp_mls::credential::ScpCredential;
+use scp_mls::encrypt::{DecryptedContent, decrypt_with_sender_did};
+use scp_mls::group::{self, SCP_CIPHERSUITE, ScpMlsGroup};
 use scp_protocol::context::ContextError;
 use scp_protocol::context::builder::ContextCreationError;
 use scp_protocol::crypto::sender_keys::{
@@ -348,9 +348,9 @@ struct PendingJoinState {
     /// The signing key pair for the generated key package, wrapped in
     /// [`EagerDropSigner`] for best-effort zeroization (consistent with
     /// [`ScpMlsGroup::signer`]).
-    signer: super::group::EagerDropSigner,
+    signer: scp_mls::group::EagerDropSigner,
     /// The MLS provider holding the key package's private state.
-    provider: crate::crypto::mls::InMemoryMlsProvider,
+    provider: scp_mls::InMemoryMlsProvider,
 }
 
 /// Production `ContextCryptoProvider` backed by `OpenMLS`.
@@ -982,7 +982,7 @@ impl MlsCryptoProvider {
             .map_err(|e| ContextError::InvalidKeyPackage(format!("TLS deserialization: {e}")))?;
 
         // Validate ciphersuite and signature.
-        let provider = crate::crypto::mls::InMemoryMlsProvider::default();
+        let provider = scp_mls::InMemoryMlsProvider::default();
         let verified = kp_in
             .validate(provider.crypto(), ProtocolVersion::Mls10)
             .map_err(|e| ContextError::InvalidKeyPackage(format!("validation failed: {e}")))?;
@@ -1064,12 +1064,12 @@ impl MlsCryptoProvider {
             KeyPackageIn::tls_deserialize(&mut &*bytes)
                 .ok()
                 .and_then(|kp_in| {
-                    let provider_tmp = crate::crypto::mls::InMemoryMlsProvider::default();
+                    let provider_tmp = scp_mls::InMemoryMlsProvider::default();
                     kp_in
                         .validate(provider_tmp.crypto(), ProtocolVersion::Mls10)
                         .ok()
                         .and_then(|verified| {
-                            super::wrapping_extension::extract_wrapping_key(
+                            scp_mls::wrapping_extension::extract_wrapping_key(
                                 verified.leaf_node().extensions(),
                             )
                             .ok()
@@ -1139,12 +1139,12 @@ impl MlsCryptoProvider {
             let members = state
                 .mls_group
                 .members()
-                .map_err(|e: super::error::MlsError| ContextError::CryptoFailed(e.to_string()))?;
+                .map_err(|e: scp_mls::error::MlsError| ContextError::CryptoFailed(e.to_string()))?;
 
             let own_index = state
                 .mls_group
                 .own_leaf_index()
-                .map_err(|e: super::error::MlsError| ContextError::CryptoFailed(e.to_string()))?;
+                .map_err(|e: scp_mls::error::MlsError| ContextError::CryptoFailed(e.to_string()))?;
 
             let mut target_index = None;
             for member in &members {
@@ -1556,7 +1556,7 @@ impl MlsCryptoProvider {
             rmp_serde::from_slice(request_bytes)
                 .map_err(|e| ContextError::CryptoFailed(format!("request deserialization: {e}")))?;
 
-        let now_secs = scp_primitives::SystemClock.now_secs();
+        let now_secs = scp_clock::SystemClock.now_secs();
 
         // ADR-049 commit 12c.9f: lock-free `DashMap::get_mut`.
         let mut entry = self.contexts.get_mut(context_id).ok_or_else(|| {
@@ -1709,10 +1709,9 @@ impl MlsCryptoProvider {
             );
 
             // 3. MLS encrypt.
-            let mls_message =
-                crate::crypto::mls::encrypt::encrypt(&mut state.mls_group, &with_header)
-                    .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
-            let encrypted_blob = crate::crypto::mls::encrypt::serialize_ciphertext(&mls_message)
+            let mls_message = scp_mls::encrypt::encrypt(&mut state.mls_group, &with_header)
+                .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+            let encrypted_blob = scp_mls::encrypt::serialize_ciphertext(&mls_message)
                 .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
 
             // 4. Wrap in outer envelope.
@@ -1955,9 +1954,9 @@ impl MlsCryptoProvider {
             let mut tagged = Vec::with_capacity(magic.len() + plaintext.len());
             tagged.extend_from_slice(magic);
             tagged.extend_from_slice(plaintext);
-            let mls_message = crate::crypto::mls::encrypt::encrypt(&mut state.mls_group, &tagged)
+            let mls_message = scp_mls::encrypt::encrypt(&mut state.mls_group, &tagged)
                 .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
-            let encrypted_blob = crate::crypto::mls::encrypt::serialize_ciphertext(&mls_message)
+            let encrypted_blob = scp_mls::encrypt::serialize_ciphertext(&mls_message)
                 .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
             let outer = scp_protocol::envelope::outer::create_outer_envelope(
                 routing_id,
@@ -1995,7 +1994,7 @@ impl MlsCryptoProvider {
         // ADR-049 commit 12c.9f: load wrapping pubkey through `ArcSwap`.
         let wrapping_pk = **self.wrapping_public_key.load();
         self.with_context(context_id, |state| {
-            let commit = super::ratchet::propose_update_with_wrapping_key(
+            let commit = scp_mls::ratchet::propose_update_with_wrapping_key(
                 &mut state.mls_group,
                 &wrapping_pk,
             )
@@ -2183,7 +2182,7 @@ impl MlsCryptoProvider {
             .map_err(|e| ContextError::CryptoFailed(format!("snapshot deserialization: {e}")))?;
 
         // Reconstruct the InMemoryMlsProvider with the persisted storage entries.
-        let provider = crate::crypto::mls::InMemoryMlsProvider::default();
+        let provider = scp_mls::InMemoryMlsProvider::default();
         {
             let mut values =
                 provider.storage().values.write().map_err(|e| {
@@ -2577,7 +2576,7 @@ impl MlsCryptoProvider {
         let wrapping_pk = **self.wrapping_public_key.load();
 
         let (kp_bundle, signer, provider) =
-            super::group::generate_key_package_with_wrapping_key(&credential, Some(&wrapping_pk))
+            scp_mls::group::generate_key_package_with_wrapping_key(&credential, Some(&wrapping_pk))
                 .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
 
         let kp_bytes = kp_bundle
@@ -2591,7 +2590,7 @@ impl MlsCryptoProvider {
         // ADR-049 commit 12c.9f: `ArcSwapOption::store` is atomic; any
         // prior `Some` is dropped (with its `Zeroizing` signer wrapper).
         self.pending_joins.store(Some(Arc::new(PendingJoinState {
-            signer: super::group::EagerDropSigner::new(signer),
+            signer: scp_mls::group::EagerDropSigner::new(signer),
             provider,
         })));
 
@@ -2652,7 +2651,7 @@ impl MlsCryptoProvider {
             ContextError::CryptoFailed("pending join signer already consumed".into())
         })?;
 
-        let group = super::group::join_group_from_bytes(welcome_bytes, entry.provider, signer)
+        let group = scp_mls::group::join_group_from_bytes(welcome_bytes, entry.provider, signer)
             .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
 
         let sender_key = generate_sender_key();
@@ -2692,8 +2691,8 @@ impl MlsCryptoProvider {
 )]
 mod tests {
     use super::*;
-    use crate::crypto::mls::encrypt::{encrypt, serialize_ciphertext};
-    use crate::crypto::mls::group::generate_key_package;
+    use scp_mls::encrypt::{encrypt, serialize_ciphertext};
+    use scp_mls::group::generate_key_package;
     use scp_protocol::crypto::sender_keys::SenderKeyError;
     use tls_codec::Serialize as TlsSerializeTrait;
 
@@ -2933,7 +2932,7 @@ mod tests {
 
         // Bob decrypts using his group directly.
         let mut bob_group = bob_group;
-        let decrypted = super::super::encrypt::decrypt(&mut bob_group, &ciphertext).unwrap();
+        let decrypted = scp_mls::encrypt::decrypt(&mut bob_group, &ciphertext).unwrap();
         assert_eq!(decrypted, plaintext);
     }
 
@@ -2970,7 +2969,7 @@ mod tests {
         };
 
         // Bob decrypts successfully in epoch 1.
-        let decrypted = super::super::encrypt::decrypt(&mut bob_group, &ciphertext_epoch1).unwrap();
+        let decrypted = scp_mls::encrypt::decrypt(&mut bob_group, &ciphertext_epoch1).unwrap();
         assert_eq!(decrypted, b"epoch 1 message");
 
         // Add Carol to advance to epoch 2.
@@ -3268,7 +3267,7 @@ mod tests {
         let entry = provider.contexts.get(&ctx_id).unwrap();
         let state = entry.value();
         let extracted =
-            super::super::wrapping_extension::extract_own_wrapping_key(&state.mls_group).unwrap();
+            scp_mls::wrapping_extension::extract_own_wrapping_key(&state.mls_group).unwrap();
         assert_eq!(
             extracted,
             Some(**provider.wrapping_public_key.load()),
@@ -3278,7 +3277,7 @@ mod tests {
 
     #[test]
     fn distribute_sender_key_hpke_seals_when_wrapping_key_available() {
-        use super::super::group::generate_key_package_with_wrapping_key;
+        use scp_mls::group::generate_key_package_with_wrapping_key;
 
         let alice_provider = make_provider();
         let ctx_id = make_context_id();
@@ -3367,7 +3366,7 @@ mod tests {
 
     #[test]
     fn process_incoming_sender_key_roundtrip() {
-        use super::super::group::generate_key_package_with_wrapping_key;
+        use scp_mls::group::generate_key_package_with_wrapping_key;
 
         let alice_provider = make_provider();
         let bob_provider = MlsCryptoProvider::new(
@@ -5039,10 +5038,10 @@ mod tests {
         let ctx_str = "ctx-app-data-zeroed-rid";
         let (alice, _bob, _ctx_id, alice_did) = setup_two_party_for_ctx_string(ctx_str);
         let alice = std::sync::Arc::new(alice);
-        let clock: std::sync::Arc<dyn scp_primitives::Clock> =
-            std::sync::Arc::new(scp_primitives::SystemClock);
+        let clock: std::sync::Arc<dyn scp_clock::Clock> =
+            std::sync::Arc::new(scp_clock::SystemClock);
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
-        let sender = scp_identity::DID(alice_did.clone());
+        let sender = scp_did::DID(alice_did.clone());
         let recipients = app_data_recipients(ctx_str, &alice_did);
 
         let wire = crate::context::messaging_helpers::build_encrypted_envelope(
@@ -5082,10 +5081,10 @@ mod tests {
         let ctx_str = "ctx-app-data-roundtrip";
         let (alice, bob, ctx_id, alice_did) = setup_two_party_for_ctx_string(ctx_str);
         let alice_arc = std::sync::Arc::new(alice);
-        let clock: std::sync::Arc<dyn scp_primitives::Clock> =
-            std::sync::Arc::new(scp_primitives::SystemClock);
+        let clock: std::sync::Arc<dyn scp_clock::Clock> =
+            std::sync::Arc::new(scp_clock::SystemClock);
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
-        let sender = scp_identity::DID(alice_did.clone());
+        let sender = scp_did::DID(alice_did.clone());
         let recipients = app_data_recipients(ctx_str, &alice_did);
 
         let wire = crate::context::messaging_helpers::build_encrypted_envelope(

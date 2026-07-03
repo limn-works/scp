@@ -24,7 +24,7 @@ use scp_core::crypto::ucan::validate::{
     InMemoryDidResolver, InMemoryProofResolver, InMemoryRevocationChecker, NonceTracker,
 };
 use scp_core::identity::block_list::{BlockListEvent, BlockListState};
-use scp_identity::DID;
+use scp_did::DID;
 
 // ---------------------------------------------------------------------------
 // Helpers

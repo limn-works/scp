@@ -31,12 +31,13 @@ use sha2::{Digest, Sha256};
 
 use scp_platform::traits::{KeyCustody, KeyType, PreRotationCustody, PreRotationKeyHandle};
 
-use super::cache::{Clock, DidCache, DidResolutionResult, Staleness, SystemClock};
+use super::cache::{DidCache, DidResolutionResult, Staleness};
 use super::dht_client::{DhtClient, InMemoryDhtClient};
-use super::document::{
+use super::{DidMethod, IdentityError, ScpIdentity};
+use scp_clock::{Clock, SystemClock};
+use scp_did::{
     DidDocument, DidRotationEvent, MigrationProof, PreRotationProof, decode_multibase_key,
 };
-use super::{DidMethod, IdentityError, ScpIdentity};
 
 /// The `did:dht` DID method prefix.
 const DID_DHT_PREFIX: &str = "did:dht:";
@@ -2121,21 +2122,15 @@ impl<D: DhtClient + 'static, C: Clock + 'static> DidMethod for DidDht<D, C> {
     }
 
     fn verify(&self, did_string: &str, public_key: &[u8]) -> bool {
-        // Strip the "did:dht:z" prefix to get the z-base-32 encoded key.
-        let Some(encoded) = did_string
-            .strip_prefix(DID_DHT_PREFIX)
-            .and_then(|s| s.strip_prefix('z'))
-        else {
-            return false;
-        };
-
-        // Decode z-base-32.
-        let Ok(decoded) = zbase32::decode(encoded) else {
-            return false;
-        };
-
-        // Compare decoded bytes to provided public key.
-        decoded == public_key
+        // Delegate to the hardened `extract_public_key` free fn (same module)
+        // rather than decoding inline. That parser strips the "did:dht:z"
+        // prefix, z-base-32-decodes, requires exactly 32 bytes, AND enforces
+        // canonicality (re-encode + byte-exact compare). Routing the self-
+        // certification check through it means a NON-canonical spelling of a
+        // valid key does not self-certify — closing the trailing-bit-padding
+        // non-injectivity — and keeps this decoder byte-for-byte identical to
+        // every other did:dht decoder (single-parser parity).
+        extract_public_key(did_string).is_ok_and(|decoded_key| public_key == decoded_key.as_slice())
     }
 
     fn publish(
@@ -2765,8 +2760,8 @@ mod tests {
     use scp_platform::testing::InMemoryKeyCustody;
 
     use super::*;
-    use crate::cache::TestClock;
     use crate::dht_client::InMemoryDhtClient;
+    use scp_clock::TestClock;
 
     /// Helper to create a fully-configured `DidDht` for testing.
     fn make_dht_with_custody(
@@ -2850,6 +2845,57 @@ mod tests {
     fn verify_did_returns_false_for_missing_z_prefix() {
         let dht = DidDht::new();
         assert!(!dht.verify("did:dht:notzbased", &[1u8; 32]));
+    }
+
+    #[test]
+    fn verify_rejects_non_canonical_spelling_of_matching_key() {
+        // The self-certification check MUST enforce z-base-32 canonicality:
+        // a non-canonical spelling of the SAME key must not self-certify,
+        // even though it decodes to the matching bytes. z-base-32 of a 32-byte
+        // payload is not injective on its trailing bit-padding (52nd char = 1
+        // payload bit + 4 padding bits → 16 alternate encodings). Without the
+        // guard, `verify` would accept 16 distinct DID strings for one key.
+        const ALPHABET: &[u8; 32] = b"ybndrfg8ejkmcpqxot1uwisza345h769";
+
+        let dht = DidDht::new();
+        let key = [0x42u8; 32];
+        let canonical_encoded = zbase32::encode(&key);
+        let canonical_did = format!("did:dht:z{canonical_encoded}");
+
+        // Canonical spelling of the matching key self-certifies.
+        assert!(
+            dht.verify(&canonical_did, &key),
+            "canonical did:dht spelling of the matching key must verify true"
+        );
+
+        // Build a non-canonical alternate by toggling a padding bit of the
+        // trailing char.
+        let last_char = canonical_encoded.as_bytes()[canonical_encoded.len() - 1];
+        let last_idx = ALPHABET
+            .iter()
+            .position(|&c| c == last_char)
+            .expect("canonical char must be in alphabet");
+        let mut mutated_bytes = canonical_encoded.as_bytes().to_vec();
+        let last_pos = mutated_bytes.len() - 1;
+        mutated_bytes[last_pos] = ALPHABET[last_idx ^ 1];
+        let mutated_encoded =
+            String::from_utf8(mutated_bytes).expect("z-base-32 alphabet is ASCII");
+        let mutated_did = format!("did:dht:z{mutated_encoded}");
+
+        // Sanity: the mutated spelling still decodes to the same 32 bytes.
+        assert_eq!(
+            zbase32::decode(&mutated_encoded)
+                .expect("alternate decodes")
+                .as_slice(),
+            &key[..],
+            "the mutated spelling must decode to the same key (a real non-canonical alternate)"
+        );
+
+        // The non-canonical spelling of the matching key MUST NOT self-certify.
+        assert!(
+            !dht.verify(&mutated_did, &key),
+            "non-canonical did:dht spelling must not self-certify even for the matching key"
+        );
     }
 
     #[test]
@@ -3334,6 +3380,67 @@ mod tests {
             }
             other => panic!("expected InvalidDidFormat, got: {other:?}"),
         }
+    }
+
+    /// Cross-parser agreement: the native DID-method parser
+    /// (`DidDht::extract_public_key`) and the wasm-safe data-model parser
+    /// (`scp_did::extract_public_key_from_did`) — the one the browser/event-log
+    /// signature-verify path reaches — MUST agree on canonicality. This test
+    /// feeds the *same* non-canonical `did:dht:z…` fixture to both and asserts
+    /// both reject it (and both accept the canonical spelling), pinning the
+    /// security-parity invariant from ADR-057's T1c passage: the browser path
+    /// must never verify against a key native would reject as non-canonical.
+    #[test]
+    fn native_and_scp_did_parsers_agree_on_canonicality() {
+        const ALPHABET: &[u8; 32] = b"ybndrfg8ejkmcpqxot1uwisza345h769";
+
+        let key = [42u8; 32];
+        let canonical_encoded = zbase32::encode(&key);
+        let canonical_did = format!("did:dht:z{canonical_encoded}");
+
+        // Both parsers accept the canonical spelling and yield the same key.
+        assert_eq!(
+            DidDht::<InMemoryDhtClient>::extract_public_key(&canonical_did).unwrap(),
+            key
+        );
+        assert_eq!(
+            scp_did::extract_public_key_from_did(&canonical_did).unwrap(),
+            key
+        );
+
+        // Construct the same non-canonical alternate used in the native
+        // regression test above (toggle a trailing padding bit).
+        let last_char = canonical_encoded.as_bytes()[canonical_encoded.len() - 1];
+        let last_idx = ALPHABET
+            .iter()
+            .position(|&c| c == last_char)
+            .expect("canonical char must be in alphabet");
+        let mutated_idx = last_idx ^ 1;
+        let mut mutated_bytes = canonical_encoded.as_bytes().to_vec();
+        let last_pos = mutated_bytes.len() - 1;
+        mutated_bytes[last_pos] = ALPHABET[mutated_idx];
+        let mutated_encoded =
+            String::from_utf8(mutated_bytes).expect("z-base-32 alphabet is ASCII");
+        let mutated_did = format!("did:dht:z{mutated_encoded}");
+
+        // Sanity: the alternate decodes to the same 32 bytes on both sides.
+        assert_eq!(
+            zbase32::decode(&mutated_encoded)
+                .expect("alternate decodes")
+                .as_slice(),
+            &key[..]
+        );
+
+        // Both parsers MUST reject the non-canonical input — identical inputs,
+        // identical rejection.
+        assert!(
+            DidDht::<InMemoryDhtClient>::extract_public_key(&mutated_did).is_err(),
+            "native parser must reject non-canonical did:dht"
+        );
+        assert!(
+            scp_did::extract_public_key_from_did(&mutated_did).is_err(),
+            "scp-did parser must reject non-canonical did:dht"
+        );
     }
 
     /// Helper that creates an identity with a fresh
@@ -4538,7 +4645,7 @@ mod tests {
         // whose `#0` verification method has a malformed
         // `publicKeyMultibase`: missing the `z` base58btc prefix that
         // `decode_multibase_key` requires.
-        let malformed_vm0 = crate::document::VerificationMethod {
+        let malformed_vm0 = scp_did::VerificationMethod {
             id: format!("{}#0", event.old_did),
             method_type: "Ed25519VerificationKey2020".to_owned(),
             controller: event.old_did.clone(),

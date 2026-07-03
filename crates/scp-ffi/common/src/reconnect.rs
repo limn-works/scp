@@ -46,7 +46,7 @@ use scp_core::context::supervisor::Supervisor;
 use scp_core::sync::days_offline::{DaysOfflineError, SnapshotTransport};
 use scp_core::sync::hours_offline::{BufferedMessage, EpochCatchUpState, SyncPhaseDriver};
 use scp_core::sync::weeks_offline::ResetTransport;
-use scp_identity::DID;
+use scp_did::DID;
 use scp_protocol::context::membership::ContextEvent;
 use scp_protocol::context::{broadcast_routing_id, context_routing_id};
 use scp_protocol::envelope::outer::{OuterEnvelope, create_outer_envelope};

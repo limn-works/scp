@@ -7,7 +7,7 @@
 //!
 //! See SCP-PERSIST-063 and spec section 17.1 (deployment patterns).
 
-use scp_primitives::Clock;
+use scp_clock::Clock;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -24,14 +24,14 @@ use super::storage::{BlobStorage, StorageError, StoredBlob};
 
 /// A clock function that returns the current Unix timestamp in seconds.
 ///
-/// The default ([`system_clock`]) delegates to [`scp_primitives::SystemClock`].
+/// The default ([`system_clock`]) delegates to [`scp_clock::SystemClock`].
 /// Tests inject a deterministic clock via [`CombinedNodeStorage::open_with_clock`].
 pub type ClockFn = Arc<dyn Fn() -> u64 + Send + Sync>;
 
 /// Returns a [`ClockFn`] backed by the real system clock.
 #[must_use]
 pub fn system_clock() -> ClockFn {
-    Arc::new(|| scp_primitives::SystemClock.now_secs())
+    Arc::new(|| scp_clock::SystemClock.now_secs())
 }
 
 // ---------------------------------------------------------------------------

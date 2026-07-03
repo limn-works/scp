@@ -19,7 +19,8 @@
 use libfuzzer_sys::fuzz_target;
 use scp_event_log::proof::{Direction, prove_inclusion, verify_inclusion};
 use scp_event_log::tree::{GENESIS_PREV_HASH, append_unsigned_event, event_count};
-use scp_event_log::{DID, Event, EventLog, EventPayload, EventType};
+use scp_did::DID;
+use scp_event_log::{Event, EventLog, EventPayload, EventType};
 
 // ---------------------------------------------------------------------------
 // Helpers

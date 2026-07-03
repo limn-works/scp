@@ -298,8 +298,8 @@ async fn handle_handle_broadcast_key_request(
     cell: &mut ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
-    author_did: &scp_identity::DID,
-    requester_did: &scp_identity::DID,
+    author_did: &scp_did::DID,
+    requester_did: &scp_did::DID,
     wrapping_pubkey: [u8; 32],
     reply: HandleBroadcastKeyRequestReply,
 ) -> Outcome<()> {

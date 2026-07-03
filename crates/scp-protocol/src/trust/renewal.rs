@@ -28,7 +28,7 @@ use std::time::Duration;
 
 use super::TrustError;
 use super::attestation::{Attestation, DidPublicKeyResolver, verify_attestation};
-use scp_primitives::Clock;
+use scp_clock::Clock;
 
 // ---------------------------------------------------------------------------
 // RenewalError
@@ -188,7 +188,7 @@ mod tests {
     use super::*;
     use crate::trust::AttestationType;
     use crate::trust::attestation::{RevocationStatus, canonical_attestation_bytes};
-    use scp_primitives::TestClock;
+    use scp_clock::TestClock;
 
     struct TestResolver {
         keys: HashMap<String, Vec<u8>>,

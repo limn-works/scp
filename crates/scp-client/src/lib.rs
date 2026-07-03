@@ -38,7 +38,7 @@
 //!   enters wasm memory),
 //! - a [`Storage`] — out-of-band snapshot store ([`MemoryStorage`] for the MVP;
 //!   `IndexedDB` in a later slice),
-//! - a [`scp_primitives::Clock`] — the hardened time source for
+//! - a [`scp_clock::Clock`] — the hardened time source for
 //!   committer-assigned event-log leaf timestamps (ADR-057 Prerequisite 1).
 //!
 //! # MISSING SEAM (cross-member sender-key distribution)

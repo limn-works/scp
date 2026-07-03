@@ -19,8 +19,8 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use scp_primitives::Clock;
-use scp_primitives::DID;
+use scp_clock::Clock;
+use scp_did::DID;
 
 use super::ContextId;
 use super::addressing::{
@@ -496,7 +496,7 @@ mod tests {
         let mut map = PetnameMap::new();
         map.set_petname(DID::from("did:dht:zAlice"), "alice".to_owned());
 
-        let results = map.resolve_petname("alice", &scp_primitives::SystemClock);
+        let results = map.resolve_petname("alice", &scp_clock::SystemClock);
         assert_eq!(results.len(), 1);
         assert!(matches!(
             &results[0],
@@ -513,7 +513,7 @@ mod tests {
         let mut map = PetnameMap::new();
         map.set_context_petname("ctx-recipes".to_owned(), "recipes".to_owned());
 
-        let results = map.resolve_petname("recipes", &scp_primitives::SystemClock);
+        let results = map.resolve_petname("recipes", &scp_clock::SystemClock);
         assert_eq!(results.len(), 1);
         assert!(matches!(
             &results[0],
@@ -531,14 +531,14 @@ mod tests {
         map.set_petname(DID::from("did:dht:zAlice"), "shared".to_owned());
         map.set_context_petname("ctx-shared".to_owned(), "shared".to_owned());
 
-        let results = map.resolve_petname("shared", &scp_primitives::SystemClock);
+        let results = map.resolve_petname("shared", &scp_clock::SystemClock);
         assert_eq!(results.len(), 2);
     }
 
     #[test]
     fn petname_store_resolve_empty_returns_empty() {
         let map = PetnameMap::new();
-        let results = map.resolve_petname("nonexistent", &scp_primitives::SystemClock);
+        let results = map.resolve_petname("nonexistent", &scp_clock::SystemClock);
         assert!(results.is_empty());
     }
 }

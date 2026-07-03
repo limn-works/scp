@@ -30,7 +30,7 @@
 use std::sync::Arc;
 
 use scp_client::{ClientError, LocalSigner, MemoryStorage, ScpClient, Storage};
-use scp_primitives::{Clock, TestClock};
+use scp_clock::{Clock, TestClock};
 use scp_protocol::context::membership::ContextEvent;
 
 const CTX: &str = "ctx-adr057-slice2-multi-party";
@@ -305,9 +305,9 @@ fn remove_commit_is_rejected_fail_closed_without_skew() {
     // out-of-scope committer could put on the wire — while BOB is a real
     // `ScpClient` whose `receive_message` is the unit under test.
     use openmls::prelude::{BasicCredential, KeyPackageIn};
+    use scp_did::SigningKeyId;
     use scp_mls::group::{add_member, create_group, generate_key_package, remove_member};
     use scp_mls::{ScpCredential, SignatureKeyPair};
-    use scp_primitives::SigningKeyId;
     use tls_codec::{Deserialize as TlsDeserialize, Serialize as TlsSerialize};
 
     let alice_cred = ScpCredential::new(ALICE_DID.to_owned(), None, SigningKeyId::Active)

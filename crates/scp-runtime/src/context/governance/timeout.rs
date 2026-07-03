@@ -36,7 +36,7 @@ use std::time::Duration;
 use tokio::sync::Notify;
 use tokio::task::{AbortHandle, JoinSet};
 
-use scp_identity::DID;
+use scp_did::DID;
 
 use scp_protocol::context::governance::{
     DeadlockJustification, GovernanceContext, GovernanceEngine, GovernanceEvent,
@@ -638,7 +638,7 @@ mod tests {
     }
 
     fn mock_resolver() -> KeyResolver {
-        Arc::new(|did: &DID, _kid: scp_protocol::identity::SigningKeyId| {
+        Arc::new(|did: &DID, _kid: scp_did::SigningKeyId| {
             let did_str: &str = did.as_ref();
             match did_str {
                 "did:dht:z6MkAlice" => {

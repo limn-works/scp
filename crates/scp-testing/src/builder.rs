@@ -9,7 +9,7 @@
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
-use scp_identity::DID;
+use scp_did::DID;
 use scp_platform::testing::{InMemoryKeyCustody, InMemoryStorage};
 
 use crate::clock::SimulatedClock;

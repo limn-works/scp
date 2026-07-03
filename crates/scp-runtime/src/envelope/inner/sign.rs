@@ -169,8 +169,8 @@ mod tests {
         MessageType, Provenance, enforce_inner_envelope_category_a, validate_inner_version,
         verify_inner_signature,
     };
+    use scp_did::SigningKeyId;
     use scp_protocol::envelope::padding::strip_padding;
-    use scp_protocol::identity::SigningKeyId;
 
     async fn setup() -> (InMemoryKeyCustody, KeyHandle) {
         let custody = InMemoryKeyCustody::new();

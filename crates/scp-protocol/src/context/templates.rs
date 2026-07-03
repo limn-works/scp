@@ -1647,7 +1647,7 @@ mod tests {
             },
             payment_adapters: vec!["x402".to_owned()],
             pricing_formula: None,
-            payee: scp_primitives::DID::from("did:dht:z6MkTestPayee"),
+            payee: scp_did::DID::from("did:dht:z6MkTestPayee"),
         }
     }
 
@@ -1669,7 +1669,7 @@ mod tests {
             },
             payment_adapters: vec!["x402".to_owned()],
             pricing_formula: None,
-            payee: scp_primitives::DID::from("did:dht:z6MkTestPayee"),
+            payee: scp_did::DID::from("did:dht:z6MkTestPayee"),
         }
     }
 

@@ -47,13 +47,13 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use dashmap::DashMap;
+use scp_clock::SystemClock;
 use scp_core::context::builder::ContextEventLogProvider;
 use scp_core::crypto::mls::provider::MlsCryptoProvider;
 use scp_core::crypto::ucan::nonce::NonceTracker;
 use scp_core::crypto::ucan::revoke::RevocationList;
 use scp_core::store::ProtocolRepository;
 use scp_event_log::EventLog;
-use scp_identity::cache::SystemClock;
 
 // ---------------------------------------------------------------------------
 // UniffiBridgeInstance — per-bridge concrete bridge instance (#1549 Phase 4 PR 1)

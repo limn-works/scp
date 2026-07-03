@@ -27,9 +27,9 @@ use std::time::Duration;
 use ed25519_dalek::Signer;
 use sha2::{Digest, Sha256};
 
+use scp_did::DID;
 use scp_event_log::tree::{self, GENESIS_PREV_HASH};
 use scp_event_log::{Event, EventLog, EventPayload, EventType};
-use scp_identity::DID;
 use scp_protocol::bridge::claiming::{ClaimRequest, claim_shadow};
 use scp_protocol::bridge::provenance::{
     BridgeTrustLevel, evaluate_bridge_trust_level, mark_bridge_provenance,
@@ -55,9 +55,9 @@ use scp_media::signaling::{
     serialize_signaling, verify_sender_attribution,
 };
 
+use scp_mls::credential::ScpCredential;
+use scp_mls::group::{add_member, create_group, generate_key_package, join_group};
 use scp_protocol::context::params::Capability as ParamCapability;
-use scp_runtime::crypto::mls::credential::ScpCredential;
-use scp_runtime::crypto::mls::group::{add_member, create_group, generate_key_package, join_group};
 
 use scp_platform::testing::{
     InMemoryDeviceAttestation, InMemoryKeyCustody, InMemoryPush, InMemoryStorage,
@@ -547,7 +547,7 @@ fn media_session_mls_key_derivation() {
     let alice_cred = ScpCredential::new(
         "did:dht:z6MkAlice".to_owned(),
         None,
-        scp_identity::SigningKeyId::Active,
+        scp_did::SigningKeyId::Active,
     )
     .expect("alice credential");
     let mut alice_group = create_group(&alice_cred).expect("create group");
@@ -556,7 +556,7 @@ fn media_session_mls_key_derivation() {
     let bob_cred = ScpCredential::new(
         "did:dht:z6MkBob".to_owned(),
         None,
-        scp_identity::SigningKeyId::Active,
+        scp_did::SigningKeyId::Active,
     )
     .expect("bob credential");
     let (bob_kp_bundle, bob_signer, bob_provider) =
@@ -979,7 +979,7 @@ fn media_session_keys_derived_from_mls_group_state() {
     let alice_cred = ScpCredential::new(
         "did:dht:z6MkAlice".to_owned(),
         None,
-        scp_identity::SigningKeyId::Active,
+        scp_did::SigningKeyId::Active,
     )
     .expect("alice cred");
     let mut alice_group = create_group(&alice_cred).expect("alice group");
@@ -987,7 +987,7 @@ fn media_session_keys_derived_from_mls_group_state() {
     let bob_cred = ScpCredential::new(
         "did:dht:z6MkBob".to_owned(),
         None,
-        scp_identity::SigningKeyId::Active,
+        scp_did::SigningKeyId::Active,
     )
     .expect("bob cred");
     let (bob_kp_bundle, bob_signer, bob_provider) =

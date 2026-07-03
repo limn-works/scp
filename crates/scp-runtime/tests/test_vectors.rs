@@ -19,7 +19,7 @@
 use ed25519_dalek::{Signer, Verifier};
 use sha2::{Digest, Sha256};
 
-use scp_identity::DID;
+use scp_did::DID;
 use scp_protocol::context::tools::interface::InterfaceOffer;
 use scp_protocol::crypto::canonical::{CanonicalField, canonical_hash, canonical_hash_bytes};
 use scp_protocol::crypto::key_continuity::{

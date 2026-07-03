@@ -11,7 +11,7 @@
 //! The split strictly preserves RFC 9420 conformance: every method maps to a
 //! single `OpenMLS` primitive with no SCP orchestration in between. The SCP
 //! ciphersuite is fixed to
-//! [`MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519`](super::group::SCP_CIPHERSUITE).
+//! [`MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519`](scp_mls::group::SCP_CIPHERSUITE).
 //!
 //! # Method contracts
 //!
@@ -32,7 +32,7 @@
 //! # Production impl
 //!
 //! [`super::production_backend::ProductionMlsBackend`] delegates to the
-//! existing [`super::group`] and [`super::encrypt`] free functions — the same
+//! existing [`scp_mls::group`] and [`scp_mls::encrypt`] free functions — the same
 //! primitives the pre-refactor `MlsCryptoProvider` calls today. The
 //! byte-identical output test in `production_backend.rs` feeds the same input
 //! to both the backend and a bare `MlsCryptoProvider` and asserts equality on
@@ -43,11 +43,11 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use openmls::prelude::LeafNodeIndex;
 
-use super::credential::ScpCredential;
-use super::encrypt::DecryptedContent;
-use super::error::MlsError;
-use super::group::ScpMlsGroup;
 use super::storage_adapter::OpenMlsStorageAdapter;
+use scp_mls::credential::ScpCredential;
+use scp_mls::encrypt::DecryptedContent;
+use scp_mls::error::MlsError;
+use scp_mls::group::ScpMlsGroup;
 
 // ---------------------------------------------------------------------------
 // Wrapper output types
@@ -171,7 +171,7 @@ impl std::fmt::Debug for SignerState {
 pub trait MlsBackend: Send + Sync {
     /// Creates a new MLS group with the caller as the sole member.
     ///
-    /// Wraps [`super::group::create_group_with_wrapping_key`] exactly.
+    /// Wraps [`scp_mls::group::create_group_with_wrapping_key`] exactly.
     ///
     /// # Errors
     ///

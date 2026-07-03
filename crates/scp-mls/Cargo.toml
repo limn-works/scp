@@ -11,16 +11,17 @@ homepage.workspace = true
 default = []
 # Enables non-production DID formats (did:key:, did:test:) in ScpCredential
 # construction, mirroring scp-protocol/testing. Used by the broad test suite.
-testing = ["scp-protocol/testing", "scp-primitives/testing"]
+testing = ["scp-protocol/testing", "scp-did/testing"]
 
 [dependencies]
-# scp-mls depends ONLY on the wasm-safe protocol/primitives crates plus the
-# openmls stack. It MUST NOT depend on scp-runtime (tokio/actor orchestration)
-# or scp-identity (tokio-coupled custody/DHT) — the ADR-057 mechanical fence
-# that keeps the crate compilable to wasm32-unknown-unknown. credential.rs
-# imports the DID-document types from scp-protocol directly (Slice 1a moved
-# them there) rather than via scp-identity.
-scp-primitives = { path = "../scp-primitives", version = "=0.1.0-beta.2" }
+# scp-mls depends ONLY on the wasm-safe capability crates plus the openmls
+# stack. It MUST NOT depend on scp-runtime (tokio/actor orchestration) or
+# scp-identity (tokio-coupled custody/DHT) — the ADR-057 mechanical fence that
+# keeps the crate compilable to wasm32-unknown-unknown. credential.rs imports
+# the DID model (DID, DidDocument, …) from scp-did directly rather than via
+# scp-identity.
+scp-clock = { path = "../scp-clock", version = "=0.1.0-beta.2" }
+scp-did = { path = "../scp-did", version = "=0.1.0-beta.2" }
 scp-protocol = { path = "../scp-protocol", version = "=0.1.0-beta.2" }
 
 openmls = { workspace = true, features = ["libcrux-provider", "js"] }
@@ -51,7 +52,7 @@ getrandom_04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] 
 uuid = { version = "1", features = ["v4", "js"] }
 
 [dev-dependencies]
-scp-primitives = { path = "../scp-primitives", features = ["testing"] }
+scp-did = { path = "../scp-did", features = ["testing"] }
 scp-protocol = { path = "../scp-protocol", features = ["testing"] }
 openmls_basic_credential = { workspace = true, features = ["test-utils"] }
 ed25519-dalek = { workspace = true }

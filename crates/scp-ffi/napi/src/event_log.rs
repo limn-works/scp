@@ -8,8 +8,8 @@
 //! See ADR-011 (Event Log) and ADR-022 in `.docs/adrs/`.
 
 use napi_derive::napi;
+use scp_clock::Clock;
 use scp_ffi_common::error_codes as codes;
-use scp_primitives::Clock;
 
 use crate::context::NapiContextHandle;
 use crate::error::ScpNapiError;
@@ -196,7 +196,7 @@ pub(crate) async fn event_log_query_on(
 
     // Unix timestamp seconds fit in f64 mantissa for centuries.
     #[allow(clippy::cast_precision_loss)]
-    let timestamp = scp_primitives::SystemClock.now_secs() as f64;
+    let timestamp = scp_clock::SystemClock.now_secs() as f64;
 
     let summary_event = NapiEvent {
         event_type: "LogSummary".to_owned(),
@@ -481,7 +481,7 @@ pub(crate) fn event_log_checkpoint_on(
         })?;
 
         let context_id = handle.context_id();
-        let sender_did = scp_identity::DID(identity.inner.did.clone());
+        let sender_did = scp_did::DID(identity.inner.did.clone());
         let epoch_u64 = validate_non_negative_epoch(epoch)?;
 
         let checkpoint = crate::runtime::with_context(bi, &context_id, |rt| {
@@ -543,7 +543,7 @@ pub(crate) fn event_log_checkpoint_by_did_on(
         .map_err(napi::Error::from)?;
 
         let context_id = handle.context_id();
-        let sender_did = scp_identity::DID(did);
+        let sender_did = scp_did::DID(did);
         let epoch_u64 = validate_non_negative_epoch(epoch)?;
 
         let checkpoint = crate::runtime::with_context(bi, &context_id, |rt| {

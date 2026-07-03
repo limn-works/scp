@@ -45,7 +45,7 @@ use scp_core::context::membership::{ContextEvent, KeyPackage};
 use scp_core::context::providers::event_log::MerkleEventLogProvider;
 use scp_core::context::supervisor::{MessageSigner, Supervisor};
 use scp_core::context::{ContextError, ContextHandle, ContextParams, context_routing_id};
-use scp_identity::DID;
+use scp_did::DID;
 
 use super::crypto::E2eCryptoProvider;
 

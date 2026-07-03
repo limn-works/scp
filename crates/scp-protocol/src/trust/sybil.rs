@@ -47,7 +47,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use scp_primitives::DID;
+use scp_did::DID;
 
 use super::AttestationType;
 use super::attestation::{AttestorInfo, ThresholdRequirement, check_threshold_attestation};

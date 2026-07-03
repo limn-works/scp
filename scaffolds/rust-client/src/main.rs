@@ -25,7 +25,8 @@ use scp_core::context::{
 use scp_identity::cache::DidCache;
 use scp_identity::dht::DidDht;
 use scp_identity::dht_client::InMemoryDhtClient;
-use scp_identity::{DidMethod, DID};
+use scp_did::DID;
+use scp_identity::DidMethod;
 use scp_platform::testing::InMemoryKeyCustody;
 
 #[tokio::main]
@@ -43,7 +44,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── 2. Build a ContextManager ─────────────────────────────────
     let key_resolver: KeyResolver =
-        Arc::new(|_did: &DID, _kid: scp_identity::SigningKeyId| None);
+        Arc::new(|_did: &DID, _kid: scp_did::SigningKeyId| None);
     let manager = ContextManager::new(
         Box::new(MockCrypto),
         Box::new(MockTransport),

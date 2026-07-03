@@ -21,8 +21,8 @@
 //!   (same `scp_client::Signer` contract the `JsSigner` satisfies under wasm32);
 //! - [`scp_client::MemoryStorage`] stands in for the `JsStorage`-backed adapter
 //!   (same `scp_client::Storage` contract);
-//! - [`scp_primitives::TestClock`] stands in for the hardened `WasmClock` (same
-//!   `scp_primitives::Clock` contract).
+//! - [`scp_clock::TestClock`] stands in for the hardened `WasmClock` (same
+//!   `scp_clock::Clock` contract).
 //!
 //! The `#[wasm_bindgen]` attribute is inert on native, so `WasmScpClient` and
 //! its wrapper types compile and run here as plain Rust — the host test drives
@@ -44,7 +44,7 @@ use std::sync::Arc;
 
 use scp_client::{LocalSigner, MemoryStorage, Signer, Storage};
 use scp_client_wasm::WasmScpClient;
-use scp_primitives::{Clock, TestClock};
+use scp_clock::{Clock, TestClock};
 
 const CTX: &str = "ctx-adr057-slice3-wasm-surface";
 const ALICE_DID: &str = "did:key:z6MkAlice3SurfaceExchangeFixtureKeyAAAAAAA";

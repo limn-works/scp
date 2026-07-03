@@ -145,7 +145,7 @@ fn create_test_context(bi: &PyBridgeInstance, creator_did: &str) -> String {
 
     let rt = test_runtime();
     let supervisor = runtime::supervisor(bi).unwrap().clone();
-    let creator = scp_identity::DID(creator_did.to_owned());
+    let creator = scp_did::DID(creator_did.to_owned());
     let ctx_id = context_id.clone();
 
     rt.block_on(async move {
@@ -540,7 +540,7 @@ fn event_log_query_with_appended_event() {
         runtime::with_context(scp.bridge_instance(), &ctx_id, |rt| {
             let event = scp_event_log::Event {
                 event_type: scp_event_log::EventType::ContextCreated,
-                actor_did: scp_identity::DID("did:key:test".to_owned()),
+                actor_did: scp_did::DID("did:key:test".to_owned()),
                 timestamp: 1_700_000_000,
                 sequence: 0,
                 payload: scp_event_log::EventPayload { data: vec![] },
@@ -597,7 +597,7 @@ fn event_log_query_projects_governance_target_did_from_storage() {
         let target_did = "did:key:target-member";
         let governance_event = scp_event_log::Event {
             event_type: scp_event_log::EventType::GovernanceActionExecuted,
-            actor_did: scp_identity::DID(did),
+            actor_did: scp_did::DID(did),
             timestamp: 1_700_000_000,
             sequence: 0,
             payload: scp_event_log::payload::encode_payload(
@@ -665,7 +665,7 @@ fn event_log_query_projects_role_assigned_subject_did_from_storage() {
         let subject_did = "did:key:subject-member";
         let role_event = scp_event_log::Event {
             event_type: scp_event_log::EventType::RoleAssigned,
-            actor_did: scp_identity::DID(did),
+            actor_did: scp_did::DID(did),
             timestamp: 1_700_000_000,
             sequence: 0,
             payload: scp_event_log::payload::encode_payload(
@@ -732,7 +732,7 @@ fn event_log_verify_inclusion_proof_after_append() {
         runtime::with_context(scp.bridge_instance(), &ctx_id, |rt| {
             let event = scp_event_log::Event {
                 event_type: scp_event_log::EventType::ContextCreated,
-                actor_did: scp_identity::DID("did:key:test".to_owned()),
+                actor_did: scp_did::DID("did:key:test".to_owned()),
                 timestamp: 1_700_000_000,
                 sequence: 0,
                 payload: scp_event_log::EventPayload { data: vec![] },
@@ -781,7 +781,7 @@ fn event_log_checkpoint_by_did_generates_signed_checkpoint() {
         runtime::with_context(scp.bridge_instance(), &ctx_id, |rt| {
             let event = scp_event_log::Event {
                 event_type: scp_event_log::EventType::ContextCreated,
-                actor_did: scp_identity::DID(did.clone()),
+                actor_did: scp_did::DID(did.clone()),
                 timestamp: 1_700_000_000,
                 sequence: 0,
                 payload: scp_event_log::EventPayload { data: vec![] },
@@ -1328,7 +1328,7 @@ fn cross_domain_identity_context_tool_eventlog_provenance() {
         runtime::with_context(scp.bridge_instance(), &ctx_id, |rt| {
             let event = scp_event_log::Event {
                 event_type: scp_event_log::EventType::ContextCreated,
-                actor_did: scp_identity::DID(did_a.clone()),
+                actor_did: scp_did::DID(did_a.clone()),
                 timestamp: 1_700_000_000,
                 sequence: 0,
                 payload: scp_event_log::EventPayload { data: vec![] },
@@ -1419,7 +1419,7 @@ fn create_test_context_with_id(bi: &PyBridgeInstance, creator_did: &str, context
 
     let rt = test_runtime();
     let supervisor = runtime::supervisor(bi).unwrap().clone();
-    let creator = scp_identity::DID(creator_did.to_owned());
+    let creator = scp_did::DID(creator_did.to_owned());
     let ctx_id = context_id.to_owned();
 
     rt.block_on(async move {

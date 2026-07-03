@@ -6,7 +6,7 @@
 //! Usage:
 //!   `cargo run -p scp-runtime --features testing --example tools`
 
-use scp_identity::DID;
+use scp_did::DID;
 use scp_protocol::context::roles::{Capability, CapabilityCeiling, ContextRoleState};
 use scp_protocol::context::tools::lifecycle::ToolStatus;
 use scp_protocol::context::tools::registry::{
@@ -36,7 +36,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &*creator,
         ceiling,
         vec![],
-        &scp_primitives::SystemClock,
+        &scp_clock::SystemClock,
     )
     .map_err(|e| e.to_string())?;
 

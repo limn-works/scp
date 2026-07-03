@@ -6,7 +6,7 @@
 //!
 //! See spec section 19.2.6 and ADR-033 acceptance criteria #4.
 
-use scp_primitives::Clock;
+use scp_clock::Clock;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
@@ -14,7 +14,7 @@ use scp_core::economy::{
     AdapterCapabilities, Amount, CurrencyCode, PaymentAdapter, PaymentAuthorization, PaymentError,
     PaymentMetadata, PaymentReceipt, RefundConfirmation, VerificationResult,
 };
-use scp_identity::DID;
+use scp_did::DID;
 
 // ---------------------------------------------------------------------------
 // Internal ledger types
@@ -87,7 +87,7 @@ fn lock_ledger(mutex: &Mutex<Ledger>) -> Result<MutexGuard<'_, Ledger>, PaymentE
 /// ```
 /// use scp_testing::TestAdapter;
 /// use scp_core::economy::{Amount, CurrencyCode};
-/// use scp_identity::DID;
+/// use scp_did::DID;
 ///
 /// let adapter = TestAdapter::new();
 /// adapter.seed_balance(
@@ -176,7 +176,7 @@ fn deterministic_id(counter: u64) -> [u8; 32] {
 /// Returns the current unix timestamp in seconds.
 ///
 fn now_secs() -> u64 {
-    scp_primitives::SystemClock.now_secs()
+    scp_clock::SystemClock.now_secs()
 }
 
 // ---------------------------------------------------------------------------

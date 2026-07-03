@@ -31,7 +31,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use scp_core::store::{CURRENT_STORE_VERSION, ProtocolRepository, StoredValue};
-use scp_identity::document::DidDocument;
+use scp_did::DidDocument;
 use scp_identity::{DidMethod, IdentityError, ScpIdentity};
 use scp_platform::traits::{KeyCustody, Storage};
 use scp_transport::nat::{NatTierChange, NetworkChangeDetector};
@@ -1516,9 +1516,9 @@ impl ApplicationNode<scp_platform::testing::InMemoryStorage> {
     /// Returns [`NodeError`] if relay binding, identity generation, or TLS
     /// provisioning fails.
     pub async fn dev(port: u16) -> Result<Self, NodeError> {
+        use scp_clock::SystemClock;
         use scp_identity::DidCache;
         use scp_identity::InMemoryDhtClient;
-        use scp_identity::cache::SystemClock;
         use scp_identity::dht::DidDht;
         use scp_platform::testing::{InMemoryKeyCustody, InMemoryStorage};
 
@@ -3037,8 +3037,8 @@ pub(crate) async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'sta
     #[cfg(feature = "http3")] http3_config: Option<scp_transport::http3::Http3Config>,
 ) -> Result<ApplicationNode<S>, NodeError> {
     let relay_url = format!("wss://{domain}/scp/v1");
-    // `add_relay_service` now returns the wasm-safe `DidDocumentError`
-    // (ADR-057 Slice 1a); route it through `IdentityError` so it lands in the
+    // `add_relay_service` now returns the wasm-safe `DidError`
+    // (ADR-057); route it through `IdentityError` so it lands in the
     // existing `NodeError::Identity` variant, preserving prior behavior.
     document
         .add_relay_service(&relay_url)
@@ -3163,7 +3163,7 @@ fn push_relay_service(document: &mut DidDocument, relay_url: &str) {
         .iter()
         .filter(|s| s.service_type == "SCPRelay")
         .count();
-    document.service.push(scp_identity::document::Service {
+    document.service.push(scp_did::Service {
         id: format!("{}#scp-relay-{}", document.id, relay_count + 1),
         service_type: "SCPRelay".to_owned(),
         service_endpoint: relay_url.to_owned(),
@@ -3549,8 +3549,8 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    use scp_clock::SystemClock;
     use scp_identity::DidCache;
-    use scp_identity::cache::SystemClock;
     use scp_identity::dht::DidDht;
     use scp_identity::dht_client::InMemoryDhtClient;
     use scp_platform::testing::{InMemoryKeyCustody, InMemoryStorage};
@@ -5044,7 +5044,7 @@ mod tests {
             authentication: vec![],
             assertion_method: vec![],
             also_known_as: vec![],
-            service: vec![scp_identity::document::Service {
+            service: vec![scp_did::Service {
                 id: "did:dht:test123#scp-relay-1".to_owned(),
                 service_type: "SCPRelay".to_owned(),
                 service_endpoint: "ws://198.51.100.7:32891/scp/v1".to_owned(),
@@ -5132,7 +5132,7 @@ mod tests {
             authentication: vec![],
             assertion_method: vec![],
             also_known_as: vec![],
-            service: vec![scp_identity::document::Service {
+            service: vec![scp_did::Service {
                 id: "did:dht:testnet123#scp-relay-1".to_owned(),
                 service_type: "SCPRelay".to_owned(),
                 service_endpoint: "ws://198.51.100.7:32891/scp/v1".to_owned(),
@@ -5220,7 +5220,7 @@ mod tests {
             authentication: vec![],
             assertion_method: vec![],
             also_known_as: vec![],
-            service: vec![scp_identity::document::Service {
+            service: vec![scp_did::Service {
                 id: "did:dht:unchanged123#scp-relay-1".to_owned(),
                 service_type: "SCPRelay".to_owned(),
                 service_endpoint: "ws://198.51.100.7:32891/scp/v1".to_owned(),
@@ -5318,7 +5318,7 @@ mod tests {
             authentication: vec![],
             assertion_method: vec![],
             also_known_as: vec![],
-            service: vec![scp_identity::document::Service {
+            service: vec![scp_did::Service {
                 id: "did:dht:resilient123#scp-relay-1".to_owned(),
                 service_type: "SCPRelay".to_owned(),
                 service_endpoint: format!("ws://{addr}/scp/v1"),

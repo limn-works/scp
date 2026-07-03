@@ -15,7 +15,7 @@
 //! See ADR-020 in `.docs/adrs/phase-4.md`, acceptance criterion 8.
 //! See §22.13 for bootstrap context governance.
 
-use scp_identity::DID;
+use scp_did::DID;
 use serde::{Deserialize, Serialize};
 
 use crate::well_known::{WellKnownScp, WellKnownValidationError};

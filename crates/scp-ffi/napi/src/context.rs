@@ -13,11 +13,11 @@ use std::sync::Arc;
 
 use napi::Error as NapiError;
 use napi_derive::napi;
+use scp_clock::Clock;
 use scp_core::context::governance::GovernanceAction;
 use scp_core::context::state::GovernanceActionResult;
 use scp_core::context::{ContextHandle, ContextState};
-use scp_identity::DID;
-use scp_primitives::Clock;
+use scp_did::DID;
 use tokio_util::sync::CancellationToken;
 
 use scp_platform::traits::KeyCustody;
@@ -50,10 +50,12 @@ fn generate_mls_key_package_bytes(did: &str) -> Result<Vec<u8>, ScpNapiError> {
     use scp_core::crypto::mls::group::generate_key_package;
     use tls_codec::Serialize as TlsSerializeTrait;
 
-    let cred = ScpCredential::new(did.to_owned(), None, scp_identity::SigningKeyId::Active)
-        .map_err(|e| ScpNapiError::Crypto {
-            message: format!("failed to create SCP credential for MLS key package: {e}"),
-            code: codes::CRYPTO_4010.to_owned(),
+    let cred =
+        ScpCredential::new(did.to_owned(), None, scp_did::SigningKeyId::Active).map_err(|e| {
+            ScpNapiError::Crypto {
+                message: format!("failed to create SCP credential for MLS key package: {e}"),
+                code: codes::CRYPTO_4010.to_owned(),
+            }
         })?;
 
     let (kp_bundle, _signer, _provider) =
@@ -1085,7 +1087,7 @@ pub(crate) async fn context_send_on(
     if let (Some(custody), Some(signing_key)) = (&handle.in_memory_custody, handle.signing_key) {
         let context_id = handle.context_id.clone();
         let sender_did_str = identity_did.clone();
-        let now_ms = scp_primitives::SystemClock.now_millis();
+        let now_ms = scp_clock::SystemClock.now_millis();
 
         let params = scp_core::envelope::InnerEnvelopeParams {
             version: scp_core::envelope::inner::SCP_INNER_ENVELOPE_VERSION,
@@ -1098,7 +1100,7 @@ pub(crate) async fn context_send_on(
             message_type: scp_core::envelope::MessageType::Content,
             payload: &payload,
             provenance: None,
-            signing_key_id: scp_identity::SigningKeyId::Active,
+            signing_key_id: scp_did::SigningKeyId::Active,
         };
 
         scp_core::envelope::create_inner_envelope(&params, custody.as_ref(), &signing_key)
@@ -1385,7 +1387,7 @@ pub(crate) async fn context_subscribe_on(
         Some(_) => resolve_napi_signing_key(handle).await.ok(),
         None => None,
     };
-    let heartbeat_sender_did: scp_identity::DID = identity_did.clone().into();
+    let heartbeat_sender_did: scp_did::DID = identity_did.clone().into();
 
     // Clones for the heartbeat scheduler task — the main subscribe closure
     // below is `async move` and consumes `context_id` / the cancel tokens /
@@ -1567,7 +1569,7 @@ pub(crate) async fn context_subscribe_on(
                             transport_mgr.record_heartbeat_received().await;
                             sequence_counter += 1.0;
                             #[allow(clippy::cast_precision_loss)]
-                            let ts = scp_primitives::SystemClock.now_secs() as f64;
+                            let ts = scp_clock::SystemClock.now_secs() as f64;
                             let msg = NapiMessage {
                                 sender_did,
                                 payload: plaintext,
@@ -2913,7 +2915,7 @@ pub(crate) async fn context_reconnect_on(
         .into_iter()
         .map(|(k, v)| (k, v as u64))
         .collect();
-    let now = scp_primitives::Clock::now_secs(&scp_primitives::SystemClock);
+    let now = scp_clock::Clock::now_secs(&scp_clock::SystemClock);
 
     // Hold the 32-byte seed in `Zeroizing` so it is wiped after the driver
     // call rather than lingering in freed memory.
@@ -4068,7 +4070,7 @@ pub(crate) async fn context_export_on(
     handle: &NapiContextHandle,
 ) -> napi::Result<Vec<u8>> {
     crate::napi_check_handle!(&bi.core, handle);
-    let exporter_did = scp_identity::DID::from(handle.creator_did.clone());
+    let exporter_did = scp_did::DID::from(handle.creator_did.clone());
     let sup = crate::runtime::supervisor(bi)?;
 
     // Resolve the exporter identity's custody provider and `#active` signing
@@ -4363,7 +4365,7 @@ struct NapiBridgeTrustOracle;
 impl scp_core::context::invitation::TrustOracle for NapiBridgeTrustOracle {
     fn satisfies_trust(
         &self,
-        inviter: &scp_identity::DID,
+        inviter: &scp_did::DID,
         requirement: &scp_core::context::policy::TrustRequirement,
     ) -> bool {
         match requirement {
@@ -4428,7 +4430,7 @@ pub(crate) fn evaluate_invitation_on(
     };
 
     let oracle = NapiBridgeTrustOracle;
-    let inviter = scp_identity::DID::from(inviter_did.as_str());
+    let inviter = scp_did::DID::from(inviter_did.as_str());
 
     let decision = bi.core.with_rate_limit_tracker(&identity_did, |tracker| {
         core_evaluate(
@@ -4438,7 +4440,7 @@ pub(crate) fn evaluate_invitation_on(
             spending.as_ref(),
             &oracle,
             tracker,
-            &scp_core::time::SystemClock,
+            &scp_clock::SystemClock,
         )
     });
 
@@ -4528,7 +4530,7 @@ pub(crate) fn metadata_record_to_json_on(
     let record = MetadataRecord {
         context_id,
         sequence: u64::from(sequence),
-        signer_did: scp_identity::DID::from(signer_did),
+        signer_did: scp_did::DID::from(signer_did),
         timestamp: ts,
         structural,
         operational,
@@ -4704,9 +4706,9 @@ mod tests {
     // in-fn `use super::*` glob (re-exporting the file-level alias). Gate the
     // alias to its sole direct consumers so the ungated build does not see an
     // unused import.
+    use scp_did::DID;
     #[cfg(feature = "allow_in_memory_custody")]
     use scp_ffi_common::error_codes as codes;
-    use scp_identity::DID;
     use std::sync::Arc;
 
     /// Test helper: dispatch `LifecycleCommand::CreateContext` through the
@@ -4716,7 +4718,7 @@ mod tests {
         bi: &crate::runtime::NapiBridgeInstance,
         ctx_id: &str,
         params: ContextParams,
-        creator: scp_identity::DID,
+        creator: scp_did::DID,
     ) -> scp_core::context::ContextHandle {
         use scp_core::context::actor::commands::{CreateContextPayload, LifecycleCommand};
         let sup = crate::runtime::supervisor(bi).unwrap();
@@ -5145,7 +5147,7 @@ mod tests {
 
         let event = ContextEvent::ConsequenceTriggered {
             context_id: "ctx-napi-123".to_owned(),
-            member_did: scp_identity::DID("did:dht:z6MkBob".to_owned()),
+            member_did: scp_did::DID("did:dht:z6MkBob".to_owned()),
             rule_index: 1,
             trigger_type: "velocity".to_owned(),
             action_type: "mute".to_owned(),
@@ -5181,7 +5183,7 @@ mod tests {
 
         let event = ContextEvent::ConsequenceEnforced {
             context_id: "ctx-napi-456".to_owned(),
-            member_did: scp_identity::DID("did:dht:z6MkAlice".to_owned()),
+            member_did: scp_did::DID("did:dht:z6MkAlice".to_owned()),
             action_type: "restrict_write".to_owned(),
             success: false,
         };

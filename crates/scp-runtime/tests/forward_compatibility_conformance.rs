@@ -357,7 +357,7 @@ mod inner_envelope {
             payload: vec![0x01, 0x02],
             provenance: None,
             provenance_hash: [0xBB; 32],
-            signing_key_id: scp_identity::SigningKeyId::Active,
+            signing_key_id: scp_did::SigningKeyId::Active,
             signature: [0xCC; 64],
             extensions: std::collections::HashMap::new(),
         };
@@ -409,7 +409,7 @@ mod inner_envelope {
             payload: vec![0x01, 0x02],
             provenance: None,
             provenance_hash: [0xBB; 32],
-            signing_key_id: scp_identity::SigningKeyId::Active,
+            signing_key_id: scp_did::SigningKeyId::Active,
             signature: [0xCC; 64],
             extensions: std::collections::HashMap::new(),
         };
@@ -450,7 +450,7 @@ mod inner_envelope {
             payload: vec![0x01, 0x02],
             provenance: None,
             provenance_hash: [0xBB; 32],
-            signing_key_id: scp_identity::SigningKeyId::Active,
+            signing_key_id: scp_did::SigningKeyId::Active,
             signature: [0xCC; 64],
             extensions: std::collections::HashMap::new(),
         };
@@ -527,7 +527,7 @@ mod inner_envelope {
             payload: vec![0x01, 0x02],
             provenance: None,
             provenance_hash: [0xBB; 32],
-            signing_key_id: scp_identity::SigningKeyId::Active,
+            signing_key_id: scp_did::SigningKeyId::Active,
             signature: [0xCC; 64],
             extensions: std::collections::HashMap::new(),
         };
@@ -668,7 +668,7 @@ mod sender_key_types {
         let advance = SenderKeyEpochAdvance {
             sender_did: "did:dht:sender".to_string(),
             epoch: 5,
-            signer_key_ref: scp_identity::SigningKeyId::Active,
+            signer_key_ref: scp_did::SigningKeyId::Active,
             signature: [0xAA; 64],
         };
         let bytes = rmp_serde::to_vec_named(&advance).unwrap();
@@ -742,7 +742,7 @@ mod sender_key_types {
             notification_type: "block".to_string(),
             blocker: "did:dht:blocker".to_string(),
             blocked: "did:dht:blocked".to_string(),
-            signing_key_id: scp_identity::SigningKeyId::Active,
+            signing_key_id: scp_did::SigningKeyId::Active,
             timestamp: 1_700_000_000,
             signature: [0xBB; 64],
         };
