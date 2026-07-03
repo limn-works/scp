@@ -2063,6 +2063,24 @@ pub struct TransportStatus {
     pub latency_ms: Option<f64>,
 }
 
+/// Result of [`Scp::reserve_key_package`](crate::scp::Scp::reserve_key_package):
+/// an opaque reservation handle plus the PUBLIC MLS `KeyPackage` bytes for the
+/// reserved key package.
+///
+/// The `reservation_id` is passed back to
+/// [`Scp::context_join_from_welcome`](crate::scp::Scp::context_join_from_welcome)
+/// so the fused consume can match the join. Only PUBLIC bytes cross the FFI
+/// boundary — the private signer state never leaves the node's `KeyPackage`
+/// actor (ADR-049 Phase 2J).
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ReservedKeyPackage {
+    /// Opaque reservation id string. A lookup key, not a capability — it grants
+    /// nothing; a bogus id simply fails the fused consume match downstream.
+    pub reservation_id: String,
+    /// The PUBLIC MLS `KeyPackage` bytes for the reserved key package.
+    pub key_package_public: Vec<u8>,
+}
+
 /// A protocol event from the context event log.
 ///
 /// See ADR-011 (Event Log) and spec §13 (Event Log).
@@ -9247,6 +9265,293 @@ impl Scp {
             .map_err(|e| ScpError::Context {
                 msg: format!("tokio task join error during context creation: {e}"),
                 code: codes::CTX_2011.to_owned(),
+            })?
+    }
+
+    /// Reserves a single-use MLS `KeyPackage` for a Welcome-based join,
+    /// returning the reservation handle and the PUBLIC `KeyPackage` bytes.
+    ///
+    /// Begins the reserve → Welcome → join handshake completed by
+    /// [`context_join_from_welcome`](Self::context_join_from_welcome): the
+    /// returned `reservation_id` is passed back to that call so the fused
+    /// consume can match the join. The private signer state never leaves the
+    /// node's `KeyPackage` actor — only PUBLIC bytes cross the FFI boundary
+    /// (ADR-049 Phase 2J).
+    ///
+    /// Local-identity custody is enforced at the bridge (the same trust model
+    /// as `context_create`): `identity` MUST be a locally-custodied identity
+    /// that holds retained key material. A DID-only handle from `identity_load`
+    /// (no custody) is rejected with `SCP-IDENT-1054`.
+    ///
+    /// # Arguments
+    ///
+    /// * `identity` -- The LOCAL identity reserving the `KeyPackage`. Rejected
+    ///   with `SCP-PERM-3030` if it was not minted by this `Scp` instance.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ScpError::Identity` (`SCP-IDENT-1054`) if `identity` holds no
+    /// retained key material, or `ScpError::Context` if the reservation fails
+    /// (providers not wired, empty pool).
+    pub async fn reserve_key_package(
+        &self,
+        identity: Arc<Identity>,
+    ) -> Result<ReservedKeyPackage, ScpError> {
+        self.inner
+            .core
+            .check_handle(identity.instance_id())
+            .map_err(ScpError::from)?;
+        let bi = Arc::clone(&self.inner);
+        runtime()
+            .spawn(async move {
+                validate_did(&identity.did)?;
+
+                // Local-custody gate — same trust model as context_create. A
+                // locally-custodied identity holds retained key material; a
+                // DID-only handle from identity_load does not. Reserve derives
+                // no pseudonym, so it needs this explicit up-front check (the
+                // Welcome-join path enforces the identical gate implicitly via
+                // `derive_member_pseudonym_required`). Fails closed with the
+                // canonical missing-key-material code (SCP-IDENT-1054).
+                if identity.core_id.is_none() {
+                    return Err(ScpError::Identity {
+                        msg: "cannot reserve a KeyPackage without retained key \
+                              material — reserve requires a locally-custodied identity"
+                            .to_owned(),
+                        code: codes::IDENT_1054.to_owned(),
+                    });
+                }
+
+                // reserve_key_package can be a node's FIRST context op (it joins
+                // before it ever creates), so ensure the supervisor is attached
+                // first — the same idempotent init context_join performs.
+                bi.init_context_manager_with_did(&identity.did);
+
+                let sup = bi.context_manager_or_error()?;
+                let owning = scp_identity::DID(identity.did.clone());
+                let (reservation_id, key_package_public) = sup
+                    .reserve_key_package(owning)
+                    .await
+                    .map_err(ScpError::from)?;
+                Ok(ReservedKeyPackage {
+                    reservation_id: reservation_id.to_string(),
+                    key_package_public,
+                })
+            })
+            .await
+            .map_err(|e| ScpError::Context {
+                msg: format!("tokio task join error during key package reservation: {e}"),
+                code: codes::CTX_2014.to_owned(),
+            })?
+    }
+
+    /// Joins an existing SCP context by processing a received MLS Welcome,
+    /// standing the local (joiner) identity up as a send-capable participant.
+    ///
+    /// Completes the reserve → Welcome → join handshake begun by
+    /// [`reserve_key_package`](Self::reserve_key_package): given the Welcome the
+    /// context creator minted for a previously-reserved `KeyPackage`, this
+    /// installs the joined MLS group, derives the joiner's §9.10.4 routing
+    /// pseudonym, persists the initial keyed snapshot fail-closed, registers a
+    /// context handle, and records the joined context in the known-contexts
+    /// discovery registry. Without it a Welcome-joined node can DECRYPT but
+    /// cannot SEND (no handle-backed context).
+    ///
+    /// The bridge-side UCAN validation state is registered as a REVERSIBLE
+    /// precheck BEFORE the irreversible runtime join and rolled back on failure:
+    /// there is no path where the runtime join commits but bridge state errors,
+    /// and no leaked bridge/discovery state when the join fails. A context id
+    /// already active on this instance collides at the Occupied precheck BEFORE
+    /// the single-use `KeyPackage` is consumed.
+    ///
+    /// Local-identity custody of the JOINER (`identity`) is enforced at the
+    /// bridge exactly as `context_create` enforces it for the creator: the
+    /// joiner's routing pseudonym is DERIVED from its locally-custodied identity
+    /// (never caller-supplied), so a non-custodied joiner hard-fails at the
+    /// derivation seam with the canonical `SCP-IDENT-1054` before the single-use
+    /// `KeyPackage` is consumed.
+    ///
+    /// # Arguments
+    ///
+    /// * `identity` -- The LOCAL (joiner) identity. Its custody derives the
+    ///   routing pseudonym; passed separately from `creator_did` so the two
+    ///   cannot be transposed. Rejected with `SCP-PERM-3030` if it was not
+    ///   minted by this `Scp` instance.
+    /// * `creator_did` -- DID of the context creator / admin (from the legible
+    ///   params).
+    /// * `context_id` -- Canonical 64-hex context id (ADR-056).
+    /// * `params` -- Legible context parameters (see [`ContextParams`]).
+    /// * `reservation_id` -- The opaque reservation id returned by
+    ///   `reserve_key_package` for the `KeyPackage` this Welcome addresses.
+    /// * `welcome_bytes` -- The TLS-serialized MLS Welcome message.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ScpError::Identity` if the joiner is not locally custodied,
+    /// or `ScpError::Context` / `ScpError::Validation` if the params are
+    /// invalid, the reservation id is malformed, the context id already
+    /// collides on this instance, or the spawn fails (bad/duplicate Welcome,
+    /// single-use replay, first-writer-wins collision, or fail-closed persist
+    /// failure).
+    pub async fn context_join_from_welcome(
+        &self,
+        identity: Arc<Identity>,
+        creator_did: String,
+        context_id: String,
+        params: ContextParams,
+        reservation_id: String,
+        welcome_bytes: Vec<u8>,
+    ) -> Result<Arc<ContextHandle>, ScpError> {
+        self.inner
+            .core
+            .check_handle(identity.instance_id())
+            .map_err(ScpError::from)?;
+        let bi = Arc::clone(&self.inner);
+        runtime()
+            .spawn(async move {
+                validate_did(&identity.did)?;
+                validate_did(&creator_did)?;
+                validate_context_id(&context_id)?;
+
+                // Convert legible params eagerly (before any async work). Retain a
+                // clone for the FFI handle — finalize_close needs the real
+                // memory_scope to decide key destruction behavior.
+                let core_params = bridge_params_to_core(&params)?;
+                let retained_core_params = core_params.clone();
+
+                // spawn-from-Welcome always stands up an ENCRYPTED context; ensure
+                // the node's supervisor is attached first (this may be the joiner's
+                // first context op — the same idempotent init context_join
+                // performs).
+                bi.init_context_manager_with_did(&identity.did);
+
+                // §9.10.4 + local-custody enforcement: DERIVE the joiner's routing
+                // pseudonym from its locally-custodied identity — never
+                // caller-supplied. This is the SAME custody gate context_create
+                // uses; a non-custodied joiner hard-fails HERE with SCP-IDENT-1054
+                // before the single-use KeyPackage is consumed.
+                let local_pseudonym =
+                    derive_member_pseudonym_required(&identity, &context_id).await?;
+
+                // Reconstruct the opaque reservation id via its sanctioned
+                // transparent serde form (a bare string): the id round-trips
+                // through the FFI as a string. It is a lookup key, not a
+                // capability — a bogus id simply fails the fused consume match
+                // downstream, it grants nothing. Parsed BEFORE any registry
+                // mutation so a malformed id can't leave orphaned state.
+                let reservation: scp_core::context::supervisor::ReservationId =
+                    serde_json::from_value(serde_json::Value::String(reservation_id.clone()))
+                        .map_err(|e| ScpError::Context {
+                            msg: format!("invalid reservation id: {e}"),
+                            code: codes::CTX_2014.to_owned(),
+                        })?;
+
+                // Occupied precheck — fail closed BEFORE `spawn_actor_from_welcome`
+                // consumes the single-use KeyPackage. Mirrors the PyO3 reference's
+                // `register_ffi_state` Entry::Occupied hard-error: a context
+                // already active on THIS instance collides here, leaving the
+                // pre-existing entry untouched (we must NOT roll back state we did
+                // not create). True concurrent races for the same id are resolved
+                // authoritatively by the supervisor's first-writer-wins spawn lock
+                // below.
+                if context_handle_registry(&bi).contains_key(&context_id) {
+                    return Err(ScpError::Context {
+                        msg: format!("context {context_id} is already registered on this instance"),
+                        code: codes::CTX_2014.to_owned(),
+                    });
+                }
+
+                // Register the bridge-side UCAN validation state (revocation list,
+                // nonce tracker, event log, ceiling) REVERSIBLY BEFORE the
+                // irreversible runtime join, mirroring the PyO3 reference's
+                // `register_ffi_state`. Capture whether it pre-existed so a
+                // rollback removes ONLY the state we created (never state we did
+                // not).
+                let ucan_preexisted = bi.with_ucan_state(&context_id, |_| ()).is_some();
+                bi.ensure_ucan_registered(&context_id, &creator_did, &params.ceiling);
+
+                // Irreversible: consume the KeyPackage, install the joined MLS
+                // group, persist the keyed snapshot, register the context actor. On
+                // failure, roll the reversible UCAN state back so an errored join
+                // leaves no orphaned bridge state beside a runtime that never
+                // committed.
+                let sup = bi.context_manager_or_error()?;
+                let owning = scp_identity::DID(identity.did.clone());
+                let req = scp_core::context::supervisor::WelcomeJoinRequest {
+                    creator_did: scp_identity::DID(creator_did.clone()),
+                    context_id: context_id.clone(),
+                    params: core_params,
+                    reservation_id: reservation,
+                    welcome_bytes,
+                    local_pseudonym: Some(local_pseudonym),
+                };
+                if let Err(e) = sup.spawn_actor_from_welcome(owning, req).await {
+                    if !ucan_preexisted {
+                        bi.remove_ucan_state(&context_id);
+                    }
+                    return Err(ScpError::from(e));
+                }
+
+                // Runtime join committed. Build and register the FFI context handle
+                // (matching context_create, which constructs the handle AFTER the
+                // runtime commit), then record the context in the known-contexts
+                // discovery registry. Both steps are infallible and idempotent, so
+                // they are safe after the irreversible commit and need no rollback.
+                #[cfg(feature = "allow_in_memory_custody")]
+                let in_memory_custody = identity.in_memory_custody.clone();
+                let callback_custody = identity.callback_custody.clone();
+                let signing_key = identity.core_id.as_ref().map(|id| id.active_signing_key);
+
+                let handle = Arc::new(ContextHandle {
+                    context_id: context_id.clone(),
+                    state: tokio::sync::Mutex::new(ContextState::Active),
+                    creator_did: creator_did.clone(),
+                    #[cfg(feature = "allow_in_memory_custody")]
+                    in_memory_custody,
+                    callback_custody,
+                    signing_key,
+                    ceiling_strings: params
+                        .ceiling
+                        .iter()
+                        .map(|s| {
+                            scp_core::context::roles::Capability::new(s).ucan_capability_name()
+                        })
+                        .collect(),
+                    tool_registry: tokio::sync::Mutex::new(
+                        scp_core::context::tools::ToolRegistry::new(),
+                    ),
+                    tool_handlers: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+                    session_store: tokio::sync::Mutex::new(
+                        scp_core::context::tools::SessionStore::new(),
+                    ),
+                    economic_policy: std::sync::Mutex::new(None),
+                    core_context_params: retained_core_params,
+                    instance_id: bi.core.instance_id(),
+                });
+                register_context_handle(&bi, &handle);
+                increment_handle_count();
+
+                // Post-commit discovery registration. spawn-from-Welcome always
+                // stands up an ENCRYPTED context, so the routing id is the joiner's
+                // derived §9.10.4 pseudonym (`local_pseudonym` is `Copy`, still
+                // valid after the request move). The member is the JOINER; the
+                // relay_url is `None` because a UniFFI `Scp` instance does not
+                // retain the connected relay URL — it lives on the caller-held
+                // opaque `TransportManager`, so `None` is the honest value here.
+                let known = scp_ffi_common::bridge_instance::KnownContext {
+                    routing_id: local_pseudonym,
+                    relay_url: None,
+                    member_did: identity.did.clone(),
+                    last_seen: scp_primitives::Clock::now_secs(&scp_primitives::SystemClock),
+                };
+                bi.core.register_known_context(&context_id, known);
+
+                Ok(handle)
+            })
+            .await
+            .map_err(|e| ScpError::Context {
+                msg: format!("tokio task join error during context join from welcome: {e}"),
+                code: codes::CTX_2014.to_owned(),
             })?
     }
 
@@ -17295,6 +17600,209 @@ mod tests {
     /// logic through an owned `Scp` instance.
     fn scp_test() -> Arc<crate::scp::Scp> {
         crate::scp::Scp::new_in_memory_for_test()
+    }
+
+    // -----------------------------------------------------------------------
+    // ADR-049 Phase 2J: reserve_key_package / context_join_from_welcome
+    // -----------------------------------------------------------------------
+
+    /// Minimal ENCRYPTED single-admin params for the 2J join-side tests.
+    #[cfg(feature = "allow_in_memory_custody")]
+    fn encrypted_join_test_params() -> ContextParams {
+        ContextParams {
+            mode: ContextMode::Encrypted,
+            ceiling: Vec::new(),
+            ceiling_policy: CeilingPolicy::Immutable,
+            governance: GovernanceModel::SingleAdmin,
+            memory_scope: MemoryScope::Ephemeral,
+            ttl_seconds: 0,
+            promotable: false,
+            min_protocol_version: 0,
+            max_chain_depth: None,
+            max_nesting_depth: None,
+            session_cap: None,
+            economic_policy: None,
+            consequence_rules_json: None,
+            consequence_config_json: None,
+        }
+    }
+
+    /// `reserve_key_package` returns a non-empty reservation id and PUBLIC
+    /// `KeyPackage` bytes for a locally-custodied identity.
+    #[test]
+    #[cfg(feature = "allow_in_memory_custody")]
+    fn reserve_key_package_returns_public_bytes() {
+        let rt = runtime();
+        let scp = scp_test();
+        let identity = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed");
+
+        let reserved = rt
+            .block_on(scp.reserve_key_package(identity))
+            .expect("reserve_key_package should succeed for a custodied identity");
+
+        assert!(
+            !reserved.reservation_id.is_empty(),
+            "reservation id must be non-empty"
+        );
+        assert!(
+            !reserved.key_package_public.is_empty(),
+            "public KeyPackage bytes must be non-empty"
+        );
+    }
+
+    /// `reserve_key_package` rejects a non-custodied (DID-only, `identity_load`)
+    /// identity with the canonical missing-key-material code.
+    #[test]
+    #[cfg(feature = "allow_in_memory_custody")]
+    fn reserve_key_package_rejects_non_custodied_identity() {
+        let rt = runtime();
+        let scp = scp_test();
+        // A real identity yields a valid did:dht DID; reloading it produces a
+        // DID-only handle with no retained key material.
+        let custodied = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed");
+        let loaded = rt
+            .block_on(scp.identity_load(custodied.did()))
+            .expect("identity_load failed");
+
+        let result = rt.block_on(scp.reserve_key_package(loaded));
+        assert!(
+            matches!(
+                &result,
+                Err(ScpError::Identity { code, .. }) if code == codes::IDENT_1054
+            ),
+            "expected SCP-IDENT-1054 for a non-custodied identity, got: {result:?}"
+        );
+    }
+
+    /// `context_join_from_welcome` rejects a non-custodied joiner at the
+    /// pseudonym-derivation seam, before any single-use `KeyPackage` is consumed.
+    #[test]
+    #[cfg(feature = "allow_in_memory_custody")]
+    fn context_join_from_welcome_rejects_non_custodied_identity() {
+        let rt = runtime();
+        let scp = scp_test();
+        let custodied = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed");
+        let creator_did = custodied.did();
+        let loaded = rt
+            .block_on(scp.identity_load(custodied.did()))
+            .expect("identity_load failed");
+        let context_id = scp_ffi_common::generate_context_id();
+
+        let result = rt.block_on(scp.context_join_from_welcome(
+            loaded,
+            creator_did,
+            context_id.clone(),
+            encrypted_join_test_params(),
+            "bogus-reservation".to_owned(),
+            b"bogus-welcome".to_vec(),
+        ));
+        assert!(
+            matches!(
+                &result,
+                Err(ScpError::Identity { code, .. }) if code == codes::IDENT_1054
+            ),
+            "expected SCP-IDENT-1054 for a non-custodied joiner, got: {result:?}"
+        );
+        // No bridge state leaked — the custody gate hard-failed before any
+        // registration.
+        assert!(
+            !context_handle_registry(&scp.inner).contains_key(&context_id),
+            "no context handle should be registered after a rejected join"
+        );
+        assert!(
+            scp.inner.with_ucan_state(&context_id, |_| ()).is_none(),
+            "no UCAN state should be registered after a rejected join"
+        );
+    }
+
+    /// A failed `spawn_actor_from_welcome` (bad Welcome) rolls the reversible
+    /// bridge state back: no context handle, no UCAN state, no discovery entry.
+    #[test]
+    #[cfg(feature = "allow_in_memory_custody")]
+    fn context_join_from_welcome_rollback_leaves_no_ffi_state() {
+        let rt = runtime();
+        let scp = scp_test();
+        let identity = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed");
+        let creator_did = identity.did();
+        let context_id = scp_ffi_common::generate_context_id();
+
+        // Custodied joiner clears the pseudonym-derivation gate, so the join
+        // reaches the irreversible spawn — which fails on the bogus Welcome.
+        let result = rt.block_on(scp.context_join_from_welcome(
+            identity,
+            creator_did,
+            context_id.clone(),
+            encrypted_join_test_params(),
+            "bogus-reservation".to_owned(),
+            b"bogus-welcome".to_vec(),
+        ));
+        assert!(
+            result.is_err(),
+            "join with a bogus Welcome must fail, got: {result:?}"
+        );
+        assert!(
+            !context_handle_registry(&scp.inner).contains_key(&context_id),
+            "context handle must be rolled back after a failed spawn"
+        );
+        assert!(
+            scp.inner.with_ucan_state(&context_id, |_| ()).is_none(),
+            "UCAN state must be rolled back after a failed spawn"
+        );
+    }
+
+    /// A context already active on this instance collides at the Occupied
+    /// precheck — the join fails BEFORE the single-use `KeyPackage` is consumed,
+    /// leaving the pre-existing handle untouched.
+    #[test]
+    #[cfg(feature = "allow_in_memory_custody")]
+    fn context_join_from_welcome_occupied_context_fails_before_consume() {
+        let rt = runtime();
+        let scp = scp_test();
+        let identity = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed");
+        let creator_did = identity.did();
+
+        // Stand up a live context so its id is registered on this instance.
+        let handle = rt
+            .block_on(scp.context_create(Arc::clone(&identity), encrypted_join_test_params()))
+            .expect("context_create should succeed");
+        let context_id = handle.context_id();
+        assert!(
+            context_handle_registry(&scp.inner).contains_key(&context_id),
+            "created context must be registered"
+        );
+
+        // Joining-from-Welcome the SAME id must fail at the Occupied precheck.
+        let result = rt.block_on(scp.context_join_from_welcome(
+            identity,
+            creator_did,
+            context_id.clone(),
+            encrypted_join_test_params(),
+            "bogus-reservation".to_owned(),
+            b"bogus-welcome".to_vec(),
+        ));
+        assert!(
+            matches!(
+                &result,
+                Err(ScpError::Context { code, msg })
+                    if code == codes::CTX_2014 && msg.contains("already registered")
+            ),
+            "expected an Occupied SCP-CTX-2014 error, got: {result:?}"
+        );
+        // The pre-existing handle is untouched (not rolled back).
+        assert!(
+            context_handle_registry(&scp.inner).contains_key(&context_id),
+            "the pre-existing context handle must survive an Occupied-rejected join"
+        );
     }
 
     #[test]
