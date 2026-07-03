@@ -2410,6 +2410,31 @@ fn build_snapshot_for_persist(
     snapshot
 }
 
+/// Whether an MLS crypto export is durable enough to stand up a Welcome-JOINER.
+///
+/// [`build_snapshot_for_persist`] is deliberately FAIL-OPEN for existing
+/// members: on an `export_crypto_state` failure it writes an EMPTY crypto blob
+/// with `needs_reconnect = true` and the persist SUCCEEDS, so restore re-enters
+/// the §23.11 reconnection pipeline. A Welcome-JOINER cannot reconnect-derive
+/// (it would need a fresh Welcome), so for the spawn-from-Welcome entrypoint an
+/// empty / errored crypto export is FATAL — a keyless snapshot there means a
+/// live send-capable actor with no durable keys.
+///
+/// The persisted snapshot's crypto blob is a 1:1 copy of the
+/// `export_crypto_state` result, so re-reading the live export tells the
+/// entrypoint exactly what the snapshot carries WITHOUT depending on the
+/// persistence backend supporting read-back (the default `NoopContextPersistence`
+/// and the `for_query_shim` path do not). Returns `true` only when the export
+/// succeeded AND carries a non-empty blob.
+///
+/// The sole caller is `Supervisor::spawn_actor_from_welcome` (test-only until
+/// the FFI follow-on slice wires a production consumer), hence `dead_code`.
+#[must_use]
+#[allow(dead_code)]
+pub const fn welcome_snapshot_crypto_is_durable(export: &Result<Vec<u8>, ContextError>) -> bool {
+    matches!(export, Ok(blob) if !blob.is_empty())
+}
+
 /// Best-effort persist of the current actor state. Mirrors the legacy
 /// Phase 3 snapshot persistence path, but reads from actor-owned state.
 ///

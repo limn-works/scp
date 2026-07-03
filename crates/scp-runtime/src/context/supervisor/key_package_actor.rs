@@ -126,6 +126,7 @@ use crate::context::builder::ContextTransportProvider;
 use crate::crypto::mls::backend::{MlsBackend, SignerState};
 use crate::crypto::mls::credential::ScpCredential;
 use crate::crypto::mls::error::MlsError;
+use crate::crypto::mls::group::ScpMlsGroup;
 use crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter;
 use scp_identity::SigningKeyId;
 
@@ -421,12 +422,14 @@ pub enum KeyPackageCommand {
     /// join + durable consume. A failed join leaves the reservation intact for
     /// retry / cancel.
     ///
-    /// The joined `ScpMlsGroup` is produced and validated INTERNALLY but is
-    /// not returned over the channel: the narrow `MlsBackend` surface has no
-    /// group-serialization primitive, and there is no production caller wired
-    /// here yet (the deferred 2E production consumer will call this fused
-    /// `ConfirmConsume(welcome)` and own group installation). The protocol
-    /// SHAPE is now fused — the private bytes are gone from the reserve path.
+    /// The joined `ScpMlsGroup` is produced and validated INTERNALLY and, on a
+    /// fresh successful confirm, MOVED out over the reply channel to the
+    /// spawn-from-Welcome entrypoint (ADR-049 Phase 2J), which installs it into
+    /// the live crypto provider so the joiner becomes a real send-capable
+    /// participant. The private signer-state is embedded inside the group value
+    /// (it owns its own OpenMLS provider + signer); it is never surfaced as raw
+    /// bytes on the reserve path, so the "fused join" property is preserved —
+    /// only the fully-formed group crosses the channel, not loose key material.
     ///
     /// # Retry idempotency (RE-CONFIRM AFTER A PARTIAL FAILURE IS SAFE)
     ///
@@ -434,17 +437,26 @@ pub enum KeyPackageCommand {
     /// the durable consume finished (e.g. the consumed-tombstone write failed),
     /// the reservation is deliberately RETAINED and the call replies `Err`. The
     /// integrator SHOULD simply retry `ConfirmConsume` with the SAME
-    /// `reservation_id`. The retry is idempotent: the re-run inner join hits the
-    /// already-written consumed-init-key marker (`MlsError::KeyPackageReplay`),
-    /// which the handler recognizes as its OWN prior completion and converts
-    /// into the idempotent durable-consume completion — replying `Ok` and
-    /// finishing the consume. Single-use still holds across the retry, and the
-    /// retry can NEVER be coerced into a second or DIFFERENT join: the original
-    /// group membership is what the consume records, and an alternate welcome's
+    /// `reservation_id`. The retry is idempotent for the DURABLE CONSUME: the
+    /// re-run inner join hits the already-written consumed-init-key marker
+    /// (`MlsError::KeyPackageReplay`), which the handler recognizes as its OWN
+    /// prior completion and finishes the durable consume (delete + tombstone +
+    /// cleanup). Single-use still holds across the retry, and the retry can
+    /// NEVER be coerced into a second or DIFFERENT join: an alternate welcome's
     /// init key is never consumed because the inner join short-circuits on the
-    /// existing marker before processing the new welcome. A retry of a fully
-    /// completed (already-consumed) reservation replies `InvalidState` — the
-    /// reservation is gone.
+    /// existing marker before processing the new welcome.
+    ///
+    /// **The joined group is NOT retained across confirms.** The group value is
+    /// produced by the inner join and dropped if the first confirm returns `Err`
+    /// (the durable-consume `?` propagates before the group is returned), and a
+    /// replay-driven own-prior-completion retry has NO group to re-produce (the
+    /// join short-circuited on the marker). So an own-prior-completion retry
+    /// COMPLETES the durable consume but replies `Err(InvalidState)` — a
+    /// tombstone-write failure loses the join, and the joiner must re-initiate
+    /// with a FRESH key package. This is fail-closed: a lost group never leaves
+    /// a half-consumed reservation reusable, and never silently succeeds without
+    /// a group to install. A retry of a fully completed (already-consumed)
+    /// reservation replies `InvalidState` — the reservation is gone.
     ///
     /// The own-prior-completion recognition does NOT rest on "the reservation is
     /// still live" alone. It additionally requires that THIS reservation's KP
@@ -460,8 +472,16 @@ pub enum KeyPackageCommand {
         reservation_id: ReservationId,
         /// TLS-serialized MLS Welcome message addressed to the reserved KP.
         welcome_bytes: Vec<u8>,
-        /// Oneshot reply: unit success of the fused join + durable consume.
-        reply: oneshot::Sender<Result<(), ContextError>>,
+        /// Oneshot reply: the joined [`ScpMlsGroup`] on a fresh successful
+        /// fused join + durable consume (ADR-049 Phase 2J). The joined group
+        /// is a self-contained value (it owns its OpenMLS provider + signer),
+        /// so it is MOVED across the reply channel for the spawn-from-Welcome
+        /// entrypoint to install into the live crypto provider — the private
+        /// signer-state is embedded in the group, never surfaced as raw bytes.
+        /// An idempotent retry of an already-consumed reservation replies
+        /// `Err(InvalidState)` because the joined group is not retained across
+        /// confirms (see the retry-idempotency note below).
+        reply: oneshot::Sender<Result<ScpMlsGroup, ContextError>>,
     },
     // NOTE: `reservation_id` is a `ReservationId` newtype — distinct from
     // `KpRef`, so a kp_ref cannot be passed where a reservation_id is wanted.
@@ -1167,13 +1187,18 @@ impl KeyPackageStoreActor {
     ///    in the fail-safe order (B1): delete the KP private record FIRST
     ///    (so a crash leaves the record GONE — can't be re-pooled), then write
     ///    the reservation-id-keyed consumed tombstone (carrying the `kp_ref`
-    ///    so reconcile excludes it from the pool branch). Reply with the
-    ///    joined group bytes — never the raw signer-state.
+    ///    so reconcile excludes it from the pool branch). Return the joined
+    ///    [`ScpMlsGroup`] (a self-contained value that owns its OpenMLS
+    ///    provider + signer) — never the raw signer-state.
+    ///
+    /// A replay-driven own-prior-completion retry (see the `ConfirmConsume`
+    /// doc) has no group to re-produce, so it completes the durable consume and
+    /// returns `Err(InvalidState)` rather than a groupless `Ok`.
     async fn handle_confirm(
         &mut self,
         reservation_id: ReservationId,
         welcome_bytes: &[u8],
-    ) -> Result<(), ContextError> {
+    ) -> Result<ScpMlsGroup, ContextError> {
         // Borrow the reserved entry WITHOUT removing it: a failed join must
         // leave the reservation intact for retry/cancel.
         let Some(reserved) = self.reserved.get(&reservation_id) else {
@@ -1191,85 +1216,96 @@ impl KeyPackageStoreActor {
             bytes: Zeroizing::new(reserved.signer_state.to_vec()),
         };
 
-        // Fused join INTERNALLY. The signer-state never leaves the actor. The
-        // joined group is produced + validated here; with no group-
-        // serialization primitive on the narrow backend and no production
-        // consumer wired yet, it is dropped after proving the join succeeded.
-        if let Err(e) = self
+        // Fused join INTERNALLY. The signer-state never leaves the actor as raw
+        // bytes; the fully-formed joined group (which embeds its own OpenMLS
+        // provider + signer) is what crosses back to the spawn-from-Welcome
+        // entrypoint. `Some(group)` on a fresh successful join; `None` on the
+        // replay-driven own-prior-completion path (the group was already
+        // produced + dropped by a prior confirm and cannot be re-produced).
+        let joined_group: Option<ScpMlsGroup> = match self
             .mls
             .join_from_welcome(welcome_bytes, signer_state, &public_bytes)
             .await
         {
-            // A crypto-layer init-key replay rejection (A2 backstop) needs
-            // careful interpretation. The init-key marker is written by THIS
-            // actor's own prior `join_from_welcome` for THIS reservation. So a
-            // replay rejection while the reservation is STILL LIVE in `reserved`
-            // means our own earlier confirm attempt already completed the join
-            // but failed to finish the durable-consume completion (e.g. the
-            // tombstone store failed and we kept the reservation for retry).
-            // A naive retry would re-run the join, hit the marker, and fail
-            // PERMANENTLY here — never reaching the tombstone write — leaving
-            // the reservation stuck until the TTL sweep. Instead, recognize our
-            // own already-completed join and fall through to the idempotent
-            // durable-consume completion (delete KP record + write tombstone +
-            // cleanup), making the retry an idempotent SUCCESS.
-            //
-            // We detect the variant BEFORE `map_join_error` so the replay is
-            // matched against the `MlsError` rather than the (now distinct)
-            // typed `ContextError`.
-            //
-            // The guard requires TWO independent facts before treating a replay
-            // as this reservation's OWN prior completion, NOT "the reservation is
-            // still live" alone:
-            //   (1) the reservation is still live in `reserved` (an
-            //       unknown/foreign reservation never reaches here — the early
-            //       lookup returned `InvalidState`); AND
-            //   (2) THIS reservation's KP private record is ALREADY ABSENT from
-            //       durable storage. A real prior join of THIS reservation
-            //       deletes the KP record FIRST (fail-safe B1 ordering) before
-            //       writing the tombstone, so record-absence is durable EVIDENCE
-            //       that a prior join of THIS reservation already ran and reached
-            //       at least the delete step. If the KP record still EXISTS, a
-            //       `KeyPackageReplay` is NOT a legitimate own-prior-completion —
-            //       our own prior join would have deleted it — so the marker must
-            //       have been written by something OTHER than a completed prior
-            //       join of this reservation (e.g. journal corruption, or a
-            //       distinct init-key collision). Surfacing it as
-            //       `KeyPackageReplay` rather than a spurious `Ok` breaks any
-            //       false-success chain regardless of how a re-pool could occur.
-            if matches!(e, MlsError::KeyPackageReplay) {
-                let record_absent = !self.kp_record_exists(&kp_ref).await?;
-                if self.reserved.contains_key(&reservation_id) && record_absent {
-                    tracing::info!(
-                        actor_kind = "key_package_store",
-                        identity = %self.identity.0,
-                        kp_ref = %kp_ref,
-                        "confirm retry: prior join already consumed this reservation's \
-                         init key AND deleted its KP record; completing the durable \
-                         consume idempotently"
-                    );
-                    // Fall through to the durable-consume completion below.
+            Ok(group) => Some(group),
+            Err(e) => {
+                // A crypto-layer init-key replay rejection (A2 backstop) needs
+                // careful interpretation. The init-key marker is written by THIS
+                // actor's own prior `join_from_welcome` for THIS reservation. So a
+                // replay rejection while the reservation is STILL LIVE in `reserved`
+                // means our own earlier confirm attempt already completed the join
+                // but failed to finish the durable-consume completion (e.g. the
+                // tombstone store failed and we kept the reservation for retry).
+                // A naive retry would re-run the join, hit the marker, and fail
+                // PERMANENTLY here — never reaching the tombstone write — leaving
+                // the reservation stuck until the TTL sweep. Instead, recognize our
+                // own already-completed join and fall through to the idempotent
+                // durable-consume completion (delete KP record + write tombstone +
+                // cleanup), making the retry an idempotent SUCCESS.
+                //
+                // We detect the variant BEFORE `map_join_error` so the replay is
+                // matched against the `MlsError` rather than the (now distinct)
+                // typed `ContextError`.
+                //
+                // The guard requires TWO independent facts before treating a replay
+                // as this reservation's OWN prior completion, NOT "the reservation is
+                // still live" alone:
+                //   (1) the reservation is still live in `reserved` (an
+                //       unknown/foreign reservation never reaches here — the early
+                //       lookup returned `InvalidState`); AND
+                //   (2) THIS reservation's KP private record is ALREADY ABSENT from
+                //       durable storage. A real prior join of THIS reservation
+                //       deletes the KP record FIRST (fail-safe B1 ordering) before
+                //       writing the tombstone, so record-absence is durable EVIDENCE
+                //       that a prior join of THIS reservation already ran and reached
+                //       at least the delete step. If the KP record still EXISTS, a
+                //       `KeyPackageReplay` is NOT a legitimate own-prior-completion —
+                //       our own prior join would have deleted it — so the marker must
+                //       have been written by something OTHER than a completed prior
+                //       join of this reservation (e.g. journal corruption, or a
+                //       distinct init-key collision). Surfacing it as
+                //       `KeyPackageReplay` rather than a spurious `Ok` breaks any
+                //       false-success chain regardless of how a re-pool could occur.
+                if matches!(e, MlsError::KeyPackageReplay) {
+                    let record_absent = !self.kp_record_exists(&kp_ref).await?;
+                    if self.reserved.contains_key(&reservation_id) && record_absent {
+                        tracing::info!(
+                            actor_kind = "key_package_store",
+                            identity = %self.identity.0,
+                            kp_ref = %kp_ref,
+                            "confirm retry: prior join already consumed this reservation's \
+                             init key AND deleted its KP record; completing the durable \
+                             consume idempotently"
+                        );
+                        // Fall through to the durable-consume completion below.
+                    } else {
+                        // Either no live reservation (defensive — the early lookup
+                        // returns first), or the KP record still EXISTS so this is
+                        // NOT our own prior completion. Surface the replay as a
+                        // security-relevant single-use rejection, never a false Ok.
+                        tracing::warn!(
+                            actor_kind = "key_package_store",
+                            identity = %self.identity.0,
+                            kp_ref = %kp_ref,
+                            kp_record_present = !record_absent,
+                            "confirm: init-key replay rejected; not this reservation's own prior \
+                             completion (KP record still present or reservation absent)"
+                        );
+                        return Err(Self::map_join_error(&e));
+                    }
                 } else {
-                    // Either no live reservation (defensive — the early lookup
-                    // returns first), or the KP record still EXISTS so this is
-                    // NOT our own prior completion. Surface the replay as a
-                    // security-relevant single-use rejection, never a false Ok.
-                    tracing::warn!(
-                        actor_kind = "key_package_store",
-                        identity = %self.identity.0,
-                        kp_ref = %kp_ref,
-                        kp_record_present = !record_absent,
-                        "confirm: init-key replay rejected; not this reservation's own prior \
-                         completion (KP record still present or reservation absent)"
-                    );
+                    // Ordinary crypto failure (bad/duplicate welcome). Join failed —
+                    // KP NOT burned; reservation stays for retry/cancel.
                     return Err(Self::map_join_error(&e));
                 }
-            } else {
-                // Ordinary crypto failure (bad/duplicate welcome). Join failed —
-                // KP NOT burned; reservation stays for retry/cancel.
-                return Err(Self::map_join_error(&e));
+                // Own-prior-completion (replay + KP record already absent): there is
+                // NO group to return — it was produced and dropped by a prior
+                // confirm. Fall through with `None`; the durable-consume completion
+                // below still runs (idempotent cleanup), and the final reply is
+                // `Err(InvalidState)` (the join is lost; re-initiate with a fresh KP).
+                None
             }
-        }
+        };
 
         // Class-S, fail-SAFE ordering (B1): delete the KP private record FIRST
         // so a crash before the tombstone leaves the record GONE (reconcile
@@ -1302,7 +1338,20 @@ impl KeyPackageStoreActor {
         // tombstone WITHOUT ever undoing the consume.
         self.finalize_confirm_consume(&reservation_id, &kp_ref)
             .await;
-        Ok(())
+
+        // Return the freshly-joined group to the spawn-from-Welcome caller. On
+        // the own-prior-completion retry path `joined_group` is `None` (the
+        // group was produced and dropped by a prior confirm and cannot be
+        // re-produced); the durable consume above still ran, but there is no
+        // group to install — reply `Err` so the joiner re-initiates the join
+        // with a fresh key package rather than silently succeeding groupless.
+        joined_group.ok_or_else(|| {
+            ContextError::InvalidState(
+                "reservation consumed on a prior confirm; the joined group was not retained \
+                 — re-initiate the join with a fresh key package"
+                    .to_owned(),
+            )
+        })
     }
 
     /// Best-effort cleanup tail of a durable confirm-consume. The consume is

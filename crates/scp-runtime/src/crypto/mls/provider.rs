@@ -463,6 +463,18 @@ pub struct MlsCryptoProvider {
     /// Lock-free [`DashSet`] — the prior `std::sync::Mutex<HashSet>`
     /// wrapper was removed in ADR-049 commit 12c.9f.
     taken_context_ids: DashSet<[u8; 32]>,
+    /// One-shot test seam: when set, the NEXT [`Self::export_crypto_state`]
+    /// call returns [`ContextError::CryptoFailed`] and resets the flag.
+    ///
+    /// This exists solely to drive the spawn-from-Welcome entrypoint's
+    /// crypto-durability fail-closed branch end-to-end: the real provider always
+    /// exports a NON-EMPTY blob for a just-installed group, so that branch is
+    /// otherwise structurally unreachable through the full entrypoint. Gated
+    /// behind `#[cfg(any(test, feature = "testing"))]` so the production build
+    /// carries neither the field nor the branch. One-shot (fires once, then
+    /// clears itself) so a post-rollback export read still behaves normally.
+    #[cfg(any(test, feature = "testing"))]
+    force_export_failure: std::sync::atomic::AtomicBool,
 }
 
 #[allow(clippy::significant_drop_tightening)]
@@ -519,7 +531,22 @@ impl MlsCryptoProvider {
             #[cfg(any(test, feature = "testing"))]
             pending_joins: ArcSwapOption::empty(),
             taken_context_ids: DashSet::new(),
+            #[cfg(any(test, feature = "testing"))]
+            force_export_failure: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Arms the one-shot [`Self::force_export_failure`] seam: the NEXT
+    /// [`Self::export_crypto_state`] call returns
+    /// [`ContextError::CryptoFailed`] and clears the flag.
+    ///
+    /// Test-only (see the field docs) — used to induce the spawn-from-Welcome
+    /// crypto-durability fail-closed branch, which the real provider cannot
+    /// otherwise reach (an installed group always exports a non-empty blob).
+    #[cfg(any(test, feature = "testing"))]
+    pub fn arm_export_failure_once(&self) {
+        self.force_export_failure
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Borrowed reference to the injected MLS primitive backend
@@ -765,6 +792,77 @@ impl MlsCryptoProvider {
 
         // Occupy the reserved vacant slot. No overwrite is possible: if
         // the entry had been occupied we returned `CreationFailed` above.
+        slot.insert(state);
+        Ok(())
+    }
+
+    /// Installs an already-joined `OpenMLS` group into the provider's live
+    /// context store, keyed by `context_id` (ADR-049 Phase 2J,
+    /// spawn-from-Welcome).
+    ///
+    /// This is the join-side counterpart of [`Self::create_mls_group`]: the
+    /// creator BUILDS a fresh group in the provider, whereas a joiner has
+    /// already produced its `ScpMlsGroup` by processing a received Welcome
+    /// (through the fused `KeyPackageStoreActor::ConfirmConsume` → the
+    /// `MlsBackend`'s consumed-init-key-backstopped `join_from_welcome`).
+    /// The joined group is a self-contained value (it owns its own `OpenMLS`
+    /// provider + signer), so installing it is a move into the `contexts`
+    /// map plus a locally-generated sender key — exactly the shape the
+    /// (test/feature-gated, now-dead — pending deletion in the FFI follow-on
+    /// slice) single-slot join path produced.
+    ///
+    /// The joiner's OWN sender key is generated LOCALLY here (spec §9.16.1);
+    /// it is NOT carried in the Welcome. Other members' sender keys and the
+    /// per-member access keys (§9.17) arrive later via sender-key-distribution
+    /// application messages / out-of-band exchange, so `sender_key_store`,
+    /// `member_wrapping_keys`, and `recv_sequence_tracker` start empty — the
+    /// same initial shape a fresh join produces.
+    ///
+    /// # Refuses to overwrite a live group
+    ///
+    /// Like [`Self::create_mls_group`], this reserves the `DashMap` slot with
+    /// a `Vacant` guard and returns [`ContextError::CreationFailed`] rather
+    /// than clobbering an existing entry — a second spawn-from-Welcome for the
+    /// same context id must not silently replace a live group with divergent
+    /// keys. The supervisor serializes same-id bootstraps, but this is the
+    /// crypto layer's own defense-in-depth invariant.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::CreationFailed`] if a group is already
+    /// registered for `context_id`.
+    pub fn install_joined_group(
+        &self,
+        context_id: &[u8; 32],
+        group: ScpMlsGroup,
+    ) -> Result<(), ContextError> {
+        use dashmap::mapref::entry::Entry;
+
+        // Atomic check-and-occupy on the shard: two concurrent installs for
+        // the same id cannot both pass the existence check.
+        let Entry::Vacant(slot) = self.contexts.entry(*context_id) else {
+            return Err(ContextError::CreationFailed(format!(
+                "MLS group already exists for context '{}' — refusing to overwrite a live \
+                 group on spawn-from-Welcome",
+                hex::encode(context_id)
+            )));
+        };
+
+        let state = ContextCryptoState {
+            mls_group: group,
+            // The joiner's own AES-256 sender key (spec §9.16.1), minted
+            // locally — the Welcome carries no sender key. Epoch starts at 1,
+            // matching a fresh create / join.
+            sender_key: generate_sender_key(),
+            sender_key_store: SenderKeyStore::new(),
+            sender_key_epoch: 1,
+            send_sequence: 0,
+            pending_distributions: Vec::new(),
+            nonce_dedup: NonceDedup::new(),
+            member_wrapping_keys: HashMap::new(),
+            recv_sequence_tracker: HashMap::new(),
+        };
+
         slot.insert(state);
         Ok(())
     }
@@ -1930,6 +2028,20 @@ impl MlsCryptoProvider {
     ///
     /// Returns [`ContextError::CryptoFailed`] if serialization fails.
     pub fn export_crypto_state(&self, context_id: &[u8; 32]) -> Result<Vec<u8>, ContextError> {
+        // One-shot test seam (see `force_export_failure`): induce an export
+        // failure so the spawn-from-Welcome crypto-durability fail-closed branch
+        // can be driven end-to-end. `swap(false)` fires exactly once, then the
+        // flag is cleared so subsequent (post-rollback) reads behave normally.
+        #[cfg(any(test, feature = "testing"))]
+        if self
+            .force_export_failure
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(ContextError::CryptoFailed(
+                "forced export failure (one-shot test seam)".to_owned(),
+            ));
+        }
+
         // ADR-049 commit 12c.9f: lock-free `DashMap::get`. Holds the
         // per-shard read guard for the duration of snapshot
         // construction; no other writer can mutate this entry while
@@ -2433,9 +2545,10 @@ impl MlsCryptoProvider {
     /// is superseded by the per-identity
     /// [`KeyPackageStoreActor`](crate::context::supervisor::key_package_actor::KeyPackageStoreActor)
     /// reserve→confirm/cancel protocol, which tracks an arbitrary number of
-    /// concurrent reservations keyed by `ReservationId`. It is retained only
-    /// until the join-from-welcome spawn entrypoint lands; it will be removed
-    /// then. No new call sites should use it.
+    /// concurrent reservations keyed by `ReservationId`. The join-from-welcome
+    /// spawn entrypoint has landed (core slice); this legacy provider path is now
+    /// dead and is retained only until the FFI follow-on slice lands, which
+    /// deletes it. No new call sites should use it.
     ///
     /// # Test/feature-gated (single-use backstop bypass)
     ///
@@ -2497,8 +2610,9 @@ impl MlsCryptoProvider {
     /// KP from the
     /// [`KeyPackageStoreActor`](crate::context::supervisor::key_package_actor::KeyPackageStoreActor),
     /// joins from the returned signer-state, then confirms/cancels the
-    /// reservation. This provider path is retained only until the
-    /// join-from-welcome spawn entrypoint lands.
+    /// reservation. The join-from-welcome spawn entrypoint has landed (core
+    /// slice); this provider path is now dead and is retained only until the FFI
+    /// follow-on slice lands, which deletes it.
     ///
     /// # Test/feature-gated (single-use backstop bypass)
     ///

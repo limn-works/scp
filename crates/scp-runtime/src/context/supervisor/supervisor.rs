@@ -1009,6 +1009,29 @@ pub struct CrossContextToolInvocationRequest {
     pub asserted_timestamp_ms: u64,
 }
 
+/// Flat, named-field request for [`Supervisor::spawn_actor_from_welcome`]
+/// (ADR-049 Phase 2J, spawn-from-Welcome). A config object (not positional
+/// args) per the agent-first API tenet: an LLM constructs it from the field
+/// names + one example, with no argument-order footgun. The joiner's OWN
+/// identity is passed separately (as a `DID` on the `Supervisor` method, or as
+/// the unforgeable `&OwnedIdentityDid` capability on the `SupervisorHandle`
+/// wrapper) so it cannot be transposed with `creator_did`.
+pub struct WelcomeJoinRequest {
+    /// The context creator / admin DID (from the legible, pre-join params).
+    pub creator_did: DID,
+    /// Canonical context id string (`hex(digest)` under ADR-056).
+    pub context_id: String,
+    /// The legible context parameters (visible before joining, spec §5).
+    pub params: scp_protocol::context::ContextParams,
+    /// The reservation id of the KeyPackage this Welcome was addressed to,
+    /// obtained from the joiner's `KeyPackageStoreActor` `Reserve`.
+    pub reservation_id: crate::context::supervisor::key_package_actor::ReservationId,
+    /// TLS-serialized MLS Welcome message received for the reserved KeyPackage.
+    pub welcome_bytes: Vec<u8>,
+    /// The joiner's §9.10.4 local pseudonym for this context, or `None`.
+    pub local_pseudonym: Option<[u8; 32]>,
+}
+
 /// The two Active Signing Keys a §6.2.4 cross-context saga signs under, named by
 /// role so the call site cannot transpose them.
 ///
@@ -10216,6 +10239,581 @@ impl Supervisor {
                 ),
             )
         })
+    }
+
+    // (WelcomeJoinRequest is defined at module scope below the impl.)
+
+    /// Spawns a per-context actor for a node that JOINED a context by
+    /// processing a received Welcome (ADR-049 Phase 2J, spawn-from-Welcome;
+    /// Deferred Work #1).
+    ///
+    /// Without this, a Welcome-joined node has a populated crypto provider (it
+    /// can DECRYPT) but no actor-backed send [`ContextHandle`](crate::context::ContextHandle)
+    /// and no event log — so any send fails closed with "context not found in
+    /// node's handles". This entrypoint makes the joiner a real, send-capable
+    /// participant.
+    ///
+    /// It is the join-side counterpart of [`crate::context::lifecycle_helpers::create_context`],
+    /// modeled as a special case of `restore`/`spawn_actor_with_state` **seeded
+    /// from Welcome-derived state**:
+    ///
+    /// 1. Fuse the join through the joiner's
+    ///    [`KeyPackageStoreActor`](crate::context::supervisor::key_package_actor::KeyPackageStoreActor)
+    ///    (`ConfirmConsume(welcome)`), which produces the joined
+    ///    [`ScpMlsGroup`](crate::crypto::mls::group::ScpMlsGroup) and durably
+    ///    consumes the single-use KeyPackage (two independent single-use
+    ///    anchors preserved).
+    /// 2. INSTALL the joined group into the live crypto provider
+    ///    ([`MlsCryptoProvider::install_joined_group`](crate::crypto::mls::provider::MlsCryptoProvider::install_joined_group)),
+    ///    plus a locally-minted sender key (spec §9.16.1).
+    /// 3. Build the joiner's Welcome-derived
+    ///    [`PerContextState`](crate::context::actor::state::PerContextState)
+    ///    (governance from the legible params, the joiner assigned the default
+    ///    `"member"` role, the creator as admin, a fresh event log).
+    /// 4. Write the initial Class-S snapshot to `mls_storage` **fail-closed,
+    ///    BEFORE the spawn is acked** (mirrors the `restore_context` crypto-
+    ///    restore fail-closed ordering). A persist failure returns `Err` and
+    ///    tears the just-installed group back out — never leaving a live,
+    ///    half-keyed actor.
+    /// 5. Spawn the owned-state actor and register its send handle.
+    ///
+    /// # Key-injection crash-safety (Decision 1/8/9)
+    ///
+    /// The joiner's picked-up crypto (the joined MLS group + its own sender
+    /// key) is **Class M** — it lives in the supervisor-owned crypto provider
+    /// `Arc`, captured into the fail-closed snapshot's `mls_crypto_state` and
+    /// max-merged on respawn (spec §23.17.2 Invariant 2). Because the snapshot
+    /// is persisted fail-closed BEFORE the actor is reachable (its send handle
+    /// is registered only in step 5), a crash between "keys injected" and "keys
+    /// durably persisted" leaves either a fully-keyed snapshot (restore
+    /// rehydrates the whole context) or none (nothing to resurrect) — never a
+    /// half-keyed actor. The `welcome_scratchpad` is transient join-handshake
+    /// state, consumed by the fused join; it is not persisted (there is nothing
+    /// authorization-critical left in it once the join lands).
+    ///
+    /// # Errors
+    ///
+    /// - The `ConfirmConsume` error (bad/duplicate Welcome, single-use replay,
+    ///   or a lost group on an own-prior-completion retry).
+    /// - [`ContextError::CreationFailed`] if a group / actor is already
+    ///   registered for `context_id` (first-writer-wins).
+    /// - [`ContextError::PersistenceFailed`] if the fail-closed initial
+    ///   snapshot persist fails (the installed group is rolled back).
+    /// - Provider-init / governance-validation errors surfaced while building
+    ///   the joiner state.
+    // Narrowed to `pub(in crate::context)` (Fix 5 / security): the raw entry
+    // takes a bare `DID`, so it must not be the `pub` "spawn under any identity"
+    // primitive the `OwnedIdentityDid` capability exists to prevent. In-crate
+    // callers are the runtime spawn-from-Welcome tests today and the
+    // `OwnedIdentityDid`-gated `SupervisorHandle` wrapper the FFI follow-on slice
+    // adds; there is no non-test production consumer until then, hence the
+    // `#[allow(dead_code)]` on this core slice.
+    //
+    // The heavily-commented crash-safety ladder (reversible prechecks → consume
+    // → install → build → persist → crypto-durability check → spawn, each with
+    // its rollback-on-error path) reads clearer as one linear sequence than split
+    // across helpers, hence the line-count allow.
+    #[allow(dead_code)]
+    #[allow(clippy::too_many_lines)]
+    pub(in crate::context) async fn spawn_actor_from_welcome(
+        self: &Arc<Self>,
+        owning_did: DID,
+        req: WelcomeJoinRequest,
+    ) -> Result<crate::context::ContextHandle, ContextError> {
+        use crate::context::supervisor::key_package_actor::KeyPackageCommand;
+
+        let WelcomeJoinRequest {
+            creator_did,
+            context_id,
+            params,
+            reservation_id,
+            welcome_bytes,
+            local_pseudonym,
+        } = req;
+
+        // Serialize the WHOLE join against every other bootstrap for this id (the
+        // `CreateContext` / `ImportContext` / `RestoreContext` dispatch arms, the
+        // `standing_context` path, and the off-mailbox watchdog
+        // `respawn_from_snapshot`) by holding `bootstrap_spawn_lock` across the
+        // entire entrypoint body — exactly as those four peer bootstraps do.
+        //
+        // Without this guard the off-mailbox watchdog `respawn_from_snapshot` can
+        // race the join: a victim actor panics → the watchdog despawns it from
+        // `self.actors` before `restore_context` re-inserts it → this join's
+        // Precheck-A `lookup` MISSES the mid-despawn victim → both paths write
+        // crypto (`restore_crypto_state` does a blind `contexts.insert`) and this
+        // join's rollback `delete_context` can destroy the victim's freshly
+        // restored snapshot. Taking the lock at the very top makes Precheck A (and
+        // its durable companion below) atomic w.r.t. every other bootstrap + the
+        // respawn, so the first writer wins deterministically.
+        //
+        // Lock order is always `bootstrap_spawn_lock` → `write_lock` (the register
+        // in `spawn_actor_with_state` below takes `write_lock` INSIDE this guard,
+        // identical to create/import/standing/respawn); neither `build_actor_deps`,
+        // the crypto ops, nor `spawn_actor_with_state` re-acquires
+        // `bootstrap_spawn_lock`, so this is re-entrancy- and deadlock-free.
+        let _bootstrap_guard = self.bootstrap_spawn_lock.lock().await;
+
+        // ---- REVERSIBLE PRECHECKS (before the irreversible ConfirmConsume) ----
+        // The KeyPackage burn in step 1 is a SINGLE-USE, irreversible cost. Every
+        // check that can be made from the legible request alone runs FIRST, so a
+        // collision or a malformed request fails WITHOUT consuming the anchor and
+        // WITHOUT persisting anything (BLACK-2J-01 / BLACK-2J-02).
+
+        // Precheck A (BLACK-2J-01) — up-front LIVE-actor existence check. A context
+        // already has a registered actor if it is live in ANY mode, INCLUDING a
+        // broadcast context (whose crypto lives in `broadcast_keys`, not the
+        // `contexts` map `install_joined_group` guards — so the step-2 install
+        // would NOT catch a broadcast collision, but this registry check does).
+        // Refusing here, before the consume + persist, stops a griefing-via-
+        // colliding-`context_id` join from overwriting a LIVE context's durable
+        // snapshot. This is only HALF of first-writer-wins: `lookup` sees the live
+        // `self.actors` registry, NOT durable storage, so a persisted-but-UNSPAWNED
+        // same-id snapshot (a post-restart / non-Active / failed-restore window)
+        // would slip past it. The durable companion below (after `build_actor_deps`
+        // builds `deps.persistence`, still BEFORE the consume) closes that window;
+        // the two together give first-writer-wins against both a live actor and an
+        // on-disk snapshot, and — because the whole body holds
+        // `bootstrap_spawn_lock` — against a concurrent same-id restore/respawn. The
+        // step-5 atomic `spawn_actor_with_state` Vacant check remains the in-memory
+        // race backstop.
+        if self.lookup(&context_id).is_some() {
+            return Err(ContextError::CreationFailed(format!(
+                "spawn-from-Welcome refused: a context actor is already registered \
+                 for '{context_id}' (first-writer-wins) — rejecting before consuming \
+                 the single-use KeyPackage"
+            )));
+        }
+
+        // Precheck B (BLACK-2J-04) — require a REAL §9.10.4 local pseudonym.
+        // spawn-from-Welcome always stands up an ENCRYPTED context; the FFI
+        // boundary derives the pseudonym via `KeyCustody::derive_pseudonym`
+        // (§9.10.4) and the runtime holds no signing key to derive it here. A
+        // `None` must NOT silently become the `[0u8; 32]` sentinel on the join
+        // surface (a linkable constant / silent security default) — reject it.
+        let local_pseudonym = local_pseudonym.ok_or_else(|| {
+            ContextError::CreationFailed(
+                "spawn-from-Welcome requires a real §9.10.4 local pseudonym for the \
+                 encrypted context; received None (no silent [0u8; 32] sentinel on \
+                 the join surface)"
+                    .to_owned(),
+            )
+        })?;
+
+        // Precheck C (BLACK-2J-02) — reversible legible-param validation. These
+        // depend ONLY on `params` (not on the joined group), so run them before
+        // the consume: malformed params fail without burning the KeyPackage.
+        params
+            .check_version_compatibility(scp_protocol::envelope::SCP_PROTOCOL_VERSION)
+            .map_err(|e| ContextError::CreationFailed(e.to_string()))?;
+        crate::context::state::validate_governance_model(&params.governance)
+            .map_err(|e| ContextError::CreationFailed(e.to_string()))?;
+        // Ceiling-grammar validation (§5.3.1.1). `build_welcome_joiner_state` →
+        // `ContextRoleState::new` runs `ceiling.validate_entries()` only AFTER the
+        // irreversible consume, so a malformed ceiling category
+        // (`InvalidCeilingCategory`) would otherwise burn the single-use KeyPackage
+        // before failing. It depends only on `params`, so validate the SAME ceiling
+        // here to keep the rejection reversible.
+        scp_protocol::context::roles::CapabilityCeiling::new(params.ceiling.iter().cloned())
+            .validate_entries()
+            .map_err(|e| ContextError::CreationFailed(e.to_string()))?;
+
+        // Build the joiner's actor deps (crypto, transport, event log, KP store,
+        // mls_storage, persistence, capability token) for the owning identity.
+        let deps = self.build_actor_deps(&owning_did).await?;
+
+        // Precheck D (BLACK-2J-06) — DURABLE first-writer-wins. Precheck A only
+        // sees the LIVE `self.actors` registry; a persisted-but-unspawned same-id
+        // snapshot (post-restart window, a non-Active snapshot, or a context whose
+        // restore has not run yet) is invisible to it. spawn-from-Welcome is the
+        // FIRST join for a NEW context, so an existing durable snapshot means either
+        // a griefing victim (whose membership / governance / event-log root a blind
+        // step-4 persist would OVERWRITE, resurrecting an attacker-influenced
+        // context on the next restore) or the joiner's own stale/prior context
+        // (which must be brought back via restore/reconnect, NOT re-joined). Either
+        // way, refusing when a snapshot already exists is the correct fail-closed
+        // stance. Run it here — under `bootstrap_spawn_lock` (atomic vs a concurrent
+        // restore) and BEFORE the irreversible `ConfirmConsume` — so a collision
+        // does not even burn the single-use KeyPackage. A storage READ fault is
+        // treated as fail-closed (we cannot prove the id is free, so we refuse).
+        match deps.persistence.load_context(&context_id) {
+            Ok(None) => {}
+            Ok(Some(_)) => {
+                return Err(ContextError::CreationFailed(format!(
+                    "spawn-from-Welcome refused: a durable snapshot already exists for \
+                     '{context_id}' (first-writer-wins) — an existing context must be \
+                     recovered via restore/reconnect, not re-joined; rejecting before \
+                     consuming the single-use KeyPackage"
+                )));
+            }
+            Err(e) => {
+                return Err(ContextError::PersistenceFailed(format!(
+                    "spawn-from-Welcome: cannot verify durable first-writer-wins for \
+                     '{context_id}' (snapshot existence read failed: {e}) — refusing \
+                     fail-closed before consuming the single-use KeyPackage"
+                )));
+            }
+        }
+
+        // ADR-056: the crypto keys under the canonical 32-byte DIGEST.
+        let context_id_bytes = crate::context::state::context_id_to_bytes(&context_id);
+
+        // Bound the whole locked long-running region under `LIFECYCLE_TIMEOUT`,
+        // exactly as the `CreateContext` / `ImportContext` / `RestoreContext`
+        // dispatch arms and `respawn_from_snapshot` bound theirs. This region runs
+        // under the GLOBAL `bootstrap_spawn_lock` and contains an UNBOUNDED wait:
+        // the step-1 `ConfirmConsume` send blocks on MLS processing of
+        // attacker-supplied `welcome_bytes` with NO reply timeout. Without this
+        // bound a slow or crafted Welcome would pin the global lock and wedge every
+        // other bootstrap (create / join / import / restore / respawn) node-wide —
+        // a node-scale bootstrap + crash-recovery DoS. The reversible prechecks
+        // (A–D) above are fast and stay OUTSIDE the bound; nothing has been
+        // consumed or persisted before this point, so an early elapse there is
+        // impossible. On elapse the rollback arm tears down any installed group +
+        // persisted snapshot, then the function returns (dropping
+        // `_bootstrap_guard`), releasing the global lock after at most
+        // `LIFECYCLE_TIMEOUT` instead of forever. The `ConfirmConsume` KP burn is
+        // irreversible: if the elapse lands AFTER the consume the KeyPackage is
+        // already spent (the same accepted cost as a crash), but the rollback still
+        // leaves no half-keyed crypto or orphaned durable snapshot resident.
+        let spawn_outcome: Result<crate::context::ContextHandle, ContextError> =
+            match tokio::time::timeout(
+                Self::LIFECYCLE_TIMEOUT,
+                // `Box::pin` the (large, ~16 KB) join future off the stack —
+                // mirrors the `Box::pin` the create / import / restore dispatch
+                // arms apply to their delegated lifecycle futures.
+                Box::pin(async {
+                    // 1. Fuse the join through the KeyPackage actor: this runs the
+                    //    consumed-init-key-backstopped `join_from_welcome` and durably
+                    //    consumes the single-use KP, returning the joined group. A failed
+                    //    join keeps the reservation intact for retry/cancel (the KP is not
+                    //    burned) and surfaces here as `Err`. From this point the ONLY
+                    //    irreversible cost of a late failure is the burned KeyPackage — every
+                    //    error path below rolls the crypto AND the durable snapshot back.
+                    let joined_group = deps
+                        .key_package_store
+                        .send(|reply| KeyPackageCommand::ConfirmConsume {
+                            reservation_id,
+                            welcome_bytes,
+                            reply,
+                        })
+                        .await?;
+
+                    // The joined group is already at its real ABSOLUTE MLS epoch (a Welcome
+                    // for a creator@0 → add-member Commit group is epoch ≥ 1). Read it BEFORE
+                    // the group moves into `install_joined_group`, so the joiner seeds its
+                    // `EpochState.mls_epoch` to the true group epoch — not a `0` placeholder
+                    // that would stamp wrong epochs into checkpoints / recovery envelopes /
+                    // governance events (bug-catcher F1).
+                    let joined_epoch = joined_group.epoch().map_err(|e| {
+                        ContextError::CryptoFailed(format!(
+                            "spawn-from-Welcome: failed to read the joined group's MLS epoch: {e}"
+                        ))
+                    })?;
+
+                    // 2. Install the joined group into the live crypto provider (Vacant-
+                    //    guarded; refuses to overwrite a live group) + a locally-minted
+                    //    sender key. From here the crypto is resident but the context is
+                    //    NOT yet reachable for send/receive — no actor handle is registered
+                    //    until step 5, so a crash in this window cannot expose a half-keyed
+                    //    live context.
+                    deps.crypto
+                        .install_joined_group(&context_id_bytes, joined_group)?;
+
+                    // 3. Build the Welcome-derived PerContextState. On any failure, roll the
+                    //    just-installed group back so nothing keyed is left resident. (No
+                    //    durable snapshot exists yet, so no `delete_context` is needed here.)
+                    let state = match Self::build_welcome_joiner_state(
+                        &deps,
+                        &context_id,
+                        &params,
+                        &creator_did,
+                        &owning_did,
+                        local_pseudonym,
+                        joined_epoch,
+                    ) {
+                        Ok(state) => state,
+                        Err(e) => {
+                            let _ = deps.crypto.destroy_mls_group(&context_id_bytes);
+                            return Err(e);
+                        }
+                    };
+                    let handle = state.handle.clone();
+
+                    // 3b. Entrypoint-level crypto durability check — BEFORE the persist
+                    //     (BLACK-2J-03 / crypto L2 / simplifier). `build_snapshot_for_persist`
+                    //     is FAIL-OPEN by design for existing members: if `export_crypto_state`
+                    //     errors it persists an EMPTY crypto blob with `needs_reconnect = true`
+                    //     and the persist SUCCEEDS, so an existing member restores and re-enters
+                    //     the §23.11 reconnection pipeline. A Welcome-JOINER cannot
+                    //     reconnect-derive — it would need a fresh Welcome — so a keyless
+                    //     snapshot means a live send-capable actor with NO durable keys. The
+                    //     snapshot's crypto blob is a 1:1 copy of `export_crypto_state`, and the
+                    //     export is DETERMINISTIC between the install above and here (no mutation
+                    //     in between), so re-reading the live export tells us exactly what a
+                    //     snapshot WOULD carry. Check it here, BEFORE persisting: on a
+                    //     non-durable export roll the just-installed group back and return
+                    //     `Err` — nothing has been persisted yet, so there is no durable
+                    //     snapshot to delete (strictly cleaner than persist-then-delete, same
+                    //     fail-closed guarantee).
+                    if !crate::context::messaging_helpers::welcome_snapshot_crypto_is_durable(
+                        &deps.crypto.export_crypto_state(&context_id_bytes),
+                    ) {
+                        let _ = deps.crypto.destroy_mls_group(&context_id_bytes);
+                        return Err(ContextError::PersistenceFailed(format!(
+                            "spawn-from-Welcome: the joined group for '{context_id}' produces no \
+                         durable MLS crypto export (export failed / needs_reconnect) — a \
+                         joiner cannot reconnect-derive, so the spawn fails closed BEFORE \
+                         persisting rather than standing up a keyless send-capable actor"
+                        )));
+                    }
+
+                    // 4. Persist the initial Class-S snapshot FAIL-CLOSED, BEFORE the spawn
+                    //    is acked. The snapshot captures the installed MLS crypto state
+                    //    (`build_snapshot_for_persist` reads `deps.crypto.export_crypto_state`),
+                    //    so a crash after this point rehydrates a fully-keyed context. A
+                    //    persist failure tears the installed group back out AND deletes any
+                    //    partial durable snapshot, then returns `Err` — never a live
+                    //    half-keyed actor and never an orphaned/clobbered durable snapshot.
+                    if let Err(e) = crate::context::messaging_helpers::persist_state_fail_closed(
+                        &state,
+                        &deps,
+                        &context_id,
+                    ) {
+                        let _ = deps.crypto.destroy_mls_group(&context_id_bytes);
+                        let _ = deps.persistence.delete_context(&context_id);
+                        return Err(e);
+                    }
+
+                    // 5. Spawn the owned-state actor + register its send handle. On failure
+                    //    (e.g. a racing duplicate registration) roll the group back AND delete
+                    //    the durable snapshot so no orphaned durable state survives the `Err`.
+                    //    Drop any stale crash-window state for this id FIRST (under
+                    //    `bootstrap_spawn_lock`, mirroring the create / import / standing
+                    //    bootstraps): a previously-poisoned+despawned same-id context must not
+                    //    leave the freshly-spawned joiner actor inheriting a sticky poison
+                    //    window.
+                    self.reset_crash_window(&context_id);
+                    let owned_deps = deps.clone_for_spawn();
+                    if let Err(e) = self.spawn_actor_with_state(state, owned_deps, None).await {
+                        let _ = deps.crypto.destroy_mls_group(&context_id_bytes);
+                        let _ = deps.persistence.delete_context(&context_id);
+                        return Err(e);
+                    }
+
+                    Ok(handle)
+                }),
+            )
+            .await
+            {
+                Ok(inner) => inner,
+                Err(_elapsed) => {
+                    // Timeout elapsed while the global `bootstrap_spawn_lock` was held.
+                    // Roll back exactly as the post-consume error arms do: destroy any
+                    // installed group and delete any persisted snapshot. Both are
+                    // idempotent `let _ =` no-ops when the elapse landed before that
+                    // step ran, so this is safe regardless of how far the timed region
+                    // progressed — no half-keyed crypto or orphaned durable snapshot
+                    // survives. Mirrors the `TransportTimeout` the import / restore /
+                    // respawn bootstraps return on their own `LIFECYCLE_TIMEOUT` elapse.
+                    // The actor is registered only by step 5's
+                    // `spawn_actor_with_state`, which resolves the timed future to
+                    // `Ok(..)` (never `Elapsed`) once it returns, so this arm is reached
+                    // only with NO registered actor for `context_id`.
+                    let _ = deps.crypto.destroy_mls_group(&context_id_bytes);
+                    let _ = deps.persistence.delete_context(&context_id);
+                    Err(ContextError::TransportTimeout(format!(
+                        "spawn-from-Welcome exceeded {:?} budget for context {context_id}",
+                        Self::LIFECYCLE_TIMEOUT
+                    )))
+                }
+            };
+        // Propagate a step-internal error or the timeout error; on success bind the
+        // joiner handle and run the (bounded, local) post-spawn finalization OUTSIDE
+        // the timeout — the actor is now registered, so the elapse rollback above
+        // (which tears the group + snapshot down) must never be able to fire against
+        // a LIVE actor.
+        let handle = spawn_outcome?;
+
+        // Finalization: gauges, governance-timeout tick, TTL timer — the same
+        // post-spawn wiring `finalize_create` installs, reached through the
+        // supervisor registry (the snapshot was already persisted fail-closed
+        // above, so no additional persist is needed here).
+        deps.supervisor.update_context_gauges().await;
+        crate::context::governance_helpers::start_governance_timeout_task(
+            &deps.supervisor,
+            &context_id,
+        )
+        .await;
+        if let Some(duration) = params.ttl {
+            // Joiner anchors the convergent expiry deadline on the same
+            // creator-assigned creation-timestamp basis the creator used
+            // (`anchor_deadline_to_creation = true`).
+            deps.supervisor
+                .dispatch_start_ttl_timer(&context_id, params.clone(), duration, true)
+                .await;
+        }
+
+        Ok(handle)
+    }
+
+    /// Build the Welcome-derived [`PerContextState`](crate::context::actor::state::PerContextState)
+    /// for a joiner (ADR-049 Phase 2J). Mirrors the fresh-context field set that
+    /// [`crate::context::lifecycle_helpers::create_context`] builds, but with the
+    /// caller as a `"member"` and `creator_did` as the context creator/admin.
+    ///
+    /// The MLS crypto (group + sender key) is NOT stored here — it lives in the
+    /// crypto provider (installed by the caller); the actor-state
+    /// `ContextCryptoState` stays in its default (empty) shape, exactly as the
+    /// create path leaves it. The per-member access-key store starts empty: a
+    /// joiner's access key is minted by the inviter with a random key (§9.17.2)
+    /// and delivered out-of-band, not regenerable locally.
+    // Called only from `spawn_actor_from_welcome` (test-only until the FFI
+    // follow-on slice wires the FFI consumer), so it inherits the same dead-code
+    // allowance.
+    #[allow(dead_code)]
+    #[allow(clippy::too_many_lines)]
+    fn build_welcome_joiner_state(
+        deps: &crate::context::actor::deps::ActorDeps,
+        context_id: &str,
+        params: &scp_protocol::context::ContextParams,
+        creator_did: &DID,
+        joiner_did: &DID,
+        local_pseudonym: [u8; 32],
+        joined_epoch: u64,
+    ) -> Result<crate::context::actor::state::PerContextState, ContextError> {
+        use scp_protocol::context::roles::{CapabilityCeiling, ContextRoleState};
+        use std::collections::{HashMap, HashSet, VecDeque};
+
+        // NOTE: the reversible legible-param validations
+        // (`check_version_compatibility` / `validate_governance_model`) are run by
+        // the `spawn_actor_from_welcome` entrypoint BEFORE the irreversible
+        // KeyPackage consume (BLACK-2J-02) — not here, after the group is already
+        // joined and installed.
+
+        let creation_timestamp_secs = deps.clock.now_secs();
+
+        let governance_engine = crate::context::state::create_governance_engine(
+            &params.governance,
+            creator_did,
+            Arc::clone(&deps.key_resolver),
+        )
+        .map_err(|e| ContextError::CreationFailed(e.to_string()))?;
+
+        // Role state: creator is the admin/creator; the joiner is added as a
+        // "member". `system_assign_role` requires the member to be present in
+        // the role state's member set first.
+        let ceiling = CapabilityCeiling::new(params.ceiling.iter().cloned());
+        let mut role_state = ContextRoleState::new(
+            context_id,
+            creator_did.as_ref(),
+            ceiling,
+            vec![],
+            &*deps.clock,
+        )
+        .map_err(|e| ContextError::CreationFailed(e.to_string()))?;
+        role_state.members.insert(joiner_did.as_ref().to_owned());
+        let joiner_tokens = role_state
+            .system_assign_role(joiner_did.as_ref(), "member", &*deps.clock)
+            .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
+
+        // Membership tracking: the admin (creator) and this member (joiner).
+        let mut membership = scp_protocol::context::membership::MembershipState::new();
+        let creator_tokens = role_state
+            .assignments
+            .get(creator_did.as_ref())
+            .map(|a| a.tokens.clone())
+            .unwrap_or_default();
+        membership.add_member(creator_did.clone(), "admin".into(), creator_tokens);
+        membership.add_member(joiner_did.clone(), "member".into(), joiner_tokens);
+
+        let initial_members: HashSet<DID> = membership.members().map(|m| m.did.clone()).collect();
+
+        // Encrypted mode: the live MLS group lives in the crypto provider
+        // (installed by the caller); the actor-state crypto stays default.
+        let mode = crate::context::actor::state::ContextModeState::Encrypted(Box::<
+            crate::context::actor::state::ContextCryptoState,
+        >::default());
+        // §9.10.4: a REAL local pseudonym (the entrypoint rejects `None` before
+        // the consume — see Precheck B), never the `[0u8; 32]` sentinel.
+        let routing =
+            crate::context::actor::state::ContextRouting::for_mode(false, local_pseudonym);
+
+        let per_context = crate::context::actor::state::PerContextState {
+            context_id: crate::context::state::context_id_to_bytes(context_id),
+            created_at: deps.clock.now_secs(),
+            creation_timestamp_secs,
+            generation: 0,
+            handle: crate::context::ContextHandle::new(context_id.to_owned(), params.clone()),
+            membership,
+            members: initial_members.clone(),
+            // Shared fresh-context governance bucket — identical to the create
+            // path (see `state::fresh_governance_state`), so the two cannot drift.
+            governance: crate::context::state::fresh_governance_state(
+                governance_engine,
+                params,
+                initial_members,
+                context_id,
+                Arc::clone(&deps.clock),
+            ),
+            role_state,
+            receive_buffer: scp_protocol::context::membership::ReceiveBuffer::new(),
+            payment_receipts: VecDeque::new(),
+            broadcast_context: None,
+            migration_state: None,
+            epoch: crate::context::state::EpochState {
+                // The ABSOLUTE joined-group MLS epoch (read from the group before
+                // it moved into `install_joined_group`) — a Welcome-joined group
+                // is already at epoch ≥ 1, not 0 (bug-catcher F1).
+                mls_epoch: joined_epoch,
+                coordinator:
+                    scp_protocol::context::governance::mls_integration::EpochCoordinator::new(),
+                grace_store: crate::crypto::mls::epoch_grace::EpochGraceStore::with_clock(
+                    std::sync::Arc::new(scp_primitives::SystemClock),
+                ),
+                needs_reconnect: false,
+            },
+            access: crate::context::state::AccessControlState {
+                read_exclusion_list: HashSet::new(),
+                // A joiner's own access key is random (§9.17.2) and delivered
+                // out-of-band, not regenerable locally — start empty.
+                access_key_store: scp_protocol::crypto::access_keys::AccessKeyStore::new(),
+            },
+            ttl: crate::context::state::TtlState {
+                timer: crate::context::ttl::TtlTimer::with_clock(Arc::clone(&deps.clock)),
+                extension: None,
+            },
+            sequence_tracker: scp_protocol::envelope::SequenceTracker::new(),
+            reorder_buffer: scp_protocol::envelope::ReorderBuffer::default(),
+            pending_commits: VecDeque::new(),
+            commit_fault: None,
+            checkpoint_events_since: 0,
+            checkpoint_last_time_secs: deps.clock.now_secs(),
+            checkpoints: Vec::new(),
+            last_seen_remote_checkpoint: std::collections::HashMap::new(),
+            routing,
+            send_tracker: crate::context::actor::sequence::SendSequenceTracker::new(),
+            recv_tracker: crate::context::actor::state::RecvSequenceTracker::new(),
+            xctx_ucan_proofs: scp_protocol::crypto::ucan::validate::InMemoryProofResolver::new(),
+            class_s: crate::context::actor::state::ClassSState {
+                saga_pending: HashMap::new(),
+                xctx_committed_outputs: HashMap::new(),
+                xctx_committed_invocations: std::collections::HashSet::new(),
+                xctx_caller_reservations: std::collections::HashMap::new(),
+                xctx_nonce_dedup: scp_protocol::crypto::sender_keys::NonceDedup::with_ttl(
+                    crate::context::actor::handlers::saga::SAGA_NONCE_DEDUP_TTL_SECS,
+                ),
+            },
+            pending_broadcast_publishes: HashMap::new(),
+            // Transient join-handshake state; the fused join already consumed
+            // it, so a fresh joiner state carries none.
+            welcome_scratchpad: None,
+            lifecycle_state: crate::context::actor::state::ContextLifecycleState::Open,
+            event_log: None,
+            mode,
+        };
+
+        Ok(per_context)
     }
 
     /// Creates a context from a flat [`ContextConfig`](crate::context::config::ContextConfig)

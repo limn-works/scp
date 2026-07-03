@@ -121,6 +121,10 @@ pub mod saga_prepared_state;
 #[allow(clippy::module_inception)]
 pub mod supervisor;
 
+#[cfg(test)]
+#[path = "spawn_from_welcome_tests.rs"]
+mod spawn_from_welcome_tests;
+
 pub use handle::SupervisorHandle;
 pub use key_package_actor::{
     KP_MAILBOX_CAPACITY, KP_SEND_TIMEOUT, KeyPackageCommand, KeyPackageStoreActor,
@@ -142,5 +146,5 @@ pub use supervisor::SagaSetReservation;
 pub use supervisor::{
     ACTOR_MAILBOX_CAPACITY, CrashWindow, CrossContextToolInvocationRequest, DurableProviders,
     MessageSigner, RestoredContexts, SagaAbortReason, SagaDivergenceRepairRecord, SagaError,
-    SagaInput, SagaOutput, SagaSigningKeys, Supervisor, SupervisorConfig,
+    SagaInput, SagaOutput, SagaSigningKeys, Supervisor, SupervisorConfig, WelcomeJoinRequest,
 };
