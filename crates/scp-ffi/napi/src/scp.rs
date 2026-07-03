@@ -32,8 +32,8 @@ use scp_primitives::Clock as _;
 use napi::bindgen_prelude::Buffer;
 
 use crate::context::{
-    NapiAssetEntry, NapiBatchPublishResult, NapiContextHandle, NapiEvaluationResult, NapiMessage,
-    NapiPublishResult,
+    NapiAssetEntry, NapiBatchPublishResult, NapiContextHandle, NapiEvaluationResult,
+    NapiKeyPackageReservation, NapiMessage, NapiPublishResult,
 };
 use crate::error::{ScpNapiError, validate_custody_type};
 use crate::event_log::{NapiCheckpoint, NapiEvent, NapiProof};
@@ -2060,6 +2060,53 @@ impl Scp {
     ) -> napi::Result<NapiContextHandle> {
         crate::napi_check_handle!(&self.inner.core, identity);
         crate::context::context_create_on(&self.inner, identity, params_json).await
+    }
+
+    /// Reserves a pooled MLS `KeyPackage` under the owning identity for a
+    /// spawn-from-Welcome join (ADR-049 Phase 2J).
+    ///
+    /// Returns the opaque `{ reservationId, keyPackagePublic }` pair: the PUBLIC
+    /// bytes are handed (out of band) to the context creator, who mints a
+    /// Welcome addressed to this reservation; the `reservationId` is passed back
+    /// to `contextJoinFromWelcome`. The joiner's private signer state never
+    /// leaves the node. `owningDid` MUST be a locally-custodied identity.
+    #[napi(js_name = "reserveKeyPackage")]
+    pub async fn reserve_key_package(
+        &self,
+        owning_did: String,
+    ) -> napi::Result<NapiKeyPackageReservation> {
+        crate::context::reserve_key_package_on(&self.inner, owning_did).await
+    }
+
+    /// Joins an existing SCP context by processing a received MLS Welcome,
+    /// standing the local (joiner) identity up as a send-capable participant
+    /// (ADR-049 Phase 2J).
+    ///
+    /// Completes the reserve → Welcome → join handshake begun by
+    /// `reserveKeyPackage`. The joiner's §9.10.4 routing pseudonym is DERIVED
+    /// from its locally-custodied identity (never caller-supplied); a
+    /// non-custodied joiner hard-fails before the single-use `KeyPackage` is
+    /// consumed. Returns an active [`NapiContextHandle`] for the joined context.
+    #[napi(js_name = "contextJoinFromWelcome")]
+    pub async fn context_join_from_welcome(
+        &self,
+        owning_did: String,
+        creator_did: String,
+        context_id: String,
+        params_json: String,
+        reservation_id: String,
+        welcome_bytes: Vec<u8>,
+    ) -> napi::Result<NapiContextHandle> {
+        crate::context::context_join_from_welcome_on(
+            &self.inner,
+            owning_did,
+            creator_did,
+            context_id,
+            params_json,
+            reservation_id,
+            welcome_bytes,
+        )
+        .await
     }
 
     /// Per-instance equivalent of the free-function `context_join`.

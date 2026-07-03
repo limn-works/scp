@@ -1533,30 +1533,27 @@ pub(crate) fn ucan_registry(bi: &NapiBridgeInstance) -> &DashMap<String, UcanCon
     bi.ucan_registry.as_ref()
 }
 
-/// Ensures UCAN validation state is registered for a context on the given
-/// bridge instance.
+/// Builds a fresh [`UcanContextState`] for a context, validating the caller's
+/// ceiling entries (§5.3.1.1) before normalizing them into the UCAN ceiling
+/// string set.
 ///
-/// If the context is already registered, this is a no-op. Otherwise, creates
-/// UCAN state from the `NapiContextHandle` metadata.
+/// Shared by [`ensure_registered`] (lazy, idempotent — the UCAN-op path) and
+/// [`register_ffi_state`] (eager, fail-closed — the Welcome-join path) so the
+/// two cannot drift in how they construct per-context FFI state. Mirrors the
+/// `PyO3` reference bridge's `register_ffi_state` state-building: the role state
+/// is seeded from `default_ceiling()` with `creator_did` as admin, and the
+/// caller ceiling drives only the UCAN `ceiling_strings`.
 ///
 /// # Errors
 ///
-/// Returns `ScpNapiError::Context` if the context state cannot be determined.
-pub fn ensure_registered(
-    bi: &NapiBridgeInstance,
-    handle: &NapiContextHandle,
-) -> Result<(), ScpNapiError> {
-    let context_id = handle.context_id();
-    let map = ucan_registry(bi);
-
-    if map.contains_key(&context_id) {
-        return Ok(());
-    }
-
-    let creator_did = handle.creator_did();
-    let handle_ceiling = handle.ceiling();
-
-    let ceiling_strings = if handle_ceiling.is_empty() {
+/// Returns `ScpNapiError::Validation` if a ceiling entry violates the §5.3.1.1
+/// grammar, or `ScpNapiError::Context` if role-state construction fails.
+fn build_ucan_context_state(
+    context_id: &str,
+    creator_did: &str,
+    user_ceiling: &[String],
+) -> Result<UcanContextState, ScpNapiError> {
+    let ceiling_strings = if user_ceiling.is_empty() {
         scp_core::context::roles::default_ceiling()
             .iter()
             .map(scp_core::context::roles::Capability::ucan_capability_name)
@@ -1574,7 +1571,7 @@ pub fn ensure_registered(
         // parsed enum keeps the raw-string validation and the enforced parse in
         // agreement on one canonical form (BLACK-003), and still rejects a
         // no-colon `payments` that would otherwise be widened to `payments:*`.
-        for entry in &handle_ceiling {
+        for entry in user_ceiling {
             scp_core::context::roles::Capability::new(entry)
                 .validate_as_ceiling_entry()
                 .map_err(|e| ScpNapiError::Validation {
@@ -1582,47 +1579,104 @@ pub fn ensure_registered(
                     code: codes::VALID_7000.to_owned(),
                 })?;
         }
-        handle_ceiling
-            .into_iter()
-            .map(|s| scp_core::context::roles::Capability::new(&s).ucan_capability_name())
+        user_ceiling
+            .iter()
+            .map(|s| scp_core::context::roles::Capability::new(s).ucan_capability_name())
             .collect::<HashSet<String>>()
     };
 
-    let event_log = EventLog::new(context_id.clone());
-    let revocation_list = RevocationList::new(context_id.clone());
-    let nonce_tracker = NonceTracker::new(context_id.clone(), SystemClock);
-
-    // No custom roles and default ceiling cannot fail validation.
-    let role_state = match ContextRoleState::new(
-        context_id.clone(),
-        creator_did.clone(),
+    // Default ceiling + no custom roles cannot fail validation in practice; the
+    // fallible path is preserved for parity with the shared constructor.
+    let role_state = ContextRoleState::new(
+        context_id,
+        creator_did,
         default_ceiling(),
         Vec::new(),
         &SystemClock,
-    ) {
-        Ok(rs) => rs,
-        Err(e) => {
-            return Err(ScpNapiError::Context {
-                message: format!("failed to create role state: {e}"),
-                code: codes::CTX_2023.to_owned(),
-            });
-        }
-    };
+    )
+    .map_err(|e| ScpNapiError::Context {
+        message: format!("failed to create role state: {e}"),
+        code: codes::CTX_2023.to_owned(),
+    })?;
 
-    let state = UcanContextState {
+    Ok(UcanContextState {
         core: scp_ffi_common::bridge_runtime::UcanContextStateCore {
-            revocation_list,
-            nonce_tracker,
+            revocation_list: RevocationList::new(context_id.to_owned()),
+            nonce_tracker: NonceTracker::new(context_id.to_owned(), SystemClock),
             ceiling_strings,
-            creator_did,
-            event_log,
+            creator_did: creator_did.to_owned(),
+            event_log: EventLog::new(context_id.to_owned()),
         },
         role_state,
         tool_registry: ToolRegistry::new(),
         tool_handlers: HashMap::new(),
         session_store: SessionStore::new(),
-    };
+    })
+}
 
+/// Eagerly registers per-context FFI (UCAN validation) state for a
+/// Welcome-join, failing CLOSED on a pre-existing entry.
+///
+/// The join-side analog of the `PyO3` reference bridge's `register_ffi_state`:
+/// [`crate::context::context_join_from_welcome_on`] calls this as a REVERSIBLE
+/// precheck BEFORE the irreversible `Supervisor::spawn_actor_from_welcome`.
+/// Unlike [`ensure_registered`] (idempotent `or_insert` for the lazy UCAN-op
+/// path), an already-registered context is a HARD error here: the collision
+/// fails the join at this precheck — BEFORE the single-use `KeyPackage` is
+/// consumed — and leaves the pre-existing entry untouched (the bridge must
+/// never roll back state it did not create).
+///
+/// `creator_did` becomes the role-state admin; the joiner is inserted as a
+/// member by the caller via [`with_context`] immediately after, so a
+/// member-insert failure can roll this back.
+///
+/// # Errors
+///
+/// Returns `ScpNapiError::Context` if the context's FFI state is already
+/// registered, plus the errors of [`build_ucan_context_state`].
+pub fn register_ffi_state(
+    bi: &NapiBridgeInstance,
+    context_id: &str,
+    creator_did: &str,
+    user_ceiling: &[String],
+) -> Result<(), ScpNapiError> {
+    use dashmap::mapref::entry::Entry;
+
+    match ucan_registry(bi).entry(context_id.to_owned()) {
+        Entry::Occupied(_) => Err(ScpNapiError::Context {
+            message: format!("context '{context_id}' FFI state is already registered"),
+            code: codes::CTX_2023.to_owned(),
+        }),
+        Entry::Vacant(vacant) => {
+            let state = build_ucan_context_state(context_id, creator_did, user_ceiling)?;
+            vacant.insert(state);
+            Ok(())
+        }
+    }
+}
+
+/// Ensures UCAN validation state is registered for a context on the given
+/// bridge instance.
+///
+/// If the context is already registered, this is a no-op. Otherwise, creates
+/// UCAN state from the `NapiContextHandle` metadata via
+/// [`build_ucan_context_state`].
+///
+/// # Errors
+///
+/// Returns `ScpNapiError::Context` if the context state cannot be determined.
+pub fn ensure_registered(
+    bi: &NapiBridgeInstance,
+    handle: &NapiContextHandle,
+) -> Result<(), ScpNapiError> {
+    let context_id = handle.context_id();
+    let map = ucan_registry(bi);
+
+    if map.contains_key(&context_id) {
+        return Ok(());
+    }
+
+    let state = build_ucan_context_state(&context_id, &handle.creator_did(), &handle.ceiling())?;
     map.entry(context_id).or_insert(state);
     Ok(())
 }

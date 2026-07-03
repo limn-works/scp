@@ -517,23 +517,48 @@ async fn announce_pseudonym_best_effort(
 }
 
 // ---------------------------------------------------------------------------
-// Bridge functions — context lifecycle (delegated to ContextManager)
+// Shared context-params parsing (create + Welcome-join)
 // ---------------------------------------------------------------------------
 
-/// Per-bridge-instance implementation of `context_create`.
+/// Legible context parameters parsed from the JSON surface, in both the core
+/// [`ContextParams`](scp_core::context::ContextParams) form (for the runtime)
+/// and the raw handle-metadata fields (for building [`NapiContextHandle`]).
 ///
-/// Takes an `Arc<NapiBridgeInstance>` so the returned handle can retain a
-/// clone for subsequent bridge-scoped operations (e.g. `memberCount`
-/// getter) without depending on the process-global default bridge.
-pub(crate) async fn context_create_on(
-    bi: &Arc<NapiBridgeInstance>,
-    identity: &NapiIdentity,
-    params_json: String,
-) -> napi::Result<NapiContextHandle> {
-    crate::napi_check_handle!(&bi.core, identity);
-    validate_did(&identity.inner.did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+/// Shared by [`context_create_on`] and [`context_join_from_welcome_on`] so the
+/// two entry points parse the identical param grammar — mirroring the `PyO3`
+/// reference bridge, whose `context_create` and `context_join_from_welcome`
+/// both route through `PyContextParams::from_py_dict` + `build_core_context_params`.
+struct ParsedContextParams {
+    /// The runtime [`ContextParams`](scp_core::context::ContextParams).
+    core: scp_core::context::ContextParams,
+    /// Raw mode string (`"Encrypted"` / `"Broadcast"`) for the handle.
+    mode: String,
+    /// Raw ceiling entries for the handle (normalized to UCAN names on build).
+    ceiling: Vec<String>,
+    /// Ceiling policy string for the handle.
+    ceiling_policy: String,
+    /// Optional TTL seconds for the handle.
+    ttl_seconds: Option<u64>,
+    /// Optional promotion policy for the handle.
+    promotion_policy: Option<String>,
+    /// Governance model string for the handle.
+    governance: String,
+    /// Optional economic policy string for the handle.
+    economic_policy: Option<String>,
+}
 
-    let params: serde_json::Value = serde_json::from_str(&params_json).map_err(|e| {
+/// Parses the JSON context-parameters surface into a [`ParsedContextParams`].
+///
+/// Delegates all validation and `ContextParams` construction to the shared
+/// `scp-ffi-common` builder (#1447) — the single source of truth across all
+/// bridges.
+///
+/// # Errors
+///
+/// Returns `ScpNapiError::Validation` (`SCP-VALID-7000`) if the JSON is
+/// malformed or the parameters fail the common builder's validation.
+fn parse_context_params(params_json: &str) -> napi::Result<ParsedContextParams> {
+    let params: serde_json::Value = serde_json::from_str(params_json).map_err(|e| {
         NapiError::from(ScpNapiError::Validation {
             message: format!(
                 "params_json is not valid JSON: {e} — pass a JSON-encoded context parameters object"
@@ -562,21 +587,6 @@ pub(crate) async fn context_create_on(
         .unwrap_or("single_admin")
         .to_owned();
     let economic_policy = params["economicPolicy"].as_str().map(str::to_owned);
-
-    // Extract key custody and signing key from the identity handle.
-    let in_memory_custody = identity.inner.in_memory_custody.clone();
-    let signing_key = identity
-        .inner
-        .scp_identity
-        .as_ref()
-        .map(|id| id.active_signing_key);
-
-    // Spec §18.4.1: context IDs MUST be 64-char lowercase hex so they
-    // embed in `scp://context/<context_id_hex>` URIs. The shared helper
-    // in `scp-ffi-common` is the single source of truth for all three
-    // bridges — see ADR-048 §7a.
-    let context_id = scp_ffi_common::generate_context_id();
-    let creator_did = identity.inner.did.clone();
 
     // Parse consequence_rules from params (ADR-017, #1531). Accepts either a
     // JSON array (preferred) or a JSON-encoded string for legacy callers.
@@ -649,13 +659,61 @@ pub(crate) async fn context_create_on(
         ..Default::default()
     };
 
-    let context_params =
-        scp_ffi_common::context_params::build_context_params(&common).map_err(|e| {
-            NapiError::from(ScpNapiError::Validation {
-                message: e,
-                code: codes::VALID_7000.to_owned(),
-            })
-        })?;
+    let core = scp_ffi_common::context_params::build_context_params(&common).map_err(|e| {
+        NapiError::from(ScpNapiError::Validation {
+            message: e,
+            code: codes::VALID_7000.to_owned(),
+        })
+    })?;
+
+    Ok(ParsedContextParams {
+        core,
+        mode: mode_str,
+        ceiling,
+        ceiling_policy,
+        ttl_seconds,
+        promotion_policy,
+        governance,
+        economic_policy,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Bridge functions — context lifecycle (delegated to ContextManager)
+// ---------------------------------------------------------------------------
+
+/// Per-bridge-instance implementation of `context_create`.
+///
+/// Takes an `Arc<NapiBridgeInstance>` so the returned handle can retain a
+/// clone for subsequent bridge-scoped operations (e.g. `memberCount`
+/// getter) without depending on the process-global default bridge.
+pub(crate) async fn context_create_on(
+    bi: &Arc<NapiBridgeInstance>,
+    identity: &NapiIdentity,
+    params_json: String,
+) -> napi::Result<NapiContextHandle> {
+    crate::napi_check_handle!(&bi.core, identity);
+    validate_did(&identity.inner.did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+
+    // Parse the legible params once via the shared helper (also used by the
+    // Welcome-join path) so the two entry points cannot drift.
+    let parsed = parse_context_params(&params_json)?;
+    let context_params = parsed.core;
+
+    // Extract key custody and signing key from the identity handle.
+    let in_memory_custody = identity.inner.in_memory_custody.clone();
+    let signing_key = identity
+        .inner
+        .scp_identity
+        .as_ref()
+        .map(|id| id.active_signing_key);
+
+    // Spec §18.4.1: context IDs MUST be 64-char lowercase hex so they
+    // embed in `scp://context/<context_id_hex>` URIs. The shared helper
+    // in `scp-ffi-common` is the single source of truth for all three
+    // bridges — see ADR-048 §7a.
+    let context_id = scp_ffi_common::generate_context_id();
+    let creator_did = identity.inner.did.clone();
 
     // Initialize the Supervisor if not already done (first context_create call).
     // Passes the creator DID to MlsCryptoProvider for real MLS encryption (#1294).
@@ -740,16 +798,17 @@ pub(crate) async fn context_create_on(
         context_id,
         state: std::sync::Mutex::new(ContextState::Active),
         creator_did,
-        mode: mode_str,
-        ceiling: ceiling
+        mode: parsed.mode,
+        ceiling: parsed
+            .ceiling
             .iter()
             .map(|s| scp_core::context::roles::Capability::new(s).ucan_capability_name())
             .collect(),
-        ceiling_policy,
-        ttl_seconds,
-        promotion_policy,
-        governance,
-        economic_policy,
+        ceiling_policy: parsed.ceiling_policy,
+        ttl_seconds: parsed.ttl_seconds,
+        promotion_policy: parsed.promotion_policy,
+        governance: parsed.governance,
+        economic_policy: parsed.economic_policy,
         in_memory_custody,
         signing_key,
         core_handle: Some(core_handle),
@@ -882,6 +941,262 @@ pub(crate) async fn context_join_on(
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// spawn-from-Welcome join (ADR-049 Phase 2J)
+// ---------------------------------------------------------------------------
+
+/// The opaque `(reservation_id, key_package_public)` pair returned by
+/// [`reserve_key_package_on`].
+///
+/// The private signer state never leaves the node's `KeyPackage` actor — only
+/// PUBLIC bytes cross the FFI boundary. Mirrors the `PyO3` reference bridge's
+/// `(str, bytes)` return, surfaced here as a flat named-field object (napi
+/// idiom) rather than a positional tuple.
+#[napi(object)]
+pub struct NapiKeyPackageReservation {
+    /// Opaque reservation id — a lookup key, not a capability. Pass back to
+    /// [`context_join_from_welcome_on`] for the Welcome this `KeyPackage`
+    /// addresses.
+    pub reservation_id: String,
+    /// The PUBLIC MLS `KeyPackage` bytes to hand (out of band) to the context
+    /// creator, who adds them to its MLS group to mint the addressed Welcome.
+    pub key_package_public: Vec<u8>,
+}
+
+/// Bridge-level local-custody gate for the bare-`DID` join-side bootstraps
+/// ([`reserve_key_package_on`] / [`context_join_from_welcome_on`]), mirroring
+/// the `PyO3` reference bridge's `ensure_local_custody` and the trust model of
+/// `context_create`: a node-level bootstrap only runs on behalf of an identity
+/// this bridge locally custodies.
+///
+/// Presence in the identity registry is exactly the local-custody signal — the
+/// Welcome-join path enforces the identical gate implicitly via
+/// [`derive_member_pseudonym_required`], but reserve derives no pseudonym, so it
+/// needs this explicit up-front check. Fails closed with the identity-not-found
+/// error (`SCP-IDENT-1001`) when the DID is not a locally-custodied identity.
+fn ensure_local_custody(bi: &NapiBridgeInstance, did: &str) -> napi::Result<()> {
+    crate::runtime::with_identity(bi, did, |_| Ok(())).map_err(NapiError::from)
+}
+
+/// Per-bridge-instance implementation of `reserve_key_package`.
+///
+/// Reserves one of the owning identity's pooled MLS `KeyPackage`s for a
+/// spawn-from-Welcome join. The join-side peer of [`context_create_on`]: a node
+/// that intends to JOIN by receiving a Welcome first reserves a single-use
+/// `KeyPackage` under its own identity; the returned PUBLIC bytes are handed to
+/// the context creator (out of band) and the `reservation_id` is passed back to
+/// [`context_join_from_welcome_on`].
+///
+/// Local-identity custody is enforced at the bridge (the same trust model as
+/// `context_create`): `owning_did` MUST be a locally-custodied identity.
+pub(crate) async fn reserve_key_package_on(
+    bi: &NapiBridgeInstance,
+    owning_did: String,
+) -> napi::Result<NapiKeyPackageReservation> {
+    validate_did(&owning_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+    // Local-custody gate — same trust model as context_create.
+    ensure_local_custody(bi, &owning_did)?;
+
+    // reserve may be a node's FIRST context op (it joins before it ever
+    // creates), so attach the supervisor first — the same idempotent init the
+    // join performs (OnceLock, first-call-wins).
+    crate::runtime::init_supervisor(bi, &owning_did);
+
+    let sup = crate::runtime::supervisor(bi)?;
+    let sup = Arc::clone(sup);
+    let (reservation_id, kp_public) =
+        sup.reserve_key_package(DID(owning_did))
+            .await
+            .map_err(|e| {
+                NapiError::from(ScpNapiError::Context {
+                    message: format!("reserve_key_package failed: {e}"),
+                    code: codes::CTX_2000.to_owned(),
+                })
+            })?;
+
+    Ok(NapiKeyPackageReservation {
+        reservation_id: reservation_id.to_string(),
+        key_package_public: kp_public,
+    })
+}
+
+/// Per-bridge-instance implementation of `context_join_from_welcome`.
+///
+/// Completes the reserve → Welcome → join handshake begun by
+/// [`reserve_key_package_on`]: given the Welcome the context creator minted for
+/// a previously-reserved `KeyPackage`, this installs the joined MLS group,
+/// derives the joiner's §9.10.4 routing pseudonym, persists the initial keyed
+/// snapshot fail-closed, registers a context actor, and records the joined
+/// context in the known-contexts discovery registry. Without it a
+/// Welcome-joined node can DECRYPT but cannot SEND (no actor-backed handle).
+///
+/// Ordering discipline mirrors the `PyO3` reference bridge exactly: validate →
+/// derive pseudonym via custody (hard-fail a non-custodied joiner BEFORE any
+/// effect; never caller-supplied) → parse the reservation id (transparent serde
+/// round-trip, before any registry mutation) → register FFI state REVERSIBLY
+/// (Occupied fails closed pre-consume; member-insert failure rolls back) →
+/// irreversible `spawn_actor_from_welcome` (on `Err`: `remove_context`
+/// rollback) → post-commit infallible known-context discovery registration.
+pub(crate) async fn context_join_from_welcome_on(
+    bi: &Arc<NapiBridgeInstance>,
+    owning_did: String,
+    creator_did: String,
+    context_id: String,
+    params_json: String,
+    reservation_id: String,
+    welcome_bytes: Vec<u8>,
+) -> napi::Result<NapiContextHandle> {
+    validate_did(&owning_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+    validate_did(&creator_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+    scp_ffi_common::validate::validate_context_id(&context_id)
+        .map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+
+    // Parse legible params eagerly (before any async work), via the shared
+    // helper `context_create_on` also uses.
+    let parsed = parse_context_params(&params_json)?;
+
+    // spawn-from-Welcome always stands up an ENCRYPTED context; ensure the
+    // node's supervisor is attached first (may be the joiner's first context op
+    // — the same idempotent init the join performs).
+    crate::runtime::init_supervisor(bi, &owning_did);
+
+    // §9.10.4 + local-custody enforcement: DERIVE the joiner's routing pseudonym
+    // from its locally-custodied identity — never caller-supplied. This is the
+    // SAME custody gate context_create uses; a non-custodied joiner hard-fails
+    // here with SCP-IDENT-1054 BEFORE the single-use KeyPackage is consumed.
+    let local_pseudonym = derive_member_pseudonym_required(bi, &owning_did, &context_id).await?;
+
+    // Reconstruct the opaque reservation id via its sanctioned transparent serde
+    // form (a bare string). It is a lookup key, not a capability — a bogus id
+    // simply fails the fused consume match downstream, it grants nothing. Parsed
+    // BEFORE any registry mutation so a malformed id can't leave orphaned state.
+    let reservation: scp_core::context::supervisor::ReservationId =
+        serde_json::from_value(serde_json::Value::String(reservation_id)).map_err(|e| {
+            NapiError::from(ScpNapiError::Context {
+                message: format!("invalid reservation id: {e}"),
+                code: codes::CTX_2000.to_owned(),
+            })
+        })?;
+
+    // Register the bridge-side FFI state (UCAN validation state) as a REVERSIBLE
+    // precheck BEFORE the irreversible runtime join. Mirrors the PyO3 reference,
+    // which registers FFI state first and rolls it back if the runtime step
+    // fails. `register_ffi_state` hard-errors on an already-registered context
+    // (Occupied) — that collision fails the join HERE, BEFORE
+    // `spawn_actor_from_welcome` consumes the single-use KeyPackage, and leaves
+    // any pre-existing entry untouched (never roll back state we did not create).
+    crate::runtime::register_ffi_state(bi, &context_id, &creator_did, &parsed.ceiling)
+        .map_err(NapiError::from)?;
+    // Insert the joiner as a member of the freshly-registered role state. On the
+    // (practically unreachable) failure of this insert into state we just
+    // created, roll it back so a failed join leaves nothing behind.
+    if let Err(e) = crate::runtime::with_context(bi, &context_id, |st| {
+        st.role_state.members.insert(owning_did.clone());
+        Ok(())
+    }) {
+        crate::runtime::remove_context(bi, &context_id);
+        return Err(NapiError::from(e));
+    }
+
+    let sup = crate::runtime::supervisor(bi)?;
+    let sup = Arc::clone(sup);
+    let req = scp_core::context::supervisor::WelcomeJoinRequest {
+        creator_did: DID(creator_did.clone()),
+        context_id: context_id.clone(),
+        params: parsed.core,
+        reservation_id: reservation,
+        welcome_bytes,
+        local_pseudonym: Some(local_pseudonym),
+    };
+    // Irreversible: consume the KeyPackage, install the joined MLS group, persist
+    // the keyed snapshot, register the context actor. On failure, roll the
+    // reversible FFI state (and — via `remove_context` → `remove_known_context`
+    // — any known-context discovery entry) back so an errored join leaves no
+    // orphaned bridge state beside a runtime that never committed.
+    let core_handle = match sup
+        .spawn_actor_from_welcome(DID(owning_did.clone()), req)
+        .await
+    {
+        Ok(handle) => handle,
+        Err(e) => {
+            crate::runtime::remove_context(bi, &context_id);
+            return Err(NapiError::from(ScpNapiError::Context {
+                message: format!("context_join_from_welcome failed: {e}"),
+                code: codes::CTX_2013.to_owned(),
+            }));
+        }
+    };
+
+    // Runtime join committed. Register the context in the known-contexts
+    // discovery registry so a Welcome-joined context is surfaced by discovery,
+    // exactly as `context_create` peers do post-create. Infallible and
+    // idempotent (overwrites), so it is safe after the irreversible commit and
+    // needs no rollback. The routing id is the joiner's derived §9.10.4
+    // pseudonym (`local_pseudonym` is `Copy`, still valid after the request
+    // move); the member is the JOINER, matching the role-state member inserted
+    // above.
+    //
+    // The relay URL comes from the handleless transport probe. On the NAPI
+    // bridge the relay URL lives on a `NapiTransportManager` handle, not on the
+    // bridge instance, and the bare-DID join receives no such handle — so the
+    // honest value here is `None` (never a fabricated URL). Peers refresh
+    // `last_seen`/relay on subsequent activity.
+    let relay_url = match crate::transport::transport_status_on(bi, None).await {
+        Ok(status) => status.relay_url,
+        Err(e) => {
+            tracing::warn!("failed to query transport status during join registration: {e}");
+            None
+        }
+    };
+    bi.core.register_known_context(
+        &context_id,
+        scp_ffi_common::bridge_instance::KnownContext {
+            routing_id: local_pseudonym,
+            relay_url,
+            member_did: owning_did.clone(),
+            last_seen: scp_primitives::SystemClock.now_secs(),
+        },
+    );
+
+    // Resolve the joiner's retained custody + signing key so the returned handle
+    // can sign subsequent context ops (send / export). The custody gate above
+    // already proved the joiner is locally custodied, so this lookup succeeds.
+    let (in_memory_custody, signing_key) =
+        crate::runtime::with_identity(bi, &owning_did, |entry| {
+            Ok((
+                Some(entry.custody.clone()),
+                Some(entry.identity.active_signing_key),
+            ))
+        })
+        .map_err(NapiError::from)?;
+
+    let handle = NapiContextHandle {
+        context_id,
+        state: std::sync::Mutex::new(ContextState::Active),
+        creator_did,
+        mode: parsed.mode,
+        ceiling: parsed
+            .ceiling
+            .iter()
+            .map(|s| scp_core::context::roles::Capability::new(s).ucan_capability_name())
+            .collect(),
+        ceiling_policy: parsed.ceiling_policy,
+        ttl_seconds: parsed.ttl_seconds,
+        promotion_policy: parsed.promotion_policy,
+        governance: parsed.governance,
+        economic_policy: parsed.economic_policy,
+        in_memory_custody,
+        signing_key,
+        core_handle: Some(core_handle),
+        subscription_cancel: std::sync::Mutex::new(CancellationToken::new()),
+        subscription_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        bi: Arc::clone(bi),
+        instance_id: bi.instance_id(),
+    };
+    increment_handle_count();
+    Ok(handle)
 }
 
 /// Per-bridge-instance implementation of [`context_leave`].
@@ -4760,6 +5075,205 @@ mod tests {
         };
         sup.dispatch_lifecycle_command(cmd).await.unwrap();
         rx.await.unwrap().unwrap();
+    }
+
+    /// Test helper: create a REAL in-memory identity and register it in the
+    /// bridge's identity registry, returning its DID. Mirrors the
+    /// `build_scp_with_identity` pattern in `scp.rs` tests — a joiner whose
+    /// locally-custodied identity makes the §9.10.4 pseudonym-derivation custody
+    /// gate SUCCEED, so a Welcome-join test reaches the register -> spawn seam.
+    #[cfg(feature = "allow_in_memory_custody")]
+    async fn register_in_memory_joiner(bi: &crate::runtime::NapiBridgeInstance) -> String {
+        use crate::identity::OpaqueInMemoryKeyCustody;
+        use scp_identity::DidMethod;
+        use scp_platform::testing::{InMemoryKeyCustody, InMemoryPreRotationCustody};
+
+        let custody = Arc::new(crate::custody::NapiKeyCustody::InMemory(
+            OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()),
+        ));
+        let pre_rotation_custody = Arc::new(InMemoryPreRotationCustody::new());
+        let dht = scp_identity::DidDht::new();
+        let (identity, document, pre_rotation_handle) = dht
+            .create(&*custody, pre_rotation_custody.as_ref())
+            .await
+            .expect("in-memory identity creation succeeds");
+        let did = identity.did.clone();
+        crate::runtime::register_identity(
+            bi,
+            &did,
+            crate::runtime::NapiIdentityEntry {
+                identity,
+                custody,
+                document,
+                identity_link_attestations: Vec::new(),
+                pre_rotation_handle,
+                pre_rotation_custody,
+            },
+        );
+        did
+    }
+
+    /// ADR-049 Phase 2J: `reserve_key_package` enforces local custody of the
+    /// owning identity at the bridge (the same trust model as `context_create`).
+    /// A non-locally-custodied `owning_did` fails closed at the
+    /// `ensure_local_custody` gate with the identity-not-registered error
+    /// (`SCP-IDENT-1001`), BEFORE any supervisor/KeyPackage work.
+    ///
+    /// The end-to-end reserve -> spawn happy path (which needs wired MLS
+    /// providers and a real creator-minted Welcome) is covered at the runtime
+    /// layer and by the cross-bridge E2E harness.
+    #[cfg(feature = "allow_in_memory_custody")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reserve_key_package_rejects_non_locally_custodied_identity() {
+        let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
+        let Err(err) =
+            super::reserve_key_package_on(&bi, "did:dht:z6MkNoSuchNapiReserve".to_owned()).await
+        else {
+            panic!("reserve for a non-locally-custodied identity must be rejected");
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains(codes::IDENT_1001),
+            "expected local-custody rejection {}, got: {msg}",
+            codes::IDENT_1001
+        );
+    }
+
+    /// ADR-049 Phase 2J: `context_join_from_welcome` enforces local custody of
+    /// the JOINER at the bridge — a non-locally-custodied `owning_did`
+    /// hard-fails at the pseudonym-derivation seam (the SAME custody gate
+    /// `context_create` uses) BEFORE the single-use `KeyPackage` is consumed.
+    ///
+    /// Drives the REAL entry point with an unregistered joiner. Because the
+    /// joiner's routing pseudonym is DERIVED from its locally-custodied identity
+    /// (never caller-supplied), the registry miss surfaces as the canonical
+    /// `SCP-IDENT-1054`. The `reservation_id` and `welcome_bytes` are dummies —
+    /// derivation runs before either is touched, so this is not false-green: were
+    /// the custody gate removed, the call would proceed past derivation and fail
+    /// later for an unrelated reason, not with `SCP-IDENT-1054`.
+    #[cfg(feature = "allow_in_memory_custody")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn context_join_from_welcome_rejects_non_locally_custodied_joiner() {
+        let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
+        let Err(err) = super::context_join_from_welcome_on(
+            &bi,
+            "did:dht:z6MkNoSuchNapiJoinFromWelcome".to_owned(),
+            "did:dht:z6MkSomeNapiCreator".to_owned(),
+            "0".repeat(64),
+            r#"{"mode":"encrypted"}"#.to_owned(),
+            "not-a-real-reservation".to_owned(),
+            b"not-a-real-welcome".to_vec(),
+        )
+        .await
+        else {
+            panic!("join-from-Welcome for a non-locally-custodied joiner must be rejected");
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains(codes::IDENT_1054),
+            "expected joiner local-custody hard-fail {}, got: {msg}",
+            codes::IDENT_1054
+        );
+    }
+
+    /// ADR-049 Phase 2J (orphaned-success fix): `context_join_from_welcome`
+    /// registers the bridge-side FFI state as a REVERSIBLE precheck BEFORE the
+    /// irreversible runtime join, and ROLLS IT BACK when the runtime join fails —
+    /// so a failed join leaves NO FFI state and NO known-context discovery entry.
+    ///
+    /// Drives the REAL entry point with a locally-custodied joiner, so the
+    /// custody / pseudonym-derivation gate SUCCEEDS and control reaches the
+    /// register -> spawn seam, but with a bogus reservation + Welcome so
+    /// `spawn_actor_from_welcome` fails at the runtime layer (the joiner reserved
+    /// nothing). The assertion is on the observable post-condition: after the
+    /// error, BOTH the UCAN-state registry and the known-contexts registry are
+    /// empty for the context. The explicit "no `SCP-IDENT-1054`" check pins that
+    /// the register -> spawn seam was actually exercised (not short-circuited at
+    /// the upstream custody gate).
+    #[cfg(feature = "allow_in_memory_custody")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn join_from_welcome_rolls_back_ffi_state_when_runtime_join_fails() {
+        let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
+        let joiner_did = register_in_memory_joiner(&bi).await;
+        let ctx_id = "a".repeat(64);
+
+        let Err(err) = super::context_join_from_welcome_on(
+            &bi,
+            joiner_did,
+            "did:dht:z6MkNapiRollbackCreator".to_owned(),
+            ctx_id.clone(),
+            r#"{"mode":"encrypted"}"#.to_owned(),
+            "bogus-reservation-id".to_owned(),
+            b"bogus-welcome-bytes".to_vec(),
+        )
+        .await
+        else {
+            panic!("join with a bogus Welcome must fail at the runtime layer");
+        };
+        let msg = err.to_string();
+        assert!(
+            !msg.contains(codes::IDENT_1054),
+            "custody must have SUCCEEDED so the register -> spawn seam is exercised; \
+             got a derivation error instead: {msg}"
+        );
+
+        // Post-condition: the reversible FFI state was rolled back — no orphaned
+        // UCAN state, and no known-context discovery entry.
+        assert!(
+            crate::runtime::with_context(&bi, &ctx_id, |_| Ok(())).is_err(),
+            "FFI (UCAN) state must NOT survive a failed join"
+        );
+        assert!(
+            !bi.core.has_known_context(&ctx_id),
+            "no known-context discovery entry may leak after a failed join"
+        );
+    }
+
+    /// ADR-049 Phase 2J (orphaned-success fix): a pre-existing (`Occupied`)
+    /// FFI-state entry fails `context_join_from_welcome` at the
+    /// `register_ffi_state` precheck — which runs BEFORE `spawn_actor_from_welcome`
+    /// consumes the single-use `KeyPackage` — and does NOT roll back the
+    /// pre-existing entry (the bridge must never delete state it did not create).
+    ///
+    /// Drives the REAL entry with a locally-custodied joiner (custody gate
+    /// passes) against a context whose FFI state is already registered. The
+    /// register-first ordering surfaces the collision as an `already registered`
+    /// error at the precheck; the pre-existing entry SURVIVES the failed join.
+    #[cfg(feature = "allow_in_memory_custody")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn join_from_welcome_occupied_ffi_state_fails_before_keypackage_consumption() {
+        let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
+        let joiner_did = register_in_memory_joiner(&bi).await;
+        let ctx_id = "b".repeat(64);
+
+        // Pre-occupy the FFI-state slot for this context id.
+        crate::runtime::register_test_context(&bi, &ctx_id, "did:dht:z6MkNapiOccupiedCreator");
+
+        let Err(err) = super::context_join_from_welcome_on(
+            &bi,
+            joiner_did,
+            "did:dht:z6MkNapiOccupiedCreator".to_owned(),
+            ctx_id.clone(),
+            r#"{"mode":"encrypted"}"#.to_owned(),
+            "bogus-reservation-id".to_owned(),
+            b"bogus-welcome-bytes".to_vec(),
+        )
+        .await
+        else {
+            panic!("join into an already-registered context must be rejected");
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("already registered"),
+            "expected an Occupied-precheck rejection before KeyPackage consumption, got: {msg}"
+        );
+
+        // The PRE-EXISTING entry must SURVIVE — the failing join must not roll
+        // back state it did not create.
+        assert!(
+            crate::runtime::with_context(&bi, &ctx_id, |_| Ok(())).is_ok(),
+            "the pre-existing FFI state must be preserved on an Occupied-precheck failure"
+        );
     }
 
     /// Test helper: dispatch `QueriesCommand::MemberCount` through the
