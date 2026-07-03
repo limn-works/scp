@@ -141,6 +141,32 @@
       ]
     },
     {
+      "canonical": "context_join_from_welcome",
+      "category": "context",
+      "pyo3": [
+        "context_join_from_welcome"
+      ],
+      "uniffi": [
+        "context_join_from_welcome"
+      ],
+      "napi": [
+        "context_join_from_welcome"
+      ]
+    },
+    {
+      "canonical": "reserve_key_package",
+      "category": "context",
+      "pyo3": [
+        "reserve_key_package"
+      ],
+      "uniffi": [
+        "reserve_key_package"
+      ],
+      "napi": [
+        "reserve_key_package"
+      ]
+    },
+    {
       "canonical": "context_leave",
       "category": "context",
       "pyo3": [
