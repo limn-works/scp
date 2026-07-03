@@ -68,6 +68,21 @@ pub struct Attestation {
     pub expires_at: Option<u64>,
     /// Optional renewal interval. Attestations past this interval but not
     /// expired are considered stale (degraded, not revoked).
+    ///
+    /// # ADVISORY / UNAUTHENTICATED
+    ///
+    /// This field is **NOT** part of the signed attestation preimage
+    /// ([`canonical_attestation_bytes`] excludes it, per §9.5.2), so the
+    /// issuer's signature does **not** cover it. It is advisory metadata only.
+    /// A holder or relay can change it in transit without invalidating the
+    /// signature, so a verifier MUST NOT treat it as an authenticated input to
+    /// any authenticity or freshness *security* decision. Freshness derived
+    /// from it (see `renewal.rs`) is a soft/degraded-status signal, not an
+    /// authenticity guarantee. Authenticated staleness bounds come only from
+    /// the signed `issued_at` / `expires_at` fields. (Design: attestations are
+    /// renewable "without re-sign" — see `renewal.rs` — so this exclusion is
+    /// intentional; the security consequence is documented here rather than
+    /// closed by signing it, which would be a wire-format/model change.)
     pub renewal_interval: Option<Duration>,
     /// Timestamp (seconds) of the last renewal, if renewable (spec 7.4.1).
     ///
@@ -75,6 +90,15 @@ pub struct Attestation {
     /// `issued_at`. A renewable attestation that has never been renewed
     /// should set this to `None`, causing freshness to be measured from
     /// `issued_at`.
+    ///
+    /// # ADVISORY / UNAUTHENTICATED
+    ///
+    /// Like [`Self::renewal_interval`], this field is **NOT** in the signed
+    /// preimage ([`canonical_attestation_bytes`] excludes it) and is therefore
+    /// unauthenticated. A holder/relay can bump it to make a stale attestation
+    /// read as freshly renewed, and no verifier can detect the change from the
+    /// signature. A verifier MUST NOT trust it for an authenticity or freshness
+    /// *security* decision; treat renewal-derived freshness as advisory only.
     pub renewed_at: Option<u64>,
     /// Current revocation status.
     pub revocation_status: RevocationStatus,
@@ -594,12 +618,32 @@ pub struct AttestorInfo {
 /// Used by [`verify_attestation`] to obtain the issuer's public key for
 /// signature verification. Implementations may resolve via DHT, cache, or
 /// test fixtures.
+///
+/// # Totality invariant (REQUIRED)
+///
+/// An `Err` from [`Self::resolve_public_key`] MUST mean a **terminal** outcome:
+/// the key genuinely cannot exist for that DID, or the DID is malformed —
+/// i.e., verification against it can never succeed and never will. An `Err`
+/// MUST NOT signal a **transient** condition (network timeout, cache miss,
+/// resolver temporarily unavailable). Callers on the trust read path (e.g.
+/// `trust::aggregate`) treat `Err` as "verification genuinely failed" and
+/// **discard** the attestation; a transient error surfaced as `Err` would
+/// silently erase a live attestation from the trust computation — a fail-open
+/// availability bug for trust evidence.
+///
+/// A resolver that cannot honor this invariant (a networked/fallible DHT or
+/// cache-backed resolver) MUST NOT be wired into the aggregate read path
+/// without first splitting terminal from transient errors there. The
+/// production [`IdentityDidPublicKeyResolver`] satisfies the invariant by
+/// construction: it is a pure, deterministic DID-string parse with no I/O.
 pub trait DidPublicKeyResolver {
     /// Resolves a DID string to its Ed25519 public key bytes (32 bytes).
     ///
     /// # Errors
     ///
-    /// Returns [`TrustError`] if the DID cannot be resolved.
+    /// Returns [`TrustError`] if the DID cannot be resolved. Per the trait's
+    /// totality invariant, an `Err` MUST be terminal (key cannot exist /
+    /// malformed DID), never a retryable transient failure.
     fn resolve_public_key(&self, did: &str) -> Result<Vec<u8>, TrustError>;
 }
 
@@ -1073,6 +1117,31 @@ pub fn check_threshold_attestation(
 /// `revocation_status` is included in the signed scope so that an
 /// intermediary cannot flip Active↔Revoked without invalidating the
 /// signature.
+///
+/// # Authenticated field set (and what is intentionally excluded)
+///
+/// The signed preimage covers exactly: `id`, `attestation_type`, `issuer`,
+/// `subject`, `claim`, `evidence`, `issued_at`, `expires_at`,
+/// `revocation_status` (§9.5.2). The renewal fields
+/// [`Attestation::renewal_interval`] and [`Attestation::renewed_at`] are
+/// **deliberately excluded** so an attestation can be renewed without
+/// re-signing (`renewal.rs`). Consequently those two fields are
+/// **UNAUTHENTICATED / ADVISORY**: they are not covered by the issuer
+/// signature, a holder/relay can alter them undetectably, and neither this
+/// function nor any verifier treats them as an authenticated input to an
+/// authenticity or freshness *security* decision. Only the fields listed above
+/// are authenticated.
+///
+/// # Canonicalization scheme — `MessagePack` (not JCS)
+///
+/// `claim`, `evidence`, and `revocation_status` are serialized with
+/// `rmp_serde::to_vec_named` (`MessagePack`, named/sorted keys) — **not** RFC
+/// 8785 JCS. This is intentional and matches
+/// `IdentityLinkAttestation::canonical_signing_bytes`. Attestation
+/// canonicalization is the one trust path that uses `MessagePack`; challenge
+/// preimages and other structured hashing use JCS (see the module doc on
+/// `crate::jcs`). Changing the scheme here would change the on-the-wire
+/// attestation hash, so it is fixed by construction.
 ///
 /// # Errors
 ///
@@ -2238,6 +2307,118 @@ mod tests {
             "revocation_status must be in the signed scope: Active and Revoked \
              must produce different canonical bytes"
         );
+    }
+
+    #[test]
+    fn renewal_fields_are_unauthenticated_outside_signed_scope() {
+        // Pins the documented ADVISORY/UNAUTHENTICATED contract (#1999): the
+        // `renewal_interval` / `renewed_at` fields are NOT in the signed
+        // attestation preimage, so mutating them changes neither the canonical
+        // bytes nor the validity of the issuer signature. A verifier therefore
+        // cannot detect (and MUST NOT trust) a holder/relay bumping them.
+        let (signing_key, pubkey_bytes) = test_keypair();
+        let mut resolver = TestResolver::new();
+        resolver.add_key("did:key:issuer", pubkey_bytes);
+        let clock = TestClock::new(1000);
+
+        // Sign with no renewal metadata.
+        let signed = make_signed_attestation_with_revocation(
+            &signing_key,
+            AttestationType::Endorsement,
+            "did:key:issuer",
+            "did:key:subject",
+            900,
+            Some(2000),
+            None, // renewal_interval
+            None, // evidence
+            RevocationStatus::Active,
+        );
+        assert!(signed.renewal_interval.is_none());
+        assert!(signed.renewed_at.is_none());
+
+        let baseline_bytes = canonical_attestation_bytes(&signed).unwrap();
+        assert!(
+            verify_attestation(&signed, &resolver, &clock).is_ok(),
+            "baseline attestation must verify"
+        );
+
+        // Adversarially mutate BOTH renewal fields (as a holder/relay would to
+        // fake freshness), keeping the original signature untouched.
+        let mut tampered = signed;
+        tampered.renewal_interval = Some(Duration::from_hours(8760));
+        tampered.renewed_at = Some(999_999);
+
+        // 1. Canonical bytes are byte-identical — the fields are outside the
+        //    authenticated set.
+        let tampered_bytes = canonical_attestation_bytes(&tampered).unwrap();
+        assert_eq!(
+            baseline_bytes, tampered_bytes,
+            "renewal_interval/renewed_at must NOT affect canonical_attestation_bytes"
+        );
+
+        // 2. The original signature still verifies over the tampered struct —
+        //    proving the mutation is undetectable via the signature.
+        assert!(
+            verify_attestation(&tampered, &resolver, &clock).is_ok(),
+            "mutating unauthenticated renewal fields must not invalidate the signature"
+        );
+    }
+
+    #[test]
+    fn identity_resolver_is_total_for_accepted_did_forms() {
+        // #2000: the aggregate read path (`trust::aggregate`) drops any cached
+        // attestation whose re-verification Errs, which is sound ONLY if the
+        // injected resolver is TOTAL — every Err is terminal (key cannot exist
+        // / malformed DID), never a transient/infra fault. The production
+        // `IdentityDidPublicKeyResolver` is a pure DID-string parse with no I/O,
+        // so it is total by construction. This test pins that:
+        //   (a) every well-formed accepted DID form resolves `Ok`, and
+        //   (b) malformed / unsupported inputs `Err` terminally AND
+        //       deterministically (same input always yields the same outcome),
+        //       which is the observable proxy for "no transient error path".
+        use scp_primitives::did_dht_from_public_key;
+
+        let resolver = IdentityDidPublicKeyResolver;
+        let key = [7u8; 32];
+
+        // (a) Accepted forms → Ok, round-tripping to the embedded key.
+        let did_dht = did_dht_from_public_key(&key);
+        assert_eq!(
+            resolver.resolve_public_key(did_dht.as_ref()).unwrap(),
+            key.to_vec(),
+            "valid did:dht:z must resolve to its embedded key",
+        );
+        let did_key = format!("did:key:{}", hex::encode(key));
+        assert_eq!(
+            resolver.resolve_public_key(&did_key).unwrap(),
+            key.to_vec(),
+            "valid did:key:{{hex}} (testing form) must resolve",
+        );
+
+        // (b) Malformed / unsupported inputs → terminal, deterministic Err.
+        // A total, pure resolver never returns Err for a resolvable key and
+        // never flips Ok↔Err for the same input across calls (which a
+        // networked/cache resolver could). Determinism here stands in for
+        // "no transient failure".
+        let terminal_cases = [
+            "",                    // empty
+            "not-a-did",           // no scheme
+            "did:web:example.com", // unsupported method
+            "did:dht:z!@#$%^&*",   // invalid z-base-32
+            "did:dht:zyyy",        // decodes but wrong length
+            "did:key:zzzz",        // invalid hex
+            "did:key:00",          // hex but wrong length
+        ];
+        for input in terminal_cases {
+            let first = resolver.resolve_public_key(input);
+            let second = resolver.resolve_public_key(input);
+            assert!(first.is_err(), "expected terminal Err for {input:?}");
+            assert_eq!(
+                first.is_ok(),
+                second.is_ok(),
+                "resolver must be deterministic (no transient behavior) for {input:?}",
+            );
+        }
     }
 
     // --- ThresholdRequirement NaN / Infinity guard tests ---

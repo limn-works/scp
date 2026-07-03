@@ -615,14 +615,27 @@ pub trait RevocationEventLogger {
 /// `crates/scp-ffi/common` builds the token-revocation leaf via this shared
 /// function across the crate boundary. It is not part of the SDK surface (see
 /// the cross-layer exemption registry).
-#[must_use]
-pub fn token_revoked_payload(context_id: &str, token_cid: &str, revoker_did: &str) -> Vec<u8> {
+///
+/// # Errors
+///
+/// Returns [`UcanError::RevocationFailed`] if the payload cannot be serialized.
+/// The error is surfaced rather than silently substituting empty bytes, so the
+/// `TokenRevoked` convergent leaf preimage is never computed over a
+/// defaulted-empty payload. Unreachable for the string-only JSON object built
+/// here (which always serializes).
+pub fn token_revoked_payload(
+    context_id: &str,
+    token_cid: &str,
+    revoker_did: &str,
+) -> Result<Vec<u8>, UcanError> {
     let value = serde_json::json!({
         "token_cid": token_cid,
         "revoker_did": revoker_did,
         "context_id": context_id,
     });
-    serde_json::to_vec(&value).unwrap_or_default()
+    serde_json::to_vec(&value).map_err(|e| {
+        UcanError::RevocationFailed(format!("TokenRevoked payload serialization failed: {e}"))
+    })
 }
 
 // ---------------------------------------------------------------------------

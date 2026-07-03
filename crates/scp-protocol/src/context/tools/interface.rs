@@ -1070,7 +1070,7 @@ where
 
     // 10. Build event payloads for both contexts.
     let (source_event, target_event) =
-        build_cross_context_events(interface, input, &output, invoker_did, &provenance);
+        build_cross_context_events(interface, input, &output, invoker_did, &provenance)?;
 
     Ok((output, source_event, target_event))
 }
@@ -1116,16 +1116,21 @@ fn build_invocation_provenance(
 
 /// Builds matched event payloads for the source and target contexts of a
 /// cross-context tool invocation. Both events share the same `request_id`.
+///
+/// # Errors
+///
+/// Returns [`ToolError::CanonicalizationFailed`] if the input or output value
+/// cannot be canonically serialized for its convergent hash.
 fn build_cross_context_events(
     interface: &ToolInterface,
     input: &serde_json::Value,
     output: &serde_json::Value,
     invoker_did: &DID,
     provenance: &DataProvenance,
-) -> (CrossContextToolEvent, CrossContextToolEvent) {
+) -> Result<(CrossContextToolEvent, CrossContextToolEvent), ToolError> {
     let request_id = uuid::Uuid::new_v4().to_string();
-    let input_hash = sha256_json(input);
-    let output_hash = Some(sha256_json(output));
+    let input_hash = sha256_json(input)?;
+    let output_hash = Some(sha256_json(output)?);
 
     let source_event = CrossContextToolEvent {
         request_id: request_id.clone(),
@@ -1151,7 +1156,7 @@ fn build_cross_context_events(
         provenance: Some(provenance.clone()),
     };
 
-    (source_event, target_event)
+    Ok((source_event, target_event))
 }
 
 // ---------------------------------------------------------------------------
@@ -1886,8 +1891,8 @@ mod tests {
         assert_eq!(target_event.status, ToolStatus::Success);
 
         // Both events have correct hashes.
-        let expected_input_hash = sha256_json(&input);
-        let expected_output_hash = sha256_json(&output);
+        let expected_input_hash = sha256_json(&input).unwrap();
+        let expected_output_hash = sha256_json(&output).unwrap();
         assert_eq!(source_event.input_hash, expected_input_hash);
         assert_eq!(source_event.output_hash, Some(expected_output_hash.clone()));
         assert_eq!(target_event.input_hash, expected_input_hash);

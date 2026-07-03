@@ -505,8 +505,17 @@ where
 /// - `operator_did`
 /// - `registered_at` (timestamp)
 /// - `cost` (if present)
-#[must_use]
-pub fn compute_tool_registration_canonical_bytes(registration: &ToolRegistration) -> Vec<u8> {
+///
+/// # Errors
+///
+/// Returns [`ToolError::CanonicalizationFailed`] if any schema or test-vector
+/// value fails RFC 8785 JCS canonical serialization. The error is surfaced
+/// rather than substituting empty bytes, so the registration signature is never
+/// computed or verified over a defaulted-empty preimage. Unreachable for
+/// well-formed `serde_json::Value` schemas.
+pub fn compute_tool_registration_canonical_bytes(
+    registration: &ToolRegistration,
+) -> Result<Vec<u8>, ToolError> {
     use sha2::{Digest, Sha256};
 
     let mut hasher = Sha256::new();
@@ -523,9 +532,11 @@ pub fn compute_tool_registration_canonical_bytes(registration: &ToolRegistration
     length_prefix(&mut hasher, registration.description.as_bytes());
 
     // Schema as RFC 8785 JCS canonical JSON bytes.
-    let input_json = crate::jcs::to_vec(&registration.schema.input_schema).unwrap_or_default();
+    let input_json = crate::jcs::to_vec(&registration.schema.input_schema)
+        .map_err(|reason| ToolError::CanonicalizationFailed { reason })?;
     length_prefix(&mut hasher, &input_json);
-    let output_json = crate::jcs::to_vec(&registration.schema.output_schema).unwrap_or_default();
+    let output_json = crate::jcs::to_vec(&registration.schema.output_schema)
+        .map_err(|reason| ToolError::CanonicalizationFailed { reason })?;
     length_prefix(&mut hasher, &output_json);
 
     hasher.update(registration.implementation_hash);
@@ -534,9 +545,11 @@ pub fn compute_tool_registration_canonical_bytes(registration: &ToolRegistration
     #[allow(clippy::cast_possible_truncation)]
     hasher.update((registration.test_vectors.len() as u32).to_be_bytes());
     for tv in &registration.test_vectors {
-        let input_bytes = crate::jcs::to_vec(&tv.input).unwrap_or_default();
+        let input_bytes = crate::jcs::to_vec(&tv.input)
+            .map_err(|reason| ToolError::CanonicalizationFailed { reason })?;
         length_prefix(&mut hasher, &input_bytes);
-        let output_bytes = crate::jcs::to_vec(&tv.expected_output).unwrap_or_default();
+        let output_bytes = crate::jcs::to_vec(&tv.expected_output)
+            .map_err(|reason| ToolError::CanonicalizationFailed { reason })?;
         length_prefix(&mut hasher, &output_bytes);
         length_prefix(&mut hasher, tv.description.as_bytes());
     }
@@ -562,7 +575,7 @@ pub fn compute_tool_registration_canonical_bytes(registration: &ToolRegistration
         None => hasher.update([0x00]),
     }
 
-    hasher.finalize().to_vec()
+    Ok(hasher.finalize().to_vec())
 }
 
 /// Verifies the Ed25519 signature on a tool registration.
@@ -596,7 +609,7 @@ pub fn verify_tool_registration_signature(
     })?;
 
     let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes);
-    let canonical = compute_tool_registration_canonical_bytes(registration);
+    let canonical = compute_tool_registration_canonical_bytes(registration)?;
 
     registrant_public_key
         .verify_strict(&canonical, &signature)

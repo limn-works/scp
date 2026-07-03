@@ -465,7 +465,9 @@ where
     // executor mutates the input object (serde_json::Value is a value type,
     // but this also protects against any future change to `F` that might
     // take the input by reference and mutate it).
-    let input_hash = sha256_json(&input);
+    let input_hash = sha256_json(&input).map_err(|e| InvocationError::ExecutionFailed {
+        message: format!("input hash canonicalization failed: {e}"),
+    })?;
 
     // 5. Execute the tool with timeout.
     let effective_timeout = timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS).min(MAX_TIMEOUT_MS);
@@ -487,7 +489,9 @@ where
     validate_value_against_schema(&output, &registration.schema.output_schema)
         .map_err(|msg| InvocationError::OutputValidationFailed { message: msg })?;
 
-    let output_hash = sha256_json(&output);
+    let output_hash = sha256_json(&output).map_err(|e| InvocationError::ExecutionFailed {
+        message: format!("output hash canonicalization failed: {e}"),
+    })?;
     let execution_time_ms = elapsed_ms(start);
 
     Ok(InvokeExecuteOutcome {
@@ -726,7 +730,22 @@ where
     // 4c. Compute the input hash from the value the executor will see so
     // the resulting `ToolInvokedEvent` records it verbatim even though we
     // have to clone the input for the cancellation path.
-    let input_hash = sha256_json(&input);
+    let input_hash = match sha256_json(&input) {
+        Ok(hash) => hash,
+        Err(e) => {
+            void_escrow_and_rollback(
+                escrow.as_ref(),
+                escrow_parts.as_ref(),
+                action_cost,
+                &mut economy,
+                invoker_did,
+            )
+            .await;
+            return Err(InvocationError::ExecutionFailed {
+                message: format!("input hash canonicalization failed: {e}"),
+            });
+        }
+    };
 
     // 5. Execute with timeout and cancellation. The cancellation variant
     // keeps its own `tokio::select!` body because composing `tokio::select!`
@@ -783,7 +802,22 @@ where
         .await;
         return Err(InvocationError::OutputValidationFailed { message: msg });
     }
-    let output_hash = sha256_json(&output);
+    let output_hash = match sha256_json(&output) {
+        Ok(hash) => hash,
+        Err(e) => {
+            void_escrow_and_rollback(
+                escrow.as_ref(),
+                escrow_parts.as_ref(),
+                action_cost,
+                &mut economy,
+                invoker_did,
+            )
+            .await;
+            return Err(InvocationError::ExecutionFailed {
+                message: format!("output hash canonicalization failed: {e}"),
+            });
+        }
+    };
     let execution_time_ms = elapsed_ms(start);
     let triggered = economy
         .as_mut()
@@ -1618,8 +1652,8 @@ mod tests {
         .unwrap();
 
         // Verify hashes are present and correct.
-        let expected_input_hash = sha256_json(&input);
-        let expected_output_hash = sha256_json(&output);
+        let expected_input_hash = sha256_json(&input).unwrap();
+        let expected_output_hash = sha256_json(&output).unwrap();
 
         assert_eq!(event.input_hash, expected_input_hash);
         assert_eq!(event.output_hash, Some(expected_output_hash));
