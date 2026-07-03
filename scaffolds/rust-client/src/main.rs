@@ -24,7 +24,7 @@ use scp_core::context::{
 };
 use scp_identity::cache::DidCache;
 use scp_identity::dht::DidDht;
-use scp_identity::dht_client::InMemoryDhtClient;
+use scp_dht::InMemoryDhtClient;
 use scp_did::DID;
 use scp_identity::DidMethod;
 use scp_platform::testing::InMemoryKeyCustody;

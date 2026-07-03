@@ -802,14 +802,6 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
         Ok(())
     }
 
-    /// Constructs the BEP44 signable payload for a value and sequence number.
-    ///
-    /// Delegates to the transport-layer [`scp_dht::bep44_signable`] helper.
-    #[must_use]
-    pub fn bep44_signable(value: &[u8], seq: u64) -> Vec<u8> {
-        scp_dht::bep44_signable(value, seq)
-    }
-
     /// Verifies a BEP44 Ed25519 signature over the given value and sequence.
     ///
     /// Delegates to the transport-layer [`scp_dht::verify_bep44_signature`]
@@ -862,7 +854,7 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
         let seq = self.sequence.fetch_add(1, Ordering::AcqRel) + 1;
 
         // Construct the BEP44 signable payload and sign it.
-        let signable = Self::bep44_signable(value, seq);
+        let signable = scp_dht::bep44_signable(value, seq);
         let sig_bytes = sign_fn(identity.identity_key.id(), signable).await?;
 
         // Convert signature to [u8; 64].
@@ -3173,7 +3165,7 @@ mod tests {
     async fn bep44_signable_format_is_correct() {
         let value = b"test";
         let seq = 42;
-        let signable = DidDht::<InMemoryDhtClient>::bep44_signable(value, seq);
+        let signable = scp_dht::bep44_signable(value, seq);
 
         // Expected: "3:seqi42e1:v4:test"
         let expected = b"3:seqi42e1:v4:test";

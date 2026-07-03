@@ -272,7 +272,9 @@ scp/
 │   │
 │   ├── scp-core/              # Facade re-exporting scp-protocol + scp-runtime
 │   │
-│   ├── scp-identity/          # Native DID subsystem — DHT resolution/publication, DidMethod, lifecycle
+│   ├── scp-identity/          # Native DID subsystem — DID-method (DidDht), resolution/publication, lifecycle
+│   │
+│   ├── scp-dht/               # Native DHT transport leaf — DhtClient/DhtRecord/InMemory/Pkarr + BEP44 helpers (ADR-057 T1c)
 │   │
 │   ├── scp-event-log/         # Merkle event log
 │   │
@@ -679,8 +681,12 @@ Layer 0 ─ scp-clock                 Clock port (wall-clock time). Wasm-safe le
 Layer 1 ─ scp-protocol              Pure sync protocol types (no tokio, wasm32-compatible).
            │  scp-runtime             Async orchestration (Supervisor + per-context actors, MLS, providers; ADR-049).
            │  scp-core                Facade re-exporting scp-protocol + scp-runtime.
-           │  scp-identity            Native DID subsystem — DHT resolution/publication,
-           │                          DidMethod, lifecycle; imports the DID model from scp-did.
+           │  scp-identity            Native DID subsystem — DID-method (DidDht), resolution/publication,
+           │                          lifecycle; imports the DID model from scp-did and the DHT
+           │                          transport from scp-dht.
+           │  scp-dht                  Native DHT transport leaf — DhtClient/DhtRecord/InMemory/Pkarr
+           │                          + BEP44 helpers + DhtError; no SCP deps (one-way
+           │                          scp-identity → scp-dht edge; ADR-057 T1c).
            │  scp-event-log           Merkle event log.
            │  scp-mls                 Synchronous MLS state machine (wasm-safe; ADR-057).
            │  scp-client              In-browser participant driver over scp-mls (ADR-057).
@@ -703,7 +709,7 @@ Layer 4 ─ scp-testing               Dev-dependency only. Network simulation ha
                                       Never imported by production code.
 ```
 
-**Completed extractions:** `scp-identity` and `scp-event-log` have been extracted from `scp-core` into standalone Layer 1 crates. `scp-protocol` (pure sync types) and `scp-runtime` (async orchestration) have been extracted from the original `scp-core`, which is now a thin facade re-exporting both. The former `scp-primitives` junk-drawer was dissolved into three single-responsibility wasm-safe capability leaves — `scp-clock` (the `Clock` port), `scp-crypto` (Ed25519 verification), and `scp-did` (the DID data model, which also absorbed the DID-document/attestation types that had been parked in `scp-protocol`) — per ADR-057's Amendment (no generality-tier crate: universality is not a domain). `scp-identity` keeps its native DHT/resolution/lifecycle subsystem as one crate (the DHT is not separable — see ADR-057 rejected alternative 5) and now imports the DID model from `scp-did`. The synchronous MLS state machine was lifted into the wasm-safe `scp-mls`, shared by the native runtime and the in-browser client (`scp-client` / `scp-client-wasm`), per ADR-057.
+**Completed extractions:** `scp-identity` and `scp-event-log` have been extracted from `scp-core` into standalone Layer 1 crates. `scp-protocol` (pure sync types) and `scp-runtime` (async orchestration) have been extracted from the original `scp-core`, which is now a thin facade re-exporting both. The former `scp-primitives` junk-drawer was dissolved into three single-responsibility wasm-safe capability leaves — `scp-clock` (the `Clock` port), `scp-crypto` (Ed25519 verification), and `scp-did` (the DID data model, which also absorbed the DID-document/attestation types that had been parked in `scp-protocol`) — per ADR-057's Amendment (no generality-tier crate: universality is not a domain). `scp-identity` keeps its native DID-method/resolution/lifecycle subsystem as one crate (the DID-**method** layer is not separable — `DidDht` is bidirectionally fused with the async, `scp-platform`-coupled identity types; see ADR-057 rejected alternative 5) and now imports the DID model from `scp-did`. The pure DHT **transport** layer, however, *was* separable and was extracted into the native `scp-dht` leaf (`DhtClient`/`DhtRecord`/`InMemoryDhtClient`/`PkarrDhtClient` + BEP44 helpers), a one-way `scp-identity` → `scp-dht` edge (ADR-057 T1c). The synchronous MLS state machine was lifted into the wasm-safe `scp-mls`, shared by the native runtime and the in-browser client (`scp-client` / `scp-client-wasm`), per ADR-057.
 
 #### 2.5.2 Replaceable Subsystems
 
@@ -717,7 +723,7 @@ Every subsystem in the table below is injected through a trait. Callers never co
 | Push notifications | `Push` | `scp-platform/src/traits.rs` | Full | Nothing — APNs, FCM, synthetic. |
 | Transport | `TransportAdapter` | `scp-transport/src/traits.rs` | Full | Nothing — native relay, Nostr, Matrix, Hyperswarm, libp2p, WebSocket, WebRTC, custom. |
 | DID method | `DidMethod` | `scp-core/src/identity/mod.rs` | Full | Nothing — did:dht (primary), did:web (fallback), or custom method. |
-| DHT client | `DhtClient` | `scp-core/src/identity/dht_client.rs` | Full | Nothing — pkarr (production), in-memory (testing), or custom BEP44 client. |
+| DHT client | `DhtClient` | `crates/scp-dht/src/dht_client/` | Full | Nothing — pkarr (production), in-memory (testing), or custom BEP44 client. |
 | MLS primitives | `MlsBackend` | `scp-runtime/src/crypto/mls/` | Partial | MLS is protocol-fundamental; the OpenMLS implementation is swappable but any replacement must implement RFC 9420 with the SCP ciphersuite. |
 | HPKE primitives | `HpkeBackend` | `scp-runtime/src/crypto/` | Full | Nothing — any RFC 9180 implementation with the SCP suite. |
 | OpenMLS storage | `OpenMlsStorageAdapter` | `scp-runtime/src/crypto/mls/storage.rs` | None — internal to the OpenMLS `MlsBackend` | Not intended for replacement; swapping this only makes sense if the OpenMLS-based `MlsBackend` itself is replaced. |

@@ -73,6 +73,7 @@ jobs:
               - 'crates/scp-clock/**'
               - 'crates/scp-crypto/**'
               - 'crates/scp-did/**'
+              - 'crates/scp-dht/**'
               - 'crates/scp-mls/**'
 
   # ── Error codes ───────────────────────────────────────────────────

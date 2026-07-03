@@ -2506,6 +2506,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "scp-dht"
+version = "0.1.0-beta.2"
+dependencies = [
+ "ed25519-dalek",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "scp-did"
 version = "0.1.0-beta.2"
 dependencies = [
@@ -2575,6 +2584,7 @@ dependencies = [
  "hex",
  "rand 0.8.5",
  "scp-clock",
+ "scp-dht",
  "scp-did",
  "scp-platform",
  "serde",
@@ -2697,6 +2707,7 @@ dependencies = [
  "rmpv",
  "scp-clock",
  "scp-crypto",
+ "scp-dht",
  "scp-did",
  "scp-event-log",
  "scp-identity",

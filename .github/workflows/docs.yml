@@ -65,6 +65,7 @@ jobs:
               - 'crates/scp-runtime/src/**'
               - 'crates/scp-ffi/**'
               - 'crates/scp-did/src/**'
+              - 'crates/scp-dht/src/**'
               - 'crates/scp-clock/src/**'
               - 'crates/scp-crypto/src/**'
               - 'crates/scp-mls/src/**'

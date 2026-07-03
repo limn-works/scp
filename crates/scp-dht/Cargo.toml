@@ -14,14 +14,14 @@ categories = ["network-programming"]
 tokio = { workspace = true }
 thiserror = { workspace = true }
 ed25519-dalek = { workspace = true }
-z-base-32 = { workspace = true }
-tracing = { workspace = true }
+z-base-32 = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
 mainline = { version = "6", optional = true }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"], optional = true }
 
 [features]
 default = []
-production-dht = ["dep:mainline", "dep:reqwest"]
+production-dht = ["dep:mainline", "dep:reqwest", "dep:z-base-32", "dep:tracing"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
