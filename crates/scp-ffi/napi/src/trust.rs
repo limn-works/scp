@@ -315,6 +315,72 @@ pub(crate) fn verify_participation_requirements_on(
 }
 
 // ---------------------------------------------------------------------------
+// check_capability_requirements (§7.3.4.4, SCP-ACR-008)
+// ---------------------------------------------------------------------------
+
+/// Per-bridge-instance implementation of `check_capability_requirements`.
+///
+/// Verifies that an agent meets a context's capability requirements for
+/// admission. Pure verification — the bridge instance is unused (the production
+/// `IdentityDidPublicKeyResolver` is stateless) but accepted for API symmetry
+/// with the other `_on` helpers in this module.
+///
+/// `subject_did` is the DID of the agent being admitted and `context_id` the
+/// context: a `ChallengeVerification` only satisfies a requirement when its
+/// signed `subject_did`/`context_id` equal these values, closing cross-subject
+/// and cross-context attribution. Authenticity is not authorization — a passing
+/// challenge-verification check does not establish verifier legitimacy (see spec
+/// §7.3.4.4).
+pub(crate) fn check_capability_requirements_on(
+    _bi: &NapiBridgeInstance,
+    context_id: String,
+    subject_did: String,
+    requirements_json: String,
+    agent_capabilities_json: String,
+    challenge_verifications_json: String,
+) -> napi::Result<()> {
+    // Full DID-format validation (matching the PyO3 reference bridge), not just a
+    // non-empty check, so all native bridges reject malformed ids identically.
+    scp_ffi_common::validate::validate_did(&subject_did)
+        .map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+
+    let requirements: Vec<scp_core::trust::CapabilityRequirement> =
+        serde_json::from_str(&requirements_json).map_err(|e| {
+            validation_error(&format!(
+                "failed to parse capability requirements JSON: {e}"
+            ))
+        })?;
+
+    let agent_capabilities: Vec<scp_core::trust::CapabilityUri> =
+        serde_json::from_str(&agent_capabilities_json).map_err(|e| {
+            validation_error(&format!("failed to parse agent capabilities JSON: {e}"))
+        })?;
+
+    let challenge_verifications: Vec<scp_core::trust::ChallengeVerification> =
+        serde_json::from_str(&challenge_verifications_json).map_err(|e| {
+            validation_error(&format!(
+                "failed to parse challenge verifications JSON: {e}"
+            ))
+        })?;
+
+    let resolver = scp_core::trust::IdentityDidPublicKeyResolver;
+    let clock = scp_identity::cache::SystemClock;
+
+    scp_core::trust::check_capability_requirements(
+        &requirements,
+        &agent_capabilities,
+        &challenge_verifications,
+        &context_id,
+        &subject_did,
+        &resolver,
+        &clock,
+    )
+    .map_err(|e| validation_error(&format!("capability admission verification failed: {e}")))?;
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // aggregate_trust_input (§7.3)
 // ---------------------------------------------------------------------------
 
@@ -651,6 +717,125 @@ mod tests {
         let result = verify_participation_requirements_on(
             &bi,
             "not-a-did".to_owned(),
+            "[]".to_owned(),
+            "[]".to_owned(),
+        );
+        assert!(result.is_err());
+    }
+
+    // -- check_capability_requirements (§7.3.4.4, SCP-ACR-008) --
+
+    #[test]
+    fn check_capability_requirements_rejects_invalid_requirements_json() {
+        let bi = test_bi();
+        let result = check_capability_requirements_on(
+            &bi,
+            "ctx-1".to_owned(),
+            "did:key:alice".to_owned(),
+            "not json".to_owned(),
+            "[]".to_owned(),
+            "[]".to_owned(),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn check_capability_requirements_rejects_invalid_capabilities_json() {
+        let bi = test_bi();
+        let result = check_capability_requirements_on(
+            &bi,
+            "ctx-1".to_owned(),
+            "did:key:alice".to_owned(),
+            "[]".to_owned(),
+            "not json".to_owned(),
+            "[]".to_owned(),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn check_capability_requirements_rejects_invalid_verifications_json() {
+        let bi = test_bi();
+        let result = check_capability_requirements_on(
+            &bi,
+            "ctx-1".to_owned(),
+            "did:key:alice".to_owned(),
+            "[]".to_owned(),
+            "[]".to_owned(),
+            "not json".to_owned(),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn check_capability_requirements_empty_inputs_succeeds() {
+        let bi = test_bi();
+        let result = check_capability_requirements_on(
+            &bi,
+            "ctx-1".to_owned(),
+            "did:key:alice".to_owned(),
+            "[]".to_owned(),
+            "[]".to_owned(),
+            "[]".to_owned(),
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn check_capability_requirements_rejects_empty_subject() {
+        let bi = test_bi();
+        let result = check_capability_requirements_on(
+            &bi,
+            "ctx-1".to_owned(),
+            String::new(),
+            "[]".to_owned(),
+            "[]".to_owned(),
+            "[]".to_owned(),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn check_capability_requirements_rejects_malformed_subject() {
+        let bi = test_bi();
+        let result = check_capability_requirements_on(
+            &bi,
+            "ctx-1".to_owned(),
+            "not-a-did".to_owned(),
+            "[]".to_owned(),
+            "[]".to_owned(),
+            "[]".to_owned(),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn check_capability_requirements_self_attested_present_succeeds() {
+        // A SelfAttested requirement is satisfied by a declared capability — no
+        // challenge verification (and thus no signature check) is needed.
+        let bi = test_bi();
+        let requirements = r#"[{"capability":"scp:capability:schema-validation/v1","verification_level":"SelfAttested"}]"#;
+        let capabilities = r#"["scp:capability:schema-validation/v1"]"#;
+        let result = check_capability_requirements_on(
+            &bi,
+            "ctx-1".to_owned(),
+            "did:key:alice".to_owned(),
+            requirements.to_owned(),
+            capabilities.to_owned(),
+            "[]".to_owned(),
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn check_capability_requirements_self_attested_missing_fails() {
+        let bi = test_bi();
+        let requirements = r#"[{"capability":"scp:capability:schema-validation/v1","verification_level":"SelfAttested"}]"#;
+        let result = check_capability_requirements_on(
+            &bi,
+            "ctx-1".to_owned(),
+            "did:key:alice".to_owned(),
+            requirements.to_owned(),
             "[]".to_owned(),
             "[]".to_owned(),
         );

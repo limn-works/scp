@@ -3520,6 +3520,32 @@ impl Scp {
         )
     }
 
+    /// Per-instance equivalent of the free-function `check_capability_requirements`.
+    ///
+    /// Verifies that an agent meets a context's capability requirements for
+    /// admission (spec §7.3.4.4). `subjectDid`/`contextId` bind challenge
+    /// verifications to the agent and context being admitted. Returns normally
+    /// when all requirements are satisfied; throws on any unmet requirement or
+    /// malformed JSON.
+    #[napi(js_name = "checkCapabilityRequirements")]
+    pub fn check_capability_requirements(
+        &self,
+        context_id: String,
+        subject_did: String,
+        requirements_json: String,
+        agent_capabilities_json: String,
+        challenge_verifications_json: String,
+    ) -> napi::Result<()> {
+        crate::trust::check_capability_requirements_on(
+            &self.inner,
+            context_id,
+            subject_did,
+            requirements_json,
+            agent_capabilities_json,
+            challenge_verifications_json,
+        )
+    }
+
     /// Per-instance equivalent of the free-function `aggregate_trust_input`.
     #[napi(js_name = "aggregateTrustInput")]
     #[allow(clippy::too_many_arguments)]

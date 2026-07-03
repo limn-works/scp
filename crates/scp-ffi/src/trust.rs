@@ -312,6 +312,99 @@ pub fn py_verify_participation_requirements(
 }
 
 // ---------------------------------------------------------------------------
+// check_capability_requirements (§7.3.4.4, SCP-ACR-008)
+// ---------------------------------------------------------------------------
+
+/// Verifies that an agent meets a context's capability requirements for
+/// admission, bound to the agent and context being admitted.
+///
+/// Inputs (all JSON except the two DID/context ids):
+/// - `context_id`: the context the agent is being admitted to. A challenge
+///   verification only satisfies a requirement when its signed `context_id`
+///   equals this value.
+/// - `subject_did`: the DID of the agent being admitted. Only challenge
+///   verifications whose signed `subject_did` equals this value can satisfy a
+///   requirement — a genuine result minted for another subject MUST NOT admit
+///   this agent (cross-subject attribution).
+/// - `requirements_json`: JSON array of `CapabilityRequirement` objects.
+/// - `agent_capabilities_json`: JSON array of capability-URI strings the agent
+///   self-attests.
+/// - `challenge_verifications_json`: JSON array of `ChallengeVerification`
+///   records; each is signature-verified against `resolver`/`clock` and only
+///   counts if authentic, in-context, in-subject, passed, and unexpired.
+///
+/// Uses the production `IdentityDidPublicKeyResolver` for verifier-DID key
+/// resolution and the fail-closed system clock for expiry. Returns `Ok(())` on
+/// success — success is indicated by returning without exception. Raises
+/// `ScpError` with a diagnostic message if any requirement is unmet or if the
+/// JSON is malformed.
+///
+/// SECURITY (verifier legitimacy): a passing `ChallengeVerified` check proves
+/// the verifier's signature is authentic and bound to this subject/context, NOT
+/// that the verifier is authorized/trusted. A `verifier_did` is self-certifying;
+/// establish verifier legitimacy separately (see spec §7.3.4.4 / §7.4).
+///
+/// See spec §7.3.4.4.
+///
+/// # Errors
+///
+/// Returns `PyValueError` if any JSON input is malformed or `subject_did` is
+/// not a valid DID, or `PyRuntimeError` if an admission requirement is unmet
+/// (with the specific reason from `AdmissionError`).
+#[pyfunction]
+#[pyo3(name = "check_capability_requirements")]
+pub fn py_check_capability_requirements(
+    context_id: &str,
+    subject_did: &str,
+    requirements_json: &str,
+    agent_capabilities_json: &str,
+    challenge_verifications_json: &str,
+) -> PyResult<()> {
+    validate::validate_did(subject_did)?;
+
+    let requirements: Vec<scp_core::trust::CapabilityRequirement> =
+        serde_json::from_str(requirements_json).map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "failed to parse capability requirements JSON: {e}"
+            ))
+        })?;
+
+    let agent_capabilities: Vec<scp_core::trust::CapabilityUri> =
+        serde_json::from_str(agent_capabilities_json).map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "failed to parse agent capabilities JSON: {e}"
+            ))
+        })?;
+
+    let challenge_verifications: Vec<scp_core::trust::ChallengeVerification> =
+        serde_json::from_str(challenge_verifications_json).map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "failed to parse challenge verifications JSON: {e}"
+            ))
+        })?;
+
+    let resolver = scp_core::trust::IdentityDidPublicKeyResolver;
+    let clock = scp_identity::cache::SystemClock;
+
+    scp_core::trust::check_capability_requirements(
+        &requirements,
+        &agent_capabilities,
+        &challenge_verifications,
+        context_id,
+        subject_did,
+        &resolver,
+        &clock,
+    )
+    .map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "capability admission verification failed: {e}"
+        ))
+    })?;
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // aggregate_trust_input (§7.3)
 // ---------------------------------------------------------------------------
 
@@ -857,6 +950,7 @@ pub fn register_trust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_trust_create_challenge, m)?)?;
     m.add_function(wrap_pyfunction!(py_trust_verify_response, m)?)?;
     m.add_function(wrap_pyfunction!(py_verify_participation_requirements, m)?)?;
+    m.add_function(wrap_pyfunction!(py_check_capability_requirements, m)?)?;
     Ok(())
 }
 
@@ -969,6 +1063,75 @@ mod tests {
     fn verify_participation_requirements_rejects_invalid_subject() {
         // A malformed subject DID is rejected at the FFI boundary.
         let result = py_verify_participation_requirements("not-a-did", "[]", "[]");
+        assert!(result.is_err());
+    }
+
+    // -- check_capability_requirements (§7.3.4.4, SCP-ACR-008) --
+
+    #[test]
+    fn check_capability_requirements_rejects_invalid_requirements_json() {
+        let result =
+            py_check_capability_requirements("ctx-1", "did:key:alice", "not json", "[]", "[]");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn check_capability_requirements_rejects_invalid_capabilities_json() {
+        let result =
+            py_check_capability_requirements("ctx-1", "did:key:alice", "[]", "not json", "[]");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn check_capability_requirements_rejects_invalid_verifications_json() {
+        let result =
+            py_check_capability_requirements("ctx-1", "did:key:alice", "[]", "[]", "not json");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn check_capability_requirements_empty_inputs_succeeds() {
+        // No requirements = no constraints = always passes.
+        let result = py_check_capability_requirements("ctx-1", "did:key:alice", "[]", "[]", "[]");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn check_capability_requirements_rejects_malformed_subject() {
+        let result = py_check_capability_requirements("ctx-1", "not-a-did", "[]", "[]", "[]");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn check_capability_requirements_rejects_empty_subject() {
+        // An empty subject is rejected at the FFI boundary (validate_did).
+        let result = py_check_capability_requirements("ctx-1", "", "[]", "[]", "[]");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn check_capability_requirements_self_attested_present_succeeds() {
+        // A SelfAttested requirement is satisfied by a declared capability — no
+        // challenge verification (and thus no signature check) is needed.
+        let requirements = r#"[{"capability":"scp:capability:schema-validation/v1","verification_level":"SelfAttested"}]"#;
+        let capabilities = r#"["scp:capability:schema-validation/v1"]"#;
+        let result = py_check_capability_requirements(
+            "ctx-1",
+            "did:key:alice",
+            requirements,
+            capabilities,
+            "[]",
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn check_capability_requirements_self_attested_missing_fails() {
+        // A SelfAttested requirement with no matching declared capability and no
+        // verification record fails as an admission (runtime) error.
+        let requirements = r#"[{"capability":"scp:capability:schema-validation/v1","verification_level":"SelfAttested"}]"#;
+        let result =
+            py_check_capability_requirements("ctx-1", "did:key:alice", requirements, "[]", "[]");
         assert!(result.is_err());
     }
 

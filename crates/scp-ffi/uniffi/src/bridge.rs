@@ -6404,6 +6404,94 @@ pub fn verify_participation_requirements(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// check_capability_requirements (§7.3.4.4, SCP-ACR-008)
+// ---------------------------------------------------------------------------
+
+/// Verifies that an agent meets a context's capability requirements for
+/// admission, bound to the agent and context being admitted.
+///
+/// Inputs:
+/// - `context_id`: the context the agent is being admitted to. A challenge
+///   verification only satisfies a requirement when its signed `context_id`
+///   equals this value.
+/// - `subject_did`: the DID of the agent being admitted. Only challenge
+///   verifications whose signed `subject_did` equals this value can satisfy a
+///   requirement (cross-subject attribution is rejected).
+/// - `requirements_json`: JSON array of `CapabilityRequirement` objects.
+/// - `agent_capabilities_json`: JSON array of capability-URI strings.
+/// - `challenge_verifications_json`: JSON array of `ChallengeVerification`
+///   records; each is signature-verified and only counts if authentic,
+///   in-context, in-subject, passed, and unexpired.
+///
+/// Uses the production `IdentityDidPublicKeyResolver` for verifier-DID key
+/// resolution and the fail-closed system clock for expiry. Returns without error
+/// (unit) if all requirements are satisfied, throws `ScpError` with a diagnostic
+/// message if any requirement is unmet or if the JSON is malformed.
+///
+/// Security caveat — authenticity is not authorization: a passing
+/// `ChallengeVerified` check proves the verifier's signature is authentic and
+/// bound to this subject/context, NOT that the verifier is trusted. Establish
+/// verifier legitimacy separately (spec §7.3.4.4 / §7.4).
+///
+/// See §7.3.4.4.
+#[uniffi::export]
+pub fn check_capability_requirements(
+    context_id: String,
+    subject_did: String,
+    requirements_json: String,
+    agent_capabilities_json: String,
+    challenge_verifications_json: String,
+) -> Result<(), ScpError> {
+    // Full DID-format validation (matching the PyO3 reference bridge), not just a
+    // non-empty check, so all native bridges reject malformed ids identically.
+    validate_did(&subject_did)?;
+
+    let requirements: Vec<scp_core::trust::CapabilityRequirement> =
+        serde_json::from_str(&requirements_json).map_err(|e| ScpError::Validation {
+            msg: format!("failed to parse capability requirements JSON: {e}"),
+            code: codes::VALID_7073.to_owned(),
+        })?;
+
+    let agent_capabilities: Vec<scp_core::trust::CapabilityUri> =
+        serde_json::from_str(&agent_capabilities_json).map_err(|e| ScpError::Validation {
+            msg: format!("failed to parse agent capabilities JSON: {e}"),
+            code: codes::VALID_7074.to_owned(),
+        })?;
+
+    let challenge_verifications: Vec<scp_core::trust::ChallengeVerification> =
+        serde_json::from_str(&challenge_verifications_json).map_err(|e| ScpError::Validation {
+            msg: format!("failed to parse challenge verifications JSON: {e}"),
+            code: codes::VALID_7075.to_owned(),
+        })?;
+
+    let resolver = scp_core::trust::IdentityDidPublicKeyResolver;
+    let clock = scp_identity::cache::SystemClock;
+
+    scp_core::trust::check_capability_requirements(
+        &requirements,
+        &agent_capabilities,
+        &challenge_verifications,
+        &context_id,
+        &subject_did,
+        &resolver,
+        &clock,
+    )
+    .map_err(|e| match e {
+        scp_core::trust::AdmissionError::EmptySubjectDid => ScpError::Validation {
+            msg: format!("capability admission verification failed: {e}"),
+            code: codes::VALID_7077.to_owned(),
+        },
+        scp_core::trust::AdmissionError::MissingCapability { .. }
+        | scp_core::trust::AdmissionError::VerificationRequired { .. } => ScpError::Validation {
+            msg: format!("capability admission verification failed: {e}"),
+            code: codes::VALID_7076.to_owned(),
+        },
+    })?;
+
+    Ok(())
+}
+
 /// Builds a `ProtocolRepositoryTrustBridge` over the concrete backend behind a
 /// [`ProtocolRepoVariant`] arm and reads back the subject's verified
 /// attestations. Single source of truth for the per-backend
@@ -17346,6 +17434,107 @@ mod tests {
         // DID-format validation, not just a non-empty check.
         let result = verify_participation_requirements(
             "not-a-did".to_owned(),
+            "[]".to_owned(),
+            "[]".to_owned(),
+        );
+        assert!(result.is_err());
+    }
+
+    // -- check_capability_requirements (§7.3.4.4, SCP-ACR-008) --
+
+    #[test]
+    fn check_capability_requirements_rejects_invalid_requirements_json() {
+        let result = check_capability_requirements(
+            "ctx-1".to_owned(),
+            "did:key:alice".to_owned(),
+            "not json".to_owned(),
+            "[]".to_owned(),
+            "[]".to_owned(),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn check_capability_requirements_rejects_invalid_capabilities_json() {
+        let result = check_capability_requirements(
+            "ctx-1".to_owned(),
+            "did:key:alice".to_owned(),
+            "[]".to_owned(),
+            "not json".to_owned(),
+            "[]".to_owned(),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn check_capability_requirements_rejects_invalid_verifications_json() {
+        let result = check_capability_requirements(
+            "ctx-1".to_owned(),
+            "did:key:alice".to_owned(),
+            "[]".to_owned(),
+            "[]".to_owned(),
+            "not json".to_owned(),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn check_capability_requirements_empty_inputs_succeeds() {
+        let result = check_capability_requirements(
+            "ctx-1".to_owned(),
+            "did:key:alice".to_owned(),
+            "[]".to_owned(),
+            "[]".to_owned(),
+            "[]".to_owned(),
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn check_capability_requirements_rejects_empty_subject() {
+        let result = check_capability_requirements(
+            "ctx-1".to_owned(),
+            String::new(),
+            "[]".to_owned(),
+            "[]".to_owned(),
+            "[]".to_owned(),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn check_capability_requirements_rejects_malformed_subject() {
+        let result = check_capability_requirements(
+            "ctx-1".to_owned(),
+            "not-a-did".to_owned(),
+            "[]".to_owned(),
+            "[]".to_owned(),
+            "[]".to_owned(),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn check_capability_requirements_self_attested_present_succeeds() {
+        let requirements = r#"[{"capability":"scp:capability:schema-validation/v1","verification_level":"SelfAttested"}]"#;
+        let capabilities = r#"["scp:capability:schema-validation/v1"]"#;
+        let result = check_capability_requirements(
+            "ctx-1".to_owned(),
+            "did:key:alice".to_owned(),
+            requirements.to_owned(),
+            capabilities.to_owned(),
+            "[]".to_owned(),
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn check_capability_requirements_self_attested_missing_fails() {
+        let requirements = r#"[{"capability":"scp:capability:schema-validation/v1","verification_level":"SelfAttested"}]"#;
+        let result = check_capability_requirements(
+            "ctx-1".to_owned(),
+            "did:key:alice".to_owned(),
+            requirements.to_owned(),
             "[]".to_owned(),
             "[]".to_owned(),
         );
