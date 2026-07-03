@@ -707,6 +707,18 @@ Contexts can require specific capabilities for admission. Admission requirements
 
 Admission checks are mechanical: the protocol verifies capability URIs and verification levels against the joining agent's `ChallengeVerification` records and DID document `SCPCapabilities` entries.
 
+**Verification flow:**
+
+1. Context declares one or more `CapabilityRequirement` entries in `ContextParams` admission requirements — each pairs a capability URI with a required `VerificationLevel` (`SelfAttested` or `ChallengeVerified`).
+2. Joining agent sees the requirements in context metadata before opting in (legibility tenet — visible before join decision).
+3. Admitting context fetches the joining agent's self-attested capability URIs (`SCPCapabilities` entries) and `ChallengeVerification` records (from the subject's `SCPCapabilities` endpoint, §7.3.4).
+4. Admitting context verifies, for each requirement: (a) every candidate `ChallengeVerification`'s signed `subject_did` equals the DID of the agent being admitted AND its signed `context_id` equals the context being admitted to — a result minted for another subject or another context (or a context-agnostic result) is discarded before it can satisfy any requirement (closing cross-subject and cross-context challenge-result replay, where a genuine result issued for a different agent or context is presented to admit this one), (b) every candidate record's verifier Ed25519 signature is valid over its canonical bytes and the record is unexpired relative to the current clock (verify-on-use — an unauthentic or expired record is not considered), (c) a `SelfAttested` requirement is met when the capability URI appears among the agent's self-attested capabilities OR a valid `ChallengeVerification` with `passed == true` exists for it (challenge-verified implies self-attested), (d) a `ChallengeVerified` requirement is met only by a valid `ChallengeVerification` with `passed == true` for that capability.
+5. If any requirement is not met, admission is denied (`MissingCapability` for an absent self-attested capability, `VerificationRequired` for a challenge-verified capability lacking a valid record).
+
+Subject binding and context binding are enforced by the protocol (steps 4a–4b), mirroring the participation-admission sibling (§7.3.2.1): the admission primitive takes the DID of the agent being admitted (`subject_did`) and the context being admitted to (`context_id`), and discards any challenge result whose signed subject or context does not match. All checks are mechanical — no judgment, no discretion, no governance vote.
+
+**Authenticity is not verifier authorization.** As with participation profiles (§7.3.2.1) and the symmetric caveat in §7.4, verify-on-use establishes that each `ChallengeVerification` was genuinely *signed* by its stated `verifier_did` and is bound to this subject, context, and expiry — it does NOT establish that the verifier is *authorized or trusted*. A `verifier_did` is self-certifying, so a subject can present a genuinely-signed result from a verifier it controls. A consumer that needs verifier legitimacy MUST establish it separately (a trusted-verifier set, a context-membership proof, or the threshold/independence path of §7.3.5) and MUST NOT treat a passing signature check as an authorization decision.
+
 ### 7.3.5 Threshold Attestations
 
 A single attestation requires trust in one party. Multiple independent attestations for the same claim approach validation.
