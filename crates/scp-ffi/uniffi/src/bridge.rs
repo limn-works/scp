@@ -17541,6 +17541,95 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// Builds a genuinely verifier-signed `ChallengeVerification` JSON array
+    /// bound to `subject_did`/`context_id`, far-future expiry, verifier DID
+    /// derived from a fixed key (did:dht:z, offline-resolvable by the production
+    /// `IdentityDidPublicKeyResolver`).
+    fn signed_cv_json(uri: &str, subject_did: &str, context_id: &str) -> String {
+        use ed25519_dalek::{Signer, SigningKey};
+
+        let verifier_key = SigningKey::from_bytes(&[9u8; 32]);
+        let verifier_pub = verifier_key.verifying_key().to_bytes();
+        let verifier_did = scp_primitives::did_dht_from_public_key(&verifier_pub);
+        let cap: scp_core::trust::CapabilityUri = uri.parse().unwrap();
+
+        let mut cv = scp_core::trust::ChallengeVerification {
+            verification_id: "bridge-test-challenge".to_owned(),
+            verifier_did,
+            subject_did: subject_did.into(),
+            capability_uri: uri.to_owned(),
+            challenge_type: scp_core::trust::ChallengeType::Uri(cap.clone()),
+            verification_method: scp_core::trust::VerificationMethod::ChallengeVerified {
+                challenge_type: scp_core::trust::ChallengeType::Uri(cap),
+            },
+            passed: true,
+            score: None,
+            test_count: 1,
+            pass_count: 1,
+            result: serde_json::Value::Bool(true),
+            completed_at: 1_700_000_000,
+            verified_at: 1_700_000_000,
+            expires_at: 4_000_000_000,
+            context_id: Some(context_id.to_owned()),
+            verifier_signature: Vec::new(),
+        };
+        let canonical = scp_core::trust::canonical_challenge_verification_bytes(&cv).unwrap();
+        cv.verifier_signature = verifier_key.sign(&canonical).to_bytes().to_vec();
+        serde_json::to_string(&vec![cv]).unwrap()
+    }
+
+    #[test]
+    fn check_capability_requirements_challenge_verified_happy_path() {
+        let uri = "scp:capability:prompt-injection-resistance/v1";
+        let subject = "did:dht:zResponder";
+        let ctx = "ctx-admission";
+        let requirements =
+            format!(r#"[{{"capability":"{uri}","verification_level":"ChallengeVerified"}}]"#);
+        let cvs = signed_cv_json(uri, subject, ctx);
+        let result = check_capability_requirements(
+            ctx.to_owned(),
+            subject.to_owned(),
+            requirements,
+            "[]".to_owned(),
+            cvs,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn check_capability_requirements_rejects_cross_subject_replay() {
+        let uri = "scp:capability:prompt-injection-resistance/v1";
+        let ctx = "ctx-admission";
+        let requirements =
+            format!(r#"[{{"capability":"{uri}","verification_level":"ChallengeVerified"}}]"#);
+        let cvs = signed_cv_json(uri, "did:dht:zVictim", ctx);
+        let result = check_capability_requirements(
+            ctx.to_owned(),
+            "did:dht:zAttacker".to_owned(),
+            requirements,
+            "[]".to_owned(),
+            cvs,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn check_capability_requirements_rejects_cross_context_replay() {
+        let uri = "scp:capability:prompt-injection-resistance/v1";
+        let subject = "did:dht:zResponder";
+        let requirements =
+            format!(r#"[{{"capability":"{uri}","verification_level":"ChallengeVerified"}}]"#);
+        let cvs = signed_cv_json(uri, subject, "ctx-other");
+        let result = check_capability_requirements(
+            "ctx-admission".to_owned(),
+            subject.to_owned(),
+            requirements,
+            "[]".to_owned(),
+            cvs,
+        );
+        assert!(result.is_err());
+    }
+
     /// The typed `ParticipationRecordView` surfaces every flattened fact from
     /// the shared `ParticipationFacts` projection with identical values.
     #[test]

@@ -385,7 +385,7 @@
       "gate": "gate-admission-verification",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-protocol/src/context/params.rs",
         "crates/scp-ffi/src/trust.rs",

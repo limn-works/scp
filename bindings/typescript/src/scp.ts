@@ -2398,6 +2398,43 @@ export class SCP {
   }
 
   /**
+   * Verify that an agent meets a context's capability requirements for
+   * admission (spec §7.3.4.4).
+   *
+   * `subjectDid`/`contextId` bind challenge verifications to the agent and
+   * context being admitted: a `ChallengeVerification` only satisfies a
+   * requirement when its signed `subject_did`/`context_id` equal these values,
+   * closing cross-subject and cross-context attribution.
+   *
+   * Returns normally when all requirements are satisfied; throws on any unmet
+   * requirement or malformed JSON.
+   *
+   * Security caveat — authenticity is not authorization: a passing
+   * `ChallengeVerified` check proves the verifier's signature is authentic and
+   * bound to this subject/context, not that the verifier is *trusted*. Because
+   * `verifierDid` is self-certifying, a subject can present a genuinely-signed
+   * result from a verifier it controls. Establish verifier legitimacy
+   * separately and do NOT treat success as authorization.
+   */
+  checkCapabilityRequirements(
+    contextId: string,
+    subjectDid: string,
+    requirementsJson: string,
+    agentCapabilitiesJson: string,
+    challengeVerificationsJson: string,
+  ): void {
+    (
+      this.#native.checkCapabilityRequirements as (
+        c: string,
+        s: string,
+        r: string,
+        a: string,
+        v: string,
+      ) => void
+    )(contextId, subjectDid, requirementsJson, agentCapabilitiesJson, challengeVerificationsJson);
+  }
+
+  /**
    * Evaluate the trustworthiness of a participant within a context.
    *
    * Composes the structured trust model (spec §7.2.4, ADR-057). The protocol

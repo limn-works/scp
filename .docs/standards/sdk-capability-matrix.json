@@ -647,6 +647,14 @@
           "swift": true
         },
         {
+          "name": "check_capability_requirements",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true,
+          "notes": "Capability-admission op (spec \u00a77.3.4.4, SCP-ACR-008): sibling of verify_participation_requirements. PyO3 (py_check_capability_requirements), NAPI (checkCapabilityRequirements), and UniFFI (check_capability_requirements) bridges take the JSON envelope (context_id, subject_did, requirements_json, agent_capabilities_json, challenge_verifications_json), validate_did(subject_did) at the boundary, and delegate to scp_protocol::trust::check_capability_requirements with the production IdentityDidPublicKeyResolver + fail-closed SystemClock so each ChallengeVerification is signature/subject/context/expiry bound. All four SDKs expose idiomatic wrappers (Python scp_sdk.check_capability_requirements, TypeScript SCP.checkCapabilityRequirements, Kotlin SCP.checkCapabilityRequirements, Swift free function checkCapabilityRequirements)."
+        },
+        {
           "name": "participation_record",
           "python": true,
           "typescript": true,

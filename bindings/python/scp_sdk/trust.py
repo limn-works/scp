@@ -1094,6 +1094,66 @@ def verify_participation_requirements(
     bridge.verify_participation_requirements(expected_subject, requirements_json, profile_json)
 
 
+def check_capability_requirements(
+    context_id: str,
+    subject_did: str,
+    requirements: list[dict[str, Any]],
+    agent_capabilities: list[str],
+    challenge_verifications: list[dict[str, Any]],
+) -> None:
+    """Verify an agent's capabilities against a context's admission requirements.
+
+    Delegates to the Rust ``scp-core`` implementation via the PyO3 bridge
+    (spec §7.3.4.4, SCP-ACR-008). For each requirement the agent must either
+    self-attest the capability (``SelfAttested``) or present a valid
+    ``ChallengeVerification`` record (``ChallengeVerified``). Each supplied
+    verification is signature-verified against the production DID resolver and
+    only counts if it is authentic and its signed ``subject_did``/``context_id``
+    equal ``subject_did``/``context_id`` — a genuine result minted for another
+    subject or context cannot admit this agent.
+
+    Security caveat — authenticity is not authorization: a passing
+    ``ChallengeVerified`` check proves the verifier's signature is authentic and
+    bound to this subject/context, NOT that the verifier is trusted. A
+    ``verifier_did`` is self-certifying, so a subject can present a genuinely
+    signed result from a verifier it controls. Establish verifier legitimacy
+    separately (a trusted-verifier set, a context-membership proof, or the
+    §7.3.5 threshold/independence path) and do NOT treat success as an
+    authorization decision.
+
+    Success is indicated by returning without exception.
+
+    Args:
+        context_id: The context the agent is being admitted to.
+        subject_did: The DID of the agent being admitted. Must be a valid DID.
+        requirements: Capability requirements as bridge-shaped dicts, each
+            ``{"capability": <uri>, "verification_level": "SelfAttested" |
+            "ChallengeVerified"}``.
+        agent_capabilities: The agent's self-attested capability URIs.
+        challenge_verifications: The agent's ``ChallengeVerification`` records
+            as bridge-shaped dicts.
+
+    Raises:
+        ScpError: If the bridge module is not available.
+        RuntimeError: If an admission requirement is unmet (with diagnostic
+            details from ``AdmissionError``).
+        ValueError: If ``subject_did`` is malformed or JSON serialization fails.
+    """
+    bridge = _bridge()
+
+    requirements_json = json.dumps(requirements)
+    agent_capabilities_json = json.dumps(agent_capabilities)
+    challenge_verifications_json = json.dumps(challenge_verifications)
+
+    bridge.check_capability_requirements(
+        context_id,
+        subject_did,
+        requirements_json,
+        agent_capabilities_json,
+        challenge_verifications_json,
+    )
+
+
 __all__ = [
     "PARTICIPATION_FACT_VARIANTS",
     "PARTICIPATION_THRESHOLD_OPERATORS",
@@ -1108,6 +1168,7 @@ __all__ = [
     "RequireParticipation",
     "TrustEvaluation",
     "aggregate_trust_input",
+    "check_capability_requirements",
     "evaluate_trust",
     "participation_record",
     "verify_participation_requirements",

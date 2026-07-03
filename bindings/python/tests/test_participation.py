@@ -24,6 +24,7 @@ from scp_sdk.trust import (
     ParticipationProfile,
     ParticipationThreshold,
     RequireParticipation,
+    check_capability_requirements,
     verify_participation_requirements,
 )
 
@@ -401,3 +402,77 @@ class TestVerifyParticipationRequirements:
         assert call_args[0][0] == "did:dht:z6MkAlice"
         assert json.loads(call_args[0][1]) == []
         assert json.loads(call_args[0][2]) == []
+
+
+# ---------------------------------------------------------------------------
+# check_capability_requirements bridge delegation tests (§7.3.4.4, SCP-ACR-008)
+# ---------------------------------------------------------------------------
+
+
+class TestCheckCapabilityRequirements:
+    """Tests that check_capability_requirements delegates to the Rust bridge."""
+
+    def test_delegates_to_bridge(self) -> None:
+        mock_bridge = MagicMock()
+        mock_bridge.check_capability_requirements.return_value = None
+
+        requirements = [
+            {
+                "capability": "scp:capability:schema-validation/v1",
+                "verification_level": "SelfAttested",
+            },
+        ]
+        capabilities = ["scp:capability:schema-validation/v1"]
+
+        with patch("scp_sdk.trust._bridge", return_value=mock_bridge):
+            result = check_capability_requirements(
+                "ctx-1", "did:dht:z6MkAlice", requirements, capabilities, []
+            )
+
+        assert result is None
+        mock_bridge.check_capability_requirements.assert_called_once()
+
+        import json
+
+        call_args = mock_bridge.check_capability_requirements.call_args
+        # Bridge arg order: (context_id, subject_did, requirements_json,
+        # agent_capabilities_json, challenge_verifications_json).
+        assert call_args[0][0] == "ctx-1"
+        assert call_args[0][1] == "did:dht:z6MkAlice"
+        assert json.loads(call_args[0][2]) == requirements
+        assert json.loads(call_args[0][3]) == capabilities
+        assert json.loads(call_args[0][4]) == []
+
+    def test_raises_on_bridge_failure(self) -> None:
+        mock_bridge = MagicMock()
+        mock_bridge.check_capability_requirements.side_effect = RuntimeError(
+            "missing required capability"
+        )
+
+        requirements = [
+            {
+                "capability": "scp:capability:schema-validation/v1",
+                "verification_level": "SelfAttested",
+            },
+        ]
+
+        with patch("scp_sdk.trust._bridge", return_value=mock_bridge):
+            with pytest.raises(RuntimeError, match="missing required capability"):
+                check_capability_requirements("ctx-1", "did:dht:z6MkBob", requirements, [], [])
+
+    def test_empty_inputs(self) -> None:
+        mock_bridge = MagicMock()
+        mock_bridge.check_capability_requirements.return_value = None
+
+        with patch("scp_sdk.trust._bridge", return_value=mock_bridge):
+            result = check_capability_requirements("ctx-1", "did:dht:z6MkAlice", [], [], [])
+
+        assert result is None
+        import json
+
+        call_args = mock_bridge.check_capability_requirements.call_args
+        assert call_args[0][0] == "ctx-1"
+        assert call_args[0][1] == "did:dht:z6MkAlice"
+        assert json.loads(call_args[0][2]) == []
+        assert json.loads(call_args[0][3]) == []
+        assert json.loads(call_args[0][4]) == []
