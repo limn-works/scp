@@ -79,10 +79,8 @@ use scp_protocol::context::builder::ContextCreationError;
 use scp_protocol::context::governance::GovernanceModelConfig;
 use scp_protocol::context::governance::mls_integration::EpochCoordinator;
 use scp_protocol::context::membership::{ContextEvent, KeyPackage, MembershipState, ReceiveBuffer};
-use scp_protocol::context::params::GovernanceModel;
 use scp_protocol::context::roles::{Capability, CapabilityCeiling, ContextRoleState};
 use scp_protocol::context::{ContextError, ContextParams, ContextState};
-use scp_protocol::economy::budget::MemberBudgetTracker;
 
 use crate::context::ContextHandle;
 use crate::context::actor::deps::ActorDeps;
@@ -1417,10 +1415,6 @@ pub async fn create_context(
     let broadcast_context =
         deps.supervisor
             .init_broadcast_context(&context_id, &params, &creator_did)?;
-    let (initial_threshold_signers, initial_threshold_value) = match &params.governance {
-        GovernanceModel::Threshold { threshold, signers } => (signers.clone(), *threshold),
-        _ => (Vec::new(), 0),
-    };
     let initial_access_key_store = generate_initial_access_key_store(&context_id, &creator_did);
     let initial_members: HashSet<DID> = membership.members().map(|m| m.did.clone()).collect();
     // ADR-049 §Decision 1: branch the actor's mode-discriminated union on
@@ -1456,45 +1450,15 @@ pub async fn create_context(
         handle: handle.clone(),
         membership,
         members: actor_members,
-        governance: GovernanceState {
-            engine: governance_engine,
-            approved_proposals: HashMap::new(),
-            // H10: fresh contexts start with a zero monotonic counter.
-            next_proposal_seq: 0,
-            freeze: None,
-            timeout_task: GovernanceTimeoutTask::new(),
-            deadlock: DeadlockDetectionState::default(),
-            pending_ceiling_modification: None,
-            pending_economic_policy_change: None,
-            registered_tools: Vec::new(),
-            tool_interfaces: Vec::new(),
-            pruning_policy: None,
-            message_pricing: crate::context::lifecycle_logic::derive_message_pricing(
-                params.economic_policy.as_ref(),
-            ),
-            hard_rate_limit: scp_protocol::economy::antispam::TokenBucketLimiter::new(
-                scp_protocol::economy::antispam::HardRateLimitConfig::matrix_defaults(),
-            ),
-            economic_policy: params.economic_policy.clone(),
-            budget_tracker: MemberBudgetTracker::new(),
-            last_known_members: initial_members,
-            pending_epoch_resets: Vec::new(),
-            consequence_rules: params.consequence_rules.clone(),
-            velocity_tracker: scp_protocol::economy::antispam::SenderVelocityTracker::new(60),
-            participation_cache: HashMap::new(),
-            cooldown_until: HashMap::new(),
-            revoked_spending_ucan_cids: HashSet::new(),
-            proposal_timestamps: HashMap::new(),
-            class_s: crate::context::state::GovernanceClassS {
-                executed_proposals: HashMap::new(),
-                threshold_signers: initial_threshold_signers,
-                threshold_value: initial_threshold_value,
-                spending_nonce_tracker: scp_protocol::crypto::ucan::nonce::NonceTracker::new(
-                    context_id.clone(),
-                    Arc::clone(&deps.clock),
-                ),
-            },
-        },
+        // Shared fresh-context governance bucket (create + spawn-from-Welcome
+        // build the identical set — see `state::fresh_governance_state`).
+        governance: crate::context::state::fresh_governance_state(
+            governance_engine,
+            &params,
+            initial_members,
+            &context_id,
+            Arc::clone(&deps.clock),
+        ),
         role_state,
         receive_buffer: ReceiveBuffer::new(),
         payment_receipts: VecDeque::new(),

@@ -1801,6 +1801,76 @@ pub(crate) fn create_governance_engine(
     }
 }
 
+/// Builds the fresh-context [`GovernanceState`] shared by BOTH the creator-side
+/// create path ([`crate::context::lifecycle_helpers::create_context`]) and the
+/// join-side spawn-from-Welcome path
+/// ([`crate::context::supervisor::Supervisor::build_welcome_joiner_state`]).
+///
+/// Both entrypoints stand up an identical fresh governance bucket — empty
+/// proposal/tool/ceiling/economy maps, the matrix-default hard rate limiter, a
+/// 60-second velocity window, and a fresh spending-nonce tracker — differing
+/// only in the already-built `engine`, the initial `last_known_members` roster,
+/// and the `context_id`/`clock` the nonce tracker binds. Extracting the field
+/// set here means the two paths cannot silently DRIFT: a new `GovernanceState`
+/// field forces one edit, not two. The import/restore paths are deliberately
+/// NOT routed through this helper — they populate the bucket from a persisted
+/// snapshot, not from fresh defaults.
+///
+/// The threshold signer set + quorum value are derived from
+/// `params.governance` here (empty / zero for non-`Threshold` models), matching
+/// what both call sites computed inline before.
+pub(crate) fn fresh_governance_state(
+    engine: Box<dyn GovernanceEngine>,
+    params: &ContextParams,
+    last_known_members: HashSet<DID>,
+    context_id: &str,
+    clock: Arc<dyn Clock>,
+) -> GovernanceState {
+    let (threshold_signers, threshold_value) = match &params.governance {
+        GovernanceModel::Threshold { threshold, signers } => (signers.clone(), *threshold),
+        _ => (Vec::new(), 0),
+    };
+    GovernanceState {
+        engine,
+        approved_proposals: HashMap::new(),
+        // H10: fresh contexts start with a zero monotonic counter.
+        next_proposal_seq: 0,
+        freeze: None,
+        timeout_task: GovernanceTimeoutTask::new(),
+        deadlock: DeadlockDetectionState::default(),
+        pending_ceiling_modification: None,
+        pending_economic_policy_change: None,
+        registered_tools: Vec::new(),
+        tool_interfaces: Vec::new(),
+        pruning_policy: None,
+        message_pricing: crate::context::lifecycle_logic::derive_message_pricing(
+            params.economic_policy.as_ref(),
+        ),
+        hard_rate_limit: scp_protocol::economy::antispam::TokenBucketLimiter::new(
+            scp_protocol::economy::antispam::HardRateLimitConfig::matrix_defaults(),
+        ),
+        economic_policy: params.economic_policy.clone(),
+        budget_tracker: MemberBudgetTracker::new(),
+        last_known_members,
+        pending_epoch_resets: Vec::new(),
+        consequence_rules: params.consequence_rules.clone(),
+        velocity_tracker: scp_protocol::economy::antispam::SenderVelocityTracker::new(60),
+        participation_cache: HashMap::new(),
+        cooldown_until: HashMap::new(),
+        revoked_spending_ucan_cids: HashSet::new(),
+        proposal_timestamps: HashMap::new(),
+        class_s: GovernanceClassS {
+            executed_proposals: HashMap::new(),
+            threshold_signers,
+            threshold_value,
+            spending_nonce_tracker: scp_protocol::crypto::ucan::nonce::NonceTracker::new(
+                context_id.to_owned(),
+                clock,
+            ),
+        },
+    }
+}
+
 /// Restores the [`EpochGraceStore`](crate::crypto::mls::epoch_grace::EpochGraceStore)
 /// from persisted snapshot entries, applying the §23.11 inconsistency
 /// detection and fallback steps.

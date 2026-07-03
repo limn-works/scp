@@ -342,7 +342,8 @@ async fn double_confirm_of_same_reservation_rejected() {
             reply,
         })
         .await
-        .expect_err("double-confirm fails");
+        .err()
+        .expect("double-confirm fails");
     assert!(matches!(err, ContextError::InvalidState(_)));
 
     handle.send_shutdown().await.unwrap();
@@ -469,7 +470,8 @@ async fn unknown_ref_and_unknown_reservation_yield_typed_errors() {
             reply,
         })
         .await
-        .expect_err("unknown reservation confirm fails");
+        .err()
+        .expect("unknown reservation confirm fails");
     assert!(matches!(err, ContextError::InvalidState(_)));
 
     let err = handle
@@ -816,7 +818,8 @@ async fn confirm_persist_failure_retains_reservation_and_errs() {
             reply,
         })
         .await
-        .expect_err("confirm fails closed when the KP-record delete fails");
+        .err()
+        .expect("confirm fails closed when the KP-record delete fails");
     assert!(matches!(err, ContextError::PersistenceFailed(_)));
 
     // KP record still present (consume did NOT durably land).
@@ -833,11 +836,14 @@ async fn confirm_persist_failure_retains_reservation_and_errs() {
 /// SUCCESSFUL internal join must NOT permanently wedge the reservation. The
 /// first confirm errs (the consume did not fully land), but a RETRY — which
 /// re-runs the internal join and now hits the already-written init-key marker
-/// (`scp-kp-consumed-initkey/`) → `MlsError::KeyPackageReplay` — must be
-/// recognized as our own prior completion and converted into an idempotent
-/// SUCCESS that finishes the durable consume. Single-use must still hold.
+/// (`scp-kp-consumed-initkey/`) → `MlsError::KeyPackageReplay` — is recognized
+/// as our own prior completion and idempotently FINISHES the durable consume.
+/// Because the joined group is not retained across confirms (it was produced and
+/// dropped by the first, failed confirm), the retry replies `Err(InvalidState)`
+/// rather than a groupless `Ok`: the join is lost and the joiner must re-initiate
+/// with a fresh key package. Single-use must still hold across the retry.
 #[tokio::test]
-async fn confirm_tombstone_failure_then_healed_retry_succeeds_idempotently() {
+async fn confirm_tombstone_failure_then_healed_retry_completes_consume_but_errs_groupless() {
     let healthy = Arc::new(InMemoryStorage::new());
     let faulty = Arc::new(FaultyStorage::new(Arc::clone(&healthy)));
     let storage: Arc<dyn OpenMlsStorageAdapter> =
@@ -876,7 +882,8 @@ async fn confirm_tombstone_failure_then_healed_retry_succeeds_idempotently() {
             reply,
         })
         .await
-        .expect_err("first confirm errs when the tombstone store fails");
+        .err()
+        .expect("first confirm errs when the tombstone store fails");
     assert!(matches!(err, ContextError::PersistenceFailed(_)));
 
     // The internal join already ran: its init-key marker is durably present
@@ -892,16 +899,22 @@ async fn confirm_tombstone_failure_then_healed_retry_succeeds_idempotently() {
 
     // Heal storage and RETRY the SAME reservation. The retry's inner join hits
     // the marker → KeyPackageReplay → recognized as our own prior completion →
-    // idempotent durable-consume completion → Ok.
+    // idempotent durable-consume completion. The joined group is NOT retained
+    // across confirms (it was produced and dropped by the first, failed
+    // confirm), so the retry replies Err(InvalidState): the join is lost and the
+    // joiner must re-initiate with a FRESH key package. This is fail-closed —
+    // a groupless success is never returned, and the durable consume still lands.
     faulty.clear_fail();
-    handle
+    let retry = handle
         .send(|reply| KeyPackageCommand::ConfirmConsume {
             reservation_id: reservation_id.clone(),
             welcome_bytes: welcome.clone(),
             reply,
         })
         .await
-        .expect("healed retry completes the durable consume idempotently");
+        .err()
+        .expect("healed retry errs — the joined group is not retained across confirms");
+    assert!(matches!(retry, ContextError::InvalidState(_)));
 
     // The consume durably landed: the KP private record is gone (the journal
     // single-use anchor delete) and the reservation is cleared.
@@ -919,7 +932,8 @@ async fn confirm_tombstone_failure_then_healed_retry_succeeds_idempotently() {
             reply,
         })
         .await
-        .expect_err("a consumed reservation must not confirm again");
+        .err()
+        .expect("a consumed reservation must not confirm again");
     assert!(matches!(unknown, ContextError::InvalidState(_)));
 
     handle.send_shutdown().await.unwrap();
@@ -1877,7 +1891,8 @@ async fn malformed_consumed_tombstone_reconciles_fail_closed_and_a2_still_reject
             reply,
         })
         .await
-        .expect_err("a malformed-tombstone reservation must not be restored as reserved");
+        .err()
+        .expect("a malformed-tombstone reservation must not be restored as reserved");
     assert!(matches!(err, ContextError::InvalidState(_)));
 
     // (c) The A2 crypto-layer backstop's durable record survives the
@@ -2049,7 +2064,8 @@ async fn confirm_replay_with_surviving_kp_record_errs_not_false_ok() {
             reply,
         })
         .await
-        .expect_err("first confirm errs when the KP-record delete fails");
+        .err()
+        .expect("first confirm errs when the KP-record delete fails");
     assert!(matches!(err, ContextError::PersistenceFailed(_)));
 
     // Heal the delete fault, but the KP record was never deleted (the delete
@@ -2071,7 +2087,8 @@ async fn confirm_replay_with_surviving_kp_record_errs_not_false_ok() {
             reply,
         })
         .await
-        .expect_err("a replay with a surviving KP record must NOT be a false-success Ok");
+        .err()
+        .expect("a replay with a surviving KP record must NOT be a false-success Ok");
     assert!(
         matches!(retry_err, ContextError::KeyPackageReplay(_)),
         "the surviving-record replay must surface as KeyPackageReplay, got {retry_err:?}"
@@ -2163,7 +2180,8 @@ async fn consumed_precedence_overlapping_reservation_and_tombstone_not_restored(
             reply,
         })
         .await
-        .expect_err("a consumed ref must NOT be restored as a confirmable reservation");
+        .err()
+        .expect("a consumed ref must NOT be restored as a confirmable reservation");
     assert!(matches!(confirm_err, ContextError::InvalidState(_)));
 
     // Nor was it re-pooled: re-reserving the ref errs (not pooled).
@@ -2498,22 +2516,27 @@ async fn confirm_retry_with_different_welcome_completes_without_second_join() {
             reply,
         })
         .await
-        .expect_err("first confirm errs when the tombstone store fails");
+        .err()
+        .expect("first confirm errs when the tombstone store fails");
     assert!(matches!(err, ContextError::PersistenceFailed(_)));
 
     // Heal storage and RETRY with the ALTERNATE welcome. The retry's inner join
     // short-circuits on the already-written init-key marker → recognized as our
-    // own prior completion → idempotent durable-consume completion → Ok. The
-    // alternate welcome is NEVER processed into a join.
+    // own prior completion → idempotent durable-consume completion. The alternate
+    // welcome is NEVER processed into a join. The joined group is not retained
+    // across confirms, so the reply is Err(InvalidState) (not a groupless Ok);
+    // the durable consume still lands and single-use holds.
     faulty.clear_fail();
-    handle
+    let retry = handle
         .send(|reply| KeyPackageCommand::ConfirmConsume {
             reservation_id: reservation_id.clone(),
             welcome_bytes: welcome_alternate.clone(),
             reply,
         })
         .await
-        .expect("retry with a different welcome idempotently completes the consume");
+        .err()
+        .expect("retry errs — the joined group is not retained across confirms");
+    assert!(matches!(retry, ContextError::InvalidState(_)));
 
     // The consume durably landed (KP record gone) and single-use holds.
     assert!(
@@ -2549,7 +2572,8 @@ async fn confirm_retry_with_different_welcome_completes_without_second_join() {
             reply,
         })
         .await
-        .expect_err("a consumed reservation must not confirm again");
+        .err()
+        .expect("a consumed reservation must not confirm again");
     assert!(matches!(unknown, ContextError::InvalidState(_)));
 
     handle.send_shutdown().await.unwrap();
@@ -2925,7 +2949,8 @@ async fn confirm_with_bad_welcome_keeps_reservation_for_retry() {
             reply,
         })
         .await
-        .expect_err("a bad welcome makes the fused join fail");
+        .err()
+        .expect("a bad welcome makes the fused join fail");
     assert!(matches!(err, ContextError::CryptoFailed(_)));
 
     // KP NOT burned — record still present.

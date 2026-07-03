@@ -430,6 +430,15 @@ impl SupervisorHandle {
             .await
     }
 
+    // NOTE (ADR-049 Phase 2J): the capability-gated `SupervisorHandle` wrapper
+    // for spawn-from-Welcome is the FUTURE FFI seam and lands WITH its FFI caller
+    // in the FFI follow-on slice (it takes `&OwnedIdentityDid` to bind the
+    // joiner's own identity). It is intentionally NOT defined in this core slice:
+    // the raw `Supervisor::spawn_actor_from_welcome` entry point is narrowed to
+    // `pub(in crate::context)` and exercised directly by the runtime
+    // spawn-from-Welcome tests; there is no production consumer until that slice, so an
+    // uncalled `#[allow(dead_code)]` wrapper here would be dead weight.
+
     /// Dispatch [`LifecycleControlCommand::PrepareForReplace`] to the
     /// actor currently registered for `context_id`, awaiting its verdict.
     ///

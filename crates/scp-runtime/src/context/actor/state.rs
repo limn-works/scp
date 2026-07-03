@@ -136,6 +136,21 @@ pub enum ContextLifecycleState {
 /// Because reservations are keyed by id, concurrent Welcomes for distinct
 /// contexts never clobber one another — the single-slot provider could hold
 /// only one outstanding KP-for-join at a time.
+///
+/// # ADR-049 Phase 2J crash-safety classification (spawn-from-Welcome)
+///
+/// This scratchpad is **transient handshake state, NOT persisted** (not in any
+/// class of the §9 snapshot). The
+/// [`Supervisor::spawn_actor_from_welcome`](crate::context::supervisor::Supervisor::spawn_actor_from_welcome)
+/// entrypoint fuses the join and durably consumes the KeyPackage BEFORE the
+/// joiner actor is spawned, so a freshly-spawned joiner carries
+/// `welcome_scratchpad: None` — there is nothing authorization-critical left in
+/// it to survive a crash. The picked-up crypto the joiner obtains (the joined
+/// MLS group + its own sender key) is **Class M**: it lives in the
+/// supervisor-owned crypto provider `Arc`, is captured into the fail-closed
+/// initial snapshot's `mls_crypto_state`, and is max-merged on respawn (spec
+/// §23.17.2 Invariant 2) via the existing crypto snapshot/restore path — so it
+/// round-trips through snapshot/respawn without any new snapshot field here.
 #[derive(Debug, Default)]
 pub struct WelcomeProcessing {
     /// Opaque bytes of the OpenMLS `StagedWelcome`. Zeroized on drop
