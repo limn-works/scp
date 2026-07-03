@@ -2239,6 +2239,58 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func contextJoin(handle: ContextHandle, identity: Identity, spendingUcanJwt: String?) async throws 
     
     /**
+     * Joins an existing SCP context by processing a received MLS Welcome,
+     * standing the local (joiner) identity up as a send-capable participant.
+     *
+     * Completes the reserve → Welcome → join handshake begun by
+     * [`reserve_key_package`](Self::reserve_key_package): given the Welcome the
+     * context creator minted for a previously-reserved `KeyPackage`, this
+     * installs the joined MLS group, derives the joiner's §9.10.4 routing
+     * pseudonym, persists the initial keyed snapshot fail-closed, registers a
+     * context handle, and records the joined context in the known-contexts
+     * discovery registry. Without it a Welcome-joined node can DECRYPT but
+     * cannot SEND (no handle-backed context).
+     *
+     * The bridge-side UCAN validation state is registered as a REVERSIBLE
+     * precheck BEFORE the irreversible runtime join and rolled back on failure:
+     * there is no path where the runtime join commits but bridge state errors,
+     * and no leaked bridge/discovery state when the join fails. A context id
+     * already active on this instance collides at the Occupied precheck BEFORE
+     * the single-use `KeyPackage` is consumed.
+     *
+     * Local-identity custody of the JOINER (`identity`) is enforced at the
+     * bridge exactly as `context_create` enforces it for the creator: the
+     * joiner's routing pseudonym is DERIVED from its locally-custodied identity
+     * (never caller-supplied), so a non-custodied joiner hard-fails at the
+     * derivation seam with the canonical `SCP-IDENT-1054` before the single-use
+     * `KeyPackage` is consumed.
+     *
+     * # Arguments
+     *
+     * * `identity` -- The LOCAL (joiner) identity. Its custody derives the
+     * routing pseudonym; passed separately from `creator_did` so the two
+     * cannot be transposed. Rejected with `SCP-PERM-3030` if it was not
+     * minted by this `Scp` instance.
+     * * `creator_did` -- DID of the context creator / admin (from the legible
+     * params).
+     * * `context_id` -- Canonical 64-hex context id (ADR-056).
+     * * `params` -- Legible context parameters (see [`ContextParams`]).
+     * * `reservation_id` -- The opaque reservation id returned by
+     * `reserve_key_package` for the `KeyPackage` this Welcome addresses.
+     * * `welcome_bytes` -- The TLS-serialized MLS Welcome message.
+     *
+     * # Errors
+     *
+     * Returns `ScpError::Identity` if the joiner is not locally custodied,
+     * or `ScpError::Context` / `ScpError::Validation` if the params are
+     * invalid, the reservation id is malformed, the context id already
+     * collides on this instance, or the spawn fails (bad/duplicate Welcome,
+     * single-use replay, first-writer-wins collision, or fail-closed persist
+     * failure).
+     */
+    func contextJoinFromWelcome(identity: Identity, creatorDid: String, contextId: String, params: ContextParams, reservationId: String, welcomeBytes: Data) async throws  -> ContextHandle
+    
+    /**
      * Per-instance equivalent of the free-function `context_leave`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` /
@@ -2902,6 +2954,35 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func relayStartLocal(dataDir: String) async throws  -> RelayHandle
     
     /**
+     * Reserves a single-use MLS `KeyPackage` for a Welcome-based join,
+     * returning the reservation handle and the PUBLIC `KeyPackage` bytes.
+     *
+     * Begins the reserve → Welcome → join handshake completed by
+     * [`context_join_from_welcome`](Self::context_join_from_welcome): the
+     * returned `reservation_id` is passed back to that call so the fused
+     * consume can match the join. The private signer state never leaves the
+     * node's `KeyPackage` actor — only PUBLIC bytes cross the FFI boundary
+     * (ADR-049 Phase 2J).
+     *
+     * Local-identity custody is enforced at the bridge (the same trust model
+     * as `context_create`): `identity` MUST be a locally-custodied identity
+     * that holds retained key material. A DID-only handle from `identity_load`
+     * (no custody) is rejected with `SCP-IDENT-1054`.
+     *
+     * # Arguments
+     *
+     * * `identity` -- The LOCAL identity reserving the `KeyPackage`. Rejected
+     * with `SCP-PERM-3030` if it was not minted by this `Scp` instance.
+     *
+     * # Errors
+     *
+     * Returns `ScpError::Identity` (`SCP-IDENT-1054`) if `identity` holds no
+     * retained key material, or `ScpError::Context` if the reservation fails
+     * (providers not wired, empty pool).
+     */
+    func reserveKeyPackage(identity: Identity) async throws  -> ReservedKeyPackage
+    
+    /**
      * Per-instance equivalent of the free-function `restore_all_contexts`.
      *
      * Routes through `&*self.inner` and the supervisor-scope
@@ -3129,8 +3210,10 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * # Errors
      *
      * Returns one of the typed saga errors — [`ScpError::SagaAborted`] (a
-     * Prepare-phase rejection — authorization, freshness, rate limit, or
-     * co-residency; carries `retry_after_ms`), [`ScpError::SagaNeedsRepair`]
+     * Prepare-phase abort that may be a permanent rejection — authorization,
+     * freshness, rate limit, or co-residency — OR a retryable transient: a rate
+     * limit, or a participant actor unavailable to complete the Prepare
+     * exchange; carries `retry_after_ms`), [`ScpError::SagaNeedsRepair`]
      * (Commit-retry exhausted — carries the durable `saga_id` operator-repair
      * handle), or [`ScpError::SagaBusy`] (the participant context set
      * overlapped an in-flight saga — §5.15.4). Returns [`ScpError::Validation`]
@@ -4194,6 +4277,73 @@ open func contextJoin(handle: ContextHandle, identity: Identity, spendingUcanJwt
             completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
             freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
             liftFunc: { $0 },
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Joins an existing SCP context by processing a received MLS Welcome,
+     * standing the local (joiner) identity up as a send-capable participant.
+     *
+     * Completes the reserve → Welcome → join handshake begun by
+     * [`reserve_key_package`](Self::reserve_key_package): given the Welcome the
+     * context creator minted for a previously-reserved `KeyPackage`, this
+     * installs the joined MLS group, derives the joiner's §9.10.4 routing
+     * pseudonym, persists the initial keyed snapshot fail-closed, registers a
+     * context handle, and records the joined context in the known-contexts
+     * discovery registry. Without it a Welcome-joined node can DECRYPT but
+     * cannot SEND (no handle-backed context).
+     *
+     * The bridge-side UCAN validation state is registered as a REVERSIBLE
+     * precheck BEFORE the irreversible runtime join and rolled back on failure:
+     * there is no path where the runtime join commits but bridge state errors,
+     * and no leaked bridge/discovery state when the join fails. A context id
+     * already active on this instance collides at the Occupied precheck BEFORE
+     * the single-use `KeyPackage` is consumed.
+     *
+     * Local-identity custody of the JOINER (`identity`) is enforced at the
+     * bridge exactly as `context_create` enforces it for the creator: the
+     * joiner's routing pseudonym is DERIVED from its locally-custodied identity
+     * (never caller-supplied), so a non-custodied joiner hard-fails at the
+     * derivation seam with the canonical `SCP-IDENT-1054` before the single-use
+     * `KeyPackage` is consumed.
+     *
+     * # Arguments
+     *
+     * * `identity` -- The LOCAL (joiner) identity. Its custody derives the
+     * routing pseudonym; passed separately from `creator_did` so the two
+     * cannot be transposed. Rejected with `SCP-PERM-3030` if it was not
+     * minted by this `Scp` instance.
+     * * `creator_did` -- DID of the context creator / admin (from the legible
+     * params).
+     * * `context_id` -- Canonical 64-hex context id (ADR-056).
+     * * `params` -- Legible context parameters (see [`ContextParams`]).
+     * * `reservation_id` -- The opaque reservation id returned by
+     * `reserve_key_package` for the `KeyPackage` this Welcome addresses.
+     * * `welcome_bytes` -- The TLS-serialized MLS Welcome message.
+     *
+     * # Errors
+     *
+     * Returns `ScpError::Identity` if the joiner is not locally custodied,
+     * or `ScpError::Context` / `ScpError::Validation` if the params are
+     * invalid, the reservation id is malformed, the context id already
+     * collides on this instance, or the spawn fails (bad/duplicate Welcome,
+     * single-use replay, first-writer-wins collision, or fail-closed persist
+     * failure).
+     */
+open func contextJoinFromWelcome(identity: Identity, creatorDid: String, contextId: String, params: ContextParams, reservationId: String, welcomeBytes: Data)async throws  -> ContextHandle  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_context_join_from_welcome(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeIdentity_lower(identity),FfiConverterString.lower(creatorDid),FfiConverterString.lower(contextId),FfiConverterTypeContextParams_lower(params),FfiConverterString.lower(reservationId),FfiConverterData.lower(welcomeBytes)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_pointer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_pointer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_pointer,
+            liftFunc: FfiConverterTypeContextHandle_lift,
             errorHandler: FfiConverterTypeScpError_lift
         )
 }
@@ -5773,6 +5923,50 @@ open func relayStartLocal(dataDir: String)async throws  -> RelayHandle  {
 }
     
     /**
+     * Reserves a single-use MLS `KeyPackage` for a Welcome-based join,
+     * returning the reservation handle and the PUBLIC `KeyPackage` bytes.
+     *
+     * Begins the reserve → Welcome → join handshake completed by
+     * [`context_join_from_welcome`](Self::context_join_from_welcome): the
+     * returned `reservation_id` is passed back to that call so the fused
+     * consume can match the join. The private signer state never leaves the
+     * node's `KeyPackage` actor — only PUBLIC bytes cross the FFI boundary
+     * (ADR-049 Phase 2J).
+     *
+     * Local-identity custody is enforced at the bridge (the same trust model
+     * as `context_create`): `identity` MUST be a locally-custodied identity
+     * that holds retained key material. A DID-only handle from `identity_load`
+     * (no custody) is rejected with `SCP-IDENT-1054`.
+     *
+     * # Arguments
+     *
+     * * `identity` -- The LOCAL identity reserving the `KeyPackage`. Rejected
+     * with `SCP-PERM-3030` if it was not minted by this `Scp` instance.
+     *
+     * # Errors
+     *
+     * Returns `ScpError::Identity` (`SCP-IDENT-1054`) if `identity` holds no
+     * retained key material, or `ScpError::Context` if the reservation fails
+     * (providers not wired, empty pool).
+     */
+open func reserveKeyPackage(identity: Identity)async throws  -> ReservedKeyPackage  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_reserve_key_package(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeIdentity_lower(identity)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeReservedKeyPackage_lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
      * Per-instance equivalent of the free-function `restore_all_contexts`.
      *
      * Routes through `&*self.inner` and the supervisor-scope
@@ -6203,8 +6397,10 @@ open func toolInvokeCrossContext(sourceHandle: ContextHandle, targetHandle: Cont
      * # Errors
      *
      * Returns one of the typed saga errors — [`ScpError::SagaAborted`] (a
-     * Prepare-phase rejection — authorization, freshness, rate limit, or
-     * co-residency; carries `retry_after_ms`), [`ScpError::SagaNeedsRepair`]
+     * Prepare-phase abort that may be a permanent rejection — authorization,
+     * freshness, rate limit, or co-residency — OR a retryable transient: a rate
+     * limit, or a participant actor unavailable to complete the Prepare
+     * exchange; carries `retry_after_ms`), [`ScpError::SagaNeedsRepair`]
      * (Commit-retry exhausted — carries the durable `saga_id` operator-repair
      * handle), or [`ScpError::SagaBusy`] (the participant context set
      * overlapped an in-flight saga — §5.15.4). Returns [`ScpError::Validation`]
@@ -10439,6 +10635,101 @@ public func FfiConverterTypeReliabilityScoreRecord_lower(_ value: ReliabilitySco
 
 
 /**
+ * Result of [`Scp::reserve_key_package`](crate::scp::Scp::reserve_key_package):
+ * an opaque reservation handle plus the PUBLIC MLS `KeyPackage` bytes for the
+ * reserved key package.
+ *
+ * The `reservation_id` is passed back to
+ * [`Scp::context_join_from_welcome`](crate::scp::Scp::context_join_from_welcome)
+ * so the fused consume can match the join. Only PUBLIC bytes cross the FFI
+ * boundary — the private signer state never leaves the node's `KeyPackage`
+ * actor (ADR-049 Phase 2J).
+ */
+public struct ReservedKeyPackage {
+    /**
+     * Opaque reservation id string. A lookup key, not a capability — it grants
+     * nothing; a bogus id simply fails the fused consume match downstream.
+     */
+    public var reservationId: String
+    /**
+     * The PUBLIC MLS `KeyPackage` bytes for the reserved key package.
+     */
+    public var keyPackagePublic: Data
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * Opaque reservation id string. A lookup key, not a capability — it grants
+         * nothing; a bogus id simply fails the fused consume match downstream.
+         */reservationId: String, 
+        /**
+         * The PUBLIC MLS `KeyPackage` bytes for the reserved key package.
+         */keyPackagePublic: Data) {
+        self.reservationId = reservationId
+        self.keyPackagePublic = keyPackagePublic
+    }
+}
+
+#if compiler(>=6)
+extension ReservedKeyPackage: Sendable {}
+#endif
+
+
+extension ReservedKeyPackage: Equatable, Hashable {
+    public static func ==(lhs: ReservedKeyPackage, rhs: ReservedKeyPackage) -> Bool {
+        if lhs.reservationId != rhs.reservationId {
+            return false
+        }
+        if lhs.keyPackagePublic != rhs.keyPackagePublic {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(reservationId)
+        hasher.combine(keyPackagePublic)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeReservedKeyPackage: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ReservedKeyPackage {
+        return
+            try ReservedKeyPackage(
+                reservationId: FfiConverterString.read(from: &buf), 
+                keyPackagePublic: FfiConverterData.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ReservedKeyPackage, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.reservationId, into: &buf)
+        FfiConverterData.write(value.keyPackagePublic, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeReservedKeyPackage_lift(_ buf: RustBuffer) throws -> ReservedKeyPackage {
+    return try FfiConverterTypeReservedKeyPackage.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeReservedKeyPackage_lower(_ value: ReservedKeyPackage) -> RustBuffer {
+    return FfiConverterTypeReservedKeyPackage.lower(value)
+}
+
+
+/**
  * The committed terminal of a §6.2.4 cross-context tool-invocation saga
  * (ADR-049 §3a).
  *
@@ -12486,14 +12777,18 @@ public enum ScpError: Swift.Error {
      * A §6.2.4 cross-context tool-invocation saga aborted at a Prepare phase.
      *
      * Surfaces the `Aborted` terminal of
-     * `Supervisor::start_cross_context_tool_invocation_saga` (a §6.2.4
-     * authorization / freshness / rate-limit / co-residency rejection — also
-     * the §6.2.4 *Caller authentication* mismatch this bridge enforces before
-     * the saga runs). Carries the rate-limit back-off hint STRUCTURALLY
+     * `Supervisor::start_cross_context_tool_invocation_saga`. This terminal may
+     * be a PERMANENT rejection (authorization / freshness / rate-limit /
+     * co-residency policy denial, or the §6.2.4 *Caller authentication*
+     * mismatch this bridge enforces before the saga runs) OR a RETRYABLE
+     * transient (a rate-limit back-off, or a participant actor unavailable to
+     * complete the Prepare exchange) — distinguished by the `SCP-SAGA-*` code.
+     * Carries the rate-limit back-off hint STRUCTURALLY
      * (`retry_after_ms`): `Some(ms)` is the limiter's computed cooldown;
      * `None` (NEVER `0`) means no precise back-off instant exists (a
-     * token-bucket hard limit, or a non-rate-limit rejection) — `0` would read
-     * as "retry immediately" and re-trip the same hard limit. `code` is the
+     * token-bucket hard limit, an unavailable participant actor, or a permanent
+     * rejection) — `0` would read as "retry immediately" and re-trip the same
+     * hard limit. `code` is the
      * canonical `SCP-SAGA-13xxx` string. Maps to Swift `ScpError.SagaAborted`
      * / Kotlin `ScpException.SagaAborted` (the `msg` field surfaces as the
      * Swift `msg:` label — the `UniFFI` field-name convention every variant
@@ -16412,6 +16707,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_context_join() != 13120) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_context_join_from_welcome() != 31910) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_context_leave() != 21568) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -16649,6 +16947,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_relay_start_local() != 7556) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_reserve_key_package() != 25723) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_restore_all_contexts() != 32770) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -16700,7 +17001,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_tool_invoke_cross_context() != 47346) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_tool_invoke_cross_context_saga() != 59585) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_tool_invoke_cross_context_saga() != 1312) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_tool_register() != 65327) {

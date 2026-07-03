@@ -320,6 +320,90 @@ public actor Context {
         )
     }
 
+    /// Joins an existing SCP context by processing a received MLS Welcome,
+    /// standing the local (joiner) identity up as a send-capable participant
+    /// (ADR-049 Phase 2J).
+    ///
+    /// The join-side counterpart of ``create(scp:identity:params:)``: it
+    /// completes the reserve → Welcome → join handshake begun by
+    /// ``SCP/reserveKeyPackage(identity:)``. Given the Welcome the creator
+    /// minted for a previously-reserved `KeyPackage`, this installs the joined
+    /// MLS group, derives the joiner's §9.10.4 routing pseudonym from its
+    /// locally-custodied identity (never caller-supplied), registers a context
+    /// handle, and returns an active ``Context``. Without it a Welcome-joined
+    /// node can DECRYPT but cannot SEND. A non-custodied joiner hard-fails with
+    /// `"SCP-IDENT-1054"` before the single-use `KeyPackage` is consumed.
+    ///
+    /// The canonical reserve → Welcome → join happy path:
+    ///
+    /// ```swift
+    /// // 1. Joiner reserves a single-use KeyPackage under its own identity.
+    /// let reservation = try await scp.reserveKeyPackage(identity: joiner)
+    ///
+    /// // 2. Hand `reservation.keyPackagePublic` to the creator out of band; the
+    /// //    creator adds it to the MLS group and returns a Welcome addressed to it.
+    /// let welcomeBytes: Data = /* received from the creator */
+    ///
+    /// // 3. Joiner processes the Welcome and stands up a send-capable context.
+    /// let ctx = try await Context.joinFromWelcome(
+    ///     scp: scp,
+    ///     identity: joiner,
+    ///     creatorDid: creator.did(),
+    ///     contextId: contextId,
+    ///     params: params,
+    ///     reservationId: reservation.reservationId,
+    ///     welcomeBytes: welcomeBytes
+    /// )
+    /// try await ctx.send(Data("hello from the joiner".utf8))
+    /// ```
+    ///
+    /// - Parameters:
+    ///   - scp: The SDK-level ``SCP`` instance that owns the reservation and
+    ///     will own the minted handle. Must be the same instance that produced
+    ///     the reservation via ``SCP/reserveKeyPackage(identity:)`` — a handle
+    ///     minted here is rejected by any other ``SCP`` via the per-instance
+    ///     handle-affinity check.
+    ///   - identity: The LOCAL (joiner) ``Identity`` — the reservation holder.
+    ///     Its custody derives the routing pseudonym, so it MUST be locally
+    ///     custodied; passed separately from `creatorDid` so the two cannot be
+    ///     transposed.
+    ///   - creatorDid: DID of the context creator / admin that minted the
+    ///     Welcome (from the legible params).
+    ///   - contextId: The canonical id of the context being joined.
+    ///   - params: The legible ``ContextParams`` — the SAME shape
+    ///     ``create(scp:identity:params:)`` takes.
+    ///   - reservationId: The ``ReservedKeyPackage/reservationId`` returned by
+    ///     ``SCP/reserveKeyPackage(identity:)`` for the `KeyPackage` this Welcome
+    ///     addresses.
+    ///   - welcomeBytes: The TLS-serialized MLS Welcome message (`Data`, the
+    ///     SDK's byte convention).
+    /// - Returns: An active ``Context`` re-homed under the joiner's identity.
+    /// - Throws: ``ScpError/Identity(msg:code:)`` (`"SCP-IDENT-1054"`) if the
+    ///   joiner is not locally custodied; ``ScpError/Validation(msg:code:)`` if
+    ///   the DIDs, context id, params, or reservation id are malformed; or
+    ///   ``ScpError/Context(msg:code:)`` if the context id already collides on
+    ///   this instance or the Welcome spawn fails (bad/duplicate/replayed
+    ///   Welcome, first-writer-wins collision, or fail-closed persist failure).
+    public static func joinFromWelcome(
+        scp: SCP,
+        identity: Identity,
+        creatorDid: String,
+        contextId: String,
+        params: ContextParams,
+        reservationId: String,
+        welcomeBytes: Data
+    ) async throws -> Context {
+        let handle = try await scp.contextJoinFromWelcome(
+            identity: identity,
+            creatorDid: creatorDid,
+            contextId: contextId,
+            params: params,
+            reservationId: reservationId,
+            welcomeBytes: welcomeBytes
+        )
+        return Context(scp: scp, handle: handle, identity: identity)
+    }
+
     // MARK: - Public methods
 
     /// Sends a message payload to this context.

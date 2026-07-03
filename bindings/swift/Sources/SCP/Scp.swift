@@ -414,6 +414,33 @@ public extension SCP {
         try await inner.contextJoin(handle: handle, identity: identity, spendingUcanJwt: spendingUcanJwt)
     }
 
+    /// Forwards to ``Scp/contextJoinFromWelcome`` on ``inner``.
+    ///
+    /// Low-level forwarder returning the raw ``ContextHandle``. Prefer
+    /// ``Context/joinFromWelcome(scp:identity:creatorDid:contextId:params:reservationId:welcomeBytes:)``,
+    /// which wraps the handle in a live ``Context`` (mirroring how
+    /// ``Context/create(scp:identity:params:)`` relates to ``contextCreate(identity:params:)``).
+    ///
+    /// `welcomeBytes` is the TLS-serialized MLS Welcome; UniFFI marshals it as
+    /// `Data` (the SDK's byte-return convention, matching `contextExport`).
+    func contextJoinFromWelcome(
+        identity: Identity,
+        creatorDid: String,
+        contextId: String,
+        params: ContextParams,
+        reservationId: String,
+        welcomeBytes: Data
+    ) async throws -> ContextHandle {
+        try await inner.contextJoinFromWelcome(
+            identity: identity,
+            creatorDid: creatorDid,
+            contextId: contextId,
+            params: params,
+            reservationId: reservationId,
+            welcomeBytes: welcomeBytes
+        )
+    }
+
     /// Forwards to ``Scp/contextLeave`` on ``inner``.
     func contextLeave(handle: ContextHandle, identity: Identity) async throws {
         try await inner.contextLeave(handle: handle, identity: identity)
@@ -877,6 +904,55 @@ public extension SCP {
     /// Forwards to ``Scp/relayStartLocal`` on ``inner``.
     func relayStartLocal(dataDir: String) async throws -> RelayHandle {
         try await inner.relayStartLocal(dataDir: dataDir)
+    }
+
+    /// Reserves a pooled MLS `KeyPackage` under the joiner's own identity for a
+    /// spawn-from-Welcome join (ADR-049 Phase 2J).
+    ///
+    /// The join-side peer of ``Context/create(scp:identity:params:)``: a node
+    /// that intends to JOIN by receiving a Welcome first reserves a single-use
+    /// `KeyPackage` under its OWN identity. Only the PUBLIC
+    /// ``ReservedKeyPackage/keyPackagePublic`` bytes cross the FFI boundary —
+    /// the joiner's private signer state never leaves the native core. Hand
+    /// those public bytes to the context creator (out of band); the creator adds
+    /// them to its MLS group and mints a Welcome addressed to this reservation,
+    /// then you pass ``ReservedKeyPackage/reservationId`` and the Welcome to
+    /// ``Context/joinFromWelcome(scp:identity:creatorDid:contextId:params:reservationId:welcomeBytes:)``.
+    ///
+    /// The canonical reserve → Welcome → join happy path:
+    ///
+    /// ```swift
+    /// // Joiner reserves a single-use KeyPackage under its own identity.
+    /// let reservation = try await scp.reserveKeyPackage(identity: joiner)
+    ///
+    /// // Hand `reservation.keyPackagePublic` to the creator out of band. The
+    /// // creator adds it to the MLS group and returns a Welcome addressed to it.
+    /// let welcomeBytes: Data = /* received from the creator */
+    ///
+    /// // Joiner processes the Welcome and stands up a send-capable context.
+    /// let ctx = try await Context.joinFromWelcome(
+    ///     scp: scp,
+    ///     identity: joiner,
+    ///     creatorDid: creator.did(),
+    ///     contextId: contextId,
+    ///     params: params,
+    ///     reservationId: reservation.reservationId,
+    ///     welcomeBytes: welcomeBytes
+    /// )
+    /// ```
+    ///
+    /// - Parameter identity: The joiner's own ``Identity``. MUST be a
+    ///   locally-custodied identity holding retained key material (the same
+    ///   trust model as ``Context/create(scp:identity:params:)``); a DID-only
+    ///   handle from ``identityLoad(did:)`` fails closed with
+    ///   ``ScpError/Identity(msg:code:)`` code `"SCP-IDENT-1054"`. Rejected with
+    ///   `"SCP-PERM-3030"` if it was not minted by this ``SCP`` instance.
+    /// - Returns: The opaque ``ReservedKeyPackage`` — the `reservationId` lookup
+    ///   key plus the PUBLIC `keyPackagePublic` MLS `KeyPackage` bytes.
+    /// - Throws: ``ScpError/Identity(msg:code:)`` if the identity is not locally
+    ///   custodied, or ``ScpError/Context(msg:code:)`` if the reservation fails.
+    func reserveKeyPackage(identity: Identity) async throws -> ReservedKeyPackage {
+        try await inner.reserveKeyPackage(identity: identity)
     }
 
     /// Forwards to ``Scp/restoreAllContexts`` on ``inner``.
