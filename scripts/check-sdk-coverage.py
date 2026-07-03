@@ -455,6 +455,9 @@ ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
     # the mapping must be explicit.
     ("Context", "reserve_key_package"): {
         "python": ["reserve_key_package"],
+        "typescript": ["reserveKeyPackage"],
+        "kotlin": ["reserveKeyPackage"],
+        "swift": ["reserveKeyPackage"],
     },
     ("Context", "join_from_welcome"): {
         "python": ["context_join_from_welcome"],
