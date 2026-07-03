@@ -32,7 +32,7 @@ use std::sync::Arc;
 
 use ed25519_dalek::SigningKey;
 use scp_core::context::supervisor::Supervisor;
-use scp_identity::DID;
+use scp_did::DID;
 use scp_transport::HeartbeatConfig;
 use scp_transport::profile::TransportProfile;
 use tokio_util::sync::CancellationToken;

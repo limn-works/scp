@@ -28,7 +28,7 @@
 use std::sync::Arc;
 
 use scp_client::{LocalSigner, MemoryStorage, ScpClient, Storage};
-use scp_primitives::{Clock, TestClock};
+use scp_clock::{Clock, TestClock};
 use scp_protocol::context::membership::ContextEvent;
 
 const CTX: &str = "ctx-adr057-slice2-two-party";

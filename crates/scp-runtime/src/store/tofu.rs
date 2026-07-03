@@ -13,7 +13,7 @@
 //!
 //! See spec section 17.3 and §9.11 (Key Continuity Verification).
 
-use scp_identity::DID;
+use scp_did::DID;
 use scp_platform::traits::Storage;
 
 use scp_protocol::crypto::tofu::TofuRecord;
@@ -85,8 +85,8 @@ mod tests {
     use crate::store::ProtocolRepository;
     use scp_protocol::crypto::tofu::{ObservedKeys, create_tofu_record};
 
-    fn test_did() -> scp_identity::DID {
-        scp_identity::DID::from("did:dht:z6MkTofuTest")
+    fn test_did() -> scp_did::DID {
+        scp_did::DID::from("did:dht:z6MkTofuTest")
     }
 
     fn make_store() -> ProtocolRepository<InMemoryStorage> {

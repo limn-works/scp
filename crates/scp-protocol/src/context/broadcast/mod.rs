@@ -26,7 +26,7 @@ use crate::crypto::ucan::capability::CapabilityUri;
 use crate::crypto::ucan::validate::{
     DidResolver, NonceTracker, ProofResolver, RevocationChecker, ValidationContext, validate_ucan,
 };
-use scp_primitives::DID;
+use scp_did::DID;
 
 // ---------------------------------------------------------------------------
 // BroadcastAdmission
@@ -2189,7 +2189,7 @@ mod tests {
         InMemoryProofResolver, InMemoryRevocationChecker,
     };
     use crate::crypto::ucan::{Attenuation, UcanHeader, UcanPayload};
-    use scp_primitives::Clock;
+    use scp_clock::Clock;
     use std::collections::HashMap as StdHashMap;
 
     // AAD constants for sender-layer encrypt/decrypt in broadcast tests.
@@ -2280,8 +2280,8 @@ mod tests {
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         use ed25519_dalek::Signer;
 
-        let now_secs = scp_primitives::SystemClock.now_secs();
-        let now_millis = scp_primitives::SystemClock.now_millis();
+        let now_secs = scp_clock::SystemClock.now_secs();
+        let now_millis = scp_clock::SystemClock.now_millis();
 
         let header = UcanHeader::new();
         let payload = UcanPayload {
@@ -2512,7 +2512,7 @@ mod tests {
             context_creator_did: &setup.issuer_did,
             presenting_agent_did: "did:example:bob",
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
-            clock: &scp_primitives::SystemClock,
+            clock: &scp_clock::SystemClock,
         };
 
         let result = ctx
@@ -2540,7 +2540,7 @@ mod tests {
             context_creator_did: &setup.issuer_did,
             presenting_agent_did: "did:example:bob",
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
-            clock: &scp_primitives::SystemClock,
+            clock: &scp_clock::SystemClock,
         };
 
         let result = ctx.subscribe("did:example:bob", Some(&ucan), 1000, Some(&mut val_ctx));
@@ -2560,8 +2560,8 @@ mod tests {
             use base64::engine::general_purpose::URL_SAFE_NO_PAD;
             use ed25519_dalek::Signer;
 
-            let now_secs = scp_primitives::SystemClock.now_secs();
-            let now_millis = scp_primitives::SystemClock.now_millis();
+            let now_secs = scp_clock::SystemClock.now_secs();
+            let now_millis = scp_clock::SystemClock.now_millis();
 
             let header = UcanHeader::new();
             let payload = UcanPayload {
@@ -2605,7 +2605,7 @@ mod tests {
             context_creator_did: &setup.issuer_did,
             presenting_agent_did: "did:example:bob",
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
-            clock: &scp_primitives::SystemClock,
+            clock: &scp_clock::SystemClock,
         };
 
         let result = ctx.subscribe("did:example:bob", Some(&ucan), 1000, Some(&mut val_ctx));
@@ -2629,7 +2629,7 @@ mod tests {
             context_creator_did: &setup.issuer_did,
             presenting_agent_did: "did:example:bob",
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
-            clock: &scp_primitives::SystemClock,
+            clock: &scp_clock::SystemClock,
         };
 
         let result = ctx.subscribe("did:example:bob", Some(&ucan), 1000, Some(&mut val_ctx));
@@ -3086,7 +3086,7 @@ mod tests {
             context_creator_did: &setup.issuer_did,
             presenting_agent_did: "did:example:sub1",
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
-            clock: &scp_primitives::SystemClock,
+            clock: &scp_clock::SystemClock,
         };
         ctx.subscribe("did:example:sub1", Some(&ucan), 1000, Some(&mut val_ctx))
             .unwrap();
@@ -3137,8 +3137,8 @@ mod tests {
             use base64::engine::general_purpose::URL_SAFE_NO_PAD;
             use ed25519_dalek::Signer;
 
-            let now_secs = scp_primitives::SystemClock.now_secs();
-            let now_millis = scp_primitives::SystemClock.now_millis();
+            let now_secs = scp_clock::SystemClock.now_secs();
+            let now_millis = scp_clock::SystemClock.now_millis();
 
             let header = UcanHeader::new();
             let payload = UcanPayload {
@@ -3182,7 +3182,7 @@ mod tests {
             context_creator_did: &setup.issuer_did,
             presenting_agent_did: "did:example:bob",
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
-            clock: &scp_primitives::SystemClock,
+            clock: &scp_clock::SystemClock,
         };
 
         // With full validation, a properly signed wildcard UCAN from the
@@ -3209,8 +3209,8 @@ mod tests {
             use base64::Engine;
             use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
-            let now_secs = scp_primitives::SystemClock.now_secs();
-            let now_millis = scp_primitives::SystemClock.now_millis();
+            let now_secs = scp_clock::SystemClock.now_secs();
+            let now_millis = scp_clock::SystemClock.now_millis();
 
             let header = UcanHeader::new();
             let payload = UcanPayload {
@@ -3253,7 +3253,7 @@ mod tests {
             context_creator_did: &setup.issuer_did,
             presenting_agent_did: "did:example:bob",
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
-            clock: &scp_primitives::SystemClock,
+            clock: &scp_clock::SystemClock,
         };
 
         let result = ctx.subscribe("did:example:bob", Some(&ucan), 1000, Some(&mut val_ctx));
@@ -3625,7 +3625,7 @@ mod tests {
             context_creator_did: &setup.issuer_did,
             presenting_agent_did: "did:example:bob",
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
-            clock: &scp_primitives::SystemClock,
+            clock: &scp_clock::SystemClock,
         };
 
         let result = ctx
@@ -4033,7 +4033,7 @@ mod tests {
             context_creator_did: &setup.issuer_did,
             presenting_agent_did: "did:example:sub1",
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
-            clock: &scp_primitives::SystemClock,
+            clock: &scp_clock::SystemClock,
         };
 
         // Subscribe with UCAN.
@@ -5026,7 +5026,7 @@ mod tests {
             context_creator_did: &setup.issuer_did,
             presenting_agent_did: sub_did,
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
-            clock: &scp_primitives::SystemClock,
+            clock: &scp_clock::SystemClock,
         };
 
         let result = ctx.register_subscriber(&reg, Some(&mut val_ctx)).unwrap();
@@ -5074,7 +5074,7 @@ mod tests {
             context_creator_did: &setup.issuer_did,
             presenting_agent_did: sub_did,
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
-            clock: &scp_primitives::SystemClock,
+            clock: &scp_clock::SystemClock,
         };
 
         let result = ctx.register_subscriber(&reg, Some(&mut val_ctx));
@@ -5125,7 +5125,7 @@ mod tests {
             context_creator_did: &setup.issuer_did,
             presenting_agent_did: sub_did,
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
-            clock: &scp_primitives::SystemClock,
+            clock: &scp_clock::SystemClock,
         };
 
         let result = ctx.register_subscriber(&reg, Some(&mut val_ctx));
@@ -5172,7 +5172,7 @@ mod tests {
             context_creator_did: &setup.issuer_did,
             presenting_agent_did: sub_did,
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
-            clock: &scp_primitives::SystemClock,
+            clock: &scp_clock::SystemClock,
         };
 
         let result = ctx.register_subscriber(&reg, Some(&mut val_ctx));
@@ -5218,7 +5218,7 @@ mod tests {
             context_creator_did: &setup.issuer_did,
             presenting_agent_did: sub_did,
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
-            clock: &scp_primitives::SystemClock,
+            clock: &scp_clock::SystemClock,
         };
 
         let result = ctx.register_subscriber(&reg, Some(&mut val_ctx)).unwrap();
@@ -5251,8 +5251,8 @@ mod tests {
             use base64::engine::general_purpose::URL_SAFE_NO_PAD;
             use ed25519_dalek::Signer as _;
 
-            let now_secs = scp_primitives::SystemClock.now_secs();
-            let now_millis = scp_primitives::SystemClock.now_millis();
+            let now_secs = scp_clock::SystemClock.now_secs();
+            let now_millis = scp_clock::SystemClock.now_millis();
 
             let header = UcanHeader::new();
             let payload = UcanPayload {
@@ -5305,7 +5305,7 @@ mod tests {
             context_creator_did: &setup.issuer_did,
             presenting_agent_did: sub_did,
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
-            clock: &scp_primitives::SystemClock,
+            clock: &scp_clock::SystemClock,
         };
 
         let result = ctx.register_subscriber(&reg, Some(&mut val_ctx));
@@ -5346,7 +5346,7 @@ mod tests {
             context_creator_did: &setup.issuer_did,
             presenting_agent_did: sub_did,
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
-            clock: &scp_primitives::SystemClock,
+            clock: &scp_clock::SystemClock,
         };
 
         let result = validate_ucan(&ucan, &required_cap, &mut val_ctx);

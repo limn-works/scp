@@ -9,7 +9,7 @@
 //!
 //! # Mechanical fence (ADR-057 scope fence)
 //!
-//! `scp-mls` depends only on `scp-protocol`, `scp-primitives`, and the
+//! `scp-mls` depends only on `scp-clock`, `scp-did`, `scp-protocol`, and the
 //! `openmls` stack. It **must not** depend on `scp-runtime` (tokio/actor
 //! orchestration) or `scp-identity` (tokio-coupled custody/DHT). The async
 //! durable-storage bridge (`ScpMlsProvider<S>`, the `block_in_place` storage

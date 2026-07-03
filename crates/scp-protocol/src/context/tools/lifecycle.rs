@@ -19,11 +19,11 @@
 
 use serde::{Deserialize, Serialize};
 
-use scp_primitives::Clock;
+use scp_clock::Clock;
 
 use crate::economy::types::Amount;
 use crate::provenance::DataProvenance;
-use scp_primitives::DID;
+use scp_did::DID;
 
 /// Type alias for tool invocation provenance.
 ///
@@ -338,7 +338,7 @@ mod tests {
             "tool-1".to_owned(),
             "did:dht:z6MkInvoker".into(),
             serde_json::json!({"x": 1}),
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         );
         // UUID v4 format: 8-4-4-4-12 hex digits.
         assert_eq!(request.request_id.len(), 36);
@@ -355,7 +355,7 @@ mod tests {
             "tool-1".to_owned(),
             "did:dht:z6MkInvoker".into(),
             serde_json::json!({}),
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         );
         request.timeout_ms = 10_000;
         request.clamp_timeout(60_000);
@@ -368,7 +368,7 @@ mod tests {
             "tool-1".to_owned(),
             "did:dht:z6MkInvoker".into(),
             serde_json::json!({}),
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         );
         request.timeout_ms = 120_000;
         request.clamp_timeout(60_000);
@@ -381,7 +381,7 @@ mod tests {
             "tool-1".to_owned(),
             "did:dht:z6MkInvoker".into(),
             serde_json::json!({}),
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         );
         request.timeout_ms = 600_000;
         // Context max is above protocol max -- should clamp to protocol max.

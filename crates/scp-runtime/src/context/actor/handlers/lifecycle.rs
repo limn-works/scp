@@ -277,8 +277,8 @@ async fn handle_leave_context_actor(
     deps: &ActorDeps,
     context_id: String,
     params: scp_protocol::context::params::ContextParams,
-    caller_did: scp_identity::DID,
-    member_did: scp_identity::DID,
+    caller_did: scp_did::DID,
+    member_did: scp_did::DID,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
     let handle = ContextHandle::new(context_id.clone(), params);
@@ -323,7 +323,7 @@ async fn handle_close_context_actor(
     deps: &ActorDeps,
     context_id: String,
     _params: scp_protocol::context::params::ContextParams,
-    initiator_did: scp_identity::DID,
+    initiator_did: scp_did::DID,
     reply: CloseContextReply,
 ) -> Outcome<()> {
     // Drive the close through a CLONE of the actor's own `state.handle`,
@@ -371,7 +371,7 @@ fn handle_export_context_actor(
     state: &PerContextState,
     deps: &ActorDeps,
     _context_id: String,
-    _exporter_did: scp_identity::DID,
+    _exporter_did: scp_did::DID,
     reply: ExportContextReply,
 ) -> Outcome<()> {
     // Export is sync and read-only — no timeout wrapping needed. The actor

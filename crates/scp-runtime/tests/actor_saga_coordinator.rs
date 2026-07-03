@@ -31,7 +31,7 @@
 
 use std::sync::Arc;
 
-use scp_identity::DID;
+use scp_did::DID;
 use scp_platform::testing::InMemoryStorage;
 use scp_protocol::context::ContextError;
 use scp_runtime::context::supervisor::{

@@ -16,7 +16,7 @@ use std::hash::BuildHasher;
 use std::time::Duration;
 
 use crate::context::ContextHandle;
-use scp_primitives::DID;
+use scp_did::DID;
 use scp_protocol::context::ContextState;
 use scp_protocol::context::roles::{Capability, ContextRoleState};
 use scp_protocol::context::tools::ToolId;
@@ -1219,7 +1219,7 @@ mod tests {
             creator_did,
             test_ceiling(),
             vec![],
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap()
     }
@@ -1843,7 +1843,7 @@ mod tests {
             signing_key_id: None,
             ceiling: None,
         };
-        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
             .await
             .unwrap();
 
@@ -1871,7 +1871,7 @@ mod tests {
             context_creator_did: &issuer_did,
             presenting_agent_did: "did:dht:z6MkMember",
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
-            clock: &scp_primitives::SystemClock,
+            clock: &scp_clock::SystemClock,
         };
 
         // validate_tool_invocation_ucan expects tool_invoke:calculator,

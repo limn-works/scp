@@ -25,7 +25,7 @@ use scp_core::context::tools::{
     ToolRegistration, ToolRegistry, ToolSchema, register_tool,
 };
 use scp_core::context::{ContextHandle, ContextParams, ContextState};
-use scp_identity::DID;
+use scp_did::DID;
 
 use std::time::Duration;
 

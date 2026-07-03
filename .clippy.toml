@@ -14,5 +14,5 @@ stack-size-threshold = 900000
 future-size-threshold = 16512
 
 # ----- Disallowed methods -----
-# now_secs/now_millis are private to scp-primitives — the compiler enforces
+# now_secs/now_millis are private to scp-clock — the compiler enforces
 # this directly. No clippy disallowed-methods entries needed.

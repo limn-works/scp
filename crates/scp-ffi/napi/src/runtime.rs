@@ -30,6 +30,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 
 use dashmap::DashMap;
+use scp_clock::SystemClock;
 use scp_core::context::builder::{ContextEventLogProvider, ContextTransportProvider};
 use scp_core::context::persistence::ContextPersistence;
 use scp_core::context::roles::{ContextRoleState, default_ceiling};
@@ -39,7 +40,6 @@ use scp_core::crypto::ucan::nonce::NonceTracker;
 use scp_core::crypto::ucan::revoke::RevocationList;
 use scp_core::store::ProtocolRepository;
 use scp_event_log::EventLog;
-use scp_identity::cache::SystemClock;
 
 use crate::context::NapiContextHandle;
 use crate::error::ScpNapiError;
@@ -1354,7 +1354,7 @@ pub(crate) struct NapiIdentityEntry {
     /// enum rather than `Arc<dyn KeyCustody>`.
     pub(crate) custody: Arc<crate::custody::NapiKeyCustody>,
     /// The DID document at the time of creation (or last key rotation).
-    pub(crate) document: scp_identity::DidDocument,
+    pub(crate) document: scp_did::DidDocument,
     /// Identity link attestations (§3.5.1). Stored locally per identity.
     pub(crate) identity_link_attestations:
         Vec<scp_core::identity::attestation::IdentityLinkAttestation>,

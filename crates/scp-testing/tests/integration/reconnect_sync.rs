@@ -38,7 +38,7 @@ use scp_core::context::membership::ContextEvent;
 use scp_core::context::params::{ContextMode, ContextParams};
 use scp_core::context::roles::Capability;
 use scp_core::sync::SyncPolicy;
-use scp_identity::DID;
+use scp_did::DID;
 use scp_testing::fullstack::FullStackNetwork;
 use scp_transport::TransportManager;
 use scp_transport::native::adapter::NativeRelayAdapter;
@@ -71,7 +71,7 @@ fn signing_key_for(did: &str) -> SigningKey {
 /// verification path in `compare_remote_checkpoint` succeed for legitimately
 /// signed peer checkpoints.
 fn deterministic_key_resolver() -> KeyResolver {
-    Arc::new(|did: &DID, _kid: scp_identity::SigningKeyId| {
+    Arc::new(|did: &DID, _kid: scp_did::SigningKeyId| {
         Some(signing_key_for(did.as_ref()).verifying_key())
     })
 }

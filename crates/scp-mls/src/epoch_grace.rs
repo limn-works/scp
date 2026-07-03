@@ -65,7 +65,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use scp_primitives::{Clock, SystemClock};
+use scp_clock::{Clock, SystemClock};
 use serde::{Deserialize, Serialize};
 
 /// Callback type invoked when epochs are expired or evicted from the grace store.
@@ -289,7 +289,7 @@ impl EpochGraceStore {
         // clock jump after insertion can extend an epoch's grace window slightly;
         // forward-secrecy exposure stays bounded by `MAX_GRACE_EPOCHS` capacity
         // eviction regardless. This inherits the protocol-wide host-clock trust
-        // assumption (see `scp_primitives::time`); on the browser target the
+        // assumption (see `scp_clock`); on the browser target the
         // grace window is governed by the same single hardened `Clock` as the
         // rest of the protocol (ADR-057 §Prereq-1/2), not a hidden second source.
         let deadline = self.clock.now_millis().saturating_add(GRACE_WINDOW_MILLIS);

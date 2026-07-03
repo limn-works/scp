@@ -20,7 +20,7 @@
 //! it; the two are bridged through the `ScpCredential`. A future custody slice
 //! unifies them behind one on-device key boundary.
 
-use scp_primitives::SigningKeyId;
+use scp_did::SigningKeyId;
 
 /// The participant's on-device DID identity.
 ///

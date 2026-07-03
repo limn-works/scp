@@ -152,7 +152,7 @@ mod tests {
     fn entry(event_type: scp_event_log::EventType, actor: &str) -> Event {
         Event {
             event_type,
-            actor_did: scp_event_log::DID(actor.to_owned()),
+            actor_did: scp_did::DID(actor.to_owned()),
             timestamp: 0,
             sequence: 0,
             payload: scp_event_log::EventPayload::default(),

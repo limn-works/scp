@@ -41,7 +41,7 @@ pub use wasm_impl::{JsKeyCustody, JsSigner};
 #[cfg(target_arch = "wasm32")]
 mod wasm_impl {
     use scp_client::Signer;
-    use scp_primitives::SigningKeyId;
+    use scp_did::SigningKeyId;
     use wasm_bindgen::prelude::*;
 
     #[wasm_bindgen]

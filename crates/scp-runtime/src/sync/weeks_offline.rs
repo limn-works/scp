@@ -37,7 +37,7 @@ use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
-use scp_identity::DID;
+use scp_did::DID;
 use scp_protocol::crypto::canonical::{CanonicalField, canonical_hash};
 use scp_protocol::sync::{ContextId, Ed25519Signature, SyncError, SyncOutcome};
 

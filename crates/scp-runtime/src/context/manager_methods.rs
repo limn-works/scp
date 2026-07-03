@@ -65,7 +65,7 @@
 //! Operational metrics:
 //! - [`update_context_gauges`] — refresh active-contexts + buffer-occupancy gauges.
 
-use scp_identity::DID;
+use scp_did::DID;
 use scp_protocol::context::ContextParams;
 use scp_protocol::context::ContextState;
 use scp_protocol::context::broadcast::{BroadcastAdmission, BroadcastContext};

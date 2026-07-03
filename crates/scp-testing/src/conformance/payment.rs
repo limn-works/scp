@@ -293,7 +293,7 @@ pub mod test_helpers {
     use scp_core::economy::{
         AdapterCapabilities, CurrencyCode, PaidActionType, PaymentAdapter, PaymentMetadata,
     };
-    use scp_identity::DID;
+    use scp_did::DID;
 
     /// Returns a deterministic payer DID for conformance tests.
     #[must_use]

@@ -14,7 +14,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use scp_identity::DID;
+use scp_did::DID;
 
 use scp_protocol::economy::types::{Amount, CurrencyCode, PaidActionType};
 

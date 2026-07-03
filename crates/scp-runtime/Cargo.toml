@@ -42,7 +42,9 @@ serde = { workspace = true }
 thiserror = { workspace = true }
 rmp-serde = { workspace = true }
 rmpv = { workspace = true }
-scp-primitives = { path = "../scp-primitives", version = "=0.1.0-beta.2" }
+scp-clock = { path = "../scp-clock", version = "=0.1.0-beta.2" }
+scp-crypto = { path = "../scp-crypto", version = "=0.1.0-beta.2" }
+scp-did = { path = "../scp-did", version = "=0.1.0-beta.2" }
 scp-protocol = { path = "../scp-protocol", version = "=0.1.0-beta.2" }
 scp-mls = { path = "../scp-mls", version = "=0.1.0-beta.2" }
 scp-platform = { path = "../scp-platform", version = "=0.1.0-beta.2" }

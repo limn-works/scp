@@ -16,8 +16,8 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use scp_primitives::Clock;
-use scp_primitives::DID;
+use scp_clock::Clock;
+use scp_did::DID;
 
 use super::ContextId;
 use super::addressing::HandleTarget;
@@ -390,7 +390,7 @@ mod tests {
         let result = registry.register(
             &params,
             &DID::from("did:dht:zAlice"),
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         );
         assert_eq!(result.status, HandleRegisterStatus::Registered);
         assert!(result.entry_id.is_some());
@@ -414,10 +414,10 @@ mod tests {
             metadata: None,
         };
 
-        let result1 = registry.register(&params_alice, &alice_did, &scp_primitives::SystemClock);
+        let result1 = registry.register(&params_alice, &alice_did, &scp_clock::SystemClock);
         assert_eq!(result1.status, HandleRegisterStatus::Registered);
 
-        let result2 = registry.register(&params_bob, &bob_did, &scp_primitives::SystemClock);
+        let result2 = registry.register(&params_bob, &bob_did, &scp_clock::SystemClock);
         assert_eq!(result2.status, HandleRegisterStatus::Conflict);
     }
 
@@ -438,8 +438,8 @@ mod tests {
             metadata: None,
         };
 
-        registry.register(&params1, &alice_did, &scp_primitives::SystemClock);
-        let result = registry.register(&params2, &bob_did, &scp_primitives::SystemClock);
+        registry.register(&params1, &alice_did, &scp_clock::SystemClock);
+        let result = registry.register(&params2, &bob_did, &scp_clock::SystemClock);
         assert_eq!(result.status, HandleRegisterStatus::Conflict);
     }
 
@@ -452,11 +452,8 @@ mod tests {
             metadata: None,
         };
 
-        let result = registry.register(
-            &params,
-            &DID::from("did:dht:zEve"),
-            &scp_primitives::SystemClock,
-        );
+        let result =
+            registry.register(&params, &DID::from("did:dht:zEve"), &scp_clock::SystemClock);
         assert_eq!(result.status, HandleRegisterStatus::OwnershipMismatch);
         assert!(result.entry_id.is_none());
         assert!(registry.is_empty());
@@ -477,7 +474,7 @@ mod tests {
         let result = registry.register(
             &params,
             &DID::from("did:dht:zAdmin"),
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         );
         assert_eq!(result.status, HandleRegisterStatus::Registered);
     }
@@ -495,7 +492,7 @@ mod tests {
         registry.register(
             &params,
             &DID::from("did:dht:zAlice"),
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         );
 
         let lookup = registry.lookup(&HandleLookupParams {
@@ -535,7 +532,7 @@ mod tests {
         registry.register(
             &params,
             &DID::from("did:dht:zAdmin"),
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         );
 
         let lookup = registry.lookup(&HandleLookupParams {
@@ -559,7 +556,7 @@ mod tests {
         registry.register(
             &params,
             &DID::from("did:dht:zAdmin"),
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         );
 
         let lookup = registry.lookup(&HandleLookupParams {
@@ -582,7 +579,7 @@ mod tests {
             target: make_identity_target("did:dht:zAlice"),
             metadata: None,
         };
-        registry.register(&params, &alice_did, &scp_primitives::SystemClock);
+        registry.register(&params, &alice_did, &scp_clock::SystemClock);
 
         let result = registry.deregister(&HandleDeregisterParams {
             handle: "alice".to_owned(),
@@ -604,7 +601,7 @@ mod tests {
             target: make_identity_target("did:dht:zAlice"),
             metadata: None,
         };
-        registry.register(&params, &alice_did, &scp_primitives::SystemClock);
+        registry.register(&params, &alice_did, &scp_clock::SystemClock);
 
         let result = registry.deregister(&HandleDeregisterParams {
             handle: "alice".to_owned(),
@@ -670,7 +667,7 @@ mod tests {
                 metadata: None,
             },
             &DID::from("did:dht:zAlice"),
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         );
 
         let r2 = registry.register(
@@ -680,7 +677,7 @@ mod tests {
                 metadata: None,
             },
             &DID::from("did:dht:zBob"),
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         );
 
         assert_ne!(r1.entry_id, r2.entry_id);
@@ -699,7 +696,7 @@ mod tests {
             target: make_identity_target("did:dht:zAlice"),
             metadata: None,
         };
-        registry.register(&params, &alice_did, &scp_primitives::SystemClock);
+        registry.register(&params, &alice_did, &scp_clock::SystemClock);
 
         registry.deregister(&HandleDeregisterParams {
             handle: "alice".to_owned(),
@@ -711,7 +708,7 @@ mod tests {
             target: make_identity_target("did:dht:zBob"),
             metadata: None,
         };
-        let result = registry.register(&params2, &bob_did, &scp_primitives::SystemClock);
+        let result = registry.register(&params2, &bob_did, &scp_clock::SystemClock);
         assert_eq!(result.status, HandleRegisterStatus::Registered);
     }
 
@@ -728,7 +725,7 @@ mod tests {
                 target: make_context_target(&format!("ctx-{i}")),
                 metadata: None,
             };
-            let result = registry.register(&params, &owner_did, &scp_primitives::SystemClock);
+            let result = registry.register(&params, &owner_did, &scp_clock::SystemClock);
             assert_eq!(result.status, HandleRegisterStatus::Registered);
         }
 
@@ -739,7 +736,7 @@ mod tests {
             target: make_context_target("ctx-overflow"),
             metadata: None,
         };
-        let result = registry.register(&overflow_params, &owner_did, &scp_primitives::SystemClock);
+        let result = registry.register(&overflow_params, &owner_did, &scp_clock::SystemClock);
         assert_eq!(result.status, HandleRegisterStatus::CapacityExceeded);
         assert!(result.entry_id.is_none());
         assert_eq!(registry.len(), MAX_HANDLE_ENTRIES);
@@ -756,7 +753,7 @@ mod tests {
                 target: make_context_target(&format!("ctx-{i}")),
                 metadata: None,
             };
-            registry.register(&params, &owner_did, &scp_primitives::SystemClock);
+            registry.register(&params, &owner_did, &scp_clock::SystemClock);
         }
 
         assert_eq!(registry.len(), MAX_HANDLE_ENTRIES);
@@ -773,7 +770,7 @@ mod tests {
             target: make_context_target("ctx-new"),
             metadata: None,
         };
-        let result = registry.register(&new_params, &owner_did, &scp_primitives::SystemClock);
+        let result = registry.register(&new_params, &owner_did, &scp_clock::SystemClock);
         assert_eq!(result.status, HandleRegisterStatus::Registered);
         assert!(result.entry_id.is_some());
     }

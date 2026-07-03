@@ -19,7 +19,7 @@ use scp_core::identity::attestation::{
     VerificationMethod,
 };
 use scp_core::trust::attestation::RevocationStatus;
-use scp_identity::DID;
+use scp_did::DID;
 
 // ---------------------------------------------------------------------------
 // Error type

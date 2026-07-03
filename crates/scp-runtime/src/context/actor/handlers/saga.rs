@@ -52,7 +52,7 @@
 //! caller-asserted timestamp / chain-depth are NEVER recorded — they feed only
 //! the freshness check and the `+1` re-derivation base (spec §6.2.4).
 
-use scp_identity::DID;
+use scp_did::DID;
 use scp_protocol::context::ContextError;
 use scp_protocol::crypto::ucan::UcanToken;
 use scp_protocol::crypto::ucan::validate::{DEFAULT_CLOCK_SKEW_TOLERANCE_SECS, ValidationContext};
@@ -2525,7 +2525,7 @@ mod tests {
     use std::collections::HashSet;
     use std::sync::Arc;
 
-    use scp_identity::DID;
+    use scp_did::DID;
     use scp_platform::testing::{InMemoryKeyCustody, InMemoryStorage};
     use scp_platform::traits::{KeyCustody, KeyType};
     use scp_protocol::context::ContextError;
@@ -3133,7 +3133,7 @@ mod tests {
             signing_key_id: None,
             ceiling: None,
         };
-        mint_ucan(&params, custody, &scp_primitives::SystemClock)
+        mint_ucan(&params, custody, &scp_clock::SystemClock)
             .await
             .expect("mint")
     }

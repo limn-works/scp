@@ -25,7 +25,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use scp_identity::DID;
+use scp_did::DID;
 use scp_identity::dht_client::DhtClient;
 use scp_identity::{DidDht, DidMethod};
 
@@ -150,7 +150,7 @@ pub async fn resolve_contexts_from_did<D: DhtClient + 'static>(
 /// Returns [`DiscoveryError::InvalidCapabilities`] if `is_broadcast` is
 /// `false` (encrypted contexts MUST NOT be published in DID documents).
 pub fn publish_context_to_did_document(
-    document: &mut scp_identity::document::DidDocument,
+    document: &mut scp_did::DidDocument,
     context_id: &str,
     relay_urls: &[String],
     is_broadcast: bool,
@@ -174,7 +174,7 @@ pub fn publish_context_to_did_document(
 ///
 /// Returns `true` if an entry was removed, `false` if no matching entry existed.
 pub fn unpublish_context_from_did_document(
-    document: &mut scp_identity::document::DidDocument,
+    document: &mut scp_did::DidDocument,
     context_id: &str,
 ) -> bool {
     document.remove_broadcast_context_service(context_id)
@@ -233,8 +233,9 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use scp_clock::SystemClock;
     use scp_identity::DidDht;
-    use scp_identity::cache::{DidCache, SystemClock};
+    use scp_identity::cache::DidCache;
     use scp_identity::dht_client::InMemoryDhtClient;
 
     use scp_platform::testing::{InMemoryKeyCustody, InMemoryPreRotationCustody};
@@ -281,12 +282,8 @@ mod tests {
 
     #[test]
     fn publish_broadcast_context_adds_service_entry() {
-        let mut doc = scp_identity::document::DidDocument::new(
-            "did:dht:zTest",
-            &[1u8; 32],
-            &[2u8; 32],
-            &[3u8; 32],
-        );
+        let mut doc =
+            scp_did::DidDocument::new("did:dht:zTest", &[1u8; 32], &[2u8; 32], &[3u8; 32]);
 
         publish_context_to_did_document(
             &mut doc,
@@ -304,12 +301,8 @@ mod tests {
 
     #[test]
     fn publish_encrypted_context_rejected() {
-        let mut doc = scp_identity::document::DidDocument::new(
-            "did:dht:zTest",
-            &[1u8; 32],
-            &[2u8; 32],
-            &[3u8; 32],
-        );
+        let mut doc =
+            scp_did::DidDocument::new("did:dht:zTest", &[1u8; 32], &[2u8; 32], &[3u8; 32]);
 
         let err = publish_context_to_did_document(
             &mut doc,
@@ -326,12 +319,8 @@ mod tests {
 
     #[test]
     fn publish_multiple_broadcast_contexts() {
-        let mut doc = scp_identity::document::DidDocument::new(
-            "did:dht:zTest",
-            &[1u8; 32],
-            &[2u8; 32],
-            &[3u8; 32],
-        );
+        let mut doc =
+            scp_did::DidDocument::new("did:dht:zTest", &[1u8; 32], &[2u8; 32], &[3u8; 32]);
 
         publish_context_to_did_document(
             &mut doc,
@@ -358,12 +347,8 @@ mod tests {
 
     #[test]
     fn publish_duplicate_context_id_is_noop() {
-        let mut doc = scp_identity::document::DidDocument::new(
-            "did:dht:zTest",
-            &[1u8; 32],
-            &[2u8; 32],
-            &[3u8; 32],
-        );
+        let mut doc =
+            scp_did::DidDocument::new("did:dht:zTest", &[1u8; 32], &[2u8; 32], &[3u8; 32]);
 
         publish_context_to_did_document(
             &mut doc,
@@ -390,12 +375,8 @@ mod tests {
 
     #[test]
     fn unpublish_removes_matching_entry() {
-        let mut doc = scp_identity::document::DidDocument::new(
-            "did:dht:zTest",
-            &[1u8; 32],
-            &[2u8; 32],
-            &[3u8; 32],
-        );
+        let mut doc =
+            scp_did::DidDocument::new("did:dht:zTest", &[1u8; 32], &[2u8; 32], &[3u8; 32]);
 
         publish_context_to_did_document(
             &mut doc,
@@ -412,12 +393,8 @@ mod tests {
 
     #[test]
     fn unpublish_nonexistent_returns_false() {
-        let mut doc = scp_identity::document::DidDocument::new(
-            "did:dht:zTest",
-            &[1u8; 32],
-            &[2u8; 32],
-            &[3u8; 32],
-        );
+        let mut doc =
+            scp_did::DidDocument::new("did:dht:zTest", &[1u8; 32], &[2u8; 32], &[3u8; 32]);
 
         let removed = unpublish_context_from_did_document(&mut doc, "nonexistent");
         assert!(!removed);
@@ -427,12 +404,8 @@ mod tests {
 
     #[test]
     fn privacy_only_discoverable_contexts_get_service_endpoints() {
-        let mut doc = scp_identity::document::DidDocument::new(
-            "did:dht:zTest",
-            &[1u8; 32],
-            &[2u8; 32],
-            &[3u8; 32],
-        );
+        let mut doc =
+            scp_did::DidDocument::new("did:dht:zTest", &[1u8; 32], &[2u8; 32], &[3u8; 32]);
 
         // Simulate: broadcast context with discoverable=false -> no publish call
         // (the caller is responsible for not calling publish when discoverable=false)

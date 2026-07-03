@@ -675,7 +675,7 @@ mod tests {
             creator_did,
             test_ceiling(),
             vec![],
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap()
     }

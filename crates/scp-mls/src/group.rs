@@ -816,7 +816,7 @@ mod tests {
         ScpCredential::new(
             format!("did:dht:z6Mk{name}"),
             None,
-            scp_primitives::SigningKeyId::Active,
+            scp_did::SigningKeyId::Active,
         )
         .unwrap()
     }
@@ -1042,7 +1042,7 @@ mod tests {
         let cred = ScpCredential::new(
             "did:dht:z6MkKeyPackageDidExtractFixture".to_string(),
             None,
-            scp_primitives::SigningKeyId::Active,
+            scp_did::SigningKeyId::Active,
         )
         .unwrap();
         let (kp_bundle, _signer, _provider) = generate_key_package(&cred).unwrap();

@@ -46,16 +46,16 @@ use std::sync::Arc;
 
 use napi::Error as NapiError;
 use napi_derive::napi;
+use scp_clock::Clock;
+use scp_did::DidDocument;
 #[cfg(all(test, feature = "allow_in_memory_custody"))]
 use scp_identity::DidMethod;
 use scp_identity::{DhtClient, IdentityError};
 use scp_identity::{
-    DidCache, DidDht, DidDocument, DualLayerResolver, InMemoryDhtClient, NoOpRelayQuerier,
-    ScpIdentity,
+    DidCache, DidDht, DualLayerResolver, InMemoryDhtClient, NoOpRelayQuerier, ScpIdentity,
 };
 #[cfg(feature = "allow_in_memory_custody")]
 use scp_platform::testing::InMemoryKeyCustody;
-use scp_primitives::Clock;
 #[cfg(feature = "allow_in_memory_custody")]
 use std::fmt;
 
@@ -221,7 +221,7 @@ impl fmt::Debug for OpaqueInMemoryKeyCustody {
 #[allow(clippy::type_complexity)]
 fn make_dht_with_signer(
     custody: &Arc<crate::custody::NapiKeyCustody>,
-) -> DidDht<InMemoryDhtClient, scp_identity::cache::SystemClock> {
+) -> DidDht<InMemoryDhtClient, scp_clock::SystemClock> {
     use scp_platform::traits::KeyCustody as _;
     let custody_clone = Arc::clone(custody);
     let sign_fn: Arc<
@@ -304,7 +304,7 @@ pub(crate) struct NapiIdentityInner {
     /// handle-affinity checks at every FFI entry point that accepts a
     /// `NapiIdentity`. Mismatches are rejected with `SCP-PERM-3030`.
     pub(crate) instance_id: u64,
-    /// JSON-serialized `scp_identity::DidRotationEvent` produced when
+    /// JSON-serialized `scp_did::DidRotationEvent` produced when
     /// this handle was minted by [`NapiIdentity::migrate`]. SDK callers
     /// MUST distribute the event to active context members per spec
     /// §3.2.1 step 4b. `None` for handles produced by `identity_create`,
@@ -775,7 +775,7 @@ impl NapiIdentity {
     /// `DidRotationEvent` JSON via the `rotationEventJson` getter
     /// (spec §9.12, ADR-003 §4b/4c). The SDK distributes the event to
     /// active context members per spec §3.2.1 step 4b. Wire shape is
-    /// `serde_json::to_string(&scp_identity::DidRotationEvent)`.
+    /// `serde_json::to_string(&scp_did::DidRotationEvent)`.
     #[napi]
     #[allow(clippy::unused_async)] // napi requires async for Promise return type
     pub async fn migrate(&self) -> napi::Result<Self> {
@@ -802,7 +802,7 @@ impl NapiIdentity {
         // `verify_migration`. The committed pre-rotation key is held in
         // cold-storage `pre_rotation_custody`, referenced by
         // `pre_rotation_handle`.
-        let rotated_at = scp_primitives::SystemClock.now_secs();
+        let rotated_at = scp_clock::SystemClock.now_secs();
 
         let dht = make_dht_with_signer(&custody);
         let scp_identity::MigrationOutcome {
@@ -1527,7 +1527,7 @@ mod tests {
         let event_json = migrated
             .rotation_event_json()
             .expect("migrated handle must surface rotationEventJson");
-        let event: scp_identity::DidRotationEvent = serde_json::from_str(&event_json)
+        let event: scp_did::DidRotationEvent = serde_json::from_str(&event_json)
             .expect("rotation_event_json must deserialize as DidRotationEvent");
         assert_eq!(event.old_did, original_did);
         assert_eq!(event.new_did, migrated.did());

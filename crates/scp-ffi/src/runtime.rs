@@ -74,15 +74,15 @@ use scp_ffi_common::bridge_instance::BridgeInstanceCore;
 // Re-export `CoreFields` at `crate::runtime::CoreFields` so the
 // `pyscp_check_handle!` macro can refer to it as
 // `$crate::runtime::CoreFields`.
+use scp_clock::{Clock, SystemClock};
+use scp_did::DidDocument;
 pub use scp_ffi_common::bridge_instance::CoreFields;
-use scp_identity::cache::SystemClock;
-use scp_identity::{DidDocument, ScpIdentity};
+use scp_identity::ScpIdentity;
 use scp_platform::PlatformError;
 use scp_platform::encrypting_adapter::EncryptingAdapter;
 use scp_platform::sqlite::SqliteStorage;
 use scp_platform::testing::InMemoryStorage;
 use scp_platform::traits::Storage;
-use scp_primitives::Clock;
 use std::path::PathBuf;
 use tokio::sync::mpsc;
 use zeroize::Zeroizing;
@@ -1812,7 +1812,7 @@ pub fn deliver_message_with_handles(
                 bi,
                 "scp:system".to_owned(),
                 b"BufferOverflow: oldest event dropped due to full receive buffer".to_vec(),
-                scp_primitives::SystemClock.now_secs() as f64,
+                SystemClock.now_secs() as f64,
                 context_id.to_owned(),
             );
             let _ = tx.try_send(overflow_warning);

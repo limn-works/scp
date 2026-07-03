@@ -78,7 +78,7 @@ mod tests {
         Coefficient, CostSchedule, CurrencyCode, EconomicPolicy, PricingFormula, PricingMetric,
         PricingVariable,
     };
-    use scp_primitives::DID;
+    use scp_did::DID;
 
     fn usd() -> CurrencyCode {
         CurrencyCode::from("USD")

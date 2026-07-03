@@ -464,7 +464,7 @@ async fn context_manager_creates_usable_context() {
 
     let network = FullStackNetwork::new();
     let key_resolver: KeyResolver =
-        Arc::new(|_did: &scp_identity::DID, _kid: scp_identity::SigningKeyId| None);
+        Arc::new(|_did: &scp_did::DID, _kid: scp_did::SigningKeyId| None);
 
     let alice = network.create_node("did:dht:z6MkAliceUsability", key_resolver.clone());
     let bob = network.create_node("did:dht:z6MkBobUsability", key_resolver);
@@ -516,7 +516,7 @@ async fn context_manager_creates_usable_context() {
         .manager
         .seed_peer_pseudonym(
             ctx_id,
-            scp_identity::DID::from("did:dht:z6MkBobUsability"),
+            scp_did::DID::from("did:dht:z6MkBobUsability"),
             [0x42u8; 32],
         )
         .await
@@ -612,7 +612,7 @@ async fn context_create_produces_active_context_with_members() {
 
     let network = FullStackNetwork::new();
     let key_resolver: KeyResolver =
-        Arc::new(|_did: &scp_identity::DID, _kid: scp_identity::SigningKeyId| None);
+        Arc::new(|_did: &scp_did::DID, _kid: scp_did::SigningKeyId| None);
     let alice = network.create_node("did:dht:z6MkAlice6b", key_resolver.clone());
     let bob = network.create_node("did:dht:z6MkBob6b", key_resolver);
 
@@ -654,7 +654,7 @@ async fn context_create_produces_active_context_with_members() {
         .manager
         .seed_peer_pseudonym(
             ctx_id,
-            scp_identity::DID::from("did:dht:z6MkBob6b"),
+            scp_did::DID::from("did:dht:z6MkBob6b"),
             [0x42u8; 32],
         )
         .await

@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use scp_protocol::context::ContextError;
 use scp_protocol::context::builder::ContextCreationError;
 
-use scp_identity::DID;
+use scp_did::DID;
 
 /// Builds an [`IdentityDepthAssessment`] for a member in a context.
 ///
@@ -296,7 +296,7 @@ pub fn enforce_join_economy(
     now: u64,
     spending_ucan: Option<&scp_protocol::crypto::ucan::UcanToken>,
     context_id: &str,
-    clock: &dyn scp_primitives::Clock,
+    clock: &dyn scp_clock::Clock,
     key_resolver: &scp_protocol::context::governance::KeyResolver,
 ) -> Result<Option<scp_protocol::economy::types::Amount>, ContextError> {
     if scp_protocol::economy::policy::auto_accept_blocked_by_economics(

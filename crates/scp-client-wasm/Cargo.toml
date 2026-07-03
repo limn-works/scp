@@ -28,7 +28,8 @@ testing = ["scp-client/testing"]
 # scp-identity, or tokio (the ADR-057 mechanical fence; verified via
 # `cargo tree`). The openmls wire types arrive transitively through scp-client.
 scp-client = { path = "../scp-client", version = "=0.1.0-beta.2" }
-scp-primitives = { path = "../scp-primitives", version = "=0.1.0-beta.2" }
+scp-clock = { path = "../scp-clock", version = "=0.1.0-beta.2" }
+scp-did = { path = "../scp-did", version = "=0.1.0-beta.2" }
 scp-protocol = { path = "../scp-protocol", version = "=0.1.0-beta.2" }
 scp-event-log = { path = "../scp-event-log", version = "=0.1.0-beta.2" }
 
@@ -61,7 +62,7 @@ getrandom_04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] 
 # The host-surface integration test drives did:key fixtures through the exposed
 # WasmScpClient, so it needs the testing DID formats enabled.
 scp-client = { path = "../scp-client", features = ["testing"] }
-scp-primitives = { path = "../scp-primitives", features = ["testing"] }
+scp-did = { path = "../scp-did", features = ["testing"] }
 
 # wasm-bindgen-test is only meaningful under wasm32 (it needs a wasm test
 # runner). It is declared so a `wasm-pack test` / `wasm32` `cargo test` can pick

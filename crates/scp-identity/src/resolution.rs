@@ -26,10 +26,11 @@
 use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
 
+use crate::IdentityError;
 use crate::cache::DidCache;
 use crate::dht::{extract_public_key, verify_bep44_signature, verify_self_certification};
-use crate::document::DidDocument;
-use crate::{IdentityError, cache::Clock};
+use scp_clock::Clock;
+use scp_did::DidDocument;
 
 /// Domain separator for DID routing IDs.
 ///
@@ -293,10 +294,10 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use super::DID_ROUTING_DOMAIN_SEPARATOR;
-    use crate::cache::TestClock;
     use crate::dht::bep44_signable;
-    use crate::document::DidDocument;
     use crate::*;
+    use scp_clock::TestClock;
+    use scp_did::DidDocument;
 
     /// Helper: create an Ed25519 signing keypair and return (`public_key`, `signing_key`).
     fn make_ed25519_keypair() -> (ed25519_dalek::VerifyingKey, ed25519_dalek::SigningKey) {

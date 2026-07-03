@@ -9,7 +9,7 @@
 
 #![allow(dead_code)]
 
-use scp_identity::DID;
+use scp_did::DID;
 use scp_protocol::context::builder::ContextCreationError;
 use scp_protocol::context::{ContextError, ContextParams};
 use scp_runtime::context::builder::{ContextEventLogProvider, ContextTransportProvider};

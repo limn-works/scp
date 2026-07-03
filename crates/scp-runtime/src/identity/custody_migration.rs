@@ -30,9 +30,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use scp_identity::DID;
+use scp_did::DID;
 
-use scp_primitives::Clock;
+use scp_clock::Clock;
 
 // Re-use CustodyType from scp-platform to avoid duplication.
 // CustodyType is already defined in scp_platform::traits but scp-core doesn't
@@ -812,7 +812,7 @@ mod tests {
         let backend = MockMigrationBackend::new();
 
         let result = orch
-            .execute(&backend, &scp_primitives::SystemClock)
+            .execute(&backend, &scp_clock::SystemClock)
             .await
             .unwrap();
 
@@ -839,7 +839,7 @@ mod tests {
 
         let backend = MockMigrationBackend::new();
         let result = orch
-            .execute(&backend, &scp_primitives::SystemClock)
+            .execute(&backend, &scp_clock::SystemClock)
             .await
             .unwrap();
 
@@ -863,7 +863,7 @@ mod tests {
         };
 
         let err = orch
-            .execute(&backend, &scp_primitives::SystemClock)
+            .execute(&backend, &scp_clock::SystemClock)
             .await
             .unwrap_err();
         assert!(matches!(err, CustodyMigrationError::KeyGenerationFailed(_)));
@@ -884,7 +884,7 @@ mod tests {
         };
 
         let err = orch
-            .execute(&backend, &scp_primitives::SystemClock)
+            .execute(&backend, &scp_clock::SystemClock)
             .await
             .unwrap_err();
         assert!(matches!(err, CustodyMigrationError::InvalidPublicKey(16)));
@@ -904,7 +904,7 @@ mod tests {
         };
 
         let err = orch
-            .execute(&backend, &scp_primitives::SystemClock)
+            .execute(&backend, &scp_clock::SystemClock)
             .await
             .unwrap_err();
         assert!(matches!(err, CustodyMigrationError::AuthorizationFailed(_)));
@@ -925,7 +925,7 @@ mod tests {
         };
 
         let err = orch
-            .execute(&backend, &scp_primitives::SystemClock)
+            .execute(&backend, &scp_clock::SystemClock)
             .await
             .unwrap_err();
         assert!(matches!(err, CustodyMigrationError::RotationFailed(_)));
@@ -945,7 +945,7 @@ mod tests {
         };
 
         let result = orch
-            .execute(&backend, &scp_primitives::SystemClock)
+            .execute(&backend, &scp_clock::SystemClock)
             .await
             .unwrap();
 
@@ -972,7 +972,7 @@ mod tests {
 
         // Step 4 failure is non-fatal — result is returned, not error.
         let result = orch
-            .execute(&backend, &scp_primitives::SystemClock)
+            .execute(&backend, &scp_clock::SystemClock)
             .await
             .unwrap();
         assert!(!result.ucans_reissued);
@@ -1001,7 +1001,7 @@ mod tests {
 
         // Step 5 failure is non-fatal per spec §3.2.1.
         let result = orch
-            .execute(&backend, &scp_primitives::SystemClock)
+            .execute(&backend, &scp_clock::SystemClock)
             .await
             .unwrap();
         assert!(!result.old_key_destroyed);
@@ -1030,7 +1030,7 @@ mod tests {
         };
 
         let result = orch
-            .execute(&backend, &scp_primitives::SystemClock)
+            .execute(&backend, &scp_clock::SystemClock)
             .await
             .unwrap();
         assert!(!result.ucans_reissued);
@@ -1063,7 +1063,7 @@ mod tests {
 
             let backend = MockMigrationBackend::new();
             let result = orch
-                .execute(&backend, &scp_primitives::SystemClock)
+                .execute(&backend, &scp_clock::SystemClock)
                 .await
                 .unwrap();
 

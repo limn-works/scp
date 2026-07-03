@@ -34,7 +34,7 @@ use std::time::Duration;
 
 use zeroize::Zeroizing;
 
-use scp_identity::cache::SystemClock;
+use scp_clock::SystemClock;
 use scp_identity::dht::SequenceStore;
 use scp_identity::{DidCache, DidDht, IdentityError, InMemoryDhtClient, PkarrDhtClient};
 use scp_platform::KeyCustody;
@@ -317,7 +317,7 @@ where
 /// the commit completes.)
 pub struct SelfHostDeployer {
     supervisor: Arc<scp_core::context::supervisor::Supervisor>,
-    author_did: scp_identity::DID,
+    author_did: scp_did::DID,
     context_id: String,
     signing_key_handle: scp_platform::KeyHandle,
 }
@@ -350,7 +350,7 @@ impl SelfHostDeployer {
     where
         S: Storage + 'static,
     {
-        let author_did: scp_identity::DID = scp_identity::DID::from(node_did.clone());
+        let author_did: scp_did::DID = scp_did::DID::from(node_did.clone());
 
         // Build the in-process supervisor on the node's OWN loopback relay and
         // register the local DID + the broadcast context. The supervisor carries
@@ -502,38 +502,36 @@ pub fn colocated_document_vm_key_resolver<R: scp_identity::resolver::DidResolver
     resolver: Arc<R>,
     handle: tokio::runtime::Handle,
 ) -> scp_core::context::governance::KeyResolver {
-    Arc::new(
-        move |did: &scp_identity::DID, kid: scp_identity::SigningKeyId| {
-            let resolver = Arc::clone(&resolver);
-            let did_owned = did.as_ref().to_owned();
-            let handle = handle.clone();
-            // Bridge async -> sync with a runtime-FLAVOR-aware match. `block_in_place`
-            // is multi-thread-only and PANICS on a current-thread runtime, so the
-            // current-thread regime is driven on a dedicated thread instead.
-            match tokio::runtime::Handle::try_current() {
-                // No ambient runtime: drive the resolve directly on `handle`.
-                Err(_) => {
-                    let outcome = handle.block_on(resolver.resolve(&did_owned)); // ci-allow: block-on: co-located KeyResolver async→sync bridge (no-runtime branch)
+    Arc::new(move |did: &scp_did::DID, kid: scp_did::SigningKeyId| {
+        let resolver = Arc::clone(&resolver);
+        let did_owned = did.as_ref().to_owned();
+        let handle = handle.clone();
+        // Bridge async -> sync with a runtime-FLAVOR-aware match. `block_in_place`
+        // is multi-thread-only and PANICS on a current-thread runtime, so the
+        // current-thread regime is driven on a dedicated thread instead.
+        match tokio::runtime::Handle::try_current() {
+            // No ambient runtime: drive the resolve directly on `handle`.
+            Err(_) => {
+                let outcome = handle.block_on(resolver.resolve(&did_owned)); // ci-allow: block-on: co-located KeyResolver async→sync bridge (no-runtime branch)
+                let doc = outcome.ok().flatten()?;
+                scp_identity::resolver::verifying_key_from_document(&doc.document, kid)
+            }
+            Ok(current) => match current.runtime_flavor() {
+                // Multi-thread runtime: `block_in_place` re-enters `handle`.
+                tokio::runtime::RuntimeFlavor::MultiThread => {
+                    let outcome = tokio::task::block_in_place(|| {
+                        handle.block_on(resolver.resolve(&did_owned)) // ci-allow: block-on: co-located KeyResolver async→sync bridge (multi-thread branch re-enters handle)
+                    }); // ci-allow: block-on: co-located KeyResolver async→sync bridge (multi-thread block_in_place; mirrors stop_and_wait / try_consume_hard_rate_limit_from_any_context)
                     let doc = outcome.ok().flatten()?;
                     scp_identity::resolver::verifying_key_from_document(&doc.document, kid)
                 }
-                Ok(current) => match current.runtime_flavor() {
-                    // Multi-thread runtime: `block_in_place` re-enters `handle`.
-                    tokio::runtime::RuntimeFlavor::MultiThread => {
-                        let outcome = tokio::task::block_in_place(|| {
-                            handle.block_on(resolver.resolve(&did_owned)) // ci-allow: block-on: co-located KeyResolver async→sync bridge (multi-thread branch re-enters handle)
-                        }); // ci-allow: block-on: co-located KeyResolver async→sync bridge (multi-thread block_in_place; mirrors stop_and_wait / try_consume_hard_rate_limit_from_any_context)
-                        let doc = outcome.ok().flatten()?;
-                        scp_identity::resolver::verifying_key_from_document(&doc.document, kid)
-                    }
-                    // Current-thread runtime: `block_in_place` would panic. Drive the
-                    // resolve on a dedicated thread that owns its own runtime, and
-                    // return the resolved key (a vote must be verified, not rejected).
-                    _ => colocated_resolve_vm_on_dedicated_thread(resolver, did_owned, kid),
-                },
-            }
-        },
-    )
+                // Current-thread runtime: `block_in_place` would panic. Drive the
+                // resolve on a dedicated thread that owns its own runtime, and
+                // return the resolved key (a vote must be verified, not rejected).
+                _ => colocated_resolve_vm_on_dedicated_thread(resolver, did_owned, kid),
+            },
+        }
+    })
 }
 
 /// Dedicated-thread escape hatch for the current-thread-runtime regime, where
@@ -550,7 +548,7 @@ pub fn colocated_document_vm_key_resolver<R: scp_identity::resolver::DidResolver
 fn colocated_resolve_vm_on_dedicated_thread<R: scp_identity::resolver::DidResolver + 'static>(
     resolver: Arc<R>,
     did_owned: String,
-    kid: scp_identity::SigningKeyId,
+    kid: scp_did::SigningKeyId,
 ) -> Option<ed25519_dalek::VerifyingKey> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -597,7 +595,7 @@ fn colocated_resolve_vm_on_dedicated_thread<R: scp_identity::resolver::DidResolv
 async fn connect_loopback_supervisor<S>(
     node: &ApplicationNode<S>,
     node_did: &str,
-    author_did: &scp_identity::DID,
+    author_did: &scp_did::DID,
     key_resolver: scp_core::context::governance::KeyResolver,
     durable: scp_core::context::supervisor::DurableProviders,
 ) -> Result<Arc<scp_core::context::supervisor::Supervisor>, SelfHostError>
@@ -659,7 +657,7 @@ where
 async fn publish_assets<C>(
     supervisor: &scp_core::context::supervisor::Supervisor,
     context_id: &str,
-    author_did: &scp_identity::DID,
+    author_did: &scp_did::DID,
     deploy_id: &str,
     signing_key_handle: scp_platform::KeyHandle,
     custody: &C,
@@ -2654,7 +2652,7 @@ mod tests {
             )
             .into()
         };
-        let doc = scp_identity::DidDocument::new(
+        let doc = scp_did::DidDocument::new(
             &did,
             identity_public.as_bytes(),
             active_public.as_bytes(),
@@ -2700,12 +2698,7 @@ mod tests {
         let active_result = tokio::task::spawn_blocking({
             let key_resolver = Arc::clone(&key_resolver);
             let did = did.clone();
-            move || {
-                key_resolver(
-                    &scp_identity::DID::from(did),
-                    scp_identity::SigningKeyId::Active,
-                )
-            }
+            move || key_resolver(&scp_did::DID::from(did), scp_did::SigningKeyId::Active)
         })
         .await
         .expect("resolver task joins");
@@ -2724,8 +2717,8 @@ mod tests {
             let key_resolver = Arc::clone(&key_resolver);
             move || {
                 key_resolver(
-                    &scp_identity::DID::from(unknown_did),
-                    scp_identity::SigningKeyId::Active,
+                    &scp_did::DID::from(unknown_did),
+                    scp_did::SigningKeyId::Active,
                 )
             }
         })
@@ -2772,10 +2765,7 @@ mod tests {
 
         // Invoke DIRECTLY on the current-thread runtime's thread — the path that
         // panicked under the old `block_in_place` gate. Must resolve, not panic.
-        let active_result = key_resolver(
-            &scp_identity::DID::from(did),
-            scp_identity::SigningKeyId::Active,
-        );
+        let active_result = key_resolver(&scp_did::DID::from(did), scp_did::SigningKeyId::Active);
         assert_eq!(
             active_result,
             Some(active_public),

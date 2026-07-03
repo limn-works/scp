@@ -16,8 +16,8 @@
 use scp_core::crypto::key_continuity::{
     KeyContinuityParty, compute_key_continuity_fingerprint, fingerprint_to_decimal,
 };
-use scp_identity::document::DidDocument;
-use scp_identity::{DidDht, DidMethod, ScpIdentity, SigningKeyId};
+use scp_did::{DidDocument, SigningKeyId};
+use scp_identity::{DidDht, DidMethod, ScpIdentity};
 use scp_platform::testing::InMemoryKeyCustody;
 use scp_platform::traits::{KeyCustody, KeyType};
 
@@ -235,7 +235,7 @@ async fn agent_key_validation() {
 
     // Fabricate a doc with two #agent VMs to trigger validation error.
     let mut bad_doc = doc.clone();
-    let fake_vm = scp_identity::document::VerificationMethod {
+    let fake_vm = scp_did::VerificationMethod {
         id: format!("{}#agent", bad_doc.id),
         method_type: "Ed25519VerificationKey2020".to_owned(),
         controller: bad_doc.id.clone(),
@@ -244,7 +244,7 @@ async fn agent_key_validation() {
     bad_doc.verification_method.push(fake_vm.clone());
     bad_doc
         .verification_method
-        .push(scp_identity::document::VerificationMethod {
+        .push(scp_did::VerificationMethod {
             id: format!("{}#agent", bad_doc.id),
             method_type: "Ed25519VerificationKey2020".to_owned(),
             controller: bad_doc.id.clone(),

@@ -65,9 +65,9 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
+use scp_clock::{Clock, SystemClock};
+use scp_did::DID;
 use scp_event_log::checkpoint::ConsistencyCheckpoint;
-use scp_identity::DID;
-use scp_primitives::{Clock, SystemClock};
 use scp_protocol::context::broadcast::BroadcastContext as ProtocolBroadcastContext;
 use scp_protocol::context::membership::{MembershipState, ReceiveBuffer};
 use scp_protocol::context::roles::ContextRoleState;
@@ -86,8 +86,8 @@ use crate::context::state::{
 };
 use crate::context::supervisor::saga_journal::SagaId;
 use crate::context::supervisor::saga_prepared_state::SagaPreparedState;
-use crate::crypto::mls::group::ScpMlsGroup;
 use crate::economy::adapter::PaymentReceipt;
+use scp_mls::group::ScpMlsGroup;
 
 // ---------------------------------------------------------------------------
 // Lifecycle state (per-actor, actor-owned)
@@ -707,7 +707,7 @@ impl ContextRouting {
 /// footprint of every [`PerContextState`] that carries it) is bounded
 /// by a pointer regardless of which variant is present.
 /// [`ContextCryptoState`] is ~1.8 KB (dominated by the
-/// [`crate::crypto::mls::group::ScpMlsGroup`]'s internal OpenMLS
+/// [`scp_mls::group::ScpMlsGroup`]'s internal OpenMLS
 /// storage) and [`BroadcastState`] is ~232 bytes (per-author maps +
 /// rotation queue); boxing both avoids the `large_enum_variant` clippy
 /// finding and prevents any future per-variant growth from forcing

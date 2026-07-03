@@ -213,7 +213,12 @@ Crates and their enforcement status:
 | `scp-ffi` | not yet | ~99% | 100% |
 | `scp-ffi-napi` | not yet | ~100% | 100% |
 | `scp-ffi-uniffi` | not yet | ~100% | 100% |
-| `scp-primitives` | `warn` | ~100% | 100% |
+| `scp-clock` | `warn` | ~100% | 100% |
+| `scp-crypto` | `warn` | ~100% | 100% |
+| `scp-did` | `warn` | ~100% | 100% |
+| `scp-mls` | not yet | ~95% | 100% |
+| `scp-client` | not yet | ~95% | 100% |
+| `scp-client-wasm` | not yet | ~95% | 100% |
 | `scp-testing` | not yet | ~90% | 100% |
 | `scp-node` | `warn` | ~91% | 100% |
 | `scp-mcp` | `warn` | ~100% | 100% |

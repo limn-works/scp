@@ -113,18 +113,18 @@ pub struct TimerHandle(u64);
 ```rust
 /// scp-testing/src/clock.rs
 
-/// Production clock backed by scp_primitives::time.
+/// Production clock backed by scp_clock::SystemClock.
 /// Timer registration returns a valid handle but callbacks never fire —
 /// production code uses its own real timer infrastructure.
 pub struct SystemClock;
 
 impl Clock for SystemClock {
     fn now_secs(&self) -> u64 {
-        scp_primitives::time::now_secs().unwrap_or(0)
+        scp_clock::Clock::now_secs(&scp_clock::SystemClock)
     }
 
     fn now_millis(&self) -> u64 {
-        scp_primitives::time::now_millis().unwrap_or(0)
+        scp_clock::Clock::now_millis(&scp_clock::SystemClock)
     }
 
     fn register_timer(&self, _at_millis: u64, _callback: Box<dyn FnOnce() + Send>) -> TimerHandle {

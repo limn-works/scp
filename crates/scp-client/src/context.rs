@@ -13,8 +13,9 @@
 
 use std::collections::{HashMap, VecDeque};
 
+use scp_did::DID;
 use scp_event_log::tree::{GENESIS_PREV_HASH, append_unsigned_event, event_count, root};
-use scp_event_log::{DID, Event, EventLog, EventPayload, EventType};
+use scp_event_log::{Event, EventLog, EventPayload, EventType};
 use scp_protocol::context::membership::ContextEvent;
 
 use crate::crypto_state::ContextCryptoState;

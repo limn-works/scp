@@ -36,7 +36,7 @@ use crate::economy::types::Amount;
 // Type aliases (match event_log/mod.rs pattern)
 // ---------------------------------------------------------------------------
 
-use scp_primitives::DID;
+use scp_did::DID;
 
 /// A context identifier string.
 ///

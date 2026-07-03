@@ -26,9 +26,9 @@
 
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
+use scp_clock::Clock;
 use scp_ffi_common::error_codes as codes;
 use scp_platform::traits::Storage;
-use scp_primitives::Clock;
 
 use crate::error::ScpPyError;
 use crate::runtime::PyBridgeInstance;
@@ -341,7 +341,7 @@ fn event_log_query_impl(
         event_type: "LogSummary".to_owned(),
         actor_did: String::new(),
         #[allow(clippy::cast_precision_loss)] // Unix timestamp seconds fit in f64 mantissa for centuries.
-        timestamp: scp_primitives::SystemClock.now_secs() as f64,
+        timestamp: scp_clock::SystemClock.now_secs() as f64,
         payload,
         sequence: event_count.saturating_sub(1),
     };
@@ -735,7 +735,7 @@ fn event_log_checkpoint_impl(
     let context_id_owned = context_id.to_owned();
     let did_owned = did.to_owned();
 
-    let sender_did = scp_identity::DID(did_owned.clone());
+    let sender_did = scp_did::DID(did_owned.clone());
 
     let checkpoint = crate::runtime::with_identity(bi, &did_owned, |entry| {
         crate::runtime::with_context(bi, &context_id_owned, |ctx_rt| {

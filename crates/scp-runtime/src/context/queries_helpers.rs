@@ -88,7 +88,7 @@
 //! finalization; the `_legacy` suffix is dropped because there is no
 //! per-context actor-shape twin to disambiguate against.
 
-use scp_identity::DID;
+use scp_did::DID;
 use scp_protocol::context::membership::{ContextEvent, ReceiveBuffer};
 use scp_protocol::context::roles::{Capability, ContextRoleState, RoleAssignment};
 use scp_protocol::context::{ContextError, ContextParams};
@@ -841,16 +841,13 @@ fn verify_remote_checkpoint_authenticity(
 
     // Consistency checkpoints are sent under `#active` (ADR-039); resolve the
     // human signing key to verify the checkpoint signature.
-    let sender_pk = (deps.key_resolver)(
-        &remote.sender_did,
-        scp_protocol::identity::SigningKeyId::Active,
-    )
-    .ok_or_else(|| {
-        ContextError::CryptoFailed(format!(
-            "cannot resolve public key for checkpoint sender {}",
-            remote.sender_did
-        ))
-    })?;
+    let sender_pk = (deps.key_resolver)(&remote.sender_did, scp_did::SigningKeyId::Active)
+        .ok_or_else(|| {
+            ContextError::CryptoFailed(format!(
+                "cannot resolve public key for checkpoint sender {}",
+                remote.sender_did
+            ))
+        })?;
     scp_event_log::checkpoint::verify_checkpoint_signature(remote, &sender_pk).map_err(|reason| {
         ContextError::CryptoFailed(format!(
             "checkpoint signature verification failed: {reason}"
@@ -1249,7 +1246,7 @@ mod equivocation_dedup_tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use scp_identity::DID;
+    use scp_did::DID;
 
     use super::record_equivocation_if_fresh;
     use crate::context::actor::deps::ActorDeps;
@@ -1308,7 +1305,7 @@ mod equivocation_dedup_tests {
         let event_log: Box<dyn crate::context::builder::ContextEventLogProvider> =
             Box::new(CountingEventLog { appends });
         let key_resolver: scp_protocol::context::governance::KeyResolver =
-            Arc::new(|_: &scp_identity::DID, _: scp_protocol::identity::SigningKeyId| None);
+            Arc::new(|_: &scp_did::DID, _: scp_did::SigningKeyId| None);
         let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
             Arc::new(
                 crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(

@@ -14,7 +14,7 @@
 use scp_platform::traits::Storage;
 use serde::{Deserialize, Serialize};
 
-use scp_identity::DID;
+use scp_did::DID;
 
 use scp_protocol::identity::block_list::{BlockListEvent, BlockListState};
 

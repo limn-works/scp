@@ -5,7 +5,7 @@ edition = "2021"
 publish = false
 
 [dependencies]
-scp-core = { path = "../../crates/scp-core" }
+scp-clock = { path = "../../crates/scp-clock" }
 scp-identity = { path = "../../crates/scp-identity", features = ["production-dht"] }
 scp-node = { path = "../../crates/scp-node" }
 scp-platform = { path = "../../crates/scp-platform", features = ["sqlite"] }

@@ -27,10 +27,10 @@ use ed25519_dalek::Signer;
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 
+use scp_did::DID;
 use scp_event_log::checkpoint::{CheckpointComparison, compare_checkpoint, generate_checkpoint};
 use scp_event_log::tree::{self, GENESIS_PREV_HASH};
 use scp_event_log::{Event, EventLog, EventPayload, EventType};
-use scp_identity::DID;
 use scp_platform::testing::InMemoryKeyCustody;
 use scp_platform::traits::{KeyCustody, KeyType};
 use scp_protocol::context::roles::{
@@ -295,7 +295,7 @@ async fn phase2_end_to_end_integration() {
         alice_did.to_string(),
         ceiling.clone(),
         vec![],
-        &scp_primitives::SystemClock,
+        &scp_clock::SystemClock,
     )
     .expect("role state creation");
 
@@ -427,7 +427,7 @@ async fn phase2_end_to_end_integration() {
         &bob_did,
         "member",
         &alice_did,
-        &scp_primitives::SystemClock,
+        &scp_clock::SystemClock,
     )
     .expect("assign member role to Bob");
 
@@ -585,7 +585,7 @@ async fn phase2_end_to_end_integration() {
         &bob_did,
         "observer",
         &bob_did,
-        &scp_primitives::SystemClock,
+        &scp_clock::SystemClock,
     );
 
     assert!(

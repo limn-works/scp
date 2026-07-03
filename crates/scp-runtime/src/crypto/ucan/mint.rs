@@ -29,15 +29,15 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use sha2::{Digest, Sha256};
 
+use scp_clock::Clock;
 use scp_platform::traits::{KeyCustody, KeyHandle};
-use scp_primitives::Clock;
 
 use std::collections::HashSet;
 
+use scp_did::SigningKeyId;
 use scp_protocol::crypto::ucan::capability::{CapabilityUri, verify_ceiling_compliance};
 use scp_protocol::crypto::ucan::nonce::generate_nonce;
 use scp_protocol::crypto::ucan::{Attenuation, UcanError, UcanHeader, UcanPayload, UcanToken};
-use scp_protocol::identity::SigningKeyId;
 
 /// Maximum token lifetime: 24 hours in seconds (spec section 9.5).
 const MAX_EXPIRY_SECS: u64 = 24 * 60 * 60;
@@ -649,7 +649,7 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
             .await
             .unwrap();
 
@@ -701,7 +701,7 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
             .await
             .unwrap();
 
@@ -745,7 +745,7 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
             .await
             .unwrap();
         let nonce = &token.payload.nnc;
@@ -785,10 +785,10 @@ mod tests {
             ceiling: None,
         };
 
-        let token1 = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        let token1 = mint_ucan(&params, &custody, &scp_clock::SystemClock)
             .await
             .unwrap();
-        let token2 = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        let token2 = mint_ucan(&params, &custody, &scp_clock::SystemClock)
             .await
             .unwrap();
 
@@ -818,7 +818,7 @@ mod tests {
             ceiling: None,
         };
 
-        let err = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        let err = mint_ucan(&params, &custody, &scp_clock::SystemClock)
             .await
             .unwrap_err();
         assert!(matches!(err, UcanError::ExpiryTooFar(_)));
@@ -845,7 +845,7 @@ mod tests {
         };
 
         assert!(
-            mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+            mint_ucan(&params, &custody, &scp_clock::SystemClock)
                 .await
                 .is_ok()
         );
@@ -875,7 +875,7 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
             .await
             .unwrap();
 
@@ -914,7 +914,7 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
             .await
             .unwrap();
 
@@ -946,7 +946,7 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
             .await
             .unwrap();
 
@@ -986,7 +986,7 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
             .await
             .unwrap();
         let cid = compute_cid(&token);
@@ -1017,7 +1017,7 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
             .await
             .unwrap();
         let cid1 = compute_cid(&token);
@@ -1046,10 +1046,10 @@ mod tests {
             ceiling: None,
         };
 
-        let token1 = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        let token1 = mint_ucan(&params, &custody, &scp_clock::SystemClock)
             .await
             .unwrap();
-        let token2 = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        let token2 = mint_ucan(&params, &custody, &scp_clock::SystemClock)
             .await
             .unwrap();
 
@@ -1082,7 +1082,7 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
             .await
             .unwrap();
         let cid = compute_cid(&token);
@@ -1125,7 +1125,7 @@ mod tests {
             signing_key_id: None,
             ceiling: None,
         };
-        mint_ucan(&params, custody, &scp_primitives::SystemClock)
+        mint_ucan(&params, custody, &scp_clock::SystemClock)
             .await
             .unwrap()
     }
@@ -1167,7 +1167,7 @@ mod tests {
             ceiling: None,
         };
 
-        let delegated = delegate_ucan(&delegate_params, &bob_custody, &scp_primitives::SystemClock)
+        let delegated = delegate_ucan(&delegate_params, &bob_custody, &scp_clock::SystemClock)
             .await
             .unwrap();
 
@@ -1225,7 +1225,7 @@ mod tests {
             ceiling: None,
         };
 
-        let delegated = delegate_ucan(&delegate_params, &bob_custody, &scp_primitives::SystemClock)
+        let delegated = delegate_ucan(&delegate_params, &bob_custody, &scp_clock::SystemClock)
             .await
             .unwrap();
 
@@ -1270,7 +1270,7 @@ mod tests {
             ceiling: None,
         };
 
-        let delegated = delegate_ucan(&delegate_params, &bob_custody, &scp_primitives::SystemClock)
+        let delegated = delegate_ucan(&delegate_params, &bob_custody, &scp_clock::SystemClock)
             .await
             .unwrap();
 
@@ -1329,7 +1329,7 @@ mod tests {
             ceiling: None,
         };
 
-        let delegated = delegate_ucan(&delegate_params, &bob_custody, &scp_primitives::SystemClock)
+        let delegated = delegate_ucan(&delegate_params, &bob_custody, &scp_clock::SystemClock)
             .await
             .unwrap();
         assert_eq!(delegated.payload.att.len(), 3);
@@ -1374,7 +1374,7 @@ mod tests {
             ceiling: None,
         };
 
-        let delegated = delegate_ucan(&delegate_params, &bob_custody, &scp_primitives::SystemClock)
+        let delegated = delegate_ucan(&delegate_params, &bob_custody, &scp_clock::SystemClock)
             .await
             .unwrap();
         assert_eq!(delegated.payload.att.len(), 1);
@@ -1415,7 +1415,7 @@ mod tests {
             ceiling: None,
         };
 
-        let delegated = delegate_ucan(&delegate_params, &bob_custody, &scp_primitives::SystemClock)
+        let delegated = delegate_ucan(&delegate_params, &bob_custody, &scp_clock::SystemClock)
             .await
             .unwrap();
         assert_eq!(
@@ -1458,10 +1458,10 @@ mod tests {
             ceiling: None,
         };
 
-        let d1 = delegate_ucan(&delegate_params, &bob_custody, &scp_primitives::SystemClock)
+        let d1 = delegate_ucan(&delegate_params, &bob_custody, &scp_clock::SystemClock)
             .await
             .unwrap();
-        let d2 = delegate_ucan(&delegate_params, &bob_custody, &scp_primitives::SystemClock)
+        let d2 = delegate_ucan(&delegate_params, &bob_custody, &scp_clock::SystemClock)
             .await
             .unwrap();
 
@@ -1522,13 +1522,10 @@ mod tests {
             ceiling: None,
         };
 
-        let bob_to_carol = delegate_ucan(
-            &bob_delegate_params,
-            &bob_custody,
-            &scp_primitives::SystemClock,
-        )
-        .await
-        .unwrap();
+        let bob_to_carol =
+            delegate_ucan(&bob_delegate_params, &bob_custody, &scp_clock::SystemClock)
+                .await
+                .unwrap();
         let bob_to_carol_cid = compute_cid(&bob_to_carol);
 
         // Bob's delegated token should have root CID in proof chain.
@@ -1557,7 +1554,7 @@ mod tests {
         let carol_to_dave = delegate_ucan(
             &carol_delegate_params,
             &carol_custody,
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .await
         .unwrap();
@@ -1609,7 +1606,7 @@ mod tests {
             ceiling: None,
         };
 
-        let err = delegate_ucan(&delegate_params, &eve_custody, &scp_primitives::SystemClock)
+        let err = delegate_ucan(&delegate_params, &eve_custody, &scp_clock::SystemClock)
             .await
             .unwrap_err();
         assert!(
@@ -1654,7 +1651,7 @@ mod tests {
             ceiling: None,
         };
 
-        let err = delegate_ucan(&delegate_params, &bob_custody, &scp_primitives::SystemClock)
+        let err = delegate_ucan(&delegate_params, &bob_custody, &scp_clock::SystemClock)
             .await
             .unwrap_err();
         assert!(
@@ -1704,7 +1701,7 @@ mod tests {
             ceiling: None,
         };
 
-        let err = delegate_ucan(&delegate_params, &bob_custody, &scp_primitives::SystemClock)
+        let err = delegate_ucan(&delegate_params, &bob_custody, &scp_clock::SystemClock)
             .await
             .unwrap_err();
         assert!(
@@ -1748,7 +1745,7 @@ mod tests {
             ceiling: None,
         };
 
-        let err = delegate_ucan(&delegate_params, &bob_custody, &scp_primitives::SystemClock)
+        let err = delegate_ucan(&delegate_params, &bob_custody, &scp_clock::SystemClock)
             .await
             .unwrap_err();
         assert!(
@@ -1791,7 +1788,7 @@ mod tests {
             ceiling: None,
         };
 
-        let err = delegate_ucan(&delegate_params, &bob_custody, &scp_primitives::SystemClock)
+        let err = delegate_ucan(&delegate_params, &bob_custody, &scp_clock::SystemClock)
             .await
             .unwrap_err();
         assert!(
@@ -1834,7 +1831,7 @@ mod tests {
             ceiling: None,
         };
 
-        let err = delegate_ucan(&delegate_params, &bob_custody, &scp_primitives::SystemClock)
+        let err = delegate_ucan(&delegate_params, &bob_custody, &scp_clock::SystemClock)
             .await
             .unwrap_err();
         assert!(
@@ -1875,7 +1872,7 @@ mod tests {
             ceiling: None,
         };
 
-        let delegated = delegate_ucan(&delegate_params, &bob_custody, &scp_primitives::SystemClock)
+        let delegated = delegate_ucan(&delegate_params, &bob_custody, &scp_clock::SystemClock)
             .await
             .unwrap();
         assert!(delegated.payload.att.is_empty());
@@ -1908,7 +1905,7 @@ mod tests {
             signing_key_id: None,
             ceiling: None,
         };
-        let mut root_token = mint_ucan(&params, &alice_custody, &scp_primitives::SystemClock)
+        let mut root_token = mint_ucan(&params, &alice_custody, &scp_clock::SystemClock)
             .await
             .unwrap();
         // Overwrite att to use the explicitly wildcard form.
@@ -1933,7 +1930,7 @@ mod tests {
             ceiling: None,
         };
 
-        let delegated = delegate_ucan(&delegate_params, &bob_custody, &scp_primitives::SystemClock)
+        let delegated = delegate_ucan(&delegate_params, &bob_custody, &scp_clock::SystemClock)
             .await
             .unwrap();
         assert_eq!(
@@ -1966,7 +1963,7 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
             .await
             .unwrap();
 
@@ -2012,7 +2009,7 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
             .await
             .unwrap();
 
@@ -2056,7 +2053,7 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
             .await
             .unwrap();
 
@@ -2100,7 +2097,7 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
             .await
             .unwrap();
 
@@ -2140,7 +2137,7 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
             .await
             .unwrap();
 
@@ -2180,7 +2177,7 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
             .await
             .unwrap();
 
@@ -2219,7 +2216,7 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
             .await
             .unwrap();
 
@@ -2268,7 +2265,7 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
             .await
             .unwrap();
 
@@ -2306,7 +2303,7 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
             .await
             .unwrap();
 
@@ -2343,7 +2340,7 @@ mod tests {
             ceiling: None,
         };
 
-        let err = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        let err = mint_ucan(&params, &custody, &scp_clock::SystemClock)
             .await
             .unwrap_err();
         assert!(
@@ -2373,7 +2370,7 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
             .await
             .unwrap();
         let fct = token.payload.fct.as_ref().expect("fct must be present");
@@ -2403,7 +2400,7 @@ mod tests {
             ceiling: None,
         };
 
-        let err = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        let err = mint_ucan(&params, &custody, &scp_clock::SystemClock)
             .await
             .unwrap_err();
         assert!(
@@ -2432,7 +2429,7 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
             .await
             .unwrap();
         assert_eq!(token.payload.iss, token.payload.aud);
@@ -2458,7 +2455,7 @@ mod tests {
             ceiling: None,
         };
 
-        let err = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        let err = mint_ucan(&params, &custody, &scp_clock::SystemClock)
             .await
             .unwrap_err();
         assert!(
@@ -2490,7 +2487,7 @@ mod tests {
                 ceiling: None,
             },
             &custody,
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .await
         .unwrap();
@@ -2509,7 +2506,7 @@ mod tests {
                 ceiling: None,
             },
             &custody_b,
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .await
         .unwrap_err();
@@ -2541,7 +2538,7 @@ mod tests {
                 ceiling: None,
             },
             &custody,
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .await
         .unwrap();
@@ -2560,7 +2557,7 @@ mod tests {
                 ceiling: None,
             },
             &custody_b,
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .await
         .unwrap_err();
@@ -2592,7 +2589,7 @@ mod tests {
                 ceiling: None,
             },
             &custody,
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .await
         .unwrap();
@@ -2611,7 +2608,7 @@ mod tests {
                 ceiling: None,
             },
             &custody_b,
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .await
         .unwrap_err();
@@ -2645,7 +2642,7 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
             .await
             .unwrap();
 
@@ -2677,7 +2674,7 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
             .await
             .unwrap();
 
@@ -2712,7 +2709,7 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
             .await
             .unwrap();
 
@@ -2752,7 +2749,7 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
             .await
             .unwrap();
 
@@ -2790,7 +2787,7 @@ mod tests {
             ceiling: Some(ceiling),
         };
 
-        let err = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        let err = mint_ucan(&params, &custody, &scp_clock::SystemClock)
             .await
             .unwrap_err();
         assert!(
@@ -2827,7 +2824,7 @@ mod tests {
         };
 
         assert!(
-            mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+            mint_ucan(&params, &custody, &scp_clock::SystemClock)
                 .await
                 .is_ok(),
             "minting with capabilities within the ceiling must succeed"
@@ -2861,7 +2858,7 @@ mod tests {
         };
 
         assert!(
-            mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+            mint_ucan(&params, &custody, &scp_clock::SystemClock)
                 .await
                 .is_ok(),
             "minting with ceiling: None must succeed for capabilities within the default ceiling"
@@ -2892,7 +2889,7 @@ mod tests {
             ceiling: None,
         };
 
-        let err = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        let err = mint_ucan(&params, &custody, &scp_clock::SystemClock)
             .await
             .unwrap_err();
         assert!(
@@ -2946,7 +2943,7 @@ mod tests {
             ceiling: Some(ceiling),
         };
 
-        let err = delegate_ucan(&delegate_params, &bob_custody, &scp_primitives::SystemClock)
+        let err = delegate_ucan(&delegate_params, &bob_custody, &scp_clock::SystemClock)
             .await
             .unwrap_err();
         assert!(
@@ -2996,7 +2993,7 @@ mod tests {
         };
 
         assert!(
-            delegate_ucan(&delegate_params, &bob_custody, &scp_primitives::SystemClock)
+            delegate_ucan(&delegate_params, &bob_custody, &scp_clock::SystemClock)
                 .await
                 .is_ok(),
             "delegation narrowing within ceiling must succeed"
@@ -3029,7 +3026,7 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
             .await
             .unwrap();
 
@@ -3061,7 +3058,7 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
             .await
             .unwrap();
 
@@ -3096,7 +3093,7 @@ mod tests {
             ceiling: Some(ceiling),
         };
 
-        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
             .await
             .unwrap();
 
@@ -3128,7 +3125,7 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
             .await
             .unwrap();
 
@@ -3164,7 +3161,7 @@ mod tests {
         };
 
         assert!(
-            mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+            mint_ucan(&params, &custody, &scp_clock::SystemClock)
                 .await
                 .is_ok(),
             "tool:invoke:* must pass ceiling check with tool_invoke:* in ceiling"
@@ -3194,7 +3191,7 @@ mod tests {
             ceiling: Some(ceiling),
         };
 
-        let err = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        let err = mint_ucan(&params, &custody, &scp_clock::SystemClock)
             .await
             .unwrap_err();
         assert!(

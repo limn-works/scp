@@ -14,7 +14,7 @@
 //!
 //! See SCP-PERSIST-065.
 
-use scp_primitives::Clock;
+use scp_clock::Clock;
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
@@ -24,7 +24,7 @@ use super::storage::{BlobStorage, StorageError, StoredBlob};
 /// Clock function type for timestamp injection (testing).
 ///
 /// Returns the current Unix timestamp in seconds. The default uses
-/// [`scp_primitives::SystemClock`].
+/// [`scp_clock::SystemClock`].
 type ClockFn = Arc<dyn Fn() -> u64 + Send + Sync>;
 
 /// Metadata tracked for each cached blob, used for eviction ordering.
@@ -95,7 +95,7 @@ impl<S: BlobStorage> LocalBlobCache<S> {
             inner,
             max_cache_size,
             entries: Arc::new(Mutex::new(Vec::new())),
-            clock: Arc::new(|| scp_primitives::SystemClock.now_secs()),
+            clock: Arc::new(|| scp_clock::SystemClock.now_secs()),
         }
     }
 

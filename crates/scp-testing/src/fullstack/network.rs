@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use scp_core::context::governance::KeyResolver;
-use scp_identity::DID;
+use scp_did::DID;
 
 use super::crypto::E2eCryptoProvider;
 use super::exchange::KeyExchange;
