@@ -211,6 +211,32 @@
           "swift": true
         },
         {
+          "name": "reserve_key_package",
+          "python": true,
+          "typescript": false,
+          "kotlin": false,
+          "swift": false,
+          "notes": "ADR-049 Phase 2J joiner handshake (step 1): reserve a single-use MLS KeyPackage. PyO3 bridge PyScp::reserve_key_package (scp-ffi/src/context.rs) reaches Supervisor::reserve_key_package; SDK wrapper SCP.reserve_key_package (bindings/python/scp_sdk/scp.py). NAPI bridge export already landed (reserve_key_package_on, scp-ffi/napi/src/context.rs); the TypeScript SDK wrapper lands in the same PR series (parallel slice). Swift/Kotlin wrappers follow in the next wave.",
+          "exemptions": {
+            "typescript": "wrapper lands in the same PR series (ADR-049 §9 Deferred Work 1 FFI follow-on slice)",
+            "kotlin": "wrapper lands in the same PR series (ADR-049 §9 Deferred Work 1 FFI follow-on slice)",
+            "swift": "wrapper lands in the same PR series (ADR-049 §9 Deferred Work 1 FFI follow-on slice)"
+          }
+        },
+        {
+          "name": "join_from_welcome",
+          "python": true,
+          "typescript": false,
+          "kotlin": false,
+          "swift": false,
+          "notes": "ADR-049 Phase 2J joiner handshake (step 2): join a context by processing a received MLS Welcome, standing the joiner up as a send-capable participant. PyO3 bridge PyScp::context_join_from_welcome (scp-ffi/src/context.rs) reaches Supervisor::spawn_actor_from_welcome; SDK wrapper SCP.context_join_from_welcome (bindings/python/scp_sdk/scp.py). NAPI bridge export already landed (context_join_from_welcome_on, scp-ffi/napi/src/context.rs); the TypeScript SDK wrapper lands in the same PR series (parallel slice). Swift/Kotlin wrappers follow in the next wave.",
+          "exemptions": {
+            "typescript": "wrapper lands in the same PR series (ADR-049 §9 Deferred Work 1 FFI follow-on slice)",
+            "kotlin": "wrapper lands in the same PR series (ADR-049 §9 Deferred Work 1 FFI follow-on slice)",
+            "swift": "wrapper lands in the same PR series (ADR-049 §9 Deferred Work 1 FFI follow-on slice)"
+          }
+        },
+        {
           "name": "leave",
           "python": true,
           "typescript": true,

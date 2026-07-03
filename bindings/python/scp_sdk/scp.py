@@ -937,6 +937,127 @@ class SCP:
             self._native.context_join, handle, identity_did, spending_ucan_jwt
         )
 
+    async def reserve_key_package(self, owning_did: str) -> tuple[str, bytes]:
+        """Reserve a single-use MLS ``KeyPackage`` to be invited into a context.
+
+        First step of the reserve -> Welcome -> join handshake (ADR-049 Phase
+        2J). ``owning_did`` MUST be a locally-custodied identity — the same
+        trust model as :meth:`context_create`. Only the PUBLIC ``KeyPackage``
+        bytes cross the FFI boundary; the private signer state never leaves the
+        node's ``KeyPackage`` actor.
+
+        Hand the returned ``key_package_public`` bytes to the context creator
+        (out of band). The creator mints an MLS Welcome addressed to that
+        ``KeyPackage`` and returns it; complete the join by passing the Welcome
+        and the returned ``reservation_id`` to
+        :meth:`context_join_from_welcome`.
+
+        Example::
+
+            reservation_id, key_package_public = await scp.reserve_key_package(
+                joiner.did
+            )
+            # ... send key_package_public to the creator, receive `welcome` back ...
+            ctx = await scp.context_join_from_welcome(
+                joiner.did, creator_did, context_id, params, reservation_id, welcome
+            )
+
+        Args:
+            owning_did: DID of the LOCAL identity reserving the ``KeyPackage``.
+
+        Returns:
+            A ``(reservation_id, key_package_public)`` tuple: the opaque
+            reservation-id string to pass back to
+            :meth:`context_join_from_welcome`, and the public MLS
+            ``KeyPackage`` bytes to hand to the context creator.
+
+        Raises:
+            Exception: If ``owning_did`` is not a locally-custodied identity, or
+                the reservation fails (providers not wired, empty pool).
+
+        Delegates to ``_scp_core.SCP.reserve_key_package``.
+        """
+        return await asyncio.to_thread(self._native.reserve_key_package, owning_did)
+
+    async def context_join_from_welcome(
+        self,
+        owning_did: str,
+        creator_did: str,
+        context_id: str,
+        params: dict[str, Any],
+        reservation_id: str,
+        welcome_bytes: bytes,
+    ) -> Any:
+        """Join a context by processing a received MLS Welcome (returns :class:`Context`).
+
+        Completes the reserve -> Welcome -> join handshake begun by
+        :meth:`reserve_key_package` (ADR-049 Phase 2J): given the Welcome the
+        creator minted for the previously-reserved ``KeyPackage``, this installs
+        the joined MLS group, derives the joiner's §9.10.4 routing pseudonym from
+        its locally-custodied identity, and stands the local (joiner) identity up
+        as a send-capable participant with an actor-backed handle. Without it a
+        Welcome-joined node can DECRYPT but cannot SEND.
+
+        Custody of the JOINER (``owning_did``) is enforced exactly as
+        :meth:`context_create` enforces it for the creator: the routing pseudonym
+        is DERIVED from the joiner's local custody, never caller-supplied, so a
+        non-custodied joiner hard-fails before the single-use ``KeyPackage`` is
+        consumed. ``owning_did`` and ``creator_did`` are passed separately so the
+        two cannot be transposed.
+
+        Example::
+
+            reservation_id, key_package_public = await scp.reserve_key_package(
+                joiner.did
+            )
+            # ... creator mints `welcome` addressed to key_package_public ...
+            ctx = await scp.context_join_from_welcome(
+                joiner.did,
+                creator_did,
+                context_id,
+                {"ceiling": ["core:send_message"]},
+                reservation_id,
+                welcome,
+            )
+
+        Args:
+            owning_did: DID of the LOCAL (joiner) identity — its custody derives
+                the routing pseudonym.
+            creator_did: DID of the context creator / admin (from the legible
+                params).
+            context_id: Canonical 64-hex context id (ADR-056).
+            params: Legible context parameters (same dict shape as
+                :meth:`context_create`).
+            reservation_id: The opaque reservation-id string returned by
+                :meth:`reserve_key_package` for the ``KeyPackage`` this Welcome
+                addresses.
+            welcome_bytes: The TLS-serialized MLS Welcome message.
+
+        Returns:
+            A :class:`~scp_sdk.context.Context` in the ``"active"`` state for the
+            joined context, scoped to the joiner (``owning_did``).
+
+        Raises:
+            Exception: If the joiner is not locally custodied, the params are
+                invalid, the reservation id is malformed, or the spawn fails
+                (bad/duplicate Welcome, single-use replay, first-writer-wins
+                collision, or fail-closed persist failure).
+
+        Delegates to ``_scp_core.SCP.context_join_from_welcome``.
+        """
+        from scp_sdk.context import Context
+
+        raw = await asyncio.to_thread(
+            self._native.context_join_from_welcome,
+            owning_did,
+            creator_did,
+            context_id,
+            params,
+            reservation_id,
+            welcome_bytes,
+        )
+        return Context(raw, identity_did=owning_did)
+
     async def context_leave(self, handle: Any, identity_did: str) -> Any:
         """Delegate to ``_scp_core.SCP.context_leave``."""
         return await asyncio.to_thread(self._native.context_leave, handle, identity_did)

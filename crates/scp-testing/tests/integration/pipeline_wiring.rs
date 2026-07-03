@@ -185,7 +185,12 @@ const NAPI_TRUST_SRC: &str = include_str!("../../../../crates/scp-ffi/napi/src/t
 // routing assertions: `Supervisor::participation_record` → core
 // `compute_participation_record`, plus PyO3/NAPI/UniFFI bridge ops → the shared
 // `Supervisor::participation_record` (Phase 2C-1).
-const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 48;
+// Raised 48 -> 52 when the ADR-049 Phase 2J joiner handshake wired the two FFI
+// joiner ops through the PyO3 + NAPI bridges: per-bridge structural assertions
+// pin `reserve_key_package` → `Supervisor::reserve_key_package` and
+// `context_join_from_welcome` → `Supervisor::spawn_actor_from_welcome`. Pure
+// coverage expansion locking the joiner-path seams into the ratchet floor.
+const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 52;
 
 // ---------------------------------------------------------------------------
 // Function body extraction — brace-matching parser
@@ -802,6 +807,67 @@ fn dispatch_lifecycle_direct_bootstrap_arms_call_actor_shape_helpers() {
         ),
         "dispatch_lifecycle_direct RestoreContext arm must delegate to the \
          actor-shape lifecycle_helpers::restore_context (spawns the per-context actor)"
+    );
+}
+
+// Bridge level (ADR-049 Phase 2J joiner handshake): the FFI joiner ops reach
+// the Supervisor seam. `reserve_key_package` (step 1) must reach
+// `Supervisor::reserve_key_package` — where the single-use MLS KeyPackage is
+// minted — and `context_join_from_welcome` (step 2) must reach
+// `Supervisor::spawn_actor_from_welcome` — where the Welcome is consumed and
+// the per-context actor is spawned. Pinned across BOTH already-landed bridges
+// (PyO3 + NAPI) so a future refactor cannot silently sever the joiner path
+// from the actor-per-context lifecycle. Additive assertions.
+#[test]
+fn pyo3_reserve_key_package_reaches_supervisor_seam() {
+    assert!(
+        fn_body_contains(PYO3_CONTEXT_SRC, "reserve_key_package", "supervisor(")
+            && fn_body_contains(
+                PYO3_CONTEXT_SRC,
+                "reserve_key_package",
+                ".reserve_key_package("
+            ),
+        "PyO3 reserve_key_package must resolve the bridge Supervisor and reach \
+         Supervisor::reserve_key_package (mints the single-use MLS KeyPackage)"
+    );
+}
+
+#[test]
+fn pyo3_context_join_from_welcome_reaches_spawn_actor_from_welcome() {
+    assert!(
+        fn_body_contains(
+            PYO3_CONTEXT_SRC,
+            "context_join_from_welcome",
+            "spawn_actor_from_welcome("
+        ),
+        "PyO3 context_join_from_welcome must reach Supervisor::spawn_actor_from_welcome \
+         (consumes the Welcome + spawns the per-context actor)"
+    );
+}
+
+#[test]
+fn napi_reserve_key_package_reaches_supervisor_seam() {
+    assert!(
+        fn_body_contains(
+            NAPI_CONTEXT_SRC,
+            "reserve_key_package_on",
+            ".reserve_key_package("
+        ),
+        "NAPI reserve_key_package_on must reach Supervisor::reserve_key_package \
+         (mints the single-use MLS KeyPackage)"
+    );
+}
+
+#[test]
+fn napi_context_join_from_welcome_reaches_spawn_actor_from_welcome() {
+    assert!(
+        fn_body_contains(
+            NAPI_CONTEXT_SRC,
+            "context_join_from_welcome_on",
+            "spawn_actor_from_welcome("
+        ),
+        "NAPI context_join_from_welcome_on must reach Supervisor::spawn_actor_from_welcome \
+         (consumes the Welcome + spawns the per-context actor)"
     );
 }
 
