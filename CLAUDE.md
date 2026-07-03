@@ -263,7 +263,7 @@ crates/              # Rust workspace — the protocol core
 │   ├── uniffi/      #   UniFFI (Swift, Kotlin)
 │   └── napi/        #   napi-rs (Node.js/Bun → TypeScript)
 ├── scp-identity/    # Native DID subsystem — DID-method, resolution/publication/lifecycle
-├── scp-dht/         # Native DHT transport leaf — DhtClient/DhtRecord/InMemory/Pkarr + BEP44 helpers (ADR-057 T1c)
+├── scp-dht/         # Native DHT transport leaf — DhtClient/DhtRecord/InMemory/Pkarr + BEP44 helpers (ADR-057 T1c-a)
 ├── scp-clock/       # Clock port (wall-clock time) — wasm-safe capability leaf
 ├── scp-crypto/      # Ed25519 signature verification — wasm-safe capability leaf
 ├── scp-did/         # DID data model (DID, SigningKeyId, DidDocument, proofs, attestation) — wasm-safe

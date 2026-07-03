@@ -15,5 +15,5 @@ signed-mutable-item transport used for DID publishing and resolution:
 
 The DID-method layer (`DidDht`, resolution, lifecycle) lives in `scp-identity`,
 which depends on this crate one-way and maps [`DhtError`] into its own
-`IdentityError` via a `From` impl. See ADR-057 (T1c) and ADR-003
+`IdentityError` via a `From` impl. See ADR-057 (T1c-a) and ADR-003
 (`.docs/adrs/phase-1.md`).

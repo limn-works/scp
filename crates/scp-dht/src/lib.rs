@@ -11,7 +11,7 @@
 //! DID-method layer in `scp-identity` maps [`DhtError`] into its own
 //! `IdentityError` via a `From` impl.
 //!
-//! See ADR-057 (T1c) and ADR-003 in `.docs/adrs/phase-1.md`.
+//! See ADR-057 (T1c-a) and ADR-003 in `.docs/adrs/phase-1.md`.
 
 #![forbid(unsafe_code)]
 

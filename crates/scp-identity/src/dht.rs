@@ -3311,7 +3311,7 @@ mod tests {
     /// signature-verify path reaches — MUST agree on canonicality. This test
     /// feeds the *same* non-canonical `did:dht:z…` fixture to both and asserts
     /// both reject it (and both accept the canonical spelling), pinning the
-    /// security-parity invariant from ADR-057's T1c passage: the browser path
+    /// security-parity invariant from ADR-057's T1c-b passage: the browser path
     /// must never verify against a key native would reject as non-canonical.
     #[test]
     fn native_and_scp_did_parsers_agree_on_canonicality() {

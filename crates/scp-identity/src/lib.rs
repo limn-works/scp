@@ -291,7 +291,7 @@ pub enum IdentityError {
 /// This is the one-way seam that lets the DID-method layer here depend on the
 /// transport crate (`scp-identity` → `scp-dht`) while surfacing a single error
 /// taxonomy to its own callers. The `?` operator in this crate's DHT
-/// publish/resolve paths relies on it (ADR-057 T1c).
+/// publish/resolve paths relies on it (ADR-057 T1c-a).
 impl From<scp_dht::DhtError> for IdentityError {
     fn from(err: scp_dht::DhtError) -> Self {
         match err {
