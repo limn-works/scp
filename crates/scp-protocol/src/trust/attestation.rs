@@ -2376,7 +2376,7 @@ mod tests {
         //   (b) malformed / unsupported inputs `Err` terminally AND
         //       deterministically (same input always yields the same outcome),
         //       which is the observable proxy for "no transient error path".
-        use scp_primitives::did_dht_from_public_key;
+        use scp_did::did_dht_from_public_key;
 
         let resolver = IdentityDidPublicKeyResolver;
         let key = [7u8; 32];
