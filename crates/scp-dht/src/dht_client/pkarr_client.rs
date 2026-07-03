@@ -427,7 +427,7 @@ impl PkarrDhtClientBuilder {
         } else {
             let client = reqwest::Client::builder()
                 .timeout(self.gateway_timeout)
-                .user_agent("scp-identity/0.1.0")
+                .user_agent(concat!("scp-dht/", env!("CARGO_PKG_VERSION")))
                 .build()
                 .map_err(|e| {
                     DhtError::DhtPublishFailed(format!(

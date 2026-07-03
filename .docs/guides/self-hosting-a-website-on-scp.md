@@ -97,7 +97,7 @@ Three addressing paths, none requiring DNS-as-central-authority:
 | Path | Who can use it | DNS? | Notes |
 |------|----------------|------|-------|
 | **Raw public IP:port** | any browser, today | none | `https://<public-ip>:<port>/` (origin-root mount; the canonical `…/scp/broadcast/<rid>/site/<path>` route also works). The self-host surface serves **self-signed HTTPS (TLS 1.3) by default** (§10.12.11) with a SAN for the external IP, so raw-IP HTTPS matches; browsers show a one-time cert warning. The routing_id route is registered unconditionally and ignores the `Host` header. Plaintext `http://` is an opt-out via `SCP_NODE_SELF_HOST_PLAINTEXT=1`. |
-| **`did:dht`** | SCP-aware clients | none | Real BitTorrent **Mainline DHT** publish via the `mainline` v6 crate, BEP44 signed mutable items (`crates/scp-identity/src/dht_client/pkarr_client.rs:271` publish / `:303` resolve). Gated behind the `production-dht` feature. No central authority in the publish path; the optional HTTP gateway is a signature-verified resolve-only fallback, empty by default. |
+| **`did:dht`** | SCP-aware clients | none | Real BitTorrent **Mainline DHT** publish via the `mainline` v6 crate, BEP44 signed mutable items (`crates/scp-dht/src/dht_client/pkarr_client.rs:233` publish / `:293` resolve). Gated behind the `production-dht` feature. No central authority in the publish path; the optional HTTP gateway is a signature-verified resolve-only fallback, empty by default. |
 | **Virtual host** (`Host:` header → routing_id) | any browser | needs DNS | Convenience only; out of scope for the DNS-free goal. |
 
 ### Known addressing gaps (honest)

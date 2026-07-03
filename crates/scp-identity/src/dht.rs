@@ -802,20 +802,6 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
         Ok(())
     }
 
-    /// Verifies a BEP44 Ed25519 signature over the given value and sequence.
-    ///
-    /// Delegates to the transport-layer [`scp_dht::verify_bep44_signature`]
-    /// helper, mapping its [`scp_dht::DhtError`] into [`IdentityError`].
-    fn verify_bep44_signature(
-        public_key: &[u8; 32],
-        signature: &[u8; 64],
-        value: &[u8],
-        seq: u64,
-    ) -> Result<(), IdentityError> {
-        scp_dht::verify_bep44_signature(public_key, signature, value, seq)
-            .map_err(IdentityError::from)
-    }
-
     /// Extracts the 32-byte public key from a `did:dht:z...` string.
     ///
     /// Delegates to the standalone [`extract_public_key`] function.
@@ -970,7 +956,7 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
             .ok_or_else(|| IdentityError::DhtNotFound(did_string.to_owned()))?;
 
         // Step 3: Verify BEP44 signature.
-        Self::verify_bep44_signature(&public_key, &record.signature, &record.value, record.seq)?;
+        scp_dht::verify_bep44_signature(&public_key, &record.signature, &record.value, record.seq)?;
 
         // Step 4: Deserialize the DID document.
         let doc_json = String::from_utf8(record.value).map_err(|e| {
@@ -3159,17 +3145,6 @@ mod tests {
 
         let result = dht.publish_document(&identity, &document).await;
         assert!(matches!(result, Err(IdentityError::DhtPublishFailed(_))));
-    }
-
-    #[tokio::test]
-    async fn bep44_signable_format_is_correct() {
-        let value = b"test";
-        let seq = 42;
-        let signable = scp_dht::bep44_signable(value, seq);
-
-        // Expected: "3:seqi42e1:v4:test"
-        let expected = b"3:seqi42e1:v4:test";
-        assert_eq!(signable, expected);
     }
 
     #[tokio::test]
