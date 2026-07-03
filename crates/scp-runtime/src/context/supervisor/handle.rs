@@ -38,8 +38,10 @@ use scp_identity::DID;
 use scp_protocol::context::ContextError;
 
 use crate::context::supervisor::identity_capability::OwnedIdentityDid;
-use crate::context::supervisor::key_package_actor::KeyPackageStoreHandle;
-use crate::context::supervisor::supervisor::{SagaInput, SagaOutput, Supervisor};
+use crate::context::supervisor::key_package_actor::{KeyPackageStoreHandle, ReservationId};
+use crate::context::supervisor::supervisor::{
+    SagaInput, SagaOutput, Supervisor, WelcomeJoinRequest,
+};
 
 // ---------------------------------------------------------------------------
 // Handle
@@ -430,14 +432,143 @@ impl SupervisorHandle {
             .await
     }
 
-    // NOTE (ADR-049 Phase 2J): the capability-gated `SupervisorHandle` wrapper
-    // for spawn-from-Welcome is the FUTURE FFI seam and lands WITH its FFI caller
-    // in the FFI follow-on slice (it takes `&OwnedIdentityDid` to bind the
-    // joiner's own identity). It is intentionally NOT defined in this core slice:
-    // the raw `Supervisor::spawn_actor_from_welcome` entry point is narrowed to
-    // `pub(in crate::context)` and exercised directly by the runtime
-    // spawn-from-Welcome tests; there is no production consumer until that slice, so an
-    // uncalled `#[allow(dead_code)]` wrapper here would be dead weight.
+    // -----------------------------------------------------------------
+    // Spawn-from-Welcome joiner surface (ADR-049 Phase 2J FFI follow-on).
+    //
+    // The two capability-gated methods below are the seam the FFI
+    // spawn-from-Welcome caller drives: reserve one of the joiner's own
+    // KeyPackages, then fuse the creator's Welcome into a live send-capable
+    // actor. Both take `&OwnedIdentityDid` — the SAME capability discipline
+    // as [`Self::my_key_package_store`] / [`Self::my_wrapping_public_key`]:
+    // the token proves the caller owns the identity being joined, it is
+    // minted only in supervisor-module code (`pub(super)` `issue_for_actor`),
+    // and its `did` field is private — so handler / infra code can hold and
+    // pass a token but cannot fabricate one for an identity it does not own.
+    // Visibility is `pub(in crate::context)` — the SAME visibility as
+    // `OwnedIdentityDid` and its peer methods — so there is no
+    // `private_interfaces` asymmetry to allow. The raw
+    // [`Supervisor::spawn_actor_from_welcome`](crate::context::supervisor::Supervisor)
+    // entry point stays `pub(in crate::context)` and takes a BARE `DID`
+    // (the "spawn under any identity" primitive the capability gate exists to
+    // fence off); these wrappers bind the owning identity through the
+    // unforgeable token instead.
+    //
+    // NOTE on FFI reachability: an FFI bridge lives in a downstream crate and
+    // cannot NAME `OwnedIdentityDid` (it is `pub(in crate::context)`, never
+    // `pub`/`pub(crate)`) nor CONSTRUCT a `SupervisorHandle`
+    // (`wrap` is `pub(in crate::context::supervisor)`). The FFI follow-on
+    // slice therefore reaches these through a genuinely-`pub` `Supervisor`
+    // entry point (which the bridge already holds as `Arc<Supervisor>`) that
+    // mints the token for a locally-custodied identity via `issue_for_actor`
+    // and delegates here — the mint stays inside supervisor-module code.
+    // -----------------------------------------------------------------
+
+    /// Reserve one of this identity's pooled KeyPackages for a
+    /// spawn-from-Welcome join, returning the `(ReservationId, public KP
+    /// bytes)` pair. The reservation moves a KP into the actor's `reserved`
+    /// map; the private signer-state never leaves the KeyPackage actor. The
+    /// public bytes are for routing only — the creator adds them to its MLS
+    /// group to produce the Welcome addressed to this KP, and the returned
+    /// [`ReservationId`] is then handed back in
+    /// [`WelcomeJoinRequest::reservation_id`] so the fused `ConfirmConsume`
+    /// can match the join.
+    ///
+    /// Get-or-spawns this identity's `KeyPackageStoreActor`, runs a
+    /// `Replenish` barrier so the pool is non-empty, lists the pooled KPs,
+    /// and reserves the first one. Capability-gated on `&OwnedIdentityDid`
+    /// so a caller can only reserve against an identity it owns.
+    ///
+    /// # Errors
+    ///
+    /// - Propagates any error from resolving the identity's
+    ///   `KeyPackageStoreActor` (e.g.
+    ///   [`ContextError::NotInitialized`](scp_protocol::context::ContextError::NotInitialized)
+    ///   when providers are absent, or a poisoned-KP-actor sticky error).
+    /// - [`ContextError::ActorBusy`](scp_protocol::context::ContextError::ActorBusy)
+    ///   if the KeyPackage actor's mailbox is full or its reply channel
+    ///   drops.
+    /// - [`ContextError::CreationFailed`] if the pool is still empty after a
+    ///   successful `Replenish` (no KP available to reserve).
+    #[allow(dead_code)]
+    pub(in crate::context) async fn reserve_key_package(
+        &self,
+        identity: &OwnedIdentityDid,
+    ) -> Result<(ReservationId, Vec<u8>), ContextError> {
+        use crate::context::supervisor::key_package_actor::KeyPackageCommand;
+
+        let store = self
+            .supervisor
+            .key_package_store_for(identity.as_did())
+            .await?;
+        // Deterministic replenish barrier (not a sleep): the store's startup
+        // replenish fills the pool before any command is served, and this
+        // explicit `Replenish` proves the pool is non-empty before the list.
+        store
+            .send(|reply| KeyPackageCommand::Replenish { reply })
+            .await?;
+        let pooled = store
+            .send(|reply| KeyPackageCommand::ListPooled { reply })
+            .await?;
+        let (kp_ref, _public) = pooled.into_iter().next().ok_or_else(|| {
+            ContextError::CreationFailed(
+                "reserve_key_package: the KeyPackage pool is empty after a successful \
+                 replenish — cannot reserve a KP for the join"
+                    .to_owned(),
+            )
+        })?;
+        store
+            .send(|reply| KeyPackageCommand::Reserve { kp_ref, reply })
+            .await
+    }
+
+    /// Fuse a creator's MLS Welcome into a live, send-capable context actor
+    /// for this identity (ADR-049 Phase 2J, spawn-from-Welcome). On success
+    /// the joiner is a registered participant: its installed MLS group
+    /// decrypts creator traffic AND encrypts traffic the creator decrypts,
+    /// and its initial keyed snapshot is persisted fail-closed BEFORE the
+    /// actor becomes reachable.
+    ///
+    /// Capability-reduced wrapper around
+    /// [`Supervisor::spawn_actor_from_welcome`](crate::context::supervisor::Supervisor):
+    /// the owning identity is bound through the unforgeable
+    /// `&OwnedIdentityDid` token rather than a bare `DID`, so a caller can
+    /// only spawn under an identity it owns. The `req`'s
+    /// [`WelcomeJoinRequest::reservation_id`] must name a live reservation in
+    /// THIS identity's `KeyPackageStoreActor` (obtained from
+    /// [`Self::reserve_key_package`]); a reservation minted under a different
+    /// identity fails closed at the fused `ConfirmConsume`.
+    ///
+    /// The large (~16 KB) Welcome-derived state-building future is `Box::pin`ned
+    /// at this seam — the production discipline the entrypoint's
+    /// `clippy::large_futures` allow documents.
+    ///
+    /// # Errors
+    ///
+    /// Propagates every error from the entrypoint, including:
+    /// - [`ContextError::CreationFailed`] — first-writer-wins collision
+    ///   (live actor or durable snapshot), a missing local pseudonym, or
+    ///   malformed legible params (all rejected before the KP is consumed).
+    /// - [`ContextError::InvalidState`](scp_protocol::context::ContextError::InvalidState)
+    ///   — the reservation is unknown / already consumed (single-use anchor).
+    /// - [`ContextError::PersistenceFailed`](scp_protocol::context::ContextError::PersistenceFailed)
+    ///   — the fail-closed initial-snapshot persist or crypto-durability
+    ///   gate failed (the just-installed group is rolled back, no actor
+    ///   stands up).
+    /// - [`ContextError::TransportTimeout`](scp_protocol::context::ContextError::TransportTimeout)
+    ///   — the locked join region exceeded `LIFECYCLE_TIMEOUT` (rolled back,
+    ///   global bootstrap lock released).
+    #[allow(dead_code)]
+    pub(in crate::context) async fn spawn_actor_from_welcome(
+        &self,
+        identity: &OwnedIdentityDid,
+        req: WelcomeJoinRequest,
+    ) -> Result<crate::context::ContextHandle, ContextError> {
+        Box::pin(
+            self.supervisor
+                .spawn_actor_from_welcome(identity.as_did().clone(), req),
+        )
+        .await
+    }
 
     /// Dispatch [`LifecycleControlCommand::PrepareForReplace`] to the
     /// actor currently registered for `context_id`, awaiting its verdict.
