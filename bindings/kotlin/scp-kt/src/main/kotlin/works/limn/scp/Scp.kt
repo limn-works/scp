@@ -44,6 +44,7 @@ import uniffi.scp.MessageListener
 import uniffi.scp.Proof
 import uniffi.scp.PublishResult
 import uniffi.scp.ReconnectReport
+import uniffi.scp.ReservedKeyPackage
 import uniffi.scp.SagaResult
 import uniffi.scp.SqliteKeyMaterial
 import uniffi.scp.StorageConfig
@@ -616,6 +617,59 @@ class SCP internal constructor(
         spendingUcanJwt = spendingUcanJwt,
     )
 
+    /**
+     * Joins an existing SCP context by processing a received MLS Welcome,
+     * standing the local (joiner) identity up as a send-capable participant.
+     *
+     * Completes the reserve -> Welcome -> join handshake begun by
+     * [reserveKeyPackage]: given the Welcome the context creator minted for a
+     * previously-reserved `KeyPackage`, this installs the joined MLS group,
+     * derives the joiner's routing pseudonym (spec §9.10.4), persists the
+     * initial keyed snapshot fail-closed, registers a context handle, and
+     * records the joined context in the known-contexts discovery registry.
+     * Without it a Welcome-joined node can DECRYPT but cannot SEND (no
+     * handle-backed context).
+     *
+     * Local-identity custody of the JOINER ([identity]) is enforced exactly as
+     * [contextCreate] enforces it for the creator: the joiner's routing
+     * pseudonym is DERIVED from its locally-custodied identity (never
+     * caller-supplied), so a non-custodied joiner (for example a DID-only
+     * handle from [identityLoad]) hard-fails with `SCP-IDENT-1054` at the
+     * derivation seam BEFORE the single-use `KeyPackage` is consumed.
+     *
+     * See [reserveKeyPackage] for the full reserve -> Welcome -> join example.
+     *
+     * @param identity The LOCAL (joiner) identity. Its custody derives the
+     *   routing pseudonym; passed separately from [creatorDid] so the two
+     *   cannot be transposed.
+     * @param creatorDid DID of the context creator / admin (from the legible
+     *   params).
+     * @param contextId Canonical 64-hex context id (ADR-056).
+     * @param params Legible context parameters (see [ContextParams]).
+     * @param reservationId The opaque reservation id returned by
+     *   [reserveKeyPackage] for the `KeyPackage` this Welcome addresses.
+     * @param welcomeBytes The TLS-serialized MLS Welcome message.
+     *
+     * Forwards to [NativeScp.contextJoinFromWelcome] on [inner].
+     */
+    @Suppress("LongParameterList")
+    suspend fun contextJoinFromWelcome(
+        identity: Identity,
+        creatorDid: String,
+        contextId: String,
+        params: ContextParams,
+        reservationId: String,
+        welcomeBytes: ByteArray,
+    ): ContextHandle =
+        inner.contextJoinFromWelcome(
+            identity = identity,
+            creatorDid = creatorDid,
+            contextId = contextId,
+            params = params,
+            reservationId = reservationId,
+            welcomeBytes = welcomeBytes,
+        )
+
     /** Forwards to [NativeScp.contextLeave] on [inner]. */
     suspend fun contextLeave(
         handle: ContextHandle,
@@ -715,6 +769,52 @@ class SCP internal constructor(
             contextIds = contextIds,
             lastRelayContacts = lastRelayContacts,
         )
+
+    /**
+     * Reserves a single-use MLS `KeyPackage` under [identity] — the first step
+     * of the reserve -> Welcome -> join handshake for spawning into a context
+     * from a creator-minted Welcome (ADR-049 Phase 2J).
+     *
+     * Only the PUBLIC `KeyPackage` bytes cross the FFI boundary
+     * ([ReservedKeyPackage.keyPackagePublic]); the private signer state never
+     * leaves the node. Hand `keyPackagePublic` to the context creator out of
+     * band — the creator adds it to the MLS group and returns a Welcome — then
+     * pass [ReservedKeyPackage.reservationId] back to [contextJoinFromWelcome]
+     * so the fused consume matches this reservation. The `reservationId` is a
+     * lookup key, not a capability: a bogus id simply fails the consume match.
+     *
+     * Local-identity custody is enforced (the same trust model as
+     * [contextCreate]): [identity] MUST be a locally-custodied identity that
+     * holds retained key material. A DID-only handle from [identityLoad] is
+     * rejected with `SCP-IDENT-1054`.
+     *
+     * ```kotlin
+     * // Step 1 (joiner): reserve a single-use KeyPackage under the joiner's
+     * // own locally-custodied identity.
+     * val joiner = scp.identityCreate(custody = "in_memory")
+     * val reservation = scp.reserveKeyPackage(joiner)
+     *
+     * // Hand reservation.keyPackagePublic to the creator out of band. The
+     * // creator adds it to the MLS group and returns the legible params plus
+     * // the Welcome addressed to this KeyPackage: (creatorDid, contextId,
+     * // params, welcomeBytes).
+     *
+     * // Step 2 (joiner): process the Welcome and stand up as a send-capable
+     * // participant under the joiner's own derived routing pseudonym.
+     * val ctx = scp.contextJoinFromWelcome(
+     *     identity = joiner,
+     *     creatorDid = creatorDid,
+     *     contextId = contextId,
+     *     params = params,
+     *     reservationId = reservation.reservationId,
+     *     welcomeBytes = welcomeBytes,
+     * )
+     * ```
+     *
+     * Forwards to [NativeScp.reserveKeyPackage] on [inner].
+     */
+    suspend fun reserveKeyPackage(identity: Identity): ReservedKeyPackage =
+        inner.reserveKeyPackage(identity = identity)
 
     /** Forwards to [NativeScp.contextSubscribe] on [inner]. */
     suspend fun contextSubscribe(
