@@ -10291,6 +10291,15 @@ impl Supervisor {
         .await
     }
 
+    // AXIS: bridge-external (ADR-049 §5 placement invariant). `create_context`
+    // and its join-side peers `reserve_key_package` / `spawn_actor_from_welcome`
+    // (below) are node-level bootstraps called by the trusted FFI/bridge
+    // orchestrator: each takes a bare `DID`, with local-identity custody
+    // enforced at the bridge, and returns only public / context state — never
+    // per-identity secret crypto. Per-identity SECRET access lives on the
+    // actor-internal `OwnedIdentityDid` axis instead (the
+    // `SupervisorHandle::my_*` accessors), never as a bare-`DID` method here.
+
     /// Create a new MLS-backed (or broadcast-mode) context via the
     /// actor mailbox.
     ///

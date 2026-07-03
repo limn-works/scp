@@ -59,6 +59,17 @@ pub struct SupervisorHandle {
 }
 
 impl SupervisorHandle {
+    // AXIS: actor-internal (ADR-049 §5 placement invariant). Every
+    // PER-IDENTITY method on this handle takes `&OwnedIdentityDid`, never a
+    // bare `&DID` — an actor reaches only the identity that owns it, even for
+    // PUBLIC reads (`my_wrapping_public_key` returns public data yet is
+    // token-gated, because the discriminator is caller-isolation, not
+    // data-sensitivity). A per-identity op callable by the FFI/bridge
+    // orchestrator does NOT belong here: add a bare-`DID` `pub fn` on
+    // `Supervisor` instead (see `Supervisor::create_context`). The
+    // non-per-identity methods below (registry fan-out, saga dispatch,
+    // lifecycle bootstrap) are unaffected by this rule.
+
     /// Wrap an `Arc<Supervisor>`. Visible only to supervisor-module
     /// code; the supervisor constructs one in
     /// [`Supervisor::build_actor_deps`](crate::context::supervisor::Supervisor)
