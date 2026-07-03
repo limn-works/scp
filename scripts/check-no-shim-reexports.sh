@@ -70,6 +70,18 @@ for mod in "${crates[@]}"; do
     while IFS= read -r line; do
         [ -z "$line" ] && continue
         file="${line%%:*}"
+        # Strip the `file:lineno:` prefix to isolate the matched source text,
+        # then skip commented lines: a doc/line comment that merely quotes a
+        # `pub use scp_x::…` spelling — e.g. narrating the deleted shim — is not
+        # a real re-export. Covers `//`, `///`, and `//!` after optional leading
+        # whitespace. One bounded comment filter — not an expanding denylist of
+        # laundering spellings.
+        content="${line#*:}"
+        content="${content#*:}"
+        trimmed="${content#"${content%%[![:space:]]*}"}"
+        case "$trimmed" in
+            //*) continue ;;
+        esac
         # Allowed only in the owning crate and the scp-core facade.
         case "$file" in
             "$own"*|"$facade"*) continue ;;
