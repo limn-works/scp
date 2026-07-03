@@ -108,9 +108,9 @@ impl std::borrow::Borrow<str> for DID {
 /// Extracts the Ed25519 public key bytes from a DID string.
 ///
 /// Supports `did:dht:z<z-base-32>` format (production). The `did:key:<hex>`
-/// test convenience format is only accepted when compiled with `#[cfg(test)]`
-/// or the `testing` feature to prevent non-standard DID acceptance in release
-/// builds. See: <https://github.com/limn-works/scp/issues/128>
+/// form is a non-standard test convenience; production accepts only `did:dht`,
+/// so it is accepted only when compiled with `#[cfg(test)]` or the `testing`
+/// feature to prevent non-standard DID acceptance in release builds.
 ///
 /// # Errors
 ///
@@ -148,9 +148,9 @@ pub fn extract_public_key_from_did(did: &str) -> Result<[u8; 32], String> {
         return Ok(bytes);
     }
 
-    // did:key:{hex} is a non-standard test convenience. Gated behind the
-    // `testing` feature (or #[cfg(test)]) to prevent acceptance in release
-    // builds. See: https://github.com/limn-works/scp/issues/128
+    // did:key:{hex} is a non-standard test convenience; production accepts only
+    // did:dht. Gated behind the `testing` feature (or #[cfg(test)]) to prevent
+    // acceptance in release builds.
     #[cfg(any(test, feature = "testing"))]
     if let Some(hex_str) = did.strip_prefix("did:key:") {
         let decoded = hex::decode(hex_str).map_err(|e| format!("hex decode error: {e}"))?;

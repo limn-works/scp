@@ -44,17 +44,46 @@ pub struct BridgeDidResolver;
 
 impl DidResolver for BridgeDidResolver {
     fn resolve_public_key(&self, did: &str) -> Result<[u8; 32], CoreUcanError> {
-        // Delegate to the single hardened `scp-did` parser rather than a
-        // hand-rolled decode. This gives this UCAN-validation path the same
-        // did:dht:z z-base-32 **canonicality** guard as every other native
-        // did:dht decoder: the parser re-encodes the decoded 32-byte key and
-        // rejects any input that does not round-trip to the canonical
-        // encoding, so a non-canonical spelling of a valid key can never
-        // resolve here (closing the trailing-bit-padding non-injectivity that
-        // would otherwise let two DID strings resolve to the same key). The
-        // did:key:{hex} test-convenience branch also comes from that one parser
-        // (gated by `scp-did/testing`, forwarded from this crate's `testing`
-        // feature), so there is exactly one parser and no drift.
+        // Narrow, fail-closed did:key gate — asserted LOCALLY, not borrowed
+        // from scp-did's feature state.
+        //
+        // Everything below delegates to the single hardened `scp-did` parser
+        // (`extract_public_key_from_did`) rather than a hand-rolled decode, so
+        // this UCAN-validation path gets the same did:dht:z z-base-32
+        // **canonicality** guard as every other native did:dht decoder: the
+        // parser re-encodes the decoded 32-byte key and rejects any input that
+        // does not round-trip to the canonical encoding, closing the
+        // trailing-bit-padding non-injectivity that would otherwise let two DID
+        // strings resolve to the same key.
+        //
+        // That parser also accepts the non-standard `did:key:{hex}`
+        // test-convenience form — but ONLY when `scp-did/testing` is enabled.
+        // Crucially, `scp-did/testing` is turned on TRANSITIVELY by *custody*
+        // opt-ins (dep:scp-testing → scp-core/testing → scp-protocol/testing →
+        // scp-did/testing). Custody opt-ins (e.g. `allow_in_memory_custody`,
+        // which controls where private key material may live) are an
+        // ORTHOGONAL concern from "this bridge is compiled for UCAN testing".
+        // If we relied solely on scp-did's gate, an in-memory-custody *source*
+        // build would silently begin accepting did:key UCAN issuers — a
+        // DID-format acceptance surface that has nothing to do with custody.
+        // did:key must never ride in on a custody flag. So we re-assert the
+        // gate against THIS crate's own `testing` feature: when
+        // scp-ffi-common's `testing` is off — which is every shipped artifact,
+        // since releases build with default features (`testing` is a dev-only
+        // opt-in and is never a shipped feature) — reject `did:key:` up front
+        // with the same `MalformedToken`/unsupported-format error class the
+        // parser emits for any other unsupported method, regardless of
+        // scp-did's feature state. This is a pure string-prefix check; it
+        // introduces no zbase32 (or any other) decode in production. did:dht
+        // and all other inputs still flow through the one shared parser, so
+        // there is exactly one canonicality authority and no drift.
+        #[cfg(not(any(test, feature = "testing")))]
+        if did.starts_with("did:key:") {
+            return Err(CoreUcanError::MalformedToken(format!(
+                "unsupported DID format: {did}"
+            )));
+        }
+
         scp_did::extract_public_key_from_did(did).map_err(CoreUcanError::MalformedToken)
     }
 }
@@ -620,7 +649,11 @@ impl scp_identity::resolver::DidResolver for IdentityBackedDidResolver {
 pub enum DispatchDidResolver<'a> {
     /// Production resolver with full DID document validation.
     Identity(&'a IdentityBackedDidResolver),
-    /// Fallback resolver: z-base-32 decode only, no document validation.
+    /// Fallback resolver: delegates DID→key extraction to the canonicality-
+    /// enforcing `scp-did` parser (`extract_public_key_from_did`), so it rejects
+    /// non-canonical did:dht spellings exactly as the native decoders do. Still
+    /// performs no DID *document* validation (no BEP44 signature check, no
+    /// self-certification, no sequence-number comparison).
     Bridge(BridgeDidResolver),
 }
 

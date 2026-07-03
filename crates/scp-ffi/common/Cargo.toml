@@ -46,7 +46,6 @@ zeroize = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
-z-base-32 = { workspace = true }
 ed25519-dalek = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
 # `rand_core` with `getrandom` is used by the always-on
@@ -72,6 +71,11 @@ tokio = { workspace = true, features = ["test-util", "macros", "rt"] }
 # key seal/open round-trip tests (src/broadcast.rs). Production code never needs
 # X25519 here — the protocol layer owns the HPKE seal/open.
 x25519-dalek = { workspace = true }
+# Test-only: z-base-32 encode/decode for the resolver unit tests (building
+# did:dht:z fixtures + the non-canonical-padding regression). Production
+# DID→key extraction is delegated to `scp_did::extract_public_key_from_did`,
+# so no production code path in this crate touches z-base-32 directly.
+z-base-32 = { workspace = true }
 
 [lints]
 workspace = true
