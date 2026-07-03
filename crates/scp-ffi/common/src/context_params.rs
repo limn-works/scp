@@ -169,6 +169,7 @@ pub fn build_context_params(params: &CommonContextParams) -> Result<ContextParam
         session_cap: params.session_cap,
         counterparty_policy: CounterpartyPolicy::default(),
         participation_requirements: Vec::new(),
+        capability_requirements: Vec::new(),
         incomplete_verification_policy: IncompleteVerificationPolicy::default(),
         min_protocol_version: params.min_protocol_version,
         migration_source: None,
