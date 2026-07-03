@@ -323,6 +323,20 @@ pub enum ToolError {
         /// Maximum allowed by inbound policy.
         max: u32,
     },
+
+    /// Canonical serialization (RFC 8785 JCS) of a value failed while computing
+    /// a convergent hash (e.g., a tool-invocation input/output hash).
+    ///
+    /// A convergent identity/hash must never be silently computed over
+    /// defaulted-empty bytes: the error is surfaced instead of substituting an
+    /// empty preimage. Unreachable for well-formed `serde_json::Value` inputs
+    /// (which always canonicalize), but propagated as defense-in-depth for any
+    /// serializable value whose `Serialize` impl can fail.
+    #[error("canonicalization failed: {reason}")]
+    CanonicalizationFailed {
+        /// Human-readable description of the serialization failure.
+        reason: String,
+    },
 }
 
 // ---------------------------------------------------------------------------

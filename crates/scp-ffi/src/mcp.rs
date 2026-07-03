@@ -925,7 +925,9 @@ impl ContextProvider for FfiBridgeProvider {
 
             // Clone handler Arc and output schema so we can release the lock.
             // Compute input hash before dispatch (arguments may be consumed).
-            let input_hash = scp_core::context::tools::sha256_json(&arguments);
+            let input_hash = scp_core::context::tools::sha256_json(&arguments).map_err(|e| {
+                ScpPyError::context(format!("input hash canonicalization failed: {e}"))
+            })?;
 
             Ok((
                 rt.tool_handlers
@@ -1009,6 +1011,9 @@ impl ContextProvider for FfiBridgeProvider {
             }
         };
 
+        let output_hash = scp_core::context::tools::sha256_json(&output)
+            .map_err(|e| refund(format!("output hash canonicalization failed: {e}")))?;
+
         let tool_event = scp_core::context::tools::ToolInvokedEvent {
             request_id: uuid::Uuid::new_v4().to_string(),
             tool_id: tool_name.to_owned(),
@@ -1016,7 +1021,7 @@ impl ContextProvider for FfiBridgeProvider {
             status: scp_core::context::tools::ToolStatus::Success,
             execution_time_ms: elapsed_ms,
             input_hash,
-            output_hash: Some(scp_core::context::tools::sha256_json(&output)),
+            output_hash: Some(output_hash),
             cost: None,
         };
 

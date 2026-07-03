@@ -4596,7 +4596,8 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
             )
             .map_err(|msg| format!("input validation failed for tool '{tool_name}': {msg}"))?;
 
-            let input_hash = scp_core::context::tools::sha256_json(&arguments);
+            let input_hash = scp_core::context::tools::sha256_json(&arguments)
+                .map_err(|e| format!("input hash canonicalization failed: {e}"))?;
 
             let handler_dispatch = {
                 let tool_handlers = handle.tool_handlers.blocking_lock();
@@ -4670,7 +4671,10 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
             status: scp_core::context::tools::ToolStatus::Success,
             execution_time_ms: elapsed_ms,
             input_hash,
-            output_hash: Some(scp_core::context::tools::sha256_json(&output)),
+            output_hash: Some(
+                scp_core::context::tools::sha256_json(&output)
+                    .map_err(|e| format!("output hash canonicalization failed: {e}"))?,
+            ),
             cost: None,
         };
 

@@ -863,7 +863,7 @@ impl scp_core::crypto::ucan::revoke::RevocationEventLogger for BridgeRevocationE
             context_id,
             token_cid,
             revoker_did,
-        );
+        )?;
 
         // Unix timestamp seconds fit in u64 for centuries.
         #[allow(clippy::cast_possible_truncation)]

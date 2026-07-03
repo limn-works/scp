@@ -821,6 +821,112 @@ impl GovernanceAction {
         }
     }
 
+    /// Returns `true` if this action is unambiguously **adverse** toward its
+    /// target — i.e., a punitive/capability-reducing action that should be
+    /// counted in `governance_actions_against` for the H18 standing-deflation
+    /// defense (`trust::participation`).
+    ///
+    /// This is the **single, compile-enforced source of truth** for
+    /// adverseness. The `match` has **no wildcard arm on purpose**: adding a
+    /// new [`GovernanceAction`] variant fails to compile until it is explicitly
+    /// classified here, so a new punitive variant can never silently fall
+    /// through as "not adverse" (the exact drift #2000 guards against).
+    ///
+    /// Only actions whose adverseness is determinable **from the action type
+    /// alone** return `true`. Actions whose adverseness depends on a role delta
+    /// — `ChangeRole` (a demotion is adverse, a promotion is not) and
+    /// `RemoveSigner` — return `false`, so `governance_actions_against` stays a
+    /// conservative LOWER BOUND that undercounts rather than over-counts (never
+    /// mis-scoring a promotion or beneficial action as adverse). Beneficial
+    /// actions (`RestoreAccess`, `AddMember`, …) are likewise `false`.
+    #[must_use]
+    pub const fn is_adverse(&self) -> bool {
+        match self {
+            // Punitive / capability-reducing — adverse toward the target.
+            Self::RemoveMember { .. }
+            | Self::SuspendCapability { .. }
+            | Self::SuspendAccess { .. }
+            | Self::RevokeAccess { .. }
+            | Self::ResetMember { .. } => true,
+
+            // Not adverse from the action type alone (beneficial, neutral, or
+            // role-delta-dependent → conservatively excluded).
+            Self::AddMember { .. }
+            | Self::ChangeRole { .. }
+            | Self::RegisterTool { .. }
+            | Self::RemoveTool { .. }
+            | Self::ModifyCeiling { .. }
+            | Self::CloseContext { .. }
+            | Self::ExtendTtl { .. }
+            | Self::TransferAdmin { .. }
+            | Self::CreateChildContext { .. }
+            | Self::RestoreAccess { .. }
+            | Self::ModifyPruningPolicy { .. }
+            | Self::AddSigner { .. }
+            | Self::RemoveSigner { .. }
+            | Self::ModifyThreshold { .. }
+            | Self::EstablishToolInterface { .. }
+            | Self::ResolveConflict { .. }
+            | Self::PromoteContext
+            | Self::RotateContentKeys { .. }
+            | Self::ReconfigureGovernance { .. }
+            | Self::SetEconomicPolicy { .. }
+            | Self::ApproveSpend { .. }
+            | Self::LockEconomicPolicy
+            | Self::ProposeContextMigration { .. }
+            | Self::CancelContextMigration
+            | Self::ModifyHardRateLimit { .. } => false,
+        }
+    }
+
+    /// Classifies a governance action by its [`Self::variant_name`] string,
+    /// routing through the exhaustive [`Self::is_adverse`] classification.
+    ///
+    /// The participation read path (`trust::participation`) only has the
+    /// `action_type` **string** from the decoded event payload, not the typed
+    /// action. This maps that string back through the typed classifier: it
+    /// builds a representative instance for the name and calls
+    /// [`Self::is_adverse`], so [`Self::is_adverse`] remains the sole authority
+    /// for the decision. A name matching no known adverse variant resolves to
+    /// `false` (non-adverse), the documented lower-bound direction.
+    #[must_use]
+    pub fn is_adverse_variant_name(action_type: &str) -> bool {
+        Self::adverse_representative(action_type).is_some_and(|a| a.is_adverse())
+    }
+
+    /// Builds a representative (dummy-data) instance for an action-type name so
+    /// [`Self::is_adverse_variant_name`] can route a string through the typed
+    /// [`Self::is_adverse`] classifier. Only the adverse variants need an arm:
+    /// every other name resolves to `None` → non-adverse, which is what
+    /// [`Self::is_adverse`] returns for them anyway. When you add a new
+    /// **adverse** variant, [`Self::is_adverse`] (no wildcard) forces you to
+    /// return `true` there; add its arm here too so the string-keyed event path
+    /// counts it. The `is_adverse_variant_name_matches_is_adverse` test
+    /// constructs every variant and fails until the two agree.
+    fn adverse_representative(action_type: &str) -> Option<Self> {
+        let did = || DID::from("did:scp:adverse-representative");
+        Some(match action_type {
+            "RemoveMember" => Self::RemoveMember {
+                did: did(),
+                reason: None,
+            },
+            "SuspendCapability" => Self::SuspendCapability {
+                did: did(),
+                capabilities: Vec::new(),
+            },
+            "SuspendAccess" => Self::SuspendAccess { did: did() },
+            "RevokeAccess" => Self::RevokeAccess {
+                did: did(),
+                access: AccessScope::Both,
+            },
+            "ResetMember" => Self::ResetMember {
+                did: did(),
+                reason: String::new(),
+            },
+            _ => return None,
+        })
+    }
+
     /// Returns the target DID for actions that operate on a specific member.
     ///
     /// This is used to populate structured event payloads so that consequence
