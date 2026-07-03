@@ -185,7 +185,12 @@ const NAPI_TRUST_SRC: &str = include_str!("../../../../crates/scp-ffi/napi/src/t
 // routing assertions: `Supervisor::participation_record` → core
 // `compute_participation_record`, plus PyO3/NAPI/UniFFI bridge ops → the shared
 // `Supervisor::participation_record` (Phase 2C-1).
-const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 48;
+// Raised 48 -> 51 when the capability-admission op `check_capability_requirements`
+// (§7.3.4.4, SCP-ACR-008) was wired through all three native bridges: one
+// per-bridge assertion pins each export body to the core
+// `scp_core::trust::check_capability_requirements` call and the production
+// `IdentityDidPublicKeyResolver`.
+const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 51;
 
 // ---------------------------------------------------------------------------
 // Function body extraction — brace-matching parser
@@ -2371,6 +2376,75 @@ fn uniffi_participation_record_routes_to_supervisor() {
             ),
         "UniFFI participation_record must call Supervisor::participation_record, \
          not re-aggregate participation facts in the bridge"
+    );
+}
+
+// ===========================================================================
+// Capability-admission op `check_capability_requirements` (§7.3.4.4, SCP-ACR-008)
+// ===========================================================================
+//
+// Each native bridge's capability-admission export MUST delegate to the shared
+// core `scp_protocol::trust::check_capability_requirements` (re-exported as
+// `scp_core::trust::check_capability_requirements`) rather than re-implementing
+// the admission decision locally, AND MUST wire the production
+// `IdentityDidPublicKeyResolver` so each `ChallengeVerification` is
+// signature/subject/context/expiry verified. Pinning the fully-qualified
+// `scp_core::trust::check_capability_requirements(` call (not the bare leaf,
+// which the bridge fn shares its name with) plus the resolver makes a
+// self-satisfying substring impossible.
+
+/// The PyO3 `check_capability_requirements` bridge op must route to core.
+#[test]
+fn pyo3_check_capability_requirements_routes_to_core() {
+    assert!(
+        fn_body_contains(
+            PYO3_TRUST_SRC,
+            "py_check_capability_requirements",
+            "scp_core::trust::check_capability_requirements("
+        ) && fn_body_contains(
+            PYO3_TRUST_SRC,
+            "py_check_capability_requirements",
+            "IdentityDidPublicKeyResolver"
+        ),
+        "PyO3 py_check_capability_requirements must call core \
+         check_capability_requirements with the production DID resolver"
+    );
+}
+
+/// The NAPI `check_capability_requirements` bridge op (body in
+/// `check_capability_requirements_on`) must route to core.
+#[test]
+fn napi_check_capability_requirements_routes_to_core() {
+    assert!(
+        fn_body_contains(
+            NAPI_TRUST_SRC,
+            "check_capability_requirements_on",
+            "scp_core::trust::check_capability_requirements("
+        ) && fn_body_contains(
+            NAPI_TRUST_SRC,
+            "check_capability_requirements_on",
+            "IdentityDidPublicKeyResolver"
+        ),
+        "NAPI check_capability_requirements_on must call core \
+         check_capability_requirements with the production DID resolver"
+    );
+}
+
+/// The UniFFI `check_capability_requirements` bridge op must route to core.
+#[test]
+fn uniffi_check_capability_requirements_routes_to_core() {
+    assert!(
+        fn_body_contains(
+            UNIFFI_BRIDGE_SRC,
+            "check_capability_requirements",
+            "scp_core::trust::check_capability_requirements("
+        ) && fn_body_contains(
+            UNIFFI_BRIDGE_SRC,
+            "check_capability_requirements",
+            "IdentityDidPublicKeyResolver"
+        ),
+        "UniFFI check_capability_requirements must call core \
+         check_capability_requirements with the production DID resolver"
     );
 }
 

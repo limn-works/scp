@@ -312,6 +312,116 @@ pub fn py_verify_participation_requirements(
 }
 
 // ---------------------------------------------------------------------------
+// check_capability_requirements (§7.3.4.4, SCP-ACR-008)
+// ---------------------------------------------------------------------------
+
+/// Verifies that an agent meets a context's capability requirements for
+/// admission, bound to the agent and context being admitted.
+///
+/// Inputs (all JSON except the two DID/context ids):
+/// - `context_id`: the context the agent is being admitted to. A challenge
+///   verification only satisfies a requirement when its signed `context_id`
+///   equals this value.
+/// - `subject_did`: the DID of the agent being admitted. Only challenge
+///   verifications whose signed `subject_did` equals this value can satisfy a
+///   requirement — a genuine result minted for another subject MUST NOT admit
+///   this agent (cross-subject attribution).
+/// - `requirements_json`: JSON array of `CapabilityRequirement` objects.
+/// - `agent_capabilities_json`: JSON array of capability-URI strings the agent
+///   self-attests.
+/// - `challenge_verifications_json`: JSON array of `ChallengeVerification`
+///   records; each is signature-verified against `resolver`/`clock` and only
+///   counts if authentic, in-context, in-subject, passed, and unexpired.
+///
+/// Uses the production `IdentityDidPublicKeyResolver` for verifier-DID key
+/// resolution and the fail-closed system clock for expiry. Returns `Ok(())` on
+/// success — success is indicated by returning without exception. Raises
+/// `ScpError` with a diagnostic message if any requirement is unmet or if the
+/// JSON is malformed.
+///
+/// SECURITY (verifier legitimacy): a passing `ChallengeVerified` check proves
+/// the verifier's signature is authentic and bound to this subject/context, NOT
+/// that the verifier is authorized/trusted. A `verifier_did` is self-certifying;
+/// establish verifier legitimacy separately (see spec §7.3.4.4 / §7.4).
+///
+/// See spec §7.3.4.4.
+///
+/// # Errors
+///
+/// Returns `PyValueError` if any JSON input is malformed or `subject_did` is
+/// not a valid DID, or `PyRuntimeError` if an admission requirement is unmet
+/// (with the specific reason from `AdmissionError`).
+#[pyfunction]
+#[pyo3(name = "check_capability_requirements")]
+pub fn py_check_capability_requirements(
+    context_id: &str,
+    subject_did: &str,
+    requirements_json: &str,
+    agent_capabilities_json: &str,
+    challenge_verifications_json: &str,
+) -> PyResult<()> {
+    validate::validate_did(subject_did)?;
+
+    let requirements: Vec<scp_core::trust::CapabilityRequirement> =
+        serde_json::from_str(requirements_json).map_err(|e| {
+            crate::error::ScpPyError::ValidationError {
+                message: format!("failed to parse capability requirements JSON: {e}"),
+                code: scp_ffi_common::error_codes::VALID_7073.to_owned(),
+            }
+        })?;
+
+    let agent_capabilities: Vec<scp_core::trust::CapabilityUri> =
+        serde_json::from_str(agent_capabilities_json).map_err(|e| {
+            crate::error::ScpPyError::ValidationError {
+                message: format!("failed to parse agent capabilities JSON: {e}"),
+                code: scp_ffi_common::error_codes::VALID_7074.to_owned(),
+            }
+        })?;
+
+    let challenge_verifications: Vec<scp_core::trust::ChallengeVerification> =
+        serde_json::from_str(challenge_verifications_json).map_err(|e| {
+            crate::error::ScpPyError::ValidationError {
+                message: format!("failed to parse challenge verifications JSON: {e}"),
+                code: scp_ffi_common::error_codes::VALID_7075.to_owned(),
+            }
+        })?;
+
+    let resolver = scp_core::trust::IdentityDidPublicKeyResolver;
+    let clock = scp_clock::SystemClock;
+
+    scp_core::trust::check_capability_requirements(
+        &requirements,
+        &agent_capabilities,
+        &challenge_verifications,
+        context_id,
+        subject_did,
+        &resolver,
+        &clock,
+    )
+    .map_err(|e| {
+        // Mirror the UniFFI/NAPI bridges' per-variant code mapping so every
+        // native bridge surfaces identical per-variant 707x codes for the same
+        // failure case: empty subject → 7077; missing capability /
+        // verification-required → 7076.
+        let code = match e {
+            scp_core::trust::AdmissionError::EmptySubjectDid => {
+                scp_ffi_common::error_codes::VALID_7077
+            }
+            scp_core::trust::AdmissionError::MissingCapability { .. }
+            | scp_core::trust::AdmissionError::VerificationRequired { .. } => {
+                scp_ffi_common::error_codes::VALID_7076
+            }
+        };
+        crate::error::ScpPyError::ValidationError {
+            message: format!("capability admission verification failed: {e}"),
+            code: code.to_owned(),
+        }
+    })?;
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // aggregate_trust_input (§7.3)
 // ---------------------------------------------------------------------------
 
@@ -857,6 +967,7 @@ pub fn register_trust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_trust_create_challenge, m)?)?;
     m.add_function(wrap_pyfunction!(py_trust_verify_response, m)?)?;
     m.add_function(wrap_pyfunction!(py_verify_participation_requirements, m)?)?;
+    m.add_function(wrap_pyfunction!(py_check_capability_requirements, m)?)?;
     Ok(())
 }
 
@@ -969,6 +1080,184 @@ mod tests {
     fn verify_participation_requirements_rejects_invalid_subject() {
         // A malformed subject DID is rejected at the FFI boundary.
         let result = py_verify_participation_requirements("not-a-did", "[]", "[]");
+        assert!(result.is_err());
+    }
+
+    // -- check_capability_requirements (§7.3.4.4, SCP-ACR-008) --
+
+    #[test]
+    fn check_capability_requirements_rejects_invalid_requirements_json() {
+        Python::with_gil(|_py| {
+            let result =
+                py_check_capability_requirements("ctx-1", "did:key:alice", "not json", "[]", "[]");
+            assert!(result.is_err());
+            let err_str = format!("{}", result.unwrap_err());
+            assert!(
+                err_str.contains(scp_ffi_common::error_codes::VALID_7073),
+                "error should contain SCP-VALID-7073, got: {err_str}"
+            );
+        });
+    }
+
+    #[test]
+    fn check_capability_requirements_rejects_invalid_capabilities_json() {
+        Python::with_gil(|_py| {
+            let result =
+                py_check_capability_requirements("ctx-1", "did:key:alice", "[]", "not json", "[]");
+            assert!(result.is_err());
+            let err_str = format!("{}", result.unwrap_err());
+            assert!(
+                err_str.contains(scp_ffi_common::error_codes::VALID_7074),
+                "error should contain SCP-VALID-7074, got: {err_str}"
+            );
+        });
+    }
+
+    #[test]
+    fn check_capability_requirements_rejects_invalid_verifications_json() {
+        Python::with_gil(|_py| {
+            let result =
+                py_check_capability_requirements("ctx-1", "did:key:alice", "[]", "[]", "not json");
+            assert!(result.is_err());
+            let err_str = format!("{}", result.unwrap_err());
+            assert!(
+                err_str.contains(scp_ffi_common::error_codes::VALID_7075),
+                "error should contain SCP-VALID-7075, got: {err_str}"
+            );
+        });
+    }
+
+    #[test]
+    fn check_capability_requirements_empty_inputs_succeeds() {
+        // No requirements = no constraints = always passes.
+        let result = py_check_capability_requirements("ctx-1", "did:key:alice", "[]", "[]", "[]");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn check_capability_requirements_rejects_malformed_subject() {
+        let result = py_check_capability_requirements("ctx-1", "not-a-did", "[]", "[]", "[]");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn check_capability_requirements_rejects_empty_subject() {
+        // An empty subject is rejected at the FFI boundary (validate_did).
+        let result = py_check_capability_requirements("ctx-1", "", "[]", "[]", "[]");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn check_capability_requirements_self_attested_present_succeeds() {
+        // A SelfAttested requirement is satisfied by a declared capability — no
+        // challenge verification (and thus no signature check) is needed.
+        let requirements = r#"[{"capability":"scp:capability:schema-validation/v1","verification_level":"SelfAttested"}]"#;
+        let capabilities = r#"["scp:capability:schema-validation/v1"]"#;
+        let result = py_check_capability_requirements(
+            "ctx-1",
+            "did:key:alice",
+            requirements,
+            capabilities,
+            "[]",
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn check_capability_requirements_self_attested_missing_fails() {
+        // A SelfAttested requirement with no matching declared capability and no
+        // verification record fails as an admission (runtime) error.
+        let requirements = r#"[{"capability":"scp:capability:schema-validation/v1","verification_level":"SelfAttested"}]"#;
+        Python::with_gil(|_py| {
+            let result = py_check_capability_requirements(
+                "ctx-1",
+                "did:key:alice",
+                requirements,
+                "[]",
+                "[]",
+            );
+            assert!(result.is_err());
+            let err_str = format!("{}", result.unwrap_err());
+            assert!(
+                err_str.contains(scp_ffi_common::error_codes::VALID_7076),
+                "error should contain SCP-VALID-7076, got: {err_str}"
+            );
+        });
+    }
+
+    /// Builds a genuinely verifier-signed `ChallengeVerification` JSON array
+    /// (single record) bound to `subject_did`/`context_id`, with a far-future
+    /// expiry so it survives the production `SystemClock`. The verifier DID is
+    /// derived from a fixed key so the production `IdentityDidPublicKeyResolver`
+    /// (did:dht:z, offline-resolvable) authenticates the signature.
+    fn signed_cv_json(uri: &str, subject_did: &str, context_id: &str) -> String {
+        use ed25519_dalek::{Signer, SigningKey};
+
+        let verifier_key = SigningKey::from_bytes(&[9u8; 32]);
+        let verifier_pub = verifier_key.verifying_key().to_bytes();
+        let verifier_did = scp_did::did_dht_from_public_key(&verifier_pub);
+        let cap: scp_core::trust::CapabilityUri = uri.parse().unwrap();
+
+        let mut cv = scp_core::trust::ChallengeVerification {
+            verification_id: "bridge-test-challenge".to_owned(),
+            verifier_did,
+            subject_did: subject_did.into(),
+            capability_uri: uri.to_owned(),
+            challenge_type: scp_core::trust::ChallengeType::Uri(cap.clone()),
+            verification_method: scp_core::trust::VerificationMethod::ChallengeVerified {
+                challenge_type: scp_core::trust::ChallengeType::Uri(cap),
+            },
+            passed: true,
+            score: None,
+            test_count: 1,
+            pass_count: 1,
+            result: serde_json::Value::Bool(true),
+            completed_at: 1_700_000_000,
+            verified_at: 1_700_000_000,
+            expires_at: 4_000_000_000,
+            context_id: Some(context_id.to_owned()),
+            verifier_signature: Vec::new(),
+        };
+        let canonical = scp_core::trust::canonical_challenge_verification_bytes(&cv).unwrap();
+        cv.verifier_signature = verifier_key.sign(&canonical).to_bytes().to_vec();
+        serde_json::to_string(&vec![cv]).unwrap()
+    }
+
+    #[test]
+    fn check_capability_requirements_challenge_verified_happy_path() {
+        let uri = "scp:capability:prompt-injection-resistance/v1";
+        let subject = "did:dht:zResponder";
+        let ctx = "ctx-admission";
+        let requirements =
+            format!(r#"[{{"capability":"{uri}","verification_level":"ChallengeVerified"}}]"#);
+        let cvs = signed_cv_json(uri, subject, ctx);
+        let result = py_check_capability_requirements(ctx, subject, &requirements, "[]", &cvs);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn check_capability_requirements_rejects_cross_subject_replay() {
+        // The verification is genuinely signed, but for a DIFFERENT subject.
+        let uri = "scp:capability:prompt-injection-resistance/v1";
+        let ctx = "ctx-admission";
+        let requirements =
+            format!(r#"[{{"capability":"{uri}","verification_level":"ChallengeVerified"}}]"#);
+        let cvs = signed_cv_json(uri, "did:dht:zVictim", ctx);
+        let result =
+            py_check_capability_requirements(ctx, "did:dht:zAttacker", &requirements, "[]", &cvs);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn check_capability_requirements_rejects_cross_context_replay() {
+        // The verification is genuinely signed, but bound to a DIFFERENT context.
+        let uri = "scp:capability:prompt-injection-resistance/v1";
+        let subject = "did:dht:zResponder";
+        let requirements =
+            format!(r#"[{{"capability":"{uri}","verification_level":"ChallengeVerified"}}]"#);
+        let cvs = signed_cv_json(uri, subject, "ctx-other");
+        let result =
+            py_check_capability_requirements("ctx-admission", subject, &requirements, "[]", &cvs);
         assert!(result.is_err());
     }
 

@@ -16,6 +16,9 @@ pub mod renewal;
 pub mod sybil;
 
 // Re-exports for backward compatibility.
+pub use admission::{
+    AdmissionError, CapabilityRequirement, VerificationLevel, check_capability_requirements,
+};
 pub use attestation::{
     Attestation, AttestationEvidence, DidPublicKeyResolver, IdentityDidPublicKeyResolver,
     RevocationStatus, canonical_attestation_bytes, verify_attestation,

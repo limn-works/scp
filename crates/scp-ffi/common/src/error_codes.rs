@@ -831,6 +831,17 @@ pub const VALID_7070: &str = "SCP-VALID-7070";
 pub const VALID_7071: &str = "SCP-VALID-7071";
 /// Webhook operation validation error.
 pub const VALID_7072: &str = "SCP-VALID-7072";
+/// `check_capability_requirements`: malformed capability-requirements JSON.
+pub const VALID_7073: &str = "SCP-VALID-7073";
+/// `check_capability_requirements`: malformed agent-capabilities JSON.
+pub const VALID_7074: &str = "SCP-VALID-7074";
+/// `check_capability_requirements`: malformed challenge-verifications JSON.
+pub const VALID_7075: &str = "SCP-VALID-7075";
+/// `check_capability_requirements`: admission requirement unmet (missing
+/// capability or challenge verification required).
+pub const VALID_7076: &str = "SCP-VALID-7076";
+/// `check_capability_requirements`: empty subject DID.
+pub const VALID_7077: &str = "SCP-VALID-7077";
 /// Attestation validation error.
 pub const VALID_7080: &str = "SCP-VALID-7080";
 /// Discovery announce validation error.

@@ -686,6 +686,15 @@ export interface Bridge {
     profileJson: string,
   ): void;
 
+  // Trust — capability admission verification (§7.3.4.4, SCP-ACR-008)
+  checkCapabilityRequirements(
+    contextId: string,
+    subjectDid: string,
+    requirementsJson: string,
+    agentCapabilitiesJson: string,
+    challengeVerificationsJson: string,
+  ): void;
+
   // Lifecycle
   version(): string;
   /**

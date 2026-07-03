@@ -853,6 +853,13 @@ def trust_verify_response(*args: Any, **kwargs: Any) -> Any: ...
 def verify_participation_requirements(
     expected_subject: str, requirements_json: str, profile_json: str
 ) -> None: ...
+def check_capability_requirements(
+    context_id: str,
+    subject_did: str,
+    requirements_json: str,
+    agent_capabilities_json: str,
+    challenge_verifications_json: str,
+) -> None: ...
 
 # -- sync (pure) --
 

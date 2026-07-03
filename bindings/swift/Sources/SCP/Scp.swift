@@ -1146,4 +1146,17 @@ public extension SCP {
     // `minContexts`). Establish signer legitimacy separately (trusted-signer
     // set, context-membership proof, or the §7.3.5 threshold/independence
     // path); do not treat success as an authorization decision.
+
+    // `checkCapabilityRequirements` is likewise a UniFFI-generated free
+    // top-level function (§7.3.4.4, SCP-ACR-008). Call it directly
+    // (`subjectDid`/`contextId` bind challenge verifications to the agent and
+    // context being admitted — a genuine result minted for another
+    // subject/context cannot admit this agent):
+    //   `try checkCapabilityRequirements(contextId:subjectDid:requirementsJson:agentCapabilitiesJson:challengeVerificationsJson:)`
+    //
+    // Security caveat — authenticity is not authorization: a passing
+    // `ChallengeVerified` check proves the verifier's signature is authentic
+    // and bound to this subject/context, not that the verifier is *trusted*
+    // (`verifierDid` is self-certifying). Establish verifier legitimacy
+    // separately; do not treat success as an authorization decision.
 }

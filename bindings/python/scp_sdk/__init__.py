@@ -165,6 +165,7 @@ from scp_sdk.trust import (
     ParticipationThreshold,
     RequireParticipation,
     TrustEvaluation,
+    check_capability_requirements,
     evaluate_trust,
     verify_participation_requirements,
 )
@@ -269,6 +270,7 @@ __all__ = [
     "auto_accept_blocked",
     "bridge_provenance_tier",
     "bridge_register",
+    "check_capability_requirements",
     "check_media_capability",
     "check_policy_lock",
     "classify_offline",

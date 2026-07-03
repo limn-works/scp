@@ -1992,6 +1992,44 @@ class SCP internal constructor(
         )
     }
 
+    /**
+     * Routes through the UniFFI-generated free function
+     * [uniffi.scp.checkCapabilityRequirements]. ADR-048 §1 + §7 Kotlin
+     * bullet.
+     *
+     * Verifies that an agent meets a context's capability requirements for
+     * admission (spec §7.3.4.4, SCP-ACR-008). [subjectDid]/[contextId] bind
+     * challenge verifications to the agent and context being admitted: a
+     * `ChallengeVerification` only satisfies a requirement when its signed
+     * `subject_did`/`context_id` equal these values, closing cross-subject
+     * and cross-context attribution.
+     *
+     * Returns normally when all requirements are satisfied; the bridge throws
+     * on any unmet requirement or malformed JSON.
+     *
+     * Security caveat — authenticity is not authorization: a passing
+     * `ChallengeVerified` check proves the verifier's signature is authentic
+     * and bound to this subject/context, NOT that the verifier is *trusted*.
+     * Because `verifier_did` is self-certifying, a subject can present a
+     * genuinely-signed result from a verifier it controls. Establish verifier
+     * legitimacy separately and MUST NOT treat success as authorization.
+     */
+    fun checkCapabilityRequirements(
+        contextId: String,
+        subjectDid: String,
+        requirementsJson: String,
+        agentCapabilitiesJson: String,
+        challengeVerificationsJson: String,
+    ) {
+        uniffi.scp.checkCapabilityRequirements(
+            contextId = contextId,
+            subjectDid = subjectDid,
+            requirementsJson = requirementsJson,
+            agentCapabilitiesJson = agentCapabilitiesJson,
+            challengeVerificationsJson = challengeVerificationsJson,
+        )
+    }
+
     companion object {
         /**
          * Constructs an [SCP] with an explicit storage configuration.

@@ -2049,6 +2049,25 @@ export function createNativeBridge(scp: SCP): Bridge {
       );
     },
 
+    // Trust — capability admission verification (§7.3.4.4, SCP-ACR-008)
+    checkCapabilityRequirements(
+      contextId: string,
+      subjectDid: string,
+      requirementsJson: string,
+      agentCapabilitiesJson: string,
+      challengeVerificationsJson: string,
+    ): void {
+      (
+        native.checkCapabilityRequirements as (
+          c: string,
+          s: string,
+          r: string,
+          a: string,
+          v: string,
+        ) => void
+      )(contextId, subjectDid, requirementsJson, agentCapabilitiesJson, challengeVerificationsJson);
+    },
+
     // Lifecycle
     //
     // `version()` stays on the module-level `scpVersion` free function —

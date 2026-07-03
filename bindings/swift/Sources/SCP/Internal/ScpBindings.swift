@@ -3129,8 +3129,10 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * # Errors
      *
      * Returns one of the typed saga errors — [`ScpError::SagaAborted`] (a
-     * Prepare-phase rejection — authorization, freshness, rate limit, or
-     * co-residency; carries `retry_after_ms`), [`ScpError::SagaNeedsRepair`]
+     * Prepare-phase abort that may be a permanent rejection — authorization,
+     * freshness, rate limit, or co-residency — OR a retryable transient: a rate
+     * limit, or a participant actor unavailable to complete the Prepare
+     * exchange; carries `retry_after_ms`), [`ScpError::SagaNeedsRepair`]
      * (Commit-retry exhausted — carries the durable `saga_id` operator-repair
      * handle), or [`ScpError::SagaBusy`] (the participant context set
      * overlapped an in-flight saga — §5.15.4). Returns [`ScpError::Validation`]
@@ -6203,8 +6205,10 @@ open func toolInvokeCrossContext(sourceHandle: ContextHandle, targetHandle: Cont
      * # Errors
      *
      * Returns one of the typed saga errors — [`ScpError::SagaAborted`] (a
-     * Prepare-phase rejection — authorization, freshness, rate limit, or
-     * co-residency; carries `retry_after_ms`), [`ScpError::SagaNeedsRepair`]
+     * Prepare-phase abort that may be a permanent rejection — authorization,
+     * freshness, rate limit, or co-residency — OR a retryable transient: a rate
+     * limit, or a participant actor unavailable to complete the Prepare
+     * exchange; carries `retry_after_ms`), [`ScpError::SagaNeedsRepair`]
      * (Commit-retry exhausted — carries the durable `saga_id` operator-repair
      * handle), or [`ScpError::SagaBusy`] (the participant context set
      * overlapped an in-flight saga — §5.15.4). Returns [`ScpError::Validation`]
@@ -12486,14 +12490,18 @@ public enum ScpError: Swift.Error {
      * A §6.2.4 cross-context tool-invocation saga aborted at a Prepare phase.
      *
      * Surfaces the `Aborted` terminal of
-     * `Supervisor::start_cross_context_tool_invocation_saga` (a §6.2.4
-     * authorization / freshness / rate-limit / co-residency rejection — also
-     * the §6.2.4 *Caller authentication* mismatch this bridge enforces before
-     * the saga runs). Carries the rate-limit back-off hint STRUCTURALLY
+     * `Supervisor::start_cross_context_tool_invocation_saga`. This terminal may
+     * be a PERMANENT rejection (authorization / freshness / rate-limit /
+     * co-residency policy denial, or the §6.2.4 *Caller authentication*
+     * mismatch this bridge enforces before the saga runs) OR a RETRYABLE
+     * transient (a rate-limit back-off, or a participant actor unavailable to
+     * complete the Prepare exchange) — distinguished by the `SCP-SAGA-*` code.
+     * Carries the rate-limit back-off hint STRUCTURALLY
      * (`retry_after_ms`): `Some(ms)` is the limiter's computed cooldown;
      * `None` (NEVER `0`) means no precise back-off instant exists (a
-     * token-bucket hard limit, or a non-rate-limit rejection) — `0` would read
-     * as "retry immediately" and re-trip the same hard limit. `code` is the
+     * token-bucket hard limit, an unavailable participant actor, or a permanent
+     * rejection) — `0` would read as "retry immediately" and re-trip the same
+     * hard limit. `code` is the
      * canonical `SCP-SAGA-13xxx` string. Maps to Swift `ScpError.SagaAborted`
      * / Kotlin `ScpException.SagaAborted` (the `msg` field surfaces as the
      * Swift `msg:` label — the `UniFFI` field-name convention every variant
@@ -15367,6 +15375,45 @@ public func broadcastOpenKey(sealedJson: String, wrappingSecret: Data)throws  ->
 })
 }
 /**
+ * Verifies that an agent meets a context's capability requirements for
+ * admission, bound to the agent and context being admitted.
+ *
+ * Inputs:
+ * - `context_id`: the context the agent is being admitted to. A challenge
+ * verification only satisfies a requirement when its signed `context_id`
+ * equals this value.
+ * - `subject_did`: the DID of the agent being admitted. Only challenge
+ * verifications whose signed `subject_did` equals this value can satisfy a
+ * requirement (cross-subject attribution is rejected).
+ * - `requirements_json`: JSON array of `CapabilityRequirement` objects.
+ * - `agent_capabilities_json`: JSON array of capability-URI strings.
+ * - `challenge_verifications_json`: JSON array of `ChallengeVerification`
+ * records; each is signature-verified and only counts if authentic,
+ * in-context, in-subject, passed, and unexpired.
+ *
+ * Uses the production `IdentityDidPublicKeyResolver` for verifier-DID key
+ * resolution and the fail-closed system clock for expiry. Returns without error
+ * (unit) if all requirements are satisfied, throws `ScpError` with a diagnostic
+ * message if any requirement is unmet or if the JSON is malformed.
+ *
+ * Security caveat — authenticity is not authorization: a passing
+ * `ChallengeVerified` check proves the verifier's signature is authentic and
+ * bound to this subject/context, NOT that the verifier is trusted. Establish
+ * verifier legitimacy separately (spec §7.3.4.4 / §7.4).
+ *
+ * See §7.3.4.4.
+ */
+public func checkCapabilityRequirements(contextId: String, subjectDid: String, requirementsJson: String, agentCapabilitiesJson: String, challengeVerificationsJson: String)throws   {try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_func_check_capability_requirements(
+        FfiConverterString.lower(contextId),
+        FfiConverterString.lower(subjectDid),
+        FfiConverterString.lower(requirementsJson),
+        FfiConverterString.lower(agentCapabilitiesJson),
+        FfiConverterString.lower(challengeVerificationsJson),$0
+    )
+}
+}
+/**
  * Discovers contexts from a DID string or `scp://` URI.
  *
  * Detects whether the query is a DID or an `scp://` URI and delegates to
@@ -16082,6 +16129,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_func_broadcast_open_key() != 24667) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_scp_ffi_uniffi_checksum_func_check_capability_requirements() != 55898) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_scp_ffi_uniffi_checksum_func_context_discover() != 49364) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -16700,7 +16750,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_tool_invoke_cross_context() != 47346) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_tool_invoke_cross_context_saga() != 59585) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_tool_invoke_cross_context_saga() != 1312) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_tool_register() != 65327) {

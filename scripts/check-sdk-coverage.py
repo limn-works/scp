@@ -625,6 +625,12 @@ ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
         "kotlin": ["verifyParticipationRequirements"],
         "swift": ["verifyParticipationRequirements"],
     },
+    ("Trust", "check_capability_requirements"): {
+        "python": ["check_capability_requirements"],
+        "typescript": ["checkCapabilityRequirements"],
+        "kotlin": ["checkCapabilityRequirements"],
+        "swift": ["checkCapabilityRequirements"],
+    },
     ("Trust", "participation_record"): {
         "python": ["participation_record"],
         "typescript": ["participationRecord"],

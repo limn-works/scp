@@ -431,3 +431,46 @@ describe("scp.participationRecord — typed cached-attestation input", () => {
     ]);
   });
 });
+
+describe("scp.checkCapabilityRequirements — capability admission (§7.3.4.4)", () => {
+  let cleanup: (() => Promise<void>) | undefined;
+  afterEach(async () => {
+    await cleanup?.();
+    cleanup = undefined;
+  });
+
+  it("passes the JSON envelope through to the native bridge and returns void", async () => {
+    const { scp, native } = mountMockScp();
+    cleanup = () => scp.shutdown(0);
+    native.__stub("checkCapabilityRequirements", () => undefined);
+
+    const requirements = JSON.stringify([
+      { capability: "scp:capability:schema-validation/v1", verification_level: "SelfAttested" },
+    ]);
+    const capabilities = JSON.stringify(["scp:capability:schema-validation/v1"]);
+
+    const result = scp.checkCapabilityRequirements(
+      "ctx-1",
+      "did:dht:subject",
+      requirements,
+      capabilities,
+      "[]",
+    );
+    expect(result).toBeUndefined();
+
+    const call = native.__lastCall("checkCapabilityRequirements");
+    expect(call?.args).toEqual(["ctx-1", "did:dht:subject", requirements, capabilities, "[]"]);
+  });
+
+  it("propagates a thrown admission error", async () => {
+    const { scp, native } = mountMockScp();
+    cleanup = () => scp.shutdown(0);
+    native.__stub("checkCapabilityRequirements", () => {
+      throw new Error("missing required capability");
+    });
+
+    expect(() =>
+      scp.checkCapabilityRequirements("ctx-1", "did:dht:subject", "[]", "[]", "[]"),
+    ).toThrow("missing required capability");
+  });
+});

@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use crate::bridge::BridgeMode;
 use crate::economy::EconomicPolicy;
 use crate::provenance::CounterpartyPolicy;
-use crate::trust::RequireParticipation;
+use crate::trust::{CapabilityRequirement, RequireParticipation};
 
 pub use super::close::IncompleteVerificationPolicy;
 
@@ -769,6 +769,27 @@ pub struct ContextParams {
     #[serde(default)]
     pub participation_requirements: Vec<RequireParticipation>,
 
+    /// Capability requirements a joining agent must satisfy for admission
+    /// (spec §7.3.4.4, ADR-041 AC6). Each entry pairs a capability URI with a
+    /// required [`VerificationLevel`](crate::trust::VerificationLevel)
+    /// (`SelfAttested` or `ChallengeVerified`); admission is checked mechanically
+    /// by [`check_capability_requirements`](crate::trust::check_capability_requirements)
+    /// against the joining agent's self-attested capabilities and
+    /// challenge-verification records. Empty (the default) means no capability
+    /// requirements.
+    ///
+    /// SECURITY (verifier legitimacy): a `ChallengeVerified` requirement is
+    /// satisfied only by a `ChallengeVerification` whose verifier signature is
+    /// authentic and whose signed `subject_did`/`context_id` match the agent and
+    /// context being admitted — but a `verifier_did` is self-certifying, so
+    /// signature authenticity does NOT establish that the verifier is
+    /// *authorized/trusted*. A context that needs verifier legitimacy must
+    /// establish it separately (a trusted-verifier set, a context-membership
+    /// proof, or the §7.3.5 threshold/independence path), not rely on a passing
+    /// challenge-verification check alone.
+    #[serde(default)]
+    pub capability_requirements: Vec<CapabilityRequirement>,
+
     /// Policy for handling incomplete summary verification at window expiry.
     ///
     /// Only relevant for `MemoryScope::Summary` contexts. Determines whether
@@ -854,6 +875,7 @@ impl Default for ContextParams {
             session_cap: None,
             counterparty_policy: CounterpartyPolicy::default(),
             participation_requirements: Vec::new(),
+            capability_requirements: Vec::new(),
             incomplete_verification_policy: IncompleteVerificationPolicy::default(),
             min_protocol_version: None,
             migration_source: None,
@@ -1021,6 +1043,7 @@ mod tests {
         );
         assert!(params.projection_policy.is_none());
         assert!(params.participation_requirements.is_empty());
+        assert!(params.capability_requirements.is_empty());
     }
 
     #[test]
@@ -1074,6 +1097,7 @@ mod tests {
             session_cap: None,
             counterparty_policy: CounterpartyPolicy::default(),
             participation_requirements: Vec::new(),
+            capability_requirements: Vec::new(),
             incomplete_verification_policy: IncompleteVerificationPolicy::default(),
             min_protocol_version: None,
             migration_source: None,
@@ -1217,6 +1241,7 @@ mod tests {
             session_cap: None,
             counterparty_policy: CounterpartyPolicy::default(),
             participation_requirements: Vec::new(),
+            capability_requirements: Vec::new(),
             incomplete_verification_policy: IncompleteVerificationPolicy::default(),
             min_protocol_version: None,
             migration_source: None,
@@ -1280,6 +1305,7 @@ mod tests {
             session_cap: None,
             counterparty_policy: CounterpartyPolicy::default(),
             participation_requirements: Vec::new(),
+            capability_requirements: Vec::new(),
             incomplete_verification_policy: IncompleteVerificationPolicy::default(),
             min_protocol_version: None,
             migration_source: None,
@@ -1319,6 +1345,7 @@ mod tests {
         );
         assert!(params.projection_policy.is_none());
         assert!(params.participation_requirements.is_empty());
+        assert!(params.capability_requirements.is_empty());
     }
 
     // -----------------------------------------------------------------------
@@ -1865,6 +1892,56 @@ mod tests {
         }"#;
         let params: ContextParams = serde_json::from_str(json).unwrap();
         assert!(params.participation_requirements.is_empty());
+        assert!(params.capability_requirements.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // capability_requirements (SCP-ACR-008, §7.3.4.4 / ADR-041 AC6)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn capability_requirements_serde_roundtrip() {
+        use crate::trust::{CapabilityRequirement, VerificationLevel};
+
+        let params = ContextParams {
+            capability_requirements: vec![
+                CapabilityRequirement {
+                    capability: "scp:capability:schema-validation/v1".parse().unwrap(),
+                    verification_level: VerificationLevel::SelfAttested,
+                },
+                CapabilityRequirement {
+                    capability: "scp:capability:prompt-injection-resistance/v1"
+                        .parse()
+                        .unwrap(),
+                    verification_level: VerificationLevel::ChallengeVerified,
+                },
+            ],
+            ..ContextParams::default()
+        };
+
+        let json = serde_json::to_string(&params).unwrap();
+        let deserialized: ContextParams = serde_json::from_str(&json).unwrap();
+        assert_eq!(params, deserialized);
+        assert_eq!(deserialized.capability_requirements.len(), 2);
+    }
+
+    #[test]
+    fn capability_requirements_backwards_compat() {
+        // JSON without capability_requirements field deserializes to empty vec.
+        let json = r#"{
+            "mode": "Encrypted",
+            "ceiling": [],
+            "ceiling_policy": "Immutable",
+            "promotion_policy": "NoPromotion",
+            "roles": [],
+            "tools": [],
+            "ttl": null,
+            "memory_scope": "Ephemeral",
+            "governance": "SingleAdmin",
+            "template_id": null
+        }"#;
+        let params: ContextParams = serde_json::from_str(json).unwrap();
+        assert!(params.capability_requirements.is_empty());
     }
 
     // -----------------------------------------------------------------------
