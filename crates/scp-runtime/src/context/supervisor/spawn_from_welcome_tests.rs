@@ -15,6 +15,7 @@
 //! fail-closed BEFORE the actor is reachable (a persist failure leaves NO live
 //! half-keyed actor — Decision 1/8/9).
 
+#![allow(clippy::doc_markdown, clippy::too_long_first_doc_paragraph)]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 // `spawn_actor_from_welcome` returns a deliberately large state-building future
 // (~16 KB — the Welcome-derived `PerContextState`); production callers `Box::pin`
@@ -32,8 +33,11 @@ use scp_identity::{DID, SigningKeyId};
 use scp_platform::testing::InMemoryStorage;
 use scp_protocol::context::builder::OpenResult;
 use scp_protocol::context::governance::KeyResolver;
-use scp_protocol::context::roles::Capability;
-use scp_protocol::context::{ContextMode, ContextParams};
+use scp_protocol::context::roles::{Capability, CapabilityCeiling};
+use scp_protocol::context::{
+    CeilingPolicy, ContextMode, ContextParams, GovernanceModel, ScpContextExtension,
+};
+use zeroize::Zeroizing;
 
 use super::key_package_actor::KeyPackageCommand;
 use super::{Supervisor, WelcomeJoinRequest};
@@ -88,6 +92,44 @@ fn joiner_params() -> ContextParams {
     }
 }
 
+/// Bob's X25519 wrapping key material (§9.16.1). A joiner's KeyPackage must
+/// declare the `scp_context_params` (`0xFF02`) capability to be added to an SCP
+/// context group (OpenMLS `valn0502`), and the production `generate_key_package`
+/// path only emits `0xFF02` when a wrapping key is present — so every joiner in
+/// these tests publishes one via [`Supervisor::set_wrapping_keys`]. The bytes are
+/// an opaque leaf extension during add/join (no X25519 DH runs on the MLS join
+/// path), so a fixed non-zero constant suffices.
+const BOB_WRAP: [u8; 32] = [0xB2; 32];
+
+/// Builds the creator-committed `scp_context_params` (`0xFF02`) extension for a
+/// ROOT context from `params`, byte-for-byte the way the creator write path
+/// (`builder::create_context` → `create_mls_group_with_context`) does — so a
+/// group created with this extension and a matching-`params` join verifies, and
+/// a divergent join is refused (spec §5.13.3, FFI-02).
+fn honest_ext(context_id: &str, params: &ContextParams) -> ScpContextExtension {
+    ScpContextExtension::for_root(
+        context_id.to_owned(),
+        params.mode,
+        &params.governance,
+        params.ceiling_policy,
+        &CapabilityCeiling::new(params.ceiling.iter().cloned()),
+    )
+    .expect("honest context extension serializes")
+}
+
+/// Publishes Bob's wrapping key on `sup` so his pooled KeyPackages declare
+/// `0xFF02` (see [`BOB_WRAP`]). Idempotent; must run BEFORE the KeyPackage store
+/// is first spawned (i.e. before [`reserve_bob_kp`]).
+async fn set_bob_wrapping(sup: &Arc<Supervisor>, bob: &DID) {
+    sup.set_wrapping_keys(
+        bob.clone(),
+        BOB_WRAP.to_vec(),
+        Zeroizing::new(BOB_WRAP.to_vec()),
+    )
+    .await
+    .expect("set bob's wrapping key");
+}
+
 fn fresh_mls_storage() -> Arc<dyn OpenMlsStorageAdapter> {
     Arc::new(SpawnBlockingStorageAdapter::new(Arc::new(
         InMemoryStorage::new(),
@@ -129,6 +171,11 @@ async fn reserve_bob_kp(
     sup: &Arc<Supervisor>,
     bob: &DID,
 ) -> (super::key_package_actor::ReservationId, Vec<u8>) {
+    // Publish Bob's wrapping key BEFORE the store spawns so every pooled KP
+    // declares `0xFF02` and satisfies `valn0502` when added to an SCP context
+    // group (§5.13.3). Harmless for the wrapping-only (non-SCP) group fixtures —
+    // a group with no `0xFF02` requirement accepts a `0xFF02`-declaring KP.
+    set_bob_wrapping(sup, bob).await;
     let store = sup
         .key_package_store_for(bob)
         .await
@@ -162,42 +209,71 @@ struct Joined {
 }
 
 /// Runs the full reserve → creator-add → Welcome → `spawn_actor_from_welcome`
-/// ladder against a Bob supervisor built with `persistence`, returning the spawn
-/// result plus the pieces needed to assert on it. The Welcome is produced by a
-/// bare creator provider (Alice) adding Bob's RESERVED KP — the same bytes Bob's
-/// store holds the private signer-state for, so the fused `ConfirmConsume` join
-/// matches.
-async fn join_bob(
+/// ladder, returning the spawn result plus the pieces needed to assert on it.
+///
+/// The FFI-02 axis is exposed by letting the CREATOR-committed parameters differ
+/// from what Bob sends in his `WelcomeJoinRequest`:
+///
+/// - `committed`: `Some(params)` → Alice creates an **honest SCP context group**
+///   whose `scp_context_params` (`0xFF02`) extension binds `params` under the
+///   group's `context_id`; `None` → Alice creates a **wrapping-only** group with
+///   NO `0xFF02` (a non-SCP group, for the rule-1 test).
+/// - `request_params`: the params Bob puts in his request (what
+///   `build_welcome_joiner_state` would build authority from). Differ from
+///   `committed` to drive a binding mismatch.
+/// - `request_ctx_id`: the `context_id` Bob claims (`None` → the group's real
+///   `ctx_hex(seed)`). Differ to drive a context_id mismatch.
+///
+/// `Joined.ctx_id` / `ctx_bytes` are the REQUEST id (the slot Bob tried to
+/// install under), so rollback assertions probe the right crypto slot.
+async fn run_join_with(
     seed: u8,
     persistence: Option<Box<dyn ContextPersistence>>,
+    committed: Option<ContextParams>,
+    request_params: ContextParams,
+    request_ctx_id: Option<String>,
 ) -> (
     Result<crate::context::ContextHandle, crate::context::ContextError>,
     Joined,
 ) {
     let bob = DID::from(BOB_DID);
-    let ctx_id = ctx_hex(seed);
-    let ctx_bytes = context_id_to_bytes(&ctx_id);
+    let group_ctx_id = ctx_hex(seed);
+    let group_ctx_bytes = context_id_to_bytes(&group_ctx_id);
 
     let (sup, bob_crypto) = bob_supervisor(persistence);
 
     // Bob reserves a real KP from his own store (private signer-state stays in
-    // the actor; only the reservation id + public bytes come back).
+    // the actor; only the reservation id + public bytes come back). This also
+    // publishes Bob's wrapping key so the KP declares `0xFF02`.
     let (reservation_id, kp_public_bytes) = reserve_bob_kp(&sup, &bob).await;
 
     // Alice (bare creator provider) creates the group and adds Bob's reserved
-    // KP, producing the real Welcome addressed to that KP's init key.
+    // KP, producing the real Welcome addressed to that KP's init key. When
+    // `committed` is `Some`, the group carries the honest `0xFF02` extension;
+    // otherwise it is a wrapping-only (non-SCP) group.
     let alice_crypto = Arc::new(MlsCryptoProvider::new(ALICE_DID.to_owned()));
-    alice_crypto
-        .create_mls_group(&ctx_bytes)
-        .expect("alice creates the MLS group");
+    match &committed {
+        Some(committed_params) => alice_crypto
+            .create_mls_group_with_context(
+                &group_ctx_bytes,
+                &honest_ext(&group_ctx_id, committed_params),
+            )
+            .expect("alice creates the SCP context group (0xFF02)"),
+        None => alice_crypto
+            .create_mls_group(&group_ctx_bytes)
+            .expect("alice creates a wrapping-only group (no 0xFF02)"),
+    }
     let add_output = alice_crypto
-        .add_member(&ctx_bytes, BOB_DID, Some(&kp_public_bytes))
+        .add_member(&group_ctx_bytes, BOB_DID, Some(&kp_public_bytes))
         .expect("alice adds bob's reserved key package");
+
+    let request_ctx_id = request_ctx_id.unwrap_or_else(|| group_ctx_id.clone());
+    let request_ctx_bytes = context_id_to_bytes(&request_ctx_id);
 
     let req = WelcomeJoinRequest {
         creator_did: DID::from(ALICE_DID),
-        context_id: ctx_id.clone(),
-        params: joiner_params(),
+        context_id: request_ctx_id.clone(),
+        params: request_params,
         reservation_id,
         welcome_bytes: add_output.welcome_bytes,
         local_pseudonym: some_pseudonym(),
@@ -210,10 +286,31 @@ async fn join_bob(
             sup,
             bob_crypto,
             alice_crypto,
-            ctx_id,
-            ctx_bytes,
+            ctx_id: request_ctx_id,
+            ctx_bytes: request_ctx_bytes,
         },
     )
+}
+
+/// The honest happy-path join: Alice commits `joiner_params()` into the group's
+/// `0xFF02` extension and Bob requests those SAME params under the group's real
+/// id, so the FFI-02 binding check passes and the join proceeds through install
+/// → persist → spawn.
+async fn join_bob(
+    seed: u8,
+    persistence: Option<Box<dyn ContextPersistence>>,
+) -> (
+    Result<crate::context::ContextHandle, crate::context::ContextError>,
+    Joined,
+) {
+    run_join_with(
+        seed,
+        persistence,
+        Some(joiner_params()),
+        joiner_params(),
+        None,
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -502,7 +599,9 @@ async fn second_spawn_reusing_a_consumed_reservation_is_rejected() {
     let (reservation_id, kp_public_bytes) = reserve_bob_kp(&sup, &bob).await;
 
     let alice_crypto = Arc::new(MlsCryptoProvider::new(ALICE_DID.to_owned()));
-    alice_crypto.create_mls_group(&ctx_bytes).unwrap();
+    alice_crypto
+        .create_mls_group_with_context(&ctx_bytes, &honest_ext(&ctx_id, &joiner_params()))
+        .unwrap();
     let add_output = alice_crypto
         .add_member(&ctx_bytes, BOB_DID, Some(&kp_public_bytes))
         .unwrap();
@@ -558,18 +657,23 @@ async fn second_spawn_reusing_a_consumed_reservation_is_rejected() {
 // Shared setup for the reversible-precheck tests (Fix 1a / Fix 6).
 // ---------------------------------------------------------------------------
 
-/// Alice (a bare creator provider) creates the group under `ctx_bytes` and adds
-/// Bob's RESERVED public KP, returning `(alice_crypto, welcome_bytes)`.
+/// Alice (a bare creator provider) creates an HONEST SCP context group under
+/// `context_id` — committing the `joiner_params()` `scp_context_params`
+/// (`0xFF02`) extension — and adds Bob's RESERVED public KP, returning
+/// `(alice_crypto, welcome_bytes)`. The committed extension binds `context_id`,
+/// so a join under a DIFFERENT id (or with divergent params) is refused by the
+/// FFI-02 binding check; every caller here joins under the SAME `context_id`.
 fn alice_welcome_for(
-    ctx_bytes: &[u8; 32],
+    context_id: &str,
     kp_public_bytes: &[u8],
 ) -> (Arc<MlsCryptoProvider>, Vec<u8>) {
+    let ctx_bytes = context_id_to_bytes(context_id);
     let alice_crypto = Arc::new(MlsCryptoProvider::new(ALICE_DID.to_owned()));
     alice_crypto
-        .create_mls_group(ctx_bytes)
-        .expect("alice creates the MLS group");
+        .create_mls_group_with_context(&ctx_bytes, &honest_ext(context_id, &joiner_params()))
+        .expect("alice creates the SCP context group (0xFF02)");
     let add_output = alice_crypto
-        .add_member(ctx_bytes, BOB_DID, Some(kp_public_bytes))
+        .add_member(&ctx_bytes, BOB_DID, Some(kp_public_bytes))
         .expect("alice adds bob's reserved key package");
     (alice_crypto, add_output.welcome_bytes)
 }
@@ -594,7 +698,7 @@ async fn missing_pseudonym_is_rejected_before_the_kp_consume() {
 
     let (sup, bob_crypto) = bob_supervisor(None);
     let (reservation_id, kp_public_bytes) = reserve_bob_kp(&sup, &bob).await;
-    let (_alice, welcome) = alice_welcome_for(&ctx_bytes, &kp_public_bytes);
+    let (_alice, welcome) = alice_welcome_for(&ctx_id, &kp_public_bytes);
 
     let make_req = |pseudonym: Option<[u8; 32]>| WelcomeJoinRequest {
         creator_did: DID::from(ALICE_DID),
@@ -663,6 +767,12 @@ async fn colliding_broadcast_context_id_is_rejected_before_the_kp_consume() {
 
     let (sup, bob_crypto) = bob_supervisor(None);
 
+    // Publish bob's wrapping key BEFORE `create_context` — which get-or-spawns
+    // bob's KeyPackage store via `build_actor_deps` and freezes its
+    // wrapping-pubkey deps at spawn time. Without this, the pooled KPs would be
+    // wrapping-only (no `0xFF02`) and could not join Alice's SCP context group.
+    set_bob_wrapping(&sup, &bob).await;
+
     // Bob pre-creates a BROADCAST context under `collide_id`: this registers an
     // actor (so `lookup` is `Some`) while the encrypted `contexts` crypto slot
     // stays VACANT (broadcast keys live in `broadcast_keys`).
@@ -695,7 +805,7 @@ async fn colliding_broadcast_context_id_is_rejected_before_the_kp_consume() {
 
     // Bob reserves a KP; Alice builds a Welcome addressed to it for `collide_id`.
     let (reservation_id, kp_public_bytes) = reserve_bob_kp(&sup, &bob).await;
-    let (_alice, welcome) = alice_welcome_for(&collide_bytes, &kp_public_bytes);
+    let (_alice, welcome) = alice_welcome_for(&collide_id, &kp_public_bytes);
 
     // The colliding join is rejected UP FRONT — before the consume.
     let colliding_req = WelcomeJoinRequest {
@@ -726,16 +836,22 @@ async fn colliding_broadcast_context_id_is_rejected_before_the_kp_consume() {
         "the survivor is still the broadcast context (broadcast reports no MLS epoch)"
     );
 
-    // KP NOT burned: the same reservation + Welcome now stand up a join to a
-    // FRESH, non-colliding context id — proving the collision reject happened
-    // before `ConfirmConsume`.
+    // KP NOT burned: the SAME reservation now stands up a join to a FRESH,
+    // non-colliding context id — proving the collision reject happened before
+    // `ConfirmConsume` (a burned reservation would fail closed at the fused
+    // consume, as Test D shows). The Welcome is rebuilt for `fresh_id` (Alice
+    // re-adds the same reserved KP to a fresh honest group whose `0xFF02`
+    // extension binds `fresh_id`): under FFI-02 the collide-bound Welcome cannot
+    // be replayed under a different id — the binding check would refuse it — so
+    // the retry uses a correctly-bound Welcome for the id it installs under.
     let fresh_id = ctx_hex(0x78);
+    let (_fresh_alice, fresh_welcome) = alice_welcome_for(&fresh_id, &kp_public_bytes);
     let fresh_req = WelcomeJoinRequest {
         creator_did: DID::from(ALICE_DID),
         context_id: fresh_id.clone(),
         params: joiner_params(),
         reservation_id,
-        welcome_bytes: welcome,
+        welcome_bytes: fresh_welcome,
         local_pseudonym: some_pseudonym(),
     };
     sup.spawn_actor_from_welcome(bob, fresh_req)
@@ -813,7 +929,7 @@ async fn non_durable_crypto_export_fails_closed_without_standing_up_an_actor() {
 
     let (sup, bob_crypto) = bob_supervisor(None);
     let (reservation_id, kp_public_bytes) = reserve_bob_kp(&sup, &bob).await;
-    let (_alice, welcome) = alice_welcome_for(&ctx_bytes, &kp_public_bytes);
+    let (_alice, welcome) = alice_welcome_for(&ctx_id, &kp_public_bytes);
 
     // Arm the one-shot seam: the step-3b durability check reads the live export
     // FIRST, so the seam fires there → the export reads non-durable.
@@ -931,7 +1047,7 @@ async fn durable_snapshot_collision_is_rejected_without_clobbering_or_burning_kp
     //     joiner's initial Class-S snapshot under `ctx_id`.
     let (seed_sup, _seed_crypto) = bob_supervisor(Some(Box::new(rec.clone())));
     let (seed_res, seed_kp) = reserve_bob_kp(&seed_sup, &bob).await;
-    let (_seed_alice, seed_welcome) = alice_welcome_for(&ctx_bytes, &seed_kp);
+    let (_seed_alice, seed_welcome) = alice_welcome_for(&ctx_id, &seed_kp);
     seed_sup
         .spawn_actor_from_welcome(
             bob.clone(),
@@ -962,7 +1078,7 @@ async fn durable_snapshot_collision_is_rejected_without_clobbering_or_burning_kp
     );
 
     let (reservation_id, kp_public_bytes) = reserve_bob_kp(&target_sup, &bob).await;
-    let (_alice, welcome) = alice_welcome_for(&ctx_bytes, &kp_public_bytes);
+    let (_alice, welcome) = alice_welcome_for(&ctx_id, &kp_public_bytes);
     let make_req =
         |context_id: String, reservation_id, welcome_bytes: Vec<u8>| WelcomeJoinRequest {
             creator_did: DID::from(ALICE_DID),
@@ -1191,6 +1307,9 @@ async fn reserve_then_spawn_via_supervisor_yields_a_live_send_capable_actor() {
 
     let (sup, bob_crypto) = bob_supervisor(None);
 
+    // Publish bob's wrapping key so his pooled KP declares `0xFF02` (valn0502).
+    set_bob_wrapping(&sup, &bob).await;
+
     // Reserve via the PUBLIC `Supervisor` entrypoint (get-or-spawn bob's store,
     // replenish barrier, list, reserve) — bare DID; in production the FFI bridge
     // enforces that the DID is locally custodied.
@@ -1200,7 +1319,7 @@ async fn reserve_then_spawn_via_supervisor_yields_a_live_send_capable_actor() {
         .expect("reserve_key_package yields a reservation for the identity");
 
     // Alice (bare creator provider) adds the reserved KP → the real Welcome.
-    let (alice_crypto, welcome) = alice_welcome_for(&ctx_bytes, &kp_public_bytes);
+    let (alice_crypto, welcome) = alice_welcome_for(&ctx_id, &kp_public_bytes);
 
     // Spawn via the PUBLIC `Supervisor` entrypoint — the reservation feeds
     // straight in.
@@ -1261,16 +1380,18 @@ async fn spawn_under_a_different_did_is_rejected() {
     let bob = DID::from(BOB_DID);
     let charlie = DID::from("did:dht:z6MkCharlieNotTheJoinerSpawnFromWelcome");
     let ctx_id = ctx_hex(0xb2);
-    let ctx_bytes = context_id_to_bytes(&ctx_id);
 
     let (sup, _bob_crypto) = bob_supervisor(None);
+
+    // Publish bob's wrapping key so his pooled KP declares `0xFF02` (valn0502).
+    set_bob_wrapping(&sup, &bob).await;
 
     // Bob reserves under HIS OWN DID; Alice builds the Welcome for that KP.
     let (reservation_id, kp_public_bytes) = sup
         .reserve_key_package(bob.clone())
         .await
         .expect("bob reserves a KP under his own DID");
-    let (_alice, welcome) = alice_welcome_for(&ctx_bytes, &kp_public_bytes);
+    let (_alice, welcome) = alice_welcome_for(&ctx_id, &kp_public_bytes);
 
     let make_req = |reservation_id, welcome_bytes| WelcomeJoinRequest {
         creator_did: DID::from(ALICE_DID),
@@ -1306,5 +1427,196 @@ async fn spawn_under_a_different_did_is_rejected() {
         sup.member_count(&ctx_id).await,
         Some(2),
         "bob's join stands up the live joiner actor after the cross-identity reject"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test L — FFI-02 context-parameter binding: a join whose caller-supplied
+// params/context_id DIVERGE from what the creator cryptographically committed
+// into the group's `scp_context_params` (`0xFF02`) extension is REFUSED before
+// any crypto is installed, any snapshot persisted, or any actor registered
+// (spec §5.13.3). This is the load-bearing forgery guard: a malicious inviter
+// cannot present benign params while the real group differs.
+// ---------------------------------------------------------------------------
+
+/// Asserts a spawn `result` was refused by the FFI-02 binding check (a
+/// `CryptoFailed` whose message names the greppable refusal + the `0xFF02`
+/// extension) and that the rejection had NO side effects: no group installed in
+/// the provider (empty crypto export for the request slot), no live actor
+/// registered, and — via the shared `RecordingPersistence` — no snapshot
+/// persisted. Mirrors the 2J rollback-assertion pattern (Test C / H).
+async fn assert_binding_refused_no_side_effects(
+    result: Result<crate::context::ContextHandle, crate::context::ContextError>,
+    j: &Joined,
+    rec: &RecordingPersistence,
+) {
+    let err = result.expect_err("a diverging context-parameter binding must be refused");
+    assert!(
+        matches!(
+            &err,
+            crate::context::ContextError::CryptoFailed(msg)
+                if msg.contains("spawn-from-Welcome refused") && msg.contains("0xFF02")
+        ),
+        "expected the FFI-02 binding refusal naming the 0xFF02 extension, got: {err:?}"
+    );
+
+    // No crypto installed under the slot Bob tried to install into (an absent
+    // context exports an EMPTY blob; an installed one is non-empty).
+    assert!(
+        j.bob_crypto
+            .export_crypto_state(&j.ctx_bytes)
+            .expect("export never errors")
+            .is_empty(),
+        "no MLS group may be installed after a binding refusal"
+    );
+    // No actor registered / reachable.
+    assert!(
+        j.sup.lookup(&j.ctx_id).is_none(),
+        "no actor handle may be registered after a binding refusal"
+    );
+    assert_eq!(
+        j.sup.member_count(&j.ctx_id).await,
+        None,
+        "an unregistered context answers the unregistered default, not a live count"
+    );
+    // No snapshot persisted — the refusal fires BEFORE the step-4 persist.
+    assert!(
+        rec.store.is_empty(),
+        "no snapshot may be persisted after a binding refusal"
+    );
+}
+
+/// The caller's `governance` diverges from the creator-committed governance
+/// model: `GovernanceHashMismatch` → refused before install.
+#[tokio::test]
+async fn tamper_governance_mismatch_is_refused_before_install() {
+    let rec = RecordingPersistence::default();
+    let mut tampered = joiner_params();
+    tampered.governance = GovernanceModel::Threshold {
+        threshold: 1,
+        signers: vec![DID::from("did:dht:z6MkThresholdSignerForTamperTest")],
+    };
+    let (result, j) = run_join_with(
+        0xc1,
+        Some(Box::new(rec.clone())),
+        Some(joiner_params()),
+        tampered,
+        None,
+    )
+    .await;
+    assert_binding_refused_no_side_effects(result, &j, &rec).await;
+}
+
+/// The caller's capability `ceiling` diverges from the committed one:
+/// `CeilingHashMismatch` → refused before install.
+#[tokio::test]
+async fn tamper_ceiling_mismatch_is_refused_before_install() {
+    let rec = RecordingPersistence::default();
+    let mut tampered = joiner_params();
+    // A strict subset of the committed ceiling — valid entries, different hash.
+    tampered.ceiling = vec![Capability::MessagesRead];
+    let (result, j) = run_join_with(
+        0xc2,
+        Some(Box::new(rec.clone())),
+        Some(joiner_params()),
+        tampered,
+        None,
+    )
+    .await;
+    assert_binding_refused_no_side_effects(result, &j, &rec).await;
+}
+
+/// The caller's `ceiling_policy` diverges (Immutable committed vs Governed
+/// requested): `CeilingPolicyMismatch` → refused before install.
+#[tokio::test]
+async fn tamper_ceiling_policy_mismatch_is_refused_before_install() {
+    let rec = RecordingPersistence::default();
+    let mut tampered = joiner_params();
+    tampered.ceiling_policy = CeilingPolicy::Governed;
+    let (result, j) = run_join_with(
+        0xc3,
+        Some(Box::new(rec.clone())),
+        Some(joiner_params()),
+        tampered,
+        None,
+    )
+    .await;
+    assert_binding_refused_no_side_effects(result, &j, &rec).await;
+}
+
+/// The caller's `mode` diverges (Encrypted committed vs Broadcast requested):
+/// `ModeMismatch` → refused before install.
+#[tokio::test]
+async fn tamper_mode_mismatch_is_refused_before_install() {
+    let rec = RecordingPersistence::default();
+    let mut tampered = joiner_params();
+    tampered.mode = ContextMode::Broadcast;
+    let (result, j) = run_join_with(
+        0xc4,
+        Some(Box::new(rec.clone())),
+        Some(joiner_params()),
+        tampered,
+        None,
+    )
+    .await;
+    assert_binding_refused_no_side_effects(result, &j, &rec).await;
+}
+
+/// The caller's `context_id` diverges from the id the group's `0xFF02` extension
+/// commits (a Welcome for context A replayed as context B): `ContextIdMismatch`
+/// → refused before install. The install slot (the REQUEST id) stays empty.
+#[tokio::test]
+async fn tamper_context_id_mismatch_is_refused_before_install() {
+    let rec = RecordingPersistence::default();
+    let (result, j) = run_join_with(
+        0xc5,
+        Some(Box::new(rec.clone())),
+        Some(joiner_params()),
+        joiner_params(),
+        Some(ctx_hex(0xc6)), // a DIFFERENT id than the group commits (0xc5)
+    )
+    .await;
+    assert_binding_refused_no_side_effects(result, &j, &rec).await;
+}
+
+/// FFI-02 rule 1: a Welcome for a WRAPPING-ONLY group (no `0xFF02` extension —
+/// not an SCP context) is refused on join, even when the caller's params are
+/// otherwise well-formed. No crypto installed, no snapshot persisted, no actor.
+#[tokio::test]
+async fn join_group_without_scp_context_extension_is_refused() {
+    let rec = RecordingPersistence::default();
+    let (result, j) = run_join_with(
+        0xc7,
+        Some(Box::new(rec.clone())),
+        None, // wrapping-only group: NO 0xFF02 extension
+        joiner_params(),
+        None,
+    )
+    .await;
+
+    let err = result.expect_err("a group with no 0xFF02 extension is not an SCP context");
+    assert!(
+        matches!(
+            &err,
+            crate::context::ContextError::CryptoFailed(msg)
+                if msg.contains("spawn-from-Welcome refused")
+                    && msg.contains("no scp_context_params (0xFF02)")
+        ),
+        "expected the rule-1 refusal (no 0xFF02 extension), got: {err:?}"
+    );
+    assert!(
+        j.bob_crypto
+            .export_crypto_state(&j.ctx_bytes)
+            .expect("export never errors")
+            .is_empty(),
+        "no MLS group may be installed after a rule-1 refusal"
+    );
+    assert!(
+        j.sup.lookup(&j.ctx_id).is_none(),
+        "no actor handle may be registered after a rule-1 refusal"
+    );
+    assert!(
+        rec.store.is_empty(),
+        "no snapshot may be persisted after a rule-1 refusal"
     );
 }

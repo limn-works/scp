@@ -2415,6 +2415,41 @@ impl MlsCryptoProvider {
         Ok(())
     }
 
+    /// Reads the `scp_context_params` (`0xFF02`) group-context extension
+    /// committed into the resident MLS group for `context_id`, if the group
+    /// carries one (spec §5.13.3, finding FFI-02).
+    ///
+    /// This is the load-time read path that lets the `scp-runtime` lifecycle
+    /// layer verify a *rehydrated* group (import / restore / respawn) against
+    /// the snapshot's declared context parameters via
+    /// [`ScpContextExtension::verify_against`](scp_protocol::context::ScpContextExtension::verify_against),
+    /// exactly as the Welcome-join path verifies the freshly-joined group
+    /// before installing it. Read-only: it inspects the replicated
+    /// `group_context` extensions (the same bytes every member's key schedule
+    /// is bound to) and never mutates crypto state.
+    ///
+    /// Returns `Ok(None)` for a group with no `0xFF02` extension (e.g. a
+    /// wrapping-key-only group — not an SCP context).
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::CryptoFailed`] `"no MLS group for this context"` if no
+    ///   group is resident for `context_id` (never created / evicted), or
+    ///   `"context state owned by actor"` if the state was destructively moved.
+    /// - [`ContextError::CryptoFailed`] if the `0xFF02` extension is present but
+    ///   its payload fails canonical decoding.
+    pub fn group_context_extension(
+        &self,
+        context_id: &[u8; 32],
+    ) -> Result<Option<scp_protocol::context::ScpContextExtension>, ContextError> {
+        self.with_context(context_id, |state| {
+            state
+                .mls_group
+                .group_context_extension()
+                .map_err(|e| ContextError::CryptoFailed(e.to_string()))
+        })
+    }
+
     /// Returns the per-sender epoch high-water marks for a given context.
     ///
     /// Each `(sender_did, epoch)` pair represents the highest sender key epoch

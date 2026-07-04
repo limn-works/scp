@@ -10676,6 +10676,37 @@ impl Supervisor {
                         ))
                     })?;
 
+                    // 1b. FFI-02 (§5.13.3): verify the caller-supplied `params`
+                    //     against the parameters the CREATOR cryptographically
+                    //     committed into the joined group's `scp_context_params`
+                    //     (`0xFF02`) group_context extension — folded into the MLS
+                    //     key schedule, so it is the group's own attestation of its
+                    //     governance model, capability ceiling, ceiling policy, mode,
+                    //     and context_id. `WelcomeJoinRequest.params` is UNTRUSTED
+                    //     caller input: a malicious inviter can present benign params
+                    //     while the real group differs. Run this HERE — after the
+                    //     KeyPackage is (irreversibly) consumed but BEFORE
+                    //     `install_joined_group`, `build_welcome_joiner_state`, the
+                    //     persist, and the spawn — so a mismatch installs NO crypto,
+                    //     persists NO snapshot, and registers NO actor; the only spent
+                    //     cost is the already-burned single-use KeyPackage (the same
+                    //     accepted cost as any post-consume failure). The rejected
+                    //     `joined_group` is dropped here (zeroizing its key material)
+                    //     with nothing half-installed to roll back. Passing verifies
+                    //     that `build_welcome_joiner_state` below only ever builds
+                    //     authority the group itself attests. A group with no `0xFF02`
+                    //     (not an SCP context) or any rule 2-6 mismatch is refused
+                    //     (§5.13.3 rule 1 + rules 2-6).
+                    crate::context::lifecycle_helpers::verify_scp_context_binding(
+                        joined_group
+                            .group_context_extension()
+                            .map_err(|e| e.to_string()),
+                        &context_id,
+                        &params,
+                        "spawn-from-Welcome",
+                    )
+                    .map_err(ContextError::CryptoFailed)?;
+
                     // 2. Install the joined group into the live crypto provider (Vacant-
                     //    guarded; refuses to overwrite a live group) + a locally-minted
                     //    sender key. From here the crypto is resident but the context is
@@ -14879,7 +14910,26 @@ mod tests {
             .crypto_ref()
             .expect("test supervisor has crypto")
             .clone();
-        crypto.create_mls_group(&ctx_id_bytes).unwrap();
+        // Create the group with the SAME creator-committed `scp_context_params`
+        // (`0xFF02`) extension the honest creator commits, bound to this
+        // context's id + params — so the load-time §5.13.3 binding check on the
+        // respawn path (`restore_context`) passes on this legitimate
+        // self-respawn, exactly as a real persisted group would. The snapshot's
+        // `context_params` is the state handle's `ContextParams::default()`
+        // (see `new_for_test_encrypted`), and its `context_id` is `ctx_key`, so
+        // the extension is bound to precisely those values.
+        let ctx_params = scp_protocol::context::ContextParams::default();
+        let ctx_extension = scp_protocol::context::ScpContextExtension::for_root(
+            ctx_key.clone(),
+            ctx_params.mode,
+            &ctx_params.governance,
+            ctx_params.ceiling_policy,
+            &scp_protocol::context::roles::CapabilityCeiling::new(ctx_params.ceiling.clone()),
+        )
+        .expect("build scp_context_params (0xFF02) extension for respawn fixture");
+        crypto
+            .create_mls_group_with_context(&ctx_id_bytes, &ctx_extension)
+            .unwrap();
         crypto.generate_sender_key(&ctx_id_bytes).unwrap();
 
         // The PERSISTED snapshot captures the floor at epoch 5 (the coalesced

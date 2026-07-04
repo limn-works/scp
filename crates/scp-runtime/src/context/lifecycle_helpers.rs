@@ -1715,6 +1715,66 @@ pub(in crate::context) fn restore_crypto_state_with_floor_guard(
     Ok(())
 }
 
+/// Verifies a joined or rehydrated MLS group's committed `scp_context_params`
+/// (`0xFF02`) group-context extension against the context's declared identity
+/// and parameters (spec §5.13.3, finding FFI-02).
+///
+/// This is the single binding check shared by every point where an SCP context
+/// group enters the live provider from a *caller-supplied* description of its
+/// parameters:
+///
+/// - **join** (`Supervisor::spawn_actor_from_welcome`) — the joiner reads the
+///   just-joined group's extension (before install) and verifies it against the
+///   `WelcomeJoinRequest.params` the (untrusted) inviter supplied;
+/// - **import** (`import_context`) and **restore / respawn** (`restore_context`)
+///   — the layer reads the *rehydrated* group's extension and verifies it
+///   against the snapshot's `context_params`.
+///
+/// It enforces validation **rule 1** (every SCP context group MUST carry the
+/// `0xFF02` extension) plus **rules 2–6** (`context_id`, governance / ceiling
+/// hashes, ceiling policy, mode, parent structure) via
+/// [`ScpContextExtension::verify_against`](scp_protocol::context::ScpContextExtension::verify_against).
+/// The extension is folded into the MLS key schedule at group creation, so it
+/// is the group's cryptographic attestation of its own parameters: a malicious
+/// inviter (or a forged / internally-inconsistent snapshot) that presents
+/// benign `params` while the real group commits divergent
+/// governance / ceiling / mode / `context_id` is refused here, *before* any
+/// authority (governance engine, ceiling, admin set) is built from those
+/// params.
+///
+/// `read` is the group-context-extension read outcome: `Ok(Some(ext))` =
+/// present, `Ok(None)` = absent (a rule-1 violation — not an SCP context),
+/// `Err(msg)` = the group is unreadable / the `0xFF02` payload is malformed.
+/// On rejection the returned reason is prefixed with `site` so each caller can
+/// wrap it in its site-idiomatic [`ContextError`] variant while sharing this
+/// one check. Returns `Ok(())` only when the extension is present AND every
+/// binding rule holds.
+pub(in crate::context) fn verify_scp_context_binding(
+    read: Result<Option<scp_protocol::context::ScpContextExtension>, String>,
+    context_id: &str,
+    params: &scp_protocol::context::ContextParams,
+    site: &str,
+) -> Result<(), String> {
+    match read {
+        Ok(Some(ext)) => ext
+            .verify_against(&context_id.to_owned(), params)
+            .map_err(|e| {
+                format!(
+                    "{site} refused: scp_context_params (0xFF02) binding mismatch \
+                     (§5.13.3 rules 2-6): {e}"
+                )
+            }),
+        Ok(None) => Err(format!(
+            "{site} refused: the MLS group carries no scp_context_params (0xFF02) \
+             group-context extension — not an SCP context (§5.13.3 rule 1)"
+        )),
+        Err(e) => Err(format!(
+            "{site} refused: scp_context_params (0xFF02) group-context extension \
+             unreadable (§5.13.3): {e}"
+        )),
+    }
+}
+
 /// Imports a previously exported context.
 ///
 /// Validates the export, performs the C3 per-instance wipe policy,
@@ -1902,6 +1962,37 @@ pub async fn import_context(
             &export.snapshot.mls_crypto_state,
             false,
         )?;
+    }
+
+    // §5.13.3 rule 1 (FFI-02, load-time binding). A non-empty restored crypto
+    // blob means an MLS group is now resident in the provider for this id (both
+    // step-2 branches converge here with the crypto installed). Verify that the
+    // group's committed `scp_context_params` (`0xFF02`) extension binds the SAME
+    // context_id + governance / ceiling / mode the SIGNED snapshot declares,
+    // BEFORE the authoritative `PerContextState` (governance engine, ceiling,
+    // membership) is built from those snapshot params below. The snapshot
+    // signature authenticates the EXPORTER's identity — not the internal
+    // consistency of its `context_params` field against the MLS group embedded
+    // in `mls_crypto_state`; this closes that gap. A group with no `0xFF02` (not
+    // an SCP context) or any rule 2-6 mismatch is rejected as a forged/corrupt
+    // import. On rejection tear the just-restored group + sender key back out so
+    // no forged crypto is left resident (mirrors the floor-guard's own rollback
+    // and the Welcome-join pre-install rejection). A keyless (needs-reconnect)
+    // snapshot has no resident group to bind and is skipped — its group arrives
+    // later via a reconnect Welcome, which verifies on the join path.
+    if !export.snapshot.mls_crypto_state.is_empty()
+        && let Err(reason) = verify_scp_context_binding(
+            deps.crypto
+                .group_context_extension(&ctx_id_bytes)
+                .map_err(|e| e.to_string()),
+            &context_id,
+            &export.snapshot.context_params,
+            "context import",
+        )
+    {
+        let _ = deps.crypto.destroy_mls_group(&ctx_id_bytes);
+        let _ = deps.crypto.destroy_sender_key(&ctx_id_bytes);
+        return Err(ContextError::ImportRejected { reason });
     }
 
     // 3. Import event log data if present.
@@ -2498,6 +2589,32 @@ pub async fn restore_context(
             &ctx_snapshot.mls_crypto_state,
             true,
         )?;
+
+        // §5.13.3 rule 1 (FFI-02, load-time binding). A group was just restored
+        // into the provider from the local snapshot's crypto blob. Verify its
+        // committed `scp_context_params` (`0xFF02`) extension binds the SAME
+        // context_id + governance / ceiling / mode the snapshot's
+        // `context_params` declares, BEFORE the authoritative `PerContextState`
+        // is rebuilt from those params below. This is the trusted self-respawn /
+        // process-restart path, so the primary threat is on-disk snapshot
+        // corruption/divergence (a persisted crypto blob whose embedded group no
+        // longer matches the persisted params) rather than a hostile peer — but
+        // rule 1 still holds on load: a restored group that is not a
+        // `0xFF02`-carrying SCP context, or whose committed params diverge, is a
+        // corrupt snapshot and is rejected. On rejection tear the restored group
+        // + sender key back out so no divergent crypto is left resident.
+        if let Err(reason) = verify_scp_context_binding(
+            deps.crypto
+                .group_context_extension(&ctx_id_bytes)
+                .map_err(|e| e.to_string()),
+            context_id,
+            &ctx_snapshot.context_params,
+            "context restore",
+        ) {
+            let _ = deps.crypto.destroy_mls_group(&ctx_id_bytes);
+            let _ = deps.crypto.destroy_sender_key(&ctx_id_bytes);
+            return Err(ContextError::PersistenceFailed(reason));
+        }
     }
 
     let last_members: HashSet<scp_identity::DID> = ctx_snapshot
@@ -3283,20 +3400,23 @@ mod restore_reconcile_tests {
         )
     }
 
-    /// Creates a real context of the requested mode and returns the harvested
-    /// snapshot plus its broadcast snapshot (if any).
+    /// Creates a real context of the requested mode under `ctx_id` and returns
+    /// the harvested snapshot plus its broadcast snapshot (if any).
+    ///
+    /// The context is created under the SAME `ctx_id` the caller restores it
+    /// under, so the group's creator-committed `scp_context_params` (`0xFF02`)
+    /// extension binds that exact `context_id` — exactly as a real snapshot
+    /// does. This lets the load-time §5.13.3 binding check pass on the honest
+    /// round-trip (so the test then exercises the routing/mode reconciliation it
+    /// targets) instead of tripping on an unrealistic id/extension divergence.
     async fn harvest_snapshot(
+        ctx_id: &str,
         is_broadcast: bool,
     ) -> (ContextSnapshot, Option<BroadcastContextSnapshot>) {
         let capture = Arc::new(CapturingPersistence::default());
         // Box the same Arc-backed capture so we can both write (via supervisor)
         // and read (via this handle) the harvested snapshot.
         let supervisor = build_supervisor(Box::new(SharedCapture(Arc::clone(&capture))));
-        let ctx_id = if is_broadcast {
-            "harvest-bcast"
-        } else {
-            "harvest-enc"
-        };
         let params = if is_broadcast {
             ContextParams {
                 mode: ContextMode::Broadcast,
@@ -3363,12 +3483,13 @@ mod restore_reconcile_tests {
     /// persisted routing variant is `Broadcast` → fail closed.
     #[tokio::test]
     async fn restore_rejects_broadcast_routing_on_encrypted_reconstruction() {
-        let (enc_snapshot, _) = harvest_snapshot(false).await;
+        let ctx_id = "restore-case-broadcast-routing-encrypted-mode";
+        let (enc_snapshot, _) = harvest_snapshot(ctx_id, false).await;
         let err = restore_with(
             enc_snapshot,
             ContextRouting::for_mode(true, [0u8; 32]),
             None,
-            "restore-case-broadcast-routing-encrypted-mode",
+            ctx_id,
         )
         .await
         .expect_err("routing/mode disagreement must fail closed");
@@ -3382,13 +3503,14 @@ mod restore_reconcile_tests {
     /// but the persisted routing variant is `Pseudonymous` → fail closed.
     #[tokio::test]
     async fn restore_rejects_pseudonymous_routing_on_broadcast_reconstruction() {
-        let (bcast_snapshot, bcast_state) = harvest_snapshot(true).await;
+        let ctx_id = "restore-case-pseudonymous-routing-broadcast-mode";
+        let (bcast_snapshot, bcast_state) = harvest_snapshot(ctx_id, true).await;
         let bcast_state = bcast_state.expect("broadcast create must persist broadcast state");
         let err = restore_with(
             bcast_snapshot,
             ContextRouting::for_mode(false, [9u8; 32]),
             Some(bcast_state),
-            "restore-case-pseudonymous-routing-broadcast-mode",
+            ctx_id,
         )
         .await
         .expect_err("routing/mode disagreement must fail closed");
@@ -3403,16 +3525,12 @@ mod restore_reconcile_tests {
     /// broadcast state) → restore succeeds.
     #[tokio::test]
     async fn restore_succeeds_when_routing_agrees_with_mode() {
-        let (enc_snapshot, _) = harvest_snapshot(false).await;
+        let ctx_id = "restore-case-agreeing-encrypted";
+        let (enc_snapshot, _) = harvest_snapshot(ctx_id, false).await;
         let routing = enc_snapshot.routing.clone();
-        restore_with(
-            enc_snapshot,
-            routing,
-            None,
-            "restore-case-agreeing-encrypted",
-        )
-        .await
-        .expect("routing agreeing with mode must restore Ok");
+        restore_with(enc_snapshot, routing, None, ctx_id)
+            .await
+            .expect("routing agreeing with mode must restore Ok");
     }
 
     /// Restore must reject a persisted snapshot whose ceiling carries a malformed
@@ -3422,7 +3540,8 @@ mod restore_reconcile_tests {
     /// silently rehydrated.
     #[tokio::test]
     async fn restore_rejects_malformed_ceiling_entry() {
-        let (mut enc_snapshot, _) = harvest_snapshot(false).await;
+        let ctx_id = "restore-case-malformed-ceiling";
+        let (mut enc_snapshot, _) = harvest_snapshot(ctx_id, false).await;
         let routing = enc_snapshot.routing.clone();
         // Inject a malformed (no-colon) custom directly into the backing set via
         // the test-only ceiling accessor, bypassing the construction invariant the
@@ -3434,14 +3553,9 @@ mod restore_reconcile_tests {
             .insert(scp_protocol::context::roles::Capability::Custom(
                 "payments".to_owned(),
             ));
-        let err = restore_with(
-            enc_snapshot,
-            routing,
-            None,
-            "restore-case-malformed-ceiling",
-        )
-        .await
-        .expect_err("a malformed restored ceiling must fail closed");
+        let err = restore_with(enc_snapshot, routing, None, ctx_id)
+            .await
+            .expect_err("a malformed restored ceiling must fail closed");
         assert!(
             matches!(err, ContextError::PersistenceFailed(ref msg) if msg.contains("malformed")),
             "expected a PersistenceFailed citing the malformed ceiling, got {err:?}"
