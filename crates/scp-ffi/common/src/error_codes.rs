@@ -811,17 +811,24 @@ pub const VALID_7057: &str = "SCP-VALID-7057";
 pub const VALID_7058: &str = "SCP-VALID-7058";
 /// Participation record validation error (§7.3.2).
 pub const VALID_7059: &str = "SCP-VALID-7059";
-/// Discovery validation error.
+/// Trust aggregation result-parse error (Swift-SDK-emitted: the typed
+/// `aggregateTrustInput` wrapper could not parse the bridge's result JSON).
 pub const VALID_7060: &str = "SCP-VALID-7060";
-/// Discovery member validation error.
+/// Trust-admission input encoding error (Swift-SDK-emitted: the shared
+/// trust-admission encoder failed to produce UTF-8 JSON).
 pub const VALID_7061: &str = "SCP-VALID-7061";
-/// Discovery context validation error.
+/// `ParticipationProfile` byte-length validation error (Swift-SDK-emitted:
+/// `eventLogRoot`/`signerPublicKey` must be 32 bytes, `signature` 64 bytes).
 pub const VALID_7062: &str = "SCP-VALID-7062";
-/// Discovery register validation error.
+/// `ChallengeVerification` byte-length validation error (Swift-SDK-emitted:
+/// `verifierSignature` must be 64 bytes).
 pub const VALID_7063: &str = "SCP-VALID-7063";
-/// Discovery unregister validation error.
+/// Aggregate-trust-input byte-length validation error (Swift-SDK-emitted:
+/// `EventLogEntry.prevHash` and the Merkle root must be 32 bytes,
+/// `EventLogEntry.signature` 64 bytes).
 pub const VALID_7064: &str = "SCP-VALID-7064";
-/// Discovery query validation error.
+/// Challenge verify-input byte-length validation error (Swift-SDK-emitted:
+/// `ChallengeRequest`/`ChallengeResponse` `signature` must be 64 bytes).
 pub const VALID_7065: &str = "SCP-VALID-7065";
 /// Discovery probe validation error.
 pub const VALID_7066: &str = "SCP-VALID-7066";

@@ -637,6 +637,24 @@ ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
         "kotlin": ["participationRecord"],
         "swift": ["participationRecord"],
     },
+    ("Trust", "trust_create_challenge"): {
+        "python": ["trust_create_challenge"],
+        "typescript": ["trustCreateChallenge"],
+        "kotlin": ["trustCreateChallenge"],
+        "swift": ["trustCreateChallenge"],
+    },
+    ("Trust", "trust_verify_attestation"): {
+        "python": ["trust_verify_attestation"],
+        "typescript": ["trustVerifyAttestation"],
+        "kotlin": ["trustVerifyAttestation"],
+        "swift": ["trustVerifyAttestation"],
+    },
+    ("Trust", "trust_verify_response"): {
+        "python": ["trust_verify_response"],
+        "typescript": ["trustVerifyResponse"],
+        "kotlin": ["trustVerifyResponse"],
+        "swift": ["trustVerifyResponse"],
+    },
     # Discovery -- bare/different names across SDKs
     ("Discovery", "parse_address"): {
         "python": ["parse_address"],

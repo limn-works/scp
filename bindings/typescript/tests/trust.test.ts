@@ -20,18 +20,31 @@
 
 import { afterEach, describe, expect, it } from "bun:test";
 import type {
+  AttestorInfo,
   CachedAttestation,
+  CachedAttestationEnvelope,
   CapabilityRequirement,
   CapabilityValidation,
+  ChallengeRequest,
+  ChallengeResponse,
   ChallengeVerification,
+  EventLogEntry,
   ParticipationProfile,
   RequireParticipation,
+  ThresholdRequirement,
 } from "../src/types";
 import {
+  encodeAttestation,
+  encodeAttestorSets,
   encodeCapabilityRequirements,
+  encodeChallengeRequest,
+  encodeChallengeResponse,
   encodeChallengeVerifications,
+  encodeEventLogEntries,
+  encodeMerkleRoot,
   encodeParticipationProfile,
   encodeRequireParticipation,
+  encodeThresholdRequirements,
 } from "../src/types";
 import { createMockNativeScp, mountMockScp } from "./mock-bridge";
 
@@ -729,5 +742,388 @@ describe("encodeChallengeVerifications", () => {
     expect(() =>
       encodeChallengeVerifications([{ ...base, verifierSignature: Array(63).fill(9) }]),
     ).toThrow("ChallengeVerification.verifierSignature must be exactly 64 elements, got 63");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Trust aggregation input encoders + call-through (§7.3, ADR-058)
+// ---------------------------------------------------------------------------
+
+/** A structurally-valid `EventLogEntry` with real 32/64 byte arrays. */
+function makeEventLogEntry(overrides: Partial<EventLogEntry> = {}): EventLogEntry {
+  return {
+    eventType: "MessageSent",
+    actorDid: "did:dht:actor",
+    timestamp: 1_700_000_000,
+    sequence: 0,
+    payload: { data: [] },
+    prevHash: Array.from({ length: 32 }, () => 0),
+    signature: Array.from({ length: 64 }, () => 5),
+    ...overrides,
+  };
+}
+
+describe("encodeEventLogEntries", () => {
+  it("emits the full 7-field snake_case signed event", () => {
+    const parsed = JSON.parse(
+      encodeEventLogEntries([
+        makeEventLogEntry({
+          payload: { data: [1, 2, 3] },
+          prevHash: Array.from({ length: 32 }, (_, i) => i),
+        }),
+      ]),
+    );
+    expect(parsed).toEqual([
+      {
+        event_type: "MessageSent",
+        actor_did: "did:dht:actor",
+        timestamp: 1_700_000_000,
+        sequence: 0,
+        payload: { data: [1, 2, 3] },
+        prev_hash: Array.from({ length: 32 }, (_, i) => i),
+        signature: Array.from({ length: 64 }, () => 5),
+      },
+    ]);
+  });
+
+  it("rejects wrong-length prevHash / signature before any bridge call", () => {
+    expect(() => encodeEventLogEntries([makeEventLogEntry({ prevHash: [1, 2, 3] })])).toThrow(
+      "EventLogEntry.prevHash must be exactly 32 elements, got 3",
+    );
+    expect(() =>
+      encodeEventLogEntries([makeEventLogEntry({ signature: Array(63).fill(5) })]),
+    ).toThrow("EventLogEntry.signature must be exactly 64 elements, got 63");
+  });
+});
+
+describe("encodeMerkleRoot", () => {
+  it("passes a 32-byte root through as a number array", () => {
+    const root = Array.from({ length: 32 }, (_, i) => i);
+    expect(JSON.parse(encodeMerkleRoot(root))).toEqual(root);
+  });
+
+  it("rejects a wrong-length root before any bridge call", () => {
+    expect(() => encodeMerkleRoot([1, 2, 3])).toThrow(
+      "AggregationInput.merkleRoot must be exactly 32 elements, got 3",
+    );
+  });
+});
+
+describe("encodeThresholdRequirements", () => {
+  it("keys by bare AttestationType strings and snake_cases the fields", () => {
+    const requirements: Partial<Record<string, ThresholdRequirement>> = {
+      Endorsement: {
+        requiredCount: 2,
+        totalAttestors: 3,
+        independenceThreshold: 0.5,
+        sharedContextPenalty: 0.2,
+        sharedContextPenaltyCap: 0.6,
+        mutualEndorsementPenalty: 0.3,
+      },
+    };
+    expect(JSON.parse(encodeThresholdRequirements(requirements))).toEqual({
+      Endorsement: {
+        required_count: 2,
+        total_attestors: 3,
+        independence_threshold: 0.5,
+        shared_context_penalty: 0.2,
+        shared_context_penalty_cap: 0.6,
+        mutual_endorsement_penalty: 0.3,
+      },
+    });
+  });
+
+  it("fills the three penalty fields with the Rust serde defaults when omitted", () => {
+    const parsed = JSON.parse(
+      encodeThresholdRequirements({
+        AgentCapability: { requiredCount: 1, totalAttestors: 1, independenceThreshold: 0 },
+      }),
+    );
+    expect(parsed.AgentCapability.shared_context_penalty).toBe(0.1);
+    expect(parsed.AgentCapability.shared_context_penalty_cap).toBe(0.5);
+    expect(parsed.AgentCapability.mutual_endorsement_penalty).toBe(0.2);
+  });
+});
+
+describe("encodeAttestorSets", () => {
+  it("encodes attestors with an explicit-null absent attestation", () => {
+    const attestor: AttestorInfo = {
+      did: "did:dht:attestor",
+      contextMemberships: ["ctx-1", "ctx-2"],
+      endorsements: ["did:dht:other"],
+    };
+    expect(JSON.parse(encodeAttestorSets({ Endorsement: [attestor] }))).toEqual({
+      Endorsement: [
+        {
+          did: "did:dht:attestor",
+          context_memberships: ["ctx-1", "ctx-2"],
+          endorsements: ["did:dht:other"],
+          attestation: null,
+        },
+      ],
+    });
+  });
+
+  it("encodes a nested attestation envelope in the serde snake_case shape", () => {
+    const attestor: AttestorInfo = {
+      did: "did:dht:attestor",
+      contextMemberships: [],
+      endorsements: [],
+      attestation: {
+        id: "att-1",
+        attestationType: "Endorsement",
+        issuer: "did:dht:attestor",
+        subject: "did:dht:subject",
+        claim: { endorsed: true },
+        issuedAt: 1000,
+        revocationStatus: "Active",
+        signature: [1, 2, 3],
+      },
+    };
+    const parsed = JSON.parse(encodeAttestorSets({ Endorsement: [attestor] }));
+    expect(parsed.Endorsement[0].attestation).toEqual({
+      id: "att-1",
+      attestation_type: "Endorsement",
+      issuer: "did:dht:attestor",
+      subject: "did:dht:subject",
+      claim: { endorsed: true },
+      issued_at: 1000,
+      revocation_status: "Active",
+      signature: [1, 2, 3],
+    });
+  });
+});
+
+describe("scp.aggregateTrustInput — typed trust-aggregation inputs (§7.3)", () => {
+  let cleanup: (() => Promise<void>) | undefined;
+  afterEach(async () => {
+    await cleanup?.();
+    cleanup = undefined;
+  });
+
+  it("serializes every typed input to the serde wire shape before crossing FFI", async () => {
+    const { scp, native } = mountMockScp();
+    cleanup = () => scp.shutdown(0);
+    native.__stub("aggregateTrustInput", () => "{}");
+
+    const events = [makeEventLogEntry()];
+    const merkleRoot = Array.from({ length: 32 }, () => 7);
+    const challengeResults: readonly ChallengeVerification[] = [
+      {
+        verificationId: "v-1",
+        verifierDid: "did:dht:zVerifier",
+        subjectDid: "did:dht:subject",
+        capabilityUri: "scp:capability:schema-validation/v1",
+        challengeType: "scp:capability:schema-validation/v1",
+        verificationMethod: { kind: "SelfAttested" },
+        passed: true,
+        testCount: 1,
+        passCount: 1,
+        result: true,
+        completedAt: 1_700_000_000,
+        verifiedAt: 1_700_000_000,
+        expiresAt: 4_000_000_000,
+        verifierSignature: Array.from({ length: 64 }, () => 9),
+      },
+    ];
+
+    const result = scp.aggregateTrustInput(
+      "ctx-1",
+      "did:dht:subject",
+      events,
+      merkleRoot,
+      [],
+      { Endorsement: { requiredCount: 1, totalAttestors: 1, independenceThreshold: 0 } },
+      { Endorsement: [{ did: "did:dht:a", contextMemberships: [], endorsements: [] }] },
+      [],
+      challengeResults,
+    );
+    expect(result).toBe("{}");
+
+    // The native bridge receives serde-canonical JSON strings, not the typed
+    // objects — the SDK serializes internally (ADR-058).
+    const call = native.__lastCall("aggregateTrustInput");
+    expect(call?.args[0]).toBe("ctx-1");
+    expect(call?.args[1]).toBe("did:dht:subject");
+    expect(call?.args[2]).toBe(encodeEventLogEntries(events));
+    expect(call?.args[3]).toBe(JSON.stringify(merkleRoot));
+    expect(call?.args[4]).toBe("[]");
+    expect(JSON.parse(call?.args[5] as string)).toEqual({
+      Endorsement: {
+        required_count: 1,
+        total_attestors: 1,
+        independence_threshold: 0,
+        shared_context_penalty: 0.1,
+        shared_context_penalty_cap: 0.5,
+        mutual_endorsement_penalty: 0.2,
+      },
+    });
+    expect(JSON.parse(call?.args[6] as string)).toEqual({
+      Endorsement: [
+        { did: "did:dht:a", context_memberships: [], endorsements: [], attestation: null },
+      ],
+    });
+    expect(call?.args[7]).toBe("[]");
+    expect(call?.args[8]).toBe(encodeChallengeVerifications(challengeResults));
+  });
+
+  it("defaults every optional collection to an empty wire value", async () => {
+    const { scp, native } = mountMockScp();
+    cleanup = () => scp.shutdown(0);
+    native.__stub("aggregateTrustInput", () => "{}");
+
+    scp.aggregateTrustInput(
+      "ctx-1",
+      "did:dht:subject",
+      [],
+      Array.from({ length: 32 }, () => 0),
+    );
+
+    const call = native.__lastCall("aggregateTrustInput");
+    expect(call?.args.slice(2)).toEqual([
+      "[]",
+      JSON.stringify(Array.from({ length: 32 }, () => 0)),
+      "[]",
+      "{}",
+      "{}",
+      "[]",
+      "[]",
+    ]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Challenge trust-input encoders + call-through (§7.3.4, ADR-058)
+// ---------------------------------------------------------------------------
+
+/** A structurally-valid attestation envelope. */
+const attestationEnvelope: CachedAttestationEnvelope = {
+  id: "att-1",
+  attestationType: "AgentCapability",
+  issuer: "did:dht:issuer",
+  subject: "did:dht:subject",
+  claim: { capability: "scp:capability:schema-validation/v1" },
+  issuedAt: 1_700_000_000,
+  revocationStatus: "Active",
+  signature: Array.from({ length: 64 }, () => 3),
+};
+
+/** A structurally-valid ChallengeRequest with a real 64-byte signature. */
+function makeChallengeRequest(overrides: Partial<ChallengeRequest> = {}): ChallengeRequest {
+  return {
+    challengeId: "chal-1",
+    challengeType: "scp:capability:schema-validation/v1",
+    challengerDid: "did:dht:challenger",
+    subjectDid: "did:dht:subject",
+    capabilityUri: "scp:capability:schema-validation/v1",
+    parameters: { schema: "object" },
+    timeout: { secs: 300, nanos: 0 },
+    signature: Array.from({ length: 64 }, () => 8),
+    ...overrides,
+  };
+}
+
+/** A structurally-valid ChallengeResponse with a real 64-byte signature. */
+function makeChallengeResponse(overrides: Partial<ChallengeResponse> = {}): ChallengeResponse {
+  return {
+    challengeId: "chal-1",
+    responderDid: "did:dht:subject",
+    result: { passed: true },
+    completedAt: 1_700_000_100,
+    signature: Array.from({ length: 64 }, () => 4),
+    ...overrides,
+  };
+}
+
+describe("encodeAttestation", () => {
+  it("emits the single-envelope serde snake_case shape", () => {
+    expect(JSON.parse(encodeAttestation(attestationEnvelope))).toEqual({
+      id: "att-1",
+      attestation_type: "AgentCapability",
+      issuer: "did:dht:issuer",
+      subject: "did:dht:subject",
+      claim: { capability: "scp:capability:schema-validation/v1" },
+      issued_at: 1_700_000_000,
+      revocation_status: "Active",
+      signature: Array.from({ length: 64 }, () => 3),
+    });
+  });
+});
+
+describe("encodeChallengeRequest", () => {
+  it("emits the full 8-field snake_case record with a Duration timeout", () => {
+    expect(JSON.parse(encodeChallengeRequest(makeChallengeRequest()))).toEqual({
+      challenge_id: "chal-1",
+      challenge_type: "scp:capability:schema-validation/v1",
+      challenger_did: "did:dht:challenger",
+      subject_did: "did:dht:subject",
+      capability_uri: "scp:capability:schema-validation/v1",
+      parameters: { schema: "object" },
+      timeout: { secs: 300, nanos: 0 },
+      signature: Array.from({ length: 64 }, () => 8),
+    });
+  });
+
+  it("rejects a wrong-length signature before any bridge call", () => {
+    expect(() => encodeChallengeRequest(makeChallengeRequest({ signature: [1, 2, 3] }))).toThrow(
+      "ChallengeRequest.signature must be exactly 64 elements, got 3",
+    );
+  });
+});
+
+describe("encodeChallengeResponse", () => {
+  it("emits the full 5-field snake_case record", () => {
+    expect(JSON.parse(encodeChallengeResponse(makeChallengeResponse()))).toEqual({
+      challenge_id: "chal-1",
+      responder_did: "did:dht:subject",
+      result: { passed: true },
+      completed_at: 1_700_000_100,
+      signature: Array.from({ length: 64 }, () => 4),
+    });
+  });
+
+  it("rejects a wrong-length signature before any bridge call", () => {
+    expect(() =>
+      encodeChallengeResponse(makeChallengeResponse({ signature: Array(63).fill(4) })),
+    ).toThrow("ChallengeResponse.signature must be exactly 64 elements, got 63");
+  });
+});
+
+describe("scp.trustVerifyAttestation / scp.trustVerifyResponse — typed challenge inputs", () => {
+  let cleanup: (() => Promise<void>) | undefined;
+  afterEach(async () => {
+    await cleanup?.();
+    cleanup = undefined;
+  });
+
+  it("serializes the typed attestation envelope before crossing FFI", async () => {
+    const { scp, native } = mountMockScp();
+    cleanup = () => scp.shutdown(0);
+    native.__stub("trustVerifyAttestation", () => ({
+      valid: false,
+      chainDepth: 0,
+      errorMessage: "unresolvable issuer",
+    }));
+
+    scp.trustVerifyAttestation(attestationEnvelope);
+    const call = native.__lastCall("trustVerifyAttestation");
+    expect(call?.args).toEqual([encodeAttestation(attestationEnvelope)]);
+  });
+
+  it("serializes the typed challenge request and response before crossing FFI", async () => {
+    const { scp, native } = mountMockScp();
+    cleanup = () => scp.shutdown(0);
+    native.__stub("trustVerifyResponse", () => false);
+
+    const challenge = makeChallengeRequest();
+    const response = makeChallengeResponse();
+    const result = scp.trustVerifyResponse(challenge, response);
+    expect(result).toBe(false);
+
+    const call = native.__lastCall("trustVerifyResponse");
+    expect(call?.args).toEqual([
+      encodeChallengeRequest(challenge),
+      encodeChallengeResponse(response),
+    ]);
   });
 });

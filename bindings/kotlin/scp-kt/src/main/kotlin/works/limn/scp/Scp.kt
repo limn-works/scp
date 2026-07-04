@@ -366,29 +366,53 @@ class SCP internal constructor(
             knownContextsJson = knownContextsJson,
         )
 
-    /** Forwards to [NativeScp.aggregateTrustInput] on [inner]. */
+    /**
+     * Aggregates all trust engine layers into a single `TrustInput` (§7.3).
+     *
+     * Every structured input is typed; the SDK serializes to the serde wire
+     * shapes internally (ADR-058) via the TrustAggregate.kt encoders and
+     * forwards to [NativeScp.aggregateTrustInput] on [inner] unchanged. An
+     * empty collection is a real value ("no rules apply"), never a request
+     * for defaults — the bridge receives `[]` / `{}` exactly as passed.
+     *
+     * @param contextId The context to aggregate trust inputs for.
+     * @param subjectDid The DID of the subject to evaluate.
+     * @param events Full signed event-log entries ([EventLogEntry]).
+     * @param merkleRoot 32-byte Merkle root.
+     * @param consequenceRules Typed [ConsequenceRule] values.
+     * @param thresholdRequirements Typed [ThresholdRequirement] values keyed
+     *   by [AttestationType].
+     * @param attestorSets Typed [AttestorInfo] lists keyed by
+     *   [AttestationType].
+     * @param cachedAttestations Typed [CachedAttestation] values to seed the
+     *   bridge's trust store.
+     * @param challengeResults Typed [ChallengeVerification] records.
+     * @return The aggregated `TrustInput` as a JSON string.
+     * @throws IllegalArgumentException on a wrong-length byte array (before
+     *   any bridge call).
+     */
     @Suppress("LongParameterList")
     fun aggregateTrustInput(
         contextId: String,
         subjectDid: String,
-        eventsJson: String,
-        merkleRootJson: String,
-        consequenceRulesJson: String,
-        thresholdRequirementsJson: String,
-        attestorSetsJson: String,
-        cachedAttestationsJson: String,
-        challengeResultsJson: String,
+        events: List<EventLogEntry>,
+        merkleRoot: List<UByte>,
+        consequenceRules: List<ConsequenceRule> = emptyList(),
+        thresholdRequirements: Map<AttestationType, ThresholdRequirement> = emptyMap(),
+        attestorSets: Map<AttestationType, List<AttestorInfo>> = emptyMap(),
+        cachedAttestations: List<CachedAttestation> = emptyList(),
+        challengeResults: List<ChallengeVerification> = emptyList(),
     ): String =
         inner.aggregateTrustInput(
             contextId = contextId,
             subjectDid = subjectDid,
-            eventsJson = eventsJson,
-            merkleRootJson = merkleRootJson,
-            consequenceRulesJson = consequenceRulesJson,
-            thresholdRequirementsJson = thresholdRequirementsJson,
-            attestorSetsJson = attestorSetsJson,
-            cachedAttestationsJson = cachedAttestationsJson,
-            challengeResultsJson = challengeResultsJson,
+            eventsJson = encodeEventLogEntriesJson(events),
+            merkleRootJson = encodeMerkleRootJson(merkleRoot),
+            consequenceRulesJson = encodeConsequenceRulesJson(consequenceRules),
+            thresholdRequirementsJson = encodeThresholdRequirementsJson(thresholdRequirements),
+            attestorSetsJson = encodeAttestorSetsJson(attestorSets),
+            cachedAttestationsJson = encodeCachedAttestationsJson(cachedAttestations),
+            challengeResultsJson = encodeChallengeVerificationsJson(challengeResults),
         )
 
     /** Forwards to [NativeScp.applyPendingCeilingModification] on [inner]. */
@@ -1701,23 +1725,36 @@ class SCP internal constructor(
         )
 
     /**
-     * Routes through the UniFFI-generated free function
-     * [uniffi.scp.trustVerifyAttestation]. ADR-048 §1 + §7 Kotlin
-     * bullet.
+     * Verifies an attestation's Ed25519 signature, evidence, expiry, and
+     * revocation status (ADR-017, §7.4). Takes the typed attestation envelope
+     * ([CachedAttestationEnvelope]) and serializes it to the serde wire shape
+     * internally (ADR-058), then routes through the UniFFI-generated free
+     * function [uniffi.scp.trustVerifyAttestation] unchanged. ADR-048 §1 + §7
+     * Kotlin bullet.
      */
-    fun trustVerifyAttestation(attestationJson: String): AttestationVerificationResult =
+    fun trustVerifyAttestation(attestation: CachedAttestationEnvelope): AttestationVerificationResult =
         uniffi.scp.trustVerifyAttestation(
-            attestationJson = attestationJson,
+            attestationJson = encodeAttestationJson(attestation),
         )
 
-    /** Forwards to [NativeScp.trustVerifyResponse] on [inner]. */
+    /**
+     * Verifies a challenge response against its original challenge request
+     * (ADR-017, §7.3.4). Takes the typed [ChallengeRequest] /
+     * [ChallengeResponse] and serializes them to the serde wire shapes
+     * internally (ADR-058), then forwards to [NativeScp.trustVerifyResponse]
+     * on [inner] unchanged. Returns `true` if the response is valid (correct
+     * responder, within timeout, valid signature), `false` otherwise.
+     *
+     * @throws IllegalArgumentException on a wrong-length signature (before
+     *   any bridge call).
+     */
     fun trustVerifyResponse(
-        challengeJson: String,
-        responseJson: String,
+        challenge: ChallengeRequest,
+        response: ChallengeResponse,
     ): Boolean =
         inner.trustVerifyResponse(
-            challengeJson = challengeJson,
-            responseJson = responseJson,
+            challengeJson = encodeChallengeRequestJson(challenge),
+            responseJson = encodeChallengeResponseJson(response),
         )
 
     /**
