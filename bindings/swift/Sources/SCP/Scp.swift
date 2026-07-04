@@ -1132,31 +1132,17 @@ public extension SCP {
         try await inner.ucanValidate(handle: handle, token: token, capability: capability, presentingAgentDid: presentingAgentDid, proofTokens: proofTokens)
     }
 
-    // `verifyParticipationRequirements` moved to a UniFFI-generated free
-    // top-level function under ADR-048 §1 + §7 Swift bullet. Call it
-    // directly (`expectedSubject` is the security-critical DID of the agent
-    // being admitted — only profiles whose signed `subject_did` equals it
-    // contribute to any accounting):
-    //   `try verifyParticipationRequirements(expectedSubject:requirementsJson:profileJson:)`
-    //
-    // Security caveat — authenticity is not authorization: this verifies
-    // signatures over the subject binding, not signer legitimacy
-    // (`signerPublicKey` is self-certifying; a subject can present
-    // genuinely-signed profiles from signers it controls, inflating
-    // `minContexts`). Establish signer legitimacy separately (trusted-signer
-    // set, context-membership proof, or the §7.3.5 threshold/independence
-    // path); do not treat success as an authorization decision.
-
-    // `checkCapabilityRequirements` is likewise a UniFFI-generated free
-    // top-level function (§7.3.4.4, SCP-ACR-008). Call it directly
-    // (`subjectDid`/`contextId` bind challenge verifications to the agent and
-    // context being admitted — a genuine result minted for another
-    // subject/context cannot admit this agent):
-    //   `try checkCapabilityRequirements(contextId:subjectDid:requirementsJson:agentCapabilitiesJson:challengeVerificationsJson:)`
-    //
-    // Security caveat — authenticity is not authorization: a passing
-    // `ChallengeVerified` check proves the verifier's signature is authentic
-    // and bound to this subject/context, not that the verifier is *trusted*
-    // (`verifierDid` is self-certifying). Establish verifier legitimacy
-    // separately; do not treat success as an authorization decision.
+    // `verifyParticipationRequirements` and `checkCapabilityRequirements` are
+    // UniFFI-generated free top-level functions (ADR-048 §1 + §7 Swift bullet,
+    // §7.3.2.1 / §7.3.4.4, SCP-ACR-008). The SDK also exposes typed free-function
+    // overloads in `Trust.swift` (ADR-058) that take typed `RequireParticipation`
+    // / `ParticipationProfile` / `CapabilityRequirement` / `ChallengeVerification`
+    // values and serialize them to the serde wire shape internally — prefer those
+    // over hand-rolled JSON:
+    //   `try verifyParticipationRequirements(expectedSubject:requirements:profiles:)`
+    //   `try checkCapabilityRequirements(contextId:subjectDid:requirements:agentCapabilities:challengeVerifications:)`
+    // (`expectedSubject` — and `subjectDid`/`contextId` — bind the accounting to
+    // the agent/context being admitted; a genuine profile/result minted for
+    // another subject/context cannot admit this agent). See those wrappers'
+    // doc-comments for the full authenticity-is-not-authorization caveat.
 }

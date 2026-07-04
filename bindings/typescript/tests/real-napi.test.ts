@@ -23,7 +23,7 @@ import type { BridgeMode } from "../src/bridge";
 import { ContextError } from "../src/errors";
 import { __getNativeScp, SCP } from "../src/scp";
 import type { Relay } from "../src/server";
-import type { BehavioralRecord } from "../src/types";
+import type { BehavioralRecord, CapabilityRequirement, ParticipationProfile } from "../src/types";
 import { allValid } from "../src/types";
 
 /**
@@ -2865,6 +2865,99 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       const decoded = JSON.parse(new TextDecoder().decode(result.output as Uint8Array));
       expect(decoded).toBeTruthy();
       expect(decoded.validated_input).toEqual({ a: "x", b: "y" });
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Typed trust-input admission (ADR-058, SCP-1991)
+  //
+  // The SDK `checkCapabilityRequirements` / `verifyParticipationRequirements`
+  // methods take typed inputs and serialize them internally to the serde wire
+  // shape. These e2e tests drive the typed API through the real napi addon so
+  // the encoders are exercised against the actual `serde_json::from_str`
+  // deserializers in crates/scp-ffi/napi/src/trust.rs — a shape mismatch would
+  // surface as a parse error here, not just in the mock unit tests.
+  // ---------------------------------------------------------------------------
+  describe("Typed trust-input admission (real NAPI, ADR-058)", () => {
+    test("checkCapabilityRequirements: SelfAttested requirement met by a declared capability", () => {
+      const requirements: readonly CapabilityRequirement[] = [
+        { capability: "scp:capability:schema-validation/v1", verificationLevel: "SelfAttested" },
+      ];
+      // A SelfAttested requirement is satisfied by the declared capability with
+      // no challenge verification — the typed inputs round-trip through the
+      // bridge deserializers and admission succeeds (returns void, no throw).
+      expect(() =>
+        scpInstance.checkCapabilityRequirements(
+          "ctx-admission",
+          "did:dht:zSubject",
+          requirements,
+          ["scp:capability:schema-validation/v1"],
+          [],
+        ),
+      ).not.toThrow();
+    });
+
+    test("checkCapabilityRequirements: missing SelfAttested capability is rejected", () => {
+      const requirements: readonly CapabilityRequirement[] = [
+        { capability: "scp:capability:schema-validation/v1", verificationLevel: "SelfAttested" },
+      ];
+      expect(() =>
+        scpInstance.checkCapabilityRequirements(
+          "ctx-admission",
+          "did:dht:zSubject",
+          requirements,
+          [],
+          [],
+        ),
+      ).toThrow();
+    });
+
+    test("verifyParticipationRequirements: valid profile + empty requirements round-trips", () => {
+      // A structurally-valid profile (real 32/32/64 byte arrays) deserializes
+      // cleanly on the Rust side; with no requirements, verification is a no-op
+      // success — this exercises the full ParticipationProfile encoder path.
+      const profile: ParticipationProfile = {
+        subjectDid: "did:dht:zSubject",
+        participationDurationSecs: 3_600,
+        governanceActionsAgainst: 0,
+        governanceActionsBy: 1,
+        toolInvocationCount: 150,
+        toolInvocationCountAnchored: false,
+        contextCreationCount: 2,
+        roleProgressionCount: 3,
+        attestationCount: 4,
+        updatedAt: 1_700_000_000,
+        eventLogRoot: Array.from({ length: 32 }, (_, i) => i),
+        signerPublicKey: Array.from({ length: 32 }, (_, i) => i + 100),
+        signature: Array.from({ length: 64 }, () => 0),
+      };
+      expect(() =>
+        scpInstance.verifyParticipationRequirements("did:dht:zSubject", [], [profile]),
+      ).not.toThrow();
+    });
+
+    test("verifyParticipationRequirements: wrong-length signature byte array is rejected", () => {
+      // The Rust `signature: [u8; 64]` field rejects a 63-element array at
+      // deserialize time — byte-array length validation is enforced by the
+      // core serde types, surfaced through the typed encoder path.
+      const malformed: ParticipationProfile = {
+        subjectDid: "did:dht:zSubject",
+        participationDurationSecs: 3_600,
+        governanceActionsAgainst: 0,
+        governanceActionsBy: 0,
+        toolInvocationCount: 0,
+        toolInvocationCountAnchored: false,
+        contextCreationCount: 0,
+        roleProgressionCount: 0,
+        attestationCount: 0,
+        updatedAt: 1_700_000_000,
+        eventLogRoot: Array.from({ length: 32 }, () => 0),
+        signerPublicKey: Array.from({ length: 32 }, () => 0),
+        signature: Array.from({ length: 63 }, () => 0),
+      };
+      expect(() =>
+        scpInstance.verifyParticipationRequirements("did:dht:zSubject", [], [malformed]),
+      ).toThrow();
     });
   });
 }

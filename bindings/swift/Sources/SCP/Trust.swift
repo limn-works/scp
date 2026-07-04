@@ -914,3 +914,660 @@ public extension SCP {
         )
     }
 }
+
+// MARK: - Participation admission types (§7.3.2.1, SCP-BA-004, ADR-058)
+
+/// Which category of participation fact to evaluate for admission.
+///
+/// Each variant corresponds to one of the 7 fact categories in a
+/// ``ParticipationProfile``. Encodes to the bare PascalCase variant name string
+/// (`"ParticipationDuration"`, …) to match the Rust `ParticipationFact` enum's
+/// default (externally-tagged) serde representation. Mirrors the TypeScript SDK
+/// `ParticipationFact` union and the Python SDK enum 1:1.
+///
+/// See §7.3.2.1.
+public nonisolated enum ParticipationFact: String, Codable, Sendable, Equatable, CaseIterable {
+    /// Total seconds of context participation.
+    case participationDuration = "ParticipationDuration"
+    /// Count of governance actions taken against the identity.
+    case governanceActionsAgainst = "GovernanceActionsAgainst"
+    /// Count of governance actions initiated by the identity.
+    case governanceActionsBy = "GovernanceActionsBy"
+    /// Total tool invocations across all tool types.
+    case toolInvocationCount = "ToolInvocationCount"
+    /// Number of contexts created.
+    case contextCreationCount = "ContextCreationCount"
+    /// Number of role transitions.
+    case roleProgressionCount = "RoleProgressionCount"
+    /// Number of attestation events.
+    case attestationCount = "AttestationCount"
+}
+
+/// Comparison operator and value for participation admission thresholds.
+///
+/// Used in ``RequireParticipation`` to specify the comparison a fact value must
+/// satisfy. Serializes as the externally-tagged single-key object the Rust
+/// `ParticipationThreshold` enum produces — `{"GreaterThan": 50}`,
+/// `{"AtLeast": 100}`, etc. Mirrors the TypeScript SDK `ParticipationThreshold`
+/// union 1:1.
+///
+/// See §7.3.2.1.
+public nonisolated enum ParticipationThreshold: Codable, Sendable, Equatable {
+    /// Fact value must be strictly greater than the associated value.
+    case greaterThan(UInt64)
+    /// Fact value must be strictly less than the associated value.
+    case lessThan(UInt64)
+    /// Fact value must be greater than or equal to the associated value.
+    case atLeast(UInt64)
+    /// Fact value must be less than or equal to the associated value.
+    case atMost(UInt64)
+    /// Fact value must equal the associated value exactly.
+    case equals(UInt64)
+
+    private enum CodingKeys: String, CodingKey {
+        case greaterThan = "GreaterThan"
+        case lessThan = "LessThan"
+        case atLeast = "AtLeast"
+        case atMost = "AtMost"
+        case equals = "Equals"
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case let .greaterThan(value):
+            try container.encode(value, forKey: .greaterThan)
+        case let .lessThan(value):
+            try container.encode(value, forKey: .lessThan)
+        case let .atLeast(value):
+            try container.encode(value, forKey: .atLeast)
+        case let .atMost(value):
+            try container.encode(value, forKey: .atMost)
+        case let .equals(value):
+            try container.encode(value, forKey: .equals)
+        }
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        if let value = try container.decodeIfPresent(UInt64.self, forKey: .greaterThan) {
+            self = .greaterThan(value)
+        } else if let value = try container.decodeIfPresent(UInt64.self, forKey: .lessThan) {
+            self = .lessThan(value)
+        } else if let value = try container.decodeIfPresent(UInt64.self, forKey: .atLeast) {
+            self = .atLeast(value)
+        } else if let value = try container.decodeIfPresent(UInt64.self, forKey: .atMost) {
+            self = .atMost(value)
+        } else if let value = try container.decodeIfPresent(UInt64.self, forKey: .equals) {
+            self = .equals(value)
+        } else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .greaterThan,
+                in: container,
+                debugDescription: "no known ParticipationThreshold operator key"
+            )
+        }
+    }
+}
+
+/// A participation admission requirement declared by a context.
+///
+/// Each entry specifies a participation fact, a threshold, a freshness
+/// requirement, and a minimum number of independent source contexts. The
+/// `CodingKeys` are the serde-canonical snake_case the Rust core deserializes
+/// (`Vec<RequireParticipation>`). Mirrors the TypeScript SDK
+/// `RequireParticipation` interface and the Rust `RequireParticipation` struct
+/// 1:1.
+///
+/// See §7.3.2.1.
+public nonisolated struct RequireParticipation: Codable, Sendable, Equatable {
+    /// Which participation category to evaluate.
+    public let fact: ParticipationFact
+    /// Comparison operator and value.
+    public let threshold: ParticipationThreshold
+    /// Maximum age in seconds for the profile's `updatedAt` timestamp. Profiles
+    /// older than this are rejected.
+    public let maxAgeSecs: UInt64
+    /// Minimum number of independent source contexts (distinct
+    /// `signerPublicKey` values) required to satisfy this requirement.
+    public let minContexts: UInt32
+
+    /// Memberwise initializer.
+    public init(
+        fact: ParticipationFact,
+        threshold: ParticipationThreshold,
+        maxAgeSecs: UInt64,
+        minContexts: UInt32
+    ) {
+        self.fact = fact
+        self.threshold = threshold
+        self.maxAgeSecs = maxAgeSecs
+        self.minContexts = minContexts
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case fact
+        case threshold
+        case maxAgeSecs = "max_age_secs"
+        case minContexts = "min_contexts"
+    }
+}
+
+/// A context-hosted participation profile attesting to a member's verifiable
+/// participation facts.
+///
+/// Produced by contexts for opted-in members and signed by a context-specific
+/// Ed25519 key (derived with domain separation) so verifiers cannot correlate
+/// which contexts share a signer. The `CodingKeys` are the serde-canonical
+/// snake_case the Rust core deserializes (`Vec<ParticipationProfile>`); the
+/// three byte-array fields (`eventLogRoot`/`signerPublicKey`, 32 bytes each;
+/// `signature`, 64 bytes) serialize as JSON number arrays, matching the Rust
+/// `[u8; N]`/`serde_bytes` representation. Mirrors the TypeScript SDK
+/// `ParticipationProfile` interface and the Rust struct 1:1.
+///
+/// See §7.3.2.1.
+public nonisolated struct ParticipationProfile: Codable, Sendable, Equatable {
+    /// DID of the member this profile is about.
+    public let subjectDid: String
+    /// Total seconds of context participation.
+    public let participationDurationSecs: UInt64
+    /// Count of governance actions taken against this identity.
+    public let governanceActionsAgainst: UInt64
+    /// Count of governance actions initiated by this identity.
+    public let governanceActionsBy: UInt64
+    /// Total tool invocations across all tool types.
+    public let toolInvocationCount: UInt64
+    /// Whether ``toolInvocationCount`` is anchored in the canonical Merkle log.
+    /// `false` until ADR-051 makes `ToolInvoked` a convergent leaf — consumers
+    /// MUST NOT treat the count as Merkle-proven while this is `false`. The flag
+    /// is part of the signed preimage, so it cannot be stripped from a signed
+    /// profile.
+    public let toolInvocationCountAnchored: Bool
+    /// Number of contexts created.
+    public let contextCreationCount: UInt64
+    /// Number of role transitions.
+    public let roleProgressionCount: UInt64
+    /// Number of attestation events.
+    public let attestationCount: UInt64
+    /// Unix timestamp (seconds) of the last update to this profile.
+    public let updatedAt: UInt64
+    /// Merkle root of the context's event log at profile computation time
+    /// (32 bytes).
+    public let eventLogRoot: [UInt8]
+    /// Context-specific Ed25519 public key used to sign this profile (32 bytes).
+    public let signerPublicKey: [UInt8]
+    /// Ed25519 signature over all fields except this one (64 bytes).
+    public let signature: [UInt8]
+
+    /// Memberwise initializer.
+    public init(
+        subjectDid: String,
+        participationDurationSecs: UInt64,
+        governanceActionsAgainst: UInt64,
+        governanceActionsBy: UInt64,
+        toolInvocationCount: UInt64,
+        toolInvocationCountAnchored: Bool,
+        contextCreationCount: UInt64,
+        roleProgressionCount: UInt64,
+        attestationCount: UInt64,
+        updatedAt: UInt64,
+        eventLogRoot: [UInt8],
+        signerPublicKey: [UInt8],
+        signature: [UInt8]
+    ) {
+        self.subjectDid = subjectDid
+        self.participationDurationSecs = participationDurationSecs
+        self.governanceActionsAgainst = governanceActionsAgainst
+        self.governanceActionsBy = governanceActionsBy
+        self.toolInvocationCount = toolInvocationCount
+        self.toolInvocationCountAnchored = toolInvocationCountAnchored
+        self.contextCreationCount = contextCreationCount
+        self.roleProgressionCount = roleProgressionCount
+        self.attestationCount = attestationCount
+        self.updatedAt = updatedAt
+        self.eventLogRoot = eventLogRoot
+        self.signerPublicKey = signerPublicKey
+        self.signature = signature
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case subjectDid = "subject_did"
+        case participationDurationSecs = "participation_duration_secs"
+        case governanceActionsAgainst = "governance_actions_against"
+        case governanceActionsBy = "governance_actions_by"
+        case toolInvocationCount = "tool_invocation_count"
+        case toolInvocationCountAnchored = "tool_invocation_count_anchored"
+        case contextCreationCount = "context_creation_count"
+        case roleProgressionCount = "role_progression_count"
+        case attestationCount = "attestation_count"
+        case updatedAt = "updated_at"
+        case eventLogRoot = "event_log_root"
+        case signerPublicKey = "signer_public_key"
+        case signature
+    }
+}
+
+// MARK: - Capability admission types (§7.3.4.4, SCP-ACR-008, ADR-058)
+
+/// How a capability must be verified for admission.
+///
+/// Encodes to the bare variant name string (`"SelfAttested"` /
+/// `"ChallengeVerified"`) to match the Rust `VerificationLevel` enum's default
+/// serde representation. `ChallengeVerified` also satisfies `SelfAttested`.
+/// Mirrors the TypeScript SDK `VerificationLevel` union 1:1.
+public nonisolated enum VerificationLevel: String, Codable, Sendable, Equatable {
+    /// The agent claims the capability (present in its capability list); no
+    /// challenge proof required.
+    case selfAttested = "SelfAttested"
+    /// The capability was verified through the challenge-response protocol.
+    case challengeVerified = "ChallengeVerified"
+}
+
+/// A single admission requirement: a capability URI and the minimum
+/// verification level needed.
+///
+/// The `CodingKeys` are the serde-canonical snake_case the Rust core
+/// deserializes (`Vec<CapabilityRequirement>`). Mirrors the TypeScript SDK
+/// `CapabilityRequirement` interface and the Rust struct 1:1.
+///
+/// See §7.3.4.4.
+public nonisolated struct CapabilityRequirement: Codable, Sendable, Equatable {
+    /// The capability URI that must be present.
+    public let capability: String
+    /// The minimum verification level required.
+    public let verificationLevel: VerificationLevel
+
+    /// Memberwise initializer.
+    public init(capability: String, verificationLevel: VerificationLevel) {
+        self.capability = capability
+        self.verificationLevel = verificationLevel
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case capability
+        case verificationLevel = "verification_level"
+    }
+}
+
+/// How a capability was verified, as recorded in a ``ChallengeVerification``.
+///
+/// Serializes as the bare string `"SelfAttested"` or the externally-tagged
+/// `{"ChallengeVerified": {"challenge_type": <uri>}}`, matching the Rust
+/// `VerificationMethod` enum. The inner `challenge_type` is a bare capability
+/// URI string (the Rust `ChallengeType` serializes as its URI string).
+///
+/// SECURITY: `verificationMethod` is NOT covered by the verifier signature
+/// (ADR-017 caveat) — consumers MUST NOT key trust decisions on it.
+public nonisolated enum ChallengeVerificationMethod: Codable, Sendable, Equatable {
+    /// Self-attested — no challenge proof.
+    case selfAttested
+    /// Challenge-verified, carrying the challenge type (a capability URI).
+    case challengeVerified(challengeType: String)
+
+    private enum CodingKeys: String, CodingKey {
+        case challengeVerified = "ChallengeVerified"
+    }
+
+    private enum ChallengeVerifiedKeys: String, CodingKey {
+        case challengeType = "challenge_type"
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        switch self {
+        case .selfAttested:
+            var container = encoder.singleValueContainer()
+            try container.encode("SelfAttested")
+        case let .challengeVerified(challengeType):
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            var nested = container.nestedContainer(
+                keyedBy: ChallengeVerifiedKeys.self,
+                forKey: .challengeVerified
+            )
+            try nested.encode(challengeType, forKey: .challengeType)
+        }
+    }
+
+    public init(from decoder: Decoder) throws {
+        let single = try decoder.singleValueContainer()
+        if let tag = try? single.decode(String.self) {
+            guard tag == "SelfAttested" else {
+                throw DecodingError.dataCorruptedError(
+                    in: single,
+                    debugDescription: "unknown VerificationMethod string: \(tag)"
+                )
+            }
+            self = .selfAttested
+            return
+        }
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let nested = try container.nestedContainer(
+            keyedBy: ChallengeVerifiedKeys.self,
+            forKey: .challengeVerified
+        )
+        self = try .challengeVerified(challengeType: nested.decode(String.self, forKey: .challengeType))
+    }
+}
+
+/// A signed record that a specific verifier tested a capability and the agent
+/// passed (spec §7.3.4.2, ADR-017).
+///
+/// Pass a list of these to
+/// ``checkCapabilityRequirements(contextId:subjectDid:requirements:agentCapabilities:challengeVerifications:)``
+/// to satisfy `ChallengeVerified` requirements. The `CodingKeys` are the
+/// serde-canonical snake_case the Rust core deserializes
+/// (`Vec<ChallengeVerification>`); `verifierSignature` is a 64-byte JSON number
+/// array. Mirrors the TypeScript SDK `ChallengeVerification` interface and the
+/// Rust struct 1:1.
+///
+/// SECURITY (ADR-017 caveat): only the *signed* fields bind trust —
+/// `verificationId`, `verifierDid`, `subjectDid`, `capabilityUri`,
+/// `challengeType`, `passed`, `score`, `testCount`, `passCount`, `verifiedAt`,
+/// `expiresAt`, `contextId`. The `result`, `completedAt`, and
+/// `verificationMethod` fields are NOT signed and can be altered after minting
+/// without invalidating the signature. Consumers MUST NOT key trust decisions
+/// on those unsigned fields.
+public nonisolated struct ChallengeVerification: Codable, Sendable, Equatable {
+    /// Unique verification identifier (derived from the challenge ID).
+    public let verificationId: String
+    /// DID of the verifier who issued and verified the challenge.
+    public let verifierDid: String
+    /// DID of the subject who answered the challenge.
+    public let subjectDid: String
+    /// The capability URI that was verified.
+    public let capabilityUri: String
+    /// The type of challenge that was verified (a capability URI string).
+    public let challengeType: String
+    /// How the capability was verified (unsigned metadata).
+    public let verificationMethod: ChallengeVerificationMethod
+    /// Whether the subject passed the challenge overall.
+    public let passed: Bool
+    /// Optional numeric score (0–100) for graded challenges.
+    public let score: UInt32?
+    /// Total number of test cases in the challenge.
+    public let testCount: UInt32
+    /// Number of test cases the subject passed.
+    public let passCount: UInt32
+    /// The challenge-specific result from the response (arbitrary JSON,
+    /// unsigned).
+    public let result: JSONValue
+    /// Unix timestamp (seconds) when the response was completed (unsigned).
+    public let completedAt: UInt64
+    /// Unix timestamp (seconds) when the verification was performed.
+    public let verifiedAt: UInt64
+    /// Unix timestamp (seconds) when this verification expires.
+    public let expiresAt: UInt64
+    /// Context in which the challenge was issued, if any.
+    public let contextId: String?
+    /// Ed25519 signature by the verifier over the verification record
+    /// (64 bytes).
+    public let verifierSignature: [UInt8]
+
+    /// Memberwise initializer.
+    public init(
+        verificationId: String,
+        verifierDid: String,
+        subjectDid: String,
+        capabilityUri: String,
+        challengeType: String,
+        verificationMethod: ChallengeVerificationMethod,
+        passed: Bool,
+        testCount: UInt32,
+        passCount: UInt32,
+        result: JSONValue,
+        completedAt: UInt64,
+        verifiedAt: UInt64,
+        expiresAt: UInt64,
+        verifierSignature: [UInt8],
+        score: UInt32? = nil,
+        contextId: String? = nil
+    ) {
+        self.verificationId = verificationId
+        self.verifierDid = verifierDid
+        self.subjectDid = subjectDid
+        self.capabilityUri = capabilityUri
+        self.challengeType = challengeType
+        self.verificationMethod = verificationMethod
+        self.passed = passed
+        self.score = score
+        self.testCount = testCount
+        self.passCount = passCount
+        self.result = result
+        self.completedAt = completedAt
+        self.verifiedAt = verifiedAt
+        self.expiresAt = expiresAt
+        self.contextId = contextId
+        self.verifierSignature = verifierSignature
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case verificationId = "verification_id"
+        case verifierDid = "verifier_did"
+        case subjectDid = "subject_did"
+        case capabilityUri = "capability_uri"
+        case challengeType = "challenge_type"
+        case verificationMethod = "verification_method"
+        case passed
+        case score
+        case testCount = "test_count"
+        case passCount = "pass_count"
+        case result
+        case completedAt = "completed_at"
+        case verifiedAt = "verified_at"
+        case expiresAt = "expires_at"
+        case contextId = "context_id"
+        case verifierSignature = "verifier_signature"
+    }
+
+    /// Custom encoder so the optional `score` / `contextId` fields serialize as
+    /// explicit JSON `null` when absent (matching `serde_json::to_string` of the
+    /// Rust `Option<T>` fields and the TypeScript SDK encoder), rather than
+    /// being omitted as Swift's synthesized `encodeIfPresent` would do. The Rust
+    /// deserializer accepts either shape, but explicit `null` keeps the wire
+    /// form byte-identical across bindings.
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(verificationId, forKey: .verificationId)
+        try container.encode(verifierDid, forKey: .verifierDid)
+        try container.encode(subjectDid, forKey: .subjectDid)
+        try container.encode(capabilityUri, forKey: .capabilityUri)
+        try container.encode(challengeType, forKey: .challengeType)
+        try container.encode(verificationMethod, forKey: .verificationMethod)
+        try container.encode(passed, forKey: .passed)
+        try container.encode(score, forKey: .score)
+        try container.encode(testCount, forKey: .testCount)
+        try container.encode(passCount, forKey: .passCount)
+        try container.encode(result, forKey: .result)
+        try container.encode(completedAt, forKey: .completedAt)
+        try container.encode(verifiedAt, forKey: .verifiedAt)
+        try container.encode(expiresAt, forKey: .expiresAt)
+        try container.encode(contextId, forKey: .contextId)
+        try container.encode(verifierSignature, forKey: .verifierSignature)
+    }
+}
+
+// MARK: - Trust admission JSON encoders
+
+/// Shared JSON encoding for the trust-admission wire inputs. Uses
+/// `.sortedKeys` for deterministic output (matching the ``ConsequenceRule``
+/// encoder precedent); the Rust serde deserializers are key-order-independent,
+/// so alphabetical ordering is wire-compatible.
+private func encodeTrustAdmissionJson(_ value: some Encodable) throws -> String {
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.sortedKeys]
+    let data = try encoder.encode(value)
+    guard let json = String(data: data, encoding: .utf8) else {
+        throw ScpError.Validation(
+            msg: "failed to encode trust admission input as UTF-8 JSON",
+            code: "SCP-VALID-7061"
+        )
+    }
+    return json
+}
+
+/// Encodes a typed ``RequireParticipation`` array to the JSON wire shape the
+/// bridge deserializes (`Vec<RequireParticipation>`). `fact` is a bare variant
+/// string and `threshold` is the serde-canonical `{"<Op>": value}` shape.
+public func encodeRequireParticipationJson(_ requirements: [RequireParticipation]) throws -> String {
+    try encodeTrustAdmissionJson(requirements)
+}
+
+/// Throws ``ScpError/Validation(msg:code:)`` when a fixed-length byte-array
+/// field has the wrong number of elements, so a malformed profile/verification
+/// fails at encode time with a field-named error instead of surfacing as a
+/// Rust `[u8; N]` deserialization error after the bridge call. Mirrors the
+/// Python SDK's construction-time checks (ADR-058 misuse resistance).
+private func requireByteLength(
+    _ typeName: String,
+    _ fieldName: String,
+    expected: Int,
+    actual: [UInt8],
+    code: String
+) throws {
+    guard actual.count == expected else {
+        throw ScpError.Validation(
+            msg: "\(typeName).\(fieldName) must be exactly \(expected) elements, got \(actual.count)",
+            code: code
+        )
+    }
+}
+
+/// Encodes a typed ``ParticipationProfile`` array to the JSON wire shape the
+/// bridge deserializes (`Vec<ParticipationProfile>`). Byte-array fields pass
+/// through as JSON number arrays.
+///
+/// - Throws: ``ScpError/Validation(msg:code:)`` if `eventLogRoot` /
+///   `signerPublicKey` are not exactly 32 elements or `signature` is not
+///   exactly 64 elements (before any bridge call).
+public func encodeParticipationProfileJson(_ profiles: [ParticipationProfile]) throws -> String {
+    for profile in profiles {
+        try requireByteLength(
+            "ParticipationProfile", "eventLogRoot",
+            expected: 32, actual: profile.eventLogRoot, code: "SCP-VALID-7062"
+        )
+        try requireByteLength(
+            "ParticipationProfile", "signerPublicKey",
+            expected: 32, actual: profile.signerPublicKey, code: "SCP-VALID-7062"
+        )
+        try requireByteLength(
+            "ParticipationProfile", "signature",
+            expected: 64, actual: profile.signature, code: "SCP-VALID-7062"
+        )
+    }
+    return try encodeTrustAdmissionJson(profiles)
+}
+
+/// Encodes a typed ``CapabilityRequirement`` array to the JSON wire shape the
+/// bridge deserializes (`Vec<CapabilityRequirement>`). `verificationLevel`
+/// serializes as the bare variant string.
+public func encodeCapabilityRequirementsJson(_ requirements: [CapabilityRequirement]) throws -> String {
+    try encodeTrustAdmissionJson(requirements)
+}
+
+/// Encodes a typed ``ChallengeVerification`` array to the JSON wire shape the
+/// bridge deserializes (`Vec<ChallengeVerification>`). The `verificationMethod`
+/// discriminated union is encoded to its serde-tagged shape; `verifierSignature`
+/// passes through as a number array; `score` / `contextId` serialize as explicit
+/// `null` when absent.
+///
+/// - Throws: ``ScpError/Validation(msg:code:)`` if `verifierSignature` is not
+///   exactly 64 elements (before any bridge call).
+public func encodeChallengeVerificationsJson(_ verifications: [ChallengeVerification]) throws -> String {
+    for verification in verifications {
+        try requireByteLength(
+            "ChallengeVerification", "verifierSignature",
+            expected: 64, actual: verification.verifierSignature, code: "SCP-VALID-7063"
+        )
+    }
+    return try encodeTrustAdmissionJson(verifications)
+}
+
+/// Encodes the agent's self-attested capability URIs to the JSON wire shape the
+/// bridge deserializes (`Vec<CapabilityUri>`). Each `CapabilityUri` serializes
+/// as its plain URI string, so a `[String]` maps directly onto the wire array.
+public func encodeAgentCapabilitiesJson(_ capabilities: [String]) throws -> String {
+    try encodeTrustAdmissionJson(capabilities)
+}
+
+// MARK: - Typed trust-admission wrappers (ADR-058)
+
+/// Verify participation profiles against admission requirements (§7.3.2.1).
+///
+/// Typed counterpart to the generated
+/// ``verifyParticipationRequirements(expectedSubject:requirementsJson:profileJson:)``
+/// free function: it serializes the typed ``RequireParticipation`` /
+/// ``ParticipationProfile`` values to the serde wire shape (ADR-058) and calls
+/// the bridge unchanged. Returns normally when all requirements are satisfied;
+/// throws on any failed requirement or malformed input.
+///
+/// Security caveat — authenticity is not authorization: this verifies signatures
+/// over the subject binding, not signer *legitimacy*. Because `signerPublicKey`
+/// is self-certifying, a subject can present genuinely-signed profiles from
+/// signers it controls (inflating `minContexts`). Establish signer legitimacy
+/// separately (a trusted-signer set, a context-membership proof, or the §7.3.5
+/// threshold/independence path); do NOT treat success as an authorization
+/// decision.
+///
+/// - Parameters:
+///   - expectedSubject: DID of the agent being admitted. Profiles for any other
+///     subject are ignored (fail-closed).
+///   - requirements: Typed ``RequireParticipation`` values, serialized
+///     internally.
+///   - profiles: Typed ``ParticipationProfile`` values, serialized internally.
+/// - Throws: ``ScpError`` on any unmet requirement or a serialization failure.
+public func verifyParticipationRequirements(
+    expectedSubject: String,
+    requirements: [RequireParticipation],
+    profiles: [ParticipationProfile]
+) throws {
+    try verifyParticipationRequirements(
+        expectedSubject: expectedSubject,
+        requirementsJson: encodeRequireParticipationJson(requirements),
+        profileJson: encodeParticipationProfileJson(profiles)
+    )
+}
+
+/// Verify that an agent meets a context's capability requirements for admission
+/// (spec §7.3.4.4).
+///
+/// Typed counterpart to the generated
+/// ``checkCapabilityRequirements(contextId:subjectDid:requirementsJson:agentCapabilitiesJson:challengeVerificationsJson:)``
+/// free function: it serializes the typed ``CapabilityRequirement`` /
+/// ``ChallengeVerification`` values (and the agent capability URIs) to the serde
+/// wire shape (ADR-058) and calls the bridge unchanged. `subjectDid`/`contextId`
+/// bind challenge verifications to the agent and context being admitted — a
+/// `ChallengeVerification` only satisfies a requirement when its signed
+/// `subjectDid`/`contextId` equal these values, closing cross-subject and
+/// cross-context attribution. Returns normally when all requirements are
+/// satisfied; throws on any unmet requirement or malformed input.
+///
+/// Security caveat — authenticity is not authorization: a passing
+/// `ChallengeVerified` check proves the verifier's signature is authentic and
+/// bound to this subject/context, NOT that the verifier is *trusted*. Because
+/// `verifierDid` is self-certifying, a subject can present a genuinely-signed
+/// result from a verifier it controls. Establish verifier legitimacy separately;
+/// do NOT treat success as an authorization decision.
+///
+/// - Parameters:
+///   - contextId: The context the agent is being admitted to.
+///   - subjectDid: DID of the agent being admitted.
+///   - requirements: Typed ``CapabilityRequirement`` values, serialized
+///     internally.
+///   - agentCapabilities: The agent's self-attested capability URIs.
+///   - challengeVerifications: Typed ``ChallengeVerification`` records,
+///     serialized internally.
+/// - Throws: ``ScpError`` on any unmet requirement or a serialization failure.
+public func checkCapabilityRequirements(
+    contextId: String,
+    subjectDid: String,
+    requirements: [CapabilityRequirement],
+    agentCapabilities: [String],
+    challengeVerifications: [ChallengeVerification]
+) throws {
+    try checkCapabilityRequirements(
+        contextId: contextId,
+        subjectDid: subjectDid,
+        requirementsJson: encodeCapabilityRequirementsJson(requirements),
+        agentCapabilitiesJson: encodeAgentCapabilitiesJson(agentCapabilities),
+        challengeVerificationsJson: encodeChallengeVerificationsJson(challengeVerifications)
+    )
+}

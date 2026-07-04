@@ -1211,6 +1211,247 @@ export interface RequireParticipation {
   readonly minContexts: number;
 }
 
+/**
+ * Encodes a typed {@link RequireParticipation} array to the JSON wire shape
+ * expected by the Rust bridge (`Vec<RequireParticipation>`).
+ *
+ * Field names are snake_cased to match `serde_json::to_string`. `fact` is a
+ * bare variant string and `threshold` is already the serde-canonical
+ * `{ "<Op>": value }` shape, so both pass through unchanged.
+ */
+export function encodeRequireParticipation(requirements: readonly RequireParticipation[]): string {
+  return JSON.stringify(
+    requirements.map((r) => ({
+      fact: r.fact,
+      threshold: r.threshold,
+      max_age_secs: r.maxAgeSecs,
+      min_contexts: r.minContexts,
+    })),
+  );
+}
+
+/**
+ * Throws when a fixed-length byte-array field has the wrong number of
+ * elements, so a malformed profile/verification fails at encode time with a
+ * field-named error instead of surfacing as a Rust `[u8; N]` deserialization
+ * error after the bridge call. Mirrors the Python SDK's construction-time
+ * checks (ADR-058 misuse resistance).
+ */
+function requireByteLength(
+  typeName: string,
+  fieldName: string,
+  expectedLength: number,
+  actual: readonly number[],
+): void {
+  if (actual.length !== expectedLength) {
+    throw new Error(
+      `${typeName}.${fieldName} must be exactly ${expectedLength} elements, got ${actual.length}`,
+    );
+  }
+}
+
+/**
+ * Encodes a typed {@link ParticipationProfile} array to the JSON wire shape
+ * expected by the Rust bridge (`Vec<ParticipationProfile>`).
+ *
+ * Field names are snake_cased to match `serde_json::to_string`. Byte-array
+ * fields (`eventLogRoot`, `signerPublicKey`, `signature`) pass through as
+ * number arrays.
+ *
+ * @throws Error if `eventLogRoot` / `signerPublicKey` are not exactly 32
+ *   elements or `signature` is not exactly 64 elements (before any bridge
+ *   call).
+ */
+export function encodeParticipationProfile(profiles: readonly ParticipationProfile[]): string {
+  for (const p of profiles) {
+    requireByteLength("ParticipationProfile", "eventLogRoot", 32, p.eventLogRoot);
+    requireByteLength("ParticipationProfile", "signerPublicKey", 32, p.signerPublicKey);
+    requireByteLength("ParticipationProfile", "signature", 64, p.signature);
+  }
+  return JSON.stringify(
+    profiles.map((p) => ({
+      subject_did: p.subjectDid,
+      participation_duration_secs: p.participationDurationSecs,
+      governance_actions_against: p.governanceActionsAgainst,
+      governance_actions_by: p.governanceActionsBy,
+      tool_invocation_count: p.toolInvocationCount,
+      tool_invocation_count_anchored: p.toolInvocationCountAnchored,
+      context_creation_count: p.contextCreationCount,
+      role_progression_count: p.roleProgressionCount,
+      attestation_count: p.attestationCount,
+      updated_at: p.updatedAt,
+      event_log_root: p.eventLogRoot,
+      signer_public_key: p.signerPublicKey,
+      signature: p.signature,
+    })),
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Capability admission (§7.3.4.4, SCP-ACR-008, ADR-058)
+// ---------------------------------------------------------------------------
+
+/**
+ * How a capability must be verified for admission.
+ *
+ * Mirrors the Rust `VerificationLevel` enum (`scp-core`). Serializes as the
+ * bare variant name string.
+ *
+ * - `"SelfAttested"` — the agent claims the capability (present in their
+ *   capability list); no challenge proof required.
+ * - `"ChallengeVerified"` — the capability was verified through the
+ *   challenge-response protocol. Also satisfies `SelfAttested`.
+ */
+export type VerificationLevel = "SelfAttested" | "ChallengeVerified";
+
+/**
+ * A single admission requirement: a capability URI and the minimum
+ * verification level needed.
+ *
+ * Mirrors the Rust `CapabilityRequirement` struct (`scp-core`). See §7.3.4.4.
+ */
+export interface CapabilityRequirement {
+  /** The capability URI that must be present. */
+  readonly capability: string;
+  /** The minimum verification level required. */
+  readonly verificationLevel: VerificationLevel;
+}
+
+/**
+ * How a capability was verified, as recorded in a {@link ChallengeVerification}.
+ *
+ * Mirrors the Rust `VerificationMethod` enum (`scp-core`). Serializes as the
+ * bare string `"SelfAttested"` or the tagged
+ * `{ "ChallengeVerified": { "challenge_type": <uri> } }`.
+ *
+ * SECURITY: `verificationMethod` is NOT covered by the verifier signature
+ * (ADR-017 caveat) — consumers MUST NOT key trust decisions on it.
+ */
+export type ChallengeVerificationMethod =
+  | { readonly kind: "SelfAttested" }
+  | { readonly kind: "ChallengeVerified"; readonly challengeType: string };
+
+/**
+ * A signed record that a specific verifier tested a capability and the agent
+ * passed (spec §7.3.4.2, ADR-017).
+ *
+ * Mirrors the Rust `ChallengeVerification` struct (`scp-core`). Pass a list of
+ * these to {@link SCP.checkCapabilityRequirements} to satisfy `ChallengeVerified`
+ * requirements.
+ *
+ * SECURITY (ADR-017 caveat): only the *signed* fields bind trust —
+ * `verificationId`, `verifierDid`, `subjectDid`, `capabilityUri`,
+ * `challengeType`, `passed`, `score`, `testCount`, `passCount`, `verifiedAt`,
+ * `expiresAt`, `contextId`. The `result`, `completedAt`, and
+ * `verificationMethod` fields are NOT signed and can be altered after minting
+ * without invalidating the signature. Consumers MUST NOT key trust decisions
+ * on those unsigned fields.
+ */
+export interface ChallengeVerification {
+  /** Unique verification identifier (derived from the challenge ID). */
+  readonly verificationId: string;
+  /** DID of the verifier who issued and verified the challenge. */
+  readonly verifierDid: string;
+  /** DID of the subject who answered the challenge. */
+  readonly subjectDid: string;
+  /** The capability URI that was verified. */
+  readonly capabilityUri: string;
+  /** The type of challenge that was verified (a capability URI string). */
+  readonly challengeType: string;
+  /** How the capability was verified (unsigned metadata). */
+  readonly verificationMethod: ChallengeVerificationMethod;
+  /** Whether the subject passed the challenge overall. */
+  readonly passed: boolean;
+  /** Total number of test cases in the challenge. */
+  readonly testCount: number;
+  /** Number of test cases the subject passed. */
+  readonly passCount: number;
+  /** The challenge-specific result from the response (arbitrary JSON, unsigned). */
+  readonly result: unknown;
+  /** Unix timestamp (seconds) when the response was completed (unsigned). */
+  readonly completedAt: number;
+  /** Unix timestamp (seconds) when the verification was performed. */
+  readonly verifiedAt: number;
+  /** Unix timestamp (seconds) when this verification expires. */
+  readonly expiresAt: number;
+  /** Ed25519 signature by the verifier over the verification record (64 bytes). */
+  readonly verifierSignature: readonly number[];
+  /** Optional numeric score (0–100) for graded challenges. */
+  readonly score?: number | null;
+  /** Context in which the challenge was issued, if any. */
+  readonly contextId?: string | null;
+}
+
+/**
+ * Encodes a typed {@link CapabilityRequirement} array to the JSON wire shape
+ * expected by the Rust bridge (`Vec<CapabilityRequirement>`).
+ *
+ * `verificationLevel` serializes as the bare variant string.
+ */
+export function encodeCapabilityRequirements(
+  requirements: readonly CapabilityRequirement[],
+): string {
+  return JSON.stringify(
+    requirements.map((r) => ({
+      capability: r.capability,
+      verification_level: r.verificationLevel,
+    })),
+  );
+}
+
+function encodeChallengeVerificationMethod(method: ChallengeVerificationMethod): unknown {
+  switch (method.kind) {
+    case "SelfAttested":
+      return "SelfAttested";
+    case "ChallengeVerified":
+      return { ChallengeVerified: { challenge_type: method.challengeType } };
+    default: {
+      const exhaustive: never = method;
+      throw new Error(`unknown ChallengeVerificationMethod kind: ${JSON.stringify(exhaustive)}`);
+    }
+  }
+}
+
+/**
+ * Encodes a typed {@link ChallengeVerification} array to the JSON wire shape
+ * expected by the Rust bridge (`Vec<ChallengeVerification>`).
+ *
+ * Field names are snake_cased to match `serde_json::to_string`. The
+ * `verificationMethod` discriminated union is encoded to the serde-tagged
+ * shape; `verifierSignature` passes through as a number array. `score` and
+ * `contextId` default to `null` when absent.
+ *
+ * @throws Error if `verifierSignature` is not exactly 64 elements (before any
+ *   bridge call).
+ */
+export function encodeChallengeVerifications(
+  verifications: readonly ChallengeVerification[],
+): string {
+  for (const v of verifications) {
+    requireByteLength("ChallengeVerification", "verifierSignature", 64, v.verifierSignature);
+  }
+  return JSON.stringify(
+    verifications.map((v) => ({
+      verification_id: v.verificationId,
+      verifier_did: v.verifierDid,
+      subject_did: v.subjectDid,
+      capability_uri: v.capabilityUri,
+      challenge_type: v.challengeType,
+      verification_method: encodeChallengeVerificationMethod(v.verificationMethod),
+      passed: v.passed,
+      score: v.score ?? null,
+      test_count: v.testCount,
+      pass_count: v.passCount,
+      result: v.result,
+      completed_at: v.completedAt,
+      verified_at: v.verifiedAt,
+      expires_at: v.expiresAt,
+      context_id: v.contextId ?? null,
+      verifier_signature: v.verifierSignature,
+    })),
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Discovery — Address Resolution (§22.2.1, §22.7)
 // ---------------------------------------------------------------------------

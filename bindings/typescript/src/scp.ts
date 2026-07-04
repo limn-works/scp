@@ -45,11 +45,21 @@ import type { Node, Relay } from "./server";
 import type {
   BehavioralRecord,
   CachedAttestation,
+  CapabilityRequirement,
   CapabilityValidation,
+  ChallengeVerification,
+  ParticipationProfile,
+  RequireParticipation,
   SagaResult,
   TrustEvaluation,
 } from "./types";
-import { encodeCachedAttestations } from "./types";
+import {
+  encodeCachedAttestations,
+  encodeCapabilityRequirements,
+  encodeChallengeVerifications,
+  encodeParticipationProfile,
+  encodeRequireParticipation,
+} from "./types";
 
 /**
  * Stable error code (spec §7.3.2) the core surfaces when a context has no
@@ -2384,16 +2394,23 @@ export class SCP {
    * `minContexts`). Callers MUST establish signer legitimacy separately
    * (a trusted-signer set, a context-membership proof, or the §7.3.5
    * threshold/independence path) and MUST NOT treat success as authorization.
+   *
+   * @param expectedSubject DID of the agent being admitted. Profiles for any
+   *   other subject are ignored (fail-closed).
+   * @param requirements Typed {@link RequireParticipation} values. Serialized
+   *   internally to the serde wire shape (ADR-058).
+   * @param profiles Typed {@link ParticipationProfile} values. Serialized
+   *   internally to the serde wire shape (ADR-058).
    */
   verifyParticipationRequirements(
     expectedSubject: string,
-    requirementsJson: string,
-    profileJson: string,
+    requirements: readonly RequireParticipation[],
+    profiles: readonly ParticipationProfile[],
   ): void {
     (this.#native.verifyParticipationRequirements as (s: string, r: string, p: string) => void)(
       expectedSubject,
-      requirementsJson,
-      profileJson,
+      encodeRequireParticipation(requirements),
+      encodeParticipationProfile(profiles),
     );
   }
 
@@ -2415,13 +2432,21 @@ export class SCP {
    * `verifierDid` is self-certifying, a subject can present a genuinely-signed
    * result from a verifier it controls. Establish verifier legitimacy
    * separately and do NOT treat success as authorization.
+   *
+   * @param contextId The context the agent is being admitted to.
+   * @param subjectDid DID of the agent being admitted.
+   * @param requirements Typed {@link CapabilityRequirement} values. Serialized
+   *   internally to the serde wire shape (ADR-058).
+   * @param agentCapabilities The agent's self-attested capability URIs.
+   * @param challengeVerifications Typed {@link ChallengeVerification} records.
+   *   Serialized internally to the serde wire shape (ADR-058).
    */
   checkCapabilityRequirements(
     contextId: string,
     subjectDid: string,
-    requirementsJson: string,
-    agentCapabilitiesJson: string,
-    challengeVerificationsJson: string,
+    requirements: readonly CapabilityRequirement[],
+    agentCapabilities: readonly string[],
+    challengeVerifications: readonly ChallengeVerification[],
   ): void {
     (
       this.#native.checkCapabilityRequirements as (
@@ -2431,7 +2456,13 @@ export class SCP {
         a: string,
         v: string,
       ) => void
-    )(contextId, subjectDid, requirementsJson, agentCapabilitiesJson, challengeVerificationsJson);
+    )(
+      contextId,
+      subjectDid,
+      encodeCapabilityRequirements(requirements),
+      JSON.stringify(agentCapabilities),
+      encodeChallengeVerifications(challengeVerifications),
+    );
   }
 
   /**

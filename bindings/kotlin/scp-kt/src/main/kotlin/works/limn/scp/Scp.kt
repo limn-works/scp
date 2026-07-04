@@ -1960,8 +1960,11 @@ class SCP internal constructor(
     )
 
     /**
-     * Routes through the UniFFI-generated free function
-     * [uniffi.scp.verifyParticipationRequirements]. ADR-048 §1 + §7
+     * Verify participation profiles against admission requirements
+     * (spec §7.3.2.1). Serializes the typed [RequireParticipation] /
+     * [ParticipationProfile] values to the serde wire shape (ADR-058) and
+     * routes through the UniFFI-generated free function
+     * [uniffi.scp.verifyParticipationRequirements] unchanged. ADR-048 §1 + §7
      * Kotlin bullet.
      *
      * [expectedSubject] is the DID of the agent being admitted: only
@@ -1970,7 +1973,7 @@ class SCP internal constructor(
      * cross-subject participation-profile replay.
      *
      * Returns normally when all requirements are satisfied; the bridge
-     * throws on any failed requirement or malformed JSON.
+     * throws on any failed requirement or malformed input.
      *
      * Security caveat — authenticity is not authorization: this verifies
      * signatures over the subject binding, not signer *legitimacy*. Because
@@ -1982,30 +1985,32 @@ class SCP internal constructor(
      */
     fun verifyParticipationRequirements(
         expectedSubject: String,
-        requirementsJson: String,
-        profileJson: String,
+        requirements: List<RequireParticipation>,
+        profiles: List<ParticipationProfile>,
     ) {
         uniffi.scp.verifyParticipationRequirements(
             expectedSubject = expectedSubject,
-            requirementsJson = requirementsJson,
-            profileJson = profileJson,
+            requirementsJson = encodeRequireParticipationJson(requirements),
+            profileJson = encodeParticipationProfileJson(profiles),
         )
     }
 
     /**
-     * Routes through the UniFFI-generated free function
-     * [uniffi.scp.checkCapabilityRequirements]. ADR-048 §1 + §7 Kotlin
-     * bullet.
-     *
      * Verifies that an agent meets a context's capability requirements for
-     * admission (spec §7.3.4.4, SCP-ACR-008). [subjectDid]/[contextId] bind
-     * challenge verifications to the agent and context being admitted: a
-     * `ChallengeVerification` only satisfies a requirement when its signed
-     * `subject_did`/`context_id` equal these values, closing cross-subject
-     * and cross-context attribution.
+     * admission (spec §7.3.4.4, SCP-ACR-008). Serializes the typed
+     * [CapabilityRequirement] / [ChallengeVerification] values (and the agent
+     * capability URIs) to the serde wire shape (ADR-058) and routes through
+     * the UniFFI-generated free function
+     * [uniffi.scp.checkCapabilityRequirements] unchanged. ADR-048 §1 + §7
+     * Kotlin bullet.
+     *
+     * [subjectDid]/[contextId] bind challenge verifications to the agent and
+     * context being admitted: a [ChallengeVerification] only satisfies a
+     * requirement when its signed `subject_did`/`context_id` equal these
+     * values, closing cross-subject and cross-context attribution.
      *
      * Returns normally when all requirements are satisfied; the bridge throws
-     * on any unmet requirement or malformed JSON.
+     * on any unmet requirement or malformed input.
      *
      * Security caveat — authenticity is not authorization: a passing
      * `ChallengeVerified` check proves the verifier's signature is authentic
@@ -2017,16 +2022,16 @@ class SCP internal constructor(
     fun checkCapabilityRequirements(
         contextId: String,
         subjectDid: String,
-        requirementsJson: String,
-        agentCapabilitiesJson: String,
-        challengeVerificationsJson: String,
+        requirements: List<CapabilityRequirement>,
+        agentCapabilities: List<String>,
+        challengeVerifications: List<ChallengeVerification>,
     ) {
         uniffi.scp.checkCapabilityRequirements(
             contextId = contextId,
             subjectDid = subjectDid,
-            requirementsJson = requirementsJson,
-            agentCapabilitiesJson = agentCapabilitiesJson,
-            challengeVerificationsJson = challengeVerificationsJson,
+            requirementsJson = encodeCapabilityRequirementsJson(requirements),
+            agentCapabilitiesJson = encodeAgentCapabilitiesJson(agentCapabilities),
+            challengeVerificationsJson = encodeChallengeVerificationsJson(challengeVerifications),
         )
     }
 
