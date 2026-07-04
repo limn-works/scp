@@ -1322,9 +1322,11 @@ def verify_participation_requirements(
     threshold/independence path) and MUST NOT treat a passing check as an
     authorization decision.
 
-    Success is indicated by returning without exception. Verification
-    failures raise ``RuntimeError`` with diagnostic details from the
-    Rust bridge.
+    Success is indicated by returning without exception. Failures raise the
+    bridge's native coded ``ValidationError`` (rooted at ``ScpError``); the
+    structured per-case ``SCP-VALID-*`` code is recoverable from the
+    exception's string form (the ``[CODE]``-prefixed message), so callers
+    branch on the code — never on error prose.
 
     Args:
         expected_subject: The DID of the agent being admitted. Profiles for
@@ -1334,9 +1336,14 @@ def verify_participation_requirements(
 
     Raises:
         ScpError: If the bridge module is not available.
-        RuntimeError: If verification fails (with diagnostic details
-            from ``ParticipationAdmissionError``).
-        ValueError: If JSON serialization or parsing fails.
+        ValidationError: Native bridge exception whose ``[SCP-VALID-NNNN]``-
+            prefixed message carries the per-case structured code:
+            ``SCP-VALID-7000`` for a malformed ``expected_subject`` DID;
+            ``SCP-VALID-7031`` / ``SCP-VALID-7030`` for malformed
+            requirements / profiles JSON (unreachable through this typed
+            wrapper, which always serializes valid JSON); and
+            ``SCP-VALID-7032`` for a failed admission check, with the
+            specific failure reason from ``ParticipationAdmissionError``.
     """
     bridge = _bridge()
 
@@ -1373,7 +1380,11 @@ def check_capability_requirements(
     §7.3.5 threshold/independence path) and do NOT treat success as an
     authorization decision.
 
-    Success is indicated by returning without exception.
+    Success is indicated by returning without exception. Failures raise the
+    bridge's native coded ``ValidationError`` (rooted at ``ScpError``); the
+    structured per-case ``SCP-VALID-*`` code is recoverable from the
+    exception's string form (the ``[CODE]``-prefixed message), so callers
+    branch on the code — never on error prose.
 
     Args:
         context_id: The context the agent is being admitted to.
@@ -1386,9 +1397,16 @@ def check_capability_requirements(
 
     Raises:
         ScpError: If the bridge module is not available.
-        RuntimeError: If an admission requirement is unmet (with diagnostic
-            details from ``AdmissionError``).
-        ValueError: If ``subject_did`` is malformed or JSON serialization fails.
+        ValidationError: Native bridge exception whose ``[SCP-VALID-NNNN]``-
+            prefixed message carries the per-case structured code:
+            ``SCP-VALID-7000`` for a malformed ``subject_did``;
+            ``SCP-VALID-7073`` / ``SCP-VALID-7074`` / ``SCP-VALID-7075`` for
+            malformed requirements / agent-capabilities /
+            challenge-verifications JSON (unreachable through this typed
+            wrapper, which always serializes valid JSON); ``SCP-VALID-7076``
+            for an unmet admission requirement, with the specific failure
+            reason from ``AdmissionError``; and ``SCP-VALID-7077`` for its
+            empty-subject variant.
     """
     bridge = _bridge()
 
