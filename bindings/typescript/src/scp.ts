@@ -43,22 +43,32 @@ import { toCapabilityValidation } from "./internal/bridge";
 import { loadNativeAddon, type NativeAddon as RawNativeAddon } from "./internal/native";
 import type { Node, Relay } from "./server";
 import type {
+  AttestationType,
+  AttestorInfo,
   BehavioralRecord,
   CachedAttestation,
   CapabilityRequirement,
   CapabilityValidation,
   ChallengeVerification,
+  ConsequenceRule,
+  EventLogEntry,
   ParticipationProfile,
   RequireParticipation,
   SagaResult,
+  ThresholdRequirement,
   TrustEvaluation,
 } from "./types";
 import {
+  encodeAttestorSets,
   encodeCachedAttestations,
   encodeCapabilityRequirements,
   encodeChallengeVerifications,
+  encodeConsequenceRules,
+  encodeEventLogEntries,
+  encodeMerkleRoot,
   encodeParticipationProfile,
   encodeRequireParticipation,
+  encodeThresholdRequirements,
 } from "./types";
 
 /**
@@ -2713,16 +2723,38 @@ export class SCP {
     };
   }
 
+  /**
+   * Aggregate all trust engine layers into a single `TrustInput` (§7.3).
+   *
+   * Every structured input is typed; the SDK serializes to the serde wire
+   * shapes internally before crossing FFI (ADR-058). An empty collection is
+   * a real value ("no rules apply"), never a request for defaults — the
+   * bridge receives `[]` / `{}` exactly as passed.
+   *
+   * @param contextId The context to aggregate trust inputs for.
+   * @param subjectDid The DID of the subject to evaluate.
+   * @param events Full signed event-log entries ({@link EventLogEntry}).
+   * @param merkleRoot 32-byte Merkle root as a number array.
+   * @param consequenceRules Typed {@link ConsequenceRule} values.
+   * @param thresholdRequirements Typed {@link ThresholdRequirement} values
+   *   keyed by {@link AttestationType}.
+   * @param attestorSets Typed {@link AttestorInfo} lists keyed by
+   *   {@link AttestationType}.
+   * @param cachedAttestations Typed {@link CachedAttestation} values to seed
+   *   the bridge's trust store.
+   * @param challengeResults Typed {@link ChallengeVerification} records.
+   * @returns The aggregated `TrustInput` as a JSON string.
+   */
   aggregateTrustInput(
     contextId: string,
     subjectDid: string,
-    eventsJson: string,
-    merkleRootJson: string,
-    consequenceRulesJson: string,
-    thresholdRequirementsJson: string,
-    attestorSetsJson: string,
-    cachedAttestationsJson: string,
-    challengeResultsJson: string,
+    events: readonly EventLogEntry[],
+    merkleRoot: readonly number[],
+    consequenceRules: readonly ConsequenceRule[] = [],
+    thresholdRequirements: Readonly<Partial<Record<AttestationType, ThresholdRequirement>>> = {},
+    attestorSets: Readonly<Partial<Record<AttestationType, readonly AttestorInfo[]>>> = {},
+    cachedAttestations: readonly CachedAttestation[] = [],
+    challengeResults: readonly ChallengeVerification[] = [],
   ): string {
     return (
       this.#native.aggregateTrustInput as (
@@ -2739,13 +2771,13 @@ export class SCP {
     )(
       contextId,
       subjectDid,
-      eventsJson,
-      merkleRootJson,
-      consequenceRulesJson,
-      thresholdRequirementsJson,
-      attestorSetsJson,
-      cachedAttestationsJson,
-      challengeResultsJson,
+      encodeEventLogEntries(events),
+      encodeMerkleRoot(merkleRoot),
+      encodeConsequenceRules(consequenceRules),
+      encodeThresholdRequirements(thresholdRequirements),
+      encodeAttestorSets(attestorSets),
+      encodeCachedAttestations(cachedAttestations),
+      encodeChallengeVerifications(challengeResults),
     );
   }
 

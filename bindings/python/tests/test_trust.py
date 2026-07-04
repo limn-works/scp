@@ -25,10 +25,12 @@ import pytest
 from scp_sdk.errors import ContextError
 from scp_sdk.trust import (
     AttestationSummary,
+    AttestorInfo,
     BehavioralRecord,
     CachedAttestation,
     CachedAttestationEnvelope,
     CapabilityValidation,
+    EventLogEntry,
     ParticipationFact,
     ParticipationProfile,
     ParticipationThreshold,
@@ -1060,7 +1062,13 @@ class TestAggregateTrustInputFalsy:
 
         bridge = self._mock_bridge()
         rules = [{"name": "rate-limit", "trigger": "velocity"}]
-        thresholds = {"WebAuthn": {"min_attestors": 2}}
+        thresholds = {
+            "Endorsement": {
+                "required_count": 2,
+                "total_attestors": 3,
+                "independence_threshold": 0.5,
+            }
+        }
         with patch("scp_sdk.trust._bridge", return_value=bridge):
             aggregate_trust_input(
                 scp=MagicMock(),
@@ -1074,3 +1082,191 @@ class TestAggregateTrustInputFalsy:
         call_args = bridge.aggregate_trust_input.call_args[0]
         assert _json.loads(call_args[4]) == rules
         assert _json.loads(call_args[5]) == thresholds
+
+
+class TestAggregateTrustInputTyped:
+    """ADR-058: aggregate_trust_input takes typed inputs and serializes to the
+    exact serde wire JSON the bridge deserializes — no hand-authored JSON."""
+
+    @staticmethod
+    def _mock_bridge() -> MagicMock:
+        bridge = MagicMock()
+        bridge.aggregate_trust_input.return_value = "{}"
+        return bridge
+
+    @staticmethod
+    def _event() -> EventLogEntry:
+        return {
+            "event_type": "MessageSent",
+            "actor_did": "did:dht:zActor",
+            "timestamp": 1_700_000_000,
+            "sequence": 0,
+            "payload": {"data": [1, 2, 3]},
+            "prev_hash": [0] * 32,
+            "signature": [5] * 64,
+        }
+
+    def test_typed_events_serialize_verbatim(self) -> None:
+        from scp_sdk.trust import aggregate_trust_input
+
+        bridge = self._mock_bridge()
+        event = self._event()
+        with patch("scp_sdk.trust._bridge", return_value=bridge):
+            aggregate_trust_input(
+                scp=MagicMock(),
+                context_id="ctx-1",
+                subject_did="did:dht:zAlice",
+                events=[event],
+                merkle_root=[7] * 32,
+            )
+        call_args = bridge.aggregate_trust_input.call_args[0]
+        assert json.loads(call_args[2]) == [event]
+        assert json.loads(call_args[3]) == [7] * 32
+
+    def test_typed_attestor_sets_serialize_verbatim(self) -> None:
+        from scp_sdk.trust import aggregate_trust_input
+
+        bridge = self._mock_bridge()
+        attestor: AttestorInfo = {
+            "did": "did:dht:zAttestor",
+            "context_memberships": ["ctx-1"],
+            "endorsements": ["did:dht:zOther"],
+            "attestation": None,
+        }
+        with patch("scp_sdk.trust._bridge", return_value=bridge):
+            aggregate_trust_input(
+                scp=MagicMock(),
+                context_id="ctx-1",
+                subject_did="did:dht:zAlice",
+                events=[],
+                merkle_root=[0] * 32,
+                attestor_sets={"Endorsement": [attestor]},
+            )
+        call_args = bridge.aggregate_trust_input.call_args[0]
+        assert json.loads(call_args[6]) == {"Endorsement": [attestor]}
+
+    def test_challenge_results_accept_the_dataclass(self) -> None:
+        """``challenge_results`` accepts the merged ChallengeVerification
+        dataclass and serializes it via its bridge projection."""
+        from scp_sdk.trust import (
+            ChallengeVerification,
+            ChallengeVerificationMethod,
+            aggregate_trust_input,
+        )
+
+        bridge = self._mock_bridge()
+        verification = ChallengeVerification(
+            verification_id="v-1",
+            verifier_did="did:dht:zVerifier",
+            subject_did="did:dht:zAlice",
+            capability_uri="scp:capability:schema-validation/v1",
+            challenge_type="scp:capability:schema-validation/v1",
+            verification_method=ChallengeVerificationMethod(name="SelfAttested"),
+            passed=True,
+            test_count=1,
+            pass_count=1,
+            result=True,
+            completed_at=1_700_000_000,
+            verified_at=1_700_000_000,
+            expires_at=4_000_000_000,
+            verifier_signature=[9] * 64,
+        )
+        with patch("scp_sdk.trust._bridge", return_value=bridge):
+            aggregate_trust_input(
+                scp=MagicMock(),
+                context_id="ctx-1",
+                subject_did="did:dht:zAlice",
+                events=[],
+                merkle_root=[0] * 32,
+                challenge_results=[verification],
+            )
+        call_args = bridge.aggregate_trust_input.call_args[0]
+        assert json.loads(call_args[8]) == [verification._to_bridge_dict()]
+
+    def test_rejects_wrong_length_merkle_root(self) -> None:
+        from scp_sdk.trust import aggregate_trust_input
+
+        bridge = self._mock_bridge()
+        with (
+            patch("scp_sdk.trust._bridge", return_value=bridge),
+            pytest.raises(ValueError, match="merkle_root must be exactly 32 elements, got 3"),
+        ):
+            aggregate_trust_input(
+                scp=MagicMock(),
+                context_id="ctx-1",
+                subject_did="did:dht:zAlice",
+                events=[],
+                merkle_root=[1, 2, 3],
+            )
+        bridge.aggregate_trust_input.assert_not_called()
+
+    @pytest.mark.parametrize("param", ["threshold_requirements", "attestor_sets"])
+    def test_rejects_invalid_attestation_type_key(self, param: str) -> None:
+        from scp_sdk.trust import aggregate_trust_input
+
+        bridge = self._mock_bridge()
+        with (
+            patch("scp_sdk.trust._bridge", return_value=bridge),
+            pytest.raises(ValueError, match="not an AttestationType"),
+        ):
+            aggregate_trust_input(
+                scp=MagicMock(),
+                context_id="ctx-1",
+                subject_did="did:dht:zAlice",
+                events=[],
+                merkle_root=[0] * 32,
+                **{param: {"WebAuthn": {}}},
+            )
+        bridge.aggregate_trust_input.assert_not_called()
+
+    def test_scp_method_serializes_through_the_shared_encoder(self) -> None:
+        """SCP.aggregate_trust_input (the class surface) takes the same typed
+        inputs and emits byte-identical wire JSON via the shared encoder."""
+        from scp_sdk.scp import SCP
+
+        scp = MagicMock()
+        scp._native.aggregate_trust_input.return_value = "{}"
+        event = self._event()
+        result = asyncio.run(
+            SCP.aggregate_trust_input(
+                scp,
+                "ctx-1",
+                "did:dht:zAlice",
+                events=[event],
+                merkle_root=[7] * 32,
+                threshold_requirements={
+                    "Endorsement": {
+                        "required_count": 1,
+                        "total_attestors": 1,
+                        "independence_threshold": 0.0,
+                    }
+                },
+            )
+        )
+        assert result == "{}"
+        call_args = scp._native.aggregate_trust_input.call_args[0]
+        assert call_args[0] == "ctx-1"
+        assert call_args[1] == "did:dht:zAlice"
+        assert json.loads(call_args[2]) == [event]
+        assert json.loads(call_args[3]) == [7] * 32
+        assert call_args[4] == "[]"
+        assert json.loads(call_args[5]) == {
+            "Endorsement": {
+                "required_count": 1,
+                "total_attestors": 1,
+                "independence_threshold": 0.0,
+            }
+        }
+        assert call_args[6] == "{}"
+        assert call_args[7] == "[]"
+        assert call_args[8] == "[]"
+
+    def test_scp_method_rejects_wrong_length_merkle_root(self) -> None:
+        from scp_sdk.scp import SCP
+
+        scp = MagicMock()
+        with pytest.raises(ValueError, match="merkle_root must be exactly 32 elements"):
+            asyncio.run(
+                SCP.aggregate_trust_input(scp, "ctx-1", "did:dht:zAlice", [], [1, 2]),
+            )
+        scp._native.aggregate_trust_input.assert_not_called()

@@ -153,9 +153,11 @@ from scp_sdk.tools import (
 )
 from scp_sdk.transport import TransportConfig, TransportStatus
 from scp_sdk.trust import (
+    ATTESTATION_TYPES,
     PARTICIPATION_FACT_VARIANTS,
     PARTICIPATION_THRESHOLD_OPERATORS,
     AttestationSummary,
+    AttestorInfo,
     BehavioralRecord,
     CachedAttestation,
     CachedAttestationEnvelope,
@@ -163,10 +165,13 @@ from scp_sdk.trust import (
     CapabilityValidation,
     ChallengeVerification,
     ChallengeVerificationMethod,
+    EventLogEntry,
+    EventLogEntryPayload,
     ParticipationFact,
     ParticipationProfile,
     ParticipationThreshold,
     RequireParticipation,
+    ThresholdRequirement,
     TrustEvaluation,
     VerificationLevel,
     check_capability_requirements,
@@ -194,12 +199,14 @@ from scp_sdk.ucan import UcanToken
 __version__ = "0.1.0"
 
 __all__ = [
+    "ATTESTATION_TYPES",
     "BRIDGE_ERROR_MAP",
     "PARTICIPATION_FACT_VARIANTS",
     "PARTICIPATION_THRESHOLD_OPERATORS",
     "SCP",
     "AssetEntry",
     "AttestationSummary",
+    "AttestorInfo",
     "BatchPublishResult",
     "BehavioralRecord",
     "BridgeMode",
@@ -220,6 +227,8 @@ __all__ = [
     "DIDDocument",
     "DiscoveryMethod",
     "Event",
+    "EventLogEntry",
+    "EventLogEntryPayload",
     "GovernanceActionResult",
     "Identity",
     "IdentityAttestation",
@@ -263,6 +272,7 @@ __all__ = [
     "SqliteStorage",
     "StorageConfig",
     "TestVector",
+    "ThresholdRequirement",
     "ToolCost",
     "ToolDefinition",
     "ToolError",

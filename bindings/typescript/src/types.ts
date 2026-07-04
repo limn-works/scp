@@ -1453,6 +1453,228 @@ export function encodeChallengeVerifications(
 }
 
 // ---------------------------------------------------------------------------
+// Trust aggregation inputs (§7.3, ADR-058)
+// ---------------------------------------------------------------------------
+
+/**
+ * Attestation type (ADR-017).
+ *
+ * Mirrors the Rust `AttestationType` enum (`scp-core`) — the 8 unit variants
+ * serialize as bare PascalCase strings, both as values and as
+ * `thresholdRequirements` / `attestorSets` map keys.
+ */
+export type AttestationType =
+  | "IdentityLink"
+  | "CapabilityDelegation"
+  | "ToolIntegrity"
+  | "AgentCapability"
+  | "Endorsement"
+  | "RoleAssignment"
+  | "ContextEndorsement"
+  | "ParticipationWitness";
+
+/**
+ * Frozen set of {@link AttestationType} variant names. Imported by the SDK
+ * round-trip tests so renaming a variant trips a compile error.
+ */
+export const ATTESTATION_TYPE_VARIANTS = [
+  "IdentityLink",
+  "CapabilityDelegation",
+  "ToolIntegrity",
+  "AgentCapability",
+  "Endorsement",
+  "RoleAssignment",
+  "ContextEndorsement",
+  "ParticipationWitness",
+] as const satisfies readonly AttestationType[];
+
+/**
+ * Type-specific data carried by an {@link EventLogEntry}.
+ *
+ * Mirrors the Rust `EventPayload` (`scp-event-log`): opaque payload bytes as
+ * a JSON number array (`serde_bytes`). An empty `data` array is the canonical
+ * representation for non-parameterized events.
+ */
+export interface EventLogEntryPayload {
+  /** Opaque payload bytes. Interpretation depends on the event type. */
+  readonly data: readonly number[];
+}
+
+/**
+ * A full signed protocol event in a context event log (ADR-011).
+ *
+ * Mirrors the Rust `Event` (`scp-event-log`) serde wire shape the bridge
+ * deserializes for {@link SCP.aggregateTrustInput} (`Vec<Event>`). This is
+ * the INPUT wire form — distinct from the projected {@link Event} the
+ * event-log query surface returns, which omits the hash-chain and signature
+ * fields. Developer-facing fields are camelCase;
+ * {@link encodeEventLogEntries} maps to the snake_case wire shape.
+ */
+export interface EventLogEntry {
+  /** Event type — a Rust `EventType` variant name (e.g. `"MessageSent"`). */
+  readonly eventType: string;
+  /** DID of the actor who produced this event. */
+  readonly actorDid: string;
+  /** Unix timestamp (seconds) when the event was created. */
+  readonly timestamp: number;
+  /** Monotonic event sequence number within the log (0-indexed). */
+  readonly sequence: number;
+  /** Type-specific event data. */
+  readonly payload: EventLogEntryPayload;
+  /**
+   * SHA-256 hash of the previous event (hash chain), exactly 32 bytes as a
+   * number array. `[0; 32]` for the first event (genesis sentinel).
+   */
+  readonly prevHash: readonly number[];
+  /**
+   * Ed25519 signature over the serialized event content (64 bytes as a
+   * number array).
+   */
+  readonly signature: readonly number[];
+}
+
+/**
+ * N-of-M threshold requirement for attestation verification (ADR-017 §7.3.5).
+ *
+ * Mirrors the Rust `ThresholdRequirement` struct (`scp-core`). The three
+ * penalty fields carry the Rust serde defaults when omitted;
+ * {@link encodeThresholdRequirements} emits them explicitly so the wire form
+ * is identical across bindings.
+ */
+export interface ThresholdRequirement {
+  /** The minimum number of valid attestations required (N). */
+  readonly requiredCount: number;
+  /** The total number of attestors in the set (M). Must be >= `requiredCount`. */
+  readonly totalAttestors: number;
+  /** Minimum independence score, in [0.0, 1.0]. */
+  readonly independenceThreshold: number;
+  /** Independence penalty per shared context membership. Default: 0.1. */
+  readonly sharedContextPenalty?: number;
+  /** Maximum total shared-context penalty for a single pair. Default: 0.5. */
+  readonly sharedContextPenaltyCap?: number;
+  /** Independence penalty per mutual endorsement direction. Default: 0.2. */
+  readonly mutualEndorsementPenalty?: number;
+}
+
+/**
+ * Information about an attestor used for independence scoring (ADR-017
+ * §7.3.5).
+ *
+ * Mirrors the Rust `AttestorInfo` struct (`scp-core`). The optional
+ * `attestation` is the full attestation envelope
+ * ({@link CachedAttestationEnvelope}); only attestations matching the
+ * required type are considered.
+ */
+export interface AttestorInfo {
+  /** The DID of the attestor. */
+  readonly did: string;
+  /** Context IDs the attestor is a member of. */
+  readonly contextMemberships: readonly string[];
+  /** DIDs this attestor has endorsed (mutual endorsements reduce independence). */
+  readonly endorsements: readonly string[];
+  /** The attestation provided by this attestor, if any. */
+  readonly attestation?: CachedAttestationEnvelope | null;
+}
+
+/**
+ * Encodes a typed {@link EventLogEntry} array to the JSON wire shape the
+ * Rust bridge deserializes (`Vec<scp_event_log::Event>`).
+ *
+ * Field names are snake_cased to match `serde_json::to_string`; `prevHash` /
+ * `signature` / `payload.data` pass through as number arrays.
+ *
+ * @throws Error if `prevHash` is not exactly 32 elements or `signature` is
+ *   not exactly 64 elements (before any bridge call).
+ */
+export function encodeEventLogEntries(events: readonly EventLogEntry[]): string {
+  for (const e of events) {
+    requireByteLength("EventLogEntry", "prevHash", 32, e.prevHash);
+    requireByteLength("EventLogEntry", "signature", 64, e.signature);
+  }
+  return JSON.stringify(
+    events.map((e) => ({
+      event_type: e.eventType,
+      actor_did: e.actorDid,
+      timestamp: e.timestamp,
+      sequence: e.sequence,
+      payload: { data: e.payload.data },
+      prev_hash: e.prevHash,
+      signature: e.signature,
+    })),
+  );
+}
+
+/**
+ * Encodes a 32-byte Merkle root to the JSON wire shape the Rust bridge
+ * deserializes (`[u8; 32]` as a number array).
+ *
+ * @throws Error if `merkleRoot` is not exactly 32 elements (before any
+ *   bridge call).
+ */
+export function encodeMerkleRoot(merkleRoot: readonly number[]): string {
+  requireByteLength("AggregationInput", "merkleRoot", 32, merkleRoot);
+  return JSON.stringify(merkleRoot);
+}
+
+/**
+ * Encodes a typed per-attestation-type {@link ThresholdRequirement} map to
+ * the JSON wire shape the Rust bridge deserializes
+ * (`HashMap<AttestationType, ThresholdRequirement>`).
+ *
+ * Map keys are the bare {@link AttestationType} variant strings; the three
+ * optional penalty fields default to the Rust serde defaults (0.1 / 0.5 /
+ * 0.2) and are always emitted explicitly.
+ */
+export function encodeThresholdRequirements(
+  requirements: Readonly<Partial<Record<AttestationType, ThresholdRequirement>>>,
+): string {
+  const wire: Record<string, unknown> = {};
+  for (const [attestationType, requirement] of Object.entries(requirements)) {
+    if (requirement === undefined) {
+      continue;
+    }
+    wire[attestationType] = {
+      required_count: requirement.requiredCount,
+      total_attestors: requirement.totalAttestors,
+      independence_threshold: requirement.independenceThreshold,
+      shared_context_penalty: requirement.sharedContextPenalty ?? 0.1,
+      shared_context_penalty_cap: requirement.sharedContextPenaltyCap ?? 0.5,
+      mutual_endorsement_penalty: requirement.mutualEndorsementPenalty ?? 0.2,
+    };
+  }
+  return JSON.stringify(wire);
+}
+
+/**
+ * Encodes a typed per-attestation-type {@link AttestorInfo} map to the JSON
+ * wire shape the Rust bridge deserializes
+ * (`HashMap<AttestationType, Vec<AttestorInfo>>`).
+ *
+ * Map keys are the bare {@link AttestationType} variant strings; the nested
+ * attestation envelope (when present) is encoded exactly as
+ * {@link encodeCachedAttestations} encodes it. An absent `attestation`
+ * serializes as explicit `null` (matching `serde_json::to_string` of the
+ * Rust `Option<Attestation>`).
+ */
+export function encodeAttestorSets(
+  attestorSets: Readonly<Partial<Record<AttestationType, readonly AttestorInfo[]>>>,
+): string {
+  const wire: Record<string, unknown> = {};
+  for (const [attestationType, attestors] of Object.entries(attestorSets)) {
+    if (attestors === undefined) {
+      continue;
+    }
+    wire[attestationType] = attestors.map((a) => ({
+      did: a.did,
+      context_memberships: a.contextMemberships,
+      endorsements: a.endorsements,
+      attestation: a.attestation != null ? encodeCachedAttestationEnvelope(a.attestation) : null,
+    }));
+  }
+  return JSON.stringify(wire);
+}
+
+// ---------------------------------------------------------------------------
 // Discovery — Address Resolution (§22.2.1, §22.7)
 // ---------------------------------------------------------------------------
 

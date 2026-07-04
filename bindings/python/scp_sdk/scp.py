@@ -58,9 +58,13 @@ if TYPE_CHECKING:
     # annotation is a lazy string, so the name need only resolve for type
     # checkers, not at import time.
     from scp_sdk.trust import (
+        AttestorInfo,
         BehavioralRecord,
         CachedAttestation,
         CapabilityValidation,
+        ChallengeVerification,
+        EventLogEntry,
+        ThresholdRequirement,
         TrustEvaluation,
     )
 
@@ -1853,26 +1857,43 @@ class SCP:
         self,
         context_id: str,
         subject_did: str,
-        events_json: str,
-        merkle_root_json: str,
-        consequence_rules_json: str,
-        threshold_requirements_json: str,
-        attestor_sets_json: str,
-        cached_attestations_json: str,
-        challenge_results_json: str,
+        events: list[EventLogEntry] | list[dict[str, Any]],
+        merkle_root: list[int],
+        consequence_rules: list[dict[str, Any]] | None = None,
+        threshold_requirements: dict[str, ThresholdRequirement] | dict[str, Any] | None = None,
+        attestor_sets: dict[str, list[AttestorInfo]] | dict[str, Any] | None = None,
+        cached_attestations: list[CachedAttestation] | list[dict[str, Any]] | None = None,
+        challenge_results: list[ChallengeVerification] | list[dict[str, Any]] | None = None,
     ) -> Any:
-        """Delegate to ``_scp_core.SCP.aggregate_trust_input``."""
+        """Aggregate all trust engine layers into a single ``TrustInput`` (§7.3).
+
+        Typed counterpart to ``_scp_core.SCP.aggregate_trust_input``
+        (ADR-058): takes the typed trust-aggregation inputs (the same shapes
+        :func:`scp_sdk.trust.aggregate_trust_input` accepts) and serializes
+        them to the serde wire JSON internally via the shared
+        ``scp_sdk.trust._encode_aggregate_trust_wire`` before crossing FFI.
+
+        Raises:
+            ValueError: If ``merkle_root`` is not exactly 32 elements or a
+                ``threshold_requirements`` / ``attestor_sets`` key is not a
+                valid ``scp_sdk.trust.ATTESTATION_TYPES`` name.
+        """
+        from scp_sdk.trust import _encode_aggregate_trust_wire
+
+        wire = _encode_aggregate_trust_wire(
+            events,
+            merkle_root,
+            consequence_rules,
+            threshold_requirements,
+            attestor_sets,
+            cached_attestations,
+            challenge_results,
+        )
         return await asyncio.to_thread(
             self._native.aggregate_trust_input,
             context_id,
             subject_did,
-            events_json,
-            merkle_root_json,
-            consequence_rules_json,
-            threshold_requirements_json,
-            attestor_sets_json,
-            cached_attestations_json,
-            challenge_results_json,
+            *wire,
         )
 
     async def trust_query_score(self, did: str, context_id: str) -> Any:
