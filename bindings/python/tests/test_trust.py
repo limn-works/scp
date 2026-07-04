@@ -1360,3 +1360,40 @@ class TestTrustVerifyTyped:
         from scp_sdk.trust import trust_verify_response
 
         assert trust_verify_response(self._challenge(), self._response()) is False
+
+
+class TestTrustCreateChallenge:
+    """trust_create_challenge wraps the bridge free function unchanged and
+    returns its `challenge_id` / `challenge_json` dict."""
+
+    def test_passes_target_did_through_to_the_bridge(self) -> None:
+        from scp_sdk.trust import trust_create_challenge
+
+        bridge = MagicMock()
+        bridge.trust_create_challenge.return_value = {
+            "challenge_id": "chal-1",
+            "challenge_json": "{}",
+        }
+        with patch("scp_sdk.trust._bridge", return_value=bridge):
+            result = trust_create_challenge("did:dht:zSubject")
+        assert result == {"challenge_id": "chal-1", "challenge_json": "{}"}
+        bridge.trust_create_challenge.assert_called_once_with("did:dht:zSubject")
+
+    def test_real_bridge_call_through(self) -> None:
+        """The REAL bridge issues a signed schema-validation challenge: the
+        returned `challenge_json` parses and targets the subject DID."""
+        pytest.importorskip("_scp_core")
+        from scp_sdk.trust import trust_create_challenge
+
+        result = trust_create_challenge("did:dht:zSubject")
+        assert result["challenge_id"]
+        challenge = json.loads(result["challenge_json"])
+        assert challenge["challenge_id"] == result["challenge_id"]
+        assert challenge["subject_did"] == "did:dht:zSubject"
+        assert len(challenge["signature"]) == 64
+
+    def test_exported_from_the_package_root(self) -> None:
+        import scp_sdk
+        from scp_sdk.trust import trust_create_challenge
+
+        assert scp_sdk.trust_create_challenge is trust_create_challenge

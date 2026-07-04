@@ -1704,6 +1704,32 @@ def trust_verify_response(
     return bridge.trust_verify_response(json.dumps(challenge), json.dumps(response))
 
 
+def trust_create_challenge(target_did: str) -> dict[str, Any]:
+    """Create a challenge request for capability verification (ADR-017,
+    §7.3.4).
+
+    Calls the bridge ``trust_create_challenge`` free function, which builds a
+    schema-validation challenge request for ``target_did`` signed with an
+    ephemeral Ed25519 key. Pass the returned ``challenge_json`` to
+    :func:`trust_verify_response` alongside the responder's serialized
+    :class:`ChallengeResponse`.
+
+    Args:
+        target_did: DID of the entity being challenged.
+
+    Returns:
+        A dict with ``challenge_id`` (str — the unique challenge ID, UUID v4)
+        and ``challenge_json`` (str — the full serialized
+        :class:`ChallengeRequest` JSON).
+
+    Raises:
+        ScpError: If the bridge module is not available, ``target_did`` fails
+            DID validation, or challenge signing fails.
+    """
+    bridge = _bridge()
+    return bridge.trust_create_challenge(target_did)
+
+
 __all__ = [
     "ATTESTATION_TYPES",
     "PARTICIPATION_FACT_VARIANTS",
@@ -1733,6 +1759,7 @@ __all__ = [
     "check_capability_requirements",
     "evaluate_trust",
     "participation_record",
+    "trust_create_challenge",
     "trust_verify_attestation",
     "trust_verify_response",
     "verify_participation_requirements",

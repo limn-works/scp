@@ -640,6 +640,30 @@
           "swift": true
         },
         {
+          "name": "trust_create_challenge",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true,
+          "notes": "Challenge-issuance op (ADR-017, §7.3.4): all four SDKs expose an idiomatic wrapper over the bridge free function (Python scp_sdk.trust_create_challenge, TypeScript SCP.trustCreateChallenge, Kotlin SCP.trustCreateChallenge, Swift SCP.trustCreateChallenge)."
+        },
+        {
+          "name": "trust_verify_attestation",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true,
+          "notes": "Attestation verification op (ADR-017, §7.4): all four SDKs expose an idiomatic typed wrapper taking the CachedAttestationEnvelope wire DTO (Python scp_sdk.trust_verify_attestation, TypeScript SCP.trustVerifyAttestation, Kotlin SCP.trustVerifyAttestation, Swift free function trustVerifyAttestation per ADR-048 §1 + §7)."
+        },
+        {
+          "name": "trust_verify_response",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true,
+          "notes": "Challenge-response verification op (ADR-017, §7.3.4): all four SDKs expose an idiomatic typed wrapper taking the ChallengeRequest/ChallengeResponse wire DTOs (Python scp_sdk.trust_verify_response, TypeScript SCP.trustVerifyResponse, Kotlin SCP.trustVerifyResponse, Swift SCP.trustVerifyResponse)."
+        },
+        {
           "name": "verify_participation_requirements",
           "python": true,
           "typescript": true,
