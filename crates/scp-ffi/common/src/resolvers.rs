@@ -865,11 +865,7 @@ impl scp_core::crypto::ucan::revoke::RevocationEventLogger for BridgeRevocationE
             revoker_did,
         )?;
 
-        // Unix timestamp seconds fit in u64 for centuries.
-        #[allow(clippy::cast_possible_truncation)]
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs());
+        let timestamp = scp_clock::Clock::now_secs(&scp_clock::SystemClock);
 
         let event = scp_event_log::Event {
             event_type: scp_event_log::EventType::TokenRevoked,

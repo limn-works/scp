@@ -340,10 +340,7 @@ fn append_provenance_event(
     event_type: scp_event_log::EventType,
     provenance_hash: &[u8; 32],
 ) -> PyResult<()> {
-    #[allow(clippy::cast_possible_truncation)]
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
+    let timestamp = scp_clock::Clock::now_secs(&scp_clock::SystemClock);
 
     crate::runtime::with_context(bi, context_id, |rt| {
         let sequence = scp_event_log::tree::event_count(&rt.event_log);

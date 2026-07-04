@@ -2101,10 +2101,7 @@ pub(crate) async fn broadcast_subscribe_on(
     let sup = crate::runtime::supervisor(bi)?;
     let context_id = handle.context_id.clone();
     let did: DID = DID(subscriber_did);
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    let timestamp = scp_clock::Clock::now_secs(&scp_clock::SystemClock);
 
     let (tx, rx) = tokio::sync::oneshot::channel();
     let cmd = BroadcastCommand::SubscribeBroadcast {

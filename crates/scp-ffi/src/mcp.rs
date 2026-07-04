@@ -878,9 +878,7 @@ impl ContextProvider for FfiBridgeProvider {
         // block_on`, or a dedicated `std::thread` with its own tiny
         // runtime depending on which regime the caller is in.
         let invoker_did_typed: scp_did::DID = agent_did.clone().into();
-        let now_secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs());
+        let now_secs = scp_clock::Clock::now_secs(&scp_clock::SystemClock);
         let supervisor = crate::runtime::supervisor(&bi).map_err(|e| format!("{e}"))?;
         if !supervisor.try_consume_hard_rate_limit_from_any_context(
             context_id,
@@ -1027,11 +1025,7 @@ impl ContextProvider for FfiBridgeProvider {
 
         let payload_data = serde_json::to_vec(&tool_event).unwrap_or_default();
 
-        // Unix timestamp seconds fit in u64 for centuries.
-        #[allow(clippy::cast_possible_truncation)]
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs());
+        let timestamp = scp_clock::Clock::now_secs(&scp_clock::SystemClock);
 
         // Re-acquire the DashMap lock briefly to append the event.
         // Returns (sequence, serialized_event_bytes) on success for

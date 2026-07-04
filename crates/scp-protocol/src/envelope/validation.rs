@@ -29,6 +29,10 @@ use super::inner::InnerEnvelope;
 ///
 /// Envelopes with timestamps more than this far in the future are rejected.
 /// Spec reference: §9.8.2(c).
+///
+/// Independent knob: shares the protocol-wide §9.14 5-minute skew default with
+/// `crypto::ucan::validate::DEFAULT_CLOCK_SKEW_TOLERANCE_SECS` and the trust
+/// skew tolerances, but is deliberately a distinct constant, not unified.
 pub const DEFAULT_CLOCK_SKEW_TOLERANCE_MS: u64 = 5 * 60 * 1_000;
 
 /// Default maximum message age: 7 days in milliseconds.

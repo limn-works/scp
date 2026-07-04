@@ -4683,10 +4683,7 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
 
         let payload_data = serde_json::to_vec(&tool_event).unwrap_or_default();
 
-        #[allow(clippy::cast_possible_truncation)]
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs());
+        let timestamp = scp_clock::Clock::now_secs(&scp_clock::SystemClock);
 
         // Ensure UCAN state is registered before appending the event.
         if let Some(handle) = context_handle_registry(&bi).get(context_id) {
@@ -6539,10 +6536,7 @@ fn uniffi_append_provenance_event_on(
     event_type: scp_event_log::EventType,
     provenance_hash: &[u8; 32],
 ) -> Result<(), ScpError> {
-    #[allow(clippy::cast_possible_truncation)]
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
+    let timestamp = scp_clock::Clock::now_secs(&scp_clock::SystemClock);
 
     bi.with_ucan_state(context_id, |state| {
         let sequence = scp_event_log::tree::event_count(&state.event_log);
@@ -10891,10 +10885,7 @@ impl Scp {
             .spawn(async move {
                 let sup = bi.context_manager_or_error()?;
                 let did: scp_did::DID = subscriber_did.into();
-                let timestamp = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
+                let timestamp = scp_clock::Clock::now_secs(&scp_clock::SystemClock);
 
                 use scp_core::context::actor::commands::{
                     BroadcastCommand, SubscribeBroadcastPayload,
@@ -12019,9 +12010,7 @@ impl Scp {
                     test_vectors,
                     operator_did: definition.operator_did.into(),
                     cost,
-                    registered_at: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map_or(0, |d| d.as_secs()),
+                    registered_at: scp_clock::Clock::now_secs(&scp_clock::SystemClock),
                     signature: Vec::new(),
                 };
 

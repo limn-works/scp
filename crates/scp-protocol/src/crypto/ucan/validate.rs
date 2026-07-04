@@ -45,6 +45,11 @@ const MAX_EXPIRY_SECS: u64 = 24 * 60 * 60;
 /// Applied to `exp` and `nbf` checks in `verify_expiry` to accommodate
 /// NTP desynchronization between issuer and validator in distributed
 /// deployments.
+///
+/// Independent knob: the sibling skew tolerances in `envelope::validation`,
+/// `trust::challenge`, and `trust::participation` share this §9.14 5-minute
+/// default but are deliberately kept as distinct constants, not unified — each
+/// governs its own subsystem and may diverge if that subsystem's requirements do.
 pub const DEFAULT_CLOCK_SKEW_TOLERANCE_SECS: u64 = 5 * 60;
 
 /// Maximum delegation chain depth to prevent infinite loops.
