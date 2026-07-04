@@ -20,10 +20,14 @@ import pytest
 from scp_sdk.trust import (
     PARTICIPATION_FACT_VARIANTS,
     PARTICIPATION_THRESHOLD_OPERATORS,
+    CapabilityRequirement,
+    ChallengeVerification,
+    ChallengeVerificationMethod,
     ParticipationFact,
     ParticipationProfile,
     ParticipationThreshold,
     RequireParticipation,
+    VerificationLevel,
     check_capability_requirements,
     verify_participation_requirements,
 )
@@ -410,17 +414,22 @@ class TestVerifyParticipationRequirements:
 
 
 class TestCheckCapabilityRequirements:
-    """Tests that check_capability_requirements delegates to the Rust bridge."""
+    """Tests that check_capability_requirements delegates to the Rust bridge.
+
+    The typed input (ADR-058) serializes internally to the exact serde
+    snake_case JSON the ``scp-core`` ``CapabilityRequirement`` /
+    ``ChallengeVerification`` deserialize.
+    """
 
     def test_delegates_to_bridge(self) -> None:
         mock_bridge = MagicMock()
         mock_bridge.check_capability_requirements.return_value = None
 
         requirements = [
-            {
-                "capability": "scp:capability:schema-validation/v1",
-                "verification_level": "SelfAttested",
-            },
+            CapabilityRequirement(
+                capability="scp:capability:schema-validation/v1",
+                verification_level=VerificationLevel("SelfAttested"),
+            ),
         ]
         capabilities = ["scp:capability:schema-validation/v1"]
 
@@ -439,9 +448,118 @@ class TestCheckCapabilityRequirements:
         # agent_capabilities_json, challenge_verifications_json).
         assert call_args[0][0] == "ctx-1"
         assert call_args[0][1] == "did:dht:z6MkAlice"
-        assert json.loads(call_args[0][2]) == requirements
+        # Typed CapabilityRequirement serializes to the serde wire shape.
+        assert json.loads(call_args[0][2]) == [
+            {
+                "capability": "scp:capability:schema-validation/v1",
+                "verification_level": "SelfAttested",
+            },
+        ]
         assert json.loads(call_args[0][3]) == capabilities
         assert json.loads(call_args[0][4]) == []
+
+    def test_serializes_challenge_verified_requirement_and_verification(self) -> None:
+        """A ChallengeVerified requirement + a typed ChallengeVerification
+        serialize to the exact snake_case serde wire shape."""
+        mock_bridge = MagicMock()
+        mock_bridge.check_capability_requirements.return_value = None
+
+        requirements = [
+            CapabilityRequirement(
+                capability="scp:capability:code-review/v1",
+                verification_level=VerificationLevel("ChallengeVerified"),
+            ),
+        ]
+        verification = ChallengeVerification(
+            verification_id="chal-1",
+            verifier_did="did:dht:z6MkVerifier",
+            subject_did="did:dht:z6MkAlice",
+            capability_uri="scp:capability:code-review/v1",
+            challenge_type="scp:capability:code-review/v1",
+            verification_method=ChallengeVerificationMethod(
+                "ChallengeVerified", challenge_type="scp:capability:code-review/v1"
+            ),
+            passed=True,
+            test_count=10,
+            pass_count=10,
+            result={"detail": "ok"},
+            completed_at=1_700_000_000,
+            verified_at=1_700_000_001,
+            expires_at=1_800_000_000,
+            verifier_signature=list(range(64)),
+            score=95,
+            context_id="ctx-1",
+        )
+
+        with patch("scp_sdk.trust._bridge", return_value=mock_bridge):
+            check_capability_requirements(
+                "ctx-1",
+                "did:dht:z6MkAlice",
+                requirements,
+                ["scp:capability:code-review/v1"],
+                [verification],
+            )
+
+        import json
+
+        call_args = mock_bridge.check_capability_requirements.call_args
+        assert json.loads(call_args[0][2]) == [
+            {
+                "capability": "scp:capability:code-review/v1",
+                "verification_level": "ChallengeVerified",
+            },
+        ]
+        assert json.loads(call_args[0][4]) == [
+            {
+                "verification_id": "chal-1",
+                "verifier_did": "did:dht:z6MkVerifier",
+                "subject_did": "did:dht:z6MkAlice",
+                "capability_uri": "scp:capability:code-review/v1",
+                "challenge_type": "scp:capability:code-review/v1",
+                "verification_method": {
+                    "ChallengeVerified": {"challenge_type": "scp:capability:code-review/v1"}
+                },
+                "passed": True,
+                "score": 95,
+                "test_count": 10,
+                "pass_count": 10,
+                "result": {"detail": "ok"},
+                "completed_at": 1_700_000_000,
+                "verified_at": 1_700_000_001,
+                "expires_at": 1_800_000_000,
+                "context_id": "ctx-1",
+                "verifier_signature": list(range(64)),
+            },
+        ]
+
+    def test_self_attested_verification_method_serializes_as_bare_string(self) -> None:
+        """A SelfAttested ChallengeVerificationMethod serializes as the bare
+        variant string, matching the serde untagged enum."""
+        method = ChallengeVerificationMethod("SelfAttested")
+        assert method._to_bridge_value() == "SelfAttested"
+
+    def test_rejects_bad_verification_level(self) -> None:
+        with pytest.raises(ValueError, match="Invalid VerificationLevel"):
+            VerificationLevel("Nonexistent")
+
+    def test_rejects_wrong_signature_length(self) -> None:
+        with pytest.raises(ValueError, match="verifier_signature must be exactly 64"):
+            ChallengeVerification(
+                verification_id="chal-1",
+                verifier_did="did:dht:z6MkVerifier",
+                subject_did="did:dht:z6MkAlice",
+                capability_uri="scp:capability:code-review/v1",
+                challenge_type="scp:capability:code-review/v1",
+                verification_method=ChallengeVerificationMethod("SelfAttested"),
+                passed=True,
+                test_count=1,
+                pass_count=1,
+                result=None,
+                completed_at=1,
+                verified_at=1,
+                expires_at=2,
+                verifier_signature=[0, 1, 2],
+            )
 
     def test_raises_on_bridge_failure(self) -> None:
         mock_bridge = MagicMock()
@@ -450,10 +568,10 @@ class TestCheckCapabilityRequirements:
         )
 
         requirements = [
-            {
-                "capability": "scp:capability:schema-validation/v1",
-                "verification_level": "SelfAttested",
-            },
+            CapabilityRequirement(
+                capability="scp:capability:schema-validation/v1",
+                verification_level=VerificationLevel("SelfAttested"),
+            ),
         ]
 
         with patch("scp_sdk.trust._bridge", return_value=mock_bridge):

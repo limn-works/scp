@@ -602,6 +602,258 @@ class RequireParticipation:
         }
 
 
+# ---------------------------------------------------------------------------
+# Capability admission types (spec §7.3.4.4, SCP-ACR-008, ADR-058)
+# ---------------------------------------------------------------------------
+
+#: Valid capability verification-level names, matching the Rust
+#: ``VerificationLevel`` enum variants in ``scp-core``.
+VERIFICATION_LEVELS: frozenset[str] = frozenset({"SelfAttested", "ChallengeVerified"})
+
+
+@dataclass
+class VerificationLevel:
+    """How a capability must be verified for admission.
+
+    Mirrors the Rust ``VerificationLevel`` enum (``scp-core``). Serializes as
+    the bare variant name string (``"SelfAttested"`` / ``"ChallengeVerified"``).
+
+    - ``"SelfAttested"`` -- the agent claims the capability (present in their
+      capability list); no challenge proof required.
+    - ``"ChallengeVerified"`` -- the capability was verified through the
+      challenge-response protocol. Also satisfies ``SelfAttested``.
+    """
+
+    #: The verification-level variant name.
+    name: str
+
+    def __post_init__(self) -> None:
+        if self.name not in VERIFICATION_LEVELS:
+            msg = (
+                f"Invalid VerificationLevel name {self.name!r}. "
+                f"Valid: {sorted(VERIFICATION_LEVELS)}"
+            )
+            raise ValueError(msg)
+
+
+@dataclass
+class CapabilityRequirement:
+    """A single admission requirement: a capability URI and the minimum
+    verification level needed.
+
+    Mirrors the Rust ``CapabilityRequirement`` struct (``scp-core``). See
+    §7.3.4.4.
+    """
+
+    #: The capability URI that must be present.
+    capability: str
+
+    #: The minimum verification level required.
+    verification_level: VerificationLevel
+
+    def _to_bridge_dict(self) -> dict[str, Any]:
+        """Convert to a dict matching the Rust ``CapabilityRequirement``
+        serde JSON representation."""
+        return {
+            "capability": self.capability,
+            "verification_level": self.verification_level.name,
+        }
+
+
+@dataclass
+class ChallengeVerificationMethod:
+    """How a capability was verified, as recorded in a
+    :class:`ChallengeVerification`.
+
+    Mirrors the Rust ``VerificationMethod`` enum (``scp-core``). Named
+    ``ChallengeVerificationMethod`` in the SDK to avoid colliding with the
+    DID-document ``VerificationMethod`` type in the other bindings; the wire
+    shape is unchanged.
+
+    - ``name == "SelfAttested"`` serializes as the bare string
+      ``"SelfAttested"``.
+    - ``name == "ChallengeVerified"`` serializes as
+      ``{"ChallengeVerified": {"challenge_type": <uri>}}`` and requires
+      ``challenge_type``.
+
+    SECURITY: ``verification_method`` is NOT covered by the verifier signature
+    (ADR-017 caveat) — consumers MUST NOT key trust decisions on it.
+    """
+
+    #: The verification-method variant name.
+    name: str
+
+    #: The challenge-type capability URI. Required iff ``name`` is
+    #: ``"ChallengeVerified"``; must be ``None`` otherwise.
+    challenge_type: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.name not in VERIFICATION_LEVELS:
+            msg = (
+                f"Invalid ChallengeVerificationMethod name {self.name!r}. "
+                f"Valid: {sorted(VERIFICATION_LEVELS)}"
+            )
+            raise ValueError(msg)
+        if self.name == "ChallengeVerified" and self.challenge_type is None:
+            msg = "ChallengeVerificationMethod 'ChallengeVerified' requires challenge_type"
+            raise ValueError(msg)
+        if self.name == "SelfAttested" and self.challenge_type is not None:
+            msg = "ChallengeVerificationMethod 'SelfAttested' must not carry challenge_type"
+            raise ValueError(msg)
+
+    def _to_bridge_value(self) -> Any:
+        """Convert to the serde-tagged value the Rust ``VerificationMethod``
+        deserializes."""
+        if self.name == "SelfAttested":
+            return "SelfAttested"
+        return {"ChallengeVerified": {"challenge_type": self.challenge_type}}
+
+
+@dataclass
+class ChallengeVerification:
+    """A signed record that a specific verifier tested a capability and the
+    agent passed (spec §7.3.4.2, ADR-017).
+
+    Mirrors the Rust ``ChallengeVerification`` struct (``scp-core``). Pass a
+    list of these to :func:`check_capability_requirements` to satisfy
+    ``ChallengeVerified`` requirements.
+
+    SECURITY (ADR-017 caveat): only the *signed* fields bind trust —
+    ``verification_id``, ``verifier_did``, ``subject_did``, ``capability_uri``,
+    ``challenge_type``, ``passed``, ``score``, ``test_count``, ``pass_count``,
+    ``verified_at``, ``expires_at``, ``context_id``. The ``result``,
+    ``completed_at``, and ``verification_method`` fields are NOT signed and can
+    be altered after minting without invalidating the signature. Consumers MUST
+    NOT key trust decisions on those unsigned fields.
+    """
+
+    #: Unique verification identifier (derived from the challenge ID).
+    verification_id: str
+
+    #: DID of the verifier who issued and verified the challenge.
+    verifier_did: str
+
+    #: DID of the subject who answered the challenge.
+    subject_did: str
+
+    #: The capability URI that was verified.
+    capability_uri: str
+
+    #: The type of challenge that was verified (a capability URI string).
+    challenge_type: str
+
+    #: How the capability was verified (unsigned metadata).
+    verification_method: ChallengeVerificationMethod
+
+    #: Whether the subject passed the challenge overall.
+    passed: bool
+
+    #: Total number of test cases in the challenge.
+    test_count: int
+
+    #: Number of test cases the subject passed.
+    pass_count: int
+
+    #: The challenge-specific result from the response (arbitrary JSON, unsigned).
+    result: Any
+
+    #: Unix timestamp (seconds) when the response was completed (unsigned).
+    completed_at: int
+
+    #: Unix timestamp (seconds) when the verification was performed.
+    verified_at: int
+
+    #: Unix timestamp (seconds) when this verification expires.
+    expires_at: int
+
+    #: Ed25519 signature by the verifier over the verification record.
+    #: 64-byte array as a list of integers.
+    verifier_signature: list[int]
+
+    #: Optional numeric score (0-100) for graded challenges.
+    score: int | None = None
+
+    #: Context in which the challenge was issued, if any.
+    context_id: str | None = None
+
+    def __post_init__(self) -> None:
+        _u64_fields = (
+            "completed_at",
+            "verified_at",
+            "expires_at",
+        )
+        for name in _u64_fields:
+            val = getattr(self, name)
+            if val < 0:
+                msg = (
+                    f"ChallengeVerification.{name} must be non-negative "
+                    f"(Rust type is u64), got {val}"
+                )
+                raise ValueError(msg)
+            if val > 0xFFFF_FFFF_FFFF_FFFF:
+                msg = (
+                    f"ChallengeVerification.{name} must be <= 18446744073709551615 "
+                    f"(Rust type is u64), got {val}"
+                )
+                raise ValueError(msg)
+
+        # test_count / pass_count are u32.
+        for name in ("test_count", "pass_count"):
+            val = getattr(self, name)
+            if val < 0:
+                msg = (
+                    f"ChallengeVerification.{name} must be non-negative "
+                    f"(Rust type is u32), got {val}"
+                )
+                raise ValueError(msg)
+            if val > 0xFFFF_FFFF:
+                msg = (
+                    f"ChallengeVerification.{name} must be <= 4294967295 "
+                    f"(Rust type is u32), got {val}"
+                )
+                raise ValueError(msg)
+
+        if self.score is not None and not (0 <= self.score <= 0xFFFF_FFFF):
+            msg = (
+                f"ChallengeVerification.score must be a u32 in [0, 4294967295] "
+                f"or None, got {self.score}"
+            )
+            raise ValueError(msg)
+
+        if len(self.verifier_signature) != 64:
+            msg = (
+                f"ChallengeVerification.verifier_signature must be exactly 64 "
+                f"elements, got {len(self.verifier_signature)}"
+            )
+            raise ValueError(msg)
+        for i, elem in enumerate(self.verifier_signature):
+            if not (0 <= elem <= 255):
+                msg = f"ChallengeVerification.verifier_signature[{i}] must be 0-255, got {elem}"
+                raise ValueError(msg)
+
+    def _to_bridge_dict(self) -> dict[str, Any]:
+        """Convert to a dict matching the Rust ``ChallengeVerification`` serde
+        JSON representation."""
+        return {
+            "verification_id": self.verification_id,
+            "verifier_did": self.verifier_did,
+            "subject_did": self.subject_did,
+            "capability_uri": self.capability_uri,
+            "challenge_type": self.challenge_type,
+            "verification_method": self.verification_method._to_bridge_value(),
+            "passed": self.passed,
+            "score": self.score,
+            "test_count": self.test_count,
+            "pass_count": self.pass_count,
+            "result": self.result,
+            "completed_at": self.completed_at,
+            "verified_at": self.verified_at,
+            "expires_at": self.expires_at,
+            "context_id": self.context_id,
+            "verifier_signature": self.verifier_signature,
+        }
+
+
 def structured_to_capability_validation(result: Any) -> CapabilityValidation:
     """Map a bridge ``CapabilityValidation`` record onto the SDK dataclass.
 
@@ -1097,9 +1349,9 @@ def verify_participation_requirements(
 def check_capability_requirements(
     context_id: str,
     subject_did: str,
-    requirements: list[dict[str, Any]],
+    requirements: list[CapabilityRequirement],
     agent_capabilities: list[str],
-    challenge_verifications: list[dict[str, Any]],
+    challenge_verifications: list[ChallengeVerification],
 ) -> None:
     """Verify an agent's capabilities against a context's admission requirements.
 
@@ -1126,12 +1378,11 @@ def check_capability_requirements(
     Args:
         context_id: The context the agent is being admitted to.
         subject_did: The DID of the agent being admitted. Must be a valid DID.
-        requirements: Capability requirements as bridge-shaped dicts, each
-            ``{"capability": <uri>, "verification_level": "SelfAttested" |
-            "ChallengeVerified"}``.
+        requirements: Typed :class:`CapabilityRequirement` values. Serialized
+            internally to the serde wire shape (ADR-058).
         agent_capabilities: The agent's self-attested capability URIs.
-        challenge_verifications: The agent's ``ChallengeVerification`` records
-            as bridge-shaped dicts.
+        challenge_verifications: The agent's typed :class:`ChallengeVerification`
+            records. Serialized internally to the serde wire shape (ADR-058).
 
     Raises:
         ScpError: If the bridge module is not available.
@@ -1141,9 +1392,11 @@ def check_capability_requirements(
     """
     bridge = _bridge()
 
-    requirements_json = json.dumps(requirements)
+    requirements_json = json.dumps([r._to_bridge_dict() for r in requirements])
     agent_capabilities_json = json.dumps(agent_capabilities)
-    challenge_verifications_json = json.dumps(challenge_verifications)
+    challenge_verifications_json = json.dumps(
+        [c._to_bridge_dict() for c in challenge_verifications]
+    )
 
     bridge.check_capability_requirements(
         context_id,
@@ -1157,16 +1410,21 @@ def check_capability_requirements(
 __all__ = [
     "PARTICIPATION_FACT_VARIANTS",
     "PARTICIPATION_THRESHOLD_OPERATORS",
+    "VERIFICATION_LEVELS",
     "AttestationSummary",
     "BehavioralRecord",
     "CachedAttestation",
     "CachedAttestationEnvelope",
+    "CapabilityRequirement",
     "CapabilityValidation",
+    "ChallengeVerification",
+    "ChallengeVerificationMethod",
     "ParticipationFact",
     "ParticipationProfile",
     "ParticipationThreshold",
     "RequireParticipation",
     "TrustEvaluation",
+    "VerificationLevel",
     "aggregate_trust_input",
     "check_capability_requirements",
     "evaluate_trust",
