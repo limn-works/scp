@@ -299,6 +299,21 @@ jobs:
       - uses: actions/checkout@v5
       - run: bash scripts/check-handler-no-panic.sh
 
+  no-panic-abort:
+    needs: check-draft
+    name: FFI / no panic=abort in cdylib profiles
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      # Self-test MUST run first: it plants panic = "abort" in a scratch
+      # manifest (must be DETECTED) and confirms benign lines
+      # (panic = "unwind" / the clippy lint panic = "deny" / a comment) are
+      # NOT flagged — proving the gate is alive before we trust it on the tree.
+      - name: Self-test gate
+        run: bash scripts/check-no-panic-abort.sh --self-test
+      - name: Real check
+        run: bash scripts/check-no-panic-abort.sh
+
   saga-gating-granularity:
     needs: check-draft
     name: Actor / saga gating granularity (ADR-049 §3a)
@@ -1067,6 +1082,7 @@ jobs:
       - bridge-globals
       - fallback-registry
       - handle-affinity
+      - no-panic-abort
       - no-mutable-globals-rust
       - no-mutable-globals-python
       - no-mutable-globals-ts
@@ -1105,6 +1121,7 @@ jobs:
             "${{ needs.bridge-globals.result }}" \
             "${{ needs.fallback-registry.result }}" \
             "${{ needs.handle-affinity.result }}" \
+            "${{ needs.no-panic-abort.result }}" \
             "${{ needs.no-mutable-globals-rust.result }}" \
             "${{ needs.no-mutable-globals-python.result }}" \
             "${{ needs.no-mutable-globals-ts.result }}" \
