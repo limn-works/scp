@@ -449,10 +449,17 @@ ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
         "typescript": ["reconnect"],
         "kotlin": ["reconnect"],
     },
-    # Context -- ADR-049 Phase 2J joiner handshake. Bare method names whose
-    # auto-generated domain-prefixed candidate (context_reserve_key_package /
-    # context_context_join_from_welcome) does not match the real SDK symbol, so
-    # the mapping must be explicit.
+    # Context -- ADR-049 Phase 2J joiner handshake.
+    #
+    # reserve_key_package NEEDS an explicit mapping: its auto-generated
+    # domain-prefixed candidate is context_reserve_key_package, which does not
+    # match the real SDK symbols (reserve_key_package / reserveKeyPackage).
+    #
+    # join_from_welcome's Python entry (context_join_from_welcome) is REDUNDANT:
+    # the domain_snake for ("Context", "join_from_welcome") is
+    # context_join_from_welcome already (single prefix), so it equals the
+    # auto-generated candidate. It is kept explicit for symmetry with the reserve
+    # entry above.
     ("Context", "reserve_key_package"): {
         "python": ["reserve_key_package"],
         "typescript": ["reserveKeyPackage"],
