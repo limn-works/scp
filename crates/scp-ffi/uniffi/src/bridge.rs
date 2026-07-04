@@ -32,12 +32,12 @@ use sha2::Digest;
 use zeroize::Zeroizing;
 
 use scp_clock::Clock;
+#[cfg(any(test, feature = "allow_in_memory_custody"))]
+use scp_dht::InMemoryDhtClient;
+#[cfg(not(any(test, feature = "allow_in_memory_custody")))]
+use scp_dht::PkarrDhtClient;
 use scp_identity::DidCache;
 use scp_identity::IdentityError;
-#[cfg(any(test, feature = "allow_in_memory_custody"))]
-use scp_identity::InMemoryDhtClient;
-#[cfg(not(any(test, feature = "allow_in_memory_custody")))]
-use scp_identity::PkarrDhtClient;
 use scp_identity::resolver::{DualLayerResolver, NoOpRelayQuerier};
 
 /// DHT client type alias: production builds use [`PkarrDhtClient`] for real
@@ -64,7 +64,10 @@ macro_rules! new_ffi_dht_client {
         let result: Result<FfiDhtClient, IdentityError> = {
             #[cfg(not(any(test, feature = "allow_in_memory_custody")))]
             {
-                FfiDhtClient::new()
+                // `PkarrDhtClient::new()` yields the transport-layer `DhtError`;
+                // map it into `IdentityError` so this macro keeps a single
+                // declared error type across both build configurations.
+                FfiDhtClient::new().map_err(IdentityError::from)
             }
             #[cfg(any(test, feature = "allow_in_memory_custody"))]
             {
@@ -21430,8 +21433,8 @@ mod tests {
         /// the supervisor snapshots.
         fn install_seedable_resolver(
             bi: &Arc<crate::runtime::UniffiBridgeInstance>,
-        ) -> Arc<scp_identity::InMemoryDhtClient> {
-            let dht_client = Arc::new(scp_identity::InMemoryDhtClient::new());
+        ) -> Arc<scp_dht::InMemoryDhtClient> {
+            let dht_client = Arc::new(scp_dht::InMemoryDhtClient::new());
             let resolver = Arc::new(scp_identity::resolver::DualLayerResolver::new(
                 Arc::new(scp_identity::resolver::NoOpRelayQuerier),
                 Arc::clone(&dht_client),
@@ -21449,9 +21452,9 @@ mod tests {
         /// key during single-admin vote verification.
         async fn seed_owner_document_into_resolver(
             owner_identity: &Identity,
-            dht_client: &Arc<scp_identity::InMemoryDhtClient>,
+            dht_client: &Arc<scp_dht::InMemoryDhtClient>,
         ) {
-            use scp_identity::dht_client::DhtClient as _;
+            use scp_dht::DhtClient as _;
             use scp_platform::traits::KeyCustody as _;
 
             let identity = owner_identity
@@ -21472,7 +21475,7 @@ mod tests {
             let public_key =
                 scp_identity::extract_public_key(&identity.did).expect("DID embeds the public key");
             let seq: u64 = 1;
-            let signable = scp_identity::dht::bep44_signable(value, seq);
+            let signable = scp_dht::bep44_signable(value, seq);
             let sig_bytes = custody
                 .0
                 .sign(&identity.identity_key, &signable)

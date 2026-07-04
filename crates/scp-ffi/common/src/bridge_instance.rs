@@ -355,7 +355,7 @@ pub struct CoreFields {
     /// rather than process-global. The `InMemoryDhtClient` stores only signed,
     /// public DID documents — it is a test/demo affordance for the in-memory
     /// custody path; production uses real `did:dht`/`did:web` resolution.
-    dht_client: OnceLock<Arc<scp_identity::InMemoryDhtClient>>,
+    dht_client: OnceLock<Arc<scp_dht::InMemoryDhtClient>>,
 
     /// The DID-resolution cache shared with the production DID resolver.
     ///
@@ -2150,7 +2150,7 @@ impl CoreFields {
     /// minted DID documents into the same `InMemoryDhtClient` the resolver
     /// reads from, so the DID is resolvable for signature verification.
     #[must_use]
-    pub fn dht_client(&self) -> Option<&Arc<scp_identity::InMemoryDhtClient>> {
+    pub fn dht_client(&self) -> Option<&Arc<scp_dht::InMemoryDhtClient>> {
         self.dht_client.get()
     }
 
@@ -2160,7 +2160,7 @@ impl CoreFields {
     /// with the SAME `InMemoryDhtClient` `Arc` the resolver was built over.
     /// Subsequent calls are no-ops (`OnceLock` guarantees single
     /// initialization).
-    pub fn set_dht_client(&self, client: Arc<scp_identity::InMemoryDhtClient>) {
+    pub fn set_dht_client(&self, client: Arc<scp_dht::InMemoryDhtClient>) {
         if self.dht_client.set(client).is_err() {
             tracing::warn!("set_dht_client called but client already initialized — ignoring");
         }

@@ -6,6 +6,7 @@ publish = false
 
 [dependencies]
 scp-clock = { path = "../../crates/scp-clock" }
+scp-dht = { path = "../../crates/scp-dht", features = ["production-dht"] }
 scp-identity = { path = "../../crates/scp-identity", features = ["production-dht"] }
 scp-node = { path = "../../crates/scp-node" }
 scp-platform = { path = "../../crates/scp-platform", features = ["sqlite"] }

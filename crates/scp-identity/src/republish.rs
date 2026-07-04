@@ -35,8 +35,8 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use super::IdentityError;
-use super::dht_client::DhtClient;
 use super::resolution::did_routing_id;
+use scp_dht::DhtClient;
 
 /// Republish interval for DHT: every 2 hours (in seconds).
 pub const REPUBLISH_INTERVAL_SECS: u64 = 2 * 60 * 60;
@@ -832,8 +832,8 @@ async fn migration_republish_loop<D: DhtClient>(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use crate::dht_client::InMemoryDhtClient;
     use crate::resolution::did_routing_id;
+    use scp_dht::InMemoryDhtClient;
 
     fn make_entry(did: &str) -> RepublishEntry {
         RepublishEntry {

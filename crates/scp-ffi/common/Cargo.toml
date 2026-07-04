@@ -11,7 +11,7 @@ publish = false
 default = ["resolvers"]
 # Full resolver implementations (BridgeDidResolver, IdentityBackedDidResolver, etc.).
 # Requires scp-core, scp-identity, tokio, scp-mcp.
-resolvers = ["dep:scp-core", "dep:scp-identity", "dep:scp-event-log", "dep:scp-transport", "dep:scp-platform", "dep:scp-mcp", "dep:tokio", "dep:tokio-util", "dep:async-trait", "dep:thiserror", "dep:tracing", "dep:rand", "dep:ed25519-dalek"]
+resolvers = ["dep:scp-core", "dep:scp-identity", "dep:scp-dht", "dep:scp-event-log", "dep:scp-transport", "dep:scp-platform", "dep:scp-mcp", "dep:tokio", "dep:tokio-util", "dep:async-trait", "dep:thiserror", "dep:tracing", "dep:rand", "dep:ed25519-dalek"]
 # Enables the did:key:{hex} DID format in BridgeDidResolver. This is a
 # non-standard test convenience — production builds must resolve via did:dht:z.
 # BridgeDidResolver delegates decoding to `scp_did::extract_public_key_from_did`,
@@ -27,7 +27,7 @@ custody = ["dep:scp-platform"]
 # Shared relay/node startup code for FFI bridges that need to spawn servers.
 # Requires scp-transport (relay), scp-node (application node), scp-platform
 # (in-memory testing backends), and tokio.
-server = ["dep:scp-transport", "dep:scp-node", "dep:scp-platform", "scp-platform/testing", "scp-platform/filesystem", "scp-platform/file", "dep:scp-identity", "dep:tokio", "dep:tokio-util", "dep:tracing", "dep:thiserror"]
+server = ["dep:scp-transport", "dep:scp-node", "dep:scp-platform", "scp-platform/testing", "scp-platform/filesystem", "scp-platform/file", "dep:scp-identity", "dep:scp-dht", "dep:tokio", "dep:tokio-util", "dep:tracing", "dep:thiserror"]
 
 [dependencies]
 scp-core = { path = "../../scp-core", optional = true }
@@ -37,6 +37,7 @@ scp-clock = { path = "../../scp-clock" }
 scp-did = { path = "../../scp-did" }
 scp-event-log = { path = "../../scp-event-log", optional = true }
 scp-identity = { path = "../../scp-identity", optional = true }
+scp-dht = { path = "../../scp-dht", optional = true }
 scp-transport = { path = "../../scp-transport", features = ["redb-blob"], optional = true }
 scp-node = { path = "../../scp-node", features = ["allow_unencrypted_storage"], optional = true }
 scp-platform = { path = "../../scp-platform", features = ["encrypting", "sqlite"], optional = true }

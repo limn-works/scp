@@ -619,8 +619,9 @@ pub(crate) async fn relay_start_local_on(
 #[cfg(feature = "allow_in_memory_custody")]
 #[allow(clippy::type_complexity)]
 fn build_node_identity_from_uniffi(id: &Identity) -> Result<server::NodeIdentity, ScpError> {
+    use scp_dht::InMemoryDhtClient;
     use scp_ffi_common::server::ConcreteDidMethod;
-    use scp_identity::{DidCache, IdentityError, InMemoryDhtClient};
+    use scp_identity::{DidCache, IdentityError};
     use scp_platform::traits::KeyCustody;
 
     let core_id = id.core_id.clone().ok_or_else(|| ScpError::Identity {

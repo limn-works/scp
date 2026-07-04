@@ -1927,8 +1927,8 @@ mod tests {
         /// the global. Mirrors the `UniFFI` bridge's `install_seedable_resolver`.
         fn install_seedable_resolver(
             bi: &std::sync::Arc<crate::runtime::NapiBridgeInstance>,
-        ) -> std::sync::Arc<scp_identity::InMemoryDhtClient> {
-            let dht_client = std::sync::Arc::new(scp_identity::InMemoryDhtClient::new());
+        ) -> std::sync::Arc<scp_dht::InMemoryDhtClient> {
+            let dht_client = std::sync::Arc::new(scp_dht::InMemoryDhtClient::new());
             let resolver = std::sync::Arc::new(scp_identity::DualLayerResolver::new(
                 std::sync::Arc::new(scp_identity::NoOpRelayQuerier),
                 std::sync::Arc::clone(&dht_client),
@@ -1947,9 +1947,9 @@ mod tests {
         /// single-admin vote verification.
         async fn seed_owner_document_into_resolver(
             owner_identity: &crate::identity::NapiIdentity,
-            dht_client: &std::sync::Arc<scp_identity::InMemoryDhtClient>,
+            dht_client: &std::sync::Arc<scp_dht::InMemoryDhtClient>,
         ) {
-            use scp_identity::DhtClient as _;
+            use scp_dht::DhtClient as _;
             use scp_platform::traits::KeyCustody as _;
 
             let inner = &owner_identity.inner;
@@ -1971,7 +1971,7 @@ mod tests {
             let public_key =
                 scp_identity::extract_public_key(&identity.did).expect("DID embeds the public key");
             let seq: u64 = 1;
-            let signable = scp_identity::dht::bep44_signable(value, seq);
+            let signable = scp_dht::bep44_signable(value, seq);
             let sig_bytes = custody
                 .sign(&identity.identity_key, &signable)
                 .await

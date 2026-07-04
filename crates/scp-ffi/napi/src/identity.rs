@@ -47,13 +47,12 @@ use std::sync::Arc;
 use napi::Error as NapiError;
 use napi_derive::napi;
 use scp_clock::Clock;
+use scp_dht::{DhtClient, InMemoryDhtClient};
 use scp_did::DidDocument;
 #[cfg(all(test, feature = "allow_in_memory_custody"))]
 use scp_identity::DidMethod;
-use scp_identity::{DhtClient, IdentityError};
-use scp_identity::{
-    DidCache, DidDht, DualLayerResolver, InMemoryDhtClient, NoOpRelayQuerier, ScpIdentity,
-};
+use scp_identity::IdentityError;
+use scp_identity::{DidCache, DidDht, DualLayerResolver, NoOpRelayQuerier, ScpIdentity};
 #[cfg(feature = "allow_in_memory_custody")]
 use scp_platform::testing::InMemoryKeyCustody;
 #[cfg(feature = "allow_in_memory_custody")]
@@ -170,7 +169,7 @@ pub(crate) async fn publish_to_shared_dht_for(
 
     // Build BEP44 signable payload and sign with the identity key.
     let seq: u64 = 1;
-    let signable = scp_identity::dht::bep44_signable(value, seq);
+    let signable = scp_dht::bep44_signable(value, seq);
     let sig_bytes = match custody.sign(&identity.identity_key, &signable).await {
         Ok(sig) => sig.into_bytes(),
         Err(e) => {

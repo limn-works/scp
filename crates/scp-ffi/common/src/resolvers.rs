@@ -911,10 +911,11 @@ impl scp_core::crypto::ucan::revoke::RevocationEventLogger for BridgeRevocationE
 mod tests {
     use super::*;
     use scp_core::crypto::ucan::validate::DidResolver as CoreDidResolver;
+    use scp_dht::InMemoryDhtClient;
     use scp_did::DidDocument;
     use scp_identity::cache::DidCache;
     use scp_identity::resolver::{ResolutionSource, ResolvedDidDocument};
-    use scp_identity::{DidMethod, DualLayerResolver, InMemoryDhtClient, NoOpRelayQuerier};
+    use scp_identity::{DidMethod, DualLayerResolver, NoOpRelayQuerier};
     use std::sync::Arc;
 
     /// Helper: create a `DualLayerResolver` with in-memory backends for testing.
@@ -1182,7 +1183,7 @@ mod tests {
     /// (`verify_self_certification`) the real resolver enforces.
     #[allow(clippy::similar_names)]
     async fn seed_identity(dht: &InMemoryDhtClient, with_agent: bool) -> SeededIdentity {
-        use scp_identity::DhtClient;
+        use scp_dht::DhtClient;
 
         // All RNG-bound key generation and signing happens synchronously and is
         // scoped into this block so the non-`Send` `ThreadRng` is dropped before
@@ -1219,7 +1220,7 @@ mod tests {
             // BEP44-sign the serialized document with the identity key (seq = 1),
             // matching DidDht::publish_document.
             let value = doc.to_json().unwrap().into_bytes();
-            let signable = scp_identity::dht::bep44_signable(&value, 1);
+            let signable = scp_dht::bep44_signable(&value, 1);
             let signature: [u8; 64] = identity_sk.sign(&signable).to_bytes();
 
             (

@@ -49,6 +49,7 @@ scp-protocol = { path = "../scp-protocol", version = "=0.1.0-beta.2" }
 scp-mls = { path = "../scp-mls", version = "=0.1.0-beta.2" }
 scp-platform = { path = "../scp-platform", version = "=0.1.0-beta.2" }
 scp-identity = { path = "../scp-identity", version = "=0.1.0-beta.2" }
+scp-dht = { path = "../scp-dht", version = "=0.1.0-beta.2" }
 scp-event-log = { path = "../scp-event-log", version = "=0.1.0-beta.2" }
 async-trait = { workspace = true }
 aes = { workspace = true }

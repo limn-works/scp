@@ -724,7 +724,7 @@ pub type ToolHandler =
 /// in the enforcement allowlist. See `scripts/check-no-bridge-globals.sh`.
 ///
 /// See issue #1144 (UCAN validation tests require shared DHT state).
-static SHARED_DHT_CLIENT: OnceLock<Arc<scp_identity::InMemoryDhtClient>> = OnceLock::new();
+static SHARED_DHT_CLIENT: OnceLock<Arc<scp_dht::InMemoryDhtClient>> = OnceLock::new();
 
 /// Returns the production DID resolver on the given bridge instance, if
 /// initialized.
@@ -744,7 +744,7 @@ pub fn did_resolver(
 /// Used by `identity_create` to publish DID documents so that the resolver
 /// can later find them during UCAN validation (#1144).
 #[must_use]
-pub fn shared_dht_client() -> Option<&'static Arc<scp_identity::InMemoryDhtClient>> {
+pub fn shared_dht_client() -> Option<&'static Arc<scp_dht::InMemoryDhtClient>> {
     SHARED_DHT_CLIENT.get()
 }
 
@@ -752,7 +752,7 @@ pub fn shared_dht_client() -> Option<&'static Arc<scp_identity::InMemoryDhtClien
 ///
 /// Called by `ensure_did_resolver_initialized` in `identity.rs`. Subsequent
 /// calls are no-ops (`OnceLock` guarantees single initialization).
-pub fn init_shared_dht_client(client: Arc<scp_identity::InMemoryDhtClient>) {
+pub fn init_shared_dht_client(client: Arc<scp_dht::InMemoryDhtClient>) {
     let _ = SHARED_DHT_CLIENT.set(client);
 }
 

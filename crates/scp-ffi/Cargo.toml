@@ -41,6 +41,7 @@ tokio = { workspace = true }
 tokio-util = { workspace = true }
 scp-core = { path = "../scp-core" }
 scp-identity = { path = "../scp-identity" }
+scp-dht = { path = "../scp-dht" }
 scp-clock = { path = "../scp-clock" }
 scp-did = { path = "../scp-did" }
 scp-event-log = { path = "../scp-event-log" }

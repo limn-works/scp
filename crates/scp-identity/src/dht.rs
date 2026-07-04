@@ -32,9 +32,9 @@ use sha2::{Digest, Sha256};
 use scp_platform::traits::{KeyCustody, KeyType, PreRotationCustody, PreRotationKeyHandle};
 
 use super::cache::{DidCache, DidResolutionResult, Staleness};
-use super::dht_client::{DhtClient, InMemoryDhtClient};
 use super::{DidMethod, IdentityError, ScpIdentity};
 use scp_clock::{Clock, SystemClock};
+use scp_dht::{DhtClient, InMemoryDhtClient};
 use scp_did::{
     DidDocument, DidRotationEvent, MigrationProof, PreRotationProof, decode_multibase_key,
 };
@@ -802,26 +802,6 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
         Ok(())
     }
 
-    /// Constructs the BEP44 signable payload for a value and sequence number.
-    ///
-    /// Delegates to the standalone [`bep44_signable`] function.
-    #[must_use]
-    pub fn bep44_signable(value: &[u8], seq: u64) -> Vec<u8> {
-        bep44_signable(value, seq)
-    }
-
-    /// Verifies a BEP44 Ed25519 signature over the given value and sequence.
-    ///
-    /// Delegates to the standalone [`verify_bep44_signature`] function.
-    fn verify_bep44_signature(
-        public_key: &[u8; 32],
-        signature: &[u8; 64],
-        value: &[u8],
-        seq: u64,
-    ) -> Result<(), IdentityError> {
-        verify_bep44_signature(public_key, signature, value, seq)
-    }
-
     /// Extracts the 32-byte public key from a `did:dht:z...` string.
     ///
     /// Delegates to the standalone [`extract_public_key`] function.
@@ -860,7 +840,7 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
         let seq = self.sequence.fetch_add(1, Ordering::AcqRel) + 1;
 
         // Construct the BEP44 signable payload and sign it.
-        let signable = Self::bep44_signable(value, seq);
+        let signable = scp_dht::bep44_signable(value, seq);
         let sig_bytes = sign_fn(identity.identity_key.id(), signable).await?;
 
         // Convert signature to [u8; 64].
@@ -976,7 +956,7 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
             .ok_or_else(|| IdentityError::DhtNotFound(did_string.to_owned()))?;
 
         // Step 3: Verify BEP44 signature.
-        Self::verify_bep44_signature(&public_key, &record.signature, &record.value, record.seq)?;
+        scp_dht::verify_bep44_signature(&public_key, &record.signature, &record.value, record.seq)?;
 
         // Step 4: Deserialize the DID document.
         let doc_json = String::from_utf8(record.value).map_err(|e| {
@@ -2637,52 +2617,6 @@ pub fn verify_migration(
 // BEP44 utility functions — public for use by relay-based resolution (§3.10.2)
 // ---------------------------------------------------------------------------
 
-/// Constructs the BEP44 signable payload for a value and sequence number.
-///
-/// BEP44 signing payload format (without salt):
-/// `"3:seqi" + seq + "e1:v" + val_len + ":" + val`
-///
-/// This is a standalone function usable from both [`DidDht`] and relay-based
-/// resolution (§3.10.2).
-#[must_use]
-pub fn bep44_signable(value: &[u8], seq: u64) -> Vec<u8> {
-    let mut payload = Vec::new();
-    payload.extend_from_slice(b"3:seqi");
-    payload.extend_from_slice(seq.to_string().as_bytes());
-    payload.extend_from_slice(b"e1:v");
-    payload.extend_from_slice(value.len().to_string().as_bytes());
-    payload.extend_from_slice(b":");
-    payload.extend_from_slice(value);
-    payload
-}
-
-/// Verifies a BEP44 Ed25519 signature over the given value and sequence.
-///
-/// Constructs the BEP44 signable payload, then verifies the Ed25519 signature
-/// against `public_key`. Used by both DHT resolution and relay-based resolution
-/// (§3.10.2).
-///
-/// # Errors
-///
-/// Returns [`IdentityError::Bep44SignatureInvalid`] if the signature does
-/// not verify or the public key is invalid.
-pub fn verify_bep44_signature(
-    public_key: &[u8; 32],
-    signature: &[u8; 64],
-    value: &[u8],
-    seq: u64,
-) -> Result<(), IdentityError> {
-    let verifying_key = VerifyingKey::from_bytes(public_key)
-        .map_err(|e| IdentityError::Bep44SignatureInvalid(format!("invalid public key: {e}")))?;
-
-    let sig = ed25519_dalek::Signature::from_bytes(signature);
-    let payload = bep44_signable(value, seq);
-
-    verifying_key.verify_strict(&payload, &sig).map_err(|e| {
-        IdentityError::Bep44SignatureInvalid(format!("signature verification failed: {e}"))
-    })
-}
-
 /// Derives the `did:dht:z...` string from a raw Ed25519 public key.
 ///
 /// Encodes the 32-byte public key as z-base-32 and prepends the `did:dht:z`
@@ -2760,8 +2694,8 @@ mod tests {
     use scp_platform::testing::InMemoryKeyCustody;
 
     use super::*;
-    use crate::dht_client::InMemoryDhtClient;
     use scp_clock::TestClock;
+    use scp_dht::{DhtError, InMemoryDhtClient};
 
     /// Helper to create a fully-configured `DidDht` for testing.
     fn make_dht_with_custody(
@@ -3214,17 +3148,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bep44_signable_format_is_correct() {
-        let value = b"test";
-        let seq = 42;
-        let signable = DidDht::<InMemoryDhtClient>::bep44_signable(value, seq);
-
-        // Expected: "3:seqi42e1:v4:test"
-        let expected = b"3:seqi42e1:v4:test";
-        assert_eq!(signable, expected);
-    }
-
-    #[tokio::test]
     async fn resolve_with_staleness_detection() {
         let custody = Arc::new(InMemoryKeyCustody::new());
         let dht_client = Arc::new(InMemoryDhtClient::new());
@@ -3388,7 +3311,7 @@ mod tests {
     /// signature-verify path reaches — MUST agree on canonicality. This test
     /// feeds the *same* non-canonical `did:dht:z…` fixture to both and asserts
     /// both reject it (and both accept the canonical spelling), pinning the
-    /// security-parity invariant from ADR-057's T1c passage: the browser path
+    /// security-parity invariant from ADR-057's T1c-b passage: the browser path
     /// must never verify against a key native would reject as non-canonical.
     #[test]
     fn native_and_scp_did_parsers_agree_on_canonicality() {
@@ -6050,7 +5973,7 @@ mod tests {
             signature: &[u8; 64],
             value: &[u8],
             seq: u64,
-        ) -> impl Future<Output = Result<(), IdentityError>> + Send {
+        ) -> impl Future<Output = Result<(), DhtError>> + Send {
             let pk = *public_key;
             let sig = *signature;
             let val = value.to_vec();
@@ -6067,8 +5990,7 @@ mod tests {
         fn resolve(
             &self,
             public_key: &[u8; 32],
-        ) -> impl Future<Output = Result<Option<crate::dht_client::DhtRecord>, IdentityError>> + Send
-        {
+        ) -> impl Future<Output = Result<Option<scp_dht::DhtRecord>, DhtError>> + Send {
             let pk = *public_key;
             async move { self.inner.resolve(&pk).await }
         }
@@ -6794,7 +6716,7 @@ mod tests {
             signature: &[u8; 64],
             value: &[u8],
             seq: u64,
-        ) -> impl Future<Output = Result<(), IdentityError>> + Send {
+        ) -> impl Future<Output = Result<(), DhtError>> + Send {
             let pk = *public_key;
             let sig = *signature;
             let val = value.to_vec();
@@ -6809,14 +6731,14 @@ mod tests {
                 match mode {
                     FailingPublishMode::FailOnNew => {
                         // Don't record: nothing actually hit the wire.
-                        return Err(IdentityError::DhtPublishFailed(
+                        return Err(DhtError::DhtPublishFailed(
                             "simulated step-7 publish failure".to_owned(),
                         ));
                     }
                     FailingPublishMode::FailOnOldAfterNew if idx == 1 => {
                         // The OLD republish (second publish in migrate_identity).
                         // Don't record — it failed.
-                        return Err(IdentityError::DhtPublishFailed(
+                        return Err(DhtError::DhtPublishFailed(
                             "simulated step-8 publish failure".to_owned(),
                         ));
                     }
@@ -6830,8 +6752,7 @@ mod tests {
         fn resolve(
             &self,
             public_key: &[u8; 32],
-        ) -> impl Future<Output = Result<Option<crate::dht_client::DhtRecord>, IdentityError>> + Send
-        {
+        ) -> impl Future<Output = Result<Option<scp_dht::DhtRecord>, DhtError>> + Send {
             let pk = *public_key;
             async move { self.inner.resolve(&pk).await }
         }
