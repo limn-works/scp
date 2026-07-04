@@ -82,7 +82,7 @@ pub struct MetadataRecord {
 /// to join a context. Hiding them would undermine informed consent.
 ///
 /// See spec §5.7.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StructuralMetadata {
     /// Template ID, if created from a well-known template (§5.12).
     pub template_id: Option<TemplateId>,
@@ -121,7 +121,7 @@ pub struct StructuralMetadata {
 /// metadata through internal context state.
 ///
 /// See spec §5.7.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OperationalMetadata {
     /// Current member count. Filtered by `visibility_policy.member_count`.
     pub member_count: Option<u64>,
@@ -149,6 +149,31 @@ pub struct OperationalMetadata {
 }
 
 // Default derived — all fields are `Option<_>` and default to `None`.
+
+// ---------------------------------------------------------------------------
+// MetadataSnapshot (§5.12.3.1 — invitation bundle metadata view)
+// ---------------------------------------------------------------------------
+
+/// A point-in-time, visibility-filtered VIEW of a context's metadata carried
+/// inside an [`InvitationBundle`](super::invitation_bundle::InvitationBundle)
+/// (spec §5.12.3.1).
+///
+/// Unlike [`MetadataRecord`], a snapshot carries no signature or sequence of
+/// its own — it is authenticated as part of the enclosing bundle's creator
+/// signature over `metadata_snapshot_hash`. Its `structural` fields are derived
+/// from the bundle's `context_params` and MUST agree with them (verified by
+/// [`InvitationBundle::verify_structural_consistency`](super::invitation_bundle::InvitationBundle::verify_structural_consistency));
+/// its `operational` fields carry runtime state (member count, age, name) not
+/// present in `context_params`.
+///
+/// See spec §5.12.3.1.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetadataSnapshot {
+    /// Structural metadata — derived from `context_params`, always visible.
+    pub structural: StructuralMetadata,
+    /// Operational metadata — visibility-filtered runtime state.
+    pub operational: OperationalMetadata,
+}
 
 // ---------------------------------------------------------------------------
 // Tests

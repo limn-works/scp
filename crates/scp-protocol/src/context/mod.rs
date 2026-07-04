@@ -12,6 +12,7 @@ pub mod export;
 pub mod governance;
 pub mod group_context_extension;
 pub mod invitation;
+pub mod invitation_bundle;
 pub mod membership;
 pub mod memory_scope;
 pub mod metadata;
@@ -43,7 +44,13 @@ pub use governance::{
 pub use group_context_extension::{
     SCP_CONTEXT_EXTENSION_TYPE_ID, ScpContextBindingError, ScpContextExtension,
 };
+pub use invitation_bundle::{
+    InvitationBundle, InvitationBundleError, InvitationKeyMaterial, JoinResponse,
+};
 pub use membership::{MemberInfo, MembershipState};
+pub use metadata::{
+    Ed25519Signature, MetadataRecord, MetadataSnapshot, OperationalMetadata, StructuralMetadata,
+};
 pub use nesting::{compute_ceiling_intersection, validate_child_ttl, validate_nesting_depth};
 pub use params::{
     BridgeCapability, BridgeDirectionality, BridgeMetadata, Capability, CeilingPolicy, ContextMode,
