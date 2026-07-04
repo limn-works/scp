@@ -240,6 +240,65 @@ final class TrustAdmissionEncoderTests: XCTestCase {
         XCTAssertEqual(first["context_id"] as? String, "ctx-1")
     }
 
+    // MARK: - Byte-length validation (encode-time, before any bridge call)
+
+    func testWrongLengthProfileByteArraysThrowValidationBeforeBridgeCall() throws {
+        let badProfile = ParticipationProfile(
+            subjectDid: "did:key:zSubject",
+            participationDurationSecs: 0,
+            governanceActionsAgainst: 0,
+            governanceActionsBy: 0,
+            toolInvocationCount: 0,
+            toolInvocationCountAnchored: false,
+            contextCreationCount: 0,
+            roleProgressionCount: 0,
+            attestationCount: 0,
+            updatedAt: 0,
+            eventLogRoot: [1, 2, 3],
+            signerPublicKey: Array(repeating: 2, count: 32),
+            signature: Array(repeating: 3, count: 64)
+        )
+        XCTAssertThrowsError(try encodeParticipationProfileJson([badProfile])) { error in
+            guard case let ScpError.Validation(msg, code) = error else {
+                return XCTFail("expected ScpError.Validation, got \(error)")
+            }
+            XCTAssertEqual(
+                msg,
+                "ParticipationProfile.eventLogRoot must be exactly 32 elements, got 3"
+            )
+            XCTAssertEqual(code, "SCP-VALID-7062")
+        }
+    }
+
+    func testWrongLengthVerifierSignatureThrowsValidationBeforeBridgeCall() throws {
+        let badVerification = ChallengeVerification(
+            verificationId: "ver-bad",
+            verifierDid: "did:key:zVerifier",
+            subjectDid: "did:key:zSubject",
+            capabilityUri: "scp:capability:schema-validation/v1",
+            challengeType: "scp:capability:schema-validation/v1",
+            verificationMethod: .selfAttested,
+            passed: true,
+            testCount: 1,
+            passCount: 1,
+            result: JSONValue.null,
+            completedAt: 1,
+            verifiedAt: 2,
+            expiresAt: 3,
+            verifierSignature: Array(repeating: 9, count: 63)
+        )
+        XCTAssertThrowsError(try encodeChallengeVerificationsJson([badVerification])) { error in
+            guard case let ScpError.Validation(msg, code) = error else {
+                return XCTFail("expected ScpError.Validation, got \(error)")
+            }
+            XCTAssertEqual(
+                msg,
+                "ChallengeVerification.verifierSignature must be exactly 64 elements, got 63"
+            )
+            XCTAssertEqual(code, "SCP-VALID-7063")
+        }
+    }
+
     // MARK: - Agent capabilities encoder
 
     func testAgentCapabilitiesEncodeAsStringArray() throws {

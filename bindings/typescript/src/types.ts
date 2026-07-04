@@ -1231,14 +1231,43 @@ export function encodeRequireParticipation(requirements: readonly RequirePartici
 }
 
 /**
+ * Throws when a fixed-length byte-array field has the wrong number of
+ * elements, so a malformed profile/verification fails at encode time with a
+ * field-named error instead of surfacing as a Rust `[u8; N]` deserialization
+ * error after the bridge call. Mirrors the Python SDK's construction-time
+ * checks (ADR-058 misuse resistance).
+ */
+function requireByteLength(
+  typeName: string,
+  fieldName: string,
+  expectedLength: number,
+  actual: readonly number[],
+): void {
+  if (actual.length !== expectedLength) {
+    throw new Error(
+      `${typeName}.${fieldName} must be exactly ${expectedLength} elements, got ${actual.length}`,
+    );
+  }
+}
+
+/**
  * Encodes a typed {@link ParticipationProfile} array to the JSON wire shape
  * expected by the Rust bridge (`Vec<ParticipationProfile>`).
  *
  * Field names are snake_cased to match `serde_json::to_string`. Byte-array
  * fields (`eventLogRoot`, `signerPublicKey`, `signature`) pass through as
  * number arrays.
+ *
+ * @throws Error if `eventLogRoot` / `signerPublicKey` are not exactly 32
+ *   elements or `signature` is not exactly 64 elements (before any bridge
+ *   call).
  */
 export function encodeParticipationProfile(profiles: readonly ParticipationProfile[]): string {
+  for (const p of profiles) {
+    requireByteLength("ParticipationProfile", "eventLogRoot", 32, p.eventLogRoot);
+    requireByteLength("ParticipationProfile", "signerPublicKey", 32, p.signerPublicKey);
+    requireByteLength("ParticipationProfile", "signature", 64, p.signature);
+  }
   return JSON.stringify(
     profiles.map((p) => ({
       subject_did: p.subjectDid,
@@ -1391,10 +1420,16 @@ function encodeChallengeVerificationMethod(method: ChallengeVerificationMethod):
  * `verificationMethod` discriminated union is encoded to the serde-tagged
  * shape; `verifierSignature` passes through as a number array. `score` and
  * `contextId` default to `null` when absent.
+ *
+ * @throws Error if `verifierSignature` is not exactly 64 elements (before any
+ *   bridge call).
  */
 export function encodeChallengeVerifications(
   verifications: readonly ChallengeVerification[],
 ): string {
+  for (const v of verifications) {
+    requireByteLength("ChallengeVerification", "verifierSignature", 64, v.verifierSignature);
+  }
   return JSON.stringify(
     verifications.map((v) => ({
       verification_id: v.verificationId,

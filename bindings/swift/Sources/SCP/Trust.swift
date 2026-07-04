@@ -1411,11 +1411,49 @@ public func encodeRequireParticipationJson(_ requirements: [RequireParticipation
     try encodeTrustAdmissionJson(requirements)
 }
 
+/// Throws ``ScpError/Validation(msg:code:)`` when a fixed-length byte-array
+/// field has the wrong number of elements, so a malformed profile/verification
+/// fails at encode time with a field-named error instead of surfacing as a
+/// Rust `[u8; N]` deserialization error after the bridge call. Mirrors the
+/// Python SDK's construction-time checks (ADR-058 misuse resistance).
+private func requireByteLength(
+    _ typeName: String,
+    _ fieldName: String,
+    expected: Int,
+    actual: [UInt8],
+    code: String
+) throws {
+    guard actual.count == expected else {
+        throw ScpError.Validation(
+            msg: "\(typeName).\(fieldName) must be exactly \(expected) elements, got \(actual.count)",
+            code: code
+        )
+    }
+}
+
 /// Encodes a typed ``ParticipationProfile`` array to the JSON wire shape the
 /// bridge deserializes (`Vec<ParticipationProfile>`). Byte-array fields pass
 /// through as JSON number arrays.
+///
+/// - Throws: ``ScpError/Validation(msg:code:)`` if `eventLogRoot` /
+///   `signerPublicKey` are not exactly 32 elements or `signature` is not
+///   exactly 64 elements (before any bridge call).
 public func encodeParticipationProfileJson(_ profiles: [ParticipationProfile]) throws -> String {
-    try encodeTrustAdmissionJson(profiles)
+    for profile in profiles {
+        try requireByteLength(
+            "ParticipationProfile", "eventLogRoot",
+            expected: 32, actual: profile.eventLogRoot, code: "SCP-VALID-7062"
+        )
+        try requireByteLength(
+            "ParticipationProfile", "signerPublicKey",
+            expected: 32, actual: profile.signerPublicKey, code: "SCP-VALID-7062"
+        )
+        try requireByteLength(
+            "ParticipationProfile", "signature",
+            expected: 64, actual: profile.signature, code: "SCP-VALID-7062"
+        )
+    }
+    return try encodeTrustAdmissionJson(profiles)
 }
 
 /// Encodes a typed ``CapabilityRequirement`` array to the JSON wire shape the
@@ -1430,8 +1468,17 @@ public func encodeCapabilityRequirementsJson(_ requirements: [CapabilityRequirem
 /// discriminated union is encoded to its serde-tagged shape; `verifierSignature`
 /// passes through as a number array; `score` / `contextId` serialize as explicit
 /// `null` when absent.
+///
+/// - Throws: ``ScpError/Validation(msg:code:)`` if `verifierSignature` is not
+///   exactly 64 elements (before any bridge call).
 public func encodeChallengeVerificationsJson(_ verifications: [ChallengeVerification]) throws -> String {
-    try encodeTrustAdmissionJson(verifications)
+    for verification in verifications {
+        try requireByteLength(
+            "ChallengeVerification", "verifierSignature",
+            expected: 64, actual: verification.verifierSignature, code: "SCP-VALID-7063"
+        )
+    }
+    return try encodeTrustAdmissionJson(verifications)
 }
 
 /// Encodes the agent's self-attested capability URIs to the JSON wire shape the

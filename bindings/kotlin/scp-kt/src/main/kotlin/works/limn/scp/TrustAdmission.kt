@@ -12,7 +12,7 @@
 // crossing FFI. Mirrors the Swift SDK `Trust.swift` admission types and the
 // TypeScript SDK `types.ts` admission types field-for-field.
 //
-// Provenance: ADR-058 (.docs/adrs/phase-2.md), spec §7.3.2.1 / §7.3.4
+// Provenance: ADR-058 (.docs/adrs/phase-4.md), spec §7.3.2.1 / §7.3.4
 // (.docs/specs/07-trust-validation-and-capabilities.md), ADR-017
 // (.docs/adrs/phase-4.md).
 
@@ -406,8 +406,9 @@ data class RequireParticipation(
  * snake_case the Rust core deserializes (`Vec<ParticipationProfile>`); the
  * three byte-array fields ([eventLogRoot]/[signerPublicKey], 32 bytes each;
  * [signature], 64 bytes) serialize as JSON number arrays, matching the Rust
- * `[u8; N]`/`serde_bytes` representation — the Rust side rejects wrong-length
- * arrays at deserialize time. Mirrors the Swift SDK `ParticipationProfile`,
+ * `[u8; N]`/`serde_bytes` representation — [encodeParticipationProfileJson]
+ * rejects wrong-length arrays before the bridge call, and the Rust side
+ * rejects them again at deserialize time. Mirrors the Swift SDK `ParticipationProfile`,
  * the TypeScript SDK `ParticipationProfile`, and the Rust struct 1:1.
  * See §7.3.2.1.
  *
@@ -467,6 +468,30 @@ fun encodeCapabilityRequirementsJson(requirements: List<CapabilityRequirement>):
         requirements,
     )
 
+/** Expected element count of a 32-byte field (Rust `[u8; 32]`). */
+private const val BYTES_32 = 32
+
+/** Expected element count of a 64-byte field (Rust `[u8; 64]`). */
+private const val BYTES_64 = 64
+
+/**
+ * Throws [IllegalArgumentException] when a fixed-length byte-array field has
+ * the wrong number of elements, so a malformed profile/verification fails at
+ * encode time with a field-named error instead of surfacing as a Rust
+ * `[u8; N]` deserialization error after the bridge call. Mirrors the Python
+ * SDK's construction-time checks (ADR-058 misuse resistance).
+ */
+private fun requireByteLength(
+    typeName: String,
+    fieldName: String,
+    expectedLength: Int,
+    actual: List<UByte>,
+) {
+    require(actual.size == expectedLength) {
+        "$typeName.$fieldName must be exactly $expectedLength elements, got ${actual.size}"
+    }
+}
+
 /**
  * Encodes a typed [ChallengeVerification] list to the JSON wire shape the
  * bridge deserializes (`Vec<ChallengeVerification>`). The
@@ -474,12 +499,24 @@ fun encodeCapabilityRequirementsJson(requirements: List<CapabilityRequirement>):
  * its serde-tagged shape; [ChallengeVerification.verifierSignature] passes
  * through as a number array; absent `score` / `context_id` serialize as
  * explicit `null`.
+ *
+ * @throws IllegalArgumentException if [ChallengeVerification.verifierSignature]
+ *   is not exactly 64 elements (before any bridge call).
  */
-fun encodeChallengeVerificationsJson(verifications: List<ChallengeVerification>): String =
-    trustAdmissionJson.encodeToString(
+fun encodeChallengeVerificationsJson(verifications: List<ChallengeVerification>): String {
+    for (verification in verifications) {
+        requireByteLength(
+            "ChallengeVerification",
+            "verifierSignature",
+            BYTES_64,
+            verification.verifierSignature,
+        )
+    }
+    return trustAdmissionJson.encodeToString(
         ListSerializer(ChallengeVerification.serializer()),
         verifications,
     )
+}
 
 /**
  * Encodes the agent's self-attested capability URIs to the JSON wire shape the
@@ -506,9 +543,25 @@ fun encodeRequireParticipationJson(requirements: List<RequireParticipation>): St
  * Encodes a typed [ParticipationProfile] list to the JSON wire shape the
  * bridge deserializes (`Vec<ParticipationProfile>`). Byte-array fields pass
  * through as JSON number arrays.
+ *
+ * @throws IllegalArgumentException if [ParticipationProfile.eventLogRoot] /
+ *   [ParticipationProfile.signerPublicKey] are not exactly 32 elements or
+ *   [ParticipationProfile.signature] is not exactly 64 elements (before any
+ *   bridge call).
  */
-fun encodeParticipationProfileJson(profiles: List<ParticipationProfile>): String =
-    trustAdmissionJson.encodeToString(
+fun encodeParticipationProfileJson(profiles: List<ParticipationProfile>): String {
+    for (profile in profiles) {
+        requireByteLength("ParticipationProfile", "eventLogRoot", BYTES_32, profile.eventLogRoot)
+        requireByteLength(
+            "ParticipationProfile",
+            "signerPublicKey",
+            BYTES_32,
+            profile.signerPublicKey,
+        )
+        requireByteLength("ParticipationProfile", "signature", BYTES_64, profile.signature)
+    }
+    return trustAdmissionJson.encodeToString(
         ListSerializer(ParticipationProfile.serializer()),
         profiles,
     )
+}

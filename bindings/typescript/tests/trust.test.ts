@@ -646,6 +646,18 @@ describe("encodeParticipationProfile", () => {
     expect(parsed[0].signer_public_key).toHaveLength(32);
     expect(parsed[0].signature).toHaveLength(64);
   });
+
+  it("rejects wrong-length byte arrays before any bridge call", () => {
+    expect(() => encodeParticipationProfile([makeProfile({ eventLogRoot: [1, 2, 3] })])).toThrow(
+      "ParticipationProfile.eventLogRoot must be exactly 32 elements, got 3",
+    );
+    expect(() =>
+      encodeParticipationProfile([makeProfile({ signerPublicKey: Array(33).fill(0) })]),
+    ).toThrow("ParticipationProfile.signerPublicKey must be exactly 32 elements, got 33");
+    expect(() =>
+      encodeParticipationProfile([makeProfile({ signature: Array(63).fill(0) })]),
+    ).toThrow("ParticipationProfile.signature must be exactly 64 elements, got 63");
+  });
 });
 
 describe("encodeChallengeVerifications", () => {
@@ -711,5 +723,11 @@ describe("encodeChallengeVerifications", () => {
     const parsed = JSON.parse(encodeChallengeVerifications([withoutOptionals]));
     expect(parsed[0].score).toBeNull();
     expect(parsed[0].context_id).toBeNull();
+  });
+
+  it("rejects a wrong-length verifierSignature before any bridge call", () => {
+    expect(() =>
+      encodeChallengeVerifications([{ ...base, verifierSignature: Array(63).fill(9) }]),
+    ).toThrow("ChallengeVerification.verifierSignature must be exactly 64 elements, got 63");
   });
 });

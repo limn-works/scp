@@ -19,6 +19,7 @@ import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import org.junit.jupiter.api.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
 
 class TrustAdmissionTest {
@@ -224,6 +225,45 @@ class TrustAdmissionTest {
         assertEquals(JsonNull, record["context_id"])
         // The SelfAttested method variant is the bare string, not an object.
         assertEquals(Json.parseToJsonElement("\"SelfAttested\""), record["verification_method"])
+    }
+
+    @Test
+    fun `wrong-length byte arrays throw before any bridge call`() {
+        val badProfile = makeProfile().copy(eventLogRoot = List(3) { 1.toUByte() })
+        val profileError =
+            assertFailsWith<IllegalArgumentException> {
+                encodeParticipationProfileJson(listOf(badProfile))
+            }
+        assertEquals(
+            "ParticipationProfile.eventLogRoot must be exactly 32 elements, got 3",
+            profileError.message,
+        )
+
+        val badVerification =
+            ChallengeVerification(
+                verificationId = "v-bad",
+                verifierDid = "did:dht:zVerifier",
+                subjectDid = "did:dht:zResponder",
+                capabilityUri = "scp:capability:tool-integrity/v1",
+                challengeType = "scp:capability:tool-integrity/v1",
+                verificationMethod = ChallengeVerificationMethod.SelfAttested,
+                passed = true,
+                testCount = 1u,
+                passCount = 1u,
+                result = JsonNull,
+                completedAt = 1uL,
+                verifiedAt = 2uL,
+                expiresAt = 3uL,
+                verifierSignature = List(63) { 9.toUByte() },
+            )
+        val verificationError =
+            assertFailsWith<IllegalArgumentException> {
+                encodeChallengeVerificationsJson(listOf(badVerification))
+            }
+        assertEquals(
+            "ChallengeVerification.verifierSignature must be exactly 64 elements, got 63",
+            verificationError.message,
+        )
     }
 
     @Test
