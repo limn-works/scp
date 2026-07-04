@@ -1132,16 +1132,26 @@ pub fn check_threshold_attestation(
 /// authenticity or freshness *security* decision. Only the fields listed above
 /// are authenticated.
 ///
-/// # Canonicalization scheme — `MessagePack` (not JCS)
+/// # Canonicalization scheme — per §9.5.2
 ///
-/// `claim`, `evidence`, and `revocation_status` are serialized with
-/// `rmp_serde::to_vec_named` (`MessagePack`, named/sorted keys) — **not** RFC
-/// 8785 JCS. This is intentional and matches
-/// `IdentityLinkAttestation::canonical_signing_bytes`. Attestation
-/// canonicalization is the one trust path that uses `MessagePack`; challenge
-/// preimages and other structured hashing use JCS (see the module doc on
-/// `crate::jcs`). Changing the scheme here would change the on-the-wire
-/// attestation hash, so it is fixed by construction.
+/// The §9.5.2 Attestation table assigns a serialization per field:
+///
+/// - `claim` — **compact JSON** (no whitespace, equivalent to Python
+///   `json.dumps(separators=(',', ':'))`), produced via [`crate::jcs::to_vec`]
+///   (RFC 8785 JCS). JCS emits exactly that compact form and additionally
+///   sorts object keys, which makes the preimage deterministic across
+///   implementations. This matches how the same §9.5.2 "compact JSON" phrase
+///   is implemented for `GovernanceProposal` `action_bytes`
+///   (`compute_proposal_id`) and `SignedVote` `vote_type`
+///   (`compute_vote_hash`).
+/// - `evidence` and `revocation_status` — `rmp_serde::to_vec_named`
+///   (`MessagePack`, named keys), as the §9.5.2 note explicitly sanctions for
+///   these two fields.
+///
+/// Note: `IdentityLinkAttestation::canonical_signing_bytes` is governed by a
+/// different spec row (§3 identity, domain
+/// `SCP-IDENTITY-LINK-ATTESTATION-V1:`) which mandates `MessagePack` for its
+/// `claim` as well — its scheme is independent of this function.
 ///
 /// # Errors
 ///
@@ -1173,12 +1183,13 @@ pub fn canonical_attestation_bytes(attestation: &Attestation) -> Result<Vec<u8>,
     // Field order per §9.5.2: id, attestation_type, issuer, subject, claim,
     // evidence, issued_at, expires_at, revocation_status.
     //
-    // Serialize claim as MessagePack (named/sorted keys) for deterministic
-    // ordering. Using `serde_json::Value::to_string()` would produce JSON
-    // with non-deterministic key ordering. This matches
-    // `IdentityLinkAttestation::canonical_signing_bytes` which also uses
-    // `rmp_serde::to_vec_named`.
-    let claim_bytes = rmp_serde::to_vec_named(&attestation.claim).map_err(|err| {
+    // Serialize claim as compact JSON per the §9.5.2 Attestation table
+    // (row 5: "compact JSON", equivalent to Python
+    // `json.dumps(separators=(',', ':'))`). RFC 8785 JCS produces exactly
+    // that compact form with deterministic (sorted) key ordering — the same
+    // implementation of the same spec phrase as `compute_proposal_id`
+    // (`action_bytes`) and `compute_vote_hash` (`vote_type`).
+    let claim_bytes = crate::jcs::to_vec(&attestation.claim).map_err(|err| {
         TrustError::CanonicalizationFailed {
             reason: format!("claim serialization failed: {err}"),
         }
@@ -2214,6 +2225,93 @@ mod tests {
         assert_ne!(
             bytes_a, bytes_b,
             "shifting bytes between id and issuer must produce different canonical bytes"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // §9.5.2 claim serialization scheme: compact JSON (RFC 8785 JCS)
+    // -------------------------------------------------------------------
+
+    /// Pins the §9.5.2 Attestation row-5 scheme: the signed preimage embeds
+    /// the `claim` as length-prefixed **compact JSON** (no whitespace, sorted
+    /// keys per RFC 8785 JCS) — not `MessagePack`.
+    #[test]
+    fn canonical_attestation_claim_is_length_prefixed_compact_json() {
+        use crate::crypto::canonical::{CanonicalField, canonical_hash_bytes};
+        use sha2::{Digest, Sha256};
+
+        let make = |claim: serde_json::Value| Attestation {
+            id: "att-claim-scheme".to_owned(),
+            attestation_type: AttestationType::Endorsement,
+            issuer: "did:key:issuer".into(),
+            subject: "did:key:subj".into(),
+            claim,
+            evidence: None,
+            issued_at: 1000,
+            expires_at: None,
+            renewal_interval: None,
+            renewed_at: None,
+            revocation_status: RevocationStatus::Active,
+            signature: vec![],
+        };
+
+        let att = make(serde_json::json!({"z": 2, "a": 1}));
+        let canonical = canonical_attestation_bytes(&att).unwrap();
+
+        // Expected claim bytes: compact JSON, keys sorted by Unicode code
+        // point (RFC 8785). Equivalent to Python
+        // json.dumps(separators=(',', ':')) for pre-sorted keys.
+        let claim_json: &[u8] = br#"{"a":1,"z":2}"#;
+
+        // Reconstruct the full §9.5.2 preimage with the compact-JSON claim
+        // embedded as a length-prefixed field, and assert the production
+        // digest commits to exactly these bytes.
+        let revocation_bytes = rmp_serde::to_vec_named(&att.revocation_status).unwrap();
+        let preimage = canonical_hash_bytes(
+            b"SCP-ATTESTATION-V1:",
+            &[
+                CanonicalField::VarBytes(att.id.as_bytes()),
+                CanonicalField::U16(super::super::attestation_type_tag(&att.attestation_type)),
+                CanonicalField::VarBytes(att.issuer.as_bytes()),
+                CanonicalField::VarBytes(att.subject.as_bytes()),
+                CanonicalField::VarBytes(claim_json),
+                CanonicalField::Absent,
+                CanonicalField::U64(att.issued_at),
+                CanonicalField::Absent,
+                CanonicalField::VarBytes(&revocation_bytes),
+            ],
+        )
+        .unwrap();
+
+        // The preimage embeds the length-prefixed compact-JSON claim bytes.
+        let mut expected_claim_field = Vec::new();
+        #[allow(clippy::cast_possible_truncation)]
+        expected_claim_field.extend_from_slice(&(claim_json.len() as u32).to_be_bytes());
+        expected_claim_field.extend_from_slice(claim_json);
+        assert!(
+            preimage
+                .windows(expected_claim_field.len())
+                .any(|window| window == expected_claim_field.as_slice()),
+            "preimage must embed the length-prefixed compact-JSON claim {:?}",
+            String::from_utf8_lossy(claim_json)
+        );
+
+        let expected_digest: [u8; 32] = Sha256::digest(&preimage).into();
+        assert_eq!(
+            canonical,
+            expected_digest.to_vec(),
+            "canonical_attestation_bytes must be the SHA-256 of the §9.5.2 \
+             preimage with the claim as compact JSON"
+        );
+
+        // Key-insertion order must not affect the preimage: JCS sorts object
+        // keys, so a semantically identical claim constructed in a different
+        // order yields byte-identical canonical bytes.
+        let att_reordered = make(serde_json::json!({"a": 1, "z": 2}));
+        let canonical_reordered = canonical_attestation_bytes(&att_reordered).unwrap();
+        assert_eq!(
+            canonical, canonical_reordered,
+            "claim key order must not change the canonical bytes (JCS sorts keys)"
         );
     }
 

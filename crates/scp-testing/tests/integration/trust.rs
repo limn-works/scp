@@ -181,7 +181,9 @@ fn make_signed_attestation(
     use scp_core::crypto::canonical::{CanonicalField, canonical_hash};
     use scp_core::trust::attestation_type_tag;
 
-    let claim_bytes = rmp_serde::to_vec_named(&att.claim).unwrap();
+    // Claim is compact JSON (RFC 8785 JCS) per §9.5.2 Attestation row 5;
+    // evidence/revocation_status stay MessagePack per the §9.5.2 note.
+    let claim_bytes = scp_core::jcs::to_vec(&att.claim).unwrap();
     let evidence_bytes = att
         .evidence
         .as_ref()
