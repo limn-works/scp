@@ -227,3 +227,151 @@ final class TrustAggregateEncoderTests: XCTestCase {
         )
     }
 }
+
+// MARK: - Challenge trust-input encoders (§7.3.4, ADR-058)
+
+/// A structurally-valid attestation envelope for the verify path.
+private func makeAttestationEnvelope() -> CachedAttestationEnvelope {
+    CachedAttestationEnvelope(
+        id: "att-1",
+        attestationType: "AgentCapability",
+        issuer: "did:dht:zIssuer",
+        subject: "did:dht:zSubject",
+        claim: ["capability": "scp:capability:schema-validation/v1"],
+        issuedAt: 1_700_000_000,
+        revocationStatus: .string("Active"),
+        signature: Array(repeating: 3, count: 64)
+    )
+}
+
+/// A structurally-valid `ChallengeRequest` with a real 64-byte signature.
+private func makeChallengeRequest(
+    signature: [UInt8] = Array(repeating: 8, count: 64)
+) -> ChallengeRequest {
+    ChallengeRequest(
+        challengeId: "chal-1",
+        challengeType: "scp:capability:schema-validation/v1",
+        challengerDid: "did:dht:zChallenger",
+        subjectDid: "did:dht:zSubject",
+        capabilityUri: "scp:capability:schema-validation/v1",
+        parameters: ["schema": "object"],
+        timeout: CachedAttestationDuration(secs: 300, nanos: 0),
+        signature: signature
+    )
+}
+
+/// A structurally-valid `ChallengeResponse` with a real 64-byte signature.
+private func makeChallengeResponse(
+    signature: [UInt8] = Array(repeating: 4, count: 64)
+) -> ChallengeResponse {
+    ChallengeResponse(
+        challengeId: "chal-1",
+        responderDid: "did:dht:zSubject",
+        result: ["passed": true],
+        completedAt: 1_700_000_100,
+        signature: signature
+    )
+}
+
+final class ChallengeTrustInputEncoderTests: XCTestCase {
+    func testAttestationEnvelopeEncodesSingleSerdeShape() throws {
+        let json = try encodeAttestationJson(makeAttestationEnvelope())
+        assertJSONEqual(
+            json,
+            """
+            {
+              "id": "att-1",
+              "attestation_type": "AgentCapability",
+              "issuer": "did:dht:zIssuer",
+              "subject": "did:dht:zSubject",
+              "claim": {"capability": "scp:capability:schema-validation/v1"},
+              "issued_at": 1700000000,
+              "revocation_status": "Active",
+              "signature": \(Array(repeating: 3, count: 64))
+            }
+            """
+        )
+    }
+
+    func testChallengeRequestEncodesEightSnakeCaseFields() throws {
+        let json = try encodeChallengeRequestJson(makeChallengeRequest())
+        assertJSONEqual(
+            json,
+            """
+            {
+              "challenge_id": "chal-1",
+              "challenge_type": "scp:capability:schema-validation/v1",
+              "challenger_did": "did:dht:zChallenger",
+              "subject_did": "did:dht:zSubject",
+              "capability_uri": "scp:capability:schema-validation/v1",
+              "parameters": {"schema": "object"},
+              "timeout": {"secs": 300, "nanos": 0},
+              "signature": \(Array(repeating: 8, count: 64))
+            }
+            """
+        )
+    }
+
+    func testChallengeResponseEncodesFiveSnakeCaseFields() throws {
+        let json = try encodeChallengeResponseJson(makeChallengeResponse())
+        assertJSONEqual(
+            json,
+            """
+            {
+              "challenge_id": "chal-1",
+              "responder_did": "did:dht:zSubject",
+              "result": {"passed": true},
+              "completed_at": 1700000100,
+              "signature": \(Array(repeating: 4, count: 64))
+            }
+            """
+        )
+    }
+
+    func testWrongLengthChallengeSignaturesThrowBeforeBridgeCall() throws {
+        XCTAssertThrowsError(
+            try encodeChallengeRequestJson(makeChallengeRequest(signature: [1, 2, 3]))
+        ) { error in
+            guard case let ScpError.Validation(msg, _) = error else {
+                return XCTFail("expected ScpError.Validation, got \(error)")
+            }
+            XCTAssertEqual(msg, "ChallengeRequest.signature must be exactly 64 elements, got 3")
+        }
+        XCTAssertThrowsError(
+            try encodeChallengeResponseJson(
+                makeChallengeResponse(signature: Array(repeating: 4, count: 63))
+            )
+        ) { error in
+            guard case let ScpError.Validation(msg, _) = error else {
+                return XCTFail("expected ScpError.Validation, got \(error)")
+            }
+            XCTAssertEqual(msg, "ChallengeResponse.signature must be exactly 64 elements, got 63")
+        }
+    }
+}
+
+/// Call-through against the real Rust deserializers: these invoke the bridge
+/// verification ops through the typed wrappers, proving the serialized JSON
+/// parses and evaluates on the Rust side (dummy signatures yield structured
+/// negative verdicts, never parse errors).
+final class ChallengeTrustInputCallThroughTests: XCTestCase {
+    func testTrustVerifyAttestationTypedEnvelopeReachesVerifier() throws {
+        // The dummy signature cannot verify — a structured `valid: false`
+        // (not a thrown parse error) proves the envelope reached the real
+        // verifier.
+        let result = try trustVerifyAttestation(attestation: makeAttestationEnvelope())
+        XCTAssertFalse(result.valid)
+        XCTAssertFalse(result.errorMessage.isEmpty)
+    }
+
+    func testTrustVerifyResponseTypedPairReachesVerifier() throws {
+        // Dummy signatures cannot verify — the structured `false` (not a
+        // thrown parse error) proves both records reached the real verifier.
+        let scp = try SCP(storage: .inMemory)
+        let valid = try scp.trustVerifyResponse(
+            challenge: makeChallengeRequest(),
+            response: makeChallengeResponse()
+        )
+        XCTAssertFalse(valid)
+    }
+}

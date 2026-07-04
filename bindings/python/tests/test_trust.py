@@ -30,6 +30,8 @@ from scp_sdk.trust import (
     CachedAttestation,
     CachedAttestationEnvelope,
     CapabilityValidation,
+    ChallengeRequest,
+    ChallengeResponse,
     EventLogEntry,
     ParticipationFact,
     ParticipationProfile,
@@ -1270,3 +1272,91 @@ class TestAggregateTrustInputTyped:
                 SCP.aggregate_trust_input(scp, "ctx-1", "did:dht:zAlice", [], [1, 2]),
             )
         scp._native.aggregate_trust_input.assert_not_called()
+
+
+class TestTrustVerifyTyped:
+    """ADR-058 Op D: trust_verify_attestation / trust_verify_response take
+    typed wire DTOs and serialize to the exact serde JSON the bridge parses."""
+
+    @staticmethod
+    def _envelope() -> CachedAttestationEnvelope:
+        return {
+            "id": "att-1",
+            "attestation_type": "AgentCapability",
+            "issuer": "did:dht:zIssuer",
+            "subject": "did:dht:zSubject",
+            "claim": {"capability": "scp:capability:schema-validation/v1"},
+            "issued_at": 1_700_000_000,
+            "revocation_status": "Active",
+            "signature": [3] * 64,
+        }
+
+    @staticmethod
+    def _challenge() -> ChallengeRequest:
+        return {
+            "challenge_id": "chal-1",
+            "challenge_type": "scp:capability:schema-validation/v1",
+            "challenger_did": "did:dht:zChallenger",
+            "subject_did": "did:dht:zSubject",
+            "capability_uri": "scp:capability:schema-validation/v1",
+            "parameters": {"schema": "object"},
+            "timeout": {"secs": 300, "nanos": 0},
+            "signature": [8] * 64,
+        }
+
+    @staticmethod
+    def _response() -> ChallengeResponse:
+        return {
+            "challenge_id": "chal-1",
+            "responder_did": "did:dht:zSubject",
+            "result": {"passed": True},
+            "completed_at": 1_700_000_100,
+            "signature": [4] * 64,
+        }
+
+    def test_verify_attestation_serializes_the_typed_envelope(self) -> None:
+        from scp_sdk.trust import trust_verify_attestation
+
+        bridge = MagicMock()
+        bridge.trust_verify_attestation.return_value = {
+            "valid": False,
+            "chain_depth": 0,
+            "error": "unresolvable issuer",
+        }
+        with patch("scp_sdk.trust._bridge", return_value=bridge):
+            result = trust_verify_attestation(self._envelope())
+        assert result["valid"] is False
+        (wire_json,) = bridge.trust_verify_attestation.call_args[0]
+        assert json.loads(wire_json) == self._envelope()
+
+    def test_verify_response_serializes_both_typed_records(self) -> None:
+        from scp_sdk.trust import trust_verify_response
+
+        bridge = MagicMock()
+        bridge.trust_verify_response.return_value = False
+        with patch("scp_sdk.trust._bridge", return_value=bridge):
+            result = trust_verify_response(self._challenge(), self._response())
+        assert result is False
+        challenge_json, response_json = bridge.trust_verify_response.call_args[0]
+        assert json.loads(challenge_json) == self._challenge()
+        assert json.loads(response_json) == self._response()
+
+    def test_verify_attestation_real_bridge_call_through(self) -> None:
+        """The typed envelope's serialized JSON parses on the REAL Rust
+        `Attestation` deserializer: a dummy signature yields a structured
+        `valid: False` (verification ran), never a parse error."""
+        pytest.importorskip("_scp_core")
+        from scp_sdk.trust import trust_verify_attestation
+
+        result = trust_verify_attestation(self._envelope())
+        assert result["valid"] is False
+        assert result["error"]
+
+    def test_verify_response_real_bridge_call_through(self) -> None:
+        """The typed challenge pair's serialized JSON parses on the REAL Rust
+        `ChallengeRequest` / `ChallengeResponse` deserializers: dummy
+        signatures yield a structured `False`, never a parse error."""
+        pytest.importorskip("_scp_core")
+        from scp_sdk.trust import trust_verify_response
+
+        assert trust_verify_response(self._challenge(), self._response()) is False

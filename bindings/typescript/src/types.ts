@@ -1675,6 +1675,106 @@ export function encodeAttestorSets(
 }
 
 // ---------------------------------------------------------------------------
+// Challenge trust inputs (§7.3.4, ADR-058)
+// ---------------------------------------------------------------------------
+
+/**
+ * A challenge request for capability verification (ADR-017, spec §7.3.4).
+ *
+ * Mirrors the Rust `ChallengeRequest` struct (`scp-core`) serde wire shape
+ * the bridge deserializes for {@link SCP.trustVerifyResponse}.
+ * `challengeType` is a bare capability URI string (the Rust `ChallengeType`
+ * serializes as its URI string); `timeout` is the Rust `std::time::Duration`
+ * serde shape ({@link CachedAttestationDuration}).
+ */
+export interface ChallengeRequest {
+  /** Unique challenge identifier (UUID v4). */
+  readonly challengeId: string;
+  /** The type of challenge being issued (a capability URI string). */
+  readonly challengeType: string;
+  /** DID of the entity issuing the challenge. */
+  readonly challengerDid: string;
+  /** DID of the entity being challenged. */
+  readonly subjectDid: string;
+  /** The capability URI being tested (spec §7.3.4.1). */
+  readonly capabilityUri: string;
+  /** Challenge-specific parameters (schema, test vectors, limits, etc.). */
+  readonly parameters: unknown;
+  /** Maximum time allowed for the subject to respond (`{ secs, nanos }`). */
+  readonly timeout: CachedAttestationDuration;
+  /** Ed25519 signature over the canonical challenge bytes (64 bytes). */
+  readonly signature: readonly number[];
+}
+
+/**
+ * A response to a challenge request (ADR-017, spec §7.3.4).
+ *
+ * Mirrors the Rust `ChallengeResponse` struct (`scp-core`) serde wire shape
+ * the bridge deserializes for {@link SCP.trustVerifyResponse}.
+ */
+export interface ChallengeResponse {
+  /** The challenge ID this response corresponds to. */
+  readonly challengeId: string;
+  /** DID of the entity responding to the challenge. */
+  readonly responderDid: string;
+  /** Challenge-specific result data (pass/fail, metrics, evidence, etc.). */
+  readonly result: unknown;
+  /** Unix timestamp (seconds) when the response was completed. */
+  readonly completedAt: number;
+  /** Ed25519 signature over the canonical response bytes (64 bytes). */
+  readonly signature: readonly number[];
+}
+
+/**
+ * Encodes a single typed attestation envelope
+ * ({@link CachedAttestationEnvelope}) to the JSON wire shape the Rust bridge
+ * deserializes for {@link SCP.trustVerifyAttestation} (`Attestation`) —
+ * exactly the shape {@link encodeCachedAttestations} nests per entry.
+ */
+export function encodeAttestation(attestation: CachedAttestationEnvelope): string {
+  return JSON.stringify(encodeCachedAttestationEnvelope(attestation));
+}
+
+/**
+ * Encodes a typed {@link ChallengeRequest} to the JSON wire shape the Rust
+ * bridge deserializes (`ChallengeRequest`).
+ *
+ * @throws Error if `signature` is not exactly 64 elements (before any bridge
+ *   call).
+ */
+export function encodeChallengeRequest(challenge: ChallengeRequest): string {
+  requireByteLength("ChallengeRequest", "signature", 64, challenge.signature);
+  return JSON.stringify({
+    challenge_id: challenge.challengeId,
+    challenge_type: challenge.challengeType,
+    challenger_did: challenge.challengerDid,
+    subject_did: challenge.subjectDid,
+    capability_uri: challenge.capabilityUri,
+    parameters: challenge.parameters,
+    timeout: { secs: challenge.timeout.secs, nanos: challenge.timeout.nanos },
+    signature: challenge.signature,
+  });
+}
+
+/**
+ * Encodes a typed {@link ChallengeResponse} to the JSON wire shape the Rust
+ * bridge deserializes (`ChallengeResponse`).
+ *
+ * @throws Error if `signature` is not exactly 64 elements (before any bridge
+ *   call).
+ */
+export function encodeChallengeResponse(response: ChallengeResponse): string {
+  requireByteLength("ChallengeResponse", "signature", 64, response.signature);
+  return JSON.stringify({
+    challenge_id: response.challengeId,
+    responder_did: response.responderDid,
+    result: response.result,
+    completed_at: response.completedAt,
+    signature: response.signature,
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Discovery — Address Resolution (§22.2.1, §22.7)
 // ---------------------------------------------------------------------------
 

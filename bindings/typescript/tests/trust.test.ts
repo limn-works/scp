@@ -22,8 +22,11 @@ import { afterEach, describe, expect, it } from "bun:test";
 import type {
   AttestorInfo,
   CachedAttestation,
+  CachedAttestationEnvelope,
   CapabilityRequirement,
   CapabilityValidation,
+  ChallengeRequest,
+  ChallengeResponse,
   ChallengeVerification,
   EventLogEntry,
   ParticipationProfile,
@@ -31,8 +34,11 @@ import type {
   ThresholdRequirement,
 } from "../src/types";
 import {
+  encodeAttestation,
   encodeAttestorSets,
   encodeCapabilityRequirements,
+  encodeChallengeRequest,
+  encodeChallengeResponse,
   encodeChallengeVerifications,
   encodeEventLogEntries,
   encodeMerkleRoot,
@@ -982,6 +988,142 @@ describe("scp.aggregateTrustInput — typed trust-aggregation inputs (§7.3)", (
       "{}",
       "[]",
       "[]",
+    ]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Challenge trust-input encoders + call-through (§7.3.4, ADR-058)
+// ---------------------------------------------------------------------------
+
+/** A structurally-valid attestation envelope. */
+const attestationEnvelope: CachedAttestationEnvelope = {
+  id: "att-1",
+  attestationType: "AgentCapability",
+  issuer: "did:dht:issuer",
+  subject: "did:dht:subject",
+  claim: { capability: "scp:capability:schema-validation/v1" },
+  issuedAt: 1_700_000_000,
+  revocationStatus: "Active",
+  signature: Array.from({ length: 64 }, () => 3),
+};
+
+/** A structurally-valid ChallengeRequest with a real 64-byte signature. */
+function makeChallengeRequest(overrides: Partial<ChallengeRequest> = {}): ChallengeRequest {
+  return {
+    challengeId: "chal-1",
+    challengeType: "scp:capability:schema-validation/v1",
+    challengerDid: "did:dht:challenger",
+    subjectDid: "did:dht:subject",
+    capabilityUri: "scp:capability:schema-validation/v1",
+    parameters: { schema: "object" },
+    timeout: { secs: 300, nanos: 0 },
+    signature: Array.from({ length: 64 }, () => 8),
+    ...overrides,
+  };
+}
+
+/** A structurally-valid ChallengeResponse with a real 64-byte signature. */
+function makeChallengeResponse(overrides: Partial<ChallengeResponse> = {}): ChallengeResponse {
+  return {
+    challengeId: "chal-1",
+    responderDid: "did:dht:subject",
+    result: { passed: true },
+    completedAt: 1_700_000_100,
+    signature: Array.from({ length: 64 }, () => 4),
+    ...overrides,
+  };
+}
+
+describe("encodeAttestation", () => {
+  it("emits the single-envelope serde snake_case shape", () => {
+    expect(JSON.parse(encodeAttestation(attestationEnvelope))).toEqual({
+      id: "att-1",
+      attestation_type: "AgentCapability",
+      issuer: "did:dht:issuer",
+      subject: "did:dht:subject",
+      claim: { capability: "scp:capability:schema-validation/v1" },
+      issued_at: 1_700_000_000,
+      revocation_status: "Active",
+      signature: Array.from({ length: 64 }, () => 3),
+    });
+  });
+});
+
+describe("encodeChallengeRequest", () => {
+  it("emits the full 8-field snake_case record with a Duration timeout", () => {
+    expect(JSON.parse(encodeChallengeRequest(makeChallengeRequest()))).toEqual({
+      challenge_id: "chal-1",
+      challenge_type: "scp:capability:schema-validation/v1",
+      challenger_did: "did:dht:challenger",
+      subject_did: "did:dht:subject",
+      capability_uri: "scp:capability:schema-validation/v1",
+      parameters: { schema: "object" },
+      timeout: { secs: 300, nanos: 0 },
+      signature: Array.from({ length: 64 }, () => 8),
+    });
+  });
+
+  it("rejects a wrong-length signature before any bridge call", () => {
+    expect(() => encodeChallengeRequest(makeChallengeRequest({ signature: [1, 2, 3] }))).toThrow(
+      "ChallengeRequest.signature must be exactly 64 elements, got 3",
+    );
+  });
+});
+
+describe("encodeChallengeResponse", () => {
+  it("emits the full 5-field snake_case record", () => {
+    expect(JSON.parse(encodeChallengeResponse(makeChallengeResponse()))).toEqual({
+      challenge_id: "chal-1",
+      responder_did: "did:dht:subject",
+      result: { passed: true },
+      completed_at: 1_700_000_100,
+      signature: Array.from({ length: 64 }, () => 4),
+    });
+  });
+
+  it("rejects a wrong-length signature before any bridge call", () => {
+    expect(() =>
+      encodeChallengeResponse(makeChallengeResponse({ signature: Array(63).fill(4) })),
+    ).toThrow("ChallengeResponse.signature must be exactly 64 elements, got 63");
+  });
+});
+
+describe("scp.trustVerifyAttestation / scp.trustVerifyResponse — typed challenge inputs", () => {
+  let cleanup: (() => Promise<void>) | undefined;
+  afterEach(async () => {
+    await cleanup?.();
+    cleanup = undefined;
+  });
+
+  it("serializes the typed attestation envelope before crossing FFI", async () => {
+    const { scp, native } = mountMockScp();
+    cleanup = () => scp.shutdown(0);
+    native.__stub("trustVerifyAttestation", () => ({
+      valid: false,
+      chainDepth: 0,
+      errorMessage: "unresolvable issuer",
+    }));
+
+    scp.trustVerifyAttestation(attestationEnvelope);
+    const call = native.__lastCall("trustVerifyAttestation");
+    expect(call?.args).toEqual([encodeAttestation(attestationEnvelope)]);
+  });
+
+  it("serializes the typed challenge request and response before crossing FFI", async () => {
+    const { scp, native } = mountMockScp();
+    cleanup = () => scp.shutdown(0);
+    native.__stub("trustVerifyResponse", () => false);
+
+    const challenge = makeChallengeRequest();
+    const response = makeChallengeResponse();
+    const result = scp.trustVerifyResponse(challenge, response);
+    expect(result).toBe(false);
+
+    const call = native.__lastCall("trustVerifyResponse");
+    expect(call?.args).toEqual([
+      encodeChallengeRequest(challenge),
+      encodeChallengeResponse(response),
     ]);
   });
 });

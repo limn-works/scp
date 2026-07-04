@@ -249,6 +249,8 @@ export type {
   Capability,
   CapabilityRequirement,
   CapabilityValidation,
+  ChallengeRequest,
+  ChallengeResponse,
   ChallengeVerification,
   ChallengeVerificationMethod,
   Checkpoint,

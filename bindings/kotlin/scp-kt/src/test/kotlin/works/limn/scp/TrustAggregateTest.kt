@@ -226,3 +226,125 @@ class TrustAggregateTest {
         )
     }
 }
+
+class ChallengeTrustInputTest {
+    /** A structurally-valid attestation envelope for the verify path. */
+    private fun makeEnvelope(): CachedAttestationEnvelope =
+        CachedAttestationEnvelope(
+            id = "att-1",
+            attestationType = "AgentCapability",
+            issuer = "did:dht:zIssuer",
+            subject = "did:dht:zSubject",
+            claim =
+                buildJsonObject { put("capability", "scp:capability:schema-validation/v1") },
+            issuedAt = 1_700_000_000uL,
+            revocationStatus = Json.parseToJsonElement("\"Active\""),
+            signature = List(64) { 3.toUByte() },
+        )
+
+    /** A structurally-valid ChallengeRequest with a real 64-byte signature. */
+    private fun makeChallenge(signature: List<UByte> = List(64) { 8.toUByte() }): ChallengeRequest =
+        ChallengeRequest(
+            challengeId = "chal-1",
+            challengeType = "scp:capability:schema-validation/v1",
+            challengerDid = "did:dht:zChallenger",
+            subjectDid = "did:dht:zSubject",
+            capabilityUri = "scp:capability:schema-validation/v1",
+            parameters = buildJsonObject { put("schema", "object") },
+            timeout = CachedAttestationDuration(secs = 300uL, nanos = 0u),
+            signature = signature,
+        )
+
+    /** A structurally-valid ChallengeResponse with a real 64-byte signature. */
+    private fun makeResponse(signature: List<UByte> = List(64) { 4.toUByte() }): ChallengeResponse =
+        ChallengeResponse(
+            challengeId = "chal-1",
+            responderDid = "did:dht:zSubject",
+            result = buildJsonObject { put("passed", true) },
+            completedAt = 1_700_000_100uL,
+            signature = signature,
+        )
+
+    /** Asserts two JSON strings are structurally equal (order-independent). */
+    private fun assertJsonEquals(
+        expected: String,
+        actual: String,
+    ) {
+        assertEquals(Json.parseToJsonElement(expected), Json.parseToJsonElement(actual))
+    }
+
+    @Test
+    fun `attestation envelope encodes the single serde snake_case shape`() {
+        assertJsonEquals(
+            """
+            {"id":"att-1",
+             "attestation_type":"AgentCapability",
+             "issuer":"did:dht:zIssuer",
+             "subject":"did:dht:zSubject",
+             "claim":{"capability":"scp:capability:schema-validation/v1"},
+             "issued_at":1700000000,
+             "revocation_status":"Active",
+             "signature":[${List(64) { 3 }.joinToString(",")}],
+             "evidence":null,
+             "expires_at":null,
+             "renewal_interval":null,
+             "renewed_at":null}
+            """.trimIndent(),
+            encodeAttestationJson(makeEnvelope()),
+        )
+    }
+
+    @Test
+    fun `challenge request encodes the full 8-field snake_case record`() {
+        assertJsonEquals(
+            """
+            {"challenge_id":"chal-1",
+             "challenge_type":"scp:capability:schema-validation/v1",
+             "challenger_did":"did:dht:zChallenger",
+             "subject_did":"did:dht:zSubject",
+             "capability_uri":"scp:capability:schema-validation/v1",
+             "parameters":{"schema":"object"},
+             "timeout":{"secs":300,"nanos":0},
+             "signature":[${List(64) { 8 }.joinToString(",")}]}
+            """.trimIndent(),
+            encodeChallengeRequestJson(makeChallenge()),
+        )
+    }
+
+    @Test
+    fun `challenge response encodes the full 5-field snake_case record`() {
+        assertJsonEquals(
+            """
+            {"challenge_id":"chal-1",
+             "responder_did":"did:dht:zSubject",
+             "result":{"passed":true},
+             "completed_at":1700000100,
+             "signature":[${List(64) { 4 }.joinToString(",")}]}
+            """.trimIndent(),
+            encodeChallengeResponseJson(makeResponse()),
+        )
+    }
+
+    @Test
+    fun `wrong-length challenge signatures throw before any bridge call`() {
+        val requestError =
+            assertFailsWith<IllegalArgumentException> {
+                encodeChallengeRequestJson(makeChallenge(signature = listOf(1u, 2u, 3u)))
+            }
+        assertTrue(
+            requestError.message!!.contains(
+                "ChallengeRequest.signature must be exactly 64 elements, got 3",
+            ),
+        )
+
+        val responseError =
+            assertFailsWith<IllegalArgumentException> {
+                encodeChallengeResponseJson(makeResponse(signature = List(63) { 4.toUByte() }))
+            }
+        assertTrue(
+            responseError.message!!.contains(
+                "ChallengeResponse.signature must be exactly 64 elements, got 63",
+            ),
+        )
+    }
+}

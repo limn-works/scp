@@ -1590,6 +1590,120 @@ def check_capability_requirements(
     )
 
 
+# ---------------------------------------------------------------------------
+# Challenge trust-input wire DTOs + typed verification wrappers (§7.3.4,
+# ADR-058)
+# ---------------------------------------------------------------------------
+
+
+class ChallengeRequest(TypedDict):
+    """A challenge request for capability verification (ADR-017, §7.3.4).
+
+    The serde wire shape of the Rust ``ChallengeRequest`` (``scp-core``) the
+    bridge deserializes for :func:`trust_verify_response`. ``challenge_type``
+    is a bare capability URI string (the Rust ``ChallengeType`` serializes as
+    its URI string); ``timeout`` is the ``std::time::Duration`` serde shape
+    (``{"secs": int, "nanos": int}``). In the same pass-through TypedDict
+    family as :class:`CachedAttestationEnvelope`; a raw equivalently-shaped
+    ``dict`` is also accepted.
+    """
+
+    #: Unique challenge identifier (UUID v4).
+    challenge_id: str
+    #: The type of challenge being issued (a capability URI string).
+    challenge_type: str
+    #: DID of the entity issuing the challenge.
+    challenger_did: str
+    #: DID of the entity being challenged.
+    subject_did: str
+    #: The capability URI being tested (§7.3.4.1).
+    capability_uri: str
+    #: Challenge-specific parameters (schema, test vectors, limits, etc.).
+    parameters: Any
+    #: Maximum time allowed to respond (``{"secs": int, "nanos": int}``).
+    timeout: dict[str, int]
+    #: Ed25519 signature over the canonical challenge bytes (64 bytes as ints).
+    signature: list[int]
+
+
+class ChallengeResponse(TypedDict):
+    """A response to a challenge request (ADR-017, §7.3.4).
+
+    The serde wire shape of the Rust ``ChallengeResponse`` (``scp-core``) the
+    bridge deserializes for :func:`trust_verify_response`.
+    """
+
+    #: The challenge ID this response corresponds to.
+    challenge_id: str
+    #: DID of the entity responding to the challenge.
+    responder_did: str
+    #: Challenge-specific result data (pass/fail, metrics, evidence, etc.).
+    result: Any
+    #: Unix timestamp (seconds) when the response was completed.
+    completed_at: int
+    #: Ed25519 signature over the canonical response bytes (64 bytes as ints).
+    signature: list[int]
+
+
+def trust_verify_attestation(
+    attestation: CachedAttestationEnvelope | dict[str, Any],
+) -> dict[str, Any]:
+    """Verify an attestation's signature, evidence, expiry, and revocation
+    status (ADR-017, §7.4).
+
+    Takes the typed attestation envelope
+    (:class:`CachedAttestationEnvelope` — the same wire DTO the
+    cached-attestation inputs use) and serializes it to the serde wire shape
+    internally (ADR-058) before calling the bridge
+    ``trust_verify_attestation`` free function.
+
+    Args:
+        attestation: The typed attestation envelope (or a raw
+            equivalently-shaped dict).
+
+    Returns:
+        A dict with ``valid`` (bool), ``chain_depth`` (int), and ``error``
+        (str | None — the verification failure reason when ``valid`` is
+        ``False``).
+
+    Raises:
+        ScpError: If the bridge module is not available.
+        ValueError: If the serialized envelope fails bridge deserialization.
+    """
+    bridge = _bridge()
+    return bridge.trust_verify_attestation(json.dumps(attestation))
+
+
+def trust_verify_response(
+    challenge: ChallengeRequest | dict[str, Any],
+    response: ChallengeResponse | dict[str, Any],
+) -> bool:
+    """Verify a challenge response against its original challenge request
+    (ADR-017, §7.3.4).
+
+    Takes the typed :class:`ChallengeRequest` / :class:`ChallengeResponse`
+    wire DTOs and serializes them to the serde wire shapes internally
+    (ADR-058) before calling the bridge ``trust_verify_response`` free
+    function.
+
+    Args:
+        challenge: The typed challenge request (or a raw equivalently-shaped
+            dict).
+        response: The typed challenge response (or a raw equivalently-shaped
+            dict).
+
+    Returns:
+        ``True`` if the response is valid (correct responder, within timeout,
+        valid signature), ``False`` otherwise.
+
+    Raises:
+        ScpError: If the bridge module is not available.
+        ValueError: If a serialized record fails bridge deserialization.
+    """
+    bridge = _bridge()
+    return bridge.trust_verify_response(json.dumps(challenge), json.dumps(response))
+
+
 __all__ = [
     "ATTESTATION_TYPES",
     "PARTICIPATION_FACT_VARIANTS",
@@ -1602,6 +1716,8 @@ __all__ = [
     "CachedAttestationEnvelope",
     "CapabilityRequirement",
     "CapabilityValidation",
+    "ChallengeRequest",
+    "ChallengeResponse",
     "ChallengeVerification",
     "ChallengeVerificationMethod",
     "EventLogEntry",
@@ -1617,5 +1733,7 @@ __all__ = [
     "check_capability_requirements",
     "evaluate_trust",
     "participation_record",
+    "trust_verify_attestation",
+    "trust_verify_response",
     "verify_participation_requirements",
 ]

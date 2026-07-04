@@ -16,7 +16,9 @@ package works.limn.scp
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.put
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Assumptions.assumeTrue
 import org.junit.jupiter.api.BeforeAll
@@ -25,6 +27,7 @@ import org.junit.jupiter.api.Test
 import uniffi.scp.StorageConfig
 import works.limn.scp.bridge.CoroutineBridge
 import works.limn.scp.conformance.ConformanceStubBindings
+import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 import kotlin.time.Duration.Companion.seconds
 
@@ -143,5 +146,68 @@ class TrustAggregateFfiTest {
             )
         val result = Json.parseToJsonElement(resultJson).jsonObject
         assertTrue("threshold_counts" in result, "missing threshold_counts: $resultJson")
+    }
+
+    // -----------------------------------------------------------------------
+    // Challenge trust inputs (§7.3.4, ADR-058 Op D)
+    // -----------------------------------------------------------------------
+
+    /**
+     * The typed attestation envelope's serialized JSON parses on the REAL
+     * Rust `Attestation` deserializer: a dummy signature yields a structured
+     * `valid = false` result (verification ran), never a parse error.
+     */
+    @Test
+    fun `trustVerifyAttestation - typed envelope reaches the real verifier`() {
+        val result =
+            scp.trustVerifyAttestation(
+                CachedAttestationEnvelope(
+                    id = "att-ffi-1",
+                    attestationType = "AgentCapability",
+                    issuer = "did:dht:zIssuer",
+                    subject = "did:dht:zSubject",
+                    claim =
+                        buildJsonObject {
+                            put("capability", "scp:capability:schema-validation/v1")
+                        },
+                    issuedAt = 1_700_000_000uL,
+                    revocationStatus = Json.parseToJsonElement("\"Active\""),
+                    signature = List(64) { 0.toUByte() },
+                ),
+            )
+        assertFalse(result.valid)
+        assertTrue(result.errorMessage.isNotEmpty())
+    }
+
+    /**
+     * The typed challenge pair's serialized JSON parses on the REAL Rust
+     * `ChallengeRequest` / `ChallengeResponse` deserializers: dummy
+     * signatures yield a structured `false`, never a parse error.
+     */
+    @Test
+    fun `trustVerifyResponse - typed challenge pair reaches the real verifier`() {
+        val valid =
+            scp.trustVerifyResponse(
+                challenge =
+                    ChallengeRequest(
+                        challengeId = "chal-ffi-1",
+                        challengeType = "scp:capability:schema-validation/v1",
+                        challengerDid = "did:dht:zChallenger",
+                        subjectDid = "did:dht:zSubject",
+                        capabilityUri = "scp:capability:schema-validation/v1",
+                        parameters = buildJsonObject { },
+                        timeout = CachedAttestationDuration(secs = 300uL, nanos = 0u),
+                        signature = List(64) { 0.toUByte() },
+                    ),
+                response =
+                    ChallengeResponse(
+                        challengeId = "chal-ffi-1",
+                        responderDid = "did:dht:zSubject",
+                        result = buildJsonObject { put("passed", true) },
+                        completedAt = 1_700_000_100uL,
+                        signature = List(64) { 0.toUByte() },
+                    ),
+            )
+        assertFalse(valid)
     }
 }

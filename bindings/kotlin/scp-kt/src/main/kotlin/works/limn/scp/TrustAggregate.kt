@@ -324,3 +324,134 @@ private fun encodeOptionalEnvelopeElement(envelope: CachedAttestationEnvelope?):
     } else {
         encodeEnvelopeElement(envelope)
     }
+
+// ---------------------------------------------------------------------------
+// Challenge trust inputs (§7.3.4, ADR-058)
+// ---------------------------------------------------------------------------
+
+/**
+ * A challenge request for capability verification (ADR-017, spec §7.3.4).
+ *
+ * The serde wire shape of the Rust `ChallengeRequest` (`scp-core`) the bridge
+ * deserializes for [SCP.trustVerifyResponse]. [challengeType] is a bare
+ * capability URI string (the Rust `ChallengeType` serializes as its URI
+ * string); [timeout] is the Rust `std::time::Duration` serde shape
+ * ([CachedAttestationDuration]). Mirrors the Swift SDK `ChallengeRequest`
+ * and the TypeScript/Python models 1:1.
+ *
+ * @property challengeId Unique challenge identifier (UUID v4).
+ * @property challengeType The type of challenge being issued (a capability
+ *   URI string).
+ * @property challengerDid DID of the entity issuing the challenge.
+ * @property subjectDid DID of the entity being challenged.
+ * @property capabilityUri The capability URI being tested (§7.3.4.1).
+ * @property parameters Challenge-specific parameters (schema, test vectors,
+ *   limits, etc.).
+ * @property timeout Maximum time allowed for the subject to respond.
+ * @property signature Ed25519 signature over the canonical challenge bytes
+ *   (64 bytes).
+ */
+data class ChallengeRequest(
+    val challengeId: String,
+    val challengeType: String,
+    val challengerDid: String,
+    val subjectDid: String,
+    val capabilityUri: String,
+    val parameters: JsonElement,
+    val timeout: CachedAttestationDuration,
+    val signature: List<UByte>,
+)
+
+/**
+ * A response to a challenge request (ADR-017, spec §7.3.4).
+ *
+ * The serde wire shape of the Rust `ChallengeResponse` (`scp-core`) the
+ * bridge deserializes for [SCP.trustVerifyResponse]. Mirrors the Swift SDK
+ * `ChallengeResponse` and the TypeScript/Python models 1:1.
+ *
+ * @property challengeId The challenge ID this response corresponds to.
+ * @property responderDid DID of the entity responding to the challenge.
+ * @property result Challenge-specific result data (pass/fail, metrics,
+ *   evidence, etc.).
+ * @property completedAt Unix timestamp (seconds) when the response was
+ *   completed.
+ * @property signature Ed25519 signature over the canonical response bytes
+ *   (64 bytes).
+ */
+data class ChallengeResponse(
+    val challengeId: String,
+    val responderDid: String,
+    val result: JsonElement,
+    val completedAt: ULong,
+    val signature: List<UByte>,
+)
+
+/**
+ * Encodes a single typed attestation envelope ([CachedAttestationEnvelope])
+ * to the JSON wire shape the bridge deserializes for
+ * [SCP.trustVerifyAttestation] (`Attestation`) — exactly the shape
+ * [encodeCachedAttestationsJson] nests per entry.
+ */
+fun encodeAttestationJson(attestation: CachedAttestationEnvelope): String =
+    Json.encodeToString(JsonObject.serializer(), encodeEnvelopeElement(attestation))
+
+/**
+ * Encodes a typed [ChallengeRequest] to the JSON wire shape the bridge
+ * deserializes (`ChallengeRequest`).
+ *
+ * @throws IllegalArgumentException if [ChallengeRequest.signature] is not
+ *   exactly 64 elements (before any bridge call).
+ */
+fun encodeChallengeRequestJson(challenge: ChallengeRequest): String {
+    requireAggregateByteLength(
+        "ChallengeRequest",
+        "signature",
+        AGGREGATE_BYTES_64,
+        challenge.signature,
+    )
+    return Json.encodeToString(
+        JsonObject.serializer(),
+        buildJsonObject {
+            put("challenge_id", challenge.challengeId)
+            put("challenge_type", challenge.challengeType)
+            put("challenger_did", challenge.challengerDid)
+            put("subject_did", challenge.subjectDid)
+            put("capability_uri", challenge.capabilityUri)
+            put("parameters", challenge.parameters)
+            put(
+                "timeout",
+                buildJsonObject {
+                    put("secs", challenge.timeout.secs.toLong())
+                    put("nanos", challenge.timeout.nanos.toLong())
+                },
+            )
+            put("signature", buildJsonArray { challenge.signature.forEach { add(it.toInt()) } })
+        },
+    )
+}
+
+/**
+ * Encodes a typed [ChallengeResponse] to the JSON wire shape the bridge
+ * deserializes (`ChallengeResponse`).
+ *
+ * @throws IllegalArgumentException if [ChallengeResponse.signature] is not
+ *   exactly 64 elements (before any bridge call).
+ */
+fun encodeChallengeResponseJson(response: ChallengeResponse): String {
+    requireAggregateByteLength(
+        "ChallengeResponse",
+        "signature",
+        AGGREGATE_BYTES_64,
+        response.signature,
+    )
+    return Json.encodeToString(
+        JsonObject.serializer(),
+        buildJsonObject {
+            put("challenge_id", response.challengeId)
+            put("responder_did", response.responderDid)
+            put("result", response.result)
+            put("completed_at", response.completedAt.toLong())
+            put("signature", buildJsonArray { response.signature.forEach { add(it.toInt()) } })
+        },
+    )
+}

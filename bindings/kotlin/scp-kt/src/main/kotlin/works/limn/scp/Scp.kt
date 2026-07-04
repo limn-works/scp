@@ -1725,23 +1725,36 @@ class SCP internal constructor(
         )
 
     /**
-     * Routes through the UniFFI-generated free function
-     * [uniffi.scp.trustVerifyAttestation]. ADR-048 §1 + §7 Kotlin
-     * bullet.
+     * Verifies an attestation's Ed25519 signature, evidence, expiry, and
+     * revocation status (ADR-017, §7.4). Takes the typed attestation envelope
+     * ([CachedAttestationEnvelope]) and serializes it to the serde wire shape
+     * internally (ADR-058), then routes through the UniFFI-generated free
+     * function [uniffi.scp.trustVerifyAttestation] unchanged. ADR-048 §1 + §7
+     * Kotlin bullet.
      */
-    fun trustVerifyAttestation(attestationJson: String): AttestationVerificationResult =
+    fun trustVerifyAttestation(attestation: CachedAttestationEnvelope): AttestationVerificationResult =
         uniffi.scp.trustVerifyAttestation(
-            attestationJson = attestationJson,
+            attestationJson = encodeAttestationJson(attestation),
         )
 
-    /** Forwards to [NativeScp.trustVerifyResponse] on [inner]. */
+    /**
+     * Verifies a challenge response against its original challenge request
+     * (ADR-017, §7.3.4). Takes the typed [ChallengeRequest] /
+     * [ChallengeResponse] and serializes them to the serde wire shapes
+     * internally (ADR-058), then forwards to [NativeScp.trustVerifyResponse]
+     * on [inner] unchanged. Returns `true` if the response is valid (correct
+     * responder, within timeout, valid signature), `false` otherwise.
+     *
+     * @throws IllegalArgumentException on a wrong-length signature (before
+     *   any bridge call).
+     */
     fun trustVerifyResponse(
-        challengeJson: String,
-        responseJson: String,
+        challenge: ChallengeRequest,
+        response: ChallengeResponse,
     ): Boolean =
         inner.trustVerifyResponse(
-            challengeJson = challengeJson,
-            responseJson = responseJson,
+            challengeJson = encodeChallengeRequestJson(challenge),
+            responseJson = encodeChallengeResponseJson(response),
         )
 
     /**

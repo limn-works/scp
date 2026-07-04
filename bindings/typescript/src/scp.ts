@@ -47,8 +47,11 @@ import type {
   AttestorInfo,
   BehavioralRecord,
   CachedAttestation,
+  CachedAttestationEnvelope,
   CapabilityRequirement,
   CapabilityValidation,
+  ChallengeRequest,
+  ChallengeResponse,
   ChallengeVerification,
   ConsequenceRule,
   EventLogEntry,
@@ -59,9 +62,12 @@ import type {
   TrustEvaluation,
 } from "./types";
 import {
+  encodeAttestation,
   encodeAttestorSets,
   encodeCachedAttestations,
   encodeCapabilityRequirements,
+  encodeChallengeRequest,
+  encodeChallengeResponse,
   encodeChallengeVerifications,
   encodeConsequenceRules,
   encodeEventLogEntries,
@@ -2376,18 +2382,37 @@ export class SCP {
     return (this.#native.trustQueryScore as (d: string, c: string) => unknown)(did, contextId);
   }
 
-  trustVerifyAttestation(attestationJson: string): unknown {
-    return (this.#native.trustVerifyAttestation as (j: string) => unknown)(attestationJson);
+  /**
+   * Verify an attestation's Ed25519 signature, evidence, expiry, and
+   * revocation status (ADR-017, §7.4).
+   *
+   * Takes the typed attestation envelope ({@link CachedAttestationEnvelope})
+   * and serializes it to the serde wire shape internally (ADR-058) before
+   * crossing FFI.
+   */
+  trustVerifyAttestation(attestation: CachedAttestationEnvelope): unknown {
+    return (this.#native.trustVerifyAttestation as (j: string) => unknown)(
+      encodeAttestation(attestation),
+    );
   }
 
   trustCreateChallenge(targetDid: string): unknown {
     return (this.#native.trustCreateChallenge as (d: string) => unknown)(targetDid);
   }
 
-  trustVerifyResponse(challengeJson: string, responseJson: string): boolean {
+  /**
+   * Verify a challenge response against its original challenge request
+   * (ADR-017, §7.3.4).
+   *
+   * Takes the typed {@link ChallengeRequest} / {@link ChallengeResponse} and
+   * serializes them to the serde wire shapes internally (ADR-058) before
+   * crossing FFI. Returns `true` if the response is valid (correct
+   * responder, within timeout, valid signature), `false` otherwise.
+   */
+  trustVerifyResponse(challenge: ChallengeRequest, response: ChallengeResponse): boolean {
     return (this.#native.trustVerifyResponse as (c: string, r: string) => boolean)(
-      challengeJson,
-      responseJson,
+      encodeChallengeRequest(challenge),
+      encodeChallengeResponse(response),
     );
   }
 

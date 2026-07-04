@@ -1853,3 +1853,191 @@ public func checkCapabilityRequirements(
         challengeVerificationsJson: encodeChallengeVerificationsJson(challengeVerifications)
     )
 }
+
+// MARK: - Challenge trust inputs (§7.3.4, ADR-058)
+
+/// A challenge request for capability verification (ADR-017, spec §7.3.4).
+///
+/// Mirrors the Rust `ChallengeRequest` struct (`scp-core`) serde wire shape
+/// the bridge deserializes for
+/// ``trustVerifyResponse(challenge:response:)``. `challengeType` is a bare
+/// capability URI string (the Rust `ChallengeType` serializes as its URI
+/// string); `timeout` is the Rust `std::time::Duration` serde shape
+/// (``CachedAttestationDuration``). The `CodingKeys` are the serde-canonical
+/// snake_case. Mirrors the TypeScript SDK `ChallengeRequest` interface and
+/// the Kotlin/Python models 1:1.
+public nonisolated struct ChallengeRequest: Codable, Sendable, Equatable {
+    /// Unique challenge identifier (UUID v4).
+    public let challengeId: String
+    /// The type of challenge being issued (a capability URI string).
+    public let challengeType: String
+    /// DID of the entity issuing the challenge.
+    public let challengerDid: String
+    /// DID of the entity being challenged.
+    public let subjectDid: String
+    /// The capability URI being tested (spec §7.3.4.1).
+    public let capabilityUri: String
+    /// Challenge-specific parameters (schema, test vectors, limits, etc.).
+    public let parameters: JSONValue
+    /// Maximum time allowed for the subject to respond (`{ secs, nanos }`).
+    public let timeout: CachedAttestationDuration
+    /// Ed25519 signature over the canonical challenge bytes (64 bytes).
+    public let signature: [UInt8]
+
+    /// Memberwise initializer.
+    public init(
+        challengeId: String,
+        challengeType: String,
+        challengerDid: String,
+        subjectDid: String,
+        capabilityUri: String,
+        parameters: JSONValue,
+        timeout: CachedAttestationDuration,
+        signature: [UInt8]
+    ) {
+        self.challengeId = challengeId
+        self.challengeType = challengeType
+        self.challengerDid = challengerDid
+        self.subjectDid = subjectDid
+        self.capabilityUri = capabilityUri
+        self.parameters = parameters
+        self.timeout = timeout
+        self.signature = signature
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case challengeId = "challenge_id"
+        case challengeType = "challenge_type"
+        case challengerDid = "challenger_did"
+        case subjectDid = "subject_did"
+        case capabilityUri = "capability_uri"
+        case parameters
+        case timeout
+        case signature
+    }
+}
+
+/// A response to a challenge request (ADR-017, spec §7.3.4).
+///
+/// Mirrors the Rust `ChallengeResponse` struct (`scp-core`) serde wire shape
+/// the bridge deserializes for ``trustVerifyResponse(challenge:response:)``.
+/// The `CodingKeys` are the serde-canonical snake_case. Mirrors the
+/// TypeScript SDK `ChallengeResponse` interface and the Kotlin/Python models
+/// 1:1.
+public nonisolated struct ChallengeResponse: Codable, Sendable, Equatable {
+    /// The challenge ID this response corresponds to.
+    public let challengeId: String
+    /// DID of the entity responding to the challenge.
+    public let responderDid: String
+    /// Challenge-specific result data (pass/fail, metrics, evidence, etc.).
+    public let result: JSONValue
+    /// Unix timestamp (seconds) when the response was completed.
+    public let completedAt: UInt64
+    /// Ed25519 signature over the canonical response bytes (64 bytes).
+    public let signature: [UInt8]
+
+    /// Memberwise initializer.
+    public init(
+        challengeId: String,
+        responderDid: String,
+        result: JSONValue,
+        completedAt: UInt64,
+        signature: [UInt8]
+    ) {
+        self.challengeId = challengeId
+        self.responderDid = responderDid
+        self.result = result
+        self.completedAt = completedAt
+        self.signature = signature
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case challengeId = "challenge_id"
+        case responderDid = "responder_did"
+        case result
+        case completedAt = "completed_at"
+        case signature
+    }
+}
+
+/// Encodes a single typed attestation envelope
+/// (``CachedAttestationEnvelope``) to the JSON wire shape the bridge
+/// deserializes for ``trustVerifyAttestation(attestation:)``
+/// (`Attestation`) — exactly the shape ``encodeCachedAttestations(_:)``
+/// nests per entry.
+public func encodeAttestationJson(_ attestation: CachedAttestationEnvelope) throws -> String {
+    try encodeTrustAdmissionJson(attestation)
+}
+
+/// Encodes a typed ``ChallengeRequest`` to the JSON wire shape the bridge
+/// deserializes (`ChallengeRequest`).
+///
+/// - Throws: ``ScpError/Validation(msg:code:)`` if `signature` is not exactly
+///   64 elements (before any bridge call).
+public func encodeChallengeRequestJson(_ challenge: ChallengeRequest) throws -> String {
+    try requireByteLength(
+        "ChallengeRequest", "signature",
+        expected: 64, actual: challenge.signature, code: "SCP-VALID-7065"
+    )
+    return try encodeTrustAdmissionJson(challenge)
+}
+
+/// Encodes a typed ``ChallengeResponse`` to the JSON wire shape the bridge
+/// deserializes (`ChallengeResponse`).
+///
+/// - Throws: ``ScpError/Validation(msg:code:)`` if `signature` is not exactly
+///   64 elements (before any bridge call).
+public func encodeChallengeResponseJson(_ response: ChallengeResponse) throws -> String {
+    try requireByteLength(
+        "ChallengeResponse", "signature",
+        expected: 64, actual: response.signature, code: "SCP-VALID-7065"
+    )
+    return try encodeTrustAdmissionJson(response)
+}
+
+// MARK: - Typed challenge-verification wrappers (ADR-058)
+
+/// Verify an attestation's Ed25519 signature, evidence, expiry, and
+/// revocation status (ADR-017, §7.4).
+///
+/// Typed counterpart to the generated
+/// ``trustVerifyAttestation(attestationJson:)`` free function: it serializes
+/// the typed attestation envelope (``CachedAttestationEnvelope``) to the
+/// serde wire shape (ADR-058) and calls the bridge unchanged.
+///
+/// - Parameter attestation: The typed attestation envelope.
+/// - Returns: The structured verification result (`valid` / `chainDepth` /
+///   `errorMessage`).
+/// - Throws: ``ScpError`` on a serialization failure or malformed envelope.
+public func trustVerifyAttestation(
+    attestation: CachedAttestationEnvelope
+) throws -> AttestationVerificationResult {
+    try trustVerifyAttestation(attestationJson: encodeAttestationJson(attestation))
+}
+
+public extension SCP {
+    /// Verify a challenge response against its original challenge request
+    /// (ADR-017, §7.3.4).
+    ///
+    /// Typed counterpart to
+    /// ``SCP/trustVerifyResponse(challengeJson:responseJson:)``: it
+    /// serializes the typed ``ChallengeRequest`` / ``ChallengeResponse`` to
+    /// the serde wire shapes (ADR-058) and calls the bridge unchanged.
+    ///
+    /// - Parameters:
+    ///   - challenge: The typed challenge request.
+    ///   - response: The typed challenge response.
+    /// - Returns: `true` if the response is valid (correct responder, within
+    ///   timeout, valid signature), `false` otherwise.
+    /// - Throws: ``ScpError`` on a wrong-length signature (before any bridge
+    ///   call) or a serialization failure.
+    func trustVerifyResponse(
+        challenge: ChallengeRequest,
+        response: ChallengeResponse
+    ) throws -> Bool {
+        try trustVerifyResponse(
+            challengeJson: encodeChallengeRequestJson(challenge),
+            responseJson: encodeChallengeResponseJson(response)
+        )
+    }
+}
