@@ -1722,6 +1722,7 @@ This section consolidates all HKDF labels, HPKE info prefixes, HMAC domain strin
 | CID content codec | DAG-CBOR (`0x71`) | Canonical CBOR encoding | §9.5 |
 | CID multibase encoding | base32lower (prefix `b`) | For display; raw bytes on wire | §9.5 |
 | MLS extension type: `scp_wrapping_key` | `0xFF01` | RFC 9420 §17.3 private-use range; carries X25519 sender key wrapping public key | §9.16 |
+| MLS extension type: `scp_context_params` | `0xFF02` | RFC 9420 §17.3 private-use range; GroupContext extension carrying JCS-serialized SCP Context Parameters (context_id, governance/ceiling hashes, parent lineage) | §5.13.3 |
 | UCAN max delegation chain depth | 32 | Maximum depth of UCAN delegation chains | §9.8.2 |
 | UCAN nonce cache max capacity | 100,000 | Maximum nonces tracked for deduplication | §9.8.2 |
 | UCAN nonce min retention | 86,400s (24h) | Minimum time nonces are retained before garbage collection | §9.8.2 |

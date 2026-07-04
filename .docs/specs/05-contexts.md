@@ -1230,33 +1230,33 @@ This reuses the existing tool call model — no new protocol primitive. The chil
 **MLS group_context extension format.** SCP defines a custom MLS extension for carrying context parameters in the `group_context`. The extension uses the IANA private-use range for MLS extension types:
 
 ```
-Extension Type ID: 0xFF01 (SCP Context Parameters)
+Extension Type ID: 0xFF02 (SCP Context Parameters)
 
-ExtensionType: 0xFF01
-ExtensionData: MessagePack-serialized ScpContextExtension
+ExtensionType: 0xFF02
+ExtensionData: RFC 8785 (JCS) canonical-JSON-serialized ScpContextExtension
 
 ScpContextExtension {
     context_id:               ContextId,           // The SCP context ID
     context_mode:             u8,                   // 0 = Encrypted, 1 = Broadcast
-    governance_policy_hash:   [u8; 32],            // SHA-256 of canonical_msgpack(governance_policy)
+    governance_policy_hash:   [u8; 32],            // SHA-256 of canonical_json_jcs(governance_policy)
     ceiling_policy:           u8,                   // 0 = Immutable, 1 = Governed
-    ceiling_hash:             [u8; 32],            // SHA-256 of canonical_msgpack(capability_ceiling)
+    ceiling_hash:             [u8; 32],            // SHA-256 of canonical_json_jcs(capability_ceiling)
     parent_context_ids:       Vec<ContextId>,       // Sorted lexicographically; empty for root contexts
-    parent_governance_hash:   Option<[u8; 32]>,    // SHA-256 of canonical_msgpack(parent_governance_configs); None for root contexts
+    parent_governance_hash:   Option<[u8; 32]>,    // SHA-256 of canonical_json_jcs(parent_governance_configs); None for root contexts
 }
 ```
 
-**Serialization.** The `ScpContextExtension` is serialized using canonical MessagePack (sorted map keys, deterministic encoding), matching SCP's standard serialization format (§17). This ensures that independent implementations produce identical byte representations for the same extension contents.
+**Serialization.** The `ScpContextExtension` is serialized using RFC 8785 canonical JSON (JCS), matching the cross-implementation canonical-hashing mandate in §9.5 (§09-security-model.md). MessagePack has no canonical form standard — field ordering varies by library, so it cannot guarantee byte-identical output across implementations; JCS provides a formal canonicalization standard that can. This ensures that independent implementations produce identical byte representations for the same extension contents.
 
-**Extension type ID.** `0xFF01` is in the IANA private-use range for MLS extension types (`0xFF00`-`0xFFFF`), as defined in RFC 9420 Section 17.3. If SCP registers with IANA in the future, the extension type ID will transition to an assigned value. SDKs MUST accept both the private-use ID and any future assigned ID during a transition period.
+**Extension type ID.** `0xFF02` is in the IANA private-use range for MLS extension types (`0xFF00`-`0xFFFF`), as defined in RFC 9420 Section 17.3. If SCP registers with IANA in the future, the extension type ID will transition to an assigned value. SDKs MUST accept both the private-use ID and any future assigned ID during a transition period.
 
 **Validation rules:**
 
-1. The `ScpContextExtension` with type ID `0xFF01` MUST be present in the `group_context.extensions` of every SCP MLS group. MLS groups without this extension are not SCP contexts and MUST be rejected.
+1. The `ScpContextExtension` with type ID `0xFF02` MUST be present in the `group_context.extensions` of every SCP MLS group. MLS groups without this extension are not SCP contexts and MUST be rejected.
 2. The `context_id` in the extension MUST match the context ID in the context's metadata and event log.
-3. The `governance_policy_hash` MUST match `SHA-256(canonical_msgpack(governance_policy))` computed from the context's declared governance policy.
-4. The `ceiling_hash` MUST match `SHA-256(canonical_msgpack(capability_ceiling))` computed from the context's declared capability ceiling.
-5. For child contexts: `parent_context_ids` MUST be non-empty and sorted lexicographically. `parent_governance_hash` MUST be present and match `SHA-256(canonical_msgpack(parent_governance_configs))`.
+3. The `governance_policy_hash` MUST match `SHA-256(canonical_json_jcs(governance_policy))` computed from the context's declared governance policy.
+4. The `ceiling_hash` MUST match `SHA-256(canonical_json_jcs(capability_ceiling))` computed from the context's declared capability ceiling.
+5. For child contexts: `parent_context_ids` MUST be non-empty and sorted lexicographically. `parent_governance_hash` MUST be present and match `SHA-256(canonical_json_jcs(parent_governance_configs))`.
 6. For root contexts: `parent_context_ids` MUST be empty. `parent_governance_hash` MUST be `None`.
 7. Any mismatch between the extension contents and the context's metadata is a protocol violation. The SDK MUST reject the MLS group and report the discrepancy.
 
