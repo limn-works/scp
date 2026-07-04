@@ -117,6 +117,31 @@ holds `13050-13099`, so the two layers never contend for the same number.
 | `SCP-SAGA-13067` | supervisor | Generic saga terminal abort with no specific sub-code (e.g. Prepare-phase 30s timeout, journal I/O failure) — the message string carries the specific cause |
 | `SCP-SAGA-13068` | supervisor | `ParticipantUnavailable` — Prepare-phase abort: participant actor unavailable to complete the Prepare exchange — inbox closed/terminated (transient, retryable) |
 
+### Registered SCP-STORAGE- codes
+
+The `SCP-STORAGE-` band (`8000-8999`) is shared across the storage-selection
+layer and several platform/adapter storage backends, so a code is unique to one
+distinct condition. `8000` is the storage-selection error (§17.6 "Storage
+Selection Is Mandatory"). The remaining numbers are allocated per-owner below;
+when adding a new storage code, take the next free number **inside the owning
+sub-block** — never reuse a number assigned to a different backend, even across
+languages. (This table is documentation of the existing allocation, not a new
+enforcement mechanism.)
+
+| Code | Owner | Condition |
+|------|-------|-----------|
+| `SCP-STORAGE-8000` | selection layer (all bridges) | No storage backend selected (mandatory selection missing) |
+| `SCP-STORAGE-8001` | `scp-kt-android` `AndroidStorage` | Storage key not found |
+| `SCP-STORAGE-8002` | `scp-kt-android` `AndroidStorage` | Storage operation failed |
+| `SCP-STORAGE-8003` | `scp-kt-android` `AndroidStorage` | Key derivation failed |
+| `SCP-STORAGE-8010` | `scp-client-wasm` (browser participant) | Injected `Storage` backend I/O fault (`get`/`put`/`delete`/`list_keys`) |
+| `SCP-STORAGE-8011` | `scp-client-wasm` (browser participant) | Corrupt snapshot — bad decode / unknown version / context-id-vs-key mismatch / §9.9.3 checkpoint mismatch |
+| `SCP-STORAGE-8012` | `scp-client-wasm` (browser participant) | Snapshot / pending-join blob belongs to a different identity (owner-DID mismatch) |
+| `SCP-STORAGE-8013` | `scp-client-wasm` (browser participant) | Context poisoned — a persist failed after the in-memory ratchet advanced; reconstruct from the last durable snapshot |
+
+The browser participant codes (`8010-8013`) start at `8010` specifically to avoid
+colliding with the Android backend's `8001-8003`, which were allocated first.
+
 ### Registered SCP-ATTEST- codes
 
 | Code | Description |
