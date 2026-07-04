@@ -963,6 +963,77 @@ class TestTrust:
         except Exception:
             pass  # Expected without attestation infrastructure
 
+    async def test_participation_admission_error_codes_surface(self, scp: SCP):
+        """verify_participation_requirements failures carry per-case structured codes.
+
+        Cross-bridge parity (spec section 7.3.2.1): the PyO3 bridge emits the
+        same per-case ``SCP-VALID-*`` code the UniFFI/NAPI bridges emit for the
+        same logical failure, and the code is recoverable from the raised
+        native ``ValidationError``'s string form (the ``[CODE]``-prefixed
+        message), exactly as ``check_capability_requirements``'s codes surface.
+        """
+        from scp_sdk.trust import (
+            ParticipationFact,
+            ParticipationThreshold,
+            RequireParticipation,
+            verify_participation_requirements,
+        )
+
+        # SDK wrapper: a malformed subject DID fails boundary validation with
+        # the generic validation code shared by all three bridges.
+        with pytest.raises(_scp_core.ValidationError, match="SCP-VALID-7000"):
+            verify_participation_requirements("not-a-did", [], [])
+
+        # SDK wrapper: a requirement with no satisfying profiles fails the
+        # admission check itself, which carries its own per-case code.
+        requirement = RequireParticipation(
+            fact=ParticipationFact("ParticipationDuration"),
+            threshold=ParticipationThreshold("AtLeast", 1),
+            max_age_secs=3600,
+            min_contexts=0,
+        )
+        with pytest.raises(_scp_core.ValidationError, match="SCP-VALID-7032"):
+            verify_participation_requirements("did:key:alice", [requirement], [])
+
+        # Raw bridge: the per-position JSON parse codes (unreachable through
+        # the typed SDK wrapper, which always serializes valid JSON).
+        with pytest.raises(_scp_core.ValidationError, match="SCP-VALID-7031"):
+            _scp_core.verify_participation_requirements("did:key:alice", "not json", "[]")
+        with pytest.raises(_scp_core.ValidationError, match="SCP-VALID-7030"):
+            _scp_core.verify_participation_requirements("did:key:alice", "[]", "not json")
+
+    async def test_capability_admission_error_codes_surface(self, scp: SCP):
+        """check_capability_requirements failures carry per-case structured codes.
+
+        The reference pattern for cross-bridge structured codes (spec section
+        7.3.4.4): asserts the anchor op's codes stay recoverable the same way
+        the participation sibling's now are.
+        """
+        from scp_sdk.trust import check_capability_requirements
+
+        # SDK wrapper: a malformed subject DID fails boundary validation with
+        # the generic validation code shared by all three bridges.
+        with pytest.raises(_scp_core.ValidationError, match="SCP-VALID-7000"):
+            check_capability_requirements("ctx-real-ffi", "not-a-did", [], [], [])
+
+        # SDK wrapper: a self-attested requirement the agent lacks fails the
+        # admission check itself, which carries its own per-case code.
+        from scp_sdk.trust import CapabilityRequirement, VerificationLevel
+
+        requirement = CapabilityRequirement(
+            capability="scp:capability:schema-validation/v1",
+            verification_level=VerificationLevel("SelfAttested"),
+        )
+        with pytest.raises(_scp_core.ValidationError, match="SCP-VALID-7076"):
+            check_capability_requirements("ctx-real-ffi", "did:key:alice", [requirement], [], [])
+
+        # Raw bridge: the per-position JSON parse code (unreachable through
+        # the typed SDK wrapper, which always serializes valid JSON).
+        with pytest.raises(_scp_core.ValidationError, match="SCP-VALID-7073"):
+            _scp_core.check_capability_requirements(
+                "ctx-real-ffi", "did:key:alice", "not json", "[]", "[]"
+            )
+
     async def test_participation_record_reflects_governance_real_ffi(self, scp: SCP):
         """The typed participation record (§7.3.2) RECEIVES real leaf-derived facts.
 

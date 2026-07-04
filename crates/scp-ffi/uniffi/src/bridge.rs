@@ -17378,6 +17378,59 @@ mod tests {
         crate::scp::Scp::new_in_memory_for_test()
     }
 
+    /// Extracts the structured code from a `Validation` error, or a
+    /// diagnostic string for any other variant, so cross-bridge parity tests
+    /// can `assert_eq!` on the exact per-case `SCP-VALID-*` code the
+    /// PyO3/NAPI bridges assert for the same logical failure.
+    fn validation_code(err: &ScpError) -> String {
+        match err {
+            ScpError::Validation { code, .. } => code.clone(),
+            other => format!("non-validation error: {other:?}"),
+        }
+    }
+
+    // -- trust helper free functions (ADR-017 Layer 3) --
+
+    #[test]
+    fn trust_query_score_rejects_empty_did_with_code() {
+        let result = trust_query_score(String::new(), "ctx-1".to_owned());
+        assert_eq!(validation_code(&result.unwrap_err()), codes::VALID_7010);
+    }
+
+    #[test]
+    fn trust_query_score_rejects_empty_context_with_code() {
+        let result = trust_query_score("did:key:test".to_owned(), String::new());
+        assert_eq!(validation_code(&result.unwrap_err()), codes::VALID_7011);
+    }
+
+    #[test]
+    fn trust_verify_attestation_rejects_invalid_json_with_code() {
+        let result = trust_verify_attestation("not json".to_owned());
+        assert_eq!(validation_code(&result.unwrap_err()), codes::VALID_7012);
+    }
+
+    #[test]
+    fn trust_create_challenge_rejects_empty_did_with_code() {
+        let result = trust_create_challenge(String::new());
+        assert_eq!(validation_code(&result.unwrap_err()), codes::VALID_7013);
+    }
+
+    #[test]
+    fn trust_verify_response_rejects_invalid_challenge_json_with_code() {
+        // Malformed JSON in the CHALLENGE position.
+        let result = trust_verify_response("bad".to_owned(), "bad".to_owned());
+        assert_eq!(validation_code(&result.unwrap_err()), codes::VALID_7016);
+    }
+
+    #[test]
+    fn trust_verify_response_rejects_invalid_response_json_with_code() {
+        // Malformed JSON in the RESPONSE position: the challenge parses, so
+        // the failure is attributed to the response argument.
+        let challenge = trust_create_challenge("did:key:target".to_owned()).unwrap();
+        let result = trust_verify_response(challenge.challenge_json, "bad".to_owned());
+        assert_eq!(validation_code(&result.unwrap_err()), codes::VALID_7017);
+    }
+
     #[test]
     fn participation_record_rejects_empty_context() {
         let scp = scp_test();
@@ -17401,7 +17454,7 @@ mod tests {
             "did:key:test".to_owned(),
             "not json".to_owned(),
         );
-        assert!(result.is_err());
+        assert_eq!(validation_code(&result.unwrap_err()), codes::VALID_7059);
     }
 
     #[test]
@@ -17418,7 +17471,7 @@ mod tests {
     fn verify_participation_requirements_rejects_empty_subject() {
         let result =
             verify_participation_requirements(String::new(), "[]".to_owned(), "[]".to_owned());
-        assert!(result.is_err());
+        assert_eq!(validation_code(&result.unwrap_err()), codes::VALID_7000);
     }
 
     #[test]
@@ -17430,7 +17483,232 @@ mod tests {
             "[]".to_owned(),
             "[]".to_owned(),
         );
-        assert!(result.is_err());
+        assert_eq!(validation_code(&result.unwrap_err()), codes::VALID_7000);
+    }
+
+    #[test]
+    fn verify_participation_requirements_rejects_invalid_requirements_json() {
+        // Malformed JSON in the REQUIREMENTS position (2nd arg).
+        let result = verify_participation_requirements(
+            "did:key:alice".to_owned(),
+            "not json".to_owned(),
+            "[]".to_owned(),
+        );
+        assert_eq!(validation_code(&result.unwrap_err()), codes::VALID_7031);
+    }
+
+    #[test]
+    fn verify_participation_requirements_rejects_invalid_profile_json() {
+        // Malformed JSON in the PROFILE position (3rd arg).
+        let result = verify_participation_requirements(
+            "did:key:alice".to_owned(),
+            "[]".to_owned(),
+            "not json".to_owned(),
+        );
+        assert_eq!(validation_code(&result.unwrap_err()), codes::VALID_7030);
+    }
+
+    #[test]
+    fn verify_participation_requirements_unmet_requirement_fails_with_admission_code() {
+        // A requirement with no satisfying profiles fails the admission check
+        // itself (not JSON parsing), which carries its own per-case code.
+        let requirements = r#"[{"fact":"ParticipationDuration","threshold":{"AtLeast":1},"max_age_secs":3600,"min_contexts":0}]"#;
+        let result = verify_participation_requirements(
+            "did:key:alice".to_owned(),
+            requirements.to_owned(),
+            "[]".to_owned(),
+        );
+        assert_eq!(validation_code(&result.unwrap_err()), codes::VALID_7032);
+    }
+
+    // -- aggregate_trust_input (§7.3) per-case codes --
+
+    #[allow(clippy::too_many_arguments)]
+    fn aggregate_on_test_scp(
+        context_id: &str,
+        subject_did: &str,
+        events_json: &str,
+        merkle_root_json: &str,
+        consequence_rules_json: &str,
+        threshold_requirements_json: &str,
+        attestor_sets_json: &str,
+        cached_attestations_json: &str,
+        challenge_results_json: &str,
+    ) -> Result<String, ScpError> {
+        scp_test().aggregate_trust_input(
+            context_id.to_owned(),
+            subject_did.to_owned(),
+            events_json.to_owned(),
+            merkle_root_json.to_owned(),
+            consequence_rules_json.to_owned(),
+            threshold_requirements_json.to_owned(),
+            attestor_sets_json.to_owned(),
+            cached_attestations_json.to_owned(),
+            challenge_results_json.to_owned(),
+        )
+    }
+
+    const TEST_MERKLE_ROOT_JSON: &str =
+        "[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]";
+
+    #[test]
+    fn aggregate_trust_input_rejects_empty_context_with_code() {
+        let result = aggregate_on_test_scp(
+            "",
+            "did:key:test",
+            "[]",
+            TEST_MERKLE_ROOT_JSON,
+            "[]",
+            "{}",
+            "{}",
+            "[]",
+            "[]",
+        );
+        assert_eq!(validation_code(&result.unwrap_err()), codes::VALID_7040);
+    }
+
+    #[test]
+    fn aggregate_trust_input_rejects_empty_did_with_code() {
+        let result = aggregate_on_test_scp(
+            "ctx-1",
+            "",
+            "[]",
+            TEST_MERKLE_ROOT_JSON,
+            "[]",
+            "{}",
+            "{}",
+            "[]",
+            "[]",
+        );
+        assert_eq!(validation_code(&result.unwrap_err()), codes::VALID_7041);
+    }
+
+    #[test]
+    fn aggregate_trust_input_rejects_invalid_events_json_with_code() {
+        let result = aggregate_on_test_scp(
+            "ctx-1",
+            "did:key:test",
+            "not json",
+            TEST_MERKLE_ROOT_JSON,
+            "[]",
+            "{}",
+            "{}",
+            "[]",
+            "[]",
+        );
+        assert_eq!(validation_code(&result.unwrap_err()), codes::VALID_7042);
+    }
+
+    #[test]
+    fn aggregate_trust_input_rejects_invalid_merkle_root_json_with_code() {
+        let result = aggregate_on_test_scp(
+            "ctx-1",
+            "did:key:test",
+            "[]",
+            "not json",
+            "[]",
+            "{}",
+            "{}",
+            "[]",
+            "[]",
+        );
+        assert_eq!(validation_code(&result.unwrap_err()), codes::VALID_7043);
+    }
+
+    #[test]
+    fn aggregate_trust_input_rejects_wrong_length_merkle_root_with_code() {
+        let result = aggregate_on_test_scp(
+            "ctx-1",
+            "did:key:test",
+            "[]",
+            "[0,0,0]",
+            "[]",
+            "{}",
+            "{}",
+            "[]",
+            "[]",
+        );
+        assert_eq!(validation_code(&result.unwrap_err()), codes::VALID_7044);
+    }
+
+    #[test]
+    fn aggregate_trust_input_rejects_invalid_consequence_rules_json_with_code() {
+        let result = aggregate_on_test_scp(
+            "ctx-1",
+            "did:key:test",
+            "[]",
+            TEST_MERKLE_ROOT_JSON,
+            "not json",
+            "{}",
+            "{}",
+            "[]",
+            "[]",
+        );
+        assert_eq!(validation_code(&result.unwrap_err()), codes::VALID_7045);
+    }
+
+    #[test]
+    fn aggregate_trust_input_rejects_invalid_threshold_requirements_json_with_code() {
+        let result = aggregate_on_test_scp(
+            "ctx-1",
+            "did:key:test",
+            "[]",
+            TEST_MERKLE_ROOT_JSON,
+            "[]",
+            "not json",
+            "{}",
+            "[]",
+            "[]",
+        );
+        assert_eq!(validation_code(&result.unwrap_err()), codes::VALID_7046);
+    }
+
+    #[test]
+    fn aggregate_trust_input_rejects_invalid_attestor_sets_json_with_code() {
+        let result = aggregate_on_test_scp(
+            "ctx-1",
+            "did:key:test",
+            "[]",
+            TEST_MERKLE_ROOT_JSON,
+            "[]",
+            "{}",
+            "not json",
+            "[]",
+            "[]",
+        );
+        assert_eq!(validation_code(&result.unwrap_err()), codes::VALID_7047);
+    }
+
+    #[test]
+    fn aggregate_trust_input_rejects_invalid_cached_attestations_json_with_code() {
+        let result = aggregate_on_test_scp(
+            "ctx-1",
+            "did:key:test",
+            "[]",
+            TEST_MERKLE_ROOT_JSON,
+            "[]",
+            "{}",
+            "{}",
+            "not json",
+            "[]",
+        );
+        assert_eq!(validation_code(&result.unwrap_err()), codes::VALID_7048);
+    }
+
+    #[test]
+    fn aggregate_trust_input_rejects_invalid_challenge_results_json_with_code() {
+        let result = aggregate_on_test_scp(
+            "ctx-1",
+            "did:key:test",
+            "[]",
+            TEST_MERKLE_ROOT_JSON,
+            "[]",
+            "{}",
+            "{}",
+            "[]",
+            "not json",
+        );
+        assert_eq!(validation_code(&result.unwrap_err()), codes::VALID_7049);
     }
 
     // -- check_capability_requirements (§7.3.4.4, SCP-ACR-008) --
