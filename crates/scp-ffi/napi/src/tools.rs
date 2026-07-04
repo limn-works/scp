@@ -241,9 +241,7 @@ pub(crate) async fn tool_register_on(
         test_vectors,
         operator_did: definition.operator_did.into(),
         cost,
-        registered_at: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs()),
+        registered_at: scp_clock::Clock::now_secs(&scp_clock::SystemClock),
         signature: Vec::new(),
     };
 
