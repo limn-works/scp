@@ -823,6 +823,11 @@ const PARTICIPATION_KEY_DOMAIN: &[u8] = b"scp-participation-statement-v1";
 /// where a trusted-but-misbehaving signer could keep a statement inside the
 /// `max_age_secs` freshness window indefinitely. 5 minutes, matching
 /// `challenge.rs`'s `MAX_COMPLETION_FUTURE_SKEW_SECS` and spec §9.14.
+///
+/// Independent knob: shares the §9.14 5-minute default with the UCAN
+/// (`crypto::ucan::validate::DEFAULT_CLOCK_SKEW_TOLERANCE_SECS`) and envelope
+/// (`envelope::validation::DEFAULT_CLOCK_SKEW_TOLERANCE_MS`) skew tolerances,
+/// but is deliberately a distinct constant, not unified.
 const MAX_PARTICIPATION_FUTURE_SKEW_SECS: u64 = 5 * 60;
 
 /// Derives a context-specific Ed25519 signing key for participation statements.
