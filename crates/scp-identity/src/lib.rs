@@ -166,10 +166,6 @@ pub enum IdentityError {
     #[error("invalid DID format: {0}")]
     InvalidDidFormat(String),
 
-    /// z-base-32 decoding failed.
-    #[error("z-base-32 decode error: {0}")]
-    ZBase32DecodeError(String),
-
     /// DID document serialization failed.
     #[error("document serialization error: {0}")]
     DocumentSerializationError(String),
