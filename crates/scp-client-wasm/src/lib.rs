@@ -27,11 +27,15 @@
 //!
 //! # Injected platform dependencies (keys on-device)
 //!
-//! [`WasmScpClient::new`] takes the three driver dependencies as JS-injected
-//! objects: a hardened [`time::WasmClock`] (captured `Date.now`), a
-//! [`storage::JsStorageAdapter`] (`IndexedDB`/OPFS), and a custody-derived
-//! [`custody::JsSigner`] (the on-device DID; see [`custody`] for the ADR-057
-//! friction note on where the MLS signing key currently lives).
+//! The browser constructor `WasmScpClient::from_js` takes two JS-injected
+//! objects: a `WebCrypto`-backed key-custody object (its bound DID becomes this
+//! participant's identity; see [`custody`] for the ADR-057 friction note on
+//! where the MLS signing key currently lives) and an `IndexedDB`/OPFS-backed
+//! storage object. The clock is **not** injected: it is the hardened
+//! captured-`Date.now` source ([`time::WasmClock`]) built inside wasm at
+//! construction, closing the override surface an injected JS clock would
+//! reintroduce. The native host-test seam [`WasmScpClient::from_parts`] takes
+//! the three built driver dependencies (signer, storage, clock) directly.
 //!
 //! # Scope fence (ADR-057, mechanically enforced)
 //!
@@ -287,7 +291,7 @@ impl WasmScpClient {
     /// `[SCP-CRYPTO-…]` error on group-creation / leaf failure. A
     /// `[SCP-STORAGE-8010]` on the post-create snapshot write **poisons** the
     /// freshly-created context (its in-memory state exists but was never durably
-    /// recorded); discard this client and reconstruct via [`WasmScpClient::new`].
+    /// recorded); discard this client and reconstruct it via the [`WasmScpClient`] constructor for your target.
     /// The poisoned context then surfaces `[SCP-STORAGE-8013]` on any later op —
     /// see [`ContextStatus`](scp_client::ContextStatus).
     #[wasm_bindgen(js_name = "createContext")]
@@ -320,8 +324,8 @@ impl WasmScpClient {
     /// MLS / leaf failure. A `[SCP-STORAGE-8010]` on the post-add snapshot write
     /// **poisons** the context (its state advanced in memory but was not durably
     /// recorded), and `[SCP-STORAGE-8013]` is thrown if the context is already
-    /// poisoned — either way, discard this client and reconstruct via
-    /// [`WasmScpClient::new`] (see [`ContextStatus`](scp_client::ContextStatus)).
+    /// poisoned — either way, discard this client and reconstruct it via the [`WasmScpClient`]
+    /// constructor for your target (see [`ContextStatus`](scp_client::ContextStatus)).
     #[wasm_bindgen(js_name = "addMember")]
     pub fn add_member(
         &mut self,
@@ -350,8 +354,8 @@ impl WasmScpClient {
     /// stream cannot be deserialized, or a `[SCP-CRYPTO-…]` error on Welcome /
     /// replay failure. A `[SCP-STORAGE-8010]` on the post-join snapshot write
     /// **poisons** the freshly-joined context (its state advanced in memory but was
-    /// not durably recorded); discard this client and reconstruct via
-    /// [`WasmScpClient::new`], which restores the still-present pending material and
+    /// not durably recorded); discard this client and reconstruct it via the [`WasmScpClient`]
+    /// constructor for your target, which restores the still-present pending material and
     /// lets the join be retried. The poisoned context then surfaces
     /// `[SCP-STORAGE-8013]` on any later op — see
     /// [`ContextStatus`](scp_client::ContextStatus).
@@ -382,7 +386,7 @@ impl WasmScpClient {
     /// snapshot write **poisons** the context (the message's state advanced in
     /// memory but was not durably recorded, so no ciphertext is returned), and
     /// `[SCP-STORAGE-8013]` is thrown if the context is already poisoned — either
-    /// way, discard this client and reconstruct via [`WasmScpClient::new`] (see
+    /// way, discard this client and reconstruct it via the [`WasmScpClient`] constructor for your target (see
     /// [`ContextStatus`](scp_client::ContextStatus)).
     #[wasm_bindgen(js_name = "sendMessage")]
     pub fn send_message(
@@ -412,8 +416,8 @@ impl WasmScpClient {
     /// `[SCP-STORAGE-8010]` on the post-receive snapshot write **poisons** the
     /// context (the decrypt advanced the ratchet but the new state was not durably
     /// recorded), and `[SCP-STORAGE-8013]` is thrown if the context is already
-    /// poisoned — either way, discard this client and reconstruct via
-    /// [`WasmScpClient::new`] (see [`ContextStatus`](scp_client::ContextStatus)).
+    /// poisoned — either way, discard this client and reconstruct it via the [`WasmScpClient`]
+    /// constructor for your target (see [`ContextStatus`](scp_client::ContextStatus)).
     #[wasm_bindgen(js_name = "receiveMessage")]
     pub fn receive_message(
         &mut self,
@@ -435,8 +439,8 @@ impl WasmScpClient {
     /// on the snapshot write that records the emptied buffer **poisons** the
     /// context (the buffer was drained in memory but the emptied state was not
     /// durably recorded), and `[SCP-STORAGE-8013]` is thrown if the context is
-    /// already poisoned — either way, discard this client and reconstruct via
-    /// [`WasmScpClient::new`] (see [`ContextStatus`](scp_client::ContextStatus)).
+    /// already poisoned — either way, discard this client and reconstruct it via the [`WasmScpClient`]
+    /// constructor for your target (see [`ContextStatus`](scp_client::ContextStatus)).
     #[wasm_bindgen(js_name = "drainEvents")]
     pub fn drain_events(&mut self, context_id: String) -> Result<Vec<WasmReceivedEvent>, JsValue> {
         use scp_protocol::context::membership::ContextEvent;
@@ -469,7 +473,11 @@ impl WasmScpClient {
     ///
     /// # Errors
     ///
-    /// Throws `[SCP-CTX-2001]` if the context is not held.
+    /// Throws `[SCP-CTX-2001]` if the context is not held, or `[SCP-STORAGE-8010]`
+    /// if a durable delete (the pending-join blob or the snapshot) fails. Close is
+    /// retryable: on such a failure the in-memory context is left intact and the
+    /// recoverable snapshot is preserved (the delete order deletes the snapshot
+    /// last), so the caller can retry.
     #[wasm_bindgen(js_name = "closeContext")]
     pub fn close_context(&mut self, context_id: String) -> Result<(), JsValue> {
         map_err(self.inner.close_context(&context_id))
@@ -489,8 +497,8 @@ impl WasmScpClient {
     /// # Errors
     ///
     /// Throws `[SCP-CTX-2001]` if the context is not held, or `[SCP-STORAGE-8013]`
-    /// if the context is poisoned (discard this client and reconstruct via
-    /// [`WasmScpClient::new`] — see [`ContextStatus`](scp_client::ContextStatus)).
+    /// if the context is poisoned (discard this client and reconstruct it via the [`WasmScpClient`]
+    /// constructor for your target — see [`ContextStatus`](scp_client::ContextStatus)).
     /// This read-only observer never writes, so it cannot raise
     /// `[SCP-STORAGE-8010]`.
     #[wasm_bindgen(js_name = "localSenderKeyBytes")]
@@ -508,8 +516,8 @@ impl WasmScpClient {
     /// `[SCP-CTX-2001]` if the context is not held. A `[SCP-STORAGE-8010]` on the
     /// snapshot write that persists the updated sender-key store **poisons** the
     /// context, and `[SCP-STORAGE-8013]` is thrown if the context is already
-    /// poisoned — either way, discard this client and reconstruct via
-    /// [`WasmScpClient::new`] (see [`ContextStatus`](scp_client::ContextStatus)).
+    /// poisoned — either way, discard this client and reconstruct it via the [`WasmScpClient`]
+    /// constructor for your target (see [`ContextStatus`](scp_client::ContextStatus)).
     #[wasm_bindgen(js_name = "installSenderKey")]
     pub fn install_sender_key(
         &mut self,
@@ -547,8 +555,8 @@ impl WasmScpClient {
     ///
     /// The `Option` observers ([`memberDids`](WasmScpClient::member_dids) et al.)
     /// collapse "poisoned" into `undefined`, indistinguishable from "absent"; this
-    /// distinguishes all three so a caller can decide between RECOVER (reconstruct
-    /// via [`WasmScpClient::new`]) and ABANDON ([`closeContext`](WasmScpClient::close_context))
+    /// distinguishes all three so a caller can decide between RECOVER (reconstruct it
+    /// via the [`WasmScpClient`] constructor for your target) and ABANDON ([`closeContext`](WasmScpClient::close_context))
     /// for a poisoned context without provoking `[SCP-STORAGE-8013]`. The status is
     /// a lowercase string (the surface's enum idiom, matching
     /// [`WasmReceivedEvent::kind`]).
@@ -615,7 +623,7 @@ impl WasmScpClient {
     ///
     /// Throws `[SCP-CTX-2001]` if the context is not held, `[SCP-CRYPTO-…]`
     /// if the MLS group has been destroyed, or `[SCP-STORAGE-8013]` if the context
-    /// is poisoned (discard this client and reconstruct via [`WasmScpClient::new`]
+    /// is poisoned (discard this client and reconstruct it via the [`WasmScpClient`] constructor for your target
     /// — see [`ContextStatus`](scp_client::ContextStatus)). This read-only observer
     /// never writes, so it cannot raise `[SCP-STORAGE-8010]`.
     #[wasm_bindgen(js_name = "mlsEpoch")]
