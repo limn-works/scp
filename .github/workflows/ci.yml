@@ -1103,6 +1103,10 @@ jobs:
       - fallback-registry
       - handle-affinity
       - no-panic-abort
+      - handler-no-panic
+      - saga-gating-granularity
+      - deleted-primitives
+      - bridge-instance-lifecycle
       - no-mutable-globals-rust
       - no-mutable-globals-python
       - no-mutable-globals-ts
@@ -1142,6 +1146,10 @@ jobs:
             "${{ needs.fallback-registry.result }}" \
             "${{ needs.handle-affinity.result }}" \
             "${{ needs.no-panic-abort.result }}" \
+            "${{ needs.handler-no-panic.result }}" \
+            "${{ needs.saga-gating-granularity.result }}" \
+            "${{ needs.deleted-primitives.result }}" \
+            "${{ needs.bridge-instance-lifecycle.result }}" \
             "${{ needs.no-mutable-globals-rust.result }}" \
             "${{ needs.no-mutable-globals-python.result }}" \
             "${{ needs.no-mutable-globals-ts.result }}" \
