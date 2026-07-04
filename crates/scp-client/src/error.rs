@@ -49,4 +49,33 @@ pub enum ClientError {
     /// that is in the membership set, or a malformed driver argument).
     #[error("driver error: {0}")]
     Driver(String),
+
+    /// The injected [`Storage`](crate::Storage) backend itself failed — a
+    /// `get`/`put`/`delete`/`list_keys` returned an error (quota exhausted,
+    /// transaction aborted, backend unavailable). Surfaced as `SCP-STORAGE-8001`.
+    /// Distinct from a corrupt-but-readable blob: this is an I/O-level fault, not
+    /// a content problem.
+    #[error("storage backend error: {0}")]
+    StorageBackend(String),
+
+    /// A persisted snapshot could not be trusted for restore: it failed to
+    /// deserialize, carried an unknown format version, embedded a different
+    /// context id than its storage key, or failed the §9.9.3 checkpoint compare
+    /// (the event-log root recomputed from the restored state does not equal the
+    /// root the snapshot recorded — a torn/corrupt/truncated event stream). The
+    /// in-blob root binds the event log only and is not tamper-resistant, so
+    /// whole-blob authenticity rests on the backend's authenticated encryption at
+    /// rest. Restore fails closed rather than resuming a context from
+    /// inconsistent state (ADR-057 crash/consistency consequence, §17.5).
+    /// Surfaced as `SCP-STORAGE-8002`.
+    #[error("corrupt snapshot: {0}")]
+    StorageCorrupt(String),
+
+    /// A persisted snapshot belongs to a different identity than the client
+    /// attempting to restore it (its bound `owner_did` does not match this
+    /// client's DID). Restoring another identity's MLS/sender-key state under
+    /// this client would be an identity confusion, so it fails closed. Surfaced
+    /// as `SCP-STORAGE-8003`.
+    #[error("snapshot identity mismatch: {0}")]
+    StorageIdentityMismatch(String),
 }

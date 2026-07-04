@@ -215,7 +215,8 @@ pub struct WasmScpClient {
 }
 
 impl WasmScpClient {
-    /// Constructs the facade from already-built driver dependencies.
+    /// Constructs the facade from already-built driver dependencies, **restoring**
+    /// any persisted contexts and pending joins from `storage` (ADR-057 T2).
     ///
     /// This is the cross-target seam: the `wasm32` constructor
     /// ([`WasmScpClient::from_js`]) builds the JS-injected adapters and calls
@@ -223,15 +224,19 @@ impl WasmScpClient {
     /// directly. Keeping the dependency wiring here (not duplicated per target)
     /// means the host test exercises the exact same driver construction the
     /// browser path uses.
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// Returns the mapped `[SCP-STORAGE-…]` / `[SCP-CRYPTO-…]` error if restore
+    /// fails closed (corrupt/foreign/unreadable snapshot).
     pub fn from_parts(
         signer: Arc<dyn Signer>,
         storage: Arc<dyn Storage>,
         clock: Arc<dyn Clock>,
-    ) -> Self {
-        Self {
-            inner: ScpClient::new(signer, storage, clock),
-        }
+    ) -> Result<Self, JsValue> {
+        Ok(Self {
+            inner: map_err(ScpClient::new(signer, storage, clock))?,
+        })
     }
 }
 
@@ -246,9 +251,15 @@ impl WasmScpClient {
     /// capturing the reference *inside* wasm at init (an injected JS clock would
     /// reintroduce the override surface the capture defends against).
     ///
+    /// On construction the client **restores** any contexts and pending joins the
+    /// injected storage holds for this identity (ADR-057 T2) — a reopened tab
+    /// resumes its live state here, with no separate "load" call.
+    ///
     /// # Errors
     ///
-    /// Throws if the custody object has no bound DID identity.
+    /// Throws if the custody object has no bound DID identity, or a
+    /// `[SCP-STORAGE-…]` / `[SCP-CRYPTO-…]` error if a persisted snapshot fails
+    /// its restore (corrupt, foreign-owned, or unreadable) — restore fails closed.
     #[wasm_bindgen(constructor)]
     #[cfg(target_arch = "wasm32")]
     pub fn from_js(
@@ -258,7 +269,7 @@ impl WasmScpClient {
         let signer: Arc<dyn Signer> = Arc::new(crate::custody::JsSigner::from_custody(custody)?);
         let storage: Arc<dyn Storage> = Arc::new(crate::storage::JsStorageAdapter::new(storage));
         let clock: Arc<dyn Clock> = Arc::new(crate::time::WasmClock::new());
-        Ok(Self::from_parts(signer, storage, clock))
+        Self::from_parts(signer, storage, clock)
     }
 
     /// This participant's DID.
@@ -531,14 +542,24 @@ impl WasmScpClient {
     pub fn mls_epoch(&self, context_id: String) -> Result<u64, JsValue> {
         map_err(self.inner.mls_epoch(&context_id))
     }
+
+    // Persistence (ADR-057 T2): there is no explicit save/restore surface. The
+    // driver writes a snapshot to the injected storage after every state-mutating
+    // op automatically, and RESTORES all persisted contexts + pending joins in the
+    // constructor ([`WasmScpClient::from_js`]) — a reopened tab reconstructs its
+    // live state simply by being built over the same storage.
 }
 
 /// Serializes the adder's event-log stream for transport to the joiner.
 ///
 /// `scp_event_log::Event` is `serde`; the joiner deserializes the identical
-/// sequence via [`deserialize_event_log`]. `MessagePack` (`rmp_serde`) is the
-/// codebase's name-tagged wire form (width-/endianness-independent — ADR-057),
-/// the same encoding the driver's convergent leaves rely on.
+/// sequence via [`deserialize_event_log`]. This is `MessagePack` (`rmp_serde`)
+/// in its compact positional (array) encoding — a self-consistent
+/// serialize/deserialize pair used only as ephemeral join-replay transport
+/// across the JS boundary. It is width-/endianness-independent (ADR-057). It is
+/// NOT the convergent artifact: the §9.9.3 Merkle root is computed over the
+/// `Event` field values by `append_unsigned_event` on replay, independent of
+/// this transport encoding.
 fn serialize_event_log(events: &[scp_event_log::Event]) -> Result<Vec<u8>, JsValue> {
     rmp_serde::to_vec(events)
         .map_err(|e| JsValue::from_str(&format!("[SCP-VALID-7010] serializing event log: {e}")))

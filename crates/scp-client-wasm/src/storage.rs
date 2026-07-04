@@ -4,9 +4,24 @@
 //! (`crates/scp-ffi/wasm/`, pinned at `1a3b41a5e^`): a JS object the TypeScript
 //! wrapper injects, backed by a browser key/value store (`IndexedDB`, or
 //! wa-sqlite/OPFS). The deleted extern exposed `get`/`set`/`delete` plus
-//! `listKeys`/`exists`; the driver's [`scp_client::Storage`] trait needs only
-//! `get`/`put`/`delete` (out-of-band snapshot persistence — ADR-057 component
-//! 3), so the adapter binds exactly those three and nothing speculative.
+//! `listKeys`/`exists`; the driver's [`scp_client::Storage`] trait needs
+//! `get`/`put`/`delete`/`list_keys` (out-of-band snapshot persistence + reopen
+//! enumeration — ADR-057 component 3, T2), so the adapter binds exactly those
+//! four and nothing speculative.
+//!
+//! # Synchronous-facade embedder contract (ADR-057 T2)
+//!
+//! [`scp_client::Storage`] is **synchronous** (the single-tab driver calls it
+//! inline under `&mut self`), but a browser's durable store (`IndexedDB`) is
+//! **asynchronous**. The injected [`JsStorage`] therefore MUST be a *synchronous
+//! facade over an in-memory mirror*: on tab open the TypeScript SDK preloads the
+//! client's keyspace (the `scp-client/*` prefix) into an in-memory `Map`, serves
+//! `get`/`listKeys`/`set`/`delete` synchronously against that mirror, and
+//! *write-behind*s each mutation to `IndexedDB` asynchronously. A durable-write
+//! failure surfaces on a later call as a thrown exception (mapped to
+//! `SCP-STORAGE-8001` here). Implementing that mirror is the TypeScript SDK's job
+//! (ADR-057 Slice 3); this crate only defines the synchronous extern contract it
+//! must satisfy.
 //!
 //! Unlike the deleted bridge, the body is **not** a re-implementation of
 //! storage logic — it forwards to the injected JS object and translates the
@@ -58,7 +73,10 @@ mod wasm_impl {
         pub type JsStorage;
 
         /// Returns the value stored under `key`, or `undefined` (mapped to
-        /// `None`) if absent. Throws on storage access failure.
+        /// `None`) if the key is genuinely absent. Throws on storage access
+        /// failure — a thrown exception is a backend fault, NOT "absent", and is
+        /// surfaced as `SCP-STORAGE-8001` rather than mistaken for a missing key
+        /// (which would silently drop durable state).
         #[wasm_bindgen(method, catch, js_name = "get")]
         fn get(this: &JsStorage, key: &str) -> Result<Option<Vec<u8>>, JsValue>;
 
@@ -71,6 +89,14 @@ mod wasm_impl {
         /// access failure.
         #[wasm_bindgen(method, catch, js_name = "delete")]
         fn delete(this: &JsStorage, key: &str) -> Result<(), JsValue>;
+
+        /// Returns every key in the mirror that starts with `prefix`, in
+        /// unspecified order. The driver uses this to enumerate its persisted
+        /// contexts and pending joins on reopen (there is no separate manifest).
+        /// A browser backend serves this from the preloaded in-memory mirror (see
+        /// the module "synchronous-facade" note). Throws on enumeration failure.
+        #[wasm_bindgen(method, catch, js_name = "listKeys")]
+        fn list_keys(this: &JsStorage, prefix: &str) -> Result<Vec<String>, JsValue>;
     }
 
     /// Adapts an injected [`JsStorage`] to the driver's [`Storage`] trait.
@@ -97,7 +123,7 @@ mod wasm_impl {
     unsafe impl Sync for JsStorageAdapter {}
 
     /// Renders a `JsValue` thrown by the injected storage as a stable error
-    /// string for the driver's `Result<(), String>` / `Option` contract.
+    /// string for the driver's fallible `Storage` contract.
     fn js_err(context: &str, e: &JsValue) -> String {
         let detail = e
             .as_string()
@@ -106,13 +132,12 @@ mod wasm_impl {
     }
 
     impl Storage for JsStorageAdapter {
-        fn get(&self, key: &str) -> Option<Vec<u8>> {
-            // The trait's `get` is infallible-by-value (returns `Option`). A
-            // storage backend that throws on read is a hard environment fault
-            // the trait cannot surface; treat it as "absent" so callers fall
-            // back to a fresh read/rebuild rather than wedging. A browser
-            // backend should not throw on a plain key read in practice.
-            self.inner.get(key).ok().flatten()
+        fn get(&self, key: &str) -> Result<Option<Vec<u8>>, String> {
+            // Propagate a thrown JS exception as `Err` — a backend read fault is
+            // NOT the same as an absent key (`Ok(None)`). Swallowing it as absence
+            // would let the driver silently drop durable state; the driver relies
+            // on this distinction to fail restore closed (ADR-057 T2).
+            self.inner.get(key).map_err(|e| js_err("get", &e))
         }
 
         fn put(&self, key: &str, value: Vec<u8>) -> Result<(), String> {
@@ -121,6 +146,12 @@ mod wasm_impl {
 
         fn delete(&self, key: &str) -> Result<(), String> {
             self.inner.delete(key).map_err(|e| js_err("delete", &e))
+        }
+
+        fn list_keys(&self, prefix: &str) -> Result<Vec<String>, String> {
+            self.inner
+                .list_keys(prefix)
+                .map_err(|e| js_err("listKeys", &e))
         }
     }
 }

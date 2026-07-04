@@ -534,9 +534,20 @@ conn.execute_batch("
 ")?;
 ```
 
-### Browser Clients Are Remote Thin Clients
+### Browser Clients Run Storage In-Process
 
-Browser clients do not run storage in-process. Per ADR-055 (which supersedes ADR-034), a browser client is a remote thin client to a server-side `scp-node`: the node holds the protocol engine, MLS group state, custody, the event log, and persistent storage. There is no in-browser `Storage` adapter — the browser issues protocol operations over RPC/WebSocket, and persistence is the node's concern (a native `SqliteStorage` / `FilesystemStorage` backend).
+Per ADR-057 (which supersedes ADR-055's browser-deployment conclusion), a browser SCP client runs the participant protocol in-tab with keys on-device — it is not a custodial remote thin client. Its persistence is therefore its own concern, held in a browser-local key/value store (`IndexedDB`, or a wa-sqlite/OPFS backend), never a server's.
+
+The in-browser client persists **per-context participant state as a self-contained snapshot** written after every state-mutating operation and read back when a tab reopens. A snapshot captures the MLS crypto state (group tree, epoch secrets, key schedule, and the on-device MLS signer), the §9.16 sender-key state (local key, the per-sender key store, epoch high-water floors, and the receive-replay tracker), the canonical event-log event stream, the membership set with per-member sequence counters, and a §9.9.3 checkpoint (the event-log Merkle root). The receive buffer (decrypted plaintext awaiting delivery to the application) and pre-join key-package material are intentionally **not** persisted — they are transient and re-established on return, keeping decrypted plaintext out of storage.
+
+Two integrity and durability properties are mandatory:
+
+- **Crash consistency.** A single-tab client has no server-side actor to serialize writes; instead each snapshot is a single atomic write of one blob per context. A crash leaves either the last fully-committed snapshot or the prior one — never a torn intra-context state. On restore, the checkpoint is recomputed from the reconstructed event log and compared to the recorded Merkle root; a mismatch fails the restore closed rather than resuming an inconsistent context. The recorded root lives inside the same blob, so this checkpoint is a torn-write / corruption / truncation consistency guard on the **event log**, not a whole-blob tamper-resistance mechanism — the MLS state, sender keys, and anti-replay floors are outside it. A decrypted-but-undrained application message lost on a crash-before-consumption is not recoverable (decrypting it advanced the MLS forward-secrecy ratchet, which is persisted), exactly as on the native runtime; this is the accepted ADR-057 lose-local-state property.
+- **Authenticated encryption at rest.** The snapshot carries raw private key material (the MLS signer and epoch/HPKE secrets, the sender keys) and the anti-replay floors. It is neither self-encrypting nor self-authenticating; the browser-local store MUST provide **authenticated** encryption at rest (an AEAD-backed store, not merely a confidential one). Confidentiality keeps the keys secret; authentication is what prevents a blob-rollback from lowering a persisted replay floor and re-opening the §9.16 replay window on restore (the event-log checkpoint above does not cover those fields). The browser tab is the platform-layer custody and plaintext boundary in this model (ADR-057), so page hardening (CSP, SRI, COOP/COEP) is load-bearing for confidentiality, not optional.
+
+Storage selection remains explicit and fails closed (see below): a browser client is constructed with its store, and a durable-backend open failure is a terminal error, never a silent downgrade.
+
+A **custodial remote thin client** — the node holding the protocol engine, MLS group state, custody, event log, and persistent storage, with the browser issuing operations over RPC/WebSocket — remains a valid *opt-in* secondary mode for users who explicitly choose convenience over self-sovereignty (ADR-057 Alternatives). It is not the default and not what "browser client" means.
 
 ### PostgreSQL Is NOT First-Party for Client Storage
 

@@ -33,7 +33,10 @@ use scp_mls::group::{
     add_member, create_group, destroy_group, generate_key_package, join_group_from_bytes,
     key_package_in_did,
 };
-use scp_mls::{InMemoryMlsProvider, ScpCredential, SignatureKeyPair};
+use scp_mls::{
+    InMemoryMlsProvider, ScpCredential, SignatureKeyPair, restore_pending_join,
+    serialize_pending_join,
+};
 use scp_protocol::context::membership::ContextEvent;
 use scp_protocol::crypto::sender_keys::SenderKey;
 use tls_codec::{Deserialize as TlsDeserialize, Serialize as TlsSerialize};
@@ -42,6 +45,7 @@ use crate::context::PerContextState;
 use crate::crypto_state::{ContextCryptoState, Inbound};
 use crate::error::ClientError;
 use crate::signer::Signer;
+use crate::snapshot::ContextSnapshot;
 use crate::storage::Storage;
 
 /// Pending join material a prospective member retains between generating its
@@ -114,10 +118,10 @@ pub struct SendOutput {
 pub struct ScpClient {
     /// This participant's on-device DID identity.
     signer: Arc<dyn Signer>,
-    /// Out-of-band snapshot storage (`IndexedDB` in a browser; in-memory here).
-    /// Held from construction so the dependency is explicit and the snapshot
-    /// seam is ready for a later slice without an API change.
-    #[allow(dead_code)]
+    /// Out-of-band snapshot storage (`IndexedDB`/OPFS in a browser; in-memory
+    /// here). The driver writes one participant snapshot (and one pending-join
+    /// blob) per context here after each state-mutating op, and restores them all
+    /// by key-prefix enumeration in [`Self::new`] when a tab reopens (ADR-057 T2).
     storage: Arc<dyn Storage>,
     /// Hardened time source. Used for committer-assigned event-log leaf
     /// timestamps; in a browser this is the hardened clock (ADR-057
@@ -131,17 +135,44 @@ pub struct ScpClient {
 }
 
 impl ScpClient {
-    /// Constructs a participant driver with the given on-device identity,
-    /// storage backend, and hardened clock.
-    #[must_use]
-    pub fn new(signer: Arc<dyn Signer>, storage: Arc<dyn Storage>, clock: Arc<dyn Clock>) -> Self {
-        Self {
+    /// Constructs a participant driver, restoring any persisted state.
+    ///
+    /// Takes the on-device identity, storage backend, and hardened clock, and
+    /// **restores** any contexts and pending joins the backend holds for this
+    /// identity (ADR-057 T2).
+    ///
+    /// This is the single canonical constructor and the ONLY restore path: a
+    /// browser tab reopening reconstructs its live state here, from the durable
+    /// snapshots the driver wrote after each mutating op. An empty store yields a
+    /// fresh client — there is no separate "load" call and no boolean to check.
+    ///
+    /// Restore is **atomic and fails closed**: every persisted context and pending
+    /// join is reconstructed and checkpoint/owner-verified before any is installed;
+    /// a single corrupt or foreign snapshot fails the whole construction, so a
+    /// caller never observes a half-restored client.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::StorageBackend`] if the backend enumeration/read
+    /// fails, [`ClientError::StorageCorrupt`] if a persisted snapshot is corrupt,
+    /// truncated, an unknown version, or fails its §9.9.3 checkpoint,
+    /// [`ClientError::StorageIdentityMismatch`] if a snapshot belongs to a
+    /// different identity, or [`ClientError::Mls`] / [`ClientError::EventLog`] if
+    /// the crypto/event-log state cannot be reconstructed.
+    pub fn new(
+        signer: Arc<dyn Signer>,
+        storage: Arc<dyn Storage>,
+        clock: Arc<dyn Clock>,
+    ) -> Result<Self, ClientError> {
+        let mut client = Self {
             signer,
             storage,
             clock,
             contexts: HashMap::new(),
             pending_joins: HashMap::new(),
-        }
+        };
+        client.restore_from_storage()?;
+        Ok(client)
     }
 
     /// This participant's DID.
@@ -203,6 +234,7 @@ impl ScpClient {
         )?;
 
         self.contexts.insert(context_id.to_owned(), state);
+        self.persist_context(context_id)?;
         Ok(())
     }
 
@@ -217,8 +249,10 @@ impl ScpClient {
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError::Mls`] if key-package generation fails, or
-    /// [`ClientError::Codec`] if the public key package cannot be serialized.
+    /// Returns [`ClientError::Mls`] if key-package generation or pending-material
+    /// serialization fails, [`ClientError::Codec`] if the public key package
+    /// cannot be serialized, or [`ClientError::StorageBackend`] if persisting the
+    /// pending-join blob fails.
     pub fn generate_key_package_for_join(
         &mut self,
         context_id: &str,
@@ -231,6 +265,19 @@ impl ScpClient {
             .key_package()
             .tls_serialize_detached()
             .map_err(|e| ClientError::Codec(format!("serializing key package: {e}")))?;
+
+        // Persist the pending-join material (the private KeyPackage half) BEFORE
+        // returning the public key package, so a crash after handing the KP to the
+        // adder but before persistence cannot orphan the join — a reopened tab
+        // restores this pending material and can still complete the join.
+        let pending_blob = serialize_pending_join(&provider, &signer)?;
+        self.storage
+            .put(&Self::pending_key(context_id), pending_blob)
+            .map_err(|e| {
+                ClientError::StorageBackend(format!(
+                    "persisting pending join for context '{context_id}': {e}"
+                ))
+            })?;
 
         self.pending_joins
             .insert(context_id.to_owned(), PendingJoin { signer, provider });
@@ -281,13 +328,18 @@ impl ScpClient {
             timestamp,
         )?;
 
-        Ok(AddMemberOutput {
+        let output = AddMemberOutput {
             commit,
             welcome,
             committer_timestamp_secs: timestamp,
             event_log: state.events(),
             members: state.members.clone(),
-        })
+        };
+        // The `state` borrow ends above (the output owns clones), so the snapshot
+        // write can re-borrow `self`. Persist the post-add state (new MLS epoch,
+        // membership, MemberJoined leaf) before returning.
+        self.persist_context(context_id)?;
+        Ok(output)
     }
 
     /// Joins `context_id` from a Welcome message, becoming an active member.
@@ -307,9 +359,11 @@ impl ScpClient {
     /// # Errors
     ///
     /// Returns [`ClientError::Driver`] if there is no pending join material for
-    /// the context, [`ClientError::ContextAlreadyExists`] if already joined, or
+    /// the context, [`ClientError::ContextAlreadyExists`] if already joined,
     /// [`ClientError::Mls`] / [`ClientError::EventLog`] on Welcome processing or
-    /// replay failure (a replay stream that does not chain cleanly is rejected).
+    /// replay failure (a replay stream that does not chain cleanly is rejected),
+    /// or [`ClientError::StorageBackend`] if persisting the joined context or
+    /// deleting the consumed pending blob fails.
     pub fn join_context_encrypted(
         &mut self,
         context_id: &str,
@@ -349,6 +403,19 @@ impl ScpClient {
         state.add_member_record(&self_did);
 
         self.contexts.insert(context_id.to_owned(), state);
+        // Persist the joined context FIRST, then delete the now-consumed pending
+        // material. Ordering matters: a crash between the two leaves a durable
+        // context plus a stale pending blob (harmless — the context already exists,
+        // so restore skips the stale blob and `close_context` clears it), never a
+        // consumed KeyPackage with no context to show for it.
+        self.persist_context(context_id)?;
+        self.storage
+            .delete(&Self::pending_key(context_id))
+            .map_err(|e| {
+                ClientError::StorageBackend(format!(
+                    "deleting consumed pending join for context '{context_id}': {e}"
+                ))
+            })?;
         Ok(())
     }
 
@@ -388,10 +455,14 @@ impl ScpClient {
 
         state.append_log_event(EventType::MessageSent, &sender_did, Vec::new(), timestamp)?;
 
-        Ok(SendOutput {
+        let output = SendOutput {
             ciphertext,
             committer_timestamp_secs: timestamp,
-        })
+        };
+        // The `state` borrow ends above; persist the post-send state (advanced
+        // sender sequence + ratchet, new MessageSent leaf) before returning.
+        self.persist_context(context_id)?;
+        Ok(output)
     }
 
     /// Receives an inbound MLS message in `context_id`: decrypts an application
@@ -447,7 +518,13 @@ impl ScpClient {
         committer_timestamp_secs: u64,
     ) -> Result<bool, ClientError> {
         let state = self.context_mut(context_id)?;
-        match state.crypto.decrypt_message(ciphertext)? {
+        // Any successful `decrypt_message` mutates persistent MLS state — it
+        // ratchets forward (application), merges a staged commit (add Commit), or
+        // caches a proposal in the provider store. So every non-error outcome is
+        // persisted after the `state` borrow ends. Only the rejected
+        // Remove-bearing Commit (which `scp-mls` dropped BEFORE merging, leaving
+        // MLS + SCP state unchanged) returns without a write.
+        let application = match state.crypto.decrypt_message(ciphertext)? {
             Inbound::Application {
                 sender_did,
                 plaintext,
@@ -462,7 +539,7 @@ impl ScpClient {
                     sender_did: sender_did.into(),
                     payload: plaintext,
                 });
-                Ok(true)
+                true
             }
             Inbound::UnsupportedMembershipChange {
                 sender_did: _committer_did,
@@ -484,13 +561,13 @@ impl ScpClient {
                 // consistent (pre-remove). The context is left fully usable; we
                 // simply surface the gap to the caller rather than silently
                 // diverging. The caller may keep using the context on the old
-                // epoch.
-                Err(ClientError::UnsupportedMembershipChange(format!(
+                // epoch. No state changed, so no snapshot is written.
+                return Err(ClientError::UnsupportedMembershipChange(format!(
                     "received a Commit removing {} member(s) ({}); convergent \
                      removal is out of ADR-057 Slice 2 scope",
                     removed_dids.len(),
                     removed_dids.join(", ")
-                )))
+                )));
             }
             Inbound::Commit {
                 sender_did: committer_did,
@@ -512,19 +589,34 @@ impl ScpClient {
                     )?;
                     state.add_member_record(added_did);
                 }
-                Ok(false)
+                false
             }
-            Inbound::Proposal { .. } => Ok(false),
-        }
+            Inbound::Proposal { .. } => false,
+        };
+        // `state` borrow ends above. Persist the mutated MLS/log/membership state.
+        self.persist_context(context_id)?;
+        Ok(application)
     }
 
-    /// Drains all buffered receive events for `context_id` in FIFO order.
+    /// Drains all buffered receive events for `context_id` in FIFO order,
+    /// persisting the now-emptied buffer.
+    ///
+    /// The receive buffer round-trips through the snapshot, so draining mutates
+    /// persisted state: the emptied buffer is persisted before the events are
+    /// returned, so a restore does not re-deliver already-drained messages. An
+    /// empty drain changes nothing and skips the write.
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError::UnknownContext`] if the context is not held.
+    /// Returns [`ClientError::UnknownContext`] if the context is not held, or
+    /// [`ClientError::StorageBackend`] / [`ClientError::Mls`] if persisting the
+    /// emptied buffer fails.
     pub fn drain_events(&mut self, context_id: &str) -> Result<Vec<ContextEvent>, ClientError> {
-        Ok(self.context_mut(context_id)?.drain_events())
+        let events = self.context_mut(context_id)?.drain_events();
+        if !events.is_empty() {
+            self.persist_context(context_id)?;
+        }
+        Ok(events)
     }
 
     /// Closes and removes `context_id`, destroying its crypto state.
@@ -536,14 +628,43 @@ impl ScpClient {
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError::UnknownContext`] if the context is not held.
+    /// Returns [`ClientError::UnknownContext`] if the context is not held, or
+    /// [`ClientError::StorageBackend`] if deleting the persisted snapshot or
+    /// pending-join blob fails (in which case the context is left fully live so
+    /// the close can be retried — see below).
     pub fn close_context(&mut self, context_id: &str) -> Result<(), ClientError> {
-        let mut state = self
-            .contexts
-            .remove(context_id)
-            .ok_or_else(|| ClientError::UnknownContext(context_id.to_owned()))?;
-        destroy_group(&mut state.crypto.mls_group)?;
+        if !self.contexts.contains_key(context_id) {
+            return Err(ClientError::UnknownContext(context_id.to_owned()));
+        }
+        // Delete the DURABLE state FIRST — both blobs — before touching in-memory
+        // state. Ordering is a forward-secrecy invariant: if a delete fails, the
+        // context is left fully live and the close is retryable, never
+        // in-memory-gone-but-durably-resurrectable (which would let a reopened tab
+        // restore a "closed" context). There is no manifest to update: restore
+        // enumerates by prefix, so a deleted blob is simply never listed. `delete`
+        // is idempotent, so a retry after a partial failure is safe.
+        self.storage
+            .delete(&Self::ctx_key(context_id))
+            .map_err(|e| {
+                ClientError::StorageBackend(format!(
+                    "deleting snapshot for context '{context_id}': {e}"
+                ))
+            })?;
+        self.storage
+            .delete(&Self::pending_key(context_id))
+            .map_err(|e| {
+                ClientError::StorageBackend(format!(
+                    "deleting pending join for context '{context_id}': {e}"
+                ))
+            })?;
+        // Durable state is gone; tear down in-memory state. Destroying the MLS
+        // group releases the group key schedule, after which no further message in
+        // this context can be decrypted by this participant (forward secrecy —
+        // ADR-057 lose-device-lose-history).
         self.pending_joins.remove(context_id);
+        if let Some(mut state) = self.contexts.remove(context_id) {
+            destroy_group(&mut state.crypto.mls_group)?;
+        }
         Ok(())
     }
 
@@ -587,6 +708,9 @@ impl ScpClient {
         state
             .crypto
             .insert_sender_key(sender_did, SenderKey::from_bytes(key_bytes));
+        // `state` borrow ends; persist the updated sender-key store so a restored
+        // client can still decrypt this peer's messages.
+        self.persist_context(context_id)?;
         Ok(())
     }
 
@@ -645,6 +769,147 @@ impl ScpClient {
             .get(context_id)
             .ok_or_else(|| ClientError::UnknownContext(context_id.to_owned()))?;
         Ok(state.crypto.mls_group.epoch()?)
+    }
+
+    // ----------------------------------------------------------------------
+    // Persistence (ADR-057 T2 — snapshot/restore through the Storage backend)
+    // ----------------------------------------------------------------------
+
+    /// Key prefix for a context's participant snapshot blob. One blob per context
+    /// is the atomicity unit (a single `put`); contexts are enumerated by this
+    /// prefix on restore — there is no separate manifest to keep consistent.
+    const CTX_KEY_PREFIX: &'static str = "scp-client/ctx/";
+
+    /// Key prefix for a context's pending-join material blob (the private half of
+    /// an unconsumed `KeyPackage`), retained between
+    /// [`Self::generate_key_package_for_join`] and
+    /// [`Self::join_context_encrypted`].
+    const PENDING_KEY_PREFIX: &'static str = "scp-client/pending/";
+
+    /// The storage key holding `context_id`'s participant snapshot.
+    fn ctx_key(context_id: &str) -> String {
+        format!("{}{context_id}", Self::CTX_KEY_PREFIX)
+    }
+
+    /// The storage key holding `context_id`'s pending-join material.
+    fn pending_key(context_id: &str) -> String {
+        format!("{}{context_id}", Self::PENDING_KEY_PREFIX)
+    }
+
+    /// Writes `context_id`'s current state to storage as a single snapshot blob.
+    ///
+    /// Called at the end of every state-mutating op. The blob is one atomic `put`,
+    /// so a crash leaves either the last committed snapshot or the prior one —
+    /// never a torn intra-context state (ADR-057 crash-consistency). There is no
+    /// manifest to keep in step: restore enumerates by key prefix.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::UnknownContext`] if the context is not held,
+    /// [`ClientError::Mls`] if the MLS state cannot be serialized,
+    /// [`ClientError::StorageCorrupt`] if the snapshot cannot be serialized, or
+    /// [`ClientError::StorageBackend`] if the backend write fails.
+    fn persist_context(&self, context_id: &str) -> Result<(), ClientError> {
+        // Build and serialize inside a scope so the structured snapshot (with its
+        // key material) is zeroized on drop before the blob leaves for storage.
+        let blob = {
+            let state = self
+                .contexts
+                .get(context_id)
+                .ok_or_else(|| ClientError::UnknownContext(context_id.to_owned()))?;
+            ContextSnapshot::capture(context_id, self.signer.did(), state)?.to_bytes()?
+        };
+        self.storage
+            .put(&Self::ctx_key(context_id), blob)
+            .map_err(|e| {
+                ClientError::StorageBackend(format!("persisting context '{context_id}': {e}"))
+            })
+    }
+
+    /// Reconstructs every persisted context and pending join for this identity
+    /// into the freshly-constructed client. See [`Self::new`] for the atomicity
+    /// and fail-closed contract; this is its implementation.
+    ///
+    /// Contexts and pending joins are each enumerated by key prefix, reconstructed
+    /// and (for contexts) checkpoint/owner-verified into staging vectors; only
+    /// after ALL succeed are they installed. A single `?` on a corrupt/foreign
+    /// snapshot returns before any install, so the half-built client is dropped and
+    /// construction fails closed.
+    fn restore_from_storage(&mut self) -> Result<(), ClientError> {
+        // --- Contexts: enumerate by prefix, reconstruct + verify, stage. ---
+        let ctx_keys = self
+            .storage
+            .list_keys(Self::CTX_KEY_PREFIX)
+            .map_err(|e| ClientError::StorageBackend(format!("listing persisted contexts: {e}")))?;
+        let mut staged_contexts: Vec<(String, PerContextState)> =
+            Vec::with_capacity(ctx_keys.len());
+        for key in ctx_keys {
+            let context_id = key
+                .strip_prefix(Self::CTX_KEY_PREFIX)
+                .unwrap_or(&key)
+                .to_owned();
+            let blob = self.read_listed_key(&key)?;
+            let snapshot = ContextSnapshot::from_bytes(&blob)?;
+            // The blob is keyed by context id; its embedded id must match, or the
+            // backend returned the wrong blob (key collision / backend bug).
+            if snapshot.context_id() != context_id {
+                return Err(ClientError::StorageCorrupt(format!(
+                    "snapshot under key '{key}' carries a different context id '{}'",
+                    snapshot.context_id()
+                )));
+            }
+            // Owner binding is verified inside `restore` against this client's DID.
+            let state = snapshot.restore(self.signer.did())?;
+            staged_contexts.push((context_id, state));
+        }
+
+        // --- Pending joins: enumerate by prefix, reconstruct, stage. ---
+        // A pending blob whose context was already restored is stale (the join
+        // completed and the delete was lost to a crash); skip it rather than
+        // resurrect a consumed KeyPackage.
+        let restored_ids: std::collections::HashSet<&str> =
+            staged_contexts.iter().map(|(id, _)| id.as_str()).collect();
+        let pending_keys = self
+            .storage
+            .list_keys(Self::PENDING_KEY_PREFIX)
+            .map_err(|e| ClientError::StorageBackend(format!("listing pending joins: {e}")))?;
+        let mut staged_pending: Vec<(String, PendingJoin)> = Vec::with_capacity(pending_keys.len());
+        for key in pending_keys {
+            let context_id = key
+                .strip_prefix(Self::PENDING_KEY_PREFIX)
+                .unwrap_or(&key)
+                .to_owned();
+            if restored_ids.contains(context_id.as_str()) {
+                continue;
+            }
+            let blob = self.read_listed_key(&key)?;
+            let (provider, signer) = restore_pending_join(&blob)?;
+            staged_pending.push((context_id, PendingJoin { signer, provider }));
+        }
+
+        // All snapshots reconstructed + verified cleanly — commit atomically.
+        for (id, state) in staged_contexts {
+            self.contexts.insert(id, state);
+        }
+        for (id, pending) in staged_pending {
+            self.pending_joins.insert(id, pending);
+        }
+        Ok(())
+    }
+
+    /// Reads a key that `list_keys` just reported. A `None` here means the key
+    /// vanished between the enumeration and the read (a concurrent delete or a
+    /// backend inconsistency), which fails closed rather than being treated as a
+    /// benign absence — restore is all-or-nothing.
+    fn read_listed_key(&self, key: &str) -> Result<Vec<u8>, ClientError> {
+        self.storage
+            .get(key)
+            .map_err(|e| ClientError::StorageBackend(format!("reading '{key}': {e}")))?
+            .ok_or_else(|| {
+                ClientError::StorageBackend(format!(
+                    "listed key '{key}' vanished before it could be read"
+                ))
+            })
     }
 }
 

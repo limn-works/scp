@@ -36,8 +36,10 @@
 //! - a [`Signer`] — the on-device DID identity (a [`LocalSigner`] for the MVP;
 //!   a WebCrypto-callback custody backend in a later slice — the key never
 //!   enters wasm memory),
-//! - a [`Storage`] — out-of-band snapshot store ([`MemoryStorage`] for the MVP;
-//!   `IndexedDB` in a later slice),
+//! - a [`Storage`] — per-context snapshot store the driver writes after every
+//!   mutating op and restores from (by key-prefix enumeration) in
+//!   [`ScpClient::new`] when a tab reopens (ADR-057 T2). [`MemoryStorage`] in dev;
+//!   an `IndexedDB`/OPFS backend in a browser,
 //! - a [`scp_clock::Clock`] — the hardened time source for
 //!   committer-assigned event-log leaf timestamps (ADR-057 Prerequisite 1).
 //!
@@ -60,6 +62,7 @@ mod context;
 mod crypto_state;
 mod error;
 mod signer;
+mod snapshot;
 mod storage;
 
 pub use client::{AddMemberOutput, ScpClient, SendOutput};
@@ -67,4 +70,5 @@ pub use context::PerContextState;
 pub use crypto_state::{ContextCryptoState, INITIAL_SENDER_KEY_EPOCH, Inbound};
 pub use error::ClientError;
 pub use signer::{LocalSigner, Signer};
+pub use snapshot::{ContextSnapshot, SNAPSHOT_FORMAT_VERSION};
 pub use storage::{MemoryStorage, Storage};
