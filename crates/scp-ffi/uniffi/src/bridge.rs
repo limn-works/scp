@@ -10882,10 +10882,7 @@ impl Scp {
             .spawn(async move {
                 let sup = bi.context_manager_or_error()?;
                 let did: scp_did::DID = subscriber_did.into();
-                let timestamp = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
+                let timestamp = scp_clock::Clock::now_secs(&scp_clock::SystemClock);
 
                 use scp_core::context::actor::commands::{
                     BroadcastCommand, SubscribeBroadcastPayload,

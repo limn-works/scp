@@ -4074,10 +4074,7 @@ impl crate::scp::PyScp {
         let sup = sup.clone();
         let context_id = handle.context_id.clone();
         let did: scp_did::DID = subscriber_did.to_owned().into();
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let timestamp = scp_clock::Clock::now_secs(&scp_clock::SystemClock);
 
         rt.block_on(async move {
             use scp_core::context::actor::commands::{BroadcastCommand, SubscribeBroadcastPayload};
