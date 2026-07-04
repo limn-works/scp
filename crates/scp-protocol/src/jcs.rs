@@ -5,17 +5,19 @@
 //! (`context::tools`), and the other structured-hash paths that call
 //! [`to_vec`] / [`to_string`] here.
 //!
-//! # Scope — one deliberate exception: attestation canonicalization
+//! # Scope
 //!
-//! JCS is **not** universal. `trust::attestation::canonical_attestation_bytes`
-//! (and `IdentityLinkAttestation::canonical_signing_bytes`) intentionally
-//! serialize their `claim` / `evidence` / `revocation_status` fields with
-//! `rmp_serde::to_vec_named` (`MessagePack`, named/sorted keys) instead of JCS.
-//! That choice is fixed by construction: it defines the on-the-wire attestation
-//! signature hash, so it cannot be migrated to JCS without changing the wire
-//! format. The scheme-per-path decision is documented in one place — on
-//! `canonical_attestation_bytes` — which is the authority for attestation
-//! canonicalization; this module governs the JCS paths.
+//! JCS is **not** universal — each signed structure's spec row assigns a
+//! serialization per field. `trust::attestation::canonical_attestation_bytes`
+//! uses JCS for the `claim` field (§9.5.2 Attestation row 5: compact JSON)
+//! and `rmp_serde::to_vec_named` (`MessagePack`, named keys) for `evidence`
+//! and `revocation_status`, which the §9.5.2 note explicitly sanctions for
+//! those two fields. `IdentityLinkAttestation::canonical_signing_bytes` is
+//! governed by a separate spec row (§3 identity, domain
+//! `SCP-IDENTITY-LINK-ATTESTATION-V1:`) that mandates `MessagePack` for its
+//! `claim`, `evidence`, and `revocation_status` sub-structures. The
+//! scheme-per-field decisions are documented on those functions; this module
+//! governs the JCS paths.
 
 /// Serializes a value to canonical JSON bytes per RFC 8785.
 ///

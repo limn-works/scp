@@ -223,7 +223,8 @@ fn conf_004_agent_binding_attestation() {
     let agent_did = format!("did:key:{}", hex(&agent_key.verifying_key().to_bytes()));
 
     let claim = serde_json::json!({"platform": "agent-binding"});
-    let claim_bytes = rmp_serde::to_vec_named(&claim).expect("claim msgpack serialization");
+    // Claim is compact JSON (RFC 8785 JCS) per §9.5.2 Attestation row 5.
+    let claim_bytes = scp_core::jcs::to_vec(&claim).expect("claim compact-JSON serialization");
 
     print_step(1, "Create identity attestation binding agent to human");
     // RevocationStatus::Active serialized as MessagePack (named keys).

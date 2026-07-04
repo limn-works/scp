@@ -59,6 +59,16 @@ pub struct Attestation {
     /// DID of the attestation subject.
     pub subject: DID,
     /// Type-specific claim data.
+    ///
+    /// Serialized into the signed preimage as RFC 8785 (JCS) canonical JSON
+    /// (§9.5.2). **I-JSON numeric constraint (RFC 7493):** numeric values in
+    /// the claim MUST be within the IEEE-754 double exactly-representable
+    /// integer range (|n| ≤ 2^53); larger identifiers (e.g. 64-bit snowflake
+    /// IDs, u64 counters) MUST be string-encoded by the caller. RFC 8785
+    /// serializes numbers as ES6 doubles, so integers beyond 2^53 are not
+    /// injective: distinct values in the same rounding class canonicalize to
+    /// identical bytes, and a signature over one such claim validly covers
+    /// every other claim in that class.
     pub claim: serde_json::Value,
     /// Optional evidence supporting the attestation.
     pub evidence: Option<AttestationEvidence>,
@@ -1132,16 +1142,38 @@ pub fn check_threshold_attestation(
 /// authenticity or freshness *security* decision. Only the fields listed above
 /// are authenticated.
 ///
-/// # Canonicalization scheme — `MessagePack` (not JCS)
+/// # Canonicalization scheme — per §9.5.2
 ///
-/// `claim`, `evidence`, and `revocation_status` are serialized with
-/// `rmp_serde::to_vec_named` (`MessagePack`, named/sorted keys) — **not** RFC
-/// 8785 JCS. This is intentional and matches
-/// `IdentityLinkAttestation::canonical_signing_bytes`. Attestation
-/// canonicalization is the one trust path that uses `MessagePack`; challenge
-/// preimages and other structured hashing use JCS (see the module doc on
-/// `crate::jcs`). Changing the scheme here would change the on-the-wire
-/// attestation hash, so it is fixed by construction.
+/// The §9.5.2 Attestation table assigns a serialization per field:
+///
+/// - `claim` — **compact JSON** (no whitespace, equivalent to Python
+///   `json.dumps(separators=(',', ':'))`), produced via [`crate::jcs::to_vec`]
+///   (RFC 8785 JCS). JCS emits exactly that compact form and additionally
+///   sorts object keys, which makes the preimage deterministic across
+///   implementations. This matches how the same §9.5.2 "compact JSON" phrase
+///   is implemented for `GovernanceProposal` `action_bytes`
+///   (`compute_proposal_id`) and `SignedVote` `vote_type`
+///   (`compute_vote_hash`).
+/// - `evidence` and `revocation_status` — `rmp_serde::to_vec_named`
+///   (`MessagePack`, named keys), as the §9.5.2 note explicitly sanctions for
+///   these two fields.
+///
+/// Note: `IdentityLinkAttestation::canonical_signing_bytes` is governed by a
+/// different spec row (§3 identity, domain
+/// `SCP-IDENTITY-LINK-ATTESTATION-V1:`) which mandates `MessagePack` for its
+/// `claim` as well — its scheme is independent of this function.
+///
+/// # I-JSON numeric constraint on `claim` (RFC 7493, per §9.5.2)
+///
+/// RFC 8785 serializes JSON numbers as ES6 IEEE-754 doubles, so claim
+/// integers outside |n| ≤ 2^53 are **not injective**: distinct values in the
+/// same f64 rounding class (e.g. `9007199254740993` and `9007199254740992`)
+/// canonicalize to identical bytes, producing identical preimages — a
+/// signature over one validly covers the other, and the substitution is
+/// undetectable. Callers MUST keep claim numeric values within |n| ≤ 2^53 and
+/// string-encode larger identifiers (snowflake IDs, u64 counters). This
+/// function does not reject out-of-range integers — the coercion is inherent
+/// to RFC 8785 and is pinned by test.
 ///
 /// # Errors
 ///
@@ -1173,12 +1205,13 @@ pub fn canonical_attestation_bytes(attestation: &Attestation) -> Result<Vec<u8>,
     // Field order per §9.5.2: id, attestation_type, issuer, subject, claim,
     // evidence, issued_at, expires_at, revocation_status.
     //
-    // Serialize claim as MessagePack (named/sorted keys) for deterministic
-    // ordering. Using `serde_json::Value::to_string()` would produce JSON
-    // with non-deterministic key ordering. This matches
-    // `IdentityLinkAttestation::canonical_signing_bytes` which also uses
-    // `rmp_serde::to_vec_named`.
-    let claim_bytes = rmp_serde::to_vec_named(&attestation.claim).map_err(|err| {
+    // Serialize claim as compact JSON per the §9.5.2 Attestation table
+    // (row 5: "compact JSON", equivalent to Python
+    // `json.dumps(separators=(',', ':'))`). RFC 8785 JCS produces exactly
+    // that compact form with deterministic (sorted) key ordering — the same
+    // implementation of the same spec phrase as `compute_proposal_id`
+    // (`action_bytes`) and `compute_vote_hash` (`vote_type`).
+    let claim_bytes = crate::jcs::to_vec(&attestation.claim).map_err(|err| {
         TrustError::CanonicalizationFailed {
             reason: format!("claim serialization failed: {err}"),
         }
@@ -2214,6 +2247,152 @@ mod tests {
         assert_ne!(
             bytes_a, bytes_b,
             "shifting bytes between id and issuer must produce different canonical bytes"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // §9.5.2 claim serialization scheme: compact JSON (RFC 8785 JCS)
+    // -------------------------------------------------------------------
+
+    /// Pins the §9.5.2 Attestation row-5 scheme: the signed preimage embeds
+    /// the `claim` as length-prefixed **compact JSON** (no whitespace, sorted
+    /// keys per RFC 8785 JCS) — not `MessagePack`.
+    #[test]
+    fn canonical_attestation_claim_is_length_prefixed_compact_json() {
+        use crate::crypto::canonical::{CanonicalField, canonical_hash_bytes};
+        use sha2::{Digest, Sha256};
+
+        let make = |claim: serde_json::Value| Attestation {
+            id: "att-claim-scheme".to_owned(),
+            attestation_type: AttestationType::Endorsement,
+            issuer: "did:key:issuer".into(),
+            subject: "did:key:subj".into(),
+            claim,
+            evidence: None,
+            issued_at: 1000,
+            expires_at: None,
+            renewal_interval: None,
+            renewed_at: None,
+            revocation_status: RevocationStatus::Active,
+            signature: vec![],
+        };
+
+        let att = make(serde_json::json!({"z": 2, "a": 1}));
+        let canonical = canonical_attestation_bytes(&att).unwrap();
+
+        // Expected claim bytes: compact JSON, keys sorted by Unicode code
+        // point (RFC 8785). Equivalent to Python
+        // json.dumps(separators=(',', ':')) for pre-sorted keys.
+        let claim_json: &[u8] = br#"{"a":1,"z":2}"#;
+
+        // Reconstruct the full §9.5.2 preimage with the compact-JSON claim
+        // embedded as a length-prefixed field, and assert the production
+        // digest commits to exactly these bytes.
+        let revocation_bytes = rmp_serde::to_vec_named(&att.revocation_status).unwrap();
+        let preimage = canonical_hash_bytes(
+            b"SCP-ATTESTATION-V1:",
+            &[
+                CanonicalField::VarBytes(att.id.as_bytes()),
+                CanonicalField::U16(super::super::attestation_type_tag(&att.attestation_type)),
+                CanonicalField::VarBytes(att.issuer.as_bytes()),
+                CanonicalField::VarBytes(att.subject.as_bytes()),
+                CanonicalField::VarBytes(claim_json),
+                CanonicalField::Absent,
+                CanonicalField::U64(att.issued_at),
+                CanonicalField::Absent,
+                CanonicalField::VarBytes(&revocation_bytes),
+            ],
+        )
+        .unwrap();
+
+        // The preimage embeds the length-prefixed compact-JSON claim bytes.
+        let mut expected_claim_field = Vec::new();
+        #[allow(clippy::cast_possible_truncation)]
+        expected_claim_field.extend_from_slice(&(claim_json.len() as u32).to_be_bytes());
+        expected_claim_field.extend_from_slice(claim_json);
+        assert!(
+            preimage
+                .windows(expected_claim_field.len())
+                .any(|window| window == expected_claim_field.as_slice()),
+            "preimage must embed the length-prefixed compact-JSON claim {:?}",
+            String::from_utf8_lossy(claim_json)
+        );
+
+        let expected_digest: [u8; 32] = Sha256::digest(&preimage).into();
+        assert_eq!(
+            canonical,
+            expected_digest.to_vec(),
+            "canonical_attestation_bytes must be the SHA-256 of the §9.5.2 \
+             preimage with the claim as compact JSON"
+        );
+
+        // Key-insertion order must not affect the preimage: JCS sorts object
+        // keys, so a semantically identical claim constructed in a different
+        // order yields byte-identical canonical bytes.
+        let att_reordered = make(serde_json::json!({"a": 1, "z": 2}));
+        let canonical_reordered = canonical_attestation_bytes(&att_reordered).unwrap();
+        assert_eq!(
+            canonical, canonical_reordered,
+            "claim key order must not change the canonical bytes (JCS sorts keys)"
+        );
+    }
+
+    /// Pins the documented RFC 8785 f64 rounding class for claim integers
+    /// beyond 2^53 (§9.5.2 I-JSON constraint, RFC 7493).
+    ///
+    /// RFC 8785 serializes JSON numbers as ES6 IEEE-754 doubles, so distinct
+    /// claim integers in the same f64 rounding class canonicalize to
+    /// IDENTICAL bytes — a signature over one validly covers the other. This
+    /// is inherent to RFC 8785 (not a defect in this implementation, and not
+    /// something to "fix" here): it is why §9.5.2 requires claim numeric
+    /// values to stay within |n| ≤ 2^53 and large identifiers (snowflake IDs,
+    /// u64 counters) to be string-encoded. The test makes the hazard visible
+    /// and pins the current behavior; the string-encoded forms of the same
+    /// values remain distinct.
+    #[test]
+    fn canonical_attestation_claim_integers_beyond_2_53_collide_per_rfc8785() {
+        let make = |claim: serde_json::Value| Attestation {
+            id: "att-claim-numeric".to_owned(),
+            attestation_type: AttestationType::Endorsement,
+            issuer: "did:key:issuer".into(),
+            subject: "did:key:subj".into(),
+            claim,
+            evidence: None,
+            issued_at: 1000,
+            expires_at: None,
+            renewal_interval: None,
+            renewed_at: None,
+            revocation_status: RevocationStatus::Active,
+            signature: vec![],
+        };
+
+        // 2^53 = 9007199254740992 is exactly representable as an f64;
+        // 2^53 + 1 = 9007199254740993 is NOT, and rounds to 2^53 under
+        // RFC 8785 / ES6 number serialization.
+        let att_exact = make(serde_json::json!({"id": 9_007_199_254_740_992_u64}));
+        let att_plus_one = make(serde_json::json!({"id": 9_007_199_254_740_993_u64}));
+
+        let canonical_exact = canonical_attestation_bytes(&att_exact).unwrap();
+        let canonical_plus_one = canonical_attestation_bytes(&att_plus_one).unwrap();
+
+        // Documented rounding-class collision: distinct claims differing only
+        // beyond f64 precision produce IDENTICAL canonical bytes, so one
+        // signature covers both. This is why §9.5.2 mandates string-encoding
+        // for identifiers beyond 2^53.
+        assert_eq!(
+            canonical_exact, canonical_plus_one,
+            "claim integers in the same f64 rounding class must canonicalize \
+             identically per RFC 8785 (documented §9.5.2 hazard)"
+        );
+
+        // The mandated mitigation preserves injectivity: string-encoded forms
+        // of the same two values yield distinct canonical bytes.
+        let att_exact_str = make(serde_json::json!({"id": "9007199254740992"}));
+        let att_plus_one_str = make(serde_json::json!({"id": "9007199254740993"}));
+        assert_ne!(
+            canonical_attestation_bytes(&att_exact_str).unwrap(),
+            canonical_attestation_bytes(&att_plus_one_str).unwrap(),
+            "string-encoded identifiers must remain distinct in the preimage"
         );
     }
 
