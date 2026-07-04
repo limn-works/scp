@@ -844,7 +844,7 @@ public extension SCP {
 ///
 /// Contains the JSON-decoded output of the trust aggregation pipeline. Each
 /// field corresponds to one of the four trust layers. This is the typed result
-/// of ``SCP/aggregateTrust(contextId:subjectDid:eventsJson:merkleRootJson:consequenceRulesJson:thresholdRequirementsJson:attestorSetsJson:cachedAttestationsJson:challengeResultsJson:)``,
+/// of ``SCP/aggregateTrust(contextId:subjectDid:events:merkleRoot:consequenceRules:thresholdRequirements:attestorSets:cachedAttestations:challengeResults:)``,
 /// the Swift counterpart to the Python SDK `aggregate_trust_input`.
 ///
 /// ## Provenance
@@ -870,31 +870,52 @@ public nonisolated struct AggregatedTrustInput {
 
 public extension SCP {
     /// Aggregates all trust engine layers into a single input for agent-level
-    /// evaluation.
+    /// evaluation (§7.3).
     ///
-    /// Routes through ``SCP/aggregateTrustInput(contextId:subjectDid:eventsJson:merkleRootJson:consequenceRulesJson:thresholdRequirementsJson:attestorSetsJson:cachedAttestationsJson:challengeResultsJson:)``
-    /// and parses the JSON result into a typed ``AggregatedTrustInput``.
+    /// Every structured input is typed; the SDK serializes to the serde wire
+    /// shapes internally (ADR-058) and routes through
+    /// ``SCP/aggregateTrustInput(contextId:subjectDid:eventsJson:merkleRootJson:consequenceRulesJson:thresholdRequirementsJson:attestorSetsJson:cachedAttestationsJson:challengeResultsJson:)``
+    /// unchanged, then parses the JSON result into a typed
+    /// ``AggregatedTrustInput``. An empty collection is a real value ("no
+    /// rules apply"), never a request for defaults — the bridge receives
+    /// `[]` / `{}` exactly as passed.
+    ///
+    /// - Parameters:
+    ///   - contextId: The context to aggregate trust inputs for.
+    ///   - subjectDid: The DID of the subject to evaluate.
+    ///   - events: Full signed event-log entries (``EventLogEntry``).
+    ///   - merkleRoot: 32-byte Merkle root.
+    ///   - consequenceRules: Typed ``ConsequenceRule`` values.
+    ///   - thresholdRequirements: Typed ``ThresholdRequirement`` values keyed
+    ///     by ``AttestationType``.
+    ///   - attestorSets: Typed ``AttestorInfo`` lists keyed by
+    ///     ``AttestationType``.
+    ///   - cachedAttestations: Typed ``CachedAttestation`` values to seed the
+    ///     bridge's trust store.
+    ///   - challengeResults: Typed ``ChallengeVerification`` records.
+    /// - Throws: ``ScpError`` on a wrong-length byte array (before any bridge
+    ///   call), a serialization failure, or a bridge aggregation failure.
     func aggregateTrust(
         contextId: String,
         subjectDid: String,
-        eventsJson: String,
-        merkleRootJson: String,
-        consequenceRulesJson: String = "[]",
-        thresholdRequirementsJson: String = "{}",
-        attestorSetsJson: String = "{}",
-        cachedAttestationsJson: String = "[]",
-        challengeResultsJson: String = "[]"
+        events: [EventLogEntry],
+        merkleRoot: [UInt8],
+        consequenceRules: [ConsequenceRule] = [],
+        thresholdRequirements: [AttestationType: ThresholdRequirement] = [:],
+        attestorSets: [AttestationType: [AttestorInfo]] = [:],
+        cachedAttestations: [CachedAttestation] = [],
+        challengeResults: [ChallengeVerification] = []
     ) throws -> AggregatedTrustInput {
         let resultJson = try aggregateTrustInput(
             contextId: contextId,
             subjectDid: subjectDid,
-            eventsJson: eventsJson,
-            merkleRootJson: merkleRootJson,
-            consequenceRulesJson: consequenceRulesJson,
-            thresholdRequirementsJson: thresholdRequirementsJson,
-            attestorSetsJson: attestorSetsJson,
-            cachedAttestationsJson: cachedAttestationsJson,
-            challengeResultsJson: challengeResultsJson
+            eventsJson: encodeEventLogEntriesJson(events),
+            merkleRootJson: encodeMerkleRootJson(merkleRoot),
+            consequenceRulesJson: encodeConsequenceRulesJson(consequenceRules),
+            thresholdRequirementsJson: encodeThresholdRequirementsJson(thresholdRequirements),
+            attestorSetsJson: encodeAttestorSetsJson(attestorSets),
+            cachedAttestationsJson: encodeCachedAttestations(cachedAttestations),
+            challengeResultsJson: encodeChallengeVerificationsJson(challengeResults)
         )
 
         guard let data = resultJson.data(using: .utf8),
@@ -1486,6 +1507,267 @@ public func encodeChallengeVerificationsJson(_ verifications: [ChallengeVerifica
 /// as its plain URI string, so a `[String]` maps directly onto the wire array.
 public func encodeAgentCapabilitiesJson(_ capabilities: [String]) throws -> String {
     try encodeTrustAdmissionJson(capabilities)
+}
+
+// MARK: - Trust aggregation input types (§7.3, ADR-058)
+
+/// Attestation type (ADR-017).
+///
+/// Mirrors the Rust `AttestationType` enum (`scp-core`) — the 8 unit variants
+/// serialize as bare PascalCase strings, both as values and as the
+/// `thresholdRequirements` / `attestorSets` map keys. Mirrors the TypeScript
+/// SDK `AttestationType` union and the Kotlin SDK `AttestationType` enum 1:1.
+public nonisolated enum AttestationType: String, Codable, Sendable, Equatable, CaseIterable {
+    /// Links an identity to an external identifier.
+    case identityLink = "IdentityLink"
+    /// Delegates a capability to another DID.
+    case capabilityDelegation = "CapabilityDelegation"
+    /// Attests to the integrity of a tool.
+    case toolIntegrity = "ToolIntegrity"
+    /// Attests to an agent's capability.
+    case agentCapability = "AgentCapability"
+    /// A general endorsement.
+    case endorsement = "Endorsement"
+    /// Assigns a role to a DID.
+    case roleAssignment = "RoleAssignment"
+    /// Endorses a context.
+    case contextEndorsement = "ContextEndorsement"
+    /// Witnesses participation facts.
+    case participationWitness = "ParticipationWitness"
+}
+
+/// Type-specific data carried by an ``EventLogEntry``.
+///
+/// Mirrors the Rust `EventPayload` (`scp-event-log`): opaque payload bytes as
+/// a JSON number array. An empty `data` array is the canonical representation
+/// for non-parameterized events.
+public nonisolated struct EventLogEntryPayload: Codable, Sendable, Equatable {
+    /// Opaque payload bytes. Interpretation depends on the event type.
+    public let data: [UInt8]
+
+    /// Memberwise initializer.
+    public init(data: [UInt8]) {
+        self.data = data
+    }
+}
+
+/// A full signed protocol event in a context event log (ADR-011).
+///
+/// Mirrors the Rust `Event` (`scp-event-log`) serde wire shape the bridge
+/// deserializes for
+/// ``SCP/aggregateTrust(contextId:subjectDid:events:merkleRoot:consequenceRules:thresholdRequirements:attestorSets:cachedAttestations:challengeResults:)``
+/// (`Vec<Event>`) — the INPUT wire form, distinct from the projected event the
+/// event-log query surface returns (which omits the hash-chain and signature
+/// fields). The `CodingKeys` are the serde-canonical snake_case. Mirrors the
+/// TypeScript SDK `EventLogEntry` interface and the Kotlin/Python models 1:1.
+public nonisolated struct EventLogEntry: Codable, Sendable, Equatable {
+    /// Event type — a Rust `EventType` variant name (e.g. `"MessageSent"`).
+    public let eventType: String
+    /// DID of the actor who produced this event.
+    public let actorDid: String
+    /// Unix timestamp (seconds) when the event was created.
+    public let timestamp: UInt64
+    /// Monotonic event sequence number within the log (0-indexed).
+    public let sequence: UInt64
+    /// Type-specific event data.
+    public let payload: EventLogEntryPayload
+    /// SHA-256 hash of the previous event (hash chain), exactly 32 bytes.
+    /// `[UInt8](repeating: 0, count: 32)` for the first event (genesis
+    /// sentinel).
+    public let prevHash: [UInt8]
+    /// Ed25519 signature over the serialized event content (64 bytes).
+    public let signature: [UInt8]
+
+    /// Memberwise initializer.
+    public init(
+        eventType: String,
+        actorDid: String,
+        timestamp: UInt64,
+        sequence: UInt64,
+        payload: EventLogEntryPayload,
+        prevHash: [UInt8],
+        signature: [UInt8]
+    ) {
+        self.eventType = eventType
+        self.actorDid = actorDid
+        self.timestamp = timestamp
+        self.sequence = sequence
+        self.payload = payload
+        self.prevHash = prevHash
+        self.signature = signature
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case eventType = "event_type"
+        case actorDid = "actor_did"
+        case timestamp
+        case sequence
+        case payload
+        case prevHash = "prev_hash"
+        case signature
+    }
+}
+
+/// N-of-M threshold requirement for attestation verification (ADR-017
+/// §7.3.5).
+///
+/// Mirrors the Rust `ThresholdRequirement` struct (`scp-core`). The three
+/// penalty parameters default to the Rust serde defaults (0.1 / 0.5 / 0.2)
+/// and are always emitted explicitly, so the wire form is identical across
+/// bindings. The `CodingKeys` are the serde-canonical snake_case.
+public nonisolated struct ThresholdRequirement: Codable, Sendable, Equatable {
+    /// The minimum number of valid attestations required (N).
+    public let requiredCount: UInt32
+    /// The total number of attestors in the set (M). Must be >= `requiredCount`.
+    public let totalAttestors: UInt32
+    /// Minimum independence score, in [0.0, 1.0].
+    public let independenceThreshold: Double
+    /// Independence penalty per shared context membership. Default: 0.1.
+    public let sharedContextPenalty: Double
+    /// Maximum total shared-context penalty for a single pair. Default: 0.5.
+    public let sharedContextPenaltyCap: Double
+    /// Independence penalty per mutual endorsement direction. Default: 0.2.
+    public let mutualEndorsementPenalty: Double
+
+    /// Memberwise initializer. The penalty parameters default to the Rust
+    /// serde defaults.
+    public init(
+        requiredCount: UInt32,
+        totalAttestors: UInt32,
+        independenceThreshold: Double,
+        sharedContextPenalty: Double = 0.1,
+        sharedContextPenaltyCap: Double = 0.5,
+        mutualEndorsementPenalty: Double = 0.2
+    ) {
+        self.requiredCount = requiredCount
+        self.totalAttestors = totalAttestors
+        self.independenceThreshold = independenceThreshold
+        self.sharedContextPenalty = sharedContextPenalty
+        self.sharedContextPenaltyCap = sharedContextPenaltyCap
+        self.mutualEndorsementPenalty = mutualEndorsementPenalty
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case requiredCount = "required_count"
+        case totalAttestors = "total_attestors"
+        case independenceThreshold = "independence_threshold"
+        case sharedContextPenalty = "shared_context_penalty"
+        case sharedContextPenaltyCap = "shared_context_penalty_cap"
+        case mutualEndorsementPenalty = "mutual_endorsement_penalty"
+    }
+}
+
+/// Information about an attestor used for independence scoring (ADR-017
+/// §7.3.5).
+///
+/// Mirrors the Rust `AttestorInfo` struct (`scp-core`). The optional
+/// `attestation` is a full attestation envelope
+/// (``CachedAttestationEnvelope``); only attestations matching the required
+/// type are considered. The `CodingKeys` are the serde-canonical snake_case;
+/// an absent `attestation` encodes as explicit JSON `null` (matching
+/// `serde_json::to_string` of the Rust `Option<Attestation>` and the
+/// TypeScript SDK encoder).
+public nonisolated struct AttestorInfo: Codable, Sendable, Equatable {
+    /// The DID of the attestor.
+    public let did: String
+    /// Context IDs the attestor is a member of.
+    public let contextMemberships: [String]
+    /// DIDs this attestor has endorsed (mutual endorsements reduce
+    /// independence).
+    public let endorsements: [String]
+    /// The attestation provided by this attestor, if any.
+    public let attestation: CachedAttestationEnvelope?
+
+    /// Memberwise initializer.
+    public init(
+        did: String,
+        contextMemberships: [String],
+        endorsements: [String],
+        attestation: CachedAttestationEnvelope? = nil
+    ) {
+        self.did = did
+        self.contextMemberships = contextMemberships
+        self.endorsements = endorsements
+        self.attestation = attestation
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case did
+        case contextMemberships = "context_memberships"
+        case endorsements
+        case attestation
+    }
+
+    /// Custom encoder so an absent `attestation` serializes as explicit JSON
+    /// `null` rather than being omitted (Swift's synthesized `encodeIfPresent`
+    /// behavior). The Rust deserializer accepts either shape, but explicit
+    /// `null` keeps the wire form identical across bindings.
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(did, forKey: .did)
+        try container.encode(contextMemberships, forKey: .contextMemberships)
+        try container.encode(endorsements, forKey: .endorsements)
+        try container.encode(attestation, forKey: .attestation)
+    }
+}
+
+/// Encodes a typed ``EventLogEntry`` array to the JSON wire shape the bridge
+/// deserializes (`Vec<scp_event_log::Event>`). Byte-array fields pass through
+/// as JSON number arrays.
+///
+/// - Throws: ``ScpError/Validation(msg:code:)`` if `prevHash` is not exactly
+///   32 elements or `signature` is not exactly 64 elements (before any bridge
+///   call).
+public func encodeEventLogEntriesJson(_ events: [EventLogEntry]) throws -> String {
+    for event in events {
+        try requireByteLength(
+            "EventLogEntry", "prevHash",
+            expected: 32, actual: event.prevHash, code: "SCP-VALID-7064"
+        )
+        try requireByteLength(
+            "EventLogEntry", "signature",
+            expected: 64, actual: event.signature, code: "SCP-VALID-7064"
+        )
+    }
+    return try encodeTrustAdmissionJson(events)
+}
+
+/// Encodes a 32-byte Merkle root to the JSON wire shape the bridge
+/// deserializes (`[u8; 32]` as a number array).
+///
+/// - Throws: ``ScpError/Validation(msg:code:)`` if `merkleRoot` is not exactly
+///   32 elements (before any bridge call).
+public func encodeMerkleRootJson(_ merkleRoot: [UInt8]) throws -> String {
+    try requireByteLength(
+        "AggregatedTrustInput", "merkleRoot",
+        expected: 32, actual: merkleRoot, code: "SCP-VALID-7064"
+    )
+    return try encodeTrustAdmissionJson(merkleRoot)
+}
+
+/// Encodes a typed per-``AttestationType`` ``ThresholdRequirement`` map to
+/// the JSON wire shape the bridge deserializes
+/// (`HashMap<AttestationType, ThresholdRequirement>`). Map keys are the bare
+/// variant strings.
+public func encodeThresholdRequirementsJson(
+    _ requirements: [AttestationType: ThresholdRequirement]
+) throws -> String {
+    try encodeTrustAdmissionJson(
+        Dictionary(uniqueKeysWithValues: requirements.map { ($0.key.rawValue, $0.value) })
+    )
+}
+
+/// Encodes a typed per-``AttestationType`` ``AttestorInfo`` map to the JSON
+/// wire shape the bridge deserializes
+/// (`HashMap<AttestationType, Vec<AttestorInfo>>`). Map keys are the bare
+/// variant strings; an absent nested `attestation` encodes as explicit
+/// `null`.
+public func encodeAttestorSetsJson(
+    _ attestorSets: [AttestationType: [AttestorInfo]]
+) throws -> String {
+    try encodeTrustAdmissionJson(
+        Dictionary(uniqueKeysWithValues: attestorSets.map { ($0.key.rawValue, $0.value) })
+    )
 }
 
 // MARK: - Typed trust-admission wrappers (ADR-058)

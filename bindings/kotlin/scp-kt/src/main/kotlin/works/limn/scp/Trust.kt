@@ -377,7 +377,7 @@ private fun encodeCachedAttestationElement(cached: CachedAttestation): JsonObjec
         put("ttl_secs", cached.ttlSecs.toLong())
     }
 
-private fun encodeEnvelopeElement(envelope: CachedAttestationEnvelope): JsonObject =
+internal fun encodeEnvelopeElement(envelope: CachedAttestationEnvelope): JsonObject =
     buildJsonObject {
         put("id", envelope.id)
         put("attestation_type", envelope.attestationType)
