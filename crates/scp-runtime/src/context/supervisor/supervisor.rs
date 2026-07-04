@@ -1009,25 +1009,57 @@ pub struct CrossContextToolInvocationRequest {
     pub asserted_timestamp_ms: u64,
 }
 
+/// Relay TTL (seconds) for a delivered invitation bundle (spec §5.12.3.3 —
+/// 7-day default).
+const INVITATION_TTL_SECS: u32 = 7 * 24 * 60 * 60;
+
+/// Outcome of [`Supervisor::invite_member`]: the sealed §5.12.3 invitation
+/// bundle's HPKE outputs and whether the runtime published it.
+#[derive(Debug, Clone)]
+pub struct InviteMemberOutcome {
+    /// RFC 9180 HPKE encapsulated key (`enc`) — the 32-byte ephemeral public key.
+    pub enc: [u8; 32],
+    /// RFC 9180 HPKE ciphertext (`ct = ciphertext || tag`) of the serialized,
+    /// signed [`InvitationBundle`](scp_protocol::context::InvitationBundle).
+    pub ciphertext: Vec<u8>,
+    /// `true` if the runtime published the sealed invitation to the invitee's
+    /// `scp-invitations` routing id; `false` if the transport does not support
+    /// routing-id delivery (the caller must deliver `(enc, ciphertext)` itself).
+    pub delivered: bool,
+}
+
 /// Flat, named-field request for [`Supervisor::spawn_actor_from_welcome`]
-/// (ADR-049 Phase 2J, spawn-from-Welcome). A config object (not positional
-/// args) per the agent-first API tenet: an LLM constructs it from the field
-/// names + one example, with no argument-order footgun. The joiner's OWN
+/// (ADR-049 Phase 2J, spawn-from-Welcome; FFI-02 Option A). A config object (not
+/// positional args) per the agent-first API tenet: an LLM constructs it from the
+/// field names + one example, with no argument-order footgun. The joiner's OWN
 /// identity is passed separately (as a `DID` on the `Supervisor` method, or as
 /// the unforgeable `&OwnedIdentityDid` capability on the `SupervisorHandle`
 /// wrapper) so it cannot be transposed with `creator_did`.
+///
+/// The request carries the creator-signed, HPKE-sealed
+/// [`InvitationBundle`](scp_protocol::context::InvitationBundle) — NOT loose
+/// caller-supplied params. `spawn_actor_from_welcome` opens the bundle (split
+/// custody), verifies the creator signature, and derives ALL authority
+/// (`creator_did`, `context_params`, `welcome_message`) from the AUTHENTICATED
+/// bundle. `context_id` / `creator_did` here are UNTRUSTED binding hints used
+/// only to rebuild the HPKE `info`/`aad`; they are AEAD-authenticated by a
+/// successful open and additionally cross-checked against the signed bundle.
 pub struct WelcomeJoinRequest {
-    /// The context creator / admin DID (from the legible, pre-join params).
-    pub creator_did: DID,
-    /// Canonical context id string (`hex(digest)` under ADR-056).
+    /// UNTRUSTED binding hint: the context id used to build the HPKE `info`/`aad`
+    /// (`hex(digest)` under ADR-056). Cross-checked against `bundle.context_id`
+    /// after the open; authority derives from the signed bundle, never this.
     pub context_id: String,
-    /// The legible context parameters (visible before joining, spec §5).
-    pub params: scp_protocol::context::ContextParams,
+    /// UNTRUSTED binding hint: the creator did used to build the HPKE
+    /// `info`/`aad`. Cross-checked against `bundle.creator_did` after the open.
+    pub creator_did: DID,
+    /// RFC 9180 HPKE encapsulated key (`enc`) of the sealed invitation bundle.
+    pub sealed_bundle_enc: [u8; 32],
+    /// RFC 9180 HPKE ciphertext (`ct`) of the MessagePack-serialized
+    /// [`InvitationBundle`](scp_protocol::context::InvitationBundle).
+    pub sealed_bundle_ct: Vec<u8>,
     /// The reservation id of the KeyPackage this Welcome was addressed to,
     /// obtained from the joiner's `KeyPackageStoreActor` `Reserve`.
     pub reservation_id: crate::context::supervisor::key_package_actor::ReservationId,
-    /// TLS-serialized MLS Welcome message received for the reserved KeyPackage.
-    pub welcome_bytes: Vec<u8>,
     /// The joiner's §9.10.4 local pseudonym for this context, or `None`.
     pub local_pseudonym: Option<[u8; 32]>,
 }
@@ -10407,6 +10439,222 @@ impl Supervisor {
             .await
     }
 
+    /// Produces, signs, HPKE-seals, and (best-effort) delivers a §5.12.3 signed
+    /// [`InvitationBundle`](scp_protocol::context::InvitationBundle) inviting
+    /// `invitee_did` to the encrypted context `context_id` (ADR-049 Phase 2J,
+    /// FFI-02 Option A — the creator-side peer of
+    /// [`Self::spawn_actor_from_welcome`]).
+    ///
+    /// Steps (all creator-side, no per-identity secret returned):
+    ///
+    /// 1. Reads the context's LIVE genesis [`ContextParams`] — the authenticated
+    ///    authority source the joiner will enforce from. Encrypted-only: the
+    ///    MLS-Welcome invitation flow stands up an encrypted context
+    ///    (spawn-from-Welcome builds Encrypted mode and rejects Broadcast), so a
+    ///    Broadcast context is refused here.
+    /// 2. Resolves the invitee's `#active` verifying key via the
+    ///    [`key_resolver`](Self::key_resolver_ref) and maps it to X25519 (RFC
+    ///    7748) as the HPKE recipient key.
+    /// 3. Drives the real MLS add-member for `invitee_key_package` (the invitee's
+    ///    reserved KeyPackage bytes from [`Self::reserve_key_package`]) to obtain
+    ///    the Welcome.
+    /// 4. Assembles the bundle: genesis `context_params`, the visibility-filtered
+    ///    [`MetadataSnapshot`](scp_protocol::context::metadata::MetadataSnapshot),
+    ///    `relay_urls`, and the §9.10.4.B `context_metadata_key`.
+    /// 5. Signs it over
+    ///    [`invitation_bundle_signing_hash`](scp_protocol::context::InvitationBundle::invitation_bundle_signing_hash)
+    ///    with the creator's `#active` key via the FFI-supplied `sign` closure
+    ///    (the actor holds no custody key — same boundary as
+    ///    [`Self::export_context`]).
+    /// 6. HPKE-seals the MessagePack-serialized bundle to the invitee (RFC 9180
+    ///    Base mode, `info`/`aad` per §5.12.3.1).
+    /// 7. Fork C: publishes the sealed
+    ///    [`SealedInvitation`](crate::context::invitation_helpers::SealedInvitation)
+    ///    to the invitee's `scp-invitations` routing id when the transport
+    ///    supports routing-id delivery; otherwise returns the `(enc, ct)` for the
+    ///    caller to deliver (`delivered = false`).
+    ///
+    /// # Cryptographic notes
+    ///
+    /// - **`context_metadata_key` (§9.10.4.B).** Spec §9.10.4.B has the creator
+    ///   generate this 32-byte key once at context creation and share it with all
+    ///   members so their metadata routing IDs converge. The runtime create path
+    ///   does not yet persist a genesis metadata key, so this method mints a
+    ///   fresh `OsRng` key per invitation. It is cryptographically sound (CSPRNG,
+    ///   signed into the bundle) and correct for a single-invitee (bilateral)
+    ///   context, but multiple invitees will NOT converge on one metadata routing
+    ///   ID until a genesis `context_metadata_key` is stored at creation and read
+    ///   here. Metadata-routing publish is itself not yet wired, so this is inert
+    ///   today.
+    /// - **`sender_key_seed`.** `None` here: this flow is Encrypted-only (guarded
+    ///   above), and Encrypted contexts carry no sender-key seed in the bundle
+    ///   (§5.12.3.1). Broadcast admission is a separate flow.
+    /// - **Actor serialization.** The MLS add-member mutates the shared group
+    ///   `Arc` off the per-context mailbox. For a first invitation to a quiescent
+    ///   context this is race-free; full serialization against concurrent actor
+    ///   MLS operations would route this through a dedicated `InviteMember`
+    ///   lifecycle command (follow-up).
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::ContextNotRegistered`] if `context_id` has no live
+    ///   context; [`ContextError::CryptoFailed`] for a Broadcast context, an
+    ///   unresolvable invitee `#active` key, an invalid key mapping, a signing or
+    ///   HPKE-seal failure, or a serialization fault;
+    ///   [`ContextError::MembershipFailed`] if the MLS add-member produces no
+    ///   Welcome; [`ContextError::NotInitialized`] if no key resolver is wired;
+    ///   or any non-"unsupported" transport error surfaced by the delivery.
+    // The produce → assemble → sign → seal → deliver sequence reads clearer as one
+    // linear method than split across helpers, hence the line-count allow (mirrors
+    // `spawn_actor_from_welcome`, its join-side peer).
+    #[allow(clippy::too_many_lines)]
+    pub async fn invite_member<F, E>(
+        self: &Arc<Self>,
+        context_id: String,
+        creator_did: DID,
+        invitee_did: DID,
+        invitee_key_package: Vec<u8>,
+        relay_urls: Vec<String>,
+        sign: F,
+    ) -> Result<InviteMemberOutcome, ContextError>
+    where
+        F: FnOnce(&[u8; 32]) -> Result<[u8; 64], E>,
+        E: std::fmt::Display,
+    {
+        use rand::RngCore as _;
+        use scp_protocol::context::{InvitationBundle, InvitationKeyMaterial};
+        use scp_protocol::crypto::envelope_seal;
+
+        // 1. Live genesis params — the authenticated authority source.
+        let params = self.context_params(&context_id).await.ok_or_else(|| {
+            ContextError::ContextNotRegistered(format!(
+                "invite_member: no live context '{context_id}'"
+            ))
+        })?;
+        if params.mode != scp_protocol::context::ContextMode::Encrypted {
+            return Err(ContextError::CryptoFailed(
+                "invite_member supports only Encrypted contexts; Broadcast admission uses the \
+                 sender-key distribution flow, not an MLS Welcome"
+                    .to_owned(),
+            ));
+        }
+
+        // 2. Resolve the invitee's #active key -> X25519 recipient.
+        let resolver = self.key_resolver_ref().ok_or_else(|| {
+            ContextError::NotInitialized("invite_member: key resolver not configured".to_owned())
+        })?;
+        let invitee_vk = resolver(&invitee_did, scp_protocol::identity::SigningKeyId::Active)
+            .ok_or_else(|| {
+                ContextError::CryptoFailed(format!(
+                    "invite_member: cannot resolve #active key for invitee '{invitee_did}'"
+                ))
+            })?;
+        let recipient_x25519 = envelope_seal::ed25519_pubkey_to_x25519(invitee_vk.as_bytes())
+            .map_err(|e| {
+                ContextError::CryptoFailed(format!(
+                    "invite_member: invitee #active key has no valid X25519 mapping: {e}"
+                ))
+            })?;
+
+        // 3. Drive the real MLS add-member for the invitee's reserved KeyPackage.
+        let context_id_bytes = crate::context::state::context_id_to_bytes(&context_id);
+        let deps = self.build_actor_deps(&creator_did).await?;
+        let add_output = deps.crypto.add_member(
+            &context_id_bytes,
+            invitee_did.as_ref(),
+            Some(&invitee_key_package),
+        )?;
+        if add_output.welcome_bytes.is_empty() {
+            return Err(ContextError::MembershipFailed(
+                "invite_member: MLS add-member produced no Welcome message".to_owned(),
+            ));
+        }
+
+        // 4. Assemble the visibility-filtered metadata snapshot + key material.
+        let member_count = self
+            .member_count(&context_id)
+            .await
+            .map(|n| u64::try_from(n).unwrap_or(u64::MAX));
+        let facts = crate::context::invitation_helpers::SnapshotRuntimeFacts {
+            member_count,
+            creator_did: Some(creator_did.clone()),
+            tool_count: Some(u64::try_from(params.tools.len()).unwrap_or(u64::MAX)),
+            ..crate::context::invitation_helpers::SnapshotRuntimeFacts::default()
+        };
+        let metadata_snapshot =
+            crate::context::invitation_helpers::build_metadata_snapshot(&params, facts);
+
+        let mut metadata_key = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut metadata_key);
+        let key_material = InvitationKeyMaterial {
+            context_metadata_key: metadata_key,
+            sender_key_seed: None,
+        };
+
+        // 5. Build + sign the bundle with the creator's #active key (via closure).
+        let mut bundle = InvitationBundle {
+            context_id: context_id.clone(),
+            creator_did: creator_did.clone(),
+            relay_urls,
+            welcome_message: add_output.welcome_bytes,
+            key_material,
+            context_params: params,
+            metadata_snapshot,
+            signature: Vec::new(),
+        };
+        let signing_hash = bundle.invitation_bundle_signing_hash().map_err(|e| {
+            ContextError::CryptoFailed(format!("invite_member: signing-hash failed: {e}"))
+        })?;
+        let signature = sign(&signing_hash).map_err(|e| {
+            ContextError::CryptoFailed(format!("invite_member: creator signing failed: {e}"))
+        })?;
+        bundle.signature = signature.to_vec();
+
+        // 6. HPKE-seal the serialized bundle to the invitee.
+        let wire = bundle.to_wire_bytes().map_err(|e| {
+            ContextError::CryptoFailed(format!("invite_member: bundle serialize failed: {e}"))
+        })?;
+        let (ciphertext, enc) = envelope_seal::hpke_seal_invitation(
+            &wire,
+            &recipient_x25519,
+            &context_id,
+            creator_did.as_ref(),
+        )
+        .map_err(|e| ContextError::CryptoFailed(format!("invite_member: HPKE seal failed: {e}")))?;
+
+        // 7. Fork C — deliver to the invitee's scp-invitations routing id when the
+        //    transport supports routing-id delivery; otherwise the caller delivers.
+        let sealed = crate::context::invitation_helpers::SealedInvitation {
+            context_id: context_id.clone(),
+            creator_did,
+            enc: enc.to_vec(),
+            ciphertext: ciphertext.clone(),
+        };
+        let payload = sealed.to_wire_bytes().map_err(|e| {
+            ContextError::CryptoFailed(format!("invite_member: delivery serialize failed: {e}"))
+        })?;
+        let routing_id = envelope_seal::derive_invitation_routing_id(invitee_did.as_ref());
+        let delivered = match self.transport_ref() {
+            Some(transport) => {
+                match transport.send_to_routing_id(&routing_id, &payload, INVITATION_TTL_SECS) {
+                    Ok(()) => true,
+                    // A transport that does not support routing-id delivery (or is
+                    // offline) returns TransportFailed; the (enc, ct) are still
+                    // returned for the caller to deliver. Any other error is fatal.
+                    Err(ContextError::TransportFailed(_)) => false,
+                    Err(e) => return Err(e),
+                }
+            }
+            None => false,
+        };
+
+        Ok(InviteMemberOutcome {
+            enc,
+            ciphertext,
+            delivered,
+        })
+    }
+
     // (WelcomeJoinRequest is defined at module scope below the impl.)
 
     /// Spawns a per-context actor for a node that JOINED a context by
@@ -10480,19 +10728,21 @@ impl Supervisor {
     // its rollback-on-error path) reads clearer as one linear sequence than split
     // across helpers, hence the line-count allow.
     #[allow(clippy::too_many_lines)]
-    pub async fn spawn_actor_from_welcome(
+    pub async fn spawn_actor_from_welcome<C: scp_platform::KeyCustody>(
         self: &Arc<Self>,
         owning_did: DID,
+        custody: &C,
+        active_key_handle: &scp_platform::KeyHandle,
         req: WelcomeJoinRequest,
     ) -> Result<crate::context::ContextHandle, ContextError> {
         use crate::context::supervisor::key_package_actor::KeyPackageCommand;
 
         let WelcomeJoinRequest {
-            creator_did,
-            context_id,
-            params,
+            context_id: hint_context_id,
+            creator_did: hint_creator_did,
+            sealed_bundle_enc,
+            sealed_bundle_ct,
             reservation_id,
-            welcome_bytes,
             local_pseudonym,
         } = req;
 
@@ -10518,6 +10768,124 @@ impl Supervisor {
         // the crypto ops, nor `spawn_actor_with_state` re-acquires
         // `bootstrap_spawn_lock`, so this is re-entrancy- and deadlock-free.
         let _bootstrap_guard = self.bootstrap_spawn_lock.lock().await;
+
+        // ---- OPEN + VERIFY the signed §5.12.3 invitation bundle (FFI-02) ------
+        // This is the FIRST thing the join does — before any precheck, the
+        // irreversible KeyPackage consume, or any state build — so authority
+        // derives ONLY from the creator-signed, HPKE-sealed bundle, never from
+        // attacker-injectable caller params (BLACK-2J10-001 admin-hijack).
+        //
+        // The joiner's #active private key never leaves custody: the KEM
+        // Diffie-Hellman `DH(sk_active_x25519, enc)` is computed INSIDE custody
+        // via `ed25519_to_x25519_agree`; the rest of the RFC 9180 open
+        // (`ExtractAndExpand`, `KeySchedule`, AEAD) is pure software (ADR-006,
+        // split custody). `info`/`aad` are rebuilt from the UNTRUSTED
+        // `hint_context_id` / `hint_creator_did`; a successful AEAD open PROVES
+        // the sealer used identical values (they are AEAD-authenticated), and the
+        // signed bundle is cross-checked against them below.
+        let dh = custody
+            .ed25519_to_x25519_agree(active_key_handle, &sealed_bundle_enc)
+            .await
+            .map_err(|e| {
+                ContextError::CryptoFailed(format!(
+                    "spawn-from-Welcome: invitation KEM DH agreement failed: {e}"
+                ))
+            })?;
+        let dh_bytes: zeroize::Zeroizing<[u8; 32]> = zeroize::Zeroizing::new(*dh.as_bytes());
+        // pkRm = the joiner's OWN #active public key mapped to X25519 (RFC 7748).
+        let active_pub = custody.public_key(active_key_handle).await.map_err(|e| {
+            ContextError::CryptoFailed(format!(
+                "spawn-from-Welcome: reading the joiner #active public key failed: {e}"
+            ))
+        })?;
+        let active_pub_bytes: [u8; 32] = active_pub.as_bytes().try_into().map_err(|_| {
+            ContextError::CryptoFailed(
+                "spawn-from-Welcome: joiner #active public key is not 32 bytes".to_owned(),
+            )
+        })?;
+        let pk_rm =
+            scp_protocol::crypto::envelope_seal::ed25519_pubkey_to_x25519(&active_pub_bytes)
+                .map_err(|e| {
+                    ContextError::CryptoFailed(format!(
+                        "spawn-from-Welcome: joiner #active key has no valid X25519 mapping: {e}"
+                    ))
+                })?;
+        let bundle_wire =
+            scp_protocol::crypto::envelope_seal::hpke_open_invitation_with_external_dh(
+                &sealed_bundle_ct,
+                &dh_bytes,
+                &pk_rm,
+                &sealed_bundle_enc,
+                &hint_context_id,
+                hint_creator_did.as_ref(),
+            )
+            .map_err(|e| {
+                ContextError::CryptoFailed(format!(
+                    "spawn-from-Welcome: invitation open failed: {e}"
+                ))
+            })?;
+        let bundle = scp_protocol::context::InvitationBundle::from_wire_bytes(&bundle_wire)
+            .map_err(|e| {
+                ContextError::CryptoFailed(format!(
+                    "spawn-from-Welcome: invitation bundle decode failed: {e}"
+                ))
+            })?;
+
+        // Resolve the creator's #active key and VERIFY the creator signature —
+        // the root of trust for ALL authority the joiner installs. A resolution
+        // failure is treated as a permanent reject (fail-closed), matching the
+        // import path: the `KeyResolver` returns `Option` with no transient
+        // signal, so there is no retryable-vs-permanent distinction to model here.
+        let resolver = self.key_resolver_ref().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "spawn-from-Welcome: key resolver not configured — cannot verify the invitation \
+                 signature"
+                    .to_owned(),
+            )
+        })?;
+        let creator_vk = resolver(
+            &bundle.creator_did,
+            scp_protocol::identity::SigningKeyId::Active,
+        )
+        .ok_or_else(|| {
+            ContextError::CryptoFailed(format!(
+                "spawn-from-Welcome: cannot resolve #active key for creator '{}'",
+                bundle.creator_did
+            ))
+        })?;
+        bundle.verify(&creator_vk).map_err(|e| {
+            ContextError::CryptoFailed(format!(
+                "spawn-from-Welcome: invitation signature invalid: {e}"
+            ))
+        })?;
+        // metadata_snapshot.structural must agree with the signed context_params
+        // (both are under the same signature — a divergence is a signed
+        // self-contradiction; spec §5.12.3.1 validation step 2).
+        bundle.verify_structural_consistency().map_err(|e| {
+            ContextError::CryptoFailed(format!(
+                "spawn-from-Welcome: invitation metadata inconsistent with signed params: {e}"
+            ))
+        })?;
+
+        // Cross-check the untrusted binding hints against the AUTHENTICATED
+        // bundle. The AEAD open already guarantees equality with what the sealer
+        // used; this is belt-and-suspenders (and makes the invariant explicit).
+        if bundle.context_id != hint_context_id || bundle.creator_did != hint_creator_did {
+            return Err(ContextError::CryptoFailed(
+                "spawn-from-Welcome: invitation binding hints disagree with the signed bundle"
+                    .to_owned(),
+            ));
+        }
+
+        // From here on, ALL authority derives from the creator-signed bundle —
+        // this is what closes FFI-02 / BLACK-2J10-001 (creator_did, governance,
+        // ceiling, economic policy, consequence rules, tools are creator-signed,
+        // not attacker-injectable). The §5.13.3 `0xFF02` cross-check below
+        // additionally binds these against the COMMITTED MLS group.
+        let context_id = bundle.context_id.clone();
+        let creator_did = bundle.creator_did.clone();
+        let params = bundle.context_params.clone();
+        let welcome_bytes = bundle.welcome_message.clone();
 
         // ---- REVERSIBLE PRECHECKS (before the irreversible ConfirmConsume) ----
         // The KeyPackage burn in step 1 is a SINGLE-USE, irreversible cost. Every
