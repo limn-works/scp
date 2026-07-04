@@ -2455,6 +2455,22 @@ impl crate::scp::PyScp {
         let parsed = PyContextParams::from_py_dict(params)?;
         let core_params = build_core_context_params(&parsed)?;
 
+        // Welcome-join is ENCRYPTED-only. A broadcast context carries no MLS
+        // Welcome (it is a per-author AES-GCM channel, spec §5.14), so a
+        // broadcast `params` would otherwise fail deep at the fused
+        // `ConfirmConsume` (no reserved KeyPackage / no Welcome to consume).
+        // Reject a non-Encrypted mode up front — before deriving the pseudonym,
+        // resolving the supervisor, or registering any reversible bridge state.
+        if !matches!(
+            core_params.mode,
+            scp_core::context::params::ContextMode::Encrypted
+        ) {
+            return Err(PyValueError::new_err(
+                "context_join_from_welcome requires an encrypted context; broadcast \
+                 contexts are not Welcome-joined (spec §5.14)",
+            ));
+        }
+
         // spawn-from-Welcome always stands up an ENCRYPTED context; ensure the
         // node's supervisor is attached first (this may be the joiner's first
         // context op — the same idempotent init context_join performs).
@@ -2478,6 +2494,18 @@ impl crate::scp::PyScp {
         let reservation: scp_core::context::supervisor::ReservationId =
             serde_json::from_value(serde_json::Value::String(reservation_id.to_owned()))
                 .map_err(|e| PyRuntimeError::new_err(format!("invalid reservation id: {e}")))?;
+
+        // Resolve the tokio runtime + supervisor handle BEFORE any reversible
+        // registration. Neither lookup needs registered bridge state, and both
+        // short-circuit on `?` — resolving them AFTER `register_ffi_state` would
+        // leak the just-registered (reversible) state with no rollback on their
+        // failure, and a later same-id retry would then hard-fail the Occupied
+        // check. Order: custody-derive (above) → runtime/supervisor-resolve →
+        // register-reversible → spawn → rollback-on-Err.
+        let rt = crate::runtime()?;
+        let sup =
+            crate::runtime::supervisor(bi).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let sup = Arc::clone(sup);
 
         // Register the bridge-side FFI state (ToolRegistry / EventLog / RoleState)
         // as a REVERSIBLE precheck BEFORE the irreversible runtime join. Mirrors
@@ -2508,11 +2536,6 @@ impl crate::scp::PyScp {
             crate::runtime::remove_context(bi, context_id);
             return Err(PyRuntimeError::new_err(e.to_string()));
         }
-
-        let rt = crate::runtime()?;
-        let sup =
-            crate::runtime::supervisor(bi).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        let sup = Arc::clone(sup);
 
         let owning = scp_identity::DID(owning_did.to_owned());
         let req = scp_core::context::supervisor::WelcomeJoinRequest {
@@ -5954,6 +5977,44 @@ mod tests {
         assert!(
             err.contains("SCP-IDENT-1054"),
             "expected joiner local-custody hard-fail SCP-IDENT-1054, got: {err}"
+        );
+    }
+
+    /// ADR-049 Phase 2J: `context_join_from_welcome` is ENCRYPTED-only. A
+    /// broadcast `params.mode` is rejected UP FRONT — before deriving the
+    /// pseudonym, resolving the supervisor, or registering any reversible bridge
+    /// state — because a broadcast context (per-author AES-GCM, spec §5.14)
+    /// carries no MLS Welcome and would otherwise fail deep at the fused
+    /// `ConfirmConsume`.
+    ///
+    /// Not false-green: the rejection precedes the custody gate, so the joiner
+    /// DID need not be registered; were the check removed, the call would
+    /// instead reach the custody seam and fail with `SCP-IDENT-1054`, not the
+    /// encrypted-context message asserted here.
+    #[test]
+    fn context_join_from_welcome_rejects_broadcast_mode() {
+        crate::init_runtime().ok();
+        let bi_arc = __bi();
+        let scp = crate::scp::PyScp {
+            inner: std::sync::Arc::clone(&bi_arc),
+        };
+        let err = Python::with_gil(|py| {
+            let params = PyDict::new(py);
+            params.set_item("mode", "broadcast").unwrap();
+            scp.context_join_from_welcome(
+                "did:dht:z6MkSomeBroadcastJoiner",
+                "did:dht:z6MkSomeCreator",
+                &"0".repeat(64),
+                &params,
+                "not-a-real-reservation",
+                b"not-a-real-welcome",
+            )
+            .expect_err("join-from-Welcome must reject a broadcast context up front")
+            .to_string()
+        });
+        assert!(
+            err.contains("requires an encrypted context"),
+            "expected up-front broadcast rejection, got: {err}"
         );
     }
 

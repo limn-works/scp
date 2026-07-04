@@ -1134,6 +1134,24 @@ pub(crate) async fn context_join_from_welcome_on(
     // helper `context_create_on` also uses.
     let parsed = parse_context_params(&params_json)?;
 
+    // Welcome-join is ENCRYPTED-only. A broadcast context carries no MLS Welcome
+    // (it is a per-author AES-GCM channel, spec §5.14), so a broadcast `params`
+    // would otherwise fail deep at the fused `ConfirmConsume` (no reserved
+    // KeyPackage / no Welcome to consume). Reject a non-Encrypted mode up front —
+    // before deriving the pseudonym, resolving the supervisor, or registering any
+    // reversible bridge state.
+    if !matches!(
+        parsed.core.mode,
+        scp_core::context::params::ContextMode::Encrypted
+    ) {
+        return Err(NapiError::from(ScpNapiError::Validation {
+            message: "context_join_from_welcome requires an encrypted context; broadcast \
+                      contexts are not Welcome-joined (spec §5.14)"
+                .to_owned(),
+            code: codes::VALID_7150.to_owned(),
+        }));
+    }
+
     // spawn-from-Welcome always stands up an ENCRYPTED context; ensure the
     // node's supervisor is attached first (may be the joiner's first context op
     // — the same idempotent init the join performs).
@@ -1157,6 +1175,16 @@ pub(crate) async fn context_join_from_welcome_on(
             })
         })?;
 
+    // Resolve the supervisor handle BEFORE any reversible registration. The
+    // lookup needs no registered bridge state and short-circuits on `?` —
+    // resolving it AFTER `register_ffi_state` would leak the just-registered
+    // (reversible) state with no rollback on its failure, and a later same-id
+    // retry would then hard-fail the Occupied check. Order: custody-derive
+    // (above) → supervisor-resolve → register-reversible → spawn →
+    // rollback-on-Err.
+    let sup = crate::runtime::supervisor(bi)?;
+    let sup = Arc::clone(sup);
+
     // Register the bridge-side FFI state (UCAN validation state) as a REVERSIBLE
     // precheck BEFORE the irreversible runtime join. Mirrors the PyO3 reference,
     // which registers FFI state first and rolls it back if the runtime step
@@ -1177,8 +1205,6 @@ pub(crate) async fn context_join_from_welcome_on(
         return Err(NapiError::from(e));
     }
 
-    let sup = crate::runtime::supervisor(bi)?;
-    let sup = Arc::clone(sup);
     let req = scp_core::context::supervisor::WelcomeJoinRequest {
         creator_did: DID(creator_did.clone()),
         context_id: context_id.clone(),
@@ -5250,6 +5276,44 @@ mod tests {
             msg.contains(codes::IDENT_1054),
             "expected joiner local-custody hard-fail {}, got: {msg}",
             codes::IDENT_1054
+        );
+    }
+
+    /// ADR-049 Phase 2J: `context_join_from_welcome` is ENCRYPTED-only. A
+    /// broadcast `params.mode` is rejected UP FRONT — before deriving the
+    /// pseudonym, resolving the supervisor, or registering any reversible bridge
+    /// state — because a broadcast context (per-author AES-GCM, spec §5.14)
+    /// carries no MLS Welcome and would otherwise fail deep at the fused
+    /// `ConfirmConsume`.
+    ///
+    /// Not false-green: the rejection precedes the custody gate, so the joiner
+    /// DID need not be registered; were the check removed, the call would instead
+    /// reach the custody seam and fail with `SCP-IDENT-1054`, not `SCP-VALID-7150`.
+    #[tokio::test]
+    async fn context_join_from_welcome_rejects_broadcast_mode() {
+        let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
+        let Err(err) = super::context_join_from_welcome_on(
+            &bi,
+            "did:dht:z6MkSomeNapiBroadcastJoiner".to_owned(),
+            "did:dht:z6MkSomeNapiCreator".to_owned(),
+            "0".repeat(64),
+            r#"{"mode":"broadcast"}"#.to_owned(),
+            "not-a-real-reservation".to_owned(),
+            b"not-a-real-welcome".to_vec(),
+        )
+        .await
+        else {
+            panic!("join-from-Welcome must reject a broadcast context up front");
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains(codes::VALID_7150),
+            "expected up-front broadcast rejection {}, got: {msg}",
+            codes::VALID_7150
+        );
+        assert!(
+            !msg.contains(codes::IDENT_1054),
+            "broadcast rejection must precede the custody gate; got a custody error: {msg}"
         );
     }
 

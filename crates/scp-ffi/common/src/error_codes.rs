@@ -883,6 +883,14 @@ pub const VALID_7135: &str = "SCP-VALID-7135";
 /// worker-pool exhaustion (RED-PR5-002 / BLACK-PR5-002). Caller should back
 /// off and retry.
 pub const VALID_7140: &str = "SCP-VALID-7140";
+/// Welcome-join attempted on a non-encrypted (broadcast) context.
+///
+/// `context_join_from_welcome` is ENCRYPTED-only: a broadcast context carries
+/// no MLS Welcome (it is a per-author AES-GCM channel, spec §5.14), so the join
+/// is rejected up front — before deriving the pseudonym, resolving the
+/// supervisor, or registering reversible bridge state — rather than failing
+/// deep at the fused `KeyPackage` consume.
+pub const VALID_7150: &str = "SCP-VALID-7150";
 /// Governance vote validation error.
 pub const VALID_7216: &str = "SCP-VALID-7216";
 /// Media validation error.

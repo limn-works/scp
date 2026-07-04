@@ -9449,6 +9449,25 @@ impl Scp {
                 let core_params = bridge_params_to_core(&params)?;
                 let retained_core_params = core_params.clone();
 
+                // Welcome-join is ENCRYPTED-only. A broadcast context carries no
+                // MLS Welcome (it is a per-author AES-GCM channel, spec §5.14), so
+                // a broadcast `params` would otherwise fail deep at the fused
+                // `ConfirmConsume` (no reserved KeyPackage / no Welcome to
+                // consume). Reject a non-Encrypted mode up front — before deriving
+                // the pseudonym, resolving the supervisor, or registering any
+                // reversible bridge state.
+                if !matches!(
+                    core_params.mode,
+                    scp_core::context::params::ContextMode::Encrypted
+                ) {
+                    return Err(ScpError::Validation {
+                        msg: "context_join_from_welcome requires an encrypted context; \
+                              broadcast contexts are not Welcome-joined (spec §5.14)"
+                            .to_owned(),
+                        code: codes::VALID_7150.to_owned(),
+                    });
+                }
+
                 // spawn-from-Welcome always stands up an ENCRYPTED context; ensure
                 // the node's supervisor is attached first (this may be the joiner's
                 // first context op — the same idempotent init context_join
@@ -9476,6 +9495,16 @@ impl Scp {
                             code: codes::CTX_2014.to_owned(),
                         })?;
 
+                // Resolve the supervisor handle BEFORE the reversible atomic
+                // occupy. The lookup needs no registered bridge state and
+                // short-circuits on `?` — resolving it AFTER
+                // `register_ucan_occupied` would leak the just-occupied
+                // (reversible) UCAN state with no rollback on its failure, and a
+                // later same-id retry would then hard-fail the Occupied check.
+                // Order: custody-derive (above) → supervisor-resolve →
+                // register-reversible → spawn → rollback-on-Err.
+                let sup = bi.context_manager_or_error()?;
+
                 // Atomic occupy — register the bridge-side UCAN validation state
                 // (revocation list, nonce tracker, event log, ceiling) and gate on
                 // collision in ONE indivisible step, fail-closed BEFORE
@@ -9502,7 +9531,6 @@ impl Scp {
                 // only our own state — never an entry another caller owns) so an
                 // errored join leaves no orphaned bridge state beside a runtime that
                 // never committed.
-                let sup = bi.context_manager_or_error()?;
                 let owning = scp_identity::DID(identity.did.clone());
                 let req = scp_core::context::supervisor::WelcomeJoinRequest {
                     creator_did: scp_identity::DID(creator_did.clone()),
@@ -17768,6 +17796,57 @@ mod tests {
         assert!(
             scp.inner.with_ucan_state(&context_id, |_| ()).is_none(),
             "no UCAN state should be registered after a rejected join"
+        );
+    }
+
+    /// `context_join_from_welcome` is ENCRYPTED-only. A broadcast `params.mode`
+    /// is rejected UP FRONT — before deriving the pseudonym, resolving the
+    /// supervisor, or registering any reversible bridge state — because a
+    /// broadcast context (per-author AES-GCM, spec §5.14) carries no MLS Welcome
+    /// and would otherwise fail deep at the fused `ConfirmConsume`.
+    ///
+    /// Not false-green: the rejection precedes the custody gate, so even a fully
+    /// custodied identity is rejected on mode alone; were the check removed, the
+    /// call would reach the register -> spawn seam and fail for an unrelated
+    /// reason (bogus reservation / Welcome), not `SCP-VALID-7150`. The assertion
+    /// also pins that no bridge state leaked.
+    #[test]
+    #[cfg(feature = "allow_in_memory_custody")]
+    fn context_join_from_welcome_rejects_broadcast_mode() {
+        let rt = runtime();
+        let scp = scp_test();
+        let custodied = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed");
+        let creator_did = custodied.did();
+        let context_id = scp_ffi_common::generate_context_id();
+
+        let mut broadcast_params = encrypted_join_test_params();
+        broadcast_params.mode = ContextMode::Broadcast;
+
+        let result = rt.block_on(scp.context_join_from_welcome(
+            custodied,
+            creator_did,
+            context_id.clone(),
+            broadcast_params,
+            "bogus-reservation".to_owned(),
+            b"bogus-welcome".to_vec(),
+        ));
+        assert!(
+            matches!(
+                &result,
+                Err(ScpError::Validation { code, .. }) if code == codes::VALID_7150
+            ),
+            "expected up-front broadcast rejection SCP-VALID-7150, got: {result:?}"
+        );
+        // No bridge state leaked — the mode gate rejected before any registration.
+        assert!(
+            !context_handle_registry(&scp.inner).contains_key(&context_id),
+            "no context handle should be registered after a broadcast rejection"
+        );
+        assert!(
+            scp.inner.with_ucan_state(&context_id, |_| ()).is_none(),
+            "no UCAN state should be registered after a broadcast rejection"
         );
     }
 
