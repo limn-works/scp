@@ -77,6 +77,14 @@ class Config:
     max_retries: int = 3
 ```
 
+### Generated PyO3 type stub (`_scp_core.pyi`)
+
+The extension-module stub `bindings/python/scp_sdk/_scp_core.pyi` is the type-checker's and IDE's view of the `_scp_core` PyO3 bridge. Its function/method **parameter lists are generated**, not hand-maintained: PyO3 binds positional parameters by declaration order (absent an explicit `#[pyo3(signature = ...)]`), so the Rust `#[pyfunction]` / `#[pymethods]` signatures are the single source of truth for the Python-visible keyword surface. A hand-edited stub drifts silently — mypy/pyright trust the stub itself, so a transposed or missing parameter is invisible.
+
+`scripts/generate-pyi.py` reads the authoritative Rust signatures (via tree-sitter) and rewrites each stub signature's positional parameter **names, order, and arity** to match, carrying each parameter's hand-authored annotation and default by name (a transposition auto-heals; a pure rename keeps its type via positional fallback). Prose — docstrings, section comments, value classes, property blocks — is preserved verbatim. It also asserts **set parity**: every export has a stub and every stubbed symbol is a real export.
+
+**Mechanism preventing drift:** `scripts/check-pyi-generated.sh` runs the generator in `--check` mode in CI (job `pyi-generated`) and fails on any name / order / arity mismatch or missing/extra symbol. Its `--self-test` mode plants a deliberately-transposed parameter and proves the gate rejects it. Both the committed stub and the regenerated candidate pass through the same `ruff format`, so the comparison is formatting-stable — only a genuine signature difference produces a diff. To change a signature: edit the Rust export, run `python3.12 scripts/generate-pyi.py`, and commit the regenerated stub. Never hand-edit the parameter lists.
+
 ### Dataclasses for configuration
 
 Use `@dataclass` for all value types (messages, tool definitions, events). Not Pydantic — keep dependencies minimal. See `.docs/scaffold/python.md` for canonical dataclass definitions (Message, ToolDefinition, etc.).
@@ -218,6 +226,7 @@ maturin build --release --target x86_64-pc-windows-msvc
 |-----|---------|-----------------|---------|
 | ruff (lint+format) | ubuntu-latest | 3.12 | Every PR |
 | mypy | ubuntu-latest | 3.12 | Every PR |
+| pyi-generated (`.pyi` ↔ PyO3 signature parity) | ubuntu-latest | 3.12 | Every PR |
 | pip-audit | ubuntu-latest | 3.12 | Every PR |
 | test | ubuntu-latest, macos-latest | 3.12, 3.13 | Every PR |
 | build-wheel | ubuntu-latest, macos-latest, windows-latest | 3.12+ | Every PR |

@@ -164,6 +164,25 @@ jobs:
       - run: pip install tree-sitter tree-sitter-rust
       - run: python3.12 scripts/check-protocol-sync.py
 
+  # ── Python stub parity ───────────────────────────────────────────────
+  pyi-generated:
+    needs: check-draft
+    name: Python stub signature parity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install tree-sitter tree-sitter-rust ruff
+      # Self-test MUST run first: it plants a deliberately-transposed stub
+      # parameter and proves the gate REJECTS it, before we trust it on the
+      # real tree.
+      - name: Self-test gate
+        run: bash scripts/check-pyi-generated.sh --self-test
+      - name: Real check (.pyi ↔ PyO3 signature parity)
+        run: bash scripts/check-pyi-generated.sh
+
   # ── Construction pattern (ADR-052) ──────────────────────────────────────
   construction-pattern:
     needs: check-draft
