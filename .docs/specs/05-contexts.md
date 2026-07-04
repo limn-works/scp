@@ -1260,6 +1260,8 @@ ScpContextExtension {
 6. For root contexts: `parent_context_ids` MUST be empty. `parent_governance_hash` MUST be `None`.
 7. Any mismatch between the extension contents and the context's metadata is a protocol violation. The SDK MUST reject the MLS group and report the discrepancy.
 
+**Implementation status.** This extension is implemented end-to-end. The creator writes the `0xFF02` extension into the MLS `group_context` at group creation, and KeyPackages declare support for it; it is carried unmodified through the Welcome and subsequent Commits as part of the group's committed cryptographic identity. On join (Welcome processing) and on import/restore, the joiner reads the group's committed extension and verifies the caller-supplied (or snapshot) context parameters against it per the validation rules above before installing any crypto state — a group presenting no `0xFF02` extension (rule 1), or one whose contents diverge from the consented parameters, is rejected. Authority is therefore derived from the cryptographically committed extension, never from unverified caller-supplied parameters.
+
 **Parent awareness.** When Context A's governance receives a child creation proposal that includes Context B as a co-parent, A's governance sees B's context metadata (§5.7) — ceiling, member count, governance model, age, etc. This is the same metadata visible to anyone inspecting a context before joining. A's governance can evaluate whether a relationship with B is acceptable based on this metadata.
 
 ### 5.13.4 Parent Governance Configuration
