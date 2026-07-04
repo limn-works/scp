@@ -245,7 +245,10 @@ export type {
   CachedAttestationEnvelope,
   CachedAttestationEvidence,
   Capability,
+  CapabilityRequirement,
   CapabilityValidation,
+  ChallengeVerification,
+  ChallengeVerificationMethod,
   Checkpoint,
   ContextParams,
   CrossContextInvocationResult,
@@ -280,6 +283,7 @@ export type {
   TrustEvaluation,
   TrustLevel,
   UcanToken,
+  VerificationLevel,
   VerificationMethod,
 } from "./types";
 

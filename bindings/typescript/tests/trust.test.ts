@@ -19,7 +19,20 @@
  */
 
 import { afterEach, describe, expect, it } from "bun:test";
-import type { CachedAttestation, CapabilityValidation } from "../src/types";
+import type {
+  CachedAttestation,
+  CapabilityRequirement,
+  CapabilityValidation,
+  ChallengeVerification,
+  ParticipationProfile,
+  RequireParticipation,
+} from "../src/types";
+import {
+  encodeCapabilityRequirements,
+  encodeChallengeVerifications,
+  encodeParticipationProfile,
+  encodeRequireParticipation,
+} from "../src/types";
 import { createMockNativeScp, mountMockScp } from "./mock-bridge";
 
 /** A fully-passing CapabilityValidation — the all-`true` identity element. */
@@ -439,27 +452,37 @@ describe("scp.checkCapabilityRequirements — capability admission (§7.3.4.4)",
     cleanup = undefined;
   });
 
-  it("passes the JSON envelope through to the native bridge and returns void", async () => {
+  it("serializes typed inputs to the serde wire shape before crossing FFI", async () => {
     const { scp, native } = mountMockScp();
     cleanup = () => scp.shutdown(0);
     native.__stub("checkCapabilityRequirements", () => undefined);
 
-    const requirements = JSON.stringify([
-      { capability: "scp:capability:schema-validation/v1", verification_level: "SelfAttested" },
-    ]);
-    const capabilities = JSON.stringify(["scp:capability:schema-validation/v1"]);
+    const requirements: readonly CapabilityRequirement[] = [
+      { capability: "scp:capability:schema-validation/v1", verificationLevel: "SelfAttested" },
+    ];
+    const capabilities: readonly string[] = ["scp:capability:schema-validation/v1"];
 
     const result = scp.checkCapabilityRequirements(
       "ctx-1",
       "did:dht:subject",
       requirements,
       capabilities,
-      "[]",
+      [],
     );
     expect(result).toBeUndefined();
 
+    // The native bridge receives snake_cased JSON strings, not the typed
+    // objects — the SDK serializes internally (ADR-058).
     const call = native.__lastCall("checkCapabilityRequirements");
-    expect(call?.args).toEqual(["ctx-1", "did:dht:subject", requirements, capabilities, "[]"]);
+    expect(call?.args).toEqual([
+      "ctx-1",
+      "did:dht:subject",
+      JSON.stringify([
+        { capability: "scp:capability:schema-validation/v1", verification_level: "SelfAttested" },
+      ]),
+      JSON.stringify(["scp:capability:schema-validation/v1"]),
+      "[]",
+    ]);
   });
 
   it("propagates a thrown admission error", async () => {
@@ -469,8 +492,224 @@ describe("scp.checkCapabilityRequirements — capability admission (§7.3.4.4)",
       throw new Error("missing required capability");
     });
 
-    expect(() =>
-      scp.checkCapabilityRequirements("ctx-1", "did:dht:subject", "[]", "[]", "[]"),
-    ).toThrow("missing required capability");
+    expect(() => scp.checkCapabilityRequirements("ctx-1", "did:dht:subject", [], [], [])).toThrow(
+      "missing required capability",
+    );
+  });
+});
+
+describe("scp.verifyParticipationRequirements — participation admission (§7.3.2.1)", () => {
+  let cleanup: (() => Promise<void>) | undefined;
+  afterEach(async () => {
+    await cleanup?.();
+    cleanup = undefined;
+  });
+
+  it("serializes typed requirements and profiles to the serde wire shape", async () => {
+    const { scp, native } = mountMockScp();
+    cleanup = () => scp.shutdown(0);
+    native.__stub("verifyParticipationRequirements", () => undefined);
+
+    const requirements: readonly RequireParticipation[] = [
+      {
+        fact: "ToolInvocationCount",
+        threshold: { AtLeast: 100 },
+        maxAgeSecs: 86_400,
+        minContexts: 2,
+      },
+    ];
+    const profiles: readonly ParticipationProfile[] = [makeProfile()];
+
+    const result = scp.verifyParticipationRequirements("did:dht:subject", requirements, profiles);
+    expect(result).toBeUndefined();
+
+    const call = native.__lastCall("verifyParticipationRequirements");
+    expect(call?.args).toEqual([
+      "did:dht:subject",
+      JSON.stringify([
+        {
+          fact: "ToolInvocationCount",
+          threshold: { AtLeast: 100 },
+          max_age_secs: 86_400,
+          min_contexts: 2,
+        },
+      ]),
+      encodeParticipationProfile(profiles),
+    ]);
+  });
+
+  it("propagates a thrown admission error", async () => {
+    const { scp, native } = mountMockScp();
+    cleanup = () => scp.shutdown(0);
+    native.__stub("verifyParticipationRequirements", () => {
+      throw new Error("participation admission verification failed");
+    });
+
+    expect(() => scp.verifyParticipationRequirements("did:dht:subject", [], [])).toThrow(
+      "participation admission verification failed",
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Encoder wire-shape unit tests (ADR-058)
+//
+// These pin the encoders against the exact `serde_json::to_string` shapes the
+// Rust bridge deserializes (crates/scp-ffi/napi/src/trust.rs fixtures): bare
+// variant strings, `{ "<Op>": u64 }` thresholds, snake_case struct fields, and
+// byte arrays as JSON number arrays.
+// ---------------------------------------------------------------------------
+
+/** A structurally-valid `ParticipationProfile` with real 32/32/64 byte arrays. */
+function makeProfile(overrides: Partial<ParticipationProfile> = {}): ParticipationProfile {
+  return {
+    subjectDid: "did:dht:subject",
+    participationDurationSecs: 3_600,
+    governanceActionsAgainst: 0,
+    governanceActionsBy: 1,
+    toolInvocationCount: 150,
+    toolInvocationCountAnchored: false,
+    contextCreationCount: 2,
+    roleProgressionCount: 3,
+    attestationCount: 4,
+    updatedAt: 1_700_000_000,
+    eventLogRoot: Array.from({ length: 32 }, (_, i) => i),
+    signerPublicKey: Array.from({ length: 32 }, (_, i) => i + 100),
+    signature: Array.from({ length: 64 }, () => 7),
+    ...overrides,
+  };
+}
+
+describe("encodeCapabilityRequirements", () => {
+  it("emits `capability` + `verification_level` bare-string fields", () => {
+    const parsed = JSON.parse(
+      encodeCapabilityRequirements([
+        {
+          capability: "scp:capability:schema-validation/v1",
+          verificationLevel: "ChallengeVerified",
+        },
+      ]),
+    );
+    expect(parsed).toEqual([
+      {
+        capability: "scp:capability:schema-validation/v1",
+        verification_level: "ChallengeVerified",
+      },
+    ]);
+  });
+});
+
+describe("encodeRequireParticipation", () => {
+  it("passes `fact`/`threshold` through and snake_cases the scalar fields", () => {
+    const reqs: readonly RequireParticipation[] = [
+      {
+        fact: "GovernanceActionsBy",
+        threshold: { GreaterThan: 5 },
+        maxAgeSecs: 604_800,
+        minContexts: 3,
+      },
+    ];
+    expect(JSON.parse(encodeRequireParticipation(reqs))).toEqual([
+      {
+        fact: "GovernanceActionsBy",
+        threshold: { GreaterThan: 5 },
+        max_age_secs: 604_800,
+        min_contexts: 3,
+      },
+    ]);
+  });
+});
+
+describe("encodeParticipationProfile", () => {
+  it("snake_cases all 13 fields and emits byte arrays as number arrays", () => {
+    const parsed = JSON.parse(encodeParticipationProfile([makeProfile()]));
+    expect(parsed).toEqual([
+      {
+        subject_did: "did:dht:subject",
+        participation_duration_secs: 3_600,
+        governance_actions_against: 0,
+        governance_actions_by: 1,
+        tool_invocation_count: 150,
+        tool_invocation_count_anchored: false,
+        context_creation_count: 2,
+        role_progression_count: 3,
+        attestation_count: 4,
+        updated_at: 1_700_000_000,
+        event_log_root: Array.from({ length: 32 }, (_, i) => i),
+        signer_public_key: Array.from({ length: 32 }, (_, i) => i + 100),
+        signature: Array.from({ length: 64 }, () => 7),
+      },
+    ]);
+    // Byte arrays keep their exact lengths — the Rust side rejects wrong-length
+    // `[u8; 32]` / `[u8; 64]` fields at deserialize time.
+    expect(parsed[0].event_log_root).toHaveLength(32);
+    expect(parsed[0].signer_public_key).toHaveLength(32);
+    expect(parsed[0].signature).toHaveLength(64);
+  });
+});
+
+describe("encodeChallengeVerifications", () => {
+  const base: ChallengeVerification = {
+    verificationId: "bridge-test-challenge",
+    verifierDid: "did:dht:zVerifier",
+    subjectDid: "did:dht:zResponder",
+    capabilityUri: "scp:capability:prompt-injection-resistance/v1",
+    challengeType: "scp:capability:prompt-injection-resistance/v1",
+    verificationMethod: {
+      kind: "ChallengeVerified",
+      challengeType: "scp:capability:prompt-injection-resistance/v1",
+    },
+    passed: true,
+    testCount: 1,
+    passCount: 1,
+    result: true,
+    completedAt: 1_700_000_000,
+    verifiedAt: 1_700_000_000,
+    expiresAt: 4_000_000_000,
+    verifierSignature: Array.from({ length: 64 }, () => 9),
+    score: null,
+    contextId: "ctx-admission",
+  };
+
+  it("emits the full 16-field snake_case record with a tagged verification_method", () => {
+    const parsed = JSON.parse(encodeChallengeVerifications([base]));
+    expect(parsed).toEqual([
+      {
+        verification_id: "bridge-test-challenge",
+        verifier_did: "did:dht:zVerifier",
+        subject_did: "did:dht:zResponder",
+        capability_uri: "scp:capability:prompt-injection-resistance/v1",
+        challenge_type: "scp:capability:prompt-injection-resistance/v1",
+        verification_method: {
+          ChallengeVerified: {
+            challenge_type: "scp:capability:prompt-injection-resistance/v1",
+          },
+        },
+        passed: true,
+        score: null,
+        test_count: 1,
+        pass_count: 1,
+        result: true,
+        completed_at: 1_700_000_000,
+        verified_at: 1_700_000_000,
+        expires_at: 4_000_000_000,
+        context_id: "ctx-admission",
+        verifier_signature: Array.from({ length: 64 }, () => 9),
+      },
+    ]);
+  });
+
+  it("encodes a SelfAttested verification_method as the bare variant string", () => {
+    const parsed = JSON.parse(
+      encodeChallengeVerifications([{ ...base, verificationMethod: { kind: "SelfAttested" } }]),
+    );
+    expect(parsed[0].verification_method).toBe("SelfAttested");
+  });
+
+  it("defaults absent `score`/`contextId` to null", () => {
+    const { score: _s, contextId: _c, ...withoutOptionals } = base;
+    const parsed = JSON.parse(encodeChallengeVerifications([withoutOptionals]));
+    expect(parsed[0].score).toBeNull();
+    expect(parsed[0].context_id).toBeNull();
   });
 });
