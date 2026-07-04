@@ -46,7 +46,7 @@ import type {
  * The NAPI bridge result (`NapiCapabilityValidation`) already exposes the six
  * camelCase booleans, so this is a field-for-field copy that pins the canonical
  * six-field shape in ONE place — the native bridge factory calls it, so a field
- * can never be silently dropped or re-spelled (ADR-057 / spec §7.2.4). The copy
+ * can never be silently dropped or re-spelled (ADR-059 / spec §7.2.4). The copy
  * (rather than returning `raw`) keeps the SDK object's own identity and strips
  * any extra bridge fields.
  */
@@ -361,7 +361,7 @@ export interface Bridge {
    * Read-only, structured counterpart to {@link ucanValidate}: runs the same
    * 11-step ADR-016 pipeline but resolves to a {@link CapabilityValidation}
    * (six per-stage booleans) instead of throwing on a capability outcome, and
-   * never records the token's nonce (spec §7.2.4, ADR-057). It still rejects
+   * never records the token's nonce (spec §7.2.4, ADR-059). It still rejects
    * for malformed FFI inputs (bad token / capability / DID strings).
    *
    * `capability` is OPTIONAL: `null`/`undefined` (or empty) evaluates the

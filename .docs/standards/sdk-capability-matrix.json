@@ -1337,7 +1337,7 @@
           "typescript": true,
           "kotlin": true,
           "swift": true,
-          "notes": "Structured read-only diagnostic (ADR-057, §7.2.4). All four bindings expose an idiomatic wrapper over the typed CapabilityValidationRecord: Python SCP.ucan_evaluate / evaluate_trust, TypeScript SCP.ucanEvaluate / evaluateTrust, Kotlin SCP.ucanEvaluate / evaluateTrust (Scp.kt, types in Trust.kt), Swift SCP.ucanEvaluate / evaluateTrust (Trust.swift). Per the per-SDK-idiom lesson the record SHAPE is identical (only casing differs); the wrappers are language-idiomatic."
+          "notes": "Structured read-only diagnostic (ADR-059, §7.2.4). All four bindings expose an idiomatic wrapper over the typed CapabilityValidationRecord: Python SCP.ucan_evaluate / evaluate_trust, TypeScript SCP.ucanEvaluate / evaluateTrust, Kotlin SCP.ucanEvaluate / evaluateTrust (Scp.kt, types in Trust.kt), Swift SCP.ucanEvaluate / evaluateTrust (Trust.swift). Per the per-SDK-idiom lesson the record SHAPE is identical (only casing differs); the wrappers are language-idiomatic."
         },
         {
           "name": "mint",

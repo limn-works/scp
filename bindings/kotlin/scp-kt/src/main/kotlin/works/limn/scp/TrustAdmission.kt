@@ -1,5 +1,5 @@
 // TrustAdmission.kt — Typed Kotlin SDK shapes for trust-admission inputs
-// (ADR-058, the input-side analog of ADR-057).
+// (ADR-058, the input-side analog of ADR-059).
 //
 // Mirrors `scp_protocol::trust::{admission, challenge, participation}`:
 // VerificationLevel / CapabilityRequirement (§7.3.4.4, SCP-ACR-008),

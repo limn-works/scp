@@ -1,6 +1,6 @@
 # SDK consumers consume structured FFI results — never reverse-engineer outcomes from error prose
 
-**Source:** ADR-057 (`.docs/adrs/phase-2.md`), spec §7.2.4
+**Source:** ADR-059 (`.docs/adrs/phase-2.md`), spec §7.2.4
 (`.docs/specs/07-trust-validation-and-capabilities.md`), the C3c trust/capability
 SDK rebuild (PRD SCP-302).
 
@@ -68,11 +68,11 @@ re-opens the downgrade.
 
 ## Related
 
-- ADR-057 Rejected Alternatives (prose-parsing; overloading the throwing gate).
+- ADR-059 Rejected Alternatives (prose-parsing; overloading the throwing gate).
 - `.docs/lessons/per-sdk-idiom-not-cross-language-dogma.md` — the structured record
   shape is identical across bindings (only field casing differs); the wrapper is
   per-SDK idiomatic.
 - The `evaluate`/`evaluateTrust` wrappers landed in all four SDKs together
-  (Python, TypeScript, Kotlin, Swift), as ADR-057 §Decision-5 mandates: they consume
+  (Python, TypeScript, Kotlin, Swift), as ADR-059 §Decision-5 mandates: they consume
   the existing `CapabilityValidationRecord` the UniFFI bridge already exports — they
   must NOT re-introduce prose-parsing.

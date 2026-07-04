@@ -1798,4 +1798,4 @@ Scope registries, as first-hop resolution points, see resolution metadata for ev
 
 ## ADR-058: Typed SDK Trust-Input Surface
 
-SDK trust-input surfaces take typed objects and serialize internally to the JSON FFI; the FFI bridges stay JSON. The input-side analog of ADR-057 (structured trust outputs). See the standalone [`ADR-058-typed-sdk-trust-input-surface.md`](./ADR-058-typed-sdk-trust-input-surface.md).
+SDK trust-input surfaces take typed objects and serialize internally to the JSON FFI; the FFI bridges stay JSON. The input-side analog of ADR-059 (structured trust outputs). See the standalone [`ADR-058-typed-sdk-trust-input-surface.md`](./ADR-058-typed-sdk-trust-input-surface.md).

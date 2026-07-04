@@ -2103,6 +2103,6 @@ export function createNativeBridge(scp: SCP): Bridge {
     },
   };
   // Single error chokepoint: convert raw FFI errors thrown by any bridge
-  // method into typed ScpError subclasses at exactly one site (ADR-057).
+  // method into typed ScpError subclasses at exactly one site (ADR-059).
   return wrapBridgeErrors(bridge);
 }
