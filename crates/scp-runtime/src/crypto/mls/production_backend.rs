@@ -472,8 +472,28 @@ impl MlsBackend for ProductionMlsBackend {
         credential: &ScpCredential,
         wrapping_pubkey: Option<&[u8; 32]>,
     ) -> Result<GeneratedKeyPackage, MlsError> {
-        let (bundle, signer, provider) =
-            group::generate_key_package_with_wrapping_key(credential, wrapping_pubkey)?;
+        // Every pooled KeyPackage must be joinable into an SCP *context* group,
+        // whose `group_context` carries the `scp_context_params` (`0xFF02`)
+        // extension. OpenMLS rejects (`valn0502`, RFC 9420 §12.1.8.2) an Add
+        // whose leaf does not declare support for every `group_context`
+        // extension present in the group — so the KP leaf MUST advertise BOTH
+        // `0xFF01` (wrapping) and `0xFF02` (context params).
+        // `generate_key_package_with_context_params` declares both and carries
+        // the `0xFF01` wrapping-key leaf extension; it therefore requires a
+        // wrapping key.
+        //
+        // When no wrapping key is available (`None`), the identity has no
+        // published wrapping key (§9.16.1) and so cannot receive sender keys —
+        // such a KP is inherently non-participating and is NOT context-joinable
+        // (it cannot declare `0xFF02` without also carrying the coupled `0xFF01`
+        // leaf via the current scp-mls API). Fall back to the wrapping-key path.
+        // In production the KeyPackageStoreActor sources the wrapping key from
+        // the identity's published wrapping key, so a context-participating
+        // identity always takes the `Some` branch.
+        let (bundle, signer, provider) = match wrapping_pubkey {
+            Some(pk) => group::generate_key_package_with_context_params(credential, pk)?,
+            None => group::generate_key_package_with_wrapping_key(credential, None)?,
+        };
 
         let kp_bytes = bundle.key_package().tls_serialize_detached().map_err(|e| {
             MlsError::KeyPackageGenerationFailed(format!("serializing key package: {e}"))
@@ -1028,5 +1048,114 @@ mod tests {
             }
             other => panic!("expected Application, got {other:?}"),
         }
+    }
+
+    /// Root `scp_context_params` extension fixture.
+    fn sample_context_extension(context_id: &str) -> scp_protocol::context::ScpContextExtension {
+        use scp_primitives::DID;
+        use scp_protocol::context::GovernanceModel;
+        use scp_protocol::context::params::{CeilingPolicy, ContextMode};
+        use scp_protocol::context::roles::{Capability, CapabilityCeiling};
+
+        let governance = GovernanceModel::Threshold {
+            threshold: 2,
+            signers: vec![
+                DID::from("did:dht:z6MkAlice".to_owned()),
+                DID::from("did:dht:z6MkBob".to_owned()),
+            ],
+        };
+        let ceiling = CapabilityCeiling::new([Capability::MessagesRead, Capability::MessagesWrite]);
+        scp_protocol::context::ScpContextExtension::for_root(
+            context_id.to_owned(),
+            ContextMode::Encrypted,
+            &governance,
+            CeilingPolicy::Immutable,
+            &ceiling,
+        )
+        .unwrap()
+    }
+
+    /// End-to-end proof of the wrapping-key / context-params coupling
+    /// (`valn0502`): a `KeyPackage` produced by the **production**
+    /// [`MlsBackend::generate_key_package`] path (which now declares BOTH
+    /// `0xFF01` and `0xFF02`) can be added to, and joined into, an SCP context
+    /// group (whose `group_context` carries the `0xFF02` extension). Without the
+    /// context-params switch in `generate_key_package`, the pooled KP would
+    /// declare only `0xFF01` and `OpenMLS` would reject the Add with
+    /// `AddMemberFailed`. This is the load-bearing coupling test.
+    #[tokio::test]
+    async fn production_key_package_joins_context_group() {
+        let backend = joinable_backend();
+
+        // Creator side: a context group carrying the 0xFF02 extension.
+        let alice_cred = test_credential("alice-ctx");
+        let alice_wrap = [0xA1u8; 32];
+        let ctx_ext = sample_context_extension("ctx:prod-join");
+        let mut alice_group =
+            group::create_group_with_context(&alice_cred, &alice_wrap, &ctx_ext).unwrap();
+
+        // Joiner side: KP via the PRODUCTION generate_key_package path WITH a
+        // wrapping key — now declares 0xFF01 + 0xFF02.
+        let bob_cred = test_credential("bob-ctx");
+        let bob_wrap = [0xB2u8; 32];
+        let bob_gen = backend
+            .generate_key_package(&bob_cred, Some(&bob_wrap))
+            .await
+            .unwrap();
+
+        // The Add SUCCEEDS: bob's leaf declares 0xFF02, satisfying valn0502.
+        let added = backend
+            .add_member_raw(&mut alice_group, &bob_gen.key_package_bytes)
+            .await
+            .expect("production KP must satisfy valn0502 for a context group");
+
+        // And bob joins from the Welcome, recovering the creator-committed
+        // context extension byte-identically from the replicated group_context.
+        let bob_group = backend
+            .join_from_welcome(
+                &added.welcome,
+                bob_gen.signer_state.clone(),
+                &bob_gen.key_package_bytes,
+            )
+            .await
+            .expect("joiner processes the Welcome for the context group");
+
+        assert_eq!(
+            bob_group.group_context_extension().unwrap(),
+            Some(ctx_ext.clone()),
+            "joiner reads the creator-committed context extension"
+        );
+        assert_eq!(
+            alice_group.group_context_extension().unwrap(),
+            bob_group.group_context_extension().unwrap(),
+            "creator and joiner observe identical context extensions"
+        );
+    }
+
+    /// The documented `None`-branch fallback: a production KP generated WITHOUT
+    /// a wrapping key declares only what the wrapping-key path can and is NOT
+    /// context-joinable — a context group rejects it (`valn0502`), matching the
+    /// non-participating identity it represents (§9.16.1). This pins that the
+    /// `None` branch does not silently produce a `0xFF02`-declaring KP.
+    #[tokio::test]
+    async fn production_key_package_without_wrapping_key_rejected_by_context_group() {
+        let backend = ProductionMlsBackend::new();
+
+        let alice_cred = test_credential("alice-ctx-neg");
+        let alice_wrap = [0xA3u8; 32];
+        let ctx_ext = sample_context_extension("ctx:prod-neg");
+        let mut alice_group =
+            group::create_group_with_context(&alice_cred, &alice_wrap, &ctx_ext).unwrap();
+
+        let bob_cred = test_credential("bob-ctx-neg");
+        let bob_gen = backend.generate_key_package(&bob_cred, None).await.unwrap();
+
+        let result = backend
+            .add_member_raw(&mut alice_group, &bob_gen.key_package_bytes)
+            .await;
+        assert!(
+            matches!(result, Err(MlsError::AddMemberFailed(_))),
+            "a wrapping-key-less production KP must be rejected by a context group, got {result:?}"
+        );
     }
 }

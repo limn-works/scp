@@ -753,6 +753,62 @@ impl MlsCryptoProvider {
     /// exists for `context_id`, or [`ContextCreationError::CryptoFailed`]
     /// if MLS group creation fails.
     pub fn create_mls_group(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        // Wrapping-key-only group (no `scp_context_params` `0xFF02`
+        // `group_context` extension). The production creator path uses
+        // [`Self::create_mls_group_with_context`], which binds the context
+        // parameters into `group_context`; this variant is retained for callers
+        // that create a bare group without params.
+        self.create_group_into_slot(context_id, |credential, wrapping_pk| {
+            group::create_group_with_wrapping_key(credential, Some(wrapping_pk))
+        })
+    }
+
+    /// Creates an MLS **context** group whose `group_context` binds the SCP
+    /// context parameters via the `scp_context_params` (`0xFF02`) extension
+    /// (spec §5.13.3, finding FFI-02).
+    ///
+    /// This is the production creator write path: the committed
+    /// [`ScpContextExtension`] is folded into the MLS key schedule and read back
+    /// byte-identically by every joiner. Because the group carries `0xFF02`,
+    /// `OpenMLS` (`valn0502`) rejects any Add whose leaf does not declare `0xFF02`
+    /// support — pooled key packages therefore MUST be generated via the
+    /// context-params path (see
+    /// [`MlsBackend::generate_key_package`](super::backend::MlsBackend::generate_key_package)).
+    ///
+    /// Shares the same slot-reservation and overwrite-refusal invariant as
+    /// [`Self::create_mls_group`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextCreationError::CreationFailed`] if a group already
+    /// exists for `context_id`, or [`ContextCreationError::CryptoFailed`]
+    /// if MLS group creation fails.
+    pub fn create_mls_group_with_context(
+        &self,
+        context_id: &[u8; 32],
+        context_extension: &scp_protocol::context::ScpContextExtension,
+    ) -> Result<(), ContextCreationError> {
+        self.create_group_into_slot(context_id, |credential, wrapping_pk| {
+            group::create_group_with_context(credential, wrapping_pk, context_extension)
+        })
+    }
+
+    /// Shared core for [`Self::create_mls_group`] and
+    /// [`Self::create_mls_group_with_context`].
+    ///
+    /// Atomically reserves the `contexts` slot for `context_id`, then builds the
+    /// [`ScpMlsGroup`] via `build_group` *while holding the vacant guard* and
+    /// installs a fresh [`ContextCryptoState`]. Holding the guard across the
+    /// crypto-init preserves the overwrite-refusal invariant: two concurrent
+    /// creates for the same id cannot both pass the existence check.
+    fn create_group_into_slot<F>(
+        &self,
+        context_id: &[u8; 32],
+        build_group: F,
+    ) -> Result<(), ContextCreationError>
+    where
+        F: FnOnce(&ScpCredential, &[u8; 32]) -> Result<ScpMlsGroup, super::MlsError>,
+    {
         use dashmap::mapref::entry::Entry;
 
         // Reserve the slot up front via `entry`: this is an atomic
@@ -772,7 +828,7 @@ impl MlsCryptoProvider {
         // the create_group call because we copy the bytes into a stack
         // array.
         let wrapping_pk = **self.wrapping_public_key.load();
-        let mls_group = group::create_group_with_wrapping_key(&credential, Some(&wrapping_pk))
+        let mls_group = build_group(&credential, &wrapping_pk)
             .map_err(|e| ContextCreationError::CryptoFailed(e.to_string()))?;
 
         let sender_key = generate_sender_key();
@@ -2574,10 +2630,15 @@ impl MlsCryptoProvider {
             .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
 
         // ADR-049 commit 12c.9f: load wrapping pubkey through `ArcSwap`.
+        // The provider always holds a wrapping key, so this join KP declares
+        // BOTH `0xFF01` (wrapping) and `0xFF02` (context params). The `0xFF02`
+        // declaration is mandatory to be added to an SCP context group whose
+        // `group_context` carries the `scp_context_params` extension: `OpenMLS`
+        // rejects (`valn0502`) an Add whose leaf does not declare it (§5.13.3).
         let wrapping_pk = **self.wrapping_public_key.load();
 
         let (kp_bundle, signer, provider) =
-            super::group::generate_key_package_with_wrapping_key(&credential, Some(&wrapping_pk))
+            super::group::generate_key_package_with_context_params(&credential, &wrapping_pk)
                 .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
 
         let kp_bytes = kp_bundle
@@ -5170,6 +5231,103 @@ mod tests {
             decoded.routing_id,
             vec![0u8; 32],
             "control routing_id must NOT be zeroed — that would break the shared channel"
+        );
+    }
+
+    /// Root `scp_context_params` extension fixture for the provider create path.
+    fn provider_context_extension(context_id: &str) -> scp_protocol::context::ScpContextExtension {
+        use scp_primitives::DID;
+        use scp_protocol::context::GovernanceModel;
+        use scp_protocol::context::params::{CeilingPolicy, ContextMode};
+        use scp_protocol::context::roles::{Capability, CapabilityCeiling};
+
+        let governance = GovernanceModel::Threshold {
+            threshold: 2,
+            signers: vec![
+                DID::from("did:dht:z6MkAlice".to_owned()),
+                DID::from("did:dht:z6MkBob".to_owned()),
+            ],
+        };
+        let ceiling = CapabilityCeiling::new([Capability::MessagesRead, Capability::MessagesWrite]);
+        scp_protocol::context::ScpContextExtension::for_root(
+            context_id.to_owned(),
+            ContextMode::Encrypted,
+            &governance,
+            CeilingPolicy::Immutable,
+            &ceiling,
+        )
+        .unwrap()
+    }
+
+    /// The production creator write path
+    /// ([`MlsCryptoProvider::create_mls_group_with_context`]) commits the
+    /// `scp_context_params` (`0xFF02`) extension into the group's
+    /// `group_context`, byte-identical to the parameters supplied (§5.13.3,
+    /// FFI-02).
+    #[test]
+    fn create_mls_group_with_context_commits_extension() {
+        let provider = make_provider();
+        let ctx_id = make_context_id();
+        let ctx_ext = provider_context_extension("ctx:provider-write");
+
+        provider
+            .create_mls_group_with_context(&ctx_id, &ctx_ext)
+            .unwrap();
+
+        let read_back = provider
+            .with_context(&ctx_id, |state| {
+                state
+                    .mls_group
+                    .group_context_extension()
+                    .map_err(|e| ContextError::CryptoFailed(e.to_string()))
+            })
+            .unwrap();
+        assert_eq!(
+            read_back,
+            Some(ctx_ext),
+            "created context group must carry the committed ScpContextExtension"
+        );
+    }
+
+    /// The wrapping-key-only [`MlsCryptoProvider::create_mls_group`] path leaves
+    /// no `0xFF02` extension on the group (contrast to the context path above).
+    #[test]
+    fn create_mls_group_has_no_context_extension() {
+        let provider = make_provider();
+        let ctx_id = make_context_id();
+
+        provider.create_mls_group(&ctx_id).unwrap();
+
+        let read_back = provider
+            .with_context(&ctx_id, |state| {
+                state
+                    .mls_group
+                    .group_context_extension()
+                    .map_err(|e| ContextError::CryptoFailed(e.to_string()))
+            })
+            .unwrap();
+        assert_eq!(
+            read_back, None,
+            "a wrapping-key-only group must not report a context extension"
+        );
+    }
+
+    /// The context create path shares the overwrite-refusal invariant with
+    /// [`MlsCryptoProvider::create_mls_group`]: a second create for a live id
+    /// fails rather than clobbering the group.
+    #[test]
+    fn create_mls_group_with_context_refuses_overwrite() {
+        let provider = make_provider();
+        let ctx_id = make_context_id();
+        let ctx_ext = provider_context_extension("ctx:provider-overwrite");
+
+        provider
+            .create_mls_group_with_context(&ctx_id, &ctx_ext)
+            .unwrap();
+        let second = provider.create_mls_group_with_context(&ctx_id, &ctx_ext);
+        assert!(
+            matches!(second, Err(ContextCreationError::CreationFailed(_))),
+            "a second create for a live id must be refused, got {second:?}"
         );
     }
 }
