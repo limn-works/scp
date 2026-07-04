@@ -8,10 +8,11 @@
 //! browser backend can wrap an `IndexedDB`/OPFS shim.
 //!
 //! The driver writes a snapshot here after every state-mutating op and reads it
-//! back through [`crate::ScpClient::restore_context`] /
-//! [`crate::ScpClient::restore_all_contexts`] (ADR-057 T2). [`MemoryStorage`] is
-//! the development/test backend; a browser supplies an `IndexedDB`/OPFS-backed
-//! implementation of the same four methods.
+//! all back in [`crate::ScpClient::new`] — the single restore path — when a tab
+//! reopens (ADR-057 T2). [`MemoryStorage`] is an in-memory backend: a valid
+//! production choice for ephemeral (no-persistence) clients, and also convenient
+//! in tests; a browser supplies an `IndexedDB`/OPFS-backed implementation of the
+//! same four methods.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -23,7 +24,7 @@ use std::sync::Mutex;
 ///
 /// Every method is **fallible** — a browser `IndexedDB`/OPFS backend can fail on
 /// any access (quota, transaction abort, corruption), and the driver must be
-/// able to surface that as a `SCP-STORAGE-8001` rather than mistaking a backend
+/// able to surface that as a `SCP-STORAGE-8010` rather than mistaking a backend
 /// fault for "absent" (which would silently drop durable state). `get` returns
 /// `Ok(None)` only for a genuinely-missing key; a backend error is `Err`.
 pub trait Storage: Send + Sync {
@@ -62,11 +63,13 @@ pub trait Storage: Send + Sync {
     fn list_keys(&self, prefix: &str) -> Result<Vec<String>, String>;
 }
 
-/// In-memory [`Storage`] for the MVP driver.
+/// In-memory [`Storage`] for the participant driver.
 ///
-/// Backs the key/value store with a `HashMap` behind a `Mutex`. This is the
-/// development/test storage backend; a browser client supplies an
-/// `IndexedDB`-backed backend in a later slice (ADR-057 component 3).
+/// Backs the key/value store with a `HashMap` behind a `Mutex`. This is a valid
+/// production backend for an ephemeral (no-persistence) client — one that does
+/// not need its contexts to survive a process restart — and is also the
+/// convenient backend in tests. A browser client that DOES need durability
+/// supplies an `IndexedDB`/OPFS-backed backend instead (ADR-057 component 3).
 #[derive(Debug, Default)]
 pub struct MemoryStorage {
     map: Mutex<HashMap<String, Vec<u8>>>,

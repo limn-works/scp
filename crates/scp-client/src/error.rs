@@ -52,9 +52,11 @@ pub enum ClientError {
 
     /// The injected [`Storage`](crate::Storage) backend itself failed — a
     /// `get`/`put`/`delete`/`list_keys` returned an error (quota exhausted,
-    /// transaction aborted, backend unavailable). Surfaced as `SCP-STORAGE-8001`.
+    /// transaction aborted, backend unavailable). Surfaced as `SCP-STORAGE-8010`.
     /// Distinct from a corrupt-but-readable blob: this is an I/O-level fault, not
-    /// a content problem.
+    /// a content problem. A `put` failure raised here from a state-mutating op
+    /// also **poisons** the context (see [`ClientError::ContextPoisoned`]): the
+    /// live state advanced but the durable snapshot did not.
     #[error("storage backend error: {0}")]
     StorageBackend(String),
 
@@ -66,8 +68,16 @@ pub enum ClientError {
     /// in-blob root binds the event log only and is not tamper-resistant, so
     /// whole-blob authenticity rests on the backend's authenticated encryption at
     /// rest. Restore fails closed rather than resuming a context from
-    /// inconsistent state (ADR-057 crash/consistency consequence, §17.5).
-    /// Surfaced as `SCP-STORAGE-8002`.
+    /// inconsistent state (ADR-057 crash/consistency consequence, §17.6).
+    /// Surfaced as `SCP-STORAGE-8011`.
+    ///
+    /// REDACTION SCOPE: when this wraps a `MessagePack` (`rmp_serde`) decode
+    /// failure, the embedded message reports the codec's *type/position*
+    /// diagnostic (e.g. "invalid type … at offset N"), NOT the raw blob bytes —
+    /// so it does not leak persisted key material. This is the honest bound on
+    /// the redaction claim: the guarantee covers the lower-layer `Display` text
+    /// this variant forwards, and `rmp_serde`'s `Display` is structural, not a
+    /// byte dump.
     #[error("corrupt snapshot: {0}")]
     StorageCorrupt(String),
 
@@ -75,7 +85,30 @@ pub enum ClientError {
     /// attempting to restore it (its bound `owner_did` does not match this
     /// client's DID). Restoring another identity's MLS/sender-key state under
     /// this client would be an identity confusion, so it fails closed. Surfaced
-    /// as `SCP-STORAGE-8003`.
+    /// as `SCP-STORAGE-8012`.
     #[error("snapshot identity mismatch: {0}")]
     StorageIdentityMismatch(String),
+
+    /// A context was **poisoned** by a storage write that failed *after* its
+    /// in-memory state had already advanced irreversibly (the MLS ratchet cannot
+    /// be un-advanced, and a new event-log leaf was already appended). Durable
+    /// storage now holds a strictly-older snapshot than the live in-memory state,
+    /// so the two have diverged: continuing to operate the live context would
+    /// hand out ciphertext / event-log leaves that no peer and no reopened tab
+    /// will ever see, permanently forking this member's Merkle root from the
+    /// group's. Every operation that would advance or expose the diverged state
+    /// therefore refuses it. Recovery is by reconstruction: discard this client
+    /// and build a fresh one via [`ScpClient::new`](crate::ScpClient::new) over
+    /// the same storage — restore rebuilds the context from its last *durable*
+    /// snapshot, unpoisoned by construction. Surfaced as `SCP-STORAGE-8013`.
+    #[error(
+        "context '{context_id}' is poisoned: a storage write failed after its \
+         in-memory state advanced irreversibly, so durable and live state have \
+         diverged; discard this client and reconstruct via ScpClient::new to \
+         resume from the last durable snapshot"
+    )]
+    ContextPoisoned {
+        /// The id of the diverged context.
+        context_id: String,
+    },
 }

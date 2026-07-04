@@ -229,102 +229,41 @@ fn restore_of_absent_store_is_a_fresh_client() {
 // Fail-closed restore (construction fails; nothing installed)
 // ---------------------------------------------------------------------------
 
-/// Wraps a storage, replacing the value of any key containing `marker` on read
-/// with `replacement` (simulating a corrupt/truncated blob). Everything else
-/// delegates.
-struct CorruptOnGet {
+/// The read-side fault a [`FaultOnGet`] injects for keys containing its marker.
+enum GetFault {
+    /// Replace the value with fixed bytes (a corrupt / non-MessagePack blob).
+    Corrupt(Vec<u8>),
+    /// Truncate the value to half its length (a torn/truncated blob).
+    Truncate,
+    /// Return a backend I/O error (an access fault, distinct from absence).
+    Fail,
+    /// Report the key absent even though `list_keys` still lists it (a vanished
+    /// key — a concurrent delete / backend inconsistency).
+    Vanish,
+}
+
+/// Wraps a storage, applying `fault` to reads of any key containing `marker`.
+/// Every other access (and every read of a non-marker key) delegates unchanged.
+struct FaultOnGet {
     inner: Arc<dyn Storage>,
     marker: String,
-    replacement: Vec<u8>,
+    fault: GetFault,
 }
 
-impl Storage for CorruptOnGet {
-    fn get(&self, key: &str) -> Result<Option<Vec<u8>>, String> {
-        let value = self.inner.get(key)?;
-        Ok(value.map(|orig| {
-            if key.contains(&self.marker) {
-                self.replacement.clone()
-            } else {
-                orig
-            }
-        }))
-    }
-    fn put(&self, key: &str, value: Vec<u8>) -> Result<(), String> {
-        self.inner.put(key, value)
-    }
-    fn delete(&self, key: &str) -> Result<(), String> {
-        self.inner.delete(key)
-    }
-    fn list_keys(&self, prefix: &str) -> Result<Vec<String>, String> {
-        self.inner.list_keys(prefix)
-    }
-}
-
-/// Wraps a storage, truncating (to half length) the value of any key containing
-/// `marker` on read.
-struct TruncateOnGet {
-    inner: Arc<dyn Storage>,
-    marker: String,
-}
-
-impl Storage for TruncateOnGet {
-    fn get(&self, key: &str) -> Result<Option<Vec<u8>>, String> {
-        let value = self.inner.get(key)?;
-        Ok(value.map(|orig| {
-            if key.contains(&self.marker) {
-                orig[..orig.len() / 2].to_vec()
-            } else {
-                orig
-            }
-        }))
-    }
-    fn put(&self, key: &str, value: Vec<u8>) -> Result<(), String> {
-        self.inner.put(key, value)
-    }
-    fn delete(&self, key: &str) -> Result<(), String> {
-        self.inner.delete(key)
-    }
-    fn list_keys(&self, prefix: &str) -> Result<Vec<String>, String> {
-        self.inner.list_keys(prefix)
-    }
-}
-
-/// Wraps a storage, returning a backend error on read of any key containing
-/// `marker` (an I/O-level fault, distinct from absence).
-struct FailOnGet {
-    inner: Arc<dyn Storage>,
-    marker: String,
-}
-
-impl Storage for FailOnGet {
+impl Storage for FaultOnGet {
     fn get(&self, key: &str) -> Result<Option<Vec<u8>>, String> {
         if key.contains(&self.marker) {
-            return Err("injected backend read failure".to_owned());
-        }
-        self.inner.get(key)
-    }
-    fn put(&self, key: &str, value: Vec<u8>) -> Result<(), String> {
-        self.inner.put(key, value)
-    }
-    fn delete(&self, key: &str) -> Result<(), String> {
-        self.inner.delete(key)
-    }
-    fn list_keys(&self, prefix: &str) -> Result<Vec<String>, String> {
-        self.inner.list_keys(prefix)
-    }
-}
-
-/// Wraps a storage whose `list_keys` still reports a key that `get` reports
-/// absent (a vanished key — a concurrent delete / backend inconsistency).
-struct VanishOnGet {
-    inner: Arc<dyn Storage>,
-    marker: String,
-}
-
-impl Storage for VanishOnGet {
-    fn get(&self, key: &str) -> Result<Option<Vec<u8>>, String> {
-        if key.contains(&self.marker) {
-            return Ok(None);
+            return match &self.fault {
+                GetFault::Fail => Err("injected backend read failure".to_owned()),
+                GetFault::Vanish => Ok(None),
+                GetFault::Corrupt(replacement) => {
+                    Ok(self.inner.get(key)?.map(|_| replacement.clone()))
+                }
+                GetFault::Truncate => Ok(self
+                    .inner
+                    .get(key)?
+                    .map(|orig| orig[..orig.len() / 2].to_vec())),
+            };
         }
         self.inner.get(key)
     }
@@ -402,10 +341,10 @@ fn expect_construction_error(storage: Arc<dyn Storage>) -> ClientError {
 #[test]
 fn corrupt_blob_fails_construction_closed() {
     let underlying = persisted_single_context();
-    let corrupting: Arc<dyn Storage> = Arc::new(CorruptOnGet {
+    let corrupting: Arc<dyn Storage> = Arc::new(FaultOnGet {
         inner: underlying,
         marker: "scp-client/ctx/".to_owned(),
-        replacement: vec![0xFF; 16], // non-empty, non-MessagePack
+        fault: GetFault::Corrupt(vec![0xFF; 16]), // non-empty, non-MessagePack
     });
     assert!(matches!(
         expect_construction_error(corrupting),
@@ -416,9 +355,10 @@ fn corrupt_blob_fails_construction_closed() {
 #[test]
 fn truncated_blob_fails_construction_closed() {
     let underlying = persisted_single_context();
-    let truncating: Arc<dyn Storage> = Arc::new(TruncateOnGet {
+    let truncating: Arc<dyn Storage> = Arc::new(FaultOnGet {
         inner: underlying,
         marker: "scp-client/ctx/".to_owned(),
+        fault: GetFault::Truncate,
     });
     assert!(matches!(
         expect_construction_error(truncating),
@@ -438,9 +378,10 @@ fn owner_mismatch_fails_construction_closed() {
 #[test]
 fn failing_backend_read_fails_construction_closed() {
     let underlying = persisted_single_context();
-    let failing: Arc<dyn Storage> = Arc::new(FailOnGet {
+    let failing: Arc<dyn Storage> = Arc::new(FaultOnGet {
         inner: underlying,
         marker: "scp-client/ctx/".to_owned(),
+        fault: GetFault::Fail,
     });
     assert!(matches!(
         expect_construction_error(failing),
@@ -451,9 +392,10 @@ fn failing_backend_read_fails_construction_closed() {
 #[test]
 fn vanishing_listed_key_fails_construction_closed() {
     let underlying = persisted_single_context();
-    let vanishing: Arc<dyn Storage> = Arc::new(VanishOnGet {
+    let vanishing: Arc<dyn Storage> = Arc::new(FaultOnGet {
         inner: underlying,
         marker: "scp-client/ctx/".to_owned(),
+        fault: GetFault::Vanish,
     });
     assert!(matches!(
         expect_construction_error(vanishing),
@@ -473,10 +415,10 @@ fn one_of_two_corrupt_contexts_fails_whole_construction() {
         b.create_context(ctx_bad).expect("create corrupt");
     }
 
-    let corrupting: Arc<dyn Storage> = Arc::new(CorruptOnGet {
+    let corrupting: Arc<dyn Storage> = Arc::new(FaultOnGet {
         inner: Arc::clone(&underlying),
         marker: ctx_bad.to_owned(),
-        replacement: vec![0xFF; 16],
+        fault: GetFault::Corrupt(vec![0xFF; 16]),
     });
     // The whole construction fails — NEITHER context is installed (there is no
     // half-restored client to observe, so a retry can't hit ContextAlreadyExists).
@@ -487,11 +429,13 @@ fn one_of_two_corrupt_contexts_fails_whole_construction() {
 }
 
 #[test]
-fn failing_put_during_send_is_a_typed_error_with_no_ciphertext() {
+fn failing_put_during_send_poisons_context_and_reconstruction_recovers() {
     let gated = Arc::new(GatedFailOnPut::new(Arc::new(MemoryStorage::new())));
     let storage: Arc<dyn Storage> = Arc::clone(&gated) as Arc<dyn Storage>;
     let mut alice = client_over(ALICE_DID, storage, 1_700_000_000);
     alice.create_context(CTX).expect("alice creates");
+    // The last DURABLE state is the post-create snapshot (one ContextCreated leaf).
+    let durable_root = alice.event_log_root(CTX).expect("post-create root");
 
     // Arm the failure; the send's post-mutation persist `put` now fails.
     gated.arm();
@@ -502,6 +446,137 @@ fn failing_put_during_send_is_a_typed_error_with_no_ciphertext() {
         matches!(result, Err(ClientError::StorageBackend(_))),
         "a failed persist surfaces as a typed StorageBackend error with no SendOutput"
     );
+
+    // The failed persist POISONED the context: the in-memory MLS ratchet advanced
+    // (irreversibly) but the durable snapshot did not, so the two have diverged. A
+    // SECOND send must refuse the diverged context rather than hand out another
+    // ciphertext that would fork Alice's Merkle root from the group's.
+    let second = alice.send_message(CTX, b"after poison");
+    assert!(
+        matches!(second, Err(ClientError::ContextPoisoned { .. })),
+        "a poisoned context rejects further sends with the ContextPoisoned terminal"
+    );
+    // A pure observer reports the poisoned context as absent (it must not hand back
+    // the misleading advanced-but-undurable root).
+    assert!(
+        alice.event_log_root(CTX).is_none(),
+        "a poisoned context reports as absent to pure observers"
+    );
+    drop(alice); // discard the poisoned client, as the error directs.
+
+    // Reconstruction from the SAME storage yields a WORKING, UNPOISONED context at
+    // the last durable snapshot (post-create) — a restored context is unpoisoned by
+    // construction. (`gated` is still armed, but reconstruction only reads.)
+    let alice2 = client_over(
+        ALICE_DID,
+        Arc::clone(&gated) as Arc<dyn Storage>,
+        1_700_000_050,
+    );
+    assert_eq!(
+        alice2.event_log_root(CTX),
+        Some(durable_root),
+        "reconstructed root matches the last durable snapshot, not the lost send"
+    );
+    assert!(
+        alice2.mls_epoch(CTX).is_ok(),
+        "the reconstructed context is unpoisoned and usable (mls_epoch does not raise ContextPoisoned)"
+    );
+    assert_eq!(
+        alice2.event_log_leaf_count(CTX),
+        Some(1),
+        "the reconstructed log holds only the durably-recorded ContextCreated leaf"
+    );
+}
+
+#[test]
+fn context_ids_lists_restored_contexts_sorted() {
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+    {
+        let mut b = client_over(BOB_DID, Arc::clone(&storage), 1_650_000_000);
+        b.create_context("ctx-b-two").expect("create 2");
+        b.create_context("ctx-a-one").expect("create 1");
+        assert_eq!(
+            b.context_ids(),
+            vec!["ctx-a-one".to_owned(), "ctx-b-two".to_owned()],
+            "context_ids is sorted"
+        );
+    }
+    // A reopened tab restores both contexts and can enumerate them (without this,
+    // a fresh client would hold its restored conversations but expose no listing).
+    let b2 = client_over(BOB_DID, Arc::clone(&storage), 1_650_000_050);
+    assert_eq!(
+        b2.context_ids(),
+        vec!["ctx-a-one".to_owned(), "ctx-b-two".to_owned()],
+        "the reopened tab lists both restored contexts"
+    );
+}
+
+#[test]
+fn context_snapshot_under_mismatched_key_fails_construction_closed() {
+    // A snapshot captured for context A, then stored under context B's key (a key
+    // collision / backend bug). Restore enumerates key B but the blob's embedded
+    // id is A → the whole construction fails closed as corrupt/mislabeled.
+    let src: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+    {
+        let mut b = client_over(BOB_DID, Arc::clone(&src), 1_650_000_000);
+        b.create_context("ctx-embedded-A").expect("create A");
+    }
+    let blob = src
+        .get("scp-client/ctx/ctx-embedded-A")
+        .expect("read ok")
+        .expect("blob present");
+    let tampered: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+    tampered
+        .put("scp-client/ctx/ctx-embedded-B", blob)
+        .expect("put under mismatched key");
+    assert!(matches!(
+        expect_construction_error(tampered),
+        ClientError::StorageCorrupt(_)
+    ));
+}
+
+/// Generates and persists Bob's pending-join material for `ctx` into a fresh
+/// store, then returns the raw pending blob (bound to Bob's DID + `ctx`).
+fn bob_pending_blob(ctx: &str) -> Vec<u8> {
+    let store: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+    let mut bob = client_over(BOB_DID, Arc::clone(&store), 1_650_000_000);
+    bob.generate_key_package_for_join(ctx)
+        .expect("bob key package");
+    store
+        .get(&format!("scp-client/pending/{ctx}"))
+        .expect("read ok")
+        .expect("pending blob present")
+}
+
+#[test]
+fn cross_identity_pending_swap_fails_construction_closed() {
+    // A pending blob generated by Bob, dropped into a store a DIFFERENT identity
+    // (Alice) constructs over. The blob is bound to Bob's DID, so Alice must refuse
+    // it — otherwise a swapped blob would drive Alice into a group under Bob's leaf
+    // credential.
+    let blob = bob_pending_blob("ctx-pending-x");
+    let store: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+    store
+        .put("scp-client/pending/ctx-pending-x", blob)
+        .expect("put");
+    let err = expect_construction_error_as(ALICE_DID, store); // Alice, not the owner (Bob)
+    assert!(matches!(err, ClientError::StorageIdentityMismatch(_)));
+}
+
+#[test]
+fn cross_context_pending_swap_fails_construction_closed() {
+    // A pending blob bound to context A, placed under context B's pending key. Even
+    // the correct identity (Bob) must refuse it: the embedded context id disagrees
+    // with the storage-key-derived one, so the key package is not for this context.
+    let blob = bob_pending_blob("ctx-pending-A");
+    let store: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+    store
+        .put("scp-client/pending/ctx-pending-B", blob)
+        .expect("put under mismatched context key");
+    assert!(matches!(
+        expect_construction_error(store), // Bob (correct identity), wrong context key
+        ClientError::StorageCorrupt(_)
+    ));
 }
 
 #[test]

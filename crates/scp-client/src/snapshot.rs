@@ -8,7 +8,9 @@
 //! event stream, the membership set with per-member outgoing sequence counters,
 //! and a §9.9.3 checkpoint (the event-log Merkle root). It is the read/write unit
 //! the driver persists through the injected [`Storage`](crate::Storage) backend
-//! — in-memory in dev, `IndexedDB`/OPFS in a browser (ADR-057 component 3).
+//! — an in-memory backend (a valid production choice for ephemeral, no-persist
+//! clients; also convenient in tests) or `IndexedDB`/OPFS in a browser (ADR-057
+//! component 3).
 //!
 //! # Crash / consistency (ADR-057)
 //!
@@ -369,6 +371,10 @@ impl ContextSnapshot {
             members: std::mem::take(&mut self.members),
             member_sequence_numbers,
             event_buffer,
+            // A restored context IS the last durable state — nothing has diverged,
+            // so it is unpoisoned by construction (the poison flag is in-memory
+            // session state, never serialized).
+            poisoned: false,
         };
 
         // `self` (and any residual key material) is zeroized by `Drop` on return.

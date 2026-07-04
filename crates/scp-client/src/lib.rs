@@ -38,8 +38,10 @@
 //!   enters wasm memory),
 //! - a [`Storage`] — per-context snapshot store the driver writes after every
 //!   mutating op and restores from (by key-prefix enumeration) in
-//!   [`ScpClient::new`] when a tab reopens (ADR-057 T2). [`MemoryStorage`] in dev;
-//!   an `IndexedDB`/OPFS backend in a browser,
+//!   [`ScpClient::new`] when a tab reopens (ADR-057 T2). [`MemoryStorage`] is a
+//!   valid production backend for an ephemeral (no-persistence) client and the
+//!   convenient one in tests; an `IndexedDB`/OPFS backend backs a durable browser
+//!   client,
 //! - a [`scp_clock::Clock`] — the hardened time source for
 //!   committer-assigned event-log leaf timestamps (ADR-057 Prerequisite 1).
 //!

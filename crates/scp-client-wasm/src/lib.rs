@@ -492,6 +492,18 @@ impl WasmScpClient {
     // Queries
     // ----------------------------------------------------------------------
 
+    /// Returns the ids of every context this client holds (live and poisoned
+    /// alike), sorted.
+    ///
+    /// A reopened tab uses this to list the conversations the constructor restored
+    /// from storage — without it there would be no way to enumerate the restored
+    /// contexts.
+    #[must_use]
+    #[wasm_bindgen(getter, js_name = "contextIds")]
+    pub fn context_ids(&self) -> Vec<String> {
+        self.inner.context_ids()
+    }
+
     /// Returns the member DIDs of `context_id`, or `undefined` if not held.
     #[must_use]
     #[wasm_bindgen(js_name = "memberDids")]

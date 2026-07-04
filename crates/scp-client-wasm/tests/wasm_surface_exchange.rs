@@ -311,6 +311,33 @@ fn restore_through_wasm_surface() {
     assert_eq!(events[0].payload(), b"after restore");
 }
 
+#[test]
+fn context_ids_lists_contexts_through_the_surface() {
+    // The surface exposes `contextIds` so a reopened tab can enumerate the
+    // conversations the constructor restored. Here we assert it over live contexts
+    // created through the surface (sorted).
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+    {
+        let mut c = client_over(ALICE_DID, Arc::clone(&storage), 1_700_000_000);
+        c.create_context("ctx-surface-b".to_owned())
+            .expect("create b");
+        c.create_context("ctx-surface-a".to_owned())
+            .expect("create a");
+        assert_eq!(
+            c.context_ids(),
+            vec!["ctx-surface-a".to_owned(), "ctx-surface-b".to_owned()],
+            "the surface lists contexts sorted"
+        );
+    }
+    // A reopened surface client over the same storage restores + lists both.
+    let c2 = client_over(ALICE_DID, Arc::clone(&storage), 1_700_000_050);
+    assert_eq!(
+        c2.context_ids(),
+        vec!["ctx-surface-a".to_owned(), "ctx-surface-b".to_owned()],
+        "the reopened surface client lists both restored contexts"
+    );
+}
+
 // NOTE on error-path coverage: a `#[wasm_bindgen]` method that returns
 // `Err(JsValue)` cannot be exercised on the native host — constructing the
 // `JsValue` aborts (wasm-bindgen imported calls cannot run off-wasm), before any

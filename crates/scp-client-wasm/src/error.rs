@@ -52,15 +52,22 @@ pub const fn error_code(err: &ClientError) -> &'static str {
         ClientError::Driver(_) => "SCP-CTX-2004",
         // The injected Storage backend failed at the I/O level (a
         // get/put/delete/list_keys fault) — distinct from a corrupt-but-readable
-        // blob.
-        ClientError::StorageBackend(_) => "SCP-STORAGE-8001",
+        // blob. NOTE: 8001-8003 are already allocated by scp-kt-android's
+        // AndroidStorage (key-not-found / storage-op-failed / key-derivation-failed);
+        // the browser participant driver's storage codes start at 8010 to avoid
+        // that collision (see `.docs/standards/sdk-common.md`, SCP-STORAGE- band).
+        ClientError::StorageBackend(_) => "SCP-STORAGE-8010",
         // A persisted snapshot could not be trusted for restore: it failed to
         // (de)serialize, carried an unknown format version, embedded a different
         // context id than its key, or failed the §9.9.3 checkpoint compare.
-        ClientError::StorageCorrupt(_) => "SCP-STORAGE-8002",
+        ClientError::StorageCorrupt(_) => "SCP-STORAGE-8011",
         // A persisted snapshot belongs to a different identity than the restoring
         // client (its bound owner DID does not match).
-        ClientError::StorageIdentityMismatch(_) => "SCP-STORAGE-8003",
+        ClientError::StorageIdentityMismatch(_) => "SCP-STORAGE-8012",
+        // A context diverged: a storage write failed after its in-memory state
+        // advanced irreversibly. The caller must reconstruct from the last durable
+        // snapshot.
+        ClientError::ContextPoisoned { .. } => "SCP-STORAGE-8013",
     }
 }
 
@@ -109,20 +116,55 @@ mod tests {
 
     #[test]
     fn storage_variants_map_to_distinct_stable_storage_codes() {
-        // The three storage failure classes each get a distinct, stable code in
-        // the SCP-STORAGE-8000 range (part of the public JS error contract).
+        // The four browser storage failure classes each get a distinct, stable
+        // code in the SCP-STORAGE-8010+ sub-range (part of the public JS error
+        // contract). 8001-8003 are reserved for scp-kt-android; the browser codes
+        // start at 8010 to avoid that collision.
         assert_eq!(
             error_code(&ClientError::StorageBackend("io".to_owned())),
-            "SCP-STORAGE-8001"
+            "SCP-STORAGE-8010"
         );
         assert_eq!(
             error_code(&ClientError::StorageCorrupt("checkpoint".to_owned())),
-            "SCP-STORAGE-8002"
+            "SCP-STORAGE-8011"
         );
         assert_eq!(
             error_code(&ClientError::StorageIdentityMismatch("owner".to_owned())),
-            "SCP-STORAGE-8003"
+            "SCP-STORAGE-8012"
         );
+        assert_eq!(
+            error_code(&ClientError::ContextPoisoned {
+                context_id: "ctx".to_owned()
+            }),
+            "SCP-STORAGE-8013"
+        );
+    }
+
+    #[test]
+    fn browser_storage_codes_avoid_the_android_reserved_low_block() {
+        // Regression guard for the collision this renumber fixed: scp-kt-android's
+        // AndroidStorage owns the low `800x` block, so every browser storage code
+        // must sit at 8010 or above. Checked numerically (no reserved-code string
+        // literal, so the grep guarding this crate against the old codes stays 0).
+        for err in [
+            ClientError::StorageBackend("s".to_owned()),
+            ClientError::StorageCorrupt("s".to_owned()),
+            ClientError::StorageIdentityMismatch("s".to_owned()),
+            ClientError::ContextPoisoned {
+                context_id: "c".to_owned(),
+            },
+        ] {
+            let code = error_code(&err);
+            // A non-storage / malformed code parses to 0 and trips the same assert.
+            let number: u32 = code
+                .strip_prefix("SCP-STORAGE-")
+                .and_then(|n| n.parse().ok())
+                .unwrap_or(0);
+            assert!(
+                number >= 8010,
+                "browser storage code {code} is in the Android-reserved low block (or malformed)"
+            );
+        }
     }
 
     #[test]
@@ -137,6 +179,9 @@ mod tests {
             ClientError::StorageBackend("s".to_owned()),
             ClientError::StorageCorrupt("s".to_owned()),
             ClientError::StorageIdentityMismatch("s".to_owned()),
+            ClientError::ContextPoisoned {
+                context_id: "c".to_owned(),
+            },
         ] {
             assert!(
                 error_code(&err).starts_with("SCP-"),

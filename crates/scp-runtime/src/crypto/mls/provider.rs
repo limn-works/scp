@@ -210,6 +210,39 @@ impl std::fmt::Debug for MlsCryptoSnapshot {
     }
 }
 
+impl MlsCryptoSnapshot {
+    /// Zeroizes every field that holds private key material.
+    ///
+    /// The `export_crypto_state` / `restore_crypto_state` paths call this
+    /// explicitly at their end (belt-and-suspenders); the [`Drop`] impl below is
+    /// the backstop that also fires on an early `?` return, so raw signer /
+    /// sender-key / wrapping-secret / MLS-secret bytes never linger un-zeroized in
+    /// freed memory on ANY path (matches the parity guarantee the `scp-mls` and
+    /// `scp-client` snapshots make via their own `Drop`s).
+    fn zeroize_secrets(&mut self) {
+        self.signer_bytes.zeroize();
+        self.local_sender_key.zeroize();
+        self.wrapping_secret_key.zeroize();
+        for (_, value) in &mut self.mls_storage_entries {
+            value.zeroize();
+        }
+        for (_, key) in &mut self.sender_key_entries {
+            key.zeroize();
+        }
+    }
+}
+
+// SECURITY: zeroize key material on every drop path — including an early `?`
+// return between deserialization and the explicit trailing `zeroize` calls — so
+// private material never lingers in freed memory. No field is ever moved out of a
+// `MlsCryptoSnapshot` (the export/restore paths drain/replace/borrow in place), so
+// this `Drop` does not conflict with a partial move.
+impl Drop for MlsCryptoSnapshot {
+    fn drop(&mut self) {
+        self.zeroize_secrets();
+    }
+}
+
 /// Per-context cryptographic state managed by [`MlsCryptoProvider`].
 struct ContextCryptoState {
     /// The `OpenMLS` group for this context (Encrypted mode only).

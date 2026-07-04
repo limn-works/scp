@@ -19,9 +19,34 @@
 //! `get`/`listKeys`/`set`/`delete` synchronously against that mirror, and
 //! *write-behind*s each mutation to `IndexedDB` asynchronously. A durable-write
 //! failure surfaces on a later call as a thrown exception (mapped to
-//! `SCP-STORAGE-8001` here). Implementing that mirror is the TypeScript SDK's job
+//! `SCP-STORAGE-8010` here). Implementing that mirror is the TypeScript SDK's job
 //! (ADR-057 Slice 3); this crate only defines the synchronous extern contract it
 //! must satisfy.
+//!
+//! ## The write-behind flush MUST be ordered (FIFO) — a crash-safety obligation
+//!
+//! The embedder MUST flush write-behind mutations to the durable store in the
+//! **same order** the driver issued them (FIFO). The driver's crash-consistency
+//! invariants silently depend on it, because they reason about *ordering* between
+//! two writes to different keys:
+//!
+//! - **Join** persists the joined-context snapshot (`put ctx/{id}`) and only THEN
+//!   deletes the consumed pending blob (`delete pending/{id}`). If the durable
+//!   flush could reorder these, a crash could land the delete but lose the put,
+//!   leaving neither a context nor its pending material — a join that can be
+//!   neither used nor resumed.
+//! - **Close** deletes the durable snapshot (`delete ctx/{id}`) *before* dropping
+//!   in-memory state, so a "closed" context is never durably resurrected. If the
+//!   flush could reorder a later unrelated write ahead of this delete, a crash
+//!   could keep the snapshot and lose the later write — resurrecting the closed
+//!   context.
+//!
+//! Losing the un-flushed **tail** of the write-behind queue on a crash is safe —
+//! that is exactly the ADR-057 "lose the last unpersisted mutation" property — but
+//! it is safe *only under FIFO*: the guarantee is that on a crash the durable store
+//! is some **prefix** of the issued mutation sequence, never a reordered subset.
+//! An embedder that flushes out of order breaks these invariants; keeping order is
+//! its obligation, not something this crate can enforce.
 //!
 //! Unlike the deleted bridge, the body is **not** a re-implementation of
 //! storage logic — it forwards to the injected JS object and translates the
@@ -75,7 +100,7 @@ mod wasm_impl {
         /// Returns the value stored under `key`, or `undefined` (mapped to
         /// `None`) if the key is genuinely absent. Throws on storage access
         /// failure — a thrown exception is a backend fault, NOT "absent", and is
-        /// surfaced as `SCP-STORAGE-8001` rather than mistaken for a missing key
+        /// surfaced as `SCP-STORAGE-8010` rather than mistaken for a missing key
         /// (which would silently drop durable state).
         #[wasm_bindgen(method, catch, js_name = "get")]
         fn get(this: &JsStorage, key: &str) -> Result<Option<Vec<u8>>, JsValue>;

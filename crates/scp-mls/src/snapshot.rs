@@ -26,6 +26,19 @@
 //! and [`ScpMlsGroup::deserialize_state`] zeroize the intermediate snapshot
 //! struct's key-bearing fields after use to minimize the window where private
 //! keys sit as structured, easily-extractable data in memory.
+//!
+//! # Relationship to the native runtime snapshot (do NOT unify blindly)
+//!
+//! The native runtime has its own crypto-state snapshot
+//! (`MlsCryptoSnapshot` in `scp-runtime/src/crypto/mls/provider.rs`) with a
+//! **different, flat byte layout** — it folds provider storage, signer, sender
+//! keys, wrapping keypair, and sequence counters into one struct, and its wire
+//! form is pinned by committed legacy KAT fixtures. This crate's snapshots
+//! deliberately keep their own, smaller byte format (group state + signer, or
+//! pending material + signer): they are not byte-compatible with the runtime's,
+//! and are not meant to be. A future refactor MUST NOT "unify" the two formats
+//! on the assumption they are the same shape — they are not, and the runtime's
+//! is fixture-locked.
 
 use openmls::prelude::{GroupId, MlsGroup};
 use openmls_basic_credential::SignatureKeyPair;
@@ -37,56 +50,146 @@ use crate::InMemoryMlsProvider;
 use crate::error::MlsError;
 use crate::group::ScpMlsGroup;
 
-/// A serializable snapshot of an [`ScpMlsGroup`]'s in-memory state.
+/// The shared secret-bearing core of both snapshot types: the `OpenMLS`
+/// `MemoryStorage` dump plus the MLS signer.
 ///
-/// Round-trips through [`ScpMlsGroup::serialize_state`] /
-/// [`ScpMlsGroup::deserialize_state`]. See the module docs for the security
-/// contract (raw private key material; storage-layer encryption-at-rest is
-/// required). Serialized with `MessagePack` (`rmp_serde`), the codebase's
-/// name-tagged, width-/endianness-independent wire form (ADR-057), so a native
-/// and a wasm32 build produce a byte-compatible encoding.
+/// Both [`MlsGroupSnapshot`] and [`PendingJoinSnapshot`] carry exactly this pair
+/// of key-bearing fields and need identical machinery over them — `Debug`
+/// redaction, zeroization, the capture-from-`(provider, signer)` dump, and the
+/// rebuild-into-`(provider, signer)`. Factoring it here means a future
+/// zeroize/Debug/format change is made once and cannot silently miss one of the
+/// two snapshot types.
+///
+/// Serialized with `MessagePack` (`rmp_serde`), the codebase's name-tagged,
+/// width-/endianness-independent wire form (ADR-057), so a native and a wasm32
+/// build produce a byte-compatible encoding.
 #[derive(Serialize, Deserialize)]
-pub struct MlsGroupSnapshot {
-    /// The raw key-value pairs from the `OpenMLS` `MemoryStorage` backing the
-    /// group. Each pair is `(key_bytes, value_bytes)`. Includes MLS epoch
-    /// secrets, HPKE private keys, and the key schedule.
+struct ProviderSignerDump {
+    /// The raw key-value pairs from the `OpenMLS` `MemoryStorage`. Each pair is
+    /// `(key_bytes, value_bytes)`. Includes MLS epoch secrets, HPKE private keys,
+    /// the stored signer, and the key schedule.
     mls_storage_entries: Vec<(Vec<u8>, Vec<u8>)>,
     /// The MLS signer (`SignatureKeyPair`) serialized to bytes via serde.
     /// `SignatureKeyPair` does not derive `Clone` without the `clonable`
     /// feature, so it is serialized separately and stored here.
     signer_bytes: Vec<u8>,
-    /// The MLS group id bytes. Required to call `MlsGroup::load` on restore.
-    group_id: Vec<u8>,
 }
 
-// SECURITY: manual `Debug` redacts all key-bearing fields. `Clone` is
-// intentionally NOT derived — the snapshot holds the Ed25519 signer private key
-// and the MLS epoch/HPKE secrets in `mls_storage_entries`, and must not be
-// freely duplicated.
-impl std::fmt::Debug for MlsGroupSnapshot {
+// SECURITY: manual `Debug` redacts both key-bearing fields. `Clone` is
+// intentionally NOT derived — this holds the Ed25519 signer private key and the
+// MLS epoch/HPKE secrets in `mls_storage_entries`, and must not be freely
+// duplicated.
+impl std::fmt::Debug for ProviderSignerDump {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MlsGroupSnapshot")
+        f.debug_struct("ProviderSignerDump")
             .field(
                 "mls_storage_entries",
                 &format_args!("[{} entries, REDACTED]", self.mls_storage_entries.len()),
             )
             .field("signer_bytes", &"[REDACTED]")
-            .field("group_id", &format_args!("[{} bytes]", self.group_id.len()))
             .finish()
     }
 }
 
-impl MlsGroupSnapshot {
-    /// Zeroizes every field that holds private key material.
+impl ProviderSignerDump {
+    /// Captures a `(provider, signer)` pair into a serializable dump.
     ///
-    /// Called after serialization (export) and after reconstruction (restore) so
-    /// the raw signer bytes and MLS storage secrets do not linger in the
-    /// intermediate struct.
+    /// # Errors
+    ///
+    /// Returns [`MlsError::Snapshot`] if the provider-storage lock is poisoned or
+    /// the signer cannot be serialized.
+    fn capture(
+        provider: &InMemoryMlsProvider,
+        signer: &SignatureKeyPair,
+    ) -> Result<Self, MlsError> {
+        let signer_bytes = rmp_serde::to_vec_named(signer)
+            .map_err(|e| MlsError::Snapshot(format!("signer serialization: {e}")))?;
+        let mls_storage_entries: Vec<(Vec<u8>, Vec<u8>)> = {
+            let values =
+                provider.storage().values.read().map_err(|e| {
+                    MlsError::Snapshot(format!("provider storage lock poisoned: {e}"))
+                })?;
+            values.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+        };
+        Ok(Self {
+            mls_storage_entries,
+            signer_bytes,
+        })
+    }
+
+    /// Rebuilds a fresh in-memory provider (with the persisted storage entries
+    /// re-injected) and deserializes the signer.
+    ///
+    /// Drains `mls_storage_entries` into the new provider and zeroizes the raw
+    /// signer bytes once deserialized, so no residual key material lingers in the
+    /// dump. The caller decides whether to also `store` the signer into the
+    /// provider (a group needs it in the key store; a bare pending pair carries it
+    /// out-of-band to `join_group`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MlsError::Snapshot`] if the provider-storage lock is poisoned or
+    /// the signer cannot be reconstructed.
+    fn rebuild(&mut self) -> Result<(InMemoryMlsProvider, SignatureKeyPair), MlsError> {
+        let provider = InMemoryMlsProvider::default();
+        {
+            let mut values =
+                provider.storage().values.write().map_err(|e| {
+                    MlsError::Snapshot(format!("provider storage lock poisoned: {e}"))
+                })?;
+            for (k, v) in self.mls_storage_entries.drain(..) {
+                values.insert(k, v);
+            }
+        }
+        let signer: SignatureKeyPair = rmp_serde::from_slice(&self.signer_bytes)
+            .map_err(|e| MlsError::Snapshot(format!("signer deserialization: {e}")))?;
+        self.signer_bytes.zeroize();
+        Ok((provider, signer))
+    }
+
+    /// Zeroizes every field that holds private key material.
     fn zeroize_secrets(&mut self) {
         self.signer_bytes.zeroize();
         for (_, value) in &mut self.mls_storage_entries {
             value.zeroize();
         }
+    }
+}
+
+// SECURITY: zeroize the key material on EVERY drop path — including an early `?`
+// return before an explicit `zeroize_secrets` call — so raw signer/MLS-secret
+// bytes never linger in freed memory. This is the sole zeroization backstop for
+// both snapshot types, whose only secret-bearing state is this embedded dump.
+impl Drop for ProviderSignerDump {
+    fn drop(&mut self) {
+        self.zeroize_secrets();
+    }
+}
+
+/// A serializable snapshot of an [`ScpMlsGroup`]'s in-memory state.
+///
+/// Round-trips through [`ScpMlsGroup::serialize_state`] /
+/// [`ScpMlsGroup::deserialize_state`]. See the module docs for the security
+/// contract (raw private key material; storage-layer encryption-at-rest is
+/// required). Its secret material lives entirely in the embedded
+/// [`ProviderSignerDump`], whose [`Drop`] zeroizes on every path.
+#[derive(Serialize, Deserialize)]
+pub(crate) struct MlsGroupSnapshot {
+    /// The provider dump + MLS signer (the shared secret-bearing core).
+    provider_signer: ProviderSignerDump,
+    /// The MLS group id bytes. Required to call `MlsGroup::load` on restore.
+    group_id: Vec<u8>,
+}
+
+// SECURITY: manual `Debug`. The secret fields are inside `provider_signer`, whose
+// own `Debug` redacts them. `Clone` is intentionally NOT derived (holds private
+// keys via the embedded dump).
+impl std::fmt::Debug for MlsGroupSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MlsGroupSnapshot")
+            .field("provider_signer", &self.provider_signer)
+            .field("group_id", &format_args!("[{} bytes]", self.group_id.len()))
+            .finish()
     }
 }
 
@@ -107,28 +210,19 @@ impl ScpMlsGroup {
         let group_id = self.group_id()?.to_vec();
         let signer = self.signer_key_pair()?;
 
-        let signer_bytes = rmp_serde::to_vec_named(signer)
-            .map_err(|e| MlsError::Snapshot(format!("signer serialization: {e}")))?;
-
-        let mls_storage_entries: Vec<(Vec<u8>, Vec<u8>)> = {
-            let values =
-                self.provider().storage().values.read().map_err(|e| {
-                    MlsError::Snapshot(format!("provider storage lock poisoned: {e}"))
-                })?;
-            values.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
-        };
+        let provider_signer = ProviderSignerDump::capture(self.provider(), signer)?;
 
         let mut snapshot = MlsGroupSnapshot {
-            mls_storage_entries,
-            signer_bytes,
+            provider_signer,
             group_id,
         };
 
         let result = rmp_serde::to_vec_named(&snapshot)
             .map_err(|e| MlsError::Snapshot(format!("snapshot serialization: {e}")));
 
-        // SECURITY: zeroize the intermediate key material regardless of outcome.
-        snapshot.zeroize_secrets();
+        // SECURITY: explicitly zeroize the intermediate key material regardless of
+        // outcome (belt-and-suspenders — the embedded dump also zeroizes on drop).
+        snapshot.provider_signer.zeroize_secrets();
 
         result
     }
@@ -151,22 +245,12 @@ impl ScpMlsGroup {
         let mut snapshot: MlsGroupSnapshot = rmp_serde::from_slice(blob)
             .map_err(|e| MlsError::Snapshot(format!("snapshot deserialization: {e}")))?;
 
-        let provider = InMemoryMlsProvider::default();
-        {
-            let mut values =
-                provider.storage().values.write().map_err(|e| {
-                    MlsError::Snapshot(format!("provider storage lock poisoned: {e}"))
-                })?;
-            // Drain so the snapshot no longer holds the MLS storage secrets.
-            for (k, v) in snapshot.mls_storage_entries.drain(..) {
-                values.insert(k, v);
-            }
-        }
+        // Rebuild the provider + signer from the shared dump (drains storage
+        // entries into a fresh provider, deserializes + zeroizes the signer bytes).
+        let (provider, signer) = snapshot.provider_signer.rebuild()?;
 
-        let signer: SignatureKeyPair = rmp_serde::from_slice(&snapshot.signer_bytes)
-            .map_err(|e| MlsError::Snapshot(format!("signer deserialization: {e}")))?;
-        snapshot.signer_bytes.zeroize();
-
+        // A loaded group needs its signer in the provider key store so OpenMLS can
+        // find it.
         signer
             .store(provider.storage())
             .map_err(|e| MlsError::Snapshot(format!("signer store failed: {e}")))?;
@@ -180,15 +264,16 @@ impl ScpMlsGroup {
                 )
             })?;
 
-        // Belt-and-suspenders: any residual key bytes (should already be
-        // drained/zeroized above) are cleared before the snapshot drops.
-        snapshot.zeroize_secrets();
+        // Belt-and-suspenders: clear any residual key bytes before drop (the dump's
+        // own `Drop` is the backstop for every path, including early `?` above).
+        snapshot.provider_signer.zeroize_secrets();
 
         Ok(Self::from_parts(mls_group, provider, signer))
     }
 }
 
-/// A serializable snapshot of unconsumed pending-join material.
+/// A serializable snapshot of unconsumed pending-join material, bound to the
+/// identity and context it belongs to.
 ///
 /// Between generating a `KeyPackage` ([`crate::group::generate_key_package`]) and
 /// processing the resulting Welcome, a prospective member must retain the private
@@ -198,53 +283,55 @@ impl ScpMlsGroup {
 /// `(provider, signer)` pair so an in-browser driver can persist it across a tab
 /// close and resume the join on reopen (ADR-057 T2, §17.9.1).
 ///
+/// # Identity / context binding
+///
+/// The blob also records the `owner_did` (the identity that generated the key
+/// package) and the `context_id` it is for. Without these a swapped pending blob
+/// would silently drive a *different* identity into a group under this leaf
+/// credential, or bind this key package to the wrong context. [`restore_pending_join`]
+/// returns both so the caller (the `scp-client` driver) verifies them against the
+/// restoring identity and the storage-key-derived context id, failing closed.
+///
 /// # Security — this blob contains raw private key material
 ///
 /// Carries the Ed25519 signer private key and the `OpenMLS` `MemoryStorage` dump
-/// (HPKE private keys). It is NOT self-encrypting: the `Storage` backend that
-/// persists it MUST provide encryption at rest (§17.5, ADR-057 tab boundary).
-/// [`serialize_pending_join`] / [`restore_pending_join`] zeroize the intermediate
-/// snapshot's key-bearing fields after use.
+/// (HPKE private keys) via the embedded [`ProviderSignerDump`]. It is NOT
+/// self-encrypting: the `Storage` backend that persists it MUST provide
+/// encryption at rest (§17.5, ADR-057 tab boundary). Its secret material is
+/// zeroized on every path by the dump's [`Drop`].
 #[derive(Serialize, Deserialize)]
-pub struct PendingJoinSnapshot {
-    /// The raw key-value pairs from the `OpenMLS` `MemoryStorage` backing the
-    /// pending key package. Each pair is `(key_bytes, value_bytes)`. Includes the
-    /// stored signer and the key package's HPKE private keys.
-    mls_storage_entries: Vec<(Vec<u8>, Vec<u8>)>,
-    /// The MLS signer (`SignatureKeyPair`) serialized to bytes via serde.
-    signer_bytes: Vec<u8>,
+pub(crate) struct PendingJoinSnapshot {
+    /// The provider dump + MLS signer (the shared secret-bearing core).
+    provider_signer: ProviderSignerDump,
+    /// The DID of the identity that generated this key package. Verified on
+    /// restore against the restoring client's DID.
+    owner_did: String,
+    /// The context id this pending join is for. Verified on restore against the
+    /// storage-key-derived context id.
+    context_id: String,
 }
 
-// SECURITY: manual `Debug` redacts all key-bearing fields. `Clone` is
-// intentionally NOT derived (holds the signer private key + HPKE secrets).
+// SECURITY: manual `Debug`. The secret fields are inside `provider_signer`, whose
+// own `Debug` redacts them; `owner_did` / `context_id` are non-secret bindings.
+// `Clone` is intentionally NOT derived (holds private keys via the embedded dump).
 impl std::fmt::Debug for PendingJoinSnapshot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PendingJoinSnapshot")
-            .field(
-                "mls_storage_entries",
-                &format_args!("[{} entries, REDACTED]", self.mls_storage_entries.len()),
-            )
-            .field("signer_bytes", &"[REDACTED]")
+            .field("provider_signer", &self.provider_signer)
+            .field("owner_did", &self.owner_did)
+            .field("context_id", &self.context_id)
             .finish()
     }
 }
 
-impl PendingJoinSnapshot {
-    /// Zeroizes every field that holds private key material.
-    fn zeroize_secrets(&mut self) {
-        self.signer_bytes.zeroize();
-        for (_, value) in &mut self.mls_storage_entries {
-            value.zeroize();
-        }
-    }
-}
-
-/// Serializes unconsumed pending-join material for out-of-band persistence.
+/// Serializes unconsumed pending-join material for out-of-band persistence,
+/// bound to `owner_did` and `context_id`.
 ///
 /// Captures a bare `(provider, signer)` pair from
 /// [`crate::group::generate_key_package`] into an opaque `MessagePack` blob
-/// (§17.9.1, ADR-057 component 3). The inverse is [`restore_pending_join`]. The
-/// intermediate snapshot's key material is zeroized before returning.
+/// (§17.9.1, ADR-057 component 3), tagged with the owning identity and context so
+/// a swapped blob is detectable on restore. The inverse is [`restore_pending_join`].
+/// The intermediate snapshot's key material is zeroized before returning.
 ///
 /// # Errors
 ///
@@ -253,40 +340,37 @@ impl PendingJoinSnapshot {
 pub fn serialize_pending_join(
     provider: &InMemoryMlsProvider,
     signer: &SignatureKeyPair,
+    owner_did: &str,
+    context_id: &str,
 ) -> Result<Vec<u8>, MlsError> {
-    let signer_bytes = rmp_serde::to_vec_named(signer)
-        .map_err(|e| MlsError::Snapshot(format!("pending signer serialization: {e}")))?;
-
-    let mls_storage_entries: Vec<(Vec<u8>, Vec<u8>)> = {
-        let values = provider
-            .storage()
-            .values
-            .read()
-            .map_err(|e| MlsError::Snapshot(format!("provider storage lock poisoned: {e}")))?;
-        values.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
-    };
+    let provider_signer = ProviderSignerDump::capture(provider, signer)?;
 
     let mut snapshot = PendingJoinSnapshot {
-        mls_storage_entries,
-        signer_bytes,
+        provider_signer,
+        owner_did: owner_did.to_owned(),
+        context_id: context_id.to_owned(),
     };
 
     let result = rmp_serde::to_vec_named(&snapshot)
         .map_err(|e| MlsError::Snapshot(format!("pending snapshot serialization: {e}")));
 
-    // SECURITY: zeroize the intermediate key material regardless of outcome.
-    snapshot.zeroize_secrets();
+    // SECURITY: explicitly zeroize the intermediate key material regardless of
+    // outcome (belt-and-suspenders — the embedded dump also zeroizes on drop).
+    snapshot.provider_signer.zeroize_secrets();
 
     result
 }
 
-/// Reconstructs the `(provider, signer)` pair from a pending-join blob.
+/// Reconstructs the `(provider, signer)` pair plus the recorded `(owner_did,
+/// context_id)` binding from a pending-join blob.
 ///
-/// Produced by [`serialize_pending_join`]; the returned pair is ready to hand to
-/// [`crate::group::join_group_from_bytes`] when the Welcome arrives.
-/// Rebuilds a fresh in-memory provider and re-injects the persisted storage
-/// entries (byte-identical to what `generate_key_package` produced), then
-/// deserializes the signer. The intermediate snapshot's key material is zeroized
+/// Produced by [`serialize_pending_join`]; the returned provider/signer pair is
+/// ready to hand to [`crate::group::join_group_from_bytes`] when the Welcome
+/// arrives, and the returned `owner_did` / `context_id` let the caller verify the
+/// blob was not swapped (identity confusion / mislabeled context) before using
+/// it. Returns `(provider, signer, owner_did, context_id)` in that order. Rebuilds
+/// a fresh in-memory provider and re-injects the persisted storage entries, then
+/// deserializes the signer; the intermediate snapshot's key material is zeroized
 /// before returning.
 ///
 /// # Errors
@@ -295,30 +379,20 @@ pub fn serialize_pending_join(
 /// provider-storage lock is poisoned, or the signer cannot be reconstructed.
 pub fn restore_pending_join(
     blob: &[u8],
-) -> Result<(InMemoryMlsProvider, SignatureKeyPair), MlsError> {
+) -> Result<(InMemoryMlsProvider, SignatureKeyPair, String, String), MlsError> {
     let mut snapshot: PendingJoinSnapshot = rmp_serde::from_slice(blob)
         .map_err(|e| MlsError::Snapshot(format!("pending snapshot deserialization: {e}")))?;
 
-    let provider = InMemoryMlsProvider::default();
-    {
-        let mut values = provider
-            .storage()
-            .values
-            .write()
-            .map_err(|e| MlsError::Snapshot(format!("provider storage lock poisoned: {e}")))?;
-        // Drain so the snapshot no longer holds the HPKE/signer secrets.
-        for (k, v) in snapshot.mls_storage_entries.drain(..) {
-            values.insert(k, v);
-        }
-    }
+    let (provider, signer) = snapshot.provider_signer.rebuild()?;
+    // Move the bindings out (leaving empties) so the returned strings are owned.
+    let owner_did = std::mem::take(&mut snapshot.owner_did);
+    let context_id = std::mem::take(&mut snapshot.context_id);
 
-    let signer: SignatureKeyPair = rmp_serde::from_slice(&snapshot.signer_bytes)
-        .map_err(|e| MlsError::Snapshot(format!("pending signer deserialization: {e}")))?;
+    // Belt-and-suspenders: clear any residual key bytes before drop (the dump's
+    // own `Drop` is the backstop for every path).
+    snapshot.provider_signer.zeroize_secrets();
 
-    // Belt-and-suspenders: clear any residual key bytes before drop.
-    snapshot.zeroize_secrets();
-
-    Ok((provider, signer))
+    Ok((provider, signer, owner_did, context_id))
 }
 
 #[cfg(test)]
@@ -405,9 +479,16 @@ mod tests {
         // material carries the HPKE private keys the Welcome needs.
         let (bundle, bob_signer, bob_provider) = generate_key_package(&credential(BOB)).unwrap();
 
-        // Persist and restore Bob's pending-join material.
-        let blob = serialize_pending_join(&bob_provider, &bob_signer).unwrap();
-        let (restored_provider, restored_signer) = restore_pending_join(&blob).unwrap();
+        // Persist and restore Bob's pending-join material (bound to his DID + ctx).
+        let blob =
+            serialize_pending_join(&bob_provider, &bob_signer, BOB, "ctx-pending-rt").unwrap();
+        let (restored_provider, restored_signer, owner_did, context_id) =
+            restore_pending_join(&blob).unwrap();
+        assert_eq!(owner_did, BOB, "restored blob carries the owning DID");
+        assert_eq!(
+            context_id, "ctx-pending-rt",
+            "restored blob carries the context id"
+        );
 
         // Alice creates a group and adds Bob from his published key package.
         let mut alice = create_group(&credential(ALICE)).unwrap();

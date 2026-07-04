@@ -190,11 +190,59 @@ impl ScpClient {
         )?)
     }
 
-    /// Returns the per-context state, or [`ClientError::UnknownContext`].
+    /// Returns the per-context state for a *live* (non-poisoned) context, or an
+    /// error.
+    ///
+    /// This is the accessor every state-mutating op routes through, so the poison
+    /// guard is enforced in exactly one place: a context whose durable state
+    /// diverged from its in-memory state (a persist failed after the ratchet
+    /// advanced) is refused with [`ClientError::ContextPoisoned`] rather than
+    /// advanced or exposed further. Returns [`ClientError::UnknownContext`] if the
+    /// context is not held. ([`Self::close_context`] deliberately does NOT go
+    /// through here — closing a poisoned context is the safe escape hatch.)
     fn context_mut(&mut self, context_id: &str) -> Result<&mut PerContextState, ClientError> {
-        self.contexts
+        let state = self
+            .contexts
             .get_mut(context_id)
-            .ok_or_else(|| ClientError::UnknownContext(context_id.to_owned()))
+            .ok_or_else(|| ClientError::UnknownContext(context_id.to_owned()))?;
+        if state.poisoned {
+            return Err(ClientError::ContextPoisoned {
+                context_id: context_id.to_owned(),
+            });
+        }
+        Ok(state)
+    }
+
+    /// Returns a shared reference to a *live* (non-poisoned) context, or an error.
+    ///
+    /// The read-path twin of [`Self::context_mut`]: [`ClientError::UnknownContext`]
+    /// if the context is not held, [`ClientError::ContextPoisoned`] if it diverged.
+    /// Used by the `Result`-returning queries so a poisoned context surfaces the
+    /// loud diagnostic.
+    fn context_ref(&self, context_id: &str) -> Result<&PerContextState, ClientError> {
+        let state = self
+            .contexts
+            .get(context_id)
+            .ok_or_else(|| ClientError::UnknownContext(context_id.to_owned()))?;
+        if state.poisoned {
+            return Err(ClientError::ContextPoisoned {
+                context_id: context_id.to_owned(),
+            });
+        }
+        Ok(state)
+    }
+
+    /// Returns a *live* context for an `Option`-returning pure observer: `None`
+    /// for both "not held" and "poisoned".
+    ///
+    /// A poisoned context has no trustworthy state to report to a pure observer —
+    /// its in-memory root / members / counts reflect an advance that never reached
+    /// durable storage — so it reports as absent here rather than handing back
+    /// misleading state. The loud [`ClientError::ContextPoisoned`] diagnostic is
+    /// delivered by every `Result`-returning op (mutating ops, [`Self::mls_epoch`],
+    /// [`Self::local_sender_key_bytes`]) instead.
+    fn live_context_ref(&self, context_id: &str) -> Option<&PerContextState> {
+        self.contexts.get(context_id).filter(|s| !s.poisoned)
     }
 
     // ----------------------------------------------------------------------
@@ -211,7 +259,9 @@ impl ScpClient {
     ///
     /// Returns [`ClientError::ContextAlreadyExists`] if the id is already held,
     /// or an [`ClientError::Mls`] / [`ClientError::EventLog`] if group creation
-    /// or the leaf append fails.
+    /// or the leaf append fails. A [`ClientError::StorageBackend`] from the
+    /// initial persist **poisons** the freshly-created context (its in-memory
+    /// state exists but was never durably recorded); reconstruct via [`Self::new`].
     pub fn create_context(&mut self, context_id: &str) -> Result<(), ClientError> {
         if self.contexts.contains_key(context_id) {
             return Err(ClientError::ContextAlreadyExists(context_id.to_owned()));
@@ -270,7 +320,13 @@ impl ScpClient {
         // returning the public key package, so a crash after handing the KP to the
         // adder but before persistence cannot orphan the join — a reopened tab
         // restores this pending material and can still complete the join.
-        let pending_blob = serialize_pending_join(&provider, &signer)?;
+        //
+        // The blob is bound to BOTH this client's DID and the context id, so a
+        // swapped pending blob cannot silently drive this identity into a group
+        // under another leaf, nor bind this key package to the wrong context. The
+        // bindings are verified on restore ([`Self::restore_from_storage`]).
+        let pending_blob =
+            serialize_pending_join(&provider, &signer, self.signer.did(), context_id)?;
         self.storage
             .put(&Self::pending_key(context_id), pending_blob)
             .map_err(|e| {
@@ -300,8 +356,11 @@ impl ScpClient {
     /// # Errors
     ///
     /// Returns [`ClientError::UnknownContext`] if the context is not held,
-    /// [`ClientError::Codec`] if the key package cannot be deserialized, or
-    /// [`ClientError::Mls`] / [`ClientError::EventLog`] on MLS or leaf failure.
+    /// [`ClientError::ContextPoisoned`] if the context has been poisoned by a
+    /// prior failed persist, [`ClientError::Codec`] if the key package cannot be
+    /// deserialized, or [`ClientError::Mls`] / [`ClientError::EventLog`] on MLS or
+    /// leaf failure. A [`ClientError::StorageBackend`] from the post-add persist
+    /// **poisons** the context.
     pub fn add_member(
         &mut self,
         context_id: &str,
@@ -363,7 +422,10 @@ impl ScpClient {
     /// [`ClientError::Mls`] / [`ClientError::EventLog`] on Welcome processing or
     /// replay failure (a replay stream that does not chain cleanly is rejected),
     /// or [`ClientError::StorageBackend`] if persisting the joined context or
-    /// deleting the consumed pending blob fails.
+    /// deleting the consumed pending blob fails. A persist failure **poisons** the
+    /// freshly-joined context (its state advanced in memory but was not durably
+    /// recorded); reconstruct via [`Self::new`], which restores the still-present
+    /// pending material and lets the join be retried.
     pub fn join_context_encrypted(
         &mut self,
         context_id: &str,
@@ -436,9 +498,13 @@ impl ScpClient {
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError::UnknownContext`] if the context is not held, or
-    /// [`ClientError::Mls`] / [`ClientError::SenderKey`] /
-    /// [`ClientError::EventLog`] on a layer failure.
+    /// Returns [`ClientError::UnknownContext`] if the context is not held,
+    /// [`ClientError::ContextPoisoned`] if the context has been poisoned by a
+    /// prior failed persist, or [`ClientError::Mls`] / [`ClientError::SenderKey`] /
+    /// [`ClientError::EventLog`] on a layer failure. A [`ClientError::StorageBackend`]
+    /// from the post-send persist **poisons** the context: the message's state
+    /// advanced in memory but was not durably recorded, so no `SendOutput` (and
+    /// thus no ciphertext) is returned and the context refuses further ops.
     pub fn send_message(
         &mut self,
         context_id: &str,
@@ -504,13 +570,17 @@ impl ScpClient {
     /// # Errors
     ///
     /// Returns [`ClientError::UnknownContext`] if the context is not held,
+    /// [`ClientError::ContextPoisoned`] if the context has been poisoned by a
+    /// prior failed persist,
     /// [`ClientError::UnsupportedMembershipChange`] if the Commit removes a
     /// member (Slice 2 has no convergent removal-leaf transport). In that case
     /// `scp-mls` rejected the Commit *before* merging, so the context's MLS
     /// epoch, SCP membership, and event log are left mutually consistent
     /// (pre-remove) and the context stays usable — the driver surfaces the gap
     /// rather than half-applying it. Otherwise returns a crypto/leaf error on
-    /// failure.
+    /// failure. A [`ClientError::StorageBackend`] from the post-receive persist
+    /// **poisons** the context (the decrypt already advanced the durable ratchet's
+    /// in-memory counterpart, so the diverged state cannot be safely reused).
     pub fn receive_message(
         &mut self,
         context_id: &str,
@@ -608,9 +678,13 @@ impl ScpClient {
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError::UnknownContext`] if the context is not held, or
-    /// [`ClientError::StorageBackend`] / [`ClientError::Mls`] if persisting the
-    /// emptied buffer fails.
+    /// Returns [`ClientError::UnknownContext`] if the context is not held,
+    /// [`ClientError::ContextPoisoned`] if the context has been poisoned by a
+    /// prior failed persist, or [`ClientError::StorageBackend`] /
+    /// [`ClientError::Mls`] if persisting the emptied buffer fails (which also
+    /// **poisons** the context — the buffer was emptied in memory but the emptied
+    /// state was not durably recorded, so a restore would re-deliver the drained
+    /// messages).
     pub fn drain_events(&mut self, context_id: &str) -> Result<Vec<ContextEvent>, ClientError> {
         let events = self.context_mut(context_id)?.drain_events();
         if !events.is_empty() {
@@ -623,8 +697,13 @@ impl ScpClient {
     ///
     /// Destroying the MLS group releases the group key schedule, after which no
     /// further message in this context can be decrypted by this participant
-    /// (forward secrecy — ADR-057 lose-device-lose-history). Returns
-    /// [`ClientError::UnknownContext`] if the context is not held.
+    /// (forward secrecy — ADR-057 lose-device-lose-history).
+    ///
+    /// Closing is the safe escape hatch for a **poisoned** context (see
+    /// [`ClientError::ContextPoisoned`]): unlike every other op, it does not go
+    /// through the poison guard. It still attempts the durable deletes (which are
+    /// safe and idempotent regardless of poison) and then removes the context from
+    /// memory, so a diverged context can always be discarded and closed cleanly.
     ///
     /// # Errors
     ///
@@ -638,11 +717,20 @@ impl ScpClient {
         }
         // Delete the DURABLE state FIRST — both blobs — before touching in-memory
         // state. Ordering is a forward-secrecy invariant: if a delete fails, the
-        // context is left fully live and the close is retryable, never
-        // in-memory-gone-but-durably-resurrectable (which would let a reopened tab
+        // context is left fully live and the close is retryable, rather than
+        // in-memory-gone-but-still-durably-present (which would let a reopened tab
         // restore a "closed" context). There is no manifest to update: restore
         // enumerates by prefix, so a deleted blob is simply never listed. `delete`
         // is idempotent, so a retry after a partial failure is safe.
+        //
+        // The non-resurrection guarantee is stated against the SYNCHRONOUS store
+        // the driver sees. Under the browser write-behind model (see the
+        // `scp-client-wasm` storage module docs) that store is an in-memory mirror
+        // whose deletes are flushed to durable `IndexedDB` asynchronously; the
+        // guarantee holds against the durable store ONLY if the embedder flushes in
+        // FIFO order, so a crash cannot lose this delete while keeping a later
+        // write. That FIFO flush is the embedder's obligation, not something this
+        // crate can enforce.
         self.storage
             .delete(&Self::ctx_key(context_id))
             .map_err(|e| {
@@ -682,12 +770,13 @@ impl ScpClient {
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError::UnknownContext`] if the context is not held.
+    /// Returns [`ClientError::UnknownContext`] if the context is not held, or
+    /// [`ClientError::ContextPoisoned`] if the context diverged.
     pub fn local_sender_key_bytes(&self, context_id: &str) -> Result<[u8; 32], ClientError> {
-        self.contexts
-            .get(context_id)
-            .map(|s| s.crypto.local_sender_key_bytes())
-            .ok_or_else(|| ClientError::UnknownContext(context_id.to_owned()))
+        Ok(self
+            .context_ref(context_id)?
+            .crypto
+            .local_sender_key_bytes())
     }
 
     /// Installs a peer's sender key for `context_id` (received out-of-band).
@@ -697,7 +786,10 @@ impl ScpClient {
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError::UnknownContext`] if the context is not held.
+    /// Returns [`ClientError::UnknownContext`] if the context is not held,
+    /// [`ClientError::ContextPoisoned`] if the context has been poisoned by a
+    /// prior failed persist, or [`ClientError::StorageBackend`] if persisting the
+    /// updated sender-key store fails (which also **poisons** the context).
     pub fn install_sender_key(
         &mut self,
         context_id: &str,
@@ -718,37 +810,52 @@ impl ScpClient {
     // Queries
     // ----------------------------------------------------------------------
 
-    /// Returns the member DIDs of `context_id`, or `None` if not held.
+    /// Returns the ids of every context this client holds (live and poisoned
+    /// alike), sorted.
+    ///
+    /// A reopened tab uses this to list the conversations restore reconstructed
+    /// from storage — without it, a fresh client would hold its restored contexts
+    /// but expose no way to enumerate them. Poisoned contexts ARE listed (they are
+    /// still held; the caller may need to see them to know a reconstruction is due),
+    /// so this is the one query that does not filter poison.
     #[must_use]
-    pub fn member_dids(&self, context_id: &str) -> Option<Vec<String>> {
-        self.contexts.get(context_id).map(|s| s.members.clone())
+    pub fn context_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self.contexts.keys().cloned().collect();
+        ids.sort();
+        ids
     }
 
-    /// Returns the event-log Merkle root for `context_id`, or `None` if not held.
+    /// Returns the member DIDs of `context_id`, or `None` if not held (or
+    /// poisoned — see [`Self::live_context_ref`]).
+    #[must_use]
+    pub fn member_dids(&self, context_id: &str) -> Option<Vec<String>> {
+        self.live_context_ref(context_id).map(|s| s.members.clone())
+    }
+
+    /// Returns the event-log Merkle root for `context_id`, or `None` if not held
+    /// (or poisoned — see [`Self::live_context_ref`]).
     #[must_use]
     pub fn event_log_root(&self, context_id: &str) -> Option<[u8; 32]> {
-        self.contexts
-            .get(context_id)
+        self.live_context_ref(context_id)
             .map(PerContextState::event_log_root)
     }
 
-    /// Returns the event-log leaf count for `context_id`, or `None` if not held.
+    /// Returns the event-log leaf count for `context_id`, or `None` if not held
+    /// (or poisoned — see [`Self::live_context_ref`]).
     #[must_use]
     pub fn event_log_leaf_count(&self, context_id: &str) -> Option<u64> {
-        self.contexts
-            .get(context_id)
+        self.live_context_ref(context_id)
             .map(PerContextState::event_log_leaf_count)
     }
 
     /// Returns the event-log leaf hashes (sequence order) for `context_id`, or
-    /// `None` if not held.
+    /// `None` if not held (or poisoned — see [`Self::live_context_ref`]).
     ///
     /// Used to assert the §9.9.3 per-leaf convergence property: two members'
     /// leaves for the same logical event are byte-identical.
     #[must_use]
     pub fn event_log_leaf_hashes(&self, context_id: &str) -> Option<Vec<[u8; 32]>> {
-        self.contexts
-            .get(context_id)
+        self.live_context_ref(context_id)
             .map(PerContextState::event_log_leaf_hashes)
     }
 
@@ -761,13 +868,11 @@ impl ScpClient {
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError::UnknownContext`] if the context is not held, or
+    /// Returns [`ClientError::UnknownContext`] if the context is not held,
+    /// [`ClientError::ContextPoisoned`] if the context diverged, or
     /// [`ClientError::Mls`] if the MLS group has been destroyed.
     pub fn mls_epoch(&self, context_id: &str) -> Result<u64, ClientError> {
-        let state = self
-            .contexts
-            .get(context_id)
-            .ok_or_else(|| ClientError::UnknownContext(context_id.to_owned()))?;
+        let state = self.context_ref(context_id)?;
         Ok(state.crypto.mls_group.epoch()?)
     }
 
@@ -796,22 +901,51 @@ impl ScpClient {
         format!("{}{context_id}", Self::PENDING_KEY_PREFIX)
     }
 
-    /// Writes `context_id`'s current state to storage as a single snapshot blob.
+    /// Writes `context_id`'s current state to storage as a single snapshot blob,
+    /// **poisoning the context** if the write fails.
     ///
-    /// Called at the end of every state-mutating op. The blob is one atomic `put`,
-    /// so a crash leaves either the last committed snapshot or the prior one —
-    /// never a torn intra-context state (ADR-057 crash-consistency). There is no
+    /// Called at the end of every state-mutating op — *after* the in-memory state
+    /// has already advanced irreversibly (the MLS ratchet cannot be un-advanced,
+    /// and the op has already appended its event-log leaf). The blob is one atomic
+    /// `put`, so a crash leaves either the last committed snapshot or the prior one
+    /// — never a torn intra-context state (ADR-057 crash-consistency). There is no
     /// manifest to keep in step: restore enumerates by key prefix.
+    ///
+    /// If persistence fails on ANY step (serialization or the backend write), the
+    /// durable snapshot is now strictly older than the live in-memory state: the
+    /// two have diverged. This method sets the context's poison flag before
+    /// propagating the error, so every subsequent op refuses the diverged context
+    /// with [`ClientError::ContextPoisoned`] rather than handing out ciphertext /
+    /// leaves no peer or reopened tab will ever see. The caller recovers by
+    /// reconstructing via [`Self::new`] from the last durable snapshot.
     ///
     /// # Errors
     ///
     /// Returns [`ClientError::UnknownContext`] if the context is not held,
     /// [`ClientError::Mls`] if the MLS state cannot be serialized,
     /// [`ClientError::StorageCorrupt`] if the snapshot cannot be serialized, or
-    /// [`ClientError::StorageBackend`] if the backend write fails.
-    fn persist_context(&self, context_id: &str) -> Result<(), ClientError> {
-        // Build and serialize inside a scope so the structured snapshot (with its
-        // key material) is zeroized on drop before the blob leaves for storage.
+    /// [`ClientError::StorageBackend`] if the backend write fails. Every failure
+    /// but `UnknownContext` poisons the context.
+    fn persist_context(&mut self, context_id: &str) -> Result<(), ClientError> {
+        let outcome = self.build_and_put(context_id);
+        if outcome.is_err() {
+            // The persist failed AFTER the in-memory ratchet/leaf advanced.
+            // Durable and live state have diverged — poison the context so no
+            // further op can advance or expose the fork. (`UnknownContext` cannot
+            // reach here for a real context, but the guard is harmless if it did.)
+            if let Some(state) = self.contexts.get_mut(context_id) {
+                state.poisoned = true;
+            }
+        }
+        outcome
+    }
+
+    /// Serializes `context_id`'s current state and writes the single snapshot
+    /// blob. The build/serialize happens inside a scope so the structured snapshot
+    /// (with its key material) is zeroized on drop before the blob leaves for
+    /// storage. Pure "do the write" half of [`Self::persist_context`]; the poison
+    /// bookkeeping lives in the caller.
+    fn build_and_put(&self, context_id: &str) -> Result<(), ClientError> {
         let blob = {
             let state = self
                 .contexts
@@ -883,7 +1017,26 @@ impl ScpClient {
                 continue;
             }
             let blob = self.read_listed_key(&key)?;
-            let (provider, signer) = restore_pending_join(&blob)?;
+            // `restore_pending_join` returns the identity + context the blob was
+            // bound to at capture; verify BOTH here, fail closed. A swapped blob
+            // that belongs to another identity is an identity confusion
+            // (StorageIdentityMismatch); one whose embedded context id disagrees
+            // with its storage key is a corrupt/mislabeled blob (StorageCorrupt).
+            let (provider, signer, bound_owner_did, bound_context_id) =
+                restore_pending_join(&blob)?;
+            if bound_owner_did != self.signer.did() {
+                return Err(ClientError::StorageIdentityMismatch(format!(
+                    "pending join under key '{key}' is bound to identity \
+                     '{bound_owner_did}', not this client '{}'",
+                    self.signer.did()
+                )));
+            }
+            if bound_context_id != context_id {
+                return Err(ClientError::StorageCorrupt(format!(
+                    "pending join under key '{key}' carries a different context id \
+                     '{bound_context_id}'"
+                )));
+            }
             staged_pending.push((context_id, PendingJoin { signer, provider }));
         }
 
