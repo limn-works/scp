@@ -415,6 +415,24 @@ pub enum KeyPackageCommand {
         /// Oneshot reply: `(ReservationId, public KP bytes)` on success.
         reply: oneshot::Sender<Result<(ReservationId, Vec<u8>), ContextError>>,
     },
+    /// Atomically reserve the FIRST pooled KP: replenish-if-empty, pick the
+    /// first pooled ref, and reserve it — ALL inside one command handler.
+    ///
+    /// This is the reserve entrypoint the supervisor's `reserve_key_package`
+    /// uses. Folding replenish + list-first-pooled + reserve into a single
+    /// command closes the concurrency gap of composing them as three separate
+    /// round-trips: because the actor owns `pool`/`reserved` and handlers run
+    /// serialized on the mailbox loop, no interleaved command can observe the
+    /// same pooled KP between the pick and the reserve, so two concurrent
+    /// same-identity reserves get DISTINCT KeyPackages instead of the second
+    /// spuriously failing `InvalidState("already reserved")` on a ref the first
+    /// just took. Returns a fresh `ReservationId` plus the KP's PUBLIC bytes,
+    /// exactly like [`Self::Reserve`]; the private signer-state never leaves the
+    /// actor.
+    ReserveAny {
+        /// Oneshot reply: `(ReservationId, public KP bytes)` on success.
+        reply: oneshot::Sender<Result<(ReservationId, Vec<u8>), ContextError>>,
+    },
     // NOTE: `kp_ref: KpRef` / `reservation_id: ReservationId` are distinct
     // newtypes — a caller cannot transpose one for the other.
     /// Confirm-consume a reservation by FUSING the join into the actor. The
@@ -1020,6 +1038,13 @@ impl KeyPackageStoreActor {
                 // successful reserve drops the pool.
                 self.maybe_replenish().await;
             }
+            KeyPackageCommand::ReserveAny { reply } => {
+                let result = self.handle_reserve_first_pooled().await;
+                let _ = reply.send(result);
+                // Auto-replenish (and sweep expired reservations) after a
+                // successful reserve drops the pool.
+                self.maybe_replenish().await;
+            }
             KeyPackageCommand::ConfirmConsume {
                 reservation_id,
                 welcome_bytes,
@@ -1159,6 +1184,41 @@ impl KeyPackageStoreActor {
         }
 
         Ok((reservation_id, public_bytes))
+    }
+
+    /// Atomically reserve the FIRST pooled KP: replenish-if-empty, pick the
+    /// first pooled ref, and reserve it — all within this one handler.
+    ///
+    /// This is the atomic counterpart to composing `Replenish` → `ListPooled`
+    /// → `Reserve` as three separate mailbox round-trips. Because handlers run
+    /// serialized on the actor's single mailbox loop and this handler both
+    /// picks the ref AND reserves it before yielding, two concurrent
+    /// same-identity reserves can never observe the same pooled KP: the first
+    /// call's [`Self::handle_reserve`] has already moved the KP out of `pool`
+    /// into `reserved` before the second call's handler runs, so the second
+    /// picks the NEXT pooled ref and both succeed with DISTINCT reservations.
+    ///
+    /// The durable-anchor write + rollback semantics are inherited unchanged
+    /// from [`Self::handle_reserve`], which this delegates to.
+    async fn handle_reserve_first_pooled(
+        &mut self,
+    ) -> Result<(ReservationId, Vec<u8>), ContextError> {
+        // Replenish first if the pool is empty so there is a KP to reserve. A
+        // deterministic barrier (not a sleep): the same explicit fill the
+        // former supervisor-side composite used, now folded in. Propagate a
+        // replenish error only when it leaves us with nothing to reserve.
+        if self.pool.is_empty() {
+            self.replenish_to_min().await?;
+        }
+        let Some(first) = self.pool.first() else {
+            return Err(ContextError::CreationFailed(
+                "reserve_first_pooled: the KeyPackage pool is empty after a \
+                 replenish — cannot reserve a KP for the join"
+                    .to_owned(),
+            ));
+        };
+        let kp_ref = first.kp_ref.clone();
+        self.handle_reserve(kp_ref).await
     }
 
     /// Roll back an in-memory reservation on a Class-S persist failure:

@@ -10365,9 +10365,19 @@ impl Supervisor {
     /// Bare-`DID` bootstrap entrypoint — the reserve half of the join-side peer
     /// of [`Self::create_context`]. Local-identity custody is enforced at the
     /// FFI bridge layer, not here (the same trust model as `create_context`).
-    /// Get-or-spawns this identity's `KeyPackageStoreActor`, runs a `Replenish`
-    /// barrier so the pool is non-empty, lists the pooled KPs, and reserves the
-    /// first one.
+    /// Get-or-spawns this identity's `KeyPackageStoreActor` and issues a SINGLE
+    /// atomic [`KeyPackageCommand::ReserveAny`] — replenish-if-empty, pick the
+    /// first pooled ref, and reserve it, all inside one command handler.
+    ///
+    /// Folding the reservation into one command (rather than composing
+    /// `Replenish` → `ListPooled` → `Reserve` as three separate mailbox
+    /// round-trips) closes a concurrency gap: two concurrent same-identity
+    /// reserves that each `ListPooled` the same pool would both pick the same
+    /// `kp_ref`, and the second `Reserve` would spuriously fail
+    /// `InvalidState("already reserved")` even though distinct KPs were
+    /// available. Because the actor owns `pool`/`reserved` and handlers run
+    /// serialized on its mailbox loop, the atomic command guarantees the two
+    /// reserves take DISTINCT KeyPackages.
     ///
     /// # Errors
     ///
@@ -10378,7 +10388,7 @@ impl Supervisor {
     /// - [`ContextError::ActorBusy`](scp_protocol::context::ContextError::ActorBusy)
     ///   if the KeyPackage actor's mailbox is full or its reply channel drops.
     /// - [`ContextError::CreationFailed`] if the pool is still empty after a
-    ///   successful `Replenish` (no KP available to reserve).
+    ///   replenish (no KP available to reserve).
     pub async fn reserve_key_package(
         self: &Arc<Self>,
         owning_did: DID,
@@ -10392,24 +10402,8 @@ impl Supervisor {
         use crate::context::supervisor::key_package_actor::KeyPackageCommand;
 
         let store = self.key_package_store_for(&owning_did).await?;
-        // Deterministic replenish barrier (not a sleep): the store's startup
-        // replenish fills the pool before any command is served, and this
-        // explicit `Replenish` proves the pool is non-empty before the list.
         store
-            .send(|reply| KeyPackageCommand::Replenish { reply })
-            .await?;
-        let pooled = store
-            .send(|reply| KeyPackageCommand::ListPooled { reply })
-            .await?;
-        let (kp_ref, _public) = pooled.into_iter().next().ok_or_else(|| {
-            ContextError::CreationFailed(
-                "reserve_key_package: the KeyPackage pool is empty after a successful \
-                 replenish — cannot reserve a KP for the join"
-                    .to_owned(),
-            )
-        })?;
-        store
-            .send(|reply| KeyPackageCommand::Reserve { kp_ref, reply })
+            .send(|reply| KeyPackageCommand::ReserveAny { reply })
             .await
     }
 

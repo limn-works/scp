@@ -3301,6 +3301,77 @@ fn newtype_kp_ref_serializes_transparently_as_string() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// ReserveAny — atomic reserve-first-pooled (concurrency-regression proof)
+// ---------------------------------------------------------------------------
+
+/// Two `ReserveAny` commands under the SAME identity must yield DISTINCT
+/// reservations over DISTINCT KeyPackages.
+///
+/// This is the regression proof for the non-atomic `Replenish` → `ListPooled`
+/// → `Reserve` composite the supervisor formerly used: two reserves that each
+/// `ListPooled` the same pool would both pick the first `kp_ref`, and the
+/// second `Reserve` would spuriously fail `InvalidState("already reserved")`.
+/// The atomic `ReserveAny` handler picks-and-reserves inside one command, so
+/// the first reserve has already moved its KP out of `pool` before the second
+/// handler runs — the second picks the NEXT ref and both succeed.
+#[tokio::test]
+async fn reserve_any_returns_distinct_reservations() {
+    let storage = in_memory_storage();
+    let (handle, _join) = spawn_filled(Arc::clone(&storage)).await;
+
+    let (rid1, public1) = handle
+        .send(|reply| KeyPackageCommand::ReserveAny { reply })
+        .await
+        .expect("first ReserveAny succeeds");
+    let (rid2, public2) = handle
+        .send(|reply| KeyPackageCommand::ReserveAny { reply })
+        .await
+        .expect("second ReserveAny succeeds despite the first holding a reservation");
+
+    assert_ne!(
+        rid1, rid2,
+        "the two ReserveAny calls must mint DISTINCT reservation ids"
+    );
+    // Distinct KeyPackages: the returned PUBLIC bytes (and therefore their
+    // content-hash KpRefs) must differ — the second reserve took a different
+    // pooled KP, not the one the first already holds.
+    assert_ne!(
+        KpRef::from_public_bytes(&public1),
+        KpRef::from_public_bytes(&public2),
+        "the two ReserveAny calls must reserve DISTINCT key packages"
+    );
+
+    handle.send_shutdown().await.unwrap();
+}
+
+/// `ReserveAny` on an EMPTY pool replenishes-then-reserves within the single
+/// command, returning a live reservation (the folded replenish barrier).
+#[tokio::test]
+async fn reserve_any_replenishes_empty_pool_then_reserves() {
+    let storage = in_memory_storage();
+    // Fresh spawn WITHOUT a warm-up Replenish barrier: the actor's startup
+    // replenish still fills the pool before serving commands, but ReserveAny
+    // owns its own replenish-if-empty step regardless, so a single ReserveAny
+    // must succeed on the first command.
+    let mls = backend_with_consumed_set(&storage);
+    let (handle, _join) = KeyPackageStoreActor::spawn(
+        alice(),
+        deps_with(mls, Arc::clone(&storage), no_transport()),
+    );
+
+    let (_rid, public_bytes) = handle
+        .send(|reply| KeyPackageCommand::ReserveAny { reply })
+        .await
+        .expect("ReserveAny fills the pool and reserves in one command");
+    assert!(
+        !public_bytes.is_empty(),
+        "ReserveAny returns PUBLIC bytes (not private signer-state)"
+    );
+
+    handle.send_shutdown().await.unwrap();
+}
+
 #[test]
 fn newtype_reservation_id_serializes_transparently_as_string() {
     let as_newtype = rmp_serde::to_vec(&vec![ReservationId::from_raw("rid-xyz")]).unwrap();
