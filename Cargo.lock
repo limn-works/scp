@@ -5086,14 +5086,17 @@ dependencies = [
  "getrandom 0.3.4",
  "getrandom 0.4.2",
  "openmls",
+ "rmp-serde",
  "scp-clock",
  "scp-did",
  "scp-event-log",
  "scp-mls",
  "scp-protocol",
+ "serde",
  "thiserror 2.0.18",
  "tls_codec",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -5431,6 +5434,7 @@ dependencies = [
  "tracing",
  "uuid",
  "x25519-dalek 2.0.1",
+ "zeroize",
 ]
 
 [[package]]

@@ -110,4 +110,13 @@ pub enum MlsError {
     /// single-use model).
     #[error("key package replay: init key already consumed")]
     KeyPackageReplay,
+
+    /// Serializing or deserializing an [`crate::ScpMlsGroup`] state snapshot
+    /// failed (the out-of-band persistence path used by the in-browser driver
+    /// to snapshot the in-memory MLS provider to durable storage — ADR-057
+    /// component 3, §17.9.1). Covers a `MessagePack` (de)serialization failure, a
+    /// poisoned provider-storage lock, or a group that could not be reloaded
+    /// from the restored provider (`MlsGroup::load` returned `None`).
+    #[error("MLS state snapshot error: {0}")]
+    Snapshot(String),
 }

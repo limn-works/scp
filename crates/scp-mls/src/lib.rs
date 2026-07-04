@@ -42,6 +42,7 @@ pub mod error;
 pub mod group;
 pub mod key_package;
 pub mod ratchet;
+pub mod snapshot;
 pub mod wrapping_extension;
 
 // Re-export primary public API types for convenience.
@@ -59,6 +60,9 @@ pub use group::{
     generate_key_package_with_wrapping_key, join_group, key_package_in_did, remove_member,
 };
 pub use openmls_basic_credential::SignatureKeyPair;
+pub use snapshot::{
+    MlsGroupSnapshot, PendingJoinSnapshot, restore_pending_join, serialize_pending_join,
+};
 pub use wrapping_extension::{
     SCP_WRAPPING_KEY_EXTENSION_TYPE, extract_member_wrapping_key, extract_own_wrapping_key,
     extract_wrapping_key, find_leaf_index_by_did, leaf_node_params_with_wrapping_key,
