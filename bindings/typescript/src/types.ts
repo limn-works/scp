@@ -810,7 +810,7 @@ export interface EventClaim {
  * Layer 1 of the trust model: protocol-enforcement results (mechanical,
  * pass/fail). Each field is one stage of the 11-step ADR-016 UCAN
  * validation pipeline, surfaced by the read-only `ucanEvaluate` diagnostic
- * (spec §7.2.4, ADR-057 Decision 3).
+ * (spec §7.2.4, ADR-059 Decision 3).
  *
  * The six booleans cross the FFI already camelCased (the NAPI
  * `NapiCapabilityValidation` `#[napi(object)]`), so the SDK consumes them

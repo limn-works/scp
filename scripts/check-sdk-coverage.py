@@ -394,7 +394,7 @@ ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
     ("UCAN", "delegate"): {
         "typescript": ["delegateUcan"],
     },
-    # UCAN.evaluate -- the structured read-only diagnostic (ADR-057, §7.2.4).
+    # UCAN.evaluate -- the structured read-only diagnostic (ADR-059, §7.2.4).
     # All four bindings expose an idiomatic wrapper over the typed
     # CapabilityValidationRecord and consume it inside their evaluate_trust /
     # evaluateTrust trust-signal wrapper (Python SCP.ucan_evaluate, TypeScript

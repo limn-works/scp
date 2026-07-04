@@ -2071,7 +2071,7 @@ export class SCP {
    * Runs the same 11-step ADR-016 validation pipeline but, instead of
    * throwing at the first failing stage, resolves to a
    * {@link CapabilityValidation} of six per-stage booleans (spec §7.2.4,
-   * ADR-057). The probe never records the token's nonce, so calling it does
+   * ADR-059). The probe never records the token's nonce, so calling it does
    * not consume the token. Capability/signature/expiry outcomes are reported
    * via the booleans; only malformed FFI inputs (bad handle / token /
    * capability) reject.
@@ -2115,7 +2115,7 @@ export class SCP {
   ): Promise<CapabilityValidation> {
     // Route the native dispatch through the single error chokepoint
     // (`mapBridgeError`) so a raw NAPI throw or rejection surfaces as a
-    // typed `ScpError` keyed on its `[SCP-CAT-NNNN]` code, per ADR-057
+    // typed `ScpError` keyed on its `[SCP-CAT-NNNN]` code, per ADR-059
     // Decision 4 (error typing routes through one mapping site, not per-call
     // prose inspection). `mapBridgeError` is idempotent on already-typed errors.
     let raw: CapabilityValidation;
@@ -2503,7 +2503,7 @@ export class SCP {
   /**
    * Evaluate the trustworthiness of a participant within a context.
    *
-   * Composes the structured trust model (spec §7.2.4, ADR-057). The protocol
+   * Composes the structured trust model (spec §7.2.4, ADR-059). The protocol
    * provides the data, not the verdict — the caller decides what to do with it:
    *
    * - **Layer 1 — protocol enforcement.** Each supplied capability token is run
@@ -2579,7 +2579,7 @@ export class SCP {
         // revocation, time bounds — not whether it grants one specific
         // capability. Passing a concrete URI (or the old `"*"` sentinel, which
         // the real bridge rejects) would wrongly impose an invoked-capability
-        // grant-match the caller never asked for. See ADR-057 / spec §7.2.4:
+        // grant-match the caller never asked for. See ADR-059 / spec §7.2.4:
         // the diagnostic's challenge capability is optional, and omitting it
         // means intrinsic-validity.
         const perToken = await this.ucanEvaluate(handle, token, subjectDid);
@@ -2636,7 +2636,7 @@ export class SCP {
     } catch (error) {
       // Branch on the STRUCTURED code (`SCP-CTX-2076`), never error prose: the
       // typed `ContextError` carries the stable code the core assigned to
-      // `NoParticipationFacts` (ADR-057 — structured, not prose, classification).
+      // `NoParticipationFacts` (ADR-059 — structured, not prose, classification).
       // Anything else (NotInitialized, a provider failure, malformed input) is a
       // genuine error and propagates unchanged.
       if (error instanceof ContextError && error.code === NO_PARTICIPATION_FACTS_CODE) {

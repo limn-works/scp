@@ -12,7 +12,7 @@
 // Python (`scp_sdk.trust`) and TypeScript (`scp.ts` / `types.ts`) SDKs
 // field-for-field.
 //
-// Provenance: ADR-057 (.docs/adrs/phase-2.md), spec §7.2.4 / §7.3.2
+// Provenance: ADR-059 (.docs/adrs/phase-2.md), spec §7.2.4 / §7.3.2
 // (.docs/specs/07-trust-validation-and-capabilities.md), ADR-017
 // (.docs/adrs/phase-4.md).
 
@@ -46,7 +46,7 @@ const val NO_PARTICIPATION_FACTS_CODE: String = "SCP-CTX-2076"
  * Layer 1: protocol-enforcement results (mechanical, pass/fail).
  *
  * The six per-stage booleans are the canonical structured result of the
- * read-only [SCP.ucanEvaluate] diagnostic (spec §7.2.4, ADR-057): one boolean
+ * read-only [SCP.ucanEvaluate] diagnostic (spec §7.2.4, ADR-059): one boolean
  * per pipeline-stage group of the 11-step ADR-016 pipeline. They are populated
  * directly from the bridge's typed [CapabilityValidationRecord] — never
  * reverse-engineered by parsing error prose. The result is strictly ordered and
@@ -116,7 +116,7 @@ data class CapabilityValidation(
          * Projects the typed UniFFI [CapabilityValidationRecord] onto this SDK
          * type. Reads the six booleans directly — the per-check breakdown comes
          * from the structured record, never from parsing error prose (spec
-         * §7.2.4, ADR-057 Decision 3).
+         * §7.2.4, ADR-059 Decision 3).
          */
         fun fromRecord(record: CapabilityValidationRecord): CapabilityValidation =
             CapabilityValidation(
@@ -245,7 +245,7 @@ data class AttestationSummary(
 
 /**
  * The complete structured trust evaluation for a subject in a context
- * (spec §7.2.4, ADR-057). The protocol provides the data, not the verdict — the
+ * (spec §7.2.4, ADR-059). The protocol provides the data, not the verdict — the
  * caller decides what to do with it.
  *
  * Mirrors the TypeScript SDK `TrustEvaluation` interface and the Python SDK

@@ -14,7 +14,7 @@ import Foundation
 //
 // ## Provenance
 //
-// - ADR-057 (Structured capability evaluation) in `.docs/adrs/phase-2.md`
+// - ADR-059 (Structured capability evaluation) in `.docs/adrs/phase-2.md`
 // - `.docs/specs/07-trust-validation-and-capabilities.md` §7.2.4, §7.3.2
 // - ADR-017 (Trust Model) in `.docs/adrs/phase-4.md`
 
@@ -34,7 +34,7 @@ public let noParticipationFactsCode = "SCP-CTX-2076"
 ///
 /// The six per-stage booleans are the canonical structured result of the
 /// read-only ``SCP/ucanEvaluate(handle:token:presentingAgentDid:capability:proofTokens:)``
-/// diagnostic (spec §7.2.4, ADR-057): one boolean per pipeline-stage group of
+/// diagnostic (spec §7.2.4, ADR-059): one boolean per pipeline-stage group of
 /// the 11-step ADR-016 pipeline. They are populated directly from the bridge's
 /// typed ``CapabilityValidationRecord`` — never reverse-engineered by parsing
 /// error prose. The result is strictly ordered and short-circuiting: a field is
@@ -89,7 +89,7 @@ public nonisolated struct CapabilityValidation: Sendable, Equatable {
     /// Projects the typed UniFFI ``CapabilityValidationRecord`` onto this SDK
     /// type. Reads the six booleans directly — the per-check breakdown comes
     /// from the structured record, never from parsing error prose (spec §7.2.4,
-    /// ADR-057 Decision 3).
+    /// ADR-059 Decision 3).
     public init(record: CapabilityValidationRecord) {
         self.init(
             tokensValid: record.tokensValid,
@@ -300,7 +300,7 @@ public nonisolated struct AttestationSummary: Sendable, Equatable {
 // MARK: - TrustEvaluation
 
 /// The complete structured trust evaluation for a subject in a context
-/// (spec §7.2.4, ADR-057). The protocol provides the data, not the verdict —
+/// (spec §7.2.4, ADR-059). The protocol provides the data, not the verdict —
 /// the caller decides what to do with it.
 ///
 /// Mirrors the TypeScript SDK `TrustEvaluation` interface and the Python SDK
@@ -622,7 +622,7 @@ public extension SCP {
     ///
     /// Runs the same 11-step ADR-016 validation pipeline but, instead of
     /// throwing at the first failing stage, returns a ``CapabilityValidation``
-    /// of six per-stage booleans (spec §7.2.4, ADR-057). The probe never records
+    /// of six per-stage booleans (spec §7.2.4, ADR-059). The probe never records
     /// the token's nonce, so calling it does not consume the token.
     /// Capability/signature/expiry outcomes are reported via the booleans; only
     /// malformed FFI inputs (bad handle / token / capability) throw.
@@ -711,7 +711,7 @@ public extension SCP {
     }
 
     /// Evaluate the trustworthiness of a participant within a context
-    /// (spec §7.2.4, ADR-057). The protocol provides the data, not the verdict.
+    /// (spec §7.2.4, ADR-059). The protocol provides the data, not the verdict.
     ///
     /// - **Layer 1 — protocol enforcement.** Each supplied capability token is
     ///   run through the read-only ``SCP/ucanEvaluate(handle:token:presentingAgentDid:capability:proofTokens:)``

@@ -1,5 +1,5 @@
 // TrustTest.kt — Unit tests for the Kotlin trust-signal SDK wrappers
-// (ADR-057, spec §7.2.4 / §7.3.2).
+// (ADR-059, spec §7.2.4 / §7.3.2).
 //
 // These exercise the PURE projection/serialization logic that sits on top of
 // the UniFFI bridge — mapping the typed CapabilityValidationRecord /

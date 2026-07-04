@@ -1762,7 +1762,7 @@ class SCP internal constructor(
      *
      * Runs the same 11-step ADR-016 validation pipeline but, instead of throwing
      * at the first failing stage, returns a [CapabilityValidation] of six
-     * per-stage booleans (spec §7.2.4, ADR-057). The probe never records the
+     * per-stage booleans (spec §7.2.4, ADR-059). The probe never records the
      * token's nonce, so calling it does not consume the token.
      * Capability/signature/expiry outcomes are reported via the booleans; only
      * malformed FFI inputs (bad handle / token / capability) throw.
@@ -1839,7 +1839,7 @@ class SCP internal constructor(
 
     /**
      * Evaluate the trustworthiness of a participant within a context
-     * (spec §7.2.4, ADR-057). The protocol provides the data, not the verdict.
+     * (spec §7.2.4, ADR-059). The protocol provides the data, not the verdict.
      *
      * - Layer 1 — protocol enforcement: each supplied capability token is run
      *   through the read-only [ucanEvaluate] diagnostic, yielding six per-stage
