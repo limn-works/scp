@@ -59,6 +59,16 @@ pub struct Attestation {
     /// DID of the attestation subject.
     pub subject: DID,
     /// Type-specific claim data.
+    ///
+    /// Serialized into the signed preimage as RFC 8785 (JCS) canonical JSON
+    /// (§9.5.2). **I-JSON numeric constraint (RFC 7493):** numeric values in
+    /// the claim MUST be within the IEEE-754 double exactly-representable
+    /// integer range (|n| ≤ 2^53); larger identifiers (e.g. 64-bit snowflake
+    /// IDs, u64 counters) MUST be string-encoded by the caller. RFC 8785
+    /// serializes numbers as ES6 doubles, so integers beyond 2^53 are not
+    /// injective: distinct values in the same rounding class canonicalize to
+    /// identical bytes, and a signature over one such claim validly covers
+    /// every other claim in that class.
     pub claim: serde_json::Value,
     /// Optional evidence supporting the attestation.
     pub evidence: Option<AttestationEvidence>,
@@ -1152,6 +1162,18 @@ pub fn check_threshold_attestation(
 /// different spec row (§3 identity, domain
 /// `SCP-IDENTITY-LINK-ATTESTATION-V1:`) which mandates `MessagePack` for its
 /// `claim` as well — its scheme is independent of this function.
+///
+/// # I-JSON numeric constraint on `claim` (RFC 7493, per §9.5.2)
+///
+/// RFC 8785 serializes JSON numbers as ES6 IEEE-754 doubles, so claim
+/// integers outside |n| ≤ 2^53 are **not injective**: distinct values in the
+/// same f64 rounding class (e.g. `9007199254740993` and `9007199254740992`)
+/// canonicalize to identical bytes, producing identical preimages — a
+/// signature over one validly covers the other, and the substitution is
+/// undetectable. Callers MUST keep claim numeric values within |n| ≤ 2^53 and
+/// string-encode larger identifiers (snowflake IDs, u64 counters). This
+/// function does not reject out-of-range integers — the coercion is inherent
+/// to RFC 8785 and is pinned by test.
 ///
 /// # Errors
 ///
@@ -2312,6 +2334,65 @@ mod tests {
         assert_eq!(
             canonical, canonical_reordered,
             "claim key order must not change the canonical bytes (JCS sorts keys)"
+        );
+    }
+
+    /// Pins the documented RFC 8785 f64 rounding class for claim integers
+    /// beyond 2^53 (§9.5.2 I-JSON constraint, RFC 7493).
+    ///
+    /// RFC 8785 serializes JSON numbers as ES6 IEEE-754 doubles, so distinct
+    /// claim integers in the same f64 rounding class canonicalize to
+    /// IDENTICAL bytes — a signature over one validly covers the other. This
+    /// is inherent to RFC 8785 (not a defect in this implementation, and not
+    /// something to "fix" here): it is why §9.5.2 requires claim numeric
+    /// values to stay within |n| ≤ 2^53 and large identifiers (snowflake IDs,
+    /// u64 counters) to be string-encoded. The test makes the hazard visible
+    /// and pins the current behavior; the string-encoded forms of the same
+    /// values remain distinct.
+    #[test]
+    fn canonical_attestation_claim_integers_beyond_2_53_collide_per_rfc8785() {
+        let make = |claim: serde_json::Value| Attestation {
+            id: "att-claim-numeric".to_owned(),
+            attestation_type: AttestationType::Endorsement,
+            issuer: "did:key:issuer".into(),
+            subject: "did:key:subj".into(),
+            claim,
+            evidence: None,
+            issued_at: 1000,
+            expires_at: None,
+            renewal_interval: None,
+            renewed_at: None,
+            revocation_status: RevocationStatus::Active,
+            signature: vec![],
+        };
+
+        // 2^53 = 9007199254740992 is exactly representable as an f64;
+        // 2^53 + 1 = 9007199254740993 is NOT, and rounds to 2^53 under
+        // RFC 8785 / ES6 number serialization.
+        let att_exact = make(serde_json::json!({"id": 9_007_199_254_740_992_u64}));
+        let att_plus_one = make(serde_json::json!({"id": 9_007_199_254_740_993_u64}));
+
+        let canonical_exact = canonical_attestation_bytes(&att_exact).unwrap();
+        let canonical_plus_one = canonical_attestation_bytes(&att_plus_one).unwrap();
+
+        // Documented rounding-class collision: distinct claims differing only
+        // beyond f64 precision produce IDENTICAL canonical bytes, so one
+        // signature covers both. This is why §9.5.2 mandates string-encoding
+        // for identifiers beyond 2^53.
+        assert_eq!(
+            canonical_exact, canonical_plus_one,
+            "claim integers in the same f64 rounding class must canonicalize \
+             identically per RFC 8785 (documented §9.5.2 hazard)"
+        );
+
+        // The mandated mitigation preserves injectivity: string-encoded forms
+        // of the same two values yield distinct canonical bytes.
+        let att_exact_str = make(serde_json::json!({"id": "9007199254740992"}));
+        let att_plus_one_str = make(serde_json::json!({"id": "9007199254740993"}));
+        assert_ne!(
+            canonical_attestation_bytes(&att_exact_str).unwrap(),
+            canonical_attestation_bytes(&att_plus_one_str).unwrap(),
+            "string-encoded identifiers must remain distinct in the preimage"
         );
     }
 
