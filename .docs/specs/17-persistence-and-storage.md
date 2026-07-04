@@ -540,7 +540,7 @@ Per ADR-057 (which supersedes ADR-055's browser-deployment conclusion), a browse
 
 The in-browser client persists **per-context participant state as a self-contained snapshot** written after every state-mutating operation and read back when a tab reopens. A snapshot captures the MLS crypto state (group tree, epoch secrets, key schedule, and the on-device MLS signer), the §9.16 sender-key state (local key, the per-sender key store, epoch high-water floors, and the receive-replay tracker), the canonical event-log event stream, the membership set with per-member sequence counters, a §9.9.3 checkpoint (the event-log Merkle root), and the **receive buffer** — decrypted messages awaiting delivery to the application. The receive buffer is persisted deliberately: a message decrypted before the tab closed is delivered **exactly once** on reopen rather than lost, and it *cannot* be re-obtained from the relay, because decrypting it already advanced the forward-secrecy ratchet whose advance is itself persisted (the relay would re-deliver a ciphertext the restored group can no longer open). Persisting the buffer keeps the anti-replay floors consistent with the persisted ratchet — both advance together on decrypt and are captured together.
 
-**Pending pre-join material is also persisted**, separately from the per-context snapshot, under its own per-context pending key (`scp-client/pending/{context_id}`): the private half of a key package that has been generated but whose Welcome has not yet arrived. Persisting it lets an **interrupted join resume** after a reopen instead of stranding a consumed key package. The pending blob is bound to the owning identity and the context it is for, and those bindings are verified on restore, so a swapped or mislabeled blob is rejected fail-closed.
+**Pending pre-join material is also persisted**, as a distinct per-context pending-join record stored separately from the per-context snapshot: the private half of a key package that has been generated but whose Welcome has not yet arrived. Persisting it lets an **interrupted join resume** after a reopen instead of stranding a consumed key package. The pending blob is bound to the owning identity and the context it is for, and those bindings are verified on restore, so a swapped or mislabeled blob is rejected fail-closed.
 
 Both the receive buffer and the pending material hold decrypted / private key material, so — like the rest of the snapshot — they rely on the store's authenticated encryption at rest (below).
 
@@ -902,7 +902,7 @@ These test the protocol layer's use of storage, not the storage adapters themsel
 
 ### Phase 4
 
-- TypeScript SDK storage configuration (native `SqliteStorage` for Node/Bun; browser clients are remote thin clients to a node per ADR-055 and run no in-process storage)
+- TypeScript SDK storage configuration (native `SqliteStorage` for Node/Bun; browser = in-tab SCP client with browser-local snapshot storage — `IndexedDB`/OPFS — per ADR-057, keys on-device; the custodial remote-thin-client to a node remains only as an opt-in secondary mode, not the default)
 
 ### Phase 5
 

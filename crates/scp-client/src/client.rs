@@ -114,6 +114,34 @@ pub struct SendOutput {
     pub committer_timestamp_secs: u64,
 }
 
+/// The lifecycle status of a context id, as reported by
+/// [`ScpClient::context_status`].
+///
+/// This is the **non-throwing predicate form** of the poison guard. The mutating
+/// ops and the `Result`-returning queries raise [`ClientError::ContextPoisoned`]
+/// on a diverged context, and the `Option`-returning observers report a poisoned
+/// context as `None` (indistinguishable from absent); this enum instead lets a
+/// caller distinguish all three states — usable, needs-reconstruction, and
+/// unknown — and pick the right terminal path for a poisoned context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextStatus {
+    /// The context is held and its durable and in-memory state agree: every op is
+    /// available.
+    Live,
+    /// The context is held but **poisoned** — a persist failed after its in-memory
+    /// state advanced irreversibly, so durable and live state diverged. Every
+    /// mutating op (and every `Result`-returning query) refuses it with
+    /// [`ClientError::ContextPoisoned`]. Two mutually-exclusive terminal paths:
+    /// **RECOVER** (discard this client and rebuild via [`ScpClient::new`] from the
+    /// last durable snapshot) or **ABANDON** ([`ScpClient::close_context`], which
+    /// deletes the durable snapshot and permanently forfeits recovery). See
+    /// [`ClientError::ContextPoisoned`].
+    Poisoned,
+    /// No context with this id is held by this client — it was never created or
+    /// joined, or it was closed.
+    Absent,
+}
+
 /// The single-threaded SCP participant driver.
 pub struct ScpClient {
     /// This participant's on-device DID identity.
@@ -699,50 +727,74 @@ impl ScpClient {
     /// further message in this context can be decrypted by this participant
     /// (forward secrecy — ADR-057 lose-device-lose-history).
     ///
-    /// Closing is the safe escape hatch for a **poisoned** context (see
-    /// [`ClientError::ContextPoisoned`]): unlike every other op, it does not go
-    /// through the poison guard. It still attempts the durable deletes (which are
-    /// safe and idempotent regardless of poison) and then removes the context from
-    /// memory, so a diverged context can always be discarded and closed cleanly.
+    /// # Close is ABANDON, not RECOVER
+    ///
+    /// For a **poisoned** context (see [`ClientError::ContextPoisoned`]) there are
+    /// two mutually-exclusive terminal paths, and this method is the abandoning one:
+    /// - **RECOVER** — discard this client and rebuild via [`ScpClient::new`] over
+    ///   the same storage; restore rebuilds the context from its last *durable*
+    ///   snapshot, unpoisoned by construction. The durable snapshot is preserved.
+    /// - **ABANDON** — this method. It deletes the durable snapshot, so closing a
+    ///   poisoned context **permanently forfeits recovery**: once closed there is
+    ///   no last-durable state left to reconstruct from. Use it to deliberately
+    ///   discard a diverged (or any) context.
+    ///
+    /// Closing is the safe escape hatch for a poisoned context: unlike every other
+    /// op it does not go through the poison guard, so a diverged context can always
+    /// be discarded and closed cleanly (the durable deletes are safe and idempotent
+    /// regardless of poison).
     ///
     /// # Errors
     ///
     /// Returns [`ClientError::UnknownContext`] if the context is not held, or
-    /// [`ClientError::StorageBackend`] if deleting the persisted snapshot or
-    /// pending-join blob fails (in which case the context is left fully live so
-    /// the close can be retried — see below).
+    /// [`ClientError::StorageBackend`] if deleting the pending-join blob or the
+    /// persisted snapshot fails. On such a failure the in-memory context is left
+    /// intact — still held, and still whatever it already was (live or poisoned) —
+    /// and no crypto state is torn down, so the close can be retried. The delete
+    /// ordering below ensures a partial failure preserves, rather than strands, the
+    /// recoverable snapshot.
     pub fn close_context(&mut self, context_id: &str) -> Result<(), ClientError> {
         if !self.contexts.contains_key(context_id) {
             return Err(ClientError::UnknownContext(context_id.to_owned()));
         }
-        // Delete the DURABLE state FIRST — both blobs — before touching in-memory
-        // state. Ordering is a forward-secrecy invariant: if a delete fails, the
-        // context is left fully live and the close is retryable, rather than
-        // in-memory-gone-but-still-durably-present (which would let a reopened tab
-        // restore a "closed" context). There is no manifest to update: restore
-        // enumerates by prefix, so a deleted blob is simply never listed. `delete`
-        // is idempotent, so a retry after a partial failure is safe.
+        // Delete the DURABLE state before touching in-memory state — a
+        // forward-secrecy invariant: were the order reversed, a delete that failed
+        // after the in-memory teardown would leave a context in-memory-gone but
+        // still durably present, and a reopened tab would restore a "closed"
+        // context. There is no manifest to update: restore enumerates by prefix, so
+        // a deleted blob is simply never listed, and `delete` is idempotent, so a
+        // retry after a partial failure is safe.
+        //
+        // Delete the pending-join blob FIRST and the context snapshot LAST. The
+        // context snapshot is the recoverable state — the one [`Self::new`] restores
+        // from — whereas the pending blob only matters for an unfinished join. If
+        // the two deletes are not atomic and the first succeeds but the second
+        // fails, this ordering leaves the *context snapshot* present, so a healthy
+        // context stays recoverable and the caller can retry the close — rather than
+        // deleting the recoverable snapshot first and then stranding the pending
+        // blob with no snapshot. (A healthy context usually has no pending blob at
+        // all, so its delete is a harmless idempotent no-op.)
         //
         // The non-resurrection guarantee is stated against the SYNCHRONOUS store
         // the driver sees. Under the browser write-behind model (see the
         // `scp-client-wasm` storage module docs) that store is an in-memory mirror
         // whose deletes are flushed to durable `IndexedDB` asynchronously; the
         // guarantee holds against the durable store ONLY if the embedder flushes in
-        // FIFO order, so a crash cannot lose this delete while keeping a later
+        // FIFO order, so a crash cannot lose these deletes while keeping a later
         // write. That FIFO flush is the embedder's obligation, not something this
         // crate can enforce.
-        self.storage
-            .delete(&Self::ctx_key(context_id))
-            .map_err(|e| {
-                ClientError::StorageBackend(format!(
-                    "deleting snapshot for context '{context_id}': {e}"
-                ))
-            })?;
         self.storage
             .delete(&Self::pending_key(context_id))
             .map_err(|e| {
                 ClientError::StorageBackend(format!(
                     "deleting pending join for context '{context_id}': {e}"
+                ))
+            })?;
+        self.storage
+            .delete(&Self::ctx_key(context_id))
+            .map_err(|e| {
+                ClientError::StorageBackend(format!(
+                    "deleting snapshot for context '{context_id}': {e}"
                 ))
             })?;
         // Durable state is gone; tear down in-memory state. Destroying the MLS
@@ -823,6 +875,25 @@ impl ScpClient {
         let mut ids: Vec<String> = self.contexts.keys().cloned().collect();
         ids.sort();
         ids
+    }
+
+    /// Reports whether `context_id` is [`Live`](ContextStatus::Live),
+    /// [`Poisoned`](ContextStatus::Poisoned), or [`Absent`](ContextStatus::Absent)
+    /// — the non-throwing predicate form of the poison guard.
+    ///
+    /// Unlike the mutating ops and `Result`-returning queries (which raise
+    /// [`ClientError::ContextPoisoned`] on a diverged context) and the `Option`
+    /// observers (which collapse "poisoned" into `None`, indistinguishable from
+    /// "absent"), this lets a caller cleanly branch on all three states — for
+    /// example, to decide between RECOVER and ABANDON for a poisoned context (see
+    /// [`ContextStatus`]) without provoking the error.
+    #[must_use]
+    pub fn context_status(&self, context_id: &str) -> ContextStatus {
+        match self.contexts.get(context_id) {
+            None => ContextStatus::Absent,
+            Some(state) if state.poisoned => ContextStatus::Poisoned,
+            Some(_) => ContextStatus::Live,
+        }
     }
 
     /// Returns the member DIDs of `context_id`, or `None` if not held (or

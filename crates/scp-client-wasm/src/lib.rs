@@ -48,7 +48,7 @@ pub mod time;
 
 use std::sync::Arc;
 
-use scp_client::{ScpClient, Signer, Storage};
+use scp_client::{ContextStatus, ScpClient, Signer, Storage};
 use scp_clock::Clock;
 use wasm_bindgen::prelude::*;
 
@@ -284,7 +284,12 @@ impl WasmScpClient {
     /// # Errors
     ///
     /// Throws `[SCP-CTX-2002]` if the context id is already held, or a
-    /// `[SCP-CRYPTO-…]` error on group-creation / leaf failure.
+    /// `[SCP-CRYPTO-…]` error on group-creation / leaf failure. A
+    /// `[SCP-STORAGE-8010]` on the post-create snapshot write **poisons** the
+    /// freshly-created context (its in-memory state exists but was never durably
+    /// recorded); discard this client and reconstruct via [`WasmScpClient::new`].
+    /// The poisoned context then surfaces `[SCP-STORAGE-8013]` on any later op —
+    /// see [`ContextStatus`](scp_client::ContextStatus).
     #[wasm_bindgen(js_name = "createContext")]
     pub fn create_context(&mut self, context_id: String) -> Result<(), JsValue> {
         map_err(self.inner.create_context(&context_id))
@@ -312,7 +317,11 @@ impl WasmScpClient {
     ///
     /// Throws `[SCP-CTX-2001]` if the context is not held, `[SCP-VALID-7010]`
     /// if the key package cannot be deserialized, or a `[SCP-CRYPTO-…]` error on
-    /// MLS / leaf failure.
+    /// MLS / leaf failure. A `[SCP-STORAGE-8010]` on the post-add snapshot write
+    /// **poisons** the context (its state advanced in memory but was not durably
+    /// recorded), and `[SCP-STORAGE-8013]` is thrown if the context is already
+    /// poisoned — either way, discard this client and reconstruct via
+    /// [`WasmScpClient::new`] (see [`ContextStatus`](scp_client::ContextStatus)).
     #[wasm_bindgen(js_name = "addMember")]
     pub fn add_member(
         &mut self,
@@ -339,7 +348,13 @@ impl WasmScpClient {
     /// Throws `[SCP-CTX-2004]` if there is no pending join material,
     /// `[SCP-CTX-2002]` if already joined, `[SCP-VALID-7010]` if the event-log
     /// stream cannot be deserialized, or a `[SCP-CRYPTO-…]` error on Welcome /
-    /// replay failure.
+    /// replay failure. A `[SCP-STORAGE-8010]` on the post-join snapshot write
+    /// **poisons** the freshly-joined context (its state advanced in memory but was
+    /// not durably recorded); discard this client and reconstruct via
+    /// [`WasmScpClient::new`], which restores the still-present pending material and
+    /// lets the join be retried. The poisoned context then surfaces
+    /// `[SCP-STORAGE-8013]` on any later op — see
+    /// [`ContextStatus`](scp_client::ContextStatus).
     #[wasm_bindgen(js_name = "joinContextEncrypted")]
     pub fn join_context_encrypted(
         &mut self,
@@ -363,7 +378,12 @@ impl WasmScpClient {
     /// # Errors
     ///
     /// Throws `[SCP-CTX-2001]` if the context is not held, or a `[SCP-CRYPTO-…]`
-    /// error on a crypto / leaf failure.
+    /// error on a crypto / leaf failure. A `[SCP-STORAGE-8010]` on the post-send
+    /// snapshot write **poisons** the context (the message's state advanced in
+    /// memory but was not durably recorded, so no ciphertext is returned), and
+    /// `[SCP-STORAGE-8013]` is thrown if the context is already poisoned — either
+    /// way, discard this client and reconstruct via [`WasmScpClient::new`] (see
+    /// [`ContextStatus`](scp_client::ContextStatus)).
     #[wasm_bindgen(js_name = "sendMessage")]
     pub fn send_message(
         &mut self,
@@ -388,7 +408,12 @@ impl WasmScpClient {
     ///
     /// Throws `[SCP-CTX-2001]` if the context is not held, `[SCP-CTX-2003]` if
     /// the Commit removes a member (out of Slice 2 scope; rejected pre-merge so
-    /// the context stays consistent), or a `[SCP-CRYPTO-…]` error on failure.
+    /// the context stays consistent), or a `[SCP-CRYPTO-…]` error on failure. A
+    /// `[SCP-STORAGE-8010]` on the post-receive snapshot write **poisons** the
+    /// context (the decrypt advanced the ratchet but the new state was not durably
+    /// recorded), and `[SCP-STORAGE-8013]` is thrown if the context is already
+    /// poisoned — either way, discard this client and reconstruct via
+    /// [`WasmScpClient::new`] (see [`ContextStatus`](scp_client::ContextStatus)).
     #[wasm_bindgen(js_name = "receiveMessage")]
     pub fn receive_message(
         &mut self,
@@ -406,7 +431,12 @@ impl WasmScpClient {
     ///
     /// # Errors
     ///
-    /// Throws `[SCP-CTX-2001]` if the context is not held.
+    /// Throws `[SCP-CTX-2001]` if the context is not held. A `[SCP-STORAGE-8010]`
+    /// on the snapshot write that records the emptied buffer **poisons** the
+    /// context (the buffer was drained in memory but the emptied state was not
+    /// durably recorded), and `[SCP-STORAGE-8013]` is thrown if the context is
+    /// already poisoned — either way, discard this client and reconstruct via
+    /// [`WasmScpClient::new`] (see [`ContextStatus`](scp_client::ContextStatus)).
     #[wasm_bindgen(js_name = "drainEvents")]
     pub fn drain_events(&mut self, context_id: String) -> Result<Vec<WasmReceivedEvent>, JsValue> {
         use scp_protocol::context::membership::ContextEvent;
@@ -458,7 +488,11 @@ impl WasmScpClient {
     ///
     /// # Errors
     ///
-    /// Throws `[SCP-CTX-2001]` if the context is not held.
+    /// Throws `[SCP-CTX-2001]` if the context is not held, or `[SCP-STORAGE-8013]`
+    /// if the context is poisoned (discard this client and reconstruct via
+    /// [`WasmScpClient::new`] — see [`ContextStatus`](scp_client::ContextStatus)).
+    /// This read-only observer never writes, so it cannot raise
+    /// `[SCP-STORAGE-8010]`.
     #[wasm_bindgen(js_name = "localSenderKeyBytes")]
     pub fn local_sender_key_bytes(&self, context_id: String) -> Result<Vec<u8>, JsValue> {
         let key = map_err(self.inner.local_sender_key_bytes(&context_id))?;
@@ -471,7 +505,11 @@ impl WasmScpClient {
     /// # Errors
     ///
     /// Throws `[SCP-VALID-7010]` if `key_bytes` is not 32 bytes, or
-    /// `[SCP-CTX-2001]` if the context is not held.
+    /// `[SCP-CTX-2001]` if the context is not held. A `[SCP-STORAGE-8010]` on the
+    /// snapshot write that persists the updated sender-key store **poisons** the
+    /// context, and `[SCP-STORAGE-8013]` is thrown if the context is already
+    /// poisoned — either way, discard this client and reconstruct via
+    /// [`WasmScpClient::new`] (see [`ContextStatus`](scp_client::ContextStatus)).
     #[wasm_bindgen(js_name = "installSenderKey")]
     pub fn install_sender_key(
         &mut self,
@@ -504,7 +542,30 @@ impl WasmScpClient {
         self.inner.context_ids()
     }
 
-    /// Returns the member DIDs of `context_id`, or `undefined` if not held.
+    /// Reports whether `context_id` is `"live"`, `"poisoned"`, or `"absent"` — the
+    /// non-throwing predicate form of the poison guard.
+    ///
+    /// The `Option` observers ([`memberDids`](WasmScpClient::member_dids) et al.)
+    /// collapse "poisoned" into `undefined`, indistinguishable from "absent"; this
+    /// distinguishes all three so a caller can decide between RECOVER (reconstruct
+    /// via [`WasmScpClient::new`]) and ABANDON ([`closeContext`](WasmScpClient::close_context))
+    /// for a poisoned context without provoking `[SCP-STORAGE-8013]`. The status is
+    /// a lowercase string (the surface's enum idiom, matching
+    /// [`WasmReceivedEvent::kind`]).
+    #[must_use]
+    #[wasm_bindgen(js_name = "contextStatus")]
+    pub fn context_status(&self, context_id: String) -> String {
+        match self.inner.context_status(&context_id) {
+            ContextStatus::Live => "live",
+            ContextStatus::Poisoned => "poisoned",
+            ContextStatus::Absent => "absent",
+        }
+        .to_owned()
+    }
+
+    /// Returns the member DIDs of `context_id`, or `undefined` if not held (or
+    /// poisoned — see `[SCP-STORAGE-8013]`; poisoned contexts still appear in
+    /// [`contextIds`](WasmScpClient::context_ids)).
     #[must_use]
     #[wasm_bindgen(js_name = "memberDids")]
     pub fn member_dids(&self, context_id: String) -> Option<Vec<String>> {
@@ -512,7 +573,8 @@ impl WasmScpClient {
     }
 
     /// Returns the event-log Merkle root (32 bytes) for `context_id`, or
-    /// `undefined` if not held.
+    /// `undefined` if not held (or poisoned — see `[SCP-STORAGE-8013]`; poisoned
+    /// contexts still appear in [`contextIds`](WasmScpClient::context_ids)).
     #[must_use]
     #[wasm_bindgen(js_name = "eventLogRoot")]
     pub fn event_log_root(&self, context_id: String) -> Option<Vec<u8>> {
@@ -522,7 +584,8 @@ impl WasmScpClient {
     }
 
     /// Returns the event-log leaf count for `context_id`, or `undefined` if not
-    /// held.
+    /// held (or poisoned — see `[SCP-STORAGE-8013]`; poisoned contexts still appear
+    /// in [`contextIds`](WasmScpClient::context_ids)).
     #[must_use]
     #[wasm_bindgen(js_name = "eventLogLeafCount")]
     pub fn event_log_leaf_count(&self, context_id: String) -> Option<u64> {
@@ -530,8 +593,10 @@ impl WasmScpClient {
     }
 
     /// Returns the concatenated event-log leaf hashes (32 bytes each, sequence
-    /// order) for `context_id`, or `undefined` if not held. Used to assert the
-    /// §9.9.3 per-leaf convergence property across members.
+    /// order) for `context_id`, or `undefined` if not held (or poisoned — see
+    /// `[SCP-STORAGE-8013]`; poisoned contexts still appear in
+    /// [`contextIds`](WasmScpClient::context_ids)). Used to assert the §9.9.3
+    /// per-leaf convergence property across members.
     #[must_use]
     #[wasm_bindgen(js_name = "eventLogLeafHashes")]
     pub fn event_log_leaf_hashes(&self, context_id: String) -> Option<Vec<u8>> {
@@ -548,8 +613,11 @@ impl WasmScpClient {
     ///
     /// # Errors
     ///
-    /// Throws `[SCP-CTX-2001]` if the context is not held, or `[SCP-CRYPTO-…]`
-    /// if the MLS group has been destroyed.
+    /// Throws `[SCP-CTX-2001]` if the context is not held, `[SCP-CRYPTO-…]`
+    /// if the MLS group has been destroyed, or `[SCP-STORAGE-8013]` if the context
+    /// is poisoned (discard this client and reconstruct via [`WasmScpClient::new`]
+    /// — see [`ContextStatus`](scp_client::ContextStatus)). This read-only observer
+    /// never writes, so it cannot raise `[SCP-STORAGE-8010]`.
     #[wasm_bindgen(js_name = "mlsEpoch")]
     pub fn mls_epoch(&self, context_id: String) -> Result<u64, JsValue> {
         map_err(self.inner.mls_epoch(&context_id))

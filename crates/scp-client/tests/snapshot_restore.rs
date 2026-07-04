@@ -17,7 +17,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use scp_client::{ClientError, LocalSigner, MemoryStorage, ScpClient, Storage};
+use scp_client::{ClientError, ContextStatus, LocalSigner, MemoryStorage, ScpClient, Storage};
 use scp_clock::{Clock, TestClock};
 use scp_protocol::context::membership::ContextEvent;
 
@@ -577,6 +577,89 @@ fn cross_context_pending_swap_fails_construction_closed() {
         expect_construction_error(store), // Bob (correct identity), wrong context key
         ClientError::StorageCorrupt(_)
     ));
+}
+
+#[test]
+fn context_status_reports_live_poisoned_and_absent() {
+    // The non-throwing predicate distinguishes all three states, unlike the
+    // `Option` observers (which collapse poisoned into `None`).
+    let gated = Arc::new(GatedFailOnPut::new(Arc::new(MemoryStorage::new())));
+    let mut alice = client_over(
+        ALICE_DID,
+        Arc::clone(&gated) as Arc<dyn Storage>,
+        1_700_000_000,
+    );
+
+    // Absent: a context that was never created/joined.
+    assert_eq!(
+        alice.context_status("ctx-never-existed"),
+        ContextStatus::Absent
+    );
+
+    // Live: created and healthy.
+    alice.create_context(CTX).expect("alice creates");
+    assert_eq!(alice.context_status(CTX), ContextStatus::Live);
+
+    // Poisoned: a persist that fails after the in-memory state advanced diverges
+    // durable vs live state.
+    gated.arm();
+    let _ = alice.send_message(CTX, b"never persisted");
+    assert_eq!(
+        alice.context_status(CTX),
+        ContextStatus::Poisoned,
+        "a failed persist flips the status to Poisoned"
+    );
+    // A poisoned context is still HELD (listed) even though the Option observers
+    // report it as absent — context_status is the way to tell the two apart.
+    assert!(alice.context_ids().contains(&CTX.to_owned()));
+    assert!(alice.member_dids(CTX).is_none());
+}
+
+#[test]
+fn closing_a_poisoned_context_forfeits_recovery() {
+    // The ABANDON path: closing a poisoned context deletes its durable snapshot, so
+    // a reconstructed client finds it ABSENT — recovery is permanently forfeited
+    // (contrast the RECOVER path in
+    // `failing_put_during_send_poisons_context_and_reconstruction_recovers`, which
+    // does NOT close and so keeps the durable snapshot).
+    let gated = Arc::new(GatedFailOnPut::new(Arc::new(MemoryStorage::new())));
+    let mut alice = client_over(
+        ALICE_DID,
+        Arc::clone(&gated) as Arc<dyn Storage>,
+        1_700_000_000,
+    );
+    alice.create_context(CTX).expect("alice creates"); // durable post-create snapshot
+
+    // Poison the context via a failing post-send persist.
+    gated.arm();
+    let send = alice.send_message(CTX, b"never persisted");
+    assert!(matches!(send, Err(ClientError::StorageBackend(_))));
+    assert_eq!(alice.context_status(CTX), ContextStatus::Poisoned);
+
+    // Close (ABANDON) succeeds: it bypasses the poison guard, and the durable
+    // deletes delegate through the gate (which only fails `put`, not `delete`).
+    alice
+        .close_context(CTX)
+        .expect("close of a poisoned context succeeds");
+    assert_eq!(
+        alice.context_status(CTX),
+        ContextStatus::Absent,
+        "the closed context is dropped from memory"
+    );
+    drop(alice);
+
+    // Reconstruction from the SAME storage finds nothing — close deleted the last
+    // durable snapshot, so the context cannot be recovered.
+    let alice2 = client_over(
+        ALICE_DID,
+        Arc::clone(&gated) as Arc<dyn Storage>,
+        1_700_000_050,
+    );
+    assert_eq!(
+        alice2.context_status(CTX),
+        ContextStatus::Absent,
+        "closing the poisoned context permanently forfeited its durable snapshot"
+    );
 }
 
 #[test]

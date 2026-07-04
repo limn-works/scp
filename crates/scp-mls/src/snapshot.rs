@@ -102,8 +102,13 @@ impl ProviderSignerDump {
         provider: &InMemoryMlsProvider,
         signer: &SignatureKeyPair,
     ) -> Result<Self, MlsError> {
-        let signer_bytes = rmp_serde::to_vec_named(signer)
-            .map_err(|e| MlsError::Snapshot(format!("signer serialization: {e}")))?;
+        // ORDER MATTERS (zeroization): perform the fallible storage-lock read
+        // FIRST, before any secret-bearing stack local exists. A poisoned-lock
+        // early return here drops nothing key-bearing. `signer_bytes` — the raw
+        // Ed25519 private key — is serialized LAST and folded straight into the
+        // returned `Self`, whose `Drop` zeroizes it. rmp_serde serialization of an
+        // in-memory `SignatureKeyPair` does not fail, so no realistic early return
+        // can strand a bare secret local between these two steps.
         let mls_storage_entries: Vec<(Vec<u8>, Vec<u8>)> = {
             let values =
                 provider.storage().values.read().map_err(|e| {
@@ -111,6 +116,8 @@ impl ProviderSignerDump {
                 })?;
             values.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
         };
+        let signer_bytes = rmp_serde::to_vec_named(signer)
+            .map_err(|e| MlsError::Snapshot(format!("signer serialization: {e}")))?;
         Ok(Self {
             mls_storage_entries,
             signer_bytes,

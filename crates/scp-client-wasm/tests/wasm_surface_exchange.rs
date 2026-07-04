@@ -338,6 +338,32 @@ fn context_ids_lists_contexts_through_the_surface() {
     );
 }
 
+#[test]
+fn context_status_reports_live_and_absent_through_the_surface() {
+    // The surface exposes `contextStatus` as a lowercase string ("live"/"poisoned"
+    // /"absent") so a caller can distinguish a held context from an absent one
+    // without the `Option` observers' poisoned/absent ambiguity.
+    let mut c = client_for(ALICE_DID, 1_700_000_000);
+
+    // Absent before creation.
+    assert_eq!(c.context_status("ctx-never-existed".to_owned()), "absent");
+
+    // Live after creation.
+    c.create_context(CTX.to_owned()).expect("create");
+    assert_eq!(c.context_status(CTX.to_owned()), "live");
+
+    // Absent again after close.
+    c.close_context(CTX.to_owned()).expect("close");
+    assert_eq!(c.context_status(CTX.to_owned()), "absent");
+
+    // The "poisoned" status is unreachable through the wasm surface on the native
+    // host: poisoning requires a mutating op whose persist fails, and that op
+    // returns `Err(JsValue)`, which aborts off-wasm before returning (the same
+    // native-host limitation documented for error-path coverage below). The full
+    // three-state mapping is asserted directly against the driver in `scp-client`'s
+    // `context_status_reports_live_poisoned_and_absent`.
+}
+
 // NOTE on error-path coverage: a `#[wasm_bindgen]` method that returns
 // `Err(JsValue)` cannot be exercised on the native host — constructing the
 // `JsValue` aborts (wasm-bindgen imported calls cannot run off-wasm), before any

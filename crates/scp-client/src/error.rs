@@ -97,10 +97,18 @@ pub enum ClientError {
     /// hand out ciphertext / event-log leaves that no peer and no reopened tab
     /// will ever see, permanently forking this member's Merkle root from the
     /// group's. Every operation that would advance or expose the diverged state
-    /// therefore refuses it. Recovery is by reconstruction: discard this client
-    /// and build a fresh one via [`ScpClient::new`](crate::ScpClient::new) over
-    /// the same storage — restore rebuilds the context from its last *durable*
-    /// snapshot, unpoisoned by construction. Surfaced as `SCP-STORAGE-8013`.
+    /// therefore refuses it. There are two mutually-exclusive terminal paths:
+    /// - **RECOVER** — discard this client and build a fresh one via
+    ///   [`ScpClient::new`](crate::ScpClient::new) over the same storage; restore
+    ///   rebuilds the context from its last *durable* snapshot, unpoisoned by
+    ///   construction. The durable snapshot is preserved.
+    /// - **ABANDON** — call [`close_context`](crate::ScpClient::close_context), the
+    ///   deliberate discard path: it deletes the durable snapshot and drops the
+    ///   context, **permanently forfeiting recovery**. It is the one op that does
+    ///   not go through the poison guard, so a diverged context can always be
+    ///   closed cleanly.
+    ///
+    /// Surfaced as `SCP-STORAGE-8013`.
     #[error(
         "context '{context_id}' is poisoned: a storage write failed after its \
          in-memory state advanced irreversibly, so durable and live state have \

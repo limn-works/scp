@@ -67,10 +67,13 @@ mod signer;
 mod snapshot;
 mod storage;
 
-pub use client::{AddMemberOutput, ScpClient, SendOutput};
+pub use client::{AddMemberOutput, ContextStatus, ScpClient, SendOutput};
 pub use context::PerContextState;
 pub use crypto_state::{ContextCryptoState, INITIAL_SENDER_KEY_EPOCH, Inbound};
 pub use error::ClientError;
 pub use signer::{LocalSigner, Signer};
-pub use snapshot::{ContextSnapshot, SNAPSHOT_FORMAT_VERSION};
+// `ContextSnapshot` / `SNAPSHOT_FORMAT_VERSION` are intentionally NOT re-exported:
+// the snapshot blob format is a crate-internal persistence detail (captured/
+// restored only inside this driver), so it stays `crate`-visible in the private
+// `snapshot` module rather than surfacing on the public API.
 pub use storage::{MemoryStorage, Storage};
