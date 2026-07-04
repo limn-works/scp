@@ -270,6 +270,7 @@ Context metadata follows a two-tier visibility model that balances legibility (i
 - Capability ceiling and ceiling policy (`immutable` or `governed`, §5.3)
 - Available roles and their permission sets
 - Governance model
+- Automated consequence rules and the `allow_automatic_access_revocation` opt-in, if declared (§7.3.7) — creation-time, member-enforced authority. §7.3.7 requires consequence rules to be visible before opt-in: hiding the automatic penalties of participation would undermine informed consent. For invited joiners these are additionally authenticated by the `InvitationBundle` signature over the full genesis `ContextParams` (§5.12.3.1).
 - TTL / time-to-live, if set (§5.10)
 - Promotion policy (`no_promotion` or `promotable`), if context has a TTL (§5.10)
 - Memory scope (§5.11)
@@ -291,6 +292,8 @@ Structural fields are always public regardless of `MetadataVisibilityPolicy`. Th
 - For child contexts (§5.13): parent context IDs, parent metadata summaries, parent governance configuration, and the prospective member's eligibility basis (§5.13.6)
 
 Each operational field has a visibility of `PreJoin` (visible to anyone with the context_id) or `MemberOnly` (visible only to context members). The `MetadataVisibilityPolicy` is declared at context creation and follows the context's ceiling policy — immutable or governed via `ModifyCeiling`.
+
+**Authentication is orthogonal to visibility.** The visibility split above governs *disclosure* — which fields a prospective member may SEE before joining. It does NOT govern *authentication* — whether the value a member enforces is creator-signed. A `MemberOnly` field is still creator-signed: for invited joiners the signature rides inside the HPKE-encrypted `InvitationBundle` (§5.12.3.1), delivered to an invitee who is about to become a member, so disclosing and authenticating a `MemberOnly` field to that specific invitee is consistent with the consent/privacy model — the creator chose the invitee and encrypted the bundle to them alone. This is why the §5.12.3.1 signature can authenticate the full genesis `ContextParams` — including `MemberOnly`-visible authority such as `economic_policy` (whose payee, per the operational visibility policy above, may be hidden from non-invited prospective members) — without weakening the pre-join disclosure limits that still apply to the *published* metadata record (§5.7.1).
 
 ```rust
 /// Controls whether a metadata field is visible before joining.
@@ -813,8 +816,21 @@ InvitationBundle {
                                           // and the invitee's KeyPackage reference.
                                           // Omitted (empty) for Broadcast contexts.
   key_material:       InvitationKeyMaterial  // Context-specific key material for the invitee.
-  metadata_snapshot:  MetadataSnapshot    // Snapshot of structural + visible operational metadata.
-  signature:          Ed25519Signature    // Creator signs all fields above.
+  context_params:     ContextParams       // The FULL genesis ContextParams the joiner installs
+                                          // authority from: governance, ceiling, ceiling_policy,
+                                          // roles, mode, ttl, memory_scope, economic_policy
+                                          // (including payee), consequence_rules and the
+                                          // allow_automatic_access_revocation opt-in, tools, and
+                                          // every other authority-relevant field. This is the
+                                          // authenticated authority source (see Signature scope);
+                                          // the joiner enforces from it, never from the lossy
+                                          // metadata_snapshot.
+  metadata_snapshot:  MetadataSnapshot    // Visibility-filtered VIEW for auto-accept policy
+                                          // evaluation (§5.12.2) and display. Its structural
+                                          // fields are derived from context_params and MUST agree
+                                          // with them; its operational fields carry runtime state
+                                          // (member count, age, name) not present in context_params.
+  signature:          Ed25519Signature    // Creator signs all fields above (see Signature scope).
 }
 
 InvitationKeyMaterial {
@@ -830,13 +846,17 @@ MetadataSnapshot {
 }
 ```
 
-**Signature scope.** The creator signs `SHA-256("SCP-INVITATION-BUNDLE-V1:" || context_id || creator_did || relay_urls_hash || welcome_message_hash || key_material_hash || metadata_snapshot_hash)` where each `_hash` is `SHA-256(MessagePack(field))`. The signature uses the creator's Active Signing Key (`#active`).
+**Signature scope.** The creator signs `SHA-256("SCP-INVITATION-BUNDLE-V1:" || context_id || creator_did || relay_urls_hash || welcome_message_hash || key_material_hash || genesis_params_hash || metadata_snapshot_hash)`. The raw `context_id` and `creator_did` are encoded per the §9.5.1 length-prefixed rules (4-byte big-endian length prefix followed by UTF-8 bytes). Each `_hash` is the 32-byte SHA-256 output `SHA-256(canonical_json_jcs(field))` over the corresponding field — RFC 8785 (JCS) canonical JSON — inserted raw into the preimage (a fixed 32-byte value carries no length prefix, per §9.5.1). In particular `genesis_params_hash = SHA-256(canonical_json_jcs(context_params))` binds the **complete genesis `ContextParams`** into the signature, so the signature authenticates the full authority the joiner enforces — governance, ceiling, ceiling_policy, roles, mode, ttl, memory_scope, economic_policy (including payee), consequence_rules and the `allow_automatic_access_revocation` opt-in, tools, and every other authority-relevant field — not merely the lossy `metadata_snapshot` (which omits economic-policy detail and consequence rules). `metadata_snapshot_hash` remains signed so the display / auto-accept view cannot be tampered independently of the authority it must agree with. The signature uses the creator's Active Signing Key (`#active`).
+
+**Canonicalization rationale.** Per-field hashes use RFC 8785 canonical JSON (JCS), matching the cross-implementation canonical-hashing mandate in §9.5 (§09-security-model.md) and the §5.13.3 `0xFF02` extension precedent. MessagePack has no canonical form standard — field ordering varies by library, so it cannot guarantee byte-identical output across independent SDK implementations; JCS provides a formal canonicalization standard that can. This ensures two implementations that serialize the same logical field produce identical signed bytes and therefore verify each other's signatures. (The bundle's MessagePack transport envelope is unaffected: the signed preimage is built from JCS field hashes, not from the MessagePack envelope bytes, so the transport encoding never enters the signature.)
 
 **Validation.** The invitee verifies the bundle before processing:
 1. Resolve `creator_did` and verify `signature` against the creator's `#active` public key.
-2. Validate `metadata_snapshot.structural` against the invitee's auto-accept policy (§5.12.2).
-3. If accepted, process `welcome_message` via MLS to join the group (Encrypted contexts) or initialize subscriber state (Broadcast contexts).
-4. Use `context_metadata_key` to derive the metadata routing ID for ongoing metadata retrieval.
+2. Verify `metadata_snapshot.structural` is consistent with `context_params`. Both are inside the same creator signature, so a divergence is a signed self-contradiction — reject. This blocks a creator from displaying benign structural values for the auto-accept check while enforcing hostile ones.
+3. Validate the structural authority (`metadata_snapshot.structural`, equivalently the corresponding `context_params` fields) against the invitee's auto-accept policy (§5.12.2).
+4. For the fields the `0xFF02` MLS group-context extension commits (governance, ceiling, ceiling_policy, mode, parent lineage — §5.13.3), verify `context_params` matches the committed extension hashes carried in `welcome_message`. Authority for those fields is anchored in the MLS-committed extension; the bundle signature additionally authenticates the remaining genesis params (roles, ttl, memory_scope, economic_policy, consequence_rules, tools) that `0xFF02` does not commit.
+5. If accepted, install authority from the verified `context_params` and process `welcome_message` via MLS to join the group (Encrypted contexts) or initialize subscriber state (Broadcast contexts).
+6. Use `context_metadata_key` to derive the metadata routing ID for ongoing metadata retrieval.
 
 **HPKE encryption.** The serialized `InvitationBundle` (and, symmetrically, the `JoinResponse` of §5.12.3.2) is encrypted to the recipient with HPKE Base mode (RFC 9180) using the SCP HPKE suite (§9.5): DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, AES-128-GCM. The recipient X25519 public key is derived from their Ed25519 identity key via RFC 7748 birational mapping. The HPKE `info` and `aad` parameters are:
 

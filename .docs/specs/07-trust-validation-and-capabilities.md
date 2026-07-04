@@ -754,7 +754,7 @@ Contexts can define **automated consequence rules** as part of their governance 
 
 These rules are:
 
-- **Declared at context creation.** Visible in context metadata before opt-in.
+- **Declared at context creation.** Visible in context metadata before opt-in — carried in the always-visible **structural** metadata set (§5.7) and, for invited joiners, authenticated by the `InvitationBundle` signature over the full genesis `ContextParams` (§5.12.3.1).
 - **Protocol-enforced.** Not governance-discretion. Triggers are mechanical, consequences are automatic.
 - **Verifiable.** Any agent can evaluate the consequence structure and determine whether misbehavior is irrational given the costs.
 - **Sanitized at creation.** All string fields in consequence rules (`Custom` trigger keys, `AssignRole` target roles) are validated when the context is created. Implementations MUST reject strings containing control characters (U+0000-U+001F, U+007F-U+009F), HTML-special characters (`<`, `>`, `&`, `"`, `'`), or strings exceeding 256 bytes. Role-typed fields (`AssignRole` target roles) use the role name limit of 64 bytes (§9.18.6) rather than the general 256-byte cap. Capability fields use the typed `Capability` enum (not raw strings). Consequence rules with `RevokeAccess` actions require the context-level `allow_automatic_access_revocation` opt-in; `RemoveMember` is governance-only and always rejected in consequence rules. This prevents injection attacks when consequence events are serialized for SDK consumers or rendered in user interfaces.
