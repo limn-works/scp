@@ -29,12 +29,15 @@
 //! - [`ratchet`] — Commit processing and epoch advance.
 //! - [`key_package`] — Single-use `KeyPackage` buffer management.
 //! - [`wrapping_extension`] — `scp_wrapping_key` `LeafNode` extension helpers.
+//! - [`context_extension`] — `scp_context_params` `group_context` extension
+//!   helpers (§5.13.3, finding FFI-02).
 //! - [`epoch_grace`] — Epoch grace-window store (forward-secrecy bound).
 //! - [`error`] — MLS-specific error types.
 //!
 //! See ADR-001 in `.docs/adrs/phase-1.md` for the MLS wrapper design and
 //! ADR-057 for the `scp-mls` extraction.
 
+pub mod context_extension;
 pub mod credential;
 pub mod encrypt;
 pub mod epoch_grace;
@@ -53,10 +56,15 @@ pub use error::MlsError;
 // (`generate_key_package` returns it; `join_group` consumes it). Re-export it so
 // consumers — notably the in-browser participant driver (ADR-057) — can name
 // the type without taking a direct dependency on `openmls_basic_credential`.
+pub use context_extension::{
+    extract_context_params, group_context_extensions, make_context_params_extension,
+    scp_capabilities_with_context_params,
+};
 pub use group::{
     AddMemberResult, RemoveMemberResult, SCP_CIPHERSUITE, ScpMlsGroup, add_member, create_group,
-    create_group_with_wrapping_key, destroy_group, generate_key_package,
-    generate_key_package_with_wrapping_key, join_group, key_package_in_did, remove_member,
+    create_group_with_context, create_group_with_wrapping_key, destroy_group, generate_key_package,
+    generate_key_package_with_context_params, generate_key_package_with_wrapping_key, join_group,
+    key_package_in_did, remove_member,
 };
 pub use openmls_basic_credential::SignatureKeyPair;
 pub use wrapping_extension::{

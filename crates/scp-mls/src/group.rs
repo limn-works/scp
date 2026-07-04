@@ -21,10 +21,12 @@ use std::ops::Deref;
 use crate::InMemoryMlsProvider;
 use crate::credential::ScpCredential;
 use crate::error::MlsError;
+use openmls::group::GroupContext;
 use openmls::messages::group_info::GroupInfo;
 use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_traits::OpenMlsProvider;
+use scp_protocol::context::ScpContextExtension;
 use tls_codec::{Deserialize as TlsDeserializeTrait, Serialize as TlsSerializeTrait};
 
 /// The single ciphersuite used by all SCP MLS groups.
@@ -310,6 +312,99 @@ pub fn create_group_with_wrapping_key(
     credential: &ScpCredential,
     wrapping_pubkey: Option<&[u8; 32]>,
 ) -> Result<ScpMlsGroup, MlsError> {
+    // If a wrapping key is provided, declare the extension type in capabilities
+    // and include the wrapping key in the LeafNode extensions. No group_context
+    // extension for the wrapping-key-only path.
+    let (capabilities, leaf_extensions) = match wrapping_pubkey {
+        Some(pubkey) => {
+            let caps = crate::wrapping_extension::scp_capabilities_with_wrapping_key();
+            let ext = crate::wrapping_extension::make_wrapping_key_extension(pubkey);
+            let leaf_extensions = Extensions::<LeafNode>::single(ext).map_err(|e| {
+                MlsError::GroupCreationFailed(format!("wrapping key extension: {e}"))
+            })?;
+            (Some(caps), Some(leaf_extensions))
+        }
+        None => (None, None),
+    };
+
+    create_group_inner(credential, capabilities, None, leaf_extensions)
+}
+
+/// Creates a new MLS group whose `group_context` binds the SCP context
+/// parameters, with the creator as the sole member.
+///
+/// The group carries **both** SCP extensions:
+/// - the `scp_wrapping_key` `LeafNode` extension (`0xFF01`) with the creator's
+///   32-byte X25519 wrapping public key, for sender key distribution (§9.16.1);
+/// - the `scp_context_params` `group_context` extension (`0xFF02`) binding
+///   `context_extension` into the group identity so the parameters are folded
+///   into the MLS key schedule and read back identically by every member
+///   (spec §5.13.3, finding FFI-02).
+///
+/// Members' [`Capabilities`](openmls::prelude::Capabilities) declare both
+/// extension types via
+/// [`scp_capabilities_with_context_params`](crate::context_extension::scp_capabilities_with_context_params).
+/// A joiner must present a `KeyPackage` from
+/// [`generate_key_package_with_context_params`] (which declares `0xFF02`):
+/// `OpenMLS` rejects an Add whose leaf does not support every `group_context`
+/// extension (`valn0502`). See the module docs on
+/// [`context_extension`](crate::context_extension).
+///
+/// A context group always has a wrapping key, so `wrapping_pubkey` is required
+/// (unlike [`create_group_with_wrapping_key`], which accepts `None` for the
+/// wrapping-key-only path).
+///
+/// # Arguments
+///
+/// * `credential` - The creator's SCP credential (DID + optional UCAN).
+/// * `wrapping_pubkey` - The creator's 32-byte X25519 wrapping public key.
+/// * `context_extension` - The context parameters to commit into `group_context`.
+///
+/// # Errors
+///
+/// Returns [`MlsError::CredentialSerializationFailed`] if the credential cannot
+/// be serialized, [`MlsError::ExtensionError`] if the context extension cannot
+/// be canonically encoded, or [`MlsError::GroupCreationFailed`] if `OpenMLS`
+/// group creation fails.
+///
+/// See ADR-001 acceptance criterion 1, spec §5.13.3, §9.16.1.
+pub fn create_group_with_context(
+    credential: &ScpCredential,
+    wrapping_pubkey: &[u8; 32],
+    context_extension: &ScpContextExtension,
+) -> Result<ScpMlsGroup, MlsError> {
+    let capabilities = crate::context_extension::scp_capabilities_with_context_params();
+    let group_context_extensions =
+        crate::context_extension::group_context_extensions(context_extension)?;
+
+    let leaf_ext = crate::wrapping_extension::make_wrapping_key_extension(wrapping_pubkey);
+    let leaf_extensions = Extensions::<LeafNode>::single(leaf_ext)
+        .map_err(|e| MlsError::GroupCreationFailed(format!("wrapping key extension: {e}")))?;
+
+    create_group_inner(
+        credential,
+        Some(capabilities),
+        Some(group_context_extensions),
+        Some(leaf_extensions),
+    )
+}
+
+/// Shared single-member group-creation core for
+/// [`create_group_with_wrapping_key`] and [`create_group_with_context`].
+///
+/// Builds a fresh in-memory provider and signer, embeds `credential` in the MLS
+/// `BasicCredential`, and creates a one-member group under [`SCP_CIPHERSUITE`].
+/// The optional `capabilities`, `group_context_extensions`, and
+/// `leaf_node_extensions` are attached to the create config. Capabilities are
+/// applied **before** the leaf-node extensions because
+/// `with_leaf_node_extensions` validates each leaf extension type against the
+/// configured capabilities (`OpenMLS` `valn0107`).
+fn create_group_inner(
+    credential: &ScpCredential,
+    capabilities: Option<Capabilities>,
+    group_context_extensions: Option<Extensions<GroupContext>>,
+    leaf_node_extensions: Option<Extensions<LeafNode>>,
+) -> Result<ScpMlsGroup, MlsError> {
     let provider = InMemoryMlsProvider::default();
 
     // Generate an Ed25519 signing key pair for the creator.
@@ -349,15 +444,16 @@ pub fn create_group_with_wrapping_key(
         .use_ratchet_tree_extension(true)
         .max_past_epochs(2);
 
-    // If a wrapping key is provided, declare the extension type in
-    // capabilities and include the wrapping key in the LeafNode extensions.
-    if let Some(pubkey) = wrapping_pubkey {
-        let caps = crate::wrapping_extension::scp_capabilities_with_wrapping_key();
+    // Capabilities must be set before the leaf-node extensions: OpenMLS's
+    // with_leaf_node_extensions validates each leaf extension type against the
+    // configured capabilities (valn0107).
+    if let Some(caps) = capabilities {
         builder = builder.capabilities(caps);
-
-        let ext = crate::wrapping_extension::make_wrapping_key_extension(pubkey);
-        let leaf_extensions = Extensions::<LeafNode>::single(ext)
-            .map_err(|e| MlsError::GroupCreationFailed(format!("wrapping key extension: {e}")))?;
+    }
+    if let Some(gc_extensions) = group_context_extensions {
+        builder = builder.with_group_context_extensions(gc_extensions);
+    }
+    if let Some(leaf_extensions) = leaf_node_extensions {
         builder = builder
             .with_leaf_node_extensions(leaf_extensions)
             .map_err(|e| MlsError::GroupCreationFailed(format!("leaf node extensions: {e}")))?;
@@ -667,6 +763,76 @@ pub fn generate_key_package_with_wrapping_key(
     credential: &ScpCredential,
     wrapping_pubkey: Option<&[u8; 32]>,
 ) -> Result<(KeyPackageBundle, SignatureKeyPair, InMemoryMlsProvider), MlsError> {
+    // Wrapping-key-only path: declare only the 0xFF01 extension type and carry
+    // the wrapping key in the LeafNode when a key is provided.
+    let (capabilities, leaf_extensions) = match wrapping_pubkey {
+        Some(pubkey) => {
+            let caps = crate::wrapping_extension::scp_capabilities_with_wrapping_key();
+            let ext = crate::wrapping_extension::make_wrapping_key_extension(pubkey);
+            let leaf_extensions = Extensions::<LeafNode>::single(ext).map_err(|e| {
+                MlsError::KeyPackageGenerationFailed(format!("wrapping key extension: {e}"))
+            })?;
+            (Some(caps), Some(leaf_extensions))
+        }
+        None => (None, None),
+    };
+
+    generate_key_package_inner(credential, capabilities, leaf_extensions)
+}
+
+/// Generates a `KeyPackage` for joining an SCP **context** group (one whose
+/// `group_context` carries the `scp_context_params` extension, `0xFF02`).
+///
+/// The generated `KeyPackage`'s `LeafNode` declares support for **both** SCP
+/// extension types (`0xFF01` + `0xFF02`) via
+/// [`scp_capabilities_with_context_params`](crate::context_extension::scp_capabilities_with_context_params)
+/// and carries the `scp_wrapping_key` (`0xFF01`) `LeafNode` extension with the
+/// participant's wrapping public key.
+///
+/// The `0xFF02` capability declaration is **required** to join a context group:
+/// `OpenMLS` rejects an Add proposal (RFC 9420 §12.1.8.2, `valn0502`) unless the
+/// joiner's leaf supports every extension present in the group's `group_context`
+/// — including the `scp_context_params` extension. A `KeyPackage` produced by
+/// [`generate_key_package_with_wrapping_key`] (which declares only `0xFF01`)
+/// therefore cannot be added to a context group; use this function instead.
+///
+/// # Arguments
+///
+/// * `credential` - The participant's SCP credential (DID + optional UCAN).
+/// * `wrapping_pubkey` - The participant's 32-byte X25519 wrapping public key.
+///
+/// # Errors
+///
+/// Returns [`MlsError::CredentialSerializationFailed`] if the credential cannot
+/// be serialized, or [`MlsError::KeyPackageGenerationFailed`] if key package
+/// generation fails.
+///
+/// See spec §5.13.3, §9.16.1.
+pub fn generate_key_package_with_context_params(
+    credential: &ScpCredential,
+    wrapping_pubkey: &[u8; 32],
+) -> Result<(KeyPackageBundle, SignatureKeyPair, InMemoryMlsProvider), MlsError> {
+    let capabilities = crate::context_extension::scp_capabilities_with_context_params();
+    let ext = crate::wrapping_extension::make_wrapping_key_extension(wrapping_pubkey);
+    let leaf_extensions = Extensions::<LeafNode>::single(ext).map_err(|e| {
+        MlsError::KeyPackageGenerationFailed(format!("wrapping key extension: {e}"))
+    })?;
+
+    generate_key_package_inner(credential, Some(capabilities), Some(leaf_extensions))
+}
+
+/// Shared `KeyPackage` generation core for
+/// [`generate_key_package_with_wrapping_key`] and
+/// [`generate_key_package_with_context_params`].
+///
+/// Builds a fresh in-memory provider and signer, embeds `credential`, and
+/// generates a single-use `KeyPackage` under [`SCP_CIPHERSUITE`] with the given
+/// optional leaf capabilities and leaf-node extensions.
+fn generate_key_package_inner(
+    credential: &ScpCredential,
+    capabilities: Option<Capabilities>,
+    leaf_node_extensions: Option<Extensions<LeafNode>>,
+) -> Result<(KeyPackageBundle, SignatureKeyPair, InMemoryMlsProvider), MlsError> {
     let provider = InMemoryMlsProvider::default();
 
     let signer = SignatureKeyPair::new(SCP_CIPHERSUITE.signature_algorithm())
@@ -685,14 +851,10 @@ pub fn generate_key_package_with_wrapping_key(
 
     let mut builder = KeyPackage::builder();
 
-    if let Some(pubkey) = wrapping_pubkey {
-        let caps = crate::wrapping_extension::scp_capabilities_with_wrapping_key();
+    if let Some(caps) = capabilities {
         builder = builder.leaf_node_capabilities(caps);
-
-        let ext = crate::wrapping_extension::make_wrapping_key_extension(pubkey);
-        let leaf_extensions = Extensions::<LeafNode>::single(ext).map_err(|e| {
-            MlsError::KeyPackageGenerationFailed(format!("wrapping key extension: {e}"))
-        })?;
+    }
+    if let Some(leaf_extensions) = leaf_node_extensions {
         builder = builder.leaf_node_extensions(leaf_extensions);
     }
 
