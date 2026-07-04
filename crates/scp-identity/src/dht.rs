@@ -3351,10 +3351,11 @@ mod tests {
     /// The native wrapper accepts ONLY `did:dht` — never `did:key` — in every
     /// build. The shared `scp-did` authority accepts a `did:key:{hex}` test
     /// convenience when `scp-did/testing` is enabled, and that feature is
-    /// reachable transitively through custody opt-ins
-    /// (`scp-ffi/allow_in_memory_custody → scp-testing → scp-identity/testing`
-    /// unifies `scp-did/testing` in the same workspace build). The wrapper's
-    /// unconditional prefix gate rejects `did:key` regardless.
+    /// unified ON by sibling crates (`scp-protocol/testing`, `scp-mls/testing`,
+    /// `scp-event-log/testing`, `scp-ffi-common/testing`) in any workspace or
+    /// CI build that also compiles this crate — including custody-opt-in
+    /// builds. The wrapper's unconditional prefix gate rejects `did:key`
+    /// regardless of which path enables it.
     ///
     /// Caveat on what this test proves in isolation: under a bare
     /// `cargo test -p scp-identity` the authority's `did:key` branch is compiled
