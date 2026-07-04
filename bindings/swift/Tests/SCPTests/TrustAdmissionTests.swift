@@ -266,7 +266,7 @@ final class TrustAdmissionEncoderTests: XCTestCase {
                 msg,
                 "ParticipationProfile.eventLogRoot must be exactly 32 elements, got 3"
             )
-            XCTAssertEqual(code, "SCP-VALID-7062")
+            XCTAssertEqual(code, "SCP-VALID-7095")
         }
     }
 
@@ -295,7 +295,7 @@ final class TrustAdmissionEncoderTests: XCTestCase {
                 msg,
                 "ChallengeVerification.verifierSignature must be exactly 64 elements, got 63"
             )
-            XCTAssertEqual(code, "SCP-VALID-7063")
+            XCTAssertEqual(code, "SCP-VALID-7096")
         }
     }
 

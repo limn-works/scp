@@ -922,7 +922,7 @@ public extension SCP {
               let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw ScpError.Validation(
                 msg: "failed to parse aggregation result JSON",
-                code: "SCP-VALID-7060"
+                code: "SCP-VALID-7093"
             )
         }
 
@@ -1419,7 +1419,7 @@ private func encodeTrustAdmissionJson(_ value: some Encodable) throws -> String 
     guard let json = String(data: data, encoding: .utf8) else {
         throw ScpError.Validation(
             msg: "failed to encode trust admission input as UTF-8 JSON",
-            code: "SCP-VALID-7061"
+            code: "SCP-VALID-7094"
         )
     }
     return json
@@ -1463,15 +1463,15 @@ public func encodeParticipationProfileJson(_ profiles: [ParticipationProfile]) t
     for profile in profiles {
         try requireByteLength(
             "ParticipationProfile", "eventLogRoot",
-            expected: 32, actual: profile.eventLogRoot, code: "SCP-VALID-7062"
+            expected: 32, actual: profile.eventLogRoot, code: "SCP-VALID-7095"
         )
         try requireByteLength(
             "ParticipationProfile", "signerPublicKey",
-            expected: 32, actual: profile.signerPublicKey, code: "SCP-VALID-7062"
+            expected: 32, actual: profile.signerPublicKey, code: "SCP-VALID-7095"
         )
         try requireByteLength(
             "ParticipationProfile", "signature",
-            expected: 64, actual: profile.signature, code: "SCP-VALID-7062"
+            expected: 64, actual: profile.signature, code: "SCP-VALID-7095"
         )
     }
     return try encodeTrustAdmissionJson(profiles)
@@ -1496,7 +1496,7 @@ public func encodeChallengeVerificationsJson(_ verifications: [ChallengeVerifica
     for verification in verifications {
         try requireByteLength(
             "ChallengeVerification", "verifierSignature",
-            expected: 64, actual: verification.verifierSignature, code: "SCP-VALID-7063"
+            expected: 64, actual: verification.verifierSignature, code: "SCP-VALID-7096"
         )
     }
     return try encodeTrustAdmissionJson(verifications)
@@ -1722,11 +1722,11 @@ public func encodeEventLogEntriesJson(_ events: [EventLogEntry]) throws -> Strin
     for event in events {
         try requireByteLength(
             "EventLogEntry", "prevHash",
-            expected: 32, actual: event.prevHash, code: "SCP-VALID-7064"
+            expected: 32, actual: event.prevHash, code: "SCP-VALID-7097"
         )
         try requireByteLength(
             "EventLogEntry", "signature",
-            expected: 64, actual: event.signature, code: "SCP-VALID-7064"
+            expected: 64, actual: event.signature, code: "SCP-VALID-7097"
         )
     }
     return try encodeTrustAdmissionJson(events)
@@ -1740,7 +1740,7 @@ public func encodeEventLogEntriesJson(_ events: [EventLogEntry]) throws -> Strin
 public func encodeMerkleRootJson(_ merkleRoot: [UInt8]) throws -> String {
     try requireByteLength(
         "AggregatedTrustInput", "merkleRoot",
-        expected: 32, actual: merkleRoot, code: "SCP-VALID-7064"
+        expected: 32, actual: merkleRoot, code: "SCP-VALID-7097"
     )
     return try encodeTrustAdmissionJson(merkleRoot)
 }
@@ -1977,7 +1977,7 @@ public func encodeAttestationJson(_ attestation: CachedAttestationEnvelope) thro
 public func encodeChallengeRequestJson(_ challenge: ChallengeRequest) throws -> String {
     try requireByteLength(
         "ChallengeRequest", "signature",
-        expected: 64, actual: challenge.signature, code: "SCP-VALID-7065"
+        expected: 64, actual: challenge.signature, code: "SCP-VALID-7098"
     )
     return try encodeTrustAdmissionJson(challenge)
 }
@@ -1990,7 +1990,7 @@ public func encodeChallengeRequestJson(_ challenge: ChallengeRequest) throws -> 
 public func encodeChallengeResponseJson(_ response: ChallengeResponse) throws -> String {
     try requireByteLength(
         "ChallengeResponse", "signature",
-        expected: 64, actual: response.signature, code: "SCP-VALID-7065"
+        expected: 64, actual: response.signature, code: "SCP-VALID-7098"
     )
     return try encodeTrustAdmissionJson(response)
 }
