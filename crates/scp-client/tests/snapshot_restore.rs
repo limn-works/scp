@@ -76,6 +76,7 @@ fn converged_pair(bob_storage: Arc<dyn Storage>) -> (ScpClient, ScpClient) {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // one end-to-end restore scenario, read top-to-bottom
 fn restore_resumes_a_converged_context_from_storage() {
     let bob_storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
     let (mut alice, mut bob) = converged_pair(Arc::clone(&bob_storage));
@@ -172,9 +173,33 @@ fn restore_resumes_a_converged_context_from_storage() {
         .receive_message(CTX, &send3)
         .expect("alice receives from restored bob");
     assert!(was_app);
+    // Alice's buffer now holds her own two sends (`before restore`, `after
+    // restore`) as local `MessageSent` history plus Bob's `MessageReceived`, in
+    // FIFO order — a send buffers the sender's own history (ADR-011: it is not a
+    // convergent leaf). The received message is the last entry.
     let alice_events = alice.drain_events(CTX).expect("alice drains");
-    assert_eq!(alice_events.len(), 1);
-    match &alice_events[0] {
+    assert_eq!(
+        alice_events.len(),
+        3,
+        "Alice's own two sends plus Bob's received message are buffered"
+    );
+    assert!(
+        matches!(
+            &alice_events[0],
+            ContextEvent::MessageSent { sender_did, payload, .. }
+                if sender_did.0 == ALICE_DID && payload.as_slice() == b"before restore"
+        ),
+        "first buffered event is Alice's own first send"
+    );
+    assert!(
+        matches!(
+            &alice_events[1],
+            ContextEvent::MessageSent { sender_did, payload, .. }
+                if sender_did.0 == ALICE_DID && payload.as_slice() == b"after restore"
+        ),
+        "second buffered event is Alice's own second send"
+    );
+    match &alice_events[2] {
         ContextEvent::MessageReceived {
             sender_did,
             payload,
@@ -182,7 +207,61 @@ fn restore_resumes_a_converged_context_from_storage() {
             assert_eq!(sender_did.0, BOB_DID);
             assert_eq!(payload.as_slice(), b"from restored bob");
         }
-        other => panic!("expected MessageReceived, got {other:?}"),
+        other => panic!("expected MessageReceived last, got {other:?}"),
+    }
+}
+
+#[test]
+fn buffer_with_sent_and_received_round_trips_through_restore() {
+    // ADR-057 T3: the driver now buffers a sender's own `MessageSent` local
+    // history alongside received `MessageReceived` messages (neither is a
+    // convergent leaf — ADR-011). A client that has both SENT and RECEIVED without
+    // draining must restore BOTH from its snapshot's variant-aware buffer.
+    let bob_storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+    let (mut alice, mut bob) = converged_pair(Arc::clone(&bob_storage));
+
+    // Bob sends (buffers his own MessageSent); Alice consumes it so her ratchet
+    // stays usable. Then Alice sends and Bob receives (buffers a MessageReceived).
+    // Bob drains neither.
+    let bob_ct = bob.send_message(CTX, b"bob's own send").expect("bob sends");
+    alice
+        .receive_message(CTX, &bob_ct)
+        .expect("alice receives bob");
+    let alice_ct = alice
+        .send_message(CTX, b"alice to bob")
+        .expect("alice sends");
+    bob.receive_message(CTX, &alice_ct)
+        .expect("bob receives alice");
+    drop(bob); // tab closes with an undrained Sent + Received in the buffer.
+
+    // A reopened tab restores both buffered events, in FIFO order.
+    let mut bob2 = client_over(BOB_DID, Arc::clone(&bob_storage), seed(199));
+    let drained = bob2.drain_events(CTX).expect("bob2 drains");
+    assert_eq!(
+        drained.len(),
+        2,
+        "both the sender's MessageSent and the received MessageReceived survive"
+    );
+    match &drained[0] {
+        ContextEvent::MessageSent {
+            sender_did,
+            payload,
+            ..
+        } => {
+            assert_eq!(sender_did.0, BOB_DID, "Bob's own send is first");
+            assert_eq!(payload.as_slice(), b"bob's own send");
+        }
+        other => panic!("expected the buffered MessageSent first, got {other:?}"),
+    }
+    match &drained[1] {
+        ContextEvent::MessageReceived {
+            sender_did,
+            payload,
+        } => {
+            assert_eq!(sender_did.0, ALICE_DID, "Alice's message is second");
+            assert_eq!(payload.as_slice(), b"alice to bob");
+        }
+        other => panic!("expected the buffered MessageReceived second, got {other:?}"),
     }
 }
 

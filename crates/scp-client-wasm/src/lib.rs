@@ -139,10 +139,12 @@ impl WasmAddMemberOutput {
     }
 }
 
-/// A drained receive event, in JS-friendly form.
+/// A drained context event, in JS-friendly form.
 ///
-/// The participant driver buffers `MessageReceived` events; this carries the
-/// decrypted message across the boundary. `kind` is the event variant name so
+/// The participant driver buffers local message history — a sender's own
+/// `MessageSent` and a receiver's `MessageReceived` — and this carries the
+/// (decrypted) message across the boundary. `kind` is the event variant name
+/// (`"MessageSent"` / `"MessageReceived"`) so the caller can discriminate, and
 /// the surface stays forward-safe if the driver buffers more variants later.
 #[wasm_bindgen]
 pub struct WasmReceivedEvent {
@@ -422,9 +424,20 @@ impl WasmScpClient {
                     sender_did: sender_did.0,
                     payload,
                 },
-                // The participant driver only buffers MessageReceived today;
-                // any other variant is surfaced with its name and an empty
-                // payload rather than dropped, so the surface is forward-safe.
+                // A sender's own local `MessageSent` history (ADR-011 / ADR-057
+                // T3): the driver buffers it on send, so the surface returns it
+                // with its sender DID + payload, discriminated by `kind`.
+                ContextEvent::MessageSent {
+                    sender_did,
+                    payload,
+                    ..
+                } => WasmReceivedEvent {
+                    kind: "MessageSent".to_owned(),
+                    sender_did: sender_did.0,
+                    payload,
+                },
+                // Any other variant is surfaced with its name and an empty payload
+                // rather than dropped, so the surface is forward-safe.
                 other => WasmReceivedEvent {
                     kind: event_kind(&other).to_owned(),
                     sender_did: String::new(),

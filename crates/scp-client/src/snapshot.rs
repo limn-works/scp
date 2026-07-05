@@ -35,17 +35,19 @@
 //!
 //! # The receive buffer IS persisted (and why)
 //!
-//! The pull-based receive buffer ([`PerContextState::event_buffer`]) — decrypted
-//! messages awaiting `drain_events` — round-trips in this snapshot (as
-//! `buffered_messages`), so a message decrypted before a crash-before-drain is
-//! delivered exactly once after restore rather than lost. It cannot be recovered
-//! by relay re-delivery: decrypting it already advanced the MLS ratchet, and that
-//! advance is persisted in `mls_state`, so on restore openmls rejects the
-//! re-delivered ciphertext with *"the requested secret was deleted to preserve
-//! forward secrecy."* Persisting the buffer keeps the persisted `recv_sequence_tracker`
-//! floor consistent with the persisted MLS ratchet — both advance together on
-//! decrypt and are captured together. This is decrypted plaintext, so it relies on
-//! the backend's encryption at rest (below). (`snapshot_restore.rs` pins both the
+//! The pull-based receive buffer ([`PerContextState::event_buffer`]) — local
+//! message history awaiting `drain_events` — round-trips in this snapshot (as
+//! `buffered_events`, a variant-aware [`BufferedEvent`] list holding a sender's
+//! own `MessageSent` and a receiver's `MessageReceived`), so a message sent or
+//! decrypted before a crash-before-drain is delivered exactly once after restore
+//! rather than lost. A received message cannot be recovered by relay re-delivery:
+//! decrypting it already advanced the MLS ratchet, and that advance is persisted
+//! in `mls_state`, so on restore openmls rejects the re-delivered ciphertext with
+//! *"the requested secret was deleted to preserve forward secrecy."* Persisting
+//! the buffer keeps the persisted `recv_sequence_tracker` floor consistent with
+//! the persisted MLS ratchet — both advance together on decrypt and are captured
+//! together. This is decrypted plaintext, so it relies on the backend's
+//! encryption at rest (below). (`snapshot_restore.rs` pins both the
 //! deliver-exactly-once and the FS-rejection properties.)
 //!
 //! # What this snapshot does NOT carry
@@ -90,7 +92,43 @@ use crate::error::ClientError;
 /// mis-deserialized. Bump this when the snapshot shape changes; SCP is
 /// pre-release, so there is no legacy-format migration path — an unknown version
 /// is a hard error.
-pub const SNAPSHOT_FORMAT_VERSION: u16 = 1;
+///
+/// **v2** widened the persisted receive buffer from `MessageReceived`-only pairs
+/// to a variant-aware [`BufferedEvent`] (the driver now also buffers a sender's
+/// own `MessageSent` local history — ADR-011 / ADR-057 T3). Pre-release: no
+/// migration, a v1 blob is rejected as an unknown version.
+pub const SNAPSHOT_FORMAT_VERSION: u16 = 2;
+
+/// A buffered, decrypted-but-undrained context event, in serializable form.
+///
+/// The participant driver buffers two variants of local message history for
+/// [`crate::ScpClient::drain_events`]: a sender's own `MessageSent` (recorded on
+/// [`crate::ScpClient::send_message`]) and a receiver's `MessageReceived`
+/// (recorded on [`crate::ScpClient::receive_message`]). Neither is a convergent
+/// event-log leaf (ADR-011 exclusion taxonomy §2), so both live only in this
+/// buffer; persisting them keeps the persisted `recv_sequence_tracker` / MLS
+/// ratchet consistent with what the tab had decrypted/sent before a
+/// crash-before-drain. Both carry decrypted plaintext, so both depend on the
+/// backend's encryption at rest (see the module security note) and are zeroized.
+#[derive(Serialize, Deserialize)]
+enum BufferedEvent {
+    /// A message this participant sent (its own local `MessageSent` history).
+    Sent {
+        /// The sender's DID (this participant).
+        sender_did: String,
+        /// The per-sender sequence number stamped on the send.
+        sequence_number: u64,
+        /// The (plaintext) payload that was sent.
+        payload: Vec<u8>,
+    },
+    /// A message this participant received and decrypted (`MessageReceived`).
+    Received {
+        /// The sender's DID (a peer).
+        sender_did: String,
+        /// The decrypted plaintext payload.
+        payload: Vec<u8>,
+    },
+}
 
 /// A serializable snapshot of one context's participant state.
 ///
@@ -127,16 +165,17 @@ pub struct ContextSnapshot {
     /// The full ordered event-log stream. Replayed on restore to reconstruct a
     /// byte-identical [`EventLog`] (same leaves, same root — §9.9.3).
     events: Vec<Event>,
-    /// The pull-based receive buffer — decrypted-but-undrained messages as
-    /// `(sender_did, plaintext)` pairs, in FIFO order. Persisted so a message
-    /// that was decrypted before a crash-before-drain is NOT lost: it survives in
-    /// the encrypted-at-rest snapshot and is returned by `drain_events` after
-    /// restore (it cannot be recovered by relay re-delivery — decrypting it
-    /// already advanced and persisted the MLS forward-secrecy ratchet). This is
-    /// decrypted plaintext, so it depends on the backend's encryption at rest
-    /// (see the module security note); the driver only ever buffers
-    /// `MessageReceived`, so this pair form is its complete representation.
-    buffered_messages: Vec<(String, Vec<u8>)>,
+    /// The pull-based receive buffer — decrypted-but-undrained local message
+    /// history as variant-aware [`BufferedEvent`]s, in FIFO order. Persisted so a
+    /// message sent or decrypted before a crash-before-drain is NOT lost: it
+    /// survives in the encrypted-at-rest snapshot and is returned by
+    /// `drain_events` after restore (a received message cannot be recovered by
+    /// relay re-delivery — decrypting it already advanced and persisted the MLS
+    /// forward-secrecy ratchet). This is decrypted plaintext, so it depends on the
+    /// backend's encryption at rest (see the module security note). The driver
+    /// buffers `MessageSent` (a sender's own history) and `MessageReceived`, so
+    /// [`BufferedEvent`]'s two variants are its complete representation.
+    buffered_events: Vec<BufferedEvent>,
     /// The membership set (member DIDs).
     members: Vec<String>,
     /// Per-member next-outgoing message sequence numbers: `(did, sequence)`.
@@ -173,8 +212,8 @@ impl std::fmt::Debug for ContextSnapshot {
             .field("recv_sequence_tracker", &self.recv_sequence_tracker)
             .field("events", &format_args!("[{} events]", self.events.len()))
             .field(
-                "buffered_messages",
-                &format_args!("[{} messages, REDACTED]", self.buffered_messages.len()),
+                "buffered_events",
+                &format_args!("[{} events, REDACTED]", self.buffered_events.len()),
             )
             .field("members", &self.members)
             .field("member_sequence_numbers", &self.member_sequence_numbers)
@@ -225,21 +264,34 @@ impl ContextSnapshot {
             .map(|(did, seq)| (did.clone(), *seq))
             .collect();
 
-        // Convert the receive buffer (decrypted-but-undrained messages) into the
-        // persisted pair form. The driver only ever buffers `MessageReceived`; any
-        // other variant is an internal invariant violation and fails closed rather
-        // than being silently dropped (the payload is never logged).
-        let mut buffered_messages = Vec::with_capacity(state.event_buffer.len());
+        // Convert the receive buffer (decrypted-but-undrained local history) into
+        // the persisted variant-aware form. The driver buffers `MessageSent` (a
+        // sender's own history) and `MessageReceived`; any other variant is an
+        // internal invariant violation and fails closed rather than being silently
+        // dropped (the payload is never logged).
+        let mut buffered_events = Vec::with_capacity(state.event_buffer.len());
         for event in &state.event_buffer {
             match event {
+                ContextEvent::MessageSent {
+                    sender_did,
+                    sequence_number,
+                    payload,
+                } => buffered_events.push(BufferedEvent::Sent {
+                    sender_did: sender_did.0.clone(),
+                    sequence_number: *sequence_number,
+                    payload: payload.clone(),
+                }),
                 ContextEvent::MessageReceived {
                     sender_did,
                     payload,
-                } => buffered_messages.push((sender_did.0.clone(), payload.clone())),
+                } => buffered_events.push(BufferedEvent::Received {
+                    sender_did: sender_did.0.clone(),
+                    payload: payload.clone(),
+                }),
                 _ => {
                     return Err(ClientError::Driver(
-                        "receive buffer holds a non-MessageReceived event; only \
-                         MessageReceived is buffered by the participant driver"
+                        "receive buffer holds an event that is neither MessageSent nor \
+                         MessageReceived; only those are buffered by the participant driver"
                             .to_owned(),
                     ));
                 }
@@ -257,7 +309,7 @@ impl ContextSnapshot {
             sender_key_epochs,
             recv_sequence_tracker,
             events: state.events(),
-            buffered_messages,
+            buffered_events,
             members: state.members.clone(),
             member_sequence_numbers,
             event_log_root: state.event_log_root(),
@@ -353,15 +405,30 @@ impl ContextSnapshot {
                 .into_iter()
                 .collect();
 
-        // Rebuild the receive buffer (decrypted-but-undrained messages) in FIFO
-        // order, so a message decrypted before the tab closed is delivered exactly
-        // once after restore (it cannot be recovered by relay re-delivery — the MLS
-        // ratchet that decrypted it is persisted and advanced).
-        let event_buffer: VecDeque<ContextEvent> = std::mem::take(&mut self.buffered_messages)
+        // Rebuild the receive buffer (decrypted-but-undrained local history) in
+        // FIFO order, so a message sent or decrypted before the tab closed is
+        // delivered exactly once after restore (a received message cannot be
+        // recovered by relay re-delivery — the MLS ratchet that decrypted it is
+        // persisted and advanced).
+        let event_buffer: VecDeque<ContextEvent> = std::mem::take(&mut self.buffered_events)
             .into_iter()
-            .map(|(sender_did, payload)| ContextEvent::MessageReceived {
-                sender_did: sender_did.into(),
-                payload,
+            .map(|event| match event {
+                BufferedEvent::Sent {
+                    sender_did,
+                    sequence_number,
+                    payload,
+                } => ContextEvent::MessageSent {
+                    sender_did: sender_did.into(),
+                    sequence_number,
+                    payload,
+                },
+                BufferedEvent::Received {
+                    sender_did,
+                    payload,
+                } => ContextEvent::MessageReceived {
+                    sender_did: sender_did.into(),
+                    payload,
+                },
             })
             .collect();
 
@@ -429,8 +496,12 @@ impl ContextSnapshot {
         for (_, key) in &mut self.sender_key_entries {
             key.zeroize();
         }
-        for (_, payload) in &mut self.buffered_messages {
-            payload.zeroize();
+        for event in &mut self.buffered_events {
+            match event {
+                BufferedEvent::Sent { payload, .. } | BufferedEvent::Received { payload, .. } => {
+                    payload.zeroize();
+                }
+            }
         }
     }
 }
@@ -506,9 +577,15 @@ mod tests {
 
     #[test]
     fn buffered_messages_round_trip() {
-        // A decrypted-but-undrained MessageReceived survives capture/restore and
-        // is delivered exactly once after restore.
+        // Both buffered variants — a sender's own MessageSent and a receiver's
+        // MessageReceived — survive capture/restore in FIFO order and are
+        // delivered exactly once after restore.
         let mut state = fresh_state();
+        state.push_event(ContextEvent::MessageSent {
+            sender_did: CREATOR.to_owned().into(),
+            sequence_number: 7,
+            payload: b"my own send".to_vec(),
+        });
         state.push_event(ContextEvent::MessageReceived {
             sender_did: "did:key:zPeer".to_owned().into(),
             payload: b"undrained".to_vec(),
@@ -524,8 +601,20 @@ mod tests {
             .unwrap();
 
         let drained = restored.drain_events();
-        assert_eq!(drained.len(), 1);
+        assert_eq!(drained.len(), 2, "both buffered events survive");
         match &drained[0] {
+            ContextEvent::MessageSent {
+                sender_did,
+                sequence_number,
+                payload,
+            } => {
+                assert_eq!(sender_did.0, CREATOR);
+                assert_eq!(*sequence_number, 7);
+                assert_eq!(payload.as_slice(), b"my own send");
+            }
+            other => panic!("expected the buffered MessageSent first, got {other:?}"),
+        }
+        match &drained[1] {
             ContextEvent::MessageReceived {
                 sender_did,
                 payload,
@@ -533,11 +622,11 @@ mod tests {
                 assert_eq!(sender_did.0, "did:key:zPeer");
                 assert_eq!(payload.as_slice(), b"undrained");
             }
-            other => panic!("expected the buffered MessageReceived, got {other:?}"),
+            other => panic!("expected the buffered MessageReceived second, got {other:?}"),
         }
         assert!(
             restored.drain_events().is_empty(),
-            "the buffered message is delivered exactly once"
+            "the buffered messages are delivered exactly once"
         );
     }
 

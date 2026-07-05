@@ -9,9 +9,11 @@
 //! / drain / close, touching ONLY the `#[wasm_bindgen]`-exported methods and the
 //! JS-friendly wrapper types (`WasmAddMemberOutput`, `WasmReceivedEvent`)
 //! exactly as JavaScript would. `sendMessage` returns the ciphertext bytes
-//! directly (the convergent timestamp rides inside the authenticated AAD — ADR-057
-//! — so there is no `WasmSendOutput` wrapper and `receiveMessage` takes only
-//! the ciphertext).
+//! directly: an application message is plain-encrypted and is not a convergent
+//! event-log leaf (ADR-011), so there is no `WasmSendOutput` wrapper and no
+//! transported timestamp — `receiveMessage` takes only the ciphertext. The
+//! convergent committer timestamp survives only on the add-Commit path, bound
+//! into that Commit's authenticated AAD (ADR-057 T3).
 //!
 //! # Why a native host test, not `wasm-bindgen-test`
 //!
@@ -109,7 +111,7 @@ fn assert_convergence(alice: &WasmScpClient, bob: &WasmScpClient) {
     let bob_leaves = bob
         .event_log_leaf_hashes(CTX.to_owned())
         .expect("bob leaves");
-    assert_eq!(alice_leaves.len(), 3 * 32, "3 leaves × 32 bytes");
+    assert_eq!(alice_leaves.len(), 2 * 32, "2 membership leaves × 32 bytes");
     assert_eq!(
         alice_leaves, bob_leaves,
         "every leaf hash is byte-identical across both members (convergence)"
@@ -204,12 +206,11 @@ fn two_party_exchange_through_wasm_surface() {
     assert!(!ciphertext.is_empty(), "ciphertext present");
     assert_eq!(
         alice.event_log_leaf_count(CTX.to_owned()),
-        Some(3),
-        "Alice's log is now created + joined + sent"
+        Some(2),
+        "a send stamps NO convergent leaf (ADR-011): Alice's log stays created + joined"
     );
 
-    // --- Bob receives + decrypts using the authenticated timestamp recovered from
-    // the ciphertext's verified AAD (no separate timestamp is passed), then
+    // --- Bob receives + decrypts a plain application message (no AAD), then
     // drains. ---
     let was_application = bob
         .receive_message(CTX.to_owned(), ciphertext)
