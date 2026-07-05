@@ -716,7 +716,9 @@ fn extract_cost(
         .transpose()?;
 
     Ok(Some(scp_core::context::tools::ToolCost {
-        amount,
+        // ADR-060: `ToolCost.amount` is the `Amount` newtype; the FFI native
+        // `u64` param is unchanged (string-typed FFI params are Phase 2).
+        amount: scp_core::economy::Amount(amount),
         currency,
         payee: payee.into(),
         cost_formula,

@@ -23,6 +23,7 @@ use super::{
     has_admin_role, has_tool_register_capability, schema,
 };
 use crate::context::roles::ContextRoleState;
+use crate::economy::types::Amount;
 
 // ---------------------------------------------------------------------------
 // ToolSchema
@@ -71,7 +72,9 @@ pub struct TestVector {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolCost {
     /// Cost per invocation in the smallest currency unit.
-    pub amount: u64,
+    ///
+    /// Serializes on the wire as a canonical decimal string (ADR-060).
+    pub amount: Amount,
     /// ISO 4217 or protocol-defined currency code.
     pub currency: String,
     /// The DID that receives tool invocation payments. May differ from the
@@ -561,7 +564,9 @@ pub fn compute_tool_registration_canonical_bytes(
     match &registration.cost {
         Some(tc) => {
             hasher.update([0x01]);
-            hasher.update(tc.amount.to_be_bytes());
+            // Hash the raw `u64` big-endian bytes (NOT the ADR-060 wire string),
+            // keeping the TOOL-REGISTRATION canonical preimage byte-identical.
+            hasher.update(tc.amount.0.to_be_bytes());
             length_prefix(&mut hasher, tc.currency.as_bytes());
             match &tc.cost_formula {
                 Some(formula) => {
@@ -969,7 +974,7 @@ mod tests {
         let mut registry = ToolRegistry::new();
         let mut registration = valid_registration("tool-1");
         registration.cost = Some(ToolCost {
-            amount: 100,
+            amount: Amount(100),
             currency: "USD".to_owned(),
             payee: "did:dht:z6MkPayee".into(),
             cost_formula: None,
@@ -985,7 +990,7 @@ mod tests {
 
         let stored = registry.get("tool-1").unwrap();
         assert!(stored.cost.is_some());
-        assert_eq!(stored.cost.as_ref().unwrap().amount, 100);
+        assert_eq!(stored.cost.as_ref().unwrap().amount, Amount(100));
         assert_eq!(stored.cost.as_ref().unwrap().currency, "USD");
     }
 
@@ -1481,7 +1486,7 @@ mod tests {
     #[test]
     fn tool_cost_serialization_roundtrip() {
         let cost = ToolCost {
-            amount: 500,
+            amount: Amount(500),
             currency: "USD".to_owned(),
             payee: "did:dht:z6MkPayee".into(),
             cost_formula: Some("linear".to_owned()),
@@ -1489,5 +1494,51 @@ mod tests {
         let json = serde_json::to_string(&cost).unwrap();
         let deserialized: ToolCost = serde_json::from_str(&json).unwrap();
         assert_eq!(cost, deserialized);
+    }
+
+    #[test]
+    fn tool_cost_amount_serializes_as_canonical_decimal_string() {
+        // ADR-060 wire form: amount is a quoted string, not a JSON number.
+        let cost = ToolCost {
+            amount: Amount(500),
+            currency: "USD".to_owned(),
+            payee: "did:dht:z6MkPayee".into(),
+            cost_formula: None,
+        };
+        let value: serde_json::Value = serde_json::to_value(&cost).unwrap();
+        assert_eq!(value["amount"], serde_json::json!("500"));
+        assert!(value["amount"].is_string());
+    }
+
+    #[test]
+    fn tool_registration_canonical_bytes_use_raw_u64_be_not_wire_string() {
+        // Byte-stability guard: the TOOL-REGISTRATION preimage must hash the raw
+        // `u64` big-endian amount, NOT the ADR-060 decimal wire string, so the
+        // canonical bytes are byte-identical to the pre-ADR-060 preimage.
+        let mut registration = valid_registration("tool-1");
+        registration.cost = Some(ToolCost {
+            amount: Amount(0x0102_0304_0506_0708),
+            currency: "USD".to_owned(),
+            payee: "did:dht:z6MkPayee".into(),
+            cost_formula: None,
+        });
+        let d1 = compute_tool_registration_canonical_bytes(&registration).unwrap();
+        let d2 = compute_tool_registration_canonical_bytes(&registration).unwrap();
+        assert_eq!(d1, d2, "canonical bytes must be deterministic");
+
+        // Changing only the raw u64 amount yields a different digest — proving
+        // the amount contributes via its raw-integer path (the decimal wire
+        // string is never hashed).
+        registration.cost = Some(ToolCost {
+            amount: Amount(0x0102_0304_0506_0709),
+            currency: "USD".to_owned(),
+            payee: "did:dht:z6MkPayee".into(),
+            cost_formula: None,
+        });
+        assert_ne!(
+            d1,
+            compute_tool_registration_canonical_bytes(&registration).unwrap(),
+            "amount must contribute to the preimage via its raw u64 bytes"
+        );
     }
 }

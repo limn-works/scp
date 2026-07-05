@@ -223,7 +223,9 @@ pub(crate) async fn tool_register_on(
         validate_implementation_hash(definition.implementation_hash.as_deref())?;
 
     let cost = definition.cost.map(|c| scp_core::context::tools::ToolCost {
-        amount: c.amount.max(0).cast_unsigned(),
+        // ADR-060: `ToolCost.amount` is the `Amount` newtype; the FFI native
+        // int param is unchanged (string-typed FFI params are Phase 2).
+        amount: scp_core::economy::Amount(c.amount.max(0).cast_unsigned()),
         currency: c.currency,
         payee: c.payee.into(),
         cost_formula: c.cost_formula,

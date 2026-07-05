@@ -8,9 +8,63 @@
 //! See spec section 19.1.1 (core types), 19.3 (economic policy), and
 //! 19.4 (dynamic pricing). See ADR-033 in `.docs/adrs/phase-3.md`.
 
-use serde::{Deserialize, Serialize};
+use serde::de::{self, Visitor};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use scp_did::DID;
+
+// ---------------------------------------------------------------------------
+// Canonical decimal-string wire codec (ADR-060)
+// ---------------------------------------------------------------------------
+//
+// Monetary values serialize on the wire as a canonical base-10 decimal STRING
+// encoding the smallest-unit integer (the scale stays with `currency` /
+// `COEFFICIENT_SCALE`). The wire form is decoupled from the Rust core width so
+// a future `u64` -> `u128` widening is non-breaking on every serde encoding,
+// and reimplementations (notably JS `JSON.parse`, which cannot round-trip a
+// `u64`) reproduce the bytes exactly. See ADR-060 and spec §19.
+
+/// Parses a canonical base-10 *unsigned* decimal string (ADR-060 wire form).
+///
+/// Accepts ONLY the canonical form: one or more ASCII digits, no leading zeros
+/// (except the lone `"0"`), no sign, no separators, no whitespace, no decimal
+/// point, no exponent, no hex. Returns `None` for any non-canonical input or on
+/// `u64` overflow. This makes encode/decode byte-identical and injective across
+/// reimplementations.
+fn parse_canonical_u64_str(s: &str) -> Option<u64> {
+    let bytes = s.as_bytes();
+    if bytes.is_empty() {
+        return None;
+    }
+    if !bytes.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    // Reject leading zeros: `"0"` is the only value that may start with `'0'`.
+    if bytes.len() > 1 && bytes[0] == b'0' {
+        return None;
+    }
+    s.parse::<u64>().ok()
+}
+
+/// Parses a canonical base-10 *signed* decimal string (ADR-060 wire form).
+///
+/// Same rules as [`parse_canonical_u64_str`] for the magnitude, plus an
+/// optional single leading `-`. Rejects `-0` (canonical zero is `"0"`), a
+/// leading `+`, and any `i64`-overflowing value.
+fn parse_canonical_i64_str(s: &str) -> Option<i64> {
+    let (negative, magnitude_str) = s.strip_prefix('-').map_or((false, s), |rest| (true, rest));
+    let magnitude = parse_canonical_u64_str(magnitude_str)?;
+    if negative && magnitude == 0 {
+        // `-0` is not canonical; zero is `"0"`.
+        return None;
+    }
+    let signed = if negative {
+        -i128::from(magnitude)
+    } else {
+        i128::from(magnitude)
+    };
+    i64::try_from(signed).ok()
+}
 
 // ---------------------------------------------------------------------------
 // Amount
@@ -24,7 +78,11 @@ use scp_did::DID;
 /// from the same inputs with identical results.
 ///
 /// See spec section 19.1.1.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+///
+/// Wire form (ADR-060): serialized as a canonical base-10 decimal string of the
+/// smallest-unit integer (e.g. `"1000000"`, `"0"`), not a JSON number. See spec
+/// §19 and the codec at the top of this module.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Amount(pub u64);
 
 impl Amount {
@@ -86,6 +144,50 @@ impl std::fmt::Display for Amount {
     }
 }
 
+impl Serialize for Amount {
+    /// Serializes as the canonical base-10 decimal string (ADR-060).
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.0.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for Amount {
+    /// Deserializes strictly from the canonical base-10 decimal string
+    /// (ADR-060). Rejects bare numbers, leading zeros, signs, whitespace,
+    /// separators, and any non-canonical form.
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct AmountVisitor;
+
+        impl Visitor<'_> for AmountVisitor {
+            type Value = Amount;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(
+                    "a canonical base-10 decimal string encoding an unsigned \
+                     smallest-unit integer (ADR-060), e.g. \"1000000\" or \"0\"",
+                )
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Amount, E>
+            where
+                E: de::Error,
+            {
+                parse_canonical_u64_str(value)
+                    .map(Amount)
+                    .ok_or_else(|| de::Error::invalid_value(de::Unexpected::Str(value), &self))
+            }
+        }
+
+        deserializer.deserialize_str(AmountVisitor)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // CurrencyCode
 // ---------------------------------------------------------------------------
@@ -144,8 +246,12 @@ impl std::fmt::Display for CurrencyCode {
 /// Used in pricing formulas where fractional multipliers are needed.
 /// Both sides evaluate identically -- no IEEE 754 variance.
 ///
+/// Wire form (ADR-060): serialized as a canonical base-10 decimal string of the
+/// raw fixed-point integer, allowing a single leading `-` for negatives (e.g.
+/// `"1500000"`, `"-500000"`, `"0"`), not a JSON number.
+///
 /// See spec section 19.1.1.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Coefficient(pub i64);
 
 /// The fixed-point scale factor for [`Coefficient`]: `1_000_000`.
@@ -194,6 +300,53 @@ impl std::fmt::Display for Coefficient {
         } else {
             write!(f, "{whole}.{frac:06}")
         }
+    }
+}
+
+impl Serialize for Coefficient {
+    /// Serializes as the canonical base-10 decimal string of the raw
+    /// fixed-point integer (ADR-060). This is NOT the human-decimal
+    /// [`Display`](std::fmt::Display) form — the scale stays with the reader.
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.0.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for Coefficient {
+    /// Deserializes strictly from the canonical base-10 decimal string of the
+    /// raw fixed-point integer (ADR-060), allowing a single leading `-`.
+    /// Rejects bare numbers, leading zeros, `-0`, `+`, whitespace, separators,
+    /// and any non-canonical form.
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct CoefficientVisitor;
+
+        impl Visitor<'_> for CoefficientVisitor {
+            type Value = Coefficient;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(
+                    "a canonical base-10 decimal string encoding a signed \
+                     fixed-point integer (ADR-060), e.g. \"1500000\", \"-500000\" or \"0\"",
+                )
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Coefficient, E>
+            where
+                E: de::Error,
+            {
+                parse_canonical_i64_str(value)
+                    .map(Coefficient)
+                    .ok_or_else(|| de::Error::invalid_value(de::Unexpected::Str(value), &self))
+            }
+        }
+
+        deserializer.deserialize_str(CoefficientVisitor)
     }
 }
 
@@ -738,5 +891,165 @@ mod tests {
     #[test]
     fn currency_code_is_4_bytes() {
         assert_eq!(std::mem::size_of::<CurrencyCode>(), 4);
+    }
+
+    // --- ADR-060 canonical decimal-string wire form ---
+
+    #[test]
+    fn amount_serializes_as_canonical_decimal_string() {
+        assert_eq!(
+            serde_json::to_string(&Amount(1_000_000)).unwrap(),
+            "\"1000000\""
+        );
+        assert_eq!(serde_json::to_string(&Amount(0)).unwrap(), "\"0\"");
+        assert_eq!(
+            serde_json::to_string(&Amount(u64::MAX)).unwrap(),
+            "\"18446744073709551615\""
+        );
+    }
+
+    #[test]
+    fn coefficient_serializes_as_canonical_decimal_string() {
+        // NOT the human-decimal Display form ("1.500000") — the raw integer.
+        assert_eq!(
+            serde_json::to_string(&Coefficient(1_500_000)).unwrap(),
+            "\"1500000\""
+        );
+        assert_eq!(serde_json::to_string(&Coefficient(0)).unwrap(), "\"0\"");
+        assert_eq!(
+            serde_json::to_string(&Coefficient(-500_000)).unwrap(),
+            "\"-500000\""
+        );
+        assert_eq!(
+            serde_json::to_string(&Coefficient(i64::MIN)).unwrap(),
+            "\"-9223372036854775808\""
+        );
+    }
+
+    #[test]
+    fn amount_deserializes_from_canonical_decimal_string() {
+        assert_eq!(
+            serde_json::from_str::<Amount>("\"1000000\"").unwrap(),
+            Amount(1_000_000)
+        );
+        assert_eq!(serde_json::from_str::<Amount>("\"0\"").unwrap(), Amount(0));
+    }
+
+    #[test]
+    fn coefficient_deserializes_from_canonical_decimal_string() {
+        assert_eq!(
+            serde_json::from_str::<Coefficient>("\"1500000\"").unwrap(),
+            Coefficient(1_500_000)
+        );
+        assert_eq!(
+            serde_json::from_str::<Coefficient>("\"-500000\"").unwrap(),
+            Coefficient(-500_000)
+        );
+        assert_eq!(
+            serde_json::from_str::<Coefficient>("\"0\"").unwrap(),
+            Coefficient(0)
+        );
+    }
+
+    #[test]
+    fn amount_string_roundtrip_is_byte_identical() {
+        for v in [0_u64, 1, 42, 1_000_000, u64::MAX] {
+            let a = Amount(v);
+            let json = serde_json::to_string(&a).unwrap();
+            let back: Amount = serde_json::from_str(&json).unwrap();
+            assert_eq!(a, back);
+            // Re-encode is byte-identical (canonical, reproducible).
+            assert_eq!(serde_json::to_string(&back).unwrap(), json);
+        }
+    }
+
+    #[test]
+    fn coefficient_string_roundtrip_is_byte_identical() {
+        for v in [0_i64, 1, -1, 1_500_000, -500_000, i64::MIN, i64::MAX] {
+            let c = Coefficient(v);
+            let json = serde_json::to_string(&c).unwrap();
+            let back: Coefficient = serde_json::from_str(&json).unwrap();
+            assert_eq!(c, back);
+            assert_eq!(serde_json::to_string(&back).unwrap(), json);
+        }
+    }
+
+    #[test]
+    fn amount_above_2_pow_53_roundtrips_without_precision_loss() {
+        // Beyond IEEE-754 double integer-exactness: a JSON-number reimplementation
+        // (e.g. JS `JSON.parse`) would corrupt this; the decimal string does not.
+        let v: u64 = 10_000_000_000_000_000; // 1e16 > 2^53
+        let a = Amount(v);
+        let json = serde_json::to_string(&a).unwrap();
+        assert_eq!(json, "\"10000000000000000\"");
+        let back: Amount = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.0, v);
+        assert_eq!(back, a);
+    }
+
+    #[test]
+    fn amount_strict_parser_rejects_noncanonical_forms() {
+        // (input, why-rejected)
+        let rejects = [
+            "\"\"",      // empty
+            "\"007\"",   // leading zeros
+            "\"00\"",    // leading zeros
+            "\"+7\"",    // explicit plus
+            "\"-0\"",    // sign on zero / negative not allowed for Amount
+            "\"-5\"",    // negative not allowed for Amount
+            "\" 7\"",    // leading whitespace
+            "\"7 \"",    // trailing whitespace
+            "\"0x5\"",   // hex
+            "\"1_000\"", // underscore separator
+            "\"1,000\"", // comma separator
+            "\"1.0\"",   // decimal point
+            "\"1e3\"",   // exponent
+            "1000",      // bare JSON number (not a string)
+        ];
+        for input in rejects {
+            assert!(
+                serde_json::from_str::<Amount>(input).is_err(),
+                "expected Amount to reject {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn coefficient_strict_parser_rejects_noncanonical_forms() {
+        let rejects = [
+            "\"\"",      // empty
+            "\"007\"",   // leading zeros
+            "\"+7\"",    // explicit plus
+            "\"-0\"",    // negative zero
+            "\"--5\"",   // double sign
+            "\"-\"",     // sign only
+            "\" -7\"",   // leading whitespace
+            "\"0x5\"",   // hex
+            "\"1_000\"", // underscore separator
+            "\"1.5\"",   // decimal point
+            "-1500000",  // bare JSON number (not a string)
+        ];
+        for input in rejects {
+            assert!(
+                serde_json::from_str::<Coefficient>(input).is_err(),
+                "expected Coefficient to reject {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn coefficient_accepts_canonical_negative_and_min() {
+        assert_eq!(
+            serde_json::from_str::<Coefficient>("\"-9223372036854775808\"").unwrap(),
+            Coefficient(i64::MIN)
+        );
+        // i64 overflow is rejected.
+        assert!(serde_json::from_str::<Coefficient>("\"9223372036854775808\"").is_err());
+    }
+
+    #[test]
+    fn amount_rejects_u64_overflow_string() {
+        // u64::MAX + 1
+        assert!(serde_json::from_str::<Amount>("\"18446744073709551616\"").is_err());
     }
 }
