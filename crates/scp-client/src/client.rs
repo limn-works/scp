@@ -30,8 +30,8 @@ use openmls::prelude::{KeyPackageBundle, KeyPackageIn, MlsMessageOut, ProtocolVe
 use scp_clock::Clock;
 use scp_event_log::{Event, EventType};
 use scp_mls::group::{
-    add_member, create_group, destroy_group, generate_key_package, join_group_from_bytes,
-    key_package_in_did,
+    add_member_with_convergent_timestamp, create_group, destroy_group, generate_key_package,
+    join_group_from_bytes, key_package_in_did,
 };
 use scp_mls::{
     InMemoryMlsProvider, ScpCredential, SignatureKeyPair, restore_pending_join,
@@ -61,16 +61,18 @@ struct PendingJoin {
     provider: InMemoryMlsProvider,
 }
 
-/// The result of adding a member: the wire bytes the driver must distribute,
-/// plus the convergent committer timestamp the adder stamped on its
-/// `MemberJoined` leaf.
+/// The result of adding a member: the wire bytes the driver must distribute.
 ///
 /// `commit` goes to all *existing* members. They apply it via
 /// [`ScpClient::receive_message`], which classifies it as a membership-changing
-/// Commit, advances their MLS epoch, and — using `committer_timestamp_secs`
-/// transported here exactly as [`SendOutput::committer_timestamp_secs`] is for
-/// messages — appends the identical `MemberJoined` leaf so their event log and
-/// membership set converge with the committer's and the joiner's.
+/// Commit, advances their MLS epoch, and appends the identical `MemberJoined`
+/// leaf so their event log and membership set converge with the committer's and
+/// the joiner's. The convergent committer timestamp each existing member stamps
+/// on that leaf is **bound into the Commit's authenticated MLS AAD** (ADR-057
+///) — covered by the committer's leaf signature and the `PrivateMessage`
+/// AEAD tag — so a receiver recovers it from the *verified* frame rather than a
+/// loose transported `u64` a relay could forge. It is therefore no longer
+/// carried as a separate field here.
 ///
 /// `welcome` goes to the *new* member, who applies it via
 /// [`ScpClient::join_context_encrypted`] and replays `event_log` (which already
@@ -78,16 +80,11 @@ struct PendingJoin {
 /// byte-identical to the committer's.
 #[derive(Debug, Clone)]
 pub struct AddMemberOutput {
-    /// TLS-serialized MLS Commit for existing members.
+    /// TLS-serialized MLS Commit for existing members. Its authenticated AAD
+    /// carries the convergent committer timestamp (ADR-057).
     pub commit: Vec<u8>,
     /// TLS-serialized MLS Welcome for the new member.
     pub welcome: Vec<u8>,
-    /// The convergent committer timestamp (Unix seconds) the adder stamped on
-    /// its `MemberJoined` leaf. Transported to existing members alongside
-    /// `commit` so their mirrored `MemberJoined` leaf carries the SAME
-    /// timestamp and converges byte-for-byte (§9.9.3). The joiner does not need
-    /// it separately — its copy already rides inside `event_log`.
-    pub committer_timestamp_secs: u64,
     /// The adder's full event-log stream AFTER the add (the prior context
     /// history plus the new `MemberJoined` leaf). The joiner replays this
     /// verbatim to reconstruct a byte-identical log and converge to the same
@@ -96,22 +93,6 @@ pub struct AddMemberOutput {
     /// The adder's membership set after the add. The joiner adopts it so both
     /// sides agree on who is in the context without re-deriving it.
     pub members: Vec<String>,
-}
-
-/// The result of sending a message: the wire ciphertext, plus the convergent
-/// committer timestamp the sender stamped on its `MessageSent` leaf.
-///
-/// Every recipient MUST stamp the same `committer_timestamp_secs` on their
-/// own `MessageSent` leaf (passed to [`ScpClient::receive_message`]) so the
-/// leaves converge byte-for-byte across members (§9.9.3). The timestamp travels
-/// with the ciphertext exactly as a signed SCP envelope's `created_at` does on
-/// the native path.
-#[derive(Debug, Clone)]
-pub struct SendOutput {
-    /// TLS-serialized MLS ciphertext for delivery to peers.
-    pub ciphertext: Vec<u8>,
-    /// The convergent committer timestamp (Unix seconds) the sender stamped.
-    pub committer_timestamp_secs: u64,
 }
 
 /// The lifecycle status of a context id, as reported by
@@ -412,7 +393,18 @@ impl ScpClient {
         let key_package_in = KeyPackageIn::tls_deserialize(&mut &*key_package_bytes)
             .map_err(|e| ClientError::Codec(format!("deserializing key package: {e}")))?;
 
-        let result = add_member(&mut state.crypto.mls_group, key_package_in, clock.as_ref())?;
+        // ADR-057: bind the convergent committer timestamp into the
+        // Commit's authenticated MLS AAD, so existing members recover the SAME
+        // value from the verified frame and stamp a byte-identical `MemberJoined`
+        // leaf — rather than trusting a loose transported `u64` a relay could
+        // forge. The identical `timestamp` is stamped on the committer's own leaf
+        // just below.
+        let result = add_member_with_convergent_timestamp(
+            &mut state.crypto.mls_group,
+            key_package_in,
+            clock.as_ref(),
+            timestamp,
+        )?;
         let commit = serialize_message(&result.commit)?;
         let welcome = serialize_message(&result.welcome)?;
 
@@ -427,7 +419,6 @@ impl ScpClient {
         let output = AddMemberOutput {
             commit,
             welcome,
-            committer_timestamp_secs: timestamp,
             event_log: state.events(),
             members: state.members.clone(),
         };
@@ -522,16 +513,23 @@ impl ScpClient {
     // Message path
     // ----------------------------------------------------------------------
 
-    /// Encrypts and "sends" an application message in `context_id`.
+    /// Encrypts and "sends" an application message in `context_id`, returning the
+    /// wire ciphertext.
     ///
-    /// Runs the full §9.16 double-encryption pipeline, appends a `MessageSent`
-    /// event-log leaf (committer = this sender, convergent timestamp = this
-    /// sender's clock reading, which every recipient copies onto their
-    /// `MessageReceived`-driven leaf), increments this sender's sequence, and
-    /// returns the wire ciphertext for the transport to deliver to peers.
+    /// Mints one convergent committer timestamp from this sender's hardened clock
+    /// and uses it for BOTH sides of the convergence: it is stamped on this
+    /// sender's own `MessageSent` leaf AND bound into the MLS ciphertext's
+    /// authenticated AAD (ADR-057), so every recipient recovers the SAME
+    /// value from the *verified* frame and stamps a byte-identical leaf. Runs the
+    /// full §9.16 double-encryption pipeline, appends the `MessageSent` leaf,
+    /// increments this sender's sequence, and returns the ciphertext for the
+    /// transport to deliver to peers.
     ///
     /// There is no relay in the MVP; the returned bytes are handed directly to
     /// recipients' [`Self::receive_message`] by the test harness "dumb pipe".
+    /// Because the convergent timestamp now rides *inside* the authenticated
+    /// ciphertext, the recipient no longer needs (and no longer accepts) it as a
+    /// separate transported value.
     ///
     /// # Errors
     ///
@@ -540,69 +538,80 @@ impl ScpClient {
     /// prior failed persist, or [`ClientError::Mls`] / [`ClientError::SenderKey`] /
     /// [`ClientError::EventLog`] on a layer failure. A [`ClientError::StorageBackend`]
     /// from the post-send persist **poisons** the context: the message's state
-    /// advanced in memory but was not durably recorded, so no `SendOutput` (and
-    /// thus no ciphertext) is returned and the context refuses further ops.
+    /// advanced in memory but was not durably recorded, so `Err` (and thus no
+    /// ciphertext) is returned and the context refuses further ops.
     pub fn send_message(
         &mut self,
         context_id: &str,
         plaintext: &[u8],
-    ) -> Result<SendOutput, ClientError> {
+    ) -> Result<Vec<u8>, ClientError> {
         let sender_did = self.signer.did().to_owned();
+        // Mint the convergent timestamp ONCE: the same value is bound into the
+        // ciphertext AAD (via `encrypt_message`) and stamped on the local leaf.
         let timestamp = self.clock.now_secs();
         let state = self.context_mut(context_id)?;
 
         let sequence = state.next_sequence(&sender_did);
-        let ciphertext = state
-            .crypto
-            .encrypt_message(plaintext, &sender_did, sequence)?;
+        let ciphertext =
+            state
+                .crypto
+                .encrypt_message(plaintext, &sender_did, sequence, timestamp)?;
 
         state.append_log_event(EventType::MessageSent, &sender_did, Vec::new(), timestamp)?;
 
-        let output = SendOutput {
-            ciphertext,
-            committer_timestamp_secs: timestamp,
-        };
         // The `state` borrow ends above; persist the post-send state (advanced
         // sender sequence + ratchet, new MessageSent leaf) before returning.
         self.persist_context(context_id)?;
-        Ok(output)
+        Ok(ciphertext)
     }
 
     /// Receives an inbound MLS message in `context_id`: decrypts an application
     /// message, or applies a membership-changing Commit, converging the event
     /// log either way.
     ///
+    /// The convergent committer timestamp each leaf is stamped with is recovered
+    /// from the message's own **authenticated** MLS AAD (ADR-057), not
+    /// supplied by the caller — so this method takes only the ciphertext.
+    ///
     /// - **Application message** → produces a `MessageReceived` event (buffered
-    ///   for [`Self::drain_events`]) and appends a `MessageSent` leaf stamped
-    ///   with the supplied `committer_timestamp_secs`, so the receiver's log
-    ///   converges with the sender's. Returns `true`.
+    ///   for [`Self::drain_events`]) and appends a `MessageSent` leaf stamped with
+    ///   the authenticated timestamp recovered from the frame, so the receiver's
+    ///   log converges with the sender's. Returns `true`.
     /// - **Membership-changing Commit (add)** → advances the MLS epoch and, for
-    ///   each member the Commit adds, appends the SAME convergent
-    ///   `MemberJoined` leaf the committer appended — committer DID + the
-    ///   transported `committer_timestamp_secs` ([`AddMemberOutput::committer_timestamp_secs`])
-    ///   — and records the added member. This is what makes an EXISTING member's
-    ///   log and membership set converge with the committer's and the new
-    ///   joiner's in a multi-party context (§9.9.3). Returns `false` (no
-    ///   application payload was produced).
+    ///   each member the Commit adds, appends the SAME convergent `MemberJoined`
+    ///   leaf the committer appended — committer DID + the authenticated timestamp
+    ///   recovered from the Commit AAD — and records the added member. This is
+    ///   what makes an EXISTING member's log and membership set converge with the
+    ///   committer's and the new joiner's in a multi-party context (§9.9.3).
+    ///   Returns `false` (no application payload was produced).
     /// - **Bare proposal** → cached by `scp-mls`; no leaf, returns `false`.
     ///
-    /// `committer_timestamp_secs` is the convergent timestamp the committer
-    /// stamped: on a `MessageSent` leaf for an application message
-    /// ([`SendOutput::committer_timestamp_secs`]), or on the `MemberJoined`
-    /// leaf for an add Commit ([`AddMemberOutput::committer_timestamp_secs`]).
+    /// # Convergent-timestamp authentication (ADR-057)
     ///
-    // SECURITY (ADR-057, leaf-signing/custody slice): `committer_timestamp_secs`
-    // is presently an UNAUTHENTICATED value transported alongside the ciphertext.
-    // It is NOT bound to the MLS ciphertext (it is not part of the §9.16 AEAD
-    // AAD) and the event-log leaves it stamps are unsigned, so a hostile relay
-    // (or any in-path attacker) could forge or alter it and drive this receiver's
-    // `MessageSent` / `MemberJoined` leaf — and thus its Merkle root — away from
-    // the honest committer's, breaking convergence. The MVP "dumb pipe" is a
-    // trusted in-process test harness, so this is acceptable ONLY until a real
-    // relay/transport is wired. Before that wiring, this timestamp MUST be bound
-    // into a signed leaf or a signed transport envelope (so a recipient verifies
-    // the committer's signature over the timestamp) rather than trusted on the
-    // wire.
+    /// The timestamp stamped on each leaf is bound into the message's
+    /// `FramedContent.authenticated_data` at send/commit time by the committer,
+    /// and is covered by the committer's MLS leaf signature and — under the
+    /// `PURE_CIPHERTEXT` policy — the `PrivateMessage` AEAD tag. `scp-mls`
+    /// recovers it from openmls's *verified* `ProcessedMessage::aad()` (after
+    /// signature + AEAD verification) and window-validates it against the injected
+    /// clock before this method ever stamps a leaf. So the value is authenticated,
+    /// not trusted on the wire: a hostile relay that alters it breaks the AEAD tag
+    /// and the frame is rejected at decrypt, and no member other than the
+    /// committer can author a frame carrying it. There is no loose transported
+    /// `u64` left for an in-path attacker to forge.
+    ///
+    /// Two residuals remain, each out of this slice's scope:
+    /// - **Joiner-trusts-adder replay.** A *new* joiner adopts the adder's
+    ///   replayed event-log stream verbatim (via [`Self::join_context_encrypted`]);
+    ///   independently re-verifying each historical leaf against a per-leaf
+    ///   committer signature is the leaf-signing / custody slice, not this one.
+    /// - **In-window authenticated committer lie.** The AAD binding proves *who*
+    ///   authored the timestamp and the window proves it is *plausible*, but a
+    ///   malicious *committer* can still bind a plausible-but-false value anywhere
+    ///   inside the receiver's window. That is the pre-existing MLS
+    ///   insider-equivocation class (a malicious committer can already fork
+    ///   receivers by sending different commits to different members); the window
+    ///   bounds it, it does not eliminate it.
     ///
     /// # Errors
     ///
@@ -614,15 +623,19 @@ impl ScpClient {
     /// `scp-mls` rejected the Commit *before* merging, so the context's MLS
     /// epoch, SCP membership, and event log are left mutually consistent
     /// (pre-remove) and the context stays usable — the driver surfaces the gap
-    /// rather than half-applying it. Otherwise returns a crypto/leaf error on
-    /// failure. A [`ClientError::StorageBackend`] from the post-receive persist
-    /// **poisons** the context (the decrypt already advanced the durable ratchet's
-    /// in-memory counterpart, so the diverged state cannot be safely reused).
+    /// rather than half-applying it. Returns [`ClientError::Mls`] wrapping a
+    /// convergent-timestamp failure (missing / malformed / implausible AAD —
+    /// ADR-057) if the frame carries no authenticated timestamp, a
+    /// malformed one, or one outside the plausibility window; for an add-Commit
+    /// this is raised *pre-merge*, so the epoch is unchanged. Otherwise returns a
+    /// crypto/leaf error on failure. A [`ClientError::StorageBackend`] from the
+    /// post-receive persist **poisons** the context (the decrypt already advanced
+    /// the durable ratchet's in-memory counterpart, so the diverged state cannot
+    /// be safely reused).
     pub fn receive_message(
         &mut self,
         context_id: &str,
         ciphertext: &[u8],
-        committer_timestamp_secs: u64,
     ) -> Result<bool, ClientError> {
         // ADR-057 §Prereq-1: captured before the `state` mutable borrow so the
         // hardened clock (used to re-validate any add-Commit's KeyPackage
@@ -639,7 +652,11 @@ impl ScpClient {
             Inbound::Application {
                 sender_did,
                 plaintext,
+                committer_timestamp_secs,
             } => {
+                // The timestamp is the authenticated value `scp-mls` recovered
+                // from the frame's verified AAD (ADR-057) — not a caller
+                // input — so the mirrored leaf converges with the sender's.
                 state.append_log_event(
                     EventType::MessageSent,
                     &sender_did,
@@ -683,14 +700,17 @@ impl ScpClient {
             Inbound::Commit {
                 sender_did: committer_did,
                 added_dids,
+                committer_timestamp_secs,
             } => {
                 // For each added member, append the identical convergent
                 // `MemberJoined` leaf the committer appended: actor = committer
-                // DID, timestamp = transported convergent T, empty payload. The
-                // sequence + prev_hash are recomputed from this member's
-                // current log, which (by the convergence invariant) is at the
-                // same state the committer's was before the add — so the leaf is
-                // byte-identical. Then record the member in the membership set.
+                // DID, timestamp = the authenticated convergent value `scp-mls`
+                // recovered from the Commit's verified AAD (ADR-057), empty
+                // payload. The sequence + prev_hash are recomputed from this
+                // member's current log, which (by the convergence invariant) is
+                // at the same state the committer's was before the add — so the
+                // leaf is byte-identical. Then record the member in the
+                // membership set.
                 for added_did in &added_dids {
                     state.append_log_event(
                         EventType::MemberJoined,

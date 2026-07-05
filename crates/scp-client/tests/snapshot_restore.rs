@@ -85,9 +85,7 @@ fn restore_resumes_a_converged_context_from_storage() {
     let pre = alice
         .send_message(CTX, b"before restore")
         .expect("alice sends");
-    let was_app = bob
-        .receive_message(CTX, &pre.ciphertext, pre.committer_timestamp_secs)
-        .expect("bob receives");
+    let was_app = bob.receive_message(CTX, &pre).expect("bob receives");
     assert!(was_app);
 
     let expected_root = bob.event_log_root(CTX).expect("bob root");
@@ -142,8 +140,7 @@ fn restore_resumes_a_converged_context_from_storage() {
     // Replaying the PRE-restore ciphertext must still be rejected — the MLS
     // ratchet that already consumed it is persisted and advanced.
     assert!(
-        bob2.receive_message(CTX, &pre.ciphertext, pre.committer_timestamp_secs)
-            .is_err(),
+        bob2.receive_message(CTX, &pre).is_err(),
         "a pre-restore ciphertext replay is rejected after restore"
     );
 
@@ -151,9 +148,7 @@ fn restore_resumes_a_converged_context_from_storage() {
     let send2 = alice
         .send_message(CTX, b"after restore")
         .expect("alice sends 2");
-    let was_app = bob2
-        .receive_message(CTX, &send2.ciphertext, send2.committer_timestamp_secs)
-        .expect("bob2 receives");
+    let was_app = bob2.receive_message(CTX, &send2).expect("bob2 receives");
     assert!(was_app);
     let events = bob2.drain_events(CTX).expect("bob2 drains");
     assert_eq!(events.len(), 1);
@@ -174,7 +169,7 @@ fn restore_resumes_a_converged_context_from_storage() {
         .send_message(CTX, b"from restored bob")
         .expect("bob2 sends");
     let was_app = alice
-        .receive_message(CTX, &send3.ciphertext, send3.committer_timestamp_secs)
+        .receive_message(CTX, &send3)
         .expect("alice receives from restored bob");
     assert!(was_app);
     let alice_events = alice.drain_events(CTX).expect("alice drains");
@@ -457,7 +452,7 @@ fn failing_put_during_send_poisons_context_and_reconstruction_recovers() {
     // caller could transmit for a message whose state was not durably recorded.
     assert!(
         matches!(result, Err(ClientError::StorageBackend(_))),
-        "a failed persist surfaces as a typed StorageBackend error with no SendOutput"
+        "a failed persist surfaces as a typed StorageBackend error and no ciphertext"
     );
 
     // The failed persist POISONED the context: the in-memory MLS ratchet advanced

@@ -16,12 +16,13 @@
 //!    the multi-party divergence bug: pre-fix, Bob's Control arm dropped the
 //!    add and his log/membership permanently diverged.
 //!
-//! 2. **Convergence rides on the transported timestamp, not local clocks** — a
+//! 2. **Convergence rides on the authenticated timestamp, not local clocks** — a
 //!    reciprocal Bob → Alice send, where Bob stamps his OWN (deliberately
-//!    different) clock onto a `MessageSent` leaf, and Alice converges to Bob's
-//!    leaf via the transported `committer_timestamp_secs`. Because the three
-//!    members' clocks all differ, this can only converge if the convergent
-//!    timestamp travels with each message.
+//!    different) clock onto a `MessageSent` leaf and binds that value into the
+//!    ciphertext's authenticated MLS AAD, and Alice/Carol converge to Bob's leaf
+//!    via the timestamp recovered from the verified frame (ADR-057).
+//!    Because the three members' clocks all differ, this can only converge if the
+//!    convergent timestamp is carried authenticated with each message.
 
 // Integration tests assert on happy-path results; `expect`/`panic!` make the
 // failure messages legible. The workspace denies these in production code.
@@ -29,7 +30,7 @@
 
 use std::sync::Arc;
 
-use scp_client::{ClientError, LocalSigner, MemoryStorage, ScpClient, Storage};
+use scp_client::{ClientError, ContextStatus, LocalSigner, MemoryStorage, ScpClient, Storage};
 use scp_clock::{Clock, SystemClock, TestClock};
 use scp_protocol::context::membership::ContextEvent;
 
@@ -128,14 +129,15 @@ fn three_party_add_commit_converges_across_all_members() {
         .expect("Carol joins");
 
     // Bob (existing member) processes Alice's add-Carol Commit. The convergent
-    // committer timestamp rides on the AddMemberOutput exactly as a message's
-    // does on SendOutput. `receive_message` returns `false` (no application
-    // payload), but its side effect — appending the convergent MemberJoined
-    // leaf and recording Carol — is what makes Bob converge. Pre-fix, this arm
-    // dropped the add: Bob stayed at 2 leaves with Carol missing and his root
-    // diverged from Alice's and Carol's.
+    // committer timestamp is bound into the Commit's authenticated AAD (ADR-057
+    //), so Bob recovers it from the verified frame — no separate value is
+    // transported. `receive_message` returns `false` (no application payload),
+    // but its side effect — appending the convergent MemberJoined leaf and
+    // recording Carol — is what makes Bob converge. Pre-fix, this arm dropped the
+    // add: Bob stayed at 2 leaves with Carol missing and his root diverged from
+    // Alice's and Carol's.
     let was_application = bob
-        .receive_message(CTX, &add_carol.commit, add_carol.committer_timestamp_secs)
+        .receive_message(CTX, &add_carol.commit)
         .expect("Bob processes the add-Carol commit");
     assert!(
         !was_application,
@@ -231,7 +233,7 @@ fn reciprocal_send_converges_via_transported_timestamp() {
             &add_carol.members,
         )
         .expect("Carol joins");
-    bob.receive_message(CTX, &add_carol.commit, add_carol.committer_timestamp_secs)
+    bob.receive_message(CTX, &add_carol.commit)
         .expect("Bob processes the add-Carol commit");
 
     // All three converge before any application message.
@@ -246,27 +248,26 @@ fn reciprocal_send_converges_via_transported_timestamp() {
     ]);
 
     // --- Reciprocal send: BOB sends. Bob stamps the leaf with HIS OWN clock
-    // reading (base + BOB_OFFSET), distinct from Alice's and Carol's. The
-    // convergent timestamp rides on Bob's SendOutput. ---
+    // reading (base + BOB_OFFSET), distinct from Alice's and Carol's, and binds
+    // that same value into the ciphertext's authenticated AAD (ADR-057). ---
     let plaintext = b"hello from Bob, stamped with Bob's clock";
-    let bob_send = bob.send_message(CTX, plaintext).expect("Bob sends");
-    assert_eq!(
-        bob_send.committer_timestamp_secs,
-        base + BOB_OFFSET,
-        "Bob stamped the leaf with HIS clock, not Alice's or Carol's"
-    );
+    let bob_ciphertext = bob.send_message(CTX, plaintext).expect("Bob sends");
 
-    // Alice and Carol receive Bob's message and stamp the SAME transported
-    // timestamp onto their MessageSent leaf — NOT their own clocks.
+    // Alice and Carol receive Bob's message and stamp the SAME authenticated
+    // timestamp (recovered from the verified AAD) onto their MessageSent leaf —
+    // NOT their own clocks, and NOT a separately-transported value. That the
+    // stamped value is Bob's clock reading (base + BOB_OFFSET), not Alice's or
+    // Carol's, is proven below by the leaf/root convergence across three
+    // deliberately-distinct clocks.
     assert!(
         alice
-            .receive_message(CTX, &bob_send.ciphertext, bob_send.committer_timestamp_secs)
+            .receive_message(CTX, &bob_ciphertext)
             .expect("Alice receives Bob's message"),
         "an application message"
     );
     assert!(
         carol
-            .receive_message(CTX, &bob_send.ciphertext, bob_send.committer_timestamp_secs)
+            .receive_message(CTX, &bob_ciphertext)
             .expect("Carol receives Bob's message"),
         "an application message"
     );
@@ -306,6 +307,7 @@ fn reciprocal_send_converges_via_transported_timestamp() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // one end-to-end raw-group remove scenario, read top-to-bottom
 fn remove_commit_is_rejected_fail_closed_without_skew() {
     // The regression test for Fix 1: a Remove-bearing Commit must be rejected by
     // `receive_message` AND must leave the receiver's MLS group + SCP membership +
@@ -321,7 +323,10 @@ fn remove_commit_is_rejected_fail_closed_without_skew() {
     // `ScpClient` whose `receive_message` is the unit under test.
     use openmls::prelude::{BasicCredential, KeyPackageIn};
     use scp_did::SigningKeyId;
-    use scp_mls::group::{add_member, create_group, generate_key_package, remove_member};
+    use scp_mls::group::{
+        add_member, add_member_with_convergent_timestamp, create_group, generate_key_package,
+        remove_member,
+    };
     use scp_mls::{ScpCredential, SignatureKeyPair};
     use tls_codec::{Deserialize as TlsDeserialize, Serialize as TlsSerialize};
 
@@ -365,16 +370,18 @@ fn remove_commit_is_rejected_fail_closed_without_skew() {
             .expect("carol kp bytes"),
     )
     .expect("carol kp deserialize");
+    // The add path converges + appends a MemberJoined leaf on Bob, so the raw
+    // Commit must carry a convergent-timestamp AAD (ADR-057) plausible
+    // against Bob's clock (`base`, well inside his window); Bob recovers it from
+    // the verified AAD.
     let add_carol =
-        add_member(&mut alice_group, carol_kp_in, &SystemClock).expect("Alice adds Carol");
+        add_member_with_convergent_timestamp(&mut alice_group, carol_kp_in, &SystemClock, base)
+            .expect("Alice adds Carol");
     let add_carol_commit = add_carol
         .commit
         .tls_serialize_detached()
         .expect("add-carol commit bytes");
-    // Convergent timestamp the committer would have stamped (any value — this is
-    // the add path, which DOES converge and append a MemberJoined leaf on Bob).
-    let add_carol_ts = 1_700_000_500u64;
-    bob.receive_message(CTX, &add_carol_commit, add_carol_ts)
+    bob.receive_message(CTX, &add_carol_commit)
         .expect("Bob processes the add-Carol commit");
 
     // Snapshot Bob's pre-remove state: MLS epoch, SCP membership, log leaf count,
@@ -408,10 +415,10 @@ fn remove_commit_is_rejected_fail_closed_without_skew() {
         .tls_serialize_detached()
         .expect("remove-carol commit bytes");
 
-    // Bob receives the remove Commit. The committer timestamp is irrelevant — the
-    // Commit is rejected before any leaf would be stamped — so pass an arbitrary
-    // value to prove it is never consumed on the reject path.
-    let result = bob.receive_message(CTX, &remove_carol_commit, 1_700_000_999);
+    // Bob receives the remove Commit. `scp-mls` decides the Remove-refusal BEFORE
+    // the AAD check, so the raw (AAD-less) remove Commit is still rejected as
+    // UnsupportedMembershipChange — never as a missing timestamp.
+    let result = bob.receive_message(CTX, &remove_carol_commit);
 
     // (1) FAIL-LOUD: the driver surfaces UnsupportedMembershipChange naming Carol.
     match result {
@@ -463,4 +470,216 @@ fn remove_commit_is_rejected_fail_closed_without_skew() {
     // merged-then-errored. (That the group also stays *encryptable* on its
     // unchanged epoch after a rejected remove is proven at the MLS layer by the
     // `scp-mls` unit test `decrypt_with_membership_changes_rejects_remove_without_merging`.)
+}
+
+/// Builds a client for `did` over a retained, mutable `TestClock` so a test can
+/// move the clock after construction (to simulate a mis-clocked / lying sender
+/// whose stamped timestamp lands outside a receiver's window).
+fn client_with_clock(did: &str, clock: Arc<TestClock>) -> ScpClient {
+    let signer = Arc::new(LocalSigner::active(did));
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+    ScpClient::new(signer, storage, clock as Arc<dyn Clock>).expect("construct fresh client")
+}
+
+#[test]
+fn application_committer_lie_beyond_window_rejected_then_honest_resend_succeeds() {
+    // ADR-057 at the DRIVER: a sender whose clock is 10 minutes AHEAD of
+    // the receiver's binds a committer timestamp beyond the receiver's 300s
+    // future-skew window into the authenticated AAD. The receiver's driver
+    // REJECTS the message (scp-mls window-validates the authenticated value and
+    // refuses — never clamps), so NO `MessageSent` leaf is stamped, the context
+    // stays Live + usable, and an honest in-window re-send (after the clocks
+    // re-converge) still decrypts.
+    let base = SystemClock.now_secs();
+    // Retain Alice's clock so we can move it later; start 10 minutes ahead of Bob.
+    let alice_clock = Arc::new(TestClock::new(base + 600));
+    let mut alice = client_with_clock(ALICE_DID, Arc::clone(&alice_clock));
+    let mut bob = client_for(BOB_DID, base);
+
+    alice.create_context(CTX).expect("alice creates");
+    let bob_kp = bob
+        .generate_key_package_for_join(CTX)
+        .expect("bob key package");
+    let add = alice.add_member(CTX, &bob_kp).expect("alice adds bob");
+    bob.join_context_encrypted(CTX, &add.welcome, &add.event_log, &add.members)
+        .expect("bob joins");
+    exchange_sender_keys(&mut [(ALICE_DID, &mut alice), (BOB_DID, &mut bob)]);
+
+    let bob_leaf_before = bob.event_log_leaf_count(CTX);
+    let bob_root_before = bob.event_log_root(CTX);
+
+    // Alice (600s ahead) sends: the AAD carries base+600, beyond Bob's window.
+    let lie_ct = alice
+        .send_message(CTX, b"stamped 10 minutes in the future")
+        .expect("alice sends");
+    let result = bob.receive_message(CTX, &lie_ct);
+    assert!(
+        matches!(result, Err(ClientError::Mls(_))),
+        "an implausible committer timestamp must be rejected at the driver, got {result:?}"
+    );
+
+    // FAIL-CLOSED, NO SKEW: no leaf was stamped and the log root is unchanged; the
+    // rejection happens BEFORE any leaf append or persist. The context is Live.
+    assert_eq!(
+        bob.event_log_leaf_count(CTX),
+        bob_leaf_before,
+        "a rejected message stamps NO leaf"
+    );
+    assert_eq!(
+        bob.event_log_root(CTX),
+        bob_root_before,
+        "a rejected message leaves the event-log root unchanged"
+    );
+    assert_eq!(
+        bob.context_status(CTX),
+        ContextStatus::Live,
+        "the context stays Live and usable after a rejected message"
+    );
+
+    // Honest re-send: move Alice's clock back in sync with Bob and re-send. The
+    // new message's authenticated AAD is now inside Bob's window, so it decrypts.
+    alice_clock.set(base);
+    let honest_ct = alice
+        .send_message(CTX, b"now in sync")
+        .expect("alice re-sends honestly");
+    assert!(
+        bob.receive_message(CTX, &honest_ct)
+            .expect("bob receives the honest re-send"),
+        "an honest in-window re-send after a rejection still decrypts"
+    );
+    let events = bob.drain_events(CTX).expect("bob drains");
+    assert_eq!(events.len(), 1, "only the honest message is delivered");
+    match &events[0] {
+        ContextEvent::MessageReceived { payload, .. } => {
+            assert_eq!(payload.as_slice(), b"now in sync");
+        }
+        other => panic!("expected MessageReceived, got {other:?}"),
+    }
+}
+
+#[test]
+fn add_commit_committer_lie_beyond_window_rejected_without_epoch_or_membership_skew() {
+    // ADR-057 for the ADD path at the driver: an existing member rejects an
+    // add-Commit whose authenticated timestamp is beyond its window, and the
+    // reject is fail-closed — scp-mls drops the staged commit BEFORE merging, so
+    // the receiver's MLS epoch, SCP membership set, and event log are all
+    // unchanged.
+    let base = SystemClock.now_secs();
+    // Alice (adder/committer) is 10 minutes ahead of Bob (existing member).
+    let alice_clock = Arc::new(TestClock::new(base + 600));
+    let mut alice = client_with_clock(ALICE_DID, Arc::clone(&alice_clock));
+    let mut bob = client_for(BOB_DID, base);
+    let mut carol = client_for(CAROL_DID, base + CAROL_OFFSET);
+
+    alice.create_context(CTX).expect("alice creates");
+    // First add (Bob): Bob JOINS via Welcome + replay — no AAD window check on the
+    // join path — so Bob adopts Alice's base+600 MemberJoined leaf and converges.
+    let bob_kp = bob
+        .generate_key_package_for_join(CTX)
+        .expect("bob key package");
+    let add_bob = alice.add_member(CTX, &bob_kp).expect("alice adds bob");
+    bob.join_context_encrypted(CTX, &add_bob.welcome, &add_bob.event_log, &add_bob.members)
+        .expect("bob joins");
+    assert_eq!(
+        bob.event_log_root(CTX),
+        alice.event_log_root(CTX),
+        "Bob converges to Alice after joining"
+    );
+
+    // Snapshot Bob's pre-add-Carol state.
+    let bob_epoch_before = bob.mls_epoch(CTX).expect("bob epoch");
+    let bob_leaf_before = bob.event_log_leaf_count(CTX);
+    let bob_root_before = bob.event_log_root(CTX);
+    let mut bob_members_before = bob.member_dids(CTX).expect("bob members");
+    bob_members_before.sort();
+
+    // Alice adds Carol; the add-Carol Commit's AAD carries Alice's base+600 —
+    // beyond Bob's window. Bob, an EXISTING member, processes it and must reject.
+    let carol_kp = carol
+        .generate_key_package_for_join(CTX)
+        .expect("carol key package");
+    let add_carol = alice.add_member(CTX, &carol_kp).expect("alice adds carol");
+    let result = bob.receive_message(CTX, &add_carol.commit);
+    assert!(
+        matches!(result, Err(ClientError::Mls(_))),
+        "an implausible add-Commit timestamp must be rejected at the driver, got {result:?}"
+    );
+
+    // FAIL-CLOSED, NO SKEW: the staged commit was dropped before merge, so Bob's
+    // MLS epoch, membership set, and event log are ALL unchanged.
+    assert_eq!(
+        bob.mls_epoch(CTX).expect("bob epoch after"),
+        bob_epoch_before,
+        "a rejected add-Commit must NOT advance Bob's MLS epoch"
+    );
+    let mut bob_members_after = bob.member_dids(CTX).expect("bob members after");
+    bob_members_after.sort();
+    assert_eq!(
+        bob_members_after, bob_members_before,
+        "a rejected add-Commit must NOT add the member to Bob's SCP membership set"
+    );
+    assert_eq!(
+        bob.event_log_leaf_count(CTX),
+        bob_leaf_before,
+        "a rejected add-Commit must NOT append a MemberJoined leaf"
+    );
+    assert_eq!(
+        bob.event_log_root(CTX),
+        bob_root_before,
+        "a rejected add-Commit must NOT change Bob's event-log root"
+    );
+    assert_eq!(
+        bob.context_status(CTX),
+        ContextStatus::Live,
+        "the context stays Live and usable after a rejected add-Commit"
+    );
+}
+
+#[test]
+fn tampered_ciphertext_produces_no_leaf() {
+    // A hostile relay flips a byte of a valid ciphertext. The AEAD tag (which also
+    // covers the convergent-timestamp AAD) fails, so the receiver's decrypt errors
+    // and NO leaf is stamped — the context is untouched and stays usable.
+    let base = SystemClock.now_secs();
+    let mut alice = client_for(ALICE_DID, base);
+    let mut bob = client_for(BOB_DID, base + BOB_OFFSET);
+
+    alice.create_context(CTX).expect("alice creates");
+    let bob_kp = bob
+        .generate_key_package_for_join(CTX)
+        .expect("bob key package");
+    let add = alice.add_member(CTX, &bob_kp).expect("alice adds bob");
+    bob.join_context_encrypted(CTX, &add.welcome, &add.event_log, &add.members)
+        .expect("bob joins");
+    exchange_sender_keys(&mut [(ALICE_DID, &mut alice), (BOB_DID, &mut bob)]);
+
+    let bob_leaf_before = bob.event_log_leaf_count(CTX);
+    let bob_root_before = bob.event_log_root(CTX);
+
+    let mut ciphertext = alice
+        .send_message(CTX, b"tamper target")
+        .expect("alice sends");
+    // Flip the last byte (corrupts the AEAD tag covering the AAD + payload).
+    if let Some(byte) = ciphertext.last_mut() {
+        *byte ^= 0xFF;
+    }
+    assert!(
+        bob.receive_message(CTX, &ciphertext).is_err(),
+        "a tampered ciphertext must be rejected, not silently accepted"
+    );
+    assert_eq!(
+        bob.event_log_leaf_count(CTX),
+        bob_leaf_before,
+        "a tampered ciphertext stamps NO leaf"
+    );
+    assert_eq!(
+        bob.event_log_root(CTX),
+        bob_root_before,
+        "a tampered ciphertext leaves the event-log root unchanged"
+    );
+    assert_eq!(
+        bob.context_status(CTX),
+        ContextStatus::Live,
+        "the context stays Live after a tampered-ciphertext rejection"
+    );
 }

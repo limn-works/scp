@@ -21,6 +21,7 @@
 //! forwards their message verbatim; it adds the code prefix and nothing else.
 
 use scp_client::ClientError;
+use scp_mls::MlsError;
 use wasm_bindgen::JsValue;
 
 /// Stable error-code prefix for each [`ClientError`] category.
@@ -37,6 +38,17 @@ use wasm_bindgen::JsValue;
 #[must_use]
 pub const fn error_code(err: &ClientError) -> &'static str {
     match err {
+        // A convergent committer-timestamp AAD failure (ADR-057): the
+        // frame carried no authenticated timestamp, a malformed one, or one
+        // outside the receiver's plausibility window. A distinct, stable code so
+        // a caller can tell a convergence-authentication rejection apart from a
+        // generic MLS failure. These arrive wrapped in `ClientError::Mls`, so they
+        // MUST be matched BEFORE the catch-all `ClientError::Mls(_)` arm below.
+        ClientError::Mls(
+            MlsError::ConvergentTimestampMissing
+            | MlsError::ConvergentTimestampMalformed(_)
+            | MlsError::ConvergentTimestampImplausible { .. },
+        ) => "SCP-CRYPTO-4040",
         // MLS / sender-key / event-log are the cryptographic protocol layers.
         ClientError::Mls(_) => "SCP-CRYPTO-4010",
         ClientError::SenderKey(_) => "SCP-CRYPTO-4020",
@@ -112,6 +124,32 @@ mod tests {
         let already = ClientError::ContextAlreadyExists("c".to_owned());
         let unsupported = ClientError::UnsupportedMembershipChange("c".to_owned());
         assert_ne!(error_code(&already), error_code(&unsupported));
+    }
+
+    #[test]
+    fn convergent_timestamp_family_maps_to_distinct_crypto_code() {
+        // ADR-057: all three convergent-timestamp AAD failures (which arrive
+        // wrapped in ClientError::Mls) get the distinct SCP-CRYPTO-4040 code, so a
+        // caller can tell a convergence-authentication rejection apart from a
+        // generic MLS failure. The distinct arm must be matched BEFORE the
+        // catch-all ClientError::Mls(_) → 4010.
+        for err in [
+            ClientError::Mls(MlsError::ConvergentTimestampMissing),
+            ClientError::Mls(MlsError::ConvergentTimestampMalformed("bad len".to_owned())),
+            ClientError::Mls(MlsError::ConvergentTimestampImplausible {
+                timestamp_secs: 1,
+                now_secs: 2,
+                max_future_skew_secs: 300,
+                max_age_secs: 604_800,
+            }),
+        ] {
+            assert_eq!(error_code(&err), "SCP-CRYPTO-4040");
+        }
+        // A different MLS failure still falls through to the generic MLS code.
+        assert_eq!(
+            error_code(&ClientError::Mls(MlsError::GroupDestroyed)),
+            "SCP-CRYPTO-4010"
+        );
     }
 
     #[test]

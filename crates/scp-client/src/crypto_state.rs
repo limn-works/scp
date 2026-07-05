@@ -32,7 +32,8 @@ use std::collections::HashMap;
 use scp_clock::Clock;
 use scp_mls::ScpMlsGroup;
 use scp_mls::encrypt::{
-    InboundChange, decrypt_with_membership_changes, encrypt, serialize_ciphertext,
+    InboundChange, decrypt_with_membership_changes, encrypt_with_convergent_timestamp,
+    serialize_ciphertext,
 };
 use scp_protocol::crypto::sender_keys::encrypt::{
     build_sender_header, decrypt_sender_layer, encrypt_sender_layer, parse_sender_header,
@@ -72,6 +73,13 @@ pub enum Inbound {
         sender_did: String,
         /// The fully decrypted plaintext.
         plaintext: Vec<u8>,
+        /// The **authenticated** convergent committer timestamp (Unix seconds),
+        /// recovered from the frame's verified MLS AAD and window-validated by
+        /// `scp-mls` against the injected clock (ADR-057). The driver
+        /// stamps this exact value on its mirrored `MessageSent` leaf so its
+        /// §9.9.3 Merkle root converges with the sender's — it is no longer a
+        /// loose `u64` a relay could forge.
+        committer_timestamp_secs: u64,
     },
     /// An **add-only** Commit that advanced the group epoch. `scp-mls` has
     /// already merged it; `added_dids` are the SCP DIDs the Commit's Add
@@ -82,6 +90,11 @@ pub enum Inbound {
         sender_did: String,
         /// DIDs added by this Commit's Add proposals.
         added_dids: Vec<String>,
+        /// The **authenticated** convergent committer timestamp (Unix seconds),
+        /// recovered from the Commit's verified MLS AAD and window-validated by
+        /// `scp-mls` against the injected clock *before* the merge (ADR-057).
+        /// The driver stamps this on each mirrored `MemberJoined` leaf.
+        committer_timestamp_secs: u64,
     },
     /// A Commit carrying one or more Remove proposals, which the participant
     /// driver does not converge. `scp-mls` **dropped the staged commit without
@@ -116,6 +129,7 @@ impl std::fmt::Debug for Inbound {
             Self::Application {
                 sender_did,
                 plaintext,
+                committer_timestamp_secs,
             } => f
                 .debug_struct("Application")
                 .field("sender_did", sender_did)
@@ -123,14 +137,17 @@ impl std::fmt::Debug for Inbound {
                     "plaintext",
                     &format_args!("<redacted {} bytes>", plaintext.len()),
                 )
+                .field("committer_timestamp_secs", committer_timestamp_secs)
                 .finish(),
             Self::Commit {
                 sender_did,
                 added_dids,
+                committer_timestamp_secs,
             } => f
                 .debug_struct("Commit")
                 .field("sender_did", sender_did)
                 .field("added_dids", added_dids)
+                .field("committer_timestamp_secs", committer_timestamp_secs)
                 .finish(),
             Self::UnsupportedMembershipChange {
                 sender_did,
@@ -220,13 +237,18 @@ impl ContextCryptoState {
             .set_unchecked(&context_id, sender_did, key);
     }
 
-    /// Encrypts a message through the full double-encryption pipeline.
+    /// Encrypts a message through the full double-encryption pipeline, binding
+    /// the convergent committer timestamp into the MLS AAD (ADR-057).
     ///
     /// 1. Sender-key encrypt (AES-256-GCM, AAD binds the raw `context_id`,
     ///    `sender_did`, `self.sender_key_epoch`, and `sequence`).
     /// 2. Prepend the 16-byte `epoch || sequence` header (§9.16.1) — the epoch
     ///    is `self.sender_key_epoch`, NOT the MLS group epoch.
-    /// 3. MLS-encrypt the framed result and TLS-serialize for transport.
+    /// 3. MLS-encrypt the framed result, binding `committer_timestamp_secs` into
+    ///    the `FramedContent.authenticated_data` (covered by the sender's leaf
+    ///    signature and the `PrivateMessage` AEAD tag), and TLS-serialize for
+    ///    transport. The receiver recovers the timestamp from the *verified* AAD
+    ///    rather than a loose transported `u64`, so a relay cannot forge it.
     ///
     /// # Errors
     ///
@@ -237,6 +259,7 @@ impl ContextCryptoState {
         plaintext: &[u8],
         sender_did: &str,
         sequence: u64,
+        committer_timestamp_secs: u64,
     ) -> Result<Vec<u8>, ClientError> {
         let epoch = self.sender_key_epoch;
         let context_id = self.context_id.clone();
@@ -257,8 +280,13 @@ impl ContextCryptoState {
         // identical AAD from the parsed header.
         let with_header = build_sender_header(epoch, sequence, &sender_encrypted);
 
-        // Layer 2: MLS encrypt, then serialize the wire frame.
-        let mls_out = encrypt(&mut self.mls_group, &with_header)?;
+        // Layer 2: MLS encrypt (binding the convergent committer timestamp into
+        // the authenticated AAD), then serialize the wire frame.
+        let mls_out = encrypt_with_convergent_timestamp(
+            &mut self.mls_group,
+            &with_header,
+            committer_timestamp_secs,
+        )?;
         Ok(serialize_ciphertext(&mls_out)?)
     }
 
@@ -300,18 +328,21 @@ impl ContextCryptoState {
         // any add-Commit's KeyPackage `Lifetime` against the hardened driver
         // clock before merge (ADR-057 §Prereq-1).
         let decrypted = decrypt_with_membership_changes(&mut self.mls_group, ciphertext, clock)?;
-        let (sender_did, framed) = match decrypted {
+        let (sender_did, framed, committer_timestamp_secs) = match decrypted {
             InboundChange::Application {
                 plaintext,
                 sender_did,
-            } => (sender_did, plaintext),
+                committer_timestamp_secs,
+            } => (sender_did, plaintext, committer_timestamp_secs),
             InboundChange::Commit {
                 sender_did,
                 added_dids,
+                committer_timestamp_secs,
             } => {
                 return Ok(Inbound::Commit {
                     sender_did,
                     added_dids,
+                    committer_timestamp_secs,
                 });
             }
             InboundChange::UnsupportedMembershipChange {
@@ -384,6 +415,7 @@ impl ContextCryptoState {
         Ok(Inbound::Application {
             sender_did,
             plaintext,
+            committer_timestamp_secs,
         })
     }
 }
@@ -395,7 +427,10 @@ mod tests {
     use openmls::prelude::KeyPackageIn;
     use scp_clock::SystemClock;
     use scp_did::SigningKeyId;
-    use scp_mls::group::{add_member, create_group, generate_key_package, join_group};
+    use scp_mls::group::{
+        add_member, add_member_with_convergent_timestamp, create_group, generate_key_package,
+        join_group,
+    };
     use scp_mls::{ScpCredential, SignatureKeyPair};
     use tls_codec::{Deserialize as TlsDeserialize, Serialize as TlsSerialize};
 
@@ -436,18 +471,47 @@ mod tests {
     #[allow(clippy::unwrap_used)]
     fn full_double_encryption_round_trip() {
         let (mut alice, mut bob) = alice_and_bob();
-        let ct = alice.encrypt_message(b"hello bob", ALICE, 0).unwrap();
+        let ts = SystemClock.now_secs();
+        let ct = alice.encrypt_message(b"hello bob", ALICE, 0, ts).unwrap();
         match bob.decrypt_message(&ct, &SystemClock).unwrap() {
             Inbound::Application {
                 sender_did,
                 plaintext,
+                committer_timestamp_secs,
             } => {
                 assert_eq!(sender_did, ALICE);
                 assert_eq!(plaintext, b"hello bob");
+                assert_eq!(
+                    committer_timestamp_secs, ts,
+                    "the authenticated convergent timestamp round-trips through the AAD"
+                );
             }
             other => panic!("expected an application message, got {other:?}"),
         }
         assert_eq!(bob.recv_sequence_tracker.get(ALICE), Some(&(1u64, 0u64)));
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn decrypt_rejects_implausible_committer_timestamp() {
+        // A committer that binds a far-future timestamp (beyond the receiver's
+        // plausibility window) is rejected: `scp-mls` window-validates the
+        // authenticated AAD value against the receiver's clock and REJECTS (never
+        // clamps) an out-of-window value, so the receiver never stamps a diverging
+        // leaf.
+        let (mut alice, mut bob) = alice_and_bob();
+        let now = SystemClock.now_secs();
+        // 10 minutes ahead — beyond the 300s future-skew bound.
+        let lie = now + 10 * 60;
+        let ct = alice.encrypt_message(b"backdated", ALICE, 0, lie).unwrap();
+        assert!(
+            bob.decrypt_message(&ct, &SystemClock).is_err(),
+            "an implausible committer timestamp must be rejected, not clamped"
+        );
+        assert!(
+            !bob.recv_sequence_tracker.contains_key(ALICE),
+            "a rejected message must not advance the replay tracker"
+        );
     }
 
     #[test]
@@ -485,16 +549,26 @@ mod tests {
             &mut &*bob_bundle.key_package().tls_serialize_detached().unwrap(),
         )
         .unwrap();
-        let add_bob = add_member(&mut alice.mls_group, bob_kp_in, &SystemClock).unwrap();
+        // ADR-057: the add-Bob commit binds a convergent timestamp into its
+        // AAD; the existing member Carol recovers + validates it on receive.
+        let ts = SystemClock.now_secs();
+        let add_bob =
+            add_member_with_convergent_timestamp(&mut alice.mls_group, bob_kp_in, &SystemClock, ts)
+                .unwrap();
         let commit_bytes = add_bob.commit.tls_serialize_detached().unwrap();
 
         match carol.decrypt_message(&commit_bytes, &SystemClock).unwrap() {
             Inbound::Commit {
                 sender_did,
                 added_dids,
+                committer_timestamp_secs,
             } => {
                 assert_eq!(sender_did, ALICE, "committer is Alice");
                 assert_eq!(added_dids, vec![BOB.to_owned()], "Bob's DID surfaced");
+                assert_eq!(
+                    committer_timestamp_secs, ts,
+                    "the authenticated convergent timestamp is recovered from the Commit AAD"
+                );
             }
             other => panic!("expected Inbound::Commit, got {other:?}"),
         }
@@ -504,9 +578,10 @@ mod tests {
     #[allow(clippy::unwrap_used)]
     fn replay_and_reorder_rejected() {
         let (mut alice, mut bob) = alice_and_bob();
-        let ct1 = alice.encrypt_message(b"first", ALICE, 1).unwrap();
-        let ct2 = alice.encrypt_message(b"second", ALICE, 2).unwrap();
-        let ct1_dup = alice.encrypt_message(b"first-again", ALICE, 1).unwrap();
+        let ts = SystemClock.now_secs();
+        let ct1 = alice.encrypt_message(b"first", ALICE, 1, ts).unwrap();
+        let ct2 = alice.encrypt_message(b"second", ALICE, 2, ts).unwrap();
+        let ct1_dup = alice.encrypt_message(b"first-again", ALICE, 1, ts).unwrap();
 
         assert!(
             bob.decrypt_message(&ct2, &SystemClock).is_ok(),
@@ -539,7 +614,8 @@ mod tests {
         let bob_group = join_group(&result.welcome, provider, signer).unwrap();
         let mut bob = ContextCryptoState::from_group(CTX, bob_group);
 
-        let ct = alice.encrypt_message(b"one", ALICE, 1).unwrap();
+        let ts = SystemClock.now_secs();
+        let ct = alice.encrypt_message(b"one", ALICE, 1, ts).unwrap();
         assert!(
             bob.decrypt_message(&ct, &SystemClock).is_err(),
             "no sender key → fails"
@@ -551,7 +627,7 @@ mod tests {
 
         // After receiving the key out-of-band, a fresh send at seq 1 decrypts.
         bob.insert_sender_key(ALICE, SenderKey::from_bytes(alice.local_sender_key_bytes()));
-        let ct_b = alice.encrypt_message(b"one-b", ALICE, 1).unwrap();
+        let ct_b = alice.encrypt_message(b"one-b", ALICE, 1, ts).unwrap();
         assert!(bob.decrypt_message(&ct_b, &SystemClock).is_ok());
     }
 
@@ -561,7 +637,9 @@ mod tests {
         let (mut alice, mut bob) = alice_and_bob();
         // Forge Alice's epoch to u64::MAX so her next header poisons the ceiling.
         alice.sender_key_epoch = u64::MAX;
-        let poisoned = alice.encrypt_message(b"poison", ALICE, 0).unwrap();
+        let poisoned = alice
+            .encrypt_message(b"poison", ALICE, 0, SystemClock.now_secs())
+            .unwrap();
         assert!(
             bob.decrypt_message(&poisoned, &SystemClock).is_err(),
             "epoch beyond store.epoch + MAX_EPOCH_ADVANCE must be rejected"
@@ -580,6 +658,7 @@ mod tests {
         let inbound = Inbound::Application {
             sender_did: ALICE.to_owned(),
             plaintext: secret.to_vec(),
+            committer_timestamp_secs: 1_700_000_000,
         };
         let rendered = format!("{inbound:?}");
         assert!(

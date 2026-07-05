@@ -16,7 +16,8 @@
 //!    byte-identical (every leaf hash AND the Merkle root match), the §9.9.3
 //!    convergence property. This holds because both sides run the same
 //!    `scp-event-log` append logic over the same committer-assigned inputs
-//!    (committer DID + the convergent timestamp that travels with each message),
+//!    (committer DID + the convergent timestamp bound into each message's
+//!    authenticated MLS AAD and recovered from the verified frame, ADR-057),
 //!    even though their local clocks deliberately differ.
 //! 3. **Pull-based receive** — Bob drains a `MessageReceived` event carrying
 //!    the decrypted plaintext.
@@ -37,8 +38,8 @@ const BOB_DID: &str = "did:key:z6MkBob2PartyExchangeFixtureKeyBBBBBBBBBBBB";
 
 /// Builds a fresh client for `did` over a fixed-time clock. Each member's own
 /// leaf timestamps come from its clock, and the convergent timestamp that must
-/// match across members travels with the message (so the two clocks need not
-/// agree — but fixing them keeps the fixture deterministic).
+/// match across members is bound into the message's authenticated AAD (so the
+/// two clocks need not agree — but fixing them keeps the fixture deterministic).
 fn client_for(did: &str, now_secs: u64) -> ScpClient {
     let signer = Arc::new(LocalSigner::active(did));
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
@@ -127,9 +128,11 @@ fn two_party_message_exchange_end_to_end() {
         .expect("Alice installs Bob's sender key");
 
     // --- Alice sends an application message: sender-layer encrypt + MLS encrypt
-    // + a MessageSent leaf. The convergent send timestamp rides on the output. ---
+    // + a MessageSent leaf. The convergent send timestamp is bound into the
+    // ciphertext's authenticated AAD (ADR-057), so the returned value is
+    // just the ciphertext bytes. ---
     let plaintext = b"hello from Alice over a single-threaded SCP client";
-    let send = alice.send_message(CTX, plaintext).expect("Alice sends");
+    let ciphertext = alice.send_message(CTX, plaintext).expect("Alice sends");
 
     assert_eq!(
         alice.event_log_leaf_count(CTX),
@@ -137,10 +140,12 @@ fn two_party_message_exchange_end_to_end() {
         "Alice's log is now created + joined + sent"
     );
 
-    // --- Bob receives + decrypts + records his MessageSent leaf using the same
-    // send timestamp, then drains the MessageReceived event. ---
+    // --- Bob receives + decrypts + records his MessageSent leaf using the
+    // convergent timestamp recovered from the ciphertext's verified AAD (no
+    // separate timestamp is transported), then drains the MessageReceived
+    // event. ---
     let was_application = bob
-        .receive_message(CTX, &send.ciphertext, send.committer_timestamp_secs)
+        .receive_message(CTX, &ciphertext)
         .expect("Bob receives the message");
     assert!(was_application, "Alice's send is an application message");
 
