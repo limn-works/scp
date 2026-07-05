@@ -95,4 +95,87 @@ public enum Economy {
             metricsJson: metricsJson
         )
     }
+
+    // MARK: - Amount display formatting (ADR-060 SDK display surface)
+
+    /// Number of decimal places for well-known currencies, keyed by uppercase
+    /// currency code. The SCP protocol does NOT store per-currency decimals —
+    /// the wire form is always a smallest-unit integer — so this table lives
+    /// entirely in the SDK for display. The same values are used across every
+    /// SDK (TypeScript, Python, Kotlin) for cross-binding consistency.
+    private static let knownCurrencyDecimals: [String: Int] = [
+        "USD": 2,
+        "EUR": 2,
+        "GBP": 2,
+        "BTC": 8,
+        "SAT": 0,
+        "SOL": 9,
+        "USDC": 6,
+        "ETH": 18
+    ]
+
+    private static func format(amount: UInt64, validatedDecimals decimals: Int) -> String {
+        // Operate on the decimal digit string directly (no divisor arithmetic),
+        // so any `decimals` — even beyond a UInt64's digit count — formats
+        // exactly with no overflow. A full-width `UInt64` formats exactly.
+        let digits = String(amount)
+        if decimals == 0 {
+            // The amount is already in whole display units — no fraction.
+            return digits
+        }
+        if digits.count <= decimals {
+            let fraction = String(repeating: "0", count: decimals - digits.count) + digits
+            return "0.\(fraction)"
+        }
+        let splitIndex = digits.index(digits.endIndex, offsetBy: -decimals)
+        let whole = digits[digits.startIndex ..< splitIndex]
+        let fraction = digits[splitIndex ..< digits.endIndex]
+        return "\(whole).\(fraction)"
+    }
+
+    /// Formats a smallest-unit monetary amount as a human-readable decimal
+    /// string, applying the currency's decimal scale.
+    ///
+    /// Pure integer/string arithmetic (no floating point), so a full-width
+    /// `UInt64` formats exactly.
+    ///
+    /// ```swift
+    /// try Economy.format(amount: 150, currency: "USD")        // "1.50"
+    /// try Economy.format(amount: 100_000_000, currency: "BTC") // "1.00000000"
+    /// ```
+    ///
+    /// - Parameters:
+    ///   - amount: Smallest-unit amount (e.g. cents, satoshis).
+    ///   - currency: A known currency code (case-insensitive).
+    /// - Returns: The human-decimal representation.
+    /// - Throws: `ScpError.Validation` if the currency is unknown; pass the
+    ///   `decimals:` overload for unknown/custom currencies.
+    public static func format(amount: UInt64, currency: String) throws -> String {
+        guard let decimals = knownCurrencyDecimals[currency.uppercased()] else {
+            throw ScpError.Validation(
+                msg: "unknown currency \"\(currency)\" has no known decimals; "
+                    + "use format(amount:decimals:) with an explicit scale",
+                code: "SCP-ECON-12070"
+            )
+        }
+        return format(amount: amount, validatedDecimals: decimals)
+    }
+
+    /// Formats a smallest-unit monetary amount using an explicit decimal scale,
+    /// for unknown or custom currencies.
+    ///
+    /// - Parameters:
+    ///   - amount: Smallest-unit amount (e.g. cents, satoshis).
+    ///   - decimals: The number of fractional decimal places (0...100).
+    /// - Returns: The human-decimal representation.
+    /// - Throws: `ScpError.Validation` if `decimals` is out of range.
+    public static func format(amount: UInt64, decimals: Int) throws -> String {
+        guard decimals >= 0, decimals <= 100 else {
+            throw ScpError.Validation(
+                msg: "decimals must be in 0...100, got \(decimals)",
+                code: "SCP-ECON-12070"
+            )
+        }
+        return format(amount: amount, validatedDecimals: decimals)
+    }
 }
