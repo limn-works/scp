@@ -1077,59 +1077,44 @@ pub struct NapiSealedInvitation {
 
 /// The outcome of [`invite_member_on`].
 ///
-/// `kind` is the discriminant — EXACTLY `"sealed"` or
-/// `"requiresGovernanceApproval"` (canonical tag strings mirrored across all
-/// bridges — see the `PyO3` reference `PyInviteMemberOutcome`). For `"sealed"`,
-/// `enc`/`ciphertext`/`delivered` are present and `proposal_id` is `None`; the
-/// caller (or transport) delivers the sealed `(enc, ciphertext)` bundle to the
-/// invitee. For `"requiresGovernanceApproval"` — a first-class SUCCESS outcome,
-/// NOT an error — the invite is deferred to a governance vote; `proposal_id`
-/// carries the tracked proposal id (hex-encoded) when one exists (`None` today,
-/// reserved).
+/// Carries the sealed [`NapiSealedInvitation`] `bundle` (directly usable as the
+/// `sealed` argument to `context_join_from_welcome` — no re-boxing) plus
+/// `delivered`: `true` if the runtime published the sealed bundle to the
+/// invitee's routing id, `false` if the caller (or transport) must deliver
+/// `bundle` itself.
+///
+/// `invite_member` supports only `SingleAdmin` contexts today; a voting-governed
+/// context throws an error (governed-context invitations are not yet
+/// implemented) rather than surfacing here. This is an extensible object — a
+/// future governed-invite outcome is added additively — mirroring the `PyO3`
+/// reference bridge's `PyInviteMemberOutcome`.
 #[napi(object)]
 pub struct NapiInviteMemberOutcome {
-    /// The outcome discriminant: `"sealed"` or `"requiresGovernanceApproval"`.
-    pub kind: String,
-    /// The HPKE encapsulated key (`enc`), or `None` when the invite requires
-    /// governance approval.
-    pub enc: Option<Vec<u8>>,
-    /// The HPKE ciphertext (`ct`), or `None` when the invite requires
-    /// governance approval.
-    pub ciphertext: Option<Vec<u8>>,
+    /// The sealed invitation bundle — pass it directly to
+    /// `context_join_from_welcome`.
+    pub bundle: NapiSealedInvitation,
     /// Whether the runtime published the sealed invitation to the invitee's
-    /// routing id (`true`) or the caller must deliver it (`false`). `None` when
-    /// the invite requires governance approval.
-    pub delivered: Option<bool>,
-    /// The tracked governance proposal id (hex-encoded), when one exists.
-    pub proposal_id: Option<String>,
+    /// routing id (`true`) or the caller must deliver it (`false`).
+    pub delivered: bool,
 }
 
 impl NapiInviteMemberOutcome {
     /// Maps a runtime
     /// [`InviteMemberOutcome`](scp_core::context::supervisor::InviteMemberOutcome)
     /// to its flat bridge projection. Mirrors the `PyO3` reference bridge's
-    /// `PyInviteMemberOutcome::from_outcome` exactly (same tag strings, same
-    /// field presence per variant).
+    /// `PyInviteMemberOutcome::from_outcome` exactly (same `bundle` + `delivered`
+    /// shape).
     fn from_outcome(outcome: scp_core::context::supervisor::InviteMemberOutcome) -> Self {
         use scp_core::context::supervisor::InviteMemberOutcome;
         match outcome {
-            InviteMemberOutcome::Sealed {
-                enc,
-                ciphertext,
+            InviteMemberOutcome::Sealed { bundle, delivered } => Self {
+                bundle: NapiSealedInvitation {
+                    context_id: bundle.context_id,
+                    creator_did: bundle.creator_did.to_string(),
+                    enc: bundle.enc,
+                    ciphertext: bundle.ciphertext,
+                },
                 delivered,
-            } => Self {
-                kind: "sealed".to_owned(),
-                enc: Some(enc.to_vec()),
-                ciphertext: Some(ciphertext),
-                delivered: Some(delivered),
-                proposal_id: None,
-            },
-            InviteMemberOutcome::RequiresGovernanceApproval { proposal_id } => Self {
-                kind: "requiresGovernanceApproval".to_owned(),
-                enc: None,
-                ciphertext: None,
-                delivered: None,
-                proposal_id: proposal_id.map(hex::encode),
             },
         }
     }
@@ -1421,8 +1406,24 @@ pub(crate) async fn context_join_from_welcome_on(
     // caller input. This runs AFTER the irreversible commit; the FFI state was
     // just registered (and not removed on this success path), so the sync targets
     // a live entry.
-    crate::runtime::sync_ceiling_from_params(bi, &sealed.context_id, &core_handle.params().ceiling)
-        .map_err(NapiError::from)?;
+    //
+    // BLACK-2JF-01 — post-irreversible-commit compensation: the sync fails ONLY
+    // if a concurrent close/leave removed the just-registered FFI state in the
+    // window since the spawn returned. A close/leave does NOT despawn the runtime
+    // actor, so returning `Err` here without tearing the actor down would strand a
+    // live, orphaned actor for a join that never fully materialized at the bridge.
+    // Compensate: despawn the just-committed actor (a silent local teardown — no
+    // MLS leave ceremony, no spurious event) and purge any residual bridge state,
+    // then surface the error.
+    if let Err(e) = crate::runtime::sync_ceiling_from_params(
+        bi,
+        &sealed.context_id,
+        &core_handle.params().ceiling,
+    ) {
+        sup.despawn_actor(&sealed.context_id).await;
+        crate::runtime::remove_context(bi, &sealed.context_id);
+        return Err(NapiError::from(e));
+    }
 
     // Runtime join committed. Register the context in the known-contexts
     // discovery registry so a Welcome-joined context is surfaced by discovery,
@@ -1488,12 +1489,13 @@ pub(crate) async fn context_join_from_welcome_on(
 /// FFI-02 Option A).
 ///
 /// The creator (or admin) seals the context's genesis params + Welcome for the
-/// invitee under RFC 9180 HPKE, binding them to the invitee's `KeyPackage`. For
-/// a `SingleAdmin` context the invite is unilateral and returns a `"sealed"`
-/// outcome carrying `(enc, ciphertext)`; for a voting context it returns
-/// `"requiresGovernanceApproval"` (a SUCCESS outcome, not an error — the invite
-/// is deferred to a governance vote). Mirrors the `PyO3` reference bridge's
-/// `invite_member` exactly.
+/// invitee under RFC 9180 HPKE, binding them to the invitee's `KeyPackage`. Only
+/// a `SingleAdmin` context is supported today: the invite is unilateral and
+/// returns a [`NapiInviteMemberOutcome`] whose `bundle` is the sealed
+/// [`NapiSealedInvitation`] — pass it directly to `context_join_from_welcome`. A
+/// voting-governed context returns `Err` (governed-context invitations are not
+/// yet implemented). Mirrors the `PyO3` reference bridge's `invite_member`
+/// exactly.
 ///
 /// The inviter MUST be a locally-custodied identity: the invite is signed under
 /// its `#active` key, resolved (and exported for the single runtime driver call)
@@ -5709,11 +5711,14 @@ mod tests {
     /// context lookup -> typed error mapping — and rejects the two reachable
     /// failure modes on the pre-add path.
     ///
-    /// NOTE ON SCOPE: the `"sealed"` happy-path (and the full creator-seal ->
-    /// joiner-open round-trip) is NOT asserted here because it terminates in the
-    /// MLS add-member step, covered at the cross-bridge E2E layer once the
-    /// §5.13.3 `0xFF02` KeyPackage-capabilities path is green. This test pins what
-    /// IS reachable on the pre-add path so the export is not merely
+    /// NOTE ON SCOPE: the sealed happy-path (the full creator-seal ->
+    /// joiner-open round-trip) is not re-asserted in THIS Rust unit test by
+    /// reference-bridge convention — the runtime already proves it in
+    /// `spawn_from_welcome_tests`, and the napi surface is exercised end-to-end
+    /// at the real-`.node` TypeScript SDK layer (peer of the Python `pytest`
+    /// round-trip). The §5.13.3 `0xFF02` KeyPackage-capabilities path is green
+    /// (9fe3b4c9b), so nothing blocks that coverage. This test pins what IS
+    /// reachable through the pre-add bridge seams so the export is not merely
     /// compiled-but-dead.
     ///
     /// Not false-green: assertion (a) uses a REAL custodied inviter (+ an attached

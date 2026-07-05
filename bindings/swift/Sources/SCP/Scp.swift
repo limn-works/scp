@@ -444,18 +444,19 @@ public extension SCP {
     ///
     /// The creator (or admin) seals the context's genesis params + MLS Welcome
     /// for the invitee under RFC 9180 HPKE, binding them to the invitee's
-    /// `KeyPackage`. The result is the native ``InviteMemberOutcome`` enum —
-    /// exhaust it with `switch`:
+    /// `KeyPackage`. Only a `SingleAdmin` context is supported today: the invite
+    /// is unilateral and returns the native ``InviteMemberOutcome`` enum's
+    /// ``InviteMemberOutcome/sealed(bundle:delivered:)`` case, whose `bundle` is
+    /// the sealed ``SealedInvitation`` — pass it straight to
+    /// ``Context/joinFromWelcome(scp:identity:sealed:reservationId:)`` (no
+    /// re-assembly). A voting-governed context THROWS ``ScpError/Context(msg:code:)``
+    /// (governed-context invitations are not yet implemented).
     ///
-    ///  - ``InviteMemberOutcome/sealed(enc:ciphertext:delivered:)`` — a
-    ///    `SingleAdmin` context: the invite is unilateral. If `delivered` is
-    ///    `false`, hand the sealed `(enc, ciphertext)` bundle to the invitee out
-    ///    of band; they open it with
-    ///    ``Context/joinFromWelcome(scp:identity:sealed:reservationId:)``.
-    ///  - ``InviteMemberOutcome/requiresGovernanceApproval(proposalId:)`` — a
-    ///    voting context: the invite is deferred to a governance vote. This is a
-    ///    SUCCESS outcome, NOT an error; `proposalId` carries the tracked
-    ///    proposal id when one exists.
+    /// The invite routes through the actor governance gate, which requires the
+    /// inviter to hold the `governance:propose` capability. A normally-created
+    /// `SingleAdmin` context grants its admin that capability at genesis, so it
+    /// works out of the box; a context with a custom ceiling must grant
+    /// `governance:propose` to the inviter.
     ///
     /// ```swift
     /// let outcome = try await scp.inviteMember(
@@ -465,17 +466,12 @@ public extension SCP {
     ///     inviteeKeyPackage: reservation.keyPackagePublic,
     ///     relayUrls: []
     /// )
-    /// switch outcome {
-    /// case let .sealed(enc, ciphertext, _):
-    ///     let sealed = SealedInvitation(
-    ///         contextId: ctx.contextId, creatorDid: creator.did(),
-    ///         enc: enc, ciphertext: ciphertext
-    ///     )
-    ///     // deliver `sealed` to the invitee
-    /// case let .requiresGovernanceApproval(proposalId):
-    ///     // the invite is pending a governance vote
-    ///     _ = proposalId
-    /// }
+    /// // `outcome.bundle` is directly usable — no manual re-assembly:
+    /// let joined = try await joinerScp.contextJoinFromWelcome(
+    ///     identity: invitee,
+    ///     sealed: outcome.bundle,
+    ///     reservationId: reservationId
+    /// )
     /// ```
     ///
     /// - Parameters:
@@ -487,12 +483,13 @@ public extension SCP {
     ///   - inviteeKeyPackage: The invitee's PUBLIC MLS `KeyPackage` bytes (from
     ///     the invitee's ``reserveKeyPackage(identity:)``).
     ///   - relayUrls: Relay URLs the runtime may publish the sealed bundle to.
-    /// - Returns: The native ``InviteMemberOutcome`` — `.sealed` or
-    ///   `.requiresGovernanceApproval` (both SUCCESS outcomes).
+    /// - Returns: The native ``InviteMemberOutcome`` — the `.sealed` case
+    ///   carrying the sealed `bundle` and the `delivered` flag.
     /// - Throws: ``ScpError/Identity(msg:code:)`` if the inviter is not locally
     ///   custodied, or ``ScpError/Context(msg:code:)`` if the supervisor is not
-    ///   initialized or the runtime invite fails (no live context, unauthorized
-    ///   inviter, invalid `KeyPackage`).
+    ///   initialized, the context is voting-governed (governed-context
+    ///   invitations are not yet implemented), or the runtime invite fails (no
+    ///   live context, unauthorized inviter, invalid `KeyPackage`).
     func inviteMember(
         identity: Identity,
         contextId: String,
@@ -996,14 +993,14 @@ public extension SCP {
     /// let reservation = try await scp.reserveKeyPackage(identity: joiner)
     ///
     /// // Hand `reservation.keyPackagePublic` to the creator out of band. The
-    /// // creator seals a signed invitation bundle for it via `inviteMember`.
-    /// let sealed: SealedInvitation = /* the .sealed outcome from the creator */
+    /// // creator seals a signed invitation bundle for it via `inviteMember`,
+    /// // then hands back `outcome.bundle` (a `SealedInvitation`).
     ///
     /// // Joiner opens the sealed bundle and stands up a send-capable context.
     /// let ctx = try await Context.joinFromWelcome(
     ///     scp: scp,
     ///     identity: joiner,
-    ///     sealed: sealed,
+    ///     sealed: outcome.bundle,
     ///     reservationId: reservation.reservationId
     /// )
     /// ```

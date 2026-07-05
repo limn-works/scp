@@ -1015,50 +1015,34 @@ const INVITATION_TTL_SECS: u32 = 7 * 24 * 60 * 60;
 
 /// Outcome of [`Supervisor::invite_member`].
 ///
-/// The two variants are the two structurally-distinct outcomes of routing the
-/// invitation's member-add through the context actor's governance gate:
+/// An extensible enum with a SINGLE variant today. `invite_member` currently
+/// supports only `SingleAdmin` contexts, where the caller-as-admin is
+/// authorized to add the member unilaterally: the governance action
+/// auto-executes, the real MLS add runs in-actor (updating `role_state`,
+/// broadcasting the epoch-advancing Commit to existing members), and the
+/// resulting Welcome is sealed into a signed §5.12.3 `InvitationBundle` for the
+/// invitee — surfaced here as [`Self::Sealed`].
 ///
-/// - [`Self::Sealed`] — the caller was authorized to add the member
-///   unilaterally (a `SingleAdmin` context whose admin is the caller), so the
-///   governance action auto-executed, the real MLS add ran in-actor (updating
-///   `role_state`, broadcasting the epoch-advancing Commit to existing
-///   members), and the resulting Welcome was sealed into a signed §5.12.3
-///   `InvitationBundle` for the invitee.
-/// - [`Self::RequiresGovernanceApproval`] — the context uses a voting
-///   governance model (Threshold / Majority / Unanimity), so a unilateral
-///   invite is NOT authorized. NO proposal was created, NO KeyPackage was
-///   staged, NO MLS add ran, and NO bundle was produced: `invite_member`
-///   refuses BEFORE proposing rather than leaving a dead-on-arrival pending
-///   proposal. Governed-context invites (which would create + track a proposal,
-///   then seal the Welcome once it is approved and executed) are not yet
-///   implemented — see the governed-invite follow-up. This is a first-class
-///   success outcome, not an error.
+/// A voting-governed context (Threshold / Majority / Unanimity) instead returns
+/// `Err`: a unilateral invite is NOT authorized and governed-context
+/// invitations (create + track a proposal, seal the Welcome once approved and
+/// executed) are not yet implemented — see `invite_member`. When they are, a
+/// second variant carrying the tracked proposal id is added ADDITIVELY; the
+/// enum shape is preserved for exactly that forward extension.
 #[derive(Debug, Clone)]
 pub enum InviteMemberOutcome {
     /// The invitation was sealed and (best-effort) delivered.
     Sealed {
-        /// RFC 9180 HPKE encapsulated key (`enc`) — the 32-byte ephemeral
-        /// public key.
-        enc: [u8; 32],
-        /// RFC 9180 HPKE ciphertext (`ct = ciphertext || tag`) of the
-        /// serialized, signed
-        /// [`InvitationBundle`](scp_protocol::context::InvitationBundle).
-        ciphertext: Vec<u8>,
+        /// The creator-signed, HPKE-sealed invitation bundle (`context_id`,
+        /// `creator_did`, `enc`, `ciphertext`) — the SAME wire type the joiner
+        /// passes to [`Supervisor::spawn_actor_from_welcome`], so the invite
+        /// output is directly usable as the join input with no re-boxing.
+        bundle: crate::context::invitation_helpers::SealedInvitation,
         /// `true` if the runtime published the sealed invitation to the
         /// invitee's `scp-invitations` routing id; `false` if the transport
         /// does not support routing-id delivery (the caller must deliver
-        /// `(enc, ciphertext)` itself).
+        /// `bundle` itself).
         delivered: bool,
-    },
-    /// The context requires a governance vote, so a unilateral invite is not
-    /// authorized. No proposal was created and no member was added (governed-
-    /// context invites are not yet implemented).
-    RequiresGovernanceApproval {
-        /// Always `None` today: no proposal is created for a voting context (the
-        /// invite is refused before proposing). Reserved to carry the tracked
-        /// `AddMember` proposal id once governed-context invites are
-        /// implemented.
-        proposal_id: Option<scp_protocol::context::governance::ProposalId>,
     },
 }
 
@@ -4700,7 +4684,7 @@ impl Supervisor {
     ///
     /// # Visibility
     ///
-    /// `pub(in crate::context)` — exposed through
+    /// `pub` — exposed through
     /// [`SupervisorHandle::despawn_actor`](crate::context::supervisor::handle::SupervisorHandle::despawn_actor)
     /// so lifecycle bootstrap (`import_context`) can perform the
     /// despawn-then-respawn dance without holding `&Supervisor`
@@ -4708,8 +4692,15 @@ impl Supervisor {
     /// [`crate::context::lifecycle_helpers::shutdown_all_contexts`] to
     /// remove each actor's handle after `ShutdownSelf`, so the inbox
     /// closes and the actor task exits rather than lingering as a
-    /// zombie.
-    pub(in crate::context) async fn despawn_actor(&self, context_id: &str) -> bool {
+    /// zombie. Also called by the FFI bridges as the COMPENSATING teardown
+    /// when a post-irreversible-commit step of the Welcome-join fails (e.g.
+    /// a concurrent close/leave removed the bridge state before the
+    /// authenticated ceiling could be synced): the just-committed actor is
+    /// despawned so no orphaned live actor lingers for a join that did not
+    /// fully materialize. This is a silent local teardown — it drops the
+    /// actor's inbox so the task exits, without any MLS leave ceremony or
+    /// spurious `MemberLeft` event.
+    pub async fn despawn_actor(&self, context_id: &str) -> bool {
         let _guard = self.write_lock.lock().await;
         self.actors.remove(context_id).is_some()
     }
@@ -10490,8 +10481,9 @@ impl Supervisor {
     ///    [`key_resolver`](Self::key_resolver_ref) and maps it to X25519 (RFC
     ///    7748) as the HPKE recipient key.
     /// 3. Only a `SingleAdmin` context is supported (a voting model returns
-    ///    [`InviteMemberOutcome::RequiresGovernanceApproval`] up front — no
-    ///    proposal, no add). Routes the member-add through the context actor's
+    ///    `Err(ContextError::InvalidState)` up front — no proposal, no add —
+    ///    because governed-context invitations are not yet implemented). Routes
+    ///    the member-add through the context actor's
     ///    governance gate (`propose_governance_action_checked` → `AddMember`),
     ///    carrying `invitee_key_package` (the invitee's reserved KeyPackage bytes
     ///    from [`Self::reserve_key_package`]) on the actor command envelope. The
@@ -10547,7 +10539,9 @@ impl Supervisor {
     /// # Errors
     ///
     /// - [`ContextError::ContextNotRegistered`] if `context_id` has no live
-    ///   context; [`ContextError::CryptoFailed`] for a Broadcast context, an
+    ///   context; [`ContextError::InvalidState`] for a voting-governed context
+    ///   (governed-context invitations are not yet implemented);
+    ///   [`ContextError::CryptoFailed`] for a Broadcast context, an
     ///   unresolvable invitee `#active` key, an invalid key mapping, a signing or
     ///   HPKE-seal failure, or a serialization fault;
     ///   [`ContextError::MembershipFailed`] if the MLS add-member produces no
@@ -10585,19 +10579,26 @@ impl Supervisor {
             ));
         }
 
-        // FIX 3 — governed-context gate: only a `SingleAdmin` context authorizes
-        // a UNILATERAL invite (the admin auto-executes the add). A voting model
+        // Governed-context gate: only a `SingleAdmin` context authorizes a
+        // UNILATERAL invite (the admin auto-executes the add). A voting model
         // (Threshold / Majority / Unanimity) requires a governance vote, so a
         // unilateral invite is NOT authorized. Refuse HERE — before proposing —
         // so we never leave a dead-on-arrival pending `AddMember` proposal, never
         // stage a KeyPackage, and never run an MLS add. Governed-context invites
         // (create + track a proposal, seal the Welcome once approved) are not yet
-        // implemented (a deferred follow-up).
+        // implemented, so this is an honest `Err` rather than a phantom-success
+        // outcome that drops the invite while claiming it was deferred. When
+        // governed invites land, this branch returns the future additive
+        // `InviteMemberOutcome` variant carrying the tracked proposal id.
         if !matches!(
             params.governance,
             scp_protocol::context::params::GovernanceModel::SingleAdmin
         ) {
-            return Ok(InviteMemberOutcome::RequiresGovernanceApproval { proposal_id: None });
+            return Err(ContextError::InvalidState(
+                "invite_member: governed-context invitations are not yet implemented; only \
+                 SingleAdmin contexts support a unilateral invite"
+                    .to_owned(),
+            ));
         }
 
         // 2. Resolve the invitee's #active key -> X25519 recipient.
@@ -10758,7 +10759,7 @@ impl Supervisor {
                 context_id: context_id.clone(),
                 creator_did: creator_did.clone(),
                 enc: enc.to_vec(),
-                ciphertext: ciphertext.clone(),
+                ciphertext,
             };
             let payload = sealed.to_wire_bytes().map_err(|e| {
                 ContextError::CryptoFailed(format!("invite_member: delivery serialize failed: {e}"))
@@ -10783,8 +10784,7 @@ impl Supervisor {
             };
 
             Ok(InviteMemberOutcome::Sealed {
-                enc,
-                ciphertext,
+                bundle: sealed,
                 delivered,
             })
         }

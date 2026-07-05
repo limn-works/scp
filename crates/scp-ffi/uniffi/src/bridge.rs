@@ -1523,41 +1523,31 @@ pub enum CustodyMethod {
 /// The outcome of [`Scp::invite_member`](crate::scp::Scp::invite_member)
 /// (ADR-049 Phase 2J; FFI-02 Option A).
 ///
-/// A native sealed enum — Swift `switch` / Kotlin `when` consumers exhaust the
-/// two variants idiomatically. `RequiresGovernanceApproval` is a first-class
-/// SUCCESS outcome, NOT an error: a voting-governed context defers the invite to
-/// a governance vote rather than sealing a Welcome unilaterally. Mirrors the
-/// runtime type
+/// A native sealed enum with a SINGLE variant today — Swift `switch` / Kotlin
+/// `when` consumers destructure `Sealed` idiomatically. `invite_member` supports
+/// only `SingleAdmin` contexts; a voting-governed context returns a thrown error
+/// (governed-context invitations are not yet implemented) rather than surfacing
+/// here. The enum shape is kept precisely so a future governed-invite outcome is
+/// added ADDITIVELY. Mirrors the runtime type
 /// [`InviteMemberOutcome`](scp_core::context::supervisor::InviteMemberOutcome)
-/// and the canonical `"sealed"` / `"requiresGovernanceApproval"` tag strings the
-/// `PyO3` / napi reference bridges project (which lack native sum types); here
-/// the discriminant IS the enum variant.
+/// and the `PyO3` / napi reference bridges' `{bundle, delivered}` projection
+/// (which lack native sum types); here the discriminant IS the enum variant.
 #[derive(Debug, Clone, uniffi::Enum)]
 pub enum InviteMemberOutcome {
-    /// The invitation was sealed and (best-effort) delivered. `enc`/`ciphertext`
-    /// are the RFC 9180 HPKE-sealed, signed `InvitationBundle` for the invitee
-    /// (`enc` is the 32-byte encapsulated key, `ciphertext` is `ct =
-    /// ciphertext || tag`). `delivered` is `true` if the runtime published the
+    /// The invitation was sealed and (best-effort) delivered. `bundle` is the
+    /// creator-signed, HPKE-sealed [`SealedInvitation`] for the invitee —
+    /// directly usable as the `sealed` argument to
+    /// [`Scp::context_join_from_welcome`](crate::scp::Scp::context_join_from_welcome)
+    /// with no re-boxing. `delivered` is `true` if the runtime published the
     /// sealed bundle to the invitee's `scp-invitations` routing id, `false` if
-    /// the caller (or transport) must deliver `(enc, ciphertext)` itself.
+    /// the caller (or transport) must deliver `bundle` itself.
     Sealed {
-        /// RFC 9180 HPKE encapsulated key (`enc`), 32 bytes.
-        enc: Vec<u8>,
-        /// RFC 9180 HPKE ciphertext (`ct = ciphertext || tag`).
-        ciphertext: Vec<u8>,
+        /// The creator-signed, HPKE-sealed invitation bundle — the SAME wire
+        /// type the joiner passes to `context_join_from_welcome`.
+        bundle: SealedInvitation,
         /// `true` if the runtime published the sealed invitation to the
         /// invitee's routing id; `false` if the caller must deliver it.
         delivered: bool,
-    },
-    /// The context requires a governance vote, so a unilateral invite is not
-    /// authorized. No proposal was created and no member was added
-    /// (governed-context invites are not yet implemented). `proposal_id` carries
-    /// the tracked proposal id (hex-encoded) once one exists — `None` today,
-    /// reserved.
-    RequiresGovernanceApproval {
-        /// Hex-encoded tracked governance proposal id, when one exists (`None`
-        /// today).
-        proposal_id: Option<String>,
     },
 }
 
@@ -1568,20 +1558,15 @@ impl InviteMemberOutcome {
     fn from_core(outcome: scp_core::context::supervisor::InviteMemberOutcome) -> Self {
         use scp_core::context::supervisor::InviteMemberOutcome as Core;
         match outcome {
-            Core::Sealed {
-                enc,
-                ciphertext,
-                delivered,
-            } => Self::Sealed {
-                enc: enc.to_vec(),
-                ciphertext,
+            Core::Sealed { bundle, delivered } => Self::Sealed {
+                bundle: SealedInvitation {
+                    context_id: bundle.context_id,
+                    creator_did: bundle.creator_did.to_string(),
+                    enc: bundle.enc,
+                    ciphertext: bundle.ciphertext,
+                },
                 delivered,
             },
-            Core::RequiresGovernanceApproval { proposal_id } => {
-                Self::RequiresGovernanceApproval {
-                    proposal_id: proposal_id.map(hex::encode),
-                }
-            }
         }
     }
 }
@@ -9624,14 +9609,13 @@ impl Scp {
                 // These are practically unreachable as errors after the custody gate
                 // above already hard-failed a non-custodied joiner, but fail CLOSED
                 // (never panic) if custody or the active handle is somehow absent.
-                let custody = resolve_identity_custody(&identity).ok_or_else(|| {
-                    ScpError::Identity {
+                let custody =
+                    resolve_identity_custody(&identity).ok_or_else(|| ScpError::Identity {
                         msg: "joiner identity has no retained custody backend to open \
                               the sealed invitation bundle"
                             .to_owned(),
                         code: codes::IDENT_1054.to_owned(),
-                    }
-                })?;
+                    })?;
                 let active_handle = identity
                     .core_id
                     .as_ref()
@@ -9702,7 +9686,16 @@ impl Scp {
                 // the creator signed — never in caller input. Runs AFTER the
                 // irreversible commit; the UCAN state was just occupied (and not
                 // removed on this success path), so the sync targets a live entry.
-                // Fail CLOSED if the entry is somehow gone (unreachable — we own it).
+                //
+                // BLACK-2JF-01 — post-irreversible-commit compensation: the sync
+                // fails ONLY if a concurrent close/leave removed the just-occupied
+                // UCAN state in the window since the spawn returned. A close/leave
+                // does NOT despawn the runtime actor, so returning `Err` here
+                // without tearing the actor down would strand a live, orphaned
+                // actor for a join that never fully materialized at the bridge.
+                // Compensate: despawn the just-committed actor (a silent local
+                // teardown — no MLS leave ceremony, no spurious event) and purge any
+                // residual UCAN state, then surface the error.
                 let authed_ceiling: std::collections::HashSet<String> = joined
                     .params()
                     .ceiling
@@ -9715,10 +9708,13 @@ impl Scp {
                     })
                     .is_none()
                 {
+                    sup.despawn_actor(&context_id).await;
+                    bi.remove_ucan_state(&context_id);
                     return Err(ScpError::Context {
                         msg: format!(
                             "UCAN state for context '{context_id}' vanished before the \
-                             authenticated ceiling could be synced"
+                             authenticated ceiling could be synced; the just-committed actor was \
+                             torn down to avoid a stranded context"
                         ),
                         code: codes::CTX_2040.to_owned(),
                     });
@@ -9793,11 +9789,12 @@ impl Scp {
     ///
     /// The creator (or admin) seals the context's genesis params + Welcome for
     /// the invitee under RFC 9180 HPKE, binding them to the invitee's
-    /// `KeyPackage`. For a `SingleAdmin` context the invite is unilateral and
-    /// returns [`InviteMemberOutcome::Sealed`] carrying `(enc, ciphertext)`; for
-    /// a voting-governed context it returns
-    /// [`InviteMemberOutcome::RequiresGovernanceApproval`] (a SUCCESS outcome,
-    /// NOT an error — the invite is deferred to a governance vote).
+    /// `KeyPackage`. Only a `SingleAdmin` context is supported today: the invite
+    /// is unilateral and returns [`InviteMemberOutcome::Sealed`] whose `bundle`
+    /// is the sealed [`SealedInvitation`] — pass it directly to
+    /// [`Scp::context_join_from_welcome`](Self::context_join_from_welcome). A
+    /// voting-governed context returns a thrown `ScpError::Context`
+    /// (governed-context invitations are not yet implemented).
     ///
     /// The inviter's `#active` Ed25519 signing key is resolved from its retained
     /// local custody (never crossing the FFI as raw bytes on the way IN — only
@@ -18067,7 +18064,12 @@ mod tests {
 
         // A well-formed 32-byte `enc` so the failure isolates the custody gate
         // (which runs BEFORE the enc-length check), not a length rejection.
-        let sealed = sealed_test(&context_id, &creator_did, vec![0u8; 32], b"bogus-bundle".to_vec());
+        let sealed = sealed_test(
+            &context_id,
+            &creator_did,
+            vec![0u8; 32],
+            b"bogus-bundle".to_vec(),
+        );
         let result = rt.block_on(scp.context_join_from_welcome(
             loaded,
             sealed,
@@ -18336,12 +18338,16 @@ mod tests {
     /// mapping — and rejects the two reachable failure modes on the pre-add path.
     ///
     /// NOTE ON SCOPE: the `Sealed` happy-path (the full creator-seal ->
-    /// joiner-open round-trip) is NOT asserted here because it terminates in the
-    /// MLS add-member step, which is not green on THIS branch — the §5.13.3
-    /// `0xFF02` KeyPackage-capabilities work FFI-02 gates. The sealed round-trip
-    /// is covered at the E2E layer once that add-member path lands. This test
-    /// pins what IS reachable on the pre-add path so the export is not merely
-    /// compiled-but-dead.
+    /// joiner-open round-trip) is NOT asserted at THIS bridge layer. The §5.13.3
+    /// `0xFF02` KeyPackage-capabilities path IS green (9fe3b4c9b) — the runtime
+    /// already proves the round-trip in `spawn_from_welcome_tests`, and the `PyO3`
+    /// / real-napi peers assert it end-to-end. `UniFFI` cannot: the invitee's
+    /// `#active` verifying key is resolved through the DID resolver, and the
+    /// `UniFFI` bridge does not publish a locally-created identity's DID document
+    /// to a resolver-visible store, so a same-instance creator-seal cannot resolve
+    /// the invitee key here (the same no-publish limitation the Swift/Kotlin SDK
+    /// invite tests document). This test pins what IS reachable on the pre-add
+    /// path so the export is not merely compiled-but-dead.
     ///
     /// Not false-green: assertion (a) uses a REAL custodied inviter so
     /// signing-key resolution SUCCEEDS and the error is the live-context lookup

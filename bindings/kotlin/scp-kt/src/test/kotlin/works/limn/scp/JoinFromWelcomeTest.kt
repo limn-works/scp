@@ -5,9 +5,10 @@
 //
 // The Kotlin SDK forwards 1:1 to the generated UniFFI `Scp` object: reserve
 // returns the generated `ReservedKeyPackage` record unchanged, invite returns
-// the native `InviteMemberOutcome` sealed class (`Sealed` | `RequiresGovernance
-// Approval`), and join takes the native `SealedInvitation` record and returns
-// the opaque `ContextHandle`. There is no client-side guard layer — custody,
+// the native `InviteMemberOutcome` sealed class (a single `Sealed` case
+// carrying the `bundle` + `delivered`; a voting-governed context throws), and
+// join takes the native `SealedInvitation` record and returns the opaque
+// `ContextHandle`. There is no client-side guard layer — custody,
 // DID/context-id validation, bundle open/verify, and single-use consume all
 // live in the Rust core, so these tests exercise the real bridge.
 //
@@ -16,9 +17,9 @@
 //     identity (non-empty reservation id + non-empty PUBLIC bytes),
 //   - reserve fails closed for a DID-only (non-custodied) identity,
 //   - inviteMember on a SingleAdmin context seals a real bundle for a reserved
-//     invitee KeyPackage (happy path — reachable via real FFI: the creator's
-//     ceiling carries member:invite + governance:propose and the invite routes
-//     through the actor's capability-checked governance gate),
+//     invitee KeyPackage (happy path — reachable via real FFI: the invite
+//     routes through the actor's governance gate, which enforces only the
+//     admin's `governance:propose` capability),
 //   - inviteMember fails closed for a non-custodied inviter DID, and
 //   - join fails closed for a DID-only joiner at the pseudonym-derivation
 //     seam BEFORE the single-use KeyPackage is consumed.
@@ -101,12 +102,13 @@ class JoinFromWelcomeTest {
             cpuDispatcher = Dispatchers.Default,
         )
 
-    // Encrypted SingleAdmin params whose ceiling carries the invite-relevant
-    // capabilities. inviteMember routes the add through the actor's governance
-    // gate, which checks the proposer's `governance:propose` (and the
-    // `member:invite` action) before auto-executing the unilateral SingleAdmin
-    // add — so both must be in the ceiling for the happy path to seal (mirrors
-    // the PyO3 reference `test_invite_member_seals_for_single_admin_context`).
+    // Encrypted SingleAdmin params. inviteMember routes the add through the
+    // actor's governance gate, which enforces ONLY the proposer's
+    // `governance:propose` capability before auto-executing the unilateral
+    // SingleAdmin add (a normally-created SingleAdmin context grants its admin
+    // that capability at genesis). The ceiling below simply keeps the default
+    // SingleAdmin capability set (mirrors the PyO3 reference
+    // `test_invite_member_seals_for_single_admin_context`).
     private fun makeInviteParams(): ContextParams =
         ContextParams(
             mode = ContextMode.ENCRYPTED,
@@ -201,11 +203,12 @@ class JoinFromWelcomeTest {
                 val creator = scp.identityCreate(custody = "in_memory")
                 val invitee = scp.identityCreate(custody = "in_memory")
 
-                // Encrypted SingleAdmin context whose ceiling holds
-                // member:invite + governance:propose — so the invite is
-                // AUTHORIZED by the actor's capability-checked governance gate
-                // (a missing capability would reject earlier with a Permission
-                // error, not the sealing-stage error we assert below).
+                // Encrypted SingleAdmin context whose admin holds
+                // governance:propose (the only capability the invite gate
+                // enforces) — so the invite is AUTHORIZED by the actor's
+                // capability-checked governance gate (a missing capability would
+                // reject earlier with a Permission error, not the sealing-stage
+                // error we assert below).
                 val ctx = scp.contextCreate(creator, makeInviteParams())
 
                 // The invitee reserves a single-use KeyPackage (declares the

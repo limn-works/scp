@@ -73,7 +73,6 @@ __all__ = [
     "InviteMemberOutcome",
     "KeyCustodyProvider",
     "McpAllowlistState",
-    "RequiresGovernanceApproval",
     "Sealed",
     "SealedInvitation",
     "SqliteStorage",
@@ -284,44 +283,28 @@ class Sealed:
 
     The creator (or admin) sealed the context's genesis params + Welcome for
     the invitee under RFC 9180 HPKE, bound to the invitee's ``KeyPackage``.
-    Deliver ``(enc, ciphertext)`` to the invitee (out of band, or the runtime
-    may already have published it — see :attr:`delivered`); the invitee
-    completes the join via :meth:`SCP.context_join_from_welcome`.
+    Pass :attr:`bundle` straight to the invitee's
+    :meth:`SCP.context_join_from_welcome` (no re-assembly); the runtime may
+    already have published it for delivery — see :attr:`delivered`.
 
     Attributes:
-        enc: RFC 9180 HPKE encapsulated key (32 bytes).
-        ciphertext: RFC 9180 HPKE ciphertext (``ct = ciphertext || tag``).
+        bundle: The sealed :class:`SealedInvitation` — the SAME object the
+            joiner passes to :meth:`SCP.context_join_from_welcome`.
         delivered: ``True`` if the runtime published the sealed bundle to the
             invitee's routing id; ``False`` if the caller must deliver it.
     """
 
-    enc: bytes
-    ciphertext: bytes
+    bundle: SealedInvitation
     delivered: bool
 
 
-@dataclass(frozen=True)
-class RequiresGovernanceApproval:
-    """:meth:`SCP.invite_member` outcome — deferred to a governance vote.
-
-    A first-class SUCCESS outcome, NOT an error: on a voting context the invite
-    is not sealed unilaterally but submitted to the context's governance
-    process. Branch on the outcome type rather than treating this as a failure.
-
-    Attributes:
-        proposal_id: The tracked governance proposal id (hex-encoded) when one
-            exists; ``None`` today (reserved).
-    """
-
-    proposal_id: str | None
-
-
-# The outcome of :meth:`SCP.invite_member`: a sealed bundle ready to deliver
-# (:class:`Sealed`) or a deferral to a governance vote
-# (:class:`RequiresGovernanceApproval`). Branch on the concrete type —
-# ``isinstance(outcome, Sealed)`` vs ``isinstance(outcome,
-# RequiresGovernanceApproval)`` — both are success outcomes.
-InviteMemberOutcome = Sealed | RequiresGovernanceApproval
+# The outcome of :meth:`SCP.invite_member`. Today the only outcome is a sealed
+# bundle (:class:`Sealed`); a voting-governed context RAISES instead
+# (governed-context invitations are not yet implemented). Kept as an alias
+# (rather than bare ``Sealed``) so a future governed-invite outcome is added
+# additively as a union member without breaking callers that annotate against
+# :data:`InviteMemberOutcome`.
+InviteMemberOutcome = Sealed
 
 
 def _native_mod() -> Any:
@@ -383,21 +366,22 @@ def _to_native_sealed(sealed: SealedInvitation) -> Any:
 
 
 def _to_invite_outcome(raw: Any) -> InviteMemberOutcome:
-    """Map the native ``PyInviteMemberOutcome`` to the SDK union.
+    """Map the native ``PyInviteMemberOutcome`` to the SDK :class:`Sealed`.
 
-    Branches on the canonical ``kind`` discriminant — ``"sealed"`` or
-    ``"requiresGovernanceApproval"`` — mirrored across every bridge. An
-    unrecognized kind is a bridge/SDK version skew and fails closed rather than
-    being silently coerced.
+    The native outcome carries a ``bundle`` (a native ``PySealedInvitation``)
+    and a ``delivered`` flag. The bundle is projected into the SDK
+    :class:`SealedInvitation` dataclass so it is directly usable as the
+    ``sealed`` argument to :meth:`SCP.context_join_from_welcome`.
     """
-    kind = raw.kind
-    if kind == "sealed":
-        return Sealed(enc=raw.enc, ciphertext=raw.ciphertext, delivered=raw.delivered)
-    if kind == "requiresGovernanceApproval":
-        return RequiresGovernanceApproval(proposal_id=raw.proposal_id)
-    raise ScpError(
-        f"invite_member returned an unrecognized outcome kind: {kind!r}",
-        code="SCP-UNKNOWN-0001",
+    native_bundle = raw.bundle
+    return Sealed(
+        bundle=SealedInvitation(
+            context_id=native_bundle.context_id,
+            creator_did=native_bundle.creator_did,
+            enc=native_bundle.enc,
+            ciphertext=native_bundle.ciphertext,
+        ),
+        delivered=raw.delivered,
     )
 
 
@@ -1131,16 +1115,10 @@ class SCP:
             reservation_id, key_package_public = await scp.reserve_key_package(
                 joiner.did
             )
-            # ... creator calls invite_member(...) → Sealed(enc, ciphertext, ...);
-            # assemble the SealedInvitation and hand it back to the joiner ...
-            sealed = SealedInvitation(
-                context_id=context_id,
-                creator_did=creator.did,
-                enc=outcome.enc,
-                ciphertext=outcome.ciphertext,
-            )
+            # ... creator calls invite_member(...) → Sealed(bundle, delivered);
+            # hand `outcome.bundle` back to the joiner (no re-assembly) ...
             ctx = await scp.context_join_from_welcome(
-                joiner.did, sealed, reservation_id
+                joiner.did, outcome.bundle, reservation_id
             )
 
         Args:
@@ -1194,17 +1172,17 @@ class SCP:
         ``KeyPackage`` via :meth:`reserve_key_package` and hands the public bytes
         to the inviter out of band.
 
-        Returns a typed :data:`InviteMemberOutcome` to branch on — both variants
-        are SUCCESS outcomes:
+        Only a ``SingleAdmin`` context is supported today: the invite is
+        unilateral and returns a :class:`Sealed` outcome whose :attr:`~Sealed.bundle`
+        is the :class:`SealedInvitation` — pass it straight to the invitee's
+        :meth:`context_join_from_welcome`. A voting-governed context RAISES
+        (governed-context invitations are not yet implemented).
 
-        - :class:`Sealed` — a unilateral invite on a ``SingleAdmin`` context.
-          Carries ``(enc, ciphertext, delivered)``; assemble a
-          :class:`SealedInvitation` from ``(context_id, creator_did, enc,
-          ciphertext)`` and pass it to the invitee's
-          :meth:`context_join_from_welcome`.
-        - :class:`RequiresGovernanceApproval` — a voting context: the invite is
-          deferred to a governance vote, NOT rejected. Carries the tracked
-          ``proposal_id`` when one exists.
+        The invite routes through the actor governance gate, which requires the
+        inviter to hold the ``governance:propose`` capability. A normally-created
+        ``SingleAdmin`` context grants its admin that capability at genesis, so it
+        works out of the box; a context with a custom ceiling must grant
+        ``governance:propose`` to the inviter.
 
         Example::
 
@@ -1214,14 +1192,10 @@ class SCP:
             outcome = await scp.invite_member(
                 context_id, creator.did, invitee.did, invitee_kp, []
             )
-            if isinstance(outcome, Sealed):
-                sealed = SealedInvitation(
-                    context_id=context_id,
-                    creator_did=creator.did,
-                    enc=outcome.enc,
-                    ciphertext=outcome.ciphertext,
-                )
-                # ... deliver `sealed` + reservation_id to the invitee ...
+            # `outcome.bundle` is directly usable — no manual re-assembly:
+            ctx = await joiner_scp.context_join_from_welcome(
+                invitee.did, outcome.bundle, reservation_id
+            )
 
         Args:
             context_id: The context to invite into.
@@ -1233,13 +1207,15 @@ class SCP:
             relay_urls: Relay URLs to include for the invitee's first contact.
 
         Returns:
-            A :class:`Sealed` or :class:`RequiresGovernanceApproval` outcome.
+            A :class:`Sealed` outcome carrying the sealed
+            :attr:`~Sealed.bundle` and the :attr:`~Sealed.delivered` flag.
 
         Raises:
             Exception: If the supervisor is not initialized, the inviter is not
                 locally custodied / its signing key cannot be resolved, the
-                context is unknown, the inviter is unauthorized, or the
-                ``KeyPackage`` is invalid.
+                context is unknown, the context is voting-governed (governed-context
+                invitations are not yet implemented), the inviter is unauthorized,
+                or the ``KeyPackage`` is invalid.
 
         Delegates to ``_scp_core.SCP.invite_member``.
         """

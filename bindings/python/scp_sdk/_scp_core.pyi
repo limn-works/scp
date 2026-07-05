@@ -211,24 +211,17 @@ class PySealedInvitation:
 class PyInviteMemberOutcome:
     """The outcome of ``SCP.invite_member``.
 
-    ``kind`` is EXACTLY ``"sealed"`` or ``"requiresGovernanceApproval"``. For
-    ``"sealed"``, ``enc``/``ciphertext``/``delivered`` are present and
-    ``proposal_id`` is ``None``; for ``"requiresGovernanceApproval"``,
-    ``proposal_id`` carries the tracked id (or ``None``) and the others are
-    ``None``. The SDK projects this into the :data:`scp_sdk.InviteMemberOutcome`
-    union.
+    Carries the sealed ``bundle`` (a :class:`PySealedInvitation`, directly usable
+    as the ``sealed`` argument to ``context_join_from_welcome``) plus
+    ``delivered``. ``invite_member`` supports only ``SingleAdmin`` contexts today;
+    a voting-governed context raises instead. The SDK projects this into the
+    :class:`scp_sdk.Sealed` outcome.
     """
 
     @property
-    def kind(self) -> str: ...
+    def bundle(self) -> PySealedInvitation: ...
     @property
-    def enc(self) -> bytes | None: ...
-    @property
-    def ciphertext(self) -> bytes | None: ...
-    @property
-    def delivered(self) -> bool | None: ...
-    @property
-    def proposal_id(self) -> str | None: ...
+    def delivered(self) -> bool: ...
 
 class UcanToken:
     """A UCAN token returned by the bridge."""

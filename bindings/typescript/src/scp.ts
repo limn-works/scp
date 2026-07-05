@@ -1164,7 +1164,7 @@ export class SCP {
    * @example
    * const ctx = await scp.contextJoinFromWelcome(
    *   joiner.did,
-   *   sealed, // from the creator's `inviteMember` (kind === "sealed")
+   *   outcome.bundle, // the SealedInvitation from the creator's `inviteMember`
    *   reservation.reservationId,
    * );
    */
@@ -1205,15 +1205,17 @@ export class SCP {
    *
    * The creator (or admin) seals the context's genesis params + MLS Welcome for
    * the invitee under RFC 9180 HPKE, binding them to the invitee's `KeyPackage`.
-   * The result is a discriminated {@link InviteMemberOutcome} on `kind`:
+   * Only a `SingleAdmin` context is supported today: the invite is unilateral
+   * and returns an {@link InviteMemberOutcome} whose `bundle` is the sealed
+   * {@link SealedInvitation} — pass it straight to the invitee's
+   * {@link contextJoinFromWelcome} (no re-assembly). A voting-governed context
+   * THROWS (governed-context invitations are not yet implemented).
    *
-   *  - `"sealed"` — a `SingleAdmin` context: the invite is unilateral and
-   *    carries `(enc, ciphertext, delivered)`. If `delivered` is `false`, hand
-   *    the sealed `(enc, ciphertext)` bundle to the invitee out of band; they
-   *    open it with {@link contextJoinFromWelcome}.
-   *  - `"requiresGovernanceApproval"` — a voting context: the invite is deferred
-   *    to a governance vote. This is a SUCCESS outcome, NOT an error;
-   *    `proposalId` carries the tracked proposal id when one exists.
+   * The invite routes through the actor governance gate, which requires the
+   * inviter to hold the `governance:propose` capability. A normally-created
+   * `SingleAdmin` context grants its admin that capability at genesis, so it
+   * works out of the box; a context with a custom ceiling must grant
+   * `governance:propose` to the inviter.
    *
    * `creatorDid` MUST be a locally-custodied identity; the invite is signed
    * under its `#active` key.
@@ -1224,8 +1226,8 @@ export class SCP {
    * @param inviteeKeyPackage The invitee's PUBLIC MLS `KeyPackage` bytes (from
    *   the invitee's {@link reserveKeyPackage}).
    * @param relayUrls Relay URLs the runtime may publish the sealed bundle to.
-   * @returns The {@link InviteMemberOutcome} — `sealed` or
-   *   `requiresGovernanceApproval`.
+   * @returns The {@link InviteMemberOutcome} — the sealed `bundle` plus the
+   *   `delivered` flag.
    *
    * @example
    * const outcome = await scp.inviteMember(
@@ -1235,9 +1237,12 @@ export class SCP {
    *   reservation.keyPackagePublic,
    *   [],
    * );
-   * if (outcome.kind === "sealed") {
-   *   // deliver { enc: outcome.enc, ciphertext: outcome.ciphertext } to the invitee
-   * }
+   * // `outcome.bundle` is directly usable — no manual re-assembly:
+   * const joined = await joinerScp.contextJoinFromWelcome(
+   *   invitee.did,
+   *   outcome.bundle,
+   *   reservationId,
+   * );
    */
   async inviteMember(
     contextId: string,
@@ -1257,38 +1262,28 @@ export class SCP {
         kp: readonly number[],
         r: readonly string[],
       ) => Promise<{
-        kind: string;
-        enc?: ArrayLike<number> | null;
-        ciphertext?: ArrayLike<number> | null;
-        delivered?: boolean | null;
-        proposalId?: string | null;
+        bundle: {
+          contextId: string;
+          creatorDid: string;
+          enc: ArrayLike<number>;
+          ciphertext: ArrayLike<number>;
+        };
+        delivered: boolean;
       }>
     )(contextId, creatorDid, inviteeDid, keyPackageArray, relayUrls);
 
-    // Narrow the flat napi projection into the SDK's discriminated union.
-    // `requiresGovernanceApproval` is a first-class SUCCESS outcome, not an
-    // error — surface it as its own variant, never a throw.
-    if (raw.kind === "sealed") {
-      return {
-        kind: "sealed",
-        enc: new Uint8Array(raw.enc ?? []),
-        ciphertext: new Uint8Array(raw.ciphertext ?? []),
-        delivered: raw.delivered ?? false,
-      };
-    }
-    if (raw.kind === "requiresGovernanceApproval") {
-      return {
-        kind: "requiresGovernanceApproval",
-        proposalId: raw.proposalId ?? null,
-      };
-    }
-    // Fail closed on an unrecognized discriminant rather than silently
-    // fabricating a variant — the bridge tag set is fixed and mirrored across
-    // all bindings, so an unknown tag is a genuine wiring defect.
-    throw new ContextError(
-      `inviteMember returned an unrecognized outcome kind: ${String(raw.kind)}`,
-      "SCP-CTX-2013",
-    );
+    // Project the flat napi object into the SDK outcome. The `bundle` is a
+    // SealedInvitation directly usable as the join input. A voting-governed
+    // context does not reach here — the native bridge throws for it.
+    return {
+      bundle: {
+        contextId: raw.bundle.contextId,
+        creatorDid: raw.bundle.creatorDid,
+        enc: new Uint8Array(raw.bundle.enc),
+        ciphertext: new Uint8Array(raw.bundle.ciphertext),
+      },
+      delivered: raw.delivered,
+    };
   }
 
   async contextJoin(

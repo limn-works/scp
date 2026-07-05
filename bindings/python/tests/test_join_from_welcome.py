@@ -31,7 +31,6 @@ import pytest
 
 from scp_sdk.context import Context
 from scp_sdk.scp import (
-    RequiresGovernanceApproval,
     Sealed,
     SealedInvitation,
 )
@@ -212,19 +211,35 @@ class TestInviteMemberDelegation:
     """Verify :meth:`SCP.invite_member` forwarding + outcome projection.
 
     The wrapper forwards its five args in order to the native bridge and maps
-    the returned ``PyInviteMemberOutcome`` (a ``kind`` discriminant plus
-    optionals) into the SDK :data:`InviteMemberOutcome` union. Both outcome
-    kinds are first-class SUCCESS results — ``requiresGovernanceApproval`` is
-    NOT an error.
+    the returned ``PyInviteMemberOutcome`` (a ``bundle`` + ``delivered``) into
+    the SDK :class:`Sealed` outcome. Today the only outcome is ``Sealed``; a
+    voting-governed context raises at the native bridge (governed-context
+    invitations are not yet implemented) and is surfaced as an exception.
     """
+
+    @staticmethod
+    def _native_sealed_outcome(
+        *,
+        enc: bytes = b"\x00" * 32,
+        ciphertext: bytes = b"ct",
+        delivered: bool = True,
+    ) -> SimpleNamespace:
+        """A stand-in for the native ``PyInviteMemberOutcome`` (bundle + flag)."""
+        return SimpleNamespace(
+            bundle=SimpleNamespace(
+                context_id=_HEX_CTX_ID,
+                creator_did=_CREATOR_DID,
+                enc=enc,
+                ciphertext=ciphertext,
+            ),
+            delivered=delivered,
+        )
 
     async def test_forwards_all_args_in_order(self) -> None:
         from scp_sdk.scp import SCP
 
         native = MagicMock()
-        native.invite_member.return_value = SimpleNamespace(
-            kind="sealed", enc=b"\x00" * 32, ciphertext=b"ct", delivered=True
-        )
+        native.invite_member.return_value = self._native_sealed_outcome()
         scp = _make_scp(native)
 
         await SCP.invite_member(
@@ -248,8 +263,7 @@ class TestInviteMemberDelegation:
         from scp_sdk.scp import SCP
 
         native = MagicMock()
-        native.invite_member.return_value = SimpleNamespace(
-            kind="sealed",
+        native.invite_member.return_value = self._native_sealed_outcome(
             enc=b"\x01" * 32,
             ciphertext=b"sealed-ct",
             delivered=False,
@@ -260,40 +274,15 @@ class TestInviteMemberDelegation:
             scp, _HEX_CTX_ID, _CREATOR_DID, "did:dht:z6MkInvitee", b"kp", []
         )
 
+        # The outcome carries a SealedInvitation `bundle` directly usable as the
+        # join input — no manual re-assembly.
         assert isinstance(outcome, Sealed)
-        assert outcome.enc == b"\x01" * 32
-        assert outcome.ciphertext == b"sealed-ct"
+        assert isinstance(outcome.bundle, SealedInvitation)
+        assert outcome.bundle.context_id == _HEX_CTX_ID
+        assert outcome.bundle.creator_did == _CREATOR_DID
+        assert outcome.bundle.enc == b"\x01" * 32
+        assert outcome.bundle.ciphertext == b"sealed-ct"
         assert outcome.delivered is False
-
-    async def test_maps_requires_governance_approval_outcome(self) -> None:
-        from scp_sdk.scp import SCP
-
-        native = MagicMock()
-        native.invite_member.return_value = SimpleNamespace(
-            kind="requiresGovernanceApproval", proposal_id="deadbeef"
-        )
-        scp = _make_scp(native)
-
-        outcome = await SCP.invite_member(
-            scp, _HEX_CTX_ID, _CREATOR_DID, "did:dht:z6MkInvitee", b"kp", []
-        )
-
-        # A first-class SUCCESS outcome — NOT an exception.
-        assert isinstance(outcome, RequiresGovernanceApproval)
-        assert outcome.proposal_id == "deadbeef"
-
-    async def test_unknown_kind_fails_closed(self) -> None:
-        from scp_sdk.errors import ScpError
-        from scp_sdk.scp import SCP
-
-        native = MagicMock()
-        native.invite_member.return_value = SimpleNamespace(kind="somethingElse")
-        scp = _make_scp(native)
-
-        with pytest.raises(ScpError, match="unrecognized outcome kind"):
-            await SCP.invite_member(
-                scp, _HEX_CTX_ID, _CREATOR_DID, "did:dht:z6MkInvitee", b"kp", []
-            )
 
     async def test_propagates_bridge_error(self) -> None:
         from scp_sdk.scp import SCP
@@ -411,10 +400,11 @@ class TestInviteMemberRealFfi:
         from scp_sdk.types import CustodyType
 
         creator = await scp.identity_create(CustodyType.IN_MEMORY)
-        # The SingleAdmin creator must hold the invite-relevant capabilities in
-        # the context ceiling (`member:invite` + `governance:propose`): the
-        # add is routed through the actor's governance gate, which checks the
-        # proposer's `governance:propose` capability before auto-executing.
+        # The invite is routed through the actor's governance gate, which checks
+        # the proposer's `governance:propose` capability before auto-executing —
+        # that is the ONLY capability enforced for the invite. A normally-created
+        # SingleAdmin context grants its admin `governance:propose` at genesis; the
+        # ceiling below simply keeps the default SingleAdmin capability set.
         ctx = await scp.context_create(
             creator.did,
             {
@@ -440,10 +430,27 @@ class TestInviteMemberRealFfi:
 
         outcome = await scp.invite_member(ctx.context_id, creator.did, invitee.did, invitee_kp, [])
 
+        # The outcome carries a SealedInvitation `bundle` directly usable as the
+        # join input (no re-assembly): its fields are exactly the
+        # `context_join_from_welcome` `sealed` parameter shape. The full two-party
+        # JOIN (a distinct joiner node consuming the bundle) is proven at the
+        # runtime layer (`spawn_from_welcome_tests`); a single instance cannot
+        # self-join its own context (first-writer-wins rejects the second actor
+        # for the same context id).
         assert isinstance(outcome, Sealed)
+        assert isinstance(outcome.bundle, SealedInvitation)
+        assert outcome.bundle.context_id == ctx.context_id
+        assert outcome.bundle.creator_did == creator.did
         # RFC 9180 HPKE encapsulated key is exactly 32 bytes.
-        assert isinstance(outcome.enc, (bytes, bytearray))
-        assert len(outcome.enc) == 32
-        assert isinstance(outcome.ciphertext, (bytes, bytearray))
-        assert len(outcome.ciphertext) > 0
+        assert isinstance(outcome.bundle.enc, (bytes, bytearray))
+        assert len(outcome.bundle.enc) == 32
+        assert isinstance(outcome.bundle.ciphertext, (bytes, bytearray))
+        assert len(outcome.bundle.ciphertext) > 0
         assert isinstance(outcome.delivered, bool)
+
+    # NOTE: the governed-context refusal (`invite_member` raising for a voting
+    # context) is NOT exercisable through this SDK: the PyO3 bridge accepts only
+    # `governance: "single_admin"` at `context_create` (a voting context cannot be
+    # stood up here), so the runtime's voting-context `Err` path has no reachable
+    # SDK entry point. It is covered at the runtime layer
+    # (`spawn_from_welcome_tests::invite_member_into_voting_context_is_rejected`).

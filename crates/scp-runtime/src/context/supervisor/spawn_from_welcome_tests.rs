@@ -280,11 +280,13 @@ fn joiner_params() -> ContextParams {
 
 /// Bob's X25519 wrapping key material (§9.16.1). A joiner's KeyPackage must
 /// declare the `scp_context_params` (`0xFF02`) capability to be added to an SCP
-/// context group (OpenMLS `valn0502`), and the production `generate_key_package`
-/// path only emits `0xFF02` when a wrapping key is present — so every joiner in
-/// these tests publishes one via [`Supervisor::set_wrapping_keys`]. The bytes are
-/// an opaque leaf extension during add/join (no X25519 DH runs on the MLS join
-/// path), so a fixed non-zero constant suffices.
+/// context group (OpenMLS `valn0502`); since 9fe3b4c9b the production
+/// `generate_key_package` path declares `0xFF02` UNCONDITIONALLY (its capability
+/// is decoupled from any wrapping key). Publishing a wrapping key here exercises
+/// the wrapping-key-PRESENT leaf path (the `0xFF01` wrapping-key leaf extension)
+/// — NOT because `0xFF02` requires it. The bytes are an opaque leaf extension
+/// during add/join (no X25519 DH runs on the MLS join path), so a fixed non-zero
+/// constant suffices.
 const BOB_WRAP: [u8; 32] = [0xB2; 32];
 
 /// Builds the creator-committed `scp_context_params` (`0xFF02`) extension for a
@@ -307,8 +309,10 @@ fn honest_ext(context_id: &str, params: &ContextParams) -> ScpContextExtension {
     .expect("honest context extension serializes")
 }
 
-/// Publishes Bob's wrapping key on `sup` so his pooled KeyPackages declare
-/// `0xFF02` (see [`BOB_WRAP`]). Idempotent; must run BEFORE the KeyPackage store
+/// Publishes Bob's wrapping key on `sup` so his pooled KeyPackages carry the
+/// `0xFF01` wrapping-key leaf extension, exercising the wrapping-key-PRESENT path
+/// (see [`BOB_WRAP`]); the `0xFF02` context-params capability is declared
+/// unconditionally regardless. Idempotent; must run BEFORE the KeyPackage store
 /// is first spawned (i.e. before [`reserve_bob_kp`]).
 async fn set_bob_wrapping(sup: &Arc<Supervisor>, bob: &DID) {
     sup.set_wrapping_keys(
@@ -2321,14 +2325,15 @@ async fn invite_member_round_trip_stands_up_a_bidirectional_joiner() {
         )
         .await
         .expect("alice seals an invitation for bob");
-    // SingleAdmin creator invite must SEAL (not defer to a governance vote).
-    let (enc, ciphertext) = match outcome {
-        InviteMemberOutcome::Sealed {
-            enc, ciphertext, ..
-        } => Some((enc, ciphertext)),
-        InviteMemberOutcome::RequiresGovernanceApproval { .. } => None,
-    }
-    .expect("SingleAdmin creator invite seals a bundle, does not require governance approval");
+    // SingleAdmin creator invite must SEAL (governed contexts return `Err`, not a
+    // deferral). The `Sealed` bundle is the SAME `SealedInvitation` wire type the
+    // joiner consumes below — directly usable as the join input with no re-boxing
+    // (the runtime `WelcomeJoinRequest` reads its `enc`/`ciphertext` straight off
+    // the bundle). `enc` is validated to be exactly 32 bytes at the seal.
+    let InviteMemberOutcome::Sealed { bundle, .. } = outcome;
+    let enc =
+        <[u8; 32]>::try_from(bundle.enc.as_slice()).expect("sealed bundle enc is exactly 32 bytes");
+    let ciphertext = bundle.ciphertext;
 
     // (c') The creator's OWN role_state now reflects Bob (the split-brain the
     //      old off-mailbox add left behind is closed: the add ran in-actor).
@@ -2539,12 +2544,12 @@ async fn invite_member_broadcasts_the_add_commit_to_existing_members() {
 /// A voting governance model (`Threshold`) does NOT authorize a unilateral
 /// invite. `invite_member` refuses BEFORE proposing — it does NOT create a
 /// dead-on-arrival pending proposal — and returns
-/// [`InviteMemberOutcome::RequiresGovernanceApproval`] with `proposal_id: None`,
-/// adding NO member (no sealed bundle, no MLS add, no proposal). This is the
-/// structural auth gate: governed-context invites are not yet implemented, so a
-/// voting context is refused cleanly rather than leaving orphaned state.
+/// `Err(ContextError::InvalidState)` because governed-context invitations are
+/// not yet implemented, adding NO member (no sealed bundle, no MLS add, no
+/// proposal). This is the structural auth gate: an honest error, not a
+/// phantom-success outcome that drops the invite while claiming a deferral.
 #[tokio::test]
-async fn invite_member_into_voting_context_requires_governance_approval() {
+async fn invite_member_into_voting_context_is_rejected() {
     let ctx_id = ctx_hex(0xd7);
     let alice = DID::from(ALICE_DID);
     let bob = DID::from(BOB_DID);
@@ -2571,7 +2576,7 @@ async fn invite_member_into_voting_context_requires_governance_approval() {
     let (bob_sup, _bob_crypto) = bob_supervisor(None);
     let (_reservation_id, kp_public_bytes) = reserve_bob_kp(&bob_sup, &bob).await;
 
-    let outcome = alice_sup
+    let err = alice_sup
         .invite_member(
             ctx_id.clone(),
             alice.clone(),
@@ -2581,16 +2586,13 @@ async fn invite_member_into_voting_context_requires_governance_approval() {
             &alice_signing_key(),
         )
         .await
-        .expect("a voting context is refused cleanly, invite does not error");
+        .expect_err("a voting context refuses a unilateral invite with an error");
 
-    // The refusal carries NO proposal id — no proposal was created.
+    // The refusal is an honest `InvalidState` error — no phantom-success
+    // outcome, no proposal, no member.
     assert!(
-        matches!(
-            outcome,
-            InviteMemberOutcome::RequiresGovernanceApproval { proposal_id: None }
-        ),
-        "a unilateral invite into a voting context is refused before proposing, with no \
-         proposal created; got {outcome:?}"
+        matches!(err, crate::context::ContextError::InvalidState(_)),
+        "a unilateral invite into a voting context is refused with InvalidState; got {err:?}"
     );
     // No member was added — the add did not run.
     assert_eq!(

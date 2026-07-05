@@ -9,8 +9,9 @@ import XCTest
 /// The suite links the Rust binary built with `allow_in_memory_custody`, so
 /// reservation, the sealed-invitation producer, and the join-side custody /
 /// validation gates run against the real engine (like `ScpClassTests` /
-/// `ToolSagaTests`). `inviteMember` under a `SingleAdmin` context whose ceiling
-/// admits `member:invite` + `governance:propose` seals unilaterally in-process
+/// `ToolSagaTests`). `inviteMember` under a `SingleAdmin` context whose admin
+/// holds `governance:propose` (the only capability the invite gate enforces)
+/// seals unilaterally in-process
 /// (the 0xFF02-capable invitee `KeyPackage` comes from `reserveKeyPackage`), so
 /// the sealed happy path IS exercised. A full happy-path JOIN additionally
 /// requires the joiner to open that specific creator-signed bundle — a two-party
@@ -50,9 +51,10 @@ final class ContextJoinFromWelcomeTests: XCTestCase {
         String(repeating: "ab", count: 32)
     }
 
-    /// Legible params for a `SingleAdmin` context whose ceiling admits the
-    /// `member:invite` + `governance:propose` capabilities the capability-checked
-    /// invite gate requires, so `inviteMember` seals unilaterally.
+    /// Legible params for a `SingleAdmin` context. The invite gate enforces only
+    /// `governance:propose` (routed through the actor governance gate); the
+    /// ceiling below simply keeps the default SingleAdmin capability set, so
+    /// `inviteMember` seals unilaterally.
     private func makeInviteParams() -> ContextParams {
         ContextParams(
             mode: .encrypted,
@@ -158,11 +160,12 @@ final class ContextJoinFromWelcomeTests: XCTestCase {
     // MARK: - inviteMember
 
     /// SingleAdmin invite reaches the real capability-checked seal path. A
-    /// creator whose context ceiling admits `member:invite` + `governance:propose`
-    /// invites a real 0xFF02-capable reserved invitee `KeyPackage`. The invite
-    /// forwards through the wrapper into the live engine, PASSES the ceiling /
-    /// governance authorization gate, and proceeds to the HPKE seal — failing
-    /// only when the runtime tries to resolve the invitee's `#active` key.
+    /// creator whose admin holds `governance:propose` (the only capability the
+    /// invite gate enforces) invites a real 0xFF02-capable reserved invitee
+    /// `KeyPackage`. The invite forwards through the wrapper into the live
+    /// engine, PASSES the governance authorization gate, and proceeds to the
+    /// HPKE seal — failing only when the runtime tries to resolve the invitee's
+    /// `#active` key.
     ///
     /// The sealed `.sealed(...)` HAPPY PATH is NOT reachable in a single-process
     /// UniFFI test: `identityCreate` on the UniFFI bridge does not publish the
@@ -192,15 +195,17 @@ final class ContextJoinFromWelcomeTests: XCTestCase {
             // If a future UniFFI identity_create begins publishing the DID doc,
             // the seal will succeed — accept the SUCCESS outcome too rather than
             // pinning the current cross-bridge gap as a permanent expectation.
+            // The `bundle` is a `SealedInvitation` directly usable as the join
+            // input.
+            let contextId = await ctx.contextId
             switch outcome {
-            case let .sealed(enc, ciphertext, _):
-                XCTAssertFalse(enc.isEmpty, "sealed enc (HPKE encapsulated key) must be non-empty")
-                XCTAssertFalse(ciphertext.isEmpty, "sealed ciphertext must be non-empty")
-            case let .requiresGovernanceApproval(proposalId):
-                XCTFail(
-                    "SingleAdmin invite must seal unilaterally, got governance defer "
-                        + "(\(String(describing: proposalId)))"
+            case let .sealed(bundle, _):
+                XCTAssertFalse(
+                    bundle.enc.isEmpty, "sealed bundle enc (HPKE encapsulated key) must be non-empty"
                 )
+                XCTAssertFalse(bundle.ciphertext.isEmpty, "sealed bundle ciphertext must be non-empty")
+                XCTAssertEqual(bundle.contextId, contextId)
+                XCTAssertEqual(bundle.creatorDid, creator.did())
             }
         } catch let ScpError.Context(msg, code) {
             // Reachable path on UniFFI: authorization passed; the seal fails at

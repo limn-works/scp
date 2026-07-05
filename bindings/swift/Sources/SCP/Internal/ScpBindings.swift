@@ -2732,11 +2732,12 @@ public protocol ScpProtocol: AnyObject, Sendable {
      *
      * The creator (or admin) seals the context's genesis params + Welcome for
      * the invitee under RFC 9180 HPKE, binding them to the invitee's
-     * `KeyPackage`. For a `SingleAdmin` context the invite is unilateral and
-     * returns [`InviteMemberOutcome::Sealed`] carrying `(enc, ciphertext)`; for
-     * a voting-governed context it returns
-     * [`InviteMemberOutcome::RequiresGovernanceApproval`] (a SUCCESS outcome,
-     * NOT an error — the invite is deferred to a governance vote).
+     * `KeyPackage`. Only a `SingleAdmin` context is supported today: the invite
+     * is unilateral and returns [`InviteMemberOutcome::Sealed`] whose `bundle`
+     * is the sealed [`SealedInvitation`] — pass it directly to
+     * [`Scp::context_join_from_welcome`](Self::context_join_from_welcome). A
+     * voting-governed context returns a thrown `ScpError::Context`
+     * (governed-context invitations are not yet implemented).
      *
      * The inviter's `#active` Ed25519 signing key is resolved from its retained
      * local custody (never crossing the FFI as raw bytes on the way IN — only
@@ -5420,11 +5421,12 @@ open func instanceId() -> UInt64  {
      *
      * The creator (or admin) seals the context's genesis params + Welcome for
      * the invitee under RFC 9180 HPKE, binding them to the invitee's
-     * `KeyPackage`. For a `SingleAdmin` context the invite is unilateral and
-     * returns [`InviteMemberOutcome::Sealed`] carrying `(enc, ciphertext)`; for
-     * a voting-governed context it returns
-     * [`InviteMemberOutcome::RequiresGovernanceApproval`] (a SUCCESS outcome,
-     * NOT an error — the invite is deferred to a governance vote).
+     * `KeyPackage`. Only a `SingleAdmin` context is supported today: the invite
+     * is unilateral and returns [`InviteMemberOutcome::Sealed`] whose `bundle`
+     * is the sealed [`SealedInvitation`] — pass it directly to
+     * [`Scp::context_join_from_welcome`](Self::context_join_from_welcome). A
+     * voting-governed context returns a thrown `ScpError::Context`
+     * (governed-context invitations are not yet implemented).
      *
      * The inviter's `#active` Ed25519 signing key is resolved from its retained
      * local custody (never crossing the FFI as raw bytes on the way IN — only
@@ -12864,51 +12866,37 @@ extension GovernanceModel: Equatable, Hashable {}
  * The outcome of [`Scp::invite_member`](crate::scp::Scp::invite_member)
  * (ADR-049 Phase 2J; FFI-02 Option A).
  *
- * A native sealed enum — Swift `switch` / Kotlin `when` consumers exhaust the
- * two variants idiomatically. `RequiresGovernanceApproval` is a first-class
- * SUCCESS outcome, NOT an error: a voting-governed context defers the invite to
- * a governance vote rather than sealing a Welcome unilaterally. Mirrors the
- * runtime type
+ * A native sealed enum with a SINGLE variant today — Swift `switch` / Kotlin
+ * `when` consumers destructure `Sealed` idiomatically. `invite_member` supports
+ * only `SingleAdmin` contexts; a voting-governed context returns a thrown error
+ * (governed-context invitations are not yet implemented) rather than surfacing
+ * here. The enum shape is kept precisely so a future governed-invite outcome is
+ * added ADDITIVELY. Mirrors the runtime type
  * [`InviteMemberOutcome`](scp_core::context::supervisor::InviteMemberOutcome)
- * and the canonical `"sealed"` / `"requiresGovernanceApproval"` tag strings the
- * `PyO3` / napi reference bridges project (which lack native sum types); here
- * the discriminant IS the enum variant.
+ * and the `PyO3` / napi reference bridges' `{bundle, delivered}` projection
+ * (which lack native sum types); here the discriminant IS the enum variant.
  */
 
 public enum InviteMemberOutcome {
     
     /**
-     * The invitation was sealed and (best-effort) delivered. `enc`/`ciphertext`
-     * are the RFC 9180 HPKE-sealed, signed `InvitationBundle` for the invitee
-     * (`enc` is the 32-byte encapsulated key, `ciphertext` is `ct =
-     * ciphertext || tag`). `delivered` is `true` if the runtime published the
+     * The invitation was sealed and (best-effort) delivered. `bundle` is the
+     * creator-signed, HPKE-sealed [`SealedInvitation`] for the invitee —
+     * directly usable as the `sealed` argument to
+     * [`Scp::context_join_from_welcome`](crate::scp::Scp::context_join_from_welcome)
+     * with no re-boxing. `delivered` is `true` if the runtime published the
      * sealed bundle to the invitee's `scp-invitations` routing id, `false` if
-     * the caller (or transport) must deliver `(enc, ciphertext)` itself.
+     * the caller (or transport) must deliver `bundle` itself.
      */
     case sealed(
         /**
-         * RFC 9180 HPKE encapsulated key (`enc`), 32 bytes.
-         */enc: Data, 
-        /**
-         * RFC 9180 HPKE ciphertext (`ct = ciphertext || tag`).
-         */ciphertext: Data, 
+         * The creator-signed, HPKE-sealed invitation bundle — the SAME wire
+         * type the joiner passes to `context_join_from_welcome`.
+         */bundle: SealedInvitation, 
         /**
          * `true` if the runtime published the sealed invitation to the
          * invitee's routing id; `false` if the caller must deliver it.
          */delivered: Bool
-    )
-    /**
-     * The context requires a governance vote, so a unilateral invite is not
-     * authorized. No proposal was created and no member was added
-     * (governed-context invites are not yet implemented). `proposal_id` carries
-     * the tracked proposal id (hex-encoded) once one exists — `None` today,
-     * reserved.
-     */
-    case requiresGovernanceApproval(
-        /**
-         * Hex-encoded tracked governance proposal id, when one exists (`None`
-         * today).
-         */proposalId: String?
     )
 }
 
@@ -12927,10 +12915,7 @@ public struct FfiConverterTypeInviteMemberOutcome: FfiConverterRustBuffer {
         let variant: Int32 = try readInt(&buf)
         switch variant {
         
-        case 1: return .sealed(enc: try FfiConverterData.read(from: &buf), ciphertext: try FfiConverterData.read(from: &buf), delivered: try FfiConverterBool.read(from: &buf)
-        )
-        
-        case 2: return .requiresGovernanceApproval(proposalId: try FfiConverterOptionString.read(from: &buf)
+        case 1: return .sealed(bundle: try FfiConverterTypeSealedInvitation.read(from: &buf), delivered: try FfiConverterBool.read(from: &buf)
         )
         
         default: throw UniffiInternalError.unexpectedEnumCase
@@ -12941,16 +12926,10 @@ public struct FfiConverterTypeInviteMemberOutcome: FfiConverterRustBuffer {
         switch value {
         
         
-        case let .sealed(enc,ciphertext,delivered):
+        case let .sealed(bundle,delivered):
             writeInt(&buf, Int32(1))
-            FfiConverterData.write(enc, into: &buf)
-            FfiConverterData.write(ciphertext, into: &buf)
+            FfiConverterTypeSealedInvitation.write(bundle, into: &buf)
             FfiConverterBool.write(delivered, into: &buf)
-            
-        
-        case let .requiresGovernanceApproval(proposalId):
-            writeInt(&buf, Int32(2))
-            FfiConverterOptionString.write(proposalId, into: &buf)
             
         }
     }
@@ -17200,7 +17179,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_instance_id() != 43175) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_invite_member() != 46690) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_invite_member() != 46281) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_is_local_did() != 10856) {

@@ -509,39 +509,30 @@ export interface SealedInvitation {
 }
 
 /**
- * The outcome of {@link SCP.inviteMember}, a discriminated union on `kind`.
+ * The outcome of {@link SCP.inviteMember}.
  *
- * Both variants are SUCCESS outcomes — `requiresGovernanceApproval` is NOT an
- * error. For a `SingleAdmin` context the invite is unilateral and yields a
- * `sealed` bundle the caller (or transport) delivers to the invitee. For a
- * voting context the invite is deferred to a governance vote.
+ * `inviteMember` supports only `SingleAdmin` contexts today: the invite is
+ * unilateral and yields a sealed `bundle` the caller (or transport) delivers to
+ * the invitee. A voting-governed context THROWS instead (governed-context
+ * invitations are not yet implemented) rather than surfacing here.
  *
- * Mirrors the runtime `InviteMemberOutcome` and the PyO3/UniFFI reference
- * bridges (same canonical tag strings, same field presence per variant).
+ * `bundle` is directly usable as the `sealed` argument to
+ * {@link SCP.contextJoinFromWelcome} — no re-assembly. Mirrors the runtime
+ * `InviteMemberOutcome` and the PyO3/napi reference bridges' `{ bundle,
+ * delivered }` projection.
  */
-export type InviteMemberOutcome =
-  | {
-      /** The invite was sealed for immediate (out-of-band or relay) delivery. */
-      readonly kind: "sealed";
-      /** RFC 9180 HPKE encapsulated key (`enc`) of the sealed bundle. */
-      readonly enc: Uint8Array;
-      /** RFC 9180 HPKE ciphertext (`ct`) of the sealed bundle. */
-      readonly ciphertext: Uint8Array;
-      /**
-       * `true` if the native core published the sealed bundle to the invitee's
-       * routing id; `false` if the caller must deliver `(enc, ciphertext)`.
-       */
-      readonly delivered: boolean;
-    }
-  | {
-      /** The invite was deferred to a governance vote (a SUCCESS outcome). */
-      readonly kind: "requiresGovernanceApproval";
-      /**
-       * The tracked governance proposal id (hex-encoded) when one exists, or
-       * `null` when the runtime tracks none.
-       */
-      readonly proposalId: string | null;
-    };
+export interface InviteMemberOutcome {
+  /**
+   * The sealed invitation bundle — pass it directly to
+   * {@link SCP.contextJoinFromWelcome}.
+   */
+  readonly bundle: SealedInvitation;
+  /**
+   * `true` if the native core published the sealed bundle to the invitee's
+   * routing id; `false` if the caller must deliver `bundle`.
+   */
+  readonly delivered: boolean;
+}
 
 // ---------------------------------------------------------------------------
 // Messages

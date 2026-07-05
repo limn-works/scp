@@ -798,14 +798,14 @@ class SCP internal constructor(
      * val reservation = scp.reserveKeyPackage(joiner)
      *
      * // Hand reservation.keyPackagePublic to the creator out of band. The
-     * // creator calls inviteMember(...) and returns the sealed, signed
-     * // invitation bundle (a SealedInvitation carrying enc + ciphertext).
+     * // creator calls inviteMember(...) and hands back `outcome.bundle`
+     * // (a SealedInvitation).
      *
      * // Step 2 (joiner): open the sealed bundle and stand up as a send-capable
      * // participant under the joiner's own derived routing pseudonym.
      * val ctx = scp.contextJoinFromWelcome(
      *     identity = joiner,
-     *     sealed = sealed,
+     *     sealed = outcome.bundle,
      *     reservationId = reservation.reservationId,
      * )
      * ```
@@ -821,20 +821,21 @@ class SCP internal constructor(
      *
      * The creator (or admin) seals the context's genesis params + Welcome for
      * the invitee under RFC 9180 HPKE, binding them to the invitee's
-     * `KeyPackage`. For a `SingleAdmin` context the invite is unilateral and
-     * returns [InviteMemberOutcome.Sealed] carrying `(enc, ciphertext)` (the
-     * bytes of a [SealedInvitation] the caller hands back to the invitee for
-     * [contextJoinFromWelcome]); for a voting-governed context it returns
-     * [InviteMemberOutcome.RequiresGovernanceApproval] — a first-class SUCCESS
-     * outcome (returned, not thrown): the invite is deferred to a governance
-     * vote rather than sealed unilaterally. Exhaust both variants with a Kotlin
-     * `when`.
+     * `KeyPackage`. Only a `SingleAdmin` context is supported today: the invite
+     * is unilateral and returns [InviteMemberOutcome.Sealed] whose
+     * [InviteMemberOutcome.Sealed.bundle] is the sealed [SealedInvitation] —
+     * pass it straight to [contextJoinFromWelcome] (no re-assembly). A
+     * voting-governed context THROWS (governed-context invitations are not yet
+     * implemented) rather than returning an outcome.
      *
      * The invite routes through the actor's capability-checked governance gate,
-     * so the inviter's ceiling must include `member:invite` and
-     * `governance:propose`. The inviter's `#active` signing key is resolved
-     * from its retained local custody (never crossing the FFI as raw bytes) and
-     * wiped immediately after the invite is produced.
+     * which requires the inviter to hold the `governance:propose` capability
+     * (that is the ONLY capability the invite gate enforces). A normally-created
+     * `SingleAdmin` context grants its admin `governance:propose` at genesis, so
+     * it works out of the box; a context with a custom ceiling must grant
+     * `governance:propose` to the inviter. The inviter's `#active` signing key
+     * is resolved from its retained local custody (never crossing the FFI as raw
+     * bytes) and wiped immediately after the invite is produced.
      *
      * @param identity The LOCAL inviting identity (creator / admin). Must be
      *   locally custodied; the invite is signed under its `#active` key. The

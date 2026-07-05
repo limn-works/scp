@@ -2112,12 +2112,12 @@ impl Scp {
     ///
     /// The creator (or admin) seals the context's genesis params + Welcome for
     /// the invitee under RFC 9180 HPKE, binding them to the invitee's
-    /// `KeyPackage`. For a `SingleAdmin` context the invite is unilateral and
-    /// returns a `"sealed"` outcome carrying `(enc, ciphertext)`; for a voting
-    /// context it returns `"requiresGovernanceApproval"` (a SUCCESS outcome, not
-    /// an error — the invite is deferred to a governance vote). `creatorDid` MUST
-    /// be a locally-custodied identity; the invite is signed under its `#active`
-    /// key.
+    /// `KeyPackage`. Only a `SingleAdmin` context is supported today: the invite
+    /// is unilateral and returns a [`NapiInviteMemberOutcome`] whose `bundle` is
+    /// the sealed `NapiSealedInvitation` — pass it directly to
+    /// `contextJoinFromWelcome`. A voting-governed context throws (governed-
+    /// context invitations are not yet implemented). `creatorDid` MUST be a
+    /// locally-custodied identity; the invite is signed under its `#active` key.
     #[napi(js_name = "inviteMember")]
     pub async fn invite_member(
         &self,
