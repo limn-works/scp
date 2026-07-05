@@ -295,7 +295,9 @@ impl ScpClient {
             return Err(ClientError::ContextAlreadyExists(context_id.to_owned()));
         }
         let credential = self.credential()?;
-        let mls_group = create_group(&credential)?;
+        // ADR-057 §Prereq-1: the creator's own MLS leaf `Lifetime` is stamped
+        // from the hardened driver clock, not openmls's internal one.
+        let mls_group = create_group(&credential, self.clock.as_ref())?;
         let crypto = ContextCryptoState::from_group(context_id, mls_group);
         let creator_did = self.signer.did().to_owned();
         let mut state = PerContextState::new(context_id, &creator_did, crypto);
@@ -336,8 +338,10 @@ impl ScpClient {
         context_id: &str,
     ) -> Result<Vec<u8>, ClientError> {
         let credential = self.credential()?;
+        // ADR-057 §Prereq-1: the published KeyPackage `Lifetime` is stamped from
+        // the hardened driver clock, not openmls's internal one.
         let (bundle, signer, provider): (KeyPackageBundle, _, InMemoryMlsProvider) =
-            generate_key_package(&credential)?;
+            generate_key_package(&credential, self.clock.as_ref())?;
 
         let kp_bytes = bundle
             .key_package()
@@ -394,7 +398,12 @@ impl ScpClient {
         context_id: &str,
         key_package_bytes: &[u8],
     ) -> Result<AddMemberOutput, ClientError> {
-        let new_member_did = key_package_member_did(key_package_bytes)?;
+        // ADR-057 §Prereq-1: validate the joiner's KeyPackage `Lifetime` against
+        // the hardened driver clock. Captured as an `Arc` clone before the
+        // `state` mutable borrow below, so the clock reference and the mutable
+        // context borrow do not alias `self` simultaneously.
+        let clock = Arc::clone(&self.clock);
+        let new_member_did = key_package_member_did(key_package_bytes, clock.as_ref())?;
         let timestamp = self.clock.now_secs();
         let committer_did = self.signer.did().to_owned();
 
@@ -403,7 +412,7 @@ impl ScpClient {
         let key_package_in = KeyPackageIn::tls_deserialize(&mut &*key_package_bytes)
             .map_err(|e| ClientError::Codec(format!("deserializing key package: {e}")))?;
 
-        let result = add_member(&mut state.crypto.mls_group, key_package_in)?;
+        let result = add_member(&mut state.crypto.mls_group, key_package_in, clock.as_ref())?;
         let commit = serialize_message(&result.commit)?;
         let welcome = serialize_message(&result.welcome)?;
 
@@ -615,6 +624,10 @@ impl ScpClient {
         ciphertext: &[u8],
         committer_timestamp_secs: u64,
     ) -> Result<bool, ClientError> {
+        // ADR-057 §Prereq-1: captured before the `state` mutable borrow so the
+        // hardened clock (used to re-validate any add-Commit's KeyPackage
+        // `Lifetime`) and the mutable context borrow do not alias `self`.
+        let clock = Arc::clone(&self.clock);
         let state = self.context_mut(context_id)?;
         // Any successful `decrypt_message` mutates persistent MLS state — it
         // ratchets forward (application), merges a staged commit (add Commit), or
@@ -622,7 +635,7 @@ impl ScpClient {
         // persisted after the `state` borrow ends. Only the rejected
         // Remove-bearing Commit (which `scp-mls` dropped BEFORE merging, leaving
         // MLS + SCP state unchanged) returns without a write.
-        let application = match state.crypto.decrypt_message(ciphertext)? {
+        let application = match state.crypto.decrypt_message(ciphertext, clock.as_ref())? {
             Inbound::Application {
                 sender_did,
                 plaintext,
@@ -1149,9 +1162,15 @@ fn serialize_message(message: &MlsMessageOut) -> Result<Vec<u8>, ClientError> {
 /// The driver names the new member by reading their credential out of the key
 /// package, rather than trusting a separately-supplied DID, so the membership
 /// record and the MLS leaf cannot disagree.
-fn key_package_member_did(key_package_bytes: &[u8]) -> Result<String, ClientError> {
+fn key_package_member_did(
+    key_package_bytes: &[u8],
+    clock: &dyn Clock,
+) -> Result<String, ClientError> {
     let key_package_in = KeyPackageIn::tls_deserialize(&mut &*key_package_bytes)
         .map_err(|e| ClientError::Codec(format!("deserializing key package: {e}")))?;
-    let did = key_package_in_did(&key_package_in, ProtocolVersion::Mls10)?;
+    // ADR-057 §Prereq-1: `key_package_in_did` re-validates the accepted
+    // `Lifetime` against the hardened clock, so this naming path accepts exactly
+    // the key packages `add_member` accepts.
+    let did = key_package_in_did(&key_package_in, ProtocolVersion::Mls10, clock)?;
     Ok(did)
 }

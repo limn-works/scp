@@ -847,7 +847,10 @@ mod tests {
 
         let (sup, handle) = test_handle();
         let did = DID("did:dht:z6MkAliceKpStore".to_owned());
-        let crypto = Arc::new(MlsCryptoProvider::new(did.0.clone()));
+        let crypto = Arc::new(MlsCryptoProvider::new(
+            did.0.clone(),
+            std::sync::Arc::new(scp_clock::SystemClock),
+        ));
         let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
             Arc::new(SpawnBlockingStorageAdapter::new(Arc::new(
                 InMemoryStorage::new(),

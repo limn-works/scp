@@ -124,8 +124,8 @@ fn generate_mls_key_package_bytes(did: &str) -> Result<Vec<u8>, ScpError> {
             }
         })?;
 
-    let (kp_bundle, _signer, _provider) =
-        generate_key_package(&cred).map_err(|e| ScpError::Crypto {
+    let (kp_bundle, _signer, _provider) = generate_key_package(&cred, &scp_clock::SystemClock)
+        .map_err(|e| ScpError::Crypto {
             msg: format!("MLS key package generation failed: {e}"),
             code: codes::CRYPTO_4011.to_owned(),
         })?;
@@ -9667,8 +9667,10 @@ impl Scp {
                 // `CloseOrchestrator` only uses this provider to destroy MLS group
                 // and sender-key material for the context being closed; a fresh
                 // per-call instance is correct.
-                let crypto_provider =
-                    scp_core::crypto::mls::provider::MlsCryptoProvider::new(identity_did);
+                let crypto_provider = scp_core::crypto::mls::provider::MlsCryptoProvider::new(
+                    identity_did,
+                    std::sync::Arc::new(scp_clock::SystemClock),
+                );
                 let orchestrator =
                     scp_core::context::key_destruction::CloseOrchestrator::new(&crypto_provider);
 

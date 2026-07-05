@@ -1316,7 +1316,10 @@ mod tests {
     const TEST_DID: &str = "did:dht:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK";
 
     fn mk_crypto() -> std::sync::Arc<MlsCryptoProvider> {
-        std::sync::Arc::new(MlsCryptoProvider::new(TEST_DID.to_owned()))
+        std::sync::Arc::new(MlsCryptoProvider::new(
+            TEST_DID.to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
+        ))
     }
 
     // ---------------------------------------------------------------------------
@@ -1768,8 +1771,11 @@ mod tests {
 
         let provider = MlsCryptoProvider::with_backends(
             TEST_DID.to_owned(),
-            Arc::new(ProductionMlsBackend::new()),
+            Arc::new(ProductionMlsBackend::new(std::sync::Arc::new(
+                scp_clock::SystemClock,
+            ))),
             Arc::new(ProductionHpkeBackend::new()),
+            std::sync::Arc::new(scp_clock::SystemClock),
         );
         let _mls = provider.mls_backend();
         let _hpke = provider.hpke_backend();

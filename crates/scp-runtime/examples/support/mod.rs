@@ -28,7 +28,10 @@ pub fn signing_key_for(did: &DID) -> ed25519_dalek::SigningKey {
 
 /// Convenience constructor: real `MlsCryptoProvider` bound to a DID.
 pub fn example_crypto(did: &str) -> std::sync::Arc<MlsCryptoProvider> {
-    std::sync::Arc::new(MlsCryptoProvider::new(did.to_owned()))
+    std::sync::Arc::new(MlsCryptoProvider::new(
+        did.to_owned(),
+        std::sync::Arc::new(scp_clock::SystemClock),
+    ))
 }
 
 /// Convenience constructor: an in-memory `OpenMLS` storage adapter for the

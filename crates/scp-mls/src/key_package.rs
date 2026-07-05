@@ -15,8 +15,11 @@
 //!
 //! [`generate_key_package`]: crate::group::generate_key_package
 
+use std::sync::Arc;
+
 use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
+use scp_clock::Clock;
 
 use crate::InMemoryMlsProvider;
 use crate::credential::ScpCredential;
@@ -57,7 +60,7 @@ pub struct KeyPackageEntry {
 ///
 /// ```rust,ignore
 /// let cred = ScpCredential::new("did:dht:z6MkAlice".to_string(), None, SigningKeyId::Active)?;
-/// let mut buffer = KeyPackageBuffer::new(cred, 10, 5)?;
+/// let mut buffer = KeyPackageBuffer::new(cred, Arc::new(SystemClock), 10, 5)?;
 ///
 /// // Take a key package to give to someone who wants to add us.
 /// let entry = buffer.take()?;
@@ -68,6 +71,11 @@ pub struct KeyPackageEntry {
 pub struct KeyPackageBuffer {
     /// The identity credential for which key packages are generated.
     credential: ScpCredential,
+    /// The injected hardened [`Clock`] used to stamp each generated key
+    /// package's `Lifetime` (ADR-057 §Prereq-1). Shared (`Arc`) because the
+    /// buffer outlives individual generations and the same clock instance is
+    /// threaded through the rest of the client.
+    clock: Arc<dyn Clock>,
     /// The minimum number of key packages to maintain.
     min_buffer: usize,
     /// When the buffer drops below this count, replenish to `min_buffer`.
@@ -83,6 +91,8 @@ impl KeyPackageBuffer {
     /// # Arguments
     ///
     /// * `credential` - The identity credential to generate key packages for.
+    /// * `clock` - The injected hardened [`Clock`] used to stamp each key
+    ///   package's `Lifetime` (ADR-057 §Prereq-1).
     /// * `min_buffer` - The target buffer size (replenish up to this count).
     /// * `replenish_threshold` - When the buffer drops below this, trigger
     ///   replenishment.
@@ -92,11 +102,13 @@ impl KeyPackageBuffer {
     /// Returns [`MlsError`] if initial key package generation fails.
     pub fn new(
         credential: ScpCredential,
+        clock: Arc<dyn Clock>,
         min_buffer: usize,
         replenish_threshold: usize,
     ) -> Result<Self, MlsError> {
         let mut buffer = Self {
             credential,
+            clock,
             min_buffer,
             replenish_threshold,
             entries: Vec::with_capacity(min_buffer),
@@ -110,12 +122,22 @@ impl KeyPackageBuffer {
     /// # Arguments
     ///
     /// * `credential` - The identity credential to generate key packages for.
+    /// * `clock` - The injected hardened [`Clock`] used to stamp each key
+    ///   package's `Lifetime` (ADR-057 §Prereq-1).
     ///
     /// # Errors
     ///
     /// Returns [`MlsError`] if initial key package generation fails.
-    pub fn with_defaults(credential: ScpCredential) -> Result<Self, MlsError> {
-        Self::new(credential, DEFAULT_MIN_BUFFER, DEFAULT_REPLENISH_THRESHOLD)
+    pub fn with_defaults(
+        credential: ScpCredential,
+        clock: Arc<dyn Clock>,
+    ) -> Result<Self, MlsError> {
+        Self::new(
+            credential,
+            clock,
+            DEFAULT_MIN_BUFFER,
+            DEFAULT_REPLENISH_THRESHOLD,
+        )
     }
 
     /// Takes one key package from the buffer.
@@ -160,7 +182,8 @@ impl KeyPackageBuffer {
     /// generated packages are retained in the buffer.
     pub fn replenish(&mut self) -> Result<(), MlsError> {
         while self.entries.len() < self.min_buffer {
-            let (bundle, signer, provider) = generate_key_package(&self.credential)?;
+            let (bundle, signer, provider) =
+                generate_key_package(&self.credential, self.clock.as_ref())?;
             self.entries.push(KeyPackageEntry {
                 bundle,
                 signer,
@@ -187,6 +210,7 @@ impl KeyPackageBuffer {
 mod tests {
     use super::*;
     use crate::group::SCP_CIPHERSUITE;
+    use scp_clock::SystemClock;
 
     #[allow(clippy::unwrap_used)]
     fn test_credential(name: &str) -> ScpCredential {
@@ -202,7 +226,7 @@ mod tests {
     #[allow(clippy::unwrap_used)]
     fn new_buffer_has_min_buffer_entries() {
         let cred = test_credential("alice");
-        let buffer = KeyPackageBuffer::new(cred, 10, 5).unwrap();
+        let buffer = KeyPackageBuffer::new(cred, Arc::new(SystemClock), 10, 5).unwrap();
         assert_eq!(buffer.len(), 10);
         assert!(!buffer.is_empty());
     }
@@ -211,7 +235,7 @@ mod tests {
     #[allow(clippy::unwrap_used)]
     fn with_defaults_creates_10_entries() {
         let cred = test_credential("alice");
-        let buffer = KeyPackageBuffer::with_defaults(cred).unwrap();
+        let buffer = KeyPackageBuffer::with_defaults(cred, Arc::new(SystemClock)).unwrap();
         assert_eq!(buffer.len(), 10);
     }
 
@@ -219,7 +243,7 @@ mod tests {
     #[allow(clippy::unwrap_used)]
     fn take_returns_valid_key_package() {
         let cred = test_credential("alice");
-        let mut buffer = KeyPackageBuffer::new(cred, 10, 5).unwrap();
+        let mut buffer = KeyPackageBuffer::new(cred, Arc::new(SystemClock), 10, 5).unwrap();
 
         let entry = buffer.take().unwrap();
         assert_eq!(
@@ -233,7 +257,7 @@ mod tests {
     #[allow(clippy::unwrap_used)]
     fn take_replenishes_when_below_threshold() {
         let cred = test_credential("alice");
-        let mut buffer = KeyPackageBuffer::new(cred, 10, 5).unwrap();
+        let mut buffer = KeyPackageBuffer::new(cred, Arc::new(SystemClock), 10, 5).unwrap();
 
         // Take 6 entries to drop below threshold (10 - 6 = 4, which is < 5).
         for _ in 0..6 {
@@ -253,7 +277,7 @@ mod tests {
     #[allow(clippy::unwrap_used)]
     fn take_does_not_replenish_above_threshold() {
         let cred = test_credential("alice");
-        let mut buffer = KeyPackageBuffer::new(cred, 10, 5).unwrap();
+        let mut buffer = KeyPackageBuffer::new(cred, Arc::new(SystemClock), 10, 5).unwrap();
 
         // Take 4 entries. Remaining = 6, which is >= 5 (threshold).
         for _ in 0..4 {
@@ -271,7 +295,7 @@ mod tests {
     #[allow(clippy::unwrap_used)]
     fn each_key_package_is_unique() {
         let cred = test_credential("alice");
-        let mut buffer = KeyPackageBuffer::new(cred, 5, 2).unwrap();
+        let mut buffer = KeyPackageBuffer::new(cred, Arc::new(SystemClock), 5, 2).unwrap();
 
         let entry1 = buffer.take().unwrap();
         let entry2 = buffer.take().unwrap();
@@ -297,16 +321,16 @@ mod tests {
     #[allow(clippy::unwrap_used)]
     fn key_package_can_be_used_for_add_member() {
         let cred = test_credential("bob");
-        let mut buffer = KeyPackageBuffer::new(cred, 10, 5).unwrap();
+        let mut buffer = KeyPackageBuffer::new(cred, Arc::new(SystemClock), 10, 5).unwrap();
 
         let entry = buffer.take().unwrap();
 
         // Create a group and add the buffered key package's owner.
         let alice_cred = test_credential("alice");
-        let mut alice_group = crate::group::create_group(&alice_cred).unwrap();
+        let mut alice_group = crate::group::create_group(&alice_cred, &SystemClock).unwrap();
 
         let kp_in: KeyPackageIn = entry.bundle.key_package().clone().into();
-        let add_result = crate::group::add_member(&mut alice_group, kp_in).unwrap();
+        let add_result = crate::group::add_member(&mut alice_group, kp_in, &SystemClock).unwrap();
 
         // Bob joins using the Welcome, with the provider and signer from the buffer entry.
         let bob_group =
@@ -321,6 +345,7 @@ mod tests {
         let cred = test_credential("alice");
         let mut buffer = KeyPackageBuffer {
             credential: cred,
+            clock: Arc::new(SystemClock),
             min_buffer: 10,
             replenish_threshold: 5,
             entries: Vec::new(),
@@ -335,7 +360,7 @@ mod tests {
     #[allow(clippy::unwrap_used)]
     fn small_buffer_sizes_work() {
         let cred = test_credential("alice");
-        let mut buffer = KeyPackageBuffer::new(cred, 2, 1).unwrap();
+        let mut buffer = KeyPackageBuffer::new(cred, Arc::new(SystemClock), 2, 1).unwrap();
         assert_eq!(buffer.len(), 2);
 
         let _entry = buffer.take().unwrap();

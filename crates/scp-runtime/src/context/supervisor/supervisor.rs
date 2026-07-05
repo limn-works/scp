@@ -12617,6 +12617,7 @@ mod tests {
         // `create_context` call runs.
         let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
             "did:dht:z6MktestDoNotRely".to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
         ));
         let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
             Box::new(crate::context::builder::NotConfiguredTransportProvider);
@@ -13805,6 +13806,7 @@ mod tests {
     ) {
         let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
             "did:dht:z6MktestBuildDeps".to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
         ));
         let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
             Box::new(crate::context::builder::NotConfiguredTransportProvider);
@@ -14369,6 +14371,7 @@ mod tests {
         install_capture_subscriber();
         let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
             "did:dht:z6MktestDoNotRely".to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
         ));
         let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
             Box::new(crate::context::builder::NotConfiguredTransportProvider);
@@ -17481,6 +17484,7 @@ mod tests {
     ) -> Arc<Supervisor> {
         let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
             "did:dht:z6MktestXctxSaga".to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
         ));
         let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
             Box::new(crate::context::builder::NotConfiguredTransportProvider);
@@ -17584,6 +17588,7 @@ mod tests {
     ) -> Arc<Supervisor> {
         let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
             "did:dht:z6MktestXctxSagaPersist".to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
         ));
         let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
             Box::new(crate::context::builder::NotConfiguredTransportProvider);
@@ -17859,6 +17864,7 @@ mod tests {
     ) -> Arc<Supervisor> {
         let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
             "did:dht:z6MktestXctxFaultJournal".to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
         ));
         let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
             Box::new(crate::context::builder::NotConfiguredTransportProvider);
@@ -19981,6 +19987,7 @@ mod tests {
 
         let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
             "did:dht:z6MkRecoverySupervisor".to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
         ));
         let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
             Box::new(crate::context::builder::NotConfiguredTransportProvider);
@@ -21043,6 +21050,7 @@ mod tests {
         ));
         let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
             "did:dht:z6MktestXctxWave8".to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
         ));
         let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
             Box::new(crate::context::builder::NotConfiguredTransportProvider);
@@ -21285,6 +21293,7 @@ mod tests {
         ));
         let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
             "did:dht:z6MktestXctxWave15".to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
         ));
         let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
             Box::new(crate::context::builder::NotConfiguredTransportProvider);
@@ -22595,6 +22604,7 @@ mod tests {
     ) -> Arc<Supervisor> {
         let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
             "did:dht:z6MkDrainTerminal".to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
         ));
         let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
             Box::new(crate::context::builder::NotConfiguredTransportProvider);

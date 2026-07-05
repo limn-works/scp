@@ -2011,6 +2011,7 @@ mod tests {
         crate::context::test_supervisor(
             Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
                 TEST_DID.to_owned(),
+                std::sync::Arc::new(scp_clock::SystemClock),
             )),
             Box::new(TestTransport),
             Box::new(TestEventLog),

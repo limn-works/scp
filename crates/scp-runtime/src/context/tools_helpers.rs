@@ -1658,6 +1658,7 @@ mod tests {
 
             let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
                 ADMIN.to_owned(),
+                std::sync::Arc::new(scp_clock::SystemClock),
             ));
             let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
                 Box::new(crate::context::builder::NotConfiguredTransportProvider);

@@ -30,13 +30,24 @@
 use std::sync::Arc;
 
 use scp_client::{ClientError, LocalSigner, MemoryStorage, ScpClient, Storage};
-use scp_clock::{Clock, TestClock};
+use scp_clock::{Clock, SystemClock, TestClock};
 use scp_protocol::context::membership::ContextEvent;
 
 const CTX: &str = "ctx-adr057-slice2-multi-party";
 const ALICE_DID: &str = "did:key:z6MkAliceMultiPartyFixtureKeyAAAAAAAAAAAAAA";
 const BOB_DID: &str = "did:key:z6MkBobMultiPartyFixtureKeyBBBBBBBBBBBBBBBB";
 const CAROL_DID: &str = "did:key:z6MkCarolMultiPartyFixtureKeyCCCCCCCCCCCCCC";
+
+// Distinct per-member clock offsets applied to a shared real-time base. Kept
+// small (seconds) so every minted KeyPackage `Lifetime` stays valid against
+// openmls's un-injectable internal (real) clock, while remaining pairwise
+// distinct — the convergence property depends only on the clocks *differing*,
+// not on their magnitude (ADR-057 §Prereq-1 test-clock realism). Seeding from
+// `SystemClock.now_secs()` (instead of a fixed past epoch) keeps the minted
+// KeyPackages inside openmls's acceptance window at test time.
+const ALICE_OFFSET: u64 = 0;
+const BOB_OFFSET: u64 = 100;
+const CAROL_OFFSET: u64 = 200;
 
 /// Builds a fresh client for `did` over a fixed-time clock.
 fn client_for(did: &str, now_secs: u64) -> ScpClient {
@@ -75,9 +86,10 @@ fn three_party_add_commit_converges_across_all_members() {
     // Three deliberately different local clocks: convergence must NOT depend on
     // them agreeing — only on the convergent timestamp transported with each
     // commit/message.
-    let mut alice = client_for(ALICE_DID, 1_700_000_000);
-    let mut bob = client_for(BOB_DID, 1_650_000_000);
-    let mut carol = client_for(CAROL_DID, 1_600_000_000);
+    let base = SystemClock.now_secs();
+    let mut alice = client_for(ALICE_DID, base + ALICE_OFFSET);
+    let mut bob = client_for(BOB_DID, base + BOB_OFFSET);
+    let mut carol = client_for(CAROL_DID, base + CAROL_OFFSET);
 
     // --- Alice creates the context. ---
     alice.create_context(CTX).expect("Alice creates");
@@ -193,9 +205,10 @@ fn three_party_add_commit_converges_across_all_members() {
 #[test]
 fn reciprocal_send_converges_via_transported_timestamp() {
     // Distinct clocks across all three members.
-    let mut alice = client_for(ALICE_DID, 1_700_000_000);
-    let mut bob = client_for(BOB_DID, 1_650_000_000);
-    let mut carol = client_for(CAROL_DID, 1_600_000_000);
+    let base = SystemClock.now_secs();
+    let mut alice = client_for(ALICE_DID, base + ALICE_OFFSET);
+    let mut bob = client_for(BOB_DID, base + BOB_OFFSET);
+    let mut carol = client_for(CAROL_DID, base + CAROL_OFFSET);
 
     alice.create_context(CTX).expect("Alice creates");
 
@@ -233,12 +246,13 @@ fn reciprocal_send_converges_via_transported_timestamp() {
     ]);
 
     // --- Reciprocal send: BOB sends. Bob stamps the leaf with HIS OWN clock
-    // reading (1_650_000_000), distinct from Alice's and Carol's. The convergent
-    // timestamp rides on Bob's SendOutput. ---
+    // reading (base + BOB_OFFSET), distinct from Alice's and Carol's. The
+    // convergent timestamp rides on Bob's SendOutput. ---
     let plaintext = b"hello from Bob, stamped with Bob's clock";
     let bob_send = bob.send_message(CTX, plaintext).expect("Bob sends");
     assert_eq!(
-        bob_send.committer_timestamp_secs, 1_650_000_000,
+        bob_send.committer_timestamp_secs,
+        base + BOB_OFFSET,
         "Bob stamped the leaf with HIS clock, not Alice's or Carol's"
     );
 
@@ -311,11 +325,16 @@ fn remove_commit_is_rejected_fail_closed_without_skew() {
     use scp_mls::{ScpCredential, SignatureKeyPair};
     use tls_codec::{Deserialize as TlsDeserialize, Serialize as TlsSerialize};
 
+    // The raw Alice group and Bob's client share a real-time base so every
+    // KeyPackage `Lifetime` stays valid against openmls's internal (real) clock
+    // and the hardened SCP checks (ADR-057 §Prereq-1). The raw group uses
+    // `SystemClock` directly; Bob's client uses a TestClock at the same base.
+    let base = SystemClock.now_secs();
     let alice_cred = ScpCredential::new(ALICE_DID.to_owned(), None, SigningKeyId::Active)
         .expect("alice credential");
-    let mut alice_group = create_group(&alice_cred).expect("Alice's raw MLS group");
+    let mut alice_group = create_group(&alice_cred, &SystemClock).expect("Alice's raw MLS group");
 
-    let mut bob = client_for(BOB_DID, 1_650_000_000);
+    let mut bob = client_for(BOB_DID, base + BOB_OFFSET);
 
     // Bob's ScpClient mints its join KeyPackage (private half retained inside the
     // client). Alice (raw group) adds Bob from that KeyPackage and Bob joins via
@@ -324,7 +343,7 @@ fn remove_commit_is_rejected_fail_closed_without_skew() {
         .generate_key_package_for_join(CTX)
         .expect("Bob key package");
     let bob_kp_in = KeyPackageIn::tls_deserialize(&mut &*bob_kp_bytes).expect("bob kp deserialize");
-    let add_bob = add_member(&mut alice_group, bob_kp_in).expect("Alice adds Bob");
+    let add_bob = add_member(&mut alice_group, bob_kp_in, &SystemClock).expect("Alice adds Bob");
     let bob_welcome = add_bob
         .welcome
         .tls_serialize_detached()
@@ -338,7 +357,7 @@ fn remove_commit_is_rejected_fail_closed_without_skew() {
     let carol_cred = ScpCredential::new(CAROL_DID.to_owned(), None, SigningKeyId::Active)
         .expect("carol credential");
     let (carol_bundle, _carol_signer, _carol_provider): (_, SignatureKeyPair, _) =
-        generate_key_package(&carol_cred).expect("carol key package");
+        generate_key_package(&carol_cred, &SystemClock).expect("carol key package");
     let carol_kp_in = KeyPackageIn::tls_deserialize(
         &mut &*carol_bundle
             .key_package()
@@ -346,7 +365,8 @@ fn remove_commit_is_rejected_fail_closed_without_skew() {
             .expect("carol kp bytes"),
     )
     .expect("carol kp deserialize");
-    let add_carol = add_member(&mut alice_group, carol_kp_in).expect("Alice adds Carol");
+    let add_carol =
+        add_member(&mut alice_group, carol_kp_in, &SystemClock).expect("Alice adds Carol");
     let add_carol_commit = add_carol
         .commit
         .tls_serialize_detached()

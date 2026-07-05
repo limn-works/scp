@@ -53,13 +53,17 @@ fn alice() -> DID {
 }
 
 fn real_backend() -> Arc<dyn MlsBackend> {
-    Arc::new(ProductionMlsBackend::new())
+    Arc::new(ProductionMlsBackend::new(std::sync::Arc::new(
+        scp_clock::SystemClock,
+    )))
 }
 
 /// A real backend with the durable consumed-init-key set attached (A2), so the
 /// crypto-layer single-use backstop is active.
 fn backend_with_consumed_set(storage: &Arc<dyn OpenMlsStorageAdapter>) -> Arc<dyn MlsBackend> {
-    let backend = Arc::new(ProductionMlsBackend::new());
+    let backend = Arc::new(ProductionMlsBackend::new(std::sync::Arc::new(
+        scp_clock::SystemClock,
+    )));
     backend.set_consumed_init_key_store(Arc::clone(storage));
     backend
 }
@@ -399,7 +403,9 @@ async fn second_join_same_init_key_rejected_at_backend() {
 #[tokio::test]
 async fn join_without_consumed_store_fails_closed() {
     // A store-less production backend (no `set_consumed_init_key_store`).
-    let mls: Arc<dyn MlsBackend> = Arc::new(ProductionMlsBackend::new());
+    let mls: Arc<dyn MlsBackend> = Arc::new(ProductionMlsBackend::new(std::sync::Arc::new(
+        scp_clock::SystemClock,
+    )));
 
     let joiner = ScpCredential::new(alice().0, None, scp_did::SigningKeyId::Active).unwrap();
     let generated = mls.generate_key_package(&joiner, None).await.unwrap();
@@ -2980,7 +2986,7 @@ struct FailingBackend {
 impl FailingBackend {
     fn new(successes: usize) -> Self {
         Self {
-            inner: ProductionMlsBackend::new(),
+            inner: ProductionMlsBackend::new(std::sync::Arc::new(scp_clock::SystemClock)),
             remaining: AtomicUsize::new(successes),
         }
     }

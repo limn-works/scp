@@ -798,7 +798,10 @@ impl UniffiBridgeInstance {
             return;
         }
         let did = local_did.to_owned();
-        let crypto = Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(did));
+        let crypto = Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(
+            did,
+            std::sync::Arc::new(scp_clock::SystemClock),
+        ));
         let event_log = self.protocol_repository.event_log_provider();
         let persistence = self.core.persistence_arc_clone();
         // Storage-before-supervisor precondition (spec §17.6): the chosen
@@ -847,7 +850,10 @@ impl UniffiBridgeInstance {
             return;
         }
         let did = local_did.to_owned();
-        let crypto = Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(did));
+        let crypto = Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(
+            did,
+            std::sync::Arc::new(scp_clock::SystemClock),
+        ));
         let transport = Box::new(scp_transport::RelayTransportProvider::new(adapter));
         let event_log = self.protocol_repository.event_log_provider();
         let persistence = self.core.persistence_arc_clone();
@@ -891,7 +897,10 @@ impl UniffiBridgeInstance {
             return;
         }
         let did = local_did.to_owned();
-        let crypto = Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(did));
+        let crypto = Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(
+            did,
+            std::sync::Arc::new(scp_clock::SystemClock),
+        ));
         let transport = Box::new(scp_core::context::LocalTransportProvider);
         let event_log = self.protocol_repository.event_log_provider();
         let persistence = self.core.persistence_arc_clone();

@@ -160,7 +160,10 @@ fn build_supervisor_with_seeded_log() -> Arc<Supervisor> {
     }
 
     Supervisor::with_providers(
-        Arc::new(MlsCryptoProvider::new(ADMIN.to_owned())),
+        Arc::new(MlsCryptoProvider::new(
+            ADMIN.to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
+        )),
         Box::new(NotConfiguredTransportProvider),
         Box::new(provider),
         mock_key_resolver(),
@@ -259,7 +262,10 @@ fn participation_record_empty_attestations_yields_zero_count() {
 #[test]
 fn participation_record_empty_log_errors() {
     let supervisor = Supervisor::with_providers(
-        Arc::new(MlsCryptoProvider::new(ADMIN.to_owned())),
+        Arc::new(MlsCryptoProvider::new(
+            ADMIN.to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
+        )),
         Box::new(NotConfiguredTransportProvider),
         Box::new(MerkleEventLogProvider::new()),
         mock_key_resolver(),
@@ -339,7 +345,10 @@ fn participation_record_is_context_isolated() {
         .expect("append B gov");
 
     let supervisor = Supervisor::with_providers(
-        Arc::new(MlsCryptoProvider::new(ADMIN.to_owned())),
+        Arc::new(MlsCryptoProvider::new(
+            ADMIN.to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
+        )),
         Box::new(NotConfiguredTransportProvider),
         Box::new(provider),
         mock_key_resolver(),
@@ -439,7 +448,10 @@ impl ContextEventLogProvider for EventsButNoRootProvider {
 #[test]
 fn participation_record_fails_closed_on_root_error_with_events() {
     let supervisor = Supervisor::with_providers(
-        Arc::new(MlsCryptoProvider::new(ADMIN.to_owned())),
+        Arc::new(MlsCryptoProvider::new(
+            ADMIN.to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
+        )),
         Box::new(NotConfiguredTransportProvider),
         Box::new(EventsButNoRootProvider),
         mock_key_resolver(),

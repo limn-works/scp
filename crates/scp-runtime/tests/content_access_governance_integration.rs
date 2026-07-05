@@ -150,6 +150,7 @@ fn new_manager() -> std::sync::Arc<Supervisor> {
     scp_runtime::context::test_supervisor(
         Arc::new(MlsCryptoProvider::new(
             "did:dht:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK".to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
         )),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog),

@@ -104,7 +104,10 @@ fn fresh_mls_storage() -> Arc<dyn OpenMlsStorageAdapter> {
 fn bob_supervisor(
     persistence: Option<Box<dyn ContextPersistence>>,
 ) -> (Arc<Supervisor>, Arc<MlsCryptoProvider>) {
-    let crypto = Arc::new(MlsCryptoProvider::new(BOB_DID.to_owned()));
+    let crypto = Arc::new(MlsCryptoProvider::new(
+        BOB_DID.to_owned(),
+        std::sync::Arc::new(scp_clock::SystemClock),
+    ));
     let transport: Box<dyn ContextTransportProvider> = Box::new(NotConfiguredTransportProvider);
     let event_log: Box<dyn ContextEventLogProvider> = Box::new(MerkleEventLogProvider::new());
     let sup = Supervisor::with_providers(
@@ -186,7 +189,10 @@ async fn join_bob(
 
     // Alice (bare creator provider) creates the group and adds Bob's reserved
     // KP, producing the real Welcome addressed to that KP's init key.
-    let alice_crypto = Arc::new(MlsCryptoProvider::new(ALICE_DID.to_owned()));
+    let alice_crypto = Arc::new(MlsCryptoProvider::new(
+        ALICE_DID.to_owned(),
+        std::sync::Arc::new(scp_clock::SystemClock),
+    ));
     alice_crypto
         .create_mls_group(&ctx_bytes)
         .expect("alice creates the MLS group");
@@ -501,7 +507,10 @@ async fn second_spawn_reusing_a_consumed_reservation_is_rejected() {
     let (sup, bob_crypto) = bob_supervisor(None);
     let (reservation_id, kp_public_bytes) = reserve_bob_kp(&sup, &bob).await;
 
-    let alice_crypto = Arc::new(MlsCryptoProvider::new(ALICE_DID.to_owned()));
+    let alice_crypto = Arc::new(MlsCryptoProvider::new(
+        ALICE_DID.to_owned(),
+        std::sync::Arc::new(scp_clock::SystemClock),
+    ));
     alice_crypto.create_mls_group(&ctx_bytes).unwrap();
     let add_output = alice_crypto
         .add_member(&ctx_bytes, BOB_DID, Some(&kp_public_bytes))
@@ -564,7 +573,10 @@ fn alice_welcome_for(
     ctx_bytes: &[u8; 32],
     kp_public_bytes: &[u8],
 ) -> (Arc<MlsCryptoProvider>, Vec<u8>) {
-    let alice_crypto = Arc::new(MlsCryptoProvider::new(ALICE_DID.to_owned()));
+    let alice_crypto = Arc::new(MlsCryptoProvider::new(
+        ALICE_DID.to_owned(),
+        std::sync::Arc::new(scp_clock::SystemClock),
+    ));
     alice_crypto
         .create_mls_group(ctx_bytes)
         .expect("alice creates the MLS group");

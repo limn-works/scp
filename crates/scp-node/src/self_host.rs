@@ -624,6 +624,7 @@ where
     );
     let crypto = Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(
         node_did.to_owned(),
+        std::sync::Arc::new(scp_clock::SystemClock),
     ));
     let event_log: Box<dyn scp_core::context::builder::ContextEventLogProvider> =
         Box::new(scp_core::context::providers::MerkleEventLogProvider::new());

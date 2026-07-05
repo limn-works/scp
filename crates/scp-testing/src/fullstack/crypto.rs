@@ -64,7 +64,10 @@ impl E2eCryptoProvider {
     /// `exchange` with every other node in the same `FullStackNetwork`.
     #[must_use]
     pub fn new(did: DID, exchange: Arc<std::sync::Mutex<KeyExchange>>) -> Self {
-        let provider = Arc::new(MlsCryptoProvider::new(did.as_ref().to_owned()));
+        let provider = Arc::new(MlsCryptoProvider::new(
+            did.as_ref().to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
+        ));
         Self {
             provider,
             exchange,

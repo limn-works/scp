@@ -28,7 +28,7 @@
 use std::sync::Arc;
 
 use scp_client::{LocalSigner, MemoryStorage, ScpClient, Storage};
-use scp_clock::{Clock, TestClock};
+use scp_clock::{Clock, SystemClock, TestClock};
 use scp_protocol::context::membership::ContextEvent;
 
 const CTX: &str = "ctx-adr057-slice2-two-party";
@@ -49,11 +49,16 @@ fn client_for(did: &str, now_secs: u64) -> ScpClient {
 
 #[test]
 fn two_party_message_exchange_end_to_end() {
-    let alice_clock = 1_700_000_000u64;
-    // Deliberately give Bob a DIFFERENT local clock to prove convergence does
-    // not depend on the two members' clocks agreeing — only on the convergent
-    // timestamp that travels with each message.
-    let bob_clock = 1_650_000_000u64;
+    // Seed from real now so every minted KeyPackage `Lifetime` stays valid
+    // against openmls's un-injectable internal (real) clock (ADR-057 §Prereq-1
+    // test-clock realism); a fixed past epoch would produce already-expired
+    // KeyPackages.
+    let base = SystemClock.now_secs();
+    let alice_clock = base;
+    // Deliberately give Bob a DIFFERENT local clock (a small distinct offset) to
+    // prove convergence does not depend on the two members' clocks agreeing —
+    // only on the convergent timestamp that travels with each message.
+    let bob_clock = base + 100;
 
     // --- Alice creates the context (MLS group + first event-log leaf). ---
     let mut alice = client_for(ALICE_DID, alice_clock);

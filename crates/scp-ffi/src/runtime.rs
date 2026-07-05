@@ -849,7 +849,10 @@ pub fn init_context_manager(bi: &PyBridgeInstance, local_did: &str) {
     }
 
     let did = local_did.to_owned();
-    let crypto = Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(did));
+    let crypto = Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(
+        did,
+        std::sync::Arc::new(scp_clock::SystemClock),
+    ));
     let persistence = build_persistence_provider(bi);
     let supervisor_arc = match build_supervisor(
         bi,
@@ -940,7 +943,10 @@ pub fn init_context_manager_with_local_transport(bi: &PyBridgeInstance, local_di
             .set(StorageProvider::new_in_memory_encrypted());
     }
     let did = local_did.to_owned();
-    let crypto = Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(did));
+    let crypto = Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(
+        did,
+        std::sync::Arc::new(scp_clock::SystemClock),
+    ));
     let persistence = build_persistence_provider(bi);
     let supervisor_arc = match build_supervisor(
         bi,
@@ -986,6 +992,7 @@ pub fn init_context_manager_for_test(bi: &PyBridgeInstance) {
     }
     let crypto = Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(
         "did:test:pyo3-bridge-test".to_owned(),
+        std::sync::Arc::new(scp_clock::SystemClock),
     ));
     let persistence = build_persistence_provider(bi);
     let supervisor_arc = match build_supervisor(
@@ -2692,6 +2699,7 @@ mod tests {
             &isolated,
             Arc::new(MlsCryptoProvider::new(
                 "did:test:pyo3-bridge-test".to_owned(),
+                std::sync::Arc::new(scp_clock::SystemClock),
             )),
             Box::new(scp_core::context::LocalTransportProvider),
             build_event_log_provider(&isolated),

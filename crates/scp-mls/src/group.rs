@@ -21,10 +21,12 @@ use std::ops::Deref;
 use crate::InMemoryMlsProvider;
 use crate::credential::ScpCredential;
 use crate::error::MlsError;
+use crate::lifetime::{key_package_lifetime, validate_key_package_lifetime};
 use openmls::messages::group_info::GroupInfo;
 use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_traits::OpenMlsProvider;
+use scp_clock::Clock;
 use tls_codec::{Deserialize as TlsDeserializeTrait, Serialize as TlsSerializeTrait};
 
 /// The single ciphersuite used by all SCP MLS groups.
@@ -268,6 +270,10 @@ impl ScpMlsGroup {
 /// # Arguments
 ///
 /// * `credential` - The creator's SCP credential (DID + optional UCAN).
+/// * `clock` - The injected hardened [`Clock`] used to stamp the creator's own
+///   `LeafNode` `Lifetime`, so the group leaf's freshness bounds come from the
+///   SCP-layer clock rather than openmls's internal (wasm: unhardened) one
+///   (ADR-057 §Prereq-1).
 ///
 /// # Returns
 ///
@@ -281,8 +287,11 @@ impl ScpMlsGroup {
 /// `OpenMLS` group creation fails.
 ///
 /// See ADR-001 acceptance criterion 1.
-pub fn create_group(credential: &ScpCredential) -> Result<ScpMlsGroup, MlsError> {
-    create_group_with_wrapping_key(credential, None)
+pub fn create_group(
+    credential: &ScpCredential,
+    clock: &dyn Clock,
+) -> Result<ScpMlsGroup, MlsError> {
+    create_group_with_wrapping_key(credential, None, clock)
 }
 
 /// Creates a new MLS group with the creator as the sole member, optionally
@@ -298,6 +307,8 @@ pub fn create_group(credential: &ScpCredential) -> Result<ScpMlsGroup, MlsError>
 /// * `credential` - The creator's SCP credential (DID + optional UCAN).
 /// * `wrapping_pubkey` - Optional 32-byte X25519 public key for the
 ///   `scp_wrapping_key` `LeafNode` extension.
+/// * `clock` - The injected hardened [`Clock`] used to stamp the creator's own
+///   `LeafNode` `Lifetime` (ADR-057 §Prereq-1).
 ///
 /// # Errors
 ///
@@ -309,6 +320,7 @@ pub fn create_group(credential: &ScpCredential) -> Result<ScpMlsGroup, MlsError>
 pub fn create_group_with_wrapping_key(
     credential: &ScpCredential,
     wrapping_pubkey: Option<&[u8; 32]>,
+    clock: &dyn Clock,
 ) -> Result<ScpMlsGroup, MlsError> {
     let provider = InMemoryMlsProvider::default();
 
@@ -344,9 +356,18 @@ pub fn create_group_with_wrapping_key(
     // margin. The EpochGraceStore enforces the 30-second time bound at the SCP
     // layer, so retention is bounded by both count (2) and time (30s).
     // See issue #324.
+    // SECURITY (ADR-057 §Prereq-1): the creator's own `LeafNode` `Lifetime` is
+    // stamped from the injected hardened `Clock` — NOT openmls's internal (wasm:
+    // unhardened `Date.now()`) clock. `MlsGroupCreateConfigBuilder::lifetime`
+    // routes our `Lifetime::init(now - margin, now + lifetime)` (built from the
+    // injected clock) into `MlsGroup::new`, so the creator's leaf freshness
+    // bounds are governed by the same clock as the rest of the client. Without
+    // this call the leaf would fall back to `Lifetime::default()`, which reads
+    // openmls's internal clock. See `crate::lifetime`.
     let mut builder = MlsGroupCreateConfig::builder()
         .ciphersuite(SCP_CIPHERSUITE)
         .use_ratchet_tree_extension(true)
+        .lifetime(key_package_lifetime(clock))
         .max_past_epochs(2);
 
     // If a wrapping key is provided, declare the extension type in
@@ -365,10 +386,12 @@ pub fn create_group_with_wrapping_key(
 
     let group_create_config = builder.build();
 
-    // SECURITY (ADR-057 §Prereq-1): the creator's own `LeafNode` lifetime is
-    // likewise stamped by openmls's internal (wasm: unhardened) clock — see the
-    // `KeyPackage::builder().build()` note in `generate_key_package_with_wrapping_key`.
-    // Create the MLS group with the creator as the sole member.
+    // Create the MLS group with the creator as the sole member. The creator's
+    // own `LeafNode` `Lifetime` was routed through the injected `Clock` via the
+    // `.lifetime(...)` call on the create-config builder above (ADR-057
+    // §Prereq-1). The residual openmls-internal-clock exposure is confined to
+    // the *receive* side (Welcome tree-leaf validation), which openmls does not
+    // expose for bracketing — see the module docs in `crate::lifetime`.
     let group = MlsGroup::new(
         &provider,
         &signer,
@@ -415,6 +438,11 @@ pub struct AddMemberResult {
 /// * `group` - The MLS group to add the member to. Must be active.
 /// * `key_package` - The new member's pre-published `KeyPackage`, signed by
 ///   their Ed25519 key and containing their SCP credential.
+/// * `clock` - The injected hardened [`Clock`]. After openmls validates the
+///   key package (which runs its own un-injectable internal `Lifetime::is_valid`
+///   against openmls's clock), the accepted `Lifetime` is *additionally*
+///   re-validated against this hardened clock — and checked for the RFC 9420
+///   maximum-range bound openmls never applies (ADR-057 §Prereq-1).
 ///
 /// # Returns
 ///
@@ -424,17 +452,28 @@ pub struct AddMemberResult {
 ///
 /// Returns [`MlsError::GroupDestroyed`] if the group has been destroyed.
 /// Returns [`MlsError::AddMemberFailed`] if `OpenMLS` rejects the add operation.
+/// Returns [`MlsError::KeyPackageLifetimeInvalid`] if the accepted key package's
+/// `Lifetime` fails validation against the injected clock (expired, not yet
+/// valid, or over-long range).
 /// Returns [`MlsError::MergePendingCommitFailed`] if committing fails.
 ///
 /// See ADR-001 acceptance criterion 2.
 pub fn add_member(
     group: &mut ScpMlsGroup,
     key_package: KeyPackageIn,
+    clock: &dyn Clock,
 ) -> Result<AddMemberResult, MlsError> {
     // Validate the key package.
     let verified_key_package = key_package
         .validate(group.provider.crypto(), ProtocolVersion::Mls10)
         .map_err(|e| MlsError::AddMemberFailed(format!("key package validation: {e}")))?;
+
+    // SECURITY (ADR-057 §Prereq-1): openmls's `validate` above runs its own
+    // internal `Lifetime::is_valid` against openmls's (wasm: unhardened) clock.
+    // Re-validate the accepted `Lifetime` against the injected hardened clock,
+    // and enforce the RFC 9420 maximum-range bound openmls's `validate` never
+    // applies. This is additive hardening — it never replaces openmls's check.
+    validate_key_package_lifetime(verified_key_package.life_time(), clock)?;
 
     let signer = group.signer.as_ref().ok_or(MlsError::GroupDestroyed)?;
     let g = group.group.as_mut().ok_or(MlsError::GroupDestroyed)?;
@@ -483,15 +522,28 @@ pub fn add_member(
 /// performs, a key package this function accepts is one `add_member` will also
 /// accept (and vice versa) — there is no weaker "advisory" window.
 ///
+/// # Arguments
+///
+/// * `key_package` - The wire-delivered key package to authenticate and read.
+/// * `protocol_version` - The MLS protocol version to validate against.
+/// * `clock` - The injected hardened [`Clock`]. The accepted `Lifetime` is
+///   re-validated against it (and the RFC 9420 max-range bound enforced) after
+///   openmls's own validation, so this function accepts exactly the key packages
+///   [`add_member`] accepts — preserving the "no weaker advisory window"
+///   equivalence documented above (ADR-057 §Prereq-1).
+///
 /// # Errors
 ///
 /// Returns [`MlsError::AddMemberFailed`] if the key package fails validation
 /// (bad signature, wrong protocol version, or an invalid/expired `Lifetime`),
-/// or [`MlsError::CredentialSerializationFailed`] if the validated leaf
+/// [`MlsError::KeyPackageLifetimeInvalid`] if the accepted `Lifetime` fails
+/// validation against the injected clock, or
+/// [`MlsError::CredentialSerializationFailed`] if the validated leaf
 /// credential is not a parseable SCP `BasicCredential`.
 pub fn key_package_in_did(
     key_package: &KeyPackageIn,
     protocol_version: ProtocolVersion,
+    clock: &dyn Clock,
 ) -> Result<String, MlsError> {
     // A fresh in-memory provider supplies the crypto backend for validation;
     // it holds no group state and is discarded.
@@ -500,6 +552,11 @@ pub fn key_package_in_did(
         .clone()
         .validate(provider.crypto(), protocol_version)
         .map_err(|e| MlsError::AddMemberFailed(format!("key package validation: {e}")))?;
+
+    // SECURITY (ADR-057 §Prereq-1): mirror the hardened-clock re-validation
+    // `add_member` performs, so the DID this function authenticates belongs to a
+    // key package `add_member` will also accept (and vice versa).
+    validate_key_package_lifetime(verified.life_time(), clock)?;
 
     let credential = verified.leaf_node().credential().clone();
     let basic = BasicCredential::try_from(credential).map_err(|e| {
@@ -622,6 +679,9 @@ pub fn destroy_group(group: &mut ScpMlsGroup) -> Result<(), MlsError> {
 /// # Arguments
 ///
 /// * `credential` - The participant's SCP credential (DID + optional UCAN).
+/// * `clock` - The injected hardened [`Clock`] used to stamp the key package's
+///   `Lifetime` (ADR-057 §Prereq-1), so the published freshness bounds come
+///   from the SCP-layer clock rather than openmls's internal one.
 ///
 /// # Returns
 ///
@@ -639,8 +699,9 @@ pub fn destroy_group(group: &mut ScpMlsGroup) -> Result<(), MlsError> {
 /// generation fails.
 pub fn generate_key_package(
     credential: &ScpCredential,
+    clock: &dyn Clock,
 ) -> Result<(KeyPackageBundle, SignatureKeyPair, InMemoryMlsProvider), MlsError> {
-    generate_key_package_with_wrapping_key(credential, None)
+    generate_key_package_with_wrapping_key(credential, None, clock)
 }
 
 /// Generates a `KeyPackage` with an optional `scp_wrapping_key` `LeafNode`
@@ -656,6 +717,8 @@ pub fn generate_key_package(
 /// * `credential` - The participant's SCP credential (DID + optional UCAN).
 /// * `wrapping_pubkey` - Optional 32-byte X25519 public key for the
 ///   `scp_wrapping_key` `LeafNode` extension.
+/// * `clock` - The injected hardened [`Clock`] used to stamp the key package's
+///   `Lifetime` (ADR-057 §Prereq-1).
 ///
 /// # Errors
 ///
@@ -666,6 +729,7 @@ pub fn generate_key_package(
 pub fn generate_key_package_with_wrapping_key(
     credential: &ScpCredential,
     wrapping_pubkey: Option<&[u8; 32]>,
+    clock: &dyn Clock,
 ) -> Result<(KeyPackageBundle, SignatureKeyPair, InMemoryMlsProvider), MlsError> {
     let provider = InMemoryMlsProvider::default();
 
@@ -696,21 +760,24 @@ pub fn generate_key_package_with_wrapping_key(
         builder = builder.leaf_node_extensions(leaf_extensions);
     }
 
-    // SECURITY (ADR-057 §Prereq-1): `KeyPackage::builder().build()` stamps the
-    // KeyPackage `Lifetime` (`not_before`/`not_after`) by reading openmls's
-    // INTERNAL clock — `openmls::key_packages::lifetime::Lifetime::new`, which
-    // calls `SystemTime::now()`. Under the wasm `js` feature that `SystemTime`
-    // is `fluvio_wasm_timer::SystemTime`, a *second, unhardened* clock reading
-    // a live, attacker-overridable `Date.now()` — distinct from the SCP-layer
-    // hardened `Clock` injected elsewhere (e.g. `EpochGraceStore`). A hostile
-    // same-origin script could thus mint KeyPackages with forged `Lifetime`s.
-    // openmls 0.8 exposes NO builder/API seam to inject a clock into `Lifetime`
-    // (the now-read is internal to `Lifetime::new`), so routing it through the
-    // hardened `Clock` requires an upstream openmls change and is tracked as a
-    // follow-up — it is NOT silently accepted. The same applies to the
-    // validation side (`Lifetime::is_valid`, read during add_member / Welcome
-    // processing).
+    // SECURITY (ADR-057 §Prereq-1): the KeyPackage `Lifetime`
+    // (`not_before`/`not_after`) is stamped from the injected hardened `Clock`,
+    // NOT openmls's internal clock. `KeyPackageBuilder::key_package_lifetime`
+    // routes our `Lifetime::init(now - margin, now + lifetime)` (built from the
+    // injected clock via `crate::lifetime::key_package_lifetime`) into
+    // `build()`, so the published freshness bounds are governed by the same
+    // clock as the rest of the client. Without this call `build()` falls back to
+    // `Lifetime::default()` → `Lifetime::new()`, which reads openmls's INTERNAL
+    // clock — under the wasm `js` feature `fluvio_wasm_timer::SystemTime`, an
+    // attacker-overridable `Date.now()`. Generation is now fully routed; the
+    // only residual openmls-internal-clock read is the *receive* side
+    // (`Lifetime::is_valid` on Welcome tree-leaf validation), which openmls does
+    // not expose for bracketing. add_member / key_package_in_did / the
+    // staged-commit Add paths re-validate accepted `Lifetime`s against the
+    // injected clock; the Welcome-leaf residual is tracked upstream (see
+    // `crate::lifetime` module docs).
     let key_package_bundle = builder
+        .key_package_lifetime(key_package_lifetime(clock))
         .build(SCP_CIPHERSUITE, &provider, &signer, credential_with_key)
         .map_err(|e| MlsError::KeyPackageGenerationFailed(e.to_string()))?;
 
@@ -810,6 +877,7 @@ pub fn join_group_from_bytes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use scp_clock::SystemClock;
 
     #[allow(clippy::unwrap_used)]
     fn test_credential(name: &str) -> ScpCredential {
@@ -825,7 +893,7 @@ mod tests {
     #[allow(clippy::unwrap_used)]
     fn create_group_returns_group_with_one_member() {
         let cred = test_credential("alice");
-        let group = create_group(&cred).unwrap();
+        let group = create_group(&cred, &SystemClock).unwrap();
 
         let members = group.members().unwrap();
         assert_eq!(members.len(), 1, "group should have exactly one member");
@@ -838,7 +906,7 @@ mod tests {
     #[allow(clippy::unwrap_used)]
     fn create_group_uses_scp_ciphersuite() {
         let cred = test_credential("alice");
-        let group = create_group(&cred).unwrap();
+        let group = create_group(&cred, &SystemClock).unwrap();
 
         let inner = group.inner().unwrap();
         assert_eq!(
@@ -852,7 +920,7 @@ mod tests {
     #[allow(clippy::unwrap_used)]
     fn create_group_embeds_scp_credential() {
         let cred = test_credential("alice");
-        let group = create_group(&cred).unwrap();
+        let group = create_group(&cred, &SystemClock).unwrap();
 
         let members = group.members().unwrap();
         assert_eq!(members.len(), 1);
@@ -868,13 +936,14 @@ mod tests {
     #[allow(clippy::unwrap_used)]
     fn add_member_returns_welcome_and_commit() {
         let alice_cred = test_credential("alice");
-        let mut alice_group = create_group(&alice_cred).unwrap();
+        let mut alice_group = create_group(&alice_cred, &SystemClock).unwrap();
 
         let bob_cred = test_credential("bob");
-        let (bob_kp_bundle, _bob_signer, _bob_provider) = generate_key_package(&bob_cred).unwrap();
+        let (bob_kp_bundle, _bob_signer, _bob_provider) =
+            generate_key_package(&bob_cred, &SystemClock).unwrap();
 
         let bob_kp: KeyPackageIn = bob_kp_bundle.key_package().clone().into();
-        let result = add_member(&mut alice_group, bob_kp).unwrap();
+        let result = add_member(&mut alice_group, bob_kp, &SystemClock).unwrap();
 
         // Verify we got both messages.
         assert!(
@@ -899,13 +968,14 @@ mod tests {
     #[allow(clippy::unwrap_used)]
     fn add_member_welcome_allows_joining() {
         let alice_cred = test_credential("alice");
-        let mut alice_group = create_group(&alice_cred).unwrap();
+        let mut alice_group = create_group(&alice_cred, &SystemClock).unwrap();
 
         let bob_cred = test_credential("bob");
-        let (bob_kp_bundle, bob_signer, bob_provider) = generate_key_package(&bob_cred).unwrap();
+        let (bob_kp_bundle, bob_signer, bob_provider) =
+            generate_key_package(&bob_cred, &SystemClock).unwrap();
 
         let bob_kp: KeyPackageIn = bob_kp_bundle.key_package().clone().into();
-        let result = add_member(&mut alice_group, bob_kp).unwrap();
+        let result = add_member(&mut alice_group, bob_kp, &SystemClock).unwrap();
 
         // Bob joins using the Welcome message.
         let bob_group = join_group(&result.welcome, bob_provider, bob_signer).unwrap();
@@ -925,13 +995,14 @@ mod tests {
     #[allow(clippy::unwrap_used)]
     fn remove_member_advances_epoch() {
         let alice_cred = test_credential("alice");
-        let mut alice_group = create_group(&alice_cred).unwrap();
+        let mut alice_group = create_group(&alice_cred, &SystemClock).unwrap();
 
         // Add Bob.
         let bob_cred = test_credential("bob");
-        let (bob_kp_bundle, _bob_signer, _bob_provider) = generate_key_package(&bob_cred).unwrap();
+        let (bob_kp_bundle, _bob_signer, _bob_provider) =
+            generate_key_package(&bob_cred, &SystemClock).unwrap();
         let bob_kp: KeyPackageIn = bob_kp_bundle.key_package().clone().into();
-        let _add_result = add_member(&mut alice_group, bob_kp).unwrap();
+        let _add_result = add_member(&mut alice_group, bob_kp, &SystemClock).unwrap();
 
         // Epoch should be 1 after add.
         assert_eq!(alice_group.epoch().unwrap(), 1);
@@ -966,7 +1037,7 @@ mod tests {
     #[allow(clippy::unwrap_used)]
     fn destroy_group_prevents_further_operations() {
         let cred = test_credential("alice");
-        let mut group = create_group(&cred).unwrap();
+        let mut group = create_group(&cred, &SystemClock).unwrap();
 
         destroy_group(&mut group).unwrap();
 
@@ -985,7 +1056,7 @@ mod tests {
     #[allow(clippy::unwrap_used)]
     fn destroy_group_releases_crypto_state() {
         let cred = test_credential("alice");
-        let mut group = create_group(&cred).unwrap();
+        let mut group = create_group(&cred, &SystemClock).unwrap();
 
         // Before destroy: group and signer are Some.
         assert!(group.group.is_some());
@@ -1008,14 +1079,15 @@ mod tests {
     #[allow(clippy::unwrap_used)]
     fn destroy_group_then_add_member_fails() {
         let cred = test_credential("alice");
-        let mut group = create_group(&cred).unwrap();
+        let mut group = create_group(&cred, &SystemClock).unwrap();
         destroy_group(&mut group).unwrap();
 
         let bob_cred = test_credential("bob");
-        let (bob_kp_bundle, _signer, _provider) = generate_key_package(&bob_cred).unwrap();
+        let (bob_kp_bundle, _signer, _provider) =
+            generate_key_package(&bob_cred, &SystemClock).unwrap();
         let bob_kp: KeyPackageIn = bob_kp_bundle.key_package().clone().into();
 
-        let result = add_member(&mut group, bob_kp);
+        let result = add_member(&mut group, bob_kp, &SystemClock);
         assert!(result.is_err());
     }
 
@@ -1023,7 +1095,7 @@ mod tests {
     #[allow(clippy::unwrap_used)]
     fn generate_key_package_produces_valid_package() {
         let cred = test_credential("bob");
-        let (kp_bundle, _signer, _provider) = generate_key_package(&cred).unwrap();
+        let (kp_bundle, _signer, _provider) = generate_key_package(&cred, &SystemClock).unwrap();
 
         // The key package should use the SCP ciphersuite.
         assert_eq!(
@@ -1045,10 +1117,186 @@ mod tests {
             scp_did::SigningKeyId::Active,
         )
         .unwrap();
-        let (kp_bundle, _signer, _provider) = generate_key_package(&cred).unwrap();
+        let (kp_bundle, _signer, _provider) = generate_key_package(&cred, &SystemClock).unwrap();
         let kp_in: KeyPackageIn = kp_bundle.key_package().clone().into();
 
-        let did = key_package_in_did(&kp_in, ProtocolVersion::Mls10).unwrap();
+        let did = key_package_in_did(&kp_in, ProtocolVersion::Mls10, &SystemClock).unwrap();
         assert_eq!(did, "did:dht:z6MkKeyPackageDidExtractFixture");
+    }
+
+    // -----------------------------------------------------------------------
+    // ADR-057 §Prereq-1: KeyPackage Lifetime routed through the injected Clock
+    // -----------------------------------------------------------------------
+    //
+    // Test-clock realism: openmls's un-injectable internal `is_valid`/`Lifetime::new`
+    // still run against the REAL system clock at every openmls generation/validation
+    // site, so injected TestClocks must sit within the real-clock acceptance window.
+    // We seed from `SystemClock.now_secs()` and apply small relative offsets.
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn generate_key_package_lifetime_pins_bounds_to_injected_clock() {
+        use crate::lifetime::{KEY_PACKAGE_LIFETIME_MARGIN_SECS, KEY_PACKAGE_LIFETIME_SECS};
+        // Seed the injected clock at real-now so openmls's own internal checks
+        // (which run against the real clock) also pass.
+        let now = SystemClock.now_secs();
+        let clock = scp_clock::TestClock::new(now);
+        let cred = test_credential("alice");
+        let (bundle, _s, _p) = generate_key_package(&cred, &clock).unwrap();
+        let lt = bundle.key_package().life_time();
+        assert_eq!(
+            lt.not_before(),
+            now - KEY_PACKAGE_LIFETIME_MARGIN_SECS,
+            "not_before must be injected-now minus the 1h margin"
+        );
+        assert_eq!(
+            lt.not_after(),
+            now + KEY_PACKAGE_LIFETIME_SECS,
+            "not_after must be injected-now plus the ~84d lifetime"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn generate_key_package_lifetime_follows_injected_clock_not_openmls_clock() {
+        use crate::lifetime::{KEY_PACKAGE_LIFETIME_MARGIN_SECS, KEY_PACKAGE_LIFETIME_SECS};
+        // Inject a clock 900s ahead of the real clock. If generation read
+        // openmls's internal clock the bounds would be pinned to real-now; they
+        // must instead be pinned to the injected (real-now + 900) value. 900s is
+        // well within openmls's real-clock acceptance window.
+        let real_now = SystemClock.now_secs();
+        let injected = real_now + 900;
+        let clock = scp_clock::TestClock::new(injected);
+        let (bundle, _s, _p) = generate_key_package(&test_credential("bob"), &clock).unwrap();
+        let lt = bundle.key_package().life_time();
+        assert_eq!(lt.not_before(), injected - KEY_PACKAGE_LIFETIME_MARGIN_SECS);
+        assert_eq!(lt.not_after(), injected + KEY_PACKAGE_LIFETIME_SECS);
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn create_group_routes_own_leaf_lifetime_through_injected_clock() {
+        // openmls does not expose the creator's own-leaf `Lifetime` publicly
+        // (`LeafNode::life_time` / `leaf_node_source` are pub(crate)), so we
+        // cannot read the leaf's bounds directly. This test pins the observable
+        // contract: create_group accepts an injected clock and builds a usable
+        // group. The leaf-bound routing shares the exact `key_package_lifetime`
+        // helper asserted directly in the two generate_key_package tests above
+        // and in the `crate::lifetime` unit tests.
+        let now = SystemClock.now_secs();
+        let clock = scp_clock::TestClock::new(now);
+        let group = create_group(&test_credential("carol"), &clock).unwrap();
+        assert_eq!(group.members().unwrap().len(), 1);
+        assert_eq!(group.epoch().unwrap(), 0);
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    fn add_member_rejects_lifetime_expired_against_injected_clock() {
+        // A KeyPackage minted at real-now (not_after ~ real-now + 84d) must be
+        // rejected by add_member when the injected clock is 100 days ahead —
+        // even though openmls's own internal validate (real clock) accepts it.
+        // The SCP-layer check is authoritative and the group epoch is unchanged.
+        let real_now = SystemClock.now_secs();
+        let mut alice = create_group(&test_credential("alice"), &SystemClock).unwrap();
+        let epoch_before = alice.epoch().unwrap();
+
+        let (bob_bundle, _s, _p) =
+            generate_key_package(&test_credential("bob"), &SystemClock).unwrap();
+        let bob_kp: KeyPackageIn = bob_bundle.key_package().clone().into();
+
+        let hundred_days = 100 * 24 * 60 * 60;
+        let future = scp_clock::TestClock::new(real_now + hundred_days);
+        // `.err()` avoids requiring `AddMemberResult: Debug` for `unwrap_err`.
+        let err = add_member(&mut alice, bob_kp, &future)
+            .err()
+            .expect("add_member must reject an expired-lifetime KP");
+        assert!(
+            matches!(err, MlsError::KeyPackageLifetimeInvalid { .. }),
+            "expected KeyPackageLifetimeInvalid, got {err:?}"
+        );
+        assert_eq!(
+            alice.epoch().unwrap(),
+            epoch_before,
+            "a rejected add must NOT advance the epoch"
+        );
+
+        // With the clock at real-now, an equivalent fresh KP is accepted.
+        let (carol_bundle, _cs, _cp) =
+            generate_key_package(&test_credential("carol"), &SystemClock).unwrap();
+        let carol_kp: KeyPackageIn = carol_bundle.key_package().clone().into();
+        add_member(&mut alice, carol_kp, &SystemClock).unwrap();
+        assert_eq!(
+            alice.epoch().unwrap(),
+            epoch_before + 1,
+            "an accepted add advances the epoch"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn key_package_in_did_rejects_expired_against_injected_clock() {
+        let real_now = SystemClock.now_secs();
+        let (bundle, _s, _p) =
+            generate_key_package(&test_credential("carol"), &SystemClock).unwrap();
+        let kp_in: KeyPackageIn = bundle.key_package().clone().into();
+
+        let hundred_days = 100 * 24 * 60 * 60;
+        let future = scp_clock::TestClock::new(real_now + hundred_days);
+        let err = key_package_in_did(&kp_in, ProtocolVersion::Mls10, &future).unwrap_err();
+        assert!(
+            matches!(err, MlsError::KeyPackageLifetimeInvalid { .. }),
+            "expected KeyPackageLifetimeInvalid, got {err:?}"
+        );
+
+        // Accepted with the clock at real-now.
+        let did = key_package_in_did(&kp_in, ProtocolVersion::Mls10, &SystemClock).unwrap();
+        assert_eq!(did, "did:dht:z6Mkcarol");
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    fn add_member_rejects_over_long_lifetime_that_openmls_would_accept() {
+        use crate::lifetime::KEY_PACKAGE_LIFETIME_MAX_RANGE_SECS;
+        // Build a legitimately-signed KeyPackage whose Lifetime is temporally
+        // valid (not_before < now < not_after) but whose total range exceeds the
+        // RFC 9420 maximum. openmls's own `validate` would accept it (it never
+        // calls `has_acceptable_range`); our add_member rejects it on range.
+        let real_now = SystemClock.now_secs();
+        let cred = test_credential("dave");
+        let provider = InMemoryMlsProvider::default();
+        let signer = SignatureKeyPair::new(SCP_CIPHERSUITE.signature_algorithm()).unwrap();
+        signer.store(provider.storage()).unwrap();
+        let cwk = CredentialWithKey {
+            credential: BasicCredential::new(cred.to_bytes().unwrap()).into(),
+            signature_key: signer.to_public_vec().into(),
+        };
+        let over_long = Lifetime::init(
+            real_now - 10,
+            real_now + KEY_PACKAGE_LIFETIME_MAX_RANGE_SECS + 10,
+        );
+        let bundle = KeyPackage::builder()
+            .key_package_lifetime(over_long)
+            .build(SCP_CIPHERSUITE, &provider, &signer, cwk)
+            .unwrap();
+        let kp_in: KeyPackageIn = bundle.key_package().clone().into();
+
+        // Sanity: openmls's own validation accepts this over-long KP.
+        assert!(
+            kp_in
+                .clone()
+                .validate(provider.crypto(), ProtocolVersion::Mls10)
+                .is_ok(),
+            "openmls validate should accept the over-long-but-temporally-valid KP"
+        );
+
+        let mut alice = create_group(&test_credential("alice"), &SystemClock).unwrap();
+        let err = add_member(&mut alice, kp_in, &SystemClock)
+            .err()
+            .expect("add_member must reject an over-long-range KP");
+        assert!(
+            matches!(err, MlsError::KeyPackageLifetimeInvalid { .. }),
+            "add_member must reject an over-long-range KP openmls would accept, got {err:?}"
+        );
     }
 }

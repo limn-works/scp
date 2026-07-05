@@ -24,13 +24,33 @@
 //! # Relationship to the openmls `Lifetime` clock (ADR-057 Prerequisite 1)
 //!
 //! openmls's `js` feature wires `fluvio_wasm_timer::SystemTime`, which reads a
-//! *live, un-captured* `Date.now()` — a second, unhardened clock used for
-//! `KeyPackage` `Lifetime` validation. This module hardens the SCP-layer clock
-//! (event-log leaf timestamps); it does **not** reach inside openmls. Unifying
-//! openmls's `Lifetime` clock with this captured source is the open item
-//! tracked by ADR-057 Prerequisite 1 — out of scope for this surface slice and
-//! surfaced here so a reader is not misled into thinking one capture covers
-//! both clocks.
+//! *live, un-captured* `Date.now()` — a second, unhardened clock openmls uses
+//! internally to stamp (`Lifetime::default`/`new`) and validate
+//! (`Lifetime::is_valid`) `KeyPackage` / `LeafNode` lifetimes. Prerequisite 1
+//! routes SCP's use of that clock through the captured/hardened
+//! [`Clock`](scp_clock::Clock) this module provides. As of the Prereq-1 landing:
+//!
+//! - **Generation is fully routed.** Every `KeyPackage` and group-leaf
+//!   `Lifetime` SCP *mints* is built via `scp_mls::lifetime::key_package_lifetime`
+//!   from the injected hardened clock (`Lifetime::init` with explicit bounds),
+//!   never openmls's `Lifetime::default()`. See `scp-mls/src/group.rs`.
+//! - **The receive/accept side is bracketed.** Every `Lifetime` SCP *accepts*
+//!   is additionally re-validated against the injected hardened clock
+//!   (`scp_mls::lifetime::validate_key_package_lifetime`) wherever openmls
+//!   exposes the accepted `Lifetime` — post-`KeyPackageIn::validate`
+//!   (add-member / key-package-DID) and pre-merge on staged-commit Add proposals
+//!   — and the RFC 9420 maximum-range bound openmls never enforces is added
+//!   there too.
+//! - **Residual (V3).** openmls's own internal `Lifetime::is_valid` on the
+//!   *Welcome tree-leaf* validation path is NOT injectable and NOT bracketable
+//!   (`LeafNode::life_time` / `leaf_node_source` are `pub(crate)`; openmls 0.8
+//!   exposes no time-provider seam), so it still reads openmls's internal clock.
+//!   Closing this residual requires an upstream openmls change — a time-provider
+//!   seam on `OpenMlsProvider` covering `Lifetime::new`/`is_valid` — requested
+//!   upstream (see this change's PR body / report for the filed feature-request
+//!   text). Until then, page same-origin integrity (CSP/SRI/COOP/COEP) remains
+//!   load-bearing for the Welcome-leaf freshness check, exactly as it already is
+//!   for the wall clock this module hardens.
 
 use scp_clock::Clock;
 

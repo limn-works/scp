@@ -937,7 +937,10 @@ pub fn init_supervisor(bi: &NapiBridgeInstance, local_did: &str) {
         return;
     }
     let did = local_did.to_owned();
-    let crypto = Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(did));
+    let crypto = Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(
+        did,
+        std::sync::Arc::new(scp_clock::SystemClock),
+    ));
     let transport = Box::new(scp_core::context::NotConfiguredTransportProvider);
     let event_log = event_log_provider_from_existing_repo(bi);
     let persistence = persistence_box_for_init(bi);
@@ -1104,7 +1107,10 @@ pub fn init_supervisor_with_local_transport(bi: &NapiBridgeInstance, local_did: 
         return;
     }
     let did = local_did.to_owned();
-    let crypto = Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(did));
+    let crypto = Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(
+        did,
+        std::sync::Arc::new(scp_clock::SystemClock),
+    ));
     let transport = Box::new(scp_core::context::LocalTransportProvider);
     let event_log = event_log_provider_from_existing_repo(bi);
     let persistence = persistence_box_for_init(bi);
@@ -1166,7 +1172,10 @@ pub fn init_supervisor_with_relay_transport(
         return;
     }
     let did = local_did.to_owned();
-    let crypto = Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(did));
+    let crypto = Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(
+        did,
+        std::sync::Arc::new(scp_clock::SystemClock),
+    ));
     let transport = Box::new(scp_transport::RelayTransportProvider::new(adapter));
     let event_log = event_log_provider_from_existing_repo(bi);
     let persistence = persistence_box_for_init(bi);
@@ -1308,6 +1317,7 @@ fn init_supervisor_for_test_on_with_did(bi: &NapiBridgeInstance, local_did: &str
     let supervisor_arc = build_supervisor_arc(
         Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(
             local_did.to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
         )),
         Box::new(scp_core::context::LocalTransportProvider),
         event_log,
