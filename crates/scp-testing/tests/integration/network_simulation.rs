@@ -249,7 +249,7 @@ async fn end_to_end_network_demo() {
 
     let alice_cred =
         ScpCredential::new(alice_did_str.to_owned(), None, SigningKeyId::Active).unwrap();
-    let mut alice_group = create_group(&alice_cred).unwrap();
+    let mut alice_group = create_group(&alice_cred, &scp_clock::SystemClock).unwrap();
     println!("  Alice created MLS group");
     println!(
         "    group_id:   {}...",
@@ -262,7 +262,8 @@ async fn end_to_end_network_demo() {
 
     // Bob joins.
     let bob_cred = ScpCredential::new(bob_did_str.to_owned(), None, SigningKeyId::Active).unwrap();
-    let (bob_kp_bundle, bob_signer, bob_provider) = generate_key_package(&bob_cred).unwrap();
+    let (bob_kp_bundle, bob_signer, bob_provider) =
+        generate_key_package(&bob_cred, &scp_clock::SystemClock).unwrap();
 
     println!("  Bob generated KeyPackage for group join");
 
@@ -271,7 +272,7 @@ async fn end_to_end_network_demo() {
         .tls_serialize_detached()
         .unwrap();
     let kp_in = KeyPackageIn::tls_deserialize(&mut kp_bytes.as_slice()).unwrap();
-    let add_result = add_member(&mut alice_group, kp_in).unwrap();
+    let add_result = add_member(&mut alice_group, kp_in, &scp_clock::SystemClock).unwrap();
     let mut bob_group = join_group(&add_result.welcome, bob_provider, bob_signer).unwrap();
 
     println!("  Alice added Bob to group via Welcome message");

@@ -44,11 +44,24 @@ use std::sync::Arc;
 
 use scp_client::{LocalSigner, MemoryStorage, Signer, Storage};
 use scp_client_wasm::WasmScpClient;
-use scp_clock::{Clock, TestClock};
+use scp_clock::{Clock, SystemClock, TestClock};
 
 const CTX: &str = "ctx-adr057-slice3-wasm-surface";
 const ALICE_DID: &str = "did:key:z6MkAlice3SurfaceExchangeFixtureKeyAAAAAAA";
 const BOB_DID: &str = "did:key:z6MkBob3SurfaceExchangeFixtureKeyBBBBBBBBBB";
+
+/// A real-time clock seed with a small distinct offset (seconds).
+///
+/// These surface tests run on the native host (`#[test]`), where both
+/// `scp_clock::SystemClock` and openmls's un-injectable internal
+/// `Lifetime::is_valid` read `std::time::SystemTime`. Seeding the stand-in
+/// `TestClock` from the real clock (instead of a fixed past epoch) keeps every
+/// minted `KeyPackage` `Lifetime` valid against openmls's internal check while
+/// remaining pairwise distinct (ADR-057 §Prereq-1 test-clock realism);
+/// convergence rides on transported timestamps, not clock magnitude.
+fn seed(offset: u64) -> u64 {
+    SystemClock.now_secs() + offset
+}
 
 /// Builds a `WasmScpClient` over mock-JS-shaped in-memory adapters, through the
 /// same `from_parts` seam the wasm32 `from_js` constructor uses.
@@ -110,8 +123,8 @@ fn two_party_exchange_through_wasm_surface() {
     // Deliberately different local clocks: convergence must depend only on the
     // convergent timestamp that travels with each message, not on the members'
     // clocks agreeing (ADR-057 §9.9.3).
-    let mut alice = client_for(ALICE_DID, 1_700_000_000);
-    let mut bob = client_for(BOB_DID, 1_650_000_000);
+    let mut alice = client_for(ALICE_DID, seed(0));
+    let mut bob = client_for(BOB_DID, seed(100));
 
     assert_eq!(alice.did(), ALICE_DID, "the surface reports Alice's DID");
 
@@ -255,8 +268,8 @@ fn restore_through_wasm_surface() {
     let alice_storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
     let bob_storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
 
-    let mut alice = client_over(ALICE_DID, alice_storage, 1_700_000_000);
-    let mut bob = client_over(BOB_DID, Arc::clone(&bob_storage), 1_650_000_000);
+    let mut alice = client_over(ALICE_DID, alice_storage, seed(0));
+    let mut bob = client_over(BOB_DID, Arc::clone(&bob_storage), seed(100));
 
     alice.create_context(CTX.to_owned()).expect("alice creates");
     let bob_kp = bob
@@ -279,7 +292,7 @@ fn restore_through_wasm_surface() {
 
     // The reopened tab: a fresh surface client over Bob's identity + storage. The
     // constructor restores the converged context from the shared store.
-    let mut bob2 = client_over(BOB_DID, Arc::clone(&bob_storage), 1_650_000_050);
+    let mut bob2 = client_over(BOB_DID, Arc::clone(&bob_storage), seed(150));
     assert_eq!(
         bob2.member_dids(CTX.to_owned()).map(|mut m| {
             m.sort();
@@ -318,7 +331,7 @@ fn context_ids_lists_contexts_through_the_surface() {
     // created through the surface (sorted).
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
     {
-        let mut c = client_over(ALICE_DID, Arc::clone(&storage), 1_700_000_000);
+        let mut c = client_over(ALICE_DID, Arc::clone(&storage), seed(0));
         c.create_context("ctx-surface-b".to_owned())
             .expect("create b");
         c.create_context("ctx-surface-a".to_owned())
@@ -330,7 +343,7 @@ fn context_ids_lists_contexts_through_the_surface() {
         );
     }
     // A reopened surface client over the same storage restores + lists both.
-    let c2 = client_over(ALICE_DID, Arc::clone(&storage), 1_700_000_050);
+    let c2 = client_over(ALICE_DID, Arc::clone(&storage), seed(50));
     assert_eq!(
         c2.context_ids(),
         vec!["ctx-surface-a".to_owned(), "ctx-surface-b".to_owned()],
@@ -343,7 +356,7 @@ fn context_status_reports_live_and_absent_through_the_surface() {
     // The surface exposes `contextStatus` as a lowercase string ("live"/"poisoned"
     // /"absent") so a caller can distinguish a held context from an absent one
     // without the `Option` observers' poisoned/absent ambiguity.
-    let mut c = client_for(ALICE_DID, 1_700_000_000);
+    let mut c = client_for(ALICE_DID, seed(0));
 
     // Absent before creation.
     assert_eq!(c.context_status("ctx-never-existed".to_owned()), "absent");

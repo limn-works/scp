@@ -58,8 +58,8 @@ fn generate_mls_key_package_bytes(did: &str) -> Result<Vec<u8>, ScpNapiError> {
             }
         })?;
 
-    let (kp_bundle, _signer, _provider) =
-        generate_key_package(&cred).map_err(|e| ScpNapiError::Crypto {
+    let (kp_bundle, _signer, _provider) = generate_key_package(&cred, &scp_clock::SystemClock)
+        .map_err(|e| ScpNapiError::Crypto {
             message: format!("MLS key package generation failed: {e}"),
             code: codes::CRYPTO_4011.to_owned(),
         })?;

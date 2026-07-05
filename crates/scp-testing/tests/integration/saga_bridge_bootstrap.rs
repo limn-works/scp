@@ -140,7 +140,10 @@ fn bridge_supervisor(
 ) -> Arc<Supervisor> {
     let key_resolver: KeyResolver = Arc::new(|_: &DID, _: scp_did::SigningKeyId| None);
     Supervisor::with_providers_and_journal(
-        Arc::new(MlsCryptoProvider::new(creator_did.to_owned())),
+        Arc::new(MlsCryptoProvider::new(
+            creator_did.to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
+        )),
         Box::new(LocalTransportProvider) as Box<dyn ContextTransportProvider>,
         Box::new(NoOpEventLog) as Box<dyn ContextEventLogProvider>,
         key_resolver,

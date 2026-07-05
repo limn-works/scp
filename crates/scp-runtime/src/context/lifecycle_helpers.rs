@@ -3269,6 +3269,7 @@ mod restore_reconcile_tests {
     fn build_supervisor(persistence: Box<dyn ContextPersistence>) -> Arc<Supervisor> {
         let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
             "did:dht:z6MkRestoreReconcile".to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
         ));
         Supervisor::with_providers(
             crypto,
@@ -3581,6 +3582,7 @@ mod restore_reconcile_tests {
         // that resolves the joiner's verifying key for the spending-UCAN sig.
         let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
             "did:dht:z6MkJoinMoneyOrder".to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
         ));
         let key_resolver: scp_protocol::context::governance::KeyResolver = {
             let did = joiner_for_resolver;
@@ -3668,8 +3670,9 @@ mod restore_reconcile_tests {
             scp_did::SigningKeyId::Active,
         )
         .expect("joiner credential");
-        let (kp_bundle, _signer, _provider) = scp_mls::group::generate_key_package(&joiner_cred)
-            .expect("generate joiner key package");
+        let (kp_bundle, _signer, _provider) =
+            scp_mls::group::generate_key_package(&joiner_cred, &scp_clock::SystemClock)
+                .expect("generate joiner key package");
         let kp_bytes =
             openmls::prelude::tls_codec::Serialize::tls_serialize_detached(kp_bundle.key_package())
                 .expect("serialize key package");
@@ -3794,6 +3797,7 @@ mod restore_reconcile_tests {
     async fn finalize_send_succeeds_without_durable_message_sent_append() {
         let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
             "did:dht:z6MkFinalizeSendSeq".to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
         ));
         let key_resolver: scp_protocol::context::governance::KeyResolver =
             Arc::new(|_q: &DID, _kid: scp_did::SigningKeyId| None);
@@ -3959,6 +3963,7 @@ mod restore_reconcile_tests {
 
         let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
             "did:dht:z6MkPayConverge".to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
         ));
         let key_resolver: scp_protocol::context::governance::KeyResolver =
             Arc::new(|_: &DID, _| None);

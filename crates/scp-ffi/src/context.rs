@@ -906,9 +906,10 @@ fn generate_mls_key_package_bytes(did: &str) -> Result<Vec<u8>, crate::error::Sc
             ))
         })?;
 
-    let (kp_bundle, _signer, _provider) = generate_key_package(&cred).map_err(|e| {
-        crate::error::ScpPyError::crypto(format!("MLS key package generation failed: {e}"))
-    })?;
+    let (kp_bundle, _signer, _provider) = generate_key_package(&cred, &scp_clock::SystemClock)
+        .map_err(|e| {
+            crate::error::ScpPyError::crypto(format!("MLS key package generation failed: {e}"))
+        })?;
 
     kp_bundle
         .key_package()

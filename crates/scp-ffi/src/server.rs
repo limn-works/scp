@@ -102,9 +102,11 @@ fn auto_wire_context_manager(
         ))
     }) {
         Ok(adapter) => {
-            let crypto = std::sync::Arc::new(
-                scp_core::crypto::mls::provider::MlsCryptoProvider::new(did_owned.clone()),
-            );
+            let crypto =
+                std::sync::Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(
+                    did_owned.clone(),
+                    std::sync::Arc::new(scp_clock::SystemClock),
+                ));
             let transport = Box::new(scp_transport::RelayTransportProvider::new(adapter));
             // The supervisor's own event log MUST be the persistent Merkle
             // provider (sharing the bridge instance's single storage backend),

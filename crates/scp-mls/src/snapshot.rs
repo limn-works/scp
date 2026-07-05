@@ -409,6 +409,7 @@ mod tests {
     use crate::ScpCredential;
     use crate::group::{add_member, create_group, generate_key_package, join_group};
     use openmls::prelude::KeyPackageIn;
+    use scp_clock::SystemClock;
     use scp_did::SigningKeyId;
     use tls_codec::{Deserialize as TlsDeserialize, Serialize as TlsSerialize};
 
@@ -421,7 +422,7 @@ mod tests {
 
     #[test]
     fn round_trip_preserves_group_identity_and_epoch() {
-        let group = create_group(&credential(ALICE)).unwrap();
+        let group = create_group(&credential(ALICE), &SystemClock).unwrap();
         let original_epoch = group.epoch().unwrap();
         let original_group_id = group.group_id().unwrap().to_vec();
 
@@ -446,13 +447,14 @@ mod tests {
 
         // Alice creates a two-member group so the restored group can decrypt a
         // message a peer sent — proving the epoch secrets survived the snapshot.
-        let mut alice = create_group(&credential(ALICE)).unwrap();
-        let (bundle, bob_signer, bob_provider) = generate_key_package(&credential(BOB)).unwrap();
+        let mut alice = create_group(&credential(ALICE), &SystemClock).unwrap();
+        let (bundle, bob_signer, bob_provider) =
+            generate_key_package(&credential(BOB), &SystemClock).unwrap();
         let kp_in = KeyPackageIn::tls_deserialize(
             &mut &*bundle.key_package().tls_serialize_detached().unwrap(),
         )
         .unwrap();
-        let add = add_member(&mut alice, kp_in).unwrap();
+        let add = add_member(&mut alice, kp_in, &SystemClock).unwrap();
         let bob = join_group(&add.welcome, bob_provider, bob_signer).unwrap();
 
         // Snapshot Bob, then restore into a fresh group.
@@ -461,7 +463,7 @@ mod tests {
 
         // Alice sends; the RESTORED Bob must decrypt it.
         let ct = serialize_ciphertext(&encrypt(&mut alice, b"after restore").unwrap()).unwrap();
-        match decrypt_with_membership_changes(&mut restored_bob, &ct).unwrap() {
+        match decrypt_with_membership_changes(&mut restored_bob, &ct, &SystemClock).unwrap() {
             crate::InboundChange::Application { plaintext, .. } => {
                 assert_eq!(plaintext, b"after restore");
             }
@@ -484,7 +486,8 @@ mod tests {
         // snapshots that pending material, then RESTORES it and uses the restored
         // pair to join a group Alice adds him to — proving the persisted pending
         // material carries the HPKE private keys the Welcome needs.
-        let (bundle, bob_signer, bob_provider) = generate_key_package(&credential(BOB)).unwrap();
+        let (bundle, bob_signer, bob_provider) =
+            generate_key_package(&credential(BOB), &SystemClock).unwrap();
 
         // Persist and restore Bob's pending-join material (bound to his DID + ctx).
         let blob =
@@ -498,12 +501,12 @@ mod tests {
         );
 
         // Alice creates a group and adds Bob from his published key package.
-        let mut alice = create_group(&credential(ALICE)).unwrap();
+        let mut alice = create_group(&credential(ALICE), &SystemClock).unwrap();
         let kp_in = KeyPackageIn::tls_deserialize(
             &mut &*bundle.key_package().tls_serialize_detached().unwrap(),
         )
         .unwrap();
-        let add = add_member(&mut alice, kp_in).unwrap();
+        let add = add_member(&mut alice, kp_in, &SystemClock).unwrap();
 
         // The RESTORED pending pair must process the Welcome into a live group.
         let bob = join_group(&add.welcome, restored_provider, restored_signer).unwrap();

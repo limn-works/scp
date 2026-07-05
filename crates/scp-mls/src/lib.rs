@@ -28,6 +28,8 @@
 //! - [`encrypt`] — Application-message encrypt/decrypt over the MLS group.
 //! - [`ratchet`] — Commit processing and epoch advance.
 //! - [`key_package`] — Single-use `KeyPackage` buffer management.
+//! - [`lifetime`] — `KeyPackage` `Lifetime` minting/validation via the injected
+//!   [`scp_clock::Clock`] (ADR-057 Prereq-1).
 //! - [`wrapping_extension`] — `scp_wrapping_key` `LeafNode` extension helpers.
 //! - [`epoch_grace`] — Epoch grace-window store (forward-secrecy bound).
 //! - [`error`] — MLS-specific error types.
@@ -41,6 +43,7 @@ pub mod epoch_grace;
 pub mod error;
 pub mod group;
 pub mod key_package;
+pub mod lifetime;
 pub mod ratchet;
 pub mod snapshot;
 pub mod wrapping_extension;
@@ -58,6 +61,10 @@ pub use group::{
     AddMemberResult, RemoveMemberResult, SCP_CIPHERSUITE, ScpMlsGroup, add_member, create_group,
     create_group_with_wrapping_key, destroy_group, generate_key_package,
     generate_key_package_with_wrapping_key, join_group, key_package_in_did, remove_member,
+};
+pub use lifetime::{
+    KEY_PACKAGE_LIFETIME_MARGIN_SECS, KEY_PACKAGE_LIFETIME_MAX_RANGE_SECS,
+    KEY_PACKAGE_LIFETIME_SECS, key_package_lifetime, validate_key_package_lifetime,
 };
 pub use openmls_basic_credential::SignatureKeyPair;
 // The snapshot STRUCTS (`MlsGroupSnapshot`, `PendingJoinSnapshot`) are NOT

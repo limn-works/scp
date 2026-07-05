@@ -111,6 +111,28 @@ pub enum MlsError {
     #[error("key package replay: init key already consumed")]
     KeyPackageReplay,
 
+    /// A `KeyPackage` `Lifetime` failed validation against the injected hardened
+    /// [`Clock`](scp_clock::Clock): it is expired, not yet valid, or its total
+    /// range (`not_after - not_before`) exceeds the RFC 9420 maximum acceptable
+    /// range. Raised by
+    /// [`validate_key_package_lifetime`](crate::lifetime::validate_key_package_lifetime),
+    /// SCP's hardened counterpart to openmls's un-injectable internal
+    /// `Lifetime::is_valid` (ADR-057 §Prereq-1). The same variant covers both the
+    /// temporal (expiry / not-before) failure and the maximum-range failure;
+    /// `now` is the timestamp read from the injected clock at validation.
+    #[error(
+        "key package lifetime invalid: not_before={not_before}, not_after={not_after}, now={now}"
+    )]
+    KeyPackageLifetimeInvalid {
+        /// The `Lifetime`'s `not_before` bound (Unix seconds).
+        not_before: u64,
+        /// The `Lifetime`'s `not_after` bound (Unix seconds).
+        not_after: u64,
+        /// The current time read from the injected clock at validation
+        /// (Unix seconds).
+        now: u64,
+    },
+
     /// Serializing or deserializing an [`crate::ScpMlsGroup`] state snapshot
     /// failed (the out-of-band persistence path used by the in-browser driver
     /// to snapshot the in-memory MLS provider to durable storage — ADR-057

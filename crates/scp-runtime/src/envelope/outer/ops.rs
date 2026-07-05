@@ -280,13 +280,14 @@ mod seal_open_tests {
     /// Returns (`alice_group`, `bob_group`).
     fn setup_mls_groups() -> (ScpMlsGroup, ScpMlsGroup) {
         let alice_cred = test_credential("alice");
-        let mut alice_group = create_group(&alice_cred).unwrap();
+        let mut alice_group = create_group(&alice_cred, &scp_clock::SystemClock).unwrap();
 
         let bob_cred = test_credential("bob");
-        let (bob_kp_bundle, bob_signer, bob_provider) = generate_key_package(&bob_cred).unwrap();
+        let (bob_kp_bundle, bob_signer, bob_provider) =
+            generate_key_package(&bob_cred, &scp_clock::SystemClock).unwrap();
         let bob_kp: KeyPackageIn = bob_kp_bundle.key_package().clone().into();
 
-        let add_result = add_member(&mut alice_group, bob_kp).unwrap();
+        let add_result = add_member(&mut alice_group, bob_kp, &scp_clock::SystemClock).unwrap();
         let bob_group = join_group(&add_result.welcome, bob_provider, bob_signer).unwrap();
 
         (alice_group, bob_group)

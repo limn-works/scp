@@ -2875,7 +2875,10 @@ mod tests {
             Arc::new(|_: &scp_did::DID, _: scp_did::SigningKeyId| None);
         let test_did = "did:test:bridge-instance-test".to_owned();
         Supervisor::with_providers(
-            Arc::new(MlsCryptoProvider::new(test_did)),
+            Arc::new(MlsCryptoProvider::new(
+                test_did,
+                std::sync::Arc::new(scp_clock::SystemClock),
+            )),
             Box::new(LocalTransportProvider),
             Box::new(NoOpEventLog),
             key_resolver,
@@ -4259,7 +4262,10 @@ mod tests {
         let key_resolver: scp_core::context::governance::KeyResolver =
             Arc::new(|_: &scp_did::DID, _: scp_did::SigningKeyId| None);
         let supervisor = Supervisor::with_providers(
-            Arc::new(MlsCryptoProvider::new("did:test:suspend-flush".to_owned())),
+            Arc::new(MlsCryptoProvider::new(
+                "did:test:suspend-flush".to_owned(),
+                std::sync::Arc::new(scp_clock::SystemClock),
+            )),
             Box::new(scp_core::context::LocalTransportProvider),
             Box::new(NoOpEventLog),
             key_resolver,

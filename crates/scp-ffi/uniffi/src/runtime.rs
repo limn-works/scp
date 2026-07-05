@@ -798,7 +798,10 @@ impl UniffiBridgeInstance {
             return;
         }
         let did = local_did.to_owned();
-        let crypto = Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(did));
+        let crypto = Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(
+            did,
+            std::sync::Arc::new(scp_clock::SystemClock),
+        ));
         let event_log = self.protocol_repository.event_log_provider();
         let persistence = self.core.persistence_arc_clone();
         // Storage-before-supervisor precondition (spec §17.6): the chosen
@@ -847,7 +850,10 @@ impl UniffiBridgeInstance {
             return;
         }
         let did = local_did.to_owned();
-        let crypto = Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(did));
+        let crypto = Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(
+            did,
+            std::sync::Arc::new(scp_clock::SystemClock),
+        ));
         let transport = Box::new(scp_transport::RelayTransportProvider::new(adapter));
         let event_log = self.protocol_repository.event_log_provider();
         let persistence = self.core.persistence_arc_clone();
@@ -891,7 +897,10 @@ impl UniffiBridgeInstance {
             return;
         }
         let did = local_did.to_owned();
-        let crypto = Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(did));
+        let crypto = Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(
+            did,
+            std::sync::Arc::new(scp_clock::SystemClock),
+        ));
         let transport = Box::new(scp_core::context::LocalTransportProvider);
         let event_log = self.protocol_repository.event_log_provider();
         let persistence = self.core.persistence_arc_clone();
@@ -1341,6 +1350,11 @@ fn build_supervisor(
     // receiver for the node webhook dispatcher (§12.10.5). The unused receiver
     // is dropped immediately; the retained sender keeps the channel open.
     let (event_tx, _rx) = tokio::sync::broadcast::channel(EVENT_CHANNEL_CAPACITY);
+    // Share the provider's exact hardened `Clock` Arc with the supervisor so the
+    // "one hardened clock per node" invariant (see the `MlsCryptoProvider::clock`
+    // field doc, ADR-057 §Prereq-1) holds by construction — the supervisor does
+    // not fabricate a second `SystemClock`. Read before `crypto` is moved below.
+    let clock = crypto.clock();
     // `durable` is REQUIRED (non-Option): the runtime never defaults storage;
     // the bridge supplies it (spec §17.6 / ADR-049). It bundles the single
     // chosen Storage erased once into the `OpenMLS` view AND the durable saga
@@ -1355,7 +1369,7 @@ fn build_supervisor(
         persistence_box,
         None,
         Some(event_tx),
-        None,
+        Some(clock),
         durable,
     )
 }

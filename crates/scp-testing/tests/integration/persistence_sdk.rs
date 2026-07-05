@@ -201,7 +201,10 @@ async fn context_create_persists_membership_to_sqlite() {
         // ADR-049 commit 12 — `Supervisor::with_providers` replaces the
         // deleted `ContextManager::builder().storage(..).build()` chain.
         let manager = Supervisor::with_providers(
-            Arc::new(MlsCryptoProvider::new(ALICE_DID.to_owned())),
+            Arc::new(MlsCryptoProvider::new(
+                ALICE_DID.to_owned(),
+                std::sync::Arc::new(scp_clock::SystemClock),
+            )),
             Box::new(NotConfiguredTransportProvider),
             Box::new(MerkleEventLogProvider::new()),
             permissive_key_resolver(),
@@ -300,7 +303,10 @@ async fn full_lifecycle_suspend_restore_roundtrip() {
         // ADR-049 commit 12 — `Supervisor::with_providers` replaces the
         // deleted `ContextManager::builder().storage(..).build()` chain.
         let manager = Supervisor::with_providers(
-            Arc::new(MlsCryptoProvider::new(ALICE_DID.to_owned())),
+            Arc::new(MlsCryptoProvider::new(
+                ALICE_DID.to_owned(),
+                std::sync::Arc::new(scp_clock::SystemClock),
+            )),
             Box::new(NotConfiguredTransportProvider),
             Box::new(MerkleEventLogProvider::new()),
             permissive_key_resolver(),
@@ -366,7 +372,10 @@ async fn full_lifecycle_suspend_restore_roundtrip() {
     // ADR-049 commit 12 — `Supervisor::with_providers` replaces the
     // deleted `ContextManager::with_persistence(..)` constructor.
     let manager2 = Supervisor::with_providers(
-        Arc::new(MlsCryptoProvider::new(ALICE_DID.to_owned())),
+        Arc::new(MlsCryptoProvider::new(
+            ALICE_DID.to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
+        )),
         Box::new(NotConfiguredTransportProvider),
         Box::new(MerkleEventLogProvider::new()),
         permissive_key_resolver(),

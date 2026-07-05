@@ -18,12 +18,25 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use scp_client::{ClientError, ContextStatus, LocalSigner, MemoryStorage, ScpClient, Storage};
-use scp_clock::{Clock, TestClock};
+use scp_clock::{Clock, SystemClock, TestClock};
 use scp_protocol::context::membership::ContextEvent;
 
 const CTX: &str = "ctx-adr057-t2-snapshot-restore";
 const ALICE_DID: &str = "did:key:z6MkAliceT2SnapshotRestoreFixtureAAAAAAAAA";
 const BOB_DID: &str = "did:key:z6MkBobT2SnapshotRestoreFixtureBBBBBBBBBBBBB";
+
+/// A real-time clock seed with a small distinct offset (seconds).
+///
+/// Seeded from `SystemClock.now_secs()` rather than a fixed past epoch so every
+/// minted `KeyPackage` `Lifetime` stays valid against openmls's un-injectable
+/// internal (real) clock (ADR-057 §Prereq-1 test-clock realism). The small
+/// offsets keep the two members' clocks distinct (and model a few seconds
+/// elapsing across a disconnect/reconnect) while staying well inside openmls's
+/// acceptance window; convergence rides on transported timestamps, not clock
+/// magnitude.
+fn seed(offset: u64) -> u64 {
+    SystemClock.now_secs() + offset
+}
 
 /// Builds a client for `did` over the given (shared) storage and a fixed clock,
 /// restoring whatever the storage holds for that identity (the constructor is the
@@ -39,8 +52,8 @@ fn client_over(did: &str, storage: Arc<dyn Storage>, now_secs: u64) -> ScpClient
 /// Returns the two clients (Bob built over the caller's shared storage).
 fn converged_pair(bob_storage: Arc<dyn Storage>) -> (ScpClient, ScpClient) {
     let alice_storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
-    let mut alice = client_over(ALICE_DID, alice_storage, 1_700_000_000);
-    let mut bob = client_over(BOB_DID, bob_storage, 1_650_000_000);
+    let mut alice = client_over(ALICE_DID, alice_storage, seed(0));
+    let mut bob = client_over(BOB_DID, bob_storage, seed(100));
 
     alice.create_context(CTX).expect("alice creates");
     let bob_kp = bob
@@ -89,7 +102,7 @@ fn restore_resumes_a_converged_context_from_storage() {
 
     // A fresh client (the reopened tab) over Bob's identity + the SAME storage.
     // The constructor restores the converged context.
-    let mut bob2 = client_over(BOB_DID, Arc::clone(&bob_storage), 1_650_000_099);
+    let mut bob2 = client_over(BOB_DID, Arc::clone(&bob_storage), seed(199));
 
     // Restored state matches what Bob held before the tab closed.
     let mut members = bob2.member_dids(CTX).expect("restored members");
@@ -185,11 +198,11 @@ fn pending_join_completes_after_restore() {
     // and completes the join.
     let bob_storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
     let alice_storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
-    let mut alice = client_over(ALICE_DID, alice_storage, 1_700_000_000);
+    let mut alice = client_over(ALICE_DID, alice_storage, seed(0));
     alice.create_context(CTX).expect("alice creates");
 
     let bob_kp = {
-        let mut bob = client_over(BOB_DID, Arc::clone(&bob_storage), 1_650_000_000);
+        let mut bob = client_over(BOB_DID, Arc::clone(&bob_storage), seed(100));
         let kp = bob
             .generate_key_package_for_join(CTX)
             .expect("bob key package");
@@ -201,7 +214,7 @@ fn pending_join_completes_after_restore() {
     let add = alice.add_member(CTX, &bob_kp).expect("alice adds bob");
 
     // The reopened tab restores the pending material and joins with it.
-    let mut bob2 = client_over(BOB_DID, Arc::clone(&bob_storage), 1_650_000_050);
+    let mut bob2 = client_over(BOB_DID, Arc::clone(&bob_storage), seed(150));
     bob2.join_context_encrypted(CTX, &add.welcome, &add.event_log, &add.members)
         .expect("restored bob completes the join");
 
@@ -218,7 +231,7 @@ fn pending_join_completes_after_restore() {
 #[test]
 fn restore_of_absent_store_is_a_fresh_client() {
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
-    let client = client_over(BOB_DID, storage, 1_650_000_000);
+    let client = client_over(BOB_DID, storage, seed(100));
     assert!(
         client.member_dids(CTX).is_none(),
         "an empty store yields a fresh client with no contexts"
@@ -326,7 +339,7 @@ fn persisted_single_context() -> Arc<dyn Storage> {
 /// (`ScpClient` is deliberately not `Debug`, so `expect_err` is unavailable.)
 fn expect_construction_error_as(did: &str, storage: Arc<dyn Storage>) -> ClientError {
     let signer = Arc::new(LocalSigner::active(did));
-    let clock: Arc<dyn Clock> = Arc::new(TestClock::new(1_650_000_100));
+    let clock: Arc<dyn Clock> = Arc::new(TestClock::new(seed(200)));
     match ScpClient::new(signer, storage, clock) {
         Ok(_) => panic!("construction must fail closed"),
         Err(e) => e,
@@ -410,7 +423,7 @@ fn one_of_two_corrupt_contexts_fails_whole_construction() {
     let ctx_good = "ctx-atomic-good";
     let ctx_bad = "ctx-atomic-corrupt";
     {
-        let mut b = client_over(BOB_DID, Arc::clone(&underlying), 1_650_000_000);
+        let mut b = client_over(BOB_DID, Arc::clone(&underlying), seed(100));
         b.create_context(ctx_good).expect("create good");
         b.create_context(ctx_bad).expect("create corrupt");
     }
@@ -432,7 +445,7 @@ fn one_of_two_corrupt_contexts_fails_whole_construction() {
 fn failing_put_during_send_poisons_context_and_reconstruction_recovers() {
     let gated = Arc::new(GatedFailOnPut::new(Arc::new(MemoryStorage::new())));
     let storage: Arc<dyn Storage> = Arc::clone(&gated) as Arc<dyn Storage>;
-    let mut alice = client_over(ALICE_DID, storage, 1_700_000_000);
+    let mut alice = client_over(ALICE_DID, storage, seed(0));
     alice.create_context(CTX).expect("alice creates");
     // The last DURABLE state is the post-create snapshot (one ContextCreated leaf).
     let durable_root = alice.event_log_root(CTX).expect("post-create root");
@@ -467,11 +480,7 @@ fn failing_put_during_send_poisons_context_and_reconstruction_recovers() {
     // Reconstruction from the SAME storage yields a WORKING, UNPOISONED context at
     // the last durable snapshot (post-create) — a restored context is unpoisoned by
     // construction. (`gated` is still armed, but reconstruction only reads.)
-    let alice2 = client_over(
-        ALICE_DID,
-        Arc::clone(&gated) as Arc<dyn Storage>,
-        1_700_000_050,
-    );
+    let alice2 = client_over(ALICE_DID, Arc::clone(&gated) as Arc<dyn Storage>, seed(50));
     assert_eq!(
         alice2.event_log_root(CTX),
         Some(durable_root),
@@ -492,7 +501,7 @@ fn failing_put_during_send_poisons_context_and_reconstruction_recovers() {
 fn context_ids_lists_restored_contexts_sorted() {
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
     {
-        let mut b = client_over(BOB_DID, Arc::clone(&storage), 1_650_000_000);
+        let mut b = client_over(BOB_DID, Arc::clone(&storage), seed(100));
         b.create_context("ctx-b-two").expect("create 2");
         b.create_context("ctx-a-one").expect("create 1");
         assert_eq!(
@@ -503,7 +512,7 @@ fn context_ids_lists_restored_contexts_sorted() {
     }
     // A reopened tab restores both contexts and can enumerate them (without this,
     // a fresh client would hold its restored conversations but expose no listing).
-    let b2 = client_over(BOB_DID, Arc::clone(&storage), 1_650_000_050);
+    let b2 = client_over(BOB_DID, Arc::clone(&storage), seed(150));
     assert_eq!(
         b2.context_ids(),
         vec!["ctx-a-one".to_owned(), "ctx-b-two".to_owned()],
@@ -518,7 +527,7 @@ fn context_snapshot_under_mismatched_key_fails_construction_closed() {
     // id is A → the whole construction fails closed as corrupt/mislabeled.
     let src: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
     {
-        let mut b = client_over(BOB_DID, Arc::clone(&src), 1_650_000_000);
+        let mut b = client_over(BOB_DID, Arc::clone(&src), seed(100));
         b.create_context("ctx-embedded-A").expect("create A");
     }
     let blob = src
@@ -539,7 +548,7 @@ fn context_snapshot_under_mismatched_key_fails_construction_closed() {
 /// store, then returns the raw pending blob (bound to Bob's DID + `ctx`).
 fn bob_pending_blob(ctx: &str) -> Vec<u8> {
     let store: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
-    let mut bob = client_over(BOB_DID, Arc::clone(&store), 1_650_000_000);
+    let mut bob = client_over(BOB_DID, Arc::clone(&store), seed(100));
     bob.generate_key_package_for_join(ctx)
         .expect("bob key package");
     store
@@ -584,11 +593,7 @@ fn context_status_reports_live_poisoned_and_absent() {
     // The non-throwing predicate distinguishes all three states, unlike the
     // `Option` observers (which collapse poisoned into `None`).
     let gated = Arc::new(GatedFailOnPut::new(Arc::new(MemoryStorage::new())));
-    let mut alice = client_over(
-        ALICE_DID,
-        Arc::clone(&gated) as Arc<dyn Storage>,
-        1_700_000_000,
-    );
+    let mut alice = client_over(ALICE_DID, Arc::clone(&gated) as Arc<dyn Storage>, seed(0));
 
     // Absent: a context that was never created/joined.
     assert_eq!(
@@ -623,11 +628,7 @@ fn closing_a_poisoned_context_forfeits_recovery() {
     // `failing_put_during_send_poisons_context_and_reconstruction_recovers`, which
     // does NOT close and so keeps the durable snapshot).
     let gated = Arc::new(GatedFailOnPut::new(Arc::new(MemoryStorage::new())));
-    let mut alice = client_over(
-        ALICE_DID,
-        Arc::clone(&gated) as Arc<dyn Storage>,
-        1_700_000_000,
-    );
+    let mut alice = client_over(ALICE_DID, Arc::clone(&gated) as Arc<dyn Storage>, seed(0));
     alice.create_context(CTX).expect("alice creates"); // durable post-create snapshot
 
     // Poison the context via a failing post-send persist.
@@ -650,11 +651,7 @@ fn closing_a_poisoned_context_forfeits_recovery() {
 
     // Reconstruction from the SAME storage finds nothing — close deleted the last
     // durable snapshot, so the context cannot be recovered.
-    let alice2 = client_over(
-        ALICE_DID,
-        Arc::clone(&gated) as Arc<dyn Storage>,
-        1_700_000_050,
-    );
+    let alice2 = client_over(ALICE_DID, Arc::clone(&gated) as Arc<dyn Storage>, seed(50));
     assert_eq!(
         alice2.context_status(CTX),
         ContextStatus::Absent,
@@ -671,7 +668,7 @@ fn close_deletes_durable_state_forward_secrecy() {
 
     // A fresh client over the same storage finds nothing to restore — the closed
     // context is not resurrected (forward secrecy).
-    let bob2 = client_over(BOB_DID, Arc::clone(&bob_storage), 1_650_000_100);
+    let bob2 = client_over(BOB_DID, Arc::clone(&bob_storage), seed(200));
     assert!(
         bob2.member_dids(CTX).is_none(),
         "the closed context's snapshot was deleted and is not restored"

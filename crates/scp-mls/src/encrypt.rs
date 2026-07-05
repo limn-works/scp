@@ -25,10 +25,12 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use openmls::prelude::*;
+use scp_clock::Clock;
 use tls_codec::{Deserialize as TlsDeserializeTrait, Serialize as TlsSerializeTrait};
 
 use crate::error::MlsError;
 use crate::group::ScpMlsGroup;
+use crate::lifetime::validate_key_package_lifetime;
 
 /// The result of decrypting an MLS protocol message.
 ///
@@ -298,9 +300,21 @@ pub fn decrypt_with_sender_key(
 /// fails (including credential parsing failure).
 /// Returns [`MlsError::CommitProcessingFailed`] if a staged commit cannot be
 /// merged after processing.
+/// Returns [`MlsError::KeyPackageLifetimeInvalid`] if a Commit's Add proposal
+/// carries a `KeyPackage` whose `Lifetime` fails validation against the injected
+/// clock; the staged commit is dropped **without merging** (ADR-057 §Prereq-1).
+///
+/// # Arguments
+///
+/// * `clock` - The injected hardened [`Clock`]. For a Commit, each Add
+///   proposal's `KeyPackage` `Lifetime` is re-validated against it *before*
+///   `merge_staged_commit`, so an add carrying a forged/expired lifetime is
+///   rejected pre-merge — the openmls internal `Lifetime::is_valid` that ran
+///   during `process_message` is on the un-injectable (wasm: unhardened) clock.
 pub fn decrypt_with_sender_did(
     group: &mut ScpMlsGroup,
     ciphertext: &[u8],
+    clock: &dyn Clock,
 ) -> Result<DecryptedContent, MlsError> {
     if group.group.is_none() {
         return Err(MlsError::GroupDestroyed);
@@ -359,6 +373,19 @@ pub fn decrypt_with_sender_did(
             sender_did,
         }),
         ProcessedMessageContent::StagedCommitMessage(staged_commit) => {
+            // SECURITY (ADR-057 §Prereq-1): re-validate each Add proposal's
+            // KeyPackage `Lifetime` against the injected hardened clock BEFORE
+            // merging. openmls validated these lifetimes during
+            // `process_message` against its own un-injectable (wasm: unhardened)
+            // clock; this bracket adds the hardened check + the RFC 9420
+            // max-range bound. On failure we return WITHOUT merging, so the
+            // group stays on its current epoch (fail-closed, not half-applied) —
+            // the same shape as the Remove-refusal in
+            // `decrypt_with_membership_changes`.
+            for add in staged_commit.add_proposals() {
+                validate_key_package_lifetime(add.add_proposal().key_package().life_time(), clock)?;
+            }
+
             // Merge the staged commit to advance the group epoch. Without
             // this call, process_message has consumed the message but the
             // group state is not updated, corrupting the MLS group.
@@ -543,9 +570,21 @@ fn credential_to_did(credential: &Credential) -> Result<String, MlsError> {
 /// merged. A Remove-bearing Commit does not error here — it is surfaced as
 /// [`InboundChange::UnsupportedMembershipChange`] without merging, leaving the
 /// group consistent.
+/// Returns [`MlsError::KeyPackageLifetimeInvalid`] if an add-only Commit's Add
+/// proposal carries a `KeyPackage` whose `Lifetime` fails validation against the
+/// injected clock; the staged commit is dropped **without merging** (ADR-057
+/// §Prereq-1).
+///
+/// # Arguments
+///
+/// * `clock` - The injected hardened [`Clock`]. For an add-only Commit, each Add
+///   proposal's `KeyPackage` `Lifetime` is re-validated against it *before*
+///   `merge_staged_commit`, mirroring the openmls-independent hardening in
+///   [`decrypt_with_sender_did`] and [`crate::group::add_member`].
 pub fn decrypt_with_membership_changes(
     group: &mut ScpMlsGroup,
     ciphertext: &[u8],
+    clock: &dyn Clock,
 ) -> Result<InboundChange, MlsError> {
     if group.group.is_none() {
         return Err(MlsError::GroupDestroyed);
@@ -652,11 +691,20 @@ pub fn decrypt_with_membership_changes(
             // process_message (a Commit carrying an invalid Add is rejected
             // above), so the DIDs are cryptographically authenticated, not
             // advisory.
+            //
+            // SECURITY (ADR-057 §Prereq-1): re-validate each Add proposal's
+            // KeyPackage `Lifetime` against the injected hardened clock (plus the
+            // RFC 9420 max-range bound) BEFORE merging. process_message ran
+            // openmls's own `Lifetime::is_valid` on its un-injectable (wasm:
+            // unhardened) clock; this bracket is the hardened counterpart. On
+            // failure we return WITHOUT merging (via `?`), leaving the group on
+            // its current epoch — fail-closed, consistent with the Remove path
+            // above.
             let mut added_dids = Vec::new();
             for add in staged_commit.add_proposals() {
-                let did =
-                    credential_to_did(add.add_proposal().key_package().leaf_node().credential())?;
-                added_dids.push(did);
+                let key_package = add.add_proposal().key_package();
+                validate_key_package_lifetime(key_package.life_time(), clock)?;
+                added_dids.push(credential_to_did(key_package.leaf_node().credential())?);
             }
 
             // Only now — having confirmed the change is add-only and supported —
@@ -700,6 +748,7 @@ mod tests {
     use super::*;
     use crate::credential::ScpCredential;
     use crate::group::{add_member, create_group, generate_key_package, join_group};
+    use scp_clock::SystemClock;
 
     #[allow(clippy::unwrap_used)]
     fn test_credential(name: &str) -> ScpCredential {
@@ -716,13 +765,14 @@ mod tests {
     #[allow(clippy::unwrap_used)]
     fn setup_alice_bob() -> (ScpMlsGroup, ScpMlsGroup) {
         let alice_cred = test_credential("alice");
-        let mut alice_group = create_group(&alice_cred).unwrap();
+        let mut alice_group = create_group(&alice_cred, &SystemClock).unwrap();
 
         let bob_cred = test_credential("bob");
-        let (bob_kp_bundle, bob_signer, bob_provider) = generate_key_package(&bob_cred).unwrap();
+        let (bob_kp_bundle, bob_signer, bob_provider) =
+            generate_key_package(&bob_cred, &SystemClock).unwrap();
         let bob_kp: KeyPackageIn = bob_kp_bundle.key_package().clone().into();
 
-        let add_result = add_member(&mut alice_group, bob_kp).unwrap();
+        let add_result = add_member(&mut alice_group, bob_kp, &SystemClock).unwrap();
 
         // Bob joins using the Welcome message.
         let bob_group = join_group(&add_result.welcome, bob_provider, bob_signer).unwrap();
@@ -772,7 +822,7 @@ mod tests {
         // Alice/Bob's group) and encrypt a message there. This produces
         // a ciphertext with a membership tag from wrong epoch secrets.
         let charlie_cred = test_credential("charlie");
-        let mut charlie_group = create_group(&charlie_cred).unwrap();
+        let mut charlie_group = create_group(&charlie_cred, &SystemClock).unwrap();
 
         // Add a dummy member so Charlie can encrypt (OpenMLS may require
         // at least 2 members, but single-member encrypt should work too).
@@ -939,7 +989,7 @@ mod tests {
         let ct_msg = encrypt(&mut alice_group, plaintext).unwrap();
         let ct_bytes = serialize_ciphertext(&ct_msg).unwrap();
 
-        let content = decrypt_with_sender_did(&mut bob_group, &ct_bytes).unwrap();
+        let content = decrypt_with_sender_did(&mut bob_group, &ct_bytes, &SystemClock).unwrap();
         assert!(
             matches!(&content, DecryptedContent::Application { .. }),
             "expected Application variant"
@@ -961,13 +1011,14 @@ mod tests {
     #[allow(clippy::unwrap_used)]
     fn decrypt_with_sender_did_handles_commit_without_corruption() {
         let alice_cred = test_credential("alice");
-        let mut alice_group = create_group(&alice_cred).unwrap();
+        let mut alice_group = create_group(&alice_cred, &SystemClock).unwrap();
 
         let bob_cred = test_credential("bob");
-        let (bob_kp_bundle, bob_signer, bob_provider) = generate_key_package(&bob_cred).unwrap();
+        let (bob_kp_bundle, bob_signer, bob_provider) =
+            generate_key_package(&bob_cred, &SystemClock).unwrap();
         let bob_kp: KeyPackageIn = bob_kp_bundle.key_package().clone().into();
 
-        let add_result = add_member(&mut alice_group, bob_kp).unwrap();
+        let add_result = add_member(&mut alice_group, bob_kp, &SystemClock).unwrap();
         let mut bob_group = join_group(&add_result.welcome, bob_provider, bob_signer).unwrap();
 
         // Record Bob's epoch before Alice's update.
@@ -992,7 +1043,7 @@ mod tests {
         let commit_bytes = commit_msg.tls_serialize_detached().unwrap();
 
         // Bob processes the Commit through decrypt_with_sender_did.
-        let content = decrypt_with_sender_did(&mut bob_group, &commit_bytes).unwrap();
+        let content = decrypt_with_sender_did(&mut bob_group, &commit_bytes, &SystemClock).unwrap();
         assert!(
             matches!(&content, DecryptedContent::Commit { .. }),
             "expected Commit variant"
@@ -1016,7 +1067,7 @@ mod tests {
         let plaintext = b"post-commit message";
         let ct_msg = encrypt(&mut alice_group, plaintext).unwrap();
         let ct_bytes = serialize_ciphertext(&ct_msg).unwrap();
-        let content = decrypt_with_sender_did(&mut bob_group, &ct_bytes).unwrap();
+        let content = decrypt_with_sender_did(&mut bob_group, &ct_bytes, &SystemClock).unwrap();
         assert!(
             matches!(&content, DecryptedContent::Application { .. }),
             "expected Application variant after Commit"
@@ -1034,22 +1085,24 @@ mod tests {
         // DID (recovered from the Add proposal's KeyPackage), so an existing
         // member can mirror the committer's MemberJoined leaf and converge.
         let alice_cred = test_credential("alice");
-        let mut alice_group = create_group(&alice_cred).unwrap();
+        let mut alice_group = create_group(&alice_cred, &SystemClock).unwrap();
 
         let bob_cred = test_credential("bob");
-        let (bob_kp_bundle, bob_signer, bob_provider) = generate_key_package(&bob_cred).unwrap();
+        let (bob_kp_bundle, bob_signer, bob_provider) =
+            generate_key_package(&bob_cred, &SystemClock).unwrap();
         let bob_kp: KeyPackageIn = bob_kp_bundle.key_package().clone().into();
-        let add_bob = add_member(&mut alice_group, bob_kp).unwrap();
+        let add_bob = add_member(&mut alice_group, bob_kp, &SystemClock).unwrap();
         let mut bob_group = join_group(&add_bob.welcome, bob_provider, bob_signer).unwrap();
 
         let carol_cred = test_credential("carol");
         let (carol_kp_bundle, _carol_signer, _carol_provider) =
-            generate_key_package(&carol_cred).unwrap();
+            generate_key_package(&carol_cred, &SystemClock).unwrap();
         let carol_kp: KeyPackageIn = carol_kp_bundle.key_package().clone().into();
-        let add_carol = add_member(&mut alice_group, carol_kp).unwrap();
+        let add_carol = add_member(&mut alice_group, carol_kp, &SystemClock).unwrap();
 
         let commit_bytes = add_carol.commit.tls_serialize_detached().unwrap();
-        let change = decrypt_with_membership_changes(&mut bob_group, &commit_bytes).unwrap();
+        let change =
+            decrypt_with_membership_changes(&mut bob_group, &commit_bytes, &SystemClock).unwrap();
 
         match change {
             InboundChange::Commit {
@@ -1079,25 +1132,31 @@ mod tests {
         // tree) WITHOUT merging — so Bob's MLS group stays on its current epoch
         // and is left consistent (fail-closed, not half-applied).
         let alice_cred = test_credential("alice");
-        let mut alice_group = create_group(&alice_cred).unwrap();
+        let mut alice_group = create_group(&alice_cred, &SystemClock).unwrap();
 
         let bob_cred = test_credential("bob");
-        let (bob_kp_bundle, bob_signer, bob_provider) = generate_key_package(&bob_cred).unwrap();
-        let add_bob =
-            add_member(&mut alice_group, bob_kp_bundle.key_package().clone().into()).unwrap();
+        let (bob_kp_bundle, bob_signer, bob_provider) =
+            generate_key_package(&bob_cred, &SystemClock).unwrap();
+        let add_bob = add_member(
+            &mut alice_group,
+            bob_kp_bundle.key_package().clone().into(),
+            &SystemClock,
+        )
+        .unwrap();
         let mut bob_group = join_group(&add_bob.welcome, bob_provider, bob_signer).unwrap();
 
         let carol_cred = test_credential("carol");
         let (carol_kp_bundle, _carol_signer, _carol_provider) =
-            generate_key_package(&carol_cred).unwrap();
+            generate_key_package(&carol_cred, &SystemClock).unwrap();
         let add_carol = add_member(
             &mut alice_group,
             carol_kp_bundle.key_package().clone().into(),
+            &SystemClock,
         )
         .unwrap();
         let add_carol_bytes = add_carol.commit.tls_serialize_detached().unwrap();
         // Bob processes the add-Carol commit so his tree contains Carol.
-        decrypt_with_membership_changes(&mut bob_group, &add_carol_bytes).unwrap();
+        decrypt_with_membership_changes(&mut bob_group, &add_carol_bytes, &SystemClock).unwrap();
 
         // Alice removes Carol.
         let alice_own = alice_group.own_leaf_index().unwrap();
@@ -1120,7 +1179,8 @@ mod tests {
         // so we can prove the rejected remove did NOT advance it.
         let bob_epoch_before = bob_group.epoch().unwrap();
 
-        let change = decrypt_with_membership_changes(&mut bob_group, &remove_bytes).unwrap();
+        let change =
+            decrypt_with_membership_changes(&mut bob_group, &remove_bytes, &SystemClock).unwrap();
         match change {
             InboundChange::UnsupportedMembershipChange {
                 sender_did,
@@ -1158,7 +1218,8 @@ mod tests {
         let (mut alice_group, mut bob_group) = setup_alice_bob();
         let ct = encrypt(&mut alice_group, b"hi").unwrap();
         let ct_bytes = serialize_ciphertext(&ct).unwrap();
-        let change = decrypt_with_membership_changes(&mut bob_group, &ct_bytes).unwrap();
+        let change =
+            decrypt_with_membership_changes(&mut bob_group, &ct_bytes, &SystemClock).unwrap();
         match change {
             InboundChange::Application {
                 plaintext,
@@ -1190,6 +1251,80 @@ mod tests {
             rendered.contains("<redacted") && rendered.contains(&format!("{} bytes", secret.len())),
             "Debug must report a redacted byte length, got: {rendered}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // ADR-057 §Prereq-1: staged-commit Add-proposal Lifetime bracketing
+    // -----------------------------------------------------------------------
+    //
+    // A Commit whose Add proposal carries a KeyPackage with an expired Lifetime
+    // (relative to the injected hardened clock) must be refused BEFORE merging —
+    // the receiver's MLS epoch stays put (fail-closed), even though openmls's own
+    // internal validation (real clock) accepted the Add during process_message.
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn decrypt_with_sender_did_rejects_expired_add_commit_without_merging() {
+        let real_now = SystemClock.now_secs();
+        let (mut alice_group, mut bob_group) = setup_alice_bob();
+        let bob_epoch_before = bob_group.epoch().unwrap();
+
+        // Carol's KP is minted at real-now (not_after ~ real-now + 84d).
+        let carol_cred = test_credential("carol");
+        let (carol_kp_bundle, _s, _p) = generate_key_package(&carol_cred, &SystemClock).unwrap();
+        let carol_kp: KeyPackageIn = carol_kp_bundle.key_package().clone().into();
+        let add_carol = add_member(&mut alice_group, carol_kp, &SystemClock).unwrap();
+        let commit_bytes = add_carol.commit.tls_serialize_detached().unwrap();
+
+        // Bob processes with a clock 100 days ahead: Carol's KP is expired
+        // relative to the injected clock, so the add-commit is refused pre-merge.
+        let hundred_days = 100 * 24 * 60 * 60;
+        let future = scp_clock::TestClock::new(real_now + hundred_days);
+        let err = decrypt_with_sender_did(&mut bob_group, &commit_bytes, &future).unwrap_err();
+        assert!(
+            matches!(err, MlsError::KeyPackageLifetimeInvalid { .. }),
+            "expected KeyPackageLifetimeInvalid, got {err:?}"
+        );
+        assert_eq!(
+            bob_group.epoch().unwrap(),
+            bob_epoch_before,
+            "a refused add-commit must NOT advance the receiver's epoch (no half-merge)"
+        );
+
+        // The group stays usable on the old epoch.
+        let ct = encrypt(&mut bob_group, b"still works").unwrap();
+        let _ = serialize_ciphertext(&ct).unwrap();
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used, clippy::panic)]
+    fn decrypt_with_membership_changes_rejects_expired_add_commit_without_merging() {
+        let real_now = SystemClock.now_secs();
+        let (mut alice_group, mut bob_group) = setup_alice_bob();
+        let bob_epoch_before = bob_group.epoch().unwrap();
+
+        let carol_cred = test_credential("carol");
+        let (carol_kp_bundle, _s, _p) = generate_key_package(&carol_cred, &SystemClock).unwrap();
+        let carol_kp: KeyPackageIn = carol_kp_bundle.key_package().clone().into();
+        let add_carol = add_member(&mut alice_group, carol_kp, &SystemClock).unwrap();
+        let commit_bytes = add_carol.commit.tls_serialize_detached().unwrap();
+
+        let hundred_days = 100 * 24 * 60 * 60;
+        let future = scp_clock::TestClock::new(real_now + hundred_days);
+        let err =
+            decrypt_with_membership_changes(&mut bob_group, &commit_bytes, &future).unwrap_err();
+        assert!(
+            matches!(err, MlsError::KeyPackageLifetimeInvalid { .. }),
+            "expected KeyPackageLifetimeInvalid, got {err:?}"
+        );
+        assert_eq!(
+            bob_group.epoch().unwrap(),
+            bob_epoch_before,
+            "a refused add-commit must NOT advance the receiver's epoch (no half-merge)"
+        );
+
+        let ct = encrypt(&mut bob_group, b"still works").unwrap();
+        let _ = serialize_ciphertext(&ct).unwrap();
     }
 
     mod proptest_tests {

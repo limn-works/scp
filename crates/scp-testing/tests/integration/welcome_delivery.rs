@@ -37,8 +37,14 @@ fn cross_process_welcome_delivery() {
     let context_id = scp_core::context::context_id_bytes(context_id_str);
 
     // Create Alice's and Bob's crypto providers (separate "processes").
-    let alice_crypto = MlsCryptoProvider::new(alice_did.to_string());
-    let bob_crypto = MlsCryptoProvider::new(bob_did.to_string());
+    let alice_crypto = MlsCryptoProvider::new(
+        alice_did.to_string(),
+        std::sync::Arc::new(scp_clock::SystemClock),
+    );
+    let bob_crypto = MlsCryptoProvider::new(
+        bob_did.to_string(),
+        std::sync::Arc::new(scp_clock::SystemClock),
+    );
 
     // Alice creates the MLS group and generates her sender key.
     alice_crypto.create_mls_group(&context_id).unwrap();
@@ -149,8 +155,14 @@ fn join_time_sender_key_distribution_uses_management_channel() {
     let context_id_str = "sender-key-mgmt-channel-ctx";
     let context_id = scp_core::context::context_id_bytes(context_id_str);
 
-    let alice_crypto = MlsCryptoProvider::new(alice_did.to_string());
-    let bob_crypto = MlsCryptoProvider::new(bob_did.to_string());
+    let alice_crypto = MlsCryptoProvider::new(
+        alice_did.to_string(),
+        std::sync::Arc::new(scp_clock::SystemClock),
+    );
+    let bob_crypto = MlsCryptoProvider::new(
+        bob_did.to_string(),
+        std::sync::Arc::new(scp_clock::SystemClock),
+    );
 
     // Alice creates the group and her sender key.
     alice_crypto.create_mls_group(&context_id).unwrap();
@@ -249,11 +261,17 @@ fn welcome_bytes_nonempty_with_key_package() {
     let bob_did = "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo";
     let context_id = [0x01u8; 32];
 
-    let alice_crypto = MlsCryptoProvider::new(alice_did.to_string());
+    let alice_crypto = MlsCryptoProvider::new(
+        alice_did.to_string(),
+        std::sync::Arc::new(scp_clock::SystemClock),
+    );
     alice_crypto.create_mls_group(&context_id).unwrap();
     alice_crypto.generate_sender_key(&context_id).unwrap();
 
-    let bob_crypto = MlsCryptoProvider::new(bob_did.to_string());
+    let bob_crypto = MlsCryptoProvider::new(
+        bob_did.to_string(),
+        std::sync::Arc::new(scp_clock::SystemClock),
+    );
     let bob_kp_bytes = bob_crypto.prepare_key_package_for_join().unwrap();
 
     let output = alice_crypto
@@ -278,7 +296,10 @@ fn welcome_bytes_nonempty_with_key_package() {
 
 #[test]
 fn join_from_welcome_without_prepare_fails() {
-    let bob_crypto = MlsCryptoProvider::new("did:dht:z6MkBob".to_string());
+    let bob_crypto = MlsCryptoProvider::new(
+        "did:dht:z6MkBob".to_string(),
+        std::sync::Arc::new(scp_clock::SystemClock),
+    );
     let context_id = [0x02u8; 32];
 
     // Attempt to join without ever calling prepare_key_package_for_join.
@@ -328,10 +349,14 @@ fn routing_id_determinism() {
 
 #[test]
 fn prepare_replaces_previous_key_package() {
-    let bob_crypto =
-        MlsCryptoProvider::new("did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo".to_string());
-    let alice_crypto =
-        MlsCryptoProvider::new("did:dht:z6MkAliceAliceAliceAliceAliceAliceAliceAlic".to_string());
+    let bob_crypto = MlsCryptoProvider::new(
+        "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo".to_string(),
+        std::sync::Arc::new(scp_clock::SystemClock),
+    );
+    let alice_crypto = MlsCryptoProvider::new(
+        "did:dht:z6MkAliceAliceAliceAliceAliceAliceAliceAlic".to_string(),
+        std::sync::Arc::new(scp_clock::SystemClock),
+    );
     let context_id = [0xAA; 32];
 
     alice_crypto.create_mls_group(&context_id).unwrap();

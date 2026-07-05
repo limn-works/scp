@@ -5397,6 +5397,7 @@ name = "scp-media"
 version = "0.1.0-beta.2"
 dependencies = [
  "openmls_traits 0.5.0",
+ "scp-clock",
  "scp-core",
  "scp-did",
  "scp-identity",

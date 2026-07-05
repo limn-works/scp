@@ -227,7 +227,7 @@ async fn alice_bob_encrypted_message_via_relay() {
     // ---------------------------------------------------------------
     let alice_cred =
         ScpCredential::new(alice_id.did.clone(), None, scp_did::SigningKeyId::Active).unwrap();
-    let mut alice_group = create_group(&alice_cred).unwrap();
+    let mut alice_group = create_group(&alice_cred, &scp_clock::SystemClock).unwrap();
 
     // ---------------------------------------------------------------
     // Step 4: Alice generates a sender key and publishes epoch advance (ADR-007)
@@ -258,13 +258,14 @@ async fn alice_bob_encrypted_message_via_relay() {
     // ---------------------------------------------------------------
     let bob_cred =
         ScpCredential::new(bob_id.did.clone(), None, scp_did::SigningKeyId::Active).unwrap();
-    let (bob_kp_bundle, bob_signer, bob_provider) = generate_key_package(&bob_cred).unwrap();
+    let (bob_kp_bundle, bob_signer, bob_provider) =
+        generate_key_package(&bob_cred, &scp_clock::SystemClock).unwrap();
 
     // ---------------------------------------------------------------
     // Step 6: Alice adds Bob to the group using his key package (ADR-001)
     // ---------------------------------------------------------------
     let bob_kp_in: openmls::prelude::KeyPackageIn = bob_kp_bundle.key_package().clone().into();
-    let add_result = add_member(&mut alice_group, bob_kp_in).unwrap();
+    let add_result = add_member(&mut alice_group, bob_kp_in, &scp_clock::SystemClock).unwrap();
 
     // Bob joins the group via the Welcome message.
     let mut bob_group = join_group(&add_result.welcome, bob_provider, bob_signer).unwrap();

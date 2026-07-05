@@ -21,5 +21,10 @@ thiserror = { workspace = true }
 sha2 = { workspace = true }
 zeroize = { workspace = true }
 
+[dev-dependencies]
+# Test-only: supplies `SystemClock` for the MLS group fixtures, which now take
+# an injected `Clock` for KeyPackage `Lifetime` stamping (ADR-057 §Prereq-1).
+scp-clock = { path = "../scp-clock", version = "=0.1.0-beta.2" }
+
 [lints]
 workspace = true

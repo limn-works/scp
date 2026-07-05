@@ -211,6 +211,7 @@ mod tests {
     use super::*;
     use crate::credential::ScpCredential;
     use crate::group::{add_member, create_group, generate_key_package, join_group};
+    use scp_clock::SystemClock;
 
     #[allow(clippy::unwrap_used)]
     fn test_credential(name: &str) -> ScpCredential {
@@ -227,13 +228,14 @@ mod tests {
     #[allow(clippy::unwrap_used)]
     fn setup_alice_bob() -> (ScpMlsGroup, ScpMlsGroup) {
         let alice_cred = test_credential("alice");
-        let mut alice_group = create_group(&alice_cred).unwrap();
+        let mut alice_group = create_group(&alice_cred, &SystemClock).unwrap();
 
         let bob_cred = test_credential("bob");
-        let (bob_kp_bundle, bob_signer, bob_provider) = generate_key_package(&bob_cred).unwrap();
+        let (bob_kp_bundle, bob_signer, bob_provider) =
+            generate_key_package(&bob_cred, &SystemClock).unwrap();
         let bob_kp: KeyPackageIn = bob_kp_bundle.key_package().clone().into();
 
-        let add_result = add_member(&mut alice_group, bob_kp).unwrap();
+        let add_result = add_member(&mut alice_group, bob_kp, &SystemClock).unwrap();
 
         let bob_group = join_group(&add_result.welcome, bob_provider, bob_signer).unwrap();
 

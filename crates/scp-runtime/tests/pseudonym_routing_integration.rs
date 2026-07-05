@@ -144,7 +144,10 @@ fn ceiling() -> Vec<Capability> {
 
 fn manager_with_transport(transport: Arc<RecordingTransport>) -> std::sync::Arc<Supervisor> {
     scp_runtime::context::test_supervisor(
-        Arc::new(MlsCryptoProvider::new(ALICE.to_owned())),
+        Arc::new(MlsCryptoProvider::new(
+            ALICE.to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
+        )),
         Box::new(TransportShim(transport)),
         Box::new(MockEventLog),
         mock_key_resolver(),

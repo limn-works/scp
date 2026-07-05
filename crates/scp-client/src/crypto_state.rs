@@ -29,6 +29,7 @@
 
 use std::collections::HashMap;
 
+use scp_clock::Clock;
 use scp_mls::ScpMlsGroup;
 use scp_mls::encrypt::{
     InboundChange, decrypt_with_membership_changes, encrypt, serialize_ciphertext,
@@ -288,11 +289,17 @@ impl ContextCryptoState {
     /// malformed, the epoch exceeds the ceiling, the message is a
     /// replay/reorder, the sender's key is not in the store, or AEAD
     /// verification fails.
-    pub fn decrypt_message(&mut self, ciphertext: &[u8]) -> Result<Inbound, ClientError> {
+    pub fn decrypt_message(
+        &mut self,
+        ciphertext: &[u8],
+        clock: &dyn Clock,
+    ) -> Result<Inbound, ClientError> {
         // Layer 2 (outer): MLS decrypt + classify. `scp-mls` merges any staged
         // commit internally (recovering its Add/Remove DIDs before the merge)
-        // and surfaces the sender DID from the credential.
-        let decrypted = decrypt_with_membership_changes(&mut self.mls_group, ciphertext)?;
+        // and surfaces the sender DID from the credential. `clock` re-validates
+        // any add-Commit's KeyPackage `Lifetime` against the hardened driver
+        // clock before merge (ADR-057 §Prereq-1).
+        let decrypted = decrypt_with_membership_changes(&mut self.mls_group, ciphertext, clock)?;
         let (sender_did, framed) = match decrypted {
             InboundChange::Application {
                 plaintext,
@@ -386,6 +393,7 @@ impl ContextCryptoState {
 mod tests {
     use super::*;
     use openmls::prelude::KeyPackageIn;
+    use scp_clock::SystemClock;
     use scp_did::SigningKeyId;
     use scp_mls::group::{add_member, create_group, generate_key_package, join_group};
     use scp_mls::{ScpCredential, SignatureKeyPair};
@@ -404,14 +412,16 @@ mod tests {
     /// MLS group, with sender keys exchanged both ways.
     #[allow(clippy::unwrap_used)]
     fn alice_and_bob() -> (ContextCryptoState, ContextCryptoState) {
-        let mut alice =
-            ContextCryptoState::from_group(CTX, create_group(&credential(ALICE)).unwrap());
+        let mut alice = ContextCryptoState::from_group(
+            CTX,
+            create_group(&credential(ALICE), &SystemClock).unwrap(),
+        );
 
         let (bundle, signer, provider): (_, SignatureKeyPair, _) =
-            generate_key_package(&credential(BOB)).unwrap();
+            generate_key_package(&credential(BOB), &SystemClock).unwrap();
         let kp_bytes = bundle.key_package().tls_serialize_detached().unwrap();
         let kp_in = KeyPackageIn::tls_deserialize(&mut &*kp_bytes).unwrap();
-        let result = add_member(&mut alice.mls_group, kp_in).unwrap();
+        let result = add_member(&mut alice.mls_group, kp_in, &SystemClock).unwrap();
 
         let bob_group = join_group(&result.welcome, provider, signer).unwrap();
         let mut bob = ContextCryptoState::from_group(CTX, bob_group);
@@ -427,7 +437,7 @@ mod tests {
     fn full_double_encryption_round_trip() {
         let (mut alice, mut bob) = alice_and_bob();
         let ct = alice.encrypt_message(b"hello bob", ALICE, 0).unwrap();
-        match bob.decrypt_message(&ct).unwrap() {
+        match bob.decrypt_message(&ct, &SystemClock).unwrap() {
             Inbound::Application {
                 sender_did,
                 plaintext,
@@ -450,17 +460,19 @@ mod tests {
         // second Commit.
         const CAROL: &str = "did:key:z6MkCarolCryptoStateUnitFixtureCCCCCCCCC";
 
-        let mut alice =
-            ContextCryptoState::from_group(CTX, create_group(&credential(ALICE)).unwrap());
+        let mut alice = ContextCryptoState::from_group(
+            CTX,
+            create_group(&credential(ALICE), &SystemClock).unwrap(),
+        );
 
         // Carol joins as an existing member.
         let (carol_bundle, carol_signer, carol_provider): (_, SignatureKeyPair, _) =
-            generate_key_package(&credential(CAROL)).unwrap();
+            generate_key_package(&credential(CAROL), &SystemClock).unwrap();
         let carol_kp_in = KeyPackageIn::tls_deserialize(
             &mut &*carol_bundle.key_package().tls_serialize_detached().unwrap(),
         )
         .unwrap();
-        let add_carol = add_member(&mut alice.mls_group, carol_kp_in).unwrap();
+        let add_carol = add_member(&mut alice.mls_group, carol_kp_in, &SystemClock).unwrap();
         let mut carol = ContextCryptoState::from_group(
             CTX,
             join_group(&add_carol.welcome, carol_provider, carol_signer).unwrap(),
@@ -468,15 +480,15 @@ mod tests {
 
         // Alice adds Bob; Carol (existing member) processes the Commit.
         let (bob_bundle, _bob_signer, _bob_provider): (_, SignatureKeyPair, _) =
-            generate_key_package(&credential(BOB)).unwrap();
+            generate_key_package(&credential(BOB), &SystemClock).unwrap();
         let bob_kp_in = KeyPackageIn::tls_deserialize(
             &mut &*bob_bundle.key_package().tls_serialize_detached().unwrap(),
         )
         .unwrap();
-        let add_bob = add_member(&mut alice.mls_group, bob_kp_in).unwrap();
+        let add_bob = add_member(&mut alice.mls_group, bob_kp_in, &SystemClock).unwrap();
         let commit_bytes = add_bob.commit.tls_serialize_detached().unwrap();
 
-        match carol.decrypt_message(&commit_bytes).unwrap() {
+        match carol.decrypt_message(&commit_bytes, &SystemClock).unwrap() {
             Inbound::Commit {
                 sender_did,
                 added_dids,
@@ -497,15 +509,15 @@ mod tests {
         let ct1_dup = alice.encrypt_message(b"first-again", ALICE, 1).unwrap();
 
         assert!(
-            bob.decrypt_message(&ct2).is_ok(),
+            bob.decrypt_message(&ct2, &SystemClock).is_ok(),
             "newer seq accepted first"
         );
         assert!(
-            bob.decrypt_message(&ct1).is_err(),
+            bob.decrypt_message(&ct1, &SystemClock).is_err(),
             "older (epoch,seq) rejected as reorder/replay"
         );
         assert!(
-            bob.decrypt_message(&ct1_dup).is_err(),
+            bob.decrypt_message(&ct1_dup, &SystemClock).is_err(),
             "duplicate (epoch,seq) rejected"
         );
     }
@@ -515,18 +527,23 @@ mod tests {
     fn failed_decrypt_does_not_advance_tracker() {
         // Bob lacks Alice's sender key, so the first decrypt fails at the inner
         // layer and must not advance the replay floor.
-        let mut alice =
-            ContextCryptoState::from_group(CTX, create_group(&credential(ALICE)).unwrap());
+        let mut alice = ContextCryptoState::from_group(
+            CTX,
+            create_group(&credential(ALICE), &SystemClock).unwrap(),
+        );
         let (bundle, signer, provider): (_, SignatureKeyPair, _) =
-            generate_key_package(&credential(BOB)).unwrap();
+            generate_key_package(&credential(BOB), &SystemClock).unwrap();
         let kp_bytes = bundle.key_package().tls_serialize_detached().unwrap();
         let kp_in = KeyPackageIn::tls_deserialize(&mut &*kp_bytes).unwrap();
-        let result = add_member(&mut alice.mls_group, kp_in).unwrap();
+        let result = add_member(&mut alice.mls_group, kp_in, &SystemClock).unwrap();
         let bob_group = join_group(&result.welcome, provider, signer).unwrap();
         let mut bob = ContextCryptoState::from_group(CTX, bob_group);
 
         let ct = alice.encrypt_message(b"one", ALICE, 1).unwrap();
-        assert!(bob.decrypt_message(&ct).is_err(), "no sender key → fails");
+        assert!(
+            bob.decrypt_message(&ct, &SystemClock).is_err(),
+            "no sender key → fails"
+        );
         assert!(
             !bob.recv_sequence_tracker.contains_key(ALICE),
             "a failed decrypt must not advance the tracker"
@@ -535,7 +552,7 @@ mod tests {
         // After receiving the key out-of-band, a fresh send at seq 1 decrypts.
         bob.insert_sender_key(ALICE, SenderKey::from_bytes(alice.local_sender_key_bytes()));
         let ct_b = alice.encrypt_message(b"one-b", ALICE, 1).unwrap();
-        assert!(bob.decrypt_message(&ct_b).is_ok());
+        assert!(bob.decrypt_message(&ct_b, &SystemClock).is_ok());
     }
 
     #[test]
@@ -546,7 +563,7 @@ mod tests {
         alice.sender_key_epoch = u64::MAX;
         let poisoned = alice.encrypt_message(b"poison", ALICE, 0).unwrap();
         assert!(
-            bob.decrypt_message(&poisoned).is_err(),
+            bob.decrypt_message(&poisoned, &SystemClock).is_err(),
             "epoch beyond store.epoch + MAX_EPOCH_ADVANCE must be rejected"
         );
         assert!(

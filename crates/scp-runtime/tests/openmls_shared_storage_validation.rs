@@ -143,7 +143,9 @@ async fn assertions_1_through_4_distinct_namespaces_no_corruption() {
     // ProductionMlsBackend uses its own per-call provider so
     // shared-storage exhaustion is exercised below.
 
-    let backend = Arc::new(ProductionMlsBackend::new());
+    let backend = Arc::new(ProductionMlsBackend::new(std::sync::Arc::new(
+        scp_clock::SystemClock,
+    )));
 
     // Spawn N concurrent actors.
     let mut tasks = Vec::with_capacity(N);
