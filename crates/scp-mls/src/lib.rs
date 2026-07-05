@@ -54,8 +54,7 @@ pub mod wrapping_extension;
 // Re-export primary public API types for convenience.
 pub use convergent_timestamp::{
     CONVERGENT_TIMESTAMP_AAD_LEN, CONVERGENT_TIMESTAMP_AAD_MAGIC, CONVERGENT_TIMESTAMP_AAD_VERSION,
-    MAX_AGE_SECS, MAX_FUTURE_SKEW_SECS, decode_convergent_timestamp_aad,
-    encode_convergent_timestamp_aad, validate_convergent_timestamp,
+    decode_convergent_timestamp_aad, encode_convergent_timestamp_aad,
 };
 pub use credential::ScpCredential;
 pub use encrypt::{DecryptedContent, InboundChange};

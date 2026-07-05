@@ -409,7 +409,7 @@ mod tests {
     use crate::ScpCredential;
     use crate::group::{add_member, create_group, generate_key_package, join_group};
     use openmls::prelude::KeyPackageIn;
-    use scp_clock::{Clock, SystemClock};
+    use scp_clock::SystemClock;
     use scp_did::SigningKeyId;
     use tls_codec::{Deserialize as TlsDeserialize, Serialize as TlsSerialize};
 
@@ -443,10 +443,7 @@ mod tests {
 
     #[test]
     fn restored_group_still_encrypts_and_decrypts() {
-        use crate::encrypt::{
-            decrypt_with_membership_changes, encrypt_with_convergent_timestamp,
-            serialize_ciphertext,
-        };
+        use crate::encrypt::{decrypt_with_membership_changes, encrypt, serialize_ciphertext};
 
         // Alice creates a two-member group so the restored group can decrypt a
         // message a peer sent — proving the epoch secrets survived the snapshot.
@@ -464,21 +461,12 @@ mod tests {
         let blob = bob.serialize_state().unwrap();
         let mut restored_bob = ScpMlsGroup::deserialize_state(&blob).unwrap();
 
-        // Alice sends (binding a convergent timestamp into the AAD, ADR-057);
-        // the RESTORED Bob must decrypt it and recover the authenticated timestamp.
-        let ts = SystemClock.now_secs();
-        let ct = serialize_ciphertext(
-            &encrypt_with_convergent_timestamp(&mut alice, b"after restore", ts).unwrap(),
-        )
-        .unwrap();
+        // Alice sends a plain application message (ADR-011: `MessageSent` is not a
+        // convergent leaf, so it binds no AAD); the RESTORED Bob must decrypt it.
+        let ct = serialize_ciphertext(&encrypt(&mut alice, b"after restore").unwrap()).unwrap();
         match decrypt_with_membership_changes(&mut restored_bob, &ct, &SystemClock).unwrap() {
-            crate::InboundChange::Application {
-                plaintext,
-                committer_timestamp_secs,
-                ..
-            } => {
+            crate::InboundChange::Application { plaintext, .. } => {
                 assert_eq!(plaintext, b"after restore");
-                assert_eq!(committer_timestamp_secs, ts);
             }
             other => panic!("expected an application message, got {other:?}"),
         }

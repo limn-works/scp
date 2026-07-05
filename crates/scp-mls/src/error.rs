@@ -161,31 +161,4 @@ pub enum MlsError {
     /// (ADR-057).
     #[error("convergent committer timestamp malformed: {0}")]
     ConvergentTimestampMalformed(String),
-
-    /// An **authenticated** convergent committer timestamp lies outside the
-    /// receiver-side plausibility window around the injected
-    /// [`Clock`](scp_clock::Clock): it is more than `max_future_skew_secs` ahead
-    /// of, or more than `max_age_secs` behind, the observed `now_secs`. Raised by
-    /// [`validate_convergent_timestamp`](crate::convergent_timestamp::validate_convergent_timestamp).
-    /// The AAD binding proved the committer *authored* this value; this bounds a
-    /// lying-but-authenticated committer. The frame is **rejected, not clamped**
-    /// (clamping to local time would diverge each receiver's Merkle root —
-    /// ADR-057).
-    #[error(
-        "convergent committer timestamp implausible: timestamp_secs={timestamp_secs}, \
-         now_secs={now_secs}, max_future_skew_secs={max_future_skew_secs}, \
-         max_age_secs={max_age_secs}"
-    )]
-    ConvergentTimestampImplausible {
-        /// The authenticated committer timestamp that failed the window check
-        /// (Unix seconds).
-        timestamp_secs: u64,
-        /// The current time read from the injected clock at validation (Unix
-        /// seconds).
-        now_secs: u64,
-        /// The maximum accepted future skew (seconds).
-        max_future_skew_secs: u64,
-        /// The maximum accepted age (seconds).
-        max_age_secs: u64,
-    },
 }
