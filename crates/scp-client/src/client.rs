@@ -524,7 +524,7 @@ impl ScpClient {
     ///
     /// # `MessageSent` is not a convergent event-log leaf
     ///
-    /// Per ADR-011 exclusion taxonomy §2 (`.docs/specs/phase-2.md`), an
+    /// Per ADR-011 exclusion taxonomy §2 (`.docs/adrs/phase-2.md`), an
     /// application message is per-author with no total delivery order over a real
     /// relay, so it is **excluded** from the canonical §9.9.3 Merkle log: it is
     /// local `ContextEvent` history only (as on the native path, until ADR-051).

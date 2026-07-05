@@ -234,8 +234,9 @@ impl ContextSnapshot {
     ///
     /// Returns [`ClientError::Mls`] if the MLS group state cannot be serialized
     /// (destroyed group, poisoned provider lock), or [`ClientError::Driver`] if
-    /// the receive buffer holds an event other than `MessageReceived` (an
-    /// internal invariant violation — the driver only ever buffers that variant).
+    /// the receive buffer holds an event other than `MessageSent` or
+    /// `MessageReceived` (an internal invariant violation — the driver only ever
+    /// buffers those two variants).
     pub fn capture(
         context_id: &str,
         owner_did: &str,

@@ -425,7 +425,7 @@ pub enum InboundChange {
     ///
     /// Application messages are **not** convergent event-log leaves (ADR-011
     /// exclusion taxonomy §2: `MessageSent` is per-author with no total delivery
-    /// order — see `.docs/specs/phase-2.md`), so they bind no convergent
+    /// order — see `.docs/adrs/phase-2.md`), so they bind no convergent
     /// timestamp: they are plain-encrypted and carry no AAD. The receiver records
     /// the message as local history, not as a Merkle leaf.
     Application {
@@ -1457,10 +1457,11 @@ mod tests {
         // Alice adds Carol with the REAL clock (so her side accepts Carol's KP,
         // whose not_after ~ real_now + 84d) but binds a convergent timestamp at
         // `real_now + 90d`. Bob then receives with a clock at that same +90d
-        // value: the AAD is valid against Bob's clock (skew 0), so the ORDER
-        // (AAD → Lifetime bracket) surfaces the *Lifetime* failure — Carol's KP
-        // is expired at +90d — not a timestamp failure. This isolates the
-        // pre-merge Lifetime bracket from the convergent-timestamp window check.
+        // value. The convergent timestamp in the AAD is adopted verbatim — there
+        // is no receiver-side clock verdict on it — so the only clock-sensitive
+        // check on this path is the MLS KeyPackage `Lifetime` bracket, which
+        // surfaces the *Lifetime* failure: Carol's KP is expired at +90d. This
+        // isolates the pre-merge Lifetime bracket; it is not a timestamp failure.
         let ninety_days = 90 * 24 * 60 * 60;
         let future_ts = real_now + ninety_days;
         let add_carol = add_member_with_convergent_timestamp(
@@ -1574,6 +1575,58 @@ mod tests {
             bob_group.epoch().unwrap(),
             bob_epoch_before,
             "a rejected (forged) add-Commit must NOT advance the epoch"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used, clippy::panic, clippy::expect_used)]
+    fn forged_add_commit_aad_region_flip_is_decryption_failed() {
+        // Strictly stronger than the tag-region flip above: this mutates a byte
+        // INSIDE the transmitted convergent-timestamp AAD blob itself, not the
+        // trailing AEAD tag. The AAD rides in `PrivateMessage.authenticated_data`,
+        // which RFC 9420 §6.3.2 folds into the AEAD's associated data — so
+        // altering the timestamp bytes on the wire breaks the tag and the frame
+        // is rejected as DecryptionFailed at `process_message`, BEFORE the value
+        // is ever decoded. This pins that the timestamp *field* is bound, not
+        // merely that the frame carries an intact tag.
+        use crate::convergent_timestamp::encode_convergent_timestamp_aad;
+
+        let (mut alice_group, mut bob_group) = setup_alice_bob();
+        let bob_epoch_before = bob_group.epoch().unwrap();
+
+        let carol_cred = test_credential("carol");
+        let (carol_kp_bundle, _s, _p) = generate_key_package(&carol_cred, &SystemClock).unwrap();
+        let carol_kp: KeyPackageIn = carol_kp_bundle.key_package().clone().into();
+        // A distinctive timestamp so its encoded AAD blob is unambiguously
+        // locatable in the cleartext `authenticated_data` on the wire.
+        let ts: u64 = 0x0102_0304_0506_0708;
+        let add_carol =
+            add_member_with_convergent_timestamp(&mut alice_group, carol_kp, &SystemClock, ts)
+                .unwrap();
+        let mut bytes = add_carol.commit.tls_serialize_detached().unwrap();
+
+        // Locate the 13-byte AAD blob (`SCPT` || version || u64-BE ts) and flip a
+        // byte inside its timestamp field — proof the transmitted AAD is present
+        // in the clear AND bound by the tag.
+        let aad_blob = encode_convergent_timestamp_aad(ts);
+        let aad_offset = bytes
+            .windows(aad_blob.len())
+            .position(|w| w == aad_blob)
+            .expect("the convergent-timestamp AAD blob must ride in the clear on the wire");
+        // Offset +5 is the first timestamp byte: magic[0..4] || version[4] || ts[5..13].
+        bytes[aad_offset + 5] ^= 0xFF;
+
+        let err =
+            decrypt_with_membership_changes(&mut bob_group, &bytes, &SystemClock).unwrap_err();
+        assert!(
+            matches!(err, MlsError::DecryptionFailed(_)),
+            "flipping a byte inside the authenticated timestamp AAD must fail the AEAD \
+             tag (DecryptionFailed), proving the timestamp field is bound, got {err:?}"
+        );
+        assert_eq!(
+            bob_group.epoch().unwrap(),
+            bob_epoch_before,
+            "a rejected (AAD-tampered) add-Commit must NOT advance the epoch"
         );
     }
 

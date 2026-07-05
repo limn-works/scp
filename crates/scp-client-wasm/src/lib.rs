@@ -383,7 +383,7 @@ impl WasmScpClient {
     /// Throws `[SCP-CTX-2001]` if the context is not held, `[SCP-CTX-2003]` if
     /// the Commit removes a member (out of Slice 2 scope; rejected pre-merge so
     /// the context stays consistent), or a `[SCP-CRYPTO-…]` error on failure
-    /// (including a missing / malformed / implausible convergent-timestamp AAD —
+    /// (including a missing or malformed convergent-timestamp AAD —
     /// `[SCP-CRYPTO-4040]`). A `[SCP-STORAGE-8010]` on the post-receive snapshot
     /// write **poisons** the context (the decrypt advanced the ratchet but the new
     /// state was not durably recorded), and `[SCP-STORAGE-8013]` is thrown if the

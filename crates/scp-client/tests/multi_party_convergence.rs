@@ -423,9 +423,9 @@ fn remove_commit_is_rejected_fail_closed_without_skew() {
     )
     .expect("carol kp deserialize");
     // The add path converges + appends a MemberJoined leaf on Bob, so the raw
-    // Commit must carry a convergent-timestamp AAD (ADR-057) plausible
-    // against Bob's clock (`base`, well inside his window); Bob recovers it from
-    // the verified AAD.
+    // Commit must carry a convergent-timestamp AAD (ADR-057) that Bob adopts
+    // verbatim: he recovers it from the verified AAD, with no receiver-side
+    // clock verdict on the value.
     let add_carol =
         add_member_with_convergent_timestamp(&mut alice_group, carol_kp_in, &SystemClock, base)
             .expect("Alice adds Carol");
