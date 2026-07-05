@@ -19,6 +19,7 @@
 use std::ops::Deref;
 
 use crate::InMemoryMlsProvider;
+use crate::convergent_timestamp::encode_convergent_timestamp_aad;
 use crate::credential::ScpCredential;
 use crate::error::MlsError;
 use crate::lifetime::{key_package_lifetime, validate_key_package_lifetime};
@@ -498,6 +499,69 @@ pub fn add_member(
         welcome,
         group_info,
     })
+}
+
+/// Adds a member, binding a **convergent committer timestamp** into the Commit's
+/// MLS AAD so existing members recover it authenticated (ADR-057).
+///
+/// Identical to [`add_member`] except it sets the group's ephemeral AAD to the
+/// 13-byte convergent-timestamp blob
+/// ([`encode_convergent_timestamp_aad`](crate::convergent_timestamp::encode_convergent_timestamp_aad))
+/// immediately before delegating. openmls folds that AAD into the Commit's
+/// `FramedContent.authenticated_data`, which is covered by the committer's leaf
+/// signature (and, under the `PURE_CIPHERTEXT` policy, the AEAD tag), so an
+/// existing member reading the value back from [`decrypt_with_membership_changes`]
+/// gets it authenticated — not trusted on the wire. The added member does not
+/// need the AAD: its copy of the timestamp already rides inside the replayed
+/// event log.
+///
+/// # AAD lifecycle
+///
+/// openmls's `set_aad` is ephemeral — it is reset automatically only on an API
+/// call that *successfully* returns an `MlsMessageOut`. This function therefore
+/// **clears the AAD on error** so a failed add cannot leak the timestamp into a
+/// subsequent unrelated send/commit on the same group.
+///
+/// The existing [`add_member`] is left untouched: the native runtime is a
+/// consumer of it and does not use the AAD-binding path (its convergent timestamp
+/// rides inside a signed SCP envelope).
+///
+/// # Arguments
+///
+/// * `group` - The MLS group to add the member to. Must be active.
+/// * `key_package` - The new member's pre-published `KeyPackage`.
+/// * `clock` - The injected hardened [`Clock`] for the `Lifetime` re-validation
+///   [`add_member`] performs (ADR-057 §Prereq-1).
+/// * `timestamp_secs` - The convergent committer timestamp (Unix seconds) to bind
+///   into the Commit AAD. The committer stamps the same value on its own
+///   `MemberJoined` leaf.
+///
+/// # Errors
+///
+/// Same as [`add_member`]. On any error the ephemeral AAD is cleared before the
+/// error is returned.
+pub fn add_member_with_convergent_timestamp(
+    group: &mut ScpMlsGroup,
+    key_package: KeyPackageIn,
+    clock: &dyn Clock,
+    timestamp_secs: u64,
+) -> Result<AddMemberResult, MlsError> {
+    let aad = encode_convergent_timestamp_aad(timestamp_secs);
+    {
+        let g = group.group.as_mut().ok_or(MlsError::GroupDestroyed)?;
+        g.set_aad(aad.to_vec());
+    }
+    let result = add_member(group, key_package, clock);
+    if result.is_err() {
+        // openmls resets the ephemeral AAD only on a successful MlsMessageOut;
+        // on error it persists, so clear it to prevent leaking the timestamp
+        // into the next op. (If the group was destroyed, there is nothing to
+        // clear.)
+        if let Some(g) = group.group.as_mut() {
+            g.set_aad(Vec::new());
+        }
+    }
+    result
 }
 
 /// Extracts the SCP DID embedded in a fully-validated `KeyPackage`'s leaf

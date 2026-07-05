@@ -25,6 +25,8 @@
 //!
 //! - [`group`] — Group lifecycle: create, add member, remove member, destroy.
 //! - [`credential`] — SCP credential type (DID + UCAN) for MLS `LeafNode` fields.
+//! - [`convergent_timestamp`] — Authenticated convergent committer timestamp
+//!   carried in the MLS AAD (ADR-057).
 //! - [`encrypt`] — Application-message encrypt/decrypt over the MLS group.
 //! - [`ratchet`] — Commit processing and epoch advance.
 //! - [`key_package`] — Single-use `KeyPackage` buffer management.
@@ -37,6 +39,7 @@
 //! See ADR-001 in `.docs/adrs/phase-1.md` for the MLS wrapper design and
 //! ADR-057 for the `scp-mls` extraction.
 
+pub mod convergent_timestamp;
 pub mod credential;
 pub mod encrypt;
 pub mod epoch_grace;
@@ -49,6 +52,11 @@ pub mod snapshot;
 pub mod wrapping_extension;
 
 // Re-export primary public API types for convenience.
+pub use convergent_timestamp::{
+    CONVERGENT_TIMESTAMP_AAD_LEN, CONVERGENT_TIMESTAMP_AAD_MAGIC, CONVERGENT_TIMESTAMP_AAD_VERSION,
+    MAX_AGE_SECS, MAX_FUTURE_SKEW_SECS, decode_convergent_timestamp_aad,
+    encode_convergent_timestamp_aad, validate_convergent_timestamp,
+};
 pub use credential::ScpCredential;
 pub use encrypt::{DecryptedContent, InboundChange};
 pub use error::MlsError;
@@ -58,9 +66,10 @@ pub use error::MlsError;
 // consumers — notably the in-browser participant driver (ADR-057) — can name
 // the type without taking a direct dependency on `openmls_basic_credential`.
 pub use group::{
-    AddMemberResult, RemoveMemberResult, SCP_CIPHERSUITE, ScpMlsGroup, add_member, create_group,
-    create_group_with_wrapping_key, destroy_group, generate_key_package,
-    generate_key_package_with_wrapping_key, join_group, key_package_in_did, remove_member,
+    AddMemberResult, RemoveMemberResult, SCP_CIPHERSUITE, ScpMlsGroup, add_member,
+    add_member_with_convergent_timestamp, create_group, create_group_with_wrapping_key,
+    destroy_group, generate_key_package, generate_key_package_with_wrapping_key, join_group,
+    key_package_in_did, remove_member,
 };
 pub use lifetime::{
     KEY_PACKAGE_LIFETIME_MARGIN_SECS, KEY_PACKAGE_LIFETIME_MAX_RANGE_SECS,
