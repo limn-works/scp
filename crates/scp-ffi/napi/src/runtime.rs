@@ -1775,6 +1775,40 @@ pub async fn sync_role_state_from_manager(
     })
 }
 
+/// Re-syncs the `UcanContextState.core.ceiling_strings` for a context from the
+/// AUTHENTICATED context params carried by a joined
+/// [`ContextHandle`](scp_core::context::ContextHandle).
+///
+/// Peer of [`sync_role_state_from_manager`] (which syncs role state); this syncs
+/// the UCAN/tool capability-check ceiling string set. Used by
+/// [`crate::context::context_join_from_welcome_on`]: the joiner no longer
+/// supplies a ceiling, so the FFI state is registered with the DEFAULT ceiling as
+/// a reversible precheck, then this overwrites it with the ceiling AUTHENTICATED
+/// by the joined MLS group's signed context binding. The ceiling entries are
+/// normalized to their enforced UCAN capability-name form (`{resource}:{action}`),
+/// matching the set [`build_ucan_context_state`] builds on the create path.
+/// Mirrors the `PyO3` reference bridge's `sync_ceiling_from_params`.
+///
+/// # Errors
+///
+/// Returns `ScpNapiError::Context` if the context's FFI state is not registered
+/// (unreachable on the join success path — the state was just registered and not
+/// removed).
+pub fn sync_ceiling_from_params(
+    bi: &NapiBridgeInstance,
+    context_id: &str,
+    ceiling: &[scp_core::context::roles::Capability],
+) -> Result<(), ScpNapiError> {
+    let ceiling_strings: HashSet<String> = ceiling
+        .iter()
+        .map(scp_core::context::roles::Capability::ucan_capability_name)
+        .collect();
+    with_context(bi, context_id, |st| {
+        st.core.ceiling_strings = ceiling_strings;
+        Ok(())
+    })
+}
+
 /// Registers a tool handler for a tool in a context.
 ///
 /// The handler will be called when the tool is invoked. The tool must already

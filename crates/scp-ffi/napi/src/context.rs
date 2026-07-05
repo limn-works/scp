@@ -1049,6 +1049,164 @@ pub struct NapiKeyPackageReservation {
     pub key_package_public: Vec<u8>,
 }
 
+/// A sealed, signed invitation bundle (ADR-049 Phase 2J; FFI-02 Option A).
+///
+/// The wire artifact produced by [`invite_member_on`] on the creator side and
+/// consumed by [`context_join_from_welcome_on`] on the joiner side. Flat
+/// named-field object per the agent-first API tenet, mirroring the `PyO3`
+/// reference bridge's `PySealedInvitation` and the runtime wire type
+/// [`SealedInvitation`](scp_core::context::invitation_helpers::SealedInvitation):
+/// `enc` is the RFC 9180 HPKE encapsulated key (32 bytes) and `ciphertext` is
+/// the HPKE ciphertext (`ct = ciphertext || tag`) of the serialized, signed
+/// `InvitationBundle`. Both are opaque bytes — the joiner does not interpret
+/// them; the runtime opens the bundle and authenticates it. `context_id` /
+/// `creator_did` are UNTRUSTED binding hints used only to rebuild the HPKE
+/// `info`/`aad`; authority derives from the signed bundle after the open.
+#[napi(object)]
+pub struct NapiSealedInvitation {
+    /// Binding hint: the context id the bundle was sealed for.
+    pub context_id: String,
+    /// Binding hint: the creator DID the bundle was sealed by.
+    pub creator_did: String,
+    /// RFC 9180 HPKE encapsulated key (`enc`). Length is validated to be
+    /// exactly 32 bytes at the join boundary (fail-closed).
+    pub enc: Vec<u8>,
+    /// RFC 9180 HPKE ciphertext (`ct = ciphertext || tag`).
+    pub ciphertext: Vec<u8>,
+}
+
+/// The outcome of [`invite_member_on`].
+///
+/// `kind` is the discriminant — EXACTLY `"sealed"` or
+/// `"requiresGovernanceApproval"` (canonical tag strings mirrored across all
+/// bridges — see the `PyO3` reference `PyInviteMemberOutcome`). For `"sealed"`,
+/// `enc`/`ciphertext`/`delivered` are present and `proposal_id` is `None`; the
+/// caller (or transport) delivers the sealed `(enc, ciphertext)` bundle to the
+/// invitee. For `"requiresGovernanceApproval"` — a first-class SUCCESS outcome,
+/// NOT an error — the invite is deferred to a governance vote; `proposal_id`
+/// carries the tracked proposal id (hex-encoded) when one exists (`None` today,
+/// reserved).
+#[napi(object)]
+pub struct NapiInviteMemberOutcome {
+    /// The outcome discriminant: `"sealed"` or `"requiresGovernanceApproval"`.
+    pub kind: String,
+    /// The HPKE encapsulated key (`enc`), or `None` when the invite requires
+    /// governance approval.
+    pub enc: Option<Vec<u8>>,
+    /// The HPKE ciphertext (`ct`), or `None` when the invite requires
+    /// governance approval.
+    pub ciphertext: Option<Vec<u8>>,
+    /// Whether the runtime published the sealed invitation to the invitee's
+    /// routing id (`true`) or the caller must deliver it (`false`). `None` when
+    /// the invite requires governance approval.
+    pub delivered: Option<bool>,
+    /// The tracked governance proposal id (hex-encoded), when one exists.
+    pub proposal_id: Option<String>,
+}
+
+impl NapiInviteMemberOutcome {
+    /// Maps a runtime
+    /// [`InviteMemberOutcome`](scp_core::context::supervisor::InviteMemberOutcome)
+    /// to its flat bridge projection. Mirrors the `PyO3` reference bridge's
+    /// `PyInviteMemberOutcome::from_outcome` exactly (same tag strings, same
+    /// field presence per variant).
+    fn from_outcome(outcome: scp_core::context::supervisor::InviteMemberOutcome) -> Self {
+        use scp_core::context::supervisor::InviteMemberOutcome;
+        match outcome {
+            InviteMemberOutcome::Sealed {
+                enc,
+                ciphertext,
+                delivered,
+            } => Self {
+                kind: "sealed".to_owned(),
+                enc: Some(enc.to_vec()),
+                ciphertext: Some(ciphertext),
+                delivered: Some(delivered),
+                proposal_id: None,
+            },
+            InviteMemberOutcome::RequiresGovernanceApproval { proposal_id } => Self {
+                kind: "requiresGovernanceApproval".to_owned(),
+                enc: None,
+                ciphertext: None,
+                delivered: None,
+                proposal_id: proposal_id.map(hex::encode),
+            },
+        }
+    }
+}
+
+/// The handle-facing string projections of an AUTHENTICATED
+/// [`ContextParams`](scp_core::context::ContextParams), used to rebuild a
+/// [`NapiContextHandle`] from the params the creator actually signed (never from
+/// caller input). Peer of the `PyO3` reference bridge's
+/// `PyContextParams::from_core_params`, restricted to the fields the NAPI handle
+/// carries. String forms match this bridge's own conventions (capitalized
+/// `mode`, snake-case `governance`/`ceilingPolicy`/`promotionPolicy`) so the
+/// Welcome-joined handle is indistinguishable from a created/joined one.
+struct CoreParamHandleFields {
+    mode: String,
+    ceiling: Vec<String>,
+    ceiling_policy: String,
+    ttl_seconds: Option<u64>,
+    promotion_policy: Option<String>,
+    governance: String,
+    economic_policy: Option<String>,
+}
+
+/// Projects an authenticated [`ContextParams`](scp_core::context::ContextParams)
+/// into the [`NapiContextHandle`] string fields. Ceiling entries are normalized
+/// to their enforced UCAN capability-name form (`{resource}:{action}`), matching
+/// the `context_create` / `context_join` handle-build sites.
+fn handle_fields_from_core_params(
+    params: &scp_core::context::ContextParams,
+) -> CoreParamHandleFields {
+    use scp_core::context::params::{CeilingPolicy, ContextMode, GovernanceModel, PromotionPolicy};
+
+    let mode = match params.mode {
+        ContextMode::Encrypted => "Encrypted",
+        ContextMode::Broadcast => "Broadcast",
+    }
+    .to_owned();
+    let ceiling_policy = match params.ceiling_policy {
+        CeilingPolicy::Governed => "governed",
+        CeilingPolicy::Immutable => "immutable",
+    }
+    .to_owned();
+    let promotion_policy = Some(
+        match params.promotion_policy {
+            PromotionPolicy::Promotable => "promotable",
+            PromotionPolicy::NoPromotion => "no_promotion",
+        }
+        .to_owned(),
+    );
+    let governance = match params.governance {
+        GovernanceModel::SingleAdmin => "single_admin",
+        GovernanceModel::Threshold { .. } => "threshold",
+        GovernanceModel::Majority { .. } => "majority",
+        GovernanceModel::Unanimity { .. } => "unanimity",
+    }
+    .to_owned();
+    let ceiling: Vec<String> = params
+        .ceiling
+        .iter()
+        .map(scp_core::context::roles::Capability::ucan_capability_name)
+        .collect();
+    let economic_policy = params
+        .economic_policy
+        .as_ref()
+        .and_then(|ep| serde_json::to_string(ep).ok());
+
+    CoreParamHandleFields {
+        mode,
+        ceiling,
+        ceiling_policy,
+        ttl_seconds: params.ttl.map(|d| d.as_secs()),
+        promotion_policy,
+        governance,
+        economic_policy,
+    }
+}
+
 /// Bridge-level local-custody gate for the bare-`DID` join-side bootstraps
 /// ([`reserve_key_package_on`] / [`context_join_from_welcome_on`]), mirroring
 /// the `PyO3` reference bridge's `ensure_local_custody` and the trust model of
@@ -1126,38 +1284,21 @@ pub(crate) async fn reserve_key_package_on(
 pub(crate) async fn context_join_from_welcome_on(
     bi: &Arc<NapiBridgeInstance>,
     owning_did: String,
-    creator_did: String,
-    context_id: String,
-    params_json: String,
+    sealed: NapiSealedInvitation,
     reservation_id: String,
-    welcome_bytes: Vec<u8>,
 ) -> napi::Result<NapiContextHandle> {
     validate_did(&owning_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
-    validate_did(&creator_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
-    scp_ffi_common::validate::validate_context_id(&context_id)
+    validate_did(&sealed.creator_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+    scp_ffi_common::validate::validate_context_id(&sealed.context_id)
         .map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
 
-    // Parse legible params eagerly (before any async work), via the shared
-    // helper `context_create_on` also uses.
-    let parsed = parse_context_params(&params_json)?;
-
-    // Welcome-join is ENCRYPTED-only. A broadcast context carries no MLS Welcome
-    // (it is a per-author AES-GCM channel, spec §5.14), so a broadcast `params`
-    // would otherwise fail deep at the fused `ConfirmConsume` (no reserved
-    // KeyPackage / no Welcome to consume). Reject a non-Encrypted mode up front —
-    // before deriving the pseudonym, resolving the supervisor, or registering any
-    // reversible bridge state.
-    if !matches!(
-        parsed.core.mode,
-        scp_core::context::params::ContextMode::Encrypted
-    ) {
-        return Err(NapiError::from(ScpNapiError::Validation {
-            message: "context_join_from_welcome requires an encrypted context; broadcast \
-                      contexts are not Welcome-joined (spec §5.14)"
-                .to_owned(),
-            code: codes::VALID_7150.to_owned(),
-        }));
-    }
+    // NOTE: the joiner no longer supplies `params`/`welcome_bytes`. The
+    // authoritative params + Welcome now travel INSIDE the signed, sealed
+    // `InvitationBundle` (`sealed.enc`/`sealed.ciphertext`), which the runtime
+    // opens and authenticates. The old up-front broadcast-mode check is gone:
+    // there are no caller params to inspect, and a broadcast bundle (which
+    // carries no MLS Welcome, spec §5.14) is rejected INSIDE the runtime at the
+    // fused `ConfirmConsume` — not at this boundary.
 
     // spawn-from-Welcome always stands up an ENCRYPTED context; ensure the
     // node's supervisor is attached first (may be the joiner's first context op
@@ -1168,7 +1309,22 @@ pub(crate) async fn context_join_from_welcome_on(
     // from its locally-custodied identity — never caller-supplied. This is the
     // SAME custody gate context_create uses; a non-custodied joiner hard-fails
     // here with SCP-IDENT-1054 BEFORE the single-use KeyPackage is consumed.
-    let local_pseudonym = derive_member_pseudonym_required(bi, &owning_did, &context_id).await?;
+    let local_pseudonym =
+        derive_member_pseudonym_required(bi, &owning_did, &sealed.context_id).await?;
+
+    // Fail-closed: the HPKE encapsulated key (`enc`) MUST be exactly 32 bytes.
+    // Reject a malformed length BEFORE any registry mutation or the irreversible
+    // KeyPackage consume, rather than letting a short/long buffer fail deep
+    // inside the HPKE open.
+    let sealed_bundle_enc =
+        scp_ffi_common::custody_parse::expect_32("sealed_bundle_enc", &sealed.enc).map_err(
+            |e| {
+                NapiError::from(ScpNapiError::Validation {
+                    message: e.to_string(),
+                    code: codes::VALID_7005.to_owned(),
+                })
+            },
+        )?;
 
     // Reconstruct the opaque reservation id via its sanctioned transparent serde
     // form (a bare string). It is a lookup key, not a capability — a bogus id
@@ -1187,10 +1343,22 @@ pub(crate) async fn context_join_from_welcome_on(
     // resolving it AFTER `register_ffi_state` would leak the just-registered
     // (reversible) state with no rollback on its failure, and a later same-id
     // retry would then hard-fail the Occupied check. Order: custody-derive
-    // (above) → supervisor-resolve → register-reversible → spawn →
-    // rollback-on-Err.
+    // (above) → supervisor-resolve → custody+active-key resolve →
+    // register-reversible → spawn → rollback-on-Err → authenticated ceiling
+    // re-sync.
     let sup = crate::runtime::supervisor(bi)?;
     let sup = Arc::clone(sup);
+
+    // Resolve the joiner's OWN custody provider + `#active` KeyHandle (the same
+    // locally-custodied identity the pseudonym was derived from). The runtime
+    // needs these to open the sealed bundle and drive the join under the joiner's
+    // key material — private keys never cross the FFI, only the opaque custody
+    // handle + KeyHandle do (ADR-006). Retained (custody `Arc` cloned,
+    // `KeyHandle` is `Copy`) so the returned handle can sign subsequent ops.
+    let (custody, active_handle) = crate::runtime::with_identity(bi, &owning_did, |entry| {
+        Ok((entry.custody.clone(), entry.identity.active_signing_key))
+    })
+    .map_err(NapiError::from)?;
 
     // Register the bridge-side FFI state (UCAN validation state) as a REVERSIBLE
     // precheck BEFORE the irreversible runtime join. Mirrors the PyO3 reference,
@@ -1199,45 +1367,62 @@ pub(crate) async fn context_join_from_welcome_on(
     // (Occupied) — that collision fails the join HERE, BEFORE
     // `spawn_actor_from_welcome` consumes the single-use KeyPackage, and leaves
     // any pre-existing entry untouched (never roll back state we did not create).
-    crate::runtime::register_ffi_state(bi, &context_id, &creator_did, &parsed.ceiling)
+    //
+    // FLAG-1: the caller no longer supplies a ceiling, so register with the
+    // DEFAULT ceiling (`&[]`). The Occupied dedup is keyed on `context_id`, so
+    // the "detect a duplicate BEFORE consuming the single-use KeyPackage"
+    // crash-safety is preserved regardless of the ceiling. The AUTHENTICATED
+    // ceiling is re-synced from the joined handle's signed params AFTER a
+    // successful spawn (see `sync_ceiling_from_params` below).
+    crate::runtime::register_ffi_state(bi, &sealed.context_id, &sealed.creator_did, &[])
         .map_err(NapiError::from)?;
     // Insert the joiner as a member of the freshly-registered role state. On the
     // (practically unreachable) failure of this insert into state we just
     // created, roll it back so a failed join leaves nothing behind.
-    if let Err(e) = crate::runtime::with_context(bi, &context_id, |st| {
+    if let Err(e) = crate::runtime::with_context(bi, &sealed.context_id, |st| {
         st.role_state.members.insert(owning_did.clone());
         Ok(())
     }) {
-        crate::runtime::remove_context(bi, &context_id);
+        crate::runtime::remove_context(bi, &sealed.context_id);
         return Err(NapiError::from(e));
     }
 
     let req = scp_core::context::supervisor::WelcomeJoinRequest {
-        creator_did: DID(creator_did.clone()),
-        context_id: context_id.clone(),
-        params: parsed.core,
+        creator_did: DID(sealed.creator_did.clone()),
+        context_id: sealed.context_id.clone(),
+        sealed_bundle_enc,
+        sealed_bundle_ct: sealed.ciphertext.clone(),
         reservation_id: reservation,
-        welcome_bytes,
         local_pseudonym: Some(local_pseudonym),
     };
-    // Irreversible: consume the KeyPackage, install the joined MLS group, persist
-    // the keyed snapshot, register the context actor. On failure, roll the
-    // reversible FFI state (and — via `remove_context` → `remove_known_context`
-    // — any known-context discovery entry) back so an errored join leaves no
-    // orphaned bridge state beside a runtime that never committed.
+    // Irreversible: open + authenticate the sealed bundle, consume the
+    // KeyPackage, install the joined MLS group, persist the keyed snapshot,
+    // register the context actor. On failure, roll the reversible FFI state
+    // (and — via `remove_context` → `remove_known_context` — any known-context
+    // discovery entry) back so an errored join leaves no orphaned bridge state
+    // beside a runtime that never committed.
     let core_handle = match sup
-        .spawn_actor_from_welcome(DID(owning_did.clone()), req)
+        .spawn_actor_from_welcome(DID(owning_did.clone()), &*custody, &active_handle, req)
         .await
     {
         Ok(handle) => handle,
         Err(e) => {
-            crate::runtime::remove_context(bi, &context_id);
+            crate::runtime::remove_context(bi, &sealed.context_id);
             return Err(NapiError::from(ScpNapiError::Context {
                 message: format!("context_join_from_welcome failed: {e}"),
                 code: codes::CTX_2013.to_owned(),
             }));
         }
     };
+
+    // FLAG-1: re-sync the AUTHENTICATED ceiling from the joined handle's signed
+    // params, overwriting the default ceiling used for the reversible precheck.
+    // The authoritative ceiling lives in the bundle the creator signed — never in
+    // caller input. This runs AFTER the irreversible commit; the FFI state was
+    // just registered (and not removed on this success path), so the sync targets
+    // a live entry.
+    crate::runtime::sync_ceiling_from_params(bi, &sealed.context_id, &core_handle.params().ceiling)
+        .map_err(NapiError::from)?;
 
     // Runtime join committed. Register the context in the known-contexts
     // discovery registry so a Welcome-joined context is surfaced by discovery,
@@ -1261,7 +1446,7 @@ pub(crate) async fn context_join_from_welcome_on(
         }
     };
     bi.core.register_known_context(
-        &context_id,
+        &sealed.context_id,
         scp_ffi_common::bridge_instance::KnownContext {
             routing_id: local_pseudonym,
             relay_url,
@@ -1270,35 +1455,25 @@ pub(crate) async fn context_join_from_welcome_on(
         },
     );
 
-    // Resolve the joiner's retained custody + signing key so the returned handle
-    // can sign subsequent context ops (send / export). The custody gate above
-    // already proved the joiner is locally custodied, so this lookup succeeds.
-    let (in_memory_custody, signing_key) =
-        crate::runtime::with_identity(bi, &owning_did, |entry| {
-            Ok((
-                Some(entry.custody.clone()),
-                Some(entry.identity.active_signing_key),
-            ))
-        })
-        .map_err(NapiError::from)?;
-
+    // Build the returned handle from the AUTHENTICATED params carried by the
+    // joined MLS group's signed context binding — NOT from caller input (there is
+    // none). The ceiling, mode, governance, and policies reflect what the creator
+    // actually signed. The custody + `#active` KeyHandle resolved above are
+    // retained so the handle can sign subsequent context ops (send / export).
+    let fields = handle_fields_from_core_params(core_handle.params());
     let handle = NapiContextHandle {
-        context_id,
+        context_id: sealed.context_id,
         state: std::sync::Mutex::new(ContextState::Active),
-        creator_did,
-        mode: parsed.mode,
-        ceiling: parsed
-            .ceiling
-            .iter()
-            .map(|s| scp_core::context::roles::Capability::new(s).ucan_capability_name())
-            .collect(),
-        ceiling_policy: parsed.ceiling_policy,
-        ttl_seconds: parsed.ttl_seconds,
-        promotion_policy: parsed.promotion_policy,
-        governance: parsed.governance,
-        economic_policy: parsed.economic_policy,
-        in_memory_custody,
-        signing_key,
+        creator_did: sealed.creator_did,
+        mode: fields.mode,
+        ceiling: fields.ceiling,
+        ceiling_policy: fields.ceiling_policy,
+        ttl_seconds: fields.ttl_seconds,
+        promotion_policy: fields.promotion_policy,
+        governance: fields.governance,
+        economic_policy: fields.economic_policy,
+        in_memory_custody: Some(custody),
+        signing_key: Some(active_handle),
         core_handle: Some(core_handle),
         subscription_cancel: std::sync::Mutex::new(CancellationToken::new()),
         subscription_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1307,6 +1482,83 @@ pub(crate) async fn context_join_from_welcome_on(
     };
     increment_handle_count();
     Ok(handle)
+}
+
+/// Per-bridge-instance implementation of `invite_member` (ADR-049 Phase 2J;
+/// FFI-02 Option A).
+///
+/// The creator (or admin) seals the context's genesis params + Welcome for the
+/// invitee under RFC 9180 HPKE, binding them to the invitee's `KeyPackage`. For
+/// a `SingleAdmin` context the invite is unilateral and returns a `"sealed"`
+/// outcome carrying `(enc, ciphertext)`; for a voting context it returns
+/// `"requiresGovernanceApproval"` (a SUCCESS outcome, not an error — the invite
+/// is deferred to a governance vote). Mirrors the `PyO3` reference bridge's
+/// `invite_member` exactly.
+///
+/// The inviter MUST be a locally-custodied identity: the invite is signed under
+/// its `#active` key, resolved (and exported for the single runtime driver call)
+/// via the identity registry. The raw signing key is wiped the moment the invite
+/// is produced (`SigningKey` is `ZeroizeOnDrop`, so the explicit early `drop`
+/// triggers the wipe).
+pub(crate) async fn invite_member_on(
+    bi: &NapiBridgeInstance,
+    context_id: String,
+    creator_did: String,
+    invitee_did: String,
+    invitee_key_package: Vec<u8>,
+    relay_urls: Vec<String>,
+) -> napi::Result<NapiInviteMemberOutcome> {
+    scp_ffi_common::validate::validate_context_id(&context_id)
+        .map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+    validate_did(&creator_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+    validate_did(&invitee_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+
+    let sup = crate::runtime::supervisor(bi)?;
+    let sup = Arc::clone(sup);
+
+    // Resolve the inviter's retained custody + `#active` KeyHandle from the
+    // identity registry (a non-custodied inviter hard-fails here with
+    // SCP-IDENT-1001, before any context lookup), then export the raw Ed25519
+    // signing key for the single runtime driver call. Private key material never
+    // lingers past the invite (ADR-006).
+    let (custody, active_handle) = crate::runtime::with_identity(bi, &creator_did, |entry| {
+        Ok((entry.custody.clone(), entry.identity.active_signing_key))
+    })
+    .map_err(NapiError::from)?;
+    let signing_key = custody
+        .export_ed25519_signing_key(&active_handle)
+        .await
+        .map_err(|e| {
+            NapiError::from(ScpNapiError::Context {
+                message: format!("failed to export signing key for invite: {e}"),
+                code: codes::CTX_2040.to_owned(),
+            })
+        })?;
+
+    let outcome = sup
+        .invite_member(
+            context_id,
+            DID(creator_did),
+            DID(invitee_did),
+            invitee_key_package,
+            relay_urls,
+            &signing_key,
+        )
+        .await;
+    // Defense-in-depth: wipe the raw signing key the moment the invite is
+    // produced, rather than letting it linger to end-of-scope. `SigningKey` is
+    // `ZeroizeOnDrop` (ed25519-dalek `zeroize` feature) but does NOT implement
+    // bare `Zeroize`, so the explicit early `drop` — not a `.zeroize()` call —
+    // is what triggers the wipe here (matching the PyO3 reference bridge).
+    drop(signing_key);
+
+    let outcome = outcome.map_err(|e| {
+        NapiError::from(ScpNapiError::Context {
+            message: format!("invite_member failed: {e}"),
+            code: codes::CTX_2013.to_owned(),
+        })
+    })?;
+    Ok(NapiInviteMemberOutcome::from_outcome(outcome))
 }
 
 /// Per-bridge-instance implementation of [`context_leave`].
@@ -5268,14 +5520,19 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn context_join_from_welcome_rejects_non_locally_custodied_joiner() {
         let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
+        // A well-formed 32-byte `enc` so the failure isolates the custody gate
+        // (which runs BEFORE the enc-length check), not a length rejection.
+        let sealed = super::NapiSealedInvitation {
+            context_id: "0".repeat(64),
+            creator_did: "did:dht:z6MkSomeNapiCreator".to_owned(),
+            enc: vec![0u8; 32],
+            ciphertext: b"not-a-real-bundle".to_vec(),
+        };
         let Err(err) = super::context_join_from_welcome_on(
             &bi,
             "did:dht:z6MkNoSuchNapiJoinFromWelcome".to_owned(),
-            "did:dht:z6MkSomeNapiCreator".to_owned(),
-            "0".repeat(64),
-            r#"{"mode":"encrypted"}"#.to_owned(),
+            sealed,
             "not-a-real-reservation".to_owned(),
-            b"not-a-real-welcome".to_vec(),
         )
         .await
         else {
@@ -5289,41 +5546,48 @@ mod tests {
         );
     }
 
-    /// ADR-049 Phase 2J: `context_join_from_welcome` is ENCRYPTED-only. A
-    /// broadcast `params.mode` is rejected UP FRONT — before deriving the
-    /// pseudonym, resolving the supervisor, or registering any reversible bridge
-    /// state — because a broadcast context (per-author AES-GCM, spec §5.14)
-    /// carries no MLS Welcome and would otherwise fail deep at the fused
-    /// `ConfirmConsume`.
+    /// ADR-049 Phase 2J / FFI-02 Option A (reshape): the reshaped
+    /// `context_join_from_welcome` no longer takes caller `params`, so there is no
+    /// `mode` field to inspect — broadcast rejection moved INSIDE the runtime (a
+    /// broadcast context carries no MLS Welcome, spec §5.14, so it fails at the
+    /// fused `ConfirmConsume`). The NEW bridge-level fail-closed boundary is the
+    /// HPKE `enc` length: it MUST be exactly 32 bytes (RFC 9180 X25519
+    /// encapsulated key). A wrong-length `enc` is rejected BEFORE the irreversible
+    /// `KeyPackage` consume.
     ///
-    /// Not false-green: the rejection precedes the custody gate, so the joiner
-    /// DID need not be registered; were the check removed, the call would instead
-    /// reach the custody seam and fail with `SCP-IDENT-1054`, not `SCP-VALID-7150`.
-    #[tokio::test]
-    async fn context_join_from_welcome_rejects_broadcast_mode() {
+    /// Not false-green: a locally-custodied joiner is used so the custody gate
+    /// SUCCEEDS and control reaches the enc-length check; were that check removed,
+    /// the malformed `enc` would instead fail deep inside the HPKE open with a
+    /// different message, not the exact "expected 32" surfaced here.
+    #[cfg(feature = "allow_in_memory_custody")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn context_join_from_welcome_rejects_non_32_byte_enc() {
         let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
+        // Locally-custodied joiner so the pseudonym-derivation custody gate passes
+        // and control reaches the fail-closed enc-length check.
+        let joiner_did = register_in_memory_joiner(&bi).await;
+
+        // 31-byte `enc` — one short of the required 32.
+        let sealed = super::NapiSealedInvitation {
+            context_id: "c".repeat(64),
+            creator_did: "did:dht:z6MkNapiEncLenCreator".to_owned(),
+            enc: vec![0u8; 31],
+            ciphertext: b"bogus-ciphertext".to_vec(),
+        };
         let Err(err) = super::context_join_from_welcome_on(
             &bi,
-            "did:dht:z6MkSomeNapiBroadcastJoiner".to_owned(),
-            "did:dht:z6MkSomeNapiCreator".to_owned(),
-            "0".repeat(64),
-            r#"{"mode":"broadcast"}"#.to_owned(),
-            "not-a-real-reservation".to_owned(),
-            b"not-a-real-welcome".to_vec(),
+            joiner_did,
+            sealed,
+            "bogus-reservation-id".to_owned(),
         )
         .await
         else {
-            panic!("join-from-Welcome must reject a broadcast context up front");
+            panic!("a non-32-byte HPKE enc must be rejected at the bridge boundary");
         };
         let msg = err.to_string();
         assert!(
-            msg.contains(codes::VALID_7150),
-            "expected up-front broadcast rejection {}, got: {msg}",
-            codes::VALID_7150
-        );
-        assert!(
-            !msg.contains(codes::IDENT_1054),
-            "broadcast rejection must precede the custody gate; got a custody error: {msg}"
+            msg.contains("expected 32"),
+            "expected a fail-closed 32-byte enc-length rejection, got: {msg}"
         );
     }
 
@@ -5348,18 +5612,24 @@ mod tests {
         let joiner_did = register_in_memory_joiner(&bi).await;
         let ctx_id = "a".repeat(64);
 
+        // A well-formed 32-byte `enc` passes the bridge enc-length check, so the
+        // failure is the runtime join itself (bogus reservation + ciphertext) —
+        // exactly the register -> spawn seam the rollback guards.
+        let sealed = super::NapiSealedInvitation {
+            context_id: ctx_id.clone(),
+            creator_did: "did:dht:z6MkNapiRollbackCreator".to_owned(),
+            enc: vec![0u8; 32],
+            ciphertext: b"bogus-bundle-ciphertext".to_vec(),
+        };
         let Err(err) = super::context_join_from_welcome_on(
             &bi,
             joiner_did,
-            "did:dht:z6MkNapiRollbackCreator".to_owned(),
-            ctx_id.clone(),
-            r#"{"mode":"encrypted"}"#.to_owned(),
+            sealed,
             "bogus-reservation-id".to_owned(),
-            b"bogus-welcome-bytes".to_vec(),
         )
         .await
         else {
-            panic!("join with a bogus Welcome must fail at the runtime layer");
+            panic!("join with a bogus sealed bundle must fail at the runtime layer");
         };
         let msg = err.to_string();
         assert!(
@@ -5400,14 +5670,20 @@ mod tests {
         // Pre-occupy the FFI-state slot for this context id.
         crate::runtime::register_test_context(&bi, &ctx_id, "did:dht:z6MkNapiOccupiedCreator");
 
+        // A well-formed 32-byte `enc` so control passes the bridge enc-length
+        // check and reaches the `register_ffi_state` Occupied precheck (which runs
+        // BEFORE the KeyPackage consume).
+        let sealed = super::NapiSealedInvitation {
+            context_id: ctx_id.clone(),
+            creator_did: "did:dht:z6MkNapiOccupiedCreator".to_owned(),
+            enc: vec![0u8; 32],
+            ciphertext: b"bogus-bundle-ciphertext".to_vec(),
+        };
         let Err(err) = super::context_join_from_welcome_on(
             &bi,
             joiner_did,
-            "did:dht:z6MkNapiOccupiedCreator".to_owned(),
-            ctx_id.clone(),
-            r#"{"mode":"encrypted"}"#.to_owned(),
+            sealed,
             "bogus-reservation-id".to_owned(),
-            b"bogus-welcome-bytes".to_vec(),
         )
         .await
         else {
@@ -5424,6 +5700,79 @@ mod tests {
         assert!(
             crate::runtime::with_context(&bi, &ctx_id, |_| Ok(())).is_ok(),
             "the pre-existing FFI state must be preserved on an Occupied-precheck failure"
+        );
+    }
+
+    /// ADR-049 Phase 2J / FFI-02 Option A (invite export wiring): the new
+    /// `invite_member` bridge export is wired end-to-end — DID validation ->
+    /// supervisor resolution -> inviter signing-key resolution/export -> live-
+    /// context lookup -> typed error mapping — and rejects the two reachable
+    /// failure modes on the pre-add path.
+    ///
+    /// NOTE ON SCOPE: the `"sealed"` happy-path (and the full creator-seal ->
+    /// joiner-open round-trip) is NOT asserted here because it terminates in the
+    /// MLS add-member step, covered at the cross-bridge E2E layer once the
+    /// §5.13.3 `0xFF02` KeyPackage-capabilities path is green. This test pins what
+    /// IS reachable on the pre-add path so the export is not merely
+    /// compiled-but-dead.
+    ///
+    /// Not false-green: assertion (a) uses a REAL custodied inviter (+ an attached
+    /// supervisor) so signing-key resolution/export SUCCEEDS and the error is the
+    /// live-context lookup ("no live context"); assertion (b) uses a non-custodied
+    /// inviter so it fails EARLIER at signing-key resolution ("not found in
+    /// registry", `SCP-IDENT-1001`) — the two distinct messages prove both seams
+    /// are exercised, not short-circuited.
+    #[cfg(feature = "allow_in_memory_custody")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn invite_member_rejects_unknown_context_and_non_custodied_inviter() {
+        let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
+        // A custodied inviter + an attached supervisor so signing-key resolution
+        // and export can succeed and control reaches the runtime live-context
+        // lookup. `init_supervisor` is idempotent (OnceLock, first-call-wins).
+        let inviter_did = register_in_memory_joiner(&bi).await;
+        crate::runtime::init_supervisor(&bi, &inviter_did);
+
+        // (a) A custodied inviter into a NON-EXISTENT context: signing-key
+        // resolution/export succeeds, then the runtime live-context lookup fails.
+        let err_unknown = {
+            let Err(err) = super::invite_member_on(
+                &bi,
+                "d".repeat(64),
+                inviter_did.clone(),
+                "did:dht:z6MkNapiInviteeUnknownCtx".to_owned(),
+                b"bogus-key-package".to_vec(),
+                vec![],
+            )
+            .await
+            else {
+                panic!("inviting into an unknown context must be rejected");
+            };
+            err.to_string()
+        };
+        assert!(
+            err_unknown.contains("no live context"),
+            "expected a live-context lookup rejection (signing-key resolved first), got: {err_unknown}"
+        );
+
+        // (b) A NON-custodied inviter: fails earlier, at signing-key resolution,
+        // before any context lookup.
+        let Err(err_uncustodied) = super::invite_member_on(
+            &bi,
+            "e".repeat(64),
+            "did:dht:z6MkNoSuchNapiInviterIdentity".to_owned(),
+            "did:dht:z6MkNapiInviteeUncustodied".to_owned(),
+            b"bogus-key-package".to_vec(),
+            vec![],
+        )
+        .await
+        else {
+            panic!("a non-locally-custodied inviter must be rejected");
+        };
+        let msg_uncustodied = err_uncustodied.to_string();
+        assert!(
+            msg_uncustodied.contains(codes::IDENT_1001),
+            "expected an inviter signing-key resolution failure {}, got: {msg_uncustodied}",
+            codes::IDENT_1001
         );
     }
 
