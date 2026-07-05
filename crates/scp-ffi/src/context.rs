@@ -633,6 +633,307 @@ impl PyContextParams {
             consequence_config,
         })
     }
+
+    /// Projects an AUTHENTICATED core [`ContextParams`](scp_core::context::ContextParams)
+    /// into a `PyContextParams` for the handle returned by
+    /// [`context_join_from_welcome`](crate::scp::PyScp::context_join_from_welcome).
+    ///
+    /// The joiner no longer supplies params — the authoritative params are the
+    /// ones carried by the joined MLS group's signed context binding (opened
+    /// inside the runtime). This is the inverse of the forward
+    /// `build_core_context_params` path: it recovers exactly the subset of
+    /// fields `PyContextParams` projects (the rest of `ContextParams` — metadata
+    /// visibility, projection policy, participation requirements, etc. — has no
+    /// `PyContextParams` field and is not surfaced here, matching the forward
+    /// path which fills those with defaults). Enum discriminants are rendered to
+    /// their canonical bridge string form; capability sets to their user-facing
+    /// colon names; JSON-backed fields (economic policy, consequence rules/config)
+    /// to their serialized JSON strings.
+    fn from_core_params(params: &scp_core::context::ContextParams) -> Self {
+        use scp_core::context::params::{
+            CeilingPolicy, ConsequenceConfig, ContextMode, GovernanceModel, MemoryScope,
+            PromotionPolicy,
+        };
+
+        let mode = match params.mode {
+            ContextMode::Broadcast => "broadcast",
+            ContextMode::Encrypted => "encrypted",
+        }
+        .to_owned();
+        let ceiling_policy = match params.ceiling_policy {
+            CeilingPolicy::Governed => "governed",
+            CeilingPolicy::Immutable => "immutable",
+        }
+        .to_owned();
+        let promotion_policy = match params.promotion_policy {
+            PromotionPolicy::Promotable => "promotable",
+            PromotionPolicy::NoPromotion => "no_promotion",
+        }
+        .to_owned();
+        let memory_scope = match params.memory_scope {
+            MemoryScope::Full => "full",
+            MemoryScope::Summary => "summary",
+            MemoryScope::Ephemeral => "ephemeral",
+        }
+        .to_owned();
+        let governance = match params.governance {
+            GovernanceModel::SingleAdmin => "single_admin",
+            GovernanceModel::Threshold { .. } => "threshold",
+            GovernanceModel::Majority { .. } => "majority",
+            GovernanceModel::Unanimity { .. } => "unanimity",
+        }
+        .to_owned();
+
+        // Ceiling and role capabilities → user-facing colon names (`name()`),
+        // the form a Python caller supplies on the forward path.
+        let ceiling: Vec<String> = params
+            .ceiling
+            .iter()
+            .map(|c| c.name().into_owned())
+            .collect();
+        let roles: HashMap<String, Vec<String>> = params
+            .roles
+            .iter()
+            .map(|rd| {
+                let mut caps: Vec<String> =
+                    rd.capabilities.iter().map(|c| c.name().into_owned()).collect();
+                caps.sort();
+                (rd.name.clone(), caps)
+            })
+            .collect();
+        let tools: Vec<String> = params.tools.iter().map(|t| t.name.clone()).collect();
+
+        // JSON-backed projections. `None` when absent/empty/default so the
+        // getters honor their "None means default/free" contract.
+        let template_id = params.template_id.as_ref().and_then(|tid| {
+            serde_json::to_value(tid)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_owned))
+        });
+        let economic_policy = params
+            .economic_policy
+            .as_ref()
+            .and_then(|ep| serde_json::to_string(ep).ok());
+        let consequence_rules = if params.consequence_rules.is_empty() {
+            None
+        } else {
+            serde_json::to_string(&params.consequence_rules).ok()
+        };
+        let consequence_config = if params.consequence_config == ConsequenceConfig::default() {
+            None
+        } else {
+            serde_json::to_string(&params.consequence_config).ok()
+        };
+
+        Self {
+            ceiling,
+            roles,
+            tools,
+            ttl: params.ttl.map(|d| d.as_secs_f64()),
+            memory_scope,
+            governance,
+            mode,
+            ceiling_policy,
+            promotion_policy,
+            template_id,
+            economic_policy,
+            min_protocol_version: params.min_protocol_version,
+            max_chain_depth: params.max_chain_depth,
+            max_nesting_depth: params.max_nesting_depth,
+            session_cap: params.session_cap,
+            consequence_rules,
+            consequence_config,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PySealedInvitation / PyInviteMemberOutcome
+// ---------------------------------------------------------------------------
+
+/// A sealed, signed invitation bundle (ADR-049 Phase 2J; FFI-02 Option A).
+///
+/// The wire artifact produced by
+/// [`invite_member`](crate::scp::PyScp::invite_member) on the creator side and
+/// consumed by [`context_join_from_welcome`](crate::scp::PyScp::context_join_from_welcome)
+/// on the joiner side.
+///
+/// Flat named-field config object per the agent-first API tenet: an LLM builds
+/// it from the field names plus one example, with no positional-argument
+/// footgun. Mirrors the runtime wire type
+/// [`SealedInvitation`](scp_core::context::invitation_helpers::SealedInvitation):
+/// `enc` is the RFC 9180 HPKE encapsulated key (32 bytes) and `ciphertext` is
+/// the HPKE ciphertext (`ct = ciphertext || tag`) of the serialized, signed
+/// `InvitationBundle`. Both are opaque bytes — the joiner does not interpret
+/// them; the runtime opens the bundle and authenticates it.
+#[pyclass]
+#[derive(Debug, Clone)]
+pub struct PySealedInvitation {
+    /// Binding hint: the context id the bundle was sealed for.
+    context_id: String,
+    /// Binding hint: the creator DID the bundle was sealed by.
+    creator_did: String,
+    /// RFC 9180 HPKE encapsulated key (`enc`). Length is validated to be
+    /// exactly 32 bytes at the join boundary (fail-closed).
+    enc: Vec<u8>,
+    /// RFC 9180 HPKE ciphertext (`ct = ciphertext || tag`).
+    ciphertext: Vec<u8>,
+}
+
+#[pymethods]
+impl PySealedInvitation {
+    /// Constructs a sealed invitation from its four wire fields.
+    #[new]
+    #[allow(clippy::missing_const_for_fn)] // PyO3 #[new] cannot be const.
+    fn new(context_id: String, creator_did: String, enc: Vec<u8>, ciphertext: Vec<u8>) -> Self {
+        Self {
+            context_id,
+            creator_did,
+            enc,
+            ciphertext,
+        }
+    }
+
+    #[getter]
+    fn context_id(&self) -> &str {
+        &self.context_id
+    }
+
+    #[getter]
+    fn creator_did(&self) -> &str {
+        &self.creator_did
+    }
+
+    /// The HPKE encapsulated key (`enc`) as Python `bytes`.
+    #[getter]
+    fn enc<'py>(&self, py: Python<'py>) -> Bound<'py, pyo3::types::PyBytes> {
+        pyo3::types::PyBytes::new(py, &self.enc)
+    }
+
+    /// The HPKE ciphertext (`ct`) as Python `bytes`.
+    #[getter]
+    fn ciphertext<'py>(&self, py: Python<'py>) -> Bound<'py, pyo3::types::PyBytes> {
+        pyo3::types::PyBytes::new(py, &self.ciphertext)
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "PySealedInvitation(context_id='{}', creator_did='{}', \
+             enc=<{} bytes>, ciphertext=<{} bytes>)",
+            self.context_id,
+            self.creator_did,
+            self.enc.len(),
+            self.ciphertext.len()
+        )
+    }
+}
+
+/// The outcome of [`invite_member`](crate::scp::PyScp::invite_member).
+///
+/// `kind` is the discriminant — EXACTLY `"sealed"` or
+/// `"requiresGovernanceApproval"` (canonical tag strings mirrored across all
+/// bridges). For `"sealed"`, `enc`/`ciphertext`/`delivered` are present and
+/// `proposal_id` is `None`; the caller (or transport) delivers the sealed
+/// `(enc, ciphertext)` bundle to the invitee. For
+/// `"requiresGovernanceApproval"` — a first-class SUCCESS outcome, NOT an error
+/// — the invite is deferred to a governance vote; `proposal_id` carries the
+/// tracked proposal id (hex-encoded) when one exists (`None` today, reserved).
+#[pyclass]
+#[derive(Debug, Clone)]
+pub struct PyInviteMemberOutcome {
+    kind: String,
+    enc: Option<Vec<u8>>,
+    ciphertext: Option<Vec<u8>>,
+    delivered: Option<bool>,
+    proposal_id: Option<String>,
+}
+
+impl PyInviteMemberOutcome {
+    /// Maps a runtime [`InviteMemberOutcome`](scp_core::context::supervisor::InviteMemberOutcome)
+    /// to its flat bridge projection.
+    fn from_outcome(outcome: scp_core::context::supervisor::InviteMemberOutcome) -> Self {
+        use scp_core::context::supervisor::InviteMemberOutcome;
+        match outcome {
+            InviteMemberOutcome::Sealed {
+                enc,
+                ciphertext,
+                delivered,
+            } => Self {
+                kind: "sealed".to_owned(),
+                enc: Some(enc.to_vec()),
+                ciphertext: Some(ciphertext),
+                delivered: Some(delivered),
+                proposal_id: None,
+            },
+            InviteMemberOutcome::RequiresGovernanceApproval { proposal_id } => Self {
+                kind: "requiresGovernanceApproval".to_owned(),
+                enc: None,
+                ciphertext: None,
+                delivered: None,
+                proposal_id: proposal_id.map(hex::encode),
+            },
+        }
+    }
+}
+
+#[pymethods]
+impl PyInviteMemberOutcome {
+    /// The outcome discriminant: `"sealed"` or `"requiresGovernanceApproval"`.
+    #[getter]
+    fn kind(&self) -> &str {
+        &self.kind
+    }
+
+    /// The HPKE encapsulated key (`enc`) as Python `bytes`, or `None` when the
+    /// invite requires governance approval.
+    #[getter]
+    fn enc<'py>(&self, py: Python<'py>) -> Option<Bound<'py, pyo3::types::PyBytes>> {
+        self.enc
+            .as_ref()
+            .map(|b| pyo3::types::PyBytes::new(py, b))
+    }
+
+    /// The HPKE ciphertext (`ct`) as Python `bytes`, or `None` when the invite
+    /// requires governance approval.
+    #[getter]
+    fn ciphertext<'py>(&self, py: Python<'py>) -> Option<Bound<'py, pyo3::types::PyBytes>> {
+        self.ciphertext
+            .as_ref()
+            .map(|b| pyo3::types::PyBytes::new(py, b))
+    }
+
+    /// Whether the runtime published the sealed invitation to the invitee's
+    /// routing id (`true`) or the caller must deliver it (`false`). `None` when
+    /// the invite requires governance approval.
+    #[getter]
+    #[allow(clippy::missing_const_for_fn)] // PyO3 getter cannot be const.
+    fn delivered(&self) -> Option<bool> {
+        self.delivered
+    }
+
+    /// The tracked governance proposal id (hex-encoded), when one exists.
+    #[getter]
+    fn proposal_id(&self) -> Option<&str> {
+        self.proposal_id.as_deref()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "PyInviteMemberOutcome(kind='{}', enc={}, ciphertext={}, \
+             delivered={:?}, proposal_id={:?})",
+            self.kind,
+            self.enc.as_ref().map_or_else(
+                || "None".to_owned(),
+                |b| format!("<{} bytes>", b.len())
+            ),
+            self.ciphertext.as_ref().map_or_else(
+                || "None".to_owned(),
+                |b| format!("<{} bytes>", b.len())
+            ),
+            self.delivered,
+            self.proposal_id,
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2435,41 +2736,26 @@ impl crate::scp::PyScp {
     /// or fail-closed persist failure).
     #[pyo3(
         name = "context_join_from_welcome",
-        signature = (owning_did, creator_did, context_id, params, reservation_id, welcome_bytes)
+        signature = (owning_did, sealed, reservation_id)
     )]
     pub fn context_join_from_welcome(
         &self,
-        owning_did: &str,
-        creator_did: &str,
-        context_id: &str,
-        params: &Bound<'_, PyDict>,
-        reservation_id: &str,
-        welcome_bytes: &[u8],
+        owning_did: String,
+        sealed: PySealedInvitation,
+        reservation_id: String,
     ) -> PyResult<PyContextHandle> {
         let bi = &*self.inner;
-        validate::validate_did(owning_did)?;
-        validate::validate_did(creator_did)?;
-        validate::validate_context_id(context_id)?;
+        validate::validate_did(&owning_did)?;
+        validate::validate_did(&sealed.creator_did)?;
+        validate::validate_context_id(&sealed.context_id)?;
 
-        // Parse legible params eagerly (before any async work).
-        let parsed = PyContextParams::from_py_dict(params)?;
-        let core_params = build_core_context_params(&parsed)?;
-
-        // Welcome-join is ENCRYPTED-only. A broadcast context carries no MLS
-        // Welcome (it is a per-author AES-GCM channel, spec §5.14), so a
-        // broadcast `params` would otherwise fail deep at the fused
-        // `ConfirmConsume` (no reserved KeyPackage / no Welcome to consume).
-        // Reject a non-Encrypted mode up front — before deriving the pseudonym,
-        // resolving the supervisor, or registering any reversible bridge state.
-        if !matches!(
-            core_params.mode,
-            scp_core::context::params::ContextMode::Encrypted
-        ) {
-            return Err(PyValueError::new_err(
-                "context_join_from_welcome requires an encrypted context; broadcast \
-                 contexts are not Welcome-joined (spec §5.14)",
-            ));
-        }
+        // NOTE: the joiner no longer supplies `params`/`welcome_bytes`. The
+        // authoritative params + Welcome now travel INSIDE the signed, sealed
+        // `InvitationBundle` (`sealed.enc`/`sealed.ciphertext`), which the
+        // runtime opens and authenticates. The old up-front broadcast-mode check
+        // is gone: there are no caller params to inspect, and a broadcast bundle
+        // (which carries no MLS Welcome, spec §5.14) is rejected INSIDE the
+        // runtime at the fused `ConfirmConsume` — not at this boundary.
 
         // spawn-from-Welcome always stands up an ENCRYPTED context; ensure the
         // node's supervisor is attached first (this may be the joiner's first
@@ -2477,14 +2763,22 @@ impl crate::scp::PyScp {
         #[cfg(test)]
         crate::runtime::init_context_manager_for_test(bi);
         #[cfg(not(test))]
-        crate::runtime::init_context_manager(bi, owning_did);
+        crate::runtime::init_context_manager(bi, &owning_did);
 
         // §9.10.4 + local-custody enforcement: DERIVE the joiner's routing
         // pseudonym from its locally-custodied identity — never caller-supplied.
         // This is the SAME custody gate context_create uses; a non-custodied
         // joiner hard-fails here with SCP-IDENT-1054 before the single-use
         // KeyPackage is consumed.
-        let local_pseudonym = derive_member_pseudonym(bi, owning_did, context_id)?;
+        let local_pseudonym = derive_member_pseudonym(bi, &owning_did, &sealed.context_id)?;
+
+        // Fail-closed: the HPKE encapsulated key (`enc`) MUST be exactly 32
+        // bytes. Reject a malformed length BEFORE any registry mutation or the
+        // irreversible KeyPackage consume, rather than letting a short/long
+        // buffer fail deep inside the HPKE open.
+        let sealed_bundle_enc =
+            scp_ffi_common::custody_parse::expect_32("sealed_bundle_enc", &sealed.enc)
+                .map_err(|e| PyValueError::new_err(e.to_string()))?;
 
         // Reconstruct the opaque reservation id via its sanctioned transparent
         // serde form (a bare string): the id round-trips through the FFI as a
@@ -2492,7 +2786,7 @@ impl crate::scp::PyScp {
         // the fused consume match downstream, it grants nothing. Parsed BEFORE
         // any registry mutation so a malformed id can't leave orphaned state.
         let reservation: scp_core::context::supervisor::ReservationId =
-            serde_json::from_value(serde_json::Value::String(reservation_id.to_owned()))
+            serde_json::from_value(serde_json::Value::String(reservation_id))
                 .map_err(|e| PyRuntimeError::new_err(format!("invalid reservation id: {e}")))?;
 
         // Resolve the tokio runtime + supervisor handle BEFORE any reversible
@@ -2501,18 +2795,36 @@ impl crate::scp::PyScp {
         // leak the just-registered (reversible) state with no rollback on their
         // failure, and a later same-id retry would then hard-fail the Occupied
         // check. Order: custody-derive (above) → runtime/supervisor-resolve →
-        // register-reversible → spawn → rollback-on-Err.
+        // custody+active-key resolve → register-reversible → spawn →
+        // rollback-on-Err → authenticated ceiling re-sync.
         let rt = crate::runtime()?;
         let sup =
             crate::runtime::supervisor(bi).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let sup = Arc::clone(sup);
 
+        // Resolve the joiner's OWN custody provider + `#active` KeyHandle (the
+        // same locally-custodied identity the pseudonym was derived from). The
+        // runtime needs these to open the sealed bundle and drive the join under
+        // the joiner's key material — private keys never cross the FFI, only the
+        // opaque custody handle + KeyHandle do (ADR-006).
+        let (custody, active_handle) = crate::runtime::with_identity(bi, &owning_did, |entry| {
+            Ok((entry.custody.clone(), entry.identity.active_signing_key))
+        })
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
         // Register the bridge-side FFI state (ToolRegistry / EventLog / RoleState)
         // as a REVERSIBLE precheck BEFORE the irreversible runtime join. Mirrors
         // `context_create`, which registers FFI state first and rolls it back via
         // `remove_context` if the runtime step fails. The creator is the
-        // role-state admin (Welcome-derived); the joiner is added as a member
+        // role-state admin (bundle-derived); the joiner is added as a member
         // below.
+        //
+        // FLAG-1: the caller no longer supplies a ceiling, so register with the
+        // DEFAULT ceiling (`&[]`). The Occupied dedup is keyed on `context_id`,
+        // so the "detect a duplicate BEFORE consuming the single-use KeyPackage"
+        // crash-safety is preserved regardless of the ceiling. The AUTHENTICATED
+        // ceiling is re-synced from the joined handle's signed params AFTER a
+        // successful spawn (see `sync_ceiling_from_params` below).
         //
         // Ordering matters for two reasons:
         //   1. `register_ffi_state` hard-errors on an already-registered context
@@ -2523,42 +2835,59 @@ impl crate::scp::PyScp {
         //   2. If the runtime join later fails, we roll THIS state back, so there
         //      is no path where the join commits but bridge state errors, and no
         //      leaked FFI state when the join fails.
-        crate::runtime::register_ffi_state(bi, context_id, creator_did, &parsed.ceiling).map_err(
-            |e| PyRuntimeError::new_err(format!("failed to register context state: {e}")),
-        )?;
+        crate::runtime::register_ffi_state(bi, &sealed.context_id, &sealed.creator_did, &[])
+            .map_err(|e| {
+                PyRuntimeError::new_err(format!("failed to register context state: {e}"))
+            })?;
         // Insert the joiner as a member of the freshly-registered role state. On
         // the (practically unreachable) failure of this insert into state we just
         // created, roll it back so a failed join leaves nothing behind.
-        if let Err(e) = crate::runtime::with_ffi_state(bi, context_id, |st| {
-            st.role_state.members.insert(owning_did.to_owned());
+        if let Err(e) = crate::runtime::with_ffi_state(bi, &sealed.context_id, |st| {
+            st.role_state.members.insert(owning_did.clone());
             Ok(())
         }) {
-            crate::runtime::remove_context(bi, context_id);
+            crate::runtime::remove_context(bi, &sealed.context_id);
             return Err(PyRuntimeError::new_err(e.to_string()));
         }
 
-        let owning = scp_identity::DID(owning_did.to_owned());
+        let owning = scp_identity::DID(owning_did.clone());
         let req = scp_core::context::supervisor::WelcomeJoinRequest {
-            creator_did: scp_identity::DID(creator_did.to_owned()),
-            context_id: context_id.to_owned(),
-            params: core_params,
+            creator_did: scp_identity::DID(sealed.creator_did.clone()),
+            context_id: sealed.context_id.clone(),
+            sealed_bundle_enc,
+            sealed_bundle_ct: sealed.ciphertext.clone(),
             reservation_id: reservation,
-            welcome_bytes: welcome_bytes.to_vec(),
             local_pseudonym: Some(local_pseudonym),
         };
-        // Irreversible: consume the KeyPackage, install the joined MLS group,
-        // persist the keyed snapshot, register the context actor. On failure,
-        // roll the reversible FFI state (and — via `remove_context` →
-        // `remove_ffi_state` — any known-context discovery entry) back so an
-        // errored join leaves no orphaned bridge state beside a runtime that
-        // never committed.
-        if let Err(e) = rt.block_on(async move { sup.spawn_actor_from_welcome(owning, req).await })
-        {
-            crate::runtime::remove_context(bi, context_id);
-            return Err(PyRuntimeError::new_err(format!(
-                "context_join_from_welcome failed: {e}"
-            )));
-        }
+        // Irreversible: open + authenticate the sealed bundle, consume the
+        // KeyPackage, install the joined MLS group, persist the keyed snapshot,
+        // register the context actor. On failure, roll the reversible FFI state
+        // (and — via `remove_context` → `remove_ffi_state` — any known-context
+        // discovery entry) back so an errored join leaves no orphaned bridge
+        // state beside a runtime that never committed.
+        let joined = match rt.block_on(sup.spawn_actor_from_welcome(
+            owning,
+            &*custody,
+            &active_handle,
+            req,
+        )) {
+            Ok(handle) => handle,
+            Err(e) => {
+                crate::runtime::remove_context(bi, &sealed.context_id);
+                return Err(PyRuntimeError::new_err(format!(
+                    "context_join_from_welcome failed: {e}"
+                )));
+            }
+        };
+
+        // FLAG-1: re-sync the AUTHENTICATED ceiling from the joined handle's
+        // signed params, overwriting the default ceiling used for the reversible
+        // precheck. The authoritative ceiling lives in the bundle the creator
+        // signed — never in caller input. This runs AFTER the irreversible
+        // commit; the FFI state was just registered (and not removed on this
+        // success path), so the sync targets a live entry.
+        crate::runtime::sync_ceiling_from_params(bi, &sealed.context_id, &joined.params().ceiling)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
         // Runtime join committed. Register the context in the known-contexts
         // discovery registry so a Welcome-joined context is surfaced by
@@ -2583,14 +2912,20 @@ impl crate::scp::PyScp {
             let known = crate::runtime::KnownContext {
                 routing_id: local_pseudonym,
                 relay_url,
-                member_did: owning_did.to_owned(),
+                member_did: owning_did,
                 last_seen: scp_primitives::SystemClock.now_secs(),
             };
-            crate::runtime::register_known_context_on(bi, context_id, known);
+            crate::runtime::register_known_context_on(bi, &sealed.context_id, known);
         }
 
+        // Build the returned handle from the AUTHENTICATED params carried by the
+        // joined MLS group's signed context binding — NOT from caller input
+        // (there is none). The ceiling, mode, governance, and policies reflect
+        // what the creator actually signed. `sealed` is fully consumed here
+        // (its fields are moved into the handle; it is unused afterward).
+        let authed_params = PyContextParams::from_core_params(joined.params());
         let handle =
-            PyContextHandle::new(bi, context_id.to_owned(), creator_did.to_owned(), parsed);
+            PyContextHandle::new(bi, sealed.context_id, sealed.creator_did, authed_params);
         {
             let mut guard = handle
                 .state
@@ -2599,6 +2934,74 @@ impl crate::scp::PyScp {
             "active".clone_into(&mut guard);
         }
         Ok(handle)
+    }
+
+    /// Invites a member to an existing context, producing a sealed, signed
+    /// invitation bundle (ADR-049 Phase 2J; FFI-02 Option A).
+    ///
+    /// The creator (or admin) seals the context's genesis params + Welcome for
+    /// the invitee under RFC 9180 HPKE, binding them to the invitee's
+    /// `KeyPackage`. For a `SingleAdmin` context the invite is unilateral and
+    /// returns a `"sealed"` outcome carrying `(enc, ciphertext)`; for a voting
+    /// context it returns `"requiresGovernanceApproval"` (a SUCCESS outcome, not
+    /// an error — the invite is deferred to a governance vote).
+    ///
+    /// # Arguments
+    ///
+    /// * `context_id` -- The context to invite into.
+    /// * `creator_did` -- The inviting member's DID (must be locally custodied;
+    ///   the invite is signed under its `#active` key).
+    /// * `invitee_did` -- The DID being invited.
+    /// * `invitee_key_package` -- The invitee's TLS-serialized MLS `KeyPackage`.
+    /// * `relay_urls` -- Relay URLs to include for the invitee's first contact.
+    ///
+    /// # Errors
+    ///
+    /// Returns `RuntimeError` if the supervisor is not initialized, the signing
+    /// key cannot be resolved, or the runtime invite fails (e.g. unauthorized
+    /// inviter, invalid `KeyPackage`).
+    #[pyo3(signature = (context_id, creator_did, invitee_did, invitee_key_package, relay_urls))]
+    pub fn invite_member(
+        &self,
+        context_id: String,
+        creator_did: String,
+        invitee_did: String,
+        invitee_key_package: Vec<u8>,
+        relay_urls: Vec<String>,
+    ) -> PyResult<PyInviteMemberOutcome> {
+        let bi = &*self.inner;
+        validate::validate_context_id(&context_id)?;
+        validate::validate_did(&creator_did)?;
+        validate::validate_did(&invitee_did)?;
+
+        let rt = crate::runtime()?;
+        let sup =
+            crate::runtime::supervisor(bi).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let sup = Arc::clone(sup);
+
+        // Resolve the inviter's Ed25519 signing key. `resolve_signing_key` runs
+        // its own `block_on` and returns BEFORE the invite `block_on` below, so
+        // the two calls are sequential (not nested — nesting would deadlock the
+        // multi-threaded runtime).
+        let signing_key = resolve_signing_key(bi, &creator_did)?;
+        let outcome = rt.block_on(sup.invite_member(
+            context_id,
+            scp_identity::DID(creator_did),
+            scp_identity::DID(invitee_did),
+            invitee_key_package,
+            relay_urls,
+            &signing_key,
+        ));
+        // Defense-in-depth: wipe the raw signing key the moment the invite is
+        // produced, rather than letting it linger to end-of-scope. `SigningKey`
+        // is `ZeroizeOnDrop` (ed25519-dalek `zeroize` feature) but does NOT
+        // implement bare `Zeroize`, so the explicit early `drop` — not a
+        // `.zeroize()` call — is what triggers the wipe here.
+        drop(signing_key);
+
+        let outcome =
+            outcome.map_err(|e| PyRuntimeError::new_err(format!("invite_member failed: {e}")))?;
+        Ok(PyInviteMemberOutcome::from_outcome(outcome))
     }
 
     /// Test-only: seed a peer's per-context pseudonym routing ID (§9.10.4)
@@ -5695,6 +6098,9 @@ pub fn register_context(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyContextParams>()?;
     m.add_class::<PyMessage>()?;
     m.add_class::<PyMessageReceiver>()?;
+    // Invitation bundle + invite outcome (ADR-049 Phase 2J; FFI-02 Option A)
+    m.add_class::<PySealedInvitation>()?;
+    m.add_class::<PyInviteMemberOutcome>()?;
     // Reconnection report (ADR-029)
     m.add_class::<PyReconnectReport>()?;
     m.add_class::<PyContextReconnectResult>()?;
@@ -5733,6 +6139,23 @@ mod tests {
 
     fn __bi() -> std::sync::Arc<crate::runtime::PyBridgeInstance> {
         std::sync::Arc::new(crate::runtime::PyBridgeInstance::new_py())
+    }
+
+    /// Test helper: build a [`PySealedInvitation`] from its four wire fields
+    /// (the reshaped `context_join_from_welcome` input, replacing the old loose
+    /// `params`/`welcome_bytes` args).
+    fn __sealed(
+        context_id: &str,
+        creator_did: &str,
+        enc: Vec<u8>,
+        ciphertext: Vec<u8>,
+    ) -> PySealedInvitation {
+        PySealedInvitation {
+            context_id: context_id.to_owned(),
+            creator_did: creator_did.to_owned(),
+            enc,
+            ciphertext,
+        }
     }
 
     /// §9.10.4: an ENCRYPTED `context_create` hard-fails pseudonym derivation.
@@ -5952,7 +6375,7 @@ mod tests {
     /// and `welcome_bytes` are dummies here — derivation runs before either is
     /// touched, so this is not false-green: were the custody gate removed, the
     /// call would proceed past derivation and fail later for an unrelated reason
-    /// (a bogus reservation / Welcome), not with `SCP-IDENT-1054`.
+    /// (a bogus reservation / bundle), not with `SCP-IDENT-1054`.
     #[test]
     fn context_join_from_welcome_rejects_non_locally_custodied_joiner() {
         crate::init_runtime().ok();
@@ -5960,16 +6383,20 @@ mod tests {
         let scp = crate::scp::PyScp {
             inner: std::sync::Arc::clone(&bi_arc),
         };
-        let err = Python::with_gil(|py| {
-            let params = PyDict::new(py);
-            params.set_item("mode", "encrypted").unwrap();
-            scp.context_join_from_welcome(
-                "did:dht:z6MkNoSuchJoinFromWelcomeJoiner",
-                "did:dht:z6MkSomeCreator",
+        let err = Python::with_gil(|_py| {
+            // A well-formed 32-byte `enc` so the failure isolates the custody
+            // gate (which runs BEFORE the enc-length check), not a length
+            // rejection.
+            let sealed = __sealed(
                 &"0".repeat(64),
-                &params,
-                "not-a-real-reservation",
-                b"not-a-real-welcome",
+                "did:dht:z6MkSomeCreator",
+                vec![0u8; 32],
+                b"not-a-real-bundle".to_vec(),
+            );
+            scp.context_join_from_welcome(
+                "did:dht:z6MkNoSuchJoinFromWelcomeJoiner".to_owned(),
+                sealed,
+                "not-a-real-reservation".to_owned(),
             )
             .expect_err("join-from-Welcome for a non-locally-custodied joiner must be rejected")
             .to_string()
@@ -5980,42 +6407,52 @@ mod tests {
         );
     }
 
-    /// ADR-049 Phase 2J: `context_join_from_welcome` is ENCRYPTED-only. A
-    /// broadcast `params.mode` is rejected UP FRONT — before deriving the
-    /// pseudonym, resolving the supervisor, or registering any reversible bridge
-    /// state — because a broadcast context (per-author AES-GCM, spec §5.14)
-    /// carries no MLS Welcome and would otherwise fail deep at the fused
-    /// `ConfirmConsume`.
+    /// ADR-049 Phase 2J / FFI-02 Option A (reshape): the reshaped
+    /// `context_join_from_welcome` no longer takes caller `params`, so there is
+    /// no `mode` field to inspect — broadcast rejection moved INSIDE the runtime
+    /// (a broadcast context carries no MLS Welcome, spec §5.14, so it fails at
+    /// the fused `ConfirmConsume`). The NEW bridge-level fail-closed boundary is
+    /// the HPKE `enc` length: it MUST be exactly 32 bytes (RFC 9180 X25519
+    /// encapsulated key). A wrong-length `enc` is rejected BEFORE the irreversible
+    /// `KeyPackage` consume.
     ///
-    /// Not false-green: the rejection precedes the custody gate, so the joiner
-    /// DID need not be registered; were the check removed, the call would
-    /// instead reach the custody seam and fail with `SCP-IDENT-1054`, not the
-    /// encrypted-context message asserted here.
+    /// Not false-green: a locally-custodied joiner is used so the custody gate
+    /// SUCCEEDS and control reaches the enc-length check; were that check removed,
+    /// the malformed `enc` would instead fail deep inside the HPKE open with a
+    /// different message, not the exact "expected 32" surfaced here.
     #[test]
-    fn context_join_from_welcome_rejects_broadcast_mode() {
+    #[cfg(feature = "allow_in_memory_custody")]
+    fn context_join_from_welcome_rejects_non_32_byte_enc() {
+        pyo3::prepare_freethreaded_python();
         crate::init_runtime().ok();
-        let bi_arc = __bi();
-        let scp = crate::scp::PyScp {
-            inner: std::sync::Arc::clone(&bi_arc),
-        };
-        let err = Python::with_gil(|py| {
-            let params = PyDict::new(py);
-            params.set_item("mode", "broadcast").unwrap();
-            scp.context_join_from_welcome(
-                "did:dht:z6MkSomeBroadcastJoiner",
-                "did:dht:z6MkSomeCreator",
-                &"0".repeat(64),
-                &params,
-                "not-a-real-reservation",
-                b"not-a-real-welcome",
-            )
-            .expect_err("join-from-Welcome must reject a broadcast context up front")
-            .to_string()
+        Python::with_gil(|py| {
+            let scp = crate::scp::PyScp::new_in_memory_for_test();
+
+            // Locally-custodied joiner so the pseudonym-derivation custody gate
+            // passes and control reaches the fail-closed enc-length check.
+            let joiner = scp.identity_create(py, "in_memory", None).unwrap();
+            let joiner_did = joiner.did().to_owned();
+
+            // 31-byte `enc` — one short of the required 32.
+            let sealed = __sealed(
+                &"c".repeat(64),
+                "did:dht:z6MkEncLenCreator",
+                vec![0u8; 31],
+                b"bogus-ciphertext".to_vec(),
+            );
+            let err = scp
+                .context_join_from_welcome(
+                    joiner_did,
+                    sealed,
+                    "bogus-reservation-id".to_owned(),
+                )
+                .expect_err("a non-32-byte HPKE enc must be rejected at the bridge boundary")
+                .to_string();
+            assert!(
+                err.contains("expected 32"),
+                "expected a fail-closed 32-byte enc-length rejection, got: {err}"
+            );
         });
-        assert!(
-            err.contains("requires an encrypted context"),
-            "expected up-front broadcast rejection, got: {err}"
-        );
     }
 
     /// ADR-049 Phase 2J (orphaned-success fix): `context_join_from_welcome`
@@ -6054,19 +6491,24 @@ mod tests {
             let joiner_did = joiner.did().to_owned();
 
             let ctx_id = "a".repeat(64);
-            let params = PyDict::new(py);
-            params.set_item("mode", "encrypted").unwrap();
+            // A well-formed 32-byte `enc` passes the bridge enc-length check, so
+            // the failure is the runtime join itself (bogus reservation +
+            // ciphertext) — exactly the register -> spawn seam the rollback
+            // guards.
+            let sealed = __sealed(
+                &ctx_id,
+                "did:dht:z6MkRollbackCreator",
+                vec![0u8; 32],
+                b"bogus-bundle-ciphertext".to_vec(),
+            );
 
             let err = scp
                 .context_join_from_welcome(
-                    &joiner_did,
-                    "did:dht:z6MkRollbackCreator",
-                    &ctx_id,
-                    &params,
-                    "bogus-reservation-id",
-                    b"bogus-welcome-bytes",
+                    joiner_did,
+                    sealed,
+                    "bogus-reservation-id".to_owned(),
                 )
-                .expect_err("join with a bogus Welcome must fail at the runtime layer");
+                .expect_err("join with a bogus sealed bundle must fail at the runtime layer");
             let msg = err.to_string();
             assert!(
                 !msg.contains("SCP-IDENT-1054"),
@@ -6121,17 +6563,21 @@ mod tests {
             crate::runtime::register_context(&bi, &ctx_id, "did:dht:z6MkOccupiedCreator", &[])
                 .unwrap();
 
-            let params = PyDict::new(py);
-            params.set_item("mode", "encrypted").unwrap();
+            // A well-formed 32-byte `enc` so control passes the bridge
+            // enc-length check and reaches the `register_ffi_state` Occupied
+            // precheck (which runs BEFORE the KeyPackage consume).
+            let sealed = __sealed(
+                &ctx_id,
+                "did:dht:z6MkOccupiedCreator",
+                vec![0u8; 32],
+                b"bogus-bundle-ciphertext".to_vec(),
+            );
 
             let err = scp
                 .context_join_from_welcome(
-                    &joiner_did,
-                    "did:dht:z6MkOccupiedCreator",
-                    &ctx_id,
-                    &params,
-                    "bogus-reservation-id",
-                    b"bogus-welcome-bytes",
+                    joiner_did,
+                    sealed,
+                    "bogus-reservation-id".to_owned(),
                 )
                 .expect_err("join into an already-registered context must be rejected");
             let msg = err.to_string();
@@ -6145,6 +6591,84 @@ mod tests {
             assert!(
                 crate::runtime::with_ffi_state(&bi, &ctx_id, |_| Ok(())).is_ok(),
                 "the pre-existing FFI state must be preserved on an Occupied-precheck failure"
+            );
+        });
+    }
+
+    /// ADR-049 Phase 2J / FFI-02 Option A (invite export wiring): the new
+    /// `invite_member` bridge export is wired end-to-end — DID validation ->
+    /// supervisor resolution -> inviter signing-key resolution -> live-context
+    /// lookup -> typed error mapping — and rejects the two reachable failure
+    /// modes on the pre-add path.
+    ///
+    /// NOTE ON SCOPE: the `"sealed"` happy-path (and the full creator-seal ->
+    /// joiner-open round-trip) is NOT asserted here because it terminates in the
+    /// MLS add-member step, which is not green on THIS branch — the same
+    /// pre-existing gap the untouched `plain_join_registers_known_context_for_joiner`
+    /// test hits ("the capabilities of the add proposal are insufficient for this
+    /// group"). That is the §5.13.3 `0xFF02` KeyPackage-capabilities work FFI-02
+    /// gates, not a defect in this bridge reshape. The sealed round-trip is
+    /// covered at the E2E layer once that add-member path lands. This test pins
+    /// what IS reachable on the pre-add path so the export is not merely
+    /// compiled-but-dead.
+    ///
+    /// Not false-green: assertion (a) uses a REAL custodied inviter so
+    /// signing-key resolution SUCCEEDS and the error is the live-context lookup
+    /// ("no live context"); assertion (b) uses a non-custodied inviter so it
+    /// fails EARLIER at signing-key resolution ("not found in registry") — the
+    /// two distinct messages prove both seams are exercised, not short-circuited.
+    #[test]
+    #[cfg(feature = "allow_in_memory_custody")]
+    fn invite_member_rejects_unknown_context_and_non_custodied_inviter() {
+        pyo3::prepare_freethreaded_python();
+        crate::init_runtime().ok();
+        Python::with_gil(|py| {
+            let scp = crate::scp::PyScp::new_in_memory_for_test();
+
+            // A custodied creator + a real context so the supervisor is attached
+            // and inviter signing-key resolution can succeed.
+            let creator = scp.identity_create(py, "in_memory", None).unwrap();
+            let creator_did = creator.did().to_owned();
+            let params = PyDict::new(py);
+            params.set_item("mode", "encrypted").unwrap();
+            params.set_item("governance", "single_admin").unwrap();
+            let _handle = scp
+                .context_create(&creator_did, &params)
+                .expect("encrypted single-admin context_create succeeds");
+
+            // (a) A custodied inviter into a NON-EXISTENT context: signing-key
+            // resolution succeeds, then the live-context lookup fails.
+            let unknown_ctx = "d".repeat(64);
+            let err_unknown = scp
+                .invite_member(
+                    unknown_ctx,
+                    creator_did,
+                    "did:dht:z6MkInviteeUnknownCtx".to_owned(),
+                    b"bogus-key-package".to_vec(),
+                    vec![],
+                )
+                .expect_err("inviting into an unknown context must be rejected")
+                .to_string();
+            assert!(
+                err_unknown.contains("no live context"),
+                "expected a live-context lookup rejection (signing-key resolved first), got: {err_unknown}"
+            );
+
+            // (b) A NON-custodied inviter: fails earlier, at signing-key
+            // resolution, before any context lookup.
+            let err_uncustodied = scp
+                .invite_member(
+                    "e".repeat(64),
+                    "did:dht:z6MkNoSuchInviterIdentity".to_owned(),
+                    "did:dht:z6MkInviteeUncustodied".to_owned(),
+                    b"bogus-key-package".to_vec(),
+                    vec![],
+                )
+                .expect_err("a non-locally-custodied inviter must be rejected")
+                .to_string();
+            assert!(
+                err_uncustodied.contains("not found in registry"),
+                "expected an inviter signing-key resolution failure, got: {err_uncustodied}"
             );
         });
     }
