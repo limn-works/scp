@@ -913,7 +913,11 @@ fn napi_invite_member_reaches_supervisor_seam() {
 #[test]
 fn uniffi_reserve_key_package_reaches_supervisor_seam() {
     assert!(
-        fn_body_contains(UNIFFI_BRIDGE_SRC, "reserve_key_package", ".reserve_key_package("),
+        fn_body_contains(
+            UNIFFI_BRIDGE_SRC,
+            "reserve_key_package",
+            ".reserve_key_package("
+        ),
         "UniFFI reserve_key_package must reach Supervisor::reserve_key_package \
          (mints the single-use MLS KeyPackage)"
     );

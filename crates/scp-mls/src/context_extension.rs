@@ -503,8 +503,11 @@ mod tests {
         let carol_cred = test_credential("carol");
         let carol_wrapping = [0xCC_u8; 32];
         let (carol_kp, _carol_signer, _carol_provider) =
-            crate::group::generate_key_package_with_context_params(&carol_cred, Some(&carol_wrapping))
-                .unwrap();
+            crate::group::generate_key_package_with_context_params(
+                &carol_cred,
+                Some(&carol_wrapping),
+            )
+            .unwrap();
         let carol_kp_in: KeyPackageIn = carol_kp.key_package().clone().into();
         let add_carol = crate::group::add_member(&mut alice_group, carol_kp_in).unwrap();
 
