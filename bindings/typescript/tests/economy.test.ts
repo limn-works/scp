@@ -12,6 +12,7 @@
 import { describe, expect, it } from "bun:test";
 import { EconomyError } from "../src/errors";
 import { formatAmount } from "../src/index";
+import { mountMockScp } from "./mock-bridge";
 
 describe("formatAmount", () => {
   it("formats a USD amount (2 decimals)", () => {
@@ -74,5 +75,46 @@ describe("formatAmount", () => {
   it("throws on invalid decimals overrides", () => {
     expect(() => formatAmount(1n, { decimals: -1 })).toThrow(EconomyError);
     expect(() => formatAmount(1n, { decimals: 1.5 })).toThrow(EconomyError);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Overflow-sentinel harmonization (ADR-060)
+//
+// The napi bridge returns a `bigint` cost and signals "no result / overflow"
+// with the sentinel `-1n`. The SDK wrapper (`SCP.economyEstimateCost` /
+// `SCP.economyEvaluateFormula`) maps that sentinel to `null` at the boundary so
+// the TS surface matches Python's `int | None` — no bigint-vs-null double-form
+// leaks to callers, and a real `-1`-valued amount is never returned (an `Amount`
+// is unsigned, so `-1n` can only be the sentinel).
+// ---------------------------------------------------------------------------
+
+describe("economy overflow-sentinel harmonization", () => {
+  it("maps the -1n estimateCost sentinel to null", () => {
+    const { scp, native } = mountMockScp();
+    native.__stub("economyEstimateCost", () => -1n);
+    expect(scp.economyEstimateCost("{}", "MessageSend", "{}")).toBeNull();
+  });
+
+  it("returns a real estimateCost bigint unchanged (including 0n)", () => {
+    const { scp, native } = mountMockScp();
+    native.__stub("economyEstimateCost", () => 0n);
+    expect(scp.economyEstimateCost("{}", "MessageSend", "{}")).toBe(0n);
+
+    // A > 2^53 cost survives the wrapper exactly (never narrowed to a number).
+    native.__stub("economyEstimateCost", () => 9_007_199_254_740_993n);
+    expect(scp.economyEstimateCost("{}", "MessageSend", "{}")).toBe(9_007_199_254_740_993n);
+  });
+
+  it("maps the -1n evaluateFormula sentinel to null", () => {
+    const { scp, native } = mountMockScp();
+    native.__stub("economyEvaluateFormula", () => -1n);
+    expect(scp.economyEvaluateFormula("{}", "{}")).toBeNull();
+  });
+
+  it("returns a real evaluateFormula bigint unchanged", () => {
+    const { scp, native } = mountMockScp();
+    native.__stub("economyEvaluateFormula", () => 4_200n);
+    expect(scp.economyEvaluateFormula("{}", "{}")).toBe(4_200n);
   });
 });

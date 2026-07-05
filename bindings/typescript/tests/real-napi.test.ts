@@ -566,6 +566,67 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       expect(parsed).toBeTruthy();
     });
 
+    test("registers a tool whose cost.amount exceeds 2^53 (bigint boundary, ADR-060)", async () => {
+      const identity = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(
+        identity,
+        JSON.stringify({ ceiling: ["tool:register"] }),
+      );
+      // 2^53 + 1 — the first integer a JS `number` cannot hold exactly — and
+      // u64::MAX. Both cross the FFI boundary as a JS `bigint`; a `number`-typed
+      // cost field would have narrowed and either lost precision or thrown.
+      for (const amount of [9_007_199_254_740_993n, 18_446_744_073_709_551_615n]) {
+        const toolId = await napi.toolRegister(ctx, {
+          name: `priced-tool-${amount}`,
+          description: "A tool with a large per-invocation cost",
+          inputSchema: {
+            type: "object",
+            properties: { a: { type: "string" }, b: { type: "number" } },
+            required: ["a", "b"],
+          },
+          outputSchema: {
+            type: "object",
+            properties: { result: { type: "string" }, ok: { type: "boolean" } },
+            required: ["result", "ok"],
+          },
+          operator: identity.did,
+          cost: {
+            amount,
+            currency: "SAT",
+            payee: identity.did,
+          },
+        });
+        expect(typeof toolId).toBe("string");
+        expect(toolId.length).toBeGreaterThan(0);
+      }
+    });
+
+    test("rejects a negative cost.amount (fail-closed, unsigned money)", async () => {
+      const identity = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(
+        identity,
+        JSON.stringify({ ceiling: ["tool:register"] }),
+      );
+      await expect(
+        napi.toolRegister(ctx, {
+          name: "negative-cost-tool",
+          description: "invalid",
+          inputSchema: {
+            type: "object",
+            properties: { a: { type: "string" }, b: { type: "number" } },
+            required: ["a", "b"],
+          },
+          outputSchema: {
+            type: "object",
+            properties: { result: { type: "string" }, ok: { type: "boolean" } },
+            required: ["result", "ok"],
+          },
+          operator: identity.did,
+          cost: { amount: -1n, currency: "SAT", payee: identity.did },
+        }),
+      ).rejects.toThrow(/SCP-VALID-7001/);
+    });
+
     test("verifies a tool and returns a verification result", async () => {
       const identity = await napi.identityCreate("in_memory");
       const ctx = await napi.contextCreate(

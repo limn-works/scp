@@ -2262,12 +2262,16 @@ export class SCP {
   // Domain: Economy
   // ───────────────────────────────────────────────────────────────────────
 
-  economyEstimateCost(policyJson: string, actionType: string, metricsJson: string): bigint {
-    return (this.#native.economyEstimateCost as (p: string, a: string, m: string) => bigint)(
+  economyEstimateCost(policyJson: string, actionType: string, metricsJson: string): bigint | null {
+    // The napi bridge returns a `bigint` cost, signalling "no result / overflow"
+    // with the sentinel `-1n`. Map that to `null` at the wrapper boundary so the
+    // TS surface matches Python's `int | None` (ADR-060).
+    const cost = (this.#native.economyEstimateCost as (p: string, a: string, m: string) => bigint)(
       policyJson,
       actionType,
       metricsJson,
     );
+    return cost === -1n ? null : cost;
   }
 
   economyPolicyRequiresPayment(policyJson: string): boolean {
@@ -2289,11 +2293,15 @@ export class SCP {
     );
   }
 
-  economyEvaluateFormula(formulaJson: string, metricsJson: string): bigint {
-    return (this.#native.economyEvaluateFormula as (f: string, m: string) => bigint)(
+  economyEvaluateFormula(formulaJson: string, metricsJson: string): bigint | null {
+    // As with `economyEstimateCost`, the napi bridge signals "no result /
+    // overflow" with the sentinel `-1n`; normalize it to `null` so the TS
+    // surface matches Python's `int | None` (ADR-060).
+    const cost = (this.#native.economyEvaluateFormula as (f: string, m: string) => bigint)(
       formulaJson,
       metricsJson,
     );
+    return cost === -1n ? null : cost;
   }
 
   economyBudgetRemaining(contextId: string, did: string): bigint {
