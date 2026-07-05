@@ -2533,15 +2533,16 @@ async fn invite_member_broadcasts_the_add_commit_to_existing_members() {
 }
 
 // ---------------------------------------------------------------------------
-// Test M3 — auth by construction: a voting context defers the invite.
+// Test M3 — auth by construction: a voting context refuses the invite.
 // ---------------------------------------------------------------------------
 
 /// A voting governance model (`Threshold`) does NOT authorize a unilateral
-/// invite: routing `AddMember` through the governance gate creates a PENDING
-/// proposal (the proposer's single approval does not meet the 2-of-2
-/// threshold), so `invite_member` returns
-/// [`InviteMemberOutcome::RequiresGovernanceApproval`] and adds NO member — no
-/// sealed bundle, no MLS add. This is the structural auth gate, for free.
+/// invite. `invite_member` refuses BEFORE proposing — it does NOT create a
+/// dead-on-arrival pending proposal — and returns
+/// [`InviteMemberOutcome::RequiresGovernanceApproval`] with `proposal_id: None`,
+/// adding NO member (no sealed bundle, no MLS add, no proposal). This is the
+/// structural auth gate: governed-context invites are not yet implemented, so a
+/// voting context is refused cleanly rather than leaving orphaned state.
 #[tokio::test]
 async fn invite_member_into_voting_context_requires_governance_approval() {
     let ctx_id = ctx_hex(0xd7);
@@ -2580,21 +2581,196 @@ async fn invite_member_into_voting_context_requires_governance_approval() {
             &alice_signing_key(),
         )
         .await
-        .expect("propose succeeds (pending), invite does not error");
+        .expect("a voting context is refused cleanly, invite does not error");
 
+    // The refusal carries NO proposal id — no proposal was created.
     assert!(
         matches!(
             outcome,
-            InviteMemberOutcome::RequiresGovernanceApproval { .. }
+            InviteMemberOutcome::RequiresGovernanceApproval { proposal_id: None }
         ),
-        "a unilateral invite into a voting context defers to governance, it does \
-         not seal a bundle; got {outcome:?}"
+        "a unilateral invite into a voting context is refused before proposing, with no \
+         proposal created; got {outcome:?}"
     );
     // No member was added — the add did not run.
     assert_eq!(
         alice_sup.member_count(&ctx_id).await,
         Some(1),
-        "the deferred invite adds NO member to the voting context"
+        "the refused invite adds NO member to the voting context"
+    );
+    // And NO proposal was created: the SingleAdmin-only gate returns before any
+    // governance proposal is submitted, so the context has zero pending
+    // proposals.
+    assert!(
+        alice_sup
+            .list_proposals(&ctx_id)
+            .await
+            .expect("listing proposals succeeds")
+            .is_empty(),
+        "the refused invite creates NO governance proposal"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test M4 — auth by construction: a non-admin caller cannot invite.
+// ---------------------------------------------------------------------------
+
+/// A non-admin caller inviting into a `SingleAdmin` context is rejected by the
+/// governance gate (`propose_governance_action_checked` verifies the proposer's
+/// `governance:propose` capability, and `SingleAdminEngine::propose` rejects any
+/// non-admin proposer). `invite_member` returns `Err` and adds NO member —
+/// authorization is a property of the governance gate, not an ad-hoc check.
+#[tokio::test]
+async fn invite_member_by_non_admin_is_rejected() {
+    let ctx_id = ctx_hex(0xd8);
+    let alice = DID::from(ALICE_DID);
+    let bob = DID::from(BOB_DID);
+
+    // Alice creates the SingleAdmin context (she is the admin).
+    let (alice_sup, _alice_crypto) = alice_supervisor();
+    alice_sup
+        .create_context(
+            ctx_id.clone(),
+            joiner_params(),
+            alice.clone(),
+            some_pseudonym(),
+        )
+        .await
+        .expect("alice creates the encrypted SingleAdmin context");
+
+    // Bob (NOT the admin, not even a member) reserves a KeyPackage and attempts
+    // to invite himself using HIS OWN signing key as the proposer.
+    let (bob_sup, _bob_crypto) = bob_supervisor(None);
+    let (_reservation_id, kp_public_bytes) = reserve_bob_kp(&bob_sup, &bob).await;
+
+    let result = alice_sup
+        .invite_member(
+            ctx_id.clone(),
+            bob.clone(),
+            bob.clone(),
+            kp_public_bytes,
+            vec![],
+            &bob_signing_key(),
+        )
+        .await;
+
+    assert!(
+        result.is_err(),
+        "a non-admin caller must not be able to invite into a SingleAdmin context; got {result:?}"
+    );
+    // No member was added — the governance gate rejected before the add ran.
+    assert_eq!(
+        alice_sup.member_count(&ctx_id).await,
+        Some(1),
+        "a rejected non-admin invite adds NO member"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test M5 — no zombie member on a post-add sealing/delivery failure (FIX 4).
+// ---------------------------------------------------------------------------
+
+/// A transport that BROADCASTS successfully (so the add's epoch Commit is
+/// delivered and the add itself succeeds) but whose invitation delivery
+/// (`send_to_routing_id`) returns a FATAL (non-`TransportFailed`) error. This
+/// drives the post-add failure path: the invitee is really added, but the sealed
+/// Welcome can never be delivered.
+struct FatalDeliveryTransport;
+
+impl ContextTransportProvider for FatalDeliveryTransport {
+    fn is_connected(&self) -> bool {
+        true
+    }
+
+    fn publish_context(
+        &self,
+        _context_id: &[u8; 32],
+        _params: &ContextParams,
+    ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+        Ok(())
+    }
+
+    fn delete_published(
+        &self,
+        _context_id: &[u8; 32],
+    ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+        Ok(())
+    }
+
+    // Commit broadcast succeeds (so both the add and the compensating remove
+    // deliver their epoch Commits without enqueuing).
+    fn send_message(
+        &self,
+        _context_id: &[u8; 32],
+        _encrypted_payload: &[u8],
+    ) -> Result<(), crate::context::ContextError> {
+        Ok(())
+    }
+
+    // Invitation delivery fails FATALLY (not `TransportFailed`), so the invitee
+    // gets nothing — this is the case that must trigger the compensating remove.
+    fn send_to_routing_id(
+        &self,
+        _routing_id: &[u8; 32],
+        _payload: &[u8],
+        _ttl: u32,
+    ) -> Result<(), crate::context::ContextError> {
+        Err(crate::context::ContextError::CryptoFailed(
+            "fatal invitation delivery failure (test)".to_owned(),
+        ))
+    }
+}
+
+/// Proves FIX 4: after the governance add commits (real MLS add + role_state +
+/// broadcast Commit), a FATAL failure in the invitation sealing/delivery path
+/// must NOT leave a zombie member behind. `invite_member` dispatches a
+/// compensating `RemoveMember` through the same actor governance gate (which
+/// broadcasts its own Commit) and surfaces the original error, so the group is
+/// restored to its pre-invite membership.
+#[tokio::test]
+async fn invite_member_rolls_back_the_add_on_delivery_failure() {
+    let ctx_id = ctx_hex(0xd9);
+    let alice = DID::from(ALICE_DID);
+    let bob = DID::from(BOB_DID);
+
+    let (alice_sup, _alice_crypto) =
+        alice_supervisor_with_transport(Box::new(FatalDeliveryTransport));
+    alice_sup
+        .create_context(
+            ctx_id.clone(),
+            joiner_params(),
+            alice.clone(),
+            some_pseudonym(),
+        )
+        .await
+        .expect("alice creates the encrypted context");
+
+    let (bob_sup, _bob_crypto) = bob_supervisor(None);
+    let (_reservation_id, kp_public_bytes) = reserve_bob_kp(&bob_sup, &bob).await;
+
+    let result = alice_sup
+        .invite_member(
+            ctx_id.clone(),
+            alice.clone(),
+            bob.clone(),
+            kp_public_bytes,
+            vec![],
+            &alice_signing_key(),
+        )
+        .await;
+
+    // The fatal delivery error is surfaced to the caller.
+    assert!(
+        result.is_err(),
+        "a fatal post-add delivery failure surfaces as an error; got {result:?}"
+    );
+    // And the added member was rolled back — no zombie. The compensating remove
+    // ran through the actor governance gate, so the creator's membership is back
+    // to just alice.
+    assert_eq!(
+        alice_sup.member_count(&ctx_id).await,
+        Some(1),
+        "the compensating remove rolls back the added member — no zombie member remains"
     );
 }
 

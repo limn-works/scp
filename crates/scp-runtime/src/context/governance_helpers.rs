@@ -1126,6 +1126,15 @@ pub fn execute_add_member(
     context_id: &str,
     did: &DID,
     role: &str,
+    // The invitee's TLS-serialized MLS `KeyPackage`, carried on the actor
+    // command envelope by the invitation-sealing caller
+    // ([`crate::context::supervisor::Supervisor::invite_member`]) and threaded
+    // through the governance dispatch to here. `Some(..)` on the real
+    // invitation path; `None` on the paths that never carried a real add
+    // (the generic FFI `AddMember` arm and `execute_reset_member` — issue
+    // #2029), where production `add_member` errors and `cfg(test)`/`testing`
+    // returns an empty `AddMemberOutput` (preserving the non-crypto pipeline).
+    key_package: Option<&[u8]>,
     meta: CommitMeta<'_>,
 ) -> Result<scp_protocol::context::builder::AddMemberOutput, ContextError> {
     let CommitMeta {
@@ -1137,16 +1146,23 @@ pub fn execute_add_member(
 
     require_active(&cell.handle)?;
 
-    // `None` key-package bytes: the crypto provider resolves the invitee's
-    // KeyPackage from its per-provider staging slot (populated by the
-    // invitation-sealing caller via `stage_key_package` before dispatching
-    // this add). Under `cfg(test)`/`testing` with no staged KP the provider
-    // returns an empty `AddMemberOutput`, preserving the non-crypto pipeline
-    // tests. This is what makes `GovernanceAction::AddMember` do a REAL MLS
-    // add in production (§5.12.3) rather than erroring on the missing KP.
+    // Bind the supplied KeyPackage to the target DID BEFORE the add: the KP's
+    // MLS credential DID MUST equal `did`, or a caller could add a member under
+    // one DID using a KeyPackage minted for a different identity. Under
+    // `cfg(test)`/`testing` with `None` this is a no-op (matches the mock
+    // fixture); in production a mismatched or malformed KP is rejected here.
+    deps.crypto
+        .validate_key_package(did.as_ref(), key_package)
+        .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
+
+    // The invitee's KeyPackage is carried on the command envelope (`Some` on
+    // the invitation path). Under `cfg(test)`/`testing` with `None` the
+    // provider returns an empty `AddMemberOutput`, preserving the non-crypto
+    // pipeline tests. This is what makes `GovernanceAction::AddMember` do a
+    // REAL MLS add in production (§5.12.3) rather than erroring on a missing KP.
     let add_output = deps
         .crypto
-        .add_member(&context_id_bytes, did, None)
+        .add_member(&context_id_bytes, did, key_package)
         .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
 
     // Clone the Welcome + Commit for the return value (the invitation-sealing
@@ -3345,7 +3361,7 @@ pub async fn execute_cancel_context_migration(
 /// When `check_propose_capability` is `true`, the `GovernancePropose`
 /// capability is verified under the same path as the proposal
 /// submission (actor-owned state — no TOCTOU window).
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub async fn propose_governance_action_inner(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
@@ -3354,6 +3370,11 @@ pub async fn propose_governance_action_inner(
     action: GovernanceAction,
     signing_key: &ed25519_dalek::SigningKey,
     check_propose_capability: bool,
+    // The invitee's MLS `KeyPackage` for an `AddMember` auto-execute, carried on
+    // the actor command envelope by `Supervisor::invite_member` and threaded to
+    // `execute_add_member`. `None` on every path that is not a real invitation
+    // add (governed-context invite is issue #2027).
+    key_package: Option<&[u8]>,
 ) -> Result<
     (
         GovernanceProposal,
@@ -3525,6 +3546,7 @@ pub async fn propose_governance_action_inner(
                 context_id,
                 &proposal.proposal_id,
                 Some(proposer_did),
+                key_package,
             ))
             .await?,
         )
@@ -3698,6 +3720,10 @@ pub async fn propose_governance_action_checked(
     proposer_did: &DID,
     action: GovernanceAction,
     signing_key: &ed25519_dalek::SigningKey,
+    // The invitee's MLS `KeyPackage` for an `AddMember` auto-execute, carried on
+    // the actor command envelope by `Supervisor::invite_member`. `None` for the
+    // generic FFI governance path (which never invites a member here).
+    key_package: Option<&[u8]>,
 ) -> Result<ProposalOutcome, ContextError> {
     let (proposal, _events, execution_result) = propose_governance_action_inner(
         cell,
@@ -3707,6 +3733,7 @@ pub async fn propose_governance_action_checked(
         action,
         signing_key,
         true,
+        key_package,
     )
     .await?;
 
@@ -3850,6 +3877,9 @@ pub async fn vote_on_proposal_inner(
                 context_id,
                 &proposal.proposal_id,
                 Some(voter_did),
+                // The quorum-approval path never carries an invitee KeyPackage
+                // (deferred governed invite is issue #2027).
+                None,
             ))
             .await?;
         }
@@ -4132,6 +4162,11 @@ pub async fn dispatch_context_governance_action(
     deps: &ActorDeps,
     context_id: &str,
     action: &GovernanceAction,
+    // The invitee's MLS `KeyPackage`, threaded from the propose/execute entry
+    // for the `AddMember` action only (the invitation path carries it on the
+    // command envelope). `None` for every other action and for the paths that
+    // never carried a real add (issue #2029).
+    key_package: Option<&[u8]>,
     meta: CommitMeta<'_>,
 ) -> Result<GovernanceActionResult, ContextError> {
     let CommitMeta {
@@ -4147,6 +4182,7 @@ pub async fn dispatch_context_governance_action(
                 context_id,
                 did,
                 role,
+                key_package,
                 CommitMeta {
                     pid,
                     actor_did,
@@ -4391,6 +4427,10 @@ pub async fn dispatch_governance_action(
     // `GovernanceActionExecuted` leaf and spec-correct per ADR-031 §8 /
     // §7.3.1 / ADR-051 §6.
     executor_did: &DID,
+    // The invitee's MLS `KeyPackage` for an `AddMember` auto-execute — carried
+    // on the actor command envelope by `Supervisor::invite_member` and threaded
+    // to `execute_add_member`. `None` on every non-invite execute path.
+    key_package: Option<&[u8]>,
 ) -> Result<GovernanceActionResult, ContextError> {
     let pid = proposal.proposal_id;
     let actor = executor_did.as_ref();
@@ -4625,6 +4665,7 @@ pub async fn dispatch_governance_action(
                 deps,
                 context_id,
                 &proposal.action,
+                key_package,
                 CommitMeta {
                     pid,
                     actor_did: actor,
@@ -4944,6 +4985,12 @@ pub async fn execute_governance_action(
     //   direct path. Spec: ADR-031 §8 "executor DID" / §7.3.1 "committing
     //   member" / ADR-051 §6.
     executor_did: Option<&DID>,
+    // The invitee's MLS `KeyPackage` for an `AddMember` auto-execute, carried on
+    // the actor command envelope by `Supervisor::invite_member` and threaded to
+    // `execute_add_member`. `None` on the vote-approval and direct-execute
+    // paths — those never carry a real KeyPackage (governed-context invite is
+    // issue #2027).
+    key_package: Option<&[u8]>,
 ) -> Result<GovernanceActionResult, ContextError> {
     // ADR-049 §9 Class-S cell seam: this entry holds the cell. The pre-dispatch
     // gate is READ-ONLY (commit-fault gate, authoritative-proposal resolution,
@@ -5032,29 +5079,37 @@ pub async fn execute_governance_action(
         Ok(())
     })?;
 
-    let result =
-        match dispatch_governance_action(cell, deps, context_id, proposal, executor_did).await {
-            Ok(r) => r,
-            Err(e) => {
-                // Roll back the executed marker on dispatch failure so the proposal
-                // can be retried (e.g. after a transient crypto error). The removal
-                // is itself a Class-S transition that must be durable fail-closed
-                // (keep-direction: a crash must not resurrect the marker and block
-                // the retry). It is staged through the deferred-persist token's own
-                // ClassSMut flow — `discharge_with` runs the removal closure
-                // (`ClassSMut::governance_class_s_mut().executed_proposals.remove`)
-                // and then performs the SINGLE fail-closed persist the token already
-                // owed, so the removed-marker state is what lands durably (no
-                // `state_mut`, exactly one persist — the one the token deferred).
-                token.discharge_with(cell, deps, context_id, |mut view| {
-                    view.governance_class_s_mut()
-                        .executed_proposals
-                        .remove(&proposal.proposal_id);
-                    Ok(())
-                })?;
-                return Err(e);
-            }
-        };
+    let result = match dispatch_governance_action(
+        cell,
+        deps,
+        context_id,
+        proposal,
+        executor_did,
+        key_package,
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            // Roll back the executed marker on dispatch failure so the proposal
+            // can be retried (e.g. after a transient crypto error). The removal
+            // is itself a Class-S transition that must be durable fail-closed
+            // (keep-direction: a crash must not resurrect the marker and block
+            // the retry). It is staged through the deferred-persist token's own
+            // ClassSMut flow — `discharge_with` runs the removal closure
+            // (`ClassSMut::governance_class_s_mut().executed_proposals.remove`)
+            // and then performs the SINGLE fail-closed persist the token already
+            // owed, so the removed-marker state is what lands durably (no
+            // `state_mut`, exactly one persist — the one the token deferred).
+            token.discharge_with(cell, deps, context_id, |mut view| {
+                view.governance_class_s_mut()
+                    .executed_proposals
+                    .remove(&proposal.proposal_id);
+                Ok(())
+            })?;
+            return Err(e);
+        }
+    };
 
     // STRENGTHENING (ADR-049 §9, authorized): `finalize_governance_action`'s
     // own persist was best-effort; the executed-marker durability now rides the

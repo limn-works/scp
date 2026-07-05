@@ -1026,11 +1026,13 @@ const INVITATION_TTL_SECS: u32 = 7 * 24 * 60 * 60;
 ///   `InvitationBundle` for the invitee.
 /// - [`Self::RequiresGovernanceApproval`] — the context uses a voting
 ///   governance model (Threshold / Majority / Unanimity), so a unilateral
-///   invite is NOT authorized. A governance proposal was created and is
-///   pending; NO MLS add ran and NO bundle was produced. The invitee is added
-///   only if the proposal is later approved and executed (a separate
-///   capability, out of scope here). This is a first-class success outcome,
-///   not an error.
+///   invite is NOT authorized. NO proposal was created, NO KeyPackage was
+///   staged, NO MLS add ran, and NO bundle was produced: `invite_member`
+///   refuses BEFORE proposing rather than leaving a dead-on-arrival pending
+///   proposal. Governed-context invites (which would create + track a proposal,
+///   then seal the Welcome once it is approved and executed) are not yet
+///   implemented — see the governed-invite follow-up. This is a first-class
+///   success outcome, not an error.
 #[derive(Debug, Clone)]
 pub enum InviteMemberOutcome {
     /// The invitation was sealed and (best-effort) delivered.
@@ -1048,12 +1050,15 @@ pub enum InviteMemberOutcome {
         /// `(enc, ciphertext)` itself).
         delivered: bool,
     },
-    /// The context requires a governance vote; a pending proposal was created
-    /// and no member was added. Carries the created proposal's id so the
-    /// caller can track it.
+    /// The context requires a governance vote, so a unilateral invite is not
+    /// authorized. No proposal was created and no member was added (governed-
+    /// context invites are not yet implemented).
     RequiresGovernanceApproval {
-        /// The id of the pending `AddMember` governance proposal.
-        proposal_id: scp_protocol::context::governance::ProposalId,
+        /// Always `None` today: no proposal is created for a voting context (the
+        /// invite is refused before proposing). Reserved to carry the tracked
+        /// `AddMember` proposal id once governed-context invites are
+        /// implemented.
+        proposal_id: Option<scp_protocol::context::governance::ProposalId>,
     },
 }
 
@@ -10484,17 +10489,20 @@ impl Supervisor {
     /// 2. Resolves the invitee's `#active` verifying key via the
     ///    [`key_resolver`](Self::key_resolver_ref) and maps it to X25519 (RFC
     ///    7748) as the HPKE recipient key.
-    /// 3. Routes the member-add through the context actor's governance gate
-    ///    (`propose_governance_action` → `AddMember`). For a `SingleAdmin`
-    ///    context the caller-as-admin auto-executes: the real MLS add for
-    ///    `invitee_key_package` (the invitee's reserved KeyPackage bytes from
-    ///    [`Self::reserve_key_package`], staged on the crypto provider so the
-    ///    governance add resolves it) runs IN-ACTOR — updating `role_state`,
-    ///    minting access keys, appending the event-log leaf, and broadcasting
-    ///    the epoch-advancing Commit to existing members — and returns the
-    ///    Welcome. A voting context instead creates a pending proposal and
-    ///    returns [`InviteMemberOutcome::RequiresGovernanceApproval`] (no add,
-    ///    no bundle). A non-admin caller is rejected by the governance engine.
+    /// 3. Only a `SingleAdmin` context is supported (a voting model returns
+    ///    [`InviteMemberOutcome::RequiresGovernanceApproval`] up front — no
+    ///    proposal, no add). Routes the member-add through the context actor's
+    ///    governance gate (`propose_governance_action_checked` → `AddMember`),
+    ///    carrying `invitee_key_package` (the invitee's reserved KeyPackage bytes
+    ///    from [`Self::reserve_key_package`]) on the actor command envelope. The
+    ///    caller-as-admin auto-executes: the real MLS add for the carried
+    ///    KeyPackage runs IN-ACTOR — updating `role_state`, minting access keys,
+    ///    appending the event-log leaf, and broadcasting the epoch-advancing
+    ///    Commit to existing members — and returns the Welcome. A non-admin
+    ///    caller is rejected by the checked capability check / governance engine
+    ///    (`?` surfaces the error, nothing is added). If any post-add step fails,
+    ///    a compensating `RemoveMember` is routed through the same gate so no
+    ///    added member is left without the sealed Welcome.
     /// 4. Assembles the bundle: genesis `context_params`, the visibility-filtered
     ///    [`MetadataSnapshot`](scp_protocol::context::metadata::MetadataSnapshot),
     ///    `relay_urls`, and the §9.10.4.B `context_metadata_key`.
@@ -10558,8 +10566,8 @@ impl Supervisor {
         relay_urls: Vec<String>,
         proposer_signing_key: &ed25519_dalek::SigningKey,
     ) -> Result<InviteMemberOutcome, ContextError> {
-        use ed25519_dalek::Signer as _;
         use rand::RngCore as _;
+        use scp_protocol::context::governance::GovernanceAction;
         use scp_protocol::context::{InvitationBundle, InvitationKeyMaterial};
         use scp_protocol::crypto::envelope_seal;
 
@@ -10575,6 +10583,21 @@ impl Supervisor {
                  sender-key distribution flow, not an MLS Welcome"
                     .to_owned(),
             ));
+        }
+
+        // FIX 3 — governed-context gate: only a `SingleAdmin` context authorizes
+        // a UNILATERAL invite (the admin auto-executes the add). A voting model
+        // (Threshold / Majority / Unanimity) requires a governance vote, so a
+        // unilateral invite is NOT authorized. Refuse HERE — before proposing —
+        // so we never leave a dead-on-arrival pending `AddMember` proposal, never
+        // stage a KeyPackage, and never run an MLS add. Governed-context invites
+        // (create + track a proposal, seal the Welcome once approved) are not yet
+        // implemented (a deferred follow-up).
+        if !matches!(
+            params.governance,
+            scp_protocol::context::params::GovernanceModel::SingleAdmin
+        ) {
+            return Ok(InviteMemberOutcome::RequiresGovernanceApproval { proposal_id: None });
         }
 
         // 2. Resolve the invitee's #active key -> X25519 recipient.
@@ -10598,33 +10621,26 @@ impl Supervisor {
         //    (structural — replaces the prior off-mailbox `deps.crypto.add_member`
         //    that bypassed the actor, dropping the epoch Commit, skipping the
         //    creator's `role_state` update, racing the mailbox, and enforcing NO
-        //    authorization). Routing through `propose_governance_action`:
-        //    - AUTHORIZES by construction: `SingleAdminEngine::propose` rejects
-        //      any proposer that is not the admin (`NotAdmin`); a voting model
-        //      returns a PENDING proposal (no auto-execution).
+        //    authorization). Routing through `propose_governance_action_checked`:
+        //    - AUTHORIZES by construction: the checked variant verifies the
+        //      proposer's `governance:propose` capability in-lock, and
+        //      `SingleAdminEngine::propose` rejects any proposer that is not the
+        //      admin (`NotAdmin`). A non-admin caller is rejected here — nothing
+        //      is added — so the `?` surfaces that authorization failure.
         //    - runs the REAL MLS add + `role_state` sync + access keys +
         //      event-log leaf ATOMICALLY in-actor (`execute_add_member`), and
         //      BROADCASTS the epoch-advancing Commit to existing members.
         //
-        //    The invitee's reserved KeyPackage is not carried on the (signed,
-        //    logged) governance proposal, so stage it on the crypto provider
-        //    keyed by the invitee DID BEFORE dispatching; `execute_add_member`'s
-        //    `add_member(None)` resolves + consumes it. If the add does not run
-        //    (voting model) or the dispatch fails, un-stage it so no KeyPackage
-        //    is left resident.
-        let context_id_bytes = crate::context::state::context_id_to_bytes(&context_id);
-        let deps = self.build_actor_deps(&creator_did).await?;
-        deps.crypto.stage_key_package(
-            &context_id_bytes,
-            invitee_did.as_ref(),
-            &invitee_key_package,
-        );
-
-        let propose_result = self
-            .propose_governance_action(
+        //    The invitee's reserved KeyPackage is carried on the actor command
+        //    envelope (NOT on the signed/logged governance proposal) and threaded
+        //    to `execute_add_member`, which binds it to the invitee DID and does
+        //    the real add. On a propose failure nothing was added, so there is
+        //    nothing to clean up.
+        let outcome = self
+            .propose_governance_action_checked_carrying_key_package(
                 &context_id,
                 &creator_did,
-                scp_protocol::context::governance::GovernanceAction::AddMember {
+                GovernanceAction::AddMember {
                     // The joiner self-assigns the default "member" role in
                     // `build_welcome_joiner_state`; the creator-side add MUST
                     // match it, so this is protocol-fixed, not a free parameter.
@@ -10632,140 +10648,199 @@ impl Supervisor {
                     role: "member".to_owned(),
                 },
                 proposer_signing_key,
+                Some(invitee_key_package),
             )
-            .await;
+            .await?;
 
-        let (proposal, _events, execution_result) = match propose_result {
-            Ok(tuple) => tuple,
-            Err(e) => {
-                // Dispatch / authorization failure (e.g. `NotAdmin`): nothing
-                // was added — drop the staged KeyPackage and surface the error.
-                deps.crypto
-                    .unstage_key_package(&context_id_bytes, invitee_did.as_ref());
-                return Err(e);
-            }
-        };
-
-        let welcome_message = match execution_result {
+        let welcome_message = match outcome.execution_result {
             Some(crate::context::state::GovernanceActionResult::MemberAdded {
                 welcome_bytes,
                 ..
             }) => welcome_bytes.0,
             None => {
-                // Voting model: the unilateral invite is not authorized — a
-                // pending proposal was created. Un-stage the KeyPackage (the add
-                // did not run) and report the pending proposal as a first-class
-                // outcome (NOT an error, NOT a fabricated bundle).
-                deps.crypto
-                    .unstage_key_package(&context_id_bytes, invitee_did.as_ref());
-                return Ok(InviteMemberOutcome::RequiresGovernanceApproval {
-                    proposal_id: proposal.proposal_id,
-                });
+                // Gated to `SingleAdmin` above, so an auto-execute is expected.
+                // No execution means the add did NOT run (e.g. governance frozen
+                // or a conflict invalidated the proposal) — so NO member was
+                // added. Surface an error; do NOT report a governance-approval
+                // outcome (this is not a voting context) and do NOT compensate
+                // (there is nothing to remove).
+                return Err(ContextError::GovernanceFailed(
+                    "invite_member: SingleAdmin AddMember did not auto-execute (governance frozen \
+                     or the proposal was invalidated); no member was added"
+                        .to_owned(),
+                ));
             }
             Some(other) => {
-                deps.crypto
-                    .unstage_key_package(&context_id_bytes, invitee_did.as_ref());
                 return Err(ContextError::GovernanceFailed(format!(
                     "invite_member: governance AddMember returned an unexpected result: {other:?}"
                 )));
             }
         };
-        if welcome_message.is_empty() {
-            return Err(ContextError::MembershipFailed(
-                "invite_member: in-actor MLS add-member produced no Welcome message".to_owned(),
-            ));
-        }
 
-        // 4. Assemble the visibility-filtered metadata snapshot + key material.
-        let member_count = self
-            .member_count(&context_id)
-            .await
-            .map(|n| u64::try_from(n).unwrap_or(u64::MAX));
-        let facts = crate::context::invitation_helpers::SnapshotRuntimeFacts {
-            member_count,
-            creator_did: Some(creator_did.clone()),
-            tool_count: Some(u64::try_from(params.tools.len()).unwrap_or(u64::MAX)),
-            ..crate::context::invitation_helpers::SnapshotRuntimeFacts::default()
-        };
-        let metadata_snapshot =
-            crate::context::invitation_helpers::build_metadata_snapshot(&params, facts);
-
-        let mut metadata_key = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut metadata_key);
-        let key_material = InvitationKeyMaterial {
-            context_metadata_key: metadata_key,
-            sender_key_seed: None,
-        };
-
-        // 5. Build + sign the bundle with the creator's #active key. The SAME
-        //    key just authorized (and signed) the governance `AddMember`
-        //    proposal, so signing the bundle here with it — rather than a
-        //    separate closure — makes it STRUCTURALLY impossible for the
-        //    authenticated `creator_did` on the bundle to diverge from the DID
-        //    the governance gate authorized (a two-signing-input design could
-        //    sign the proposal under admin A while sealing a bundle claiming
-        //    creator B; the joiner would only catch it after burning its
-        //    single-use KeyPackage). One key, one identity, checked up-front.
-        let mut bundle = InvitationBundle {
-            context_id: context_id.clone(),
-            creator_did: creator_did.clone(),
-            relay_urls,
-            welcome_message,
-            key_material,
-            context_params: params,
-            metadata_snapshot,
-            signature: Vec::new(),
-        };
-        let signing_hash = bundle.invitation_bundle_signing_hash().map_err(|e| {
-            ContextError::CryptoFailed(format!("invite_member: signing-hash failed: {e}"))
-        })?;
-        bundle.signature = proposer_signing_key.sign(&signing_hash).to_bytes().to_vec();
-
-        // 6. HPKE-seal the serialized bundle to the invitee. `wire` carries the
-        //    plaintext `context_metadata_key` (§9.10.4.B) — hold it in
-        //    `Zeroizing` so the serialized bundle zeroes on drop.
-        let wire = zeroize::Zeroizing::new(bundle.to_wire_bytes().map_err(|e| {
-            ContextError::CryptoFailed(format!("invite_member: bundle serialize failed: {e}"))
-        })?);
-        let (ciphertext, enc) = envelope_seal::hpke_seal_invitation(
-            &wire,
-            &recipient_x25519,
-            &context_id,
-            creator_did.as_ref(),
-        )
-        .map_err(|e| ContextError::CryptoFailed(format!("invite_member: HPKE seal failed: {e}")))?;
-
-        // 7. Fork C — deliver to the invitee's scp-invitations routing id when the
-        //    transport supports routing-id delivery; otherwise the caller delivers.
-        let sealed = crate::context::invitation_helpers::SealedInvitation {
-            context_id: context_id.clone(),
-            creator_did,
-            enc: enc.to_vec(),
-            ciphertext: ciphertext.clone(),
-        };
-        let payload = sealed.to_wire_bytes().map_err(|e| {
-            ContextError::CryptoFailed(format!("invite_member: delivery serialize failed: {e}"))
-        })?;
-        let routing_id = envelope_seal::derive_invitation_routing_id(invitee_did.as_ref());
-        let delivered = match self.transport_ref() {
-            Some(transport) => {
-                match transport.send_to_routing_id(&routing_id, &payload, INVITATION_TTL_SECS) {
-                    Ok(()) => true,
-                    // A transport that does not support routing-id delivery (or is
-                    // offline) returns TransportFailed; the (enc, ct) are still
-                    // returned for the caller to deliver. Any other error is fatal.
-                    Err(ContextError::TransportFailed(_)) => false,
-                    Err(e) => return Err(e),
-                }
+        // The member is now ADDED (real MLS add + role_state + broadcast Commit).
+        // Every remaining step (sign / serialize / HPKE-seal / deliver) is
+        // fallible, so run them in a fallible region; on ANY failure the group
+        // would otherwise retain a member who never receives the sealed Welcome
+        // (a zombie), so we dispatch a COMPENSATING remove through the same actor
+        // governance gate (which broadcasts its own Commit, restoring epoch
+        // consistency) before surfacing the error (FIX 4).
+        let seal_result: Result<InviteMemberOutcome, ContextError> = async {
+            if welcome_message.is_empty() {
+                return Err(ContextError::MembershipFailed(
+                    "invite_member: in-actor MLS add-member produced no Welcome message".to_owned(),
+                ));
             }
-            None => false,
-        };
 
-        Ok(InviteMemberOutcome::Sealed {
-            enc,
-            ciphertext,
-            delivered,
-        })
+            // 4. Assemble the visibility-filtered metadata snapshot + key material.
+            let member_count = self
+                .member_count(&context_id)
+                .await
+                .map(|n| u64::try_from(n).unwrap_or(u64::MAX));
+            let facts = crate::context::invitation_helpers::SnapshotRuntimeFacts {
+                member_count,
+                creator_did: Some(creator_did.clone()),
+                tool_count: Some(u64::try_from(params.tools.len()).unwrap_or(u64::MAX)),
+                ..crate::context::invitation_helpers::SnapshotRuntimeFacts::default()
+            };
+            let metadata_snapshot =
+                crate::context::invitation_helpers::build_metadata_snapshot(&params, facts);
+
+            let mut metadata_key = [0u8; 32];
+            rand::rngs::OsRng.fill_bytes(&mut metadata_key);
+            let key_material = InvitationKeyMaterial {
+                context_metadata_key: metadata_key,
+                sender_key_seed: None,
+            };
+
+            // 5. Build + sign the bundle with the creator's #active key. The SAME
+            //    key just authorized (and signed) the governance `AddMember`
+            //    proposal, so signing the bundle here with it makes it
+            //    STRUCTURALLY impossible for the authenticated `creator_did` on
+            //    the bundle to diverge from the DID the governance gate authorized
+            //    (a two-signing-input design could sign the proposal under admin A
+            //    while sealing a bundle claiming creator B; the joiner would only
+            //    catch it after burning its single-use KeyPackage). One key, one
+            //    identity, checked up-front.
+            let mut bundle = InvitationBundle {
+                context_id: context_id.clone(),
+                creator_did: creator_did.clone(),
+                relay_urls,
+                welcome_message,
+                key_material,
+                context_params: params,
+                metadata_snapshot,
+                signature: Vec::new(),
+            };
+            bundle.sign(proposer_signing_key).map_err(|e| {
+                ContextError::CryptoFailed(format!("invite_member: bundle sign failed: {e}"))
+            })?;
+
+            // 6. HPKE-seal the serialized bundle to the invitee. `wire` carries
+            //    the plaintext `context_metadata_key` (§9.10.4.B) — hold it in
+            //    `Zeroizing` so the serialized bundle zeroes on drop.
+            let wire = zeroize::Zeroizing::new(bundle.to_wire_bytes().map_err(|e| {
+                ContextError::CryptoFailed(format!("invite_member: bundle serialize failed: {e}"))
+            })?);
+            let (ciphertext, enc) = envelope_seal::hpke_seal_invitation(
+                &wire,
+                &recipient_x25519,
+                &context_id,
+                creator_did.as_ref(),
+            )
+            .map_err(|e| {
+                ContextError::CryptoFailed(format!("invite_member: HPKE seal failed: {e}"))
+            })?;
+
+            // 7. Fork C — deliver to the invitee's scp-invitations routing id when
+            //    the transport supports routing-id delivery; otherwise the caller
+            //    delivers.
+            let sealed = crate::context::invitation_helpers::SealedInvitation {
+                context_id: context_id.clone(),
+                creator_did: creator_did.clone(),
+                enc: enc.to_vec(),
+                ciphertext: ciphertext.clone(),
+            };
+            let payload = sealed.to_wire_bytes().map_err(|e| {
+                ContextError::CryptoFailed(format!("invite_member: delivery serialize failed: {e}"))
+            })?;
+            let routing_id = envelope_seal::derive_invitation_routing_id(invitee_did.as_ref());
+            let delivered = match self.transport_ref() {
+                Some(transport) => {
+                    match transport.send_to_routing_id(&routing_id, &payload, INVITATION_TTL_SECS) {
+                        Ok(()) => true,
+                        // A transport that does not support routing-id delivery (or
+                        // is offline) returns TransportFailed; this is NON-FATAL:
+                        // the (enc, ct) are returned for the caller to deliver, so
+                        // the invitee still receives the sealed Welcome — no zombie,
+                        // no compensating remove. Any OTHER transport error is
+                        // fatal (the invitee gets nothing), so it propagates and
+                        // triggers the compensating remove below.
+                        Err(ContextError::TransportFailed(_)) => false,
+                        Err(e) => return Err(e),
+                    }
+                }
+                None => false,
+            };
+
+            Ok(InviteMemberOutcome::Sealed {
+                enc,
+                ciphertext,
+                delivered,
+            })
+        }
+        .await;
+
+        match seal_result {
+            Ok(outcome) => Ok(outcome),
+            Err(e) => {
+                // FIX 4 — compensating remove: the member was added but the
+                // invitation could not be sealed/delivered, so route a
+                // RemoveMember through the SAME actor governance gate. The remove
+                // runs in-actor (real MLS remove + role_state strip) and
+                // broadcasts its own epoch-advancing Commit, so no member is left
+                // who never received the Welcome and the group stays epoch-
+                // consistent. Best-effort: if the compensation ITSELF fails we
+                // log loudly (a member may linger) but still surface the original
+                // sealing error.
+                match self
+                    .propose_governance_action_checked_carrying_key_package(
+                        &context_id,
+                        &creator_did,
+                        GovernanceAction::RemoveMember {
+                            did: invitee_did.clone(),
+                            reason: Some(
+                                "invitation could not be sealed/delivered after the add".to_owned(),
+                            ),
+                        },
+                        proposer_signing_key,
+                        None,
+                    )
+                    .await
+                {
+                    Ok(_) => {
+                        tracing::warn!(
+                            context_id = %context_id,
+                            invitee = %invitee_did,
+                            error = %e,
+                            "invite_member: sealing failed after the add; compensating remove \
+                             succeeded — the added member was rolled back"
+                        );
+                    }
+                    Err(remove_err) => {
+                        tracing::error!(
+                            context_id = %context_id,
+                            invitee = %invitee_did,
+                            error = %e,
+                            compensating_remove_error = %remove_err,
+                            "invite_member: sealing failed after the add AND the compensating \
+                             remove failed — the invitee may remain a member without ever \
+                             receiving the sealed Welcome; manual removal required"
+                        );
+                    }
+                }
+                Err(e)
+            }
+        }
     }
 
     // (WelcomeJoinRequest is defined at module scope below the impl.)
@@ -11932,6 +12007,9 @@ impl Supervisor {
                 signing_key: crate::context::actor::commands::SigningKeyBytes::from_signing_key(
                     signing_key,
                 ),
+                // The unchecked propose path never carries an invitee KeyPackage
+                // (the invitation path uses the checked variant).
+                key_package: None,
             },
         );
         let cmd = GovernanceCommand::ProposeGovernanceAction { payload, reply: tx };
@@ -11957,6 +12035,38 @@ impl Supervisor {
         action: scp_protocol::context::governance::GovernanceAction,
         signing_key: &ed25519_dalek::SigningKey,
     ) -> Result<crate::context::state::ProposalOutcome, ContextError> {
+        self.propose_governance_action_checked_carrying_key_package(
+            context_id,
+            proposer_did,
+            action,
+            signing_key,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::propose_governance_action_checked`] carrying an optional invitee
+    /// `KeyPackage` on the in-process actor command envelope.
+    ///
+    /// The `KeyPackage` rides the actor command (NOT the signed/logged
+    /// [`GovernanceAction`](scp_protocol::context::governance::GovernanceAction)
+    /// wire type) and is threaded to `execute_add_member` for an `AddMember`
+    /// auto-execute, so the governance add performs a REAL MLS add (§5.12.3).
+    /// Only [`Self::invite_member`] supplies `Some(..)`; the public
+    /// [`Self::propose_governance_action_checked`] (the generic FFI governance
+    /// path) delegates here with `None`.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`ContextError`] from the handler.
+    async fn propose_governance_action_checked_carrying_key_package(
+        &self,
+        context_id: &str,
+        proposer_did: &DID,
+        action: scp_protocol::context::governance::GovernanceAction,
+        signing_key: &ed25519_dalek::SigningKey,
+        key_package: Option<Vec<u8>>,
+    ) -> Result<crate::context::state::ProposalOutcome, ContextError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let payload = Box::new(
             crate::context::actor::commands::ProposeGovernanceActionPayload {
@@ -11966,6 +12076,7 @@ impl Supervisor {
                 signing_key: crate::context::actor::commands::SigningKeyBytes::from_signing_key(
                     signing_key,
                 ),
+                key_package,
             },
         );
         let cmd = GovernanceCommand::ProposeGovernanceActionChecked { payload, reply: tx };

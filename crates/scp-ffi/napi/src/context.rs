@@ -3578,6 +3578,9 @@ pub(crate) async fn context_governance_propose_on(
             proposer_did: did,
             action,
             signing_key: SigningKeyBytes::from_signing_key(&signing_key),
+            // The generic FFI governance path never carries an invitee
+            // KeyPackage (that rides only Supervisor::invite_member).
+            key_package: None,
         }),
         reply: tx,
     };

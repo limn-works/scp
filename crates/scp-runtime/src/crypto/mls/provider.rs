@@ -392,24 +392,6 @@ pub struct MlsCryptoProvider {
     /// [`Self::take_crypto_state`] is removed from this map and recorded
     /// in [`Self::taken_context_ids`].
     contexts: DashMap<[u8; 32], ContextCryptoState>,
-    /// Staged invitee `KeyPackage`s awaiting a governance `AddMember`
-    /// execution, keyed by `(context_id, invitee_did)`.
-    ///
-    /// The governance `AddMember` path ([`crate::context::governance_helpers::execute_add_member`])
-    /// calls [`Self::add_member`] with `None` key-package bytes — it does not
-    /// carry the invitee's `KeyPackage` on the (signed, logged) governance
-    /// proposal. The invitation-sealing caller
-    /// ([`crate::context::supervisor::Supervisor::invite_member`]) stages the
-    /// invitee's reserved `KeyPackage` here via [`Self::stage_key_package`] BEFORE
-    /// dispatching the proposal; the `None`-branch of `add_member` resolves and
-    /// consumes it, so the governance add performs a REAL MLS add. This is the
-    /// local stand-in for a published-`KeyPackage` directory / DHT fetch. Entries
-    /// are removed on use (or explicitly un-staged when the add does not run —
-    /// e.g. a voting context defers the proposal).
-    ///
-    /// Lock-free [`DashMap`]; the `KeyPackage` is the invitee's PUBLIC credential
-    /// (no private key material).
-    staged_key_packages: DashMap<([u8; 32], String), Vec<u8>>,
     /// Broadcast keys for broadcast-mode contexts.
     ///
     /// Lock-free [`DashMap`] — same migration path as
@@ -543,7 +525,6 @@ impl MlsCryptoProvider {
             mls_backend,
             hpke_backend,
             contexts: DashMap::new(),
-            staged_key_packages: DashMap::new(),
             broadcast_keys: DashMap::new(),
             wrapping_public_key: ArcSwap::from_pointee(wrapping_public_key),
             wrapping_secret_key: ArcSwap::from_pointee(Zeroizing::new(wrapping_secret_key)),
@@ -1091,33 +1072,6 @@ impl MlsCryptoProvider {
         Ok(())
     }
 
-    /// Stages an invitee's `KeyPackage` for a later governance `AddMember`
-    /// execution on `context_id`, keyed by `member_did`. See
-    /// [`Self::staged_key_packages`]. Overwrites any prior staged `KeyPackage`
-    /// for the same `(context, did)`.
-    pub fn stage_key_package(
-        &self,
-        context_id: &[u8; 32],
-        member_did: &str,
-        key_package_bytes: &[u8],
-    ) {
-        self.staged_key_packages.insert(
-            (*context_id, member_did.to_owned()),
-            key_package_bytes.to_vec(),
-        );
-    }
-
-    /// Removes (without consuming via an add) a previously staged invitee
-    /// `KeyPackage`. Idempotent — returns the staged bytes if present, `None`
-    /// otherwise. Called by the invitation-sealing caller when the governance
-    /// add did NOT run (e.g. a voting context deferred the proposal), so no
-    /// stale `KeyPackage` is left resident.
-    pub fn unstage_key_package(&self, context_id: &[u8; 32], member_did: &str) -> Option<Vec<u8>> {
-        self.staged_key_packages
-            .remove(&(*context_id, member_did.to_owned()))
-            .map(|(_k, v)| v)
-    }
-
     /// Adds a member to the MLS group (ADR-001 `add_member()`).
     ///
     /// Returns an [`AddMemberOutput`](scp_protocol::context::builder::AddMemberOutput)
@@ -1130,11 +1084,11 @@ impl MlsCryptoProvider {
     /// * `context_id` - The 32-byte context identifier.
     /// * `member_did` - The DID of the member to add.
     /// * `key_package_bytes` - Optional TLS-serialized MLS `KeyPackage` bytes.
-    ///   When `None`, a `KeyPackage` previously staged for `member_did` via
-    ///   [`Self::stage_key_package`] is resolved and consumed (the governance
-    ///   `AddMember` path). With neither an explicit nor a staged `KeyPackage`,
-    ///   mock providers (`cfg(test)`/`testing`) return an empty output and
-    ///   production returns an error.
+    ///   The governance `AddMember` path carries the invitee's reserved
+    ///   `KeyPackage` on the actor command envelope and passes it here as
+    ///   `Some(..)`. With `None` (no `KeyPackage`), mock providers
+    ///   (`cfg(test)`/`testing`) return an empty output and production returns
+    ///   an error.
     ///
     /// # Errors
     ///
@@ -1146,33 +1100,25 @@ impl MlsCryptoProvider {
         member_did: &str,
         key_package_bytes: Option<&[u8]>,
     ) -> Result<scp_protocol::context::builder::AddMemberOutput, ContextError> {
-        // An explicit KeyPackage takes precedence. When `None`, resolve a
-        // staged invitee KeyPackage (the governance `AddMember` path — the
-        // caller stages the KP before dispatching the proposal). Resolving
-        // consumes the staged entry so a retry must re-stage.
+        // The invitee's KeyPackage is supplied explicitly (the governance
+        // `AddMember` path carries it on the actor command envelope).
         if let Some(bytes) = key_package_bytes {
             return self.add_member_from_bytes(context_id, member_did, bytes);
         }
-        if let Some((_k, staged)) = self
-            .staged_key_packages
-            .remove(&(*context_id, member_did.to_owned()))
-        {
-            return self.add_member_from_bytes(context_id, member_did, &staged);
-        }
 
-        // No explicit and no staged KeyPackage. Under the `testing` feature or
-        // `cfg(test)`, `None` key-package bytes were previously handled by the
-        // no-op `MockCrypto` fixture (deleted in ADR-049 commit 12c.9e).
-        // Preserve the mock-equivalent return so integration tests that don't
-        // produce real MLS key packages continue to exercise the non-crypto
-        // pipeline — role state sync, event logging, governance side effects.
+        // No KeyPackage. Under the `testing` feature or `cfg(test)`, `None`
+        // key-package bytes were previously handled by the no-op `MockCrypto`
+        // fixture (deleted in ADR-049 commit 12c.9e). Preserve the
+        // mock-equivalent return so integration tests that don't produce real
+        // MLS key packages continue to exercise the non-crypto pipeline — role
+        // state sync, event logging, governance side effects.
         if cfg!(any(test, feature = "testing")) {
             let _ = member_did; // used only by the real path
             return Ok(scp_protocol::context::builder::AddMemberOutput::default());
         }
         Err(ContextError::CryptoFailed(
             "production MlsCryptoProvider requires MLS key package bytes for add_member \
-             (none supplied and none staged for this member)"
+             (none supplied for this member)"
                 .to_string(),
         ))
     }
