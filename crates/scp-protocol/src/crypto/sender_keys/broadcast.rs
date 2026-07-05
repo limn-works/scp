@@ -2118,7 +2118,7 @@ mod tests {
         let hash = compute_provenance_hash(Some(&provenance)).unwrap();
         let hex = hex::encode(hash);
         assert_eq!(
-            hex, "d49aed04eda886b9cef513ac16965e7194f7574b0422ae4753d5f89cb6bcbaa5",
+            hex, "12ea6cf53e3e2fe1c851214d6c9b1acf1338e835bcb91271c8bcdf04e553ce68",
             "provenance_hash KAT drift — see §25 Vector 35 / §24.3.3"
         );
 

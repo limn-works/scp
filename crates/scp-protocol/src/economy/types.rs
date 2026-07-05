@@ -14,15 +14,26 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use scp_did::DID;
 
 // ---------------------------------------------------------------------------
-// Canonical decimal-string wire codec (ADR-060)
+// Monetary wire codec (ADR-060) — human-readable / binary split
 // ---------------------------------------------------------------------------
 //
-// Monetary values serialize on the wire as a canonical base-10 decimal STRING
-// encoding the smallest-unit integer (the scale stays with `currency` /
-// `COEFFICIENT_SCALE`). The wire form is decoupled from the Rust core width so
-// a future `u64` -> `u128` widening is non-breaking on every serde encoding,
-// and reimplementations (notably JS `JSON.parse`, which cannot round-trip a
-// `u64`) reproduce the bytes exactly. See ADR-060 and spec §19.
+// Monetary values (`Amount`, `Coefficient`) pick their wire form by encoding
+// class, via `Serializer::is_human_readable()`:
+//
+//   * Human-readable formats (JSON) — a canonical base-10 decimal STRING of the
+//     smallest-unit integer. JSON numbers are not safely round-trippable as a
+//     64-bit integer in every target (JS `JSON.parse` widens to an IEEE-754
+//     double, silently corrupting values above 2^53, with no parse hook), so the
+//     string keeps every reimplementation byte-exact.
+//
+//   * Binary formats (MessagePack) — the NATIVE integer (`u64` / `i64`).
+//     MessagePack encodes an exact 64-bit integer natively, so it has no parser
+//     hazard to mitigate; keeping it native leaves the binary wire idiomatic and
+//     compact, and every binary KAT / signature preimage byte-identical to its
+//     pre-ADR-060 value.
+//
+// The scale stays with `currency` / `COEFFICIENT_SCALE` in both forms. See
+// ADR-060 and spec §19.15.1.
 
 /// Parses a canonical base-10 *unsigned* decimal string (ADR-060 wire form).
 ///
@@ -79,9 +90,10 @@ fn parse_canonical_i64_str(s: &str) -> Option<i64> {
 ///
 /// See spec section 19.1.1.
 ///
-/// Wire form (ADR-060): serialized as a canonical base-10 decimal string of the
-/// smallest-unit integer (e.g. `"1000000"`, `"0"`), not a JSON number. See spec
-/// §19 and the codec at the top of this module.
+/// Wire form (ADR-060): a canonical base-10 decimal string of the smallest-unit
+/// integer in human-readable formats (JSON, e.g. `"1000000"`, `"0"` — never a
+/// JSON number), and the native `u64` in binary formats (`MessagePack`). See spec
+/// §19.15.1 and the codec at the top of this module.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Amount(pub u64);
 
@@ -145,19 +157,26 @@ impl std::fmt::Display for Amount {
 }
 
 impl Serialize for Amount {
-    /// Serializes as the canonical base-10 decimal string (ADR-060).
+    /// Serializes as the canonical base-10 decimal string in human-readable
+    /// formats (JSON) and as the native `u64` in binary formats (`MessagePack`).
+    /// See ADR-060 and the codec at the top of this module.
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
-        serializer.serialize_str(&self.0.to_string())
+        if serializer.is_human_readable() {
+            serializer.serialize_str(&self.0.to_string())
+        } else {
+            serializer.serialize_u64(self.0)
+        }
     }
 }
 
 impl<'de> Deserialize<'de> for Amount {
-    /// Deserializes strictly from the canonical base-10 decimal string
-    /// (ADR-060). Rejects bare numbers, leading zeros, signs, whitespace,
-    /// separators, and any non-canonical form.
+    /// Deserializes from the canonical base-10 decimal string in human-readable
+    /// formats (JSON — strict: rejects bare numbers, leading zeros, signs,
+    /// whitespace, separators, and any non-canonical form) and from the native
+    /// `u64` in binary formats (`MessagePack`). See ADR-060.
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
@@ -170,10 +189,12 @@ impl<'de> Deserialize<'de> for Amount {
             fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 f.write_str(
                     "a canonical base-10 decimal string encoding an unsigned \
-                     smallest-unit integer (ADR-060), e.g. \"1000000\" or \"0\"",
+                     smallest-unit integer (ADR-060, human-readable formats), \
+                     e.g. \"1000000\" or \"0\", or a native u64 (binary formats)",
                 )
             }
 
+            /// Human-readable path (JSON): strict canonical decimal string.
             fn visit_str<E>(self, value: &str) -> Result<Amount, E>
             where
                 E: de::Error,
@@ -182,9 +203,21 @@ impl<'de> Deserialize<'de> for Amount {
                     .map(Amount)
                     .ok_or_else(|| de::Error::invalid_value(de::Unexpected::Str(value), &self))
             }
+
+            /// Binary path (`MessagePack`): native u64.
+            fn visit_u64<E>(self, value: u64) -> Result<Amount, E>
+            where
+                E: de::Error,
+            {
+                Ok(Amount(value))
+            }
         }
 
-        deserializer.deserialize_str(AmountVisitor)
+        if deserializer.is_human_readable() {
+            deserializer.deserialize_str(AmountVisitor)
+        } else {
+            deserializer.deserialize_u64(AmountVisitor)
+        }
     }
 }
 
@@ -246,11 +279,12 @@ impl std::fmt::Display for CurrencyCode {
 /// Used in pricing formulas where fractional multipliers are needed.
 /// Both sides evaluate identically -- no IEEE 754 variance.
 ///
-/// Wire form (ADR-060): serialized as a canonical base-10 decimal string of the
-/// raw fixed-point integer, allowing a single leading `-` for negatives (e.g.
-/// `"1500000"`, `"-500000"`, `"0"`), not a JSON number.
+/// Wire form (ADR-060): a canonical base-10 decimal string of the raw
+/// fixed-point integer, allowing a single leading `-` for negatives (e.g.
+/// `"1500000"`, `"-500000"`, `"0"` — never a JSON number), in human-readable
+/// formats (JSON), and the native `i64` in binary formats (`MessagePack`).
 ///
-/// See spec section 19.1.1.
+/// See spec section 19.1.1 and §19.15.1.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Coefficient(pub i64);
 
@@ -305,21 +339,28 @@ impl std::fmt::Display for Coefficient {
 
 impl Serialize for Coefficient {
     /// Serializes as the canonical base-10 decimal string of the raw
-    /// fixed-point integer (ADR-060). This is NOT the human-decimal
+    /// fixed-point integer in human-readable formats (JSON) and as the native
+    /// `i64` in binary formats (`MessagePack`). This is NOT the human-decimal
     /// [`Display`](std::fmt::Display) form — the scale stays with the reader.
+    /// See ADR-060.
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
-        serializer.serialize_str(&self.0.to_string())
+        if serializer.is_human_readable() {
+            serializer.serialize_str(&self.0.to_string())
+        } else {
+            serializer.serialize_i64(self.0)
+        }
     }
 }
 
 impl<'de> Deserialize<'de> for Coefficient {
-    /// Deserializes strictly from the canonical base-10 decimal string of the
-    /// raw fixed-point integer (ADR-060), allowing a single leading `-`.
-    /// Rejects bare numbers, leading zeros, `-0`, `+`, whitespace, separators,
-    /// and any non-canonical form.
+    /// Deserializes from the canonical base-10 decimal string of the raw
+    /// fixed-point integer in human-readable formats (JSON — strict, allowing a
+    /// single leading `-`; rejects bare numbers, leading zeros, `-0`, `+`,
+    /// whitespace, separators, and any non-canonical form) and from the native
+    /// `i64` in binary formats (`MessagePack`). See ADR-060.
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
@@ -332,10 +373,12 @@ impl<'de> Deserialize<'de> for Coefficient {
             fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 f.write_str(
                     "a canonical base-10 decimal string encoding a signed \
-                     fixed-point integer (ADR-060), e.g. \"1500000\", \"-500000\" or \"0\"",
+                     fixed-point integer (ADR-060, human-readable formats), e.g. \
+                     \"1500000\", \"-500000\" or \"0\", or a native i64 (binary formats)",
                 )
             }
 
+            /// Human-readable path (JSON): strict canonical decimal string.
             fn visit_str<E>(self, value: &str) -> Result<Coefficient, E>
             where
                 E: de::Error,
@@ -344,9 +387,34 @@ impl<'de> Deserialize<'de> for Coefficient {
                     .map(Coefficient)
                     .ok_or_else(|| de::Error::invalid_value(de::Unexpected::Str(value), &self))
             }
+
+            /// Binary path (`MessagePack`): native i64.
+            fn visit_i64<E>(self, value: i64) -> Result<Coefficient, E>
+            where
+                E: de::Error,
+            {
+                Ok(Coefficient(value))
+            }
+
+            /// Binary path (`MessagePack`): a self-describing binary format (rmp)
+            /// dispatches a NON-negative integer to `visit_u64` even under a
+            /// `deserialize_i64` hint, so accept it here and narrow to `i64`,
+            /// erroring only on genuine `i64` overflow.
+            fn visit_u64<E>(self, value: u64) -> Result<Coefficient, E>
+            where
+                E: de::Error,
+            {
+                i64::try_from(value)
+                    .map(Coefficient)
+                    .map_err(|_| de::Error::invalid_value(de::Unexpected::Unsigned(value), &self))
+            }
         }
 
-        deserializer.deserialize_str(CoefficientVisitor)
+        if deserializer.is_human_readable() {
+            deserializer.deserialize_str(CoefficientVisitor)
+        } else {
+            deserializer.deserialize_i64(CoefficientVisitor)
+        }
     }
 }
 
@@ -1051,5 +1119,104 @@ mod tests {
     fn amount_rejects_u64_overflow_string() {
         // u64::MAX + 1
         assert!(serde_json::from_str::<Amount>("\"18446744073709551616\"").is_err());
+    }
+
+    // --- ADR-060 human-readable / binary split ---
+    //
+    // JSON (human-readable) carries the canonical decimal STRING; MessagePack
+    // (binary) carries the NATIVE integer. The MessagePack path stays native so
+    // the binary wire is idiomatic/compact and binary KATs (e.g. the
+    // provenance-hash Vector 35, which hashes `rmp_serde::to_vec(DataProvenance)`)
+    // are byte-identical to their pre-ADR-060 values.
+
+    #[test]
+    fn amount_messagepack_is_native_u64_not_string() {
+        // The MessagePack encoding of an `Amount` is byte-identical to the
+        // encoding of its raw `u64` — i.e. a native int marker, never a str.
+        let amount = Amount(1000);
+        let msgpack = rmp_serde::to_vec(&amount).unwrap();
+        assert_eq!(
+            msgpack,
+            rmp_serde::to_vec(&1000_u64).unwrap(),
+            "Amount must encode as the native u64 in MessagePack (ADR-060)"
+        );
+        // Not a string: MessagePack str markers are 0xa0..=0xbf / 0xd9 / 0xda /
+        // 0xdb. A native int like 1000 encodes as `0xcd 0x03 0xe8` (uint16).
+        assert_eq!(msgpack, vec![0xcd, 0x03, 0xe8]);
+        // Round-trips through the native path.
+        let back: Amount = rmp_serde::from_slice(&msgpack).unwrap();
+        assert_eq!(back, amount);
+    }
+
+    #[test]
+    fn amount_messagepack_native_roundtrip_full_range() {
+        for v in [
+            0_u64,
+            1,
+            42,
+            1000,
+            1_000_000,
+            10_000_000_000_000_000,
+            u64::MAX,
+        ] {
+            let a = Amount(v);
+            let bytes = rmp_serde::to_vec(&a).unwrap();
+            // Byte-identical to encoding the bare u64 (native int, not a str).
+            assert_eq!(bytes, rmp_serde::to_vec(&v).unwrap());
+            let back: Amount = rmp_serde::from_slice(&bytes).unwrap();
+            assert_eq!(back, a);
+        }
+    }
+
+    #[test]
+    fn amount_json_is_string_messagepack_is_int() {
+        let amount = Amount(42_000);
+        // JSON: decimal string.
+        assert_eq!(serde_json::to_string(&amount).unwrap(), "\"42000\"");
+        let json_back: Amount = serde_json::from_str("\"42000\"").unwrap();
+        assert_eq!(json_back, amount);
+        // MessagePack: native int, identical to the raw u64.
+        let mp = rmp_serde::to_vec(&amount).unwrap();
+        assert_eq!(mp, rmp_serde::to_vec(&42_000_u64).unwrap());
+        let mp_back: Amount = rmp_serde::from_slice(&mp).unwrap();
+        assert_eq!(mp_back, amount);
+    }
+
+    #[test]
+    fn coefficient_messagepack_is_native_i64_not_string() {
+        for v in [0_i64, 1, -1, 1_500_000, -500_000, i64::MIN, i64::MAX] {
+            let c = Coefficient(v);
+            let bytes = rmp_serde::to_vec(&c).unwrap();
+            // Byte-identical to encoding the bare i64 (native int, not a str).
+            assert_eq!(
+                bytes,
+                rmp_serde::to_vec(&v).unwrap(),
+                "Coefficient must encode as the native i64 in MessagePack (ADR-060)"
+            );
+            let back: Coefficient = rmp_serde::from_slice(&bytes).unwrap();
+            assert_eq!(back, c);
+        }
+    }
+
+    #[test]
+    fn coefficient_json_is_string_messagepack_is_int() {
+        let coeff = Coefficient(-500_000);
+        // JSON: decimal string with a single leading `-`.
+        assert_eq!(serde_json::to_string(&coeff).unwrap(), "\"-500000\"");
+        let json_back: Coefficient = serde_json::from_str("\"-500000\"").unwrap();
+        assert_eq!(json_back, coeff);
+        // MessagePack: native i64, identical to the raw i64.
+        let mp = rmp_serde::to_vec(&coeff).unwrap();
+        assert_eq!(mp, rmp_serde::to_vec(&-500_000_i64).unwrap());
+        let mp_back: Coefficient = rmp_serde::from_slice(&mp).unwrap();
+        assert_eq!(mp_back, coeff);
+    }
+
+    #[test]
+    fn amount_messagepack_rejects_string_form() {
+        // A str encoded in MessagePack where an Amount is expected must fail —
+        // the binary path is native-int only.
+        let str_bytes = rmp_serde::to_vec(&"1000").unwrap();
+        assert!(rmp_serde::from_slice::<Amount>(&str_bytes).is_err());
     }
 }
