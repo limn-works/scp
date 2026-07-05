@@ -31,7 +31,7 @@ fn validation_error(msg: &str) -> napi::Error {
 /// precision above 2^53 (ADR-060 SDK-surface rule; the wire form itself is a
 /// canonical decimal string in JSON / native `u64` in `MessagePack`). Rejects a
 /// negative value or one that does not fit losslessly in `u64`.
-fn amount_u64_from_bigint(amount: &BigInt, field: &str) -> napi::Result<u64> {
+pub(crate) fn amount_u64_from_bigint(amount: &BigInt, field: &str) -> napi::Result<u64> {
     let (signed, value, lossless) = amount.get_u64();
     if signed || !lossless {
         return Err(napi::Error::from(ScpNapiError::Validation {

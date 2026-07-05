@@ -193,7 +193,10 @@ pub(crate) fn provenance_attach_on(
         "chain_path": prov.chain_path,
         "purpose": prov.purpose,
         "discovery_method": discovery_method_str,
-        "payment_amount": prov.payment_amount.map(|a| a.0),
+        // ADR-060: a monetary `Amount` crosses JSON as its canonical base-10
+        // decimal string (never a bare number), so a full `u64` survives the
+        // boundary exactly. The TS SDK parses this string into a `bigint`.
+        "payment_amount": prov.payment_amount.map(|a| a.0.to_string()),
         "payment_adapter": prov.payment_adapter,
         "payment_receipt_id": prov.payment_receipt_id.map(hex::encode),
     });

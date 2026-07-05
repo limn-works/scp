@@ -11992,9 +11992,10 @@ impl Scp {
                 let tool_id = format!("tool-{}", definition.name.replace(' ', "-").to_lowercase());
 
                 let cost = definition.cost.map(|c| scp_core::context::tools::ToolCost {
-                    // ADR-060: `ToolCost.amount` is the `Amount` newtype; the FFI
-                    // native `u64` param is unchanged (string-typed FFI params
-                    // are Phase 2).
+                    // ADR-060: `ToolCost.amount` is the `Amount` newtype. UniFFI
+                    // carries it as a native `u64` (Swift `UInt64` / Kotlin
+                    // `ULong`), which represents the full smallest-unit range
+                    // exactly.
                     amount: scp_core::economy::Amount(c.amount),
                     currency: c.currency,
                     payee: c.payee.into(),
