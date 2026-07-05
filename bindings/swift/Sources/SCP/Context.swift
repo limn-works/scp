@@ -351,13 +351,15 @@ public actor Context {
     ///
     /// // 2. Hand `reservation.keyPackagePublic` to the creator out of band; the
     /// //    creator seals a signed invitation bundle for it via `inviteMember`,
-    /// //    then hands back `outcome.bundle` (a `SealedInvitation`).
+    /// //    then destructures the native `.sealed` outcome to recover the
+    /// //    `SealedInvitation` and hands it back:
+    /// guard case let .sealed(bundle, _) = outcome else { return }
     ///
     /// // 3. Joiner opens the sealed bundle and stands up a send-capable context.
     /// let ctx = try await Context.joinFromWelcome(
     ///     scp: scp,
     ///     identity: joiner,
-    ///     sealed: outcome.bundle,
+    ///     sealed: bundle,
     ///     reservationId: reservation.reservationId
     /// )
     /// try await ctx.send(Data("hello from the joiner".utf8))

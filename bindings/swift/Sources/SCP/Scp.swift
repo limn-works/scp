@@ -466,10 +466,12 @@ public extension SCP {
     ///     inviteeKeyPackage: reservation.keyPackagePublic,
     ///     relayUrls: []
     /// )
-    /// // `outcome.bundle` is directly usable — no manual re-assembly:
+    /// // Destructure the native `.sealed` case; `bundle` is directly usable as
+    /// // the join input — no manual re-assembly:
+    /// guard case let .sealed(bundle, _) = outcome else { return }
     /// let joined = try await joinerScp.contextJoinFromWelcome(
     ///     identity: invitee,
-    ///     sealed: outcome.bundle,
+    ///     sealed: bundle,
     ///     reservationId: reservationId
     /// )
     /// ```
@@ -994,13 +996,15 @@ public extension SCP {
     ///
     /// // Hand `reservation.keyPackagePublic` to the creator out of band. The
     /// // creator seals a signed invitation bundle for it via `inviteMember`,
-    /// // then hands back `outcome.bundle` (a `SealedInvitation`).
+    /// // then destructures the native `.sealed` outcome to recover the
+    /// // `SealedInvitation` and hands it back:
+    /// guard case let .sealed(bundle, _) = outcome else { return }
     ///
     /// // Joiner opens the sealed bundle and stands up a send-capable context.
     /// let ctx = try await Context.joinFromWelcome(
     ///     scp: scp,
     ///     identity: joiner,
-    ///     sealed: outcome.bundle,
+    ///     sealed: bundle,
     ///     reservationId: reservation.reservationId
     /// )
     /// ```

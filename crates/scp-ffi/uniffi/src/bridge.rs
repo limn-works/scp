@@ -9693,9 +9693,12 @@ impl Scp {
                 // does NOT despawn the runtime actor, so returning `Err` here
                 // without tearing the actor down would strand a live, orphaned
                 // actor for a join that never fully materialized at the bridge.
-                // Compensate: despawn the just-committed actor (a silent local
-                // teardown — no MLS leave ceremony, no spurious event) and purge any
-                // residual UCAN state, then surface the error.
+                // Compensate with the COMPLETE teardown (`discard_joined_context`):
+                // it removes the actor handle AND destroys the resident MLS group
+                // AND deletes the durable Class-S snapshot the join persisted — a
+                // bare `despawn_actor` would leave the crypto group and snapshot
+                // behind, resurrecting the context on restart and blocking a fresh
+                // re-join. Then purge residual UCAN state and surface the error.
                 let authed_ceiling: std::collections::HashSet<String> = joined
                     .params()
                     .ceiling
@@ -9708,7 +9711,7 @@ impl Scp {
                     })
                     .is_none()
                 {
-                    sup.despawn_actor(&context_id).await;
+                    sup.discard_joined_context(&context_id).await;
                     bi.remove_ucan_state(&context_id);
                     return Err(ScpError::Context {
                         msg: format!(

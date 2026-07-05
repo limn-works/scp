@@ -4705,6 +4705,61 @@ impl Supervisor {
         self.actors.remove(context_id).is_some()
     }
 
+    /// COMPLETE compensating teardown of a just-joined context (BLACK-2JF-01).
+    ///
+    /// Unlike [`Self::despawn_actor`] — which removes ONLY the in-memory actor
+    /// handle — this fully reverses everything
+    /// [`Self::spawn_actor_from_welcome`] materialized after the irreversible
+    /// KeyPackage consume, mirroring that entrypoint's OWN post-consume
+    /// rollback arms: it destroys the installed MLS crypto group
+    /// (`destroy_mls_group`) AND deletes the persisted Class-S snapshot
+    /// (`delete_context`) in addition to dropping the actor handle.
+    ///
+    /// The FFI bridges call this as the compensating teardown when a
+    /// post-irreversible-commit join step fails (e.g. a concurrent close/leave
+    /// removed the bridge state before the authenticated ceiling could be
+    /// synced). A bare `despawn_actor` there would leave the resident MLS
+    /// crypto group AND the durable snapshot behind, so on restart the
+    /// "torn-down" context would RESURRECT (FFI/runtime divergence) and the
+    /// residual snapshot would block a fresh re-join via Precheck-D
+    /// (first-writer-wins durable collision). Tearing down all three leaves the
+    /// join strictly MORE recoverable: a re-join with a fresh KeyPackage
+    /// reservation now succeeds.
+    ///
+    /// The single-use KeyPackage the join burned is NOT restored — that
+    /// consume is irreversible by construction (a KeyPackage is one-shot), and
+    /// re-joining draws a fresh reservation anyway.
+    ///
+    /// Like the internal rollback arms, the crypto-destroy and snapshot-delete
+    /// are best-effort (`let _ =`): each is an idempotent no-op when the
+    /// corresponding step never ran, and a compensating teardown must never
+    /// itself fail. Both are synchronous, so they run under `write_lock`
+    /// (no `.await` while held) — making the teardown atomic with respect to
+    /// concurrent register/despawn.
+    ///
+    /// Returns `true` if a live actor handle was registered and removed,
+    /// `false` if no entry existed for `context_id`.
+    pub async fn discard_joined_context(&self, context_id: &str) -> bool {
+        let _guard = self.write_lock.lock().await;
+        // 1. Drop the in-memory actor handle (identical to `despawn_actor`).
+        let removed = self.actors.remove(context_id).is_some();
+        // 2. Destroy the resident MLS crypto group so no keyed state lingers
+        //    (mirrors `spawn_actor_from_welcome`'s `destroy_mls_group` arm).
+        let context_id_bytes = crate::context::state::context_id_to_bytes(context_id);
+        if let Some(crypto) = self.crypto_ref() {
+            let _ = crypto.destroy_mls_group(&context_id_bytes);
+        }
+        // 3. Delete the durable Class-S snapshot the join persisted so a
+        //    restart cannot resurrect the context and Precheck-D does not block
+        //    a fresh re-join (mirrors the `delete_context` rollback arm; the
+        //    helper-persistence slot is the same backend the join persisted to,
+        //    an unset slot means nothing durable was ever written).
+        if let Some(persistence) = self.persistence_ref() {
+            let _ = persistence.delete_context(context_id);
+        }
+        removed
+    }
+
     /// Reap a context's [`CrashWindow`] entry on a CLEAN, NON-poison despawn
     /// (ADR-049 §10): a clean close / expire / tombstone / shutdown.
     ///

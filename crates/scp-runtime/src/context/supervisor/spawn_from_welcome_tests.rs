@@ -2886,3 +2886,93 @@ async fn spawn_from_welcome_rejects_creator_substitution_before_admin_install() 
         "no MLS group may be installed after a creator-binding rejection"
     );
 }
+
+// ---------------------------------------------------------------------------
+// FIX 1 (BLACK-2JF-01) — `discard_joined_context` is a COMPLETE teardown.
+// ---------------------------------------------------------------------------
+
+/// The FFI compensating path (a post-irreversible-commit join step failing —
+/// e.g. a concurrent close/leave removed the bridge state before the
+/// authenticated ceiling could be synced) must FULLY reverse what
+/// `spawn_actor_from_welcome` materialized, not merely drop the in-memory actor
+/// handle. `discard_joined_context` removes the actor AND destroys the resident
+/// MLS crypto group AND deletes the durable Class-S snapshot the join persisted,
+/// mirroring the entrypoint's OWN post-consume rollback arms. A bare
+/// `despawn_actor` would leave the crypto group + snapshot behind, so on restart
+/// the "torn-down" context would RESURRECT (FFI/runtime divergence) and the
+/// residual snapshot would block a fresh re-join via the durable
+/// first-writer-wins precheck (Precheck D).
+///
+/// This drives a REAL happy-path join (installs a group, registers an actor,
+/// persists a snapshot into the shared recording store), asserts all three
+/// pieces of state exist, then calls `discard_joined_context` and asserts each
+/// is fully reversed: no actor handle remains, the crypto group is destroyed,
+/// and no durable snapshot remains — so a subsequent restore (which reads
+/// `load_context`) finds NOTHING to resurrect.
+#[tokio::test]
+async fn discard_joined_context_fully_reverses_a_welcome_join() {
+    let rec = RecordingPersistence::default();
+    let (result, j) = join_bob(0x6d, Some(Box::new(rec.clone()))).await;
+    result.expect("the happy-path join succeeds");
+
+    // --- Pre-teardown: all three pieces of join state are present. ---
+    assert!(
+        j.sup.lookup(&j.ctx_id).is_some(),
+        "a live context actor is registered for the joiner"
+    );
+    assert!(
+        !j.bob_crypto
+            .export_crypto_state(&j.ctx_bytes)
+            .expect("export never errors")
+            .is_empty(),
+        "the joined MLS group is resident in the crypto provider"
+    );
+    assert!(
+        rec.load_context(&j.ctx_id)
+            .expect("load never errors")
+            .is_some(),
+        "the join persisted an initial Class-S snapshot"
+    );
+
+    // --- COMPLETE teardown (the FFI compensating path). ---
+    let removed = j.sup.discard_joined_context(&j.ctx_id).await;
+    assert!(
+        removed,
+        "discard_joined_context reports it removed the live actor handle"
+    );
+
+    // 1. Actor handle gone — no orphaned live actor lingers.
+    assert!(
+        j.sup.lookup(&j.ctx_id).is_none(),
+        "the actor handle is removed"
+    );
+    assert_eq!(
+        j.sup.member_count(&j.ctx_id).await,
+        None,
+        "an unregistered context yields None member_count (the mailbox is gone)"
+    );
+
+    // 2. Crypto group destroyed — a bare `despawn_actor` would leave it
+    //    resident (`export_crypto_state` returns EMPTY for an absent context).
+    assert!(
+        j.bob_crypto
+            .export_crypto_state(&j.ctx_bytes)
+            .expect("export never errors")
+            .is_empty(),
+        "the resident MLS group is destroyed"
+    );
+
+    // 3. Durable snapshot deleted → a restore finds NOTHING to resurrect and
+    //    Precheck D no longer blocks a fresh re-join. The delete was actually
+    //    issued to the backend (recorded), and a subsequent load is empty.
+    assert!(
+        rec.load_context(&j.ctx_id)
+            .expect("load never errors")
+            .is_none(),
+        "no durable snapshot remains — a restore cannot resurrect the context"
+    );
+    assert!(
+        rec.deletes.contains(&j.ctx_id),
+        "the snapshot delete was issued to the persistence backend"
+    );
+}

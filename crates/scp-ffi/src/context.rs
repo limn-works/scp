@@ -2860,15 +2860,19 @@ impl crate::scp::PyScp {
         // in the window since the spawn returned. A close/leave does NOT despawn
         // the runtime actor, so returning `Err` here without tearing the actor
         // down would strand a live, orphaned actor for a join that never fully
-        // materialized at the bridge. Compensate: despawn the just-committed
-        // actor (a silent local teardown — no MLS leave ceremony, no spurious
-        // event) and purge any residual bridge state, then surface the error.
+        // materialized at the bridge. Compensate with the COMPLETE teardown
+        // (`discard_joined_context`): it removes the actor handle AND destroys
+        // the resident MLS group AND deletes the durable Class-S snapshot the
+        // join persisted — a bare `despawn_actor` would leave the crypto group
+        // and snapshot behind, resurrecting the context on restart and blocking
+        // a fresh re-join. Then purge residual bridge state and surface the
+        // error.
         if let Err(e) = crate::runtime::sync_ceiling_from_params(
             bi,
             &sealed.context_id,
             &joined.params().ceiling,
         ) {
-            rt.block_on(sup.despawn_actor(&sealed.context_id));
+            rt.block_on(sup.discard_joined_context(&sealed.context_id));
             crate::runtime::remove_context(bi, &sealed.context_id);
             return Err(PyRuntimeError::new_err(e.to_string()));
         }

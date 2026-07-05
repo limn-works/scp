@@ -798,14 +798,17 @@ class SCP internal constructor(
      * val reservation = scp.reserveKeyPackage(joiner)
      *
      * // Hand reservation.keyPackagePublic to the creator out of band. The
-     * // creator calls inviteMember(...) and hands back `outcome.bundle`
-     * // (a SealedInvitation).
+     * // creator calls inviteMember(...), then destructures the sealed outcome
+     * // to recover the SealedInvitation and hands it back:
+     * val bundle = when (outcome) {
+     *     is InviteMemberOutcome.Sealed -> outcome.bundle
+     * }
      *
      * // Step 2 (joiner): open the sealed bundle and stand up as a send-capable
      * // participant under the joiner's own derived routing pseudonym.
      * val ctx = scp.contextJoinFromWelcome(
      *     identity = joiner,
-     *     sealed = outcome.bundle,
+     *     sealed = bundle,
      *     reservationId = reservation.reservationId,
      * )
      * ```
