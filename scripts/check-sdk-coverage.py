@@ -455,19 +455,14 @@ ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
     # domain-prefixed candidate is context_reserve_key_package, which does not
     # match the real SDK symbols (reserve_key_package / reserveKeyPackage).
     #
-    # join_from_welcome's Python entry (context_join_from_welcome) is REDUNDANT:
-    # the domain_snake for ("Context", "join_from_welcome") is
-    # context_join_from_welcome already (single prefix), so it equals the
-    # auto-generated candidate. It is kept explicit for symmetry with the reserve
-    # entry above.
+    # join_from_welcome needs NO entry: the auto-generated domain_snake for
+    # ("Context", "join_from_welcome") is already context_join_from_welcome
+    # (single prefix), so it matches the real symbols with no alias required.
     ("Context", "reserve_key_package"): {
         "python": ["reserve_key_package"],
         "typescript": ["reserveKeyPackage"],
         "kotlin": ["reserveKeyPackage"],
         "swift": ["reserveKeyPackage"],
-    },
-    ("Context", "join_from_welcome"): {
-        "python": ["context_join_from_welcome"],
     },
     # invite_member (ADR-049 Phase 2J / FFI-02 Option A) NEEDS an explicit
     # mapping: its auto-generated domain-prefixed candidate is

@@ -898,6 +898,49 @@ fn napi_invite_member_reaches_supervisor_seam() {
     );
 }
 
+// Bridge level (ADR-049 Phase 2J / FFI-02 Option A): the UniFFI bridge is the
+// THIRD landed bridge for the joiner handshake + creator-side invite. The
+// capability matrix + bridge-aliases declare uniffi=true for
+// `reserve_key_package` / `context_join_from_welcome` / `invite_member`, so the
+// same Supervisor-seam pins that guard the PyO3 + NAPI bodies above MUST also
+// guard the UniFFI bodies — otherwise a refactor could sever the UniFFI joiner
+// / invite path from the actor-per-context lifecycle while the matrix still
+// advertises coverage. `extract_fn_body` excludes the signature, so the
+// `.reserve_key_package(` / `.invite_member(` call — even though the UniFFI
+// bridge method shares its leaf name with the Supervisor method it calls — is
+// the real runtime call (`sup.<method>(`), not a self-satisfying signature
+// mention. Additive assertions mirroring the NAPI peers over UNIFFI_BRIDGE_SRC.
+#[test]
+fn uniffi_reserve_key_package_reaches_supervisor_seam() {
+    assert!(
+        fn_body_contains(UNIFFI_BRIDGE_SRC, "reserve_key_package", ".reserve_key_package("),
+        "UniFFI reserve_key_package must reach Supervisor::reserve_key_package \
+         (mints the single-use MLS KeyPackage)"
+    );
+}
+
+#[test]
+fn uniffi_context_join_from_welcome_reaches_supervisor_seam() {
+    assert!(
+        fn_body_contains(
+            UNIFFI_BRIDGE_SRC,
+            "context_join_from_welcome",
+            "spawn_actor_from_welcome("
+        ),
+        "UniFFI context_join_from_welcome must reach Supervisor::spawn_actor_from_welcome \
+         (consumes the Welcome + spawns the per-context actor)"
+    );
+}
+
+#[test]
+fn uniffi_invite_member_reaches_supervisor_seam() {
+    assert!(
+        fn_body_contains(UNIFFI_BRIDGE_SRC, "invite_member", ".invite_member("),
+        "UniFFI invite_member must reach Supervisor::invite_member \
+         (performs the MLS add + seals the signed InvitationBundle)"
+    );
+}
+
 // Supervisor level: import is actor-native. The replaceability gate (NEVER
 // overwrite a live context) + the §23.17 epoch-floor capture/teardown/merge
 // run INSIDE the existing actor via `dispatch_prepare_for_replace`
