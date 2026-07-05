@@ -417,27 +417,95 @@ public extension SCP {
     /// Forwards to ``Scp/contextJoinFromWelcome`` on ``inner``.
     ///
     /// Low-level forwarder returning the raw ``ContextHandle``. Prefer
-    /// ``Context/joinFromWelcome(scp:identity:creatorDid:contextId:params:reservationId:welcomeBytes:)``,
+    /// ``Context/joinFromWelcome(scp:identity:sealed:reservationId:)``,
     /// which wraps the handle in a live ``Context`` (mirroring how
     /// ``Context/create(scp:identity:params:)`` relates to ``contextCreate(identity:params:)``).
     ///
-    /// `welcomeBytes` is the TLS-serialized MLS Welcome; UniFFI marshals it as
-    /// `Data` (the SDK's byte-return convention, matching `contextExport`).
+    /// The joiner supplies NO loose `params`/`welcomeBytes` (FFI-02 Option A):
+    /// the authoritative genesis params + MLS Welcome travel INSIDE the signed,
+    /// HPKE-sealed ``SealedInvitation`` bundle, which the native core opens and
+    /// authenticates. `sealed.contextId` / `sealed.creatorDid` are UNTRUSTED
+    /// binding hints only — authority derives from the signed bundle.
     func contextJoinFromWelcome(
         identity: Identity,
-        creatorDid: String,
-        contextId: String,
-        params: ContextParams,
-        reservationId: String,
-        welcomeBytes: Data
+        sealed: SealedInvitation,
+        reservationId: String
     ) async throws -> ContextHandle {
         try await inner.contextJoinFromWelcome(
             identity: identity,
-            creatorDid: creatorDid,
+            sealed: sealed,
+            reservationId: reservationId
+        )
+    }
+
+    /// Invites a member to an existing context, producing a sealed, signed
+    /// invitation bundle (ADR-049 Phase 2J; FFI-02 Option A). Forwards to
+    /// ``Scp/inviteMember`` on ``inner``.
+    ///
+    /// The creator (or admin) seals the context's genesis params + MLS Welcome
+    /// for the invitee under RFC 9180 HPKE, binding them to the invitee's
+    /// `KeyPackage`. The result is the native ``InviteMemberOutcome`` enum —
+    /// exhaust it with `switch`:
+    ///
+    ///  - ``InviteMemberOutcome/sealed(enc:ciphertext:delivered:)`` — a
+    ///    `SingleAdmin` context: the invite is unilateral. If `delivered` is
+    ///    `false`, hand the sealed `(enc, ciphertext)` bundle to the invitee out
+    ///    of band; they open it with
+    ///    ``Context/joinFromWelcome(scp:identity:sealed:reservationId:)``.
+    ///  - ``InviteMemberOutcome/requiresGovernanceApproval(proposalId:)`` — a
+    ///    voting context: the invite is deferred to a governance vote. This is a
+    ///    SUCCESS outcome, NOT an error; `proposalId` carries the tracked
+    ///    proposal id when one exists.
+    ///
+    /// ```swift
+    /// let outcome = try await scp.inviteMember(
+    ///     identity: creator,
+    ///     contextId: ctx.contextId,
+    ///     inviteeDid: invitee.did(),
+    ///     inviteeKeyPackage: reservation.keyPackagePublic,
+    ///     relayUrls: []
+    /// )
+    /// switch outcome {
+    /// case let .sealed(enc, ciphertext, _):
+    ///     let sealed = SealedInvitation(
+    ///         contextId: ctx.contextId, creatorDid: creator.did(),
+    ///         enc: enc, ciphertext: ciphertext
+    ///     )
+    ///     // deliver `sealed` to the invitee
+    /// case let .requiresGovernanceApproval(proposalId):
+    ///     // the invite is pending a governance vote
+    ///     _ = proposalId
+    /// }
+    /// ```
+    ///
+    /// - Parameters:
+    ///   - identity: The LOCAL inviting ``Identity`` (creator / admin). MUST be
+    ///     locally custodied — the invite is signed under its `#active` key; a
+    ///     DID-only handle fails closed with `"SCP-IDENT-1054"`.
+    ///   - contextId: The context to invite the member into.
+    ///   - inviteeDid: The DID of the member being invited.
+    ///   - inviteeKeyPackage: The invitee's PUBLIC MLS `KeyPackage` bytes (from
+    ///     the invitee's ``reserveKeyPackage(identity:)``).
+    ///   - relayUrls: Relay URLs the runtime may publish the sealed bundle to.
+    /// - Returns: The native ``InviteMemberOutcome`` — `.sealed` or
+    ///   `.requiresGovernanceApproval` (both SUCCESS outcomes).
+    /// - Throws: ``ScpError/Identity(msg:code:)`` if the inviter is not locally
+    ///   custodied, or ``ScpError/Context(msg:code:)`` if the supervisor is not
+    ///   initialized or the runtime invite fails (no live context, unauthorized
+    ///   inviter, invalid `KeyPackage`).
+    func inviteMember(
+        identity: Identity,
+        contextId: String,
+        inviteeDid: String,
+        inviteeKeyPackage: Data,
+        relayUrls: [String]
+    ) async throws -> InviteMemberOutcome {
+        try await inner.inviteMember(
+            identity: identity,
             contextId: contextId,
-            params: params,
-            reservationId: reservationId,
-            welcomeBytes: welcomeBytes
+            inviteeDid: inviteeDid,
+            inviteeKeyPackage: inviteeKeyPackage,
+            relayUrls: relayUrls
         )
     }
 
@@ -914,30 +982,29 @@ public extension SCP {
     /// `KeyPackage` under its OWN identity. Only the PUBLIC
     /// ``ReservedKeyPackage/keyPackagePublic`` bytes cross the FFI boundary —
     /// the joiner's private signer state never leaves the native core. Hand
-    /// those public bytes to the context creator (out of band); the creator adds
-    /// them to its MLS group and mints a Welcome addressed to this reservation,
-    /// then you pass ``ReservedKeyPackage/reservationId`` and the Welcome to
-    /// ``Context/joinFromWelcome(scp:identity:creatorDid:contextId:params:reservationId:welcomeBytes:)``.
+    /// those public bytes to the context creator (out of band); the creator
+    /// seals a signed invitation bundle addressed to this reservation via
+    /// ``inviteMember(identity:contextId:inviteeDid:inviteeKeyPackage:relayUrls:)``,
+    /// then you pass ``ReservedKeyPackage/reservationId`` and the
+    /// ``SealedInvitation`` to
+    /// ``Context/joinFromWelcome(scp:identity:sealed:reservationId:)``.
     ///
-    /// The canonical reserve → Welcome → join happy path:
+    /// The canonical reserve → invite → join happy path:
     ///
     /// ```swift
     /// // Joiner reserves a single-use KeyPackage under its own identity.
     /// let reservation = try await scp.reserveKeyPackage(identity: joiner)
     ///
     /// // Hand `reservation.keyPackagePublic` to the creator out of band. The
-    /// // creator adds it to the MLS group and returns a Welcome addressed to it.
-    /// let welcomeBytes: Data = /* received from the creator */
+    /// // creator seals a signed invitation bundle for it via `inviteMember`.
+    /// let sealed: SealedInvitation = /* the .sealed outcome from the creator */
     ///
-    /// // Joiner processes the Welcome and stands up a send-capable context.
+    /// // Joiner opens the sealed bundle and stands up a send-capable context.
     /// let ctx = try await Context.joinFromWelcome(
     ///     scp: scp,
     ///     identity: joiner,
-    ///     creatorDid: creator.did(),
-    ///     contextId: contextId,
-    ///     params: params,
-    ///     reservationId: reservation.reservationId,
-    ///     welcomeBytes: welcomeBytes
+    ///     sealed: sealed,
+    ///     reservationId: reservation.reservationId
     /// )
     /// ```
     ///
