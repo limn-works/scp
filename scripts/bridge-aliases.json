@@ -167,6 +167,19 @@
       ]
     },
     {
+      "canonical": "invite_member",
+      "category": "context",
+      "pyo3": [
+        "invite_member"
+      ],
+      "uniffi": [
+        "invite_member"
+      ],
+      "napi": [
+        "invite_member"
+      ]
+    },
+    {
       "canonical": "context_leave",
       "category": "context",
       "pyo3": [

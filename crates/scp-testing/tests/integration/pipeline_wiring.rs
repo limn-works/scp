@@ -871,6 +871,33 @@ fn napi_context_join_from_welcome_reaches_spawn_actor_from_welcome() {
     );
 }
 
+// Bridge level (ADR-049 Phase 2J / FFI-02 Option A creator-side invite): the
+// FFI `invite_member` op reaches `Supervisor::invite_member` — where the MLS
+// add is performed and the sealed, signed InvitationBundle (or the deferred
+// governance outcome) is produced. Pinned across BOTH landed bridges (PyO3 +
+// NAPI, mirroring the reserve/join peers above) so a refactor cannot silently
+// sever the creator-side invite path from the Supervisor seam. Additive
+// assertions.
+#[test]
+fn pyo3_invite_member_reaches_supervisor_seam() {
+    assert!(
+        fn_body_contains(PYO3_CONTEXT_SRC, "invite_member", "supervisor(")
+            && fn_body_contains(PYO3_CONTEXT_SRC, "invite_member", ".invite_member("),
+        "PyO3 invite_member must resolve the bridge Supervisor and reach \
+         Supervisor::invite_member (performs the MLS add + seals the signed \
+         InvitationBundle)"
+    );
+}
+
+#[test]
+fn napi_invite_member_reaches_supervisor_seam() {
+    assert!(
+        fn_body_contains(NAPI_CONTEXT_SRC, "invite_member_on", ".invite_member("),
+        "NAPI invite_member_on must reach Supervisor::invite_member \
+         (performs the MLS add + seals the signed InvitationBundle)"
+    );
+}
+
 // Supervisor level: import is actor-native. The replaceability gate (NEVER
 // overwrite a live context) + the §23.17 epoch-floor capture/teardown/merge
 // run INSIDE the existing actor via `dispatch_prepare_for_replace`

@@ -208,6 +208,36 @@
       "reason": "Getter for a message payload on a result type."
     },
     {
+      "name": "enc",
+      "path": "crates/scp-ffi/src/context.rs",
+      "kind": "getter",
+      "reason": "Getter for the RFC 9180 HPKE encapsulated key on the PySealedInvitation / PyInviteMemberOutcome result types (ADR-049 Phase 2J / FFI-02 Option A). Not an operation."
+    },
+    {
+      "name": "ciphertext",
+      "path": "crates/scp-ffi/src/context.rs",
+      "kind": "getter",
+      "reason": "Getter for the RFC 9180 HPKE ciphertext on the PySealedInvitation / PyInviteMemberOutcome result types (ADR-049 Phase 2J / FFI-02 Option A). Not an operation."
+    },
+    {
+      "name": "delivered",
+      "path": "crates/scp-ffi/src/context.rs",
+      "kind": "getter",
+      "reason": "Getter for the sealed-invitation delivery flag on the PyInviteMemberOutcome result type (ADR-049 Phase 2J / FFI-02 Option A). Not an operation."
+    },
+    {
+      "name": "kind",
+      "path": "crates/scp-ffi/src/context.rs",
+      "kind": "getter",
+      "reason": "Getter for the PyInviteMemberOutcome discriminant (\"sealed\" | \"requiresGovernanceApproval\") result type (ADR-049 Phase 2J / FFI-02 Option A). Not an operation."
+    },
+    {
+      "name": "proposal_id",
+      "path": "crates/scp-ffi/src/context.rs",
+      "kind": "getter",
+      "reason": "Getter for the deferred governance proposal id on the PyInviteMemberOutcome result type (ADR-049 Phase 2J / FFI-02 Option A). Not an operation."
+    },
+    {
       "name": "promotion_policy",
       "path": "crates/scp-ffi/src/context.rs",
       "kind": "getter",

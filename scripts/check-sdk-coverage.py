@@ -469,6 +469,16 @@ ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
     ("Context", "join_from_welcome"): {
         "python": ["context_join_from_welcome"],
     },
+    # invite_member (ADR-049 Phase 2J / FFI-02 Option A) NEEDS an explicit
+    # mapping: its auto-generated domain-prefixed candidate is
+    # context_invite_member, which does not match the real SDK symbols
+    # (invite_member / inviteMember). Peer of reserve_key_package above.
+    ("Context", "invite_member"): {
+        "python": ["invite_member"],
+        "typescript": ["inviteMember"],
+        "kotlin": ["inviteMember"],
+        "swift": ["inviteMember"],
+    },
     ("Context", "set_economic_policy"): {
         "python": ["set_economic_policy"],
     },
