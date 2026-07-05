@@ -85,6 +85,8 @@ pub enum PaidActionType {
 
 **Why fixed-point coefficients:** Pricing formulas need fractional multipliers (e.g., "cost increases by 0.5x per 100 messages/min"). `Coefficient` provides 6 decimal places of precision using integer arithmetic. Evaluation: `(coefficient.0 * metric_value) / 1_000_000`. Both sides compute the same result.
 
+**Wire form for monetary values (ADR-060):** `Amount` and `Coefficient` serialize as a **canonical base-10 decimal string** of their underlying smallest-unit integer — e.g. `Amount(1500)` → `"1500"`, `Coefficient(-500000)` → `"-500000"`, `Amount(0)` → `"0"` — in both JSON and MessagePack, and everywhere they appear in a wire-crossing structure (`CostSchedule`, `PricingFormula`, `SubscriptionCost`, `PaymentReceipt`, `SpendingCapability`, tool `ToolCost`, etc.). The string encodes the smallest-unit integer, NOT a human decimal (`"1.50"` is invalid); the scale lives with `currency` / `COEFFICIENT_SCALE`. Deserialization is strict and injective — digits only, no leading zeros (except the lone `"0"`), a single optional leading `-` for `Coefficient`, and no `+`, `-0`, whitespace, separators, decimal point, exponent, hex, or bare JSON number. This decouples the wire form from the Rust core integer width (`u64` / `i64` today) so a future widening is non-breaking on every encoding, and lets reimplementations — notably JS `JSON.parse`, which cannot round-trip a `u64` — reproduce every value byte-for-byte. See ADR-060 and §19.15.1.
+
 ## 19.2 Payment Adapters
 
 Payment adapters are the backbone of economic governance. They abstract over concrete payment rails, following the same pattern as transport adapters (ADR-005, §16.12.1): a trait that any payment rail can implement, a conformance macro that validates correctness, and a reference adapter for testing.
@@ -523,8 +525,8 @@ Relay economics are SEPARATE from context economics — different trust model. R
     "rate_limit_publish": 6000,
     "economic": {
       "currency": "USD",
-      "per_publish": 10,
-      "per_byte_stored": 1,
+      "per_publish": "10",
+      "per_byte_stored": "1",
       "payment_adapters": ["x402", "lightning"],
       "payee": "did:dht:z6Mk..."
     }
@@ -532,9 +534,9 @@ Relay economics are SEPARATE from context economics — different trust model. R
 }
 ```
 
-**`per_byte_stored` billing model.** The `per_byte_stored` amount is a **one-time storage fee** charged when a blob is published to the relay. The fee is `per_byte_stored * blob_size_bytes`, charged once at publish time. There is no recurring charge — once paid, the blob is stored until its TTL expires. Example: with `per_byte_stored: 1` (1 cent) and `currency: "USD"`, a 256 KiB blob costs `1 * 262144 = 262144 cents = $2,621.44`. Relay operators SHOULD set `per_byte_stored` to values appropriate for their cost structure — the example value of `1` is illustrative, not recommended. A more realistic value for a USD-denominated relay might be `per_byte_stored: 0` (free, subsidized by `per_publish`) or use sub-cent amounts via a different currency unit (e.g., SAT with `per_byte_stored: 1` = 1 satoshi per byte = ~$0.0004 per byte at $40k/BTC).
+**`per_byte_stored` billing model.** The `per_byte_stored` amount is a **one-time storage fee** charged when a blob is published to the relay. The fee is `per_byte_stored * blob_size_bytes`, charged once at publish time. There is no recurring charge — once paid, the blob is stored until its TTL expires. Example: with `per_byte_stored: "1"` (1 cent) and `currency: "USD"`, a 256 KiB blob costs `1 * 262144 = 262144 cents = $2,621.44`. Relay operators SHOULD set `per_byte_stored` to values appropriate for their cost structure — the example value of `"1"` is illustrative, not recommended. A more realistic value for a USD-denominated relay might be `per_byte_stored: "0"` (free, subsidized by `per_publish`) or use sub-cent amounts via a different currency unit (e.g., SAT with `per_byte_stored: "1"` = 1 satoshi per byte = ~$0.0004 per byte at $40k/BTC).
 
-**JSON Amount serialization:** `Amount` values in `.well-known/scp` are serialized as JSON integers in the smallest currency unit specified by `currency`. For USD (unit: cent), `10` = $0.10. For BTC (unit: satoshi), `100` = 100 satoshis. Parsers convert JSON integer → `Amount(u64)` directly. Decimal string representations are NOT valid — all amounts are integers. The `currency` field determines the interpretation scale.
+**Amount wire serialization (ADR-060):** `Amount` values in `.well-known/scp` — and everywhere monetary values cross the wire — are serialized as a **canonical base-10 decimal string** of the smallest-unit integer specified by `currency`. For USD (unit: cent), `"10"` = $0.10. For BTC (unit: satoshi), `"100"` = 100 satoshis. The string encodes the smallest-unit integer directly — it is NOT a human decimal like `"1.50"` (the scale stays with `currency`). Parsers accept ONLY the canonical form (digits only; no leading zeros except the lone `"0"`; no sign, separators, whitespace, decimal point, or exponent) and reject bare JSON numbers, so encode/decode are byte-identical and reproducible across reimplementations. The `currency` field determines the interpretation scale. This supersedes the earlier JSON-integer representation: the wire form is a string, decoupling it from the Rust core width so a later `u64` → `u128` widening is non-breaking, and so reimplementations (notably JS `JSON.parse`, which cannot round-trip a `u64`) reproduce values exactly.
 
 **Payment flow:** Agent evaluates relay config (visible before connecting) → selects compatible adapter → authorizes per-action → relay verifies + captures.
 
@@ -631,12 +633,12 @@ This section tabulates the wire format for all economy protocol types that cross
 
 ### 19.15.1 Core Value Types
 
-**`Amount`** — Newtype wrapping `u64`. Represents the smallest currency unit (e.g., cents for USD, satoshis for BTC). No floating-point anywhere in the economy protocol.
+**`Amount`** — Newtype wrapping `u64`. Represents the smallest currency unit (e.g., cents for USD, satoshis for BTC). No floating-point anywhere in the economy protocol. Serialized on the wire as a **canonical base-10 decimal string** of the smallest-unit integer (ADR-060), decoupling the wire form from the Rust core width.
 
 | Wire Representation | Type | Notes |
 |---------------------|------|-------|
-| JSON | `number` (unsigned integer) | e.g., `1500` = 15.00 USD |
-| MessagePack | `uint 64` | Network byte order |
+| JSON | `string` (canonical decimal) | e.g., `"1500"` = 15.00 USD. Strict: digits only, no leading zeros (except `"0"`), no sign, separators, whitespace, decimal point, or exponent (ADR-060). |
+| MessagePack | `str` (canonical decimal) | Same canonical decimal string as JSON (ADR-060). |
 
 **`CurrencyCode`** — Newtype wrapping `[u8; 4]`. ISO 4217 currency code, null-padded to 4 bytes.
 
@@ -647,12 +649,12 @@ This section tabulates the wire format for all economy protocol types that cross
 
 **JSON encoding note:** JSON representations MUST use the trimmed currency string without null-byte padding (e.g., `"USD"`, not `"USD\u0000"`). Null-padding to 4 bytes is applied only in MessagePack/binary encoding. This avoids parser-compatibility issues across implementations, since many JSON parsers reject or mishandle embedded null bytes in strings.
 
-**`Coefficient`** — Newtype wrapping `i64`. Fixed-point with 6 decimal places: `value = raw / 1,000,000`.
+**`Coefficient`** — Newtype wrapping `i64`. Fixed-point with 6 decimal places: `value = raw / 1,000,000`. Serialized on the wire as a **canonical base-10 decimal string** of the raw fixed-point integer (ADR-060).
 
 | Wire Representation | Type | Notes |
 |---------------------|------|-------|
-| JSON | `number` (signed integer) | e.g., `1500000` = 1.5 |
-| MessagePack | `int 64` | Signed |
+| JSON | `string` (canonical decimal) | e.g., `"1500000"` = 1.5. A single leading `-` is allowed for negatives; otherwise strict as for `Amount` (ADR-060). |
+| MessagePack | `str` (canonical decimal) | Same canonical decimal string as JSON (ADR-060). |
 
 ### 19.15.2 Cost Structure
 
