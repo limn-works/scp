@@ -11,8 +11,8 @@ package works.limn.scp
 
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertThrows
+import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
-import works.limn.scp.bridge.BridgeException
 
 class EconomyFormatTest {
     @Test
@@ -67,12 +67,17 @@ class EconomyFormatTest {
 
     @Test
     fun `unknown currency throws with the economy code`() {
-        val ex = assertThrows(BridgeException::class.java) { formatAmount(100uL, "XYZ") }
-        assertEquals("SCP-ECON-12070", ex.code)
+        // Pure SDK-side display helper: an idiomatic IllegalArgumentException,
+        // not a BridgeException (which carries FFI codes). The SCP-ECON-12070
+        // code is kept in the message for cross-SDK parity.
+        val ex =
+            assertThrows(IllegalArgumentException::class.java) { formatAmount(100uL, "XYZ") }
+        assertTrue(ex.message?.contains("SCP-ECON-12070") == true)
     }
 
     @Test
     fun `negative decimals override throws`() {
-        assertThrows(BridgeException::class.java) { formatAmount(1uL, -1) }
+        val ex = assertThrows(IllegalArgumentException::class.java) { formatAmount(1uL, -1) }
+        assertTrue(ex.message?.contains("SCP-ECON-12070") == true)
     }
 }
