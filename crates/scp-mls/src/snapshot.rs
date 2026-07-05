@@ -461,7 +461,8 @@ mod tests {
         let blob = bob.serialize_state().unwrap();
         let mut restored_bob = ScpMlsGroup::deserialize_state(&blob).unwrap();
 
-        // Alice sends; the RESTORED Bob must decrypt it.
+        // Alice sends a plain application message (ADR-011: `MessageSent` is not a
+        // convergent leaf, so it binds no AAD); the RESTORED Bob must decrypt it.
         let ct = serialize_ciphertext(&encrypt(&mut alice, b"after restore").unwrap()).unwrap();
         match decrypt_with_membership_changes(&mut restored_bob, &ct, &SystemClock).unwrap() {
             crate::InboundChange::Application { plaintext, .. } => {

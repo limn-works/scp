@@ -67,21 +67,33 @@ pub const INITIAL_SENDER_KEY_EPOCH: u64 = 1;
 #[derive(Clone, PartialEq, Eq)]
 pub enum Inbound {
     /// An application message: recovered plaintext plus the sender's DID.
+    ///
+    /// Application messages are **not** convergent event-log leaves (ADR-011
+    /// exclusion taxonomy §2: `MessageSent` is per-author with no total delivery
+    /// order), so they bind no convergent timestamp — the driver records the
+    /// message as local history (a `MessageSent` / `MessageReceived`
+    /// `ContextEvent`), not as a Merkle leaf.
     Application {
         /// The sender's DID, extracted from the MLS credential.
         sender_did: String,
         /// The fully decrypted plaintext.
         plaintext: Vec<u8>,
     },
-    /// An **add-only** Commit that advanced the group epoch. `scp-mls` has
-    /// already merged it; `added_dids` are the SCP DIDs the Commit's Add
-    /// proposals add (in proposal order), for the driver to mirror onto its
-    /// SCP-layer membership + event log.
+    /// A Commit that advanced the group epoch. `scp-mls` has already merged it;
+    /// `added_dids` are the SCP DIDs the Commit's Add proposals add (in proposal
+    /// order), for the driver to mirror onto its SCP-layer membership + event
+    /// log. Empty for a no-add Commit (e.g. a self-update).
     Commit {
         /// The committer's DID, extracted from the MLS credential.
         sender_did: String,
         /// DIDs added by this Commit's Add proposals.
         added_dids: Vec<String>,
+        /// The **authenticated** convergent committer timestamp (Unix seconds),
+        /// recovered from the Commit's verified MLS AAD *before* the merge and
+        /// adopted **verbatim** by `scp-mls` (ADR-057). The driver stamps this on
+        /// each mirrored `MemberJoined` leaf. `Some` only for an add-Commit;
+        /// `None` for a no-add Commit, which stamps no leaf.
+        committer_timestamp_secs: Option<u64>,
     },
     /// A Commit carrying one or more Remove proposals, which the participant
     /// driver does not converge. `scp-mls` **dropped the staged commit without
@@ -127,10 +139,12 @@ impl std::fmt::Debug for Inbound {
             Self::Commit {
                 sender_did,
                 added_dids,
+                committer_timestamp_secs,
             } => f
                 .debug_struct("Commit")
                 .field("sender_did", sender_did)
                 .field("added_dids", added_dids)
+                .field("committer_timestamp_secs", committer_timestamp_secs)
                 .finish(),
             Self::UnsupportedMembershipChange {
                 sender_did,
@@ -228,6 +242,11 @@ impl ContextCryptoState {
     ///    is `self.sender_key_epoch`, NOT the MLS group epoch.
     /// 3. MLS-encrypt the framed result and TLS-serialize for transport.
     ///
+    /// An application message is **not** a convergent event-log leaf (ADR-011
+    /// exclusion taxonomy §2: `MessageSent` is per-author with no total delivery
+    /// order), so — unlike an add-Commit — it binds NO convergent-timestamp AAD.
+    /// It is plain MLS-encrypted; convergence does not apply.
+    ///
     /// # Errors
     ///
     /// Returns [`ClientError`] if either encryption layer or the wire
@@ -257,7 +276,8 @@ impl ContextCryptoState {
         // identical AAD from the parsed header.
         let with_header = build_sender_header(epoch, sequence, &sender_encrypted);
 
-        // Layer 2: MLS encrypt, then serialize the wire frame.
+        // Layer 2: plain MLS encrypt (application messages bind no convergent
+        // timestamp — ADR-011), then serialize the wire frame.
         let mls_out = encrypt(&mut self.mls_group, &with_header)?;
         Ok(serialize_ciphertext(&mls_out)?)
     }
@@ -308,10 +328,12 @@ impl ContextCryptoState {
             InboundChange::Commit {
                 sender_did,
                 added_dids,
+                committer_timestamp_secs,
             } => {
                 return Ok(Inbound::Commit {
                     sender_did,
                     added_dids,
+                    committer_timestamp_secs,
                 });
             }
             InboundChange::UnsupportedMembershipChange {
@@ -395,7 +417,10 @@ mod tests {
     use openmls::prelude::KeyPackageIn;
     use scp_clock::SystemClock;
     use scp_did::SigningKeyId;
-    use scp_mls::group::{add_member, create_group, generate_key_package, join_group};
+    use scp_mls::group::{
+        add_member, add_member_with_convergent_timestamp, create_group, generate_key_package,
+        join_group,
+    };
     use scp_mls::{ScpCredential, SignatureKeyPair};
     use tls_codec::{Deserialize as TlsDeserialize, Serialize as TlsSerialize};
 
@@ -485,16 +510,27 @@ mod tests {
             &mut &*bob_bundle.key_package().tls_serialize_detached().unwrap(),
         )
         .unwrap();
-        let add_bob = add_member(&mut alice.mls_group, bob_kp_in, &SystemClock).unwrap();
+        // ADR-057: the add-Bob commit binds a convergent timestamp into its
+        // AAD; the existing member Carol recovers + validates it on receive.
+        let ts = SystemClock.now_secs();
+        let add_bob =
+            add_member_with_convergent_timestamp(&mut alice.mls_group, bob_kp_in, &SystemClock, ts)
+                .unwrap();
         let commit_bytes = add_bob.commit.tls_serialize_detached().unwrap();
 
         match carol.decrypt_message(&commit_bytes, &SystemClock).unwrap() {
             Inbound::Commit {
                 sender_did,
                 added_dids,
+                committer_timestamp_secs,
             } => {
                 assert_eq!(sender_did, ALICE, "committer is Alice");
                 assert_eq!(added_dids, vec![BOB.to_owned()], "Bob's DID surfaced");
+                assert_eq!(
+                    committer_timestamp_secs,
+                    Some(ts),
+                    "the authenticated convergent timestamp is recovered from the Commit AAD and adopted verbatim"
+                );
             }
             other => panic!("expected Inbound::Commit, got {other:?}"),
         }

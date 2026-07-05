@@ -5112,6 +5112,7 @@ dependencies = [
  "scp-clock",
  "scp-did",
  "scp-event-log",
+ "scp-mls",
  "scp-protocol",
  "serde-wasm-bindgen",
  "wasm-bindgen",

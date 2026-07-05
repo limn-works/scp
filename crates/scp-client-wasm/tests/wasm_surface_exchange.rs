@@ -7,8 +7,13 @@
 //! covers). It drives two [`WasmScpClient`]s — Alice (creator) and Bob (joiner)
 //! — through create / generate-key-package / add-member / join / send / receive
 //! / drain / close, touching ONLY the `#[wasm_bindgen]`-exported methods and the
-//! JS-friendly wrapper types (`WasmAddMemberOutput`, `WasmSendOutput`,
-//! `WasmReceivedEvent`) exactly as JavaScript would.
+//! JS-friendly wrapper types (`WasmAddMemberOutput`, `WasmReceivedEvent`)
+//! exactly as JavaScript would. `sendMessage` returns the ciphertext bytes
+//! directly: an application message is plain-encrypted and is not a convergent
+//! event-log leaf (ADR-011), so there is no `WasmSendOutput` wrapper and no
+//! transported timestamp — `receiveMessage` takes only the ciphertext. The
+//! convergent committer timestamp survives only on the add-Commit path, bound
+//! into that Commit's authenticated AAD (ADR-057 T3).
 //!
 //! # Why a native host test, not `wasm-bindgen-test`
 //!
@@ -106,7 +111,7 @@ fn assert_convergence(alice: &WasmScpClient, bob: &WasmScpClient) {
     let bob_leaves = bob
         .event_log_leaf_hashes(CTX.to_owned())
         .expect("bob leaves");
-    assert_eq!(alice_leaves.len(), 3 * 32, "3 leaves × 32 bytes");
+    assert_eq!(alice_leaves.len(), 2 * 32, "2 membership leaves × 32 bytes");
     assert_eq!(
         alice_leaves, bob_leaves,
         "every leaf hash is byte-identical across both members (convergence)"
@@ -193,25 +198,22 @@ fn two_party_exchange_through_wasm_surface() {
     // --- Out-of-band sender-key exchange (ADR-057 MISSING SEAM). ---
     exchange_sender_keys(&mut alice, &mut bob);
 
-    // --- Alice sends an application message → WasmSendOutput. ---
+    // --- Alice sends an application message → ciphertext bytes (Uint8Array). ---
     let plaintext = b"hello from Alice through the wasm-bindgen surface".to_vec();
-    let send = alice
+    let ciphertext = alice
         .send_message(CTX.to_owned(), plaintext.clone())
         .expect("Alice sends");
-    assert!(!send.ciphertext().is_empty(), "ciphertext present");
+    assert!(!ciphertext.is_empty(), "ciphertext present");
     assert_eq!(
         alice.event_log_leaf_count(CTX.to_owned()),
-        Some(3),
-        "Alice's log is now created + joined + sent"
+        Some(2),
+        "a send stamps NO convergent leaf (ADR-011): Alice's log stays created + joined"
     );
 
-    // --- Bob receives + decrypts using the convergent timestamp, then drains. ---
+    // --- Bob receives + decrypts a plain application message (no AAD), then
+    // drains. ---
     let was_application = bob
-        .receive_message(
-            CTX.to_owned(),
-            send.ciphertext(),
-            send.committer_timestamp_secs(),
-        )
+        .receive_message(CTX.to_owned(), ciphertext)
         .expect("Bob receives the message");
     assert!(was_application, "Alice's send is an application message");
 
@@ -308,15 +310,11 @@ fn restore_through_wasm_surface() {
     );
 
     // The restored surface client decrypts a message Alice sends post-restore.
-    let send = alice
+    let ciphertext = alice
         .send_message(CTX.to_owned(), b"after restore".to_vec())
         .expect("alice sends");
     let was_app = bob2
-        .receive_message(
-            CTX.to_owned(),
-            send.ciphertext(),
-            send.committer_timestamp_secs(),
-        )
+        .receive_message(CTX.to_owned(), ciphertext)
         .expect("bob2 receives");
     assert!(was_app);
     let events = bob2.drain_events(CTX.to_owned()).expect("bob2 drains");
@@ -377,14 +375,41 @@ fn context_status_reports_live_and_absent_through_the_surface() {
     // `context_status_reports_live_poisoned_and_absent`.
 }
 
+/// ADR-057 at the surface: the convergent-timestamp forgery seam is gone
+/// **by construction**. `sendMessage` returns the raw ciphertext bytes (no
+/// `WasmSendOutput` wrapper carrying a loose `committerTimestampSecs`), and
+/// `receiveMessage` takes ONLY `(context_id, ciphertext)` — there is no third
+/// `u64` timestamp parameter a caller or relay could set to a forged value. This
+/// is a compile-time proof: binding each method to its exact function type only
+/// type-checks if the signature matches, so a re-introduction of a transported
+/// timestamp parameter (or a send-output wrapper) fails the build.
+#[test]
+#[allow(clippy::type_complexity)] // the explicit fn-pointer type IS the assertion
+fn convergent_timestamp_forgery_seam_is_gone_by_construction() {
+    use wasm_bindgen::JsValue;
+
+    // `receiveMessage` accepts only the ciphertext — no timestamp to forge.
+    let _: fn(&mut WasmScpClient, String, Vec<u8>) -> Result<bool, JsValue> =
+        WasmScpClient::receive_message;
+    // `sendMessage` returns the ciphertext bytes directly — the convergent
+    // timestamp rides inside the authenticated AAD, not a separate return value.
+    let _: fn(&mut WasmScpClient, String, Vec<u8>) -> Result<Vec<u8>, JsValue> =
+        WasmScpClient::send_message;
+}
+
 // NOTE on error-path coverage: a `#[wasm_bindgen]` method that returns
 // `Err(JsValue)` cannot be exercised on the native host — constructing the
 // `JsValue` aborts (wasm-bindgen imported calls cannot run off-wasm), before any
-// `Result` is returned. So the surface's error mapping is NOT asserted in this
-// native happy-path test. It is covered instead by:
+// `Result` is returned. So the surface's error mapping — including the
+// tampered-ciphertext rejection through `receiveMessage` — is NOT asserted in
+// this native happy-path test. It is covered instead by:
+//   * the driver-level tamper test `tampered_ciphertext_produces_no_leaf`
+//     (`scp-client`), which proves a flipped ciphertext byte is rejected and
+//     stamps no leaf — `receiveMessage` is a thin forwarder to that exact path;
 //   * the pure `error::error_code` mapping (native unit tests in `error.rs`),
 //     which proves duplicate-context → `SCP-CTX-2002`, unknown-context →
-//     `SCP-CTX-2001`, etc.; and
+//     `SCP-CTX-2001`, and the convergent-timestamp family → `SCP-CRYPTO-4040`;
+//     and
 //   * `error::wasm_tests` (`#[wasm_bindgen_test]`), which proves the wrapped
 //     `JsValue` carries that prefix and the message.
 // This native-host limitation is a real property of testing a wasm-bindgen

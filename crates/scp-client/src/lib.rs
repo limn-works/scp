@@ -67,7 +67,7 @@ mod signer;
 mod snapshot;
 mod storage;
 
-pub use client::{AddMemberOutput, ContextStatus, ScpClient, SendOutput};
+pub use client::{AddMemberOutput, ContextStatus, ScpClient};
 pub use context::PerContextState;
 pub use crypto_state::{ContextCryptoState, INITIAL_SENDER_KEY_EPOCH, Inbound};
 pub use error::ClientError;

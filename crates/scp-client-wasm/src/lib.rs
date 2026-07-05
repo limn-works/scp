@@ -90,18 +90,19 @@ pub fn scp_version() -> String {
 }
 
 /// The wire output of [`WasmScpClient::add_member`]: the bytes the caller must
-/// distribute, plus the convergent committer timestamp and the join-replay
-/// material the new member needs.
+/// distribute, plus the join-replay material the new member needs.
 ///
 /// Mirrors [`scp_client::AddMemberOutput`] across the JS boundary. The
-/// `event_log` is exposed as its TLS/MessagePack-serialized form so it can ride
-/// the wire to the joiner; the joiner feeds it back via
-/// [`WasmScpClient::join_context_encrypted`].
+/// convergent committer timestamp is **not** a field: it is bound into the
+/// `commit`'s authenticated MLS AAD (ADR-057), so existing members recover
+/// it from the verified frame in [`WasmScpClient::receive_message`] rather than
+/// being handed a forgeable loose value. The `event_log` is exposed as its
+/// TLS/MessagePack-serialized form so it can ride the wire to the joiner; the
+/// joiner feeds it back via [`WasmScpClient::join_context_encrypted`].
 #[wasm_bindgen]
 pub struct WasmAddMemberOutput {
     commit: Vec<u8>,
     welcome: Vec<u8>,
-    committer_timestamp_secs: u64,
     event_log: Vec<u8>,
     members: Vec<String>,
 }
@@ -122,15 +123,6 @@ impl WasmAddMemberOutput {
         self.welcome.clone()
     }
 
-    /// The convergent committer timestamp (Unix seconds) the adder stamped on
-    /// its `MemberJoined` leaf. Existing members pass it to
-    /// [`WasmScpClient::receive_message`] so their mirrored leaf converges.
-    #[must_use]
-    #[wasm_bindgen(getter, js_name = "committerTimestampSecs")]
-    pub fn committer_timestamp_secs(&self) -> u64 {
-        self.committer_timestamp_secs
-    }
-
     /// The adder's serialized event-log stream after the add. The joiner
     /// replays it (via [`WasmScpClient::join_context_encrypted`]) to converge.
     #[must_use]
@@ -147,38 +139,12 @@ impl WasmAddMemberOutput {
     }
 }
 
-/// The wire output of [`WasmScpClient::send_message`]: the ciphertext plus the
-/// convergent committer timestamp recipients must echo.
+/// A drained context event, in JS-friendly form.
 ///
-/// Mirrors [`scp_client::SendOutput`] across the JS boundary.
-#[wasm_bindgen]
-pub struct WasmSendOutput {
-    ciphertext: Vec<u8>,
-    committer_timestamp_secs: u64,
-}
-
-#[wasm_bindgen]
-impl WasmSendOutput {
-    /// The TLS-serialized MLS ciphertext to deliver to peers.
-    #[must_use]
-    #[wasm_bindgen(getter)]
-    pub fn ciphertext(&self) -> Vec<u8> {
-        self.ciphertext.clone()
-    }
-
-    /// The convergent committer timestamp (Unix seconds) the sender stamped;
-    /// every recipient passes it to [`WasmScpClient::receive_message`].
-    #[must_use]
-    #[wasm_bindgen(getter, js_name = "committerTimestampSecs")]
-    pub fn committer_timestamp_secs(&self) -> u64 {
-        self.committer_timestamp_secs
-    }
-}
-
-/// A drained receive event, in JS-friendly form.
-///
-/// The participant driver buffers `MessageReceived` events; this carries the
-/// decrypted message across the boundary. `kind` is the event variant name so
+/// The participant driver buffers local message history — a sender's own
+/// `MessageSent` and a receiver's `MessageReceived` — and this carries the
+/// (decrypted) message across the boundary. `kind` is the event variant name
+/// (`"MessageSent"` / `"MessageReceived"`) so the caller can discriminate, and
 /// the surface stays forward-safe if the driver buffers more variants later.
 #[wasm_bindgen]
 pub struct WasmReceivedEvent {
@@ -337,7 +303,6 @@ impl WasmScpClient {
         Ok(WasmAddMemberOutput {
             commit: out.commit,
             welcome: out.welcome,
-            committer_timestamp_secs: out.committer_timestamp_secs,
             event_log,
             members: out.members,
         })
@@ -377,7 +342,13 @@ impl WasmScpClient {
     }
 
     /// Encrypts and "sends" an application message in `context_id`, returning
-    /// the wire ciphertext plus the convergent send timestamp.
+    /// the wire ciphertext (`Uint8Array`).
+    ///
+    /// The convergent committer timestamp is bound into the ciphertext's
+    /// authenticated MLS AAD (ADR-057) rather than returned separately, so
+    /// the recipient recovers it from the verified frame in
+    /// [`WasmScpClient::receive_message`] — there is no forgeable loose value for
+    /// the caller to relay.
     ///
     /// # Errors
     ///
@@ -393,42 +364,39 @@ impl WasmScpClient {
         &mut self,
         context_id: String,
         plaintext: Vec<u8>,
-    ) -> Result<WasmSendOutput, JsValue> {
-        let out = map_err(self.inner.send_message(&context_id, &plaintext))?;
-        Ok(WasmSendOutput {
-            ciphertext: out.ciphertext,
-            committer_timestamp_secs: out.committer_timestamp_secs,
-        })
+    ) -> Result<Vec<u8>, JsValue> {
+        map_err(self.inner.send_message(&context_id, &plaintext))
     }
 
     /// Receives an inbound MLS message in `context_id`. Returns `true` if it was
     /// an application message (a `MessageReceived` event is buffered for
     /// [`WasmScpClient::drain_events`]), `false` for a membership Commit or
-    /// bare proposal. `committer_timestamp_secs` is the convergent timestamp the
-    /// committer stamped (from [`WasmSendOutput::committer_timestamp_secs`] or
-    /// [`WasmAddMemberOutput::committer_timestamp_secs`]).
+    /// bare proposal.
+    ///
+    /// Takes only the ciphertext: the convergent committer timestamp each mirrored
+    /// leaf is stamped with is recovered from the message's own **authenticated**
+    /// MLS AAD (ADR-057), not passed in — so there is no forgery seam where
+    /// a caller (or relay) could supply a mismatched timestamp.
     ///
     /// # Errors
     ///
     /// Throws `[SCP-CTX-2001]` if the context is not held, `[SCP-CTX-2003]` if
     /// the Commit removes a member (out of Slice 2 scope; rejected pre-merge so
-    /// the context stays consistent), or a `[SCP-CRYPTO-…]` error on failure. A
-    /// `[SCP-STORAGE-8010]` on the post-receive snapshot write **poisons** the
-    /// context (the decrypt advanced the ratchet but the new state was not durably
-    /// recorded), and `[SCP-STORAGE-8013]` is thrown if the context is already
-    /// poisoned — either way, discard this client and reconstruct it via the [`WasmScpClient`]
-    /// constructor for your target (see [`ContextStatus`](scp_client::ContextStatus)).
+    /// the context stays consistent), or a `[SCP-CRYPTO-…]` error on failure
+    /// (including a missing or malformed convergent-timestamp AAD —
+    /// `[SCP-CRYPTO-4040]`). A `[SCP-STORAGE-8010]` on the post-receive snapshot
+    /// write **poisons** the context (the decrypt advanced the ratchet but the new
+    /// state was not durably recorded), and `[SCP-STORAGE-8013]` is thrown if the
+    /// context is already poisoned — either way, discard this client and
+    /// reconstruct it via the [`WasmScpClient`] constructor for your target (see
+    /// [`ContextStatus`](scp_client::ContextStatus)).
     #[wasm_bindgen(js_name = "receiveMessage")]
     pub fn receive_message(
         &mut self,
         context_id: String,
         ciphertext: Vec<u8>,
-        committer_timestamp_secs: u64,
     ) -> Result<bool, JsValue> {
-        map_err(
-            self.inner
-                .receive_message(&context_id, &ciphertext, committer_timestamp_secs),
-        )
+        map_err(self.inner.receive_message(&context_id, &ciphertext))
     }
 
     /// Drains all buffered receive events for `context_id` in FIFO order.
@@ -456,9 +424,20 @@ impl WasmScpClient {
                     sender_did: sender_did.0,
                     payload,
                 },
-                // The participant driver only buffers MessageReceived today;
-                // any other variant is surfaced with its name and an empty
-                // payload rather than dropped, so the surface is forward-safe.
+                // A sender's own local `MessageSent` history (ADR-011 / ADR-057
+                // T3): the driver buffers it on send, so the surface returns it
+                // with its sender DID + payload, discriminated by `kind`.
+                ContextEvent::MessageSent {
+                    sender_did,
+                    payload,
+                    ..
+                } => WasmReceivedEvent {
+                    kind: "MessageSent".to_owned(),
+                    sender_did: sender_did.0,
+                    payload,
+                },
+                // Any other variant is surfaced with its name and an empty payload
+                // rather than dropped, so the surface is forward-safe.
                 other => WasmReceivedEvent {
                     kind: event_kind(&other).to_owned(),
                     sender_did: String::new(),

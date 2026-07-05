@@ -28,6 +28,7 @@ use openmls::prelude::*;
 use scp_clock::Clock;
 use tls_codec::{Deserialize as TlsDeserializeTrait, Serialize as TlsSerializeTrait};
 
+use crate::convergent_timestamp::decode_convergent_timestamp_aad;
 use crate::error::MlsError;
 use crate::group::ScpMlsGroup;
 use crate::lifetime::validate_key_package_lifetime;
@@ -421,27 +422,40 @@ pub fn decrypt_with_sender_did(
 #[derive(Clone, PartialEq, Eq)]
 pub enum InboundChange {
     /// An application message carrying user plaintext and the sender DID.
+    ///
+    /// Application messages are **not** convergent event-log leaves (ADR-011
+    /// exclusion taxonomy §2: `MessageSent` is per-author with no total delivery
+    /// order — see `.docs/adrs/phase-2.md`), so they bind no convergent
+    /// timestamp: they are plain-encrypted and carry no AAD. The receiver records
+    /// the message as local history, not as a Merkle leaf.
     Application {
         /// The decrypted payload bytes.
         plaintext: Vec<u8>,
         /// The sender's DID string extracted from the MLS credential.
         sender_did: String,
     },
-    /// An **add-only** Commit that advanced the group epoch.
-    /// `merge_staged_commit` has already been called. `added_dids` are the SCP
-    /// DIDs of the members the Commit's Add proposals add, recovered from the
-    /// staged commit's Add proposals' `KeyPackage` leaf credentials before the
-    /// merge.
+    /// A Commit that advanced the group epoch. `merge_staged_commit` has already
+    /// been called. `added_dids` are the SCP DIDs of the members the Commit's Add
+    /// proposals add, recovered from the staged commit's Add proposals'
+    /// `KeyPackage` leaf credentials before the merge.
     ///
     /// A Commit carrying any Remove proposal never reaches this variant — it is
     /// surfaced as [`InboundChange::UnsupportedMembershipChange`] *without*
-    /// merging, so this variant only ever describes an applied, add-only epoch
-    /// advance.
+    /// merging, so this variant only ever describes an applied add-only or no-add
+    /// epoch advance.
     Commit {
         /// The committer's DID string extracted from the MLS credential.
         sender_did: String,
-        /// DIDs added by this Commit's Add proposals, in proposal order.
+        /// DIDs added by this Commit's Add proposals, in proposal order. Empty
+        /// for a no-add Commit (e.g. a self-update).
         added_dids: Vec<String>,
+        /// The authenticated convergent committer timestamp (Unix seconds),
+        /// recovered from the Commit's verified MLS AAD *before* the merge and
+        /// adopted **verbatim** (ADR-057). The receiver stamps this exact value
+        /// on each mirrored `MemberJoined` leaf. `Some` only when the Commit adds
+        /// members (an add-Commit stamps membership leaves); `None` for a no-add
+        /// Commit, which stamps no leaf and so carries no timestamp.
+        committer_timestamp_secs: Option<u64>,
     },
     /// A Commit that carries one or more Remove proposals, which this seam does
     /// not converge.
@@ -494,10 +508,12 @@ impl std::fmt::Debug for InboundChange {
             Self::Commit {
                 sender_did,
                 added_dids,
+                committer_timestamp_secs,
             } => f
                 .debug_struct("Commit")
                 .field("sender_did", sender_did)
                 .field("added_dids", added_dids)
+                .field("committer_timestamp_secs", committer_timestamp_secs)
                 .finish(),
             Self::UnsupportedMembershipChange {
                 sender_did,
@@ -540,47 +556,74 @@ fn credential_to_did(credential: &Credential) -> Result<String, MlsError> {
 /// the added member's DID — which [`decrypt_with_sender_did`] discarded. This
 /// function recovers it.
 ///
+/// # Convergent timestamp authentication (ADR-057)
+///
+/// Only an **add-Commit** stamps convergent membership (`MemberJoined`) leaves,
+/// so only it binds a convergent committer timestamp. This function recovers the
+/// **authenticated** value from openmls's *verified* `ProcessedMessage::aad()`
+/// (the `FramedContent.authenticated_data`, covered by the committer's leaf
+/// signature and the `PrivateMessage` AEAD tag), bound at commit time by
+/// [`crate::group::add_member_with_convergent_timestamp`], and adopts it
+/// **verbatim** — there is no receiver-side plausibility window and no clock
+/// verdict (a per-receiver verdict would itself be a §9.9.3 violation; see the
+/// [`crate::convergent_timestamp`] module docs). Because the value is
+/// authenticated, a receiver stamps it on each mirrored `MemberJoined` leaf
+/// rather than trusting a loose transported `u64` a relay could forge. A missing
+/// or malformed AAD on an add-Commit fails it closed (see Errors).
+///
+/// Application messages are **not** convergent leaves (ADR-011 exclusion
+/// taxonomy §2), so they carry no AAD and no timestamp is decoded for them.
+///
 /// # Message Type Handling
 ///
 /// - **`ApplicationMessage`** → [`InboundChange::Application`] (plaintext +
-///   sender DID), identical to [`decrypt_with_sender_did`].
+///   sender DID). No AAD is read; the message is local history, not a leaf.
 /// - **`StagedCommitMessage`, add-only** → the added members' DIDs are read
 ///   from the Add proposals' `KeyPackage` leaf credentials **before**
-///   `merge_staged_commit` consumes the staged commit, the commit is then
-///   merged, and [`InboundChange::Commit`] is returned. The `KeyPackage`s inside
-///   the Add proposals were already validated by `process_message` (it rejects a
-///   Commit carrying an invalid Add), so the recovered added DIDs are
-///   authenticated.
+///   `merge_staged_commit`. The pre-merge order is: Remove-refusal → `Lifetime`
+///   brackets + added-DID recovery → AAD decode (adopt verbatim) → merge. Any
+///   failure drops the staged commit unmerged (epoch unchanged). On success
+///   [`InboundChange::Commit`] carries the added DIDs and `Some` authenticated
+///   `committer_timestamp_secs`.
+/// - **`StagedCommitMessage`, no-add** (e.g. a self-update) → no AAD is decoded
+///   (a no-add Commit stamps no membership leaf); [`InboundChange::Commit`] is
+///   returned with empty `added_dids` and `committer_timestamp_secs` = `None`,
+///   and the epoch advances.
 /// - **`StagedCommitMessage` carrying any Remove** → the staged commit is
 ///   **dropped without merging** and [`InboundChange::UnsupportedMembershipChange`]
 ///   is returned. The removed members' DIDs are recovered from the *current*
-///   (pre-merge) tree for reporting, but `merge_staged_commit` is **never
-///   called**, so the MLS group stays on its current epoch and remains
-///   consistent with the caller's SCP-layer state (fail-closed, not
-///   half-applied). The caller can keep using the group on the old epoch.
+///   (pre-merge) tree for reporting; `merge_staged_commit` is **never called**,
+///   so the group stays on its current epoch, consistent with the caller's
+///   SCP-layer state.
 /// - **`ProposalMessage` / `ExternalJoinProposalMessage`** →
 ///   [`InboundChange::Proposal`]; `OpenMLS` caches the proposal, no membership
-///   change is committed yet.
+///   change is committed yet, and the AAD is ignored.
 ///
 /// # Errors
 ///
 /// Returns [`MlsError::GroupDestroyed`] if the group has been destroyed,
 /// [`MlsError::DecryptionFailed`] if decryption or credential parsing fails, or
-/// [`MlsError::CommitProcessingFailed`] if an add-only staged commit cannot be
-/// merged. A Remove-bearing Commit does not error here — it is surfaced as
+/// [`MlsError::CommitProcessingFailed`] if a staged commit cannot be merged. A
+/// Remove-bearing Commit does not error here — it is surfaced as
 /// [`InboundChange::UnsupportedMembershipChange`] without merging, leaving the
 /// group consistent.
-/// Returns [`MlsError::KeyPackageLifetimeInvalid`] if an add-only Commit's Add
+/// Returns [`MlsError::KeyPackageLifetimeInvalid`] if an add-Commit's Add
 /// proposal carries a `KeyPackage` whose `Lifetime` fails validation against the
 /// injected clock; the staged commit is dropped **without merging** (ADR-057
 /// §Prereq-1).
+/// Returns [`MlsError::ConvergentTimestampMissing`] /
+/// [`MlsError::ConvergentTimestampMalformed`] (ADR-057) if an add-Commit's AAD
+/// carries no timestamp or a malformed one. These are raised *pre-merge*, so the
+/// epoch is unchanged.
 ///
 /// # Arguments
 ///
-/// * `clock` - The injected hardened [`Clock`]. For an add-only Commit, each Add
+/// * `clock` - The injected hardened [`Clock`]. For an add-Commit, each Add
 ///   proposal's `KeyPackage` `Lifetime` is re-validated against it *before*
 ///   `merge_staged_commit`, mirroring the openmls-independent hardening in
-///   [`decrypt_with_sender_did`] and [`crate::group::add_member`].
+///   [`decrypt_with_sender_did`] and [`crate::group::add_member`]. It is no
+///   longer used to adjudicate the convergent timestamp (which is adopted
+///   verbatim).
 pub fn decrypt_with_membership_changes(
     group: &mut ScpMlsGroup,
     ciphertext: &[u8],
@@ -614,6 +657,13 @@ pub fn decrypt_with_membership_changes(
         }
     };
 
+    // Capture the VERIFIED authenticated_data (AAD) before consuming the
+    // ProcessedMessage. `ProcessedMessage::aad()` is post-verification: it is the
+    // AAD covered by the committer's leaf signature (and, under PURE_CIPHERTEXT,
+    // the AEAD tag), so decoding the convergent timestamp from it yields an
+    // authenticated value, not one trusted on the wire (ADR-057).
+    let aad = processed.aad().to_vec();
+
     // Resolve the sender DID from their leaf credential before consuming the
     // ProcessedMessage.
     let sender = processed.sender().clone();
@@ -635,10 +685,17 @@ pub fn decrypt_with_membership_changes(
     let sender_did = credential_to_did(&sender_credential)?;
 
     match processed.into_content() {
-        ProcessedMessageContent::ApplicationMessage(app_msg) => Ok(InboundChange::Application {
-            plaintext: app_msg.into_bytes(),
-            sender_did,
-        }),
+        ProcessedMessageContent::ApplicationMessage(app_msg) => {
+            // ADR-011 exclusion taxonomy §2: an application message is NOT a
+            // convergent Merkle leaf (`MessageSent` is per-author with no total
+            // delivery order), so it binds no convergent timestamp — it is plain
+            // encrypted and carries no AAD. Nothing is decoded here; the receiver
+            // records it as local history.
+            Ok(InboundChange::Application {
+                plaintext: app_msg.into_bytes(),
+                sender_did,
+            })
+        }
         ProcessedMessageContent::StagedCommitMessage(staged_commit) => {
             // Inspect the staged commit's proposals BEFORE merging. openmls lets
             // us read `add_proposals()` / `remove_proposals()` off the
@@ -679,18 +736,20 @@ pub fn decrypt_with_membership_changes(
             if !removed_dids.is_empty() {
                 // `staged_commit` is dropped at the end of this block without
                 // ever being passed to `merge_staged_commit`, so the group is
-                // unchanged.
+                // unchanged. The Remove-refusal is decided FIRST (a Remove-bearing
+                // Commit is rejected regardless of any AAD), matching the pre-merge
+                // ordering: Remove-refusal → Lifetime brackets → AAD decode →
+                // merge.
                 return Ok(InboundChange::UnsupportedMembershipChange {
                     sender_did,
                     removed_dids,
                 });
             }
 
-            // Add-only Commit: recover the added DIDs from the Add proposals'
-            // KeyPackage leaf credentials. These KeyPackages were validated by
-            // process_message (a Commit carrying an invalid Add is rejected
-            // above), so the DIDs are cryptographically authenticated, not
-            // advisory.
+            // Recover the added DIDs from the Add proposals' KeyPackage leaf
+            // credentials. These KeyPackages were validated by process_message (a
+            // Commit carrying an invalid Add is rejected above), so the DIDs are
+            // cryptographically authenticated, not advisory.
             //
             // SECURITY (ADR-057 §Prereq-1): re-validate each Add proposal's
             // KeyPackage `Lifetime` against the injected hardened clock (plus the
@@ -707,9 +766,25 @@ pub fn decrypt_with_membership_changes(
                 added_dids.push(credential_to_did(key_package.leaf_node().credential())?);
             }
 
-            // Only now — having confirmed the change is add-only and supported —
-            // merge the staged commit to advance the group epoch (mirrors
-            // decrypt_with_sender_did — without this the group is corrupted).
+            // ADR-057: only an add-Commit stamps convergent MemberJoined leaves,
+            // so only an add-Commit binds a convergent timestamp. Decode it from
+            // the verified AAD and adopt it VERBATIM (no receiver-side window, no
+            // clock verdict — a per-receiver verdict would itself be a §9.9.3
+            // violation) IFF this Commit adds members. A no-add Commit (e.g. a
+            // self-update) carries no AAD and stamps no leaf → `None`. A missing /
+            // malformed AAD on an add-Commit rejects it here via `?`, pre-merge,
+            // so the group stays on its current epoch (fail-closed, consistent
+            // with the Remove path and the Lifetime bracket above).
+            let committer_timestamp_secs = if added_dids.is_empty() {
+                None
+            } else {
+                Some(decode_convergent_timestamp_aad(&aad)?)
+            };
+
+            // Only now — having confirmed the change carries no Remove and every
+            // Add is supported — merge the staged commit to advance the group
+            // epoch (mirrors decrypt_with_sender_did — without this the group is
+            // corrupted).
             let g = group.group.as_mut().ok_or(MlsError::GroupDestroyed)?;
             g.merge_staged_commit(&group.provider, *staged_commit)
                 .map_err(|e| {
@@ -719,10 +794,13 @@ pub fn decrypt_with_membership_changes(
             Ok(InboundChange::Commit {
                 sender_did,
                 added_dids,
+                committer_timestamp_secs,
             })
         }
         ProcessedMessageContent::ProposalMessage(_)
         | ProcessedMessageContent::ExternalJoinProposalMessage(_) => {
+            // A bare proposal commits no membership change and stamps no leaf, so
+            // it carries no convergent timestamp — the AAD is ignored here.
             Ok(InboundChange::Proposal { sender_did })
         }
     }
@@ -747,8 +825,11 @@ pub fn serialize_ciphertext(message: &MlsMessageOut) -> Result<Vec<u8>, MlsError
 mod tests {
     use super::*;
     use crate::credential::ScpCredential;
-    use crate::group::{add_member, create_group, generate_key_package, join_group};
-    use scp_clock::SystemClock;
+    use crate::group::{
+        add_member, add_member_with_convergent_timestamp, create_group, generate_key_package,
+        join_group,
+    };
+    use scp_clock::{SystemClock, TestClock};
 
     #[allow(clippy::unwrap_used)]
     fn test_credential(name: &str) -> ScpCredential {
@@ -1098,7 +1179,12 @@ mod tests {
         let (carol_kp_bundle, _carol_signer, _carol_provider) =
             generate_key_package(&carol_cred, &SystemClock).unwrap();
         let carol_kp: KeyPackageIn = carol_kp_bundle.key_package().clone().into();
-        let add_carol = add_member(&mut alice_group, carol_kp, &SystemClock).unwrap();
+        // ADR-057: the add-Carol commit binds a convergent timestamp into
+        // its AAD; Bob recovers + validates it on receive.
+        let ts = SystemClock.now_secs();
+        let add_carol =
+            add_member_with_convergent_timestamp(&mut alice_group, carol_kp, &SystemClock, ts)
+                .unwrap();
 
         let commit_bytes = add_carol.commit.tls_serialize_detached().unwrap();
         let change =
@@ -1108,12 +1194,18 @@ mod tests {
             InboundChange::Commit {
                 sender_did,
                 added_dids,
+                committer_timestamp_secs,
             } => {
                 assert_eq!(sender_did, "did:dht:z6Mkalice", "committer is Alice");
                 assert_eq!(
                     added_dids,
                     vec!["did:dht:z6Mkcarol".to_owned()],
                     "the seam surfaces Carol's DID from the Add proposal"
+                );
+                assert_eq!(
+                    committer_timestamp_secs,
+                    Some(ts),
+                    "the authenticated convergent timestamp is recovered from the AAD and adopted verbatim"
                 );
             }
             other => panic!("expected Commit change, got {other:?}"),
@@ -1148,10 +1240,13 @@ mod tests {
         let carol_cred = test_credential("carol");
         let (carol_kp_bundle, _carol_signer, _carol_provider) =
             generate_key_package(&carol_cred, &SystemClock).unwrap();
-        let add_carol = add_member(
+        // ADR-057: bind a convergent timestamp so Bob's add-Carol receive
+        // (a Commit-arm decrypt) accepts.
+        let add_carol = add_member_with_convergent_timestamp(
             &mut alice_group,
             carol_kp_bundle.key_package().clone().into(),
             &SystemClock,
+            SystemClock.now_secs(),
         )
         .unwrap();
         let add_carol_bytes = add_carol.commit.tls_serialize_detached().unwrap();
@@ -1215,6 +1310,9 @@ mod tests {
     #[test]
     #[allow(clippy::unwrap_used, clippy::panic)]
     fn decrypt_with_membership_changes_application_variant() {
+        // An application message is plain-encrypted (no AAD): ADR-011 excludes
+        // `MessageSent` from the convergent Merkle log, so the seam surfaces only
+        // the plaintext + sender DID, with no convergent timestamp.
         let (mut alice_group, mut bob_group) = setup_alice_bob();
         let ct = encrypt(&mut alice_group, b"hi").unwrap();
         let ct_bytes = serialize_ciphertext(&ct).unwrap();
@@ -1230,6 +1328,56 @@ mod tests {
             }
             other => panic!("expected Application change, got {other:?}"),
         }
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used, clippy::panic)]
+    fn decrypt_with_membership_changes_no_add_self_update_commit_carries_no_timestamp() {
+        // A no-add Commit (a self-update) stamps no MemberJoined leaf, so it binds
+        // no convergent timestamp and carries no AAD. The seam must NOT try to
+        // decode a timestamp (the pre-fix code decoded unconditionally and failed
+        // a self-update closed as ConvergentTimestampMissing — BLACK-T3-03): it
+        // returns `added_dids` empty, `committer_timestamp_secs` None, and MERGES
+        // (the epoch advances).
+        let (mut alice_group, mut bob_group) = setup_alice_bob();
+        let bob_epoch_before = bob_group.epoch().unwrap();
+
+        // Alice self-updates (a Commit with no Add and no Remove proposals).
+        let alice_g = alice_group.group.as_mut().unwrap();
+        let alice_signer = alice_group.signer.as_ref().unwrap();
+        let bundle = alice_g
+            .self_update(
+                &alice_group.provider,
+                alice_signer,
+                LeafNodeParameters::default(),
+            )
+            .unwrap();
+        let commit_msg = bundle.into_commit();
+        let alice_g = alice_group.group.as_mut().unwrap();
+        alice_g.merge_pending_commit(&alice_group.provider).unwrap();
+        let commit_bytes = commit_msg.tls_serialize_detached().unwrap();
+
+        let change =
+            decrypt_with_membership_changes(&mut bob_group, &commit_bytes, &SystemClock).unwrap();
+        match change {
+            InboundChange::Commit {
+                added_dids,
+                committer_timestamp_secs,
+                ..
+            } => {
+                assert!(added_dids.is_empty(), "a self-update adds nobody");
+                assert_eq!(
+                    committer_timestamp_secs, None,
+                    "a no-add Commit stamps no leaf, so it carries no timestamp"
+                );
+            }
+            other => panic!("expected a no-add Commit change, got {other:?}"),
+        }
+        assert_eq!(
+            bob_group.epoch().unwrap(),
+            bob_epoch_before + 1,
+            "a no-add Commit still advances the epoch (merged, not rejected)"
+        );
     }
 
     #[test]
@@ -1306,11 +1454,26 @@ mod tests {
         let carol_cred = test_credential("carol");
         let (carol_kp_bundle, _s, _p) = generate_key_package(&carol_cred, &SystemClock).unwrap();
         let carol_kp: KeyPackageIn = carol_kp_bundle.key_package().clone().into();
-        let add_carol = add_member(&mut alice_group, carol_kp, &SystemClock).unwrap();
+        // Alice adds Carol with the REAL clock (so her side accepts Carol's KP,
+        // whose not_after ~ real_now + 84d) but binds a convergent timestamp at
+        // `real_now + 90d`. Bob then receives with a clock at that same +90d
+        // value. The convergent timestamp in the AAD is adopted verbatim — there
+        // is no receiver-side clock verdict on it — so the only clock-sensitive
+        // check on this path is the MLS KeyPackage `Lifetime` bracket, which
+        // surfaces the *Lifetime* failure: Carol's KP is expired at +90d. This
+        // isolates the pre-merge Lifetime bracket; it is not a timestamp failure.
+        let ninety_days = 90 * 24 * 60 * 60;
+        let future_ts = real_now + ninety_days;
+        let add_carol = add_member_with_convergent_timestamp(
+            &mut alice_group,
+            carol_kp,
+            &SystemClock,
+            future_ts,
+        )
+        .unwrap();
         let commit_bytes = add_carol.commit.tls_serialize_detached().unwrap();
 
-        let hundred_days = 100 * 24 * 60 * 60;
-        let future = scp_clock::TestClock::new(real_now + hundred_days);
+        let future = TestClock::new(future_ts);
         let err =
             decrypt_with_membership_changes(&mut bob_group, &commit_bytes, &future).unwrap_err();
         assert!(
@@ -1325,6 +1488,146 @@ mod tests {
 
         let ct = encrypt(&mut bob_group, b"still works").unwrap();
         let _ = serialize_ciphertext(&ct).unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // ADR-057: convergent-timestamp AAD authentication
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn membership_changes_application_carries_no_aad() {
+        // A plain `encrypt` application message decrypts cleanly through the
+        // membership-changes seam: ADR-011 excludes `MessageSent` from the
+        // convergent log, so no AAD is expected and none is decoded — the receiver
+        // records local history, not a leaf.
+        let (mut alice_group, mut bob_group) = setup_alice_bob();
+        let ct = encrypt(&mut alice_group, b"no aad here").unwrap();
+        let bytes = serialize_ciphertext(&ct).unwrap();
+        let change = decrypt_with_membership_changes(&mut bob_group, &bytes, &SystemClock).unwrap();
+        assert!(
+            matches!(change, InboundChange::Application { .. }),
+            "a plain application message decodes without any AAD requirement, got {change:?}"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn membership_changes_missing_aad_commit_rejected_pre_merge() {
+        // A plain `add_member` Commit (no AAD) processed by an existing member is
+        // rejected pre-merge on the missing timestamp: the epoch is unchanged and
+        // the group stays usable (fail-closed, not half-applied).
+        let (mut alice_group, mut bob_group) = setup_alice_bob();
+        let bob_epoch_before = bob_group.epoch().unwrap();
+
+        let carol_cred = test_credential("carol");
+        let (carol_kp_bundle, _s, _p) = generate_key_package(&carol_cred, &SystemClock).unwrap();
+        let carol_kp: KeyPackageIn = carol_kp_bundle.key_package().clone().into();
+        // Plain add_member — binds NO convergent-timestamp AAD.
+        let add_carol = add_member(&mut alice_group, carol_kp, &SystemClock).unwrap();
+        let commit_bytes = add_carol.commit.tls_serialize_detached().unwrap();
+
+        let err = decrypt_with_membership_changes(&mut bob_group, &commit_bytes, &SystemClock)
+            .unwrap_err();
+        assert!(
+            matches!(err, MlsError::ConvergentTimestampMissing),
+            "an add-Commit with no convergent-timestamp AAD must be rejected as missing, got {err:?}"
+        );
+        assert_eq!(
+            bob_group.epoch().unwrap(),
+            bob_epoch_before,
+            "a rejected (missing-AAD) add-Commit must NOT advance the epoch (no half-merge)"
+        );
+        // The group stays usable on the unchanged epoch.
+        let ct = encrypt(&mut bob_group, b"still works").unwrap();
+        let _ = serialize_ciphertext(&ct).unwrap();
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn forged_add_commit_aad_is_decryption_failed() {
+        // An add-Commit's convergent timestamp lives in the AUTHENTICATED AAD,
+        // covered by the committer's leaf signature and the PrivateMessage AEAD
+        // tag. Flipping a wire byte breaks the tag, so the frame is rejected as
+        // DecryptionFailed pre-merge — a relay cannot alter the Commit (or its
+        // timestamp) and have it accepted.
+        let (mut alice_group, mut bob_group) = setup_alice_bob();
+        let bob_epoch_before = bob_group.epoch().unwrap();
+
+        let carol_cred = test_credential("carol");
+        let (carol_kp_bundle, _s, _p) = generate_key_package(&carol_cred, &SystemClock).unwrap();
+        let carol_kp: KeyPackageIn = carol_kp_bundle.key_package().clone().into();
+        let ts = SystemClock.now_secs();
+        let add_carol =
+            add_member_with_convergent_timestamp(&mut alice_group, carol_kp, &SystemClock, ts)
+                .unwrap();
+        let mut bytes = add_carol.commit.tls_serialize_detached().unwrap();
+        if let Some(byte) = bytes.last_mut() {
+            *byte ^= 0xFF;
+        }
+        let err =
+            decrypt_with_membership_changes(&mut bob_group, &bytes, &SystemClock).unwrap_err();
+        assert!(
+            matches!(err, MlsError::DecryptionFailed(_)),
+            "a forged add-Commit AAD must fail the AEAD tag (DecryptionFailed), got {err:?}"
+        );
+        assert_eq!(
+            bob_group.epoch().unwrap(),
+            bob_epoch_before,
+            "a rejected (forged) add-Commit must NOT advance the epoch"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used, clippy::panic, clippy::expect_used)]
+    fn forged_add_commit_aad_region_flip_is_decryption_failed() {
+        // Strictly stronger than the tag-region flip above: this mutates a byte
+        // INSIDE the transmitted convergent-timestamp AAD blob itself, not the
+        // trailing AEAD tag. The AAD rides in `PrivateMessage.authenticated_data`,
+        // which RFC 9420 §6.3.2 folds into the AEAD's associated data — so
+        // altering the timestamp bytes on the wire breaks the tag and the frame
+        // is rejected as DecryptionFailed at `process_message`, BEFORE the value
+        // is ever decoded. This pins that the timestamp *field* is bound, not
+        // merely that the frame carries an intact tag.
+        use crate::convergent_timestamp::encode_convergent_timestamp_aad;
+
+        let (mut alice_group, mut bob_group) = setup_alice_bob();
+        let bob_epoch_before = bob_group.epoch().unwrap();
+
+        let carol_cred = test_credential("carol");
+        let (carol_kp_bundle, _s, _p) = generate_key_package(&carol_cred, &SystemClock).unwrap();
+        let carol_kp: KeyPackageIn = carol_kp_bundle.key_package().clone().into();
+        // A distinctive timestamp so its encoded AAD blob is unambiguously
+        // locatable in the cleartext `authenticated_data` on the wire.
+        let ts: u64 = 0x0102_0304_0506_0708;
+        let add_carol =
+            add_member_with_convergent_timestamp(&mut alice_group, carol_kp, &SystemClock, ts)
+                .unwrap();
+        let mut bytes = add_carol.commit.tls_serialize_detached().unwrap();
+
+        // Locate the 13-byte AAD blob (`SCPT` || version || u64-BE ts) and flip a
+        // byte inside its timestamp field — proof the transmitted AAD is present
+        // in the clear AND bound by the tag.
+        let aad_blob = encode_convergent_timestamp_aad(ts);
+        let aad_offset = bytes
+            .windows(aad_blob.len())
+            .position(|w| w == aad_blob)
+            .expect("the convergent-timestamp AAD blob must ride in the clear on the wire");
+        // Offset +5 is the first timestamp byte: magic[0..4] || version[4] || ts[5..13].
+        bytes[aad_offset + 5] ^= 0xFF;
+
+        let err =
+            decrypt_with_membership_changes(&mut bob_group, &bytes, &SystemClock).unwrap_err();
+        assert!(
+            matches!(err, MlsError::DecryptionFailed(_)),
+            "flipping a byte inside the authenticated timestamp AAD must fail the AEAD \
+             tag (DecryptionFailed), proving the timestamp field is bound, got {err:?}"
+        );
+        assert_eq!(
+            bob_group.epoch().unwrap(),
+            bob_epoch_before,
+            "a rejected (AAD-tampered) add-Commit must NOT advance the epoch"
+        );
     }
 
     mod proptest_tests {

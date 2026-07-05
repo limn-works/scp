@@ -141,4 +141,24 @@ pub enum MlsError {
     /// from the restored provider (`MlsGroup::load` returned `None`).
     #[error("MLS state snapshot error: {0}")]
     Snapshot(String),
+
+    /// A decrypted-and-verified MLS frame carried **no** convergent-timestamp
+    /// AAD (its `FramedContent.authenticated_data` was empty), so the receiver
+    /// has no authenticated committer timestamp to stamp on its mirrored
+    /// event-log leaf. Raised by
+    /// [`decode_convergent_timestamp_aad`](crate::convergent_timestamp::decode_convergent_timestamp_aad)
+    /// on an empty AAD — a frame authored without `set_aad` (an old-path or
+    /// forged message). Fail-closed: the receiver rejects rather than substitute
+    /// its own clock, which would diverge its §9.9.3 Merkle root (ADR-057).
+    #[error("convergent committer timestamp missing from MLS AAD")]
+    ConvergentTimestampMissing,
+
+    /// A decrypted-and-verified MLS frame carried an AAD that is not a
+    /// well-formed convergent-timestamp blob (wrong length, wrong magic, or an
+    /// unrecognized version). Raised by
+    /// [`decode_convergent_timestamp_aad`](crate::convergent_timestamp::decode_convergent_timestamp_aad).
+    /// Fail-closed: the receiver never guesses a timestamp from malformed bytes
+    /// (ADR-057).
+    #[error("convergent committer timestamp malformed: {0}")]
+    ConvergentTimestampMalformed(String),
 }
