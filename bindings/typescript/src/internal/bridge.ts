@@ -627,26 +627,26 @@ export interface Bridge {
   validateContextParams(paramsJson: string): string | null;
 
   // Economy (§19, ADR-033)
-  economyEstimateCost(policyJson: string, actionType: string, metricsJson: string): number;
+  economyEstimateCost(policyJson: string, actionType: string, metricsJson: string): bigint;
   economyPolicyRequiresPayment(policyJson: string): boolean;
   economyAutoAcceptBlocked(policyJson: string): boolean;
   economyCheckPolicyLock(policyJson: string): boolean;
   economyValidatePolicyChange(currentJson: string, proposedJson: string): boolean;
-  economyEvaluateFormula(formulaJson: string, metricsJson: string): number;
-  economyBudgetRemaining(contextId: string, did: string): number;
-  economyBudgetGrant(contextId: string, did: string, amount: number): void;
-  economyBudgetRecordSpend(contextId: string, did: string, amount: number): void;
+  economyEvaluateFormula(formulaJson: string, metricsJson: string): bigint;
+  economyBudgetRemaining(contextId: string, did: string): bigint;
+  economyBudgetGrant(contextId: string, did: string, amount: bigint): void;
+  economyBudgetRecordSpend(contextId: string, did: string, amount: bigint): void;
   economyAntispamRecord(contextId: string, senderDid: string, timestamp: number): void;
   economyAntispamVelocity(contextId: string, senderDid: string, now: number): number;
   economyAntispamEscalatedCost(
     contextId: string,
     senderDid: string,
     now: number,
-    baseCost: number,
+    baseCost: bigint,
     thresholdsJson: string,
-    floor: number | null,
-    cap: number | null,
-  ): number;
+    floor: bigint | null,
+    cap: bigint | null,
+  ): bigint;
   economyVerifyPaymentReceipts(receiptsJson: string): string;
 
   // Media (ADR-024)

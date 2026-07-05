@@ -1848,7 +1848,10 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       // named adapter against a registry.
       const paid = JSON.stringify({
         locked: false,
-        cost_schedule: { currency: [85, 83, 68, 0], per_message: 100 },
+        // ADR-060: monetary `Amount` values serialize as canonical decimal
+        // STRINGS in JSON (native integer only in MessagePack), so
+        // `per_message` is `"100"`, not a bare number.
+        cost_schedule: { currency: [85, 83, 68, 0], per_message: "100" },
         payment_adapters: ["x402"],
         pricing_formula: null,
         payee: "did:dht:zpayee",

@@ -2960,4 +2960,34 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       ).toThrow();
     });
   });
+
+  // ---------------------------------------------------------------------------
+  // Economy amounts cross the addon as bigint (ADR-060)
+  // ---------------------------------------------------------------------------
+
+  describe("Economy bigint amounts (real NAPI)", () => {
+    test("grants and reads back a > 2^53 budget exactly", async () => {
+      const ctxId = `econ-bigint-${Date.now()}`;
+      const did = "did:dht:econ-member";
+      // 2^53 + 1 — the first integer a JS `number` cannot hold exactly.
+      const granted = 9_007_199_254_740_993n;
+
+      scpInstance.economyBudgetGrant(ctxId, did, granted);
+      const remaining = scpInstance.economyBudgetRemaining(ctxId, did);
+
+      expect(typeof remaining).toBe("bigint");
+      expect(remaining).toBe(granted);
+
+      // Spend part of it and confirm exact bigint arithmetic survives the
+      // round-trip through the native tracker.
+      scpInstance.economyBudgetRecordSpend(ctxId, did, 1n);
+      expect(scpInstance.economyBudgetRemaining(ctxId, did)).toBe(granted - 1n);
+    });
+
+    test("estimateCost returns a bigint for a free context", () => {
+      const cost = scpInstance.economyEstimateCost("", "MessageSend", "{}");
+      expect(typeof cost).toBe("bigint");
+      expect(cost).toBe(0n);
+    });
+  });
 }
