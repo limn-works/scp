@@ -587,8 +587,14 @@ export interface ToolDefinition {
 
 /** Per-invocation cost metadata for a tool (spec section 5.4.1). */
 export interface ToolCost {
-  /** Cost per invocation in the smallest currency unit. */
-  readonly amount: number;
+  /**
+   * Cost per invocation in the smallest currency unit.
+   *
+   * A `bigint` so the full `u64` range round-trips exactly across the FFI
+   * boundary — a JS `number` loses precision above 2^53 (ADR-060 native-integer
+   * money surface).
+   */
+  readonly amount: bigint;
   /** ISO 4217 or protocol-defined currency code. */
   readonly currency: string;
   /** DID of the payment recipient. May differ from the tool operator. */

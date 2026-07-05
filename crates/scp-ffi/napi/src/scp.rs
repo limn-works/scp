@@ -3328,7 +3328,7 @@ impl Scp {
         policy_json: String,
         action_type: String,
         metrics_json: String,
-    ) -> napi::Result<i64> {
+    ) -> napi::Result<napi::bindgen_prelude::BigInt> {
         crate::economy::economy_estimate_cost_on(
             &self.inner,
             policy_json,
@@ -3375,34 +3375,44 @@ impl Scp {
         &self,
         formula_json: String,
         metrics_json: String,
-    ) -> napi::Result<i64> {
+    ) -> napi::Result<napi::bindgen_prelude::BigInt> {
         crate::economy::economy_evaluate_formula_on(&self.inner, formula_json, metrics_json)
     }
 
     /// Per-instance equivalent of the free-function `economy_budget_remaining`.
     #[napi(js_name = "economyBudgetRemaining")]
-    pub fn economy_budget_remaining(&self, context_id: String, did: String) -> napi::Result<i64> {
+    pub fn economy_budget_remaining(
+        &self,
+        context_id: String,
+        did: String,
+    ) -> napi::Result<napi::bindgen_prelude::BigInt> {
         crate::economy::economy_budget_remaining_on(&self.inner, context_id, did)
     }
 
     /// Per-instance equivalent of the free-function `economy_budget_grant`.
+    ///
+    /// `amount` is a JS `bigint` so a full `u64` monetary amount round-trips
+    /// exactly (ADR-060 SDK-surface rule).
     #[napi(js_name = "economyBudgetGrant")]
     pub fn economy_budget_grant(
         &self,
         context_id: String,
         did: String,
-        amount: i64,
+        amount: napi::bindgen_prelude::BigInt,
     ) -> napi::Result<()> {
         crate::economy::economy_budget_grant_on(&self.inner, context_id, did, amount)
     }
 
     /// Per-instance equivalent of the free-function `economy_budget_record_spend`.
+    ///
+    /// `amount` is a JS `bigint` so a full `u64` monetary amount round-trips
+    /// exactly (ADR-060 SDK-surface rule).
     #[napi(js_name = "economyBudgetRecordSpend")]
     pub fn economy_budget_record_spend(
         &self,
         context_id: String,
         did: String,
-        amount: i64,
+        amount: napi::bindgen_prelude::BigInt,
     ) -> napi::Result<()> {
         crate::economy::economy_budget_record_spend_on(&self.inner, context_id, did, amount)
     }
@@ -3430,6 +3440,11 @@ impl Scp {
     }
 
     /// Per-instance equivalent of the free-function `economy_antispam_escalated_cost`.
+    ///
+    /// Monetary amounts (`base_cost`, `floor`, `cap`, and the returned cost) are
+    /// JS `bigint` so a full `u64` round-trips exactly (ADR-060 SDK-surface
+    /// rule). `now` is a millisecond timestamp, not a monetary amount, and stays
+    /// a JS `number`.
     #[napi(js_name = "economyAntispamEscalatedCost")]
     #[allow(clippy::too_many_arguments)]
     pub fn economy_antispam_escalated_cost(
@@ -3437,11 +3452,11 @@ impl Scp {
         context_id: String,
         sender_did: String,
         now: i64,
-        base_cost: i64,
+        base_cost: napi::bindgen_prelude::BigInt,
         thresholds_json: String,
-        floor: Option<i64>,
-        cap: Option<i64>,
-    ) -> napi::Result<i64> {
+        floor: Option<napi::bindgen_prelude::BigInt>,
+        cap: Option<napi::bindgen_prelude::BigInt>,
+    ) -> napi::Result<napi::bindgen_prelude::BigInt> {
         crate::economy::economy_antispam_escalated_cost_on(
             &self.inner,
             context_id,

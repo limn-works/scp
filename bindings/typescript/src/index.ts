@@ -167,10 +167,11 @@ export type {
 export type { DiscoveryMethod, ProvenanceRecord } from "./provenance";
 
 // ---------------------------------------------------------------------------
-// Economy — types only (entry points moved to SCP)
+// Economy — types + display helper (stateful entry points moved to SCP)
 // ---------------------------------------------------------------------------
 
 export type { ObservableMetrics, PaidActionType } from "./economy";
+export { formatAmount } from "./economy";
 
 // ---------------------------------------------------------------------------
 // Sync — types only (entry points moved to SCP)

@@ -1006,6 +1006,13 @@ pub const ATTEST_9018: &str = "SCP-ATTEST-9018";
 
 /// Economy insufficient balance.
 pub const ECON_12061: &str = "SCP-ECON-12061";
+/// Economy amount-display formatting: unknown currency, no decimals override.
+///
+/// Raised by the SDK `format`/`formatAmount` display helpers when a currency
+/// is not in the SDK's known-currency decimals table and no explicit
+/// `decimals` override was supplied (ADR-060 SDK display surface). SDK-side
+/// only — the protocol does not store per-currency decimals.
+pub const ECON_12070: &str = "SCP-ECON-12070";
 /// Economy governance action spending error.
 pub const ECON_12090: &str = "SCP-ECON-12090";
 /// Economy context operation spending error.

@@ -11994,7 +11994,11 @@ impl Scp {
                 let tool_id = format!("tool-{}", definition.name.replace(' ', "-").to_lowercase());
 
                 let cost = definition.cost.map(|c| scp_core::context::tools::ToolCost {
-                    amount: c.amount,
+                    // ADR-060: `ToolCost.amount` is the `Amount` newtype. UniFFI
+                    // carries it as a native `u64` (Swift `UInt64` / Kotlin
+                    // `ULong`), which represents the full smallest-unit range
+                    // exactly.
+                    amount: scp_core::economy::Amount(c.amount),
                     currency: c.currency,
                     payee: c.payee.into(),
                     cost_formula: c.cost_formula,
@@ -18343,7 +18347,7 @@ mod tests {
         assert!(result.is_none());
 
         // Direct set always rejects.
-        let json = r#"{"locked":false,"cost_schedule":{"currency":[85,83,68,0],"per_message":null,"per_tool_invoke":100,"per_join":null,"per_period":null,"per_byte_stored":null},"payment_adapters":[],"pricing_formula":null,"payee":"did:dht:z6MkTest"}"#;
+        let json = r#"{"locked":false,"cost_schedule":{"currency":[85,83,68,0],"per_message":null,"per_tool_invoke":"100","per_join":null,"per_period":null,"per_byte_stored":null},"payment_adapters":[],"pricing_formula":null,"payee":"did:dht:z6MkTest"}"#;
         let result = scp.set_economic_policy(Arc::clone(&handle), json.to_owned());
         assert!(
             result.is_err(),

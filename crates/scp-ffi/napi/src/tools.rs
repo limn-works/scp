@@ -95,7 +95,11 @@ pub struct NapiToolDefinition {
 #[napi(object)]
 pub struct NapiToolCost {
     /// Cost per invocation in the smallest currency unit.
-    pub amount: i64,
+    ///
+    /// Crosses the napi boundary as a JS `bigint` (`BigInt`) so a full `u64`
+    /// round-trips exactly — a JS `number` narrows through `i64` and loses
+    /// precision above 2^53 (ADR-060 native-integer money surface).
+    pub amount: napi::bindgen_prelude::BigInt,
     /// ISO 4217 or protocol-defined currency code.
     pub currency: String,
     /// DID of the payment recipient. May differ from `operator_did`.
@@ -222,12 +226,21 @@ pub(crate) async fn tool_register_on(
     let implementation_hash =
         validate_implementation_hash(definition.implementation_hash.as_deref())?;
 
-    let cost = definition.cost.map(|c| scp_core::context::tools::ToolCost {
-        amount: c.amount.max(0).cast_unsigned(),
-        currency: c.currency,
-        payee: c.payee.into(),
-        cost_formula: c.cost_formula,
-    });
+    let cost = definition
+        .cost
+        .map(|c| -> napi::Result<scp_core::context::tools::ToolCost> {
+            // ADR-060: `ToolCost.amount` is the `Amount` newtype. The JS
+            // `bigint` marshals to an exact `u64` via the shared economy helper,
+            // preserving the full range (values above 2^53 survive intact).
+            let amount = crate::economy::amount_u64_from_bigint(&c.amount, "cost.amount")?;
+            Ok(scp_core::context::tools::ToolCost {
+                amount: scp_core::economy::Amount(amount),
+                currency: c.currency,
+                payee: c.payee.into(),
+                cost_formula: c.cost_formula,
+            })
+        })
+        .transpose()?;
 
     let core_registration = scp_core::context::tools::ToolRegistration {
         tool_id,

@@ -430,7 +430,7 @@ Reference implementation and assertions: `crates/scp-event-log/tests/test_vector
 
 ### Vector 35: `DataProvenance` -> `provenance_hash` KAT (§24.3.3)
 
-Pins the canonical provenance-hash encoding — `SHA-256(rmp_serde::to_vec(DataProvenance))`, positional MessagePack in struct-declaration field order (§24.3.3). This is the single encoding used by the signed BroadcastEnvelope `provenance_hash` (§5.14.5), the inner-envelope provenance hash, and the FFI event-log `ProvenanceAttached` / `ProvenanceReceived` payloads — so this hash is identical whether computed on a signed path or recorded in an event log.
+Pins the canonical provenance-hash encoding — `SHA-256(rmp_serde::to_vec(DataProvenance))`, positional MessagePack in struct-declaration field order (§24.3.3). This is the single encoding used by the signed BroadcastEnvelope `provenance_hash` (§5.14.5), the inner-envelope provenance hash, and the FFI event-log `ProvenanceAttached` / `ProvenanceReceived` payloads — so this hash is identical whether computed on a signed path or recorded in an event log. `payment_amount` (an `Amount`) encodes as a **native MessagePack integer** (`uint`) here: ADR-060's decimal-string wire form applies only to human-readable encodings (JSON); binary MessagePack keeps the native `u64`, so this KAT is byte-identical to its pre-ADR-060 value.
 
 ```
 DataProvenance (all fields populated; field order per §24.2.1):
@@ -443,7 +443,7 @@ DataProvenance (all fields populated; field order per §24.2.1):
   memory_scope:       Full
   chain_depth:        1
   chain_path:         Some(["ctx-hop-1"])
-  payment_amount:     Some(1000)
+  payment_amount:     Some(Amount(1000))   # wire: native MessagePack uint 1000 (ADR-060 binary path)
   payment_adapter:    Some("stripe")
   payment_receipt_id: Some([0x11; 32])
 

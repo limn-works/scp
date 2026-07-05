@@ -716,7 +716,10 @@ fn extract_cost(
         .transpose()?;
 
     Ok(Some(scp_core::context::tools::ToolCost {
-        amount,
+        // ADR-060: `ToolCost.amount` is the `Amount` newtype. Python `int` is
+        // arbitrary-precision, so the FFI param stays a native `u64` and carries
+        // the full smallest-unit range exactly.
+        amount: scp_core::economy::Amount(amount),
         currency,
         payee: payee.into(),
         cost_formula,

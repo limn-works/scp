@@ -43,8 +43,16 @@ export interface ProvenanceRecord {
   readonly purpose: string | null;
   /** How the data source was discovered (§24.2.3). */
   readonly discoveryMethod: DiscoveryMethod;
-  /** Cost of producing this data in atomic units, if any (§24.3.4, §19.6). */
-  readonly paymentAmount: number | null;
+  /**
+   * Cost of producing this data in smallest currency units, if any
+   * (§24.3.4, §19.6).
+   *
+   * A `bigint` so the full `u64` range is exact — a JS `number` loses precision
+   * above 2^53 (ADR-060 native-integer money surface). On the wire the value
+   * crosses as its canonical base-10 decimal string (never a bare number),
+   * parsed into a `bigint`.
+   */
+  readonly paymentAmount: bigint | null;
   /** Payment adapter used (e.g., `"lightning"`, `"stripe"`), if any. */
   readonly paymentAdapter: string | null;
   /** Hex-encoded 32-byte receipt ID for payment verification, if any. */

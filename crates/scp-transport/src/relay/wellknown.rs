@@ -10,8 +10,8 @@
 //! - `.well-known/scp` JSON with an `economic` field in `relay_config`
 //!   deserializes into a relay with economic parameters.
 //! - Without the `economic` field, the relay is treated as free.
-//! - `Amount` values are JSON integers in the smallest currency unit
-//!   (section 19.1.1).
+//! - `Amount` values are canonical base-10 decimal strings in the smallest
+//!   currency unit (ADR-060, section 19.1.1).
 //!
 //! # Bootstrap Validation
 //!
@@ -131,8 +131,8 @@ mod tests {
             "rate_limit_subscribe": 50,
             "economic": {
                 "currency": [85, 83, 68, 0],
-                "per_publish": 10,
-                "per_byte_stored": 1,
+                "per_publish": "10",
+                "per_byte_stored": "1",
                 "payment_adapters": ["x402", "lightning"],
                 "payee": "did:dht:z6MkRelay"
             }
