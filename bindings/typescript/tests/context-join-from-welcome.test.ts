@@ -1,12 +1,16 @@
 /**
- * Tests for the ADR-049 Phase 2J spawn-from-Welcome joiner wrappers on the
+ * Tests for the ADR-049 Phase 2J / FFI-02 Option A invitation wrappers on the
  * {@link SCP} class:
  *
  *   - {@link SCP.reserveKeyPackage} — reserve a single-use MLS `KeyPackage`
  *     under the joiner's own identity; returns `{ reservationId,
  *     keyPackagePublic }`.
- *   - {@link SCP.contextJoinFromWelcome} — process a received MLS Welcome and
- *     stand the joiner up as a send-capable {@link Context}.
+ *   - {@link SCP.inviteMember} — the creator seals a signed invitation bundle
+ *     for an invitee `KeyPackage`; returns a discriminated
+ *     {@link InviteMemberOutcome} (`sealed` | `requiresGovernanceApproval`).
+ *   - {@link SCP.contextJoinFromWelcome} — open a received {@link
+ *     SealedInvitation} bundle and stand the joiner up as a send-capable
+ *     {@link Context}.
  *
  * Two layers of coverage:
  *
@@ -14,28 +18,29 @@
  *     Proxy-backed mock `#native` handle (`mountMockScp`), asserting the exact
  *     arguments that cross the FFI boundary and the return-shape normalization
  *     the wrapper performs. napi surfaces a Rust `Vec<u8>` as an `Array<number>`
- *     (or `Buffer`) — the reserve wrapper normalizes `keyPackagePublic` to a
- *     `Uint8Array` (the SDK's canonical byte-return type, matching
- *     `contextExport`), and the join wrapper marshals `welcomeBytes` to a plain
- *     number array the way `contextImport` marshals its byte input. A typed
- *     `IdentityError` thrown by the native custody gate must propagate through
- *     the wrapper unchanged.
+ *     (or `Buffer`): the join wrapper marshals the sealed bundle's `enc` /
+ *     `ciphertext` to plain number arrays on the wire, and the invite wrapper
+ *     narrows the flat napi projection into the SDK's discriminated union
+ *     (normalizing bytes to `Uint8Array`). A typed error thrown by the native
+ *     custody gate must propagate through the wrapper unchanged, and an
+ *     unrecognized outcome `kind` must fail closed (never a silent success).
  *
  *  2. **Real NAPI addon.** When the platform addon is built (with
- *     `allow_in_memory_custody`), exercises the real reserve path end-to-end
- *     (round-tripping through the supervisor's `KeyPackage` pool), the
- *     custody-gate rejection (`SCP-IDENT-1001` for a non-custodied DID), and the
- *     join path reaching the real OpenMLS Welcome processor (a garbage Welcome
- *     is rejected only after the wrapper's args — reservation id, params JSON,
- *     marshaled bytes — reach the native spawn). Skips when the addon is absent,
- *     matching `identity-create-with-custody.test.ts` / `real-napi.test.ts`.
+ *     `allow_in_memory_custody`), exercises the real reserve → invite → join
+ *     handshake: the SingleAdmin unilateral invite produces a real sealed bundle
+ *     from a `reserveKeyPackage` KeyPackage (the invitee KP declares the 0xFF02
+ *     context-binding extension), a malformed/garbage sealed bundle is rejected
+ *     after arg marshaling, and the custody gates reject non-custodied
+ *     inviter/joiner DIDs. Skips when the addon is absent, matching
+ *     `identity-create-with-custody.test.ts` / `real-napi.test.ts`.
  */
 
 import { afterEach, describe, expect, test } from "bun:test";
 
 import { Context } from "../src/context";
-import { IdentityError } from "../src/errors";
+import { ContextError, IdentityError } from "../src/errors";
 import { SCP } from "../src/scp";
+import type { SealedInvitation } from "../src/types";
 import { mountMockScp } from "./mock-bridge";
 
 // ---------------------------------------------------------------------------
@@ -93,40 +98,176 @@ describe("SCP.reserveKeyPackage — delegation and byte normalization", () => {
   });
 });
 
-describe("SCP.contextJoinFromWelcome — delegation, param passthrough, byte marshaling", () => {
+describe("SCP.inviteMember — delegation and outcome narrowing", () => {
   let cleanup: (() => Promise<void>) | undefined;
   afterEach(async () => {
     await cleanup?.();
     cleanup = undefined;
   });
 
-  test("forwards all six args, marshals a Uint8Array welcome to number[], and returns a Context", async () => {
+  test("narrows a napi sealed outcome into { kind: 'sealed' } and normalizes bytes to Uint8Array", async () => {
+    const { scp, native } = mountMockScp();
+    cleanup = () => scp.shutdown(0);
+    // napi surfaces `enc`/`ciphertext` (Vec<u8>) as Array<number> / Buffer.
+    native.__stub("inviteMember", async () => ({
+      kind: "sealed",
+      enc: [1, 2, 3],
+      ciphertext: Buffer.from([4, 5, 6]),
+      delivered: true,
+      proposalId: null,
+    }));
+
+    const outcome = await scp.inviteMember(
+      "ctx-1",
+      "did:dht:creator",
+      "did:dht:invitee",
+      new Uint8Array([7, 7]),
+      ["wss://relay.example"],
+    );
+
+    const call = native.__lastCall("inviteMember");
+    expect(call?.args[0]).toBe("ctx-1");
+    expect(call?.args[1]).toBe("did:dht:creator");
+    expect(call?.args[2]).toBe("did:dht:invitee");
+    // KeyPackage bytes marshaled to a plain number[] on the wire.
+    expect(Array.isArray(call?.args[3])).toBe(true);
+    expect(call?.args[3]).toEqual([7, 7]);
+    expect(call?.args[4]).toEqual(["wss://relay.example"]);
+
+    expect(outcome.kind).toBe("sealed");
+    if (outcome.kind === "sealed") {
+      expect(outcome.enc).toBeInstanceOf(Uint8Array);
+      expect(Array.from(outcome.enc)).toEqual([1, 2, 3]);
+      expect(outcome.ciphertext).toBeInstanceOf(Uint8Array);
+      expect(Array.from(outcome.ciphertext)).toEqual([4, 5, 6]);
+      expect(outcome.delivered).toBe(true);
+    }
+  });
+
+  test("narrows a governance-deferred outcome into { kind: 'requiresGovernanceApproval' } as a SUCCESS (no throw)", async () => {
+    const { scp, native } = mountMockScp();
+    cleanup = () => scp.shutdown(0);
+    native.__stub("inviteMember", async () => ({
+      kind: "requiresGovernanceApproval",
+      enc: null,
+      ciphertext: null,
+      delivered: null,
+      proposalId: "deadbeef",
+    }));
+
+    const outcome = await scp.inviteMember(
+      "ctx-vote",
+      "did:dht:creator",
+      "did:dht:invitee",
+      new Uint8Array([1]),
+      [],
+    );
+
+    expect(outcome.kind).toBe("requiresGovernanceApproval");
+    if (outcome.kind === "requiresGovernanceApproval") {
+      expect(outcome.proposalId).toBe("deadbeef");
+    }
+  });
+
+  test("requiresGovernanceApproval with no tracked proposal id normalizes to null", async () => {
+    const { scp, native } = mountMockScp();
+    cleanup = () => scp.shutdown(0);
+    native.__stub("inviteMember", async () => ({
+      kind: "requiresGovernanceApproval",
+      proposalId: null,
+    }));
+
+    const outcome = await scp.inviteMember(
+      "ctx-vote",
+      "did:dht:creator",
+      "did:dht:invitee",
+      new Uint8Array([1]),
+      [],
+    );
+    expect(outcome.kind).toBe("requiresGovernanceApproval");
+    if (outcome.kind === "requiresGovernanceApproval") {
+      expect(outcome.proposalId).toBeNull();
+    }
+  });
+
+  test("accepts a readonly number[] key package and forwards it unchanged", async () => {
+    const { scp, native } = mountMockScp();
+    cleanup = () => scp.shutdown(0);
+    native.__stub("inviteMember", async () => ({
+      kind: "sealed",
+      enc: [],
+      ciphertext: [],
+      delivered: false,
+    }));
+
+    const kp: readonly number[] = [1, 2, 3];
+    await scp.inviteMember("ctx", "did:dht:creator", "did:dht:invitee", kp, []);
+
+    const call = native.__lastCall("inviteMember");
+    expect(call?.args[3]).toEqual([1, 2, 3]);
+  });
+
+  test("fails closed on an unrecognized outcome kind (never a silent success)", async () => {
+    const { scp, native } = mountMockScp();
+    cleanup = () => scp.shutdown(0);
+    native.__stub("inviteMember", async () => ({ kind: "bogus" }));
+
+    await expect(
+      scp.inviteMember("ctx", "did:dht:creator", "did:dht:invitee", new Uint8Array(), []),
+    ).rejects.toBeInstanceOf(ContextError);
+  });
+
+  test("propagates a typed ContextError from the native invite unchanged", async () => {
+    const { scp, native } = mountMockScp();
+    cleanup = () => scp.shutdown(0);
+    native.__stub("inviteMember", async () => {
+      throw new ContextError("invite_member failed: not an admin", "SCP-CTX-2013");
+    });
+
+    await expect(
+      scp.inviteMember("ctx", "did:dht:creator", "did:dht:invitee", new Uint8Array([1]), []),
+    ).rejects.toBeInstanceOf(ContextError);
+  });
+});
+
+describe("SCP.contextJoinFromWelcome — delegation, sealed-bundle marshaling", () => {
+  let cleanup: (() => Promise<void>) | undefined;
+  afterEach(async () => {
+    await cleanup?.();
+    cleanup = undefined;
+  });
+
+  test("forwards owningDid + reservationId and marshals the sealed bundle bytes to number[]", async () => {
     const { scp, native } = mountMockScp();
     cleanup = () => scp.shutdown(0);
     native.__stub("contextJoinFromWelcome", async () => ({ contextId: "ctx-joined" }));
 
-    const paramsJson = JSON.stringify({ ceiling: ["messages:read"], memoryScope: "ephemeral" });
-    const welcome = new Uint8Array([10, 20, 30]);
+    const sealed: SealedInvitation = {
+      contextId: "ctx-joined",
+      creatorDid: "did:dht:creator",
+      enc: new Uint8Array([1, 2, 3]),
+      ciphertext: new Uint8Array([9, 8, 7, 6]),
+    };
 
-    const ctx = await scp.contextJoinFromWelcome(
-      "did:dht:joiner",
-      "did:dht:creator",
-      "ctx-joined",
-      paramsJson,
-      "res-abc",
-      welcome,
-    );
+    const ctx = await scp.contextJoinFromWelcome("did:dht:joiner", sealed, "res-abc");
 
     const call = native.__lastCall("contextJoinFromWelcome");
     expect(call?.args[0]).toBe("did:dht:joiner");
-    expect(call?.args[1]).toBe("did:dht:creator");
-    expect(call?.args[2]).toBe("ctx-joined");
-    // Params cross as the JSON string verbatim (same shape contextCreate takes).
-    expect(call?.args[3]).toBe(paramsJson);
-    expect(call?.args[4]).toBe("res-abc");
-    // Bytes are marshaled to a plain number[] on the wire (not a Uint8Array).
-    expect(Array.isArray(call?.args[5])).toBe(true);
-    expect(call?.args[5]).toEqual([10, 20, 30]);
+    const wireSealed = call?.args[1] as {
+      contextId: string;
+      creatorDid: string;
+      enc: unknown;
+      ciphertext: unknown;
+    };
+    expect(wireSealed.contextId).toBe("ctx-joined");
+    expect(wireSealed.creatorDid).toBe("did:dht:creator");
+    // Bytes marshaled to plain number[] on the wire (not a Uint8Array, which the
+    // napi Vec<u8> deserializer would reject).
+    expect(Array.isArray(wireSealed.enc)).toBe(true);
+    expect(wireSealed.enc).toEqual([1, 2, 3]);
+    expect(Array.isArray(wireSealed.ciphertext)).toBe(true);
+    expect(wireSealed.ciphertext).toEqual([9, 8, 7, 6]);
+    expect(call?.args[2]).toBe("res-abc");
 
     // The wrapper returns a live Context re-homed under the joiner's DID.
     expect(ctx).toBeInstanceOf(Context);
@@ -134,23 +275,23 @@ describe("SCP.contextJoinFromWelcome — delegation, param passthrough, byte mar
     expect(ctx.identityDid).toBe("did:dht:joiner");
   });
 
-  test("accepts a readonly number[] welcome input and forwards it unchanged", async () => {
+  test("propagates a typed IdentityError from the native custody gate unchanged", async () => {
     const { scp, native } = mountMockScp();
     cleanup = () => scp.shutdown(0);
-    native.__stub("contextJoinFromWelcome", async () => ({ contextId: "ctx-2" }));
+    native.__stub("contextJoinFromWelcome", async () => {
+      throw new IdentityError("non-custodied joiner", "SCP-IDENT-1054");
+    });
 
-    const welcome: readonly number[] = [1, 2, 3];
-    await scp.contextJoinFromWelcome(
-      "did:dht:joiner",
-      "did:dht:creator",
-      "ctx-2",
-      "{}",
-      "res-2",
-      welcome,
-    );
+    const sealed: SealedInvitation = {
+      contextId: "ctx-x",
+      creatorDid: "did:dht:creator",
+      enc: new Uint8Array(32),
+      ciphertext: new Uint8Array([1, 2, 3]),
+    };
 
-    const call = native.__lastCall("contextJoinFromWelcome");
-    expect(call?.args[5]).toEqual([1, 2, 3]);
+    await expect(
+      scp.contextJoinFromWelcome("did:dht:joiner", sealed, "res-x"),
+    ).rejects.toBeInstanceOf(IdentityError);
   });
 });
 
@@ -169,11 +310,11 @@ try {
 }
 
 if (!scpAvailable) {
-  describe("spawn-from-Welcome joiner ops (SKIPPED)", () => {
+  describe("reserve → invite → join handshake (SKIPPED)", () => {
     test.skip(`native NAPI addon unavailable: ${skipReason}`, () => {});
   });
 } else {
-  describe("SCP.reserveKeyPackage / contextJoinFromWelcome (real NAPI)", () => {
+  describe("SCP.reserveKeyPackage (real NAPI)", () => {
     test("reserves a real KeyPackage under a locally-custodied identity", async () => {
       const scp = new SCP({ storage: { type: "in_memory" } });
       try {
@@ -219,8 +360,103 @@ if (!scpAvailable) {
         await scp.shutdown(1000).catch(() => {});
       }
     });
+  });
 
-    test("join reaches the real MLS Welcome processor: a garbage Welcome is rejected after arg marshaling", async () => {
+  describe("SCP.inviteMember (real NAPI)", () => {
+    test("SingleAdmin unilateral invite returns a real sealed bundle for a reserved invitee KeyPackage", async () => {
+      const scp = new SCP({ storage: { type: "in_memory" } });
+      try {
+        const creator = await scp.identityCreate("in_memory");
+        const invitee = await scp.identityCreate("in_memory");
+
+        // Encrypted SingleAdmin context: the creator can invite unilaterally.
+        // The SingleAdmin creator must hold the invite-relevant capabilities in
+        // the ceiling (`member:invite` + `governance:propose`): the add is
+        // routed through the actor's governance gate, which checks the
+        // proposer's `governance:propose` capability before auto-executing
+        // (mirrors the PyO3 reference `test_invite_member_seals_for_single_admin_context`).
+        const ctx = await scp.contextCreate(
+          creator,
+          JSON.stringify({
+            ceiling: [
+              "messages:read",
+              "messages:write",
+              "role:assign",
+              "member:invite",
+              "member:remove",
+              "governance:propose",
+              "governance:vote",
+              "context:close",
+            ],
+            memoryScope: "ephemeral",
+            mode: "Encrypted",
+            governance: "single_admin",
+          }),
+        );
+
+        // The invitee reserves a single-use KeyPackage (declares the 0xFF02
+        // context-binding extension) and hands the PUBLIC bytes to the creator.
+        const reservation = await scp.reserveKeyPackage(invitee.did);
+
+        const outcome = await scp.inviteMember(
+          ctx.contextId,
+          creator.did,
+          invitee.did,
+          reservation.keyPackagePublic,
+          [],
+        );
+
+        expect(outcome.kind).toBe("sealed");
+        if (outcome.kind === "sealed") {
+          // RFC 9180 HPKE encapsulated key is exactly 32 bytes.
+          expect(outcome.enc).toBeInstanceOf(Uint8Array);
+          expect(outcome.enc.length).toBe(32);
+          // Non-empty HPKE ciphertext of the signed InvitationBundle.
+          expect(outcome.ciphertext).toBeInstanceOf(Uint8Array);
+          expect(outcome.ciphertext.length).toBeGreaterThan(0);
+          expect(typeof outcome.delivered).toBe("boolean");
+        }
+      } finally {
+        await scp.shutdown(1000).catch(() => {});
+      }
+    });
+
+    test("rejects inviting under a non-custodied creator DID", async () => {
+      const scp = new SCP({ storage: { type: "in_memory" } });
+      try {
+        const creator = await scp.identityCreate("in_memory");
+        const invitee = await scp.identityCreate("in_memory");
+        const ctx = await scp.contextCreate(
+          creator,
+          JSON.stringify({
+            ceiling: ["messages:read"],
+            memoryScope: "ephemeral",
+            mode: "Encrypted",
+            governance: "single_admin",
+          }),
+        );
+        const reservation = await scp.reserveKeyPackage(invitee.did);
+
+        // Well-formed DID that is not custodied on this instance: the invite is
+        // signed under the inviter's `#active` key, so the identity-registry
+        // lookup fails closed before the runtime driver call.
+        await expect(
+          scp.inviteMember(
+            ctx.contextId,
+            "did:dht:not-custodied-here",
+            invitee.did,
+            reservation.keyPackagePublic,
+            [],
+          ),
+        ).rejects.toThrow();
+      } finally {
+        await scp.shutdown(1000).catch(() => {});
+      }
+    });
+  });
+
+  describe("SCP.contextJoinFromWelcome (real NAPI)", () => {
+    test("join reaches the real bundle open: a garbage sealed bundle is rejected after arg marshaling", async () => {
       const scp = new SCP({ storage: { type: "in_memory" } });
       try {
         const joiner = await scp.identityCreate("in_memory");
@@ -229,21 +465,40 @@ if (!scpAvailable) {
         // A real reservation id from the pool — parses cleanly at the bridge.
         const reservation = await scp.reserveKeyPackage(joiner.did);
 
-        // Custody passes (joiner is locally custodied) and the reservation id
-        // round-trips, so the failure originates deep in the real
-        // `spawn_actor_from_welcome` path when OpenMLS rejects the bogus
-        // Welcome bytes — proving the marshaled arguments actually reached the
-        // native join, and that the wrapper does not mask the failure.
-        const garbageWelcome = new Uint8Array([0, 1, 2, 3, 4, 5, 6, 7]);
+        // A 32-byte `enc` passes the fail-closed length gate; the garbage
+        // ciphertext then fails deep in the real HPKE open / ConfirmConsume,
+        // proving the marshaled sealed-bundle bytes actually reached the native
+        // join and the wrapper does not mask the failure.
+        const sealed: SealedInvitation = {
+          contextId: "ctx-welcome-spawn",
+          creatorDid: creator.did,
+          enc: new Uint8Array(32),
+          ciphertext: new Uint8Array([0, 1, 2, 3, 4, 5, 6, 7]),
+        };
         await expect(
-          scp.contextJoinFromWelcome(
-            joiner.did,
-            creator.did,
-            "ctx-welcome-spawn",
-            JSON.stringify({ ceiling: ["messages:read"], memoryScope: "ephemeral" }),
-            reservation.reservationId,
-            garbageWelcome,
-          ),
+          scp.contextJoinFromWelcome(joiner.did, sealed, reservation.reservationId),
+        ).rejects.toThrow();
+      } finally {
+        await scp.shutdown(1000).catch(() => {});
+      }
+    });
+
+    test("join rejects a malformed (non-32-byte) enc at the boundary", async () => {
+      const scp = new SCP({ storage: { type: "in_memory" } });
+      try {
+        const joiner = await scp.identityCreate("in_memory");
+        const creator = await scp.identityCreate("in_memory");
+        const reservation = await scp.reserveKeyPackage(joiner.did);
+
+        // enc length gate is fail-closed: a 3-byte enc is rejected up front.
+        const sealed: SealedInvitation = {
+          contextId: "ctx-badenc",
+          creatorDid: creator.did,
+          enc: new Uint8Array([1, 2, 3]),
+          ciphertext: new Uint8Array([9]),
+        };
+        await expect(
+          scp.contextJoinFromWelcome(joiner.did, sealed, reservation.reservationId),
         ).rejects.toThrow();
       } finally {
         await scp.shutdown(1000).catch(() => {});
@@ -255,14 +510,17 @@ if (!scpAvailable) {
       try {
         // owningDid is not a locally custodied identity: the §9.10.4 pseudonym
         // derivation (custody-backed) hard-fails up front.
+        const sealed: SealedInvitation = {
+          contextId: "ctx-nocustody",
+          creatorDid: "did:dht:creator",
+          enc: new Uint8Array(32),
+          ciphertext: new Uint8Array([1, 2, 3]),
+        };
         await expect(
           scp.contextJoinFromWelcome(
             "did:dht:not-custodied-here",
-            "did:dht:creator",
-            "ctx-nocustody",
-            "{}",
+            sealed,
             "reservation-that-will-not-be-reached",
-            new Uint8Array([1, 2, 3]),
           ),
         ).rejects.toThrow();
       } finally {

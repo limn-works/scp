@@ -46,7 +46,9 @@ import type {
   BehavioralRecord,
   CachedAttestation,
   CapabilityValidation,
+  InviteMemberOutcome,
   SagaResult,
+  SealedInvitation,
   TrustEvaluation,
 } from "./types";
 import { encodeCachedAttestations } from "./types";
@@ -1112,15 +1114,13 @@ export class SCP {
    *
    * @example
    * const reservation = await scp.reserveKeyPackage(joiner.did);
-   * // Hand reservation.keyPackagePublic to the creator out of band; it mints a
-   * // Welcome addressed to this reservation, which you then process:
+   * // Hand reservation.keyPackagePublic to the creator out of band; it seals a
+   * // signed invitation bundle addressed to this reservation via
+   * // `scp.inviteMember(...)`, which you then open:
    * const ctx = await scp.contextJoinFromWelcome(
    *   joiner.did,
-   *   creator.did,
-   *   contextId,
-   *   JSON.stringify({ ceiling: ["messages:read"], memoryScope: "ephemeral" }),
+   *   sealed, // the SealedInvitation from the creator's `inviteMember`
    *   reservation.reservationId,
-   *   welcomeBytes,
    * );
    */
   async reserveKeyPackage(owningDid: string): Promise<KeyPackageReservation> {
@@ -1136,61 +1136,159 @@ export class SCP {
   }
 
   /**
-   * Joins an existing SCP context by processing a received MLS Welcome, standing
-   * the local (joiner) identity up as a send-capable participant (ADR-049 Phase
-   * 2J).
+   * Joins an existing SCP context by opening a received sealed, signed
+   * invitation bundle, standing the local (joiner) identity up as a send-capable
+   * participant (ADR-049 Phase 2J; FFI-02 Option A).
    *
-   * Completes the reserve → Welcome → join handshake begun by
-   * {@link reserveKeyPackage}: given the Welcome the creator minted for a
-   * previously-reserved `KeyPackage`, this installs the joined MLS group, derives
-   * the joiner's §9.10.4 routing pseudonym from its locally-custodied identity
-   * (never caller-supplied), and returns an active {@link Context}. Without it a
-   * Welcome-joined node can DECRYPT but cannot SEND. A non-custodied joiner
+   * Completes the reserve → invite → join handshake begun by
+   * {@link reserveKeyPackage}: given the {@link SealedInvitation} the creator
+   * produced with {@link inviteMember}, this opens and AUTHENTICATES the bundle,
+   * installs the joined MLS group, derives the joiner's §9.10.4 routing pseudonym
+   * from its locally-custodied identity (never caller-supplied), and returns an
+   * active {@link Context} rebuilt from the AUTHENTICATED bundle params. Without
+   * it a Welcome-joined node can DECRYPT but cannot SEND. A non-custodied joiner
    * hard-fails before the single-use `KeyPackage` is consumed.
    *
+   * The joiner supplies NO loose `params`/`welcomeBytes`: the authoritative
+   * genesis params + MLS Welcome travel INSIDE the signed `sealed` bundle, which
+   * the native core opens and verifies. `sealed.contextId` / `sealed.creatorDid`
+   * are UNTRUSTED binding hints only — authority derives from the signed bundle.
+   *
    * @param owningDid The joiner's own DID (the reservation holder).
-   * @param creatorDid DID of the context creator that minted the Welcome.
-   * @param contextId The context being joined.
-   * @param paramsJson Legible context parameters as a JSON string — the SAME
-   *   shape {@link contextCreate} takes.
+   * @param sealed The {@link SealedInvitation} bundle produced by the creator's
+   *   {@link inviteMember} and delivered to this joiner.
    * @param reservationId The id returned by {@link reserveKeyPackage} for the
-   *   `KeyPackage` this Welcome addresses.
-   * @param welcomeBytes The TLS-serialized MLS Welcome message.
+   *   `KeyPackage` this bundle addresses.
    * @returns An active {@link Context} for the joined context.
    *
    * @example
    * const ctx = await scp.contextJoinFromWelcome(
    *   joiner.did,
-   *   creator.did,
-   *   "ctx-abc",
-   *   JSON.stringify({ ceiling: ["messages:read"], memoryScope: "ephemeral" }),
+   *   sealed, // from the creator's `inviteMember` (kind === "sealed")
    *   reservation.reservationId,
-   *   welcomeBytes,
    * );
    */
   async contextJoinFromWelcome(
     owningDid: string,
-    creatorDid: string,
-    contextId: string,
-    paramsJson: string,
+    sealed: SealedInvitation,
     reservationId: string,
-    welcomeBytes: Uint8Array | readonly number[],
   ): Promise<Context> {
-    const welcomeArray = ArrayBuffer.isView(welcomeBytes)
-      ? Array.from(welcomeBytes as Uint8Array)
-      : (welcomeBytes as readonly number[]);
+    // napi surfaces the bundle's `enc`/`ciphertext` as Rust `Vec<u8>` fields;
+    // marshal them to plain number[] on the wire (the same normalization the
+    // reserve/import byte paths use), never a Uint8Array the napi Vec<u8>
+    // deserializer would reject.
+    const nativeSealed = {
+      contextId: sealed.contextId,
+      creatorDid: sealed.creatorDid,
+      enc: Array.from(sealed.enc),
+      ciphertext: Array.from(sealed.ciphertext),
+    };
     const raw = await (
       this.#native.contextJoinFromWelcome as (
         o: string,
-        c: string,
-        ctx: string,
-        p: string,
+        s: {
+          contextId: string;
+          creatorDid: string;
+          enc: readonly number[];
+          ciphertext: readonly number[];
+        },
         r: string,
-        w: readonly number[],
       ) => Promise<unknown>
-    )(owningDid, creatorDid, contextId, paramsJson, reservationId, welcomeArray);
+    )(owningDid, nativeSealed, reservationId);
     const { Context: ContextCls } = await import("./context");
     return ContextCls._fromHandle(this, raw as never, owningDid);
+  }
+
+  /**
+   * Invites a member to an existing context, producing a sealed, signed
+   * invitation bundle (ADR-049 Phase 2J; FFI-02 Option A).
+   *
+   * The creator (or admin) seals the context's genesis params + MLS Welcome for
+   * the invitee under RFC 9180 HPKE, binding them to the invitee's `KeyPackage`.
+   * The result is a discriminated {@link InviteMemberOutcome} on `kind`:
+   *
+   *  - `"sealed"` — a `SingleAdmin` context: the invite is unilateral and
+   *    carries `(enc, ciphertext, delivered)`. If `delivered` is `false`, hand
+   *    the sealed `(enc, ciphertext)` bundle to the invitee out of band; they
+   *    open it with {@link contextJoinFromWelcome}.
+   *  - `"requiresGovernanceApproval"` — a voting context: the invite is deferred
+   *    to a governance vote. This is a SUCCESS outcome, NOT an error;
+   *    `proposalId` carries the tracked proposal id when one exists.
+   *
+   * `creatorDid` MUST be a locally-custodied identity; the invite is signed
+   * under its `#active` key.
+   *
+   * @param contextId The context to invite the member into.
+   * @param creatorDid The inviting creator/admin DID (locally custodied).
+   * @param inviteeDid The DID of the member being invited.
+   * @param inviteeKeyPackage The invitee's PUBLIC MLS `KeyPackage` bytes (from
+   *   the invitee's {@link reserveKeyPackage}).
+   * @param relayUrls Relay URLs the runtime may publish the sealed bundle to.
+   * @returns The {@link InviteMemberOutcome} — `sealed` or
+   *   `requiresGovernanceApproval`.
+   *
+   * @example
+   * const outcome = await scp.inviteMember(
+   *   ctx.contextId,
+   *   creator.did,
+   *   invitee.did,
+   *   reservation.keyPackagePublic,
+   *   [],
+   * );
+   * if (outcome.kind === "sealed") {
+   *   // deliver { enc: outcome.enc, ciphertext: outcome.ciphertext } to the invitee
+   * }
+   */
+  async inviteMember(
+    contextId: string,
+    creatorDid: string,
+    inviteeDid: string,
+    inviteeKeyPackage: Uint8Array | readonly number[],
+    relayUrls: readonly string[],
+  ): Promise<InviteMemberOutcome> {
+    const keyPackageArray = ArrayBuffer.isView(inviteeKeyPackage)
+      ? Array.from(inviteeKeyPackage as Uint8Array)
+      : (inviteeKeyPackage as readonly number[]);
+    const raw = await (
+      this.#native.inviteMember as (
+        ctx: string,
+        c: string,
+        i: string,
+        kp: readonly number[],
+        r: readonly string[],
+      ) => Promise<{
+        kind: string;
+        enc?: ArrayLike<number> | null;
+        ciphertext?: ArrayLike<number> | null;
+        delivered?: boolean | null;
+        proposalId?: string | null;
+      }>
+    )(contextId, creatorDid, inviteeDid, keyPackageArray, relayUrls);
+
+    // Narrow the flat napi projection into the SDK's discriminated union.
+    // `requiresGovernanceApproval` is a first-class SUCCESS outcome, not an
+    // error — surface it as its own variant, never a throw.
+    if (raw.kind === "sealed") {
+      return {
+        kind: "sealed",
+        enc: new Uint8Array(raw.enc ?? []),
+        ciphertext: new Uint8Array(raw.ciphertext ?? []),
+        delivered: raw.delivered ?? false,
+      };
+    }
+    if (raw.kind === "requiresGovernanceApproval") {
+      return {
+        kind: "requiresGovernanceApproval",
+        proposalId: raw.proposalId ?? null,
+      };
+    }
+    // Fail closed on an unrecognized discriminant rather than silently
+    // fabricating a variant — the bridge tag set is fixed and mirrored across
+    // all bindings, so an unknown tag is a genuine wiring defect.
+    throw new ContextError(
+      `inviteMember returned an unrecognized outcome kind: ${String(raw.kind)}`,
+      "SCP-CTX-2013",
+    );
   }
 
   async contextJoin(

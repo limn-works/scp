@@ -478,6 +478,72 @@ export type GovernanceActionResult =
   | "Executed";
 
 // ---------------------------------------------------------------------------
+// Invitations (ADR-049 Phase 2J / FFI-02 Option A)
+// ---------------------------------------------------------------------------
+
+/**
+ * A sealed, signed context invitation bundle produced by
+ * {@link SCP.inviteMember} on the creator side and consumed by
+ * {@link SCP.contextJoinFromWelcome} on the joiner side.
+ *
+ * Flat named-field object mirroring the runtime wire type and the PyO3/UniFFI
+ * reference bridges. `enc` is the RFC 9180 HPKE encapsulated key (32 bytes) and
+ * `ciphertext` is the HPKE ciphertext (`ct = ciphertext || tag`) of the
+ * serialized, signed `InvitationBundle` carrying the authoritative genesis
+ * params + MLS Welcome. Both are opaque bytes — the joiner does not interpret
+ * them; the native core opens the bundle and authenticates it.
+ *
+ * `contextId` / `creatorDid` are UNTRUSTED binding hints used only to rebuild
+ * the HPKE `info`/`aad`; the joiner's authority derives from the signed bundle
+ * after it is opened, never from these fields.
+ */
+export interface SealedInvitation {
+  /** Binding hint: the context id the bundle was sealed for. */
+  readonly contextId: string;
+  /** Binding hint: the creator DID the bundle was sealed by. */
+  readonly creatorDid: string;
+  /** RFC 9180 HPKE encapsulated key (`enc`) — exactly 32 bytes. */
+  readonly enc: Uint8Array;
+  /** RFC 9180 HPKE ciphertext (`ct = ciphertext || tag`). */
+  readonly ciphertext: Uint8Array;
+}
+
+/**
+ * The outcome of {@link SCP.inviteMember}, a discriminated union on `kind`.
+ *
+ * Both variants are SUCCESS outcomes — `requiresGovernanceApproval` is NOT an
+ * error. For a `SingleAdmin` context the invite is unilateral and yields a
+ * `sealed` bundle the caller (or transport) delivers to the invitee. For a
+ * voting context the invite is deferred to a governance vote.
+ *
+ * Mirrors the runtime `InviteMemberOutcome` and the PyO3/UniFFI reference
+ * bridges (same canonical tag strings, same field presence per variant).
+ */
+export type InviteMemberOutcome =
+  | {
+      /** The invite was sealed for immediate (out-of-band or relay) delivery. */
+      readonly kind: "sealed";
+      /** RFC 9180 HPKE encapsulated key (`enc`) of the sealed bundle. */
+      readonly enc: Uint8Array;
+      /** RFC 9180 HPKE ciphertext (`ct`) of the sealed bundle. */
+      readonly ciphertext: Uint8Array;
+      /**
+       * `true` if the native core published the sealed bundle to the invitee's
+       * routing id; `false` if the caller must deliver `(enc, ciphertext)`.
+       */
+      readonly delivered: boolean;
+    }
+  | {
+      /** The invite was deferred to a governance vote (a SUCCESS outcome). */
+      readonly kind: "requiresGovernanceApproval";
+      /**
+       * The tracked governance proposal id (hex-encoded) when one exists, or
+       * `null` when the runtime tracks none.
+       */
+      readonly proposalId: string | null;
+    };
+
+// ---------------------------------------------------------------------------
 // Messages
 // ---------------------------------------------------------------------------
 
