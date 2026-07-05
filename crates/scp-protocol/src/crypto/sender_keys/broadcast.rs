@@ -346,14 +346,19 @@ pub struct SealBroadcastParams<'a> {
 ///
 /// This mirrors [`compute_provenance_hash`](crate::envelope::inner) and uses
 /// the same serialization format (`MessagePack` via `rmp_serde::to_vec`) to ensure
-/// cross-envelope consistency.
+/// cross-site consistency.
 ///
-/// **Note on serialization format**: Uses `MessagePack` because this hash is
-/// covered by the broadcast `Ed25519` signature and verified within a single
-/// broadcast context — no cross-implementation parity needed. FFI bridges
-/// use canonical JSON (`serde_json::to_vec`) for provenance hashing that
-/// crosses implementation boundaries. See the doc comment on
-/// [`crate::envelope::inner::compute_provenance_hash`] for the full rationale.
+/// **Serialization format**: `SHA-256(rmp_serde::to_vec(&provenance))` over the
+/// [`crate::provenance::DataProvenance`] struct (positional `MessagePack`,
+/// struct-declaration field order), or `SHA-256(0x00)` when absent. This is the
+/// one protocol-wide provenance-hash encoding: the FFI event-log provenance-hash
+/// sites (`ProvenanceAttached` / `ProvenanceReceived`) serialize the same
+/// `DataProvenance` with the same call, so the FFI-logged hash equals this
+/// signed-path hash for identical input. No JSON is used on any provenance-hash
+/// path. See the doc comment on
+/// [`crate::envelope::inner::compute_provenance_hash`] for the full rationale,
+/// `.docs/specs/24-provenance-system.md` §24.3.3 for the normative rule, and
+/// `.docs/specs/25-test-vectors.md` Vector 35 for the KAT.
 ///
 /// Public so callers can compute the provenance hash externally for use in
 /// [`SigningPayloadFields::provenance_hash`] when constructing the signing
@@ -2076,5 +2081,53 @@ mod tests {
             0,
         );
         assert!(result.is_err(), "wrong author should fail HPKE open");
+    }
+
+    /// Spec §25 Vector 35: `DataProvenance` -> `provenance_hash` KAT.
+    ///
+    /// Pins the canonical provenance-hash encoding
+    /// (`SHA-256(rmp_serde::to_vec(DataProvenance))`, §24.3.3) against a fully
+    /// populated `DataProvenance` value. This is the same hash the FFI
+    /// event-log provenance sites record for `ProvenanceAttached` /
+    /// `ProvenanceReceived`, so a byte change here signals a cross-layer
+    /// provenance-hash divergence.
+    ///
+    /// Regenerate with:
+    /// `cargo test -p scp-protocol vector_35_data_provenance_hash_kat -- --nocapture`
+    #[test]
+    fn vector_35_data_provenance_hash_kat() {
+        use crate::economy::types::Amount;
+        use crate::provenance::{DataProvenance, DiscoveryMethod, SourceType};
+
+        let provenance = DataProvenance {
+            source_context: "ctx-kat-provenance".to_string(),
+            source_type: SourceType::Persistent,
+            counterparties: vec!["did:key:alice".into(), "did:key:bob".into()],
+            purpose: Some("kat".to_string()),
+            discovery_method: DiscoveryMethod::SharedContext("ctx-shared".to_string()),
+            age: std::time::Duration::from_mins(5),
+            memory_scope: crate::context::params::MemoryScope::Full,
+            chain_depth: 1,
+            chain_path: Some(vec!["ctx-hop-1".to_string()]),
+            payment_amount: Some(Amount(1000)),
+            payment_adapter: Some("stripe".to_string()),
+            payment_receipt_id: Some([0x11; 32]),
+        };
+
+        // Present-provenance hash: SHA-256(rmp_serde::to_vec(&provenance)).
+        let hash = compute_provenance_hash(Some(&provenance)).unwrap();
+        let hex = hex::encode(hash);
+        assert_eq!(
+            hex, "12ea6cf53e3e2fe1c851214d6c9b1acf1338e835bcb91271c8bcdf04e553ce68",
+            "provenance_hash KAT drift — see §25 Vector 35 / §24.3.3"
+        );
+
+        // Absent-provenance sentinel: SHA-256(0x00) (ADR-002).
+        let absent = compute_provenance_hash(None).unwrap();
+        let absent_hex = hex::encode(absent);
+        assert_eq!(
+            absent_hex, "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d",
+            "absent-provenance sentinel is SHA-256(0x00)"
+        );
     }
 }
