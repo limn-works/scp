@@ -1067,6 +1067,7 @@ mod tests {
         let ceiling = CapabilityCeiling::new([Capability::MessagesRead, Capability::MessagesWrite]);
         scp_protocol::context::ScpContextExtension::for_root(
             context_id.to_owned(),
+            DID::from("did:dht:z6MkAlice".to_owned()),
             ContextMode::Encrypted,
             &governance,
             CeilingPolicy::Immutable,

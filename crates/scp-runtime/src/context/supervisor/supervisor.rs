@@ -11050,7 +11050,14 @@ impl Supervisor {
                     //     (`0xFF02`) group_context extension — folded into the MLS
                     //     key schedule, so it is the group's own attestation of its
                     //     governance model, capability ceiling, ceiling policy, mode,
-                    //     and context_id. `WelcomeJoinRequest.params` is UNTRUSTED
+                    //     context_id, and — rule 8 — its GENESIS creator/admin DID.
+                    //     The creator binding is the sole anchor of admin identity
+                    //     for a DID-less governance model (SingleAdmin, whose
+                    //     `governance_policy_hash` is a constant): the joiner refuses
+                    //     unless the bundle's authenticated `creator_did` equals the
+                    //     one the group committed at creation, so a signed bundle
+                    //     naming a DIFFERENT admin installs NO `SingleAdminEngine`
+                    //     (BLACK-2J10-001-R). `WelcomeJoinRequest.params` is UNTRUSTED
                     //     caller input: a malicious inviter can present benign params
                     //     while the real group differs. Run this HERE — after the
                     //     KeyPackage is (irreversibly) consumed but BEFORE
@@ -11070,6 +11077,7 @@ impl Supervisor {
                             .group_context_extension()
                             .map_err(|e| e.to_string()),
                         &context_id,
+                        creator_did.as_ref(),
                         &params,
                         "spawn-from-Welcome",
                     )
@@ -15289,6 +15297,14 @@ mod tests {
         let ctx_params = scp_protocol::context::ContextParams::default();
         let ctx_extension = scp_protocol::context::ScpContextExtension::for_root(
             ctx_key.clone(),
+            // The committed genesis creator must equal the snapshot's
+            // `role_state.creator_did` so the restore-time §5.13.3 rule-8 creator
+            // binding passes on this legitimate self-respawn. The state below is
+            // built via `new_for_test_encrypted`, whose `role_state` is the empty
+            // test role state (`ContextRoleState::empty_for_test`, `creator_did =
+            // ""`) — so the honest committed creator here is the same empty DID
+            // the snapshot carries.
+            DID(String::new()),
             ctx_params.mode,
             &ctx_params.governance,
             ctx_params.ceiling_policy,

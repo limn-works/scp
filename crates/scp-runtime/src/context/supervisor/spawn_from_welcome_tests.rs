@@ -62,6 +62,10 @@ use crate::crypto::mls::storage_adapter::{OpenMlsStorageAdapter, SpawnBlockingSt
 
 const ALICE_DID: &str = "did:dht:z6MkAliceSpawnFromWelcomeCreator";
 const BOB_DID: &str = "did:dht:z6MkBobSpawnFromWelcomeJoiner";
+/// Mallory (an in-group member / attacker) used by the BLACK-2J10-001-R
+/// creator-substitution regression: she forges an invitation bundle naming
+/// herself as `creator_did` and signs it with her OWN key.
+const MALLORY_DID: &str = "did:dht:z6MkMalloryCreatorSubstitution";
 
 /// Alice (creator) fixed signing key. `ALICE_DID` resolves to its verifying key
 /// via [`pair_resolver`], so a joiner can verify the creator-signed invitation
@@ -78,6 +82,15 @@ fn alice_signing_key() -> SigningKey {
 /// Bob's custody can open with.
 fn bob_signing_key() -> SigningKey {
     SigningKey::from_bytes(&[0xB0; 32])
+}
+
+/// Mallory (attacker) fixed signing key. `MALLORY_DID` resolves to its verifying
+/// key via [`trio_resolver`], so a bundle Mallory signs with THIS key and labels
+/// `creator_did = MALLORY_DID` passes the bundle signature check — the §5.13.3
+/// rule-8 creator binding against the group-committed genesis creator is what
+/// rejects it.
+fn mallory_signing_key() -> SigningKey {
+    SigningKey::from_bytes(&[0xEE; 32])
 }
 
 /// Resolves `ALICE_DID` / `BOB_DID` to their fixed #active verifying keys (all
@@ -280,8 +293,12 @@ const BOB_WRAP: [u8; 32] = [0xB2; 32];
 /// group created with this extension and a matching-`params` join verifies, and
 /// a divergent join is refused (spec §5.13.3, FFI-02).
 fn honest_ext(context_id: &str, params: &ContextParams) -> ScpContextExtension {
+    // The honest creator committed into the group's `0xFF02` extension is
+    // `ALICE_DID` (rule 8) — the same DID the honest bundle carries as
+    // `creator_did`, so the join's creator binding passes.
     ScpContextExtension::for_root(
         context_id.to_owned(),
+        DID::from(ALICE_DID),
         params.mode,
         &params.governance,
         params.ceiling_policy,
@@ -303,6 +320,31 @@ async fn set_bob_wrapping(sup: &Arc<Supervisor>, bob: &DID) {
     .expect("set bob's wrapping key");
 }
 
+/// Resolves `ALICE_DID` / `BOB_DID` / `MALLORY_DID` to their fixed #active
+/// verifying keys. Used by the creator-substitution regression so the joiner can
+/// verify a bundle Mallory signs with her OWN key (labelled `creator_did =
+/// MALLORY_DID`) — proving the rejection is the §5.13.3 rule-8 creator binding,
+/// not a signature failure.
+fn trio_resolver() -> KeyResolver {
+    let alice = DID::from(ALICE_DID);
+    let bob = DID::from(BOB_DID);
+    let mallory = DID::from(MALLORY_DID);
+    let alice_vk = alice_signing_key().verifying_key();
+    let bob_vk = bob_signing_key().verifying_key();
+    let mallory_vk = mallory_signing_key().verifying_key();
+    Arc::new(move |did: &DID, _: SigningKeyId| {
+        if did == &alice {
+            Some(alice_vk)
+        } else if did == &bob {
+            Some(bob_vk)
+        } else if did == &mallory {
+            Some(mallory_vk)
+        } else {
+            None
+        }
+    })
+}
+
 fn fresh_mls_storage() -> Arc<dyn OpenMlsStorageAdapter> {
     Arc::new(SpawnBlockingStorageAdapter::new(Arc::new(
         InMemoryStorage::new(),
@@ -319,6 +361,16 @@ fn fresh_mls_storage() -> Arc<dyn OpenMlsStorageAdapter> {
 fn bob_supervisor(
     persistence: Option<Box<dyn ContextPersistence>>,
 ) -> (Arc<Supervisor>, Arc<MlsCryptoProvider>) {
+    bob_supervisor_with_resolver(persistence, pair_resolver())
+}
+
+/// Builds Bob's joiner `Supervisor` with a caller-supplied [`KeyResolver`] — used
+/// by the creator-substitution regression, which needs a resolver that also
+/// resolves `MALLORY_DID` (see [`trio_resolver`]).
+fn bob_supervisor_with_resolver(
+    persistence: Option<Box<dyn ContextPersistence>>,
+    resolver: KeyResolver,
+) -> (Arc<Supervisor>, Arc<MlsCryptoProvider>) {
     let crypto = Arc::new(MlsCryptoProvider::new(BOB_DID.to_owned()));
     let transport: Box<dyn ContextTransportProvider> = Box::new(NotConfiguredTransportProvider);
     let event_log: Box<dyn ContextEventLogProvider> = Box::new(MerkleEventLogProvider::new());
@@ -326,7 +378,7 @@ fn bob_supervisor(
         Arc::clone(&crypto),
         transport,
         event_log,
-        pair_resolver(),
+        resolver,
         persistence,
         None,
         None,
@@ -2331,5 +2383,116 @@ async fn invite_member_round_trip_stands_up_a_bidirectional_joiner() {
             OpenResult::Management { payload, .. } if payload.as_slice() == from_bob.as_slice()
         ),
         "alice decrypts bob's traffic — bidirectional round-trip closed; got {opened_bob:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test N — BLACK-2J10-001-R creator-substitution regression (§5.13.3 rule 8).
+// ---------------------------------------------------------------------------
+
+/// An honest SingleAdmin context commits `creator_did = Alice` into its `0xFF02`
+/// group-context extension. Mallory (an in-group member) forges an invitation
+/// bundle that names HERSELF as `creator_did`, signs it with her OWN key (which
+/// the resolver resolves, so the bundle signature verifies), and carries Alice's
+/// REAL params — so every bundle check passes. The join is nonetheless REJECTED
+/// by the §5.13.3 rule-8 creator binding (`bundle.creator_did` != the committed
+/// genesis creator), BEFORE any `SingleAdminEngine(Mallory)` is built or any
+/// crypto is installed.
+///
+/// Without the creator binding this attack succeeds: `GovernanceModel::SingleAdmin`
+/// is a DID-less unit variant, so `governance_policy_hash` is a CONSTANT that
+/// matches regardless of who the admin is — no other §5.13.3 rule catches the
+/// substitution, and `build_welcome_joiner_state` would install Mallory as the
+/// context admin.
+#[tokio::test]
+async fn spawn_from_welcome_rejects_creator_substitution_before_admin_install() {
+    let bob = DID::from(BOB_DID);
+    let ctx_id = ctx_hex(0x9e);
+    let ctx_bytes = context_id_to_bytes(&ctx_id);
+    // Default governance is SingleAdmin (a DID-less unit variant) — the vulnerable
+    // case whose `governance_policy_hash` commits no identity.
+    let params = joiner_params();
+    assert!(
+        matches!(params.governance, GovernanceModel::SingleAdmin),
+        "the regression targets the DID-less SingleAdmin governance model"
+    );
+
+    // Bob's joiner supervisor with a resolver that also resolves Mallory, so her
+    // self-signed bundle passes the signature check and the rule-8 binding is the
+    // sole reason for rejection.
+    let (sup, bob_crypto) = bob_supervisor_with_resolver(None, trio_resolver());
+    let (reservation_id, kp_public_bytes) = reserve_bob_kp(&sup, &bob).await;
+
+    // Alice creates the honest SCP group (its `0xFF02` extension commits
+    // creator = Alice via `honest_ext`) and adds Bob's reserved KP, producing the
+    // real Welcome. The committed extension rides through the add Commit unchanged
+    // as part of the group's cryptographic identity, so it still binds creator =
+    // Alice regardless of who issued the add.
+    let alice_crypto = Arc::new(MlsCryptoProvider::new(ALICE_DID.to_owned()));
+    alice_crypto
+        .create_mls_group_with_context(&ctx_bytes, &honest_ext(&ctx_id, &params))
+        .expect("alice creates the honest SCP context group committing creator=Alice");
+    let add_output = alice_crypto
+        .add_member(&ctx_bytes, BOB_DID, Some(&kp_public_bytes))
+        .expect("alice adds bob's reserved key package");
+
+    // Mallory's forged bundle: creator_did = Mallory, signed with Mallory's key,
+    // params = Alice's REAL params. Hints == Mallory so the HPKE open succeeds and
+    // the §5.13.3 rule-8 binding is what rejects (not the open or the signature).
+    let mallory = DID::from(MALLORY_DID);
+    let (bob_custody, bob_handle, bob_recipient) = bob_active_custody().await;
+    let bundle = signed_bundle(
+        &mallory_signing_key(),
+        &mallory,
+        &ctx_id,
+        &params,
+        add_output.welcome_bytes,
+    );
+    let req = seal_bundle(
+        &bundle,
+        &bob_recipient,
+        &ctx_id,
+        &mallory,
+        reservation_id,
+        some_pseudonym(),
+    );
+
+    let err = sup
+        .spawn_actor_from_welcome(bob, &bob_custody, &bob_handle, req)
+        .await
+        .expect_err("a creator-substituted bundle must be rejected");
+
+    // The rejection is the §5.13.3 rule-8 creator-DID binding (surfaced as a
+    // CryptoFailed carrying the `0xFF02` binding-mismatch reason).
+    assert!(
+        matches!(err, crate::context::ContextError::CryptoFailed(_)),
+        "expected CryptoFailed for the creator-binding rejection, got {err:?}"
+    );
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("creator DID mismatch") && msg.contains("0xFF02"),
+        "expected a §5.13.3 rule-8 creator-binding rejection naming 0xFF02, got: {msg}"
+    );
+
+    // No `SingleAdminEngine(Mallory)`: the binding check fires BEFORE
+    // `install_joined_group` and `build_welcome_joiner_state` (which builds the
+    // governance engine from `creator_did`), so NO context actor is registered
+    // and Bob's crypto provider has NO installed group for this id.
+    assert!(
+        sup.lookup(&ctx_id).is_none(),
+        "no context actor may be registered for a creator-substituted join — \
+         build_welcome_joiner_state (and SingleAdminEngine::new) never ran"
+    );
+    assert_eq!(
+        sup.member_count(&ctx_id).await,
+        None,
+        "an unregistered context yields None member_count — no admin was installed"
+    );
+    assert!(
+        bob_crypto
+            .export_crypto_state(&ctx_bytes)
+            .expect("export never errors")
+            .is_empty(),
+        "no MLS group may be installed after a creator-binding rejection"
     );
 }

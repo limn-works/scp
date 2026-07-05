@@ -13,7 +13,21 @@
 //! the context's declared parameters and checks them against the values the
 //! group creator committed into `group_context` via [`ScpContextExtension`].
 //! [`ScpContextExtension::verify_against`] performs that check (spec §5.13.3
-//! validation rules 2-6).
+//! validation rules 2-6 plus the creator-DID binding, rule 8).
+//!
+//! # Creator (genesis-admin) binding
+//!
+//! The extension also commits the group's **genesis `creator_did`** (rule 8).
+//! For a DID-less governance model such as [`GovernanceModel::SingleAdmin`] the
+//! `governance_policy_hash` is a *constant* — it carries no identity — so
+//! without a committed creator a joiner has no cryptographic proof that the
+//! `creator_did` its (untrusted) inviter supplied is the group's real
+//! creator/admin. Committing `creator_did` into the `0xFF02` extension (part of
+//! the group's committed cryptographic identity, immutable in `group_context`)
+//! lets every joiner prove "this group's genesis creator is X" and refuse a
+//! bundle that names any other admin. The committed value pins the **genesis**
+//! creator (the initial `SingleAdmin` admin); admin *transfers* are not tracked
+//! here — they apply from the authenticated event log AFTER join.
 //!
 //! This module is the pure protocol layer: the type, its canonical encoding,
 //! the hash constructors, and the verification predicate. The MLS glue (writing
@@ -30,6 +44,7 @@
 //!
 //! See spec §5.13.3 and `.docs/specs/05-contexts.md`.
 
+use scp_primitives::DID;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -53,13 +68,14 @@ pub const SCP_CONTEXT_EXTENSION_TYPE_ID: u16 = 0xFF02;
 /// Failure kinds for [`ScpContextExtension::verify_against`] and the canonical
 /// encode/decode helpers.
 ///
-/// The mismatch variants correspond to spec §5.13.3 validation rules 2-6. The
-/// runtime maps them onto its own `ContextError` when a Welcome-based join is
-/// rejected. The two infrastructural variants ([`SerializationFailed`] /
-/// [`DeserializationFailed`]) surface canonical-JSON failures — they are kept
-/// distinct from the six semantic mismatches because they signal an internal /
-/// wire-format fault rather than a parameter-binding violation, and neither may
-/// be discarded with an `unwrap` (§ "No shortcuts").
+/// The mismatch variants correspond to spec §5.13.3 validation rules 2-6 plus
+/// the creator-DID binding (rule 8). The runtime maps them onto its own
+/// `ContextError` when a Welcome-based join is rejected. The two infrastructural
+/// variants ([`SerializationFailed`] / [`DeserializationFailed`]) surface
+/// canonical-JSON failures — they are kept distinct from the semantic mismatches
+/// because they signal an internal / wire-format fault rather than a
+/// parameter-binding violation, and neither may be discarded with an `unwrap`
+/// (§ "No shortcuts").
 ///
 /// [`SerializationFailed`]: ScpContextBindingError::SerializationFailed
 /// [`DeserializationFailed`]: ScpContextBindingError::DeserializationFailed
@@ -73,6 +89,25 @@ pub enum ScpContextBindingError {
         expected: ContextId,
         /// The context's actual declared identity.
         actual: ContextId,
+    },
+
+    /// Rule 8: the extension's committed `creator_did` does not match the
+    /// creator/admin DID the joiner presents (the bundle's `creator_did` on a
+    /// Welcome-based join; the snapshot's `role_state.creator_did` on
+    /// import/restore).
+    ///
+    /// The committed value pins the group's **genesis** creator/admin. This is
+    /// the sole cryptographic anchor of admin identity for DID-less governance
+    /// models (e.g. [`GovernanceModel::SingleAdmin`], whose
+    /// `governance_policy_hash` is a constant): a mismatch means the presented
+    /// creator is NOT the party the group committed at creation, so no authority
+    /// may be built for them.
+    #[error("creator DID mismatch: extension binds {expected}, presented {actual}")]
+    CreatorMismatch {
+        /// The genesis `creator_did` committed in the extension.
+        expected: DID,
+        /// The `creator_did` the joiner presented.
+        actual: DID,
     },
 
     /// Rule 3: `governance_policy_hash` does not match
@@ -136,11 +171,18 @@ pub enum ScpContextBindingError {
 ///
 /// The hashes commit to the context's governance model, capability ceiling, and
 /// — for child contexts — parent lineage, so a joiner can verify the parameters
-/// it was handed against the ones the creator cryptographically committed.
+/// it was handed against the ones the creator cryptographically committed. The
+/// `creator_did` field commits the group's genesis creator/admin, so a joiner
+/// can prove the `creator_did` its untrusted inviter supplied is the real one.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScpContextExtension {
     /// The SCP context ID this group represents.
     pub context_id: ContextId,
+    /// The group's genesis creator/admin DID (spec §5.13.3 rule 8). Committed at
+    /// group creation and immutable in `group_context`; pins the INITIAL admin
+    /// (e.g. the `SingleAdmin` admin). Admin transfers are NOT tracked here —
+    /// they apply from the authenticated event log after join.
+    pub creator_did: DID,
     /// Context processing mode: `0` = Encrypted, `1` = Broadcast
     /// (matches [`ContextMode`] discriminants).
     pub context_mode: u8,
@@ -161,7 +203,8 @@ pub struct ScpContextExtension {
 impl ScpContextExtension {
     /// Builds the extension for a **root** context (no parents).
     ///
-    /// Per validation rule 6, `parent_context_ids` is empty and
+    /// `creator_did` is the group's genesis creator/admin (rule 8). Per
+    /// validation rule 6, `parent_context_ids` is empty and
     /// `parent_governance_hash` is `None`.
     ///
     /// # Errors
@@ -170,6 +213,7 @@ impl ScpContextExtension {
     /// model or capability ceiling cannot be canonically serialized.
     pub fn for_root(
         context_id: ContextId,
+        creator_did: DID,
         mode: ContextMode,
         governance: &GovernanceModel,
         ceiling_policy: CeilingPolicy,
@@ -177,6 +221,7 @@ impl ScpContextExtension {
     ) -> Result<Self, ScpContextBindingError> {
         Ok(Self {
             context_id,
+            creator_did,
             context_mode: mode as u8,
             governance_policy_hash: jcs_sha256(governance)?,
             ceiling_policy: ceiling_policy as u8,
@@ -190,6 +235,7 @@ impl ScpContextExtension {
     /// data: the parent context IDs and the parent-governance hash (see
     /// [`Self::parent_governance_hash`]).
     ///
+    /// `creator_did` is the group's genesis creator/admin (rule 8).
     /// `parent_context_ids` is normalized (sorted lexicographically, duplicates
     /// removed) so the result always satisfies validation rule 5. A child must
     /// have at least one parent.
@@ -200,8 +246,10 @@ impl ScpContextExtension {
     /// `parent_context_ids` is empty, or
     /// [`ScpContextBindingError::SerializationFailed`] if the governance model
     /// or capability ceiling cannot be canonically serialized.
+    #[allow(clippy::too_many_arguments)]
     pub fn for_child(
         context_id: ContextId,
+        creator_did: DID,
         mode: ContextMode,
         governance: &GovernanceModel,
         ceiling_policy: CeilingPolicy,
@@ -218,6 +266,7 @@ impl ScpContextExtension {
         }
         Ok(Self {
             context_id,
+            creator_did,
             context_mode: mode as u8,
             governance_policy_hash: jcs_sha256(governance)?,
             ceiling_policy: ceiling_policy as u8,
@@ -231,6 +280,8 @@ impl ScpContextExtension {
     /// parent context IDs and the parent-governance hash directly from the
     /// parent references.
     ///
+    /// `creator_did` is the group's genesis creator/admin (rule 8).
+    ///
     /// # Errors
     ///
     /// Returns [`ScpContextBindingError::ParentStructureInvalid`] if `parents`
@@ -238,6 +289,7 @@ impl ScpContextExtension {
     /// input cannot be canonically serialized.
     pub fn for_child_from_parents(
         context_id: ContextId,
+        creator_did: DID,
         mode: ContextMode,
         governance: &GovernanceModel,
         ceiling_policy: CeilingPolicy,
@@ -253,6 +305,7 @@ impl ScpContextExtension {
         let parent_context_ids = parents.iter().map(|p| p.context_id.clone()).collect();
         Self::for_child(
             context_id,
+            creator_did,
             mode,
             governance,
             ceiling_policy,
@@ -305,10 +358,15 @@ impl ScpContextExtension {
             .map_err(|e| ScpContextBindingError::DeserializationFailed(e.to_string()))
     }
 
-    /// Verifies the extension against a context's declared identity and
-    /// parameters (spec §5.13.3 validation rules 2-6).
+    /// Verifies the extension against a context's declared identity, genesis
+    /// creator, and parameters (spec §5.13.3 validation rules 2-6 plus the
+    /// creator-DID binding, rule 8).
     ///
     /// - **Rule 2:** `context_id` matches `context_id`.
+    /// - **Rule 8:** `creator_did` matches the presented `creator_did` (the
+    ///   bundle's `creator_did` on join; the snapshot's `role_state.creator_did`
+    ///   on import/restore). This is the sole cryptographic anchor of admin
+    ///   identity for DID-less governance models.
     /// - **Rule 3:** `governance_policy_hash == SHA-256(JCS(params.governance))`.
     /// - **Rule 4:** `ceiling_hash == SHA-256(JCS(capability_ceiling))`,
     ///   `ceiling_policy == params.ceiling_policy`, and
@@ -333,6 +391,7 @@ impl ScpContextExtension {
     pub fn verify_against(
         &self,
         context_id: &ContextId,
+        creator_did: &DID,
         params: &ContextParams,
     ) -> Result<(), ScpContextBindingError> {
         // Rule 2: context_id binding.
@@ -340,6 +399,19 @@ impl ScpContextExtension {
             return Err(ScpContextBindingError::ContextIdMismatch {
                 expected: self.context_id.clone(),
                 actual: context_id.clone(),
+            });
+        }
+
+        // Rule 8: genesis creator/admin binding. The committed `creator_did`
+        // pins the group's real creator; a caller-supplied `creator_did` that
+        // diverges is refused BEFORE any authority (governance engine, admin
+        // set) is built for it. This closes the DID-less-governance
+        // (SingleAdmin) admin-substitution path where `governance_policy_hash`
+        // is a constant and therefore commits no identity.
+        if &self.creator_did != creator_did {
+            return Err(ScpContextBindingError::CreatorMismatch {
+                expected: self.creator_did.clone(),
+                actual: creator_did.clone(),
             });
         }
 
@@ -455,6 +527,11 @@ mod tests {
         DID::from(format!("did:dht:z6Mk{name}"))
     }
 
+    /// The genesis creator/admin DID used across the `verify_against` fixtures.
+    fn creator() -> DID {
+        did("Creator")
+    }
+
     fn ceiling(caps: &[Capability]) -> CapabilityCeiling {
         CapabilityCeiling::new(caps.iter().cloned())
     }
@@ -486,6 +563,7 @@ mod tests {
     fn root_fixture() -> ScpContextExtension {
         ScpContextExtension {
             context_id: "ctx:root".to_owned(),
+            creator_did: DID("did:example:root-creator".to_owned()),
             context_mode: 0,
             governance_policy_hash: [0x11; 32],
             ceiling_policy: 0,
@@ -499,6 +577,7 @@ mod tests {
     fn child_fixture() -> ScpContextExtension {
         ScpContextExtension {
             context_id: "ctx:child".to_owned(),
+            creator_did: DID("did:example:child-creator".to_owned()),
             context_mode: 1,
             governance_policy_hash: [0x33; 32],
             ceiling_policy: 1,
@@ -519,7 +598,8 @@ mod tests {
         let json = String::from_utf8(bytes.clone()).unwrap();
 
         // JCS sorts object keys by Unicode code point. `[u8; 32]` serializes as
-        // a JSON array of decimal numbers.
+        // a JSON array of decimal numbers; `creator_did` (a `DID`) serializes as
+        // a JSON string (its `#[serde(transparent)]` inner `String`).
         let expected = concat!(
             "{",
             "\"ceiling_hash\":[34,34,34,34,34,34,34,34,34,34,34,34,34,34,34,34,",
@@ -527,6 +607,7 @@ mod tests {
             "\"ceiling_policy\":0,",
             "\"context_id\":\"ctx:root\",",
             "\"context_mode\":0,",
+            "\"creator_did\":\"did:example:root-creator\",",
             "\"governance_policy_hash\":[17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,",
             "17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17],",
             "\"parent_context_ids\":[],",
@@ -542,7 +623,7 @@ mod tests {
             hex::encode(h.finalize())
         };
         assert_eq!(
-            digest, "77532927ac253b1b6b9401ddea130a025aece5959f4fa198d53cc5b97fcf5d2a",
+            digest, "e97afe19159fd27cb29af7c8815d561ffd4ecca0641f9793192716f1b829b7cd",
             "root canonical-bytes SHA-256 KAT"
         );
     }
@@ -560,6 +641,7 @@ mod tests {
             "\"ceiling_policy\":1,",
             "\"context_id\":\"ctx:child\",",
             "\"context_mode\":1,",
+            "\"creator_did\":\"did:example:child-creator\",",
             "\"governance_policy_hash\":[51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,",
             "51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51],",
             "\"parent_context_ids\":[\"ctx:a\",\"ctx:b\"],",
@@ -605,6 +687,7 @@ mod tests {
         let cap = ceiling(&[Capability::MessagesRead]);
         let ext = ScpContextExtension::for_root(
             "ctx:r".to_owned(),
+            creator(),
             ContextMode::Encrypted,
             &gov,
             CeilingPolicy::Immutable,
@@ -627,6 +710,7 @@ mod tests {
         let cap = ceiling(&[Capability::MessagesRead, Capability::MessagesWrite]);
         let ext = ScpContextExtension::for_root(
             "ctx:r".to_owned(),
+            creator(),
             ContextMode::Encrypted,
             &gov,
             CeilingPolicy::Immutable,
@@ -650,6 +734,7 @@ mod tests {
         let cap_ba = ceiling(&[Capability::MessagesWrite, Capability::MessagesRead]);
         let ext_ab = ScpContextExtension::for_root(
             "ctx:r".to_owned(),
+            creator(),
             ContextMode::Encrypted,
             &gov,
             CeilingPolicy::Immutable,
@@ -658,6 +743,7 @@ mod tests {
         .unwrap();
         let ext_ba = ScpContextExtension::for_root(
             "ctx:r".to_owned(),
+            creator(),
             ContextMode::Encrypted,
             &gov,
             CeilingPolicy::Immutable,
@@ -675,12 +761,14 @@ mod tests {
     fn for_root_has_no_parent_data() {
         let ext = ScpContextExtension::for_root(
             "ctx:r".to_owned(),
+            creator(),
             ContextMode::Broadcast,
             &governance(),
             CeilingPolicy::Governed,
             &ceiling(&[Capability::MessagesRead]),
         )
         .unwrap();
+        assert_eq!(ext.creator_did, creator());
         assert_eq!(ext.context_mode, 1); // Broadcast
         assert_eq!(ext.ceiling_policy, 1); // Governed
         assert!(ext.parent_context_ids.is_empty());
@@ -691,6 +779,7 @@ mod tests {
     fn for_child_normalizes_parent_ids_and_sets_hash() {
         let ext = ScpContextExtension::for_child(
             "ctx:c".to_owned(),
+            creator(),
             ContextMode::Encrypted,
             &governance(),
             CeilingPolicy::Immutable,
@@ -699,6 +788,7 @@ mod tests {
             [0x99; 32],
         )
         .unwrap();
+        assert_eq!(ext.creator_did, creator());
         assert_eq!(ext.parent_context_ids, vec!["ctx:a", "ctx:b"]);
         assert_eq!(ext.parent_governance_hash, Some([0x99; 32]));
     }
@@ -707,6 +797,7 @@ mod tests {
     fn for_child_rejects_empty_parents() {
         let err = ScpContextExtension::for_child(
             "ctx:c".to_owned(),
+            creator(),
             ContextMode::Encrypted,
             &governance(),
             CeilingPolicy::Immutable,
@@ -729,6 +820,7 @@ mod tests {
         ];
         let ext = ScpContextExtension::for_child_from_parents(
             "ctx:c".to_owned(),
+            creator(),
             ContextMode::Encrypted,
             &governance(),
             CeilingPolicy::Immutable,
@@ -798,6 +890,7 @@ mod tests {
     fn extension_for(params: &ContextParams, context_id: &str) -> ScpContextExtension {
         ScpContextExtension::for_root(
             context_id.to_owned(),
+            creator(),
             params.mode,
             &params.governance,
             params.ceiling_policy,
@@ -810,7 +903,10 @@ mod tests {
     fn verify_against_accepts_matching_root() {
         let params = params_for(ContextMode::Encrypted, CeilingPolicy::Immutable);
         let ext = extension_for(&params, "ctx:r");
-        assert!(ext.verify_against(&"ctx:r".to_owned(), &params).is_ok());
+        assert!(
+            ext.verify_against(&"ctx:r".to_owned(), &creator(), &params)
+                .is_ok()
+        );
     }
 
     #[test]
@@ -818,12 +914,44 @@ mod tests {
         let params = params_for(ContextMode::Encrypted, CeilingPolicy::Immutable);
         let ext = extension_for(&params, "ctx:r");
         let err = ext
-            .verify_against(&"ctx:other".to_owned(), &params)
+            .verify_against(&"ctx:other".to_owned(), &creator(), &params)
             .unwrap_err();
         assert!(matches!(
             err,
             ScpContextBindingError::ContextIdMismatch { .. }
         ));
+    }
+
+    #[test]
+    fn verify_against_rejects_creator_mismatch() {
+        // BLACK-2J10-001-R regression (protocol layer): an honest SingleAdmin
+        // group commits creator = Alice; a joiner presenting creator = Mallory
+        // (a valid DID, matching params) is refused with `CreatorMismatch`. With
+        // SingleAdmin governance `governance_policy_hash` is a constant, so NO
+        // other rule catches the substitution — this is the sole anchor.
+        let mut params = params_for(ContextMode::Encrypted, CeilingPolicy::Immutable);
+        params.governance = GovernanceModel::SingleAdmin;
+        let ext = ScpContextExtension::for_root(
+            "ctx:r".to_owned(),
+            did("Alice"),
+            params.mode,
+            &params.governance,
+            params.ceiling_policy,
+            &CapabilityCeiling::new(params.ceiling.iter().cloned()),
+        )
+        .unwrap();
+        let err = ext
+            .verify_against(&"ctx:r".to_owned(), &did("Mallory"), &params)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ScpContextBindingError::CreatorMismatch { .. }
+        ));
+        // The honest creator still verifies.
+        assert!(
+            ext.verify_against(&"ctx:r".to_owned(), &did("Alice"), &params)
+                .is_ok()
+        );
     }
 
     #[test]
@@ -833,7 +961,7 @@ mod tests {
         // Different governance model than committed.
         params.governance = GovernanceModel::SingleAdmin;
         let err = ext
-            .verify_against(&"ctx:r".to_owned(), &params)
+            .verify_against(&"ctx:r".to_owned(), &creator(), &params)
             .unwrap_err();
         assert!(matches!(
             err,
@@ -847,7 +975,7 @@ mod tests {
         let ext = extension_for(&params, "ctx:r");
         params.ceiling = vec![Capability::MessagesRead]; // narrower than committed
         let err = ext
-            .verify_against(&"ctx:r".to_owned(), &params)
+            .verify_against(&"ctx:r".to_owned(), &creator(), &params)
             .unwrap_err();
         assert!(matches!(err, ScpContextBindingError::CeilingHashMismatch));
     }
@@ -858,7 +986,7 @@ mod tests {
         let ext = extension_for(&params, "ctx:r");
         params.ceiling_policy = CeilingPolicy::Governed;
         let err = ext
-            .verify_against(&"ctx:r".to_owned(), &params)
+            .verify_against(&"ctx:r".to_owned(), &creator(), &params)
             .unwrap_err();
         assert!(matches!(
             err,
@@ -875,7 +1003,7 @@ mod tests {
         let ext = extension_for(&params, "ctx:r");
         params.mode = ContextMode::Broadcast;
         let err = ext
-            .verify_against(&"ctx:r".to_owned(), &params)
+            .verify_against(&"ctx:r".to_owned(), &creator(), &params)
             .unwrap_err();
         assert!(matches!(
             err,
@@ -893,7 +1021,7 @@ mod tests {
         // Structurally corrupt: root with a parent-governance hash.
         ext.parent_governance_hash = Some([0x01; 32]);
         let err = ext
-            .verify_against(&"ctx:r".to_owned(), &params)
+            .verify_against(&"ctx:r".to_owned(), &creator(), &params)
             .unwrap_err();
         assert!(matches!(
             err,
@@ -908,7 +1036,7 @@ mod tests {
         ext.parent_context_ids = vec!["ctx:a".to_owned()];
         ext.parent_governance_hash = None;
         let err = ext
-            .verify_against(&"ctx:c".to_owned(), &params)
+            .verify_against(&"ctx:c".to_owned(), &creator(), &params)
             .unwrap_err();
         assert!(matches!(
             err,
@@ -924,7 +1052,7 @@ mod tests {
         ext.parent_context_ids = vec!["ctx:b".to_owned(), "ctx:a".to_owned()];
         ext.parent_governance_hash = Some([0x01; 32]);
         let err = ext
-            .verify_against(&"ctx:c".to_owned(), &params)
+            .verify_against(&"ctx:c".to_owned(), &creator(), &params)
             .unwrap_err();
         assert!(matches!(
             err,
@@ -937,6 +1065,7 @@ mod tests {
         let params = params_for(ContextMode::Encrypted, CeilingPolicy::Immutable);
         let ext = ScpContextExtension::for_child(
             "ctx:c".to_owned(),
+            creator(),
             params.mode,
             &params.governance,
             params.ceiling_policy,
@@ -945,6 +1074,9 @@ mod tests {
             [0x01; 32],
         )
         .unwrap();
-        assert!(ext.verify_against(&"ctx:c".to_owned(), &params).is_ok());
+        assert!(
+            ext.verify_against(&"ctx:c".to_owned(), &creator(), &params)
+                .is_ok()
+        );
     }
 }

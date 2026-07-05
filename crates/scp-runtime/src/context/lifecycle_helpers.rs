@@ -1732,7 +1732,8 @@ pub(in crate::context) fn restore_crypto_state_with_floor_guard(
 ///
 /// It enforces validation **rule 1** (every SCP context group MUST carry the
 /// `0xFF02` extension) plus **rules 2–6** (`context_id`, governance / ceiling
-/// hashes, ceiling policy, mode, parent structure) via
+/// hashes, ceiling policy, mode, parent structure) and **rule 8** (the committed
+/// genesis `creator_did` MUST equal the presented `creator_did`) via
 /// [`ScpContextExtension::verify_against`](scp_protocol::context::ScpContextExtension::verify_against).
 /// The extension is folded into the MLS key schedule at group creation, so it
 /// is the group's cryptographic attestation of its own parameters: a malicious
@@ -1741,6 +1742,13 @@ pub(in crate::context) fn restore_crypto_state_with_floor_guard(
 /// governance / ceiling / mode / `context_id` is refused here, *before* any
 /// authority (governance engine, ceiling, admin set) is built from those
 /// params.
+///
+/// `creator_did` is the genesis creator/admin the caller presents — the
+/// (untrusted) bundle's `creator_did` on a Welcome-based join, or the snapshot's
+/// `role_state.creator_did` on import/restore. Rule 8 refuses the group unless
+/// it equals the `creator_did` the group cryptographically committed at
+/// creation, so no authority is ever built for a substituted admin (the sole
+/// anchor for DID-less governance models such as `SingleAdmin`).
 ///
 /// `read` is the group-context-extension read outcome: `Ok(Some(ext))` =
 /// present, `Ok(None)` = absent (a rule-1 violation — not an SCP context),
@@ -1752,16 +1760,21 @@ pub(in crate::context) fn restore_crypto_state_with_floor_guard(
 pub(in crate::context) fn verify_scp_context_binding(
     read: Result<Option<scp_protocol::context::ScpContextExtension>, String>,
     context_id: &str,
+    creator_did: &str,
     params: &scp_protocol::context::ContextParams,
     site: &str,
 ) -> Result<(), String> {
     match read {
         Ok(Some(ext)) => ext
-            .verify_against(&context_id.to_owned(), params)
+            .verify_against(
+                &context_id.to_owned(),
+                &scp_identity::DID::from(creator_did.to_owned()),
+                params,
+            )
             .map_err(|e| {
                 format!(
                     "{site} refused: scp_context_params (0xFF02) binding mismatch \
-                     (§5.13.3 rules 2-6): {e}"
+                     (§5.13.3 rules 2-6, 8): {e}"
                 )
             }),
         Ok(None) => Err(format!(
@@ -1986,6 +1999,7 @@ pub async fn import_context(
                 .group_context_extension(&ctx_id_bytes)
                 .map_err(|e| e.to_string()),
             &context_id,
+            export.snapshot.role_state.creator_did.as_str(),
             &export.snapshot.context_params,
             "context import",
         )
@@ -2608,6 +2622,7 @@ pub async fn restore_context(
                 .group_context_extension(&ctx_id_bytes)
                 .map_err(|e| e.to_string()),
             context_id,
+            ctx_snapshot.role_state.creator_did.as_str(),
             &ctx_snapshot.context_params,
             "context restore",
         ) {

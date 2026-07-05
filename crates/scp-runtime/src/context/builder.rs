@@ -858,6 +858,7 @@ pub async fn create_context(
             // canonical-encoding failure aborts with nothing to roll back.
             let context_extension = ScpContextExtension::for_root(
                 context_id.clone(),
+                scp_identity::DID::from(creator_did.to_owned()),
                 params.mode,
                 &params.governance,
                 params.ceiling_policy,
