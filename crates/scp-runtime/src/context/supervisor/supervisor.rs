@@ -10799,10 +10799,21 @@ impl Supervisor {
                 // runs in-actor (real MLS remove + role_state strip) and
                 // broadcasts its own epoch-advancing Commit, so no member is left
                 // who never received the Welcome and the group stays epoch-
-                // consistent. Best-effort: if the compensation ITSELF fails we
-                // log loudly (a member may linger) but still surface the original
-                // sealing error.
-                match self
+                // consistent. Best-effort: if the compensation does not ACTUALLY
+                // execute we log loudly (a member may linger) but still surface
+                // the original sealing error.
+                //
+                // The remove is a rollback ONLY when it AUTO-EXECUTED: an `Ok`
+                // with `execution_result == Some(MemberRemoved)`. A propose can
+                // return `Ok` with `execution_result: None` — the proposal was
+                // created but NOT auto-executed (e.g. governance froze via a
+                // concurrent CloseContext in the yield window between the two
+                // awaits) — in which case the member is STILL a member. Treating
+                // that (or any non-`MemberRemoved` result, or an `Err`) as
+                // success would mask exactly the zombie this compensation exists
+                // to prevent, so only `Some(MemberRemoved)` logs a rollback; every
+                // other shape takes the loud error branch.
+                let compensation = self
                     .propose_governance_action_checked_carrying_key_package(
                         &context_id,
                         &creator_did,
@@ -10815,15 +10826,35 @@ impl Supervisor {
                         proposer_signing_key,
                         None,
                     )
-                    .await
-                {
-                    Ok(_) => {
+                    .await;
+                match compensation {
+                    Ok(outcome)
+                        if matches!(
+                            outcome.execution_result,
+                            Some(crate::context::state::GovernanceActionResult::MemberRemoved)
+                        ) =>
+                    {
                         tracing::warn!(
                             context_id = %context_id,
                             invitee = %invitee_did,
                             error = %e,
                             "invite_member: sealing failed after the add; compensating remove \
-                             succeeded — the added member was rolled back"
+                             executed — the added member was rolled back"
+                        );
+                    }
+                    Ok(outcome) => {
+                        // Propose succeeded but the remove did NOT auto-execute
+                        // (e.g. governance froze in the window) — the member was
+                        // NOT removed. This is a zombie; surface it loudly.
+                        tracing::error!(
+                            context_id = %context_id,
+                            invitee = %invitee_did,
+                            error = %e,
+                            compensating_remove_status = ?outcome.status,
+                            "invite_member: sealing failed after the add AND the compensating \
+                             remove did NOT execute (proposal created but not auto-executed); the \
+                             invitee remains a member without ever receiving the sealed Welcome; \
+                             manual removal required"
                         );
                     }
                     Err(remove_err) => {
