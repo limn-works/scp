@@ -10302,7 +10302,7 @@ impl Scp {
                 // Serialize the result variant name for the caller.
                 use scp_core::context::state::GovernanceActionResult;
                 let result_str = match result {
-                    GovernanceActionResult::MemberAdded => "MemberAdded",
+                    GovernanceActionResult::MemberAdded { .. } => "MemberAdded",
                     GovernanceActionResult::MemberRemoved => "MemberRemoved",
                     GovernanceActionResult::RoleChanged => "RoleChanged",
                     GovernanceActionResult::ToolRegistered => "ToolRegistered",

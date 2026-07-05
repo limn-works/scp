@@ -1127,7 +1127,7 @@ pub fn execute_add_member(
     did: &DID,
     role: &str,
     meta: CommitMeta<'_>,
-) -> Result<(), ContextError> {
+) -> Result<scp_protocol::context::builder::AddMemberOutput, ContextError> {
     let CommitMeta {
         pid: _,
         actor_did,
@@ -1137,10 +1137,25 @@ pub fn execute_add_member(
 
     require_active(&cell.handle)?;
 
+    // `None` key-package bytes: the crypto provider resolves the invitee's
+    // KeyPackage from its per-provider staging slot (populated by the
+    // invitation-sealing caller via `stage_key_package` before dispatching
+    // this add). Under `cfg(test)`/`testing` with no staged KP the provider
+    // returns an empty `AddMemberOutput`, preserving the non-crypto pipeline
+    // tests. This is what makes `GovernanceAction::AddMember` do a REAL MLS
+    // add in production (§5.12.3) rather than erroring on the missing KP.
     let add_output = deps
         .crypto
         .add_member(&context_id_bytes, did, None)
         .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
+
+    // Clone the Welcome + Commit for the return value (the invitation-sealing
+    // caller needs the Welcome to seal the bundle; the Commit is surfaced for
+    // observability) and for the existing-member broadcast below, BEFORE the
+    // originals are moved into the `WelcomeGenerated` emit.
+    let welcome_bytes_out = add_output.welcome_bytes.clone();
+    let commit_bytes_out = add_output.commit_bytes.clone();
+    let commit_for_broadcast = add_output.commit_bytes.clone();
 
     // The fallible role assignment + structural member insert run through the
     // field-granular Class-C role view (ADR-049 §9): `system_assign_role` mints +
@@ -1201,6 +1216,27 @@ pub fn execute_add_member(
                 deps.event_tx.as_ref(),
             );
         }
+
+        // ROOT FIX (parity with `execute_remove_member` / `execute_reset_member`):
+        // broadcast the MLS Commit to the EXISTING members. An MLS Add advances
+        // the group epoch exactly like a Remove, so without this the add's
+        // Commit was only buffered into the (broadcast-suppressed)
+        // `WelcomeGenerated` event and NEVER reached the group — every existing
+        // member desynced from the admin after any add. Routed through the same
+        // persistent retry queue (`try_broadcast_commit_or_enqueue`) as the
+        // remove/reset commits. A no-op when `commit_for_broadcast` is empty
+        // (the `cfg(test)` no-crypto pipeline).
+        if !commit_for_broadcast.is_empty() {
+            try_broadcast_commit_or_enqueue(
+                view.commit_broadcast_borrows(),
+                deps,
+                context_id,
+                commit_for_broadcast,
+                &CommitOperation::AddMember {
+                    target_did: did.clone(),
+                },
+            );
+        }
     });
 
     // Subject-bearing leaf (ADR-011 amendment): carry the *affected member*
@@ -1216,7 +1252,10 @@ pub fn execute_add_member(
         timestamp_secs,
     )?;
     *cell.class_c_view().checkpoint_events_since_mut() += 1;
-    Ok(())
+    Ok(scp_protocol::context::builder::AddMemberOutput {
+        welcome_bytes: welcome_bytes_out,
+        commit_bytes: commit_bytes_out,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -4102,7 +4141,7 @@ pub async fn dispatch_context_governance_action(
     } = meta;
     match action {
         GovernanceAction::AddMember { did, role } => {
-            execute_add_member(
+            let add_output = execute_add_member(
                 cell,
                 deps,
                 context_id,
@@ -4114,7 +4153,14 @@ pub async fn dispatch_context_governance_action(
                     timestamp_secs,
                 },
             )?;
-            Ok(GovernanceActionResult::MemberAdded)
+            Ok(GovernanceActionResult::MemberAdded {
+                welcome_bytes: scp_protocol::context::membership::RedactedBytes(
+                    add_output.welcome_bytes,
+                ),
+                commit_bytes: scp_protocol::context::membership::RedactedBytes(
+                    add_output.commit_bytes,
+                ),
+            })
         }
         GovernanceAction::RemoveMember { did, .. } => {
             execute_remove_member(

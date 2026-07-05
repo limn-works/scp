@@ -33,7 +33,9 @@ use scp_protocol::context::governance::{
     multisig::ThresholdEngine,
     unanimity::UnanimityEngine,
 };
-use scp_protocol::context::membership::{ContextEvent, MembershipState, ReceiveBuffer};
+use scp_protocol::context::membership::{
+    ContextEvent, MembershipState, ReceiveBuffer, RedactedBytes,
+};
 use scp_protocol::context::params::GovernanceModel;
 use scp_protocol::context::params::ToolRegistration;
 use scp_protocol::context::roles::{Capability, ContextRoleState};
@@ -128,6 +130,17 @@ pub fn commit_retry_backoff(failed_attempts: u32) -> u64 {
 /// canonical Merkle event log (§9.9.3).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CommitOperation {
+    /// Commit produced by `execute_add_member` for the given target DID.
+    ///
+    /// An MLS Add advances the group epoch exactly like a Remove, so the
+    /// existing members MUST process this Commit or they desync from the
+    /// admin. The add's Commit is broadcast through the same persistent
+    /// retry queue as the remove/reset commits (parity restored — the add
+    /// path historically dropped it).
+    AddMember {
+        /// The DID that was added to the MLS group.
+        target_did: DID,
+    },
     /// Commit produced by `execute_remove_member` for the given target DID.
     RemoveMember {
         /// The DID that was removed from the MLS group.
@@ -161,6 +174,7 @@ impl CommitOperation {
     #[must_use]
     pub fn label(&self) -> String {
         match self {
+            Self::AddMember { .. } => "AddMember".to_owned(),
             Self::RemoveMember { .. } => "RemoveMember".to_owned(),
             Self::RotateContentKeys { .. } => "RotateContentKeys".to_owned(),
             Self::ResetMember {
@@ -447,7 +461,24 @@ pub struct MigrationProposedResult {
 #[derive(Debug)]
 pub enum GovernanceActionResult {
     /// A member was added to the context.
-    MemberAdded,
+    ///
+    /// Carries the MLS `Welcome` (for the newly added member, delivered
+    /// out-of-band inside a signed §5.12.3 `InvitationBundle`) and the MLS
+    /// `Commit` (broadcast to the EXISTING members so they advance to the new
+    /// epoch). `execute_add_member` broadcasts the Commit itself; the Welcome
+    /// is surfaced here so the invitation-sealing caller
+    /// ([`crate::context::supervisor::Supervisor::invite_member`]) can seal it
+    /// to the invitee. Both are redacting-`Debug` byte wrappers — they are
+    /// public protocol messages, not key material, but the redaction keeps the
+    /// generic `format!("{result:?}")` FFI surface quiet.
+    MemberAdded {
+        /// TLS-serialized MLS `Welcome` for the newly added member.
+        welcome_bytes: RedactedBytes,
+        /// TLS-serialized MLS `Commit` for the existing members (already
+        /// broadcast by `execute_add_member`; surfaced for observability /
+        /// caller-side delivery fallback).
+        commit_bytes: RedactedBytes,
+    },
     /// A member was ejected from the context (MLS removal).
     MemberRemoved,
     /// A member's role was changed.

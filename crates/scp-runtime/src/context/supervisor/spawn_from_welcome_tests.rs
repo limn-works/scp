@@ -49,7 +49,7 @@ use scp_protocol::crypto::envelope_seal::{ed25519_pubkey_to_x25519, hpke_seal_in
 use zeroize::Zeroizing;
 
 use super::key_package_actor::{KeyPackageCommand, ReservationId};
-use super::{Supervisor, WelcomeJoinRequest};
+use super::{InviteMemberOutcome, Supervisor, WelcomeJoinRequest};
 use crate::context::builder::{
     ContextEventLogProvider, ContextTransportProvider, NotConfiguredTransportProvider,
 };
@@ -2284,8 +2284,6 @@ async fn structurally_inconsistent_bundle_is_rejected() {
 /// resolved #active) opens.
 #[tokio::test]
 async fn invite_member_round_trip_stands_up_a_bidirectional_joiner() {
-    use std::convert::Infallible;
-
     let ctx_id = ctx_hex(0xd5);
     let ctx_bytes = context_id_to_bytes(&ctx_id);
     let alice = DID::from(ALICE_DID);
@@ -2308,8 +2306,10 @@ async fn invite_member_round_trip_stands_up_a_bidirectional_joiner() {
     let (bob_sup, bob_crypto) = bob_supervisor(None);
     let (reservation_id, kp_public_bytes) = reserve_bob_kp(&bob_sup, &bob).await;
 
-    // (c) Alice invites Bob: real MLS add-member + signed, sealed §5.12.3 bundle.
-    //     The creator signs the §5.12.3.1 signing hash with alice's #active key.
+    // (c) Alice invites Bob: the add is routed through the context actor's
+    //     governance gate (SingleAdmin → auto-executes the real in-actor MLS
+    //     add), then the returned Welcome is signed + sealed into a §5.12.3
+    //     bundle with alice's #active key.
     let outcome = alice_sup
         .invite_member(
             ctx_id.clone(),
@@ -2317,10 +2317,26 @@ async fn invite_member_round_trip_stands_up_a_bidirectional_joiner() {
             bob.clone(),
             kp_public_bytes,
             vec![],
-            |h: &[u8; 32]| Ok::<[u8; 64], Infallible>(alice_signing_key().sign(h).to_bytes()),
+            &alice_signing_key(),
         )
         .await
         .expect("alice seals an invitation for bob");
+    // SingleAdmin creator invite must SEAL (not defer to a governance vote).
+    let (enc, ciphertext) = match outcome {
+        InviteMemberOutcome::Sealed {
+            enc, ciphertext, ..
+        } => Some((enc, ciphertext)),
+        InviteMemberOutcome::RequiresGovernanceApproval { .. } => None,
+    }
+    .expect("SingleAdmin creator invite seals a bundle, does not require governance approval");
+
+    // (c') The creator's OWN role_state now reflects Bob (the split-brain the
+    //      old off-mailbox add left behind is closed: the add ran in-actor).
+    assert_eq!(
+        alice_sup.member_count(&ctx_id).await,
+        Some(2),
+        "the in-actor governance add updates the CREATOR's membership/role_state"
+    );
 
     // (d) Bob joins. His #active custody holds the fixed BOB seed = the key
     //     `pair_resolver` returns for BOB, which is what `invite_member` sealed to.
@@ -2328,8 +2344,8 @@ async fn invite_member_round_trip_stands_up_a_bidirectional_joiner() {
     let req = WelcomeJoinRequest {
         context_id: ctx_id.clone(),
         creator_did: alice.clone(),
-        sealed_bundle_enc: outcome.enc,
-        sealed_bundle_ct: outcome.ciphertext,
+        sealed_bundle_enc: enc,
+        sealed_bundle_ct: ciphertext,
         reservation_id,
         local_pseudonym: some_pseudonym(),
     };
@@ -2383,6 +2399,202 @@ async fn invite_member_round_trip_stands_up_a_bidirectional_joiner() {
             OpenResult::Management { payload, .. } if payload.as_slice() == from_bob.as_slice()
         ),
         "alice decrypts bob's traffic — bidirectional round-trip closed; got {opened_bob:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test M2 — root fix: the governance AddMember broadcasts its epoch Commit.
+// ---------------------------------------------------------------------------
+
+/// A transport that watches for a non-empty `send_message` to ONE expected
+/// routing id and flips an atomic flag when it sees one. Used to prove the
+/// add-member Commit was broadcast to existing members. `send_message`
+/// succeeds (so the Commit is delivered, not enqueued for retry); all other
+/// operations are inert. An [`AtomicBool`](std::sync::atomic::AtomicBool)
+/// avoids a `Mutex` on the sync transport hot path.
+struct BroadcastWatchTransport {
+    /// The routing id whose broadcast proves the fix (`context_routing_id`).
+    expected_routing: [u8; 32],
+    /// Set to `true` when a non-empty `send_message` to `expected_routing` is
+    /// observed.
+    saw_broadcast: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ContextTransportProvider for BroadcastWatchTransport {
+    fn is_connected(&self) -> bool {
+        true
+    }
+
+    fn publish_context(
+        &self,
+        _context_id: &[u8; 32],
+        _params: &ContextParams,
+    ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+        Ok(())
+    }
+
+    fn delete_published(
+        &self,
+        _context_id: &[u8; 32],
+    ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+        Ok(())
+    }
+
+    fn send_message(
+        &self,
+        context_id: &[u8; 32],
+        encrypted_payload: &[u8],
+    ) -> Result<(), crate::context::ContextError> {
+        if *context_id == self.expected_routing && !encrypted_payload.is_empty() {
+            self.saw_broadcast
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        Ok(())
+    }
+}
+
+/// Builds Alice's creator supervisor wired to a caller-supplied transport (so a
+/// test can observe the outbound Commit broadcast). Mirrors [`alice_supervisor`]
+/// otherwise.
+fn alice_supervisor_with_transport(
+    transport: Box<dyn ContextTransportProvider>,
+) -> (Arc<Supervisor>, Arc<MlsCryptoProvider>) {
+    let crypto = Arc::new(MlsCryptoProvider::new(ALICE_DID.to_owned()));
+    let event_log: Box<dyn ContextEventLogProvider> = Box::new(MerkleEventLogProvider::new());
+    let sup = Supervisor::with_providers(
+        Arc::clone(&crypto),
+        transport,
+        event_log,
+        pair_resolver(),
+        None,
+        None,
+        None,
+        None,
+        fresh_mls_storage(),
+    );
+    (sup, crypto)
+}
+
+/// Proves the ROOT fix: `execute_add_member` now broadcasts the epoch-advancing
+/// MLS Commit to the existing members (parity with remove/reset). Before the
+/// fix the add's Commit was only buffered into the broadcast-suppressed
+/// `WelcomeGenerated` event and NEVER hit the transport — so an add into a
+/// multi-member context silently desynced every existing member. Here the
+/// invite routes `AddMember` through the actor; the recording transport must
+/// capture a `send_message` to the context routing id carrying the Commit.
+#[tokio::test]
+async fn invite_member_broadcasts_the_add_commit_to_existing_members() {
+    let ctx_id = ctx_hex(0xd6);
+    let alice = DID::from(ALICE_DID);
+    let bob = DID::from(BOB_DID);
+
+    let want_routing = scp_protocol::context::context_routing_id(&ctx_id);
+    let saw_broadcast = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let transport = BroadcastWatchTransport {
+        expected_routing: want_routing,
+        saw_broadcast: Arc::clone(&saw_broadcast),
+    };
+    let (alice_sup, _alice_crypto) = alice_supervisor_with_transport(Box::new(transport));
+    alice_sup
+        .create_context(
+            ctx_id.clone(),
+            joiner_params(),
+            alice.clone(),
+            some_pseudonym(),
+        )
+        .await
+        .expect("alice creates the encrypted context");
+
+    let (bob_sup, _bob_crypto) = bob_supervisor(None);
+    let (_reservation_id, kp_public_bytes) = reserve_bob_kp(&bob_sup, &bob).await;
+
+    let outcome = alice_sup
+        .invite_member(
+            ctx_id.clone(),
+            alice.clone(),
+            bob.clone(),
+            kp_public_bytes,
+            vec![],
+            &alice_signing_key(),
+        )
+        .await
+        .expect("alice invites bob");
+    assert!(
+        matches!(outcome, InviteMemberOutcome::Sealed { .. }),
+        "SingleAdmin invite seals a bundle"
+    );
+
+    // The add's Commit must have been broadcast to the context routing id.
+    assert!(
+        saw_broadcast.load(std::sync::atomic::Ordering::SeqCst),
+        "the in-actor governance add must broadcast its epoch Commit to existing \
+         members (a non-empty send_message to the context routing id)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test M3 — auth by construction: a voting context defers the invite.
+// ---------------------------------------------------------------------------
+
+/// A voting governance model (`Threshold`) does NOT authorize a unilateral
+/// invite: routing `AddMember` through the governance gate creates a PENDING
+/// proposal (the proposer's single approval does not meet the 2-of-2
+/// threshold), so `invite_member` returns
+/// [`InviteMemberOutcome::RequiresGovernanceApproval`] and adds NO member — no
+/// sealed bundle, no MLS add. This is the structural auth gate, for free.
+#[tokio::test]
+async fn invite_member_into_voting_context_requires_governance_approval() {
+    let ctx_id = ctx_hex(0xd7);
+    let alice = DID::from(ALICE_DID);
+    let bob = DID::from(BOB_DID);
+
+    let voting_params = ContextParams {
+        governance: GovernanceModel::Threshold {
+            threshold: 2,
+            signers: vec![alice.clone(), bob.clone()],
+        },
+        ..joiner_params()
+    };
+
+    let (alice_sup, _alice_crypto) = alice_supervisor();
+    alice_sup
+        .create_context(
+            ctx_id.clone(),
+            voting_params,
+            alice.clone(),
+            some_pseudonym(),
+        )
+        .await
+        .expect("alice creates the voting context");
+
+    let (bob_sup, _bob_crypto) = bob_supervisor(None);
+    let (_reservation_id, kp_public_bytes) = reserve_bob_kp(&bob_sup, &bob).await;
+
+    let outcome = alice_sup
+        .invite_member(
+            ctx_id.clone(),
+            alice.clone(),
+            bob.clone(),
+            kp_public_bytes,
+            vec![],
+            &alice_signing_key(),
+        )
+        .await
+        .expect("propose succeeds (pending), invite does not error");
+
+    assert!(
+        matches!(
+            outcome,
+            InviteMemberOutcome::RequiresGovernanceApproval { .. }
+        ),
+        "a unilateral invite into a voting context defers to governance, it does \
+         not seal a bundle; got {outcome:?}"
+    );
+    // No member was added — the add did not run.
+    assert_eq!(
+        alice_sup.member_count(&ctx_id).await,
+        Some(1),
+        "the deferred invite adds NO member to the voting context"
     );
 }
 
