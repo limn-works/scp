@@ -40,10 +40,17 @@
 //! against openmls's internal clock (the real wall clock natively; the
 //! attacker-overridable `Date.now()` on wasm). The SCP checks in this module
 //! sit *in addition to* that internal check — they never replace or weaken it.
-//! The remaining residual (openmls validating Welcome tree leaves against its
-//! own clock, with no public accessor to bracket) is tracked upstream; see the
-//! `SECURITY (ADR-057 §Prereq-1)` notes in [`crate::group`] and the browser
-//! surface's `time.rs`.
+//! The remaining residual — openmls validating Welcome tree leaves against its
+//! own clock — is tracked upstream. It is not bracketable, but not because the
+//! accessor is private: `LeafNode::life_time()` is `pub(crate)`, yet
+//! `leaf_node_source()` is public and its public `LeafNodeSource::KeyPackage`
+//! variant carries the `Lifetime`. The real blocker is that a joined `MlsGroup`
+//! exposes no public way to reach another member's `LeafNode` (`members()` /
+//! `member_at()` yield a `Member` with no lifetime; `export_ratchet_tree()`'s
+//! `RatchetTree` has no public node iterator; `public_group()` is `pub(crate)`;
+//! only `own_leaf_node()` is public — and that leaf is SCP-minted, so bracketing
+//! it is possible but pointless). See the `SECURITY (ADR-057 §Prereq-1)` notes
+//! in [`crate::group`] and the browser surface's `time.rs`.
 //!
 //! # Test-clock realism constraint (IMPORTANT)
 //!

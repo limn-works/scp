@@ -50,6 +50,7 @@ use crate::crypto::hpke_backend::{HpkeBackend, ProductionHpkeBackend};
 use scp_mls::credential::ScpCredential;
 use scp_mls::encrypt::{DecryptedContent, decrypt_with_sender_did};
 use scp_mls::group::{self, SCP_CIPHERSUITE, ScpMlsGroup};
+use scp_mls::validate_key_package_lifetime;
 use scp_protocol::context::ContextError;
 use scp_protocol::context::builder::ContextCreationError;
 use scp_protocol::crypto::sender_keys::{
@@ -621,6 +622,19 @@ impl MlsCryptoProvider {
         &self.hpke_backend
     }
 
+    /// A clone of the injected hardened [`Clock`] (ADR-057 §Prereq-1) `Arc`.
+    ///
+    /// Lets the node/FFI construction sites wire the SAME clock `Arc` into the
+    /// `Supervisor` that this provider holds, so the "one hardened clock per
+    /// node" invariant documented on the [`Self::clock`] field holds by
+    /// construction — the supervisor does not fabricate a second `SystemClock`.
+    /// The returned `Arc` points at the exact same [`Clock`] this provider (and
+    /// its [`ProductionMlsBackend`]) already share.
+    #[must_use]
+    pub fn clock(&self) -> Arc<dyn Clock> {
+        Arc::clone(&self.clock)
+    }
+
     /// Destructively move the per-context MLS crypto state out of this
     /// provider and return it as an [`OwnedMlsCryptoState`] the caller
     /// can hand to a [`crate::context::actor::ContextActor`] at spawn
@@ -1045,6 +1059,17 @@ impl MlsCryptoProvider {
         let verified = kp_in
             .validate(provider.crypto(), ProtocolVersion::Mls10)
             .map_err(|e| ContextError::InvalidKeyPackage(format!("validation failed: {e}")))?;
+
+        // SECURITY (ADR-057 §Prereq-1): openmls's `validate` above runs its own
+        // internal `Lifetime::is_valid` against openmls's (wasm: unhardened)
+        // clock. This eager join gate is the accept-family sibling of
+        // `ProductionMlsBackend::validate_key_package` — re-validate the accepted
+        // `Lifetime` against the injected hardened clock and enforce the RFC 9420
+        // max-range bound openmls's `validate` never applies. Additive hardening;
+        // never replaces openmls.
+        validate_key_package_lifetime(verified.life_time(), self.clock.as_ref()).map_err(|e| {
+            ContextError::InvalidKeyPackage(format!("key package lifetime invalid: {e}"))
+        })?;
 
         if verified.ciphersuite() != SCP_CIPHERSUITE {
             return Err(ContextError::InvalidKeyPackage(format!(
@@ -2866,6 +2891,66 @@ mod tests {
         // Add Bob.
         let result = provider.add_member(&ctx_id, &bob_cred.did, Some(&kp_bytes));
         assert!(result.is_ok(), "add_member failed: {result:?}");
+    }
+
+    #[test]
+    fn validate_key_package_rejects_expired_lifetime_at_gate() {
+        use scp_clock::TestClock;
+        use scp_mls::KEY_PACKAGE_LIFETIME_MAX_RANGE_SECS;
+
+        // Security intent (ADR-057 §Prereq-1): the eager join gate
+        // `validate_key_package` must re-check the accepted KeyPackage
+        // `Lifetime` against the provider's injected hardened clock — mirroring
+        // its accept-family sibling `ProductionMlsBackend::validate_key_package`
+        // — so a KeyPackage that is temporally invalid under the SCP clock is
+        // rejected even though openmls's own internal `is_valid` (against the
+        // real system clock) accepts it.
+
+        // Bob's KeyPackage is minted at the REAL present via `SystemClock`, so
+        // openmls's un-injectable internal validation (which reads the real
+        // wall clock inside `kp_in.validate`) accepts it.
+        let bob_cred = ScpCredential::new(
+            "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo".to_string(),
+            None,
+            SigningKeyId::Active,
+        )
+        .unwrap();
+        let (bob_kp_bundle, _bob_signer, _bob_provider) =
+            generate_key_package(&bob_cred, &SystemClock).unwrap();
+        let kp_bytes = bob_kp_bundle
+            .key_package()
+            .tls_serialize_detached()
+            .unwrap();
+
+        // Provider clock is pinned far past the KeyPackage's `not_after`
+        // (`real_now + KEY_PACKAGE_LIFETIME_SECS`). One full max-range beyond the
+        // present clears the ~3-month window with margin, so the SCP bracket's
+        // `now < not_after` check fails.
+        let future_now = SystemClock.now_secs() + KEY_PACKAGE_LIFETIME_MAX_RANGE_SECS * 2;
+        let provider =
+            MlsCryptoProvider::new(TEST_DID.to_string(), Arc::new(TestClock::new(future_now)));
+
+        let result = provider.validate_key_package(&bob_cred.did, Some(&kp_bytes));
+        let err = result.expect_err(
+            "validate_key_package must reject a KeyPackage whose lifetime is expired \
+             under the injected clock",
+        );
+        assert!(
+            matches!(err, ContextError::InvalidKeyPackage(ref m) if m.contains("lifetime")),
+            "rejection must be at the lifetime gate, got: {err:?}"
+        );
+
+        // Positive control: with the provider clock at the real present, the
+        // same KeyPackage passes the lifetime gate (and every other check),
+        // proving the rejection above is caused by the injected clock offset —
+        // not by an unrelated defect in the KeyPackage bytes.
+        let live_provider = MlsCryptoProvider::new(TEST_DID.to_string(), Arc::new(SystemClock));
+        assert!(
+            live_provider
+                .validate_key_package(&bob_cred.did, Some(&kp_bytes))
+                .is_ok(),
+            "a freshly-minted KeyPackage must pass under a real-present clock"
+        );
     }
 
     #[test]

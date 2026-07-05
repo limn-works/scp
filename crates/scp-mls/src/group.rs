@@ -1176,13 +1176,17 @@ mod tests {
     #[test]
     #[allow(clippy::unwrap_used)]
     fn create_group_routes_own_leaf_lifetime_through_injected_clock() {
-        // openmls does not expose the creator's own-leaf `Lifetime` publicly
-        // (`LeafNode::life_time` / `leaf_node_source` are pub(crate)), so we
-        // cannot read the leaf's bounds directly. This test pins the observable
-        // contract: create_group accepts an injected clock and builds a usable
-        // group. The leaf-bound routing shares the exact `key_package_lifetime`
-        // helper asserted directly in the two generate_key_package tests above
-        // and in the `crate::lifetime` unit tests.
+        // The creator's own-leaf `Lifetime` is in fact publicly reachable
+        // (`MlsGroup::own_leaf_node()` is public, and `leaf_node_source()` — also
+        // public — exposes the `Lifetime` via `LeafNodeSource::KeyPackage`; only
+        // `LeafNode::life_time()` is `pub(crate)`). This test deliberately pins
+        // the observable contract instead — create_group accepts an injected
+        // clock and builds a usable group — because the leaf-bound routing shares
+        // the exact `key_package_lifetime` helper already asserted directly in
+        // the two generate_key_package tests above and in the `crate::lifetime`
+        // unit tests, so re-reading the own leaf here would only duplicate that.
+        // (The un-bracketable residual is the *joining peers'* leaves, which — un-
+        // like the own leaf — a joined `MlsGroup` exposes no public way to reach.)
         let now = SystemClock.now_secs();
         let clock = scp_clock::TestClock::new(now);
         let group = create_group(&test_credential("carol"), &clock).unwrap();

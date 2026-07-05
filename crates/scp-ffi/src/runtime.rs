@@ -1211,6 +1211,11 @@ fn build_supervisor(
         .map_or_else(not_configured_key_resolver, |r| {
             document_vm_key_resolver(std::sync::Arc::clone(r))
         });
+    // Share the provider's exact hardened `Clock` Arc with the supervisor so the
+    // "one hardened clock per node" invariant (see the `MlsCryptoProvider::clock`
+    // field doc, ADR-057 §Prereq-1) holds by construction — the supervisor does
+    // not fabricate a second `SystemClock`. Read before `crypto` is moved below.
+    let clock = crypto.clock();
     Ok(
         scp_core::context::supervisor::Supervisor::with_providers_and_journal(
             crypto,
@@ -1220,7 +1225,7 @@ fn build_supervisor(
             persistence,
             None,
             Some(event_tx),
-            None,
+            Some(clock),
             durable,
         ),
     )

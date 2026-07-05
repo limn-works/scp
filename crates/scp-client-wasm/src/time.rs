@@ -42,15 +42,27 @@
 //!   — and the RFC 9420 maximum-range bound openmls never enforces is added
 //!   there too.
 //! - **Residual (V3).** openmls's own internal `Lifetime::is_valid` on the
-//!   *Welcome tree-leaf* validation path is NOT injectable and NOT bracketable
-//!   (`LeafNode::life_time` / `leaf_node_source` are `pub(crate)`; openmls 0.8
-//!   exposes no time-provider seam), so it still reads openmls's internal clock.
-//!   Closing this residual requires an upstream openmls change — a time-provider
-//!   seam on `OpenMlsProvider` covering `Lifetime::new`/`is_valid` — requested
-//!   upstream (see this change's PR body / report for the filed feature-request
-//!   text). Until then, page same-origin integrity (CSP/SRI/COOP/COEP) remains
-//!   load-bearing for the Welcome-leaf freshness check, exactly as it already is
-//!   for the wall clock this module hardens.
+//!   *Welcome tree-leaf* validation path is NOT injectable and NOT bracketable —
+//!   but not because the accessor is private. `LeafNode::life_time()` is
+//!   `pub(crate)`, yet `leaf_node_source()` IS public and its public
+//!   `LeafNodeSource::KeyPackage(Lifetime)` variant hands back the `Lifetime`
+//!   whenever you hold the `LeafNode`. The real blocker is that a *joined*
+//!   `MlsGroup` gives no public way to reach another member's `LeafNode`:
+//!   `members()`/`member_at()` yield `Member` (no lifetime),
+//!   `export_ratchet_tree()`'s `RatchetTree` has no public node iterator,
+//!   `public_group()` is `pub(crate)`, and only `own_leaf_node()`/`own_leaf()`
+//!   are public — and that own leaf is SCP-minted anyway, so bracketing it is
+//!   possible but pointless (it is not the attacker-supplied Welcome leaf).
+//!   openmls 0.8 also exposes no time-provider seam, so the internal check still
+//!   reads openmls's internal clock. Do NOT "fix" V3 by calling the public
+//!   `leaf_node_source()` on the wrong object — there is no object that yields
+//!   the joining peers' leaves. Closing this residual requires an upstream
+//!   openmls change — a time-provider seam on `OpenMlsProvider` covering
+//!   `Lifetime::new`/`is_valid` — requested upstream (see this change's PR body /
+//!   report for the filed feature-request text). Until then, page same-origin
+//!   integrity (CSP/SRI/COOP/COEP) remains load-bearing for the Welcome-leaf
+//!   freshness check, exactly as it already is for the wall clock this module
+//!   hardens.
 
 use scp_clock::Clock;
 

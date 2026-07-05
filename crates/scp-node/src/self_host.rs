@@ -630,6 +630,11 @@ where
         Box::new(scp_core::context::providers::MerkleEventLogProvider::new());
     let (event_tx, _event_rx) = tokio::sync::broadcast::channel(1000);
 
+    // Share the provider's exact hardened `Clock` Arc with the supervisor so the
+    // "one hardened clock per node" invariant (see the `MlsCryptoProvider::clock`
+    // field doc, ADR-057 §Prereq-1) holds by construction — the supervisor does
+    // not fabricate a second `SystemClock`. Read before `crypto` is moved below.
+    let clock = crypto.clock();
     // The durable saga journal is built over the SAME `Storage` backend as
     // `mls_storage` so crash-recovery replay loads unresolved saga entries from
     // one store on restart — guaranteed by the `DurableProviders` newtype
@@ -642,7 +647,7 @@ where
         None,
         None,
         Some(event_tx),
-        None,
+        Some(clock),
         durable,
     );
 

@@ -1038,6 +1038,11 @@ fn build_supervisor_arc(
     // receiver for the node webhook dispatcher (§12.10.5). The unused receiver
     // is dropped immediately; the retained sender keeps the channel open.
     let (event_tx, _rx) = tokio::sync::broadcast::channel(EVENT_CHANNEL_CAPACITY);
+    // Share the provider's exact hardened `Clock` Arc with the supervisor so the
+    // "one hardened clock per node" invariant (see the `MlsCryptoProvider::clock`
+    // field doc, ADR-057 §Prereq-1) holds by construction — the supervisor does
+    // not fabricate a second `SystemClock`. Read before `crypto` is moved below.
+    let clock = crypto.clock();
     // Wire the durable saga journal (§17.16 / ADR-049): replay loads unresolved
     // saga entries from the SAME storage backend as `mls_storage` on restart.
     scp_core::context::supervisor::Supervisor::with_providers_and_journal(
@@ -1048,7 +1053,7 @@ fn build_supervisor_arc(
         Some(persistence),
         None,
         Some(event_tx),
-        None,
+        Some(clock),
         durable,
     )
 }
