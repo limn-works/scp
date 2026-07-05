@@ -1,16 +1,21 @@
-"""Tests for the ADR-049 Phase 2J joiner handshake SDK wrappers.
+"""Tests for the ADR-049 Phase 2J invite / joiner handshake SDK wrappers.
 
-Covers :meth:`scp_sdk.SCP.reserve_key_package` (step 1) and
-:meth:`scp_sdk.SCP.context_join_from_welcome` (step 2):
+Covers :meth:`scp_sdk.SCP.reserve_key_package` (step 1),
+:meth:`scp_sdk.SCP.invite_member` (creator side; FFI-02 Option A), and
+:meth:`scp_sdk.SCP.context_join_from_welcome` (joiner side, reshaped to take a
+:class:`scp_sdk.SealedInvitation`):
 
 - Mock-based delegation: the wrappers forward their arguments to the PyO3
-  ``_native`` bridge in order, return the reservation tuple unchanged, and wrap
+  ``_native`` bridge in order, return the reservation tuple unchanged, project
+  the invite outcome into the :data:`scp_sdk.InviteMemberOutcome` union, and wrap
   the joined handle in a :class:`~scp_sdk.context.Context` scoped to the joiner.
-  No Rust extension required.
+  No Rust extension required (the join wrapper's native-projection seam,
+  ``_to_native_sealed``, is patched).
 - Real-FFI (skips without the native module): ``reserve_key_package`` mints a
-  real single-use MLS ``KeyPackage`` for a locally-custodied identity, and both
-  ops fail closed for a non-locally-custodied DID (the same trust model as
-  ``context_create``).
+  real single-use MLS ``KeyPackage``; ``invite_member`` seals a real bundle for a
+  SingleAdmin context (0xFF02-capable KeyPackage, §5.13.3 / valn0502, fixed in
+  9fe3b4c9b); and the ops fail closed for a non-locally-custodied DID / unknown
+  context (the same trust model as ``context_create``).
 
 See ``.docs/adrs/ADR-049-actor-per-context.md`` §9 (Deferred Work 1) and
 ``crates/scp-ffi/CLAUDE.md``.
@@ -19,11 +24,17 @@ See ``.docs/adrs/ADR-049-actor-per-context.md`` §9 (Deferred Work 1) and
 from __future__ import annotations
 
 from dataclasses import dataclass
-from unittest.mock import MagicMock
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from scp_sdk.context import Context
+from scp_sdk.scp import (
+    RequiresGovernanceApproval,
+    Sealed,
+    SealedInvitation,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers — minimal bridge mocks (mirrors tests/test_context.py)
@@ -52,6 +63,16 @@ def _make_scp(native_mock: MagicMock | None = None) -> MagicMock:
 # A syntactically-valid 64-hex context id (ADR-056) for FFI-boundary validation.
 _HEX_CTX_ID = "a" * 64
 _CREATOR_DID = "did:dht:z6MkCreatorAbc"
+
+
+def _sealed() -> SealedInvitation:
+    """A representative SDK :class:`SealedInvitation` for delegation tests."""
+    return SealedInvitation(
+        context_id=_HEX_CTX_ID,
+        creator_did=_CREATOR_DID,
+        enc=b"\x00" * 32,
+        ciphertext=b"sealed-bundle-ct",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -106,7 +127,14 @@ class TestReserveKeyPackageDelegation:
 
 
 class TestContextJoinFromWelcomeDelegation:
-    """Verify :meth:`SCP.context_join_from_welcome` forwarding + wrapping."""
+    """Verify :meth:`SCP.context_join_from_welcome` forwarding + wrapping.
+
+    The wrapper projects the SDK :class:`SealedInvitation` into the native
+    ``PySealedInvitation`` via ``scp_sdk.scp._to_native_sealed`` (which needs the
+    extension). These pure-Python delegation tests patch that seam with an
+    identity function so forwarding can be asserted against the SDK dataclass —
+    the real projection is exercised by the real-FFI happy path below.
+    """
 
     async def test_forwards_all_args_in_order(self) -> None:
         from scp_sdk.scp import SCP
@@ -114,25 +142,23 @@ class TestContextJoinFromWelcomeDelegation:
         native = MagicMock()
         native.context_join_from_welcome.return_value = _MockHandle()
         scp = _make_scp(native)
+        sealed = _sealed()
 
-        params = {"ceiling": ["core:send_message"]}
-        await SCP.context_join_from_welcome(
-            scp,
-            "did:dht:z6MkJoiner",
-            _CREATOR_DID,
-            _HEX_CTX_ID,
-            params,
-            "res-id-3",
-            b"welcome-bytes",
-        )
+        with patch("scp_sdk.scp._to_native_sealed", side_effect=lambda s: s):
+            await SCP.context_join_from_welcome(
+                scp,
+                "did:dht:z6MkJoiner",
+                sealed,
+                "res-id-3",
+            )
 
+        # Reshaped signature: (owning_did, sealed, reservation_id). The loose
+        # creator_did/context_id/params/welcome_bytes are gone — they now travel
+        # inside the sealed, authenticated bundle.
         native.context_join_from_welcome.assert_called_once_with(
             "did:dht:z6MkJoiner",
-            _CREATOR_DID,
-            _HEX_CTX_ID,
-            params,
+            sealed,
             "res-id-3",
-            b"welcome-bytes",
         )
 
     async def test_returns_context_scoped_to_joiner(self) -> None:
@@ -142,15 +168,13 @@ class TestContextJoinFromWelcomeDelegation:
         native.context_join_from_welcome.return_value = _MockHandle()
         scp = _make_scp(native)
 
-        ctx = await SCP.context_join_from_welcome(
-            scp,
-            "did:dht:z6MkJoiner",
-            _CREATOR_DID,
-            _HEX_CTX_ID,
-            {"ceiling": ["core:send_message"]},
-            "res-id-4",
-            b"welcome-bytes",
-        )
+        with patch("scp_sdk.scp._to_native_sealed", side_effect=lambda s: s):
+            ctx = await SCP.context_join_from_welcome(
+                scp,
+                "did:dht:z6MkJoiner",
+                _sealed(),
+                "res-id-4",
+            )
 
         assert isinstance(ctx, Context)
         assert ctx.context_id == "ctx-test-abc123"
@@ -167,15 +191,120 @@ class TestContextJoinFromWelcomeDelegation:
         )
         scp = _make_scp(native)
 
-        with pytest.raises(RuntimeError, match="not locally custodied"):
+        with (
+            patch("scp_sdk.scp._to_native_sealed", side_effect=lambda s: s),
+            pytest.raises(RuntimeError, match="not locally custodied"),
+        ):
             await SCP.context_join_from_welcome(
                 scp,
                 "did:dht:z6MkStranger",
-                _CREATOR_DID,
-                _HEX_CTX_ID,
-                {"ceiling": ["core:send_message"]},
+                _sealed(),
                 "res-id-5",
-                b"welcome-bytes",
+            )
+
+
+# ---------------------------------------------------------------------------
+# SCP.invite_member — mock delegation
+# ---------------------------------------------------------------------------
+
+
+class TestInviteMemberDelegation:
+    """Verify :meth:`SCP.invite_member` forwarding + outcome projection.
+
+    The wrapper forwards its five args in order to the native bridge and maps
+    the returned ``PyInviteMemberOutcome`` (a ``kind`` discriminant plus
+    optionals) into the SDK :data:`InviteMemberOutcome` union. Both outcome
+    kinds are first-class SUCCESS results — ``requiresGovernanceApproval`` is
+    NOT an error.
+    """
+
+    async def test_forwards_all_args_in_order(self) -> None:
+        from scp_sdk.scp import SCP
+
+        native = MagicMock()
+        native.invite_member.return_value = SimpleNamespace(
+            kind="sealed", enc=b"\x00" * 32, ciphertext=b"ct", delivered=True
+        )
+        scp = _make_scp(native)
+
+        await SCP.invite_member(
+            scp,
+            _HEX_CTX_ID,
+            _CREATOR_DID,
+            "did:dht:z6MkInvitee",
+            b"invitee-key-package",
+            ["wss://relay.example"],
+        )
+
+        native.invite_member.assert_called_once_with(
+            _HEX_CTX_ID,
+            _CREATOR_DID,
+            "did:dht:z6MkInvitee",
+            b"invitee-key-package",
+            ["wss://relay.example"],
+        )
+
+    async def test_maps_sealed_outcome(self) -> None:
+        from scp_sdk.scp import SCP
+
+        native = MagicMock()
+        native.invite_member.return_value = SimpleNamespace(
+            kind="sealed",
+            enc=b"\x01" * 32,
+            ciphertext=b"sealed-ct",
+            delivered=False,
+        )
+        scp = _make_scp(native)
+
+        outcome = await SCP.invite_member(
+            scp, _HEX_CTX_ID, _CREATOR_DID, "did:dht:z6MkInvitee", b"kp", []
+        )
+
+        assert isinstance(outcome, Sealed)
+        assert outcome.enc == b"\x01" * 32
+        assert outcome.ciphertext == b"sealed-ct"
+        assert outcome.delivered is False
+
+    async def test_maps_requires_governance_approval_outcome(self) -> None:
+        from scp_sdk.scp import SCP
+
+        native = MagicMock()
+        native.invite_member.return_value = SimpleNamespace(
+            kind="requiresGovernanceApproval", proposal_id="deadbeef"
+        )
+        scp = _make_scp(native)
+
+        outcome = await SCP.invite_member(
+            scp, _HEX_CTX_ID, _CREATOR_DID, "did:dht:z6MkInvitee", b"kp", []
+        )
+
+        # A first-class SUCCESS outcome — NOT an exception.
+        assert isinstance(outcome, RequiresGovernanceApproval)
+        assert outcome.proposal_id == "deadbeef"
+
+    async def test_unknown_kind_fails_closed(self) -> None:
+        from scp_sdk.errors import ScpError
+        from scp_sdk.scp import SCP
+
+        native = MagicMock()
+        native.invite_member.return_value = SimpleNamespace(kind="somethingElse")
+        scp = _make_scp(native)
+
+        with pytest.raises(ScpError, match="unrecognized outcome kind"):
+            await SCP.invite_member(
+                scp, _HEX_CTX_ID, _CREATOR_DID, "did:dht:z6MkInvitee", b"kp", []
+            )
+
+    async def test_propagates_bridge_error(self) -> None:
+        from scp_sdk.scp import SCP
+
+        native = MagicMock()
+        native.invite_member.side_effect = RuntimeError("invite_member failed: no live context")
+        scp = _make_scp(native)
+
+        with pytest.raises(RuntimeError, match="no live context"):
+            await SCP.invite_member(
+                scp, _HEX_CTX_ID, _CREATOR_DID, "did:dht:z6MkInvitee", b"kp", []
             )
 
 
@@ -222,13 +351,99 @@ class TestJoinerHandshakeRealFfi:
     async def test_context_join_from_welcome_rejects_non_custodied_joiner(self, scp) -> None:
         # The joiner's routing pseudonym is DERIVED from its local custody. A
         # non-custodied joiner hard-fails at the derivation seam BEFORE the
-        # single-use KeyPackage is consumed.
+        # single-use KeyPackage is consumed. `enc` is a valid 32-byte length so
+        # the rejection is the custody gate, not the length precheck.
+        sealed = SealedInvitation(
+            context_id=_HEX_CTX_ID,
+            creator_did=_CREATOR_DID,
+            enc=b"\x00" * 32,
+            ciphertext=b"not-a-real-sealed-bundle",
+        )
         with pytest.raises(Exception):
             await scp.context_join_from_welcome(
                 "did:dht:z6MkNeverCustodiedHere",
-                _CREATOR_DID,
-                _HEX_CTX_ID,
-                {"ceiling": ["core:send_message"]},
+                sealed,
                 "bogus-reservation-id",
-                b"not-a-real-welcome",
             )
+
+
+@pytestmark_native
+class TestInviteMemberRealFfi:
+    """`invite_member` through the real PyO3 bridge."""
+
+    async def test_invite_member_rejects_unknown_context(self, scp) -> None:
+        # A custodied inviter + a real context so the supervisor is attached and
+        # signing-key resolution succeeds; then the live-context lookup for a
+        # DIFFERENT (non-existent) context fails.
+        from scp_sdk.types import CustodyType
+
+        creator = await scp.identity_create(CustodyType.IN_MEMORY)
+        await scp.context_create(creator.did, {"mode": "encrypted", "governance": "single_admin"})
+
+        unknown_ctx = "d" * 64
+        with pytest.raises(Exception, match="no live context"):
+            await scp.invite_member(
+                unknown_ctx,
+                creator.did,
+                "did:dht:z6MkInviteeUnknownCtx",
+                b"bogus-key-package",
+                [],
+            )
+
+    async def test_invite_member_rejects_non_custodied_inviter(self, scp) -> None:
+        # A non-locally-custodied inviter fails at signing-key resolution, before
+        # any context lookup.
+        with pytest.raises(Exception):
+            await scp.invite_member(
+                "e" * 64,
+                "did:dht:z6MkNoSuchInviterIdentity",
+                "did:dht:z6MkInviteeUncustodied",
+                b"bogus-key-package",
+                [],
+            )
+
+    async def test_invite_member_seals_for_single_admin_context(self, scp) -> None:
+        # Happy path: a SingleAdmin creator invites a real, KeyPackage-reserved
+        # invitee. The invite is unilateral and returns a `Sealed` outcome. The
+        # invitee's reserved KeyPackage declares the 0xFF02 context-binding
+        # capability (§5.13.3, valn0502; fixed in 9fe3b4c9b), so the MLS add
+        # succeeds instead of failing the group-context-extension round-trip.
+        from scp_sdk.types import CustodyType
+
+        creator = await scp.identity_create(CustodyType.IN_MEMORY)
+        # The SingleAdmin creator must hold the invite-relevant capabilities in
+        # the context ceiling (`member:invite` + `governance:propose`): the
+        # add is routed through the actor's governance gate, which checks the
+        # proposer's `governance:propose` capability before auto-executing.
+        ctx = await scp.context_create(
+            creator.did,
+            {
+                "mode": "encrypted",
+                "governance": "single_admin",
+                "ceiling": [
+                    "messages:read",
+                    "messages:write",
+                    "role:assign",
+                    "member:invite",
+                    "member:remove",
+                    "governance:propose",
+                    "governance:vote",
+                    "context:close",
+                ],
+            },
+        )
+
+        invitee = await scp.identity_create(CustodyType.IN_MEMORY)
+        reservation_id, invitee_kp = await scp.reserve_key_package(invitee.did)
+        assert reservation_id
+        assert len(invitee_kp) > 0
+
+        outcome = await scp.invite_member(ctx.context_id, creator.did, invitee.did, invitee_kp, [])
+
+        assert isinstance(outcome, Sealed)
+        # RFC 9180 HPKE encapsulated key is exactly 32 bytes.
+        assert isinstance(outcome.enc, (bytes, bytearray))
+        assert len(outcome.enc) == 32
+        assert isinstance(outcome.ciphertext, (bytes, bytearray))
+        assert len(outcome.ciphertext) > 0
+        assert isinstance(outcome.delivered, bool)

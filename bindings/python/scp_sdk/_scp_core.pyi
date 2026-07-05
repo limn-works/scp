@@ -188,6 +188,48 @@ class PyMessageReceiver:
     def __aiter__(self) -> PyMessageReceiver: ...
     def __anext__(self) -> Future[PyMessage]: ...
 
+class PySealedInvitation:
+    """A sealed, signed invitation bundle (ADR-049 Phase 2J; FFI-02 Option A).
+
+    The input to ``SCP.context_join_from_welcome``; produced on the creator side
+    by ``SCP.invite_member``. The SDK wraps this as
+    :class:`scp_sdk.SealedInvitation`.
+    """
+
+    def __init__(
+        self, context_id: str, creator_did: str, enc: bytes, ciphertext: bytes
+    ) -> None: ...
+    @property
+    def context_id(self) -> str: ...
+    @property
+    def creator_did(self) -> str: ...
+    @property
+    def enc(self) -> bytes: ...
+    @property
+    def ciphertext(self) -> bytes: ...
+
+class PyInviteMemberOutcome:
+    """The outcome of ``SCP.invite_member``.
+
+    ``kind`` is EXACTLY ``"sealed"`` or ``"requiresGovernanceApproval"``. For
+    ``"sealed"``, ``enc``/``ciphertext``/``delivered`` are present and
+    ``proposal_id`` is ``None``; for ``"requiresGovernanceApproval"``,
+    ``proposal_id`` carries the tracked id (or ``None``) and the others are
+    ``None``. The SDK projects this into the :data:`scp_sdk.InviteMemberOutcome`
+    union.
+    """
+
+    @property
+    def kind(self) -> str: ...
+    @property
+    def enc(self) -> bytes | None: ...
+    @property
+    def ciphertext(self) -> bytes | None: ...
+    @property
+    def delivered(self) -> bool | None: ...
+    @property
+    def proposal_id(self) -> str | None: ...
+
 class UcanToken:
     """A UCAN token returned by the bridge."""
 
@@ -488,12 +530,17 @@ class SCP:
     def context_join_from_welcome(
         self,
         owning_did: Any,
-        creator_did: Any,
-        context_id: Any,
-        params: Any,
+        sealed: PySealedInvitation,
         reservation_id: Any,
-        welcome_bytes: Any,
     ) -> Any: ...
+    def invite_member(
+        self,
+        context_id: Any,
+        creator_did: Any,
+        invitee_did: Any,
+        invitee_key_package: Any,
+        relay_urls: Any,
+    ) -> PyInviteMemberOutcome: ...
     def context_leave(self, handle: Any, identity_did: Any) -> Any: ...
     def context_member_count(self, handle: Any) -> Any: ...
     def context_member_dids(self, handle: Any) -> Any: ...
