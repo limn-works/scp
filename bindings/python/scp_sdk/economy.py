@@ -43,6 +43,98 @@ def _bridge() -> Any:
 
 
 # ---------------------------------------------------------------------------
+# Amount display formatting (ADR-060 SDK display surface)
+# ---------------------------------------------------------------------------
+
+# Number of decimal places for well-known currencies, keyed by uppercase
+# currency code. The SCP protocol does NOT store per-currency decimals -- the
+# wire form is always a smallest-unit integer -- so this table lives entirely
+# in the SDK for display purposes. The same values are used across every SDK
+# (TypeScript, Swift, Kotlin) for cross-binding consistency.
+_KNOWN_CURRENCY_DECIMALS: dict[str, int] = {
+    "USD": 2,
+    "EUR": 2,
+    "GBP": 2,
+    "BTC": 8,
+    "SAT": 0,
+    "SOL": 9,
+    "USDC": 6,
+    "ETH": 18,
+}
+
+
+def _format_with_decimals(amount: int, decimals: int) -> str:
+    if amount < 0:
+        raise ScpError(
+            f"amount must be non-negative, got {amount}",
+            code="SCP-ECON-12070",
+        )
+    if decimals < 0 or decimals > 100:
+        raise ScpError(
+            f"decimals must be in 0..=100, got {decimals}",
+            code="SCP-ECON-12070",
+        )
+    if decimals == 0:
+        # The amount is already expressed in whole display units -- no fraction.
+        return str(amount)
+    divisor = 10**decimals
+    whole, fraction = divmod(amount, divisor)
+    return f"{whole}.{fraction:0{decimals}d}"
+
+
+def format_amount(
+    amount: int,
+    currency: str | None = None,
+    *,
+    decimals: int | None = None,
+) -> str:
+    """Format a smallest-unit monetary amount as a human-readable decimal string.
+
+    Applies the currency's decimal scale using pure integer/string arithmetic
+    (no floating point), so amounts far beyond ``2**53`` format exactly.
+
+    Examples:
+        >>> format_amount(150, "USD")
+        '1.50'
+        >>> format_amount(100_000_000, "BTC")
+        '1.00000000'
+        >>> format_amount(1500, decimals=3)
+        '1.500'
+
+    Args:
+        amount: Smallest-unit amount (e.g. cents, satoshis). Must be non-negative.
+        currency: A known currency code (case-insensitive). Mutually exclusive
+            with ``decimals``.
+        decimals: An explicit decimal-scale override for unknown/custom
+            currencies. Mutually exclusive with ``currency``.
+
+    Returns:
+        The human-decimal representation as a string.
+
+    Raises:
+        ScpError: If neither/both of ``currency`` and ``decimals`` are given, if
+            the currency is unknown and no ``decimals`` override is supplied, or
+            if ``amount``/``decimals`` are out of range.
+    """
+    if (currency is None) == (decimals is None):
+        raise ScpError(
+            "exactly one of 'currency' or 'decimals' must be supplied",
+            code="SCP-ECON-12070",
+        )
+    if decimals is not None:
+        return _format_with_decimals(amount, decimals)
+    assert currency is not None  # narrowed by the exclusivity check above
+    known = _KNOWN_CURRENCY_DECIMALS.get(currency.upper())
+    if known is None:
+        raise ScpError(
+            f"unknown currency {currency!r} has no known decimals; "
+            "pass an explicit decimals= override",
+            code="SCP-ECON-12070",
+        )
+    return _format_with_decimals(amount, known)
+
+
+# ---------------------------------------------------------------------------
 # Cost estimation
 # ---------------------------------------------------------------------------
 
@@ -219,6 +311,7 @@ __all__ = [
     "check_policy_lock",
     "estimate_cost",
     "evaluate_formula",
+    "format_amount",
     "policy_requires_payment",
     "validate_policy_change",
     "verify_payment_receipts",
