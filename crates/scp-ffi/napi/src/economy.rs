@@ -7,6 +7,7 @@
 //!
 //! See spec section 19 (Economic Governance) and ADR-033.
 
+use napi::bindgen_prelude::BigInt;
 use scp_ffi_common::error_codes as codes;
 
 use crate::error::ScpNapiError;
@@ -21,6 +22,26 @@ fn validation_error(msg: &str) -> napi::Error {
         message: msg.to_owned(),
         code: codes::VALID_7050.to_owned(),
     })
+}
+
+/// Marshals a JS `bigint` monetary amount to an exact `u64`.
+///
+/// Monetary amounts cross the napi boundary as `BigInt` (JS `bigint`) so a full
+/// `u64` round-trips exactly — a JS `number` narrows through `i64` and loses
+/// precision above 2^53 (ADR-060 SDK-surface rule; the wire form itself is a
+/// canonical decimal string in JSON / native `u64` in `MessagePack`). Rejects a
+/// negative value or one that does not fit losslessly in `u64`.
+fn amount_u64_from_bigint(amount: &BigInt, field: &str) -> napi::Result<u64> {
+    let (signed, value, lossless) = amount.get_u64();
+    if signed || !lossless {
+        return Err(napi::Error::from(ScpNapiError::Validation {
+            message: format!(
+                "{field} must be a non-negative amount that fits in an unsigned 64-bit integer"
+            ),
+            code: codes::VALID_7001.to_owned(),
+        }));
+    }
+    Ok(value)
 }
 
 fn parse_action_type(s: &str) -> Result<scp_core::economy::PaidActionType, napi::Error> {
@@ -83,7 +104,7 @@ pub(crate) fn economy_estimate_cost_on(
     policy_json: String,
     action_type: String,
     metrics_json: String,
-) -> napi::Result<i64> {
+) -> napi::Result<BigInt> {
     let action = parse_action_type(&action_type)?;
     let metrics = parse_metrics(&metrics_json)?;
 
@@ -95,10 +116,11 @@ pub(crate) fn economy_estimate_cost_on(
         Some(p)
     };
 
-    #[allow(clippy::cast_possible_wrap)]
+    // The cost is a monetary `Amount` (`u64`) returned as a JS `bigint`;
+    // `None` (overflow / no result) is signalled by the sentinel `-1n`.
     Ok(
         scp_core::economy::estimate_cost(policy.as_ref(), &action, &metrics)
-            .map_or(-1, |a| a.value() as i64),
+            .map_or_else(|| BigInt::from(-1_i64), |a| BigInt::from(a.value())),
     )
 }
 
@@ -164,12 +186,14 @@ pub(crate) fn economy_evaluate_formula_on(
     _bi: &NapiBridgeInstance,
     formula_json: String,
     metrics_json: String,
-) -> napi::Result<i64> {
+) -> napi::Result<BigInt> {
     let formula: scp_core::economy::PricingFormula = serde_json::from_str(&formula_json)
         .map_err(|e| validation_error(&format!("invalid formula JSON: {e}")))?;
     let metrics = parse_metrics(&metrics_json)?;
-    #[allow(clippy::cast_possible_wrap)]
-    Ok(scp_core::economy::evaluate_formula(&formula, &metrics).map_or(-1, |a| a.value() as i64))
+    // Result is a monetary `Amount` (`u64`) as a JS `bigint`; `None` (overflow)
+    // is signalled by the sentinel `-1n`.
+    Ok(scp_core::economy::evaluate_formula(&formula, &metrics)
+        .map_or_else(|| BigInt::from(-1_i64), |a| BigInt::from(a.value())))
 }
 
 /// Per-bridge-instance implementation of `economy_budget_remaining`.
@@ -177,7 +201,7 @@ pub(crate) fn economy_budget_remaining_on(
     bi: &NapiBridgeInstance,
     context_id: String,
     did: String,
-) -> napi::Result<i64> {
+) -> napi::Result<BigInt> {
     if context_id.is_empty() {
         return Err(validation_error("context_id must not be empty"));
     }
@@ -188,8 +212,8 @@ pub(crate) fn economy_budget_remaining_on(
     let remaining = bi
         .core
         .with_economy_budget(&context_id, |tracker| tracker.remaining(&member_did));
-    #[allow(clippy::cast_possible_wrap)]
-    Ok(remaining.value() as i64)
+    // Remaining budget is a monetary `Amount` (`u64`) as a JS `bigint`.
+    Ok(BigInt::from(remaining.value()))
 }
 
 /// Per-bridge-instance implementation of `economy_budget_grant`.
@@ -197,7 +221,7 @@ pub(crate) fn economy_budget_grant_on(
     bi: &NapiBridgeInstance,
     context_id: String,
     did: String,
-    amount: i64,
+    amount: BigInt,
 ) -> napi::Result<()> {
     if context_id.is_empty() {
         return Err(validation_error("context_id must not be empty"));
@@ -205,18 +229,10 @@ pub(crate) fn economy_budget_grant_on(
     if did.is_empty() {
         return Err(validation_error("DID must not be empty"));
     }
-    if amount < 0 {
-        return Err(napi::Error::from(ScpNapiError::Validation {
-            message: format!("amount must be non-negative, got {amount}"),
-            code: codes::VALID_7001.to_owned(),
-        }));
-    }
+    let amount = amount_u64_from_bigint(&amount, "amount")?;
     let member_did = scp_did::DID::from(did.as_str());
     bi.core.with_economy_budget_mut(&context_id, |tracker| {
-        tracker.grant(
-            &member_did,
-            scp_core::economy::Amount::new(amount.cast_unsigned()),
-        );
+        tracker.grant(&member_did, scp_core::economy::Amount::new(amount));
     });
     Ok(())
 }
@@ -226,7 +242,7 @@ pub(crate) fn economy_budget_record_spend_on(
     bi: &NapiBridgeInstance,
     context_id: String,
     did: String,
-    amount: i64,
+    amount: BigInt,
 ) -> napi::Result<()> {
     if context_id.is_empty() {
         return Err(validation_error("context_id must not be empty"));
@@ -234,19 +250,11 @@ pub(crate) fn economy_budget_record_spend_on(
     if did.is_empty() {
         return Err(validation_error("DID must not be empty"));
     }
-    if amount < 0 {
-        return Err(napi::Error::from(ScpNapiError::Validation {
-            message: format!("amount must be non-negative, got {amount}"),
-            code: codes::VALID_7001.to_owned(),
-        }));
-    }
+    let amount = amount_u64_from_bigint(&amount, "amount")?;
     let member_did = scp_did::DID::from(did.as_str());
     bi.core.with_economy_budget_mut(&context_id, |tracker| {
         tracker
-            .record_spend(
-                &member_did,
-                scp_core::economy::Amount::new(amount.cast_unsigned()),
-            )
+            .record_spend(&member_did, scp_core::economy::Amount::new(amount))
             .map_err(|e| validation_error(&format!("{e}")))
     })
 }
@@ -312,11 +320,11 @@ pub(crate) fn economy_antispam_escalated_cost_on(
     context_id: String,
     sender_did: String,
     now: i64,
-    base_cost: i64,
+    base_cost: BigInt,
     thresholds_json: String,
-    floor: Option<i64>,
-    cap: Option<i64>,
-) -> napi::Result<i64> {
+    floor: Option<BigInt>,
+    cap: Option<BigInt>,
+) -> napi::Result<BigInt> {
     if context_id.is_empty() {
         return Err(validation_error("context_id must not be empty"));
     }
@@ -332,27 +340,12 @@ pub(crate) fn economy_antispam_escalated_cost_on(
             code: codes::VALID_7001.to_owned(),
         }));
     }
-    if base_cost < 0 {
-        return Err(napi::Error::from(ScpNapiError::Validation {
-            message: format!("base_cost must be non-negative, got {base_cost}"),
-            code: codes::VALID_7001.to_owned(),
-        }));
-    }
-    if floor.is_some_and(|f| f < 0) {
-        return Err(napi::Error::from(ScpNapiError::Validation {
-            message: format!(
-                "floor must be non-negative, got {}",
-                floor.unwrap_or_default()
-            ),
-            code: codes::VALID_7001.to_owned(),
-        }));
-    }
-    if cap.is_some_and(|c| c < 0) {
-        return Err(napi::Error::from(ScpNapiError::Validation {
-            message: format!("cap must be non-negative, got {}", cap.unwrap_or_default()),
-            code: codes::VALID_7001.to_owned(),
-        }));
-    }
+    // Monetary amounts arrive as JS `bigint`; convert to exact `u64`.
+    let base_cost = amount_u64_from_bigint(&base_cost, "base_cost")?;
+    let floor = floor
+        .map(|f| amount_u64_from_bigint(&f, "floor"))
+        .transpose()?;
+    let cap = cap.map(|c| amount_u64_from_bigint(&c, "cap")).transpose()?;
 
     let config = scp_core::economy::EscalationConfig {
         thresholds: thresholds
@@ -369,14 +362,14 @@ pub(crate) fn economy_antispam_escalated_cost_on(
         tracker.compute_escalated_cost(
             &did,
             now.cast_unsigned(),
-            scp_core::economy::Amount::new(base_cost.cast_unsigned()),
+            scp_core::economy::Amount::new(base_cost),
             &config,
-            floor.map(|f| scp_core::economy::Amount::new(f.cast_unsigned())),
-            cap.map(|c| scp_core::economy::Amount::new(c.cast_unsigned())),
+            floor.map(scp_core::economy::Amount::new),
+            cap.map(scp_core::economy::Amount::new),
         )
     });
-    #[allow(clippy::cast_possible_wrap)]
-    Ok(cost.value() as i64)
+    // Escalated cost is a monetary `Amount` (`u64`) as a JS `bigint`.
+    Ok(BigInt::from(cost.value()))
 }
 
 /// Per-bridge-instance implementation of `economy_verify_payment_receipts`.
@@ -471,6 +464,14 @@ mod tests {
         NapiBridgeInstance::new_napi()
     }
 
+    /// Extracts an exact `i64` from a returned amount `BigInt` for assertions,
+    /// asserting the value fit losslessly.
+    fn bigint_i64(v: BigInt) -> i64 {
+        let (value, lossless) = v.get_i64();
+        assert!(lossless, "amount BigInt did not fit losslessly in i64");
+        value
+    }
+
     #[test]
     fn estimate_cost_no_policy_returns_zero() {
         let bi = test_bi();
@@ -480,7 +481,7 @@ mod tests {
             "MessageSend".to_owned(),
             "{}".to_owned(),
         );
-        assert_eq!(result.unwrap(), 0);
+        assert_eq!(bigint_i64(result.unwrap()), 0);
     }
 
     #[test]
@@ -508,7 +509,7 @@ mod tests {
         let bi = test_bi();
         let result =
             economy_budget_remaining_on(&bi, "test-ctx".to_owned(), "did:key:test".to_owned());
-        assert_eq!(result.unwrap(), 0);
+        assert_eq!(bigint_i64(result.unwrap()), 0);
     }
 
     #[test]
@@ -518,7 +519,7 @@ mod tests {
             &bi,
             "napi-econ-ctx".to_owned(),
             "did:key:alice".to_owned(),
-            1000,
+            BigInt::from(1000_u64),
         )
         .unwrap();
         let r = economy_budget_remaining_on(
@@ -527,13 +528,13 @@ mod tests {
             "did:key:alice".to_owned(),
         )
         .unwrap();
-        assert_eq!(r, 1000);
+        assert_eq!(bigint_i64(r), 1000);
 
         economy_budget_record_spend_on(
             &bi,
             "napi-econ-ctx".to_owned(),
             "did:key:alice".to_owned(),
-            400,
+            BigInt::from(400_u64),
         )
         .unwrap();
         let r = economy_budget_remaining_on(
@@ -542,7 +543,7 @@ mod tests {
             "did:key:alice".to_owned(),
         )
         .unwrap();
-        assert_eq!(r, 600);
+        assert_eq!(bigint_i64(r), 600);
     }
 
     #[test]
@@ -567,8 +568,13 @@ mod tests {
     #[test]
     fn budget_grant_rejects_negative_amount() {
         let bi = test_bi();
-        let err = economy_budget_grant_on(&bi, "ctx".to_owned(), "did:key:alice".to_owned(), -1)
-            .unwrap_err();
+        let err = economy_budget_grant_on(
+            &bi,
+            "ctx".to_owned(),
+            "did:key:alice".to_owned(),
+            BigInt::from(-1_i64),
+        )
+        .unwrap_err();
         assert!(
             err.reason.contains("non-negative"),
             "error should mention 'non-negative': {err:?}"
@@ -646,9 +652,13 @@ mod tests {
     #[test]
     fn budget_record_spend_rejects_negative_amount() {
         let bi = test_bi();
-        let err =
-            economy_budget_record_spend_on(&bi, "ctx".to_owned(), "did:key:alice".to_owned(), -100)
-                .unwrap_err();
+        let err = economy_budget_record_spend_on(
+            &bi,
+            "ctx".to_owned(),
+            "did:key:alice".to_owned(),
+            BigInt::from(-100_i64),
+        )
+        .unwrap_err();
         assert!(
             err.reason.contains("non-negative"),
             "error should mention 'non-negative': {err:?}"

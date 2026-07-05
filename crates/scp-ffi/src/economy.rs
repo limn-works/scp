@@ -560,7 +560,7 @@ mod tests {
             "locked": false,
             "cost_schedule": {
                 "currency": [85,83,68,0],
-                "per_message": 10,
+                "per_message": "10",
                 "per_tool_invoke": null,
                 "per_join": null,
                 "per_period": null,

@@ -5033,7 +5033,7 @@ mod tests {
         );
 
         // Direct set always rejects — must use governance (#728).
-        let json = r#"{"locked":false,"cost_schedule":{"currency":[85,83,68,0],"per_message":null,"per_tool_invoke":100,"per_join":null,"per_period":null,"per_byte_stored":null},"payment_adapters":[],"pricing_formula":null,"payee":"did:dht:z6MkTest"}"#;
+        let json = r#"{"locked":false,"cost_schedule":{"currency":[85,83,68,0],"per_message":null,"per_tool_invoke":"100","per_join":null,"per_period":null,"per_byte_stored":null},"payment_adapters":[],"pricing_formula":null,"payee":"did:dht:z6MkTest"}"#;
         let result = context_set_economic_policy_on(&bi, &mut handle, json.to_owned());
         assert!(
             result.is_err(),
