@@ -406,6 +406,38 @@ fn provenance_to_dict<'py>(py: Python<'py>, prov: &DataProvenance) -> PyResult<B
     dict.set_item("memory_scope", format!("{:?}", prov.memory_scope))?;
     dict.set_item("chain_path", prov.chain_path.clone())?;
     dict.set_item("purpose", prov.purpose.as_deref())?;
+
+    // Discovery method (§24.2.3). Mirrors the tagged shape the NAPI/UniFFI
+    // bridges surface: the unit variant is a bare `"OutOfBand"` string; the
+    // context-bearing variants are single-key mappings keyed by the variant
+    // name, so the wire shape is identical across every bridge.
+    match &prov.discovery_method {
+        DiscoveryMethod::OutOfBand => dict.set_item("discovery_method", "OutOfBand")?,
+        DiscoveryMethod::SharedContext(ctx_id) => {
+            let dm = PyDict::new(py);
+            dm.set_item("SharedContext", ctx_id)?;
+            dict.set_item("discovery_method", dm)?;
+        }
+        DiscoveryMethod::Registry(ctx_id) => {
+            let dm = PyDict::new(py);
+            dm.set_item("Registry", ctx_id)?;
+            dict.set_item("discovery_method", dm)?;
+        }
+    }
+
+    // Economic provenance (§24.3.4, §19.6). ADR-060: a monetary `Amount`
+    // crosses the boundary as its canonical base-10 decimal string (never a
+    // bare number) so the full `u64` range survives exactly — matching the
+    // NAPI/UniFFI bridges. `None` surfaces as Python `None`.
+    dict.set_item(
+        "payment_amount",
+        prov.payment_amount.map(|a| a.0.to_string()),
+    )?;
+    dict.set_item("payment_adapter", prov.payment_adapter.as_deref())?;
+    dict.set_item(
+        "payment_receipt_id",
+        prov.payment_receipt_id.map(hex::encode),
+    )?;
     Ok(dict)
 }
 
@@ -688,6 +720,112 @@ mod tests {
         assert!(
             provenance_pseudonymize_counterparties(&prov_json.to_string(), "not-hex-zz").is_err()
         );
+    }
+
+    #[test]
+    fn provenance_to_dict_surfaces_payment_fields() {
+        use scp_core::economy::types::Amount;
+
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let prov = DataProvenance {
+                source_context: "ctx-src".to_string(),
+                source_type: SourceType::Persistent,
+                counterparties: vec!["did:dht:z6MkAlice".into()],
+                purpose: Some("paid data".to_string()),
+                discovery_method: DiscoveryMethod::SharedContext("ctx-shared".to_string()),
+                age: std::time::Duration::from_secs(0),
+                memory_scope: MemoryScope::Full,
+                chain_depth: 0,
+                chain_path: None,
+                // u64::MAX exercises the > 2^53 range that a bare JS number
+                // would lose — the decimal string must survive exactly.
+                payment_amount: Some(Amount::new(u64::MAX)),
+                payment_adapter: Some("lightning".to_string()),
+                payment_receipt_id: Some([0xAB; 32]),
+            };
+
+            let dict = provenance_to_dict(py, &prov).unwrap();
+
+            // Amount crosses as the canonical base-10 decimal string.
+            let amount: String = dict
+                .get_item("payment_amount")
+                .unwrap()
+                .unwrap()
+                .extract()
+                .unwrap();
+            assert_eq!(amount, u64::MAX.to_string());
+
+            let adapter: String = dict
+                .get_item("payment_adapter")
+                .unwrap()
+                .unwrap()
+                .extract()
+                .unwrap();
+            assert_eq!(adapter, "lightning");
+
+            // 32-byte receipt id surfaces hex-encoded (64 hex chars).
+            let receipt: String = dict
+                .get_item("payment_receipt_id")
+                .unwrap()
+                .unwrap()
+                .extract()
+                .unwrap();
+            assert_eq!(receipt, "ab".repeat(32));
+
+            // Discovery method mirrors the tagged wire shape.
+            let dm = dict.get_item("discovery_method").unwrap().unwrap();
+            let dm_dict = dm.downcast::<PyDict>().unwrap();
+            let shared: String = dm_dict
+                .get_item("SharedContext")
+                .unwrap()
+                .unwrap()
+                .extract()
+                .unwrap();
+            assert_eq!(shared, "ctx-shared");
+        });
+    }
+
+    #[test]
+    fn provenance_to_dict_none_payment_is_null() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let prov = DataProvenance {
+                source_context: "ctx-src".to_string(),
+                source_type: SourceType::Persistent,
+                counterparties: vec![],
+                purpose: None,
+                discovery_method: DiscoveryMethod::OutOfBand,
+                age: std::time::Duration::from_secs(0),
+                memory_scope: MemoryScope::Full,
+                chain_depth: 0,
+                chain_path: None,
+                payment_amount: None,
+                payment_adapter: None,
+                payment_receipt_id: None,
+            };
+
+            let dict = provenance_to_dict(py, &prov).unwrap();
+
+            // Absent payment surfaces as Python None for every field.
+            assert!(dict.get_item("payment_amount").unwrap().unwrap().is_none());
+            assert!(dict.get_item("payment_adapter").unwrap().unwrap().is_none());
+            assert!(
+                dict.get_item("payment_receipt_id")
+                    .unwrap()
+                    .unwrap()
+                    .is_none()
+            );
+
+            // Unit discovery variant surfaces as the bare string.
+            let dm: String = dict
+                .get_item("discovery_method")
+                .unwrap()
+                .unwrap()
+                .extract()
+                .unwrap();
+            assert_eq!(dm, "OutOfBand");
+        });
     }
 
     #[test]
