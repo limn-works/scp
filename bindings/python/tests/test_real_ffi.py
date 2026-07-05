@@ -928,6 +928,17 @@ class TestProvenance:
             None,
         )
         assert isinstance(result, dict)
+        # The dict surfaces every DataProvenance field, matching the NAPI/UniFFI
+        # bridges (parity with the canonical provenance record).
+        assert result["source_context"] == "source-ctx"
+        assert result["chain_depth"] == 0
+        # Discovery method mirrors the tagged wire shape; default is OutOfBand.
+        assert result["discovery_method"] == "OutOfBand"
+        # Economic provenance (§24.3.4, §19.6): present, null on this path since
+        # attach never mints a payment. ADR-060: amount is a decimal string.
+        assert result["payment_amount"] is None
+        assert result["payment_adapter"] is None
+        assert result["payment_receipt_id"] is None
 
     async def test_chain_depth(self, scp: SCP):
         # ADR-048 §1: pure helper now exposed as a module-level free fn.

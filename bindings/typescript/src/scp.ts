@@ -41,6 +41,7 @@ import { ContextError, mapBridgeError, mapSagaError, ValidationError } from "./e
 import type { Identity } from "./identity";
 import { toCapabilityValidation } from "./internal/bridge";
 import { loadNativeAddon, type NativeAddon as RawNativeAddon } from "./internal/native";
+import { decodeProvenanceRecord, type ProvenanceRecord } from "./provenance";
 import type { Node, Relay } from "./server";
 import type {
   AttestationType,
@@ -3175,8 +3176,8 @@ export class SCP {
     discoveryMethod?: string,
     purpose?: string,
     counterpartyPolicy?: string,
-  ): string {
-    return (
+  ): ProvenanceRecord {
+    const raw = (
       this.#native.provenanceAttach as (
         sc: string,
         st: string,
@@ -3201,6 +3202,9 @@ export class SCP {
       purpose,
       counterpartyPolicy,
     );
+    // The native bridge returns the raw snake_case JSON wire string; decode it
+    // into the SDK's typed camelCase surface (ADR-060 `paymentAmount` bigint).
+    return decodeProvenanceRecord(raw);
   }
 
   provenanceCheckChainDepth(chainDepth: number, maxDepth?: number): boolean {
