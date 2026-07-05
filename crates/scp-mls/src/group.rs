@@ -783,23 +783,42 @@ pub fn generate_key_package_with_wrapping_key(
 /// Generates a `KeyPackage` for joining an SCP **context** group (one whose
 /// `group_context` carries the `scp_context_params` extension, `0xFF02`).
 ///
-/// The generated `KeyPackage`'s `LeafNode` declares support for **both** SCP
-/// extension types (`0xFF01` + `0xFF02`) via
-/// [`scp_capabilities_with_context_params`](crate::context_extension::scp_capabilities_with_context_params)
-/// and carries the `scp_wrapping_key` (`0xFF01`) `LeafNode` extension with the
-/// participant's wrapping public key.
+/// The generated `KeyPackage`'s `LeafNode` **unconditionally** declares support
+/// for **both** SCP extension types (`0xFF01` + `0xFF02`) via
+/// [`scp_capabilities_with_context_params`](crate::context_extension::scp_capabilities_with_context_params).
+/// It carries the `scp_wrapping_key` (`0xFF01`) `LeafNode` extension with the
+/// participant's wrapping public key **only when `wrapping_pubkey` is `Some`**.
 ///
 /// The `0xFF02` capability declaration is **required** to join a context group:
 /// `OpenMLS` rejects an Add proposal (RFC 9420 §12.1.8.2, `valn0502`) unless the
 /// joiner's leaf supports every extension present in the group's `group_context`
 /// — including the `scp_context_params` extension. A `KeyPackage` produced by
-/// [`generate_key_package_with_wrapping_key`] (which declares only `0xFF01`)
-/// therefore cannot be added to a context group; use this function instead.
+/// [`generate_key_package_with_wrapping_key`] (which declares only `0xFF01`, or
+/// nothing at all when no key is given) therefore cannot be added to a context
+/// group; use this function instead for **any** `KeyPackage` destined for an
+/// encrypted (`0xFF02`) context.
+///
+/// # Capability vs. leaf extension
+///
+/// The `0xFF02` *capability* — a support declaration in the leaf's
+/// [`Capabilities`] — is what `valn0502` checks, and it requires **no** key
+/// material. The `0xFF01` *leaf extension* — the actual 32-byte wrapping public
+/// key — is a separate, optional §9.16.1 enhancement that lets other members
+/// HPKE-seal sender keys to this member (`add_member` reads it from the leaf via
+/// `extract_wrapping_key`; distribution to a member with no published wrapping
+/// key is simply skipped). A member with `wrapping_pubkey == None` is therefore
+/// still fully **context-joinable** — it just receives no sender keys until it
+/// publishes a wrapping key. Declaring the `0xFF01` capability while omitting the
+/// `0xFF01` leaf extension is valid: `valn0107` only constrains the reverse
+/// (a present leaf extension must be declared in capabilities).
 ///
 /// # Arguments
 ///
 /// * `credential` - The participant's SCP credential (DID + optional UCAN).
-/// * `wrapping_pubkey` - The participant's 32-byte X25519 wrapping public key.
+/// * `wrapping_pubkey` - The participant's 32-byte X25519 wrapping public key,
+///   or `None` when the identity has not published one. In both cases the KP is
+///   context-joinable (declares `0xFF02`); the leaf wrapping-key extension is
+///   attached only in the `Some` case.
 ///
 /// # Errors
 ///
@@ -810,15 +829,24 @@ pub fn generate_key_package_with_wrapping_key(
 /// See spec §5.13.3, §9.16.1.
 pub fn generate_key_package_with_context_params(
     credential: &ScpCredential,
-    wrapping_pubkey: &[u8; 32],
+    wrapping_pubkey: Option<&[u8; 32]>,
 ) -> Result<(KeyPackageBundle, SignatureKeyPair, InMemoryMlsProvider), MlsError> {
+    // Always declare BOTH 0xFF01 + 0xFF02 capabilities: this KP is
+    // context-joinable by construction, satisfying valn0502 regardless of
+    // whether a wrapping key is available.
     let capabilities = crate::context_extension::scp_capabilities_with_context_params();
-    let ext = crate::wrapping_extension::make_wrapping_key_extension(wrapping_pubkey);
-    let leaf_extensions = Extensions::<LeafNode>::single(ext).map_err(|e| {
-        MlsError::KeyPackageGenerationFailed(format!("wrapping key extension: {e}"))
-    })?;
+    // Carry the 0xFF01 wrapping-key LEAF extension only when a key is present.
+    let leaf_extensions = match wrapping_pubkey {
+        Some(pubkey) => {
+            let ext = crate::wrapping_extension::make_wrapping_key_extension(pubkey);
+            Some(Extensions::<LeafNode>::single(ext).map_err(|e| {
+                MlsError::KeyPackageGenerationFailed(format!("wrapping key extension: {e}"))
+            })?)
+        }
+        None => None,
+    };
 
-    generate_key_package_inner(credential, Some(capabilities), Some(leaf_extensions))
+    generate_key_package_inner(credential, Some(capabilities), leaf_extensions)
 }
 
 /// Shared `KeyPackage` generation core for

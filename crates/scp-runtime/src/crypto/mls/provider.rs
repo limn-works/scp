@@ -2693,7 +2693,7 @@ impl MlsCryptoProvider {
         let wrapping_pk = **self.wrapping_public_key.load();
 
         let (kp_bundle, signer, provider) =
-            super::group::generate_key_package_with_context_params(&credential, &wrapping_pk)
+            super::group::generate_key_package_with_context_params(&credential, Some(&wrapping_pk))
                 .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
 
         let kp_bytes = kp_bundle

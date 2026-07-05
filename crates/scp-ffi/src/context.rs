@@ -1195,9 +1195,19 @@ fn resolve_future(
 /// for the DID, generates a fresh MLS key package, and returns the
 /// TLS-serialized bytes suitable for passing to
 /// `ContextManager::join_context`.
+///
+/// Uses [`generate_key_package_with_context_params`] with `None` so the leaf
+/// **declares the `0xFF02` (`scp_context_params`) capability** — mandatory to
+/// be added to an encrypted context group (`valn0502`, §5.13.3). The base
+/// `generate_key_package` (which declares no SCP capabilities) produces a KP
+/// that real MLS rejects from a context group ("the capabilities of the add
+/// proposal are insufficient for this group"). No wrapping-key leaf extension
+/// is attached: this single-process membership path retains no joiner private
+/// state, so a wrapping key here would advertise a key whose secret is
+/// discarded; sender-key distribution to such a member is correctly skipped.
 fn generate_mls_key_package_bytes(did: &str) -> Result<Vec<u8>, crate::error::ScpPyError> {
     use scp_core::crypto::mls::credential::ScpCredential;
-    use scp_core::crypto::mls::group::generate_key_package;
+    use scp_core::crypto::mls::group::generate_key_package_with_context_params;
     use tls_codec::Serialize as TlsSerializeTrait;
 
     let cred = ScpCredential::new(did.to_owned(), None, scp_identity::SigningKeyId::Active)
@@ -1207,9 +1217,10 @@ fn generate_mls_key_package_bytes(did: &str) -> Result<Vec<u8>, crate::error::Sc
             ))
         })?;
 
-    let (kp_bundle, _signer, _provider) = generate_key_package(&cred).map_err(|e| {
-        crate::error::ScpPyError::crypto(format!("MLS key package generation failed: {e}"))
-    })?;
+    let (kp_bundle, _signer, _provider) = generate_key_package_with_context_params(&cred, None)
+        .map_err(|e| {
+            crate::error::ScpPyError::crypto(format!("MLS key package generation failed: {e}"))
+        })?;
 
     kp_bundle
         .key_package()

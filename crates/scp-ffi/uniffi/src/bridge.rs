@@ -98,10 +98,17 @@ use crate::{decrement_handle_count, increment_handle_count, runtime};
 ///
 /// Mirrors the NAPI bridge's `generate_mls_key_package_bytes`: builds an
 /// [`ScpCredential`] from the joiner's DID and TLS-serializes a fresh
-/// `KeyPackage` bundle produced by `generate_key_package`. The output bytes
-/// are what `MlsCryptoProvider::validate_key_package` and
+/// `KeyPackage` bundle produced by `generate_key_package_with_context_params`.
+/// The output bytes are what `MlsCryptoProvider::validate_key_package` and
 /// `MlsCryptoProvider::add_member` require — the old `FfiBridgeCrypto` stub
 /// used to accept `None`, but real MLS rejects it.
+///
+/// Uses `None` for the wrapping key so the leaf **declares the `0xFF02`
+/// (`scp_context_params`) capability** — mandatory to be added to an encrypted
+/// context group (`valn0502`, §5.13.3) — without attaching a wrapping-key leaf
+/// extension (this single-process membership path retains no joiner private
+/// state). The base `generate_key_package` declares no SCP capabilities and
+/// real MLS rejects it from a context group.
 ///
 /// # Errors
 ///
@@ -109,7 +116,7 @@ use crate::{decrement_handle_count, increment_handle_count, runtime};
 /// `did:dht:z…`), key package generation fails, or TLS serialization fails.
 fn generate_mls_key_package_bytes(did: &str) -> Result<Vec<u8>, ScpError> {
     use scp_core::crypto::mls::credential::ScpCredential;
-    use scp_core::crypto::mls::group::generate_key_package;
+    use scp_core::crypto::mls::group::generate_key_package_with_context_params;
     use tls_codec::Serialize as TlsSerializeTrait;
 
     let cred = ScpCredential::new(did.to_owned(), None, scp_identity::SigningKeyId::Active)
@@ -118,8 +125,8 @@ fn generate_mls_key_package_bytes(did: &str) -> Result<Vec<u8>, ScpError> {
             code: codes::CRYPTO_4010.to_owned(),
         })?;
 
-    let (kp_bundle, _signer, _provider) =
-        generate_key_package(&cred).map_err(|e| ScpError::Crypto {
+    let (kp_bundle, _signer, _provider) = generate_key_package_with_context_params(&cred, None)
+        .map_err(|e| ScpError::Crypto {
             msg: format!("MLS key package generation failed: {e}"),
             code: codes::CRYPTO_4011.to_owned(),
         })?;

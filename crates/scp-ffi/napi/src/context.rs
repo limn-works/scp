@@ -40,6 +40,13 @@ use crate::{decrement_handle_count, increment_handle_count};
 /// and TLS-serializes it to bytes suitable for
 /// `ContextCryptoProvider::validate_key_package` and `add_member`.
 ///
+/// Uses `generate_key_package_with_context_params` with `None` so the leaf
+/// **declares the `0xFF02` (`scp_context_params`) capability** — mandatory to
+/// be added to an encrypted context group (`valn0502`, §5.13.3). The base
+/// `generate_key_package` declares no SCP capabilities and real MLS rejects it
+/// from a context group. No wrapping-key leaf extension is attached (this
+/// single-process membership path retains no joiner private state).
+///
 /// # Errors
 ///
 /// Returns `ScpNapiError::Crypto` if the DID format is invalid (must be
@@ -47,7 +54,7 @@ use crate::{decrement_handle_count, increment_handle_count};
 /// fails.
 fn generate_mls_key_package_bytes(did: &str) -> Result<Vec<u8>, ScpNapiError> {
     use scp_core::crypto::mls::credential::ScpCredential;
-    use scp_core::crypto::mls::group::generate_key_package;
+    use scp_core::crypto::mls::group::generate_key_package_with_context_params;
     use tls_codec::Serialize as TlsSerializeTrait;
 
     let cred = ScpCredential::new(did.to_owned(), None, scp_identity::SigningKeyId::Active)
@@ -56,8 +63,8 @@ fn generate_mls_key_package_bytes(did: &str) -> Result<Vec<u8>, ScpNapiError> {
             code: codes::CRYPTO_4010.to_owned(),
         })?;
 
-    let (kp_bundle, _signer, _provider) =
-        generate_key_package(&cred).map_err(|e| ScpNapiError::Crypto {
+    let (kp_bundle, _signer, _provider) = generate_key_package_with_context_params(&cred, None)
+        .map_err(|e| ScpNapiError::Crypto {
             message: format!("MLS key package generation failed: {e}"),
             code: codes::CRYPTO_4011.to_owned(),
         })?;

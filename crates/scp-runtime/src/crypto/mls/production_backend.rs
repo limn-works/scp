@@ -476,24 +476,23 @@ impl MlsBackend for ProductionMlsBackend {
         // whose `group_context` carries the `scp_context_params` (`0xFF02`)
         // extension. OpenMLS rejects (`valn0502`, RFC 9420 §12.1.8.2) an Add
         // whose leaf does not declare support for every `group_context`
-        // extension present in the group — so the KP leaf MUST advertise BOTH
-        // `0xFF01` (wrapping) and `0xFF02` (context params).
-        // `generate_key_package_with_context_params` declares both and carries
-        // the `0xFF01` wrapping-key leaf extension; it therefore requires a
-        // wrapping key.
+        // extension present in the group — so the KP leaf MUST advertise the
+        // `0xFF02` capability regardless of whether a wrapping key is available.
         //
-        // When no wrapping key is available (`None`), the identity has no
-        // published wrapping key (§9.16.1) and so cannot receive sender keys —
-        // such a KP is inherently non-participating and is NOT context-joinable
-        // (it cannot declare `0xFF02` without also carrying the coupled `0xFF01`
-        // leaf via the current scp-mls API). Fall back to the wrapping-key path.
-        // In production the KeyPackageStoreActor sources the wrapping key from
-        // the identity's published wrapping key, so a context-participating
-        // identity always takes the `Some` branch.
-        let (bundle, signer, provider) = match wrapping_pubkey {
-            Some(pk) => group::generate_key_package_with_context_params(credential, pk)?,
-            None => group::generate_key_package_with_wrapping_key(credential, None)?,
-        };
+        // `generate_key_package_with_context_params` declares BOTH `0xFF01` +
+        // `0xFF02` *capabilities* unconditionally, and attaches the `0xFF01`
+        // wrapping-key *leaf extension* only when a key is present (§9.16.1).
+        // The capability is what `valn0502` requires (no key material); the
+        // leaf extension is the optional enhancement that lets other members
+        // HPKE-seal sender keys to this member. Passing `wrapping_pubkey`
+        // straight through therefore yields a context-joinable KP in BOTH
+        // cases: `Some` → full participant (declares `0xFF02`, carries the
+        // wrapping key); `None` → context-joinable but non-receiving until the
+        // identity publishes a wrapping key. A `None` KP is NOT downgraded to a
+        // wrapping-only (`0xFF01`-only) KeyPackage, which real MLS would reject
+        // from a context group.
+        let (bundle, signer, provider) =
+            group::generate_key_package_with_context_params(credential, wrapping_pubkey)?;
 
         let kp_bytes = bundle.key_package().tls_serialize_detached().map_err(|e| {
             MlsError::KeyPackageGenerationFailed(format!("serializing key package: {e}"))
@@ -1133,14 +1132,25 @@ mod tests {
         );
     }
 
-    /// The documented `None`-branch fallback: a production KP generated WITHOUT
-    /// a wrapping key declares only what the wrapping-key path can and is NOT
-    /// context-joinable — a context group rejects it (`valn0502`), matching the
-    /// non-participating identity it represents (§9.16.1). This pins that the
-    /// `None` branch does not silently produce a `0xFF02`-declaring KP.
+    /// The `None`-branch (no wrapping key) production KP is STILL
+    /// context-joinable: it declares the `0xFF02` (`scp_context_params`)
+    /// capability — required by `valn0502` — even though it carries no `0xFF01`
+    /// wrapping-key leaf extension. This is the load-bearing invariant for the
+    /// production reserve path, whose supervisor `wrapping_keys` map has no
+    /// production writer yet (§9.16.1 wrapping-key publication is unwired), so
+    /// every reserved KP is generated with `wrapping_pubkey == None`. Were the
+    /// `None` branch to downgrade to a wrapping-only (`0xFF01`-only) KP, real
+    /// MLS would reject the Add ("the capabilities of the add proposal are
+    /// insufficient for this group") and NO node could ever join an encrypted
+    /// context via the reserve path.
+    ///
+    /// The joiner completes the Welcome round-trip and reads the
+    /// creator-committed context extension byte-identically. Sender-key
+    /// distribution to this member is separately (and correctly) skipped
+    /// because the leaf carries no wrapping key — but MLS membership succeeds.
     #[tokio::test]
-    async fn production_key_package_without_wrapping_key_rejected_by_context_group() {
-        let backend = ProductionMlsBackend::new();
+    async fn production_key_package_without_wrapping_key_joins_context_group() {
+        let backend = joinable_backend();
 
         let alice_cred = test_credential("alice-ctx-neg");
         let alice_wrap = [0xA3u8; 32];
@@ -1148,15 +1158,36 @@ mod tests {
         let mut alice_group =
             group::create_group_with_context(&alice_cred, &alice_wrap, &ctx_ext).unwrap();
 
+        // Reserve-path KP: generated WITHOUT a wrapping key (the production
+        // reserve path today, since supervisor `wrapping_keys` is unwired).
         let bob_cred = test_credential("bob-ctx-neg");
         let bob_gen = backend.generate_key_package(&bob_cred, None).await.unwrap();
 
-        let result = backend
+        // The Add SUCCEEDS: bob's leaf declares 0xFF02 (capability, no key
+        // material required), satisfying valn0502 for the context group.
+        let added = backend
             .add_member_raw(&mut alice_group, &bob_gen.key_package_bytes)
-            .await;
-        assert!(
-            matches!(result, Err(MlsError::AddMemberFailed(_))),
-            "a wrapping-key-less production KP must be rejected by a context group, got {result:?}"
+            .await
+            .expect(
+                "a wrapping-key-less production KP MUST still be context-joinable \
+                 (declares 0xFF02 capability)",
+            );
+
+        // And bob joins from the Welcome, recovering the creator-committed
+        // context extension byte-identically.
+        let bob_group = backend
+            .join_from_welcome(
+                &added.welcome,
+                bob_gen.signer_state.clone(),
+                &bob_gen.key_package_bytes,
+            )
+            .await
+            .expect("wrapping-key-less joiner processes the Welcome for the context group");
+
+        assert_eq!(
+            bob_group.group_context_extension().unwrap(),
+            Some(ctx_ext),
+            "wrapping-key-less joiner reads the creator-committed context extension",
         );
     }
 }
