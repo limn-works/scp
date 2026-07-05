@@ -428,6 +428,35 @@ checkpoint.event_count == 9
 
 Reference implementation and assertions: `crates/scp-event-log/tests/test_vectors.rs` (`vector_32_typed_leaf_and_checkpoint_kat`, `vector_33_checkpoint_root_equals_tree_root_kat`). Regenerate with `cargo test -p scp-event-log --test test_vectors -- --nocapture`.
 
+### Vector 35: `DataProvenance` -> `provenance_hash` KAT (§24.3.3)
+
+Pins the canonical provenance-hash encoding — `SHA-256(rmp_serde::to_vec(DataProvenance))`, positional MessagePack in struct-declaration field order (§24.3.3). This is the single encoding used by the signed BroadcastEnvelope `provenance_hash` (§5.14.5), the inner-envelope provenance hash, and the FFI event-log `ProvenanceAttached` / `ProvenanceReceived` payloads — so this hash is identical whether computed on a signed path or recorded in an event log.
+
+```
+DataProvenance (all fields populated; field order per §24.2.1):
+  source_context:     "ctx-kat-provenance"
+  source_type:        Persistent
+  counterparties:     ["did:key:alice", "did:key:bob"]
+  purpose:            Some("kat")
+  discovery_method:   SharedContext("ctx-shared")
+  age:                300 s
+  memory_scope:       Full
+  chain_depth:        1
+  chain_path:         Some(["ctx-hop-1"])
+  payment_amount:     Some(1000)
+  payment_adapter:    Some("stripe")
+  payment_receipt_id: Some([0x11; 32])
+
+provenance_hash = SHA-256(rmp_serde::to_vec(DataProvenance))
+  = 0x12ea6cf53e3e2fe1c851214d6c9b1acf1338e835bcb91271c8bcdf04e553ce68
+
+Absent-provenance sentinel (ADR-002):
+  provenance_hash = SHA-256(0x00)
+  = 0x6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d
+```
+
+Reference implementation and assertions: `crates/scp-protocol/src/crypto/sender_keys/broadcast.rs` (`vector_35_data_provenance_hash_kat`). Regenerate with `cargo test -p scp-protocol vector_35_data_provenance_hash_kat -- --nocapture`.
+
 ## 25.9 Key Continuity Fingerprint Vectors (§9.11)
 
 Domain: `"SCP-KEY-CONTINUITY-V1:"`

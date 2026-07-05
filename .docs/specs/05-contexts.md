@@ -1523,7 +1523,7 @@ Ed25519_sign(active_signing_key_or_agent_signing_key, SHA-256(
 ```
 
 Where:
-- `provenance_hash = SHA256(serialize(provenance))` if present, or `SHA256(0x00)` if absent (same sentinel as InnerEnvelope, ADR-002).
+- `provenance_hash = SHA-256(serialize(provenance))` if present, or `SHA-256(0x00)` if absent (same sentinel as InnerEnvelope, ADR-002). `serialize` is the canonical provenance encoding defined in §24.3.3: positional MessagePack (`rmp_serde::to_vec`) over the `DataProvenance` struct in declaration field order. This is the same encoding used for the event-log provenance-hash leaves, so the value is identical whether computed on the signed broadcast path or the event-log path.
 - Variable-length fields (`context_id`, `author_did`) are 4-byte big-endian length-prefixed.
 - `version` is 2 bytes big-endian.
 - `sequence`, `key_epoch`, `timestamp` are 8 bytes big-endian.

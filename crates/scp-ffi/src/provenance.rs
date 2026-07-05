@@ -281,13 +281,17 @@ impl crate::scp::PyScp {
             None,
         );
 
-        // Compute provenance hash: SHA-256 of JSON-serialized provenance record.
-        let prov_json_bytes =
-            serde_json::to_vec(&prov).map_err(|e| ScpPyError::ValidationError {
-                message: format!("failed to serialize provenance for hashing: {e}"),
-                code: codes::VALID_7053.to_string(),
-            })?;
-        let prov_hash: [u8; 32] = Sha256::digest(&prov_json_bytes).into();
+        // Compute provenance hash: SHA-256 of the MessagePack-serialized
+        // provenance record (§24.3.3). Uses the same `rmp_serde::to_vec`
+        // encoding as the signed broadcast path
+        // (`scp_protocol::crypto::sender_keys::broadcast::compute_provenance_hash`)
+        // and the event-log leaf, so the logged hash matches the signed-path
+        // hash for identical input.
+        let prov_bytes = rmp_serde::to_vec(&prov).map_err(|e| ScpPyError::ValidationError {
+            message: format!("failed to serialize provenance for hashing: {e}"),
+            code: codes::VALID_7053.to_string(),
+        })?;
+        let prov_hash: [u8; 32] = Sha256::digest(&prov_bytes).into();
 
         // Record ProvenanceAttached in the source context event log.
         // Best-effort: log warning if context not found (provenance_attach

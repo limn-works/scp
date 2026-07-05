@@ -467,18 +467,26 @@ pub const fn validate_inner_version(
 /// Computes `SHA-256(serialize(provenance))` if present, or `SHA-256(0x00)` if
 /// absent. Returns a fixed-size 32-byte array (SHA-256 output).
 ///
-/// **Serialization format**: This function uses `MessagePack` (`rmp_serde::to_vec`)
-/// because it operates on the inner envelope path where the hash is covered by
-/// the `Ed25519` signature and verified within a single MLS group — no
-/// cross-implementation parity is needed.
+/// **Serialization format**: This function serializes `provenance` with
+/// `MessagePack` (`rmp_serde::to_vec`), producing the positional (array-encoded)
+/// `MessagePack` form in struct-declaration field order, then hashes the bytes
+/// with SHA-256.
 ///
-/// **This is NOT the same as FFI bridge provenance hashing.** The FFI bridges
-/// (`PyO3`, NAPI, `UniFFI`) use `serde_json::to_vec` (canonical JSON) for
-/// provenance hashing because that hash crosses implementation boundaries
-/// (Rust ↔ Python ↔ TypeScript ↔ Swift ↔ Kotlin). The protocol rule is:
-/// **cross-implementation canonical hashing uses JSON (RFC 8785); `MessagePack`
-/// is for wire format only.** See `.docs/specs/05-contexts.md` §5.14 and
-/// `.docs/specs/25-test-vectors.md`.
+/// **Encoding is uniform across every provenance-hash site.** The same
+/// `SHA-256(rmp_serde::to_vec(..))` construction is used by the signed broadcast
+/// path ([`crate::crypto::sender_keys::broadcast::compute_provenance_hash`], over
+/// [`crate::provenance::DataProvenance`]), by this inner-envelope path (over the
+/// local [`Provenance`] struct), and by the FFI event-log provenance-hash sites
+/// that emit `ProvenanceAttached` / `ProvenanceReceived` (over `DataProvenance`).
+/// For a given struct value the resulting hash is therefore identical across
+/// these sites — the inner and broadcast/FFI sites operate on different structs
+/// (`Provenance` vs `DataProvenance`) but share the one encoding rule. That rule
+/// also matches the event-log leaf encoding, which serializes the wrapping
+/// `Event` with `rmp_serde::to_vec` (`scp-event-log`
+/// `tree::serialize_event_for_hashing`). No JSON is used on any provenance-hash
+/// path. See `.docs/specs/24-provenance-system.md` §24.3.3 for the normative
+/// rule and `.docs/specs/25-test-vectors.md` Vector 35 for the `DataProvenance`
+/// KAT.
 ///
 /// # Errors
 ///
