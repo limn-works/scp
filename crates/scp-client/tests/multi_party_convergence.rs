@@ -43,7 +43,8 @@ fn client_for(did: &str, now_secs: u64) -> ScpClient {
     let signer = Arc::new(LocalSigner::active(did));
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
     let clock: Arc<dyn Clock> = Arc::new(TestClock::new(now_secs));
-    ScpClient::new(signer, storage, clock)
+    // A fresh store restores nothing, so construction cannot fail here.
+    ScpClient::new(signer, storage, clock).expect("construct fresh client")
 }
 
 /// Hands every pair of clients the other's sender key, out-of-band (the MISSING

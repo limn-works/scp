@@ -37,6 +37,13 @@ scp-mls = { path = "../scp-mls", version = "=0.1.0-beta.2" }
 openmls = { workspace = true, features = ["libcrux-provider", "js"] }
 tls_codec = "0.4"
 
+# MessagePack is the codebase's name-tagged, width-/endianness-independent wire
+# form (ADR-057, §17.5). The driver serializes each context's participant
+# snapshot with it for out-of-band persistence through the `Storage` trait, so a
+# native and a wasm32 build round-trip byte-compatibly.
+serde = { workspace = true }
+rmp-serde = { workspace = true }
+zeroize = { workspace = true }
 thiserror = { workspace = true }
 
 # wasm32 backends: mirror scp-mls/Cargo.toml so the driver compiles to wasm32.

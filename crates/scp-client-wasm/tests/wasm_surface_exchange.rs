@@ -56,7 +56,8 @@ fn client_for(did: &str, now_secs: u64) -> WasmScpClient {
     let signer: Arc<dyn Signer> = Arc::new(LocalSigner::active(did));
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
     let clock: Arc<dyn Clock> = Arc::new(TestClock::new(now_secs));
-    WasmScpClient::from_parts(signer, storage, clock)
+    // A fresh store restores nothing, so construction cannot fail here.
+    WasmScpClient::from_parts(signer, storage, clock).expect("construct fresh surface client")
 }
 
 /// Performs the out-of-band §9.16 sender-key handoff through the exposed
@@ -238,6 +239,131 @@ fn two_party_exchange_through_wasm_surface() {
     );
 }
 
+/// Builds a `WasmScpClient` over a caller-supplied (shared) storage handle. When
+/// the storage already holds this identity's snapshots, the CONSTRUCTOR restores
+/// them (ADR-057 T2) — a reopened tab resumes with no explicit "load" call.
+fn client_over(did: &str, storage: Arc<dyn Storage>, now_secs: u64) -> WasmScpClient {
+    let signer: Arc<dyn Signer> = Arc::new(LocalSigner::active(did));
+    let clock: Arc<dyn Clock> = Arc::new(TestClock::new(now_secs));
+    WasmScpClient::from_parts(signer, storage, clock).expect("construct/restore surface client")
+}
+
+#[test]
+fn restore_through_wasm_surface() {
+    // Alice creates + adds Bob; Bob joins — all through the exposed surface.
+    // Bob's storage is shared so a reopened-tab client can restore from it.
+    let alice_storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+    let bob_storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+
+    let mut alice = client_over(ALICE_DID, alice_storage, 1_700_000_000);
+    let mut bob = client_over(BOB_DID, Arc::clone(&bob_storage), 1_650_000_000);
+
+    alice.create_context(CTX.to_owned()).expect("alice creates");
+    let bob_kp = bob
+        .generate_key_package_for_join(CTX.to_owned())
+        .expect("bob key package");
+    let add = alice
+        .add_member(CTX.to_owned(), bob_kp)
+        .expect("alice adds bob");
+    bob.join_context_encrypted(
+        CTX.to_owned(),
+        add.welcome(),
+        add.event_log(),
+        add.members(),
+    )
+    .expect("bob joins");
+    exchange_sender_keys(&mut alice, &mut bob);
+
+    let expected_root = bob.event_log_root(CTX.to_owned());
+    drop(bob); // The tab closes.
+
+    // The reopened tab: a fresh surface client over Bob's identity + storage. The
+    // constructor restores the converged context from the shared store.
+    let mut bob2 = client_over(BOB_DID, Arc::clone(&bob_storage), 1_650_000_050);
+    assert_eq!(
+        bob2.member_dids(CTX.to_owned()).map(|mut m| {
+            m.sort();
+            m
+        }),
+        Some(vec![ALICE_DID.to_owned(), BOB_DID.to_owned()]),
+        "the converged context was restored on construction"
+    );
+    assert_eq!(
+        bob2.event_log_root(CTX.to_owned()),
+        expected_root,
+        "restored root matches through the surface"
+    );
+
+    // The restored surface client decrypts a message Alice sends post-restore.
+    let send = alice
+        .send_message(CTX.to_owned(), b"after restore".to_vec())
+        .expect("alice sends");
+    let was_app = bob2
+        .receive_message(
+            CTX.to_owned(),
+            send.ciphertext(),
+            send.committer_timestamp_secs(),
+        )
+        .expect("bob2 receives");
+    assert!(was_app);
+    let events = bob2.drain_events(CTX.to_owned()).expect("bob2 drains");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].payload(), b"after restore");
+}
+
+#[test]
+fn context_ids_lists_contexts_through_the_surface() {
+    // The surface exposes `contextIds` so a reopened tab can enumerate the
+    // conversations the constructor restored. Here we assert it over live contexts
+    // created through the surface (sorted).
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+    {
+        let mut c = client_over(ALICE_DID, Arc::clone(&storage), 1_700_000_000);
+        c.create_context("ctx-surface-b".to_owned())
+            .expect("create b");
+        c.create_context("ctx-surface-a".to_owned())
+            .expect("create a");
+        assert_eq!(
+            c.context_ids(),
+            vec!["ctx-surface-a".to_owned(), "ctx-surface-b".to_owned()],
+            "the surface lists contexts sorted"
+        );
+    }
+    // A reopened surface client over the same storage restores + lists both.
+    let c2 = client_over(ALICE_DID, Arc::clone(&storage), 1_700_000_050);
+    assert_eq!(
+        c2.context_ids(),
+        vec!["ctx-surface-a".to_owned(), "ctx-surface-b".to_owned()],
+        "the reopened surface client lists both restored contexts"
+    );
+}
+
+#[test]
+fn context_status_reports_live_and_absent_through_the_surface() {
+    // The surface exposes `contextStatus` as a lowercase string ("live"/"poisoned"
+    // /"absent") so a caller can distinguish a held context from an absent one
+    // without the `Option` observers' poisoned/absent ambiguity.
+    let mut c = client_for(ALICE_DID, 1_700_000_000);
+
+    // Absent before creation.
+    assert_eq!(c.context_status("ctx-never-existed".to_owned()), "absent");
+
+    // Live after creation.
+    c.create_context(CTX.to_owned()).expect("create");
+    assert_eq!(c.context_status(CTX.to_owned()), "live");
+
+    // Absent again after close.
+    c.close_context(CTX.to_owned()).expect("close");
+    assert_eq!(c.context_status(CTX.to_owned()), "absent");
+
+    // The "poisoned" status is unreachable through the wasm surface on the native
+    // host: poisoning requires a mutating op whose persist fails, and that op
+    // returns `Err(JsValue)`, which aborts off-wasm before returning (the same
+    // native-host limitation documented for error-path coverage below). The full
+    // three-state mapping is asserted directly against the driver in `scp-client`'s
+    // `context_status_reports_live_poisoned_and_absent`.
+}
+
 // NOTE on error-path coverage: a `#[wasm_bindgen]` method that returns
 // `Err(JsValue)` cannot be exercised on the native host — constructing the
 // `JsValue` aborts (wasm-bindgen imported calls cannot run off-wasm), before any
@@ -250,3 +376,65 @@ fn two_party_exchange_through_wasm_surface() {
 //     `JsValue` carries that prefix and the message.
 // This native-host limitation is a real property of testing a wasm-bindgen
 // surface off-target, reported in the slice write-up.
+
+// wasm-target tests: exercises the real `JsStorage` extern against a JS
+// `Map`-backed store — the synchronous-facade shape a browser SDK injects
+// (ADR-057 T2, `storage.rs` module docs). Runs only under a wasm test runner (no
+// `wasm-bindgen-test-runner` is wired here — see the module header — so these are
+// compiled by the `wasm32` build gate and run when a runner is present).
+#[cfg(all(test, target_arch = "wasm32"))]
+mod wasm_tests {
+    use scp_client::Storage;
+    use scp_client_wasm::storage::{JsStorage, JsStorageAdapter};
+    use wasm_bindgen::prelude::*;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    // A synchronous, in-memory `Map`-backed store implementing the `JsStorage`
+    // contract (`get`/`set`/`delete`/`listKeys`) — the shape the TypeScript SDK's
+    // IndexedDB mirror satisfies.
+    #[wasm_bindgen(inline_js = "export function makeMapStore() { \
+        const m = new Map(); \
+        return { \
+            get(k) { return m.has(k) ? m.get(k) : undefined; }, \
+            set(k, v) { m.set(k, v); }, \
+            delete(k) { m.delete(k); }, \
+            listKeys(prefix) { const out = []; for (const k of m.keys()) { if (k.startsWith(prefix)) out.push(k); } return out; } \
+        }; \
+    }")]
+    extern "C" {
+        #[wasm_bindgen(js_name = "makeMapStore")]
+        fn make_map_store() -> JsStorage;
+    }
+
+    #[wasm_bindgen_test]
+    fn map_backed_js_store_round_trips_through_the_adapter() {
+        let store = JsStorageAdapter::new(make_map_store());
+
+        // Absent key → Ok(None), not an error.
+        assert_eq!(store.get("scp-client/ctx/a").unwrap(), None);
+
+        store.put("scp-client/ctx/a", vec![1, 2, 3]).unwrap();
+        store.put("scp-client/ctx/b", vec![4]).unwrap();
+        store.put("scp-client/pending/a", vec![9]).unwrap();
+
+        // Values round-trip byte-for-byte.
+        assert_eq!(store.get("scp-client/ctx/a").unwrap(), Some(vec![1, 2, 3]));
+
+        // Prefix enumeration returns exactly the matching keys (the restore path).
+        let mut ctx_keys = store.list_keys("scp-client/ctx/").unwrap();
+        ctx_keys.sort();
+        assert_eq!(
+            ctx_keys,
+            vec!["scp-client/ctx/a".to_owned(), "scp-client/ctx/b".to_owned()]
+        );
+        assert_eq!(
+            store.list_keys("scp-client/pending/").unwrap(),
+            vec!["scp-client/pending/a".to_owned()]
+        );
+
+        // Delete removes exactly one key.
+        store.delete("scp-client/ctx/a").unwrap();
+        assert_eq!(store.get("scp-client/ctx/a").unwrap(), None);
+        assert_eq!(store.list_keys("scp-client/ctx/").unwrap().len(), 1);
+    }
+}

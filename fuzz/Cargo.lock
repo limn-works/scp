@@ -2619,6 +2619,7 @@ dependencies = [
  "tls_codec",
  "tracing",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]

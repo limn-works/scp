@@ -210,6 +210,44 @@ impl std::fmt::Debug for MlsCryptoSnapshot {
     }
 }
 
+impl MlsCryptoSnapshot {
+    /// Zeroizes every field that holds private key material.
+    ///
+    /// [`export_crypto_state`](Self::export_crypto_state) calls this once at its
+    /// end (belt-and-suspenders) after serializing the snapshot.
+    /// [`restore_crypto_state`](Self::restore_crypto_state) does NOT call it:
+    /// restore consumes each secret field incrementally as it moves the material
+    /// into the live crypto state (`drain`/`mem::replace`/per-field `zeroize` at
+    /// the point of use), so there is no single end-of-function sweep to make. On
+    /// both paths the [`Drop`] impl below is the backstop that also fires on an
+    /// early `?` return, so raw signer / sender-key / wrapping-secret / MLS-secret
+    /// bytes never linger un-zeroized in freed memory on ANY path (matches the
+    /// parity guarantee the `scp-mls` and `scp-client` snapshots make via their
+    /// own `Drop`s).
+    fn zeroize_secrets(&mut self) {
+        self.signer_bytes.zeroize();
+        self.local_sender_key.zeroize();
+        self.wrapping_secret_key.zeroize();
+        for (_, value) in &mut self.mls_storage_entries {
+            value.zeroize();
+        }
+        for (_, key) in &mut self.sender_key_entries {
+            key.zeroize();
+        }
+    }
+}
+
+// SECURITY: zeroize key material on every drop path — including an early `?`
+// return between deserialization and the explicit trailing `zeroize` calls — so
+// private material never lingers in freed memory. No field is ever moved out of a
+// `MlsCryptoSnapshot` (the export/restore paths drain/replace/borrow in place), so
+// this `Drop` does not conflict with a partial move.
+impl Drop for MlsCryptoSnapshot {
+    fn drop(&mut self) {
+        self.zeroize_secrets();
+    }
+}
+
 /// Per-context cryptographic state managed by [`MlsCryptoProvider`].
 struct ContextCryptoState {
     /// The `OpenMLS` group for this context (Encrypted mode only).
@@ -2140,17 +2178,11 @@ impl MlsCryptoProvider {
 
         // SECURITY: Zeroize sensitive key material in the intermediate snapshot
         // to minimize the window where private keys exist as structured data in
-        // memory. The serialized blob is the caller's responsibility (Storage
-        // layer must encrypt at rest per §17.5).
-        snapshot.signer_bytes.zeroize();
-        snapshot.local_sender_key.zeroize();
-        snapshot.wrapping_secret_key.zeroize();
-        for (_, value) in &mut snapshot.mls_storage_entries {
-            value.zeroize();
-        }
-        for (_, key) in &mut snapshot.sender_key_entries {
-            key.zeroize();
-        }
+        // memory. Delegates to the shared `zeroize_secrets` helper (single source
+        // of truth for which fields are secret; the `Drop` impl is the backstop).
+        // The serialized blob is the caller's responsibility (Storage layer must
+        // encrypt at rest per §17.5).
+        snapshot.zeroize_secrets();
 
         result
     }
