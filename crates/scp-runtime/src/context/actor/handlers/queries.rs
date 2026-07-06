@@ -55,8 +55,8 @@ use crate::context::queries_helpers;
 /// not `Sync`). The body only READS the owned state through
 /// [`Deref`](std::ops::Deref) — no [`ClassSCell::state_mut`] escape hatch
 /// (ADR-049 §9). Every helper called here takes `&PerContextState`; the
-/// only async read ([`queries_helpers::read_context_state`]) drives
-/// `handle.state()`, which is itself `&self`, so a shared borrow suffices.
+/// lifecycle-state read is the lock-free `handle.state()` atomic load,
+/// which takes `&self`, so a shared borrow suffices.
 #[allow(clippy::too_many_lines, clippy::needless_pass_by_ref_mut)]
 pub(crate) async fn dispatch(
     cell: &mut ClassSCell,
@@ -69,7 +69,7 @@ pub(crate) async fn dispatch(
             context_id: _,
             reply,
         } => {
-            let answer = queries_helpers::read_context_state(state.handle.clone()).await;
+            let answer = state.handle.state();
             let _ = reply.send(Ok(answer));
             Outcome::ok(())
         }

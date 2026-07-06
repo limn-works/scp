@@ -246,7 +246,7 @@ where
     // economy pre-check — this is intentional redundancy so direct callers
     // get the pre-budget early bail path while the manager wrapper can share
     // the helper directly without replicating the economy flow.
-    let state = context.state().await;
+    let state = context.state();
     if state != ContextState::Active {
         return Err(InvocationError::ContextNotActive {
             current_state: state.to_string(),
@@ -434,7 +434,7 @@ where
     let start = std::time::Instant::now();
 
     // 1. Validate context state is Active.
-    let state = context.state().await;
+    let state = context.state();
     if state != ContextState::Active {
         return Err(InvocationError::ContextNotActive {
             current_state: state.to_string(),
@@ -665,7 +665,7 @@ where
     let start = std::time::Instant::now();
 
     // 1-4: Validate context, capability, tool, schema (same as invoke_tool).
-    let state = context.state().await;
+    let state = context.state();
     if state != ContextState::Active {
         return Err(InvocationError::ContextNotActive {
             current_state: state.to_string(),
@@ -1280,9 +1280,9 @@ mod tests {
     }
 
     /// Creates an active context handle (transitions from Creating to Active).
-    async fn active_context() -> ContextHandle {
+    fn active_context() -> ContextHandle {
         let handle = ContextHandle::new("ctx-invoke-test".to_owned(), ContextParams::default());
-        handle.transition_to(&ContextState::Active).await.unwrap();
+        handle.transition_to(&ContextState::Active).unwrap();
         handle
     }
 
@@ -1308,7 +1308,7 @@ mod tests {
         let creator_did = "did:dht:z6MkCreator";
         let role_state = test_role_state(creator_did);
         let registry = setup_registry_with_tool(&role_state, creator_did);
-        let context = active_context().await;
+        let context = active_context();
 
         let input = serde_json::json!({"a": 3, "b": 4});
         let result = invoke_tool(
@@ -1379,7 +1379,7 @@ mod tests {
         let member_did = "did:dht:z6MkMember";
         let role_state = test_role_state_with_no_invoke_member(creator_did, member_did);
         let registry = setup_registry_with_tool(&role_state, creator_did);
-        let context = active_context().await;
+        let context = active_context();
 
         let result = invoke_tool(
             &context,
@@ -1411,7 +1411,7 @@ mod tests {
         let creator_did = "did:dht:z6MkCreator";
         let role_state = test_role_state(creator_did);
         let registry = ToolRegistry::new(); // Empty registry
-        let context = active_context().await;
+        let context = active_context();
 
         let result = invoke_tool(
             &context,
@@ -1443,7 +1443,7 @@ mod tests {
         let creator_did = "did:dht:z6MkCreator";
         let role_state = test_role_state(creator_did);
         let registry = setup_registry_with_tool(&role_state, creator_did);
-        let context = active_context().await;
+        let context = active_context();
 
         // Input schema expects an object, passing a string instead.
         let result = invoke_tool(
@@ -1476,7 +1476,7 @@ mod tests {
         let creator_did = "did:dht:z6MkCreator";
         let role_state = test_role_state(creator_did);
         let registry = setup_registry_with_tool(&role_state, creator_did);
-        let context = active_context().await;
+        let context = active_context();
 
         // Executor that sleeps for 5 seconds (will be timed out).
         let slow_executor = |_input: serde_json::Value| async {
@@ -1514,7 +1514,7 @@ mod tests {
         let creator_did = "did:dht:z6MkCreator";
         let role_state = test_role_state(creator_did);
         let registry = setup_registry_with_tool(&role_state, creator_did);
-        let context = active_context().await;
+        let context = active_context();
 
         // Executor that sleeps for 5 seconds (will be cancelled).
         let slow_executor = |_input: serde_json::Value| async {
@@ -1558,7 +1558,7 @@ mod tests {
         let creator_did = "did:dht:z6MkCreator";
         let role_state = test_role_state(creator_did);
         let registry = setup_registry_with_tool(&role_state, creator_did);
-        let context = active_context().await;
+        let context = active_context();
 
         // Executor that always fails.
         let failing_executor = |_input: serde_json::Value| async {
@@ -1596,7 +1596,7 @@ mod tests {
         let creator_did = "did:dht:z6MkCreator";
         let role_state = test_role_state(creator_did);
         let registry = setup_registry_with_tool(&role_state, creator_did);
-        let context = active_context().await;
+        let context = active_context();
 
         // Executor that returns a string instead of an object.
         let bad_output_executor = |_input: serde_json::Value| async {
@@ -1633,7 +1633,7 @@ mod tests {
         let creator_did = "did:dht:z6MkCreator";
         let role_state = test_role_state(creator_did);
         let registry = setup_registry_with_tool(&role_state, creator_did);
-        let context = active_context().await;
+        let context = active_context();
 
         let input = serde_json::json!({"a": 10, "b": 20});
 
@@ -1674,8 +1674,8 @@ mod tests {
         let registry = setup_registry_with_tool(&role_state, creator_did);
 
         let context = ContextHandle::new("ctx-closing".to_owned(), ContextParams::default());
-        context.transition_to(&ContextState::Active).await.unwrap();
-        context.transition_to(&ContextState::Closing).await.unwrap();
+        context.transition_to(&ContextState::Active).unwrap();
+        context.transition_to(&ContextState::Closing).unwrap();
 
         let result = invoke_tool(
             &context,
@@ -1755,7 +1755,7 @@ mod tests {
         let creator_did = "did:dht:z6MkCreator";
         let role_state = test_role_state(creator_did);
         let registry = setup_registry_with_tool(&role_state, creator_did);
-        let context = active_context().await;
+        let context = active_context();
 
         // Request a timeout larger than the protocol max.
         // The executor completes immediately, so the test verifies the function
@@ -1917,7 +1917,7 @@ mod tests {
 
         // Budget enforcement is now inline in economy_pre_check via invoke_tool.
         // Test it through invoke_tool with a ToolEconomyContext.
-        let context = active_context().await;
+        let context = active_context();
         let role_state = test_role_state(invoker.as_ref());
         let registry = setup_registry_with_tool(&role_state, invoker.as_ref());
         // Test fixture metrics: zeros are intentional for this budget-

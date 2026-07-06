@@ -1156,7 +1156,7 @@ async fn application_layer_demo() {
         .create_context(ctx_id.to_owned(), params, alice.clone(), None)
         .await
         .unwrap();
-    let state = handle.state().await;
+    let state = handle.state();
 
     println!("  Context created!");
     println!("    state:    {state:?}");
@@ -1583,7 +1583,7 @@ async fn application_layer_demo() {
     println!("  Proposed & auto-executed: CloseContext");
     println!("    status: {:?}", close_proposal.status);
 
-    let final_state = handle.state().await;
+    let final_state = handle.state();
     println!("  Context state: {final_state:?}");
     assert!(
         matches!(final_state, ContextState::Closing | ContextState::Closed),

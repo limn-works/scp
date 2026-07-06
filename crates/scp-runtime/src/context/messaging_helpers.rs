@@ -2512,7 +2512,6 @@ pub fn build_snapshot_from_state(
     state: &PerContextState,
 ) -> crate::context::state::ContextSnapshot {
     use crate::context::state::{GovernanceState, VelocityTrackerSnapshot};
-    use scp_protocol::context::ContextState;
 
     // ADR-049 §9 (white-hat P2): exhaustively destructure `GovernanceState` so a
     // NEW governance field forces a conscious persist decision AT COMPILE TIME.
@@ -2570,10 +2569,7 @@ pub fn build_snapshot_from_state(
         pending_epoch_resets: _pending_epoch_resets_transient,
     } = &state.governance;
 
-    let context_state_value = state
-        .handle
-        .try_read_state()
-        .unwrap_or(ContextState::Active);
+    let context_state_value = state.handle.state();
     let ttl_remaining_secs = state.ttl.timer.remaining_secs();
     let grace_entries = state.epoch.grace_store.to_grace_entries();
 
@@ -4259,7 +4255,6 @@ mod pseudonym_routing_tests {
         state
             .handle
             .transition_to(&crate::context::ContextState::Active)
-            .await
             .expect("transition to Active");
 
         // ALICE must be a writable member: the direct path checks membership +

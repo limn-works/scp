@@ -31,9 +31,14 @@
 # annotation naming the specific reason. This is the sanctioned allow-list,
 # NOT a weakening of the ban.
 #
-# `tokio::sync::RwLock` is intentionally NOT banned yet: the legacy
-# `ContextHandle.inner: Arc<RwLock<ContextInner>>` still exists and its
-# removal is a separate unit of work. The ban lands once that handle is gone.
+# `tokio::sync::RwLock` is not yet banned here. The legacy
+# `ContextHandle.inner: Arc<RwLock<ContextInner>>` read-path lock has been
+# eliminated (it is now a lock-free `Arc<ArcSwap<ContextState>>`; see
+# `context::ContextHandle`), and `check-deleted-primitives.sh` bans the
+# `RwLock<ContextInner>` shape from reappearing. The blanket
+# `tokio::sync::RwLock` `disallowed-types` ban lands as a separate follow-up
+# (ADR-049 §Decision 12 PR2) so it can sweep any remaining `RwLock` sites in
+# one focused pass.
 disallowed-types = [
     { path = "std::sync::Mutex", reason = "Use tokio::sync::Mutex in runtime async code; actor-owned state needs no Mutex. See ADR-049." },
     { path = "tokio::sync::Mutex", reason = "ADR-049 §Decision 12: forbidden on read paths. Use ArcSwap+write_lock, OnceLock/AtomicU64/DashMap, or the actor-owned &mut PerContextState. Sanctioned exceptions carry an #[allow(clippy::disallowed_types, reason = \"ADR-049 §Decision 12 allow-list: …\")]." },

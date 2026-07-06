@@ -22,7 +22,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 1. Set up a context handle in Active state.
     let handle = ContextHandle::new("tool-demo".to_owned(), ContextParams::default());
-    handle.transition_to(&ContextState::Active).await?;
+    handle.transition_to(&ContextState::Active)?;
 
     // 2. Build role state with tool capabilities in the ceiling.
     let ceiling = CapabilityCeiling::new([

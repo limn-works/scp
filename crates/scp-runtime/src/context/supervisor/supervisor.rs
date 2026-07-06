@@ -2892,7 +2892,6 @@ impl Supervisor {
                 let handle = crate::context::ContextHandle::new(p.context_id.clone(), p.params);
                 if let Err(e) = handle
                     .transition_to(&scp_protocol::context::ContextState::Active)
-                    .await
                 {
                     let sketch = standing_outcome_error_sketch(&e);
                     let _ = reply.send(Err(e));
@@ -4410,10 +4409,7 @@ impl Supervisor {
         // `RestoreContext` direct dispatch arm, which transitions to `Active`
         // before calling `restore_context`. On a transition failure, count it
         // as a failed respawn.
-        if let Err(e) = handle
-            .transition_to(&scp_protocol::context::ContextState::Active)
-            .await
-        {
+        if let Err(e) = handle.transition_to(&scp_protocol::context::ContextState::Active) {
             self.record_respawn_failure(ctx_id).await;
             return Err(ContextError::ActorCrashed(format!(
                 "{ctx_id} (could not activate respawned context handle: {e})"
@@ -13593,7 +13589,6 @@ mod tests {
         let observed_handle = state.handle.clone();
         observed_handle
             .transition_to(&crate::context::ContextState::Active)
-            .await
             .unwrap();
 
         let actor_handle = supervisor_arc
@@ -13615,7 +13610,7 @@ mod tests {
             )
             .await;
         assert_eq!(
-            observed_handle.state().await,
+            observed_handle.state(),
             crate::context::ContextState::Active,
             "context must remain Active immediately after the timer is installed"
         );
@@ -13624,7 +13619,7 @@ mod tests {
         // to run. Poll the shared handle until it leaves `Active`.
         let expired = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
-                if observed_handle.state().await != crate::context::ContextState::Active {
+                if observed_handle.state() != crate::context::ContextState::Active {
                     break;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -13636,7 +13631,7 @@ mod tests {
             "TTL timer task must fire FireTimer and move the context out of Active"
         );
         assert_eq!(
-            observed_handle.state().await,
+            observed_handle.state(),
             crate::context::ContextState::Expired,
             "FireTimer expiry pipeline must transition the context to Expired"
         );
@@ -13882,7 +13877,6 @@ mod tests {
         state
             .handle
             .transition_to(&crate::context::ContextState::Active)
-            .await
             .unwrap();
         let handle = supervisor_arc
             .spawn_actor_with_state(state, deps, None)
@@ -13941,12 +13935,10 @@ mod tests {
         state
             .handle
             .transition_to(&crate::context::ContextState::Active)
-            .await
             .unwrap();
         state
             .handle
             .transition_to(&crate::context::ContextState::Closing)
-            .await
             .unwrap();
         let handle = supervisor_arc
             .spawn_actor_with_state(state, deps, None)
@@ -14255,7 +14247,6 @@ mod tests {
         state
             .handle
             .transition_to(&crate::context::ContextState::Active)
-            .await
             .expect("drive live context to Active");
         supervisor
             .spawn_actor_with_state(state, deps, None)
@@ -14962,7 +14953,6 @@ mod tests {
         state
             .handle
             .transition_to(&scp_protocol::context::ContextState::Active)
-            .await
             .expect("transition to Active");
 
         let handle = supervisor_arc
@@ -15211,7 +15201,6 @@ mod tests {
         state
             .handle
             .transition_to(&crate::context::ContextState::Active)
-            .await
             .unwrap();
         // Persist a snapshot so a respawn can rehydrate the context.
         let snap = crate::context::manager_methods::snapshot_context(&state);
@@ -15498,7 +15487,6 @@ mod tests {
         state
             .handle
             .transition_to(&crate::context::ContextState::Active)
-            .await
             .unwrap();
         let snap = crate::context::manager_methods::snapshot_context(&state);
         // The snapshot's routing axis must be encrypted (not broadcast) —
@@ -15633,7 +15621,6 @@ mod tests {
         state
             .handle
             .transition_to(&crate::context::ContextState::Active)
-            .await
             .unwrap();
         let mut snap = crate::context::manager_methods::snapshot_context(&state);
         // Capture the live crypto state (floor=5) into the persisted snapshot,
@@ -15918,7 +15905,6 @@ mod tests {
         state
             .handle
             .transition_to(&crate::context::ContextState::Active)
-            .await
             .unwrap();
         let deps = test_actor_deps(&sup).await;
         let handle = sup
@@ -16005,12 +15991,10 @@ mod tests {
         state
             .handle
             .transition_to(&crate::context::ContextState::Active)
-            .await
             .unwrap();
         state
             .handle
             .transition_to(&crate::context::ContextState::Closing)
-            .await
             .unwrap();
         let snap = crate::context::manager_methods::snapshot_context(&state);
         assert_eq!(
@@ -16152,12 +16136,10 @@ mod tests {
         state
             .handle
             .transition_to(&crate::context::ContextState::Active)
-            .await
             .unwrap();
         state
             .handle
             .transition_to(&crate::context::ContextState::Closing)
-            .await
             .unwrap();
         let snap = crate::context::manager_methods::snapshot_context(&state);
         sup.persistence_ref()
@@ -16294,7 +16276,6 @@ mod tests {
         state
             .handle
             .transition_to(&crate::context::ContextState::Active)
-            .await
             .unwrap();
         let snap = crate::context::manager_methods::snapshot_context(&state);
         sup.persistence_ref()
@@ -16391,7 +16372,6 @@ mod tests {
         state
             .handle
             .transition_to(&crate::context::ContextState::Active)
-            .await
             .unwrap();
 
         let deps = test_actor_deps(&sup).await;
@@ -16844,7 +16824,6 @@ mod tests {
         state
             .handle
             .transition_to(&crate::context::ContextState::Active)
-            .await
             .unwrap();
 
         let deps = test_actor_deps(&sup).await;
@@ -16917,7 +16896,6 @@ mod tests {
         state
             .handle
             .transition_to(&crate::context::ContextState::Active)
-            .await
             .unwrap();
 
         // Seed a consumed nonce into the tracker via the snapshot path (the
@@ -17033,7 +17011,6 @@ mod tests {
         state
             .handle
             .transition_to(&crate::context::ContextState::Active)
-            .await
             .unwrap();
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0x11u8; 32]);
 
@@ -17089,7 +17066,7 @@ mod tests {
 
     /// Build an Active broadcast `PerContextState` with `author` registered as
     /// a broadcast author (§5.14.8 test scaffold).
-    async fn broadcast_state_with_author(
+    fn broadcast_state_with_author(
         ctx_id_bytes: [u8; 32],
         author: &DID,
     ) -> crate::context::actor::state::PerContextState {
@@ -17106,7 +17083,6 @@ mod tests {
         state
             .handle
             .transition_to(&crate::context::ContextState::Active)
-            .await
             .unwrap();
         let mut bc = scp_protocol::context::broadcast::BroadcastContext::new(
             ctx_key,
@@ -17135,7 +17111,7 @@ mod tests {
         let author = DID("did:example:bcast-block-author".to_owned());
         let blocked = DID("did:example:bcast-block-target".to_owned());
 
-        let state = broadcast_state_with_author(ctx_id_bytes, &author).await;
+        let state = broadcast_state_with_author(ctx_id_bytes, &author);
         let mut cell = crate::context::actor::class_s::ClassSCell::new(state);
 
         let res = crate::context::broadcast_helpers::block_broadcast_subscriber(
@@ -17170,7 +17146,7 @@ mod tests {
         let author = DID("did:example:bcast-unblock-author".to_owned());
         let blocked = DID("did:example:bcast-unblock-target".to_owned());
 
-        let mut state = broadcast_state_with_author(ctx_id_bytes, &author).await;
+        let mut state = broadcast_state_with_author(ctx_id_bytes, &author);
         // Pre-block the subscriber in memory so there is something to unblock.
         state
             .broadcast_context
@@ -17215,7 +17191,7 @@ mod tests {
         deps.local_dids
             .store(Arc::new(std::collections::HashSet::from([author.clone()])));
 
-        let mut state = broadcast_state_with_author(ctx_id_bytes, &author).await;
+        let mut state = broadcast_state_with_author(ctx_id_bytes, &author);
         // Make the requester a VALID subscriber, NOT on the author block list, so
         // the only thing denying the request is the read_exclusion consult.
         let mut seed = state.broadcast_context.as_ref().unwrap().to_snapshot();
@@ -17272,14 +17248,14 @@ mod tests {
     /// member, with a ceiling permitting `MemberBan` — everything
     /// `execute_revoke` requires of a governance-ban target (§5.14.8 test
     /// scaffold shared by the ban durability / atomicity / fail-closed probes).
-    async fn ban_ready_broadcast_state(
+    fn ban_ready_broadcast_state(
         ctx_id_bytes: [u8; 32],
         author: &DID,
         banned: &DID,
     ) -> crate::context::actor::state::PerContextState {
         use scp_protocol::context::roles::Capability;
 
-        let mut state = broadcast_state_with_author(ctx_id_bytes, author).await;
+        let mut state = broadcast_state_with_author(ctx_id_bytes, author);
         seed_broadcast_subscriber(&mut state, banned);
         state
             .membership
@@ -17318,7 +17294,7 @@ mod tests {
         let author = DID("did:example:bcast-crash-author".to_owned());
         let blocked = DID("did:example:bcast-crash-blocked".to_owned());
 
-        let mut state = broadcast_state_with_author(ctx_id_bytes, &author).await;
+        let mut state = broadcast_state_with_author(ctx_id_bytes, &author);
         // The blocked DID is a VALID subscriber so the post-restore serve-deny is
         // attributable to the BLOCK (not to being unregistered).
         seed_broadcast_subscriber(&mut state, &blocked);
@@ -17410,7 +17386,7 @@ mod tests {
         let author = DID("did:example:ban-crash-author".to_owned());
         let banned = DID("did:example:ban-crash-target".to_owned());
 
-        let state = ban_ready_broadcast_state(ctx_id_bytes, &author, &banned).await;
+        let state = ban_ready_broadcast_state(ctx_id_bytes, &author, &banned);
         let deps = test_actor_deps(&sup).await;
 
         let pre = crate::context::manager_methods::snapshot_context(&state);
@@ -17510,7 +17486,7 @@ mod tests {
         let author = DID("did:example:atomic-author".to_owned());
         let banned = DID("did:example:atomic-banned".to_owned());
 
-        let state = ban_ready_broadcast_state(ctx_id_bytes, &author, &banned).await;
+        let state = ban_ready_broadcast_state(ctx_id_bytes, &author, &banned);
         let mut cell = crate::context::actor::class_s::ClassSCell::new(state);
         crate::context::governance_helpers::execute_revoke(
             &mut cell,
@@ -17588,7 +17564,7 @@ mod tests {
         let author = DID("did:example:ban-failclosed-author".to_owned());
         let banned = DID("did:example:ban-failclosed-target".to_owned());
 
-        let state = ban_ready_broadcast_state(ctx_id_bytes, &author, &banned).await;
+        let state = ban_ready_broadcast_state(ctx_id_bytes, &author, &banned);
         let mut cell = crate::context::actor::class_s::ClassSCell::new(state);
         let res = crate::context::governance_helpers::execute_revoke(
             &mut cell,
@@ -17639,7 +17615,7 @@ mod tests {
         let control_ctx_bytes = [0xB9u8; 32];
         let control_ctx_key = hex::encode(control_ctx_bytes);
         let control_deps = test_actor_deps(&sup).await;
-        let control_state = ban_ready_broadcast_state(control_ctx_bytes, &author, &banned).await;
+        let control_state = ban_ready_broadcast_state(control_ctx_bytes, &author, &banned);
         let mut control_cell = crate::context::actor::class_s::ClassSCell::new(control_state);
         crate::context::governance_helpers::execute_revoke(
             &mut control_cell,
@@ -17696,7 +17672,6 @@ mod tests {
         state
             .handle
             .transition_to(&crate::context::ContextState::Active)
-            .await
             .unwrap();
 
         // Seed the post-`commit_spending_ucan_nonce` tracker state (the same
@@ -17787,7 +17762,6 @@ mod tests {
         state
             .handle
             .transition_to(&crate::context::ContextState::Active)
-            .await
             .unwrap();
 
         // Mark a proposal executed (the mutation the conflict-resolution
@@ -17852,7 +17826,6 @@ mod tests {
         state
             .handle
             .transition_to(&crate::context::ContextState::Active)
-            .await
             .unwrap();
 
         // Add a revoked CID (the mutation a future revocation handler will
@@ -17927,7 +17900,6 @@ mod tests {
         state
             .handle
             .transition_to(&crate::context::ContextState::Active)
-            .await
             .unwrap();
 
         let deps = test_actor_deps(&sup).await;
@@ -18011,7 +17983,6 @@ mod tests {
         state
             .handle
             .transition_to(&crate::context::ContextState::Active)
-            .await
             .unwrap();
 
         let deps = test_actor_deps(&sup).await;
@@ -18082,7 +18053,6 @@ mod tests {
         state
             .handle
             .transition_to(&crate::context::ContextState::Active)
-            .await
             .unwrap();
 
         let deps = test_actor_deps(&sup).await;
@@ -18157,7 +18127,6 @@ mod tests {
         state
             .handle
             .transition_to(&crate::context::ContextState::Active)
-            .await
             .unwrap();
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0x33u8; 32]);
 
@@ -18428,7 +18397,7 @@ mod tests {
     /// authorize-before-reserve `is_member` check passes) holding
     /// `ToolInterface` (so Prepare-A's outbound gate passes). `creator_did` is
     /// the role-state creator.
-    async fn xctx_caller_state(
+    fn xctx_caller_state(
         caller_did: &str,
         creator_did: &str,
     ) -> crate::context::actor::state::PerContextState {
@@ -18440,7 +18409,6 @@ mod tests {
         );
         st.handle
             .transition_to(&scp_protocol::context::ContextState::Active)
-            .await
             .expect("active");
         st.role_state.creator_did = creator_did.to_owned();
         // `is_member` reads `membership`; the outbound gate reads `role_state`.
@@ -18482,7 +18450,7 @@ mod tests {
     /// Build the TARGET context state: registered `XCTX_TOOL` (2-field schemas,
     /// passing the specificity floor), `caller_did` granted ToolInterface +
     /// ToolInvokeAll, `creator_did` the role-state creator / UCAN root issuer.
-    async fn xctx_target_state(
+    fn xctx_target_state(
         caller_did: &str,
         creator_did: &str,
     ) -> crate::context::actor::state::PerContextState {
@@ -18495,7 +18463,6 @@ mod tests {
         );
         st.handle
             .transition_to(&scp_protocol::context::ContextState::Active)
-            .await
             .expect("active");
         st.role_state.creator_did = creator_did.to_owned();
         st.membership
@@ -18754,8 +18721,8 @@ mod tests {
             mls_storage,
             Some(Box::new(persistence)),
         );
-        let caller_state = xctx_caller_state(caller_did, creator_did).await;
-        let target_state = xctx_target_state(caller_did, creator_did).await;
+        let caller_state = xctx_caller_state(caller_did, creator_did);
+        let target_state = xctx_target_state(caller_did, creator_did);
         Box::pin(spawn_xctx_pair(&supervisor, caller_state, target_state)).await;
 
         let target_signing = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
@@ -19010,8 +18977,8 @@ mod tests {
             Some(Box::new(persistence.clone())),
         );
         let caller_did = "did:dht:z6MkXctxOkArmCaller";
-        let caller_state = xctx_caller_state(caller_did, &creator_did).await;
-        let target_state = xctx_target_state(caller_did, &creator_did).await;
+        let caller_state = xctx_caller_state(caller_did, &creator_did);
+        let target_state = xctx_target_state(caller_did, &creator_did);
         Box::pin(spawn_xctx_pair(&supervisor, caller_state, target_state)).await;
 
         let target_signing = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
@@ -19212,8 +19179,8 @@ mod tests {
         );
         let caller_did = "did:dht:z6MkXctxHappyCaller";
 
-        let caller_state = xctx_caller_state(caller_did, &creator_did).await;
-        let target_state = xctx_target_state(caller_did, &creator_did).await;
+        let caller_state = xctx_caller_state(caller_did, &creator_did);
+        let target_state = xctx_target_state(caller_did, &creator_did);
         Box::pin(spawn_xctx_pair(&supervisor, caller_state, target_state)).await;
 
         // The target's Active Signing Key (caller-supplied, ADR-049 — the actor
@@ -19361,8 +19328,8 @@ mod tests {
         let caller_did = "did:dht:z6MkXctxDeputyCaller";
         let other_did = "did:dht:z6MkXctxDeputyOther";
 
-        let caller_state = xctx_caller_state(caller_did, &creator_did).await;
-        let mut target_state = xctx_target_state(caller_did, &creator_did).await;
+        let caller_state = xctx_caller_state(caller_did, &creator_did);
+        let mut target_state = xctx_target_state(caller_did, &creator_did);
 
         // Proof audience = OTHER, NOT the carried caller_did.
         let ctx_hex = hex::encode(XCTX_TARGET);
@@ -19499,8 +19466,8 @@ mod tests {
         let supervisor = xctx_supervisor(creator_did.clone(), creator_key);
         let caller_did = "did:dht:z6MkXctxMailboxCaller";
 
-        let caller_state = xctx_caller_state(caller_did, &creator_did).await;
-        let target_state = xctx_target_state(caller_did, &creator_did).await;
+        let caller_state = xctx_caller_state(caller_did, &creator_did);
+        let target_state = xctx_target_state(caller_did, &creator_did);
         Box::pin(spawn_xctx_pair(&supervisor, caller_state, target_state)).await;
 
         // Swap the TARGET handle for a closed-inbox one: the receiver is dropped,
@@ -19587,7 +19554,7 @@ mod tests {
         // The caller context has an established interface to XCTX_TARGET only —
         // NOT to XCTX_VICTIM. The caller is a member of its own context (so the
         // caller-axis is_member gate trivially passes).
-        let caller_state = xctx_caller_state(caller_did, &creator_did).await;
+        let caller_state = xctx_caller_state(caller_did, &creator_did);
         supervisor
             .spawn_actor_with_state(
                 caller_state,
@@ -19674,8 +19641,8 @@ mod tests {
         let supervisor = xctx_supervisor(creator_did.clone(), creator_key);
         let caller_did = "did:dht:z6MkXctxBusyCaller";
 
-        let caller_state = xctx_caller_state(caller_did, &creator_did).await;
-        let target_state = xctx_target_state(caller_did, &creator_did).await;
+        let caller_state = xctx_caller_state(caller_did, &creator_did);
+        let target_state = xctx_target_state(caller_did, &creator_did);
         Box::pin(spawn_xctx_pair(&supervisor, caller_state, target_state)).await;
 
         // Hold the {caller, target} set in flight via the production reservation
@@ -20193,8 +20160,8 @@ mod tests {
         let supervisor = xctx_supervisor(creator_did.clone(), creator_key);
         let caller_did = "did:dht:z6MkXctxReplayCaller";
 
-        let caller_state = xctx_caller_state(caller_did, &creator_did).await;
-        let target_state = xctx_target_state(caller_did, &creator_did).await;
+        let caller_state = xctx_caller_state(caller_did, &creator_did);
+        let target_state = xctx_target_state(caller_did, &creator_did);
         Box::pin(spawn_xctx_pair(&supervisor, caller_state, target_state)).await;
 
         let target_signing = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
@@ -20387,8 +20354,8 @@ mod tests {
             Box::new(event_log.clone()),
         );
         let caller_did = "did:dht:z6MkXctxDivCaller";
-        let caller_state = xctx_caller_state(caller_did, &creator_did).await;
-        let target_state = xctx_target_state(caller_did, &creator_did).await;
+        let caller_state = xctx_caller_state(caller_did, &creator_did);
+        let target_state = xctx_target_state(caller_did, &creator_did);
         Box::pin(spawn_xctx_pair(&supervisor, caller_state, target_state)).await;
 
         let target_signing = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
@@ -20484,8 +20451,8 @@ mod tests {
             Box::new(event_log.clone()),
         );
         let caller_did = "did:dht:z6MkXctxRepairCaller";
-        let caller_state = xctx_caller_state(caller_did, &creator_did).await;
-        let target_state = xctx_target_state(caller_did, &creator_did).await;
+        let caller_state = xctx_caller_state(caller_did, &creator_did);
+        let target_state = xctx_target_state(caller_did, &creator_did);
         Box::pin(spawn_xctx_pair(&supervisor, caller_state, target_state)).await;
 
         // Despawn the CALLER actor so it is unreachable at divergence time.
@@ -21058,8 +21025,8 @@ mod tests {
         let creator_key = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]).verifying_key();
         let supervisor = xctx_supervisor(creator_did.clone(), creator_key);
         let caller_did = "did:dht:z6MkXctxReplay2Caller";
-        let caller_state = xctx_caller_state(caller_did, &creator_did).await;
-        let target_state = xctx_target_state(caller_did, &creator_did).await;
+        let caller_state = xctx_caller_state(caller_did, &creator_did);
+        let target_state = xctx_target_state(caller_did, &creator_did);
         Box::pin(spawn_xctx_pair(&supervisor, caller_state, target_state)).await;
 
         let target_signing = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
@@ -21159,8 +21126,8 @@ mod tests {
         let creator_key = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]).verifying_key();
         let supervisor = xctx_supervisor(creator_did.clone(), creator_key);
         let caller_did = "did:dht:z6MkXctxWitnessCaller";
-        let caller_state = xctx_caller_state(caller_did, &creator_did).await;
-        let target_state = xctx_target_state(caller_did, &creator_did).await;
+        let caller_state = xctx_caller_state(caller_did, &creator_did);
+        let target_state = xctx_target_state(caller_did, &creator_did);
         Box::pin(spawn_xctx_pair(&supervisor, caller_state, target_state)).await;
 
         let target_signing = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
@@ -21266,8 +21233,8 @@ mod tests {
         let creator_key = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]).verifying_key();
         let supervisor = xctx_supervisor(creator_did.clone(), creator_key);
         let caller_did = "did:dht:z6MkXctxOneSidedCaller";
-        let caller_state = xctx_caller_state(caller_did, &creator_did).await;
-        let target_state = xctx_target_state(caller_did, &creator_did).await;
+        let caller_state = xctx_caller_state(caller_did, &creator_did);
+        let target_state = xctx_target_state(caller_did, &creator_did);
         Box::pin(spawn_xctx_pair(&supervisor, caller_state, target_state)).await;
 
         let target_signing = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
@@ -21474,8 +21441,8 @@ mod tests {
             Box::new(persistence),
         );
         let caller_did = "did:dht:z6MkXctxSettleRetryCaller";
-        let caller_state = xctx_caller_state(caller_did, &creator_did).await;
-        let target_state = xctx_target_state(caller_did, &creator_did).await;
+        let caller_state = xctx_caller_state(caller_did, &creator_did);
+        let target_state = xctx_target_state(caller_did, &creator_did);
         Box::pin(spawn_xctx_pair(&supervisor, caller_state, target_state)).await;
 
         let target_signing = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
@@ -21546,8 +21513,8 @@ mod tests {
         let creator_key = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]).verifying_key();
         let supervisor = xctx_supervisor(creator_did.clone(), creator_key);
         let caller_did = "did:dht:z6MkXctxSendFailCaller";
-        let caller_state = xctx_caller_state(caller_did, &creator_did).await;
-        let target_state = xctx_target_state(caller_did, &creator_did).await;
+        let caller_state = xctx_caller_state(caller_did, &creator_did);
+        let target_state = xctx_target_state(caller_did, &creator_did);
         Box::pin(spawn_xctx_pair(&supervisor, caller_state, target_state)).await;
 
         let target_signing = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
@@ -21658,8 +21625,8 @@ mod tests {
         let creator_key = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]).verifying_key();
         let supervisor = xctx_supervisor(creator_did.clone(), creator_key);
         let caller_did = "did:dht:z6MkXctxAbortSendFailCaller";
-        let caller_state = xctx_caller_state(caller_did, &creator_did).await;
-        let target_state = xctx_target_state(caller_did, &creator_did).await;
+        let caller_state = xctx_caller_state(caller_did, &creator_did);
+        let target_state = xctx_target_state(caller_did, &creator_did);
         Box::pin(spawn_xctx_pair(&supervisor, caller_state, target_state)).await;
 
         let target_signing = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
@@ -21888,8 +21855,8 @@ mod tests {
             crate::context::supervisor::DurableProviders::for_test(journal, mls_storage),
         );
         let caller_did = "did:dht:z6MkXctxWave8Caller";
-        let caller_state = xctx_caller_state(caller_did, &creator_did).await;
-        let target_state = xctx_target_state(caller_did, &creator_did).await;
+        let caller_state = xctx_caller_state(caller_did, &creator_did);
+        let target_state = xctx_target_state(caller_did, &creator_did);
         Box::pin(spawn_xctx_pair(&supervisor, caller_state, target_state)).await;
 
         let caller_hex = hex::encode(XCTX_CALLER);
@@ -22158,8 +22125,8 @@ mod tests {
             creator_key,
             persistence,
         );
-        let caller_state = xctx_caller_state(caller_did, creator_did).await;
-        let target_state = xctx_target_state(caller_did, creator_did).await;
+        let caller_state = xctx_caller_state(caller_did, creator_did);
+        let target_state = xctx_target_state(caller_did, creator_did);
         Box::pin(spawn_xctx_pair(&supervisor, caller_state, target_state)).await;
 
         let caller_hex = hex::encode(XCTX_CALLER);
@@ -22284,8 +22251,8 @@ mod tests {
         let (supervisor, persistence) =
             xctx_supervisor_with_real_journal(creator_did.clone(), creator_key);
         let caller_did = "did:dht:z6MkXctxWave15NonResCaller";
-        let caller_state = xctx_caller_state(caller_did, &creator_did).await;
-        let target_state = xctx_target_state(caller_did, &creator_did).await;
+        let caller_state = xctx_caller_state(caller_did, &creator_did);
+        let target_state = xctx_target_state(caller_did, &creator_did);
         Box::pin(spawn_xctx_pair(&supervisor, caller_state, target_state)).await;
 
         let caller_hex = hex::encode(XCTX_CALLER);
@@ -22423,8 +22390,8 @@ mod tests {
         let (supervisor, persistence) =
             xctx_supervisor_with_real_journal(creator_did.clone(), creator_key);
         let caller_did = "did:dht:z6MkXctxWave15ResCaller";
-        let caller_state = xctx_caller_state(caller_did, &creator_did).await;
-        let target_state = xctx_target_state(caller_did, &creator_did).await;
+        let caller_state = xctx_caller_state(caller_did, &creator_did);
+        let target_state = xctx_target_state(caller_did, &creator_did);
         Box::pin(spawn_xctx_pair(&supervisor, caller_state, target_state)).await;
 
         let caller_hex = hex::encode(XCTX_CALLER);
@@ -22858,8 +22825,8 @@ mod tests {
         let (supervisor, persistence) =
             xctx_supervisor_with_real_journal(creator_did.clone(), creator_key);
         let caller_did = "did:dht:z6MkXctxWave23PrepACaller";
-        let caller_state = xctx_caller_state(caller_did, &creator_did).await;
-        let target_state = xctx_target_state(caller_did, &creator_did).await;
+        let caller_state = xctx_caller_state(caller_did, &creator_did);
+        let target_state = xctx_target_state(caller_did, &creator_did);
         Box::pin(spawn_xctx_pair(&supervisor, caller_state, target_state)).await;
 
         let caller_hex = hex::encode(XCTX_CALLER);
@@ -23011,8 +22978,8 @@ mod tests {
         let (supervisor, persistence) =
             xctx_supervisor_with_real_journal(creator_did.clone(), creator_key);
         let caller_did = "did:dht:z6MkXctxWave23PrepANonResCaller";
-        let caller_state = xctx_caller_state(caller_did, &creator_did).await;
-        let target_state = xctx_target_state(caller_did, &creator_did).await;
+        let caller_state = xctx_caller_state(caller_did, &creator_did);
+        let target_state = xctx_target_state(caller_did, &creator_did);
         Box::pin(spawn_xctx_pair(&supervisor, caller_state, target_state)).await;
 
         let caller_hex = hex::encode(XCTX_CALLER);
@@ -23159,8 +23126,8 @@ mod tests {
             Box::new(persistence.clone()),
         );
         let caller_did = "did:dht:z6MkXctxHigh2Caller";
-        let caller_state = xctx_caller_state(caller_did, &creator_did).await;
-        let target_state = xctx_target_state(caller_did, &creator_did).await;
+        let caller_state = xctx_caller_state(caller_did, &creator_did);
+        let target_state = xctx_target_state(caller_did, &creator_did);
         Box::pin(spawn_xctx_pair(&supervisor, caller_state, target_state)).await;
 
         let target_signing = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
@@ -23280,8 +23247,8 @@ mod tests {
         let creator_key = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]).verifying_key();
         let supervisor = xctx_supervisor(creator_did.clone(), creator_key);
         let caller_did = "did:dht:z6MkXctxPrepReplayCaller";
-        let caller_state = xctx_caller_state(caller_did, &creator_did).await;
-        let target_state = xctx_target_state(caller_did, &creator_did).await;
+        let caller_state = xctx_caller_state(caller_did, &creator_did);
+        let target_state = xctx_target_state(caller_did, &creator_did);
         Box::pin(spawn_xctx_pair(&supervisor, caller_state, target_state)).await;
 
         let saga_id = SagaId::new();

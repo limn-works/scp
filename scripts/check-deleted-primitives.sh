@@ -112,13 +112,12 @@ BAN_ENTRIES=(
     "merge_send_tracker|crates/scp-runtime|*.rs|Actor-per-context refactor deleted the send-tracker take/merge primitives (ADR-049)"
     "MutationStateView|crates/scp-runtime|*.rs|Actor-per-context refactor deleted the transitional mutation/query borrow adapters (ADR-049)"
     "QueryStateView|crates/scp-runtime|*.rs|Actor-per-context refactor deleted the transitional mutation/query borrow adapters (ADR-049)"
+    "RwLock<ContextInner>|crates/scp-runtime|*.rs|ADR-049 §Decision 12: ContextHandle's read-path RwLock<ContextInner> was replaced by lock-free Arc<ArcSwap<ContextState>>; the RwLock<ContextInner> shape must not reappear"
 )
 
-# Example of the activated form for the remaining, still-pending bans.
-# `RwLock<ContextInner>` waits on legacy `ContextHandle` removal; the
-# `pending_joins` ban waits on the 2F-residual join-path deletion.
+# Example of the activated form for the remaining, still-pending ban.
+# `pending_joins` waits on the 2F-residual join-path deletion.
 # BAN_ENTRIES+=(
-#     "RwLock<ContextInner>|crates/scp-runtime|*.rs|Actor-per-context refactor deleted this (ADR-049)"
 #     "pending_joins|crates/scp-runtime/src/crypto|*.rs|Actor-per-context refactor deleted this (ADR-049)"
 # )
 

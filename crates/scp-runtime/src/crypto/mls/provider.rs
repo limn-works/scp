@@ -405,9 +405,9 @@ struct PendingJoinState {
 /// # Concurrency
 ///
 /// Each method acquires the internal mutex for the duration of the operation.
-/// The `ContextManager` ensures that concurrent calls for the same context are
-/// serialized at a higher level (via `tokio::sync::Mutex` on the context map),
-/// so contention on these mutexes is minimal.
+/// Concurrent calls for the same context are serialized at a higher level by
+/// the per-context actor's single-threaded command loop (ADR-049), so
+/// contention on these mutexes is minimal.
 pub struct MlsCryptoProvider {
     /// The local member's DID (e.g., `"did:dht:z6Mk..."`).
     local_did: String,

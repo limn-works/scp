@@ -115,16 +115,14 @@ fn handle_prepare_for_replace(
     // and is no longer serving the context — so it is replaceable, exactly
     // like the terminal states. Including it here lets an import / replace
     // recover a poisoned id without first requiring an operator `clear_poison`.
-    let replaceable = cell.handle.try_read_state().is_some_and(|s| {
-        matches!(
-            s,
-            ContextState::Closing
-                | ContextState::Closed
-                | ContextState::Expired
-                | ContextState::Tombstoned
-                | ContextState::Poisoned
-        )
-    });
+    let replaceable = matches!(
+        cell.handle.state(),
+        ContextState::Closing
+            | ContextState::Closed
+            | ContextState::Expired
+            | ContextState::Tombstoned
+            | ContextState::Poisoned
+    );
     if !replaceable {
         let _ = reply.send(Err(ContextError::MembershipFailed(
             "context already exists — cannot import".to_owned(),

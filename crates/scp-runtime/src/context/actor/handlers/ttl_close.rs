@@ -140,10 +140,7 @@ async fn handle_start_ttl_timer(
     };
 
     let handle = ContextHandle::new(context_id.clone(), params);
-    if let Err(e) = handle
-        .transition_to(&scp_protocol::context::ContextState::Active)
-        .await
-    {
+    if let Err(e) = handle.transition_to(&scp_protocol::context::ContextState::Active) {
         let sketch = outcome_error_sketch(&e);
         let _ = reply.send(Err(e));
         return Outcome::err(sketch);
@@ -229,10 +226,7 @@ async fn handle_reset_ttl_timer(
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
     let handle = ContextHandle::new(context_id.clone(), params);
-    if let Err(e) = handle
-        .transition_to(&scp_protocol::context::ContextState::Active)
-        .await
-    {
+    if let Err(e) = handle.transition_to(&scp_protocol::context::ContextState::Active) {
         let sketch = outcome_error_sketch(&e);
         let _ = reply.send(Err(e));
         return Outcome::err(sketch);
@@ -270,10 +264,7 @@ async fn handle_execute_ttl_close(
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
     let handle = ContextHandle::new(context_id.clone(), params);
-    if let Err(e) = handle
-        .transition_to(&scp_protocol::context::ContextState::Active)
-        .await
-    {
+    if let Err(e) = handle.transition_to(&scp_protocol::context::ContextState::Active) {
         let sketch = outcome_error_sketch(&e);
         let _ = reply.send(Err(e));
         return Outcome::err(sketch);
@@ -363,10 +354,7 @@ async fn handle_finalize_close(
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
     let handle = ContextHandle::new(context_id.clone(), params);
-    if let Err(e) = handle
-        .transition_to(&scp_protocol::context::ContextState::Closing)
-        .await
-    {
+    if let Err(e) = handle.transition_to(&scp_protocol::context::ContextState::Closing) {
         let sketch = outcome_error_sketch(&e);
         let _ = reply.send(Err(e));
         return Outcome::err(sketch);

@@ -227,7 +227,7 @@ async fn context_create_persists_membership_to_sqlite() {
             .create_context(ctx_id.to_owned(), encrypted_params(), alice.clone(), None)
             .await
             .expect("context_create must succeed with sqlite-backed persistence");
-        assert_eq!(handle.state().await, ContextState::Active);
+        assert_eq!(handle.state(), ContextState::Active);
         // Flush snapshots before drop.
         manager.flush_all_contexts_sync().unwrap();
     }

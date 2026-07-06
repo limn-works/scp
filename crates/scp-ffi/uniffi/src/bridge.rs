@@ -10043,9 +10043,7 @@ impl Scp {
                     scp_core::context::ContextParams::default(),
                 );
                 // Transition core handle to Active so join_context accepts it.
-                let _ = core_handle
-                    .transition_to(&scp_core::context::ContextState::Active)
-                    .await;
+                let _ = core_handle.transition_to(&scp_core::context::ContextState::Active);
 
                 // Generate a real MLS key package for the joining member. The
                 // `MlsCryptoProvider` requires `Some(bytes)` — the old DID-less
@@ -10194,9 +10192,7 @@ impl Scp {
                     handle.context_id.clone(),
                     scp_core::context::ContextParams::default(),
                 );
-                let _ = core_handle
-                    .transition_to(&scp_core::context::ContextState::Active)
-                    .await;
+                let _ = core_handle.transition_to(&scp_core::context::ContextState::Active);
 
                 let member_did: scp_did::DID = identity.did.clone().into();
                 {
@@ -10285,9 +10281,7 @@ impl Scp {
                     handle.context_id.clone(),
                     scp_core::context::ContextParams::default(),
                 );
-                let _ = core_handle
-                    .transition_to(&scp_core::context::ContextState::Active)
-                    .await;
+                let _ = core_handle.transition_to(&scp_core::context::ContextState::Active);
 
                 let initiator_did: scp_did::DID = identity_did.clone().into();
                 {
@@ -10504,9 +10498,7 @@ impl Scp {
                     handle.context_id.clone(),
                     scp_core::context::ContextParams::default(),
                 );
-                let _ = core_handle
-                    .transition_to(&scp_core::context::ContextState::Active)
-                    .await;
+                let _ = core_handle.transition_to(&scp_core::context::ContextState::Active);
 
                 // Parse optional spending UCAN JWT into a UcanToken for AND-composition.
                 let spending_ucan = spending_ucan_jwt
@@ -11140,12 +11132,8 @@ impl Scp {
             .spawn(async move {
                 let sup = bi.context_manager_or_error()?;
                 let core_handle = scp_core::context::ContextHandle::new(context_id, core_params);
-                let _ = core_handle
-                    .transition_to(&scp_core::context::ContextState::Active)
-                    .await;
-                let _ = core_handle
-                    .transition_to(&scp_core::context::ContextState::Closing)
-                    .await;
+                let _ = core_handle.transition_to(&scp_core::context::ContextState::Active);
+                let _ = core_handle.transition_to(&scp_core::context::ContextState::Closing);
 
                 {
                     use scp_core::context::actor::commands::{TtlCloseCommand, TtlContextPayload};

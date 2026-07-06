@@ -136,7 +136,7 @@ async fn create_with_template_config_returns_active_handle() {
         .await
         .unwrap();
 
-    assert_eq!(handle.try_read_state().unwrap(), ContextState::Active);
+    assert_eq!(handle.state(), ContextState::Active);
 
     // The handle's params must match the equivalent `from_template` path with
     // the TTL applied — proving `create` is a front-end over the same engine.
@@ -170,8 +170,8 @@ async fn create_matches_create_context_for_equivalent_inputs() {
         .await
         .unwrap();
 
-    assert_eq!(via_create.try_read_state().unwrap(), ContextState::Active);
-    assert_eq!(via_engine.try_read_state().unwrap(), ContextState::Active);
+    assert_eq!(via_create.state(), ContextState::Active);
+    assert_eq!(via_engine.state(), ContextState::Active);
     assert_eq!(via_create.params(), via_engine.params());
 }
 
@@ -226,5 +226,5 @@ async fn create_without_peer_succeeds() {
         .create("ctx-no-peer".into(), config, alice(), None)
         .await
         .unwrap();
-    assert_eq!(handle.try_read_state().unwrap(), ContextState::Active);
+    assert_eq!(handle.state(), ContextState::Active);
 }

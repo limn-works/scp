@@ -235,10 +235,7 @@ async fn handle_join_context_actor(
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
     let handle = ContextHandle::new(context_id.clone(), params);
-    if let Err(e) = handle
-        .transition_to(&scp_protocol::context::ContextState::Active)
-        .await
-    {
+    if let Err(e) = handle.transition_to(&scp_protocol::context::ContextState::Active) {
         let sketch = outcome_error_sketch(&e);
         let _ = reply.send(Err(e));
         return Outcome::err(sketch);
@@ -282,10 +279,7 @@ async fn handle_leave_context_actor(
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
     let handle = ContextHandle::new(context_id.clone(), params);
-    if let Err(e) = handle
-        .transition_to(&scp_protocol::context::ContextState::Active)
-        .await
-    {
+    if let Err(e) = handle.transition_to(&scp_protocol::context::ContextState::Active) {
         let sketch = outcome_error_sketch(&e);
         let _ = reply.send(Err(e));
         return Outcome::err(sketch);
@@ -328,11 +322,11 @@ async fn handle_close_context_actor(
 ) -> Outcome<()> {
     // Drive the close through a CLONE of the actor's own `state.handle`,
     // NOT a freshly-constructed `ContextHandle::new(...)`. `ContextHandle`
-    // is a thin `Arc<RwLock<ContextInner>>` newtype, so a clone SHARES the
-    // interior lifecycle state. `ttl::close_context` transitions that
-    // shared state Active -> Closing; reading it back through
+    // holds its lifecycle state in a lock-free `Arc<ArcSwap<ContextState>>`,
+    // so a clone SHARES the interior cell. `ttl::close_context` transitions
+    // that shared state Active -> Closing; reading it back through
     // `state.handle` (e.g. the `import_context` replaceability gate's
-    // `state.handle.try_read_state()`) then observes the terminal state.
+    // `state.handle.state()`) then observes the terminal state.
     //
     // A separate `ContextHandle::new` owned its OWN fresh `Arc`, so the
     // Closing transition landed on a throwaway cell and `state.handle`

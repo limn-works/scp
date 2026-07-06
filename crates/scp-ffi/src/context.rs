@@ -2503,9 +2503,7 @@ impl crate::scp::PyScp {
             // §9.10.4: pass the pseudonym to join_context so it is stored in
             // PerContextState for subsequent send_message fan-out.
             rt.block_on(async {
-                let _ = temp_handle
-                    .transition_to(&scp_core::context::ContextState::Active)
-                    .await;
+                let _ = temp_handle.transition_to(&scp_core::context::ContextState::Active);
                 sup.join_context(
                     &temp_handle,
                     key_package,
@@ -3098,9 +3096,7 @@ impl crate::scp::PyScp {
             let temp_handle =
                 scp_core::context::ContextHandle::new(context_id.clone(), core_params);
             rt.block_on(async {
-                let _ = temp_handle
-                    .transition_to(&scp_core::context::ContextState::Active)
-                    .await;
+                let _ = temp_handle.transition_to(&scp_core::context::ContextState::Active);
                 // Self-removal: caller_did == member_did.
                 sup.leave_context(&temp_handle, &member_did, &member_did)
                     .await
@@ -3351,9 +3347,7 @@ impl crate::scp::PyScp {
             let core_params = build_core_context_params(&handle.params)?;
             let temp_handle = scp_core::context::ContextHandle::new(context_id, core_params);
             rt.block_on(async {
-                let _ = temp_handle
-                    .transition_to(&scp_core::context::ContextState::Active)
-                    .await;
+                let _ = temp_handle.transition_to(&scp_core::context::ContextState::Active);
                 sup.send_message(
                     &temp_handle,
                     &sender_did,

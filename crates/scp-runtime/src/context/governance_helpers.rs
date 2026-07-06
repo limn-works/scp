@@ -259,10 +259,7 @@ pub async fn tombstone_migrated_context(
     let context_id_bytes = context_id_to_bytes(context_id);
     let now = deps.clock.now_secs();
 
-    let handle_state = cell
-        .handle
-        .try_read_state()
-        .ok_or(ContextError::ContextNotActive)?;
+    let handle_state = cell.handle.state();
     if handle_state != ContextState::MigratingOut {
         return Err(ContextError::PermissionDenied(
             "context is not in MigratingOut state — cannot tombstone".to_owned(),
@@ -294,7 +291,6 @@ pub async fn tombstone_migrated_context(
     // returns early, before any `state`-field mutation or persist.
     cell.handle
         .transition_to(&ContextState::Tombstoned)
-        .await
         .map_err(|_| {
             ContextError::PermissionDenied(
                 "cannot transition from MigratingOut to Tombstoned".to_owned(),
@@ -327,7 +323,7 @@ pub async fn tombstone_migrated_context(
 
     let tombstone_payload =
         scp_event_log::payload::encode_payload(&scp_event_log::payload::ContextTombstonedPayload {
-            destination_id: destination_id.clone(),
+            destination_id,
             migration_proposal_id: migration_pid,
         })
         .map_err(|e| ContextError::EventLogFailed(e.to_string()))?;
@@ -1702,6 +1698,11 @@ pub fn execute_modify_ceiling(
 // execute_close_context (per-action leaf helper)
 // ---------------------------------------------------------------------------
 
+// ADR-049 §Decision 12: `state`/`transition_to` are now synchronous lock-free
+// ArcSwap ops. Async is retained as the ContextManager helper API contract —
+// callers await uniformly, and provider-trait calls regain await points under
+// ADR-049 Decision 7 (async-provider-trait conversion).
+#[allow(clippy::unused_async)]
 pub async fn execute_close_context(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
@@ -1725,7 +1726,6 @@ pub async fn execute_close_context(
     // `state`-field mutation or persist.
     handle
         .transition_to(&ContextState::Closing)
-        .await
         .map_err(|_| ContextError::PermissionDenied("cannot transition to Closing".to_owned()))?;
 
     // ADR-049 §9 Class S: the lifecycle close transition is security-critical
@@ -3162,7 +3162,6 @@ pub fn execute_propose_context_migration<'a>(
 
         cell.handle
             .transition_to(&ContextState::MigratingOut)
-            .await
             .map_err(|_| {
                 ContextError::PermissionDenied("cannot transition to MigratingOut".to_owned())
             })?;
@@ -3230,7 +3229,7 @@ pub fn execute_propose_context_migration<'a>(
             // `transition_to` await runs with no view borrow live; the Class-C
             // rollback (clear migration state + truncate the buffered events)
             // then runs in a short view borrow.
-            let _ = cell.handle.transition_to(&ContextState::Active).await;
+            let _ = cell.handle.transition_to(&ContextState::Active);
             {
                 let mut view = cell.class_c_view();
                 *view.migration_state_mut() = None;
@@ -3268,6 +3267,11 @@ pub fn execute_propose_context_migration<'a>(
 // execute_cancel_context_migration (per-action leaf helper)
 // ---------------------------------------------------------------------------
 
+// ADR-049 §Decision 12: `state`/`transition_to` are now synchronous lock-free
+// ArcSwap ops. Async is retained as the ContextManager helper API contract —
+// callers await uniformly, and provider-trait calls regain await points under
+// ADR-049 Decision 7 (async-provider-trait conversion).
+#[allow(clippy::unused_async)]
 pub async fn execute_cancel_context_migration(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
@@ -3282,10 +3286,7 @@ pub async fn execute_cancel_context_migration(
     let context_id_bytes = context_id_to_bytes(context_id);
 
     // Reads via the cell's `Deref`; `transition_to` takes `&self`.
-    let s = cell
-        .handle
-        .try_read_state()
-        .ok_or(ContextError::ContextNotActive)?;
+    let s = cell.handle.state();
     if s != ContextState::MigratingOut {
         return Err(ContextError::PermissionDenied(
             "context is not in MigratingOut state — cannot cancel migration".to_owned(),
@@ -3294,7 +3295,6 @@ pub async fn execute_cancel_context_migration(
 
     cell.handle
         .transition_to(&ContextState::Active)
-        .await
         .map_err(|_| {
             ContextError::PermissionDenied(
                 "cannot transition from MigratingOut to Active".to_owned(),

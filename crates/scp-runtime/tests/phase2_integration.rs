@@ -280,14 +280,13 @@ async fn phase2_end_to_end_integration() {
 
     // Create the context handle (starts in Creating state).
     let context = ContextHandle::new(context_id.to_owned(), params.clone());
-    assert_eq!(context.state().await, ContextState::Creating);
+    assert_eq!(context.state(), ContextState::Creating);
 
     // Transition to Active (MLS group formation is complete).
     context
         .transition_to(&ContextState::Active)
-        .await
         .expect("Creating -> Active");
-    assert_eq!(context.state().await, ContextState::Active);
+    assert_eq!(context.state(), ContextState::Active);
 
     // Initialize role state with Alice as admin.
     let mut role_state = ContextRoleState::new(
@@ -678,17 +677,16 @@ async fn phase2_end_to_end_integration() {
     // Transition context to Expired (simulating TTL expiry).
     context
         .transition_to(&ContextState::Expired)
-        .await
         .expect("Active -> Expired");
-    assert_eq!(context.state().await, ContextState::Expired);
+    assert_eq!(context.state(), ContextState::Expired);
 
     // Verify Expired is a terminal state: no further transitions allowed.
-    let transition_result = context.transition_to(&ContextState::Active).await;
+    let transition_result = context.transition_to(&ContextState::Active);
     assert!(
         transition_result.is_err(),
         "Expired is terminal -- cannot transition to Active"
     );
-    let transition_result = context.transition_to(&ContextState::Closing).await;
+    let transition_result = context.transition_to(&ContextState::Closing);
     assert!(
         transition_result.is_err(),
         "Expired is terminal -- cannot transition to Closing"

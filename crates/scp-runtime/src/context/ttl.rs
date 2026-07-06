@@ -580,6 +580,11 @@ pub trait TtlTimerHandle: Send + Sync {
 /// Returns [`ContextError::ContextNotActive`] if the context is not `Active`.
 /// Returns [`ContextError::PermissionDenied`] if the initiator lacks the
 /// `ContextClose` capability.
+// ADR-049 §Decision 12: `state`/`transition_to` are now synchronous lock-free
+// ArcSwap ops. Async is retained as the ContextManager helper API contract —
+// callers await uniformly, and the event-log provider calls regain await
+// points under ADR-049 Decision 7 (async-provider-trait conversion).
+#[allow(clippy::unused_async)]
 pub async fn close_context(
     handle: &ContextHandle,
     initiator_did: &DID,
@@ -591,7 +596,7 @@ pub async fn close_context(
     // (§7.3.1, §9.9.3).
     timestamp_secs: u64,
 ) -> Result<CloseResult, ContextError> {
-    let state = handle.state().await;
+    let state = handle.state();
     if state != ContextState::Active {
         return Err(ContextError::ContextNotActive);
     }
@@ -602,7 +607,7 @@ pub async fn close_context(
         )));
     }
 
-    handle.transition_to(&ContextState::Closing).await?;
+    handle.transition_to(&ContextState::Closing)?;
 
     let context_id = handle.context_id().to_owned();
     let context_id_bytes = context_id_to_bytes(&context_id);
@@ -646,6 +651,11 @@ pub struct CloseResult {
 ///
 /// Returns [`ContextError::InvalidTransition`] if the context is not in
 /// `Closing` state.
+// ADR-049 §Decision 12: `transition_to` is now a synchronous lock-free ArcSwap
+// store. Async is retained as the ContextManager helper API contract — callers
+// await uniformly, and the crypto/transport/event-log provider calls regain
+// await points under ADR-049 Decision 7 (async-provider-trait conversion).
+#[allow(clippy::unused_async)]
 pub async fn finalize_close(
     handle: &ContextHandle,
     crypto: &MlsCryptoProvider,
@@ -661,7 +671,7 @@ pub async fn finalize_close(
     // Key destruction is irreversible — once zeroized, encrypted content
     // becomes permanently unreadable. If the transition fails (e.g. context
     // is not in Closing state), no keys must be destroyed.
-    handle.transition_to(&ContextState::Closed).await?;
+    handle.transition_to(&ContextState::Closed)?;
 
     let context_id = handle.context_id().to_owned();
     let context_id_bytes = context_id_to_bytes(&context_id);
@@ -736,7 +746,7 @@ pub async fn handle_ttl_expiry_with_transport(
     event_log: &dyn ContextEventLogProvider,
     expiry_deadline_secs: u64,
 ) -> Result<(), ContextError> {
-    let state = handle.state().await;
+    let state = handle.state();
     if state != ContextState::Active && state != ContextState::Expired {
         return Err(ContextError::ContextNotActive);
     }
@@ -777,6 +787,11 @@ pub async fn handle_ttl_expiry_with_transport(
 /// State transition is inherently idempotent (an already-`Expired` context
 /// is recognized as transitioned), but crypto destruction and event log
 /// appends are **not** idempotent — hence the bitmask guard.
+// ADR-049 §Decision 12: `state`/`transition_to` are now synchronous lock-free
+// ArcSwap ops. Async is retained as the ContextManager helper API contract —
+// callers await uniformly, and the crypto/transport/event-log provider calls
+// regain await points under ADR-049 Decision 7 (async-provider-trait conversion).
+#[allow(clippy::unused_async)]
 pub async fn try_ttl_expiry_cleanup(
     handle: &ContextHandle,
     crypto: &MlsCryptoProvider,
@@ -808,9 +823,9 @@ pub async fn try_ttl_expiry_cleanup(
     // 1. State transition (idempotent — skip if already Expired or already
     //    completed on a prior attempt).
     if result.completed_steps & STEP_STATE_TRANSITIONED == 0 {
-        let state = handle.state().await;
+        let state = handle.state();
         match state {
-            ContextState::Active => match handle.transition_to(&ContextState::Expired).await {
+            ContextState::Active => match handle.transition_to(&ContextState::Expired) {
                 Ok(_) => result.set_step(STEP_STATE_TRANSITIONED),
                 Err(e) => {
                     let msg = format!("state transition failed: {e}");
@@ -1426,8 +1441,8 @@ mod tests {
         let crypto = mk_crypto();
         let transport = NullTransport;
         let event_log = CapturingEventLog::default();
-        let handle = active_handle("ctx-close-actor", MemoryScope::Full).await;
-        handle.transition_to(&ContextState::Closing).await.unwrap();
+        let handle = active_handle("ctx-close-actor", MemoryScope::Full);
+        handle.transition_to(&ContextState::Closing).unwrap();
         finalize_close(
             &handle,
             crypto.as_ref(),
@@ -1456,7 +1471,7 @@ mod tests {
     async fn handle_ttl_expiry_stamps_system_timer_actor_did() {
         let crypto = mk_crypto();
         let event_log = CapturingEventLog::default();
-        let handle = active_handle("ctx-ttl-actor", MemoryScope::Full).await;
+        let handle = active_handle("ctx-ttl-actor", MemoryScope::Full);
         handle_ttl_expiry(&handle, crypto.as_ref(), &event_log, 1_700_000_000)
             .await
             .unwrap();
@@ -1472,13 +1487,13 @@ mod tests {
         );
     }
 
-    async fn active_handle(context_id: &str, memory_scope: MemoryScope) -> ContextHandle {
+    fn active_handle(context_id: &str, memory_scope: MemoryScope) -> ContextHandle {
         let params = ContextParams {
             memory_scope,
             ..Default::default()
         };
         let handle = ContextHandle::new(context_id.to_owned(), params);
-        handle.transition_to(&ContextState::Active).await.ok();
+        handle.transition_to(&ContextState::Active).ok();
         handle
     }
 
@@ -1493,8 +1508,8 @@ mod tests {
         let crypto = mk_crypto();
         let transport = NullTransport;
         let event_log = NullEventLog;
-        let handle = active_handle("ctx-1", MemoryScope::Full).await;
-        handle.transition_to(&ContextState::Closing).await.unwrap();
+        let handle = active_handle("ctx-1", MemoryScope::Full);
+        handle.transition_to(&ContextState::Closing).unwrap();
         let res = finalize_close(
             &handle,
             crypto.as_ref(),
@@ -1511,8 +1526,8 @@ mod tests {
         let crypto = mk_crypto();
         let transport = NullTransport;
         let event_log = NullEventLog;
-        let handle = active_handle("ctx-eph", MemoryScope::Ephemeral).await;
-        handle.transition_to(&ContextState::Closing).await.unwrap();
+        let handle = active_handle("ctx-eph", MemoryScope::Ephemeral);
+        handle.transition_to(&ContextState::Closing).unwrap();
         let res = finalize_close(
             &handle,
             crypto.as_ref(),
@@ -1593,7 +1608,7 @@ mod tests {
         // carrying the STRING id, so production resolves id -> bytes via the
         // chokepoint at :792.
         let event_log = NullEventLog;
-        let handle = active_handle(&id, MemoryScope::Ephemeral).await;
+        let handle = active_handle(&id, MemoryScope::Ephemeral);
         let result = try_ttl_expiry_cleanup(
             &handle,
             crypto.as_ref(),
@@ -1639,10 +1654,10 @@ mod tests {
     async fn handle_ttl_expiry_transitions_active_to_expired() {
         let crypto = mk_crypto();
         let event_log = NullEventLog;
-        let handle = active_handle("ctx-ttl", MemoryScope::Full).await;
+        let handle = active_handle("ctx-ttl", MemoryScope::Full);
         let res = handle_ttl_expiry(&handle, crypto.as_ref(), &event_log, 1_700_000_000).await;
         assert!(res.is_ok());
-        assert_eq!(handle.state().await, ContextState::Expired);
+        assert_eq!(handle.state(), ContextState::Expired);
     }
 
     #[tokio::test]
@@ -1661,7 +1676,7 @@ mod tests {
         let event_log: std::sync::Arc<dyn ContextEventLogProvider> =
             std::sync::Arc::new(NullEventLog);
         let mut timer = TtlTimer::new();
-        let handle = active_handle("ctx-tt", MemoryScope::Full).await;
+        let handle = active_handle("ctx-tt", MemoryScope::Full);
         timer.spawn(Duration::from_hours(1), handle, crypto, event_log);
         assert!(timer.is_active());
         timer.cancel();
@@ -1674,7 +1689,7 @@ mod tests {
             std::sync::Arc::new(NullEventLog);
         let clock: std::sync::Arc<dyn scp_clock::Clock> = std::sync::Arc::new(TestClock::new(1000));
         let mut timer = TtlTimer::with_clock(clock);
-        let handle = active_handle("ctx-tt", MemoryScope::Full).await;
+        let handle = active_handle("ctx-tt", MemoryScope::Full);
         timer.spawn(Duration::from_mins(10), handle, crypto, event_log);
         let remaining = timer.remaining_secs().unwrap();
         assert_eq!(remaining, 600);

@@ -205,7 +205,7 @@ async fn ac1_create_single_admin_context() {
         .create_context("ctx-single-admin".into(), params, alice(), None)
         .await
         .unwrap();
-    assert_eq!(handle.try_read_state().unwrap(), ContextState::Active);
+    assert_eq!(handle.state(), ContextState::Active);
 }
 
 #[tokio::test]
@@ -223,7 +223,7 @@ async fn ac1_create_threshold_context() {
         .create_context("ctx-threshold".into(), params, alice(), None)
         .await
         .unwrap();
-    assert_eq!(handle.try_read_state().unwrap(), ContextState::Active);
+    assert_eq!(handle.state(), ContextState::Active);
 }
 
 #[tokio::test]
@@ -240,7 +240,7 @@ async fn ac1_create_majority_context() {
         .create_context("ctx-majority".into(), params, alice(), None)
         .await
         .unwrap();
-    assert_eq!(handle.try_read_state().unwrap(), ContextState::Active);
+    assert_eq!(handle.state(), ContextState::Active);
 }
 
 #[tokio::test]
@@ -257,7 +257,7 @@ async fn ac1_create_unanimity_context() {
         .create_context("ctx-unanimity".into(), params, alice(), None)
         .await
         .unwrap();
-    assert_eq!(handle.try_read_state().unwrap(), ContextState::Active);
+    assert_eq!(handle.state(), ContextState::Active);
 }
 
 // =========================================================================
