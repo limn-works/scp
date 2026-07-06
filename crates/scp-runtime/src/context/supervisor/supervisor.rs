@@ -3873,55 +3873,6 @@ impl Supervisor {
         self.actors.iter().map(|e| e.key().clone()).collect()
     }
 
-    /// Spawn a new `ContextActor` task, register its handle, and return
-    /// the handle. The mailbox receiver is moved into the spawned task
-    /// so it never escapes this function.
-    ///
-    /// The spawn site is `pub(in crate::context)` so the context
-    /// module's lifecycle handlers can spawn actors at
-    /// `create_context` / `restore_context` time. Code outside
-    /// `crate::context::` has no way to spawn an actor.
-    ///
-    /// This is the no-state SKELETON spawn path: it constructs the actor
-    /// via [`ContextActor::new_skeleton`], whose `run()` loop drains the
-    /// mailbox and ACKs every command through `skeleton_dispatch`
-    /// (`NotImplemented`). The real per-domain handlers run on the
-    /// state-owning actor spawned via [`Self::spawn_actor_with_state`].
-    ///
-    /// `dead_code` allow: production bootstrap uses
-    /// [`Self::spawn_actor_with_state`], so this skeleton spawn is
-    /// exercised only by the unit tests in this module.
-    #[allow(dead_code)]
-    pub(in crate::context) async fn spawn_actor(
-        &self,
-        ctx_id: String,
-        mailbox_capacity: Option<usize>,
-    ) -> ContextActorHandle {
-        let capacity = mailbox_capacity.unwrap_or(ACTOR_MAILBOX_CAPACITY);
-        let (tx, rx) = tokio::sync::mpsc::channel::<ContextCommand>(capacity);
-
-        let handle = ContextActorHandle::from_sender(tx);
-        {
-            // Write-path mutation: register the handle under the write lock.
-            let _guard = self.write_lock.lock().await;
-            self.actors.insert(ctx_id.clone(), handle.clone());
-        }
-
-        // Spawn the actor's dispatch loop. This state-less `spawn_actor`
-        // path constructs the actor via [`ContextActor::new_skeleton`],
-        // whose `run()` loop ACKs every command through
-        // `skeleton_dispatch`. It is dead-code / test-only: production
-        // bootstrap spawns state-owning actors via
-        // [`Self::spawn_actor_with_state`] (constructed via
-        // [`ContextActor::new`]), which own their context state directly.
-        let inbox = rx;
-        tokio::spawn(async move {
-            Box::pin(crate::context::actor::ContextActor::new_skeleton(ctx_id, inbox).run()).await;
-        });
-
-        handle
-    }
-
     /// Spawn a new `ContextActor` task that owns drained
     /// [`PerContextState`](crate::context::actor::PerContextState) +
     /// [`ActorDeps`](crate::context::actor::ActorDeps) directly
@@ -3955,9 +3906,7 @@ impl Supervisor {
     /// `run()` loop dispatches every command variant to the real
     /// per-domain handlers via
     /// [`ContextActor::dispatch_state`](crate::context::actor::ContextActor)
-    /// (`&mut self.state` + `&self.deps`) — not the skeleton dispatch
-    /// path, which is reserved for the no-state
-    /// [`ContextActor::new_skeleton`] actors.
+    /// (`&mut self.state` + `&self.deps`).
     ///
     /// # Errors
     ///
@@ -13375,20 +13324,6 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err2, ContextError::InvalidState(_)));
-    }
-
-    #[tokio::test]
-    async fn spawn_actor_registers_handle_under_write_lock() {
-        let s = test_supervisor();
-        let _handle = s.spawn_actor("ctx-42".to_owned(), None).await;
-        assert!(s.lookup("ctx-42").is_some());
-        // Second spawn with the same ID overwrites: the skeleton
-        // `spawn_actor` overwrites by design. Duplicate-spawn rejection
-        // is enforced in the owned-state `spawn_actor_with_state` path
-        // (first-writer-wins `CreationFailed`), covered by
-        // `spawn_actor_with_state_rejects_duplicate_context_id`.
-        let _handle2 = s.spawn_actor("ctx-42".to_owned(), None).await;
-        assert!(s.lookup("ctx-42").is_some());
     }
 
     // -----------------------------------------------------------------

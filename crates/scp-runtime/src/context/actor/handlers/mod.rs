@@ -17,10 +17,9 @@
 //! are rejected on the mailbox in favor of the supervisor's
 //! custody-generic two-phase path (see `broadcast.rs`). The
 //! migration-window stub bodies (which replied `NotImplemented`) have
-//! been deleted; the only surviving `NotImplemented` producer is the
-//! state-less
-//! [`ContextActor::skeleton_dispatch`](crate::context::actor::ContextActor)
-//! path exercised by the actor's smoke tests.
+//! been deleted, along with the test-only skeleton-dispatch path that
+//! was their last vestige: the live actor mailbox no longer produces
+//! `NotImplemented`.
 //!
 //! # `unused_async` allow, scoped module-wide
 //!

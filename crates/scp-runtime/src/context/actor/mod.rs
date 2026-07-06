@@ -69,7 +69,6 @@ pub use scp_protocol::context::ContextError;
 // ContextActor — the per-context dispatch loop
 // ---------------------------------------------------------------------------
 
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
@@ -114,29 +113,21 @@ pub struct ContextActor {
     /// Command inbox. Paired with the `Sender` held by
     /// [`ContextActorHandle`].
     inbox: mpsc::Receiver<ContextCommand>,
-    /// Owned per-context state. `Some` for actors constructed via
-    /// [`Self::new`] with a full state payload — the production path:
-    /// every production spawn
+    /// Owned per-context state, wrapped in the Class-S fail-closed-persist
+    /// cell. Every actor is constructed via [`Self::new`] with a full state
+    /// payload — the sole spawn path
     /// ([`crate::context::supervisor::supervisor::Supervisor::spawn_actor_with_state`])
-    /// carries `Some(state)`. `None` only for skeleton actors
-    /// constructed via the test-only [`Self::new_skeleton`].
+    /// carries it.
     ///
-    /// State-owning actors consume the state on every command: the
-    /// run-loop's `dispatch` threads it as `&mut ClassSCell` through
-    /// `dispatch_state` into the real per-domain handler. Only
-    /// skeleton actors (state = `None`) fall through to
-    /// `skeleton_dispatch`, the sole surviving `NotImplemented`
-    /// producer.
-    ///
-    /// Two-mode is bounded: this field becomes non-`Option` when the
-    /// test-only skeleton apparatus is retired in a follow-on chunk.
+    /// The actor consumes the state on every command: the run-loop's
+    /// `dispatch` threads it as `&mut ClassSCell` through `dispatch_state`
+    /// into the real per-domain handler.
     // read by the run-loop's dispatch/dispatch_state path
-    state: Option<class_s::ClassSCell>,
-    /// Owned dependency bundle. `Some` / `None` mirrors [`Self::state`]
-    /// — the two are always both `Some` or both `None`. Two-mode is
-    /// bounded identically.
+    state: class_s::ClassSCell,
+    /// Owned dependency bundle, sourced alongside [`Self::state`] at
+    /// construction time.
     // read by the run-loop's dispatch/dispatch_state path
-    deps: Option<deps::ActorDeps>,
+    deps: deps::ActorDeps,
     /// TTL expiry interval timer. `None` until the supervisor-side TTL
     /// timer path (`task_set`-spawned timers that mailbox
     /// `TtlCloseCommand::FireTimer`) migrates onto the run-loop's
@@ -169,21 +160,6 @@ pub struct ContextActor {
     /// Initialized `false` at actor construction.
     // read by the run-loop's persistence coalesce arm
     dirty: bool,
-    /// Full-supervisor pointer captured at construction. Today its
-    /// only read is the `dispatch` pre-check that partitions
-    /// state-owning actors from skeleton actors — handler bodies reach
-    /// the supervisor through the capability-reduced
-    /// [`deps::ActorDeps::supervisor`] handle instead. Removed when
-    /// the test-only skeleton apparatus is retired in a follow-on
-    /// chunk.
-    ///
-    /// Sourced from [`deps::ActorDeps::supervisor`] via
-    /// [`crate::context::supervisor::SupervisorHandle::shim_supervisor`]
-    /// at actor construction time. `None` for skeleton-mode actors
-    /// constructed via [`Self::new_skeleton`] (those route through
-    /// the actor's terminal-NotImplemented fallback because they have
-    /// no state/deps to operate on).
-    shim_supervisor: Option<Arc<crate::context::supervisor::Supervisor>>,
 }
 
 impl ContextActor {
@@ -196,9 +172,7 @@ impl ContextActor {
     /// actor task, making the actor their sole owner.
     ///
     /// Visibility is `pub(in crate::context)` — only
-    /// `crate::context::supervisor::supervisor` constructs actors
-    /// (the test-only [`Self::new_skeleton`] is also `pub(in
-    /// crate::context)` for the same reason).
+    /// `crate::context::supervisor::supervisor` constructs actors.
     ///
     /// # Construction of auxiliary fields
     ///
@@ -225,10 +199,6 @@ impl ContextActor {
         inbox: mpsc::Receiver<ContextCommand>,
     ) -> Self {
         let context_id = hex_encode_context_id(&state.context_id);
-        // Capture the shim-supervisor pointer before moving `deps` into
-        // the actor: `dispatch` reads its presence to partition
-        // state-owning actors from skeleton actors.
-        let shim_supervisor = Some(deps.supervisor.shim_supervisor());
         Self {
             context_id,
             inbox,
@@ -236,52 +206,12 @@ impl ContextActor {
             // cell hands out no whole `&mut PerContextState` (no `DerefMut`, no
             // `state_mut`); every handler mutates through the cell's persist-on-
             // commit combinators or the airtight `class_c_view()` (ADR-049 §9).
-            state: Some(class_s::ClassSCell::new(state)),
-            deps: Some(deps),
+            state: class_s::ClassSCell::new(state),
+            deps,
             ttl_timer: None,
             governance_timeout: None,
             last_persisted_at: Instant::now(),
             dirty: false,
-            shim_supervisor,
-        }
-    }
-
-    /// Construct a skeleton actor without state or deps. Used by the
-    /// module's unit-test fixtures and by the dead-code / test-only
-    /// [`crate::context::supervisor::supervisor::Supervisor::spawn_actor`]
-    /// path. No production context uses the skeleton — production spawns
-    /// state-owning actors via [`Self::new`].
-    ///
-    /// The skeleton's `run()` loop drains commands from the inbox and
-    /// ACKs each with `Err(NotImplemented)` via `skeleton_dispatch` —
-    /// the sole surviving `NotImplemented` producer, since a skeleton
-    /// actor carries no state for the real handlers to operate on.
-    ///
-    /// Visibility matches [`Self::new`]: `pub(in crate::context)`.
-    ///
-    /// `dead_code` allow: no production caller. Production spawns
-    /// state-owning actors via [`Self::new`]; this skeleton constructor
-    /// is exercised only by the module's existing unit tests, pending
-    /// removal of the skeleton apparatus in a follow-on chunk.
-    #[allow(dead_code)]
-    pub(in crate::context) fn new_skeleton(
-        context_id: String,
-        inbox: mpsc::Receiver<ContextCommand>,
-    ) -> Self {
-        Self {
-            context_id,
-            inbox,
-            state: None,
-            deps: None,
-            ttl_timer: None,
-            governance_timeout: None,
-            // `Instant::now()` initializes the coalescing window even
-            // though the skeleton dispatch never reads it — avoids
-            // carrying a magic-value sentinel. State-owning actors
-            // populate this field identically via [`Self::new`].
-            last_persisted_at: Instant::now(),
-            dirty: false,
-            shim_supervisor: None,
         }
     }
 
@@ -297,21 +227,10 @@ impl ContextActor {
     /// `biased;` ordering keeps shutdown priority and gives deterministic
     /// dispatch under test reproducers.
     ///
-    /// # State-owning vs. skeleton-mode actors
-    ///
-    /// State-owning actors (constructed via [`Self::new`] — the
-    /// production shape) carry both `state` and `deps`. The dispatch
-    /// routes each command through `dispatch_state` into the matching
-    /// handler module's actor-shape `dispatch` entry point, which
-    /// operates on the actor-owned state cell and the
-    /// capability-reduced deps.
-    ///
-    /// Skeleton-mode actors (constructed via the test-only
-    /// [`Self::new_skeleton`]) carry no state or deps — they fall
-    /// through to the synchronous `skeleton_dispatch` path that ACKs
-    /// every command with `NotImplemented`. This preserves the
-    /// pre-Phase-2A test fixtures' behaviour; no production spawn uses
-    /// it.
+    /// The actor owns both `state` and `deps`; the dispatch routes each
+    /// command through `dispatch_state` into the matching handler
+    /// module's actor-shape `dispatch` entry point, which operates on the
+    /// actor-owned state cell and the capability-reduced deps.
     pub async fn run(mut self) {
         // Kick the persistence coalesce timer off the floor: the first
         // mutation will set `dirty = true`, then the `select!` arm
@@ -355,14 +274,11 @@ impl ContextActor {
                             }
                             if is_prepare_replace {
                                 // Claimed terminal iff the handler set
-                                // `lifecycle_state == Closed`. A skeleton
-                                // actor (no owned state) trivially succeeds.
-                                let claimed = self.state.as_ref().is_none_or(|s| {
-                                    matches!(
-                                        s.lifecycle_state,
-                                        state::ContextLifecycleState::Closed
-                                    )
-                                });
+                                // `lifecycle_state == Closed`.
+                                let claimed = matches!(
+                                    self.state.lifecycle_state,
+                                    state::ContextLifecycleState::Closed
+                                );
                                 if claimed {
                                     break;
                                 }
@@ -417,41 +333,10 @@ impl ContextActor {
         }
     }
 
-    /// Dispatch a single command to its matching handler: takes the
-    /// actor-owned state/deps and threads them through
-    /// `dispatch_state` into the per-domain actor-shape `dispatch`
-    /// entry points.
-    ///
-    /// Skeleton-mode actors (no state/deps) fall through to
-    /// `skeleton_dispatch` and ACK every variant with
-    /// `NotImplemented`.
+    /// Dispatch a single command to its matching handler: threads the
+    /// actor-owned state/deps through `dispatch_state` into the
+    /// per-domain actor-shape `dispatch` entry points.
     async fn dispatch(&mut self, cmd: ContextCommand) {
-        // Skeleton path: no state, no deps. Fall through to the
-        // synchronous ACK helper that replies `NotImplemented` to every
-        // variant. Used by the pre-Phase-2A test fixtures.
-        if self.state.is_none() || self.deps.is_none() || self.shim_supervisor.is_none() {
-            Self::skeleton_dispatch(cmd);
-            return;
-        }
-
-        // Take the state/deps out so we can pass them as exclusive
-        // borrows without re-borrow conflicts. The pre-check above
-        // partitions skeleton actors from state-bearing actors; any
-        // missing field after that point is an internal invariant
-        // violation and should fail loudly, not degrade to skeleton
-        // dispatch. The `shim_supervisor` field is not consumed here —
-        // its presence was checked above, and every handler reaches
-        // the supervisor through `deps.supervisor` (the
-        // capability-reduced
-        // [`SupervisorHandle`](crate::context::supervisor::SupervisorHandle)).
-        let (mut cell, deps) = {
-            #[allow(clippy::expect_used)]
-            (
-                self.state.take().expect("state-bearing actor lost state"),
-                self.deps.take().expect("state-bearing actor lost deps"),
-            )
-        };
-
         // `dispatch_state` receives the `&mut ClassSCell` directly and threads
         // it into every domain handler. Every domain mutates through the cell's
         // combinators — the fail-closed `commit_class_s_*` / `ClassSCommitToken`
@@ -461,14 +346,13 @@ impl ContextActor {
         // removal in `unsubscribe_broadcast` routes through the restricted
         // `MembershipClassCMut::remove_subscriber` (a public-content subscriber
         // unsubscribe is best-effort-acceptable; see its doc, ADR-049 §9).
-        let outcome = Self::dispatch_state(&mut cell, &deps, cmd).await;
+        //
+        // `state` and `deps` are disjoint fields of `self`, so the
+        // borrow checker permits the simultaneous `&mut`/`&` borrows.
+        let outcome = Self::dispatch_state(&mut self.state, &self.deps, cmd).await;
         if outcome.mutated {
             self.dirty = true;
         }
-
-        // Restore.
-        self.state = Some(cell);
-        self.deps = Some(deps);
     }
 
     /// State-owning dispatch. Routes each `ContextCommand` variant to
@@ -646,764 +530,6 @@ impl ContextActor {
         // synchronously within each handler) until the migration
         // completes.
     }
-
-    /// Skeleton dispatch — the test-only path for state-less skeleton
-    /// actors. Matches every variant and ACKs via the embedded
-    /// `oneshot::Sender`. The real, state-owning actor does not use this:
-    /// its `run()` loop routes commands through `dispatch_state` to the
-    /// per-domain handlers described in plan §"ContextActor".
-    ///
-    /// The function body is a flat `match` on the outer
-    /// [`ContextCommand`] variants. Each arm replies `NotImplemented` and
-    /// returns `Outcome::err`, since a skeleton actor carries no
-    /// `&mut PerContextState` for the real handlers to operate on.
-    /// Discarding the `Outcome` is fine for the skeleton — only the real
-    /// `dispatch_state` path reads the `Outcome::mutated` flag to flip
-    /// `self.dirty`.
-    ///
-    /// Lifecycle-control commands use a dedicated fast path that acks
-    /// with `Ok(())` so the bridge's `BridgeInstanceCore::suspend()`
-    /// default body can complete its pause/persist/shutdown sequence
-    /// without each actor returning `NotImplemented` on the control
-    /// channel (see `handlers/lifecycle_control.rs`).
-    #[allow(clippy::needless_pass_by_value)] // consumed by the dispatch
-    fn skeleton_dispatch(cmd: ContextCommand) {
-        // Route every variant to its matching handler's oneshot-ack so
-        // callers learn the outcome even though a skeleton actor owns no
-        // state (commands for such contexts are handled by the
-        // supervisor-side dispatch shim, not the actor). We MUST route
-        // the oneshot sender out of the variant — synchronously, in
-        // this function — because the real handler modules take a
-        // `&mut PerContextState` which the skeleton actor does not
-        // carry. Reproducing the ack shape inline keeps the
-        // skeleton's mailbox contract (`send -> ack`) intact.
-        fn ack_not_impl<T>(
-            reply: tokio::sync::oneshot::Sender<Result<T, ContextError>>,
-            which: &'static str,
-        ) {
-            let _ = reply.send(Err(ContextError::NotImplemented(format!(
-                "{which} — migrates in the matching handler commit of ADR-049"
-            ))));
-        }
-        fn ack_ok(reply: tokio::sync::oneshot::Sender<Result<(), ContextError>>) {
-            let _ = reply.send(Ok(()));
-        }
-
-        match cmd {
-            ContextCommand::Messaging(sub) => Self::skeleton_dispatch_messaging(sub),
-            ContextCommand::Lifecycle(sub) => Self::skeleton_dispatch_lifecycle(sub),
-            ContextCommand::Governance(sub) => Self::skeleton_dispatch_governance(sub),
-            ContextCommand::Broadcast(sub) => Self::skeleton_dispatch_broadcast(sub),
-            ContextCommand::Economy(sub) => Self::skeleton_dispatch_economy(sub),
-            ContextCommand::TrustRecovery(sub) => Self::skeleton_dispatch_trust_recovery(sub),
-            ContextCommand::Standing(sub) => Self::skeleton_dispatch_standing(sub),
-            ContextCommand::TtlClose(sub) => Self::skeleton_dispatch_ttl_close(sub),
-            ContextCommand::Tools(sub) => Self::skeleton_dispatch_tools(sub),
-            // Queries variants — skeleton dispatch acks each typed
-            // oneshot with `Err(NotImplemented)` so the caller learns
-            // immediately that the actor did not own the state to
-            // answer. The real answer path lives on
-            // `Supervisor::dispatch_query`, which bypasses this skeleton
-            // and resolves the query on the supervisor side under the
-            // query shim. The skeleton only sees query commands if a caller
-            // mistakenly routes through the actor's mailbox — the real
-            // FFI dispatch goes through `Supervisor::dispatch_query`.
-            ContextCommand::Queries(q) => Self::skeleton_dispatch_queries(q),
-            // The skeleton actor owns no state, so every saga-phase variant
-            // acks its typed oneshot with `Err(NotImplemented)` — the real
-            // Prepare-A/Prepare-B bodies run only on a stateful actor via
-            // `dispatch_state` → `handlers::saga::dispatch`. PrepareA replies a
-            // `PrepareAOutcome` and PrepareB a `PrepareBOutcome` (each carrying a
-            // §6.2.4 policy reject on the SUCCESS channel as a `SagaReject`); the
-            // skeleton routes them through the unchanged `Err(ContextError)`
-            // channel, so each phase arm acks separately.
-            ContextCommand::SagaPhase(SagaPhaseMessage::PrepareA { reply, .. }) => {
-                ack_not_impl(reply, "saga_phase");
-            }
-            ContextCommand::SagaPhase(SagaPhaseMessage::PrepareB { reply, .. }) => {
-                ack_not_impl(reply, "saga_phase");
-            }
-            // CommitBReserve / CommitBSettle reply distinct outcome shapes, so
-            // they are acked separately from the unit-reply phase arms.
-            ContextCommand::SagaPhase(SagaPhaseMessage::CommitBReserve { reply, .. }) => {
-                ack_not_impl(reply, "saga_phase");
-            }
-            ContextCommand::SagaPhase(SagaPhaseMessage::CommitBSettle { reply, .. }) => {
-                ack_not_impl(reply, "saga_phase");
-            }
-            // CommitACheckWitness replies a distinct `bool` outcome shape, so it
-            // is acked separately from the unit-reply phase arms.
-            ContextCommand::SagaPhase(SagaPhaseMessage::CommitACheckWitness { reply, .. }) => {
-                ack_not_impl(reply, "saga_phase");
-            }
-            ContextCommand::SagaPhase(
-                SagaPhaseMessage::CommitA { reply, .. }
-                | SagaPhaseMessage::Abort { reply, .. }
-                | SagaPhaseMessage::EmitDivergenceMarker { reply, .. },
-            ) => {
-                ack_not_impl(reply, "saga_phase");
-            }
-            ContextCommand::LifecycleControl(LifecycleControlCommand::Pause { reply }) => {
-                // Ack Ok — the bridge's `suspend()` default body sends
-                // `Pause` and expects an Ok reply to proceed to
-                // `PersistSync`. Commit 11's real handler keeps the
-                // same Ok-on-pause contract.
-                ack_ok(reply);
-            }
-            ContextCommand::LifecycleControl(LifecycleControlCommand::PersistSync { reply }) => {
-                // Ack Ok — a skeleton actor owns no state, so there is
-                // nothing to persist. Semantically equivalent to
-                // "flush buffer is empty, nothing to write".
-                ack_ok(reply);
-            }
-            ContextCommand::LifecycleControl(LifecycleControlCommand::Shutdown { reply }) => {
-                // Ack Ok and let the outer `run()` loop exit after this
-                // dispatch returns (the caller detected `is_terminal`
-                // before invoking us).
-                ack_ok(reply);
-            }
-            ContextCommand::LifecycleControl(LifecycleControlCommand::PrepareForReplace {
-                reply,
-                ..
-            }) => {
-                // Defensive: import only ever sends PrepareForReplace to
-                // a looked-up real (stateful) actor, never a skeleton. A
-                // skeleton owns no crypto/state, so teardown is a no-op
-                // success; ack Ok and let `run()` exit (`is_terminal`).
-                ack_ok(reply);
-            }
-            // The test-only fault-injection variant carries no reply and is
-            // only meaningful for a state-bearing actor (the watchdog tests
-            // spawn one). A skeleton actor owns no state — make it a no-op.
-            #[cfg(feature = "testing")]
-            ContextCommand::LifecycleControl(LifecycleControlCommand::TestInducePanic {
-                ..
-            }) => {}
-        }
-    }
-
-    /// Skeleton-dispatch helper for [`ContextCommand::Messaging`].
-    /// Extracted from [`Self::skeleton_dispatch`] so the outer function
-    /// stays below the `too_many_lines` clippy threshold (mirrors the
-    /// per-domain `skeleton_dispatch_*` helpers). Each arm acks the
-    /// variant's embedded oneshot with `Err(NotImplemented)`: the real
-    /// messaging path runs through `Supervisor::dispatch_command` /
-    /// `Supervisor::drain_*`, not the actor's skeleton mailbox.
-    fn skeleton_dispatch_messaging(sub: MessagingCommand) {
-        fn ack_not_impl<T>(
-            reply: tokio::sync::oneshot::Sender<Result<T, ContextError>>,
-            which: &'static str,
-        ) {
-            let _ = reply.send(Err(ContextError::NotImplemented(format!(
-                "{which} — migrates in the matching handler commit of ADR-049"
-            ))));
-        }
-        match sub {
-            MessagingCommand::SendMessage { reply, .. } => {
-                ack_not_impl(
-                    reply,
-                    "messaging::send_message (use Supervisor::dispatch_command)",
-                );
-            }
-            MessagingCommand::DeliverIncoming { reply, .. } => {
-                ack_not_impl(
-                    reply,
-                    "messaging::deliver_incoming (use Supervisor::dispatch_command)",
-                );
-            }
-            MessagingCommand::DrainEvents { reply, .. }
-            | MessagingCommand::DrainEquivocationAlerts { reply, .. } => {
-                ack_not_impl(
-                    reply,
-                    "messaging::drain_* (use Supervisor::drain_events / drain_equivocation_alerts)",
-                );
-            }
-            MessagingCommand::SendPseudonymAnnouncement { reply, .. } => {
-                ack_not_impl(
-                    reply,
-                    "messaging::send_pseudonym_announcement (use Supervisor::dispatch_command)",
-                );
-            }
-            MessagingCommand::ReportDegradedMode { reply, .. } => {
-                ack_not_impl(
-                    reply,
-                    "messaging::report_degraded_mode (use Supervisor::dispatch_command)",
-                );
-            }
-            MessagingCommand::BuildLocalCheckpoint { reply, .. } => {
-                ack_not_impl(
-                    reply,
-                    "messaging::build_local_checkpoint (use Supervisor — actor mailbox)",
-                );
-            }
-            MessagingCommand::CompareRemoteCheckpoint { reply, .. } => {
-                ack_not_impl(
-                    reply,
-                    "messaging::compare_remote_checkpoint (use Supervisor — actor mailbox)",
-                );
-            }
-            MessagingCommand::SendHeartbeat { reply, .. } => {
-                ack_not_impl(
-                    reply,
-                    "messaging::send_heartbeat (use Supervisor::send_heartbeat — actor mailbox)",
-                );
-            }
-            #[cfg(feature = "testing")]
-            MessagingCommand::SeedPeerPseudonym { reply, .. } => {
-                ack_not_impl(
-                    reply,
-                    "messaging::seed_peer_pseudonym (test-only — use Supervisor::dispatch_command)",
-                );
-            }
-            #[cfg(feature = "testing")]
-            MessagingCommand::TestInsertMember { reply, .. } => {
-                ack_not_impl(
-                    reply,
-                    "messaging::test_insert_member (test-only — use Supervisor::dispatch_command)",
-                );
-            }
-        }
-    }
-
-    /// Skeleton-dispatch helper for [`ContextCommand::Queries`]. Extracted
-    /// from [`Self::skeleton_dispatch`] so the outer function stays below
-    /// the `too_many_lines` clippy threshold. The body is a flat match on
-    /// every [`QueriesCommand`] variant; each arm acks with
-    /// `Err(NotImplemented)` via the variant's embedded oneshot sender.
-    ///
-    /// Shim-routed query dispatch does not go through this function — see
-    /// the comment on the sole call site in [`Self::skeleton_dispatch`].
-    fn skeleton_dispatch_queries(q: QueriesCommand) {
-        fn ack_not_impl<T>(
-            reply: tokio::sync::oneshot::Sender<Result<T, ContextError>>,
-            which: &'static str,
-        ) {
-            let _ = reply.send(Err(ContextError::NotImplemented(format!(
-                "{which} — migrates in the matching handler commit of ADR-049"
-            ))));
-        }
-        match q {
-            QueriesCommand::ReadContextState { reply, .. } => {
-                ack_not_impl(reply, "queries::read_context_state");
-            }
-            QueriesCommand::LocalPseudonym { reply, .. } => {
-                ack_not_impl(reply, "queries::local_pseudonym");
-            }
-            QueriesCommand::GetBroadcastKeyForLocalAuthor { reply, .. } => {
-                ack_not_impl(reply, "queries::get_broadcast_key_for_local_author");
-            }
-            QueriesCommand::MemberCount { reply, .. } => {
-                ack_not_impl(reply, "queries::member_count");
-            }
-            QueriesCommand::IsMember { reply, .. } => {
-                ack_not_impl(reply, "queries::is_member");
-            }
-            QueriesCommand::MemberDids { reply, .. } => {
-                ack_not_impl(reply, "queries::member_dids");
-            }
-            QueriesCommand::MemberRole { reply, .. } => {
-                ack_not_impl(reply, "queries::member_role");
-            }
-            QueriesCommand::ContextParams { reply, .. } => {
-                ack_not_impl(reply, "queries::context_params");
-            }
-            QueriesCommand::GetRoleState { reply, .. } => {
-                ack_not_impl(reply, "queries::get_role_state");
-            }
-            QueriesCommand::HasEstablishedToolInterface { reply, .. } => {
-                ack_not_impl(reply, "queries::has_established_tool_interface");
-            }
-            QueriesCommand::PendingCommits { reply, .. } => {
-                ack_not_impl(reply, "queries::pending_commits");
-            }
-            QueriesCommand::CommitFault { reply, .. } => {
-                ack_not_impl(reply, "queries::commit_fault");
-            }
-            QueriesCommand::EventLogEntries { reply, .. } => {
-                ack_not_impl(reply, "queries::event_log_entries");
-            }
-            QueriesCommand::LocalMlsEpoch { reply, .. } => {
-                ack_not_impl(reply, "queries::local_mls_epoch");
-            }
-            QueriesCommand::NeedsReconnect { reply, .. } => {
-                ack_not_impl(reply, "queries::needs_reconnect");
-            }
-            QueriesCommand::PaymentHistory { reply, .. } => {
-                ack_not_impl(reply, "queries::payment_history");
-            }
-            #[cfg(feature = "testing")]
-            QueriesCommand::GetAccessKey { reply, .. } => {
-                ack_not_impl(reply, "queries::get_access_key");
-            }
-            #[cfg(feature = "testing")]
-            QueriesCommand::GetAllAccessKeys { reply, .. } => {
-                ack_not_impl(reply, "queries::get_all_access_keys");
-            }
-            #[cfg(feature = "testing")]
-            QueriesCommand::RemainingBudgetForTest { reply, .. } => {
-                ack_not_impl(reply, "queries::remaining_budget_for_test");
-            }
-            #[cfg(feature = "testing")]
-            QueriesCommand::VelocityForTest { reply, .. } => {
-                ack_not_impl(reply, "queries::velocity_for_test");
-            }
-        }
-    }
-
-    /// Skeleton-dispatch helper for [`ContextCommand::Lifecycle`].
-    /// Extracted from [`Self::skeleton_dispatch`] so the outer function
-    /// stays below the `too_many_lines` clippy threshold.
-    ///
-    /// Shim-routed lifecycle dispatch does not go through this
-    /// function — the real production path is
-    /// [`crate::context::supervisor::supervisor::Supervisor::dispatch_lifecycle_command`]
-    /// (ADR-049 commit 9). Any caller that mistakenly routes a
-    /// lifecycle operation through the actor mailbox during the
-    /// migration window gets a typed error rather than a hang.
-    fn skeleton_dispatch_lifecycle(sub: LifecycleCommand) {
-        fn ack_not_impl<T>(
-            reply: tokio::sync::oneshot::Sender<Result<T, ContextError>>,
-            which: &'static str,
-        ) {
-            let _ = reply.send(Err(ContextError::NotImplemented(format!(
-                "{which} — migrates in the matching handler commit of ADR-049"
-            ))));
-        }
-        match sub {
-            // `CreateContext` carries a `ContextCreationError` reply
-            // (not `ContextError`); surface an equivalent
-            // `CreationFailed` stub so the typed result's error
-            // category is preserved.
-            LifecycleCommand::CreateContext { reply, .. } => {
-                let _ = reply.send(Err(
-                    scp_protocol::context::builder::ContextCreationError::CreationFailed(
-                        "lifecycle::create_context (use Supervisor::dispatch_lifecycle_command during commits 9-11) \
-                         — migrates in the matching handler commit of ADR-049"
-                            .to_owned(),
-                    ),
-                ));
-            }
-            LifecycleCommand::JoinContext { reply, .. } => ack_not_impl(
-                reply,
-                "lifecycle::join_context (use Supervisor::dispatch_lifecycle_command during commits 9-11)",
-            ),
-            LifecycleCommand::LeaveContext { reply, .. } => ack_not_impl(
-                reply,
-                "lifecycle::leave_context (use Supervisor::dispatch_lifecycle_command during commits 9-11)",
-            ),
-            LifecycleCommand::CloseContext { reply, .. } => ack_not_impl(
-                reply,
-                "lifecycle::close_context (use Supervisor::dispatch_lifecycle_command during commits 9-11)",
-            ),
-            LifecycleCommand::ExportContext { reply, .. } => ack_not_impl(
-                reply,
-                "lifecycle::export_context (use Supervisor::dispatch_lifecycle_command during commits 9-11)",
-            ),
-            LifecycleCommand::ImportContext { reply, .. } => ack_not_impl(
-                reply,
-                "lifecycle::import_context (use Supervisor::dispatch_lifecycle_command during commits 9-11)",
-            ),
-            LifecycleCommand::RestoreContext { reply, .. } => ack_not_impl(
-                reply,
-                "lifecycle::restore_context (use Supervisor::dispatch_lifecycle_command during commits 9-11)",
-            ),
-            LifecycleCommand::GenerateContextAccessKey { reply, .. } => ack_not_impl(
-                reply,
-                "lifecycle::generate_context_access_key (use Supervisor::dispatch_lifecycle_command during commits 9-11)",
-            ),
-            LifecycleCommand::RevokeContextAccessKey { reply, .. } => ack_not_impl(
-                reply,
-                "lifecycle::revoke_context_access_key (use Supervisor::dispatch_lifecycle_command during commits 9-11)",
-            ),
-            LifecycleCommand::RestoreContextAccessKey { reply, .. } => ack_not_impl(
-                reply,
-                "lifecycle::restore_context_access_key (use Supervisor::dispatch_lifecycle_command during commits 9-11)",
-            ),
-            // Sweep variants — the skeleton dispatch is the legacy
-            // mailbox-test stub; real sweep dispatch goes via
-            // `handlers::lifecycle::dispatch` against an actor's owned
-            // `&mut state`. The skeleton path returns NotImplemented so
-            // a misrouted sweep surfaces a typed error rather than
-            // silently completing.
-            LifecycleCommand::FlushSnapshot { reply } => ack_not_impl(
-                reply,
-                "lifecycle::flush_snapshot (sweep — use lifecycle_helpers::flush_all_contexts iterator)",
-            ),
-            LifecycleCommand::ShutdownSelf { reply } => ack_not_impl(
-                reply,
-                "lifecycle::shutdown_self (sweep — use lifecycle_helpers::shutdown_all_contexts iterator)",
-            ),
-            // Read-only gauge sweep: a skeleton actor owns no
-            // receive-buffer state, so report 0. The reply channel
-            // carries a bare `usize` (not a `Result`), so it cannot use
-            // `ack_not_impl`.
-            LifecycleCommand::ReportBufferLen { reply } => {
-                let _ = reply.send(0);
-            }
-            LifecycleCommand::ClearNeedsReconnect { reply, .. } => ack_not_impl(
-                reply,
-                "lifecycle::clear_needs_reconnect (use Supervisor::clear_needs_reconnect — actor mailbox)",
-            ),
-            LifecycleCommand::IssueMlsUpdate { reply, .. } => ack_not_impl(
-                reply,
-                "lifecycle::issue_mls_update (use Supervisor::issue_mls_update — actor mailbox)",
-            ),
-        }
-    }
-
-    /// Skeleton-dispatch helper for [`ContextCommand::Governance`].
-    /// Extracted from [`Self::skeleton_dispatch`] so the outer function
-    /// stays below the `too_many_lines` clippy threshold.
-    ///
-    /// Shim-routed governance dispatch does not go through this
-    /// function — the real production path is
-    /// [`crate::context::supervisor::supervisor::Supervisor::dispatch_governance_command`]
-    /// (ADR-049 commit 10).
-    fn skeleton_dispatch_governance(sub: GovernanceCommand) {
-        fn ack_not_impl<T>(
-            reply: tokio::sync::oneshot::Sender<Result<T, ContextError>>,
-            which: &'static str,
-        ) {
-            let _ = reply.send(Err(ContextError::NotImplemented(format!(
-                "{which} — migrates in the matching handler commit of ADR-049"
-            ))));
-        }
-        match sub {
-            GovernanceCommand::ProposeGovernanceAction { reply, .. } => ack_not_impl(
-                reply,
-                "governance::propose_governance_action (use Supervisor::dispatch_governance_command during commits 10-11)",
-            ),
-            GovernanceCommand::ProposeGovernanceActionChecked { reply, .. } => ack_not_impl(
-                reply,
-                "governance::propose_governance_action_checked (use Supervisor::dispatch_governance_command during commits 10-11)",
-            ),
-            GovernanceCommand::VoteOnProposal { reply, .. } => ack_not_impl(
-                reply,
-                "governance::vote_on_proposal (use Supervisor::dispatch_governance_command during commits 10-11)",
-            ),
-            GovernanceCommand::ApproveGovernanceProposal { reply, .. } => ack_not_impl(
-                reply,
-                "governance::approve_governance_proposal (use Supervisor::dispatch_governance_command during commits 10-11)",
-            ),
-            GovernanceCommand::RejectGovernanceProposal { reply, .. } => ack_not_impl(
-                reply,
-                "governance::reject_governance_proposal (use Supervisor::dispatch_governance_command during commits 10-11)",
-            ),
-            GovernanceCommand::WithdrawGovernanceVote { reply, .. } => ack_not_impl(
-                reply,
-                "governance::withdraw_governance_vote (use Supervisor::dispatch_governance_command during commits 10-11)",
-            ),
-            GovernanceCommand::ExecuteGovernanceAction { reply, .. } => ack_not_impl(
-                reply,
-                "governance::execute_governance_action (use Supervisor::dispatch_governance_command during commits 10-11)",
-            ),
-            GovernanceCommand::GetProposal { reply, .. } => ack_not_impl(
-                reply,
-                "governance::get_proposal (use Supervisor::dispatch_governance_command during commits 10-11)",
-            ),
-            GovernanceCommand::ListProposals { reply, .. } => ack_not_impl(
-                reply,
-                "governance::list_proposals (use Supervisor::dispatch_governance_command during commits 10-11)",
-            ),
-            GovernanceCommand::ApplyPendingCeilingModification { reply, .. } => ack_not_impl(
-                reply,
-                "governance::apply_pending_ceiling_modification (use Supervisor::dispatch_governance_command during commits 10-11)",
-            ),
-            GovernanceCommand::ApplyPendingEconomicPolicyChange { reply, .. } => ack_not_impl(
-                reply,
-                "governance::apply_pending_economic_policy_change (use Supervisor::dispatch_governance_command during commits 10-11)",
-            ),
-            GovernanceCommand::TombstoneMigratedContext { reply, .. } => ack_not_impl(
-                reply,
-                "governance::tombstone_migrated_context (use Supervisor::dispatch_governance_command during commits 10-11)",
-            ),
-            GovernanceCommand::MigrationState { reply, .. } => ack_not_impl(
-                reply,
-                "governance::migration_state (use Supervisor::dispatch_governance_command during commits 10-11)",
-            ),
-            GovernanceCommand::AcknowledgeCommitFault { reply, .. } => ack_not_impl(
-                reply,
-                "governance::acknowledge_commit_fault (use Supervisor::dispatch_governance_command during commits 10-11)",
-            ),
-            // Sweep variants — the skeleton dispatch is the legacy
-            // mailbox-test stub; real sweep dispatch goes via
-            // `handlers::governance::dispatch` against an actor's owned
-            // `&mut state`. The skeleton path returns NotImplemented so
-            // a misrouted sweep surfaces a typed error rather than
-            // silently completing.
-            GovernanceCommand::EvaluatePeriodicConsequences { reply } => ack_not_impl(
-                reply,
-                "governance::evaluate_periodic_consequences (sweep — use governance_helpers::evaluate_periodic_consequences iterator)",
-            ),
-            GovernanceCommand::ProcessPendingCommits { reply } => ack_not_impl(
-                reply,
-                "governance::process_pending_commits (sweep — use governance_helpers::process_pending_commits iterator)",
-            ),
-            GovernanceCommand::EvaluateTimeouts { reply } => ack_not_impl(
-                reply,
-                "governance::evaluate_timeouts (sweep — use governance_helpers::start_governance_timeout_task iterator)",
-            ),
-            GovernanceCommand::StartTimeoutTask { reply } => ack_not_impl(
-                reply,
-                "governance::start_timeout_task (timer install — use governance_helpers::start_governance_timeout_task)",
-            ),
-        }
-    }
-
-    /// Skeleton-dispatch helper for [`ContextCommand::Economy`].
-    /// Extracted from [`Self::skeleton_dispatch`] so the outer function
-    /// stays below the `too_many_lines` clippy threshold.
-    ///
-    /// Shim-routed economy dispatch does not go through this
-    /// function — the real production path is
-    /// [`crate::context::supervisor::supervisor::Supervisor::dispatch_economy_command`]
-    /// (ADR-049 commit 10).
-    fn skeleton_dispatch_economy(sub: EconomyCommand) {
-        match sub {
-            // `VerifyPaymentReceipts` carries a `Vec<Result<..>>` reply
-            // (not `Result<.., ContextError>`); synthesize an empty
-            // reply so the mailbox contract is preserved even for the
-            // skeleton. Callers that mistakenly route through the
-            // skeleton observe an empty verification vector (the
-            // timeout/error semantics are defined in the real
-            // handler).
-            EconomyCommand::VerifyPaymentReceipts { reply, .. } => {
-                let _ = reply.send(Vec::new());
-            }
-        }
-    }
-
-    /// Skeleton-dispatch helper for [`ContextCommand::TrustRecovery`].
-    /// Extracted from [`Self::skeleton_dispatch`] so the outer function
-    /// stays below the `too_many_lines` clippy threshold.
-    ///
-    /// Shim-routed trust-recovery dispatch does not go through this
-    /// function — the real production path is
-    /// [`crate::context::supervisor::supervisor::Supervisor::dispatch_trust_recovery_command`]
-    /// (ADR-049 commit 10).
-    fn skeleton_dispatch_trust_recovery(sub: TrustRecoveryCommand) {
-        fn ack_not_impl<T>(
-            reply: tokio::sync::oneshot::Sender<Result<T, ContextError>>,
-            which: &'static str,
-        ) {
-            let _ = reply.send(Err(ContextError::NotImplemented(format!(
-                "{which} — migrates in the matching handler commit of ADR-049"
-            ))));
-        }
-        match sub {
-            TrustRecoveryCommand::CreateGovernanceCheckpoint { reply, .. } => ack_not_impl(
-                reply,
-                "trust_recovery::create_governance_checkpoint (use Supervisor::dispatch_trust_recovery_command during commits 10-11)",
-            ),
-            TrustRecoveryCommand::AddCheckpointCosignature { reply, .. } => ack_not_impl(
-                reply,
-                "trust_recovery::add_checkpoint_cosignature (use Supervisor::dispatch_trust_recovery_command during commits 10-11)",
-            ),
-            TrustRecoveryCommand::RecoveryAdvanceEpoch { reply, .. } => ack_not_impl(
-                reply,
-                "trust_recovery::recovery_advance_epoch (use Supervisor::dispatch_trust_recovery_command during commits 10-11)",
-            ),
-            TrustRecoveryCommand::RecoverySendNotification { reply, .. } => ack_not_impl(
-                reply,
-                "trust_recovery::recovery_send_notification (use Supervisor::dispatch_trust_recovery_command during commits 10-11)",
-            ),
-            TrustRecoveryCommand::RecoveryNotifyContact { reply, .. } => ack_not_impl(
-                reply,
-                "trust_recovery::recovery_notify_contact (use Supervisor::dispatch_trust_recovery_command during commits 10-11)",
-            ),
-        }
-    }
-
-    /// Skeleton-dispatch helper for [`ContextCommand::TtlClose`].
-    /// Extracted from [`Self::skeleton_dispatch`] so the outer function
-    /// stays below the `too_many_lines` clippy threshold.
-    ///
-    /// Shim-routed TTL-close dispatch does not go through this
-    /// function — the real production path is
-    /// [`crate::context::supervisor::supervisor::Supervisor::dispatch_ttl_close_command`]
-    /// (ADR-049 commit 9).
-    fn skeleton_dispatch_ttl_close(sub: TtlCloseCommand) {
-        fn ack_not_impl<T>(
-            reply: tokio::sync::oneshot::Sender<Result<T, ContextError>>,
-            which: &'static str,
-        ) {
-            let _ = reply.send(Err(ContextError::NotImplemented(format!(
-                "{which} — migrates in the matching handler commit of ADR-049"
-            ))));
-        }
-        match sub {
-            TtlCloseCommand::FireTimer { reply } => ack_not_impl(
-                reply,
-                "ttl_close::fire_timer (use Supervisor::dispatch_ttl_close_command)",
-            ),
-            TtlCloseCommand::StartTtlTimer { reply, .. } => ack_not_impl(
-                reply,
-                "ttl_close::start_ttl_timer (use Supervisor::dispatch_ttl_close_command during commits 9-11)",
-            ),
-            TtlCloseCommand::ExtendTtl { reply, .. } => ack_not_impl(
-                reply,
-                "ttl_close::extend_ttl (use Supervisor::dispatch_ttl_close_command during commits 9-11)",
-            ),
-            TtlCloseCommand::ResetTtlTimer { reply, .. } => ack_not_impl(
-                reply,
-                "ttl_close::reset_ttl_timer (use Supervisor::dispatch_ttl_close_command during commits 9-11)",
-            ),
-            TtlCloseCommand::ExecuteTtlClose { reply, .. } => ack_not_impl(
-                reply,
-                "ttl_close::execute_ttl_close (use Supervisor::dispatch_ttl_close_command during commits 9-11)",
-            ),
-            TtlCloseCommand::FinalizeClose { reply, .. } => ack_not_impl(
-                reply,
-                "ttl_close::finalize_close (use Supervisor::dispatch_ttl_close_command during commits 9-11)",
-            ),
-        }
-    }
-
-    /// Skeleton-dispatch helper for [`ContextCommand::Standing`].
-    /// Extracted for the same reason as the other sibling helpers.
-    ///
-    /// Shim-routed standing dispatch does not go through this function —
-    /// the real production path is
-    /// [`crate::context::supervisor::supervisor::Supervisor::dispatch_standing_command`]
-    /// (ADR-049 commit 11).
-    fn skeleton_dispatch_standing(sub: StandingCommand) {
-        fn ack_not_impl<T>(
-            reply: tokio::sync::oneshot::Sender<Result<T, ContextError>>,
-            which: &'static str,
-        ) {
-            let _ = reply.send(Err(ContextError::NotImplemented(format!(
-                "{which} — migrates in the matching handler commit of ADR-049"
-            ))));
-        }
-        match sub {
-            StandingCommand::StandingContext { reply, .. } => ack_not_impl(
-                reply,
-                "standing::standing_context (use Supervisor::dispatch_standing_command during commit 11)",
-            ),
-            StandingCommand::StandingContextCount { reply, .. } => ack_not_impl(
-                reply,
-                "standing::standing_context_count (use Supervisor::dispatch_standing_command during commit 11)",
-            ),
-            StandingCommand::HasStandingContext { reply, .. } => ack_not_impl(
-                reply,
-                "standing::has_standing_context (use Supervisor::dispatch_standing_command during commit 11)",
-            ),
-            StandingCommand::RegisterStandingContext { reply, .. } => ack_not_impl(
-                reply,
-                "standing::register_standing_context (use Supervisor::dispatch_standing_command during commit 11)",
-            ),
-            StandingCommand::ReconnectAllStanding { reply, .. } => ack_not_impl(
-                reply,
-                "standing::reconnect_all_standing (use Supervisor::dispatch_standing_command during commit 11)",
-            ),
-        }
-    }
-
-    /// Skeleton-dispatch helper for [`ContextCommand::Tools`].
-    ///
-    /// Shim-routed tools dispatch does not go through this function —
-    /// the real production path is
-    /// [`crate::context::supervisor::supervisor::Supervisor::dispatch_tools_command`]
-    /// (ADR-049 commit 11).
-    fn skeleton_dispatch_tools(sub: ToolsCommand) {
-        fn ack_not_impl<T>(
-            reply: tokio::sync::oneshot::Sender<Result<T, ContextError>>,
-            which: &'static str,
-        ) {
-            let _ = reply.send(Err(ContextError::NotImplemented(format!(
-                "{which} — migrates in the matching handler commit of ADR-049"
-            ))));
-        }
-        match sub {
-            ToolsCommand::TryConsumeHardRateLimit { reply, .. } => ack_not_impl(
-                reply,
-                "tools::try_consume_hard_rate_limit (use Supervisor::dispatch_tools_command during commit 11)",
-            ),
-            ToolsCommand::RefundHardRateLimit { reply, .. } => ack_not_impl(
-                reply,
-                "tools::refund_hard_rate_limit (use Supervisor::dispatch_tools_command during commit 11)",
-            ),
-            ToolsCommand::ReserveToolEconomy { reply, .. } => ack_not_impl(
-                reply,
-                "tools::reserve_tool_economy (use Supervisor::invoke_tool_with_economy / dispatch_tools_command)",
-            ),
-            ToolsCommand::SettleToolEconomy { reply, .. } => ack_not_impl(
-                reply,
-                "tools::settle_tool_economy (use Supervisor::invoke_tool_with_economy / dispatch_tools_command)",
-            ),
-        }
-    }
-
-    /// Skeleton-dispatch helper for [`ContextCommand::Broadcast`].
-    ///
-    /// Shim-routed broadcast dispatch does not go through this function —
-    /// the real production path is
-    /// [`crate::context::supervisor::supervisor::Supervisor::dispatch_broadcast_command`]
-    /// (ADR-049 commit 11).
-    fn skeleton_dispatch_broadcast(sub: BroadcastCommand) {
-        fn ack_not_impl<T>(
-            reply: tokio::sync::oneshot::Sender<Result<T, ContextError>>,
-            which: &'static str,
-        ) {
-            let _ = reply.send(Err(ContextError::NotImplemented(format!(
-                "{which} — migrates in the matching handler commit of ADR-049"
-            ))));
-        }
-        match sub {
-            BroadcastCommand::SubscribeBroadcast { reply, .. } => ack_not_impl(
-                reply,
-                "broadcast::subscribe_broadcast (use Supervisor::dispatch_broadcast_command during commit 11)",
-            ),
-            BroadcastCommand::UnsubscribeBroadcast { reply, .. } => ack_not_impl(
-                reply,
-                "broadcast::unsubscribe_broadcast (use Supervisor::dispatch_broadcast_command during commit 11)",
-            ),
-            BroadcastCommand::PublishBroadcast { reply, .. } => ack_not_impl(
-                reply,
-                "broadcast::publish_broadcast (use Supervisor::dispatch_broadcast_command during commit 11)",
-            ),
-            BroadcastCommand::PublishBroadcastContent { reply, .. } => ack_not_impl(
-                reply,
-                "broadcast::publish_broadcast_content (use Supervisor::dispatch_broadcast_command during commit 11)",
-            ),
-            BroadcastCommand::BlockBroadcastSubscriber { reply, .. } => ack_not_impl(
-                reply,
-                "broadcast::block_broadcast_subscriber (use Supervisor::dispatch_broadcast_command during commit 11)",
-            ),
-            BroadcastCommand::UnblockBroadcastSubscriber { reply, .. } => ack_not_impl(
-                reply,
-                "broadcast::unblock_broadcast_subscriber (use Supervisor::dispatch_broadcast_command during commit 11)",
-            ),
-            BroadcastCommand::HandleBroadcastKeyRequest { reply, .. } => ack_not_impl(
-                reply,
-                "broadcast::handle_broadcast_key_request (use Supervisor::dispatch_broadcast_command during commit 11)",
-            ),
-            BroadcastCommand::BroadcastSubscriberCount { reply, .. } => ack_not_impl(
-                reply,
-                "broadcast::broadcast_subscriber_count (use Supervisor::dispatch_broadcast_command during commit 11)",
-            ),
-            BroadcastCommand::IsBroadcastSubscriber { reply, .. } => ack_not_impl(
-                reply,
-                "broadcast::is_broadcast_subscriber (use Supervisor::dispatch_broadcast_command during commit 11)",
-            ),
-            BroadcastCommand::BroadcastAdmission { reply, .. } => ack_not_impl(
-                reply,
-                "broadcast::broadcast_admission (use Supervisor::dispatch_broadcast_command during commit 11)",
-            ),
-            BroadcastCommand::ReserveBroadcastPublish { reply, .. } => ack_not_impl(
-                reply,
-                "broadcast::reserve_broadcast_publish (use Supervisor::dispatch_broadcast_command_with_custody)",
-            ),
-            BroadcastCommand::ApplyBroadcastPublish { reply, .. } => ack_not_impl(
-                reply,
-                "broadcast::apply_broadcast_publish (use Supervisor::dispatch_broadcast_command_with_custody)",
-            ),
-            BroadcastCommand::ReleaseBroadcastReservation { reply, .. } => ack_not_impl(
-                reply,
-                "broadcast::release_broadcast_reservation (use Supervisor::dispatch_broadcast_command_with_custody)",
-            ),
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1417,35 +543,18 @@ mod tests {
     use tokio::sync::mpsc;
 
     #[tokio::test]
-    async fn skeleton_actor_acks_query_with_not_implemented() {
-        let (tx, rx) = mpsc::channel::<ContextCommand>(1);
-        let actor = ContextActor::new_skeleton("ctx-42".to_owned(), rx);
-        let actor_handle = tokio::spawn(actor.run());
-
-        let handle = ContextActorHandle::from_sender(tx);
-        // A skeleton actor owns no state, so every command — including a
-        // read-only query — acks `NotImplemented` through the synchronous
-        // skeleton-dispatch path.
-        let err = handle
-            .send(|reply| {
-                ContextCommand::Queries(QueriesCommand::MemberCount {
-                    context_id: "ctx-42".to_owned(),
-                    reply,
-                })
-            })
-            .await
-            .unwrap_err();
-        assert!(matches!(err, ContextError::NotImplemented(_)));
-
-        // Send a shutdown and let the actor exit cleanly.
-        handle.send_shutdown().await.unwrap();
-        actor_handle.await.unwrap();
-    }
-
-    #[tokio::test]
     async fn actor_exits_on_inbox_close() {
+        // Run-loop invariant: when every sender drops, `recv()` yields
+        // `None` and the actor exits — no Shutdown command needed. This
+        // holds for the (sole) state-owning actor shape.
+        let deps = new_test_deps().await;
+        let state = state::PerContextState::new_for_test_encrypted(
+            [0x11u8; 32],
+            1_700_000_000,
+            scp_did::DID("did:example:admin".to_owned()),
+        );
         let (tx, rx) = mpsc::channel::<ContextCommand>(1);
-        let actor = ContextActor::new_skeleton("ctx-1".to_owned(), rx);
+        let actor = ContextActor::new(state, deps, rx);
         let actor_handle = tokio::spawn(actor.run());
 
         // Drop every sender; actor should observe `None` on recv and
@@ -1461,23 +570,33 @@ mod tests {
 
     #[tokio::test]
     async fn actor_pause_acks_ok_and_keeps_running() {
-        let (tx, rx) = mpsc::channel::<ContextCommand>(1);
-        let actor = ContextActor::new_skeleton("ctx-1".to_owned(), rx);
+        // `Pause` is non-terminal: the actor acks `Ok(())` and keeps
+        // running, so a subsequent query is still answered off its owned
+        // state.
+        let deps = new_test_deps().await;
+        let state = state::PerContextState::new_for_test_encrypted(
+            [0x12u8; 32],
+            1_700_000_000,
+            scp_did::DID("did:example:admin".to_owned()),
+        );
+        let (tx, rx) = mpsc::channel::<ContextCommand>(4);
+        let actor = ContextActor::new(state, deps, rx);
         let actor_handle = tokio::spawn(actor.run());
 
         let handle = ContextActorHandle::from_sender(tx);
         handle.send_pause().await.unwrap();
-        // Actor is still running; a subsequent command is processed.
-        let err = handle
+        // Actor is still running; a subsequent read query answers off
+        // owned state (empty test fixture ⇒ exact roster count 0).
+        let count = handle
             .send(|reply| {
                 ContextCommand::Queries(QueriesCommand::MemberCount {
-                    context_id: "ctx-1".to_owned(),
+                    context_id: hex_encode_context_id(&[0x12u8; 32]),
                     reply,
                 })
             })
             .await
-            .unwrap_err();
-        assert!(matches!(err, ContextError::NotImplemented(_)));
+            .expect("member-count query round-trips after a Pause");
+        assert_eq!(count, Some(0));
 
         handle.send_shutdown().await.unwrap();
         actor_handle.await.unwrap();
@@ -1485,8 +604,17 @@ mod tests {
 
     #[tokio::test]
     async fn actor_shutdown_command_exits_loop_promptly() {
+        // `Shutdown` is unconditionally terminal: the run loop breaks
+        // after dispatching it. Bound the wait so a regression that fails
+        // to exit is caught rather than hanging CI.
+        let deps = new_test_deps().await;
+        let state = state::PerContextState::new_for_test_encrypted(
+            [0x13u8; 32],
+            1_700_000_000,
+            scp_did::DID("did:example:admin".to_owned()),
+        );
         let (tx, rx) = mpsc::channel::<ContextCommand>(1);
-        let actor = ContextActor::new_skeleton("ctx-1".to_owned(), rx);
+        let actor = ContextActor::new(state, deps, rx);
         let actor_handle = tokio::spawn(actor.run());
 
         let handle = ContextActorHandle::from_sender(tx);
