@@ -409,6 +409,7 @@ async fn handle_propose_governance_action_actor(
     let signing_key = p.signing_key.to_signing_key();
     let proposer_did = p.proposer_did.clone();
     let action = p.action;
+    let key_package = p.key_package;
 
     // Actor-shape twin of the legacy unchecked
     // `Supervisor::propose_governance_action` entry point: `check=false`.
@@ -428,6 +429,7 @@ async fn handle_propose_governance_action_actor(
                 action,
                 &signing_key,
                 false,
+                key_package.as_deref(),
             ),
         )
         .await
@@ -465,6 +467,7 @@ async fn handle_propose_governance_action_checked_actor(
     let signing_key = p.signing_key.to_signing_key();
     let proposer_did = p.proposer_did.clone();
     let action = p.action;
+    let key_package = p.key_package;
 
     let propose_fut = async move {
         Box::pin(
@@ -475,6 +478,7 @@ async fn handle_propose_governance_action_checked_actor(
                 &proposer_did,
                 action,
                 &signing_key,
+                key_package.as_deref(),
             ),
         )
         .await
@@ -684,6 +688,9 @@ async fn handle_execute_governance_action_actor(
                 // the `GovernanceActionExecuted` leaf actor_did) is resolved
                 // inside `execute_governance_action` from the TRACKED proposal's
                 // proposer — never a caller-supplied DID.
+                None,
+                // Direct-execute never carries an invitee KeyPackage (deferred
+                // governed invite is issue #2027).
                 None,
             ),
         )

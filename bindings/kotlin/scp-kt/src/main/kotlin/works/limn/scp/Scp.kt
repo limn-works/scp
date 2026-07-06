@@ -35,6 +35,7 @@ import uniffi.scp.ContextParams
 import uniffi.scp.DidDocument
 import uniffi.scp.Event
 import uniffi.scp.Identity
+import uniffi.scp.InviteMemberOutcome
 import uniffi.scp.KeyCustodyProvider
 import uniffi.scp.McpAllowlistState
 import uniffi.scp.McpInvokeResult
@@ -44,7 +45,9 @@ import uniffi.scp.MessageListener
 import uniffi.scp.Proof
 import uniffi.scp.PublishResult
 import uniffi.scp.ReconnectReport
+import uniffi.scp.ReservedKeyPackage
 import uniffi.scp.SagaResult
+import uniffi.scp.SealedInvitation
 import uniffi.scp.SqliteKeyMaterial
 import uniffi.scp.StorageConfig
 import uniffi.scp.SyncPolicyResult
@@ -640,6 +643,60 @@ class SCP internal constructor(
         spendingUcanJwt = spendingUcanJwt,
     )
 
+    /**
+     * Joins an existing SCP context by processing a received MLS Welcome,
+     * standing the local (joiner) identity up as a send-capable participant.
+     *
+     * Completes the reserve -> Welcome -> join handshake begun by
+     * [reserveKeyPackage]: given the Welcome the context creator minted for a
+     * previously-reserved `KeyPackage`, this installs the joined MLS group,
+     * derives the joiner's routing pseudonym (spec §9.10.4), persists the
+     * initial keyed snapshot fail-closed, registers a context handle, and
+     * records the joined context in the known-contexts discovery registry.
+     * Without it a Welcome-joined node can DECRYPT but cannot SEND (no
+     * handle-backed context).
+     *
+     * Local-identity custody of the JOINER ([identity]) is enforced exactly as
+     * [contextCreate] enforces it for the creator: the joiner's routing
+     * pseudonym is DERIVED from its locally-custodied identity (never
+     * caller-supplied), so a non-custodied joiner (for example a DID-only
+     * handle from [identityLoad]) hard-fails with `SCP-IDENT-1054` at the
+     * derivation seam BEFORE the single-use `KeyPackage` is consumed.
+     *
+     * See [reserveKeyPackage] for the full reserve -> Welcome -> join example.
+     *
+     * The joiner supplies NO loose params or Welcome bytes (FFI-02 Option A):
+     * the authoritative context id, creator DID, and the encrypted genesis
+     * params + MLS Welcome all travel INSIDE the creator-signed, HPKE-sealed
+     * [SealedInvitation] bundle ([SealedInvitation.enc] / [ciphertext]). The
+     * runtime opens the bundle, verifies the creator signature, and derives all
+     * authority from it — the bundle's `contextId` / `creatorDid` are untrusted
+     * binding hints only. Build the [SealedInvitation] from the named fields the
+     * inviter delivered (the `(enc, ciphertext)` produced by
+     * [inviteMember]).
+     *
+     * @param identity The LOCAL (joiner) identity. Its custody derives the
+     *   routing pseudonym AND opens the sealed bundle (split custody); passed
+     *   separately from [SealedInvitation.creatorDid] so the two cannot be
+     *   transposed.
+     * @param sealed The creator-signed, HPKE-sealed [SealedInvitation] bundle
+     *   produced by [inviteMember] on the creator side.
+     * @param reservationId The opaque reservation id returned by
+     *   [reserveKeyPackage] for the `KeyPackage` this Welcome addresses.
+     *
+     * Forwards to [NativeScp.contextJoinFromWelcome] on [inner].
+     */
+    suspend fun contextJoinFromWelcome(
+        identity: Identity,
+        sealed: SealedInvitation,
+        reservationId: String,
+    ): ContextHandle =
+        inner.contextJoinFromWelcome(
+            identity = identity,
+            sealed = sealed,
+            reservationId = reservationId,
+        )
+
     /** Forwards to [NativeScp.contextLeave] on [inner]. */
     suspend fun contextLeave(
         handle: ContextHandle,
@@ -738,6 +795,100 @@ class SCP internal constructor(
             identity = identity,
             contextIds = contextIds,
             lastRelayContacts = lastRelayContacts,
+        )
+
+    /**
+     * Reserves a single-use MLS `KeyPackage` under [identity] — the first step
+     * of the reserve -> Welcome -> join handshake for spawning into a context
+     * from a creator-minted Welcome (ADR-049 Phase 2J).
+     *
+     * Only the PUBLIC `KeyPackage` bytes cross the FFI boundary
+     * ([ReservedKeyPackage.keyPackagePublic]); the private signer state never
+     * leaves the node. Hand `keyPackagePublic` to the context creator out of
+     * band — the creator adds it to the MLS group and returns a Welcome — then
+     * pass [ReservedKeyPackage.reservationId] back to [contextJoinFromWelcome]
+     * so the fused consume matches this reservation. The `reservationId` is a
+     * lookup key, not a capability: a bogus id simply fails the consume match.
+     *
+     * Local-identity custody is enforced (the same trust model as
+     * [contextCreate]): [identity] MUST be a locally-custodied identity that
+     * holds retained key material. A DID-only handle from [identityLoad] is
+     * rejected with `SCP-IDENT-1054`.
+     *
+     * ```kotlin
+     * // Step 1 (joiner): reserve a single-use KeyPackage under the joiner's
+     * // own locally-custodied identity.
+     * val joiner = scp.identityCreate(custody = "in_memory")
+     * val reservation = scp.reserveKeyPackage(joiner)
+     *
+     * // Hand reservation.keyPackagePublic to the creator out of band. The
+     * // creator calls inviteMember(...), then destructures the sealed outcome
+     * // to recover the SealedInvitation and hands it back:
+     * val bundle = when (outcome) {
+     *     is InviteMemberOutcome.Sealed -> outcome.bundle
+     * }
+     *
+     * // Step 2 (joiner): open the sealed bundle and stand up as a send-capable
+     * // participant under the joiner's own derived routing pseudonym.
+     * val ctx = scp.contextJoinFromWelcome(
+     *     identity = joiner,
+     *     sealed = bundle,
+     *     reservationId = reservation.reservationId,
+     * )
+     * ```
+     *
+     * Forwards to [NativeScp.reserveKeyPackage] on [inner].
+     */
+    suspend fun reserveKeyPackage(identity: Identity): ReservedKeyPackage =
+        inner.reserveKeyPackage(identity = identity)
+
+    /**
+     * Invites a member to an existing context, producing a sealed, signed
+     * invitation bundle (ADR-049 Phase 2J; FFI-02 Option A).
+     *
+     * The creator (or admin) seals the context's genesis params + Welcome for
+     * the invitee under RFC 9180 HPKE, binding them to the invitee's
+     * `KeyPackage`. Only a `SingleAdmin` context is supported today: the invite
+     * is unilateral and returns [InviteMemberOutcome.Sealed] whose
+     * [InviteMemberOutcome.Sealed.bundle] is the sealed [SealedInvitation] —
+     * pass it straight to [contextJoinFromWelcome] (no re-assembly). A
+     * voting-governed context THROWS (governed-context invitations are not yet
+     * implemented) rather than returning an outcome.
+     *
+     * The invite routes through the actor's capability-checked governance gate,
+     * which requires the inviter to hold the `governance:propose` capability
+     * (that is the ONLY capability the invite gate enforces). A normally-created
+     * `SingleAdmin` context grants its admin `governance:propose` at genesis, so
+     * it works out of the box; a context with a custom ceiling must grant
+     * `governance:propose` to the inviter. The inviter's `#active` signing key
+     * is resolved from its retained local custody (never crossing the FFI as raw
+     * bytes) and wiped immediately after the invite is produced.
+     *
+     * @param identity The LOCAL inviting identity (creator / admin). Must be
+     *   locally custodied; the invite is signed under its `#active` key. The
+     *   inviter DID is taken from this handle, never a caller-supplied string,
+     *   so it cannot be transposed with [inviteeDid].
+     * @param contextId The context to invite into.
+     * @param inviteeDid The DID being invited.
+     * @param inviteeKeyPackage The invitee's TLS-serialized MLS `KeyPackage`
+     *   (its [ReservedKeyPackage.keyPackagePublic] from [reserveKeyPackage]).
+     * @param relayUrls Relay URLs to include for the invitee's first contact.
+     *
+     * Forwards to [NativeScp.inviteMember] on [inner].
+     */
+    suspend fun inviteMember(
+        identity: Identity,
+        contextId: String,
+        inviteeDid: String,
+        inviteeKeyPackage: ByteArray,
+        relayUrls: List<String>,
+    ): InviteMemberOutcome =
+        inner.inviteMember(
+            identity = identity,
+            contextId = contextId,
+            inviteeDid = inviteeDid,
+            inviteeKeyPackage = inviteeKeyPackage,
+            relayUrls = relayUrls,
         )
 
     /** Forwards to [NativeScp.contextSubscribe] on [inner]. */

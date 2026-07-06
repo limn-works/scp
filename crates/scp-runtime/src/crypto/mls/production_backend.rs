@@ -494,7 +494,29 @@ impl MlsBackend for ProductionMlsBackend {
         credential: &ScpCredential,
         wrapping_pubkey: Option<&[u8; 32]>,
     ) -> Result<GeneratedKeyPackage, MlsError> {
-        let (bundle, signer, provider) = group::generate_key_package_with_wrapping_key(
+        // Every pooled KeyPackage must be joinable into an SCP *context* group,
+        // whose `group_context` carries the `scp_context_params` (`0xFF02`)
+        // extension. OpenMLS rejects (`valn0502`, RFC 9420 §12.1.8.2) an Add
+        // whose leaf does not declare support for every `group_context`
+        // extension present in the group — so the KP leaf MUST advertise the
+        // `0xFF02` capability regardless of whether a wrapping key is available.
+        //
+        // `generate_key_package_with_context_params` declares BOTH `0xFF01` +
+        // `0xFF02` *capabilities* unconditionally, and attaches the `0xFF01`
+        // wrapping-key *leaf extension* only when a key is present (§9.16.1).
+        // The capability is what `valn0502` requires (no key material); the
+        // leaf extension is the optional enhancement that lets other members
+        // HPKE-seal sender keys to this member. Passing `wrapping_pubkey`
+        // straight through therefore yields a context-joinable KP in BOTH
+        // cases: `Some` → full participant (declares `0xFF02`, carries the
+        // wrapping key); `None` → context-joinable but non-receiving until the
+        // identity publishes a wrapping key. A `None` KP is NOT downgraded to a
+        // wrapping-only (`0xFF01`-only) KeyPackage, which real MLS would reject
+        // from a context group.
+        //
+        // The injected `Clock` mints the KeyPackage `Lifetime` (ADR-057
+        // Prereq-1, #2026) — never wall-clock `SystemTime::now()`.
+        let (bundle, signer, provider) = group::generate_key_package_with_context_params(
             credential,
             wrapping_pubkey,
             self.clock.as_ref(),
@@ -1054,5 +1076,157 @@ mod tests {
             }
             other => panic!("expected Application, got {other:?}"),
         }
+    }
+
+    /// Root `scp_context_params` extension fixture.
+    fn sample_context_extension(context_id: &str) -> scp_protocol::context::ScpContextExtension {
+        use scp_did::DID;
+        use scp_protocol::context::GovernanceModel;
+        use scp_protocol::context::params::{CeilingPolicy, ContextMode};
+        use scp_protocol::context::roles::{Capability, CapabilityCeiling};
+
+        let governance = GovernanceModel::Threshold {
+            threshold: 2,
+            signers: vec![
+                DID::from("did:dht:z6MkAlice".to_owned()),
+                DID::from("did:dht:z6MkBob".to_owned()),
+            ],
+        };
+        let ceiling = CapabilityCeiling::new([Capability::MessagesRead, Capability::MessagesWrite]);
+        scp_protocol::context::ScpContextExtension::for_root(
+            context_id.to_owned(),
+            DID::from("did:dht:z6MkAlice".to_owned()),
+            ContextMode::Encrypted,
+            &governance,
+            CeilingPolicy::Immutable,
+            &ceiling,
+        )
+        .unwrap()
+    }
+
+    /// End-to-end proof of the wrapping-key / context-params coupling
+    /// (`valn0502`): a `KeyPackage` produced by the **production**
+    /// [`MlsBackend::generate_key_package`] path (which now declares BOTH
+    /// `0xFF01` and `0xFF02`) can be added to, and joined into, an SCP context
+    /// group (whose `group_context` carries the `0xFF02` extension). Without the
+    /// context-params switch in `generate_key_package`, the pooled KP would
+    /// declare only `0xFF01` and `OpenMLS` would reject the Add with
+    /// `AddMemberFailed`. This is the load-bearing coupling test.
+    #[tokio::test]
+    async fn production_key_package_joins_context_group() {
+        let backend = joinable_backend();
+
+        // Creator side: a context group carrying the 0xFF02 extension.
+        let alice_cred = test_credential("alice-ctx");
+        let alice_wrap = [0xA1u8; 32];
+        let ctx_ext = sample_context_extension("ctx:prod-join");
+        let mut alice_group = group::create_group_with_context(
+            &alice_cred,
+            &alice_wrap,
+            &ctx_ext,
+            &scp_clock::SystemClock,
+        )
+        .unwrap();
+
+        // Joiner side: KP via the PRODUCTION generate_key_package path WITH a
+        // wrapping key — now declares 0xFF01 + 0xFF02.
+        let bob_cred = test_credential("bob-ctx");
+        let bob_wrap = [0xB2u8; 32];
+        let bob_gen = backend
+            .generate_key_package(&bob_cred, Some(&bob_wrap))
+            .await
+            .unwrap();
+
+        // The Add SUCCEEDS: bob's leaf declares 0xFF02, satisfying valn0502.
+        let added = backend
+            .add_member_raw(&mut alice_group, &bob_gen.key_package_bytes)
+            .await
+            .expect("production KP must satisfy valn0502 for a context group");
+
+        // And bob joins from the Welcome, recovering the creator-committed
+        // context extension byte-identically from the replicated group_context.
+        let bob_group = backend
+            .join_from_welcome(
+                &added.welcome,
+                bob_gen.signer_state.clone(),
+                &bob_gen.key_package_bytes,
+            )
+            .await
+            .expect("joiner processes the Welcome for the context group");
+
+        assert_eq!(
+            bob_group.group_context_extension().unwrap(),
+            Some(ctx_ext.clone()),
+            "joiner reads the creator-committed context extension"
+        );
+        assert_eq!(
+            alice_group.group_context_extension().unwrap(),
+            bob_group.group_context_extension().unwrap(),
+            "creator and joiner observe identical context extensions"
+        );
+    }
+
+    /// The `None`-branch (no wrapping key) production KP is STILL
+    /// context-joinable: it declares the `0xFF02` (`scp_context_params`)
+    /// capability — required by `valn0502` — even though it carries no `0xFF01`
+    /// wrapping-key leaf extension. This is the load-bearing invariant for the
+    /// production reserve path, whose supervisor `wrapping_keys` map has no
+    /// production writer yet (§9.16.1 wrapping-key publication is unwired), so
+    /// every reserved KP is generated with `wrapping_pubkey == None`. Were the
+    /// `None` branch to downgrade to a wrapping-only (`0xFF01`-only) KP, real
+    /// MLS would reject the Add ("the capabilities of the add proposal are
+    /// insufficient for this group") and NO node could ever join an encrypted
+    /// context via the reserve path.
+    ///
+    /// The joiner completes the Welcome round-trip and reads the
+    /// creator-committed context extension byte-identically. Sender-key
+    /// distribution to this member is separately (and correctly) skipped
+    /// because the leaf carries no wrapping key — but MLS membership succeeds.
+    #[tokio::test]
+    async fn production_key_package_without_wrapping_key_joins_context_group() {
+        let backend = joinable_backend();
+
+        let alice_cred = test_credential("alice-ctx-neg");
+        let alice_wrap = [0xA3u8; 32];
+        let ctx_ext = sample_context_extension("ctx:prod-neg");
+        let mut alice_group = group::create_group_with_context(
+            &alice_cred,
+            &alice_wrap,
+            &ctx_ext,
+            &scp_clock::SystemClock,
+        )
+        .unwrap();
+
+        // Reserve-path KP: generated WITHOUT a wrapping key (the production
+        // reserve path today, since supervisor `wrapping_keys` is unwired).
+        let bob_cred = test_credential("bob-ctx-neg");
+        let bob_gen = backend.generate_key_package(&bob_cred, None).await.unwrap();
+
+        // The Add SUCCEEDS: bob's leaf declares 0xFF02 (capability, no key
+        // material required), satisfying valn0502 for the context group.
+        let added = backend
+            .add_member_raw(&mut alice_group, &bob_gen.key_package_bytes)
+            .await
+            .expect(
+                "a wrapping-key-less production KP MUST still be context-joinable \
+                 (declares 0xFF02 capability)",
+            );
+
+        // And bob joins from the Welcome, recovering the creator-committed
+        // context extension byte-identically.
+        let bob_group = backend
+            .join_from_welcome(
+                &added.welcome,
+                bob_gen.signer_state.clone(),
+                &bob_gen.key_package_bytes,
+            )
+            .await
+            .expect("wrapping-key-less joiner processes the Welcome for the context group");
+
+        assert_eq!(
+            bob_group.group_context_extension().unwrap(),
+            Some(ctx_ext),
+            "wrapping-key-less joiner reads the creator-committed context extension",
+        );
     }
 }

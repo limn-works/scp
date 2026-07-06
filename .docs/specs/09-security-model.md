@@ -1628,6 +1628,8 @@ All domain separators are UTF-8 strings used as prefixes in canonical hash, sign
 | `"SCP-CONTEXT-EXPORT-V1:"` | Signed context export snapshot signing | §23.16.8 |
 | `"SCP-XCTX-RECEIPT-V1:"` | Cross-context tool receipt signing | §6.2.4 |
 | `"SCP-XCTX-DIVERGENCE-V1:"` | Cross-context divergence marker signing | §6.2.4 |
+| `"SCP-INVITATION-BUNDLE-V1:"` | InvitationBundle signing — over the full genesis `ContextParams` (per-field JCS hashes) | §5.12.3.1 |
+| `"SCP-JOIN-RESPONSE-V1:"` | JoinResponse signing | §5.12.3.2 |
 | `"standing:"` / `"standing-"` | Standing-pair context-id derivation prefix — internal id construction over a §9.5.1 length-prefixed body, NOT a §9.5.1 signature-preimage separator (`"standing-"` is an output id-prefix) | §5.15.8 |
 
 #### 9.18.3 Key Derivation and HPKE Labels
@@ -1722,6 +1724,7 @@ This section consolidates all HKDF labels, HPKE info prefixes, HMAC domain strin
 | CID content codec | DAG-CBOR (`0x71`) | Canonical CBOR encoding | §9.5 |
 | CID multibase encoding | base32lower (prefix `b`) | For display; raw bytes on wire | §9.5 |
 | MLS extension type: `scp_wrapping_key` | `0xFF01` | RFC 9420 §17.3 private-use range; carries X25519 sender key wrapping public key | §9.16 |
+| MLS extension type: `scp_context_params` | `0xFF02` | RFC 9420 §17.3 private-use range; GroupContext extension carrying JCS-serialized SCP Context Parameters (context_id, governance/ceiling hashes, parent lineage) | §5.13.3 |
 | UCAN max delegation chain depth | 32 | Maximum depth of UCAN delegation chains | §9.8.2 |
 | UCAN nonce cache max capacity | 100,000 | Maximum nonces tracked for deduplication | §9.8.2 |
 | UCAN nonce min retention | 86,400s (24h) | Minimum time nonces are retained before garbage collection | §9.8.2 |

@@ -1009,25 +1009,75 @@ pub struct CrossContextToolInvocationRequest {
     pub asserted_timestamp_ms: u64,
 }
 
+/// Relay TTL (seconds) for a delivered invitation bundle (spec §5.12.3.3 —
+/// 7-day default).
+const INVITATION_TTL_SECS: u32 = 7 * 24 * 60 * 60;
+
+/// Outcome of [`Supervisor::invite_member`].
+///
+/// An extensible enum with a SINGLE variant today. `invite_member` currently
+/// supports only `SingleAdmin` contexts, where the caller-as-admin is
+/// authorized to add the member unilaterally: the governance action
+/// auto-executes, the real MLS add runs in-actor (updating `role_state`,
+/// broadcasting the epoch-advancing Commit to existing members), and the
+/// resulting Welcome is sealed into a signed §5.12.3 `InvitationBundle` for the
+/// invitee — surfaced here as [`Self::Sealed`].
+///
+/// A voting-governed context (Threshold / Majority / Unanimity) instead returns
+/// `Err`: a unilateral invite is NOT authorized and governed-context
+/// invitations (create + track a proposal, seal the Welcome once approved and
+/// executed) are not yet implemented — see `invite_member`. When they are, a
+/// second variant carrying the tracked proposal id is added ADDITIVELY; the
+/// enum shape is preserved for exactly that forward extension.
+#[derive(Debug, Clone)]
+pub enum InviteMemberOutcome {
+    /// The invitation was sealed and (best-effort) delivered.
+    Sealed {
+        /// The creator-signed, HPKE-sealed invitation bundle (`context_id`,
+        /// `creator_did`, `enc`, `ciphertext`) — the SAME wire type the joiner
+        /// passes to [`Supervisor::spawn_actor_from_welcome`], so the invite
+        /// output is directly usable as the join input with no re-boxing.
+        bundle: crate::context::invitation_helpers::SealedInvitation,
+        /// `true` if the runtime published the sealed invitation to the
+        /// invitee's `scp-invitations` routing id; `false` if the transport
+        /// does not support routing-id delivery (the caller must deliver
+        /// `bundle` itself).
+        delivered: bool,
+    },
+}
+
 /// Flat, named-field request for [`Supervisor::spawn_actor_from_welcome`]
-/// (ADR-049 Phase 2J, spawn-from-Welcome). A config object (not positional
-/// args) per the agent-first API tenet: an LLM constructs it from the field
-/// names + one example, with no argument-order footgun. The joiner's OWN
+/// (ADR-049 Phase 2J, spawn-from-Welcome; FFI-02 Option A). A config object (not
+/// positional args) per the agent-first API tenet: an LLM constructs it from the
+/// field names + one example, with no argument-order footgun. The joiner's OWN
 /// identity is passed separately (as a `DID` on the `Supervisor` method, or as
 /// the unforgeable `&OwnedIdentityDid` capability on the `SupervisorHandle`
 /// wrapper) so it cannot be transposed with `creator_did`.
+///
+/// The request carries the creator-signed, HPKE-sealed
+/// [`InvitationBundle`](scp_protocol::context::InvitationBundle) — NOT loose
+/// caller-supplied params. `spawn_actor_from_welcome` opens the bundle (split
+/// custody), verifies the creator signature, and derives ALL authority
+/// (`creator_did`, `context_params`, `welcome_message`) from the AUTHENTICATED
+/// bundle. `context_id` / `creator_did` here are UNTRUSTED binding hints used
+/// only to rebuild the HPKE `info`/`aad`; they are AEAD-authenticated by a
+/// successful open and additionally cross-checked against the signed bundle.
 pub struct WelcomeJoinRequest {
-    /// The context creator / admin DID (from the legible, pre-join params).
-    pub creator_did: DID,
-    /// Canonical context id string (`hex(digest)` under ADR-056).
+    /// UNTRUSTED binding hint: the context id used to build the HPKE `info`/`aad`
+    /// (`hex(digest)` under ADR-056). Cross-checked against `bundle.context_id`
+    /// after the open; authority derives from the signed bundle, never this.
     pub context_id: String,
-    /// The legible context parameters (visible before joining, spec §5).
-    pub params: scp_protocol::context::ContextParams,
+    /// UNTRUSTED binding hint: the creator did used to build the HPKE
+    /// `info`/`aad`. Cross-checked against `bundle.creator_did` after the open.
+    pub creator_did: DID,
+    /// RFC 9180 HPKE encapsulated key (`enc`) of the sealed invitation bundle.
+    pub sealed_bundle_enc: [u8; 32],
+    /// RFC 9180 HPKE ciphertext (`ct`) of the MessagePack-serialized
+    /// [`InvitationBundle`](scp_protocol::context::InvitationBundle).
+    pub sealed_bundle_ct: Vec<u8>,
     /// The reservation id of the KeyPackage this Welcome was addressed to,
     /// obtained from the joiner's `KeyPackageStoreActor` `Reserve`.
     pub reservation_id: crate::context::supervisor::key_package_actor::ReservationId,
-    /// TLS-serialized MLS Welcome message received for the reserved KeyPackage.
-    pub welcome_bytes: Vec<u8>,
     /// The joiner's §9.10.4 local pseudonym for this context, or `None`.
     pub local_pseudonym: Option<[u8; 32]>,
 }
@@ -2107,10 +2157,10 @@ impl Supervisor {
     /// acquired and the probe is re-checked under the lock (double-
     /// checked) before spawning, so concurrent callers never spawn two
     /// actors for the same identity.
-    // Non-test callers land when `dispatch_lifecycle_direct` switches to
-    // actor-shape (storage-foundation Step 5); until then this is reached
-    // only from `build_actor_deps`' test fixtures.
-    #[cfg_attr(not(test), allow(dead_code))]
+    // Reached in production from `Supervisor::reserve_key_package` (the
+    // spawn-from-Welcome reserve entrypoint); additional non-test callers land
+    // when `dispatch_lifecycle_direct` switches to actor-shape (storage-
+    // foundation Step 5).
     pub(in crate::context) async fn key_package_store_for(
         self: &Arc<Self>,
         identity: &DID,
@@ -4634,7 +4684,7 @@ impl Supervisor {
     ///
     /// # Visibility
     ///
-    /// `pub(in crate::context)` — exposed through
+    /// `pub` — exposed through
     /// [`SupervisorHandle::despawn_actor`](crate::context::supervisor::handle::SupervisorHandle::despawn_actor)
     /// so lifecycle bootstrap (`import_context`) can perform the
     /// despawn-then-respawn dance without holding `&Supervisor`
@@ -4642,10 +4692,72 @@ impl Supervisor {
     /// [`crate::context::lifecycle_helpers::shutdown_all_contexts`] to
     /// remove each actor's handle after `ShutdownSelf`, so the inbox
     /// closes and the actor task exits rather than lingering as a
-    /// zombie.
-    pub(in crate::context) async fn despawn_actor(&self, context_id: &str) -> bool {
+    /// zombie. Also called by the FFI bridges as the COMPENSATING teardown
+    /// when a post-irreversible-commit step of the Welcome-join fails (e.g.
+    /// a concurrent close/leave removed the bridge state before the
+    /// authenticated ceiling could be synced): the just-committed actor is
+    /// despawned so no orphaned live actor lingers for a join that did not
+    /// fully materialize. This is a silent local teardown — it drops the
+    /// actor's inbox so the task exits, without any MLS leave ceremony or
+    /// spurious `MemberLeft` event.
+    pub async fn despawn_actor(&self, context_id: &str) -> bool {
         let _guard = self.write_lock.lock().await;
         self.actors.remove(context_id).is_some()
+    }
+
+    /// COMPLETE compensating teardown of a just-joined context (BLACK-2JF-01).
+    ///
+    /// Unlike [`Self::despawn_actor`] — which removes ONLY the in-memory actor
+    /// handle — this fully reverses everything
+    /// [`Self::spawn_actor_from_welcome`] materialized after the irreversible
+    /// KeyPackage consume, mirroring that entrypoint's OWN post-consume
+    /// rollback arms: it destroys the installed MLS crypto group
+    /// (`destroy_mls_group`) AND deletes the persisted Class-S snapshot
+    /// (`delete_context`) in addition to dropping the actor handle.
+    ///
+    /// The FFI bridges call this as the compensating teardown when a
+    /// post-irreversible-commit join step fails (e.g. a concurrent close/leave
+    /// removed the bridge state before the authenticated ceiling could be
+    /// synced). A bare `despawn_actor` there would leave the resident MLS
+    /// crypto group AND the durable snapshot behind, so on restart the
+    /// "torn-down" context would RESURRECT (FFI/runtime divergence) and the
+    /// residual snapshot would block a fresh re-join via Precheck-D
+    /// (first-writer-wins durable collision). Tearing down all three leaves the
+    /// join strictly MORE recoverable: a re-join with a fresh KeyPackage
+    /// reservation now succeeds.
+    ///
+    /// The single-use KeyPackage the join burned is NOT restored — that
+    /// consume is irreversible by construction (a KeyPackage is one-shot), and
+    /// re-joining draws a fresh reservation anyway.
+    ///
+    /// Like the internal rollback arms, the crypto-destroy and snapshot-delete
+    /// are best-effort (`let _ =`): each is an idempotent no-op when the
+    /// corresponding step never ran, and a compensating teardown must never
+    /// itself fail. Both are synchronous, so they run under `write_lock`
+    /// (no `.await` while held) — making the teardown atomic with respect to
+    /// concurrent register/despawn.
+    ///
+    /// Returns `true` if a live actor handle was registered and removed,
+    /// `false` if no entry existed for `context_id`.
+    pub async fn discard_joined_context(&self, context_id: &str) -> bool {
+        let _guard = self.write_lock.lock().await;
+        // 1. Drop the in-memory actor handle (identical to `despawn_actor`).
+        let removed = self.actors.remove(context_id).is_some();
+        // 2. Destroy the resident MLS crypto group so no keyed state lingers
+        //    (mirrors `spawn_actor_from_welcome`'s `destroy_mls_group` arm).
+        let context_id_bytes = crate::context::state::context_id_to_bytes(context_id);
+        if let Some(crypto) = self.crypto_ref() {
+            let _ = crypto.destroy_mls_group(&context_id_bytes);
+        }
+        // 3. Delete the durable Class-S snapshot the join persisted so a
+        //    restart cannot resurrect the context and Precheck-D does not block
+        //    a fresh re-join (mirrors the `delete_context` rollback arm; the
+        //    helper-persistence slot is the same backend the join persisted to,
+        //    an unset slot means nothing durable was ever written).
+        if let Some(persistence) = self.persistence_ref() {
+            let _ = persistence.delete_context(context_id);
+        }
+        removed
     }
 
     /// Reap a context's [`CrashWindow`] entry on a CLEAN, NON-poison despawn
@@ -10291,6 +10403,15 @@ impl Supervisor {
         .await
     }
 
+    // AXIS: bridge-external (ADR-049 §5 placement invariant). `create_context`
+    // and its join-side peers `reserve_key_package` / `spawn_actor_from_welcome`
+    // (below) are node-level bootstraps called by the trusted FFI/bridge
+    // orchestrator: each takes a bare `DID`, with local-identity custody
+    // enforced at the bridge, and returns only public / context state — never
+    // per-identity secret crypto. Per-identity SECRET access lives on the
+    // actor-internal `OwnedIdentityDid` axis instead (the
+    // `SupervisorHandle::my_*` accessors), never as a bare-`DID` method here.
+
     /// Create a new MLS-backed (or broadcast-mode) context via the
     /// actor mailbox.
     ///
@@ -10340,6 +10461,472 @@ impl Supervisor {
                 ),
             )
         })
+    }
+
+    /// Reserve one of this identity's pooled KeyPackages for a
+    /// spawn-from-Welcome join, returning the `(ReservationId, public KP
+    /// bytes)` pair. The reservation moves a KP into the KeyPackage actor's
+    /// `reserved` map; the private signer-state never leaves that actor. The
+    /// public bytes are for routing only — the creator adds them to its MLS
+    /// group to produce the Welcome addressed to this KP, and the returned
+    /// [`ReservationId`](crate::context::supervisor::key_package_actor::ReservationId)
+    /// is handed back in the `WelcomeJoinRequest`'s `reservation_id` so the
+    /// fused `ConfirmConsume` inside [`Self::spawn_actor_from_welcome`] can
+    /// match the join.
+    ///
+    /// Bare-`DID` bootstrap entrypoint — the reserve half of the join-side peer
+    /// of [`Self::create_context`]. Local-identity custody is enforced at the
+    /// FFI bridge layer, not here (the same trust model as `create_context`).
+    /// Get-or-spawns this identity's `KeyPackageStoreActor` and issues a SINGLE
+    /// atomic [`KeyPackageCommand::ReserveAny`] — replenish-if-empty, pick the
+    /// first pooled ref, and reserve it, all inside one command handler.
+    ///
+    /// Folding the reservation into one command (rather than composing
+    /// `Replenish` → `ListPooled` → `Reserve` as three separate mailbox
+    /// round-trips) closes a concurrency gap: two concurrent same-identity
+    /// reserves that each `ListPooled` the same pool would both pick the same
+    /// `kp_ref`, and the second `Reserve` would spuriously fail
+    /// `InvalidState("already reserved")` even though distinct KPs were
+    /// available. Because the actor owns `pool`/`reserved` and handlers run
+    /// serialized on its mailbox loop, the atomic command guarantees the two
+    /// reserves take DISTINCT KeyPackages.
+    ///
+    /// # Errors
+    ///
+    /// - Propagates any error from resolving the identity's
+    ///   `KeyPackageStoreActor` (e.g.
+    ///   [`ContextError::NotInitialized`](scp_protocol::context::ContextError::NotInitialized)
+    ///   when providers are absent, or a poisoned-KP-actor sticky error).
+    /// - [`ContextError::ActorBusy`](scp_protocol::context::ContextError::ActorBusy)
+    ///   if the KeyPackage actor's mailbox is full or its reply channel drops.
+    /// - [`ContextError::CreationFailed`] if the pool is still empty after a
+    ///   replenish (no KP available to reserve).
+    pub async fn reserve_key_package(
+        self: &Arc<Self>,
+        owning_did: DID,
+    ) -> Result<
+        (
+            crate::context::supervisor::key_package_actor::ReservationId,
+            Vec<u8>,
+        ),
+        ContextError,
+    > {
+        use crate::context::supervisor::key_package_actor::KeyPackageCommand;
+
+        let store = self.key_package_store_for(&owning_did).await?;
+        store
+            .send(|reply| KeyPackageCommand::ReserveAny { reply })
+            .await
+    }
+
+    /// Produces, signs, HPKE-seals, and (best-effort) delivers a §5.12.3 signed
+    /// [`InvitationBundle`](scp_protocol::context::InvitationBundle) inviting
+    /// `invitee_did` to the encrypted context `context_id` (ADR-049 Phase 2J,
+    /// FFI-02 Option A — the creator-side peer of
+    /// [`Self::spawn_actor_from_welcome`]).
+    ///
+    /// Steps (all creator-side, no per-identity secret returned):
+    ///
+    /// 1. Reads the context's LIVE genesis [`ContextParams`] — the authenticated
+    ///    authority source the joiner will enforce from. Encrypted-only: the
+    ///    MLS-Welcome invitation flow stands up an encrypted context
+    ///    (spawn-from-Welcome builds Encrypted mode and rejects Broadcast), so a
+    ///    Broadcast context is refused here.
+    /// 2. Resolves the invitee's `#active` verifying key via the
+    ///    [`key_resolver`](Self::key_resolver_ref) and maps it to X25519 (RFC
+    ///    7748) as the HPKE recipient key.
+    /// 3. Only a `SingleAdmin` context is supported (a voting model returns
+    ///    `Err(ContextError::InvalidState)` up front — no proposal, no add —
+    ///    because governed-context invitations are not yet implemented). Routes
+    ///    the member-add through the context actor's
+    ///    governance gate (`propose_governance_action_checked` → `AddMember`),
+    ///    carrying `invitee_key_package` (the invitee's reserved KeyPackage bytes
+    ///    from [`Self::reserve_key_package`]) on the actor command envelope. The
+    ///    caller-as-admin auto-executes: the real MLS add for the carried
+    ///    KeyPackage runs IN-ACTOR — updating `role_state`, minting access keys,
+    ///    appending the event-log leaf, and broadcasting the epoch-advancing
+    ///    Commit to existing members — and returns the Welcome. A non-admin
+    ///    caller is rejected by the checked capability check / governance engine
+    ///    (`?` surfaces the error, nothing is added). If any post-add step fails,
+    ///    a compensating `RemoveMember` is routed through the same gate so no
+    ///    added member is left without the sealed Welcome.
+    /// 4. Assembles the bundle: genesis `context_params`, the visibility-filtered
+    ///    [`MetadataSnapshot`](scp_protocol::context::metadata::MetadataSnapshot),
+    ///    `relay_urls`, and the §9.10.4.B `context_metadata_key`.
+    /// 5. Signs it over
+    ///    [`invitation_bundle_signing_hash`](scp_protocol::context::InvitationBundle::invitation_bundle_signing_hash)
+    ///    with the creator's `#active` key — the SAME `proposer_signing_key`
+    ///    that authorized the governance `AddMember` in step 3. Using one key
+    ///    for both makes it structurally impossible for the bundle's
+    ///    authenticated `creator_did` to diverge from the DID the governance
+    ///    gate authorized. The actor holds no custody key; the raw key is
+    ///    supplied by the FFI boundary (same trust model as the governance
+    ///    proposal path, which also takes a raw `&SigningKey`).
+    /// 6. HPKE-seals the MessagePack-serialized bundle to the invitee (RFC 9180
+    ///    Base mode, `info`/`aad` per §5.12.3.1).
+    /// 7. Fork C: publishes the sealed
+    ///    [`SealedInvitation`](crate::context::invitation_helpers::SealedInvitation)
+    ///    to the invitee's `scp-invitations` routing id when the transport
+    ///    supports routing-id delivery; otherwise returns the `(enc, ct)` for the
+    ///    caller to deliver (`delivered = false`).
+    ///
+    /// # Cryptographic notes
+    ///
+    /// - **`context_metadata_key` (§9.10.4.B).** Spec §9.10.4.B has the creator
+    ///   generate this 32-byte key once at context creation and share it with all
+    ///   members so their metadata routing IDs converge. The runtime create path
+    ///   does not yet persist a genesis metadata key, so this method mints a
+    ///   fresh `OsRng` key per invitation. It is cryptographically sound (CSPRNG,
+    ///   signed into the bundle) and correct for a single-invitee (bilateral)
+    ///   context, but multiple invitees will NOT converge on one metadata routing
+    ///   ID until a genesis `context_metadata_key` is stored at creation and read
+    ///   here. Metadata-routing publish is itself not yet wired, so this is inert
+    ///   today.
+    /// - **`sender_key_seed`.** `None` here: this flow is Encrypted-only (guarded
+    ///   above), and Encrypted contexts carry no sender-key seed in the bundle
+    ///   (§5.12.3.1). Broadcast admission is a separate flow.
+    /// - **Actor serialization.** The MLS add-member runs IN-ACTOR via the
+    ///   governance mailbox command (`propose_governance_action`), so it is
+    ///   serialized against every other actor MLS operation — no off-mailbox
+    ///   race. Only the read-only param/metadata gathering and the
+    ///   bundle-seal/deliver happen on the caller task.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::ContextNotRegistered`] if `context_id` has no live
+    ///   context; [`ContextError::InvalidState`] for a voting-governed context
+    ///   (governed-context invitations are not yet implemented);
+    ///   [`ContextError::CryptoFailed`] for a Broadcast context, an
+    ///   unresolvable invitee `#active` key, an invalid key mapping, a signing or
+    ///   HPKE-seal failure, or a serialization fault;
+    ///   [`ContextError::MembershipFailed`] if the MLS add-member produces no
+    ///   Welcome; [`ContextError::NotInitialized`] if no key resolver is wired;
+    ///   or any non-"unsupported" transport error surfaced by the delivery.
+    // The produce → assemble → sign → seal → deliver sequence reads clearer as one
+    // linear method than split across helpers, hence the line-count allow (mirrors
+    // `spawn_actor_from_welcome`, its join-side peer).
+    #[allow(clippy::too_many_lines)]
+    pub async fn invite_member(
+        self: &Arc<Self>,
+        context_id: String,
+        creator_did: DID,
+        invitee_did: DID,
+        invitee_key_package: Vec<u8>,
+        relay_urls: Vec<String>,
+        proposer_signing_key: &ed25519_dalek::SigningKey,
+    ) -> Result<InviteMemberOutcome, ContextError> {
+        use rand::RngCore as _;
+        use scp_protocol::context::governance::GovernanceAction;
+        use scp_protocol::context::{InvitationBundle, InvitationKeyMaterial};
+        use scp_protocol::crypto::envelope_seal;
+
+        // 1. Live genesis params — the authenticated authority source.
+        let params = self.context_params(&context_id).await.ok_or_else(|| {
+            ContextError::ContextNotRegistered(format!(
+                "invite_member: no live context '{context_id}'"
+            ))
+        })?;
+        if params.mode != scp_protocol::context::ContextMode::Encrypted {
+            return Err(ContextError::CryptoFailed(
+                "invite_member supports only Encrypted contexts; Broadcast admission uses the \
+                 sender-key distribution flow, not an MLS Welcome"
+                    .to_owned(),
+            ));
+        }
+
+        // Governed-context gate: only a `SingleAdmin` context authorizes a
+        // UNILATERAL invite (the admin auto-executes the add). A voting model
+        // (Threshold / Majority / Unanimity) requires a governance vote, so a
+        // unilateral invite is NOT authorized. Refuse HERE — before proposing —
+        // so we never leave a dead-on-arrival pending `AddMember` proposal, never
+        // stage a KeyPackage, and never run an MLS add. Governed-context invites
+        // (create + track a proposal, seal the Welcome once approved) are not yet
+        // implemented, so this is an honest `Err` rather than a phantom-success
+        // outcome that drops the invite while claiming it was deferred. When
+        // governed invites land, this branch returns the future additive
+        // `InviteMemberOutcome` variant carrying the tracked proposal id.
+        if !matches!(
+            params.governance,
+            scp_protocol::context::params::GovernanceModel::SingleAdmin
+        ) {
+            return Err(ContextError::InvalidState(
+                "invite_member: governed-context invitations are not yet implemented; only \
+                 SingleAdmin contexts support a unilateral invite"
+                    .to_owned(),
+            ));
+        }
+
+        // 2. Resolve the invitee's #active key -> X25519 recipient.
+        let resolver = self.key_resolver_ref().ok_or_else(|| {
+            ContextError::NotInitialized("invite_member: key resolver not configured".to_owned())
+        })?;
+        let invitee_vk =
+            resolver(&invitee_did, scp_did::SigningKeyId::Active).ok_or_else(|| {
+                ContextError::CryptoFailed(format!(
+                    "invite_member: cannot resolve #active key for invitee '{invitee_did}'"
+                ))
+            })?;
+        let recipient_x25519 = envelope_seal::ed25519_pubkey_to_x25519(invitee_vk.as_bytes())
+            .map_err(|e| {
+                ContextError::CryptoFailed(format!(
+                    "invite_member: invitee #active key has no valid X25519 mapping: {e}"
+                ))
+            })?;
+
+        // 3. Drive the member-add THROUGH THE CONTEXT ACTOR's governance gate
+        //    (structural — replaces the prior off-mailbox `deps.crypto.add_member`
+        //    that bypassed the actor, dropping the epoch Commit, skipping the
+        //    creator's `role_state` update, racing the mailbox, and enforcing NO
+        //    authorization). Routing through `propose_governance_action_checked`:
+        //    - AUTHORIZES by construction: the checked variant verifies the
+        //      proposer's `governance:propose` capability in-lock, and
+        //      `SingleAdminEngine::propose` rejects any proposer that is not the
+        //      admin (`NotAdmin`). A non-admin caller is rejected here — nothing
+        //      is added — so the `?` surfaces that authorization failure.
+        //    - runs the REAL MLS add + `role_state` sync + access keys +
+        //      event-log leaf ATOMICALLY in-actor (`execute_add_member`), and
+        //      BROADCASTS the epoch-advancing Commit to existing members.
+        //
+        //    The invitee's reserved KeyPackage is carried on the actor command
+        //    envelope (NOT on the signed/logged governance proposal) and threaded
+        //    to `execute_add_member`, which binds it to the invitee DID and does
+        //    the real add. On a propose failure nothing was added, so there is
+        //    nothing to clean up.
+        let outcome = self
+            .propose_governance_action_checked_carrying_key_package(
+                &context_id,
+                &creator_did,
+                GovernanceAction::AddMember {
+                    // The joiner self-assigns the default "member" role in
+                    // `build_welcome_joiner_state`; the creator-side add MUST
+                    // match it, so this is protocol-fixed, not a free parameter.
+                    did: invitee_did.clone(),
+                    role: "member".to_owned(),
+                },
+                proposer_signing_key,
+                Some(invitee_key_package),
+            )
+            .await?;
+
+        let welcome_message = match outcome.execution_result {
+            Some(crate::context::state::GovernanceActionResult::MemberAdded {
+                welcome_bytes,
+                ..
+            }) => welcome_bytes.0,
+            None => {
+                // Gated to `SingleAdmin` above, so an auto-execute is expected.
+                // No execution means the add did NOT run (e.g. governance frozen
+                // or a conflict invalidated the proposal) — so NO member was
+                // added. Surface an error; do NOT report a governance-approval
+                // outcome (this is not a voting context) and do NOT compensate
+                // (there is nothing to remove).
+                return Err(ContextError::GovernanceFailed(
+                    "invite_member: SingleAdmin AddMember did not auto-execute (governance frozen \
+                     or the proposal was invalidated); no member was added"
+                        .to_owned(),
+                ));
+            }
+            Some(other) => {
+                return Err(ContextError::GovernanceFailed(format!(
+                    "invite_member: governance AddMember returned an unexpected result: {other:?}"
+                )));
+            }
+        };
+
+        // The member is now ADDED (real MLS add + role_state + broadcast Commit).
+        // Every remaining step (sign / serialize / HPKE-seal / deliver) is
+        // fallible, so run them in a fallible region; on ANY failure the group
+        // would otherwise retain a member who never receives the sealed Welcome
+        // (a zombie), so we dispatch a COMPENSATING remove through the same actor
+        // governance gate (which broadcasts its own Commit, restoring epoch
+        // consistency) before surfacing the error (FIX 4).
+        let seal_result: Result<InviteMemberOutcome, ContextError> = async {
+            if welcome_message.is_empty() {
+                return Err(ContextError::MembershipFailed(
+                    "invite_member: in-actor MLS add-member produced no Welcome message".to_owned(),
+                ));
+            }
+
+            // 4. Assemble the visibility-filtered metadata snapshot + key material.
+            let member_count = self
+                .member_count(&context_id)
+                .await
+                .map(|n| u64::try_from(n).unwrap_or(u64::MAX));
+            let facts = crate::context::invitation_helpers::SnapshotRuntimeFacts {
+                member_count,
+                creator_did: Some(creator_did.clone()),
+                tool_count: Some(u64::try_from(params.tools.len()).unwrap_or(u64::MAX)),
+                ..crate::context::invitation_helpers::SnapshotRuntimeFacts::default()
+            };
+            let metadata_snapshot =
+                crate::context::invitation_helpers::build_metadata_snapshot(&params, facts);
+
+            let mut metadata_key = [0u8; 32];
+            rand::rngs::OsRng.fill_bytes(&mut metadata_key);
+            let key_material = InvitationKeyMaterial {
+                context_metadata_key: metadata_key,
+                sender_key_seed: None,
+            };
+
+            // 5. Build + sign the bundle with the creator's #active key. The SAME
+            //    key just authorized (and signed) the governance `AddMember`
+            //    proposal, so signing the bundle here with it makes it
+            //    STRUCTURALLY impossible for the authenticated `creator_did` on
+            //    the bundle to diverge from the DID the governance gate authorized
+            //    (a two-signing-input design could sign the proposal under admin A
+            //    while sealing a bundle claiming creator B; the joiner would only
+            //    catch it after burning its single-use KeyPackage). One key, one
+            //    identity, checked up-front.
+            let mut bundle = InvitationBundle {
+                context_id: context_id.clone(),
+                creator_did: creator_did.clone(),
+                relay_urls,
+                welcome_message,
+                key_material,
+                context_params: params,
+                metadata_snapshot,
+                signature: Vec::new(),
+            };
+            bundle.sign(proposer_signing_key).map_err(|e| {
+                ContextError::CryptoFailed(format!("invite_member: bundle sign failed: {e}"))
+            })?;
+
+            // 6. HPKE-seal the serialized bundle to the invitee. `wire` carries
+            //    the plaintext `context_metadata_key` (§9.10.4.B) — hold it in
+            //    `Zeroizing` so the serialized bundle zeroes on drop.
+            let wire = zeroize::Zeroizing::new(bundle.to_wire_bytes().map_err(|e| {
+                ContextError::CryptoFailed(format!("invite_member: bundle serialize failed: {e}"))
+            })?);
+            let (ciphertext, enc) = envelope_seal::hpke_seal_invitation(
+                &wire,
+                &recipient_x25519,
+                &context_id,
+                creator_did.as_ref(),
+            )
+            .map_err(|e| {
+                ContextError::CryptoFailed(format!("invite_member: HPKE seal failed: {e}"))
+            })?;
+
+            // 7. Fork C — deliver to the invitee's scp-invitations routing id when
+            //    the transport supports routing-id delivery; otherwise the caller
+            //    delivers.
+            let sealed = crate::context::invitation_helpers::SealedInvitation {
+                context_id: context_id.clone(),
+                creator_did: creator_did.clone(),
+                enc: enc.to_vec(),
+                ciphertext,
+            };
+            let payload = sealed.to_wire_bytes().map_err(|e| {
+                ContextError::CryptoFailed(format!("invite_member: delivery serialize failed: {e}"))
+            })?;
+            let routing_id = envelope_seal::derive_invitation_routing_id(invitee_did.as_ref());
+            let delivered = match self.transport_ref() {
+                Some(transport) => {
+                    match transport.send_to_routing_id(&routing_id, &payload, INVITATION_TTL_SECS) {
+                        Ok(()) => true,
+                        // A transport that does not support routing-id delivery (or
+                        // is offline) returns TransportFailed; this is NON-FATAL:
+                        // the (enc, ct) are returned for the caller to deliver, so
+                        // the invitee still receives the sealed Welcome — no zombie,
+                        // no compensating remove. Any OTHER transport error is
+                        // fatal (the invitee gets nothing), so it propagates and
+                        // triggers the compensating remove below.
+                        Err(ContextError::TransportFailed(_)) => false,
+                        Err(e) => return Err(e),
+                    }
+                }
+                None => false,
+            };
+
+            Ok(InviteMemberOutcome::Sealed {
+                bundle: sealed,
+                delivered,
+            })
+        }
+        .await;
+
+        match seal_result {
+            Ok(outcome) => Ok(outcome),
+            Err(e) => {
+                // FIX 4 — compensating remove: the member was added but the
+                // invitation could not be sealed/delivered, so route a
+                // RemoveMember through the SAME actor governance gate. The remove
+                // runs in-actor (real MLS remove + role_state strip) and
+                // broadcasts its own epoch-advancing Commit, so no member is left
+                // who never received the Welcome and the group stays epoch-
+                // consistent. Best-effort: if the compensation does not ACTUALLY
+                // execute we log loudly (a member may linger) but still surface
+                // the original sealing error.
+                //
+                // The remove is a rollback ONLY when it AUTO-EXECUTED: an `Ok`
+                // with `execution_result == Some(MemberRemoved)`. A propose can
+                // return `Ok` with `execution_result: None` — the proposal was
+                // created but NOT auto-executed (e.g. governance froze via a
+                // concurrent CloseContext in the yield window between the two
+                // awaits) — in which case the member is STILL a member. Treating
+                // that (or any non-`MemberRemoved` result, or an `Err`) as
+                // success would mask exactly the zombie this compensation exists
+                // to prevent, so only `Some(MemberRemoved)` logs a rollback; every
+                // other shape takes the loud error branch.
+                let compensation = self
+                    .propose_governance_action_checked_carrying_key_package(
+                        &context_id,
+                        &creator_did,
+                        GovernanceAction::RemoveMember {
+                            did: invitee_did.clone(),
+                            reason: Some(
+                                "invitation could not be sealed/delivered after the add".to_owned(),
+                            ),
+                        },
+                        proposer_signing_key,
+                        None,
+                    )
+                    .await;
+                match compensation {
+                    Ok(outcome)
+                        if matches!(
+                            outcome.execution_result,
+                            Some(crate::context::state::GovernanceActionResult::MemberRemoved)
+                        ) =>
+                    {
+                        tracing::warn!(
+                            context_id = %context_id,
+                            invitee = %invitee_did,
+                            error = %e,
+                            "invite_member: sealing failed after the add; compensating remove \
+                             executed — the added member was rolled back"
+                        );
+                    }
+                    Ok(outcome) => {
+                        // Propose succeeded but the remove did NOT auto-execute
+                        // (e.g. governance froze in the window) — the member was
+                        // NOT removed. This is a zombie; surface it loudly.
+                        tracing::error!(
+                            context_id = %context_id,
+                            invitee = %invitee_did,
+                            error = %e,
+                            compensating_remove_status = ?outcome.status,
+                            "invite_member: sealing failed after the add AND the compensating \
+                             remove did NOT execute (proposal created but not auto-executed); the \
+                             invitee remains a member without ever receiving the sealed Welcome; \
+                             manual removal required"
+                        );
+                    }
+                    Err(remove_err) => {
+                        tracing::error!(
+                            context_id = %context_id,
+                            invitee = %invitee_did,
+                            error = %e,
+                            compensating_remove_error = %remove_err,
+                            "invite_member: sealing failed after the add AND the compensating \
+                             remove failed — the invitee may remain a member without ever \
+                             receiving the sealed Welcome; manual removal required"
+                        );
+                    }
+                }
+                Err(e)
+            }
+        }
     }
 
     // (WelcomeJoinRequest is defined at module scope below the impl.)
@@ -10402,33 +10989,34 @@ impl Supervisor {
     ///   snapshot persist fails (the installed group is rolled back).
     /// - Provider-init / governance-validation errors surfaced while building
     ///   the joiner state.
-    // Narrowed to `pub(in crate::context)` (Fix 5 / security): the raw entry
-    // takes a bare `DID`, so it must not be the `pub` "spawn under any identity"
-    // primitive the `OwnedIdentityDid` capability exists to prevent. In-crate
-    // callers are the runtime spawn-from-Welcome tests today and the
-    // `OwnedIdentityDid`-gated `SupervisorHandle` wrapper the FFI follow-on slice
-    // adds; there is no non-test production consumer until then, hence the
-    // `#[allow(dead_code)]` on this core slice.
+    // Genuinely `pub` — the bridge-external "spawn under a locally-custodied
+    // identity" bootstrap, the join-side peer of `create_context`. It takes a
+    // bare `DID` (local-identity custody is enforced at the FFI bridge layer,
+    // the same trust model as `create_context`) and returns only a
+    // `ContextHandle` — context state, never per-identity secret crypto — so it
+    // sits on the bare-`DID` bootstrap axis, NOT the actor-internal
+    // `OwnedIdentityDid` per-identity-secret axis (ADR-049 Decision 5).
     //
     // The heavily-commented crash-safety ladder (reversible prechecks → consume
     // → install → build → persist → crypto-durability check → spawn, each with
     // its rollback-on-error path) reads clearer as one linear sequence than split
     // across helpers, hence the line-count allow.
-    #[allow(dead_code)]
     #[allow(clippy::too_many_lines)]
-    pub(in crate::context) async fn spawn_actor_from_welcome(
+    pub async fn spawn_actor_from_welcome<C: scp_platform::KeyCustody>(
         self: &Arc<Self>,
         owning_did: DID,
+        custody: &C,
+        active_key_handle: &scp_platform::KeyHandle,
         req: WelcomeJoinRequest,
     ) -> Result<crate::context::ContextHandle, ContextError> {
         use crate::context::supervisor::key_package_actor::KeyPackageCommand;
 
         let WelcomeJoinRequest {
-            creator_did,
-            context_id,
-            params,
+            context_id: hint_context_id,
+            creator_did: hint_creator_did,
+            sealed_bundle_enc,
+            sealed_bundle_ct,
             reservation_id,
-            welcome_bytes,
             local_pseudonym,
         } = req;
 
@@ -10454,6 +11042,153 @@ impl Supervisor {
         // the crypto ops, nor `spawn_actor_with_state` re-acquires
         // `bootstrap_spawn_lock`, so this is re-entrancy- and deadlock-free.
         let _bootstrap_guard = self.bootstrap_spawn_lock.lock().await;
+
+        // ---- OPEN + VERIFY the signed §5.12.3 invitation bundle (FFI-02) ------
+        // This is the FIRST thing the join does — before any precheck, the
+        // irreversible KeyPackage consume, or any state build — so authority
+        // derives ONLY from the creator-signed, HPKE-sealed bundle, never from
+        // attacker-injectable caller params (BLACK-2J10-001 admin-hijack).
+        //
+        // The joiner's #active private key never leaves custody: the KEM
+        // Diffie-Hellman `DH(sk_active_x25519, enc)` is computed INSIDE custody
+        // via `ed25519_to_x25519_agree`; the rest of the RFC 9180 open
+        // (`ExtractAndExpand`, `KeySchedule`, AEAD) is pure software (ADR-006,
+        // split custody). `info`/`aad` are rebuilt from the UNTRUSTED
+        // `hint_context_id` / `hint_creator_did`; a successful AEAD open PROVES
+        // the sealer used identical values (they are AEAD-authenticated), and the
+        // signed bundle is cross-checked against them below.
+        // The two custody `.await`s (KEM DH agreement + reading the joiner's
+        // #active public key) hit an external custody device whose latency the
+        // runtime does not control. They run UNDER the global
+        // `bootstrap_spawn_lock`, so a slow or hostile custody device would pin
+        // that lock and wedge every other bootstrap (create / join / import /
+        // restore / respawn) node-wide — a bootstrap DoS. Bound them under
+        // `LIFECYCLE_TIMEOUT` (same budget as the consume region below). This is
+        // a SEPARATE timeout from the post-consume region on purpose: nothing is
+        // consumed or persisted here, so an elapse has nothing to roll back and
+        // the reversible-precheck ordering is preserved.
+        let (dh_bytes, active_pub_bytes): (zeroize::Zeroizing<[u8; 32]>, [u8; 32]) =
+            match tokio::time::timeout(Self::LIFECYCLE_TIMEOUT, async {
+                let dh = custody
+                    .ed25519_to_x25519_agree(active_key_handle, &sealed_bundle_enc)
+                    .await
+                    .map_err(|e| {
+                        ContextError::CryptoFailed(format!(
+                            "spawn-from-Welcome: invitation KEM DH agreement failed: {e}"
+                        ))
+                    })?;
+                let dh_bytes: zeroize::Zeroizing<[u8; 32]> =
+                    zeroize::Zeroizing::new(*dh.as_bytes());
+                // pkRm = the joiner's OWN #active public key mapped to X25519.
+                let active_pub = custody.public_key(active_key_handle).await.map_err(|e| {
+                    ContextError::CryptoFailed(format!(
+                        "spawn-from-Welcome: reading the joiner #active public key failed: {e}"
+                    ))
+                })?;
+                let active_pub_bytes: [u8; 32] =
+                    active_pub.as_bytes().try_into().map_err(|_| {
+                        ContextError::CryptoFailed(
+                            "spawn-from-Welcome: joiner #active public key is not 32 bytes"
+                                .to_owned(),
+                        )
+                    })?;
+                Ok::<_, ContextError>((dh_bytes, active_pub_bytes))
+            })
+            .await
+            {
+                Ok(result) => result?,
+                Err(_elapsed) => {
+                    return Err(ContextError::TransportTimeout(format!(
+                        "spawn-from-Welcome: custody key operations exceeded {:?} — refusing \
+                         to hold the global bootstrap lock (nothing consumed)",
+                        Self::LIFECYCLE_TIMEOUT
+                    )));
+                }
+            };
+        let pk_rm =
+            scp_protocol::crypto::envelope_seal::ed25519_pubkey_to_x25519(&active_pub_bytes)
+                .map_err(|e| {
+                    ContextError::CryptoFailed(format!(
+                        "spawn-from-Welcome: joiner #active key has no valid X25519 mapping: {e}"
+                    ))
+                })?;
+        // `bundle_wire` is the decrypted, serialized InvitationBundle — it holds
+        // the plaintext `context_metadata_key` (§9.10.4.B). Hold it in
+        // `Zeroizing` so it zeroes on drop once decoded.
+        let bundle_wire = zeroize::Zeroizing::new(
+            scp_protocol::crypto::envelope_seal::hpke_open_invitation_with_external_dh(
+                &sealed_bundle_ct,
+                &dh_bytes,
+                &pk_rm,
+                &sealed_bundle_enc,
+                &hint_context_id,
+                hint_creator_did.as_ref(),
+            )
+            .map_err(|e| {
+                ContextError::CryptoFailed(format!(
+                    "spawn-from-Welcome: invitation open failed: {e}"
+                ))
+            })?,
+        );
+        let bundle = scp_protocol::context::InvitationBundle::from_wire_bytes(&bundle_wire)
+            .map_err(|e| {
+                ContextError::CryptoFailed(format!(
+                    "spawn-from-Welcome: invitation bundle decode failed: {e}"
+                ))
+            })?;
+
+        // Resolve the creator's #active key and VERIFY the creator signature —
+        // the root of trust for ALL authority the joiner installs. A resolution
+        // failure is treated as a permanent reject (fail-closed), matching the
+        // import path: the `KeyResolver` returns `Option` with no transient
+        // signal, so there is no retryable-vs-permanent distinction to model here.
+        let resolver = self.key_resolver_ref().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "spawn-from-Welcome: key resolver not configured — cannot verify the invitation \
+                 signature"
+                    .to_owned(),
+            )
+        })?;
+        let creator_vk =
+            resolver(&bundle.creator_did, scp_did::SigningKeyId::Active).ok_or_else(|| {
+                ContextError::CryptoFailed(format!(
+                    "spawn-from-Welcome: cannot resolve #active key for creator '{}'",
+                    bundle.creator_did
+                ))
+            })?;
+        bundle.verify(&creator_vk).map_err(|e| {
+            ContextError::CryptoFailed(format!(
+                "spawn-from-Welcome: invitation signature invalid: {e}"
+            ))
+        })?;
+        // metadata_snapshot.structural must agree with the signed context_params
+        // (both are under the same signature — a divergence is a signed
+        // self-contradiction; spec §5.12.3.1 validation step 2).
+        bundle.verify_structural_consistency().map_err(|e| {
+            ContextError::CryptoFailed(format!(
+                "spawn-from-Welcome: invitation metadata inconsistent with signed params: {e}"
+            ))
+        })?;
+
+        // Cross-check the untrusted binding hints against the AUTHENTICATED
+        // bundle. The AEAD open already guarantees equality with what the sealer
+        // used; this is belt-and-suspenders (and makes the invariant explicit).
+        if bundle.context_id != hint_context_id || bundle.creator_did != hint_creator_did {
+            return Err(ContextError::CryptoFailed(
+                "spawn-from-Welcome: invitation binding hints disagree with the signed bundle"
+                    .to_owned(),
+            ));
+        }
+
+        // From here on, ALL authority derives from the creator-signed bundle —
+        // this is what closes FFI-02 / BLACK-2J10-001 (creator_did, governance,
+        // ceiling, economic policy, consequence rules, tools are creator-signed,
+        // not attacker-injectable). The §5.13.3 `0xFF02` cross-check below
+        // additionally binds these against the COMMITTED MLS group.
+        let context_id = bundle.context_id.clone();
+        let creator_did = bundle.creator_did.clone();
+        let params = bundle.context_params.clone();
+        let welcome_bytes = bundle.welcome_message.clone();
 
         // ---- REVERSIBLE PRECHECKS (before the irreversible ConfirmConsume) ----
         // The KeyPackage burn in step 1 is a SINGLE-USE, irreversible cost. Every
@@ -10611,6 +11346,45 @@ impl Supervisor {
                             "spawn-from-Welcome: failed to read the joined group's MLS epoch: {e}"
                         ))
                     })?;
+
+                    // 1b. FFI-02 (§5.13.3): verify the caller-supplied `params`
+                    //     against the parameters the CREATOR cryptographically
+                    //     committed into the joined group's `scp_context_params`
+                    //     (`0xFF02`) group_context extension — folded into the MLS
+                    //     key schedule, so it is the group's own attestation of its
+                    //     governance model, capability ceiling, ceiling policy, mode,
+                    //     context_id, and — rule 8 — its GENESIS creator/admin DID.
+                    //     The creator binding is the sole anchor of admin identity
+                    //     for a DID-less governance model (SingleAdmin, whose
+                    //     `governance_policy_hash` is a constant): the joiner refuses
+                    //     unless the bundle's authenticated `creator_did` equals the
+                    //     one the group committed at creation, so a signed bundle
+                    //     naming a DIFFERENT admin installs NO `SingleAdminEngine`
+                    //     (BLACK-2J10-001-R). `WelcomeJoinRequest.params` is UNTRUSTED
+                    //     caller input: a malicious inviter can present benign params
+                    //     while the real group differs. Run this HERE — after the
+                    //     KeyPackage is (irreversibly) consumed but BEFORE
+                    //     `install_joined_group`, `build_welcome_joiner_state`, the
+                    //     persist, and the spawn — so a mismatch installs NO crypto,
+                    //     persists NO snapshot, and registers NO actor; the only spent
+                    //     cost is the already-burned single-use KeyPackage (the same
+                    //     accepted cost as any post-consume failure). The rejected
+                    //     `joined_group` is dropped here (zeroizing its key material)
+                    //     with nothing half-installed to roll back. Passing verifies
+                    //     that `build_welcome_joiner_state` below only ever builds
+                    //     authority the group itself attests. A group with no `0xFF02`
+                    //     (not an SCP context) or any rule 2-6 mismatch is refused
+                    //     (§5.13.3 rule 1 + rules 2-6).
+                    crate::context::lifecycle_helpers::verify_scp_context_binding(
+                        joined_group
+                            .group_context_extension()
+                            .map_err(|e| e.to_string()),
+                        &context_id,
+                        creator_did.as_ref(),
+                        &params,
+                        "spawn-from-Welcome",
+                    )
+                    .map_err(ContextError::CryptoFailed)?;
 
                     // 2. Install the joined group into the live crypto provider (Vacant-
                     //    guarded; refuses to overwrite a live group) + a locally-minted
@@ -11316,6 +12090,9 @@ impl Supervisor {
                 signing_key: crate::context::actor::commands::SigningKeyBytes::from_signing_key(
                     signing_key,
                 ),
+                // The unchecked propose path never carries an invitee KeyPackage
+                // (the invitation path uses the checked variant).
+                key_package: None,
             },
         );
         let cmd = GovernanceCommand::ProposeGovernanceAction { payload, reply: tx };
@@ -11341,6 +12118,38 @@ impl Supervisor {
         action: scp_protocol::context::governance::GovernanceAction,
         signing_key: &ed25519_dalek::SigningKey,
     ) -> Result<crate::context::state::ProposalOutcome, ContextError> {
+        self.propose_governance_action_checked_carrying_key_package(
+            context_id,
+            proposer_did,
+            action,
+            signing_key,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::propose_governance_action_checked`] carrying an optional invitee
+    /// `KeyPackage` on the in-process actor command envelope.
+    ///
+    /// The `KeyPackage` rides the actor command (NOT the signed/logged
+    /// [`GovernanceAction`](scp_protocol::context::governance::GovernanceAction)
+    /// wire type) and is threaded to `execute_add_member` for an `AddMember`
+    /// auto-execute, so the governance add performs a REAL MLS add (§5.12.3).
+    /// Only [`Self::invite_member`] supplies `Some(..)`; the public
+    /// [`Self::propose_governance_action_checked`] (the generic FFI governance
+    /// path) delegates here with `None`.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`ContextError`] from the handler.
+    async fn propose_governance_action_checked_carrying_key_package(
+        &self,
+        context_id: &str,
+        proposer_did: &DID,
+        action: scp_protocol::context::governance::GovernanceAction,
+        signing_key: &ed25519_dalek::SigningKey,
+        key_package: Option<Vec<u8>>,
+    ) -> Result<crate::context::state::ProposalOutcome, ContextError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let payload = Box::new(
             crate::context::actor::commands::ProposeGovernanceActionPayload {
@@ -11350,6 +12159,7 @@ impl Supervisor {
                 signing_key: crate::context::actor::commands::SigningKeyBytes::from_signing_key(
                     signing_key,
                 ),
+                key_package,
             },
         );
         let cmd = GovernanceCommand::ProposeGovernanceActionChecked { payload, reply: tx };
@@ -14812,7 +15622,34 @@ mod tests {
             .crypto_ref()
             .expect("test supervisor has crypto")
             .clone();
-        crypto.create_mls_group(&ctx_id_bytes).unwrap();
+        // Create the group with the SAME creator-committed `scp_context_params`
+        // (`0xFF02`) extension the honest creator commits, bound to this
+        // context's id + params — so the load-time §5.13.3 binding check on the
+        // respawn path (`restore_context`) passes on this legitimate
+        // self-respawn, exactly as a real persisted group would. The snapshot's
+        // `context_params` is the state handle's `ContextParams::default()`
+        // (see `new_for_test_encrypted`), and its `context_id` is `ctx_key`, so
+        // the extension is bound to precisely those values.
+        let ctx_params = scp_protocol::context::ContextParams::default();
+        let ctx_extension = scp_protocol::context::ScpContextExtension::for_root(
+            ctx_key.clone(),
+            // The committed genesis creator must equal the snapshot's
+            // `role_state.creator_did` so the restore-time §5.13.3 rule-8 creator
+            // binding passes on this legitimate self-respawn. The state below is
+            // built via `new_for_test_encrypted`, whose `role_state` is the empty
+            // test role state (`ContextRoleState::empty_for_test`, `creator_did =
+            // ""`) — so the honest committed creator here is the same empty DID
+            // the snapshot carries.
+            DID(String::new()),
+            ctx_params.mode,
+            &ctx_params.governance,
+            ctx_params.ceiling_policy,
+            &scp_protocol::context::roles::CapabilityCeiling::new(ctx_params.ceiling.clone()),
+        )
+        .expect("build scp_context_params (0xFF02) extension for respawn fixture");
+        crypto
+            .create_mls_group_with_context(&ctx_id_bytes, &ctx_extension)
+            .unwrap();
         crypto.generate_sender_key(&ctx_id_bytes).unwrap();
 
         // The PERSISTED snapshot captures the floor at epoch 5 (the coalesced

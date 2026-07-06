@@ -2239,6 +2239,61 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func contextJoin(handle: ContextHandle, identity: Identity, spendingUcanJwt: String?) async throws 
     
     /**
+     * Joins an existing SCP context by processing a received MLS Welcome,
+     * standing the local (joiner) identity up as a send-capable participant.
+     *
+     * Completes the reserve → Welcome → join handshake begun by
+     * [`reserve_key_package`](Self::reserve_key_package): given the Welcome the
+     * context creator minted for a previously-reserved `KeyPackage`, this
+     * installs the joined MLS group, derives the joiner's §9.10.4 routing
+     * pseudonym, persists the initial keyed snapshot fail-closed, registers a
+     * context handle, and records the joined context in the known-contexts
+     * discovery registry. Without it a Welcome-joined node can DECRYPT but
+     * cannot SEND (no handle-backed context).
+     *
+     * The bridge-side UCAN validation state is registered via an ATOMIC
+     * `Entry::Occupied`/`Vacant` occupy BEFORE the irreversible runtime join
+     * and rolled back on failure: there is no path where the runtime join
+     * commits but bridge state errors, and no leaked bridge/discovery state
+     * when the join fails. A context id already active on this instance
+     * collides at that atomic occupy BEFORE the single-use `KeyPackage` is
+     * consumed; a losing concurrent same-id join errors at the same gate and
+     * never rolls back state it did not create.
+     *
+     * Local-identity custody of the JOINER (`identity`) is enforced at the
+     * bridge exactly as `context_create` enforces it for the creator: the
+     * joiner's routing pseudonym is DERIVED from its locally-custodied identity
+     * (never caller-supplied), so a non-custodied joiner hard-fails at the
+     * derivation seam with the canonical `SCP-IDENT-1054` before the single-use
+     * `KeyPackage` is consumed.
+     *
+     * # Arguments
+     *
+     * * `identity` -- The LOCAL (joiner) identity. Its custody derives the
+     * routing pseudonym AND opens the sealed bundle (split custody); passed
+     * separately from `sealed.creator_did` so the two cannot be transposed.
+     * Rejected with `SCP-PERM-3030` if it was not minted by this `Scp`
+     * instance.
+     * * `sealed` -- The creator-signed, HPKE-sealed [`SealedInvitation`]
+     * bundle. Carries the AUTHORITATIVE context id, creator DID, and the
+     * encrypted genesis params + MLS Welcome. The joiner supplies NO loose
+     * params or Welcome bytes — the runtime opens the bundle, verifies the
+     * creator signature, and derives all authority from it.
+     * * `reservation_id` -- The opaque reservation id returned by
+     * `reserve_key_package` for the `KeyPackage` this Welcome addresses.
+     *
+     * # Errors
+     *
+     * Returns `ScpError::Identity` if the joiner is not locally custodied,
+     * `ScpError::Validation` if the HPKE `enc` is not exactly 32 bytes, or
+     * `ScpError::Context` if the reservation id is malformed, the context id
+     * already collides on this instance, or the spawn fails (bad/forged/
+     * duplicate bundle, non-encrypted context, single-use replay,
+     * first-writer-wins collision, or fail-closed persist failure).
+     */
+    func contextJoinFromWelcome(identity: Identity, sealed: SealedInvitation, reservationId: String) async throws  -> ContextHandle
+    
+    /**
      * Per-instance equivalent of the free-function `context_leave`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` /
@@ -2672,6 +2727,44 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func instanceId()  -> UInt64
     
     /**
+     * Invites a member to an existing context, producing a sealed, signed
+     * invitation bundle (ADR-049 Phase 2J; FFI-02 Option A).
+     *
+     * The creator (or admin) seals the context's genesis params + Welcome for
+     * the invitee under RFC 9180 HPKE, binding them to the invitee's
+     * `KeyPackage`. Only a `SingleAdmin` context is supported today: the invite
+     * is unilateral and returns [`InviteMemberOutcome::Sealed`] whose `bundle`
+     * is the sealed [`SealedInvitation`] — pass it directly to
+     * [`Scp::context_join_from_welcome`](Self::context_join_from_welcome). A
+     * voting-governed context returns a thrown `ScpError::Context`
+     * (governed-context invitations are not yet implemented).
+     *
+     * The inviter's `#active` Ed25519 signing key is resolved from its retained
+     * local custody (never crossing the FFI as raw bytes on the way IN — only
+     * the opaque `Identity` handle does) and wiped immediately after the invite
+     * is produced.
+     *
+     * # Arguments
+     *
+     * * `identity` -- The LOCAL inviting identity (creator / admin). Must be
+     * locally custodied; the invite is signed under its `#active` key.
+     * Rejected with `SCP-PERM-3030` if it was not minted by this `Scp`
+     * instance.
+     * * `context_id` -- The context to invite into.
+     * * `invitee_did` -- The DID being invited.
+     * * `invitee_key_package` -- The invitee's TLS-serialized MLS `KeyPackage`.
+     * * `relay_urls` -- Relay URLs to include for the invitee's first contact.
+     *
+     * # Errors
+     *
+     * Returns `ScpError::Identity` if the inviter is not locally custodied,
+     * or `ScpError::Context` if the supervisor is not initialized or the
+     * runtime invite fails (e.g. no live context, unauthorized inviter,
+     * invalid `KeyPackage`).
+     */
+    func inviteMember(identity: Identity, contextId: String, inviteeDid: String, inviteeKeyPackage: Data, relayUrls: [String]) async throws  -> InviteMemberOutcome
+    
+    /**
      * Per-instance equivalent of the free-function `is_local_did`.
      *
      * Routes through `&*self.inner`. Returns `false` if the DID fails
@@ -2900,6 +2993,35 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * Starts a new redb-backed relay at `data_dir/blobs.redb`.
      */
     func relayStartLocal(dataDir: String) async throws  -> RelayHandle
+    
+    /**
+     * Reserves a single-use MLS `KeyPackage` for a Welcome-based join,
+     * returning the reservation handle and the PUBLIC `KeyPackage` bytes.
+     *
+     * Begins the reserve → Welcome → join handshake completed by
+     * [`context_join_from_welcome`](Self::context_join_from_welcome): the
+     * returned `reservation_id` is passed back to that call so the fused
+     * consume can match the join. The private signer state never leaves the
+     * node's `KeyPackage` actor — only PUBLIC bytes cross the FFI boundary
+     * (ADR-049 Phase 2J).
+     *
+     * Local-identity custody is enforced at the bridge (the same trust model
+     * as `context_create`): `identity` MUST be a locally-custodied identity
+     * that holds retained key material. A DID-only handle from `identity_load`
+     * (no custody) is rejected with `SCP-IDENT-1054`.
+     *
+     * # Arguments
+     *
+     * * `identity` -- The LOCAL identity reserving the `KeyPackage`. Rejected
+     * with `SCP-PERM-3030` if it was not minted by this `Scp` instance.
+     *
+     * # Errors
+     *
+     * Returns `ScpError::Identity` (`SCP-IDENT-1054`) if `identity` holds no
+     * retained key material, or `ScpError::Context` if the reservation fails
+     * (providers not wired, empty pool).
+     */
+    func reserveKeyPackage(identity: Identity) async throws  -> ReservedKeyPackage
     
     /**
      * Per-instance equivalent of the free-function `restore_all_contexts`.
@@ -4201,6 +4323,76 @@ open func contextJoin(handle: ContextHandle, identity: Identity, spendingUcanJwt
 }
     
     /**
+     * Joins an existing SCP context by processing a received MLS Welcome,
+     * standing the local (joiner) identity up as a send-capable participant.
+     *
+     * Completes the reserve → Welcome → join handshake begun by
+     * [`reserve_key_package`](Self::reserve_key_package): given the Welcome the
+     * context creator minted for a previously-reserved `KeyPackage`, this
+     * installs the joined MLS group, derives the joiner's §9.10.4 routing
+     * pseudonym, persists the initial keyed snapshot fail-closed, registers a
+     * context handle, and records the joined context in the known-contexts
+     * discovery registry. Without it a Welcome-joined node can DECRYPT but
+     * cannot SEND (no handle-backed context).
+     *
+     * The bridge-side UCAN validation state is registered via an ATOMIC
+     * `Entry::Occupied`/`Vacant` occupy BEFORE the irreversible runtime join
+     * and rolled back on failure: there is no path where the runtime join
+     * commits but bridge state errors, and no leaked bridge/discovery state
+     * when the join fails. A context id already active on this instance
+     * collides at that atomic occupy BEFORE the single-use `KeyPackage` is
+     * consumed; a losing concurrent same-id join errors at the same gate and
+     * never rolls back state it did not create.
+     *
+     * Local-identity custody of the JOINER (`identity`) is enforced at the
+     * bridge exactly as `context_create` enforces it for the creator: the
+     * joiner's routing pseudonym is DERIVED from its locally-custodied identity
+     * (never caller-supplied), so a non-custodied joiner hard-fails at the
+     * derivation seam with the canonical `SCP-IDENT-1054` before the single-use
+     * `KeyPackage` is consumed.
+     *
+     * # Arguments
+     *
+     * * `identity` -- The LOCAL (joiner) identity. Its custody derives the
+     * routing pseudonym AND opens the sealed bundle (split custody); passed
+     * separately from `sealed.creator_did` so the two cannot be transposed.
+     * Rejected with `SCP-PERM-3030` if it was not minted by this `Scp`
+     * instance.
+     * * `sealed` -- The creator-signed, HPKE-sealed [`SealedInvitation`]
+     * bundle. Carries the AUTHORITATIVE context id, creator DID, and the
+     * encrypted genesis params + MLS Welcome. The joiner supplies NO loose
+     * params or Welcome bytes — the runtime opens the bundle, verifies the
+     * creator signature, and derives all authority from it.
+     * * `reservation_id` -- The opaque reservation id returned by
+     * `reserve_key_package` for the `KeyPackage` this Welcome addresses.
+     *
+     * # Errors
+     *
+     * Returns `ScpError::Identity` if the joiner is not locally custodied,
+     * `ScpError::Validation` if the HPKE `enc` is not exactly 32 bytes, or
+     * `ScpError::Context` if the reservation id is malformed, the context id
+     * already collides on this instance, or the spawn fails (bad/forged/
+     * duplicate bundle, non-encrypted context, single-use replay,
+     * first-writer-wins collision, or fail-closed persist failure).
+     */
+open func contextJoinFromWelcome(identity: Identity, sealed: SealedInvitation, reservationId: String)async throws  -> ContextHandle  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_context_join_from_welcome(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeIdentity_lower(identity),FfiConverterTypeSealedInvitation_lower(sealed),FfiConverterString.lower(reservationId)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_pointer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_pointer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_pointer,
+            liftFunc: FfiConverterTypeContextHandle_lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
      * Per-instance equivalent of the free-function `context_leave`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` /
@@ -5224,6 +5416,59 @@ open func instanceId() -> UInt64  {
 }
     
     /**
+     * Invites a member to an existing context, producing a sealed, signed
+     * invitation bundle (ADR-049 Phase 2J; FFI-02 Option A).
+     *
+     * The creator (or admin) seals the context's genesis params + Welcome for
+     * the invitee under RFC 9180 HPKE, binding them to the invitee's
+     * `KeyPackage`. Only a `SingleAdmin` context is supported today: the invite
+     * is unilateral and returns [`InviteMemberOutcome::Sealed`] whose `bundle`
+     * is the sealed [`SealedInvitation`] — pass it directly to
+     * [`Scp::context_join_from_welcome`](Self::context_join_from_welcome). A
+     * voting-governed context returns a thrown `ScpError::Context`
+     * (governed-context invitations are not yet implemented).
+     *
+     * The inviter's `#active` Ed25519 signing key is resolved from its retained
+     * local custody (never crossing the FFI as raw bytes on the way IN — only
+     * the opaque `Identity` handle does) and wiped immediately after the invite
+     * is produced.
+     *
+     * # Arguments
+     *
+     * * `identity` -- The LOCAL inviting identity (creator / admin). Must be
+     * locally custodied; the invite is signed under its `#active` key.
+     * Rejected with `SCP-PERM-3030` if it was not minted by this `Scp`
+     * instance.
+     * * `context_id` -- The context to invite into.
+     * * `invitee_did` -- The DID being invited.
+     * * `invitee_key_package` -- The invitee's TLS-serialized MLS `KeyPackage`.
+     * * `relay_urls` -- Relay URLs to include for the invitee's first contact.
+     *
+     * # Errors
+     *
+     * Returns `ScpError::Identity` if the inviter is not locally custodied,
+     * or `ScpError::Context` if the supervisor is not initialized or the
+     * runtime invite fails (e.g. no live context, unauthorized inviter,
+     * invalid `KeyPackage`).
+     */
+open func inviteMember(identity: Identity, contextId: String, inviteeDid: String, inviteeKeyPackage: Data, relayUrls: [String])async throws  -> InviteMemberOutcome  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_invite_member(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeIdentity_lower(identity),FfiConverterString.lower(contextId),FfiConverterString.lower(inviteeDid),FfiConverterData.lower(inviteeKeyPackage),FfiConverterSequenceString.lower(relayUrls)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeInviteMemberOutcome_lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
      * Per-instance equivalent of the free-function `is_local_did`.
      *
      * Routes through `&*self.inner`. Returns `false` if the DID fails
@@ -5770,6 +6015,50 @@ open func relayStartLocal(dataDir: String)async throws  -> RelayHandle  {
             completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_pointer,
             freeFunc: ffi_scp_ffi_uniffi_rust_future_free_pointer,
             liftFunc: FfiConverterTypeRelayHandle_lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Reserves a single-use MLS `KeyPackage` for a Welcome-based join,
+     * returning the reservation handle and the PUBLIC `KeyPackage` bytes.
+     *
+     * Begins the reserve → Welcome → join handshake completed by
+     * [`context_join_from_welcome`](Self::context_join_from_welcome): the
+     * returned `reservation_id` is passed back to that call so the fused
+     * consume can match the join. The private signer state never leaves the
+     * node's `KeyPackage` actor — only PUBLIC bytes cross the FFI boundary
+     * (ADR-049 Phase 2J).
+     *
+     * Local-identity custody is enforced at the bridge (the same trust model
+     * as `context_create`): `identity` MUST be a locally-custodied identity
+     * that holds retained key material. A DID-only handle from `identity_load`
+     * (no custody) is rejected with `SCP-IDENT-1054`.
+     *
+     * # Arguments
+     *
+     * * `identity` -- The LOCAL identity reserving the `KeyPackage`. Rejected
+     * with `SCP-PERM-3030` if it was not minted by this `Scp` instance.
+     *
+     * # Errors
+     *
+     * Returns `ScpError::Identity` (`SCP-IDENT-1054`) if `identity` holds no
+     * retained key material, or `ScpError::Context` if the reservation fails
+     * (providers not wired, empty pool).
+     */
+open func reserveKeyPackage(identity: Identity)async throws  -> ReservedKeyPackage  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_reserve_key_package(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeIdentity_lower(identity)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeReservedKeyPackage_lift,
             errorHandler: FfiConverterTypeScpError_lift
         )
 }
@@ -10443,6 +10732,101 @@ public func FfiConverterTypeReliabilityScoreRecord_lower(_ value: ReliabilitySco
 
 
 /**
+ * Result of [`Scp::reserve_key_package`](crate::scp::Scp::reserve_key_package):
+ * an opaque reservation handle plus the PUBLIC MLS `KeyPackage` bytes for the
+ * reserved key package.
+ *
+ * The `reservation_id` is passed back to
+ * [`Scp::context_join_from_welcome`](crate::scp::Scp::context_join_from_welcome)
+ * so the fused consume can match the join. Only PUBLIC bytes cross the FFI
+ * boundary — the private signer state never leaves the node's `KeyPackage`
+ * actor (ADR-049 Phase 2J).
+ */
+public struct ReservedKeyPackage {
+    /**
+     * Opaque reservation id string. A lookup key, not a capability — it grants
+     * nothing; a bogus id simply fails the fused consume match downstream.
+     */
+    public var reservationId: String
+    /**
+     * The PUBLIC MLS `KeyPackage` bytes for the reserved key package.
+     */
+    public var keyPackagePublic: Data
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * Opaque reservation id string. A lookup key, not a capability — it grants
+         * nothing; a bogus id simply fails the fused consume match downstream.
+         */reservationId: String, 
+        /**
+         * The PUBLIC MLS `KeyPackage` bytes for the reserved key package.
+         */keyPackagePublic: Data) {
+        self.reservationId = reservationId
+        self.keyPackagePublic = keyPackagePublic
+    }
+}
+
+#if compiler(>=6)
+extension ReservedKeyPackage: Sendable {}
+#endif
+
+
+extension ReservedKeyPackage: Equatable, Hashable {
+    public static func ==(lhs: ReservedKeyPackage, rhs: ReservedKeyPackage) -> Bool {
+        if lhs.reservationId != rhs.reservationId {
+            return false
+        }
+        if lhs.keyPackagePublic != rhs.keyPackagePublic {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(reservationId)
+        hasher.combine(keyPackagePublic)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeReservedKeyPackage: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ReservedKeyPackage {
+        return
+            try ReservedKeyPackage(
+                reservationId: FfiConverterString.read(from: &buf), 
+                keyPackagePublic: FfiConverterData.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ReservedKeyPackage, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.reservationId, into: &buf)
+        FfiConverterData.write(value.keyPackagePublic, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeReservedKeyPackage_lift(_ buf: RustBuffer) throws -> ReservedKeyPackage {
+    return try FfiConverterTypeReservedKeyPackage.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeReservedKeyPackage_lower(_ value: ReservedKeyPackage) -> RustBuffer {
+    return FfiConverterTypeReservedKeyPackage.lower(value)
+}
+
+
+/**
  * The committed terminal of a §6.2.4 cross-context tool-invocation saga
  * (ADR-049 §3a).
  *
@@ -10579,6 +10963,136 @@ public func FfiConverterTypeSagaResult_lift(_ buf: RustBuffer) throws -> SagaRes
 #endif
 public func FfiConverterTypeSagaResult_lower(_ value: SagaResult) -> RustBuffer {
     return FfiConverterTypeSagaResult.lower(value)
+}
+
+
+/**
+ * A sealed, signed invitation bundle (ADR-049 Phase 2J; FFI-02 Option A).
+ *
+ * The wire artifact produced by [`Scp::invite_member`](crate::scp::Scp::invite_member)
+ * on the creator side and consumed by
+ * [`Scp::context_join_from_welcome`](crate::scp::Scp::context_join_from_welcome)
+ * on the joiner side.
+ *
+ * Flat named-field config object per the agent-first API tenet: an LLM builds
+ * it from the field names plus one example, with no positional-argument
+ * footgun. Peer of [`ReservedKeyPackage`] on the join handshake. Mirrors the
+ * runtime wire type
+ * [`SealedInvitation`](scp_core::context::invitation_helpers::SealedInvitation):
+ * `enc` is the RFC 9180 HPKE encapsulated key (32 bytes) and `ciphertext` is
+ * the HPKE ciphertext (`ct = ciphertext || tag`) of the serialized, signed
+ * `InvitationBundle`. Both are opaque bytes — the joiner does not interpret
+ * them; the runtime opens the bundle and authenticates it.
+ */
+public struct SealedInvitation {
+    /**
+     * Binding hint: the context id the bundle was sealed for.
+     */
+    public var contextId: String
+    /**
+     * Binding hint: the creator DID the bundle was sealed by.
+     */
+    public var creatorDid: String
+    /**
+     * RFC 9180 HPKE encapsulated key (`enc`). Length is validated to be
+     * exactly 32 bytes at the join boundary (fail-closed).
+     */
+    public var enc: Data
+    /**
+     * RFC 9180 HPKE ciphertext (`ct = ciphertext || tag`).
+     */
+    public var ciphertext: Data
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * Binding hint: the context id the bundle was sealed for.
+         */contextId: String, 
+        /**
+         * Binding hint: the creator DID the bundle was sealed by.
+         */creatorDid: String, 
+        /**
+         * RFC 9180 HPKE encapsulated key (`enc`). Length is validated to be
+         * exactly 32 bytes at the join boundary (fail-closed).
+         */enc: Data, 
+        /**
+         * RFC 9180 HPKE ciphertext (`ct = ciphertext || tag`).
+         */ciphertext: Data) {
+        self.contextId = contextId
+        self.creatorDid = creatorDid
+        self.enc = enc
+        self.ciphertext = ciphertext
+    }
+}
+
+#if compiler(>=6)
+extension SealedInvitation: Sendable {}
+#endif
+
+
+extension SealedInvitation: Equatable, Hashable {
+    public static func ==(lhs: SealedInvitation, rhs: SealedInvitation) -> Bool {
+        if lhs.contextId != rhs.contextId {
+            return false
+        }
+        if lhs.creatorDid != rhs.creatorDid {
+            return false
+        }
+        if lhs.enc != rhs.enc {
+            return false
+        }
+        if lhs.ciphertext != rhs.ciphertext {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(contextId)
+        hasher.combine(creatorDid)
+        hasher.combine(enc)
+        hasher.combine(ciphertext)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSealedInvitation: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SealedInvitation {
+        return
+            try SealedInvitation(
+                contextId: FfiConverterString.read(from: &buf), 
+                creatorDid: FfiConverterString.read(from: &buf), 
+                enc: FfiConverterData.read(from: &buf), 
+                ciphertext: FfiConverterData.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SealedInvitation, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.contextId, into: &buf)
+        FfiConverterString.write(value.creatorDid, into: &buf)
+        FfiConverterData.write(value.enc, into: &buf)
+        FfiConverterData.write(value.ciphertext, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSealedInvitation_lift(_ buf: RustBuffer) throws -> SealedInvitation {
+    return try FfiConverterTypeSealedInvitation.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSealedInvitation_lower(_ value: SealedInvitation) -> RustBuffer {
+    return FfiConverterTypeSealedInvitation.lower(value)
 }
 
 
@@ -12340,6 +12854,104 @@ public func FfiConverterTypeGovernanceModel_lower(_ value: GovernanceModel) -> R
 
 
 extension GovernanceModel: Equatable, Hashable {}
+
+
+
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * The outcome of [`Scp::invite_member`](crate::scp::Scp::invite_member)
+ * (ADR-049 Phase 2J; FFI-02 Option A).
+ *
+ * A native sealed enum with a SINGLE variant today — Swift `switch` / Kotlin
+ * `when` consumers destructure `Sealed` idiomatically. `invite_member` supports
+ * only `SingleAdmin` contexts; a voting-governed context returns a thrown error
+ * (governed-context invitations are not yet implemented) rather than surfacing
+ * here. The enum shape is kept precisely so a future governed-invite outcome is
+ * added ADDITIVELY. Mirrors the runtime type
+ * [`InviteMemberOutcome`](scp_core::context::supervisor::InviteMemberOutcome)
+ * and the `PyO3` / napi reference bridges' `{bundle, delivered}` projection
+ * (which lack native sum types); here the discriminant IS the enum variant.
+ */
+
+public enum InviteMemberOutcome {
+    
+    /**
+     * The invitation was sealed and (best-effort) delivered. `bundle` is the
+     * creator-signed, HPKE-sealed [`SealedInvitation`] for the invitee —
+     * directly usable as the `sealed` argument to
+     * [`Scp::context_join_from_welcome`](crate::scp::Scp::context_join_from_welcome)
+     * with no re-boxing. `delivered` is `true` if the runtime published the
+     * sealed bundle to the invitee's `scp-invitations` routing id, `false` if
+     * the caller (or transport) must deliver `bundle` itself.
+     */
+    case sealed(
+        /**
+         * The creator-signed, HPKE-sealed invitation bundle — the SAME wire
+         * type the joiner passes to `context_join_from_welcome`.
+         */bundle: SealedInvitation, 
+        /**
+         * `true` if the runtime published the sealed invitation to the
+         * invitee's routing id; `false` if the caller must deliver it.
+         */delivered: Bool
+    )
+}
+
+
+#if compiler(>=6)
+extension InviteMemberOutcome: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeInviteMemberOutcome: FfiConverterRustBuffer {
+    typealias SwiftType = InviteMemberOutcome
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> InviteMemberOutcome {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .sealed(bundle: try FfiConverterTypeSealedInvitation.read(from: &buf), delivered: try FfiConverterBool.read(from: &buf)
+        )
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: InviteMemberOutcome, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case let .sealed(bundle,delivered):
+            writeInt(&buf, Int32(1))
+            FfiConverterTypeSealedInvitation.write(bundle, into: &buf)
+            FfiConverterBool.write(delivered, into: &buf)
+            
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeInviteMemberOutcome_lift(_ buf: RustBuffer) throws -> InviteMemberOutcome {
+    return try FfiConverterTypeInviteMemberOutcome.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeInviteMemberOutcome_lower(_ value: InviteMemberOutcome) -> RustBuffer {
+    return FfiConverterTypeInviteMemberOutcome.lower(value)
+}
+
+
+extension InviteMemberOutcome: Equatable, Hashable {}
 
 
 
@@ -16462,6 +17074,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_context_join() != 13120) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_context_join_from_welcome() != 59263) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_context_leave() != 21568) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -16606,6 +17221,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_instance_id() != 43175) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_invite_member() != 46281) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_is_local_did() != 10856) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -16697,6 +17315,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_relay_start_local() != 7556) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_reserve_key_package() != 25723) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_restore_all_contexts() != 32770) {

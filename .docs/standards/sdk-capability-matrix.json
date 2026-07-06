@@ -211,6 +211,30 @@
           "swift": true
         },
         {
+          "name": "reserve_key_package",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true,
+          "notes": "ADR-049 Phase 2J joiner handshake (step 1): reserve a single-use MLS KeyPackage. PyO3 bridge PyScp::reserve_key_package (scp-ffi/src/context.rs) reaches Supervisor::reserve_key_package; SDK wrapper SCP.reserve_key_package (bindings/python/scp_sdk/scp.py). NAPI bridge export reserve_key_package_on (scp-ffi/napi/src/context.rs) with TS wrapper SCP.reserveKeyPackage (bindings/typescript/src/scp.ts); UniFFI export Scp::reserve_key_package (scp-ffi/uniffi/src/bridge.rs) with Swift SCP.reserveKeyPackage (bindings/swift/Sources/SCP/Scp.swift) and Kotlin Scp.reserveKeyPackage (bindings/kotlin/scp-kt)."
+        },
+        {
+          "name": "join_from_welcome",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true,
+          "notes": "ADR-049 Phase 2J joiner handshake (step 2): join a context by processing a received MLS Welcome, standing the joiner up as a send-capable participant. Reshaped for FFI-02 Option A: the joiner consumes a sealed, signed InvitationBundle (SealedInvitation: enc + ciphertext) produced by invite_member — not loose plaintext params. PyO3 bridge PyScp::context_join_from_welcome (scp-ffi/src/context.rs) reaches Supervisor::spawn_actor_from_welcome; SDK wrapper SCP.context_join_from_welcome (bindings/python/scp_sdk/scp.py). NAPI bridge export context_join_from_welcome_on (scp-ffi/napi/src/context.rs) with TS wrapper SCP.contextJoinFromWelcome (bindings/typescript/src/scp.ts); UniFFI export Scp::context_join_from_welcome (scp-ffi/uniffi/src/bridge.rs) with Swift Context.joinFromWelcome (bindings/swift/Sources/SCP/Context.swift) and Kotlin Scp.contextJoinFromWelcome (bindings/kotlin/scp-kt)."
+        },
+        {
+          "name": "invite_member",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true,
+          "notes": "ADR-049 Phase 2J / FFI-02 Option A creator-side invite: adds an invitee to a SingleAdmin context (unilateral MLS add) and returns an InviteMemberOutcome::Sealed { bundle: SealedInvitation, delivered } — the creator-signed, HPKE-sealed bundle (enc + ciphertext) directly usable as the sealed join input to context_join_from_welcome, plus a delivered flag (true if the runtime published it to the invitee's routing id). Peer of join_from_welcome (step 2's producer). Only SingleAdmin contexts are supported today: a voting / non-SingleAdmin (Threshold/Majority/Unanimity) context throws InvalidState — governed-context invitations are not yet implemented (#2027 adds the governed path additively). PyO3 bridge PyScp::invite_member (scp-ffi/src/context.rs) reaches Supervisor::invite_member; SDK wrapper SCP.invite_member (bindings/python/scp_sdk/scp.py). NAPI bridge export invite_member (scp-ffi/napi/src/scp.rs, delegating to invite_member_on in scp-ffi/napi/src/context.rs) with TS wrapper SCP.inviteMember (bindings/typescript/src/scp.ts); UniFFI export Scp::invite_member (scp-ffi/uniffi/src/bridge.rs) with Swift SCP.inviteMember (bindings/swift/Sources/SCP/Scp.swift) and Kotlin Scp.inviteMember (bindings/kotlin/scp-kt/.../Scp.kt)."
+        },
+        {
           "name": "leave",
           "python": true,
           "typescript": true,

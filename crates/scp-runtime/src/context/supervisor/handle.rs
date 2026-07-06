@@ -59,6 +59,17 @@ pub struct SupervisorHandle {
 }
 
 impl SupervisorHandle {
+    // AXIS: actor-internal (ADR-049 §5 placement invariant). Every
+    // PER-IDENTITY method on this handle takes `&OwnedIdentityDid`, never a
+    // bare `&DID` — an actor reaches only the identity that owns it, even for
+    // PUBLIC reads (`my_wrapping_public_key` returns public data yet is
+    // token-gated, because the discriminator is caller-isolation, not
+    // data-sensitivity). A per-identity op callable by the FFI/bridge
+    // orchestrator does NOT belong here: add a bare-`DID` `pub fn` on
+    // `Supervisor` instead (see `Supervisor::create_context`). The
+    // non-per-identity methods below (registry fan-out, saga dispatch,
+    // lifecycle bootstrap) are unaffected by this rule.
+
     /// Wrap an `Arc<Supervisor>`. Visible only to supervisor-module
     /// code; the supervisor constructs one in
     /// [`Supervisor::build_actor_deps`](crate::context::supervisor::Supervisor)
@@ -430,14 +441,19 @@ impl SupervisorHandle {
             .await
     }
 
-    // NOTE (ADR-049 Phase 2J): the capability-gated `SupervisorHandle` wrapper
-    // for spawn-from-Welcome is the FUTURE FFI seam and lands WITH its FFI caller
-    // in the FFI follow-on slice (it takes `&OwnedIdentityDid` to bind the
-    // joiner's own identity). It is intentionally NOT defined in this core slice:
-    // the raw `Supervisor::spawn_actor_from_welcome` entry point is narrowed to
-    // `pub(in crate::context)` and exercised directly by the runtime
-    // spawn-from-Welcome tests; there is no production consumer until that slice, so an
-    // uncalled `#[allow(dead_code)]` wrapper here would be dead weight.
+    // NOTE (ADR-049 Phase 2J): the spawn-from-Welcome joiner seam is NOT a
+    // `SupervisorHandle` method. `Supervisor::reserve_key_package` and
+    // `Supervisor::spawn_actor_from_welcome` are bridge-initiated node-level
+    // bootstraps (the app receives a Welcome, or pre-publishes KeyPackages), so
+    // they live as genuinely-`pub` `Supervisor` entrypoints taking a bare `DID`
+    // — the same shape as `Supervisor::create_context`, with local-identity
+    // custody enforced at the FFI bridge layer. They are deliberately NOT gated
+    // on `&OwnedIdentityDid`: that token is the actor-internal per-identity-
+    // secret axis (ADR-049 Decision 5), and neither op returns identity-private
+    // crypto — `reserve_key_package` yields only a `ReservationId` + PUBLIC
+    // KeyPackage bytes, and `spawn_actor_from_welcome` yields a `ContextHandle`
+    // (context state), so §5's "no `&DID` method returning identity state" rule
+    // is not triggered.
 
     /// Dispatch [`LifecycleControlCommand::PrepareForReplace`] to the
     /// actor currently registered for `context_id`, awaiting its verdict.

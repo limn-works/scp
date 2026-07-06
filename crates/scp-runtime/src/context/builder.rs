@@ -16,7 +16,9 @@
 use super::ContextHandle;
 use crate::crypto::mls::provider::MlsCryptoProvider;
 use scp_protocol::context::templates::validate_against_template;
-use scp_protocol::context::{ContextError, ContextMode, ContextParams, ContextState};
+use scp_protocol::context::{
+    CapabilityCeiling, ContextError, ContextMode, ContextParams, ContextState, ScpContextExtension,
+};
 
 pub use scp_protocol::context::builder::{
     AddMemberOutput, AdvanceEpochOutput, ContextCreationError, MANAGEMENT_MSG_MAGIC,
@@ -841,13 +843,33 @@ pub async fn create_context(
     let id_bytes = context_id_bytes(&context_id);
     let mut receipt = CreationReceipt::default();
 
-    // Step 1: Create the handle in `Creating` state.
-    let handle = ContextHandle::new(context_id, params.clone());
+    // Step 1: Create the handle in `Creating` state. `context_id` is cloned so
+    // it remains available to build the `scp_context_params` extension below.
+    let handle = ContextHandle::new(context_id.clone(), params.clone());
 
     // Step 2: Create MLS group (Encrypted) or init broadcast key (Broadcast).
     match params.mode {
         ContextMode::Encrypted => {
-            if let Err(e) = crypto.create_mls_group(&id_bytes) {
+            // Bind the context parameters into the MLS `group_context` via the
+            // `scp_context_params` (`0xFF02`) extension so every joiner reads
+            // the same creator-committed parameters, folded into the key
+            // schedule (spec §5.13.3, finding FFI-02). A root context has no
+            // parents. Built before the side-effecting group create so a
+            // canonical-encoding failure aborts with nothing to roll back.
+            let context_extension = ScpContextExtension::for_root(
+                context_id.clone(),
+                scp_did::DID::from(creator_did.to_owned()),
+                params.mode,
+                &params.governance,
+                params.ceiling_policy,
+                &CapabilityCeiling::new(params.ceiling.clone()),
+            )
+            .map_err(|e| {
+                ContextCreationError::CryptoFailed(format!(
+                    "building scp_context_params extension: {e}"
+                ))
+            })?;
+            if let Err(e) = crypto.create_mls_group_with_context(&id_bytes, &context_extension) {
                 receipt.rollback(&id_bytes, crypto, transport, event_log_provider);
                 return Err(e);
             }

@@ -1010,6 +1010,75 @@ impl UniffiBridgeInstance {
             return;
         }
 
+        self.ucan_registry.insert(
+            context_id.to_owned(),
+            Self::build_ucan_context_state(context_id, creator_did, ceiling),
+        );
+    }
+
+    /// Atomically registers per-context UCAN validation state for a
+    /// Welcome-join, failing CLOSED on a pre-existing entry.
+    ///
+    /// The Welcome-join analog of the `PyO3`/napi reference bridges'
+    /// `register_ffi_state`: [`crate::Scp::context_join_from_welcome`] calls
+    /// this as a single ATOMIC gate BEFORE the irreversible
+    /// `Supervisor::spawn_actor_from_welcome`. Unlike the idempotent
+    /// [`Self::ensure_ucan_registered`] (the lazy UCAN-op path), a
+    /// pre-existing entry is a HARD error here.
+    ///
+    /// The `DashMap` `Entry::Occupied`/`Vacant` decision is what makes the
+    /// gate atomic — the collision test and the state insert are one
+    /// indivisible step, so exactly one caller can occupy the vacant slot for
+    /// a given `context_id`. A losing concurrent same-id caller errors HERE —
+    /// before the single-use `KeyPackage` is consumed — and never runs the
+    /// join's rollback, so it can never delete the winner's shared UCAN state.
+    /// The pre-existing entry is left untouched (the bridge must never roll
+    /// back state it did not create).
+    ///
+    /// # Errors
+    ///
+    /// Returns `ScpError::Context` (`SCP-CTX-2014`) if the context's UCAN
+    /// state is already registered on this instance.
+    #[allow(dead_code)]
+    pub fn register_ucan_occupied(
+        &self,
+        context_id: &str,
+        creator_did: &str,
+        ceiling: &[String],
+    ) -> Result<(), crate::ScpError> {
+        use dashmap::mapref::entry::Entry;
+
+        match self.ucan_registry.entry(context_id.to_owned()) {
+            Entry::Occupied(_) => Err(crate::ScpError::Context {
+                msg: format!("context {context_id} is already registered on this instance"),
+                code: codes::CTX_2014.to_owned(),
+            }),
+            Entry::Vacant(vacant) => {
+                // `build_ucan_context_state` never touches `ucan_registry`, so
+                // building it while holding this shard's `Entry` write guard
+                // cannot deadlock (mirrors the napi reference's Vacant arm).
+                vacant.insert(Self::build_ucan_context_state(
+                    context_id,
+                    creator_did,
+                    ceiling,
+                ));
+                Ok(())
+            }
+        }
+    }
+
+    /// Builds the per-context UCAN validation state (revocation list, nonce
+    /// tracker, event log, normalized capability ceiling) for a context.
+    ///
+    /// Shared by [`Self::ensure_ucan_registered`] (idempotent lazy path) and
+    /// [`Self::register_ucan_occupied`] (atomic Welcome-join gate) so both
+    /// construct byte-identical state. Does NOT insert into `ucan_registry` —
+    /// the caller decides the insert semantics.
+    fn build_ucan_context_state(
+        context_id: &str,
+        creator_did: &str,
+        ceiling: &[String],
+    ) -> UcanContextState {
         let ceiling_strings = if ceiling.is_empty() {
             scp_core::context::roles::default_ceiling()
                 .iter()
@@ -1046,20 +1115,13 @@ impl UniffiBridgeInstance {
                 .collect::<HashSet<String>>()
         };
 
-        let event_log = EventLog::new(context_id.to_owned());
-        let revocation_list = RevocationList::new(context_id.to_owned());
-        let nonce_tracker = NonceTracker::new(context_id.to_owned(), SystemClock);
-
-        self.ucan_registry.insert(
-            context_id.to_owned(),
-            UcanContextState {
-                revocation_list,
-                nonce_tracker,
-                ceiling_strings,
-                creator_did: creator_did.to_owned(),
-                event_log,
-            },
-        );
+        UcanContextState {
+            revocation_list: RevocationList::new(context_id.to_owned()),
+            nonce_tracker: NonceTracker::new(context_id.to_owned(), SystemClock),
+            ceiling_strings,
+            creator_did: creator_did.to_owned(),
+            event_log: EventLog::new(context_id.to_owned()),
+        }
     }
 
     /// Per-instance equivalent of the module-level `with_ucan_state` free

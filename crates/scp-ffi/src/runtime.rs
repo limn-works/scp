@@ -1695,6 +1695,39 @@ pub async fn sync_role_state_from_manager_async(
     })
 }
 
+/// Re-syncs the `FfiBridgeState.ceiling_strings` for a context from the
+/// AUTHENTICATED context params carried by a joined
+/// [`ContextHandle`](scp_core::context::ContextHandle).
+///
+/// Peer of [`sync_role_state_from_manager`] (which syncs role state); this syncs
+/// the UCAN/tool capability-check ceiling string set. Used by
+/// `context_join_from_welcome`: the joiner no longer supplies a ceiling, so the
+/// FFI state is registered with the DEFAULT ceiling as a reversible precheck,
+/// then this overwrites it with the ceiling AUTHENTICATED by the joined MLS
+/// group's signed context binding. The ceiling entries are normalized to their
+/// enforced UCAN capability-name form (`{resource}:{action}`), matching the set
+/// [`register_ffi_state`] builds on the create path.
+///
+/// # Errors
+///
+/// Returns `ScpPyError::ContextError` if the context's FFI state is not
+/// registered (unreachable on the join success path — the state was just
+/// registered and not removed).
+pub fn sync_ceiling_from_params(
+    bi: &PyBridgeInstance,
+    context_id: &str,
+    ceiling: &[scp_core::context::roles::Capability],
+) -> Result<(), ScpPyError> {
+    let ceiling_strings: HashSet<String> = ceiling
+        .iter()
+        .map(scp_core::context::roles::Capability::ucan_capability_name)
+        .collect();
+    with_ffi_state(bi, context_id, |st| {
+        st.ceiling_strings = ceiling_strings;
+        Ok(())
+    })
+}
+
 /// Closes the receive channel for a context by dropping the sender (SCP-216).
 ///
 /// Called by `py_context_leave` when a member leaves. Dropping the sender

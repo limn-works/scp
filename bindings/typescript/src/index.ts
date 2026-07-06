@@ -198,6 +198,7 @@ export { Node, Relay } from "./server";
 export type {
   ContextReconnectResult,
   KeyCustodyProvider,
+  KeyPackageReservation,
   ReconnectReport,
   ScpOptions,
   StorageConfig,
@@ -264,6 +265,7 @@ export type {
   EventLogEntry,
   EventLogEntryPayload,
   GovernanceActionResult,
+  InviteMemberOutcome,
   McpClientConfig,
   McpServerConfig,
   MemberRole,
@@ -278,6 +280,7 @@ export type {
   ResolutionLayer,
   ResolutionPath,
   SagaResult,
+  SealedInvitation,
   SiteConfig,
   TestVector,
   ThresholdRequirement,

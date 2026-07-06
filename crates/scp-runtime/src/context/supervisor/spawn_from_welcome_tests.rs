@@ -15,12 +15,18 @@
 //! fail-closed BEFORE the actor is reachable (a persist failure leaves NO live
 //! half-keyed actor — Decision 1/8/9).
 
+#![allow(clippy::doc_markdown, clippy::too_long_first_doc_paragraph)]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 // `spawn_actor_from_welcome` returns a deliberately large state-building future
 // (~16 KB — the Welcome-derived `PerContextState`); production callers `Box::pin`
 // it at the `SupervisorHandle` seam. These tests await it directly, so allow the
 // large-future lint module-wide rather than box every call site.
 #![allow(clippy::large_futures)]
+// The reshaped join tests are linear integration fixtures (reserve → creator-add →
+// sign → HPKE-seal → open → spawn → assert); several run past 100 lines and read
+// clearer unsplit than fragmented across per-step helpers, so allow the
+// line-count lint module-wide (these are test fixtures, not production handlers).
+#![allow(clippy::too_many_lines)]
 // The `FailingPersistence` double is stateless; the `RecordingPersistence` double
 // (durable first-writer-wins test) backs its in-memory store with a lock-free
 // `DashMap`/`DashSet` (matching the `CapturingPersistence` pattern), so it needs
@@ -28,18 +34,26 @@
 
 use std::sync::Arc;
 
+use ed25519_dalek::{Signer as _, SigningKey};
 use scp_did::{DID, SigningKeyId};
-use scp_platform::testing::InMemoryStorage;
+use scp_platform::testing::{InMemoryKeyCustody, InMemoryStorage};
+use scp_platform::{KeyCustody, KeyHandle, KeyType};
 use scp_protocol::context::builder::OpenResult;
 use scp_protocol::context::governance::KeyResolver;
-use scp_protocol::context::roles::Capability;
-use scp_protocol::context::{ContextMode, ContextParams};
+use scp_protocol::context::roles::{Capability, CapabilityCeiling};
+use scp_protocol::context::{
+    CeilingPolicy, ContextMode, ContextParams, GovernanceModel, InvitationBundle,
+    InvitationKeyMaterial, ScpContextExtension,
+};
+use scp_protocol::crypto::envelope_seal::{ed25519_pubkey_to_x25519, hpke_seal_invitation};
+use zeroize::Zeroizing;
 
-use super::key_package_actor::KeyPackageCommand;
-use super::{Supervisor, WelcomeJoinRequest};
+use super::key_package_actor::{KeyPackageCommand, ReservationId};
+use super::{InviteMemberOutcome, Supervisor, WelcomeJoinRequest};
 use crate::context::builder::{
     ContextEventLogProvider, ContextTransportProvider, NotConfiguredTransportProvider,
 };
+use crate::context::invitation_helpers::{SnapshotRuntimeFacts, build_metadata_snapshot};
 use crate::context::persistence::ContextPersistence;
 use crate::context::providers::event_log::MerkleEventLogProvider;
 use crate::context::state::context_id_to_bytes;
@@ -48,11 +62,187 @@ use crate::crypto::mls::storage_adapter::{OpenMlsStorageAdapter, SpawnBlockingSt
 
 const ALICE_DID: &str = "did:dht:z6MkAliceSpawnFromWelcomeCreator";
 const BOB_DID: &str = "did:dht:z6MkBobSpawnFromWelcomeJoiner";
+/// Mallory (an in-group member / attacker) used by the BLACK-2J10-001-R
+/// creator-substitution regression: she forges an invitation bundle naming
+/// herself as `creator_did` and signs it with her OWN key.
+const MALLORY_DID: &str = "did:dht:z6MkMalloryCreatorSubstitution";
 
-/// A trivial key resolver — the default `SingleAdmin` governance model needs no
-/// signer keys to build, so an always-`None` resolver suffices.
-fn trivial_resolver() -> KeyResolver {
-    Arc::new(|_: &DID, _: SigningKeyId| None)
+/// Alice (creator) fixed signing key. `ALICE_DID` resolves to its verifying key
+/// via [`pair_resolver`], so a joiner can verify the creator-signed invitation
+/// bundle. Unrelated to the MLS group creator identity (which is the `ALICE_DID`
+/// string) — this key only produces / is verified against the bundle signature.
+fn alice_signing_key() -> SigningKey {
+    SigningKey::from_bytes(&[0xA1; 32])
+}
+
+/// Bob (invitee) fixed signing key. Used by the `invite_member` round-trip
+/// (Test M): `BOB_DID` resolves to its verifying key via [`pair_resolver`], and
+/// Bob's #active custody imports the SAME seed (see [`bob_imported_custody`]) so
+/// the key the creator seals to (resolved from `BOB_DID`) is exactly the key
+/// Bob's custody can open with.
+fn bob_signing_key() -> SigningKey {
+    SigningKey::from_bytes(&[0xB0; 32])
+}
+
+/// Mallory (attacker) fixed signing key. `MALLORY_DID` resolves to its verifying
+/// key via [`trio_resolver`], so a bundle Mallory signs with THIS key and labels
+/// `creator_did = MALLORY_DID` passes the bundle signature check — the §5.13.3
+/// rule-8 creator binding against the group-committed genesis creator is what
+/// rejects it.
+fn mallory_signing_key() -> SigningKey {
+    SigningKey::from_bytes(&[0xEE; 32])
+}
+
+/// Resolves `ALICE_DID` / `BOB_DID` to their fixed #active verifying keys (all
+/// else `None`). The joiner verifies the creator (`ALICE`) signature; the
+/// inviter (`invite_member`) seals to the invitee (`BOB`) #active key. One
+/// resolver serves both roles — resolving the extra DID is inert on the joiner
+/// path (only `bundle.creator_did` is ever resolved there).
+fn pair_resolver() -> KeyResolver {
+    let alice = DID::from(ALICE_DID);
+    let bob = DID::from(BOB_DID);
+    let alice_vk = alice_signing_key().verifying_key();
+    let bob_vk = bob_signing_key().verifying_key();
+    Arc::new(move |did: &DID, _: SigningKeyId| {
+        if did == &alice {
+            Some(alice_vk)
+        } else if did == &bob {
+            Some(bob_vk)
+        } else {
+            None
+        }
+    })
+}
+
+/// Bob's #active custody with a FRESH random Ed25519 key. Returns
+/// `(custody, handle, recipient_x25519)` where `recipient_x25519` is the
+/// birational X25519 mapping of the #active public key — the value a creator
+/// seals an invitation to. The joiner spawn opens via
+/// `custody.ed25519_to_x25519_agree(handle, enc)`, which reconstructs the SAME
+/// DH, so a bundle sealed to `recipient_x25519` opens. Resolver identity is
+/// irrelevant here (`BOB` is never resolved on the joiner path); only Test M
+/// needs a resolver-matching key (see [`bob_imported_custody`]).
+async fn bob_active_custody() -> (InMemoryKeyCustody, KeyHandle, [u8; 32]) {
+    let custody = InMemoryKeyCustody::new();
+    let handle = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+    let pk = custody.public_key(&handle).await.unwrap();
+    let pk_bytes: [u8; 32] = pk.as_bytes().try_into().unwrap();
+    let x = ed25519_pubkey_to_x25519(&pk_bytes).unwrap();
+    (custody, handle, x)
+}
+
+/// Bob's #active custody holding the FIXED [`bob_signing_key`] seed, so
+/// `custody.public_key(handle)` equals the verifying key [`pair_resolver`]
+/// returns for `BOB_DID`. Test M's `invite_member` seals to that resolved key;
+/// Bob must open with the identical private key.
+async fn bob_imported_custody() -> (InMemoryKeyCustody, KeyHandle) {
+    let custody = InMemoryKeyCustody::new();
+    let handle = custody
+        .import_ed25519_signing_key(&Zeroizing::new(bob_signing_key().to_bytes()))
+        .await
+        .unwrap();
+    (custody, handle)
+}
+
+/// Builds a signed [`InvitationBundle`] (creator = `signer`) carrying `params`,
+/// `context_id`, and `welcome_bytes`, with a structural snapshot copied verbatim
+/// from `params` (so `verify_structural_consistency` passes). The signature is
+/// over the §5.12.3.1 signing hash produced with `signer` — pass the creator key
+/// for a valid bundle, or an ATTACKER key to drive a signature-verify rejection.
+/// Callers may hand-tamper the returned bundle (e.g. flip a `signature` byte or
+/// diverge a `metadata_snapshot.structural` field) before sealing it.
+fn signed_bundle(
+    signer: &SigningKey,
+    creator_did: &DID,
+    context_id: &str,
+    params: &ContextParams,
+    welcome_bytes: Vec<u8>,
+) -> InvitationBundle {
+    let facts = SnapshotRuntimeFacts {
+        member_count: Some(1),
+        creator_did: Some(creator_did.clone()),
+        ..SnapshotRuntimeFacts::default()
+    };
+    let mut bundle = InvitationBundle {
+        context_id: context_id.to_owned(),
+        creator_did: creator_did.clone(),
+        relay_urls: vec![],
+        welcome_message: welcome_bytes,
+        key_material: InvitationKeyMaterial {
+            context_metadata_key: [7u8; 32],
+            sender_key_seed: None,
+        },
+        context_params: params.clone(),
+        metadata_snapshot: build_metadata_snapshot(params, facts),
+        signature: vec![],
+    };
+    let hash = bundle
+        .invitation_bundle_signing_hash()
+        .expect("signing hash");
+    bundle.signature = signer.sign(&hash).to_bytes().to_vec();
+    bundle
+}
+
+/// HPKE-seals a (possibly hand-tampered) `bundle` into a reshaped
+/// [`WelcomeJoinRequest`]. `hint_ctx` / `hint_creator` are the HPKE `info`/`aad`
+/// binding hints AND the request's untrusted `context_id` / `creator_did`
+/// (normally == the bundle's values, so the open succeeds and the downstream
+/// signature / binding check is what rejects). `local_pseudonym` is passed
+/// through (use `None` to drive the BLACK-2J-04 precheck).
+fn seal_bundle(
+    bundle: &InvitationBundle,
+    recipient_x25519: &[u8; 32],
+    hint_ctx: &str,
+    hint_creator: &DID,
+    reservation_id: ReservationId,
+    local_pseudonym: Option<[u8; 32]>,
+) -> WelcomeJoinRequest {
+    let wire = bundle.to_wire_bytes().expect("bundle serializes");
+    let (ct, enc) = hpke_seal_invitation(&wire, recipient_x25519, hint_ctx, hint_creator.as_ref())
+        .expect("HPKE seal");
+    WelcomeJoinRequest {
+        context_id: hint_ctx.to_owned(),
+        creator_did: hint_creator.clone(),
+        sealed_bundle_enc: enc,
+        sealed_bundle_ct: ct,
+        reservation_id,
+        local_pseudonym,
+    }
+}
+
+/// The common case: build a validly-signed bundle and seal it into a request
+/// with a real pseudonym. `bundle_*` go INTO the signed bundle; `hint_*` are the
+/// request's untrusted binding hints (normally == the bundle values). Where a
+/// test drives a mismatch, pass the divergent value as `bundle_context_id` /
+/// `bundle_params` and keep the hints equal to the bundle so the open succeeds
+/// and the downstream §5.13.3 check is what rejects.
+#[allow(clippy::too_many_arguments)]
+fn seal_join_request(
+    signer: &SigningKey,
+    bundle_creator_did: &DID,
+    bundle_context_id: &str,
+    bundle_params: &ContextParams,
+    welcome_bytes: Vec<u8>,
+    recipient_x25519: &[u8; 32],
+    hint_ctx: &str,
+    hint_creator: &DID,
+    reservation_id: ReservationId,
+) -> WelcomeJoinRequest {
+    let bundle = signed_bundle(
+        signer,
+        bundle_creator_did,
+        bundle_context_id,
+        bundle_params,
+        welcome_bytes,
+    );
+    seal_bundle(
+        &bundle,
+        recipient_x25519,
+        hint_ctx,
+        hint_creator,
+        reservation_id,
+        some_pseudonym(),
+    )
 }
 
 /// A 64-hex canonical context id (ADR-056 decodes it to its 32-byte digest).
@@ -88,6 +278,77 @@ fn joiner_params() -> ContextParams {
     }
 }
 
+/// Bob's X25519 wrapping key material (§9.16.1). A joiner's KeyPackage must
+/// declare the `scp_context_params` (`0xFF02`) capability to be added to an SCP
+/// context group (OpenMLS `valn0502`); since 9fe3b4c9b the production
+/// `generate_key_package` path declares `0xFF02` UNCONDITIONALLY (its capability
+/// is decoupled from any wrapping key). Publishing a wrapping key here exercises
+/// the wrapping-key-PRESENT leaf path (the `0xFF01` wrapping-key leaf extension)
+/// — NOT because `0xFF02` requires it. The bytes are an opaque leaf extension
+/// during add/join (no X25519 DH runs on the MLS join path), so a fixed non-zero
+/// constant suffices.
+const BOB_WRAP: [u8; 32] = [0xB2; 32];
+
+/// Builds the creator-committed `scp_context_params` (`0xFF02`) extension for a
+/// ROOT context from `params`, byte-for-byte the way the creator write path
+/// (`builder::create_context` → `create_mls_group_with_context`) does — so a
+/// group created with this extension and a matching-`params` join verifies, and
+/// a divergent join is refused (spec §5.13.3, FFI-02).
+fn honest_ext(context_id: &str, params: &ContextParams) -> ScpContextExtension {
+    // The honest creator committed into the group's `0xFF02` extension is
+    // `ALICE_DID` (rule 8) — the same DID the honest bundle carries as
+    // `creator_did`, so the join's creator binding passes.
+    ScpContextExtension::for_root(
+        context_id.to_owned(),
+        DID::from(ALICE_DID),
+        params.mode,
+        &params.governance,
+        params.ceiling_policy,
+        &CapabilityCeiling::new(params.ceiling.iter().cloned()),
+    )
+    .expect("honest context extension serializes")
+}
+
+/// Publishes Bob's wrapping key on `sup` so his pooled KeyPackages carry the
+/// `0xFF01` wrapping-key leaf extension, exercising the wrapping-key-PRESENT path
+/// (see [`BOB_WRAP`]); the `0xFF02` context-params capability is declared
+/// unconditionally regardless. Idempotent; must run BEFORE the KeyPackage store
+/// is first spawned (i.e. before [`reserve_bob_kp`]).
+async fn set_bob_wrapping(sup: &Arc<Supervisor>, bob: &DID) {
+    sup.set_wrapping_keys(
+        bob.clone(),
+        BOB_WRAP.to_vec(),
+        Zeroizing::new(BOB_WRAP.to_vec()),
+    )
+    .await
+    .expect("set bob's wrapping key");
+}
+
+/// Resolves `ALICE_DID` / `BOB_DID` / `MALLORY_DID` to their fixed #active
+/// verifying keys. Used by the creator-substitution regression so the joiner can
+/// verify a bundle Mallory signs with her OWN key (labelled `creator_did =
+/// MALLORY_DID`) — proving the rejection is the §5.13.3 rule-8 creator binding,
+/// not a signature failure.
+fn trio_resolver() -> KeyResolver {
+    let alice = DID::from(ALICE_DID);
+    let bob = DID::from(BOB_DID);
+    let mallory = DID::from(MALLORY_DID);
+    let alice_vk = alice_signing_key().verifying_key();
+    let bob_vk = bob_signing_key().verifying_key();
+    let mallory_vk = mallory_signing_key().verifying_key();
+    Arc::new(move |did: &DID, _: SigningKeyId| {
+        if did == &alice {
+            Some(alice_vk)
+        } else if did == &bob {
+            Some(bob_vk)
+        } else if did == &mallory {
+            Some(mallory_vk)
+        } else {
+            None
+        }
+    })
+}
+
 fn fresh_mls_storage() -> Arc<dyn OpenMlsStorageAdapter> {
     Arc::new(SpawnBlockingStorageAdapter::new(Arc::new(
         InMemoryStorage::new(),
@@ -104,6 +365,16 @@ fn fresh_mls_storage() -> Arc<dyn OpenMlsStorageAdapter> {
 fn bob_supervisor(
     persistence: Option<Box<dyn ContextPersistence>>,
 ) -> (Arc<Supervisor>, Arc<MlsCryptoProvider>) {
+    bob_supervisor_with_resolver(persistence, pair_resolver())
+}
+
+/// Builds Bob's joiner `Supervisor` with a caller-supplied [`KeyResolver`] — used
+/// by the creator-substitution regression, which needs a resolver that also
+/// resolves `MALLORY_DID` (see [`trio_resolver`]).
+fn bob_supervisor_with_resolver(
+    persistence: Option<Box<dyn ContextPersistence>>,
+    resolver: KeyResolver,
+) -> (Arc<Supervisor>, Arc<MlsCryptoProvider>) {
     let crypto = Arc::new(MlsCryptoProvider::new(
         BOB_DID.to_owned(),
         std::sync::Arc::new(scp_clock::SystemClock),
@@ -114,8 +385,35 @@ fn bob_supervisor(
         Arc::clone(&crypto),
         transport,
         event_log,
-        trivial_resolver(),
+        resolver,
         persistence,
+        None,
+        None,
+        None,
+        fresh_mls_storage(),
+    );
+    (sup, crypto)
+}
+
+/// Builds Alice's creator `Supervisor` (real MLS crypto under `ALICE_DID`,
+/// not-configured transport, in-memory event log + MLS storage, the
+/// [`pair_resolver`] that resolves BOTH `ALICE`/`BOB` #active keys). Used by the
+/// `invite_member` round-trip (Test M), which resolves the INVITEE (`BOB`)
+/// #active to seal to. Returns the supervisor and a clone of Alice's crypto
+/// provider (so the test can drive the installed group).
+fn alice_supervisor() -> (Arc<Supervisor>, Arc<MlsCryptoProvider>) {
+    let crypto = Arc::new(MlsCryptoProvider::new(
+        ALICE_DID.to_owned(),
+        std::sync::Arc::new(scp_clock::SystemClock),
+    ));
+    let transport: Box<dyn ContextTransportProvider> = Box::new(NotConfiguredTransportProvider);
+    let event_log: Box<dyn ContextEventLogProvider> = Box::new(MerkleEventLogProvider::new());
+    let sup = Supervisor::with_providers(
+        Arc::clone(&crypto),
+        transport,
+        event_log,
+        pair_resolver(),
+        None,
         None,
         None,
         None,
@@ -132,6 +430,11 @@ async fn reserve_bob_kp(
     sup: &Arc<Supervisor>,
     bob: &DID,
 ) -> (super::key_package_actor::ReservationId, Vec<u8>) {
+    // Publish Bob's wrapping key BEFORE the store spawns so every pooled KP
+    // declares `0xFF02` and satisfies `valn0502` when added to an SCP context
+    // group (§5.13.3). Harmless for the wrapping-only (non-SCP) group fixtures —
+    // a group with no `0xFF02` requirement accepts a `0xFF02`-declaring KP.
+    set_bob_wrapping(sup, bob).await;
     let store = sup
         .key_package_store_for(bob)
         .await
@@ -165,11 +468,106 @@ struct Joined {
 }
 
 /// Runs the full reserve → creator-add → Welcome → `spawn_actor_from_welcome`
-/// ladder against a Bob supervisor built with `persistence`, returning the spawn
-/// result plus the pieces needed to assert on it. The Welcome is produced by a
-/// bare creator provider (Alice) adding Bob's RESERVED KP — the same bytes Bob's
-/// store holds the private signer-state for, so the fused `ConfirmConsume` join
-/// matches.
+/// ladder, returning the spawn result plus the pieces needed to assert on it.
+///
+/// The FFI-02 axis is exposed by letting the CREATOR-committed parameters differ
+/// from what Bob sends in his `WelcomeJoinRequest`:
+///
+/// - `committed`: `Some(params)` → Alice creates an **honest SCP context group**
+///   whose `scp_context_params` (`0xFF02`) extension binds `params` under the
+///   group's `context_id`; `None` → Alice creates a **wrapping-only** group with
+///   NO `0xFF02` (a non-SCP group, for the rule-1 test).
+/// - `request_params`: the params Bob puts in his request (what
+///   `build_welcome_joiner_state` would build authority from). Differ from
+///   `committed` to drive a binding mismatch.
+/// - `request_ctx_id`: the `context_id` Bob claims (`None` → the group's real
+///   `ctx_hex(seed)`). Differ to drive a context_id mismatch.
+///
+/// `Joined.ctx_id` / `ctx_bytes` are the REQUEST id (the slot Bob tried to
+/// install under), so rollback assertions probe the right crypto slot.
+async fn run_join_with(
+    seed: u8,
+    persistence: Option<Box<dyn ContextPersistence>>,
+    committed: Option<ContextParams>,
+    request_params: ContextParams,
+    request_ctx_id: Option<String>,
+) -> (
+    Result<crate::context::ContextHandle, crate::context::ContextError>,
+    Joined,
+) {
+    let bob = DID::from(BOB_DID);
+    let group_ctx_id = ctx_hex(seed);
+    let group_ctx_bytes = context_id_to_bytes(&group_ctx_id);
+
+    let (sup, bob_crypto) = bob_supervisor(persistence);
+
+    // Bob reserves a real KP from his own store (private signer-state stays in
+    // the actor; only the reservation id + public bytes come back). This also
+    // publishes Bob's wrapping key so the KP declares `0xFF02`.
+    let (reservation_id, kp_public_bytes) = reserve_bob_kp(&sup, &bob).await;
+
+    // Alice (bare creator provider) creates the group and adds Bob's reserved
+    // KP, producing the real Welcome addressed to that KP's init key. When
+    // `committed` is `Some`, the group carries the honest `0xFF02` extension;
+    // otherwise it is a wrapping-only (non-SCP) group.
+    let alice_crypto = Arc::new(MlsCryptoProvider::new(
+        ALICE_DID.to_owned(),
+        std::sync::Arc::new(scp_clock::SystemClock),
+    ));
+    match &committed {
+        Some(committed_params) => alice_crypto
+            .create_mls_group_with_context(
+                &group_ctx_bytes,
+                &honest_ext(&group_ctx_id, committed_params),
+            )
+            .expect("alice creates the SCP context group (0xFF02)"),
+        None => alice_crypto
+            .create_mls_group(&group_ctx_bytes)
+            .expect("alice creates a wrapping-only group (no 0xFF02)"),
+    }
+    let add_output = alice_crypto
+        .add_member(&group_ctx_bytes, BOB_DID, Some(&kp_public_bytes))
+        .expect("alice adds bob's reserved key package");
+
+    let request_ctx_id = request_ctx_id.unwrap_or_else(|| group_ctx_id.clone());
+    let request_ctx_bytes = context_id_to_bytes(&request_ctx_id);
+
+    // Seal the creator-signed §5.12.3 bundle to Bob's #active. The bundle carries
+    // the (possibly divergent) `request_params` / `request_ctx_id`; the hints
+    // equal them so the open succeeds and the §5.13.3 `0xFF02` cross-check against
+    // the committed group is what accepts or rejects.
+    let (bob_custody, bob_handle, bob_recipient) = bob_active_custody().await;
+    let req = seal_join_request(
+        &alice_signing_key(),
+        &DID::from(ALICE_DID),
+        &request_ctx_id,
+        &request_params,
+        add_output.welcome_bytes,
+        &bob_recipient,
+        &request_ctx_id,
+        &DID::from(ALICE_DID),
+        reservation_id,
+    );
+
+    let result = sup
+        .spawn_actor_from_welcome(bob, &bob_custody, &bob_handle, req)
+        .await;
+    (
+        result,
+        Joined {
+            sup,
+            bob_crypto,
+            alice_crypto,
+            ctx_id: request_ctx_id,
+            ctx_bytes: request_ctx_bytes,
+        },
+    )
+}
+
+/// The honest happy-path join: Alice commits `joiner_params()` into the group's
+/// `0xFF02` extension and Bob requests those SAME params under the group's real
+/// id, so the FFI-02 binding check passes and the join proceeds through install
+/// → persist → spawn.
 async fn join_bob(
     seed: u8,
     persistence: Option<Box<dyn ContextPersistence>>,
@@ -177,49 +575,14 @@ async fn join_bob(
     Result<crate::context::ContextHandle, crate::context::ContextError>,
     Joined,
 ) {
-    let bob = DID::from(BOB_DID);
-    let ctx_id = ctx_hex(seed);
-    let ctx_bytes = context_id_to_bytes(&ctx_id);
-
-    let (sup, bob_crypto) = bob_supervisor(persistence);
-
-    // Bob reserves a real KP from his own store (private signer-state stays in
-    // the actor; only the reservation id + public bytes come back).
-    let (reservation_id, kp_public_bytes) = reserve_bob_kp(&sup, &bob).await;
-
-    // Alice (bare creator provider) creates the group and adds Bob's reserved
-    // KP, producing the real Welcome addressed to that KP's init key.
-    let alice_crypto = Arc::new(MlsCryptoProvider::new(
-        ALICE_DID.to_owned(),
-        std::sync::Arc::new(scp_clock::SystemClock),
-    ));
-    alice_crypto
-        .create_mls_group(&ctx_bytes)
-        .expect("alice creates the MLS group");
-    let add_output = alice_crypto
-        .add_member(&ctx_bytes, BOB_DID, Some(&kp_public_bytes))
-        .expect("alice adds bob's reserved key package");
-
-    let req = WelcomeJoinRequest {
-        creator_did: DID::from(ALICE_DID),
-        context_id: ctx_id.clone(),
-        params: joiner_params(),
-        reservation_id,
-        welcome_bytes: add_output.welcome_bytes,
-        local_pseudonym: some_pseudonym(),
-    };
-
-    let result = sup.spawn_actor_from_welcome(bob, req).await;
-    (
-        result,
-        Joined {
-            sup,
-            bob_crypto,
-            alice_crypto,
-            ctx_id,
-            ctx_bytes,
-        },
+    run_join_with(
+        seed,
+        persistence,
+        Some(joiner_params()),
+        joiner_params(),
+        None,
     )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -511,32 +874,53 @@ async fn second_spawn_reusing_a_consumed_reservation_is_rejected() {
         ALICE_DID.to_owned(),
         std::sync::Arc::new(scp_clock::SystemClock),
     ));
-    alice_crypto.create_mls_group(&ctx_bytes).unwrap();
+    alice_crypto
+        .create_mls_group_with_context(&ctx_bytes, &honest_ext(&ctx_id, &joiner_params()))
+        .unwrap();
     let add_output = alice_crypto
         .add_member(&ctx_bytes, BOB_DID, Some(&kp_public_bytes))
         .unwrap();
     let welcome = add_output.welcome_bytes;
 
-    let make_req = |context_id: String, welcome_bytes: Vec<u8>| WelcomeJoinRequest {
-        creator_did: DID::from(ALICE_DID),
-        context_id,
-        params: joiner_params(),
-        reservation_id: reservation_id.clone(),
-        welcome_bytes,
-        local_pseudonym: some_pseudonym(),
+    // Both spawns present Bob's SAME #active custody (the replay opens an
+    // identically-sealed bundle); the single-use anchor tested is the reservation
+    // journal, not the opening key.
+    let (bob_custody, bob_handle, bob_recipient) = bob_active_custody().await;
+    let make_req = |context_id: &str, welcome_bytes: Vec<u8>| {
+        seal_join_request(
+            &alice_signing_key(),
+            &DID::from(ALICE_DID),
+            context_id,
+            &joiner_params(),
+            welcome_bytes,
+            &bob_recipient,
+            context_id,
+            &DID::from(ALICE_DID),
+            reservation_id.clone(),
+        )
     };
 
     // First join succeeds and consumes the reservation's single-use KP.
-    sup.spawn_actor_from_welcome(bob.clone(), make_req(ctx_id.clone(), welcome.clone()))
-        .await
-        .expect("first spawn-from-Welcome succeeds");
+    sup.spawn_actor_from_welcome(
+        bob.clone(),
+        &bob_custody,
+        &bob_handle,
+        make_req(&ctx_id, welcome.clone()),
+    )
+    .await
+    .expect("first spawn-from-Welcome succeeds");
     assert_eq!(sup.member_count(&ctx_id).await, Some(2));
 
     // Second spawn (fresh context id) reusing the SAME (now-consumed) reservation
     // is rejected at the fused ConfirmConsume — the reservation journal no longer
     // holds it.
     let replay = sup
-        .spawn_actor_from_welcome(bob, make_req(replay_ctx_id.clone(), welcome))
+        .spawn_actor_from_welcome(
+            bob,
+            &bob_custody,
+            &bob_handle,
+            make_req(&replay_ctx_id, welcome),
+        )
         .await
         .expect_err("a consumed reservation must not spawn a second actor");
     assert!(
@@ -567,21 +951,26 @@ async fn second_spawn_reusing_a_consumed_reservation_is_rejected() {
 // Shared setup for the reversible-precheck tests (Fix 1a / Fix 6).
 // ---------------------------------------------------------------------------
 
-/// Alice (a bare creator provider) creates the group under `ctx_bytes` and adds
-/// Bob's RESERVED public KP, returning `(alice_crypto, welcome_bytes)`.
+/// Alice (a bare creator provider) creates an HONEST SCP context group under
+/// `context_id` — committing the `joiner_params()` `scp_context_params`
+/// (`0xFF02`) extension — and adds Bob's RESERVED public KP, returning
+/// `(alice_crypto, welcome_bytes)`. The committed extension binds `context_id`,
+/// so a join under a DIFFERENT id (or with divergent params) is refused by the
+/// FFI-02 binding check; every caller here joins under the SAME `context_id`.
 fn alice_welcome_for(
-    ctx_bytes: &[u8; 32],
+    context_id: &str,
     kp_public_bytes: &[u8],
 ) -> (Arc<MlsCryptoProvider>, Vec<u8>) {
+    let ctx_bytes = context_id_to_bytes(context_id);
     let alice_crypto = Arc::new(MlsCryptoProvider::new(
         ALICE_DID.to_owned(),
         std::sync::Arc::new(scp_clock::SystemClock),
     ));
     alice_crypto
-        .create_mls_group(ctx_bytes)
-        .expect("alice creates the MLS group");
+        .create_mls_group_with_context(&ctx_bytes, &honest_ext(context_id, &joiner_params()))
+        .expect("alice creates the SCP context group (0xFF02)");
     let add_output = alice_crypto
-        .add_member(ctx_bytes, BOB_DID, Some(kp_public_bytes))
+        .add_member(&ctx_bytes, BOB_DID, Some(kp_public_bytes))
         .expect("alice adds bob's reserved key package");
     (alice_crypto, add_output.welcome_bytes)
 }
@@ -606,20 +995,32 @@ async fn missing_pseudonym_is_rejected_before_the_kp_consume() {
 
     let (sup, bob_crypto) = bob_supervisor(None);
     let (reservation_id, kp_public_bytes) = reserve_bob_kp(&sup, &bob).await;
-    let (_alice, welcome) = alice_welcome_for(&ctx_bytes, &kp_public_bytes);
+    let (_alice, welcome) = alice_welcome_for(&ctx_id, &kp_public_bytes);
 
-    let make_req = |pseudonym: Option<[u8; 32]>| WelcomeJoinRequest {
-        creator_did: DID::from(ALICE_DID),
-        context_id: ctx_id.clone(),
-        params: joiner_params(),
-        reservation_id: reservation_id.clone(),
-        welcome_bytes: welcome.clone(),
-        local_pseudonym: pseudonym,
+    // A validly-signed bundle (so the open + creator-signature verify PASS and
+    // control reaches Precheck B); only the request's `local_pseudonym` varies.
+    let (bob_custody, bob_handle, bob_recipient) = bob_active_custody().await;
+    let bundle = signed_bundle(
+        &alice_signing_key(),
+        &DID::from(ALICE_DID),
+        &ctx_id,
+        &joiner_params(),
+        welcome,
+    );
+    let make_req = |pseudonym: Option<[u8; 32]>| {
+        seal_bundle(
+            &bundle,
+            &bob_recipient,
+            &ctx_id,
+            &DID::from(ALICE_DID),
+            reservation_id.clone(),
+            pseudonym,
+        )
     };
 
     // `None` is rejected up front (CreationFailed), no context stands up.
     let err = sup
-        .spawn_actor_from_welcome(bob.clone(), make_req(None))
+        .spawn_actor_from_welcome(bob.clone(), &bob_custody, &bob_handle, make_req(None))
         .await
         .expect_err("a None pseudonym must be rejected on the encrypted join surface");
     assert!(
@@ -640,7 +1041,7 @@ async fn missing_pseudonym_is_rejected_before_the_kp_consume() {
 
     // KP NOT burned: the same reservation + Welcome now succeed WITH a real
     // pseudonym — the reject happened before `ConfirmConsume`.
-    sup.spawn_actor_from_welcome(bob, make_req(some_pseudonym()))
+    sup.spawn_actor_from_welcome(bob, &bob_custody, &bob_handle, make_req(some_pseudonym()))
         .await
         .expect("the retry with a real pseudonym succeeds — the KP was never burned");
     assert_eq!(
@@ -675,6 +1076,12 @@ async fn colliding_broadcast_context_id_is_rejected_before_the_kp_consume() {
 
     let (sup, bob_crypto) = bob_supervisor(None);
 
+    // Publish bob's wrapping key BEFORE `create_context` — which get-or-spawns
+    // bob's KeyPackage store via `build_actor_deps` and freezes its
+    // wrapping-pubkey deps at spawn time. Without this, the pooled KPs would be
+    // wrapping-only (no `0xFF02`) and could not join Alice's SCP context group.
+    set_bob_wrapping(&sup, &bob).await;
+
     // Bob pre-creates a BROADCAST context under `collide_id`: this registers an
     // actor (so `lookup` is `Some`) while the encrypted `contexts` crypto slot
     // stays VACANT (broadcast keys live in `broadcast_keys`).
@@ -707,19 +1114,25 @@ async fn colliding_broadcast_context_id_is_rejected_before_the_kp_consume() {
 
     // Bob reserves a KP; Alice builds a Welcome addressed to it for `collide_id`.
     let (reservation_id, kp_public_bytes) = reserve_bob_kp(&sup, &bob).await;
-    let (_alice, welcome) = alice_welcome_for(&collide_bytes, &kp_public_bytes);
+    let (_alice, welcome) = alice_welcome_for(&collide_id, &kp_public_bytes);
 
-    // The colliding join is rejected UP FRONT — before the consume.
-    let colliding_req = WelcomeJoinRequest {
-        creator_did: DID::from(ALICE_DID),
-        context_id: collide_id.clone(),
-        params: joiner_params(),
-        reservation_id: reservation_id.clone(),
-        welcome_bytes: welcome.clone(),
-        local_pseudonym: some_pseudonym(),
-    };
+    // The colliding join is rejected UP FRONT — before the consume. The bundle
+    // opens + verifies (valid alice signature) so control reaches Precheck A,
+    // which is the live-registry collision guard under test.
+    let (bob_custody, bob_handle, bob_recipient) = bob_active_custody().await;
+    let colliding_req = seal_join_request(
+        &alice_signing_key(),
+        &DID::from(ALICE_DID),
+        &collide_id,
+        &joiner_params(),
+        welcome.clone(),
+        &bob_recipient,
+        &collide_id,
+        &DID::from(ALICE_DID),
+        reservation_id.clone(),
+    );
     let err = sup
-        .spawn_actor_from_welcome(bob.clone(), colliding_req)
+        .spawn_actor_from_welcome(bob.clone(), &bob_custody, &bob_handle, colliding_req)
         .await
         .expect_err("a join colliding with a live context id must be rejected");
     assert!(
@@ -738,19 +1151,28 @@ async fn colliding_broadcast_context_id_is_rejected_before_the_kp_consume() {
         "the survivor is still the broadcast context (broadcast reports no MLS epoch)"
     );
 
-    // KP NOT burned: the same reservation + Welcome now stand up a join to a
-    // FRESH, non-colliding context id — proving the collision reject happened
-    // before `ConfirmConsume`.
+    // KP NOT burned: the SAME reservation now stands up a join to a FRESH,
+    // non-colliding context id — proving the collision reject happened before
+    // `ConfirmConsume` (a burned reservation would fail closed at the fused
+    // consume, as Test D shows). The Welcome is rebuilt for `fresh_id` (Alice
+    // re-adds the same reserved KP to a fresh honest group whose `0xFF02`
+    // extension binds `fresh_id`): under FFI-02 the collide-bound Welcome cannot
+    // be replayed under a different id — the binding check would refuse it — so
+    // the retry uses a correctly-bound Welcome for the id it installs under.
     let fresh_id = ctx_hex(0x78);
-    let fresh_req = WelcomeJoinRequest {
-        creator_did: DID::from(ALICE_DID),
-        context_id: fresh_id.clone(),
-        params: joiner_params(),
+    let (_fresh_alice, fresh_welcome) = alice_welcome_for(&fresh_id, &kp_public_bytes);
+    let fresh_req = seal_join_request(
+        &alice_signing_key(),
+        &DID::from(ALICE_DID),
+        &fresh_id,
+        &joiner_params(),
+        fresh_welcome,
+        &bob_recipient,
+        &fresh_id,
+        &DID::from(ALICE_DID),
         reservation_id,
-        welcome_bytes: welcome,
-        local_pseudonym: some_pseudonym(),
-    };
-    sup.spawn_actor_from_welcome(bob, fresh_req)
+    );
+    sup.spawn_actor_from_welcome(bob, &bob_custody, &bob_handle, fresh_req)
         .await
         .expect("the fresh-id retry succeeds — the KP was never burned by the collision");
     assert_eq!(
@@ -825,24 +1247,29 @@ async fn non_durable_crypto_export_fails_closed_without_standing_up_an_actor() {
 
     let (sup, bob_crypto) = bob_supervisor(None);
     let (reservation_id, kp_public_bytes) = reserve_bob_kp(&sup, &bob).await;
-    let (_alice, welcome) = alice_welcome_for(&ctx_bytes, &kp_public_bytes);
+    let (_alice, welcome) = alice_welcome_for(&ctx_id, &kp_public_bytes);
+
+    // A valid bundle (open + signature + §5.13.3 all pass) so control reaches the
+    // step-3b durability check, which is where the armed seam fires.
+    let (bob_custody, bob_handle, bob_recipient) = bob_active_custody().await;
+    let req = seal_join_request(
+        &alice_signing_key(),
+        &DID::from(ALICE_DID),
+        &ctx_id,
+        &joiner_params(),
+        welcome,
+        &bob_recipient,
+        &ctx_id,
+        &DID::from(ALICE_DID),
+        reservation_id,
+    );
 
     // Arm the one-shot seam: the step-3b durability check reads the live export
     // FIRST, so the seam fires there → the export reads non-durable.
     bob_crypto.arm_export_failure_once();
 
     let err = sup
-        .spawn_actor_from_welcome(
-            bob,
-            WelcomeJoinRequest {
-                creator_did: DID::from(ALICE_DID),
-                context_id: ctx_id.clone(),
-                params: joiner_params(),
-                reservation_id,
-                welcome_bytes: welcome,
-                local_pseudonym: some_pseudonym(),
-            },
-        )
+        .spawn_actor_from_welcome(bob, &bob_custody, &bob_handle, req)
         .await
         .expect_err("a non-durable crypto export must fail the spawn closed");
     assert!(
@@ -938,23 +1365,33 @@ async fn durable_snapshot_collision_is_rejected_without_clobbering_or_burning_kp
 
     let rec = RecordingPersistence::default();
 
+    // ONE Bob #active custody opens every bundle here (seed + target reject +
+    // target retry); the property under test is durable first-writer-wins, not
+    // the opening key, so a single custody sealed-to across supervisors is faithful.
+    let (bob_custody, bob_handle, bob_recipient) = bob_active_custody().await;
+
     // --- Seed: a first supervisor persists a REAL snapshot for `ctx_id` via a
     //     successful join. It shares the recording store; the spawn persists the
     //     joiner's initial Class-S snapshot under `ctx_id`.
     let (seed_sup, _seed_crypto) = bob_supervisor(Some(Box::new(rec.clone())));
     let (seed_res, seed_kp) = reserve_bob_kp(&seed_sup, &bob).await;
-    let (_seed_alice, seed_welcome) = alice_welcome_for(&ctx_bytes, &seed_kp);
+    let (_seed_alice, seed_welcome) = alice_welcome_for(&ctx_id, &seed_kp);
     seed_sup
         .spawn_actor_from_welcome(
             bob.clone(),
-            WelcomeJoinRequest {
-                creator_did: DID::from(ALICE_DID),
-                context_id: ctx_id.clone(),
-                params: joiner_params(),
-                reservation_id: seed_res,
-                welcome_bytes: seed_welcome,
-                local_pseudonym: some_pseudonym(),
-            },
+            &bob_custody,
+            &bob_handle,
+            seal_join_request(
+                &alice_signing_key(),
+                &DID::from(ALICE_DID),
+                &ctx_id,
+                &joiner_params(),
+                seed_welcome,
+                &bob_recipient,
+                &ctx_id,
+                &DID::from(ALICE_DID),
+                seed_res,
+            ),
         )
         .await
         .expect("the seed join persists a real snapshot for ctx_id");
@@ -974,21 +1411,27 @@ async fn durable_snapshot_collision_is_rejected_without_clobbering_or_burning_kp
     );
 
     let (reservation_id, kp_public_bytes) = reserve_bob_kp(&target_sup, &bob).await;
-    let (_alice, welcome) = alice_welcome_for(&ctx_bytes, &kp_public_bytes);
-    let make_req =
-        |context_id: String, reservation_id, welcome_bytes: Vec<u8>| WelcomeJoinRequest {
-            creator_did: DID::from(ALICE_DID),
-            context_id,
-            params: joiner_params(),
-            reservation_id,
+    let (_alice, welcome) = alice_welcome_for(&ctx_id, &kp_public_bytes);
+    let make_req = |reservation_id: ReservationId, welcome_bytes: Vec<u8>| {
+        seal_join_request(
+            &alice_signing_key(),
+            &DID::from(ALICE_DID),
+            &ctx_id,
+            &joiner_params(),
             welcome_bytes,
-            local_pseudonym: some_pseudonym(),
-        };
+            &bob_recipient,
+            &ctx_id,
+            &DID::from(ALICE_DID),
+            reservation_id,
+        )
+    };
 
     let err = target_sup
         .spawn_actor_from_welcome(
             bob.clone(),
-            make_req(ctx_id.clone(), reservation_id.clone(), welcome.clone()),
+            &bob_custody,
+            &bob_handle,
+            make_req(reservation_id.clone(), welcome.clone()),
         )
         .await
         .expect_err("a durable same-id snapshot must reject the first-join");
@@ -1034,7 +1477,12 @@ async fn durable_snapshot_collision_is_rejected_without_clobbering_or_burning_kp
     rec.store.remove(&ctx_id);
     rec.deletes.clear();
     target_sup
-        .spawn_actor_from_welcome(bob, make_req(ctx_id.clone(), reservation_id, welcome))
+        .spawn_actor_from_welcome(
+            bob,
+            &bob_custody,
+            &bob_handle,
+            make_req(reservation_id, welcome),
+        )
         .await
         .expect("the retry after clearing the snapshot succeeds — the KP was never burned");
     assert_eq!(
@@ -1079,7 +1527,7 @@ async fn durable_snapshot_collision_is_rejected_without_clobbering_or_burning_kp
 async fn slow_confirm_consume_times_out_rolls_back_and_releases_the_lock() {
     use std::time::Duration;
 
-    use super::key_package_actor::{KeyPackageStoreHandle, ReservationId};
+    use super::key_package_actor::KeyPackageStoreHandle;
 
     let bob = DID::from(BOB_DID);
     let ctx_id = ctx_hex(0xa5);
@@ -1114,17 +1562,26 @@ async fn slow_confirm_consume_times_out_rolls_back_and_releases_the_lock() {
     // prechecks (A live-registry miss, B pseudonym, C legible params, D durable
     // first-writer-wins) all PASS, so control reaches the timed region and blocks
     // in the step-1 `ConfirmConsume`.
-    let req = WelcomeJoinRequest {
-        creator_did: DID::from(ALICE_DID),
-        context_id: ctx_id.clone(),
-        params: joiner_params(),
-        reservation_id: ReservationId::new_random(),
-        welcome_bytes: vec![0u8; 4],
-        local_pseudonym: some_pseudonym(),
-    };
+    // A validly-signed bundle so the open + verify + reversible prechecks (A–D)
+    // all PASS and control reaches the timed ConfirmConsume region (the fake store
+    // ignores `reservation_id` / `welcome_message`, so both may be junk). No Alice
+    // group is needed — §5.13.3 runs only AFTER ConfirmConsume returns, which it
+    // never does here.
+    let (bob_custody, bob_handle, bob_recipient) = bob_active_custody().await;
+    let req = seal_join_request(
+        &alice_signing_key(),
+        &DID::from(ALICE_DID),
+        &ctx_id,
+        &joiner_params(),
+        vec![0u8; 4],
+        &bob_recipient,
+        &ctx_id,
+        &DID::from(ALICE_DID),
+        ReservationId::new_random(),
+    );
 
     let err = sup
-        .spawn_actor_from_welcome(bob.clone(), req)
+        .spawn_actor_from_welcome(bob.clone(), &bob_custody, &bob_handle, req)
         .await
         .expect_err("a ConfirmConsume exceeding LIFECYCLE_TIMEOUT must fail the join closed");
     assert!(
@@ -1177,4 +1634,1366 @@ async fn slow_confirm_consume_times_out_rolls_back_and_releases_the_lock() {
     );
 
     fake_actor.abort();
+}
+
+// ---------------------------------------------------------------------------
+// The PUBLIC bare-`DID` `Supervisor` joiner entrypoints (ADR-049 Phase 2J):
+// `reserve_key_package` + `spawn_actor_from_welcome` are bridge-initiated
+// node-level bootstraps (custody enforced at the FFI bridge layer, the same
+// trust model as `create_context`), NOT actor-internal `OwnedIdentityDid`-gated
+// methods. These exercise the reserve→spawn round trip and the store-binding
+// fail-closed path through those public methods.
+// ---------------------------------------------------------------------------
+
+/// The two PUBLIC bare-`DID` `Supervisor` bootstrap entrypoints compose into a
+/// working join: `reserve_key_package` reserves one of the joiner's own pooled
+/// `KeyPackages`, the creator builds a Welcome addressed to it, and
+/// `spawn_actor_from_welcome` fuses that Welcome into a live, send-capable
+/// actor. The joiner comes up registered (`member_count` is `Some(2)`, the
+/// live-actor discriminator) and the installed group is bidirectionally
+/// functional (bob encrypts through it, alice decrypts).
+#[tokio::test]
+async fn reserve_then_spawn_via_supervisor_yields_a_live_send_capable_actor() {
+    let bob = DID::from(BOB_DID);
+    let ctx_id = ctx_hex(0xb1);
+    let ctx_bytes = context_id_to_bytes(&ctx_id);
+
+    let (sup, bob_crypto) = bob_supervisor(None);
+
+    // Publish bob's wrapping key so his pooled KP declares `0xFF02` (valn0502).
+    set_bob_wrapping(&sup, &bob).await;
+
+    // Reserve via the PUBLIC `Supervisor` entrypoint (get-or-spawn bob's store,
+    // replenish barrier, list, reserve) — bare DID; in production the FFI bridge
+    // enforces that the DID is locally custodied.
+    let (reservation_id, kp_public_bytes) = sup
+        .reserve_key_package(bob.clone())
+        .await
+        .expect("reserve_key_package yields a reservation for the identity");
+
+    // Alice (bare creator provider) adds the reserved KP → the real Welcome.
+    let (alice_crypto, welcome) = alice_welcome_for(&ctx_id, &kp_public_bytes);
+
+    // Spawn via the PUBLIC `Supervisor` entrypoint — the reservation feeds
+    // straight in through the creator-signed, sealed bundle.
+    let (bob_custody, bob_handle, bob_recipient) = bob_active_custody().await;
+    let joined = sup
+        .spawn_actor_from_welcome(
+            bob.clone(),
+            &bob_custody,
+            &bob_handle,
+            seal_join_request(
+                &alice_signing_key(),
+                &DID::from(ALICE_DID),
+                &ctx_id,
+                &joiner_params(),
+                welcome,
+                &bob_recipient,
+                &ctx_id,
+                &DID::from(ALICE_DID),
+                reservation_id,
+            ),
+        )
+        .await
+        .expect("spawn_actor_from_welcome stands up the joiner actor");
+    assert_eq!(joined.context_id(), ctx_id);
+
+    // Live-actor discriminator: `Some(2)` (vs the unregistered `None`).
+    assert_eq!(
+        sup.member_count(&ctx_id).await,
+        Some(2),
+        "the reserve->spawn join stands up a registered, send-capable actor"
+    );
+    assert!(
+        sup.lookup(&ctx_id).is_some(),
+        "a context actor handle is registered for the joiner"
+    );
+
+    // The installed group is real: bob encrypts through it, alice decrypts.
+    let routing_id = scp_protocol::context::context_routing_id(&hex::encode(ctx_bytes));
+    let from_bob = b"supervisor-seam-payload-from-bob";
+    let wrapped_bob = bob_crypto
+        .mls_encrypt_management(&ctx_bytes, from_bob, &routing_id, 3600)
+        .expect("bob encrypts a management message through the installed group");
+    let opened = alice_crypto
+        .open(&ctx_bytes, &ctx_id, &wrapped_bob)
+        .expect("alice opens bob's message");
+    assert!(
+        matches!(
+            &opened,
+            OpenResult::Management { payload, .. } if payload.as_slice() == from_bob.as_slice()
+        ),
+        "creator decrypts joiner traffic through the installed group; \
+         expected Management({from_bob:?}), got {opened:?}"
+    );
+}
+
+/// The join binds to the identity whose `KeyPackageStoreActor` holds the
+/// reservation. A reservation minted for BOB is consumed under CHARLIE — whose
+/// OWN (fresh) store never held it — so the fused `ConfirmConsume` fails closed
+/// with `InvalidState` and NO actor stands up. Non-vacuity: the SAME
+/// reservation + Welcome, retried under BOB, then succeeds — proving Charlie's
+/// rejected attempt neither burned the KP nor stood up the context.
+#[tokio::test]
+async fn spawn_under_a_different_did_is_rejected() {
+    let bob = DID::from(BOB_DID);
+    let charlie = DID::from("did:dht:z6MkCharlieNotTheJoinerSpawnFromWelcome");
+    let ctx_id = ctx_hex(0xb2);
+
+    let (sup, _bob_crypto) = bob_supervisor(None);
+
+    // Publish bob's wrapping key so his pooled KP declares `0xFF02` (valn0502).
+    set_bob_wrapping(&sup, &bob).await;
+
+    // Bob reserves under HIS OWN DID; Alice builds the Welcome for that KP.
+    let (reservation_id, kp_public_bytes) = sup
+        .reserve_key_package(bob.clone())
+        .await
+        .expect("bob reserves a KP under his own DID");
+    let (_alice, welcome) = alice_welcome_for(&ctx_id, &kp_public_bytes);
+
+    // Both spawns open the SAME bundle sealed to Bob's #active custody; the
+    // identity binding under test is the reservation's per-identity KeyPackage
+    // store (via `owning_did`), independent of the bundle-opening key.
+    let (bob_custody, bob_handle, bob_recipient) = bob_active_custody().await;
+    let make_req = |reservation_id: ReservationId, welcome_bytes: Vec<u8>| {
+        seal_join_request(
+            &alice_signing_key(),
+            &DID::from(ALICE_DID),
+            &ctx_id,
+            &joiner_params(),
+            welcome_bytes,
+            &bob_recipient,
+            &ctx_id,
+            &DID::from(ALICE_DID),
+            reservation_id,
+        )
+    };
+
+    // Spawn under CHARLIE: `spawn_actor_from_welcome` resolves Charlie's OWN
+    // fresh KeyPackage store, which never held bob's reservation, so the fused
+    // `ConfirmConsume` finds no live reservation and fails closed.
+    let err = sup
+        .spawn_actor_from_welcome(
+            charlie,
+            &bob_custody,
+            &bob_handle,
+            make_req(reservation_id.clone(), welcome.clone()),
+        )
+        .await
+        .expect_err("a reservation bound to bob must not consume under a different DID");
+    assert!(
+        matches!(err, crate::context::ContextError::InvalidState(_)),
+        "expected InvalidState for an absent (cross-identity) reservation, got {err:?}"
+    );
+    assert!(
+        sup.lookup(&ctx_id).is_none(),
+        "no actor may stand up under the wrong identity"
+    );
+
+    // Non-vacuity: bob's OWN DID now spawns the joiner with the same reservation
+    // + Welcome — Charlie's rejected attempt burned nothing.
+    sup.spawn_actor_from_welcome(
+        bob,
+        &bob_custody,
+        &bob_handle,
+        make_req(reservation_id, welcome),
+    )
+    .await
+    .expect("bob's own DID spawns the joiner — the reservation stayed bound to him");
+    assert_eq!(
+        sup.member_count(&ctx_id).await,
+        Some(2),
+        "bob's join stands up the live joiner actor after the cross-identity reject"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test L — FFI-02 context-parameter binding: a join whose caller-supplied
+// params/context_id DIVERGE from what the creator cryptographically committed
+// into the group's `scp_context_params` (`0xFF02`) extension is REFUSED before
+// any crypto is installed, any snapshot persisted, or any actor registered
+// (spec §5.13.3). This is the load-bearing forgery guard: a malicious inviter
+// cannot present benign params while the real group differs.
+// ---------------------------------------------------------------------------
+
+/// Asserts a spawn `result` was refused by the FFI-02 binding check (a
+/// `CryptoFailed` whose message names the greppable refusal + the `0xFF02`
+/// extension) and that the rejection had NO side effects: no group installed in
+/// the provider (empty crypto export for the request slot), no live actor
+/// registered, and — via the shared `RecordingPersistence` — no snapshot
+/// persisted. Mirrors the 2J rollback-assertion pattern (Test C / H).
+async fn assert_binding_refused_no_side_effects(
+    result: Result<crate::context::ContextHandle, crate::context::ContextError>,
+    j: &Joined,
+    rec: &RecordingPersistence,
+) {
+    let err = result.expect_err("a diverging context-parameter binding must be refused");
+    assert!(
+        matches!(
+            &err,
+            crate::context::ContextError::CryptoFailed(msg)
+                if msg.contains("spawn-from-Welcome refused") && msg.contains("0xFF02")
+        ),
+        "expected the FFI-02 binding refusal naming the 0xFF02 extension, got: {err:?}"
+    );
+
+    // No crypto installed under the slot Bob tried to install into (an absent
+    // context exports an EMPTY blob; an installed one is non-empty).
+    assert!(
+        j.bob_crypto
+            .export_crypto_state(&j.ctx_bytes)
+            .expect("export never errors")
+            .is_empty(),
+        "no MLS group may be installed after a binding refusal"
+    );
+    // No actor registered / reachable.
+    assert!(
+        j.sup.lookup(&j.ctx_id).is_none(),
+        "no actor handle may be registered after a binding refusal"
+    );
+    assert_eq!(
+        j.sup.member_count(&j.ctx_id).await,
+        None,
+        "an unregistered context answers the unregistered default, not a live count"
+    );
+    // No snapshot persisted — the refusal fires BEFORE the step-4 persist.
+    assert!(
+        rec.store.is_empty(),
+        "no snapshot may be persisted after a binding refusal"
+    );
+}
+
+/// The caller's `governance` diverges from the creator-committed governance
+/// model: `GovernanceHashMismatch` → refused before install.
+#[tokio::test]
+async fn tamper_governance_mismatch_is_refused_before_install() {
+    let rec = RecordingPersistence::default();
+    let mut tampered = joiner_params();
+    tampered.governance = GovernanceModel::Threshold {
+        threshold: 1,
+        signers: vec![DID::from("did:dht:z6MkThresholdSignerForTamperTest")],
+    };
+    let (result, j) = run_join_with(
+        0xc1,
+        Some(Box::new(rec.clone())),
+        Some(joiner_params()),
+        tampered,
+        None,
+    )
+    .await;
+    assert_binding_refused_no_side_effects(result, &j, &rec).await;
+}
+
+/// The caller's capability `ceiling` diverges from the committed one:
+/// `CeilingHashMismatch` → refused before install.
+#[tokio::test]
+async fn tamper_ceiling_mismatch_is_refused_before_install() {
+    let rec = RecordingPersistence::default();
+    let mut tampered = joiner_params();
+    // A strict subset of the committed ceiling — valid entries, different hash.
+    tampered.ceiling = vec![Capability::MessagesRead];
+    let (result, j) = run_join_with(
+        0xc2,
+        Some(Box::new(rec.clone())),
+        Some(joiner_params()),
+        tampered,
+        None,
+    )
+    .await;
+    assert_binding_refused_no_side_effects(result, &j, &rec).await;
+}
+
+/// The caller's `ceiling_policy` diverges (Immutable committed vs Governed
+/// requested): `CeilingPolicyMismatch` → refused before install.
+#[tokio::test]
+async fn tamper_ceiling_policy_mismatch_is_refused_before_install() {
+    let rec = RecordingPersistence::default();
+    let mut tampered = joiner_params();
+    tampered.ceiling_policy = CeilingPolicy::Governed;
+    let (result, j) = run_join_with(
+        0xc3,
+        Some(Box::new(rec.clone())),
+        Some(joiner_params()),
+        tampered,
+        None,
+    )
+    .await;
+    assert_binding_refused_no_side_effects(result, &j, &rec).await;
+}
+
+/// The caller's `mode` diverges (Encrypted committed vs Broadcast requested):
+/// `ModeMismatch` → refused before install.
+#[tokio::test]
+async fn tamper_mode_mismatch_is_refused_before_install() {
+    let rec = RecordingPersistence::default();
+    let mut tampered = joiner_params();
+    tampered.mode = ContextMode::Broadcast;
+    let (result, j) = run_join_with(
+        0xc4,
+        Some(Box::new(rec.clone())),
+        Some(joiner_params()),
+        tampered,
+        None,
+    )
+    .await;
+    assert_binding_refused_no_side_effects(result, &j, &rec).await;
+}
+
+/// The caller's `context_id` diverges from the id the group's `0xFF02` extension
+/// commits (a Welcome for context A replayed as context B): `ContextIdMismatch`
+/// → refused before install. The install slot (the REQUEST id) stays empty.
+#[tokio::test]
+async fn tamper_context_id_mismatch_is_refused_before_install() {
+    let rec = RecordingPersistence::default();
+    let (result, j) = run_join_with(
+        0xc5,
+        Some(Box::new(rec.clone())),
+        Some(joiner_params()),
+        joiner_params(),
+        Some(ctx_hex(0xc6)), // a DIFFERENT id than the group commits (0xc5)
+    )
+    .await;
+    assert_binding_refused_no_side_effects(result, &j, &rec).await;
+}
+
+/// FFI-02 rule 1: a Welcome for a WRAPPING-ONLY group (no `0xFF02` extension —
+/// not an SCP context) is refused on join, even when the caller's params are
+/// otherwise well-formed. No crypto installed, no snapshot persisted, no actor.
+#[tokio::test]
+async fn join_group_without_scp_context_extension_is_refused() {
+    let rec = RecordingPersistence::default();
+    let (result, j) = run_join_with(
+        0xc7,
+        Some(Box::new(rec.clone())),
+        None, // wrapping-only group: NO 0xFF02 extension
+        joiner_params(),
+        None,
+    )
+    .await;
+
+    let err = result.expect_err("a group with no 0xFF02 extension is not an SCP context");
+    assert!(
+        matches!(
+            &err,
+            crate::context::ContextError::CryptoFailed(msg)
+                if msg.contains("spawn-from-Welcome refused")
+                    && msg.contains("no scp_context_params (0xFF02)")
+        ),
+        "expected the rule-1 refusal (no 0xFF02 extension), got: {err:?}"
+    );
+    assert!(
+        j.bob_crypto
+            .export_crypto_state(&j.ctx_bytes)
+            .expect("export never errors")
+            .is_empty(),
+        "no MLS group may be installed after a rule-1 refusal"
+    );
+    assert!(
+        j.sup.lookup(&j.ctx_id).is_none(),
+        "no actor handle may be registered after a rule-1 refusal"
+    );
+    assert!(
+        rec.store.is_empty(),
+        "no snapshot may be persisted after a rule-1 refusal"
+    );
+}
+
+// ===========================================================================
+// SIGNED §5.12.3 INVITATION-BUNDLE CRYPTO ACCEPTANCE (ADR-049 Phase 2J, FFI-02
+// Option A). These pin the open → verify → structural → §5.13.3 ladder that
+// spawn-from-Welcome runs BEFORE deriving any authority: authority comes ONLY
+// from the creator-signed, HPKE-sealed bundle, never from caller-supplied loose
+// params (BLACK-2J10-001 admin-hijack). Each rejection has NO side effects and,
+// where the reject fires BEFORE the irreversible ConfirmConsume, does NOT burn
+// the single-use KeyPackage.
+//
+// Coverage notes:
+//   * "signed params disagree with the committed 0xFF02 group" is covered by the
+//     `tamper_*_mismatch_is_refused_before_install` tests above — with the FFI-02
+//     reshape those now carry the divergence INSIDE the creator-signed bundle
+//     (`bundle.verify` + `verify_structural_consistency` pass; the kept §5.13.3
+//     `0xFF02` cross-check against the committed group is what rejects).
+//   * "wrong-signer rejected" is covered by
+//     `non_creator_signed_bundle_is_rejected_before_kp_consume` below.
+// ===========================================================================
+
+/// BLACK-2J10-001 — a bundle signed by a NON-creator key is rejected at the
+/// creator-signature verify (step 2), BEFORE the irreversible `ConfirmConsume`.
+/// The bundle claims `creator_did = ALICE` and honest params, but is signed by an
+/// ATTACKER key; the resolver resolves `ALICE -> alice_vk`, so `bundle.verify`
+/// fails closed. The KeyPackage is NOT burned: the SAME reservation + Welcome,
+/// retried with a validly creator-signed bundle, then succeeds (a burned KP would
+/// fail closed at the fused consume, as Test D shows).
+#[tokio::test]
+async fn non_creator_signed_bundle_is_rejected_before_kp_consume() {
+    let bob = DID::from(BOB_DID);
+    let ctx_id = ctx_hex(0xd1);
+    let ctx_bytes = context_id_to_bytes(&ctx_id);
+
+    let (sup, bob_crypto) = bob_supervisor(None);
+    let (reservation_id, kp_public_bytes) = reserve_bob_kp(&sup, &bob).await;
+    let (_alice, welcome) = alice_welcome_for(&ctx_id, &kp_public_bytes);
+    let (bob_custody, bob_handle, bob_recipient) = bob_active_custody().await;
+
+    // Signed by an ATTACKER key, NOT alice's — `bundle.verify(alice_vk)` fails.
+    let attacker = SigningKey::from_bytes(&[0xEE; 32]);
+    let forged = seal_join_request(
+        &attacker,
+        &DID::from(ALICE_DID),
+        &ctx_id,
+        &joiner_params(),
+        welcome.clone(),
+        &bob_recipient,
+        &ctx_id,
+        &DID::from(ALICE_DID),
+        reservation_id.clone(),
+    );
+    let err = sup
+        .spawn_actor_from_welcome(bob.clone(), &bob_custody, &bob_handle, forged)
+        .await
+        .expect_err("a bundle NOT signed by the creator's #active key must be rejected");
+    assert!(
+        matches!(
+            &err,
+            crate::context::ContextError::CryptoFailed(msg) if msg.contains("signature invalid")
+        ),
+        "expected the creator-signature refusal, got: {err:?}"
+    );
+    // Reject fired before any state build — nothing installed, no actor.
+    assert!(
+        bob_crypto
+            .export_crypto_state(&ctx_bytes)
+            .expect("export never errors")
+            .is_empty(),
+        "no group may be installed after a signature refusal"
+    );
+    assert!(
+        sup.lookup(&ctx_id).is_none(),
+        "no actor may be registered after a signature refusal"
+    );
+
+    // KP NOT burned: the SAME reservation + Welcome, now validly creator-signed,
+    // succeeds — proving the signature reject fired BEFORE `ConfirmConsume`.
+    let honest = seal_join_request(
+        &alice_signing_key(),
+        &DID::from(ALICE_DID),
+        &ctx_id,
+        &joiner_params(),
+        welcome,
+        &bob_recipient,
+        &ctx_id,
+        &DID::from(ALICE_DID),
+        reservation_id,
+    );
+    sup.spawn_actor_from_welcome(bob, &bob_custody, &bob_handle, honest)
+        .await
+        .expect("the retry with a creator-signed bundle succeeds — the KP was never burned");
+    assert_eq!(
+        sup.member_count(&ctx_id).await,
+        Some(2),
+        "the valid retry stands up the live joiner actor"
+    );
+}
+
+/// A tampered HPKE ciphertext fails the AEAD open — the join is refused with
+/// `CryptoFailed("... open failed ...")` and no crypto / actor is left resident.
+/// The AEAD tag binds `enc || pkRm || info || aad || ct`, so a single flipped
+/// ciphertext byte is fatal and indistinguishable from a wrong-key error.
+#[tokio::test]
+async fn tampered_ciphertext_fails_aead_open() {
+    let bob = DID::from(BOB_DID);
+    let ctx_id = ctx_hex(0xd2);
+    let ctx_bytes = context_id_to_bytes(&ctx_id);
+
+    let (sup, bob_crypto) = bob_supervisor(None);
+    let (reservation_id, kp_public_bytes) = reserve_bob_kp(&sup, &bob).await;
+    let (_alice, welcome) = alice_welcome_for(&ctx_id, &kp_public_bytes);
+    let (bob_custody, bob_handle, bob_recipient) = bob_active_custody().await;
+
+    let mut req = seal_join_request(
+        &alice_signing_key(),
+        &DID::from(ALICE_DID),
+        &ctx_id,
+        &joiner_params(),
+        welcome,
+        &bob_recipient,
+        &ctx_id,
+        &DID::from(ALICE_DID),
+        reservation_id,
+    );
+    // Flip a ciphertext byte -> the AEAD tag no longer verifies.
+    req.sealed_bundle_ct[0] ^= 0xFF;
+
+    let err = sup
+        .spawn_actor_from_welcome(bob, &bob_custody, &bob_handle, req)
+        .await
+        .expect_err("a tampered ciphertext must fail the AEAD open");
+    assert!(
+        matches!(
+            &err,
+            crate::context::ContextError::CryptoFailed(msg) if msg.contains("open failed")
+        ),
+        "expected the AEAD open-failure refusal, got: {err:?}"
+    );
+    assert!(
+        bob_crypto
+            .export_crypto_state(&ctx_bytes)
+            .expect("export never errors")
+            .is_empty(),
+        "no group may be installed after an open failure"
+    );
+    assert!(
+        sup.lookup(&ctx_id).is_none(),
+        "no actor may be registered after an open failure"
+    );
+}
+
+/// A corrupted creator signature (flipped BEFORE sealing, so the AEAD open still
+/// succeeds) is rejected at `bundle.verify` — `CryptoFailed("... signature
+/// invalid ...")`, no crypto / actor resident.
+#[tokio::test]
+async fn tampered_bundle_signature_is_rejected() {
+    let bob = DID::from(BOB_DID);
+    let ctx_id = ctx_hex(0xd3);
+    let ctx_bytes = context_id_to_bytes(&ctx_id);
+
+    let (sup, bob_crypto) = bob_supervisor(None);
+    let (reservation_id, kp_public_bytes) = reserve_bob_kp(&sup, &bob).await;
+    let (_alice, welcome) = alice_welcome_for(&ctx_id, &kp_public_bytes);
+    let (bob_custody, bob_handle, bob_recipient) = bob_active_custody().await;
+
+    let mut bundle = signed_bundle(
+        &alice_signing_key(),
+        &DID::from(ALICE_DID),
+        &ctx_id,
+        &joiner_params(),
+        welcome,
+    );
+    // Corrupt the signature; the ciphertext stays intact so the open succeeds and
+    // the creator-signature verify is what rejects.
+    bundle.signature[0] ^= 0xFF;
+    let req = seal_bundle(
+        &bundle,
+        &bob_recipient,
+        &ctx_id,
+        &DID::from(ALICE_DID),
+        reservation_id,
+        some_pseudonym(),
+    );
+
+    let err = sup
+        .spawn_actor_from_welcome(bob, &bob_custody, &bob_handle, req)
+        .await
+        .expect_err("a corrupted bundle signature must be rejected");
+    assert!(
+        matches!(
+            &err,
+            crate::context::ContextError::CryptoFailed(msg) if msg.contains("signature invalid")
+        ),
+        "expected the creator-signature refusal, got: {err:?}"
+    );
+    assert!(
+        bob_crypto
+            .export_crypto_state(&ctx_bytes)
+            .expect("export never errors")
+            .is_empty(),
+        "no group may be installed after a signature refusal"
+    );
+    assert!(
+        sup.lookup(&ctx_id).is_none(),
+        "no actor may be registered after a signature refusal"
+    );
+}
+
+/// A bundle whose `metadata_snapshot.structural.governance` diverges from the
+/// signed `context_params.governance` is a signed self-contradiction — rejected
+/// by `verify_structural_consistency` (spec §5.12.3.1 step 2) with
+/// `CryptoFailed("... metadata inconsistent ...")`, no crypto / actor resident.
+/// The bundle is otherwise validly creator-signed, so this pins the structural
+/// check specifically (not the signature).
+#[tokio::test]
+async fn structurally_inconsistent_bundle_is_rejected() {
+    let bob = DID::from(BOB_DID);
+    let ctx_id = ctx_hex(0xd4);
+    let ctx_bytes = context_id_to_bytes(&ctx_id);
+
+    let (sup, bob_crypto) = bob_supervisor(None);
+    let (reservation_id, kp_public_bytes) = reserve_bob_kp(&sup, &bob).await;
+    let (_alice, welcome) = alice_welcome_for(&ctx_id, &kp_public_bytes);
+    let (bob_custody, bob_handle, bob_recipient) = bob_active_custody().await;
+
+    // Hand-build a bundle whose structural governance diverges from the params
+    // governance (bypassing `build_metadata_snapshot`, which copies structural
+    // verbatim), then sign it VALIDLY.
+    let params = joiner_params();
+    let facts = SnapshotRuntimeFacts {
+        member_count: Some(1),
+        creator_did: Some(DID::from(ALICE_DID)),
+        ..SnapshotRuntimeFacts::default()
+    };
+    let mut snapshot = build_metadata_snapshot(&params, facts);
+    snapshot.structural.governance = GovernanceModel::Threshold {
+        threshold: 1,
+        signers: vec![DID::from("did:dht:z6MkStructuralInconsistencySigner")],
+    };
+    let mut bundle = InvitationBundle {
+        context_id: ctx_id.clone(),
+        creator_did: DID::from(ALICE_DID),
+        relay_urls: vec![],
+        welcome_message: welcome,
+        key_material: InvitationKeyMaterial {
+            context_metadata_key: [7u8; 32],
+            sender_key_seed: None,
+        },
+        context_params: params,
+        metadata_snapshot: snapshot,
+        signature: vec![],
+    };
+    let hash = bundle
+        .invitation_bundle_signing_hash()
+        .expect("signing hash");
+    bundle.signature = alice_signing_key().sign(&hash).to_bytes().to_vec();
+    let req = seal_bundle(
+        &bundle,
+        &bob_recipient,
+        &ctx_id,
+        &DID::from(ALICE_DID),
+        reservation_id,
+        some_pseudonym(),
+    );
+
+    let err = sup
+        .spawn_actor_from_welcome(bob, &bob_custody, &bob_handle, req)
+        .await
+        .expect_err("a structurally inconsistent bundle must be rejected");
+    assert!(
+        matches!(
+            &err,
+            crate::context::ContextError::CryptoFailed(msg) if msg.contains("metadata inconsistent")
+        ),
+        "expected the structural-consistency refusal, got: {err:?}"
+    );
+    assert!(
+        bob_crypto
+            .export_crypto_state(&ctx_bytes)
+            .expect("export never errors")
+            .is_empty(),
+        "no group may be installed after a structural refusal"
+    );
+    assert!(
+        sup.lookup(&ctx_id).is_none(),
+        "no actor may be registered after a structural refusal"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test M — the flagship end-to-end round trip: `Supervisor::invite_member`
+// (creator side) → `spawn_actor_from_welcome` (joiner side). A real MLS
+// add-member + a creator-signed, HPKE-sealed §5.12.3 bundle stands the invitee
+// up as a live, bidirectionally-functional member.
+// ---------------------------------------------------------------------------
+
+/// Alice creates an encrypted context, `invite_member` produces the signed,
+/// sealed invitation for Bob's reserved KeyPackage, and Bob's
+/// `spawn_actor_from_welcome` opens it (split custody), verifies the creator
+/// signature, and stands up a live actor whose installed group round-trips MLS
+/// traffic in BOTH directions. Bob's #active custody holds the SAME key
+/// `pair_resolver` returns for `BOB_DID`, so the invitation (sealed to that
+/// resolved #active) opens.
+#[tokio::test]
+async fn invite_member_round_trip_stands_up_a_bidirectional_joiner() {
+    let ctx_id = ctx_hex(0xd5);
+    let ctx_bytes = context_id_to_bytes(&ctx_id);
+    let alice = DID::from(ALICE_DID);
+    let bob = DID::from(BOB_DID);
+
+    // (a) Alice creates the encrypted context.
+    let (alice_sup, alice_crypto) = alice_supervisor();
+    alice_sup
+        .create_context(
+            ctx_id.clone(),
+            joiner_params(),
+            alice.clone(),
+            some_pseudonym(),
+        )
+        .await
+        .expect("alice creates the encrypted context");
+
+    // (b) Bob reserves a KeyPackage from HIS OWN supervisor + store (declares
+    //     0xFF02 via `reserve_bob_kp`'s wrapping-key publish).
+    let (bob_sup, bob_crypto) = bob_supervisor(None);
+    let (reservation_id, kp_public_bytes) = reserve_bob_kp(&bob_sup, &bob).await;
+
+    // (c) Alice invites Bob: the add is routed through the context actor's
+    //     governance gate (SingleAdmin → auto-executes the real in-actor MLS
+    //     add), then the returned Welcome is signed + sealed into a §5.12.3
+    //     bundle with alice's #active key.
+    let outcome = alice_sup
+        .invite_member(
+            ctx_id.clone(),
+            alice.clone(),
+            bob.clone(),
+            kp_public_bytes,
+            vec![],
+            &alice_signing_key(),
+        )
+        .await
+        .expect("alice seals an invitation for bob");
+    // SingleAdmin creator invite must SEAL (governed contexts return `Err`, not a
+    // deferral). The `Sealed` bundle is the SAME `SealedInvitation` wire type the
+    // joiner consumes below — directly usable as the join input with no re-boxing
+    // (the runtime `WelcomeJoinRequest` reads its `enc`/`ciphertext` straight off
+    // the bundle). `enc` is validated to be exactly 32 bytes at the seal.
+    let InviteMemberOutcome::Sealed { bundle, .. } = outcome;
+    let enc =
+        <[u8; 32]>::try_from(bundle.enc.as_slice()).expect("sealed bundle enc is exactly 32 bytes");
+    let ciphertext = bundle.ciphertext;
+
+    // (c') The creator's OWN role_state now reflects Bob (the split-brain the
+    //      old off-mailbox add left behind is closed: the add ran in-actor).
+    assert_eq!(
+        alice_sup.member_count(&ctx_id).await,
+        Some(2),
+        "the in-actor governance add updates the CREATOR's membership/role_state"
+    );
+
+    // (d) Bob joins. His #active custody holds the fixed BOB seed = the key
+    //     `pair_resolver` returns for BOB, which is what `invite_member` sealed to.
+    let (bob_custody, bob_handle) = bob_imported_custody().await;
+    let req = WelcomeJoinRequest {
+        context_id: ctx_id.clone(),
+        creator_did: alice.clone(),
+        sealed_bundle_enc: enc,
+        sealed_bundle_ct: ciphertext,
+        reservation_id,
+        local_pseudonym: some_pseudonym(),
+    };
+    let handle = bob_sup
+        .spawn_actor_from_welcome(bob.clone(), &bob_custody, &bob_handle, req)
+        .await
+        .expect("bob joins from alice's real invitation");
+    assert_eq!(handle.context_id(), ctx_id);
+
+    // (e) Bob is a live, registered member and his joined group is installed.
+    assert_eq!(
+        bob_sup.member_count(&ctx_id).await,
+        Some(2),
+        "the invited joiner stands up a live, send-capable actor"
+    );
+    assert!(
+        !bob_crypto
+            .export_crypto_state(&ctx_bytes)
+            .expect("export never errors")
+            .is_empty(),
+        "bob's joined MLS group is installed"
+    );
+
+    // Bidirectional MLS traffic through the invitation-installed group.
+    let routing_id = scp_protocol::context::context_routing_id(&hex::encode(ctx_bytes));
+    let from_alice = b"invite-member-round-trip-from-alice";
+    let wrapped_alice = alice_crypto
+        .mls_encrypt_management(&ctx_bytes, from_alice, &routing_id, 3600)
+        .expect("alice encrypts a management message");
+    let opened_alice = bob_crypto
+        .open(&ctx_bytes, &ctx_id, &wrapped_alice)
+        .expect("bob opens alice's message");
+    assert!(
+        matches!(
+            &opened_alice,
+            OpenResult::Management { payload, .. } if payload.as_slice() == from_alice.as_slice()
+        ),
+        "bob decrypts alice's traffic through the invitation-installed group; got {opened_alice:?}"
+    );
+
+    let from_bob = b"invite-member-round-trip-from-bob";
+    let wrapped_bob = bob_crypto
+        .mls_encrypt_management(&ctx_bytes, from_bob, &routing_id, 3600)
+        .expect("bob encrypts a management message");
+    let opened_bob = alice_crypto
+        .open(&ctx_bytes, &ctx_id, &wrapped_bob)
+        .expect("alice opens bob's message");
+    assert!(
+        matches!(
+            &opened_bob,
+            OpenResult::Management { payload, .. } if payload.as_slice() == from_bob.as_slice()
+        ),
+        "alice decrypts bob's traffic — bidirectional round-trip closed; got {opened_bob:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test M2 — root fix: the governance AddMember broadcasts its epoch Commit.
+// ---------------------------------------------------------------------------
+
+/// A transport that watches for a non-empty `send_message` to ONE expected
+/// routing id and flips an atomic flag when it sees one. Used to prove the
+/// add-member Commit was broadcast to existing members. `send_message`
+/// succeeds (so the Commit is delivered, not enqueued for retry); all other
+/// operations are inert. An [`AtomicBool`](std::sync::atomic::AtomicBool)
+/// avoids a `Mutex` on the sync transport hot path.
+struct BroadcastWatchTransport {
+    /// The routing id whose broadcast proves the fix (`context_routing_id`).
+    expected_routing: [u8; 32],
+    /// Set to `true` when a non-empty `send_message` to `expected_routing` is
+    /// observed.
+    saw_broadcast: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ContextTransportProvider for BroadcastWatchTransport {
+    fn is_connected(&self) -> bool {
+        true
+    }
+
+    fn publish_context(
+        &self,
+        _context_id: &[u8; 32],
+        _params: &ContextParams,
+    ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+        Ok(())
+    }
+
+    fn delete_published(
+        &self,
+        _context_id: &[u8; 32],
+    ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+        Ok(())
+    }
+
+    fn send_message(
+        &self,
+        context_id: &[u8; 32],
+        encrypted_payload: &[u8],
+    ) -> Result<(), crate::context::ContextError> {
+        if *context_id == self.expected_routing && !encrypted_payload.is_empty() {
+            self.saw_broadcast
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        Ok(())
+    }
+}
+
+/// Builds Alice's creator supervisor wired to a caller-supplied transport (so a
+/// test can observe the outbound Commit broadcast). Mirrors [`alice_supervisor`]
+/// otherwise.
+fn alice_supervisor_with_transport(
+    transport: Box<dyn ContextTransportProvider>,
+) -> (Arc<Supervisor>, Arc<MlsCryptoProvider>) {
+    let crypto = Arc::new(MlsCryptoProvider::new(
+        ALICE_DID.to_owned(),
+        std::sync::Arc::new(scp_clock::SystemClock),
+    ));
+    let event_log: Box<dyn ContextEventLogProvider> = Box::new(MerkleEventLogProvider::new());
+    let sup = Supervisor::with_providers(
+        Arc::clone(&crypto),
+        transport,
+        event_log,
+        pair_resolver(),
+        None,
+        None,
+        None,
+        None,
+        fresh_mls_storage(),
+    );
+    (sup, crypto)
+}
+
+/// Proves the ROOT fix: `execute_add_member` now broadcasts the epoch-advancing
+/// MLS Commit to the existing members (parity with remove/reset). Before the
+/// fix the add's Commit was only buffered into the broadcast-suppressed
+/// `WelcomeGenerated` event and NEVER hit the transport — so an add into a
+/// multi-member context silently desynced every existing member. Here the
+/// invite routes `AddMember` through the actor; the recording transport must
+/// capture a `send_message` to the context routing id carrying the Commit.
+#[tokio::test]
+async fn invite_member_broadcasts_the_add_commit_to_existing_members() {
+    let ctx_id = ctx_hex(0xd6);
+    let alice = DID::from(ALICE_DID);
+    let bob = DID::from(BOB_DID);
+
+    let want_routing = scp_protocol::context::context_routing_id(&ctx_id);
+    let saw_broadcast = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let transport = BroadcastWatchTransport {
+        expected_routing: want_routing,
+        saw_broadcast: Arc::clone(&saw_broadcast),
+    };
+    let (alice_sup, _alice_crypto) = alice_supervisor_with_transport(Box::new(transport));
+    alice_sup
+        .create_context(
+            ctx_id.clone(),
+            joiner_params(),
+            alice.clone(),
+            some_pseudonym(),
+        )
+        .await
+        .expect("alice creates the encrypted context");
+
+    let (bob_sup, _bob_crypto) = bob_supervisor(None);
+    let (_reservation_id, kp_public_bytes) = reserve_bob_kp(&bob_sup, &bob).await;
+
+    let outcome = alice_sup
+        .invite_member(
+            ctx_id.clone(),
+            alice.clone(),
+            bob.clone(),
+            kp_public_bytes,
+            vec![],
+            &alice_signing_key(),
+        )
+        .await
+        .expect("alice invites bob");
+    assert!(
+        matches!(outcome, InviteMemberOutcome::Sealed { .. }),
+        "SingleAdmin invite seals a bundle"
+    );
+
+    // The add's Commit must have been broadcast to the context routing id.
+    assert!(
+        saw_broadcast.load(std::sync::atomic::Ordering::SeqCst),
+        "the in-actor governance add must broadcast its epoch Commit to existing \
+         members (a non-empty send_message to the context routing id)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test M3 — auth by construction: a voting context refuses the invite.
+// ---------------------------------------------------------------------------
+
+/// A voting governance model (`Threshold`) does NOT authorize a unilateral
+/// invite. `invite_member` refuses BEFORE proposing — it does NOT create a
+/// dead-on-arrival pending proposal — and returns
+/// `Err(ContextError::InvalidState)` because governed-context invitations are
+/// not yet implemented, adding NO member (no sealed bundle, no MLS add, no
+/// proposal). This is the structural auth gate: an honest error, not a
+/// phantom-success outcome that drops the invite while claiming a deferral.
+#[tokio::test]
+async fn invite_member_into_voting_context_is_rejected() {
+    let ctx_id = ctx_hex(0xd7);
+    let alice = DID::from(ALICE_DID);
+    let bob = DID::from(BOB_DID);
+
+    let voting_params = ContextParams {
+        governance: GovernanceModel::Threshold {
+            threshold: 2,
+            signers: vec![alice.clone(), bob.clone()],
+        },
+        ..joiner_params()
+    };
+
+    let (alice_sup, _alice_crypto) = alice_supervisor();
+    alice_sup
+        .create_context(
+            ctx_id.clone(),
+            voting_params,
+            alice.clone(),
+            some_pseudonym(),
+        )
+        .await
+        .expect("alice creates the voting context");
+
+    let (bob_sup, _bob_crypto) = bob_supervisor(None);
+    let (_reservation_id, kp_public_bytes) = reserve_bob_kp(&bob_sup, &bob).await;
+
+    let err = alice_sup
+        .invite_member(
+            ctx_id.clone(),
+            alice.clone(),
+            bob.clone(),
+            kp_public_bytes,
+            vec![],
+            &alice_signing_key(),
+        )
+        .await
+        .expect_err("a voting context refuses a unilateral invite with an error");
+
+    // The refusal is an honest `InvalidState` error — no phantom-success
+    // outcome, no proposal, no member.
+    assert!(
+        matches!(err, crate::context::ContextError::InvalidState(_)),
+        "a unilateral invite into a voting context is refused with InvalidState; got {err:?}"
+    );
+    // No member was added — the add did not run.
+    assert_eq!(
+        alice_sup.member_count(&ctx_id).await,
+        Some(1),
+        "the refused invite adds NO member to the voting context"
+    );
+    // And NO proposal was created: the SingleAdmin-only gate returns before any
+    // governance proposal is submitted, so the context has zero pending
+    // proposals.
+    assert!(
+        alice_sup
+            .list_proposals(&ctx_id)
+            .await
+            .expect("listing proposals succeeds")
+            .is_empty(),
+        "the refused invite creates NO governance proposal"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test M4 — auth by construction: a non-admin caller cannot invite.
+// ---------------------------------------------------------------------------
+
+/// A non-admin caller inviting into a `SingleAdmin` context is rejected by the
+/// governance gate (`propose_governance_action_checked` verifies the proposer's
+/// `governance:propose` capability, and `SingleAdminEngine::propose` rejects any
+/// non-admin proposer). `invite_member` returns `Err` and adds NO member —
+/// authorization is a property of the governance gate, not an ad-hoc check.
+#[tokio::test]
+async fn invite_member_by_non_admin_is_rejected() {
+    let ctx_id = ctx_hex(0xd8);
+    let alice = DID::from(ALICE_DID);
+    let bob = DID::from(BOB_DID);
+
+    // Alice creates the SingleAdmin context (she is the admin).
+    let (alice_sup, _alice_crypto) = alice_supervisor();
+    alice_sup
+        .create_context(
+            ctx_id.clone(),
+            joiner_params(),
+            alice.clone(),
+            some_pseudonym(),
+        )
+        .await
+        .expect("alice creates the encrypted SingleAdmin context");
+
+    // Bob (NOT the admin, not even a member) reserves a KeyPackage and attempts
+    // to invite himself using HIS OWN signing key as the proposer.
+    let (bob_sup, _bob_crypto) = bob_supervisor(None);
+    let (_reservation_id, kp_public_bytes) = reserve_bob_kp(&bob_sup, &bob).await;
+
+    let result = alice_sup
+        .invite_member(
+            ctx_id.clone(),
+            bob.clone(),
+            bob.clone(),
+            kp_public_bytes,
+            vec![],
+            &bob_signing_key(),
+        )
+        .await;
+
+    assert!(
+        result.is_err(),
+        "a non-admin caller must not be able to invite into a SingleAdmin context; got {result:?}"
+    );
+    // No member was added — the governance gate rejected before the add ran.
+    assert_eq!(
+        alice_sup.member_count(&ctx_id).await,
+        Some(1),
+        "a rejected non-admin invite adds NO member"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test M5 — no zombie member on a post-add sealing/delivery failure (FIX 4).
+// ---------------------------------------------------------------------------
+
+/// A transport that BROADCASTS successfully (so the add's epoch Commit is
+/// delivered and the add itself succeeds) but whose invitation delivery
+/// (`send_to_routing_id`) returns a FATAL (non-`TransportFailed`) error. This
+/// drives the post-add failure path: the invitee is really added, but the sealed
+/// Welcome can never be delivered.
+struct FatalDeliveryTransport;
+
+impl ContextTransportProvider for FatalDeliveryTransport {
+    fn is_connected(&self) -> bool {
+        true
+    }
+
+    fn publish_context(
+        &self,
+        _context_id: &[u8; 32],
+        _params: &ContextParams,
+    ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+        Ok(())
+    }
+
+    fn delete_published(
+        &self,
+        _context_id: &[u8; 32],
+    ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+        Ok(())
+    }
+
+    // Commit broadcast succeeds (so both the add and the compensating remove
+    // deliver their epoch Commits without enqueuing).
+    fn send_message(
+        &self,
+        _context_id: &[u8; 32],
+        _encrypted_payload: &[u8],
+    ) -> Result<(), crate::context::ContextError> {
+        Ok(())
+    }
+
+    // Invitation delivery fails FATALLY (not `TransportFailed`), so the invitee
+    // gets nothing — this is the case that must trigger the compensating remove.
+    fn send_to_routing_id(
+        &self,
+        _routing_id: &[u8; 32],
+        _payload: &[u8],
+        _ttl: u32,
+    ) -> Result<(), crate::context::ContextError> {
+        Err(crate::context::ContextError::CryptoFailed(
+            "fatal invitation delivery failure (test)".to_owned(),
+        ))
+    }
+}
+
+/// Proves FIX 4: after the governance add commits (real MLS add + role_state +
+/// broadcast Commit), a FATAL failure in the invitation sealing/delivery path
+/// must NOT leave a zombie member behind. `invite_member` dispatches a
+/// compensating `RemoveMember` through the same actor governance gate (which
+/// broadcasts its own Commit) and surfaces the original error, so the group is
+/// restored to its pre-invite membership.
+#[tokio::test]
+async fn invite_member_rolls_back_the_add_on_delivery_failure() {
+    let ctx_id = ctx_hex(0xd9);
+    let alice = DID::from(ALICE_DID);
+    let bob = DID::from(BOB_DID);
+
+    let (alice_sup, _alice_crypto) =
+        alice_supervisor_with_transport(Box::new(FatalDeliveryTransport));
+    alice_sup
+        .create_context(
+            ctx_id.clone(),
+            joiner_params(),
+            alice.clone(),
+            some_pseudonym(),
+        )
+        .await
+        .expect("alice creates the encrypted context");
+
+    let (bob_sup, _bob_crypto) = bob_supervisor(None);
+    let (_reservation_id, kp_public_bytes) = reserve_bob_kp(&bob_sup, &bob).await;
+
+    let result = alice_sup
+        .invite_member(
+            ctx_id.clone(),
+            alice.clone(),
+            bob.clone(),
+            kp_public_bytes,
+            vec![],
+            &alice_signing_key(),
+        )
+        .await;
+
+    // The fatal delivery error is surfaced to the caller.
+    assert!(
+        result.is_err(),
+        "a fatal post-add delivery failure surfaces as an error; got {result:?}"
+    );
+    // And the added member was rolled back — no zombie. The compensating remove
+    // ran through the actor governance gate, so the creator's membership is back
+    // to just alice.
+    assert_eq!(
+        alice_sup.member_count(&ctx_id).await,
+        Some(1),
+        "the compensating remove rolls back the added member — no zombie member remains"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test N — BLACK-2J10-001-R creator-substitution regression (§5.13.3 rule 8).
+// ---------------------------------------------------------------------------
+
+/// An honest SingleAdmin context commits `creator_did = Alice` into its `0xFF02`
+/// group-context extension. Mallory (an in-group member) forges an invitation
+/// bundle that names HERSELF as `creator_did`, signs it with her OWN key (which
+/// the resolver resolves, so the bundle signature verifies), and carries Alice's
+/// REAL params — so every bundle check passes. The join is nonetheless REJECTED
+/// by the §5.13.3 rule-8 creator binding (`bundle.creator_did` != the committed
+/// genesis creator), BEFORE any `SingleAdminEngine(Mallory)` is built or any
+/// crypto is installed.
+///
+/// Without the creator binding this attack succeeds: `GovernanceModel::SingleAdmin`
+/// is a DID-less unit variant, so `governance_policy_hash` is a CONSTANT that
+/// matches regardless of who the admin is — no other §5.13.3 rule catches the
+/// substitution, and `build_welcome_joiner_state` would install Mallory as the
+/// context admin.
+#[tokio::test]
+async fn spawn_from_welcome_rejects_creator_substitution_before_admin_install() {
+    let bob = DID::from(BOB_DID);
+    let ctx_id = ctx_hex(0x9e);
+    let ctx_bytes = context_id_to_bytes(&ctx_id);
+    // Default governance is SingleAdmin (a DID-less unit variant) — the vulnerable
+    // case whose `governance_policy_hash` commits no identity.
+    let params = joiner_params();
+    assert!(
+        matches!(params.governance, GovernanceModel::SingleAdmin),
+        "the regression targets the DID-less SingleAdmin governance model"
+    );
+
+    // Bob's joiner supervisor with a resolver that also resolves Mallory, so her
+    // self-signed bundle passes the signature check and the rule-8 binding is the
+    // sole reason for rejection.
+    let (sup, bob_crypto) = bob_supervisor_with_resolver(None, trio_resolver());
+    let (reservation_id, kp_public_bytes) = reserve_bob_kp(&sup, &bob).await;
+
+    // Alice creates the honest SCP group (its `0xFF02` extension commits
+    // creator = Alice via `honest_ext`) and adds Bob's reserved KP, producing the
+    // real Welcome. The committed extension rides through the add Commit unchanged
+    // as part of the group's cryptographic identity, so it still binds creator =
+    // Alice regardless of who issued the add.
+    let alice_crypto = Arc::new(MlsCryptoProvider::new(
+        ALICE_DID.to_owned(),
+        std::sync::Arc::new(scp_clock::SystemClock),
+    ));
+    alice_crypto
+        .create_mls_group_with_context(&ctx_bytes, &honest_ext(&ctx_id, &params))
+        .expect("alice creates the honest SCP context group committing creator=Alice");
+    let add_output = alice_crypto
+        .add_member(&ctx_bytes, BOB_DID, Some(&kp_public_bytes))
+        .expect("alice adds bob's reserved key package");
+
+    // Mallory's forged bundle: creator_did = Mallory, signed with Mallory's key,
+    // params = Alice's REAL params. Hints == Mallory so the HPKE open succeeds and
+    // the §5.13.3 rule-8 binding is what rejects (not the open or the signature).
+    let mallory = DID::from(MALLORY_DID);
+    let (bob_custody, bob_handle, bob_recipient) = bob_active_custody().await;
+    let bundle = signed_bundle(
+        &mallory_signing_key(),
+        &mallory,
+        &ctx_id,
+        &params,
+        add_output.welcome_bytes,
+    );
+    let req = seal_bundle(
+        &bundle,
+        &bob_recipient,
+        &ctx_id,
+        &mallory,
+        reservation_id,
+        some_pseudonym(),
+    );
+
+    let err = sup
+        .spawn_actor_from_welcome(bob, &bob_custody, &bob_handle, req)
+        .await
+        .expect_err("a creator-substituted bundle must be rejected");
+
+    // The rejection is the §5.13.3 rule-8 creator-DID binding (surfaced as a
+    // CryptoFailed carrying the `0xFF02` binding-mismatch reason).
+    assert!(
+        matches!(err, crate::context::ContextError::CryptoFailed(_)),
+        "expected CryptoFailed for the creator-binding rejection, got {err:?}"
+    );
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("creator DID mismatch") && msg.contains("0xFF02"),
+        "expected a §5.13.3 rule-8 creator-binding rejection naming 0xFF02, got: {msg}"
+    );
+
+    // No `SingleAdminEngine(Mallory)`: the binding check fires BEFORE
+    // `install_joined_group` and `build_welcome_joiner_state` (which builds the
+    // governance engine from `creator_did`), so NO context actor is registered
+    // and Bob's crypto provider has NO installed group for this id.
+    assert!(
+        sup.lookup(&ctx_id).is_none(),
+        "no context actor may be registered for a creator-substituted join — \
+         build_welcome_joiner_state (and SingleAdminEngine::new) never ran"
+    );
+    assert_eq!(
+        sup.member_count(&ctx_id).await,
+        None,
+        "an unregistered context yields None member_count — no admin was installed"
+    );
+    assert!(
+        bob_crypto
+            .export_crypto_state(&ctx_bytes)
+            .expect("export never errors")
+            .is_empty(),
+        "no MLS group may be installed after a creator-binding rejection"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// FIX 1 (BLACK-2JF-01) — `discard_joined_context` is a COMPLETE teardown.
+// ---------------------------------------------------------------------------
+
+/// The FFI compensating path (a post-irreversible-commit join step failing —
+/// e.g. a concurrent close/leave removed the bridge state before the
+/// authenticated ceiling could be synced) must FULLY reverse what
+/// `spawn_actor_from_welcome` materialized, not merely drop the in-memory actor
+/// handle. `discard_joined_context` removes the actor AND destroys the resident
+/// MLS crypto group AND deletes the durable Class-S snapshot the join persisted,
+/// mirroring the entrypoint's OWN post-consume rollback arms. A bare
+/// `despawn_actor` would leave the crypto group + snapshot behind, so on restart
+/// the "torn-down" context would RESURRECT (FFI/runtime divergence) and the
+/// residual snapshot would block a fresh re-join via the durable
+/// first-writer-wins precheck (Precheck D).
+///
+/// This drives a REAL happy-path join (installs a group, registers an actor,
+/// persists a snapshot into the shared recording store), asserts all three
+/// pieces of state exist, then calls `discard_joined_context` and asserts each
+/// is fully reversed: no actor handle remains, the crypto group is destroyed,
+/// and no durable snapshot remains — so a subsequent restore (which reads
+/// `load_context`) finds NOTHING to resurrect.
+#[tokio::test]
+async fn discard_joined_context_fully_reverses_a_welcome_join() {
+    let rec = RecordingPersistence::default();
+    let (result, j) = join_bob(0x6d, Some(Box::new(rec.clone()))).await;
+    result.expect("the happy-path join succeeds");
+
+    // --- Pre-teardown: all three pieces of join state are present. ---
+    assert!(
+        j.sup.lookup(&j.ctx_id).is_some(),
+        "a live context actor is registered for the joiner"
+    );
+    assert!(
+        !j.bob_crypto
+            .export_crypto_state(&j.ctx_bytes)
+            .expect("export never errors")
+            .is_empty(),
+        "the joined MLS group is resident in the crypto provider"
+    );
+    assert!(
+        rec.load_context(&j.ctx_id)
+            .expect("load never errors")
+            .is_some(),
+        "the join persisted an initial Class-S snapshot"
+    );
+
+    // --- COMPLETE teardown (the FFI compensating path). ---
+    let removed = j.sup.discard_joined_context(&j.ctx_id).await;
+    assert!(
+        removed,
+        "discard_joined_context reports it removed the live actor handle"
+    );
+
+    // 1. Actor handle gone — no orphaned live actor lingers.
+    assert!(
+        j.sup.lookup(&j.ctx_id).is_none(),
+        "the actor handle is removed"
+    );
+    assert_eq!(
+        j.sup.member_count(&j.ctx_id).await,
+        None,
+        "an unregistered context yields None member_count (the mailbox is gone)"
+    );
+
+    // 2. Crypto group destroyed — a bare `despawn_actor` would leave it
+    //    resident (`export_crypto_state` returns EMPTY for an absent context).
+    assert!(
+        j.bob_crypto
+            .export_crypto_state(&j.ctx_bytes)
+            .expect("export never errors")
+            .is_empty(),
+        "the resident MLS group is destroyed"
+    );
+
+    // 3. Durable snapshot deleted → a restore finds NOTHING to resurrect and
+    //    Precheck D no longer blocks a fresh re-join. The delete was actually
+    //    issued to the backend (recorded), and a subsequent load is empty.
+    assert!(
+        rec.load_context(&j.ctx_id)
+            .expect("load never errors")
+            .is_none(),
+        "no durable snapshot remains — a restore cannot resurrect the context"
+    );
+    assert!(
+        rec.deletes.contains(&j.ctx_id),
+        "the snapshot delete was issued to the persistence backend"
+    );
 }

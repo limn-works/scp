@@ -56,9 +56,11 @@ import type {
   ChallengeVerification,
   ConsequenceRule,
   EventLogEntry,
+  InviteMemberOutcome,
   ParticipationProfile,
   RequireParticipation,
   SagaResult,
+  SealedInvitation,
   ThresholdRequirement,
   TrustEvaluation,
 } from "./types";
@@ -422,6 +424,30 @@ export interface ReconnectReport {
   readonly messagesDiscarded: number;
   /** Total reconnection duration in milliseconds. */
   readonly totalDurationMs: number;
+}
+
+/**
+ * The opaque `(reservationId, keyPackagePublic)` pair returned by
+ * {@link SCP.reserveKeyPackage} (ADR-049 Phase 2J).
+ *
+ * The joiner's private signer state never leaves the native core — only the
+ * PUBLIC `KeyPackage` bytes cross the FFI boundary. Hand `keyPackagePublic` to
+ * the context creator (out of band) so it can mint a Welcome addressed to this
+ * reservation, then pass `reservationId` back to
+ * {@link SCP.contextJoinFromWelcome}.
+ */
+export interface KeyPackageReservation {
+  /**
+   * Opaque reservation id — a lookup key, not a capability. Pass back to
+   * {@link SCP.contextJoinFromWelcome} for the Welcome this `KeyPackage`
+   * addresses.
+   */
+  readonly reservationId: string;
+  /**
+   * PUBLIC MLS `KeyPackage` bytes to hand (out of band) to the context creator,
+   * who adds them to its MLS group to mint the addressed Welcome.
+   */
+  readonly keyPackagePublic: Uint8Array;
 }
 
 /**
@@ -1095,6 +1121,196 @@ export class SCP {
     );
     const { Context: ContextCls } = await import("./context");
     return ContextCls._fromHandle(this, raw as never, identity.did);
+  }
+
+  /**
+   * Reserves a pooled MLS `KeyPackage` under the joiner's own identity for a
+   * spawn-from-Welcome join (ADR-049 Phase 2J).
+   *
+   * The join-side peer of {@link contextCreate}: a node that intends to JOIN by
+   * receiving a Welcome first reserves a single-use `KeyPackage` under its own
+   * identity. The returned PUBLIC bytes are handed (out of band) to the context
+   * creator, who mints a Welcome addressed to this reservation; the
+   * `reservationId` is passed back to {@link contextJoinFromWelcome}. The
+   * joiner's private signer state never leaves the native core.
+   *
+   * @param owningDid The joiner's own DID. MUST be a locally-custodied identity
+   *   (same trust model as {@link contextCreate}); a non-custodied DID fails
+   *   closed with `SCP-IDENT-1001`.
+   * @returns The opaque `{ reservationId, keyPackagePublic }` pair.
+   *
+   * @example
+   * const reservation = await scp.reserveKeyPackage(joiner.did);
+   * // Hand reservation.keyPackagePublic to the creator out of band; it seals a
+   * // signed invitation bundle addressed to this reservation via
+   * // `scp.inviteMember(...)`, which you then open:
+   * const ctx = await scp.contextJoinFromWelcome(
+   *   joiner.did,
+   *   sealed, // the SealedInvitation from the creator's `inviteMember`
+   *   reservation.reservationId,
+   * );
+   */
+  async reserveKeyPackage(owningDid: string): Promise<KeyPackageReservation> {
+    const raw = await (
+      this.#native.reserveKeyPackage as (
+        d: string,
+      ) => Promise<{ reservationId: string; keyPackagePublic: ArrayLike<number> }>
+    )(owningDid);
+    return {
+      reservationId: raw.reservationId,
+      keyPackagePublic: new Uint8Array(raw.keyPackagePublic),
+    };
+  }
+
+  /**
+   * Joins an existing SCP context by opening a received sealed, signed
+   * invitation bundle, standing the local (joiner) identity up as a send-capable
+   * participant (ADR-049 Phase 2J; FFI-02 Option A).
+   *
+   * Completes the reserve → invite → join handshake begun by
+   * {@link reserveKeyPackage}: given the {@link SealedInvitation} the creator
+   * produced with {@link inviteMember}, this opens and AUTHENTICATES the bundle,
+   * installs the joined MLS group, derives the joiner's §9.10.4 routing pseudonym
+   * from its locally-custodied identity (never caller-supplied), and returns an
+   * active {@link Context} rebuilt from the AUTHENTICATED bundle params. Without
+   * it a Welcome-joined node can DECRYPT but cannot SEND. A non-custodied joiner
+   * hard-fails before the single-use `KeyPackage` is consumed.
+   *
+   * The joiner supplies NO loose `params`/`welcomeBytes`: the authoritative
+   * genesis params + MLS Welcome travel INSIDE the signed `sealed` bundle, which
+   * the native core opens and verifies. `sealed.contextId` / `sealed.creatorDid`
+   * are UNTRUSTED binding hints only — authority derives from the signed bundle.
+   *
+   * @param owningDid The joiner's own DID (the reservation holder).
+   * @param sealed The {@link SealedInvitation} bundle produced by the creator's
+   *   {@link inviteMember} and delivered to this joiner.
+   * @param reservationId The id returned by {@link reserveKeyPackage} for the
+   *   `KeyPackage` this bundle addresses.
+   * @returns An active {@link Context} for the joined context.
+   *
+   * @example
+   * const ctx = await scp.contextJoinFromWelcome(
+   *   joiner.did,
+   *   outcome.bundle, // the SealedInvitation from the creator's `inviteMember`
+   *   reservation.reservationId,
+   * );
+   */
+  async contextJoinFromWelcome(
+    owningDid: string,
+    sealed: SealedInvitation,
+    reservationId: string,
+  ): Promise<Context> {
+    // napi surfaces the bundle's `enc`/`ciphertext` as Rust `Vec<u8>` fields;
+    // marshal them to plain number[] on the wire (the same normalization the
+    // reserve/import byte paths use), never a Uint8Array the napi Vec<u8>
+    // deserializer would reject.
+    const nativeSealed = {
+      contextId: sealed.contextId,
+      creatorDid: sealed.creatorDid,
+      enc: Array.from(sealed.enc),
+      ciphertext: Array.from(sealed.ciphertext),
+    };
+    const raw = await (
+      this.#native.contextJoinFromWelcome as (
+        o: string,
+        s: {
+          contextId: string;
+          creatorDid: string;
+          enc: readonly number[];
+          ciphertext: readonly number[];
+        },
+        r: string,
+      ) => Promise<unknown>
+    )(owningDid, nativeSealed, reservationId);
+    const { Context: ContextCls } = await import("./context");
+    return ContextCls._fromHandle(this, raw as never, owningDid);
+  }
+
+  /**
+   * Invites a member to an existing context, producing a sealed, signed
+   * invitation bundle (ADR-049 Phase 2J; FFI-02 Option A).
+   *
+   * The creator (or admin) seals the context's genesis params + MLS Welcome for
+   * the invitee under RFC 9180 HPKE, binding them to the invitee's `KeyPackage`.
+   * Only a `SingleAdmin` context is supported today: the invite is unilateral
+   * and returns an {@link InviteMemberOutcome} whose `bundle` is the sealed
+   * {@link SealedInvitation} — pass it straight to the invitee's
+   * {@link contextJoinFromWelcome} (no re-assembly). A voting-governed context
+   * THROWS (governed-context invitations are not yet implemented).
+   *
+   * The invite routes through the actor governance gate, which requires the
+   * inviter to hold the `governance:propose` capability. A normally-created
+   * `SingleAdmin` context grants its admin that capability at genesis, so it
+   * works out of the box; a context with a custom ceiling must grant
+   * `governance:propose` to the inviter.
+   *
+   * `creatorDid` MUST be a locally-custodied identity; the invite is signed
+   * under its `#active` key.
+   *
+   * @param contextId The context to invite the member into.
+   * @param creatorDid The inviting creator/admin DID (locally custodied).
+   * @param inviteeDid The DID of the member being invited.
+   * @param inviteeKeyPackage The invitee's PUBLIC MLS `KeyPackage` bytes (from
+   *   the invitee's {@link reserveKeyPackage}).
+   * @param relayUrls Relay URLs the runtime may publish the sealed bundle to.
+   * @returns The {@link InviteMemberOutcome} — the sealed `bundle` plus the
+   *   `delivered` flag.
+   *
+   * @example
+   * const outcome = await scp.inviteMember(
+   *   ctx.contextId,
+   *   creator.did,
+   *   invitee.did,
+   *   reservation.keyPackagePublic,
+   *   [],
+   * );
+   * // `outcome.bundle` is directly usable — no manual re-assembly:
+   * const joined = await joinerScp.contextJoinFromWelcome(
+   *   invitee.did,
+   *   outcome.bundle,
+   *   reservationId,
+   * );
+   */
+  async inviteMember(
+    contextId: string,
+    creatorDid: string,
+    inviteeDid: string,
+    inviteeKeyPackage: Uint8Array | readonly number[],
+    relayUrls: readonly string[],
+  ): Promise<InviteMemberOutcome> {
+    const keyPackageArray = ArrayBuffer.isView(inviteeKeyPackage)
+      ? Array.from(inviteeKeyPackage as Uint8Array)
+      : (inviteeKeyPackage as readonly number[]);
+    const raw = await (
+      this.#native.inviteMember as (
+        ctx: string,
+        c: string,
+        i: string,
+        kp: readonly number[],
+        r: readonly string[],
+      ) => Promise<{
+        bundle: {
+          contextId: string;
+          creatorDid: string;
+          enc: ArrayLike<number>;
+          ciphertext: ArrayLike<number>;
+        };
+        delivered: boolean;
+      }>
+    )(contextId, creatorDid, inviteeDid, keyPackageArray, relayUrls);
+
+    // Project the flat napi object into the SDK outcome. The `bundle` is a
+    // SealedInvitation directly usable as the join input. A voting-governed
+    // context does not reach here — the native bridge throws for it.
+    return {
+      bundle: {
+        contextId: raw.bundle.contextId,
+        creatorDid: raw.bundle.creatorDid,
+        enc: new Uint8Array(raw.bundle.enc),
+        ciphertext: new Uint8Array(raw.bundle.ciphertext),
+      },
+      delivered: raw.delivered,
+    };
   }
 
   async contextJoin(

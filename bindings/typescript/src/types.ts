@@ -478,6 +478,63 @@ export type GovernanceActionResult =
   | "Executed";
 
 // ---------------------------------------------------------------------------
+// Invitations (ADR-049 Phase 2J / FFI-02 Option A)
+// ---------------------------------------------------------------------------
+
+/**
+ * A sealed, signed context invitation bundle produced by
+ * {@link SCP.inviteMember} on the creator side and consumed by
+ * {@link SCP.contextJoinFromWelcome} on the joiner side.
+ *
+ * Flat named-field object mirroring the runtime wire type and the PyO3/UniFFI
+ * reference bridges. `enc` is the RFC 9180 HPKE encapsulated key (32 bytes) and
+ * `ciphertext` is the HPKE ciphertext (`ct = ciphertext || tag`) of the
+ * serialized, signed `InvitationBundle` carrying the authoritative genesis
+ * params + MLS Welcome. Both are opaque bytes — the joiner does not interpret
+ * them; the native core opens the bundle and authenticates it.
+ *
+ * `contextId` / `creatorDid` are UNTRUSTED binding hints used only to rebuild
+ * the HPKE `info`/`aad`; the joiner's authority derives from the signed bundle
+ * after it is opened, never from these fields.
+ */
+export interface SealedInvitation {
+  /** Binding hint: the context id the bundle was sealed for. */
+  readonly contextId: string;
+  /** Binding hint: the creator DID the bundle was sealed by. */
+  readonly creatorDid: string;
+  /** RFC 9180 HPKE encapsulated key (`enc`) — exactly 32 bytes. */
+  readonly enc: Uint8Array;
+  /** RFC 9180 HPKE ciphertext (`ct = ciphertext || tag`). */
+  readonly ciphertext: Uint8Array;
+}
+
+/**
+ * The outcome of {@link SCP.inviteMember}.
+ *
+ * `inviteMember` supports only `SingleAdmin` contexts today: the invite is
+ * unilateral and yields a sealed `bundle` the caller (or transport) delivers to
+ * the invitee. A voting-governed context THROWS instead (governed-context
+ * invitations are not yet implemented) rather than surfacing here.
+ *
+ * `bundle` is directly usable as the `sealed` argument to
+ * {@link SCP.contextJoinFromWelcome} — no re-assembly. Mirrors the runtime
+ * `InviteMemberOutcome` and the PyO3/napi reference bridges' `{ bundle,
+ * delivered }` projection.
+ */
+export interface InviteMemberOutcome {
+  /**
+   * The sealed invitation bundle — pass it directly to
+   * {@link SCP.contextJoinFromWelcome}.
+   */
+  readonly bundle: SealedInvitation;
+  /**
+   * `true` if the native core published the sealed bundle to the invitee's
+   * routing id; `false` if the caller must deliver `bundle`.
+   */
+  readonly delivered: boolean;
+}
+
+// ---------------------------------------------------------------------------
 // Messages
 // ---------------------------------------------------------------------------
 

@@ -43,8 +43,17 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+from dataclasses import dataclass
 from types import TracebackType
-from typing import TYPE_CHECKING, Any, Literal, Protocol, TypedDict, runtime_checkable
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Literal,
+    Protocol,
+    TypeAlias,
+    TypedDict,
+    runtime_checkable,
+)
 
 from scp_sdk.errors import ScpError
 from scp_sdk.types import CustodyType
@@ -73,8 +82,11 @@ logger = logging.getLogger("scp_sdk")
 __all__ = [
     "SCP",
     "InMemoryStorage",
+    "InviteMemberOutcome",
     "KeyCustodyProvider",
     "McpAllowlistState",
+    "Sealed",
+    "SealedInvitation",
     "SqliteStorage",
     "StorageConfig",
 ]
@@ -248,6 +260,65 @@ class SqlitePassphraseStorage(TypedDict):
 StorageConfig = InMemoryStorage | SqliteStorage | SqlitePassphraseStorage
 
 
+@dataclass(frozen=True)
+class SealedInvitation:
+    """A sealed, signed invitation bundle (ADR-049 Phase 2J; FFI-02 Option A).
+
+    The wire artifact produced by :meth:`SCP.invite_member` on the creator
+    side and consumed by :meth:`SCP.context_join_from_welcome` on the joiner
+    side. The authoritative genesis params + MLS Welcome travel *inside* the
+    signed bundle; the joiner does not supply them separately — the runtime
+    opens the bundle under the joiner's key material and authenticates it.
+
+    A flat, frozen, named-field object per the agent-first API tenet, mapping
+    1:1 to the native ``_scp_core.PySealedInvitation`` and to the runtime wire
+    type ``scp_core::context::invitation_helpers::SealedInvitation``.
+
+    Attributes:
+        context_id: Binding hint — the context id the bundle was sealed for.
+        creator_did: Binding hint — the creator DID the bundle was sealed by.
+        enc: RFC 9180 HPKE encapsulated key. Exactly 32 bytes (validated at
+            the join boundary, fail-closed).
+        ciphertext: RFC 9180 HPKE ciphertext (``ct = ciphertext || tag``) of
+            the serialized, signed ``InvitationBundle``. Opaque bytes.
+    """
+
+    context_id: str
+    creator_did: str
+    enc: bytes
+    ciphertext: bytes
+
+
+@dataclass(frozen=True)
+class Sealed:
+    """:meth:`SCP.invite_member` outcome — the invitation was sealed.
+
+    The creator (or admin) sealed the context's genesis params + Welcome for
+    the invitee under RFC 9180 HPKE, bound to the invitee's ``KeyPackage``.
+    Pass :attr:`bundle` straight to the invitee's
+    :meth:`SCP.context_join_from_welcome` (no re-assembly); the runtime may
+    already have published it for delivery — see :attr:`delivered`.
+
+    Attributes:
+        bundle: The sealed :class:`SealedInvitation` — the SAME object the
+            joiner passes to :meth:`SCP.context_join_from_welcome`.
+        delivered: ``True`` if the runtime published the sealed bundle to the
+            invitee's routing id; ``False`` if the caller must deliver it.
+    """
+
+    bundle: SealedInvitation
+    delivered: bool
+
+
+# The outcome of :meth:`SCP.invite_member`. Today the only outcome is a sealed
+# bundle (:class:`Sealed`); a voting-governed context RAISES instead
+# (governed-context invitations are not yet implemented). Kept as an alias
+# (rather than bare ``Sealed``) so a future governed-invite outcome is added
+# additively as a union member without breaking callers that annotate against
+# :data:`InviteMemberOutcome`.
+InviteMemberOutcome: TypeAlias = Sealed
+
+
 def _native_mod() -> Any:
     """Return the ``_scp_core`` PyO3 extension module.
 
@@ -288,6 +359,42 @@ def _native_cls() -> Any:
             code="SCP-UNKNOWN-0001",
         )
     return cls
+
+
+def _to_native_sealed(sealed: SealedInvitation) -> Any:
+    """Project an SDK :class:`SealedInvitation` into the native pyclass.
+
+    The PyO3 :meth:`context_join_from_welcome` entry point extracts a typed
+    ``_scp_core.PySealedInvitation`` argument (not a loose dict), so the wrapper
+    reconstructs the native bundle from the SDK dataclass's four wire fields.
+    """
+    mod = _native_mod()
+    return mod.PySealedInvitation(
+        sealed.context_id,
+        sealed.creator_did,
+        sealed.enc,
+        sealed.ciphertext,
+    )
+
+
+def _to_invite_outcome(raw: Any) -> InviteMemberOutcome:
+    """Map the native ``PyInviteMemberOutcome`` to the SDK :class:`Sealed`.
+
+    The native outcome carries a ``bundle`` (a native ``PySealedInvitation``)
+    and a ``delivered`` flag. The bundle is projected into the SDK
+    :class:`SealedInvitation` dataclass so it is directly usable as the
+    ``sealed`` argument to :meth:`SCP.context_join_from_welcome`.
+    """
+    native_bundle = raw.bundle
+    return Sealed(
+        bundle=SealedInvitation(
+            context_id=native_bundle.context_id,
+            creator_did=native_bundle.creator_did,
+            enc=native_bundle.enc,
+            ciphertext=native_bundle.ciphertext,
+        ),
+        delivered=raw.delivered,
+    )
 
 
 class SCP:
@@ -940,6 +1047,199 @@ class SCP:
         return await asyncio.to_thread(
             self._native.context_join, handle, identity_did, spending_ucan_jwt
         )
+
+    async def reserve_key_package(self, owning_did: str) -> tuple[str, bytes]:
+        """Reserve a single-use MLS ``KeyPackage`` to be invited into a context.
+
+        First step of the reserve -> Welcome -> join handshake (ADR-049 Phase
+        2J). ``owning_did`` MUST be a locally-custodied identity — the same
+        trust model as :meth:`context_create`. Only the PUBLIC ``KeyPackage``
+        bytes cross the FFI boundary; the private signer state never leaves the
+        node's ``KeyPackage`` actor.
+
+        Hand the returned ``key_package_public`` bytes to the context creator
+        (out of band). The creator mints an MLS Welcome addressed to that
+        ``KeyPackage`` and returns it; complete the join by passing the Welcome
+        and the returned ``reservation_id`` to
+        :meth:`context_join_from_welcome`.
+
+        Example::
+
+            reservation_id, key_package_public = await scp.reserve_key_package(
+                joiner.did
+            )
+            # ... hand key_package_public to the creator; the creator calls
+            # invite_member(...) and returns the resulting SealedInvitation ...
+            ctx = await scp.context_join_from_welcome(
+                joiner.did, sealed, reservation_id
+            )
+
+        Args:
+            owning_did: DID of the LOCAL identity reserving the ``KeyPackage``.
+
+        Returns:
+            A ``(reservation_id, key_package_public)`` tuple: the opaque
+            reservation-id string to pass back to
+            :meth:`context_join_from_welcome`, and the public MLS
+            ``KeyPackage`` bytes to hand to the context creator.
+
+        Raises:
+            Exception: If ``owning_did`` is not a locally-custodied identity, or
+                the reservation fails (providers not wired, empty pool).
+
+        Delegates to ``_scp_core.SCP.reserve_key_package``.
+        """
+        return await asyncio.to_thread(self._native.reserve_key_package, owning_did)
+
+    async def context_join_from_welcome(
+        self,
+        owning_did: str,
+        sealed: SealedInvitation,
+        reservation_id: str,
+    ) -> Any:
+        """Join a context from a sealed invitation bundle (returns :class:`Context`).
+
+        Completes the reserve -> invite -> join handshake begun by
+        :meth:`reserve_key_package` (ADR-049 Phase 2J; FFI-02 Option A): given
+        the :class:`SealedInvitation` the creator produced via
+        :meth:`invite_member` for the previously-reserved ``KeyPackage``, the
+        runtime opens the sealed bundle under the joiner's key material,
+        authenticates the creator's signature over the genesis params, installs
+        the joined MLS group, derives the joiner's §9.10.4 routing pseudonym from
+        its locally-custodied identity, and stands the local (joiner) identity up
+        as a send-capable participant with an actor-backed handle. Without it a
+        Welcome-joined node can DECRYPT but cannot SEND.
+
+        The authoritative context params + MLS Welcome travel *inside* the signed
+        bundle — the joiner no longer supplies loose ``params``/``welcome_bytes``.
+        The returned handle reflects the params the creator actually signed, not
+        caller input. ``creator_did`` and ``context_id`` are carried by
+        :class:`SealedInvitation` as binding hints.
+
+        Custody of the JOINER (``owning_did``) is enforced exactly as
+        :meth:`context_create` enforces it for the creator: the routing pseudonym
+        is DERIVED from the joiner's local custody, never caller-supplied, so a
+        non-custodied joiner hard-fails before the single-use ``KeyPackage`` is
+        consumed.
+
+        Example::
+
+            reservation_id, key_package_public = await scp.reserve_key_package(
+                joiner.did
+            )
+            # ... creator calls invite_member(...) → Sealed(bundle, delivered);
+            # hand `outcome.bundle` back to the joiner (no re-assembly) ...
+            ctx = await scp.context_join_from_welcome(
+                joiner.did, outcome.bundle, reservation_id
+            )
+
+        Args:
+            owning_did: DID of the LOCAL (joiner) identity — its custody derives
+                the routing pseudonym.
+            sealed: The :class:`SealedInvitation` bundle (``context_id``,
+                ``creator_did``, ``enc``, ``ciphertext``) produced by the
+                creator's :meth:`invite_member`.
+            reservation_id: The opaque reservation-id string returned by
+                :meth:`reserve_key_package` for the ``KeyPackage`` this bundle's
+                Welcome addresses.
+
+        Returns:
+            A :class:`~scp_sdk.context.Context` in the ``"active"`` state for the
+            joined context, scoped to the joiner (``owning_did``).
+
+        Raises:
+            Exception: If the joiner is not locally custodied, the sealed bundle
+                fails to open or authenticate, the ``enc`` is not 32 bytes, the
+                reservation id is malformed, or the spawn fails (bad/duplicate
+                Welcome, single-use replay, first-writer-wins collision, or
+                fail-closed persist failure).
+
+        Delegates to ``_scp_core.SCP.context_join_from_welcome``.
+        """
+        from scp_sdk.context import Context
+
+        native_sealed = _to_native_sealed(sealed)
+        raw = await asyncio.to_thread(
+            self._native.context_join_from_welcome,
+            owning_did,
+            native_sealed,
+            reservation_id,
+        )
+        return Context(raw, identity_did=owning_did)
+
+    async def invite_member(
+        self,
+        context_id: str,
+        creator_did: str,
+        invitee_did: str,
+        invitee_key_package: bytes,
+        relay_urls: list[str],
+    ) -> InviteMemberOutcome:
+        """Invite a member into a context (ADR-049 Phase 2J; FFI-02 Option A).
+
+        The inviting member (``creator_did``, which MUST be locally custodied)
+        seals the context's genesis params + MLS Welcome for the invitee under
+        RFC 9180 HPKE, binding them to the invitee's ``KeyPackage``, and signs
+        the bundle under its ``#active`` key. The invitee reserves its
+        ``KeyPackage`` via :meth:`reserve_key_package` and hands the public bytes
+        to the inviter out of band.
+
+        Only a ``SingleAdmin`` context is supported today: the invite is
+        unilateral and returns a :class:`Sealed` outcome whose :attr:`~Sealed.bundle`
+        is the :class:`SealedInvitation` — pass it straight to the invitee's
+        :meth:`context_join_from_welcome`. A voting-governed context RAISES
+        (governed-context invitations are not yet implemented).
+
+        The invite routes through the actor governance gate, which requires the
+        inviter to hold the ``governance:propose`` capability. A normally-created
+        ``SingleAdmin`` context grants its admin that capability at genesis, so it
+        works out of the box; a context with a custom ceiling must grant
+        ``governance:propose`` to the inviter.
+
+        Example::
+
+            reservation_id, invitee_kp = await joiner_scp.reserve_key_package(
+                invitee.did
+            )
+            outcome = await scp.invite_member(
+                context_id, creator.did, invitee.did, invitee_kp, []
+            )
+            # `outcome.bundle` is directly usable — no manual re-assembly:
+            ctx = await joiner_scp.context_join_from_welcome(
+                invitee.did, outcome.bundle, reservation_id
+            )
+
+        Args:
+            context_id: The context to invite into.
+            creator_did: The inviting member's DID (locally custodied; the invite
+                is signed under its ``#active`` key).
+            invitee_did: The DID being invited.
+            invitee_key_package: The invitee's TLS-serialized MLS ``KeyPackage``
+                (the public bytes from the invitee's :meth:`reserve_key_package`).
+            relay_urls: Relay URLs to include for the invitee's first contact.
+
+        Returns:
+            A :class:`Sealed` outcome carrying the sealed
+            :attr:`~Sealed.bundle` and the :attr:`~Sealed.delivered` flag.
+
+        Raises:
+            Exception: If the supervisor is not initialized, the inviter is not
+                locally custodied / its signing key cannot be resolved, the
+                context is unknown, the context is voting-governed (governed-context
+                invitations are not yet implemented), the inviter is unauthorized,
+                or the ``KeyPackage`` is invalid.
+
+        Delegates to ``_scp_core.SCP.invite_member``.
+        """
+        raw = await asyncio.to_thread(
+            self._native.invite_member,
+            context_id,
+            creator_did,
+            invitee_did,
+            invitee_key_package,
+            relay_urls,
+        )
+        return _to_invite_outcome(raw)
 
     async def context_leave(self, handle: Any, identity_did: str) -> Any:
         """Delegate to ``_scp_core.SCP.context_leave``."""

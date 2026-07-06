@@ -449,6 +449,31 @@ ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
         "typescript": ["reconnect"],
         "kotlin": ["reconnect"],
     },
+    # Context -- ADR-049 Phase 2J joiner handshake.
+    #
+    # reserve_key_package NEEDS an explicit mapping: its auto-generated
+    # domain-prefixed candidate is context_reserve_key_package, which does not
+    # match the real SDK symbols (reserve_key_package / reserveKeyPackage).
+    #
+    # join_from_welcome needs NO entry: the auto-generated domain_snake for
+    # ("Context", "join_from_welcome") is already context_join_from_welcome
+    # (single prefix), so it matches the real symbols with no alias required.
+    ("Context", "reserve_key_package"): {
+        "python": ["reserve_key_package"],
+        "typescript": ["reserveKeyPackage"],
+        "kotlin": ["reserveKeyPackage"],
+        "swift": ["reserveKeyPackage"],
+    },
+    # invite_member (ADR-049 Phase 2J / FFI-02 Option A) NEEDS an explicit
+    # mapping: its auto-generated domain-prefixed candidate is
+    # context_invite_member, which does not match the real SDK symbols
+    # (invite_member / inviteMember). Peer of reserve_key_package above.
+    ("Context", "invite_member"): {
+        "python": ["invite_member"],
+        "typescript": ["inviteMember"],
+        "kotlin": ["inviteMember"],
+        "swift": ["inviteMember"],
+    },
     ("Context", "set_economic_policy"): {
         "python": ["set_economic_policy"],
     },

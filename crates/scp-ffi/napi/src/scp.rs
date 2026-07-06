@@ -32,8 +32,9 @@ use scp_identity::DidMethod as _;
 use napi::bindgen_prelude::Buffer;
 
 use crate::context::{
-    NapiAssetEntry, NapiBatchPublishResult, NapiContextHandle, NapiEvaluationResult, NapiMessage,
-    NapiPublishResult,
+    NapiAssetEntry, NapiBatchPublishResult, NapiContextHandle, NapiEvaluationResult,
+    NapiInviteMemberOutcome, NapiKeyPackageReservation, NapiMessage, NapiPublishResult,
+    NapiSealedInvitation,
 };
 use crate::error::{ScpNapiError, validate_custody_type};
 use crate::event_log::{NapiCheckpoint, NapiEvent, NapiProof};
@@ -2060,6 +2061,81 @@ impl Scp {
     ) -> napi::Result<NapiContextHandle> {
         crate::napi_check_handle!(&self.inner.core, identity);
         crate::context::context_create_on(&self.inner, identity, params_json).await
+    }
+
+    /// Reserves a pooled MLS `KeyPackage` under the owning identity for a
+    /// spawn-from-Welcome join (ADR-049 Phase 2J).
+    ///
+    /// Returns the opaque `{ reservationId, keyPackagePublic }` pair: the PUBLIC
+    /// bytes are handed (out of band) to the context creator, who mints a
+    /// Welcome addressed to this reservation; the `reservationId` is passed back
+    /// to `contextJoinFromWelcome`. The joiner's private signer state never
+    /// leaves the node. `owningDid` MUST be a locally-custodied identity.
+    #[napi(js_name = "reserveKeyPackage")]
+    pub async fn reserve_key_package(
+        &self,
+        owning_did: String,
+    ) -> napi::Result<NapiKeyPackageReservation> {
+        crate::context::reserve_key_package_on(&self.inner, owning_did).await
+    }
+
+    /// Joins an existing SCP context by opening a received sealed, signed
+    /// invitation bundle, standing the local (joiner) identity up as a
+    /// send-capable participant (ADR-049 Phase 2J; FFI-02 Option A).
+    ///
+    /// Completes the reserve → invite → join handshake begun by
+    /// `reserveKeyPackage`. The authoritative params + MLS Welcome travel INSIDE
+    /// the `sealed` bundle (produced by the creator's `inviteMember`), which the
+    /// runtime opens and authenticates — the joiner supplies no loose params. The
+    /// joiner's §9.10.4 routing pseudonym is DERIVED from its locally-custodied
+    /// identity (never caller-supplied); a non-custodied joiner hard-fails before
+    /// the single-use `KeyPackage` is consumed. Returns an active
+    /// [`NapiContextHandle`] rebuilt from the AUTHENTICATED bundle params.
+    #[napi(js_name = "contextJoinFromWelcome")]
+    pub async fn context_join_from_welcome(
+        &self,
+        owning_did: String,
+        sealed: NapiSealedInvitation,
+        reservation_id: String,
+    ) -> napi::Result<NapiContextHandle> {
+        crate::context::context_join_from_welcome_on(
+            &self.inner,
+            owning_did,
+            sealed,
+            reservation_id,
+        )
+        .await
+    }
+
+    /// Invites a member to an existing context, producing a sealed, signed
+    /// invitation bundle (ADR-049 Phase 2J; FFI-02 Option A).
+    ///
+    /// The creator (or admin) seals the context's genesis params + Welcome for
+    /// the invitee under RFC 9180 HPKE, binding them to the invitee's
+    /// `KeyPackage`. Only a `SingleAdmin` context is supported today: the invite
+    /// is unilateral and returns a [`NapiInviteMemberOutcome`] whose `bundle` is
+    /// the sealed `NapiSealedInvitation` — pass it directly to
+    /// `contextJoinFromWelcome`. A voting-governed context throws (governed-
+    /// context invitations are not yet implemented). `creatorDid` MUST be a
+    /// locally-custodied identity; the invite is signed under its `#active` key.
+    #[napi(js_name = "inviteMember")]
+    pub async fn invite_member(
+        &self,
+        context_id: String,
+        creator_did: String,
+        invitee_did: String,
+        invitee_key_package: Vec<u8>,
+        relay_urls: Vec<String>,
+    ) -> napi::Result<NapiInviteMemberOutcome> {
+        crate::context::invite_member_on(
+            &self.inner,
+            context_id,
+            creator_did,
+            invitee_did,
+            invitee_key_package,
+            relay_urls,
+        )
+        .await
     }
 
     /// Per-instance equivalent of the free-function `context_join`.
