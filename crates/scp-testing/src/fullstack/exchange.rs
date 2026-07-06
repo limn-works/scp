@@ -1,21 +1,37 @@
 //! Shared key-exchange side channel for the full-stack harness.
 //!
-//! In a real deployment the joiner's key package, the MLS Welcome, the
+//! In a real deployment the creator-signed, HPKE-sealed invitation bundle, the
 //! inviter-minted per-member access keys, and the MLS-wrapped sender-key
 //! distribution messages all travel over transport (relay, blob store, MLS
 //! management channel). In the in-process `FullStackNetwork` harness there is
-//! no shared transport between the creator's actor and the joiner's provider,
+//! no shared transport between the creator's actor and the joiner's supervisor,
 //! so `KeyExchange` carries those bootstrap bytes between nodes.
 //!
-//! Everything stored here is wire bytes — there is no in-process MLS state
-//! (no `MlsMessageOut`, signer, or `OpenMLS` provider) crossing the channel.
-//! After ADR-049 commit 12c.9f the joiner generates and retains its own MLS
-//! signer state inside its [`MlsCryptoProvider`](scp_core::crypto::mls::provider::MlsCryptoProvider);
-//! only the serialized Welcome bytes need to travel.
+//! The reserve → `invite_member` → `spawn_actor_from_welcome` migration (ADR-049
+//! §9 2F-residual) retires the legacy raw-Welcome slot: the creator now reserves
+//! the joiner's KeyPackage directly on the joiner's supervisor and calls
+//! `Supervisor::invite_member`, which returns a signed, sealed
+//! [`SealedInvitation`]. That bundle (plus the joiner's reservation id) is what
+//! crosses this channel — the joiner feeds it straight into
+//! `Supervisor::spawn_actor_from_welcome`, becoming a live send-capable actor.
 
 use std::collections::HashMap;
 
+use scp_core::context::invitation_helpers::SealedInvitation;
+use scp_core::context::supervisor::ReservationId;
 use scp_core::crypto::access_keys::AccessKey;
+
+/// A pending invitation for a joiner: the creator-signed, HPKE-sealed
+/// [`SealedInvitation`] bundle plus the joiner's own reservation id (the handle
+/// on the KeyPackage the creator's `invite_member` consumed). Together they are
+/// exactly the inputs `Supervisor::spawn_actor_from_welcome` needs.
+#[derive(Clone)]
+pub struct PendingJoin {
+    /// The creator-signed, HPKE-sealed invitation bundle.
+    pub sealed: SealedInvitation,
+    /// The joiner's reservation id for the KeyPackage the creator added.
+    pub reservation_id: ReservationId,
+}
 
 /// Shared key-exchange between `E2eCryptoProvider` instances.
 ///
@@ -24,14 +40,11 @@ use scp_core::crypto::access_keys::AccessKey;
 /// by `(context_id_str, joiner_did)` for access keys (which use the original
 /// string context ID, matching the access-key store's keying).
 pub struct KeyExchange {
-    /// Joiner key packages: `(context_id, joiner_did) -> kp_bytes`.
-    /// The joiner deposits its TLS-serialized MLS `KeyPackage`; the inviter
-    /// takes it and feeds it to the real `add_member` path.
-    key_packages: HashMap<([u8; 32], String), Vec<u8>>,
-    /// Pending Welcomes: `(context_id, joiner_did) -> welcome_bytes`.
-    /// The inviter deposits the TLS-serialized MLS Welcome produced by
-    /// `add_member`; the joiner takes it and forms its group state.
-    welcomes: HashMap<([u8; 32], String), Vec<u8>>,
+    /// Pending invitations: `(context_id, joiner_did) -> PendingJoin`.
+    /// The inviter deposits the creator-signed sealed bundle + reservation id
+    /// produced by `Supervisor::invite_member`; the joiner takes it and feeds
+    /// it to `Supervisor::spawn_actor_from_welcome`.
+    pending_joins: HashMap<([u8; 32], String), PendingJoin>,
     /// MLS-wrapped sender-key distribution messages for joiners:
     /// `(context_id, joiner_did) -> Vec<wrapped_bytes>`. The inviter captures
     /// these off its transport during `add_member` and deposits them; the
@@ -57,47 +70,34 @@ impl KeyExchange {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            key_packages: HashMap::new(),
-            welcomes: HashMap::new(),
+            pending_joins: HashMap::new(),
             sender_key_messages: HashMap::new(),
             commits: HashMap::new(),
             access_keys: HashMap::new(),
         }
     }
 
-    /// Deposits a joiner key package for the inviter to pick up.
-    pub fn deposit_key_package(
+    /// Deposits a pending invitation (sealed bundle + reservation id) for the
+    /// given joiner to pick up.
+    pub fn deposit_pending_join(
         &mut self,
         context_id: [u8; 32],
         joiner_did: &str,
-        kp_bytes: Vec<u8>,
+        pending: PendingJoin,
     ) {
-        self.key_packages
-            .insert((context_id, joiner_did.to_owned()), kp_bytes);
+        self.pending_joins
+            .insert((context_id, joiner_did.to_owned()), pending);
     }
 
-    /// Takes (removes) the key package the given joiner deposited.
+    /// Takes (removes) the pending invitation deposited for the given joiner.
     #[must_use]
-    pub fn take_key_package(&mut self, context_id: &[u8; 32], joiner_did: &str) -> Option<Vec<u8>> {
-        self.key_packages
+    pub fn take_pending_join(
+        &mut self,
+        context_id: &[u8; 32],
+        joiner_did: &str,
+    ) -> Option<PendingJoin> {
+        self.pending_joins
             .remove(&(*context_id, joiner_did.to_owned()))
-    }
-
-    /// Deposits a serialized Welcome for a joiner to retrieve.
-    pub fn deposit_welcome(
-        &mut self,
-        context_id: [u8; 32],
-        joiner_did: &str,
-        welcome_bytes: Vec<u8>,
-    ) {
-        self.welcomes
-            .insert((context_id, joiner_did.to_owned()), welcome_bytes);
-    }
-
-    /// Takes (removes) the Welcome deposited for the given joiner.
-    #[must_use]
-    pub fn take_welcome(&mut self, context_id: &[u8; 32], joiner_did: &str) -> Option<Vec<u8>> {
-        self.welcomes.remove(&(*context_id, joiner_did.to_owned()))
     }
 
     /// Deposits an MLS-wrapped sender-key distribution message for a joiner.
