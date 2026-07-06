@@ -273,9 +273,10 @@ disallowed-types = [
 ]
 ```
 
-Allow-list (sites that legitimately use these primitives). Every site below is a cold lifecycle / write-serialization / test path — never a per-command read or dispatch path — so each carries an `#[allow(clippy::disallowed_types, reason = "ADR-049 §Decision 12 allow-list: …")]` naming its specific justification, consistent with the operative "no lock on per-command read/dispatch paths" rule:
+The per-context actor owns its `PerContextState` **by move** (`&mut PerContextState`) — there is no interior lock on it at all. That owned-by-move design is *why* the read paths need no `Mutex`; it is not itself an `#[allow]` site (there is nothing to allow when there is no lock — `check-deleted-primitives.sh` in fact bans any `Mutex<PerContextState>`).
 
-- Actor-owned `Mutex<PerContextState>` (per-context mailbox holder).
+Allow-list (sites that actually carry a `tokio::sync::Mutex`). Every site below is a cold lifecycle / write-serialization / test path — never a per-command read or dispatch path — so each carries an `#[allow(clippy::disallowed_types, reason = "ADR-049 §Decision 12 allow-list: …")]` naming its specific justification, consistent with the operative "no lock on per-command read/dispatch paths" rule:
+
 - `Supervisor::write_lock: tokio::sync::Mutex<()>` — the ArcSwap+write_lock write-serialization guard. Cold write path, not a per-command read.
 - `Supervisor::bootstrap_spawn_lock: tokio::sync::Mutex<()>` — serializes the same-id bootstrap-spawn sequence (all three lifecycle bootstrap variants: `create_context`, `import_context`, standing-recreate). Cold bootstrap path, not a per-command read.
 - `Supervisor::task_set: OnceLock<Arc<tokio::sync::Mutex<JoinSet<()>>>>` — guards the shared JoinSet of spawned TTL/governance-timeout tasks. Touched only on spawn/reap, never on a per-command read path (the `task_set_ref` accessor is likewise cold).
