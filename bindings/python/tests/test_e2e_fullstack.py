@@ -101,18 +101,23 @@ class TestBobSendsAliceDecrypts:
         scp._native.fullstack_add_member(alice, ctx_id, bob.did)
         scp._native.fullstack_join_from_welcome(bob, ctx_id)
 
-        # Joiner-sends is not yet supported under the actor-per-context model
-        # (no spawn-from-Welcome entrypoint — Welcome-Delivery work item). The
-        # send must fail closed, not fake a roundtrip.
-        #
-        # INTENTIONAL TRIPWIRE: this positive fail-closed assertion verifies the
-        # CURRENT one-way contract and is meant to trip loudly the moment the
-        # behavior changes. When the Welcome-Delivery / spawn-from-Welcome
-        # entrypoint lands and joiner-send starts working, this assertion MUST be
-        # rewritten into a real bidirectional roundtrip (Bob sends, Alice
-        # decrypts) — not deleted or relaxed.
-        with pytest.raises(RuntimeError, match="not found in node's handles"):
-            scp._native.fullstack_send_message(bob, ctx_id, b"Hello from Bob via Python!")
+        # Bob is a Welcome-joiner: the spawn-from-Welcome entrypoint activates
+        # his lifecycle handle (ADR-049 §9(b)), so his actor is live and
+        # send-capable. Mirror the sibling A->B test exactly with the send
+        # direction reversed. Bob is the sender, so seed Alice's per-member
+        # pseudonym into Bob's node for fan-out (§9.10.4).
+        scp._native.fullstack_seed_peer_pseudonym(bob, ctx_id, alice.did, bytes([0x42] * 32))
+
+        plaintext = b"Hello from Bob via Python!"
+        ciphertext = scp._native.fullstack_send_message(bob, ctx_id, plaintext)
+
+        # Ciphertext must differ from plaintext.
+        assert ciphertext != plaintext
+        assert len(ciphertext) > len(plaintext)
+
+        # Alice decrypts Bob's message -- the bidirectional assertion.
+        decrypted = scp._native.fullstack_decrypt_message(alice, ctx_id, ciphertext, bob.did)
+        assert bytes(decrypted) == plaintext
 
 
 class TestThreePartyGroup:

@@ -153,21 +153,23 @@ if (addon === null) {
       scp.fullstackAddMember(alice, ctxId, bob.did);
       scp.fullstackJoinFromWelcome(bob, ctxId);
 
-      // Joiner-sends is not yet supported under the actor-per-context model:
-      // a node that joined via Welcome has no actor-backed send handle
-      // (no spawn-from-Welcome entrypoint — tracked as the Welcome-Delivery
-      // work). The send must fail closed with a clean error rather than
-      // silently producing unverifiable crypto.
-      //
-      // INTENTIONAL TRIPWIRE: this positive fail-closed assertion verifies the
-      // CURRENT one-way contract and is meant to trip loudly the moment the
-      // behavior changes. When the Welcome-Delivery / spawn-from-Welcome
-      // entrypoint lands and joiner-send starts working, this assertion MUST be
-      // rewritten into a real bidirectional roundtrip (Bob sends, Alice
-      // decrypts) — not deleted or relaxed.
-      expect(() => scp.fullstackSendMessage(bob, ctxId, Buffer.from("Hello from Bob!"))).toThrow(
-        /not found in node's handles/,
-      );
+      // Bob is a Welcome-joiner: the spawn-from-Welcome entrypoint activates
+      // his lifecycle handle (ADR-049 §9(b)), so his actor is live and
+      // send-capable. Mirror the A->B test with the send direction reversed.
+      // Bob is the sender, so seed Alice's per-member pseudonym into Bob's
+      // node for the multi-member fan-out (§9.10.4).
+      scp.fullstackSeedPeerPseudonym(bob, ctxId, alice.did, new Uint8Array(32).fill(0x42));
+
+      const plaintext = Buffer.from("Hello from Bob!");
+      const ciphertext = scp.fullstackSendMessage(bob, ctxId, plaintext);
+
+      // Ciphertext must differ from plaintext
+      expect(Buffer.from(ciphertext)).not.toEqual(plaintext);
+      expect(ciphertext.length).toBeGreaterThan(plaintext.length);
+
+      // Alice decrypts Bob's message -- the bidirectional assertion.
+      const decrypted = scp.fullstackDecryptMessage(alice, ctxId, ciphertext, bob.did);
+      expect(Buffer.from(decrypted)).toEqual(plaintext);
     });
 
     test("three-party: Alice sends, Bob and Carol both decrypt", () => {
