@@ -49,7 +49,7 @@ use scp_protocol::crypto::envelope_seal::{ed25519_pubkey_to_x25519, hpke_seal_in
 use zeroize::Zeroizing;
 
 use super::key_package_actor::{KeyPackageCommand, ReservationId};
-use super::{InviteMemberOutcome, Supervisor, WelcomeJoinRequest};
+use super::{InviteMemberOutcome, MessageSigner, Supervisor, WelcomeJoinRequest};
 use crate::context::builder::{
     ContextEventLogProvider, ContextTransportProvider, NotConfiguredTransportProvider,
 };
@@ -2995,5 +2995,188 @@ async fn discard_joined_context_fully_reverses_a_welcome_join() {
     assert!(
         rec.deletes.contains(&j.ctx_id),
         "the snapshot delete was issued to the persistence backend"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test N — §9(b) runtime pin: the joiner is `Active` AND send-capable through
+// its actor command path (not merely crypto-capable).
+// ---------------------------------------------------------------------------
+
+/// A transport that accepts every `send_message` (returns `Ok`, so the send
+/// pipeline completes rather than fail-closed on the `NotConfigured` default)
+/// and counts the non-empty application ciphertexts it observes. An
+/// [`AtomicUsize`](std::sync::atomic::AtomicUsize) keeps the sync transport hot
+/// path lock-free.
+struct AcceptingSendTransport {
+    /// Incremented for each non-empty `send_message` payload observed.
+    sends: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl ContextTransportProvider for AcceptingSendTransport {
+    fn is_connected(&self) -> bool {
+        true
+    }
+
+    fn publish_context(
+        &self,
+        _context_id: &[u8; 32],
+        _params: &ContextParams,
+    ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+        Ok(())
+    }
+
+    fn delete_published(
+        &self,
+        _context_id: &[u8; 32],
+    ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+        Ok(())
+    }
+
+    fn send_message(
+        &self,
+        _context_id: &[u8; 32],
+        encrypted_payload: &[u8],
+    ) -> Result<(), crate::context::ContextError> {
+        if !encrypted_payload.is_empty() {
+            self.sends.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        Ok(())
+    }
+}
+
+/// Builds Bob's real joiner `Supervisor` wired to a caller-supplied transport so
+/// a test can drive a REAL application send through the spawned joiner's actor
+/// and observe it succeed (the [`bob_supervisor`] default is
+/// `NotConfiguredTransportProvider`, whose `send_message` fails closed).
+/// Mirrors [`bob_supervisor`] otherwise.
+fn bob_supervisor_with_transport(transport: Box<dyn ContextTransportProvider>) -> Arc<Supervisor> {
+    let crypto = Arc::new(MlsCryptoProvider::new(
+        BOB_DID.to_owned(),
+        std::sync::Arc::new(scp_clock::SystemClock),
+    ));
+    let event_log: Box<dyn ContextEventLogProvider> = Box::new(MerkleEventLogProvider::new());
+    Supervisor::with_providers(
+        crypto,
+        transport,
+        event_log,
+        pair_resolver(),
+        None,
+        None,
+        None,
+        None,
+        fresh_mls_storage(),
+    )
+}
+
+/// §9(b) RUNTIME pin: the Welcome-joiner that `spawn_actor_from_welcome` stands
+/// up is `Active` and SEND-CAPABLE through its actor command path — not merely
+/// crypto-capable.
+///
+/// The existing round-trip tests
+/// ([`spawn_from_welcome_group_round_trips_both_directions`],
+/// [`invite_member_round_trip_stands_up_a_bidirectional_joiner`]) drive
+/// `mls_encrypt_management` DIRECTLY on the crypto provider, which BYPASSES the
+/// lifecycle send-gate: an application send routed through
+/// `Supervisor::send_message` (→ `MessagingCommand::SendMessage` →
+/// `state::require_active` in `messaging.rs`) is the ONLY path that exercises
+/// it. Step 3a of `spawn_actor_from_welcome` transitions the joiner's handle to
+/// `Active`; without it the handle is stuck in `Creating` and every
+/// `Active`-gated operation fails closed with `ContextError::ContextNotActive`.
+///
+/// This test therefore FAILS if step 3a is reverted — the direct pin sees
+/// `Creating` instead of `Active`, and the behavioral pin's send returns
+/// `Err(ContextNotActive)` instead of `Ok`.
+#[tokio::test]
+async fn spawn_from_welcome_joiner_is_active_and_send_capable() {
+    let seed = 0x2f;
+    let bob = DID::from(BOB_DID);
+    let alice = DID::from(ALICE_DID);
+    let group_ctx_id = ctx_hex(seed);
+    let group_ctx_bytes = context_id_to_bytes(&group_ctx_id);
+
+    // Bob's joiner supervisor wired to a WORKING (accepting) transport so a real
+    // send returns `Ok` rather than the `NotConfigured` fail-closed default.
+    let sends = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let sup = bob_supervisor_with_transport(Box::new(AcceptingSendTransport {
+        sends: Arc::clone(&sends),
+    }));
+
+    // Bob reserves a real KP from his own store (§9.16.1 wrapping key published
+    // so the KP declares `0xFF02`).
+    let (reservation_id, kp_public_bytes) = reserve_bob_kp(&sup, &bob).await;
+
+    // Alice (bare creator provider) creates the honest SCP context group and
+    // adds Bob's reserved KP, producing the real Welcome addressed to that KP.
+    let alice_crypto = Arc::new(MlsCryptoProvider::new(
+        ALICE_DID.to_owned(),
+        std::sync::Arc::new(scp_clock::SystemClock),
+    ));
+    alice_crypto
+        .create_mls_group_with_context(
+            &group_ctx_bytes,
+            &honest_ext(&group_ctx_id, &joiner_params()),
+        )
+        .expect("alice creates the SCP context group (0xFF02)");
+    let add_output = alice_crypto
+        .add_member(&group_ctx_bytes, BOB_DID, Some(&kp_public_bytes))
+        .expect("alice adds bob's reserved key package");
+
+    // Seal the creator-signed §5.12.3 bundle to Bob's #active and spawn.
+    let (bob_custody, bob_handle, bob_recipient) = bob_active_custody().await;
+    let req = seal_join_request(
+        &alice_signing_key(),
+        &alice,
+        &group_ctx_id,
+        &joiner_params(),
+        add_output.welcome_bytes,
+        &bob_recipient,
+        &group_ctx_id,
+        &alice,
+        reservation_id,
+    );
+    let handle = sup
+        .spawn_actor_from_welcome(bob.clone(), &bob_custody, &bob_handle, req)
+        .await
+        .expect("spawn_actor_from_welcome succeeds on a valid Welcome");
+
+    // (a) DIRECT PIN — the joiner's lifecycle handle is `Active` post-spawn
+    //     (sync getter after item-2's ArcSwap conversion). FAILS with `Creating`
+    //     if step 3a is reverted.
+    assert_eq!(
+        handle.state(),
+        scp_protocol::context::ContextState::Active,
+        "spawn_actor_from_welcome must leave the joiner handle Active (§9(b))"
+    );
+
+    // (b) BEHAVIORAL PIN — a real application send routed through the joiner's
+    //     actor command path passes `require_active`. Seed Alice's per-member
+    //     pseudonym so the 2-member fan-out (§9.10.4) has a recipient routing id.
+    sup.seed_peer_pseudonym(&group_ctx_id, alice.clone(), [0x42; 32])
+        .await
+        .expect("seed alice's per-member pseudonym");
+
+    let result = sup
+        .send_message(
+            &handle,
+            &bob,
+            b"joiner send after welcome (\xc2\xa79b)",
+            MessageSigner::Active(&bob_signing_key()),
+            None,
+            None,
+        )
+        .await;
+    assert!(
+        result.is_ok(),
+        "the joiner's actor must accept an application send (require_active \
+         passes); a reverted step-3a activation yields Err(ContextNotActive). \
+         Got: {result:?}"
+    );
+
+    // The send actually reached the wire (a non-empty application ciphertext was
+    // broadcast to Alice's pseudonym), so the `Ok` is a real send, not a no-op.
+    assert!(
+        sends.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+        "the accepted send must have produced at least one application ciphertext"
     );
 }
