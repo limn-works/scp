@@ -394,7 +394,7 @@ ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
     ("UCAN", "delegate"): {
         "typescript": ["delegateUcan"],
     },
-    # UCAN.evaluate -- the structured read-only diagnostic (ADR-057, §7.2.4).
+    # UCAN.evaluate -- the structured read-only diagnostic (ADR-059, §7.2.4).
     # All four bindings expose an idiomatic wrapper over the typed
     # CapabilityValidationRecord and consume it inside their evaluate_trust /
     # evaluateTrust trust-signal wrapper (Python SCP.ucan_evaluate, TypeScript
@@ -650,11 +650,35 @@ ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
         "kotlin": ["verifyParticipationRequirements"],
         "swift": ["verifyParticipationRequirements"],
     },
+    ("Trust", "check_capability_requirements"): {
+        "python": ["check_capability_requirements"],
+        "typescript": ["checkCapabilityRequirements"],
+        "kotlin": ["checkCapabilityRequirements"],
+        "swift": ["checkCapabilityRequirements"],
+    },
     ("Trust", "participation_record"): {
         "python": ["participation_record"],
         "typescript": ["participationRecord"],
         "kotlin": ["participationRecord"],
         "swift": ["participationRecord"],
+    },
+    ("Trust", "trust_create_challenge"): {
+        "python": ["trust_create_challenge"],
+        "typescript": ["trustCreateChallenge"],
+        "kotlin": ["trustCreateChallenge"],
+        "swift": ["trustCreateChallenge"],
+    },
+    ("Trust", "trust_verify_attestation"): {
+        "python": ["trust_verify_attestation"],
+        "typescript": ["trustVerifyAttestation"],
+        "kotlin": ["trustVerifyAttestation"],
+        "swift": ["trustVerifyAttestation"],
+    },
+    ("Trust", "trust_verify_response"): {
+        "python": ["trust_verify_response"],
+        "typescript": ["trustVerifyResponse"],
+        "kotlin": ["trustVerifyResponse"],
+        "swift": ["trustVerifyResponse"],
     },
     # Discovery -- bare/different names across SDKs
     ("Discovery", "parse_address"): {

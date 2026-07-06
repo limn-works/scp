@@ -24,8 +24,8 @@ use x25519_dalek::{PublicKey as X25519Pub, StaticSecret};
 use super::generate_sender_key;
 use super::{SenderKey, SenderKeyError};
 use crate::crypto::hpke;
-use crate::identity::SigningKeyId;
 use crate::serde_util::{serde_hpke_sealed_48, serde_pubkey_32, serde_signature_64};
+use scp_did::SigningKeyId;
 
 // ---------------------------------------------------------------------------
 // Wrapping keypair generation (§9.16.1)
@@ -1051,7 +1051,7 @@ pub(super) fn verify_ed25519_signature(
     message: &[u8],
     signature: &[u8],
 ) -> Result<bool, SenderKeyError> {
-    match crate::crypto::ed25519::verify_ed25519_signature(public_key, message, signature) {
+    match scp_crypto::verify_ed25519_signature(public_key, message, signature) {
         Ok(()) => Ok(true),
         Err(reason) => {
             // Signature mismatch → Ok(false). Malformed inputs → Err.

@@ -20,6 +20,7 @@ use crate::runtime::NapiBridgeInstance;
 
 /// Trust score query result.
 #[napi(object)]
+#[derive(Debug)]
 pub struct NapiTrustScoreResult {
     /// Number of message events attributed to the DID.
     pub message_count: i64,
@@ -31,6 +32,7 @@ pub struct NapiTrustScoreResult {
 
 /// Attestation verification result.
 #[napi(object)]
+#[derive(Debug)]
 pub struct NapiAttestationVerificationResult {
     /// Whether the attestation is valid.
     pub valid: bool,
@@ -42,6 +44,7 @@ pub struct NapiAttestationVerificationResult {
 
 /// Challenge creation result.
 #[napi(object)]
+#[derive(Debug)]
 pub struct NapiChallengeResult {
     /// The unique challenge ID (UUID v4).
     pub challenge_id: String,
@@ -59,6 +62,7 @@ pub struct NapiChallengeResult {
 /// number; lossless for these ranges, matching `NapiTrustScoreResult`);
 /// booleans/strings map directly. See ADR-017.
 #[napi(object)]
+#[derive(Debug)]
 pub struct NapiParticipationRecord {
     /// The DID whose participation is summarized.
     pub subject_did: String,
@@ -115,10 +119,16 @@ impl From<&scp_core::trust::ParticipationFacts> for NapiParticipationRecord {
 // Helper
 // ---------------------------------------------------------------------------
 
-fn validation_error(msg: &str) -> napi::Error {
+/// Builds a bridge validation error carrying the explicit `SCP-VALID-*` code
+/// the UniFFI/PyO3 bridges emit for the same logical failure case (e.g. the
+/// per-case `check_capability_requirements` codes `VALID_7073`..=`VALID_7077`,
+/// or the `verify_participation_requirements` codes `VALID_7030`/`VALID_7031`/
+/// `VALID_7032`), so a TypeScript caller can branch on the same code a
+/// Python/Swift/Kotlin caller sees.
+fn coded_validation_error(msg: &str, code: &str) -> napi::Error {
     napi::Error::from(ScpNapiError::Validation {
         message: msg.to_owned(),
-        code: codes::VALID_7010.to_owned(),
+        code: code.to_owned(),
     })
 }
 
@@ -132,11 +142,20 @@ pub(crate) fn trust_query_score_on(
     did: String,
     context_id: String,
 ) -> napi::Result<NapiTrustScoreResult> {
+    // Per-argument codes match the UniFFI bridge (invalid DID → VALID_7010,
+    // invalid context id → VALID_7011) so the same logical failure carries
+    // the same code on every native bridge.
     if did.is_empty() {
-        return Err(validation_error("DID must not be empty"));
+        return Err(coded_validation_error(
+            "DID must not be empty",
+            codes::VALID_7010,
+        ));
     }
     if context_id.is_empty() {
-        return Err(validation_error("context_id must not be empty"));
+        return Err(coded_validation_error(
+            "context_id must not be empty",
+            codes::VALID_7011,
+        ));
     }
 
     let (message_count, governance_count) =
@@ -162,11 +181,18 @@ pub(crate) fn trust_verify_attestation_on(
     _bi: &NapiBridgeInstance,
     attestation_json: String,
 ) -> napi::Result<NapiAttestationVerificationResult> {
+    // VALID_7012 matches the UniFFI bridge's code for malformed attestation
+    // JSON so the same logical failure carries the same code on every bridge.
     let attestation: scp_core::trust::Attestation = serde_json::from_str(&attestation_json)
-        .map_err(|e| validation_error(&format!("failed to parse attestation JSON: {e}")))?;
+        .map_err(|e| {
+            coded_validation_error(
+                &format!("failed to parse attestation JSON: {e}"),
+                codes::VALID_7012,
+            )
+        })?;
 
     let resolver = scp_core::trust::IdentityDidPublicKeyResolver;
-    let clock = scp_identity::cache::SystemClock;
+    let clock = scp_clock::SystemClock;
 
     match scp_core::trust::verify_attestation(&attestation, &resolver, &clock) {
         Ok(()) => Ok(NapiAttestationVerificationResult {
@@ -190,8 +216,12 @@ pub(crate) fn trust_create_challenge_on(
     _bi: &NapiBridgeInstance,
     target_did: String,
 ) -> napi::Result<NapiChallengeResult> {
+    // VALID_7013 matches the UniFFI bridge's code for an empty target DID.
     if target_did.is_empty() {
-        return Err(validation_error("target DID must not be empty"));
+        return Err(coded_validation_error(
+            "target DID must not be empty",
+            codes::VALID_7013,
+        ));
     }
 
     struct EphemeralSigner(ed25519_dalek::SigningKey);
@@ -215,10 +245,21 @@ pub(crate) fn trust_create_challenge_on(
         std::time::Duration::from_mins(5),
         &signer,
     )
-    .map_err(|e| validation_error(&format!("challenge creation failed: {e}")))?;
+    .map_err(|e| {
+        // VALID_7014 (creation failure) / VALID_7015 (serialization failure)
+        // match the UniFFI bridge's per-case codes.
+        coded_validation_error(
+            &format!("challenge creation failed: {e}"),
+            codes::VALID_7014,
+        )
+    })?;
 
-    let challenge_json = serde_json::to_string(&request)
-        .map_err(|e| validation_error(&format!("failed to serialize challenge: {e}")))?;
+    let challenge_json = serde_json::to_string(&request).map_err(|e| {
+        coded_validation_error(
+            &format!("failed to serialize challenge: {e}"),
+            codes::VALID_7015,
+        )
+    })?;
 
     Ok(NapiChallengeResult {
         challenge_id: request.challenge_id,
@@ -235,14 +276,26 @@ pub(crate) fn trust_verify_response_on(
     challenge_json: String,
     response_json: String,
 ) -> napi::Result<bool> {
+    // VALID_7016 (challenge position) / VALID_7017 (response position) match
+    // the UniFFI bridge's per-case codes for malformed JSON.
     let request: scp_core::trust::ChallengeRequest = serde_json::from_str(&challenge_json)
-        .map_err(|e| validation_error(&format!("failed to parse challenge JSON: {e}")))?;
+        .map_err(|e| {
+            coded_validation_error(
+                &format!("failed to parse challenge JSON: {e}"),
+                codes::VALID_7016,
+            )
+        })?;
 
     let response: scp_core::trust::ChallengeResponse = serde_json::from_str(&response_json)
-        .map_err(|e| validation_error(&format!("failed to parse response JSON: {e}")))?;
+        .map_err(|e| {
+            coded_validation_error(
+                &format!("failed to parse response JSON: {e}"),
+                codes::VALID_7017,
+            )
+        })?;
 
     let resolver = scp_core::trust::IdentityDidPublicKeyResolver;
-    let clock = scp_identity::cache::SystemClock;
+    let clock = scp_clock::SystemClock;
 
     struct EphemeralSigner(ed25519_dalek::SigningKey);
     impl scp_core::trust::ChallengeSigner for EphemeralSigner {
@@ -285,23 +338,30 @@ pub(crate) fn verify_participation_requirements_on(
     scp_ffi_common::validate::validate_did(&expected_subject)
         .map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
 
+    // Per-case codes match the UniFFI bridge: malformed requirements JSON →
+    // VALID_7031, malformed profiles JSON → VALID_7030, failed admission
+    // check → VALID_7032 (below).
     let requirements: Vec<scp_core::trust::RequireParticipation> =
         serde_json::from_str(&requirements_json).map_err(|e| {
-            validation_error(&format!(
-                "failed to parse participation requirements JSON: {e}"
-            ))
+            coded_validation_error(
+                &format!("failed to parse participation requirements JSON: {e}"),
+                codes::VALID_7031,
+            )
         })?;
 
     let profiles: Vec<scp_core::trust::ParticipationProfile> = serde_json::from_str(&profile_json)
         .map_err(|e| {
-            validation_error(&format!("failed to parse participation profiles JSON: {e}"))
+            coded_validation_error(
+                &format!("failed to parse participation profiles JSON: {e}"),
+                codes::VALID_7030,
+            )
         })?;
 
     // Fail-closed clock: a pre-epoch host clock is an unrecoverable environment
     // failure and must not silently read as time 0, which would make every
     // participation statement appear maximally fresh and bypass `max_age_secs`.
     // Matches the SystemClock invariant used on the verify-on-ingest path.
-    let current_time = scp_primitives::Clock::now_secs(&scp_primitives::SystemClock);
+    let current_time = scp_clock::Clock::now_secs(&scp_clock::SystemClock);
 
     scp_core::trust::verify_participation_requirements(
         current_time,
@@ -309,7 +369,97 @@ pub(crate) fn verify_participation_requirements_on(
         &requirements,
         &profiles,
     )
-    .map_err(|e| validation_error(&format!("participation admission verification failed: {e}")))?;
+    .map_err(|e| {
+        coded_validation_error(
+            &format!("participation admission verification failed: {e}"),
+            codes::VALID_7032,
+        )
+    })?;
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// check_capability_requirements (§7.3.4.4, SCP-ACR-008)
+// ---------------------------------------------------------------------------
+
+/// Per-bridge-instance implementation of `check_capability_requirements`.
+///
+/// Verifies that an agent meets a context's capability requirements for
+/// admission. Pure verification — the bridge instance is unused (the production
+/// `IdentityDidPublicKeyResolver` is stateless) but accepted for API symmetry
+/// with the other `_on` helpers in this module.
+///
+/// `subject_did` is the DID of the agent being admitted and `context_id` the
+/// context: a `ChallengeVerification` only satisfies a requirement when its
+/// signed `subject_did`/`context_id` equal these values, closing cross-subject
+/// and cross-context attribution. Authenticity is not authorization — a passing
+/// challenge-verification check does not establish verifier legitimacy (see spec
+/// §7.3.4.4).
+pub(crate) fn check_capability_requirements_on(
+    _bi: &NapiBridgeInstance,
+    context_id: String,
+    subject_did: String,
+    requirements_json: String,
+    agent_capabilities_json: String,
+    challenge_verifications_json: String,
+) -> napi::Result<()> {
+    // Full DID-format validation (matching the PyO3 reference bridge), not just a
+    // non-empty check, so all native bridges reject malformed ids identically.
+    scp_ffi_common::validate::validate_did(&subject_did)
+        .map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+
+    let requirements: Vec<scp_core::trust::CapabilityRequirement> =
+        serde_json::from_str(&requirements_json).map_err(|e| {
+            coded_validation_error(
+                &format!("failed to parse capability requirements JSON: {e}"),
+                codes::VALID_7073,
+            )
+        })?;
+
+    let agent_capabilities: Vec<scp_core::trust::CapabilityUri> =
+        serde_json::from_str(&agent_capabilities_json).map_err(|e| {
+            coded_validation_error(
+                &format!("failed to parse agent capabilities JSON: {e}"),
+                codes::VALID_7074,
+            )
+        })?;
+
+    let challenge_verifications: Vec<scp_core::trust::ChallengeVerification> =
+        serde_json::from_str(&challenge_verifications_json).map_err(|e| {
+            coded_validation_error(
+                &format!("failed to parse challenge verifications JSON: {e}"),
+                codes::VALID_7075,
+            )
+        })?;
+
+    let resolver = scp_core::trust::IdentityDidPublicKeyResolver;
+    let clock = scp_clock::SystemClock;
+
+    scp_core::trust::check_capability_requirements(
+        &requirements,
+        &agent_capabilities,
+        &challenge_verifications,
+        &context_id,
+        &subject_did,
+        &resolver,
+        &clock,
+    )
+    .map_err(|e| {
+        // Mirror the UniFFI bridge's per-variant code mapping so all native
+        // bridges surface identical per-variant 707x codes for the same failure
+        // case: empty subject → 7077; missing capability / verification-required
+        // → 7076.
+        let code = match e {
+            scp_core::trust::AdmissionError::EmptySubjectDid => codes::VALID_7077,
+            scp_core::trust::AdmissionError::MissingCapability { .. }
+            | scp_core::trust::AdmissionError::VerificationRequired { .. } => codes::VALID_7076,
+        };
+        coded_validation_error(
+            &format!("capability admission verification failed: {e}"),
+            code,
+        )
+    })?;
 
     Ok(())
 }
@@ -332,51 +482,85 @@ pub(crate) fn aggregate_trust_input_on(
     cached_attestations_json: String,
     challenge_results_json: String,
 ) -> napi::Result<String> {
+    // Per-argument codes match the UniFFI bridge's `aggregate_trust_input`
+    // (context id → VALID_7040, subject DID → VALID_7041, then one code per
+    // JSON input, VALID_7042..=VALID_7049) so the same logical failure
+    // carries the same code on every native bridge.
     if context_id.is_empty() {
-        return Err(validation_error("context_id must not be empty"));
+        return Err(coded_validation_error(
+            "context_id must not be empty",
+            codes::VALID_7040,
+        ));
     }
     if subject_did.is_empty() {
-        return Err(validation_error("subject DID must not be empty"));
+        return Err(coded_validation_error(
+            "subject DID must not be empty",
+            codes::VALID_7041,
+        ));
     }
 
-    let events: Vec<scp_event_log::Event> = serde_json::from_str(&events_json)
-        .map_err(|e| validation_error(&format!("failed to parse events JSON: {e}")))?;
+    let events: Vec<scp_event_log::Event> = serde_json::from_str(&events_json).map_err(|e| {
+        coded_validation_error(
+            &format!("failed to parse events JSON: {e}"),
+            codes::VALID_7042,
+        )
+    })?;
 
-    let merkle_root_vec: Vec<u8> = serde_json::from_str(&merkle_root_json)
-        .map_err(|e| validation_error(&format!("failed to parse merkle_root JSON: {e}")))?;
+    let merkle_root_vec: Vec<u8> = serde_json::from_str(&merkle_root_json).map_err(|e| {
+        coded_validation_error(
+            &format!("failed to parse merkle_root JSON: {e}"),
+            codes::VALID_7043,
+        )
+    })?;
     let merkle_root: [u8; 32] = merkle_root_vec.try_into().map_err(|v: Vec<u8>| {
-        validation_error(&format!(
-            "merkle_root must be exactly 32 bytes, got {}",
-            v.len()
-        ))
+        coded_validation_error(
+            &format!("merkle_root must be exactly 32 bytes, got {}", v.len()),
+            codes::VALID_7044,
+        )
     })?;
 
     let consequence_rules: Vec<scp_core::trust::ConsequenceRule> =
         serde_json::from_str(&consequence_rules_json).map_err(|e| {
-            validation_error(&format!("failed to parse consequence_rules JSON: {e}"))
+            coded_validation_error(
+                &format!("failed to parse consequence_rules JSON: {e}"),
+                codes::VALID_7045,
+            )
         })?;
 
     let threshold_requirements: std::collections::HashMap<
         scp_core::trust::AttestationType,
         scp_core::trust::ThresholdRequirement,
     > = serde_json::from_str(&threshold_requirements_json).map_err(|e| {
-        validation_error(&format!("failed to parse threshold_requirements JSON: {e}"))
+        coded_validation_error(
+            &format!("failed to parse threshold_requirements JSON: {e}"),
+            codes::VALID_7046,
+        )
     })?;
 
     let attestor_sets: std::collections::HashMap<
         scp_core::trust::AttestationType,
         Vec<scp_core::trust::AttestorInfo>,
-    > = serde_json::from_str(&attestor_sets_json)
-        .map_err(|e| validation_error(&format!("failed to parse attestor_sets JSON: {e}")))?;
+    > = serde_json::from_str(&attestor_sets_json).map_err(|e| {
+        coded_validation_error(
+            &format!("failed to parse attestor_sets JSON: {e}"),
+            codes::VALID_7047,
+        )
+    })?;
 
     let cached_attestations: Vec<scp_core::trust::aggregate::CachedAttestation> =
         serde_json::from_str(&cached_attestations_json).map_err(|e| {
-            validation_error(&format!("failed to parse cached_attestations JSON: {e}"))
+            coded_validation_error(
+                &format!("failed to parse cached_attestations JSON: {e}"),
+                codes::VALID_7048,
+            )
         })?;
 
     let challenge_results: Vec<scp_core::trust::ChallengeVerification> =
         serde_json::from_str(&challenge_results_json).map_err(|e| {
-            validation_error(&format!("failed to parse challenge_results JSON: {e}"))
+            coded_validation_error(
+                &format!("failed to parse challenge_results JSON: {e}"),
+                codes::VALID_7049,
+            )
         })?;
 
     // Route trust aggregation through this bridge instance's
@@ -405,7 +589,11 @@ pub(crate) fn aggregate_trust_input_on(
                 &threshold_requirements,
                 &attestor_sets,
             )
-            .map_err(|e| validation_error(&e.to_string()))
+            .map_err(|e| {
+                // VALID_7052 mirrors the UniFFI bridge's code for a failed
+                // trust aggregation.
+                coded_validation_error(&e.to_string(), codes::VALID_7052)
+            })
         }
         crate::runtime::ProtocolRepoVariant::Sqlite(repo) => {
             let handle = crate::runtime().handle().clone();
@@ -423,7 +611,11 @@ pub(crate) fn aggregate_trust_input_on(
                 &threshold_requirements,
                 &attestor_sets,
             )
-            .map_err(|e| validation_error(&e.to_string()))
+            .map_err(|e| {
+                // VALID_7052 mirrors the UniFFI bridge's code for a failed
+                // trust aggregation.
+                coded_validation_error(&e.to_string(), codes::VALID_7052)
+            })
         }
     }
 }
@@ -542,6 +734,12 @@ mod tests {
         let bi = test_bi();
         let result = trust_query_score_on(&bi, String::new(), "ctx".to_owned());
         assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains(codes::VALID_7010),
+            "expected {}, got: {msg}",
+            codes::VALID_7010
+        );
     }
 
     #[test]
@@ -549,6 +747,12 @@ mod tests {
         let bi = test_bi();
         let result = trust_query_score_on(&bi, "did:key:test".to_owned(), String::new());
         assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains(codes::VALID_7011),
+            "expected {}, got: {msg}",
+            codes::VALID_7011
+        );
     }
 
     #[test]
@@ -567,6 +771,12 @@ mod tests {
         let bi = test_bi();
         let result = trust_create_challenge_on(&bi, String::new());
         assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains(codes::VALID_7013),
+            "expected {}, got: {msg}",
+            codes::VALID_7013
+        );
     }
 
     #[test]
@@ -584,13 +794,42 @@ mod tests {
         let bi = test_bi();
         let result = trust_verify_attestation_on(&bi, "not json".to_owned());
         assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains(codes::VALID_7012),
+            "expected {}, got: {msg}",
+            codes::VALID_7012
+        );
     }
 
     #[test]
-    fn trust_verify_response_rejects_invalid_json() {
+    fn trust_verify_response_rejects_invalid_challenge_json() {
+        // Malformed JSON in the CHALLENGE position.
         let bi = test_bi();
         let result = trust_verify_response_on(&bi, "bad".to_owned(), "bad".to_owned());
         assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains(codes::VALID_7016),
+            "expected {}, got: {msg}",
+            codes::VALID_7016
+        );
+    }
+
+    #[test]
+    fn trust_verify_response_rejects_invalid_response_json() {
+        // Malformed JSON in the RESPONSE position: the challenge parses, so
+        // the failure is attributed to the response argument.
+        let bi = test_bi();
+        let challenge = trust_create_challenge_on(&bi, "did:key:target".to_owned()).unwrap();
+        let result = trust_verify_response_on(&bi, challenge.challenge_json, "bad".to_owned());
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains(codes::VALID_7017),
+            "expected {}, got: {msg}",
+            codes::VALID_7017
+        );
     }
 
     #[test]
@@ -604,6 +843,12 @@ mod tests {
             "not json".to_owned(),
         );
         assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains(codes::VALID_7030),
+            "expected {}, got: {msg}",
+            codes::VALID_7030
+        );
     }
 
     #[test]
@@ -617,6 +862,33 @@ mod tests {
             "[]".to_owned(),
         );
         assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains(codes::VALID_7031),
+            "expected {}, got: {msg}",
+            codes::VALID_7031
+        );
+    }
+
+    #[test]
+    fn verify_participation_requirements_unmet_requirement_fails_with_admission_code() {
+        // A requirement with no satisfying profiles fails the admission check
+        // itself (not JSON parsing), which carries its own per-case code.
+        let bi = test_bi();
+        let requirements = r#"[{"fact":"ParticipationDuration","threshold":{"AtLeast":1},"max_age_secs":3600,"min_contexts":0}]"#;
+        let result = verify_participation_requirements_on(
+            &bi,
+            "did:key:alice".to_owned(),
+            requirements.to_owned(),
+            "[]".to_owned(),
+        );
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains(codes::VALID_7032),
+            "expected {}, got: {msg}",
+            codes::VALID_7032
+        );
     }
 
     #[test]
@@ -641,6 +913,12 @@ mod tests {
             "[]".to_owned(),
         );
         assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains(codes::VALID_7000),
+            "expected {}, got: {msg}",
+            codes::VALID_7000
+        );
     }
 
     #[test]
@@ -653,6 +931,240 @@ mod tests {
             "not-a-did".to_owned(),
             "[]".to_owned(),
             "[]".to_owned(),
+        );
+        assert!(result.is_err());
+    }
+
+    // -- check_capability_requirements (§7.3.4.4, SCP-ACR-008) --
+
+    #[test]
+    fn check_capability_requirements_rejects_invalid_requirements_json() {
+        let bi = test_bi();
+        let result = check_capability_requirements_on(
+            &bi,
+            "ctx-1".to_owned(),
+            "did:key:alice".to_owned(),
+            "not json".to_owned(),
+            "[]".to_owned(),
+            "[]".to_owned(),
+        );
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains(codes::VALID_7073),
+            "error should contain SCP-VALID-7073, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn check_capability_requirements_rejects_invalid_capabilities_json() {
+        let bi = test_bi();
+        let result = check_capability_requirements_on(
+            &bi,
+            "ctx-1".to_owned(),
+            "did:key:alice".to_owned(),
+            "[]".to_owned(),
+            "not json".to_owned(),
+            "[]".to_owned(),
+        );
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains(codes::VALID_7074),
+            "error should contain SCP-VALID-7074, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn check_capability_requirements_rejects_invalid_verifications_json() {
+        let bi = test_bi();
+        let result = check_capability_requirements_on(
+            &bi,
+            "ctx-1".to_owned(),
+            "did:key:alice".to_owned(),
+            "[]".to_owned(),
+            "[]".to_owned(),
+            "not json".to_owned(),
+        );
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains(codes::VALID_7075),
+            "error should contain SCP-VALID-7075, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn check_capability_requirements_empty_inputs_succeeds() {
+        let bi = test_bi();
+        let result = check_capability_requirements_on(
+            &bi,
+            "ctx-1".to_owned(),
+            "did:key:alice".to_owned(),
+            "[]".to_owned(),
+            "[]".to_owned(),
+            "[]".to_owned(),
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn check_capability_requirements_rejects_empty_subject() {
+        let bi = test_bi();
+        let result = check_capability_requirements_on(
+            &bi,
+            "ctx-1".to_owned(),
+            String::new(),
+            "[]".to_owned(),
+            "[]".to_owned(),
+            "[]".to_owned(),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn check_capability_requirements_rejects_malformed_subject() {
+        let bi = test_bi();
+        let result = check_capability_requirements_on(
+            &bi,
+            "ctx-1".to_owned(),
+            "not-a-did".to_owned(),
+            "[]".to_owned(),
+            "[]".to_owned(),
+            "[]".to_owned(),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn check_capability_requirements_self_attested_present_succeeds() {
+        // A SelfAttested requirement is satisfied by a declared capability — no
+        // challenge verification (and thus no signature check) is needed.
+        let bi = test_bi();
+        let requirements = r#"[{"capability":"scp:capability:schema-validation/v1","verification_level":"SelfAttested"}]"#;
+        let capabilities = r#"["scp:capability:schema-validation/v1"]"#;
+        let result = check_capability_requirements_on(
+            &bi,
+            "ctx-1".to_owned(),
+            "did:key:alice".to_owned(),
+            requirements.to_owned(),
+            capabilities.to_owned(),
+            "[]".to_owned(),
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn check_capability_requirements_self_attested_missing_fails() {
+        let bi = test_bi();
+        let requirements = r#"[{"capability":"scp:capability:schema-validation/v1","verification_level":"SelfAttested"}]"#;
+        let result = check_capability_requirements_on(
+            &bi,
+            "ctx-1".to_owned(),
+            "did:key:alice".to_owned(),
+            requirements.to_owned(),
+            "[]".to_owned(),
+            "[]".to_owned(),
+        );
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains(codes::VALID_7076),
+            "error should contain SCP-VALID-7076, got: {msg}"
+        );
+    }
+
+    /// Builds a genuinely verifier-signed `ChallengeVerification` JSON array
+    /// bound to `subject_did`/`context_id`, far-future expiry, verifier DID
+    /// derived from a fixed key (did:dht:z, offline-resolvable by the production
+    /// `IdentityDidPublicKeyResolver`).
+    fn signed_cv_json(uri: &str, subject_did: &str, context_id: &str) -> String {
+        use ed25519_dalek::{Signer, SigningKey};
+
+        let verifier_key = SigningKey::from_bytes(&[9u8; 32]);
+        let verifier_pub = verifier_key.verifying_key().to_bytes();
+        let verifier_did = scp_did::did_dht_from_public_key(&verifier_pub);
+        let cap: scp_core::trust::CapabilityUri = uri.parse().unwrap();
+
+        let mut cv = scp_core::trust::ChallengeVerification {
+            verification_id: "bridge-test-challenge".to_owned(),
+            verifier_did,
+            subject_did: subject_did.into(),
+            capability_uri: uri.to_owned(),
+            challenge_type: scp_core::trust::ChallengeType::Uri(cap.clone()),
+            verification_method: scp_core::trust::VerificationMethod::ChallengeVerified {
+                challenge_type: scp_core::trust::ChallengeType::Uri(cap),
+            },
+            passed: true,
+            score: None,
+            test_count: 1,
+            pass_count: 1,
+            result: serde_json::Value::Bool(true),
+            completed_at: 1_700_000_000,
+            verified_at: 1_700_000_000,
+            expires_at: 4_000_000_000,
+            context_id: Some(context_id.to_owned()),
+            verifier_signature: Vec::new(),
+        };
+        let canonical = scp_core::trust::canonical_challenge_verification_bytes(&cv).unwrap();
+        cv.verifier_signature = verifier_key.sign(&canonical).to_bytes().to_vec();
+        serde_json::to_string(&vec![cv]).unwrap()
+    }
+
+    #[test]
+    fn check_capability_requirements_challenge_verified_happy_path() {
+        let bi = test_bi();
+        let uri = "scp:capability:prompt-injection-resistance/v1";
+        let subject = "did:dht:zResponder";
+        let ctx = "ctx-admission";
+        let requirements =
+            format!(r#"[{{"capability":"{uri}","verification_level":"ChallengeVerified"}}]"#);
+        let cvs = signed_cv_json(uri, subject, ctx);
+        let result = check_capability_requirements_on(
+            &bi,
+            ctx.to_owned(),
+            subject.to_owned(),
+            requirements,
+            "[]".to_owned(),
+            cvs,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn check_capability_requirements_rejects_cross_subject_replay() {
+        let bi = test_bi();
+        let uri = "scp:capability:prompt-injection-resistance/v1";
+        let ctx = "ctx-admission";
+        let requirements =
+            format!(r#"[{{"capability":"{uri}","verification_level":"ChallengeVerified"}}]"#);
+        let cvs = signed_cv_json(uri, "did:dht:zVictim", ctx);
+        let result = check_capability_requirements_on(
+            &bi,
+            ctx.to_owned(),
+            "did:dht:zAttacker".to_owned(),
+            requirements,
+            "[]".to_owned(),
+            cvs,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn check_capability_requirements_rejects_cross_context_replay() {
+        let bi = test_bi();
+        let uri = "scp:capability:prompt-injection-resistance/v1";
+        let subject = "did:dht:zResponder";
+        let requirements =
+            format!(r#"[{{"capability":"{uri}","verification_level":"ChallengeVerified"}}]"#);
+        let cvs = signed_cv_json(uri, subject, "ctx-other");
+        let result = check_capability_requirements_on(
+            &bi,
+            "ctx-admission".to_owned(),
+            subject.to_owned(),
+            requirements,
+            "[]".to_owned(),
+            cvs,
         );
         assert!(result.is_err());
     }
@@ -673,6 +1185,12 @@ mod tests {
             "[]".to_owned(),
         );
         assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains(codes::VALID_7040),
+            "expected {}, got: {msg}",
+            codes::VALID_7040
+        );
     }
 
     #[test]
@@ -691,6 +1209,204 @@ mod tests {
             "[]".to_owned(),
         );
         assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains(codes::VALID_7042),
+            "expected {}, got: {msg}",
+            codes::VALID_7042
+        );
+    }
+
+    #[test]
+    fn aggregate_trust_input_rejects_empty_did() {
+        let bi = test_bi();
+        let result = aggregate_trust_input_on(
+            &bi,
+            "ctx-1".to_owned(),
+            String::new(),
+            "[]".to_owned(),
+            "[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]".to_owned(),
+            "[]".to_owned(),
+            "{}".to_owned(),
+            "{}".to_owned(),
+            "[]".to_owned(),
+            "[]".to_owned(),
+        );
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains(codes::VALID_7041),
+            "expected {}, got: {msg}",
+            codes::VALID_7041
+        );
+    }
+
+    #[test]
+    fn aggregate_trust_input_rejects_invalid_merkle_root_json() {
+        let bi = test_bi();
+        let result = aggregate_trust_input_on(
+            &bi,
+            "ctx-1".to_owned(),
+            "did:key:test".to_owned(),
+            "[]".to_owned(),
+            "not json".to_owned(),
+            "[]".to_owned(),
+            "{}".to_owned(),
+            "{}".to_owned(),
+            "[]".to_owned(),
+            "[]".to_owned(),
+        );
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains(codes::VALID_7043),
+            "expected {}, got: {msg}",
+            codes::VALID_7043
+        );
+    }
+
+    #[test]
+    fn aggregate_trust_input_rejects_wrong_length_merkle_root() {
+        let bi = test_bi();
+        let result = aggregate_trust_input_on(
+            &bi,
+            "ctx-1".to_owned(),
+            "did:key:test".to_owned(),
+            "[]".to_owned(),
+            "[0,0,0]".to_owned(),
+            "[]".to_owned(),
+            "{}".to_owned(),
+            "{}".to_owned(),
+            "[]".to_owned(),
+            "[]".to_owned(),
+        );
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains(codes::VALID_7044),
+            "expected {}, got: {msg}",
+            codes::VALID_7044
+        );
+    }
+
+    #[test]
+    fn aggregate_trust_input_rejects_invalid_consequence_rules_json() {
+        let bi = test_bi();
+        let result = aggregate_trust_input_on(
+            &bi,
+            "ctx-1".to_owned(),
+            "did:key:test".to_owned(),
+            "[]".to_owned(),
+            "[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]".to_owned(),
+            "not json".to_owned(),
+            "{}".to_owned(),
+            "{}".to_owned(),
+            "[]".to_owned(),
+            "[]".to_owned(),
+        );
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains(codes::VALID_7045),
+            "expected {}, got: {msg}",
+            codes::VALID_7045
+        );
+    }
+
+    #[test]
+    fn aggregate_trust_input_rejects_invalid_threshold_requirements_json() {
+        let bi = test_bi();
+        let result = aggregate_trust_input_on(
+            &bi,
+            "ctx-1".to_owned(),
+            "did:key:test".to_owned(),
+            "[]".to_owned(),
+            "[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]".to_owned(),
+            "[]".to_owned(),
+            "not json".to_owned(),
+            "{}".to_owned(),
+            "[]".to_owned(),
+            "[]".to_owned(),
+        );
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains(codes::VALID_7046),
+            "expected {}, got: {msg}",
+            codes::VALID_7046
+        );
+    }
+
+    #[test]
+    fn aggregate_trust_input_rejects_invalid_attestor_sets_json() {
+        let bi = test_bi();
+        let result = aggregate_trust_input_on(
+            &bi,
+            "ctx-1".to_owned(),
+            "did:key:test".to_owned(),
+            "[]".to_owned(),
+            "[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]".to_owned(),
+            "[]".to_owned(),
+            "{}".to_owned(),
+            "not json".to_owned(),
+            "[]".to_owned(),
+            "[]".to_owned(),
+        );
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains(codes::VALID_7047),
+            "expected {}, got: {msg}",
+            codes::VALID_7047
+        );
+    }
+
+    #[test]
+    fn aggregate_trust_input_rejects_invalid_cached_attestations_json() {
+        let bi = test_bi();
+        let result = aggregate_trust_input_on(
+            &bi,
+            "ctx-1".to_owned(),
+            "did:key:test".to_owned(),
+            "[]".to_owned(),
+            "[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]".to_owned(),
+            "[]".to_owned(),
+            "{}".to_owned(),
+            "{}".to_owned(),
+            "not json".to_owned(),
+            "[]".to_owned(),
+        );
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains(codes::VALID_7048),
+            "expected {}, got: {msg}",
+            codes::VALID_7048
+        );
+    }
+
+    #[test]
+    fn aggregate_trust_input_rejects_invalid_challenge_results_json() {
+        let bi = test_bi();
+        let result = aggregate_trust_input_on(
+            &bi,
+            "ctx-1".to_owned(),
+            "did:key:test".to_owned(),
+            "[]".to_owned(),
+            "[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]".to_owned(),
+            "[]".to_owned(),
+            "{}".to_owned(),
+            "{}".to_owned(),
+            "[]".to_owned(),
+            "not json".to_owned(),
+        );
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains(codes::VALID_7049),
+            "expected {}, got: {msg}",
+            codes::VALID_7049
+        );
     }
 
     #[test]

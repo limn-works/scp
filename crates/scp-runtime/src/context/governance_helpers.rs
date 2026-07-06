@@ -30,8 +30,8 @@
 
 use std::sync::Arc;
 
-use scp_identity::DID;
-use scp_primitives::Clock;
+use scp_clock::Clock;
+use scp_did::DID;
 use scp_protocol::context::governance::mls_integration::{
     MlsImpact, classify_action, generate_mls_operations,
 };

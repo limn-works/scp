@@ -15,7 +15,7 @@ default = []
 testing = [
     "scp-mls/testing",
     "scp-protocol/testing",
-    "scp-primitives/testing",
+    "scp-did/testing",
 ]
 
 [dependencies]
@@ -25,7 +25,8 @@ testing = [
 # keeps the participant driver compilable to wasm32-unknown-unknown. All
 # protocol logic is called through scp-mls / scp-protocol / scp-event-log; this
 # crate re-derives nothing.
-scp-primitives = { path = "../scp-primitives", version = "=0.1.0-beta.2" }
+scp-clock = { path = "../scp-clock", version = "=0.1.0-beta.2" }
+scp-did = { path = "../scp-did", version = "=0.1.0-beta.2" }
 scp-protocol = { path = "../scp-protocol", version = "=0.1.0-beta.2" }
 scp-event-log = { path = "../scp-event-log", version = "=0.1.0-beta.2" }
 scp-mls = { path = "../scp-mls", version = "=0.1.0-beta.2" }
@@ -36,6 +37,13 @@ scp-mls = { path = "../scp-mls", version = "=0.1.0-beta.2" }
 openmls = { workspace = true, features = ["libcrux-provider", "js"] }
 tls_codec = "0.4"
 
+# MessagePack is the codebase's name-tagged, width-/endianness-independent wire
+# form (ADR-057, §17.5). The driver serializes each context's participant
+# snapshot with it for out-of-band persistence through the `Storage` trait, so a
+# native and a wasm32 build round-trip byte-compatibly.
+serde = { workspace = true }
+rmp-serde = { workspace = true }
+zeroize = { workspace = true }
 thiserror = { workspace = true }
 
 # wasm32 backends: mirror scp-mls/Cargo.toml so the driver compiles to wasm32.
@@ -50,7 +58,7 @@ getrandom_04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] 
 uuid = { version = "1", features = ["v4", "js"] }
 
 [dev-dependencies]
-scp-primitives = { path = "../scp-primitives", features = ["testing"] }
+scp-did = { path = "../scp-did", features = ["testing"] }
 scp-protocol = { path = "../scp-protocol", features = ["testing"] }
 scp-mls = { path = "../scp-mls", features = ["testing"] }
 

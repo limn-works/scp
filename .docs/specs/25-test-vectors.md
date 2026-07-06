@@ -428,6 +428,35 @@ checkpoint.event_count == 9
 
 Reference implementation and assertions: `crates/scp-event-log/tests/test_vectors.rs` (`vector_32_typed_leaf_and_checkpoint_kat`, `vector_33_checkpoint_root_equals_tree_root_kat`). Regenerate with `cargo test -p scp-event-log --test test_vectors -- --nocapture`.
 
+### Vector 35: `DataProvenance` -> `provenance_hash` KAT (§24.3.3)
+
+Pins the canonical provenance-hash encoding — `SHA-256(rmp_serde::to_vec(DataProvenance))`, positional MessagePack in struct-declaration field order (§24.3.3). This is the single encoding used by the signed BroadcastEnvelope `provenance_hash` (§5.14.5), the inner-envelope provenance hash, and the FFI event-log `ProvenanceAttached` / `ProvenanceReceived` payloads — so this hash is identical whether computed on a signed path or recorded in an event log. `payment_amount` (an `Amount`) encodes as a **native MessagePack integer** (`uint`) here: ADR-060's decimal-string wire form applies only to human-readable encodings (JSON); binary MessagePack keeps the native `u64`, so this KAT is byte-identical to its pre-ADR-060 value.
+
+```
+DataProvenance (all fields populated; field order per §24.2.1):
+  source_context:     "ctx-kat-provenance"
+  source_type:        Persistent
+  counterparties:     ["did:key:alice", "did:key:bob"]
+  purpose:            Some("kat")
+  discovery_method:   SharedContext("ctx-shared")
+  age:                300 s
+  memory_scope:       Full
+  chain_depth:        1
+  chain_path:         Some(["ctx-hop-1"])
+  payment_amount:     Some(Amount(1000))   # wire: native MessagePack uint 1000 (ADR-060 binary path)
+  payment_adapter:    Some("stripe")
+  payment_receipt_id: Some([0x11; 32])
+
+provenance_hash = SHA-256(rmp_serde::to_vec(DataProvenance))
+  = 0x12ea6cf53e3e2fe1c851214d6c9b1acf1338e835bcb91271c8bcdf04e553ce68
+
+Absent-provenance sentinel (ADR-002):
+  provenance_hash = SHA-256(0x00)
+  = 0x6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d
+```
+
+Reference implementation and assertions: `crates/scp-protocol/src/crypto/sender_keys/broadcast.rs` (`vector_35_data_provenance_hash_kat`). Regenerate with `cargo test -p scp-protocol vector_35_data_provenance_hash_kat -- --nocapture`.
+
 ## 25.9 Key Continuity Fingerprint Vectors (§9.11)
 
 Domain: `"SCP-KEY-CONTINUITY-V1:"`
@@ -707,11 +736,11 @@ To verify an implementation against these test vectors:
 The Rust reference implementation can generate exact expected outputs for all vectors. Run the test vector generation tool:
 
 ```bash
-cargo test -p scp-core --test test_vectors -- --nocapture
+cargo test -p scp-runtime --test test_vectors -- --nocapture
 cargo test -p scp-event-log --test test_vectors -- --nocapture
 ```
 
-The test vector generation test is defined in `crates/scp-core/tests/test_vectors.rs` and `crates/scp-event-log/tests/test_vectors.rs`. These tests print hex-encoded intermediate and final values for each vector defined above.
+The test vector generation test is defined in `crates/scp-runtime/tests/test_vectors.rs` and `crates/scp-event-log/tests/test_vectors.rs`. These tests print hex-encoded intermediate and final values for each vector defined above.
 
 Independent implementations SHOULD run these tests against the Rust implementation to obtain the expected outputs, then embed those outputs in their own test suites.
 
@@ -777,3 +806,49 @@ Expected v2 pseudonym public key (epoch = 1):
 ```
 
 These vectors are mechanically enforced by the Rust known-answer test `derive_pseudonym_keypair_known_answer_vectors` in `crates/scp-platform/src/pseudonym.rs`.
+
+## 25.20 Trust Attestation Signing Vectors (§7.4.1, §9.5.2)
+
+Domain: `"SCP-ATTESTATION-V1:"`
+
+### Vector 34: Trust Attestation Signature
+
+The signing payload for the common attestation envelope (`trust::Attestation`, §7.4.1) uses the canonical hash construction from §9.5.1 with domain separator `"SCP-ATTESTATION-V1:"` and the §9.5.2 Attestation field order. The `claim` field is serialized as RFC 8785 (JCS) canonical JSON — sorted keys, no whitespace — so a claim constructed with any key insertion order yields identical bytes. Per the §9.5.2 I-JSON constraint, claim numeric values MUST be within |n| ≤ 2^53 (this vector's claim uses `42`). `evidence` and `revocation_status` are serialized as MessagePack (`rmp_serde::to_vec_named`). The renewal fields (`renewal_interval`, `renewed_at`) are excluded from the signed preimage (§9.5.2) and do not appear below.
+
+Note: this is the *signature* construction for the generic trust attestation envelope. It is distinct from the IdentityLinkAttestation signature (§25.13, domain `"SCP-IDENTITY-LINK-ATTESTATION-V1:"`, MessagePack claim) and from the attestation *ID* computation (§25.16, domain `"SCP-ATTESTATION-ID-V1:"`).
+
+```
+Input:
+  id:                "att-trust-001"
+  attestation_type:  Endorsement  (type tag 4 per attestation_type_tag())
+  issuer:            "did:dht:z6MkIssuer"
+  subject:           "did:dht:z6MkSubject"
+  claim:             {"level": "gold", "score": 42}
+                       JCS: {"level":"gold","score":42}  (27 bytes)
+  evidence:          absent (use absent sentinel)
+  issued_at:         1700000000
+  expires_at:        absent (no expiry — use absent sentinel)
+  revocation_status: RevocationStatus::Active
+                       msgpack: 0xa6 "Active"  (7 bytes)
+
+Canonical hash input:
+  "SCP-ATTESTATION-V1:"                          (19 bytes, no length prefix)
+  || BE32(13) || "att-trust-001"                  (4 + 13 = 17 bytes — id)
+  || BE16(4)                                      (2 bytes — attestation_type tag)
+  || BE32(18) || "did:dht:z6MkIssuer"            (4 + 18 = 22 bytes — issuer)
+  || BE32(19) || "did:dht:z6MkSubject"           (4 + 19 = 23 bytes — subject)
+  || BE32(27) || {"level":"gold","score":42}      (4 + 27 = 31 bytes — claim as JCS)
+  || SHA-256(0x00)                                 (32 bytes, raw — no length prefix — absent evidence sentinel)
+  || BE64(1700000000)                              (8 bytes — issued_at)
+  || SHA-256(0x00)                                 (32 bytes, raw — no length prefix — absent expires_at sentinel)
+  || BE32(7)  || msgpack(Active)                  (4 + 7 = 11 bytes — revocation_status as MessagePack)
+
+Total: 19 + 17 + 2 + 22 + 23 + 31 + 32 + 8 + 32 + 11 = 197 bytes
+
+Expected SHA-256 (= canonical_attestation_bytes output):
+  0x6d07c76821a2ae4dd830ca117aa9fd8e30232cca72459a4d129432f56d87a08c
+```
+
+The Ed25519 signature is computed over the 32-byte canonical hash. Sign with the reference key (§25.2) and verify per §25.17 step 5; Ed25519 is deterministic, so the reference implementation reproduces the same signature bytes on every run.
+
+This vector is mechanically enforced by `vector_34_trust_attestation_signature` in `crates/scp-runtime/tests/test_vectors.rs`, which pins the expected hash, reconstructs the preimage byte-for-byte, and verifies the signed attestation through the production `verify_attestation` path.

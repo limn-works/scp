@@ -34,7 +34,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use scp_identity::DID;
+use scp_did::DID;
 use scp_protocol::context::ContextError;
 
 use crate::context::supervisor::identity_capability::OwnedIdentityDid;
@@ -863,14 +863,17 @@ mod tests {
 
         let (sup, handle) = test_handle();
         let did = DID("did:dht:z6MkAliceKpStore".to_owned());
-        let crypto = Arc::new(MlsCryptoProvider::new(did.0.clone()));
+        let crypto = Arc::new(MlsCryptoProvider::new(
+            did.0.clone(),
+            std::sync::Arc::new(scp_clock::SystemClock),
+        ));
         let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
             Arc::new(SpawnBlockingStorageAdapter::new(Arc::new(
                 InMemoryStorage::new(),
             )));
         let transport: Arc<dyn crate::context::builder::ContextTransportProvider> =
             Arc::new(crate::context::builder::NotConfiguredTransportProvider);
-        let clock: Arc<dyn scp_primitives::Clock> = Arc::new(scp_primitives::SystemClock);
+        let clock: Arc<dyn scp_clock::Clock> = Arc::new(scp_clock::SystemClock);
         let deps = KeyPackageStoreDeps {
             mls: Arc::clone(crypto.mls_backend()),
             mls_storage,

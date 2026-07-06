@@ -24,10 +24,10 @@
 
 use std::borrow::Cow;
 
-use scp_primitives::DID;
+use scp_did::DID;
 use serde::{Deserialize, Serialize};
 
-use crate::crypto::ed25519::verify_ed25519_signature;
+use scp_crypto::verify_ed25519_signature;
 
 // ---------------------------------------------------------------------------
 // Renewal interval constants (§3.5.2)

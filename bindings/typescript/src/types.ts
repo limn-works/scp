@@ -644,8 +644,14 @@ export interface ToolDefinition {
 
 /** Per-invocation cost metadata for a tool (spec section 5.4.1). */
 export interface ToolCost {
-  /** Cost per invocation in the smallest currency unit. */
-  readonly amount: number;
+  /**
+   * Cost per invocation in the smallest currency unit.
+   *
+   * A `bigint` so the full `u64` range round-trips exactly across the FFI
+   * boundary — a JS `number` loses precision above 2^53 (ADR-060 native-integer
+   * money surface).
+   */
+  readonly amount: bigint;
   /** ISO 4217 or protocol-defined currency code. */
   readonly currency: string;
   /** DID of the payment recipient. May differ from the tool operator. */
@@ -867,7 +873,7 @@ export interface EventClaim {
  * Layer 1 of the trust model: protocol-enforcement results (mechanical,
  * pass/fail). Each field is one stage of the 11-step ADR-016 UCAN
  * validation pipeline, surfaced by the read-only `ucanEvaluate` diagnostic
- * (spec §7.2.4, ADR-057 Decision 3).
+ * (spec §7.2.4, ADR-059 Decision 3).
  *
  * The six booleans cross the FFI already camelCased (the NAPI
  * `NapiCapabilityValidation` `#[napi(object)]`), so the SDK consumes them
@@ -1266,6 +1272,569 @@ export interface RequireParticipation {
   readonly maxAgeSecs: number;
   /** Minimum number of independent source contexts (distinct signer keys). */
   readonly minContexts: number;
+}
+
+/**
+ * Encodes a typed {@link RequireParticipation} array to the JSON wire shape
+ * expected by the Rust bridge (`Vec<RequireParticipation>`).
+ *
+ * Field names are snake_cased to match `serde_json::to_string`. `fact` is a
+ * bare variant string and `threshold` is already the serde-canonical
+ * `{ "<Op>": value }` shape, so both pass through unchanged.
+ */
+export function encodeRequireParticipation(requirements: readonly RequireParticipation[]): string {
+  return JSON.stringify(
+    requirements.map((r) => ({
+      fact: r.fact,
+      threshold: r.threshold,
+      max_age_secs: r.maxAgeSecs,
+      min_contexts: r.minContexts,
+    })),
+  );
+}
+
+/**
+ * Throws when a fixed-length byte-array field has the wrong number of
+ * elements, so a malformed profile/verification fails at encode time with a
+ * field-named error instead of surfacing as a Rust `[u8; N]` deserialization
+ * error after the bridge call. Mirrors the Python SDK's construction-time
+ * checks (ADR-058 misuse resistance).
+ */
+function requireByteLength(
+  typeName: string,
+  fieldName: string,
+  expectedLength: number,
+  actual: readonly number[],
+): void {
+  if (actual.length !== expectedLength) {
+    throw new Error(
+      `${typeName}.${fieldName} must be exactly ${expectedLength} elements, got ${actual.length}`,
+    );
+  }
+}
+
+/**
+ * Encodes a typed {@link ParticipationProfile} array to the JSON wire shape
+ * expected by the Rust bridge (`Vec<ParticipationProfile>`).
+ *
+ * Field names are snake_cased to match `serde_json::to_string`. Byte-array
+ * fields (`eventLogRoot`, `signerPublicKey`, `signature`) pass through as
+ * number arrays.
+ *
+ * @throws Error if `eventLogRoot` / `signerPublicKey` are not exactly 32
+ *   elements or `signature` is not exactly 64 elements (before any bridge
+ *   call).
+ */
+export function encodeParticipationProfile(profiles: readonly ParticipationProfile[]): string {
+  for (const p of profiles) {
+    requireByteLength("ParticipationProfile", "eventLogRoot", 32, p.eventLogRoot);
+    requireByteLength("ParticipationProfile", "signerPublicKey", 32, p.signerPublicKey);
+    requireByteLength("ParticipationProfile", "signature", 64, p.signature);
+  }
+  return JSON.stringify(
+    profiles.map((p) => ({
+      subject_did: p.subjectDid,
+      participation_duration_secs: p.participationDurationSecs,
+      governance_actions_against: p.governanceActionsAgainst,
+      governance_actions_by: p.governanceActionsBy,
+      tool_invocation_count: p.toolInvocationCount,
+      tool_invocation_count_anchored: p.toolInvocationCountAnchored,
+      context_creation_count: p.contextCreationCount,
+      role_progression_count: p.roleProgressionCount,
+      attestation_count: p.attestationCount,
+      updated_at: p.updatedAt,
+      event_log_root: p.eventLogRoot,
+      signer_public_key: p.signerPublicKey,
+      signature: p.signature,
+    })),
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Capability admission (§7.3.4.4, SCP-ACR-008, ADR-058)
+// ---------------------------------------------------------------------------
+
+/**
+ * How a capability must be verified for admission.
+ *
+ * Mirrors the Rust `VerificationLevel` enum (`scp-core`). Serializes as the
+ * bare variant name string.
+ *
+ * - `"SelfAttested"` — the agent claims the capability (present in their
+ *   capability list); no challenge proof required.
+ * - `"ChallengeVerified"` — the capability was verified through the
+ *   challenge-response protocol. Also satisfies `SelfAttested`.
+ */
+export type VerificationLevel = "SelfAttested" | "ChallengeVerified";
+
+/**
+ * A single admission requirement: a capability URI and the minimum
+ * verification level needed.
+ *
+ * Mirrors the Rust `CapabilityRequirement` struct (`scp-core`). See §7.3.4.4.
+ */
+export interface CapabilityRequirement {
+  /** The capability URI that must be present. */
+  readonly capability: string;
+  /** The minimum verification level required. */
+  readonly verificationLevel: VerificationLevel;
+}
+
+/**
+ * How a capability was verified, as recorded in a {@link ChallengeVerification}.
+ *
+ * Mirrors the Rust `VerificationMethod` enum (`scp-core`). Serializes as the
+ * bare string `"SelfAttested"` or the tagged
+ * `{ "ChallengeVerified": { "challenge_type": <uri> } }`.
+ *
+ * SECURITY: `verificationMethod` is NOT covered by the verifier signature
+ * (ADR-017 caveat) — consumers MUST NOT key trust decisions on it.
+ */
+export type ChallengeVerificationMethod =
+  | { readonly kind: "SelfAttested" }
+  | { readonly kind: "ChallengeVerified"; readonly challengeType: string };
+
+/**
+ * A signed record that a specific verifier tested a capability and the agent
+ * passed (spec §7.3.4.2, ADR-017).
+ *
+ * Mirrors the Rust `ChallengeVerification` struct (`scp-core`). Pass a list of
+ * these to {@link SCP.checkCapabilityRequirements} to satisfy `ChallengeVerified`
+ * requirements.
+ *
+ * SECURITY (ADR-017 caveat): only the *signed* fields bind trust —
+ * `verificationId`, `verifierDid`, `subjectDid`, `capabilityUri`,
+ * `challengeType`, `passed`, `score`, `testCount`, `passCount`, `verifiedAt`,
+ * `expiresAt`, `contextId`. The `result`, `completedAt`, and
+ * `verificationMethod` fields are NOT signed and can be altered after minting
+ * without invalidating the signature. Consumers MUST NOT key trust decisions
+ * on those unsigned fields.
+ */
+export interface ChallengeVerification {
+  /** Unique verification identifier (derived from the challenge ID). */
+  readonly verificationId: string;
+  /** DID of the verifier who issued and verified the challenge. */
+  readonly verifierDid: string;
+  /** DID of the subject who answered the challenge. */
+  readonly subjectDid: string;
+  /** The capability URI that was verified. */
+  readonly capabilityUri: string;
+  /** The type of challenge that was verified (a capability URI string). */
+  readonly challengeType: string;
+  /** How the capability was verified (unsigned metadata). */
+  readonly verificationMethod: ChallengeVerificationMethod;
+  /** Whether the subject passed the challenge overall. */
+  readonly passed: boolean;
+  /** Total number of test cases in the challenge. */
+  readonly testCount: number;
+  /** Number of test cases the subject passed. */
+  readonly passCount: number;
+  /** The challenge-specific result from the response (arbitrary JSON, unsigned). */
+  readonly result: unknown;
+  /** Unix timestamp (seconds) when the response was completed (unsigned). */
+  readonly completedAt: number;
+  /** Unix timestamp (seconds) when the verification was performed. */
+  readonly verifiedAt: number;
+  /** Unix timestamp (seconds) when this verification expires. */
+  readonly expiresAt: number;
+  /** Ed25519 signature by the verifier over the verification record (64 bytes). */
+  readonly verifierSignature: readonly number[];
+  /** Optional numeric score (0–100) for graded challenges. */
+  readonly score?: number | null;
+  /** Context in which the challenge was issued, if any. */
+  readonly contextId?: string | null;
+}
+
+/**
+ * Encodes a typed {@link CapabilityRequirement} array to the JSON wire shape
+ * expected by the Rust bridge (`Vec<CapabilityRequirement>`).
+ *
+ * `verificationLevel` serializes as the bare variant string.
+ */
+export function encodeCapabilityRequirements(
+  requirements: readonly CapabilityRequirement[],
+): string {
+  return JSON.stringify(
+    requirements.map((r) => ({
+      capability: r.capability,
+      verification_level: r.verificationLevel,
+    })),
+  );
+}
+
+function encodeChallengeVerificationMethod(method: ChallengeVerificationMethod): unknown {
+  switch (method.kind) {
+    case "SelfAttested":
+      return "SelfAttested";
+    case "ChallengeVerified":
+      return { ChallengeVerified: { challenge_type: method.challengeType } };
+    default: {
+      const exhaustive: never = method;
+      throw new Error(`unknown ChallengeVerificationMethod kind: ${JSON.stringify(exhaustive)}`);
+    }
+  }
+}
+
+/**
+ * Encodes a typed {@link ChallengeVerification} array to the JSON wire shape
+ * expected by the Rust bridge (`Vec<ChallengeVerification>`).
+ *
+ * Field names are snake_cased to match `serde_json::to_string`. The
+ * `verificationMethod` discriminated union is encoded to the serde-tagged
+ * shape; `verifierSignature` passes through as a number array. `score` and
+ * `contextId` default to `null` when absent.
+ *
+ * @throws Error if `verifierSignature` is not exactly 64 elements (before any
+ *   bridge call).
+ */
+export function encodeChallengeVerifications(
+  verifications: readonly ChallengeVerification[],
+): string {
+  for (const v of verifications) {
+    requireByteLength("ChallengeVerification", "verifierSignature", 64, v.verifierSignature);
+  }
+  return JSON.stringify(
+    verifications.map((v) => ({
+      verification_id: v.verificationId,
+      verifier_did: v.verifierDid,
+      subject_did: v.subjectDid,
+      capability_uri: v.capabilityUri,
+      challenge_type: v.challengeType,
+      verification_method: encodeChallengeVerificationMethod(v.verificationMethod),
+      passed: v.passed,
+      score: v.score ?? null,
+      test_count: v.testCount,
+      pass_count: v.passCount,
+      result: v.result,
+      completed_at: v.completedAt,
+      verified_at: v.verifiedAt,
+      expires_at: v.expiresAt,
+      context_id: v.contextId ?? null,
+      verifier_signature: v.verifierSignature,
+    })),
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Trust aggregation inputs (§7.3, ADR-058)
+// ---------------------------------------------------------------------------
+
+/**
+ * Attestation type (ADR-017).
+ *
+ * Mirrors the Rust `AttestationType` enum (`scp-core`) — the 8 unit variants
+ * serialize as bare PascalCase strings, both as values and as
+ * `thresholdRequirements` / `attestorSets` map keys.
+ */
+export type AttestationType =
+  | "IdentityLink"
+  | "CapabilityDelegation"
+  | "ToolIntegrity"
+  | "AgentCapability"
+  | "Endorsement"
+  | "RoleAssignment"
+  | "ContextEndorsement"
+  | "ParticipationWitness";
+
+/**
+ * Frozen set of {@link AttestationType} variant names. Imported by the SDK
+ * round-trip tests so renaming a variant trips a compile error.
+ */
+export const ATTESTATION_TYPE_VARIANTS = [
+  "IdentityLink",
+  "CapabilityDelegation",
+  "ToolIntegrity",
+  "AgentCapability",
+  "Endorsement",
+  "RoleAssignment",
+  "ContextEndorsement",
+  "ParticipationWitness",
+] as const satisfies readonly AttestationType[];
+
+/**
+ * Type-specific data carried by an {@link EventLogEntry}.
+ *
+ * Mirrors the Rust `EventPayload` (`scp-event-log`): opaque payload bytes as
+ * a JSON number array (`serde_bytes`). An empty `data` array is the canonical
+ * representation for non-parameterized events.
+ */
+export interface EventLogEntryPayload {
+  /** Opaque payload bytes. Interpretation depends on the event type. */
+  readonly data: readonly number[];
+}
+
+/**
+ * A full signed protocol event in a context event log (ADR-011).
+ *
+ * Mirrors the Rust `Event` (`scp-event-log`) serde wire shape the bridge
+ * deserializes for {@link SCP.aggregateTrustInput} (`Vec<Event>`). This is
+ * the INPUT wire form — distinct from the projected {@link Event} the
+ * event-log query surface returns, which omits the hash-chain and signature
+ * fields. Developer-facing fields are camelCase;
+ * {@link encodeEventLogEntries} maps to the snake_case wire shape.
+ */
+export interface EventLogEntry {
+  /** Event type — a Rust `EventType` variant name (e.g. `"MessageSent"`). */
+  readonly eventType: string;
+  /** DID of the actor who produced this event. */
+  readonly actorDid: string;
+  /** Unix timestamp (seconds) when the event was created. */
+  readonly timestamp: number;
+  /** Monotonic event sequence number within the log (0-indexed). */
+  readonly sequence: number;
+  /** Type-specific event data. */
+  readonly payload: EventLogEntryPayload;
+  /**
+   * SHA-256 hash of the previous event (hash chain), exactly 32 bytes as a
+   * number array. `[0; 32]` for the first event (genesis sentinel).
+   */
+  readonly prevHash: readonly number[];
+  /**
+   * Ed25519 signature over the serialized event content (64 bytes as a
+   * number array).
+   */
+  readonly signature: readonly number[];
+}
+
+/**
+ * N-of-M threshold requirement for attestation verification (ADR-017 §7.3.5).
+ *
+ * Mirrors the Rust `ThresholdRequirement` struct (`scp-core`). The three
+ * penalty fields carry the Rust serde defaults when omitted;
+ * {@link encodeThresholdRequirements} emits them explicitly so the wire form
+ * is identical across bindings.
+ */
+export interface ThresholdRequirement {
+  /** The minimum number of valid attestations required (N). */
+  readonly requiredCount: number;
+  /** The total number of attestors in the set (M). Must be >= `requiredCount`. */
+  readonly totalAttestors: number;
+  /** Minimum independence score, in [0.0, 1.0]. */
+  readonly independenceThreshold: number;
+  /** Independence penalty per shared context membership. Default: 0.1. */
+  readonly sharedContextPenalty?: number;
+  /** Maximum total shared-context penalty for a single pair. Default: 0.5. */
+  readonly sharedContextPenaltyCap?: number;
+  /** Independence penalty per mutual endorsement direction. Default: 0.2. */
+  readonly mutualEndorsementPenalty?: number;
+}
+
+/**
+ * Information about an attestor used for independence scoring (ADR-017
+ * §7.3.5).
+ *
+ * Mirrors the Rust `AttestorInfo` struct (`scp-core`). The optional
+ * `attestation` is the full attestation envelope
+ * ({@link CachedAttestationEnvelope}); only attestations matching the
+ * required type are considered.
+ */
+export interface AttestorInfo {
+  /** The DID of the attestor. */
+  readonly did: string;
+  /** Context IDs the attestor is a member of. */
+  readonly contextMemberships: readonly string[];
+  /** DIDs this attestor has endorsed (mutual endorsements reduce independence). */
+  readonly endorsements: readonly string[];
+  /** The attestation provided by this attestor, if any. */
+  readonly attestation?: CachedAttestationEnvelope | null;
+}
+
+/**
+ * Encodes a typed {@link EventLogEntry} array to the JSON wire shape the
+ * Rust bridge deserializes (`Vec<scp_event_log::Event>`).
+ *
+ * Field names are snake_cased to match `serde_json::to_string`; `prevHash` /
+ * `signature` / `payload.data` pass through as number arrays.
+ *
+ * @throws Error if `prevHash` is not exactly 32 elements or `signature` is
+ *   not exactly 64 elements (before any bridge call).
+ */
+export function encodeEventLogEntries(events: readonly EventLogEntry[]): string {
+  for (const e of events) {
+    requireByteLength("EventLogEntry", "prevHash", 32, e.prevHash);
+    requireByteLength("EventLogEntry", "signature", 64, e.signature);
+  }
+  return JSON.stringify(
+    events.map((e) => ({
+      event_type: e.eventType,
+      actor_did: e.actorDid,
+      timestamp: e.timestamp,
+      sequence: e.sequence,
+      payload: { data: e.payload.data },
+      prev_hash: e.prevHash,
+      signature: e.signature,
+    })),
+  );
+}
+
+/**
+ * Encodes a 32-byte Merkle root to the JSON wire shape the Rust bridge
+ * deserializes (`[u8; 32]` as a number array).
+ *
+ * @throws Error if `merkleRoot` is not exactly 32 elements (before any
+ *   bridge call).
+ */
+export function encodeMerkleRoot(merkleRoot: readonly number[]): string {
+  requireByteLength("AggregationInput", "merkleRoot", 32, merkleRoot);
+  return JSON.stringify(merkleRoot);
+}
+
+/**
+ * Encodes a typed per-attestation-type {@link ThresholdRequirement} map to
+ * the JSON wire shape the Rust bridge deserializes
+ * (`HashMap<AttestationType, ThresholdRequirement>`).
+ *
+ * Map keys are the bare {@link AttestationType} variant strings; the three
+ * optional penalty fields default to the Rust serde defaults (0.1 / 0.5 /
+ * 0.2) and are always emitted explicitly.
+ */
+export function encodeThresholdRequirements(
+  requirements: Readonly<Partial<Record<AttestationType, ThresholdRequirement>>>,
+): string {
+  const wire: Record<string, unknown> = {};
+  for (const [attestationType, requirement] of Object.entries(requirements)) {
+    if (requirement === undefined) {
+      continue;
+    }
+    wire[attestationType] = {
+      required_count: requirement.requiredCount,
+      total_attestors: requirement.totalAttestors,
+      independence_threshold: requirement.independenceThreshold,
+      shared_context_penalty: requirement.sharedContextPenalty ?? 0.1,
+      shared_context_penalty_cap: requirement.sharedContextPenaltyCap ?? 0.5,
+      mutual_endorsement_penalty: requirement.mutualEndorsementPenalty ?? 0.2,
+    };
+  }
+  return JSON.stringify(wire);
+}
+
+/**
+ * Encodes a typed per-attestation-type {@link AttestorInfo} map to the JSON
+ * wire shape the Rust bridge deserializes
+ * (`HashMap<AttestationType, Vec<AttestorInfo>>`).
+ *
+ * Map keys are the bare {@link AttestationType} variant strings; the nested
+ * attestation envelope (when present) is encoded exactly as
+ * {@link encodeCachedAttestations} encodes it. An absent `attestation`
+ * serializes as explicit `null` (matching `serde_json::to_string` of the
+ * Rust `Option<Attestation>`).
+ */
+export function encodeAttestorSets(
+  attestorSets: Readonly<Partial<Record<AttestationType, readonly AttestorInfo[]>>>,
+): string {
+  const wire: Record<string, unknown> = {};
+  for (const [attestationType, attestors] of Object.entries(attestorSets)) {
+    if (attestors === undefined) {
+      continue;
+    }
+    wire[attestationType] = attestors.map((a) => ({
+      did: a.did,
+      context_memberships: a.contextMemberships,
+      endorsements: a.endorsements,
+      attestation: a.attestation != null ? encodeCachedAttestationEnvelope(a.attestation) : null,
+    }));
+  }
+  return JSON.stringify(wire);
+}
+
+// ---------------------------------------------------------------------------
+// Challenge trust inputs (§7.3.4, ADR-058)
+// ---------------------------------------------------------------------------
+
+/**
+ * A challenge request for capability verification (ADR-017, spec §7.3.4).
+ *
+ * Mirrors the Rust `ChallengeRequest` struct (`scp-core`) serde wire shape
+ * the bridge deserializes for {@link SCP.trustVerifyResponse}.
+ * `challengeType` is a bare capability URI string (the Rust `ChallengeType`
+ * serializes as its URI string); `timeout` is the Rust `std::time::Duration`
+ * serde shape ({@link CachedAttestationDuration}).
+ */
+export interface ChallengeRequest {
+  /** Unique challenge identifier (UUID v4). */
+  readonly challengeId: string;
+  /** The type of challenge being issued (a capability URI string). */
+  readonly challengeType: string;
+  /** DID of the entity issuing the challenge. */
+  readonly challengerDid: string;
+  /** DID of the entity being challenged. */
+  readonly subjectDid: string;
+  /** The capability URI being tested (spec §7.3.4.1). */
+  readonly capabilityUri: string;
+  /** Challenge-specific parameters (schema, test vectors, limits, etc.). */
+  readonly parameters: unknown;
+  /** Maximum time allowed for the subject to respond (`{ secs, nanos }`). */
+  readonly timeout: CachedAttestationDuration;
+  /** Ed25519 signature over the canonical challenge bytes (64 bytes). */
+  readonly signature: readonly number[];
+}
+
+/**
+ * A response to a challenge request (ADR-017, spec §7.3.4).
+ *
+ * Mirrors the Rust `ChallengeResponse` struct (`scp-core`) serde wire shape
+ * the bridge deserializes for {@link SCP.trustVerifyResponse}.
+ */
+export interface ChallengeResponse {
+  /** The challenge ID this response corresponds to. */
+  readonly challengeId: string;
+  /** DID of the entity responding to the challenge. */
+  readonly responderDid: string;
+  /** Challenge-specific result data (pass/fail, metrics, evidence, etc.). */
+  readonly result: unknown;
+  /** Unix timestamp (seconds) when the response was completed. */
+  readonly completedAt: number;
+  /** Ed25519 signature over the canonical response bytes (64 bytes). */
+  readonly signature: readonly number[];
+}
+
+/**
+ * Encodes a single typed attestation envelope
+ * ({@link CachedAttestationEnvelope}) to the JSON wire shape the Rust bridge
+ * deserializes for {@link SCP.trustVerifyAttestation} (`Attestation`) —
+ * exactly the shape {@link encodeCachedAttestations} nests per entry.
+ */
+export function encodeAttestation(attestation: CachedAttestationEnvelope): string {
+  return JSON.stringify(encodeCachedAttestationEnvelope(attestation));
+}
+
+/**
+ * Encodes a typed {@link ChallengeRequest} to the JSON wire shape the Rust
+ * bridge deserializes (`ChallengeRequest`).
+ *
+ * @throws Error if `signature` is not exactly 64 elements (before any bridge
+ *   call).
+ */
+export function encodeChallengeRequest(challenge: ChallengeRequest): string {
+  requireByteLength("ChallengeRequest", "signature", 64, challenge.signature);
+  return JSON.stringify({
+    challenge_id: challenge.challengeId,
+    challenge_type: challenge.challengeType,
+    challenger_did: challenge.challengerDid,
+    subject_did: challenge.subjectDid,
+    capability_uri: challenge.capabilityUri,
+    parameters: challenge.parameters,
+    timeout: { secs: challenge.timeout.secs, nanos: challenge.timeout.nanos },
+    signature: challenge.signature,
+  });
+}
+
+/**
+ * Encodes a typed {@link ChallengeResponse} to the JSON wire shape the Rust
+ * bridge deserializes (`ChallengeResponse`).
+ *
+ * @throws Error if `signature` is not exactly 64 elements (before any bridge
+ *   call).
+ */
+export function encodeChallengeResponse(response: ChallengeResponse): string {
+  requireByteLength("ChallengeResponse", "signature", 64, response.signature);
+  return JSON.stringify({
+    challenge_id: response.challengeId,
+    responder_did: response.responderDid,
+    result: response.result,
+    completed_at: response.completedAt,
+    signature: response.signature,
+  });
 }
 
 // ---------------------------------------------------------------------------

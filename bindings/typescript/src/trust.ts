@@ -17,7 +17,15 @@
  * See ADR-017 (Trust Engine) and ADR-022 in `.docs/adrs/phase-4.md`.
  */
 
-import type { ConsequenceRule } from "./types";
+import type {
+  AttestationType,
+  AttestorInfo,
+  CachedAttestation,
+  ChallengeVerification,
+  ConsequenceRule,
+  EventLogEntry,
+  ThresholdRequirement,
+} from "./types";
 
 // ---------------------------------------------------------------------------
 // Trust aggregation (spec section 7.3)
@@ -27,15 +35,16 @@ import type { ConsequenceRule } from "./types";
  * Input parameters for trust aggregation.
  *
  * Contains all the data needed to compute an aggregated `TrustInput`
- * for a subject DID within a context.
+ * for a subject DID within a context. Every structured field is typed
+ * (ADR-058); the SDK serializes to the serde wire shapes internally.
  */
 export interface AggregationInput {
   /** The context to aggregate trust inputs for. */
   contextId: string;
   /** The DID of the subject to evaluate. */
   subjectDid: string;
-  /** Event log entries for the context (as plain objects). */
-  events: readonly Record<string, unknown>[];
+  /** Full signed event-log entries for the context. */
+  events: readonly EventLogEntry[];
   /** 32-byte Merkle root as an array of numbers. */
   merkleRoot: readonly number[];
   /**
@@ -45,14 +54,14 @@ export interface AggregationInput {
    * wire shape before forwarding to the bridge.
    */
   consequenceRules?: readonly ConsequenceRule[];
-  /** Threshold requirements per attestation type. */
-  thresholdRequirements?: Readonly<Record<string, unknown>>;
-  /** Attestor information per attestation type. */
-  attestorSets?: Readonly<Record<string, unknown>>;
-  /** Cached attestations to pre-populate the trust store. */
-  cachedAttestations?: readonly Record<string, unknown>[];
-  /** Challenge results to pre-populate the trust store. */
-  challengeResults?: readonly Record<string, unknown>[];
+  /** Typed threshold requirements per attestation type. */
+  thresholdRequirements?: Readonly<Partial<Record<AttestationType, ThresholdRequirement>>>;
+  /** Typed attestor information per attestation type. */
+  attestorSets?: Readonly<Partial<Record<AttestationType, readonly AttestorInfo[]>>>;
+  /** Typed cached attestations to pre-populate the trust store. */
+  cachedAttestations?: readonly CachedAttestation[];
+  /** Typed challenge verifications to pre-populate the trust store. */
+  challengeResults?: readonly ChallengeVerification[];
 }
 
 /**

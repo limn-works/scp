@@ -114,8 +114,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use scp_identity::DID;
-use scp_primitives::Clock;
+use scp_clock::Clock;
+use scp_did::DID;
 use scp_protocol::context::ContextError;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -124,11 +124,11 @@ use zeroize::Zeroizing;
 
 use crate::context::builder::ContextTransportProvider;
 use crate::crypto::mls::backend::{MlsBackend, SignerState};
-use crate::crypto::mls::credential::ScpCredential;
-use crate::crypto::mls::error::MlsError;
-use crate::crypto::mls::group::ScpMlsGroup;
 use crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter;
-use scp_identity::SigningKeyId;
+use scp_did::SigningKeyId;
+use scp_mls::credential::ScpCredential;
+use scp_mls::error::MlsError;
+use scp_mls::group::ScpMlsGroup;
 
 // ---------------------------------------------------------------------------
 // Constants

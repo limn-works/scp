@@ -54,8 +54,8 @@ use std::sync::Arc;
 use sha2::Digest;
 use subtle::ConstantTimeEq;
 
-use scp_identity::DID;
-use scp_primitives::Clock;
+use scp_clock::Clock;
+use scp_did::{DID, SigningKeyId};
 use scp_protocol::context::ContextError;
 use scp_protocol::context::governance::KeyResolver;
 use scp_protocol::context::membership::ContextEvent;
@@ -66,7 +66,6 @@ use scp_protocol::crypto::sender_keys::broadcast::BroadcastEnvelope;
 use scp_protocol::crypto::ucan::UcanToken;
 use scp_protocol::envelope::inner::{InnerEnvelope, InnerEnvelopeParams, MessageType};
 use scp_protocol::envelope::validation::SequenceCheck;
-use scp_protocol::identity::SigningKeyId;
 use scp_protocol::provenance::attach::SourceContextInfo;
 use scp_protocol::trust::consequence::{ConsequenceRule, evaluate_consequence_rules};
 
@@ -3358,7 +3357,7 @@ mod pseudonym_routing_tests {
         is_pseudonym_announcement_payload, is_reserved_pseudonym, pseudonym_collides_with_other_did,
     };
     use crate::context::state::{PSEUDONYM_ANNOUNCEMENT_TAG, PseudonymAnnouncement};
-    use scp_identity::DID;
+    use scp_did::DID;
     use std::collections::HashMap;
 
     const CTX: &str = "ctx-pseudonym-routing-tests";
@@ -3757,7 +3756,7 @@ mod pseudonym_routing_tests {
     // -----------------------------------------------------------------------
 
     use crate::context::actor::state::PerContextState as RegressionState;
-    use scp_primitives::TestClock;
+    use scp_clock::TestClock;
     use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
     /// Event-log provider that flags which `EventType`s were appended so the
@@ -4034,7 +4033,7 @@ mod pseudonym_routing_tests {
             payload: Vec::new(),
             provenance: None,
             provenance_hash: [0u8; 32],
-            signing_key_id: scp_protocol::identity::SigningKeyId::Active,
+            signing_key_id: scp_did::SigningKeyId::Active,
             signature: [0u8; 64],
             extensions: std::collections::HashMap::new(),
         }
@@ -4051,6 +4050,7 @@ mod pseudonym_routing_tests {
 
         let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
             ALICE.to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
         ));
         let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
             Box::new(crate::context::builder::NotConfiguredTransportProvider);
@@ -4061,8 +4061,7 @@ mod pseudonym_routing_tests {
                     InMemoryStorage::new(),
                 )),
             );
-        let clock: Arc<dyn scp_primitives::Clock> =
-            Arc::new(scp_primitives::TestClock::new(1_700_000_000));
+        let clock: Arc<dyn scp_clock::Clock> = Arc::new(scp_clock::TestClock::new(1_700_000_000));
         let supervisor = Supervisor::with_providers(
             crypto,
             transport,

@@ -1,12 +1,28 @@
-//! Identity primitives shared across the SCP workspace.
+#![doc = include_str!("../README.md")]
+#![warn(missing_docs)]
+#![forbid(unsafe_code)]
+
+//! The DID data model for SCP — the single wasm-safe home for identity types.
 //!
-//! This module defines the [`DID`] newtype and [`SigningKeyId`] enum — pure
-//! value types with zero async dependencies. They live in `scp-primitives`
-//! (the leaf crate) so that `scp-event-log` and future crates like
-//! `scp-protocol` can use them without pulling in `scp-identity`'s tokio
-//! dependency.
+//! This crate owns the DID **data model**: the [`DID`] newtype, the
+//! [`SigningKeyId`] enum, [`extract_public_key_from_did`], and the W3C DID
+//! Document types ([`DidDocument`], [`VerificationMethod`], rotation/migration
+//! proofs, and the key-custody/identity-link [`attestation`] types). These are
+//! pure synchronous value types with zero async dependencies, so they compile
+//! to `wasm32-unknown-unknown` for the in-browser SCP client (ADR-057).
 //!
-//! `scp-identity` re-exports both types for backward compatibility.
+//! The **native** identity subsystem — DHT resolution, publication, the
+//! `DidMethod` trait, and lifecycle management — lives in `scp-identity`, which
+//! imports this data model. See ADR-057's Amendment (2026-06-30) for the crate
+//! topology.
+
+pub mod attestation;
+pub mod document;
+
+pub use document::{
+    DidDocument, DidError, DidRotationEvent, MigrationProof, PreRotationProof, Service,
+    VerificationMethod, decode_multibase_key,
+};
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -92,15 +108,15 @@ impl std::borrow::Borrow<str> for DID {
 /// Extracts the Ed25519 public key bytes from a DID string.
 ///
 /// Supports `did:dht:z<z-base-32>` format (production). The `did:key:<hex>`
-/// test convenience format is only accepted when compiled with `#[cfg(test)]`
-/// or the `testing` feature to prevent non-standard DID acceptance in release
-/// builds. See: <https://github.com/limn-works/scp/issues/128>
+/// form is a non-standard test convenience; production accepts only `did:dht`,
+/// so it is accepted only when compiled with `#[cfg(test)]` or the `testing`
+/// feature to prevent non-standard DID acceptance in release builds.
 ///
 /// # Errors
 ///
 /// Returns an error string if the DID format is unsupported,
-/// if z-base-32/hex decoding fails, or if the decoded key is not exactly
-/// 32 bytes.
+/// if z-base-32/hex decoding fails, if the decoded key is not exactly
+/// 32 bytes, or if the `did:dht` z-base-32 encoding is not canonical.
 pub fn extract_public_key_from_did(did: &str) -> Result<[u8; 32], String> {
     // Support did:dht:z<z-base-32> format.
     if let Some(suffix) = did.strip_prefix("did:dht:z") {
@@ -109,12 +125,32 @@ pub fn extract_public_key_from_did(did: &str) -> Result<[u8; 32], String> {
         let bytes: [u8; 32] = decoded
             .try_into()
             .map_err(|v: Vec<u8>| format!("DID public key must be 32 bytes, got {}", v.len()))?;
+
+        // Canonicality check: z-base-32 encoding of a 32-byte payload is NOT
+        // injective on its trailing bit-padding — 256 bits = 51 full chars
+        // (255 bits) + a 52nd char carrying 1 payload bit + 4 padding bits, so
+        // 16 alternate encodings decode to the same 32-byte key. Re-encode the
+        // decoded bytes and reject any input that does not round-trip to the
+        // canonical form, so two distinct DID strings cannot resolve to the
+        // same key (which would otherwise enable petname squatting, log/UI
+        // spoofing, and equality-by-string mismatches downstream). This mirrors
+        // the native `scp_identity::dht::extract_public_key` check exactly, so
+        // the browser/wasm signature-verify path rejects precisely the inputs
+        // native rejects. Comparison is byte-exact against the input suffix
+        // (the canonical encoder emits lowercase; no case folding).
+        let canonical = zbase32::encode(&bytes);
+        if canonical != suffix {
+            return Err(format!(
+                "did:dht z-base-32 payload is not canonical (expected {canonical:?}, got {suffix:?}) for DID: {did}"
+            ));
+        }
+
         return Ok(bytes);
     }
 
-    // did:key:{hex} is a non-standard test convenience. Gated behind the
-    // `testing` feature (or #[cfg(test)]) to prevent acceptance in release
-    // builds. See: https://github.com/limn-works/scp/issues/128
+    // did:key:{hex} is a non-standard test convenience; production accepts only
+    // did:dht. Gated behind the `testing` feature (or #[cfg(test)]) to prevent
+    // acceptance in release builds.
     #[cfg(any(test, feature = "testing"))]
     if let Some(hex_str) = did.strip_prefix("did:key:") {
         let decoded = hex::decode(hex_str).map_err(|e| format!("hex decode error: {e}"))?;
@@ -473,6 +509,55 @@ mod tests {
         // 'l' is not valid z-base-32
         let result = extract_public_key_from_did("did:dht:z!!!invalid!!!");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn extract_public_key_rejects_non_canonical_zbase32_padding() {
+        // z-base-32 encoding of a 32-byte payload is NOT injective on its
+        // trailing bit-padding: the 52nd char carries 1 payload bit + 4 padding
+        // bits, so 16 alternate encodings decode to the same 32 bytes. The
+        // browser/wasm parser MUST reject non-canonical inputs so two distinct
+        // DID strings cannot resolve to the same key. This fixture is identical
+        // to the native regression test in scp-identity's dht.rs, pinning that
+        // both parsers reject the same input (see
+        // `extract_public_key_rejects_non_canonical_zbase32_padding` there).
+        const ALPHABET: &[u8; 32] = b"ybndrfg8ejkmcpqxot1uwisza345h769";
+
+        let key = [42u8; 32];
+        let canonical_encoded = zbase32::encode(&key);
+        let canonical_did = format!("did:dht:z{canonical_encoded}");
+
+        // Sanity: the canonical form is accepted and yields the key.
+        let canonical_result = extract_public_key_from_did(&canonical_did).unwrap();
+        assert_eq!(canonical_result, key);
+
+        // Construct a non-canonical alternate by toggling a padding bit of the
+        // trailing char.
+        let last_char = canonical_encoded.as_bytes()[canonical_encoded.len() - 1];
+        let last_idx = ALPHABET
+            .iter()
+            .position(|&c| c == last_char)
+            .expect("canonical char must be in alphabet");
+        let mutated_idx = last_idx ^ 1;
+        let mut mutated_bytes = canonical_encoded.as_bytes().to_vec();
+        let last_pos = mutated_bytes.len() - 1;
+        mutated_bytes[last_pos] = ALPHABET[mutated_idx];
+        let mutated_encoded =
+            String::from_utf8(mutated_bytes).expect("z-base-32 alphabet is ASCII");
+        let mutated_did = format!("did:dht:z{mutated_encoded}");
+
+        // Sanity: the mutated input still decodes to the same 32 bytes (a real
+        // non-canonical alternate, not a typo).
+        let raw_decoded = zbase32::decode(&mutated_encoded).expect("alternate decodes");
+        assert_eq!(raw_decoded.as_slice(), &key[..]);
+
+        // The canonicality check MUST reject it.
+        let err = extract_public_key_from_did(&mutated_did)
+            .expect_err("non-canonical DID MUST be rejected");
+        assert!(
+            err.contains("not canonical"),
+            "expected canonicality error, got: {err}"
+        );
     }
 
     #[test]

@@ -11,7 +11,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use scp_primitives::DID;
+use scp_did::DID;
 
 use super::params::{
     CeilingPolicy, ContextMode, GovernanceModel, MemoryScope, MetadataVisibilityPolicy,

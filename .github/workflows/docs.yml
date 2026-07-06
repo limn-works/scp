@@ -64,6 +64,13 @@ jobs:
               - 'crates/scp-protocol/src/**'
               - 'crates/scp-runtime/src/**'
               - 'crates/scp-ffi/**'
+              - 'crates/scp-did/src/**'
+              - 'crates/scp-dht/src/**'
+              - 'crates/scp-clock/src/**'
+              - 'crates/scp-crypto/src/**'
+              - 'crates/scp-mls/src/**'
+              - 'crates/scp-client/src/**'
+              - 'crates/scp-client-wasm/src/**'
 
   # ---- Rust (rustdoc) ----
   rust-docs:

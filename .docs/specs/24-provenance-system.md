@@ -100,7 +100,18 @@ Example: data originates in context A, flows to context B (depth 0), then from B
 
 ### 24.3.3 Dual Recording
 
-Provenance is recorded in both the source and target contexts' event logs. The returned `DataProvenance` is a self-contained value that can be cloned for dual recording. This ensures that both sides of a cross-context data flow have an auditable record.
+Provenance is recorded in both the source and target contexts' event logs. The returned `DataProvenance` is a self-contained value that can be cloned for dual recording. This ensures that both sides of a cross-context data flow have an auditable record. The source context records a `ProvenanceAttached` event and the target context records a `ProvenanceReceived` event; each event's payload carries the provenance hash defined below.
+
+**Provenance hash encoding (normative).** Every provenance hash in the protocol -- the `provenance_hash` bound into the BroadcastEnvelope signature (§5.14.5), the equivalent inner-envelope hash, and the hash recorded in the `ProvenanceAttached` / `ProvenanceReceived` event-log payloads -- is computed as:
+
+```
+provenance_hash = SHA-256(rmp_serde::to_vec(provenance))   if provenance is present
+provenance_hash = SHA-256(0x00)                            if provenance is absent (sentinel, ADR-002)
+```
+
+where `provenance` is the `DataProvenance` record and `rmp_serde::to_vec` is positional (array-encoded) MessagePack in struct-declaration field order. The `DataProvenance` field order is: `source_context`, `source_type`, `counterparties`, `purpose`, `discovery_method`, `age`, `memory_scope`, `chain_depth`, `chain_path`, `payment_amount`, `payment_adapter`, `payment_receipt_id` (§24.2). JSON is **not** used on any provenance-hash path.
+
+This single encoding is deliberate: it makes the hash a context member records for a `DataProvenance` value in its event log bit-for-bit identical to the `provenance_hash` a broadcast author signs over the same value, and it matches the event-log leaf encoding (which serializes the wrapping `Event` with `rmp_serde::to_vec`). A third-party reimplementer MUST use exactly this encoding to reproduce protocol-conformant provenance hashes. The `SHA-256(0x00)` absent-sentinel distinguishes "no provenance" from any real provenance value. See §25 Vector 35 for the `DataProvenance` known-answer test.
 
 ### 24.3.4 Economic Provenance
 

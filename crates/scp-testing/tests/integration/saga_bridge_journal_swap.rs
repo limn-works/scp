@@ -52,8 +52,8 @@ use scp_core::context::supervisor::{
 use scp_core::context::{ContextMode, ContextParams, ContextState, LocalTransportProvider};
 use scp_core::crypto::mls::provider::MlsCryptoProvider;
 use scp_core::crypto::mls::storage_adapter::{OpenMlsStorageAdapter, SpawnBlockingStorageAdapter};
+use scp_did::DID;
 use scp_ffi_common::bridge_instance::CoreFields;
-use scp_identity::DID;
 use scp_platform::testing::InMemoryStorage;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -156,9 +156,12 @@ fn journal_supervisor(
     journal: Arc<dyn SagaJournal>,
     mls_storage: Arc<dyn OpenMlsStorageAdapter>,
 ) -> Arc<Supervisor> {
-    let key_resolver: KeyResolver = Arc::new(|_: &DID, _: scp_identity::SigningKeyId| None);
+    let key_resolver: KeyResolver = Arc::new(|_: &DID, _: scp_did::SigningKeyId| None);
     Supervisor::with_providers_and_journal(
-        Arc::new(MlsCryptoProvider::new(creator_did.to_owned())),
+        Arc::new(MlsCryptoProvider::new(
+            creator_did.to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
+        )),
         Box::new(LocalTransportProvider) as Box<dyn ContextTransportProvider>,
         Box::new(NoOpEventLog) as Box<dyn ContextEventLogProvider>,
         key_resolver,

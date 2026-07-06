@@ -35,8 +35,8 @@ use std::sync::{Arc, OnceLock};
 
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
-use scp_identity::DID;
-use scp_primitives::Clock;
+use scp_clock::Clock;
+use scp_did::DID;
 use scp_protocol::context::ContextError;
 use scp_protocol::context::governance::KeyResolver;
 use scp_protocol::context::membership::ContextEvent;
@@ -1148,10 +1148,10 @@ impl<'a> MessageSigner<'a> {
     /// derived from the same variant that carries the key, so the stamped
     /// persona and the signing key can never disagree.
     #[must_use]
-    pub const fn signing_key_id(&self) -> scp_protocol::identity::SigningKeyId {
+    pub const fn signing_key_id(&self) -> scp_did::SigningKeyId {
         match self {
-            Self::Active(_) => scp_protocol::identity::SigningKeyId::Active,
-            Self::Agent(_) => scp_protocol::identity::SigningKeyId::Agent,
+            Self::Active(_) => scp_did::SigningKeyId::Active,
+            Self::Agent(_) => scp_did::SigningKeyId::Agent,
         }
     }
 }
@@ -1274,7 +1274,7 @@ pub struct Supervisor {
     /// calls when no real backend is wired.
     helper_persistence: OnceLock<Arc<dyn ContextPersistence>>,
     /// Wall-clock source. Populated by [`Self::with_providers`] (or
-    /// defaulted to [`scp_primitives::SystemClock`] when the caller
+    /// defaulted to [`scp_clock::SystemClock`] when the caller
     /// passes `None`).
     clock: OnceLock<Arc<dyn Clock>>,
     /// Key resolver for governance signature verification. The type is
@@ -1656,7 +1656,7 @@ impl Supervisor {
     ///   paid-action flow (spec §19.2.2).
     /// * `event_tx` — optional broadcast sender for event fan-out.
     /// * `clock` — optional [`Clock`] override; defaults to
-    ///   [`scp_primitives::SystemClock`] when `None`.
+    ///   [`scp_clock::SystemClock`] when `None`.
     /// * `mls_storage` — **required** OpenMLS storage adapter (the
     ///   bridge's chosen `Storage`, erased once via
     ///   [`SpawnBlockingStorageAdapter`](crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter)).
@@ -1788,7 +1788,7 @@ impl Supervisor {
             let _ = supervisor.helper_persistence.set(p);
         }
         let _ = supervisor.key_resolver.set(key_resolver);
-        let clock = clock.unwrap_or_else(|| Arc::new(scp_primitives::SystemClock));
+        let clock = clock.unwrap_or_else(|| Arc::new(scp_clock::SystemClock));
         let _ = supervisor.clock.set(clock);
         if let Some(adapter) = payment_adapter {
             let _ = supervisor.payment_adapter.set(adapter);
@@ -2254,7 +2254,7 @@ impl Supervisor {
                 );
                 0
             },
-            |c| scp_primitives::Clock::now_millis(c.as_ref()),
+            |c| scp_clock::Clock::now_millis(c.as_ref()),
         )
     }
 
@@ -3685,7 +3685,7 @@ impl Supervisor {
             message_type: scp_protocol::envelope::inner::MessageType::Recovery,
             payload,
             provenance: None,
-            signing_key_id: scp_protocol::identity::SigningKeyId::Active,
+            signing_key_id: scp_did::SigningKeyId::Active,
         };
 
         let inner = crate::envelope::inner::sign::create_inner_envelope_raw(&params, signing_key)
@@ -4537,7 +4537,7 @@ impl Supervisor {
                 );
                 0
             },
-            |c| scp_primitives::Clock::now_millis(c.as_ref()),
+            |c| scp_clock::Clock::now_millis(c.as_ref()),
         );
         let poisoned = {
             let mut entry = self.crash_windows.entry(ctx_id.to_owned()).or_default();
@@ -10660,8 +10660,8 @@ impl Supervisor {
         let resolver = self.key_resolver_ref().ok_or_else(|| {
             ContextError::NotInitialized("invite_member: key resolver not configured".to_owned())
         })?;
-        let invitee_vk = resolver(&invitee_did, scp_protocol::identity::SigningKeyId::Active)
-            .ok_or_else(|| {
+        let invitee_vk =
+            resolver(&invitee_did, scp_did::SigningKeyId::Active).ok_or_else(|| {
                 ContextError::CryptoFailed(format!(
                     "invite_member: cannot resolve #active key for invitee '{invitee_did}'"
                 ))
@@ -11149,16 +11149,13 @@ impl Supervisor {
                     .to_owned(),
             )
         })?;
-        let creator_vk = resolver(
-            &bundle.creator_did,
-            scp_protocol::identity::SigningKeyId::Active,
-        )
-        .ok_or_else(|| {
-            ContextError::CryptoFailed(format!(
-                "spawn-from-Welcome: cannot resolve #active key for creator '{}'",
-                bundle.creator_did
-            ))
-        })?;
+        let creator_vk =
+            resolver(&bundle.creator_did, scp_did::SigningKeyId::Active).ok_or_else(|| {
+                ContextError::CryptoFailed(format!(
+                    "spawn-from-Welcome: cannot resolve #active key for creator '{}'",
+                    bundle.creator_did
+                ))
+            })?;
         bundle.verify(&creator_vk).map_err(|e| {
             ContextError::CryptoFailed(format!(
                 "spawn-from-Welcome: invitation signature invalid: {e}"
@@ -11646,8 +11643,8 @@ impl Supervisor {
                 mls_epoch: joined_epoch,
                 coordinator:
                     scp_protocol::context::governance::mls_integration::EpochCoordinator::new(),
-                grace_store: crate::crypto::mls::epoch_grace::EpochGraceStore::with_clock(
-                    std::sync::Arc::new(scp_primitives::SystemClock),
+                grace_store: scp_mls::epoch_grace::EpochGraceStore::with_clock(
+                    std::sync::Arc::new(scp_clock::SystemClock),
                 ),
                 needs_reconnect: false,
             },
@@ -13430,11 +13427,11 @@ mod tests {
         // `create_context` call runs.
         let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
             "did:dht:z6MktestDoNotRely".to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
         ));
         let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
             Box::new(crate::context::builder::NotConfiguredTransportProvider);
-        let key_resolver: KeyResolver =
-            Arc::new(|_: &DID, _: scp_protocol::identity::SigningKeyId| None);
+        let key_resolver: KeyResolver = Arc::new(|_: &DID, _: scp_did::SigningKeyId| None);
         let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
             Arc::new(
                 crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
@@ -13485,7 +13482,7 @@ mod tests {
     /// would make this join fail closed and the test would fail.
     #[tokio::test]
     async fn with_providers_attaches_consumed_init_key_store() {
-        use crate::crypto::mls::credential::ScpCredential;
+        use scp_mls::credential::ScpCredential;
 
         let supervisor = supervisor_with_providers();
         let crypto = supervisor
@@ -13496,7 +13493,7 @@ mod tests {
         let joiner = ScpCredential::new(
             "did:dht:z6MkWithProvidersStoreCheck".to_owned(),
             None,
-            scp_identity::SigningKeyId::Active,
+            scp_did::SigningKeyId::Active,
         )
         .expect("valid credential");
         let generated = backend
@@ -13508,7 +13505,7 @@ mod tests {
         let inviter = ScpCredential::new(
             "did:dht:z6MkWithProvidersInviter".to_owned(),
             None,
-            scp_identity::SigningKeyId::Active,
+            scp_did::SigningKeyId::Active,
         )
         .expect("valid inviter credential");
         let mut group = backend
@@ -13531,10 +13528,7 @@ mod tests {
             )
             .await;
         assert!(
-            !matches!(
-                result,
-                Err(crate::crypto::mls::error::MlsError::StorageError(_))
-            ),
+            !matches!(result, Err(scp_mls::error::MlsError::StorageError(_))),
             "with_providers must attach the consumed-init-key store \
              (a store-less backend fails the join closed with StorageError)"
         );
@@ -14052,7 +14046,7 @@ mod tests {
             creator,
             default_ceiling(),
             vec![],
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
 
@@ -14143,7 +14137,7 @@ mod tests {
             event_log_data,
             DID(creator.to_owned()),
             crate::context::export_import::ExportScope::Full,
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
             |hash: &[u8; 32]| Ok::<_, std::convert::Infallible>(signing_key.sign(hash).to_bytes()),
         )
         .expect("build a valid signed export");
@@ -14191,7 +14185,7 @@ mod tests {
             event_log_data,
             DID(creator.to_owned()),
             crate::context::export_import::ExportScope::Full,
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
             |hash: &[u8; 32]| Ok::<_, std::convert::Infallible>(signing_key.sign(hash).to_bytes()),
         )
         .expect("build a valid signed broadcast export");
@@ -14237,7 +14231,7 @@ mod tests {
             event_log_data,
             DID(creator.to_owned()),
             crate::context::export_import::ExportScope::Full,
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
             |hash: &[u8; 32]| Ok::<_, std::convert::Infallible>(signing_key.sign(hash).to_bytes()),
         )
         .expect("build a valid signed export with a malformed ceiling");
@@ -14331,7 +14325,7 @@ mod tests {
             event_log_data,
             DID(creator.to_owned()),
             crate::context::export_import::ExportScope::Full,
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
             |hash: &[u8; 32]| Ok::<_, std::convert::Infallible>(signing_key.sign(hash).to_bytes()),
         )
         .expect("build a valid signed export")
@@ -14519,7 +14513,7 @@ mod tests {
             Vec::new(),
             DID(creator.to_owned()),
             crate::context::export_import::ExportScope::Full,
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
             |hash: &[u8; 32]| Ok::<_, std::convert::Infallible>(signing_key.sign(hash).to_bytes()),
         )
         .expect("build a valid signed full export");
@@ -14622,6 +14616,7 @@ mod tests {
     ) {
         let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
             "did:dht:z6MktestBuildDeps".to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
         ));
         let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
             Box::new(crate::context::builder::NotConfiguredTransportProvider);
@@ -14629,14 +14624,13 @@ mod tests {
             Box::new(TestEventLog);
         // Resolver returns Some for every DID — witnesses key_resolver
         // propagation.
-        let key_resolver: KeyResolver =
-            Arc::new(|did: &DID, _kid: scp_protocol::identity::SigningKeyId| {
-                let mut seed = [0u8; 32];
-                for (i, b) in did.as_ref().as_bytes().iter().enumerate() {
-                    seed[i % 32] ^= *b;
-                }
-                Some(ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key())
-            });
+        let key_resolver: KeyResolver = Arc::new(|did: &DID, _kid: scp_did::SigningKeyId| {
+            let mut seed = [0u8; 32];
+            for (i, b) in did.as_ref().as_bytes().iter().enumerate() {
+                seed[i % 32] ^= *b;
+            }
+            Some(ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key())
+        });
         let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
             Arc::new(
                 crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
@@ -14683,7 +14677,7 @@ mod tests {
         assert!(
             (deps.key_resolver)(
                 &DID("did:example:alice".to_owned()),
-                scp_protocol::identity::SigningKeyId::Active
+                scp_did::SigningKeyId::Active
             )
             .is_some(),
             "key_resolver must populate from the supervisor"
@@ -15061,7 +15055,7 @@ mod tests {
     // `TestClock` so the 60s crash window is driven deterministically.
     // =================================================================
 
-    use scp_primitives::TestClock;
+    use scp_clock::TestClock;
 
     // -----------------------------------------------------------------
     // Global tracing capture (test-only) for the payload-redaction test.
@@ -15187,13 +15181,13 @@ mod tests {
         install_capture_subscriber();
         let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
             "did:dht:z6MktestDoNotRely".to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
         ));
         let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
             Box::new(crate::context::builder::NotConfiguredTransportProvider);
         let event_log: Box<dyn crate::context::builder::ContextEventLogProvider> =
             Box::new(TestEventLog);
-        let key_resolver: KeyResolver =
-            Arc::new(|_: &DID, _: scp_protocol::identity::SigningKeyId| None);
+        let key_resolver: KeyResolver = Arc::new(|_: &DID, _: scp_did::SigningKeyId| None);
         let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
             Arc::new(
                 crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
@@ -18327,6 +18321,7 @@ mod tests {
     ) -> Arc<Supervisor> {
         let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
             "did:dht:z6MktestXctxSaga".to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
         ));
         let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
             Box::new(crate::context::builder::NotConfiguredTransportProvider);
@@ -18430,6 +18425,7 @@ mod tests {
     ) -> Arc<Supervisor> {
         let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
             "did:dht:z6MktestXctxSagaPersist".to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
         ));
         let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
             Box::new(crate::context::builder::NotConfiguredTransportProvider);
@@ -18705,6 +18701,7 @@ mod tests {
     ) -> Arc<Supervisor> {
         let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
             "did:dht:z6MktestXctxFaultJournal".to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
         ));
         let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
             Box::new(crate::context::builder::NotConfiguredTransportProvider);
@@ -19416,7 +19413,7 @@ mod tests {
             ceiling: None,
         };
         let token =
-            crate::crypto::ucan::mint::mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+            crate::crypto::ucan::mint::mint_ucan(&params, &custody, &scp_clock::SystemClock)
                 .await
                 .expect("mint");
         target_state
@@ -20827,6 +20824,7 @@ mod tests {
 
         let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
             "did:dht:z6MkRecoverySupervisor".to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
         ));
         let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
             Box::new(crate::context::builder::NotConfiguredTransportProvider);
@@ -21889,6 +21887,7 @@ mod tests {
         ));
         let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
             "did:dht:z6MktestXctxWave8".to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
         ));
         let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
             Box::new(crate::context::builder::NotConfiguredTransportProvider);
@@ -22131,6 +22130,7 @@ mod tests {
         ));
         let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
             "did:dht:z6MktestXctxWave15".to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
         ));
         let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
             Box::new(crate::context::builder::NotConfiguredTransportProvider);
@@ -23441,6 +23441,7 @@ mod tests {
     ) -> Arc<Supervisor> {
         let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
             "did:dht:z6MkDrainTerminal".to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
         ));
         let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
             Box::new(crate::context::builder::NotConfiguredTransportProvider);
@@ -23492,7 +23493,7 @@ mod tests {
             "did:example:xctx-drain-escrow",
             default_ceiling(),
             vec![],
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
         let policy = scp_protocol::economy::types::EconomicPolicy {
@@ -23619,7 +23620,7 @@ mod tests {
             "did:example:xctx-extractor",
             default_ceiling(),
             vec![],
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
         let ticket =

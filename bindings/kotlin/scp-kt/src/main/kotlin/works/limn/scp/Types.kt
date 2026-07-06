@@ -119,21 +119,20 @@ enum class ShadowStatus(val rawValue: String) {
  * All monetary values are in the smallest currency unit (e.g., cents
  * for USD, satoshis for BTC).
  *
- * @property amount Cost per invocation in the smallest currency unit.
+ * @property amount Cost per invocation in the smallest currency unit. A [ULong]
+ *     so the full unsigned smallest-unit range round-trips exactly (ADR-060
+ *     native-integer money surface); unsigned by construction — a monetary
+ *     amount is never negative.
  * @property currency ISO 4217 or protocol-defined currency code.
  * @property payee DID of the payment recipient. May differ from the tool operator.
  * @property costFormula Optional pricing formula identifier for dynamic pricing (spec section 19.4).
  */
 data class ToolCost(
-    val amount: Long,
+    val amount: ULong,
     val currency: String,
     val payee: String,
     val costFormula: String? = null,
-) {
-    init {
-        require(amount >= 0) { "ToolCost amount must be non-negative, got $amount" }
-    }
-}
+)
 
 /**
  * Definition of a tool that can be registered in an SCP context.
@@ -184,7 +183,10 @@ data class ToolDefinition(
                 }
                 if (cost != null) {
                     putJsonObject("cost") {
-                        put("amount", cost.amount)
+                        // ADR-060: a monetary Amount crosses JSON as its canonical
+                        // base-10 decimal string (never a bare number), so the full
+                        // ULong range survives exactly.
+                        put("amount", cost.amount.toString())
                         put("currency", cost.currency)
                         put("payee", cost.payee)
                         if (cost.costFormula != null) {

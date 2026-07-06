@@ -147,7 +147,7 @@ pub struct SendMessagePayload {
     /// side. Cloned from the caller's handle at dispatch time.
     pub params: scp_protocol::context::params::ContextParams,
     /// Sender DID.
-    pub sender_did: scp_identity::DID,
+    pub sender_did: scp_did::DID,
     /// Plaintext payload to encrypt and send.
     pub payload: Vec<u8>,
     /// Sender's Ed25519 signing key. `None` is rejected by the
@@ -160,7 +160,7 @@ pub struct SendMessagePayload {
     /// envelope's `signing_key_id` so the recipient resolves the
     /// matching public key from the sender's DID document. Must agree
     /// with the key material in `signing_key`.
-    pub signing_key_id: scp_protocol::identity::SigningKeyId,
+    pub signing_key_id: scp_did::SigningKeyId,
     /// Optional cross-context provenance metadata — attaches a
     /// signed `DataProvenance` envelope to the inner message.
     pub source_provenance: Option<scp_protocol::provenance::attach::SourceContextInfo>,
@@ -337,7 +337,7 @@ pub enum MessagingCommand {
         /// Context identifier.
         context_id: String,
         /// The peer member whose routing ID is being recorded.
-        member_did: scp_identity::DID,
+        member_did: scp_did::DID,
         /// The peer's per-context pseudonym routing ID.
         pseudonym: [u8; 32],
         /// Oneshot reply channel. Replies `Ok(())` once the registry is
@@ -363,7 +363,7 @@ pub enum MessagingCommand {
         /// Context identifier.
         context_id: String,
         /// The member DID to insert.
-        member_did: scp_identity::DID,
+        member_did: scp_did::DID,
         /// The role name to assign (e.g. `"member"`).
         role: String,
         /// Oneshot reply channel. Replies `Ok(())` once role state is updated,
@@ -421,7 +421,7 @@ pub enum MessagingCommand {
         /// Context identifier.
         context_id: String,
         /// Checkpoint author DID (a locally-controlled member).
-        sender_did: scp_identity::DID,
+        sender_did: scp_did::DID,
         /// Author's Ed25519 signing key. Wrapped in [`SigningKeyBytes`]
         /// so the private key zeroes on drop (mirrors the
         /// [`SendMessagePayload`] pattern).
@@ -481,7 +481,7 @@ pub enum MessagingCommand {
         /// Context identifier.
         context_id: String,
         /// Heartbeat author DID (a locally-controlled member).
-        sender_did: scp_identity::DID,
+        sender_did: scp_did::DID,
         /// Author's Ed25519 signing key. Wrapped in [`SigningKeyBytes`] so
         /// the private key zeroes on drop (mirrors the
         /// [`SendMessagePayload`] pattern).
@@ -518,7 +518,7 @@ pub struct SendPseudonymAnnouncementPayload {
     /// side. Cloned from the caller's handle at dispatch time.
     pub params: scp_protocol::context::params::ContextParams,
     /// Sender DID (the announcing member).
-    pub sender_did: scp_identity::DID,
+    pub sender_did: scp_did::DID,
     /// Sender's Ed25519 signing key. Wrapped in [`SigningKeyBytes`] so
     /// the private key zeroes on drop (mirrors the
     /// [`SendMessagePayload`] pattern).
@@ -597,7 +597,7 @@ pub struct CreateContextPayload {
     pub params: scp_protocol::context::params::ContextParams,
     /// Creator's DID. Becomes the sole `admin` assignment in the
     /// initial `ContextRoleState`.
-    pub creator_did: scp_identity::DID,
+    pub creator_did: scp_did::DID,
     /// Optional §9.10.4 pseudonym routing ID for the creator's
     /// local member. `None` on broadcast contexts (ignored).
     pub local_pseudonym: Option<[u8; 32]>,
@@ -630,9 +630,9 @@ pub struct LeaveContextPayload {
     /// Context params — used to rebuild an ephemeral handle.
     pub params: scp_protocol::context::params::ContextParams,
     /// Caller DID (the initiator of the leave operation).
-    pub caller_did: scp_identity::DID,
+    pub caller_did: scp_did::DID,
     /// Target DID (the member to remove; may equal `caller_did`).
-    pub member_did: scp_identity::DID,
+    pub member_did: scp_did::DID,
 }
 
 /// Payload for [`LifecycleCommand::CloseContext`]. Boxed inside the
@@ -644,7 +644,7 @@ pub struct CloseContextPayload {
     pub params: scp_protocol::context::params::ContextParams,
     /// Initiator DID. Requires the `ContextClose` capability under
     /// `SingleAdmin` governance.
-    pub initiator_did: scp_identity::DID,
+    pub initiator_did: scp_did::DID,
 }
 
 /// Payload for [`LifecycleCommand::RestoreContext`]. Boxed inside the
@@ -753,7 +753,7 @@ pub enum LifecycleCommand {
         /// Context identifier string.
         context_id: String,
         /// Exporter DID — signs the export header.
-        exporter_did: scp_identity::DID,
+        exporter_did: scp_did::DID,
         /// Oneshot reply channel. See [`ExportContextReply`].
         reply: ExportContextReply,
     },
@@ -1025,7 +1025,7 @@ pub struct ProposeGovernanceActionPayload {
     /// Context identifier string.
     pub context_id: String,
     /// Proposer DID.
-    pub proposer_did: scp_identity::DID,
+    pub proposer_did: scp_did::DID,
     /// Typed governance action — one of the 28 variants from ADR-031.
     pub action: scp_protocol::context::governance::GovernanceAction,
     /// Proposer's Ed25519 signing key. Wrapped in [`SigningKeyBytes`]
@@ -1057,7 +1057,7 @@ pub struct VoteOnProposalPayload {
     /// Target proposal ID (32 bytes).
     pub proposal_id: scp_protocol::context::governance::ProposalId,
     /// Voter DID.
-    pub voter_did: scp_identity::DID,
+    pub voter_did: scp_did::DID,
     /// Voter's Ed25519 signing key (zeroized on drop via
     /// [`SigningKeyBytes`]).
     pub signing_key: SigningKeyBytes,
@@ -1173,7 +1173,7 @@ pub enum GovernanceCommand {
         /// Target proposal ID (32 bytes).
         proposal_id: scp_protocol::context::governance::ProposalId,
         /// Voter DID.
-        voter_did: scp_identity::DID,
+        voter_did: scp_did::DID,
         /// Oneshot reply channel.
         reply: oneshot::Sender<
             Result<scp_protocol::context::governance::ProposalStatus, ContextError>,
@@ -1429,7 +1429,7 @@ pub struct SubscribeBroadcastPayload {
     /// Context identifier string.
     pub context_id: String,
     /// Subscriber DID.
-    pub subscriber_did: scp_identity::DID,
+    pub subscriber_did: scp_did::DID,
     /// Optional UCAN token — required for gated broadcast contexts.
     pub ucan: Option<scp_protocol::crypto::ucan::UcanToken>,
     /// Timestamp (seconds) at the point of subscription. The caller
@@ -1444,7 +1444,7 @@ pub struct UnsubscribeBroadcastPayload {
     /// Context identifier string.
     pub context_id: String,
     /// Subscriber DID.
-    pub subscriber_did: scp_identity::DID,
+    pub subscriber_did: scp_did::DID,
     /// Rotate per-author keys on unsubscribe so the departed subscriber
     /// cannot decrypt future broadcasts (forward secrecy). `false` is
     /// valid when the subscriber left voluntarily and re-subscribes
@@ -1480,7 +1480,7 @@ pub struct PublishBroadcastPayload {
     /// Context identifier string.
     pub context_id: String,
     /// Author DID (registered in the broadcast context).
-    pub author_did: scp_identity::DID,
+    pub author_did: scp_did::DID,
     /// Plaintext payload bytes.
     pub payload: Vec<u8>,
     /// Handle to the author's signing key inside the caller's custody
@@ -1495,7 +1495,7 @@ pub struct PublishBroadcastContentPayload {
     /// Context identifier string.
     pub context_id: String,
     /// Author DID.
-    pub author_did: scp_identity::DID,
+    pub author_did: scp_did::DID,
     /// Structured broadcast content.
     pub content: scp_protocol::context::BroadcastContent,
     /// Handle to the author's signing key inside the caller's custody
@@ -1512,7 +1512,7 @@ pub struct ReserveBroadcastPublishPayload {
     /// Context identifier string.
     pub context_id: String,
     /// Author DID (registered in the broadcast context).
-    pub author_did: scp_identity::DID,
+    pub author_did: scp_did::DID,
 }
 
 /// Payload for [`BroadcastCommand::ApplyBroadcastPublish`] — phase 2 of the
@@ -1549,9 +1549,9 @@ pub struct BroadcastBlockPayload {
     /// Context identifier string.
     pub context_id: String,
     /// Author DID executing the block/unblock.
-    pub author_did: scp_identity::DID,
+    pub author_did: scp_did::DID,
     /// Subscriber DID being blocked/unblocked.
-    pub subscriber_did: scp_identity::DID,
+    pub subscriber_did: scp_did::DID,
 }
 
 /// See [`ContextCommand::Broadcast`]. Real variants cover every public
@@ -1681,9 +1681,9 @@ pub enum BroadcastCommand {
         /// Context identifier string.
         context_id: String,
         /// Author DID (locally controlled) whose key is being requested.
-        author_did: scp_identity::DID,
+        author_did: scp_did::DID,
         /// Requester DID.
-        requester_did: scp_identity::DID,
+        requester_did: scp_did::DID,
         /// Requester's X25519 wrapping public key. The broadcast key is
         /// HPKE-sealed to this key inside the protocol handler (§5.14.2) — the
         /// raw key never leaves the protocol layer.
@@ -1788,7 +1788,7 @@ pub struct CreateGovernanceCheckpointPayload {
     /// Hash of the state snapshot accompanying the checkpoint.
     pub state_snapshot_hash: [u8; 32],
     /// Creator DID.
-    pub creator_did: scp_identity::DID,
+    pub creator_did: scp_did::DID,
     /// Creator's Ed25519 signature over the canonical checkpoint
     /// bytes (computed outside the handler — passed through verbatim).
     pub creator_signature: Vec<u8>,
@@ -1927,9 +1927,9 @@ pub enum StandingCommand {
     /// directly through that path — NOT a 2-phase-commit saga FSM.
     StandingContext {
         /// Local identity DID.
-        local_did: scp_identity::DID,
+        local_did: scp_did::DID,
         /// Remote peer DID.
-        peer_did: scp_identity::DID,
+        peer_did: scp_did::DID,
         /// Oneshot reply channel. `Ok(String)` carries the
         /// deterministic standing context ID; the underlying method
         /// returns the same ID whether the context already existed or
@@ -1951,7 +1951,7 @@ pub enum StandingCommand {
     /// Read-only.
     HasStandingContext {
         /// Candidate peer DID.
-        peer_did: scp_identity::DID,
+        peer_did: scp_did::DID,
         /// Oneshot reply channel.
         reply: oneshot::Sender<Result<bool, ContextError>>,
     },
@@ -1962,7 +1962,7 @@ pub enum StandingCommand {
     /// persisted snapshot.
     RegisterStandingContext {
         /// Peer DID whose context to register.
-        peer_did: scp_identity::DID,
+        peer_did: scp_did::DID,
         /// Oneshot reply channel.
         reply: oneshot::Sender<Result<(), ContextError>>,
     },
@@ -2087,7 +2087,7 @@ pub enum TtlCloseCommand {
         /// Context identifier string.
         context_id: String,
         /// Consenting member DID.
-        member_did: scp_identity::DID,
+        member_did: scp_did::DID,
         /// Proposed TTL duration.
         proposed_duration: std::time::Duration,
         /// Oneshot reply channel. `Ok(true)` iff unanimous consent was
@@ -2160,7 +2160,7 @@ pub enum ToolsCommand {
         /// Context identifier string.
         context_id: String,
         /// Sender DID.
-        did: scp_identity::DID,
+        did: scp_did::DID,
         /// Current Unix time in seconds — caller supplies to keep the
         /// handler pure / deterministic.
         now_secs: u64,
@@ -2175,7 +2175,7 @@ pub enum ToolsCommand {
         /// Context identifier string.
         context_id: String,
         /// Sender DID.
-        did: scp_identity::DID,
+        did: scp_did::DID,
         /// Oneshot reply channel.
         reply: oneshot::Sender<Result<(), ContextError>>,
     },
@@ -2193,7 +2193,7 @@ pub enum ToolsCommand {
         /// Context identifier string.
         context_id: String,
         /// Invoker DID.
-        invoker_did: scp_identity::DID,
+        invoker_did: scp_did::DID,
         /// Optional spending UCAN for paid actions (§19.5). Boxed so the
         /// variant payload stays pointer-sized.
         spending_ucan: Option<Box<scp_protocol::crypto::ucan::UcanToken>>,
@@ -2217,7 +2217,7 @@ pub enum ToolsCommand {
         /// Context identifier string.
         context_id: String,
         /// Invoker DID.
-        invoker_did: scp_identity::DID,
+        invoker_did: scp_did::DID,
         /// Capture-or-rollback request carrying the in-flight ticket.
         /// Boxed so the variant payload stays pointer-sized.
         request: Box<crate::context::tools_helpers::ToolSettleRequest>,
@@ -2486,7 +2486,7 @@ pub enum QueriesCommand {
         /// Context identifier string.
         context_id: String,
         /// Member DID.
-        member_did: scp_identity::DID,
+        member_did: scp_did::DID,
         /// Oneshot reply channel.
         reply: oneshot::Sender<Result<scp_protocol::economy::types::Amount, ContextError>>,
     },
@@ -2497,7 +2497,7 @@ pub enum QueriesCommand {
         /// Context identifier string.
         context_id: String,
         /// Member DID.
-        member_did: scp_identity::DID,
+        member_did: scp_did::DID,
         /// Current Unix time (seconds) — caller supplies to keep the
         /// handler pure / deterministic.
         now_secs: u64,
@@ -2787,7 +2787,7 @@ pub enum SagaPhaseMessage {
         /// Caller DID — the channel-authenticated initiator (spec §6.2.4
         /// "Caller authentication"; the supervisor binds this, not the
         /// envelope).
-        caller_did: scp_identity::DID,
+        caller_did: scp_did::DID,
         /// Context-local tool registration id being invoked at the target.
         tool_registration_id: String,
         /// Oneshot reply channel. A §6.2.4 policy reject rides
@@ -2812,7 +2812,7 @@ pub enum SagaPhaseMessage {
         target_context_id: [u8; 32],
         /// Channel-authenticated caller DID (spec §6.2.4 "Caller
         /// authentication"). The confused-deputy re-bind audience.
-        caller_did: scp_identity::DID,
+        caller_did: scp_did::DID,
         /// Context-local tool registration id (indexes B's own registry).
         tool_registration_id: String,
         /// UCAN proof reference — an INDEX into B's own UCAN store, never the
@@ -2912,7 +2912,7 @@ pub enum SagaPhaseMessage {
         /// the `CrossContextToolInvoked` actor field.
         caller_context_id: [u8; 32],
         /// Caller DID — the channel-authenticated initiator (the event actor).
-        caller_did: scp_identity::DID,
+        caller_did: scp_did::DID,
         /// Target context id (raw 32-byte digest) — referenced by the
         /// `CrossContextToolInvoked` record so an auditor can join it to B's log.
         target_context_id: [u8; 32],

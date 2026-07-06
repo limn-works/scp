@@ -19,7 +19,7 @@ structures) are gathered separately via :func:`aggregate_trust_input`.
 See ``.docs/sketch.md`` section ``SCP.Trust.evaluate`` and
 ``.docs/adrs/phase-3.md`` ADR-014 for the SDK design. The structured
 ``ucan_evaluate`` consumption (Layer 1 / :class:`CapabilityValidation`) is
-governed by ``.docs/adrs/phase-2.md`` ADR-057 and
+governed by ``.docs/adrs/phase-2.md`` ADR-059 and
 ``.docs/specs/07-trust-validation-and-capabilities.md`` §7.2.4: the SDK
 consumes the typed per-stage result and never reverse-engineers which check
 failed by parsing error prose.
@@ -103,7 +103,7 @@ class CapabilityValidation:
     protocol-compliant.
 
     These six per-stage booleans are the canonical structured result of
-    the read-only ``ucan_evaluate`` diagnostic (spec §7.2.4, ADR-057):
+    the read-only ``ucan_evaluate`` diagnostic (spec §7.2.4, ADR-059):
     one boolean per pipeline-stage group of the 11-step ADR-016 pipeline.
     They are populated directly from the bridge's structured result --
     never reverse-engineered by parsing error prose. The result is
@@ -602,6 +602,258 @@ class RequireParticipation:
         }
 
 
+# ---------------------------------------------------------------------------
+# Capability admission types (spec §7.3.4.4, SCP-ACR-008, ADR-058)
+# ---------------------------------------------------------------------------
+
+#: Valid capability verification-level names, matching the Rust
+#: ``VerificationLevel`` enum variants in ``scp-core``.
+VERIFICATION_LEVELS: frozenset[str] = frozenset({"SelfAttested", "ChallengeVerified"})
+
+
+@dataclass
+class VerificationLevel:
+    """How a capability must be verified for admission.
+
+    Mirrors the Rust ``VerificationLevel`` enum (``scp-core``). Serializes as
+    the bare variant name string (``"SelfAttested"`` / ``"ChallengeVerified"``).
+
+    - ``"SelfAttested"`` -- the agent claims the capability (present in their
+      capability list); no challenge proof required.
+    - ``"ChallengeVerified"`` -- the capability was verified through the
+      challenge-response protocol. Also satisfies ``SelfAttested``.
+    """
+
+    #: The verification-level variant name.
+    name: str
+
+    def __post_init__(self) -> None:
+        if self.name not in VERIFICATION_LEVELS:
+            msg = (
+                f"Invalid VerificationLevel name {self.name!r}. "
+                f"Valid: {sorted(VERIFICATION_LEVELS)}"
+            )
+            raise ValueError(msg)
+
+
+@dataclass
+class CapabilityRequirement:
+    """A single admission requirement: a capability URI and the minimum
+    verification level needed.
+
+    Mirrors the Rust ``CapabilityRequirement`` struct (``scp-core``). See
+    §7.3.4.4.
+    """
+
+    #: The capability URI that must be present.
+    capability: str
+
+    #: The minimum verification level required.
+    verification_level: VerificationLevel
+
+    def _to_bridge_dict(self) -> dict[str, Any]:
+        """Convert to a dict matching the Rust ``CapabilityRequirement``
+        serde JSON representation."""
+        return {
+            "capability": self.capability,
+            "verification_level": self.verification_level.name,
+        }
+
+
+@dataclass
+class ChallengeVerificationMethod:
+    """How a capability was verified, as recorded in a
+    :class:`ChallengeVerification`.
+
+    Mirrors the Rust ``VerificationMethod`` enum (``scp-core``). Named
+    ``ChallengeVerificationMethod`` in the SDK to avoid colliding with the
+    DID-document ``VerificationMethod`` type in the other bindings; the wire
+    shape is unchanged.
+
+    - ``name == "SelfAttested"`` serializes as the bare string
+      ``"SelfAttested"``.
+    - ``name == "ChallengeVerified"`` serializes as
+      ``{"ChallengeVerified": {"challenge_type": <uri>}}`` and requires
+      ``challenge_type``.
+
+    SECURITY: ``verification_method`` is NOT covered by the verifier signature
+    (ADR-017 caveat) — consumers MUST NOT key trust decisions on it.
+    """
+
+    #: The verification-method variant name.
+    name: str
+
+    #: The challenge-type capability URI. Required iff ``name`` is
+    #: ``"ChallengeVerified"``; must be ``None`` otherwise.
+    challenge_type: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.name not in VERIFICATION_LEVELS:
+            msg = (
+                f"Invalid ChallengeVerificationMethod name {self.name!r}. "
+                f"Valid: {sorted(VERIFICATION_LEVELS)}"
+            )
+            raise ValueError(msg)
+        if self.name == "ChallengeVerified" and self.challenge_type is None:
+            msg = "ChallengeVerificationMethod 'ChallengeVerified' requires challenge_type"
+            raise ValueError(msg)
+        if self.name == "SelfAttested" and self.challenge_type is not None:
+            msg = "ChallengeVerificationMethod 'SelfAttested' must not carry challenge_type"
+            raise ValueError(msg)
+
+    def _to_bridge_value(self) -> Any:
+        """Convert to the serde-tagged value the Rust ``VerificationMethod``
+        deserializes."""
+        if self.name == "SelfAttested":
+            return "SelfAttested"
+        return {"ChallengeVerified": {"challenge_type": self.challenge_type}}
+
+
+@dataclass
+class ChallengeVerification:
+    """A signed record that a specific verifier tested a capability and the
+    agent passed (spec §7.3.4.2, ADR-017).
+
+    Mirrors the Rust ``ChallengeVerification`` struct (``scp-core``). Pass a
+    list of these to :func:`check_capability_requirements` to satisfy
+    ``ChallengeVerified`` requirements.
+
+    SECURITY (ADR-017 caveat): only the *signed* fields bind trust —
+    ``verification_id``, ``verifier_did``, ``subject_did``, ``capability_uri``,
+    ``challenge_type``, ``passed``, ``score``, ``test_count``, ``pass_count``,
+    ``verified_at``, ``expires_at``, ``context_id``. The ``result``,
+    ``completed_at``, and ``verification_method`` fields are NOT signed and can
+    be altered after minting without invalidating the signature. Consumers MUST
+    NOT key trust decisions on those unsigned fields.
+    """
+
+    #: Unique verification identifier (derived from the challenge ID).
+    verification_id: str
+
+    #: DID of the verifier who issued and verified the challenge.
+    verifier_did: str
+
+    #: DID of the subject who answered the challenge.
+    subject_did: str
+
+    #: The capability URI that was verified.
+    capability_uri: str
+
+    #: The type of challenge that was verified (a capability URI string).
+    challenge_type: str
+
+    #: How the capability was verified (unsigned metadata).
+    verification_method: ChallengeVerificationMethod
+
+    #: Whether the subject passed the challenge overall.
+    passed: bool
+
+    #: Total number of test cases in the challenge.
+    test_count: int
+
+    #: Number of test cases the subject passed.
+    pass_count: int
+
+    #: The challenge-specific result from the response (arbitrary JSON, unsigned).
+    result: Any
+
+    #: Unix timestamp (seconds) when the response was completed (unsigned).
+    completed_at: int
+
+    #: Unix timestamp (seconds) when the verification was performed.
+    verified_at: int
+
+    #: Unix timestamp (seconds) when this verification expires.
+    expires_at: int
+
+    #: Ed25519 signature by the verifier over the verification record.
+    #: 64-byte array as a list of integers.
+    verifier_signature: list[int]
+
+    #: Optional numeric score (0-100) for graded challenges.
+    score: int | None = None
+
+    #: Context in which the challenge was issued, if any.
+    context_id: str | None = None
+
+    def __post_init__(self) -> None:
+        _u64_fields = (
+            "completed_at",
+            "verified_at",
+            "expires_at",
+        )
+        for name in _u64_fields:
+            val = getattr(self, name)
+            if val < 0:
+                msg = (
+                    f"ChallengeVerification.{name} must be non-negative "
+                    f"(Rust type is u64), got {val}"
+                )
+                raise ValueError(msg)
+            if val > 0xFFFF_FFFF_FFFF_FFFF:
+                msg = (
+                    f"ChallengeVerification.{name} must be <= 18446744073709551615 "
+                    f"(Rust type is u64), got {val}"
+                )
+                raise ValueError(msg)
+
+        # test_count / pass_count are u32.
+        for name in ("test_count", "pass_count"):
+            val = getattr(self, name)
+            if val < 0:
+                msg = (
+                    f"ChallengeVerification.{name} must be non-negative "
+                    f"(Rust type is u32), got {val}"
+                )
+                raise ValueError(msg)
+            if val > 0xFFFF_FFFF:
+                msg = (
+                    f"ChallengeVerification.{name} must be <= 4294967295 "
+                    f"(Rust type is u32), got {val}"
+                )
+                raise ValueError(msg)
+
+        if self.score is not None and not (0 <= self.score <= 0xFFFF_FFFF):
+            msg = (
+                f"ChallengeVerification.score must be a u32 in [0, 4294967295] "
+                f"or None, got {self.score}"
+            )
+            raise ValueError(msg)
+
+        if len(self.verifier_signature) != 64:
+            msg = (
+                f"ChallengeVerification.verifier_signature must be exactly 64 "
+                f"elements, got {len(self.verifier_signature)}"
+            )
+            raise ValueError(msg)
+        for i, elem in enumerate(self.verifier_signature):
+            if not (0 <= elem <= 255):
+                msg = f"ChallengeVerification.verifier_signature[{i}] must be 0-255, got {elem}"
+                raise ValueError(msg)
+
+    def _to_bridge_dict(self) -> dict[str, Any]:
+        """Convert to a dict matching the Rust ``ChallengeVerification`` serde
+        JSON representation."""
+        return {
+            "verification_id": self.verification_id,
+            "verifier_did": self.verifier_did,
+            "subject_did": self.subject_did,
+            "capability_uri": self.capability_uri,
+            "challenge_type": self.challenge_type,
+            "verification_method": self.verification_method._to_bridge_value(),
+            "passed": self.passed,
+            "score": self.score,
+            "test_count": self.test_count,
+            "pass_count": self.pass_count,
+            "result": self.result,
+            "completed_at": self.completed_at,
+            "verified_at": self.verified_at,
+            "expires_at": self.expires_at,
+            "context_id": self.context_id,
+            "verifier_signature": self.verifier_signature,
+        }
+
+
 def structured_to_capability_validation(result: Any) -> CapabilityValidation:
     """Map a bridge ``CapabilityValidation`` record onto the SDK dataclass.
 
@@ -609,7 +861,7 @@ def structured_to_capability_validation(result: Any) -> CapabilityValidation:
     ``PyCapabilityValidation``) exposes the same six snake_case booleans as
     the SDK :class:`CapabilityValidation`. This reads them directly -- the
     per-check breakdown comes from the structured record, never from parsing
-    error prose (spec §7.2.4, ADR-057 Decision 3).
+    error prose (spec §7.2.4, ADR-059 Decision 3).
     """
     return CapabilityValidation(
         tokens_valid=bool(result.tokens_valid),
@@ -654,7 +906,7 @@ async def evaluate_trust(
     controls. They MUST NOT be a sole trust or admission factor; use the
     threshold/independence path (§7.3.5) for Sybil resistance.
 
-    Layer 1 consumes the structured bridge result directly (ADR-057): it
+    Layer 1 consumes the structured bridge result directly (ADR-059): it
     does not reverse-engineer *which* check failed by parsing error prose.
     The diagnostic is non-throwing for capability outcomes; it raises only
     for malformed FFI inputs (e.g. a ``context_id`` with control
@@ -718,7 +970,7 @@ async def evaluate_trust(
             # specific capability. Passing a concrete URI here (or the old
             # ``"*"`` sentinel, which the real bridge rejects) would wrongly
             # impose an invoked-capability grant-match the caller never asked
-            # for. See ADR-057 / spec §7.2.4: the diagnostic's challenge
+            # for. See ADR-059 / spec §7.2.4: the diagnostic's challenge
             # capability is optional, and ``None`` means intrinsic-validity.
             #
             # ``subject_did`` is passed as the presenting agent so the step-5
@@ -759,7 +1011,7 @@ async def evaluate_trust(
     # `NoParticipationFacts` as a `ContextError` carrying the dedicated
     # `SCP-CTX-2076` code. That is not a failure for a trust evaluation (it means
     # "no recorded facts"), so it is folded into a ZEROED behavioral record —
-    # branching on the STRUCTURED code, never on error prose (ADR-057). Any other
+    # branching on the STRUCTURED code, never on error prose (ADR-059). Any other
     # error (NotInitialized, a provider failure, malformed input) is genuine and
     # MUST propagate — the prior blanket `except ContextError` masked them.
     try:
@@ -851,6 +1103,197 @@ class CachedAttestation(TypedDict):
     verified_at: int
     #: Time-to-live in seconds for the cache entry.
     ttl_secs: int
+
+
+# ---------------------------------------------------------------------------
+# Trust-aggregation wire DTOs (§7.3, ADR-058)
+#
+# Pass-through input types for :func:`aggregate_trust_input`, in the same
+# family as the cached-attestation DTOs above: field names are the
+# serde-canonical snake_case the Rust core deserializes, and a raw ``dict`` of
+# the same shape is also accepted. Mirror the TypeScript SDK
+# ``EventLogEntry`` / ``ThresholdRequirement`` / ``AttestorInfo`` interfaces
+# and the Swift/Kotlin models 1:1 (Agent-first API design tenet).
+# ---------------------------------------------------------------------------
+
+#: Valid attestation-type names, matching the Rust ``AttestationType`` enum
+#: variants (ADR-017). These are both attestation-envelope ``attestation_type``
+#: values and the map keys of ``threshold_requirements`` / ``attestor_sets``.
+ATTESTATION_TYPES: frozenset[str] = frozenset(
+    {
+        "IdentityLink",
+        "CapabilityDelegation",
+        "ToolIntegrity",
+        "AgentCapability",
+        "Endorsement",
+        "RoleAssignment",
+        "ContextEndorsement",
+        "ParticipationWitness",
+    }
+)
+
+
+class EventLogEntryPayload(TypedDict):
+    """Type-specific data carried by an :class:`EventLogEntry`.
+
+    Mirrors the Rust ``EventPayload`` (``scp-event-log``): opaque payload
+    bytes as a JSON number array. An empty ``data`` list is the canonical
+    representation for non-parameterized events.
+    """
+
+    #: Opaque payload bytes (as ints). Interpretation depends on the event type.
+    data: list[int]
+
+
+class EventLogEntry(TypedDict):
+    """A full signed protocol event in a context event log (ADR-011).
+
+    The serde wire shape of the Rust ``Event`` (``scp-event-log``) the bridge
+    deserializes for :func:`aggregate_trust_input` (``Vec<Event>``) — the
+    INPUT wire form, distinct from the projected event the event-log query
+    surface returns (which omits the hash-chain and signature fields).
+    """
+
+    #: Event type — a Rust ``EventType`` variant name (e.g. ``"MessageSent"``).
+    event_type: str
+    #: DID of the actor who produced this event.
+    actor_did: str
+    #: Unix timestamp (seconds) when the event was created.
+    timestamp: int
+    #: Monotonic event sequence number within the log (0-indexed).
+    sequence: int
+    #: Type-specific event data.
+    payload: EventLogEntryPayload
+    #: SHA-256 hash of the previous event (hash chain), exactly 32 bytes as
+    #: ints. ``[0] * 32`` for the first event (genesis sentinel).
+    prev_hash: list[int]
+    #: Ed25519 signature over the serialized event content (64 bytes as ints).
+    signature: list[int]
+
+
+class _ThresholdRequirementRequired(TypedDict):
+    """Required fields of a wire-format threshold requirement."""
+
+    #: The minimum number of valid attestations required (N).
+    required_count: int
+    #: The total number of attestors in the set (M). Must be >= ``required_count``.
+    total_attestors: int
+    #: Minimum independence score, in [0.0, 1.0].
+    independence_threshold: float
+
+
+class ThresholdRequirement(_ThresholdRequirementRequired, total=False):
+    """N-of-M threshold requirement for attestation verification (§7.3.5).
+
+    Mirrors the Rust ``ThresholdRequirement`` struct (ADR-017). The three
+    penalty fields carry Rust serde defaults (0.1 / 0.5 / 0.2) when omitted —
+    the bridge deserializer fills them in.
+    """
+
+    #: Independence penalty per shared context membership. Default: 0.1.
+    shared_context_penalty: float
+    #: Maximum total shared-context penalty for a single pair. Default: 0.5.
+    shared_context_penalty_cap: float
+    #: Independence penalty per mutual endorsement direction. Default: 0.2.
+    mutual_endorsement_penalty: float
+
+
+class _AttestorInfoRequired(TypedDict):
+    """Required fields of a wire-format attestor descriptor."""
+
+    #: The DID of the attestor.
+    did: str
+    #: Context IDs the attestor is a member of.
+    context_memberships: list[str]
+    #: DIDs this attestor has endorsed (mutual endorsements reduce independence).
+    endorsements: list[str]
+
+
+class AttestorInfo(_AttestorInfoRequired, total=False):
+    """Information about an attestor used for independence scoring (§7.3.5).
+
+    Mirrors the Rust ``AttestorInfo`` struct (ADR-017). The optional
+    ``attestation`` is a full attestation envelope
+    (:class:`CachedAttestationEnvelope`); only attestations matching the
+    required type are considered.
+    """
+
+    #: The attestation provided by this attestor, if any.
+    attestation: CachedAttestationEnvelope | None
+
+
+def _encode_aggregate_trust_wire(
+    events: list[EventLogEntry] | list[dict[str, Any]],
+    merkle_root: list[int],
+    consequence_rules: list[dict[str, Any]] | None,
+    threshold_requirements: dict[str, ThresholdRequirement] | dict[str, Any] | None,
+    attestor_sets: dict[str, list[AttestorInfo]] | dict[str, Any] | None,
+    cached_attestations: list[CachedAttestation] | list[dict[str, Any]] | None,
+    challenge_results: list[ChallengeVerification] | list[dict[str, Any]] | None,
+) -> tuple[str, str, str, str, str, str, str]:
+    """Validate and serialize the typed aggregation inputs to the serde wire.
+
+    The single serialization point shared by :func:`aggregate_trust_input` and
+    :meth:`scp_sdk.SCP.aggregate_trust_input` (ADR-058), so both surfaces emit
+    byte-identical wire JSON. Uses ``is not None`` (never a falsy check) to
+    keep the distinction between an explicit empty collection ("no rules
+    apply") and an absent parameter.
+
+    Raises:
+        ValueError: If ``merkle_root`` is not exactly 32 elements, or a
+            ``threshold_requirements`` / ``attestor_sets`` key is not a valid
+            :data:`ATTESTATION_TYPES` name — failing at the SDK boundary with
+            a field-named error instead of a bridge deserialization error.
+    """
+    if len(merkle_root) != 32:
+        msg = (
+            f"aggregate_trust_input merkle_root must be exactly 32 elements, got {len(merkle_root)}"
+        )
+        raise ValueError(msg)
+    for param_name, mapping in (
+        ("threshold_requirements", threshold_requirements),
+        ("attestor_sets", attestor_sets),
+    ):
+        if mapping is not None:
+            for key in mapping:
+                if key not in ATTESTATION_TYPES:
+                    msg = (
+                        f"Invalid {param_name} key {key!r}: not an AttestationType. "
+                        f"Valid: {sorted(ATTESTATION_TYPES)}"
+                    )
+                    raise ValueError(msg)
+
+    events_json = json.dumps(events)
+    merkle_root_json = json.dumps(merkle_root)
+    consequence_rules_json = (
+        json.dumps(consequence_rules) if consequence_rules is not None else "[]"
+    )
+    threshold_requirements_json = (
+        json.dumps(threshold_requirements) if threshold_requirements is not None else "{}"
+    )
+    attestor_sets_json = json.dumps(attestor_sets) if attestor_sets is not None else "{}"
+    cached_attestations_json = (
+        json.dumps(cached_attestations) if cached_attestations is not None else "[]"
+    )
+    challenge_results_json = (
+        json.dumps(
+            [
+                c._to_bridge_dict() if isinstance(c, ChallengeVerification) else c
+                for c in challenge_results
+            ]
+        )
+        if challenge_results is not None
+        else "[]"
+    )
+    return (
+        events_json,
+        merkle_root_json,
+        consequence_rules_json,
+        threshold_requirements_json,
+        attestor_sets_json,
+        cached_attestations_json,
+        challenge_results_json,
+    )
 
 
 def _participation_record_from(
@@ -951,20 +1394,25 @@ def aggregate_trust_input(
     scp: SCP,
     context_id: str,
     subject_did: str,
-    events: list[dict[str, Any]],
+    events: list[EventLogEntry] | list[dict[str, Any]],
     merkle_root: list[int],
     consequence_rules: list[dict[str, Any]] | None = None,
-    threshold_requirements: dict[str, Any] | None = None,
-    attestor_sets: dict[str, Any] | None = None,
+    threshold_requirements: dict[str, ThresholdRequirement] | dict[str, Any] | None = None,
+    attestor_sets: dict[str, list[AttestorInfo]] | dict[str, Any] | None = None,
     cached_attestations: list[CachedAttestation] | list[dict[str, Any]] | None = None,
-    challenge_results: list[dict[str, Any]] | None = None,
+    challenge_results: list[ChallengeVerification] | list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Aggregate all trust engine layers into a single TrustInput.
 
-    Phase 4 PR 5 Agent B+C retained this module-level helper because it is
-    a pure serialization layer over :meth:`scp_sdk.SCP.aggregate_trust_input`
-    -- it takes the caller-friendly Python types (lists/dicts of ``Any``)
-    and produces the ``json.dumps``-serialized strings the bridge expects.
+    Every structured input is typed (ADR-058): the wire DTOs
+    (:class:`EventLogEntry`, :class:`ThresholdRequirement`,
+    :class:`AttestorInfo`, :class:`CachedAttestation`) are ``TypedDict``
+    pass-throughs of the serde snake_case shapes, and ``challenge_results``
+    accepts the :class:`ChallengeVerification` dataclass (serialized via its
+    bridge projection). Raw equivalently-shaped dicts remain accepted (a
+    ``TypedDict`` is a ``dict`` at runtime). Serialization lives in the shared
+    :func:`_encode_aggregate_trust_wire`, so this helper and
+    :meth:`scp_sdk.SCP.aggregate_trust_input` emit byte-identical wire JSON.
     Using ``is not None`` (never a falsy check) keeps the distinction between
     an explicit empty collection and an absent parameter — empty means
     "no rules apply", absent means "use protocol defaults".
@@ -973,24 +1421,31 @@ def aggregate_trust_input(
         scp: The :class:`~scp_sdk.SCP` instance to dispatch on.
         context_id: The context to aggregate trust inputs for.
         subject_did: The DID of the subject to evaluate.
-        events: List of event log entry dicts.
+        events: Full signed event-log entries (:class:`EventLogEntry`).
         merkle_root: 32-byte Merkle root as a list of integers.
         consequence_rules: Optional list of consequence rule dicts.
-        threshold_requirements: Optional mapping of attestation type
-            names to threshold requirement dicts.
-        attestor_sets: Optional mapping of attestation type names to
-            lists of attestor info dicts.
+        threshold_requirements: Optional mapping of
+            :data:`ATTESTATION_TYPES` names to
+            :class:`ThresholdRequirement` values.
+        attestor_sets: Optional mapping of :data:`ATTESTATION_TYPES` names to
+            lists of :class:`AttestorInfo` values.
         cached_attestations: Optional list of :class:`CachedAttestation`
             (typed) or raw equivalently-shaped dicts to pre-populate the
-            in-memory trust store.
-        challenge_results: Optional list of challenge verification
-            dicts to pre-populate the in-memory trust store.
+            trust store.
+        challenge_results: Optional list of :class:`ChallengeVerification`
+            (typed) or raw equivalently-shaped dicts to pre-populate the
+            trust store.
 
     Returns:
         A dict containing the aggregated ``TrustInput`` fields:
         ``verified_attestations``, ``participation_record``,
         ``challenge_results``, ``consequence_structure``, and
         ``threshold_counts``.
+
+    Raises:
+        ValueError: If ``merkle_root`` is not exactly 32 elements or a
+            ``threshold_requirements`` / ``attestor_sets`` key is not a
+            valid :data:`ATTESTATION_TYPES` name.
     """
     # Same `_bridge()` test seam as :func:`evaluate_trust` — tests patch
     # ``scp_sdk.trust._bridge`` with a MagicMock whose
@@ -1002,37 +1457,17 @@ def aggregate_trust_input(
     else:
         instance = scp._native
 
-    events_json = json.dumps(events)
-    merkle_root_json = json.dumps(merkle_root)
-    # Distinguish "explicit empty collection" from "absent". Each Optional
-    # parameter must round-trip an empty list/dict as `"[]"` / `"{}"` so the
-    # bridge sees the caller's intent. Never use the falsy form — it collapses
-    # `[]` (no rules to evaluate) to the same value as `None` (use defaults).
-    consequence_rules_json = (
-        json.dumps(consequence_rules) if consequence_rules is not None else "[]"
-    )
-    threshold_requirements_json = (
-        json.dumps(threshold_requirements) if threshold_requirements is not None else "{}"
-    )
-    attestor_sets_json = json.dumps(attestor_sets) if attestor_sets is not None else "{}"
-    cached_attestations_json = (
-        json.dumps(cached_attestations) if cached_attestations is not None else "[]"
-    )
-    challenge_results_json = (
-        json.dumps(challenge_results) if challenge_results is not None else "[]"
+    wire = _encode_aggregate_trust_wire(
+        events,
+        merkle_root,
+        consequence_rules,
+        threshold_requirements,
+        attestor_sets,
+        cached_attestations,
+        challenge_results,
     )
 
-    result = instance.aggregate_trust_input(
-        context_id,
-        subject_did,
-        events_json,
-        merkle_root_json,
-        consequence_rules_json,
-        threshold_requirements_json,
-        attestor_sets_json,
-        cached_attestations_json,
-        challenge_results_json,
-    )
+    result = instance.aggregate_trust_input(context_id, subject_did, *wire)
     if isinstance(result, str):
         return json.loads(result)
     return result
@@ -1070,9 +1505,11 @@ def verify_participation_requirements(
     threshold/independence path) and MUST NOT treat a passing check as an
     authorization decision.
 
-    Success is indicated by returning without exception. Verification
-    failures raise ``RuntimeError`` with diagnostic details from the
-    Rust bridge.
+    Success is indicated by returning without exception. Failures raise the
+    bridge's native coded ``ValidationError`` (rooted at ``ScpError``); the
+    structured per-case ``SCP-VALID-*`` code is recoverable from the
+    exception's string form (the ``[CODE]``-prefixed message), so callers
+    branch on the code — never on error prose.
 
     Args:
         expected_subject: The DID of the agent being admitted. Profiles for
@@ -1082,9 +1519,14 @@ def verify_participation_requirements(
 
     Raises:
         ScpError: If the bridge module is not available.
-        RuntimeError: If verification fails (with diagnostic details
-            from ``ParticipationAdmissionError``).
-        ValueError: If JSON serialization or parsing fails.
+        ValidationError: Native bridge exception whose ``[SCP-VALID-NNNN]``-
+            prefixed message carries the per-case structured code:
+            ``SCP-VALID-7000`` for a malformed ``expected_subject`` DID;
+            ``SCP-VALID-7031`` / ``SCP-VALID-7030`` for malformed
+            requirements / profiles JSON (unreachable through this typed
+            wrapper, which always serializes valid JSON); and
+            ``SCP-VALID-7032`` for a failed admission check, with the
+            specific failure reason from ``ParticipationAdmissionError``.
     """
     bridge = _bridge()
 
@@ -1094,21 +1536,249 @@ def verify_participation_requirements(
     bridge.verify_participation_requirements(expected_subject, requirements_json, profile_json)
 
 
+def check_capability_requirements(
+    context_id: str,
+    subject_did: str,
+    requirements: list[CapabilityRequirement],
+    agent_capabilities: list[str],
+    challenge_verifications: list[ChallengeVerification],
+) -> None:
+    """Verify an agent's capabilities against a context's admission requirements.
+
+    Delegates to the Rust ``scp-core`` implementation via the PyO3 bridge
+    (spec §7.3.4.4, SCP-ACR-008). For each requirement the agent must either
+    self-attest the capability (``SelfAttested``) or present a valid
+    ``ChallengeVerification`` record (``ChallengeVerified``). Each supplied
+    verification is signature-verified against the production DID resolver and
+    only counts if it is authentic and its signed ``subject_did``/``context_id``
+    equal ``subject_did``/``context_id`` — a genuine result minted for another
+    subject or context cannot admit this agent.
+
+    Security caveat — authenticity is not authorization: a passing
+    ``ChallengeVerified`` check proves the verifier's signature is authentic and
+    bound to this subject/context, NOT that the verifier is trusted. A
+    ``verifier_did`` is self-certifying, so a subject can present a genuinely
+    signed result from a verifier it controls. Establish verifier legitimacy
+    separately (a trusted-verifier set, a context-membership proof, or the
+    §7.3.5 threshold/independence path) and do NOT treat success as an
+    authorization decision.
+
+    Success is indicated by returning without exception. Failures raise the
+    bridge's native coded ``ValidationError`` (rooted at ``ScpError``); the
+    structured per-case ``SCP-VALID-*`` code is recoverable from the
+    exception's string form (the ``[CODE]``-prefixed message), so callers
+    branch on the code — never on error prose.
+
+    Args:
+        context_id: The context the agent is being admitted to.
+        subject_did: The DID of the agent being admitted. Must be a valid DID.
+        requirements: Typed :class:`CapabilityRequirement` values. Serialized
+            internally to the serde wire shape (ADR-058).
+        agent_capabilities: The agent's self-attested capability URIs.
+        challenge_verifications: The agent's typed :class:`ChallengeVerification`
+            records. Serialized internally to the serde wire shape (ADR-058).
+
+    Raises:
+        ScpError: If the bridge module is not available.
+        ValidationError: Native bridge exception whose ``[SCP-VALID-NNNN]``-
+            prefixed message carries the per-case structured code:
+            ``SCP-VALID-7000`` for a malformed ``subject_did``;
+            ``SCP-VALID-7073`` / ``SCP-VALID-7074`` / ``SCP-VALID-7075`` for
+            malformed requirements / agent-capabilities /
+            challenge-verifications JSON (unreachable through this typed
+            wrapper, which always serializes valid JSON); ``SCP-VALID-7076``
+            for an unmet admission requirement, with the specific failure
+            reason from ``AdmissionError``; and ``SCP-VALID-7077`` for its
+            empty-subject variant.
+    """
+    bridge = _bridge()
+
+    requirements_json = json.dumps([r._to_bridge_dict() for r in requirements])
+    agent_capabilities_json = json.dumps(agent_capabilities)
+    challenge_verifications_json = json.dumps(
+        [c._to_bridge_dict() for c in challenge_verifications]
+    )
+
+    bridge.check_capability_requirements(
+        context_id,
+        subject_did,
+        requirements_json,
+        agent_capabilities_json,
+        challenge_verifications_json,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Challenge trust-input wire DTOs + typed verification wrappers (§7.3.4,
+# ADR-058)
+# ---------------------------------------------------------------------------
+
+
+class ChallengeRequest(TypedDict):
+    """A challenge request for capability verification (ADR-017, §7.3.4).
+
+    The serde wire shape of the Rust ``ChallengeRequest`` (``scp-core``) the
+    bridge deserializes for :func:`trust_verify_response`. ``challenge_type``
+    is a bare capability URI string (the Rust ``ChallengeType`` serializes as
+    its URI string); ``timeout`` is the ``std::time::Duration`` serde shape
+    (``{"secs": int, "nanos": int}``). In the same pass-through TypedDict
+    family as :class:`CachedAttestationEnvelope`; a raw equivalently-shaped
+    ``dict`` is also accepted.
+    """
+
+    #: Unique challenge identifier (UUID v4).
+    challenge_id: str
+    #: The type of challenge being issued (a capability URI string).
+    challenge_type: str
+    #: DID of the entity issuing the challenge.
+    challenger_did: str
+    #: DID of the entity being challenged.
+    subject_did: str
+    #: The capability URI being tested (§7.3.4.1).
+    capability_uri: str
+    #: Challenge-specific parameters (schema, test vectors, limits, etc.).
+    parameters: Any
+    #: Maximum time allowed to respond (``{"secs": int, "nanos": int}``).
+    timeout: dict[str, int]
+    #: Ed25519 signature over the canonical challenge bytes (64 bytes as ints).
+    signature: list[int]
+
+
+class ChallengeResponse(TypedDict):
+    """A response to a challenge request (ADR-017, §7.3.4).
+
+    The serde wire shape of the Rust ``ChallengeResponse`` (``scp-core``) the
+    bridge deserializes for :func:`trust_verify_response`.
+    """
+
+    #: The challenge ID this response corresponds to.
+    challenge_id: str
+    #: DID of the entity responding to the challenge.
+    responder_did: str
+    #: Challenge-specific result data (pass/fail, metrics, evidence, etc.).
+    result: Any
+    #: Unix timestamp (seconds) when the response was completed.
+    completed_at: int
+    #: Ed25519 signature over the canonical response bytes (64 bytes as ints).
+    signature: list[int]
+
+
+def trust_verify_attestation(
+    attestation: CachedAttestationEnvelope | dict[str, Any],
+) -> dict[str, Any]:
+    """Verify an attestation's signature, evidence, expiry, and revocation
+    status (ADR-017, §7.4).
+
+    Takes the typed attestation envelope
+    (:class:`CachedAttestationEnvelope` — the same wire DTO the
+    cached-attestation inputs use) and serializes it to the serde wire shape
+    internally (ADR-058) before calling the bridge
+    ``trust_verify_attestation`` free function.
+
+    Args:
+        attestation: The typed attestation envelope (or a raw
+            equivalently-shaped dict).
+
+    Returns:
+        A dict with ``valid`` (bool), ``chain_depth`` (int), and ``error``
+        (str | None — the verification failure reason when ``valid`` is
+        ``False``).
+
+    Raises:
+        ScpError: If the bridge module is not available.
+        ValueError: If the serialized envelope fails bridge deserialization.
+    """
+    bridge = _bridge()
+    return bridge.trust_verify_attestation(json.dumps(attestation))
+
+
+def trust_verify_response(
+    challenge: ChallengeRequest | dict[str, Any],
+    response: ChallengeResponse | dict[str, Any],
+) -> bool:
+    """Verify a challenge response against its original challenge request
+    (ADR-017, §7.3.4).
+
+    Takes the typed :class:`ChallengeRequest` / :class:`ChallengeResponse`
+    wire DTOs and serializes them to the serde wire shapes internally
+    (ADR-058) before calling the bridge ``trust_verify_response`` free
+    function.
+
+    Args:
+        challenge: The typed challenge request (or a raw equivalently-shaped
+            dict).
+        response: The typed challenge response (or a raw equivalently-shaped
+            dict).
+
+    Returns:
+        ``True`` if the response is valid (correct responder, within timeout,
+        valid signature), ``False`` otherwise.
+
+    Raises:
+        ScpError: If the bridge module is not available.
+        ValueError: If a serialized record fails bridge deserialization.
+    """
+    bridge = _bridge()
+    return bridge.trust_verify_response(json.dumps(challenge), json.dumps(response))
+
+
+def trust_create_challenge(target_did: str) -> dict[str, Any]:
+    """Create a challenge request for capability verification (ADR-017,
+    §7.3.4).
+
+    Calls the bridge ``trust_create_challenge`` free function, which builds a
+    schema-validation challenge request for ``target_did`` signed with an
+    ephemeral Ed25519 key. Pass the returned ``challenge_json`` to
+    :func:`trust_verify_response` alongside the responder's serialized
+    :class:`ChallengeResponse`.
+
+    Args:
+        target_did: DID of the entity being challenged.
+
+    Returns:
+        A dict with ``challenge_id`` (str — the unique challenge ID, UUID v4)
+        and ``challenge_json`` (str — the full serialized
+        :class:`ChallengeRequest` JSON).
+
+    Raises:
+        ScpError: If the bridge module is not available, ``target_did`` fails
+            DID validation, or challenge signing fails.
+    """
+    bridge = _bridge()
+    return bridge.trust_create_challenge(target_did)
+
+
 __all__ = [
+    "ATTESTATION_TYPES",
     "PARTICIPATION_FACT_VARIANTS",
     "PARTICIPATION_THRESHOLD_OPERATORS",
+    "VERIFICATION_LEVELS",
     "AttestationSummary",
+    "AttestorInfo",
     "BehavioralRecord",
     "CachedAttestation",
     "CachedAttestationEnvelope",
+    "CapabilityRequirement",
     "CapabilityValidation",
+    "ChallengeRequest",
+    "ChallengeResponse",
+    "ChallengeVerification",
+    "ChallengeVerificationMethod",
+    "EventLogEntry",
+    "EventLogEntryPayload",
     "ParticipationFact",
     "ParticipationProfile",
     "ParticipationThreshold",
     "RequireParticipation",
+    "ThresholdRequirement",
     "TrustEvaluation",
+    "VerificationLevel",
     "aggregate_trust_input",
+    "check_capability_requirements",
     "evaluate_trust",
     "participation_record",
+    "trust_create_challenge",
+    "trust_verify_attestation",
+    "trust_verify_response",
     "verify_participation_requirements",
 ]

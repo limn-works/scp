@@ -12,7 +12,7 @@
 //!
 //! See ADR-015 in `.docs/adrs/phase-3.md` for the full design.
 
-use scp_primitives::Clock;
+use scp_clock::Clock;
 use std::sync::atomic::{AtomicI64, Ordering};
 
 use serde::{Deserialize, Serialize};
@@ -164,7 +164,7 @@ pub struct SystemTimestamp;
 
 impl TimestampProvider for SystemTimestamp {
     fn now_millis(&self) -> u64 {
-        scp_primitives::SystemClock.now_millis()
+        scp_clock::SystemClock.now_millis()
     }
 }
 

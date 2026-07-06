@@ -21,9 +21,9 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use scp_did::DID;
 use scp_event_log::payload::{GovernanceActionExecutedPayload, decode_payload, project_payload};
 use scp_event_log::{ContextId, Event, EventType};
-use scp_primitives::DID;
 
 use super::attestation::{Attestation, RevocationStatus};
 use super::{AttestationReference, GovernanceActionSummary, RoleTransition, ToolId, TrustError};
@@ -154,12 +154,14 @@ pub struct ParticipationFacts {
     /// Count of governance actions taken against this identity (where the
     /// projected `target_did` is the subject).
     ///
-    /// This is a LOWER BOUND of adverse actions: only the unambiguously-adverse
-    /// [`ADVERSE_ACTION_TYPES`] are counted. Actions whose adverseness cannot be
-    /// determined without the role delta (e.g. `ChangeRole`, `RemoveSigner`) are
-    /// deliberately excluded to avoid a hostile admin deflating standing with
-    /// beneficial-looking actions (H18), so a genuinely-adverse `ChangeRole` is
-    /// undercounted rather than over-counted.
+    /// This is a LOWER BOUND of adverse actions: only actions the
+    /// compile-enforced classifier
+    /// [`GovernanceAction::is_adverse`](crate::context::governance::GovernanceAction::is_adverse)
+    /// marks unambiguously adverse are counted. Actions whose adverseness
+    /// cannot be determined without the role delta (e.g. `ChangeRole`,
+    /// `RemoveSigner`) are deliberately excluded to avoid a hostile admin
+    /// deflating standing with beneficial-looking actions (H18), so a
+    /// genuinely-adverse `ChangeRole` is undercounted rather than over-counted.
     pub governance_actions_against: u64,
 
     /// Count of governance actions initiated by this identity.
@@ -495,45 +497,31 @@ fn extract_tool_id_from_payload(data: &[u8]) -> ToolId {
         .to_owned()
 }
 
-/// Adverse governance action types counted against the target in
-/// `governance_actions_against`.
-///
-/// Only these action types represent punitive or restrictive measures that
-/// should weigh against the target member's standing score. All other action
-/// types (e.g., `RestoreAccess`, `AssignRole`, `ApproveSpend`) are beneficial
-/// or neutral and MUST NOT be counted, as a hostile admin could otherwise
-/// issue many beneficial-looking actions to deflate a member's standing
-/// (H18: standing-deflation attack).
-///
-/// This makes `governance_actions_against` a LOWER BOUND of adverse actions:
-/// action types whose adverseness depends on the role delta — notably
-/// `ChangeRole` (a demotion is adverse, a promotion is not) and `RemoveSigner` —
-/// are intentionally excluded because adverseness is not determinable from the
-/// action type alone. A genuinely-adverse such action is therefore undercounted,
-/// never over-counted; the conservative direction preferred for H18.
-///
-/// When `action_type` is absent from the payload (legacy events written before
-/// H18), the action is conservatively counted as adverse to preserve the
-/// pre-fix behavior.
-const ADVERSE_ACTION_TYPES: &[&str] = &[
-    "SuspendCapability",
-    "SuspendAccess",
-    "RevokeAccess",
-    "RemoveMember",
-    "ResetMember",
-];
-
 /// Returns `true` if a governance action's `action_type` is adverse toward its
-/// target and should therefore be counted in `governance_actions_against`.
+/// target and should therefore be counted in `governance_actions_against`
+/// (H18: standing-deflation defense).
 ///
 /// `action_type` comes from the canonical [`GovernanceActionExecutedPayload`]
-/// (positional `MessagePack`, ADR-011 amendment). An action is adverse if its
-/// `action_type` matches one of the [`ADVERSE_ACTION_TYPES`]. An empty
-/// `action_type` string is conservatively treated as adverse (preserving the
-/// pre-H18 behavior for legacy events that decode but carry no `action_type`).
+/// (positional `MessagePack`, ADR-011 amendment). Adverseness is decided by the
+/// single, compile-enforced source of truth
+/// [`GovernanceAction::is_adverse`](crate::context::governance::GovernanceAction::is_adverse):
+/// this routes the string back through it via
+/// [`GovernanceAction::is_adverse_variant_name`](crate::context::governance::GovernanceAction::is_adverse_variant_name).
+/// Because that classifier is an exhaustive `match` with no wildcard, a new
+/// punitive `GovernanceAction` variant cannot silently classify as "not
+/// adverse" — it fails to compile until explicitly classified.
+///
+/// Only actions unambiguously adverse from the action type alone count.
+/// Role-delta-dependent actions (`ChangeRole`, `RemoveSigner`) and beneficial
+/// actions (`RestoreAccess`, `ApproveSpend`, …) are excluded, keeping
+/// `governance_actions_against` a conservative LOWER BOUND (undercounts, never
+/// over-counts a promotion). An empty `action_type` (legacy events that decode
+/// but carry no `action_type`) is conservatively treated as adverse, preserving
+/// the pre-H18 behavior.
 fn is_adverse_action_type(action_type: &str) -> bool {
     // Empty action_type — treat conservatively as adverse.
-    action_type.is_empty() || ADVERSE_ACTION_TYPES.contains(&action_type)
+    action_type.is_empty()
+        || crate::context::governance::GovernanceAction::is_adverse_variant_name(action_type)
 }
 
 /// Records a [`EventType::GovernanceActionExecuted`] leaf into the appropriate
@@ -835,6 +823,11 @@ const PARTICIPATION_KEY_DOMAIN: &[u8] = b"scp-participation-statement-v1";
 /// where a trusted-but-misbehaving signer could keep a statement inside the
 /// `max_age_secs` freshness window indefinitely. 5 minutes, matching
 /// `challenge.rs`'s `MAX_COMPLETION_FUTURE_SKEW_SECS` and spec §9.14.
+///
+/// Independent knob: shares the §9.14 5-minute default with the UCAN
+/// (`crypto::ucan::validate::DEFAULT_CLOCK_SKEW_TOLERANCE_SECS`) and envelope
+/// (`envelope::validation::DEFAULT_CLOCK_SKEW_TOLERANCE_MS`) skew tolerances,
+/// but is deliberately a distinct constant, not unified.
 const MAX_PARTICIPATION_FUTURE_SKEW_SECS: u64 = 5 * 60;
 
 /// Derives a context-specific Ed25519 signing key for participation statements.
@@ -968,7 +961,8 @@ pub enum ParticipationAdmissionError {
 ///    high-standing profiles and be admitted on the victim's reputation
 ///    (cross-subject profile replay). Statements for any other subject are
 ///    silently skipped — they never contribute (fail-closed). This mirrors the
-///    subject binding in [`check_capability_requirements`].
+///    subject binding in
+///    [`check_capability_requirements`](crate::trust::check_capability_requirements).
 /// 2. AUTHENTICITY. For the subject-matching statements, this verifies the
 ///    AUTHENTICITY of each — its Ed25519 signature over `signable_bytes` against
 ///    the `signer_public_key` carried IN the profile. The signer key is
@@ -1278,7 +1272,7 @@ pub fn produce_participation_profile(
 pub const PARTICIPATION_STATEMENTS_SERVICE_TYPE: &str = "ScpParticipationStatements";
 
 // NOTE: The following functions were moved to scp-runtime::trust::participation_service
-// because they depend on `scp_identity::document::DidDocument`, which would pull
+// because they depend on `scp_did::DidDocument`, which would pull
 // tokio into scp-protocol's dependency tree:
 //   - add_participation_service()
 //   - remove_participation_service()
@@ -3273,7 +3267,7 @@ mod tests {
     }
 
     // SCP-BA-006 tests moved to scp-runtime::trust::participation_service (they
-    // depend on scp_identity::document::DidDocument).
+    // depend on scp_did::DidDocument).
 
     // -----------------------------------------------------------------------
     // Canonical subject-bearing payload tests
@@ -3492,18 +3486,19 @@ mod tests {
 
     #[test]
     fn adverse_action_types_pin_governance_variant_names() {
-        // Pins the `ADVERSE_ACTION_TYPES` string literals to the actual
-        // `GovernanceAction::variant_name()` output. The literals are matched
-        // against `variant_name()` at runtime in `is_adverse_action_type`, but
-        // nothing else binds the two; a future variant rename would silently
-        // make `governance_actions_against` stop counting that action. This test
-        // constructs every adverse variant and asserts the correspondence in
-        // both directions.
+        // Pins the string-keyed participation path (`is_adverse_action_type`)
+        // to the compile-enforced source of truth
+        // (`GovernanceAction::is_adverse`). The exhaustive, wildcard-free
+        // `is_adverse` match is what makes a new punitive variant fail to
+        // compile until classified; this test proves the string bridge agrees
+        // with it for every current variant's name, and that the exact adverse
+        // set is preserved.
         use crate::context::governance::{AccessScope, GovernanceAction};
-        use scp_primitives::DID;
+        use scp_did::DID;
 
         let target = || DID::from("did:dht:z6MkAdverseTarget");
 
+        // The complete adverse set (must equal exactly these five).
         let adverse: &[GovernanceAction] = &[
             GovernanceAction::SuspendCapability {
                 did: target(),
@@ -3524,30 +3519,89 @@ mod tests {
             },
         ];
 
-        // Forward: every constructed adverse variant's name is in the set.
+        // A broad sample of NON-adverse variants (beneficial / neutral /
+        // role-delta-dependent). These are the cheap-to-construct ones; the
+        // complex-payload variants are covered by `is_adverse`'s exhaustive
+        // match (compile-time) rather than reconstructed here.
+        let non_adverse: &[GovernanceAction] = &[
+            GovernanceAction::AddMember {
+                did: target(),
+                role: "member".to_owned(),
+            },
+            GovernanceAction::ChangeRole {
+                did: target(),
+                new_role: "member".to_owned(),
+            },
+            GovernanceAction::RestoreAccess {
+                did: target(),
+                capabilities: vec![],
+            },
+            GovernanceAction::AddSigner { did: target() },
+            GovernanceAction::RemoveSigner { did: target() },
+            GovernanceAction::TransferAdmin {
+                new_admin: target(),
+            },
+            GovernanceAction::ExtendTtl { additional_secs: 1 },
+            GovernanceAction::PromoteContext,
+            GovernanceAction::LockEconomicPolicy,
+            GovernanceAction::CancelContextMigration,
+            GovernanceAction::RotateContentKeys { reason: None },
+        ];
+
         for action in adverse {
             let name = action.variant_name();
             assert!(
-                ADVERSE_ACTION_TYPES.contains(&name),
-                "GovernanceAction variant_name {name:?} is absent from \
-                 ADVERSE_ACTION_TYPES — a rename desynced the adverse-action \
-                 set; governance_actions_against would stop counting it",
+                action.is_adverse(),
+                "{name:?} must be classified adverse by GovernanceAction::is_adverse",
             );
-            // And the runtime classifier agrees.
-            assert!(is_adverse_action_type(name));
+            // The string bridge routes through is_adverse and agrees.
+            assert!(
+                GovernanceAction::is_adverse_variant_name(name),
+                "is_adverse_variant_name disagrees with is_adverse for {name:?}",
+            );
+            assert!(
+                is_adverse_action_type(name),
+                "is_adverse_action_type must count adverse variant {name:?}",
+            );
         }
 
-        // Reverse: every literal in the set is produced by some constructed
-        // adverse variant, so a stale literal (renamed/removed variant) is
-        // also caught.
-        let produced: Vec<&str> = adverse.iter().map(GovernanceAction::variant_name).collect();
-        for literal in ADVERSE_ACTION_TYPES {
+        for action in non_adverse {
+            let name = action.variant_name();
             assert!(
-                produced.contains(literal),
-                "ADVERSE_ACTION_TYPES literal {literal:?} is not produced by \
-                 any constructed adverse GovernanceAction variant — it is \
-                 stale",
+                !action.is_adverse(),
+                "{name:?} must NOT be classified adverse by is_adverse",
+            );
+            assert!(
+                !GovernanceAction::is_adverse_variant_name(name),
+                "is_adverse_variant_name disagrees with is_adverse for {name:?}",
+            );
+            assert!(
+                !is_adverse_action_type(name),
+                "is_adverse_action_type must NOT count non-adverse variant {name:?}",
             );
         }
+
+        // Exact adverse set is preserved: no more, no fewer than these five.
+        let mut adverse_names: Vec<&str> =
+            adverse.iter().map(GovernanceAction::variant_name).collect();
+        adverse_names.sort_unstable();
+        assert_eq!(
+            adverse_names,
+            [
+                "RemoveMember",
+                "ResetMember",
+                "RevokeAccess",
+                "SuspendAccess",
+                "SuspendCapability"
+            ],
+        );
+
+        // Empty action_type ⇒ conservatively adverse (legacy-event fallback).
+        assert!(is_adverse_action_type(""));
+
+        // An unknown/unclassified name ⇒ not adverse (documented lower-bound
+        // direction). A future adverse variant is instead caught at compile
+        // time by is_adverse's wildcard-free match.
+        assert!(!is_adverse_action_type("SomeFutureUnclassifiedAction"));
     }
 }

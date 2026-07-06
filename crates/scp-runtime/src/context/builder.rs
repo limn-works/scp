@@ -858,7 +858,7 @@ pub async fn create_context(
             // canonical-encoding failure aborts with nothing to roll back.
             let context_extension = ScpContextExtension::for_root(
                 context_id.clone(),
-                scp_identity::DID::from(creator_did.to_owned()),
+                scp_did::DID::from(creator_did.to_owned()),
                 params.mode,
                 &params.governance,
                 params.ceiling_policy,
@@ -1068,8 +1068,11 @@ mod tests {
 
         let provider = MlsCryptoProvider::with_backends(
             TEST_DID.to_owned(),
-            Arc::new(ProductionMlsBackend::new()),
+            Arc::new(ProductionMlsBackend::new(std::sync::Arc::new(
+                scp_clock::SystemClock,
+            ))),
             Arc::new(ProductionHpkeBackend::new()),
+            std::sync::Arc::new(scp_clock::SystemClock),
         );
         let _mls = provider.mls_backend();
         let _hpke = provider.hpke_backend();
@@ -1117,7 +1120,10 @@ mod tests {
 
         // Drive real creation crypto. A real MLS provider + no-op transport /
         // event log isolates the keying behavior under test.
-        let crypto = MlsCryptoProvider::new(TEST_DID.to_owned());
+        let crypto = MlsCryptoProvider::new(
+            TEST_DID.to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
+        );
         let handle = create_context(
             id.clone(),
             ContextParams::default(),
@@ -1170,7 +1176,10 @@ mod tests {
         // A real 64-hex context id (the shape `generate_context_id` emits).
         let id = hex::encode([0x2au8; 32]);
         let id_bytes = context_id_bytes(&id);
-        let crypto = MlsCryptoProvider::new(TEST_DID.to_owned());
+        let crypto = MlsCryptoProvider::new(
+            TEST_DID.to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
+        );
         let provider = MerkleEventLogProvider::new();
 
         create_context(

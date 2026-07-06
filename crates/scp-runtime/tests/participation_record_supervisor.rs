@@ -50,7 +50,7 @@ const ADMIN: &str = "did:dht:z6MkAlice";
 /// signatures (the supervisor method gathers events + threads attestations; it
 /// does not validate them), so the resolver is never consulted here.
 fn mock_key_resolver() -> scp_protocol::context::governance::KeyResolver {
-    Arc::new(|_did: &scp_identity::DID, _kid: scp_identity::SigningKeyId| None)
+    Arc::new(|_did: &scp_did::DID, _kid: scp_did::SigningKeyId| None)
 }
 
 fn test_mls_storage() -> Arc<dyn OpenMlsStorageAdapter> {
@@ -160,7 +160,10 @@ fn build_supervisor_with_seeded_log() -> Arc<Supervisor> {
     }
 
     Supervisor::with_providers(
-        Arc::new(MlsCryptoProvider::new(ADMIN.to_owned())),
+        Arc::new(MlsCryptoProvider::new(
+            ADMIN.to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
+        )),
         Box::new(NotConfiguredTransportProvider),
         Box::new(provider),
         mock_key_resolver(),
@@ -259,7 +262,10 @@ fn participation_record_empty_attestations_yields_zero_count() {
 #[test]
 fn participation_record_empty_log_errors() {
     let supervisor = Supervisor::with_providers(
-        Arc::new(MlsCryptoProvider::new(ADMIN.to_owned())),
+        Arc::new(MlsCryptoProvider::new(
+            ADMIN.to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
+        )),
         Box::new(NotConfiguredTransportProvider),
         Box::new(MerkleEventLogProvider::new()),
         mock_key_resolver(),
@@ -339,7 +345,10 @@ fn participation_record_is_context_isolated() {
         .expect("append B gov");
 
     let supervisor = Supervisor::with_providers(
-        Arc::new(MlsCryptoProvider::new(ADMIN.to_owned())),
+        Arc::new(MlsCryptoProvider::new(
+            ADMIN.to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
+        )),
         Box::new(NotConfiguredTransportProvider),
         Box::new(provider),
         mock_key_resolver(),
@@ -439,7 +448,10 @@ impl ContextEventLogProvider for EventsButNoRootProvider {
 #[test]
 fn participation_record_fails_closed_on_root_error_with_events() {
     let supervisor = Supervisor::with_providers(
-        Arc::new(MlsCryptoProvider::new(ADMIN.to_owned())),
+        Arc::new(MlsCryptoProvider::new(
+            ADMIN.to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
+        )),
         Box::new(NotConfiguredTransportProvider),
         Box::new(EventsButNoRootProvider),
         mock_key_resolver(),

@@ -523,7 +523,7 @@ async fn vector_33_checkpoint_root_equals_tree_root_kat() {
     }
 
     let tree_root = tree::root(&log);
-    let did: scp_event_log::DID = kat_did().into();
+    let did: scp_did::DID = kat_did().into();
     let signer = KatSigner(kat_signing_key());
 
     // generate_checkpoint computes merkle_root = tree::root(log) and signs the

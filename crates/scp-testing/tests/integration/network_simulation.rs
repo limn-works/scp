@@ -44,7 +44,7 @@ use scp_core::envelope::inner::{
 use scp_core::envelope::outer::{open_envelope, seal_envelope};
 use scp_core::envelope::padding::strip_padding;
 use scp_core::envelope::pseudonym::derive_pseudonym;
-use scp_core::identity::SigningKeyId;
+use scp_did::SigningKeyId;
 use scp_platform::error::PlatformError;
 use scp_platform::testing::InMemoryKeyCustody;
 use scp_platform::traits::{
@@ -249,7 +249,7 @@ async fn end_to_end_network_demo() {
 
     let alice_cred =
         ScpCredential::new(alice_did_str.to_owned(), None, SigningKeyId::Active).unwrap();
-    let mut alice_group = create_group(&alice_cred).unwrap();
+    let mut alice_group = create_group(&alice_cred, &scp_clock::SystemClock).unwrap();
     println!("  Alice created MLS group");
     println!(
         "    group_id:   {}...",
@@ -262,7 +262,8 @@ async fn end_to_end_network_demo() {
 
     // Bob joins.
     let bob_cred = ScpCredential::new(bob_did_str.to_owned(), None, SigningKeyId::Active).unwrap();
-    let (bob_kp_bundle, bob_signer, bob_provider) = generate_key_package(&bob_cred).unwrap();
+    let (bob_kp_bundle, bob_signer, bob_provider) =
+        generate_key_package(&bob_cred, &scp_clock::SystemClock).unwrap();
 
     println!("  Bob generated KeyPackage for group join");
 
@@ -271,7 +272,7 @@ async fn end_to_end_network_demo() {
         .tls_serialize_detached()
         .unwrap();
     let kp_in = KeyPackageIn::tls_deserialize(&mut kp_bytes.as_slice()).unwrap();
-    let add_result = add_member(&mut alice_group, kp_in).unwrap();
+    let add_result = add_member(&mut alice_group, kp_in, &scp_clock::SystemClock).unwrap();
     let mut bob_group = join_group(&add_result.welcome, bob_provider, bob_signer).unwrap();
 
     println!("  Alice added Bob to group via Welcome message");
@@ -314,7 +315,7 @@ async fn end_to_end_network_demo() {
     println!();
 
     // Bob requests Alice's sender key via HPKE.
-    let clock = scp_primitives::SystemClock;
+    let clock = scp_clock::SystemClock;
     let req_result = request_sender_key(
         &bob_custody,
         &bob_sign_key,
@@ -1062,9 +1063,7 @@ impl scp_core::context::builder::ContextEventLogProvider for DemoEventLog {
 /// Deterministic key resolver for governance vote verification.
 fn demo_key_resolver() -> scp_core::context::governance::KeyResolver {
     std::sync::Arc::new(
-        |did: &scp_identity::DID,
-         _kid: scp_identity::SigningKeyId|
-         -> Option<ed25519_dalek::VerifyingKey> {
+        |did: &scp_did::DID, _kid: scp_did::SigningKeyId| -> Option<ed25519_dalek::VerifyingKey> {
             use ed25519_dalek::SigningKey;
             use std::hash::{Hash, Hasher};
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -1077,7 +1076,7 @@ fn demo_key_resolver() -> scp_core::context::governance::KeyResolver {
     )
 }
 
-fn demo_signing_key(did: &scp_identity::DID) -> ed25519_dalek::SigningKey {
+fn demo_signing_key(did: &scp_did::DID) -> ed25519_dalek::SigningKey {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     did.as_ref().hash(&mut hasher);
@@ -1097,7 +1096,7 @@ async fn application_layer_demo() {
     use scp_core::context::tools::registry::{ToolRegistration, ToolRegistry, ToolSchema};
     use scp_core::context::tools::{invoke_tool, register_tool};
     use scp_core::context::{Capability, ContextParams, ContextState, GovernanceAction};
-    use scp_identity::DID;
+    use scp_did::DID;
 
     println!();
     println!("╔══════════════════════════════════════════════════════════════╗");
@@ -1309,7 +1308,7 @@ async fn application_layer_demo() {
         alice.as_ref(),
         ceiling,
         vec![],
-        &scp_primitives::SystemClock,
+        &scp_clock::SystemClock,
     )
     .unwrap();
 
@@ -1323,7 +1322,7 @@ async fn application_layer_demo() {
             bob.as_ref(),
             "member",
             alice.as_ref(),
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
         assign_role(
@@ -1331,7 +1330,7 @@ async fn application_layer_demo() {
             charlie.as_ref(),
             "member",
             alice.as_ref(),
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
     }

@@ -26,13 +26,14 @@ use std::sync::Arc;
 
 use zeroize::Zeroizing;
 
-use scp_identity::{DidDht, DidDocument, Identity, IdentityConfig};
+use scp_did::DidDocument;
+use scp_identity::{DidDht, Identity, IdentityConfig};
 use scp_platform::encrypting_adapter::EncryptingAdapter;
 use scp_platform::testing::{InMemoryKeyCustody, InMemoryStorage};
 use scp_platform::traits::Storage;
 use scp_runtime::store::ProtocolRepository;
 
-use scp_identity::DID;
+use scp_did::DID;
 
 /// A shared encrypted backend usable as both the `EncryptedStorage` argument to
 /// `Identity::create` and the `Storage` backing a `ProtocolRepository`.

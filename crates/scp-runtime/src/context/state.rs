@@ -21,8 +21,8 @@ use serde::{Deserialize, Serialize};
 use super::ContextHandle;
 use super::governance::timeout::{DeadlockDetectionState, GovernanceTimeoutTask};
 use super::ttl::{TtlExtension, TtlTimer};
-use scp_identity::DID;
-use scp_primitives::Clock;
+use scp_clock::Clock;
+use scp_did::DID;
 use scp_protocol::context::broadcast::{BroadcastContextSnapshot, GovernanceBanResult};
 use scp_protocol::context::builder::ContextCreationError;
 use scp_protocol::context::governance::{
@@ -796,13 +796,13 @@ pub struct ContextSnapshot {
     pub epoch_coordination_records: Vec<CoordinationRecord>,
     /// Persisted epoch grace window entries (§23.11).
     ///
-    /// Captured from [`EpochGraceStore::to_grace_entries`](crate::crypto::mls::epoch_grace::EpochGraceStore::to_grace_entries)
+    /// Captured from [`EpochGraceStore::to_grace_entries`](scp_mls::epoch_grace::EpochGraceStore::to_grace_entries)
     /// during snapshot creation. On recovery, fed to
-    /// [`EpochGraceStore::restore_from_entries`](crate::crypto::mls::epoch_grace::EpochGraceStore::restore_from_entries)
+    /// [`EpochGraceStore::restore_from_entries`](scp_mls::epoch_grace::EpochGraceStore::restore_from_entries)
     /// to reconstruct the grace store. Persisted alongside all other context
     /// state to ensure transactional consistency (§23.11 step 2).
     #[serde(default)]
-    pub grace_entries: Vec<crate::crypto::mls::epoch_grace::GraceEntry>,
+    pub grace_entries: Vec<scp_mls::epoch_grace::GraceEntry>,
     /// Whether this context needs to re-enter the reconnection protocol
     /// (§23.3) before processing new messages (§23.11 inconsistent state
     /// fallback step 3). Persisted so the flag survives additional restarts
@@ -1472,7 +1472,7 @@ pub(crate) struct EpochState {
     /// epoch advances. Persisted alongside the context snapshot and restored
     /// on startup. Used by the MLS decrypt path to determine whether to
     /// attempt decryption for a given past epoch.
-    pub(crate) grace_store: crate::crypto::mls::epoch_grace::EpochGraceStore,
+    pub(crate) grace_store: scp_mls::epoch_grace::EpochGraceStore,
     /// Whether this context needs to re-enter the reconnection protocol
     /// (§23.3) before processing new messages (§23.11 inconsistent state
     /// fallback step 3). Set during `restore_context` when grace store
@@ -1533,9 +1533,9 @@ impl EpochState {
             coordinator: EpochCoordinator::from_records(Vec::new(), context_id),
             // Native runtime injects the production SystemClock; an in-browser
             // client injects its hardened clock (ADR-057 §Prereq-2).
-            grace_store: crate::crypto::mls::epoch_grace::EpochGraceStore::with_clock(
-                std::sync::Arc::new(scp_primitives::SystemClock),
-            ),
+            grace_store: scp_mls::epoch_grace::EpochGraceStore::with_clock(std::sync::Arc::new(
+                scp_clock::SystemClock,
+            )),
             needs_reconnect: false,
         }
     }
@@ -1572,7 +1572,7 @@ impl GovernanceState {
         clock: Arc<dyn Clock>,
     ) -> Self {
         let resolver: scp_protocol::context::governance::KeyResolver =
-            Arc::new(|_did: &DID, _kid: scp_protocol::identity::SigningKeyId| None);
+            Arc::new(|_did: &DID, _kid: scp_did::SigningKeyId| None);
         let engine: Box<dyn GovernanceEngine> =
             Box::new(SingleAdminEngine::new(admin_did, resolver));
         Self {
@@ -1902,7 +1902,7 @@ pub(crate) fn fresh_governance_state(
     }
 }
 
-/// Restores the [`EpochGraceStore`](crate::crypto::mls::epoch_grace::EpochGraceStore)
+/// Restores the [`EpochGraceStore`](scp_mls::epoch_grace::EpochGraceStore)
 /// from persisted snapshot entries, applying the §23.11 inconsistency
 /// detection and fallback steps.
 ///
@@ -1911,11 +1911,11 @@ pub(crate) fn fresh_governance_state(
 pub(crate) fn restore_grace_store_from_snapshot(
     context_id: &str,
     snapshot: &ContextSnapshot,
-) -> (crate::crypto::mls::epoch_grace::EpochGraceStore, bool) {
+) -> (scp_mls::epoch_grace::EpochGraceStore, bool) {
     // Native runtime injects the production SystemClock (ADR-057 §Prereq-2).
-    let mut grace_store = crate::crypto::mls::epoch_grace::EpochGraceStore::with_clock(
-        std::sync::Arc::new(scp_primitives::SystemClock),
-    );
+    let mut grace_store = scp_mls::epoch_grace::EpochGraceStore::with_clock(std::sync::Arc::new(
+        scp_clock::SystemClock,
+    ));
     let mut needs_reconnect = snapshot.needs_reconnect;
 
     if !snapshot.grace_entries.is_empty() {
@@ -2250,7 +2250,7 @@ mod notification_window_backdating_tests {
             },
             payment_adapters: vec!["test".to_owned()],
             pricing_formula: None,
-            payee: scp_identity::DID::from("did:dht:z6MkPayee".to_owned()),
+            payee: scp_did::DID::from("did:dht:z6MkPayee".to_owned()),
         }
     }
 

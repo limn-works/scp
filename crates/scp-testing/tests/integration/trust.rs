@@ -25,7 +25,6 @@ use std::time::Duration;
 
 use ed25519_dalek::{Signer, SigningKey};
 use scp_core::context::roles::Capability;
-use scp_core::identity::SigningKeyId;
 use scp_core::identity::block_list::{BlockListEvent, BlockListState};
 use scp_core::trust::challenge::VerificationMethod;
 use scp_core::trust::{
@@ -42,8 +41,8 @@ use scp_core::trust::{
     produce_participation_profile, verify_attestation, verify_challenge_response,
     verify_participation_requirements,
 };
+use scp_did::{DID, SigningKeyId};
 use scp_event_log::{Event, EventPayload, EventType};
-use scp_identity::DID;
 use scp_platform::testing::InMemoryDeviceAttestation;
 use scp_platform::traits::DeviceAttestation;
 
@@ -62,7 +61,7 @@ fn sk_for(seed: u8) -> SigningKey {
 /// Test Clock that always returns a fixed timestamp.
 struct FixedClock(u64);
 
-impl scp_identity::cache::Clock for FixedClock {
+impl scp_clock::Clock for FixedClock {
     fn now_secs(&self) -> u64 {
         self.0
     }
@@ -182,7 +181,9 @@ fn make_signed_attestation(
     use scp_core::crypto::canonical::{CanonicalField, canonical_hash};
     use scp_core::trust::attestation_type_tag;
 
-    let claim_bytes = rmp_serde::to_vec_named(&att.claim).unwrap();
+    // Claim is compact JSON (RFC 8785 JCS) per §9.5.2 Attestation row 5;
+    // evidence/revocation_status stay MessagePack per the §9.5.2 note.
+    let claim_bytes = scp_core::jcs::to_vec(&att.claim).unwrap();
     let evidence_bytes = att
         .evidence
         .as_ref()

@@ -761,6 +761,20 @@
       ]
     },
     {
+      "canonical": "check_capability_requirements",
+      "category": "trust",
+      "pyo3": [
+        "py_check_capability_requirements",
+        "check_capability_requirements"
+      ],
+      "uniffi": [
+        "check_capability_requirements"
+      ],
+      "napi": [
+        "check_capability_requirements"
+      ]
+    },
+    {
       "canonical": "sync_classify_offline",
       "category": "sync",
       "pyo3": [

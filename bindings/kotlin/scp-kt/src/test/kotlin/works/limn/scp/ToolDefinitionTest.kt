@@ -1,20 +1,19 @@
-// ToolDefinitionTest.kt — Unit tests for ToolDefinition.toJson() and ToolCost validation (#1203)
+// ToolDefinitionTest.kt — Unit tests for ToolDefinition.toJson() and ToolCost (#1203)
 //
 // Verifies that ToolDefinition.toJson() produces structurally valid JSON that is
-// immune to injection via untrusted string fields, and that ToolCost rejects
-// negative amounts.
+// immune to injection via untrusted string fields, and that the monetary
+// ToolCost.amount is a ULong serialized as its canonical decimal string
+// (ADR-060 native-integer money surface).
 //
-// Provenance: spec §5.4.1, ADR-010, issue #1203
+// Provenance: spec §5.4.1, ADR-010, ADR-060, issue #1203
 
 package works.limn.scp
 
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
-import kotlinx.serialization.json.long
 import org.junit.jupiter.api.Test
 import kotlin.test.assertEquals
-import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
@@ -30,7 +29,7 @@ class ToolDefinitionTest {
                 operatorDid = "did:dht:operator123",
                 testVectorsJson = """[{"input":{"a":1},"output":{"sum":1}}]""",
                 implementationHashHex = "abcdef0123456789",
-                cost = ToolCost(amount = 100, currency = "USD", payee = "did:dht:payee456", costFormula = "flat"),
+                cost = ToolCost(amount = 100uL, currency = "USD", payee = "did:dht:payee456", costFormula = "flat"),
             )
         val json = def.toJson()
         val obj = Json.parseToJsonElement(json).jsonObject
@@ -41,7 +40,9 @@ class ToolDefinitionTest {
         assertEquals("abcdef0123456789", obj["implementation_hash"]?.jsonPrimitive?.content)
 
         val costObj = obj["cost"]?.jsonObject
-        assertEquals(100L, costObj?.get("amount")?.jsonPrimitive?.long)
+        // ADR-060: amount is the canonical decimal STRING, not a bare number.
+        assertEquals("100", costObj?.get("amount")?.jsonPrimitive?.content)
+        assertEquals(true, costObj?.get("amount")?.jsonPrimitive?.isString)
         assertEquals("USD", costObj?.get("currency")?.jsonPrimitive?.content)
         assertEquals("did:dht:payee456", costObj?.get("payee")?.jsonPrimitive?.content)
         assertEquals("flat", costObj?.get("cost_formula")?.jsonPrimitive?.content)
@@ -104,7 +105,7 @@ class ToolDefinitionTest {
                 operatorDid = "did:dht:op",
                 cost =
                     ToolCost(
-                        amount = 50,
+                        amount = 50uL,
                         currency = "US\"D",
                         payee = "did:dht:payee\u00e9\u00fc",
                     ),
@@ -117,24 +118,18 @@ class ToolDefinitionTest {
     }
 
     @Test
-    fun `negative amount rejection`() {
-        assertFailsWith<IllegalArgumentException> {
-            ToolCost(amount = -1, currency = "USD", payee = "did:dht:p")
-        }
-    }
-
-    @Test
     fun `zero amount accepted`() {
-        val cost = ToolCost(amount = 0, currency = "USD", payee = "did:dht:p")
-        assertEquals(0L, cost.amount)
+        val cost = ToolCost(amount = 0uL, currency = "USD", payee = "did:dht:p")
+        assertEquals(0uL, cost.amount)
     }
 
     @Test
-    fun `large amount`() {
-        val cost = ToolCost(amount = Long.MAX_VALUE, currency = "BTC", payee = "did:dht:p")
-        assertEquals(Long.MAX_VALUE, cost.amount)
+    fun `full-width ULong amount survives exactly through toJson`() {
+        // ULong.MAX_VALUE (2^64 - 1) exceeds Long.MAX_VALUE — a signed Long would
+        // have overflowed. As the canonical decimal string it round-trips exactly.
+        val cost = ToolCost(amount = ULong.MAX_VALUE, currency = "BTC", payee = "did:dht:p")
+        assertEquals(ULong.MAX_VALUE, cost.amount)
 
-        // Verify it serializes correctly through toJson
         val def =
             ToolDefinition(
                 name = "expensive",
@@ -146,7 +141,11 @@ class ToolDefinitionTest {
             )
         val json = def.toJson()
         val obj = Json.parseToJsonElement(json).jsonObject
-        assertEquals(Long.MAX_VALUE, obj["cost"]?.jsonObject?.get("amount")?.jsonPrimitive?.long)
+        val amount = obj["cost"]?.jsonObject?.get("amount")?.jsonPrimitive
+        assertEquals(true, amount?.isString)
+        assertEquals("18446744073709551615", amount?.content)
+        // And the string parses back to the exact ULong.
+        assertEquals(ULong.MAX_VALUE, amount?.content?.toULong())
     }
 
     @Test
@@ -158,7 +157,7 @@ class ToolDefinitionTest {
                 inputSchemaJson = """{}""",
                 outputSchemaJson = """{}""",
                 operatorDid = "did:dht:op",
-                cost = ToolCost(amount = 10, currency = "USD", payee = "did:dht:p"),
+                cost = ToolCost(amount = 10uL, currency = "USD", payee = "did:dht:p"),
             )
         val json = def.toJson()
         val costObj = Json.parseToJsonElement(json).jsonObject["cost"]?.jsonObject

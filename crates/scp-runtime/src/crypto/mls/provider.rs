@@ -38,18 +38,19 @@ use dashmap::{DashMap, DashSet};
 use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_traits::OpenMlsProvider;
-use scp_identity::SigningKeyId;
-use scp_primitives::Clock;
+use scp_clock::Clock;
+use scp_did::SigningKeyId;
 use serde::{Deserialize, Serialize};
 use tls_codec::Deserialize as TlsDeserializeTrait;
 use zeroize::{Zeroize, Zeroizing};
 
 use super::backend::MlsBackend;
-use super::credential::ScpCredential;
-use super::encrypt::{DecryptedContent, decrypt_with_sender_did};
-use super::group::{self, SCP_CIPHERSUITE, ScpMlsGroup};
 use super::production_backend::ProductionMlsBackend;
 use crate::crypto::hpke_backend::{HpkeBackend, ProductionHpkeBackend};
+use scp_mls::credential::ScpCredential;
+use scp_mls::encrypt::{DecryptedContent, decrypt_with_sender_did};
+use scp_mls::group::{self, SCP_CIPHERSUITE, ScpMlsGroup};
+use scp_mls::validate_key_package_lifetime;
 use scp_protocol::context::ContextError;
 use scp_protocol::context::builder::ContextCreationError;
 use scp_protocol::crypto::sender_keys::{
@@ -210,6 +211,44 @@ impl std::fmt::Debug for MlsCryptoSnapshot {
     }
 }
 
+impl MlsCryptoSnapshot {
+    /// Zeroizes every field that holds private key material.
+    ///
+    /// [`export_crypto_state`](Self::export_crypto_state) calls this once at its
+    /// end (belt-and-suspenders) after serializing the snapshot.
+    /// [`restore_crypto_state`](Self::restore_crypto_state) does NOT call it:
+    /// restore consumes each secret field incrementally as it moves the material
+    /// into the live crypto state (`drain`/`mem::replace`/per-field `zeroize` at
+    /// the point of use), so there is no single end-of-function sweep to make. On
+    /// both paths the [`Drop`] impl below is the backstop that also fires on an
+    /// early `?` return, so raw signer / sender-key / wrapping-secret / MLS-secret
+    /// bytes never linger un-zeroized in freed memory on ANY path (matches the
+    /// parity guarantee the `scp-mls` and `scp-client` snapshots make via their
+    /// own `Drop`s).
+    fn zeroize_secrets(&mut self) {
+        self.signer_bytes.zeroize();
+        self.local_sender_key.zeroize();
+        self.wrapping_secret_key.zeroize();
+        for (_, value) in &mut self.mls_storage_entries {
+            value.zeroize();
+        }
+        for (_, key) in &mut self.sender_key_entries {
+            key.zeroize();
+        }
+    }
+}
+
+// SECURITY: zeroize key material on every drop path — including an early `?`
+// return between deserialization and the explicit trailing `zeroize` calls — so
+// private material never lingers in freed memory. No field is ever moved out of a
+// `MlsCryptoSnapshot` (the export/restore paths drain/replace/borrow in place), so
+// this `Drop` does not conflict with a partial move.
+impl Drop for MlsCryptoSnapshot {
+    fn drop(&mut self) {
+        self.zeroize_secrets();
+    }
+}
+
 /// Per-context cryptographic state managed by [`MlsCryptoProvider`].
 struct ContextCryptoState {
     /// The `OpenMLS` group for this context (Encrypted mode only).
@@ -348,9 +387,9 @@ struct PendingJoinState {
     /// The signing key pair for the generated key package, wrapped in
     /// [`EagerDropSigner`] for best-effort zeroization (consistent with
     /// [`ScpMlsGroup::signer`]).
-    signer: super::group::EagerDropSigner,
+    signer: scp_mls::group::EagerDropSigner,
     /// The MLS provider holding the key package's private state.
-    provider: crate::crypto::mls::InMemoryMlsProvider,
+    provider: scp_mls::InMemoryMlsProvider,
 }
 
 /// Production `ContextCryptoProvider` backed by `OpenMLS`.
@@ -372,6 +411,14 @@ struct PendingJoinState {
 pub struct MlsCryptoProvider {
     /// The local member's DID (e.g., `"did:dht:z6Mk..."`).
     local_did: String,
+    /// Injected hardened [`Clock`] (ADR-057 §Prereq-1). Used for the provider's
+    /// direct `scp-mls` calls that mint or validate `KeyPackage` / group-leaf
+    /// `Lifetime`s (create-group, generate-key-package, add-member, decrypt) and
+    /// for the committer-assigned timestamp at [`Self::add_member`]. In
+    /// production this is the SAME `Arc` the actor-deps clock and the injected
+    /// [`ProductionMlsBackend`] share — one hardened clock per node, never
+    /// openmls's internal one.
+    clock: Arc<dyn Clock>,
     /// Injected MLS primitive backend (ADR-049 commit 12). Production
     /// callers receive a [`ProductionMlsBackend`] from
     /// [`MlsCryptoProvider::new`]; tests inject failure-driven mocks via
@@ -488,12 +535,16 @@ impl MlsCryptoProvider {
     /// # Arguments
     ///
     /// * `local_did` - The local member's DID (must be a valid `did:dht:z...`).
+    /// * `clock` - The injected hardened [`Clock`] (ADR-057 §Prereq-1). Shared
+    ///   with the constructed [`ProductionMlsBackend`] so a node has exactly one
+    ///   hardened clock governing every `KeyPackage` / group-leaf `Lifetime`.
     #[must_use]
-    pub fn new(local_did: String) -> Self {
+    pub fn new(local_did: String, clock: Arc<dyn Clock>) -> Self {
         Self::with_backends(
             local_did,
-            Arc::new(ProductionMlsBackend::new()),
+            Arc::new(ProductionMlsBackend::new(Arc::clone(&clock))),
             Arc::new(ProductionHpkeBackend::new()),
+            clock,
         )
     }
 
@@ -513,15 +564,20 @@ impl MlsCryptoProvider {
     ///   in tests).
     /// * `hpke_backend` - The HPKE primitive backend (typically
     ///   [`ProductionHpkeBackend`] in production).
+    /// * `clock` - The injected hardened [`Clock`] (ADR-057 §Prereq-1) used for
+    ///   the provider's direct `scp-mls` `Lifetime` mint/validate calls. Tests
+    ///   pass `Arc::new(SystemClock)`; production passes the node's shared clock.
     #[must_use]
     pub fn with_backends(
         local_did: String,
         mls_backend: Arc<dyn MlsBackend>,
         hpke_backend: Arc<dyn HpkeBackend>,
+        clock: Arc<dyn Clock>,
     ) -> Self {
         let (wrapping_public_key, wrapping_secret_key) = generate_wrapping_keypair();
         Self {
             local_did,
+            clock,
             mls_backend,
             hpke_backend,
             contexts: DashMap::new(),
@@ -564,6 +620,19 @@ impl MlsCryptoProvider {
     #[must_use]
     pub fn hpke_backend(&self) -> &Arc<dyn HpkeBackend> {
         &self.hpke_backend
+    }
+
+    /// A clone of the injected hardened [`Clock`] (ADR-057 §Prereq-1) `Arc`.
+    ///
+    /// Lets the node/FFI construction sites wire the SAME clock `Arc` into the
+    /// `Supervisor` that this provider holds, so the "one hardened clock per
+    /// node" invariant documented on the [`Self::clock`] field holds by
+    /// construction — the supervisor does not fabricate a second `SystemClock`.
+    /// The returned `Arc` points at the exact same [`Clock`] this provider (and
+    /// its [`ProductionMlsBackend`]) already share.
+    #[must_use]
+    pub fn clock(&self) -> Arc<dyn Clock> {
+        Arc::clone(&self.clock)
     }
 
     /// Destructively move the per-context MLS crypto state out of this
@@ -759,7 +828,11 @@ impl MlsCryptoProvider {
         // parameters into `group_context`; this variant is retained for callers
         // that create a bare group without params.
         self.create_group_into_slot(context_id, |credential, wrapping_pk| {
-            group::create_group_with_wrapping_key(credential, Some(wrapping_pk))
+            group::create_group_with_wrapping_key(
+                credential,
+                Some(wrapping_pk),
+                self.clock.as_ref(),
+            )
         })
     }
 
@@ -789,7 +862,12 @@ impl MlsCryptoProvider {
         context_extension: &scp_protocol::context::ScpContextExtension,
     ) -> Result<(), ContextCreationError> {
         self.create_group_into_slot(context_id, |credential, wrapping_pk| {
-            group::create_group_with_context(credential, wrapping_pk, context_extension)
+            group::create_group_with_context(
+                credential,
+                wrapping_pk,
+                context_extension,
+                self.clock.as_ref(),
+            )
         })
     }
 
@@ -807,7 +885,7 @@ impl MlsCryptoProvider {
         build_group: F,
     ) -> Result<(), ContextCreationError>
     where
-        F: FnOnce(&ScpCredential, &[u8; 32]) -> Result<ScpMlsGroup, super::MlsError>,
+        F: FnOnce(&ScpCredential, &[u8; 32]) -> Result<ScpMlsGroup, scp_mls::MlsError>,
     {
         use dashmap::mapref::entry::Entry;
 
@@ -1038,10 +1116,21 @@ impl MlsCryptoProvider {
             .map_err(|e| ContextError::InvalidKeyPackage(format!("TLS deserialization: {e}")))?;
 
         // Validate ciphersuite and signature.
-        let provider = crate::crypto::mls::InMemoryMlsProvider::default();
+        let provider = scp_mls::InMemoryMlsProvider::default();
         let verified = kp_in
             .validate(provider.crypto(), ProtocolVersion::Mls10)
             .map_err(|e| ContextError::InvalidKeyPackage(format!("validation failed: {e}")))?;
+
+        // SECURITY (ADR-057 §Prereq-1): openmls's `validate` above runs its own
+        // internal `Lifetime::is_valid` against openmls's (wasm: unhardened)
+        // clock. This eager join gate is the accept-family sibling of
+        // `ProductionMlsBackend::validate_key_package` — re-validate the accepted
+        // `Lifetime` against the injected hardened clock and enforce the RFC 9420
+        // max-range bound openmls's `validate` never applies. Additive hardening;
+        // never replaces openmls.
+        validate_key_package_lifetime(verified.life_time(), self.clock.as_ref()).map_err(|e| {
+            ContextError::InvalidKeyPackage(format!("key package lifetime invalid: {e}"))
+        })?;
 
         if verified.ciphersuite() != SCP_CIPHERSUITE {
             return Err(ContextError::InvalidKeyPackage(format!(
@@ -1140,12 +1229,12 @@ impl MlsCryptoProvider {
             KeyPackageIn::tls_deserialize(&mut &*bytes)
                 .ok()
                 .and_then(|kp_in| {
-                    let provider_tmp = crate::crypto::mls::InMemoryMlsProvider::default();
+                    let provider_tmp = scp_mls::InMemoryMlsProvider::default();
                     kp_in
                         .validate(provider_tmp.crypto(), ProtocolVersion::Mls10)
                         .ok()
                         .and_then(|verified| {
-                            super::wrapping_extension::extract_wrapping_key(
+                            scp_mls::wrapping_extension::extract_wrapping_key(
                                 verified.leaf_node().extensions(),
                             )
                             .ok()
@@ -1159,8 +1248,11 @@ impl MlsCryptoProvider {
             .map_err(|e| ContextError::CryptoFailed(format!("key package deserialization: {e}")))?;
 
         let member_did_owned = member_did.to_owned();
+        // ADR-057 §Prereq-1: bound before the closure so the hardened clock ref
+        // is captured by the closure without re-borrowing `self` inside it.
+        let clock = self.clock.as_ref();
         self.with_context(context_id, |state| {
-            let result = group::add_member(&mut state.mls_group, kp_in)
+            let result = group::add_member(&mut state.mls_group, kp_in, clock)
                 .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
 
             // TLS-serialize Welcome and Commit for cross-process delivery.
@@ -1215,12 +1307,12 @@ impl MlsCryptoProvider {
             let members = state
                 .mls_group
                 .members()
-                .map_err(|e: super::error::MlsError| ContextError::CryptoFailed(e.to_string()))?;
+                .map_err(|e: scp_mls::error::MlsError| ContextError::CryptoFailed(e.to_string()))?;
 
             let own_index = state
                 .mls_group
                 .own_leaf_index()
-                .map_err(|e: super::error::MlsError| ContextError::CryptoFailed(e.to_string()))?;
+                .map_err(|e: scp_mls::error::MlsError| ContextError::CryptoFailed(e.to_string()))?;
 
             let mut target_index = None;
             for member in &members {
@@ -1632,7 +1724,9 @@ impl MlsCryptoProvider {
             rmp_serde::from_slice(request_bytes)
                 .map_err(|e| ContextError::CryptoFailed(format!("request deserialization: {e}")))?;
 
-        let now_secs = scp_primitives::SystemClock.now_secs();
+        // ADR-057 §Prereq-1: committer-assigned timestamp from the injected
+        // hardened clock, not a fresh un-injected `SystemClock`.
+        let now_secs = self.clock.now_secs();
 
         // ADR-049 commit 12c.9f: lock-free `DashMap::get_mut`.
         let mut entry = self.contexts.get_mut(context_id).ok_or_else(|| {
@@ -1785,10 +1879,9 @@ impl MlsCryptoProvider {
             );
 
             // 3. MLS encrypt.
-            let mls_message =
-                crate::crypto::mls::encrypt::encrypt(&mut state.mls_group, &with_header)
-                    .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
-            let encrypted_blob = crate::crypto::mls::encrypt::serialize_ciphertext(&mls_message)
+            let mls_message = scp_mls::encrypt::encrypt(&mut state.mls_group, &with_header)
+                .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+            let encrypted_blob = scp_mls::encrypt::serialize_ciphertext(&mls_message)
                 .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
 
             // 4. Wrap in outer envelope.
@@ -1834,6 +1927,10 @@ impl MlsCryptoProvider {
         context_id_str: &str,
         outer_bytes: &[u8],
     ) -> Result<scp_protocol::context::builder::OpenResult, ContextError> {
+        // ADR-057 §Prereq-1: bound before the closure so the hardened clock ref
+        // (used to re-validate an add-Commit's KeyPackage `Lifetime`) is captured
+        // without re-borrowing `self` inside it.
+        let clock = self.clock.as_ref();
         self.with_context(context_id, |state| {
             // Defense in depth (symmetry with `seal`): the supplied 32-byte
             // `context_id` MUST be the canonical digest of `context_id_str` —
@@ -1871,8 +1968,9 @@ impl MlsCryptoProvider {
                 })?;
 
             // Step 1: MLS decrypt and extract sender DID from credential.
-            let content = decrypt_with_sender_did(&mut state.mls_group, &outer.encrypted_blob)
-                .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+            let content =
+                decrypt_with_sender_did(&mut state.mls_group, &outer.encrypted_blob, clock)
+                    .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
 
             match content {
                 DecryptedContent::Application {
@@ -2031,9 +2129,9 @@ impl MlsCryptoProvider {
             let mut tagged = Vec::with_capacity(magic.len() + plaintext.len());
             tagged.extend_from_slice(magic);
             tagged.extend_from_slice(plaintext);
-            let mls_message = crate::crypto::mls::encrypt::encrypt(&mut state.mls_group, &tagged)
+            let mls_message = scp_mls::encrypt::encrypt(&mut state.mls_group, &tagged)
                 .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
-            let encrypted_blob = crate::crypto::mls::encrypt::serialize_ciphertext(&mls_message)
+            let encrypted_blob = scp_mls::encrypt::serialize_ciphertext(&mls_message)
                 .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
             let outer = scp_protocol::envelope::outer::create_outer_envelope(
                 routing_id,
@@ -2071,7 +2169,7 @@ impl MlsCryptoProvider {
         // ADR-049 commit 12c.9f: load wrapping pubkey through `ArcSwap`.
         let wrapping_pk = **self.wrapping_public_key.load();
         self.with_context(context_id, |state| {
-            let commit = super::ratchet::propose_update_with_wrapping_key(
+            let commit = scp_mls::ratchet::propose_update_with_wrapping_key(
                 &mut state.mls_group,
                 &wrapping_pk,
             )
@@ -2217,17 +2315,11 @@ impl MlsCryptoProvider {
 
         // SECURITY: Zeroize sensitive key material in the intermediate snapshot
         // to minimize the window where private keys exist as structured data in
-        // memory. The serialized blob is the caller's responsibility (Storage
-        // layer must encrypt at rest per §17.5).
-        snapshot.signer_bytes.zeroize();
-        snapshot.local_sender_key.zeroize();
-        snapshot.wrapping_secret_key.zeroize();
-        for (_, value) in &mut snapshot.mls_storage_entries {
-            value.zeroize();
-        }
-        for (_, key) in &mut snapshot.sender_key_entries {
-            key.zeroize();
-        }
+        // memory. Delegates to the shared `zeroize_secrets` helper (single source
+        // of truth for which fields are secret; the `Drop` impl is the backstop).
+        // The serialized blob is the caller's responsibility (Storage layer must
+        // encrypt at rest per §17.5).
+        snapshot.zeroize_secrets();
 
         result
     }
@@ -2259,7 +2351,7 @@ impl MlsCryptoProvider {
             .map_err(|e| ContextError::CryptoFailed(format!("snapshot deserialization: {e}")))?;
 
         // Reconstruct the InMemoryMlsProvider with the persisted storage entries.
-        let provider = crate::crypto::mls::InMemoryMlsProvider::default();
+        let provider = scp_mls::InMemoryMlsProvider::default();
         {
             let mut values =
                 provider.storage().values.write().map_err(|e| {
@@ -2693,8 +2785,12 @@ impl MlsCryptoProvider {
         let wrapping_pk = **self.wrapping_public_key.load();
 
         let (kp_bundle, signer, provider) =
-            super::group::generate_key_package_with_context_params(&credential, Some(&wrapping_pk))
-                .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+            scp_mls::group::generate_key_package_with_context_params(
+                &credential,
+                Some(&wrapping_pk),
+                self.clock.as_ref(),
+            )
+            .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
 
         let kp_bytes = kp_bundle
             .key_package()
@@ -2707,7 +2803,7 @@ impl MlsCryptoProvider {
         // ADR-049 commit 12c.9f: `ArcSwapOption::store` is atomic; any
         // prior `Some` is dropped (with its `Zeroizing` signer wrapper).
         self.pending_joins.store(Some(Arc::new(PendingJoinState {
-            signer: super::group::EagerDropSigner::new(signer),
+            signer: scp_mls::group::EagerDropSigner::new(signer),
             provider,
         })));
 
@@ -2768,7 +2864,7 @@ impl MlsCryptoProvider {
             ContextError::CryptoFailed("pending join signer already consumed".into())
         })?;
 
-        let group = super::group::join_group_from_bytes(welcome_bytes, entry.provider, signer)
+        let group = scp_mls::group::join_group_from_bytes(welcome_bytes, entry.provider, signer)
             .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
 
         let sender_key = generate_sender_key();
@@ -2808,8 +2904,9 @@ impl MlsCryptoProvider {
 )]
 mod tests {
     use super::*;
-    use crate::crypto::mls::encrypt::{encrypt, serialize_ciphertext};
-    use crate::crypto::mls::group::generate_key_package;
+    use scp_clock::SystemClock;
+    use scp_mls::encrypt::{encrypt, serialize_ciphertext};
+    use scp_mls::group::generate_key_package;
     use scp_protocol::crypto::sender_keys::SenderKeyError;
     use tls_codec::Serialize as TlsSerializeTrait;
 
@@ -2847,7 +2944,7 @@ mod tests {
     }
 
     fn make_provider() -> MlsCryptoProvider {
-        MlsCryptoProvider::new(TEST_DID.to_string())
+        MlsCryptoProvider::new(TEST_DID.to_string(), Arc::new(SystemClock))
     }
 
     fn make_context_id() -> [u8; 32] {
@@ -2867,7 +2964,8 @@ mod tests {
         // Under `cfg(test)` the validator accepts `did:key:*` and
         // `did:test:*` so legacy mock-based tests still work; pick a
         // truly malformed DID string to prove rejection.
-        let provider = MlsCryptoProvider::new("invalid:format:whatever".to_string());
+        let provider =
+            MlsCryptoProvider::new("invalid:format:whatever".to_string(), Arc::new(SystemClock));
         assert!(provider.validate_creator_identity().is_err());
     }
 
@@ -2903,7 +3001,8 @@ mod tests {
             SigningKeyId::Active,
         )
         .unwrap();
-        let (bob_kp_bundle, _bob_signer, _bob_provider) = generate_key_package(&bob_cred).unwrap();
+        let (bob_kp_bundle, _bob_signer, _bob_provider) =
+            generate_key_package(&bob_cred, &SystemClock).unwrap();
 
         // Serialize the key package to bytes.
         let kp_bytes = bob_kp_bundle
@@ -2914,6 +3013,66 @@ mod tests {
         // Add Bob.
         let result = provider.add_member(&ctx_id, &bob_cred.did, Some(&kp_bytes));
         assert!(result.is_ok(), "add_member failed: {result:?}");
+    }
+
+    #[test]
+    fn validate_key_package_rejects_expired_lifetime_at_gate() {
+        use scp_clock::TestClock;
+        use scp_mls::KEY_PACKAGE_LIFETIME_MAX_RANGE_SECS;
+
+        // Security intent (ADR-057 §Prereq-1): the eager join gate
+        // `validate_key_package` must re-check the accepted KeyPackage
+        // `Lifetime` against the provider's injected hardened clock — mirroring
+        // its accept-family sibling `ProductionMlsBackend::validate_key_package`
+        // — so a KeyPackage that is temporally invalid under the SCP clock is
+        // rejected even though openmls's own internal `is_valid` (against the
+        // real system clock) accepts it.
+
+        // Bob's KeyPackage is minted at the REAL present via `SystemClock`, so
+        // openmls's un-injectable internal validation (which reads the real
+        // wall clock inside `kp_in.validate`) accepts it.
+        let bob_cred = ScpCredential::new(
+            "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo".to_string(),
+            None,
+            SigningKeyId::Active,
+        )
+        .unwrap();
+        let (bob_kp_bundle, _bob_signer, _bob_provider) =
+            generate_key_package(&bob_cred, &SystemClock).unwrap();
+        let kp_bytes = bob_kp_bundle
+            .key_package()
+            .tls_serialize_detached()
+            .unwrap();
+
+        // Provider clock is pinned far past the KeyPackage's `not_after`
+        // (`real_now + KEY_PACKAGE_LIFETIME_SECS`). One full max-range beyond the
+        // present clears the ~3-month window with margin, so the SCP bracket's
+        // `now < not_after` check fails.
+        let future_now = SystemClock.now_secs() + KEY_PACKAGE_LIFETIME_MAX_RANGE_SECS * 2;
+        let provider =
+            MlsCryptoProvider::new(TEST_DID.to_string(), Arc::new(TestClock::new(future_now)));
+
+        let result = provider.validate_key_package(&bob_cred.did, Some(&kp_bytes));
+        let err = result.expect_err(
+            "validate_key_package must reject a KeyPackage whose lifetime is expired \
+             under the injected clock",
+        );
+        assert!(
+            matches!(err, ContextError::InvalidKeyPackage(ref m) if m.contains("lifetime")),
+            "rejection must be at the lifetime gate, got: {err:?}"
+        );
+
+        // Positive control: with the provider clock at the real present, the
+        // same KeyPackage passes the lifetime gate (and every other check),
+        // proving the rejection above is caused by the injected clock offset —
+        // not by an unrelated defect in the KeyPackage bytes.
+        let live_provider = MlsCryptoProvider::new(TEST_DID.to_string(), Arc::new(SystemClock));
+        assert!(
+            live_provider
+                .validate_key_package(&bob_cred.did, Some(&kp_bytes))
+                .is_ok(),
+            "a freshly-minted KeyPackage must pass under a real-present clock"
+        );
     }
 
     #[test]
@@ -2947,7 +3106,8 @@ mod tests {
         // Add Bob.
         let bob_did = "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo";
         let bob_cred = ScpCredential::new(bob_did.to_string(), None, SigningKeyId::Active).unwrap();
-        let (bob_kp_bundle, _bob_signer, _bob_provider) = generate_key_package(&bob_cred).unwrap();
+        let (bob_kp_bundle, _bob_signer, _bob_provider) =
+            generate_key_package(&bob_cred, &SystemClock).unwrap();
         let kp_bytes = bob_kp_bundle
             .key_package()
             .tls_serialize_detached()
@@ -3016,7 +3176,7 @@ mod tests {
     fn encrypt_decrypt_roundtrip_two_members() {
         // Alice creates a group.
         let alice_did = "did:dht:z6MkAliceAliceAliceAliceAliceAliceAliceAlic";
-        let alice_provider = MlsCryptoProvider::new(alice_did.to_string());
+        let alice_provider = MlsCryptoProvider::new(alice_did.to_string(), Arc::new(SystemClock));
         let ctx_id = make_context_id();
         alice_provider.create_mls_group(&ctx_id).unwrap();
 
@@ -3024,14 +3184,14 @@ mod tests {
         let bob_did = "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo";
         let bob_cred = ScpCredential::new(bob_did.to_string(), None, SigningKeyId::Active).unwrap();
         let (bob_kp_bundle, bob_signer, bob_provider_mls) =
-            generate_key_package(&bob_cred).unwrap();
+            generate_key_package(&bob_cred, &SystemClock).unwrap();
         // We need the Welcome message to let Bob join. Get it from the
         // underlying group directly.
         let add_result = {
             let mut entry = alice_provider.contexts.get_mut(&ctx_id).unwrap();
             let state = entry.value_mut();
             let kp_in: KeyPackageIn = bob_kp_bundle.key_package().clone().into();
-            group::add_member(&mut state.mls_group, kp_in).unwrap()
+            group::add_member(&mut state.mls_group, kp_in, &SystemClock).unwrap()
         };
 
         // Bob joins using the Welcome.
@@ -3049,7 +3209,7 @@ mod tests {
 
         // Bob decrypts using his group directly.
         let mut bob_group = bob_group;
-        let decrypted = super::super::encrypt::decrypt(&mut bob_group, &ciphertext).unwrap();
+        let decrypted = scp_mls::encrypt::decrypt(&mut bob_group, &ciphertext).unwrap();
         assert_eq!(decrypted, plaintext);
     }
 
@@ -3057,7 +3217,7 @@ mod tests {
     fn forward_secrecy_after_epoch_advance() {
         // Alice creates a group.
         let alice_did = "did:dht:z6MkAliceAliceAliceAliceAliceAliceAliceAlic";
-        let alice_provider = MlsCryptoProvider::new(alice_did.to_string());
+        let alice_provider = MlsCryptoProvider::new(alice_did.to_string(), Arc::new(SystemClock));
         let ctx_id = make_context_id();
         alice_provider.create_mls_group(&ctx_id).unwrap();
 
@@ -3065,13 +3225,13 @@ mod tests {
         let bob_did = "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo";
         let bob_cred = ScpCredential::new(bob_did.to_string(), None, SigningKeyId::Active).unwrap();
         let (bob_kp_bundle, bob_signer, bob_provider_mls) =
-            generate_key_package(&bob_cred).unwrap();
+            generate_key_package(&bob_cred, &SystemClock).unwrap();
 
         let add_result = {
             let mut entry = alice_provider.contexts.get_mut(&ctx_id).unwrap();
             let state = entry.value_mut();
             let kp_in: KeyPackageIn = bob_kp_bundle.key_package().clone().into();
-            group::add_member(&mut state.mls_group, kp_in).unwrap()
+            group::add_member(&mut state.mls_group, kp_in, &SystemClock).unwrap()
         };
 
         let mut bob_group =
@@ -3086,7 +3246,7 @@ mod tests {
         };
 
         // Bob decrypts successfully in epoch 1.
-        let decrypted = super::super::encrypt::decrypt(&mut bob_group, &ciphertext_epoch1).unwrap();
+        let decrypted = scp_mls::encrypt::decrypt(&mut bob_group, &ciphertext_epoch1).unwrap();
         assert_eq!(decrypted, b"epoch 1 message");
 
         // Add Carol to advance to epoch 2.
@@ -3094,13 +3254,14 @@ mod tests {
         let carol_cred =
             ScpCredential::new(carol_did.to_string(), None, SigningKeyId::Active).unwrap();
         let (carol_kp_bundle, _carol_signer, _carol_provider) =
-            generate_key_package(&carol_cred).unwrap();
+            generate_key_package(&carol_cred, &SystemClock).unwrap();
 
         {
             let mut entry = alice_provider.contexts.get_mut(&ctx_id).unwrap();
             let state = entry.value_mut();
             let kp_in: KeyPackageIn = carol_kp_bundle.key_package().clone().into();
-            let _add_result2 = group::add_member(&mut state.mls_group, kp_in).unwrap();
+            let _add_result2 =
+                group::add_member(&mut state.mls_group, kp_in, &SystemClock).unwrap();
         }
 
         // Verify epoch advanced.
@@ -3145,7 +3306,7 @@ mod tests {
     #[test]
     fn three_member_group() {
         let alice_did = "did:dht:z6MkAliceAliceAliceAliceAliceAliceAliceAlic";
-        let provider = MlsCryptoProvider::new(alice_did.to_string());
+        let provider = MlsCryptoProvider::new(alice_did.to_string(), Arc::new(SystemClock));
         let ctx_id = make_context_id();
         provider.create_mls_group(&ctx_id).unwrap();
 
@@ -3153,12 +3314,12 @@ mod tests {
         let bob_did = "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo";
         let bob_cred = ScpCredential::new(bob_did.to_string(), None, SigningKeyId::Active).unwrap();
         let (bob_kp_bundle, bob_signer, bob_provider_mls) =
-            generate_key_package(&bob_cred).unwrap();
+            generate_key_package(&bob_cred, &SystemClock).unwrap();
         let add_bob_result = {
             let mut entry = provider.contexts.get_mut(&ctx_id).unwrap();
             let state = entry.value_mut();
             let kp_in: KeyPackageIn = bob_kp_bundle.key_package().clone().into();
-            group::add_member(&mut state.mls_group, kp_in).unwrap()
+            group::add_member(&mut state.mls_group, kp_in, &SystemClock).unwrap()
         };
 
         let _bob_group =
@@ -3169,13 +3330,13 @@ mod tests {
         let carol_cred =
             ScpCredential::new(carol_did.to_string(), None, SigningKeyId::Active).unwrap();
         let (carol_kp_bundle, carol_signer, carol_provider_mls) =
-            generate_key_package(&carol_cred).unwrap();
+            generate_key_package(&carol_cred, &SystemClock).unwrap();
 
         let add_carol_result = {
             let mut entry = provider.contexts.get_mut(&ctx_id).unwrap();
             let state = entry.value_mut();
             let kp_in: KeyPackageIn = carol_kp_bundle.key_package().clone().into();
-            group::add_member(&mut state.mls_group, kp_in).unwrap()
+            group::add_member(&mut state.mls_group, kp_in, &SystemClock).unwrap()
         };
 
         let _carol_group =
@@ -3199,13 +3360,14 @@ mod tests {
     #[test]
     fn member_removal_advances_epoch() {
         let alice_did = "did:dht:z6MkAliceAliceAliceAliceAliceAliceAliceAlic";
-        let provider = MlsCryptoProvider::new(alice_did.to_string());
+        let provider = MlsCryptoProvider::new(alice_did.to_string(), Arc::new(SystemClock));
         let ctx_id = make_context_id();
         provider.create_mls_group(&ctx_id).unwrap();
 
         let bob_did = "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo";
         let bob_cred = ScpCredential::new(bob_did.to_string(), None, SigningKeyId::Active).unwrap();
-        let (bob_kp_bundle, _bob_signer, _bob_provider) = generate_key_package(&bob_cred).unwrap();
+        let (bob_kp_bundle, _bob_signer, _bob_provider) =
+            generate_key_package(&bob_cred, &SystemClock).unwrap();
         let bob_kp_bytes = bob_kp_bundle
             .key_package()
             .tls_serialize_detached()
@@ -3384,7 +3546,7 @@ mod tests {
         let entry = provider.contexts.get(&ctx_id).unwrap();
         let state = entry.value();
         let extracted =
-            super::super::wrapping_extension::extract_own_wrapping_key(&state.mls_group).unwrap();
+            scp_mls::wrapping_extension::extract_own_wrapping_key(&state.mls_group).unwrap();
         assert_eq!(
             extracted,
             Some(**provider.wrapping_public_key.load()),
@@ -3394,7 +3556,7 @@ mod tests {
 
     #[test]
     fn distribute_sender_key_hpke_seals_when_wrapping_key_available() {
-        use super::super::group::generate_key_package_with_wrapping_key;
+        use scp_mls::group::generate_key_package_with_wrapping_key;
 
         let alice_provider = make_provider();
         let ctx_id = make_context_id();
@@ -3404,7 +3566,8 @@ mod tests {
         let bob_wrapping = [0xBB_u8; 32];
         let bob_cred = ScpCredential::new(bob_did.to_string(), None, SigningKeyId::Active).unwrap();
         let (bob_kp_bundle, _bob_signer, _bob_provider) =
-            generate_key_package_with_wrapping_key(&bob_cred, Some(&bob_wrapping)).unwrap();
+            generate_key_package_with_wrapping_key(&bob_cred, Some(&bob_wrapping), &SystemClock)
+                .unwrap();
         let kp_bytes = bob_kp_bundle
             .key_package()
             .tls_serialize_detached()
@@ -3459,7 +3622,8 @@ mod tests {
 
         let bob_did = "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo";
         let bob_cred = ScpCredential::new(bob_did.to_string(), None, SigningKeyId::Active).unwrap();
-        let (bob_kp_bundle, _bob_signer, _bob_provider) = generate_key_package(&bob_cred).unwrap();
+        let (bob_kp_bundle, _bob_signer, _bob_provider) =
+            generate_key_package(&bob_cred, &SystemClock).unwrap();
         let kp_bytes = bob_kp_bundle
             .key_package()
             .tls_serialize_detached()
@@ -3483,11 +3647,12 @@ mod tests {
 
     #[test]
     fn process_incoming_sender_key_roundtrip() {
-        use super::super::group::generate_key_package_with_wrapping_key;
+        use scp_mls::group::generate_key_package_with_wrapping_key;
 
         let alice_provider = make_provider();
         let bob_provider = MlsCryptoProvider::new(
             "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo".to_string(),
+            Arc::new(SystemClock),
         );
         let ctx_id = make_context_id();
         alice_provider.create_mls_group(&ctx_id).unwrap();
@@ -3498,7 +3663,8 @@ mod tests {
         let bob_cred = ScpCredential::new(bob_did.to_string(), None, SigningKeyId::Active).unwrap();
         let bob_wrapping_pk = **bob_provider.wrapping_public_key.load();
         let (bob_kp_bundle, _bob_signer, _bob_mls) =
-            generate_key_package_with_wrapping_key(&bob_cred, Some(&bob_wrapping_pk)).unwrap();
+            generate_key_package_with_wrapping_key(&bob_cred, Some(&bob_wrapping_pk), &SystemClock)
+                .unwrap();
         let kp_bytes = bob_kp_bundle
             .key_package()
             .tls_serialize_detached()
@@ -3566,6 +3732,7 @@ mod tests {
     fn process_incoming_sender_key_rejects_wrong_sender() {
         let bob_provider = MlsCryptoProvider::new(
             "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo".to_string(),
+            Arc::new(SystemClock),
         );
         let ctx_id = make_context_id();
         bob_provider.create_mls_group(&ctx_id).unwrap();
@@ -3680,7 +3847,7 @@ mod tests {
         assert!(!exported.is_empty(), "exported state should be non-empty");
 
         // Create a fresh provider and restore the state.
-        let provider2 = MlsCryptoProvider::new(TEST_DID.to_string());
+        let provider2 = MlsCryptoProvider::new(TEST_DID.to_string(), Arc::new(SystemClock));
 
         // Verify context doesn't exist before restore.
         let encrypted = test_encrypt_message(&provider2, &ctx_id, b"test", 0, 0);
@@ -3790,7 +3957,7 @@ mod tests {
         assert!(!exported.is_empty());
 
         // Step 3: simulate restart — fresh provider, restore state.
-        let provider2 = MlsCryptoProvider::new(TEST_DID.to_string());
+        let provider2 = MlsCryptoProvider::new(TEST_DID.to_string(), Arc::new(SystemClock));
         provider2.restore_crypto_state(&ctx_id, &exported).unwrap();
 
         // Verify the restored floor exactly matches the persisted epoch.
@@ -3898,7 +4065,7 @@ mod tests {
 
         // Snapshot + restart.
         let exported = provider.export_crypto_state(&ctx_id).unwrap();
-        let provider2 = MlsCryptoProvider::new(TEST_DID.to_string());
+        let provider2 = MlsCryptoProvider::new(TEST_DID.to_string(), Arc::new(SystemClock));
         provider2.restore_crypto_state(&ctx_id, &exported).unwrap();
 
         // Restored store has no key for Carol but still has the floor.
@@ -4195,7 +4362,7 @@ mod tests {
         snapshot.sender_key_epochs.clear();
         let legacy_bytes = rmp_serde::to_vec_named(&snapshot).unwrap();
 
-        let provider2 = MlsCryptoProvider::new(TEST_DID.to_string());
+        let provider2 = MlsCryptoProvider::new(TEST_DID.to_string(), Arc::new(SystemClock));
         provider2
             .restore_crypto_state(&ctx_id, &legacy_bytes)
             .expect("legacy snapshot (empty epoch map) must restore cleanly");
@@ -4280,7 +4447,7 @@ mod tests {
         snapshot.sender_key_epochs.clear();
         let legacy_bytes = rmp_serde::to_vec_named(&snapshot).unwrap();
 
-        let provider2 = MlsCryptoProvider::new(TEST_DID.to_string());
+        let provider2 = MlsCryptoProvider::new(TEST_DID.to_string(), Arc::new(SystemClock));
         provider2
             .restore_crypto_state(&ctx_id, &legacy_bytes)
             .expect("legacy restore must succeed");
@@ -4339,7 +4506,7 @@ mod tests {
         snapshot.sender_key_epochs.clear();
         let legacy_bytes = rmp_serde::to_vec_named(&snapshot).unwrap();
 
-        let provider2 = MlsCryptoProvider::new(TEST_DID.to_string());
+        let provider2 = MlsCryptoProvider::new(TEST_DID.to_string(), Arc::new(SystemClock));
         provider2
             .restore_crypto_state(&ctx_id, &legacy_bytes)
             .unwrap();
@@ -4387,7 +4554,7 @@ mod tests {
         let exported = provider.export_crypto_state(&ctx_id).unwrap();
 
         // Restore into a fresh provider twice — second should overwrite cleanly.
-        let provider2 = MlsCryptoProvider::new(TEST_DID.to_string());
+        let provider2 = MlsCryptoProvider::new(TEST_DID.to_string(), Arc::new(SystemClock));
         provider2.restore_crypto_state(&ctx_id, &exported).unwrap();
         provider2.restore_crypto_state(&ctx_id, &exported).unwrap();
 
@@ -4414,7 +4581,7 @@ mod tests {
 
         let exported = provider.export_crypto_state(&ctx_id).unwrap();
 
-        let provider2 = MlsCryptoProvider::new(TEST_DID.to_string());
+        let provider2 = MlsCryptoProvider::new(TEST_DID.to_string(), Arc::new(SystemClock));
         provider2.restore_crypto_state(&ctx_id, &exported).unwrap();
 
         // Verify epoch is preserved.
@@ -4455,7 +4622,7 @@ mod tests {
         assert!(!exported.is_empty());
 
         // Create a fresh provider (simulates restart — gets a NEW random keypair).
-        let provider2 = MlsCryptoProvider::new(TEST_DID.to_string());
+        let provider2 = MlsCryptoProvider::new(TEST_DID.to_string(), Arc::new(SystemClock));
         let fresh_public = **provider2.wrapping_public_key.load();
         assert_ne!(
             fresh_public, original_public,
@@ -4499,11 +4666,11 @@ mod tests {
         let bob_did = "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo";
         let context_id = scp_protocol::context::context_id_bytes(TEST_CTX_STR);
 
-        let alice = MlsCryptoProvider::new(alice_did.to_string());
+        let alice = MlsCryptoProvider::new(alice_did.to_string(), Arc::new(SystemClock));
         alice.create_mls_group(&context_id).unwrap();
         alice.generate_sender_key(&context_id).unwrap();
 
-        let bob = MlsCryptoProvider::new(bob_did.to_string());
+        let bob = MlsCryptoProvider::new(bob_did.to_string(), Arc::new(SystemClock));
         let bob_kp_bytes = bob.prepare_key_package_for_join().unwrap();
 
         let add_output = alice
@@ -5118,11 +5285,11 @@ mod tests {
         let bob_did = "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo";
         let context_id = scp_protocol::context::context_id_bytes(ctx_str);
 
-        let alice = MlsCryptoProvider::new(alice_did.to_string());
+        let alice = MlsCryptoProvider::new(alice_did.to_string(), Arc::new(SystemClock));
         alice.create_mls_group(&context_id).unwrap();
         alice.generate_sender_key(&context_id).unwrap();
 
-        let bob = MlsCryptoProvider::new(bob_did.to_string());
+        let bob = MlsCryptoProvider::new(bob_did.to_string(), Arc::new(SystemClock));
         let bob_kp_bytes = bob.prepare_key_package_for_join().unwrap();
         let add_output = alice
             .add_member(&context_id, bob_did, Some(&bob_kp_bytes))
@@ -5155,10 +5322,10 @@ mod tests {
         let ctx_str = "ctx-app-data-zeroed-rid";
         let (alice, _bob, _ctx_id, alice_did) = setup_two_party_for_ctx_string(ctx_str);
         let alice = std::sync::Arc::new(alice);
-        let clock: std::sync::Arc<dyn scp_primitives::Clock> =
-            std::sync::Arc::new(scp_primitives::SystemClock);
+        let clock: std::sync::Arc<dyn scp_clock::Clock> =
+            std::sync::Arc::new(scp_clock::SystemClock);
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
-        let sender = scp_identity::DID(alice_did.clone());
+        let sender = scp_did::DID(alice_did.clone());
         let recipients = app_data_recipients(ctx_str, &alice_did);
 
         let wire = crate::context::messaging_helpers::build_encrypted_envelope(
@@ -5198,10 +5365,10 @@ mod tests {
         let ctx_str = "ctx-app-data-roundtrip";
         let (alice, bob, ctx_id, alice_did) = setup_two_party_for_ctx_string(ctx_str);
         let alice_arc = std::sync::Arc::new(alice);
-        let clock: std::sync::Arc<dyn scp_primitives::Clock> =
-            std::sync::Arc::new(scp_primitives::SystemClock);
+        let clock: std::sync::Arc<dyn scp_clock::Clock> =
+            std::sync::Arc::new(scp_clock::SystemClock);
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
-        let sender = scp_identity::DID(alice_did.clone());
+        let sender = scp_did::DID(alice_did.clone());
         let recipients = app_data_recipients(ctx_str, &alice_did);
 
         let wire = crate::context::messaging_helpers::build_encrypted_envelope(
@@ -5291,7 +5458,7 @@ mod tests {
 
     /// Root `scp_context_params` extension fixture for the provider create path.
     fn provider_context_extension(context_id: &str) -> scp_protocol::context::ScpContextExtension {
-        use scp_primitives::DID;
+        use scp_did::DID;
         use scp_protocol::context::GovernanceModel;
         use scp_protocol::context::params::{CeilingPolicy, ContextMode};
         use scp_protocol::context::roles::{Capability, CapabilityCeiling};

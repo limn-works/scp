@@ -46,7 +46,7 @@ use scp_core::context::{
     AddMemberOutput, Capability, ContextError, ContextParams, RemoveMemberOutput,
 };
 use scp_core::economy::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
-use scp_identity::DID;
+use scp_did::DID;
 
 // ---------------------------------------------------------------------------
 // Mock providers — minimal implementations for ContextManager construction.
@@ -200,7 +200,7 @@ impl ContextEventLogProvider for MockEventLog {
 }
 
 fn noop_key_resolver() -> KeyResolver {
-    std::sync::Arc::new(|_did: &DID, _kid: scp_identity::SigningKeyId| None)
+    std::sync::Arc::new(|_did: &DID, _kid: scp_did::SigningKeyId| None)
 }
 
 /// Derives a deterministic Ed25519 seed from a DID string by XOR-folding
@@ -218,7 +218,7 @@ fn did_to_seed(did: &DID) -> [u8; 32] {
 /// Mock key resolver that returns a deterministic verifying key derived from
 /// the DID string. Used by happy-path tests that need real signature verification.
 fn mock_key_resolver() -> KeyResolver {
-    std::sync::Arc::new(|did, _kid: scp_identity::SigningKeyId| {
+    std::sync::Arc::new(|did, _kid: scp_did::SigningKeyId| {
         let seed = did_to_seed(did);
         Some(ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key())
     })
@@ -329,7 +329,7 @@ fn dummy_spending_ucan() -> scp_core::crypto::ucan::UcanToken {
             aud: "did:key:test-context".to_owned(),
             exp: now + 3600,
             nbf: Some(now),
-            nnc: generate_nonce(&scp_primitives::SystemClock),
+            nnc: generate_nonce(&scp_clock::SystemClock),
             att: vec![Attenuation {
                 with: "scp:spending:*".to_owned(),
                 can: "spend".to_owned(),
@@ -385,7 +385,7 @@ fn signed_spending_ucan_for(actor_did: &DID) -> scp_core::crypto::ucan::UcanToke
         aud: actor_did.as_ref().to_owned(),
         exp: now + 3600,
         nbf: Some(now.saturating_sub(60)),
-        nnc: generate_nonce(&scp_primitives::SystemClock),
+        nnc: generate_nonce(&scp_clock::SystemClock),
         att: vec![Attenuation {
             with: "scp:spending:*".to_owned(),
             can: "spend".to_owned(),

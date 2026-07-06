@@ -45,8 +45,10 @@ tokio-util = { workspace = true }
 thiserror = { workspace = true }
 scp-core = { path = "../../scp-core" }
 scp-media = { path = "../../scp-media" }
-scp-primitives = { path = "../../scp-primitives" }
+scp-clock = { path = "../../scp-clock" }
+scp-did = { path = "../../scp-did" }
 scp-identity = { path = "../../scp-identity", features = ["production-dht"] }
+scp-dht = { path = "../../scp-dht", features = ["production-dht"] }
 scp-event-log = { path = "../../scp-event-log" }
 scp-ffi-common = { path = "../common", features = ["custody"] }
 scp-node = { path = "../../scp-node", features = ["allow_unencrypted_storage"], optional = true }

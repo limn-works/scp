@@ -337,6 +337,7 @@ impl crate::scp::PyScp {
 
         let crypto = std::sync::Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(
             local_did.to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
         ));
         let transport = Box::new(scp_transport::RelayTransportProvider::new(adapter));
         // The supervisor's own event log MUST be the persistent Merkle provider

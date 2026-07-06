@@ -2,7 +2,7 @@
 //! free-function logic hoisted out of the deleted `manager/` directory
 //! in ADR-049 commit 12.
 
-use scp_identity::DID;
+use scp_did::DID;
 use scp_protocol::context::membership::{ContextEvent, ReceiveBuffer};
 use scp_protocol::context::params::Capability;
 use scp_protocol::trust::consequence::{ConsequenceRule, TriggeredConsequence};
@@ -111,7 +111,7 @@ pub struct EnforceConsequencesCtx<'a> {
     pub now: u64,
     pub triggered: &'a [TriggeredConsequence],
     pub rules: &'a [ConsequenceRule],
-    pub clock: &'a dyn scp_primitives::Clock,
+    pub clock: &'a dyn scp_clock::Clock,
     pub event_log: &'a dyn crate::context::builder::ContextEventLogProvider,
     /// Optional broadcast channel for event propagation from free
     /// functions that lack `&self` access to `ContextManager`.
@@ -525,7 +525,7 @@ fn dispatch_enforcement_action(
     role_state: &mut ConsequenceRoleStateMut<'_>,
     member_did: &DID,
     consequence: &TriggeredConsequence,
-    clock: &dyn scp_primitives::Clock,
+    clock: &dyn scp_clock::Clock,
     context_id: &str,
     obligation: &mut Option<ClassSCommitToken>,
 ) -> EnforcementOutcome {
@@ -654,7 +654,7 @@ fn enforce_assign_role(
     role_state: &mut ConsequenceRoleStateMut<'_>,
     member_did: &DID,
     to_role: &str,
-    clock: &dyn scp_primitives::Clock,
+    clock: &dyn scp_clock::Clock,
     obligation: &mut Option<ClassSCommitToken>,
     context_id: &str,
 ) -> bool {
@@ -854,8 +854,8 @@ mod convergence_tests {
     use crate::context::actor::state::PerContextState;
     use crate::context::builder::ContextEventLogProvider;
     use crate::context::providers::MerkleEventLogProvider;
-    use scp_identity::DID;
-    use scp_primitives::SystemClock;
+    use scp_clock::SystemClock;
+    use scp_did::DID;
     use scp_protocol::context::membership::ContextEvent;
     use scp_protocol::trust::consequence::{
         ConsequenceAction, ConsequenceRule, ConsequenceTrigger, EnforcementSeverity,

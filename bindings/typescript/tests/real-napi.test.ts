@@ -23,7 +23,7 @@ import type { BridgeMode } from "../src/bridge";
 import { ContextError } from "../src/errors";
 import { __getNativeScp, SCP } from "../src/scp";
 import type { Relay } from "../src/server";
-import type { BehavioralRecord } from "../src/types";
+import type { BehavioralRecord, CapabilityRequirement, ParticipationProfile } from "../src/types";
 import { allValid } from "../src/types";
 
 /**
@@ -566,6 +566,67 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       expect(parsed).toBeTruthy();
     });
 
+    test("registers a tool whose cost.amount exceeds 2^53 (bigint boundary, ADR-060)", async () => {
+      const identity = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(
+        identity,
+        JSON.stringify({ ceiling: ["tool:register"] }),
+      );
+      // 2^53 + 1 — the first integer a JS `number` cannot hold exactly — and
+      // u64::MAX. Both cross the FFI boundary as a JS `bigint`; a `number`-typed
+      // cost field would have narrowed and either lost precision or thrown.
+      for (const amount of [9_007_199_254_740_993n, 18_446_744_073_709_551_615n]) {
+        const toolId = await napi.toolRegister(ctx, {
+          name: `priced-tool-${amount}`,
+          description: "A tool with a large per-invocation cost",
+          inputSchema: {
+            type: "object",
+            properties: { a: { type: "string" }, b: { type: "number" } },
+            required: ["a", "b"],
+          },
+          outputSchema: {
+            type: "object",
+            properties: { result: { type: "string" }, ok: { type: "boolean" } },
+            required: ["result", "ok"],
+          },
+          operator: identity.did,
+          cost: {
+            amount,
+            currency: "SAT",
+            payee: identity.did,
+          },
+        });
+        expect(typeof toolId).toBe("string");
+        expect(toolId.length).toBeGreaterThan(0);
+      }
+    });
+
+    test("rejects a negative cost.amount (fail-closed, unsigned money)", async () => {
+      const identity = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(
+        identity,
+        JSON.stringify({ ceiling: ["tool:register"] }),
+      );
+      await expect(
+        napi.toolRegister(ctx, {
+          name: "negative-cost-tool",
+          description: "invalid",
+          inputSchema: {
+            type: "object",
+            properties: { a: { type: "string" }, b: { type: "number" } },
+            required: ["a", "b"],
+          },
+          outputSchema: {
+            type: "object",
+            properties: { result: { type: "string" }, ok: { type: "boolean" } },
+            required: ["result", "ok"],
+          },
+          operator: identity.did,
+          cost: { amount: -1n, currency: "SAT", payee: identity.did },
+        }),
+      ).rejects.toThrow(/SCP-VALID-7001/);
+    });
+
     test("verifies a tool and returns a verification result", async () => {
       const identity = await napi.identityCreate("in_memory");
       const ctx = await napi.contextCreate(
@@ -650,11 +711,13 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       const token = await napi.ucanMint(ctx, member.did, ["messages:read"]);
       const fullUri = token.capabilities[0] as string;
 
-      // No presenting agent → the gate MUST reject rather than default the
+      // Empty presenting agent → the gate MUST reject rather than default the
       // audience check to the token's own `aud` (which would be a tautology that
-      // inflates trust). The fail-closed check fires before nonce recording, so
-      // the token's nonce is NOT consumed and the control call below still works.
-      await expect(napi.ucanValidate(ctx, token.encoded, fullUri)).rejects.toThrow();
+      // inflates trust). presenting_agent_did is a required (non-optional)
+      // parameter; an empty string is rejected by validate_did. The fail-closed
+      // check fires before nonce recording, so the token's nonce is NOT consumed
+      // and the control call below still works.
+      await expect(napi.ucanValidate(ctx, token.encoded, fullUri, "")).rejects.toThrow();
 
       // Control: supplying the subject (the token's audience) passes.
       await napi.ucanValidate(ctx, token.encoded, fullUri, member.did);
@@ -670,7 +733,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       await napi.ucanRevoke(ctx, token.encoded, admin.did);
     });
 
-    // C3c (ADR-057, §7.2.4): structured read-only diagnostic.
+    // C3c (ADR-059, §7.2.4): structured read-only diagnostic.
     test("ucanEvaluate returns all-true for a valid token on a granted capability", async () => {
       const admin = await napi.identityCreate("in_memory");
       const member = await napi.identityCreate("in_memory");
@@ -762,7 +825,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       expect(allValid(omitted)).toBe(true);
     });
 
-    // C3c (ADR-057 / §7.2.4): evaluateTrust assesses each token's GENERAL
+    // C3c (ADR-059 / §7.2.4): evaluateTrust assesses each token's GENERAL
     // (intrinsic) validity — it must NOT impose an invoked-capability
     // grant-match. The previous implementation passed a `"*"` sentinel that the
     // real bridge rejects ("missing scp:ctx: prefix"); the fix passes no
@@ -1124,7 +1187,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
     // value rather than defaulting the presenting agent to the token's OWN `aud`
     // (which would make `aud == aud` always true, inflating trust for a token
     // addressed to someone else). This guards a future edit that drops
-    // `subjectDid` from `evaluateTrust` (ADR-057 / §7.2.4).
+    // `subjectDid` from `evaluateTrust` (ADR-059 / §7.2.4).
     test("evaluateTrust reports signaturesValid:false for an audience-mismatched token", async () => {
       const admin = await napi.identityCreate("in_memory");
       const bob = await napi.identityCreate("in_memory");
@@ -2863,6 +2926,129 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       const decoded = JSON.parse(new TextDecoder().decode(result.output as Uint8Array));
       expect(decoded).toBeTruthy();
       expect(decoded.validated_input).toEqual({ a: "x", b: "y" });
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Typed trust-input admission (ADR-058, SCP-1991)
+  //
+  // The SDK `checkCapabilityRequirements` / `verifyParticipationRequirements`
+  // methods take typed inputs and serialize them internally to the serde wire
+  // shape. These e2e tests drive the typed API through the real napi addon so
+  // the encoders are exercised against the actual `serde_json::from_str`
+  // deserializers in crates/scp-ffi/napi/src/trust.rs — a shape mismatch would
+  // surface as a parse error here, not just in the mock unit tests.
+  // ---------------------------------------------------------------------------
+  describe("Typed trust-input admission (real NAPI, ADR-058)", () => {
+    test("checkCapabilityRequirements: SelfAttested requirement met by a declared capability", () => {
+      const requirements: readonly CapabilityRequirement[] = [
+        { capability: "scp:capability:schema-validation/v1", verificationLevel: "SelfAttested" },
+      ];
+      // A SelfAttested requirement is satisfied by the declared capability with
+      // no challenge verification — the typed inputs round-trip through the
+      // bridge deserializers and admission succeeds (returns void, no throw).
+      expect(() =>
+        scpInstance.checkCapabilityRequirements(
+          "ctx-admission",
+          "did:dht:zSubject",
+          requirements,
+          ["scp:capability:schema-validation/v1"],
+          [],
+        ),
+      ).not.toThrow();
+    });
+
+    test("checkCapabilityRequirements: missing SelfAttested capability is rejected", () => {
+      const requirements: readonly CapabilityRequirement[] = [
+        { capability: "scp:capability:schema-validation/v1", verificationLevel: "SelfAttested" },
+      ];
+      expect(() =>
+        scpInstance.checkCapabilityRequirements(
+          "ctx-admission",
+          "did:dht:zSubject",
+          requirements,
+          [],
+          [],
+        ),
+      ).toThrow();
+    });
+
+    test("verifyParticipationRequirements: valid profile + empty requirements round-trips", () => {
+      // A structurally-valid profile (real 32/32/64 byte arrays) deserializes
+      // cleanly on the Rust side; with no requirements, verification is a no-op
+      // success — this exercises the full ParticipationProfile encoder path.
+      const profile: ParticipationProfile = {
+        subjectDid: "did:dht:zSubject",
+        participationDurationSecs: 3_600,
+        governanceActionsAgainst: 0,
+        governanceActionsBy: 1,
+        toolInvocationCount: 150,
+        toolInvocationCountAnchored: false,
+        contextCreationCount: 2,
+        roleProgressionCount: 3,
+        attestationCount: 4,
+        updatedAt: 1_700_000_000,
+        eventLogRoot: Array.from({ length: 32 }, (_, i) => i),
+        signerPublicKey: Array.from({ length: 32 }, (_, i) => i + 100),
+        signature: Array.from({ length: 64 }, () => 0),
+      };
+      expect(() =>
+        scpInstance.verifyParticipationRequirements("did:dht:zSubject", [], [profile]),
+      ).not.toThrow();
+    });
+
+    test("verifyParticipationRequirements: wrong-length signature byte array is rejected", () => {
+      // The Rust `signature: [u8; 64]` field rejects a 63-element array at
+      // deserialize time — byte-array length validation is enforced by the
+      // core serde types, surfaced through the typed encoder path.
+      const malformed: ParticipationProfile = {
+        subjectDid: "did:dht:zSubject",
+        participationDurationSecs: 3_600,
+        governanceActionsAgainst: 0,
+        governanceActionsBy: 0,
+        toolInvocationCount: 0,
+        toolInvocationCountAnchored: false,
+        contextCreationCount: 0,
+        roleProgressionCount: 0,
+        attestationCount: 0,
+        updatedAt: 1_700_000_000,
+        eventLogRoot: Array.from({ length: 32 }, () => 0),
+        signerPublicKey: Array.from({ length: 32 }, () => 0),
+        signature: Array.from({ length: 63 }, () => 0),
+      };
+      expect(() =>
+        scpInstance.verifyParticipationRequirements("did:dht:zSubject", [], [malformed]),
+      ).toThrow();
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Economy amounts cross the addon as bigint (ADR-060)
+  // ---------------------------------------------------------------------------
+
+  describe("Economy bigint amounts (real NAPI)", () => {
+    test("grants and reads back a > 2^53 budget exactly", async () => {
+      const ctxId = `econ-bigint-${Date.now()}`;
+      const did = "did:dht:econ-member";
+      // 2^53 + 1 — the first integer a JS `number` cannot hold exactly.
+      const granted = 9_007_199_254_740_993n;
+
+      scpInstance.economyBudgetGrant(ctxId, did, granted);
+      const remaining = scpInstance.economyBudgetRemaining(ctxId, did);
+
+      expect(typeof remaining).toBe("bigint");
+      expect(remaining).toBe(granted);
+
+      // Spend part of it and confirm exact bigint arithmetic survives the
+      // round-trip through the native tracker.
+      scpInstance.economyBudgetRecordSpend(ctxId, did, 1n);
+      expect(scpInstance.economyBudgetRemaining(ctxId, did)).toBe(granted - 1n);
+    });
+
+    test("estimateCost returns a bigint for a free context", () => {
+      const cost = scpInstance.economyEstimateCost("", "MessageSend", "{}");
+      expect(typeof cost).toBe("bigint");
+      expect(cost).toBe(0n);
     });
   });
 }

@@ -12,10 +12,12 @@ use std::net::SocketAddr;
 use std::path::{Component, Path};
 use std::sync::Arc;
 
+use scp_clock::SystemClock;
 use scp_core::context::supervisor::Supervisor;
-use scp_identity::cache::SystemClock;
+use scp_dht::InMemoryDhtClient;
+use scp_did::DidDocument;
+use scp_identity::ScpIdentity;
 use scp_identity::dht::DidDht;
-use scp_identity::{DidDocument, InMemoryDhtClient, ScpIdentity};
 use scp_node::{DhtMode, ExplicitIdentity, IdentitySource, Node, NodeConfig, NodeError, Reach};
 use scp_platform::testing::{InMemoryKeyCustody, InMemoryStorage};
 use scp_transport::native::server::{RelayConfig, RelayError, RelayServer, ShutdownHandle};
@@ -280,7 +282,7 @@ pub async fn start_relay_local(data_dir: &Path) -> Result<RunningRelay, ServerEr
 /// When `identity` is `None` (auto-generate):
 /// - [`InMemoryKeyCustody`](scp_platform::testing::InMemoryKeyCustody)
 /// - [`InMemoryStorage`](scp_platform::testing::InMemoryStorage)
-/// - [`InMemoryDhtClient`](scp_identity::InMemoryDhtClient) (no real DHT network)
+/// - [`InMemoryDhtClient`](scp_dht::InMemoryDhtClient) (no real DHT network)
 /// - Self-signed TLS (for the localhost domain)
 /// - Relay bound to `127.0.0.1:0` (OS-assigned port)
 ///
@@ -347,7 +349,7 @@ pub async fn start_node_in_memory(
 ///   `<data_dir>/storage/` — persistent key-value storage for protocol state
 /// - [`BlobStorageBackend::redb`] at `<data_dir>/blobs.redb` — persistent
 ///   relay blob storage
-/// - [`InMemoryDhtClient`](scp_identity::InMemoryDhtClient) (no real DHT
+/// - [`InMemoryDhtClient`](scp_dht::InMemoryDhtClient) (no real DHT
 ///   network — suitable for local-only use)
 /// - Self-signed TLS (for the localhost domain)
 /// - Relay bound to `127.0.0.1:0` (OS-assigned port)
@@ -1256,9 +1258,10 @@ mod tests {
 
     /// Helper: creates a test identity using `InMemoryKeyCustody` and `DidDht`.
     async fn create_test_identity() -> NodeIdentity {
-        use scp_identity::cache::SystemClock;
+        use scp_clock::SystemClock;
+        use scp_dht::InMemoryDhtClient;
         use scp_identity::dht::DidDht;
-        use scp_identity::{DidCache, DidMethod, InMemoryDhtClient};
+        use scp_identity::{DidCache, DidMethod};
         use scp_platform::testing::InMemoryKeyCustody;
 
         type DevDidDht = DidDht<InMemoryDhtClient, SystemClock>;

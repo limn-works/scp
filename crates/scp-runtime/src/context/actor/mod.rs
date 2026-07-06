@@ -1568,19 +1568,20 @@ mod tests {
     /// function stays below the `too_many_lines` clippy threshold.
     async fn new_test_deps() -> deps::ActorDeps {
         use crate::context::supervisor::supervisor::Supervisor;
-        use scp_identity::DID;
+        use scp_did::DID;
         use scp_platform::testing::InMemoryStorage;
         use std::sync::Arc;
 
         let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
             "did:dht:z6MktestActorNew".to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
         ));
         let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
             Box::new(crate::context::builder::NotConfiguredTransportProvider);
         let event_log: Box<dyn crate::context::builder::ContextEventLogProvider> =
             Box::new(TestEventLog);
         let key_resolver: scp_protocol::context::governance::KeyResolver =
-            Arc::new(|_: &scp_identity::DID, _: scp_protocol::identity::SigningKeyId| None);
+            Arc::new(|_: &scp_did::DID, _: scp_did::SigningKeyId| None);
         let persistence: Box<dyn crate::context::persistence::ContextPersistence> =
             Box::new(TestPersistence);
         let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
@@ -1639,7 +1640,7 @@ mod tests {
         let st = state::PerContextState::new_for_test_encrypted(
             [ctx_byte; 32],
             1_700_000_000,
-            scp_identity::DID(member.to_owned()),
+            scp_did::DID(member.to_owned()),
         );
         // The in-order ingest path requires the context to be Active.
         st.handle
@@ -1648,11 +1649,11 @@ mod tests {
             .expect("transition test handle to Active");
         let mut st = st;
         st.membership.add_member(
-            scp_identity::DID(member.to_owned()),
+            scp_did::DID(member.to_owned()),
             "member".to_owned(),
             Vec::new(),
         );
-        st.members.insert(scp_identity::DID(member.to_owned()));
+        st.members.insert(scp_did::DID(member.to_owned()));
         st.role_state.members.insert(member.to_owned());
         let mut caps = HashSet::new();
         caps.insert(Capability::MessagesWrite);
@@ -1696,7 +1697,7 @@ mod tests {
             payload: Vec::new(),
             provenance: None,
             provenance_hash: [0u8; 32],
-            signing_key_id: scp_protocol::identity::SigningKeyId::Active,
+            signing_key_id: scp_did::SigningKeyId::Active,
             signature: [0u8; 64],
             extensions: std::collections::HashMap::new(),
         }
@@ -1738,7 +1739,7 @@ mod tests {
         assert!(consumed, "an announcement is reported as consumed (true)");
         let reg = state.routing.peer_registry().expect("encrypted ⇒ registry");
         assert_eq!(
-            reg.get(&scp_identity::DID(DIRECT_ALICE.to_owned())),
+            reg.get(&scp_did::DID(DIRECT_ALICE.to_owned())),
             Some(&pseudonym)
         );
     }
@@ -1834,7 +1835,7 @@ mod tests {
         }
         let reg = state.routing.peer_registry().expect("encrypted ⇒ registry");
         assert_eq!(
-            reg.get(&scp_identity::DID(DIRECT_ALICE.to_owned())),
+            reg.get(&scp_did::DID(DIRECT_ALICE.to_owned())),
             Some(&[0x43u8; 32]),
             "a same-DID re-announce updates the registry to the rotated routing ID"
         );
@@ -1858,7 +1859,7 @@ mod tests {
         let state = state::PerContextState::new_for_test_encrypted(
             [0x42u8; 32],
             1_700_000_000,
-            scp_identity::DID("did:example:admin".to_owned()),
+            scp_did::DID("did:example:admin".to_owned()),
         );
 
         let (tx, rx) = mpsc::channel::<ContextCommand>(4);

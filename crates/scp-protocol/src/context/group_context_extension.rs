@@ -44,7 +44,7 @@
 //!
 //! See spec §5.13.3 and `.docs/specs/05-contexts.md`.
 
-use scp_primitives::DID;
+use scp_did::DID;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -520,7 +520,7 @@ mod tests {
     use super::*;
     use crate::context::nesting::OnSeverPolicy;
     use crate::context::roles::Capability;
-    use scp_primitives::DID;
+    use scp_did::DID;
     use std::collections::BTreeSet;
 
     fn did(name: &str) -> DID {

@@ -534,9 +534,24 @@ conn.execute_batch("
 ")?;
 ```
 
-### Browser Clients Are Remote Thin Clients
+### Browser Clients Run Storage In-Process
 
-Browser clients do not run storage in-process. Per ADR-055 (which supersedes ADR-034), a browser client is a remote thin client to a server-side `scp-node`: the node holds the protocol engine, MLS group state, custody, the event log, and persistent storage. There is no in-browser `Storage` adapter — the browser issues protocol operations over RPC/WebSocket, and persistence is the node's concern (a native `SqliteStorage` / `FilesystemStorage` backend).
+Per ADR-057 (which supersedes ADR-055's browser-deployment conclusion), a browser SCP client runs the participant protocol in-tab with keys on-device — it is not a custodial remote thin client. Its persistence is therefore its own concern, held in a browser-local key/value store (`IndexedDB`, or a wa-sqlite/OPFS backend), never a server's.
+
+The in-browser client persists **per-context participant state as a self-contained snapshot** written after every state-mutating operation and read back when a tab reopens. A snapshot captures the MLS crypto state (group tree, epoch secrets, key schedule, and the on-device MLS signer), the §9.16 sender-key state (local key, the per-sender key store, epoch high-water floors, and the receive-replay tracker), the canonical event-log event stream, the membership set with per-member sequence counters, a §9.9.3 checkpoint (the event-log Merkle root), and the **receive buffer** — decrypted messages awaiting delivery to the application. The receive buffer is persisted deliberately: a message decrypted before the tab closed is delivered **exactly once** on reopen rather than lost, and it *cannot* be re-obtained from the relay, because decrypting it already advanced the forward-secrecy ratchet whose advance is itself persisted (the relay would re-deliver a ciphertext the restored group can no longer open). Persisting the buffer keeps the anti-replay floors consistent with the persisted ratchet — both advance together on decrypt and are captured together.
+
+**Pending pre-join material is also persisted**, as a distinct per-context pending-join record stored separately from the per-context snapshot: the private half of a key package that has been generated but whose Welcome has not yet arrived. Persisting it lets an **interrupted join resume** after a reopen instead of stranding a consumed key package. The pending blob is bound to the owning identity and the context it is for, and those bindings are verified on restore, so a swapped or mislabeled blob is rejected fail-closed.
+
+Both the receive buffer and the pending material hold decrypted / private key material, so — like the rest of the snapshot — they rely on the store's authenticated encryption at rest (below).
+
+Two integrity and durability properties are mandatory:
+
+- **Crash consistency.** A single-tab client has no server-side actor to serialize writes; instead each snapshot is a single atomic write of one blob per context. A crash leaves either the last fully-committed snapshot or the prior one — never a torn intra-context state. On restore, the checkpoint is recomputed from the reconstructed event log and compared to the recorded Merkle root; a mismatch fails the restore closed rather than resuming an inconsistent context. The recorded root lives inside the same blob, so this checkpoint is a torn-write / corruption / truncation consistency guard on the **event log**, not a whole-blob tamper-resistance mechanism — the MLS state, sender keys, and anti-replay floors are outside it. Because the receive buffer round-trips through the snapshot, ordinary state loss is bounded to the **last un-persisted mutation**, not to decrypted-but-undrained messages in general. The one true-loss case is narrow: a message whose decrypt advanced the ratchet in memory but whose follow-on snapshot write then *failed* before committing. That failure is not swallowed — it **poisons the context** (the durable snapshot is now strictly older than the live in-memory state, which have diverged), so every further operation on that context is refused and the client recovers by reconstructing from the last durable snapshot rather than silently continuing on a forked state.
+- **Authenticated encryption at rest.** The snapshot carries raw private key material (the MLS signer and epoch/HPKE secrets, the sender keys), the decrypted receive buffer, and the anti-replay floors. It is neither self-encrypting nor self-authenticating; the browser-local store MUST provide **authenticated** encryption at rest (an AEAD-backed store, not merely a confidential one). Confidentiality keeps the keys and plaintext secret; **authentication is the *sole* defense for whole-blob authenticity — the protocol itself does not defend against rollback or resurrection of a persisted blob.** Only the store's AEAD prevents a rolled-back blob from lowering a persisted replay floor and re-opening the §9.16 replay window on restore, or a deleted-on-close blob from being resurrected (the event-log checkpoint above does not cover those fields, and the ordered write-behind flush that a close relies on is likewise an embedder obligation). The browser tab is the platform-layer custody and plaintext boundary in this model (ADR-057), so page hardening (CSP, SRI, COOP/COEP) is load-bearing for confidentiality, not optional.
+
+Storage selection remains explicit and fails closed (see below): a browser client is constructed with its store, and a durable-backend open failure is a terminal error, never a silent downgrade.
+
+A **custodial remote thin client** — the node holding the protocol engine, MLS group state, custody, event log, and persistent storage, with the browser issuing operations over RPC/WebSocket — remains a valid *opt-in* secondary mode for users who explicitly choose convenience over self-sovereignty (ADR-057 Alternatives). It is not the default and not what "browser client" means.
 
 ### PostgreSQL Is NOT First-Party for Client Storage
 
@@ -887,7 +902,7 @@ These test the protocol layer's use of storage, not the storage adapters themsel
 
 ### Phase 4
 
-- TypeScript SDK storage configuration (native `SqliteStorage` for Node/Bun; browser clients are remote thin clients to a node per ADR-055 and run no in-process storage)
+- TypeScript SDK storage configuration (native `SqliteStorage` for Node/Bun; browser = in-tab SCP client with browser-local snapshot storage — `IndexedDB`/OPFS — per ADR-057, keys on-device; the custodial remote-thin-client to a node remains only as an opt-in secondary mode, not the default)
 
 ### Phase 5
 

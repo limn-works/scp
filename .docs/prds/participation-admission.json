@@ -142,9 +142,11 @@
         "crates/scp-core/src/trust/participation.rs",
         "crates/scp-core/src/trust/mod.rs"
       ],
-      "description": "Implement the verification function that checks a set of ParticipationProfiles (fetched from a joining agent's DID document ParticipationStatements service endpoint) against a context's Vec<RequireParticipation> admission requirements, per §7.3.2.1 verification flow. The function takes the current timestamp, the requirements, and the fetched signed statements. For each requirement it verifies: (a) each statement's Ed25519 signature is valid over its signable_bytes using its signer_public_key, (b) signers are distinct (N different signer_public_key values proving N independent contexts), (c) the required fact value (extracted from the full profile via ParticipationFact::extract_value) meets the threshold (using ParticipationThreshold::is_satisfied from SCP-BA-001), (d) the statement's updated_at is within max_age_secs of current time, (e) statements span at least min_contexts distinct signers. Returns Ok(()) if all requirements are satisfied, or an error indicating which requirement failed and why.",
+      "description": "Implement the verification function that checks a set of ParticipationProfiles (fetched from a joining agent's DID document ParticipationStatements service endpoint) against a context's Vec<RequireParticipation> admission requirements, per §7.3.2.1 verification flow. The function takes the current timestamp, the expected_subject (the DID of the agent being admitted), the requirements, and the fetched signed statements. Step 0 is subject binding (§7.3.2.1 step 5a): before any accounting, every statement whose signed subject_did does not equal expected_subject is dropped fail-closed, so cross-subject profiles never contribute — this closes cross-subject participation-profile replay, where a victim's genuine high-standing profiles are presented to admit a different agent. Profiles are signed by the context, not the subject, so this binding is enforced by the protocol, not delegated to the caller. An empty expected_subject is rejected as invalid input (ParticipationAdmissionError::EmptyExpectedSubject) rather than treated as a wildcard match. Then, over the subject-matching statements only, for each requirement it verifies: (a) each statement's Ed25519 signature is valid over its signable_bytes using its signer_public_key, (b) signers are distinct (N different signer_public_key values proving N independent contexts), (c) the required fact value (extracted from the full profile via ParticipationFact::extract_value) meets the threshold (using ParticipationThreshold::is_satisfied from SCP-BA-001), (d) the statement's updated_at is within max_age_secs of current time, (e) statements span at least min_contexts distinct signers. Returns Ok(()) if all requirements are satisfied, or an error indicating which requirement failed and why.",
       "acceptanceCriteria": [
-        "verify_participation_requirements(current_time: u64, requirements: &[RequireParticipation], statements: &[ParticipationProfile]) -> Result<(), ParticipationAdmissionError> is implemented",
+        "verify_participation_requirements(current_time: u64, expected_subject: &str, requirements: &[RequireParticipation], statements: &[ParticipationProfile]) -> Result<(), ParticipationAdmissionError> is implemented",
+        "Step 0 (subject binding, §7.3.2.1 step 5a): before any threshold, freshness, or distinct-signer accounting, statements whose signed subject_did does not equal expected_subject are dropped fail-closed and never contribute to any requirement",
+        "Returns ParticipationAdmissionError::EmptyExpectedSubject when expected_subject is empty (invalid input, not a wildcard match)",
         "Returns Ok(()) when all requirements are satisfied by the provided statements",
         "Each statement's Ed25519 signature is verified against its signer_public_key over signable_bytes",
         "Returns ParticipationAdmissionError::InvalidSignature when a statement's signature does not verify",
@@ -160,10 +162,13 @@
         "Test: threshold not met returns ThresholdNotMet",
         "Test: stale statement returns RecordTooStale",
         "Test: insufficient distinct signers returns InsufficientContexts",
-        "Test: two statements with same signer_public_key count as one context"
+        "Test: two statements with same signer_public_key count as one context",
+        "Test: a statement whose signed subject_did differs from expected_subject is dropped and does not contribute to any requirement (cross-subject profile replay is fail-closed)",
+        "Test: empty expected_subject returns ParticipationAdmissionError::EmptyExpectedSubject"
       ],
       "actionItems": [
-        "Define ParticipationAdmissionError enum with variants InvalidSignature, ThresholdNotMet, RecordTooStale, InsufficientContexts, each carrying diagnostic fields",
+        "Define ParticipationAdmissionError enum with variants EmptyExpectedSubject, InvalidSignature, ThresholdNotMet, RecordTooStale, InsufficientContexts, each carrying diagnostic fields where applicable",
+        "Implement the Step 0 subject-binding filter: reject an empty expected_subject with EmptyExpectedSubject, then drop statements whose subject_did does not equal expected_subject before any accounting",
         "Implement verify_participation_requirements function in trust/participation.rs",
         "Implement Ed25519 signature verification for each statement using signer_public_key and signable_bytes",
         "Implement freshness check (current_time - statement.updated_at <= max_age_secs)",
@@ -204,7 +209,7 @@
       "acceptanceCriteria": [
         "Python bridge: RequireParticipation, ParticipationFact, ParticipationThreshold, ParticipationProfile are importable from scp_sdk",
         "Python bridge: ParticipationProfile exposes all 7 fact fields (participation_duration_secs, governance_actions_against, governance_actions_by, tool_invocation_count, context_creation_count, role_progression_count, attestation_count) plus updated_at, event_log_root, signer_public_key, signature",
-        "Python bridge: verify_participation_requirements is callable with ParticipationProfile inputs and returns None on success or raises an exception on failure",
+        "Python bridge: verify_participation_requirements is callable with an expected_subject DID and ParticipationProfile inputs and returns None on success or raises an exception on failure (including on empty expected_subject)",
         "Python bridge: ParticipationAdmissionError variants are mapped to Python exception types",
         "Python bridge: ContextParams includes participation_requirements field",
         "UniFFI bridge: RequireParticipation, ParticipationFact, ParticipationThreshold, ParticipationProfile are exposed in the UDL/proc-macro interface",
@@ -215,7 +220,7 @@
       ],
       "actionItems": [
         "Add RequireParticipation, ParticipationFact, ParticipationThreshold, ParticipationProfile (full profile) wrappers to Python bridge trust module",
-        "Add verify_participation_requirements binding to Python bridge accepting ParticipationProfile inputs",
+        "Add verify_participation_requirements binding to Python bridge accepting an expected_subject DID and ParticipationProfile inputs",
         "Update Python ContextParams wrapper to include participation_requirements",
         "Add equivalent types and function to UniFFI bridge trust module",
         "Add equivalent types and function to NAPI bridge trust module",

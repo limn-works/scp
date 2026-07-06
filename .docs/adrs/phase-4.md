@@ -1793,3 +1793,9 @@ Scope registries, as first-hop resolution points, see resolution metadata for ev
 8. **FFI bridges.** All three bridges (PyO3, NAPI, UniFFI) expose `scope_register`, `scope_lookup`, `scope_deregister` functions. Each bridge has a `scope_registries()` global singleton separate from `handle_registries()`.
 
 9. **Resolution integration.** Each FFI bridge's `address_resolve` function builds `known_contexts` from scope entries (all scope entries are context targets by `ScopeTarget` construction) in the scope registries, in addition to existing handle registry keys.
+
+---
+
+## ADR-058: Typed SDK Trust-Input Surface
+
+SDK trust-input surfaces take typed objects and serialize internally to the JSON FFI; the FFI bridges stay JSON. The input-side analog of ADR-059 (structured trust outputs). See the standalone [`ADR-058-typed-sdk-trust-input-surface.md`](./ADR-058-typed-sdk-trust-input-surface.md).

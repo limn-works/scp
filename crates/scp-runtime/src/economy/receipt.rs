@@ -154,7 +154,8 @@ pub fn all_receipts_valid(
 /// {ok:false, error} ] }`.
 ///
 /// `verified_currency` is emitted as its string form (e.g. `"USD"`),
-/// `verified_amount` as a number.
+/// `verified_amount` as a canonical base-10 decimal string (ADR-060, e.g.
+/// `"1500"`).
 ///
 /// `ok` = the verification CALL succeeded (adapter responded); `valid` /
 /// `all_valid` = payment validity. `all_valid` starts `true` and is cleared by
@@ -179,8 +180,8 @@ pub fn verification_results_to_json(
                 // Build `result` as an explicit object so `verified_currency`
                 // serializes as its string form (e.g. "USD") rather than the
                 // raw `[u8; 4]` byte array produced by `CurrencyCode`'s derived
-                // `Serialize`. `verified_amount` is an `Amount` newtype over
-                // `u64`, which already serializes as a plain number.
+                // `Serialize`. `verified_amount` is an `Amount` newtype whose
+                // serde form is a canonical base-10 decimal string (ADR-060).
                 serde_json::json!({
                     "receipt_id": hex::encode(v.receipt_id),
                     "ok": true,
@@ -450,8 +451,8 @@ where
 )]
 mod tests {
     use super::*;
+    use scp_did::DID;
     use scp_event_log::EventType;
-    use scp_identity::DID;
     use scp_protocol::economy::types::{Amount, CurrencyCode, PaidActionType};
 
     /// Creates a test `PaymentReceipt` with a configurable `receipt_id`.
@@ -1143,9 +1144,9 @@ mod tests {
         // Currency is a string, NOT an array.
         assert!(r0["verified_currency"].is_string());
         assert!(!r0["verified_currency"].is_array());
-        // Amount is a plain number.
-        assert!(r0["verified_amount"].is_number());
-        assert_eq!(r0["verified_amount"], serde_json::json!(1500));
+        // Amount is a canonical base-10 decimal string (ADR-060).
+        assert!(r0["verified_amount"].is_string());
+        assert_eq!(r0["verified_amount"], serde_json::json!("1500"));
         assert_eq!(r0["valid"], serde_json::Value::Bool(true));
         assert_eq!(
             r0["adapter_id"],

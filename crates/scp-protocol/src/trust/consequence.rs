@@ -14,8 +14,8 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use scp_did::DID;
 use scp_event_log::{Event, EventType};
-use scp_primitives::DID;
 
 // ---------------------------------------------------------------------------
 // ConsequenceValidationError

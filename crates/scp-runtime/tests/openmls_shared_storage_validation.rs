@@ -24,10 +24,10 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use rand::RngCore;
-use scp_identity::SigningKeyId;
+use scp_did::SigningKeyId;
+use scp_mls::credential::ScpCredential;
 use scp_platform::testing::InMemoryStorage;
 use scp_runtime::crypto::mls::backend::MlsBackend;
-use scp_runtime::crypto::mls::credential::ScpCredential;
 use scp_runtime::crypto::mls::production_backend::ProductionMlsBackend;
 use scp_runtime::crypto::mls::storage_adapter::{
     OpenMlsStorageAdapter, SpawnBlockingStorageAdapter,
@@ -143,7 +143,9 @@ async fn assertions_1_through_4_distinct_namespaces_no_corruption() {
     // ProductionMlsBackend uses its own per-call provider so
     // shared-storage exhaustion is exercised below.
 
-    let backend = Arc::new(ProductionMlsBackend::new());
+    let backend = Arc::new(ProductionMlsBackend::new(std::sync::Arc::new(
+        scp_clock::SystemClock,
+    )));
 
     // Spawn N concurrent actors.
     let mut tasks = Vec::with_capacity(N);

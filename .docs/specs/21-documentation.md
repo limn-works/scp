@@ -134,7 +134,7 @@ Each binding directory gets a README answering:
 1. **What is this** — One sentence (e.g., "Python SDK for SCP, providing identity, contexts, encryption, and transport")
 2. **Install** — `pip install scp-python` / SPM / npm
 3. **Quickstart** — 10-20 lines of working code: create identity, create context, send message
-4. **Platform notes** — Language-specific considerations (Python: async, Swift: Keychain/Secure Enclave, TypeScript: NAPI in-process for Node/Bun; browser = remote thin client per ADR-055)
+4. **Platform notes** — Language-specific considerations (Python: async, Swift: Keychain/Secure Enclave, TypeScript: NAPI in-process for Node/Bun; browser = in-tab client over scp-client-wasm with keys on-device per ADR-057)
 5. **API overview** — Brief listing of main classes/modules with one-line descriptions
 6. **Link to full docs** — Point to `docs/guides/sdk-quickstart.md` and generated API reference
 
@@ -213,7 +213,12 @@ Crates and their enforcement status:
 | `scp-ffi` | not yet | ~99% | 100% |
 | `scp-ffi-napi` | not yet | ~100% | 100% |
 | `scp-ffi-uniffi` | not yet | ~100% | 100% |
-| `scp-primitives` | `warn` | ~100% | 100% |
+| `scp-clock` | `warn` | ~100% | 100% |
+| `scp-crypto` | `warn` | ~100% | 100% |
+| `scp-did` | `warn` | ~100% | 100% |
+| `scp-mls` | not yet | ~95% | 100% |
+| `scp-client` | not yet | ~95% | 100% |
+| `scp-client-wasm` | not yet | ~95% | 100% |
 | `scp-testing` | not yet | ~90% | 100% |
 | `scp-node` | `warn` | ~91% | 100% |
 | `scp-mcp` | `warn` | ~100% | 100% |

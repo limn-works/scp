@@ -664,11 +664,43 @@
           "swift": true
         },
         {
+          "name": "trust_create_challenge",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true,
+          "notes": "Challenge-issuance op (ADR-017, §7.3.4): all four SDKs expose an idiomatic wrapper over the bridge free function (Python scp_sdk.trust_create_challenge, TypeScript SCP.trustCreateChallenge, Kotlin SCP.trustCreateChallenge, Swift SCP.trustCreateChallenge)."
+        },
+        {
+          "name": "trust_verify_attestation",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true,
+          "notes": "Attestation verification op (ADR-017, §7.4): all four SDKs expose an idiomatic typed wrapper taking the CachedAttestationEnvelope wire DTO (Python scp_sdk.trust_verify_attestation, TypeScript SCP.trustVerifyAttestation, Kotlin SCP.trustVerifyAttestation, Swift free function trustVerifyAttestation per ADR-048 §1 + §7)."
+        },
+        {
+          "name": "trust_verify_response",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true,
+          "notes": "Challenge-response verification op (ADR-017, §7.3.4): all four SDKs expose an idiomatic typed wrapper taking the ChallengeRequest/ChallengeResponse wire DTOs (Python scp_sdk.trust_verify_response, TypeScript SCP.trustVerifyResponse, Kotlin SCP.trustVerifyResponse, Swift SCP.trustVerifyResponse)."
+        },
+        {
           "name": "verify_participation_requirements",
           "python": true,
           "typescript": true,
           "kotlin": true,
           "swift": true
+        },
+        {
+          "name": "check_capability_requirements",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true,
+          "notes": "Capability-admission op (spec \u00a77.3.4.4, SCP-ACR-008): sibling of verify_participation_requirements. PyO3 (py_check_capability_requirements), NAPI (checkCapabilityRequirements), and UniFFI (check_capability_requirements) bridges take the JSON envelope (context_id, subject_did, requirements_json, agent_capabilities_json, challenge_verifications_json), validate_did(subject_did) at the boundary, and delegate to scp_protocol::trust::check_capability_requirements with the production IdentityDidPublicKeyResolver + fail-closed SystemClock so each ChallengeVerification is signature/subject/context/expiry bound. All four SDKs expose idiomatic wrappers (Python scp_sdk.check_capability_requirements, TypeScript SCP.checkCapabilityRequirements, Kotlin SCP.checkCapabilityRequirements, Swift free function checkCapabilityRequirements)."
         },
         {
           "name": "participation_record",
@@ -1329,7 +1361,7 @@
           "typescript": true,
           "kotlin": true,
           "swift": true,
-          "notes": "Structured read-only diagnostic (ADR-057, §7.2.4). All four bindings expose an idiomatic wrapper over the typed CapabilityValidationRecord: Python SCP.ucan_evaluate / evaluate_trust, TypeScript SCP.ucanEvaluate / evaluateTrust, Kotlin SCP.ucanEvaluate / evaluateTrust (Scp.kt, types in Trust.kt), Swift SCP.ucanEvaluate / evaluateTrust (Trust.swift). Per the per-SDK-idiom lesson the record SHAPE is identical (only casing differs); the wrappers are language-idiomatic."
+          "notes": "Structured read-only diagnostic (ADR-059, §7.2.4). All four bindings expose an idiomatic wrapper over the typed CapabilityValidationRecord: Python SCP.ucan_evaluate / evaluate_trust, TypeScript SCP.ucanEvaluate / evaluateTrust, Kotlin SCP.ucanEvaluate / evaluateTrust (Scp.kt, types in Trust.kt), Swift SCP.ucanEvaluate / evaluateTrust (Trust.swift). Per the per-SDK-idiom lesson the record SHAPE is identical (only casing differs); the wrappers are language-idiomatic."
         },
         {
           "name": "mint",

@@ -540,12 +540,12 @@ mod tests {
     mod block_handler_tests {
         use super::*;
         use crate::crypto::sender_keys::key_protocol::send_block_notification;
+        use scp_did::SigningKeyId;
         use scp_platform::testing::InMemoryKeyCustody;
         use scp_platform::traits::{KeyCustody, KeyType};
         use scp_protocol::crypto::sender_keys::{
             BlockNotification, SenderKeyStore, generate_sender_key,
         };
-        use scp_protocol::identity::SigningKeyId;
 
         /// Creates a custody + signing key for test use.
         async fn make_custody_and_key() -> (InMemoryKeyCustody, scp_platform::traits::KeyHandle) {
@@ -565,7 +565,7 @@ mod tests {
             initiator_did: &str,
             target_did: &str,
         ) -> (BlockNotification, Vec<u8>) {
-            let clock = scp_primitives::SystemClock;
+            let clock = scp_clock::SystemClock;
             let msg = send_block_notification(
                 custody,
                 key,

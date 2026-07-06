@@ -1,8 +1,23 @@
 //! RFC 8785 JSON Canonicalization Scheme (JCS).
 //!
-//! All cross-implementation canonical hashing of complex structures
-//! uses JCS (not `MessagePack`). See project memory:
-//! "Canonical Hashing Uses JSON, Not `MessagePack`."
+//! JCS is the canonicalization scheme for challenge preimages
+//! (`trust::challenge`), tool-registration and tool-invocation hashing
+//! (`context::tools`), and the other structured-hash paths that call
+//! [`to_vec`] / [`to_string`] here.
+//!
+//! # Scope
+//!
+//! JCS is **not** universal — each signed structure's spec row assigns a
+//! serialization per field. `trust::attestation::canonical_attestation_bytes`
+//! uses JCS for the `claim` field (§9.5.2 Attestation row 5: compact JSON)
+//! and `rmp_serde::to_vec_named` (`MessagePack`, named keys) for `evidence`
+//! and `revocation_status`, which the §9.5.2 note explicitly sanctions for
+//! those two fields. `IdentityLinkAttestation::canonical_signing_bytes` is
+//! governed by a separate spec row (§3 identity, domain
+//! `SCP-IDENTITY-LINK-ATTESTATION-V1:`) that mandates `MessagePack` for its
+//! `claim`, `evidence`, and `revocation_status` sub-structures. The
+//! scheme-per-field decisions are documented on those functions; this module
+//! governs the JCS paths.
 
 /// Serializes a value to canonical JSON bytes per RFC 8785.
 ///

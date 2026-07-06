@@ -110,4 +110,55 @@ pub enum MlsError {
     /// single-use model).
     #[error("key package replay: init key already consumed")]
     KeyPackageReplay,
+
+    /// A `KeyPackage` `Lifetime` failed validation against the injected hardened
+    /// [`Clock`](scp_clock::Clock): it is expired, not yet valid, or its total
+    /// range (`not_after - not_before`) exceeds the RFC 9420 maximum acceptable
+    /// range. Raised by
+    /// [`validate_key_package_lifetime`](crate::lifetime::validate_key_package_lifetime),
+    /// SCP's hardened counterpart to openmls's un-injectable internal
+    /// `Lifetime::is_valid` (ADR-057 §Prereq-1). The same variant covers both the
+    /// temporal (expiry / not-before) failure and the maximum-range failure;
+    /// `now` is the timestamp read from the injected clock at validation.
+    #[error(
+        "key package lifetime invalid: not_before={not_before}, not_after={not_after}, now={now}"
+    )]
+    KeyPackageLifetimeInvalid {
+        /// The `Lifetime`'s `not_before` bound (Unix seconds).
+        not_before: u64,
+        /// The `Lifetime`'s `not_after` bound (Unix seconds).
+        not_after: u64,
+        /// The current time read from the injected clock at validation
+        /// (Unix seconds).
+        now: u64,
+    },
+
+    /// Serializing or deserializing an [`crate::ScpMlsGroup`] state snapshot
+    /// failed (the out-of-band persistence path used by the in-browser driver
+    /// to snapshot the in-memory MLS provider to durable storage — ADR-057
+    /// component 3, §17.9.1). Covers a `MessagePack` (de)serialization failure, a
+    /// poisoned provider-storage lock, or a group that could not be reloaded
+    /// from the restored provider (`MlsGroup::load` returned `None`).
+    #[error("MLS state snapshot error: {0}")]
+    Snapshot(String),
+
+    /// A decrypted-and-verified MLS frame carried **no** convergent-timestamp
+    /// AAD (its `FramedContent.authenticated_data` was empty), so the receiver
+    /// has no authenticated committer timestamp to stamp on its mirrored
+    /// event-log leaf. Raised by
+    /// [`decode_convergent_timestamp_aad`](crate::convergent_timestamp::decode_convergent_timestamp_aad)
+    /// on an empty AAD — a frame authored without `set_aad` (an old-path or
+    /// forged message). Fail-closed: the receiver rejects rather than substitute
+    /// its own clock, which would diverge its §9.9.3 Merkle root (ADR-057).
+    #[error("convergent committer timestamp missing from MLS AAD")]
+    ConvergentTimestampMissing,
+
+    /// A decrypted-and-verified MLS frame carried an AAD that is not a
+    /// well-formed convergent-timestamp blob (wrong length, wrong magic, or an
+    /// unrecognized version). Raised by
+    /// [`decode_convergent_timestamp_aad`](crate::convergent_timestamp::decode_convergent_timestamp_aad).
+    /// Fail-closed: the receiver never guesses a timestamp from malformed bytes
+    /// (ADR-057).
+    #[error("convergent committer timestamp malformed: {0}")]
+    ConvergentTimestampMalformed(String),
 }

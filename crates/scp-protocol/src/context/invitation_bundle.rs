@@ -50,7 +50,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-use scp_primitives::DID;
+use scp_did::DID;
 
 use super::metadata::{Ed25519Signature, MetadataSnapshot};
 use super::params::ContextParams;
@@ -263,12 +263,8 @@ impl InvitationBundle {
     /// computed.
     pub fn verify(&self, verifying_key: &VerifyingKey) -> Result<(), InvitationBundleError> {
         let hash = self.invitation_bundle_signing_hash()?;
-        crate::crypto::ed25519::verify_ed25519_signature(
-            verifying_key.as_bytes(),
-            &hash,
-            &self.signature,
-        )
-        .map_err(|_| InvitationBundleError::SignatureInvalid)
+        scp_crypto::verify_ed25519_signature(verifying_key.as_bytes(), &hash, &self.signature)
+            .map_err(|_| InvitationBundleError::SignatureInvalid)
     }
 
     /// In-bundle **structural-consistency** check (spec §5.12.3.1 validation
@@ -461,12 +457,8 @@ impl JoinResponse {
     /// computed.
     pub fn verify(&self, verifying_key: &VerifyingKey) -> Result<(), InvitationBundleError> {
         let hash = self.join_response_signing_hash()?;
-        crate::crypto::ed25519::verify_ed25519_signature(
-            verifying_key.as_bytes(),
-            &hash,
-            &self.signature,
-        )
-        .map_err(|_| InvitationBundleError::SignatureInvalid)
+        scp_crypto::verify_ed25519_signature(verifying_key.as_bytes(), &hash, &self.signature)
+            .map_err(|_| InvitationBundleError::SignatureInvalid)
     }
 
     /// Serializes the response to its `MessagePack` transport envelope.
@@ -625,9 +617,15 @@ mod tests {
     fn kat_invitation_bundle_signing_hash() {
         let bundle = fixture_bundle();
         let hash = bundle.invitation_bundle_signing_hash().unwrap();
+        // Regenerated when `ContextParams` gained the `capability_requirements`
+        // field (SCP-ACR-008, spec §7.3.4.4 / ADR-041 AC6). The bundle signs the
+        // full genesis `ContextParams` via `genesis_params_hash`, so the
+        // additional (default-empty) field is folded into the JCS canonical form
+        // and thus into this digest — an intended encoding change, not a
+        // regression.
         assert_eq!(
             hex::encode(hash),
-            "ad0a623f3e71534104a96fc1abe6aac5e6cb9d2c5510d2933818b4842a8aa414",
+            "222a69e8987a1619f0eee9d2c6c830bda19f5f675b7650ca665b1bd3b82906af",
             "invitation bundle signing-hash KAT"
         );
     }

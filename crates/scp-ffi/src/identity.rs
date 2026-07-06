@@ -43,15 +43,14 @@ use std::sync::Arc;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
-use scp_identity::{
-    DidCache, DidDht, DidDocument, DidMethod, DualLayerResolver, InMemoryDhtClient,
-    NoOpRelayQuerier, ScpIdentity,
-};
+use scp_clock::Clock;
+use scp_dht::InMemoryDhtClient;
+use scp_did::DidDocument;
+use scp_identity::{DidCache, DidDht, DidMethod, DualLayerResolver, NoOpRelayQuerier, ScpIdentity};
 use scp_platform::file::FileKeyCustody;
 #[cfg(feature = "allow_in_memory_custody")]
 use scp_platform::testing::InMemoryKeyCustody;
 use scp_platform::traits::{KeyCustody, Storage};
-use scp_primitives::Clock;
 
 use crate::custody::FfiKeyCustody;
 use crate::error::ScpPyError;
@@ -113,7 +112,7 @@ fn ensure_did_resolver_initialized_on(bi: &PyBridgeInstance, handle: tokio::runt
 ///
 /// Constructs a BEP44 signed mutable item (32-byte public key, 64-byte
 /// signature, document JSON, sequence number 1) and calls
-/// [`scp_identity::dht_client::DhtClient::publish`]. Best-effort: errors are
+/// [`scp_dht::DhtClient::publish`]. Best-effort: errors are
 /// logged but never fail identity creation (the document is still registered
 /// locally; only resolver discoverability is affected).
 ///
@@ -132,7 +131,7 @@ async fn publish_to_resolver_dht_for(
     document: &DidDocument,
     custody: &FfiKeyCustody,
 ) {
-    use scp_identity::dht_client::DhtClient as _;
+    use scp_dht::DhtClient as _;
 
     let Some(dht_client) = crate::runtime::resolver_dht_client(bi) else {
         // Resolver not initialized on this instance; nothing to seed.
@@ -160,7 +159,7 @@ async fn publish_to_resolver_dht_for(
 
     // Build the BEP44 signable payload and sign it with the identity key.
     let seq: u64 = 1;
-    let signable = scp_identity::dht::bep44_signable(value, seq);
+    let signable = scp_dht::bep44_signable(value, seq);
     let sig_bytes = match custody.sign(&identity.identity_key, &signable).await {
         Ok(sig) => sig.into_bytes(),
         Err(e) => {
@@ -229,9 +228,8 @@ async fn run_migrate_publish<C>(
 where
     C: KeyCustody + Send + Sync + 'static,
 {
-    let sign_fn = DidDht::<InMemoryDhtClient, scp_identity::cache::SystemClock>::make_sign_fn(
-        Arc::clone(key_custody),
-    );
+    let sign_fn =
+        DidDht::<InMemoryDhtClient, scp_clock::SystemClock>::make_sign_fn(Arc::clone(key_custody));
     let publish_client = rotation_publish_client(bi);
     let did_method =
         DidDht::with_client_and_signer(publish_client, Arc::new(DidCache::new()), sign_fn);
@@ -785,7 +783,7 @@ fn deserialize_identity_state(data: &[u8]) -> Result<(String, String), ScpPyErro
     Ok((did, custody))
 }
 
-/// Serializes a [`scp_identity::DidRotationEvent`] to JSON for return
+/// Serializes a [`scp_did::DidRotationEvent`] to JSON for return
 /// across the `PyO3` boundary, wrapping serialization errors in
 /// `ScpPyError::IdentityError` with code `IDENT_1004`.
 ///
@@ -793,7 +791,7 @@ fn deserialize_identity_state(data: &[u8]) -> Result<(String, String), ScpPyErro
 /// `too_many_lines` clippy threshold after the recovery-handle
 /// refactor moved the call to `migrate_identity` to a struct
 /// destructure.
-fn serialize_rotation_event(event: &scp_identity::DidRotationEvent) -> Result<String, ScpPyError> {
+fn serialize_rotation_event(event: &scp_did::DidRotationEvent) -> Result<String, ScpPyError> {
     serde_json::to_string(event).map_err(|e| ScpPyError::IdentityError {
         message: format!("failed to serialize rotation event: {e}"),
         code: scp_ffi_common::error_codes::IDENT_1004.to_owned(),
@@ -1489,7 +1487,7 @@ impl crate::scp::PyScp {
         let result: Result<PyIdentity, ScpPyError> = py.allow_threads(|| {
             crate::runtime::with_identity_mut(&bi_arc, &did, |entry| {
                 let sign_fn =
-                    DidDht::<InMemoryDhtClient, scp_identity::cache::SystemClock>::make_sign_fn(
+                    DidDht::<InMemoryDhtClient, scp_clock::SystemClock>::make_sign_fn(
                         Arc::clone(&entry.custody),
                     );
                 // Publish the rotated document into the SHARED resolver DHT
@@ -1584,7 +1582,7 @@ impl crate::scp::PyScp {
         let result: Result<PyIdentity, ScpPyError> = py.allow_threads(|| {
             crate::runtime::with_identity_mut(&bi_arc, &did, |entry| {
                 let sign_fn =
-                    DidDht::<InMemoryDhtClient, scp_identity::cache::SystemClock>::make_sign_fn(
+                    DidDht::<InMemoryDhtClient, scp_clock::SystemClock>::make_sign_fn(
                         Arc::clone(&entry.custody),
                     );
                 // Publish the agent-key-bearing document into the SHARED
@@ -1676,7 +1674,7 @@ impl crate::scp::PyScp {
         let result: Result<PyIdentity, ScpPyError> = py.allow_threads(|| {
             crate::runtime::with_identity_mut(&bi_arc, &did, |entry| {
                 let sign_fn =
-                    DidDht::<InMemoryDhtClient, scp_identity::cache::SystemClock>::make_sign_fn(
+                    DidDht::<InMemoryDhtClient, scp_clock::SystemClock>::make_sign_fn(
                         Arc::clone(&entry.custody),
                     );
                 // Publish the rotated-agent-key document into the SHARED
@@ -1767,7 +1765,7 @@ impl crate::scp::PyScp {
         let result: Result<PyIdentity, ScpPyError> = py.allow_threads(|| {
             crate::runtime::with_identity_mut(&bi_arc, &did, |entry| {
                 let sign_fn =
-                    DidDht::<InMemoryDhtClient, scp_identity::cache::SystemClock>::make_sign_fn(
+                    DidDht::<InMemoryDhtClient, scp_clock::SystemClock>::make_sign_fn(
                         Arc::clone(&entry.custody),
                     );
                 // Publish the agent-key-removed document into the SHARED
@@ -1875,7 +1873,7 @@ impl crate::scp::PyScp {
     ///
     /// See ADR-003 acceptance criterion 4b and SCP-214 criterion 10.
     /// Returns `(new_identity, rotation_event_json)`. The JSON shape is
-    /// `serde_json::to_string(&scp_identity::DidRotationEvent)` so JS-,
+    /// `serde_json::to_string(&scp_did::DidRotationEvent)` so JS-,
     /// Python-, Swift-, or Kotlin-side consumers parse it directly. The
     /// SDK distributes the event to context members (spec §3.2.1
     /// step 4b).
@@ -1921,7 +1919,7 @@ impl crate::scp::PyScp {
                     ))
                 })?;
 
-                let rotated_at = scp_primitives::SystemClock.now_secs();
+                let rotated_at = scp_clock::SystemClock.now_secs();
 
                 let old_identity = ScpIdentity {
                     identity_key: old_identity_key,
@@ -2301,7 +2299,7 @@ impl crate::scp::PyScp {
             RecoveryBackend, RecoveryStepError, active_key_rotation_outcome,
             agent_key_rotation_outcome,
         };
-        use scp_identity::DID;
+        use scp_did::DID;
 
         validate::validate_did(did)?;
         let did_owned = did.to_owned();
@@ -2323,7 +2321,7 @@ impl crate::scp::PyScp {
             };
 
             // Build key rotation outcome (step 1 is pre-completed by caller).
-            let now_ms = scp_primitives::SystemClock.now_millis();
+            let now_ms = scp_clock::SystemClock.now_millis();
             let key_rotation = match compromise_tier {
                 CompromiseTier::Agent => agent_key_rotation_outcome(&did_val, now_ms),
                 CompromiseTier::ActiveSigning => active_key_rotation_outcome(&did_val, now_ms),
@@ -2388,7 +2386,7 @@ impl crate::scp::PyScp {
                     &contacts,
                     None,
                     &backend,
-                    &scp_primitives::SystemClock,
+                    &scp_clock::SystemClock,
                 ))
                 .map_err(|e| ScpPyError::identity(format!("recovery failed: {e}")))?;
 
@@ -2439,7 +2437,7 @@ impl crate::scp::PyScp {
             CustodyMigrationBackend, CustodyMigrationOrchestrator, CustodyMigrationRequest,
             CustodyMigrationTarget,
         };
-        use scp_identity::DID;
+        use scp_did::DID;
 
         validate::validate_did(did)?;
         let did_owned = did.to_owned();
@@ -2500,7 +2498,7 @@ impl crate::scp::PyScp {
             let backend = NotConfiguredMigrationBackend;
 
             let result = rt
-                .block_on(orchestrator.execute(&backend, &scp_primitives::SystemClock))
+                .block_on(orchestrator.execute(&backend, &scp_clock::SystemClock))
                 .map_err(|e| ScpPyError::identity(format!("custody migration failed: {e}")))?;
 
             // Serialize to JSON and return — the Python layer converts to dict.
@@ -2607,7 +2605,7 @@ mod tests {
             // Rotation event JSON deserializes into the canonical
             // `DidRotationEvent` shape (spec §9.12, ADR-003 §4b/4c) so the
             // SDK can distribute it to context members per §3.2.1 step 4b.
-            let event: scp_identity::DidRotationEvent =
+            let event: scp_did::DidRotationEvent =
                 serde_json::from_str(&rotation_event_json).unwrap();
             assert_eq!(event.old_did, old_did);
             assert_eq!(event.new_did, new_did);

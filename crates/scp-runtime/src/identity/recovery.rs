@@ -27,11 +27,11 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use scp_identity::DID;
+use scp_did::DID;
 
 // ContextManager type deleted in ADR-049 commit 12; recovery binds to
 // the supervisor directly.
-use scp_primitives::Clock;
+use scp_clock::Clock;
 
 // ---------------------------------------------------------------------------
 // CompromiseTier — which key was compromised
@@ -1525,7 +1525,7 @@ mod tests {
                 &contacts,
                 None,
                 &backend,
-                &scp_primitives::SystemClock,
+                &scp_clock::SystemClock,
             )
             .await
             .unwrap();
@@ -1564,7 +1564,7 @@ mod tests {
                 &contacts,
                 Some(&psk_params),
                 &backend,
-                &scp_primitives::SystemClock,
+                &scp_clock::SystemClock,
             )
             .await
             .unwrap();
@@ -1597,7 +1597,7 @@ mod tests {
                 &contacts,
                 Some(&psk_params),
                 &backend,
-                &scp_primitives::SystemClock,
+                &scp_clock::SystemClock,
             )
             .await
             .unwrap();
@@ -1623,7 +1623,7 @@ mod tests {
                 &contacts,
                 None,
                 &backend,
-                &scp_primitives::SystemClock,
+                &scp_clock::SystemClock,
             )
             .await
             .unwrap();
@@ -1650,7 +1650,7 @@ mod tests {
                 &contacts,
                 None,
                 &backend,
-                &scp_primitives::SystemClock,
+                &scp_clock::SystemClock,
             )
             .await
             .unwrap();
@@ -1681,7 +1681,7 @@ mod tests {
                 &contacts,
                 Some(&psk_params),
                 &backend,
-                &scp_primitives::SystemClock,
+                &scp_clock::SystemClock,
             )
             .await
             .unwrap();
@@ -1716,7 +1716,7 @@ mod tests {
                 &contacts,
                 Some(&psk_params),
                 &backend,
-                &scp_primitives::SystemClock,
+                &scp_clock::SystemClock,
             )
             .await
             .unwrap();
@@ -1740,7 +1740,7 @@ mod tests {
                 &contacts,
                 None,
                 &backend,
-                &scp_primitives::SystemClock,
+                &scp_clock::SystemClock,
             )
             .await
             .unwrap();
@@ -1827,7 +1827,7 @@ mod tests {
                     &contacts,
                     None,
                     &backend,
-                    &scp_primitives::SystemClock,
+                    &scp_clock::SystemClock,
                 )
                 .await
                 .unwrap();
@@ -1849,7 +1849,7 @@ mod tests {
                     &contacts,
                     Some(&psk_params),
                     &backend,
-                    &scp_primitives::SystemClock,
+                    &scp_clock::SystemClock,
                 )
                 .await
                 .unwrap();
@@ -1870,7 +1870,7 @@ mod tests {
                     &contacts,
                     Some(&psk_params),
                     &backend,
-                    &scp_primitives::SystemClock,
+                    &scp_clock::SystemClock,
                 )
                 .await
                 .unwrap();
@@ -2011,10 +2011,11 @@ mod tests {
         crate::context::test_supervisor(
             Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
                 TEST_DID.to_owned(),
+                std::sync::Arc::new(scp_clock::SystemClock),
             )),
             Box::new(TestTransport),
             Box::new(TestEventLog),
-            Arc::new(|_: &scp_identity::DID, _: scp_protocol::identity::SigningKeyId| None),
+            Arc::new(|_: &scp_did::DID, _: scp_did::SigningKeyId| None),
         )
     }
 
@@ -2260,7 +2261,7 @@ mod tests {
                 &contacts,
                 None,
                 &backend,
-                &scp_primitives::SystemClock,
+                &scp_clock::SystemClock,
             )
             .await
             .unwrap();
@@ -2304,7 +2305,7 @@ mod tests {
                 &contacts,
                 Some(&psk_params),
                 &backend,
-                &scp_primitives::SystemClock,
+                &scp_clock::SystemClock,
             )
             .await
             .unwrap();
@@ -2347,7 +2348,7 @@ mod tests {
                 &contacts,
                 Some(&psk_params),
                 &backend,
-                &scp_primitives::SystemClock,
+                &scp_clock::SystemClock,
             )
             .await
             .unwrap();
@@ -2388,7 +2389,7 @@ mod tests {
                 &contacts,
                 None,
                 &backend,
-                &scp_primitives::SystemClock,
+                &scp_clock::SystemClock,
             )
             .await
             .unwrap();

@@ -197,7 +197,8 @@ impl ScpMlsGroup {
 mod tests {
     use super::*;
 
-    use scp_primitives::DID;
+    use scp_clock::SystemClock;
+    use scp_did::DID;
     use scp_protocol::context::params::{CeilingPolicy, ContextMode};
     use scp_protocol::context::roles::{Capability, CapabilityCeiling};
     use scp_protocol::context::{GovernanceModel, ScpContextExtension};
@@ -210,7 +211,7 @@ mod tests {
         crate::credential::ScpCredential::new(
             format!("did:dht:z6Mk{name}"),
             None,
-            scp_primitives::SigningKeyId::Active,
+            scp_did::SigningKeyId::Active,
         )
         .unwrap()
     }
@@ -304,7 +305,8 @@ mod tests {
         let ctx_ext = sample_context_extension("ctx:creator");
 
         let group =
-            crate::group::create_group_with_context(&cred, &wrapping_key, &ctx_ext).unwrap();
+            crate::group::create_group_with_context(&cred, &wrapping_key, &ctx_ext, &SystemClock)
+                .unwrap();
 
         let read_back = group.group_context_extension().unwrap();
         assert_eq!(
@@ -321,7 +323,8 @@ mod tests {
         let cred = test_credential("alice");
         let wrapping_key = [0xAA_u8; 32];
         let group =
-            crate::group::create_group_with_wrapping_key(&cred, Some(&wrapping_key)).unwrap();
+            crate::group::create_group_with_wrapping_key(&cred, Some(&wrapping_key), &SystemClock)
+                .unwrap();
 
         let read_back = group.group_context_extension().unwrap();
         assert_eq!(
@@ -340,19 +343,27 @@ mod tests {
         let alice_cred = test_credential("alice");
         let alice_wrapping = [0xAA_u8; 32];
         let ctx_ext = sample_context_extension("ctx:valn0502");
-        let mut alice_group =
-            crate::group::create_group_with_context(&alice_cred, &alice_wrapping, &ctx_ext)
-                .unwrap();
+        let mut alice_group = crate::group::create_group_with_context(
+            &alice_cred,
+            &alice_wrapping,
+            &ctx_ext,
+            &SystemClock,
+        )
+        .unwrap();
 
         // Bob's key package declares only 0xFF01 (wrapping key), not 0xFF02.
         let bob_cred = test_credential("bob");
         let bob_wrapping = [0xBB_u8; 32];
         let (bob_kp, _bob_signer, _bob_provider) =
-            crate::group::generate_key_package_with_wrapping_key(&bob_cred, Some(&bob_wrapping))
-                .unwrap();
+            crate::group::generate_key_package_with_wrapping_key(
+                &bob_cred,
+                Some(&bob_wrapping),
+                &SystemClock,
+            )
+            .unwrap();
         let bob_kp_in: KeyPackageIn = bob_kp.key_package().clone().into();
 
-        match crate::group::add_member(&mut alice_group, bob_kp_in) {
+        match crate::group::add_member(&mut alice_group, bob_kp_in, &SystemClock) {
             Err(MlsError::AddMemberFailed(_)) => {}
             Err(other) => panic!("expected AddMemberFailed, got {other:?}"),
             Ok(_) => {
@@ -375,7 +386,8 @@ mod tests {
         // None: context-capable, but no wrapping-key leaf extension.
         let cred_none = test_credential("kp-caps-none");
         let (kp_none, _s, _p) =
-            crate::group::generate_key_package_with_context_params(&cred_none, None).unwrap();
+            crate::group::generate_key_package_with_context_params(&cred_none, None, &SystemClock)
+                .unwrap();
         let caps_none = kp_none.key_package().leaf_node().capabilities();
         assert!(
             caps_none
@@ -401,9 +413,12 @@ mod tests {
         // Some: context-capable AND carries the wrapping-key leaf extension.
         let cred_some = test_credential("kp-caps-some");
         let wrapping = [0x5A_u8; 32];
-        let (kp_some, _s2, _p2) =
-            crate::group::generate_key_package_with_context_params(&cred_some, Some(&wrapping))
-                .unwrap();
+        let (kp_some, _s2, _p2) = crate::group::generate_key_package_with_context_params(
+            &cred_some,
+            Some(&wrapping),
+            &SystemClock,
+        )
+        .unwrap();
         let caps_some = kp_some.key_package().leaf_node().capabilities();
         assert!(
             caps_some
@@ -434,18 +449,27 @@ mod tests {
         let alice_wrapping = [0xAA_u8; 32];
         let ctx_ext = sample_context_extension("ctx:through-join");
 
-        let mut alice_group =
-            crate::group::create_group_with_context(&alice_cred, &alice_wrapping, &ctx_ext)
-                .unwrap();
+        let mut alice_group = crate::group::create_group_with_context(
+            &alice_cred,
+            &alice_wrapping,
+            &ctx_ext,
+            &SystemClock,
+        )
+        .unwrap();
 
         let bob_cred = test_credential("bob");
         let bob_wrapping = [0xBB_u8; 32];
         let (bob_kp, bob_signer, bob_provider) =
-            crate::group::generate_key_package_with_context_params(&bob_cred, Some(&bob_wrapping))
-                .unwrap();
+            crate::group::generate_key_package_with_context_params(
+                &bob_cred,
+                Some(&bob_wrapping),
+                &SystemClock,
+            )
+            .unwrap();
 
         let bob_kp_in: KeyPackageIn = bob_kp.key_package().clone().into();
-        let add_result = crate::group::add_member(&mut alice_group, bob_kp_in).unwrap();
+        let add_result =
+            crate::group::add_member(&mut alice_group, bob_kp_in, &SystemClock).unwrap();
 
         let bob_group =
             crate::group::join_group(&add_result.welcome, bob_provider, bob_signer).unwrap();
@@ -484,18 +508,26 @@ mod tests {
         let alice_wrapping = [0xAA_u8; 32];
         let ctx_ext = sample_context_extension("ctx:multi-commit");
 
-        let mut alice_group =
-            crate::group::create_group_with_context(&alice_cred, &alice_wrapping, &ctx_ext)
-                .unwrap();
+        let mut alice_group = crate::group::create_group_with_context(
+            &alice_cred,
+            &alice_wrapping,
+            &ctx_ext,
+            &SystemClock,
+        )
+        .unwrap();
 
         // Add Bob (epoch 1).
         let bob_cred = test_credential("bob");
         let bob_wrapping = [0xBB_u8; 32];
         let (bob_kp, bob_signer, bob_provider) =
-            crate::group::generate_key_package_with_context_params(&bob_cred, Some(&bob_wrapping))
-                .unwrap();
+            crate::group::generate_key_package_with_context_params(
+                &bob_cred,
+                Some(&bob_wrapping),
+                &SystemClock,
+            )
+            .unwrap();
         let bob_kp_in: KeyPackageIn = bob_kp.key_package().clone().into();
-        let add_bob = crate::group::add_member(&mut alice_group, bob_kp_in).unwrap();
+        let add_bob = crate::group::add_member(&mut alice_group, bob_kp_in, &SystemClock).unwrap();
         let mut bob_group =
             crate::group::join_group(&add_bob.welcome, bob_provider, bob_signer).unwrap();
 
@@ -506,10 +538,12 @@ mod tests {
             crate::group::generate_key_package_with_context_params(
                 &carol_cred,
                 Some(&carol_wrapping),
+                &SystemClock,
             )
             .unwrap();
         let carol_kp_in: KeyPackageIn = carol_kp.key_package().clone().into();
-        let add_carol = crate::group::add_member(&mut alice_group, carol_kp_in).unwrap();
+        let add_carol =
+            crate::group::add_member(&mut alice_group, carol_kp_in, &SystemClock).unwrap();
 
         // Bob processes the Carol-add commit to advance to epoch 2.
         let commit_bytes = crate::ratchet::serialize_mls_message(&add_carol.commit).unwrap();

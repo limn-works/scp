@@ -203,7 +203,7 @@ pub fn py_bridge_register(
         code: codes::CTX_2100.to_string(),
     })?;
 
-    let approver_did: scp_identity::DID = governance_did.into();
+    let approver_did: scp_did::DID = governance_did.into();
     let (connector, _approval_event) =
         approve_registration(&mut registry, &bridge_id, &approver_did, 0).map_err(|e| {
             ScpPyError::ContextError {

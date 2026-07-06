@@ -29,8 +29,8 @@
 
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
+use scp_clock::Clock;
 use scp_ffi_common::error_codes as codes;
-use scp_primitives::Clock;
 
 use crate::error::ScpPyError;
 use crate::runtime::PyBridgeInstance;
@@ -290,9 +290,7 @@ fn tool_register_impl(
         test_vectors,
         operator_did: operator_did.into(),
         cost,
-        registered_at: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs()),
+        registered_at: scp_clock::Clock::now_secs(&scp_clock::SystemClock),
         signature: vec![],
     };
 
@@ -349,7 +347,7 @@ fn validate_tool_ucan(
             presenting_agent_did: identity_did,
             clock_skew_tolerance_secs:
                 scp_core::crypto::ucan::validate::DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
-            clock: &scp_primitives::SystemClock,
+            clock: &scp_clock::SystemClock,
         };
 
         scp_core::context::tools::validate_tool_invocation_ucan(
@@ -532,7 +530,7 @@ fn tool_invoke_impl(
     // so we are NOT inside a tokio runtime context — `block_on` on the
     // multi-thread global runtime is safe (matches `py_context_send`).
     let supervisor = crate::runtime::supervisor(bi)?;
-    let invoker_did_typed: scp_primitives::DID = identity_did_owned.into();
+    let invoker_did_typed: scp_did::DID = identity_did_owned.into();
     let tool_id_typed = scp_core::context::tools::ToolId::from(tool_id_owned.as_str());
     let rt = crate::runtime()?;
     let outcome = rt
@@ -718,7 +716,10 @@ fn extract_cost(
         .transpose()?;
 
     Ok(Some(scp_core::context::tools::ToolCost {
-        amount,
+        // ADR-060: `ToolCost.amount` is the `Amount` newtype. Python `int` is
+        // arbitrary-precision, so the FFI param stays a native `u64` and carries
+        // the full smallest-unit range exactly.
+        amount: scp_core::economy::Amount(amount),
         currency,
         payee: payee.into(),
         cost_formula,
@@ -1202,7 +1203,7 @@ fn tool_invoke_cross_context_saga_impl(
     let request = CrossContextToolInvocationRequest {
         caller_context_id: caller_context_bytes,
         target_context_id: target_context_bytes,
-        caller_did: scp_primitives::DID(caller_did.to_owned()),
+        caller_did: scp_did::DID(caller_did.to_owned()),
         tool_registration_id: tool_registration_id.to_owned(),
         ucan_proof_id,
         input: input_json,
@@ -1301,7 +1302,7 @@ fn tool_session_create_impl(
         }
 
         let session_id = uuid::Uuid::new_v4().to_string();
-        let now_ms = scp_primitives::SystemClock.now_millis();
+        let now_ms = scp_clock::SystemClock.now_millis();
 
         let session = scp_core::context::tools::ToolSession {
             session_id: session_id.clone(),
@@ -1398,7 +1399,7 @@ fn tool_session_invoke_impl(
             .ok_or_else(|| ScpPyError::context(format!("session '{session_id}' not found")))?;
 
         // Check expiry.
-        let now_ms = scp_primitives::SystemClock.now_millis();
+        let now_ms = scp_clock::SystemClock.now_millis();
         if session.is_expired(now_ms) {
             rt.session_store.remove(session_id);
             return Err(ScpPyError::context(format!(
@@ -1667,7 +1668,7 @@ fn tool_interface_revoke_impl(
         code: codes::VALID_7042.to_owned(),
     })?;
 
-    let now_ms = scp_primitives::SystemClock.now_millis();
+    let now_ms = scp_clock::SystemClock.now_millis();
 
     let event = scp_core::context::tools::interface::revoke_tool_interface(
         interface_id,

@@ -434,13 +434,13 @@ Note: `context_id` is not in the current signed hash (the request struct does no
 | 2 | `attestation_type` | 2-byte BE u16 (attestation type tag per `attestation_type_tag()`) |
 | 3 | `issuer` | 4-byte BE length + UTF-8 bytes (DID) |
 | 4 | `subject` | 4-byte BE length + UTF-8 bytes (DID) |
-| 5 | `claim` | 4-byte BE length + UTF-8 bytes (compact JSON — see note) |
+| 5 | `claim` | 4-byte BE length + UTF-8 bytes (RFC 8785 canonical JSON — see note) |
 | 6 | `evidence` | 4-byte BE length + raw bytes if present, or `SHA-256(0x00)` sentinel if absent |
 | 7 | `issued_at` | 8-byte BE u64 |
 | 8 | `expires_at` | 8-byte BE u64 if present, or `SHA-256(0x00)` sentinel if absent |
 | 9 | `revocation_status` | 4-byte BE length + MessagePack bytes of `RevocationStatus` enum |
 
-Note: the `claim` field uses compact JSON with no whitespace (equivalent to Python `json.dumps(separators=(',', ':'))`). JSON key ordering within claim objects is NOT guaranteed deterministic across implementations — claims with nested objects should use only flat key-value structures or pre-serialized byte strings. The `evidence` field, when present, is serialized as MessagePack bytes of the `AttestationEvidence` struct. The `revocation_status` field is always present (never absent) — `Active` serializes as a distinct MessagePack value from `Revoked{...}`. Including `revocation_status` in the signed scope prevents an intermediary from flipping Active↔Revoked without invalidating the signature (§7.4.1).
+Note: the `claim` field is serialized as **canonical JSON per RFC 8785 (JCS)** — compact form with no insignificant whitespace and object keys sorted deterministically. The serialization is byte-identical across all conforming implementations, including for nested objects; this is the same formal canonicalization standard cited for `GovernanceProposal` `action_bytes` below. **Numeric constraint (I-JSON, RFC 7493):** numeric values within `claim` MUST be within the IEEE-754 double-precision exactly-representable integer range (|n| ≤ 2^53); larger identifiers (e.g. 64-bit snowflake IDs) MUST be string-encoded. Rationale: RFC 8785 serializes numbers as ES6 doubles, so integer values beyond 2^53 are not injective — distinct values within one rounding class canonicalize to identical bytes, and a signature over one such claim validly covers every other claim in that class. The `evidence` field, when present, is serialized as MessagePack bytes of the `AttestationEvidence` struct. The `revocation_status` field is always present (never absent) — `Active` serializes as a distinct MessagePack value from `Revoked{...}`. Including `revocation_status` in the signed scope prevents an intermediary from flipping Active↔Revoked without invalidating the signature (§7.4.1).
 
 **ParticipationProfile** — domain: `"SCP-PARTICIPATION-PROFILE-V1:"`
 

@@ -36,58 +36,16 @@
 pub mod cache;
 pub mod config;
 pub mod dht;
-pub mod dht_client;
 pub mod republish;
 pub mod resolution;
 pub mod resolver;
 
-/// DID-document, verification-method, and multibase-decode types.
-///
-/// These moved into `scp-protocol::identity::document` (ADR-057 Slice 1a) so
-/// they compile to `wasm32-unknown-unknown` for the in-browser client. This
-/// module re-exports them verbatim, so `scp_identity::document::{...}`
-/// consumers compile unchanged.
-pub mod document {
-    pub use scp_protocol::identity::document::{
-        DidDocument, DidDocumentError, DidRotationEvent, MigrationProof, PreRotationProof, Service,
-        VerificationMethod, decode_multibase_key,
-    };
-}
-
-/// Key-custody and identity-link attestation types.
-///
-/// These moved into `scp-protocol::identity::did_attestation` (ADR-057 Slice
-/// 1a) alongside the DID-document closure. This module re-exports them
-/// verbatim, so `scp_identity::attestation::{...}` consumers compile
-/// unchanged.
-pub mod attestation {
-    pub use scp_protocol::identity::did_attestation::{
-        AttestationPlatform, IdentityLinkPlatform, IdentityLinkServiceEntry, KeyCustodyModel,
-        Platform, PlatformAttestation, ScpKeyCustodyAttestation, ServiceRevocationStatus,
-        UnknownPlatformError,
-    };
-}
-
-pub use attestation::{
-    AttestationPlatform, IdentityLinkPlatform, IdentityLinkServiceEntry, KeyCustodyModel, Platform,
-    PlatformAttestation, ScpKeyCustodyAttestation, ServiceRevocationStatus, UnknownPlatformError,
-};
 pub use cache::{DidCache, DidResolutionResult, Staleness};
 pub use config::{CreatedIdentity, Identity, IdentityConfig, NoPersistence};
 pub use dht::{
     DidDht, InMemorySequenceStore, MigrationOutcome, MigrationPartialState, MigrationResumePhase,
     PostResolveHook, SequenceStore, did_from_ed25519_public_key, extract_public_key,
-    verify_bep44_signature, verify_migration, verify_self_certification,
-};
-// SigningKeyId re-exported from scp-primitives (see pub use above).
-pub use dht_client::{DhtClient, InMemoryDhtClient};
-#[cfg(feature = "production-dht")]
-pub use dht_client::{PkarrDhtClient, PkarrDhtClientBuilder};
-// DID-document types now live in scp-protocol (ADR-057 Slice 1a); re-exported
-// at crate root for `scp_identity::{DidDocument, ...}` consumers.
-pub use document::{
-    DidDocument, DidDocumentError, DidRotationEvent, MigrationProof, PreRotationProof,
-    decode_multibase_key,
+    verify_migration, verify_self_certification,
 };
 pub use republish::RepublishManager;
 pub use resolution::{
@@ -101,10 +59,8 @@ pub use resolver::{
 
 use serde::{Deserialize, Serialize};
 
+use scp_did::DidDocument;
 use scp_platform::traits::{KeyCustody, KeyHandle, PreRotationCustody, PreRotationKeyHandle};
-
-// Re-export DID and SigningKeyId from scp-primitives for backward compatibility.
-pub use scp_primitives::{DID, SigningKeyId};
 
 /// An SCP identity containing the DID string, key handles, and pre-rotation
 /// commitment.
@@ -154,7 +110,7 @@ pub struct ScpIdentity {
     /// field is captured at `create_identity` / `migrate_identity` time
     /// and is a convenience cache only. The authoritative source for
     /// migration verification is the `PreRotationCommitment` service
-    /// entry on the published [`DidDocument`](crate::DidDocument)
+    /// entry on the published [`DidDocument`](scp_did::DidDocument)
     /// (consulted by [`crate::dht::verify_migration`]). If a future SDK
     /// path were to mutate pre-rotation custody outside
     /// `migrate_identity` and the cached value drifted from the
@@ -209,10 +165,6 @@ pub enum IdentityError {
     /// The DID string has an invalid format.
     #[error("invalid DID format: {0}")]
     InvalidDidFormat(String),
-
-    /// z-base-32 decoding failed.
-    #[error("z-base-32 decode error: {0}")]
-    ZBase32DecodeError(String),
 
     /// DID document serialization failed.
     #[error("document serialization error: {0}")]
@@ -329,6 +281,23 @@ pub enum IdentityError {
     },
 }
 
+/// Maps the DHT transport-layer error ([`scp_dht::DhtError`]) into the
+/// identically-named [`IdentityError`] variant, preserving the message.
+///
+/// This is the one-way seam that lets the DID-method layer here depend on the
+/// transport crate (`scp-identity` → `scp-dht`) while surfacing a single error
+/// taxonomy to its own callers. The `?` operator in this crate's DHT
+/// publish/resolve paths relies on it (ADR-057 T1c-a).
+impl From<scp_dht::DhtError> for IdentityError {
+    fn from(err: scp_dht::DhtError) -> Self {
+        match err {
+            scp_dht::DhtError::DhtPublishFailed(msg) => Self::DhtPublishFailed(msg),
+            scp_dht::DhtError::DhtResolveFailed(msg) => Self::DhtResolveFailed(msg),
+            scp_dht::DhtError::Bep44SignatureInvalid(msg) => Self::Bep44SignatureInvalid(msg),
+        }
+    }
+}
+
 impl IdentityError {
     /// Borrows the partial state from a
     /// [`IdentityError::MigrationPublishFailed`] variant. Returns
@@ -382,32 +351,32 @@ impl IdentityError {
     }
 }
 
-/// Maps the wasm-safe [`DidDocumentError`] (raised by the DID-document,
-/// verification-method, attestation, and multibase-decode types that moved
-/// into `scp-protocol` per ADR-057 Slice 1a) onto the corresponding
-/// `IdentityError` variant.
+/// Maps the wasm-safe [`DidError`](scp_did::DidError) (raised by the
+/// DID-document, verification-method, attestation, and multibase-decode types
+/// that live in `scp-did` per ADR-057) onto the corresponding `IdentityError`
+/// variant.
 ///
 /// The mapping is variant-for-variant onto the pre-existing `IdentityError`
-/// variants, so `?`-propagation from a moved method yields the *identical*
+/// variants, so `?`-propagation from a `scp-did` method yields the *identical*
 /// observable error (`IdentityError::InvalidRelayUrl(..)`, etc.) it did before
 /// the move — the split is behavior-preserving for every existing consumer,
 /// not just compile-preserving. `scp-identity`'s own code constructs these
 /// same variants directly for its DHT/config paths, so no new variant is
 /// introduced.
-impl From<DidDocumentError> for IdentityError {
-    fn from(err: DidDocumentError) -> Self {
+impl From<scp_did::DidError> for IdentityError {
+    fn from(err: scp_did::DidError) -> Self {
         match err {
-            DidDocumentError::InvalidDidFormat(msg) => Self::InvalidDidFormat(msg),
-            DidDocumentError::DocumentSerializationError(msg) => {
+            scp_did::DidError::InvalidDidFormat(msg) => Self::InvalidDidFormat(msg),
+            scp_did::DidError::DocumentSerializationError(msg) => {
                 Self::DocumentSerializationError(msg)
             }
-            DidDocumentError::DocumentDeserializationError(msg) => {
+            scp_did::DidError::DocumentDeserializationError(msg) => {
                 Self::DocumentDeserializationError(msg)
             }
-            DidDocumentError::InvalidRelayUrl(msg) => Self::InvalidRelayUrl(msg),
-            DidDocumentError::AgentKeyAlreadyExists => Self::AgentKeyAlreadyExists,
-            DidDocumentError::AgentKeyNotFound => Self::AgentKeyNotFound,
-            DidDocumentError::MultipleAgentKeys { count } => Self::MultipleAgentKeys { count },
+            scp_did::DidError::InvalidRelayUrl(msg) => Self::InvalidRelayUrl(msg),
+            scp_did::DidError::AgentKeyAlreadyExists => Self::AgentKeyAlreadyExists,
+            scp_did::DidError::AgentKeyNotFound => Self::AgentKeyNotFound,
+            scp_did::DidError::MultipleAgentKeys { count } => Self::MultipleAgentKeys { count },
         }
     }
 }

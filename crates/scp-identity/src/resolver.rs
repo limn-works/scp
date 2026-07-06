@@ -34,12 +34,13 @@ use std::time::Duration;
 use tracing::{debug, info, warn};
 
 use crate::IdentityError;
-use crate::cache::{Clock, DidCache, SystemClock};
-use crate::dht::{extract_public_key, verify_bep44_signature, verify_self_certification};
-use crate::dht_client::{DhtClient, DhtRecord};
-use crate::document::{DidDocument, decode_multibase_key};
+use crate::cache::DidCache;
+use crate::dht::{extract_public_key, verify_self_certification};
 use crate::republish::RelayPublisher;
 use crate::resolution::did_routing_id;
+use scp_clock::{Clock, SystemClock};
+use scp_dht::{DhtClient, DhtRecord, verify_bep44_signature};
+use scp_did::{DidDocument, decode_multibase_key};
 
 // ---------------------------------------------------------------------------
 // Core types (§3.10.10)
@@ -171,7 +172,7 @@ pub enum StaleLayer {
 /// failures are logged, not propagated to the caller.
 ///
 /// Production implementations may delegate to [`super::republish::RelayPublisher`]
-/// for relay healing and [`super::dht_client::DhtClient`] for DHT healing.
+/// for relay healing and [`scp_dht::DhtClient`] for DHT healing.
 /// Test implementations record calls for assertion.
 pub trait HealingPublisher: Send + Sync {
     /// Republishes the fresher document to the stale layer.
@@ -201,8 +202,9 @@ pub trait HealingPublisher: Send + Sync {
 }
 
 // Re-exports `did_routing_id` from `resolution` — no duplication.
-// BEP44 verification helpers (`verify_bep44_signature`, `extract_public_key`,
-// `bep44_signable`) are imported from `super::dht`.
+// The BEP44 verification helper `verify_bep44_signature` (and `bep44_signable`)
+// are imported from the transport crate `scp_dht`; `extract_public_key` and
+// `verify_self_certification` remain in `super::dht`.
 
 /// Verifies a raw BEP44 record against a DID string and deserializes the
 /// DID document. Performs:
@@ -368,9 +370,12 @@ impl<D: DhtClient + 'static, R: RelayPublisher + 'static> HealingPublisher
             match stale_layer {
                 StaleLayer::Dht => {
                     debug!(did = %did, seq, "healing: republishing to DHT");
+                    // The DHT transport yields `DhtError`; map it into this
+                    // crate's `IdentityError` so both match arms share a type.
                     dht_client
                         .publish(&public_key, &signature, &document_bytes, seq)
                         .await
+                        .map_err(IdentityError::from)
                 }
                 StaleLayer::Relay { relay_urls: _ } => {
                     // Publish the fresher document to relays via the relay
@@ -506,7 +511,10 @@ impl<
             // return `ValidatedRecord` which bundles the resolved document with
             // the raw BEP44 bytes and signature needed for healing (SCP-245).
             let relay_validated = validate_relay_result(relay_result, &did, &public_key);
-            let dht_validated = validate_dht_result(dht_result, &did, &public_key);
+            // The DHT transport yields `DhtError`; map it into `IdentityError`
+            // so `validate_dht_result` keeps its single error taxonomy.
+            let dht_validated =
+                validate_dht_result(dht_result.map_err(IdentityError::from), &did, &public_key);
 
             // Step 5: Reject results with sequence numbers lower than the
             // last known cached sequence. Prevents rollback attacks where an
@@ -794,7 +802,7 @@ fn validate_dht_result(
 // ---------------------------------------------------------------------------
 
 /// Extracts the Ed25519 verifying key for a specific signing key from a resolved
-/// DID document, keyed by the requested [`SigningKeyId`](scp_primitives::SigningKeyId).
+/// DID document, keyed by the requested [`SigningKeyId`](scp_did::SigningKeyId).
 ///
 /// This is the single, pure, sync document→key extraction shared by every
 /// participant that verifies governance vote signatures against a voter's
@@ -817,9 +825,9 @@ fn validate_dht_result(
 /// call the bridge copy without a crate cycle; hoisting the pure extraction here
 /// breaks that cycle.
 ///
-/// The lookup is keyed by [`SigningKeyId::fragment`](scp_primitives::SigningKeyId::fragment)
+/// The lookup is keyed by [`SigningKeyId::fragment`](scp_did::SigningKeyId::fragment)
 /// (`"active"` / `"agent"`) — the `SigningKeyId` is honored, never ignored:
-/// resolving [`SigningKeyId::Agent`](scp_primitives::SigningKeyId::Agent) returns
+/// resolving [`SigningKeyId::Agent`](scp_did::SigningKeyId::Agent) returns
 /// the document's distinct `#agent` key, not the `#active` key.
 ///
 /// # Purity and downgrade protection
@@ -841,7 +849,7 @@ fn validate_dht_result(
 #[must_use]
 pub fn verifying_key_from_document(
     document: &DidDocument,
-    kid: scp_primitives::SigningKeyId,
+    kid: scp_did::SigningKeyId,
 ) -> Option<ed25519_dalek::VerifyingKey> {
     let vm = document.verification_method_by_fragment(kid.fragment())?;
     let bytes = decode_multibase_key(&vm.public_key_multibase).ok()?;
@@ -869,12 +877,12 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use super::*;
-    use crate::SigningKeyId;
-    use crate::cache::{DidCache, TestClock};
-    use crate::dht::bep44_signable;
-    use crate::dht_client::{DhtRecord, InMemoryDhtClient};
-    use crate::document::DidDocument;
+    use crate::cache::DidCache;
     use crate::resolution::did_routing_id;
+    use scp_clock::TestClock;
+    use scp_dht::bep44_signable;
+    use scp_dht::{DhtError, DhtRecord, InMemoryDhtClient};
+    use scp_did::{DidDocument, SigningKeyId};
 
     // -----------------------------------------------------------------------
     // Test helpers
@@ -982,14 +990,14 @@ mod tests {
             signature: &[u8; 64],
             value: &[u8],
             seq: u64,
-        ) -> impl Future<Output = Result<(), IdentityError>> + Send {
+        ) -> impl Future<Output = Result<(), DhtError>> + Send {
             self.inner.publish(public_key, signature, value, seq)
         }
 
         fn resolve(
             &self,
             public_key: &[u8; 32],
-        ) -> impl Future<Output = Result<Option<DhtRecord>, IdentityError>> + Send {
+        ) -> impl Future<Output = Result<Option<DhtRecord>, DhtError>> + Send {
             let delay = self.delay;
             let key = *public_key;
             async move {
@@ -997,7 +1005,7 @@ mod tests {
 
                 let fail = *self.should_fail.lock().await;
                 if fail {
-                    return Err(IdentityError::DhtResolveFailed(
+                    return Err(DhtError::DhtResolveFailed(
                         "DHT resolve failed (test)".to_owned(),
                     ));
                 }

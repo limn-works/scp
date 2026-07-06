@@ -24,6 +24,19 @@
 //! All FFI bridges (`PyO3`, napi-rs, `UniFFI`) import these constants
 //! instead of defining error code strings locally. This eliminates
 //! cross-bridge divergence and makes error code auditing trivial.
+//!
+//! # Uniqueness rule
+//!
+//! Every code number has exactly ONE meaning, defined by exactly ONE
+//! constant in this file, and the doc-comment on that constant is
+//! normative. Never re-label an existing constant's doc-comment to a new
+//! purpose and never emit an existing code for a different purpose from
+//! any layer (bridge or SDK wrapper) — codes already in this registry are
+//! taken even if no Rust code currently emits them (they may be emitted
+//! from SDK wrappers, e.g. Swift). New purposes get NEW numbers from the
+//! next free run in the band. `scripts/check-error-codes.sh` enforces
+//! that no code literal is defined twice in this file; cross-layer
+//! purpose drift must be caught in review against these doc-comments.
 
 // -------------------------------------------------------------------------
 // Identity (SCP-IDENT- 1000--1999)
@@ -831,6 +844,17 @@ pub const VALID_7070: &str = "SCP-VALID-7070";
 pub const VALID_7071: &str = "SCP-VALID-7071";
 /// Webhook operation validation error.
 pub const VALID_7072: &str = "SCP-VALID-7072";
+/// `check_capability_requirements`: malformed capability-requirements JSON.
+pub const VALID_7073: &str = "SCP-VALID-7073";
+/// `check_capability_requirements`: malformed agent-capabilities JSON.
+pub const VALID_7074: &str = "SCP-VALID-7074";
+/// `check_capability_requirements`: malformed challenge-verifications JSON.
+pub const VALID_7075: &str = "SCP-VALID-7075";
+/// `check_capability_requirements`: admission requirement unmet (missing
+/// capability or challenge verification required).
+pub const VALID_7076: &str = "SCP-VALID-7076";
+/// `check_capability_requirements`: empty subject DID.
+pub const VALID_7077: &str = "SCP-VALID-7077";
 /// Attestation validation error.
 pub const VALID_7080: &str = "SCP-VALID-7080";
 /// Discovery announce validation error.
@@ -839,6 +863,25 @@ pub const VALID_7090: &str = "SCP-VALID-7090";
 pub const VALID_7091: &str = "SCP-VALID-7091";
 /// Discovery result validation error.
 pub const VALID_7092: &str = "SCP-VALID-7092";
+/// Trust aggregation result-parse error (Swift-SDK-emitted: the typed
+/// `aggregateTrustInput` wrapper could not parse the bridge's result JSON).
+pub const VALID_7093: &str = "SCP-VALID-7093";
+/// Trust-admission input encoding error (Swift-SDK-emitted: the shared
+/// trust-admission encoder failed to produce UTF-8 JSON).
+pub const VALID_7094: &str = "SCP-VALID-7094";
+/// `ParticipationProfile` byte-length validation error (Swift-SDK-emitted:
+/// `eventLogRoot`/`signerPublicKey` must be 32 bytes, `signature` 64 bytes).
+pub const VALID_7095: &str = "SCP-VALID-7095";
+/// `ChallengeVerification` byte-length validation error (Swift-SDK-emitted:
+/// `verifierSignature` must be 64 bytes).
+pub const VALID_7096: &str = "SCP-VALID-7096";
+/// Aggregate-trust-input byte-length validation error (Swift-SDK-emitted:
+/// `EventLogEntry.prevHash` and the Merkle root must be 32 bytes,
+/// `EventLogEntry.signature` 64 bytes).
+pub const VALID_7097: &str = "SCP-VALID-7097";
+/// Challenge verify-input byte-length validation error (Swift-SDK-emitted:
+/// `ChallengeRequest`/`ChallengeResponse` `signature` must be 64 bytes).
+pub const VALID_7098: &str = "SCP-VALID-7098";
 /// Handle/petname DID validation error.
 pub const VALID_7110: &str = "SCP-VALID-7110";
 /// Handle/petname alias validation error.
@@ -963,6 +1006,13 @@ pub const ATTEST_9018: &str = "SCP-ATTEST-9018";
 
 /// Economy insufficient balance.
 pub const ECON_12061: &str = "SCP-ECON-12061";
+/// Economy amount-display formatting: unknown currency, no decimals override.
+///
+/// Raised by the SDK `format`/`formatAmount` display helpers when a currency
+/// is not in the SDK's known-currency decimals table and no explicit
+/// `decimals` override was supplied (ADR-060 SDK display surface). SDK-side
+/// only — the protocol does not store per-currency decimals.
+pub const ECON_12070: &str = "SCP-ECON-12070";
 /// Economy governance action spending error.
 pub const ECON_12090: &str = "SCP-ECON-12090";
 /// Economy context operation spending error.

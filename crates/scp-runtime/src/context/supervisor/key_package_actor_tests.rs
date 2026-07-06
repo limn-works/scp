@@ -18,8 +18,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use async_trait::async_trait;
-use scp_identity::DID;
-use scp_primitives::{Clock, SystemClock};
+use scp_clock::{Clock, SystemClock};
+use scp_did::DID;
 use scp_protocol::context::{ContextError, ContextParams};
 
 use super::{
@@ -33,13 +33,13 @@ use crate::crypto::mls::backend::{
     AddMemberRaw, GeneratedKeyPackage, MlsBackend, RemoveMemberRaw, SignerState,
     ValidatedKeyPackage,
 };
-use crate::crypto::mls::credential::ScpCredential;
-use crate::crypto::mls::encrypt::DecryptedContent;
-use crate::crypto::mls::error::MlsError;
-use crate::crypto::mls::group::ScpMlsGroup;
 use crate::crypto::mls::production_backend::ProductionMlsBackend;
 use crate::crypto::mls::storage_adapter::{OpenMlsStorageAdapter, SpawnBlockingStorageAdapter};
 use openmls::prelude::LeafNodeIndex;
+use scp_mls::credential::ScpCredential;
+use scp_mls::encrypt::DecryptedContent;
+use scp_mls::error::MlsError;
+use scp_mls::group::ScpMlsGroup;
 use scp_platform::PlatformError;
 use scp_platform::testing::InMemoryStorage;
 use scp_platform::traits::Storage;
@@ -53,13 +53,17 @@ fn alice() -> DID {
 }
 
 fn real_backend() -> Arc<dyn MlsBackend> {
-    Arc::new(ProductionMlsBackend::new())
+    Arc::new(ProductionMlsBackend::new(std::sync::Arc::new(
+        scp_clock::SystemClock,
+    )))
 }
 
 /// A real backend with the durable consumed-init-key set attached (A2), so the
 /// crypto-layer single-use backstop is active.
 fn backend_with_consumed_set(storage: &Arc<dyn OpenMlsStorageAdapter>) -> Arc<dyn MlsBackend> {
-    let backend = Arc::new(ProductionMlsBackend::new());
+    let backend = Arc::new(ProductionMlsBackend::new(std::sync::Arc::new(
+        scp_clock::SystemClock,
+    )));
     backend.set_consumed_init_key_store(Arc::clone(storage));
     backend
 }
@@ -172,7 +176,7 @@ async fn real_welcome_for(mls: &Arc<dyn MlsBackend>, kp_public_bytes: &[u8]) -> 
     let inviter = ScpCredential::new(
         "did:dht:z6MkInviterForWelcome".to_owned(),
         None,
-        scp_identity::SigningKeyId::Active,
+        scp_did::SigningKeyId::Active,
     )
     .unwrap();
     let mut group = mls.create_group(&inviter, None).await.unwrap();
@@ -360,7 +364,7 @@ async fn second_join_same_init_key_rejected_at_backend() {
     // Generate ONE key package and TWO independent Welcomes addressed to it
     // (two separate inviter groups both add the same KP). The first join
     // consumes the init key durably; the second must be rejected.
-    let joiner = ScpCredential::new(alice().0, None, scp_identity::SigningKeyId::Active).unwrap();
+    let joiner = ScpCredential::new(alice().0, None, scp_did::SigningKeyId::Active).unwrap();
     let generated = mls.generate_key_package(&joiner, None).await.unwrap();
     let welcome_a = real_welcome_for(&mls, &generated.key_package_bytes).await;
     let welcome_b = real_welcome_for(&mls, &generated.key_package_bytes).await;
@@ -399,9 +403,11 @@ async fn second_join_same_init_key_rejected_at_backend() {
 #[tokio::test]
 async fn join_without_consumed_store_fails_closed() {
     // A store-less production backend (no `set_consumed_init_key_store`).
-    let mls: Arc<dyn MlsBackend> = Arc::new(ProductionMlsBackend::new());
+    let mls: Arc<dyn MlsBackend> = Arc::new(ProductionMlsBackend::new(std::sync::Arc::new(
+        scp_clock::SystemClock,
+    )));
 
-    let joiner = ScpCredential::new(alice().0, None, scp_identity::SigningKeyId::Active).unwrap();
+    let joiner = ScpCredential::new(alice().0, None, scp_did::SigningKeyId::Active).unwrap();
     let generated = mls.generate_key_package(&joiner, None).await.unwrap();
     let welcome = real_welcome_for(&mls, &generated.key_package_bytes).await;
 
@@ -427,7 +433,7 @@ async fn join_with_mismatched_public_bytes_rejected() {
     let storage = in_memory_storage();
     let mls = backend_with_consumed_set(&storage);
 
-    let joiner = ScpCredential::new(alice().0, None, scp_identity::SigningKeyId::Active).unwrap();
+    let joiner = ScpCredential::new(alice().0, None, scp_did::SigningKeyId::Active).unwrap();
     let generated = mls.generate_key_package(&joiner, None).await.unwrap();
     // A DIFFERENT KP — its public bytes do not match `generated.signer_state`.
     let other = mls.generate_key_package(&joiner, None).await.unwrap();
@@ -616,12 +622,7 @@ async fn replenish_fails_closed_when_credential_absent() {
     let malformed = DID("did:malformed:no-credential".to_owned());
     // Sanity: this DID truly produces no credential.
     assert!(
-        ScpCredential::new(
-            malformed.0.clone(),
-            None,
-            scp_identity::SigningKeyId::Active
-        )
-        .is_err(),
+        ScpCredential::new(malformed.0.clone(), None, scp_did::SigningKeyId::Active).is_err(),
         "precondition: the malformed DID must not yield a valid credential"
     );
 
@@ -2985,7 +2986,7 @@ struct FailingBackend {
 impl FailingBackend {
     fn new(successes: usize) -> Self {
         Self {
-            inner: ProductionMlsBackend::new(),
+            inner: ProductionMlsBackend::new(std::sync::Arc::new(scp_clock::SystemClock)),
             remaining: AtomicUsize::new(successes),
         }
     }

@@ -36,9 +36,13 @@
 //! - a [`Signer`] — the on-device DID identity (a [`LocalSigner`] for the MVP;
 //!   a WebCrypto-callback custody backend in a later slice — the key never
 //!   enters wasm memory),
-//! - a [`Storage`] — out-of-band snapshot store ([`MemoryStorage`] for the MVP;
-//!   `IndexedDB` in a later slice),
-//! - a [`scp_primitives::Clock`] — the hardened time source for
+//! - a [`Storage`] — per-context snapshot store the driver writes after every
+//!   mutating op and restores from (by key-prefix enumeration) in
+//!   [`ScpClient::new`] when a tab reopens (ADR-057 T2). [`MemoryStorage`] is a
+//!   valid production backend for an ephemeral (no-persistence) client and the
+//!   convenient one in tests; an `IndexedDB`/OPFS backend backs a durable browser
+//!   client,
+//! - a [`scp_clock::Clock`] — the hardened time source for
 //!   committer-assigned event-log leaf timestamps (ADR-057 Prerequisite 1).
 //!
 //! # MISSING SEAM (cross-member sender-key distribution)
@@ -60,11 +64,16 @@ mod context;
 mod crypto_state;
 mod error;
 mod signer;
+mod snapshot;
 mod storage;
 
-pub use client::{AddMemberOutput, ScpClient, SendOutput};
+pub use client::{AddMemberOutput, ContextStatus, ScpClient};
 pub use context::PerContextState;
 pub use crypto_state::{ContextCryptoState, INITIAL_SENDER_KEY_EPOCH, Inbound};
 pub use error::ClientError;
 pub use signer::{LocalSigner, Signer};
+// `ContextSnapshot` / `SNAPSHOT_FORMAT_VERSION` are intentionally NOT re-exported:
+// the snapshot blob format is a crate-internal persistence detail (captured/
+// restored only inside this driver), so it stays `crate`-visible in the private
+// `snapshot` module rather than surfacing on the public API.
 pub use storage::{MemoryStorage, Storage};

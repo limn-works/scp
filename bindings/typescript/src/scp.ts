@@ -41,17 +41,44 @@ import { ContextError, mapBridgeError, mapSagaError, ValidationError } from "./e
 import type { Identity } from "./identity";
 import { toCapabilityValidation } from "./internal/bridge";
 import { loadNativeAddon, type NativeAddon as RawNativeAddon } from "./internal/native";
+import { decodeProvenanceRecord, type ProvenanceRecord } from "./provenance";
 import type { Node, Relay } from "./server";
 import type {
+  AttestationType,
+  AttestorInfo,
   BehavioralRecord,
   CachedAttestation,
+  CachedAttestationEnvelope,
+  CapabilityRequirement,
   CapabilityValidation,
+  ChallengeRequest,
+  ChallengeResponse,
+  ChallengeVerification,
+  ConsequenceRule,
+  EventLogEntry,
   InviteMemberOutcome,
+  ParticipationProfile,
+  RequireParticipation,
   SagaResult,
   SealedInvitation,
+  ThresholdRequirement,
   TrustEvaluation,
 } from "./types";
-import { encodeCachedAttestations } from "./types";
+import {
+  encodeAttestation,
+  encodeAttestorSets,
+  encodeCachedAttestations,
+  encodeCapabilityRequirements,
+  encodeChallengeRequest,
+  encodeChallengeResponse,
+  encodeChallengeVerifications,
+  encodeConsequenceRules,
+  encodeEventLogEntries,
+  encodeMerkleRoot,
+  encodeParticipationProfile,
+  encodeRequireParticipation,
+  encodeThresholdRequirements,
+} from "./types";
 
 /**
  * Stable error code (spec §7.3.2) the core surfaces when a context has no
@@ -2261,7 +2288,7 @@ export class SCP {
    * Runs the same 11-step ADR-016 validation pipeline but, instead of
    * throwing at the first failing stage, resolves to a
    * {@link CapabilityValidation} of six per-stage booleans (spec §7.2.4,
-   * ADR-057). The probe never records the token's nonce, so calling it does
+   * ADR-059). The probe never records the token's nonce, so calling it does
    * not consume the token. Capability/signature/expiry outcomes are reported
    * via the booleans; only malformed FFI inputs (bad handle / token /
    * capability) reject.
@@ -2305,7 +2332,7 @@ export class SCP {
   ): Promise<CapabilityValidation> {
     // Route the native dispatch through the single error chokepoint
     // (`mapBridgeError`) so a raw NAPI throw or rejection surfaces as a
-    // typed `ScpError` keyed on its `[SCP-CAT-NNNN]` code, per ADR-057
+    // typed `ScpError` keyed on its `[SCP-CAT-NNNN]` code, per ADR-059
     // Decision 4 (error typing routes through one mapping site, not per-call
     // prose inspection). `mapBridgeError` is idempotent on already-typed errors.
     let raw: CapabilityValidation;
@@ -2452,12 +2479,16 @@ export class SCP {
   // Domain: Economy
   // ───────────────────────────────────────────────────────────────────────
 
-  economyEstimateCost(policyJson: string, actionType: string, metricsJson: string): number {
-    return (this.#native.economyEstimateCost as (p: string, a: string, m: string) => number)(
+  economyEstimateCost(policyJson: string, actionType: string, metricsJson: string): bigint | null {
+    // The napi bridge returns a `bigint` cost, signalling "no result / overflow"
+    // with the sentinel `-1n`. Map that to `null` at the wrapper boundary so the
+    // TS surface matches Python's `int | None` (ADR-060).
+    const cost = (this.#native.economyEstimateCost as (p: string, a: string, m: string) => bigint)(
       policyJson,
       actionType,
       metricsJson,
     );
+    return cost === -1n ? null : cost;
   }
 
   economyPolicyRequiresPayment(policyJson: string): boolean {
@@ -2479,30 +2510,34 @@ export class SCP {
     );
   }
 
-  economyEvaluateFormula(formulaJson: string, metricsJson: string): number {
-    return (this.#native.economyEvaluateFormula as (f: string, m: string) => number)(
+  economyEvaluateFormula(formulaJson: string, metricsJson: string): bigint | null {
+    // As with `economyEstimateCost`, the napi bridge signals "no result /
+    // overflow" with the sentinel `-1n`; normalize it to `null` so the TS
+    // surface matches Python's `int | None` (ADR-060).
+    const cost = (this.#native.economyEvaluateFormula as (f: string, m: string) => bigint)(
       formulaJson,
       metricsJson,
     );
+    return cost === -1n ? null : cost;
   }
 
-  economyBudgetRemaining(contextId: string, did: string): number {
-    return (this.#native.economyBudgetRemaining as (c: string, d: string) => number)(
+  economyBudgetRemaining(contextId: string, did: string): bigint {
+    return (this.#native.economyBudgetRemaining as (c: string, d: string) => bigint)(
       contextId,
       did,
     );
   }
 
-  economyBudgetGrant(contextId: string, did: string, amount: number): void {
-    (this.#native.economyBudgetGrant as (c: string, d: string, a: number) => void)(
+  economyBudgetGrant(contextId: string, did: string, amount: bigint): void {
+    (this.#native.economyBudgetGrant as (c: string, d: string, a: bigint) => void)(
       contextId,
       did,
       amount,
     );
   }
 
-  economyBudgetRecordSpend(contextId: string, did: string, amount: number): void {
-    (this.#native.economyBudgetRecordSpend as (c: string, d: string, a: number) => void)(
+  economyBudgetRecordSpend(contextId: string, did: string, amount: bigint): void {
+    (this.#native.economyBudgetRecordSpend as (c: string, d: string, a: bigint) => void)(
       contextId,
       did,
       amount,
@@ -2529,21 +2564,21 @@ export class SCP {
     contextId: string,
     senderDid: string,
     now: number,
-    baseCost: number,
+    baseCost: bigint,
     thresholdsJson: string,
-    floor?: number | null,
-    cap?: number | null,
-  ): number {
+    floor?: bigint | null,
+    cap?: bigint | null,
+  ): bigint {
     return (
       this.#native.economyAntispamEscalatedCost as (
         c: string,
         s: string,
         n: number,
-        b: number,
+        b: bigint,
         t: string,
-        f: number | null,
-        cp: number | null,
-      ) => number
+        f: bigint | null,
+        cp: bigint | null,
+      ) => bigint
     )(contextId, senderDid, now, baseCost, thresholdsJson, floor ?? null, cap ?? null);
   }
 
@@ -2572,18 +2607,37 @@ export class SCP {
     return (this.#native.trustQueryScore as (d: string, c: string) => unknown)(did, contextId);
   }
 
-  trustVerifyAttestation(attestationJson: string): unknown {
-    return (this.#native.trustVerifyAttestation as (j: string) => unknown)(attestationJson);
+  /**
+   * Verify an attestation's Ed25519 signature, evidence, expiry, and
+   * revocation status (ADR-017, §7.4).
+   *
+   * Takes the typed attestation envelope ({@link CachedAttestationEnvelope})
+   * and serializes it to the serde wire shape internally (ADR-058) before
+   * crossing FFI.
+   */
+  trustVerifyAttestation(attestation: CachedAttestationEnvelope): unknown {
+    return (this.#native.trustVerifyAttestation as (j: string) => unknown)(
+      encodeAttestation(attestation),
+    );
   }
 
   trustCreateChallenge(targetDid: string): unknown {
     return (this.#native.trustCreateChallenge as (d: string) => unknown)(targetDid);
   }
 
-  trustVerifyResponse(challengeJson: string, responseJson: string): boolean {
+  /**
+   * Verify a challenge response against its original challenge request
+   * (ADR-017, §7.3.4).
+   *
+   * Takes the typed {@link ChallengeRequest} / {@link ChallengeResponse} and
+   * serializes them to the serde wire shapes internally (ADR-058) before
+   * crossing FFI. Returns `true` if the response is valid (correct
+   * responder, within timeout, valid signature), `false` otherwise.
+   */
+  trustVerifyResponse(challenge: ChallengeRequest, response: ChallengeResponse): boolean {
     return (this.#native.trustVerifyResponse as (c: string, r: string) => boolean)(
-      challengeJson,
-      responseJson,
+      encodeChallengeRequest(challenge),
+      encodeChallengeResponse(response),
     );
   }
 
@@ -2600,23 +2654,81 @@ export class SCP {
    * `minContexts`). Callers MUST establish signer legitimacy separately
    * (a trusted-signer set, a context-membership proof, or the §7.3.5
    * threshold/independence path) and MUST NOT treat success as authorization.
+   *
+   * @param expectedSubject DID of the agent being admitted. Profiles for any
+   *   other subject are ignored (fail-closed).
+   * @param requirements Typed {@link RequireParticipation} values. Serialized
+   *   internally to the serde wire shape (ADR-058).
+   * @param profiles Typed {@link ParticipationProfile} values. Serialized
+   *   internally to the serde wire shape (ADR-058).
    */
   verifyParticipationRequirements(
     expectedSubject: string,
-    requirementsJson: string,
-    profileJson: string,
+    requirements: readonly RequireParticipation[],
+    profiles: readonly ParticipationProfile[],
   ): void {
     (this.#native.verifyParticipationRequirements as (s: string, r: string, p: string) => void)(
       expectedSubject,
-      requirementsJson,
-      profileJson,
+      encodeRequireParticipation(requirements),
+      encodeParticipationProfile(profiles),
+    );
+  }
+
+  /**
+   * Verify that an agent meets a context's capability requirements for
+   * admission (spec §7.3.4.4).
+   *
+   * `subjectDid`/`contextId` bind challenge verifications to the agent and
+   * context being admitted: a `ChallengeVerification` only satisfies a
+   * requirement when its signed `subject_did`/`context_id` equal these values,
+   * closing cross-subject and cross-context attribution.
+   *
+   * Returns normally when all requirements are satisfied; throws on any unmet
+   * requirement or malformed JSON.
+   *
+   * Security caveat — authenticity is not authorization: a passing
+   * `ChallengeVerified` check proves the verifier's signature is authentic and
+   * bound to this subject/context, not that the verifier is *trusted*. Because
+   * `verifierDid` is self-certifying, a subject can present a genuinely-signed
+   * result from a verifier it controls. Establish verifier legitimacy
+   * separately and do NOT treat success as authorization.
+   *
+   * @param contextId The context the agent is being admitted to.
+   * @param subjectDid DID of the agent being admitted.
+   * @param requirements Typed {@link CapabilityRequirement} values. Serialized
+   *   internally to the serde wire shape (ADR-058).
+   * @param agentCapabilities The agent's self-attested capability URIs.
+   * @param challengeVerifications Typed {@link ChallengeVerification} records.
+   *   Serialized internally to the serde wire shape (ADR-058).
+   */
+  checkCapabilityRequirements(
+    contextId: string,
+    subjectDid: string,
+    requirements: readonly CapabilityRequirement[],
+    agentCapabilities: readonly string[],
+    challengeVerifications: readonly ChallengeVerification[],
+  ): void {
+    (
+      this.#native.checkCapabilityRequirements as (
+        c: string,
+        s: string,
+        r: string,
+        a: string,
+        v: string,
+      ) => void
+    )(
+      contextId,
+      subjectDid,
+      encodeCapabilityRequirements(requirements),
+      JSON.stringify(agentCapabilities),
+      encodeChallengeVerifications(challengeVerifications),
     );
   }
 
   /**
    * Evaluate the trustworthiness of a participant within a context.
    *
-   * Composes the structured trust model (spec §7.2.4, ADR-057). The protocol
+   * Composes the structured trust model (spec §7.2.4, ADR-059). The protocol
    * provides the data, not the verdict — the caller decides what to do with it:
    *
    * - **Layer 1 — protocol enforcement.** Each supplied capability token is run
@@ -2692,7 +2804,7 @@ export class SCP {
         // revocation, time bounds — not whether it grants one specific
         // capability. Passing a concrete URI (or the old `"*"` sentinel, which
         // the real bridge rejects) would wrongly impose an invoked-capability
-        // grant-match the caller never asked for. See ADR-057 / spec §7.2.4:
+        // grant-match the caller never asked for. See ADR-059 / spec §7.2.4:
         // the diagnostic's challenge capability is optional, and omitting it
         // means intrinsic-validity.
         const perToken = await this.ucanEvaluate(handle, token, subjectDid);
@@ -2749,7 +2861,7 @@ export class SCP {
     } catch (error) {
       // Branch on the STRUCTURED code (`SCP-CTX-2076`), never error prose: the
       // typed `ContextError` carries the stable code the core assigned to
-      // `NoParticipationFacts` (ADR-057 — structured, not prose, classification).
+      // `NoParticipationFacts` (ADR-059 — structured, not prose, classification).
       // Anything else (NotInitialized, a provider failure, malformed input) is a
       // genuine error and propagates unchanged.
       if (error instanceof ContextError && error.code === NO_PARTICIPATION_FACTS_CODE) {
@@ -2861,16 +2973,38 @@ export class SCP {
     };
   }
 
+  /**
+   * Aggregate all trust engine layers into a single `TrustInput` (§7.3).
+   *
+   * Every structured input is typed; the SDK serializes to the serde wire
+   * shapes internally before crossing FFI (ADR-058). An empty collection is
+   * a real value ("no rules apply"), never a request for defaults — the
+   * bridge receives `[]` / `{}` exactly as passed.
+   *
+   * @param contextId The context to aggregate trust inputs for.
+   * @param subjectDid The DID of the subject to evaluate.
+   * @param events Full signed event-log entries ({@link EventLogEntry}).
+   * @param merkleRoot 32-byte Merkle root as a number array.
+   * @param consequenceRules Typed {@link ConsequenceRule} values.
+   * @param thresholdRequirements Typed {@link ThresholdRequirement} values
+   *   keyed by {@link AttestationType}.
+   * @param attestorSets Typed {@link AttestorInfo} lists keyed by
+   *   {@link AttestationType}.
+   * @param cachedAttestations Typed {@link CachedAttestation} values to seed
+   *   the bridge's trust store.
+   * @param challengeResults Typed {@link ChallengeVerification} records.
+   * @returns The aggregated `TrustInput` as a JSON string.
+   */
   aggregateTrustInput(
     contextId: string,
     subjectDid: string,
-    eventsJson: string,
-    merkleRootJson: string,
-    consequenceRulesJson: string,
-    thresholdRequirementsJson: string,
-    attestorSetsJson: string,
-    cachedAttestationsJson: string,
-    challengeResultsJson: string,
+    events: readonly EventLogEntry[],
+    merkleRoot: readonly number[],
+    consequenceRules: readonly ConsequenceRule[] = [],
+    thresholdRequirements: Readonly<Partial<Record<AttestationType, ThresholdRequirement>>> = {},
+    attestorSets: Readonly<Partial<Record<AttestationType, readonly AttestorInfo[]>>> = {},
+    cachedAttestations: readonly CachedAttestation[] = [],
+    challengeResults: readonly ChallengeVerification[] = [],
   ): string {
     return (
       this.#native.aggregateTrustInput as (
@@ -2887,13 +3021,13 @@ export class SCP {
     )(
       contextId,
       subjectDid,
-      eventsJson,
-      merkleRootJson,
-      consequenceRulesJson,
-      thresholdRequirementsJson,
-      attestorSetsJson,
-      cachedAttestationsJson,
-      challengeResultsJson,
+      encodeEventLogEntries(events),
+      encodeMerkleRoot(merkleRoot),
+      encodeConsequenceRules(consequenceRules),
+      encodeThresholdRequirements(thresholdRequirements),
+      encodeAttestorSets(attestorSets),
+      encodeCachedAttestations(cachedAttestations),
+      encodeChallengeVerifications(challengeResults),
     );
   }
 
@@ -3258,8 +3392,8 @@ export class SCP {
     discoveryMethod?: string,
     purpose?: string,
     counterpartyPolicy?: string,
-  ): string {
-    return (
+  ): ProvenanceRecord {
+    const raw = (
       this.#native.provenanceAttach as (
         sc: string,
         st: string,
@@ -3284,6 +3418,9 @@ export class SCP {
       purpose,
       counterpartyPolicy,
     );
+    // The native bridge returns the raw snake_case JSON wire string; decode it
+    // into the SDK's typed camelCase surface (ADR-060 `paymentAmount` bigint).
+    return decodeProvenanceRecord(raw);
   }
 
   provenanceCheckChainDepth(chainDepth: number, maxDepth?: number): boolean {

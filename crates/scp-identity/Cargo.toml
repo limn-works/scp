@@ -11,12 +11,9 @@ keywords = ["did", "identity", "decentralized", "dht"]
 categories = ["authentication", "cryptography"]
 
 [dependencies]
-scp-primitives = { path = "../scp-primitives", version = "=0.1.0-beta.2" }
-# DID-document, attestation, and multibase-decode types moved here (ADR-057
-# Slice 1a) so they compile to wasm32 for the in-browser client; scp-identity
-# re-exports them. scp-protocol is pure-sync and acyclic (it does not depend
-# on scp-identity).
-scp-protocol = { path = "../scp-protocol", version = "=0.1.0-beta.2" }
+scp-clock = { path = "../scp-clock", version = "=0.1.0-beta.2" }
+scp-did = { path = "../scp-did", version = "=0.1.0-beta.2" }
+scp-dht = { path = "../scp-dht", version = "=0.1.0-beta.2" }
 # `testing` is enabled non-optionally because the standalone identity
 # construction front-end (`config.rs`, ADR-052 Phase B-P3e) mints an
 # `InMemoryPreRotationCustody` on its production `Identity::create` path —
@@ -38,12 +35,10 @@ hex = { workspace = true }
 tracing = { workspace = true }
 zeroize = { workspace = true }
 rand = { workspace = true }
-mainline = { version = "6", optional = true }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"], optional = true }
 
 [features]
 default = []
-production-dht = ["dep:mainline", "dep:reqwest"]
+production-dht = ["scp-dht/production-dht"]
 testing = ["scp-platform/testing"]
 
 [dev-dependencies]

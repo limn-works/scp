@@ -39,7 +39,7 @@ use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
-use scp_primitives::Clock;
+use scp_clock::Clock;
 
 use super::ContextError;
 use crate::crypto::ucan::nonce::generate_nonce;
@@ -2864,7 +2864,7 @@ mod tests {
             "did:dht:creator",
             ceiling,
             vec![],
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
 
@@ -2902,7 +2902,7 @@ mod tests {
             "did:dht:creator",
             ceiling,
             vec![custom],
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
         assert!(state.role_definitions.contains_key("content-mod"));
@@ -2923,7 +2923,7 @@ mod tests {
             "did:dht:creator",
             ceiling,
             vec![bad_custom],
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         );
         assert!(result.is_err());
     }
@@ -2936,7 +2936,7 @@ mod tests {
             "did:dht:creator",
             ceiling.clone(),
             vec![],
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
 
@@ -2956,7 +2956,7 @@ mod tests {
             "did:dht:creator",
             ceiling,
             vec![],
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
 
@@ -2975,7 +2975,7 @@ mod tests {
             "did:dht:creator",
             ceiling,
             vec![],
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
 
@@ -2987,7 +2987,7 @@ mod tests {
             "did:dht:alice",
             "member",
             "did:dht:creator",
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         );
         assert!(result.is_ok());
 
@@ -3018,7 +3018,7 @@ mod tests {
             "did:dht:creator",
             ceiling,
             vec![],
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
 
@@ -3041,7 +3041,7 @@ mod tests {
             "did:dht:alice",
             "smuggled",
             "did:dht:creator",
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         );
         assert!(
             matches!(
@@ -3069,7 +3069,7 @@ mod tests {
             "did:dht:creator",
             ceiling,
             vec![],
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
 
@@ -3089,7 +3089,7 @@ mod tests {
             &mut state,
             "did:dht:alice",
             "smuggled",
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         );
         assert!(
             matches!(
@@ -3113,7 +3113,7 @@ mod tests {
             "did:dht:creator",
             ceiling,
             vec![],
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
 
@@ -3127,7 +3127,7 @@ mod tests {
             "did:dht:alice",
             "member",
             "did:dht:creator",
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
 
@@ -3137,7 +3137,7 @@ mod tests {
             "did:dht:bob",
             "member",
             "did:dht:alice",
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         );
         assert!(result.is_err());
         assert!(matches!(
@@ -3154,7 +3154,7 @@ mod tests {
             "did:dht:creator",
             ceiling,
             vec![],
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
 
@@ -3163,7 +3163,7 @@ mod tests {
             "did:dht:nobody",
             "member",
             "did:dht:creator",
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         );
         assert!(result.is_err());
         assert!(matches!(
@@ -3180,7 +3180,7 @@ mod tests {
             "did:dht:creator",
             ceiling,
             vec![],
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
 
@@ -3191,7 +3191,7 @@ mod tests {
             "did:dht:alice",
             "nonexistent",
             "did:dht:creator",
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         );
         assert!(result.is_err());
         assert!(matches!(
@@ -3208,7 +3208,7 @@ mod tests {
             "did:dht:creator",
             ceiling,
             vec![],
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
 
@@ -3220,7 +3220,7 @@ mod tests {
             "did:dht:alice",
             "member",
             "did:dht:creator",
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
         assert!(state.member_has_capability("did:dht:alice", &Capability::MessagesWrite));
@@ -3231,7 +3231,7 @@ mod tests {
             "did:dht:alice",
             "observer",
             "did:dht:creator",
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
         assert!(state.member_has_capability("did:dht:alice", &Capability::MessagesRead));
@@ -3252,7 +3252,7 @@ mod tests {
             "did:dht:creator",
             ceiling,
             vec![],
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
 
@@ -3264,7 +3264,7 @@ mod tests {
             "did:dht:alice",
             "member",
             "did:dht:creator",
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
 
@@ -3284,7 +3284,7 @@ mod tests {
             "did:dht:alice",
             "observer",
             "did:dht:creator",
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
 
@@ -3308,7 +3308,7 @@ mod tests {
             "did:dht:creator",
             ceiling,
             vec![],
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
 
@@ -3320,7 +3320,7 @@ mod tests {
             "did:dht:alice",
             "member",
             "did:dht:creator",
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
 
@@ -3333,7 +3333,7 @@ mod tests {
             "did:dht:alice",
             "admin",
             "did:dht:creator",
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
 
@@ -3362,7 +3362,7 @@ mod tests {
             "did:dht:creator",
             ceiling,
             vec![],
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
 
@@ -3372,7 +3372,7 @@ mod tests {
             "did:dht:alice",
             "member",
             "did:dht:creator",
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
 
@@ -3389,7 +3389,7 @@ mod tests {
             "did:dht:alice",
             "observer",
             "did:dht:creator",
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
 
@@ -3411,7 +3411,7 @@ mod tests {
             "did:dht:creator",
             ceiling,
             vec![],
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
 
@@ -3422,7 +3422,7 @@ mod tests {
             "did:dht:alice",
             "observer",
             "did:dht:creator",
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
 
@@ -3446,7 +3446,7 @@ mod tests {
             "did:dht:creator",
             ceiling.clone(),
             vec![],
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
 
@@ -3457,7 +3457,7 @@ mod tests {
             "did:dht:alice",
             "admin",
             "did:dht:creator",
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
 
@@ -3491,7 +3491,7 @@ mod tests {
             "did:dht:creator",
             ceiling,
             vec![custom],
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
 
@@ -3502,7 +3502,7 @@ mod tests {
             "did:dht:alice",
             "content-mod",
             "did:dht:creator",
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
         assert_eq!(tokens.len(), 3);
@@ -3523,7 +3523,7 @@ mod tests {
             "did:dht:creator",
             ceiling,
             vec![],
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
         state.members.insert("did:dht:alice".to_owned());
@@ -3533,7 +3533,7 @@ mod tests {
             "did:dht:alice",
             "admin",
             "did:dht:creator",
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
 
@@ -3564,7 +3564,7 @@ mod tests {
             "did:dht:creator",
             ceiling,
             vec![],
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
         state.members.insert("did:dht:alice".to_owned());
@@ -3573,7 +3573,7 @@ mod tests {
             "did:dht:alice",
             "member",
             "did:dht:creator",
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
 
@@ -3609,7 +3609,7 @@ mod tests {
             "did:dht:creator",
             ceiling,
             vec![],
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
         state.members.insert("did:dht:alice".to_owned());
@@ -3619,7 +3619,7 @@ mod tests {
             "did:dht:alice",
             "admin",
             "did:dht:creator",
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
         let custom = Capability::Custom("payments:approve".to_owned());
@@ -3654,7 +3654,7 @@ mod tests {
             "did:dht:creator",
             ceiling,
             vec![],
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
         state.members.insert("did:dht:alice".to_owned());
@@ -3663,7 +3663,7 @@ mod tests {
             "did:dht:alice",
             "member",
             "did:dht:creator",
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
         state.suspend_capabilities("did:dht:alice", [Capability::MessagesWrite]);
@@ -3751,7 +3751,7 @@ mod tests {
     #[test]
     fn generated_nonces_are_unique() {
         let nonces: Vec<String> = (0..100)
-            .map(|_| generate_nonce(&scp_primitives::SystemClock))
+            .map(|_| generate_nonce(&scp_clock::SystemClock))
             .collect();
         let unique: HashSet<&String> = nonces.iter().collect();
         assert_eq!(
@@ -3763,7 +3763,7 @@ mod tests {
 
     #[test]
     fn nonce_format_is_valid() {
-        let nonce = generate_nonce(&scp_primitives::SystemClock);
+        let nonce = generate_nonce(&scp_clock::SystemClock);
         let parts: Vec<&str> = nonce.splitn(2, '-').collect();
         assert_eq!(parts.len(), 2, "nonce should have timestamp-hex format");
         // Timestamp part should be a valid number.
@@ -4557,7 +4557,7 @@ mod tests {
     #[test]
     fn context_role_state_new_rejects_malformed_ceiling_entry() {
         // End-to-end: context creation fails (does not store) a malformed entry.
-        let clock = scp_primitives::SystemClock;
+        let clock = scp_clock::SystemClock;
         let ceiling = CapabilityCeiling::new([
             Capability::MessagesRead,
             Capability::Custom("payments".to_owned()),
@@ -4573,7 +4573,7 @@ mod tests {
 
     #[test]
     fn context_role_state_new_accepts_wellformed_custom_ceiling() {
-        let clock = scp_primitives::SystemClock;
+        let clock = scp_clock::SystemClock;
         let ceiling = CapabilityCeiling::new([
             Capability::MessagesRead,
             Capability::Custom("payments:approve".to_owned()),
@@ -4588,7 +4588,7 @@ mod tests {
         // Construction invariant: `set_ceiling` validates the WHOLE replacement
         // against the ceiling-entry grammar before storing, so a malformed
         // `CapabilityCeiling` can never be stored via the mutation path either.
-        let clock = scp_primitives::SystemClock;
+        let clock = scp_clock::SystemClock;
         let initial = CapabilityCeiling::new([
             Capability::MessagesRead,
             Capability::Custom("payments:approve".to_owned()),
@@ -4614,7 +4614,7 @@ mod tests {
 
     #[test]
     fn set_ceiling_accepts_wellformed_replacement() {
-        let clock = scp_primitives::SystemClock;
+        let clock = scp_clock::SystemClock;
         let initial = CapabilityCeiling::new([Capability::MessagesRead]);
         let mut state =
             ContextRoleState::new("ctx-1", "did:scp:creator", initial, vec![], &clock).unwrap();
@@ -4757,7 +4757,7 @@ mod tests {
     /// embeds a `ContextRoleState`). No per-field re-validation is needed.
     #[test]
     fn context_role_state_deserialize_rejects_malformed_ceiling() {
-        let clock = scp_primitives::SystemClock;
+        let clock = scp_clock::SystemClock;
         let mut state = ContextRoleState::new(
             "ctx-1",
             "did:scp:creator",
@@ -4804,7 +4804,7 @@ mod tests {
             "did:dht:creator",
             ceiling,
             vec![],
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
 
@@ -4816,7 +4816,7 @@ mod tests {
             "did:dht:alice",
             "member",
             "did:dht:creator",
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
         assign_role(
@@ -4824,7 +4824,7 @@ mod tests {
             "did:dht:bob",
             "observer",
             "did:dht:creator",
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
 
@@ -4859,7 +4859,7 @@ mod tests {
             "did:dht:creator",
             ceiling,
             vec![custom],
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
 
@@ -4870,7 +4870,7 @@ mod tests {
             "did:dht:alice",
             "content-mod",
             "did:dht:creator",
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
 
@@ -4977,7 +4977,7 @@ mod tests {
             "did:dht:creator",
             ceiling,
             vec![custom],
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap_err();
         assert!(
@@ -5184,7 +5184,7 @@ mod tests {
             "did:dht:creator",
             ceiling,
             vec![],
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
 
@@ -5196,7 +5196,7 @@ mod tests {
             "did:dht:alice",
             "member",
             "did:dht:creator",
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .expect("creator can assign member role");
 
@@ -5261,7 +5261,7 @@ mod tests {
             "did:dht:creator",
             ceiling,
             vec![],
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
 
@@ -5311,13 +5311,13 @@ mod tests {
             "did:dht:creator",
             ceiling,
             vec![],
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
 
         state.members.insert("did:dht:alice".to_owned());
         state
-            .system_assign_role("did:dht:alice", "member", &scp_primitives::SystemClock)
+            .system_assign_role("did:dht:alice", "member", &scp_clock::SystemClock)
             .unwrap();
         // Suspend a capability the role grants, so a dangling suspension is
         // possible if removal does not clear it.
@@ -5354,7 +5354,7 @@ mod tests {
             "did:dht:creator",
             ceiling,
             vec![],
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
 
@@ -5378,14 +5378,14 @@ mod tests {
             "did:dht:creator",
             ceiling,
             vec![],
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
 
         // First tenure: join, get the member role, then suspend a granted cap.
         state.members.insert("did:dht:alice".to_owned());
         state
-            .system_assign_role("did:dht:alice", "member", &scp_primitives::SystemClock)
+            .system_assign_role("did:dht:alice", "member", &scp_clock::SystemClock)
             .unwrap();
         state.suspend_capabilities("did:dht:alice", [Capability::MessagesWrite]);
         assert!(
@@ -5399,7 +5399,7 @@ mod tests {
         // Re-admit the SAME DID with the SAME role.
         state.members.insert("did:dht:alice".to_owned());
         state
-            .system_assign_role("did:dht:alice", "member", &scp_primitives::SystemClock)
+            .system_assign_role("did:dht:alice", "member", &scp_clock::SystemClock)
             .unwrap();
 
         // The re-admitted member holds the capability their new role grants —

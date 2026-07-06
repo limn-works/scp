@@ -275,7 +275,10 @@ mod tests {
 
     #[test]
     fn destroy_ephemeral_keys_happy_path() {
-        let crypto = MlsCryptoProvider::new(TEST_DID.to_owned());
+        let crypto = MlsCryptoProvider::new(
+            TEST_DID.to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
+        );
         let orchestrator = KeyDestructionOrchestrator::new(&crypto);
 
         // No groups registered — destroy is idempotent on MlsCryptoProvider.
@@ -297,7 +300,10 @@ mod tests {
 
     #[test]
     fn initiate_close_full_scope_preserves_data() {
-        let crypto = MlsCryptoProvider::new(TEST_DID.to_owned());
+        let crypto = MlsCryptoProvider::new(
+            TEST_DID.to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
+        );
         let orchestrator = CloseOrchestrator::new(&crypto);
 
         let action = orchestrator
@@ -319,7 +325,10 @@ mod tests {
 
     #[test]
     fn initiate_close_ephemeral_scope_destroys_keys() {
-        let crypto = MlsCryptoProvider::new(TEST_DID.to_owned());
+        let crypto = MlsCryptoProvider::new(
+            TEST_DID.to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
+        );
         let orchestrator = CloseOrchestrator::new(&crypto);
 
         let action = orchestrator
@@ -347,7 +356,10 @@ mod tests {
 
     #[test]
     fn initiate_close_summary_scope_opens_window() {
-        let crypto = MlsCryptoProvider::new(TEST_DID.to_owned());
+        let crypto = MlsCryptoProvider::new(
+            TEST_DID.to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
+        );
         let orchestrator = CloseOrchestrator::new(&crypto);
 
         let action = orchestrator
@@ -423,7 +435,10 @@ mod tests {
 
         // Seed an MLS group AND a sender key under the DIGEST — the slot the
         // live context (and the chokepoint) key on.
-        let crypto = MlsCryptoProvider::new(TEST_DID.to_owned());
+        let crypto = MlsCryptoProvider::new(
+            TEST_DID.to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
+        );
         crypto
             .create_mls_group(&digest)
             .expect("create_mls_group under the digest");

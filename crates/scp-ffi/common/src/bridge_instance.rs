@@ -355,7 +355,7 @@ pub struct CoreFields {
     /// rather than process-global. The `InMemoryDhtClient` stores only signed,
     /// public DID documents — it is a test/demo affordance for the in-memory
     /// custody path; production uses real `did:dht`/`did:web` resolution.
-    dht_client: OnceLock<Arc<scp_identity::InMemoryDhtClient>>,
+    dht_client: OnceLock<Arc<scp_dht::InMemoryDhtClient>>,
 
     /// The DID-resolution cache shared with the production DID resolver.
     ///
@@ -2150,7 +2150,7 @@ impl CoreFields {
     /// minted DID documents into the same `InMemoryDhtClient` the resolver
     /// reads from, so the DID is resolvable for signature verification.
     #[must_use]
-    pub fn dht_client(&self) -> Option<&Arc<scp_identity::InMemoryDhtClient>> {
+    pub fn dht_client(&self) -> Option<&Arc<scp_dht::InMemoryDhtClient>> {
         self.dht_client.get()
     }
 
@@ -2160,7 +2160,7 @@ impl CoreFields {
     /// with the SAME `InMemoryDhtClient` `Arc` the resolver was built over.
     /// Subsequent calls are no-ops (`OnceLock` guarantees single
     /// initialization).
-    pub fn set_dht_client(&self, client: Arc<scp_identity::InMemoryDhtClient>) {
+    pub fn set_dht_client(&self, client: Arc<scp_dht::InMemoryDhtClient>) {
         if self.dht_client.set(client).is_err() {
             tracing::warn!("set_dht_client called but client already initialized — ignoring");
         }
@@ -2872,10 +2872,13 @@ mod tests {
         // Use LocalTransportProvider (silently succeeds) for tests.
         // Key resolver returns None — no signature verification in tests.
         let key_resolver: scp_core::context::governance::KeyResolver =
-            Arc::new(|_: &scp_identity::DID, _: scp_identity::SigningKeyId| None);
+            Arc::new(|_: &scp_did::DID, _: scp_did::SigningKeyId| None);
         let test_did = "did:test:bridge-instance-test".to_owned();
         Supervisor::with_providers(
-            Arc::new(MlsCryptoProvider::new(test_did)),
+            Arc::new(MlsCryptoProvider::new(
+                test_did,
+                std::sync::Arc::new(scp_clock::SystemClock),
+            )),
             Box::new(LocalTransportProvider),
             Box::new(NoOpEventLog),
             key_resolver,
@@ -3629,7 +3632,7 @@ mod tests {
     fn economy_budget_creates_default_on_first_access() {
         let instance = CoreFields::with_supervisor(test_supervisor());
         let remaining = instance.with_economy_budget("ctx-1", |tracker| {
-            tracker.remaining(&scp_primitives::DID::from("did:dht:zalice"))
+            tracker.remaining(&scp_did::DID::from("did:dht:zalice"))
         });
         assert_eq!(remaining.value(), 0);
     }
@@ -3637,7 +3640,7 @@ mod tests {
     #[test]
     fn economy_budget_mut_grants_and_reads() {
         let instance = CoreFields::with_supervisor(test_supervisor());
-        let did = scp_primitives::DID::from("did:dht:zalice");
+        let did = scp_did::DID::from("did:dht:zalice");
         instance.with_economy_budget_mut("ctx-eco", |tracker| {
             tracker.grant(&did, scp_protocol::economy::Amount::new(500));
         });
@@ -3648,7 +3651,7 @@ mod tests {
     #[test]
     fn economy_antispam_creates_default_on_first_access() {
         let instance = CoreFields::with_supervisor(test_supervisor());
-        let did = scp_primitives::DID::from("did:dht:zbob");
+        let did = scp_did::DID::from("did:dht:zbob");
         let velocity =
             instance.with_economy_antispam("ctx-spam", |tracker| tracker.get_velocity(&did, 1000));
         assert_eq!(velocity, 0);
@@ -3657,7 +3660,7 @@ mod tests {
     #[test]
     fn remove_economy_state_clears_both() {
         let instance = CoreFields::with_supervisor(test_supervisor());
-        let did = scp_primitives::DID::from("did:dht:zalice");
+        let did = scp_did::DID::from("did:dht:zalice");
         instance.with_economy_budget_mut("ctx-rm", |tracker| {
             tracker.grant(&did, scp_protocol::economy::Amount::new(100));
         });
@@ -3675,7 +3678,7 @@ mod tests {
     #[test]
     fn economy_existing_context_id_bypasses_capacity_check() {
         let instance = CoreFields::with_supervisor(test_supervisor());
-        let did = scp_primitives::DID::from("did:dht:zalice");
+        let did = scp_did::DID::from("did:dht:zalice");
 
         // Create one entry.
         instance.with_economy_budget_mut("ctx-exist", |tracker| {
@@ -3696,7 +3699,7 @@ mod tests {
     #[test]
     fn economy_accessors_use_ephemeral_after_shutdown() {
         let instance = CoreFields::with_supervisor(test_supervisor());
-        let did = scp_primitives::DID::from("did:dht:zalice");
+        let did = scp_did::DID::from("did:dht:zalice");
 
         // Grant a budget before shutdown.
         instance.with_economy_budget_mut("ctx-sd", |tracker| {
@@ -3789,7 +3792,7 @@ mod tests {
         let instance = CoreFields::with_supervisor(test_supervisor());
 
         // Populate economy
-        let did = scp_primitives::DID::from("did:dht:zalice");
+        let did = scp_did::DID::from("did:dht:zalice");
         instance.with_economy_budget_mut("ctx-sd", |tracker| {
             tracker.grant(&did, scp_protocol::economy::Amount::new(100));
         });
@@ -4257,9 +4260,12 @@ mod tests {
         // `ContextManager`). The supervisor populates its lifted-
         // provider slots and the manager attachment internally.
         let key_resolver: scp_core::context::governance::KeyResolver =
-            Arc::new(|_: &scp_identity::DID, _: scp_identity::SigningKeyId| None);
+            Arc::new(|_: &scp_did::DID, _: scp_did::SigningKeyId| None);
         let supervisor = Supervisor::with_providers(
-            Arc::new(MlsCryptoProvider::new("did:test:suspend-flush".to_owned())),
+            Arc::new(MlsCryptoProvider::new(
+                "did:test:suspend-flush".to_owned(),
+                std::sync::Arc::new(scp_clock::SystemClock),
+            )),
             Box::new(scp_core::context::LocalTransportProvider),
             Box::new(NoOpEventLog),
             key_resolver,

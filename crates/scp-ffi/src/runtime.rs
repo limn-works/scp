@@ -74,15 +74,15 @@ use scp_ffi_common::bridge_instance::BridgeInstanceCore;
 // Re-export `CoreFields` at `crate::runtime::CoreFields` so the
 // `pyscp_check_handle!` macro can refer to it as
 // `$crate::runtime::CoreFields`.
+use scp_clock::{Clock, SystemClock};
+use scp_did::DidDocument;
 pub use scp_ffi_common::bridge_instance::CoreFields;
-use scp_identity::cache::SystemClock;
-use scp_identity::{DidDocument, ScpIdentity};
+use scp_identity::ScpIdentity;
 use scp_platform::PlatformError;
 use scp_platform::encrypting_adapter::EncryptingAdapter;
 use scp_platform::sqlite::SqliteStorage;
 use scp_platform::testing::InMemoryStorage;
 use scp_platform::traits::Storage;
-use scp_primitives::Clock;
 use std::path::PathBuf;
 use tokio::sync::mpsc;
 use zeroize::Zeroizing;
@@ -849,7 +849,10 @@ pub fn init_context_manager(bi: &PyBridgeInstance, local_did: &str) {
     }
 
     let did = local_did.to_owned();
-    let crypto = Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(did));
+    let crypto = Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(
+        did,
+        std::sync::Arc::new(scp_clock::SystemClock),
+    ));
     let persistence = build_persistence_provider(bi);
     let supervisor_arc = match build_supervisor(
         bi,
@@ -940,7 +943,10 @@ pub fn init_context_manager_with_local_transport(bi: &PyBridgeInstance, local_di
             .set(StorageProvider::new_in_memory_encrypted());
     }
     let did = local_did.to_owned();
-    let crypto = Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(did));
+    let crypto = Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(
+        did,
+        std::sync::Arc::new(scp_clock::SystemClock),
+    ));
     let persistence = build_persistence_provider(bi);
     let supervisor_arc = match build_supervisor(
         bi,
@@ -986,6 +992,7 @@ pub fn init_context_manager_for_test(bi: &PyBridgeInstance) {
     }
     let crypto = Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(
         "did:test:pyo3-bridge-test".to_owned(),
+        std::sync::Arc::new(scp_clock::SystemClock),
     ));
     let persistence = build_persistence_provider(bi);
     let supervisor_arc = match build_supervisor(
@@ -1204,6 +1211,11 @@ fn build_supervisor(
         .map_or_else(not_configured_key_resolver, |r| {
             document_vm_key_resolver(std::sync::Arc::clone(r))
         });
+    // Share the provider's exact hardened `Clock` Arc with the supervisor so the
+    // "one hardened clock per node" invariant (see the `MlsCryptoProvider::clock`
+    // field doc, ADR-057 §Prereq-1) holds by construction — the supervisor does
+    // not fabricate a second `SystemClock`. Read before `crypto` is moved below.
+    let clock = crypto.clock();
     Ok(
         scp_core::context::supervisor::Supervisor::with_providers_and_journal(
             crypto,
@@ -1213,7 +1225,7 @@ fn build_supervisor(
             persistence,
             None,
             Some(event_tx),
-            None,
+            Some(clock),
             durable,
         ),
     )
@@ -1290,7 +1302,7 @@ where
 /// into the same client the resolver reads from, so the DID resolves for
 /// signature verification (UCAN validation, governance vote verification).
 #[must_use]
-pub fn resolver_dht_client(bi: &PyBridgeInstance) -> Option<Arc<scp_identity::InMemoryDhtClient>> {
+pub fn resolver_dht_client(bi: &PyBridgeInstance) -> Option<Arc<scp_dht::InMemoryDhtClient>> {
     bi.core.dht_client().map(Arc::clone)
 }
 
@@ -1298,10 +1310,7 @@ pub fn resolver_dht_client(bi: &PyBridgeInstance) -> Option<Arc<scp_identity::In
 ///
 /// Called once during resolver initialization with the SAME `InMemoryDhtClient`
 /// `Arc` the resolver was built over. Subsequent calls are no-ops.
-pub fn set_resolver_dht_client(
-    bi: &PyBridgeInstance,
-    client: Arc<scp_identity::InMemoryDhtClient>,
-) {
+pub fn set_resolver_dht_client(bi: &PyBridgeInstance, client: Arc<scp_dht::InMemoryDhtClient>) {
     bi.core.set_dht_client(client);
 }
 
@@ -1845,7 +1854,7 @@ pub fn deliver_message_with_handles(
                 bi,
                 "scp:system".to_owned(),
                 b"BufferOverflow: oldest event dropped due to full receive buffer".to_vec(),
-                scp_primitives::SystemClock.now_secs() as f64,
+                SystemClock.now_secs() as f64,
                 context_id.to_owned(),
             );
             let _ = tx.try_send(overflow_warning);
@@ -2728,6 +2737,7 @@ mod tests {
             &isolated,
             Arc::new(MlsCryptoProvider::new(
                 "did:test:pyo3-bridge-test".to_owned(),
+                std::sync::Arc::new(scp_clock::SystemClock),
             )),
             Box::new(scp_core::context::LocalTransportProvider),
             build_event_log_provider(&isolated),

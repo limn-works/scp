@@ -29,7 +29,7 @@
 
 use std::collections::HashMap;
 
-use scp_identity::DID;
+use scp_did::DID;
 use scp_runtime::context::actor::{
     AuthorKeyEntry, BroadcastRecvTracker, BroadcastState, ContextCryptoState,
     ContextLifecycleState, ContextModeState, PendingBroadcastKeyRotation, PerContextState,

@@ -369,29 +369,53 @@ class SCP internal constructor(
             knownContextsJson = knownContextsJson,
         )
 
-    /** Forwards to [NativeScp.aggregateTrustInput] on [inner]. */
+    /**
+     * Aggregates all trust engine layers into a single `TrustInput` (§7.3).
+     *
+     * Every structured input is typed; the SDK serializes to the serde wire
+     * shapes internally (ADR-058) via the TrustAggregate.kt encoders and
+     * forwards to [NativeScp.aggregateTrustInput] on [inner] unchanged. An
+     * empty collection is a real value ("no rules apply"), never a request
+     * for defaults — the bridge receives `[]` / `{}` exactly as passed.
+     *
+     * @param contextId The context to aggregate trust inputs for.
+     * @param subjectDid The DID of the subject to evaluate.
+     * @param events Full signed event-log entries ([EventLogEntry]).
+     * @param merkleRoot 32-byte Merkle root.
+     * @param consequenceRules Typed [ConsequenceRule] values.
+     * @param thresholdRequirements Typed [ThresholdRequirement] values keyed
+     *   by [AttestationType].
+     * @param attestorSets Typed [AttestorInfo] lists keyed by
+     *   [AttestationType].
+     * @param cachedAttestations Typed [CachedAttestation] values to seed the
+     *   bridge's trust store.
+     * @param challengeResults Typed [ChallengeVerification] records.
+     * @return The aggregated `TrustInput` as a JSON string.
+     * @throws IllegalArgumentException on a wrong-length byte array (before
+     *   any bridge call).
+     */
     @Suppress("LongParameterList")
     fun aggregateTrustInput(
         contextId: String,
         subjectDid: String,
-        eventsJson: String,
-        merkleRootJson: String,
-        consequenceRulesJson: String,
-        thresholdRequirementsJson: String,
-        attestorSetsJson: String,
-        cachedAttestationsJson: String,
-        challengeResultsJson: String,
+        events: List<EventLogEntry>,
+        merkleRoot: List<UByte>,
+        consequenceRules: List<ConsequenceRule> = emptyList(),
+        thresholdRequirements: Map<AttestationType, ThresholdRequirement> = emptyMap(),
+        attestorSets: Map<AttestationType, List<AttestorInfo>> = emptyMap(),
+        cachedAttestations: List<CachedAttestation> = emptyList(),
+        challengeResults: List<ChallengeVerification> = emptyList(),
     ): String =
         inner.aggregateTrustInput(
             contextId = contextId,
             subjectDid = subjectDid,
-            eventsJson = eventsJson,
-            merkleRootJson = merkleRootJson,
-            consequenceRulesJson = consequenceRulesJson,
-            thresholdRequirementsJson = thresholdRequirementsJson,
-            attestorSetsJson = attestorSetsJson,
-            cachedAttestationsJson = cachedAttestationsJson,
-            challengeResultsJson = challengeResultsJson,
+            eventsJson = encodeEventLogEntriesJson(events),
+            merkleRootJson = encodeMerkleRootJson(merkleRoot),
+            consequenceRulesJson = encodeConsequenceRulesJson(consequenceRules),
+            thresholdRequirementsJson = encodeThresholdRequirementsJson(thresholdRequirements),
+            attestorSetsJson = encodeAttestorSetsJson(attestorSets),
+            cachedAttestationsJson = encodeCachedAttestationsJson(cachedAttestations),
+            challengeResultsJson = encodeChallengeVerificationsJson(challengeResults),
         )
 
     /** Forwards to [NativeScp.applyPendingCeilingModification] on [inner]. */
@@ -1852,23 +1876,36 @@ class SCP internal constructor(
         )
 
     /**
-     * Routes through the UniFFI-generated free function
-     * [uniffi.scp.trustVerifyAttestation]. ADR-048 §1 + §7 Kotlin
-     * bullet.
+     * Verifies an attestation's Ed25519 signature, evidence, expiry, and
+     * revocation status (ADR-017, §7.4). Takes the typed attestation envelope
+     * ([CachedAttestationEnvelope]) and serializes it to the serde wire shape
+     * internally (ADR-058), then routes through the UniFFI-generated free
+     * function [uniffi.scp.trustVerifyAttestation] unchanged. ADR-048 §1 + §7
+     * Kotlin bullet.
      */
-    fun trustVerifyAttestation(attestationJson: String): AttestationVerificationResult =
+    fun trustVerifyAttestation(attestation: CachedAttestationEnvelope): AttestationVerificationResult =
         uniffi.scp.trustVerifyAttestation(
-            attestationJson = attestationJson,
+            attestationJson = encodeAttestationJson(attestation),
         )
 
-    /** Forwards to [NativeScp.trustVerifyResponse] on [inner]. */
+    /**
+     * Verifies a challenge response against its original challenge request
+     * (ADR-017, §7.3.4). Takes the typed [ChallengeRequest] /
+     * [ChallengeResponse] and serializes them to the serde wire shapes
+     * internally (ADR-058), then forwards to [NativeScp.trustVerifyResponse]
+     * on [inner] unchanged. Returns `true` if the response is valid (correct
+     * responder, within timeout, valid signature), `false` otherwise.
+     *
+     * @throws IllegalArgumentException on a wrong-length signature (before
+     *   any bridge call).
+     */
     fun trustVerifyResponse(
-        challengeJson: String,
-        responseJson: String,
+        challenge: ChallengeRequest,
+        response: ChallengeResponse,
     ): Boolean =
         inner.trustVerifyResponse(
-            challengeJson = challengeJson,
-            responseJson = responseJson,
+            challengeJson = encodeChallengeRequestJson(challenge),
+            responseJson = encodeChallengeResponseJson(response),
         )
 
     /**
@@ -1876,7 +1913,7 @@ class SCP internal constructor(
      *
      * Runs the same 11-step ADR-016 validation pipeline but, instead of throwing
      * at the first failing stage, returns a [CapabilityValidation] of six
-     * per-stage booleans (spec §7.2.4, ADR-057). The probe never records the
+     * per-stage booleans (spec §7.2.4, ADR-059). The probe never records the
      * token's nonce, so calling it does not consume the token.
      * Capability/signature/expiry outcomes are reported via the booleans; only
      * malformed FFI inputs (bad handle / token / capability) throw.
@@ -1953,7 +1990,7 @@ class SCP internal constructor(
 
     /**
      * Evaluate the trustworthiness of a participant within a context
-     * (spec §7.2.4, ADR-057). The protocol provides the data, not the verdict.
+     * (spec §7.2.4, ADR-059). The protocol provides the data, not the verdict.
      *
      * - Layer 1 — protocol enforcement: each supplied capability token is run
      *   through the read-only [ucanEvaluate] diagnostic, yielding six per-stage
@@ -2111,8 +2148,11 @@ class SCP internal constructor(
     )
 
     /**
-     * Routes through the UniFFI-generated free function
-     * [uniffi.scp.verifyParticipationRequirements]. ADR-048 §1 + §7
+     * Verify participation profiles against admission requirements
+     * (spec §7.3.2.1). Serializes the typed [RequireParticipation] /
+     * [ParticipationProfile] values to the serde wire shape (ADR-058) and
+     * routes through the UniFFI-generated free function
+     * [uniffi.scp.verifyParticipationRequirements] unchanged. ADR-048 §1 + §7
      * Kotlin bullet.
      *
      * [expectedSubject] is the DID of the agent being admitted: only
@@ -2121,7 +2161,7 @@ class SCP internal constructor(
      * cross-subject participation-profile replay.
      *
      * Returns normally when all requirements are satisfied; the bridge
-     * throws on any failed requirement or malformed JSON.
+     * throws on any failed requirement or malformed input.
      *
      * Security caveat — authenticity is not authorization: this verifies
      * signatures over the subject binding, not signer *legitimacy*. Because
@@ -2133,13 +2173,53 @@ class SCP internal constructor(
      */
     fun verifyParticipationRequirements(
         expectedSubject: String,
-        requirementsJson: String,
-        profileJson: String,
+        requirements: List<RequireParticipation>,
+        profiles: List<ParticipationProfile>,
     ) {
         uniffi.scp.verifyParticipationRequirements(
             expectedSubject = expectedSubject,
-            requirementsJson = requirementsJson,
-            profileJson = profileJson,
+            requirementsJson = encodeRequireParticipationJson(requirements),
+            profileJson = encodeParticipationProfileJson(profiles),
+        )
+    }
+
+    /**
+     * Verifies that an agent meets a context's capability requirements for
+     * admission (spec §7.3.4.4, SCP-ACR-008). Serializes the typed
+     * [CapabilityRequirement] / [ChallengeVerification] values (and the agent
+     * capability URIs) to the serde wire shape (ADR-058) and routes through
+     * the UniFFI-generated free function
+     * [uniffi.scp.checkCapabilityRequirements] unchanged. ADR-048 §1 + §7
+     * Kotlin bullet.
+     *
+     * [subjectDid]/[contextId] bind challenge verifications to the agent and
+     * context being admitted: a [ChallengeVerification] only satisfies a
+     * requirement when its signed `subject_did`/`context_id` equal these
+     * values, closing cross-subject and cross-context attribution.
+     *
+     * Returns normally when all requirements are satisfied; the bridge throws
+     * on any unmet requirement or malformed input.
+     *
+     * Security caveat — authenticity is not authorization: a passing
+     * `ChallengeVerified` check proves the verifier's signature is authentic
+     * and bound to this subject/context, NOT that the verifier is *trusted*.
+     * Because `verifier_did` is self-certifying, a subject can present a
+     * genuinely-signed result from a verifier it controls. Establish verifier
+     * legitimacy separately and MUST NOT treat success as authorization.
+     */
+    fun checkCapabilityRequirements(
+        contextId: String,
+        subjectDid: String,
+        requirements: List<CapabilityRequirement>,
+        agentCapabilities: List<String>,
+        challengeVerifications: List<ChallengeVerification>,
+    ) {
+        uniffi.scp.checkCapabilityRequirements(
+            contextId = contextId,
+            subjectDid = subjectDid,
+            requirementsJson = encodeCapabilityRequirementsJson(requirements),
+            agentCapabilitiesJson = encodeAgentCapabilitiesJson(agentCapabilities),
+            challengeVerificationsJson = encodeChallengeVerificationsJson(challengeVerifications),
         )
     }
 

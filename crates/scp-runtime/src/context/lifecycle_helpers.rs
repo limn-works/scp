@@ -74,7 +74,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
-use scp_identity::DID;
+use scp_did::DID;
 use scp_protocol::context::builder::ContextCreationError;
 use scp_protocol::context::governance::GovernanceModelConfig;
 use scp_protocol::context::governance::mls_integration::EpochCoordinator;
@@ -1497,9 +1497,9 @@ pub async fn create_context(
             mls_epoch: 0,
             coordinator: EpochCoordinator::new(),
             // Native runtime injects the production SystemClock (ADR-057 §Prereq-2).
-            grace_store: crate::crypto::mls::epoch_grace::EpochGraceStore::with_clock(
-                std::sync::Arc::new(scp_primitives::SystemClock),
-            ),
+            grace_store: scp_mls::epoch_grace::EpochGraceStore::with_clock(std::sync::Arc::new(
+                scp_clock::SystemClock,
+            )),
             needs_reconnect: false,
         },
         access: AccessControlState {
@@ -1768,7 +1768,7 @@ pub(in crate::context) fn verify_scp_context_binding(
         Ok(Some(ext)) => ext
             .verify_against(
                 &context_id.to_owned(),
-                &scp_identity::DID::from(creator_did.to_owned()),
+                &scp_did::DID::from(creator_did.to_owned()),
                 params,
             )
             .map_err(|e| {
@@ -2274,9 +2274,9 @@ pub async fn import_context(
                 &context_id,
             ),
             // Native runtime injects the production SystemClock (ADR-057 §Prereq-2).
-            grace_store: crate::crypto::mls::epoch_grace::EpochGraceStore::with_clock(
-                std::sync::Arc::new(scp_primitives::SystemClock),
-            ),
+            grace_store: scp_mls::epoch_grace::EpochGraceStore::with_clock(std::sync::Arc::new(
+                scp_clock::SystemClock,
+            )),
             needs_reconnect: false,
         },
         access: AccessControlState {
@@ -2632,7 +2632,7 @@ pub async fn restore_context(
         }
     }
 
-    let last_members: HashSet<scp_identity::DID> = ctx_snapshot
+    let last_members: HashSet<scp_did::DID> = ctx_snapshot
         .membership
         .members()
         .map(|m| m.did.clone())
@@ -3239,7 +3239,7 @@ mod restore_reconcile_tests {
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
-    use scp_identity::DID;
+    use scp_did::DID;
     use scp_platform::testing::InMemoryStorage;
     use scp_protocol::context::broadcast::BroadcastContextSnapshot;
     use scp_protocol::context::params::{ContextMode, ContextParams};
@@ -3401,12 +3401,13 @@ mod restore_reconcile_tests {
     fn build_supervisor(persistence: Box<dyn ContextPersistence>) -> Arc<Supervisor> {
         let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
             "did:dht:z6MkRestoreReconcile".to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
         ));
         Supervisor::with_providers(
             crypto,
             Box::new(OkTransport),
             Box::new(OkEventLog),
-            Arc::new(|_: &DID, _: scp_protocol::identity::SigningKeyId| None),
+            Arc::new(|_: &DID, _: scp_did::SigningKeyId| None),
             Some(persistence),
             None,
             None,
@@ -3648,14 +3649,14 @@ mod restore_reconcile_tests {
             serde_json::Value::String("#agent".to_owned()),
         );
 
-        let now = scp_primitives::Clock::now_secs(&scp_primitives::SystemClock);
+        let now = scp_clock::Clock::now_secs(&scp_clock::SystemClock);
         let header = UcanHeader::with_kid("#agent".to_owned());
         let payload = UcanPayload {
             iss: joiner.as_ref().to_owned(),
             aud: joiner.as_ref().to_owned(),
             exp: now + 3600,
             nbf: Some(now.saturating_sub(60)),
-            nnc: generate_nonce(&scp_primitives::SystemClock),
+            nnc: generate_nonce(&scp_clock::SystemClock),
             att: vec![Attenuation {
                 with: "scp:spending:*".to_owned(),
                 can: "spend".to_owned(),
@@ -3710,12 +3711,13 @@ mod restore_reconcile_tests {
         // that resolves the joiner's verifying key for the spending-UCAN sig.
         let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
             "did:dht:z6MkJoinMoneyOrder".to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
         ));
         let key_resolver: scp_protocol::context::governance::KeyResolver = {
             let did = joiner_for_resolver;
             let vk = joiner_vk;
             Arc::new(
-                move |q: &DID, _kid: scp_protocol::identity::SigningKeyId| {
+                move |q: &DID, _kid: scp_did::SigningKeyId| {
                     if *q == did { Some(vk) } else { None }
                 },
             )
@@ -3756,7 +3758,7 @@ mod restore_reconcile_tests {
 
         // Build per-context state with a per_join cost so a spending UCAN is
         // required and the escrow path runs.
-        let now_secs = scp_primitives::Clock::now_secs(&scp_primitives::SystemClock);
+        let now_secs = scp_clock::Clock::now_secs(&scp_clock::SystemClock);
         let mut state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
             context_id_bytes,
             now_secs,
@@ -3791,14 +3793,14 @@ mod restore_reconcile_tests {
             .unwrap();
 
         // Generate a real MLS KeyPackage for the joiner.
-        let joiner_cred = crate::crypto::mls::credential::ScpCredential::new(
+        let joiner_cred = scp_mls::credential::ScpCredential::new(
             joiner.as_ref().to_owned(),
             None,
-            scp_protocol::identity::SigningKeyId::Active,
+            scp_did::SigningKeyId::Active,
         )
         .expect("joiner credential");
         let (kp_bundle, _signer, _provider) =
-            crate::crypto::mls::group::generate_key_package(&joiner_cred)
+            scp_mls::group::generate_key_package(&joiner_cred, &scp_clock::SystemClock)
                 .expect("generate joiner key package");
         let kp_bytes =
             openmls::prelude::tls_codec::Serialize::tls_serialize_detached(kp_bundle.key_package())
@@ -3924,9 +3926,10 @@ mod restore_reconcile_tests {
     async fn finalize_send_succeeds_without_durable_message_sent_append() {
         let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
             "did:dht:z6MkFinalizeSendSeq".to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
         ));
         let key_resolver: scp_protocol::context::governance::KeyResolver =
-            Arc::new(|_q: &DID, _kid: scp_protocol::identity::SigningKeyId| None);
+            Arc::new(|_q: &DID, _kid: scp_did::SigningKeyId| None);
 
         // Working persistence (CapturingPersistence) + FAILING event-log append.
         let sup = Supervisor::with_providers(
@@ -3953,7 +3956,7 @@ mod restore_reconcile_tests {
         let sender = DID("did:dht:z6MkFinalizeSendSender".to_owned());
         let mut state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
             context_id_bytes,
-            scp_primitives::Clock::now_secs(&scp_primitives::SystemClock),
+            scp_clock::Clock::now_secs(&scp_clock::SystemClock),
             admin.clone(),
         );
         state
@@ -4089,6 +4092,7 @@ mod restore_reconcile_tests {
 
         let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
             "did:dht:z6MkPayConverge".to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
         ));
         let key_resolver: scp_protocol::context::governance::KeyResolver =
             Arc::new(|_: &DID, _| None);
@@ -4119,7 +4123,7 @@ mod restore_reconcile_tests {
 
         let context_id = "ctx-pay-converge".to_owned();
         let context_id_bytes = crate::context::state::context_id_to_bytes(&context_id);
-        let now_secs = scp_primitives::Clock::now_secs(&scp_primitives::SystemClock);
+        let now_secs = scp_clock::Clock::now_secs(&scp_clock::SystemClock);
         let mut state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
             context_id_bytes,
             now_secs,
@@ -4328,7 +4332,7 @@ mod restore_reconcile_tests {
 
         let context_id = "ctx-leave-fail-closed".to_owned();
         let context_id_bytes = crate::context::state::context_id_to_bytes(&context_id);
-        let now = scp_primitives::Clock::now_secs(&scp_primitives::SystemClock);
+        let now = scp_clock::Clock::now_secs(&scp_clock::SystemClock);
 
         // Broadcast-mode state: leave skips MLS (no crypto group needed), so the
         // whole removal body runs synchronously inside `commit_class_s_keep`.
@@ -4396,7 +4400,7 @@ mod restore_reconcile_tests {
 
         let context_id = "ctx-close-fail-closed".to_owned();
         let context_id_bytes = crate::context::state::context_id_to_bytes(&context_id);
-        let now = scp_primitives::Clock::now_secs(&scp_primitives::SystemClock);
+        let now = scp_clock::Clock::now_secs(&scp_clock::SystemClock);
 
         // Default test governance is SingleAdmin (the close-path model gate).
         let mut state = crate::context::actor::state::PerContextState::new_for_test_encrypted(

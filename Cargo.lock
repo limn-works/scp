@@ -5086,13 +5086,17 @@ dependencies = [
  "getrandom 0.3.4",
  "getrandom 0.4.2",
  "openmls",
+ "rmp-serde",
+ "scp-clock",
+ "scp-did",
  "scp-event-log",
  "scp-mls",
- "scp-primitives",
  "scp-protocol",
+ "serde",
  "thiserror 2.0.18",
  "tls_codec",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -5105,8 +5109,10 @@ dependencies = [
  "js-sys",
  "rmp-serde",
  "scp-client",
+ "scp-clock",
+ "scp-did",
  "scp-event-log",
- "scp-primitives",
+ "scp-mls",
  "scp-protocol",
  "serde-wasm-bindgen",
  "wasm-bindgen",
@@ -5115,12 +5121,55 @@ dependencies = [
 ]
 
 [[package]]
+name = "scp-clock"
+version = "0.1.0-beta.2"
+
+[[package]]
 name = "scp-core"
 version = "0.1.0-beta.2"
 dependencies = [
+ "scp-mls",
  "scp-protocol",
  "scp-runtime",
  "serde_json",
+]
+
+[[package]]
+name = "scp-crypto"
+version = "0.1.0-beta.2"
+dependencies = [
+ "ed25519-dalek 2.2.0",
+ "rand 0.8.5",
+]
+
+[[package]]
+name = "scp-dht"
+version = "0.1.0-beta.2"
+dependencies = [
+ "ed25519-dalek 2.2.0",
+ "mainline",
+ "reqwest",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "z-base-32",
+]
+
+[[package]]
+name = "scp-did"
+version = "0.1.0-beta.2"
+dependencies = [
+ "base64",
+ "bs58",
+ "ed25519-dalek 2.2.0",
+ "hex",
+ "rand 0.8.5",
+ "rmp-serde",
+ "serde",
+ "serde_bytes",
+ "serde_json",
+ "thiserror 2.0.18",
+ "z-base-32",
 ]
 
 [[package]]
@@ -5132,7 +5181,9 @@ dependencies = [
  "hex",
  "rand 0.8.5",
  "rmp-serde",
- "scp-primitives",
+ "scp-clock",
+ "scp-crypto",
+ "scp-did",
  "serde",
  "serde_bytes",
  "serde_json",
@@ -5156,7 +5207,10 @@ dependencies = [
  "pyo3",
  "rand 0.8.5",
  "rmp-serde",
+ "scp-clock",
  "scp-core",
+ "scp-dht",
+ "scp-did",
  "scp-event-log",
  "scp-ffi-common",
  "scp-identity",
@@ -5164,7 +5218,6 @@ dependencies = [
  "scp-media",
  "scp-node",
  "scp-platform",
- "scp-primitives",
  "scp-testing",
  "scp-transport",
  "serde_json",
@@ -5189,13 +5242,15 @@ dependencies = [
  "hex",
  "rand 0.8.5",
  "rand_core 0.6.4",
+ "scp-clock",
  "scp-core",
+ "scp-dht",
+ "scp-did",
  "scp-event-log",
  "scp-identity",
  "scp-mcp",
  "scp-node",
  "scp-platform",
- "scp-primitives",
  "scp-protocol",
  "scp-transport",
  "serde_json",
@@ -5224,7 +5279,10 @@ dependencies = [
  "napi-derive",
  "rand 0.8.5",
  "rmp-serde",
+ "scp-clock",
  "scp-core",
+ "scp-dht",
+ "scp-did",
  "scp-event-log",
  "scp-ffi-common",
  "scp-ffi-napi-test-stubs",
@@ -5233,7 +5291,6 @@ dependencies = [
  "scp-media",
  "scp-node",
  "scp-platform",
- "scp-primitives",
  "scp-testing",
  "scp-transport",
  "serde_json",
@@ -5267,7 +5324,10 @@ dependencies = [
  "hex",
  "rand 0.8.5",
  "rmp-serde",
+ "scp-clock",
  "scp-core",
+ "scp-dht",
+ "scp-did",
  "scp-event-log",
  "scp-ffi-common",
  "scp-identity",
@@ -5275,7 +5335,6 @@ dependencies = [
  "scp-media",
  "scp-node",
  "scp-platform",
- "scp-primitives",
  "scp-transport",
  "serde_json",
  "sha2 0.10.9",
@@ -5300,12 +5359,11 @@ dependencies = [
  "bs58",
  "ed25519-dalek 2.2.0",
  "hex",
- "mainline",
  "rand 0.8.5",
- "reqwest",
+ "scp-clock",
+ "scp-dht",
+ "scp-did",
  "scp-platform",
- "scp-primitives",
- "scp-protocol",
  "serde",
  "serde_bytes",
  "serde_json",
@@ -5322,8 +5380,8 @@ name = "scp-mcp"
 version = "0.1.0-beta.2"
 dependencies = [
  "axum",
+ "scp-clock",
  "scp-core",
- "scp-primitives",
  "serde",
  "serde_json",
  "subtle",
@@ -5340,7 +5398,9 @@ name = "scp-media"
 version = "0.1.0-beta.2"
 dependencies = [
  "openmls_traits 0.5.0",
+ "scp-clock",
  "scp-core",
+ "scp-did",
  "scp-identity",
  "serde",
  "serde_json",
@@ -5366,7 +5426,8 @@ dependencies = [
  "proptest",
  "rand 0.8.5",
  "rmp-serde",
- "scp-primitives",
+ "scp-clock",
+ "scp-did",
  "scp-protocol",
  "serde",
  "serde_json",
@@ -5375,6 +5436,7 @@ dependencies = [
  "tracing",
  "uuid",
  "x25519-dalek 2.0.1",
+ "zeroize",
 ]
 
 [[package]]
@@ -5402,10 +5464,13 @@ dependencies = [
  "rmp-serde",
  "rustls",
  "rustls-pemfile",
+ "scp-clock",
  "scp-core",
+ "scp-crypto",
+ "scp-dht",
+ "scp-did",
  "scp-identity",
  "scp-platform",
- "scp-primitives",
  "scp-transport",
  "serde",
  "serde_json",
@@ -5453,19 +5518,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "scp-primitives"
-version = "0.1.0-beta.2"
-dependencies = [
- "ed25519-dalek 2.2.0",
- "hex",
- "rand 0.8.5",
- "rmp-serde",
- "serde",
- "serde_json",
- "z-base-32",
-]
-
-[[package]]
 name = "scp-protocol"
 version = "0.1.0-beta.2"
 dependencies = [
@@ -5488,8 +5540,10 @@ dependencies = [
  "rand 0.8.5",
  "rmp-serde",
  "rmpv",
+ "scp-clock",
+ "scp-crypto",
+ "scp-did",
  "scp-event-log",
- "scp-primitives",
  "serde",
  "serde_bytes",
  "serde_json",
@@ -5546,12 +5600,15 @@ dependencies = [
  "rand 0.8.5",
  "rmp-serde",
  "rmpv",
+ "scp-clock",
+ "scp-crypto",
+ "scp-dht",
+ "scp-did",
  "scp-event-log",
  "scp-identity",
  "scp-media",
  "scp-mls",
  "scp-platform",
- "scp-primitives",
  "scp-protocol",
  "serde",
  "serde_bytes",
@@ -5589,13 +5646,15 @@ dependencies = [
  "proc-macro2",
  "rand 0.8.5",
  "rmp-serde",
+ "scp-clock",
  "scp-core",
+ "scp-dht",
+ "scp-did",
  "scp-event-log",
  "scp-ffi-common",
  "scp-identity",
  "scp-node",
  "scp-platform",
- "scp-primitives",
  "scp-transport",
  "serde",
  "serde_json",
@@ -5647,10 +5706,10 @@ dependencies = [
  "rmpv",
  "rusqlite",
  "rustls",
+ "scp-clock",
  "scp-core",
  "scp-identity",
  "scp-platform",
- "scp-primitives",
  "scp-testing",
  "serde",
  "serde_bytes",

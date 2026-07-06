@@ -21,14 +21,15 @@
 //! forwards their message verbatim; it adds the code prefix and nothing else.
 
 use scp_client::ClientError;
+use scp_mls::MlsError;
 use wasm_bindgen::JsValue;
 
 /// Stable error-code prefix for each [`ClientError`] category.
 ///
 /// The numbers slot into the cross-SDK ranges documented in
 /// `.docs/standards/sdk-common.md` (CTX 2000-2999, CRYPTO 4000-4999,
-/// VALID 7000-7999). They are part of the public JS error contract —
-/// append new variants, never renumber existing ones.
+/// VALID 7000-7999, STORAGE 8000-8999). They are part of the public JS error
+/// contract — append new variants, never renumber existing ones.
 ///
 /// This is a pure `&ClientError -> &str` mapping with no `JsValue` dependency,
 /// so it is testable on the native host (where `JsValue` construction aborts —
@@ -37,6 +38,15 @@ use wasm_bindgen::JsValue;
 #[must_use]
 pub const fn error_code(err: &ClientError) -> &'static str {
     match err {
+        // A convergent committer-timestamp AAD failure (ADR-057): an add-Commit
+        // carried no authenticated timestamp or a malformed one. A distinct,
+        // stable code so a caller can tell a convergence-authentication rejection
+        // apart from a generic MLS failure. These arrive wrapped in
+        // `ClientError::Mls`, so they MUST be matched BEFORE the catch-all
+        // `ClientError::Mls(_)` arm below.
+        ClientError::Mls(
+            MlsError::ConvergentTimestampMissing | MlsError::ConvergentTimestampMalformed(_),
+        ) => "SCP-CRYPTO-4040",
         // MLS / sender-key / event-log are the cryptographic protocol layers.
         ClientError::Mls(_) => "SCP-CRYPTO-4010",
         ClientError::SenderKey(_) => "SCP-CRYPTO-4020",
@@ -50,6 +60,24 @@ pub const fn error_code(err: &ClientError) -> &'static str {
         ClientError::UnsupportedMembershipChange(_) => "SCP-CTX-2003",
         // A driver invariant violation (bad argument / missing pending state).
         ClientError::Driver(_) => "SCP-CTX-2004",
+        // The injected Storage backend failed at the I/O level (a
+        // get/put/delete/list_keys fault) — distinct from a corrupt-but-readable
+        // blob. NOTE: 8001-8003 are already allocated by scp-kt-android's
+        // AndroidStorage (key-not-found / storage-op-failed / key-derivation-failed);
+        // the browser participant driver's storage codes start at 8010 to avoid
+        // that collision (see `.docs/standards/sdk-common.md`, SCP-STORAGE- band).
+        ClientError::StorageBackend(_) => "SCP-STORAGE-8010",
+        // A persisted snapshot could not be trusted for restore: it failed to
+        // (de)serialize, carried an unknown format version, embedded a different
+        // context id than its key, or failed the §9.9.3 checkpoint compare.
+        ClientError::StorageCorrupt(_) => "SCP-STORAGE-8011",
+        // A persisted snapshot belongs to a different identity than the restoring
+        // client (its bound owner DID does not match).
+        ClientError::StorageIdentityMismatch(_) => "SCP-STORAGE-8012",
+        // A context diverged: a storage write failed after its in-memory state
+        // advanced irreversibly. The caller must reconstruct from the last durable
+        // snapshot.
+        ClientError::ContextPoisoned { .. } => "SCP-STORAGE-8013",
     }
 }
 
@@ -97,6 +125,79 @@ mod tests {
     }
 
     #[test]
+    fn convergent_timestamp_family_maps_to_distinct_crypto_code() {
+        // ADR-057: both convergent-timestamp AAD failures (which arrive wrapped in
+        // ClientError::Mls) get the distinct SCP-CRYPTO-4040 code, so a caller can
+        // tell a convergence-authentication rejection apart from a generic MLS
+        // failure. The distinct arm must be matched BEFORE the catch-all
+        // ClientError::Mls(_) → 4010.
+        for err in [
+            ClientError::Mls(MlsError::ConvergentTimestampMissing),
+            ClientError::Mls(MlsError::ConvergentTimestampMalformed("bad len".to_owned())),
+        ] {
+            assert_eq!(error_code(&err), "SCP-CRYPTO-4040");
+        }
+        // A different MLS failure still falls through to the generic MLS code.
+        assert_eq!(
+            error_code(&ClientError::Mls(MlsError::GroupDestroyed)),
+            "SCP-CRYPTO-4010"
+        );
+    }
+
+    #[test]
+    fn storage_variants_map_to_distinct_stable_storage_codes() {
+        // The four browser storage failure classes each get a distinct, stable
+        // code in the SCP-STORAGE-8010+ sub-range (part of the public JS error
+        // contract). 8001-8003 are reserved for scp-kt-android; the browser codes
+        // start at 8010 to avoid that collision.
+        assert_eq!(
+            error_code(&ClientError::StorageBackend("io".to_owned())),
+            "SCP-STORAGE-8010"
+        );
+        assert_eq!(
+            error_code(&ClientError::StorageCorrupt("checkpoint".to_owned())),
+            "SCP-STORAGE-8011"
+        );
+        assert_eq!(
+            error_code(&ClientError::StorageIdentityMismatch("owner".to_owned())),
+            "SCP-STORAGE-8012"
+        );
+        assert_eq!(
+            error_code(&ClientError::ContextPoisoned {
+                context_id: "ctx".to_owned()
+            }),
+            "SCP-STORAGE-8013"
+        );
+    }
+
+    #[test]
+    fn browser_storage_codes_avoid_the_android_reserved_low_block() {
+        // Regression guard for the collision this renumber fixed: scp-kt-android's
+        // AndroidStorage owns the low `800x` block, so every browser storage code
+        // must sit at 8010 or above. Checked numerically (no reserved-code string
+        // literal, so the grep guarding this crate against the old codes stays 0).
+        for err in [
+            ClientError::StorageBackend("s".to_owned()),
+            ClientError::StorageCorrupt("s".to_owned()),
+            ClientError::StorageIdentityMismatch("s".to_owned()),
+            ClientError::ContextPoisoned {
+                context_id: "c".to_owned(),
+            },
+        ] {
+            let code = error_code(&err);
+            // A non-storage / malformed code parses to 0 and trips the same assert.
+            let number: u32 = code
+                .strip_prefix("SCP-STORAGE-")
+                .and_then(|n| n.parse().ok())
+                .unwrap_or(0);
+            assert!(
+                number >= 8010,
+                "browser storage code {code} is in the Android-reserved low block (or malformed)"
+            );
+        }
+    }
+
+    #[test]
     fn every_code_is_in_the_documented_prefix_space() {
         // A representative of each category resolves to a `SCP-` code.
         for err in [
@@ -105,6 +206,12 @@ mod tests {
             ClientError::UnsupportedMembershipChange("c".to_owned()),
             ClientError::Codec("c".to_owned()),
             ClientError::Driver("d".to_owned()),
+            ClientError::StorageBackend("s".to_owned()),
+            ClientError::StorageCorrupt("s".to_owned()),
+            ClientError::StorageIdentityMismatch("s".to_owned()),
+            ClientError::ContextPoisoned {
+                context_id: "c".to_owned(),
+            },
         ] {
             assert!(
                 error_code(&err).starts_with("SCP-"),

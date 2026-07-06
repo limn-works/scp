@@ -28,10 +28,10 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::crypto::ed25519::verify_ed25519_signature;
+use scp_clock::Clock;
+use scp_crypto::verify_ed25519_signature;
+use scp_did::DID;
 use scp_event_log::Ed25519Signature;
-use scp_primitives::Clock;
-use scp_primitives::DID;
 
 use super::TrustError;
 use super::attestation::DidPublicKeyResolver;
@@ -405,6 +405,12 @@ const DEFAULT_VERIFICATION_TTL_SECS: u64 = 90 * 24 * 3600;
 /// bound (`completed_at >= now - timeout`) could be evaded by stamping an
 /// arbitrarily far-future `completed_at`. Set to 5 minutes to match the
 /// protocol-wide clock-skew tolerance (spec §9.14).
+///
+/// Independent knob: shares the §9.14 5-minute default with
+/// `crypto::ucan::validate::DEFAULT_CLOCK_SKEW_TOLERANCE_SECS`,
+/// `envelope::validation::DEFAULT_CLOCK_SKEW_TOLERANCE_MS`, and
+/// `trust::participation::MAX_PARTICIPATION_FUTURE_SKEW_SECS`, but is
+/// deliberately a distinct constant, not unified.
 const MAX_COMPLETION_FUTURE_SKEW_SECS: u64 = 5 * 60;
 
 // ---------------------------------------------------------------------------
@@ -932,7 +938,7 @@ mod tests {
     use ed25519_dalek::{Signer, SigningKey};
 
     use super::*;
-    use scp_primitives::TestClock;
+    use scp_clock::TestClock;
 
     // -----------------------------------------------------------------------
     // Test helpers

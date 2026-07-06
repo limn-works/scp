@@ -32,7 +32,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use scp_primitives::Clock;
+use scp_clock::Clock;
 
 use super::{Attenuation, UcanError, UcanPayload, UcanToken};
 
@@ -1663,7 +1663,7 @@ mod tests {
             lifetime_secs: 3600,
             not_before: None,
         };
-        let payload = mint_spending_ucan_payload(&params, &scp_primitives::SystemClock).unwrap();
+        let payload = mint_spending_ucan_payload(&params, &scp_clock::SystemClock).unwrap();
 
         // Self-delegation: iss == aud
         assert_eq!(payload.iss, "did:dht:z6MkShared");
@@ -1698,7 +1698,7 @@ mod tests {
             lifetime_secs: 3600,
             not_before: None,
         };
-        let payload = mint_spending_ucan_payload(&params, &scp_primitives::SystemClock).unwrap();
+        let payload = mint_spending_ucan_payload(&params, &scp_clock::SystemClock).unwrap();
         assert_eq!(payload.att[0].with, "scp:spending:*");
         assert_eq!(payload.iss, payload.aud); // self-delegation
     }
@@ -1715,7 +1715,7 @@ mod tests {
             lifetime_secs: MAX_EXPIRY_SECS + 1,
             not_before: None,
         };
-        let err = mint_spending_ucan_payload(&params, &scp_primitives::SystemClock).unwrap_err();
+        let err = mint_spending_ucan_payload(&params, &scp_clock::SystemClock).unwrap_err();
         assert!(matches!(err, SpendingError::ExpiryTooLong { .. }));
     }
 
@@ -1731,7 +1731,7 @@ mod tests {
             lifetime_secs: 3600,
             not_before: Some(1_700_000_000),
         };
-        let payload = mint_spending_ucan_payload(&params, &scp_primitives::SystemClock).unwrap();
+        let payload = mint_spending_ucan_payload(&params, &scp_clock::SystemClock).unwrap();
         assert_eq!(payload.nbf, Some(1_700_000_000));
     }
 
@@ -1744,7 +1744,7 @@ mod tests {
     /// Uses the shared-DID model: `iss == aud` (self-delegation) with
     /// `fct.scp_key_scope: "#agent"`.
     fn make_spending_token(cap: &SpendingCapability, scope_uri: &str) -> UcanToken {
-        let now = scp_primitives::SystemClock.now_secs();
+        let now = scp_clock::SystemClock.now_secs();
 
         UcanToken {
             header: super::super::UcanHeader::with_kid("#agent".to_owned()),
@@ -1773,7 +1773,7 @@ mod tests {
     fn validate_spending_ucan_context_scoped() {
         let cap = sample_capability();
         let token = make_spending_token(&cap, "scp:spending:ctx123");
-        let result = validate_spending_ucan(&token, "ctx123", None, &scp_primitives::SystemClock);
+        let result = validate_spending_ucan(&token, "ctx123", None, &scp_clock::SystemClock);
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), cap);
     }
@@ -1782,8 +1782,7 @@ mod tests {
     fn validate_spending_ucan_global_scope() {
         let cap = sample_capability();
         let token = make_spending_token(&cap, "scp:spending:*");
-        let result =
-            validate_spending_ucan(&token, "any-context", None, &scp_primitives::SystemClock);
+        let result = validate_spending_ucan(&token, "any-context", None, &scp_clock::SystemClock);
         assert!(result.is_ok());
     }
 
@@ -1791,8 +1790,8 @@ mod tests {
     fn validate_spending_ucan_scope_mismatch() {
         let cap = sample_capability();
         let token = make_spending_token(&cap, "scp:spending:ctx123");
-        let err = validate_spending_ucan(&token, "ctx456", None, &scp_primitives::SystemClock)
-            .unwrap_err();
+        let err =
+            validate_spending_ucan(&token, "ctx456", None, &scp_clock::SystemClock).unwrap_err();
         assert!(matches!(err, SpendingError::ScopeNotCovered { .. }));
     }
 
@@ -1816,8 +1815,8 @@ mod tests {
             signature: vec![0u8; 64],
             encoded: String::new(),
         };
-        let err = validate_spending_ucan(&token, "ctx123", None, &scp_primitives::SystemClock)
-            .unwrap_err();
+        let err =
+            validate_spending_ucan(&token, "ctx123", None, &scp_clock::SystemClock).unwrap_err();
         assert!(matches!(err, SpendingError::SpendingCapabilityRequired(_)));
     }
 
@@ -1832,12 +1831,8 @@ mod tests {
             allowed_adapters: vec!["x402".to_owned()],
         };
         let token = make_spending_token(&child_cap, "scp:spending:ctx123");
-        let result = validate_spending_ucan(
-            &token,
-            "ctx123",
-            Some(&parent_cap),
-            &scp_primitives::SystemClock,
-        );
+        let result =
+            validate_spending_ucan(&token, "ctx123", Some(&parent_cap), &scp_clock::SystemClock);
         assert!(result.is_ok());
     }
 
@@ -1852,13 +1847,9 @@ mod tests {
         };
         let child_cap = sample_capability(); // wider than parent
         let token = make_spending_token(&child_cap, "scp:spending:ctx123");
-        let err = validate_spending_ucan(
-            &token,
-            "ctx123",
-            Some(&parent_cap),
-            &scp_primitives::SystemClock,
-        )
-        .unwrap_err();
+        let err =
+            validate_spending_ucan(&token, "ctx123", Some(&parent_cap), &scp_clock::SystemClock)
+                .unwrap_err();
         assert!(matches!(err, SpendingError::AttenuationViolation(_)));
     }
 
@@ -1928,7 +1919,7 @@ mod tests {
             lifetime_secs: 3600,
             not_before: None,
         };
-        let payload = mint_spending_ucan_payload(&params, &scp_primitives::SystemClock).unwrap();
+        let payload = mint_spending_ucan_payload(&params, &scp_clock::SystemClock).unwrap();
 
         // Build a token from the payload (skip actual signing for unit test).
         let token = UcanToken {
@@ -1940,12 +1931,12 @@ mod tests {
 
         // Validate the spending UCAN.
         let validated_cap =
-            validate_spending_ucan(&token, "ctx123", None, &scp_primitives::SystemClock).unwrap();
+            validate_spending_ucan(&token, "ctx123", None, &scp_clock::SystemClock).unwrap();
         assert_eq!(validated_cap, cap);
 
         // Use budget tracker to enforce limits.
         let mut tracker = BudgetTracker::new(validated_cap);
-        let now = scp_primitives::SystemClock.now_secs();
+        let now = scp_clock::SystemClock.now_secs();
 
         // Spend 1000 three times (total 3000 = max_total).
         assert!(
@@ -2059,7 +2050,7 @@ mod tests {
             lifetime_secs: 1800,
             not_before: None,
         };
-        let payload = mint_spending_ucan_payload(&params, &scp_primitives::SystemClock).unwrap();
+        let payload = mint_spending_ucan_payload(&params, &scp_clock::SystemClock).unwrap();
 
         // Core invariant: self-delegation means iss == aud
         assert_eq!(payload.iss, "did:dht:z6MkSharedIdentity");
@@ -2079,7 +2070,7 @@ mod tests {
             lifetime_secs: 3600,
             not_before: None,
         };
-        let payload = mint_spending_ucan_payload(&params, &scp_primitives::SystemClock).unwrap();
+        let payload = mint_spending_ucan_payload(&params, &scp_clock::SystemClock).unwrap();
 
         let fct = payload.fct.as_ref().expect("facts must be present");
         assert_eq!(
@@ -2101,7 +2092,7 @@ mod tests {
             lifetime_secs: 3600,
             not_before: None,
         };
-        let payload = mint_spending_ucan_payload(&params, &scp_primitives::SystemClock).unwrap();
+        let payload = mint_spending_ucan_payload(&params, &scp_clock::SystemClock).unwrap();
 
         // Custom key scope should be respected
         let fct = payload.fct.as_ref().unwrap();
@@ -2125,7 +2116,7 @@ mod tests {
             lifetime_secs: 3600,
             not_before: None,
         };
-        let payload = mint_spending_ucan_payload(&params, &scp_primitives::SystemClock).unwrap();
+        let payload = mint_spending_ucan_payload(&params, &scp_clock::SystemClock).unwrap();
 
         let fct = payload.fct.as_ref().expect("facts must be present");
 
@@ -2170,7 +2161,7 @@ mod tests {
             lifetime_secs: 3600,
             not_before: None,
         };
-        let payload = mint_spending_ucan_payload(&params, &scp_primitives::SystemClock).unwrap();
+        let payload = mint_spending_ucan_payload(&params, &scp_clock::SystemClock).unwrap();
 
         // Verify self-delegation structure
         assert_eq!(payload.iss, payload.aud);
@@ -2188,12 +2179,12 @@ mod tests {
             encoded: String::new(),
         };
         let validated_cap =
-            validate_spending_ucan(&token, "ctx-e2e", None, &scp_primitives::SystemClock).unwrap();
+            validate_spending_ucan(&token, "ctx-e2e", None, &scp_clock::SystemClock).unwrap();
         assert_eq!(validated_cap, cap);
 
         // Budget tracker works with the validated capability
         let mut tracker = BudgetTracker::new(validated_cap);
-        let now = scp_primitives::SystemClock.now_secs();
+        let now = scp_clock::SystemClock.now_secs();
 
         assert!(
             tracker

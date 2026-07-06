@@ -17,12 +17,12 @@ use http_body_util::BodyExt;
 use hyper::Request;
 use tower::ServiceExt;
 
+use scp_clock::SystemClock;
 use scp_core::context::ContextMode;
 use scp_core::uri::ScpUri;
 use scp_core::well_known::WellKnownScp;
-use scp_identity::cache::SystemClock;
+use scp_dht::InMemoryDhtClient;
 use scp_identity::dht::DidDht;
-use scp_identity::dht_client::InMemoryDhtClient;
 use scp_identity::{DidCache, DidMethod};
 use scp_node::{DhtMode, IdentitySource, Node, NodeConfig, Reach};
 use scp_platform::testing::{InMemoryKeyCustody, InMemoryStorage};

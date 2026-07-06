@@ -29,7 +29,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use super::UcanError;
-use scp_primitives::Clock;
+use scp_clock::Clock;
 
 /// Nonce freshness tolerance: 5 minutes in milliseconds (spec section 9.14).
 const NONCE_FRESHNESS_TOLERANCE_MS: u128 = 5 * 60 * 1000;
@@ -535,7 +535,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use scp_primitives::TestClock;
+    use scp_clock::TestClock;
 
     /// Base timestamp for tests: 2024-01-01 00:00:00 UTC in seconds.
     const BASE_SECS: u64 = 1_704_067_200;

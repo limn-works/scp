@@ -9,7 +9,7 @@
 //!
 //! # Mechanical fence (ADR-057 scope fence)
 //!
-//! `scp-mls` depends only on `scp-protocol`, `scp-primitives`, and the
+//! `scp-mls` depends only on `scp-clock`, `scp-did`, `scp-protocol`, and the
 //! `openmls` stack. It **must not** depend on `scp-runtime` (tokio/actor
 //! orchestration) or `scp-identity` (tokio-coupled custody/DHT). The async
 //! durable-storage bridge (`ScpMlsProvider<S>`, the `block_in_place` storage
@@ -25,9 +25,13 @@
 //!
 //! - [`group`] — Group lifecycle: create, add member, remove member, destroy.
 //! - [`credential`] — SCP credential type (DID + UCAN) for MLS `LeafNode` fields.
+//! - [`convergent_timestamp`] — Authenticated convergent committer timestamp
+//!   carried in the MLS AAD (ADR-057).
 //! - [`encrypt`] — Application-message encrypt/decrypt over the MLS group.
 //! - [`ratchet`] — Commit processing and epoch advance.
 //! - [`key_package`] — Single-use `KeyPackage` buffer management.
+//! - [`lifetime`] — `KeyPackage` `Lifetime` minting/validation via the injected
+//!   [`scp_clock::Clock`] (ADR-057 Prereq-1).
 //! - [`wrapping_extension`] — `scp_wrapping_key` `LeafNode` extension helpers.
 //! - [`context_extension`] — `scp_context_params` `group_context` extension
 //!   helpers (§5.13.3, finding FFI-02).
@@ -38,16 +42,23 @@
 //! ADR-057 for the `scp-mls` extraction.
 
 pub mod context_extension;
+pub mod convergent_timestamp;
 pub mod credential;
 pub mod encrypt;
 pub mod epoch_grace;
 pub mod error;
 pub mod group;
 pub mod key_package;
+pub mod lifetime;
 pub mod ratchet;
+pub mod snapshot;
 pub mod wrapping_extension;
 
 // Re-export primary public API types for convenience.
+pub use convergent_timestamp::{
+    CONVERGENT_TIMESTAMP_AAD_LEN, CONVERGENT_TIMESTAMP_AAD_MAGIC, CONVERGENT_TIMESTAMP_AAD_VERSION,
+    decode_convergent_timestamp_aad, encode_convergent_timestamp_aad,
+};
 pub use credential::ScpCredential;
 pub use encrypt::{DecryptedContent, InboundChange};
 pub use error::MlsError;
@@ -61,12 +72,22 @@ pub use context_extension::{
     scp_capabilities_with_context_params,
 };
 pub use group::{
-    AddMemberResult, RemoveMemberResult, SCP_CIPHERSUITE, ScpMlsGroup, add_member, create_group,
-    create_group_with_context, create_group_with_wrapping_key, destroy_group, generate_key_package,
+    AddMemberResult, RemoveMemberResult, SCP_CIPHERSUITE, ScpMlsGroup, add_member,
+    add_member_with_convergent_timestamp, create_group, create_group_with_context,
+    create_group_with_wrapping_key, destroy_group, generate_key_package,
     generate_key_package_with_context_params, generate_key_package_with_wrapping_key, join_group,
     key_package_in_did, remove_member,
 };
+pub use lifetime::{
+    KEY_PACKAGE_LIFETIME_MARGIN_SECS, KEY_PACKAGE_LIFETIME_MAX_RANGE_SECS,
+    KEY_PACKAGE_LIFETIME_SECS, key_package_lifetime, validate_key_package_lifetime,
+};
 pub use openmls_basic_credential::SignatureKeyPair;
+// The snapshot STRUCTS (`MlsGroupSnapshot`, `PendingJoinSnapshot`) are NOT
+// re-exported: they have private fields, no public constructor, and appear in no
+// public signature (serde reaches them through the free fns / methods, which does
+// not need `pub`). Only the round-trip entry points are public API.
+pub use snapshot::{restore_pending_join, serialize_pending_join};
 pub use wrapping_extension::{
     SCP_WRAPPING_KEY_EXTENSION_TYPE, extract_member_wrapping_key, extract_own_wrapping_key,
     extract_wrapping_key, find_leaf_index_by_did, leaf_node_params_with_wrapping_key,

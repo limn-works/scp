@@ -69,8 +69,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use scp_identity::{DID, DidDocument, SigningKeyId};
-use scp_primitives::{Clock, SystemClock};
+use scp_clock::{Clock, SystemClock};
+use scp_did::{DID, DidDocument, SigningKeyId};
 use scp_protocol::context::ContextError;
 use scp_protocol::context::governance::KeyResolver;
 use scp_protocol::crypto::access_keys::{AccessKey, generate_access_key};
@@ -89,10 +89,10 @@ const BOB_DID: &str = "did:dht:z6MkAgentBindingPipelineBobBobBobBobBobBo";
 
 /// Decodes a `z`-prefixed base58btc multibase public key (as stored in a
 /// [`DidDocument`] verification method) into an Ed25519 [`VerifyingKey`], using
-/// the canonical `scp_identity::decode_multibase_key` decoder (which performs
+/// the canonical `scp_did::decode_multibase_key` decoder (which performs
 /// the same curve-point validation production DID resolution does).
 fn verifying_key_from_vm_multibase(multibase: &str) -> VerifyingKey {
-    let bytes = scp_identity::decode_multibase_key(multibase)
+    let bytes = scp_did::decode_multibase_key(multibase)
         .expect("verification-method multibase must decode to a valid Ed25519 key");
     VerifyingKey::from_bytes(&bytes).expect("decoded bytes must be a valid Ed25519 key")
 }
@@ -140,11 +140,17 @@ fn document_backed_resolver(
 fn setup_two_party(ctx_str: &str) -> (Arc<MlsCryptoProvider>, Arc<MlsCryptoProvider>, [u8; 32]) {
     let context_id = scp_protocol::context::context_id_bytes(ctx_str);
 
-    let alice = MlsCryptoProvider::new(ALICE_DID.to_owned());
+    let alice = MlsCryptoProvider::new(
+        ALICE_DID.to_owned(),
+        std::sync::Arc::new(scp_clock::SystemClock),
+    );
     alice.create_mls_group(&context_id).unwrap();
     alice.generate_sender_key(&context_id).unwrap();
 
-    let bob = MlsCryptoProvider::new(BOB_DID.to_owned());
+    let bob = MlsCryptoProvider::new(
+        BOB_DID.to_owned(),
+        std::sync::Arc::new(scp_clock::SystemClock),
+    );
     let bob_kp_bytes = bob.prepare_key_package_for_join().unwrap();
     let add_output = alice
         .add_member(&context_id, BOB_DID, Some(&bob_kp_bytes))
@@ -443,7 +449,7 @@ mod live_supervisor_send {
     use std::sync::{Arc, Mutex};
 
     use ed25519_dalek::SigningKey;
-    use scp_identity::{DID, SigningKeyId};
+    use scp_did::{DID, SigningKeyId};
     use scp_protocol::context::builder::{ContextCreationError, OpenResult};
     use scp_protocol::context::membership::{ContextEvent, KeyPackage};
     use scp_protocol::context::params::{ContextMode, ContextParams};
@@ -541,7 +547,10 @@ mod live_supervisor_send {
     /// in-memory event log / MLS storage via `test_supervisor`) and returns it
     /// alongside the shared capture buffer.
     fn alice_supervisor(sent: SentBuffer) -> Arc<Supervisor> {
-        let crypto = Arc::new(MlsCryptoProvider::new(ALICE_DID.to_owned()));
+        let crypto = Arc::new(MlsCryptoProvider::new(
+            ALICE_DID.to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
+        ));
         let (_active_sk, _agent_sk, alice_doc) = alice_identity();
         let resolver = document_backed_resolver(&alice_doc, None);
         let transport: Box<dyn ContextTransportProvider> = Box::new(CapturingTransport::new(sent));
@@ -597,7 +606,10 @@ mod live_supervisor_send {
 
         // Bob mints a real MLS key package (his provider keeps the matching
         // signer state for the later Welcome join).
-        let bob = Arc::new(MlsCryptoProvider::new(BOB_DID.to_owned()));
+        let bob = Arc::new(MlsCryptoProvider::new(
+            BOB_DID.to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
+        ));
         let bob_kp_bytes = bob
             .prepare_key_package_for_join()
             .expect("bob prepares key package");

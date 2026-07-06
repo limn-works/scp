@@ -30,6 +30,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 
 use dashmap::DashMap;
+use scp_clock::SystemClock;
 use scp_core::context::builder::{ContextEventLogProvider, ContextTransportProvider};
 use scp_core::context::persistence::ContextPersistence;
 use scp_core::context::roles::{ContextRoleState, default_ceiling};
@@ -39,7 +40,6 @@ use scp_core::crypto::ucan::nonce::NonceTracker;
 use scp_core::crypto::ucan::revoke::RevocationList;
 use scp_core::store::ProtocolRepository;
 use scp_event_log::EventLog;
-use scp_identity::cache::SystemClock;
 
 use crate::context::NapiContextHandle;
 use crate::error::ScpNapiError;
@@ -724,7 +724,7 @@ pub type ToolHandler =
 /// in the enforcement allowlist. See `scripts/check-no-bridge-globals.sh`.
 ///
 /// See issue #1144 (UCAN validation tests require shared DHT state).
-static SHARED_DHT_CLIENT: OnceLock<Arc<scp_identity::InMemoryDhtClient>> = OnceLock::new();
+static SHARED_DHT_CLIENT: OnceLock<Arc<scp_dht::InMemoryDhtClient>> = OnceLock::new();
 
 /// Returns the production DID resolver on the given bridge instance, if
 /// initialized.
@@ -744,7 +744,7 @@ pub fn did_resolver(
 /// Used by `identity_create` to publish DID documents so that the resolver
 /// can later find them during UCAN validation (#1144).
 #[must_use]
-pub fn shared_dht_client() -> Option<&'static Arc<scp_identity::InMemoryDhtClient>> {
+pub fn shared_dht_client() -> Option<&'static Arc<scp_dht::InMemoryDhtClient>> {
     SHARED_DHT_CLIENT.get()
 }
 
@@ -752,7 +752,7 @@ pub fn shared_dht_client() -> Option<&'static Arc<scp_identity::InMemoryDhtClien
 ///
 /// Called by `ensure_did_resolver_initialized` in `identity.rs`. Subsequent
 /// calls are no-ops (`OnceLock` guarantees single initialization).
-pub fn init_shared_dht_client(client: Arc<scp_identity::InMemoryDhtClient>) {
+pub fn init_shared_dht_client(client: Arc<scp_dht::InMemoryDhtClient>) {
     let _ = SHARED_DHT_CLIENT.set(client);
 }
 
@@ -937,7 +937,10 @@ pub fn init_supervisor(bi: &NapiBridgeInstance, local_did: &str) {
         return;
     }
     let did = local_did.to_owned();
-    let crypto = Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(did));
+    let crypto = Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(
+        did,
+        std::sync::Arc::new(scp_clock::SystemClock),
+    ));
     let transport = Box::new(scp_core::context::NotConfiguredTransportProvider);
     let event_log = event_log_provider_from_existing_repo(bi);
     let persistence = persistence_box_for_init(bi);
@@ -1035,6 +1038,11 @@ fn build_supervisor_arc(
     // receiver for the node webhook dispatcher (§12.10.5). The unused receiver
     // is dropped immediately; the retained sender keeps the channel open.
     let (event_tx, _rx) = tokio::sync::broadcast::channel(EVENT_CHANNEL_CAPACITY);
+    // Share the provider's exact hardened `Clock` Arc with the supervisor so the
+    // "one hardened clock per node" invariant (see the `MlsCryptoProvider::clock`
+    // field doc, ADR-057 §Prereq-1) holds by construction — the supervisor does
+    // not fabricate a second `SystemClock`. Read before `crypto` is moved below.
+    let clock = crypto.clock();
     // Wire the durable saga journal (§17.16 / ADR-049): replay loads unresolved
     // saga entries from the SAME storage backend as `mls_storage` on restart.
     scp_core::context::supervisor::Supervisor::with_providers_and_journal(
@@ -1045,7 +1053,7 @@ fn build_supervisor_arc(
         Some(persistence),
         None,
         Some(event_tx),
-        None,
+        Some(clock),
         durable,
     )
 }
@@ -1104,7 +1112,10 @@ pub fn init_supervisor_with_local_transport(bi: &NapiBridgeInstance, local_did: 
         return;
     }
     let did = local_did.to_owned();
-    let crypto = Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(did));
+    let crypto = Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(
+        did,
+        std::sync::Arc::new(scp_clock::SystemClock),
+    ));
     let transport = Box::new(scp_core::context::LocalTransportProvider);
     let event_log = event_log_provider_from_existing_repo(bi);
     let persistence = persistence_box_for_init(bi);
@@ -1166,7 +1177,10 @@ pub fn init_supervisor_with_relay_transport(
         return;
     }
     let did = local_did.to_owned();
-    let crypto = Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(did));
+    let crypto = Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(
+        did,
+        std::sync::Arc::new(scp_clock::SystemClock),
+    ));
     let transport = Box::new(scp_transport::RelayTransportProvider::new(adapter));
     let event_log = event_log_provider_from_existing_repo(bi);
     let persistence = persistence_box_for_init(bi);
@@ -1308,6 +1322,7 @@ fn init_supervisor_for_test_on_with_did(bi: &NapiBridgeInstance, local_did: &str
     let supervisor_arc = build_supervisor_arc(
         Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(
             local_did.to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
         )),
         Box::new(scp_core::context::LocalTransportProvider),
         event_log,
@@ -1354,7 +1369,7 @@ pub(crate) struct NapiIdentityEntry {
     /// enum rather than `Arc<dyn KeyCustody>`.
     pub(crate) custody: Arc<crate::custody::NapiKeyCustody>,
     /// The DID document at the time of creation (or last key rotation).
-    pub(crate) document: scp_identity::DidDocument,
+    pub(crate) document: scp_did::DidDocument,
     /// Identity link attestations (§3.5.1). Stored locally per identity.
     pub(crate) identity_link_attestations:
         Vec<scp_core::identity::attestation::IdentityLinkAttestation>,

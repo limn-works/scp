@@ -32,7 +32,7 @@ use scp_core::context::{
     Capability, ContextHandle, ContextMode, ContextParams, ContextState, MemoryScope,
 };
 use scp_core::store::ProtocolRepository;
-use scp_identity::DID;
+use scp_did::DID;
 use scp_platform::testing::InMemoryStorage;
 
 #[cfg(feature = "filesystem")]
@@ -924,7 +924,7 @@ mod mock_providers {
 
 /// Creates a mock key resolver that maps known test DIDs to verifying keys.
 fn mock_key_resolver() -> KeyResolver {
-    Arc::new(|did: &DID, _kid: scp_identity::SigningKeyId| {
+    Arc::new(|did: &DID, _kid: scp_did::SigningKeyId| {
         let did_str: &str = did.as_ref();
         match did_str {
             "did:dht:z6MkAuthor1" => {
@@ -950,8 +950,8 @@ async fn context_manager_broadcast_restore_roundtrip() {
 
     let persistence = Arc::new(InMemoryContextPersistence::new());
     let ctx_id = "ctx-manager-restore";
-    let creator_did = scp_identity::DID::from("did:dht:z6MkAuthor1");
-    let bob_did = scp_identity::DID::from("did:dht:z6MkBob");
+    let creator_did = scp_did::DID::from("did:dht:z6MkAuthor1");
+    let bob_did = scp_did::DID::from("did:dht:z6MkBob");
 
     // --- Phase 1: Create context, execute governance action, persist ---
 

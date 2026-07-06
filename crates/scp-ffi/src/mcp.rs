@@ -740,7 +740,7 @@ impl ContextProvider for FfiBridgeProvider {
                     presenting_agent_did: &self.agent_did,
                     clock_skew_tolerance_secs:
                         scp_core::crypto::ucan::validate::DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
-                    clock: &scp_primitives::SystemClock,
+                    clock: &scp_clock::SystemClock,
                 };
 
                 scp_core::context::tools::validate_tool_invocation_ucan(
@@ -877,10 +877,8 @@ impl ContextProvider for FfiBridgeProvider {
         // internally between `blocking_lock`, `block_in_place +
         // block_on`, or a dedicated `std::thread` with its own tiny
         // runtime depending on which regime the caller is in.
-        let invoker_did_typed: scp_primitives::DID = agent_did.clone().into();
-        let now_secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs());
+        let invoker_did_typed: scp_did::DID = agent_did.clone().into();
+        let now_secs = scp_clock::Clock::now_secs(&scp_clock::SystemClock);
         let supervisor = crate::runtime::supervisor(&bi).map_err(|e| format!("{e}"))?;
         if !supervisor.try_consume_hard_rate_limit_from_any_context(
             context_id,
@@ -925,7 +923,9 @@ impl ContextProvider for FfiBridgeProvider {
 
             // Clone handler Arc and output schema so we can release the lock.
             // Compute input hash before dispatch (arguments may be consumed).
-            let input_hash = scp_core::context::tools::sha256_json(&arguments);
+            let input_hash = scp_core::context::tools::sha256_json(&arguments).map_err(|e| {
+                ScpPyError::context(format!("input hash canonicalization failed: {e}"))
+            })?;
 
             Ok((
                 rt.tool_handlers
@@ -1009,6 +1009,9 @@ impl ContextProvider for FfiBridgeProvider {
             }
         };
 
+        let output_hash = scp_core::context::tools::sha256_json(&output)
+            .map_err(|e| refund(format!("output hash canonicalization failed: {e}")))?;
+
         let tool_event = scp_core::context::tools::ToolInvokedEvent {
             request_id: uuid::Uuid::new_v4().to_string(),
             tool_id: tool_name.to_owned(),
@@ -1016,17 +1019,13 @@ impl ContextProvider for FfiBridgeProvider {
             status: scp_core::context::tools::ToolStatus::Success,
             execution_time_ms: elapsed_ms,
             input_hash,
-            output_hash: Some(scp_core::context::tools::sha256_json(&output)),
+            output_hash: Some(output_hash),
             cost: None,
         };
 
         let payload_data = serde_json::to_vec(&tool_event).unwrap_or_default();
 
-        // Unix timestamp seconds fit in u64 for centuries.
-        #[allow(clippy::cast_possible_truncation)]
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs());
+        let timestamp = scp_clock::Clock::now_secs(&scp_clock::SystemClock);
 
         // Re-acquire the DashMap lock briefly to append the event.
         // Returns (sequence, serialized_event_bytes) on success for

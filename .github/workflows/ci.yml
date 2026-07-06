@@ -70,7 +70,11 @@ jobs:
               - 'crates/scp-transport/**'
               - 'crates/scp-runtime/**'
               - 'crates/scp-event-log/**'
-              - 'crates/scp-primitives/**'
+              - 'crates/scp-clock/**'
+              - 'crates/scp-crypto/**'
+              - 'crates/scp-did/**'
+              - 'crates/scp-dht/**'
+              - 'crates/scp-mls/**'
 
   # ── Error codes ───────────────────────────────────────────────────
   error-codes:
@@ -161,6 +165,25 @@ jobs:
       - run: pip install tree-sitter tree-sitter-rust
       - run: python3.12 scripts/check-protocol-sync.py
 
+  # ── Python stub parity ───────────────────────────────────────────────
+  pyi-generated:
+    needs: check-draft
+    name: Python stub signature parity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install tree-sitter tree-sitter-rust ruff
+      # Self-test MUST run first: it plants a deliberately-transposed stub
+      # parameter and proves the gate REJECTS it, before we trust it on the
+      # real tree.
+      - name: Self-test gate
+        run: bash scripts/check-pyi-generated.sh --self-test
+      - name: Real check (.pyi ↔ PyO3 signature parity)
+        run: bash scripts/check-pyi-generated.sh
+
   # ── Construction pattern (ADR-052) ──────────────────────────────────────
   construction-pattern:
     needs: check-draft
@@ -181,6 +204,7 @@ jobs:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - run: bash scripts/check-protocol-deps.sh
+      - run: bash scripts/check-no-shim-reexports.sh
 
   # ── FFI singleton enforcement (ADR-048, #1549 Phase 4) ──────────────────
   bridge-globals:
@@ -295,6 +319,21 @@ jobs:
       - uses: actions/checkout@v5
       - run: bash scripts/check-handler-no-panic.sh
 
+  no-panic-abort:
+    needs: check-draft
+    name: FFI / no panic=abort in cdylib profiles
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      # Self-test MUST run first: it plants panic = "abort" in a scratch
+      # manifest (must be DETECTED) and confirms benign lines
+      # (panic = "unwind" / the clippy lint panic = "deny" / a comment) are
+      # NOT flagged — proving the gate is alive before we trust it on the tree.
+      - name: Self-test gate
+        run: bash scripts/check-no-panic-abort.sh --self-test
+      - name: Real check
+        run: bash scripts/check-no-panic-abort.sh
+
   saga-gating-granularity:
     needs: check-draft
     name: Actor / saga gating granularity (ADR-049 §3a)
@@ -331,7 +370,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
-      - run: cargo check -p scp-protocol --target wasm32-unknown-unknown
+      - run: cargo check -p scp-clock -p scp-crypto -p scp-did -p scp-protocol -p scp-mls -p scp-client -p scp-event-log -p scp-client-wasm --target wasm32-unknown-unknown
 
   # ── Rust ────────────────────────────────────────────────────────────
   rust-fmt:
@@ -1063,6 +1102,11 @@ jobs:
       - bridge-globals
       - fallback-registry
       - handle-affinity
+      - no-panic-abort
+      - handler-no-panic
+      - saga-gating-granularity
+      - deleted-primitives
+      - bridge-instance-lifecycle
       - no-mutable-globals-rust
       - no-mutable-globals-python
       - no-mutable-globals-ts
@@ -1101,6 +1145,11 @@ jobs:
             "${{ needs.bridge-globals.result }}" \
             "${{ needs.fallback-registry.result }}" \
             "${{ needs.handle-affinity.result }}" \
+            "${{ needs.no-panic-abort.result }}" \
+            "${{ needs.handler-no-panic.result }}" \
+            "${{ needs.saga-gating-granularity.result }}" \
+            "${{ needs.deleted-primitives.result }}" \
+            "${{ needs.bridge-instance-lifecycle.result }}" \
             "${{ needs.no-mutable-globals-rust.result }}" \
             "${{ needs.no-mutable-globals-python.result }}" \
             "${{ needs.no-mutable-globals-ts.result }}" \

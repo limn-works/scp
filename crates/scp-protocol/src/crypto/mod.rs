@@ -6,7 +6,6 @@
 pub mod access_keys;
 mod bip39_wordlist;
 pub mod canonical;
-pub mod ed25519;
 pub mod envelope_seal;
 pub mod hpke;
 pub mod key_continuity;

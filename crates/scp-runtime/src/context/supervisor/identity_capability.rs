@@ -86,7 +86,7 @@
 //! security over the type system + the two compiler lints + review. See
 //! ADR-049 §5 and spec §9.4.1.
 
-use scp_identity::DID;
+use scp_did::DID;
 
 /// Proof that the bearer's identity owns this actor.
 ///

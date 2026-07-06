@@ -47,7 +47,7 @@
 //! handling), and `crate::context::supervisor::identity_capability` for
 //! the analogous capability-token discipline.
 
-use scp_identity::DID;
+use scp_did::DID;
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------

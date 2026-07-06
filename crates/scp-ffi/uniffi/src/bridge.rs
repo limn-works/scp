@@ -31,14 +31,14 @@ use std::sync::Arc;
 use sha2::Digest;
 use zeroize::Zeroizing;
 
+use scp_clock::Clock;
+#[cfg(any(test, feature = "allow_in_memory_custody"))]
+use scp_dht::InMemoryDhtClient;
+#[cfg(not(any(test, feature = "allow_in_memory_custody")))]
+use scp_dht::PkarrDhtClient;
 use scp_identity::DidCache;
 use scp_identity::IdentityError;
-#[cfg(any(test, feature = "allow_in_memory_custody"))]
-use scp_identity::InMemoryDhtClient;
-#[cfg(not(any(test, feature = "allow_in_memory_custody")))]
-use scp_identity::PkarrDhtClient;
 use scp_identity::resolver::{DualLayerResolver, NoOpRelayQuerier};
-use scp_primitives::Clock;
 
 /// DHT client type alias: production builds use [`PkarrDhtClient`] for real
 /// Mainline DHT resolution; test and `allow_in_memory_custody` builds use
@@ -64,7 +64,10 @@ macro_rules! new_ffi_dht_client {
         let result: Result<FfiDhtClient, IdentityError> = {
             #[cfg(not(any(test, feature = "allow_in_memory_custody")))]
             {
-                FfiDhtClient::new()
+                // `PkarrDhtClient::new()` yields the transport-layer `DhtError`;
+                // map it into `IdentityError` so this macro keeps a single
+                // declared error type across both build configurations.
+                FfiDhtClient::new().map_err(IdentityError::from)
             }
             #[cfg(any(test, feature = "allow_in_memory_custody"))]
             {
@@ -74,7 +77,8 @@ macro_rules! new_ffi_dht_client {
         result
     }};
 }
-use scp_identity::{DidDht, DidDocument as CoreDidDocument, DidMethod, ScpIdentity};
+use scp_did::DidDocument as CoreDidDocument;
+use scp_identity::{DidDht, DidMethod, ScpIdentity};
 use scp_platform::error::PlatformError;
 #[cfg(feature = "allow_in_memory_custody")]
 use scp_platform::testing::InMemoryKeyCustody;
@@ -119,17 +123,21 @@ fn generate_mls_key_package_bytes(did: &str) -> Result<Vec<u8>, ScpError> {
     use scp_core::crypto::mls::group::generate_key_package_with_context_params;
     use tls_codec::Serialize as TlsSerializeTrait;
 
-    let cred = ScpCredential::new(did.to_owned(), None, scp_identity::SigningKeyId::Active)
-        .map_err(|e| ScpError::Crypto {
-            msg: format!("failed to create SCP credential for MLS key package: {e}"),
-            code: codes::CRYPTO_4010.to_owned(),
+    let cred =
+        ScpCredential::new(did.to_owned(), None, scp_did::SigningKeyId::Active).map_err(|e| {
+            ScpError::Crypto {
+                msg: format!("failed to create SCP credential for MLS key package: {e}"),
+                code: codes::CRYPTO_4010.to_owned(),
+            }
         })?;
 
-    let (kp_bundle, _signer, _provider) = generate_key_package_with_context_params(&cred, None)
-        .map_err(|e| ScpError::Crypto {
-            msg: format!("MLS key package generation failed: {e}"),
-            code: codes::CRYPTO_4011.to_owned(),
-        })?;
+    let (kp_bundle, _signer, _provider) =
+        generate_key_package_with_context_params(&cred, None, &scp_clock::SystemClock).map_err(
+            |e| ScpError::Crypto {
+                msg: format!("MLS key package generation failed: {e}"),
+                code: codes::CRYPTO_4011.to_owned(),
+            },
+        )?;
 
     kp_bundle
         .key_package()
@@ -288,7 +296,7 @@ async fn snapshot_verifying_key_hex<C: KeyCustody>(custody: &C, key: &KeyHandle)
 #[allow(clippy::type_complexity)]
 fn make_dht_with_signer<C: KeyCustody + Send + Sync + 'static>(
     custody: &Arc<C>,
-) -> Result<DidDht<FfiDhtClient, scp_identity::cache::SystemClock>, IdentityError> {
+) -> Result<DidDht<FfiDhtClient, scp_clock::SystemClock>, IdentityError> {
     let custody_clone = Arc::clone(custody);
     let sign_fn: Arc<
         dyn Fn(
@@ -450,7 +458,7 @@ async fn announce_pseudonym_best_effort(
         payload: Box::new(SendPseudonymAnnouncementPayload {
             context_id: context_id.to_owned(),
             params,
-            sender_did: scp_identity::DID(identity.did.clone()),
+            sender_did: scp_did::DID(identity.did.clone()),
             signing_key: SigningKeyBytes::from_signing_key(&sk),
         }),
         reply: tx,
@@ -2002,7 +2010,7 @@ impl DataProvenance {
             counterparties: self
                 .counterparties
                 .iter()
-                .map(|s| scp_identity::DID::from(s.as_str()))
+                .map(|s| scp_did::DID::from(s.as_str()))
                 .collect(),
             purpose: self.purpose.clone(),
             discovery_method,
@@ -2394,7 +2402,7 @@ pub struct Identity {
     /// every `#[uniffi::export]` entry that accepts an `Identity`. Mismatches
     /// map to `ScpError::Permission` with code `SCP-PERM-3030`.
     pub(crate) instance_id: u64,
-    /// JSON-serialized `scp_identity::DidRotationEvent` produced when this
+    /// JSON-serialized `scp_did::DidRotationEvent` produced when this
     /// handle was minted by [`Scp::identity_migrate`]. SDK callers MUST
     /// distribute the event to active context members per spec §3.2.1
     /// step 4b. `None` for handles produced by `identity_create`,
@@ -4004,7 +4012,7 @@ fn validate_tool_ucan_uniffi(
             context_creator_did: &ucan_state.creator_did,
             presenting_agent_did: identity_did,
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
-            clock: &scp_primitives::SystemClock,
+            clock: &scp_clock::SystemClock,
         };
 
         validate_tool_invocation_ucan(ucan_token, &handle.context_id, tool_id, &mut ctx).map_err(
@@ -4587,7 +4595,7 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
                     presenting_agent_did: &agent_did,
                     clock_skew_tolerance_secs:
                         scp_core::crypto::ucan::validate::DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
-                    clock: &scp_primitives::SystemClock,
+                    clock: &scp_clock::SystemClock,
                 };
 
                 scp_core::context::tools::validate_tool_invocation_ucan(
@@ -4698,7 +4706,8 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
             )
             .map_err(|msg| format!("input validation failed for tool '{tool_name}': {msg}"))?;
 
-            let input_hash = scp_core::context::tools::sha256_json(&arguments);
+            let input_hash = scp_core::context::tools::sha256_json(&arguments)
+                .map_err(|e| format!("input hash canonicalization failed: {e}"))?;
 
             let handler_dispatch = {
                 let tool_handlers = handle.tool_handlers.blocking_lock();
@@ -4772,16 +4781,16 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
             status: scp_core::context::tools::ToolStatus::Success,
             execution_time_ms: elapsed_ms,
             input_hash,
-            output_hash: Some(scp_core::context::tools::sha256_json(&output)),
+            output_hash: Some(
+                scp_core::context::tools::sha256_json(&output)
+                    .map_err(|e| format!("output hash canonicalization failed: {e}"))?,
+            ),
             cost: None,
         };
 
         let payload_data = serde_json::to_vec(&tool_event).unwrap_or_default();
 
-        #[allow(clippy::cast_possible_truncation)]
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs());
+        let timestamp = scp_clock::Clock::now_secs(&scp_clock::SystemClock);
 
         // Ensure UCAN state is registered before appending the event.
         if let Some(handle) = context_handle_registry(&bi).get(context_id) {
@@ -5114,7 +5123,7 @@ async fn ucan_mint_impl(
             let token = scp_core::crypto::ucan::mint::mint_ucan(
                 &params,
                 &*custody,
-                &scp_primitives::SystemClock,
+                &scp_clock::SystemClock,
             )
             .await
             .map_err(ScpError::from)?;
@@ -5224,7 +5233,7 @@ async fn ucan_delegate_impl(
                 ceiling,
             };
 
-            let token = delegate_ucan(&params, &*custody, &scp_primitives::SystemClock)
+            let token = delegate_ucan(&params, &*custody, &scp_clock::SystemClock)
                 .await
                 .map_err(ScpError::from)?;
 
@@ -5293,7 +5302,7 @@ async fn event_log_checkpoint_impl(
                 &handle.ceiling_strings,
             );
 
-            let sender_did = scp_identity::DID(identity.did.clone());
+            let sender_did = scp_did::DID(identity.did.clone());
             let context_id = handle.context_id.clone();
 
             let checkpoint = bi
@@ -5418,7 +5427,7 @@ async fn event_log_checkpoint_by_did_impl(
                 &handle.ceiling_strings,
             );
 
-            let sender_did = scp_identity::DID(did);
+            let sender_did = scp_did::DID(did);
             let context_id = handle.context_id.clone();
 
             let checkpoint = bi
@@ -6225,10 +6234,7 @@ pub fn evaluate_provenance_quality(
     let provenance = source_context.map(|ctx| scp_core::provenance::DataProvenance {
         source_context: ctx,
         source_type: st,
-        counterparties: counterparties
-            .into_iter()
-            .map(scp_identity::DID::from)
-            .collect(),
+        counterparties: counterparties.into_iter().map(scp_did::DID::from).collect(),
         purpose: None,
         discovery_method: DiscoveryMethod::OutOfBand,
         age: std::time::Duration::from_secs(0),
@@ -6336,7 +6342,7 @@ pub fn trust_verify_attestation(
         })?;
 
     let resolver = scp_core::trust::IdentityDidPublicKeyResolver;
-    let clock = scp_identity::cache::SystemClock;
+    let clock = scp_clock::SystemClock;
 
     match scp_core::trust::verify_attestation(&attestation, &resolver, &clock) {
         Ok(()) => Ok(AttestationVerificationResult {
@@ -6422,7 +6428,7 @@ pub fn trust_verify_response(
         })?;
 
     let resolver = scp_core::trust::IdentityDidPublicKeyResolver;
-    let clock = scp_identity::cache::SystemClock;
+    let clock = scp_clock::SystemClock;
 
     struct EphemeralVerifySigner(ed25519_dalek::SigningKey);
     impl scp_core::trust::ChallengeSigner for EphemeralVerifySigner {
@@ -6493,7 +6499,7 @@ pub fn verify_participation_requirements(
     // failure and must not silently read as time 0, which would make every
     // participation statement appear maximally fresh and bypass `max_age_secs`.
     // Matches the SystemClock invariant used on the verify-on-ingest path.
-    let current_time = scp_primitives::Clock::now_secs(&scp_primitives::SystemClock);
+    let current_time = scp_clock::Clock::now_secs(&scp_clock::SystemClock);
 
     scp_core::trust::verify_participation_requirements(
         current_time,
@@ -6504,6 +6510,94 @@ pub fn verify_participation_requirements(
     .map_err(|e| ScpError::Validation {
         msg: format!("participation admission verification failed: {e}"),
         code: codes::VALID_7032.to_owned(),
+    })?;
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// check_capability_requirements (§7.3.4.4, SCP-ACR-008)
+// ---------------------------------------------------------------------------
+
+/// Verifies that an agent meets a context's capability requirements for
+/// admission, bound to the agent and context being admitted.
+///
+/// Inputs:
+/// - `context_id`: the context the agent is being admitted to. A challenge
+///   verification only satisfies a requirement when its signed `context_id`
+///   equals this value.
+/// - `subject_did`: the DID of the agent being admitted. Only challenge
+///   verifications whose signed `subject_did` equals this value can satisfy a
+///   requirement (cross-subject attribution is rejected).
+/// - `requirements_json`: JSON array of `CapabilityRequirement` objects.
+/// - `agent_capabilities_json`: JSON array of capability-URI strings.
+/// - `challenge_verifications_json`: JSON array of `ChallengeVerification`
+///   records; each is signature-verified and only counts if authentic,
+///   in-context, in-subject, passed, and unexpired.
+///
+/// Uses the production `IdentityDidPublicKeyResolver` for verifier-DID key
+/// resolution and the fail-closed system clock for expiry. Returns without error
+/// (unit) if all requirements are satisfied, throws `ScpError` with a diagnostic
+/// message if any requirement is unmet or if the JSON is malformed.
+///
+/// Security caveat — authenticity is not authorization: a passing
+/// `ChallengeVerified` check proves the verifier's signature is authentic and
+/// bound to this subject/context, NOT that the verifier is trusted. Establish
+/// verifier legitimacy separately (spec §7.3.4.4 / §7.4).
+///
+/// See §7.3.4.4.
+#[uniffi::export]
+pub fn check_capability_requirements(
+    context_id: String,
+    subject_did: String,
+    requirements_json: String,
+    agent_capabilities_json: String,
+    challenge_verifications_json: String,
+) -> Result<(), ScpError> {
+    // Full DID-format validation (matching the PyO3 reference bridge), not just a
+    // non-empty check, so all native bridges reject malformed ids identically.
+    validate_did(&subject_did)?;
+
+    let requirements: Vec<scp_core::trust::CapabilityRequirement> =
+        serde_json::from_str(&requirements_json).map_err(|e| ScpError::Validation {
+            msg: format!("failed to parse capability requirements JSON: {e}"),
+            code: codes::VALID_7073.to_owned(),
+        })?;
+
+    let agent_capabilities: Vec<scp_core::trust::CapabilityUri> =
+        serde_json::from_str(&agent_capabilities_json).map_err(|e| ScpError::Validation {
+            msg: format!("failed to parse agent capabilities JSON: {e}"),
+            code: codes::VALID_7074.to_owned(),
+        })?;
+
+    let challenge_verifications: Vec<scp_core::trust::ChallengeVerification> =
+        serde_json::from_str(&challenge_verifications_json).map_err(|e| ScpError::Validation {
+            msg: format!("failed to parse challenge verifications JSON: {e}"),
+            code: codes::VALID_7075.to_owned(),
+        })?;
+
+    let resolver = scp_core::trust::IdentityDidPublicKeyResolver;
+    let clock = scp_clock::SystemClock;
+
+    scp_core::trust::check_capability_requirements(
+        &requirements,
+        &agent_capabilities,
+        &challenge_verifications,
+        &context_id,
+        &subject_did,
+        &resolver,
+        &clock,
+    )
+    .map_err(|e| match e {
+        scp_core::trust::AdmissionError::EmptySubjectDid => ScpError::Validation {
+            msg: format!("capability admission verification failed: {e}"),
+            code: codes::VALID_7077.to_owned(),
+        },
+        scp_core::trust::AdmissionError::MissingCapability { .. }
+        | scp_core::trust::AdmissionError::VerificationRequired { .. } => ScpError::Validation {
+            msg: format!("capability admission verification failed: {e}"),
+            code: codes::VALID_7076.to_owned(),
+        },
     })?;
 
     Ok(())
@@ -6549,10 +6643,7 @@ fn uniffi_append_provenance_event_on(
     event_type: scp_event_log::EventType,
     provenance_hash: &[u8; 32],
 ) -> Result<(), ScpError> {
-    #[allow(clippy::cast_possible_truncation)]
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
+    let timestamp = scp_clock::Clock::now_secs(&scp_clock::SystemClock);
 
     bi.with_ucan_state(context_id, |state| {
         let sequence = scp_event_log::tree::event_count(&state.event_log);
@@ -6564,7 +6655,7 @@ fn uniffi_append_provenance_event_on(
 
         let event = scp_event_log::Event {
             event_type,
-            actor_did: scp_identity::DID::from(actor_did.to_owned()),
+            actor_did: scp_did::DID::from(actor_did.to_owned()),
             timestamp,
             sequence,
             payload: scp_event_log::EventPayload {
@@ -6785,10 +6876,7 @@ pub fn media_initiate_session(
         context_id,
         &param_caps,
         caps,
-        participants
-            .into_iter()
-            .map(scp_identity::DID::from)
-            .collect(),
+        participants.into_iter().map(scp_did::DID::from).collect(),
         timestamp,
     )
     .map_err(|e| ScpError::Context {
@@ -7500,7 +7588,7 @@ pub fn bridge_register(
         }
     })?;
 
-    let approver_did: scp_identity::DID = governance_did.into();
+    let approver_did: scp_did::DID = governance_did.into();
     let (connector, _approval_event) = scp_core::bridge::registration::approve_registration(
         &mut registry,
         &bridge_id,
@@ -8023,7 +8111,7 @@ struct UniffiBridgeTrustOracle;
 impl scp_core::context::invitation::TrustOracle for UniffiBridgeTrustOracle {
     fn satisfies_trust(
         &self,
-        inviter: &scp_identity::DID,
+        inviter: &scp_did::DID,
         requirement: &scp_core::context::policy::TrustRequirement,
     ) -> bool {
         match requirement {
@@ -8132,8 +8220,8 @@ pub(crate) fn scpid_sign_impl(
         })?;
 
     let key_handle = match key_id {
-        scp_identity::SigningKeyId::Active => core_id.active_signing_key,
-        scp_identity::SigningKeyId::Agent => {
+        scp_did::SigningKeyId::Active => core_id.active_signing_key,
+        scp_did::SigningKeyId::Agent => {
             core_id
                 .agent_signing_key
                 .ok_or_else(|| ScpError::Identity {
@@ -8247,10 +8335,10 @@ fn scpid_verify_on(
 /// Parses an SCPID signing key ID string (`"#active"` or `"#agent"`).
 // Called from `#[uniffi::export]` `scpid_sign` which the dead_code lint cannot trace.
 #[allow(dead_code)]
-fn parse_scpid_signing_key_id(s: &str) -> Result<scp_identity::SigningKeyId, ScpError> {
+fn parse_scpid_signing_key_id(s: &str) -> Result<scp_did::SigningKeyId, ScpError> {
     match s {
-        "#active" => Ok(scp_identity::SigningKeyId::Active),
-        "#agent" => Ok(scp_identity::SigningKeyId::Agent),
+        "#active" => Ok(scp_did::SigningKeyId::Active),
+        "#agent" => Ok(scp_did::SigningKeyId::Agent),
         other => Err(ScpError::Validation {
             msg: format!("invalid signing_key_id '{other}': expected '#active' or '#agent'"),
             code: codes::IDENT_1034.to_owned(),
@@ -8476,7 +8564,7 @@ pub fn metadata_record_to_json(
     let record = MetadataRecord {
         context_id,
         sequence,
-        signer_did: scp_identity::DID::from(signer_did),
+        signer_did: scp_did::DID::from(signer_did),
         timestamp,
         structural,
         operational,
@@ -9370,7 +9458,7 @@ impl Scp {
                     routing_id,
                     relay_url: None,
                     member_did: identity.did.clone(),
-                    last_seen: scp_primitives::Clock::now_secs(&scp_primitives::SystemClock),
+                    last_seen: scp_clock::Clock::now_secs(&scp_clock::SystemClock),
                 };
                 bi.core.register_known_context(&handle.context_id, known);
 
@@ -9443,7 +9531,7 @@ impl Scp {
                 bi.init_context_manager_with_did(&identity.did);
 
                 let sup = bi.context_manager_or_error()?;
-                let owning = scp_identity::DID(identity.did.clone());
+                let owning = scp_did::DID(identity.did.clone());
                 let (reservation_id, key_package_public) = sup
                     .reserve_key_package(owning)
                     .await
@@ -9660,9 +9748,9 @@ impl Scp {
                 // the vacant slot above, so this removes only our own state — never
                 // an entry another caller owns) so an errored join leaves no orphaned
                 // bridge state beside a runtime that never committed.
-                let owning = scp_identity::DID(identity.did.clone());
+                let owning = scp_did::DID(identity.did.clone());
                 let req = scp_core::context::supervisor::WelcomeJoinRequest {
-                    creator_did: scp_identity::DID(creator_did.clone()),
+                    creator_did: scp_did::DID(creator_did.clone()),
                     context_id: context_id.clone(),
                     sealed_bundle_enc,
                     sealed_bundle_ct: ciphertext,
@@ -9774,7 +9862,7 @@ impl Scp {
                     routing_id: local_pseudonym,
                     relay_url: None,
                     member_did: identity.did.clone(),
-                    last_seen: scp_primitives::Clock::now_secs(&scp_primitives::SystemClock),
+                    last_seen: scp_clock::Clock::now_secs(&scp_clock::SystemClock),
                 };
                 bi.core.register_known_context(&context_id, known);
 
@@ -9859,8 +9947,8 @@ impl Scp {
                 let outcome = sup
                     .invite_member(
                         context_id,
-                        scp_identity::DID(creator_did),
-                        scp_identity::DID(invitee_did),
+                        scp_did::DID(creator_did),
+                        scp_did::DID(invitee_did),
                         invitee_key_package,
                         relay_urls,
                         &signing_key,
@@ -10054,7 +10142,7 @@ impl Scp {
                     routing_id,
                     relay_url: None,
                     member_did: identity.did.clone(),
-                    last_seen: scp_primitives::Clock::now_secs(&scp_primitives::SystemClock),
+                    last_seen: scp_clock::Clock::now_secs(&scp_clock::SystemClock),
                 };
                 bi.core.register_known_context(&handle.context_id, known);
 
@@ -10110,7 +10198,7 @@ impl Scp {
                     .transition_to(&scp_core::context::ContextState::Active)
                     .await;
 
-                let member_did: scp_identity::DID = identity.did.clone().into();
+                let member_did: scp_did::DID = identity.did.clone().into();
                 {
                     use scp_core::context::actor::commands::{
                         LeaveContextPayload, LifecycleCommand,
@@ -10201,7 +10289,7 @@ impl Scp {
                     .transition_to(&scp_core::context::ContextState::Active)
                     .await;
 
-                let initiator_did: scp_identity::DID = identity_did.clone().into();
+                let initiator_did: scp_did::DID = identity_did.clone().into();
                 {
                     use scp_core::context::actor::commands::{
                         CloseContextPayload, LifecycleCommand,
@@ -10231,7 +10319,7 @@ impl Scp {
                 // context's memory scope and initiate the appropriate destruction
                 // path via CloseOrchestrator (#365).
                 let memory_scope = core_handle.params().memory_scope;
-                let now = scp_primitives::SystemClock.now_secs();
+                let now = scp_clock::SystemClock.now_secs();
 
                 // Build a fresh `MlsCryptoProvider` for key-destruction scoped to
                 // the initiator's DID. The bridge no longer caches a global stub
@@ -10239,8 +10327,10 @@ impl Scp {
                 // `CloseOrchestrator` only uses this provider to destroy MLS group
                 // and sender-key material for the context being closed; a fresh
                 // per-call instance is correct.
-                let crypto_provider =
-                    scp_core::crypto::mls::provider::MlsCryptoProvider::new(identity_did);
+                let crypto_provider = scp_core::crypto::mls::provider::MlsCryptoProvider::new(
+                    identity_did,
+                    std::sync::Arc::new(scp_clock::SystemClock),
+                );
                 let orchestrator =
                     scp_core::context::key_destruction::CloseOrchestrator::new(&crypto_provider);
 
@@ -10357,7 +10447,7 @@ impl Scp {
                 if let Some(core_id) = identity.core_id.as_ref() {
                     let context_id = handle.context_id.clone();
                     let sender_did_str = identity.did.clone();
-                    let now_ms = scp_primitives::SystemClock.now_millis();
+                    let now_ms = scp_clock::SystemClock.now_millis();
 
                     let params = scp_core::envelope::InnerEnvelopeParams {
                         version: scp_core::envelope::inner::SCP_INNER_ENVELOPE_VERSION,
@@ -10370,7 +10460,7 @@ impl Scp {
                         message_type: scp_core::envelope::MessageType::Content,
                         payload: &payload,
                         provenance: None,
-                        signing_key_id: scp_identity::SigningKeyId::Active,
+                        signing_key_id: scp_did::SigningKeyId::Active,
                     };
 
                     if let Some(ref cb) = handle.callback_custody {
@@ -10428,7 +10518,7 @@ impl Scp {
                         code: codes::ECON_12061.to_owned(),
                     })?;
 
-                let sender_did: scp_identity::DID = identity.did.clone().into();
+                let sender_did: scp_did::DID = identity.did.clone().into();
                 // Every send path requires a signing key; `MessageSigner` is
                 // non-optional. Fail closed with a descriptive error when the
                 // key cannot be resolved rather than handing the send path a
@@ -10679,7 +10769,7 @@ impl Scp {
                     },
                 )?;
                 let action_name = action.variant_name();
-                let did = scp_identity::DID(proposer_did);
+                let did = scp_did::DID(proposer_did);
                 let manager = bi.context_manager_or_error()?;
                 let outcome = manager
                     .propose_governance_action_checked(&context_id, &did, action, &signing_key)
@@ -10738,7 +10828,7 @@ impl Scp {
 
         let result = runtime()
             .spawn(async move {
-                let did = scp_identity::DID(voter_did);
+                let did = scp_did::DID(voter_did);
                 let sup = bi.context_manager_or_error()?;
                 let status = {
                     use scp_core::context::actor::commands::{
@@ -10809,7 +10899,7 @@ impl Scp {
 
         let result = runtime()
             .spawn(async move {
-                let did = scp_identity::DID(voter_did);
+                let did = scp_did::DID(voter_did);
                 let sup = bi.context_manager_or_error()?;
                 let status = {
                     use scp_core::context::actor::commands::{
@@ -10879,7 +10969,7 @@ impl Scp {
 
         let result = runtime()
             .spawn(async move {
-                let did = scp_identity::DID(voter_did);
+                let did = scp_did::DID(voter_did);
                 let manager = bi.context_manager_or_error()?;
                 let status = manager
                     .withdraw_governance_vote(&context_id, &proposal_id, &did)
@@ -11125,7 +11215,7 @@ impl Scp {
                     code: codes::CTX_2066.to_owned(),
                 }
             })?);
-        let did = scp_identity::DID(creator_did);
+        let did = scp_did::DID(creator_did);
 
         runtime()
             .spawn(async move {
@@ -11205,7 +11295,7 @@ impl Scp {
             );
 
         let cosignature = scp_core::context::governance::CosignedCheckpoint {
-            signer_did: scp_identity::DID(signer_did),
+            signer_did: scp_did::DID(signer_did),
             signature: (*signature).clone(),
         };
 
@@ -11456,11 +11546,8 @@ impl Scp {
         runtime()
             .spawn(async move {
                 let sup = bi.context_manager_or_error()?;
-                let did: scp_identity::DID = subscriber_did.into();
-                let timestamp = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
+                let did: scp_did::DID = subscriber_did.into();
+                let timestamp = scp_clock::Clock::now_secs(&scp_clock::SystemClock);
 
                 use scp_core::context::actor::commands::{
                     BroadcastCommand, SubscribeBroadcastPayload,
@@ -11511,7 +11598,7 @@ impl Scp {
         runtime()
             .spawn(async move {
                 let sup = bi.context_manager_or_error()?;
-                let did: scp_identity::DID = subscriber_did.into();
+                let did: scp_did::DID = subscriber_did.into();
                 use scp_core::context::actor::commands::{
                     BroadcastCommand, UnsubscribeBroadcastPayload,
                 };
@@ -11563,7 +11650,7 @@ impl Scp {
         let bi = Arc::clone(&self.inner);
         runtime()
             .spawn(async move {
-                let did: scp_identity::DID = identity.did.clone().into();
+                let did: scp_did::DID = identity.did.clone().into();
 
                 // Validate retained signing custody before depending on
                 // supervisor state, so an externally-loaded identity surfaces
@@ -11685,7 +11772,7 @@ impl Scp {
         let bi = Arc::clone(&self.inner);
         runtime()
             .spawn(async move {
-                let did: scp_identity::DID = identity.did.clone().into();
+                let did: scp_did::DID = identity.did.clone().into();
 
                 // Validate retained signing custody before depending on
                 // supervisor state, so an externally-loaded identity surfaces
@@ -11884,7 +11971,7 @@ impl Scp {
 
         runtime()
             .spawn(async move {
-                let did: scp_identity::DID = identity.did.clone().into();
+                let did: scp_did::DID = identity.did.clone().into();
 
                 // Validate retained signing custody before depending on
                 // supervisor state, so an externally-loaded identity surfaces
@@ -12073,8 +12160,8 @@ impl Scp {
         runtime()
             .spawn(async move {
                 let sup = bi.context_manager_or_error()?;
-                let subscriber: scp_identity::DID = subscriber_did.into();
-                let blocker: scp_identity::DID = blocker_did.into();
+                let subscriber: scp_did::DID = subscriber_did.into();
+                let blocker: scp_did::DID = blocker_did.into();
                 use scp_core::context::actor::commands::{BroadcastBlockPayload, BroadcastCommand};
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 let cmd = BroadcastCommand::BlockBroadcastSubscriber {
@@ -12122,8 +12209,8 @@ impl Scp {
         runtime()
             .spawn(async move {
                 let sup = bi.context_manager_or_error()?;
-                let subscriber: scp_identity::DID = subscriber_did.into();
-                let unblocker: scp_identity::DID = unblocker_did.into();
+                let subscriber: scp_did::DID = subscriber_did.into();
+                let unblocker: scp_did::DID = unblocker_did.into();
                 use scp_core::context::actor::commands::{BroadcastBlockPayload, BroadcastCommand};
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 let cmd = BroadcastCommand::UnblockBroadcastSubscriber {
@@ -12188,8 +12275,8 @@ impl Scp {
                 let context_id = handle.context_id.clone();
                 let context_id_for_seal = context_id.clone();
                 let author_did_owned = author_did.clone();
-                let author: scp_identity::DID = author_did.into();
-                let requester: scp_identity::DID = requester_did.into();
+                let author: scp_did::DID = author_did.into();
+                let requester: scp_did::DID = requester_did.into();
                 use scp_core::context::actor::commands::BroadcastCommand;
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 let cmd = BroadcastCommand::HandleBroadcastKeyRequest {
@@ -12375,11 +12462,11 @@ impl Scp {
         let report = scp_ffi_common::reconnect::reconnect_contexts_no_drain(
             &transport,
             supervisor,
-            scp_identity::DID(identity.did.clone()),
+            scp_did::DID(identity.did.clone()),
             signing_key_bytes,
             context_ids,
             last_relay_contacts,
-            scp_primitives::Clock::now_secs(&scp_primitives::SystemClock),
+            scp_clock::Clock::now_secs(&scp_clock::SystemClock),
             scp_core::sync::SyncPolicy::default(),
         )
         .await;
@@ -12567,7 +12654,11 @@ impl Scp {
                 let tool_id = format!("tool-{}", definition.name.replace(' ', "-").to_lowercase());
 
                 let cost = definition.cost.map(|c| scp_core::context::tools::ToolCost {
-                    amount: c.amount,
+                    // ADR-060: `ToolCost.amount` is the `Amount` newtype. UniFFI
+                    // carries it as a native `u64` (Swift `UInt64` / Kotlin
+                    // `ULong`), which represents the full smallest-unit range
+                    // exactly.
+                    amount: scp_core::economy::Amount(c.amount),
                     currency: c.currency,
                     payee: c.payee.into(),
                     cost_formula: c.cost_formula,
@@ -12585,9 +12676,7 @@ impl Scp {
                     test_vectors,
                     operator_did: definition.operator_did.into(),
                     cost,
-                    registered_at: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map_or(0, |d| d.as_secs()),
+                    registered_at: scp_clock::Clock::now_secs(&scp_clock::SystemClock),
                     signature: Vec::new(),
                 };
 
@@ -12598,7 +12687,7 @@ impl Scp {
                     &handle.creator_did,
                     ceiling,
                     vec![],
-                    &scp_primitives::SystemClock,
+                    &scp_clock::SystemClock,
                 )
                 .map_err(|e| ScpError::Tool {
                     msg: format!("failed to create role state: {e}"),
@@ -12766,7 +12855,7 @@ impl Scp {
                 };
 
                 let manager = bi.context_manager_expect()?;
-                let invoker_did_typed: scp_primitives::DID = identity.did.clone().into();
+                let invoker_did_typed: scp_did::DID = identity.did.clone().into();
                 let tool_id_typed = scp_core::context::tools::ToolId::from(tool_id.as_str());
                 let outcome = manager
                     .invoke_tool_with_economy(
@@ -13207,7 +13296,7 @@ impl Scp {
                 let request = CrossContextToolInvocationRequest {
                     caller_context_id: caller_context_bytes,
                     target_context_id: target_context_bytes,
-                    caller_did: scp_identity::DID(caller_did),
+                    caller_did: scp_did::DID(caller_did),
                     tool_registration_id,
                     ucan_proof_id,
                     input: input_value,
@@ -13293,7 +13382,7 @@ impl Scp {
                 }
 
                 let session_id = Uuid::new_v4().to_string();
-                let now_ms = scp_primitives::SystemClock.now_millis();
+                let now_ms = scp_clock::SystemClock.now_millis();
 
                 let session = scp_core::context::tools::ToolSession {
                     session_id: session_id.clone(),
@@ -13380,7 +13469,7 @@ impl Scp {
                 })?;
 
                 // Check expiry.
-                let now_ms = scp_primitives::SystemClock.now_millis();
+                let now_ms = scp_clock::SystemClock.now_millis();
                 if session.is_expired(now_ms) {
                     store.remove(&session_id);
                     return Err(ScpError::Tool {
@@ -13536,7 +13625,7 @@ impl Scp {
                     &handle.creator_did,
                     ceiling,
                     vec![],
-                    &scp_primitives::SystemClock,
+                    &scp_clock::SystemClock,
                 )
                 .map_err(|e| ScpError::Tool {
                     msg: format!("failed to create role state: {e}"),
@@ -13616,7 +13705,7 @@ impl Scp {
                     &handle.creator_did,
                     ceiling,
                     vec![],
-                    &scp_primitives::SystemClock,
+                    &scp_clock::SystemClock,
                 )
                 .map_err(|e| ScpError::Tool {
                     msg: format!("failed to create role state: {e}"),
@@ -13681,7 +13770,7 @@ impl Scp {
                     code: codes::VALID_7042.to_owned(),
                 })?;
 
-                let now_ms = scp_primitives::SystemClock.now_millis();
+                let now_ms = scp_clock::SystemClock.now_millis();
 
                 let event = scp_core::context::tools::interface::revoke_tool_interface(
                     interface_id,
@@ -13859,7 +13948,7 @@ impl Scp {
         runtime()
             .spawn(async move {
                 let sup = bi.context_manager_or_error()?;
-                let did: scp_identity::DID = member_did.into();
+                let did: scp_did::DID = member_did.into();
                 let duration = std::time::Duration::from_secs(proposed_seconds);
                 use scp_core::context::actor::commands::TtlCloseCommand;
                 let (tx, rx) = tokio::sync::oneshot::channel();
@@ -13984,7 +14073,7 @@ impl Scp {
 
                 // Pre-compute timestamp for the fallback summary event outside the
                 // closure so we can propagate clock errors properly.
-                let fallback_now = scp_primitives::SystemClock.now_secs();
+                let fallback_now = scp_clock::SystemClock.now_secs();
 
                 // First, try the ContextManager's event log provider — the
                 // authoritative source populated by `create_context`
@@ -14545,7 +14634,7 @@ impl Scp {
                             context_creator_did: &ucan_state.creator_did,
                             presenting_agent_did: agent_did,
                             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
-                            clock: &scp_primitives::SystemClock,
+                            clock: &scp_clock::SystemClock,
                         };
 
                         validate_ucan(&parsed_token, &required_cap, &mut ctx).map_err(|e| {
@@ -14703,7 +14792,7 @@ impl Scp {
                             context_creator_did: &ucan_state.creator_did,
                             presenting_agent_did: agent_did,
                             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
-                            clock: &scp_primitives::SystemClock,
+                            clock: &scp_clock::SystemClock,
                         };
 
                         evaluate_ucan(&parsed_token, required_cap.as_ref(), &ctx)
@@ -15575,7 +15664,7 @@ impl Scp {
         let Ok(manager) = self.inner.context_manager_expect() else {
             return false;
         };
-        let did_ref: scp_identity::DID = did.into();
+        let did_ref: scp_did::DID = did.into();
         manager.is_local_did(&did_ref).await.unwrap_or(false)
     }
 
@@ -15847,7 +15936,7 @@ impl Scp {
             })?;
 
         let resolver = scp_core::trust::IdentityDidPublicKeyResolver;
-        let clock = scp_identity::cache::SystemClock;
+        let clock = scp_clock::SystemClock;
 
         struct EphemeralVerifySigner(ed25519_dalek::SigningKey);
         impl scp_core::trust::ChallengeSigner for EphemeralVerifySigner {
@@ -16169,7 +16258,7 @@ impl Scp {
                     // creation. Generating a fresh key here would break
                     // `verify_migration`'s SHA-256(revealed) == commitment
                     // invariant.
-                    let rotated_at = scp_primitives::SystemClock.now_secs();
+                    let rotated_at = scp_clock::SystemClock.now_secs();
 
                     // `migrate_identity` calls `publish_document` for the old
                     // and new DID documents — both BEP44 puts require a
@@ -16256,7 +16345,7 @@ impl Scp {
                     // its handle satisfies the SHA-256(revealed) ==
                     // commitment invariant. Callback custody MUST surface
                     // the same handle on resume.
-                    let rotated_at = scp_primitives::SystemClock.now_secs();
+                    let rotated_at = scp_clock::SystemClock.now_secs();
 
                     // `migrate_identity` calls `publish_document` for the old
                     // and new DID documents — both BEP44 puts require a
@@ -16478,7 +16567,7 @@ impl Scp {
             RecoveryBackend, RecoveryStepError, active_key_rotation_outcome,
             agent_key_rotation_outcome,
         };
-        use scp_identity::DID;
+        use scp_did::DID;
 
         validate_did(&did)?;
         let did_val = DID::from(did.as_str());
@@ -16497,7 +16586,7 @@ impl Scp {
             }
         };
 
-        let now_ms = scp_primitives::SystemClock.now_millis();
+        let now_ms = scp_clock::SystemClock.now_millis();
 
         let key_rotation = match compromise_tier {
             CompromiseTier::Agent => agent_key_rotation_outcome(&did_val, now_ms),
@@ -16561,7 +16650,7 @@ impl Scp {
                 &contacts,
                 None,
                 &backend,
-                &scp_primitives::SystemClock,
+                &scp_clock::SystemClock,
             ))
             .map_err(|e| ScpError::Identity {
                 msg: format!("recovery failed: {e}"),
@@ -16585,7 +16674,7 @@ impl Scp {
             CustodyMigrationBackend, CustodyMigrationOrchestrator, CustodyMigrationRequest,
             CustodyMigrationTarget,
         };
-        use scp_identity::DID;
+        use scp_did::DID;
 
         validate_did(&did)?;
         let did_val = DID::from(did.as_str());
@@ -16658,7 +16747,7 @@ impl Scp {
         let rt = crate::runtime();
 
         let result = rt
-            .block_on(orchestrator.execute(&backend, &scp_primitives::SystemClock))
+            .block_on(orchestrator.execute(&backend, &scp_clock::SystemClock))
             .map_err(|e| ScpError::Identity {
                 msg: format!("custody migration failed: {e}"),
                 code: codes::IDENT_1025.to_owned(),
@@ -16712,7 +16801,7 @@ impl Scp {
             context_id: source_context_id.clone(),
             source_type: st,
             memory_scope: ms,
-            members: members.into_iter().map(scp_identity::DID::from).collect(),
+            members: members.into_iter().map(scp_did::DID::from).collect(),
             discovery_method: scp_core::provenance::DiscoveryMethod::OutOfBand,
             data_age: std::time::Duration::from_secs(0),
             purpose: None,
@@ -16743,12 +16832,17 @@ impl Scp {
             None,
         );
 
-        // Compute provenance hash: SHA-256 of JSON-serialized provenance record.
-        let prov_json_bytes = serde_json::to_vec(&prov).map_err(|e| ScpError::Validation {
+        // Compute provenance hash: SHA-256 of the MessagePack-serialized
+        // provenance record (§24.3.3). Uses the same `rmp_serde::to_vec`
+        // encoding as the signed broadcast path
+        // (`scp_protocol::crypto::sender_keys::broadcast::compute_provenance_hash`)
+        // and the event-log leaf, so the logged hash matches the signed-path
+        // hash for identical input.
+        let prov_bytes = rmp_serde::to_vec(&prov).map_err(|e| ScpError::Validation {
             msg: format!("failed to serialize provenance for hashing: {e}"),
             code: codes::VALID_7053.to_owned(),
         })?;
-        let prov_hash: [u8; 32] = sha2::Sha256::digest(&prov_json_bytes).into();
+        let prov_hash: [u8; 32] = sha2::Sha256::digest(&prov_bytes).into();
 
         // Record ProvenanceAttached in the source context event log.
         if let Err(e) = uniffi_append_provenance_event_on(
@@ -16823,7 +16917,7 @@ impl Scp {
                     code: codes::VALID_7112.to_owned(),
                 })?;
         let map = guard.entry(owner_did).or_default();
-        map.set_petname(scp_identity::DID::from(target_did.as_str()), name);
+        map.set_petname(scp_did::DID::from(target_did.as_str()), name);
         Ok(())
     }
 
@@ -16840,7 +16934,7 @@ impl Scp {
                     code: codes::VALID_7112.to_owned(),
                 })?;
         if let Some(map) = guard.get_mut(&owner_did) {
-            map.remove_petname(&scp_identity::DID::from(target_did.as_str()));
+            map.remove_petname(&scp_did::DID::from(target_did.as_str()));
         }
         Ok(())
     }
@@ -16965,7 +17059,7 @@ impl Scp {
                 code: codes::VALID_7112.to_owned(),
             })?;
         Ok(guard.get(&owner_did).and_then(|map| {
-            map.petname_for_did(&scp_identity::DID::from(target_did.as_str()))
+            map.petname_for_did(&scp_did::DID::from(target_did.as_str()))
                 .map(str::to_owned)
         }))
     }
@@ -17103,8 +17197,8 @@ impl Scp {
             .or_insert_with(|| scp_core::discovery::HandleRegistry::new(discovery_context_id));
         let result = registry.register(
             &params,
-            &scp_identity::DID::from(registrant_did.as_str()),
-            &scp_primitives::SystemClock,
+            &scp_did::DID::from(registrant_did.as_str()),
+            &scp_clock::SystemClock,
         );
         serde_json::to_string(&result).map_err(|e| ScpError::Validation {
             msg: format!("failed to serialize handle register result: {e}"),
@@ -17177,7 +17271,7 @@ impl Scp {
             |registry| {
                 registry.deregister(&scp_core::discovery::HandleDeregisterParams {
                     handle,
-                    did: scp_identity::DID::from(did.as_str()),
+                    did: scp_did::DID::from(did.as_str()),
                 })
             },
         );
@@ -17246,8 +17340,8 @@ impl Scp {
         let result = registry
             .register(
                 &params,
-                &scp_identity::DID::from(registrant_did.as_str()),
-                &scp_primitives::SystemClock,
+                &scp_did::DID::from(registrant_did.as_str()),
+                &scp_clock::SystemClock,
             )
             .map_err(|e| ScpError::Validation {
                 msg: format!("scope registration failed: {e}"),
@@ -17316,7 +17410,7 @@ impl Scp {
             Some(registry) => registry
                 .deregister(&scp_core::discovery::ScopeDeregisterParams {
                     name,
-                    did: scp_identity::DID::from(did.as_str()),
+                    did: scp_did::DID::from(did.as_str()),
                 })
                 .map_err(|e| ScpError::Validation {
                     msg: format!("scope deregister failed: {e}"),
@@ -17398,7 +17492,7 @@ impl Scp {
                         &querier,
                         &known_contexts,
                         &known_domains,
-                        &scp_primitives::SystemClock,
+                        &scp_clock::SystemClock,
                     )
                     .await
                     .map_err(|e| ScpError::Validation {
@@ -17427,7 +17521,7 @@ impl Scp {
         did: String,
     ) -> Result<u64, ScpError> {
         validate_did(&did)?;
-        let member_did = scp_identity::DID::from(did.as_str());
+        let member_did = scp_did::DID::from(did.as_str());
         let remaining = self
             .inner
             .core
@@ -17443,7 +17537,7 @@ impl Scp {
         amount: u64,
     ) -> Result<(), ScpError> {
         validate_did(&did)?;
-        let member_did = scp_identity::DID::from(did.as_str());
+        let member_did = scp_did::DID::from(did.as_str());
         self.inner
             .core
             .with_economy_budget_mut(&context_id, |tracker| {
@@ -17460,7 +17554,7 @@ impl Scp {
         amount: u64,
     ) -> Result<(), ScpError> {
         validate_did(&did)?;
-        let member_did = scp_identity::DID::from(did.as_str());
+        let member_did = scp_did::DID::from(did.as_str());
         self.inner
             .core
             .with_economy_budget_mut(&context_id, |tracker| {
@@ -17483,7 +17577,7 @@ impl Scp {
         timestamp: u64,
     ) -> Result<(), ScpError> {
         validate_did(&sender_did)?;
-        let did = scp_identity::DID::from(sender_did.as_str());
+        let did = scp_did::DID::from(sender_did.as_str());
         self.inner
             .core
             .with_economy_antispam(&context_id, |tracker| {
@@ -17500,7 +17594,7 @@ impl Scp {
         now: u64,
     ) -> Result<u64, ScpError> {
         validate_did(&sender_did)?;
-        let did = scp_identity::DID::from(sender_did.as_str());
+        let did = scp_did::DID::from(sender_did.as_str());
         let velocity = self
             .inner
             .core
@@ -17537,7 +17631,7 @@ impl Scp {
                 .collect(),
         };
 
-        let did = scp_identity::DID::from(sender_did.as_str());
+        let did = scp_did::DID::from(sender_did.as_str());
         let cost = self
             .inner
             .core
@@ -17708,7 +17802,7 @@ impl Scp {
                 let export = manager
                     .export_context(
                         &ctx_id,
-                        scp_identity::DID::from(creator_did),
+                        scp_did::DID::from(creator_did),
                         |hash: &[u8; 32]| {
                             tokio::task::block_in_place(|| {
                                 rt.block_on(sign_export_snapshot_via_custody(&handle, hash))
@@ -17912,7 +18006,7 @@ impl Scp {
         };
 
         let oracle = UniffiBridgeTrustOracle;
-        let inviter = scp_identity::DID::from(inviter_did.as_str());
+        let inviter = scp_did::DID::from(inviter_did.as_str());
 
         let decision = self
             .inner
@@ -17924,7 +18018,7 @@ impl Scp {
                     spending.as_ref(),
                     &oracle,
                     tracker,
-                    &scp_core::time::SystemClock,
+                    &scp_clock::SystemClock,
                 )
             });
 
@@ -18573,6 +18667,59 @@ mod tests {
         );
     }
 
+    /// Extracts the structured code from a `Validation` error, or a
+    /// diagnostic string for any other variant, so cross-bridge parity tests
+    /// can `assert_eq!` on the exact per-case `SCP-VALID-*` code the
+    /// PyO3/NAPI bridges assert for the same logical failure.
+    fn validation_code(err: &ScpError) -> String {
+        match err {
+            ScpError::Validation { code, .. } => code.clone(),
+            other => format!("non-validation error: {other:?}"),
+        }
+    }
+
+    // -- trust helper free functions (ADR-017 Layer 3) --
+
+    #[test]
+    fn trust_query_score_rejects_empty_did_with_code() {
+        let result = trust_query_score(String::new(), "ctx-1".to_owned());
+        assert_eq!(validation_code(&result.unwrap_err()), codes::VALID_7010);
+    }
+
+    #[test]
+    fn trust_query_score_rejects_empty_context_with_code() {
+        let result = trust_query_score("did:key:test".to_owned(), String::new());
+        assert_eq!(validation_code(&result.unwrap_err()), codes::VALID_7011);
+    }
+
+    #[test]
+    fn trust_verify_attestation_rejects_invalid_json_with_code() {
+        let result = trust_verify_attestation("not json".to_owned());
+        assert_eq!(validation_code(&result.unwrap_err()), codes::VALID_7012);
+    }
+
+    #[test]
+    fn trust_create_challenge_rejects_empty_did_with_code() {
+        let result = trust_create_challenge(String::new());
+        assert_eq!(validation_code(&result.unwrap_err()), codes::VALID_7013);
+    }
+
+    #[test]
+    fn trust_verify_response_rejects_invalid_challenge_json_with_code() {
+        // Malformed JSON in the CHALLENGE position.
+        let result = trust_verify_response("bad".to_owned(), "bad".to_owned());
+        assert_eq!(validation_code(&result.unwrap_err()), codes::VALID_7016);
+    }
+
+    #[test]
+    fn trust_verify_response_rejects_invalid_response_json_with_code() {
+        // Malformed JSON in the RESPONSE position: the challenge parses, so
+        // the failure is attributed to the response argument.
+        let challenge = trust_create_challenge("did:key:target".to_owned()).unwrap();
+        let result = trust_verify_response(challenge.challenge_json, "bad".to_owned());
+        assert_eq!(validation_code(&result.unwrap_err()), codes::VALID_7017);
+    }
+
     #[test]
     fn participation_record_rejects_empty_context() {
         let scp = scp_test();
@@ -18596,7 +18743,7 @@ mod tests {
             "did:key:test".to_owned(),
             "not json".to_owned(),
         );
-        assert!(result.is_err());
+        assert_eq!(validation_code(&result.unwrap_err()), codes::VALID_7059);
     }
 
     #[test]
@@ -18613,7 +18760,7 @@ mod tests {
     fn verify_participation_requirements_rejects_empty_subject() {
         let result =
             verify_participation_requirements(String::new(), "[]".to_owned(), "[]".to_owned());
-        assert!(result.is_err());
+        assert_eq!(validation_code(&result.unwrap_err()), codes::VALID_7000);
     }
 
     #[test]
@@ -18624,6 +18771,421 @@ mod tests {
             "not-a-did".to_owned(),
             "[]".to_owned(),
             "[]".to_owned(),
+        );
+        assert_eq!(validation_code(&result.unwrap_err()), codes::VALID_7000);
+    }
+
+    #[test]
+    fn verify_participation_requirements_rejects_invalid_requirements_json() {
+        // Malformed JSON in the REQUIREMENTS position (2nd arg).
+        let result = verify_participation_requirements(
+            "did:key:alice".to_owned(),
+            "not json".to_owned(),
+            "[]".to_owned(),
+        );
+        assert_eq!(validation_code(&result.unwrap_err()), codes::VALID_7031);
+    }
+
+    #[test]
+    fn verify_participation_requirements_rejects_invalid_profile_json() {
+        // Malformed JSON in the PROFILE position (3rd arg).
+        let result = verify_participation_requirements(
+            "did:key:alice".to_owned(),
+            "[]".to_owned(),
+            "not json".to_owned(),
+        );
+        assert_eq!(validation_code(&result.unwrap_err()), codes::VALID_7030);
+    }
+
+    #[test]
+    fn verify_participation_requirements_unmet_requirement_fails_with_admission_code() {
+        // A requirement with no satisfying profiles fails the admission check
+        // itself (not JSON parsing), which carries its own per-case code.
+        let requirements = r#"[{"fact":"ParticipationDuration","threshold":{"AtLeast":1},"max_age_secs":3600,"min_contexts":0}]"#;
+        let result = verify_participation_requirements(
+            "did:key:alice".to_owned(),
+            requirements.to_owned(),
+            "[]".to_owned(),
+        );
+        assert_eq!(validation_code(&result.unwrap_err()), codes::VALID_7032);
+    }
+
+    // -- aggregate_trust_input (§7.3) per-case codes --
+
+    #[allow(clippy::too_many_arguments)]
+    fn aggregate_on_test_scp(
+        context_id: &str,
+        subject_did: &str,
+        events_json: &str,
+        merkle_root_json: &str,
+        consequence_rules_json: &str,
+        threshold_requirements_json: &str,
+        attestor_sets_json: &str,
+        cached_attestations_json: &str,
+        challenge_results_json: &str,
+    ) -> Result<String, ScpError> {
+        scp_test().aggregate_trust_input(
+            context_id.to_owned(),
+            subject_did.to_owned(),
+            events_json.to_owned(),
+            merkle_root_json.to_owned(),
+            consequence_rules_json.to_owned(),
+            threshold_requirements_json.to_owned(),
+            attestor_sets_json.to_owned(),
+            cached_attestations_json.to_owned(),
+            challenge_results_json.to_owned(),
+        )
+    }
+
+    const TEST_MERKLE_ROOT_JSON: &str =
+        "[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]";
+
+    #[test]
+    fn aggregate_trust_input_rejects_empty_context_with_code() {
+        let result = aggregate_on_test_scp(
+            "",
+            "did:key:test",
+            "[]",
+            TEST_MERKLE_ROOT_JSON,
+            "[]",
+            "{}",
+            "{}",
+            "[]",
+            "[]",
+        );
+        assert_eq!(validation_code(&result.unwrap_err()), codes::VALID_7040);
+    }
+
+    #[test]
+    fn aggregate_trust_input_rejects_empty_did_with_code() {
+        let result = aggregate_on_test_scp(
+            "ctx-1",
+            "",
+            "[]",
+            TEST_MERKLE_ROOT_JSON,
+            "[]",
+            "{}",
+            "{}",
+            "[]",
+            "[]",
+        );
+        assert_eq!(validation_code(&result.unwrap_err()), codes::VALID_7041);
+    }
+
+    #[test]
+    fn aggregate_trust_input_rejects_invalid_events_json_with_code() {
+        let result = aggregate_on_test_scp(
+            "ctx-1",
+            "did:key:test",
+            "not json",
+            TEST_MERKLE_ROOT_JSON,
+            "[]",
+            "{}",
+            "{}",
+            "[]",
+            "[]",
+        );
+        assert_eq!(validation_code(&result.unwrap_err()), codes::VALID_7042);
+    }
+
+    #[test]
+    fn aggregate_trust_input_rejects_invalid_merkle_root_json_with_code() {
+        let result = aggregate_on_test_scp(
+            "ctx-1",
+            "did:key:test",
+            "[]",
+            "not json",
+            "[]",
+            "{}",
+            "{}",
+            "[]",
+            "[]",
+        );
+        assert_eq!(validation_code(&result.unwrap_err()), codes::VALID_7043);
+    }
+
+    #[test]
+    fn aggregate_trust_input_rejects_wrong_length_merkle_root_with_code() {
+        let result = aggregate_on_test_scp(
+            "ctx-1",
+            "did:key:test",
+            "[]",
+            "[0,0,0]",
+            "[]",
+            "{}",
+            "{}",
+            "[]",
+            "[]",
+        );
+        assert_eq!(validation_code(&result.unwrap_err()), codes::VALID_7044);
+    }
+
+    #[test]
+    fn aggregate_trust_input_rejects_invalid_consequence_rules_json_with_code() {
+        let result = aggregate_on_test_scp(
+            "ctx-1",
+            "did:key:test",
+            "[]",
+            TEST_MERKLE_ROOT_JSON,
+            "not json",
+            "{}",
+            "{}",
+            "[]",
+            "[]",
+        );
+        assert_eq!(validation_code(&result.unwrap_err()), codes::VALID_7045);
+    }
+
+    #[test]
+    fn aggregate_trust_input_rejects_invalid_threshold_requirements_json_with_code() {
+        let result = aggregate_on_test_scp(
+            "ctx-1",
+            "did:key:test",
+            "[]",
+            TEST_MERKLE_ROOT_JSON,
+            "[]",
+            "not json",
+            "{}",
+            "[]",
+            "[]",
+        );
+        assert_eq!(validation_code(&result.unwrap_err()), codes::VALID_7046);
+    }
+
+    #[test]
+    fn aggregate_trust_input_rejects_invalid_attestor_sets_json_with_code() {
+        let result = aggregate_on_test_scp(
+            "ctx-1",
+            "did:key:test",
+            "[]",
+            TEST_MERKLE_ROOT_JSON,
+            "[]",
+            "{}",
+            "not json",
+            "[]",
+            "[]",
+        );
+        assert_eq!(validation_code(&result.unwrap_err()), codes::VALID_7047);
+    }
+
+    #[test]
+    fn aggregate_trust_input_rejects_invalid_cached_attestations_json_with_code() {
+        let result = aggregate_on_test_scp(
+            "ctx-1",
+            "did:key:test",
+            "[]",
+            TEST_MERKLE_ROOT_JSON,
+            "[]",
+            "{}",
+            "{}",
+            "not json",
+            "[]",
+        );
+        assert_eq!(validation_code(&result.unwrap_err()), codes::VALID_7048);
+    }
+
+    #[test]
+    fn aggregate_trust_input_rejects_invalid_challenge_results_json_with_code() {
+        let result = aggregate_on_test_scp(
+            "ctx-1",
+            "did:key:test",
+            "[]",
+            TEST_MERKLE_ROOT_JSON,
+            "[]",
+            "{}",
+            "{}",
+            "[]",
+            "not json",
+        );
+        assert_eq!(validation_code(&result.unwrap_err()), codes::VALID_7049);
+    }
+
+    // -- check_capability_requirements (§7.3.4.4, SCP-ACR-008) --
+
+    #[test]
+    fn check_capability_requirements_rejects_invalid_requirements_json() {
+        let result = check_capability_requirements(
+            "ctx-1".to_owned(),
+            "did:key:alice".to_owned(),
+            "not json".to_owned(),
+            "[]".to_owned(),
+            "[]".to_owned(),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn check_capability_requirements_rejects_invalid_capabilities_json() {
+        let result = check_capability_requirements(
+            "ctx-1".to_owned(),
+            "did:key:alice".to_owned(),
+            "[]".to_owned(),
+            "not json".to_owned(),
+            "[]".to_owned(),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn check_capability_requirements_rejects_invalid_verifications_json() {
+        let result = check_capability_requirements(
+            "ctx-1".to_owned(),
+            "did:key:alice".to_owned(),
+            "[]".to_owned(),
+            "[]".to_owned(),
+            "not json".to_owned(),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn check_capability_requirements_empty_inputs_succeeds() {
+        let result = check_capability_requirements(
+            "ctx-1".to_owned(),
+            "did:key:alice".to_owned(),
+            "[]".to_owned(),
+            "[]".to_owned(),
+            "[]".to_owned(),
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn check_capability_requirements_rejects_empty_subject() {
+        let result = check_capability_requirements(
+            "ctx-1".to_owned(),
+            String::new(),
+            "[]".to_owned(),
+            "[]".to_owned(),
+            "[]".to_owned(),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn check_capability_requirements_rejects_malformed_subject() {
+        let result = check_capability_requirements(
+            "ctx-1".to_owned(),
+            "not-a-did".to_owned(),
+            "[]".to_owned(),
+            "[]".to_owned(),
+            "[]".to_owned(),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn check_capability_requirements_self_attested_present_succeeds() {
+        let requirements = r#"[{"capability":"scp:capability:schema-validation/v1","verification_level":"SelfAttested"}]"#;
+        let capabilities = r#"["scp:capability:schema-validation/v1"]"#;
+        let result = check_capability_requirements(
+            "ctx-1".to_owned(),
+            "did:key:alice".to_owned(),
+            requirements.to_owned(),
+            capabilities.to_owned(),
+            "[]".to_owned(),
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn check_capability_requirements_self_attested_missing_fails() {
+        let requirements = r#"[{"capability":"scp:capability:schema-validation/v1","verification_level":"SelfAttested"}]"#;
+        let result = check_capability_requirements(
+            "ctx-1".to_owned(),
+            "did:key:alice".to_owned(),
+            requirements.to_owned(),
+            "[]".to_owned(),
+            "[]".to_owned(),
+        );
+        assert!(result.is_err());
+    }
+
+    /// Builds a genuinely verifier-signed `ChallengeVerification` JSON array
+    /// bound to `subject_did`/`context_id`, far-future expiry, verifier DID
+    /// derived from a fixed key (did:dht:z, offline-resolvable by the production
+    /// `IdentityDidPublicKeyResolver`).
+    fn signed_cv_json(uri: &str, subject_did: &str, context_id: &str) -> String {
+        use ed25519_dalek::{Signer, SigningKey};
+
+        let verifier_key = SigningKey::from_bytes(&[9u8; 32]);
+        let verifier_pub = verifier_key.verifying_key().to_bytes();
+        let verifier_did = scp_did::did_dht_from_public_key(&verifier_pub);
+        let cap: scp_core::trust::CapabilityUri = uri.parse().unwrap();
+
+        let mut cv = scp_core::trust::ChallengeVerification {
+            verification_id: "bridge-test-challenge".to_owned(),
+            verifier_did,
+            subject_did: subject_did.into(),
+            capability_uri: uri.to_owned(),
+            challenge_type: scp_core::trust::ChallengeType::Uri(cap.clone()),
+            verification_method: scp_core::trust::VerificationMethod::ChallengeVerified {
+                challenge_type: scp_core::trust::ChallengeType::Uri(cap),
+            },
+            passed: true,
+            score: None,
+            test_count: 1,
+            pass_count: 1,
+            result: serde_json::Value::Bool(true),
+            completed_at: 1_700_000_000,
+            verified_at: 1_700_000_000,
+            expires_at: 4_000_000_000,
+            context_id: Some(context_id.to_owned()),
+            verifier_signature: Vec::new(),
+        };
+        let canonical = scp_core::trust::canonical_challenge_verification_bytes(&cv).unwrap();
+        cv.verifier_signature = verifier_key.sign(&canonical).to_bytes().to_vec();
+        serde_json::to_string(&vec![cv]).unwrap()
+    }
+
+    #[test]
+    fn check_capability_requirements_challenge_verified_happy_path() {
+        let uri = "scp:capability:prompt-injection-resistance/v1";
+        let subject = "did:dht:zResponder";
+        let ctx = "ctx-admission";
+        let requirements =
+            format!(r#"[{{"capability":"{uri}","verification_level":"ChallengeVerified"}}]"#);
+        let cvs = signed_cv_json(uri, subject, ctx);
+        let result = check_capability_requirements(
+            ctx.to_owned(),
+            subject.to_owned(),
+            requirements,
+            "[]".to_owned(),
+            cvs,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn check_capability_requirements_rejects_cross_subject_replay() {
+        let uri = "scp:capability:prompt-injection-resistance/v1";
+        let ctx = "ctx-admission";
+        let requirements =
+            format!(r#"[{{"capability":"{uri}","verification_level":"ChallengeVerified"}}]"#);
+        let cvs = signed_cv_json(uri, "did:dht:zVictim", ctx);
+        let result = check_capability_requirements(
+            ctx.to_owned(),
+            "did:dht:zAttacker".to_owned(),
+            requirements,
+            "[]".to_owned(),
+            cvs,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn check_capability_requirements_rejects_cross_context_replay() {
+        let uri = "scp:capability:prompt-injection-resistance/v1";
+        let subject = "did:dht:zResponder";
+        let requirements =
+            format!(r#"[{{"capability":"{uri}","verification_level":"ChallengeVerified"}}]"#);
+        let cvs = signed_cv_json(uri, subject, "ctx-other");
+        let result = check_capability_requirements(
+            "ctx-admission".to_owned(),
+            subject.to_owned(),
+            requirements,
+            "[]".to_owned(),
+            cvs,
         );
         assert!(result.is_err());
     }
@@ -19063,7 +19625,7 @@ mod tests {
         assert!(result.is_none());
 
         // Direct set always rejects.
-        let json = r#"{"locked":false,"cost_schedule":{"currency":[85,83,68,0],"per_message":null,"per_tool_invoke":100,"per_join":null,"per_period":null,"per_byte_stored":null},"payment_adapters":[],"pricing_formula":null,"payee":"did:dht:z6MkTest"}"#;
+        let json = r#"{"locked":false,"cost_schedule":{"currency":[85,83,68,0],"per_message":null,"per_tool_invoke":"100","per_join":null,"per_period":null,"per_byte_stored":null},"payment_adapters":[],"pricing_formula":null,"payee":"did:dht:z6MkTest"}"#;
         let result = scp.set_economic_policy(Arc::clone(&handle), json.to_owned());
         assert!(
             result.is_err(),
@@ -19150,8 +19712,8 @@ mod tests {
             source_context: "ctx-abc".to_string(),
             source_type: scp_core::provenance::SourceType::Persistent,
             counterparties: vec![
-                scp_identity::DID::from("did:dht:z6MkAlice"),
-                scp_identity::DID::from("did:dht:z6MkBob"),
+                scp_did::DID::from("did:dht:z6MkAlice"),
+                scp_did::DID::from("did:dht:z6MkBob"),
             ],
             purpose: Some("sharing".to_string()),
             discovery_method: scp_core::provenance::DiscoveryMethod::SharedContext(
@@ -19190,8 +19752,8 @@ mod tests {
         assert_eq!(
             roundtripped.counterparties,
             vec![
-                scp_identity::DID::from("did:dht:z6MkAlice"),
-                scp_identity::DID::from("did:dht:z6MkBob"),
+                scp_did::DID::from("did:dht:z6MkAlice"),
+                scp_did::DID::from("did:dht:z6MkBob"),
             ]
         );
         assert_eq!(roundtripped.discovery_method, core_prov.discovery_method);
@@ -19241,7 +19803,7 @@ mod tests {
         let core_prov = scp_core::provenance::DataProvenance {
             source_context: "ctx-sum".to_string(),
             source_type: scp_core::provenance::SourceType::Summary,
-            counterparties: vec![scp_identity::DID::from("did:dht:z6MkCharlie")],
+            counterparties: vec![scp_did::DID::from("did:dht:z6MkCharlie")],
             purpose: None,
             discovery_method: scp_core::provenance::DiscoveryMethod::Registry(
                 "ctx-reg".to_string(),
@@ -19844,11 +20406,11 @@ mod tests {
     fn parse_scpid_signing_key_id_valid() {
         assert_eq!(
             parse_scpid_signing_key_id("#active").unwrap(),
-            scp_identity::SigningKeyId::Active
+            scp_did::SigningKeyId::Active
         );
         assert_eq!(
             parse_scpid_signing_key_id("#agent").unwrap(),
-            scp_identity::SigningKeyId::Agent
+            scp_did::SigningKeyId::Agent
         );
     }
 
@@ -19957,7 +20519,7 @@ mod tests {
 
         // Create a DidDht with a signer so we can publish the DID document.
         let sign_fn =
-            scp_identity::DidDht::<InMemoryDhtClient, scp_identity::cache::SystemClock>::make_sign_fn(
+            scp_identity::DidDht::<InMemoryDhtClient, scp_clock::SystemClock>::make_sign_fn(
                 Arc::clone(&custody),
             );
         let dht = scp_identity::DidDht::with_client_and_signer(
@@ -19983,7 +20545,7 @@ mod tests {
             custody.as_ref(),
             &identity.active_signing_key,
             &identity.did,
-            scp_identity::SigningKeyId::Active,
+            scp_did::SigningKeyId::Active,
             &challenge,
             None,
         )
@@ -20005,7 +20567,7 @@ mod tests {
         let auth = core_verify(&resolver, &response, &challenge).await.unwrap();
 
         assert_eq!(auth.did, identity.did);
-        assert_eq!(auth.signing_key_id, scp_identity::SigningKeyId::Active);
+        assert_eq!(auth.signing_key_id, scp_did::SigningKeyId::Active);
     }
 
     // -----------------------------------------------------------------------
@@ -20041,7 +20603,7 @@ mod tests {
         let event_json = migrated
             .rotation_event_json()
             .expect("rotationEventJson must be Some on migrated handles");
-        let event: scp_identity::DidRotationEvent =
+        let event: scp_did::DidRotationEvent =
             serde_json::from_str(&event_json).expect("rotation_event_json deserialises");
         let pre_rot = event
             .pre_rotation_proof
@@ -20520,7 +21082,7 @@ mod tests {
 
         let event = ContextEvent::ConsequenceTriggered {
             context_id: "ctx-uniffi-123".to_owned(),
-            member_did: scp_identity::DID("did:dht:z6MkBob".to_owned()),
+            member_did: scp_did::DID("did:dht:z6MkBob".to_owned()),
             rule_index: 3,
             trigger_type: "tool_rate".to_owned(),
             action_type: "capability_suspension".to_owned(),
@@ -20556,7 +21118,7 @@ mod tests {
 
         let event = ContextEvent::ConsequenceEnforced {
             context_id: "ctx-uniffi-456".to_owned(),
-            member_did: scp_identity::DID("did:dht:z6MkAlice".to_owned()),
+            member_did: scp_did::DID("did:dht:z6MkAlice".to_owned()),
             action_type: "access_revocation".to_owned(),
             success: true,
         };
@@ -22427,8 +22989,8 @@ mod tests {
         /// the supervisor snapshots.
         fn install_seedable_resolver(
             bi: &Arc<crate::runtime::UniffiBridgeInstance>,
-        ) -> Arc<scp_identity::InMemoryDhtClient> {
-            let dht_client = Arc::new(scp_identity::InMemoryDhtClient::new());
+        ) -> Arc<scp_dht::InMemoryDhtClient> {
+            let dht_client = Arc::new(scp_dht::InMemoryDhtClient::new());
             let resolver = Arc::new(scp_identity::resolver::DualLayerResolver::new(
                 Arc::new(scp_identity::resolver::NoOpRelayQuerier),
                 Arc::clone(&dht_client),
@@ -22446,9 +23008,9 @@ mod tests {
         /// key during single-admin vote verification.
         async fn seed_owner_document_into_resolver(
             owner_identity: &Identity,
-            dht_client: &Arc<scp_identity::InMemoryDhtClient>,
+            dht_client: &Arc<scp_dht::InMemoryDhtClient>,
         ) {
-            use scp_identity::dht_client::DhtClient as _;
+            use scp_dht::DhtClient as _;
             use scp_platform::traits::KeyCustody as _;
 
             let identity = owner_identity
@@ -22469,7 +23031,7 @@ mod tests {
             let public_key =
                 scp_identity::extract_public_key(&identity.did).expect("DID embeds the public key");
             let seq: u64 = 1;
-            let signable = scp_identity::dht::bep44_signable(value, seq);
+            let signable = scp_dht::bep44_signable(value, seq);
             let sig_bytes = custody
                 .0
                 .sign(&identity.identity_key, &signable)
@@ -23229,7 +23791,7 @@ mod tests {
             supervisor
                 .test_insert_member(
                     &ctx_a,
-                    scp_identity::DID(member_but_unhosted_caller.clone()),
+                    scp_did::DID(member_but_unhosted_caller.clone()),
                     "member",
                 )
                 .await

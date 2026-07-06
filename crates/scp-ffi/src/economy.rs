@@ -267,7 +267,7 @@ impl crate::scp::PyScp {
         validate::validate_context_id(context_id)?;
         validate::validate_did(did)?;
 
-        let member_did = scp_identity::DID::from(did);
+        let member_did = scp_did::DID::from(did);
         let remaining = bi
             .core
             .with_economy_budget(context_id, |tracker| tracker.remaining(&member_did));
@@ -283,7 +283,7 @@ impl crate::scp::PyScp {
         validate::validate_context_id(context_id)?;
         validate::validate_did(did)?;
 
-        let member_did = scp_identity::DID::from(did);
+        let member_did = scp_did::DID::from(did);
         bi.core.with_economy_budget_mut(context_id, |tracker| {
             tracker.grant(&member_did, scp_core::economy::Amount::new(amount));
         });
@@ -307,7 +307,7 @@ impl crate::scp::PyScp {
         validate::validate_context_id(context_id)?;
         validate::validate_did(did)?;
 
-        let member_did = scp_identity::DID::from(did);
+        let member_did = scp_did::DID::from(did);
         bi.core.with_economy_budget_mut(context_id, |tracker| {
             tracker
                 .record_spend(&member_did, scp_core::economy::Amount::new(amount))
@@ -333,7 +333,7 @@ impl crate::scp::PyScp {
         validate::validate_context_id(context_id)?;
         validate::validate_did(sender_did)?;
 
-        let did = scp_identity::DID::from(sender_did);
+        let did = scp_did::DID::from(sender_did);
         bi.core.with_economy_antispam(context_id, |tracker| {
             tracker.record_message(&did, timestamp);
         });
@@ -362,7 +362,7 @@ impl crate::scp::PyScp {
         validate::validate_context_id(context_id)?;
         validate::validate_did(sender_did)?;
 
-        let did = scp_identity::DID::from(sender_did);
+        let did = scp_did::DID::from(sender_did);
         let velocity = bi
             .core
             .with_economy_antispam(context_id, |tracker| tracker.get_velocity(&did, now));
@@ -415,7 +415,7 @@ impl crate::scp::PyScp {
                 .collect(),
         };
 
-        let did = scp_identity::DID::from(sender_did);
+        let did = scp_did::DID::from(sender_did);
         let cost = bi.core.with_economy_antispam(context_id, |tracker| {
             tracker.compute_escalated_cost(
                 &did,
@@ -560,7 +560,7 @@ mod tests {
             "locked": false,
             "cost_schedule": {
                 "currency": [85,83,68,0],
-                "per_message": 10,
+                "per_message": "10",
                 "per_tool_invoke": null,
                 "per_join": null,
                 "per_period": null,

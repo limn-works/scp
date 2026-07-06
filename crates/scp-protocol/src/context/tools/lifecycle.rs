@@ -19,11 +19,11 @@
 
 use serde::{Deserialize, Serialize};
 
-use scp_primitives::Clock;
+use scp_clock::Clock;
 
 use crate::economy::types::Amount;
 use crate::provenance::DataProvenance;
-use scp_primitives::DID;
+use scp_did::DID;
 
 /// Type alias for tool invocation provenance.
 ///
@@ -295,21 +295,32 @@ pub struct ToolInvokedEvent {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-/// Computes a SHA-256 hash of a JSON value's RFC 8785 (JCS) canonical
+/// Computes a SHA-256 hash of a value's RFC 8785 (JCS) canonical
 /// representation.
 ///
 /// The value is serialized to a JCS-canonical JSON string, then hashed with
 /// SHA-256. Returns the hash as a lowercase hex string.
-#[must_use]
-pub fn sha256_json(value: &serde_json::Value) -> String {
+///
+/// # Errors
+///
+/// Returns [`ToolError::CanonicalizationFailed`] if canonical serialization
+/// fails. A serialization failure is surfaced rather than silently hashing an
+/// empty preimage, so a convergent hash is never computed over defaulted-empty
+/// bytes. For well-formed `serde_json::Value` inputs this is unreachable (every
+/// JSON value canonicalizes); it can only occur for a serializable type whose
+/// `Serialize` implementation itself fails.
+pub fn sha256_json<T>(value: &T) -> Result<String, super::ToolError>
+where
+    T: serde::Serialize,
+{
     use sha2::{Digest, Sha256};
 
     // RFC 8785 JCS canonical serialization for cross-implementation
-    // deterministic hashing. Falls back to empty string on error (should
-    // not happen for valid JSON).
-    let bytes = crate::jcs::to_string(value).unwrap_or_default();
+    // deterministic hashing.
+    let bytes = crate::jcs::to_string(value)
+        .map_err(|reason| super::ToolError::CanonicalizationFailed { reason })?;
     let hash = Sha256::digest(bytes.as_bytes());
-    hex::encode(hash)
+    Ok(hex::encode(hash))
 }
 
 // ---------------------------------------------------------------------------
@@ -327,7 +338,7 @@ mod tests {
             "tool-1".to_owned(),
             "did:dht:z6MkInvoker".into(),
             serde_json::json!({"x": 1}),
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         );
         // UUID v4 format: 8-4-4-4-12 hex digits.
         assert_eq!(request.request_id.len(), 36);
@@ -344,7 +355,7 @@ mod tests {
             "tool-1".to_owned(),
             "did:dht:z6MkInvoker".into(),
             serde_json::json!({}),
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         );
         request.timeout_ms = 10_000;
         request.clamp_timeout(60_000);
@@ -357,7 +368,7 @@ mod tests {
             "tool-1".to_owned(),
             "did:dht:z6MkInvoker".into(),
             serde_json::json!({}),
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         );
         request.timeout_ms = 120_000;
         request.clamp_timeout(60_000);
@@ -370,7 +381,7 @@ mod tests {
             "tool-1".to_owned(),
             "did:dht:z6MkInvoker".into(),
             serde_json::json!({}),
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         );
         request.timeout_ms = 600_000;
         // Context max is above protocol max -- should clamp to protocol max.
@@ -471,7 +482,7 @@ mod tests {
     #[test]
     fn sha256_json_produces_64_char_hex() {
         let value = serde_json::json!({"hello": "world"});
-        let hash = sha256_json(&value);
+        let hash = sha256_json(&value).unwrap();
         assert_eq!(hash.len(), 64);
         assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
     }
@@ -479,16 +490,52 @@ mod tests {
     #[test]
     fn sha256_json_deterministic() {
         let value = serde_json::json!({"a": 1, "b": 2});
-        let hash1 = sha256_json(&value);
-        let hash2 = sha256_json(&value);
+        let hash1 = sha256_json(&value).unwrap();
+        let hash2 = sha256_json(&value).unwrap();
         assert_eq!(hash1, hash2);
     }
 
     #[test]
     fn sha256_json_different_inputs_produce_different_hashes() {
-        let hash1 = sha256_json(&serde_json::json!({"a": 1}));
-        let hash2 = sha256_json(&serde_json::json!({"a": 2}));
+        let hash1 = sha256_json(&serde_json::json!({"a": 1})).unwrap();
+        let hash2 = sha256_json(&serde_json::json!({"a": 2})).unwrap();
         assert_ne!(hash1, hash2);
+    }
+
+    #[test]
+    fn sha256_json_propagates_serialization_error() {
+        // A type whose `Serialize` impl always fails forces the JCS
+        // canonicalization to error. `sha256_json` MUST surface that as
+        // `CanonicalizationFailed` — never fall back to hashing an empty
+        // preimage (the anti-pattern the previous `unwrap_or_default` had).
+        struct AlwaysFails;
+        impl serde::Serialize for AlwaysFails {
+            fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                Err(serde::ser::Error::custom(
+                    "intentional serialization failure",
+                ))
+            }
+        }
+
+        let result = sha256_json(&AlwaysFails);
+        assert!(
+            matches!(
+                result,
+                Err(crate::context::tools::ToolError::CanonicalizationFailed { .. })
+            ),
+            "expected CanonicalizationFailed, got {result:?}",
+        );
+
+        // Guard against the empty-preimage regression: the SHA-256 of the empty
+        // string must NOT be returned as a "successful" hash.
+        let empty_preimage_hash = {
+            use sha2::{Digest, Sha256};
+            hex::encode(Sha256::digest(b""))
+        };
+        assert_ne!(result.ok().as_deref(), Some(empty_preimage_hash.as_str()));
     }
 
     #[test]

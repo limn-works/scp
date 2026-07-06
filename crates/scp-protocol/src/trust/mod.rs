@@ -16,6 +16,9 @@ pub mod renewal;
 pub mod sybil;
 
 // Re-exports for backward compatibility.
+pub use admission::{
+    AdmissionError, CapabilityRequirement, VerificationLevel, check_capability_requirements,
+};
 pub use attestation::{
     Attestation, AttestationEvidence, DidPublicKeyResolver, IdentityDidPublicKeyResolver,
     RevocationStatus, canonical_attestation_bytes, verify_attestation,
@@ -45,7 +48,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use scp_primitives::DID;
+use scp_did::DID;
 
 // ---------------------------------------------------------------------------
 // Type aliases

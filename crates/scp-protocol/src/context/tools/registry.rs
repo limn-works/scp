@@ -23,6 +23,7 @@ use super::{
     has_admin_role, has_tool_register_capability, schema,
 };
 use crate::context::roles::ContextRoleState;
+use crate::economy::types::Amount;
 
 // ---------------------------------------------------------------------------
 // ToolSchema
@@ -71,7 +72,9 @@ pub struct TestVector {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolCost {
     /// Cost per invocation in the smallest currency unit.
-    pub amount: u64,
+    ///
+    /// Serializes on the wire as a canonical decimal string (ADR-060).
+    pub amount: Amount,
     /// ISO 4217 or protocol-defined currency code.
     pub currency: String,
     /// The DID that receives tool invocation payments. May differ from the
@@ -505,8 +508,17 @@ where
 /// - `operator_did`
 /// - `registered_at` (timestamp)
 /// - `cost` (if present)
-#[must_use]
-pub fn compute_tool_registration_canonical_bytes(registration: &ToolRegistration) -> Vec<u8> {
+///
+/// # Errors
+///
+/// Returns [`ToolError::CanonicalizationFailed`] if any schema or test-vector
+/// value fails RFC 8785 JCS canonical serialization. The error is surfaced
+/// rather than substituting empty bytes, so the registration signature is never
+/// computed or verified over a defaulted-empty preimage. Unreachable for
+/// well-formed `serde_json::Value` schemas.
+pub fn compute_tool_registration_canonical_bytes(
+    registration: &ToolRegistration,
+) -> Result<Vec<u8>, ToolError> {
     use sha2::{Digest, Sha256};
 
     let mut hasher = Sha256::new();
@@ -523,9 +535,11 @@ pub fn compute_tool_registration_canonical_bytes(registration: &ToolRegistration
     length_prefix(&mut hasher, registration.description.as_bytes());
 
     // Schema as RFC 8785 JCS canonical JSON bytes.
-    let input_json = crate::jcs::to_vec(&registration.schema.input_schema).unwrap_or_default();
+    let input_json = crate::jcs::to_vec(&registration.schema.input_schema)
+        .map_err(|reason| ToolError::CanonicalizationFailed { reason })?;
     length_prefix(&mut hasher, &input_json);
-    let output_json = crate::jcs::to_vec(&registration.schema.output_schema).unwrap_or_default();
+    let output_json = crate::jcs::to_vec(&registration.schema.output_schema)
+        .map_err(|reason| ToolError::CanonicalizationFailed { reason })?;
     length_prefix(&mut hasher, &output_json);
 
     hasher.update(registration.implementation_hash);
@@ -534,9 +548,11 @@ pub fn compute_tool_registration_canonical_bytes(registration: &ToolRegistration
     #[allow(clippy::cast_possible_truncation)]
     hasher.update((registration.test_vectors.len() as u32).to_be_bytes());
     for tv in &registration.test_vectors {
-        let input_bytes = crate::jcs::to_vec(&tv.input).unwrap_or_default();
+        let input_bytes = crate::jcs::to_vec(&tv.input)
+            .map_err(|reason| ToolError::CanonicalizationFailed { reason })?;
         length_prefix(&mut hasher, &input_bytes);
-        let output_bytes = crate::jcs::to_vec(&tv.expected_output).unwrap_or_default();
+        let output_bytes = crate::jcs::to_vec(&tv.expected_output)
+            .map_err(|reason| ToolError::CanonicalizationFailed { reason })?;
         length_prefix(&mut hasher, &output_bytes);
         length_prefix(&mut hasher, tv.description.as_bytes());
     }
@@ -548,7 +564,9 @@ pub fn compute_tool_registration_canonical_bytes(registration: &ToolRegistration
     match &registration.cost {
         Some(tc) => {
             hasher.update([0x01]);
-            hasher.update(tc.amount.to_be_bytes());
+            // Hash the raw `u64` big-endian bytes (NOT the ADR-060 wire string),
+            // keeping the TOOL-REGISTRATION canonical preimage byte-identical.
+            hasher.update(tc.amount.0.to_be_bytes());
             length_prefix(&mut hasher, tc.currency.as_bytes());
             match &tc.cost_formula {
                 Some(formula) => {
@@ -562,7 +580,7 @@ pub fn compute_tool_registration_canonical_bytes(registration: &ToolRegistration
         None => hasher.update([0x00]),
     }
 
-    hasher.finalize().to_vec()
+    Ok(hasher.finalize().to_vec())
 }
 
 /// Verifies the Ed25519 signature on a tool registration.
@@ -596,7 +614,7 @@ pub fn verify_tool_registration_signature(
     })?;
 
     let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes);
-    let canonical = compute_tool_registration_canonical_bytes(registration);
+    let canonical = compute_tool_registration_canonical_bytes(registration)?;
 
     registrant_public_key
         .verify_strict(&canonical, &signature)
@@ -662,7 +680,7 @@ mod tests {
             creator_did,
             test_ceiling(),
             vec![],
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap()
     }
@@ -956,7 +974,7 @@ mod tests {
         let mut registry = ToolRegistry::new();
         let mut registration = valid_registration("tool-1");
         registration.cost = Some(ToolCost {
-            amount: 100,
+            amount: Amount(100),
             currency: "USD".to_owned(),
             payee: "did:dht:z6MkPayee".into(),
             cost_formula: None,
@@ -972,7 +990,7 @@ mod tests {
 
         let stored = registry.get("tool-1").unwrap();
         assert!(stored.cost.is_some());
-        assert_eq!(stored.cost.as_ref().unwrap().amount, 100);
+        assert_eq!(stored.cost.as_ref().unwrap().amount, Amount(100));
         assert_eq!(stored.cost.as_ref().unwrap().currency, "USD");
     }
 
@@ -1468,7 +1486,7 @@ mod tests {
     #[test]
     fn tool_cost_serialization_roundtrip() {
         let cost = ToolCost {
-            amount: 500,
+            amount: Amount(500),
             currency: "USD".to_owned(),
             payee: "did:dht:z6MkPayee".into(),
             cost_formula: Some("linear".to_owned()),
@@ -1476,5 +1494,51 @@ mod tests {
         let json = serde_json::to_string(&cost).unwrap();
         let deserialized: ToolCost = serde_json::from_str(&json).unwrap();
         assert_eq!(cost, deserialized);
+    }
+
+    #[test]
+    fn tool_cost_amount_serializes_as_canonical_decimal_string() {
+        // ADR-060 wire form: amount is a quoted string, not a JSON number.
+        let cost = ToolCost {
+            amount: Amount(500),
+            currency: "USD".to_owned(),
+            payee: "did:dht:z6MkPayee".into(),
+            cost_formula: None,
+        };
+        let value: serde_json::Value = serde_json::to_value(&cost).unwrap();
+        assert_eq!(value["amount"], serde_json::json!("500"));
+        assert!(value["amount"].is_string());
+    }
+
+    #[test]
+    fn tool_registration_canonical_bytes_use_raw_u64_be_not_wire_string() {
+        // Byte-stability guard: the TOOL-REGISTRATION preimage must hash the raw
+        // `u64` big-endian amount, NOT the ADR-060 decimal wire string, so the
+        // canonical bytes are byte-identical to the pre-ADR-060 preimage.
+        let mut registration = valid_registration("tool-1");
+        registration.cost = Some(ToolCost {
+            amount: Amount(0x0102_0304_0506_0708),
+            currency: "USD".to_owned(),
+            payee: "did:dht:z6MkPayee".into(),
+            cost_formula: None,
+        });
+        let d1 = compute_tool_registration_canonical_bytes(&registration).unwrap();
+        let d2 = compute_tool_registration_canonical_bytes(&registration).unwrap();
+        assert_eq!(d1, d2, "canonical bytes must be deterministic");
+
+        // Changing only the raw u64 amount yields a different digest — proving
+        // the amount contributes via its raw-integer path (the decimal wire
+        // string is never hashed).
+        registration.cost = Some(ToolCost {
+            amount: Amount(0x0102_0304_0506_0709),
+            currency: "USD".to_owned(),
+            payee: "did:dht:z6MkPayee".into(),
+            cost_formula: None,
+        });
+        assert_ne!(
+            d1,
+            compute_tool_registration_canonical_bytes(&registration).unwrap(),
+            "amount must contribute to the preimage via its raw u64 bytes"
+        );
     }
 }

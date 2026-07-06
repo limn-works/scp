@@ -35,7 +35,7 @@
 use std::sync::Arc;
 
 use ed25519_dalek::{Signer as _, SigningKey};
-use scp_identity::{DID, SigningKeyId};
+use scp_did::{DID, SigningKeyId};
 use scp_platform::testing::{InMemoryKeyCustody, InMemoryStorage};
 use scp_platform::{KeyCustody, KeyHandle, KeyType};
 use scp_protocol::context::builder::OpenResult;
@@ -375,7 +375,10 @@ fn bob_supervisor_with_resolver(
     persistence: Option<Box<dyn ContextPersistence>>,
     resolver: KeyResolver,
 ) -> (Arc<Supervisor>, Arc<MlsCryptoProvider>) {
-    let crypto = Arc::new(MlsCryptoProvider::new(BOB_DID.to_owned()));
+    let crypto = Arc::new(MlsCryptoProvider::new(
+        BOB_DID.to_owned(),
+        std::sync::Arc::new(scp_clock::SystemClock),
+    ));
     let transport: Box<dyn ContextTransportProvider> = Box::new(NotConfiguredTransportProvider);
     let event_log: Box<dyn ContextEventLogProvider> = Box::new(MerkleEventLogProvider::new());
     let sup = Supervisor::with_providers(
@@ -399,7 +402,10 @@ fn bob_supervisor_with_resolver(
 /// #active to seal to. Returns the supervisor and a clone of Alice's crypto
 /// provider (so the test can drive the installed group).
 fn alice_supervisor() -> (Arc<Supervisor>, Arc<MlsCryptoProvider>) {
-    let crypto = Arc::new(MlsCryptoProvider::new(ALICE_DID.to_owned()));
+    let crypto = Arc::new(MlsCryptoProvider::new(
+        ALICE_DID.to_owned(),
+        std::sync::Arc::new(scp_clock::SystemClock),
+    ));
     let transport: Box<dyn ContextTransportProvider> = Box::new(NotConfiguredTransportProvider);
     let event_log: Box<dyn ContextEventLogProvider> = Box::new(MerkleEventLogProvider::new());
     let sup = Supervisor::with_providers(
@@ -504,7 +510,10 @@ async fn run_join_with(
     // KP, producing the real Welcome addressed to that KP's init key. When
     // `committed` is `Some`, the group carries the honest `0xFF02` extension;
     // otherwise it is a wrapping-only (non-SCP) group.
-    let alice_crypto = Arc::new(MlsCryptoProvider::new(ALICE_DID.to_owned()));
+    let alice_crypto = Arc::new(MlsCryptoProvider::new(
+        ALICE_DID.to_owned(),
+        std::sync::Arc::new(scp_clock::SystemClock),
+    ));
     match &committed {
         Some(committed_params) => alice_crypto
             .create_mls_group_with_context(
@@ -861,7 +870,10 @@ async fn second_spawn_reusing_a_consumed_reservation_is_rejected() {
     let (sup, bob_crypto) = bob_supervisor(None);
     let (reservation_id, kp_public_bytes) = reserve_bob_kp(&sup, &bob).await;
 
-    let alice_crypto = Arc::new(MlsCryptoProvider::new(ALICE_DID.to_owned()));
+    let alice_crypto = Arc::new(MlsCryptoProvider::new(
+        ALICE_DID.to_owned(),
+        std::sync::Arc::new(scp_clock::SystemClock),
+    ));
     alice_crypto
         .create_mls_group_with_context(&ctx_bytes, &honest_ext(&ctx_id, &joiner_params()))
         .unwrap();
@@ -950,7 +962,10 @@ fn alice_welcome_for(
     kp_public_bytes: &[u8],
 ) -> (Arc<MlsCryptoProvider>, Vec<u8>) {
     let ctx_bytes = context_id_to_bytes(context_id);
-    let alice_crypto = Arc::new(MlsCryptoProvider::new(ALICE_DID.to_owned()));
+    let alice_crypto = Arc::new(MlsCryptoProvider::new(
+        ALICE_DID.to_owned(),
+        std::sync::Arc::new(scp_clock::SystemClock),
+    ));
     alice_crypto
         .create_mls_group_with_context(&ctx_bytes, &honest_ext(context_id, &joiner_params()))
         .expect("alice creates the SCP context group (0xFF02)");
@@ -2464,7 +2479,10 @@ impl ContextTransportProvider for BroadcastWatchTransport {
 fn alice_supervisor_with_transport(
     transport: Box<dyn ContextTransportProvider>,
 ) -> (Arc<Supervisor>, Arc<MlsCryptoProvider>) {
-    let crypto = Arc::new(MlsCryptoProvider::new(ALICE_DID.to_owned()));
+    let crypto = Arc::new(MlsCryptoProvider::new(
+        ALICE_DID.to_owned(),
+        std::sync::Arc::new(scp_clock::SystemClock),
+    ));
     let event_log: Box<dyn ContextEventLogProvider> = Box::new(MerkleEventLogProvider::new());
     let sup = Supervisor::with_providers(
         Arc::clone(&crypto),
@@ -2818,7 +2836,10 @@ async fn spawn_from_welcome_rejects_creator_substitution_before_admin_install() 
     // real Welcome. The committed extension rides through the add Commit unchanged
     // as part of the group's cryptographic identity, so it still binds creator =
     // Alice regardless of who issued the add.
-    let alice_crypto = Arc::new(MlsCryptoProvider::new(ALICE_DID.to_owned()));
+    let alice_crypto = Arc::new(MlsCryptoProvider::new(
+        ALICE_DID.to_owned(),
+        std::sync::Arc::new(scp_clock::SystemClock),
+    ));
     alice_crypto
         .create_mls_group_with_context(&ctx_bytes, &honest_ext(&ctx_id, &params))
         .expect("alice creates the honest SCP context group committing creator=Alice");

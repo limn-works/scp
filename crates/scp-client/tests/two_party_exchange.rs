@@ -11,15 +11,19 @@
 //! 1. **End-to-end exchange works single-threaded over `scp-mls`** — Bob
 //!    recovers Alice's exact plaintext through the §9.16 double-encryption
 //!    pipeline.
-//! 2. **Event-log convergence by shared code** — after the joiner replays the
-//!    adder's log and both exchange a message, their full event sequences are
-//!    byte-identical (every leaf hash AND the Merkle root match), the §9.9.3
-//!    convergence property. This holds because both sides run the same
-//!    `scp-event-log` append logic over the same committer-assigned inputs
-//!    (committer DID + the convergent timestamp that travels with each message),
-//!    even though their local clocks deliberately differ.
-//! 3. **Pull-based receive** — Bob drains a `MessageReceived` event carrying
-//!    the decrypted plaintext.
+//! 2. **Membership-log convergence by shared code, unperturbed by messages** —
+//!    after the joiner replays the adder's log, both members hold a byte-identical
+//!    membership sequence [`ContextCreated`, `MemberJoined`] (every leaf hash AND
+//!    the Merkle root match), the §9.9.3 convergence property. This holds because
+//!    both sides run the same `scp-event-log` append logic over the same
+//!    committer-assigned inputs (committer DID + the convergent timestamp bound
+//!    into the add-Commit's authenticated MLS AAD and adopted verbatim from the
+//!    verified frame, ADR-057), even though their local clocks deliberately
+//!    differ. A subsequent application-message exchange leaves this log and its
+//!    root **unchanged** — `MessageSent` is excluded from the convergent Merkle
+//!    log (ADR-011 exclusion taxonomy §2), so it is local history, not a leaf.
+//! 3. **Pull-based buffers** — Bob drains a `MessageReceived` and Alice drains
+//!    her own `MessageSent`, each carrying the (decrypted) plaintext.
 
 // Integration tests assert on happy-path results; `expect`/`panic!` make the
 // failure messages legible. The workspace denies these in production code.
@@ -28,7 +32,7 @@
 use std::sync::Arc;
 
 use scp_client::{LocalSigner, MemoryStorage, ScpClient, Storage};
-use scp_primitives::{Clock, TestClock};
+use scp_clock::{Clock, SystemClock, TestClock};
 use scp_protocol::context::membership::ContextEvent;
 
 const CTX: &str = "ctx-adr057-slice2-two-party";
@@ -37,22 +41,29 @@ const BOB_DID: &str = "did:key:z6MkBob2PartyExchangeFixtureKeyBBBBBBBBBBBB";
 
 /// Builds a fresh client for `did` over a fixed-time clock. Each member's own
 /// leaf timestamps come from its clock, and the convergent timestamp that must
-/// match across members travels with the message (so the two clocks need not
-/// agree — but fixing them keeps the fixture deterministic).
+/// match across members is bound into the message's authenticated AAD (so the
+/// two clocks need not agree — but fixing them keeps the fixture deterministic).
 fn client_for(did: &str, now_secs: u64) -> ScpClient {
     let signer = Arc::new(LocalSigner::active(did));
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
     let clock: Arc<dyn Clock> = Arc::new(TestClock::new(now_secs));
-    ScpClient::new(signer, storage, clock)
+    // A fresh store restores nothing, so construction cannot fail here.
+    ScpClient::new(signer, storage, clock).expect("construct fresh client")
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // one end-to-end two-party scenario, read top-to-bottom
 fn two_party_message_exchange_end_to_end() {
-    let alice_clock = 1_700_000_000u64;
-    // Deliberately give Bob a DIFFERENT local clock to prove convergence does
-    // not depend on the two members' clocks agreeing — only on the convergent
-    // timestamp that travels with each message.
-    let bob_clock = 1_650_000_000u64;
+    // Seed from real now so every minted KeyPackage `Lifetime` stays valid
+    // against openmls's un-injectable internal (real) clock (ADR-057 §Prereq-1
+    // test-clock realism); a fixed past epoch would produce already-expired
+    // KeyPackages.
+    let base = SystemClock.now_secs();
+    let alice_clock = base;
+    // Deliberately give Bob a DIFFERENT local clock (a small distinct offset) to
+    // prove convergence does not depend on the two members' clocks agreeing —
+    // only on the convergent timestamp that travels with each message.
+    let bob_clock = base + 100;
 
     // --- Alice creates the context (MLS group + first event-log leaf). ---
     let mut alice = client_for(ALICE_DID, alice_clock);
@@ -120,24 +131,58 @@ fn two_party_message_exchange_end_to_end() {
         .install_sender_key(CTX, BOB_DID, bob_sk)
         .expect("Alice installs Bob's sender key");
 
-    // --- Alice sends an application message: sender-layer encrypt + MLS encrypt
-    // + a MessageSent leaf. The convergent send timestamp rides on the output. ---
+    // === The convergent membership log is now settled: both members hold
+    // [ContextCreated, MemberJoined] (2 leaves) with equal roots. Capture that
+    // baseline — the message exchange below must NOT change it, because an
+    // application message is NOT a convergent leaf (ADR-011 exclusion taxonomy §2:
+    // `MessageSent` is per-author with no total delivery order). ===
+    let alice_root_before = alice.event_log_root(CTX).expect("alice root");
+    let bob_root_before = bob.event_log_root(CTX).expect("bob root");
+    assert_eq!(alice.event_log_leaf_count(CTX), Some(2));
+    assert_eq!(bob.event_log_leaf_count(CTX), Some(2));
+    assert_eq!(
+        alice_root_before, bob_root_before,
+        "the membership log converged before any message"
+    );
+
+    // --- Alice sends an application message: sender-layer encrypt + plain MLS
+    // encrypt (no AAD — ADR-011). The message is recorded as Alice's local
+    // `MessageSent` history (buffered for drain), NOT as a convergent leaf, so the
+    // returned value is just the ciphertext bytes and the event log is unchanged. ---
     let plaintext = b"hello from Alice over a single-threaded SCP client";
-    let send = alice.send_message(CTX, plaintext).expect("Alice sends");
+    let ciphertext = alice.send_message(CTX, plaintext).expect("Alice sends");
 
     assert_eq!(
         alice.event_log_leaf_count(CTX),
-        Some(3),
-        "Alice's log is now created + joined + sent"
+        Some(2),
+        "a send stamps NO convergent leaf: Alice's log stays at created + joined"
+    );
+    assert_eq!(
+        alice.event_log_root(CTX),
+        Some(alice_root_before),
+        "a send leaves the Merkle root unchanged (MessageSent is excluded from the log)"
     );
 
-    // --- Bob receives + decrypts + records his MessageSent leaf using the same
-    // send timestamp, then drains the MessageReceived event. ---
+    // --- Bob receives + decrypts. This buffers a MessageReceived (local history),
+    // NOT a convergent leaf, so Bob's event log is likewise unchanged. ---
     let was_application = bob
-        .receive_message(CTX, &send.ciphertext, send.committer_timestamp_secs)
+        .receive_message(CTX, &ciphertext)
         .expect("Bob receives the message");
     assert!(was_application, "Alice's send is an application message");
 
+    assert_eq!(
+        bob.event_log_leaf_count(CTX),
+        Some(2),
+        "a received message stamps NO convergent leaf: Bob's log stays at created + joined"
+    );
+    assert_eq!(
+        bob.event_log_root(CTX),
+        Some(bob_root_before),
+        "a received message leaves Bob's Merkle root unchanged"
+    );
+
+    // --- The message surfaces via the pull-based buffers: Bob drains the
+    // MessageReceived, and Alice drains her own MessageSent local history. ---
     let events = bob.drain_events(CTX).expect("Bob drains events");
     assert_eq!(events.len(), 1, "exactly one received event is buffered");
     match &events[0] {
@@ -154,21 +199,33 @@ fn two_party_message_exchange_end_to_end() {
         }
         other => panic!("expected MessageReceived, got {other:?}"),
     }
-
     // Draining again yields nothing (pull-based, FIFO, consumed).
     assert!(bob.drain_events(CTX).expect("re-drain ok").is_empty());
 
-    // === Convergence (§9.9.3): after the exchange, Alice and Bob hold the
-    // identical event sequence [ContextCreated, MemberJoined, MessageSent], so
-    // their leaf hashes are byte-identical AND their Merkle roots are equal —
-    // despite their local clocks differing — because the convergent timestamp
-    // travelled with each message and both sides ran the same shared
-    // `scp-event-log` append logic. ===
+    let sent_events = alice.drain_events(CTX).expect("Alice drains her own send");
+    assert_eq!(sent_events.len(), 1, "Alice buffered her own MessageSent");
+    match &sent_events[0] {
+        ContextEvent::MessageSent {
+            sender_did,
+            sequence_number,
+            payload,
+        } => {
+            assert_eq!(sender_did.0, ALICE_DID, "the sender DID is Alice");
+            assert_eq!(*sequence_number, 0, "Alice's first send is sequence 0");
+            assert_eq!(payload.as_slice(), plaintext, "Alice's own sent plaintext");
+        }
+        other => panic!("expected MessageSent, got {other:?}"),
+    }
+
+    // === Convergence (§9.9.3): after the exchange, Alice and Bob still hold the
+    // identical membership sequence [ContextCreated, MemberJoined] — the message
+    // did not perturb it — so their leaf hashes are byte-identical AND their
+    // Merkle roots are equal, despite their local clocks differing. ===
     let alice_leaves = alice.event_log_leaf_hashes(CTX).expect("alice leaves");
     let bob_leaves = bob.event_log_leaf_hashes(CTX).expect("bob leaves");
 
-    assert_eq!(alice_leaves.len(), 3, "Alice: created + joined + sent");
-    assert_eq!(bob_leaves.len(), 3, "Bob: created + joined + sent");
+    assert_eq!(alice_leaves.len(), 2, "Alice: created + joined");
+    assert_eq!(bob_leaves.len(), 2, "Bob: created + joined");
     assert_eq!(
         alice_leaves, bob_leaves,
         "every leaf hash is byte-identical across both members (convergence)"

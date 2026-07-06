@@ -27,9 +27,9 @@ use std::time::Duration;
 use ed25519_dalek::Signer;
 use sha2::{Digest, Sha256};
 
+use scp_did::DID;
 use scp_event_log::tree::{self, GENESIS_PREV_HASH};
 use scp_event_log::{Event, EventLog, EventPayload, EventType};
-use scp_identity::DID;
 use scp_protocol::bridge::claiming::{ClaimRequest, claim_shadow};
 use scp_protocol::bridge::provenance::{
     BridgeTrustLevel, evaluate_bridge_trust_level, mark_bridge_provenance,
@@ -55,9 +55,9 @@ use scp_media::signaling::{
     serialize_signaling, verify_sender_attribution,
 };
 
+use scp_mls::credential::ScpCredential;
+use scp_mls::group::{add_member, create_group, generate_key_package, join_group};
 use scp_protocol::context::params::Capability as ParamCapability;
-use scp_runtime::crypto::mls::credential::ScpCredential;
-use scp_runtime::crypto::mls::group::{add_member, create_group, generate_key_package, join_group};
 
 use scp_platform::testing::{
     InMemoryDeviceAttestation, InMemoryKeyCustody, InMemoryPush, InMemoryStorage,
@@ -150,8 +150,10 @@ fn compute_attestation_canonical_bytes(attestation: &Attestation) -> Vec<u8> {
     let evidence_bytes = attestation.evidence.as_ref().map(|e| {
         rmp_serde::to_vec_named(e).expect("AttestationEvidence serialization is infallible")
     });
+    // Claim is compact JSON (RFC 8785 JCS) per §9.5.2 Attestation row 5;
+    // evidence/revocation_status stay MessagePack per the §9.5.2 note.
     let claim_bytes =
-        rmp_serde::to_vec_named(&attestation.claim).expect("claim serialization is infallible");
+        scp_protocol::jcs::to_vec(&attestation.claim).expect("claim serialization is infallible");
     let revocation_bytes = rmp_serde::to_vec_named(&attestation.revocation_status)
         .expect("RevocationStatus serialization is infallible");
 
@@ -547,22 +549,23 @@ fn media_session_mls_key_derivation() {
     let alice_cred = ScpCredential::new(
         "did:dht:z6MkAlice".to_owned(),
         None,
-        scp_identity::SigningKeyId::Active,
+        scp_did::SigningKeyId::Active,
     )
     .expect("alice credential");
-    let mut alice_group = create_group(&alice_cred).expect("create group");
+    let mut alice_group = create_group(&alice_cred, &scp_clock::SystemClock).expect("create group");
 
     // -- Step 2: Add Bob to the group --
     let bob_cred = ScpCredential::new(
         "did:dht:z6MkBob".to_owned(),
         None,
-        scp_identity::SigningKeyId::Active,
+        scp_did::SigningKeyId::Active,
     )
     .expect("bob credential");
     let (bob_kp_bundle, bob_signer, bob_provider) =
-        generate_key_package(&bob_cred).expect("bob key package");
+        generate_key_package(&bob_cred, &scp_clock::SystemClock).expect("bob key package");
     let bob_kp = bob_kp_bundle.key_package().clone().into();
-    let add_result = add_member(&mut alice_group, bob_kp).expect("add bob");
+    let add_result =
+        add_member(&mut alice_group, bob_kp, &scp_clock::SystemClock).expect("add bob");
 
     let bob_group = join_group(&add_result.welcome, bob_provider, bob_signer).expect("bob joins");
 
@@ -979,21 +982,22 @@ fn media_session_keys_derived_from_mls_group_state() {
     let alice_cred = ScpCredential::new(
         "did:dht:z6MkAlice".to_owned(),
         None,
-        scp_identity::SigningKeyId::Active,
+        scp_did::SigningKeyId::Active,
     )
     .expect("alice cred");
-    let mut alice_group = create_group(&alice_cred).expect("alice group");
+    let mut alice_group = create_group(&alice_cred, &scp_clock::SystemClock).expect("alice group");
 
     let bob_cred = ScpCredential::new(
         "did:dht:z6MkBob".to_owned(),
         None,
-        scp_identity::SigningKeyId::Active,
+        scp_did::SigningKeyId::Active,
     )
     .expect("bob cred");
     let (bob_kp_bundle, bob_signer, bob_provider) =
-        generate_key_package(&bob_cred).expect("bob kp");
+        generate_key_package(&bob_cred, &scp_clock::SystemClock).expect("bob kp");
     let bob_kp = bob_kp_bundle.key_package().clone().into();
-    let add_result = add_member(&mut alice_group, bob_kp).expect("add bob");
+    let add_result =
+        add_member(&mut alice_group, bob_kp, &scp_clock::SystemClock).expect("add bob");
     let bob_group = join_group(&add_result.welcome, bob_provider, bob_signer).expect("bob join");
 
     // Export keys at 32 bytes (standard DTLS-SRTP keying material length).

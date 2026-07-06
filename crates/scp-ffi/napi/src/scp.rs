@@ -20,10 +20,10 @@ use std::time::Duration;
 use napi::Env;
 use napi::Error as NapiError;
 use napi_derive::napi;
+use scp_clock::Clock as _;
 use scp_ffi_common::bridge_instance::BridgeInstanceCore as _;
 use scp_ffi_common::error_codes as codes;
 use scp_identity::DidMethod as _;
-use scp_primitives::Clock as _;
 
 // `Buffer` is referenced only by the in-memory-custody-gated full-stack test
 // methods (`fullstackSendMessage` / `fullstackDecryptMessage`); production
@@ -1081,8 +1081,8 @@ impl Scp {
             RecoveryBackend, RecoveryStepError, active_key_rotation_outcome,
             agent_key_rotation_outcome,
         };
+        use scp_did::DID;
         use scp_ffi_common::validate::validate_did;
-        use scp_identity::DID;
 
         validate_did(&did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
 
@@ -1157,7 +1157,7 @@ impl Scp {
             }
         };
 
-        let now_ms = scp_primitives::SystemClock.now_millis();
+        let now_ms = scp_clock::SystemClock.now_millis();
         let key_rotation = match compromise_tier {
             CompromiseTier::Agent => agent_key_rotation_outcome(&did_val, now_ms),
             CompromiseTier::ActiveSigning => active_key_rotation_outcome(&did_val, now_ms),
@@ -1222,7 +1222,7 @@ impl Scp {
                 &contacts,
                 None,
                 &backend,
-                &scp_primitives::SystemClock,
+                &scp_clock::SystemClock,
             ))
             .map_err(|e| {
                 NapiError::from(ScpNapiError::Identity {
@@ -1261,8 +1261,8 @@ impl Scp {
             CustodyMigrationBackend, CustodyMigrationOrchestrator, CustodyMigrationRequest,
             CustodyMigrationTarget,
         };
+        use scp_did::DID;
         use scp_ffi_common::validate::validate_did;
-        use scp_identity::DID;
 
         validate_did(&did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
 
@@ -1385,7 +1385,7 @@ impl Scp {
         // the napi-rs worker thread has no tokio context (round-2
         // bug-catcher finding).
         let result = crate::runtime()
-            .block_on(orchestrator.execute(&backend, &scp_primitives::SystemClock))
+            .block_on(orchestrator.execute(&backend, &scp_clock::SystemClock))
             .map_err(|e| {
                 NapiError::from(ScpNapiError::Identity {
                     message: format!("custody migration failed: {e}"),
@@ -1419,7 +1419,7 @@ impl Scp {
         target_did: String,
         name: String,
     ) -> napi::Result<()> {
-        use scp_identity::DID;
+        use scp_did::DID;
 
         scp_ffi_common::validate::validate_did(&owner_did)
             .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
@@ -1443,7 +1443,7 @@ impl Scp {
     /// Per-instance equivalent of `petname_remove`.
     #[napi(js_name = "petnameRemove")]
     pub fn petname_remove(&self, owner_did: String, target_did: String) -> napi::Result<()> {
-        use scp_identity::DID;
+        use scp_did::DID;
 
         scp_ffi_common::validate::validate_did(&owner_did)
             .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
@@ -1565,7 +1565,7 @@ impl Scp {
         owner_did: String,
         target_did: String,
     ) -> napi::Result<Option<String>> {
-        use scp_identity::DID;
+        use scp_did::DID;
 
         scp_ffi_common::validate::validate_did(&owner_did)
             .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
@@ -1690,7 +1690,7 @@ impl Scp {
         tags: Option<Vec<String>>,
     ) -> napi::Result<String> {
         use scp_core::discovery::handles::{HandleMetadata, HandleRegisterParams, HandleRegistry};
-        use scp_identity::DID;
+        use scp_did::DID;
 
         let target =
             scp_ffi_common::petname_helpers::parse_handle_target(&target_json).map_err(|e| {
@@ -1716,7 +1716,7 @@ impl Scp {
         let result = registry.register(
             &params,
             &DID::from(registrant_did.as_str()),
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         );
         serde_json::to_string(&result).map_err(|e| {
             NapiError::from(ScpNapiError::Validation {
@@ -1783,7 +1783,7 @@ impl Scp {
         did: String,
     ) -> napi::Result<String> {
         use scp_core::discovery::handles::HandleDeregisterParams;
-        use scp_identity::DID;
+        use scp_did::DID;
 
         let mut guard = self.inner.core.handle_registries().lock().map_err(|e| {
             NapiError::from(ScpNapiError::Validation {
@@ -1821,7 +1821,7 @@ impl Scp {
         description: Option<String>,
         tags: Option<Vec<String>>,
     ) -> napi::Result<String> {
-        use scp_identity::DID;
+        use scp_did::DID;
 
         scp_ffi_common::validate::validate_context_id(&scope_context_id)
             .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
@@ -1866,7 +1866,7 @@ impl Scp {
             .register(
                 &params,
                 &DID::from(registrant_did.as_str()),
-                &scp_primitives::SystemClock,
+                &scp_clock::SystemClock,
             )
             .map_err(|e| {
                 NapiError::from(ScpNapiError::Validation {
@@ -1926,7 +1926,7 @@ impl Scp {
         name: String,
         did: String,
     ) -> napi::Result<String> {
-        use scp_identity::DID;
+        use scp_did::DID;
 
         scp_ffi_common::validate::validate_context_id(&scope_context_id)
             .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
@@ -2023,7 +2023,7 @@ impl Scp {
                 &querier,
                 &known_contexts,
                 &known_domains,
-                &scp_primitives::SystemClock,
+                &scp_clock::SystemClock,
             )
             .await
             .map_err(|e| {
@@ -3176,7 +3176,7 @@ impl Scp {
         handle: &NapiContextHandle,
         token: String,
         capability: String,
-        presenting_agent_did: Option<String>,
+        presenting_agent_did: String,
         proof_tokens: Option<Vec<String>>,
     ) -> napi::Result<()> {
         crate::napi_check_handle!(&self.inner.core, handle);
@@ -3209,7 +3209,7 @@ impl Scp {
         handle: &NapiContextHandle,
         token: String,
         capability: Option<String>,
-        presenting_agent_did: Option<String>,
+        presenting_agent_did: String,
         proof_tokens: Option<Vec<String>>,
     ) -> napi::Result<crate::ucan::NapiCapabilityValidation> {
         crate::napi_check_handle!(&self.inner.core, handle);
@@ -3404,7 +3404,7 @@ impl Scp {
         policy_json: String,
         action_type: String,
         metrics_json: String,
-    ) -> napi::Result<i64> {
+    ) -> napi::Result<napi::bindgen_prelude::BigInt> {
         crate::economy::economy_estimate_cost_on(
             &self.inner,
             policy_json,
@@ -3451,34 +3451,44 @@ impl Scp {
         &self,
         formula_json: String,
         metrics_json: String,
-    ) -> napi::Result<i64> {
+    ) -> napi::Result<napi::bindgen_prelude::BigInt> {
         crate::economy::economy_evaluate_formula_on(&self.inner, formula_json, metrics_json)
     }
 
     /// Per-instance equivalent of the free-function `economy_budget_remaining`.
     #[napi(js_name = "economyBudgetRemaining")]
-    pub fn economy_budget_remaining(&self, context_id: String, did: String) -> napi::Result<i64> {
+    pub fn economy_budget_remaining(
+        &self,
+        context_id: String,
+        did: String,
+    ) -> napi::Result<napi::bindgen_prelude::BigInt> {
         crate::economy::economy_budget_remaining_on(&self.inner, context_id, did)
     }
 
     /// Per-instance equivalent of the free-function `economy_budget_grant`.
+    ///
+    /// `amount` is a JS `bigint` so a full `u64` monetary amount round-trips
+    /// exactly (ADR-060 SDK-surface rule).
     #[napi(js_name = "economyBudgetGrant")]
     pub fn economy_budget_grant(
         &self,
         context_id: String,
         did: String,
-        amount: i64,
+        amount: napi::bindgen_prelude::BigInt,
     ) -> napi::Result<()> {
         crate::economy::economy_budget_grant_on(&self.inner, context_id, did, amount)
     }
 
     /// Per-instance equivalent of the free-function `economy_budget_record_spend`.
+    ///
+    /// `amount` is a JS `bigint` so a full `u64` monetary amount round-trips
+    /// exactly (ADR-060 SDK-surface rule).
     #[napi(js_name = "economyBudgetRecordSpend")]
     pub fn economy_budget_record_spend(
         &self,
         context_id: String,
         did: String,
-        amount: i64,
+        amount: napi::bindgen_prelude::BigInt,
     ) -> napi::Result<()> {
         crate::economy::economy_budget_record_spend_on(&self.inner, context_id, did, amount)
     }
@@ -3506,6 +3516,11 @@ impl Scp {
     }
 
     /// Per-instance equivalent of the free-function `economy_antispam_escalated_cost`.
+    ///
+    /// Monetary amounts (`base_cost`, `floor`, `cap`, and the returned cost) are
+    /// JS `bigint` so a full `u64` round-trips exactly (ADR-060 SDK-surface
+    /// rule). `now` is a millisecond timestamp, not a monetary amount, and stays
+    /// a JS `number`.
     #[napi(js_name = "economyAntispamEscalatedCost")]
     #[allow(clippy::too_many_arguments)]
     pub fn economy_antispam_escalated_cost(
@@ -3513,11 +3528,11 @@ impl Scp {
         context_id: String,
         sender_did: String,
         now: i64,
-        base_cost: i64,
+        base_cost: napi::bindgen_prelude::BigInt,
         thresholds_json: String,
-        floor: Option<i64>,
-        cap: Option<i64>,
-    ) -> napi::Result<i64> {
+        floor: Option<napi::bindgen_prelude::BigInt>,
+        cap: Option<napi::bindgen_prelude::BigInt>,
+    ) -> napi::Result<napi::bindgen_prelude::BigInt> {
         crate::economy::economy_antispam_escalated_cost_on(
             &self.inner,
             context_id,
@@ -3593,6 +3608,32 @@ impl Scp {
             expected_subject,
             requirements_json,
             profile_json,
+        )
+    }
+
+    /// Per-instance equivalent of the free-function `check_capability_requirements`.
+    ///
+    /// Verifies that an agent meets a context's capability requirements for
+    /// admission (spec §7.3.4.4). `subjectDid`/`contextId` bind challenge
+    /// verifications to the agent and context being admitted. Returns normally
+    /// when all requirements are satisfied; throws on any unmet requirement or
+    /// malformed JSON.
+    #[napi(js_name = "checkCapabilityRequirements")]
+    pub fn check_capability_requirements(
+        &self,
+        context_id: String,
+        subject_did: String,
+        requirements_json: String,
+        agent_capabilities_json: String,
+        challenge_verifications_json: String,
+    ) -> napi::Result<()> {
+        crate::trust::check_capability_requirements_on(
+            &self.inner,
+            context_id,
+            subject_did,
+            requirements_json,
+            agent_capabilities_json,
+            challenge_verifications_json,
         )
     }
 

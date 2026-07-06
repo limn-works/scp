@@ -174,7 +174,7 @@ pub(crate) async fn dispatch(
 #[cfg(feature = "testing")]
 fn handle_seed_peer_pseudonym(
     cell: &mut crate::context::actor::class_s::ClassSCell,
-    member_did: scp_identity::DID,
+    member_did: scp_did::DID,
     pseudonym: [u8; 32],
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
@@ -207,7 +207,7 @@ fn handle_seed_peer_pseudonym(
 fn handle_test_insert_member(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
-    member_did: &scp_identity::DID,
+    member_did: &scp_did::DID,
     role: &str,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
@@ -255,10 +255,10 @@ async fn handle_send_message(
     deps: &ActorDeps,
     context_id: &str,
     params: scp_protocol::context::params::ContextParams,
-    sender_did: &scp_identity::DID,
+    sender_did: &scp_did::DID,
     payload: &[u8],
     signing_key: Option<&crate::context::actor::commands::SigningKeyBytes>,
-    signing_key_id: scp_protocol::identity::SigningKeyId,
+    signing_key_id: scp_did::SigningKeyId,
     source_provenance: Option<&scp_protocol::provenance::attach::SourceContextInfo>,
     spending_ucan: Option<&scp_protocol::crypto::ucan::UcanToken>,
     reply: oneshot::Sender<Result<(), ContextError>>,
@@ -507,7 +507,7 @@ async fn handle_send_pseudonym_announcement(
     deps: &ActorDeps,
     context_id: String,
     params: scp_protocol::context::params::ContextParams,
-    sender_did: &scp_identity::DID,
+    sender_did: &scp_did::DID,
     signing_key: &crate::context::actor::commands::SigningKeyBytes,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
@@ -600,7 +600,7 @@ fn handle_build_local_checkpoint(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
-    sender_did: &scp_identity::DID,
+    sender_did: &scp_did::DID,
     signing_key: &crate::context::actor::commands::SigningKeyBytes,
     reply: crate::context::actor::commands::BuildLocalCheckpointReply,
 ) -> Outcome<()> {
@@ -707,7 +707,7 @@ fn handle_send_heartbeat(
     state: &PerContextState,
     deps: &ActorDeps,
     context_id: &str,
-    sender_did: &scp_identity::DID,
+    sender_did: &scp_did::DID,
     signing_key: &crate::context::actor::commands::SigningKeyBytes,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {

@@ -9,9 +9,9 @@
 
 use std::collections::HashMap;
 
-use scp_primitives::Clock;
+use scp_clock::Clock;
 
-use scp_primitives::DID;
+use scp_did::DID;
 use scp_protocol::discovery::context::{AgentSearchParams, AgentSearchResult};
 use scp_protocol::discovery::{
     ContextId, DataProvenance, DiscoveryError, DiscoveryQuery, DiscoveryResult,
@@ -687,7 +687,7 @@ mod tests {
             min_history: None,
         };
 
-        let result = unified_search(&query, &[], &cache, &querier, &scp_primitives::SystemClock)
+        let result = unified_search(&query, &[], &cache, &querier, &scp_clock::SystemClock)
             .await
             .unwrap();
 
@@ -720,7 +720,7 @@ mod tests {
             &["ctx-discovery-1".to_owned()],
             &cache,
             &querier,
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .await
         .unwrap();
@@ -751,7 +751,7 @@ mod tests {
             &["ctx-discovery-1".to_owned()],
             &cache,
             &querier,
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .await
         .unwrap();
@@ -791,7 +791,7 @@ mod tests {
             &["ctx-discovery-1".to_owned()],
             &cache,
             &querier,
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .await
         .unwrap();
@@ -827,7 +827,7 @@ mod tests {
             &["ctx-good".to_owned(), "ctx-bad".to_owned()],
             &cache,
             &querier,
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .await
         .unwrap();
@@ -849,7 +849,7 @@ mod tests {
 
         let query = DiscoveryQuery::default();
 
-        let result = unified_search(&query, &[], &cache, &querier, &scp_primitives::SystemClock)
+        let result = unified_search(&query, &[], &cache, &querier, &scp_clock::SystemClock)
             .await
             .unwrap();
 
@@ -867,7 +867,7 @@ mod tests {
             min_history: None,
         };
 
-        let result = unified_search(&query, &[], &cache, &querier, &scp_primitives::SystemClock)
+        let result = unified_search(&query, &[], &cache, &querier, &scp_clock::SystemClock)
             .await
             .unwrap();
 
@@ -902,7 +902,7 @@ mod tests {
             &["ctx-1".to_owned(), "ctx-2".to_owned()],
             &cache,
             &querier,
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .await
         .unwrap();
@@ -929,7 +929,7 @@ mod tests {
             min_history: None,
         };
 
-        let result = unified_search(&query, &[], &cache, &querier, &scp_primitives::SystemClock)
+        let result = unified_search(&query, &[], &cache, &querier, &scp_clock::SystemClock)
             .await
             .unwrap();
 
@@ -960,7 +960,7 @@ mod tests {
             &["ctx-1".to_owned()],
             &cache,
             &querier,
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .await
         .unwrap();

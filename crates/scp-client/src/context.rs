@@ -13,8 +13,9 @@
 
 use std::collections::{HashMap, VecDeque};
 
+use scp_did::DID;
 use scp_event_log::tree::{GENESIS_PREV_HASH, append_unsigned_event, event_count, root};
-use scp_event_log::{DID, Event, EventLog, EventPayload, EventType};
+use scp_event_log::{Event, EventLog, EventPayload, EventType};
 use scp_protocol::context::membership::ContextEvent;
 
 use crate::crypto_state::ContextCryptoState;
@@ -48,6 +49,16 @@ pub struct PerContextState {
     pub member_sequence_numbers: HashMap<String, u64>,
     /// Pull-based receive buffer. Drained by `ScpClient::drain_events`.
     pub event_buffer: VecDeque<ContextEvent>,
+    /// Poison flag: set when a `Storage` write failed *after* this context's
+    /// in-memory state had already advanced irreversibly (see
+    /// [`ClientError::ContextPoisoned`](crate::ClientError::ContextPoisoned)). A
+    /// poisoned context is refused by every op that would advance or expose its
+    /// diverged state; the caller reconstructs from the last durable snapshot.
+    ///
+    /// Deliberately **not** part of the serialized snapshot: a restored context
+    /// is unpoisoned by construction (it *is* the last durable state, so nothing
+    /// has diverged). It is in-memory-only session state.
+    pub(crate) poisoned: bool,
 }
 
 impl PerContextState {
@@ -64,6 +75,7 @@ impl PerContextState {
             members: vec![creator_did.to_owned()],
             member_sequence_numbers,
             event_buffer: VecDeque::new(),
+            poisoned: false,
         }
     }
 
@@ -78,6 +90,7 @@ impl PerContextState {
             members: Vec::new(),
             member_sequence_numbers: HashMap::new(),
             event_buffer: VecDeque::new(),
+            poisoned: false,
         }
     }
 

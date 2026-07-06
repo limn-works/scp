@@ -272,13 +272,25 @@ scp/
 │   │
 │   ├── scp-core/              # Facade re-exporting scp-protocol + scp-runtime
 │   │
-│   ├── scp-identity/          # DID, DHT, document, key management
+│   ├── scp-identity/          # Native DID subsystem — DID-method (DidDht), resolution/publication, lifecycle
+│   │
+│   ├── scp-dht/               # Native DHT transport leaf — DhtClient/DhtRecord/InMemory/Pkarr + BEP44 helpers (ADR-057 T1c-a)
 │   │
 │   ├── scp-event-log/         # Merkle event log
 │   │
-│   ├── scp-primitives/        # Pure utility crate — zero SCP dependencies (Layer 0)
-│   │   ├── time.rs            # Clock helpers (now_secs, now_millis) with ClockError
-│   │   └── crypto.rs          # Ed25519 signature verification helpers
+│   ├── scp-clock/             # Clock port — wasm-safe capability leaf (Clock, SystemClock, TestClock)
+│   │
+│   ├── scp-crypto/            # Ed25519 verification — wasm-safe capability leaf
+│   │
+│   ├── scp-did/               # DID data model — wasm-safe (DID, SigningKeyId, DidDocument, proofs, attestation)
+│   │   ├── document.rs        # DidDocument, VerificationMethod, rotation/migration proofs, DidError
+│   │   └── attestation.rs     # Key-custody / identity-link attestation types
+│   │
+│   ├── scp-mls/               # Synchronous MLS state machine — wasm-safe, shared by node + browser (ADR-057)
+│   │
+│   ├── scp-client/            # Single-threaded in-browser participant driver over scp-mls (ADR-057)
+│   │
+│   ├── scp-client-wasm/       # wasm-bindgen browser surface over scp-client (ADR-057)
 │   │
 │   ├── scp-transport/         # Transport abstraction + adapters
 │   │   ├── traits.rs          # TransportAdapter trait (5 methods)
@@ -334,7 +346,7 @@ scp/
 │   └── scp-ffi/               # Foreign function interface layer
 │       ├── src/               # PyO3 definitions → Python (the REFERENCE bridge)
 │       ├── uniffi/            # UniFFI definitions → Swift, Kotlin
-│       └── napi/              # napi-rs → Node.js/Bun TypeScript (browser=remote thin client per ADR-055)
+│       └── napi/              # napi-rs → Node.js/Bun TypeScript (browser = in-tab client over scp-client-wasm, keys on-device, per ADR-057)
 │
 ├── bindings/
 │   ├── python/                # python package (scp-python)
@@ -583,7 +595,9 @@ State:
               ├──► scp-protocol
               ├──► scp-platform
               ├──► scp-identity
-              │    scp-protocol ──► scp-primitives
+              │    scp-protocol ──► scp-did
+              │                 ──► scp-crypto
+              │                 ──► scp-clock
               │                 ──► scp-event-log
               ▼
   scp-transport    scp-identity
@@ -592,11 +606,11 @@ State:
          scp-platform (traits)
               │
               ▼
-     scp-primitives (Layer 0)
+     scp-clock  scp-crypto  scp-did (wasm-safe capability leaves)
 
    scp-event-log (Merkle event log)
         │
-        └──► scp-primitives
+        └──► scp-clock, scp-crypto, scp-did
 
    scp-node (§18.6 — application deployment)
         │
@@ -652,10 +666,14 @@ This section documents the layered dependency graph, every replaceable subsystem
 
 #### 2.5.1 Layered Dependency Graph
 
-Dependencies flow strictly upward. No crate may depend on a crate at the same or higher layer. Violations are compile errors (separate crates) or PR review failures (internal modules).
+Dependencies flow strictly upward. No crate may depend on a crate at a *higher* layer; intra-layer edges are permitted but must be acyclic. The Layer 0 capability leaves (`scp-clock`, `scp-crypto`, `scp-did`) are mutually independent — each depends only on external crates (`scp-did` on `ed25519-dalek` directly), so there are no intra-layer edges among them. Violations are compile errors (separate crates) or PR review failures (internal modules).
 
 ```
-Layer 0 ─ scp-primitives            Pure utility crate (time, encoding, hashing helpers).
+Layer 0 ─ scp-clock                 Clock port (wall-clock time). Wasm-safe leaf.
+           │  scp-crypto             Ed25519 signature verification. Wasm-safe leaf.
+           │  scp-did                DID data model (DID, SigningKeyId, DidDocument,
+           │                          proofs, attestation). Wasm-safe leaf; deps =
+           │                          ed25519-dalek directly (no SCP deps).
            │  scp-platform            Platform abstraction traits (KeyCustody, Storage,
            │                          DeviceAttestation, Push).
            │                          Zero SCP dependencies — leaf crates.
@@ -663,9 +681,17 @@ Layer 0 ─ scp-primitives            Pure utility crate (time, encoding, hashin
 Layer 1 ─ scp-protocol              Pure sync protocol types (no tokio, wasm32-compatible).
            │  scp-runtime             Async orchestration (Supervisor + per-context actors, MLS, providers; ADR-049).
            │  scp-core                Facade re-exporting scp-protocol + scp-runtime.
-           │  scp-identity            DID, DHT, document, key management.
+           │  scp-identity            Native DID subsystem — DID-method (DidDht), resolution/publication,
+           │                          lifecycle; imports the DID model from scp-did and the DHT
+           │                          transport from scp-dht.
+           │  scp-dht                  Native DHT transport leaf — DhtClient/DhtRecord/InMemory/Pkarr
+           │                          + BEP44 helpers + DhtError; no SCP deps (one-way
+           │                          scp-identity → scp-dht edge; ADR-057 T1c-a).
            │  scp-event-log           Merkle event log.
-           │                          Depend on scp-primitives and scp-platform.
+           │  scp-mls                 Synchronous MLS state machine (wasm-safe; ADR-057).
+           │  scp-client              In-browser participant driver over scp-mls (ADR-057).
+           │  scp-client-wasm         wasm-bindgen browser surface over scp-client (ADR-057).
+           │                          Depend on scp-clock / scp-crypto / scp-did and scp-platform.
            │
 Layer 2 ─ scp-transport             Transport abstraction + native relay adapter.
            │  scp-mcp                 MCP bridge (server + client).
@@ -683,7 +709,7 @@ Layer 4 ─ scp-testing               Dev-dependency only. Network simulation ha
                                       Never imported by production code.
 ```
 
-**Completed extractions:** `scp-identity` and `scp-event-log` have been extracted from `scp-core` into standalone Layer 1 crates (issues #93, #94). `scp-primitives` was extracted as a Layer 0 leaf crate housing shared utilities (time, encoding, hashing) that previously lived in `scp-core` (issue #233). `scp-protocol` (pure sync types) and `scp-runtime` (async orchestration) have been extracted from the original `scp-core`, which is now a thin facade re-exporting both (issue #1446).
+**Completed extractions:** `scp-identity` and `scp-event-log` have been extracted from `scp-core` into standalone Layer 1 crates. `scp-protocol` (pure sync types) and `scp-runtime` (async orchestration) have been extracted from the original `scp-core`, which is now a thin facade re-exporting both. The former `scp-primitives` junk-drawer was dissolved into three single-responsibility wasm-safe capability leaves — `scp-clock` (the `Clock` port), `scp-crypto` (Ed25519 verification), and `scp-did` (the DID data model, which also absorbed the DID-document/attestation types that had been parked in `scp-protocol`) — per ADR-057's Amendment (no generality-tier crate: universality is not a domain). `scp-identity` keeps its native DID-method/resolution/lifecycle subsystem as one crate (the DID-**method** layer is not separable — `DidDht` is bidirectionally fused with the async, `scp-platform`-coupled identity types; see ADR-057 rejected alternative 5) and now imports the DID model from `scp-did`. The pure DHT **transport** layer, however, *was* separable and was extracted into the native `scp-dht` leaf (`DhtClient`/`DhtRecord`/`InMemoryDhtClient`/`PkarrDhtClient` + BEP44 helpers), a one-way `scp-identity` → `scp-dht` edge (ADR-057 T1c-a). The synchronous MLS state machine was lifted into the wasm-safe `scp-mls`, shared by the native runtime and the in-browser client (`scp-client` / `scp-client-wasm`), per ADR-057.
 
 #### 2.5.2 Replaceable Subsystems
 
@@ -696,8 +722,8 @@ Every subsystem in the table below is injected through a trait. Callers never co
 | Device attestation | `DeviceAttestation` | `scp-platform/src/traits.rs` | Full | Nothing — App Attest, Play Integrity, synthetic for testing. |
 | Push notifications | `Push` | `scp-platform/src/traits.rs` | Full | Nothing — APNs, FCM, synthetic. |
 | Transport | `TransportAdapter` | `scp-transport/src/traits.rs` | Full | Nothing — native relay, Nostr, Matrix, Hyperswarm, libp2p, WebSocket, WebRTC, custom. |
-| DID method | `DidMethod` | `scp-core/src/identity/mod.rs` | Full | Nothing — did:dht (primary), did:web (fallback), or custom method. |
-| DHT client | `DhtClient` | `scp-core/src/identity/dht_client.rs` | Full | Nothing — pkarr (production), in-memory (testing), or custom BEP44 client. |
+| DID method | `DidMethod` | `scp-identity/src/lib.rs` | Full | Nothing — did:dht (primary), did:web (fallback), or custom method. |
+| DHT client | `DhtClient` | `crates/scp-dht/src/dht_client/` | Full | Nothing — pkarr (production), in-memory (testing), or custom BEP44 client. |
 | MLS primitives | `MlsBackend` | `scp-runtime/src/crypto/mls/` | Partial | MLS is protocol-fundamental; the OpenMLS implementation is swappable but any replacement must implement RFC 9420 with the SCP ciphersuite. |
 | HPKE primitives | `HpkeBackend` | `scp-runtime/src/crypto/` | Full | Nothing — any RFC 9180 implementation with the SCP suite. |
 | OpenMLS storage | `OpenMlsStorageAdapter` | `scp-runtime/src/crypto/mls/storage.rs` | None — internal to the OpenMLS `MlsBackend` | Not intended for replacement; swapping this only makes sense if the OpenMLS-based `MlsBackend` itself is replaced. |
@@ -964,12 +990,13 @@ const ctx = await SCP.Context.create({
 await ctx.send('Hello from TypeScript');
 
 // Browser
-// Same API, but the browser build is a remote thin client (ADR-055): it
-// connects to a server-side scp-node over RPC/WebSocket and issues protocol
-// operations remotely. There is no in-browser protocol engine.
+// Same API, but the browser build runs the protocol in-tab over shared
+// scp-mls code (ADR-057): keys stay on-device and the browser executes its
+// own MLS/participant steps in wasm. A remote thin client to a server-side
+// scp-node (keys node-held) remains an opt-in custodial secondary mode.
 ```
 
-TypeScript uses napi-rs for in-process use on Node.js/Bun (Rust → native addon). The browser target is a remote thin client to a server-side `scp-node` (ADR-055) — it runs no protocol engine in-process.
+TypeScript uses napi-rs for in-process use on Node.js/Bun (Rust → native addon). The browser target runs the protocol in-tab over shared `scp-mls` code compiled to wasm32 (ADR-057) — an in-browser participant client with keys on-device; a remote custodial thin client to a server-side `scp-node` remains an opt-in secondary mode.
 
 ### 3.3 Swift SDK (iOS/macOS)
 
@@ -1121,7 +1148,7 @@ Build:
   • scp-core/discovery/scope.rs — scope registration tools: ScopeRegistry, validate_scope_name, scope_register/lookup/deregister (§22.3.5, ADR-043)
   • scp-core/provenance/ — data provenance tagging
   • crates/scp-ffi/uniffi/ — UniFFI definitions (prepares Swift/Kotlin)
-  • bindings/typescript/ — TypeScript SDK (napi-rs for Node/Bun; browser = remote thin client per ADR-055)
+  • bindings/typescript/ — TypeScript SDK (napi-rs for Node/Bun; browser = in-tab client over scp-client-wasm, keys on-device, per ADR-057)
 
 Test:
   • Key destruction: SimulatedClock advance triggers context expiry (§16.3),
@@ -1266,7 +1293,7 @@ This is a hard requirement, not an aspiration. Every protocol mechanism must be 
 | OpenMLS immaturity | Medium | High | OpenMLS is the most mature MLS library in Rust but may have edge cases. Fallback: mls-rs. Both are active. |
 | PyO3 async complexity | Medium | Medium | Rust async (tokio) ↔ Python async (asyncio) bridging is tricky. Mitigate with synchronous Python API as fallback. |
 | did:dht library gaps | Medium | Medium | did:dht is the primary method. If libraries hit a wall, did:web is the contingency fallback (not a planned path). SDK abstracts the DID method so the fallback is transparent to apps. |
-| Browser key custody | Low | Medium | Browser clients are remote thin clients (ADR-055): the server-side `scp-node` holds keys, MLS state, and the event log. The browser performs no in-process protocol execution, so Secure Enclave / platform-custody access is a node concern, not a browser one. |
+| Browser key custody | Low | Medium | Browser clients run the protocol in-tab over shared `scp-mls` code (ADR-057), so keys are on-device: the browser uses WebCrypto-backed custody (non-extractable keys) and holds its own MLS state and event log, rather than a server-side `scp-node` holding them. There is no browser Secure Enclave, so on-device key protection rests on the WebCrypto/IndexedDB substrate; a remote custodial thin client (node-held keys) remains an opt-in secondary mode. |
 | Transport adapter availability | Low | Low | SCP native relay is canonical and purpose-built. Multiple adapter options (Nostr, Hyperswarm, libp2p, Matrix, etc.) provide redundancy. No single-transport dependency. |
 | MLS group state sync (offline) | High | High | Offline members accumulate pending proposals. Extended offline (days) may require group state reset. This is the hardest unsolved problem. |
 
@@ -1278,7 +1305,7 @@ This is a hard requirement, not an aspiration. Every protocol mechanism must be 
 |---|---|---|
 | Ship order | SDK before app | Agents are the killer app. Demand is proven (Moltbook 2.6M). |
 | First binding | Python (PyO3) | Agent ecosystem is overwhelmingly Python. |
-| Second binding | TypeScript (napi-rs) | Node/Bun in-process; browser via remote thin client (ADR-055). |
+| Second binding | TypeScript (napi-rs) | Node/Bun in-process; browser = in-tab client over shared scp-mls, keys on-device (ADR-057). |
 | Third binding | Swift (UniFFI) | iOS/macOS apps. |
 | Core language | Rust | Crypto libraries, performance, cross-platform via FFI. |
 | DID method (primary) | did:dht | Self-certifying, decentralized, key rotation, no server dependency. No migration path. |

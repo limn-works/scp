@@ -24,7 +24,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use scp_core::store::ProtocolRepository;
-use scp_identity::document::DidDocument;
+use scp_did::DidDocument;
 use scp_identity::{DidMethod, ScpIdentity};
 use scp_platform::EncryptedStorage;
 use scp_platform::traits::{KeyCustody, Storage};
@@ -1159,10 +1159,10 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    use scp_clock::SystemClock;
+    use scp_dht::InMemoryDhtClient;
     use scp_identity::DidCache;
-    use scp_identity::cache::SystemClock;
     use scp_identity::dht::DidDht;
-    use scp_identity::dht_client::InMemoryDhtClient;
     use scp_platform::testing::{InMemoryKeyCustody, InMemoryStorage};
 
     use crate::ReachabilityTier;

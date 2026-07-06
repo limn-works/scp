@@ -20,7 +20,7 @@ fn test_credential(name: &str) -> scp_mls::ScpCredential {
     scp_mls::ScpCredential::new(
         format!("did:dht:z6Mk{name}"),
         None,
-        scp_primitives::SigningKeyId::Active,
+        scp_did::SigningKeyId::Active,
     )
     .unwrap()
 }
@@ -70,7 +70,7 @@ async fn sender_key_request_response_with_wrapping_key() {
     let bob_pubkey = custody.public_key(&bob_signing).await.unwrap();
 
     // Bob creates a request with an ephemeral wrapping key.
-    let clock = scp_primitives::SystemClock;
+    let clock = scp_clock::SystemClock;
     let request_result = request_sender_key(
         &custody,
         &bob_signing,
@@ -148,7 +148,7 @@ async fn tampered_wrapping_key_prevents_decryption() {
     let bob_signing = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
     let bob_pubkey = custody.public_key(&bob_signing).await.unwrap();
 
-    let clock = scp_primitives::SystemClock;
+    let clock = scp_clock::SystemClock;
     let request_result = request_sender_key(
         &custody,
         &bob_signing,
@@ -219,7 +219,12 @@ fn sender_keys_wrapping_stable_001() {
 
     // 3. Create group with wrapping key -> LeafNode contains extension.
     let cred = test_credential("conformance");
-    let group = scp_mls::group::create_group_with_wrapping_key(&cred, Some(&pub_key)).unwrap();
+    let group = scp_mls::group::create_group_with_wrapping_key(
+        &cred,
+        Some(&pub_key),
+        &scp_clock::SystemClock,
+    )
+    .unwrap();
     let extracted = extract_own_wrapping_key(&group).unwrap();
     assert_eq!(extracted, Some(pub_key), "wrapping key in LeafNode");
 
@@ -227,11 +232,12 @@ fn sender_keys_wrapping_stable_001() {
     //    the wrapping key is explicitly preserved.
     let bob_cred = test_credential("bob");
     let (bob_kp, _bob_signer, _bob_provider) =
-        scp_mls::group::generate_key_package(&bob_cred).unwrap();
+        scp_mls::group::generate_key_package(&bob_cred, &scp_clock::SystemClock).unwrap();
     let bob_kp_in: KeyPackageIn = bob_kp.key_package().clone().into();
 
     let mut group_mut = group;
-    let _add = scp_mls::group::add_member(&mut group_mut, bob_kp_in).unwrap();
+    let _add =
+        scp_mls::group::add_member(&mut group_mut, bob_kp_in, &scp_clock::SystemClock).unwrap();
 
     let _commit =
         scp_mls::ratchet::propose_update_with_wrapping_key(&mut group_mut, &pub_key).unwrap();

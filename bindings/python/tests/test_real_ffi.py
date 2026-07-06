@@ -601,12 +601,13 @@ class TestUcan:
             pass  # May fail depending on implementation state
 
     async def test_ucan_validate_fails_closed_without_presenting_agent(self, scp: SCP):
-        """The ENFORCING ucan_validate gate rejects an absent presenting agent.
+        """The ENFORCING ucan_validate gate requires a presenting agent.
 
-        Symmetric with the diagnostic ucan_evaluate gate: defaulting the
-        presenting agent to the token's own ``aud`` would make the step-5
-        audience check a tautology and inflate trust. The fail-closed check fires
-        before token parse, so any well-formed token string reaches it.
+        ``presenting_agent_did`` is a REQUIRED (non-optional) parameter: it is
+        never defaulted to the token's own ``aud`` (which would make the step-5
+        audience check a tautology and inflate trust). Omitting it is a
+        ``TypeError`` at the PyO3 boundary; an empty/whitespace value is trimmed
+        and rejected by ``validate_did`` as an invalid DID before token parse.
         """
         alice = await scp.identity_create(CustodyType.IN_MEMORY)
         handle = scp._native.context_create(
@@ -617,11 +618,13 @@ class TestUcan:
                 "governance": "single_admin",
             },
         )
-        # Omitted presenting agent → rejected.
-        with pytest.raises(Exception, match="presenting_agent_did is required"):
+        # Omitted presenting agent → the parameter is required, so PyO3 raises
+        # TypeError for the missing positional argument (no silent aud default).
+        with pytest.raises(TypeError):
             scp._native.ucan_validate(handle.context_id, "header.payload.sig", "messages:read")
-        # Empty / whitespace presenting agent → also rejected.
-        with pytest.raises(Exception, match="presenting_agent_did is required"):
+        # Empty / whitespace presenting agent → trimmed, then rejected as an
+        # invalid DID (empty after trim).
+        with pytest.raises(Exception, match="DID"):
             scp._native.ucan_validate(
                 handle.context_id, "header.payload.sig", "messages:read", "   "
             )
@@ -632,7 +635,7 @@ class TestUcan:
         Closes the coverage gap where only mocks exercised ``evaluate_trust``.
         Mints a valid token, then runs ``evaluate_trust`` (which drives the
         read-only ``ucan_evaluate`` diagnostic with NO challenge capability —
-        intrinsic-validity mode, ADR-057 / §7.2.4) and asserts the structured
+        intrinsic-validity mode, ADR-059 / §7.2.4) and asserts the structured
         Layer-1 booleans. A freshly minted, well-signed, in-ceiling token must
         report all six per-stage checks ``True``.
         """
@@ -694,7 +697,7 @@ class TestUcan:
         ``signatures_valid`` for a token addressed to someone else — trust
         inflation). Mints a token for Bob, then evaluates trust for Carol
         against that token and asserts the structured ``signatures_valid`` is
-        False (ADR-057 / §7.2.4).
+        False (ADR-059 / §7.2.4).
         """
         from scp_sdk.trust import evaluate_trust
 
@@ -748,7 +751,7 @@ class TestUcan:
         before the core diagnostic, so an empty or whitespace-only capability
         string is treated as "no challenge" — identical to omitting it. A bare
         ``"*"`` is NOT this (it is a malformed capability URI the bridge
-        rejects); absence is expressed by emptiness/omission only (ADR-057 /
+        rejects); absence is expressed by emptiness/omission only (ADR-059 /
         §7.2.4). This pins the PyO3 bridge's coercion so the cross-bridge
         parity test (TS real-napi sibling) and this one cannot diverge.
         """
@@ -803,7 +806,7 @@ class TestUcan:
         an empty capability must STILL report ``signatures_valid`` False --
         coercion to no-challenge cannot be mistaken for a validity shortcut. The
         sibling parity test only covered a VALID token; this pins the INVALID
-        case (ADR-057 / §7.2.4). TS sibling: the real-napi forged-token coercion
+        case (ADR-059 / §7.2.4). TS sibling: the real-napi forged-token coercion
         test.
         """
         alice = await scp.identity_create(CustodyType.IN_MEMORY)
@@ -925,6 +928,17 @@ class TestProvenance:
             None,
         )
         assert isinstance(result, dict)
+        # The dict surfaces every DataProvenance field, matching the NAPI/UniFFI
+        # bridges (parity with the canonical provenance record).
+        assert result["source_context"] == "source-ctx"
+        assert result["chain_depth"] == 0
+        # Discovery method mirrors the tagged wire shape; default is OutOfBand.
+        assert result["discovery_method"] == "OutOfBand"
+        # Economic provenance (§24.3.4, §19.6): present, null on this path since
+        # attach never mints a payment. ADR-060: amount is a decimal string.
+        assert result["payment_amount"] is None
+        assert result["payment_adapter"] is None
+        assert result["payment_receipt_id"] is None
 
     async def test_chain_depth(self, scp: SCP):
         # ADR-048 §1: pure helper now exposed as a module-level free fn.
@@ -959,6 +973,77 @@ class TestTrust:
             assert result is not None
         except Exception:
             pass  # Expected without attestation infrastructure
+
+    async def test_participation_admission_error_codes_surface(self, scp: SCP):
+        """verify_participation_requirements failures carry per-case structured codes.
+
+        Cross-bridge parity (spec section 7.3.2.1): the PyO3 bridge emits the
+        same per-case ``SCP-VALID-*`` code the UniFFI/NAPI bridges emit for the
+        same logical failure, and the code is recoverable from the raised
+        native ``ValidationError``'s string form (the ``[CODE]``-prefixed
+        message), exactly as ``check_capability_requirements``'s codes surface.
+        """
+        from scp_sdk.trust import (
+            ParticipationFact,
+            ParticipationThreshold,
+            RequireParticipation,
+            verify_participation_requirements,
+        )
+
+        # SDK wrapper: a malformed subject DID fails boundary validation with
+        # the generic validation code shared by all three bridges.
+        with pytest.raises(_scp_core.ValidationError, match="SCP-VALID-7000"):
+            verify_participation_requirements("not-a-did", [], [])
+
+        # SDK wrapper: a requirement with no satisfying profiles fails the
+        # admission check itself, which carries its own per-case code.
+        requirement = RequireParticipation(
+            fact=ParticipationFact("ParticipationDuration"),
+            threshold=ParticipationThreshold("AtLeast", 1),
+            max_age_secs=3600,
+            min_contexts=0,
+        )
+        with pytest.raises(_scp_core.ValidationError, match="SCP-VALID-7032"):
+            verify_participation_requirements("did:key:alice", [requirement], [])
+
+        # Raw bridge: the per-position JSON parse codes (unreachable through
+        # the typed SDK wrapper, which always serializes valid JSON).
+        with pytest.raises(_scp_core.ValidationError, match="SCP-VALID-7031"):
+            _scp_core.verify_participation_requirements("did:key:alice", "not json", "[]")
+        with pytest.raises(_scp_core.ValidationError, match="SCP-VALID-7030"):
+            _scp_core.verify_participation_requirements("did:key:alice", "[]", "not json")
+
+    async def test_capability_admission_error_codes_surface(self, scp: SCP):
+        """check_capability_requirements failures carry per-case structured codes.
+
+        The reference pattern for cross-bridge structured codes (spec section
+        7.3.4.4): asserts the anchor op's codes stay recoverable the same way
+        the participation sibling's now are.
+        """
+        from scp_sdk.trust import check_capability_requirements
+
+        # SDK wrapper: a malformed subject DID fails boundary validation with
+        # the generic validation code shared by all three bridges.
+        with pytest.raises(_scp_core.ValidationError, match="SCP-VALID-7000"):
+            check_capability_requirements("ctx-real-ffi", "not-a-did", [], [], [])
+
+        # SDK wrapper: a self-attested requirement the agent lacks fails the
+        # admission check itself, which carries its own per-case code.
+        from scp_sdk.trust import CapabilityRequirement, VerificationLevel
+
+        requirement = CapabilityRequirement(
+            capability="scp:capability:schema-validation/v1",
+            verification_level=VerificationLevel("SelfAttested"),
+        )
+        with pytest.raises(_scp_core.ValidationError, match="SCP-VALID-7076"):
+            check_capability_requirements("ctx-real-ffi", "did:key:alice", [requirement], [], [])
+
+        # Raw bridge: the per-position JSON parse code (unreachable through
+        # the typed SDK wrapper, which always serializes valid JSON).
+        with pytest.raises(_scp_core.ValidationError, match="SCP-VALID-7073"):
+            _scp_core.check_capability_requirements(
+                "ctx-real-ffi", "did:key:alice", "not json", "[]", "[]"
+            )
 
     async def test_participation_record_reflects_governance_real_ffi(self, scp: SCP):
         """The typed participation record (§7.3.2) RECEIVES real leaf-derived facts.

@@ -25,7 +25,7 @@ use scp_core::identity::{
     ScpIdChallenge, ScpIdResponse, scpid_challenge as core_scpid_challenge, scpid_sign,
     scpid_verify,
 };
-use scp_identity::SigningKeyId;
+use scp_did::SigningKeyId;
 
 use crate::error::ScpPyError;
 use crate::runtime::with_identity;
@@ -300,8 +300,9 @@ mod tests {
     use scp_ffi_common::error_codes as codes;
     use std::sync::Arc;
 
+    use scp_dht::InMemoryDhtClient;
     use scp_identity::resolver::DualLayerResolver;
-    use scp_identity::{DidCache, InMemoryDhtClient, NoOpRelayQuerier};
+    use scp_identity::{DidCache, NoOpRelayQuerier};
 
     fn default_scp() -> crate::scp::PyScp {
         crate::scp::PyScp::new_in_memory_for_test()
@@ -410,7 +411,10 @@ mod tests {
         let custody = Arc::new(scp_platform::testing::InMemoryKeyCustody::new());
 
         // Create a DidDht with a signer so we can publish the DID document.
-        let sign_fn = scp_identity::DidDht::<InMemoryDhtClient, scp_identity::cache::SystemClock>::make_sign_fn(Arc::clone(&custody));
+        let sign_fn =
+            scp_identity::DidDht::<InMemoryDhtClient, scp_clock::SystemClock>::make_sign_fn(
+                Arc::clone(&custody),
+            );
         let dht = scp_identity::DidDht::with_client_and_signer(
             Arc::clone(&dht_client),
             Arc::new(DidCache::new()),

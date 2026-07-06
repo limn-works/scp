@@ -18,7 +18,7 @@ use scp_core::economy::{
     PricingVariable, SenderVelocityTracker,
 };
 use scp_core::economy::{ObservableMetrics, check_policy_lock, evaluate_formula, lookup_cost};
-use scp_identity::DID;
+use scp_did::DID;
 use scp_testing::TestAdapter;
 
 /// Helper: create a payer DID.

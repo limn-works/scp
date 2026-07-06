@@ -330,7 +330,7 @@ async fn handle_withdraw_governance_vote_actor(
     deps: &ActorDeps,
     context_id: &str,
     proposal_id: &scp_protocol::context::governance::ProposalId,
-    voter_did: &scp_identity::DID,
+    voter_did: &scp_did::DID,
     reply: oneshot::Sender<Result<scp_protocol::context::governance::ProposalStatus, ContextError>>,
 ) -> Outcome<()> {
     let withdraw_fut = crate::context::governance_helpers::withdraw_governance_vote(
@@ -791,8 +791,7 @@ fn handle_evaluate_periodic_consequences_actor(
     }
     let now = deps.clock.now_secs();
     let context_id = cell.handle.context_id().to_owned();
-    let member_dids: Vec<scp_identity::DID> =
-        cell.membership.members().map(|m| m.did.clone()).collect();
+    let member_dids: Vec<scp_did::DID> = cell.membership.members().map(|m| m.did.clone()).collect();
     // Periodic sweep: one convergent window anchor shared across all members
     // so every honest member's durable consequence leaf converges (§9.9.3).
     let (events, convergent_now) = event_log_entries_for_consequences(
@@ -802,7 +801,7 @@ fn handle_evaluate_periodic_consequences_actor(
         deps.event_log.as_ref(),
     );
 
-    let mut results: Vec<(scp_identity::DID, Vec<TriggeredConsequence>)> = Vec::new();
+    let mut results: Vec<(scp_did::DID, Vec<TriggeredConsequence>)> = Vec::new();
     for member_did in member_dids {
         let triggered =
             evaluate_consequence_rules(&rules, &events, member_did.as_ref(), now, convergent_now);
@@ -1140,7 +1139,7 @@ async fn handle_evaluate_timeouts_actor(
 ) -> Outcome<()> {
     use std::collections::HashSet;
 
-    use scp_identity::DID;
+    use scp_did::DID;
 
     use crate::context::governance::timeout::{
         collect_active_voters, process_pending_proposals, update_detection_state,
@@ -1297,7 +1296,7 @@ mod consequence_fail_closed_tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use scp_identity::DID;
+    use scp_did::DID;
     use scp_protocol::context::membership::ContextEvent;
     use scp_protocol::context::params::Capability;
     use scp_protocol::trust::consequence::{
@@ -1355,6 +1354,7 @@ mod consequence_fail_closed_tests {
 
         let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
             ADMIN.to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
         ));
         let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
             Box::new(crate::context::builder::NotConfiguredTransportProvider);
@@ -1366,8 +1366,7 @@ mod consequence_fail_closed_tests {
                     InMemoryStorage::new(),
                 )),
             );
-        let clock: Arc<dyn scp_primitives::Clock> =
-            Arc::new(scp_primitives::TestClock::new(1_700_000_000));
+        let clock: Arc<dyn scp_clock::Clock> = Arc::new(scp_clock::TestClock::new(1_700_000_000));
         let supervisor = Supervisor::with_providers(
             crypto,
             transport,
@@ -1560,7 +1559,7 @@ mod consequence_fail_closed_tests {
             payload: Vec::new(),
             provenance: None,
             provenance_hash: [0u8; 32],
-            signing_key_id: scp_protocol::identity::SigningKeyId::Active,
+            signing_key_id: scp_did::SigningKeyId::Active,
             signature: [0u8; 64],
             extensions: std::collections::HashMap::new(),
         };

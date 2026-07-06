@@ -46,7 +46,7 @@ import type {
  * The NAPI bridge result (`NapiCapabilityValidation`) already exposes the six
  * camelCase booleans, so this is a field-for-field copy that pins the canonical
  * six-field shape in ONE place — the native bridge factory calls it, so a field
- * can never be silently dropped or re-spelled (ADR-057 / spec §7.2.4). The copy
+ * can never be silently dropped or re-spelled (ADR-059 / spec §7.2.4). The copy
  * (rather than returning `raw`) keeps the SDK object's own identity and strips
  * any extra bridge fields.
  */
@@ -361,7 +361,7 @@ export interface Bridge {
    * Read-only, structured counterpart to {@link ucanValidate}: runs the same
    * 11-step ADR-016 pipeline but resolves to a {@link CapabilityValidation}
    * (six per-stage booleans) instead of throwing on a capability outcome, and
-   * never records the token's nonce (spec §7.2.4, ADR-057). It still rejects
+   * never records the token's nonce (spec §7.2.4, ADR-059). It still rejects
    * for malformed FFI inputs (bad token / capability / DID strings).
    *
    * `capability` is OPTIONAL: `null`/`undefined` (or empty) evaluates the
@@ -627,26 +627,26 @@ export interface Bridge {
   validateContextParams(paramsJson: string): string | null;
 
   // Economy (§19, ADR-033)
-  economyEstimateCost(policyJson: string, actionType: string, metricsJson: string): number;
+  economyEstimateCost(policyJson: string, actionType: string, metricsJson: string): bigint;
   economyPolicyRequiresPayment(policyJson: string): boolean;
   economyAutoAcceptBlocked(policyJson: string): boolean;
   economyCheckPolicyLock(policyJson: string): boolean;
   economyValidatePolicyChange(currentJson: string, proposedJson: string): boolean;
-  economyEvaluateFormula(formulaJson: string, metricsJson: string): number;
-  economyBudgetRemaining(contextId: string, did: string): number;
-  economyBudgetGrant(contextId: string, did: string, amount: number): void;
-  economyBudgetRecordSpend(contextId: string, did: string, amount: number): void;
+  economyEvaluateFormula(formulaJson: string, metricsJson: string): bigint;
+  economyBudgetRemaining(contextId: string, did: string): bigint;
+  economyBudgetGrant(contextId: string, did: string, amount: bigint): void;
+  economyBudgetRecordSpend(contextId: string, did: string, amount: bigint): void;
   economyAntispamRecord(contextId: string, senderDid: string, timestamp: number): void;
   economyAntispamVelocity(contextId: string, senderDid: string, now: number): number;
   economyAntispamEscalatedCost(
     contextId: string,
     senderDid: string,
     now: number,
-    baseCost: number,
+    baseCost: bigint,
     thresholdsJson: string,
-    floor: number | null,
-    cap: number | null,
-  ): number;
+    floor: bigint | null,
+    cap: bigint | null,
+  ): bigint;
   economyVerifyPaymentReceipts(receiptsJson: string): string;
 
   // Media (ADR-024)
@@ -686,6 +686,15 @@ export interface Bridge {
     profileJson: string,
   ): void;
 
+  // Trust — capability admission verification (§7.3.4.4, SCP-ACR-008)
+  checkCapabilityRequirements(
+    contextId: string,
+    subjectDid: string,
+    requirementsJson: string,
+    agentCapabilitiesJson: string,
+    challengeVerificationsJson: string,
+  ): void;
+
   // Lifecycle
   version(): string;
   /**
@@ -722,7 +731,7 @@ export interface BridgeIdentityHandle {
   readonly did: string;
   readonly custodyType: string;
   /**
-   * JSON-serialized `scp_identity::DidRotationEvent`, present only on
+   * JSON-serialized `scp_did::DidRotationEvent`, present only on
    * handles produced by `identityMigrate` (spec §9.12, ADR-003 §4b/4c).
    * SDK callers MUST distribute this event to active context members
    * per spec §3.2.1 step 4b. `undefined` for any handle minted by

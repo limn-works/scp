@@ -29,7 +29,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use scp_primitives::DID;
+use scp_did::DID;
 use scp_protocol::context::metadata::{MetadataSnapshot, OperationalMetadata, StructuralMetadata};
 use scp_protocol::context::params::{ContextParams, FieldVisibility};
 use scp_protocol::economy::EconomicPolicy;

@@ -27,7 +27,7 @@ describe("bridge selection", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Single bridge-error chokepoint (ADR-057)
+// Single bridge-error chokepoint (ADR-059)
 // ---------------------------------------------------------------------------
 //
 // `wrapBridgeErrors` is the one site that converts raw FFI errors into typed

@@ -61,7 +61,7 @@ use scp_core::store::ProtocolRepository;
 #[cfg(feature = "sqlite")]
 use scp_core::store::context::ProtocolRepositoryContextBridge;
 #[cfg(feature = "sqlite")]
-use scp_identity::DID;
+use scp_did::DID;
 #[cfg(feature = "sqlite")]
 use scp_platform::testing::InMemoryStorage;
 
@@ -89,7 +89,7 @@ const SQLITE_KEY: [u8; 32] = [0x42; 32];
 /// lifecycle — we only need the `ContextManager` to be constructible.
 #[cfg(feature = "sqlite")]
 fn permissive_key_resolver() -> KeyResolver {
-    Arc::new(|_did: &DID, _kid: scp_identity::SigningKeyId| None)
+    Arc::new(|_did: &DID, _kid: scp_did::SigningKeyId| None)
 }
 
 /// Returns `ContextParams` for an encrypted context with the capability
@@ -201,7 +201,10 @@ async fn context_create_persists_membership_to_sqlite() {
         // ADR-049 commit 12 — `Supervisor::with_providers` replaces the
         // deleted `ContextManager::builder().storage(..).build()` chain.
         let manager = Supervisor::with_providers(
-            Arc::new(MlsCryptoProvider::new(ALICE_DID.to_owned())),
+            Arc::new(MlsCryptoProvider::new(
+                ALICE_DID.to_owned(),
+                std::sync::Arc::new(scp_clock::SystemClock),
+            )),
             Box::new(NotConfiguredTransportProvider),
             Box::new(MerkleEventLogProvider::new()),
             permissive_key_resolver(),
@@ -300,7 +303,10 @@ async fn full_lifecycle_suspend_restore_roundtrip() {
         // ADR-049 commit 12 — `Supervisor::with_providers` replaces the
         // deleted `ContextManager::builder().storage(..).build()` chain.
         let manager = Supervisor::with_providers(
-            Arc::new(MlsCryptoProvider::new(ALICE_DID.to_owned())),
+            Arc::new(MlsCryptoProvider::new(
+                ALICE_DID.to_owned(),
+                std::sync::Arc::new(scp_clock::SystemClock),
+            )),
             Box::new(NotConfiguredTransportProvider),
             Box::new(MerkleEventLogProvider::new()),
             permissive_key_resolver(),
@@ -366,7 +372,10 @@ async fn full_lifecycle_suspend_restore_roundtrip() {
     // ADR-049 commit 12 — `Supervisor::with_providers` replaces the
     // deleted `ContextManager::with_persistence(..)` constructor.
     let manager2 = Supervisor::with_providers(
-        Arc::new(MlsCryptoProvider::new(ALICE_DID.to_owned())),
+        Arc::new(MlsCryptoProvider::new(
+            ALICE_DID.to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
+        )),
         Box::new(NotConfiguredTransportProvider),
         Box::new(MerkleEventLogProvider::new()),
         permissive_key_resolver(),

@@ -5,6 +5,8 @@
 #           number in the allocated range (sdk-common.md).
 # Phase 2: Detects cross-bridge error code collisions — same code number
 #           used for semantically different errors.
+# Phase 3: Registry in-band uniqueness — each code literal is defined by
+#           exactly one constant in error_codes.rs (one number, one purpose).
 #
 # Canonical prefixes and ranges:
 #   SCP-IDENT-   1000-1999    SCP-CTX-     2000-2999
@@ -273,6 +275,31 @@ if [[ $COLLISION_COUNT -gt 0 ]]; then
     echo ""
     echo "Found $COLLISION_COUNT error code collision(s)."
     echo "Each error code number must have a single semantic meaning across all bridges."
+fi
+
+# ---------------------------------------------------------------------------
+# Phase 3: Registry in-band uniqueness.
+#
+# The registry (error_codes.rs) is the single source of truth mapping each
+# code number to one purpose (the constant's doc-comment is normative).
+# Assert that every quoted "SCP-...-NNNN" literal appears exactly once in
+# the registry file — a duplicate means two constants (two purposes) claim
+# the same number.
+# ---------------------------------------------------------------------------
+
+REGISTRY_FILE="crates/scp-ffi/common/src/error_codes.rs"
+if [[ -f "$REGISTRY_FILE" ]]; then
+    REGISTRY_DUPES=$(grep -oE '"SCP-[A-Z]+-[0-9]+"' "$REGISTRY_FILE" | sort | uniq -d || true)
+    if [[ -n "$REGISTRY_DUPES" ]]; then
+        while IFS= read -r dup; do
+            echo "VIOLATION: $REGISTRY_FILE: $dup is defined by more than one registry constant"
+            VIOLATIONS=$((VIOLATIONS + 1))
+        done <<< "$REGISTRY_DUPES"
+        echo "Each code number must map to exactly one registry constant/purpose."
+    fi
+else
+    echo "VIOLATION: registry file $REGISTRY_FILE not found"
+    VIOLATIONS=$((VIOLATIONS + 1))
 fi
 
 if [[ $VIOLATIONS -gt 0 ]]; then

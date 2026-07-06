@@ -31,12 +31,13 @@ use sha2::{Digest, Sha256};
 
 use scp_platform::traits::{KeyCustody, KeyType, PreRotationCustody, PreRotationKeyHandle};
 
-use super::cache::{Clock, DidCache, DidResolutionResult, Staleness, SystemClock};
-use super::dht_client::{DhtClient, InMemoryDhtClient};
-use super::document::{
+use super::cache::{DidCache, DidResolutionResult, Staleness};
+use super::{DidMethod, IdentityError, ScpIdentity};
+use scp_clock::{Clock, SystemClock};
+use scp_dht::{DhtClient, InMemoryDhtClient};
+use scp_did::{
     DidDocument, DidRotationEvent, MigrationProof, PreRotationProof, decode_multibase_key,
 };
-use super::{DidMethod, IdentityError, ScpIdentity};
 
 /// The `did:dht` DID method prefix.
 const DID_DHT_PREFIX: &str = "did:dht:";
@@ -801,33 +802,6 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
         Ok(())
     }
 
-    /// Constructs the BEP44 signable payload for a value and sequence number.
-    ///
-    /// Delegates to the standalone [`bep44_signable`] function.
-    #[must_use]
-    pub fn bep44_signable(value: &[u8], seq: u64) -> Vec<u8> {
-        bep44_signable(value, seq)
-    }
-
-    /// Verifies a BEP44 Ed25519 signature over the given value and sequence.
-    ///
-    /// Delegates to the standalone [`verify_bep44_signature`] function.
-    fn verify_bep44_signature(
-        public_key: &[u8; 32],
-        signature: &[u8; 64],
-        value: &[u8],
-        seq: u64,
-    ) -> Result<(), IdentityError> {
-        verify_bep44_signature(public_key, signature, value, seq)
-    }
-
-    /// Extracts the 32-byte public key from a `did:dht:z...` string.
-    ///
-    /// Delegates to the standalone [`extract_public_key`] function.
-    fn extract_public_key(did_string: &str) -> Result<[u8; 32], IdentityError> {
-        extract_public_key(did_string)
-    }
-
     /// Publishes a DID document to the DHT with the given signing function.
     ///
     /// This is the internal publish implementation used by both
@@ -859,7 +833,7 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
         let seq = self.sequence.fetch_add(1, Ordering::AcqRel) + 1;
 
         // Construct the BEP44 signable payload and sign it.
-        let signable = Self::bep44_signable(value, seq);
+        let signable = scp_dht::bep44_signable(value, seq);
         let sig_bytes = sign_fn(identity.identity_key.id(), signable).await?;
 
         // Convert signature to [u8; 64].
@@ -871,7 +845,7 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
         })?;
 
         // Extract the public key from the DID.
-        let public_key = Self::extract_public_key(&identity.did)?;
+        let public_key = extract_public_key(&identity.did)?;
 
         // Publish to DHT.
         self.dht_client
@@ -966,7 +940,7 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
         }
 
         // Step 2: Extract public key and query DHT.
-        let public_key = Self::extract_public_key(did_string)?;
+        let public_key = extract_public_key(did_string)?;
 
         let record = self
             .dht_client
@@ -975,7 +949,7 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
             .ok_or_else(|| IdentityError::DhtNotFound(did_string.to_owned()))?;
 
         // Step 3: Verify BEP44 signature.
-        Self::verify_bep44_signature(&public_key, &record.signature, &record.value, record.seq)?;
+        scp_dht::verify_bep44_signature(&public_key, &record.signature, &record.value, record.seq)?;
 
         // Step 4: Deserialize the DID document.
         let doc_json = String::from_utf8(record.value).map_err(|e| {
@@ -2121,21 +2095,15 @@ impl<D: DhtClient + 'static, C: Clock + 'static> DidMethod for DidDht<D, C> {
     }
 
     fn verify(&self, did_string: &str, public_key: &[u8]) -> bool {
-        // Strip the "did:dht:z" prefix to get the z-base-32 encoded key.
-        let Some(encoded) = did_string
-            .strip_prefix(DID_DHT_PREFIX)
-            .and_then(|s| s.strip_prefix('z'))
-        else {
-            return false;
-        };
-
-        // Decode z-base-32.
-        let Ok(decoded) = zbase32::decode(encoded) else {
-            return false;
-        };
-
-        // Compare decoded bytes to provided public key.
-        decoded == public_key
+        // Delegate to the hardened `extract_public_key` free fn (same module)
+        // rather than decoding inline. That parser strips the "did:dht:z"
+        // prefix, z-base-32-decodes, requires exactly 32 bytes, AND enforces
+        // canonicality (re-encode + byte-exact compare). Routing the self-
+        // certification check through it means a NON-canonical spelling of a
+        // valid key does not self-certify — closing the trailing-bit-padding
+        // non-injectivity — and keeps this decoder byte-for-byte identical to
+        // every other did:dht decoder (single-parser parity).
+        extract_public_key(did_string).is_ok_and(|decoded_key| public_key == decoded_key.as_slice())
     }
 
     fn publish(
@@ -2642,52 +2610,6 @@ pub fn verify_migration(
 // BEP44 utility functions — public for use by relay-based resolution (§3.10.2)
 // ---------------------------------------------------------------------------
 
-/// Constructs the BEP44 signable payload for a value and sequence number.
-///
-/// BEP44 signing payload format (without salt):
-/// `"3:seqi" + seq + "e1:v" + val_len + ":" + val`
-///
-/// This is a standalone function usable from both [`DidDht`] and relay-based
-/// resolution (§3.10.2).
-#[must_use]
-pub fn bep44_signable(value: &[u8], seq: u64) -> Vec<u8> {
-    let mut payload = Vec::new();
-    payload.extend_from_slice(b"3:seqi");
-    payload.extend_from_slice(seq.to_string().as_bytes());
-    payload.extend_from_slice(b"e1:v");
-    payload.extend_from_slice(value.len().to_string().as_bytes());
-    payload.extend_from_slice(b":");
-    payload.extend_from_slice(value);
-    payload
-}
-
-/// Verifies a BEP44 Ed25519 signature over the given value and sequence.
-///
-/// Constructs the BEP44 signable payload, then verifies the Ed25519 signature
-/// against `public_key`. Used by both DHT resolution and relay-based resolution
-/// (§3.10.2).
-///
-/// # Errors
-///
-/// Returns [`IdentityError::Bep44SignatureInvalid`] if the signature does
-/// not verify or the public key is invalid.
-pub fn verify_bep44_signature(
-    public_key: &[u8; 32],
-    signature: &[u8; 64],
-    value: &[u8],
-    seq: u64,
-) -> Result<(), IdentityError> {
-    let verifying_key = VerifyingKey::from_bytes(public_key)
-        .map_err(|e| IdentityError::Bep44SignatureInvalid(format!("invalid public key: {e}")))?;
-
-    let sig = ed25519_dalek::Signature::from_bytes(signature);
-    let payload = bep44_signable(value, seq);
-
-    verifying_key.verify_strict(&payload, &sig).map_err(|e| {
-        IdentityError::Bep44SignatureInvalid(format!("signature verification failed: {e}"))
-    })
-}
-
 /// Derives the `did:dht:z...` string from a raw Ed25519 public key.
 ///
 /// Encodes the 32-byte public key as z-base-32 and prepends the `did:dht:z`
@@ -2703,58 +2625,49 @@ pub fn did_from_ed25519_public_key(public_key: &[u8; 32]) -> String {
 
 /// Extracts the 32-byte Ed25519 public key from a `did:dht:z...` string.
 ///
-/// Strips the `did:dht:z` prefix and z-base-32 decodes the remainder to recover
-/// the 32-byte Identity Key public key. Used by both DHT resolution and
+/// A thin wrapper (ADR-057 T1c-b): an unconditional `did:dht`-only prefix gate
+/// followed by delegation to the single hardened z-base-32 authority,
+/// [`scp_did::extract_public_key_from_did`]. Used by both DHT resolution and
 /// relay-based resolution (§3.10.2).
 ///
 /// # Errors
 ///
-/// Returns [`IdentityError::InvalidDidFormat`] if the DID format is wrong,
-/// the z-base-32 payload is non-canonical, or the decoded bytes are not
-/// 32 bytes. Returns [`IdentityError::ZBase32DecodeError`] if z-base-32
-/// decoding fails.
+/// Returns [`IdentityError::InvalidDidFormat`] if the DID does not have a
+/// `did:dht:z` prefix, if z-base-32 decoding fails, if the decoded bytes are
+/// not exactly 32, or if the z-base-32 payload is non-canonical. The decode,
+/// length, and canonicality failures carry the `scp-did` authority's message
+/// text under the single `InvalidDidFormat` channel.
 ///
 /// # Canonicality
 ///
 /// z-base-32 encoding of 32-byte payloads is NOT injective on its
 /// trailing bit-padding: 256 bits = 51 full chars (255 bits) + a 52nd
 /// char carrying 1 payload bit + 4 padding bits, so 16 alternate
-/// encodings decode to the same 32-byte payload. We re-encode the
-/// decoded bytes and require the input to match the canonical form,
-/// so two distinct DID strings cannot resolve to the same `#0` key
-/// (would otherwise enable petname squatting, log/UI spoofing, and
+/// encodings decode to the same 32-byte payload. The `scp-did` authority
+/// re-encodes the decoded bytes and requires the input to match the
+/// canonical form, so two distinct DID strings cannot resolve to the same
+/// `#0` key (would otherwise enable petname squatting, log/UI spoofing, and
 /// equality-by-string mismatches downstream).
 pub fn extract_public_key(did_string: &str) -> Result<[u8; 32], IdentityError> {
-    let encoded = did_string
+    // Custody-independent did:dht-only gate (ADR-057 T1c-b). The scp-did
+    // authority accepts a did:key:{hex} test convenience when scp-did/testing
+    // is enabled — a feature reachable transitively through custody opt-ins.
+    // A cfg-gate on this crate's own `testing` feature would be off in those
+    // same custody builds, so the gate is an unconditional positive prefix
+    // check: the native surface accepts ONLY did:dht, in every build,
+    // exactly as before consolidation.
+    let is_did_dht = did_string
         .strip_prefix(DID_DHT_PREFIX)
-        .and_then(|s| s.strip_prefix('z'))
-        .ok_or_else(|| {
-            IdentityError::InvalidDidFormat(format!(
-                "expected 'did:dht:z...' prefix, got: {did_string}"
-            ))
-        })?;
-
-    let decoded = zbase32::decode(encoded)
-        .map_err(|e| IdentityError::ZBase32DecodeError(format!("z-base-32 decode failed: {e}")))?;
-
-    let key_bytes: [u8; 32] = decoded.try_into().map_err(|v: Vec<u8>| {
-        IdentityError::InvalidDidFormat(format!(
-            "expected 32-byte public key, got {} bytes",
-            v.len()
-        ))
-    })?;
-
-    // Canonicality check: the encoder is not strictly injective on
-    // the trailing bit-padding of a 32-byte payload. Reject inputs
-    // that don't round-trip through the canonical encoding.
-    let canonical = zbase32::encode(&key_bytes);
-    if canonical != encoded {
+        .is_some_and(|s| s.starts_with('z'));
+    if !is_did_dht {
         return Err(IdentityError::InvalidDidFormat(format!(
-            "did:dht z-base-32 payload is not canonical (expected {canonical:?}, got {encoded:?})"
+            "expected 'did:dht:z...' prefix, got: {did_string}"
         )));
     }
 
-    Ok(key_bytes)
+    // Delegate decode, 32-byte length, and z-base-32 canonicality to the
+    // single hardened scp-did authority (one zbase32::decode workspace-wide).
+    scp_did::extract_public_key_from_did(did_string).map_err(IdentityError::InvalidDidFormat)
 }
 
 #[cfg(test)]
@@ -2765,8 +2678,8 @@ mod tests {
     use scp_platform::testing::InMemoryKeyCustody;
 
     use super::*;
-    use crate::cache::TestClock;
-    use crate::dht_client::InMemoryDhtClient;
+    use scp_clock::TestClock;
+    use scp_dht::{DhtError, InMemoryDhtClient};
 
     /// Helper to create a fully-configured `DidDht` for testing.
     fn make_dht_with_custody(
@@ -2850,6 +2763,57 @@ mod tests {
     fn verify_did_returns_false_for_missing_z_prefix() {
         let dht = DidDht::new();
         assert!(!dht.verify("did:dht:notzbased", &[1u8; 32]));
+    }
+
+    #[test]
+    fn verify_rejects_non_canonical_spelling_of_matching_key() {
+        // The self-certification check MUST enforce z-base-32 canonicality:
+        // a non-canonical spelling of the SAME key must not self-certify,
+        // even though it decodes to the matching bytes. z-base-32 of a 32-byte
+        // payload is not injective on its trailing bit-padding (52nd char = 1
+        // payload bit + 4 padding bits → 16 alternate encodings). Without the
+        // guard, `verify` would accept 16 distinct DID strings for one key.
+        const ALPHABET: &[u8; 32] = b"ybndrfg8ejkmcpqxot1uwisza345h769";
+
+        let dht = DidDht::new();
+        let key = [0x42u8; 32];
+        let canonical_encoded = zbase32::encode(&key);
+        let canonical_did = format!("did:dht:z{canonical_encoded}");
+
+        // Canonical spelling of the matching key self-certifies.
+        assert!(
+            dht.verify(&canonical_did, &key),
+            "canonical did:dht spelling of the matching key must verify true"
+        );
+
+        // Build a non-canonical alternate by toggling a padding bit of the
+        // trailing char.
+        let last_char = canonical_encoded.as_bytes()[canonical_encoded.len() - 1];
+        let last_idx = ALPHABET
+            .iter()
+            .position(|&c| c == last_char)
+            .expect("canonical char must be in alphabet");
+        let mut mutated_bytes = canonical_encoded.as_bytes().to_vec();
+        let last_pos = mutated_bytes.len() - 1;
+        mutated_bytes[last_pos] = ALPHABET[last_idx ^ 1];
+        let mutated_encoded =
+            String::from_utf8(mutated_bytes).expect("z-base-32 alphabet is ASCII");
+        let mutated_did = format!("did:dht:z{mutated_encoded}");
+
+        // Sanity: the mutated spelling still decodes to the same 32 bytes.
+        assert_eq!(
+            zbase32::decode(&mutated_encoded)
+                .expect("alternate decodes")
+                .as_slice(),
+            &key[..],
+            "the mutated spelling must decode to the same key (a real non-canonical alternate)"
+        );
+
+        // The non-canonical spelling of the matching key MUST NOT self-certify.
+        assert!(
+            !dht.verify(&mutated_did, &key),
+            "non-canonical did:dht spelling must not self-certify even for the matching key"
+        );
     }
 
     #[test]
@@ -3126,8 +3090,7 @@ mod tests {
             &[97u8; 32],
         );
         let tampered_json = tampered_doc.to_json().unwrap();
-        let public_key =
-            DidDht::<InMemoryDhtClient, Arc<TestClock>>::extract_public_key(&identity.did).unwrap();
+        let public_key = extract_public_key(&identity.did).unwrap();
         dht_client
             .publish(&public_key, &[0u8; 64], tampered_json.as_bytes(), 1)
             .await
@@ -3165,17 +3128,6 @@ mod tests {
 
         let result = dht.publish_document(&identity, &document).await;
         assert!(matches!(result, Err(IdentityError::DhtPublishFailed(_))));
-    }
-
-    #[tokio::test]
-    async fn bep44_signable_format_is_correct() {
-        let value = b"test";
-        let seq = 42;
-        let signable = DidDht::<InMemoryDhtClient>::bep44_signable(value, seq);
-
-        // Expected: "3:seqi42e1:v4:test"
-        let expected = b"3:seqi42e1:v4:test";
-        assert_eq!(signable, expected);
     }
 
     #[tokio::test]
@@ -3268,13 +3220,13 @@ mod tests {
         let encoded = zbase32::encode(&key);
         let did = format!("did:dht:z{encoded}");
 
-        let extracted = DidDht::<InMemoryDhtClient>::extract_public_key(&did).unwrap();
+        let extracted = extract_public_key(&did).unwrap();
         assert_eq!(extracted, key);
     }
 
     #[test]
     fn extract_public_key_rejects_invalid_prefix() {
-        let result = DidDht::<InMemoryDhtClient>::extract_public_key("did:web:example.com");
+        let result = extract_public_key("did:web:example.com");
         assert!(result.is_err());
     }
 
@@ -3298,8 +3250,7 @@ mod tests {
         let canonical_did = format!("did:dht:z{canonical_encoded}");
 
         // Sanity: the canonical form is accepted.
-        let canonical_result =
-            DidDht::<InMemoryDhtClient>::extract_public_key(&canonical_did).unwrap();
+        let canonical_result = extract_public_key(&canonical_did).unwrap();
         assert_eq!(canonical_result, key);
 
         // Construct a non-canonical alternate by mutating the trailing
@@ -3323,8 +3274,7 @@ mod tests {
         assert_eq!(raw_decoded.as_slice(), &key[..]);
 
         // The canonicality check MUST reject it.
-        let err = DidDht::<InMemoryDhtClient>::extract_public_key(&mutated_did)
-            .expect_err("non-canonical DID MUST be rejected");
+        let err = extract_public_key(&mutated_did).expect_err("non-canonical DID MUST be rejected");
         match err {
             IdentityError::InvalidDidFormat(msg) => {
                 assert!(
@@ -3334,6 +3284,109 @@ mod tests {
             }
             other => panic!("expected InvalidDidFormat, got: {other:?}"),
         }
+    }
+
+    /// Re-fork guard (ADR-057 T1c-b): the native wrapper
+    /// (`scp_identity::dht::extract_public_key`) delegates to the single
+    /// hardened z-base-32 authority (`scp_did::extract_public_key_from_did`) —
+    /// the same parser the browser/event-log signature-verify path reaches. This
+    /// test feeds the *same* `did:dht:z…` fixtures through both symbols and
+    /// asserts they accept and reject identically. Its purpose is to catch a
+    /// future RE-FORK: if someone reintroduces an inline z-base-32 decode inside
+    /// the wrapper that drifts from the authority (e.g. drops the canonicality
+    /// round-trip), the wrapper would accept a non-canonical `did:dht` the
+    /// authority rejects and this assertion would fail. It pins the
+    /// security-parity invariant: the native surface must never accept a key the
+    /// shared authority would reject as non-canonical.
+    #[test]
+    fn wrapper_delegates_to_scp_did_authority_on_accept_and_reject() {
+        const ALPHABET: &[u8; 32] = b"ybndrfg8ejkmcpqxot1uwisza345h769";
+
+        let key = [42u8; 32];
+        let canonical_encoded = zbase32::encode(&key);
+        let canonical_did = format!("did:dht:z{canonical_encoded}");
+
+        // Wrapper and authority accept the canonical spelling and yield the
+        // same key.
+        assert_eq!(extract_public_key(&canonical_did).unwrap(), key);
+        assert_eq!(
+            scp_did::extract_public_key_from_did(&canonical_did).unwrap(),
+            key
+        );
+
+        // Construct a non-canonical alternate (toggle a trailing padding bit).
+        let last_char = canonical_encoded.as_bytes()[canonical_encoded.len() - 1];
+        let last_idx = ALPHABET
+            .iter()
+            .position(|&c| c == last_char)
+            .expect("canonical char must be in alphabet");
+        let mutated_idx = last_idx ^ 1;
+        let mut mutated_bytes = canonical_encoded.as_bytes().to_vec();
+        let last_pos = mutated_bytes.len() - 1;
+        mutated_bytes[last_pos] = ALPHABET[mutated_idx];
+        let mutated_encoded =
+            String::from_utf8(mutated_bytes).expect("z-base-32 alphabet is ASCII");
+        let mutated_did = format!("did:dht:z{mutated_encoded}");
+
+        // Sanity: the alternate decodes to the same 32 bytes on both sides.
+        assert_eq!(
+            zbase32::decode(&mutated_encoded)
+                .expect("alternate decodes")
+                .as_slice(),
+            &key[..]
+        );
+
+        // Wrapper and authority MUST reject the non-canonical input — identical
+        // inputs, identical rejection (the wrapper only by delegating).
+        assert!(
+            extract_public_key(&mutated_did).is_err(),
+            "wrapper must reject non-canonical did:dht"
+        );
+        assert!(
+            scp_did::extract_public_key_from_did(&mutated_did).is_err(),
+            "scp-did authority must reject non-canonical did:dht"
+        );
+    }
+
+    /// The native wrapper accepts ONLY `did:dht` — never `did:key` — in every
+    /// build. The shared `scp-did` authority accepts a `did:key:{hex}` test
+    /// convenience when `scp-did/testing` is enabled, and that feature is
+    /// unified ON by sibling crates (`scp-protocol/testing`, `scp-mls/testing`,
+    /// `scp-event-log/testing`, `scp-ffi-common/testing`) in any workspace or
+    /// CI build that also compiles this crate — including custody-opt-in
+    /// builds. The wrapper's unconditional prefix gate rejects `did:key`
+    /// regardless of which path enables it.
+    ///
+    /// Caveat on what this test proves in isolation: under a bare
+    /// `cargo test -p scp-identity` the authority's `did:key` branch is compiled
+    /// out anyway, so the authority alone would also reject. The load-bearing
+    /// execution is the feature-unified workspace run (CI), where
+    /// `scp-did/testing` IS on and the authority WOULD accept `did:key` — there,
+    /// the wrapper's gate is the sole reason the native surface still rejects.
+    #[test]
+    fn extract_public_key_rejects_did_key_in_every_build() {
+        // 64 hex chars = 32 bytes; a form the scp-did authority accepts under
+        // `testing`, but the native wrapper must not.
+        let did_key = format!("did:key:{}", "aa".repeat(32));
+        let result = extract_public_key(&did_key);
+        assert!(
+            matches!(result, Err(IdentityError::InvalidDidFormat(_))),
+            "wrapper must reject did:key with InvalidDidFormat, got: {result:?}"
+        );
+    }
+
+    /// A malformed `did:dht:z…` payload surfaces as `InvalidDidFormat`, pinning
+    /// the reconciled error taxonomy (ADR-057 T1c-b): z-base-32 decode failures
+    /// once had their own typed variant and are now folded into the single
+    /// `InvalidDidFormat` channel carrying the `scp-did` authority's message
+    /// text.
+    #[test]
+    fn extract_public_key_maps_decode_failure_to_invalid_did_format() {
+        let result = extract_public_key("did:dht:z!!!invalid!!!");
+        assert!(
+            matches!(result, Err(IdentityError::InvalidDidFormat(_))),
+            "decode failure must map to InvalidDidFormat, got: {result:?}"
+        );
     }
 
     /// Helper that creates an identity with a fresh
@@ -4538,7 +4591,7 @@ mod tests {
         // whose `#0` verification method has a malformed
         // `publicKeyMultibase`: missing the `z` base58btc prefix that
         // `decode_multibase_key` requires.
-        let malformed_vm0 = crate::document::VerificationMethod {
+        let malformed_vm0 = scp_did::VerificationMethod {
             id: format!("{}#0", event.old_did),
             method_type: "Ed25519VerificationKey2020".to_owned(),
             controller: event.old_did.clone(),
@@ -5943,7 +5996,7 @@ mod tests {
             signature: &[u8; 64],
             value: &[u8],
             seq: u64,
-        ) -> impl Future<Output = Result<(), IdentityError>> + Send {
+        ) -> impl Future<Output = Result<(), DhtError>> + Send {
             let pk = *public_key;
             let sig = *signature;
             let val = value.to_vec();
@@ -5960,8 +6013,7 @@ mod tests {
         fn resolve(
             &self,
             public_key: &[u8; 32],
-        ) -> impl Future<Output = Result<Option<crate::dht_client::DhtRecord>, IdentityError>> + Send
-        {
+        ) -> impl Future<Output = Result<Option<scp_dht::DhtRecord>, DhtError>> + Send {
             let pk = *public_key;
             async move { self.inner.resolve(&pk).await }
         }
@@ -6687,7 +6739,7 @@ mod tests {
             signature: &[u8; 64],
             value: &[u8],
             seq: u64,
-        ) -> impl Future<Output = Result<(), IdentityError>> + Send {
+        ) -> impl Future<Output = Result<(), DhtError>> + Send {
             let pk = *public_key;
             let sig = *signature;
             let val = value.to_vec();
@@ -6702,14 +6754,14 @@ mod tests {
                 match mode {
                     FailingPublishMode::FailOnNew => {
                         // Don't record: nothing actually hit the wire.
-                        return Err(IdentityError::DhtPublishFailed(
+                        return Err(DhtError::DhtPublishFailed(
                             "simulated step-7 publish failure".to_owned(),
                         ));
                     }
                     FailingPublishMode::FailOnOldAfterNew if idx == 1 => {
                         // The OLD republish (second publish in migrate_identity).
                         // Don't record — it failed.
-                        return Err(IdentityError::DhtPublishFailed(
+                        return Err(DhtError::DhtPublishFailed(
                             "simulated step-8 publish failure".to_owned(),
                         ));
                     }
@@ -6723,8 +6775,7 @@ mod tests {
         fn resolve(
             &self,
             public_key: &[u8; 32],
-        ) -> impl Future<Output = Result<Option<crate::dht_client::DhtRecord>, IdentityError>> + Send
-        {
+        ) -> impl Future<Output = Result<Option<scp_dht::DhtRecord>, DhtError>> + Send {
             let pk = *public_key;
             async move { self.inner.resolve(&pk).await }
         }
