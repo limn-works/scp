@@ -110,12 +110,15 @@ impl std::fmt::Debug for SenderKeyDistribution {
 /// at keygen. Starting at 1 (not 0) keeps the first application message's
 /// 8-byte big-endian epoch prefix as `0x0000000000000001`, whose leading 4
 /// bytes are `00 00 00 00` — disjoint from the 4-byte `SCPM_MAGIC` management
-/// prefix (§9.16.1). This disjointness is precise for all *reachable* epochs
-/// (< 2^32, guaranteed by `MAX_EPOCH_ADVANCE`'s monotonic per-sender ceiling):
-/// an epoch's high 4 bytes could only equal `SCPM_MAGIC` at epoch ≥ 2^32, which
-/// the ceiling makes unreachable. Classification never rests on disjointness
-/// alone — the independent `sender_did == mls_sender_did` binding (see
-/// [`ContextCryptoState::install_incoming_distribution`]) is a separate guard.
+/// prefix (§9.16.1). An epoch's high 4 bytes could only equal `SCPM_MAGIC` at
+/// epoch ≥ 2^32. `MAX_EPOCH_ADVANCE` is a per-message *rate* window (not an
+/// absolute cap), and each local rotation advances the epoch by one, so
+/// reaching 2^32 would take ~4.3 billion monotonically-accepted advances —
+/// operationally unreachable rather than hard-bounded. Crucially, classification
+/// never rests on disjointness alone: the independent `sender_did ==
+/// mls_sender_did` binding (see
+/// [`ContextCryptoState::install_incoming_distribution`]) is the load-bearing
+/// guard, so a collision even at epoch ≥ 2^32 could not misroute a frame.
 pub const INITIAL_SENDER_KEY_EPOCH: u64 = 1;
 
 /// The outcome of decrypting an inbound MLS message.
@@ -748,13 +751,15 @@ impl ContextCryptoState {
         //
         // Disjointness (§9.16.1): an application message's first 4 bytes are the
         // high 4 bytes of the big-endian sender-key epoch. For every reachable
-        // epoch (< 2^32, held there by `MAX_EPOCH_ADVANCE`'s monotonic ceiling)
-        // those bytes are `00 00 00 00`, which cannot equal SCPM_MAGIC
-        // (`53 43 50 4D`), so this branch and the application path below are
-        // mutually exclusive. A collision would require epoch ≥ 2^32 (high bytes
-        // equal to SCPM_MAGIC), which the ceiling makes unreachable; and even
-        // then the sender-DID binding in `install_incoming_distribution` is an
-        // independent guard, so classification never rests on disjointness alone.
+        // epoch (< 2^32) those bytes are `00 00 00 00`, which cannot equal
+        // SCPM_MAGIC (`53 43 50 4D`), so this branch and the application path
+        // below are mutually exclusive. A collision would require epoch ≥ 2^32;
+        // that is operationally unreachable (each rotation advances by one, so
+        // ~4.3 billion monotonic advances would be needed — `MAX_EPOCH_ADVANCE`
+        // is a per-message rate window, not an absolute cap) rather than
+        // hard-bounded, AND the sender-DID binding in
+        // `install_incoming_distribution` is an independent guard, so
+        // classification never rests on disjointness alone.
         if let Some(payload) = try_strip_management_prefix(&framed) {
             return self.install_incoming_distribution(&sender_did, payload);
         }

@@ -347,9 +347,13 @@ impl ScpClient {
         // can HPKE-seal sender keys to it. ADR-057 §Prereq-1: the creator's own MLS
         // leaf `Lifetime` is stamped from the hardened driver clock.
         let (wrapping_public, wrapping_secret) = generate_wrapping_keypair();
-        // Hold the transient secret in `Zeroizing` so its stack copy is wiped on
-        // scope exit; the crypto state re-wraps its own copy in `Zeroizing`
-        // (`from_group_with_wrapping`).
+        // Wrap the transient secret in `Zeroizing` so this binding's copy is
+        // wiped when it drops. `[u8; 32]` is `Copy`, so this cannot wipe every
+        // transient copy the value takes (the crypto state holds its own live
+        // copy in a `Zeroizing` field via `from_group_with_wrapping`); the
+        // wrapping secret has a long-lived home in the crypto state and the
+        // persisted snapshot by design, so best-effort transient hygiene here is
+        // defense-in-depth, not the primary guarantee.
         let wrapping_secret = Zeroizing::new(wrapping_secret);
         let mls_group = create_group_with_wrapping_key(
             &credential,
@@ -408,8 +412,9 @@ impl ScpClient {
         // the SAME key. ADR-057 §Prereq-1: the KeyPackage `Lifetime` is stamped
         // from the hardened driver clock.
         let (wrapping_public, wrapping_secret) = generate_wrapping_keypair();
-        // Hold the transient secret in `Zeroizing` so its stack copy is wiped on
-        // scope exit; the persisted blob and the retained `PendingJoin` each take
+        // Wrap the transient secret in `Zeroizing` so this binding's copy is
+        // wiped on drop (best-effort — `[u8; 32]` is `Copy`, so downstream
+        // holders take their own copies); the persisted blob and the retained `PendingJoin` each take
         // their own copy from it below.
         let wrapping_secret = Zeroizing::new(wrapping_secret);
         let (bundle, signer, provider): (KeyPackageBundle, _, InMemoryMlsProvider) =
