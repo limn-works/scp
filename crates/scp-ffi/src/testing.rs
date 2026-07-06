@@ -222,35 +222,34 @@ fn fullstack_add_member_impl(
         })
 }
 
-/// Joins a context by retrieving the Welcome from the shared `KeyExchange`.
+/// Joins a context from the sealed invitation the creator deposited in the
+/// shared `KeyExchange`, standing up a live, send-capable per-context ACTOR via
+/// `Supervisor::spawn_actor_from_welcome` (ADR-049 §9 2F-residual).
 ///
-/// The joiner's `E2eCryptoProvider` processes the Welcome and picks up the
-/// access/sender keys so it can DECRYPT messages from the creator. It does
-/// NOT register a per-context send `ContextHandle`: the actor-per-context
-/// model has no spawn-from-Welcome entrypoint yet (the separate
-/// Welcome-Delivery work item), so a subsequent `fullstack_send_message` on a
-/// Welcome-joined node fails closed with "context not found in node's
-/// handles". The unidirectional path (creator sends, joiner decrypts) is
-/// fully supported.
+/// The joiner opens the creator-signed, HPKE-sealed bundle under its #active
+/// split custody, installs the joined MLS group, spawns the actor, and picks up
+/// the inviter-minted access keys + HPKE-sealed sender-key distribution. The
+/// joiner IS now a registered, send-capable participant — a subsequent
+/// `fullstack_send_message` on a Welcome-joined node succeeds (bidirectional).
 fn fullstack_join_from_welcome_impl(
     bi: &PyBridgeInstance,
     node: &PyFullStackNode,
     context_id: String,
 ) -> PyResult<()> {
     crate::pyscp_check_handle!(&bi.core, node);
+    let rt = crate::runtime()?;
     // ADR-056: key the shared crypto under the canonical digest via the
     // chokepoint, never the raw routing primitive (which double-hashes a real
     // 64-hex id and would diverge from the creator's deposit slot).
     let ctx_bytes = scp_core::context::state::context_id_to_bytes(&context_id);
 
-    // ADR-049 commit 12c.9f: the joiner's MLS group, sender keys, and access
-    // keys live directly in its `E2eCryptoProvider` (the joiner has no context
-    // actor). `join_from_welcome` forms the group from the captured Welcome,
-    // picks up the inviter-minted access keys, processes the inviter's
-    // HPKE-sealed sender-key distribution, and applies any epoch-advance
-    // Commits — all real crypto.
-    node.inner
-        .join_from_welcome(&context_id, &ctx_bytes)
+    // The joiner reserves its own KeyPackage, the creator's `invite_member`
+    // seals the Welcome, and `spawn_actor_from_welcome` opens it under split
+    // custody, installs the joined group, and registers a live actor. The
+    // returned `ContextHandle` is discarded here — later fullstack seams look
+    // the joiner's context up by id through its supervisor.
+    rt.block_on(node.inner.join_from_welcome(&context_id, &ctx_bytes))
+        .map(|_handle| ())
         .map_err(|e| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("failed to join from Welcome: {e}"))
         })
