@@ -492,8 +492,12 @@ fn decrypt_credential(
 /// development.
 ///
 /// Stores credentials in a `HashMap` keyed by `(bridge_id, credential_type)`.
-/// Thread-safe via `tokio::sync::RwLock`. Tracks bridge suspension status
+/// Thread-safe via `std::sync::RwLock`. Tracks bridge suspension status
 /// via an internal set.
+///
+/// Every locked region is a synchronous map/set operation — no guard is ever
+/// held across an `.await`, so a blocking `std::sync::RwLock` is correct here
+/// (ADR-049 Decision 12: the async `tokio` read-path `RwLock` is banned).
 ///
 /// Not suitable for production -- credentials are not persisted across
 /// restarts. Production implementations should use the `Storage` trait
@@ -502,16 +506,16 @@ fn decrypt_credential(
 pub struct InMemoryCredentialStore {
     /// Credentials keyed by `(bridge_id, credential_type)`.
     credentials:
-        tokio::sync::RwLock<std::collections::HashMap<(String, CredentialType), BridgeCredential>>,
+        std::sync::RwLock<std::collections::HashMap<(String, CredentialType), BridgeCredential>>,
 
     /// Set of bridge IDs that are currently suspended.
-    suspended_bridges: tokio::sync::RwLock<std::collections::HashSet<String>>,
+    suspended_bridges: std::sync::RwLock<std::collections::HashSet<String>>,
 
     /// Bridge credential keys keyed by bridge ID.
     ///
     /// Each key is wrapped in [`Zeroizing`] so it is zeroed on drop.
     bridge_credential_keys:
-        tokio::sync::RwLock<std::collections::HashMap<String, Zeroizing<[u8; 32]>>>,
+        std::sync::RwLock<std::collections::HashMap<String, Zeroizing<[u8; 32]>>>,
 }
 
 impl InMemoryCredentialStore {
@@ -519,9 +523,9 @@ impl InMemoryCredentialStore {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            credentials: tokio::sync::RwLock::new(std::collections::HashMap::new()),
-            suspended_bridges: tokio::sync::RwLock::new(std::collections::HashSet::new()),
-            bridge_credential_keys: tokio::sync::RwLock::new(std::collections::HashMap::new()),
+            credentials: std::sync::RwLock::new(std::collections::HashMap::new()),
+            suspended_bridges: std::sync::RwLock::new(std::collections::HashSet::new()),
+            bridge_credential_keys: std::sync::RwLock::new(std::collections::HashMap::new()),
         }
     }
 
@@ -530,10 +534,10 @@ impl InMemoryCredentialStore {
     /// After this call, `retrieve()` will return
     /// [`CredentialError::BridgeSuspended`] for this bridge. Credentials
     /// are retained for potential reactivation.
-    pub async fn suspend_bridge(&self, bridge_id: &str) {
+    pub fn suspend_bridge(&self, bridge_id: &str) {
         self.suspended_bridges
             .write()
-            .await
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(bridge_id.to_owned());
     }
 
@@ -541,8 +545,11 @@ impl InMemoryCredentialStore {
     ///
     /// After this call, `retrieve()` will succeed for this bridge
     /// (assuming credentials exist).
-    pub async fn reactivate_bridge(&self, bridge_id: &str) {
-        self.suspended_bridges.write().await.remove(bridge_id);
+    pub fn reactivate_bridge(&self, bridge_id: &str) {
+        self.suspended_bridges
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(bridge_id);
     }
 }
 
@@ -552,7 +559,7 @@ impl Default for InMemoryCredentialStore {
     }
 }
 
-#[allow(clippy::significant_drop_tightening)] // Nursery false positive on async RwLock patterns.
+#[allow(clippy::significant_drop_tightening)] // Nursery false positive: guards are held across the synchronous critical section, then dropped at scope end.
 impl BridgeCredentialStore for InMemoryCredentialStore {
     async fn provision(
         &self,
@@ -576,7 +583,10 @@ impl BridgeCredentialStore for InMemoryCredentialStore {
         };
 
         let map_key = (bridge_id.to_owned(), credential_type.clone());
-        let mut creds = self.credentials.write().await;
+        let mut creds = self
+            .credentials
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         if creds.contains_key(&map_key) {
             return Err(CredentialError::AlreadyExists {
@@ -596,14 +606,22 @@ impl BridgeCredentialStore for InMemoryCredentialStore {
         bridge_credential_key: &[u8; 32],
     ) -> Result<Zeroizing<Vec<u8>>, CredentialError> {
         // Check suspension status before retrieval.
-        if self.suspended_bridges.read().await.contains(bridge_id) {
+        if self
+            .suspended_bridges
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(bridge_id)
+        {
             return Err(CredentialError::BridgeSuspended {
                 bridge_id: bridge_id.to_owned(),
             });
         }
 
         let map_key = (bridge_id.to_owned(), credential_type.clone());
-        let creds = self.credentials.read().await;
+        let creds = self
+            .credentials
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let credential = creds
             .get(&map_key)
@@ -627,7 +645,10 @@ impl BridgeCredentialStore for InMemoryCredentialStore {
         let new_encrypted = encrypt_credential(&key, new_plaintext)?;
 
         let map_key = (bridge_id.to_owned(), credential_type.clone());
-        let mut creds = self.credentials.write().await;
+        let mut creds = self
+            .credentials
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let existing = creds
             .get_mut(&map_key)
@@ -658,7 +679,10 @@ impl BridgeCredentialStore for InMemoryCredentialStore {
 
     async fn revoke(&self, bridge_id: &str) -> Result<(), CredentialError> {
         {
-            let mut creds = self.credentials.write().await;
+            let mut creds = self
+                .credentials
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
 
             // Collect keys for this bridge.
             let keys_to_remove: Vec<(String, CredentialType)> = creds
@@ -680,13 +704,19 @@ impl BridgeCredentialStore for InMemoryCredentialStore {
         self.delete_bridge_credential_key(bridge_id).await?;
 
         // Also remove from suspended set if present.
-        self.suspended_bridges.write().await.remove(bridge_id);
+        self.suspended_bridges
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(bridge_id);
 
         Ok(())
     }
 
     async fn list(&self, bridge_id: &str) -> Result<Vec<CredentialType>, CredentialError> {
-        let creds = self.credentials.read().await;
+        let creds = self
+            .credentials
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let types: Vec<CredentialType> = creds
             .keys()
@@ -704,7 +734,7 @@ impl BridgeCredentialStore for InMemoryCredentialStore {
     ) -> Result<(), CredentialError> {
         self.bridge_credential_keys
             .write()
-            .await
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(bridge_id.to_owned(), key);
         Ok(())
     }
@@ -715,7 +745,7 @@ impl BridgeCredentialStore for InMemoryCredentialStore {
     ) -> Result<Zeroizing<[u8; 32]>, CredentialError> {
         self.bridge_credential_keys
             .read()
-            .await
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(bridge_id)
             .cloned()
             .ok_or_else(|| CredentialError::KeyNotFound {
@@ -725,7 +755,10 @@ impl BridgeCredentialStore for InMemoryCredentialStore {
 
     async fn delete_bridge_credential_key(&self, bridge_id: &str) -> Result<(), CredentialError> {
         // Zeroizing<[u8; 32]> zeros on drop when removed from the HashMap.
-        self.bridge_credential_keys.write().await.remove(bridge_id);
+        self.bridge_credential_keys
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(bridge_id);
         Ok(())
     }
 }
@@ -1174,7 +1207,7 @@ mod tests {
             .expect("provision");
 
         // Suspend the bridge.
-        store.suspend_bridge("bridge-001").await;
+        store.suspend_bridge("bridge-001");
 
         // Retrieve should fail with BridgeSuspended.
         let result = store
@@ -1187,7 +1220,7 @@ mod tests {
         );
 
         // Reactivate the bridge.
-        store.reactivate_bridge("bridge-001").await;
+        store.reactivate_bridge("bridge-001");
 
         // Retrieve should succeed again.
         let retrieved = store
