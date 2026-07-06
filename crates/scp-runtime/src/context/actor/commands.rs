@@ -29,10 +29,6 @@
 //! `NotImplemented` scaffolding on the live dispatch path — the
 //! state-owning [`ContextActor`](crate::context::actor::ContextActor)
 //! routes every command through `dispatch_state` to its real handler.
-//! The only remaining `ContextError::NotImplemented(..)` producer is the
-//! test-only `skeleton_dispatch` path, which acks the mailbox contract
-//! for state-less skeleton actors and returns
-//! [`Outcome::err`](crate::context::actor::Outcome::err).
 //!
 //! # Naming
 //!

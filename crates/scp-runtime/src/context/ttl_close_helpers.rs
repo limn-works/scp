@@ -35,9 +35,9 @@
 //! the task cleanly — this replaces the legacy stale-generation gate, as
 //! the actor owns its state for the whole dispatch turn so there is no
 //! concurrent close-and-recreate window. This removes the
-//! `spawn_ttl_timer_legacy` `DashMap` reads and the
-//! [`SupervisorHandle::shim_supervisor`](crate::context::supervisor::handle::SupervisorHandle::shim_supervisor)
-//! escape that [`start_ttl_timer`] / [`reset_ttl_timer`] previously used.
+//! `spawn_ttl_timer_legacy` `DashMap` reads and the full-`Supervisor`
+//! escape hatch that [`start_ttl_timer`] / [`reset_ttl_timer`]
+//! previously used.
 
 use std::sync::Arc;
 
