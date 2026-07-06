@@ -454,7 +454,6 @@ async fn sender_key_encrypt_relay_decrypt_roundtrip() {
 /// a developer's perspective.
 #[tokio::test(flavor = "multi_thread")]
 async fn context_manager_creates_usable_context() {
-    use scp_core::context::governance::KeyResolver;
     use scp_core::context::{
         Capability, ContextMode, ContextParams, ContextState, context_id_bytes,
     };
@@ -463,11 +462,9 @@ async fn context_manager_creates_usable_context() {
     println!("\n=== 5: ContextManager creates usable context ===\n");
 
     let network = FullStackNetwork::new();
-    let key_resolver: KeyResolver =
-        Arc::new(|_did: &scp_did::DID, _kid: scp_did::SigningKeyId| None);
 
-    let alice = network.create_node("did:dht:z6MkAliceUsability", key_resolver.clone());
-    let bob = network.create_node("did:dht:z6MkBobUsability", key_resolver);
+    let alice = network.create_node("did:dht:z6MkAliceUsability");
+    let bob = network.create_node("did:dht:z6MkBobUsability");
 
     // Create a context with realistic parameters.
     // RoleAssign is required for add_member (the admin assigns the new
@@ -480,6 +477,7 @@ async fn context_manager_creates_usable_context() {
             Capability::RoleAssign,
             Capability::MemberInvite,
             Capability::MemberRemove,
+            Capability::GovernancePropose,
         ],
         ..ContextParams::default()
     };
@@ -505,7 +503,7 @@ async fn context_manager_creates_usable_context() {
 
     // Bob joins.
     let ctx_bytes = context_id_bytes(ctx_id);
-    bob.join_from_welcome(ctx_id, &ctx_bytes).unwrap();
+    bob.join_from_welcome(ctx_id, &ctx_bytes).await.unwrap();
     println!("  Bob joined from Welcome");
 
     // Seed Bob's per-member pseudonym routing ID into Alice's manager (§9.10.4).
@@ -604,17 +602,14 @@ async fn identity_create_produces_resolvable_did() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn context_create_produces_active_context_with_members() {
-    use scp_core::context::governance::KeyResolver;
     use scp_core::context::{Capability, ContextMode, ContextParams, ContextState};
     use scp_testing::fullstack::FullStackNetwork;
 
     println!("\n=== 6b: context_create produces active context ===\n");
 
     let network = FullStackNetwork::new();
-    let key_resolver: KeyResolver =
-        Arc::new(|_did: &scp_did::DID, _kid: scp_did::SigningKeyId| None);
-    let alice = network.create_node("did:dht:z6MkAlice6b", key_resolver.clone());
-    let bob = network.create_node("did:dht:z6MkBob6b", key_resolver);
+    let alice = network.create_node("did:dht:z6MkAlice6b");
+    let bob = network.create_node("did:dht:z6MkBob6b");
 
     // RoleAssign / MemberInvite are required for add_member (the admin assigns
     // the new member's role).
@@ -625,6 +620,7 @@ async fn context_create_produces_active_context_with_members() {
             Capability::MessagesWrite,
             Capability::RoleAssign,
             Capability::MemberInvite,
+            Capability::GovernancePropose,
         ],
         ..ContextParams::default()
     };
@@ -646,7 +642,7 @@ async fn context_create_produces_active_context_with_members() {
         .add_member(&handle, "did:dht:z6MkBob6b")
         .await
         .unwrap();
-    bob.join_from_welcome(ctx_id, &ctx_bytes).unwrap();
+    bob.join_from_welcome(ctx_id, &ctx_bytes).await.unwrap();
 
     // Seed Bob's per-member pseudonym (in production Bob announces it via a
     // PseudonymAnnouncement).
