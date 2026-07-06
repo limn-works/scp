@@ -351,6 +351,10 @@ pub async fn retrieve_adapter_credential<S: AdapterCredentialStore>(
     clippy::manual_async_fn,
     clippy::significant_drop_tightening
 )]
+#[allow(
+    clippy::disallowed_types,
+    reason = "ADR-049 §Decision 12 allow-list: test-only InMemoryCredentialStore holds its map behind a tokio::sync::Mutex; not a runtime read path."
+)]
 mod tests {
     use std::collections::HashMap;
 

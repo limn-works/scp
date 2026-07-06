@@ -76,8 +76,8 @@
 //!   capability contract (ADR §2: "Never ContextActor → ContextActor
 //!   directly"). Cross-context work goes through
 //!   `SupervisorHandle::start_saga`.
-//! - `task_set` / `next_generation` — supervisor-scoped lifecycle
-//!   state, held on the supervisor side.
+//! - `task_set` — supervisor-scoped lifecycle state, held on the
+//!   supervisor side.
 //! - `consequence_rules` — per-context state stored in `PerContextState`,
 //!   not a cross-cutting dep.
 //!

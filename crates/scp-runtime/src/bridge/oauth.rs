@@ -672,6 +672,10 @@ impl<H: OAuthHttpClient, S: BridgeCredentialStore> fmt::Debug for OAuthCredentia
     clippy::panic,
     clippy::significant_drop_tightening
 )]
+#[allow(
+    clippy::disallowed_types,
+    reason = "ADR-049 §Decision 12 allow-list: test-only mock OAuth provider records calls behind a tokio::sync::Mutex; not a runtime read path."
+)]
 mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
