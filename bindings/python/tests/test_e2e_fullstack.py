@@ -55,6 +55,7 @@ CEILING_JSON = json.dumps(
             "role:assign",
             "member:invite",
             "member:remove",
+            "governance:propose",
             "context:close",
         ],
         "governance": "single_admin",

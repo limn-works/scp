@@ -24,11 +24,10 @@
 //! production builds.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
-use scp_core::context::governance::KeyResolver;
 use scp_core::context::{Capability, ContextHandle, ContextMode, ContextParams};
 use scp_testing::fullstack::{FullStackNetwork, FullStackNode};
 
@@ -66,11 +65,6 @@ where
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let network = guard.get_or_insert_with(FullStackNetwork::new);
     f(network)
-}
-
-/// Returns a permissive key resolver that always returns `None`.
-fn permissive_key_resolver() -> KeyResolver {
-    Arc::new(|_did: &scp_did::DID, _kid: scp_did::SigningKeyId| None)
 }
 
 // ---------------------------------------------------------------------------
@@ -121,7 +115,7 @@ impl PyFullStackNode {
 fn fullstack_create_node_impl(bi: &PyBridgeInstance, did: String) -> PyFullStackNode {
     let instance_id = bi.core.instance_id();
     with_network(bi, |network| {
-        let node = network.create_node(&did, permissive_key_resolver());
+        let node = network.create_node(&did);
         PyFullStackNode {
             inner: node,
             handles: Mutex::new(HashMap::new()),

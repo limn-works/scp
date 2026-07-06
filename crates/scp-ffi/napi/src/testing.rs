@@ -9,11 +9,10 @@
 
 use scp_ffi_common::error_codes as codes;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 use napi::bindgen_prelude::Buffer;
 use napi_derive::napi;
-use scp_core::context::governance::KeyResolver;
 use scp_core::context::{Capability, ContextHandle, ContextMode, ContextParams};
 use scp_testing::fullstack::{FullStackNetwork, FullStackNode};
 
@@ -58,13 +57,6 @@ where
     f(network)
 }
 
-/// Returns a permissive key resolver that always returns `None`.
-///
-/// Full-stack E2E tests verify crypto, not governance vote signatures.
-fn permissive_key_resolver() -> KeyResolver {
-    Arc::new(|_did: &scp_did::DID, _kid: scp_did::SigningKeyId| None)
-}
-
 // ---------------------------------------------------------------------------
 // NapiFullStackNode -- opaque JS class wrapping FullStackNode
 // ---------------------------------------------------------------------------
@@ -106,7 +98,7 @@ impl NapiFullStackNode {
 pub(crate) fn fullstack_create_node_on(bi: &NapiBridgeInstance, did: String) -> NapiFullStackNode {
     let instance_id = bi.instance_id();
     with_network_on(bi, |network| {
-        let node = network.create_node(&did, permissive_key_resolver());
+        let node = network.create_node(&did);
         NapiFullStackNode {
             inner: node,
             handles: Mutex::new(HashMap::new()),
