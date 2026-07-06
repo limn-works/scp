@@ -54,7 +54,7 @@ let handle = manager
     .create_context("my-context-1".into(), params, "did:dht:z6Mk...creator".into())
     .await?;
 
-assert_eq!(handle.state().await, ContextState::Active);
+assert_eq!(handle.state(), ContextState::Active);
 ```
 
 ## Send a Message

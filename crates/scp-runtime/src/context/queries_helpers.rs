@@ -95,7 +95,6 @@ use scp_protocol::context::{ContextError, ContextParams};
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
-use crate::context::ContextHandle;
 use crate::context::actor::class_s::ClassCMut;
 use crate::context::actor::deps::ActorDeps;
 use crate::context::actor::state::PerContextState;
@@ -213,41 +212,6 @@ pub const fn needs_reconnect(state: &PerContextState) -> bool {
 /// fail-closed Class-S witness.
 pub const fn clear_needs_reconnect(epoch: &mut EpochState) {
     epoch.needs_reconnect = false;
-}
-
-/// Reads this actor's current lifecycle
-/// [`ContextState`](scp_protocol::context::ContextState).
-///
-/// Read-only — borrows the owned `state.handle` and awaits its interior
-/// read lock. The actor's dispatch loop owns `state` exclusively, so the
-/// only writer of the handle's interior state is the actor itself (via a
-/// lifecycle transition processed on the same single-threaded mailbox).
-/// No concurrent writer can be mid-transition while this read runs, so
-/// the definitive async `state()` read is used rather than the
-/// non-blocking `try_read_state()` the legacy `per-context-state Mutex`
-/// path required to dodge a cross-task TOCTOU.
-///
-/// `state` is taken as `&mut` even though the read only borrows the
-/// handle immutably, so the resulting future is `Send`: an
-/// `&PerContextState` borrow makes the captured future non-`Send`
-/// because `PerContextState` is not `Sync` (its event callback is `dyn
-/// FnMut + Send`, not `Send + Sync`). The actor's run loop owns `state`
-/// exclusively so the upgraded borrow does not race — this matches the
-/// `&mut` convention every read helper on the [`queries`](crate::context::actor::handlers::queries)
-/// dispatch path already uses.
-#[allow(clippy::needless_pass_by_ref_mut)]
-pub(in crate::context) async fn read_context_state(
-    handle: ContextHandle,
-) -> scp_protocol::context::ContextState {
-    // Takes an OWNED (Arc-backed, cheap to clone) handle rather than
-    // borrowing `&PerContextState` across the await: a borrowed
-    // `&PerContextState` future is not `Send` (`PerContextState` is
-    // intentionally `Send` + `!Sync` — its event callback is `dyn FnMut +
-    // Send`, not `Sync`), and the spawned actor run loop requires `Send`.
-    // The prior `&mut PerContextState` signature obtained `Send` via the
-    // `&mut` referent; a Class-C read site must not take a whole `&mut`, so
-    // the caller clones `state.handle` (Deref read) and hands it in by value.
-    handle.state().await
 }
 
 /// Returns `true` if the given DID is a member of the context.

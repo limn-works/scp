@@ -207,6 +207,10 @@ impl SessionStore {
 ///
 /// Returns [`ToolError`] if the context is not active or the tool is not
 /// found in the registry.
+// ADR-049 §Decision 12: `state` is now a synchronous lock-free ArcSwap load.
+// Async is retained for uniformity with the tool-session API's async
+// `invoke_session` and as the stable ContextManager tool API contract.
+#[allow(clippy::unused_async)]
 pub async fn create_session(
     store: &mut SessionStore,
     registry: &ToolRegistry,
@@ -217,7 +221,7 @@ pub async fn create_session(
     clock: &dyn Clock,
 ) -> Result<String, ToolError> {
     // Validate context is Active.
-    let state = context.state().await;
+    let state = context.state();
     if state != ContextState::Active {
         return Err(ToolError::ContextNotActive {
             current_state: state.to_string(),
@@ -316,7 +320,7 @@ where
     Fut: std::future::Future<Output = Result<(serde_json::Value, serde_json::Value), String>>,
 {
     // Validate context is Active.
-    let ctx_state = context.state().await;
+    let ctx_state = context.state();
     if ctx_state != ContextState::Active {
         return Err(ToolError::ContextNotActive {
             current_state: ctx_state.to_string(),
@@ -450,9 +454,9 @@ mod tests {
     }
 
     /// Creates an active context handle.
-    async fn active_context() -> ContextHandle {
+    fn active_context() -> ContextHandle {
         let handle = ContextHandle::new("ctx-session-test".to_owned(), ContextParams::default());
-        handle.transition_to(&ContextState::Active).await.unwrap();
+        handle.transition_to(&ContextState::Active).unwrap();
         handle
     }
 
@@ -646,7 +650,7 @@ mod tests {
         let creator_did = "did:dht:z6MkCreator";
         let role_state = test_role_state(creator_did);
         let registry = setup_registry_with_tool(&role_state, creator_did);
-        let context = active_context().await;
+        let context = active_context();
         let mut store = SessionStore::new();
 
         let result = create_session(
@@ -708,7 +712,7 @@ mod tests {
         let creator_did = "did:dht:z6MkCreator";
         let role_state = test_role_state(creator_did);
         let registry = setup_registry_with_tool(&role_state, creator_did);
-        let context = active_context().await;
+        let context = active_context();
         let mut store = SessionStore::new();
 
         let result = create_session(
@@ -744,7 +748,7 @@ mod tests {
             ..ContextParams::default()
         };
         let context = ContextHandle::new("ctx-session-test".to_owned(), params);
-        context.transition_to(&ContextState::Active).await.unwrap();
+        context.transition_to(&ContextState::Active).unwrap();
         let mut store = SessionStore::new();
         let source_ctx = "ctx-source".to_owned();
 
@@ -799,7 +803,7 @@ mod tests {
     async fn create_session_default_cap_is_1000() {
         // ContextParams { session_cap: None } should resolve to DEFAULT_SESSION_CAP_PER_CALLER (1000).
         assert_eq!(DEFAULT_SESSION_CAP_PER_CALLER, 1000);
-        let context = active_context().await;
+        let context = active_context();
         assert!(context.params().session_cap.is_none());
     }
 
@@ -814,7 +818,7 @@ mod tests {
             ..ContextParams::default()
         };
         let context = ContextHandle::new("ctx-session-test".to_owned(), params);
-        context.transition_to(&ContextState::Active).await.unwrap();
+        context.transition_to(&ContextState::Active).unwrap();
         let mut store = SessionStore::new();
 
         // Fill caller A to the cap.
@@ -859,7 +863,7 @@ mod tests {
         let creator_did = "did:dht:z6MkCreator";
         let role_state = test_role_state(creator_did);
         let registry = setup_registry_with_tool(&role_state, creator_did);
-        let context = active_context().await;
+        let context = active_context();
         let mut store = SessionStore::new();
 
         // Insert a session that is already expired (TTL = 0).
@@ -963,7 +967,7 @@ mod tests {
         let member_did = "did:dht:z6MkMember";
         let role_state = test_role_state_with_no_invoke_member(creator_did, member_did);
         let registry = setup_registry_with_tool(&role_state, creator_did);
-        let context = active_context().await;
+        let context = active_context();
         let mut store = SessionStore::new();
 
         // Create session (using the store directly since create_session
@@ -1029,7 +1033,7 @@ mod tests {
         let creator_did = "did:dht:z6MkCreator";
         let role_state = test_role_state(creator_did);
         let registry = setup_registry_with_tool(&role_state, creator_did);
-        let context = active_context().await;
+        let context = active_context();
         let mut store = SessionStore::new();
 
         let result = invoke_session(
@@ -1061,7 +1065,7 @@ mod tests {
         let creator_did = "did:dht:z6MkCreator";
         let role_state = test_role_state(creator_did);
         let registry = setup_registry_with_tool(&role_state, creator_did);
-        let context = active_context().await;
+        let context = active_context();
         let mut store = SessionStore::new();
 
         let session_id = create_session(
@@ -1193,7 +1197,7 @@ mod tests {
         let creator_did = "did:dht:z6MkCreator";
         let role_state = test_role_state(creator_did);
         let registry = setup_registry_with_tool(&role_state, creator_did);
-        let context = active_context().await;
+        let context = active_context();
         let mut store = SessionStore::new();
 
         let session_id = create_session(

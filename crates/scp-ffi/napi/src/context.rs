@@ -4239,7 +4239,7 @@ pub(crate) async fn context_finalize_close_on(
     // Ensure the core handle is in Closing state. If close_context already
     // transitioned it, the transition_to call fails harmlessly (self-transition
     // or invalid source state) and we ignore the error.
-    let _ = core_handle.transition_to(&ContextState::Closing).await;
+    let _ = core_handle.transition_to(&ContextState::Closing);
 
     let sup = crate::runtime::supervisor(bi)?;
     let (tx, rx) = tokio::sync::oneshot::channel();

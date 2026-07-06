@@ -204,7 +204,11 @@ pub fn export_context_blocks(
 ///   state is not Active.
 /// - [`ContextError::MemberNotFound`] if `member_did` is not a member.
 /// - Crypto / transport / event-log failures are propagated.
-#[allow(clippy::too_many_lines)]
+// ADR-049 §Decision 12: `state`/`transition_to` are now synchronous lock-free
+// ArcSwap ops. Async is retained as the ContextManager helper API contract —
+// callers await uniformly, and the crypto/transport/event-log provider calls
+// regain await points under ADR-049 Decision 7 (async-provider-trait conversion).
+#[allow(clippy::too_many_lines, clippy::unused_async)]
 pub async fn leave_context(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
@@ -407,7 +411,7 @@ pub async fn leave_context(
     // If member count reaches zero, transition to Closing. Runs AFTER the
     // fail-closed persist above, matching the prior ordering.
     if should_close {
-        handle.transition_to(&ContextState::Closing).await?;
+        handle.transition_to(&ContextState::Closing)?;
     }
 
     Ok(())
@@ -2021,7 +2025,7 @@ pub async fn import_context(
     // Transition to the state from the snapshot.
     match &export.snapshot.state {
         ContextState::Active => {
-            handle.transition_to(&ContextState::Active).await?;
+            handle.transition_to(&ContextState::Active)?;
         }
         ContextState::Creating => {
             // Already in Creating state, nothing to do.
@@ -3789,7 +3793,6 @@ mod restore_reconcile_tests {
         state
             .handle
             .transition_to(&crate::context::ContextState::Active)
-            .await
             .unwrap();
 
         // Generate a real MLS KeyPackage for the joiner.
@@ -3811,7 +3814,6 @@ mod restore_reconcile_tests {
         let handle = ContextHandle::new(context_id.clone(), state.handle.params().clone());
         handle
             .transition_to(&crate::context::ContextState::Active)
-            .await
             .unwrap();
 
         let spending_ucan = signed_join_ucan(&joiner, &joiner_key);
@@ -3965,7 +3967,6 @@ mod restore_reconcile_tests {
         state
             .handle
             .transition_to(&crate::context::ContextState::Active)
-            .await
             .unwrap();
 
         // Reserve a sequence exactly as `send_message` does, capturing it.
@@ -4358,13 +4359,11 @@ mod restore_reconcile_tests {
         state
             .handle
             .transition_to(&crate::context::ContextState::Active)
-            .await
             .unwrap();
 
         let handle = ContextHandle::new(context_id.clone(), state.handle.params().clone());
         handle
             .transition_to(&crate::context::ContextState::Active)
-            .await
             .unwrap();
 
         let mut cell = crate::context::actor::class_s::ClassSCell::new(state);
@@ -4419,13 +4418,11 @@ mod restore_reconcile_tests {
         state
             .handle
             .transition_to(&crate::context::ContextState::Active)
-            .await
             .unwrap();
 
         let handle = ContextHandle::new(context_id.clone(), state.handle.params().clone());
         handle
             .transition_to(&crate::context::ContextState::Active)
-            .await
             .unwrap();
 
         let mut cell = crate::context::actor::class_s::ClassSCell::new(state);

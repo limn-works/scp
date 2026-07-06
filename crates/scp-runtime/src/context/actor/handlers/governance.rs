@@ -1482,7 +1482,6 @@ mod consequence_fail_closed_tests {
         state
             .handle
             .transition_to(&crate::context::ContextState::Active)
-            .await
             .expect("transition to Active");
         let mut cell = ClassSCell::new(state);
         let ctx_str = hex::encode([CTX_BYTE; 32]);
@@ -1537,7 +1536,6 @@ mod consequence_fail_closed_tests {
         state
             .handle
             .transition_to(&crate::context::ContextState::Active)
-            .await
             .expect("transition to Active");
         let mut cell = ClassSCell::new(state);
         let ctx_str = hex::encode([CTX_BYTE; 32]);

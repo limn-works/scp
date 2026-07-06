@@ -10,7 +10,7 @@
 //!
 //! - [`ContextState`] -- The seven lifecycle states.
 //! - [`ContextHandle`] -- Thread-safe handle to a context, holding state and
-//!   parameters. `Send + Sync` via interior `Arc<RwLock<_>>`.
+//!   parameters. `Send + Sync` via interior `Arc<ArcSwap<_>>`.
 //! - [`ContextError`] -- Error type for context operations.
 //! - [`ContextParams`] -- Full context configuration (re-exported from
 //!   [`params`]).
@@ -23,9 +23,13 @@
 //!
 //! # Concurrency
 //!
-//! All public handle types are `Send + Sync`. Individual operations on shared
-//! handles are serialized internally via `tokio::sync::RwLock`. See
-//! `.docs/standards/sdk-common.md` Concurrency Model.
+//! All public handle types are `Send + Sync`. The cached lifecycle state is
+//! held in a lock-free `arc_swap::ArcSwap<ContextState>`: reads
+//! ([`ContextHandle::state`]) are a lock-free atomic load, and writes
+//! ([`ContextHandle::transition_to`]) validate then atomically store. State
+//! writes are performed exclusively by the owning per-context actor's
+//! single-threaded command loop (ADR-049 §10), so no compare-and-swap retry
+//! loop is required. See `.docs/standards/sdk-common.md` Concurrency Model.
 
 pub mod actor;
 pub mod app_sandbox;
@@ -60,23 +64,12 @@ pub mod tools;
 
 use std::sync::Arc;
 
-use tokio::sync::RwLock;
+use arc_swap::ArcSwap;
 
 use scp_protocol::context::params;
 use scp_protocol::context::{ContextError, ContextParams, ContextState, transition};
 
 pub use config::{ContextConfig, ContextCreation};
-
-// ---------------------------------------------------------------------------
-// ContextInner
-// ---------------------------------------------------------------------------
-
-/// Mutable interior of a [`ContextHandle`], protected by `RwLock`.
-#[derive(Debug)]
-struct ContextInner {
-    /// Current lifecycle state.
-    state: ContextState,
-}
 
 // ---------------------------------------------------------------------------
 // ContextHandle
@@ -86,8 +79,10 @@ struct ContextInner {
 ///
 /// `ContextHandle` holds the context's identity, lifecycle state, and creation
 /// parameters. It is `Send + Sync` -- safe to share across threads and async
-/// tasks. Internal state mutations (state transitions) are serialized via
-/// `tokio::sync::RwLock`.
+/// tasks. The lifecycle state lives in a lock-free
+/// `arc_swap::ArcSwap<ContextState>`: reads are atomic loads, and transitions
+/// atomically store the validated next state. State writes are serialized by
+/// the owning per-context actor's single-threaded command loop (ADR-049 §10).
 ///
 /// The handle does not own the MLS group, event log, or transport connections.
 /// Those are managed by the Context Manager (SCP-019/020).
@@ -106,9 +101,12 @@ pub struct ContextHandle {
     context_id: String,
     /// Creation-time parameters. Immutable after creation.
     params: ContextParams,
-    /// Mutable state protected by `RwLock` for `Send + Sync` interior
-    /// mutability.
-    inner: Arc<RwLock<ContextInner>>,
+    /// Cached lifecycle state in a lock-free `ArcSwap` for `Send + Sync`
+    /// interior mutability. Reads are atomic loads; transitions atomically
+    /// store the validated next state. Clone-shared across handle clones so
+    /// the FFI mutating path (`transition_to` through `&self`) and the close
+    /// path observe the same cell.
+    inner: Arc<ArcSwap<ContextState>>,
 }
 
 impl ContextHandle {
@@ -122,9 +120,7 @@ impl ContextHandle {
         Self {
             context_id,
             params,
-            inner: Arc::new(RwLock::new(ContextInner {
-                state: ContextState::Creating,
-            })),
+            inner: Arc::new(ArcSwap::from_pointee(ContextState::Creating)),
         }
     }
 
@@ -150,20 +146,22 @@ impl ContextHandle {
 
     /// Returns the context's current lifecycle state.
     ///
-    /// Acquires a read lock on the interior state.
-    pub async fn state(&self) -> ContextState {
-        self.inner.read().await.state.clone()
+    /// A lock-free atomic load of the cached state (ADR-049 §10).
+    #[must_use]
+    pub fn state(&self) -> ContextState {
+        ContextState::clone(&self.inner.load())
     }
 
-    /// Attempts a non-blocking read of the context state.
+    /// Reads the context state.
     ///
-    /// Returns `None` if the read lock cannot be acquired immediately (e.g.,
-    /// a state transition is in progress). Used by `ContextManager` to
-    /// check state synchronously inside a `Mutex` lock scope, avoiding
-    /// TOCTOU races without holding the `MutexGuard` across `.await` points.
+    /// Retained as an infallible synchronous getter for call sites that
+    /// previously needed a non-blocking read to avoid holding a lock across
+    /// `.await`. With the lock-free `ArcSwap` cache the read can never fail,
+    /// so this always returns `Some` — the signature is preserved for
+    /// source compatibility with those call sites.
     #[must_use]
     pub fn try_read_state(&self) -> Option<ContextState> {
-        self.inner.try_read().ok().map(|g| g.state.clone())
+        Some(self.state())
     }
 
     /// Attempts to transition the context to a new state.
@@ -171,15 +169,18 @@ impl ContextHandle {
     /// Validates the transition via [`state_machine::transition`](scp_protocol::context::state_machine::transition) and applies
     /// it atomically if valid. Returns the new state on success.
     ///
+    /// State writes are performed exclusively by the owning per-context
+    /// actor's single-threaded command loop (ADR-049 §10), so the
+    /// load-validate-store sequence needs no compare-and-swap retry loop.
+    ///
     /// # Errors
     ///
     /// Returns [`ContextError::InvalidTransition`] if the transition is not
     /// permitted by the lifecycle state machine.
-    pub async fn transition_to(&self, target: &ContextState) -> Result<ContextState, ContextError> {
-        let mut inner = self.inner.write().await;
-        let new_state = transition(&inner.state, target)?;
-        inner.state = new_state.clone();
-        drop(inner);
+    pub fn transition_to(&self, target: &ContextState) -> Result<ContextState, ContextError> {
+        let current = self.inner.load();
+        let new_state = transition(&current, target)?;
+        self.inner.store(Arc::new(new_state.clone()));
         Ok(new_state)
     }
 }
@@ -260,7 +261,7 @@ mod tests {
     #[tokio::test]
     async fn context_handle_starts_in_creating_state() {
         let handle = ContextHandle::new("ctx-1".to_owned(), ContextParams::default());
-        assert_eq!(handle.state().await, ContextState::Creating);
+        assert_eq!(handle.state(), ContextState::Creating);
     }
 
     #[tokio::test]
@@ -282,9 +283,9 @@ mod tests {
     #[tokio::test]
     async fn context_handle_transition_creating_to_active() {
         let handle = ContextHandle::new("ctx-1".to_owned(), ContextParams::default());
-        let result = handle.transition_to(&ContextState::Active).await;
+        let result = handle.transition_to(&ContextState::Active);
         assert_eq!(result.ok(), Some(ContextState::Active));
-        assert_eq!(handle.state().await, ContextState::Active);
+        assert_eq!(handle.state(), ContextState::Active);
     }
 
     #[tokio::test]
@@ -292,19 +293,19 @@ mod tests {
         let handle = ContextHandle::new("ctx-1".to_owned(), ContextParams::default());
 
         // Creating -> Active
-        let result = handle.transition_to(&ContextState::Active).await;
+        let result = handle.transition_to(&ContextState::Active);
         assert!(result.is_ok());
-        assert_eq!(handle.state().await, ContextState::Active);
+        assert_eq!(handle.state(), ContextState::Active);
 
         // Active -> Closing
-        let result = handle.transition_to(&ContextState::Closing).await;
+        let result = handle.transition_to(&ContextState::Closing);
         assert!(result.is_ok());
-        assert_eq!(handle.state().await, ContextState::Closing);
+        assert_eq!(handle.state(), ContextState::Closing);
 
         // Closing -> Closed
-        let result = handle.transition_to(&ContextState::Closed).await;
+        let result = handle.transition_to(&ContextState::Closed);
         assert!(result.is_ok());
-        assert_eq!(handle.state().await, ContextState::Closed);
+        assert_eq!(handle.state(), ContextState::Closed);
     }
 
     #[tokio::test]
@@ -312,13 +313,13 @@ mod tests {
         let handle = ContextHandle::new("ctx-1".to_owned(), ContextParams::default());
 
         // Creating -> Active
-        let result = handle.transition_to(&ContextState::Active).await;
+        let result = handle.transition_to(&ContextState::Active);
         assert!(result.is_ok());
 
         // Active -> Expired
-        let result = handle.transition_to(&ContextState::Expired).await;
+        let result = handle.transition_to(&ContextState::Expired);
         assert!(result.is_ok());
-        assert_eq!(handle.state().await, ContextState::Expired);
+        assert_eq!(handle.state(), ContextState::Expired);
     }
 
     #[tokio::test]
@@ -326,36 +327,36 @@ mod tests {
         let handle = ContextHandle::new("ctx-1".to_owned(), ContextParams::default());
 
         // Creating -> Closing is invalid
-        let result = handle.transition_to(&ContextState::Closing).await;
+        let result = handle.transition_to(&ContextState::Closing);
         assert!(result.is_err());
 
         // State should still be Creating
-        assert_eq!(handle.state().await, ContextState::Creating);
+        assert_eq!(handle.state(), ContextState::Creating);
     }
 
     #[tokio::test]
     async fn context_handle_closed_is_terminal() {
         let handle = ContextHandle::new("ctx-1".to_owned(), ContextParams::default());
-        handle.transition_to(&ContextState::Active).await.ok();
-        handle.transition_to(&ContextState::Closing).await.ok();
-        handle.transition_to(&ContextState::Closed).await.ok();
+        handle.transition_to(&ContextState::Active).ok();
+        handle.transition_to(&ContextState::Closing).ok();
+        handle.transition_to(&ContextState::Closed).ok();
 
         // Closed -> Active is invalid
-        let result = handle.transition_to(&ContextState::Active).await;
+        let result = handle.transition_to(&ContextState::Active);
         assert!(result.is_err());
-        assert_eq!(handle.state().await, ContextState::Closed);
+        assert_eq!(handle.state(), ContextState::Closed);
     }
 
     #[tokio::test]
     async fn context_handle_expired_is_terminal() {
         let handle = ContextHandle::new("ctx-1".to_owned(), ContextParams::default());
-        handle.transition_to(&ContextState::Active).await.ok();
-        handle.transition_to(&ContextState::Expired).await.ok();
+        handle.transition_to(&ContextState::Active).ok();
+        handle.transition_to(&ContextState::Expired).ok();
 
         // Expired -> Active is invalid
-        let result = handle.transition_to(&ContextState::Active).await;
+        let result = handle.transition_to(&ContextState::Active);
         assert!(result.is_err());
-        assert_eq!(handle.state().await, ContextState::Expired);
+        assert_eq!(handle.state(), ContextState::Expired);
     }
 
     #[tokio::test]
@@ -364,10 +365,10 @@ mod tests {
         let handle2 = handle1.clone();
 
         // Transition via handle1.
-        handle1.transition_to(&ContextState::Active).await.ok();
+        handle1.transition_to(&ContextState::Active).ok();
 
         // handle2 should see the new state.
-        assert_eq!(handle2.state().await, ContextState::Active);
+        assert_eq!(handle2.state(), ContextState::Active);
     }
 
     #[test]

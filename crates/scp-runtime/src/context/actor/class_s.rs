@@ -5883,7 +5883,6 @@ impl ClassSCell
         cell.class_c_view()
             .handle_mut()
             .transition_to(&crate::context::ContextState::Active)
-            .await
             .expect("transition to Active");
 
         // The sender must be a present member for the suspension GROW to apply.
@@ -7529,7 +7528,7 @@ impl ClassSCell
     /// Build an ACTIVE, `Governed`-ceiling-policy cell so `execute_modify_ceiling`
     /// reaches its staging logic. The default `ContextParams` ceiling policy is
     /// `Immutable`; ceiling modification requires `Governed`.
-    async fn active_governed_cell(ctx_byte: u8) -> ClassSCell {
+    fn active_governed_cell(ctx_byte: u8) -> ClassSCell {
         let mut state = fresh_state(ctx_byte);
         let params = scp_protocol::context::params::ContextParams {
             ceiling_policy: scp_protocol::context::params::CeilingPolicy::Governed,
@@ -7540,7 +7539,6 @@ impl ClassSCell
         state
             .handle
             .transition_to(&crate::context::ContextState::Active)
-            .await
             .expect("transition to Active");
         ClassSCell::new(state)
     }
@@ -7566,7 +7564,7 @@ impl ClassSCell
             Capability::Custom("*:*".to_owned()),      // stray wildcard resource
             Capability::Custom("a:b:c".to_owned()),    // multi-colon (3 segments)
         ] {
-            let mut cell = active_governed_cell(0xC1).await;
+            let mut cell = active_governed_cell(0xC1);
             let new_ceiling = vec![Capability::MessagesRead, malformed.clone()];
             let res = crate::context::governance_helpers::execute_modify_ceiling(
                 &mut cell,
@@ -7595,7 +7593,7 @@ impl ClassSCell
 
         let deps = build_deps(Box::new(OkPersistence)).await;
         let ctx_id = ctx_hex(0xC2);
-        let mut cell = active_governed_cell(0xC2).await;
+        let mut cell = active_governed_cell(0xC2);
 
         let new_ceiling = vec![
             Capability::MessagesRead,

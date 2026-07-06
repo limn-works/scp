@@ -360,11 +360,11 @@ async fn conf_006_create_context() {
 
     print_step(2, "Initialize context handle");
     let handle = ContextHandle::new("conf-006-ctx".to_owned(), params);
-    assert_eq!(handle.state().await, ContextState::Creating);
+    assert_eq!(handle.state(), ContextState::Creating);
 
     print_step(3, "Transition to Active (MLS group established)");
-    handle.transition_to(&ContextState::Active).await.unwrap();
-    assert_eq!(handle.state().await, ContextState::Active);
+    handle.transition_to(&ContextState::Active).unwrap();
+    assert_eq!(handle.state(), ContextState::Active);
 
     println!("  PASS: Context created and activated");
 }
@@ -530,7 +530,7 @@ async fn conf_011_context_parameter_update() {
     print_step(1, "Create context with default params");
     let params = ContextParams::default();
     let handle = ContextHandle::new("conf-011-ctx".to_owned(), params);
-    handle.transition_to(&ContextState::Active).await.unwrap();
+    handle.transition_to(&ContextState::Active).unwrap();
 
     print_step(2, "Verify ChangeRole is a valid governance action");
     let action = GovernanceAction::ChangeRole {
@@ -607,19 +607,19 @@ async fn conf_013_context_close_lifecycle() {
     println!("=== CONF-013: Context Close Lifecycle ===");
 
     let handle = ContextHandle::new("conf-013-ctx".to_owned(), ContextParams::default());
-    handle.transition_to(&ContextState::Active).await.unwrap();
+    handle.transition_to(&ContextState::Active).unwrap();
 
     print_step(1, "Initiate context close");
-    handle.transition_to(&ContextState::Closing).await.unwrap();
-    assert_eq!(handle.state().await, ContextState::Closing);
+    handle.transition_to(&ContextState::Closing).unwrap();
+    assert_eq!(handle.state(), ContextState::Closing);
 
     print_step(2, "Complete close");
-    handle.transition_to(&ContextState::Closed).await.unwrap();
-    assert_eq!(handle.state().await, ContextState::Closed);
+    handle.transition_to(&ContextState::Closed).unwrap();
+    assert_eq!(handle.state(), ContextState::Closed);
 
     print_step(3, "Verify no further transitions from Closed");
-    assert!(handle.transition_to(&ContextState::Active).await.is_err());
-    assert!(handle.transition_to(&ContextState::Creating).await.is_err());
+    assert!(handle.transition_to(&ContextState::Active).is_err());
+    assert!(handle.transition_to(&ContextState::Creating).is_err());
 
     println!("  PASS: Context close lifecycle verified");
 }
@@ -1799,7 +1799,7 @@ async fn conf_040_cross_implementation_join() {
 
     print_step(1, "Implementation A creates context");
     let handle = ContextHandle::new("conf-040-ctx".to_owned(), ContextParams::default());
-    handle.transition_to(&ContextState::Active).await.unwrap();
+    handle.transition_to(&ContextState::Active).unwrap();
 
     let mut membership = MembershipState::new();
     membership.add_member(DID::from("did:dht:z6MkImplA"), "admin".to_owned(), vec![]);

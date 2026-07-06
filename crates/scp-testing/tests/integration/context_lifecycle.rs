@@ -33,7 +33,7 @@ async fn context_handle_creation() {
     let handle = ContextHandle::new("ctx-b4-001".to_owned(), params);
 
     assert_eq!(handle.context_id(), "ctx-b4-001");
-    assert_eq!(handle.state().await, ContextState::Creating);
+    assert_eq!(handle.state(), ContextState::Creating);
     assert_eq!(handle.params().mode, ContextMode::Encrypted);
 }
 
@@ -46,19 +46,19 @@ async fn state_transitions_happy_path() {
     let handle = ContextHandle::new("ctx-b4-002".to_owned(), ContextParams::default());
 
     // Creating -> Active
-    let new = handle.transition_to(&ContextState::Active).await.unwrap();
+    let new = handle.transition_to(&ContextState::Active).unwrap();
     assert_eq!(new, ContextState::Active);
-    assert_eq!(handle.state().await, ContextState::Active);
+    assert_eq!(handle.state(), ContextState::Active);
 
     // Active -> Closing
-    let new = handle.transition_to(&ContextState::Closing).await.unwrap();
+    let new = handle.transition_to(&ContextState::Closing).unwrap();
     assert_eq!(new, ContextState::Closing);
-    assert_eq!(handle.state().await, ContextState::Closing);
+    assert_eq!(handle.state(), ContextState::Closing);
 
     // Closing -> Closed
-    let new = handle.transition_to(&ContextState::Closed).await.unwrap();
+    let new = handle.transition_to(&ContextState::Closed).unwrap();
     assert_eq!(new, ContextState::Closed);
-    assert_eq!(handle.state().await, ContextState::Closed);
+    assert_eq!(handle.state(), ContextState::Closed);
 }
 
 // ---------------------------------------------------------------------------
@@ -68,11 +68,11 @@ async fn state_transitions_happy_path() {
 #[tokio::test]
 async fn state_transition_active_to_expired() {
     let handle = ContextHandle::new("ctx-b4-003".to_owned(), ContextParams::default());
-    handle.transition_to(&ContextState::Active).await.unwrap();
+    handle.transition_to(&ContextState::Active).unwrap();
 
-    let new = handle.transition_to(&ContextState::Expired).await.unwrap();
+    let new = handle.transition_to(&ContextState::Expired).unwrap();
     assert_eq!(new, ContextState::Expired);
-    assert_eq!(handle.state().await, ContextState::Expired);
+    assert_eq!(handle.state(), ContextState::Expired);
 }
 
 // ---------------------------------------------------------------------------
@@ -83,11 +83,11 @@ async fn state_transition_active_to_expired() {
 async fn invalid_state_transitions() {
     // Closed -> Active
     let handle = ContextHandle::new("ctx-b4-004a".to_owned(), ContextParams::default());
-    handle.transition_to(&ContextState::Active).await.unwrap();
-    handle.transition_to(&ContextState::Closing).await.unwrap();
-    handle.transition_to(&ContextState::Closed).await.unwrap();
+    handle.transition_to(&ContextState::Active).unwrap();
+    handle.transition_to(&ContextState::Closing).unwrap();
+    handle.transition_to(&ContextState::Closed).unwrap();
 
-    let result = handle.transition_to(&ContextState::Active).await;
+    let result = handle.transition_to(&ContextState::Active);
     assert!(result.is_err());
     assert!(
         matches!(
@@ -99,14 +99,14 @@ async fn invalid_state_transitions() {
         ),
         "Closed -> Active should return InvalidTransition"
     );
-    assert_eq!(handle.state().await, ContextState::Closed);
+    assert_eq!(handle.state(), ContextState::Closed);
 
     // Expired -> Active
     let handle2 = ContextHandle::new("ctx-b4-004b".to_owned(), ContextParams::default());
-    handle2.transition_to(&ContextState::Active).await.unwrap();
-    handle2.transition_to(&ContextState::Expired).await.unwrap();
+    handle2.transition_to(&ContextState::Active).unwrap();
+    handle2.transition_to(&ContextState::Expired).unwrap();
 
-    let result2 = handle2.transition_to(&ContextState::Active).await;
+    let result2 = handle2.transition_to(&ContextState::Active);
     assert!(result2.is_err());
     assert!(
         matches!(
@@ -118,7 +118,7 @@ async fn invalid_state_transitions() {
         ),
         "Expired -> Active should return InvalidTransition"
     );
-    assert_eq!(handle2.state().await, ContextState::Expired);
+    assert_eq!(handle2.state(), ContextState::Expired);
 }
 
 // ---------------------------------------------------------------------------
@@ -636,20 +636,20 @@ async fn context_close_lifecycle() {
     let handle = ContextHandle::new("ctx-b4-019".to_owned(), ContextParams::default());
 
     // Creating -> Active
-    handle.transition_to(&ContextState::Active).await.unwrap();
-    assert_eq!(handle.state().await, ContextState::Active);
+    handle.transition_to(&ContextState::Active).unwrap();
+    assert_eq!(handle.state(), ContextState::Active);
 
     // Active -> Closing
-    handle.transition_to(&ContextState::Closing).await.unwrap();
-    assert_eq!(handle.state().await, ContextState::Closing);
+    handle.transition_to(&ContextState::Closing).unwrap();
+    assert_eq!(handle.state(), ContextState::Closing);
 
     // Closing -> Closed
-    handle.transition_to(&ContextState::Closed).await.unwrap();
-    assert_eq!(handle.state().await, ContextState::Closed);
+    handle.transition_to(&ContextState::Closed).unwrap();
+    assert_eq!(handle.state(), ContextState::Closed);
 
     // Verify terminal: cannot go back to Active or Closing
-    assert!(handle.transition_to(&ContextState::Active).await.is_err());
-    assert!(handle.transition_to(&ContextState::Closing).await.is_err());
-    assert!(handle.transition_to(&ContextState::Creating).await.is_err());
-    assert_eq!(handle.state().await, ContextState::Closed);
+    assert!(handle.transition_to(&ContextState::Active).is_err());
+    assert!(handle.transition_to(&ContextState::Closing).is_err());
+    assert!(handle.transition_to(&ContextState::Creating).is_err());
+    assert_eq!(handle.state(), ContextState::Closed);
 }

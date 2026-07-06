@@ -3066,7 +3066,6 @@ mod tests {
         );
         st.handle
             .transition_to(&scp_protocol::context::ContextState::Active)
-            .await
             .expect("active");
         // creator_did binds the UCAN root issuer (validate_ucan step 4).
         st.role_state.creator_did = creator.to_owned();

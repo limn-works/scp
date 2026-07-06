@@ -1041,7 +1041,7 @@ async fn context_manager_broadcast_restore_roundtrip() {
     ));
 
     let handle2 = ContextHandle::new(ctx_id.to_owned(), params);
-    handle2.transition_to(&ContextState::Active).await.unwrap();
+    handle2.transition_to(&ContextState::Active).unwrap();
     manager2.restore_context(ctx_id, &handle2).await.unwrap();
 
     // Verify membership survived restart.

@@ -761,7 +761,7 @@ mod tests {
     /// Build an encrypted test state where `member` is a writable context
     /// member (so the direct ingest path's membership + capability gates pass)
     /// and the handle is `Active` (so `require_active` passes).
-    async fn writable_encrypted_state(ctx_byte: u8, member: &str) -> state::PerContextState {
+    fn writable_encrypted_state(ctx_byte: u8, member: &str) -> state::PerContextState {
         use scp_protocol::context::roles::Capability;
         use std::collections::HashSet;
 
@@ -773,7 +773,6 @@ mod tests {
         // The in-order ingest path requires the context to be Active.
         st.handle
             .transition_to(&scp_protocol::context::ContextState::Active)
-            .await
             .expect("transition test handle to Active");
         let mut st = st;
         st.membership.add_member(
@@ -844,7 +843,7 @@ mod tests {
     #[tokio::test]
     async fn direct_legitimate_announcement_records_and_returns_consumed() {
         let deps = new_test_deps().await;
-        let mut state = writable_encrypted_state(0x31, DIRECT_ALICE).await;
+        let mut state = writable_encrypted_state(0x31, DIRECT_ALICE);
         let ctx = ctx_hex(0x31);
         let ctx_bytes = [0x31u8; 32];
         let pseudonym = [0x42u8; 32];
@@ -875,7 +874,7 @@ mod tests {
     #[tokio::test]
     async fn direct_forged_did_announcement_errors_permission_denied() {
         let deps = new_test_deps().await;
-        let mut state = writable_encrypted_state(0x32, DIRECT_ALICE).await;
+        let mut state = writable_encrypted_state(0x32, DIRECT_ALICE);
         let ctx = ctx_hex(0x32);
         let ctx_bytes = [0x32u8; 32];
         // Authenticated sender is ALICE, but the announcement claims BOB.
@@ -911,7 +910,7 @@ mod tests {
     #[tokio::test]
     async fn direct_reserved_value_announcement_errors_permission_denied() {
         let deps = new_test_deps().await;
-        let mut state = writable_encrypted_state(0x33, DIRECT_ALICE).await;
+        let mut state = writable_encrypted_state(0x33, DIRECT_ALICE);
         let ctx = ctx_hex(0x33);
         let ctx_bytes = [0x33u8; 32];
         let inner = minimal_inner(&ctx, DIRECT_ALICE, 1);
@@ -938,7 +937,7 @@ mod tests {
     #[tokio::test]
     async fn direct_same_did_reannounce_succeeds_and_updates_registry() {
         let deps = new_test_deps().await;
-        let mut state = writable_encrypted_state(0x34, DIRECT_ALICE).await;
+        let mut state = writable_encrypted_state(0x34, DIRECT_ALICE);
         let ctx = ctx_hex(0x34);
         let ctx_bytes = [0x34u8; 32];
 

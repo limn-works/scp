@@ -70,8 +70,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!();
     println!("Context created:");
     println!("  ID: {}", handle.context_id());
-    println!("  State: {:?}", handle.state().await);
-    assert_eq!(handle.state().await, ContextState::Active);
+    println!("  State: {:?}", handle.state());
+    assert_eq!(handle.state(), ContextState::Active);
 
     // 5. Send a message (mock transport captures it).
     let alice_sk = support::signing_key_for(&alice);

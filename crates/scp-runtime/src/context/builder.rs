@@ -812,6 +812,11 @@ fn context_id_bytes(context_id: &str) -> [u8; 32] {
 /// log state persists (atomic from the caller's perspective).
 ///
 /// See ADR-008 acceptance criterion 2.
+// ADR-049 §Decision 12: `transition_to` is now a synchronous lock-free ArcSwap
+// store. Async is retained as the ContextManager helper API contract — callers
+// await uniformly, and the crypto/transport/event-log provider calls regain
+// await points under ADR-049 Decision 7 (async-provider-trait conversion).
+#[allow(clippy::unused_async)]
 pub async fn create_context(
     context_id: String,
     params: ContextParams,
@@ -857,7 +862,7 @@ pub async fn create_context(
             // parents. Built before the side-effecting group create so a
             // canonical-encoding failure aborts with nothing to roll back.
             let context_extension = ScpContextExtension::for_root(
-                context_id.clone(),
+                context_id,
                 scp_did::DID::from(creator_did.to_owned()),
                 params.mode,
                 &params.governance,
@@ -926,7 +931,7 @@ pub async fn create_context(
     }
 
     // Step 6: Transition state to Active.
-    if let Err(e) = handle.transition_to(&ContextState::Active).await {
+    if let Err(e) = handle.transition_to(&ContextState::Active) {
         receipt.rollback(&id_bytes, crypto, transport, event_log_provider);
         return Err(e.into());
     }

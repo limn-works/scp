@@ -4259,7 +4259,6 @@ mod pseudonym_routing_tests {
         state
             .handle
             .transition_to(&crate::context::ContextState::Active)
-            .await
             .expect("transition to Active");
 
         // ALICE must be a writable member: the direct path checks membership +

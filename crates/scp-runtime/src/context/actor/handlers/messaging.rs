@@ -290,10 +290,7 @@ async fn handle_send_message(
     // `Active` so the helper observes the same handle state every FFI
     // bridge passes today.
     let handle = ContextHandle::new(context_id.to_owned(), params);
-    if let Err(e) = handle
-        .transition_to(&scp_protocol::context::ContextState::Active)
-        .await
-    {
+    if let Err(e) = handle.transition_to(&scp_protocol::context::ContextState::Active) {
         // Manual rollback — restore the high-water mark prior to
         // reservation. `from_persisted` rebuilds the tracker at the
         // given last-issued value.
@@ -512,10 +509,7 @@ async fn handle_send_pseudonym_announcement(
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
     let handle = ContextHandle::new(context_id.clone(), params);
-    if let Err(e) = handle
-        .transition_to(&scp_protocol::context::ContextState::Active)
-        .await
-    {
+    if let Err(e) = handle.transition_to(&scp_protocol::context::ContextState::Active) {
         let sketch = outcome_error_sketch(&e);
         let _ = reply.send(Err(e));
         return Outcome::err(sketch);
