@@ -2,34 +2,33 @@
 //!
 //! Each `FullStackNode` owns a [`Supervisor`] bound to a concrete
 //! [`MlsCryptoProvider`](scp_core::crypto::mls::provider::MlsCryptoProvider).
-//! The creator side (Alice) drives every operation through the supervisor's
-//! actor mailbox; the per-context MLS / sender-key / access-key state is owned
-//! by the context actor. The joiner side (Bob, Carol) never spawns an actor
-//! for the context — its MLS group lives directly in its provider, joined from
-//! the Welcome the creator side produces.
+//! Every node drives its operations through the supervisor's actor mailbox. The
+//! creator side (Alice) owns the per-context state in its context actor; the
+//! joiner side (Bob, Carol) stands up its OWN live per-context actor via
+//! `spawn_actor_from_welcome` — the joiner is a registered, send-capable
+//! participant, not a decrypt-only provider (ADR-049 §9 2F-residual).
 //!
-//! # Cross-node bridging (ADR-049 commit 12c.9f)
+//! # Cross-node bridging (ADR-049 §9 2F-residual)
 //!
-//! In a real deployment the joiner's key package, the MLS Welcome, the
-//! per-member access keys, and the MLS-wrapped sender-key distribution
-//! messages travel over transport. In this in-process harness there is no
-//! shared relay between the creator's actor and the joiner's provider, so the
-//! shared [`KeyExchange`](super::exchange::KeyExchange) carries those bootstrap
-//! bytes:
+//! In a real deployment the creator-signed, HPKE-sealed invitation bundle, the
+//! per-member access keys, and the MLS-wrapped sender-key distribution messages
+//! travel over transport. In this in-process harness there is no shared relay
+//! between the creator's and the joiner's supervisors, so the shared
+//! [`KeyExchange`](super::exchange::KeyExchange) carries those bootstrap bytes:
 //!
-//! - The joiner's [`E2eCryptoProvider`] generates a real MLS key package (its
-//!   provider retains the matching signer state) and deposits the bytes.
-//! - The creator's [`add_member`](FullStackNode::add_member) takes the key
-//!   package, runs the real `join_context` path (real MLS add → real Welcome →
-//!   real HPKE sender-key distribution → minted access keys), then extracts
-//!   the Welcome (from the actor's `WelcomeGenerated` event — the same event a
-//!   real SDK consumes off its event stream and forwards out-of-band per
-//!   §9.17.2), the per-member access keys (via the actor `GetAllAccessKeys`
-//!   query), and the MLS-wrapped sender-key distribution messages (captured
-//!   off the creator's transport), and deposits them for the joiner.
-//! - The joiner's [`join_from_welcome`](FullStackNode::join_from_welcome)
-//!   forms its group from the Welcome, picks up its access keys, processes the
-//!   sender-key messages, and applies any pending epoch-advance Commits.
+//! - The joiner reserves its OWN pooled MLS `KeyPackage` on its OWN supervisor's
+//!   `KeyPackageStoreActor` (which retains the private signer state).
+//! - The creator's [`add_member`](FullStackNode::add_member) publishes the
+//!   joiner's wrapping keypair, reserves that `KeyPackage`, calls
+//!   `Supervisor::invite_member` (real in-actor MLS add → broadcast epoch
+//!   Commit → creator `role_state` update → creator-signed, HPKE-sealed §5.12.3
+//!   bundle), distributes the creator's sender key, then deposits the sealed
+//!   bundle (+ reservation id), the epoch Commit (for existing members), and
+//!   every member's access key (via the actor `GetAllAccessKeys` query).
+//! - The joiner's [`join_from_welcome`](FullStackNode::join_from_welcome) opens
+//!   the sealed bundle under its #active split custody, spawns a live actor via
+//!   `Supervisor::spawn_actor_from_welcome`, picks up its access keys, processes
+//!   the sender-key messages, and applies any pending epoch-advance Commits.
 //!
 //! All MLS / sender-key / access-key cryptography is real; the `KeyExchange`
 //! only substitutes for the absent transport.
@@ -41,27 +40,52 @@ use scp_core::context::builder::{
     ContextCreationError, ContextEventLogProvider, ContextTransportProvider,
 };
 use scp_core::context::governance::KeyResolver;
-use scp_core::context::membership::{ContextEvent, KeyPackage};
+use scp_core::context::membership::ContextEvent;
 use scp_core::context::providers::event_log::MerkleEventLogProvider;
-use scp_core::context::supervisor::{MessageSigner, Supervisor};
+use scp_core::context::state::context_id_to_bytes;
+use scp_core::context::supervisor::{
+    InviteMemberOutcome, MessageSigner, Supervisor, WelcomeJoinRequest,
+};
 use scp_core::context::{ContextError, ContextHandle, ContextParams, context_routing_id};
 use scp_did::DID;
+use scp_platform::testing::InMemoryKeyCustody;
+use zeroize::Zeroizing;
 
 use super::crypto::E2eCryptoProvider;
+use super::exchange::PendingJoin;
 
 /// Shared buffer of `(routing_id, ciphertext)` pairs captured by the transport.
 type SentBuffer = Arc<Mutex<Vec<([u8; 32], Vec<u8>)>>>;
 
-/// Registry of every node's crypto helper in a `FullStackNetwork`, keyed by
-/// DID. Lets the creator side reach a joiner's provider to mint its real MLS
-/// key package during `add_member` (the joiner provider retains the matching
-/// signer state for its later Welcome processing).
-pub(super) type NodeRegistry = Arc<Mutex<HashMap<String, Arc<E2eCryptoProvider>>>>;
+/// A node's shared, cloneable handles — its `Supervisor` and crypto helper.
+/// The creator side reaches a joiner's supervisor (to reserve the joiner's own
+/// `KeyPackage`) and its crypto helper (to publish the joiner's wrapping keypair)
+/// during `add_member`.
+#[derive(Clone)]
+pub(super) struct NodeShared {
+    /// The joiner's `Supervisor` — the creator reserves the joiner's own pooled
+    /// `KeyPackage` on it and (via the joiner) publishes its wrapping keypair.
+    pub manager: Arc<Supervisor>,
+    /// The joiner's crypto helper — source of the provider's own wrapping
+    /// keypair so the reserved KP's `0xFF01` leaf and the secret the provider
+    /// opens sender keys with are the SAME keypair.
+    pub crypto: Arc<E2eCryptoProvider>,
+}
+
+/// Registry of every node's shared handles in a `FullStackNetwork`, keyed by
+/// DID. Lets the creator side reach a joiner's supervisor + crypto helper to
+/// reserve its real MLS key package and publish its wrapping keypair during
+/// `add_member`.
+pub(super) type NodeRegistry = Arc<Mutex<HashMap<String, NodeShared>>>;
 
 /// Derives a deterministic 32-byte seed from a DID string for test key
 /// generation. The signing key is used for inner-envelope signatures on the
-/// send path.
-fn did_to_seed(did: &DID) -> [u8; 32] {
+/// send path AND as the node's `#active` identity key: the network's
+/// deterministic [`KeyResolver`] resolves each DID to
+/// `SigningKey::from_bytes(did_to_seed(did)).verifying_key()`, so a joiner's
+/// `#active` custody (which imports this same seed) opens the invitation the
+/// creator's `invite_member` sealed to the resolved key.
+pub(super) fn did_to_seed(did: &DID) -> [u8; 32] {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     did.as_ref().hash(&mut hasher);
@@ -271,15 +295,22 @@ impl FullStackNode {
             .await
     }
 
-    /// Adds a member to the context (creator-side operation).
+    /// Adds a member to the context (creator-side operation), driving the REAL
+    /// reserve → `invite_member` → sealed-bundle path (ADR-049 §9 2F-residual).
     ///
-    /// Runs the real `join_context` path and bridges every cross-node artifact
-    /// to the joiner through the shared `KeyExchange`. See the module docs for
-    /// the full sequence.
+    /// The joiner reserves its OWN pooled `KeyPackage` on its OWN supervisor; the
+    /// creator calls `Supervisor::invite_member`, which runs the in-actor MLS
+    /// add + broadcasts the epoch Commit + updates the creator's `role_state`, and
+    /// returns a creator-signed, HPKE-sealed [`super::exchange::PendingJoin`].
+    /// The creator then distributes its sender key (`invite_member` does NOT), and
+    /// deposits the sealed bundle, the epoch Commit, and every member's access
+    /// key for the joiner to pick up. See the module docs for the full sequence.
     ///
     /// # Errors
     ///
-    /// Propagates [`ContextError`] from the supervisor or crypto provider.
+    /// Propagates [`ContextError`] from the supervisor or crypto provider —
+    /// including the `invite_member` governed-context refusal (only `SingleAdmin`
+    /// contexts authorize a unilateral invite).
     pub async fn add_member(
         &self,
         handle: &ContextHandle,
@@ -290,11 +321,10 @@ impl FullStackNode {
         // canonical chokepoint, which DECODES a real 64-hex id to its digest
         // rather than re-hashing it (the raw primitive would double-hash a real
         // id and key the wrong MLS group / key-exchange slot).
-        let ctx_bytes = scp_core::context::state::context_id_to_bytes(context_id);
+        let ctx_bytes = context_id_to_bytes(context_id);
 
-        // 1. The joiner mints a real MLS key package (its provider retains the
-        //    matching signer state) and deposits the bytes in the exchange.
-        let joiner_crypto = {
+        // 1. Reach the joiner's shared handles (its supervisor + crypto helper).
+        let joiner: NodeShared = {
             let registry = self
                 .registry
                 .lock()
@@ -305,45 +335,74 @@ impl FullStackNode {
                 ))
             })?
         };
-        joiner_crypto.deposit_key_package(&ctx_bytes)?;
 
-        // 2. Take the joiner's key package for the real add.
-        let kp_bytes = self
-            .crypto
-            .take_key_package(&ctx_bytes, member_did)
-            .ok_or_else(|| {
-                ContextError::CryptoFailed(format!(
-                    "no key package deposited for joiner {member_did}"
-                ))
-            })?;
-
-        // Capture the set of existing members BEFORE the add — they need the
-        // epoch-advance Commit so their MLS groups stay in lockstep.
-        let existing_members = self.manager.member_dids(context_id).await;
-
-        // 3. Run the real join_context path: real MLS add → real Welcome →
-        //    real HPKE sender-key distribution → minted access keys.
-        let key_package = KeyPackage {
-            owner_did: DID::from(member_did),
-            mls_key_package_bytes: Some(kp_bytes),
-        };
-        self.manager
-            .join_context(handle, key_package, None, None)
+        // 2. Publish the joiner's OWN provider wrapping keypair into its
+        //    supervisor slot BEFORE reserving, so the pooled KeyPackage embeds
+        //    the matching `0xFF01` wrapping-leaf pubkey and the secret the
+        //    provider opens sender keys with stays the SAME keypair across the
+        //    reserve → spawn_actor_from_welcome migration.
+        let (wpub, wsec) = joiner.crypto.provider.wrapping_keypair_snapshot();
+        joiner
+            .manager
+            .set_wrapping_keys(
+                DID::from(member_did),
+                wpub.to_vec(),
+                Zeroizing::new(wsec.to_vec()),
+            )
             .await?;
 
-        // 4. The HPKE sender-key distribution messages were MLS-wrapped and
-        //    "sent" by the actor — they are now in the capture buffer. Drain
-        //    them and deposit for the joiner (keeping the buffer clean for the
-        //    application ciphertext the test sends later).
-        let captured: Vec<([u8; 32], Vec<u8>)> = std::mem::take(&mut *self.lock_sent());
-        for (_routing_id, msg) in captured {
-            self.crypto
-                .deposit_sender_key_message(&ctx_bytes, member_did, msg);
-        }
+        // 3. Reserve the joiner's own pooled KeyPackage on the joiner's
+        //    supervisor (its KeyPackageStoreActor mints + retains the private
+        //    signer state; only the reservation id + public bytes come back).
+        let (reservation_id, kp_bytes) = joiner
+            .manager
+            .reserve_key_package(DID::from(member_did))
+            .await?;
 
-        // 5. Extract the Welcome (and the epoch-advance Commit for existing
-        //    members) from the actor's WelcomeGenerated event. Accumulate every
-        //    other event so the tests' later drain_events still observes them.
+        // 4. Capture the set of existing members BEFORE the add — they need the
+        //    epoch-advance Commit so their MLS groups stay in lockstep.
+        let existing_members = self.manager.member_dids(context_id).await;
+
+        // 5. Invite the joiner: the add is routed through the context actor's
+        //    governance gate (SingleAdmin → auto-executes the real in-actor MLS
+        //    add + broadcasts the epoch Commit), and the returned Welcome is
+        //    signed + HPKE-sealed into a §5.12.3 bundle with this node's #active
+        //    key.
+        let outcome = self
+            .manager
+            .invite_member(
+                context_id.to_owned(),
+                self.did.clone(),
+                DID::from(member_did),
+                kp_bytes,
+                vec![],
+                &self.signing_key,
+            )
+            .await?;
+        let InviteMemberOutcome::Sealed { bundle, .. } = outcome;
+
+        // 6. Deposit the sealed invitation (+ reservation id) for the joiner to
+        //    feed into `spawn_actor_from_welcome`.
+        self.crypto.deposit_pending_join(
+            &ctx_bytes,
+            member_did,
+            PendingJoin {
+                sealed: bundle,
+                reservation_id,
+            },
+        );
+
+        // 7. Distribute THIS node's sender key to the new member — `invite_member`
+        //    does NOT distribute sender keys on add, so the joiner needs it to
+        //    decrypt the creator's traffic. Deposits directly into the exchange
+        //    (does not touch the transport capture buffer).
+        self.crypto.distribute_sender_key(&ctx_bytes, member_did)?;
+
+        // 8. Extract the epoch-advance Commit from the actor's WelcomeGenerated
+        //    event and deposit it for every existing member so their MLS group
+        //    advances to the new epoch. The Welcome itself travels INSIDE the
+        //    sealed bundle, so `welcome_bytes` is discarded here. Every OTHER
+        //    event is buffered so the tests' later `drain_events` still sees it.
         let drained = self.manager.drain_events(context_id).await;
         {
             let mut pending = self
@@ -351,17 +410,7 @@ impl FullStackNode {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             for event in drained {
-                if let ContextEvent::WelcomeGenerated {
-                    welcome_bytes,
-                    commit_bytes,
-                    ..
-                } = event
-                {
-                    self.crypto
-                        .deposit_welcome(&ctx_bytes, member_did, welcome_bytes.0);
-                    // Deposit the Commit for every existing member so their MLS
-                    // group advances to the new epoch (skip the new joiner, who
-                    // receives the Welcome instead).
+                if let ContextEvent::WelcomeGenerated { commit_bytes, .. } = event {
                     for existing in &existing_members {
                         if existing != member_did {
                             self.crypto.deposit_commit(
@@ -377,8 +426,15 @@ impl FullStackNode {
             }
         }
 
-        // 6. Deposit every member's access key for the joiner (it needs every
-        //    key to both decrypt inbound content and wrap outbound content).
+        // 9. `invite_member` broadcast the epoch Commit to the transport, so the
+        //    capture buffer now holds it. The raw commit_bytes were already
+        //    deposited for existing members from the event in step 8, so clear
+        //    the buffer to keep `take_sent_ciphertexts` clean for later
+        //    application-ciphertext assertions.
+        let _ = std::mem::take(&mut *self.lock_sent());
+
+        // 10. Deposit every member's access key for the joiner (it needs every
+        //     key to both decrypt inbound content and wrap outbound content).
         let all_keys = self.get_all_access_keys(context_id).await?;
         for (did, key) in all_keys {
             self.crypto
@@ -407,29 +463,77 @@ impl FullStackNode {
         })?
     }
 
-    /// Joins a context by retrieving the Welcome from the `KeyExchange`
-    /// (joiner-side operation).
+    /// Joins a context from the sealed invitation the creator deposited in the
+    /// `KeyExchange` (joiner-side operation), standing up a live, send-capable
+    /// per-context ACTOR via `Supervisor::spawn_actor_from_welcome` (ADR-049 §9
+    /// 2F-residual).
     ///
-    /// Forms the local MLS group, picks up access keys, processes the queued
-    /// sender-key distribution messages, and applies any pending epoch-advance
-    /// Commits.
+    /// Opens the creator-signed, HPKE-sealed bundle under this node's #active
+    /// split custody, installs the joined MLS group, spawns the actor, then
+    /// picks up access keys, processes the queued sender-key distribution
+    /// messages, and applies any pending epoch-advance Commits. Returns the
+    /// live [`ContextHandle`].
     ///
     /// # Errors
     ///
-    /// Propagates [`ContextError`] if no Welcome is available or processing
-    /// fails.
-    pub fn join_from_welcome(
+    /// Propagates [`ContextError`] if no invitation is available, the spawn
+    /// rejects the bundle (bad signature / binding / replay / persist), or any
+    /// pickup step fails.
+    pub async fn join_from_welcome(
         &self,
         context_id_str: &str,
         context_id: &[u8; 32],
-    ) -> Result<(), ContextError> {
-        self.crypto.join_from_welcome(context_id)?;
+    ) -> Result<ContextHandle, ContextError> {
+        // 1. Take the sealed invitation (bundle + reservation id) the creator
+        //    deposited.
+        let PendingJoin {
+            sealed,
+            reservation_id,
+        } = self.crypto.take_pending_join(context_id).ok_or_else(|| {
+            ContextError::CryptoFailed(format!(
+                "no pending invitation for {} in context {}",
+                self.did.as_ref(),
+                hex::encode(context_id)
+            ))
+        })?;
+
+        // 2. Build this node's #active split custody from the SAME seed the
+        //    network resolver publishes for this DID (so the key the creator
+        //    sealed to is exactly the key this custody opens with).
+        let custody = InMemoryKeyCustody::new();
+        let active_handle = custody
+            .import_ed25519_key(&self.signing_key.to_bytes())
+            .await;
+
+        // 3. Reconstruct the request. The spawn entrypoint rejects `None` /
+        //    all-zero pseudonyms, so derive a distinct non-zero §9.10.4
+        //    pseudonym from this joiner's DID + context.
+        let enc: [u8; 32] = sealed.enc.as_slice().try_into().map_err(|_| {
+            ContextError::CryptoFailed("sealed enc not 32 bytes".to_owned())
+        })?;
+        let req = WelcomeJoinRequest {
+            context_id: sealed.context_id.clone(),
+            creator_did: sealed.creator_did.clone(),
+            sealed_bundle_enc: enc,
+            sealed_bundle_ct: sealed.ciphertext.clone(),
+            reservation_id,
+            local_pseudonym: Some(harness_pseudonym(&self.did, context_id_str)),
+        };
+
+        // 4. Spawn the live per-context actor from the opened, verified bundle.
+        let handle = self
+            .manager
+            .spawn_actor_from_welcome(self.did.clone(), &custody, &active_handle, req)
+            .await?;
+
+        // 5. Joiner-side pickup: access keys, sender-key distribution messages,
+        //    and any pending epoch-advance Commits.
         self.crypto.pickup_access_keys(context_id_str);
         self.crypto
             .pickup_sender_key_messages(context_id_str, context_id)?;
         self.crypto
             .process_pending_commits(context_id_str, context_id)?;
-        Ok(())
+        Ok(handle)
     }
 
     /// Sends a message through the real `Supervisor` (encrypts with real MLS +
@@ -711,6 +815,29 @@ impl FullStackNode {
     pub fn merkle_root(&self, context_id: &[u8; 32]) -> Result<[u8; 32], ContextError> {
         self.event_log.event_log_merkle_root(context_id)
     }
+}
+
+/// Derives a distinct, non-zero §9.10.4 local pseudonym for a joiner from its
+/// DID + context id. `Supervisor::spawn_actor_from_welcome` rejects a `None`
+/// pseudonym and refuses the all-zero `[0u8; 32]`, so the harness supplies a
+/// deterministic non-zero value (byte 31 is pinned to `0xA5` to guarantee it is
+/// never all-zero even in the astronomically-unlikely hash-collision case).
+fn harness_pseudonym(did: &DID, ctx: &str) -> [u8; 32] {
+    use std::hash::{Hash, Hasher};
+    let mut pseudonym = [0u8; 32];
+    // Fill the array with 4 rounds of a DefaultHasher over (did || ctx || round)
+    // so it is distinct per joiner + context, not just a repeated 8-byte block.
+    for (round, chunk) in pseudonym.chunks_mut(8).enumerate() {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        did.as_ref().hash(&mut hasher);
+        ctx.hash(&mut hasher);
+        round.hash(&mut hasher);
+        let h = hasher.finish().to_le_bytes();
+        chunk.copy_from_slice(&h[..chunk.len()]);
+    }
+    // Guarantee non-zero (spawn refuses the all-zero pseudonym).
+    pseudonym[31] = 0xA5;
+    pseudonym
 }
 
 /// Builds a throwaway `OuterEnvelope` wrapping a raw MLS message and returns

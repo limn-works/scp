@@ -2327,9 +2327,9 @@ impl MlsCryptoProvider {
     /// Test-only snapshot of the provider's identity-level X25519 wrapping
     /// keypair (§9.16.1): `(public, secret)`. Lets the full-stack harness
     /// publish the provider's OWN self-consistent keypair into the joiner's
-    /// `Supervisor::set_wrapping_keys` slot so the pooled KeyPackage's `0xFF01`
+    /// `Supervisor::set_wrapping_keys` slot so the pooled `KeyPackage`'s `0xFF01`
     /// wrapping-leaf pubkey and the secret this provider opens sender keys with
-    /// stay the SAME keypair across the reserve → spawn_actor_from_welcome join
+    /// stay the SAME keypair across the reserve → `spawn_actor_from_welcome` join
     /// migration. The wrapping SECRET never leaves the provider in a prod build.
     #[cfg(any(test, feature = "testing"))]
     #[must_use]

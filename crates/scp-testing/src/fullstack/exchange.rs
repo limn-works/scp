@@ -9,7 +9,7 @@
 //!
 //! The reserve → `invite_member` → `spawn_actor_from_welcome` migration (ADR-049
 //! §9 2F-residual) retires the legacy raw-Welcome slot: the creator now reserves
-//! the joiner's KeyPackage directly on the joiner's supervisor and calls
+//! the joiner's `KeyPackage` directly on the joiner's supervisor and calls
 //! `Supervisor::invite_member`, which returns a signed, sealed
 //! [`SealedInvitation`]. That bundle (plus the joiner's reservation id) is what
 //! crosses this channel — the joiner feeds it straight into
@@ -23,13 +23,13 @@ use scp_core::crypto::access_keys::AccessKey;
 
 /// A pending invitation for a joiner: the creator-signed, HPKE-sealed
 /// [`SealedInvitation`] bundle plus the joiner's own reservation id (the handle
-/// on the KeyPackage the creator's `invite_member` consumed). Together they are
+/// on the `KeyPackage` the creator's `invite_member` consumed). Together they are
 /// exactly the inputs `Supervisor::spawn_actor_from_welcome` needs.
 #[derive(Clone)]
 pub struct PendingJoin {
     /// The creator-signed, HPKE-sealed invitation bundle.
     pub sealed: SealedInvitation,
-    /// The joiner's reservation id for the KeyPackage the creator added.
+    /// The joiner's reservation id for the `KeyPackage` the creator added.
     pub reservation_id: ReservationId,
 }
 

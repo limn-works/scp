@@ -7,13 +7,16 @@
 //! spawns an actor for the context).
 //!
 //! `E2eCryptoProvider` is the harness-side helper that bridges the
-//! Welcome / sender-key / access-key material between two in-process nodes
-//! through a shared [`KeyExchange`]. It does NOT re-introduce a trait impl:
-//! every MLS primitive runs on the real concrete [`MlsCryptoProvider`]; the
-//! `KeyExchange` only carries the cross-process bootstrap bytes that a real
-//! deployment would move over transport (the joiner's key package, the
-//! Welcome, the inviter-minted per-member access keys, and the MLS-wrapped
-//! sender-key distribution messages).
+//! sealed-invitation / sender-key / access-key material between two in-process
+//! nodes through a shared [`KeyExchange`]. It does NOT re-introduce a trait
+//! impl: every MLS primitive runs on the real concrete [`MlsCryptoProvider`];
+//! the `KeyExchange` only carries the cross-process bootstrap bytes that a real
+//! deployment would move over transport (the creator-signed, HPKE-sealed
+//! invitation bundle, the inviter-minted per-member access keys, and the
+//! MLS-wrapped sender-key distribution messages). The joiner reserves its own
+//! `KeyPackage` on its supervisor and, after the creator's `invite_member`,
+//! stands up a live actor via `spawn_actor_from_welcome` (ADR-049 §9
+//! 2F-residual) — the legacy provider single-slot join path is gone.
 //!
 //! # What is real
 //!
@@ -84,67 +87,34 @@ impl E2eCryptoProvider {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    // -- Joiner side: key package -> Welcome -> join -----------------------
+    // -- Joiner side: pick up the sealed invitation ------------------------
 
-    /// Prepares a real MLS key package for this node to join a context and
-    /// deposits it in the shared exchange for the inviter to pick up.
-    ///
-    /// The provider retains the matching signer / storage state internally
-    /// (its `pending_joins` slot), consumed later by
-    /// [`MlsCryptoProvider::join_from_welcome`].
-    ///
-    /// # Errors
-    ///
-    /// Propagates [`ContextError`](scp_core::context::ContextError) from key
-    /// package generation.
-    pub fn deposit_key_package(
-        &self,
-        context_id: &[u8; 32],
-    ) -> Result<(), scp_core::context::ContextError> {
-        let kp_bytes = self.provider.prepare_key_package_for_join()?;
-        self.exchange()
-            .deposit_key_package(*context_id, self.local_did.as_ref(), kp_bytes);
-        Ok(())
-    }
-
-    /// Joins an MLS group from the Welcome the inviter deposited in the
-    /// shared exchange, forming this node's local group state.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ContextError`](scp_core::context::ContextError) if no
-    /// Welcome is available or Welcome processing fails.
-    pub fn join_from_welcome(
-        &self,
-        context_id: &[u8; 32],
-    ) -> Result<(), scp_core::context::ContextError> {
-        let welcome_bytes = {
-            let mut exchange = self.exchange();
-            exchange
-                .take_welcome(context_id, self.local_did.as_ref())
-                .ok_or_else(|| {
-                    scp_core::context::ContextError::CryptoFailed(format!(
-                        "no Welcome available for {} in context {}",
-                        self.local_did.as_ref(),
-                        hex::encode(context_id)
-                    ))
-                })?
-        };
-        self.provider.join_from_welcome(context_id, &welcome_bytes)
-    }
-
-    // -- Inviter side: deposit Welcome + access keys -----------------------
-
-    /// Deposits a Welcome for `joiner_did` to pick up.
-    pub fn deposit_welcome(&self, context_id: &[u8; 32], joiner_did: &str, welcome_bytes: Vec<u8>) {
-        self.exchange()
-            .deposit_welcome(*context_id, joiner_did, welcome_bytes);
-    }
-
-    /// Takes (removes) a key package the joiner deposited for this context.
+    /// Takes (removes) the pending invitation deposited for this node — the
+    /// creator-signed, HPKE-sealed [`SealedInvitation`](scp_core::context::invitation_helpers::SealedInvitation)
+    /// bundle plus this node's reservation id. The joiner feeds these straight
+    /// into `Supervisor::spawn_actor_from_welcome`.
     #[must_use]
-    pub fn take_key_package(&self, context_id: &[u8; 32], joiner_did: &str) -> Option<Vec<u8>> {
-        self.exchange().take_key_package(context_id, joiner_did)
+    pub fn take_pending_join(
+        &self,
+        context_id: &[u8; 32],
+    ) -> Option<super::exchange::PendingJoin> {
+        self.exchange()
+            .take_pending_join(context_id, self.local_did.as_ref())
+    }
+
+    // -- Inviter side: deposit the sealed invitation + access keys ---------
+
+    /// Deposits a pending invitation (sealed bundle + reservation id) for
+    /// `joiner_did` to pick up. Produced by the inviter's
+    /// `Supervisor::invite_member`.
+    pub fn deposit_pending_join(
+        &self,
+        context_id: &[u8; 32],
+        joiner_did: &str,
+        pending: super::exchange::PendingJoin,
+    ) {
+        self.exchange()
+            .deposit_pending_join(*context_id, joiner_did, pending);
     }
 
     /// Deposits a per-member access key for `joiner_did` to pick up during

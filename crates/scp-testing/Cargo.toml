@@ -41,6 +41,7 @@ rmp-serde = { workspace = true }
 tls_codec = "0.4"
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
+zeroize = { workspace = true }
 
 [dev-dependencies]
 scp-core = { path = "../scp-core", features = ["testing"] }
