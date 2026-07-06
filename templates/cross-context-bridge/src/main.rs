@@ -47,11 +47,10 @@ fn admin_ceiling() -> CapabilityCeiling {
 }
 
 /// Sets up a context handle in the Active state.
-async fn create_active_context(
-    context_id: &str,
-) -> Result<ContextHandle, Box<dyn std::error::Error>> {
+fn create_active_context(context_id: &str) -> Result<ContextHandle, Box<dyn std::error::Error>> {
     let handle = ContextHandle::new(context_id.to_owned(), ContextParams::default());
-    handle.transition_to(&ContextState::Active).await?;
+    // `transition_to` is a synchronous lock-free ArcSwap CAS (ADR-049 §10).
+    handle.transition_to(&ContextState::Active)?;
     Ok(handle)
 }
 
@@ -72,8 +71,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 2. Create two separate contexts
     // -----------------------------------------------------------------------
 
-    let ctx_a = create_active_context("context-a-provider").await?;
-    let ctx_b = create_active_context("context-b-consumer").await?;
+    let ctx_a = create_active_context("context-a-provider")?;
+    let ctx_b = create_active_context("context-b-consumer")?;
     println!("Context A (provider): {}", ctx_a.context_id());
     println!("Context B (consumer): {}", ctx_b.context_id());
 
