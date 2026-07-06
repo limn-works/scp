@@ -113,13 +113,8 @@ BAN_ENTRIES=(
     "MutationStateView|crates/scp-runtime|*.rs|Actor-per-context refactor deleted the transitional mutation/query borrow adapters (ADR-049)"
     "QueryStateView|crates/scp-runtime|*.rs|Actor-per-context refactor deleted the transitional mutation/query borrow adapters (ADR-049)"
     "RwLock<ContextInner>|crates/scp-runtime|*.rs|ADR-049 §Decision 12: ContextHandle's read-path RwLock<ContextInner> was replaced by lock-free Arc<ArcSwap<ContextState>>; the RwLock<ContextInner> shape must not reappear"
+    "pending_joins|crates/scp-runtime/src/crypto|*.rs|ADR-049 2F-residual deleted the legacy single-slot Welcome-join primitive (prepare_key_package_for_join + MlsCryptoProvider::join_from_welcome); joins flow through the KeyPackageStoreActor reserve/confirm protocol"
 )
-
-# Example of the activated form for the remaining, still-pending ban.
-# `pending_joins` waits on the 2F-residual join-path deletion.
-# BAN_ENTRIES+=(
-#     "pending_joins|crates/scp-runtime/src/crypto|*.rs|Actor-per-context refactor deleted this (ADR-049)"
-# )
 
 # ---------------------------------------------------------------------------
 # Entry-point
