@@ -253,16 +253,22 @@ pub(crate) fn fullstack_join_from_welcome_on(
     // The joiner reserves its own KeyPackage, the creator's `invite_member`
     // seals the Welcome, and `spawn_actor_from_welcome` opens it under split
     // custody, installs the joined group, and registers a live actor. The
-    // returned `ContextHandle` is discarded here — later fullstack seams look
-    // the joiner's context up by id through its supervisor.
-    rt.block_on(node.inner.join_from_welcome(&context_id, &ctx_bytes))
-        .map(|_handle| ())
+    // returned `ContextHandle` is stored in the node's handle map so a
+    // subsequent `fullstack_send_message` on this joiner resolves it — the
+    // joiner is now a bidirectional, send-capable participant.
+    let handle = rt
+        .block_on(node.inner.join_from_welcome(&context_id, &ctx_bytes))
         .map_err(|e| {
             napi::Error::from(ScpNapiError::Crypto {
                 message: format!("failed to join from Welcome: {e}"),
                 code: codes::CRYPTO_4051.to_owned(),
             })
-        })
+        })?;
+    node.handles
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(context_id, handle);
+    Ok(())
 }
 
 /// Per-bridge-instance implementation of [`fullstack_sync_sender_keys`].

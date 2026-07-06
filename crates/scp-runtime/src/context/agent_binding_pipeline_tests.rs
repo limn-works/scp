@@ -138,39 +138,14 @@ fn document_backed_resolver(
 /// returning Alice's provider (the sender) and Bob's provider (used to MLS-open
 /// the produced blob on the receive side).
 fn setup_two_party(ctx_str: &str) -> (Arc<MlsCryptoProvider>, Arc<MlsCryptoProvider>, [u8; 32]) {
-    let context_id = scp_protocol::context::context_id_bytes(ctx_str);
-
-    let alice = MlsCryptoProvider::new(
-        ALICE_DID.to_owned(),
-        std::sync::Arc::new(scp_clock::SystemClock),
-    );
-    alice.create_mls_group(&context_id).unwrap();
-    alice.generate_sender_key(&context_id).unwrap();
-
-    let bob = MlsCryptoProvider::new(
-        BOB_DID.to_owned(),
-        std::sync::Arc::new(scp_clock::SystemClock),
-    );
-    let bob_kp_bytes = bob.prepare_key_package_for_join().unwrap();
-    let add_output = alice
-        .add_member(&context_id, BOB_DID, Some(&bob_kp_bytes))
-        .unwrap();
-    bob.join_from_welcome(&context_id, &add_output.welcome_bytes)
-        .unwrap();
-    bob.generate_sender_key(&context_id).unwrap();
-
-    // Distribute Alice's sender key to Bob so Bob can sender-key-decrypt
-    // Alice's application sends.
-    alice.distribute_sender_key(&context_id, BOB_DID).unwrap();
-    for (_target, msg) in alice
-        .drain_pending_sender_key_messages(&context_id)
-        .unwrap()
-    {
-        bob.process_incoming_sender_key(&context_id, ALICE_DID, &msg)
-            .unwrap();
-    }
-
-    (Arc::new(alice), Arc::new(bob), context_id)
+    // Stand up the joined pair over the REAL reserve → creator-add → sign →
+    // HPKE-seal → spawn-from-Welcome path (the legacy provider-level prepare/join
+    // shortcut is retired). The helper keys the group by `context_id_bytes(ctx_str)`
+    // and distributes Alice's sender key to Bob so Bob can sender-key-decrypt
+    // Alice's application sends. The bootstrap's internal resolver only verifies
+    // the joiner's creator signature and seals to Bob's #active — the send /
+    // receive half below builds its own document-derived `#agent`-aware resolver.
+    crate::crypto::mls::two_party_test_support::stand_up_two_party(ctx_str, ALICE_DID, BOB_DID)
 }
 
 /// Generates Alice's identity-key, active-key, and agent-key keypairs and the
@@ -450,11 +425,15 @@ mod live_supervisor_send {
 
     use ed25519_dalek::SigningKey;
     use scp_did::{DID, SigningKeyId};
+    use scp_platform::KeyCustody;
+    use scp_platform::testing::InMemoryKeyCustody;
     use scp_protocol::context::builder::{ContextCreationError, OpenResult};
+    use scp_protocol::context::governance::KeyResolver;
     use scp_protocol::context::membership::{ContextEvent, KeyPackage};
     use scp_protocol::context::params::{ContextMode, ContextParams};
     use scp_protocol::context::roles::Capability;
     use scp_protocol::context::{ContextError, context_id_bytes};
+    use zeroize::Zeroizing;
 
     use super::{ALICE_DID, BOB_DID, alice_identity, document_backed_resolver};
     use crate::context::ContextHandle;
@@ -604,18 +583,42 @@ mod live_supervisor_send {
     ) {
         let ctx_bytes = context_id_bytes(ctx_id);
 
-        // Bob mints a real MLS key package (his provider keeps the matching
-        // signer state for the later Welcome join).
-        let bob = Arc::new(MlsCryptoProvider::new(
-            BOB_DID.to_owned(),
-            std::sync::Arc::new(scp_clock::SystemClock),
-        ));
-        let bob_kp_bytes = bob
-            .prepare_key_package_for_join()
-            .expect("bob prepares key package");
+        // Bob's joiner supervisor + a clone of his provider (holds the installed
+        // group after the join, even after the supervisor is dropped). Its
+        // resolver resolves the bundle creator (ALICE) so Bob can verify the
+        // creator-signed §5.12.3 invitation. The bundle-signing key is
+        // independent of Alice's send-signing identity: SingleAdmin `0xFF02`
+        // commits only the creator DID, so any key the resolver maps to
+        // `ALICE_DID` validly signs the bundle.
+        let alice_bundle_key = SigningKey::from_bytes(&[0xA1; 32]);
+        let bob_active_key = SigningKey::from_bytes(&[0xB0; 32]);
+        let resolver: KeyResolver = {
+            let alice = DID::from(ALICE_DID);
+            let alice_vk = alice_bundle_key.verifying_key();
+            Arc::new(move |did: &DID, _| (did == &alice).then_some(alice_vk))
+        };
+        let (bob_sup, bob) =
+            crate::crypto::mls::two_party_test_support::bob_supervisor(BOB_DID, resolver);
 
-        // Real add-member through the actor: real MLS add → real Welcome → real
-        // HPKE sender-key distribution → minted access keys.
+        // Publish Bob's OWN provider wrapping keypair BEFORE reserving so the
+        // pooled KP's `0xFF01` leaf and the secret Bob opens sender keys with stay
+        // the same keypair; then reserve his real KeyPackage from his own store.
+        let (bob_wrap_public, bob_wrap_secret) = bob.wrapping_keypair_snapshot();
+        bob_sup
+            .set_wrapping_keys(
+                DID::from(BOB_DID),
+                bob_wrap_public.to_vec(),
+                Zeroizing::new(bob_wrap_secret.to_vec()),
+            )
+            .await
+            .expect("publish bob's wrapping key");
+        let (reservation_id, bob_kp_bytes) = bob_sup
+            .reserve_key_package(DID::from(BOB_DID))
+            .await
+            .expect("bob reserves a real KeyPackage from his own store");
+
+        // Real add-member through Alice's LIVE actor: real MLS add → real Welcome
+        // → real HPKE sender-key distribution → minted access keys.
         sup.join_context(
             handle,
             KeyPackage {
@@ -635,7 +638,7 @@ mod live_supervisor_send {
         // buffer clean for the application ciphertext the test sends later.
         let bootstrap_blobs = drain_sent(sent);
 
-        // Bob forms his group from the Welcome the actor emitted.
+        // Extract the Welcome the actor emitted for Bob.
         let welcome_bytes = {
             let mut welcome = None;
             for event in sup.drain_events(ctx_id).await {
@@ -645,8 +648,38 @@ mod live_supervisor_send {
             }
             welcome.expect("actor emitted a WelcomeGenerated event for Bob")
         };
-        bob.join_from_welcome(&ctx_bytes, &welcome_bytes)
-            .expect("bob joins from Welcome");
+
+        // Bob installs the joined group through the REAL spawn path (the legacy
+        // provider-level `join_from_welcome` is retired): Alice's Welcome is
+        // hand-sealed into a creator-signed §5.12.3 bundle addressed to Bob's
+        // #active, and `spawn_actor_from_welcome` opens + installs it into Bob's
+        // provider. Alice is a LIVE Supervisor here, so the group's committed
+        // `0xFF02` params/creator come from her `create_context`; the bundle
+        // carries the SAME `encrypted_params()` + `ALICE_DID`, so the §5.13.3
+        // binding verifies. After the join the group lives in Bob's provider, so
+        // it survives the supervisor drop.
+        let bob_pseudonym = [0x42u8; 32];
+        let bob_custody = InMemoryKeyCustody::new();
+        let bob_active_handle = bob_custody
+            .import_ed25519_signing_key(&Zeroizing::new(bob_active_key.to_bytes()))
+            .await
+            .expect("import bob's #active seed into custody");
+        let req = crate::crypto::mls::two_party_test_support::seal_welcome_for_joiner(
+            &alice_bundle_key,
+            &DID::from(ALICE_DID),
+            ctx_id,
+            &encrypted_params(),
+            welcome_bytes,
+            bob_active_key.verifying_key().as_bytes(),
+            reservation_id,
+            bob_pseudonym,
+        );
+        bob_sup
+            .spawn_actor_from_welcome(DID::from(BOB_DID), &bob_custody, &bob_active_handle, req)
+            .await
+            .expect("bob installs the joined group from alice's invitation");
+        drop(bob_sup);
+
         bob.generate_sender_key(&ctx_bytes)
             .expect("bob generates his sender key");
 
@@ -673,10 +706,10 @@ mod live_supervisor_send {
             }
         }
 
-        // Seed Bob's per-member pseudonym (§9.10.4): the encrypted send fans out
-        // to known peer pseudonyms only, so without this seed the send fails
-        // closed with `PseudonymRegistryEmpty`.
-        let bob_pseudonym = [0x42u8; 32];
+        // Seed Bob's per-member pseudonym (§9.10.4) into Alice's actor: the
+        // encrypted send fans out to known peer pseudonyms only, so without this
+        // seed the send fails closed with `PseudonymRegistryEmpty`. Uses the SAME
+        // `bob_pseudonym` Bob registered at spawn above.
         sup.seed_peer_pseudonym(ctx_id, DID::from(BOB_DID), bob_pseudonym)
             .await
             .expect("seed Bob's per-context pseudonym");

@@ -4676,38 +4676,24 @@ mod tests {
     /// derive its id from a real string rather than an arbitrary 32-byte value.
     const TEST_CTX_STR: &str = "h9-ceiling-ctx";
 
-    fn setup_alice_bob_two_party() -> (MlsCryptoProvider, MlsCryptoProvider, [u8; 32], String) {
+    fn setup_alice_bob_two_party() -> (
+        Arc<MlsCryptoProvider>,
+        Arc<MlsCryptoProvider>,
+        [u8; 32],
+        String,
+    ) {
         let alice_did = TEST_DID;
         let bob_did = "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo";
-        let context_id = scp_protocol::context::context_id_bytes(TEST_CTX_STR);
-
-        let alice = MlsCryptoProvider::new(alice_did.to_string(), Arc::new(SystemClock));
-        alice.create_mls_group(&context_id).unwrap();
-        alice.generate_sender_key(&context_id).unwrap();
-
-        let bob = MlsCryptoProvider::new(bob_did.to_string(), Arc::new(SystemClock));
-        let bob_kp_bytes = bob.prepare_key_package_for_join().unwrap();
-
-        let add_output = alice
-            .add_member(&context_id, bob_did, Some(&bob_kp_bytes))
-            .unwrap();
-
-        bob.join_from_welcome(&context_id, &add_output.welcome_bytes)
-            .unwrap();
-        bob.generate_sender_key(&context_id).unwrap();
-
-        // Distribute Alice's sender key to Bob via the legitimate path.
-        // This sets `bob.sender_key_store.epoch(ctx, alice_did) = 1`,
-        // which is the H9 high-water mark.
-        alice.distribute_sender_key(&context_id, bob_did).unwrap();
-        let pending = alice
-            .drain_pending_sender_key_messages(&context_id)
-            .unwrap();
-        assert_eq!(pending.len(), 1);
-        for (_target, msg) in pending {
-            bob.process_incoming_sender_key(&context_id, alice_did, &msg)
-                .unwrap();
-        }
+        // Stand up the joined pair over the REAL reserve → creator-add → sign →
+        // HPKE-seal → spawn-from-Welcome path (the legacy provider-level
+        // prepare/join shortcut is retired). The helper also distributes Alice's
+        // sender key to Bob, so `bob.sender_key_store.epoch(ctx, alice_did) = 1` —
+        // the H9 high-water mark these tests anchor on.
+        let (alice, bob, context_id) = crate::crypto::mls::two_party_test_support::stand_up_two_party(
+            TEST_CTX_STR,
+            alice_did,
+            bob_did,
+        );
 
         (alice, bob, context_id, alice_did.to_string())
     }
@@ -5295,34 +5281,20 @@ mod tests {
     /// which the string-driven helper cannot address.)
     fn setup_two_party_for_ctx_string(
         ctx_str: &str,
-    ) -> (MlsCryptoProvider, MlsCryptoProvider, [u8; 32], String) {
+    ) -> (
+        Arc<MlsCryptoProvider>,
+        Arc<MlsCryptoProvider>,
+        [u8; 32],
+        String,
+    ) {
         let alice_did = TEST_DID;
         let bob_did = "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo";
-        let context_id = scp_protocol::context::context_id_bytes(ctx_str);
-
-        let alice = MlsCryptoProvider::new(alice_did.to_string(), Arc::new(SystemClock));
-        alice.create_mls_group(&context_id).unwrap();
-        alice.generate_sender_key(&context_id).unwrap();
-
-        let bob = MlsCryptoProvider::new(bob_did.to_string(), Arc::new(SystemClock));
-        let bob_kp_bytes = bob.prepare_key_package_for_join().unwrap();
-        let add_output = alice
-            .add_member(&context_id, bob_did, Some(&bob_kp_bytes))
-            .unwrap();
-        bob.join_from_welcome(&context_id, &add_output.welcome_bytes)
-            .unwrap();
-        bob.generate_sender_key(&context_id).unwrap();
-
-        // Distribute Alice's sender key to Bob via the legitimate path so Bob
-        // can decrypt Alice's app-data sends.
-        alice.distribute_sender_key(&context_id, bob_did).unwrap();
-        let pending = alice
-            .drain_pending_sender_key_messages(&context_id)
-            .unwrap();
-        for (_target, msg) in pending {
-            bob.process_incoming_sender_key(&context_id, alice_did, &msg)
-                .unwrap();
-        }
+        // Stand up the joined pair over the REAL join path, keyed by
+        // `context_id_bytes(ctx_str)`. The helper distributes Alice's sender key
+        // to Bob so Bob can decrypt Alice's app-data sends.
+        let (alice, bob, context_id) = crate::crypto::mls::two_party_test_support::stand_up_two_party(
+            ctx_str, alice_did, bob_did,
+        );
 
         (alice, bob, context_id, alice_did.to_string())
     }
