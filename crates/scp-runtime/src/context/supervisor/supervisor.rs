@@ -11394,6 +11394,28 @@ impl Supervisor {
                     };
                     let handle = state.handle.clone();
 
+                    // 3a. Activate the joiner's lifecycle handle. A freshly-built
+                    //     handle is `Creating` (`ContextHandle::new`); the create and
+                    //     restore paths transition to `Active` once their group is
+                    //     installed, and a Welcome-JOINER is equally live at this point
+                    //     — its MLS group is installed (step 2) and its authority is
+                    //     verified (step 1b). Without this transition the joined context
+                    //     is stuck in `Creating`, so every `Active`-gated operation
+                    //     (send, governance, TTL) fails closed with `ContextNotActive`
+                    //     — i.e. the "live send-capable actor" this entrypoint is
+                    //     documented to stand up (§9(b)) could receive but never send.
+                    //     `state.handle` and this `handle` clone share one
+                    //     `Arc<RwLock<..>>`, so the actor's own handle observes `Active`
+                    //     too. On a transition failure roll the installed group back
+                    //     (nothing is persisted or registered yet) and fail closed.
+                    if let Err(e) = handle
+                        .transition_to(&scp_protocol::context::ContextState::Active)
+                        .await
+                    {
+                        let _ = deps.crypto.destroy_mls_group(&context_id_bytes);
+                        return Err(e);
+                    }
+
                     // 3b. Entrypoint-level crypto durability check — BEFORE the persist
                     //     (BLACK-2J-03 / crypto L2 / simplifier). `build_snapshot_for_persist`
                     //     is FAIL-OPEN by design for existing members: if `export_crypto_state`
