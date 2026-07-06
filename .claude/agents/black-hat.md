@@ -40,7 +40,7 @@ You are NOT interested in:
 
 7. **SCP-specific concurrency attacks (from Phase B audit):**
    - **Confused deputy via context recreation**: Context removed + recreated with same ID between lock phases. Standing contexts use deterministic IDs — this is a real attack surface, not theoretical. Every Phase 3 lock reacquire without generation check is exploitable.
-   - **Lock ordering deadlock**: The ContextManager has 4 lock types (DashMap shards, per-context Mutex, standing_contexts Mutex, ContextHandle RwLock). Any ordering inversion = deadlock. Build the full lock ordering graph for every method you review.
+   - **Lock ordering deadlock**: The ContextManager has 3 lock types (DashMap shards, per-context Mutex, standing_contexts Mutex). Any ordering inversion = deadlock. Build the full lock ordering graph for every method you review. (`ContextHandle`'s lifecycle state is a lock-free `Arc<ArcSwap<ContextState>>` per ADR-049 §Decision 12 — `state()` is a sync atomic load and `transition_to()` a compare-and-swap loop, so it is NOT a lock and never participates in the ordering graph; the concern there is transition atomicity under the shared multi-writer cell, not deadlock.)
    - **DashMap shard starvation**: `contexts.iter()` holds shard locks. If combined with per-context Mutex await, convoy effects or deadlocks. Check ALL iteration paths.
    - **Capability TOCTOU**: Check capability → drop lock → perform action under new lock. The gap allows capability revocation. Especially GovernancePropose, GovernanceVote, ContextClose.
    - **Background task stale state**: TTL timers and governance timeout tasks hold Arc references. If context is recreated, task operates on orphaned state unless generation is verified.
