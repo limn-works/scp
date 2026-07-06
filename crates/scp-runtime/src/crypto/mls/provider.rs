@@ -2707,7 +2707,6 @@ impl MlsCryptoProvider {
 
         Ok(())
     }
-
 }
 
 #[cfg(test)]
@@ -4489,11 +4488,12 @@ mod tests {
         // prepare/join shortcut is retired). The helper also distributes Alice's
         // sender key to Bob, so `bob.sender_key_store.epoch(ctx, alice_did) = 1` —
         // the H9 high-water mark these tests anchor on.
-        let (alice, bob, context_id) = crate::crypto::mls::two_party_test_support::stand_up_two_party(
-            TEST_CTX_STR,
-            alice_did,
-            bob_did,
-        );
+        let (alice, bob, context_id) =
+            crate::crypto::mls::two_party_test_support::stand_up_two_party(
+                TEST_CTX_STR,
+                alice_did,
+                bob_did,
+            );
 
         (alice, bob, context_id, alice_did.to_string())
     }
@@ -5092,9 +5092,10 @@ mod tests {
         // Stand up the joined pair over the REAL join path, keyed by
         // `context_id_bytes(ctx_str)`. The helper distributes Alice's sender key
         // to Bob so Bob can decrypt Alice's app-data sends.
-        let (alice, bob, context_id) = crate::crypto::mls::two_party_test_support::stand_up_two_party(
-            ctx_str, alice_did, bob_did,
-        );
+        let (alice, bob, context_id) =
+            crate::crypto::mls::two_party_test_support::stand_up_two_party(
+                ctx_str, alice_did, bob_did,
+            );
 
         (alice, bob, context_id, alice_did.to_string())
     }

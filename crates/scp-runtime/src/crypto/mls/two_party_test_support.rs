@@ -48,9 +48,9 @@ use crate::context::builder::{
 };
 use crate::context::invitation_helpers::{SnapshotRuntimeFacts, build_metadata_snapshot};
 use crate::context::providers::event_log::MerkleEventLogProvider;
+use crate::context::supervisor::Supervisor;
 use crate::context::supervisor::WelcomeJoinRequest;
 use crate::context::supervisor::key_package_actor::ReservationId;
-use crate::context::supervisor::Supervisor;
 
 /// Alice's (creator) fixed bundle-signing key. The bootstrap resolver maps
 /// `alice_did` to its verifying key so the joiner can verify the creator-signed
@@ -172,13 +172,8 @@ fn seal_join_request(
 ) -> WelcomeJoinRequest {
     let bundle = signed_bundle(signer, creator_did, context_id, params, welcome_bytes);
     let wire = bundle.to_wire_bytes().expect("bundle serializes");
-    let (ct, enc) = hpke_seal_invitation(
-        &wire,
-        recipient_x25519,
-        context_id,
-        creator_did.as_ref(),
-    )
-    .expect("HPKE seal");
+    let (ct, enc) = hpke_seal_invitation(&wire, recipient_x25519, context_id, creator_did.as_ref())
+        .expect("HPKE seal");
     WelcomeJoinRequest {
         context_id: context_id.to_owned(),
         creator_did: creator_did.clone(),
@@ -228,8 +223,9 @@ pub fn seal_welcome_for_joiner(
         welcome_bytes,
     );
     let wire = bundle.to_wire_bytes().expect("bundle serializes");
-    let (ct, enc) = hpke_seal_invitation(&wire, &recipient_x25519, context_id, creator_did.as_ref())
-        .expect("HPKE seal");
+    let (ct, enc) =
+        hpke_seal_invitation(&wire, &recipient_x25519, context_id, creator_did.as_ref())
+            .expect("HPKE seal");
     WelcomeJoinRequest {
         context_id: context_id.to_owned(),
         creator_did: creator_did.clone(),
@@ -252,7 +248,10 @@ fn fresh_mls_storage() -> Arc<dyn OpenMlsStorageAdapter> {
 // `pub` (not `pub(crate)`) inside this `pub(crate)` test-only module: the module
 // gate already caps the effective visibility to the crate, and
 // `clippy::redundant_pub_crate` (nursery) rejects a redundant `pub(crate)`.
-pub fn bob_supervisor(bob_did: &str, resolver: KeyResolver) -> (Arc<Supervisor>, Arc<MlsCryptoProvider>) {
+pub fn bob_supervisor(
+    bob_did: &str,
+    resolver: KeyResolver,
+) -> (Arc<Supervisor>, Arc<MlsCryptoProvider>) {
     let crypto = Arc::new(MlsCryptoProvider::new(
         bob_did.to_owned(),
         Arc::new(scp_clock::SystemClock),

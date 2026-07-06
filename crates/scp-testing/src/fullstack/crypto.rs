@@ -94,10 +94,7 @@ impl E2eCryptoProvider {
     /// bundle plus this node's reservation id. The joiner feeds these straight
     /// into `Supervisor::spawn_actor_from_welcome`.
     #[must_use]
-    pub fn take_pending_join(
-        &self,
-        context_id: &[u8; 32],
-    ) -> Option<super::exchange::PendingJoin> {
+    pub fn take_pending_join(&self, context_id: &[u8; 32]) -> Option<super::exchange::PendingJoin> {
         self.exchange()
             .take_pending_join(context_id, self.local_did.as_ref())
     }

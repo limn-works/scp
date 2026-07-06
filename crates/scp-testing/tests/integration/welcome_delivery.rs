@@ -88,16 +88,26 @@ async fn stand_up_group_without_sender_key(
     // Bob reserves his own KeyPackage (publish his wrapping keypair first).
     let (wpub, wsec) = bob.crypto.provider.wrapping_keypair_snapshot();
     bob.manager
-        .set_wrapping_keys(DID::from(bob_did), wpub.to_vec(), Zeroizing::new(wsec.to_vec()))
+        .set_wrapping_keys(
+            DID::from(bob_did),
+            wpub.to_vec(),
+            Zeroizing::new(wsec.to_vec()),
+        )
         .await
         .unwrap();
-    let (reservation_id, kp_bytes) =
-        bob.manager.reserve_key_package(DID::from(bob_did)).await.unwrap();
+    let (reservation_id, kp_bytes) = bob
+        .manager
+        .reserve_key_package(DID::from(bob_did))
+        .await
+        .unwrap();
 
     // Alice creates the context and invites Bob (real in-actor MLS add + sealed
     // bundle). `invite_member` does NOT distribute sender keys — exactly the
     // property this helper preserves.
-    alice.create_context(context_id_str, invite_params()).await.unwrap();
+    alice
+        .create_context(context_id_str, invite_params())
+        .await
+        .unwrap();
     let outcome = alice
         .manager
         .invite_member(
@@ -155,7 +165,10 @@ async fn cross_process_welcome_delivery() {
 
     // Alice creates the encrypted context; add_member drives the real
     // reserve → invite_member → sealed-bundle path + sender-key distribution.
-    let handle = alice.create_context(context_id_str, invite_params()).await.unwrap();
+    let handle = alice
+        .create_context(context_id_str, invite_params())
+        .await
+        .unwrap();
     alice.add_member(&handle, bob_did).await.unwrap();
 
     // Bob opens the sealed invitation and spawns a live actor; his provider now
@@ -324,11 +337,18 @@ async fn welcome_bytes_nonempty_with_key_package() {
     let bob = network.create_node(bob_did);
     let (wpub, wsec) = bob.crypto.provider.wrapping_keypair_snapshot();
     bob.manager
-        .set_wrapping_keys(DID::from(bob_did), wpub.to_vec(), Zeroizing::new(wsec.to_vec()))
+        .set_wrapping_keys(
+            DID::from(bob_did),
+            wpub.to_vec(),
+            Zeroizing::new(wsec.to_vec()),
+        )
         .await
         .unwrap();
-    let (_reservation_id, bob_kp_bytes) =
-        bob.manager.reserve_key_package(DID::from(bob_did)).await.unwrap();
+    let (_reservation_id, bob_kp_bytes) = bob
+        .manager
+        .reserve_key_package(DID::from(bob_did))
+        .await
+        .unwrap();
 
     // A bare creator provider creates a group and adds Bob's reserved KP.
     let alice_crypto = MlsCryptoProvider::new(

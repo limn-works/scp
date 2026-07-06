@@ -508,9 +508,11 @@ impl FullStackNode {
         // 3. Reconstruct the request. The spawn entrypoint rejects `None` /
         //    all-zero pseudonyms, so derive a distinct non-zero §9.10.4
         //    pseudonym from this joiner's DID + context.
-        let enc: [u8; 32] = sealed.enc.as_slice().try_into().map_err(|_| {
-            ContextError::CryptoFailed("sealed enc not 32 bytes".to_owned())
-        })?;
+        let enc: [u8; 32] = sealed
+            .enc
+            .as_slice()
+            .try_into()
+            .map_err(|_| ContextError::CryptoFailed("sealed enc not 32 bytes".to_owned()))?;
         let req = WelcomeJoinRequest {
             context_id: sealed.context_id.clone(),
             creator_did: sealed.creator_did.clone(),
