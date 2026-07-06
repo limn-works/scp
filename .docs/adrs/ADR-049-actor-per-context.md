@@ -269,16 +269,20 @@ Enforced via `crates/scp-runtime/clippy.toml`:
 ```toml
 disallowed-types = [
     { path = "tokio::sync::RwLock", reason = "ADR-049 §Decision 12: forbidden on read paths. Use OnceLock/ArcSwap/AtomicU64/DashMap." },
-    { path = "tokio::sync::Mutex",  reason = "ADR-049 §Decision 12: forbidden on read paths. Use ArcSwap+write_lock or Mutex<PerContextState>." },
+    { path = "tokio::sync::Mutex",  reason = "ADR-049 §Decision 12: forbidden on read paths. Use ArcSwap+write_lock or the actor-owned &mut PerContextState." },
 ]
 ```
 
-Allow-list (sites that legitimately use these primitives):
+Allow-list (sites that legitimately use these primitives). Every site below is a cold lifecycle / write-serialization / test path — never a per-command read or dispatch path — so each carries an `#[allow(clippy::disallowed_types, reason = "ADR-049 §Decision 12 allow-list: …")]` naming its specific justification, consistent with the operative "no lock on per-command read/dispatch paths" rule:
 
 - Actor-owned `Mutex<PerContextState>` (per-context mailbox holder).
-- `Supervisor::write_lock: tokio::sync::Mutex<()>` (write serialization for the ArcSwap+write_lock pattern).
+- `Supervisor::write_lock: tokio::sync::Mutex<()>` — the ArcSwap+write_lock write-serialization guard. Cold write path, not a per-command read.
+- `Supervisor::bootstrap_spawn_lock: tokio::sync::Mutex<()>` — serializes the same-id bootstrap-spawn sequence (all three lifecycle bootstrap variants: `create_context`, `import_context`, standing-recreate). Cold bootstrap path, not a per-command read.
+- `Supervisor::task_set: OnceLock<Arc<tokio::sync::Mutex<JoinSet<()>>>>` — guards the shared JoinSet of spawned TTL/governance-timeout tasks. Touched only on spawn/reap, never on a per-command read path (the `task_set_ref` accessor is likewise cold).
+- `ProductionMlsBackend::join_gate: tokio::sync::Mutex<()>` — serializes the `join_from_welcome` consumed-init-key retrieve→join→store sequence (TOCTOU guard). Acquired only on a join, not on a per-command read path.
 - OpenMLS storage adapter internals (sync upstream trait).
 - FFI sync boundaries.
+- Test-only mock/store locks in `#[cfg(test)]` modules — the mock OAuth provider (`bridge/oauth.rs`), the `InMemoryCredentialStore` (`economy/credentials.rs`), and the governance-engine share in the timeout-callback tests (`context/governance/timeout.rs`). Not runtime read paths.
 
 The clippy rule lands in commit 13 of the ADR-049 ladder (Phase 3 of the post-review-round-1 plan); commit 12 already conforms to the rule.
 

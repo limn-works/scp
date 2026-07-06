@@ -17,12 +17,16 @@
 # the actor refactor completes (commit 12), the only remaining
 # `std::sync::Mutex` uses are in code that is test-only.
 #
-# `tokio::sync::Mutex` is FORBIDDEN on read paths per ADR-049 §Decision 12
-# (a `Mutex` acquire costs ~4× an atomic load — see the OpenSSL #30659
-# evidence in the ADR). Actor-owned per-context state is serialized by the
-# command loop and needs no lock. The legitimate exceptions are the write
-# serialization / bootstrap / join-gate `Mutex<()>` guards and the
-# supervisor's `task_set` JoinSet holder; each such site carries an
+# `tokio::sync::Mutex` is FORBIDDEN on read paths per ADR-049 §Decision 12,
+# for the same lock-free-read-path invariant as the RwLock ban: a lock
+# acquired on a hot read path costs cycles a lock-free atomic load does not.
+# The ADR's empirical anchor (OpenSSL #30659) measured an rwlock *read*
+# acquire at ~4× an atomic load; the Mutex ban applies that same invariant
+# to Mutex — it is not a separate Mutex-specific ~4× measurement. Actor-owned
+# per-context state is serialized by the command loop and needs no lock. The
+# legitimate exceptions are the write serialization / bootstrap / join-gate
+# `Mutex<()>` guards and the supervisor's `task_set` JoinSet holder; each
+# such site carries an
 # `#[allow(clippy::disallowed_types, reason = "ADR-049 §Decision 12 allow-list: …")]`
 # annotation naming the specific reason. This is the sanctioned allow-list,
 # NOT a weakening of the ban.
