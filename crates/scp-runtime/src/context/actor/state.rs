@@ -71,7 +71,6 @@ use scp_event_log::checkpoint::ConsistencyCheckpoint;
 use scp_protocol::context::broadcast::BroadcastContext as ProtocolBroadcastContext;
 use scp_protocol::context::membership::{MembershipState, ReceiveBuffer};
 use scp_protocol::context::roles::ContextRoleState;
-use scp_protocol::crypto::access_keys::AccessKeyStore;
 use scp_protocol::crypto::sender_keys::{NonceDedup, SenderKey, SenderKeyStore};
 use scp_protocol::crypto::ucan::validate::InMemoryProofResolver;
 use scp_protocol::envelope::{ReorderBuffer, SequenceTracker};
@@ -367,10 +366,7 @@ pub struct PendingBroadcastKeyRotation {
 
 /// State owned by an encrypted-mode (MLS) `ContextActor`. Mirrors the
 /// legacy `MlsCryptoProvider::contexts[ctx_id]`
-/// (`crate::crypto::mls::provider::ContextCryptoState`) field-for-field,
-/// plus the `AccessControlState.access_key_store` field which spec §9.17
-/// scopes to encrypted contexts only (broadcast contexts use the
-/// per-author AES-GCM layer in [`BroadcastState`] instead).
+/// (`crate::crypto::mls::provider::ContextCryptoState`) field-for-field.
 ///
 /// # MLS group is `Option<ScpMlsGroup>`, not `ScpMlsGroup`
 ///
@@ -472,19 +468,6 @@ pub struct ContextCryptoState {
     ///
     /// [`open`]: crate::crypto::mls::provider::MlsCryptoProvider::open
     pub recv_sequence_tracker: HashMap<String, (u64, u64)>,
-
-    /// Per-member access-key store for content-encryption-key wrapping
-    /// (spec §9.17, ADR-038). Scoped to encrypted contexts: legacy
-    /// stored this on
-    /// [`AccessControlState::access_key_store`](crate::context::state::AccessControlState)
-    /// on every `PerContextState` — per task §2, commit 12a hoists the
-    /// field to [`ContextCryptoState`] because it is encrypted-mode-
-    /// specific (broadcast contexts use the per-author AES-GCM layer
-    /// on [`BroadcastState`]). The [`AccessControlState`] field on
-    /// [`PerContextState`](PerContextState) remains populated for the
-    /// shim window so 12b+ handler migrations can pick whichever
-    /// storage site to authoritatively consolidate onto.
-    pub access_key_store: AccessKeyStore,
 }
 
 impl std::fmt::Debug for ContextCryptoState {
@@ -525,7 +508,6 @@ impl std::fmt::Debug for ContextCryptoState {
                 "recv_sequence_tracker",
                 &format_args!("[{} entries]", self.recv_sequence_tracker.len()),
             )
-            .field("access_key_store", &self.access_key_store)
             .finish()
     }
 }
@@ -541,7 +523,6 @@ impl Default for ContextCryptoState {
             nonce_dedup: NonceDedup::new(),
             member_wrapping_keys: HashMap::new(),
             recv_sequence_tracker: HashMap::new(),
-            access_key_store: AccessKeyStore::new(),
         }
     }
 }
@@ -1170,11 +1151,9 @@ pub struct PerContextState {
     /// elevated from private to `pub(crate)` by commit 12a; field
     /// visibility matches.
     ///
-    /// Note: per task §2, the `access_key_store` sub-field of this
-    /// struct is also duplicated on
-    /// [`ContextCryptoState::access_key_store`] — encrypted contexts
-    /// have both storage sites available; 12b+ handler migrations pick
-    /// one. 12d removes the unused one.
+    /// This is the sole authoritative storage site for the
+    /// `access_key_store`: commit 12d removed the vestigial duplicate
+    /// that briefly lived on [`ContextCryptoState`].
     pub(crate) access: AccessControlState,
 
     /// TTL timer + extension state (SCP-021). Mirrors legacy
@@ -1855,7 +1834,6 @@ mod tests {
             nonce_dedup,
             member_wrapping_keys,
             recv_sequence_tracker,
-            access_key_store,
         } = c;
 
         assert!(mls_group.is_none());
@@ -1869,7 +1847,6 @@ mod tests {
             recv_sequence_tracker.is_empty(),
             "recv_sequence_tracker starts empty",
         );
-        let _ = &access_key_store;
     }
 
     /// Exhaustive-destructure witness for [`BroadcastState`]. Catches
