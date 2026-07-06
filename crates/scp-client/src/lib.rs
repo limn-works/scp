@@ -45,19 +45,32 @@
 //! - a [`scp_clock::Clock`] — the hardened time source for
 //!   committer-assigned event-log leaf timestamps (ADR-057 Prerequisite 1).
 //!
-//! # MISSING SEAM (cross-member sender-key distribution)
+//! # In-tab sender-key distribution (§9.16.1/§9.16.2, ADR-057)
 //!
-//! The driver has **no in-tab path to distribute a member's §9.16 sender key to
-//! its peers**. This is a pre-existing gap inherited from the deleted bridge:
-//! `send_message` emits only the double-ciphertext, never the sender key.
-//! ADR-057 defers HPKE-sealed distribution over the MLS `scp_wrapping_key`
-//! leaf-node extension (already published by
-//! [`scp_mls::generate_key_package_with_wrapping_key`]) to a later slice. For
-//! the MVP, [`ScpClient::local_sender_key_bytes`] /
-//! [`ScpClient::install_sender_key`] expose the hand-off so a test harness — or
-//! a later distribution layer — can wire it; the integration test performs the
-//! exchange out-of-band over its "dumb pipe". This is a distribution gap, not a
-//! missing `scp-mls` MLS-op seam.
+//! Members share their §9.16 sender keys **in-tab**, over the MLS
+//! `scp_wrapping_key` leaf extension — there is no out-of-band hand-off. Each
+//! member publishes a stable X25519 **wrapping key** in its `KeyPackage` / creator
+//! leaf; peers HPKE-seal their per-member sender keys to it and deliver the
+//! sealed key as an MLS-authenticated **management message** (SCPM-tagged,
+//! §9.16.1) over the same wire path as an application message. The wrapping-key
+//! **directory** (`did → wrapping_key`) IS the authoritative member set, so a
+//! member is never recorded without the key a peer needs to seal to it.
+//!
+//! Distribution fires on three events (a topologically complete push mesh):
+//! 1. the **adder** seals its key to the joiner
+//!    ([`AddMemberOutput::sender_key_distributions`]);
+//! 2. the **joiner** seals its key to every existing member
+//!    ([`ScpClient::join_context_encrypted`] return);
+//! 3. every **bystander** processing the add-Commit seals its key to the new
+//!    member ([`ReceiveOutput::sender_key_distributions`] — the make-or-break
+//!    third trigger; without it members silently cannot decrypt each other).
+//!
+//! A member installs an incoming distribution by HPKE-opening it with its
+//! wrapping secret in [`ScpClient::receive_message`]; only the sealed-to member
+//! can open it. [`ScpClient::rotate_sender_key`] re-distributes a fresh key
+//! (§9.16.5). Residuals (out of scope, pending the pull path): a signed
+//! `SenderKeyEpochAdvance`, block-triggered auto-rotation, and re-driving a push
+//! to a member that was offline during it.
 
 mod client;
 mod context;
@@ -67,9 +80,11 @@ mod signer;
 mod snapshot;
 mod storage;
 
-pub use client::{AddMemberOutput, ContextStatus, ScpClient};
+pub use client::{AddMemberOutput, ContextStatus, ReceiveOutput, ScpClient};
 pub use context::PerContextState;
-pub use crypto_state::{ContextCryptoState, INITIAL_SENDER_KEY_EPOCH, Inbound};
+pub use crypto_state::{
+    ContextCryptoState, INITIAL_SENDER_KEY_EPOCH, Inbound, SenderKeyDistribution,
+};
 pub use error::ClientError;
 pub use signer::{LocalSigner, Signer};
 // `ContextSnapshot` / `SNAPSHOT_FORMAT_VERSION` are intentionally NOT re-exported:

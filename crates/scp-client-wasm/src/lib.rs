@@ -104,7 +104,8 @@ pub struct WasmAddMemberOutput {
     commit: Vec<u8>,
     welcome: Vec<u8>,
     event_log: Vec<u8>,
-    members: Vec<String>,
+    wrapping_keys: Vec<u8>,
+    sender_key_distributions: Vec<WasmSenderKeyDistribution>,
 }
 
 #[wasm_bindgen]
@@ -131,11 +132,91 @@ impl WasmAddMemberOutput {
         self.event_log.clone()
     }
 
-    /// The adder's membership set after the add (member DIDs).
+    /// The adder's serialized member-wrapping-key directory after the add — the
+    /// authoritative member set as `(did, wrapping_key)` pairs (ADR-057 sender-key
+    /// distribution). The joiner feeds it back via
+    /// [`WasmScpClient::join_context_encrypted`] so it can seal its sender key to
+    /// every existing member.
+    #[must_use]
+    #[wasm_bindgen(getter, js_name = "wrappingKeys")]
+    pub fn wrapping_keys(&self) -> Vec<u8> {
+        self.wrapping_keys.clone()
+    }
+
+    /// The adder's own §9.16 sender key, HPKE-sealed to the new joiner (delivered
+    /// to `target_did` via [`WasmScpClient::receive_message`]).
+    #[must_use]
+    #[wasm_bindgen(getter, js_name = "senderKeyDistributions")]
+    pub fn sender_key_distributions(&self) -> Vec<WasmSenderKeyDistribution> {
+        self.sender_key_distributions.clone()
+    }
+}
+
+/// A single HPKE-sealed sender-key distribution to deliver (§9.16.1/§9.16.2).
+///
+/// `ciphertext` is an MLS-encrypted management frame; the caller routes it to
+/// `targetDid`'s [`WasmScpClient::receive_message`], which installs the key.
+#[wasm_bindgen]
+#[derive(Clone)]
+pub struct WasmSenderKeyDistribution {
+    target_did: String,
+    ciphertext: Vec<u8>,
+}
+
+#[wasm_bindgen]
+impl WasmSenderKeyDistribution {
+    /// The DID this distribution is sealed for (the in-tab delivery hint).
+    #[must_use]
+    #[wasm_bindgen(getter, js_name = "targetDid")]
+    pub fn target_did(&self) -> String {
+        self.target_did.clone()
+    }
+
+    /// The MLS-encrypted management frame carrying the HPKE-sealed sender key.
     #[must_use]
     #[wasm_bindgen(getter)]
-    pub fn members(&self) -> Vec<String> {
-        self.members.clone()
+    pub fn ciphertext(&self) -> Vec<u8> {
+        self.ciphertext.clone()
+    }
+}
+
+impl From<scp_client::SenderKeyDistribution> for WasmSenderKeyDistribution {
+    fn from(d: scp_client::SenderKeyDistribution) -> Self {
+        Self {
+            target_did: d.target_did,
+            ciphertext: d.ciphertext,
+        }
+    }
+}
+
+/// The outcome of [`WasmScpClient::receive_message`].
+///
+/// Reports whether an application message was produced, plus any sender-key
+/// distributions the receive triggered (the bystander re-distribution trigger —
+/// ADR-057 INVARIANT 2).
+#[wasm_bindgen]
+pub struct WasmReceiveOutput {
+    application: bool,
+    sender_key_distributions: Vec<WasmSenderKeyDistribution>,
+}
+
+#[wasm_bindgen]
+impl WasmReceiveOutput {
+    /// `true` if an application message was decrypted (a `MessageReceived` event
+    /// is buffered for [`WasmScpClient::drain_events`]); `false` for a Commit, a
+    /// sender-key install, or a bare proposal.
+    #[must_use]
+    #[wasm_bindgen(getter)]
+    pub fn application(&self) -> bool {
+        self.application
+    }
+
+    /// Sender-key distributions this receive triggered (empty except when
+    /// processing an add-Commit as an existing member — INVARIANT 2).
+    #[must_use]
+    #[wasm_bindgen(getter, js_name = "senderKeyDistributions")]
+    pub fn sender_key_distributions(&self) -> Vec<WasmSenderKeyDistribution> {
+        self.sender_key_distributions.clone()
     }
 }
 
@@ -300,11 +381,17 @@ impl WasmScpClient {
     ) -> Result<WasmAddMemberOutput, JsValue> {
         let out = map_err(self.inner.add_member(&context_id, &key_package_bytes))?;
         let event_log = serialize_event_log(&out.event_log)?;
+        let wrapping_keys = serialize_wrapping_keys(&out.wrapping_keys)?;
         Ok(WasmAddMemberOutput {
             commit: out.commit,
             welcome: out.welcome,
             event_log,
-            members: out.members,
+            wrapping_keys,
+            sender_key_distributions: out
+                .sender_key_distributions
+                .into_iter()
+                .map(WasmSenderKeyDistribution::from)
+                .collect(),
         })
     }
 
@@ -330,15 +417,20 @@ impl WasmScpClient {
         context_id: String,
         welcome_bytes: Vec<u8>,
         event_log_bytes: Vec<u8>,
-        members: Vec<String>,
-    ) -> Result<(), JsValue> {
+        wrapping_keys_bytes: Vec<u8>,
+    ) -> Result<Vec<WasmSenderKeyDistribution>, JsValue> {
         let prior_event_log = deserialize_event_log(&event_log_bytes)?;
-        map_err(self.inner.join_context_encrypted(
+        let wrapping_keys = deserialize_wrapping_keys(&wrapping_keys_bytes)?;
+        let distributions = map_err(self.inner.join_context_encrypted(
             &context_id,
             &welcome_bytes,
             &prior_event_log,
-            &members,
-        ))
+            &wrapping_keys,
+        ))?;
+        Ok(distributions
+            .into_iter()
+            .map(WasmSenderKeyDistribution::from)
+            .collect())
     }
 
     /// Encrypts and "sends" an application message in `context_id`, returning
@@ -368,10 +460,13 @@ impl WasmScpClient {
         map_err(self.inner.send_message(&context_id, &plaintext))
     }
 
-    /// Receives an inbound MLS message in `context_id`. Returns `true` if it was
-    /// an application message (a `MessageReceived` event is buffered for
-    /// [`WasmScpClient::drain_events`]), `false` for a membership Commit or
-    /// bare proposal.
+    /// Receives an inbound MLS message in `context_id`. Returns a
+    /// [`WasmReceiveOutput`]: `application` is `true` if it was an application
+    /// message (a `MessageReceived` event is buffered for
+    /// [`WasmScpClient::drain_events`]), `false` for a membership Commit, a
+    /// sender-key install, or a bare proposal; `senderKeyDistributions` carries the
+    /// bystander re-distributions an add-Commit triggers (ADR-057 INVARIANT 2), to
+    /// deliver to their targets.
     ///
     /// Takes only the ciphertext: the convergent committer timestamp each mirrored
     /// leaf is stamped with is recovered from the message's own **authenticated**
@@ -395,8 +490,16 @@ impl WasmScpClient {
         &mut self,
         context_id: String,
         ciphertext: Vec<u8>,
-    ) -> Result<bool, JsValue> {
-        map_err(self.inner.receive_message(&context_id, &ciphertext))
+    ) -> Result<WasmReceiveOutput, JsValue> {
+        let out = map_err(self.inner.receive_message(&context_id, &ciphertext))?;
+        Ok(WasmReceiveOutput {
+            application: out.application,
+            sender_key_distributions: out
+                .sender_key_distributions
+                .into_iter()
+                .map(WasmSenderKeyDistribution::from)
+                .collect(),
+        })
     }
 
     /// Drains all buffered receive events for `context_id` in FIFO order.
@@ -463,54 +566,29 @@ impl WasmScpClient {
     }
 
     // ----------------------------------------------------------------------
-    // Sender-key hand-off (out-of-band — ADR-057 MISSING SEAM)
+    // Sender-key rotation (§9.16.5)
     // ----------------------------------------------------------------------
 
-    /// Returns this participant's local §9.16 sender-key bytes for `context_id`.
-    ///
-    /// The driver has no in-tab cross-member sender-key distribution path (a
-    /// gap ADR-057 defers to a later HPKE-over-`scp_wrapping_key` slice); the
-    /// caller hands these to peers out-of-band, who install them via
-    /// [`WasmScpClient::install_sender_key`].
+    /// Rotates this participant's §9.16 sender key and re-distributes it to every
+    /// member (§9.16.5), returning the distributions to deliver via
+    /// [`WasmScpClient::receive_message`].
     ///
     /// # Errors
     ///
-    /// Throws `[SCP-CTX-2001]` if the context is not held, or `[SCP-STORAGE-8013]`
-    /// if the context is poisoned (discard this client and reconstruct it via the [`WasmScpClient`]
-    /// constructor for your target — see [`ContextStatus`](scp_client::ContextStatus)).
-    /// This read-only observer never writes, so it cannot raise
-    /// `[SCP-STORAGE-8010]`.
-    #[wasm_bindgen(js_name = "localSenderKeyBytes")]
-    pub fn local_sender_key_bytes(&self, context_id: String) -> Result<Vec<u8>, JsValue> {
-        let key = map_err(self.inner.local_sender_key_bytes(&context_id))?;
-        Ok(key.to_vec())
-    }
-
-    /// Installs a peer's §9.16 sender key for `context_id` (received
-    /// out-of-band). `key_bytes` MUST be exactly 32 bytes.
-    ///
-    /// # Errors
-    ///
-    /// Throws `[SCP-VALID-7010]` if `key_bytes` is not 32 bytes, or
-    /// `[SCP-CTX-2001]` if the context is not held. A `[SCP-STORAGE-8010]` on the
-    /// snapshot write that persists the updated sender-key store **poisons** the
-    /// context, and `[SCP-STORAGE-8013]` is thrown if the context is already
-    /// poisoned — either way, discard this client and reconstruct it via the [`WasmScpClient`]
-    /// constructor for your target (see [`ContextStatus`](scp_client::ContextStatus)).
-    #[wasm_bindgen(js_name = "installSenderKey")]
-    pub fn install_sender_key(
+    /// Throws `[SCP-CTX-2001]` if the context is not held, `[SCP-STORAGE-8013]` if
+    /// it is poisoned, or a `[SCP-CRYPTO-…]` error on epoch overflow or a
+    /// seal/frame failure. A `[SCP-STORAGE-8010]` on the post-rotation snapshot
+    /// write **poisons** the context.
+    #[wasm_bindgen(js_name = "rotateSenderKey")]
+    pub fn rotate_sender_key(
         &mut self,
         context_id: String,
-        sender_did: String,
-        key_bytes: Vec<u8>,
-    ) -> Result<(), JsValue> {
-        let key: [u8; 32] = key_bytes.try_into().map_err(|v: Vec<u8>| {
-            JsValue::from_str(&format!(
-                "[SCP-VALID-7010] sender key must be 32 bytes, got {}",
-                v.len()
-            ))
-        })?;
-        map_err(self.inner.install_sender_key(&context_id, &sender_did, key))
+    ) -> Result<Vec<WasmSenderKeyDistribution>, JsValue> {
+        let distributions = map_err(self.inner.rotate_sender_key(&context_id))?;
+        Ok(distributions
+            .into_iter()
+            .map(WasmSenderKeyDistribution::from)
+            .collect())
     }
 
     // ----------------------------------------------------------------------
@@ -763,6 +841,23 @@ fn serialize_event_log(events: &[scp_event_log::Event]) -> Result<Vec<u8>, JsVal
 fn deserialize_event_log(bytes: &[u8]) -> Result<Vec<scp_event_log::Event>, JsValue> {
     rmp_serde::from_slice(bytes)
         .map_err(|e| JsValue::from_str(&format!("[SCP-VALID-7010] deserializing event log: {e}")))
+}
+
+/// Serializes the adder's member-wrapping-key directory for transport to the
+/// joiner (`MessagePack`, width-/endianness-independent — same transport idiom as
+/// the event-log stream).
+fn serialize_wrapping_keys(wrapping_keys: &[(String, [u8; 32])]) -> Result<Vec<u8>, JsValue> {
+    rmp_serde::to_vec(wrapping_keys)
+        .map_err(|e| JsValue::from_str(&format!("[SCP-VALID-7010] serializing wrapping keys: {e}")))
+}
+
+/// Deserializes the member-wrapping-key directory the joiner adopts.
+fn deserialize_wrapping_keys(bytes: &[u8]) -> Result<Vec<(String, [u8; 32])>, JsValue> {
+    rmp_serde::from_slice(bytes).map_err(|e| {
+        JsValue::from_str(&format!(
+            "[SCP-VALID-7010] deserializing wrapping keys: {e}"
+        ))
+    })
 }
 
 /// The variant name of a non-`MessageReceived` context event (forward-safety

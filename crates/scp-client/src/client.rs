@@ -30,19 +30,22 @@ use openmls::prelude::{KeyPackageBundle, KeyPackageIn, MlsMessageOut, ProtocolVe
 use scp_clock::Clock;
 use scp_event_log::{Event, EventType};
 use scp_mls::group::{
-    add_member_with_convergent_timestamp, create_group, destroy_group, generate_key_package,
-    join_group_from_bytes, key_package_in_did,
+    add_member_with_convergent_timestamp, create_group_with_wrapping_key, destroy_group,
+    generate_key_package_with_wrapping_key, join_group_from_bytes, key_package_in_did,
+    key_package_in_wrapping_key,
 };
 use scp_mls::{
     InMemoryMlsProvider, ScpCredential, SignatureKeyPair, restore_pending_join,
     serialize_pending_join,
 };
 use scp_protocol::context::membership::ContextEvent;
-use scp_protocol::crypto::sender_keys::SenderKey;
+use scp_protocol::crypto::sender_keys::generate_wrapping_keypair;
+use serde::{Deserialize, Serialize};
 use tls_codec::{Deserialize as TlsDeserialize, Serialize as TlsSerialize};
+use zeroize::Zeroizing;
 
 use crate::context::PerContextState;
-use crate::crypto_state::{ContextCryptoState, Inbound};
+use crate::crypto_state::{ContextCryptoState, Inbound, SenderKeyDistribution};
 use crate::error::ClientError;
 use crate::signer::Signer;
 use crate::snapshot::ContextSnapshot;
@@ -59,6 +62,38 @@ use crate::storage::Storage;
 struct PendingJoin {
     signer: SignatureKeyPair,
     provider: InMemoryMlsProvider,
+    /// The stable wrapping public key embedded in this join's published
+    /// `KeyPackage` leaf (§9.16.1). Adopted into the joined context's crypto state
+    /// so the key peers HPKE-seal sender keys to matches the one this member can
+    /// HPKE-open with.
+    wrapping_public: [u8; 32],
+    /// The matching wrapping secret. Zeroized on drop.
+    wrapping_secret: Zeroizing<[u8; 32]>,
+}
+
+/// The persisted form of a pending join: the `scp-mls` pending-join blob plus the
+/// stable wrapping keypair this member published in its `KeyPackage` leaf.
+///
+/// The wrapping keypair MUST survive a tab-reopen-mid-join, or the completed join
+/// would install a *different* wrapping key than the one peers already HPKE-seal
+/// to (from the published `KeyPackage`), and the joiner could never open their
+/// distributions. The `scp-mls` pending blob (its own `MessagePack`) is embedded
+/// verbatim so no `scp-mls` API change is needed.
+#[derive(Serialize, Deserialize)]
+struct PersistedPendingJoin {
+    /// The `scp-mls` `serialize_pending_join` blob (provider + signer + bindings).
+    mls_blob: Vec<u8>,
+    /// The published wrapping public key.
+    wrapping_public: [u8; 32],
+    /// The matching wrapping secret. Zeroized after reconstruction.
+    wrapping_secret: [u8; 32],
+}
+
+impl Drop for PersistedPendingJoin {
+    fn drop(&mut self) {
+        use zeroize::Zeroize as _;
+        self.wrapping_secret.zeroize();
+    }
 }
 
 /// The result of adding a member: the wire bytes the driver must distribute.
@@ -90,9 +125,39 @@ pub struct AddMemberOutput {
     /// verbatim to reconstruct a byte-identical log and converge to the same
     /// Merkle root (§7.3.1 context-state import, §9.9.3 convergence).
     pub event_log: Vec<Event>,
-    /// The adder's membership set after the add. The joiner adopts it so both
-    /// sides agree on who is in the context without re-deriving it.
-    pub members: Vec<String>,
+    /// The adder's member-wrapping-key **directory** after the add — every member
+    /// (existing + self + the new joiner) as `(did, scp_wrapping_key)`. The joiner
+    /// adopts it as its own directory (the authoritative member set, ADR-057
+    /// sender-key distribution INVARIANT 1) so it can HPKE-seal its sender key to
+    /// every existing member. This replaces a bare member-DID list: the DIDs are
+    /// the directory keys, so there is no parallel collection to drift.
+    pub wrapping_keys: Vec<(String, [u8; 32])>,
+    /// The adder's own §9.16 sender key, HPKE-sealed to the new joiner (one
+    /// distribution). The adder is the committer, so no bystander mirrors this add
+    /// for it — the adder must seal to the joiner itself, or the joiner would never
+    /// receive the adder's key. Delivered to the joiner via
+    /// [`ScpClient::receive_message`].
+    pub sender_key_distributions: Vec<SenderKeyDistribution>,
+}
+
+/// The outcome of [`ScpClient::receive_message`]: whether an application message
+/// was produced, plus any sender-key distributions the receive triggered.
+///
+/// A **bystander** processing an add-Commit HPKE-seals its own sender key to each
+/// newly-added member (ADR-057 sender-key distribution INVARIANT 2) and surfaces
+/// those here; the driver's caller delivers them to their targets. Application
+/// messages, sender-key installs, no-add Commits, and proposals produce no
+/// distributions.
+#[derive(Debug, Clone, Default)]
+pub struct ReceiveOutput {
+    /// `true` if an application message was decrypted and buffered as a
+    /// `MessageReceived` event for [`ScpClient::drain_events`]; `false` for a
+    /// Commit, a sender-key install, or a bare proposal.
+    pub application: bool,
+    /// Sender-key distributions this receive triggered (the bystander
+    /// re-distribution trigger — empty except when processing an add-Commit as an
+    /// existing member).
+    pub sender_key_distributions: Vec<SenderKeyDistribution>,
 }
 
 /// The lifecycle status of a context id, as reported by
@@ -249,7 +314,7 @@ impl ScpClient {
     /// durable storage — so it reports as absent here rather than handing back
     /// misleading state. The loud [`ClientError::ContextPoisoned`] diagnostic is
     /// delivered by every `Result`-returning op (mutating ops, [`Self::mls_epoch`],
-    /// [`Self::local_sender_key_bytes`]) instead.
+    /// [`Self::rotate_sender_key`]) instead.
     fn live_context_ref(&self, context_id: &str) -> Option<&PerContextState> {
         self.contexts.get(context_id).filter(|s| !s.poisoned)
     }
@@ -276,10 +341,23 @@ impl ScpClient {
             return Err(ClientError::ContextAlreadyExists(context_id.to_owned()));
         }
         let credential = self.credential()?;
-        // ADR-057 §Prereq-1: the creator's own MLS leaf `Lifetime` is stamped
-        // from the hardened driver clock, not openmls's internal one.
-        let mls_group = create_group(&credential, self.clock.as_ref())?;
-        let crypto = ContextCryptoState::from_group(context_id, mls_group);
+        // ADR-057 §9.16.1: generate this context's stable wrapping keypair once,
+        // publish the public key in the creator's own MLS leaf `scp_wrapping_key`
+        // extension, and seed the crypto state with the matching secret so peers
+        // can HPKE-seal sender keys to it. ADR-057 §Prereq-1: the creator's own MLS
+        // leaf `Lifetime` is stamped from the hardened driver clock.
+        let (wrapping_public, wrapping_secret) = generate_wrapping_keypair();
+        let mls_group = create_group_with_wrapping_key(
+            &credential,
+            Some(&wrapping_public),
+            self.clock.as_ref(),
+        )?;
+        let crypto = ContextCryptoState::from_group_with_wrapping(
+            context_id,
+            mls_group,
+            wrapping_public,
+            wrapping_secret,
+        );
         let creator_did = self.signer.did().to_owned();
         let mut state = PerContextState::new(context_id, &creator_did, crypto);
 
@@ -319,27 +397,46 @@ impl ScpClient {
         context_id: &str,
     ) -> Result<Vec<u8>, ClientError> {
         let credential = self.credential()?;
-        // ADR-057 §Prereq-1: the published KeyPackage `Lifetime` is stamped from
-        // the hardened driver clock, not openmls's internal one.
+        // ADR-057 §9.16.1: generate this join's stable wrapping keypair and publish
+        // the public key in the KeyPackage leaf `scp_wrapping_key` extension, so
+        // the adder and every bystander can HPKE-seal their sender keys to it. The
+        // secret is retained (and persisted below) so the joined context opens with
+        // the SAME key. ADR-057 §Prereq-1: the KeyPackage `Lifetime` is stamped
+        // from the hardened driver clock.
+        let (wrapping_public, wrapping_secret) = generate_wrapping_keypair();
         let (bundle, signer, provider): (KeyPackageBundle, _, InMemoryMlsProvider) =
-            generate_key_package(&credential, self.clock.as_ref())?;
+            generate_key_package_with_wrapping_key(
+                &credential,
+                Some(&wrapping_public),
+                self.clock.as_ref(),
+            )?;
 
         let kp_bytes = bundle
             .key_package()
             .tls_serialize_detached()
             .map_err(|e| ClientError::Codec(format!("serializing key package: {e}")))?;
 
-        // Persist the pending-join material (the private KeyPackage half) BEFORE
-        // returning the public key package, so a crash after handing the KP to the
-        // adder but before persistence cannot orphan the join — a reopened tab
-        // restores this pending material and can still complete the join.
+        // Persist the pending-join material (the private KeyPackage half PLUS the
+        // wrapping keypair) BEFORE returning the public key package, so a crash
+        // after handing the KP to the adder but before persistence cannot orphan
+        // the join — a reopened tab restores this pending material and can still
+        // complete the join with the SAME wrapping key it published.
         //
         // The blob is bound to BOTH this client's DID and the context id, so a
         // swapped pending blob cannot silently drive this identity into a group
         // under another leaf, nor bind this key package to the wrong context. The
         // bindings are verified on restore ([`Self::restore_from_storage`]).
-        let pending_blob =
-            serialize_pending_join(&provider, &signer, self.signer.did(), context_id)?;
+        let mls_blob = serialize_pending_join(&provider, &signer, self.signer.did(), context_id)?;
+        let pending_blob = {
+            let persisted = PersistedPendingJoin {
+                mls_blob,
+                wrapping_public,
+                wrapping_secret,
+            };
+            rmp_serde::to_vec_named(&persisted).map_err(|e| {
+                ClientError::StorageCorrupt(format!("serializing pending join: {e}"))
+            })?
+        };
         self.storage
             .put(&Self::pending_key(context_id), pending_blob)
             .map_err(|e| {
@@ -348,8 +445,15 @@ impl ScpClient {
                 ))
             })?;
 
-        self.pending_joins
-            .insert(context_id.to_owned(), PendingJoin { signer, provider });
+        self.pending_joins.insert(
+            context_id.to_owned(),
+            PendingJoin {
+                signer,
+                provider,
+                wrapping_public,
+                wrapping_secret: Zeroizing::new(wrapping_secret),
+            },
+        );
 
         Ok(kp_bytes)
     }
@@ -388,10 +492,19 @@ impl ScpClient {
         let timestamp = self.clock.now_secs();
         let committer_did = self.signer.did().to_owned();
 
-        let state = self.context_mut(context_id)?;
-
         let key_package_in = KeyPackageIn::tls_deserialize(&mut &*key_package_bytes)
             .map_err(|e| ClientError::Codec(format!("deserializing key package: {e}")))?;
+
+        // ADR-057 §9.16.1: read the joiner's published stable wrapping key from the
+        // SAME validated KeyPackage the add consumes, so the adder can HPKE-seal
+        // its sender key to the joiner. Fail-closed if the leaf carries no wrapping
+        // extension (INVARIANT 3): a member no peer can seal to must not be
+        // admitted. Read BEFORE the `state` mutable borrow (a fresh-provider
+        // validation that does not touch `self`).
+        let new_member_wrapping_key =
+            key_package_in_wrapping_key(&key_package_in, ProtocolVersion::Mls10, clock.as_ref())?;
+
+        let state = self.context_mut(context_id)?;
 
         // ADR-057: bind the convergent committer timestamp into the
         // Commit's authenticated MLS AAD, so existing members recover the SAME
@@ -408,7 +521,7 @@ impl ScpClient {
         let commit = serialize_message(&result.commit)?;
         let welcome = serialize_message(&result.welcome)?;
 
-        state.add_member_record(&new_member_did);
+        state.add_member_record(&new_member_did, new_member_wrapping_key);
         state.append_log_event(
             EventType::MemberJoined,
             &committer_did,
@@ -416,15 +529,28 @@ impl ScpClient {
             timestamp,
         )?;
 
+        // ADR-057 sender-key distribution: the adder is the committer, so no
+        // bystander mirrors this add for it — it must HPKE-seal its OWN sender key
+        // to the new joiner here, or the joiner would never receive the adder's
+        // key. (Existing members seal their keys to the joiner as bystanders when
+        // they process this Commit; the joiner seals its key to everyone on join.)
+        let sender_key_distributions = vec![state.crypto.seal_sender_key_distribution(
+            &committer_did,
+            &new_member_did,
+            &new_member_wrapping_key,
+        )?];
+
         let output = AddMemberOutput {
             commit,
             welcome,
             event_log: state.events(),
-            members: state.members.clone(),
+            wrapping_keys: state.crypto.wrapping_keys_snapshot(),
+            sender_key_distributions,
         };
         // The `state` borrow ends above (the output owns clones), so the snapshot
         // write can re-borrow `self`. Persist the post-add state (new MLS epoch,
-        // membership, MemberJoined leaf) before returning.
+        // membership, MemberJoined leaf, advanced send ratchet from the seal)
+        // before returning.
         self.persist_context(context_id)?;
         Ok(output)
     }
@@ -440,27 +566,33 @@ impl ScpClient {
     /// adopts the adder's, which already records the join.
     ///
     /// `prior_event_log` is [`AddMemberOutput::event_log`] from the adder;
-    /// `members` is [`AddMemberOutput::members`]. Both travel alongside the
-    /// Welcome.
+    /// `wrapping_keys` is [`AddMemberOutput::wrapping_keys`] (the adder's
+    /// member-wrapping-key directory). Both travel alongside the Welcome.
+    ///
+    /// Returns the joiner's own sender-key distributions: the joiner HPKE-seals
+    /// its §9.16 sender key to every existing member (adopted from `wrapping_keys`)
+    /// so they can decrypt its messages. The caller delivers each to its
+    /// `target_did` via [`Self::receive_message`].
     ///
     /// # Errors
     ///
     /// Returns [`ClientError::Driver`] if there is no pending join material for
     /// the context, [`ClientError::ContextAlreadyExists`] if already joined,
-    /// [`ClientError::Mls`] / [`ClientError::EventLog`] on Welcome processing or
+    /// [`ClientError::Mls`] / [`ClientError::EventLog`] on Welcome processing,
     /// replay failure (a replay stream that does not chain cleanly is rejected),
-    /// or [`ClientError::StorageBackend`] if persisting the joined context or
-    /// deleting the consumed pending blob fails. A persist failure **poisons** the
-    /// freshly-joined context (its state advanced in memory but was not durably
-    /// recorded); reconstruct via [`Self::new`], which restores the still-present
-    /// pending material and lets the join be retried.
+    /// or a sender-key seal failure, or [`ClientError::StorageBackend`] if
+    /// persisting the joined context or deleting the consumed pending blob fails. A
+    /// persist failure **poisons** the freshly-joined context (its state advanced
+    /// in memory but was not durably recorded); reconstruct via [`Self::new`],
+    /// which restores the still-present pending material and lets the join be
+    /// retried.
     pub fn join_context_encrypted(
         &mut self,
         context_id: &str,
         welcome_bytes: &[u8],
         prior_event_log: &[Event],
-        members: &[String],
-    ) -> Result<(), ClientError> {
+        wrapping_keys: &[(String, [u8; 32])],
+    ) -> Result<Vec<SenderKeyDistribution>, ClientError> {
         if self.contexts.contains_key(context_id) {
             return Err(ClientError::ContextAlreadyExists(context_id.to_owned()));
         }
@@ -471,11 +603,24 @@ impl ScpClient {
             ))
         })?;
 
+        // Adopt the wrapping keypair this join published in its KeyPackage leaf, so
+        // the joined context HPKE-opens distributions with the SAME key peers
+        // sealed to (read before `pending`'s MLS material is moved into the join).
+        // Held in `Zeroizing` so the stack copy is wiped on scope exit; the crypto
+        // state re-wraps its own copy in `Zeroizing` (`from_group_with_wrapping`).
+        let wrapping_public = pending.wrapping_public;
+        let wrapping_secret = Zeroizing::new(*pending.wrapping_secret);
+
         // `join_group_from_bytes` is the wire-path variant: it deserializes the
         // Welcome (as `MlsMessageIn`) internally, so the driver never has to
         // name the inbound MLS message type.
         let mls_group = join_group_from_bytes(welcome_bytes, pending.provider, pending.signer)?;
-        let crypto = ContextCryptoState::from_group(context_id, mls_group);
+        let crypto = ContextCryptoState::from_group_with_wrapping(
+            context_id,
+            mls_group,
+            wrapping_public,
+            *wrapping_secret,
+        );
         let self_did = self.signer.did().to_owned();
 
         // Start from an EMPTY log and replay the adder's stream verbatim, so the
@@ -486,11 +631,39 @@ impl ScpClient {
             state.replay_event(event)?;
         }
 
-        // Adopt the adder's membership snapshot; ensure self is present.
-        for member in members {
-            state.add_member_record(member);
+        // Adopt the adder's wrapping-key directory (existing members incl. the
+        // adder), then add self with its own published wrapping key. This IS the
+        // membership set (ADR-057 INVARIANT 1).
+        //
+        // SECURITY (ADR-057 T4 residual — "self-certifying directory"): these
+        // existing-member wrapping keys arrive in the adder's transported
+        // `wrapping_keys` snapshot, which — like the replayed event-log stream and
+        // the Welcome itself — is trusted from the adder, NOT independently
+        // authenticated against each member's signed leaf. A malicious adder could
+        // substitute member M's wrapping key so the joiner seals its sender key to a
+        // key M cannot open (M never decrypts the joiner → targeted within-group
+        // downgrade). The blast radius is bounded: the adder is already the trusted
+        // bootstrap source, and a substituted-key holder still cannot strip the
+        // outer MLS layer. The authenticated source is each member's signed
+        // `scp_wrapping_key` leaf extension in the (now Welcome-embedded) ratchet
+        // tree; sourcing recipients from there is blocked only because openmls does
+        // not expose remote leaf extensions via its public API, and lands with the
+        // leaf-signing / custody slice (§23.13) — the same residual T3/T4 name for
+        // the convergent timestamp. Triggers 1 (adder→joiner) and 3
+        // (bystander→joiner) do NOT share this gap: they read the wrapping key from
+        // a validated KeyPackage / Add proposal.
+        for (member_did, member_wrapping_key) in wrapping_keys {
+            state.add_member_record(member_did, *member_wrapping_key);
         }
-        state.add_member_record(&self_did);
+        state.add_member_record(&self_did, wrapping_public);
+
+        // ADR-057 sender-key distribution: the joiner HPKE-seals its own sender key
+        // to every existing member (the directory minus self), so they can decrypt
+        // the joiner's messages. Returned for the caller to deliver.
+        let recipients = state.crypto.wrapping_keys_snapshot();
+        let distributions = state
+            .crypto
+            .distribute_local_key_to(&self_did, &recipients)?;
 
         self.contexts.insert(context_id.to_owned(), state);
         // Persist the joined context FIRST, then delete the now-consumed pending
@@ -506,7 +679,7 @@ impl ScpClient {
                     "deleting consumed pending join for context '{context_id}': {e}"
                 ))
             })?;
-        Ok(())
+        Ok(distributions)
     }
 
     // ----------------------------------------------------------------------
@@ -647,19 +820,23 @@ impl ScpClient {
         &mut self,
         context_id: &str,
         ciphertext: &[u8],
-    ) -> Result<bool, ClientError> {
+    ) -> Result<ReceiveOutput, ClientError> {
         // ADR-057 §Prereq-1: captured before the `state` mutable borrow so the
         // hardened clock (used to re-validate any add-Commit's KeyPackage
         // `Lifetime`) and the mutable context borrow do not alias `self`.
         let clock = Arc::clone(&self.clock);
+        // This member's own DID — needed as the `local_did` when it seals its own
+        // sender key to a member a bystander add introduces (INVARIANT 2).
+        let self_did = self.signer.did().to_owned();
         let state = self.context_mut(context_id)?;
         // Any successful `decrypt_message` mutates persistent MLS state — it
-        // ratchets forward (application), merges a staged commit (add Commit), or
-        // caches a proposal in the provider store. So every non-error outcome is
-        // persisted after the `state` borrow ends. Only the rejected
-        // Remove-bearing Commit (which `scp-mls` dropped BEFORE merging, leaving
-        // MLS + SCP state unchanged) returns without a write.
-        let application = match state.crypto.decrypt_message(ciphertext, clock.as_ref())? {
+        // ratchets forward (application), merges a staged commit (add Commit),
+        // installs an incoming sender key (management distribution), or caches a
+        // proposal in the provider store. So every non-error outcome is persisted
+        // after the `state` borrow ends. Only the rejected Remove-bearing Commit
+        // (which `scp-mls` dropped BEFORE merging, leaving MLS + SCP state
+        // unchanged) returns without a write.
+        let outcome = match state.crypto.decrypt_message(ciphertext, clock.as_ref())? {
             Inbound::Application {
                 sender_did,
                 plaintext,
@@ -673,7 +850,20 @@ impl ScpClient {
                     sender_did: sender_did.into(),
                     payload: plaintext,
                 });
-                true
+                ReceiveOutput {
+                    application: true,
+                    sender_key_distributions: Vec::new(),
+                }
+            }
+            Inbound::SenderKeyInstalled { .. } => {
+                // A peer's sender key was HPKE-opened and installed into the store
+                // by `decrypt_message` (§9.16.1/§9.16.2). No application payload, no
+                // leaf, no ContextEvent — just persist the updated store below so a
+                // reopened tab keeps the key.
+                ReceiveOutput {
+                    application: false,
+                    sender_key_distributions: Vec::new(),
+                }
             }
             Inbound::UnsupportedMembershipChange {
                 sender_did: _committer_did,
@@ -706,12 +896,14 @@ impl ScpClient {
             Inbound::Commit {
                 sender_did: committer_did,
                 added_dids,
+                added_wrapping_keys,
                 committer_timestamp_secs,
             } => {
                 // A no-add Commit (e.g. a self-update) has `committer_timestamp_secs
                 // == None` and empty `added_dids` by construction: it advanced the
                 // MLS epoch inside `scp-mls` but stamps no membership leaf and
                 // records no member. An add-Commit carries `Some(timestamp)`.
+                let mut sender_key_distributions = Vec::new();
                 if let Some(timestamp) = committer_timestamp_secs {
                     // For each added member, append the identical convergent
                     // `MemberJoined` leaf the committer appended: actor = committer
@@ -721,24 +913,44 @@ impl ScpClient {
                     // recomputed from this member's current log, which (by the
                     // convergence invariant) is at the same state the committer's
                     // was before the add — so the leaf is byte-identical. Then
-                    // record the member in the membership set.
-                    for added_did in &added_dids {
+                    // record the member in the wrapping-key directory (with the
+                    // wrapping key `scp-mls` recovered from the Add proposal, 1:1
+                    // with `added_dids`).
+                    //
+                    // ADR-057 sender-key distribution INVARIANT 2 (bystander
+                    // re-distribution): this existing member also HPKE-seals its OWN
+                    // sender key to each newly-added member, so the new member can
+                    // decrypt this member's messages. Without this, push
+                    // distribution is incomplete — the joiner only learns the
+                    // adder's key (from the add) and its own, never the bystanders'.
+                    for (added_did, added_wrapping_key) in
+                        added_dids.iter().zip(added_wrapping_keys.iter())
+                    {
                         state.append_log_event(
                             EventType::MemberJoined,
                             &committer_did,
                             Vec::new(),
                             timestamp,
                         )?;
-                        state.add_member_record(added_did);
+                        state.add_member_record(added_did, *added_wrapping_key);
+                        sender_key_distributions.push(state.crypto.seal_sender_key_distribution(
+                            &self_did,
+                            added_did,
+                            added_wrapping_key,
+                        )?);
                     }
                 }
-                false
+                ReceiveOutput {
+                    application: false,
+                    sender_key_distributions,
+                }
             }
-            Inbound::Proposal { .. } => false,
+            Inbound::Proposal { .. } => ReceiveOutput::default(),
         };
-        // `state` borrow ends above. Persist the mutated MLS/log/membership state.
+        // `state` borrow ends above. Persist the mutated MLS/log/membership state
+        // (including any send-ratchet advance from a bystander re-distribution).
         self.persist_context(context_id)?;
-        Ok(application)
+        Ok(outcome)
     }
 
     /// Drains all buffered receive events for `context_id` in FIFO order,
@@ -854,53 +1066,41 @@ impl ScpClient {
     }
 
     // ----------------------------------------------------------------------
-    // Sender-key exchange (out-of-band — see crate root MISSING SEAM note)
+    // Sender-key rotation (§9.16.5)
     // ----------------------------------------------------------------------
 
-    /// Returns this participant's local sender-key bytes for `context_id`.
+    /// Rotates this participant's §9.16 sender key and re-distributes it to every
+    /// member (§9.16.5), returning the distributions to deliver.
     ///
-    /// The driver has no in-tab cross-member sender-key distribution path (a
-    /// pre-existing gap inherited from the deleted bridge; ADR-057 defers
-    /// HPKE-sealed distribution over the MLS `scp_wrapping_key` extension to a
-    /// later slice). For the MVP the caller hands these bytes to peers
-    /// out-of-band and they install them via [`Self::install_sender_key`].
+    /// Generates a fresh sender key, increments the monotonic sender-key epoch,
+    /// and HPKE-seals the new key to every other member's stable wrapping key. The
+    /// caller delivers each returned [`SenderKeyDistribution`] to its `target_did`
+    /// via [`Self::receive_message`]; recipients accept the higher epoch under
+    /// `set_checked` monotonicity and reject any stale earlier-epoch key.
     ///
-    /// # Errors
-    ///
-    /// Returns [`ClientError::UnknownContext`] if the context is not held, or
-    /// [`ClientError::ContextPoisoned`] if the context diverged.
-    pub fn local_sender_key_bytes(&self, context_id: &str) -> Result<[u8; 32], ClientError> {
-        Ok(self
-            .context_ref(context_id)?
-            .crypto
-            .local_sender_key_bytes())
-    }
-
-    /// Installs a peer's sender key for `context_id` (received out-of-band).
-    ///
-    /// See [`Self::local_sender_key_bytes`] for why distribution is out-of-band
-    /// in the MVP.
+    /// Note: an in-tab MVP has no signed `SenderKeyEpochAdvance` notification and
+    /// no pull path — rotation is an unsigned push over the same
+    /// management-message channel as the join/add distributions. Peers that are
+    /// offline during the push do not receive the new key until a future push
+    /// (the offline-re-drive gap is a documented residual pending the pull path).
     ///
     /// # Errors
     ///
     /// Returns [`ClientError::UnknownContext`] if the context is not held,
-    /// [`ClientError::ContextPoisoned`] if the context has been poisoned by a
-    /// prior failed persist, or [`ClientError::StorageBackend`] if persisting the
-    /// updated sender-key store fails (which also **poisons** the context).
-    pub fn install_sender_key(
+    /// [`ClientError::ContextPoisoned`] if the context diverged,
+    /// [`ClientError::Driver`] on sender-key-epoch overflow, or a seal/frame error.
+    /// A [`ClientError::StorageBackend`] from the post-rotation persist **poisons**
+    /// the context (the new key advanced in memory but was not durably recorded).
+    pub fn rotate_sender_key(
         &mut self,
         context_id: &str,
-        sender_did: &str,
-        key_bytes: [u8; 32],
-    ) -> Result<(), ClientError> {
+    ) -> Result<Vec<SenderKeyDistribution>, ClientError> {
+        let self_did = self.signer.did().to_owned();
         let state = self.context_mut(context_id)?;
-        state
-            .crypto
-            .insert_sender_key(sender_did, SenderKey::from_bytes(key_bytes));
-        // `state` borrow ends; persist the updated sender-key store so a restored
-        // client can still decrypt this peer's messages.
+        let distributions = state.crypto.rotate_sender_key(&self_did)?;
+        // `state` borrow ends; persist the rotated key + advanced send ratchet.
         self.persist_context(context_id)?;
-        Ok(())
+        Ok(distributions)
     }
 
     // ----------------------------------------------------------------------
@@ -945,7 +1145,8 @@ impl ScpClient {
     /// poisoned — see [`Self::live_context_ref`]).
     #[must_use]
     pub fn member_dids(&self, context_id: &str) -> Option<Vec<String>> {
-        self.live_context_ref(context_id).map(|s| s.members.clone())
+        self.live_context_ref(context_id)
+            .map(PerContextState::member_dids)
     }
 
     /// Returns the event-log Merkle root for `context_id`, or `None` if not held
@@ -1133,13 +1334,21 @@ impl ScpClient {
                 continue;
             }
             let blob = self.read_listed_key(&key)?;
+            // Unwrap the scp-client pending envelope (the scp-mls blob + the
+            // published wrapping keypair). The wrapping secret is zeroized when the
+            // `PersistedPendingJoin` drops at the end of this iteration.
+            let persisted: PersistedPendingJoin = rmp_serde::from_slice(&blob).map_err(|e| {
+                ClientError::StorageCorrupt(format!(
+                    "deserializing pending join under key '{key}': {e}"
+                ))
+            })?;
             // `restore_pending_join` returns the identity + context the blob was
             // bound to at capture; verify BOTH here, fail closed. A swapped blob
             // that belongs to another identity is an identity confusion
             // (StorageIdentityMismatch); one whose embedded context id disagrees
             // with its storage key is a corrupt/mislabeled blob (StorageCorrupt).
             let (provider, signer, bound_owner_did, bound_context_id) =
-                restore_pending_join(&blob)?;
+                restore_pending_join(&persisted.mls_blob)?;
             if bound_owner_did != self.signer.did() {
                 return Err(ClientError::StorageIdentityMismatch(format!(
                     "pending join under key '{key}' is bound to identity \
@@ -1153,7 +1362,15 @@ impl ScpClient {
                      '{bound_context_id}'"
                 )));
             }
-            staged_pending.push((context_id, PendingJoin { signer, provider }));
+            staged_pending.push((
+                context_id,
+                PendingJoin {
+                    signer,
+                    provider,
+                    wrapping_public: persisted.wrapping_public,
+                    wrapping_secret: Zeroizing::new(persisted.wrapping_secret),
+                },
+            ));
         }
 
         // All snapshots reconstructed + verified cleanly — commit atomically.
