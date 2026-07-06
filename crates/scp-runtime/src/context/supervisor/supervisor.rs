@@ -11405,12 +11405,11 @@ impl Supervisor {
                     //     — i.e. the "live send-capable actor" this entrypoint is
                     //     documented to stand up (§9(b)) could receive but never send.
                     //     `state.handle` and this `handle` clone share one
-                    //     `Arc<RwLock<..>>`, so the actor's own handle observes `Active`
-                    //     too. On a transition failure roll the installed group back
+                    //     `Arc<ArcSwap<ContextState>>`, so the actor's own handle observes
+                    //     `Active` too. On a transition failure roll the installed group back
                     //     (nothing is persisted or registered yet) and fail closed.
-                    if let Err(e) = handle
-                        .transition_to(&scp_protocol::context::ContextState::Active)
-                        .await
+                    if let Err(e) =
+                        handle.transition_to(&scp_protocol::context::ContextState::Active)
                     {
                         let _ = deps.crypto.destroy_mls_group(&context_id_bytes);
                         return Err(e);
