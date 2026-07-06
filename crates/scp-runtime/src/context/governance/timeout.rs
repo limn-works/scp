@@ -1293,6 +1293,10 @@ mod tests {
         let proposal_id = proposal.proposal_id;
 
         // Wrap engine in shared state so the callback can access it.
+        #[allow(
+            clippy::disallowed_types,
+            reason = "ADR-049 §Decision 12 allow-list: test-only sharing of the governance engine into a timeout callback; not a runtime read path."
+        )]
         let engine = Arc::new(tokio::sync::Mutex::new(engine));
         let expired = Arc::new(AtomicBool::new(false));
 

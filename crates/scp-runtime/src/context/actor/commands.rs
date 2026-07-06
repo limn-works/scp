@@ -2234,10 +2234,9 @@ pub enum ToolsCommand {
 /// the dispatch function sends the reply and returns
 /// `Outcome { mutated: false }`.
 ///
-/// Commit 7 lands the real read variants. Commit 12c.7 deletes the
-/// transitional `QueryStateView` borrow adapter and routes the
-/// `&PerContextState` + shared event-log provider directly into the
-/// query handler. Variants that mutate state (`drain_events`, access-key
+/// Commit 7 lands the real read variants. The query handler takes the
+/// `&PerContextState` + shared event-log provider directly, with no
+/// intervening borrow adapter. Variants that mutate state (`drain_events`, access-key
 /// management, `compare_remote_checkpoint`, etc.) are NOT migrated here —
 /// they are carried by their own command families
 /// (`MessagingCommand::DrainEvents` / `::CompareRemoteCheckpoint`, the

@@ -106,12 +106,18 @@ BAN_ENTRIES=(
     "lock_context|crates/scp-runtime|*.rs|Actor-per-context refactor (ADR-049) deleted the per-context lock/relock primitives"
     "relock_context|crates/scp-runtime|*.rs|Actor-per-context refactor (ADR-049) deleted the per-context lock/relock primitives"
     "[^_]contexts_ref|crates/scp-runtime|*.rs|Actor-per-context refactor (ADR-049) deleted the contexts DashMap accessor"
+    "ContextGeneration|crates/scp-runtime|*.rs|Actor-per-context refactor deleted this (ADR-049)"
+    "next_generation|crates/scp-runtime|*.rs|Actor-per-context refactor deleted this (ADR-049)"
+    "take_send_tracker|crates/scp-runtime|*.rs|Actor-per-context refactor deleted the send-tracker take/merge primitives (ADR-049)"
+    "merge_send_tracker|crates/scp-runtime|*.rs|Actor-per-context refactor deleted the send-tracker take/merge primitives (ADR-049)"
+    "MutationStateView|crates/scp-runtime|*.rs|Actor-per-context refactor deleted the transitional mutation/query borrow adapters (ADR-049)"
+    "QueryStateView|crates/scp-runtime|*.rs|Actor-per-context refactor deleted the transitional mutation/query borrow adapters (ADR-049)"
 )
 
-# Example of the activated form for follow-on sessions:
+# Example of the activated form for the remaining, still-pending bans.
+# `RwLock<ContextInner>` waits on legacy `ContextHandle` removal; the
+# `pending_joins` ban waits on the 2F-residual join-path deletion.
 # BAN_ENTRIES+=(
-#     "ContextGeneration|crates/scp-runtime|*.rs|Actor-per-context refactor deleted this (ADR-049)"
-#     "next_generation|crates/scp-runtime|*.rs|Actor-per-context refactor deleted this (ADR-049)"
 #     "RwLock<ContextInner>|crates/scp-runtime|*.rs|Actor-per-context refactor deleted this (ADR-049)"
 #     "pending_joins|crates/scp-runtime/src/crypto|*.rs|Actor-per-context refactor deleted this (ADR-049)"
 # )

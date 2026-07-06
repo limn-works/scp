@@ -122,6 +122,10 @@ pub struct ProductionMlsBackend {
     /// hot per-context dispatch path, so ADR-049 §12's "no `Mutex` on read
     /// paths" rule is not implicated (the gate is acquired only on a join,
     /// which is not a per-command-dispatch read).
+    #[allow(
+        clippy::disallowed_types,
+        reason = "ADR-049 §Decision 12 allow-list: serializes the join_from_welcome consumed-init-key retrieve→join→store sequence (TOCTOU guard). Acquired only on a join, not on a per-command read path."
+    )]
     join_gate: tokio::sync::Mutex<()>,
 }
 
@@ -151,10 +155,15 @@ impl ProductionMlsBackend {
     ///   group-leaf `Lifetime` stamping and validation (ADR-057 §Prereq-1).
     #[must_use]
     pub fn new(clock: Arc<dyn Clock>) -> Self {
+        #[allow(
+            clippy::disallowed_types,
+            reason = "ADR-049 §Decision 12 allow-list: constructs the join_from_welcome TOCTOU guard (see the `join_gate` field); acquired only on a join, not a per-command read."
+        )]
+        let join_gate = tokio::sync::Mutex::new(());
         Self {
             clock,
             consumed_init_key_store: OnceLock::new(),
-            join_gate: tokio::sync::Mutex::new(()),
+            join_gate,
         }
     }
 

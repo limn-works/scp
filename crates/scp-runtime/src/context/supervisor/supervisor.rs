@@ -1197,6 +1197,10 @@ pub struct Supervisor {
     #[allow(dead_code)]
     pub(in crate::context::supervisor) persistence: Arc<dyn ContextPersistence>,
     /// Single-producer-multi-read write lock — plan §"Write path".
+    #[allow(
+        clippy::disallowed_types,
+        reason = "ADR-049 §Decision 12 allow-list: the ArcSwap+write_lock write-serialization guard. Cold write path (not a per-command read), so the Mutex acquire cost the ban targets does not apply."
+    )]
     pub(crate) write_lock: tokio::sync::Mutex<()>,
     /// Serializes the whole bootstrap-spawn sequence of ALL three lifecycle
     /// bootstrap variants — `create_context`, `import_context`, and
@@ -1214,6 +1218,10 @@ pub struct Supervisor {
     /// `spawn_actor_with_state`/`despawn_actor` (which take `write_lock`).
     /// Lock order is always `bootstrap_spawn_lock` → `write_lock`, never the
     /// reverse.
+    #[allow(
+        clippy::disallowed_types,
+        reason = "ADR-049 §Decision 12 allow-list: serializes the same-id bootstrap-spawn sequence. Cold bootstrap path (not a per-command read), so the Mutex acquire cost the ban targets does not apply."
+    )]
     pub(crate) bootstrap_spawn_lock: tokio::sync::Mutex<()>,
     /// Durable saga journal (plan §"Cross-context saga protocol").
     pub(in crate::context::supervisor) saga_journal: Arc<dyn SagaJournal>,
@@ -1293,6 +1301,10 @@ pub struct Supervisor {
     /// configured".
     event_tx: OnceLock<tokio::sync::broadcast::Sender<(String, ContextEvent)>>,
     /// Shared task set for TTL timers + governance timeouts.
+    #[allow(
+        clippy::disallowed_types,
+        reason = "ADR-049 §Decision 12 allow-list: guards the shared JoinSet of spawned TTL/governance-timeout tasks. Touched only on spawn/reap, never on a per-command read path."
+    )]
     task_set: OnceLock<Arc<tokio::sync::Mutex<tokio::task::JoinSet<()>>>>,
     /// OpenMLS storage adapter — the bridge's chosen Storage, erased once via
     /// `SpawnBlockingStorageAdapter`. Runtime NEVER defaults this. Lock-free
@@ -1564,14 +1576,29 @@ impl Supervisor {
                       never held across an .await. ADR-049 §3a."
         )]
         let reserved_saga_contexts = std::sync::Mutex::new(HashSet::new());
+        // ADR-049 §Decision 12 allow-list: the ArcSwap+write_lock and
+        // same-id bootstrap-spawn serialization guards. Cold write/bootstrap
+        // paths (not per-command reads), so the Mutex acquire cost the ban
+        // targets does not apply. Hoisted into `let`s to carry the `#[allow]`
+        // the same way `reserved_saga_contexts` above does.
+        #[allow(
+            clippy::disallowed_types,
+            reason = "ADR-049 §Decision 12 allow-list: ArcSwap+write_lock write-serialization guard; cold write path, not a per-command read."
+        )]
+        let write_lock = tokio::sync::Mutex::new(());
+        #[allow(
+            clippy::disallowed_types,
+            reason = "ADR-049 §Decision 12 allow-list: same-id bootstrap-spawn serialization guard; cold bootstrap path, not a per-command read."
+        )]
+        let bootstrap_spawn_lock = tokio::sync::Mutex::new(());
         Self {
             actors: DashMap::new(),
             standing_contexts: ArcSwap::new(Arc::new(HashMap::new())),
             local_dids: Arc::new(ArcSwap::new(Arc::new(HashSet::new()))),
             wrapping_keys: DashMap::new(),
             persistence,
-            write_lock: tokio::sync::Mutex::new(()),
-            bootstrap_spawn_lock: tokio::sync::Mutex::new(()),
+            write_lock,
+            bootstrap_spawn_lock,
             saga_journal,
             key_package_stores: DashMap::new(),
             health_config,
@@ -1796,9 +1823,12 @@ impl Supervisor {
         if let Some(tx) = event_tx {
             let _ = supervisor.event_tx.set(tx);
         }
-        let _ = supervisor.task_set.set(Arc::new(tokio::sync::Mutex::new(
-            tokio::task::JoinSet::new(),
-        )));
+        #[allow(
+            clippy::disallowed_types,
+            reason = "ADR-049 §Decision 12 allow-list: guards the shared JoinSet of spawned TTL/governance-timeout tasks; touched only on spawn/reap, not a per-command read."
+        )]
+        let task_set = Arc::new(tokio::sync::Mutex::new(tokio::task::JoinSet::new()));
+        let _ = supervisor.task_set.set(task_set);
         // A2 — attach the durable consumed-init-key set to the shared MLS
         // backend so `join_from_welcome` enforces the crypto-layer single-use
         // backstop on EVERY join path (independent of the KeyPackage actor's
@@ -1943,6 +1973,10 @@ impl Supervisor {
     /// Cheap reference to the supervisor's shared task-set. Returns
     /// `None` if [`Self::with_providers`] was not used.
     #[must_use]
+    #[allow(
+        clippy::disallowed_types,
+        reason = "ADR-049 §Decision 12 allow-list: exposes the shared TTL/governance-timeout JoinSet holder (see the `task_set` field); accessor is cold, not a per-command read."
+    )]
     pub(crate) fn task_set_ref(
         &self,
     ) -> Option<&Arc<tokio::sync::Mutex<tokio::task::JoinSet<()>>>> {
