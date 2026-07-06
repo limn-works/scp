@@ -22,11 +22,6 @@
 //! twin — they remain in
 //! [`crate::context::governance_helpers_legacy`] until the legacy
 //! contexts map dissolves at Phase 2A finalization.
-//!
-//! Legacy `lifecycle_helpers` callsites (`create_context`,
-//! `drain_and_deliver_sender_keys`) are reached via the
-//! [`SupervisorHandle::shim_supervisor`](crate::context::supervisor::handle::SupervisorHandle::shim_supervisor)
-//! escape hatch until those domains migrate (Phase 2A.9).
 
 use std::sync::Arc;
 

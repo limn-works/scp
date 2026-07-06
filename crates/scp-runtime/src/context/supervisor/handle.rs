@@ -381,25 +381,6 @@ impl SupervisorHandle {
         .await;
     }
 
-    /// Returns the inner `Arc<Supervisor>`. The legacy
-    /// `dispatch_from_shim` handler entry points this escape hatch fed
-    /// were deleted in Phase 2A finalization; its one remaining caller
-    /// is `ContextActor::new`, which captures the pointer so the
-    /// actor's `dispatch` can partition state-owning actors from
-    /// test-only skeleton actors. Removed together with the skeleton
-    /// apparatus in a follow-on chunk.
-    ///
-    /// Visibility is `pub(in crate::context)` so only code within the
-    /// `context` module tree can call this. Handler bodies under
-    /// `actor/handlers/` MUST NOT call this — they reach the
-    /// supervisor through the capability-reduced [`SupervisorHandle`]
-    /// on `ActorDeps`.
-    #[must_use]
-    #[allow(dead_code)]
-    pub(in crate::context) fn shim_supervisor(&self) -> Arc<Supervisor> {
-        Arc::clone(&self.supervisor)
-    }
-
     /// Spawn a per-context [`ContextActor`](crate::context::actor::ContextActor)
     /// task that owns the supplied
     /// [`PerContextState`](crate::context::actor::state::PerContextState) +
