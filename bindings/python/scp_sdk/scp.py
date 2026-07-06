@@ -45,7 +45,15 @@ import logging
 import math
 from dataclasses import dataclass
 from types import TracebackType
-from typing import TYPE_CHECKING, Any, Literal, Protocol, TypedDict, runtime_checkable
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Literal,
+    Protocol,
+    TypeAlias,
+    TypedDict,
+    runtime_checkable,
+)
 
 from scp_sdk.errors import ScpError
 from scp_sdk.types import CustodyType
@@ -308,7 +316,7 @@ class Sealed:
 # (rather than bare ``Sealed``) so a future governed-invite outcome is added
 # additively as a union member without breaking callers that annotate against
 # :data:`InviteMemberOutcome`.
-InviteMemberOutcome = Sealed
+InviteMemberOutcome: TypeAlias = Sealed
 
 
 def _native_mod() -> Any:
