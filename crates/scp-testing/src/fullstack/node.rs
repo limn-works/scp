@@ -412,7 +412,16 @@ impl FullStackNode {
             for event in drained {
                 if let ContextEvent::WelcomeGenerated { commit_bytes, .. } = event {
                     for existing in &existing_members {
-                        if existing != member_did {
+                        // Deposit the epoch-advance Commit only for OTHER existing
+                        // members on separate nodes. Exclude the newly-added member
+                        // (it joins via the Welcome, not a Commit) AND this node —
+                        // the inviter ran the add in-actor on its own SHARED
+                        // provider, so its MLS group already advanced to the new
+                        // epoch. Re-depositing the Commit for `self.did` would make
+                        // its later `decrypt_message` → `process_pending_commits`
+                        // replay it, double-advancing the epoch and breaking the
+                        // B→A roundtrip with an epoch mismatch.
+                        if existing != member_did && existing.as_str() != self.did.as_ref() {
                             self.crypto.deposit_commit(
                                 &ctx_bytes,
                                 existing,
@@ -535,6 +544,20 @@ impl FullStackNode {
             .pickup_sender_key_messages(context_id_str, context_id)?;
         self.crypto
             .process_pending_commits(context_id_str, context_id)?;
+
+        // 6. Mirror `add_member` step 7 in the OTHER direction: distribute THIS
+        //    joiner's sender key to every existing member so they can decrypt the
+        //    joiner's outbound traffic. Neither `invite_member` nor the Welcome
+        //    carries the joiner's sender key to the incumbents, so without this a
+        //    B→A send fails at the receiver with `sender key lookup failed`. The
+        //    joiner holds each peer's `0xFF01` wrapping pubkey from the joined
+        //    group's leaf nodes, so the HPKE seal targets the right recipient.
+        let joiner_did = self.did.as_ref();
+        for existing in self.manager.member_dids(handle.context_id()).await {
+            if existing.as_str() != joiner_did {
+                self.crypto.distribute_sender_key(context_id, &existing)?;
+            }
+        }
         Ok(handle)
     }
 
@@ -719,6 +742,14 @@ impl FullStackNode {
         // Apply any pending epoch-advance commits to sync the MLS epoch.
         self.crypto
             .process_pending_commits(context_id_str, context_id)?;
+
+        // Ingest any sender-key distribution addressed to this node before
+        // opening. Distribution is symmetric — a joiner distributes its sender
+        // key to the incumbents just as the inviter distributes to the joiner —
+        // so the receiver must pick up the sender's key here or the open below
+        // fails with `sender key lookup failed`.
+        self.crypto
+            .pickup_sender_key_messages(context_id_str, context_id)?;
 
         // Open: outer envelope → MLS decrypt → sender-key decrypt → inner
         // envelope → strip padding → integrity check.
