@@ -347,6 +347,10 @@ impl ScpClient {
         // can HPKE-seal sender keys to it. ADR-057 §Prereq-1: the creator's own MLS
         // leaf `Lifetime` is stamped from the hardened driver clock.
         let (wrapping_public, wrapping_secret) = generate_wrapping_keypair();
+        // Hold the transient secret in `Zeroizing` so its stack copy is wiped on
+        // scope exit; the crypto state re-wraps its own copy in `Zeroizing`
+        // (`from_group_with_wrapping`).
+        let wrapping_secret = Zeroizing::new(wrapping_secret);
         let mls_group = create_group_with_wrapping_key(
             &credential,
             Some(&wrapping_public),
@@ -356,7 +360,7 @@ impl ScpClient {
             context_id,
             mls_group,
             wrapping_public,
-            wrapping_secret,
+            *wrapping_secret,
         );
         let creator_did = self.signer.did().to_owned();
         let mut state = PerContextState::new(context_id, &creator_did, crypto);
@@ -404,6 +408,10 @@ impl ScpClient {
         // the SAME key. ADR-057 §Prereq-1: the KeyPackage `Lifetime` is stamped
         // from the hardened driver clock.
         let (wrapping_public, wrapping_secret) = generate_wrapping_keypair();
+        // Hold the transient secret in `Zeroizing` so its stack copy is wiped on
+        // scope exit; the persisted blob and the retained `PendingJoin` each take
+        // their own copy from it below.
+        let wrapping_secret = Zeroizing::new(wrapping_secret);
         let (bundle, signer, provider): (KeyPackageBundle, _, InMemoryMlsProvider) =
             generate_key_package_with_wrapping_key(
                 &credential,
@@ -431,7 +439,7 @@ impl ScpClient {
             let persisted = PersistedPendingJoin {
                 mls_blob,
                 wrapping_public,
-                wrapping_secret,
+                wrapping_secret: *wrapping_secret,
             };
             rmp_serde::to_vec_named(&persisted).map_err(|e| {
                 ClientError::StorageCorrupt(format!("serializing pending join: {e}"))
@@ -451,7 +459,7 @@ impl ScpClient {
                 signer,
                 provider,
                 wrapping_public,
-                wrapping_secret: Zeroizing::new(wrapping_secret),
+                wrapping_secret: Zeroizing::new(*wrapping_secret),
             },
         );
 
@@ -644,7 +652,19 @@ impl ScpClient {
         // key M cannot open (M never decrypts the joiner → targeted within-group
         // downgrade). The blast radius is bounded: the adder is already the trusted
         // bootstrap source, and a substituted-key holder still cannot strip the
-        // outer MLS layer. The authenticated source is each member's signed
+        // outer MLS layer.
+        //
+        // This transported directory is likewise NOT cross-validated against the
+        // replayed event log's `MemberJoined` set — the directory membership and
+        // the log both originate from the same adder, so a cross-check would only
+        // compare the adder against itself. It is deliberately advisory: MLS group
+        // membership is authoritative, and by INVARIANT 1 the directory IS the
+        // single member set (there is no parallel derived membership view to
+        // reconcile it against — re-deriving one from the log would reintroduce the
+        // drift-prone parallel set INVARIANT 1 exists to avoid). Independent
+        // validation lands with the same §23.13 slice below.
+        //
+        // The authenticated source is each member's signed
         // `scp_wrapping_key` leaf extension in the (now Welcome-embedded) ratchet
         // tree; sourcing recipients from there is blocked only because openmls does
         // not expose remote leaf extensions via its public API, and lands with the

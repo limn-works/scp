@@ -108,8 +108,14 @@ impl std::fmt::Debug for SenderKeyDistribution {
 ///
 /// Mirrors the native `MlsCryptoProvider`, which seeds `sender_key_epoch = 1`
 /// at keygen. Starting at 1 (not 0) keeps the first application message's
-/// 8-byte big-endian epoch prefix as `0x0000000000000001`, which can never
-/// collide with the 4-byte `SCPM_MAGIC` management prefix (§9.16.1).
+/// 8-byte big-endian epoch prefix as `0x0000000000000001`, whose leading 4
+/// bytes are `00 00 00 00` — disjoint from the 4-byte `SCPM_MAGIC` management
+/// prefix (§9.16.1). This disjointness is precise for all *reachable* epochs
+/// (< 2^32, guaranteed by `MAX_EPOCH_ADVANCE`'s monotonic per-sender ceiling):
+/// an epoch's high 4 bytes could only equal `SCPM_MAGIC` at epoch ≥ 2^32, which
+/// the ceiling makes unreachable. Classification never rests on disjointness
+/// alone — the independent `sender_did == mls_sender_did` binding (see
+/// [`ContextCryptoState::install_incoming_distribution`]) is a separate guard.
 pub const INITIAL_SENDER_KEY_EPOCH: u64 = 1;
 
 /// The outcome of decrypting an inbound MLS message.
@@ -741,9 +747,14 @@ impl ContextCryptoState {
         // its authenticated MLS credential DID.
         //
         // Disjointness (§9.16.1): an application message's first 4 bytes are the
-        // big-endian sender-key epoch (≥ 1 → `00 00 00 00`), which can never equal
-        // SCPM_MAGIC (`53 43 50 4D`), so this branch and the application path below
-        // are mutually exclusive.
+        // high 4 bytes of the big-endian sender-key epoch. For every reachable
+        // epoch (< 2^32, held there by `MAX_EPOCH_ADVANCE`'s monotonic ceiling)
+        // those bytes are `00 00 00 00`, which cannot equal SCPM_MAGIC
+        // (`53 43 50 4D`), so this branch and the application path below are
+        // mutually exclusive. A collision would require epoch ≥ 2^32 (high bytes
+        // equal to SCPM_MAGIC), which the ceiling makes unreachable; and even
+        // then the sender-DID binding in `install_incoming_distribution` is an
+        // independent guard, so classification never rests on disjointness alone.
         if let Some(payload) = try_strip_management_prefix(&framed) {
             return self.install_incoming_distribution(&sender_did, payload);
         }
@@ -1086,9 +1097,17 @@ mod tests {
     #[test]
     fn management_magic_is_disjoint_from_application_epoch_prefix() {
         // §9.16.1 disjointness: an application frame starts with the 8-byte BE
-        // sender-key epoch (≥ 1), so its first 4 bytes are `00 00 00 00`, which can
-        // never equal SCPM_MAGIC (`53 43 50 4D`). This is what lets the single
-        // magic check at the MLS-plaintext boundary classify the frame.
+        // sender-key epoch, so its first 4 bytes are the epoch's high 4 bytes. For
+        // every reachable epoch (< 2^32, held there by `MAX_EPOCH_ADVANCE`'s
+        // monotonic ceiling) those bytes are `00 00 00 00`, which can never equal
+        // SCPM_MAGIC (`53 43 50 4D`). This is what lets the single magic check at
+        // the MLS-plaintext boundary classify the frame — backstopped, never
+        // replaced, by the independent sender-DID binding.
+        // The disjointness argument holds only for reachable epochs (< 2^32);
+        // pinned at compile time since both operands are constants.
+        const {
+            assert!(INITIAL_SENDER_KEY_EPOCH < (1u64 << 32));
+        }
         let header = build_sender_header(INITIAL_SENDER_KEY_EPOCH, 0, b"ct");
         assert_eq!(
             &header[..4],
