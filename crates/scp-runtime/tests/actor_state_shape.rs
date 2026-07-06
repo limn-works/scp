@@ -153,7 +153,6 @@ fn context_crypto_state_default_exhaustive_field_witness() {
         nonce_dedup,
         member_wrapping_keys,
         recv_sequence_tracker,
-        access_key_store,
     } = c;
 
     // MLS group and sender key default to `None` per ADR-049 actor
@@ -174,7 +173,6 @@ fn context_crypto_state_default_exhaustive_field_witness() {
     // compiles only if the field exists.
     let _ = &sender_key_store;
     let _ = &nonce_dedup;
-    let _ = &access_key_store;
 }
 
 // ---------------------------------------------------------------------------
