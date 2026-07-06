@@ -207,10 +207,15 @@ impl SessionStore {
 ///
 /// Returns [`ToolError`] if the context is not active or the tool is not
 /// found in the registry.
-// ADR-049 §Decision 12: `state` is now a synchronous lock-free ArcSwap load.
-// Async is retained for uniformity with the tool-session API's async
-// `invoke_session` and as the stable ContextManager tool API contract.
-#[allow(clippy::unused_async)]
+// ADR-049 §Decision 12: `state` is now a synchronous lock-free ArcSwap load,
+// so this body has no `.await`. It calls no async provider trait; `async` is
+// retained purely for API symmetry with the genuinely-async `invoke_session`
+// (which awaits the tool executor) and as the stable ContextManager tool API
+// contract — not for any pending provider await.
+#[allow(
+    clippy::unused_async,
+    reason = "kept async for API symmetry with the async invoke_session and the stable tool API contract; body has no await and calls no async provider"
+)]
 pub async fn create_session(
     store: &mut SessionStore,
     registry: &ToolRegistry,

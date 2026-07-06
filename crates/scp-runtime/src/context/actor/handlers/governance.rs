@@ -1153,15 +1153,12 @@ async fn handle_evaluate_timeouts_actor(
     // through a short-lived non-persisting Class-C view whose borrow is dropped
     // before the next call — coalesced (no per-site persist; the run loop
     // flushes after the handler reports `mutated`).
-    let current_state = cell.handle.try_read_state();
-    if !matches!(
-        current_state,
-        Some(scp_protocol::context::ContextState::Active)
-    ) {
-        // None = write-contended, continue next tick.
-        // Not Active = context closing, stop the loop.
-        let continue_loop = current_state.is_none();
-        let _ = reply.send(Ok(continue_loop));
+    let current_state = cell.handle.state();
+    if current_state != scp_protocol::context::ContextState::Active {
+        // Not Active = context closing, stop the loop. (The former
+        // write-contended `None` branch is gone: the lock-free `ArcSwap`
+        // read can never fail, so there is no "retry next tick" case.)
+        let _ = reply.send(Ok(false));
         return Outcome::ok(());
     }
 

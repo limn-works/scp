@@ -274,7 +274,7 @@ async fn reconnect_tier1_builds_checkpoint_and_clears_flag() {
         .create_context(ctx_id, encrypted_params())
         .await
         .expect("create context");
-    assert_eq!(handle.try_read_state().unwrap(), ContextState::Active);
+    assert_eq!(handle.state(), ContextState::Active);
 
     alice.add_member(&handle, BOB_DID).await.expect("add bob");
     bob.join_from_welcome(ctx_id, &ctx_bytes)

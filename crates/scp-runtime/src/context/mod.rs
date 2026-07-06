@@ -25,11 +25,13 @@
 //!
 //! All public handle types are `Send + Sync`. The cached lifecycle state is
 //! held in a lock-free `arc_swap::ArcSwap<ContextState>`: reads
-//! ([`ContextHandle::state`]) are a lock-free atomic load, and writes
-//! ([`ContextHandle::transition_to`]) validate then atomically store. State
-//! writes are performed exclusively by the owning per-context actor's
-//! single-threaded command loop (ADR-049 §10), so no compare-and-swap retry
-//! loop is required. See `.docs/standards/sdk-common.md` Concurrency Model.
+//! ([`ContextHandle::state`]) are a lock-free atomic load. The cell is shared
+//! cross-thread and written by more than one party (the owning per-context
+//! actor's command loop and the off-actor FFI finalize path, ADR-049 §10), so
+//! writes ([`ContextHandle::transition_to`]) validate then commit through a
+//! compare-and-swap retry loop — making read-validate-write atomic under any
+//! number of concurrent writers. See `.docs/standards/sdk-common.md`
+//! Concurrency Model.
 
 pub mod actor;
 pub mod app_sandbox;
@@ -80,9 +82,13 @@ pub use config::{ContextConfig, ContextCreation};
 /// `ContextHandle` holds the context's identity, lifecycle state, and creation
 /// parameters. It is `Send + Sync` -- safe to share across threads and async
 /// tasks. The lifecycle state lives in a lock-free
-/// `arc_swap::ArcSwap<ContextState>`: reads are atomic loads, and transitions
-/// atomically store the validated next state. State writes are serialized by
-/// the owning per-context actor's single-threaded command loop (ADR-049 §10).
+/// `arc_swap::ArcSwap<ContextState>`: reads are atomic loads. The cell is
+/// shared cross-thread and written by more than one party — the owning
+/// per-context actor's command loop and the off-actor FFI finalize path both
+/// call [`transition_to`](ContextHandle::transition_to) on clones that share
+/// the same `Arc<ArcSwap<ContextState>>`. Transitions are therefore committed
+/// with a compare-and-swap retry loop so read-validate-write is atomic under
+/// any number of writers (ADR-049 §10).
 ///
 /// The handle does not own the MLS group, event log, or transport connections.
 /// Those are managed by the Context Manager (SCP-019/020).
@@ -152,36 +158,58 @@ impl ContextHandle {
         ContextState::clone(&self.inner.load())
     }
 
-    /// Reads the context state.
-    ///
-    /// Retained as an infallible synchronous getter for call sites that
-    /// previously needed a non-blocking read to avoid holding a lock across
-    /// `.await`. With the lock-free `ArcSwap` cache the read can never fail,
-    /// so this always returns `Some` — the signature is preserved for
-    /// source compatibility with those call sites.
-    #[must_use]
-    pub fn try_read_state(&self) -> Option<ContextState> {
-        Some(self.state())
-    }
-
     /// Attempts to transition the context to a new state.
     ///
     /// Validates the transition via [`state_machine::transition`](scp_protocol::context::state_machine::transition) and applies
     /// it atomically if valid. Returns the new state on success.
     ///
-    /// State writes are performed exclusively by the owning per-context
-    /// actor's single-threaded command loop (ADR-049 §10), so the
-    /// load-validate-store sequence needs no compare-and-swap retry loop.
+    /// # Concurrency
+    ///
+    /// The state cell is shared cross-thread: it is written both by the
+    /// owning per-context actor's command loop (e.g. TTL expiry ->
+    /// `Expired`, close -> `Closing`) and off-actor through the FFI
+    /// finalize path, which persists a clone of this handle and calls
+    /// `transition_to(&Closing)` on it (`napi/context.rs`
+    /// `context_finalize_close_on`). Because `ContextHandle` is `Clone` and
+    /// every clone shares the same `Arc<ArcSwap<ContextState>>`, a naive
+    /// load-validate-store would let two writers race: one could validate
+    /// against a state the other has already replaced and blindly store an
+    /// invalid edge (e.g. `Expired -> Closing`).
+    ///
+    /// This method therefore uses a compare-and-swap retry loop: it
+    /// validates against the *live* loaded state and only commits if the
+    /// cell has not moved since the load. If another writer intervened, it
+    /// retries against the fresh state. This makes read-validate-write
+    /// atomic under any number of concurrent writers — a rejected
+    /// transition never lands, and no committed update is ever lost.
     ///
     /// # Errors
     ///
     /// Returns [`ContextError::InvalidTransition`] if the transition is not
     /// permitted by the lifecycle state machine.
     pub fn transition_to(&self, target: &ContextState) -> Result<ContextState, ContextError> {
-        let current = self.inner.load();
-        let new_state = transition(&current, target)?;
-        self.inner.store(Arc::new(new_state.clone()));
-        Ok(new_state)
+        loop {
+            let current = self.inner.load();
+            // Validate against the LIVE state; propagate a rejected edge as Err
+            // without ever storing.
+            let new_state = transition(&current, target)?;
+            let previous = self
+                .inner
+                .compare_and_swap(&current, Arc::new(new_state.clone()));
+            // `compare_and_swap` swaps only if the cell still held the pointer we
+            // loaded; the returned guard is the value that was in the cell. When
+            // it points at the same allocation we validated against, the swap
+            // committed. Compare by data-pointer identity (both guards deref into
+            // their backing `Arc<ContextState>` allocation).
+            if std::ptr::eq(
+                std::ptr::from_ref::<ContextState>(&previous),
+                std::ptr::from_ref::<ContextState>(&current),
+            ) {
+                return Ok(new_state);
+            }
+            // Another writer moved the cell between load and swap; retry so the
+            // validation is never stale.
+        }
     }
 }
 

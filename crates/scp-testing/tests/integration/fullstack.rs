@@ -93,7 +93,7 @@ async fn fullstack_alice_to_bob_encrypted_message() {
     let ctx_bytes = context_id_bytes(ctx_id);
 
     println!("  [2] Alice created context '{ctx_id}'");
-    assert_eq!(handle.try_read_state().unwrap(), ContextState::Active);
+    assert_eq!(handle.state(), ContextState::Active);
 
     // 3. Alice adds Bob (internally: add_member + distribute_sender_key).
     //    The Welcome and sender key are deposited in the shared KeyExchange.
@@ -782,7 +782,7 @@ async fn full_stack_relay_encrypted_roundtrip() {
     let ctx_bytes = context_id_bytes(ctx_id);
     let params = encrypted_params();
     let handle = alice.create_context(ctx_id, params).await.unwrap();
-    assert_eq!(handle.try_read_state().unwrap(), ContextState::Active);
+    assert_eq!(handle.state(), ContextState::Active);
 
     alice.add_member(&handle, BOB_DID).await.unwrap();
     bob.join_from_welcome(ctx_id, &ctx_bytes).unwrap();

@@ -490,7 +490,7 @@ async fn context_manager_creates_usable_context() {
 
     // Verify state is Active.
     assert_eq!(
-        handle.try_read_state().unwrap(),
+        handle.state(),
         ContextState::Active,
         "newly created context should be Active"
     );
@@ -633,7 +633,7 @@ async fn context_create_produces_active_context_with_members() {
     let handle = alice.create_context(ctx_id, params).await.unwrap();
 
     // Context must be Active, not some default/empty state.
-    let state = handle.try_read_state().unwrap();
+    let state = handle.state();
     assert_eq!(state, ContextState::Active, "context should be Active");
     println!("  Context state: {state:?}");
 

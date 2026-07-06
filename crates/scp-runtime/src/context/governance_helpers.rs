@@ -259,10 +259,7 @@ pub async fn tombstone_migrated_context(
     let context_id_bytes = context_id_to_bytes(context_id);
     let now = deps.clock.now_secs();
 
-    let handle_state = cell
-        .handle
-        .try_read_state()
-        .ok_or(ContextError::ContextNotActive)?;
+    let handle_state = cell.handle.state();
     if handle_state != ContextState::MigratingOut {
         return Err(ContextError::PermissionDenied(
             "context is not in MigratingOut state — cannot tombstone".to_owned(),
@@ -3289,10 +3286,7 @@ pub async fn execute_cancel_context_migration(
     let context_id_bytes = context_id_to_bytes(context_id);
 
     // Reads via the cell's `Deref`; `transition_to` takes `&self`.
-    let s = cell
-        .handle
-        .try_read_state()
-        .ok_or(ContextError::ContextNotActive)?;
+    let s = cell.handle.state();
     if s != ContextState::MigratingOut {
         return Err(ContextError::PermissionDenied(
             "context is not in MigratingOut state — cannot cancel migration".to_owned(),

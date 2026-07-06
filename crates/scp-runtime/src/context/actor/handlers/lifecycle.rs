@@ -326,7 +326,7 @@ async fn handle_close_context_actor(
     // so a clone SHARES the interior cell. `ttl::close_context` transitions
     // that shared state Active -> Closing; reading it back through
     // `state.handle` (e.g. the `import_context` replaceability gate's
-    // `state.handle.try_read_state()`) then observes the terminal state.
+    // `state.handle.state()`) then observes the terminal state.
     //
     // A separate `ContextHandle::new` owned its OWN fresh `Arc`, so the
     // Closing transition landed on a throwaway cell and `state.handle`

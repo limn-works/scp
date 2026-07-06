@@ -2053,12 +2053,6 @@ pub(crate) fn restore_governance_engine_from_snapshot(
     }
 }
 
-/// Reads the context state synchronously via [`ContextHandle::try_read_state`].
-/// Returns `ContextNotActive` if the read lock cannot be acquired (a state
-/// transition is in progress) or if the state is not `Active`.
-///
-/// This is used inside `Mutex` lock scopes to avoid TOCTOU races: the state
-/// check and the subsequent mutation happen within the same lock acquisition,
 /// Validates governance model parameters at context creation time.
 ///
 /// Rejects configurations that would make governance impossible:
@@ -2120,9 +2114,7 @@ pub(crate) fn validate_governance_model(
 /// guaranteeing that no concurrent `close_context` or `handle_ttl_expiry` can
 /// interleave between the check and the mutation.
 pub(crate) fn require_active(handle: &ContextHandle) -> Result<(), ContextError> {
-    let state = handle
-        .try_read_state()
-        .ok_or(ContextError::ContextNotActive)?;
+    let state = handle.state();
     if state != ContextState::Active {
         return Err(ContextError::ContextNotActive);
     }
@@ -2132,9 +2124,7 @@ pub(crate) fn require_active(handle: &ContextHandle) -> Result<(), ContextError>
 /// Requires the context to be in `MigratingOut` state (§5.11A).
 /// Used for `CancelContextMigration` which is only valid during migration.
 pub(crate) fn require_migrating_out(handle: &ContextHandle) -> Result<(), ContextError> {
-    let state = handle
-        .try_read_state()
-        .ok_or(ContextError::ContextNotActive)?;
+    let state = handle.state();
     if state != ContextState::MigratingOut {
         return Err(ContextError::PermissionDenied(
             "action requires MigratingOut state".to_owned(),

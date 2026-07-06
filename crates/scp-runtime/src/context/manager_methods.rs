@@ -67,7 +67,6 @@
 
 use scp_did::DID;
 use scp_protocol::context::ContextParams;
-use scp_protocol::context::ContextState;
 use scp_protocol::context::broadcast::{BroadcastAdmission, BroadcastContext};
 use scp_protocol::context::builder::ContextCreationError;
 use scp_protocol::context::params::{ContextMode, TemplateId};
@@ -263,7 +262,7 @@ pub async fn persist_context_and_broadcast(supervisor: &Supervisor, context_id: 
 ///
 /// Must be called while the contexts mutex is held (snapshot under lock).
 pub fn snapshot_context(ctx: &PerContextState) -> ContextSnapshot {
-    let state = ctx.handle.try_read_state().unwrap_or(ContextState::Active);
+    let state = ctx.handle.state();
     let ttl_remaining_secs = ctx.ttl.timer.remaining_secs();
     // Capture grace entries for transactional persistence (§23.11).
     // On clock error, persist an empty vec — the recovery path will
