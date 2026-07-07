@@ -293,10 +293,7 @@ use super::state::{
 };
 use crate::context::ContextHandle;
 use crate::context::governance::timeout::{DeadlockDetectionState, GovernanceTimeoutTask};
-use crate::context::messaging_helpers::{
-    build_snapshot_for_persist, persist_snapshot_fail_closed, persist_state_best_effort,
-    persist_state_fail_closed,
-};
+use crate::context::messaging_helpers::{persist_state_best_effort, persist_state_fail_closed};
 use crate::context::state::{
     AccessControlState, CommitFaultMarker, EpochState, GovernanceClassS, GovernanceState,
     MigrationState, PendingCeilingModification, PendingCommit, PendingEconomicPolicyChange,
@@ -3509,10 +3506,11 @@ impl ClassSCommitToken {
     ///
     /// # Not `async fn` — `Send` discipline (ADR-049 Decision 7)
     ///
-    /// This is a SYNC fn that returns a future, NOT an `async fn`. The
-    /// `&PerContextState` is consumed in the synchronous prelude
-    /// ([`build_snapshot_for_persist`]) and is NOT captured by the returned
-    /// future — which holds only the owned snapshot plus `deps` / `context_id`.
+    /// This is a SYNC fn that returns a future, NOT an `async fn`. It delegates to
+    /// the shared [`persist_state_fail_closed`], whose synchronous prelude consumes
+    /// the `&PerContextState` (building the owned snapshot) so it is NOT captured by
+    /// the returned future — which holds only the owned snapshot plus
+    /// `deps` / `context_id`.
     /// An `async fn` would keep the `&PerContextState` parameter in the future's
     /// captured state across the `.await`; `PerContextState` is `!Sync` (it
     /// holds a `dyn FnMut` sink), so that would make the actor's `run()` future
@@ -3535,11 +3533,14 @@ impl ClassSCommitToken {
         // counts as committed (keep-direction: the consume stays, the error
         // propagates to the caller's reversal).
         self.consumed = true;
-        // Build the owned snapshot in the SYNC prelude so the `&PerContextState`
-        // borrow is dropped before the returned future — the future then captures
-        // only the owned snapshot + `deps`/`context_id`, keeping it `Send`.
-        let snapshot = build_snapshot_for_persist(state, deps, context_id);
-        async move { persist_snapshot_fail_closed(&snapshot, deps, context_id).await }
+        // Delegate the single deferred fail-closed persist to the shared
+        // [`persist_state_fail_closed`] helper — the canonical sync-prelude form
+        // (its prelude builds the owned snapshot and drops the `&PerContextState`
+        // borrow before the returned future, which then captures only the owned
+        // snapshot + `deps`/`context_id`, keeping it `Send`). Sharing the one
+        // helper keeps the keep-direction/fail-closed core identical across this
+        // terminal and the deferred terminals `discharge_with` / `commit_fail_closed`.
+        persist_state_fail_closed(state, deps, context_id)
     }
 
     /// Discharge the deferred obligation, running ONE final (possibly fallible)
@@ -3608,11 +3609,14 @@ impl ClassSCommitToken {
         // durable; un-doing it is the unsafe direction).
         let f_result = f(ClassSMut::new(&mut cell.state));
         self.consumed = true;
-        // Build the owned snapshot before the persist `.await` so the
-        // `&cell.state` borrow is dropped off the await point — keeps the actor
-        // future `Send` (`PerContextState` is `!Sync`; ADR-049 Decision 7).
-        let snapshot = build_snapshot_for_persist(&cell.state, deps, context_id);
-        let persist_result = persist_snapshot_fail_closed(&snapshot, deps, context_id).await;
+        // The SINGLE deferred fail-closed persist, routed through the shared
+        // [`persist_state_fail_closed`] helper so the keep-direction/fail-closed
+        // core stays identical to `ClassSDischargeGuard::commit_fail_closed`, the
+        // read-only `commit`, and the combinators. Its sync prelude builds the
+        // owned snapshot and drops the `&cell.state` borrow off the await point —
+        // keeps the actor future `Send` (`PerContextState` is `!Sync`; ADR-049
+        // Decision 7).
+        let persist_result = persist_state_fail_closed(&cell.state, deps, context_id).await;
         match (f_result, persist_result) {
             // `f` failed: the persist still ran (keep); surface `f`'s error.
             (Err(f_err), _) => Err(f_err),
@@ -3776,8 +3780,11 @@ impl ClassSDischargeGuard<'_> {
             "ClassSDischargeGuard committed against the wrong context",
         );
         self.token.consumed = true;
-        let snapshot = build_snapshot_for_persist(self.state, deps, context_id);
-        persist_snapshot_fail_closed(&snapshot, deps, context_id).await
+        // Single deferred fail-closed persist via the shared
+        // [`persist_state_fail_closed`] helper — identical keep-direction core to
+        // `ClassSCommitToken::discharge_with`. Its sync prelude builds the owned
+        // snapshot off the await point, keeping the actor future `Send`.
+        persist_state_fail_closed(self.state, deps, context_id).await
     }
 }
 
