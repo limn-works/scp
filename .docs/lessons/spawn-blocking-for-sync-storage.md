@@ -41,13 +41,21 @@ extra hop there would be redundant for an already-async backend.
 genuine sync→async boundary, and the wrong cost for work that is already async — which is
 why the adapter does **not** re-wrap. The ban on `block_in_place` / `.block_on(…)` in the
 actor-refactor scope is mechanically enforced by `scripts/check-block-in-place.py` (an
-AST gate — see `ast-based-ci-enforcement.md`). The remaining legitimate sites — the
-legacy `crypto/mls/storage.rs` bridge and a handful of others still mid-migration — opt out
-via the gate's **inline allow-list directive**, an explicit per-site exemption rather than
-a silent exception; the count is ratcheted down (`ratchet/block-in-place-count.json`) as
-Decision-7 PRs delete each bridge. At the current commit the `scp-transport`
-`provider.rs` / `relay_persistence.rs` bridges and `crypto/mls/storage.rs` still hold
-`block_in_place` sites; the direction is single: toward zero.
+AST gate — see `ast-based-ci-enforcement.md`), which opts sites out two ways.
+`crypto/mls/storage.rs` — whose sync `OpenMLS` `StorageProvider` bridge (`sync_store` /
+`sync_retrieve` / `sync_delete`, ~:201/212/223) is the one place a `block_in_place` is still
+genuinely required — is a **wholesale file-scope exclusion** (`EXCLUDED_FILES` in the gate,
+alongside the `crates/scp-ffi/**` prefix), *not* an inline directive: it carries no
+`// ci-allow`. Individual sites elsewhere opt out with the gate's **inline allow-list
+directive** (`// ci-allow: block-on: <reason>`) — e.g. `shutdown_all_contexts_sync`'s FFI
+sync-shutdown path; the remaining still-counted sites (`lifecycle_helpers.rs`'s
+`flush_all_contexts_sync` pair, `store/trust.rs`, the `tools_helpers` `_legacy` slack, and
+the `scp-node` HTTP handler) are simply **ratchet-baselined** and driven toward zero
+(`ratchet/block-in-place-count.json`). At the current commit the `scp-transport`
+`provider.rs` / `relay_persistence.rs` bridges are **gone** (count `0` — the `block_in_place`
+tokens still in `provider.rs` are doc-comment prose, not calls); the only real
+`block_in_place` sites left in this lesson's storage scope are the three in
+`crypto/mls/storage.rs`.
 
 ## Cross-refs
 

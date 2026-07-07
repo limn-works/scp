@@ -57,17 +57,19 @@ The cell has no `DerefMut` and no `state_mut()` escape hatch. This encodes ADR-0
 
 `ActorDeps` is moved into the spawned task, so **every field it carries must be `Send`** —
 including the `OwnedIdentityDid` capability token (`identity_capability.rs` ships a
-`token_is_send_sync` compile-time witness for exactly this reason; see
+`token_is_send_sync` `#[test]` asserting `Send + Sync` for exactly this reason; see
 `owned-identity-did-capability.md`). ADR-049 §153 (Decision 7) is the normative rule that
 follows: the provider traits an actor reaches through `ActorDeps` become `async` via
 plain `#[async_trait]` (dyn-compatible, `Send` futures) rather than RPITIT, and all
 `block_in_place` sync→async bridges are deleted. `SqliteStorage` wraps each `rusqlite` op
 in `spawn_blocking` instead of pinning a worker thread — see
 `spawn-blocking-for-sync-storage.md`, which covers the already-landed KV seam
-(`SpawnBlockingStorageAdapter`). This is a multi-PR rollout: at the current commit the
+(`SpawnBlockingStorageAdapter`). This was a multi-PR rollout, now complete: the
 runtime-facing `ContextTransportProvider` (`context/builder.rs`) and `RelayPersistence`
-(`scp-transport`) are still synchronous and their `block_in_place` bridges still present —
-the decision governs the direction, the bridges are deleted bridge-by-bridge, gated by
+(`scp-transport/src/native/relay_persistence.rs`) are both `#[async_trait]` now, and their
+`block_in_place` sync→async bridges are deleted (`ratchet/block-in-place-count.json` records
+`provider.rs: 0` / `relay_persistence.rs: 0`, and notes this is the LAST
+block-in-place-deletion PR of Decision 7). The deletions were gated bridge-by-bridge by
 `scripts/check-block-in-place.py` (see `ast-based-ci-enforcement.md`).
 
 The Send boundary is not uniform. A trait whose futures must cross the spawn boundary is
@@ -83,13 +85,36 @@ synchronous and fail-closed (`commit_class_s_keep`, `commit_class_s_restore`); t
 call) is a *separate* async combinator (`commit_class_s_compensating`,
 `commit_class_s_keep_compensating`). The state mutation + its durable record commit
 without an await in the critical section; the awaitable effect runs after, so a persist
-can never straddle an await point. The best-effort broadcast counterpart,
-`try_broadcast_commit_or_enqueue` (`context/governance_helpers.rs`), is deliberately
-Class-C: it takes only the three disjoint fields it touches
-(`CommitBroadcastBorrows { pending_commits, commit_fault, receive_buffer }`) from a
-non-persisting `class_c_view()`, and on transport failure enqueues a retry / sets a
-`commit_fault` gate rather than blocking a fail-closed persist behind the send. Keep the
-durable write synchronous; let the network hop be its own arm.
+can never straddle an await point.
+
+The MLS-Commit broadcast is the sharpest instance of the split — and it runs the *other* way
+from the escrow case above: here the awaitable step is the async terminal that touches **no**
+state, and the *durable* record is the synchronous part the caller places in whichever class
+its safety needs. Because `ContextTransportProvider` is now async (Decision 7), the broadcast
+can no longer be awaited inside the synchronous `commit_class_s_keep` closure that
+fail-closed-persisted the underlying mutation, so PR-3 split the failure bookkeeping OUT into
+three pieces (`context/governance_helpers.rs`):
+
+- `try_broadcast_commit` — the **async terminal**. `Send`, `&ActorDeps`,
+  `-> Option<BroadcastFailure>`; it performs ONLY the transport send and builds the retry
+  payload, mutating **no** `PerContextState` field.
+- `apply_broadcast_failure` — the **synchronous applier**. Given a `BroadcastFailure` and the
+  three disjoint Class-C `&mut` fields
+  (`CommitBroadcastBorrows { pending_commits, commit_fault, receive_buffer }`), it enqueues the
+  retry / trips the `commit_fault` gate / emits the local event, and touches nothing else — so
+  the **durability class is the caller's choice.**
+- `keep_broadcast_failure` — the safety-gated wrapper: a *second* `commit_class_s_keep` that
+  runs `apply_broadcast_failure` fail-closed (the second `commit_class_s_keep` in the operation).
+
+The caller picks the class. The safety-gated Class-S sites — `execute_remove_member`,
+`execute_rotate_content_keys`, `leave_context`, and `recovery_advance_epoch` (§9.12) — call
+`keep_broadcast_failure`, so the `commit_fault` safety-gate marker and the `pending_commits`
+retry entry persist FAIL-CLOSED; a crash between the send failure and the ≤50 ms coalesce tick
+would otherwise drop the only re-delivery of an epoch-advancing Commit — silent, permanent
+group desync. The best-effort sites — `execute_add_member`, `execute_reset_member` — apply the
+identical value COALESCED through a `class_c_view()` / `ClassCMut`. The async terminal stays
+out of every persist closure; the durable step is a plain synchronous applier the caller runs
+in its chosen class (ADR-049 §9 / Decision 7).
 
 ## Cross-refs
 

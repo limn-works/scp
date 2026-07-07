@@ -11,7 +11,10 @@ generalizes it to the whole roster.
 - `scripts/check-block-in-place.py` — tree-sitter AST gate banning `block_in_place` /
   `.block_on(…)` in the actor scope. Structural: it flags any identifier that *resolves to*
   `block_in_place` at a call site, including aliased imports and fn-pointer rebinds tracked
-  through `let` declarations. Opt-outs are explicit inline allow-list directives.
+  through `let` declarations. Opt-outs come two ways: explicit inline allow-list directives
+  (`// ci-allow: block-on: <reason>`) for individual sites, and wholesale file-scope
+  exclusions (`crypto/mls/storage.rs`, the `crates/scp-ffi/**` prefix) for boundaries that
+  require a sync→async bridge by construction.
 - `scripts/check-deleted-primitives.sh` — bans token patterns for primitives the refactor
   deleted, so they cannot reappear (production *and* test scope). Ships with an **empty**
   ban list and is populated only as the corresponding deletions land.
