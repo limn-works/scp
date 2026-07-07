@@ -2468,10 +2468,25 @@ pub async fn execute_reset_member(
         .add_member(&context_id_bytes, did, None)
         .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
 
-    // Member reset operates on a coalesced `ClassCMut` view (best-effort — parity
-    // with the pre-async shape; NOT a downward-authorization Class-S transition).
-    // The broadcasts are async; on failure the retry-queue bookkeeping is applied
-    // through the same coalesced view (`view.commit_broadcast_borrows()`).
+    // Member reset operates on a coalesced `ClassCMut` view (best-effort). The
+    // broadcasts are async; on failure the retry-queue bookkeeping is applied
+    // through the same coalesced view (`view.commit_broadcast_borrows()`), so a
+    // crash before the ≤50 ms persist tick can drop the `commit_fault`/retry
+    // bookkeeping. RESIDUAL of coalescing here (be honest): a lost reset Commit
+    // leaves remaining members on an epoch where the reset member's OLD
+    // (rotated-out, possibly compromised) keys still decrypt until the Commit is
+    // re-delivered — the same desync class the safety-gated sites fail-close
+    // against. Coalesced is nonetheless the correct/defensible class for reset,
+    // for three reasons: (1) reset is a same-member key REFRESH — the member is
+    // removed and IMMEDIATELY re-added in the same operation and remains
+    // authorized throughout, so it is net-neutral versus a true `RemoveMember`
+    // (no authority is being withdrawn from anyone); (2) §9 classifies the
+    // membership effect as Class-M, not a downward-authorization Class-S
+    // transition, so it carries no §9 fail-closed obligation; and (3) it matches
+    // the pre-async coalesced `ClassCMut` shape exactly — coalescing here is
+    // parity, NOT a regression introduced by the async-transport hoist. (The
+    // fail-closed sites — remove/rotate/leave/recovery — genuinely withdraw
+    // authority or re-key away from a compromised party, which reset does not.)
     if let Some(failure) = try_broadcast_commit(
         deps,
         context_id,
