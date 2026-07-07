@@ -16589,29 +16589,30 @@ impl Scp {
         };
 
         struct UniffiRecoveryBackend;
+        #[async_trait::async_trait(?Send)]
         impl RecoveryBackend for UniffiRecoveryBackend {
-            fn mls_update(
+            async fn mls_update(
                 &self,
                 _context_id: &str,
                 _key_rotation: &KeyRotationOutcome,
             ) -> Result<(), RecoveryStepError> {
                 Ok(())
             }
-            fn revoke_ucans(
+            async fn revoke_ucans(
                 &self,
                 _context_id: &str,
                 _key_rotation: &KeyRotationOutcome,
             ) -> Result<(), RecoveryStepError> {
                 Ok(())
             }
-            fn rotate_key_packages(
+            async fn rotate_key_packages(
                 &self,
                 _context_id: &str,
                 _key_rotation: &KeyRotationOutcome,
             ) -> Result<(), RecoveryStepError> {
                 Ok(())
             }
-            fn notify_contacts(
+            async fn notify_contacts(
                 &self,
                 _did: &DID,
                 _tier: CompromiseTier,
@@ -16620,7 +16621,7 @@ impl Scp {
             ) -> bool {
                 true
             }
-            fn rotate_psk(&self, _params: &PskRotationParams) -> bool {
+            async fn rotate_psk(&self, _params: &PskRotationParams) -> bool {
                 true
             }
         }
