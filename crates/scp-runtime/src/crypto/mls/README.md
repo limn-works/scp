@@ -19,8 +19,9 @@ inject test doubles:
   trait objects:
   - `mls_backend: Arc<dyn MlsBackend>` (`backend.rs`)
   - `hpke_backend: Arc<dyn HpkeBackend>` (`../hpke_backend.rs`)
-  Build the production provider with `MlsCryptoProvider::new(local_did)`
-  (wires `ProductionMlsBackend` + `ProductionHpkeBackend`); tests inject
+  Build the production provider with `MlsCryptoProvider::new(local_did, clock)`
+  — `clock` is an `Arc<dyn scp_clock::Clock>` (e.g. `Arc::new(SystemClock)`) —
+  which wires `ProductionMlsBackend` + `ProductionHpkeBackend`; tests inject
   failure-driven mocks via `MlsCryptoProvider::with_backends`.
 - **`ProductionMlsBackend`** (`production_backend.rs`) — a stateless struct
   that delegates each primitive to the `group` / `encrypt` / `ratchet` free
@@ -85,13 +86,22 @@ queue orchestration lives in the context layer (it needs `ActorDeps` transport
 + persistence), not in `crypto/mls/` — the MLS backend only produces the
 Commit bytes:
 
-- **`try_broadcast_commit_or_enqueue`** (`context/governance_helpers.rs`) —
-  attempts the broadcast; on failure enqueues a `PendingCommit`
-  (`context/state.rs`) carrying the serialized Commit bytes, routing ID, the
-  logical `CommitOperation`, and retry bookkeeping. Retries use exponential
-  backoff (`COMMIT_RETRY_BACKOFFS`), bounded by `MAX_COMMIT_RETRIES` (20),
-  `MAX_COMMIT_AGE_SECS` (1 h), and `MAX_PENDING_COMMITS` (50). The queue is
-  persisted so retries survive process restart.
+- The broadcast is a three-function split (`context/governance_helpers.rs`) so
+  the async transport send stays out of the fail-closed Class-S persist closure:
+  - **`try_broadcast_commit`** — async, send-only; it touches no
+    `PerContextState` and returns `Option<BroadcastFailure>` (`None` on success,
+    `Some(..)` carrying the retry payload on transport failure).
+  - **`apply_broadcast_failure`** — synchronous; applies that payload by
+    enqueuing a `PendingCommit` (`context/state.rs`) carrying the serialized
+    Commit bytes, routing ID, the logical `CommitOperation`, and retry
+    bookkeeping, or setting the `commit_fault` marker when the queue is full.
+    Retries use exponential backoff (`COMMIT_RETRY_BACKOFFS`), bounded by
+    `MAX_COMMIT_RETRIES` (20), `MAX_COMMIT_AGE_SECS` (1 h), and
+    `MAX_PENDING_COMMITS` (50). The queue is persisted so retries survive
+    process restart.
+  - **`keep_broadcast_failure`** — async; runs `apply_broadcast_failure` inside
+    a second `commit_class_s_keep` so the failure bookkeeping fail-closes
+    (persists before ack) rather than being lost on a coalesced tick.
 - On budget exhaustion the context **fail-closes**: a `CommitFaultMarker` is
   set. While it is set, `check_commit_fault` makes all governance and
   lifecycle mutations return `ContextError::CommitBroadcastFault`.

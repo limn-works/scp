@@ -62,7 +62,10 @@ use scp_protocol::context::{ContextParams, ContextState};
 // `event_log` are boxed provider trait objects; `key_resolver` maps a DID +
 // verification method to its Ed25519 verifying key (ADR-039).
 let supervisor = test_supervisor(
-    Arc::new(MlsCryptoProvider::new("did:dht:z6Mk...creator".to_owned())),
+    Arc::new(MlsCryptoProvider::new(
+        "did:dht:z6Mk...creator".to_owned(),
+        Arc::new(scp_clock::SystemClock),
+    )),
     Box::new(my_transport_provider),
     Box::new(my_event_log_provider),
     my_key_resolver,
@@ -78,7 +81,7 @@ let handle = supervisor
     )
     .await?;
 
-assert_eq!(handle.try_read_state(), Some(ContextState::Active));
+assert_eq!(handle.state(), ContextState::Active);
 ```
 
 ## Send a message

@@ -88,11 +88,12 @@ Actor futures are `tokio::spawn`'d, so **everything the actor awaits must be
   process. When you need byte-blob storage inside a handler, reach it through
   a bridge that already owns a concrete `Arc<S>` — never try to add
   `dyn Storage` to `ActorDeps`.
-- Not every backend is async. `RecoveryBackend` (`identity/recovery.rs`) is a
-  **synchronous** trait; its production impl (`ProductionRecoveryBackend`)
-  bridges sync→async internally via a sanctioned `block_in_place` +
-  `Handle::block_on` hop (`block_on_async`). That hop is one of the
-  allow-listed sites in the ratchet below.
+- `RecoveryBackend` (`identity/recovery.rs`) is the one `Send`-rule exception:
+  it is the SOLE `#[async_trait(?Send)]` provider trait (every other
+  ActorDeps-resident provider trait is a plain `Send` `#[async_trait]`). Its
+  production impl (`ProductionRecoveryBackend`) `.await`s the supervisor mailbox
+  directly. It is driven at the FFI boundary on a single task, never
+  `tokio::spawn`'d, so its futures need not be `Send`.
 
 ## Invariant 3 — capability reduction (who can reach what)
 
@@ -114,9 +115,8 @@ Actor futures are `tokio::spawn`'d, so **everything the actor awaits must be
 ADR-049 removes the sync-bridge pattern that made `current_thread` runtimes
 panic. `scripts/check-block-in-place.py` is an AST **ratchet**: each in-scope
 file has a baseline count that may only drop. New sites are budget-0 and fail
-CI. Genuinely-needed sync→async seams (e.g. `RecoveryBackend`, the OpenMLS
-sync `StorageProvider` bridge in `crypto/mls/storage.rs`) are inline
-allow-listed. If you find yourself reaching for `block_in_place`, you almost
+CI. Genuinely-needed sync→async seams (e.g. the OpenMLS sync `StorageProvider`
+bridge in `crypto/mls/storage.rs`) are inline allow-listed. If you find yourself reaching for `block_in_place`, you almost
 certainly want `spawn_blocking` at the seam instead (see
 `SpawnBlockingStorageAdapter`).
 
