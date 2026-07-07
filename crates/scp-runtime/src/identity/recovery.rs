@@ -1986,21 +1986,22 @@ mod tests {
         const TEST_DID: &str = "did:dht:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK";
 
         struct TestTransport;
+        #[async_trait::async_trait]
         impl ContextTransportProvider for TestTransport {
             fn is_connected(&self) -> bool {
                 true
             }
-            fn publish_context(
+            async fn publish_context(
                 &self,
                 _: &[u8; 32],
                 _: &ContextParams,
             ) -> Result<(), ContextCreationError> {
                 Ok(())
             }
-            fn delete_published(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
+            async fn delete_published(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
                 Ok(())
             }
-            fn send_message(&self, _: &[u8; 32], _: &[u8]) -> Result<(), ContextError> {
+            async fn send_message(&self, _: &[u8; 32], _: &[u8]) -> Result<(), ContextError> {
                 Ok(())
             }
         }

@@ -689,7 +689,7 @@ pub async fn finalize_close(
             .destroy_sender_key(&context_id_bytes)
             .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
 
-        let _ = transport.delete_published(&context_id_bytes);
+        let _ = transport.delete_published(&context_id_bytes).await;
     }
 
     event_log
@@ -886,7 +886,7 @@ pub async fn try_ttl_expiry_cleanup(
         // keys are destroyed and the data is unreadable. Not tracked in the
         // bitmask since it is best-effort by design.
         if let Some(transport) = transport
-            && let Err(e) = transport.delete_published(&context_id_bytes)
+            && let Err(e) = transport.delete_published(&context_id_bytes).await
         {
             tracing::warn!(context_id = %context_id, error = %e,
                 "best-effort relay deletion failed after TTL expiry");
@@ -1350,24 +1350,25 @@ mod tests {
 
     struct NullTransport;
 
+    #[async_trait::async_trait]
     impl ContextTransportProvider for NullTransport {
         fn is_connected(&self) -> bool {
             true
         }
-        fn publish_context(
+        async fn publish_context(
             &self,
             _cid: &[u8; 32],
             _p: &ContextParams,
         ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
             Ok(())
         }
-        fn delete_published(
+        async fn delete_published(
             &self,
             _cid: &[u8; 32],
         ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
             Ok(())
         }
-        fn send_message(&self, _cid: &[u8; 32], _payload: &[u8]) -> Result<(), ContextError> {
+        async fn send_message(&self, _cid: &[u8; 32], _payload: &[u8]) -> Result<(), ContextError> {
             Ok(())
         }
     }

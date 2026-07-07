@@ -454,6 +454,7 @@ async fn handle_apply_broadcast_publish(
             &p.signature,
             &p.payload,
         )
+        .await
     };
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, apply_fut).await {

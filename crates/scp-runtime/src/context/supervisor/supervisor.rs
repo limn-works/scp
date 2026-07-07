@@ -3600,13 +3600,15 @@ impl Supervisor {
             // has a digest-keyed MLS group at a non-zero MLS epoch.
             TrustRecoveryCommand::RecoverySendNotification { payload, reply } => {
                 let signing_key = payload.signing_key.to_signing_key();
-                let send_result = self.recovery_send_notification_direct(
-                    &payload.context_id,
-                    &payload.sender_did,
-                    &payload.payload,
-                    payload.sequence,
-                    &signing_key,
-                );
+                let send_result = self
+                    .recovery_send_notification_direct(
+                        &payload.context_id,
+                        &payload.sender_did,
+                        &payload.payload,
+                        payload.sequence,
+                        &signing_key,
+                    )
+                    .await;
                 match send_result {
                     Ok(()) => {
                         let _ = reply.send(Ok(()));
@@ -3671,7 +3673,7 @@ impl Supervisor {
     /// - [`ContextError::CryptoFailed`] if envelope signing or sealing
     ///   fails.
     /// - Any [`ContextError`] surfaced by the transport's `send_message`.
-    fn recovery_send_notification_direct(
+    async fn recovery_send_notification_direct(
         &self,
         context_id: &str,
         sender_did: &str,
@@ -3735,7 +3737,7 @@ impl Supervisor {
             300, // 5 minute blob TTL
         )?;
 
-        transport.send_message(&routing_id, &encrypted)?;
+        transport.send_message(&routing_id, &encrypted).await?;
 
         Ok(())
     }
@@ -9283,6 +9285,7 @@ impl Supervisor {
                                     )
                                 })?
                                 .publish_context(&context_id_bytes, &params)
+                                .await
                                 .map_err(|e| {
                                     ContextError::TransportFailed(format!(
                                         "reconnection failed for context {context_id}: {e}"
@@ -10803,7 +10806,10 @@ impl Supervisor {
             let routing_id = envelope_seal::derive_invitation_routing_id(invitee_did.as_ref());
             let delivered = match self.transport_ref() {
                 Some(transport) => {
-                    match transport.send_to_routing_id(&routing_id, &payload, INVITATION_TTL_SECS) {
+                    match transport
+                        .send_to_routing_id(&routing_id, &payload, INVITATION_TTL_SECS)
+                        .await
+                    {
                         Ok(()) => true,
                         // A transport that does not support routing-id delivery (or
                         // is offline) returns TransportFailed; this is NON-FATAL:
@@ -15834,13 +15840,15 @@ mod tests {
         assert_ne!(raw_bytes, digest);
 
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0x11u8; 32]);
-        let result = sup.recovery_send_notification_direct(
-            &context_id,
-            "did:example:recovery-sender",
-            b"recovery-notification-payload",
-            1,
-            &signing_key,
-        );
+        let result = sup
+            .recovery_send_notification_direct(
+                &context_id,
+                "did:example:recovery-sender",
+                b"recovery-notification-payload",
+                1,
+                &signing_key,
+            )
+            .await;
 
         // The seal MUST have succeeded (state found under the digest), so the
         // method reaches the transport step and fails THERE with

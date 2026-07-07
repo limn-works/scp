@@ -1,9 +1,11 @@
 //! Relay operational state persistence (SCP-PERSIST-066).
 //!
-//! Defines [`RelayPersistence`], a dyn-compatible trait for persisting relay
-//! operational state (subscriptions, rate limits) across relay restarts.
-//! Follows the same synchronous-trait-with-async-bridge pattern used by
-//! `ContextPersistence` in `scp-core`.
+//! Defines [`RelayPersistence`], a dyn-compatible **async** trait for
+//! persisting relay operational state (subscriptions, rate limits) across
+//! relay restarts. Follows the async-provider-trait pattern used by
+//! `ContextPersistence` / `EventLogPersistence` in `scp-core` (ADR-049
+//! Decision 7): the methods `.await` the async [`Storage`](scp_platform::Storage)
+//! backend directly — there is NO `block_in_place` sync→async bridge.
 //!
 //! The canonical implementation `StorageRelayPersistence` wraps any
 //! `Storage` implementation.
@@ -30,11 +32,18 @@ const RATE_LIMIT_PREFIX: &str = "relay/rate_limit/";
 
 /// Provider for persisting relay operational state across restarts.
 ///
-/// Implementors must be dyn-compatible (`Send + Sync`, synchronous methods).
-/// All methods are best-effort — the relay logs errors but does not abort
-/// operations when persistence fails.
+/// Implementors must be dyn-compatible (`Send + Sync`, async methods via
+/// `#[async_trait]`). All methods are best-effort — the relay logs errors but
+/// does not abort operations when persistence fails.
+///
+/// # Async discipline (ADR-049 Decision 7)
+///
+/// Plain `#[async_trait]` (Send), not `?Send`: the relay holds the provider as
+/// `Arc<dyn RelayPersistence>` and calls it from spawned async tasks, so the
+/// method futures must be `Send`.
 ///
 /// See SCP-PERSIST-066.
+#[async_trait::async_trait]
 pub trait RelayPersistence: Send + Sync + fmt::Debug {
     /// Records that `routing_id` has an active subscription.
     ///
@@ -44,7 +53,7 @@ pub trait RelayPersistence: Send + Sync + fmt::Debug {
     /// # Errors
     ///
     /// Returns an error if the storage backend fails.
-    fn persist_subscription(&self, routing_id: &[u8; 32]) -> Result<(), BoxError>;
+    async fn persist_subscription(&self, routing_id: &[u8; 32]) -> Result<(), BoxError>;
 
     /// Removes the subscription record for `routing_id`.
     ///
@@ -54,7 +63,7 @@ pub trait RelayPersistence: Send + Sync + fmt::Debug {
     /// # Errors
     ///
     /// Returns an error if the storage backend fails.
-    fn remove_subscription(&self, routing_id: &[u8; 32]) -> Result<(), BoxError>;
+    async fn remove_subscription(&self, routing_id: &[u8; 32]) -> Result<(), BoxError>;
 
     /// Loads all persisted routing IDs that had active subscriptions.
     ///
@@ -66,7 +75,7 @@ pub trait RelayPersistence: Send + Sync + fmt::Debug {
     /// # Errors
     ///
     /// Returns an error if the storage backend fails.
-    fn load_subscribed_routing_ids(&self) -> Result<Vec<[u8; 32]>, BoxError>;
+    async fn load_subscribed_routing_ids(&self) -> Result<Vec<[u8; 32]>, BoxError>;
 
     /// Persists rate limit state for an IP address.
     ///
@@ -75,7 +84,7 @@ pub trait RelayPersistence: Send + Sync + fmt::Debug {
     /// # Errors
     ///
     /// Returns an error if the storage backend fails.
-    fn persist_rate_limit(
+    async fn persist_rate_limit(
         &self,
         ip: &str,
         tokens: f64,
@@ -89,7 +98,7 @@ pub trait RelayPersistence: Send + Sync + fmt::Debug {
     /// # Errors
     ///
     /// Returns an error if the storage backend fails.
-    fn load_rate_limit(&self, ip: &str) -> Result<Option<(f64, u64)>, BoxError>;
+    async fn load_rate_limit(&self, ip: &str) -> Result<Option<(f64, u64)>, BoxError>;
 
     /// Deletes all persisted relay state.
     ///
@@ -98,7 +107,7 @@ pub trait RelayPersistence: Send + Sync + fmt::Debug {
     /// # Errors
     ///
     /// Returns an error if the storage backend fails.
-    fn clear_all(&self) -> Result<(), BoxError>;
+    async fn clear_all(&self) -> Result<(), BoxError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -106,7 +115,9 @@ pub trait RelayPersistence: Send + Sync + fmt::Debug {
 // ---------------------------------------------------------------------------
 
 /// Bridges any [`Storage`](scp_platform::Storage) implementation to
-/// [`RelayPersistence`] using the sync-to-async bridge pattern.
+/// [`RelayPersistence`]. Being an async trait (ADR-049 Decision 7), each method
+/// `.await`s the async `Storage` backend directly — there is NO `block_in_place`
+/// sync→async bridge (the pattern PR-3 deleted).
 ///
 /// Key layout:
 /// - `relay/subscription/{routing_id_hex}` — marker value `b"1"`
@@ -134,63 +145,50 @@ impl<S> StorageRelayPersistence<S> {
 }
 
 #[cfg(feature = "relay-persistence")]
+#[async_trait::async_trait]
 impl<S: scp_platform::Storage + 'static> RelayPersistence for StorageRelayPersistence<S> {
-    fn persist_subscription(&self, routing_id: &[u8; 32]) -> Result<(), BoxError> {
+    async fn persist_subscription(&self, routing_id: &[u8; 32]) -> Result<(), BoxError> {
         let key = format!("{}{}", SUBSCRIPTION_PREFIX, hex::encode(routing_id));
-        let storage = Arc::clone(&self.storage);
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                storage
-                    .store(&key, b"1")
-                    .await
-                    .map_err(|e| -> BoxError { Box::new(e) })
-            })
-        })
+        self.storage
+            .store(&key, b"1")
+            .await
+            .map_err(|e| -> BoxError { Box::new(e) })
     }
 
-    fn remove_subscription(&self, routing_id: &[u8; 32]) -> Result<(), BoxError> {
+    async fn remove_subscription(&self, routing_id: &[u8; 32]) -> Result<(), BoxError> {
         let key = format!("{}{}", SUBSCRIPTION_PREFIX, hex::encode(routing_id));
-        let storage = Arc::clone(&self.storage);
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                storage
-                    .delete(&key)
-                    .await
-                    .map_err(|e| -> BoxError { Box::new(e) })
-            })
-        })
+        self.storage
+            .delete(&key)
+            .await
+            .map_err(|e| -> BoxError { Box::new(e) })
     }
 
-    fn load_subscribed_routing_ids(&self) -> Result<Vec<[u8; 32]>, BoxError> {
-        let storage = Arc::clone(&self.storage);
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                let keys = storage
-                    .list_keys(SUBSCRIPTION_PREFIX)
-                    .await
-                    .map_err(|e| -> BoxError { Box::new(e) })?;
+    async fn load_subscribed_routing_ids(&self) -> Result<Vec<[u8; 32]>, BoxError> {
+        let keys = self
+            .storage
+            .list_keys(SUBSCRIPTION_PREFIX)
+            .await
+            .map_err(|e| -> BoxError { Box::new(e) })?;
 
-                let mut routing_ids = Vec::with_capacity(keys.len());
-                for key in keys {
-                    let hex_part =
-                        key.strip_prefix(SUBSCRIPTION_PREFIX)
-                            .ok_or_else(|| -> BoxError {
-                                format!("unexpected key without prefix: {key}").into()
-                            })?;
-                    let bytes = hex::decode(hex_part).map_err(|e| -> BoxError { Box::new(e) })?;
-                    if bytes.len() != 32 {
-                        continue; // skip malformed entries
-                    }
-                    let mut routing_id = [0u8; 32];
-                    routing_id.copy_from_slice(&bytes);
-                    routing_ids.push(routing_id);
-                }
-                Ok(routing_ids)
-            })
-        })
+        let mut routing_ids = Vec::with_capacity(keys.len());
+        for key in keys {
+            let hex_part = key
+                .strip_prefix(SUBSCRIPTION_PREFIX)
+                .ok_or_else(|| -> BoxError {
+                    format!("unexpected key without prefix: {key}").into()
+                })?;
+            let bytes = hex::decode(hex_part).map_err(|e| -> BoxError { Box::new(e) })?;
+            if bytes.len() != 32 {
+                continue; // skip malformed entries
+            }
+            let mut routing_id = [0u8; 32];
+            routing_id.copy_from_slice(&bytes);
+            routing_ids.push(routing_id);
+        }
+        Ok(routing_ids)
     }
 
-    fn persist_rate_limit(
+    async fn persist_rate_limit(
         &self,
         ip: &str,
         tokens: f64,
@@ -206,18 +204,13 @@ impl<S: scp_platform::Storage + 'static> RelayPersistence for StorageRelayPersis
         let key = format!("{RATE_LIMIT_PREFIX}{ip}");
         let value = rmp_serde::to_vec(&(tokens, window_start_secs))
             .map_err(|e| -> BoxError { Box::new(e) })?;
-        let storage = Arc::clone(&self.storage);
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                storage
-                    .store(&key, &value)
-                    .await
-                    .map_err(|e| -> BoxError { Box::new(e) })
-            })
-        })
+        self.storage
+            .store(&key, &value)
+            .await
+            .map_err(|e| -> BoxError { Box::new(e) })
     }
 
-    fn load_rate_limit(&self, ip: &str) -> Result<Option<(f64, u64)>, BoxError> {
+    async fn load_rate_limit(&self, ip: &str) -> Result<Option<(f64, u64)>, BoxError> {
         // Validate IP to prevent key injection.
         let _: std::net::IpAddr = ip.parse().map_err(|e| -> BoxError {
             Box::new(std::io::Error::new(
@@ -226,40 +219,31 @@ impl<S: scp_platform::Storage + 'static> RelayPersistence for StorageRelayPersis
             ))
         })?;
         let key = format!("{RATE_LIMIT_PREFIX}{ip}");
-        let storage = Arc::clone(&self.storage);
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                let data = storage
-                    .retrieve(&key)
-                    .await
-                    .map_err(|e| -> BoxError { Box::new(e) })?;
-                match data {
-                    Some(bytes) => {
-                        let (tokens, window): (f64, u64) = rmp_serde::from_slice(&bytes)
-                            .map_err(|e| -> BoxError { Box::new(e) })?;
-                        Ok(Some((tokens, window)))
-                    }
-                    None => Ok(None),
-                }
-            })
-        })
+        let data = self
+            .storage
+            .retrieve(&key)
+            .await
+            .map_err(|e| -> BoxError { Box::new(e) })?;
+        match data {
+            Some(bytes) => {
+                let (tokens, window): (f64, u64) =
+                    rmp_serde::from_slice(&bytes).map_err(|e| -> BoxError { Box::new(e) })?;
+                Ok(Some((tokens, window)))
+            }
+            None => Ok(None),
+        }
     }
 
-    fn clear_all(&self) -> Result<(), BoxError> {
-        let storage = Arc::clone(&self.storage);
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                storage
-                    .delete_prefix(SUBSCRIPTION_PREFIX)
-                    .await
-                    .map_err(|e| -> BoxError { Box::new(e) })?;
-                storage
-                    .delete_prefix(RATE_LIMIT_PREFIX)
-                    .await
-                    .map_err(|e| -> BoxError { Box::new(e) })?;
-                Ok(())
-            })
-        })
+    async fn clear_all(&self) -> Result<(), BoxError> {
+        self.storage
+            .delete_prefix(SUBSCRIPTION_PREFIX)
+            .await
+            .map_err(|e| -> BoxError { Box::new(e) })?;
+        self.storage
+            .delete_prefix(RATE_LIMIT_PREFIX)
+            .await
+            .map_err(|e| -> BoxError { Box::new(e) })?;
+        Ok(())
     }
 }
 
@@ -293,8 +277,9 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
     impl RelayPersistence for MockRelayPersistence {
-        fn persist_subscription(&self, routing_id: &[u8; 32]) -> Result<(), BoxError> {
+        async fn persist_subscription(&self, routing_id: &[u8; 32]) -> Result<(), BoxError> {
             let mut subs = self.subscriptions.lock().unwrap();
             if !subs.contains(routing_id) {
                 subs.push(*routing_id);
@@ -302,17 +287,17 @@ mod tests {
             Ok(())
         }
 
-        fn remove_subscription(&self, routing_id: &[u8; 32]) -> Result<(), BoxError> {
+        async fn remove_subscription(&self, routing_id: &[u8; 32]) -> Result<(), BoxError> {
             let mut subs = self.subscriptions.lock().unwrap();
             subs.retain(|id| id != routing_id);
             Ok(())
         }
 
-        fn load_subscribed_routing_ids(&self) -> Result<Vec<[u8; 32]>, BoxError> {
+        async fn load_subscribed_routing_ids(&self) -> Result<Vec<[u8; 32]>, BoxError> {
             Ok(self.subscriptions.lock().unwrap().clone())
         }
 
-        fn persist_rate_limit(
+        async fn persist_rate_limit(
             &self,
             ip: &str,
             tokens: f64,
@@ -325,91 +310,100 @@ mod tests {
             Ok(())
         }
 
-        fn load_rate_limit(&self, ip: &str) -> Result<Option<(f64, u64)>, BoxError> {
+        async fn load_rate_limit(&self, ip: &str) -> Result<Option<(f64, u64)>, BoxError> {
             Ok(self.rate_limits.lock().unwrap().get(ip).copied())
         }
 
-        fn clear_all(&self) -> Result<(), BoxError> {
+        async fn clear_all(&self) -> Result<(), BoxError> {
             self.subscriptions.lock().unwrap().clear();
             self.rate_limits.lock().unwrap().clear();
             Ok(())
         }
     }
 
-    #[test]
-    fn subscription_roundtrip() {
+    #[tokio::test]
+    async fn subscription_roundtrip() {
         let persistence = MockRelayPersistence::new();
         let routing_id = [0xAA; 32];
 
-        persistence.persist_subscription(&routing_id).unwrap();
-        let loaded = persistence.load_subscribed_routing_ids().unwrap();
+        persistence.persist_subscription(&routing_id).await.unwrap();
+        let loaded = persistence.load_subscribed_routing_ids().await.unwrap();
         assert_eq!(loaded, vec![routing_id]);
     }
 
-    #[test]
-    fn subscription_remove() {
+    #[tokio::test]
+    async fn subscription_remove() {
         let persistence = MockRelayPersistence::new();
         let routing_id = [0xAA; 32];
 
-        persistence.persist_subscription(&routing_id).unwrap();
-        persistence.remove_subscription(&routing_id).unwrap();
-        let loaded = persistence.load_subscribed_routing_ids().unwrap();
+        persistence.persist_subscription(&routing_id).await.unwrap();
+        persistence.remove_subscription(&routing_id).await.unwrap();
+        let loaded = persistence.load_subscribed_routing_ids().await.unwrap();
         assert!(loaded.is_empty());
     }
 
-    #[test]
-    fn subscription_idempotent() {
+    #[tokio::test]
+    async fn subscription_idempotent() {
         let persistence = MockRelayPersistence::new();
         let routing_id = [0xAA; 32];
 
-        persistence.persist_subscription(&routing_id).unwrap();
-        persistence.persist_subscription(&routing_id).unwrap();
-        let loaded = persistence.load_subscribed_routing_ids().unwrap();
+        persistence.persist_subscription(&routing_id).await.unwrap();
+        persistence.persist_subscription(&routing_id).await.unwrap();
+        let loaded = persistence.load_subscribed_routing_ids().await.unwrap();
         assert_eq!(loaded.len(), 1);
     }
 
-    #[test]
-    fn rate_limit_roundtrip() {
+    #[tokio::test]
+    async fn rate_limit_roundtrip() {
         let persistence = MockRelayPersistence::new();
         persistence
             .persist_rate_limit("192.168.1.1", 50.0, 1_000_000)
+            .await
             .unwrap();
-        let loaded = persistence.load_rate_limit("192.168.1.1").unwrap();
+        let loaded = persistence.load_rate_limit("192.168.1.1").await.unwrap();
         assert_eq!(loaded, Some((50.0, 1_000_000)));
     }
 
-    #[test]
-    fn rate_limit_missing_returns_none() {
+    #[tokio::test]
+    async fn rate_limit_missing_returns_none() {
         let persistence = MockRelayPersistence::new();
-        let loaded = persistence.load_rate_limit("10.0.0.1").unwrap();
+        let loaded = persistence.load_rate_limit("10.0.0.1").await.unwrap();
         assert_eq!(loaded, None);
     }
 
-    #[test]
-    fn clear_all_removes_everything() {
+    #[tokio::test]
+    async fn clear_all_removes_everything() {
         let persistence = MockRelayPersistence::new();
-        persistence.persist_subscription(&[0xBB; 32]).unwrap();
+        persistence.persist_subscription(&[0xBB; 32]).await.unwrap();
         persistence
             .persist_rate_limit("1.2.3.4", 10.0, 500)
+            .await
             .unwrap();
 
-        persistence.clear_all().unwrap();
+        persistence.clear_all().await.unwrap();
 
         assert!(
             persistence
                 .load_subscribed_routing_ids()
+                .await
                 .unwrap()
                 .is_empty()
         );
-        assert!(persistence.load_rate_limit("1.2.3.4").unwrap().is_none());
+        assert!(
+            persistence
+                .load_rate_limit("1.2.3.4")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
-    #[test]
-    fn trait_is_dyn_compatible() {
+    #[tokio::test]
+    async fn trait_is_dyn_compatible() {
         // Verify RelayPersistence can be used as a trait object.
         let persistence: Arc<dyn RelayPersistence> = Arc::new(MockRelayPersistence::new());
-        persistence.persist_subscription(&[0xCC; 32]).unwrap();
-        let loaded = persistence.load_subscribed_routing_ids().unwrap();
+        persistence.persist_subscription(&[0xCC; 32]).await.unwrap();
+        let loaded = persistence.load_subscribed_routing_ids().await.unwrap();
         assert_eq!(loaded.len(), 1);
     }
 }

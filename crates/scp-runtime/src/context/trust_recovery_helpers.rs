@@ -55,7 +55,8 @@ use scp_protocol::context::governance::{
 use crate::context::actor::class_s::ClassSCell;
 use crate::context::actor::deps::ActorDeps;
 use crate::context::actor::state::PerContextState;
-use crate::context::state::{context_id_to_bytes, require_active};
+use crate::context::governance_helpers::{keep_broadcast_failure, try_broadcast_commit};
+use crate::context::state::{CommitOperation, context_id_to_bytes, require_active};
 
 // ---------------------------------------------------------------------------
 // 1. create_governance_checkpoint
@@ -192,6 +193,22 @@ pub fn add_checkpoint_cosignature(
 /// `deps.transport`; the epoch-advancement event is appended via
 /// `deps.event_log`.
 ///
+/// # Fail-closed broadcast (spec §9.12 / ADR-049 §9)
+///
+/// The epoch-advance Commit rides the SAME persistent retry queue as the other
+/// epoch-advancing commits: [`try_broadcast_commit`] +
+/// [`keep_broadcast_failure`]. On transport failure the `commit_fault`
+/// safety-gate marker and the `pending_commits` retry entry are persisted
+/// FAIL-CLOSED (a second `commit_class_s_keep`), and a second-persist failure
+/// aborts recovery with [`ContextError::PersistenceFailed`] — recovery is NOT
+/// acked unless the retry is durable. This replaces the former warn-and-drop,
+/// which could leave this node at epoch N+1 believing recovery succeeded while
+/// remaining members stayed at epoch N still using the compromised keys (silent
+/// post-compromise desync). Recovery re-entry itself does NOT read `commit_fault`
+/// (that gate trips on a full retry queue OR on retry exhaustion
+/// (`MAX_COMMIT_RETRIES`) in the retry drain, and only blocks
+/// send/lifecycle/governance), so the fail-close here cannot deadlock recovery.
+///
 /// # No relock / generation gate
 ///
 /// The legacy version dropped the per-context lock around the MLS
@@ -220,20 +237,27 @@ pub async fn recovery_advance_epoch(
     //    fails the bookkeeping counter is NOT incremented.
     let epoch_output = deps.crypto.advance_epoch(&context_id_bytes)?;
 
-    // 2b. Broadcast the MLS Commit to all members so they can advance
-    //     their group epoch and ratchet key material.
-    if !epoch_output.commit_bytes.is_empty() {
-        let routing_id = scp_protocol::context::context_routing_id(context_id);
-        if let Err(e) = deps
-            .transport
-            .send_message(&routing_id, &epoch_output.commit_bytes)
-        {
-            tracing::warn!(
-                context_id = %context_id,
-                error = %e,
-                "failed to broadcast recovery epoch advance MLS Commit"
-            );
-        }
+    // 2b. Broadcast the MLS Commit to all members so they advance their group
+    //     epoch and ratchet key material AWAY from the compromised keys. Broadcast
+    //     async (ADR-049 Decision 7); on FAILURE the retry-queue bookkeeping — the
+    //     `commit_fault` safety-gate marker and the `pending_commits` entry that is
+    //     the ONLY re-delivery of this Commit — is persisted FAIL-CLOSED via
+    //     `keep_broadcast_failure`. This is the highest-stakes safety-gated
+    //     broadcast in the system: a warn-and-drop here would leave the local node
+    //     at epoch N+1 believing recovery succeeded while remaining members stay at
+    //     epoch N still using the compromised keys — silent post-compromise desync
+    //     letting the excluded/compromised party retain read access (spec §9.12).
+    //     `try_broadcast_commit` no-ops on empty bytes (the cfg(test) no-crypto
+    //     pipeline), so no `is_empty` guard is needed here.
+    if let Some(failure) = try_broadcast_commit(
+        deps,
+        context_id,
+        epoch_output.commit_bytes,
+        &CommitOperation::RecoveryAdvanceEpoch,
+    )
+    .await
+    {
+        keep_broadcast_failure(cell, deps, context_id, failure).await?;
     }
 
     // 3. Re-validate after the crypto op to close the TOCTOU window
@@ -321,7 +345,7 @@ pub async fn recovery_advance_epoch(
 /// through `deps.crypto` (still supervisor-scoped during the migration
 /// window); transport delivery via `deps.transport`. Does NOT mutate
 /// `state`.
-pub fn recovery_send_notification(
+pub async fn recovery_send_notification(
     cell: &mut ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
@@ -369,7 +393,7 @@ pub fn recovery_send_notification(
     )?;
 
     // Send via transport using the domain-separated routing ID.
-    deps.transport.send_message(&routing_id, &encrypted)?;
+    deps.transport.send_message(&routing_id, &encrypted).await?;
 
     Ok(())
 }

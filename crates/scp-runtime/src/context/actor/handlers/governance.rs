@@ -903,7 +903,7 @@ struct CommitRetryOutcome {
 /// with no `&state` borrow held. The actor's `dispatch_state` arm owns
 /// the `&mut state` borrow exclusively for the command's lifetime so
 /// no other command can interleave between Phase A and Phase B.
-fn compute_commit_retry_outcomes(
+async fn compute_commit_retry_outcomes(
     snapshot: &[crate::context::state::PendingCommit],
     now: u64,
     transport: &dyn crate::context::builder::ContextTransportProvider,
@@ -927,7 +927,10 @@ fn compute_commit_retry_outcomes(
             });
             continue;
         }
-        match transport.send_message(&pending.routing_id, &pending.commit_bytes) {
+        match transport
+            .send_message(&pending.routing_id, &pending.commit_bytes)
+            .await
+        {
             Ok(()) => {
                 outcomes.push(CommitRetryOutcome {
                     index: idx,
@@ -1103,7 +1106,7 @@ async fn handle_process_pending_commits_actor(
     let now = deps.clock.now_secs();
     let context_id = cell.handle.context_id().to_owned();
 
-    let outcomes = compute_commit_retry_outcomes(&snapshot, now, deps.transport.as_ref());
+    let outcomes = compute_commit_retry_outcomes(&snapshot, now, deps.transport.as_ref()).await;
     if outcomes.is_empty() {
         let _ = reply.send(Ok(()));
         return Outcome::ok(());

@@ -989,7 +989,9 @@ pub async fn execute_revoke(
             deps,
             context_id,
             &context_id_bytes,
-        ) {
+        )
+        .await
+        {
             tracing::warn!(
                 context_id = %context_id,
                 error = %e,
@@ -1244,29 +1246,42 @@ pub async fn execute_add_member(
                 deps.event_tx.as_ref(),
             );
         }
-
-        // ROOT FIX (parity with `execute_remove_member` / `execute_reset_member`):
-        // broadcast the MLS Commit to the EXISTING members. An MLS Add advances
-        // the group epoch exactly like a Remove, so without this the add's
-        // Commit was only buffered into the (broadcast-suppressed)
-        // `WelcomeGenerated` event and NEVER reached the group — every existing
-        // member desynced from the admin after any add. Routed through the same
-        // persistent retry queue (`try_broadcast_commit_or_enqueue`) as the
-        // remove/reset commits. A no-op when `commit_for_broadcast` is empty
-        // (the `cfg(test)` no-crypto pipeline).
-        if !commit_for_broadcast.is_empty() {
-            try_broadcast_commit_or_enqueue(
-                view.commit_broadcast_borrows(),
-                deps,
-                context_id,
-                commit_for_broadcast,
-                &CommitOperation::AddMember {
-                    target_did: did.clone(),
-                },
-            );
-        }
     })
     .await;
+
+    // ROOT FIX (parity with `execute_remove_member` / `execute_reset_member`):
+    // broadcast the MLS Commit to the EXISTING members. An MLS Add advances the
+    // group epoch exactly like a Remove, so without this the add's Commit was only
+    // buffered into the (broadcast-suppressed) `WelcomeGenerated` event and NEVER
+    // reached the group — every existing member desynced from the admin after any
+    // add. Routed through the same persistent retry queue (`try_broadcast_commit`
+    // + `apply_broadcast_failure`) as the remove/reset commits. A no-op when
+    // `commit_for_broadcast` is empty (the `cfg(test)` no-crypto pipeline).
+    //
+    // Hoisted AFTER the best-effort persist above (ADR-049 Decision 7 — transport
+    // is async and cannot be awaited inside the sync closure). The broadcast is
+    // async; on failure the retry-queue bookkeeping is applied Class-C (coalesced
+    // — picked up by the actor's persist tick), which is this add's correct class
+    // (member-add is not a downward-authorization transition — parity with the
+    // pre-async `commit_class_c_best_effort` shape).
+    if !commit_for_broadcast.is_empty()
+        && let Some(failure) = try_broadcast_commit(
+            deps,
+            context_id,
+            commit_for_broadcast,
+            &CommitOperation::AddMember {
+                target_did: did.clone(),
+            },
+        )
+        .await
+    {
+        apply_broadcast_failure(
+            cell.class_c_view().commit_broadcast_borrows(),
+            deps,
+            context_id,
+            failure,
+        );
+    }
 
     // Subject-bearing leaf (ADR-011 amendment): carry the *affected member*
     // (`did`) in the payload, not just `actor_did` (which on this admin-driven
@@ -1318,7 +1333,7 @@ pub async fn execute_remove_member(
     // where the fail-close `commit_fault` marker is set but NOT persisted before
     // the early return). All structural mutations + emit + broadcast + sender-
     // key drain ride the SAME fail-closed persist via `view.rest_mut()`.
-    let removed_role_name = cell
+    let (removed_role_name, remove_commit_bytes) = cell
         .commit_class_s_keep(deps, context_id, |mut view| {
             let state = view.rest_mut();
 
@@ -1353,7 +1368,7 @@ pub async fn execute_remove_member(
                     "remove_member_sender_key",
                     &e.to_string(),
                 )
-                .map(|()| String::new());
+                .map(|()| (String::new(), None));
             }
 
             if let Err(e) = deps.crypto.rotate_sender_key(&context_id_bytes) {
@@ -1365,7 +1380,7 @@ pub async fn execute_remove_member(
                     "rotate_sender_key",
                     &e.to_string(),
                 )
-                .map(|()| String::new());
+                .map(|()| (String::new(), None));
             }
 
             state.membership.remove_member(did);
@@ -1403,35 +1418,56 @@ pub async fn execute_remove_member(
                 deps,
             );
 
-            try_broadcast_commit_or_enqueue(
-                CommitBroadcastBorrows {
-                    pending_commits: &mut state.pending_commits,
-                    commit_fault: &mut state.commit_fault,
-                    receive_buffer: &mut state.receive_buffer,
-                },
-                deps,
-                context_id,
-                remove_output.commit_bytes,
-                &CommitOperation::RemoveMember {
-                    target_did: did.clone(),
-                },
-            );
-
-            // Phase 2A.9: drain_and_deliver_sender_keys is now actor-shape.
-            if let Err(e) = crate::context::lifecycle_helpers::drain_and_deliver_sender_keys(
-                deps,
-                context_id,
-                &context_id_bytes,
-            ) {
-                tracing::warn!(
-                    context_id = %context_id,
-                    error = %e,
-                    "failed to deliver rotated sender keys after member removal"
-                );
-            }
-            Ok(removed_role_name)
+            // Capture the removal Commit bytes; the ASYNC broadcast + sender-key
+            // delivery run AFTER the fail-closed persist, outside this sync
+            // `_keep` closure (ADR-049 Decision 7 — transport is async). `None`
+            // on the fail-close paths above, which skip the broadcast/drain
+            // exactly as the pre-hoist early returns did.
+            Ok((removed_role_name, Some(remove_output.commit_bytes)))
         })
         .await?;
+
+    // Async transport ops AFTER the Class-S removal persist (ADR-049 Decision 7:
+    // `ContextTransportProvider` is async and cannot be awaited inside the sync
+    // `_keep` closure above). The membership removal is already
+    // fail-closed-persisted; the sender-key delivery is best-effort.
+    // `remove_commit_bytes` is `Some` only on the success path (the fail-close
+    // paths return `None` and skip both, matching pre-hoist ordering); it is the
+    // removal Commit already produced under the crypto `Arc` (Class-M) inside the
+    // closure.
+    if let Some(remove_commit_bytes) = remove_commit_bytes {
+        // Broadcast async (Decision 7); on FAILURE the retry-queue bookkeeping is
+        // persisted FAIL-CLOSED via `keep_broadcast_failure` (removal Commit is a
+        // safety-gated site — see that helper's doc for why the second persist).
+        if let Some(failure) = try_broadcast_commit(
+            deps,
+            context_id,
+            remove_commit_bytes,
+            &CommitOperation::RemoveMember {
+                target_did: did.clone(),
+            },
+        )
+        .await
+        {
+            keep_broadcast_failure(cell, deps, context_id, failure).await?;
+        }
+
+        // Phase 2A.9: drain_and_deliver_sender_keys is now actor-shape.
+        if let Err(e) = crate::context::lifecycle_helpers::drain_and_deliver_sender_keys(
+            deps,
+            context_id,
+            &context_id_bytes,
+        )
+        .await
+        {
+            tracing::warn!(
+                context_id = %context_id,
+                error = %e,
+                "failed to deliver rotated sender keys after member removal"
+            );
+        }
+    }
+
     // Subject-bearing leaf (ADR-011 amendment): carry the *affected member*
     // (`did`) and the role it held at departure, not just `actor_did` (the
     // executing admin). Participation `participation_duration_secs` (§7.3.2)
@@ -2432,8 +2468,26 @@ pub async fn execute_reset_member(
         .add_member(&context_id_bytes, did, None)
         .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
 
-    try_broadcast_commit_or_enqueue(
-        view.commit_broadcast_borrows(),
+    // Member reset operates on a coalesced `ClassCMut` view (best-effort). The
+    // broadcasts are async; on failure the retry-queue bookkeeping is applied
+    // through the same coalesced view (`view.commit_broadcast_borrows()`), so a
+    // crash before the ≤50 ms persist tick can drop the `commit_fault`/retry
+    // bookkeeping. RESIDUAL of coalescing here (be honest): a lost reset Commit
+    // leaves remaining members on an epoch where the reset member's OLD
+    // (rotated-out, possibly compromised) keys still decrypt until the Commit is
+    // re-delivered — the same desync class the safety-gated sites fail-close
+    // against. Coalesced is nonetheless the correct/defensible class for reset,
+    // for three reasons: (1) reset is a same-member key REFRESH — the member is
+    // removed and IMMEDIATELY re-added in the same operation and remains
+    // authorized throughout, so it is net-neutral versus a true `RemoveMember`
+    // (no authority is being withdrawn from anyone); (2) §9 classifies the
+    // membership effect as Class-M, not a downward-authorization Class-S
+    // transition, so it carries no §9 fail-closed obligation; and (3) it matches
+    // the pre-async coalesced `ClassCMut` shape exactly — coalescing here is
+    // parity, NOT a regression introduced by the async-transport hoist. (The
+    // fail-closed sites — remove/rotate/leave/recovery — genuinely withdraw
+    // authority or re-key away from a compromised party, which reset does not.)
+    if let Some(failure) = try_broadcast_commit(
         deps,
         context_id,
         remove_output.commit_bytes,
@@ -2441,9 +2495,12 @@ pub async fn execute_reset_member(
             target_did: did.clone(),
             is_remove: true,
         },
-    );
-    try_broadcast_commit_or_enqueue(
-        view.commit_broadcast_borrows(),
+    )
+    .await
+    {
+        apply_broadcast_failure(view.commit_broadcast_borrows(), deps, context_id, failure);
+    }
+    if let Some(failure) = try_broadcast_commit(
         deps,
         context_id,
         add_output.commit_bytes,
@@ -2451,7 +2508,11 @@ pub async fn execute_reset_member(
             target_did: did.clone(),
             is_remove: false,
         },
-    );
+    )
+    .await
+    {
+        apply_broadcast_failure(view.commit_broadcast_borrows(), deps, context_id, failure);
+    }
 
     if let Err(e) = deps
         .crypto
@@ -2478,7 +2539,9 @@ pub async fn execute_reset_member(
         deps,
         context_id,
         &context_id_bytes,
-    ) {
+    )
+    .await
+    {
         tracing::warn!(
             context_id = %context_id,
             error = %e,
@@ -2722,75 +2785,88 @@ pub async fn execute_rotate_content_keys(
     // through `commit_class_s_keep` so it persists fail-closed (keep-direction:
     // on persist failure the rotation STAYS — reverting to the pre-rotation key
     // state after the rotation was acknowledged is the unsafe direction). The
-    // crypto/access-key mutations + emit + broadcast enqueue (Class-C) ride the
-    // SAME fail-closed persist via `view.rest_mut()`. Broadcast per-author key
-    // epochs now ride the Class-S `ContextSnapshot`, so the all-author key-epoch
-    // advance persists fail-closed atomically inside the combinator — the prior
-    // trailing best-effort `persist_broadcast_snapshot` is gone (§5.14.8).
-    cell.commit_class_s_keep(deps, context_id, |mut view| {
-        let state = view.rest_mut();
-        require_active(&state.handle)?;
+    // crypto/access-key mutations + emit ride the fail-closed persist via
+    // `view.rest_mut()`. The MLS-Commit broadcast ENQUEUE (Class-C) is hoisted to
+    // AFTER the persist (ADR-049 Decision 7 — transport is async and cannot be
+    // awaited inside the sync closure); it is coalesced, not fail-closed, which is
+    // its correct class. Broadcast per-author key epochs still ride the Class-S
+    // `ContextSnapshot`, so the all-author key-epoch advance persists fail-closed
+    // atomically inside the combinator — the prior trailing best-effort
+    // `persist_broadcast_snapshot` is gone (§5.14.8).
+    let rotate_commit_bytes = cell
+        .commit_class_s_keep(deps, context_id, |mut view| {
+            let state = view.rest_mut();
+            require_active(&state.handle)?;
 
-        let epoch_output = if let Some(ref mut bc) = state.broadcast_context {
-            bc.rotate_all_author_keys()?;
-            None
-        } else {
-            let epoch_out = deps.crypto.advance_epoch(&context_id_bytes)?;
+            let epoch_output = if let Some(ref mut bc) = state.broadcast_context {
+                bc.rotate_all_author_keys()?;
+                None
+            } else {
+                let epoch_out = deps.crypto.advance_epoch(&context_id_bytes)?;
 
-            let member_dids: Vec<String> = state
-                .membership
-                .member_dids()
-                .map(|d| d.0.clone())
-                .collect();
-            let current_epoch = state
-                .access
-                .access_key_store
-                .get_all(context_id)
-                .values()
-                .map(scp_protocol::crypto::access_keys::AccessKey::epoch)
-                .max()
-                .unwrap_or(0);
-            let did_refs: Vec<&str> = member_dids.iter().map(String::as_str).collect();
-            let rotation = crate::crypto::access_keys::lifecycle::rotate_all_access_keys(
-                context_id,
-                &did_refs,
-                current_epoch,
-            )
-            .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
-            for new_key in rotation.new_keys {
-                let did = new_key.member_did().to_owned();
-                state.access.access_key_store.set(context_id, &did, new_key);
-            }
-            Some(epoch_out)
-        };
+                let member_dids: Vec<String> = state
+                    .membership
+                    .member_dids()
+                    .map(|d| d.0.clone())
+                    .collect();
+                let current_epoch = state
+                    .access
+                    .access_key_store
+                    .get_all(context_id)
+                    .values()
+                    .map(scp_protocol::crypto::access_keys::AccessKey::epoch)
+                    .max()
+                    .unwrap_or(0);
+                let did_refs: Vec<&str> = member_dids.iter().map(String::as_str).collect();
+                let rotation = crate::crypto::access_keys::lifecycle::rotate_all_access_keys(
+                    context_id,
+                    &did_refs,
+                    current_epoch,
+                )
+                .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+                for new_key in rotation.new_keys {
+                    let did = new_key.member_did().to_owned();
+                    state.access.access_key_store.set(context_id, &did, new_key);
+                }
+                Some(epoch_out)
+            };
 
-        emit(
-            state,
-            ContextEvent::ContentKeysRotated {
-                reason: reason.map(String::from),
-            },
-            context_id,
-            deps,
-        );
-
-        if let Some(epoch_out) = epoch_output {
-            try_broadcast_commit_or_enqueue(
-                CommitBroadcastBorrows {
-                    pending_commits: &mut state.pending_commits,
-                    commit_fault: &mut state.commit_fault,
-                    receive_buffer: &mut state.receive_buffer,
-                },
-                deps,
-                context_id,
-                epoch_out.commit_bytes,
-                &CommitOperation::RotateContentKeys {
+            emit(
+                state,
+                ContextEvent::ContentKeysRotated {
                     reason: reason.map(String::from),
                 },
+                context_id,
+                deps,
             );
-        }
-        Ok(())
-    })
-    .await?;
+
+            // Capture the epoch-advance Commit bytes (non-broadcast path); the ASYNC
+            // Commit broadcast runs AFTER the fail-closed persist, outside this sync
+            // `_keep` closure (ADR-049 Decision 7 — transport is async). `None` on
+            // the broadcast path (no MLS Commit) or when no epoch advance occurred.
+            Ok(epoch_output.map(|epoch_out| epoch_out.commit_bytes))
+        })
+        .await?;
+
+    // Async transport op AFTER the Class-S rotation persist (ADR-049 Decision 7).
+    // The key rotation is fail-closed-persisted; the commit bytes were produced
+    // under the crypto `Arc` (Class-M) inside the closure. Broadcast async
+    // (Decision 7); on FAILURE the retry-queue bookkeeping is persisted
+    // FAIL-CLOSED via `keep_broadcast_failure` (epoch-advance is a safety-gated
+    // site — see that helper's doc for why the second persist).
+    if let Some(commit_bytes) = rotate_commit_bytes
+        && let Some(failure) = try_broadcast_commit(
+            deps,
+            context_id,
+            commit_bytes,
+            &CommitOperation::RotateContentKeys {
+                reason: reason.map(String::from),
+            },
+        )
+        .await
+    {
+        keep_broadcast_failure(cell, deps, context_id, failure).await?;
+    }
 
     deps.event_log
         .append_context_event(
@@ -3439,7 +3515,7 @@ pub async fn execute_cancel_context_migration(
 }
 
 // ---------------------------------------------------------------------------
-// try_broadcast_commit_or_enqueue (transitive helper, actor-shape)
+// try_broadcast_commit / apply_broadcast_failure (transitive helpers, actor-shape)
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
@@ -5287,20 +5363,22 @@ pub async fn execute_governance_action(
 }
 
 // ---------------------------------------------------------------------------
-// try_broadcast_commit_or_enqueue (transitive helper, actor-shape)
+// try_broadcast_commit / apply_broadcast_failure (transitive helpers, actor-shape)
 // ---------------------------------------------------------------------------
 
-/// The three disjoint Class-C `&mut` fields
-/// [`try_broadcast_commit_or_enqueue`] mutates, threaded as ONE struct so the
-/// caller holds all three at once (they are distinct fields of
-/// [`PerContextState`], so the borrow checker accepts the simultaneous `&mut`).
+/// The three disjoint Class-C `&mut` fields [`apply_broadcast_failure`] mutates,
+/// threaded as ONE struct so the caller holds all three at once (they are
+/// distinct fields of [`PerContextState`], so the borrow checker accepts the
+/// simultaneous `&mut`).
 ///
-/// Replaces the prior whole `&mut PerContextState` parameter: the broadcast
-/// helper touches ONLY the MLS Commit retry queue (`pending_commits`), the
+/// Replaces the prior whole `&mut PerContextState` parameter: the broadcast-
+/// failure apply touches ONLY the MLS Commit retry queue (`pending_commits`), the
 /// queue-full fail-close marker (`commit_fault`), and the local receive buffer
-/// (`receive_buffer`). All three are Class-C / structural / best-effort (no
-/// fail-closed persist; see the function's doc), so the field-granular borrow is
-/// sound — there is no whole-state `&mut` and no reach to any Class-S sub-struct.
+/// (`receive_buffer`). The borrow is field-granular and reaches no Class-S
+/// sub-struct; the DURABILITY class is the caller's choice — the safety-gated
+/// sites supply these from a `commit_class_s_keep` `rest_mut()` view (fail-closed
+/// persist of `pending_commits`/`commit_fault`), the best-effort sites from a
+/// coalesced `ClassCMut` view (see [`apply_broadcast_failure`]).
 pub struct CommitBroadcastBorrows<'a> {
     /// `&mut` to the MLS Commit retry queue (Class-C / §9.9.3).
     pub pending_commits: &'a mut std::collections::VecDeque<PendingCommit>,
@@ -5310,8 +5388,40 @@ pub struct CommitBroadcastBorrows<'a> {
     pub receive_buffer: &'a mut ReceiveBuffer,
 }
 
-/// Attempts to broadcast an MLS Commit and, on transport failure,
-/// enqueues the commit in the persistent retry queue (PR #1606 C6).
+/// The retry-queue bookkeeping an MLS-Commit broadcast requires when its
+/// transport send FAILS, returned by [`try_broadcast_commit`] so the CALLER
+/// applies it (via [`apply_broadcast_failure`]) in the correct durability class.
+///
+/// Splitting the failure bookkeeping OUT of the async transport send is what
+/// lets the safety-gated Class-S sites — `execute_remove_member`,
+/// `execute_rotate_content_keys` (this module) and `leave_context`
+/// (`lifecycle_helpers`) — persist the `commit_fault` marker + `pending_commits`
+/// enqueue FAIL-CLOSED even though the broadcast itself, being async under
+/// ADR-049 Decision 7, cannot run inside their synchronous `commit_class_s_keep`
+/// closure. The best-effort sites (`execute_add_member`, `execute_reset_member`)
+/// apply the identical value coalesced through a `ClassCMut` view.
+///
+/// Why fail-closed matters here: `commit_fault` is a SAFETY GATE
+/// ([`check_commit_fault`] blocks send/lifecycle/governance) and the
+/// `pending_commits` entry is the ONLY re-delivery of the epoch-advancing
+/// Commit. If a crash lands between a broadcast failure and the ≤50 ms coalesced
+/// persist tick, a coalesced-only write loses BOTH — the context respawns
+/// "healthy" while members are stuck on a stale MLS epoch with no retry queued:
+/// silent, permanent group desync (ADR-049 §9 / §9.9.3).
+pub struct BroadcastFailure {
+    /// The retry record to enqueue (or, when the queue is full at apply time,
+    /// the source of the fail-close [`CommitFaultMarker`]).
+    pending: PendingCommit,
+    /// Operation label for the surfaced local `ContextEvent`.
+    label: String,
+    /// Transport error string for the surfaced local `ContextEvent`.
+    error: String,
+}
+
+/// Attempts to broadcast an MLS Commit. Returns `None` on success (or an empty
+/// commit — the `cfg(test)` no-crypto pipeline); on transport failure returns
+/// `Some(BroadcastFailure)` describing the retry-queue bookkeeping the caller
+/// must persist via [`apply_broadcast_failure`].
 ///
 /// Per the phase-2.md ADR-011-amendment exclusion taxonomy (per-committer
 /// broadcast-retry bookkeeping), the commit-broadcast lifecycle events
@@ -5321,42 +5431,33 @@ pub struct CommitBroadcastBorrows<'a> {
 /// surfaced as local `ContextEvent`s only (first-attempt success is not
 /// surfaced); no durable consumer reads them.
 ///
-/// Infallible: a transport-send failure is absorbed into the persistent
-/// retry queue (or a `commit_fault` marker when the queue is full) rather
-/// than propagated. Dropping the durable commit-lifecycle appends removed the
-/// function's only `Result`-returning path.
+/// # No state mutation (ADR-049 §9 / Decision 7)
 ///
-/// # Field-granular borrows (ADR-049 §9)
-///
-/// Takes a [`CommitBroadcastBorrows`] — the THREE disjoint Class-C `&mut`
-/// fields it actually touches (`pending_commits`, `commit_fault`,
-/// `receive_buffer`) — rather than a whole `&mut PerContextState`. A cell holder
-/// supplies them from a non-persisting [`crate::context::actor::class_s::ClassCMut`]
-/// view (`view.commit_broadcast_borrows()`); a bare-`&mut state` caller supplies
-/// them by disjoint field borrow. All three fields are Class-C / structural and
-/// best-effort: the enqueue is a retry-queue bookkeeping insert, the
-/// `commit_fault` marker is the queue-full fail-close surfaced LOCALLY only
-/// (never a durable Merkle leaf — see the §9.9.3 note above), and the
-/// `receive_buffer` emit is a local `ContextEvent`. None requires a fail-closed
-/// persist, so the field-granular best-effort shape is sound.
-pub fn try_broadcast_commit_or_enqueue(
-    borrows: CommitBroadcastBorrows<'_>,
+/// This function performs ONLY the async transport send and builds the retry
+/// payload; it touches NO `PerContextState` field. Applying that payload —
+/// enqueue into `pending_commits`, set the `commit_fault` marker, emit the local
+/// event — is deferred to the synchronous [`apply_broadcast_failure`] so the
+/// CALLER picks the durability class (fail-closed at the safety-gated Class-S
+/// sites, coalesced at the best-effort sites). This is the decoupling that
+/// restores fail-closed durability of the `commit_fault` safety gate after the
+/// transport became async and the broadcast could no longer live inside the
+/// sync `commit_class_s_keep` closure.
+pub async fn try_broadcast_commit(
     deps: &ActorDeps,
     context_id: &str,
     commit_bytes: Vec<u8>,
     operation: &CommitOperation,
-) {
+) -> Option<BroadcastFailure> {
     if commit_bytes.is_empty() {
-        return;
+        return None;
     }
-    let CommitBroadcastBorrows {
-        pending_commits,
-        commit_fault,
-        receive_buffer,
-    } = borrows;
     let routing_id = scp_protocol::context::context_routing_id(context_id);
-    match deps.transport.send_message(&routing_id, &commit_bytes) {
-        Ok(()) => {}
+    match deps
+        .transport
+        .send_message(&routing_id, &commit_bytes)
+        .await
+    {
+        Ok(()) => None,
         Err(e) => {
             let now = deps.clock.now_secs();
             let error_str = e.to_string();
@@ -5370,48 +5471,132 @@ pub fn try_broadcast_commit_or_enqueue(
                 last_error: Some(error_str.clone()),
                 next_attempt_at: now.saturating_add(backoff),
             };
-            let label = operation.label();
-
-            // N2: Cap the pending commits queue.
-            if pending_commits.len() >= MAX_PENDING_COMMITS {
-                *commit_fault = Some(CommitFaultMarker {
-                    operation: operation.clone(),
-                    reason: format!("pending commit queue full ({MAX_PENDING_COMMITS} entries)"),
-                    retry_count: 1,
-                    failed_at: now,
-                });
-                emit_event_into(
-                    receive_buffer,
-                    ContextEvent::CommitBroadcastFailed {
-                        operation: label,
-                        reason: format!("queue full ({MAX_PENDING_COMMITS}): {error_str}"),
-                        attempts: 1,
-                    },
-                    context_id,
-                    deps.event_tx.as_ref(),
-                );
-                return;
-            }
-            pending_commits.push_back(pending);
-            let label_for_event = label.clone();
-            emit_event_into(
-                receive_buffer,
-                ContextEvent::CommitBroadcastPending {
-                    operation: label_for_event,
-                    error: error_str.clone(),
-                    attempt: 1,
-                },
-                context_id,
-                deps.event_tx.as_ref(),
-            );
-            tracing::warn!(
-                context_id = %context_id,
-                operation = %label,
-                error = %error_str,
-                "MLS commit broadcast failed; enqueued for persistent retry (PR #1606 C6)"
-            );
+            Some(BroadcastFailure {
+                pending,
+                label: operation.label(),
+                error: error_str,
+            })
         }
     }
+}
+
+/// Applies the retry-queue bookkeeping from a failed [`try_broadcast_commit`] to
+/// the three disjoint Class-C fields it touches (`pending_commits`,
+/// `commit_fault`, `receive_buffer`) and emits the surfaced local event.
+///
+/// SYNCHRONOUS by design: a caller runs it INSIDE a `commit_class_s_keep`
+/// closure (via `view.rest_mut()`) to persist the fields FAIL-CLOSED at the
+/// safety-gated sites, or against a coalesced `class_c_view()` / `ClassCMut` at
+/// the best-effort sites. The durability class is the CALLER's choice; this
+/// helper only mutates the borrowed fields.
+///
+/// # Field-granular borrows (ADR-049 §9)
+///
+/// Takes a [`CommitBroadcastBorrows`] — the THREE disjoint Class-C `&mut` fields
+/// rather than a whole `&mut PerContextState`.
+///
+/// Preserves the exact `MAX_PENDING_COMMITS` cap semantics: the length check
+/// runs HERE, holding the live `&mut pending_commits`, so a full queue converts
+/// the enqueue into a fail-close [`CommitFaultMarker`] instead — identical to the
+/// pre-async single-function behavior (§9.9.3).
+pub fn apply_broadcast_failure(
+    borrows: CommitBroadcastBorrows<'_>,
+    deps: &ActorDeps,
+    context_id: &str,
+    failure: BroadcastFailure,
+) {
+    let CommitBroadcastBorrows {
+        pending_commits,
+        commit_fault,
+        receive_buffer,
+    } = borrows;
+    let BroadcastFailure {
+        pending,
+        label,
+        error,
+    } = failure;
+
+    // N2: Cap the pending commits queue.
+    if pending_commits.len() >= MAX_PENDING_COMMITS {
+        *commit_fault = Some(CommitFaultMarker {
+            operation: pending.operation.clone(),
+            reason: format!("pending commit queue full ({MAX_PENDING_COMMITS} entries)"),
+            retry_count: 1,
+            failed_at: pending.first_attempt_at,
+        });
+        emit_event_into(
+            receive_buffer,
+            ContextEvent::CommitBroadcastFailed {
+                operation: label,
+                reason: format!("queue full ({MAX_PENDING_COMMITS}): {error}"),
+                attempts: 1,
+            },
+            context_id,
+            deps.event_tx.as_ref(),
+        );
+        return;
+    }
+    pending_commits.push_back(pending);
+    let label_for_event = label.clone();
+    emit_event_into(
+        receive_buffer,
+        ContextEvent::CommitBroadcastPending {
+            operation: label_for_event,
+            error: error.clone(),
+            attempt: 1,
+        },
+        context_id,
+        deps.event_tx.as_ref(),
+    );
+    tracing::warn!(
+        context_id = %context_id,
+        operation = %label,
+        error = %error,
+        "MLS commit broadcast failed; enqueued for persistent retry (PR #1606 C6)"
+    );
+}
+
+/// Applies a failed MLS-Commit broadcast's retry-queue bookkeeping FAIL-CLOSED,
+/// inside a second [`commit_class_s_keep`](crate::context::actor::class_s::ClassSCell::commit_class_s_keep)
+/// so it survives a crash before the actor's ≤50 ms coalesced persist tick.
+///
+/// The single call the safety-gated commit-broadcast sites —
+/// [`execute_remove_member`], [`execute_rotate_content_keys`] (this module),
+/// [`recovery_advance_epoch`](crate::context::trust_recovery_helpers::recovery_advance_epoch)
+/// (§9.12 post-compromise recovery), and
+/// [`leave_context`](crate::context::lifecycle_helpers::leave_context) —
+/// make after [`try_broadcast_commit`] returns `Some(BroadcastFailure)`.
+///
+/// # Why the second fail-closed persist (ADR-049 §9 / §9.9.3)
+///
+/// The transport became async under ADR-049 Decision 7, so the broadcast can no
+/// longer be awaited inside the primary `commit_class_s_keep` closure that
+/// fail-closed-persisted the underlying mutation; it now runs AFTER it. Its
+/// failure bookkeeping, however — the `commit_fault` safety-gate marker
+/// ([`check_commit_fault`] blocks send/lifecycle/governance) and the
+/// `pending_commits` entry that is the ONLY re-delivery of the epoch-advancing
+/// Commit — is synchronous ([`apply_broadcast_failure`]) and DOES ride a second
+/// `commit_class_s_keep`. If instead it were only coalesced (a plain `ClassCMut`
+/// write), a crash between the broadcast failure and the next persist tick would
+/// drop BOTH: the context respawns "healthy" while remaining members are stuck on
+/// a stale MLS epoch with no retry queued — silent, permanent group desync. The
+/// success path persists nothing (there is no `BroadcastFailure` to apply).
+///
+/// `pub` (not `pub(crate)`) is the private-module convention here —
+/// `clippy::redundant_pub_crate` forbids `pub(crate)` in this non-`pub` module;
+/// the helper is not FFI-exported (reconciled via the cross-layer PR-body marker,
+/// like the sibling async transport helpers).
+pub async fn keep_broadcast_failure(
+    cell: &mut crate::context::actor::class_s::ClassSCell,
+    deps: &ActorDeps,
+    context_id: &str,
+    failure: BroadcastFailure,
+) -> Result<(), ContextError> {
+    cell.commit_class_s_keep(deps, context_id, |mut view| {
+        apply_broadcast_failure(view.commit_broadcast_borrows(), deps, context_id, failure);
+        Ok(())
+    })
+    .await
 }
 
 // ===========================================================================
@@ -5763,4 +5948,654 @@ pub fn translate_timeout_events(
     }
 
     ctx_events
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    // Test-only capturing persistence: the `Mutex<Option<ContextSnapshot>>` is
+    // never held across `.await` (the write is a synchronous store inside the
+    // trait method), so a plain `std::sync::Mutex` is the right tool. The
+    // runtime's actor path bans it (ADR-049); test fixtures are exempt, mirroring
+    // the sibling `CapturingPersistence` in `lifecycle_helpers.rs`.
+    clippy::disallowed_types
+)]
+mod commit_broadcast_retry_tests {
+    //! ADR-049 Decision 7, PR-3: pins the retry-queue bookkeeping split out of
+    //! the (now async) MLS-Commit broadcast.
+    //!
+    //! [`try_broadcast_commit`] performs ONLY the async transport send and, on
+    //! failure, builds a [`BroadcastFailure`] payload (it touches no state); the
+    //! synchronous [`apply_broadcast_failure`] applies that payload to the three
+    //! disjoint Class-C fields, preserving the `MAX_PENDING_COMMITS` cap →
+    //! `commit_fault` fail-close conversion; [`keep_broadcast_failure`] rides a
+    //! second `commit_class_s_keep` so the safety-gated call sites persist the
+    //! marker + retry entry FAIL-CLOSED (§9 / §9.9.3).
+    //!
+    //! NOTE (coverage boundary): the full call sites
+    //! ([`execute_remove_member`], [`execute_rotate_content_keys`],
+    //! [`recovery_advance_epoch`], [`leave_context`]) cannot be driven end-to-end
+    //! here — under the `cfg(test)` no-crypto pipeline the MLS Commit serializes
+    //! to EMPTY bytes, so `try_broadcast_commit` short-circuits to `None` and
+    //! never reaches the fail-closed enqueue. These tests therefore exercise the
+    //! extracted helpers directly with a manufactured `BroadcastFailure` (the
+    //! payload a real failed broadcast produces) plus a real failing transport,
+    //! and drive `keep_broadcast_failure` against a real `ClassSCell` +
+    //! failing/succeeding persistence to pin the fail-closed durability.
+    //!
+    //! This is an ACCEPTED boundary, stated honestly: the surrounding
+    //! governance/remove/rotate/leave suites run under the SAME `cfg(test)`
+    //! no-crypto pipeline, so their Commits also serialize to empty bytes and
+    //! `try_broadcast_commit` short-circuits to `None` — they exercise only the
+    //! happy-path invocation of the broadcast helper, NOT the
+    //! failure→`keep_broadcast_failure` routing. Consequently the fail-closed
+    //! HELPER semantics (enqueue, cap→`commit_fault`, fail-closed persist) are
+    //! FULLY pinned by these unit tests, but each safety-gated SITE's CHOICE of
+    //! `keep_broadcast_failure` over the coalesced
+    //! `apply_broadcast_failure(class_c_view())` on the failure path is guarded
+    //! by CODE REVIEW — not structurally by a test — because the no-crypto
+    //! pipeline cannot manufacture the non-empty Commit those sites would need to
+    //! reach the failure branch.
+
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use scp_did::DID;
+    use scp_protocol::context::builder::ContextCreationError;
+    use scp_protocol::context::membership::{ContextEvent, ReceiveBuffer};
+    use scp_protocol::context::{ContextError, ContextParams};
+
+    use super::{
+        CommitBroadcastBorrows, apply_broadcast_failure, keep_broadcast_failure,
+        try_broadcast_commit,
+    };
+    use crate::context::actor::class_s::ClassSCell;
+    use crate::context::actor::deps::ActorDeps;
+    use crate::context::actor::state::PerContextState;
+    use crate::context::builder::{ContextEventLogProvider, ContextTransportProvider};
+    use crate::context::persistence::ContextPersistence;
+    use crate::context::state::{
+        CommitFaultMarker, CommitOperation, MAX_PENDING_COMMITS, PendingCommit,
+    };
+
+    const ADMIN: &str = "did:dht:z6MkAdminBroadcastRetry";
+    const TARGET: &str = "did:dht:z6MkTargetBroadcastRetry";
+    const CTX_BYTE: u8 = 0x7d;
+
+    /// 64-hex context id matching `[CTX_BYTE; 32]` (the form the code under test
+    /// hashes for the routing id and keys the persisted snapshot under).
+    fn ctx_hex() -> String {
+        hex::encode([CTX_BYTE; 32])
+    }
+
+    /// A transport that records every `send_message` call and either fails or
+    /// succeeds it, deterministically. `fail == true` mirrors an unreachable
+    /// relay (the case that produces a `BroadcastFailure`).
+    struct RecordingTransport {
+        sends: Arc<AtomicUsize>,
+        fail: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl ContextTransportProvider for RecordingTransport {
+        fn is_connected(&self) -> bool {
+            !self.fail
+        }
+        async fn publish_context(
+            &self,
+            _: &[u8; 32],
+            _: &ContextParams,
+        ) -> Result<(), ContextCreationError> {
+            Ok(())
+        }
+        async fn delete_published(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
+            Ok(())
+        }
+        async fn send_message(&self, _: &[u8; 32], _: &[u8]) -> Result<(), ContextError> {
+            self.sends.fetch_add(1, Ordering::SeqCst);
+            if self.fail {
+                Err(ContextError::TransportFailed("induced send failure".into()))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    /// Minimal event-log provider whose reads are empty (mirrors the sibling
+    /// `TestEventLog` fixtures).
+    struct TestEventLog;
+    #[async_trait::async_trait]
+    impl ContextEventLogProvider for TestEventLog {
+        async fn init_event_log(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
+            Ok(())
+        }
+        async fn append_event(
+            &self,
+            _: &[u8; 32],
+            _event_type: scp_event_log::EventType,
+            _actor_did: &str,
+            _payload: scp_event_log::EventPayload,
+            _timestamp_secs: u64,
+        ) -> Result<(), ContextCreationError> {
+            Ok(())
+        }
+        async fn destroy_event_log(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
+            Ok(())
+        }
+    }
+
+    /// Persistence whose every `persist_context` SUCCEEDS, counting calls and
+    /// capturing the LAST persisted snapshot — lets the fail-closed keep test
+    /// assert the marker was actually persisted before `keep_broadcast_failure`
+    /// returned `Ok`, and that the retry entry is IN the persisted snapshot (not
+    /// merely that a persist happened).
+    struct CountingOkPersistence {
+        persists: Arc<AtomicUsize>,
+        last_snapshot: Arc<Mutex<Option<crate::context::state::ContextSnapshot>>>,
+    }
+    #[async_trait::async_trait]
+    impl ContextPersistence for CountingOkPersistence {
+        async fn persist_context(
+            &self,
+            _: &str,
+            snapshot: &crate::context::state::ContextSnapshot,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            self.persists.fetch_add(1, Ordering::SeqCst);
+            *self.last_snapshot.lock().unwrap() = Some(snapshot.clone());
+            Ok(())
+        }
+        async fn load_context(
+            &self,
+            _: &str,
+        ) -> Result<
+            Option<crate::context::state::ContextSnapshot>,
+            Box<dyn std::error::Error + Send + Sync>,
+        > {
+            Ok(None)
+        }
+        async fn delete_context(
+            &self,
+            _: &str,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+        async fn list_persisted_contexts(
+            &self,
+        ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Persistence whose every `persist_context` FAILS — the fail-closed path.
+    struct FailPersistence;
+    #[async_trait::async_trait]
+    impl ContextPersistence for FailPersistence {
+        async fn persist_context(
+            &self,
+            _: &str,
+            _: &crate::context::state::ContextSnapshot,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Err("induced persist failure".into())
+        }
+        async fn load_context(
+            &self,
+            _: &str,
+        ) -> Result<
+            Option<crate::context::state::ContextSnapshot>,
+            Box<dyn std::error::Error + Send + Sync>,
+        > {
+            Ok(None)
+        }
+        async fn delete_context(
+            &self,
+            _: &str,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+        async fn list_persisted_contexts(
+            &self,
+        ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Assemble an `ActorDeps` wired with the supplied transport and persistence
+    /// (and the minimal in-memory event log + MLS storage), mirroring the
+    /// `class_s`/`governance` fail-closed test fixtures.
+    async fn build_deps(
+        transport: Box<dyn ContextTransportProvider>,
+        persistence: Box<dyn ContextPersistence>,
+    ) -> ActorDeps {
+        use crate::context::supervisor::supervisor::Supervisor;
+        use scp_platform::testing::InMemoryStorage;
+
+        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+            ADMIN.to_owned(),
+            Arc::new(scp_clock::SystemClock),
+        ));
+        let event_log: Box<dyn ContextEventLogProvider> = Box::new(TestEventLog);
+        let key_resolver: scp_protocol::context::governance::KeyResolver = Arc::new(|_, _| None);
+        let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
+            Arc::new(
+                crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
+                    InMemoryStorage::new(),
+                )),
+            );
+        let clock: Arc<dyn scp_clock::Clock> = Arc::new(scp_clock::TestClock::new(1_700_000_000));
+        let supervisor = Supervisor::with_providers(
+            crypto,
+            transport,
+            event_log,
+            key_resolver,
+            Some(persistence),
+            None,
+            None,
+            Some(clock),
+            mls_storage,
+        );
+        supervisor
+            .build_actor_deps(&DID(ADMIN.to_owned()))
+            .await
+            .expect("build_actor_deps")
+    }
+
+    /// A fresh encrypted test state with an empty pending-commit queue.
+    fn fresh_state() -> PerContextState {
+        PerContextState::new_for_test_encrypted(
+            [CTX_BYTE; 32],
+            1_700_000_000,
+            DID(ADMIN.to_owned()),
+        )
+    }
+
+    fn remove_op() -> CommitOperation {
+        CommitOperation::RemoveMember {
+            target_did: DID(TARGET.to_owned()),
+        }
+    }
+
+    /// Produce a real `BroadcastFailure` by driving `try_broadcast_commit`
+    /// against a failing transport — the exact payload a failed broadcast hands
+    /// the caller to apply.
+    async fn make_failure(deps: &ActorDeps, op: &CommitOperation) -> super::BroadcastFailure {
+        try_broadcast_commit(deps, &ctx_hex(), b"commit-bytes".to_vec(), op)
+            .await
+            .expect("failing transport yields Some(BroadcastFailure)")
+    }
+
+    // -- Test 1: normal enqueue -------------------------------------------
+
+    /// At normal capacity `apply_broadcast_failure` pushes exactly one retry
+    /// entry, leaves `commit_fault` clear, and surfaces the local
+    /// `CommitBroadcastPending` event.
+    #[tokio::test]
+    async fn apply_broadcast_failure_enqueues_at_normal_capacity() {
+        let deps = build_deps(
+            Box::new(RecordingTransport {
+                sends: Arc::new(AtomicUsize::new(0)),
+                fail: true,
+            }),
+            Box::new(FailPersistence),
+        )
+        .await;
+        let op = remove_op();
+        let failure = make_failure(&deps, &op).await;
+
+        let mut pending: VecDeque<PendingCommit> = VecDeque::new();
+        let mut commit_fault: Option<CommitFaultMarker> = None;
+        let mut receive_buffer = ReceiveBuffer::new();
+
+        apply_broadcast_failure(
+            CommitBroadcastBorrows {
+                pending_commits: &mut pending,
+                commit_fault: &mut commit_fault,
+                receive_buffer: &mut receive_buffer,
+            },
+            &deps,
+            &ctx_hex(),
+            failure,
+        );
+
+        assert_eq!(pending.len(), 1, "exactly one retry entry enqueued");
+        assert_eq!(
+            pending[0].operation, op,
+            "the enqueued entry carries the source operation"
+        );
+        assert_eq!(pending[0].retry_count, 1, "first failure ⇒ retry_count 1");
+        assert!(
+            commit_fault.is_none(),
+            "commit_fault stays clear below the queue cap"
+        );
+        assert!(
+            receive_buffer
+                .drain()
+                .iter()
+                .any(|e| matches!(e, ContextEvent::CommitBroadcastPending { .. })),
+            "a local CommitBroadcastPending event is surfaced"
+        );
+    }
+
+    // -- Test 2: queue-full → commit_fault --------------------------------
+
+    /// A full queue converts the enqueue into a fail-close `CommitFaultMarker`
+    /// (queue-full reason) WITHOUT growing the queue — pins the cap logic that
+    /// moved into `apply_broadcast_failure`.
+    #[tokio::test]
+    async fn apply_broadcast_failure_full_queue_sets_commit_fault() {
+        let deps = build_deps(
+            Box::new(RecordingTransport {
+                sends: Arc::new(AtomicUsize::new(0)),
+                fail: true,
+            }),
+            Box::new(FailPersistence),
+        )
+        .await;
+        let failure = make_failure(&deps, &remove_op()).await;
+
+        // Pre-fill the queue to exactly the cap. The fillers carry a DIFFERENT
+        // operation variant (`RotateContentKeys`) than the injected failure
+        // (`RemoveMember`), so the `commit_fault` marker's `operation` assertion
+        // below actually proves provenance — that the marker carries the DROPPED
+        // operation, not a filler.
+        let filler = PendingCommit {
+            commit_bytes: vec![0x01, 0x02, 0x03],
+            routing_id: [0u8; 32],
+            operation: CommitOperation::RotateContentKeys { reason: None },
+            first_attempt_at: 1_700_000_000,
+            retry_count: 1,
+            last_error: None,
+            next_attempt_at: 1_700_000_001,
+        };
+        let mut pending: VecDeque<PendingCommit> = VecDeque::new();
+        for _ in 0..MAX_PENDING_COMMITS {
+            pending.push_back(filler.clone());
+        }
+        assert_eq!(
+            pending.len(),
+            MAX_PENDING_COMMITS,
+            "queue seeded at the cap"
+        );
+
+        let mut commit_fault: Option<CommitFaultMarker> = None;
+        let mut receive_buffer = ReceiveBuffer::new();
+
+        apply_broadcast_failure(
+            CommitBroadcastBorrows {
+                pending_commits: &mut pending,
+                commit_fault: &mut commit_fault,
+                receive_buffer: &mut receive_buffer,
+            },
+            &deps,
+            &ctx_hex(),
+            failure,
+        );
+
+        assert_eq!(
+            pending.len(),
+            MAX_PENDING_COMMITS,
+            "a full queue must NOT grow past the cap"
+        );
+        let marker = commit_fault.expect("a full queue converts the enqueue to a commit_fault");
+        assert!(
+            marker.reason.contains("queue full"),
+            "the fault records the queue-full reason; got {:?}",
+            marker.reason
+        );
+        assert_eq!(
+            marker.operation,
+            remove_op(),
+            "the fault carries the DROPPED operation (RemoveMember), not a filler \
+             (RotateContentKeys) — proving marker provenance"
+        );
+        assert!(
+            receive_buffer
+                .drain()
+                .iter()
+                .any(|e| matches!(e, ContextEvent::CommitBroadcastFailed { .. })),
+            "a local CommitBroadcastFailed event is surfaced on queue-full"
+        );
+    }
+
+    // -- Test 3: try_broadcast_commit outcomes ----------------------------
+
+    /// A transport-send error yields `Some(BroadcastFailure)` whose label
+    /// matches the operation, after exactly one send attempt.
+    #[tokio::test]
+    async fn try_broadcast_commit_returns_failure_on_transport_error() {
+        let sends = Arc::new(AtomicUsize::new(0));
+        let deps = build_deps(
+            Box::new(RecordingTransport {
+                sends: Arc::clone(&sends),
+                fail: true,
+            }),
+            Box::new(FailPersistence),
+        )
+        .await;
+        let op = CommitOperation::RotateContentKeys { reason: None };
+
+        let failure = try_broadcast_commit(&deps, &ctx_hex(), b"bytes".to_vec(), &op)
+            .await
+            .expect("transport error yields Some(BroadcastFailure)");
+
+        assert_eq!(
+            failure.label,
+            op.label(),
+            "the surfaced label matches operation.label()"
+        );
+        assert_eq!(
+            failure.pending.operation, op,
+            "the retry payload carries the source operation"
+        );
+        assert_eq!(
+            sends.load(Ordering::SeqCst),
+            1,
+            "exactly one send attempted"
+        );
+    }
+
+    /// A successful send yields `None` after exactly one send attempt.
+    #[tokio::test]
+    async fn try_broadcast_commit_returns_none_on_success() {
+        let sends = Arc::new(AtomicUsize::new(0));
+        let deps = build_deps(
+            Box::new(RecordingTransport {
+                sends: Arc::clone(&sends),
+                fail: false,
+            }),
+            Box::new(FailPersistence),
+        )
+        .await;
+
+        let out = try_broadcast_commit(
+            &deps,
+            &ctx_hex(),
+            b"bytes".to_vec(),
+            &CommitOperation::RecoveryAdvanceEpoch,
+        )
+        .await;
+
+        assert!(out.is_none(), "a successful broadcast yields None");
+        assert_eq!(
+            sends.load(Ordering::SeqCst),
+            1,
+            "exactly one send attempted"
+        );
+    }
+
+    /// Empty commit bytes short-circuit to `None` WITHOUT attempting any send
+    /// (the `cfg(test)` no-crypto pipeline).
+    #[tokio::test]
+    async fn try_broadcast_commit_skips_empty_bytes_without_sending() {
+        let sends = Arc::new(AtomicUsize::new(0));
+        let deps = build_deps(
+            Box::new(RecordingTransport {
+                sends: Arc::clone(&sends),
+                fail: true,
+            }),
+            Box::new(FailPersistence),
+        )
+        .await;
+
+        let out = try_broadcast_commit(&deps, &ctx_hex(), Vec::new(), &remove_op()).await;
+
+        assert!(out.is_none(), "empty commit bytes is a no-op");
+        assert_eq!(
+            sends.load(Ordering::SeqCst),
+            0,
+            "no send is attempted for empty commit bytes"
+        );
+    }
+
+    // -- Test 4: keep_broadcast_failure fail-closed durability ------------
+
+    /// `keep_broadcast_failure` persists the retry entry FAIL-CLOSED: when the
+    /// persist succeeds it returns `Ok`, the marker is durable (persist ran),
+    /// and the entry is enqueued in the cell's `pending_commits`.
+    #[tokio::test]
+    async fn keep_broadcast_failure_persists_retry_entry_before_ok() {
+        let persists = Arc::new(AtomicUsize::new(0));
+        let last_snapshot = Arc::new(Mutex::new(None));
+        let deps = build_deps(
+            Box::new(RecordingTransport {
+                sends: Arc::new(AtomicUsize::new(0)),
+                fail: true,
+            }),
+            Box::new(CountingOkPersistence {
+                persists: Arc::clone(&persists),
+                last_snapshot: Arc::clone(&last_snapshot),
+            }),
+        )
+        .await;
+        let failure = make_failure(&deps, &remove_op()).await;
+        let mut cell = ClassSCell::new(fresh_state());
+
+        let result = keep_broadcast_failure(&mut cell, &deps, &ctx_hex(), failure).await;
+
+        assert!(
+            result.is_ok(),
+            "a successful fail-closed persist returns Ok"
+        );
+        assert_eq!(
+            persists.load(Ordering::SeqCst),
+            1,
+            "the retry entry was persisted (fail-closed) before returning Ok"
+        );
+        let snapshot = last_snapshot
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("a snapshot was captured by the persist");
+        assert_eq!(
+            snapshot.pending_commits.len(),
+            1,
+            "the retry entry is actually IN the persisted snapshot, not merely \
+             that a persist happened"
+        );
+        assert_eq!(
+            cell.pending_commits.len(),
+            1,
+            "the retry entry is enqueued in the cell"
+        );
+        assert!(
+            cell.commit_fault.is_none(),
+            "a normal enqueue leaves commit_fault clear"
+        );
+    }
+
+    /// A FAILING persist inside `keep_broadcast_failure` surfaces
+    /// `PersistenceFailed` (never a silent `Ok`) AND retains the retry entry in
+    /// memory (keep-direction) so the coalesced tick re-attempts the write —
+    /// the fail-closed guarantee the async-broadcast split had to restore.
+    #[tokio::test]
+    async fn keep_broadcast_failure_surfaces_persist_error_and_retains_entry() {
+        let deps = build_deps(
+            Box::new(RecordingTransport {
+                sends: Arc::new(AtomicUsize::new(0)),
+                fail: true,
+            }),
+            Box::new(FailPersistence),
+        )
+        .await;
+        let failure = make_failure(&deps, &remove_op()).await;
+        let mut cell = ClassSCell::new(fresh_state());
+
+        let result = keep_broadcast_failure(&mut cell, &deps, &ctx_hex(), failure).await;
+
+        assert!(
+            matches!(result, Err(ContextError::PersistenceFailed(_))),
+            "a failing fail-closed persist must surface PersistenceFailed, not Ok; got {result:?}"
+        );
+        assert_eq!(
+            cell.pending_commits.len(),
+            1,
+            "the retry entry is RETAINED in memory (keep-direction) after the persist failure"
+        );
+        assert!(
+            cell.commit_fault.is_none(),
+            "a persist failure must NOT spuriously trip the safety gate — only a \
+             full retry queue or retry exhaustion sets commit_fault (parity with \
+             the normal-capacity path)"
+        );
+    }
+
+    // -- Test 5 (unit-level recovery fail-close) --------------------------
+
+    /// The §9.12 post-compromise recovery epoch-advance commit rides the SAME
+    /// retry queue: a failed `RecoveryAdvanceEpoch` broadcast enqueues a pending
+    /// entry tagged `RecoveryAdvanceEpoch`. (The full `recovery_advance_epoch`
+    /// call site cannot be driven under the `cfg(test)` no-crypto pipeline — the
+    /// Commit serializes to empty bytes and short-circuits before the enqueue;
+    /// see the module NOTE. This pins the operation-tag invariant on the path
+    /// that IS reachable.)
+    #[tokio::test]
+    async fn recovery_advance_epoch_failure_enqueues_recovery_tagged_entry() {
+        let deps = build_deps(
+            Box::new(RecordingTransport {
+                sends: Arc::new(AtomicUsize::new(0)),
+                fail: true,
+            }),
+            Box::new(FailPersistence),
+        )
+        .await;
+        let failure = try_broadcast_commit(
+            &deps,
+            &ctx_hex(),
+            b"recovery-commit".to_vec(),
+            &CommitOperation::RecoveryAdvanceEpoch,
+        )
+        .await
+        .expect("failing transport yields Some(BroadcastFailure)");
+
+        let mut pending: VecDeque<PendingCommit> = VecDeque::new();
+        let mut commit_fault: Option<CommitFaultMarker> = None;
+        let mut receive_buffer = ReceiveBuffer::new();
+
+        apply_broadcast_failure(
+            CommitBroadcastBorrows {
+                pending_commits: &mut pending,
+                commit_fault: &mut commit_fault,
+                receive_buffer: &mut receive_buffer,
+            },
+            &deps,
+            &ctx_hex(),
+            failure,
+        );
+
+        assert_eq!(
+            pending.len(),
+            1,
+            "the recovery commit is enqueued for retry"
+        );
+        assert_eq!(
+            pending[0].operation,
+            CommitOperation::RecoveryAdvanceEpoch,
+            "the enqueued retry entry is tagged RecoveryAdvanceEpoch"
+        );
+        assert!(
+            commit_fault.is_none(),
+            "commit_fault stays clear below the queue cap"
+        );
+    }
 }

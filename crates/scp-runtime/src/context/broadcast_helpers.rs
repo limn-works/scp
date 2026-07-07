@@ -368,7 +368,7 @@ pub fn reserve_broadcast_publish(
 ///   context.
 /// - [`ContextError::CryptoFailed`] on a signature-length mismatch, an
 ///   epoch change between phases, or a seal failure.
-pub fn apply_broadcast_publish(
+pub async fn apply_broadcast_publish(
     cell: &mut ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
@@ -404,6 +404,7 @@ pub fn apply_broadcast_publish(
         signature,
         payload,
     )
+    .await
 }
 
 /// Relay routing id under which a sealed broadcast envelope is published.
@@ -427,7 +428,7 @@ fn broadcast_publish_routing_id(context_id: &str) -> [u8; 32] {
 /// Inner apply body. Separated so the caller-facing
 /// [`apply_broadcast_publish`] can guarantee the reserved sequence is
 /// released on every error path.
-fn apply_guarded(
+async fn apply_guarded(
     cell: &mut ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
@@ -468,7 +469,9 @@ fn apply_guarded(
 
     let envelope_bytes = rmp_serde::to_vec_named(&envelope)
         .map_err(|e| ContextError::CryptoFailed(format!("envelope serialization: {e}")))?;
-    deps.transport.send_message(routing_id, &envelope_bytes)?;
+    deps.transport
+        .send_message(routing_id, &envelope_bytes)
+        .await?;
 
     // `MessageSent` is no longer a durable Merkle leaf — per ADR-051 §6 / the
     // phase-2.md ADR-011 amendment exclusion taxonomy §2 it is a per-author,

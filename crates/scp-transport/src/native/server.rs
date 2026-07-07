@@ -288,7 +288,7 @@ impl RelayServer {
     /// Best-effort -- logs warnings on failure and continues.
     async fn restore_persisted_subscriptions(&self) {
         if let Some(ref persistence) = self.persistence {
-            match persistence.load_subscribed_routing_ids() {
+            match persistence.load_subscribed_routing_ids().await {
                 Ok(routing_ids) => {
                     if !routing_ids.is_empty() {
                         tracing::info!(
@@ -938,7 +938,7 @@ async fn cleanup_connection_subscriptions(
     // Persist removal for routing IDs that no longer have any subscribers.
     if let Some(persistence) = persistence {
         for routing_id in &removed_ids {
-            if let Err(e) = persistence.remove_subscription(routing_id) {
+            if let Err(e) = persistence.remove_subscription(routing_id).await {
                 tracing::warn!(
                     error = %e,
                     routing_id = hex::encode(routing_id),
@@ -1261,7 +1261,7 @@ async fn handle_subscribe(
 
     // Persist subscription (best-effort, SCP-PERSIST-066).
     if let Some(persistence) = persistence
-        && let Err(e) = persistence.persist_subscription(&routing_id)
+        && let Err(e) = persistence.persist_subscription(&routing_id).await
     {
         tracing::warn!(
             error = %e,
@@ -1344,7 +1344,7 @@ async fn handle_unsubscribe(
     // routing ID. Other connections may still be subscribed.
     if routing_id_removed
         && let Some(persistence) = persistence
-        && let Err(e) = persistence.remove_subscription(&routing_id)
+        && let Err(e) = persistence.remove_subscription(&routing_id).await
     {
         tracing::warn!(
             error = %e,
@@ -2909,8 +2909,14 @@ mod tests {
         let routing_id_b = [0xBB; 32];
 
         // Persist subscriptions (simulates what the relay does on SUBSCRIBE).
-        persistence.persist_subscription(&routing_id_a).unwrap();
-        persistence.persist_subscription(&routing_id_b).unwrap();
+        persistence
+            .persist_subscription(&routing_id_a)
+            .await
+            .unwrap();
+        persistence
+            .persist_subscription(&routing_id_b)
+            .await
+            .unwrap();
 
         // Create a "restarted" relay with the same persistence.
         let config = RelayConfig {
@@ -2942,9 +2948,11 @@ mod tests {
         // Persist rate limit state (simulates periodic snapshots).
         persistence
             .persist_rate_limit("192.168.1.1", 42.5, 1_000_000)
+            .await
             .unwrap();
         persistence
             .persist_rate_limit("10.0.0.1", 99.0, 2_000_000)
+            .await
             .unwrap();
 
         // Create a "restarted" relay with the same persistence.
@@ -2959,10 +2967,10 @@ mod tests {
         let (_handle, _addr) = server.start().await.unwrap();
 
         // Rate limit state should be loadable from persistence after restart.
-        let rate1 = persistence.load_rate_limit("192.168.1.1").unwrap();
+        let rate1 = persistence.load_rate_limit("192.168.1.1").await.unwrap();
         assert_eq!(rate1, Some((42.5, 1_000_000)));
 
-        let rate2 = persistence.load_rate_limit("10.0.0.1").unwrap();
+        let rate2 = persistence.load_rate_limit("10.0.0.1").await.unwrap();
         assert_eq!(rate2, Some((99.0, 2_000_000)));
     }
 
@@ -2982,8 +2990,9 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
     impl RelayPersistence for MockRelayPersistence {
-        fn persist_subscription(
+        async fn persist_subscription(
             &self,
             routing_id: &[u8; 32],
         ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -2995,7 +3004,7 @@ mod tests {
             Ok(())
         }
 
-        fn remove_subscription(
+        async fn remove_subscription(
             &self,
             routing_id: &[u8; 32],
         ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -3006,13 +3015,13 @@ mod tests {
             Ok(())
         }
 
-        fn load_subscribed_routing_ids(
+        async fn load_subscribed_routing_ids(
             &self,
         ) -> Result<Vec<[u8; 32]>, Box<dyn std::error::Error + Send + Sync>> {
             Ok(self.subscriptions.lock().unwrap().clone())
         }
 
-        fn persist_rate_limit(
+        async fn persist_rate_limit(
             &self,
             ip: &str,
             tokens: f64,
@@ -3025,14 +3034,14 @@ mod tests {
             Ok(())
         }
 
-        fn load_rate_limit(
+        async fn load_rate_limit(
             &self,
             ip: &str,
         ) -> Result<Option<(f64, u64)>, Box<dyn std::error::Error + Send + Sync>> {
             Ok(self.rate_limits.lock().unwrap().get(ip).copied())
         }
 
-        fn clear_all(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        async fn clear_all(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             self.subscriptions.lock().unwrap().clear();
             self.rate_limits.lock().unwrap().clear();
             Ok(())

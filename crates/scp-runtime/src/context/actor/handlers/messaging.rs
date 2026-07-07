@@ -45,7 +45,6 @@ use crate::context::actor::commands::MessagingCommand;
 use crate::context::actor::deps::ActorDeps;
 use crate::context::actor::outcome::Outcome;
 use crate::context::actor::sequence::SequenceReservation;
-use crate::context::actor::state::PerContextState;
 
 /// Per-call transport budget for mutation handlers. Plan §"Transport
 /// timeouts inside actor handlers": 30 seconds.
@@ -157,6 +156,7 @@ pub(crate) async fn dispatch(
             reply,
         } => {
             handle_build_local_checkpoint(cell, deps, &context_id, &sender_did, &signing_key, reply)
+                .await
         }
         MessagingCommand::CompareRemoteCheckpoint {
             context_id,
@@ -168,7 +168,7 @@ pub(crate) async fn dispatch(
             sender_did,
             signing_key,
             reply,
-        } => handle_send_heartbeat(&*cell, deps, &context_id, &sender_did, &signing_key, reply),
+        } => handle_send_heartbeat(cell, deps, &context_id, &sender_did, &signing_key, reply).await,
     }
 }
 
@@ -637,7 +637,7 @@ fn handle_report_degraded_mode(
 /// `tokio::time::timeout` wrapper required. Always replies
 /// `Ok(checkpoint)`; reports [`Outcome::ok_mutated`] because the
 /// checkpoint ring and counters changed.
-fn handle_build_local_checkpoint(
+async fn handle_build_local_checkpoint(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
@@ -679,7 +679,9 @@ fn handle_build_local_checkpoint(
         sender_did,
         &sk,
         &checkpoint,
-    ) {
+    )
+    .await
+    {
         tracing::warn!(
             context_id,
             error = %e,
@@ -744,17 +746,33 @@ fn handle_compare_remote_checkpoint(
 /// `Ok(())` on success, or the transport error if every fan-out send fails.
 /// The send does not mutate per-context state (it uses sequence `0` and
 /// touches no counters), so this reports [`Outcome::ok`] / [`Outcome::err`].
-fn handle_send_heartbeat(
-    state: &PerContextState,
+// `needless_pass_by_ref_mut`: the `&mut ClassSCell` is only read (`&*cell`), but
+// the `&mut` is load-bearing for Send — this async handler holds the cell borrow
+// across the `send_heartbeat` await, and `&mut ClassSCell` is Send whereas
+// `&PerContextState` (`!Sync`) would be `!Send` and break the spawned actor
+// future. Same rationale as the module-level allow in the `*_helpers` modules.
+#[allow(
+    clippy::needless_pass_by_ref_mut,
+    reason = "&mut ClassSCell held across await must be Send; &PerContextState is !Send (ADR-049 Decision 7)"
+)]
+async fn handle_send_heartbeat(
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     sender_did: &scp_did::DID,
     signing_key: &crate::context::actor::commands::SigningKeyBytes,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
+    // Take `&mut ClassSCell` (Send) rather than `&PerContextState` (`!Sync`, so
+    // `&PerContextState` is `!Send`): this async handler holds the borrow across
+    // the `send_heartbeat` await, so the borrow must be `Send` for the spawned
+    // actor future. `send_heartbeat` reads the shared `&*cell` in its sync
+    // prelude (ADR-049 Decision 7).
     let sk = signing_key.to_signing_key();
-    let result =
-        crate::context::messaging_helpers::send_heartbeat(deps, state, context_id, sender_did, &sk);
+    let result = crate::context::messaging_helpers::send_heartbeat(
+        deps, &*cell, context_id, sender_did, &sk,
+    )
+    .await;
     match result {
         Ok(()) => {
             let _ = reply.send(Ok(()));

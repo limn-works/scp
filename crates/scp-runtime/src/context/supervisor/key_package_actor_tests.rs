@@ -3112,28 +3112,33 @@ impl RecordingTransport {
     }
 }
 
+#[async_trait::async_trait]
 impl ContextTransportProvider for RecordingTransport {
     fn is_connected(&self) -> bool {
         true
     }
-    fn publish_context(
+    async fn publish_context(
         &self,
         _context_id: &[u8; 32],
         _params: &ContextParams,
     ) -> Result<(), ContextCreationError> {
         Ok(())
     }
-    fn delete_published(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+    async fn delete_published(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
         Ok(())
     }
-    fn send_message(
+    async fn send_message(
         &self,
         _context_id: &[u8; 32],
         _encrypted_payload: &[u8],
     ) -> Result<(), ContextError> {
         Ok(())
     }
-    fn publish_key_package(&self, owner_did: &str, _kp_bytes: &[u8]) -> Result<(), ContextError> {
+    async fn publish_key_package(
+        &self,
+        owner_did: &str,
+        _kp_bytes: &[u8],
+    ) -> Result<(), ContextError> {
         if self.fail.load(Ordering::Acquire) {
             return Err(ContextError::TransportFailed("injected".to_owned()));
         }

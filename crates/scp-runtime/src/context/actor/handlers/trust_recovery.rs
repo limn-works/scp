@@ -256,6 +256,7 @@ async fn handle_recovery_send_notification(
             p.sequence,
             &signing_key,
         )
+        .await
     };
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, send_fut).await {

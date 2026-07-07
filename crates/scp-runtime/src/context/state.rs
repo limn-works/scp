@@ -94,7 +94,7 @@ pub const MAX_COMMIT_AGE_SECS: u64 = 3600; // 1 hour
 /// Maximum number of pending commits allowed in the retry queue per context.
 ///
 /// Prevents unbounded memory growth during sustained transport outages.
-/// When this cap is reached, [`try_broadcast_commit_or_enqueue`](crate::context::governance_helpers::try_broadcast_commit_or_enqueue) sets the
+/// When this cap is reached, [`apply_broadcast_failure`](crate::context::governance_helpers::apply_broadcast_failure) sets the
 /// `commit_fault` marker immediately rather than enqueuing, fail-closing
 /// the context for operator attention.
 pub const MAX_PENDING_COMMITS: usize = 50;
@@ -167,6 +167,17 @@ pub enum CommitOperation {
         /// The DID of the member who left.
         member_did: DID,
     },
+    /// Commit produced by `recovery_advance_epoch` — the spec §9.12 step-2
+    /// post-compromise recovery epoch advance (an MLS Update + self-Commit).
+    ///
+    /// Broadcasting this Commit is what re-keys the group away from the
+    /// compromised material: until remaining members process it they stay on
+    /// the compromised epoch and the excluded/compromised party retains read
+    /// access. It carries no reason/target payload — the epoch advance is fully
+    /// determined by the context state. Like the other epoch-advancing commits
+    /// it rides the persistent retry queue, so a dropped broadcast fail-closes
+    /// the context rather than silently completing recovery.
+    RecoveryAdvanceEpoch,
 }
 
 impl CommitOperation {
@@ -184,6 +195,7 @@ impl CommitOperation {
                 is_remove: false, ..
             } => "ResetMemberAdd".to_owned(),
             Self::LeaveContext { .. } => "LeaveContext".to_owned(),
+            Self::RecoveryAdvanceEpoch => "RecoveryAdvanceEpoch".to_owned(),
         }
     }
 }
