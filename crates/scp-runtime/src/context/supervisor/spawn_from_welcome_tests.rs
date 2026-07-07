@@ -3180,3 +3180,168 @@ async fn spawn_from_welcome_joiner_is_active_and_send_capable() {
         "the accepted send must have produced at least one application ciphertext"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Test §9(b)-app — a real B→A APPLICATION-DATA round-trip (coverage gap pin).
+// ---------------------------------------------------------------------------
+
+/// §9(b) APPLICATION-path pin: a Welcome-joiner (Bob) seals a real application
+/// message and the creator (Alice) opens it.
+///
+/// # Why this test exists (the coverage gap that shipped a bug green)
+///
+/// The existing bidirectional round-trip tests
+/// ([`spawn_from_welcome_group_round_trips_both_directions`],
+/// [`invite_member_round_trip_stands_up_a_bidirectional_joiner`]) drive
+/// [`MlsCryptoProvider::mls_encrypt_management`] / [`MlsCryptoProvider::open`],
+/// which travels the MANAGEMENT path: MLS-encrypt only, decoded as
+/// [`OpenResult::Management`]. That path NEVER touches the per-sender key layer.
+/// Application messages ride an extra AEAD layer keyed by the sender's sender
+/// key (distributed out-of-band via HPKE), decoded as [`OpenResult::Application`].
+///
+/// Because no test exercised the B→A *application* direction, a real defect
+/// shipped green: a Welcome-joiner was RECEIVE-ONLY. The joiner cannot proactively
+/// PUSH its sender key to incumbents (a push seals to each incumbent's STABLE
+/// `0xFF01` wrapping key, which openmls 0.8.1 does not expose from a joined group,
+/// ADR-057), so incumbents must PULL it (§9.16.2). But the pull answer,
+/// [`MlsCryptoProvider::handle_sender_key_request`], gated membership on the
+/// `member_wrapping_keys` cache — which is EMPTY for a joiner — and so rejected
+/// every incumbent's request as "from a non-member". The fix reads membership from
+/// the joiner's MLS group tree instead (§9.16.6 Mitigation 1). This test drives the
+/// real PULL round trip end-to-end and then the FULL application pipeline: `seal`
+/// (sender-key AEAD → MLS application encrypt → outer envelope) on Bob and `open`
+/// (MLS decrypt → sender-key AEAD decrypt → deserialize) on Alice.
+///
+/// # Non-vacuity
+///
+/// The round trip fails CLOSED — not silently — if the fix is reverted:
+/// - If `handle_sender_key_request` is reverted to the `member_wrapping_keys`
+///   gate, Bob returns `Err("sender key request from non-member")` and the
+///   `expect` on Bob's response panics — Alice never obtains Bob's key.
+/// - Even past that, if Alice's opened key is wrong or unstored, `open` returns
+///   `Err(CryptoFailed("sender key lookup failed"))` at step 2 of the Application
+///   arm, or the recovered plaintext mismatches.
+/// - If Bob's joined group is at the wrong epoch relative to Alice, the MLS
+///   decrypt at step 1 fails before the sender-key layer is even reached.
+///
+/// A passing management-path round-trip does NOT imply a passing application-path
+/// round-trip — that gap is exactly what this test pins.
+#[tokio::test]
+async fn spawn_from_welcome_application_data_round_trips_joiner_to_creator() {
+    // Bob joins Alice's real SCP context group via the Welcome path.
+    let (result, j) = join_bob(0x40, None).await;
+    result.expect("spawn_actor_from_welcome succeeds");
+
+    // Alice (the incumbent) PULLS Bob's sender key via the §9.16.2 request/
+    // response protocol — the spec's canonical new-member mechanism, and the only
+    // one openmls 0.8.1 supports for a joiner (a joiner cannot push; ADR-057).
+    // Alice issues a signed `SenderKeyRequest` carrying a FRESH EPHEMERAL wrapping
+    // key; Bob answers via `handle_sender_key_request`; Alice opens the response
+    // with her ephemeral secret and stores Bob's key. Application messages ride
+    // the sender-key layer, so without this Alice cannot decrypt Bob's traffic.
+    //
+    // NON-VACUITY ANCHOR: `handle_sender_key_request` is exactly where the H1
+    // membership gate lives. Bob's `member_wrapping_keys` is empty (a joiner never
+    // caches incumbents' stable keys), so if the gate is reverted to the cache
+    // check Bob returns `Err("sender key request from non-member")` and the first
+    // `expect` below panics — this test cannot pass on the old, buggy gate.
+    let alice_signing = alice_signing_key();
+    let custody = InMemoryKeyCustody::new();
+    // Alice's #active signing key, for the request signature. The EPHEMERAL
+    // wrapping keypair is generated INSIDE `request_sender_key` (custody-held),
+    // and its handle comes back as `request.wrapping_key_handle`.
+    let alice_signing_handle = custody.import_ed25519_key(&alice_signing.to_bytes()).await;
+    let request = crate::crypto::sender_keys::key_protocol::request_sender_key(
+        &custody,
+        &alice_signing_handle,
+        ALICE_DID,
+        BOB_DID,
+        1, // joiner's initial sender-key epoch (not validated by the responder)
+        &scp_clock::SystemClock,
+    )
+    .await
+    .expect("alice builds a signed sender-key request for bob's key");
+
+    let blocked = std::collections::HashSet::new();
+    let response_bytes = j
+        .bob_crypto
+        .handle_sender_key_request(
+            &j.ctx_bytes,
+            &request.request_message,
+            alice_signing.verifying_key().as_bytes(),
+            &blocked,
+        )
+        .expect(
+            "bob ACCEPTS alice's sender-key request — the H1 gate reads bob's MLS group \
+             membership, not his empty member_wrapping_keys cache (§9.16.6 Mitigation 1)",
+        )
+        .expect("bob returns a response for a non-blocked member");
+
+    let response: scp_protocol::crypto::sender_keys::SenderKeyResponse =
+        rmp_serde::from_slice(&response_bytes).expect("decode bob's SenderKeyResponse");
+    assert_eq!(
+        response.sender_did, BOB_DID,
+        "the response carries bob's sender key"
+    );
+    let ctx_id_hex = hex::encode(j.ctx_bytes);
+    let bob_key = crate::crypto::sender_keys::key_protocol::open_sender_key_response(
+        &custody,
+        &request.wrapping_key_handle,
+        &ctx_id_hex,
+        &response,
+    )
+    .await
+    .expect("alice opens bob's HPKE-sealed sender key with her ephemeral secret");
+    j.alice_crypto
+        .store_member_sender_key(&j.ctx_bytes, BOB_DID, bob_key, response.epoch)
+        .expect("alice stores bob's pulled sender key");
+
+    // Bob seals a REAL application message through the full send pipeline.
+    let payload = b"application-data-from-the-welcome-joiner-\xc2\xa79b";
+    let params = crate::envelope::inner::InnerEnvelopeParams {
+        version: scp_protocol::envelope::SCP_PROTOCOL_VERSION,
+        context_id: &j.ctx_id,
+        sender_did: BOB_DID,
+        epoch: 0,
+        generation: 0,
+        sequence: 0,
+        timestamp: 1_700_000_000,
+        message_type: crate::envelope::inner::MessageType::Content,
+        payload,
+        provenance: None,
+        signing_key_id: SigningKeyId::Active,
+    };
+    let inner =
+        crate::envelope::inner::sign::create_inner_envelope_raw(&params, &bob_signing_key())
+            .expect("bob builds a signed application inner envelope");
+    let routing_id = scp_protocol::context::context_routing_id(&j.ctx_id);
+    let sealed = j
+        .bob_crypto
+        .seal(&j.ctx_bytes, &inner, &routing_id, 3600)
+        .expect("bob seals the application message through the joined group");
+
+    // Alice opens Bob's APPLICATION ciphertext — the direction + layer no
+    // management-path test reaches. Fails closed on an epoch mismatch (MLS
+    // decrypt) or a missing sender key (sender-key lookup).
+    let opened = j
+        .alice_crypto
+        .open(&j.ctx_bytes, &j.ctx_id, &sealed)
+        .expect("alice opens bob's application ciphertext (B→A application round-trip)");
+    let env = match opened {
+        OpenResult::Application(env) => *env,
+        other => {
+            panic!("expected OpenResult::Application from a sealed app message, got {other:?}")
+        }
+    };
+    assert_eq!(
+        env.sender_did, BOB_DID,
+        "the opened application message is attributed to the joiner (bob)"
+    );
+    let recovered = scp_protocol::envelope::padding::strip_padding(&env.inner.payload)
+        .expect("strip bucket padding from the opened application payload");
+    assert_eq!(
+        recovered.as_slice(),
+        payload.as_slice(),
+        "alice recovers bob's exact application plaintext — B→A application round-trip closed"
+    );
+}

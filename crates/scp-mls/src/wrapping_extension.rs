@@ -145,18 +145,26 @@ pub fn extract_own_wrapping_key(
 /// Extracts the `scp_wrapping_key` from a member's `LeafNode`, identified by
 /// their DID in the SCP credential.
 ///
-/// For the local member, reads `own_leaf_node()` directly which provides
-/// full access to the `LeafNode` extensions. For remote members, the wrapping
-/// public key should be obtained from the `ProtocolRepository` where it was
-/// persisted at join time, since `OpenMLS` does not expose other members'
-/// `LeafNode` extensions through its public API.
+/// For the local member, reads `own_leaf_node()` directly which provides full
+/// access to the `LeafNode` extensions. For a REMOTE member this returns
+/// [`MlsError::MemberNotFound`]: openmls 0.8.1 exposes no public way to reach
+/// another member's `LeafNode` from a joined group (the `RatchetTree` returned
+/// by `export_ratchet_tree()` has no public node iterator, `full_leaves()` lives
+/// on the `pub(crate)` `TreeSync`, and `members()` yields a `Member` without
+/// extensions — see ADR-057 and the notes in [`crate::lifetime`]). Remote
+/// members' stable wrapping keys are therefore NOT read from the tree; they are
+/// only ever needed for the proactive/offline PUSH path (§9.16.1), where the
+/// key holder caches them from the added `KeyPackage` at `add_member` time. The
+/// canonical new-member key exchange is the PULL protocol (§9.16.2), which
+/// carries a fresh ephemeral wrapping key inline in each `SenderKeyRequest` and
+/// needs no stable-key lookup at all.
 ///
 /// # Errors
 ///
 /// Returns [`MlsError::GroupDestroyed`] if the group has been destroyed.
-/// Returns [`MlsError::MemberNotFound`] if the local member's DID does not
-///   match `target_did` (use `ProtocolRepository::load_wrapping_public_key` for
-///   remote members instead).
+/// Returns [`MlsError::MemberNotFound`] if `target_did` is not the local member
+///   (remote members' extensions are not accessible via openmls's public API,
+///   per the note above).
 /// Returns [`MlsError::ExtensionError`] if the extension data is malformed.
 pub fn extract_member_wrapping_key(
     group: &crate::group::ScpMlsGroup,
@@ -173,9 +181,11 @@ pub fn extract_member_wrapping_key(
         return extract_wrapping_key(own_leaf.extensions());
     }
 
-    // Remote members' extensions are not accessible through OpenMLS's public
-    // API. The caller should use ProtocolRepository::load_wrapping_public_key()
-    // for remote members' wrapping keys.
+    // Remote members' `LeafNode` extensions are not accessible through openmls
+    // 0.8.1's public API (ADR-057; see this function's doc comment). A joiner
+    // does not need remote stable wrapping keys: it exchanges sender keys via
+    // the pull protocol (§9.16.2), which carries a fresh ephemeral wrapping key
+    // inline in each `SenderKeyRequest`.
     Err(MlsError::MemberNotFound(u32::MAX))
 }
 

@@ -903,11 +903,23 @@ impl MlsCryptoProvider {
     /// slice) single-slot join path produced.
     ///
     /// The joiner's OWN sender key is generated LOCALLY here (spec §9.16.1);
-    /// it is NOT carried in the Welcome. Other members' sender keys and the
-    /// per-member access keys (§9.17) arrive later via sender-key-distribution
-    /// application messages / out-of-band exchange, so `sender_key_store`,
-    /// `member_wrapping_keys`, and `recv_sequence_tracker` start empty — the
-    /// same initial shape a fresh join produces.
+    /// it is NOT carried in the Welcome. Other members' sender keys arrive
+    /// later on demand via the PULL protocol (§9.16.2): the joiner sends a
+    /// `SenderKeyRequest` — carrying a fresh EPHEMERAL wrapping key — to each
+    /// incumbent, whose `handle_sender_key_request` seals its sender key to
+    /// that ephemeral key. So `sender_key_store` and `recv_sequence_tracker`
+    /// start empty — the same initial shape a fresh join produces.
+    ///
+    /// `member_wrapping_keys` also starts empty and, for a joiner, STAYS empty:
+    /// it caches other members' STABLE wrapping keys, which are used ONLY by the
+    /// proactive/offline PUSH path (`distribute_sender_key` / `rotate_sender_key`,
+    /// §9.16.1) and are populated on the incumbent/adder side from the added
+    /// `KeyPackage`'s leaf (`add_member_from_bytes`). openmls 0.8.1 exposes no
+    /// public way to read a remote member's `scp_wrapping_key` `LeafNode` extension
+    /// from a joined group (ADR-057; see `scp_mls::wrapping_extension`), so a
+    /// joiner cannot learn incumbents' stable keys — but it does not need them:
+    /// it reaches every incumbent through the pull protocol above, and answers
+    /// incumbents' pulls via the ephemeral key in their requests.
     ///
     /// # Refuses to overwrite a live group
     ///
@@ -1652,6 +1664,59 @@ impl MlsCryptoProvider {
         }
     }
 
+    /// Stores a member's sender key recovered from a PULL response (§9.16.2).
+    ///
+    /// This is the store half of pull-response ingest — the requester-side
+    /// counterpart to the push path's [`Self::process_incoming_sender_key`].
+    /// After this node issues a `SenderKeyRequest` and the sender answers via
+    /// [`Self::handle_sender_key_request`], the requester opens the HPKE-sealed
+    /// response with the EPHEMERAL wrapping secret it generated for the request
+    /// (via `key_protocol::open_sender_key_response`, which verifies the RFC 9180
+    /// AEAD tag and the context/sender/epoch binding) and lands the authenticated
+    /// key here. The key is therefore never injected blind: it is only reachable
+    /// by presenting a response that opens under the requester's own ephemeral
+    /// secret.
+    ///
+    /// Applies the SAME epoch monotonicity (`set_checked`) and epoch-poisoning
+    /// (`MAX_EPOCH_ADVANCE`) defenses as the push path (§9.16.1, §9.16.5), so a
+    /// stale or artificially-inflated epoch cannot rewind or wedge the store.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::CryptoFailed`] if no group is registered for
+    /// `context_id`, if `epoch` exceeds `current_epoch + MAX_EPOCH_ADVANCE`
+    /// (epoch poisoning), or if the monotonicity check rejects a rewind.
+    pub fn store_member_sender_key(
+        &self,
+        context_id: &[u8; 32],
+        sender_did: &str,
+        sender_key: SenderKey,
+        epoch: u64,
+    ) -> Result<(), ContextError> {
+        let ctx_id_hex = hex::encode(context_id);
+        // ADR-049 commit 12c.9f: lock-free `DashMap::get_mut`.
+        let mut entry = self.contexts.get_mut(context_id).ok_or_else(|| {
+            ContextError::CryptoFailed("no MLS group for this context".to_string())
+        })?;
+        let state = entry.value_mut();
+
+        // Epoch poisoning defense (mirrors `process_incoming_sender_key`):
+        // reject a claimed epoch unreasonably far above the current one so an
+        // attacker cannot set epoch=u64::MAX to permanently block future
+        // rotations via the monotonicity check.
+        let current_epoch = state.sender_key_store.epoch(&ctx_id_hex, sender_did);
+        if epoch > current_epoch.saturating_add(MAX_EPOCH_ADVANCE) {
+            return Err(ContextError::CryptoFailed(
+                "epoch poisoning: claimed epoch exceeds acceptable advance".into(),
+            ));
+        }
+        state
+            .sender_key_store
+            .set_checked(&ctx_id_hex, sender_did, sender_key, epoch)
+            .map_err(|e| ContextError::CryptoFailed(format!("epoch check failed: {e}")))?;
+        Ok(())
+    }
+
     /// Handles an incoming sender key request from a remote member.
     ///
     /// Verifies the request, checks replay protection, and HPKE-seals the
@@ -1716,13 +1781,37 @@ impl MlsCryptoProvider {
             ));
         }
 
-        // H1: Membership check — requester must be a known member (has a
-        // wrapping key registered via add_member). Prevents non-members
-        // from obtaining sender keys even if they forge a valid request.
-        if !state
-            .member_wrapping_keys
-            .contains_key(&request.requester_did)
-        {
+        // H1: Membership check — requester must be a CURRENT MLS group member,
+        // per spec §9.16.6 Mitigation 1 ("handle_sender_key_request MUST verify
+        // that the requester's DID is a current member of the context").
+        //
+        // Membership is read authoritatively from the MLS group tree — the same
+        // DID-match over `members()` that `remove_member` uses — NOT from
+        // `member_wrapping_keys`. That map only records members whose STABLE
+        // wrapping key this node happens to have cached (populated on the
+        // incumbent/adder side in `add_member_from_bytes`, from the added
+        // `KeyPackage`'s own leaf). A Welcome-joiner's map starts empty
+        // (`install_joined_group`), so gating on it would make the joiner reject
+        // every incumbent's key request and be permanently RECEIVE-ONLY. The
+        // pull protocol (§9.16.2) seals the response to the fresh EPHEMERAL
+        // `request.wrapping_pubkey` carried in the request, so the responder
+        // never needs the requester's stable key to answer — only proof that the
+        // requester is a member, which the group tree provides directly.
+        let members = state
+            .mls_group
+            .members()
+            .map_err(|e: scp_mls::error::MlsError| ContextError::CryptoFailed(e.to_string()))?;
+        let mut requester_is_member = false;
+        for member in &members {
+            if let Ok(basic_cred) = BasicCredential::try_from(member.credential.clone())
+                && let Ok(scp_cred) = ScpCredential::from_bytes(basic_cred.identity())
+                && scp_cred.did == request.requester_did
+            {
+                requester_is_member = true;
+                break;
+            }
+        }
+        if !requester_is_member {
             return Err(ContextError::CryptoFailed(
                 "sender key request from non-member".to_string(),
             ));
