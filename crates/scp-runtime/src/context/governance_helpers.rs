@@ -2002,7 +2002,7 @@ pub async fn execute_transfer_admin(
 }
 
 // ---------------------------------------------------------------------------
-// execute_create_child_context (per-action leaf helper).await
+// execute_create_child_context (per-action leaf helper)
 // ---------------------------------------------------------------------------
 
 pub async fn execute_create_child_context(
@@ -2398,7 +2398,7 @@ pub async fn execute_establish_tool_interface(
 }
 
 // ---------------------------------------------------------------------------
-// execute_reset_member (per-action leaf helper).await
+// execute_reset_member (per-action leaf helper)
 // ---------------------------------------------------------------------------
 
 pub async fn execute_reset_member(
@@ -3672,7 +3672,7 @@ fn actor_check_proposer_eligibility(
     use scp_protocol::context::params::GovernanceModel;
     use scp_protocol::trust::participation::{compute_participation_record, meets_threshold};
 
-    // Pending-removal defense-in-depth (read via the cell's `Deref`).await.
+    // Pending-removal defense-in-depth (read via the cell's `Deref`).
     for (proposal, _seq, _ts) in cell.governance.approved_proposals.values() {
         if let GovernanceAction::RemoveMember { did, .. } = &proposal.action
             && did == proposer_did
@@ -4813,7 +4813,7 @@ pub async fn dispatch_governance_action(
 }
 
 // ---------------------------------------------------------------------------
-// finalize_governance_action (post-dispatch).await
+// finalize_governance_action (post-dispatch)
 // ---------------------------------------------------------------------------
 
 /// Post-dispatch finalization for an executed governance action.
@@ -5144,7 +5144,7 @@ pub async fn execute_governance_action(
     check_commit_fault(cell)?;
 
     // Resolve the authoritative proposal from the engine. Clone so the engine
-    // borrow (taken via the cell's `Deref`).await is dropped before the Class-S
+    // borrow (taken via the cell's `Deref`) is dropped before the Class-S
     // replay-marker WRITE below. A missing proposal means the caller referenced
     // something the quorum-validated engine never retained — reject rather than
     // trust caller-supplied data.

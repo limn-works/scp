@@ -1375,7 +1375,7 @@ pub async fn send_message(
 }
 
 // ---------------------------------------------------------------------------
-// 8. deliver_incoming (top-level, actor-shape).await
+// 8. deliver_incoming (top-level, actor-shape)
 // ---------------------------------------------------------------------------
 
 /// Classified result of delivering one incoming envelope (§9.9.2).
