@@ -293,7 +293,7 @@ pub fn stand_up_two_party(
 ) -> (Arc<MlsCryptoProvider>, Arc<MlsCryptoProvider>, [u8; 32]) {
     let ctx_bytes = scp_protocol::context::context_id_bytes(ctx_str);
 
-    tokio::runtime::Builder::new_current_thread()
+    tokio::runtime::Builder::new_current_thread() // ci-allow: block-on: test-only two-party fixture drives async MLS provider calls from sync #[test] callers; not a production async bridge
         .enable_all()
         .build()
         .unwrap()
