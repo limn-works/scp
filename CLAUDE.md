@@ -250,13 +250,14 @@ The orchestrator never writes code. It manages execution, maintains plan alignme
 ├── adrs/            # Architecture Decision Records (phase-1 through phase-6)
 ├── lessons/         # Evergreen learnings, grouped by topic
 ├── planning-sessions/
+├── runbooks/        # Operator runbooks (incident diagnosis + remediation)
 ├── scaffold/        # Per-language SDK build blueprints
 ├── specs/           # Product specs — what to build
 └── standards/       # Coding and workflow standards. NON-NEGOTIABLE
 
 crates/              # Rust workspace — the protocol core
 ├── scp-protocol/    # Pure sync protocol types (no tokio, compiles for wasm32)
-├── scp-runtime/     # Async orchestration (ContextManager, MLS, providers)
+├── scp-runtime/     # Async orchestration (Supervisor actor-per-context, MLS, providers)
 ├── scp-core/        # Facade re-exporting scp-protocol + scp-runtime
 ├── scp-ffi/         # FFI bridges — 3 targets, one codebase
 │   ├── src/         #   PyO3 (Python) — the REFERENCE bridge (100% coverage target)
