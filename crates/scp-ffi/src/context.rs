@@ -1501,17 +1501,24 @@ pub(crate) fn resolve_signing_key(
     identity_did: &str,
 ) -> PyResult<ed25519_dalek::SigningKey> {
     let rt = crate::runtime()?;
-    crate::runtime::with_identity(bi, identity_did, |entry| {
-        let handle = entry.identity.active_signing_key;
-        let custody = entry.custody.clone();
-        rt.block_on(async move { custody.export_ed25519_signing_key(&handle).await })
-            .map_err(|e| {
-                crate::error::ScpPyError::context(format!(
-                    "failed to export signing key for governance: {e}"
-                ))
-            })
+    // Copy the key handle and clone the custody `Arc` OUT of the `with_identity`
+    // closure, then DROP the DashMap identity-registry shard guard (by exiting
+    // the closure) BEFORE the blocking async export. The `block_on` at the FFI
+    // sync boundary is the ADR-049 §12-14-exempt class and stays; the hazard is
+    // holding a sharded read guard across a (potentially slow / HSM-backed /
+    // callback) async export, which pins a runtime worker and blocks any writer
+    // of the same shard for its duration. The export operates only on the cloned
+    // `custody`/`handle` and never re-touches the registry, so the clone-then-drop
+    // reorder is sufficient — same shape as the DashMap-ref-before-await fixes
+    // elsewhere. See GitHub issue #1940.
+    let (custody, handle) = crate::runtime::with_identity(bi, identity_did, |entry| {
+        Ok((entry.custody.clone(), entry.identity.active_signing_key))
     })
-    .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    rt.block_on(async move { custody.export_ed25519_signing_key(&handle).await })
+        .map_err(|e| {
+            PyRuntimeError::new_err(format!("failed to export signing key for governance: {e}"))
+        })
 }
 
 /// Helper: resolve the Ed25519 *verifying* key for an identity DID without
