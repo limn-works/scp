@@ -24,7 +24,7 @@
       "crates/scp-runtime/src/context/lifecycle_helpers.rs:2461-2462 (1 block_in_place + 1 block_on — flush_all_contexts_sync; renamed from manager/mod.rs in ADR-049 commit 12)",
       "crates/scp-runtime/src/context/tools_helpers.rs:237-327 (2 block_in_place + 4 block_on — try_consume / refund hard rate limit blocking + from_any_context wrappers; renamed from manager/tools.rs in ADR-049 commit 12)",
       "crates/scp-runtime/src/identity/recovery.rs: ELIMINATED (was 1 block_in_place + 1 block_on in the block_on_async bridge) — RecoveryBackend is now an async trait (ADR-049 Decision 7 PR-0); execute_recovery awaits the trait methods directly. Count tightened 2→0.",
-      "crates/scp-runtime/src/store/context.rs (4 block_in_place + 4 block_on — ProtocolRepositoryEventLogBridge only; the ProtocolRepositoryContextBridge sync→async shim was deleted when ContextPersistence became an async trait in ADR-049 Decision 7 PR-1, removing 4 block_in_place + 4 block_on — count 20→8)",
+      "crates/scp-runtime/src/store/context.rs: 8 live sites (4 block_in_place + 4 block_on) — ProtocolRepositoryEventLogBridge, retained for PR-2. The ProtocolRepositoryContextBridge sync→async shim was deleted when ContextPersistence became an async trait (ADR-049 Decision 7 PR-1); baseline tightened 20→8 to the scanner's current live count (the prior 20 sat above the actual live count).",
       "crates/scp-runtime/src/store/trust.rs:273-336 (6 block_on via stored Handle)"
     ],
     "scp-transport": [
