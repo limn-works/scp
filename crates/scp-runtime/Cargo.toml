@@ -159,6 +159,10 @@ required-features = ["testing"]
 name = "identity_config_cross_path"
 required-features = ["testing"]
 
+[[test]]
+name = "perf_baseline"
+required-features = ["testing"]
+
 [[example]]
 name = "identity"
 
