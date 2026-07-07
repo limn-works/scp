@@ -101,7 +101,13 @@ Commit bytes:
     process restart.
   - **`keep_broadcast_failure`** — async; runs `apply_broadcast_failure` inside
     a second `commit_class_s_keep` so the failure bookkeeping fail-closes
-    (persists before ack) rather than being lost on a coalesced tick.
+    (persists before ack) rather than being lost on a coalesced tick. Only the
+    four safety-gated / forward-secrecy sites — `execute_remove_member`,
+    `execute_rotate_content_keys`, `leave_context`, `recovery_advance_epoch` —
+    fail-close this way; the two best-effort sites (`execute_add_member`,
+    `execute_reset_member`) apply the *same* failure value **coalesced** via
+    `class_c_view()` / `ClassCMut` (Class-C), not fail-closed — see the context
+    layer + `crates/scp-runtime/CLAUDE.md` for the authoritative site list.
 - On budget exhaustion the context **fail-closes**: a `CommitFaultMarker` is
   set. While it is set, `check_commit_fault` makes all governance and
   lifecycle mutations return `ContextError::CommitBroadcastFault`.
