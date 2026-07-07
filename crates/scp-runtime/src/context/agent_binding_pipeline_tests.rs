@@ -461,12 +461,13 @@ mod live_supervisor_send {
         }
     }
 
+    #[async_trait::async_trait]
     impl ContextTransportProvider for CapturingTransport {
         fn is_connected(&self) -> bool {
             true
         }
 
-        fn publish_context(
+        async fn publish_context(
             &self,
             _context_id: &[u8; 32],
             _params: &ContextParams,
@@ -474,11 +475,14 @@ mod live_supervisor_send {
             Ok(())
         }
 
-        fn delete_published(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        async fn delete_published(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<(), ContextCreationError> {
             Ok(())
         }
 
-        fn send_message(
+        async fn send_message(
             &self,
             context_id: &[u8; 32],
             encrypted_payload: &[u8],

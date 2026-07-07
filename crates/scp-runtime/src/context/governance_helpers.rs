@@ -989,7 +989,9 @@ pub async fn execute_revoke(
             deps,
             context_id,
             &context_id_bytes,
-        ) {
+        )
+        .await
+        {
             tracing::warn!(
                 context_id = %context_id,
                 error = %e,
@@ -1244,29 +1246,34 @@ pub async fn execute_add_member(
                 deps.event_tx.as_ref(),
             );
         }
-
-        // ROOT FIX (parity with `execute_remove_member` / `execute_reset_member`):
-        // broadcast the MLS Commit to the EXISTING members. An MLS Add advances
-        // the group epoch exactly like a Remove, so without this the add's
-        // Commit was only buffered into the (broadcast-suppressed)
-        // `WelcomeGenerated` event and NEVER reached the group — every existing
-        // member desynced from the admin after any add. Routed through the same
-        // persistent retry queue (`try_broadcast_commit_or_enqueue`) as the
-        // remove/reset commits. A no-op when `commit_for_broadcast` is empty
-        // (the `cfg(test)` no-crypto pipeline).
-        if !commit_for_broadcast.is_empty() {
-            try_broadcast_commit_or_enqueue(
-                view.commit_broadcast_borrows(),
-                deps,
-                context_id,
-                commit_for_broadcast,
-                &CommitOperation::AddMember {
-                    target_did: did.clone(),
-                },
-            );
-        }
     })
     .await;
+
+    // ROOT FIX (parity with `execute_remove_member` / `execute_reset_member`):
+    // broadcast the MLS Commit to the EXISTING members. An MLS Add advances the
+    // group epoch exactly like a Remove, so without this the add's Commit was only
+    // buffered into the (broadcast-suppressed) `WelcomeGenerated` event and NEVER
+    // reached the group — every existing member desynced from the admin after any
+    // add. Routed through the same persistent retry queue
+    // (`try_broadcast_commit_or_enqueue`) as the remove/reset commits. A no-op
+    // when `commit_for_broadcast` is empty (the `cfg(test)` no-crypto pipeline).
+    //
+    // Hoisted AFTER the best-effort persist above (ADR-049 Decision 7 — transport
+    // is async and cannot be awaited inside the sync closure). The enqueue is
+    // Class-C (coalesced — picked up by the actor's persist tick), which is its
+    // correct class.
+    if !commit_for_broadcast.is_empty() {
+        try_broadcast_commit_or_enqueue(
+            cell.class_c_view().commit_broadcast_borrows(),
+            deps,
+            context_id,
+            commit_for_broadcast,
+            &CommitOperation::AddMember {
+                target_did: did.clone(),
+            },
+        )
+        .await;
+    }
 
     // Subject-bearing leaf (ADR-011 amendment): carry the *affected member*
     // (`did`) in the payload, not just `actor_did` (which on this admin-driven
@@ -1318,7 +1325,7 @@ pub async fn execute_remove_member(
     // where the fail-close `commit_fault` marker is set but NOT persisted before
     // the early return). All structural mutations + emit + broadcast + sender-
     // key drain ride the SAME fail-closed persist via `view.rest_mut()`.
-    let removed_role_name = cell
+    let (removed_role_name, remove_commit_bytes) = cell
         .commit_class_s_keep(deps, context_id, |mut view| {
             let state = view.rest_mut();
 
@@ -1353,7 +1360,7 @@ pub async fn execute_remove_member(
                     "remove_member_sender_key",
                     &e.to_string(),
                 )
-                .map(|()| String::new());
+                .map(|()| (String::new(), None));
             }
 
             if let Err(e) = deps.crypto.rotate_sender_key(&context_id_bytes) {
@@ -1365,7 +1372,7 @@ pub async fn execute_remove_member(
                     "rotate_sender_key",
                     &e.to_string(),
                 )
-                .map(|()| String::new());
+                .map(|()| (String::new(), None));
             }
 
             state.membership.remove_member(did);
@@ -1403,35 +1410,52 @@ pub async fn execute_remove_member(
                 deps,
             );
 
-            try_broadcast_commit_or_enqueue(
-                CommitBroadcastBorrows {
-                    pending_commits: &mut state.pending_commits,
-                    commit_fault: &mut state.commit_fault,
-                    receive_buffer: &mut state.receive_buffer,
-                },
-                deps,
-                context_id,
-                remove_output.commit_bytes,
-                &CommitOperation::RemoveMember {
-                    target_did: did.clone(),
-                },
-            );
-
-            // Phase 2A.9: drain_and_deliver_sender_keys is now actor-shape.
-            if let Err(e) = crate::context::lifecycle_helpers::drain_and_deliver_sender_keys(
-                deps,
-                context_id,
-                &context_id_bytes,
-            ) {
-                tracing::warn!(
-                    context_id = %context_id,
-                    error = %e,
-                    "failed to deliver rotated sender keys after member removal"
-                );
-            }
-            Ok(removed_role_name)
+            // Capture the removal Commit bytes; the ASYNC broadcast + sender-key
+            // delivery run AFTER the fail-closed persist, outside this sync
+            // `_keep` closure (ADR-049 Decision 7 — transport is async). `None`
+            // on the fail-close paths above, which skip the broadcast/drain
+            // exactly as the pre-hoist early returns did.
+            Ok((removed_role_name, Some(remove_output.commit_bytes)))
         })
         .await?;
+
+    // Async transport ops AFTER the Class-S removal persist (ADR-049 Decision 7:
+    // `ContextTransportProvider` is async and cannot be awaited inside the sync
+    // `_keep` closure above). The membership removal is already
+    // fail-closed-persisted; the Commit-broadcast enqueue is Class-C (coalesced —
+    // picked up by the actor's persist tick) and the sender-key delivery is
+    // best-effort. `remove_commit_bytes` is `Some` only on the success path (the
+    // fail-close paths return `None` and skip both, matching pre-hoist ordering);
+    // it is the removal Commit already produced under the crypto `Arc` (Class-M)
+    // inside the closure.
+    if let Some(remove_commit_bytes) = remove_commit_bytes {
+        try_broadcast_commit_or_enqueue(
+            cell.class_c_view().commit_broadcast_borrows(),
+            deps,
+            context_id,
+            remove_commit_bytes,
+            &CommitOperation::RemoveMember {
+                target_did: did.clone(),
+            },
+        )
+        .await;
+
+        // Phase 2A.9: drain_and_deliver_sender_keys is now actor-shape.
+        if let Err(e) = crate::context::lifecycle_helpers::drain_and_deliver_sender_keys(
+            deps,
+            context_id,
+            &context_id_bytes,
+        )
+        .await
+        {
+            tracing::warn!(
+                context_id = %context_id,
+                error = %e,
+                "failed to deliver rotated sender keys after member removal"
+            );
+        }
+    }
+
     // Subject-bearing leaf (ADR-011 amendment): carry the *affected member*
     // (`did`) and the role it held at departure, not just `actor_did` (the
     // executing admin). Participation `participation_duration_secs` (§7.3.2)
@@ -2441,7 +2465,8 @@ pub async fn execute_reset_member(
             target_did: did.clone(),
             is_remove: true,
         },
-    );
+    )
+    .await;
     try_broadcast_commit_or_enqueue(
         view.commit_broadcast_borrows(),
         deps,
@@ -2451,7 +2476,8 @@ pub async fn execute_reset_member(
             target_did: did.clone(),
             is_remove: false,
         },
-    );
+    )
+    .await;
 
     if let Err(e) = deps
         .crypto
@@ -2478,7 +2504,9 @@ pub async fn execute_reset_member(
         deps,
         context_id,
         &context_id_bytes,
-    ) {
+    )
+    .await
+    {
         tracing::warn!(
             context_id = %context_id,
             error = %e,
@@ -2722,75 +2750,85 @@ pub async fn execute_rotate_content_keys(
     // through `commit_class_s_keep` so it persists fail-closed (keep-direction:
     // on persist failure the rotation STAYS — reverting to the pre-rotation key
     // state after the rotation was acknowledged is the unsafe direction). The
-    // crypto/access-key mutations + emit + broadcast enqueue (Class-C) ride the
-    // SAME fail-closed persist via `view.rest_mut()`. Broadcast per-author key
-    // epochs now ride the Class-S `ContextSnapshot`, so the all-author key-epoch
-    // advance persists fail-closed atomically inside the combinator — the prior
-    // trailing best-effort `persist_broadcast_snapshot` is gone (§5.14.8).
-    cell.commit_class_s_keep(deps, context_id, |mut view| {
-        let state = view.rest_mut();
-        require_active(&state.handle)?;
+    // crypto/access-key mutations + emit ride the fail-closed persist via
+    // `view.rest_mut()`. The MLS-Commit broadcast ENQUEUE (Class-C) is hoisted to
+    // AFTER the persist (ADR-049 Decision 7 — transport is async and cannot be
+    // awaited inside the sync closure); it is coalesced, not fail-closed, which is
+    // its correct class. Broadcast per-author key epochs still ride the Class-S
+    // `ContextSnapshot`, so the all-author key-epoch advance persists fail-closed
+    // atomically inside the combinator — the prior trailing best-effort
+    // `persist_broadcast_snapshot` is gone (§5.14.8).
+    let rotate_commit_bytes = cell
+        .commit_class_s_keep(deps, context_id, |mut view| {
+            let state = view.rest_mut();
+            require_active(&state.handle)?;
 
-        let epoch_output = if let Some(ref mut bc) = state.broadcast_context {
-            bc.rotate_all_author_keys()?;
-            None
-        } else {
-            let epoch_out = deps.crypto.advance_epoch(&context_id_bytes)?;
+            let epoch_output = if let Some(ref mut bc) = state.broadcast_context {
+                bc.rotate_all_author_keys()?;
+                None
+            } else {
+                let epoch_out = deps.crypto.advance_epoch(&context_id_bytes)?;
 
-            let member_dids: Vec<String> = state
-                .membership
-                .member_dids()
-                .map(|d| d.0.clone())
-                .collect();
-            let current_epoch = state
-                .access
-                .access_key_store
-                .get_all(context_id)
-                .values()
-                .map(scp_protocol::crypto::access_keys::AccessKey::epoch)
-                .max()
-                .unwrap_or(0);
-            let did_refs: Vec<&str> = member_dids.iter().map(String::as_str).collect();
-            let rotation = crate::crypto::access_keys::lifecycle::rotate_all_access_keys(
-                context_id,
-                &did_refs,
-                current_epoch,
-            )
-            .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
-            for new_key in rotation.new_keys {
-                let did = new_key.member_did().to_owned();
-                state.access.access_key_store.set(context_id, &did, new_key);
-            }
-            Some(epoch_out)
-        };
+                let member_dids: Vec<String> = state
+                    .membership
+                    .member_dids()
+                    .map(|d| d.0.clone())
+                    .collect();
+                let current_epoch = state
+                    .access
+                    .access_key_store
+                    .get_all(context_id)
+                    .values()
+                    .map(scp_protocol::crypto::access_keys::AccessKey::epoch)
+                    .max()
+                    .unwrap_or(0);
+                let did_refs: Vec<&str> = member_dids.iter().map(String::as_str).collect();
+                let rotation = crate::crypto::access_keys::lifecycle::rotate_all_access_keys(
+                    context_id,
+                    &did_refs,
+                    current_epoch,
+                )
+                .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+                for new_key in rotation.new_keys {
+                    let did = new_key.member_did().to_owned();
+                    state.access.access_key_store.set(context_id, &did, new_key);
+                }
+                Some(epoch_out)
+            };
 
-        emit(
-            state,
-            ContextEvent::ContentKeysRotated {
-                reason: reason.map(String::from),
-            },
-            context_id,
-            deps,
-        );
-
-        if let Some(epoch_out) = epoch_output {
-            try_broadcast_commit_or_enqueue(
-                CommitBroadcastBorrows {
-                    pending_commits: &mut state.pending_commits,
-                    commit_fault: &mut state.commit_fault,
-                    receive_buffer: &mut state.receive_buffer,
-                },
-                deps,
-                context_id,
-                epoch_out.commit_bytes,
-                &CommitOperation::RotateContentKeys {
+            emit(
+                state,
+                ContextEvent::ContentKeysRotated {
                     reason: reason.map(String::from),
                 },
+                context_id,
+                deps,
             );
-        }
-        Ok(())
-    })
-    .await?;
+
+            // Capture the epoch-advance Commit bytes (non-broadcast path); the ASYNC
+            // Commit broadcast runs AFTER the fail-closed persist, outside this sync
+            // `_keep` closure (ADR-049 Decision 7 — transport is async). `None` on
+            // the broadcast path (no MLS Commit) or when no epoch advance occurred.
+            Ok(epoch_output.map(|epoch_out| epoch_out.commit_bytes))
+        })
+        .await?;
+
+    // Async transport op AFTER the Class-S rotation persist (ADR-049 Decision 7).
+    // The key rotation is fail-closed-persisted; the Commit-broadcast enqueue is
+    // Class-C (coalesced — picked up by the actor's persist tick). The commit
+    // bytes were produced under the crypto `Arc` (Class-M) inside the closure.
+    if let Some(commit_bytes) = rotate_commit_bytes {
+        try_broadcast_commit_or_enqueue(
+            cell.class_c_view().commit_broadcast_borrows(),
+            deps,
+            context_id,
+            commit_bytes,
+            &CommitOperation::RotateContentKeys {
+                reason: reason.map(String::from),
+            },
+        )
+        .await;
+    }
 
     deps.event_log
         .append_context_event(
@@ -5339,7 +5377,7 @@ pub struct CommitBroadcastBorrows<'a> {
 /// (never a durable Merkle leaf — see the §9.9.3 note above), and the
 /// `receive_buffer` emit is a local `ContextEvent`. None requires a fail-closed
 /// persist, so the field-granular best-effort shape is sound.
-pub fn try_broadcast_commit_or_enqueue(
+pub async fn try_broadcast_commit_or_enqueue(
     borrows: CommitBroadcastBorrows<'_>,
     deps: &ActorDeps,
     context_id: &str,
@@ -5355,7 +5393,11 @@ pub fn try_broadcast_commit_or_enqueue(
         receive_buffer,
     } = borrows;
     let routing_id = scp_protocol::context::context_routing_id(context_id);
-    match deps.transport.send_message(&routing_id, &commit_bytes) {
+    match deps
+        .transport
+        .send_message(&routing_id, &commit_bytes)
+        .await
+    {
         Ok(()) => {}
         Err(e) => {
             let now = deps.clock.now_secs();

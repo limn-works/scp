@@ -2442,12 +2442,13 @@ struct BroadcastWatchTransport {
     saw_broadcast: Arc<std::sync::atomic::AtomicBool>,
 }
 
+#[async_trait::async_trait]
 impl ContextTransportProvider for BroadcastWatchTransport {
     fn is_connected(&self) -> bool {
         true
     }
 
-    fn publish_context(
+    async fn publish_context(
         &self,
         _context_id: &[u8; 32],
         _params: &ContextParams,
@@ -2455,14 +2456,14 @@ impl ContextTransportProvider for BroadcastWatchTransport {
         Ok(())
     }
 
-    fn delete_published(
+    async fn delete_published(
         &self,
         _context_id: &[u8; 32],
     ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
         Ok(())
     }
 
-    fn send_message(
+    async fn send_message(
         &self,
         context_id: &[u8; 32],
         encrypted_payload: &[u8],
@@ -2699,12 +2700,13 @@ async fn invite_member_by_non_admin_is_rejected() {
 /// Welcome can never be delivered.
 struct FatalDeliveryTransport;
 
+#[async_trait::async_trait]
 impl ContextTransportProvider for FatalDeliveryTransport {
     fn is_connected(&self) -> bool {
         true
     }
 
-    fn publish_context(
+    async fn publish_context(
         &self,
         _context_id: &[u8; 32],
         _params: &ContextParams,
@@ -2712,7 +2714,7 @@ impl ContextTransportProvider for FatalDeliveryTransport {
         Ok(())
     }
 
-    fn delete_published(
+    async fn delete_published(
         &self,
         _context_id: &[u8; 32],
     ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
@@ -2721,7 +2723,7 @@ impl ContextTransportProvider for FatalDeliveryTransport {
 
     // Commit broadcast succeeds (so both the add and the compensating remove
     // deliver their epoch Commits without enqueuing).
-    fn send_message(
+    async fn send_message(
         &self,
         _context_id: &[u8; 32],
         _encrypted_payload: &[u8],
@@ -2731,7 +2733,7 @@ impl ContextTransportProvider for FatalDeliveryTransport {
 
     // Invitation delivery fails FATALLY (not `TransportFailed`), so the invitee
     // gets nothing — this is the case that must trigger the compensating remove.
-    fn send_to_routing_id(
+    async fn send_to_routing_id(
         &self,
         _routing_id: &[u8; 32],
         _payload: &[u8],
@@ -3017,12 +3019,13 @@ struct AcceptingSendTransport {
     sends: Arc<std::sync::atomic::AtomicUsize>,
 }
 
+#[async_trait::async_trait]
 impl ContextTransportProvider for AcceptingSendTransport {
     fn is_connected(&self) -> bool {
         true
     }
 
-    fn publish_context(
+    async fn publish_context(
         &self,
         _context_id: &[u8; 32],
         _params: &ContextParams,
@@ -3030,14 +3033,14 @@ impl ContextTransportProvider for AcceptingSendTransport {
         Ok(())
     }
 
-    fn delete_published(
+    async fn delete_published(
         &self,
         _context_id: &[u8; 32],
     ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
         Ok(())
     }
 
-    fn send_message(
+    async fn send_message(
         &self,
         _context_id: &[u8; 32],
         encrypted_payload: &[u8],

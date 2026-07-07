@@ -30,6 +30,21 @@ pub use scp_protocol::context::builder::{
 ///
 /// Implementors handle relay connectivity checks and context publication /
 /// deletion.
+///
+/// # Async discipline (ADR-049 Decision 7)
+///
+/// This is a partial-async trait. The transport-I/O methods (`publish_context`,
+/// `delete_published`, `send_message`, `send_to_routing_id`,
+/// `publish_key_package`) are `async` and `.await` the underlying async
+/// transport adapter directly — the `block_in_place` sync→async bridge in
+/// `scp-transport`'s `RelayTransportProvider` is deleted. The `is_connected`
+/// method stays **sync**: it reads an `AtomicBool` and touches no async I/O.
+/// This is the ADR's explicit `is_connected`-stays-sync carve-out.
+///
+/// Held as `Arc<dyn ContextTransportProvider>` inside `ActorDeps` (moved into
+/// `tokio::spawn`), so the async futures must be **Send** — plain
+/// `#[async_trait]`, not `?Send`.
+#[async_trait::async_trait]
 pub trait ContextTransportProvider: Send + Sync {
     /// Returns `true` if the transport layer is connected and at least one
     /// relay is reachable.
@@ -40,7 +55,7 @@ pub trait ContextTransportProvider: Send + Sync {
     /// # Errors
     ///
     /// Returns [`ContextCreationError`] if publication fails.
-    fn publish_context(
+    async fn publish_context(
         &self,
         context_id: &[u8; 32],
         params: &ContextParams,
@@ -52,7 +67,7 @@ pub trait ContextTransportProvider: Send + Sync {
     ///
     /// Returns [`ContextCreationError`] if deletion fails. Callers may
     /// ignore this error during rollback (best-effort).
-    fn delete_published(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError>;
+    async fn delete_published(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError>;
 
     // -- Messaging operations (SCP-020) ------------------------------------
 
@@ -61,7 +76,7 @@ pub trait ContextTransportProvider: Send + Sync {
     /// # Errors
     ///
     /// Returns [`ContextError::TransportFailed`] if sending fails.
-    fn send_message(
+    async fn send_message(
         &self,
         context_id: &[u8; 32],
         encrypted_payload: &[u8],
@@ -76,7 +91,7 @@ pub trait ContextTransportProvider: Send + Sync {
     /// # Errors
     ///
     /// Returns [`ContextError::TransportFailed`] if sending fails.
-    fn send_to_routing_id(
+    async fn send_to_routing_id(
         &self,
         _routing_id: &[u8; 32],
         _payload: &[u8],
@@ -114,7 +129,11 @@ pub trait ContextTransportProvider: Send + Sync {
     /// # Errors
     ///
     /// Returns [`ContextError::TransportFailed`] if publication fails.
-    fn publish_key_package(&self, _owner_did: &str, _kp_bytes: &[u8]) -> Result<(), ContextError> {
+    async fn publish_key_package(
+        &self,
+        _owner_did: &str,
+        _kp_bytes: &[u8],
+    ) -> Result<(), ContextError> {
         Err(ContextError::TransportFailed(
             "publish_key_package not supported".into(),
         ))
@@ -532,12 +551,13 @@ pub trait ContextEventLogProvider: Send + Sync {
 /// production builds and carries no failure-injection machinery.
 pub struct LocalTransportProvider;
 
+#[async_trait::async_trait]
 impl ContextTransportProvider for LocalTransportProvider {
     fn is_connected(&self) -> bool {
         true
     }
 
-    fn publish_context(
+    async fn publish_context(
         &self,
         _context_id: &[u8; 32],
         _params: &ContextParams,
@@ -545,11 +565,11 @@ impl ContextTransportProvider for LocalTransportProvider {
         Ok(())
     }
 
-    fn delete_published(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+    async fn delete_published(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
         Ok(())
     }
 
-    fn send_message(
+    async fn send_message(
         &self,
         _context_id: &[u8; 32],
         _encrypted_payload: &[u8],
@@ -573,12 +593,13 @@ impl ContextTransportProvider for LocalTransportProvider {
 /// successfully when no relay is actually reachable.
 pub struct NotConfiguredTransportProvider;
 
+#[async_trait::async_trait]
 impl ContextTransportProvider for NotConfiguredTransportProvider {
     fn is_connected(&self) -> bool {
         false
     }
 
-    fn publish_context(
+    async fn publish_context(
         &self,
         _context_id: &[u8; 32],
         _params: &ContextParams,
@@ -590,7 +611,7 @@ impl ContextTransportProvider for NotConfiguredTransportProvider {
         ))
     }
 
-    fn delete_published(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+    async fn delete_published(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
         Err(ContextCreationError::TransportFailed(
             "transport not configured — call transport_connect() to set up a relay \
              before deleting published contexts"
@@ -598,7 +619,7 @@ impl ContextTransportProvider for NotConfiguredTransportProvider {
         ))
     }
 
-    fn send_message(
+    async fn send_message(
         &self,
         _context_id: &[u8; 32],
         _encrypted_payload: &[u8],
@@ -723,7 +744,7 @@ impl CreationReceipt {
         if self.published {
             // Best-effort: relays are untrusted, orphaned blobs are encrypted
             // with destroyed keys.
-            let _ = transport.delete_published(context_id);
+            let _ = transport.delete_published(context_id).await;
         }
         if self.event_log.is_some() {
             let _ = event_log.destroy_event_log(context_id).await;
@@ -955,7 +976,7 @@ pub async fn create_context(
     // warning and continue.  The context won't be discoverable via
     // relay until a subsequent publish or sync, but all local state
     // (MLS group, sender key, event log) remains valid.
-    match transport.publish_context(&id_bytes, &params) {
+    match transport.publish_context(&id_bytes, &params).await {
         Ok(()) => {
             receipt.published = true;
         }
@@ -1057,21 +1078,22 @@ mod tests {
     const TEST_DID: &str = "did:dht:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK";
 
     struct TestTransport;
+    #[async_trait::async_trait]
     impl ContextTransportProvider for TestTransport {
         fn is_connected(&self) -> bool {
             true
         }
-        fn publish_context(
+        async fn publish_context(
             &self,
             _: &[u8; 32],
             _: &ContextParams,
         ) -> Result<(), ContextCreationError> {
             Ok(())
         }
-        fn delete_published(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
+        async fn delete_published(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
             Ok(())
         }
-        fn send_message(&self, _: &[u8; 32], _: &[u8]) -> Result<(), ContextError> {
+        async fn send_message(&self, _: &[u8; 32], _: &[u8]) -> Result<(), ContextError> {
             Ok(())
         }
     }

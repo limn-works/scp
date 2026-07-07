@@ -1,30 +1,34 @@
 //! Production [`ContextTransportProvider`] wrapping `NativeRelayAdapter`.
 //!
-//! [`RelayTransportProvider`] implements the synchronous
+//! [`RelayTransportProvider`] implements the async
 //! [`ContextTransportProvider`] trait from `scp-core` by wrapping a
-//! `NativeRelayAdapter` (or any [`TransportAdapter`]) and bridging
-//! async transport operations to synchronous calls using
-//! `tokio::task::block_in_place`.
+//! `NativeRelayAdapter` (or any [`TransportAdapter`]) and `.await`ing the
+//! adapter's async transport operations directly.
 //!
-//! # Design
+//! # Design (ADR-049 Decision 7)
 //!
-//! The [`ContextTransportProvider`] trait methods are synchronous (`&self`)
-//! because they are called from within `ContextManager` operations that hold
-//! `Mutex` guards. The underlying transport operations are async, so this
-//! provider bridges the gap using `block_in_place` + `Handle::block_on`.
+//! The I/O [`ContextTransportProvider`] trait methods are `async` and simply
+//! `.await` the underlying async [`TransportAdapter`] — there is NO
+//! `block_in_place` / `Handle::block_on` sync→async bridge. Because every
+//! [`TransportAdapter`] method takes `&self`, the adapter is held behind a
+//! plain `Arc<A>` (no `Mutex`): concurrent sends share `&A` directly and the
+//! resulting futures stay `Send`, so the provider is safe to hold as
+//! `Arc<dyn ContextTransportProvider>` in `ActorDeps` (moved into
+//! `tokio::spawn`).
 //!
-//! The `is_connected` method tracks connection state via an `AtomicBool`
-//! that is set during construction or reconnection.
+//! The `is_connected` method stays **sync** — it tracks connection state via
+//! an `AtomicBool` set during construction or reconnection (ADR-049 Decision 7
+//! `is_connected`-stays-sync carve-out).
 //!
 //! # Thread Safety
 //!
-//! `RelayTransportProvider` is `Send + Sync`. The underlying adapter is
-//! stored in an `Arc<Mutex<_>>` to allow mutable access for send operations.
+//! `RelayTransportProvider` is `Send + Sync`. The underlying adapter is stored
+//! in an `Arc<A>`; all adapter operations take `&self`.
 //!
 //! See ADR-005 (transport abstraction), ADR-008 (context creation).
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 
 use scp_core::context::builder::{ContextCreationError, ContextTransportProvider};
 use scp_core::context::{ContextError, ContextParams};
@@ -61,8 +65,10 @@ const DEFAULT_BLOB_TTL: u32 = 3600;
 /// );
 /// ```
 pub struct RelayTransportProvider<A: TransportAdapter + Send + Sync + 'static> {
-    /// The underlying transport adapter.
-    adapter: Arc<Mutex<A>>,
+    /// The underlying transport adapter. Held behind a plain `Arc` (no
+    /// `Mutex`): every [`TransportAdapter`] method takes `&self`, so the
+    /// async provider methods share `&A` and `.await` directly.
+    adapter: Arc<A>,
     /// Whether the transport is currently connected.
     connected: AtomicBool,
 }
@@ -75,7 +81,7 @@ impl<A: TransportAdapter + Send + Sync + 'static> RelayTransportProvider<A> {
     #[must_use]
     pub fn new(adapter: A) -> Self {
         Self {
-            adapter: Arc::new(Mutex::new(adapter)),
+            adapter: Arc::new(adapter),
             connected: AtomicBool::new(true),
         }
     }
@@ -114,64 +120,21 @@ impl<A: TransportAdapter + Send + Sync + 'static> RelayTransportProvider<A> {
         }
     }
 
-    /// Bridge the async adapter `send` to the synchronous
-    /// [`ContextTransportProvider`] surface WITHOUT panicking on a
-    /// `current_thread` runtime.
+    /// `.await` the async adapter `send`, mapping a transport failure into a
+    /// typed [`ContextError::TransportFailed`].
     ///
-    /// `tokio::task::block_in_place` requires a multi-thread runtime: on a
-    /// `current_thread` runtime it PANICS (`can call blocking only when
-    /// running on the multi-threaded runtime`), and that panic is reachable
-    /// from production (any node driven by a `current_thread` runtime), so it
-    /// must be turned into a typed error rather than an unwind. We probe the
-    /// current runtime's flavor first and return
-    /// [`ContextError::TransportFailed`] on `current_thread`, only entering
-    /// `block_in_place` when the multi-thread flavor makes it safe.
-    fn send_blocking(&self, envelope: &OuterEnvelope) -> Result<BlobId, ContextError> {
-        // Shared runtime-flavor probe: `block_in_place` panics on a
-        // `current_thread` runtime (a reachable production crash), so guard it
-        // and surface a typed error. `op` is the description for the typed
-        // error messages.
-        require_multi_thread_runtime("send").map_err(ContextError::TransportFailed)?;
-        let adapter = Arc::clone(&self.adapter);
-        // ci-allow: block-on: multi-thread runtime only — flavor is checked
-        // above; current_thread returns a typed error instead of panicking.
-        // Sync ContextTransportProvider surface bridges to the async adapter
-        // here.
-        tokio::task::block_in_place(|| {
-            let guard = adapter
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            tokio::runtime::Handle::current().block_on(guard.send(envelope))
-        })
-        .map_err(|e| ContextError::TransportFailed(e.to_string()))
+    /// Every [`TransportAdapter`] method takes `&self`, so this shares `&A`
+    /// through the `Arc` and awaits the adapter future directly — no
+    /// `block_in_place`, and the future is `Send`.
+    async fn send_via_adapter(&self, envelope: &OuterEnvelope) -> Result<BlobId, ContextError> {
+        self.adapter
+            .send(envelope)
+            .await
+            .map_err(|e| ContextError::TransportFailed(e.to_string()))
     }
 }
 
-/// Probe the current tokio runtime and require the multi-thread flavor.
-///
-/// `tokio::task::block_in_place` PANICS on a `current_thread` runtime (a
-/// reachable production crash from any node driven by a `current_thread`
-/// runtime), so every sync→async bridge in this provider must check the flavor
-/// FIRST and return a typed error instead of unwinding. `op` names the
-/// operation for the error text (e.g. `"send"`, `"delete"`).
-///
-/// Returns `Ok(())` only on a multi-thread runtime; otherwise an `Err(String)`
-/// the caller maps into its own transport-error type.
-fn require_multi_thread_runtime(op: &str) -> Result<(), String> {
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
-            Ok(())
-        }
-        Ok(_) => Err(format!(
-            "transport {op} requires a multi-thread tokio runtime; \
-             a current_thread runtime cannot bridge the sync→async boundary"
-        )),
-        Err(_) => Err(format!("transport {op} called outside a tokio runtime")),
-    }
-}
-
-// Nursery lint — false-positives on lock guards across block boundaries.
-#[allow(clippy::significant_drop_tightening)]
+#[async_trait::async_trait]
 impl<A: TransportAdapter + Send + Sync + 'static> ContextTransportProvider
     for RelayTransportProvider<A>
 {
@@ -179,7 +142,7 @@ impl<A: TransportAdapter + Send + Sync + 'static> ContextTransportProvider
         self.connected.load(Ordering::Acquire)
     }
 
-    fn publish_context(
+    async fn publish_context(
         &self,
         context_id: &[u8; 32],
         _params: &ContextParams,
@@ -189,46 +152,34 @@ impl<A: TransportAdapter + Send + Sync + 'static> ContextTransportProvider
         // published (they are exchanged via the invite/join flow). The
         // routing_id is the context_id itself (used by relays for routing).
         let envelope = Self::build_envelope(context_id.to_vec(), vec![0x00]);
-        self.send_blocking(&envelope)
+        self.send_via_adapter(&envelope)
+            .await
             .map(|_blob_id| ())
             .map_err(|e| ContextCreationError::TransportFailed(e.to_string()))
     }
 
-    fn delete_published(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+    async fn delete_published(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
         let blob_id = BlobId::from_sha256(context_id);
-
-        // Shared runtime-flavor probe (see `require_multi_thread_runtime`):
-        // block_in_place panics on a current_thread runtime, so guard it and
-        // surface a typed error instead.
-        require_multi_thread_runtime("delete").map_err(ContextCreationError::TransportFailed)?;
-
-        let adapter = Arc::clone(&self.adapter);
-        let result = tokio::task::block_in_place(|| {
-            let guard = adapter
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            // ci-allow: block-on: multi-thread runtime only (flavor checked
-            // above); sync ContextTransportProvider surface bridges to the
-            // async adapter delete here.
-            tokio::runtime::Handle::current().block_on(guard.delete(&blob_id))
-        });
-
-        match result {
-            Ok(()) => Ok(()),
-            Err(e) => Err(ContextCreationError::TransportFailed(e.to_string())),
-        }
+        self.adapter
+            .delete(&blob_id)
+            .await
+            .map_err(|e| ContextCreationError::TransportFailed(e.to_string()))
     }
 
-    fn send_message(
+    async fn send_message(
         &self,
         context_id: &[u8; 32],
         encrypted_payload: &[u8],
     ) -> Result<(), ContextError> {
         let envelope = Self::build_envelope(context_id.to_vec(), encrypted_payload.to_vec());
-        self.send_blocking(&envelope).map(|_blob_id| ())
+        self.send_via_adapter(&envelope).await.map(|_blob_id| ())
     }
 
-    fn publish_key_package(&self, owner_did: &str, kp_bytes: &[u8]) -> Result<(), ContextError> {
+    async fn publish_key_package(
+        &self,
+        owner_did: &str,
+        kp_bytes: &[u8],
+    ) -> Result<(), ContextError> {
         // Route the published KeyPackage under the CANONICAL per-DID routing id
         // `derive_key_package_routing_id(owner_did)` (spec §5.12.3), so a peer
         // fetches this identity's KeyPackages with the SAME id the canonical
@@ -238,7 +189,7 @@ impl<A: TransportAdapter + Send + Sync + 'static> ContextTransportProvider
         // idempotent at the relay.
         let routing_id = derive_key_package_routing_id(owner_did);
         let envelope = Self::build_envelope(routing_id.to_vec(), kp_bytes.to_vec());
-        self.send_blocking(&envelope).map(|_blob_id| ())
+        self.send_via_adapter(&envelope).await.map(|_blob_id| ())
     }
 }
 
@@ -338,32 +289,33 @@ mod tests {
         assert!(provider.is_connected());
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    // Async provider methods run on a plain `current_thread` runtime — no
+    // `block_in_place`, so no multi-thread requirement (ADR-049 Decision 7).
+    #[tokio::test]
     async fn publish_context_sends_envelope() {
         let adapter = TestAdapter::new();
         let provider = RelayTransportProvider::new(adapter);
         let ctx_id = [1u8; 32];
 
-        let result = provider.publish_context(&ctx_id, &ContextParams::default());
+        let result = provider
+            .publish_context(&ctx_id, &ContextParams::default())
+            .await;
         assert!(result.is_ok());
 
-        let count = provider
-            .adapter
-            .lock()
-            .unwrap()
-            .send_count
-            .load(Ordering::Relaxed);
+        let count = provider.adapter.send_count.load(Ordering::Relaxed);
         assert_eq!(count, 1);
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[tokio::test]
     async fn publish_context_returns_error_on_send_failure() {
         let adapter = TestAdapter::new();
         adapter.fail_send.store(true, Ordering::Relaxed);
         let provider = RelayTransportProvider::new(adapter);
         let ctx_id = [2u8; 32];
 
-        let result = provider.publish_context(&ctx_id, &ContextParams::default());
+        let result = provider
+            .publish_context(&ctx_id, &ContextParams::default())
+            .await;
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
@@ -371,50 +323,40 @@ mod tests {
         ));
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[tokio::test]
     async fn delete_published_sends_delete() {
         let adapter = TestAdapter::new();
         let provider = RelayTransportProvider::new(adapter);
         let ctx_id = [3u8; 32];
 
-        let result = provider.delete_published(&ctx_id);
+        let result = provider.delete_published(&ctx_id).await;
         assert!(result.is_ok());
 
-        let count = provider
-            .adapter
-            .lock()
-            .unwrap()
-            .delete_count
-            .load(Ordering::Relaxed);
+        let count = provider.adapter.delete_count.load(Ordering::Relaxed);
         assert_eq!(count, 1);
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[tokio::test]
     async fn send_message_delivers_payload() {
         let adapter = TestAdapter::new();
         let provider = RelayTransportProvider::new(adapter);
         let ctx_id = [4u8; 32];
 
-        let result = provider.send_message(&ctx_id, b"encrypted-payload");
+        let result = provider.send_message(&ctx_id, b"encrypted-payload").await;
         assert!(result.is_ok());
 
-        let count = provider
-            .adapter
-            .lock()
-            .unwrap()
-            .send_count
-            .load(Ordering::Relaxed);
+        let count = provider.adapter.send_count.load(Ordering::Relaxed);
         assert_eq!(count, 1);
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[tokio::test]
     async fn send_message_returns_error_on_failure() {
         let adapter = TestAdapter::new();
         adapter.fail_send.store(true, Ordering::Relaxed);
         let provider = RelayTransportProvider::new(adapter);
         let ctx_id = [5u8; 32];
 
-        let result = provider.send_message(&ctx_id, b"data");
+        let result = provider.send_message(&ctx_id, b"data").await;
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),

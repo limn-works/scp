@@ -1066,7 +1066,7 @@ impl KeyPackageStoreActor {
                 let _ = reply.send(result);
             }
             KeyPackageCommand::Publish { reply } => {
-                let result = self.handle_publish();
+                let result = self.handle_publish().await;
                 let _ = reply.send(result);
             }
             KeyPackageCommand::ListPooled { reply } => {
@@ -1576,7 +1576,7 @@ impl KeyPackageStoreActor {
     /// happens). Idempotent: a `kp_ref` already published is skipped, and it is
     /// marked published only after the transport accepts it. An empty pool is a
     /// no-op success.
-    fn handle_publish(&mut self) -> Result<(), ContextError> {
+    async fn handle_publish(&mut self) -> Result<(), ContextError> {
         // Snapshot the refs+bytes to publish so we don't borrow `self.pool`
         // while mutating `published_refs`. The transport publish is sync.
         let to_publish: Vec<(KpRef, Vec<u8>)> = self
@@ -1592,6 +1592,7 @@ impl KeyPackageStoreActor {
             }
             self.transport
                 .publish_key_package(&owner_did, &public_bytes)
+                .await
                 .map_err(|e| {
                     ContextError::TransportFailed(format!("publishing key package: {e}"))
                 })?;

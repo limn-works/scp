@@ -227,6 +227,7 @@ pub async fn recovery_advance_epoch(
         if let Err(e) = deps
             .transport
             .send_message(&routing_id, &epoch_output.commit_bytes)
+            .await
         {
             tracing::warn!(
                 context_id = %context_id,
@@ -321,7 +322,7 @@ pub async fn recovery_advance_epoch(
 /// through `deps.crypto` (still supervisor-scoped during the migration
 /// window); transport delivery via `deps.transport`. Does NOT mutate
 /// `state`.
-pub fn recovery_send_notification(
+pub async fn recovery_send_notification(
     cell: &mut ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
@@ -369,7 +370,7 @@ pub fn recovery_send_notification(
     )?;
 
     // Send via transport using the domain-separated routing ID.
-    deps.transport.send_message(&routing_id, &encrypted)?;
+    deps.transport.send_message(&routing_id, &encrypted).await?;
 
     Ok(())
 }

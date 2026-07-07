@@ -234,7 +234,7 @@ pub async fn leave_context(
     // through the whole `&mut PerContextState` the view hands back;
     // `try_broadcast_commit_or_enqueue` is passed only the three disjoint Class-C
     // fields it mutates (via `CommitBroadcastBorrows`), borrowed from that same state.
-    let (should_close, left_role_name) = cell
+    let (should_close, left_role_name, is_broadcast, mls_commit_bytes) = cell
         .commit_class_s_keep(deps, &context_id, |mut view| {
             let state = view.rest_mut();
 
@@ -259,7 +259,18 @@ pub async fn leave_context(
             // H9: MLS group removal FIRST (hard security boundary), then sender
             // key cleanup as best-effort. MLS removal is the cryptographic
             // enforcement; sender key removal is defense-in-depth (§9.16).
-            if !is_broadcast {
+            //
+            // Capture the removal Commit bytes here; the ASYNC transport ops
+            // (Commit broadcast, sender-key rotation + delivery) run AFTER the
+            // fail-closed persist below, outside this synchronous `_keep` closure
+            // (ADR-049 Decision 7 — `ContextTransportProvider` is now async and
+            // cannot be awaited inside the sync closure). The membership removal
+            // is fail-closed-persisted by the combinator; the Commit-broadcast
+            // enqueue is Class-C (coalesced) and the sender-key rotation/delivery
+            // are best-effort crypto/transport side-effects.
+            let mls_commit_bytes = if is_broadcast {
+                None
+            } else {
                 let remove_output = deps.crypto.remove_member(&context_id_bytes, member_did)?;
                 if let Err(e) = deps
                     .crypto
@@ -273,45 +284,8 @@ pub async fn leave_context(
                          sender key layer may retain stale key"
                     );
                 }
-
-                // Broadcast the MLS Commit to remaining members so they can
-                // advance their group epoch and ratchet key material. PR #1606
-                // C6: on transport failure, the commit is durably enqueued for
-                // retry.
-                governance_helpers::try_broadcast_commit_or_enqueue(
-                    governance_helpers::CommitBroadcastBorrows {
-                        pending_commits: &mut state.pending_commits,
-                        commit_fault: &mut state.commit_fault,
-                        receive_buffer: &mut state.receive_buffer,
-                    },
-                    deps,
-                    &context_id,
-                    remove_output.commit_bytes,
-                    &CommitOperation::LeaveContext {
-                        member_did: member_did.clone(),
-                    },
-                );
-
-                // Rotate the local sender key and distribute to remaining members
-                // (§9.16.4). M23: Non-fatal — MLS removal above is the hard
-                // security boundary. If rotation fails, log but continue.
-                if let Err(e) = deps.crypto.rotate_sender_key(&context_id_bytes) {
-                    tracing::warn!(
-                        context_id = %context_id,
-                        error = %e,
-                        "rotate_sender_key failed after leave — \
-                         remaining members retain old sender key"
-                    );
-                }
-                if let Err(e) = drain_and_deliver_sender_keys(deps, &context_id, &context_id_bytes)
-                {
-                    tracing::warn!(
-                        context_id = %context_id,
-                        error = %e,
-                        "failed to deliver rotated sender keys after leave"
-                    );
-                }
-            }
+                Some(remove_output.commit_bytes)
+            };
 
             // State check + membership removal -- the actor owns state for the
             // duration of this command, so no relock dance is required.
@@ -384,9 +358,54 @@ pub async fn leave_context(
 
             let should_close = state.membership.count() == 0;
 
-            Ok((should_close, left_role_name))
+            Ok((should_close, left_role_name, is_broadcast, mls_commit_bytes))
         })
         .await?;
+
+    // Async transport ops AFTER the Class-S removal persist (ADR-049 Decision 7:
+    // `ContextTransportProvider` is async and cannot be awaited inside the
+    // synchronous `_keep` closure above). The membership removal is already
+    // fail-closed-persisted; the MLS-Commit broadcast enqueue is Class-C
+    // (coalesced — picked up by the actor's persist tick) and the sender-key
+    // rotation + delivery are best-effort crypto/transport side-effects. The
+    // captured `mls_commit_bytes` is the removal Commit already produced under
+    // the crypto `Arc` (Class-M) inside the closure.
+    if !is_broadcast {
+        if let Some(commit_bytes) = mls_commit_bytes {
+            // Broadcast the MLS Commit to remaining members so they can advance
+            // their group epoch and ratchet key material. PR #1606 C6: on
+            // transport failure, the commit is durably enqueued for retry.
+            governance_helpers::try_broadcast_commit_or_enqueue(
+                cell.class_c_view().commit_broadcast_borrows(),
+                deps,
+                &context_id,
+                commit_bytes,
+                &CommitOperation::LeaveContext {
+                    member_did: member_did.clone(),
+                },
+            )
+            .await;
+        }
+
+        // Rotate the local sender key and distribute to remaining members
+        // (§9.16.4). M23: Non-fatal — MLS removal above is the hard security
+        // boundary. If rotation fails, log but continue.
+        if let Err(e) = deps.crypto.rotate_sender_key(&context_id_bytes) {
+            tracing::warn!(
+                context_id = %context_id,
+                error = %e,
+                "rotate_sender_key failed after leave — \
+                 remaining members retain old sender key"
+            );
+        }
+        if let Err(e) = drain_and_deliver_sender_keys(deps, &context_id, &context_id_bytes).await {
+            tracing::warn!(
+                context_id = %context_id,
+                error = %e,
+                "failed to deliver rotated sender keys after leave"
+            );
+        }
+    }
 
     // Append the `MemberLeft` Merkle leaf AFTER the Class-S removal persist.
     // Under ADR-049 Decision 7 `EventLogPersistence` is async, so this append
@@ -445,7 +464,7 @@ pub async fn leave_context(
 /// Returns a [`ContextError`] if the underlying drain call fails
 /// catastrophically. Per-recipient send failures are logged but not
 /// propagated (the receiver can recover via `SenderKeyRequest`).
-pub fn drain_and_deliver_sender_keys(
+pub async fn drain_and_deliver_sender_keys(
     deps: &ActorDeps,
     context_id: &str,
     context_id_bytes: &[u8; 32],
@@ -469,7 +488,7 @@ pub fn drain_and_deliver_sender_keys(
                 crate::context::messaging_helpers::DEFAULT_BLOB_TTL_SECS,
             ) {
                 Ok(sealed) => {
-                    if let Err(e) = deps.transport.send_message(&routing_id, &sealed) {
+                    if let Err(e) = deps.transport.send_message(&routing_id, &sealed).await {
                         tracing::warn!(target_did = %target_did, context_id = %context_id, error = %e, "failed to send rotated sender key");
                     }
                 }
@@ -946,7 +965,7 @@ pub async fn join_context(
     // Drain pending HPKE-sealed sender key distribution messages and
     // deliver them via the MLS management channel (§9.16.2). MLS-wrap
     // is mandatory — see comment on `drain_and_deliver_sender_keys`.
-    if let Err(e) = drain_and_deliver_sender_keys(deps, &context_id, &context_id_bytes) {
+    if let Err(e) = drain_and_deliver_sender_keys(deps, &context_id, &context_id_bytes).await {
         // Drain failed catastrophically — roll back MLS state, sender
         // key, escrow, and economy ticket so the join is fully aborted.
         let _ = deps.crypto.remove_member(&context_id_bytes, &member_did);
@@ -3284,21 +3303,22 @@ mod restore_reconcile_tests {
 
     /// Connected no-op transport — `create_context` publishes through it.
     struct OkTransport;
+    #[async_trait::async_trait]
     impl ContextTransportProvider for OkTransport {
         fn is_connected(&self) -> bool {
             true
         }
-        fn publish_context(
+        async fn publish_context(
             &self,
             _id: &[u8; 32],
             _params: &ContextParams,
         ) -> Result<(), ContextCreationError> {
             Ok(())
         }
-        fn delete_published(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        async fn delete_published(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
             Ok(())
         }
-        fn send_message(&self, _id: &[u8; 32], _payload: &[u8]) -> Result<(), ContextError> {
+        async fn send_message(&self, _id: &[u8; 32], _payload: &[u8]) -> Result<(), ContextError> {
             Ok(())
         }
     }
