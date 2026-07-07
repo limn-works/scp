@@ -1,7 +1,7 @@
 //! `#[napi] Scp` class — the caller-owned SCP instance exposed to TypeScript.
 //!
 //! `SCP` (exposed to TS as `SCP`) is the top-level SDK-facing handle that
-//! owns a `NapiBridgeInstance` — which in turn owns the `ContextManager`,
+//! owns a `NapiBridgeInstance` — which in turn owns the `Supervisor`,
 //! transport, and bridge-specific registries.
 //!
 //! Phase 4 PR 4 (#1549, ADR-048) completed the migration: the
