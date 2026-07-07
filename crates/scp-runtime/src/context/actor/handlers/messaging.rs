@@ -746,6 +746,15 @@ fn handle_compare_remote_checkpoint(
 /// `Ok(())` on success, or the transport error if every fan-out send fails.
 /// The send does not mutate per-context state (it uses sequence `0` and
 /// touches no counters), so this reports [`Outcome::ok`] / [`Outcome::err`].
+// `needless_pass_by_ref_mut`: the `&mut ClassSCell` is only read (`&*cell`), but
+// the `&mut` is load-bearing for Send — this async handler holds the cell borrow
+// across the `send_heartbeat` await, and `&mut ClassSCell` is Send whereas
+// `&PerContextState` (`!Sync`) would be `!Send` and break the spawned actor
+// future. Same rationale as the module-level allow in the `*_helpers` modules.
+#[allow(
+    clippy::needless_pass_by_ref_mut,
+    reason = "&mut ClassSCell held across await must be Send; &PerContextState is !Send (ADR-049 Decision 7)"
+)]
 async fn handle_send_heartbeat(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
