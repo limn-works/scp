@@ -269,8 +269,18 @@ fn handle_test_install_access_key(
             .set(context_id, member_did, key);
         Ok(())
     })();
+    // Mirror the reference handler
+    // [`handle_generate_context_access_key_actor`]: a successful install
+    // mutated the persisted `access_key_store`, so mark the actor dirty
+    // (`ok_mutated`) — otherwise a joiner restored from its spawn-time snapshot
+    // would lose the pulled §9.17 keys. The only error path is `require_active`
+    // failing BEFORE any write, so on error nothing was mutated (`err`).
+    let outcome = match &result {
+        Ok(()) => Outcome::ok_mutated(()),
+        Err(e) => Outcome::err(outcome_error_sketch(e)),
+    };
     let _ = reply.send(result);
-    Outcome::ok(())
+    outcome
 }
 
 /// Handle [`MessagingCommand::SendMessage`] (actor-shape): reserve a
