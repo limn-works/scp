@@ -104,6 +104,11 @@ if (addon === null) {
             "role:assign",
             "member:invite",
             "member:remove",
+            // Post ADR-049 §9 2F-residual the creator adds members through the
+            // REAL governance-gated `invite_member` path (SingleAdmin auto-
+            // executes the AddMember proposal), so the ceiling MUST grant
+            // `governance:propose` or `fullstackAddMember` fails closed.
+            "governance:propose",
             "context:close",
           ],
           governance: "single_admin",
@@ -130,6 +135,14 @@ if (addon === null) {
       expect(Buffer.from(decrypted)).toEqual(plaintext);
     });
 
+    // Proves the §9.16 (sender-key) + §9.17 (content-access-key) crypto and
+    // protocol compose end-to-end for a bidirectional spawn-from-Welcome joiner
+    // over the harness's simulated transport: Bob (the joiner) acquires every
+    // member's access key through the REAL §9.17 pull the creator answers, so
+    // his live actor can wrap CEKs for Alice on send, and Alice unwraps with her
+    // own §9.17 key on receive. The PRODUCTION actor-loop key distribution this
+    // stands in for is tracked in #2049 (§9.16 actor-loop pull) and #2050 (§9.17
+    // production distribution); it is not exercised here.
     test("Bob sends, Alice decrypts (bidirectional)", () => {
       const alice = scp.fullstackCreateNode("did:dht:z6MkAliceBidir");
       const bob = scp.fullstackCreateNode("did:dht:z6MkBobBidir");
@@ -144,6 +157,11 @@ if (addon === null) {
             "role:assign",
             "member:invite",
             "member:remove",
+            // Post ADR-049 §9 2F-residual the creator adds members through the
+            // REAL governance-gated `invite_member` path (SingleAdmin auto-
+            // executes the AddMember proposal), so the ceiling MUST grant
+            // `governance:propose` or `fullstackAddMember` fails closed.
+            "governance:propose",
             "context:close",
           ],
           governance: "single_admin",
@@ -187,6 +205,11 @@ if (addon === null) {
             "role:assign",
             "member:invite",
             "member:remove",
+            // Post ADR-049 §9 2F-residual the creator adds members through the
+            // REAL governance-gated `invite_member` path (SingleAdmin auto-
+            // executes the AddMember proposal), so the ceiling MUST grant
+            // `governance:propose` or `fullstackAddMember` fails closed.
+            "governance:propose",
           ],
         }),
       );
@@ -223,7 +246,16 @@ if (addon === null) {
         alice,
         "test-ctx-multi",
         JSON.stringify({
-          ceiling: ["messages:read", "messages:write", "role:assign", "member:invite"],
+          // `governance:propose` is required: post ADR-049 §9 2F-residual the
+          // creator adds members through the governance-gated `invite_member`
+          // path, so without it `fullstackAddMember` fails closed.
+          ceiling: [
+            "messages:read",
+            "messages:write",
+            "role:assign",
+            "member:invite",
+            "governance:propose",
+          ],
         }),
       );
 
@@ -258,6 +290,11 @@ if (addon === null) {
             "role:assign",
             "member:invite",
             "member:remove",
+            // Post ADR-049 §9 2F-residual the creator adds members through the
+            // REAL governance-gated `invite_member` path (SingleAdmin auto-
+            // executes the AddMember proposal), so the ceiling MUST grant
+            // `governance:propose` or `fullstackAddMember` fails closed.
+            "governance:propose",
           ],
         }),
       );
@@ -300,7 +337,16 @@ if (addon === null) {
         alice,
         "test-ctx-indcpa",
         JSON.stringify({
-          ceiling: ["messages:read", "messages:write", "role:assign", "member:invite"],
+          // `governance:propose` is required: post ADR-049 §9 2F-residual the
+          // creator adds members through the governance-gated `invite_member`
+          // path, so without it `fullstackAddMember` fails closed.
+          ceiling: [
+            "messages:read",
+            "messages:write",
+            "role:assign",
+            "member:invite",
+            "governance:propose",
+          ],
         }),
       );
 

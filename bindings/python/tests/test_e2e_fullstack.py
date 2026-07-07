@@ -90,7 +90,18 @@ class TestAliceToBobEncryptedRoundtrip:
 
 
 class TestBobSendsAliceDecrypts:
-    """Bob sends a message and Alice decrypts it (bidirectional)."""
+    """Bob sends a message and Alice decrypts it (bidirectional).
+
+    This proves the §9.16 (sender-key) + §9.17 (content-access-key) crypto and
+    protocol compose end-to-end for a bidirectional spawn-from-Welcome joiner
+    over the harness's simulated transport: Bob (the joiner) acquires every
+    member's access key through the REAL §9.17 pull the creator answers, so his
+    live actor can wrap CEKs for Alice on send, and Alice unwraps with her own
+    §9.17 key on receive. The PRODUCTION actor-loop key distribution this stands
+    in for (running that pull inside the context actor's run loop and
+    distributing keys on join) is tracked in #2049 (§9.16 actor-loop pull) and
+    #2050 (§9.17 production distribution); it is not exercised here.
+    """
 
     def test_bidirectional_roundtrip(self, scp: SCP) -> None:
         alice = scp._native.fullstack_create_node("did:dht:z6MkAliceBidirPy")
