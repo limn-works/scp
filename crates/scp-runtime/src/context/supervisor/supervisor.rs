@@ -11920,6 +11920,44 @@ impl Supervisor {
         })?
     }
 
+    /// Installs a member's §9.17 access key directly into a context's access
+    /// key store via the actor mailbox — test-only.
+    ///
+    /// The full-stack test harness uses this to land an access key it obtained
+    /// through the REAL §9.17 pull (`request_access_key` →
+    /// `handle_access_key_request` → `open_access_key_response` over the harness's
+    /// simulated transport) into a Welcome-joiner's actor store, so the joiner
+    /// can wrap content CEKs for its peers on send. The production actor-loop
+    /// distribution this simulates is deferred and tracked (#2050). Gated behind
+    /// the `testing` feature — never compiled into production, never reachable
+    /// from any FFI bridge.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError`] if the context is inactive or the actor reply channel
+    ///   closes.
+    #[cfg(feature = "testing")]
+    pub async fn test_install_access_key(
+        &self,
+        context_id: &str,
+        member_did: &str,
+        key: scp_protocol::crypto::access_keys::AccessKey,
+    ) -> Result<(), ContextError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = MessagingCommand::TestInstallAccessKey {
+            context_id: context_id.to_owned(),
+            member_did: member_did.to_owned(),
+            key,
+            reply: tx,
+        };
+        self.dispatch_command(context_id, cmd).await?;
+        rx.await.map_err(|_| {
+            ContextError::TransportFailed(
+                "Supervisor::test_install_access_key — actor reply channel closed".to_owned(),
+            )
+        })?
+    }
+
     /// Inserts a member directly into a context's role state via the actor
     /// mailbox — test-only.
     ///

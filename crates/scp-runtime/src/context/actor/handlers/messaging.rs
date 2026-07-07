@@ -130,6 +130,13 @@ pub(crate) async fn dispatch(
             role,
             reply,
         } => handle_test_insert_member(cell, deps, &member_did, &role, reply),
+        #[cfg(feature = "testing")]
+        MessagingCommand::TestInstallAccessKey {
+            context_id,
+            member_did,
+            key,
+            reply,
+        } => handle_test_install_access_key(cell, &context_id, &member_did, key, reply),
         MessagingCommand::ReportDegradedMode {
             context_id,
             compat,
@@ -231,6 +238,35 @@ fn handle_test_insert_member(
             role.to_owned(),
             tokens,
         );
+        Ok(())
+    })();
+    let _ = reply.send(result);
+    Outcome::ok(())
+}
+
+/// Handle [`MessagingCommand::TestInstallAccessKey`] (actor-shape, test-only).
+///
+/// Stores a member's access key into the context's access key store — exactly
+/// as an executed `GenerateContextAccessKey` (or the deferred §9.17 production
+/// pull-response ingest, #2050) would for that one entry — but with a key the
+/// harness recovered through the REAL §9.17 pull round trip, not one minted
+/// locally. Rejects an inactive context so a mis-targeted test fails loudly.
+/// Routes the store through the non-persisting `class_c_view` (the run loop
+/// persists on `mutated`), mirroring [`generate_context_access_key`](crate::context::queries_helpers::generate_context_access_key).
+#[cfg(feature = "testing")]
+fn handle_test_install_access_key(
+    cell: &mut crate::context::actor::class_s::ClassSCell,
+    context_id: &str,
+    member_did: &str,
+    key: scp_protocol::crypto::access_keys::AccessKey,
+    reply: oneshot::Sender<Result<(), ContextError>>,
+) -> Outcome<()> {
+    let result = (|| {
+        crate::context::state::require_active(&cell.handle)?;
+        cell.class_c_view()
+            .access_mut()
+            .access_key_store
+            .set(context_id, member_did, key);
         Ok(())
     })();
     let _ = reply.send(result);

@@ -367,6 +367,37 @@ pub enum MessagingCommand {
         reply: oneshot::Sender<Result<(), ContextError>>,
     },
 
+    /// Install a specific member's access key directly into the context's
+    /// access key store (§9.17), bypassing the pull-based distribution protocol.
+    ///
+    /// The §9.17 access-key PULL protocol (`crypto::access_keys::wire`) lets a
+    /// member acquire another member's access key via a signed HPKE request the
+    /// key holder answers. A Welcome-joiner's actor spawns with an EMPTY access
+    /// key store (its own random key is minted by the creator and delivered
+    /// out-of-band; incumbents' keys likewise). The PRODUCTION wiring that runs
+    /// that pull in the actor loop and distributes keys on join is deferred and
+    /// tracked (§9.16 actor-loop pull = #2049; §9.17 production distribution =
+    /// #2050; spec↔ADR reconciliation = #2051). This seam lets the full-stack
+    /// test harness land an access key it obtained through the REAL pull
+    /// (`request_access_key` → `handle_access_key_request` → `open_access_key_response`
+    /// over the harness's simulated transport) into the joiner's actor store, so
+    /// the joiner can wrap content CEKs for its peers on send exactly as the
+    /// deferred production distribution eventually will.
+    ///
+    /// Gated behind the `testing` feature — never compiled into production
+    /// builds, never reachable from any FFI bridge.
+    #[cfg(feature = "testing")]
+    TestInstallAccessKey {
+        /// Context identifier (the raw string id the access-key store is keyed by).
+        context_id: String,
+        /// The member whose access key this is (the key's owner).
+        member_did: String,
+        /// The access key, recovered from a real §9.17 pull response.
+        key: scp_protocol::crypto::access_keys::AccessKey,
+        /// Oneshot reply channel. Replies `Ok(())` once the key is stored.
+        reply: oneshot::Sender<Result<(), ContextError>>,
+    },
+
     /// Record that a received envelope triggered degraded-mode (spec
     /// §13.6) for a context. Emits a `DegradedMode` event into the
     /// per-context receive buffer (and the supervisor's optional event
