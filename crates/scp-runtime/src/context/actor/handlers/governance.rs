@@ -198,7 +198,7 @@ async fn dispatch_state(
             .await
         }
         GovernanceCommand::EvaluatePeriodicConsequences { reply } => {
-            handle_evaluate_periodic_consequences_actor(cell, deps, reply)
+            handle_evaluate_periodic_consequences_actor(cell, deps, reply).await
         }
         GovernanceCommand::ProcessPendingCommits { reply } => {
             Box::pin(handle_process_pending_commits_actor(cell, deps, reply)).await
@@ -770,7 +770,7 @@ async fn handle_apply_pending_economic_policy_change_actor(
 /// `evaluate_periodic_consequences_legacy` (which read
 /// `Supervisor::contexts` DashMap directly); the actor-shape variant
 /// operates on `&mut state` and never touches the supervisor's DashMap.
-fn handle_evaluate_periodic_consequences_actor(
+async fn handle_evaluate_periodic_consequences_actor(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     reply: oneshot::Sender<Result<(), ContextError>>,
@@ -859,9 +859,10 @@ fn handle_evaluate_periodic_consequences_actor(
     // discharges the Drop guard). On persist failure the mutation STAYS and the
     // error is surfaced to the caller; the handler still reports `mutated` so the
     // run loop also persists.
-    let reply_result = downward_auth_obligation
-        .take()
-        .map_or(Ok(()), |token| token.commit(cell, deps, &context_id));
+    let reply_result = match downward_auth_obligation.take() {
+        Some(token) => token.commit(cell, deps, &context_id).await,
+        None => Ok(()),
+    };
     let _ = reply.send(reply_result);
     Outcome::ok_mutated(())
 }
@@ -1242,7 +1243,7 @@ async fn handle_evaluate_timeouts_actor(
     // mailbox dispatch — both operate on the `cell` already owned by
     // this handler. No view borrow is live here.
     let (consequence_reply_tx, _consequence_reply_rx) = oneshot::channel();
-    let _ = handle_evaluate_periodic_consequences_actor(cell, deps, consequence_reply_tx);
+    let _ = handle_evaluate_periodic_consequences_actor(cell, deps, consequence_reply_tx).await;
 
     // Phase 5 (PR #1606 C6): drain MLS commit retry queue. Same pattern
     // as Phase 4 — direct in-handler call.
@@ -1315,15 +1316,16 @@ mod consequence_fail_closed_tests {
 
     /// Persistence whose `persist_context` ALWAYS fails — the fail-closed path.
     struct FailPersistence;
+    #[async_trait::async_trait]
     impl ContextPersistence for FailPersistence {
-        fn persist_context(
+        async fn persist_context(
             &self,
             _: &str,
             _: &crate::context::state::ContextSnapshot,
         ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Err("induced persist failure".into())
         }
-        fn load_context(
+        async fn load_context(
             &self,
             _: &str,
         ) -> Result<
@@ -1332,10 +1334,13 @@ mod consequence_fail_closed_tests {
         > {
             Ok(None)
         }
-        fn delete_context(&self, _: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        async fn delete_context(
+            &self,
+            _: &str,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Ok(())
         }
-        fn list_persisted_contexts(
+        async fn list_persisted_contexts(
             &self,
         ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
             Ok(Vec::new())
@@ -1431,7 +1436,7 @@ mod consequence_fail_closed_tests {
 
         let (reply_tx, reply_rx) = oneshot::channel();
         let outcome =
-            super::handle_evaluate_periodic_consequences_actor(&mut cell, &deps, reply_tx);
+            super::handle_evaluate_periodic_consequences_actor(&mut cell, &deps, reply_tx).await;
 
         // The reply surfaces the fail-closed persist error — the suspension
         // OUTCOME was NOT acknowledged as durable while the write failed.
@@ -1499,7 +1504,8 @@ mod consequence_fail_closed_tests {
             None,
             None,
             false,
-        );
+        )
+        .await;
 
         assert!(
             matches!(result, Err(ContextError::PersistenceFailed(_))),
@@ -1587,7 +1593,7 @@ mod consequence_fail_closed_tests {
         // error — the keep-direction `commit` consumes the token regardless, which
         // is all that is needed to satisfy the Drop guard.
         if let Some(token) = downward_auth_sink.take() {
-            let persist = token.commit(&cell, &deps, &ctx_str);
+            let persist = token.commit(&cell, &deps, &ctx_str).await;
             assert!(
                 matches!(persist, Err(ContextError::PersistenceFailed(_))),
                 "the failing backend surfaces the §9 durability error on commit; got \

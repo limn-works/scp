@@ -204,7 +204,7 @@ async fn dispatch_actor_inner(
             reply,
         ),
         LifecycleCommand::FlushSnapshot { reply } => {
-            handle_flush_snapshot_actor(&*cell, deps, reply)
+            handle_flush_snapshot_actor(&*cell, deps, reply).await
         }
         LifecycleCommand::ShutdownSelf { reply } => handle_shutdown_self_actor(&*cell, deps, reply),
         LifecycleCommand::ReportBufferLen { reply } => {
@@ -493,11 +493,16 @@ fn outcome_error_sketch(err: &ContextError) -> ContextError {
 /// Best-effort: persist failures log via `tracing::warn!` and
 /// increment `crate::metrics::record_persistence_failure()`; the
 /// reply oneshot always carries `Ok(())`.
-fn handle_flush_snapshot_actor(
+// `Send` discipline (ADR-049 Decision 7): SYNC fn returning a future. The
+// snapshot is built from `&PerContextState` in the synchronous prelude; the
+// returned future captures only the owned `context_id` / `snapshot` / `reply`
+// plus `deps`, so the actor future stays `Send`. An `async fn` would keep the
+// `&PerContextState` parameter across the persist `.await` and be `!Send`.
+fn handle_flush_snapshot_actor<'d>(
     state: &PerContextState,
-    deps: &ActorDeps,
+    deps: &'d ActorDeps,
     reply: oneshot::Sender<Result<(), ContextError>>,
-) -> Outcome<()> {
+) -> impl std::future::Future<Output = Outcome<()>> + Send + use<'d> {
     use crate::context::state::context_id_to_bytes;
 
     let context_id = state.handle.context_id().to_owned();
@@ -525,16 +530,22 @@ fn handle_flush_snapshot_actor(
     // (built by `snapshot_context` above), so the single `persist_context` write
     // covers it atomically — the prior separate best-effort `persist_broadcast`
     // write is gone (ADR-049 §9 / §5.14.8 block-before-serve).
-    if let Err(e) = deps.persistence.persist_context(&context_id, &snapshot) {
-        crate::metrics::record_persistence_failure();
-        tracing::warn!(
-            context_id = %context_id,
-            error = %e,
-            "failed to persist context snapshot"
-        );
+    async move {
+        if let Err(e) = deps
+            .persistence
+            .persist_context(&context_id, &snapshot)
+            .await
+        {
+            crate::metrics::record_persistence_failure();
+            tracing::warn!(
+                context_id = %context_id,
+                error = %e,
+                "failed to persist context snapshot"
+            );
+        }
+        let _ = reply.send(Ok(()));
+        Outcome::ok(())
     }
-    let _ = reply.send(Ok(()));
-    Outcome::ok(())
 }
 
 /// Handle [`LifecycleCommand::ShutdownSelf`] (actor-shape).

@@ -184,9 +184,9 @@ async fn handle_extend_ttl(
     proposed_duration: std::time::Duration,
     reply: oneshot::Sender<Result<bool, ContextError>>,
 ) -> Outcome<()> {
-    // `propose_ttl_extension` is synchronous (the actor owns `state`
-    // and persistence is fire-and-forget); wrap in `async { ... }` so
-    // the timeout budget still fires on pathological mutex contention.
+    // `propose_ttl_extension` awaits its best-effort persist (async
+    // `ContextPersistence`, ADR-049 Decision 7); wrap in `async { ... }`
+    // so the timeout budget still bounds the persist + any mutex contention.
     let extend_fut = async {
         crate::context::ttl_close_helpers::propose_ttl_extension(
             cell,
@@ -195,6 +195,7 @@ async fn handle_extend_ttl(
             &member_did,
             proposed_duration,
         )
+        .await
     };
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, extend_fut).await {

@@ -73,8 +73,8 @@ use crate::context::ttl::{self, TtlExtension, TtlTimer};
 /// after the cleanup. The actor owns `state` for the entire dispatch
 /// turn, so the generation gate is no longer required — there is no
 /// concurrent close-and-recreate window for a sibling actor to slip a
-/// new context into. Persistence after the expiry is best-effort and
-/// runs synchronously here (the actor's coalesced persist tick will
+/// new context into. Persistence after the expiry is best-effort and is
+/// awaited inline here (the actor's coalesced persist tick will
 /// catch any subsequent mutations).
 pub async fn handle_ttl_expiry(
     cell: &mut ClassSCell,
@@ -146,7 +146,7 @@ pub async fn handle_ttl_expiry(
     );
 
     // Persist context state after TTL expiry (best-effort).
-    persist_state_best_effort(cell, deps, &context_id);
+    persist_state_best_effort(cell, deps, &context_id).await;
 
     if result.has_failures() {
         let msg = result.errors().join("; ");
@@ -181,7 +181,7 @@ pub async fn handle_ttl_expiry(
 /// turn — no lock acquisition is needed and the persistence call is
 /// best-effort fire-and-forget. The handler wraps this in
 /// `async { ... }` for the dispatcher's `tokio::time::timeout` budget.
-pub fn propose_ttl_extension(
+pub async fn propose_ttl_extension(
     cell: &mut ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
@@ -209,7 +209,7 @@ pub fn propose_ttl_extension(
     };
 
     // Persist context state after proposal consent (best-effort).
-    persist_state_best_effort(cell, deps, context_id);
+    persist_state_best_effort(cell, deps, context_id).await;
 
     Ok(unanimous)
 }
@@ -256,7 +256,7 @@ pub async fn reset_ttl_timer(
     }
 
     // Persist context state after TTL reset (best-effort).
-    persist_state_best_effort(cell, deps, context_id);
+    persist_state_best_effort(cell, deps, context_id).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -491,7 +491,7 @@ pub async fn finalize_close(
     // the legacy path which only ran the delete when a persistence
     // provider was attached; ContextPersistence is always present on
     // ActorDeps so we always issue the delete.
-    let _ = deps.persistence.delete_context(&context_id);
+    let _ = deps.persistence.delete_context(&context_id).await;
 
     Ok(())
 }
@@ -527,7 +527,11 @@ fn emit_event(
 /// Best-effort persist of the current actor state. Mirrors the legacy
 /// context-snapshot persistence path, but reads fields off the actor's
 /// `PerContextState` rather than the legacy lock-shaped type.
-fn persist_state_best_effort(state: &PerContextState, deps: &ActorDeps, context_id: &str) {
+fn persist_state_best_effort<'d, 'c>(
+    state: &PerContextState,
+    deps: &'d ActorDeps,
+    context_id: &'c str,
+) -> impl std::future::Future<Output = ()> + Send + use<'d, 'c> {
     let mut snapshot = build_snapshot_from_state(state);
 
     // Export MLS crypto state alongside the context snapshot (#645).
@@ -550,13 +554,19 @@ fn persist_state_best_effort(state: &PerContextState, deps: &ActorDeps, context_
         }
     }
 
-    if let Err(e) = deps.persistence.persist_context(context_id, &snapshot) {
-        crate::metrics::record_persistence_failure();
-        tracing::warn!(
-            context_id = %context_id,
-            error = %e,
-            "failed to persist context snapshot"
-        );
+    async move {
+        if let Err(e) = deps
+            .persistence
+            .persist_context(context_id, &snapshot)
+            .await
+        {
+            crate::metrics::record_persistence_failure();
+            tracing::warn!(
+                context_id = %context_id,
+                error = %e,
+                "failed to persist context snapshot"
+            );
+        }
     }
 }
 

@@ -319,7 +319,8 @@ pub async fn tombstone_migrated_context(
         // M7: Participation decay on tombstone (#1530).
         state.governance.decay_participation();
         Ok(())
-    })?;
+    })
+    .await?;
 
     let tombstone_payload =
         scp_event_log::payload::encode_payload(&scp_event_log::payload::ContextTombstonedPayload {
@@ -425,7 +426,8 @@ pub async fn withdraw_governance_vote(
         if event_count > 0 {
             *view.checkpoint_events_since_mut() += event_count;
         }
-    });
+    })
+    .await;
 
     Ok(status)
 }
@@ -487,7 +489,8 @@ pub async fn apply_pending_ceiling_modification(
             })?;
         state.governance.pending_ceiling_modification = None;
         Ok(())
-    })?;
+    })
+    .await?;
 
     let context_id_bytes = context_id_to_bytes(context_id);
     deps.event_log.append_context_event(
@@ -540,7 +543,8 @@ pub async fn apply_pending_economic_policy_change(
         let gov = view.governance_class_c_mut();
         *gov.economic_policy_mut() = Some(pending.new_policy);
         *gov.pending_economic_policy_change_mut() = None;
-    });
+    })
+    .await;
 
     let context_id_bytes = context_id_to_bytes(context_id);
     deps.event_log.append_context_event(
@@ -755,7 +759,7 @@ fn fail_close_remove_member(
 // ---------------------------------------------------------------------------
 
 /// Executes a `SuspendMember` governance action.
-pub fn execute_suspend_member(
+pub async fn execute_suspend_member(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
@@ -804,7 +808,8 @@ pub fn execute_suspend_member(
             deps,
         );
         Ok(())
-    })?;
+    })
+    .await?;
 
     let context_id_bytes = context_id_to_bytes(context_id);
     deps.event_log.append_context_event(
@@ -825,7 +830,7 @@ pub fn execute_suspend_member(
 ///
 /// Returns the number of rotated authors (for broadcast contexts).
 #[allow(clippy::too_many_lines)]
-pub fn execute_revoke(
+pub async fn execute_revoke(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
@@ -859,8 +864,8 @@ pub fn execute_revoke(
     // (§5.14.8 block-before-serve). The post-persist external work (event-log
     // append, sender-key rotation, the coalesced `checkpoint_events_since` bump)
     // is UNCHANGED and runs after.
-    let (rotated, needs_sender_key_rotation) =
-        cell.commit_class_s_keep(deps, context_id, |mut view| {
+    let (rotated, needs_sender_key_rotation) = cell
+        .commit_class_s_keep(deps, context_id, |mut view| {
             let state = view.rest_mut();
             require_active(&state.handle)?;
 
@@ -938,7 +943,8 @@ pub fn execute_revoke(
                     && state.broadcast_context.is_none();
 
             Ok((rotated, needs_sender_key_rotation))
-        })?;
+        })
+        .await?;
 
     let access_revoked_payload =
         scp_event_log::payload::encode_payload(&scp_event_log::payload::AccessRevokedPayload {
@@ -988,7 +994,7 @@ pub fn execute_revoke(
 // ---------------------------------------------------------------------------
 
 /// Executes a `RestoreAccess` governance action.
-pub fn execute_restore_access(
+pub async fn execute_restore_access(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
@@ -1093,7 +1099,8 @@ pub fn execute_restore_access(
         }
 
         Ok(())
-    })?;
+    })
+    .await?;
 
     deps.event_log.append_context_event(
         &context_id_bytes,
@@ -1111,7 +1118,7 @@ pub fn execute_restore_access(
 // execute_add_member (per-action leaf helper)
 // ---------------------------------------------------------------------------
 
-pub fn execute_add_member(
+pub async fn execute_add_member(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
@@ -1244,7 +1251,8 @@ pub fn execute_add_member(
                 },
             );
         }
-    });
+    })
+    .await;
 
     // Subject-bearing leaf (ADR-011 amendment): carry the *affected member*
     // (`did`) in the payload, not just `actor_did` (which on this admin-driven
@@ -1269,7 +1277,8 @@ pub fn execute_add_member(
 // execute_remove_member (per-action leaf helper)
 // ---------------------------------------------------------------------------
 
-pub fn execute_remove_member(
+#[allow(clippy::too_many_lines)]
+pub async fn execute_remove_member(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
@@ -1293,118 +1302,120 @@ pub fn execute_remove_member(
     // where the fail-close `commit_fault` marker is set but NOT persisted before
     // the early return). All structural mutations + emit + broadcast + sender-
     // key drain ride the SAME fail-closed persist via `view.rest_mut()`.
-    let removed_role_name = cell.commit_class_s_keep(deps, context_id, |mut view| {
-        let state = view.rest_mut();
+    let removed_role_name = cell
+        .commit_class_s_keep(deps, context_id, |mut view| {
+            let state = view.rest_mut();
 
-        require_active(&state.handle)?;
+            require_active(&state.handle)?;
 
-        if !state.membership.contains(did) {
-            return Err(ContextError::MemberNotFound(did.to_string()));
-        }
+            if !state.membership.contains(did) {
+                return Err(ContextError::MemberNotFound(did.to_string()));
+            }
 
-        // Role at departure, captured BEFORE the strip below for the
-        // subject-bearing MemberLeft leaf (ADR-011 amendment; §7.3.2).
-        let removed_role_name = state
-            .membership
-            .get(did.as_ref())
-            .map_or_else(String::new, |info| info.role_name.clone());
+            // Role at departure, captured BEFORE the strip below for the
+            // subject-bearing MemberLeft leaf (ADR-011 amendment; §7.3.2).
+            let removed_role_name = state
+                .membership
+                .get(did.as_ref())
+                .map_or_else(String::new, |info| info.role_name.clone());
 
-        // H9: MLS group removal FIRST (hard security boundary).
-        let remove_output = deps
-            .crypto
-            .remove_member(&context_id_bytes, did)
-            .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
+            // H9: MLS group removal FIRST (hard security boundary).
+            let remove_output = deps
+                .crypto
+                .remove_member(&context_id_bytes, did)
+                .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
 
-        if let Err(e) = deps
-            .crypto
-            .remove_member_sender_key(&context_id_bytes, did.as_ref())
-        {
-            return fail_close_remove_member(
+            if let Err(e) = deps
+                .crypto
+                .remove_member_sender_key(&context_id_bytes, did.as_ref())
+            {
+                return fail_close_remove_member(
+                    state,
+                    deps,
+                    context_id,
+                    did,
+                    "remove_member_sender_key",
+                    &e.to_string(),
+                )
+                .map(|()| String::new());
+            }
+
+            if let Err(e) = deps.crypto.rotate_sender_key(&context_id_bytes) {
+                return fail_close_remove_member(
+                    state,
+                    deps,
+                    context_id,
+                    did,
+                    "rotate_sender_key",
+                    &e.to_string(),
+                )
+                .map(|()| String::new());
+            }
+
+            state.membership.remove_member(did);
+            // Clean teardown of ALL per-DID role state (spec §5.6.1): members,
+            // assignments, member_capabilities, AND suspended_capabilities. Replaces
+            // the prior strip that left the removed DID's suspension dangling, so a
+            // re-admitted same-DID member no longer inherits a phantom suspension.
+            // Inside `commit_class_s_keep`, so the downward-auth suspension drop
+            // persists fail-closed (ADR-049 §9).
+            state.role_state.remove_member(did.as_ref());
+
+            state
+                .access
+                .access_key_store
+                .remove(context_id, did.as_ref());
+
+            // Drop the removed member's CEK-exclusion entry (spec §5.6.1, §9.17) —
+            // per-DID content-access state outside the role state. Mirrors
+            // `execute_restore_access`. Without this, a re-admitted same-DID member
+            // would inherit a phantom read exclusion.
+            state.access.read_exclusion_list.remove(did);
+
+            // §9.10.4: drop the removed member's pseudonym routing ID. No-op on a
+            // broadcast context (which carries no peer registry).
+            if let Some(reg) = state.routing.peer_registry_mut() {
+                reg.remove(did);
+            }
+
+            emit(
                 state,
-                deps,
+                ContextEvent::MemberLeft {
+                    member_did: did.clone(),
+                },
                 context_id,
-                did,
-                "remove_member_sender_key",
-                &e.to_string(),
-            )
-            .map(|()| String::new());
-        }
-
-        if let Err(e) = deps.crypto.rotate_sender_key(&context_id_bytes) {
-            return fail_close_remove_member(
-                state,
                 deps,
-                context_id,
-                did,
-                "rotate_sender_key",
-                &e.to_string(),
-            )
-            .map(|()| String::new());
-        }
-
-        state.membership.remove_member(did);
-        // Clean teardown of ALL per-DID role state (spec §5.6.1): members,
-        // assignments, member_capabilities, AND suspended_capabilities. Replaces
-        // the prior strip that left the removed DID's suspension dangling, so a
-        // re-admitted same-DID member no longer inherits a phantom suspension.
-        // Inside `commit_class_s_keep`, so the downward-auth suspension drop
-        // persists fail-closed (ADR-049 §9).
-        state.role_state.remove_member(did.as_ref());
-
-        state
-            .access
-            .access_key_store
-            .remove(context_id, did.as_ref());
-
-        // Drop the removed member's CEK-exclusion entry (spec §5.6.1, §9.17) —
-        // per-DID content-access state outside the role state. Mirrors
-        // `execute_restore_access`. Without this, a re-admitted same-DID member
-        // would inherit a phantom read exclusion.
-        state.access.read_exclusion_list.remove(did);
-
-        // §9.10.4: drop the removed member's pseudonym routing ID. No-op on a
-        // broadcast context (which carries no peer registry).
-        if let Some(reg) = state.routing.peer_registry_mut() {
-            reg.remove(did);
-        }
-
-        emit(
-            state,
-            ContextEvent::MemberLeft {
-                member_did: did.clone(),
-            },
-            context_id,
-            deps,
-        );
-
-        try_broadcast_commit_or_enqueue(
-            CommitBroadcastBorrows {
-                pending_commits: &mut state.pending_commits,
-                commit_fault: &mut state.commit_fault,
-                receive_buffer: &mut state.receive_buffer,
-            },
-            deps,
-            context_id,
-            remove_output.commit_bytes,
-            &CommitOperation::RemoveMember {
-                target_did: did.clone(),
-            },
-        );
-
-        // Phase 2A.9: drain_and_deliver_sender_keys is now actor-shape.
-        if let Err(e) = crate::context::lifecycle_helpers::drain_and_deliver_sender_keys(
-            deps,
-            context_id,
-            &context_id_bytes,
-        ) {
-            tracing::warn!(
-                context_id = %context_id,
-                error = %e,
-                "failed to deliver rotated sender keys after member removal"
             );
-        }
-        Ok(removed_role_name)
-    })?;
+
+            try_broadcast_commit_or_enqueue(
+                CommitBroadcastBorrows {
+                    pending_commits: &mut state.pending_commits,
+                    commit_fault: &mut state.commit_fault,
+                    receive_buffer: &mut state.receive_buffer,
+                },
+                deps,
+                context_id,
+                remove_output.commit_bytes,
+                &CommitOperation::RemoveMember {
+                    target_did: did.clone(),
+                },
+            );
+
+            // Phase 2A.9: drain_and_deliver_sender_keys is now actor-shape.
+            if let Err(e) = crate::context::lifecycle_helpers::drain_and_deliver_sender_keys(
+                deps,
+                context_id,
+                &context_id_bytes,
+            ) {
+                tracing::warn!(
+                    context_id = %context_id,
+                    error = %e,
+                    "failed to deliver rotated sender keys after member removal"
+                );
+            }
+            Ok(removed_role_name)
+        })
+        .await?;
     // Subject-bearing leaf (ADR-011 amendment): carry the *affected member*
     // (`did`) and the role it held at departure, not just `actor_did` (the
     // executing admin). Participation `participation_duration_secs` (§7.3.2)
@@ -1425,7 +1436,7 @@ pub fn execute_remove_member(
 // execute_change_role (per-action leaf helper)
 // ---------------------------------------------------------------------------
 
-pub fn execute_change_role(
+pub async fn execute_change_role(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
@@ -1463,7 +1474,8 @@ pub fn execute_change_role(
             info.tokens = tokens;
         }
         Ok(())
-    })?;
+    })
+    .await?;
     // Subject-bearing leaf (ADR-011 amendment): carry the *affected member*
     // (`did`) and the newly-assigned role, not just `actor_did` (which on this
     // admin-driven change is the executing admin). Participation
@@ -1484,7 +1496,7 @@ pub fn execute_change_role(
 // execute_register_tool (per-action leaf helper)
 // ---------------------------------------------------------------------------
 
-pub fn execute_register_tool(
+pub async fn execute_register_tool(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
@@ -1523,7 +1535,8 @@ pub fn execute_register_tool(
         view.governance_class_c_mut()
             .registered_tools_mut()
             .push(registration.clone());
-    });
+    })
+    .await;
     deps.event_log.append_context_event(
         &context_id_bytes,
         scp_event_log::EventType::ToolRegistered,
@@ -1538,7 +1551,7 @@ pub fn execute_register_tool(
 // execute_remove_tool (per-action leaf helper)
 // ---------------------------------------------------------------------------
 
-pub fn execute_remove_tool(
+pub async fn execute_remove_tool(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
@@ -1569,7 +1582,8 @@ pub fn execute_remove_tool(
             .registered_tools
             .retain(|t| t.tool_id != tool_id);
         Ok(())
-    })?;
+    })
+    .await?;
     deps.event_log.append_context_event(
         &context_id_bytes,
         scp_event_log::EventType::ToolRemoved,
@@ -1584,7 +1598,7 @@ pub fn execute_remove_tool(
 // execute_modify_ceiling (per-action leaf helper)
 // ---------------------------------------------------------------------------
 
-pub fn execute_modify_ceiling(
+pub async fn execute_modify_ceiling(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
@@ -1683,7 +1697,8 @@ pub fn execute_modify_ceiling(
             deps,
         );
         Ok(())
-    })?;
+    })
+    .await?;
     deps.event_log.append_context_event(
         &context_id_bytes,
         scp_event_log::EventType::CeilingModificationPending,
@@ -1741,7 +1756,8 @@ pub async fn execute_close_context(
         state.broadcast_context = None;
         state.governance.decay_participation();
         Ok(())
-    })?;
+    })
+    .await?;
     deps.event_log.append_context_event(
         &context_id_bytes,
         scp_event_log::EventType::ContextClosing,
@@ -1862,7 +1878,7 @@ pub async fn execute_extend_ttl(
         (old_dl, new_dl)
     };
 
-    crate::context::messaging_helpers::persist_state_best_effort(&*cell, deps, context_id);
+    crate::context::messaging_helpers::persist_state_best_effort(&*cell, deps, context_id).await;
 
     let extended_payload =
         scp_event_log::payload::encode_payload(&scp_event_log::payload::TtlExtendedPayload {
@@ -1887,7 +1903,7 @@ pub async fn execute_extend_ttl(
 // execute_transfer_admin (per-action leaf helper)
 // ---------------------------------------------------------------------------
 
-pub fn execute_transfer_admin(
+pub async fn execute_transfer_admin(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
@@ -1939,7 +1955,8 @@ pub fn execute_transfer_admin(
             info.tokens = tokens;
         }
         Ok(())
-    })?;
+    })
+    .await?;
     deps.event_log.append_context_event(
         &context_id_bytes,
         scp_event_log::EventType::AdminTransferred,
@@ -1997,7 +2014,7 @@ pub fn execute_create_child_context(
 // execute_modify_pruning_policy (per-action leaf helper)
 // ---------------------------------------------------------------------------
 
-pub fn execute_modify_pruning_policy(
+pub async fn execute_modify_pruning_policy(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
@@ -2055,7 +2072,8 @@ pub fn execute_modify_pruning_policy(
     require_active(&cell.handle)?;
     cell.commit_class_c_best_effort(deps, context_id, |mut view| {
         *view.governance_class_c_mut().pruning_policy_mut() = Some(new_policy.clone());
-    });
+    })
+    .await;
     deps.event_log.append_context_event(
         &context_id_bytes,
         scp_event_log::EventType::PruningPolicyModified,
@@ -2070,7 +2088,7 @@ pub fn execute_modify_pruning_policy(
 // execute_add_signer (per-action leaf helper)
 // ---------------------------------------------------------------------------
 
-pub fn execute_add_signer(
+pub async fn execute_add_signer(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
@@ -2138,7 +2156,8 @@ pub fn execute_add_signer(
             }
         }
         Ok(())
-    })?;
+    })
+    .await?;
     deps.event_log.append_context_event(
         &context_id_bytes,
         scp_event_log::EventType::SignerAdded,
@@ -2153,7 +2172,7 @@ pub fn execute_add_signer(
 // execute_remove_signer (per-action leaf helper)
 // ---------------------------------------------------------------------------
 
-pub fn execute_remove_signer(
+pub async fn execute_remove_signer(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
@@ -2218,7 +2237,8 @@ pub fn execute_remove_signer(
             });
         }
         Ok(())
-    })?;
+    })
+    .await?;
     deps.event_log.append_context_event(
         &context_id_bytes,
         scp_event_log::EventType::SignerRemoved,
@@ -2233,7 +2253,7 @@ pub fn execute_remove_signer(
 // execute_modify_threshold (per-action leaf helper)
 // ---------------------------------------------------------------------------
 
-pub fn execute_modify_threshold(
+pub async fn execute_modify_threshold(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
@@ -2264,7 +2284,8 @@ pub fn execute_modify_threshold(
         }
         view.governance_class_s_mut().threshold_value = new_threshold;
         Ok(())
-    })?;
+    })
+    .await?;
     deps.event_log.append_context_event(
         &context_id_bytes,
         scp_event_log::EventType::ThresholdModified,
@@ -2279,7 +2300,7 @@ pub fn execute_modify_threshold(
 // execute_establish_tool_interface (per-action leaf helper)
 // ---------------------------------------------------------------------------
 
-pub fn execute_establish_tool_interface(
+pub async fn execute_establish_tool_interface(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
@@ -2318,7 +2339,8 @@ pub fn execute_establish_tool_interface(
         view.governance_class_c_mut()
             .tool_interfaces_mut()
             .push(interface.clone());
-    });
+    })
+    .await;
     deps.event_log.append_context_event(
         &context_id_bytes,
         scp_event_log::EventType::ToolInterfaceEstablished,
@@ -2441,7 +2463,7 @@ pub fn execute_reset_member(
     reason = "single-pipeline conflict-resolution scope"
 )]
 #[allow(clippy::too_many_arguments)]
-pub fn execute_resolve_conflict(
+pub async fn execute_resolve_conflict(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
@@ -2546,7 +2568,8 @@ pub fn execute_resolve_conflict(
 
         view.rest_mut().governance.freeze = None;
         Ok(())
-    })?;
+    })
+    .await?;
     deps.event_log.append_context_event(
         &context_id_bytes,
         scp_event_log::EventType::GovernanceConflictResolved,
@@ -2561,7 +2584,7 @@ pub fn execute_resolve_conflict(
 // execute_promote_context (per-action leaf helper)
 // ---------------------------------------------------------------------------
 
-pub fn execute_promote_context(
+pub async fn execute_promote_context(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
@@ -2611,7 +2634,8 @@ pub fn execute_promote_context(
         ttl.timer.cancel();
         ttl.timer.deadline_unix_secs = None;
         view.handle_mut().promote_memory_scope();
-    });
+    })
+    .await;
     deps.event_log.append_context_event(
         &context_id_bytes,
         scp_event_log::EventType::ContextPromoted,
@@ -2627,7 +2651,7 @@ pub fn execute_promote_context(
 // ---------------------------------------------------------------------------
 
 #[allow(clippy::too_many_lines)]
-pub fn execute_rotate_content_keys(
+pub async fn execute_rotate_content_keys(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
@@ -2713,7 +2737,8 @@ pub fn execute_rotate_content_keys(
             );
         }
         Ok(())
-    })?;
+    })
+    .await?;
 
     deps.event_log.append_context_event(
         &context_id_bytes,
@@ -2730,7 +2755,7 @@ pub fn execute_rotate_content_keys(
 // ---------------------------------------------------------------------------
 
 #[allow(clippy::too_many_arguments)]
-pub fn execute_reconfigure_governance(
+pub async fn execute_reconfigure_governance(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
@@ -2804,7 +2829,8 @@ pub fn execute_reconfigure_governance(
             }
         }
         Ok(())
-    })?;
+    })
+    .await?;
     deps.event_log.append_context_event(
         &context_id_bytes,
         scp_event_log::EventType::GovernanceReconfigured,
@@ -2819,7 +2845,7 @@ pub fn execute_reconfigure_governance(
 // execute_set_economic_policy (per-action leaf helper)
 // ---------------------------------------------------------------------------
 
-pub fn execute_set_economic_policy(
+pub async fn execute_set_economic_policy(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
@@ -2902,7 +2928,8 @@ pub fn execute_set_economic_policy(
             context_id,
             deps.event_tx.as_ref(),
         );
-    });
+    })
+    .await;
     deps.event_log.append_context_event(
         &context_id_bytes,
         scp_event_log::EventType::EconomicPolicyChanged,
@@ -2918,7 +2945,7 @@ pub fn execute_set_economic_policy(
 // ---------------------------------------------------------------------------
 
 #[allow(clippy::too_many_arguments)]
-pub fn execute_approve_spend(
+pub async fn execute_approve_spend(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
@@ -2948,7 +2975,8 @@ pub fn execute_approve_spend(
         view.governance_class_c_mut()
             .budget_tracker_mut()
             .grant(spender, amount);
-    });
+    })
+    .await;
     let spend_payload =
         scp_event_log::payload::encode_payload(&scp_event_log::payload::SpendApprovedPayload {
             spender: spender.as_ref().to_owned(),
@@ -2970,7 +2998,7 @@ pub fn execute_approve_spend(
 // execute_lock_economic_policy (per-action leaf helper)
 // ---------------------------------------------------------------------------
 
-pub fn execute_lock_economic_policy(
+pub async fn execute_lock_economic_policy(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
@@ -3009,7 +3037,8 @@ pub fn execute_lock_economic_policy(
         if let Some(policy) = view.governance_class_c_mut().economic_policy_mut() {
             policy.locked = true;
         }
-    });
+    })
+    .await;
     deps.event_log.append_context_event(
         &context_id_bytes,
         scp_event_log::EventType::EconomicPolicyLocked,
@@ -3024,7 +3053,7 @@ pub fn execute_lock_economic_policy(
 // execute_modify_hard_rate_limit (per-action leaf helper)
 // ---------------------------------------------------------------------------
 
-pub fn execute_modify_hard_rate_limit(
+pub async fn execute_modify_hard_rate_limit(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
@@ -3071,7 +3100,8 @@ pub fn execute_modify_hard_rate_limit(
                 new_config.clone(),
                 preserved_state,
             );
-    });
+    })
+    .await;
     deps.event_log.append_context_event(
         &context_id_bytes,
         scp_event_log::EventType::HardRateLimitModified,
@@ -3247,7 +3277,8 @@ pub fn execute_propose_context_migration<'a>(
             let _ = tx.send((context_id.to_owned(), strip_event_payload(&started_event)));
         }
 
-        crate::context::messaging_helpers::persist_state_best_effort(&*cell, deps, context_id);
+        crate::context::messaging_helpers::persist_state_best_effort(&*cell, deps, context_id)
+            .await;
         deps.event_log.append_context_event(
             &context_id_bytes,
             scp_event_log::EventType::ContextMigrationStarted,
@@ -3321,7 +3352,7 @@ pub async fn execute_cancel_context_migration(
         original_proposal_id
     };
 
-    crate::context::messaging_helpers::persist_state_best_effort(&*cell, deps, context_id);
+    crate::context::messaging_helpers::persist_state_best_effort(&*cell, deps, context_id).await;
     let cancel_payload = scp_event_log::payload::encode_payload(
         &scp_event_log::payload::ContextMigrationCancelledPayload {
             original_proposal_id,
@@ -3549,7 +3580,7 @@ pub async fn propose_governance_action_inner(
         None
     };
 
-    crate::context::messaging_helpers::persist_state_best_effort(&*cell, deps, context_id);
+    crate::context::messaging_helpers::persist_state_best_effort(&*cell, deps, context_id).await;
 
     Ok((proposal, events, execution_result))
 }
@@ -3880,7 +3911,7 @@ pub async fn vote_on_proposal_inner(
         }
     }
 
-    crate::context::messaging_helpers::persist_state_best_effort(&*cell, deps, context_id);
+    crate::context::messaging_helpers::persist_state_best_effort(&*cell, deps, context_id).await;
 
     Ok((status, events))
 }
@@ -3960,7 +3991,7 @@ pub async fn reject_governance_proposal(
 /// Dispatches content access, structural, and reconfiguration governance
 /// actions. Companion to [`dispatch_context_governance_action`].
 #[allow(clippy::too_many_lines)]
-pub fn dispatch_content_governance_action(
+pub async fn dispatch_content_governance_action(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
@@ -3984,7 +4015,8 @@ pub fn dispatch_content_governance_action(
                     actor_did,
                     timestamp_secs,
                 },
-            )?;
+            )
+            .await?;
             Ok(GovernanceActionResult::SignerAdded)
         }
         GovernanceAction::RemoveSigner { did } => {
@@ -3998,7 +4030,8 @@ pub fn dispatch_content_governance_action(
                     actor_did,
                     timestamp_secs,
                 },
-            )?;
+            )
+            .await?;
             Ok(GovernanceActionResult::SignerRemoved)
         }
         GovernanceAction::ModifyThreshold { new_threshold } => {
@@ -4012,7 +4045,8 @@ pub fn dispatch_content_governance_action(
                     actor_did,
                     timestamp_secs,
                 },
-            )?;
+            )
+            .await?;
             Ok(GovernanceActionResult::ThresholdModified)
         }
         GovernanceAction::EstablishToolInterface { interface } => {
@@ -4026,7 +4060,8 @@ pub fn dispatch_content_governance_action(
                     actor_did,
                     timestamp_secs,
                 },
-            )?;
+            )
+            .await?;
             Ok(GovernanceActionResult::ToolInterfaceEstablished)
         }
         GovernanceAction::ResetMember { did, reason } => {
@@ -4061,7 +4096,8 @@ pub fn dispatch_content_governance_action(
                     actor_did,
                     timestamp_secs,
                 },
-            )?;
+            )
+            .await?;
             Ok(GovernanceActionResult::ConflictResolved)
         }
         GovernanceAction::RotateContentKeys { reason } => {
@@ -4075,7 +4111,8 @@ pub fn dispatch_content_governance_action(
                     actor_did,
                     timestamp_secs,
                 },
-            )?;
+            )
+            .await?;
             Ok(GovernanceActionResult::ContentKeysRotated(
                 ContentKeysRotatedResult {
                     reason: reason.clone(),
@@ -4097,7 +4134,8 @@ pub fn dispatch_content_governance_action(
                     actor_did,
                     timestamp_secs,
                 },
-            )?;
+            )
+            .await?;
             Ok(GovernanceActionResult::GovernanceReconfigured(
                 GovernanceReconfiguredResult {
                     changes_applied: changes.len(),
@@ -4183,7 +4221,8 @@ pub async fn dispatch_context_governance_action(
                     actor_did,
                     timestamp_secs,
                 },
-            )?;
+            )
+            .await?;
             Ok(GovernanceActionResult::MemberAdded {
                 welcome_bytes: scp_protocol::context::membership::RedactedBytes(
                     add_output.welcome_bytes,
@@ -4204,7 +4243,8 @@ pub async fn dispatch_context_governance_action(
                     actor_did,
                     timestamp_secs,
                 },
-            )?;
+            )
+            .await?;
             Ok(GovernanceActionResult::MemberRemoved)
         }
         GovernanceAction::ChangeRole { did, new_role } => {
@@ -4219,7 +4259,8 @@ pub async fn dispatch_context_governance_action(
                     actor_did,
                     timestamp_secs,
                 },
-            )?;
+            )
+            .await?;
             Ok(GovernanceActionResult::RoleChanged)
         }
         GovernanceAction::RegisterTool { registration } => {
@@ -4233,7 +4274,8 @@ pub async fn dispatch_context_governance_action(
                     actor_did,
                     timestamp_secs,
                 },
-            )?;
+            )
+            .await?;
             Ok(GovernanceActionResult::ToolRegistered)
         }
         GovernanceAction::RemoveTool { tool_id } => {
@@ -4247,7 +4289,8 @@ pub async fn dispatch_context_governance_action(
                     actor_did,
                     timestamp_secs,
                 },
-            )?;
+            )
+            .await?;
             Ok(GovernanceActionResult::ToolRemoved)
         }
         GovernanceAction::ModifyCeiling { new_ceiling } => {
@@ -4261,7 +4304,8 @@ pub async fn dispatch_context_governance_action(
                     actor_did,
                     timestamp_secs,
                 },
-            )?;
+            )
+            .await?;
             Ok(GovernanceActionResult::CeilingModified)
         }
         GovernanceAction::CloseContext { reason } => {
@@ -4290,7 +4334,8 @@ pub async fn dispatch_context_governance_action(
                     actor_did,
                     timestamp_secs,
                 },
-            )?;
+            )
+            .await?;
             Ok(GovernanceActionResult::AdminTransferred)
         }
         GovernanceAction::CreateChildContext { params } => {
@@ -4318,7 +4363,8 @@ pub async fn dispatch_context_governance_action(
                     actor_did,
                     timestamp_secs,
                 },
-            )?;
+            )
+            .await?;
             Ok(GovernanceActionResult::PruningPolicyModified)
         }
         GovernanceAction::ProposeContextMigration {
@@ -4370,17 +4416,20 @@ pub async fn dispatch_context_governance_action(
         | GovernanceAction::ResetMember { .. }
         | GovernanceAction::ResolveConflict { .. }
         | GovernanceAction::RotateContentKeys { .. }
-        | GovernanceAction::ReconfigureGovernance { .. } => dispatch_content_governance_action(
-            cell,
-            deps,
-            context_id,
-            action,
-            CommitMeta {
-                pid,
-                actor_did,
-                timestamp_secs,
-            },
-        ),
+        | GovernanceAction::ReconfigureGovernance { .. } => {
+            dispatch_content_governance_action(
+                cell,
+                deps,
+                context_id,
+                action,
+                CommitMeta {
+                    pid,
+                    actor_did,
+                    timestamp_secs,
+                },
+            )
+            .await
+        }
         GovernanceAction::PromoteContext
         | GovernanceAction::ExtendTtl { .. }
         | GovernanceAction::SuspendCapability { .. }
@@ -4449,7 +4498,8 @@ pub async fn dispatch_governance_action(
                     actor_did: actor,
                     timestamp_secs: ts,
                 },
-            )?;
+            )
+            .await?;
             Ok(GovernanceActionResult::MemberSuspended(
                 SuspendMemberResult {
                     did: did.clone(),
@@ -4493,7 +4543,8 @@ pub async fn dispatch_governance_action(
                     deps,
                 );
                 Ok(())
-            })?;
+            })
+            .await?;
             let context_id_bytes = context_id_to_bytes(context_id);
             deps.event_log.append_context_event(
                 &context_id_bytes,
@@ -4516,7 +4567,8 @@ pub async fn dispatch_governance_action(
                     actor_did: actor,
                     timestamp_secs: ts,
                 },
-            )?;
+            )
+            .await?;
             Ok(GovernanceActionResult::AccessRevoked(RevokeResult {
                 did: did.clone(),
                 access: *access,
@@ -4535,7 +4587,8 @@ pub async fn dispatch_governance_action(
                     actor_did: actor,
                     timestamp_secs: ts,
                 },
-            )?;
+            )
+            .await?;
             Ok(GovernanceActionResult::AccessRestored(
                 RestoreAccessResult {
                     did: did.clone(),
@@ -4554,7 +4607,8 @@ pub async fn dispatch_governance_action(
                     actor_did: actor,
                     timestamp_secs: ts,
                 },
-            )?;
+            )
+            .await?;
             Ok(GovernanceActionResult::ContextPromoted)
         }
         GovernanceAction::ExtendTtl { additional_secs } => {
@@ -4584,7 +4638,8 @@ pub async fn dispatch_governance_action(
                     actor_did: actor,
                     timestamp_secs: ts,
                 },
-            )?;
+            )
+            .await?;
             Ok(GovernanceActionResult::Executed)
         }
         GovernanceAction::ApproveSpend {
@@ -4604,7 +4659,8 @@ pub async fn dispatch_governance_action(
                     actor_did: actor,
                     timestamp_secs: ts,
                 },
-            )?;
+            )
+            .await?;
             Ok(GovernanceActionResult::Executed)
         }
         GovernanceAction::LockEconomicPolicy => {
@@ -4617,7 +4673,8 @@ pub async fn dispatch_governance_action(
                     actor_did: actor,
                     timestamp_secs: ts,
                 },
-            )?;
+            )
+            .await?;
             Ok(GovernanceActionResult::Executed)
         }
         GovernanceAction::ModifyHardRateLimit { new_config } => {
@@ -4631,7 +4688,8 @@ pub async fn dispatch_governance_action(
                     actor_did: actor,
                     timestamp_secs: ts,
                 },
-            )?;
+            )
+            .await?;
             Ok(GovernanceActionResult::Executed)
         }
         // Remaining actions dispatched to context-level handler.
@@ -5096,12 +5154,14 @@ pub async fn execute_governance_action(
             // and then performs the SINGLE fail-closed persist the token already
             // owed, so the removed-marker state is what lands durably (no
             // `state_mut`, exactly one persist — the one the token deferred).
-            token.discharge_with(cell, deps, context_id, |mut view| {
-                view.governance_class_s_mut()
-                    .executed_proposals
-                    .remove(&proposal.proposal_id);
-                Ok(())
-            })?;
+            token
+                .discharge_with(cell, deps, context_id, |mut view| {
+                    view.governance_class_s_mut()
+                        .executed_proposals
+                        .remove(&proposal.proposal_id);
+                    Ok(())
+                })
+                .await?;
             return Err(e);
         }
     };
@@ -5114,9 +5174,11 @@ pub async fn execute_governance_action(
     // deferred persist the token owed — no whole-state `state_mut`. On a finalize
     // error the persist STILL runs (keep-direction — the executed marker stays
     // set and must persist) and `discharge_with` surfaces the finalize error.
-    token.discharge_with(cell, deps, context_id, |mut view| {
-        finalize_governance_action(view.rest_mut(), deps, context_id, proposal, executor_did)
-    })?;
+    token
+        .discharge_with(cell, deps, context_id, |mut view| {
+            finalize_governance_action(view.rest_mut(), deps, context_id, proposal, executor_did)
+        })
+        .await?;
 
     Ok(result)
 }

@@ -5,6 +5,7 @@
 //! the trait and its no-op stub.
 
 use super::state::ContextSnapshot;
+use async_trait::async_trait;
 
 // ---------------------------------------------------------------------------
 // ContextPersistence -- unified persistence provider
@@ -22,15 +23,32 @@ use super::state::ContextSnapshot;
 /// best-effort `persist_broadcast` / `load_broadcast` methods (a separate
 /// warn-and-continue write path) are gone.
 ///
-/// Implementors must be dyn-compatible (`Send + Sync`, no generics, no
-/// RPITIT). `persist_context` / `load_context` are the security-critical seam
-/// (called fail-closed via `persist_state_fail_closed`); the other methods
-/// carry best-effort semantics.
+/// # Async trait (ADR-049 Decision 7)
+///
+/// This is an `#[async_trait]` async trait: methods `.await` the underlying
+/// storage directly instead of blocking on it via
+/// `tokio::task::block_in_place` + `Handle::block_on` (the deleted
+/// `ProtocolRepositoryContextBridge` sync→async shim). Implementors must be
+/// dyn-compatible (`Send + Sync`, no generics, no RPITIT); `async_trait`
+/// preserves that by desugaring each method to a boxed future.
+///
+/// **Send futures — NOT `#[async_trait(?Send)]`.** The trait object is held as
+/// `Arc<dyn ContextPersistence>` owned inside `ActorDeps`, which is moved by
+/// value into `tokio::spawn(actor.run())`. `tokio::spawn` requires
+/// `Send + 'static`, so the desugared method futures MUST be `Send` — hence
+/// plain `#[async_trait]`. This is deliberately asymmetric with
+/// `RecoveryBackend` (ADR-049 Decision 7 PR-0), which is `#[async_trait(?Send)]`
+/// because it is never held across a `tokio::spawn` boundary.
+///
+/// `persist_context` / `load_context` are the security-critical seam (called
+/// fail-closed via `persist_state_fail_closed`); the other methods carry
+/// best-effort semantics.
 ///
 /// The canonical implementation is `ProtocolRepositoryContextBridge<S>` which
 /// wraps `Arc<ProtocolRepository<S>>`.
 ///
 /// See spec section 17.4.
+#[async_trait]
 pub trait ContextPersistence: Send + Sync {
     /// Persists the full context snapshot.
     ///
@@ -39,7 +57,7 @@ pub trait ContextPersistence: Send + Sync {
     /// # Errors
     ///
     /// Returns an error if the underlying storage write fails.
-    fn persist_context(
+    async fn persist_context(
         &self,
         context_id: &str,
         snapshot: &ContextSnapshot,
@@ -52,7 +70,7 @@ pub trait ContextPersistence: Send + Sync {
     /// # Errors
     ///
     /// Returns an error if the underlying storage read fails.
-    fn load_context(
+    async fn load_context(
         &self,
         context_id: &str,
     ) -> Result<Option<ContextSnapshot>, Box<dyn std::error::Error + Send + Sync>>;
@@ -62,7 +80,7 @@ pub trait ContextPersistence: Send + Sync {
     /// # Errors
     ///
     /// Returns an error if the underlying storage delete fails.
-    fn delete_context(
+    async fn delete_context(
         &self,
         context_id: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
@@ -72,7 +90,7 @@ pub trait ContextPersistence: Send + Sync {
     /// # Errors
     ///
     /// Returns an error if the underlying storage list fails.
-    fn list_persisted_contexts(
+    async fn list_persisted_contexts(
         &self,
     ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>>;
 }
@@ -88,8 +106,9 @@ pub trait ContextPersistence: Send + Sync {
 /// is called with `persistence: None`.
 pub struct NoopContextPersistence;
 
+#[async_trait]
 impl ContextPersistence for NoopContextPersistence {
-    fn persist_context(
+    async fn persist_context(
         &self,
         _context_id: &str,
         _snapshot: &ContextSnapshot,
@@ -97,21 +116,21 @@ impl ContextPersistence for NoopContextPersistence {
         Ok(())
     }
 
-    fn load_context(
+    async fn load_context(
         &self,
         _context_id: &str,
     ) -> Result<Option<ContextSnapshot>, Box<dyn std::error::Error + Send + Sync>> {
         Ok(None)
     }
 
-    fn delete_context(
+    async fn delete_context(
         &self,
         _context_id: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Ok(())
     }
 
-    fn list_persisted_contexts(
+    async fn list_persisted_contexts(
         &self,
     ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
         Ok(Vec::new())

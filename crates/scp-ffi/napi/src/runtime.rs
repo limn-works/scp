@@ -1962,8 +1962,9 @@ impl NapiBridgePersistence {
     }
 }
 
+#[async_trait::async_trait]
 impl ContextPersistence for NapiBridgePersistence {
-    fn persist_context(
+    async fn persist_context(
         &self,
         context_id: &str,
         snapshot: &ContextSnapshot,
@@ -1973,14 +1974,14 @@ impl ContextPersistence for NapiBridgePersistence {
         Ok(())
     }
 
-    fn load_context(
+    async fn load_context(
         &self,
         context_id: &str,
     ) -> Result<Option<ContextSnapshot>, Box<dyn std::error::Error + Send + Sync>> {
         Ok(self.contexts.get(context_id).map(|v| v.value().clone()))
     }
 
-    fn delete_context(
+    async fn delete_context(
         &self,
         context_id: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -1988,7 +1989,7 @@ impl ContextPersistence for NapiBridgePersistence {
         Ok(())
     }
 
-    fn list_persisted_contexts(
+    async fn list_persisted_contexts(
         &self,
     ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
         Ok(self
@@ -2024,33 +2025,34 @@ impl ArcContextPersistence {
     }
 }
 
+#[async_trait::async_trait]
 impl ContextPersistence for ArcContextPersistence {
-    fn persist_context(
+    async fn persist_context(
         &self,
         context_id: &str,
         snapshot: &ContextSnapshot,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.inner.persist_context(context_id, snapshot)
+        self.inner.persist_context(context_id, snapshot).await
     }
 
-    fn load_context(
+    async fn load_context(
         &self,
         context_id: &str,
     ) -> Result<Option<ContextSnapshot>, Box<dyn std::error::Error + Send + Sync>> {
-        self.inner.load_context(context_id)
+        self.inner.load_context(context_id).await
     }
 
-    fn delete_context(
+    async fn delete_context(
         &self,
         context_id: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.inner.delete_context(context_id)
+        self.inner.delete_context(context_id).await
     }
 
-    fn list_persisted_contexts(
+    async fn list_persisted_contexts(
         &self,
     ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
-        self.inner.list_persisted_contexts()
+        self.inner.list_persisted_contexts().await
     }
 }
 

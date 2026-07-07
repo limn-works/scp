@@ -1337,7 +1337,7 @@ pub async fn settle_tool_economy(
             // the original capture cause is preserved in its message. When the
             // commit succeeds, the original capture error is surfaced unchanged.
             if let Some(token) = downward_auth_obligation.take()
-                && let Err(persist_err) = token.commit(cell, deps, context_id)
+                && let Err(persist_err) = token.commit(cell, deps, context_id).await
             {
                 return Err(match capture_result {
                     Ok(_) => persist_err,
@@ -1779,15 +1779,16 @@ mod tests {
     /// fail-closed path. Defined at the `tests` module scope so the nested
     /// `tool_settle_fail_closed` module can reference it via `super::`.
     struct FailToolPersistence;
+    #[async_trait::async_trait]
     impl crate::context::persistence::ContextPersistence for FailToolPersistence {
-        fn persist_context(
+        async fn persist_context(
             &self,
             _: &str,
             _: &crate::context::state::ContextSnapshot,
         ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Err("induced persist failure".into())
         }
-        fn load_context(
+        async fn load_context(
             &self,
             _: &str,
         ) -> Result<
@@ -1796,10 +1797,13 @@ mod tests {
         > {
             Ok(None)
         }
-        fn delete_context(&self, _: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        async fn delete_context(
+            &self,
+            _: &str,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Ok(())
         }
-        fn list_persisted_contexts(
+        async fn list_persisted_contexts(
             &self,
         ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
             Ok(Vec::new())

@@ -1,30 +1,30 @@
 {
-  "_comment": "Ratchet baseline for `tokio::task::block_in_place`, `.block_on(...)`, `Runtime::new()`, and sync-bridge macro wrappers in the actor-refactor scope (ADR-049). See scripts/check-block-in-place.py for scope, detection rules, and the inline allow-list directive `// ci-allow: block-on: <reason>`. Enforcement is PER-FILE: the gate fails when any file's count goes UP. The previous per-crate-aggregate baseline was gameable \u2014 an attacker could delete a legit site and add a new one within the same crate without detection. Per-file baselines close that gap. Test code (`**/tests/**` paths and `#[cfg(test)] mod` items) is excluded from counting. Allow-listed sites are excluded from counting and must carry a reason string.",
-  "_updated": "2026-07-07 (ADR-049 Decision 7 PR-0 \u2014 RecoveryBackend converted to an async trait; its 2 recovery.rs sites (1 block_in_place + 1 block_on in the deleted block_on_async bridge) are eliminated, tightening recovery.rs 2\u21920 and scp-runtime 36\u219234)",
-  "_context": "Pre-refactor state. scp-runtime counts are sync-in-async bridges in (now-deleted) ContextManager, MlsCryptoProvider, recovery, trust store, and per-context store. scp-transport counts are in the provider.rs sync-adapter bridge and native/relay_persistence.rs. scp-node has one site in the HTTP/3 request handler (sync trait method, legitimate and will be annotated once post-refactor patterns settle). The actor refactor eliminates every scp-runtime and scp-transport site listed below; the scp-node site may remain and be annotated with `// ci-allow: block-on: <reason>` in a later commit. Post-commit-12 file-rename mapping: `manager/mod.rs` (2 sites: flush_all_contexts_sync) \u2192 `lifecycle_helpers.rs`; `manager/tools.rs` (6 sites) \u2192 `tools_helpers.rs`. Site counts unchanged at the rename \u2014 the bodies are byte-identical hoists. Phase-2A actor-migration rename (2026-06): the 6 `tools_helpers.rs` blocking rate-limit variants moved verbatim into `tools_helpers_legacy.rs` (the actor-shape `tools_helpers.rs` is now block-free); the baseline entry moves files accordingly \u2014 net-zero coverage, removed entirely when the `_legacy` shim is deleted in Phase-2A finalization Step E. `lifecycle_helpers.rs:shutdown_all_contexts_sync` is annotated with `// ci-allow: block-on:` (ADR-049 \u00a77 FFI sync-shutdown), so only the grandfathered `flush_all_contexts_sync` pair remains counted there.",
+  "_comment": "Ratchet baseline for `tokio::task::block_in_place`, `.block_on(...)`, `Runtime::new()`, and sync-bridge macro wrappers in the actor-refactor scope (ADR-049). See scripts/check-block-in-place.py for scope, detection rules, and the inline allow-list directive `// ci-allow: block-on: <reason>`. Enforcement is PER-FILE: the gate fails when any file's count goes UP. The previous per-crate-aggregate baseline was gameable — an attacker could delete a legit site and add a new one within the same crate without detection. Per-file baselines close that gap. Test code (`**/tests/**` paths and `#[cfg(test)] mod` items) is excluded from counting. Allow-listed sites are excluded from counting and must carry a reason string.",
+  "_updated": "2026-07-07 (ADR-049 Decision 7 PR-1 — ContextPersistence converted to an async trait; the ProtocolRepositoryContextBridge sync→async shim in store/context.rs is deleted (4 block_in_place + 4 block_on), tightening store/context.rs 20→8 and scp-runtime 34→22. Builds on PR-0 which eliminated recovery.rs 2→0.)",
+  "_context": "Pre-refactor state. scp-runtime counts are sync-in-async bridges in (now-deleted) ContextManager, MlsCryptoProvider, recovery, trust store, and per-context store. scp-transport counts are in the provider.rs sync-adapter bridge and native/relay_persistence.rs. scp-node has one site in the HTTP/3 request handler (sync trait method, legitimate and will be annotated once post-refactor patterns settle). The actor refactor eliminates every scp-runtime and scp-transport site listed below; the scp-node site may remain and be annotated with `// ci-allow: block-on: <reason>` in a later commit. Post-commit-12 file-rename mapping: `manager/mod.rs` (2 sites: flush_all_contexts_sync) → `lifecycle_helpers.rs`; `manager/tools.rs` (6 sites) → `tools_helpers.rs`. Site counts unchanged at the rename — the bodies are byte-identical hoists. Phase-2A actor-migration rename (2026-06): the 6 `tools_helpers.rs` blocking rate-limit variants moved verbatim into `tools_helpers_legacy.rs` (the actor-shape `tools_helpers.rs` is now block-free); the baseline entry moves files accordingly — net-zero coverage, removed entirely when the `_legacy` shim is deleted in Phase-2A finalization Step E. `lifecycle_helpers.rs:shutdown_all_contexts_sync` is annotated with `// ci-allow: block-on:` (ADR-049 §7 FFI sync-shutdown), so only the grandfathered `flush_all_contexts_sync` pair remains counted there.",
   "files": {
     "crates/scp-node/src/http.rs": 1,
     "crates/scp-runtime/src/context/lifecycle_helpers.rs": 2,
     "crates/scp-runtime/src/identity/recovery.rs": 0,
-    "crates/scp-runtime/src/store/context.rs": 20,
+    "crates/scp-runtime/src/store/context.rs": 8,
     "crates/scp-runtime/src/store/trust.rs": 6,
     "crates/scp-transport/src/native/relay_persistence.rs": 12,
     "crates/scp-transport/src/provider.rs": 4
   },
   "crates": {
     "scp-node": 1,
-    "scp-runtime": 34,
+    "scp-runtime": 22,
     "scp-transport": 16
   },
   "_breakdown": {
     "scp-node": [
-      "crates/scp-node/src/http.rs:1541 \u2014 HTTP/3 RequestHandler sync trait method (block_on)"
+      "crates/scp-node/src/http.rs:1541 — HTTP/3 RequestHandler sync trait method (block_on)"
     ],
     "scp-runtime": [
-      "crates/scp-runtime/src/context/lifecycle_helpers.rs:2461-2462 (1 block_in_place + 1 block_on \u2014 flush_all_contexts_sync; renamed from manager/mod.rs in ADR-049 commit 12)",
-      "crates/scp-runtime/src/context/tools_helpers.rs:237-327 (2 block_in_place + 4 block_on \u2014 try_consume / refund hard rate limit blocking + from_any_context wrappers; renamed from manager/tools.rs in ADR-049 commit 12)",
-      "crates/scp-runtime/src/identity/recovery.rs: ELIMINATED (was 1 block_in_place + 1 block_on in the block_on_async bridge) \u2014 RecoveryBackend is now an async trait (ADR-049 Decision 7 PR-0); execute_recovery awaits the trait methods directly. Count tightened 2\u21920.",
-      "crates/scp-runtime/src/store/context.rs:944-1109 (10 block_in_place + 10 block_on \u2014 RwLock-backed per-context store sync bridge)",
+      "crates/scp-runtime/src/context/lifecycle_helpers.rs:2461-2462 (1 block_in_place + 1 block_on — flush_all_contexts_sync; renamed from manager/mod.rs in ADR-049 commit 12)",
+      "crates/scp-runtime/src/context/tools_helpers.rs:237-327 (2 block_in_place + 4 block_on — try_consume / refund hard rate limit blocking + from_any_context wrappers; renamed from manager/tools.rs in ADR-049 commit 12)",
+      "crates/scp-runtime/src/identity/recovery.rs: ELIMINATED (was 1 block_in_place + 1 block_on in the block_on_async bridge) — RecoveryBackend is now an async trait (ADR-049 Decision 7 PR-0); execute_recovery awaits the trait methods directly. Count tightened 2→0.",
+      "crates/scp-runtime/src/store/context.rs (4 block_in_place + 4 block_on — ProtocolRepositoryEventLogBridge only; the ProtocolRepositoryContextBridge sync→async shim was deleted when ContextPersistence became an async trait in ADR-049 Decision 7 PR-1, removing 4 block_in_place + 4 block_on — count 20→8)",
       "crates/scp-runtime/src/store/trust.rs:273-336 (6 block_on via stored Handle)"
     ],
     "scp-transport": [

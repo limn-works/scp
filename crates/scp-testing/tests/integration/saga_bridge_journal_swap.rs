@@ -70,8 +70,9 @@ struct SharedPersistence {
     contexts: Mutex<HashMap<String, ContextSnapshot>>,
 }
 
+#[async_trait::async_trait]
 impl ContextPersistence for SharedPersistence {
-    fn persist_context(
+    async fn persist_context(
         &self,
         context_id: &str,
         snapshot: &ContextSnapshot,
@@ -83,16 +84,16 @@ impl ContextPersistence for SharedPersistence {
         Ok(())
     }
 
-    fn load_context(&self, context_id: &str) -> Result<Option<ContextSnapshot>, BoxError> {
+    async fn load_context(&self, context_id: &str) -> Result<Option<ContextSnapshot>, BoxError> {
         Ok(self.contexts.lock().unwrap().get(context_id).cloned())
     }
 
-    fn delete_context(&self, context_id: &str) -> Result<(), BoxError> {
+    async fn delete_context(&self, context_id: &str) -> Result<(), BoxError> {
         self.contexts.lock().unwrap().remove(context_id);
         Ok(())
     }
 
-    fn list_persisted_contexts(&self) -> Result<Vec<String>, BoxError> {
+    async fn list_persisted_contexts(&self) -> Result<Vec<String>, BoxError> {
         Ok(self.contexts.lock().unwrap().keys().cloned().collect())
     }
 }
@@ -100,22 +101,23 @@ impl ContextPersistence for SharedPersistence {
 /// `Box<dyn ContextPersistence>` newtype sharing the `Arc` backing map between
 /// the two supervisors (the constructor takes an owned `Box`).
 struct SharedPersistenceArc(Arc<SharedPersistence>);
+#[async_trait::async_trait]
 impl ContextPersistence for SharedPersistenceArc {
-    fn persist_context(
+    async fn persist_context(
         &self,
         context_id: &str,
         snapshot: &ContextSnapshot,
     ) -> Result<(), BoxError> {
-        self.0.persist_context(context_id, snapshot)
+        self.0.persist_context(context_id, snapshot).await
     }
-    fn load_context(&self, context_id: &str) -> Result<Option<ContextSnapshot>, BoxError> {
-        self.0.load_context(context_id)
+    async fn load_context(&self, context_id: &str) -> Result<Option<ContextSnapshot>, BoxError> {
+        self.0.load_context(context_id).await
     }
-    fn delete_context(&self, context_id: &str) -> Result<(), BoxError> {
-        self.0.delete_context(context_id)
+    async fn delete_context(&self, context_id: &str) -> Result<(), BoxError> {
+        self.0.delete_context(context_id).await
     }
-    fn list_persisted_contexts(&self) -> Result<Vec<String>, BoxError> {
-        self.0.list_persisted_contexts()
+    async fn list_persisted_contexts(&self) -> Result<Vec<String>, BoxError> {
+        self.0.list_persisted_contexts().await
     }
 }
 
@@ -252,7 +254,12 @@ async fn journal_swap_runs_restore_and_replay_legs_over_real_journal() {
             .expect("create_context");
         sup1.flush_all_contexts().await.expect("flush_all_contexts");
         assert_eq!(
-            persistence.load_context(ctx_id).unwrap().unwrap().state,
+            persistence
+                .load_context(ctx_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
             ContextState::Active,
             "the flushed snapshot must be Active for the restore leg to rehydrate it"
         );

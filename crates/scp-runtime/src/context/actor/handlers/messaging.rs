@@ -464,7 +464,7 @@ async fn handle_deliver_incoming(
     // stays `None`) when no downward-auth mutation occurred (the ordinary coalesced
     // persist via `mutated` is sufficient).
     let reply_result = if let Some(token) = downward_auth_obligation.take() {
-        match token.commit(cell, deps, context_id) {
+        match token.commit(cell, deps, context_id).await {
             Ok(()) => reply_result,
             Err(persist_err) => Err(match reply_result {
                 Ok(_) => persist_err,

@@ -308,19 +308,32 @@ pub fn enforce_send_economy(
 ///
 /// Internal cross-module helper — `pub` only so the sibling `crate::context`
 /// dispatch modules can call it; not part of the SDK surface.
-pub fn commit_send_nonce_token_on_abort(
+///
+/// # Not `async fn` — `Send` discipline (ADR-049 Decision 7)
+///
+/// SYNC fn returning a future: [`ClassSCommitToken::commit`] is itself a
+/// sync-returns-future that consumes the `&PerContextState` in its prelude, so
+/// the returned future here captures only the (already state-free) commit future
+/// plus the owned `abort_err`. An `async fn` would keep the `&PerContextState`
+/// parameter across the await and make the awaiting handler `!Send`.
+pub fn commit_send_nonce_token_on_abort<'d, 'c>(
     token: Option<crate::context::actor::class_s::ClassSCommitToken>,
     state: &PerContextState,
-    deps: &ActorDeps,
-    context_id: &str,
+    deps: &'d ActorDeps,
+    context_id: &'c str,
     abort_err: ContextError,
-) -> ContextError {
-    match token {
-        None => abort_err,
-        Some(t) => match t.commit(state, deps, context_id) {
-            Ok(()) => abort_err,
-            Err(persist_err) => persist_err,
-        },
+) -> impl std::future::Future<Output = ContextError> + Send + use<'d, 'c> {
+    // `t.commit(...)` runs its snapshot-building prelude synchronously here
+    // (consuming the `&PerContextState`) and yields a state-free `Send` future.
+    let commit_fut = token.map(|t| t.commit(state, deps, context_id));
+    async move {
+        match commit_fut {
+            None => abort_err,
+            Some(fut) => match fut.await {
+                Ok(()) => abort_err,
+                Err(persist_err) => persist_err,
+            },
+        }
     }
 }
 
@@ -836,7 +849,7 @@ pub fn run_buffered_post_delivery(
 /// per-sender sequence. Returns the original `abort_err` when the token persists
 /// cleanly (or no token was burned), or the [`ContextError::PersistenceFailed`]
 /// when the fail-closed persist of the burned nonce itself fails.
-fn discharge_send_abort(
+async fn discharge_send_abort(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
@@ -844,7 +857,7 @@ fn discharge_send_abort(
     ticket: crate::context::economy_logic::EconomyTicket,
     abort_err: ContextError,
 ) -> Result<(), ContextError> {
-    let err = commit_send_nonce_token_on_abort(token, cell, deps, context_id, abort_err);
+    let err = commit_send_nonce_token_on_abort(token, cell, deps, context_id, abort_err).await;
     crate::context::economy_logic::rollback_economy_ticket_inline_view(
         cell.class_c_view().governance_class_c_mut(),
         ticket,
@@ -1061,7 +1074,8 @@ pub async fn send_message(
                     ContextError::MemberNotFound(format!(
                         "cannot assign sequence: {sender_did} is not a member"
                     )),
-                );
+                )
+                .await;
             };
             // §9.10.4: encrypted contexts fan out to each member's pseudonym
             // routing ID. App data embeds NO correlating routing value: the outer
@@ -1142,7 +1156,8 @@ pub async fn send_message(
                         spending_nonce_token.take(),
                         ticket,
                         err,
-                    );
+                    )
+                    .await;
                 }
                 let recipients = view.access_mut().access_key_store.get_all(&context_id);
                 Ok((None, recipients, seq, false, peer_pseudonyms))
@@ -1160,7 +1175,8 @@ pub async fn send_message(
                     spending_nonce_token.take(),
                     ticket,
                     err,
-                );
+                )
+                .await;
             }
         };
 
@@ -1187,9 +1203,10 @@ pub async fn send_message(
         // (fail-closed) instead of the no-op `Ok(())`. The Class-C reversal
         // (ticket + sequence) runs regardless.
         // The token's `commit` takes a SHARED `&PerContextState` (via `&*cell`).
-        let nonce_persist = spending_nonce_token
-            .take()
-            .map_or(Ok(()), |t| t.commit(cell, deps, &context_id));
+        let nonce_persist = match spending_nonce_token.take() {
+            Some(t) => t.commit(cell, deps, &context_id).await,
+            None => Ok(()),
+        };
         crate::context::economy_logic::rollback_economy_ticket_inline_view(
             cell.class_c_view().governance_class_c_mut(),
             ticket,
@@ -1224,7 +1241,8 @@ pub async fn send_message(
                     deps,
                     &context_id,
                     e,
-                );
+                )
+                .await;
                 crate::context::economy_logic::rollback_economy_ticket_inline_view(
                     cell.class_c_view().governance_class_c_mut(),
                     ticket,
@@ -1264,7 +1282,8 @@ pub async fn send_message(
             deps,
             &context_id,
             e,
-        );
+        )
+        .await;
         // Void escrow + roll back ticket on send failure.
         if let Some(a) = auth {
             crate::context::economy_helpers::void_paid_action(deps, a, &context_id).await;
@@ -1325,7 +1344,9 @@ pub async fn send_message(
         Some(signer.key()),
         spending_nonce_token.take(),
         is_broadcast,
-    ) {
+    )
+    .await
+    {
         // Fail-closed persist of the Class-S nonce consume failed. Reverse the
         // economy reservation (the ticket is still alive — it is NOT committed
         // until finalize succeeds) and void the escrow hold. The sequence
@@ -2096,7 +2117,7 @@ fn record_send_participation(
 /// alive — finalize did not commit them); only the sequence is the caller's
 /// deferred responsibility, discharged here.
 #[allow(clippy::too_many_arguments)]
-pub fn finalize_send(
+pub async fn finalize_send(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
@@ -2137,7 +2158,7 @@ pub fn finalize_send(
         // (ADR-049 §9 Class S, keep-direction). A free send carries no token. The
         // token's `commit` takes a SHARED `&PerContextState` (via `&*cell`).
         if let Some(t) = token {
-            t.commit(cell, deps, context_id)?;
+            t.commit(cell, deps, context_id).await?;
         }
         return Ok(());
     }
@@ -2257,6 +2278,7 @@ pub fn finalize_send(
         is_broadcast,
         downward_auth_obligation,
     )
+    .await
 }
 
 /// Creates a consistency checkpoint when due (§9.9.3 thresholds) and, when one
@@ -2335,7 +2357,7 @@ fn create_and_broadcast_checkpoint_if_due(
 /// from best-effort to fail-closed so a coalesce-window crash cannot silently
 /// re-grant removed authority. The token carrier (vs. the prior `bool`) makes a
 /// populated-but-undischarged obligation a Drop-guard PANIC in debug/CI.
-fn persist_finalized_send(
+async fn persist_finalized_send(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
@@ -2359,7 +2381,7 @@ fn persist_finalized_send(
                 "paid send mints no separate downward-auth obligation — the nonce \
                  token's commit covers the GROW",
             );
-            if let Err(e) = t.commit(cell, deps, context_id) {
+            if let Err(e) = t.commit(cell, deps, context_id).await {
                 if !is_broadcast {
                     cell.class_c_view()
                         .membership_class_c_mut()
@@ -2374,9 +2396,9 @@ fn persist_finalized_send(
         // obligation's token commits fail-closed (ADR-049 §9, keep-direction).
         None => {
             if let Some(obligation) = downward_auth_obligation {
-                obligation.commit(cell, deps, context_id)?;
+                obligation.commit(cell, deps, context_id).await?;
             } else {
-                persist_state_best_effort(cell, deps, context_id);
+                persist_state_best_effort(cell, deps, context_id).await;
             }
         }
     }
@@ -2389,7 +2411,15 @@ fn persist_finalized_send(
 /// `needs_reconnect` (so restore fires the §23.11 reconnection pipeline)
 /// rather than failing — the crypto state is Class M (crash-surviving), so a
 /// transient export failure does not lose security state.
-fn build_snapshot_for_persist(
+///
+/// `pub(crate)` so the `ClassSCommitToken` deferred-persist terminals
+/// (`commit` / `discharge_with`) can build the owned snapshot in their OWN
+/// frame and drop the `&PerContextState` borrow BEFORE awaiting
+/// [`persist_snapshot_fail_closed`]. `PerContextState` is `!Sync` (it holds a
+/// `dyn FnMut` sink), so a `&PerContextState` held across an `.await` makes the
+/// actor future `!Send` and fails `tokio::spawn`. Building the snapshot first
+/// keeps the borrow off the await point (ADR-049 Decision 7).
+pub fn build_snapshot_for_persist(
     state: &PerContextState,
     deps: &ActorDeps,
     context_id: &str,
@@ -2452,21 +2482,43 @@ pub const fn welcome_snapshot_crypto_is_durable(export: &Result<Vec<u8>, Context
 /// (Class S — spending-nonce consume, executed-proposals, downward-authorization
 /// transitions), use [`persist_state_fail_closed`] so a persist failure returns
 /// an error instead of silently acknowledging an unpersisted mutation.
-pub fn persist_state_best_effort(state: &PerContextState, deps: &ActorDeps, context_id: &str) {
+///
+/// # Not `async fn` — `Send` discipline (ADR-049 Decision 7)
+///
+/// This is a SYNC fn returning a future, NOT an `async fn`. The
+/// `&PerContextState` is consumed by [`build_snapshot_for_persist`] in the
+/// synchronous prelude and is NOT captured by the returned future (which holds
+/// only the owned snapshot + `deps` / `context_id`). `PerContextState` is
+/// `!Sync` (it holds a `dyn FnMut` sink), so an `async fn` — which keeps its
+/// `&PerContextState` parameter in the future for the whole future lifetime —
+/// would make every awaiting actor handler `!Send` and fail `tokio::spawn`.
+/// `use<'d, 'c>` precisely captures only the `deps` / `context_id` lifetimes
+/// (edition 2024), excluding the `state` borrow.
+pub fn persist_state_best_effort<'d, 'c>(
+    state: &PerContextState,
+    deps: &'d ActorDeps,
+    context_id: &'c str,
+) -> impl std::future::Future<Output = ()> + Send + use<'d, 'c> {
     let snapshot = build_snapshot_for_persist(state, deps, context_id);
-    if let Err(e) = deps.persistence.persist_context(context_id, &snapshot) {
-        crate::metrics::record_persistence_failure();
-        tracing::warn!(
-            context_id = %context_id,
-            error = %e,
-            "failed to persist context snapshot"
-        );
+    async move {
+        if let Err(e) = deps
+            .persistence
+            .persist_context(context_id, &snapshot)
+            .await
+        {
+            crate::metrics::record_persistence_failure();
+            tracing::warn!(
+                context_id = %context_id,
+                error = %e,
+                "failed to persist context snapshot"
+            );
+        }
     }
 }
 
-/// Fail-closed sync persist of the current actor state (ADR-049 §9 Class S).
+/// Fail-closed persist of the current actor state (ADR-049 §9 Class S).
 ///
-/// Persists synchronously and, on failure, returns
+/// Persists and, on failure, returns
 /// [`ContextError::PersistenceFailed`] instead of swallowing the error — so a
 /// security-critical mutation (spending-nonce consume, executed-proposals,
 /// downward-authorization transition) is NEVER acknowledged to a caller unless
@@ -2485,14 +2537,47 @@ pub fn persist_state_best_effort(state: &PerContextState, deps: &ActorDeps, cont
 ///
 /// Returns [`ContextError::PersistenceFailed`] if the underlying
 /// `persist_context` write fails.
-pub fn persist_state_fail_closed(
+/// # Not `async fn` — `Send` discipline (ADR-049 Decision 7)
+///
+/// SYNC fn returning a future (see [`persist_state_best_effort`] for the full
+/// rationale): the `&PerContextState` is consumed in the synchronous prelude and
+/// is NOT captured by the returned future, so every awaiting actor handler stays
+/// `Send`.
+pub fn persist_state_fail_closed<'d, 'c>(
     state: &PerContextState,
+    deps: &'d ActorDeps,
+    context_id: &'c str,
+) -> impl std::future::Future<Output = Result<(), ContextError>> + Send + use<'d, 'c> {
+    // Build the owned snapshot FIRST so the `&PerContextState` borrow is dropped
+    // before the returned future — keeps this future `Send` (see
+    // [`build_snapshot_for_persist`]).
+    let snapshot = build_snapshot_for_persist(state, deps, context_id);
+    async move { persist_snapshot_fail_closed(&snapshot, deps, context_id).await }
+}
+
+/// Fail-closed persist of an ALREADY-BUILT snapshot (ADR-049 §9 Class S).
+///
+/// The `&PerContextState`-holding half of [`persist_state_fail_closed`] split
+/// out so the `ClassSCommitToken` deferred-persist terminals can build the
+/// snapshot in their own frame (dropping the `!Send` `&PerContextState` borrow)
+/// and then await this owned-`&ContextSnapshot` persist. `ContextSnapshot` is
+/// `Send`, so a caller holding `&snapshot` across the await stays `Send`.
+///
+/// Records the failure metric and logs on error, identically to
+/// [`persist_state_fail_closed`].
+///
+/// # Errors
+///
+/// Returns [`ContextError::PersistenceFailed`] if the underlying
+/// `persist_context` write fails.
+pub async fn persist_snapshot_fail_closed(
+    snapshot: &crate::context::state::ContextSnapshot,
     deps: &ActorDeps,
     context_id: &str,
 ) -> Result<(), ContextError> {
-    let snapshot = build_snapshot_for_persist(state, deps, context_id);
     deps.persistence
-        .persist_context(context_id, &snapshot)
+        .persist_context(context_id, snapshot)
+        .await
         .map_err(|e| {
             crate::metrics::record_persistence_failure();
             tracing::error!(
@@ -4167,7 +4252,7 @@ mod pseudonym_routing_tests {
         // populated the sink; discharge it (commit performs the fail-closed persist)
         // so the token's Drop guard is satisfied.
         if let Some(token) = downward_auth_applied.take() {
-            let _ = token.commit(&state, &deps, &ctx);
+            let _ = token.commit(&state, &deps, &ctx).await;
         }
 
         // (a) Velocity recorded for the buffered sender via the drain path.
@@ -4309,7 +4394,7 @@ mod pseudonym_routing_tests {
         // No consequence rules are installed here, so the sink stays `None`; the
         // `take()` is a no-op that satisfies the token's Drop guard either way.
         if let Some(token) = downward_auth_applied.take() {
-            let _ = token.commit(&state, &deps, &ctx);
+            let _ = token.commit(&state, &deps, &ctx).await;
         }
 
         // The announcement WAS recognized + processed (consumed as an internal

@@ -162,6 +162,7 @@ async fn handle_subscribe_broadcast(
             p.timestamp,
             None,
         )
+        .await
     };
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, subscribe_fut).await {
@@ -199,6 +200,7 @@ async fn handle_unsubscribe_broadcast(
             &p.subscriber_did,
             p.rotate_keys,
         )
+        .await
     };
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, unsub_fut).await {
@@ -236,6 +238,7 @@ async fn handle_block_broadcast_subscriber(
             &p.author_did,
             &p.subscriber_did,
         )
+        .await
     };
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, block_fut).await {
@@ -273,6 +276,7 @@ async fn handle_unblock_broadcast_subscriber(
             &p.author_did,
             &p.subscriber_did,
         )
+        .await
     };
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, unblock_fut).await {

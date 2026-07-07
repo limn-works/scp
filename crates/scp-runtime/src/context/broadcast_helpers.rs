@@ -56,7 +56,7 @@ use crate::context::state::{context_id_to_bytes, require_active, strip_event_pay
 ///   context or the subscriber is already registered.
 /// - [`ContextError::PermissionDenied`] if the context is gated and no valid
 ///   `messagesRead` UCAN is supplied.
-pub fn subscribe_broadcast<D, N, R, P, S>(
+pub async fn subscribe_broadcast<D, N, R, P, S>(
     cell: &mut ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
@@ -112,7 +112,7 @@ where
     // Broadcast roster state now rides the Class-S `ContextSnapshot`; the
     // whole-snapshot best-effort persist below covers it. Subscribe/unsubscribe
     // are roster ADD/REMOVE with no key secrecy, best-effort by design (§9 carve).
-    persist_state_best_effort(cell, deps, context_id);
+    persist_state_best_effort(cell, deps, context_id).await;
 
     // Subject-bearing leaf (ADR-011 amendment): carry the subscriber
     // (`subscriber_did`, which on a self-subscribe already equals `actor_did`)
@@ -146,7 +146,7 @@ where
 /// - [`ContextError::ContextNotActive`] if the context is not `Active`.
 /// - [`ContextError::MembershipFailed`] if the actor is not a broadcast
 ///   context.
-pub fn unsubscribe_broadcast(
+pub async fn unsubscribe_broadcast(
     cell: &mut ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
@@ -192,7 +192,7 @@ pub fn unsubscribe_broadcast(
     // Broadcast roster state now rides the Class-S `ContextSnapshot`; the
     // whole-snapshot best-effort persist below covers it. Subscribe/unsubscribe
     // are roster ADD/REMOVE with no key secrecy, best-effort by design (§9 carve).
-    persist_state_best_effort(cell, deps, context_id);
+    persist_state_best_effort(cell, deps, context_id).await;
 
     // Subject-bearing leaf (ADR-011 amendment): carry the unsubscribing
     // subscriber (`subscriber_did`, which already equals `actor_did` on this
@@ -572,7 +572,7 @@ pub fn release_broadcast_reservation(
 /// - [`ContextError::MembershipFailed`] if the actor is not a broadcast
 ///   context.
 /// - [`ContextError::MemberNotFound`] if the author is not registered.
-pub fn block_broadcast_subscriber(
+pub async fn block_broadcast_subscriber(
     cell: &mut ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
@@ -595,14 +595,15 @@ pub fn block_broadcast_subscriber(
     // non-durable block — BEFORE any MemberBlocked event-log append or ack. The
     // broadcast state now rides the Class-S `ContextSnapshot`, so this persist is
     // atomic with `read_exclusion_list` in one row.
-    let result = cell.commit_class_s_keep(deps, context_id, |mut view| {
-        let bc = view
-            .rest_mut()
-            .broadcast_context
-            .as_mut()
-            .ok_or_else(|| ContextError::MembershipFailed("not a broadcast context".into()))?;
-        bc.block_subscriber(author_did, subscriber_did)
-    })?;
+    let result = cell
+        .commit_class_s_keep(deps, context_id, |mut view| {
+            let bc =
+                view.rest_mut().broadcast_context.as_mut().ok_or_else(|| {
+                    ContextError::MembershipFailed("not a broadcast context".into())
+                })?;
+            bc.block_subscriber(author_did, subscriber_did)
+        })
+        .await?;
 
     // Durable — now emit the MemberBlocked receive-buffer event + Merkle leaf.
     emit_event(
@@ -642,7 +643,7 @@ pub fn block_broadcast_subscriber(
 ///   context.
 /// - [`ContextError::MemberNotFound`] if the author is not registered.
 /// - [`ContextError::InvalidState`] if the subscriber is not blocked.
-pub fn unblock_broadcast_subscriber(
+pub async fn unblock_broadcast_subscriber(
     cell: &mut ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
@@ -681,7 +682,7 @@ pub fn unblock_broadcast_subscriber(
 
     // Broadcast roster/block state rides the Class-S `ContextSnapshot`; the
     // whole-snapshot best-effort persist covers the block-list REMOVE.
-    persist_state_best_effort(cell, deps, context_id);
+    persist_state_best_effort(cell, deps, context_id).await;
 
     deps.event_log.append_context_event(
         &context_id_bytes,
@@ -804,7 +805,11 @@ fn emit_event(
 /// Best-effort persist of the current actor state. Mirrors
 /// the legacy context-snapshot persistence path, but reads fields from actor
 /// state rather than the old lock-shaped state.
-fn persist_state_best_effort(state: &PerContextState, deps: &ActorDeps, context_id: &str) {
+fn persist_state_best_effort<'d, 'c>(
+    state: &PerContextState,
+    deps: &'d ActorDeps,
+    context_id: &'c str,
+) -> impl std::future::Future<Output = ()> + Send + use<'d, 'c> {
     let mut snapshot = build_snapshot_from_state(state);
 
     let ctx_id_bytes = context_id_to_bytes(context_id);
@@ -823,13 +828,19 @@ fn persist_state_best_effort(state: &PerContextState, deps: &ActorDeps, context_
         }
     }
 
-    if let Err(e) = deps.persistence.persist_context(context_id, &snapshot) {
-        crate::metrics::record_persistence_failure();
-        tracing::warn!(
-            context_id = %context_id,
-            error = %e,
-            "failed to persist context snapshot"
-        );
+    async move {
+        if let Err(e) = deps
+            .persistence
+            .persist_context(context_id, &snapshot)
+            .await
+        {
+            crate::metrics::record_persistence_failure();
+            tracing::warn!(
+                context_id = %context_id,
+                error = %e,
+                "failed to persist context snapshot"
+            );
+        }
     }
 }
 
