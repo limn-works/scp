@@ -10,6 +10,7 @@
 
 use std::collections::HashSet;
 
+use async_trait::async_trait;
 use scp_core::identity::recovery::{
     CompromiseRecoveryOrchestrator, CompromiseTier, ContactNotification, ContextRecoveryState,
     KeyRotationOutcome, PskRotationParams, RecoveryBackend, RecoveryError, RecoveryResult,
@@ -48,8 +49,9 @@ impl MockBackend {
     }
 }
 
+#[async_trait(?Send)]
 impl RecoveryBackend for MockBackend {
-    fn mls_update(
+    async fn mls_update(
         &self,
         context_id: &str,
         _key_rotation: &KeyRotationOutcome,
@@ -62,7 +64,7 @@ impl RecoveryBackend for MockBackend {
         Ok(())
     }
 
-    fn revoke_ucans(
+    async fn revoke_ucans(
         &self,
         context_id: &str,
         _key_rotation: &KeyRotationOutcome,
@@ -75,7 +77,7 @@ impl RecoveryBackend for MockBackend {
         Ok(())
     }
 
-    fn rotate_key_packages(
+    async fn rotate_key_packages(
         &self,
         context_id: &str,
         _key_rotation: &KeyRotationOutcome,
@@ -88,7 +90,7 @@ impl RecoveryBackend for MockBackend {
         Ok(())
     }
 
-    fn notify_contacts(
+    async fn notify_contacts(
         &self,
         _did: &DID,
         _tier: CompromiseTier,
@@ -98,7 +100,7 @@ impl RecoveryBackend for MockBackend {
         self.notify_contacts_result
     }
 
-    fn rotate_psk(&self, _params: &PskRotationParams) -> bool {
+    async fn rotate_psk(&self, _params: &PskRotationParams) -> bool {
         self.rotate_psk_result
     }
 }

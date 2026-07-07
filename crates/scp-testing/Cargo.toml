@@ -49,6 +49,9 @@ scp-identity = { path = "../scp-identity" }
 scp-platform = { path = "../scp-platform", features = ["testing"] }
 scp-transport = { path = "../scp-transport" }
 scp-ffi-common = { path = "../scp-ffi/common", features = ["resolvers"] }
+# async-trait: the compromise-recovery integration test implements the async
+# `RecoveryBackend` trait (ADR-049 Decision 7) with a mock backend.
+async-trait = { workspace = true }
 base64 = { workspace = true }
 ed25519-dalek = { workspace = true }
 sha2 = { workspace = true }
