@@ -205,7 +205,8 @@ pub fn add_checkpoint_cosignature(
 /// which could leave this node at epoch N+1 believing recovery succeeded while
 /// remaining members stayed at epoch N still using the compromised keys (silent
 /// post-compromise desync). Recovery re-entry itself does NOT read `commit_fault`
-/// (that gate trips only on a full retry queue and only blocks
+/// (that gate trips on a full retry queue OR on retry exhaustion
+/// (`MAX_COMMIT_RETRIES`) in the retry drain, and only blocks
 /// send/lifecycle/governance), so the fail-close here cannot deadlock recovery.
 ///
 /// # No relock / generation gate
