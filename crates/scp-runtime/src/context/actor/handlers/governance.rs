@@ -848,7 +848,8 @@ async fn handle_evaluate_periodic_consequences_actor(
                     event_tx: deps.event_tx.as_ref(),
                 },
                 &mut downward_auth_obligation,
-            );
+            )
+            .await;
         }
         // `split` / `view` drop here, releasing the `&mut cell` borrow.
     }
@@ -1579,6 +1580,7 @@ mod consequence_fail_closed_tests {
             false,
             &mut downward_auth_sink,
         )
+        .await
         .expect("delivery of an in-order application message succeeds");
 
         assert!(

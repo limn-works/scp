@@ -55,7 +55,7 @@ use scp_protocol::trust::consequence::{
 /// wrapped in an [`scp_event_log::EventPayload`]. The consequence engine reads
 /// `target_did` back out of these bytes via
 /// `scp_protocol::trust::consequence::payload_target_is`.
-fn append_consequence_event(
+async fn append_consequence_event(
     event_log: &dyn crate::context::builder::ContextEventLogProvider,
     context_id: &str,
     context_id_bytes: &[u8; 32],
@@ -67,13 +67,16 @@ fn append_consequence_event(
     // every member, never a per-member evaluation `now()` (§7.3.1, §9.9.3).
     trigger_timestamp_secs: u64,
 ) {
-    if let Err(e) = event_log.append_context_event_with_payload(
-        context_id_bytes,
-        event_type,
-        CONSEQUENCE_ACTOR_DID,
-        payload,
-        trigger_timestamp_secs,
-    ) {
+    if let Err(e) = event_log
+        .append_context_event_with_payload(
+            context_id_bytes,
+            event_type,
+            CONSEQUENCE_ACTOR_DID,
+            payload,
+            trigger_timestamp_secs,
+        )
+        .await
+    {
         tracing::warn!(
             context_id,
             member = %member_did,
@@ -184,7 +187,7 @@ pub struct EnforceConsequencesCtx<'a> {
 /// observe the signal directly, but the obligation arming itself is now carried by
 /// the sink, not by the caller reacting to the return value.
 #[must_use]
-pub fn enforce_triggered_consequences(
+pub async fn enforce_triggered_consequences(
     state: &mut ConsequenceStateSplit<'_>,
     args: &EnforceConsequencesCtx<'_>,
     obligation: &mut Option<ClassSCommitToken>,
@@ -198,7 +201,8 @@ pub fn enforce_triggered_consequences(
             &context_id_bytes,
             consequence,
             obligation,
-        );
+        )
+        .await;
     }
     downward_auth_applied
 }
@@ -213,7 +217,7 @@ pub fn enforce_triggered_consequences(
 /// replacement (a demotion shrinks the member's effective authority). The caller
 /// OR-accumulates this across the triggered set to decide whether a fail-closed
 /// persist of the already-mutated state is owed.
-fn process_one_triggered_consequence(
+async fn process_one_triggered_consequence(
     state: &mut ConsequenceStateSplit<'_>,
     args: &EnforceConsequencesCtx<'_>,
     context_id_bytes: &[u8; 32],
@@ -276,7 +280,8 @@ fn process_one_triggered_consequence(
         &trigger_kind,
         action_type,
         durable,
-    );
+    )
+    .await;
 
     if !member_present {
         // Member left between evaluation and enforcement: emit a failed
@@ -293,7 +298,8 @@ fn process_one_triggered_consequence(
             &trigger_kind,
             action_type,
             durable,
-        );
+        )
+        .await;
         return false;
     }
 
@@ -315,7 +321,8 @@ fn process_one_triggered_consequence(
             action_type,
             durable,
             obligation,
-        );
+        )
+        .await;
         // The H10 escalation unconditionally applies `suspend_all` (a Class-S
         // `suspended_capabilities` mutation), so this path always owes a
         // fail-closed persist regardless of which action originally failed.
@@ -341,7 +348,8 @@ fn process_one_triggered_consequence(
         &trigger_kind,
         action_type,
         durable,
-    );
+    )
+    .await;
 
     // `true` iff this successful action reduced the member's effective authority
     // and therefore owes a fail-closed persist (ADR-049 §9): a
@@ -359,7 +367,7 @@ fn process_one_triggered_consequence(
 /// velocity/rate-triggered, non-convergent consequence — ADR-051 §6), the
 /// durable leaf and counter bump are suppressed and only the `ContextEvent` is
 /// surfaced.
-fn emit_consequence_triggered(
+async fn emit_consequence_triggered(
     state: &mut ConsequenceStateSplit<'_>,
     args: &EnforceConsequencesCtx<'_>,
     context_id_bytes: &[u8; 32],
@@ -383,7 +391,8 @@ fn emit_consequence_triggered(
             args.member_did,
             payload,
             convergent_consequence_timestamp(consequence),
-        );
+        )
+        .await;
         *state.checkpoint_events_since += 1;
     }
     let event = ContextEvent::ConsequenceTriggered {
@@ -401,7 +410,7 @@ fn emit_consequence_triggered(
 /// "member-departed-mid-flight" path. Separate from
 /// [`emit_failure_escalation`] because no escalation is applied when the
 /// member is absent — there is nothing to escalate against.
-fn emit_absent_member_enforcement_failed(
+async fn emit_absent_member_enforcement_failed(
     state: &mut ConsequenceStateSplit<'_>,
     args: &EnforceConsequencesCtx<'_>,
     context_id_bytes: &[u8; 32],
@@ -425,7 +434,8 @@ fn emit_absent_member_enforcement_failed(
             args.member_did,
             payload,
             convergent_consequence_timestamp(consequence),
-        );
+        )
+        .await;
         *state.checkpoint_events_since += 1;
     }
     let event = ContextEvent::ConsequenceEnforced {
@@ -439,7 +449,7 @@ fn emit_absent_member_enforcement_failed(
 
 /// Emits a `ConsequenceEnforced { success: true }` durable entry plus the
 /// matching receive-buffer push for the success path.
-fn emit_consequence_enforced_success(
+async fn emit_consequence_enforced_success(
     state: &mut ConsequenceStateSplit<'_>,
     args: &EnforceConsequencesCtx<'_>,
     context_id_bytes: &[u8; 32],
@@ -463,7 +473,8 @@ fn emit_consequence_enforced_success(
             args.member_did,
             payload,
             convergent_consequence_timestamp(consequence),
-        );
+        )
+        .await;
         *state.checkpoint_events_since += 1;
     }
     let event = ContextEvent::ConsequenceEnforced {
@@ -667,7 +678,7 @@ fn enforce_assign_role(
 /// durable event log entries (`ConsequenceEnforcementFailed` then
 /// `ConsequenceEscalatedToSuspendAll`) so an audit can reconstruct
 /// (a) which action failed and (b) that escalation was applied.
-fn emit_failure_escalation(
+async fn emit_failure_escalation(
     state: &mut ConsequenceStateSplit<'_>,
     args: &EnforceConsequencesCtx<'_>,
     consequence: &TriggeredConsequence,
@@ -717,7 +728,8 @@ fn emit_failure_escalation(
             member_did,
             failed_payload,
             convergent_consequence_timestamp(consequence),
-        );
+        )
+        .await;
         *state.checkpoint_events_since += 1;
         let escalation_payload = consequence_event_payload(
             member_did.as_ref(),
@@ -733,7 +745,8 @@ fn emit_failure_escalation(
             member_did,
             escalation_payload,
             convergent_consequence_timestamp(consequence),
-        );
+        )
+        .await;
         *state.checkpoint_events_since += 1;
     }
     let event = ContextEvent::ConsequenceEnforced {
@@ -884,7 +897,7 @@ mod convergence_tests {
     /// Drives one already-triggered consequence through the enforcement chain
     /// against a fresh `PerContextState` + a `scp_event_log`-backed provider,
     /// returning `(merkle_root_delta_nonzero, consequence_triggered_event_seen)`.
-    fn run_one(trigger: ConsequenceTrigger) -> (bool, bool) {
+    async fn run_one(trigger: ConsequenceTrigger) -> (bool, bool) {
         let mut state = PerContextState::new_for_test_encrypted(
             CTX_BYTES,
             1_700_000_000,
@@ -906,7 +919,10 @@ mod convergence_tests {
         let storage_key = crate::context::state::context_id_to_bytes(&context_id_str);
 
         let event_log = MerkleEventLogProvider::new();
-        event_log.init_event_log(&storage_key).expect("init log");
+        event_log
+            .init_event_log(&storage_key)
+            .await
+            .expect("init log");
         let root_before = event_log
             .event_log_merkle_root(&storage_key)
             .expect("root before");
@@ -939,7 +955,8 @@ mod convergence_tests {
                     event_tx: Some(&tx),
                 },
                 &mut obligation,
-            );
+            )
+            .await;
             assert!(
                 suspended,
                 "SuspendAccess against a present member applies a suspension"
@@ -967,9 +984,9 @@ mod convergence_tests {
         (root_before != root_after, saw_triggered)
     }
 
-    #[test]
-    fn velocity_triggered_consequence_adds_no_durable_leaf() {
-        let (root_changed, saw_triggered) = run_one(ConsequenceTrigger::MessageVelocity);
+    #[tokio::test]
+    async fn velocity_triggered_consequence_adds_no_durable_leaf() {
+        let (root_changed, saw_triggered) = run_one(ConsequenceTrigger::MessageVelocity).await;
         assert!(
             !root_changed,
             "a MessageVelocity-triggered consequence is non-convergent (ADR-051 §6) \
@@ -982,9 +999,9 @@ mod convergence_tests {
         );
     }
 
-    #[test]
-    fn warning_count_triggered_consequence_adds_durable_leaf() {
-        let (root_changed, saw_triggered) = run_one(ConsequenceTrigger::WarningCount);
+    #[tokio::test]
+    async fn warning_count_triggered_consequence_adds_durable_leaf() {
+        let (root_changed, saw_triggered) = run_one(ConsequenceTrigger::WarningCount).await;
         assert!(
             root_changed,
             "a WarningCount-triggered consequence is convergent (ADR-051 §6) and \
@@ -996,10 +1013,10 @@ mod convergence_tests {
         );
     }
 
-    #[test]
-    fn tool_rate_triggered_consequence_adds_no_durable_leaf() {
+    #[tokio::test]
+    async fn tool_rate_triggered_consequence_adds_no_durable_leaf() {
         // The second non-convergent trigger — same posture as MessageVelocity.
-        let (root_changed, _) = run_one(ConsequenceTrigger::ToolRateExceeded);
+        let (root_changed, _) = run_one(ConsequenceTrigger::ToolRateExceeded).await;
         assert!(
             !root_changed,
             "a ToolRateExceeded-triggered consequence is non-convergent (ADR-051 §6) \
@@ -1007,10 +1024,10 @@ mod convergence_tests {
         );
     }
 
-    #[test]
-    fn custom_triggered_consequence_adds_durable_leaf() {
+    #[tokio::test]
+    async fn custom_triggered_consequence_adds_durable_leaf() {
         // The second convergent trigger — same posture as WarningCount.
-        let (root_changed, _) = run_one(ConsequenceTrigger::Custom("abuse".to_owned()));
+        let (root_changed, _) = run_one(ConsequenceTrigger::Custom("abuse".to_owned())).await;
         assert!(
             root_changed,
             "a Custom-triggered consequence is convergent (ADR-051 §6) and MUST \
@@ -1028,11 +1045,11 @@ mod convergence_tests {
     /// durable history every honest member observes: one `GovernanceAction`
     /// targeting `SUBJECT` (the `WarningCount` bucket). This is the only
     /// source from which convergent governance/consequence events may be drawn.
-    fn convergent_log() -> (MerkleEventLogProvider, String) {
+    async fn convergent_log() -> (MerkleEventLogProvider, String) {
         let context_id_str = hex::encode(CTX_BYTES);
         let storage_key = crate::context::state::context_id_to_bytes(&context_id_str);
         let log = MerkleEventLogProvider::new();
-        log.init_event_log(&storage_key).expect("init log");
+        log.init_event_log(&storage_key).await.expect("init log");
         log.append_context_event_with_payload(
             &storage_key,
             EventType::GovernanceAction,
@@ -1043,6 +1060,7 @@ mod convergence_tests {
             },
             1_700_000_000,
         )
+        .await
         .expect("append governance action");
         (log, context_id_str)
     }
@@ -1077,8 +1095,8 @@ mod convergence_tests {
 
     /// Counts the `GovernanceAction`-bucket events (the bucket `WarningCount` /
     /// `Custom` triggers match) in the merged consequence-evaluation event list.
-    fn governance_bucket_count(buffer: &ReceiveBuffer) -> usize {
-        let (log, ctx) = convergent_log();
+    async fn governance_bucket_count(buffer: &ReceiveBuffer) -> usize {
+        let (log, ctx) = convergent_log().await;
         let (merged, _convergent_now) =
             event_log_entries_for_consequences(buffer, &ctx, 1_700_000_100, &log);
         merged
@@ -1096,11 +1114,11 @@ mod convergence_tests {
     /// `GovernanceActionExecuted` projection was double-counted on the quiet
     /// member and skipped on the busy one (dedup keyed on member-local
     /// `buffer_len`), diverging the count and the durable leaf.
-    #[test]
-    fn convergent_governance_count_is_independent_of_buffer_length() {
+    #[tokio::test]
+    async fn convergent_governance_count_is_independent_of_buffer_length() {
         // Member A: quiet (2 local messages). Member B: busy (50 local messages).
-        let quiet = governance_bucket_count(&buffer_with_local_activity(2));
-        let busy = governance_bucket_count(&buffer_with_local_activity(50));
+        let quiet = governance_bucket_count(&buffer_with_local_activity(2)).await;
+        let busy = governance_bucket_count(&buffer_with_local_activity(50)).await;
 
         assert_eq!(
             quiet, busy,
@@ -1129,12 +1147,12 @@ mod convergence_tests {
     /// `last_log_ts > 0` dedup gate is bypassed and the buffer source is
     /// isolated (the durable provider stamps appends with the real system
     /// clock, which would otherwise dedup all buffer events against it).
-    #[test]
-    fn per_author_messages_still_flow_from_buffer() {
+    #[tokio::test]
+    async fn per_author_messages_still_flow_from_buffer() {
         let context_id_str = hex::encode(CTX_BYTES);
         let storage_key = crate::context::state::context_id_to_bytes(&context_id_str);
         let log = MerkleEventLogProvider::new();
-        log.init_event_log(&storage_key).expect("init log");
+        log.init_event_log(&storage_key).await.expect("init log");
 
         let buffer = buffer_with_local_activity(3);
         let now = std::time::SystemTime::now()

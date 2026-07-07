@@ -124,13 +124,33 @@ pub trait ContextTransportProvider: Send + Sync {
 /// Provides event log operations needed during context creation.
 ///
 /// Implementors initialise the Merkle event log and append events.
+///
+/// # Async discipline (ADR-049 Decision 7)
+///
+/// This is a partial-async trait. The persistence-touching methods
+/// (`init_event_log`, `append_event`, `destroy_event_log`, the `append_*`
+/// helpers, `import_event_log_data`, `restore_event_log`,
+/// `prune_before_checkpoint`) are `async` and `.await` the async
+/// [`EventLogPersistence`](crate::context::providers::event_log::EventLogPersistence)
+/// backend directly. The pure in-memory read methods (`event_log_entries`,
+/// `event_log_merkle_root`, `export_event_log_data`, `prove_event_inclusion`,
+/// `prove_event_consistency`, `rebuild_event_log_for_proof`) stay **sync**:
+/// they touch no async I/O and are read directly by sync FFI-boundary
+/// supervisor probes (`Supervisor::event_log_entries` / `participation_record`),
+/// so forcing them async would add `block_on` at that boundary — the Decision-7
+/// anti-goal. This mirrors the ADR's `is_connected`-stays-sync carve-out.
+///
+/// Held as `Arc<dyn ContextEventLogProvider>` inside `ActorDeps` (moved into
+/// `tokio::spawn`), so the async futures must be **Send** — plain
+/// `#[async_trait]`, not `?Send`.
+#[async_trait::async_trait]
 pub trait ContextEventLogProvider: Send + Sync {
     /// Initialises an empty event log for the given context.
     ///
     /// # Errors
     ///
     /// Returns [`ContextCreationError`] if initialisation fails.
-    fn init_event_log(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError>;
+    async fn init_event_log(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError>;
 
     /// Appends a typed event to the context's event log.
     ///
@@ -157,7 +177,7 @@ pub trait ContextEventLogProvider: Send + Sync {
     /// # Errors
     ///
     /// Returns [`ContextCreationError`] if the append fails.
-    fn append_event(
+    async fn append_event(
         &self,
         context_id: &[u8; 32],
         event_type: scp_event_log::EventType,
@@ -172,7 +192,7 @@ pub trait ContextEventLogProvider: Send + Sync {
     ///
     /// Returns [`ContextCreationError`] if destruction fails. Callers may
     /// ignore this error during rollback (best-effort).
-    fn destroy_event_log(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError>;
+    async fn destroy_event_log(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError>;
 
     // -- Membership/messaging event logging (SCP-020) ----------------------
 
@@ -186,7 +206,7 @@ pub trait ContextEventLogProvider: Send + Sync {
     /// # Errors
     ///
     /// Returns [`ContextError::EventLogFailed`] if the append fails.
-    fn append_context_event(
+    async fn append_context_event(
         &self,
         context_id: &[u8; 32],
         event_type: scp_event_log::EventType,
@@ -200,6 +220,7 @@ pub trait ContextEventLogProvider: Send + Sync {
             scp_event_log::EventPayload::default(),
             timestamp_secs,
         )
+        .await
         .map_err(|e| ContextError::EventLogFailed(e.to_string()))
     }
 
@@ -212,7 +233,7 @@ pub trait ContextEventLogProvider: Send + Sync {
     /// # Errors
     ///
     /// Returns [`ContextError::EventLogFailed`] if the append fails.
-    fn append_context_event_with_payload(
+    async fn append_context_event_with_payload(
         &self,
         context_id: &[u8; 32],
         event_type: scp_event_log::EventType,
@@ -221,6 +242,7 @@ pub trait ContextEventLogProvider: Send + Sync {
         timestamp_secs: u64,
     ) -> Result<(), ContextError> {
         self.append_event(context_id, event_type, actor_did, payload, timestamp_secs)
+            .await
             .map_err(|e| ContextError::EventLogFailed(e.to_string()))
     }
 
@@ -238,7 +260,7 @@ pub trait ContextEventLogProvider: Send + Sync {
     ///
     /// Returns [`ContextError::EventLogFailed`] if payload encoding or the
     /// append fails.
-    fn append_membership_change_leaf(
+    async fn append_membership_change_leaf(
         &self,
         context_id: &[u8; 32],
         event_type: scp_event_log::EventType,
@@ -261,6 +283,7 @@ pub trait ContextEventLogProvider: Send + Sync {
             payload,
             timestamp_secs,
         )
+        .await
     }
 
     /// Appends a `RoleAssigned` leaf carrying a subject-bearing
@@ -276,7 +299,7 @@ pub trait ContextEventLogProvider: Send + Sync {
     ///
     /// Returns [`ContextError::EventLogFailed`] if payload encoding or the
     /// append fails.
-    fn append_role_assigned_leaf(
+    async fn append_role_assigned_leaf(
         &self,
         context_id: &[u8; 32],
         actor_did: &str,
@@ -297,6 +320,7 @@ pub trait ContextEventLogProvider: Send + Sync {
             payload,
             timestamp_secs,
         )
+        .await
     }
 
     // -- Entry reading (symmetric with append) --------------------------------
@@ -347,7 +371,7 @@ pub trait ContextEventLogProvider: Send + Sync {
     ///
     /// Returns [`ContextError::EventLogFailed`] if deserialization fails or
     /// the Merkle chain is broken.
-    fn import_event_log_data(
+    async fn import_event_log_data(
         &self,
         context_id: &[u8; 32],
         data: &[u8],
@@ -388,9 +412,9 @@ pub trait ContextEventLogProvider: Send + Sync {
     ///
     /// Returns [`ContextCreationError`] if the persisted data is corrupt
     /// (e.g., broken Merkle chain).
-    fn restore_event_log(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+    async fn restore_event_log(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
         // Default: initialize empty event log (no persistence).
-        self.init_event_log(context_id)
+        self.init_event_log(context_id).await
     }
 
     /// Prunes event log entries before a checkpoint boundary based on a
@@ -404,7 +428,7 @@ pub trait ContextEventLogProvider: Send + Sync {
     ///
     /// The number of entries removed, or `None` if no log exists for the
     /// context or the provider does not support pruning.
-    fn prune_before_checkpoint(
+    async fn prune_before_checkpoint(
         &self,
         _context_id: &[u8; 32],
         _checkpoint_event_count: u64,
@@ -688,7 +712,7 @@ impl CreationReceipt {
     /// Rollback is best-effort: if a destruction step fails, it is ignored
     /// so that subsequent rollback steps still execute. This ensures that a
     /// failure during rollback does not leave additional orphaned state.
-    pub fn rollback(
+    pub async fn rollback(
         &self,
         context_id: &[u8; 32],
         crypto: &MlsCryptoProvider,
@@ -702,7 +726,7 @@ impl CreationReceipt {
             let _ = transport.delete_published(context_id);
         }
         if self.event_log.is_some() {
-            let _ = event_log.destroy_event_log(context_id);
+            let _ = event_log.destroy_event_log(context_id).await;
         }
         if self.sender_key.is_some() {
             let _ = crypto.destroy_sender_key(context_id);
@@ -813,10 +837,16 @@ fn context_id_bytes(context_id: &str) -> [u8; 32] {
 ///
 /// See ADR-008 acceptance criterion 2.
 // ADR-049 §Decision 12: `transition_to` is now a synchronous lock-free ArcSwap
-// store. Async is retained as the ContextManager helper API contract — callers
-// await uniformly, and the crypto/transport/event-log provider calls regain
-// await points under ADR-049 Decision 7 (async-provider-trait conversion).
-#[allow(clippy::unused_async)]
+// store. The async event-log provider calls (`init_event_log`, `append_event`,
+// `append_membership_change_leaf`) and the async `receipt.rollback` regain real
+// await points under ADR-049 Decision 7 (async-provider-trait conversion), so
+// this fn genuinely awaits (no longer `unused_async`). `too_many_lines` is
+// allowed: it is a single cohesive multi-phase creation orchestrator (validate →
+// crypto → sender key → event log → publish → activate → creation leaves) whose
+// per-phase rollback-and-return blocks each gained `.await` continuation lines;
+// splitting the sequential phases across helpers would reduce, not improve,
+// readability.
+#[allow(clippy::too_many_lines)]
 pub async fn create_context(
     context_id: String,
     params: ContextParams,
@@ -875,14 +905,18 @@ pub async fn create_context(
                 ))
             })?;
             if let Err(e) = crypto.create_mls_group_with_context(&id_bytes, &context_extension) {
-                receipt.rollback(&id_bytes, crypto, transport, event_log_provider);
+                receipt
+                    .rollback(&id_bytes, crypto, transport, event_log_provider)
+                    .await;
                 return Err(e);
             }
             receipt.mls_group = Some(MlsGroupHandle::new());
         }
         ContextMode::Broadcast => {
             if let Err(e) = crypto.init_broadcast_key(&id_bytes) {
-                receipt.rollback(&id_bytes, crypto, transport, event_log_provider);
+                receipt
+                    .rollback(&id_bytes, crypto, transport, event_log_provider)
+                    .await;
                 return Err(e);
             }
             // No MLS group for Broadcast mode -- mls_group stays None.
@@ -894,7 +928,9 @@ pub async fn create_context(
     if params.mode == ContextMode::Encrypted
         && let Err(e) = crypto.generate_sender_key(&id_bytes)
     {
-        receipt.rollback(&id_bytes, crypto, transport, event_log_provider);
+        receipt
+            .rollback(&id_bytes, crypto, transport, event_log_provider)
+            .await;
         return Err(e);
     }
     // Mark sender_key for both modes: Encrypted has an explicit key,
@@ -903,8 +939,10 @@ pub async fn create_context(
     receipt.sender_key = Some(SenderKeyHandle::new());
 
     // Step 4: Initialise event log.
-    if let Err(e) = event_log_provider.init_event_log(&id_bytes) {
-        receipt.rollback(&id_bytes, crypto, transport, event_log_provider);
+    if let Err(e) = event_log_provider.init_event_log(&id_bytes).await {
+        receipt
+            .rollback(&id_bytes, crypto, transport, event_log_provider)
+            .await;
         return Err(e);
     }
     receipt.event_log = Some(EventLogHandle::new());
@@ -932,22 +970,29 @@ pub async fn create_context(
 
     // Step 6: Transition state to Active.
     if let Err(e) = handle.transition_to(&ContextState::Active) {
-        receipt.rollback(&id_bytes, crypto, transport, event_log_provider);
+        receipt
+            .rollback(&id_bytes, crypto, transport, event_log_provider)
+            .await;
         return Err(e.into());
     }
 
     // Step 7: Append ContextCreated event.
-    if let Err(e) = event_log_provider.append_event(
-        &id_bytes,
-        scp_event_log::EventType::ContextCreated,
-        creator_did,
-        scp_event_log::EventPayload::default(),
-        // Creator-assigned creation time, copied by every member (§7.3.1,
-        // §9.9.3) — not each member's local `now()`.
-        creation_timestamp_secs,
-    ) {
+    if let Err(e) = event_log_provider
+        .append_event(
+            &id_bytes,
+            scp_event_log::EventType::ContextCreated,
+            creator_did,
+            scp_event_log::EventPayload::default(),
+            // Creator-assigned creation time, copied by every member (§7.3.1,
+            // §9.9.3) — not each member's local `now()`.
+            creation_timestamp_secs,
+        )
+        .await
+    {
         // Even though the handle is Active, we must roll back everything.
-        receipt.rollback(&id_bytes, crypto, transport, event_log_provider);
+        receipt
+            .rollback(&id_bytes, crypto, transport, event_log_provider)
+            .await;
         return Err(e);
     }
 
@@ -964,15 +1009,20 @@ pub async fn create_context(
     // mirroring the supervisor's creator membership in
     // `lifecycle_helpers::create_context`. Rolls back the whole creation on
     // failure, exactly like the `ContextCreated` append above.
-    if let Err(e) = event_log_provider.append_membership_change_leaf(
-        &id_bytes,
-        scp_event_log::EventType::MemberJoined,
-        creator_did,
-        creator_did,
-        "admin",
-        creation_timestamp_secs,
-    ) {
-        receipt.rollback(&id_bytes, crypto, transport, event_log_provider);
+    if let Err(e) = event_log_provider
+        .append_membership_change_leaf(
+            &id_bytes,
+            scp_event_log::EventType::MemberJoined,
+            creator_did,
+            creator_did,
+            "admin",
+            creation_timestamp_secs,
+        )
+        .await
+    {
+        receipt
+            .rollback(&id_bytes, crypto, transport, event_log_provider)
+            .await;
         return Err(e.into());
     }
 
@@ -1027,11 +1077,12 @@ mod tests {
     }
 
     struct TestEventLog;
+    #[async_trait::async_trait]
     impl ContextEventLogProvider for TestEventLog {
-        fn init_event_log(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
+        async fn init_event_log(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
             Ok(())
         }
-        fn append_event(
+        async fn append_event(
             &self,
             _: &[u8; 32],
             _event_type: scp_event_log::EventType,
@@ -1041,7 +1092,7 @@ mod tests {
         ) -> Result<(), ContextCreationError> {
             Ok(())
         }
-        fn destroy_event_log(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
+        async fn destroy_event_log(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
             Ok(())
         }
     }
@@ -1209,6 +1260,7 @@ mod tests {
                 scp_event_log::EventPayload::default(),
                 SEND_TS,
             )
+            .await
             .expect("append founder MessageSent");
 
         let entries = provider

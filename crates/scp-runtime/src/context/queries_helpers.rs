@@ -1226,15 +1226,16 @@ mod equivocation_dedup_tests {
         appends: Arc<AtomicUsize>,
     }
 
+    #[async_trait::async_trait]
     impl crate::context::builder::ContextEventLogProvider for CountingEventLog {
-        fn init_event_log(
+        async fn init_event_log(
             &self,
             _id: &[u8; 32],
         ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
             Ok(())
         }
 
-        fn append_event(
+        async fn append_event(
             &self,
             _id: &[u8; 32],
             _event: scp_event_log::EventType,
@@ -1246,7 +1247,7 @@ mod equivocation_dedup_tests {
             Ok(())
         }
 
-        fn destroy_event_log(
+        async fn destroy_event_log(
             &self,
             _id: &[u8; 32],
         ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {

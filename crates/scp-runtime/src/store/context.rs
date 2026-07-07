@@ -860,12 +860,15 @@ impl<S: Storage + 'static> crate::context::persistence::ContextPersistence
 // ProtocolRepositoryEventLogBridge — event log bridge (#636)
 // ---------------------------------------------------------------------------
 
-/// Canonical bridge from [`crate::context::providers::event_log::EventLogPersistence`] (synchronous) to the async
+/// Canonical bridge from [`crate::context::providers::event_log::EventLogPersistence`] to the async
 /// `ProtocolRepository` event log methods.
 ///
-/// Wraps `Arc<ProtocolRepository<S>>` and implements the synchronous
-/// [`crate::context::providers::event_log::EventLogPersistence`] trait by blocking on async methods via
-/// `tokio::task::block_in_place` + `Handle::block_on`.
+/// Wraps `Arc<ProtocolRepository<S>>` and implements the async
+/// [`crate::context::providers::event_log::EventLogPersistence`] trait by
+/// `.await`-ing the async `ProtocolRepository` methods directly (ADR-049
+/// Decision 7). The former `tokio::task::block_in_place` + `Handle::block_on`
+/// sync→async shim is gone — the trait is now `#[async_trait]`, so the provider
+/// `.await`s persistence on its own task instead of parking a runtime worker.
 ///
 /// See GitHub issue #636.
 pub struct ProtocolRepositoryEventLogBridge<S: Storage> {
@@ -879,69 +882,48 @@ impl<S: Storage> ProtocolRepositoryEventLogBridge<S> {
     }
 }
 
+#[async_trait::async_trait]
 impl<S: Storage + 'static> crate::context::providers::event_log::EventLogPersistence
     for ProtocolRepositoryEventLogBridge<S>
 {
-    fn persist_entry(
+    async fn persist_entry(
         &self,
         context_id: &str,
         seq: usize,
         entry: &scp_event_log::Event,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let store = self.store.clone();
-        let ctx_id = context_id.to_owned();
-        let entry_owned = entry.clone();
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                store
-                    .store_merkle_event_log_entry(&ctx_id, seq, &entry_owned)
-                    .await
-            })
-        })?;
+        self.store
+            .store_merkle_event_log_entry(context_id, seq, entry)
+            .await?;
         Ok(())
     }
 
-    fn persist_entries(
+    async fn persist_entries(
         &self,
         context_id: &str,
         entries: &[scp_event_log::Event],
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let store = self.store.clone();
-        let ctx_id = context_id.to_owned();
-        let entries_owned = entries.to_vec();
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                store
-                    .store_merkle_event_log_entries(&ctx_id, &entries_owned)
-                    .await
-            })
-        })?;
+        self.store
+            .store_merkle_event_log_entries(context_id, entries)
+            .await?;
         Ok(())
     }
 
-    fn load_entries(
+    async fn load_entries(
         &self,
         context_id: &str,
     ) -> Result<Option<Vec<scp_event_log::Event>>, Box<dyn std::error::Error + Send + Sync>> {
-        let store = self.store.clone();
-        let ctx_id = context_id.to_owned();
-        let result = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(async { store.load_merkle_event_log_entries(&ctx_id).await })
-        })?;
+        let result = self.store.load_merkle_event_log_entries(context_id).await?;
         Ok(result)
     }
 
-    fn delete_entries(
+    async fn delete_entries(
         &self,
         context_id: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let store = self.store.clone();
-        let ctx_id = context_id.to_owned();
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(async { store.delete_merkle_event_log_entries(&ctx_id).await })
-        })?;
+        self.store
+            .delete_merkle_event_log_entries(context_id)
+            .await?;
         Ok(())
     }
 }
@@ -1513,10 +1495,16 @@ mod tests {
         };
 
         // O(1) per-entry persist.
-        bridge.persist_entry("ctx-bridge-el", 0, &entry0).unwrap();
-        bridge.persist_entry("ctx-bridge-el", 1, &entry1).unwrap();
+        bridge
+            .persist_entry("ctx-bridge-el", 0, &entry0)
+            .await
+            .unwrap();
+        bridge
+            .persist_entry("ctx-bridge-el", 1, &entry1)
+            .await
+            .unwrap();
 
-        let loaded = bridge.load_entries("ctx-bridge-el").unwrap().unwrap();
+        let loaded = bridge.load_entries("ctx-bridge-el").await.unwrap().unwrap();
         assert_eq!(loaded.len(), 2);
         assert_eq!(
             loaded[0].event_type,
@@ -1524,8 +1512,14 @@ mod tests {
         );
         assert_eq!(loaded[1].event_type, scp_event_log::EventType::MemberJoined);
 
-        bridge.delete_entries("ctx-bridge-el").unwrap();
-        assert!(bridge.load_entries("ctx-bridge-el").unwrap().is_none());
+        bridge.delete_entries("ctx-bridge-el").await.unwrap();
+        assert!(
+            bridge
+                .load_entries("ctx-bridge-el")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -1556,9 +1550,16 @@ mod tests {
             },
         ];
 
-        bridge.persist_entries("ctx-bridge-bulk", &entries).unwrap();
+        bridge
+            .persist_entries("ctx-bridge-bulk", &entries)
+            .await
+            .unwrap();
 
-        let loaded = bridge.load_entries("ctx-bridge-bulk").unwrap().unwrap();
+        let loaded = bridge
+            .load_entries("ctx-bridge-bulk")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(loaded.len(), 2);
         assert_eq!(
             loaded[0].event_type,

@@ -65,13 +65,14 @@ fn join_payload(subject_did: &str) -> EventPayload {
 /// rule it is IGNORED for the leaf, so it must not perturb the root. The
 /// negative-control test below feeds the offset into the leaf instead to prove
 /// per-member-local stamping would diverge.
-fn append_convergent_stream(log: &MerkleEventLogProvider, local_clock_offset: u64) {
+async fn append_convergent_stream(log: &MerkleEventLogProvider, local_clock_offset: u64) {
     // `local_clock_offset` is intentionally unused for the leaf timestamp: the
     // committer-assigned value is what every member records. It exists so the
     // two members in the positive test can be given DIFFERENT skews and still
     // converge.
     let _ = local_clock_offset;
     log.append_context_event(&CTX, EventType::ContextCreated, ALICE, TS_CREATED)
+        .await
         .unwrap();
     log.append_context_event_with_payload(
         &CTX,
@@ -80,6 +81,7 @@ fn append_convergent_stream(log: &MerkleEventLogProvider, local_clock_offset: u6
         join_payload(ALICE),
         TS_JOIN_ALICE,
     )
+    .await
     .unwrap();
     log.append_context_event_with_payload(
         &CTX,
@@ -88,6 +90,7 @@ fn append_convergent_stream(log: &MerkleEventLogProvider, local_clock_offset: u6
         join_payload(BOB),
         TS_JOIN_BOB,
     )
+    .await
     .unwrap();
     log.append_context_event_with_payload(
         &CTX,
@@ -98,6 +101,7 @@ fn append_convergent_stream(log: &MerkleEventLogProvider, local_clock_offset: u6
         },
         TS_GOV,
     )
+    .await
     .unwrap();
 }
 
@@ -105,13 +109,17 @@ fn append_convergent_stream(log: &MerkleEventLogProvider, local_clock_offset: u6
 /// per-member LOCAL timestamp = committer value + the member's clock offset.
 /// This is the pre-fix behavior the convergent rule replaces; used only by the
 /// negative control to prove divergence.
-fn append_stream_with_local_timestamps(log: &MerkleEventLogProvider, local_clock_offset: u64) {
+async fn append_stream_with_local_timestamps(
+    log: &MerkleEventLogProvider,
+    local_clock_offset: u64,
+) {
     log.append_context_event(
         &CTX,
         EventType::ContextCreated,
         ALICE,
         TS_CREATED + local_clock_offset,
     )
+    .await
     .unwrap();
     log.append_context_event_with_payload(
         &CTX,
@@ -120,6 +128,7 @@ fn append_stream_with_local_timestamps(log: &MerkleEventLogProvider, local_clock
         join_payload(ALICE),
         TS_JOIN_ALICE + local_clock_offset,
     )
+    .await
     .unwrap();
     log.append_context_event_with_payload(
         &CTX,
@@ -128,6 +137,7 @@ fn append_stream_with_local_timestamps(log: &MerkleEventLogProvider, local_clock
         join_payload(BOB),
         TS_JOIN_BOB + local_clock_offset,
     )
+    .await
     .unwrap();
     log.append_context_event_with_payload(
         &CTX,
@@ -138,15 +148,16 @@ fn append_stream_with_local_timestamps(log: &MerkleEventLogProvider, local_clock
         },
         TS_GOV + local_clock_offset,
     )
+    .await
     .unwrap();
 }
 
-#[test]
-fn two_honest_members_converge_despite_divergent_application_streams() {
+#[tokio::test]
+async fn two_honest_members_converge_despite_divergent_application_streams() {
     // Member A's local view. A's physical clock is +0s from "true" time.
     let log_a = MerkleEventLogProvider::new();
-    log_a.init_event_log(&CTX).unwrap();
-    append_convergent_stream(&log_a, 0);
+    log_a.init_event_log(&CTX).await.unwrap();
+    append_convergent_stream(&log_a, 0).await;
     // A's local application activity: 3 messages. Under the unification these
     // are local `ContextEvent`s only — NO durable leaf is appended, so they do
     // not perturb A's Merkle root.
@@ -159,8 +170,8 @@ fn two_honest_members_converge_despite_divergent_application_streams() {
     // would diverge at equal event count — the §9.9.3 false positive this fix
     // removes.
     let log_b = MerkleEventLogProvider::new();
-    log_b.init_event_log(&CTX).unwrap();
-    append_convergent_stream(&log_b, 250);
+    log_b.init_event_log(&CTX).await.unwrap();
+    append_convergent_stream(&log_b, 250).await;
     // B's local application activity: 5 messages — also durable-leaf-free.
 
     let root_a = log_a.event_log_merkle_root(&CTX).unwrap();
@@ -183,28 +194,30 @@ fn two_honest_members_converge_despite_divergent_application_streams() {
     );
 }
 
-#[test]
-fn negative_control_per_author_appends_break_convergence() {
+#[tokio::test]
+async fn negative_control_per_author_appends_break_convergence() {
     // This pins that the convergence test above is not vacuous: if application
     // events WERE durably appended per author (the pre-unification behavior),
     // the divergent counts (3 vs 5) make the roots differ. Catching this proves
     // the positive test would detect a regression that re-introduced the
     // per-author `MessageSent` durable append.
     let log_a = MerkleEventLogProvider::new();
-    log_a.init_event_log(&CTX).unwrap();
-    append_convergent_stream(&log_a, 0);
+    log_a.init_event_log(&CTX).await.unwrap();
+    append_convergent_stream(&log_a, 0).await;
     for _ in 0..3 {
         log_a
             .append_context_event(&CTX, EventType::MessageSent, ALICE, 1_700_000_200)
+            .await
             .unwrap();
     }
 
     let log_b = MerkleEventLogProvider::new();
-    log_b.init_event_log(&CTX).unwrap();
-    append_convergent_stream(&log_b, 250);
+    log_b.init_event_log(&CTX).await.unwrap();
+    append_convergent_stream(&log_b, 250).await;
     for _ in 0..5 {
         log_b
             .append_context_event(&CTX, EventType::MessageSent, BOB, 1_700_000_200)
+            .await
             .unwrap();
     }
 
@@ -219,21 +232,21 @@ fn negative_control_per_author_appends_break_convergence() {
     );
 }
 
-#[test]
-fn two_honest_members_converge_despite_divergent_payment_captures() {
+#[tokio::test]
+async fn two_honest_members_converge_despite_divergent_payment_captures() {
     // Wave B: `PaymentReceived` is per-payee application activity — under the
     // unification it appends NO durable leaf (surfaced as a local
     // `ContextEvent` + the per-context `payment_receipts` buffer). Two honest
     // members who process the same convergent stream but capture a DIFFERENT
     // number of per-payee payments MUST still derive identical Merkle roots.
     let log_a = MerkleEventLogProvider::new();
-    log_a.init_event_log(&CTX).unwrap();
-    append_convergent_stream(&log_a, 0);
+    log_a.init_event_log(&CTX).await.unwrap();
+    append_convergent_stream(&log_a, 0).await;
     // A captures 2 payments — local-only, no durable leaf.
 
     let log_b = MerkleEventLogProvider::new();
-    log_b.init_event_log(&CTX).unwrap();
-    append_convergent_stream(&log_b, 250);
+    log_b.init_event_log(&CTX).await.unwrap();
+    append_convergent_stream(&log_b, 250).await;
     // B captures 4 payments — also durable-leaf-free.
 
     let root_a = log_a.event_log_merkle_root(&CTX).unwrap();
@@ -251,28 +264,30 @@ fn two_honest_members_converge_despite_divergent_payment_captures() {
     );
 }
 
-#[test]
-fn negative_control_per_payee_payment_appends_break_convergence() {
+#[tokio::test]
+async fn negative_control_per_payee_payment_appends_break_convergence() {
     // Pins that the payment-convergence test above is not vacuous: if
     // `PaymentReceived` leaves WERE durably appended per payee (the
     // pre-unification behavior), the divergent counts (2 vs 4) make the roots
     // differ. This proves the positive test would detect a regression that
     // re-introduced the per-payee `PaymentReceived` durable append.
     let log_a = MerkleEventLogProvider::new();
-    log_a.init_event_log(&CTX).unwrap();
-    append_convergent_stream(&log_a, 0);
+    log_a.init_event_log(&CTX).await.unwrap();
+    append_convergent_stream(&log_a, 0).await;
     for _ in 0..2 {
         log_a
             .append_context_event(&CTX, EventType::PaymentReceived, ALICE, 1_700_000_300)
+            .await
             .unwrap();
     }
 
     let log_b = MerkleEventLogProvider::new();
-    log_b.init_event_log(&CTX).unwrap();
-    append_convergent_stream(&log_b, 250);
+    log_b.init_event_log(&CTX).await.unwrap();
+    append_convergent_stream(&log_b, 250).await;
     for _ in 0..4 {
         log_b
             .append_context_event(&CTX, EventType::PaymentReceived, BOB, 1_700_000_300)
+            .await
             .unwrap();
     }
 
@@ -287,8 +302,8 @@ fn negative_control_per_payee_payment_appends_break_convergence() {
     );
 }
 
-#[test]
-fn two_honest_members_converge_despite_divergent_commit_broadcast_records() {
+#[tokio::test]
+async fn two_honest_members_converge_despite_divergent_commit_broadcast_records() {
     // Per-committer broadcast-retry bookkeeping (phase-2.md ADR-011-amendment
     // exclusion taxonomy §3): `CommitBroadcasted` / `CommitBroadcastPending` /
     // `CommitBroadcastSucceeded` / `CommitBroadcastFailed` track one member's
@@ -300,14 +315,14 @@ fn two_honest_members_converge_despite_divergent_commit_broadcast_records() {
     // stream but whose own broadcast paths differ (e.g. one retried, one
     // succeeded first-try) MUST still derive identical Merkle roots.
     let log_a = MerkleEventLogProvider::new();
-    log_a.init_event_log(&CTX).unwrap();
-    append_convergent_stream(&log_a, 0);
+    log_a.init_event_log(&CTX).await.unwrap();
+    append_convergent_stream(&log_a, 0).await;
     // A is the committer: its commit broadcast succeeded first try — no durable
     // leaf for `CommitBroadcasted`.
 
     let log_b = MerkleEventLogProvider::new();
-    log_b.init_event_log(&CTX).unwrap();
-    append_convergent_stream(&log_b, 250);
+    log_b.init_event_log(&CTX).await.unwrap();
+    append_convergent_stream(&log_b, 250).await;
     // B is a receiver: it processed the same commit but holds no broadcast
     // record at all — also durable-leaf-free.
 
@@ -326,8 +341,8 @@ fn two_honest_members_converge_despite_divergent_commit_broadcast_records() {
     );
 }
 
-#[test]
-fn negative_control_per_committer_commit_broadcast_appends_break_convergence() {
+#[tokio::test]
+async fn negative_control_per_committer_commit_broadcast_appends_break_convergence() {
     // Pins that the commit-broadcast-convergence test above is not vacuous: if
     // the per-committer broadcast lifecycle leaves WERE durably appended (the
     // pre-fix behavior that caused the §9.9.3 false-positive equivocation), the
@@ -336,19 +351,21 @@ fn negative_control_per_committer_commit_broadcast_appends_break_convergence() {
     // re-introduced a `CommitBroadcasted` / `CommitBroadcastFailed` durable
     // append.
     let log_a = MerkleEventLogProvider::new();
-    log_a.init_event_log(&CTX).unwrap();
-    append_convergent_stream(&log_a, 0);
+    log_a.init_event_log(&CTX).await.unwrap();
+    append_convergent_stream(&log_a, 0).await;
     // Committer-only divergence: re-introduce the durable broadcast records.
     log_a
         .append_context_event(&CTX, EventType::CommitBroadcasted, ALICE, 1_700_000_400)
+        .await
         .unwrap();
     log_a
         .append_context_event(&CTX, EventType::CommitBroadcastFailed, ALICE, 1_700_000_460)
+        .await
         .unwrap();
 
     let log_b = MerkleEventLogProvider::new();
-    log_b.init_event_log(&CTX).unwrap();
-    append_convergent_stream(&log_b, 250);
+    log_b.init_event_log(&CTX).await.unwrap();
+    append_convergent_stream(&log_b, 250).await;
     // Receiver appends none — divergent counts (4 vs 6).
 
     let root_a = log_a.event_log_merkle_root(&CTX).unwrap();
@@ -362,8 +379,8 @@ fn negative_control_per_committer_commit_broadcast_appends_break_convergence() {
     );
 }
 
-#[test]
-fn committer_assigned_timestamp_converges_despite_clock_skew() {
+#[tokio::test]
+async fn committer_assigned_timestamp_converges_despite_clock_skew() {
     // The core property of the committer-assigned-timestamp fix: two honest
     // members who append the SAME convergent stream but whose physical clocks
     // are skewed relative to each other (A +0s, B +250s) MUST derive identical
@@ -371,12 +388,12 @@ fn committer_assigned_timestamp_converges_despite_clock_skew() {
     // (the signed commit envelope's `created_at`) — never each member's local
     // `now()`.
     let log_a = MerkleEventLogProvider::new();
-    log_a.init_event_log(&CTX).unwrap();
-    append_convergent_stream(&log_a, 0);
+    log_a.init_event_log(&CTX).await.unwrap();
+    append_convergent_stream(&log_a, 0).await;
 
     let log_b = MerkleEventLogProvider::new();
-    log_b.init_event_log(&CTX).unwrap();
-    append_convergent_stream(&log_b, 250);
+    log_b.init_event_log(&CTX).await.unwrap();
+    append_convergent_stream(&log_b, 250).await;
 
     assert_eq!(
         log_a.event_log_merkle_root(&CTX).unwrap(),
@@ -386,8 +403,8 @@ fn committer_assigned_timestamp_converges_despite_clock_skew() {
     );
 }
 
-#[test]
-fn negative_control_per_member_local_timestamps_break_convergence() {
+#[tokio::test]
+async fn negative_control_per_member_local_timestamps_break_convergence() {
     // Proves the positive test is not vacuous: if each member stamped leaves
     // with its OWN local clock (committer value + per-member skew) — the
     // pre-fix behavior — two honest members at the SAME event count would
@@ -395,12 +412,12 @@ fn negative_control_per_member_local_timestamps_break_convergence() {
     // positive the committer-assigned rule removes. Same event types, same
     // order, same count; only the timestamp source differs.
     let log_a = MerkleEventLogProvider::new();
-    log_a.init_event_log(&CTX).unwrap();
-    append_stream_with_local_timestamps(&log_a, 0);
+    log_a.init_event_log(&CTX).await.unwrap();
+    append_stream_with_local_timestamps(&log_a, 0).await;
 
     let log_b = MerkleEventLogProvider::new();
-    log_b.init_event_log(&CTX).unwrap();
-    append_stream_with_local_timestamps(&log_b, 250);
+    log_b.init_event_log(&CTX).await.unwrap();
+    append_stream_with_local_timestamps(&log_b, 250).await;
 
     assert_ne!(
         log_a.event_log_merkle_root(&CTX).unwrap(),
@@ -430,10 +447,10 @@ fn negative_control_per_member_local_timestamps_break_convergence() {
 /// a locally-seeded fixture. Until that lands there is no machinery to make
 /// member B's log a function of member A's commits, so this test is `#[ignore]`d
 /// to keep the gap mechanically visible rather than silently absent.
-#[test]
+#[tokio::test]
 #[ignore = "pending cross-member leaf replication (ADR-051 forward step); current \
             convergence tests hand-feed identical committer-assigned timestamps"]
-fn two_real_members_converge_pending_cross_member_replication() {
+async fn two_real_members_converge_pending_cross_member_replication() {
     // Intentionally not the real cross-member driver: see the doc comment above.
     // When cross-member leaf replication exists, replace this body with a driver
     // that (1) has member A commit a convergent stream, (2) delivers A's signed
@@ -442,8 +459,8 @@ fn two_real_members_converge_pending_cross_member_replication() {
     // `log_a.event_log_merkle_root(&CTX) == log_b.event_log_merkle_root(&CTX)`
     // WITHOUT either side being seeded from a shared fixture.
     let log = MerkleEventLogProvider::new();
-    log.init_event_log(&CTX).unwrap();
-    append_convergent_stream(&log, 0);
+    log.init_event_log(&CTX).await.unwrap();
+    append_convergent_stream(&log, 0).await;
     // Placeholder assertion so the (ignored) test is a valid, type-checked body
     // and does not bit-rot; it does NOT exercise the cross-member path.
     assert_ne!(log.event_log_merkle_root(&CTX).unwrap(), [0u8; 32]);

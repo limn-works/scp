@@ -12035,7 +12035,7 @@ impl Supervisor {
     /// - [`ContextError::EventLogFailed`] if the provider has no log for the
     ///   context or the append fails.
     #[cfg(any(test, feature = "testing"))]
-    pub fn test_append_event_log(
+    pub async fn test_append_event_log(
         &self,
         context_id_bytes: &[u8; 32],
         event_type: scp_event_log::EventType,
@@ -12056,6 +12056,7 @@ impl Supervisor {
                 payload,
                 timestamp_secs,
             )
+            .await
             .map_err(|e| ContextError::EventLogFailed(e.to_string()))
     }
 
@@ -13425,14 +13426,15 @@ mod tests {
     /// minimal providers without dragging in the full mock stack from
     /// the `tests/actor_*_shim.rs` integration harnesses.
     struct TestEventLog;
+    #[async_trait::async_trait]
     impl crate::context::builder::ContextEventLogProvider for TestEventLog {
-        fn init_event_log(
+        async fn init_event_log(
             &self,
             _context_id: &[u8; 32],
         ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
             Ok(())
         }
-        fn append_event(
+        async fn append_event(
             &self,
             _context_id: &[u8; 32],
             _event: scp_event_log::EventType,
@@ -13442,7 +13444,7 @@ mod tests {
         ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
             Ok(())
         }
-        fn destroy_event_log(
+        async fn destroy_event_log(
             &self,
             _context_id: &[u8; 32],
         ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
@@ -14167,7 +14169,7 @@ mod tests {
         let creator = "did:key:forge-test-creator";
         let snapshot = import_test_snapshot("forge-ctx", creator);
         let event_log_data =
-            create_event_log_data(&[0x11u8; 32], &[scp_event_log::EventType::ContextCreated]);
+            create_event_log_data(&[0x11u8; 32], &[scp_event_log::EventType::ContextCreated]).await;
 
         // Sign with the real creator key so the export is internally
         // consistent (exporter_did == creator_did, signature authentic
@@ -14218,7 +14220,7 @@ mod tests {
         snapshot.context_params.mode = scp_protocol::context::ContextMode::Broadcast;
         snapshot.routing = crate::context::actor::state::ContextRouting::Broadcast;
         let event_log_data =
-            create_event_log_data(&[0x22u8; 32], &[scp_event_log::EventType::ContextCreated]);
+            create_event_log_data(&[0x22u8; 32], &[scp_event_log::EventType::ContextCreated]).await;
 
         let signing_key = SigningKey::from_bytes(&[9u8; 32]);
         let export = crate::context::export_import::create_export(
@@ -14264,7 +14266,7 @@ mod tests {
             scp_protocol::context::roles::Capability::Custom("payments".to_owned()),
         );
         let event_log_data =
-            create_event_log_data(&[0x33u8; 32], &[scp_event_log::EventType::ContextCreated]);
+            create_event_log_data(&[0x33u8; 32], &[scp_event_log::EventType::ContextCreated]).await;
 
         let signing_key = SigningKey::from_bytes(&[9u8; 32]);
         let export = crate::context::export_import::create_export(
@@ -14339,7 +14341,7 @@ mod tests {
     /// roster contains exactly `owning_member` (so the import arm's
     /// lex-min-member derivation resolves `owning_did == owning_member`).
     /// Signed by `signing_key`; verifies under its public half.
-    fn signed_import_export_with_member(
+    async fn signed_import_export_with_member(
         context_id: &str,
         creator: &str,
         owning_member: &str,
@@ -14359,7 +14361,7 @@ mod tests {
         // 64-hex id; the raw primitive would double-hash it and diverge.
         let ctx_id_bytes = crate::context::state::context_id_to_bytes(context_id);
         let event_log_data =
-            create_event_log_data(&ctx_id_bytes, &[scp_event_log::EventType::ContextCreated]);
+            create_event_log_data(&ctx_id_bytes, &[scp_event_log::EventType::ContextCreated]).await;
         crate::context::export_import::create_export(
             snapshot,
             event_log_data,
@@ -14391,7 +14393,8 @@ mod tests {
         let verifying_key = signing_key.verifying_key();
 
         let export =
-            signed_import_export_with_member(&context_id, creator, owning_member, &signing_key);
+            signed_import_export_with_member(&context_id, creator, owning_member, &signing_key)
+                .await;
 
         // Baseline: `spawn_live_context` builds deps for an admin DID,
         // so the map already holds that store. The owning member's store
@@ -14463,7 +14466,8 @@ mod tests {
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
         let verifying_key = signing_key.verifying_key();
         let export =
-            signed_import_export_with_member(&context_id, creator, owning_member, &signing_key);
+            signed_import_export_with_member(&context_id, creator, owning_member, &signing_key)
+                .await;
 
         let result = supervisor
             .import_context(export, &verifying_key, None)
@@ -14616,13 +14620,13 @@ mod tests {
 
     /// Helper mirroring `export_import::tests::create_event_log_data` —
     /// builds a Merkle event log byte payload via the provider.
-    fn create_event_log_data(
+    async fn create_event_log_data(
         context_id_bytes: &[u8; 32],
         event_types: &[scp_event_log::EventType],
     ) -> Vec<u8> {
         use crate::context::builder::ContextEventLogProvider;
         let provider = crate::context::providers::event_log::MerkleEventLogProvider::new();
-        provider.init_event_log(context_id_bytes).unwrap();
+        provider.init_event_log(context_id_bytes).await.unwrap();
         for event_type in event_types {
             provider
                 .append_event(
@@ -14632,6 +14636,7 @@ mod tests {
                     scp_event_log::EventPayload::default(),
                     1_700_000_000,
                 )
+                .await
                 .unwrap();
         }
         provider.export_event_log_entries(context_id_bytes).unwrap()
@@ -18334,14 +18339,15 @@ mod tests {
     struct RecordingEventLog {
         events: Arc<std::sync::Mutex<Vec<RecordedEvent>>>,
     }
+    #[async_trait::async_trait]
     impl crate::context::builder::ContextEventLogProvider for RecordingEventLog {
-        fn init_event_log(
+        async fn init_event_log(
             &self,
             _id: &[u8; 32],
         ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
             Ok(())
         }
-        fn append_event(
+        async fn append_event(
             &self,
             id: &[u8; 32],
             event_type: scp_event_log::EventType,
@@ -18361,7 +18367,7 @@ mod tests {
                 ));
             Ok(())
         }
-        fn destroy_event_log(
+        async fn destroy_event_log(
             &self,
             _id: &[u8; 32],
         ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {

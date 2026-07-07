@@ -122,14 +122,16 @@ where
     //
     // Committer-assigned: the subscriber's signed subscribe-request timestamp,
     // copied by every member (§7.3.1, §9.9.3).
-    deps.event_log.append_membership_change_leaf(
-        &context_id_bytes,
-        scp_event_log::EventType::MemberJoined,
-        subscriber_did.as_ref(),
-        subscriber_did.as_ref(),
-        "subscriber",
-        timestamp,
-    )?;
+    deps.event_log
+        .append_membership_change_leaf(
+            &context_id_bytes,
+            scp_event_log::EventType::MemberJoined,
+            subscriber_did.as_ref(),
+            subscriber_did.as_ref(),
+            "subscriber",
+            timestamp,
+        )
+        .await?;
     *cell.class_c_view().checkpoint_events_since_mut() += 1;
 
     Ok(result)
@@ -202,14 +204,16 @@ pub async fn unsubscribe_broadcast(
     // Committer-assigned: the unsubscribing author's clock — the source of the
     // `created_at` on its outgoing leave message, copied by every member
     // (§7.3.1, §9.9.3).
-    deps.event_log.append_membership_change_leaf(
-        &context_id_bytes,
-        scp_event_log::EventType::MemberLeft,
-        subscriber_did.as_ref(),
-        subscriber_did.as_ref(),
-        "subscriber",
-        deps.clock.now_secs(),
-    )?;
+    deps.event_log
+        .append_membership_change_leaf(
+            &context_id_bytes,
+            scp_event_log::EventType::MemberLeft,
+            subscriber_did.as_ref(),
+            subscriber_did.as_ref(),
+            "subscriber",
+            deps.clock.now_secs(),
+        )
+        .await?;
     *cell.class_c_view().checkpoint_events_since_mut() += 1;
 
     Ok(result)
@@ -616,15 +620,17 @@ pub async fn block_broadcast_subscriber(
         deps.event_tx.as_ref(),
     );
 
-    deps.event_log.append_context_event(
-        &context_id_bytes,
-        scp_event_log::EventType::MemberBlocked,
-        author_did.as_ref(),
-        // Committer-assigned: the blocking author's clock — the source of the
-        // `created_at` on its outgoing block message, copied by every member
-        // (§7.3.1, §9.9.3).
-        deps.clock.now_secs(),
-    )?;
+    deps.event_log
+        .append_context_event(
+            &context_id_bytes,
+            scp_event_log::EventType::MemberBlocked,
+            author_did.as_ref(),
+            // Committer-assigned: the blocking author's clock — the source of the
+            // `created_at` on its outgoing block message, copied by every member
+            // (§7.3.1, §9.9.3).
+            deps.clock.now_secs(),
+        )
+        .await?;
     *cell.class_c_view().checkpoint_events_since_mut() += 1;
 
     Ok(result)
@@ -684,15 +690,17 @@ pub async fn unblock_broadcast_subscriber(
     // whole-snapshot best-effort persist covers the block-list REMOVE.
     persist_state_best_effort(cell, deps, context_id).await;
 
-    deps.event_log.append_context_event(
-        &context_id_bytes,
-        scp_event_log::EventType::MemberUnblocked,
-        author_did.as_ref(),
-        // Committer-assigned: the unblocking author's clock — the source of the
-        // `created_at` on its outgoing unblock message, copied by every member
-        // (§7.3.1, §9.9.3).
-        deps.clock.now_secs(),
-    )?;
+    deps.event_log
+        .append_context_event(
+            &context_id_bytes,
+            scp_event_log::EventType::MemberUnblocked,
+            author_did.as_ref(),
+            // Committer-assigned: the unblocking author's clock — the source of the
+            // `created_at` on its outgoing unblock message, copied by every member
+            // (§7.3.1, §9.9.3).
+            deps.clock.now_secs(),
+        )
+        .await?;
     *cell.class_c_view().checkpoint_events_since_mut() += 1;
 
     Ok(())

@@ -939,7 +939,8 @@ pub async fn settle_tool_economy_capture(
             event_tx: event_tx.as_ref(),
         },
         downward_auth_sink,
-    );
+    )
+    .await;
 
     let payment_receipt = match (
         payment_adapter.as_ref(),

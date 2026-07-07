@@ -328,13 +328,15 @@ pub async fn tombstone_migrated_context(
             migration_proposal_id: migration_pid,
         })
         .map_err(|e| ContextError::EventLogFailed(e.to_string()))?;
-    deps.event_log.append_context_event_with_payload(
-        &context_id_bytes,
-        scp_event_log::EventType::ContextTombstoned,
-        "system",
-        tombstone_payload,
-        tombstone_ts,
-    )?;
+    deps.event_log
+        .append_context_event_with_payload(
+            &context_id_bytes,
+            scp_event_log::EventType::ContextTombstoned,
+            "system",
+            tombstone_payload,
+            tombstone_ts,
+        )
+        .await?;
     *cell.class_c_view().checkpoint_events_since_mut() += 1;
 
     Ok(())
@@ -410,12 +412,14 @@ pub async fn withdraw_governance_vote(
     let context_id_bytes = context_id_to_bytes(context_id);
     let mut event_count: u64 = 0;
     for event in &events {
-        deps.event_log.append_context_event(
-            &context_id_bytes,
-            governance_event_label(event),
-            voter_did.as_ref(),
-            withdraw_ts,
-        )?;
+        deps.event_log
+            .append_context_event(
+                &context_id_bytes,
+                governance_event_label(event),
+                voter_did.as_ref(),
+                withdraw_ts,
+            )
+            .await?;
         event_count += 1;
     }
 
@@ -493,15 +497,17 @@ pub async fn apply_pending_ceiling_modification(
     .await?;
 
     let context_id_bytes = context_id_to_bytes(context_id);
-    deps.event_log.append_context_event(
-        &context_id_bytes,
-        scp_event_log::EventType::CeilingModified,
-        "",
-        // Timer-triggered deferred application: the convergent leaf timestamp is
-        // the pre-computed effective deadline (deterministic across members),
-        // never local `now()` (§7.3.1, §9.9.3).
-        pending.effective_at,
-    )?;
+    deps.event_log
+        .append_context_event(
+            &context_id_bytes,
+            scp_event_log::EventType::CeilingModified,
+            "",
+            // Timer-triggered deferred application: the convergent leaf timestamp is
+            // the pre-computed effective deadline (deterministic across members),
+            // never local `now()` (§7.3.1, §9.9.3).
+            pending.effective_at,
+        )
+        .await?;
     *cell.class_c_view().checkpoint_events_since_mut() += 1;
 
     Ok(true)
@@ -547,15 +553,17 @@ pub async fn apply_pending_economic_policy_change(
     .await;
 
     let context_id_bytes = context_id_to_bytes(context_id);
-    deps.event_log.append_context_event(
-        &context_id_bytes,
-        scp_event_log::EventType::EconomicPolicyApplied,
-        "",
-        // Timer-triggered deferred application: the convergent leaf timestamp is
-        // the pre-computed effective deadline (deterministic across members),
-        // never local `now()` (§7.3.1, §9.9.3).
-        effective_at,
-    )?;
+    deps.event_log
+        .append_context_event(
+            &context_id_bytes,
+            scp_event_log::EventType::EconomicPolicyApplied,
+            "",
+            // Timer-triggered deferred application: the convergent leaf timestamp is
+            // the pre-computed effective deadline (deterministic across members),
+            // never local `now()` (§7.3.1, §9.9.3).
+            effective_at,
+        )
+        .await?;
     *cell.class_c_view().checkpoint_events_since_mut() += 1;
 
     Ok(true)
@@ -812,12 +820,14 @@ pub async fn execute_suspend_member(
     .await?;
 
     let context_id_bytes = context_id_to_bytes(context_id);
-    deps.event_log.append_context_event(
-        &context_id_bytes,
-        scp_event_log::EventType::MemberSuspended,
-        actor_did,
-        timestamp_secs,
-    )?;
+    deps.event_log
+        .append_context_event(
+            &context_id_bytes,
+            scp_event_log::EventType::MemberSuspended,
+            actor_did,
+            timestamp_secs,
+        )
+        .await?;
     *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
@@ -951,13 +961,15 @@ pub async fn execute_revoke(
             target_did: did.as_ref().to_owned(),
         })
         .map_err(|e| ContextError::EventLogFailed(e.to_string()))?;
-    deps.event_log.append_context_event_with_payload(
-        &context_id_bytes,
-        scp_event_log::EventType::AccessRevoked,
-        actor_did,
-        access_revoked_payload,
-        timestamp_secs,
-    )?;
+    deps.event_log
+        .append_context_event_with_payload(
+            &context_id_bytes,
+            scp_event_log::EventType::AccessRevoked,
+            actor_did,
+            access_revoked_payload,
+            timestamp_secs,
+        )
+        .await?;
     // Coalesced Class-C counter bump (rides the next run-loop persist, exactly
     // as before the combinator migration — NOT covered by the FC persist above).
     *cell.class_c_view().checkpoint_events_since_mut() += 1;
@@ -1102,12 +1114,14 @@ pub async fn execute_restore_access(
     })
     .await?;
 
-    deps.event_log.append_context_event(
-        &context_id_bytes,
-        scp_event_log::EventType::AccessRestored,
-        actor_did,
-        timestamp_secs,
-    )?;
+    deps.event_log
+        .append_context_event(
+            &context_id_bytes,
+            scp_event_log::EventType::AccessRestored,
+            actor_did,
+            timestamp_secs,
+        )
+        .await?;
     // Coalesced Class-C counter bump (rides the next run-loop persist).
     *cell.class_c_view().checkpoint_events_since_mut() += 1;
 
@@ -1258,14 +1272,16 @@ pub async fn execute_add_member(
     // (`did`) in the payload, not just `actor_did` (which on this admin-driven
     // add is the executing admin). Participation `participation_duration_secs`
     // (§7.3.2) attributes the join interval to this subject.
-    deps.event_log.append_membership_change_leaf(
-        &context_id_bytes,
-        scp_event_log::EventType::MemberJoined,
-        actor_did,
-        did.as_ref(),
-        role,
-        timestamp_secs,
-    )?;
+    deps.event_log
+        .append_membership_change_leaf(
+            &context_id_bytes,
+            scp_event_log::EventType::MemberJoined,
+            actor_did,
+            did.as_ref(),
+            role,
+            timestamp_secs,
+        )
+        .await?;
     *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(scp_protocol::context::builder::AddMemberOutput {
         welcome_bytes: welcome_bytes_out,
@@ -1420,14 +1436,16 @@ pub async fn execute_remove_member(
     // (`did`) and the role it held at departure, not just `actor_did` (the
     // executing admin). Participation `participation_duration_secs` (§7.3.2)
     // attributes the leave interval to this subject.
-    deps.event_log.append_membership_change_leaf(
-        &context_id_bytes,
-        scp_event_log::EventType::MemberLeft,
-        actor_did,
-        did.as_ref(),
-        &removed_role_name,
-        timestamp_secs,
-    )?;
+    deps.event_log
+        .append_membership_change_leaf(
+            &context_id_bytes,
+            scp_event_log::EventType::MemberLeft,
+            actor_did,
+            did.as_ref(),
+            &removed_role_name,
+            timestamp_secs,
+        )
+        .await?;
     *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
@@ -1481,13 +1499,15 @@ pub async fn execute_change_role(
     // admin-driven change is the executing admin). Participation
     // `role_progression_count` (§7.3.2) attributes the role transition to this
     // subject.
-    deps.event_log.append_role_assigned_leaf(
-        &context_id_bytes,
-        actor_did,
-        did.as_ref(),
-        new_role,
-        timestamp_secs,
-    )?;
+    deps.event_log
+        .append_role_assigned_leaf(
+            &context_id_bytes,
+            actor_did,
+            did.as_ref(),
+            new_role,
+            timestamp_secs,
+        )
+        .await?;
     *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
@@ -1537,12 +1557,14 @@ pub async fn execute_register_tool(
             .push(registration.clone());
     })
     .await;
-    deps.event_log.append_context_event(
-        &context_id_bytes,
-        scp_event_log::EventType::ToolRegistered,
-        actor_did,
-        timestamp_secs,
-    )?;
+    deps.event_log
+        .append_context_event(
+            &context_id_bytes,
+            scp_event_log::EventType::ToolRegistered,
+            actor_did,
+            timestamp_secs,
+        )
+        .await?;
     *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
@@ -1584,12 +1606,14 @@ pub async fn execute_remove_tool(
         Ok(())
     })
     .await?;
-    deps.event_log.append_context_event(
-        &context_id_bytes,
-        scp_event_log::EventType::ToolRemoved,
-        actor_did,
-        timestamp_secs,
-    )?;
+    deps.event_log
+        .append_context_event(
+            &context_id_bytes,
+            scp_event_log::EventType::ToolRemoved,
+            actor_did,
+            timestamp_secs,
+        )
+        .await?;
     *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
@@ -1699,12 +1723,14 @@ pub async fn execute_modify_ceiling(
         Ok(())
     })
     .await?;
-    deps.event_log.append_context_event(
-        &context_id_bytes,
-        scp_event_log::EventType::CeilingModificationPending,
-        actor_did,
-        timestamp_secs,
-    )?;
+    deps.event_log
+        .append_context_event(
+            &context_id_bytes,
+            scp_event_log::EventType::CeilingModificationPending,
+            actor_did,
+            timestamp_secs,
+        )
+        .await?;
     *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
@@ -1758,12 +1784,14 @@ pub async fn execute_close_context(
         Ok(())
     })
     .await?;
-    deps.event_log.append_context_event(
-        &context_id_bytes,
-        scp_event_log::EventType::ContextClosing,
-        actor_did,
-        timestamp_secs,
-    )?;
+    deps.event_log
+        .append_context_event(
+            &context_id_bytes,
+            scp_event_log::EventType::ContextClosing,
+            actor_did,
+            timestamp_secs,
+        )
+        .await?;
     *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
@@ -1807,13 +1835,15 @@ pub async fn execute_extend_ttl(
             },
         )
         .map_err(|e| ContextError::EventLogFailed(e.to_string()))?;
-        deps.event_log.append_context_event_with_payload(
-            &context_id_bytes,
-            scp_event_log::EventType::TtlExtensionRejected,
-            actor_did,
-            rejected_payload,
-            timestamp_secs,
-        )?;
+        deps.event_log
+            .append_context_event_with_payload(
+                &context_id_bytes,
+                scp_event_log::EventType::TtlExtensionRejected,
+                actor_did,
+                rejected_payload,
+                timestamp_secs,
+            )
+            .await?;
         let missing_len = missing.len();
         let member_count = member_dids.len();
         // Drop the `member_dids` / `missing` borrows of `cell` (held via
@@ -1888,13 +1918,15 @@ pub async fn execute_extend_ttl(
             consenting_members: consenting,
         })
         .map_err(|e| ContextError::EventLogFailed(e.to_string()))?;
-    deps.event_log.append_context_event_with_payload(
-        &context_id_bytes,
-        scp_event_log::EventType::TtlExtended,
-        actor_did,
-        extended_payload,
-        timestamp_secs,
-    )?;
+    deps.event_log
+        .append_context_event_with_payload(
+            &context_id_bytes,
+            scp_event_log::EventType::TtlExtended,
+            actor_did,
+            extended_payload,
+            timestamp_secs,
+        )
+        .await?;
     *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
@@ -1957,12 +1989,14 @@ pub async fn execute_transfer_admin(
         Ok(())
     })
     .await?;
-    deps.event_log.append_context_event(
-        &context_id_bytes,
-        scp_event_log::EventType::AdminTransferred,
-        actor_did,
-        timestamp_secs,
-    )?;
+    deps.event_log
+        .append_context_event(
+            &context_id_bytes,
+            scp_event_log::EventType::AdminTransferred,
+            actor_did,
+            timestamp_secs,
+        )
+        .await?;
     *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
@@ -1971,7 +2005,7 @@ pub async fn execute_transfer_admin(
 // execute_create_child_context (per-action leaf helper)
 // ---------------------------------------------------------------------------
 
-pub fn execute_create_child_context(
+pub async fn execute_create_child_context(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
@@ -2000,12 +2034,14 @@ pub fn execute_create_child_context(
         ));
     }
 
-    deps.event_log.append_context_event(
-        &context_id_bytes,
-        scp_event_log::EventType::ChildContextCreated,
-        actor_did,
-        timestamp_secs,
-    )?;
+    deps.event_log
+        .append_context_event(
+            &context_id_bytes,
+            scp_event_log::EventType::ChildContextCreated,
+            actor_did,
+            timestamp_secs,
+        )
+        .await?;
     *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
@@ -2074,12 +2110,14 @@ pub async fn execute_modify_pruning_policy(
         *view.governance_class_c_mut().pruning_policy_mut() = Some(new_policy.clone());
     })
     .await;
-    deps.event_log.append_context_event(
-        &context_id_bytes,
-        scp_event_log::EventType::PruningPolicyModified,
-        actor_did,
-        timestamp_secs,
-    )?;
+    deps.event_log
+        .append_context_event(
+            &context_id_bytes,
+            scp_event_log::EventType::PruningPolicyModified,
+            actor_did,
+            timestamp_secs,
+        )
+        .await?;
     *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
@@ -2158,12 +2196,14 @@ pub async fn execute_add_signer(
         Ok(())
     })
     .await?;
-    deps.event_log.append_context_event(
-        &context_id_bytes,
-        scp_event_log::EventType::SignerAdded,
-        actor_did,
-        timestamp_secs,
-    )?;
+    deps.event_log
+        .append_context_event(
+            &context_id_bytes,
+            scp_event_log::EventType::SignerAdded,
+            actor_did,
+            timestamp_secs,
+        )
+        .await?;
     *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
@@ -2239,12 +2279,14 @@ pub async fn execute_remove_signer(
         Ok(())
     })
     .await?;
-    deps.event_log.append_context_event(
-        &context_id_bytes,
-        scp_event_log::EventType::SignerRemoved,
-        actor_did,
-        timestamp_secs,
-    )?;
+    deps.event_log
+        .append_context_event(
+            &context_id_bytes,
+            scp_event_log::EventType::SignerRemoved,
+            actor_did,
+            timestamp_secs,
+        )
+        .await?;
     *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
@@ -2286,12 +2328,14 @@ pub async fn execute_modify_threshold(
         Ok(())
     })
     .await?;
-    deps.event_log.append_context_event(
-        &context_id_bytes,
-        scp_event_log::EventType::ThresholdModified,
-        actor_did,
-        timestamp_secs,
-    )?;
+    deps.event_log
+        .append_context_event(
+            &context_id_bytes,
+            scp_event_log::EventType::ThresholdModified,
+            actor_did,
+            timestamp_secs,
+        )
+        .await?;
     *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
@@ -2341,12 +2385,14 @@ pub async fn execute_establish_tool_interface(
             .push(interface.clone());
     })
     .await;
-    deps.event_log.append_context_event(
-        &context_id_bytes,
-        scp_event_log::EventType::ToolInterfaceEstablished,
-        actor_did,
-        timestamp_secs,
-    )?;
+    deps.event_log
+        .append_context_event(
+            &context_id_bytes,
+            scp_event_log::EventType::ToolInterfaceEstablished,
+            actor_did,
+            timestamp_secs,
+        )
+        .await?;
     *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
@@ -2355,7 +2401,7 @@ pub async fn execute_establish_tool_interface(
 // execute_reset_member (per-action leaf helper)
 // ---------------------------------------------------------------------------
 
-pub fn execute_reset_member(
+pub async fn execute_reset_member(
     view: &mut crate::context::actor::class_s::ClassCMut<'_>,
     deps: &ActorDeps,
     context_id: &str,
@@ -2440,12 +2486,14 @@ pub fn execute_reset_member(
         );
     }
 
-    deps.event_log.append_context_event(
-        &context_id_bytes,
-        scp_event_log::EventType::MemberReset,
-        actor_did,
-        timestamp_secs,
-    )?;
+    deps.event_log
+        .append_context_event(
+            &context_id_bytes,
+            scp_event_log::EventType::MemberReset,
+            actor_did,
+            timestamp_secs,
+        )
+        .await?;
     *view.checkpoint_events_since_mut() += 1;
     view.governance_class_c_mut()
         .pending_epoch_resets_mut()
@@ -2570,12 +2618,14 @@ pub async fn execute_resolve_conflict(
         Ok(())
     })
     .await?;
-    deps.event_log.append_context_event(
-        &context_id_bytes,
-        scp_event_log::EventType::GovernanceConflictResolved,
-        actor_did,
-        timestamp_secs,
-    )?;
+    deps.event_log
+        .append_context_event(
+            &context_id_bytes,
+            scp_event_log::EventType::GovernanceConflictResolved,
+            actor_did,
+            timestamp_secs,
+        )
+        .await?;
     *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
@@ -2636,12 +2686,14 @@ pub async fn execute_promote_context(
         view.handle_mut().promote_memory_scope();
     })
     .await;
-    deps.event_log.append_context_event(
-        &context_id_bytes,
-        scp_event_log::EventType::ContextPromoted,
-        actor_did,
-        timestamp_secs,
-    )?;
+    deps.event_log
+        .append_context_event(
+            &context_id_bytes,
+            scp_event_log::EventType::ContextPromoted,
+            actor_did,
+            timestamp_secs,
+        )
+        .await?;
     *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
@@ -2740,12 +2792,14 @@ pub async fn execute_rotate_content_keys(
     })
     .await?;
 
-    deps.event_log.append_context_event(
-        &context_id_bytes,
-        scp_event_log::EventType::ContentKeysRotated,
-        actor_did,
-        timestamp_secs,
-    )?;
+    deps.event_log
+        .append_context_event(
+            &context_id_bytes,
+            scp_event_log::EventType::ContentKeysRotated,
+            actor_did,
+            timestamp_secs,
+        )
+        .await?;
     *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
@@ -2831,12 +2885,14 @@ pub async fn execute_reconfigure_governance(
         Ok(())
     })
     .await?;
-    deps.event_log.append_context_event(
-        &context_id_bytes,
-        scp_event_log::EventType::GovernanceReconfigured,
-        actor_did,
-        timestamp_secs,
-    )?;
+    deps.event_log
+        .append_context_event(
+            &context_id_bytes,
+            scp_event_log::EventType::GovernanceReconfigured,
+            actor_did,
+            timestamp_secs,
+        )
+        .await?;
     *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
@@ -2930,12 +2986,14 @@ pub async fn execute_set_economic_policy(
         );
     })
     .await;
-    deps.event_log.append_context_event(
-        &context_id_bytes,
-        scp_event_log::EventType::EconomicPolicyChanged,
-        actor_did,
-        timestamp_secs,
-    )?;
+    deps.event_log
+        .append_context_event(
+            &context_id_bytes,
+            scp_event_log::EventType::EconomicPolicyChanged,
+            actor_did,
+            timestamp_secs,
+        )
+        .await?;
     *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
@@ -2984,13 +3042,15 @@ pub async fn execute_approve_spend(
             purpose: purpose.to_owned(),
         })
         .map_err(|e| ContextError::EventLogFailed(e.to_string()))?;
-    deps.event_log.append_context_event_with_payload(
-        &context_id_bytes,
-        scp_event_log::EventType::SpendApproved,
-        actor_did,
-        spend_payload,
-        timestamp_secs,
-    )?;
+    deps.event_log
+        .append_context_event_with_payload(
+            &context_id_bytes,
+            scp_event_log::EventType::SpendApproved,
+            actor_did,
+            spend_payload,
+            timestamp_secs,
+        )
+        .await?;
     Ok(())
 }
 
@@ -3039,12 +3099,14 @@ pub async fn execute_lock_economic_policy(
         }
     })
     .await;
-    deps.event_log.append_context_event(
-        &context_id_bytes,
-        scp_event_log::EventType::EconomicPolicyLocked,
-        actor_did,
-        timestamp_secs,
-    )?;
+    deps.event_log
+        .append_context_event(
+            &context_id_bytes,
+            scp_event_log::EventType::EconomicPolicyLocked,
+            actor_did,
+            timestamp_secs,
+        )
+        .await?;
     *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
@@ -3102,12 +3164,14 @@ pub async fn execute_modify_hard_rate_limit(
             );
     })
     .await;
-    deps.event_log.append_context_event(
-        &context_id_bytes,
-        scp_event_log::EventType::HardRateLimitModified,
-        actor_did,
-        timestamp_secs,
-    )?;
+    deps.event_log
+        .append_context_event(
+            &context_id_bytes,
+            scp_event_log::EventType::HardRateLimitModified,
+            actor_did,
+            timestamp_secs,
+        )
+        .await?;
     *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
@@ -3279,12 +3343,14 @@ pub fn execute_propose_context_migration<'a>(
 
         crate::context::messaging_helpers::persist_state_best_effort(&*cell, deps, context_id)
             .await;
-        deps.event_log.append_context_event(
-            &context_id_bytes,
-            scp_event_log::EventType::ContextMigrationStarted,
-            actor_did,
-            timestamp_secs,
-        )?;
+        deps.event_log
+            .append_context_event(
+                &context_id_bytes,
+                scp_event_log::EventType::ContextMigrationStarted,
+                actor_did,
+                timestamp_secs,
+            )
+            .await?;
         *cell.class_c_view().checkpoint_events_since_mut() += 1;
 
         Ok(MigrationProposedResult {
@@ -3359,13 +3425,15 @@ pub async fn execute_cancel_context_migration(
         },
     )
     .map_err(|e| ContextError::EventLogFailed(e.to_string()))?;
-    deps.event_log.append_context_event_with_payload(
-        &context_id_bytes,
-        scp_event_log::EventType::ContextMigrationCancelled,
-        actor_did,
-        cancel_payload,
-        timestamp_secs,
-    )?;
+    deps.event_log
+        .append_context_event_with_payload(
+            &context_id_bytes,
+            scp_event_log::EventType::ContextMigrationCancelled,
+            actor_did,
+            cancel_payload,
+            timestamp_secs,
+        )
+        .await?;
     *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
@@ -3469,12 +3537,14 @@ pub async fn propose_governance_action_inner(
         let freeze_ts = freeze_expiry_deadline.unwrap_or(0);
         for event in &freeze_events {
             if let GovernanceEvent::ConflictResolved { .. } = event {
-                deps.event_log.append_context_event(
-                    &cid_bytes,
-                    scp_event_log::EventType::GovernanceFreezeExpired,
-                    proposer_did.as_ref(),
-                    freeze_ts,
-                )?;
+                deps.event_log
+                    .append_context_event(
+                        &cid_bytes,
+                        scp_event_log::EventType::GovernanceFreezeExpired,
+                        proposer_did.as_ref(),
+                        freeze_ts,
+                    )
+                    .await?;
                 *cell.class_c_view().checkpoint_events_since_mut() += 1;
             }
         }
@@ -3528,24 +3598,28 @@ pub async fn propose_governance_action_inner(
         for event in &conflict_events {
             match event {
                 GovernanceEvent::ConflictDetected { .. } => {
-                    deps.event_log.append_context_event(
-                        &context_id_bytes,
-                        scp_event_log::EventType::GovernanceConflictDetected,
-                        proposer_did.as_ref(),
-                        // Conflict detected deterministically while processing
-                        // this proposal: the convergent leaf timestamp is the
-                        // proposal's signed `created_at` (§7.3.1, §9.9.3).
-                        proposal.created_at,
-                    )?;
+                    deps.event_log
+                        .append_context_event(
+                            &context_id_bytes,
+                            scp_event_log::EventType::GovernanceConflictDetected,
+                            proposer_did.as_ref(),
+                            // Conflict detected deterministically while processing
+                            // this proposal: the convergent leaf timestamp is the
+                            // proposal's signed `created_at` (§7.3.1, §9.9.3).
+                            proposal.created_at,
+                        )
+                        .await?;
                     conflict_event_count += 1;
                 }
                 GovernanceEvent::ConflictResolved { .. } => {
-                    deps.event_log.append_context_event(
-                        &context_id_bytes,
-                        scp_event_log::EventType::GovernanceConflictResolved,
-                        proposer_did.as_ref(),
-                        proposal.created_at,
-                    )?;
+                    deps.event_log
+                        .append_context_event(
+                            &context_id_bytes,
+                            scp_event_log::EventType::GovernanceConflictResolved,
+                            proposer_did.as_ref(),
+                            proposal.created_at,
+                        )
+                        .await?;
                     conflict_event_count += 1;
                 }
                 _ => {}
@@ -3856,21 +3930,25 @@ pub async fn vote_on_proposal_inner(
         for event in &conflict_events {
             match event {
                 GovernanceEvent::ConflictDetected { .. } => {
-                    deps.event_log.append_context_event(
-                        &context_id_bytes,
-                        scp_event_log::EventType::GovernanceConflictDetected,
-                        voter_did.as_ref(),
-                        conflict_ts,
-                    )?;
+                    deps.event_log
+                        .append_context_event(
+                            &context_id_bytes,
+                            scp_event_log::EventType::GovernanceConflictDetected,
+                            voter_did.as_ref(),
+                            conflict_ts,
+                        )
+                        .await?;
                     conflict_event_count += 1;
                 }
                 GovernanceEvent::ConflictResolved { .. } => {
-                    deps.event_log.append_context_event(
-                        &context_id_bytes,
-                        scp_event_log::EventType::GovernanceConflictResolved,
-                        voter_did.as_ref(),
-                        conflict_ts,
-                    )?;
+                    deps.event_log
+                        .append_context_event(
+                            &context_id_bytes,
+                            scp_event_log::EventType::GovernanceConflictResolved,
+                            voter_did.as_ref(),
+                            conflict_ts,
+                        )
+                        .await?;
                     conflict_event_count += 1;
                 }
                 _ => {}
@@ -4076,7 +4154,8 @@ pub async fn dispatch_content_governance_action(
                     actor_did,
                     timestamp_secs,
                 },
-            )?;
+            )
+            .await?;
             Ok(GovernanceActionResult::MemberReset)
         }
         GovernanceAction::ResolveConflict {
@@ -4349,7 +4428,8 @@ pub async fn dispatch_context_governance_action(
                     actor_did,
                     timestamp_secs,
                 },
-            )?;
+            )
+            .await?;
             Ok(GovernanceActionResult::ChildContextCreated)
         }
         GovernanceAction::ModifyPruningPolicy { new_policy } => {
@@ -4546,12 +4626,14 @@ pub async fn dispatch_governance_action(
             })
             .await?;
             let context_id_bytes = context_id_to_bytes(context_id);
-            deps.event_log.append_context_event(
-                &context_id_bytes,
-                scp_event_log::EventType::MemberSuspendedAll,
-                actor,
-                ts,
-            )?;
+            deps.event_log
+                .append_context_event(
+                    &context_id_bytes,
+                    scp_event_log::EventType::MemberSuspendedAll,
+                    actor,
+                    ts,
+                )
+                .await?;
             *cell.class_c_view().checkpoint_events_since_mut() += 1;
             Ok(GovernanceActionResult::Executed)
         }
@@ -4740,7 +4822,7 @@ pub async fn dispatch_governance_action(
 /// (PRD SCP-269/SCP-270), checkpoint cosignature triggering (ADR-031 §9),
 /// and cleanup of approved proposals (ADR-031 §7).
 #[allow(clippy::too_many_lines, clippy::option_if_let_else)]
-pub fn finalize_governance_action(
+pub async fn finalize_governance_action(
     state: &mut PerContextState,
     deps: &ActorDeps,
     context_id: &str,
@@ -4806,18 +4888,20 @@ pub fn finalize_governance_action(
         },
     )
     .map_err(|e| ContextError::EventLogFailed(e.to_string()))?;
-    deps.event_log.append_context_event_with_payload(
-        &context_id_bytes,
-        governance_event_label(&executed_event),
-        executor_did.as_ref(),
-        executed_payload,
-        // Committer-assigned timestamp: the proposal's signed `created_at` —
-        // identical and tamper-evident for every member that processes the
-        // signed proposal (convergent-by-construction), never local `now()`.
-        // The leaf is currently committer-appended-only; cross-member leaf
-        // replication is the forward step under ADR-051 (§7.3.1, §9.9.3).
-        proposal.created_at,
-    )?;
+    deps.event_log
+        .append_context_event_with_payload(
+            &context_id_bytes,
+            governance_event_label(&executed_event),
+            executor_did.as_ref(),
+            executed_payload,
+            // Committer-assigned timestamp: the proposal's signed `created_at` —
+            // identical and tamper-evident for every member that processes the
+            // signed proposal (convergent-by-construction), never local `now()`.
+            // The leaf is currently committer-appended-only; cross-member leaf
+            // replication is the forward step under ADR-051 (§7.3.1, §9.9.3).
+            proposal.created_at,
+        )
+        .await?;
 
     let action_summary = proposal.action.variant_name().to_owned();
     let target_did = proposal.action.target_did().cloned();
@@ -4924,7 +5008,8 @@ pub fn finalize_governance_action(
                     event_tx: deps.event_tx.as_ref(),
                 },
                 &mut downward_auth_sink,
-            );
+            )
+            .await;
             if let Some((target, triggered)) = triggered_target {
                 let mut split = ConsequenceStateSplit::from_state(state);
                 let _ = enforce_triggered_consequences(
@@ -4940,7 +5025,8 @@ pub fn finalize_governance_action(
                         event_tx: deps.event_tx.as_ref(),
                     },
                     &mut downward_auth_sink,
-                );
+                )
+                .await;
             }
             // Covered fail-closed by the caller's `discharge_with` commit (above):
             // subsume any armed obligation so EXACTLY ONE persist is owed.
@@ -5174,11 +5260,28 @@ pub async fn execute_governance_action(
     // deferred persist the token owed — no whole-state `state_mut`. On a finalize
     // error the persist STILL runs (keep-direction — the executed marker stays
     // set and must persist) and `discharge_with` surfaces the finalize error.
-    token
-        .discharge_with(cell, deps, context_id, |mut view| {
-            finalize_governance_action(view.rest_mut(), deps, context_id, proposal, executor_did)
-        })
-        .await?;
+    // Deferred fail-closed discharge with an ASYNC finalize body (ADR-049
+    // Decision 7): `finalize_governance_action` appends to the async
+    // `EventLogPersistence`-backed Merkle log while mutating the state,
+    // interleaved, so it runs inside the RAII `begin_discharge` guard (which hands
+    // out the `ClassSMut` view held across the finalize awaits) rather than a
+    // synchronous `discharge_with` closure. Keep-direction: the SINGLE persist runs
+    // REGARDLESS of the finalize result; the finalize error is surfaced after.
+    let mut discharge = token.begin_discharge(cell);
+    let finalize_result = finalize_governance_action(
+        discharge.view().rest_mut(),
+        deps,
+        context_id,
+        proposal,
+        executor_did,
+    )
+    .await;
+    // Keep-direction: the fail-closed persist runs REGARDLESS of the finalize
+    // result. Error priority matches the former `discharge_with` `match`: a
+    // finalize error is surfaced BEFORE a persist error when both fail.
+    let persist_result = discharge.commit_fail_closed(deps, context_id).await;
+    finalize_result?;
+    persist_result?;
 
     Ok(result)
 }

@@ -635,14 +635,15 @@ mod tests {
     /// anything to a real log — the 12b.2a dispatch does not exercise
     /// the event-log path, so the stub is never actually touched.
     struct TestEventLog;
+    #[async_trait::async_trait]
     impl crate::context::builder::ContextEventLogProvider for TestEventLog {
-        fn init_event_log(
+        async fn init_event_log(
             &self,
             _id: &[u8; 32],
         ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
             Ok(())
         }
-        fn append_event(
+        async fn append_event(
             &self,
             _id: &[u8; 32],
             _event: scp_event_log::EventType,
@@ -652,7 +653,7 @@ mod tests {
         ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
             Ok(())
         }
-        fn destroy_event_log(
+        async fn destroy_event_log(
             &self,
             _id: &[u8; 32],
         ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
@@ -866,6 +867,7 @@ mod tests {
             true,
             &mut downward_auth_applied,
         )
+        .await
         .expect("a legitimate announcement is consumed, not an error");
         assert!(consumed, "an announcement is reported as consumed (true)");
         let reg = state.routing.peer_registry().expect("encrypted ⇒ registry");
@@ -896,7 +898,8 @@ mod tests {
             &announcement_bytes(DIRECT_BOB, [0x42u8; 32]),
             true,
             &mut downward_auth_applied,
-        );
+        )
+        .await;
         assert!(
             matches!(result, Err(ContextError::PermissionDenied(_))),
             "the direct ingest site maps a rejection to PermissionDenied; got {result:?}"
@@ -931,7 +934,8 @@ mod tests {
             &announcement_bytes(DIRECT_ALICE, [0u8; 32]), // zero sentinel = reserved
             true,
             &mut downward_auth_applied,
-        );
+        )
+        .await;
         assert!(
             matches!(result, Err(ContextError::PermissionDenied(_))),
             "a reserved routing-ID value is rejected on the direct path; got {result:?}"
@@ -961,6 +965,7 @@ mod tests {
                 true,
                 &mut downward_auth_applied,
             )
+            .await
             .expect("same-DID re-announce must succeed");
             assert!(consumed);
         }

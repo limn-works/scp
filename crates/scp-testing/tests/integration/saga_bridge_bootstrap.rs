@@ -102,11 +102,16 @@ impl ContextPersistence for SharedPersistence {
 
 // Minimal no-op event-log provider (mirrors the bridge_instance test harness).
 struct NoOpEventLog;
+// `unused_async`: these no-op test-double methods have no await, but the
+// ADR-049 Decision-7 async `ContextEventLogProvider` trait requires the
+// `async fn` signature.
+#[async_trait::async_trait]
+#[allow(clippy::unused_async)]
 impl ContextEventLogProvider for NoOpEventLog {
-    fn init_event_log(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
+    async fn init_event_log(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
         Ok(())
     }
-    fn append_event(
+    async fn append_event(
         &self,
         _: &[u8; 32],
         _: scp_event_log::EventType,
@@ -116,7 +121,7 @@ impl ContextEventLogProvider for NoOpEventLog {
     ) -> Result<(), ContextCreationError> {
         Ok(())
     }
-    fn destroy_event_log(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
+    async fn destroy_event_log(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
         Ok(())
     }
 }

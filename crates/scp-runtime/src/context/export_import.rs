@@ -1052,7 +1052,7 @@ mod tests {
     /// All test events use [`scp_event_log::EventType::MessageSent`]; their
     /// leaf hashes still differ because the per-event `sequence`, `timestamp`,
     /// and payload bytes vary.
-    fn append_test_event(
+    async fn append_test_event(
         provider: &MerkleEventLogProvider,
         context_id_bytes: &[u8; 32],
         label: &str,
@@ -1067,6 +1067,7 @@ mod tests {
                 },
                 1_700_000_000,
             )
+            .await
             .unwrap();
     }
 
@@ -1076,11 +1077,11 @@ mod tests {
     }
 
     /// Helper to create event log entries via the provider.
-    fn create_event_log_data(context_id_bytes: &[u8; 32], event_names: &[&str]) -> Vec<u8> {
+    async fn create_event_log_data(context_id_bytes: &[u8; 32], event_names: &[&str]) -> Vec<u8> {
         let provider = MerkleEventLogProvider::new();
-        provider.init_event_log(context_id_bytes).unwrap();
+        provider.init_event_log(context_id_bytes).await.unwrap();
         for name in event_names {
-            append_test_event(&provider, context_id_bytes, name);
+            append_test_event(&provider, context_id_bytes, name).await;
         }
         provider.export_event_log_entries(context_id_bytes).unwrap()
     }
@@ -1191,13 +1192,14 @@ mod tests {
         assert!(decoded.snapshot.mls_crypto_state.is_empty());
     }
 
-    #[test]
-    fn roundtrip_export_with_events() {
+    #[tokio::test]
+    async fn roundtrip_export_with_events() {
         let ctx_id_bytes = scp_protocol::context::context_id_bytes("ctx-roundtrip-2");
         let event_log_data = create_event_log_data(
             &ctx_id_bytes,
             &["ContextCreated", "MemberJoined", "MessageSent"],
-        );
+        )
+        .await;
 
         let mut snapshot = test_snapshot("ctx-roundtrip-2");
         // MLS group state rides inside the SIGNED snapshot, not the envelope.
@@ -1228,10 +1230,11 @@ mod tests {
         assert!(!decoded.event_log_data.is_empty());
     }
 
-    #[test]
-    fn roundtrip_preserves_all_fields() {
+    #[tokio::test]
+    async fn roundtrip_preserves_all_fields() {
         let ctx_id_bytes = scp_protocol::context::context_id_bytes("ctx-roundtrip-3");
-        let event_log_data = create_event_log_data(&ctx_id_bytes, &["E1", "E2", "E3", "E4", "E5"]);
+        let event_log_data =
+            create_event_log_data(&ctx_id_bytes, &["E1", "E2", "E3", "E4", "E5"]).await;
 
         let mut snapshot = test_snapshot("ctx-roundtrip-3");
         snapshot.ttl_remaining_secs = Some(3600);
@@ -1266,25 +1269,26 @@ mod tests {
         assert_eq!(root, [0u8; 32]);
     }
 
-    #[test]
-    fn recompute_event_log_root_valid_entries() {
+    #[tokio::test]
+    async fn recompute_event_log_root_valid_entries() {
         let ctx_id_bytes = scp_protocol::context::context_id_bytes("ctx-merkle-1");
         let data = create_event_log_data(
             &ctx_id_bytes,
             &["ContextCreated", "MemberJoined", "MessageSent"],
-        );
+        )
+        .await;
 
         let root = recompute_event_log_root(&data).unwrap();
         assert_ne!(root, [0u8; 32]);
     }
 
-    #[test]
-    fn recompute_event_log_root_detects_tampered_chain_link() {
+    #[tokio::test]
+    async fn recompute_event_log_root_detects_tampered_chain_link() {
         let ctx_id_bytes = scp_protocol::context::context_id_bytes("ctx-merkle-2");
         let provider = MerkleEventLogProvider::new();
-        provider.init_event_log(&ctx_id_bytes).unwrap();
-        append_test_event(&provider, &ctx_id_bytes, "Event1");
-        append_test_event(&provider, &ctx_id_bytes, "Event2");
+        provider.init_event_log(&ctx_id_bytes).await.unwrap();
+        append_test_event(&provider, &ctx_id_bytes, "Event1").await;
+        append_test_event(&provider, &ctx_id_bytes, "Event2").await;
 
         let mut entries = provider.entries(&ctx_id_bytes).unwrap();
         // Tamper the second entry's prev_hash chain link so the substrate
@@ -1301,14 +1305,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn recompute_event_log_root_detects_removed_entry() {
+    #[tokio::test]
+    async fn recompute_event_log_root_detects_removed_entry() {
         let ctx_id_bytes = scp_protocol::context::context_id_bytes("ctx-merkle-3");
         let provider = MerkleEventLogProvider::new();
-        provider.init_event_log(&ctx_id_bytes).unwrap();
-        append_test_event(&provider, &ctx_id_bytes, "Event1");
-        append_test_event(&provider, &ctx_id_bytes, "Event2");
-        append_test_event(&provider, &ctx_id_bytes, "Event3");
+        provider.init_event_log(&ctx_id_bytes).await.unwrap();
+        append_test_event(&provider, &ctx_id_bytes, "Event1").await;
+        append_test_event(&provider, &ctx_id_bytes, "Event2").await;
+        append_test_event(&provider, &ctx_id_bytes, "Event3").await;
 
         let mut entries = provider.entries(&ctx_id_bytes).unwrap();
         // Remove the middle entry: the surviving tail now carries stale
@@ -1321,8 +1325,8 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[test]
-    fn recompute_event_log_root_rejects_suffix_truncated_log() {
+    #[tokio::test]
+    async fn recompute_event_log_root_rejects_suffix_truncated_log() {
         // Truncation-forgery-closed property: dropping trailing events from a
         // signed export must be detected. `recompute_event_log_root` recomputes the
         // RFC 6962 root over whatever events it receives; a suffix-truncated
@@ -1331,10 +1335,10 @@ mod tests {
         // against the signed `snapshot.event_log_merkle_root` rejects it.
         let ctx_id_bytes = scp_protocol::context::context_id_bytes("ctx-merkle-trunc");
         let provider = MerkleEventLogProvider::new();
-        provider.init_event_log(&ctx_id_bytes).unwrap();
-        append_test_event(&provider, &ctx_id_bytes, "Event1");
-        append_test_event(&provider, &ctx_id_bytes, "Event2");
-        append_test_event(&provider, &ctx_id_bytes, "Event3");
+        provider.init_event_log(&ctx_id_bytes).await.unwrap();
+        append_test_event(&provider, &ctx_id_bytes, "Event1").await;
+        append_test_event(&provider, &ctx_id_bytes, "Event2").await;
+        append_test_event(&provider, &ctx_id_bytes, "Event3").await;
 
         let full_root = provider.merkle_root(&ctx_id_bytes).unwrap();
         let full_data = provider.export_event_log_entries(&ctx_id_bytes).unwrap();
@@ -1356,17 +1360,17 @@ mod tests {
         );
     }
 
-    #[test]
-    fn recompute_event_log_root_rejects_prefix_truncated_log() {
+    #[tokio::test]
+    async fn recompute_event_log_root_rejects_prefix_truncated_log() {
         // Prefix truncation (dropping leading events) is rejected outright:
         // the new first event carries a non-zero `sequence`, so the substrate
         // replay's sequence check fails closed inside `recompute_event_log_root`.
         let ctx_id_bytes = scp_protocol::context::context_id_bytes("ctx-merkle-prefix");
         let provider = MerkleEventLogProvider::new();
-        provider.init_event_log(&ctx_id_bytes).unwrap();
-        append_test_event(&provider, &ctx_id_bytes, "Event1");
-        append_test_event(&provider, &ctx_id_bytes, "Event2");
-        append_test_event(&provider, &ctx_id_bytes, "Event3");
+        provider.init_event_log(&ctx_id_bytes).await.unwrap();
+        append_test_event(&provider, &ctx_id_bytes, "Event1").await;
+        append_test_event(&provider, &ctx_id_bytes, "Event2").await;
+        append_test_event(&provider, &ctx_id_bytes, "Event3").await;
 
         // Drop the leading event (prefix truncation).
         let mut entries = provider.entries(&ctx_id_bytes).unwrap();
@@ -1384,11 +1388,11 @@ mod tests {
     // Import validation tests
     // -------------------------------------------------------------------
 
-    #[test]
-    fn validate_export_succeeds_for_valid_export() {
+    #[tokio::test]
+    async fn validate_export_succeeds_for_valid_export() {
         let ctx_id_bytes = scp_protocol::context::context_id_bytes("ctx-validate-1");
         let event_log_data =
-            create_event_log_data(&ctx_id_bytes, &["ContextCreated", "MemberJoined"]);
+            create_event_log_data(&ctx_id_bytes, &["ContextCreated", "MemberJoined"]).await;
 
         let snapshot = test_snapshot("ctx-validate-1");
         let export = create_export(
@@ -1423,8 +1427,8 @@ mod tests {
         assert!(err_msg.contains("unsupported export version"));
     }
 
-    #[test]
-    fn validate_export_rejects_substituted_event_log() {
+    #[tokio::test]
+    async fn validate_export_rejects_substituted_event_log() {
         // The signature-coverage attack the signed merkle-root binding closes:
         // an attacker holds a VALID signed snapshot but swaps in a DIFFERENT,
         // internally-consistent event log. Because the true root is bound into
@@ -1435,7 +1439,8 @@ mod tests {
         let ctx_id_bytes = scp_protocol::context::context_id_bytes(ctx_id);
 
         // Legitimate export over the real event log.
-        let real_log = create_event_log_data(&ctx_id_bytes, &["ContextCreated", "MemberJoined"]);
+        let real_log =
+            create_event_log_data(&ctx_id_bytes, &["ContextCreated", "MemberJoined"]).await;
         let export = create_export(
             test_snapshot(ctx_id),
             real_log,
@@ -1447,7 +1452,8 @@ mod tests {
         .unwrap();
 
         // Build a DIFFERENT but internally-consistent event log and its root.
-        let substitute_log = create_event_log_data(&ctx_id_bytes, &["ContextCreated", "Evicted"]);
+        let substitute_log =
+            create_event_log_data(&ctx_id_bytes, &["ContextCreated", "Evicted"]).await;
         let substitute_root = recompute_event_log_root(&substitute_log).unwrap();
         assert_ne!(
             substitute_root, export.snapshot.event_log_merkle_root,
@@ -1481,11 +1487,11 @@ mod tests {
     /// "no genuinely-unsigned envelope field affects authoritative state" — if a
     /// future change started deriving trusted state from `exported_at`, this
     /// test (or a sibling step) would need to fail it.
-    #[test]
-    fn mutating_unsigned_envelope_fields_does_not_change_validation() {
+    #[tokio::test]
+    async fn mutating_unsigned_envelope_fields_does_not_change_validation() {
         let ctx_id = "ctx-unsigned-envelope-inert";
         let ctx_id_bytes = scp_protocol::context::context_id_bytes(ctx_id);
-        let event_log_data = create_event_log_data(&ctx_id_bytes, &["ContextCreated"]);
+        let event_log_data = create_event_log_data(&ctx_id_bytes, &["ContextCreated"]).await;
 
         let export = create_export(
             test_snapshot(ctx_id),
@@ -1630,14 +1636,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn validate_export_rejects_tampered_event_log() {
+    #[tokio::test]
+    async fn validate_export_rejects_tampered_event_log() {
         let ctx_id_bytes = scp_protocol::context::context_id_bytes("ctx-validate-4");
         let provider = MerkleEventLogProvider::new();
-        provider.init_event_log(&ctx_id_bytes).unwrap();
-        append_test_event(&provider, &ctx_id_bytes, "Event1");
-        append_test_event(&provider, &ctx_id_bytes, "Event2");
-        append_test_event(&provider, &ctx_id_bytes, "Event3");
+        provider.init_event_log(&ctx_id_bytes).await.unwrap();
+        append_test_event(&provider, &ctx_id_bytes, "Event1").await;
+        append_test_event(&provider, &ctx_id_bytes, "Event2").await;
+        append_test_event(&provider, &ctx_id_bytes, "Event3").await;
 
         let _original_data = provider.export_event_log_entries(&ctx_id_bytes).unwrap();
 
@@ -1675,8 +1681,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn validate_export_rejects_suffix_truncated_event_log() {
+    #[tokio::test]
+    async fn validate_export_rejects_suffix_truncated_event_log() {
         // Full-pipeline truncation-forgery-closed property: an attacker takes a
         // legitimately signed export and drops trailing events from the
         // `event_log_data`. The signed `snapshot.event_log_merkle_root` commits
@@ -1685,10 +1691,10 @@ mod tests {
         // without the signing key the attacker cannot re-bind the snapshot.
         let ctx_id_bytes = scp_protocol::context::context_id_bytes("ctx-validate-trunc");
         let provider = MerkleEventLogProvider::new();
-        provider.init_event_log(&ctx_id_bytes).unwrap();
-        append_test_event(&provider, &ctx_id_bytes, "Event1");
-        append_test_event(&provider, &ctx_id_bytes, "Event2");
-        append_test_event(&provider, &ctx_id_bytes, "Event3");
+        provider.init_event_log(&ctx_id_bytes).await.unwrap();
+        append_test_event(&provider, &ctx_id_bytes, "Event1").await;
+        append_test_event(&provider, &ctx_id_bytes, "Event2").await;
+        append_test_event(&provider, &ctx_id_bytes, "Event3").await;
 
         let full_data = provider.export_event_log_entries(&ctx_id_bytes).unwrap();
 
@@ -1750,10 +1756,10 @@ mod tests {
         assert_eq!(export.snapshot.membership.count(), 0);
     }
 
-    #[test]
-    fn full_export_includes_all_data() {
+    #[tokio::test]
+    async fn full_export_includes_all_data() {
         let ctx_id_bytes = scp_protocol::context::context_id_bytes("ctx-full-1");
-        let event_log_data = create_event_log_data(&ctx_id_bytes, &["ContextCreated"]);
+        let event_log_data = create_event_log_data(&ctx_id_bytes, &["ContextCreated"]).await;
 
         let mut snapshot = test_snapshot("ctx-full-1");
         // MLS group state rides inside the signed snapshot; full scope keeps it.
@@ -1778,8 +1784,8 @@ mod tests {
     // Integration: export -> serialize -> deserialize -> validate -> import
     // -------------------------------------------------------------------
 
-    #[test]
-    fn full_export_import_pipeline() {
+    #[tokio::test]
+    async fn full_export_import_pipeline() {
         let ctx_id_bytes = scp_protocol::context::context_id_bytes("ctx-pipeline-1");
         let event_log_data = create_event_log_data(
             &ctx_id_bytes,
@@ -1790,7 +1796,8 @@ mod tests {
                 "MessageSent",
                 "ToolInvoked",
             ],
-        );
+        )
+        .await;
 
         let snapshot = test_snapshot("ctx-pipeline-1");
         let export = create_export(
@@ -1891,10 +1898,10 @@ mod tests {
     /// distinct from the Merkle-chain error. This is the gap the signature
     /// closes — `validate_export_for_import` previously verified only the
     /// event-log Merkle chain, leaving membership/roles/params forgeable.
-    #[test]
-    fn tampered_membership_rejected_with_signature_error() {
+    #[tokio::test]
+    async fn tampered_membership_rejected_with_signature_error() {
         let ctx_id_bytes = scp_protocol::context::context_id_bytes("ctx-tamper-membership");
-        let event_log_data = create_event_log_data(&ctx_id_bytes, &["ContextCreated"]);
+        let event_log_data = create_event_log_data(&ctx_id_bytes, &["ContextCreated"]).await;
 
         let mut snapshot = test_snapshot("ctx-tamper-membership");
         // Legitimate membership at export time: a single member.
@@ -1944,14 +1951,14 @@ mod tests {
     /// verifier recomputes `SHA-256(domain || [scope.tag_byte()] || JCS(...))`
     /// from the *received* envelope scope, which no longer matches the digest
     /// the creator signed. Tests both flip directions.
-    #[test]
-    fn tampered_scope_rejected_with_signature_error() {
+    #[tokio::test]
+    async fn tampered_scope_rejected_with_signature_error() {
         for original in [ExportScope::Full, ExportScope::Public] {
             let ctx_id = "ctx-tamper-scope";
             let ctx_id_bytes = scp_protocol::context::context_id_bytes(ctx_id);
             // Public exports carry no event log; Full does. Build the log
             // unconditionally — create_export discards it for Public scope.
-            let event_log_data = create_event_log_data(&ctx_id_bytes, &["ContextCreated"]);
+            let event_log_data = create_event_log_data(&ctx_id_bytes, &["ContextCreated"]).await;
 
             let mut export = create_export(
                 test_snapshot(ctx_id),
@@ -2053,14 +2060,14 @@ mod tests {
     // Event log provider round-trip
     // -------------------------------------------------------------------
 
-    #[test]
-    fn event_log_export_import_roundtrip() {
+    #[tokio::test]
+    async fn event_log_export_import_roundtrip() {
         let ctx_id_bytes = scp_protocol::context::context_id_bytes("ctx-el-roundtrip");
         let provider = MerkleEventLogProvider::new();
-        provider.init_event_log(&ctx_id_bytes).unwrap();
-        append_test_event(&provider, &ctx_id_bytes, "Event1");
-        append_test_event(&provider, &ctx_id_bytes, "Event2");
-        append_test_event(&provider, &ctx_id_bytes, "Event3");
+        provider.init_event_log(&ctx_id_bytes).await.unwrap();
+        append_test_event(&provider, &ctx_id_bytes, "Event1").await;
+        append_test_event(&provider, &ctx_id_bytes, "Event2").await;
+        append_test_event(&provider, &ctx_id_bytes, "Event3").await;
 
         let original_entries = provider.entries(&ctx_id_bytes).unwrap();
         let original_root = provider.merkle_root(&ctx_id_bytes).unwrap();
@@ -2072,6 +2079,7 @@ mod tests {
         let new_provider = MerkleEventLogProvider::new();
         new_provider
             .import_event_log_entries(&ctx_id_bytes, &data)
+            .await
             .unwrap();
 
         let imported_entries = new_provider.entries(&ctx_id_bytes).unwrap();
@@ -2108,13 +2116,13 @@ mod tests {
     // Pruned event log round-trip (#705)
     // -------------------------------------------------------------------
 
-    #[test]
-    fn pruned_event_log_export_import_roundtrip() {
+    #[tokio::test]
+    async fn pruned_event_log_export_import_roundtrip() {
         let ctx_id_bytes = scp_protocol::context::context_id_bytes("ctx-prune-roundtrip");
         let provider = MerkleEventLogProvider::new();
-        provider.init_event_log(&ctx_id_bytes).unwrap();
+        provider.init_event_log(&ctx_id_bytes).await.unwrap();
         for i in 0..10 {
-            append_test_event(&provider, &ctx_id_bytes, &format!("Event{i}"));
+            append_test_event(&provider, &ctx_id_bytes, &format!("Event{i}")).await;
         }
 
         // Prune, keeping only the last 3 entries via a size-based policy.
@@ -2129,6 +2137,7 @@ mod tests {
         };
         let removed = provider
             .prune_before_checkpoint(&ctx_id_bytes, 10, &policy)
+            .await
             .unwrap();
         assert_eq!(removed, 7);
 
@@ -2167,6 +2176,7 @@ mod tests {
         let new_provider = MerkleEventLogProvider::new();
         new_provider
             .import_event_log_entries(&ctx_id_bytes, &data)
+            .await
             .unwrap();
 
         let imported_entries = new_provider.entries(&ctx_id_bytes).unwrap();
@@ -2188,7 +2198,7 @@ mod tests {
 
         // Appending after import should chain correctly: the new event's
         // prev_hash equals the canonical leaf hash of the prior tail entry.
-        append_test_event(&new_provider, &ctx_id_bytes, "Event10");
+        append_test_event(&new_provider, &ctx_id_bytes, "Event10").await;
         let final_entries = new_provider.entries(&ctx_id_bytes).unwrap();
         assert_eq!(final_entries.len(), 4);
         assert_eq!(

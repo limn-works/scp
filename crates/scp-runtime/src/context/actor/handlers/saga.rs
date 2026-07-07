@@ -1774,15 +1774,19 @@ async fn commit_b_settle_finalize(
     // reproduces byte-for-byte — never a fresh Commit-time `now()`, so two honest
     // members reconstruct the identical leaf (§7.3.1, §9.9.3).
     let append_result = match serde_json::to_vec(&tool_invoked_payload) {
-        Ok(tool_invoked_payload_bytes) => deps.event_log.append_context_event_with_payload(
-            &target_context_id,
-            scp_event_log::EventType::ToolInvoked,
-            &caller_did_str,
-            scp_event_log::EventPayload {
-                data: tool_invoked_payload_bytes,
-            },
-            receipt.timestamp_ms / 1000,
-        ),
+        Ok(tool_invoked_payload_bytes) => {
+            deps.event_log
+                .append_context_event_with_payload(
+                    &target_context_id,
+                    scp_event_log::EventType::ToolInvoked,
+                    &caller_did_str,
+                    scp_event_log::EventPayload {
+                        data: tool_invoked_payload_bytes,
+                    },
+                    receipt.timestamp_ms / 1000,
+                )
+                .await
+        }
         Err(e) => Err(ContextError::EventLogFailed(format!(
             "SCP-SAGA-13038: ToolInvoked payload serialization failed: {e}"
         ))),
@@ -2118,15 +2122,17 @@ async fn commit_a(
     );
     let append_result = match leaf {
         Ok((invoked_leaf_secs, invoked_payload_bytes)) => {
-            deps.event_log.append_context_event_with_payload(
-                &req.caller_context_id,
-                scp_event_log::EventType::CrossContextToolInvoked,
-                req.caller_did.as_ref(),
-                scp_event_log::EventPayload {
-                    data: invoked_payload_bytes,
-                },
-                invoked_leaf_secs,
-            )
+            deps.event_log
+                .append_context_event_with_payload(
+                    &req.caller_context_id,
+                    scp_event_log::EventType::CrossContextToolInvoked,
+                    req.caller_did.as_ref(),
+                    scp_event_log::EventPayload {
+                        data: invoked_payload_bytes,
+                    },
+                    invoked_leaf_secs,
+                )
+                .await
         }
         Err(err) => Err(err),
     };
@@ -2516,15 +2522,19 @@ async fn emit_divergence_marker(
             return Outcome::err(sketch);
         }
     };
-    if let Err(err) = deps.event_log.append_context_event_with_payload(
-        &context_id,
-        scp_event_log::EventType::CrossContextDivergenceMarker,
-        scp_event_log::system_actors::SYSTEM_SAGA_ACTOR,
-        scp_event_log::EventPayload {
-            data: marker_payload_bytes,
-        },
-        committed_timestamp_secs,
-    ) {
+    if let Err(err) = deps
+        .event_log
+        .append_context_event_with_payload(
+            &context_id,
+            scp_event_log::EventType::CrossContextDivergenceMarker,
+            scp_event_log::system_actors::SYSTEM_SAGA_ACTOR,
+            scp_event_log::EventPayload {
+                data: marker_payload_bytes,
+            },
+            committed_timestamp_secs,
+        )
+        .await
+    {
         let sketch = outcome_error_sketch(&err);
         let _ = reply.send(Err(err));
         return Outcome::err(sketch);
@@ -2750,14 +2760,15 @@ mod tests {
     // --- test event-log / persistence stubs -------------------------------
 
     struct TestEventLog;
+    #[async_trait::async_trait]
     impl crate::context::builder::ContextEventLogProvider for TestEventLog {
-        fn init_event_log(
+        async fn init_event_log(
             &self,
             _id: &[u8; 32],
         ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
             Ok(())
         }
-        fn append_event(
+        async fn append_event(
             &self,
             _id: &[u8; 32],
             _event_type: scp_event_log::EventType,
@@ -2767,7 +2778,7 @@ mod tests {
         ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
             Ok(())
         }
-        fn destroy_event_log(
+        async fn destroy_event_log(
             &self,
             _id: &[u8; 32],
         ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
@@ -2822,14 +2833,15 @@ mod tests {
     struct CountingEventLog {
         tool_invoked_appends: Arc<std::sync::atomic::AtomicUsize>,
     }
+    #[async_trait::async_trait]
     impl crate::context::builder::ContextEventLogProvider for CountingEventLog {
-        fn init_event_log(
+        async fn init_event_log(
             &self,
             _id: &[u8; 32],
         ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
             Ok(())
         }
-        fn append_event(
+        async fn append_event(
             &self,
             _id: &[u8; 32],
             event_type: scp_event_log::EventType,
@@ -2843,7 +2855,7 @@ mod tests {
             }
             Ok(())
         }
-        fn destroy_event_log(
+        async fn destroy_event_log(
             &self,
             _id: &[u8; 32],
         ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
@@ -2944,14 +2956,15 @@ mod tests {
     struct CrossContextCountingEventLog {
         xctx_invoked_appends: Arc<std::sync::atomic::AtomicUsize>,
     }
+    #[async_trait::async_trait]
     impl crate::context::builder::ContextEventLogProvider for CrossContextCountingEventLog {
-        fn init_event_log(
+        async fn init_event_log(
             &self,
             _id: &[u8; 32],
         ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
             Ok(())
         }
-        fn append_event(
+        async fn append_event(
             &self,
             _id: &[u8; 32],
             event_type: scp_event_log::EventType,
@@ -2965,7 +2978,7 @@ mod tests {
             }
             Ok(())
         }
-        fn destroy_event_log(
+        async fn destroy_event_log(
             &self,
             _id: &[u8; 32],
         ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {

@@ -293,10 +293,7 @@ use super::state::{
 };
 use crate::context::ContextHandle;
 use crate::context::governance::timeout::{DeadlockDetectionState, GovernanceTimeoutTask};
-use crate::context::messaging_helpers::{
-    build_snapshot_for_persist, persist_snapshot_fail_closed, persist_state_best_effort,
-    persist_state_fail_closed,
-};
+use crate::context::messaging_helpers::{persist_state_best_effort, persist_state_fail_closed};
 use crate::context::state::{
     AccessControlState, CommitFaultMarker, EpochState, GovernanceClassS, GovernanceState,
     MigrationState, PendingCeilingModification, PendingCommit, PendingEconomicPolicyChange,
@@ -3509,10 +3506,11 @@ impl ClassSCommitToken {
     ///
     /// # Not `async fn` — `Send` discipline (ADR-049 Decision 7)
     ///
-    /// This is a SYNC fn that returns a future, NOT an `async fn`. The
-    /// `&PerContextState` is consumed in the synchronous prelude
-    /// ([`build_snapshot_for_persist`]) and is NOT captured by the returned
-    /// future — which holds only the owned snapshot plus `deps` / `context_id`.
+    /// This is a SYNC fn that returns a future, NOT an `async fn`. It delegates to
+    /// the shared [`persist_state_fail_closed`], whose synchronous prelude consumes
+    /// the `&PerContextState` (building the owned snapshot) so it is NOT captured by
+    /// the returned future — which holds only the owned snapshot plus
+    /// `deps` / `context_id`.
     /// An `async fn` would keep the `&PerContextState` parameter in the future's
     /// captured state across the `.await`; `PerContextState` is `!Sync` (it
     /// holds a `dyn FnMut` sink), so that would make the actor's `run()` future
@@ -3535,11 +3533,14 @@ impl ClassSCommitToken {
         // counts as committed (keep-direction: the consume stays, the error
         // propagates to the caller's reversal).
         self.consumed = true;
-        // Build the owned snapshot in the SYNC prelude so the `&PerContextState`
-        // borrow is dropped before the returned future — the future then captures
-        // only the owned snapshot + `deps`/`context_id`, keeping it `Send`.
-        let snapshot = build_snapshot_for_persist(state, deps, context_id);
-        async move { persist_snapshot_fail_closed(&snapshot, deps, context_id).await }
+        // Delegate the single deferred fail-closed persist to the shared
+        // [`persist_state_fail_closed`] helper — the canonical sync-prelude form
+        // (its prelude builds the owned snapshot and drops the `&PerContextState`
+        // borrow before the returned future, which then captures only the owned
+        // snapshot + `deps`/`context_id`, keeping it `Send`). Sharing the one
+        // helper keeps the keep-direction/fail-closed core identical across this
+        // terminal and the deferred terminals `discharge_with` / `commit_fail_closed`.
+        persist_state_fail_closed(state, deps, context_id)
     }
 
     /// Discharge the deferred obligation, running ONE final (possibly fallible)
@@ -3608,11 +3609,14 @@ impl ClassSCommitToken {
         // durable; un-doing it is the unsafe direction).
         let f_result = f(ClassSMut::new(&mut cell.state));
         self.consumed = true;
-        // Build the owned snapshot before the persist `.await` so the
-        // `&cell.state` borrow is dropped off the await point — keeps the actor
-        // future `Send` (`PerContextState` is `!Sync`; ADR-049 Decision 7).
-        let snapshot = build_snapshot_for_persist(&cell.state, deps, context_id);
-        let persist_result = persist_snapshot_fail_closed(&snapshot, deps, context_id).await;
+        // The SINGLE deferred fail-closed persist, routed through the shared
+        // [`persist_state_fail_closed`] helper so the keep-direction/fail-closed
+        // core stays identical to `ClassSDischargeGuard::commit_fail_closed`, the
+        // read-only `commit`, and the combinators. Its sync prelude builds the
+        // owned snapshot and drops the `&cell.state` borrow off the await point —
+        // keeps the actor future `Send` (`PerContextState` is `!Sync`; ADR-049
+        // Decision 7).
+        let persist_result = persist_state_fail_closed(&cell.state, deps, context_id).await;
         match (f_result, persist_result) {
             // `f` failed: the persist still ran (keep); surface `f`'s error.
             (Err(f_err), _) => Err(f_err),
@@ -3620,6 +3624,35 @@ impl ClassSCommitToken {
             (Ok(_), Err(persist_err)) => Err(persist_err),
             // Both succeeded.
             (Ok(value), Ok(())) => Ok(value),
+        }
+    }
+
+    /// Begin an `async`-body deferred discharge (ADR-049 Decision 7).
+    ///
+    /// RAII counterpart to [`Self::discharge_with`] for a finalize body that must
+    /// `.await` while holding the `&mut PerContextState` view — e.g.
+    /// `finalize_governance_action`, which appends to the async
+    /// `EventLogPersistence`-backed Merkle event log AND mutates the state,
+    /// interleaved, so it cannot be expressed as a synchronous `discharge_with`
+    /// closure. A closure returning a borrowing future would need an
+    /// `for<'a> Fn(..) -> BoxFuture<'a>` bound that (via the boxed trait-object
+    /// lifetime) demands `'static` captures — hence this guard shape, which keeps
+    /// a single ordinary borrow lifetime.
+    ///
+    /// The returned [`ClassSDischargeGuard`] hands out the `ClassSMut` view via
+    /// [`ClassSDischargeGuard::view`] (held across the finalize awaits — a
+    /// `&mut PerContextState` across an await is `Send`), then performs the SINGLE
+    /// deferred fail-closed persist via
+    /// [`ClassSDischargeGuard::commit_fail_closed`]. Semantics match
+    /// `discharge_with` exactly: the `Drop` obligation is discharged BEFORE the
+    /// persist, and the persist runs REGARDLESS of the finalize result
+    /// (keep-direction). If the guard is dropped WITHOUT `commit_fail_closed`
+    /// (e.g. the finalize body panics), the owned token's `Drop` obligation fires,
+    /// exactly as an un-committed `ClassSCommitToken` would.
+    pub(crate) const fn begin_discharge(self, cell: &mut ClassSCell) -> ClassSDischargeGuard<'_> {
+        ClassSDischargeGuard {
+            token: self,
+            state: &mut cell.state,
         }
     }
 
@@ -3706,6 +3739,52 @@ impl Drop for ClassSCommitToken {
                 self.context_id
             );
         }
+    }
+}
+
+/// RAII discharge guard for an `async`-body deferred Class-S persist (ADR-049
+/// Decision 7). Minted by [`ClassSCommitToken::begin_discharge`].
+///
+/// Holds the owed [`ClassSCommitToken`] AND the `&mut PerContextState` view for
+/// the finalize body's duration, so the finalize can `.await` (its interleaved
+/// async Merkle-event-log appends) while mutating the state. The SINGLE deferred
+/// fail-closed persist is performed by [`Self::commit_fail_closed`]; dropping the
+/// guard without committing lets the owned token's `Drop` obligation fire — so a
+/// panicking finalize does not silently skip the owed persist.
+pub(crate) struct ClassSDischargeGuard<'a> {
+    token: ClassSCommitToken,
+    state: &'a mut PerContextState,
+}
+
+impl ClassSDischargeGuard<'_> {
+    /// The `ClassSMut` view over the guarded state. Called for the finalize body
+    /// (via `view().rest_mut()`); the returned view may be held across the
+    /// finalize awaits — a `&mut PerContextState` across an await is `Send`.
+    pub(crate) const fn view(&mut self) -> ClassSMut<'_> {
+        ClassSMut::new(&mut *self.state)
+    }
+
+    /// Perform the SINGLE deferred fail-closed persist and discharge the token.
+    ///
+    /// Mirrors [`ClassSCommitToken::discharge_with`]: the `Drop` obligation is
+    /// marked discharged BEFORE the persist (so a persist `Err` still counts as
+    /// committed — keep-direction), and the owned snapshot is built off the await
+    /// point. Consumes the guard.
+    pub(crate) async fn commit_fail_closed(
+        mut self,
+        deps: &ActorDeps,
+        context_id: &str,
+    ) -> Result<(), ContextError> {
+        debug_assert_eq!(
+            self.token.context_id, context_id,
+            "ClassSDischargeGuard committed against the wrong context",
+        );
+        self.token.consumed = true;
+        // Single deferred fail-closed persist via the shared
+        // [`persist_state_fail_closed`] helper — identical keep-direction core to
+        // `ClassSCommitToken::discharge_with`. Its sync prelude builds the owned
+        // snapshot off the await point, keeping the actor future `Send`.
+        persist_state_fail_closed(self.state, deps, context_id).await
     }
 }
 
@@ -5156,14 +5235,15 @@ impl ClassSCell
     /// Minimal event log provider — accepts every call (the combinator paths do
     /// not touch the event log).
     struct TestEventLog;
+    #[async_trait::async_trait]
     impl crate::context::builder::ContextEventLogProvider for TestEventLog {
-        fn init_event_log(
+        async fn init_event_log(
             &self,
             _id: &[u8; 32],
         ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
             Ok(())
         }
-        fn append_event(
+        async fn append_event(
             &self,
             _id: &[u8; 32],
             _event_type: scp_event_log::EventType,
@@ -5173,7 +5253,7 @@ impl ClassSCell
         ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
             Ok(())
         }
-        fn destroy_event_log(
+        async fn destroy_event_log(
             &self,
             _id: &[u8; 32],
         ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
@@ -5802,6 +5882,7 @@ impl ClassSCell
                 },
                 &mut obligation,
             )
+            .await
         };
         assert!(
             downward_auth_applied,
@@ -5902,6 +5983,7 @@ impl ClassSCell
         // convergence.
         event_log
             .init_event_log(&ctx_id_bytes)
+            .await
             .expect("init event log");
         let warning_payload = scp_event_log::EventPayload {
             data: serde_json::to_vec(&serde_json::json!({ "target_did": sender.as_ref() }))
@@ -5915,6 +5997,7 @@ impl ClassSCell
                 warning_payload,
                 1_700_000_050,
             )
+            .await
             .expect("seed governance warning leaf");
 
         // FailPersistence ⇒ the single nonce-token commit must surface the §9
@@ -6008,6 +6091,10 @@ impl ClassSCell
     /// §9 durability error (`PersistenceFailed`), and (c) the demotion is RETAINED
     /// in memory (keep-direction) — the member's `member_capabilities` reflect the
     /// LOWER role even when the persist failed.
+    // `.await` continuation lines from the ADR-049 Decision 7 async-event-log
+    // conversion pushed this test one line over the heuristic; the body is a
+    // single cohesive fail-closed-persist scenario, not separable work.
+    #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn consequence_assign_role_demotion_owes_fail_closed_persist() {
         use crate::context::governance_logic::{
@@ -6103,6 +6190,7 @@ impl ClassSCell
                 },
                 &mut obligation,
             )
+            .await
         };
         assert!(
             downward_auth_applied,

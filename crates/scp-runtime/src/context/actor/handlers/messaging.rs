@@ -433,6 +433,7 @@ async fn handle_deliver_incoming(
                 envelope_bytes,
                 &mut downward_auth_obligation,
             )
+            .await
         };
 
         match tokio::time::timeout(HANDLER_TIMEOUT, deliver_fut).await {

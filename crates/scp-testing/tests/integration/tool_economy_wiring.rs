@@ -176,11 +176,16 @@ struct MockEventLog {
     events: Mutex<Vec<([u8; 32], String)>>,
 }
 
+// `unused_async`: `init_event_log` / `destroy_event_log` have no await because
+// they are no-op test doubles, but the ADR-049 Decision-7 async
+// `ContextEventLogProvider` trait requires the `async fn` signature.
+#[async_trait::async_trait]
+#[allow(clippy::unused_async)]
 impl ContextEventLogProvider for MockEventLog {
-    fn init_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+    async fn init_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
         Ok(())
     }
-    fn append_event(
+    async fn append_event(
         &self,
         id: &[u8; 32],
         event_type: scp_event_log::EventType,
@@ -194,7 +199,7 @@ impl ContextEventLogProvider for MockEventLog {
             .push((*id, format!("{event_type:?}")));
         Ok(())
     }
-    fn destroy_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+    async fn destroy_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
         Ok(())
     }
 }

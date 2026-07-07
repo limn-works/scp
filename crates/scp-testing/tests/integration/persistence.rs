@@ -904,11 +904,16 @@ mod mock_providers {
     }
 
     pub struct MockEventLog;
+    // `unused_async`: these methods have no await because they are no-op test
+    // doubles, but the ADR-049 Decision-7 async `ContextEventLogProvider` trait
+    // requires the `async fn` signature.
+    #[async_trait::async_trait]
+    #[allow(clippy::unused_async)]
     impl ContextEventLogProvider for MockEventLog {
-        fn init_event_log(&self, _ctx_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        async fn init_event_log(&self, _ctx_id: &[u8; 32]) -> Result<(), ContextCreationError> {
             Ok(())
         }
-        fn append_event(
+        async fn append_event(
             &self,
             _ctx_id: &[u8; 32],
             _event_type: scp_event_log::EventType,
@@ -918,7 +923,7 @@ mod mock_providers {
         ) -> Result<(), ContextCreationError> {
             Ok(())
         }
-        fn destroy_event_log(&self, _ctx_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        async fn destroy_event_log(&self, _ctx_id: &[u8; 32]) -> Result<(), ContextCreationError> {
             Ok(())
         }
     }

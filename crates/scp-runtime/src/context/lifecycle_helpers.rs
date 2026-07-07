@@ -221,20 +221,20 @@ pub async fn leave_context(
 
     // ADR-049 §9 Class S: a member leaving removes their own membership (a
     // downward-authorization transition for that member) — STRUCTURAL fail-closed.
-    // The whole removal body (MLS remove + membership/role/access/routing cleanup
-    // + the `MemberLeft` event-log append) runs inside the Class-S `_keep`
-    // combinator's `rest_mut()` view, so the fail-closed persist is performed BY
-    // the combinator (replacing the former inline `persist_state_fail_closed`).
-    // KEEP-direction: a removal that did not durably land is NOT rolled back in
-    // memory — re-admitting a member the caller was told had left is the unsafe
-    // direction; the persist error is surfaced instead so the leave is not
-    // acknowledged as durable. The body is entirely synchronous (the only
-    // `.await`, the close-on-empty transition, runs AFTER the persist), so it
-    // fits the sync `_keep` closure. `check_commit_fault` reads through the whole
-    // `&mut PerContextState` the view hands back; `try_broadcast_commit_or_enqueue`
-    // is passed only the three disjoint Class-C fields it mutates (via
-    // `CommitBroadcastBorrows`), borrowed from that same state.
-    let should_close = cell
+    // The removal body (MLS remove + membership/role/access/routing cleanup) runs
+    // inside the Class-S `_keep` combinator's `rest_mut()` view, so the fail-closed
+    // persist is performed BY the combinator (replacing the former inline
+    // `persist_state_fail_closed`). KEEP-direction: a removal that did not durably
+    // land is NOT rolled back in memory — re-admitting a member the caller was told
+    // had left is the unsafe direction; the persist error is surfaced instead so the
+    // leave is not acknowledged as durable. The closure body is synchronous; the
+    // `MemberLeft` Merkle-leaf append and the close-on-empty transition (both now or
+    // already async — under ADR-049 Decision 7 `EventLogPersistence` is async) run
+    // AFTER the persist, outside the sync `_keep` closure. `check_commit_fault` reads
+    // through the whole `&mut PerContextState` the view hands back;
+    // `try_broadcast_commit_or_enqueue` is passed only the three disjoint Class-C
+    // fields it mutates (via `CommitBroadcastBorrows`), borrowed from that same state.
+    let (should_close, left_role_name) = cell
         .commit_class_s_keep(deps, &context_id, |mut view| {
             let state = view.rest_mut();
 
@@ -384,32 +384,39 @@ pub async fn leave_context(
 
             let should_close = state.membership.count() == 0;
 
-            // Append MemberLeft event to event log. Subject-bearing leaf (ADR-011
-            // amendment): the payload carries the affected member (`member_did`,
-            // which on a self-leave already equals `actor_did`) and its role at
-            // departure, so the leaf shape is uniform with admin-driven removals and
-            // the SDK reads `subject_did` consistently.
-            //
-            // Committer-assigned: the leaving member's clock — the source of the
-            // `created_at` on its outgoing leave commit. This is the
-            // convergent-by-construction value WHEN cross-member leaf replication
-            // lands: the receive-side append path is currently dormant, so this
-            // leaf is committer-appended-only and is NOT yet replicated to other
-            // members. Cross-member convergence of membership leaves is the forward
-            // step under ADR-051 (§7.3.1, §9.9.3).
-            deps.event_log.append_membership_change_leaf(
-                &context_id_bytes,
-                scp_event_log::EventType::MemberLeft,
-                member_did.as_ref(),
-                member_did.as_ref(),
-                &left_role_name,
-                deps.clock.now_secs(),
-            )?;
-            state.checkpoint_events_since += 1;
-
-            Ok(should_close)
+            Ok((should_close, left_role_name))
         })
         .await?;
+
+    // Append the `MemberLeft` Merkle leaf AFTER the Class-S removal persist.
+    // Under ADR-049 Decision 7 `EventLogPersistence` is async, so this append
+    // cannot run inside the synchronous `_keep` closure above — the membership
+    // removal is already fail-closed-persisted by the combinator; the Merkle
+    // leaf is a separate durable record.
+    //
+    // Subject-bearing leaf (ADR-011 amendment): the payload carries the affected
+    // member (`member_did`, which on a self-leave already equals `actor_did`) and
+    // its role at departure, so the leaf shape is uniform with admin-driven
+    // removals and the SDK reads `subject_did` consistently.
+    //
+    // Committer-assigned: the leaving member's clock — the source of the
+    // `created_at` on its outgoing leave commit. This is the
+    // convergent-by-construction value WHEN cross-member leaf replication lands:
+    // the receive-side append path is currently dormant, so this leaf is
+    // committer-appended-only and is NOT yet replicated to other members.
+    // Cross-member convergence of membership leaves is the forward step under
+    // ADR-051 (§7.3.1, §9.9.3).
+    deps.event_log
+        .append_membership_change_leaf(
+            &context_id_bytes,
+            scp_event_log::EventType::MemberLeft,
+            member_did.as_ref(),
+            member_did.as_ref(),
+            &left_role_name,
+            deps.clock.now_secs(),
+        )
+        .await?;
+    *cell.class_c_view().checkpoint_events_since_mut() += 1;
 
     // If member count reaches zero, transition to Closing. Runs AFTER the
     // fail-closed persist above, matching the prior ordering.
@@ -1040,14 +1047,18 @@ pub async fn join_context(
     // committer-appended-only and is NOT yet replicated to other members.
     // Cross-member convergence is the forward step under ADR-051 (§7.3.1,
     // §9.9.3).
-    if let Err(e) = deps.event_log.append_membership_change_leaf(
-        &context_id_bytes,
-        scp_event_log::EventType::MemberJoined,
-        member_did.as_ref(),
-        member_did.as_ref(),
-        "member",
-        now_secs,
-    ) {
+    if let Err(e) = deps
+        .event_log
+        .append_membership_change_leaf(
+            &context_id_bytes,
+            scp_event_log::EventType::MemberJoined,
+            member_did.as_ref(),
+            member_did.as_ref(),
+            "member",
+            now_secs,
+        )
+        .await
+    {
         // Keep-direction (ADR-049 §9): persist the burned nonce fail-closed
         // before voiding the escrow hold (mirrors the money-ordering rule
         // below). The membership / MLS state already applied is NOT reversed.
@@ -2027,7 +2038,8 @@ pub async fn import_context(
     // 3. Import event log data if present.
     if !export.event_log_data.is_empty() {
         deps.event_log
-            .import_event_log_data(&ctx_id_bytes, &export.event_log_data)?;
+            .import_event_log_data(&ctx_id_bytes, &export.event_log_data)
+            .await?;
     }
 
     // 4. Reconstruct the ContextHandle.
@@ -2487,17 +2499,17 @@ pub async fn load_persisted_context_state(
 
 /// Best-effort event log restore from persistence.
 #[allow(dead_code)] // Transitive of `restore_context` — see bootstrap rationale.
-fn restore_event_log_best_effort(deps: &ActorDeps, context_id: &str) {
+async fn restore_event_log_best_effort(deps: &ActorDeps, context_id: &str) {
     use crate::context::state::context_id_to_bytes;
     let ctx_id_bytes = context_id_to_bytes(context_id);
-    if let Err(e) = deps.event_log.restore_event_log(&ctx_id_bytes) {
+    if let Err(e) = deps.event_log.restore_event_log(&ctx_id_bytes).await {
         tracing::warn!(
             context_id = %context_id,
             error = %e,
             "failed to restore event log from persistence; \
              context will start with an empty event log"
         );
-        let _ = deps.event_log.init_event_log(&ctx_id_bytes);
+        let _ = deps.event_log.init_event_log(&ctx_id_bytes).await;
     }
 }
 
@@ -2547,7 +2559,7 @@ pub async fn restore_context(
 
     let (mut ctx_snapshot, broadcast_ctx) =
         load_persisted_context_state(deps, context_id, preloaded_snapshot).await?;
-    restore_event_log_best_effort(deps, context_id);
+    restore_event_log_best_effort(deps, context_id).await;
 
     validate_consequence_rules_for_import(
         &ctx_snapshot.consequence_rules,
@@ -3292,11 +3304,12 @@ mod restore_reconcile_tests {
     }
 
     struct OkEventLog;
+    #[async_trait::async_trait]
     impl ContextEventLogProvider for OkEventLog {
-        fn init_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        async fn init_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
             Ok(())
         }
-        fn append_event(
+        async fn append_event(
             &self,
             _id: &[u8; 32],
             _event: scp_event_log::EventType,
@@ -3306,7 +3319,7 @@ mod restore_reconcile_tests {
         ) -> Result<(), ContextCreationError> {
             Ok(())
         }
-        fn destroy_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        async fn destroy_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
             Ok(())
         }
     }
@@ -3317,11 +3330,12 @@ mod restore_reconcile_tests {
     /// `append_context_event("MessageSent")` returns `Err` AFTER the caller has
     /// reserved a per-sender sequence — exercising the rollback this gate fixes.
     struct FailingAppendEventLog;
+    #[async_trait::async_trait]
     impl ContextEventLogProvider for FailingAppendEventLog {
-        fn init_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        async fn init_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
             Ok(())
         }
-        fn append_event(
+        async fn append_event(
             &self,
             _id: &[u8; 32],
             _event: scp_event_log::EventType,
@@ -3333,7 +3347,7 @@ mod restore_reconcile_tests {
                 "fixture: event-log append deliberately fails".to_owned(),
             ))
         }
-        fn destroy_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        async fn destroy_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
             Ok(())
         }
     }

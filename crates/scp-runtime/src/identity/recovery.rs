@@ -2006,11 +2006,12 @@ mod tests {
         }
 
         struct TestEventLog;
+        #[async_trait::async_trait]
         impl ContextEventLogProvider for TestEventLog {
-            fn init_event_log(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
+            async fn init_event_log(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
                 Ok(())
             }
-            fn append_event(
+            async fn append_event(
                 &self,
                 _: &[u8; 32],
                 _: scp_event_log::EventType,
@@ -2020,7 +2021,7 @@ mod tests {
             ) -> Result<(), ContextCreationError> {
                 Ok(())
             }
-            fn destroy_event_log(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
+            async fn destroy_event_log(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
                 Ok(())
             }
             fn event_log_entries(
