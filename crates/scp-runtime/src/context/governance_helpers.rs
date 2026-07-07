@@ -5951,7 +5951,16 @@ pub fn translate_timeout_events(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    // Test-only capturing persistence: the `Mutex<Option<ContextSnapshot>>` is
+    // never held across `.await` (the write is a synchronous store inside the
+    // trait method), so a plain `std::sync::Mutex` is the right tool. The
+    // runtime's actor path bans it (ADR-049); test fixtures are exempt, mirroring
+    // the sibling `CapturingPersistence` in `lifecycle_helpers.rs`.
+    clippy::disallowed_types
+)]
 mod commit_broadcast_retry_tests {
     //! ADR-049 Decision 7, PR-3: pins the retry-queue bookkeeping split out of
     //! the (now async) MLS-Commit broadcast.
@@ -5973,13 +5982,25 @@ mod commit_broadcast_retry_tests {
     //! extracted helpers directly with a manufactured `BroadcastFailure` (the
     //! payload a real failed broadcast produces) plus a real failing transport,
     //! and drive `keep_broadcast_failure` against a real `ClassSCell` +
-    //! failing/succeeding persistence to pin the fail-closed durability. The
-    //! surrounding governance/remove/rotate/leave suites cover the call-site
-    //! wiring.
+    //! failing/succeeding persistence to pin the fail-closed durability.
+    //!
+    //! This is an ACCEPTED boundary, stated honestly: the surrounding
+    //! governance/remove/rotate/leave suites run under the SAME `cfg(test)`
+    //! no-crypto pipeline, so their Commits also serialize to empty bytes and
+    //! `try_broadcast_commit` short-circuits to `None` — they exercise only the
+    //! happy-path invocation of the broadcast helper, NOT the
+    //! failure→`keep_broadcast_failure` routing. Consequently the fail-closed
+    //! HELPER semantics (enqueue, cap→`commit_fault`, fail-closed persist) are
+    //! FULLY pinned by these unit tests, but each safety-gated SITE's CHOICE of
+    //! `keep_broadcast_failure` over the coalesced
+    //! `apply_broadcast_failure(class_c_view())` on the failure path is guarded
+    //! by CODE REVIEW — not structurally by a test — because the no-crypto
+    //! pipeline cannot manufacture the non-empty Commit those sites would need to
+    //! reach the failure branch.
 
     use std::collections::VecDeque;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     use scp_did::DID;
     use scp_protocol::context::builder::ContextCreationError;
@@ -6065,20 +6086,24 @@ mod commit_broadcast_retry_tests {
         }
     }
 
-    /// Persistence whose every `persist_context` SUCCEEDS, counting calls — lets
-    /// the fail-closed keep test assert the marker was actually persisted before
-    /// `keep_broadcast_failure` returned `Ok`.
+    /// Persistence whose every `persist_context` SUCCEEDS, counting calls and
+    /// capturing the LAST persisted snapshot — lets the fail-closed keep test
+    /// assert the marker was actually persisted before `keep_broadcast_failure`
+    /// returned `Ok`, and that the retry entry is IN the persisted snapshot (not
+    /// merely that a persist happened).
     struct CountingOkPersistence {
         persists: Arc<AtomicUsize>,
+        last_snapshot: Arc<Mutex<Option<crate::context::state::ContextSnapshot>>>,
     }
     #[async_trait::async_trait]
     impl ContextPersistence for CountingOkPersistence {
         async fn persist_context(
             &self,
             _: &str,
-            _: &crate::context::state::ContextSnapshot,
+            snapshot: &crate::context::state::ContextSnapshot,
         ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             self.persists.fetch_add(1, Ordering::SeqCst);
+            *self.last_snapshot.lock().unwrap() = Some(snapshot.clone());
             Ok(())
         }
         async fn load_context(
@@ -6269,11 +6294,15 @@ mod commit_broadcast_retry_tests {
         .await;
         let failure = make_failure(&deps, &remove_op()).await;
 
-        // Pre-fill the queue to exactly the cap.
+        // Pre-fill the queue to exactly the cap. The fillers carry a DIFFERENT
+        // operation variant (`RotateContentKeys`) than the injected failure
+        // (`RemoveMember`), so the `commit_fault` marker's `operation` assertion
+        // below actually proves provenance — that the marker carries the DROPPED
+        // operation, not a filler.
         let filler = PendingCommit {
             commit_bytes: vec![0x01, 0x02, 0x03],
             routing_id: [0u8; 32],
-            operation: remove_op(),
+            operation: CommitOperation::RotateContentKeys { reason: None },
             first_attempt_at: 1_700_000_000,
             retry_count: 1,
             last_error: None,
@@ -6317,7 +6346,8 @@ mod commit_broadcast_retry_tests {
         assert_eq!(
             marker.operation,
             remove_op(),
-            "the fault carries the dropped operation"
+            "the fault carries the DROPPED operation (RemoveMember), not a filler \
+             (RotateContentKeys) — proving marker provenance"
         );
         assert!(
             receive_buffer
@@ -6426,6 +6456,7 @@ mod commit_broadcast_retry_tests {
     #[tokio::test]
     async fn keep_broadcast_failure_persists_retry_entry_before_ok() {
         let persists = Arc::new(AtomicUsize::new(0));
+        let last_snapshot = Arc::new(Mutex::new(None));
         let deps = build_deps(
             Box::new(RecordingTransport {
                 sends: Arc::new(AtomicUsize::new(0)),
@@ -6433,6 +6464,7 @@ mod commit_broadcast_retry_tests {
             }),
             Box::new(CountingOkPersistence {
                 persists: Arc::clone(&persists),
+                last_snapshot: Arc::clone(&last_snapshot),
             }),
         )
         .await;
@@ -6449,6 +6481,17 @@ mod commit_broadcast_retry_tests {
             persists.load(Ordering::SeqCst),
             1,
             "the retry entry was persisted (fail-closed) before returning Ok"
+        );
+        let snapshot = last_snapshot
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("a snapshot was captured by the persist");
+        assert_eq!(
+            snapshot.pending_commits.len(),
+            1,
+            "the retry entry is actually IN the persisted snapshot, not merely \
+             that a persist happened"
         );
         assert_eq!(
             cell.pending_commits.len(),
@@ -6488,6 +6531,12 @@ mod commit_broadcast_retry_tests {
             cell.pending_commits.len(),
             1,
             "the retry entry is RETAINED in memory (keep-direction) after the persist failure"
+        );
+        assert!(
+            cell.commit_fault.is_none(),
+            "a persist failure must NOT spuriously trip the safety gate — only a \
+             full retry queue or retry exhaustion sets commit_fault (parity with \
+             the normal-capacity path)"
         );
     }
 
