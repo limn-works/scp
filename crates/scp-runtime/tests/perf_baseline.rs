@@ -14,7 +14,7 @@
 //! This is a **measurement-recording** harness, not a threshold test. It drives
 //! the six operations named in ADR-049 §Decision 14 —
 //!
-//! 1. `handshake`            (welcome + `key_package` + `add_member`)
+//! 1. `handshake`            (real adder-side MLS `add_member` + Welcome/Commit)
 //! 2. `send_message`
 //! 3. `deliver_incoming`
 //! 4. `governance_propose`
@@ -53,25 +53,48 @@
 //! summed, which isolates per-context actor cost from tokio-scheduler noise and
 //! keeps the pre/post diff reproducible; `mean/op = total / N` is the
 //! per-operation figure the 15% gate compares. Per-context setup (context
-//! creation, member add, pseudonym seeding, custody keygen) is **excluded** from
-//! the timed region — only the named operation is measured.
+//! creation, member add, pseudonym seeding, custody keygen, per-context
+//! key-package generation) is **excluded** from the timed region — only the
+//! named operation is measured.
+//!
+//! # No warmup; fixed operation order
+//!
+//! Operations run in a fixed order with no warmup iteration, so the earliest
+//! points (notably each op's `N=1`) absorb one-time cold-path cost — allocator
+//! arena growth, lazy-`static`/`OnceLock` initialization, first-touch page
+//! faults. This is a **systematic** offset, not noise: it recurs identically on
+//! every run on a given machine, so it cancels in the same-machine pre-vs-post
+//! diff the rollback gate computes. It does mean the absolute single-run numbers
+//! are not meaningfully comparable *across* ops — only against the same op/N on
+//! the same box before and after a change.
 //!
 //! # Faithfulness of each driven op (single-crate constraint)
 //!
-//! Every op is driven through the genuine actor command surface. Two ops cannot
-//! reach a clean cross-node `Ok` from a **single** `scp-runtime` test — a real
-//! second party's MLS/crypto state only exists in the two-node fullstack
-//! `KeyExchange` harness, which lives in `scp-testing` and therefore cannot be a
-//! dependency of a `scp-runtime` test (that would be a dependency cycle). For
-//! those two the closest faithfully-drivable proxy is measured and the
-//! limitation is documented at the call site — no measurement is faked:
+//! Every op is driven through the genuine actor command surface. A real second
+//! party's MLS/crypto state only exists in the two-node fullstack `KeyExchange`
+//! harness, which lives in `scp-testing` and therefore cannot be a dependency of
+//! a `scp-runtime` test (that would be a dependency cycle). Where the full
+//! cross-node `Ok` needs that second party, the closest faithfully-drivable
+//! single-node region is measured and the boundary is documented at the call
+//! site — no measurement is faked:
 //!
-//! - **`handshake`** — driven via the real [`Supervisor::join_context`] path
-//!   (welcome + `key_package` + `add_member`). The concrete `MlsCryptoProvider`'s
-//!   `cfg(test)` accommodation accepts a `None` key-package (ADR-049
-//!   §Consequences), so the local MLS add, Welcome generation, and access-key
-//!   minting all run; only the joiner-side Welcome *consumption* (a second node)
-//!   is absent.
+//! - **`handshake`** — driven via the real [`Supervisor::join_context`] path fed
+//!   a **real, locally-generated, TLS-serialized MLS `KeyPackage`** bound to a
+//!   second identity (`bob`) and carrying the `0xFF01` wrapping-key extension.
+//!   Because a real `KeyPackage` is supplied, the provider's `cfg(test)`
+//!   `None`-key-package accommodation is **not** taken — the timed region runs
+//!   the genuine adder-side MLS handshake crypto: `MlsCryptoProvider::add_member`
+//!   deserializes the `KeyPackage`, runs `scp_mls::group::add_member` (leaf
+//!   insertion + Commit), TLS-serializes both the Welcome and the Commit, and
+//!   extracts + stores `bob`'s wrapping key; then `distribute_sender_key`
+//!   HPKE-seals the local sender key to that wrapping key and the drain step
+//!   MLS-encrypts the resulting management blob. What is **not** measured is the
+//!   joiner-side Welcome *consumption* — a second party installing the group
+//!   from the Welcome — which requires `bob`'s own MLS provider, i.e. the
+//!   two-node fullstack `KeyExchange` harness in `scp-testing` (unavailable here
+//!   without a dependency cycle). So the `handshake` column measures the full
+//!   **adder-side** MLS handshake crypto and excludes only the cross-node
+//!   joiner-side install.
 //! - **`deliver_incoming`** — driven via the real
 //!   [`Supervisor::deliver_commit_blob`] (`DeliverIncoming` actor command) fed a
 //!   **real captured application ciphertext** produced by a live
@@ -93,7 +116,10 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use scp_did::DID;
+use openmls::prelude::tls_codec::Serialize as _;
+use scp_did::{DID, SigningKeyId};
+use scp_mls::credential::ScpCredential;
+use scp_mls::group::generate_key_package_with_context_params;
 use scp_platform::testing::InMemoryKeyCustody;
 use scp_platform::traits::{KeyCustody, KeyType};
 use scp_protocol::context::ContextError;
@@ -333,23 +359,54 @@ async fn create_two_member(m: &Arc<Supervisor>, id: &str) -> ContextHandle {
 // Measurements — one per ADR-049 §Decision 14 operation.
 // ---------------------------------------------------------------------------
 
-/// `handshake` = welcome + `key_package` + `add_member`, via the real
-/// `join_context` actor path. Setup (context creation) is untimed; the
-/// `join_context` call is timed.
+/// `handshake` = the real **adder-side** MLS handshake crypto — `add_member`
+/// (leaf insertion + Commit), Welcome/Commit TLS serialization, and HPKE
+/// sender-key seal — via the real `join_context` actor path fed a real,
+/// locally-generated MLS `KeyPackage` bound to `bob`. Setup (context creation +
+/// per-context key-package generation) is untimed; the `join_context` call is
+/// timed. See the module docs for exactly what the adder-side measurement does
+/// and does not cover (the cross-node joiner-side Welcome consumption is
+/// excluded).
 async fn measure_handshake(n: usize) {
     let (m, _t) = supervisor();
+
+    // Bob's published wrapping public key. Any 32-byte value is a valid X25519
+    // recipient key; only the (absent, cross-node) joiner needs the matching
+    // secret, so a constant suffices to drive the adder-side HPKE seal.
+    let bob_wrapping_pub = [0xBB_u8; 32];
+    let bob_cred =
+        ScpCredential::new(BOB.to_owned(), None, SigningKeyId::Active).expect("bob credential");
+
+    // Untimed setup: N distinct encrypted contexts, and one real, TLS-serialized
+    // MLS KeyPackage bound to `bob` per context. Generating the KeyPackage (the
+    // joiner-side work) is deliberately outside the timed region — only the
+    // adder-side `join_context` is measured.
     let mut handles = Vec::with_capacity(n);
+    let mut key_packages = Vec::with_capacity(n);
     for i in 0..n {
         handles.push(create_encrypted(&m, &format!("perf-handshake-{n}-{i}")).await);
+        // Context (`0xFF02`) KeyPackage: declares both SCP capabilities so the
+        // Add proposal satisfies RFC 9420 §12.1.8.2 (`valn0502`) against the
+        // context group's `scp_context_params` extension, and carries the
+        // `0xFF01` wrapping-key leaf extension so the adder-side HPKE seal runs.
+        let (bundle, _signer, _provider) = generate_key_package_with_context_params(
+            &bob_cred,
+            Some(&bob_wrapping_pub),
+            &scp_clock::SystemClock,
+        )
+        .expect("generate bob key package");
+        let kp_bytes = bundle
+            .key_package()
+            .tls_serialize_detached()
+            .expect("serialize bob key package");
+        key_packages.push(KeyPackage {
+            owner_did: bob(),
+            mls_key_package_bytes: Some(kp_bytes),
+        });
     }
 
     let start = Instant::now();
-    for handle in &handles {
-        let key_package = KeyPackage {
-            owner_did: bob(),
-            // Concrete-provider `cfg(test)` accommodation (ADR-049 §Consequences).
-            mls_key_package_bytes: None,
-        };
+    for (handle, key_package) in handles.iter().zip(key_packages) {
         m.join_context(handle, key_package, None, None)
             .await
             .expect("handshake (join_context) must succeed");
