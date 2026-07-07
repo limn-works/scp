@@ -602,6 +602,14 @@ impl FullStackNode {
     /// production actor-loop concern tracked in #2050 (no current test drives a
     /// joiner→later-joiner send, so it is not simulated here).
     ///
+    /// # Expiry
+    ///
+    /// This driver EXPIRES with #2050, together with the `testing`-only
+    /// `Supervisor::test_install_access_key` seam it lands each pulled key
+    /// through. When production §9.17 distribution lands, DELETE this method and
+    /// that seam, and confirm the Python/TS bidirectional tripwires still pass on
+    /// the *production* distribution path rather than this harness stand-in.
+    ///
     /// # Errors
     ///
     /// Propagates [`ContextError`] if the creator node is not registered, the

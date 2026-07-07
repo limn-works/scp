@@ -11932,6 +11932,19 @@ impl Supervisor {
     /// the `testing` feature — never compiled into production, never reachable
     /// from any FFI bridge.
     ///
+    /// # Expiry
+    ///
+    /// This seam EXPIRES with #2050. When production §9.17 distribution lands,
+    /// DELETE this method, the [`MessagingCommand::TestInstallAccessKey`]
+    /// variant + its handler, and the harness
+    /// `FullStackNode::pull_access_keys_from_creator` driver that calls it — then
+    /// confirm the Python/TS bidirectional tripwires still pass on the *production*
+    /// distribution path (not the harness stand-in). It is safe to carry until
+    /// then because it is `testing`-gated (never in a production build), has no
+    /// FFI wrapper, and is reachable only by in-process `Arc<Supervisor>` callers
+    /// (the full-stack harness), so no untrusted or cross-process caller can drive
+    /// it even in the `allow_in_memory_custody` build the tripwires use.
+    ///
     /// # Errors
     ///
     /// - [`ContextError`] if the context is inactive or the actor reply channel

@@ -386,6 +386,20 @@ pub enum MessagingCommand {
     ///
     /// Gated behind the `testing` feature — never compiled into production
     /// builds, never reachable from any FFI bridge.
+    ///
+    /// # Expiry
+    ///
+    /// EXPIRES with #2050. When production §9.17 distribution lands, DELETE this
+    /// variant, its handler
+    /// [`handle_test_install_access_key`](crate::context::actor::handlers::messaging),
+    /// the [`Supervisor::test_install_access_key`](crate::context::supervisor::Supervisor::test_install_access_key)
+    /// mailbox entrypoint, and the harness
+    /// `FullStackNode::pull_access_keys_from_creator` driver — then confirm the
+    /// Python/TS bidirectional tripwires still pass on the *production*
+    /// distribution path. Safe to carry until then: `testing`-gated, no FFI
+    /// wrapper, reachable only by in-process `Arc<Supervisor>` callers (the
+    /// full-stack harness), even in the `allow_in_memory_custody` build the
+    /// tripwires use.
     #[cfg(feature = "testing")]
     TestInstallAccessKey {
         /// Context identifier (the raw string id the access-key store is keyed by).
