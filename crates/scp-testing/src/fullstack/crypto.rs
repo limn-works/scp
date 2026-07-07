@@ -7,16 +7,18 @@
 //! spawns an actor for the context).
 //!
 //! `E2eCryptoProvider` is the harness-side helper that bridges the
-//! sealed-invitation / sender-key / access-key material between two in-process
-//! nodes through a shared [`KeyExchange`]. It does NOT re-introduce a trait
-//! impl: every MLS primitive runs on the real concrete [`MlsCryptoProvider`];
-//! the `KeyExchange` only carries the cross-process bootstrap bytes that a real
-//! deployment would move over transport (the creator-signed, HPKE-sealed
-//! invitation bundle, the inviter-minted per-member access keys, and the
-//! MLS-wrapped sender-key distribution messages). The joiner reserves its own
-//! `KeyPackage` on its supervisor and, after the creator's `invite_member`,
-//! stands up a live actor via `spawn_actor_from_welcome` (ADR-049 §9
-//! 2F-residual) — the legacy provider single-slot join path is gone.
+//! sealed-invitation / sender-key material between two in-process nodes through
+//! a shared [`KeyExchange`]. It does NOT re-introduce a trait impl: every MLS
+//! primitive runs on the real concrete [`MlsCryptoProvider`]; the `KeyExchange`
+//! only carries the cross-process bootstrap bytes that a real deployment would
+//! move over transport (the creator-signed, HPKE-sealed invitation bundle and
+//! the MLS-wrapped sender-key distribution messages the inviter pushes to the
+//! joiner). Per-member §9.17 access keys are NOT carried by the `KeyExchange`:
+//! the joiner acquires them by issuing REAL §9.17 pull requests the creator
+//! answers (see [`super::node::FullStackNode::join_from_welcome`]). The joiner
+//! reserves its own `KeyPackage` on its supervisor and, after the creator's
+//! `invite_member`, stands up a live actor via `spawn_actor_from_welcome`
+//! (ADR-049 §9 2F-residual) — the legacy provider single-slot join path is gone.
 //!
 //! # What is real
 //!
@@ -32,9 +34,8 @@
 //! - The [`KeyExchange`] side channel that moves the bootstrap bytes
 //!   between `FullStackNode`s without a live relay.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use scp_core::crypto::access_keys::{AccessKey, AccessKeyStore};
 use scp_core::crypto::mls::provider::MlsCryptoProvider;
 use scp_did::DID;
 
@@ -55,11 +56,6 @@ pub struct E2eCryptoProvider {
     pub(crate) exchange: Arc<std::sync::Mutex<KeyExchange>>,
     /// This node's DID.
     pub local_did: DID,
-    /// Joiner-side access-key store. On the creator side the per-member access
-    /// keys live in the context actor's `PerContextState`; the joiner has no
-    /// actor for the context, so it stores the keys the creator deposited here
-    /// for the decrypt path to unwrap content with.
-    access_keys: Mutex<AccessKeyStore>,
 }
 
 impl E2eCryptoProvider {
@@ -75,7 +71,6 @@ impl E2eCryptoProvider {
             provider,
             exchange,
             local_did: did,
-            access_keys: Mutex::new(AccessKeyStore::new()),
         }
     }
 
@@ -112,45 +107,6 @@ impl E2eCryptoProvider {
     ) {
         self.exchange()
             .deposit_pending_join(*context_id, joiner_did, pending);
-    }
-
-    /// Deposits a per-member access key for `joiner_did` to pick up during
-    /// join. `member_did` identifies whose key this is.
-    pub fn deposit_access_key(
-        &self,
-        context_id: &str,
-        joiner_did: &str,
-        member_did: &str,
-        key: AccessKey,
-    ) {
-        self.exchange()
-            .deposit_access_key(context_id, joiner_did, member_did, key);
-    }
-
-    /// Picks up every access key the inviter deposited for this node and
-    /// stores them locally so the decrypt path can unwrap content.
-    pub fn pickup_access_keys(&self, context_id: &str) {
-        let keys = {
-            let mut exchange = self.exchange();
-            exchange.take_access_keys(context_id, self.local_did.as_ref())
-        };
-        let mut store = self
-            .access_keys
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for (member_did, key) in keys {
-            store.set(context_id, &member_did, key);
-        }
-    }
-
-    /// Returns this node's locally-stored access key for `member_did`, if any.
-    #[must_use]
-    pub fn get_access_key(&self, context_id: &str, member_did: &str) -> Option<AccessKey> {
-        self.access_keys
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(context_id, member_did)
-            .cloned()
     }
 
     // -- Epoch-advance Commits for existing members ------------------------

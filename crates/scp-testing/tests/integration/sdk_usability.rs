@@ -542,6 +542,7 @@ async fn context_manager_creates_usable_context() {
     // Bob decrypts.
     let decrypted = bob
         .decrypt_message(ctx_id, &ctx_bytes, &sent[0].1, "did:dht:z6MkAliceUsability")
+        .await
         .unwrap();
     assert_eq!(
         decrypted.as_slice(),

@@ -1,11 +1,13 @@
 //! Shared key-exchange side channel for the full-stack harness.
 //!
-//! In a real deployment the creator-signed, HPKE-sealed invitation bundle, the
-//! inviter-minted per-member access keys, and the MLS-wrapped sender-key
-//! distribution messages all travel over transport (relay, blob store, MLS
-//! management channel). In the in-process `FullStackNetwork` harness there is
-//! no shared transport between the creator's actor and the joiner's supervisor,
-//! so `KeyExchange` carries those bootstrap bytes between nodes.
+//! In a real deployment the creator-signed, HPKE-sealed invitation bundle and
+//! the MLS-wrapped sender-key distribution messages the inviter pushes to the
+//! joiner travel over transport (relay, blob store, MLS management channel). In
+//! the in-process `FullStackNetwork` harness there is no shared transport
+//! between the creator's actor and the joiner's supervisor, so `KeyExchange`
+//! carries those bootstrap bytes between nodes. Per-member §9.17 access keys do
+//! NOT cross this channel — the joiner acquires them through the REAL §9.17
+//! pull the creator answers (see [`super::node::FullStackNode::join_from_welcome`]).
 //!
 //! The reserve → `invite_member` → `spawn_actor_from_welcome` migration (ADR-049
 //! §9 2F-residual) retires the legacy raw-Welcome slot: the creator now reserves
@@ -19,7 +21,6 @@ use std::collections::HashMap;
 
 use scp_core::context::invitation_helpers::SealedInvitation;
 use scp_core::context::supervisor::ReservationId;
-use scp_core::crypto::access_keys::AccessKey;
 
 /// A pending invitation for a joiner: the creator-signed, HPKE-sealed
 /// [`SealedInvitation`] bundle plus the joiner's own reservation id (the handle
@@ -36,9 +37,7 @@ pub struct PendingJoin {
 /// Shared key-exchange between `E2eCryptoProvider` instances.
 ///
 /// Thread-safe via an external `std::sync::Mutex` wrapping. Keyed by
-/// `([u8; 32] context_id, joiner_did)` for per-joiner bootstrap material and
-/// by `(context_id_str, joiner_did)` for access keys (which use the original
-/// string context ID, matching the access-key store's keying).
+/// `([u8; 32] context_id, joiner_did)` for per-joiner bootstrap material.
 pub struct KeyExchange {
     /// Pending invitations: `(context_id, joiner_did) -> PendingJoin`.
     /// The inviter deposits the creator-signed sealed bundle + reservation id
@@ -56,13 +55,6 @@ pub struct KeyExchange {
     /// their MLS group advances to the new epoch. Raw TLS-serialized MLS
     /// Commit bytes (not envelope-wrapped).
     commits: HashMap<([u8; 32], String), Vec<Vec<u8>>>,
-    /// Access keys deposited for joiners:
-    /// `(context_id_str, joiner_did) -> Vec<(member_did, AccessKey)>`.
-    /// When the inviter adds a joiner it deposits every existing member's
-    /// access key (including the joiner's own) so the joiner can both decrypt
-    /// inbound content and wrap outbound content. A `Vec` allows multiple
-    /// keys per joiner.
-    access_keys: HashMap<(String, String), Vec<(String, AccessKey)>>,
 }
 
 impl KeyExchange {
@@ -73,7 +65,6 @@ impl KeyExchange {
             pending_joins: HashMap::new(),
             sender_key_messages: HashMap::new(),
             commits: HashMap::new(),
-            access_keys: HashMap::new(),
         }
     }
 
@@ -144,38 +135,6 @@ impl KeyExchange {
     pub fn take_commits(&mut self, context_id: &[u8; 32], member_did: &str) -> Vec<Vec<u8>> {
         self.commits
             .remove(&(*context_id, member_did.to_owned()))
-            .unwrap_or_default()
-    }
-
-    /// Deposits an access key for a joiner to retrieve during join.
-    ///
-    /// The key is associated with `joiner_did` (who picks it up).
-    /// `member_did` identifies whose access key this is. Call once per
-    /// existing member when adding a new joiner.
-    pub fn deposit_access_key(
-        &mut self,
-        context_id: &str,
-        joiner_did: &str,
-        member_did: &str,
-        key: AccessKey,
-    ) {
-        self.access_keys
-            .entry((context_id.to_owned(), joiner_did.to_owned()))
-            .or_default()
-            .push((member_did.to_owned(), key));
-    }
-
-    /// Takes (removes) all access keys deposited for the given joiner.
-    ///
-    /// Returns `(member_did, AccessKey)` pairs, or an empty `Vec` if none.
-    #[must_use]
-    pub fn take_access_keys(
-        &mut self,
-        context_id: &str,
-        joiner_did: &str,
-    ) -> Vec<(String, AccessKey)> {
-        self.access_keys
-            .remove(&(context_id.to_owned(), joiner_did.to_owned()))
             .unwrap_or_default()
     }
 }

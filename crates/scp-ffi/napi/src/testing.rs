@@ -384,9 +384,12 @@ pub(crate) fn fullstack_decrypt_message_on(
     // ADR-056: key decryption under the canonical digest via the chokepoint,
     // never the raw routing primitive.
     let ctx_bytes = scp_core::context::state::context_id_to_bytes(&context_id);
-    let plaintext = node
-        .inner
-        .decrypt_message(&context_id, &ctx_bytes, &ciphertext, &sender_did)
+    let rt = crate::runtime();
+    let plaintext = rt
+        .block_on(
+            node.inner
+                .decrypt_message(&context_id, &ctx_bytes, &ciphertext, &sender_did),
+        )
         .map_err(|e| {
             napi::Error::from(ScpNapiError::Crypto {
                 message: format!("failed to decrypt message: {e}"),

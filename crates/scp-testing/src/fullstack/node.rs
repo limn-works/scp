@@ -95,6 +95,26 @@ pub(super) fn did_to_seed(did: &DID) -> [u8; 32] {
     seed
 }
 
+/// Reads every per-member §9.17 access key held by `manager`'s context actor
+/// via the `GetAllAccessKeys` mailbox query.
+///
+/// Used both for a node's OWN keys and — through the shared registry — to read
+/// the CREATOR's held keys when answering a joiner's §9.17 pull requests.
+async fn dispatch_get_all_access_keys(
+    manager: &Arc<Supervisor>,
+    context_id: &str,
+) -> Result<HashMap<String, scp_core::crypto::access_keys::AccessKey>, ContextError> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let cmd = scp_core::context::actor::QueriesCommand::GetAllAccessKeys {
+        context_id: context_id.to_owned(),
+        reply: tx,
+    };
+    manager.dispatch_query(cmd).await?;
+    rx.await.map_err(|_| {
+        ContextError::TransportFailed("get_all_access_keys — actor reply channel closed".to_owned())
+    })?
+}
+
 // ---------------------------------------------------------------------------
 // CapturingTransport — stores sent ciphertexts for test retrieval
 // ---------------------------------------------------------------------------
@@ -442,34 +462,23 @@ impl FullStackNode {
         //    application-ciphertext assertions.
         let _ = std::mem::take(&mut *self.lock_sent());
 
-        // 10. Deposit every member's access key for the joiner (it needs every
-        //     key to both decrypt inbound content and wrap outbound content).
-        let all_keys = self.get_all_access_keys(context_id).await?;
-        for (did, key) in all_keys {
-            self.crypto
-                .deposit_access_key(context_id, member_did, &did, key);
-        }
+        // NOTE: the new member's access keys are NOT pushed here. The creator
+        // (this node) holds every member's §9.17 access key in its OWN actor
+        // store (minted at create / add). The joiner acquires the keys it needs
+        // by issuing REAL §9.17 pull requests the creator answers — see
+        // `join_from_welcome` → `pull_access_keys_from_creator`. The production
+        // actor-loop distribution this replaces is deferred and tracked (#2050).
 
         Ok(())
     }
 
-    /// Reads every per-member access key from the creator's context actor via
+    /// Reads every per-member access key from THIS node's context actor via
     /// the `GetAllAccessKeys` mailbox query.
     async fn get_all_access_keys(
         &self,
         context_id: &str,
     ) -> Result<HashMap<String, scp_core::crypto::access_keys::AccessKey>, ContextError> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let cmd = scp_core::context::actor::QueriesCommand::GetAllAccessKeys {
-            context_id: context_id.to_owned(),
-            reply: tx,
-        };
-        self.manager.dispatch_query(cmd).await?;
-        rx.await.map_err(|_| {
-            ContextError::TransportFailed(
-                "get_all_access_keys — actor reply channel closed".to_owned(),
-            )
-        })?
+        dispatch_get_all_access_keys(&self.manager, context_id).await
     }
 
     /// Joins a context from the sealed invitation the creator deposited in the
@@ -505,6 +514,9 @@ impl FullStackNode {
                 hex::encode(context_id)
             ))
         })?;
+        // The creator holds every member's §9.17 access key (minted at create /
+        // add) and answers this joiner's pull requests below.
+        let creator_did = sealed.creator_did.clone();
 
         // 2. Build this node's #active split custody from the SAME seed the
         //    network resolver publishes for this DID (so the key the creator
@@ -537,9 +549,9 @@ impl FullStackNode {
             .spawn_actor_from_welcome(self.did.clone(), &custody, &active_handle, req)
             .await?;
 
-        // 5. Joiner-side pickup: access keys, sender-key distribution messages,
-        //    and any pending epoch-advance Commits.
-        self.crypto.pickup_access_keys(context_id_str);
+        // 5. Joiner-side pickup: sender-key distribution messages and any
+        //    pending epoch-advance Commits. (§9.17 access keys are acquired via
+        //    the real pull in step 7, not a deposit/pickup side-channel.)
         self.crypto
             .pickup_sender_key_messages(context_id_str, context_id)?;
         self.crypto
@@ -556,7 +568,130 @@ impl FullStackNode {
         //    Instead each incumbent PULLS the joiner's key (see the helper).
         self.incumbents_pull_joiner_sender_key(context_id, &handle)
             .await?;
+
+        // 7. §9.17 content-access-key acquisition via the REAL pull protocol.
+        //    The joiner's actor spawned with an EMPTY access_key_store, so it can
+        //    neither unwrap its own inbound CEKs nor wrap CEKs for its peers on
+        //    send. It acquires every current member's access key (its own + the
+        //    incumbents') by issuing signed §9.17 requests the creator (the key
+        //    holder) answers via `handle_access_key_request`, then installs the
+        //    opened keys into its actor store. (The production actor-loop
+        //    distribution this simulates over the harness transport is deferred
+        //    and tracked in #2050.)
+        self.pull_access_keys_from_creator(context_id_str, &creator_did, &handle)
+            .await?;
         Ok(handle)
+    }
+
+    /// Drives the §9.17 access-key PULL for a Welcome-joiner (`self`).
+    ///
+    /// The joiner's actor spawned with an empty access-key store. For EVERY
+    /// current member `member` (the joiner itself + every incumbent), the joiner
+    /// issues a signed [`AccessKeyRequest`](scp_core::crypto::access_keys::wire)
+    /// with a fresh ephemeral wrapping key, the creator — which holds every
+    /// member's access key (§9.17.1: "the key holder (context creator or
+    /// `AddMember` executor)") — answers via
+    /// [`handle_access_key_request`](scp_core::crypto::access_keys::wire::handle_access_key_request)
+    /// with that member's key sealed to the ephemeral key, and the joiner opens
+    /// the response and installs the key into its own actor store via the
+    /// testing seam. This is the real request/response round trip over the
+    /// harness's simulated transport — no deposit/pickup shortcut.
+    ///
+    /// The joiner pulls the FULL current member set at join time. Incremental
+    /// re-distribution to already-joined members when a LATER member joins is the
+    /// production actor-loop concern tracked in #2050 (no current test drives a
+    /// joiner→later-joiner send, so it is not simulated here).
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`ContextError`] if the creator node is not registered, the
+    /// creator holds no key for a member, or any request / open / install fails.
+    async fn pull_access_keys_from_creator(
+        &self,
+        context_id_str: &str,
+        creator_did: &str,
+        joiner_handle: &ContextHandle,
+    ) -> Result<(), ContextError> {
+        use scp_clock::Clock as _;
+        use scp_core::crypto::access_keys::wire::{
+            AccessKeyResponse, handle_access_key_request, open_access_key_response,
+            request_access_key,
+        };
+
+        // Reach the creator node (the §9.17 key holder) through the shared
+        // registry, and read the access keys it holds from its actor store.
+        let creator = {
+            let registry = self
+                .registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            registry.get(creator_did).cloned()
+        };
+        let Some(creator) = creator else {
+            return Err(ContextError::CryptoFailed(format!(
+                "§9.17 pull: creator node {creator_did} is not registered in the network"
+            )));
+        };
+        let creator_keys = dispatch_get_all_access_keys(&creator.manager, context_id_str).await?;
+
+        let joiner_did = self.did.as_ref();
+        let mut nonce_dedup = scp_core::crypto::sender_keys::NonceDedup::new();
+
+        for member_did in self.manager.member_dids(joiner_handle.context_id()).await {
+            // The creator holds every member's key; a missing entry is a real
+            // wiring bug (fail loud rather than silently skip a recipient).
+            let member_key = creator_keys.get(&member_did).cloned().ok_or_else(|| {
+                ContextError::CryptoFailed(format!(
+                    "§9.17 pull: creator holds no access key for member {member_did}"
+                ))
+            })?;
+
+            // 1. Joiner builds a signed request with a fresh ephemeral wrapping
+            //    keypair (held in a throwaway in-memory custody).
+            let custody = InMemoryKeyCustody::new();
+            let signing_handle = custody
+                .import_ed25519_key(&self.signing_key.to_bytes())
+                .await;
+            let request = request_access_key(
+                &custody,
+                &signing_handle,
+                joiner_did,
+                context_id_str,
+                &scp_clock::SystemClock,
+            )
+            .await
+            .map_err(|e| ContextError::CryptoFailed(format!("build access-key request: {e}")))?;
+
+            // 2. Creator (holder) seals `member_did`'s key to the joiner's
+            //    ephemeral wrapping key via the REAL responder path.
+            let parsed_request: scp_core::crypto::access_keys::wire::AccessKeyRequest =
+                serde_json::from_slice(&request.request_message).map_err(|e| {
+                    ContextError::CryptoFailed(format!("decode access-key request: {e}"))
+                })?;
+            let response_bytes = handle_access_key_request(
+                &parsed_request,
+                self.signing_key.verifying_key().as_bytes(),
+                &member_key,
+                scp_clock::SystemClock.now_secs(),
+                &mut nonce_dedup,
+            )
+            .map_err(|e| ContextError::CryptoFailed(format!("creator seals access key: {e}")))?;
+
+            // 3. Joiner opens the response and installs the key into its actor.
+            let response: AccessKeyResponse =
+                serde_json::from_slice(&response_bytes).map_err(|e| {
+                    ContextError::CryptoFailed(format!("decode access-key response: {e}"))
+                })?;
+            let key = open_access_key_response(&custody, &request.wrapping_key_handle, &response)
+                .await
+                .map_err(|e| {
+                    ContextError::CryptoFailed(format!("open access-key response: {e}"))
+                })?;
+            self.manager
+                .test_install_access_key(context_id_str, &member_did, key)
+                .await?;
+        }
+        Ok(())
     }
 
     /// Drives the §9.16.2 PULL exchange for the joiner→incumbent direction.
@@ -854,7 +989,7 @@ impl FullStackNode {
     /// # Errors
     ///
     /// Propagates [`ContextError`] if any decryption or verification step fails.
-    pub fn decrypt_message(
+    pub async fn decrypt_message(
         &self,
         context_id_str: &str,
         context_id: &[u8; 32],
@@ -913,10 +1048,15 @@ impl FullStackNode {
                 ContextError::CryptoFailed(format!("WrappedContent deserialization: {e}"))
             })?;
 
+        // Unwrap with this node's OWN §9.17 access key, read from its context
+        // actor's access_key_store (the single source of truth for access keys):
+        // the creator minted its own at create; a joiner installed its own via
+        // the real §9.17 pull at join (`pull_access_keys_from_creator`).
         let local_did = self.did.as_ref().to_string();
         let access_key = self
-            .crypto
-            .get_access_key(context_id_str, &local_did)
+            .get_all_access_keys(context_id_str)
+            .await?
+            .remove(&local_did)
             .ok_or_else(|| {
                 ContextError::CryptoFailed(format!(
                     "no access key for {local_did} in context {context_id_str}"
