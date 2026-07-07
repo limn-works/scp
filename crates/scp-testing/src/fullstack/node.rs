@@ -545,20 +545,142 @@ impl FullStackNode {
         self.crypto
             .process_pending_commits(context_id_str, context_id)?;
 
-        // 6. Mirror `add_member` step 7 in the OTHER direction: distribute THIS
-        //    joiner's sender key to every existing member so they can decrypt the
-        //    joiner's outbound traffic. Neither `invite_member` nor the Welcome
-        //    carries the joiner's sender key to the incumbents, so without this a
-        //    B→A send fails at the receiver with `sender key lookup failed`. The
-        //    joiner holds each peer's `0xFF01` wrapping pubkey from the joined
-        //    group's leaf nodes, so the HPKE seal targets the right recipient.
-        let joiner_did = self.did.as_ref();
-        for existing in self.manager.member_dids(handle.context_id()).await {
-            if existing.as_str() != joiner_did {
-                self.crypto.distribute_sender_key(context_id, &existing)?;
-            }
-        }
+        // 6. Joiner→incumbent sender-key exchange via the spec's PULL protocol
+        //    (§9.16.2), the canonical new-member mechanism. Neither `invite_member`
+        //    nor the Welcome carries the joiner's sender key to the incumbents, so
+        //    without this a B→A send fails at the receiver with `sender key lookup
+        //    failed`. The joiner CANNOT proactively PUSH its key: a push seals to
+        //    each incumbent's STABLE `0xFF01` wrapping key, and openmls 0.8.1
+        //    exposes no way to read a remote member's LeafNode extension from a
+        //    joined group (ADR-057) — a joiner's `member_wrapping_keys` is empty.
+        //    Instead each incumbent PULLS the joiner's key (see the helper).
+        self.incumbents_pull_joiner_sender_key(context_id, &handle)
+            .await?;
         Ok(handle)
+    }
+
+    /// Drives the §9.16.2 PULL exchange for the joiner→incumbent direction.
+    ///
+    /// For each existing member `incumbent`, the incumbent issues a signed
+    /// [`SenderKeyRequest`](scp_core::crypto::sender_keys::SenderKeyRequest)
+    /// carrying a FRESH EPHEMERAL wrapping key, the joiner (`self`) answers via
+    /// [`MlsCryptoProvider::handle_sender_key_request`](scp_core::crypto::mls::provider::MlsCryptoProvider::handle_sender_key_request),
+    /// and the incumbent opens the response with its ephemeral secret and stores
+    /// the joiner's key in its OWN provider. This is the real request/response
+    /// round trip, not a shortcut: the joiner's response goes through the H1
+    /// membership gate (§9.16.6 Mitigation 1), which reads the joiner's MLS group
+    /// tree — so the joiner accepts every incumbent (a member) even though its
+    /// `member_wrapping_keys` cache is empty. The incumbent's `#active` signing
+    /// key and provider are reached through the shared node registry, exactly as
+    /// `add_member` reaches a joiner's supervisor.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`ContextError`] if the request build, the joiner's response,
+    /// the HPKE open, or the store fails. A missing registry entry for a member
+    /// is skipped (only registered nodes participate in the harness exchange).
+    async fn incumbents_pull_joiner_sender_key(
+        &self,
+        context_id: &[u8; 32],
+        joiner_handle: &ContextHandle,
+    ) -> Result<(), ContextError> {
+        use scp_core::crypto::sender_keys::SenderKeyResponse;
+        use scp_core::crypto::sender_keys::key_protocol::{
+            open_sender_key_response, request_sender_key,
+        };
+
+        // The sender-key HPKE layer binds `hex::encode(context_id)` (the hex of
+        // the 32-byte digest), NOT the human context-id string: the responder's
+        // `handle_sender_key_request` seals with that value, so the requester
+        // MUST open with the same one (§9.16.2 info/aad).
+        let ctx_id_hex = hex::encode(context_id);
+        let joiner_did = self.did.as_ref().to_owned();
+        // The joiner's own sender key is minted at `install_joined_group` with
+        // epoch 1. The request's `epoch` field is not validated by the responder
+        // (it seals its CURRENT key and returns the authoritative epoch in the
+        // response), so this is only the requester's best-effort hint.
+        let joiner_epoch = 1u64;
+
+        for incumbent_did in self.manager.member_dids(joiner_handle.context_id()).await {
+            if incumbent_did == joiner_did {
+                continue;
+            }
+
+            // Reach the incumbent's provider + derive its deterministic #active
+            // signing key (the network resolver maps every DID to this key).
+            let incumbent = {
+                let registry = self
+                    .registry
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                registry.get(&incumbent_did).cloned()
+            };
+            let Some(incumbent) = incumbent else {
+                continue;
+            };
+            let incumbent_signing =
+                ed25519_dalek::SigningKey::from_bytes(&did_to_seed(&DID(incumbent_did.clone())));
+
+            // 1. Incumbent builds a signed request with a fresh ephemeral
+            //    wrapping keypair (held in a throwaway in-memory custody).
+            let custody = InMemoryKeyCustody::new();
+            let signing_handle = custody
+                .import_ed25519_key(&incumbent_signing.to_bytes())
+                .await;
+            let request = request_sender_key(
+                &custody,
+                &signing_handle,
+                &incumbent_did,
+                &joiner_did,
+                joiner_epoch,
+                &scp_clock::SystemClock,
+            )
+            .await
+            .map_err(|e| {
+                ContextError::CryptoFailed(format!("incumbent build sender-key request: {e}"))
+            })?;
+
+            // 2. Joiner answers via the real provider path (H1 membership gate).
+            let blocked = std::collections::HashSet::new();
+            let response_bytes = self
+                .crypto
+                .provider
+                .handle_sender_key_request(
+                    context_id,
+                    &request.request_message,
+                    incumbent_signing.verifying_key().as_bytes(),
+                    &blocked,
+                )?
+                .ok_or_else(|| {
+                    ContextError::CryptoFailed(
+                        "joiner declined the incumbent's sender-key request".to_owned(),
+                    )
+                })?;
+
+            // 3. Incumbent opens the ephemeral-sealed response and stores the
+            //    joiner's key in its own provider so it can decrypt the joiner.
+            let response: SenderKeyResponse =
+                rmp_serde::from_slice(&response_bytes).map_err(|e| {
+                    ContextError::CryptoFailed(format!("decode sender-key response: {e}"))
+                })?;
+            let joiner_key = open_sender_key_response(
+                &custody,
+                &request.wrapping_key_handle,
+                &ctx_id_hex,
+                &response,
+            )
+            .await
+            .map_err(|e| {
+                ContextError::CryptoFailed(format!("incumbent open sender-key response: {e}"))
+            })?;
+            incumbent.crypto.provider.store_member_sender_key(
+                context_id,
+                &joiner_did,
+                joiner_key,
+                response.epoch,
+            )?;
+        }
+        Ok(())
     }
 
     /// Sends a message through the real `Supervisor` (encrypts with real MLS +
@@ -743,11 +865,15 @@ impl FullStackNode {
         self.crypto
             .process_pending_commits(context_id_str, context_id)?;
 
-        // Ingest any sender-key distribution addressed to this node before
-        // opening. Distribution is symmetric — a joiner distributes its sender
-        // key to the incumbents just as the inviter distributes to the joiner —
-        // so the receiver must pick up the sender's key here or the open below
-        // fails with `sender key lookup failed`.
+        // Ingest any PUSHED sender-key distribution addressed to this node
+        // before opening (the incumbent→joiner direction: the inviter proactively
+        // pushes its key to the joiner at `add_member`, sealed to the joiner's
+        // stable wrapping key, and the joiner picks it up here). The reverse
+        // joiner→incumbent direction is handled at join time by the PULL protocol
+        // (`incumbents_pull_joiner_sender_key`), not by push, so nothing is
+        // deposited for it — but this pickup is still required so a joiner
+        // decrypting an incumbent's message resolves the incumbent's key here
+        // rather than failing with `sender key lookup failed`.
         self.crypto
             .pickup_sender_key_messages(context_id_str, context_id)?;
 
