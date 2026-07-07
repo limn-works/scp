@@ -231,9 +231,11 @@ pub async fn leave_context(
     // `MemberLeft` Merkle-leaf append and the close-on-empty transition (both now or
     // already async — under ADR-049 Decision 7 `EventLogPersistence` is async) run
     // AFTER the persist, outside the sync `_keep` closure. `check_commit_fault` reads
-    // through the whole `&mut PerContextState` the view hands back;
-    // `try_broadcast_commit_or_enqueue` is passed only the three disjoint Class-C
-    // fields it mutates (via `CommitBroadcastBorrows`), borrowed from that same state.
+    // through the whole `&mut PerContextState` the view hands back. The MLS-Commit
+    // broadcast also runs after this persist (async — Decision 7); on failure its
+    // `commit_fault`/`pending_commits` bookkeeping is applied FAIL-CLOSED via a
+    // second `commit_class_s_keep` (`apply_broadcast_failure`), because `commit_fault`
+    // is a safety gate that must survive a crash before the coalesced persist tick.
     let (should_close, left_role_name, is_broadcast, mls_commit_bytes) = cell
         .commit_class_s_keep(deps, &context_id, |mut view| {
             let state = view.rest_mut();
@@ -365,18 +367,26 @@ pub async fn leave_context(
     // Async transport ops AFTER the Class-S removal persist (ADR-049 Decision 7:
     // `ContextTransportProvider` is async and cannot be awaited inside the
     // synchronous `_keep` closure above). The membership removal is already
-    // fail-closed-persisted; the MLS-Commit broadcast enqueue is Class-C
-    // (coalesced — picked up by the actor's persist tick) and the sender-key
-    // rotation + delivery are best-effort crypto/transport side-effects. The
-    // captured `mls_commit_bytes` is the removal Commit already produced under
-    // the crypto `Arc` (Class-M) inside the closure.
+    // fail-closed-persisted; the MLS-Commit broadcast's failure bookkeeping is
+    // itself re-persisted FAIL-CLOSED (see below), while the sender-key rotation +
+    // delivery are best-effort crypto/transport side-effects. The captured
+    // `mls_commit_bytes` is the removal Commit already produced under the crypto
+    // `Arc` (Class-M) inside the closure.
     if !is_broadcast {
-        if let Some(commit_bytes) = mls_commit_bytes {
-            // Broadcast the MLS Commit to remaining members so they can advance
-            // their group epoch and ratchet key material. PR #1606 C6: on
-            // transport failure, the commit is durably enqueued for retry.
-            governance_helpers::try_broadcast_commit_or_enqueue(
-                cell.class_c_view().commit_broadcast_borrows(),
+        // Broadcast the MLS Commit to remaining members so they can advance their
+        // group epoch and ratchet key material. The broadcast is async (ADR-049
+        // Decision 7) and cannot run inside the sync `_keep` closure above. PR #1606
+        // C6: on transport FAILURE the retry-queue bookkeeping — the `commit_fault`
+        // safety-gate marker (`check_commit_fault` blocks send/lifecycle/governance)
+        // and the `pending_commits` entry that is the ONLY re-delivery of the removal
+        // Commit — MUST persist FAIL-CLOSED. A crash before the ≤50 ms coalesced tick
+        // would otherwise drop both, respawning the context "healthy" while remaining
+        // members are stuck on a stale MLS epoch with no retry: silent, permanent
+        // group desync (ADR-049 §9). The apply therefore rides a SECOND
+        // `commit_class_s_keep` (the async broadcast cannot; its fail-close
+        // bookkeeping can). The success path persists nothing.
+        if let Some(commit_bytes) = mls_commit_bytes
+            && let Some(failure) = governance_helpers::try_broadcast_commit(
                 deps,
                 &context_id,
                 commit_bytes,
@@ -384,7 +394,23 @@ pub async fn leave_context(
                     member_did: member_did.clone(),
                 },
             )
-            .await;
+            .await
+        {
+            cell.commit_class_s_keep(deps, &context_id, |mut view| {
+                let state = view.rest_mut();
+                governance_helpers::apply_broadcast_failure(
+                    governance_helpers::CommitBroadcastBorrows {
+                        pending_commits: &mut state.pending_commits,
+                        commit_fault: &mut state.commit_fault,
+                        receive_buffer: &mut state.receive_buffer,
+                    },
+                    deps,
+                    &context_id,
+                    failure,
+                );
+                Ok(())
+            })
+            .await?;
         }
 
         // Rotate the local sender key and distribute to remaining members

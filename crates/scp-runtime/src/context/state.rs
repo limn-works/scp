@@ -94,7 +94,7 @@ pub const MAX_COMMIT_AGE_SECS: u64 = 3600; // 1 hour
 /// Maximum number of pending commits allowed in the retry queue per context.
 ///
 /// Prevents unbounded memory growth during sustained transport outages.
-/// When this cap is reached, [`try_broadcast_commit_or_enqueue`](crate::context::governance_helpers::try_broadcast_commit_or_enqueue) sets the
+/// When this cap is reached, [`apply_broadcast_failure`](crate::context::governance_helpers::apply_broadcast_failure) sets the
 /// `commit_fault` marker immediately rather than enqueuing, fail-closing
 /// the context for operator attention.
 pub const MAX_PENDING_COMMITS: usize = 50;

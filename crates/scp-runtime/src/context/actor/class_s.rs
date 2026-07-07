@@ -2482,11 +2482,13 @@ impl<'a> ClassCMut<'a> {
         self.commit_fault
     }
 
-    /// The three disjoint Class-C `&mut` fields the MLS-Commit broadcast helper
-    /// ([`crate::context::governance_helpers::try_broadcast_commit_or_enqueue`])
+    /// The three disjoint Class-C `&mut` fields the MLS-Commit broadcast-failure
+    /// apply ([`crate::context::governance_helpers::apply_broadcast_failure`])
     /// mutates, bundled so a cell holder can pass all three at once. Each is a
     /// distinct field of this view, so the simultaneous `&mut` is sound by
-    /// construction; all three are Class-C / structural / best-effort.
+    /// construction. This view supplies them COALESCED (best-effort); the
+    /// safety-gated sites instead supply them from a `commit_class_s_keep`
+    /// `rest_mut()` view for a fail-closed persist.
     pub(crate) const fn commit_broadcast_borrows(
         &mut self,
     ) -> crate::context::governance_helpers::CommitBroadcastBorrows<'_> {
