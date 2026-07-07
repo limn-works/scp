@@ -431,6 +431,28 @@ impl<'a> ClassSMut<'a> {
     pub(crate) const fn rest_mut(&mut self) -> &mut PerContextState {
         self.state
     }
+
+    /// The three disjoint Class-C `&mut` fields the MLS-Commit broadcast-failure
+    /// apply ([`crate::context::governance_helpers::apply_broadcast_failure`])
+    /// mutates, bundled so a caller can pass all three at once. The MIRROR of
+    /// [`ClassCMut::commit_broadcast_borrows`], but supplied from this
+    /// Class-S-capable view so the apply rides the owning combinator's
+    /// **fail-closed** persist: the safety-gated commit-broadcast sites
+    /// ([`crate::context::governance_helpers::keep_broadcast_failure`]) build the
+    /// borrows HERE — inside a `commit_class_s_keep` closure — rather than through
+    /// the coalesced `ClassCMut` view, so the `commit_fault` safety gate and the
+    /// `pending_commits` retry entry survive a crash before the ≤50 ms persist
+    /// tick. Each is a distinct field of the underlying `PerContextState`, so the
+    /// simultaneous `&mut` is sound by construction.
+    pub(crate) const fn commit_broadcast_borrows(
+        &mut self,
+    ) -> crate::context::governance_helpers::CommitBroadcastBorrows<'_> {
+        crate::context::governance_helpers::CommitBroadcastBorrows {
+            pending_commits: &mut self.state.pending_commits,
+            commit_fault: &mut self.state.commit_fault,
+            receive_buffer: &mut self.state.receive_buffer,
+        }
+    }
 }
 
 impl Deref for ClassSMut<'_> {

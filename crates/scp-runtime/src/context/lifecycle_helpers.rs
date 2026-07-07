@@ -374,17 +374,10 @@ pub async fn leave_context(
     // `Arc` (Class-M) inside the closure.
     if !is_broadcast {
         // Broadcast the MLS Commit to remaining members so they can advance their
-        // group epoch and ratchet key material. The broadcast is async (ADR-049
-        // Decision 7) and cannot run inside the sync `_keep` closure above. PR #1606
-        // C6: on transport FAILURE the retry-queue bookkeeping — the `commit_fault`
-        // safety-gate marker (`check_commit_fault` blocks send/lifecycle/governance)
-        // and the `pending_commits` entry that is the ONLY re-delivery of the removal
-        // Commit — MUST persist FAIL-CLOSED. A crash before the ≤50 ms coalesced tick
-        // would otherwise drop both, respawning the context "healthy" while remaining
-        // members are stuck on a stale MLS epoch with no retry: silent, permanent
-        // group desync (ADR-049 §9). The apply therefore rides a SECOND
-        // `commit_class_s_keep` (the async broadcast cannot; its fail-close
-        // bookkeeping can). The success path persists nothing.
+        // group epoch and ratchet key material. Broadcast async (ADR-049 Decision
+        // 7); on transport FAILURE the retry-queue bookkeeping is persisted
+        // FAIL-CLOSED via `keep_broadcast_failure` (member departure is a
+        // safety-gated site — see that helper's doc for why the second persist).
         if let Some(commit_bytes) = mls_commit_bytes
             && let Some(failure) = governance_helpers::try_broadcast_commit(
                 deps,
@@ -396,21 +389,7 @@ pub async fn leave_context(
             )
             .await
         {
-            cell.commit_class_s_keep(deps, &context_id, |mut view| {
-                let state = view.rest_mut();
-                governance_helpers::apply_broadcast_failure(
-                    governance_helpers::CommitBroadcastBorrows {
-                        pending_commits: &mut state.pending_commits,
-                        commit_fault: &mut state.commit_fault,
-                        receive_buffer: &mut state.receive_buffer,
-                    },
-                    deps,
-                    &context_id,
-                    failure,
-                );
-                Ok(())
-            })
-            .await?;
+            governance_helpers::keep_broadcast_failure(cell, deps, &context_id, failure).await?;
         }
 
         // Rotate the local sender key and distribute to remaining members

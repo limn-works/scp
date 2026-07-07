@@ -1436,16 +1436,9 @@ pub async fn execute_remove_member(
     // removal Commit already produced under the crypto `Arc` (Class-M) inside the
     // closure.
     if let Some(remove_commit_bytes) = remove_commit_bytes {
-        // The broadcast is async; on FAILURE its retry-queue bookkeeping — the
-        // `commit_fault` safety-gate marker (`check_commit_fault` blocks
-        // send/lifecycle/governance) and the `pending_commits` entry that is the
-        // ONLY re-delivery of the removal Commit — MUST persist FAIL-CLOSED. A
-        // crash before the ≤50 ms coalesced tick would otherwise drop both,
-        // respawning the context "healthy" while members are stuck on a stale MLS
-        // epoch with no retry: silent, permanent group desync (ADR-049 §9). So the
-        // apply runs inside a SECOND `commit_class_s_keep` — the async broadcast
-        // itself cannot live in the sync `_keep` closure (Decision 7), but its
-        // fail-close bookkeeping can and does. The success path persists nothing.
+        // Broadcast async (Decision 7); on FAILURE the retry-queue bookkeeping is
+        // persisted FAIL-CLOSED via `keep_broadcast_failure` (removal Commit is a
+        // safety-gated site — see that helper's doc for why the second persist).
         if let Some(failure) = try_broadcast_commit(
             deps,
             context_id,
@@ -1456,21 +1449,7 @@ pub async fn execute_remove_member(
         )
         .await
         {
-            cell.commit_class_s_keep(deps, context_id, |mut view| {
-                let state = view.rest_mut();
-                apply_broadcast_failure(
-                    CommitBroadcastBorrows {
-                        pending_commits: &mut state.pending_commits,
-                        commit_fault: &mut state.commit_fault,
-                        receive_buffer: &mut state.receive_buffer,
-                    },
-                    deps,
-                    context_id,
-                    failure,
-                );
-                Ok(())
-            })
-            .await?;
+            keep_broadcast_failure(cell, deps, context_id, failure).await?;
         }
 
         // Phase 2A.9: drain_and_deliver_sender_keys is now actor-shape.
@@ -2856,14 +2835,10 @@ pub async fn execute_rotate_content_keys(
 
     // Async transport op AFTER the Class-S rotation persist (ADR-049 Decision 7).
     // The key rotation is fail-closed-persisted; the commit bytes were produced
-    // under the crypto `Arc` (Class-M) inside the closure. The broadcast is async;
-    // on FAILURE its retry-queue bookkeeping — the `commit_fault` safety-gate
-    // marker and the `pending_commits` entry that is the ONLY re-delivery of the
-    // epoch-advance Commit — MUST persist FAIL-CLOSED, else a crash before the
-    // ≤50 ms coalesced tick drops the gate and members desync on a stale epoch
-    // with no retry (ADR-049 §9). The apply therefore rides a SECOND
-    // `commit_class_s_keep`; the async broadcast cannot live in the sync closure
-    // (Decision 7), but its fail-close bookkeeping can. Success persists nothing.
+    // under the crypto `Arc` (Class-M) inside the closure. Broadcast async
+    // (Decision 7); on FAILURE the retry-queue bookkeeping is persisted
+    // FAIL-CLOSED via `keep_broadcast_failure` (epoch-advance is a safety-gated
+    // site — see that helper's doc for why the second persist).
     if let Some(commit_bytes) = rotate_commit_bytes
         && let Some(failure) = try_broadcast_commit(
             deps,
@@ -2875,21 +2850,7 @@ pub async fn execute_rotate_content_keys(
         )
         .await
     {
-        cell.commit_class_s_keep(deps, context_id, |mut view| {
-            let state = view.rest_mut();
-            apply_broadcast_failure(
-                CommitBroadcastBorrows {
-                    pending_commits: &mut state.pending_commits,
-                    commit_fault: &mut state.commit_fault,
-                    receive_buffer: &mut state.receive_buffer,
-                },
-                deps,
-                context_id,
-                failure,
-            );
-            Ok(())
-        })
-        .await?;
+        keep_broadcast_failure(cell, deps, context_id, failure).await?;
     }
 
     deps.event_log
@@ -5578,6 +5539,49 @@ pub fn apply_broadcast_failure(
         error = %error,
         "MLS commit broadcast failed; enqueued for persistent retry (PR #1606 C6)"
     );
+}
+
+/// Applies a failed MLS-Commit broadcast's retry-queue bookkeeping FAIL-CLOSED,
+/// inside a second [`commit_class_s_keep`](crate::context::actor::class_s::ClassSCell::commit_class_s_keep)
+/// so it survives a crash before the actor's ≤50 ms coalesced persist tick.
+///
+/// The single call the safety-gated commit-broadcast sites —
+/// [`execute_remove_member`], [`execute_rotate_content_keys`] (this module),
+/// [`recovery_advance_epoch`](crate::context::trust_recovery_helpers::recovery_advance_epoch)
+/// (§9.12 post-compromise recovery), and
+/// [`leave_context`](crate::context::lifecycle_helpers::leave_context) —
+/// make after [`try_broadcast_commit`] returns `Some(BroadcastFailure)`.
+///
+/// # Why the second fail-closed persist (ADR-049 §9 / §9.9.3)
+///
+/// The transport became async under ADR-049 Decision 7, so the broadcast can no
+/// longer be awaited inside the primary `commit_class_s_keep` closure that
+/// fail-closed-persisted the underlying mutation; it now runs AFTER it. Its
+/// failure bookkeeping, however — the `commit_fault` safety-gate marker
+/// ([`check_commit_fault`] blocks send/lifecycle/governance) and the
+/// `pending_commits` entry that is the ONLY re-delivery of the epoch-advancing
+/// Commit — is synchronous ([`apply_broadcast_failure`]) and DOES ride a second
+/// `commit_class_s_keep`. If instead it were only coalesced (a plain `ClassCMut`
+/// write), a crash between the broadcast failure and the next persist tick would
+/// drop BOTH: the context respawns "healthy" while remaining members are stuck on
+/// a stale MLS epoch with no retry queued — silent, permanent group desync. The
+/// success path persists nothing (there is no `BroadcastFailure` to apply).
+///
+/// `pub` (not `pub(crate)`) is the private-module convention here —
+/// `clippy::redundant_pub_crate` forbids `pub(crate)` in this non-`pub` module;
+/// the helper is not FFI-exported (reconciled via the cross-layer PR-body marker,
+/// like the sibling async transport helpers).
+pub async fn keep_broadcast_failure(
+    cell: &mut crate::context::actor::class_s::ClassSCell,
+    deps: &ActorDeps,
+    context_id: &str,
+    failure: BroadcastFailure,
+) -> Result<(), ContextError> {
+    cell.commit_class_s_keep(deps, context_id, |mut view| {
+        apply_broadcast_failure(view.commit_broadcast_borrows(), deps, context_id, failure);
+        Ok(())
+    })
+    .await
 }
 
 // ===========================================================================
