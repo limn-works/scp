@@ -115,7 +115,9 @@ pub trait RelayPersistence: Send + Sync + fmt::Debug {
 // ---------------------------------------------------------------------------
 
 /// Bridges any [`Storage`](scp_platform::Storage) implementation to
-/// [`RelayPersistence`] using the sync-to-async bridge pattern.
+/// [`RelayPersistence`]. Being an async trait (ADR-049 Decision 7), each method
+/// `.await`s the async `Storage` backend directly — there is NO `block_in_place`
+/// sync→async bridge (the pattern PR-3 deleted).
 ///
 /// Key layout:
 /// - `relay/subscription/{routing_id_hex}` — marker value `b"1"`
