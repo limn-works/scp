@@ -127,6 +127,7 @@ async fn handle_create_governance_checkpoint(
             &p.creator_did,
             p.creator_signature,
         )
+        .await
     };
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, create_fut).await {

@@ -177,11 +177,12 @@ impl ContextTransportProvider for CapturingTransport {
 /// `merkle_root` / export helpers read and write the same event log.
 struct ArcEventLogProvider(Arc<MerkleEventLogProvider>);
 
+#[async_trait::async_trait]
 impl ContextEventLogProvider for ArcEventLogProvider {
-    fn init_event_log(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
-        self.0.init_event_log(id)
+    async fn init_event_log(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        self.0.init_event_log(id).await
     }
-    fn append_event(
+    async fn append_event(
         &self,
         id: &[u8; 32],
         event_type: scp_event_log::EventType,
@@ -191,9 +192,10 @@ impl ContextEventLogProvider for ArcEventLogProvider {
     ) -> Result<(), ContextCreationError> {
         self.0
             .append_event(id, event_type, actor_did, payload, timestamp_secs)
+            .await
     }
-    fn destroy_event_log(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
-        self.0.destroy_event_log(id)
+    async fn destroy_event_log(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        self.0.destroy_event_log(id).await
     }
     fn event_log_entries(
         &self,
@@ -204,16 +206,16 @@ impl ContextEventLogProvider for ArcEventLogProvider {
     fn export_event_log_data(&self, id: &[u8; 32]) -> Result<Vec<u8>, ContextError> {
         self.0.export_event_log_data(id)
     }
-    fn import_event_log_data(&self, id: &[u8; 32], data: &[u8]) -> Result<(), ContextError> {
-        self.0.import_event_log_data(id, data)
+    async fn import_event_log_data(&self, id: &[u8; 32], data: &[u8]) -> Result<(), ContextError> {
+        self.0.import_event_log_data(id, data).await
     }
     fn event_log_merkle_root(&self, id: &[u8; 32]) -> Result<[u8; 32], ContextError> {
         self.0.event_log_merkle_root(id)
     }
-    fn restore_event_log(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
-        self.0.restore_event_log(id)
+    async fn restore_event_log(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        self.0.restore_event_log(id).await
     }
-    fn prune_before_checkpoint(
+    async fn prune_before_checkpoint(
         &self,
         id: &[u8; 32],
         checkpoint_event_count: u64,
@@ -221,6 +223,7 @@ impl ContextEventLogProvider for ArcEventLogProvider {
     ) -> Option<usize> {
         self.0
             .prune_before_checkpoint(id, checkpoint_event_count, policy)
+            .await
     }
 }
 

@@ -5989,6 +5989,7 @@ mod tests {
                 payload,
                 1_700_000_000,
             )
+            .await
             .expect("append RoleAssigned leaf to supervisor event log");
 
         let handle =

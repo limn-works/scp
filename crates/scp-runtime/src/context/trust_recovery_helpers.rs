@@ -73,7 +73,7 @@ use crate::context::state::{context_id_to_bytes, require_active};
 /// flags this as `mutated: true` only because pruning has external side
 /// effects worth coalescing into the actor's persist tick.
 #[allow(clippy::too_many_arguments)]
-pub fn create_governance_checkpoint(
+pub async fn create_governance_checkpoint(
     cell: &mut ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
@@ -120,6 +120,7 @@ pub fn create_governance_checkpoint(
         if deps
             .event_log
             .prune_before_checkpoint(&context_id_bytes, event_count, policy)
+            .await
             .is_some_and(|pruned| pruned > 0)
         {
             tracing::info!(
@@ -268,18 +269,28 @@ pub async fn recovery_advance_epoch(
     // initiator's clock — the source of the `created_at` on the broadcast MLS
     // Commit, copied by every member (§7.3.1, §9.9.3).
     let recovery_ts = deps.clock.now_secs();
-    if let Err(e) = recovery_payload
-        .map_err(|e| ContextError::EventLogFailed(e.to_string()))
-        .and_then(|payload| {
-            deps.event_log.append_context_event_with_payload(
-                &context_id_bytes,
-                scp_event_log::EventType::RecoveryEpochAdvanced,
-                "system:recovery",
-                payload,
-                recovery_ts,
-            )
-        })
-    {
+    // The append is now async (ADR-049 Decision 7), so the former
+    // `.map_err(..).and_then(|payload| ...)` combinator chain (whose closure
+    // cannot `.await`) is unrolled imperatively: encode the payload first, then
+    // await the append. Both the encode failure and the append failure are
+    // non-fatal (recovery must not be blocked by logging issues), warned with
+    // the same message as before.
+    let append_result =
+        match recovery_payload.map_err(|e| ContextError::EventLogFailed(e.to_string())) {
+            Ok(payload) => {
+                deps.event_log
+                    .append_context_event_with_payload(
+                        &context_id_bytes,
+                        scp_event_log::EventType::RecoveryEpochAdvanced,
+                        "system:recovery",
+                        payload,
+                        recovery_ts,
+                    )
+                    .await
+            }
+            Err(e) => Err(e),
+        };
+    if let Err(e) = append_result {
         tracing::warn!(
             context_id = %context_id,
             error = %e,

@@ -547,11 +547,11 @@ async fn fullstack_event_log_merkle_chain() {
 
     // Verify chain integrity via import (import verifies Merkle chain).
     let bob_event_log = scp_core::context::providers::event_log::MerkleEventLogProvider::new();
-    bob_event_log.init_event_log(&ctx_bytes).unwrap();
+    bob_event_log.init_event_log(&ctx_bytes).await.unwrap();
     // Import into a fresh log should fail because it already has an init entry.
     // Instead verify chain by re-importing from scratch.
     let fresh_log = scp_core::context::providers::event_log::MerkleEventLogProvider::new();
-    let import_result = fresh_log.import_event_log_data(&ctx_bytes, &exported);
+    let import_result = fresh_log.import_event_log_data(&ctx_bytes, &exported).await;
     assert!(
         import_result.is_ok(),
         "import should succeed with valid Merkle chain"

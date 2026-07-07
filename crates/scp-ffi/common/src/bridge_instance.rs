@@ -2843,11 +2843,24 @@ mod tests {
     // `ContextCryptoProvider` was deleted in commit 12c.9e of ADR-049.
 
     struct NoOpEventLog;
+    // The async methods carry no `.await`: this test double just returns `Ok`.
+    // `ContextEventLogProvider` is an `#[async_trait]` (ADR-049 Decision 7),
+    // so the signatures must stay `async fn` to satisfy the trait; the
+    // `unused_async` lint is expected and allowed here.
+    #[async_trait::async_trait]
     impl ContextEventLogProvider for NoOpEventLog {
-        fn init_event_log(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
+        #[allow(
+            clippy::unused_async,
+            reason = "async fn required by the ContextEventLogProvider async_trait; body has no await"
+        )]
+        async fn init_event_log(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
             Ok(())
         }
-        fn append_event(
+        #[allow(
+            clippy::unused_async,
+            reason = "async fn required by the ContextEventLogProvider async_trait; body has no await"
+        )]
+        async fn append_event(
             &self,
             _: &[u8; 32],
             _: scp_event_log::EventType,
@@ -2857,7 +2870,11 @@ mod tests {
         ) -> Result<(), ContextCreationError> {
             Ok(())
         }
-        fn destroy_event_log(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
+        #[allow(
+            clippy::unused_async,
+            reason = "async fn required by the ContextEventLogProvider async_trait; body has no await"
+        )]
+        async fn destroy_event_log(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
             Ok(())
         }
     }

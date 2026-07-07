@@ -617,12 +617,14 @@ pub async fn close_context(
     let should_schedule_key_destruction =
         memory_scope == MemoryScope::Ephemeral || memory_scope == MemoryScope::Summary;
 
-    event_log.append_context_event(
-        &context_id_bytes,
-        scp_event_log::EventType::ContextClosing,
-        initiator_did.as_ref(),
-        timestamp_secs,
-    )?;
+    event_log
+        .append_context_event(
+            &context_id_bytes,
+            scp_event_log::EventType::ContextClosing,
+            initiator_did.as_ref(),
+            timestamp_secs,
+        )
+        .await?;
 
     Ok(CloseResult {
         should_generate_summary,
@@ -690,12 +692,14 @@ pub async fn finalize_close(
         let _ = transport.delete_published(&context_id_bytes);
     }
 
-    event_log.append_context_event(
-        &context_id_bytes,
-        scp_event_log::EventType::ContextClosed,
-        scp_event_log::system_actors::SYSTEM_CLOSE_ACTOR,
-        timestamp_secs,
-    )?;
+    event_log
+        .append_context_event(
+            &context_id_bytes,
+            scp_event_log::EventType::ContextClosed,
+            scp_event_log::system_actors::SYSTEM_CLOSE_ACTOR,
+            timestamp_secs,
+        )
+        .await?;
 
     Ok(())
 }
@@ -892,12 +896,15 @@ pub async fn try_ttl_expiry_cleanup(
     // 3. Event log append — skip if already succeeded on a prior attempt to
     //    avoid duplicate ContextExpired entries in the Merkle log.
     if result.completed_steps & STEP_EVENT_LOGGED == 0 {
-        match event_log.append_context_event(
-            &context_id_bytes,
-            scp_event_log::EventType::ContextExpired,
-            scp_event_log::system_actors::SYSTEM_TIMER_ACTOR,
-            expiry_deadline_secs,
-        ) {
+        match event_log
+            .append_context_event(
+                &context_id_bytes,
+                scp_event_log::EventType::ContextExpired,
+                scp_event_log::system_actors::SYSTEM_TIMER_ACTOR,
+                expiry_deadline_secs,
+            )
+            .await
+        {
             Ok(()) => result.set_step(STEP_EVENT_LOGGED),
             Err(e) => {
                 let msg = format!("failed to log ContextExpired event: {e}");
@@ -1367,14 +1374,15 @@ mod tests {
 
     struct NullEventLog;
 
+    #[async_trait::async_trait]
     impl ContextEventLogProvider for NullEventLog {
-        fn init_event_log(
+        async fn init_event_log(
             &self,
             _cid: &[u8; 32],
         ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
             Ok(())
         }
-        fn append_event(
+        async fn append_event(
             &self,
             _cid: &[u8; 32],
             _event: scp_event_log::EventType,
@@ -1384,7 +1392,7 @@ mod tests {
         ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
             Ok(())
         }
-        fn destroy_event_log(
+        async fn destroy_event_log(
             &self,
             _cid: &[u8; 32],
         ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
@@ -1404,14 +1412,15 @@ mod tests {
         appends: std::sync::Mutex<Vec<(scp_event_log::EventType, String)>>,
     }
 
+    #[async_trait::async_trait]
     impl ContextEventLogProvider for CapturingEventLog {
-        fn init_event_log(
+        async fn init_event_log(
             &self,
             _cid: &[u8; 32],
         ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
             Ok(())
         }
-        fn append_event(
+        async fn append_event(
             &self,
             _cid: &[u8; 32],
             event: scp_event_log::EventType,
@@ -1425,7 +1434,7 @@ mod tests {
                 .push((event, actor_did.to_owned()));
             Ok(())
         }
-        fn destroy_event_log(
+        async fn destroy_event_log(
             &self,
             _cid: &[u8; 32],
         ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {

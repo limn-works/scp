@@ -206,7 +206,9 @@ async fn dispatch_actor_inner(
         LifecycleCommand::FlushSnapshot { reply } => {
             handle_flush_snapshot_actor(&*cell, deps, reply).await
         }
-        LifecycleCommand::ShutdownSelf { reply } => handle_shutdown_self_actor(&*cell, deps, reply),
+        LifecycleCommand::ShutdownSelf { reply } => {
+            handle_shutdown_self_actor(&*cell, deps, reply).await
+        }
         LifecycleCommand::ReportBufferLen { reply } => {
             handle_report_buffer_len_actor(&*cell, reply)
         }
@@ -562,11 +564,19 @@ fn handle_flush_snapshot_actor<'d>(
 /// Supervisor-level cleanup (standing contexts, local DIDs, wrapping
 /// keys, task set) is the iterating entry point's responsibility —
 /// each actor only owns its own per-context resources.
+// Sync-prelude + Send-future terminal (ADR-049 Decision 7 Send-discipline).
+// `PerContextState` is `!Sync` (it holds the `dyn FnMut` event-emit sink), so a
+// `&state` held across an `.await` would make this spawned actor future `!Send`.
+// The `&state` (and `&deps`) work runs entirely in a SYNCHRONOUS prelude; the
+// returned future captures ONLY owned `Send` data (the cloned `event_log` `Arc`,
+// the owned `ctx_id_bytes` / `context_id`, and the `reply` sender). The
+// precise-capture `+ use<>` bound excludes the input lifetimes, so the `&state`
+// borrow ends before the returned `async move`.
 fn handle_shutdown_self_actor(
     state: &PerContextState,
     deps: &ActorDeps,
     reply: oneshot::Sender<Result<(), ContextError>>,
-) -> Outcome<()> {
+) -> impl std::future::Future<Output = Outcome<()>> + Send + use<> {
     use crate::context::state::context_id_to_bytes;
 
     let context_id = state.handle.context_id().to_owned();
@@ -586,25 +596,34 @@ fn handle_shutdown_self_actor(
             "failed to destroy MLS group during shutdown — may already be gone"
         );
     }
-    if let Err(e) = deps.event_log.destroy_event_log(&ctx_id_bytes) {
-        tracing::debug!(
-            context_id = %context_id,
-            error = %e,
-            "failed to destroy event log during shutdown — may already be gone"
-        );
-    }
     // Cancel any per-actor background tasks (TTL timer + governance
     // timeout). These hold task handles inside `state` directly;
     // cancelling them here mirrors the legacy `_legacy` body's
     // `task_set.abort_all()` except scoped to this actor's tasks
-    // rather than the supervisor's global set.
+    // rather than the supervisor's global set. All `&state` reads happen HERE,
+    // in the synchronous prelude, before the async tail below.
     state.ttl.timer.cancel();
     state.governance.timeout_task.cancel();
-    let _ = reply.send(Ok(()));
-    // Shutdown mutates external resources (crypto, event log, task
-    // handles) but does NOT mutate `state` itself — `cancel()` takes
-    // `&self`. Mark non-mutated for the actor's dirty tracking.
-    Outcome::ok(())
+
+    // Clone the event-log provider `Arc` so the async tail owns it (no `&deps`
+    // borrow crosses the await). The event-log destroy still runs after the
+    // MLS-group destroy (secrets zeroize before structure); the task cancels
+    // touch no secret material.
+    let event_log = std::sync::Arc::clone(&deps.event_log);
+    async move {
+        if let Err(e) = event_log.destroy_event_log(&ctx_id_bytes).await {
+            tracing::debug!(
+                context_id = %context_id,
+                error = %e,
+                "failed to destroy event log during shutdown — may already be gone"
+            );
+        }
+        let _ = reply.send(Ok(()));
+        // Shutdown mutates external resources (crypto, event log, task
+        // handles) but does NOT mutate `state` itself — `cancel()` takes
+        // `&self`. Mark non-mutated for the actor's dirty tracking.
+        Outcome::ok(())
+    }
 }
 
 /// Handle [`LifecycleCommand::ReportBufferLen`] (actor-shape).

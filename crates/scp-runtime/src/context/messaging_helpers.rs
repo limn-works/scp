@@ -736,8 +736,8 @@ fn ingest_pseudonym_announcement(
 /// armed (retained as the RED-CS3b engine signal for callers that observe it).
 #[must_use]
 #[allow(clippy::too_many_arguments)]
-pub fn run_buffered_post_delivery(
-    view: &mut ClassCMut,
+pub async fn run_buffered_post_delivery(
+    view: &mut ClassCMut<'_>,
     obligation: &mut Option<crate::context::actor::class_s::ClassSCommitToken>,
     context_id: &str,
     context_id_bytes: &[u8; 32],
@@ -769,12 +769,14 @@ pub fn run_buffered_post_delivery(
     // Durable Merkle append ONLY for sender-authenticated events. Application
     // messages (`None`) skip the append but still run governance below.
     if let Some(event_name) = event_name
-        && let Err(e) = event_log.append_context_event(
-            context_id_bytes,
-            event_name,
-            sender_did,
-            event_timestamp_secs,
-        )
+        && let Err(e) = event_log
+            .append_context_event(
+                context_id_bytes,
+                event_name,
+                sender_did,
+                event_timestamp_secs,
+            )
+            .await
     {
         tracing::warn!(
             context_id,
@@ -827,6 +829,7 @@ pub fn run_buffered_post_delivery(
             },
             obligation,
         )
+        .await
     };
 
     *view.checkpoint_events_since_mut() += 1;
@@ -1372,7 +1375,7 @@ pub async fn send_message(
 }
 
 // ---------------------------------------------------------------------------
-// 8. deliver_incoming (top-level, actor-shape)
+// 8. deliver_incoming (top-level, actor-shape).await
 // ---------------------------------------------------------------------------
 
 /// Classified result of delivering one incoming envelope (§9.9.2).
@@ -1424,8 +1427,8 @@ pub enum DeliverOutcome {
 /// undischarged obligation a Drop-guard PANIC in debug/CI rather than a silently
 /// dropped flag.
 #[allow(clippy::too_many_lines)]
-pub fn deliver_incoming(
-    view: &mut ClassCMut,
+pub async fn deliver_incoming(
+    view: &mut ClassCMut<'_>,
     deps: &ActorDeps,
     context_id: &str,
     encrypted_blob: &[u8],
@@ -1529,7 +1532,8 @@ pub fn deliver_incoming(
     // Anti-replay + reorder buffer (§9.8.2, §9.8.5).
     let now_ms = deps.clock.now_millis();
     let sequence_check =
-        validate_and_drain_timeouts(view, deps, context_id, &inner, now_ms, downward_auth_sink)?;
+        validate_and_drain_timeouts(view, deps, context_id, &inner, now_ms, downward_auth_sink)
+            .await?;
 
     let is_local_sender = sender_did == local_member_did;
 
@@ -1545,7 +1549,8 @@ pub fn deliver_incoming(
                 &plaintext,
                 is_local_sender,
                 downward_auth_sink,
-            )?;
+            )
+            .await?;
             if consumed_as_announcement {
                 Ok(DeliverOutcome::Handled)
             } else {
@@ -1562,7 +1567,8 @@ pub fn deliver_incoming(
                 &plaintext,
                 now_ms,
                 downward_auth_sink,
-            );
+            )
+            .await;
             Ok(DeliverOutcome::Handled)
         }
     }
@@ -2231,7 +2237,8 @@ pub async fn finalize_send(
                     event_tx: deps.event_tx.as_ref(),
                 },
                 &mut downward_auth_sink,
-            );
+            )
+            .await;
         }
 
         // Participation record (#1530).
@@ -2895,8 +2902,8 @@ pub fn decrypt_and_dispatch(
 /// runs consequence enforcement that performs a downward-authorization mutation (a
 /// capability suspension or an `AssignRole` demotion), so the cell-holding caller
 /// commits it fail-closed.
-pub fn validate_and_drain_timeouts(
-    view: &mut ClassCMut,
+pub async fn validate_and_drain_timeouts(
+    view: &mut ClassCMut<'_>,
     deps: &ActorDeps,
     context_id: &str,
     inner: &scp_protocol::envelope::inner::InnerEnvelope,
@@ -2972,7 +2979,8 @@ pub fn validate_and_drain_timeouts(
                 &*deps.clock,
                 &*deps.event_log,
                 deps.event_tx.as_ref(),
-            );
+            )
+            .await;
         }
     }
 
@@ -2992,8 +3000,8 @@ pub fn validate_and_drain_timeouts(
 /// capability suspension or an `AssignRole` demotion), so the cell-holding caller
 /// commits it fail-closed.
 #[allow(clippy::too_many_arguments)]
-pub fn buffer_ahead_message(
-    view: &mut ClassCMut,
+pub async fn buffer_ahead_message(
+    view: &mut ClassCMut<'_>,
     deps: &ActorDeps,
     context_id: &str,
     inner: &scp_protocol::envelope::inner::InnerEnvelope,
@@ -3070,7 +3078,8 @@ pub fn buffer_ahead_message(
                 &*deps.clock,
                 &*deps.event_log,
                 deps.event_tx.as_ref(),
-            );
+            )
+            .await;
         }
     }
 }
@@ -3092,8 +3101,8 @@ pub fn buffer_ahead_message(
 /// fail-closed (keep-direction).
 #[allow(clippy::too_many_lines)]
 #[allow(clippy::too_many_arguments)]
-pub fn deliver_message_and_drain_buffered(
-    view: &mut ClassCMut,
+pub async fn deliver_message_and_drain_buffered(
+    view: &mut ClassCMut<'_>,
     deps: &ActorDeps,
     context_id: &str,
     context_id_bytes: &[u8; 32],
@@ -3205,7 +3214,8 @@ pub fn deliver_message_and_drain_buffered(
                     &*deps.clock,
                     &*deps.event_log,
                     deps.event_tx.as_ref(),
-                );
+                )
+                .await;
             }
 
             let now = deps.clock.now_secs();
@@ -3249,7 +3259,8 @@ pub fn deliver_message_and_drain_buffered(
                         event_tx: deps.event_tx.as_ref(),
                     },
                     downward_auth_sink,
-                );
+                )
+                .await;
             }
             *view.checkpoint_events_since_mut() += 1;
 
@@ -3314,7 +3325,8 @@ pub fn deliver_message_and_drain_buffered(
             &*deps.clock,
             &*deps.event_log,
             deps.event_tx.as_ref(),
-        );
+        )
+        .await;
     }
 
     // §9.9.3: received application messages are NOT appended to the durable
@@ -3366,7 +3378,8 @@ pub fn deliver_message_and_drain_buffered(
                 event_tx: deps.event_tx.as_ref(),
             },
             downward_auth_sink,
-        );
+        )
+        .await;
     }
 
     *view.checkpoint_events_since_mut() += 1;
@@ -3852,15 +3865,16 @@ mod pseudonym_routing_tests {
         saw_message_sent: AtomicBool,
     }
 
+    #[async_trait::async_trait]
     impl crate::context::builder::ContextEventLogProvider for RecordingEventLog {
-        fn init_event_log(
+        async fn init_event_log(
             &self,
             _id: &[u8; 32],
         ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
             Ok(())
         }
 
-        fn append_event(
+        async fn append_event(
             &self,
             _id: &[u8; 32],
             event: scp_event_log::EventType,
@@ -3881,7 +3895,7 @@ mod pseudonym_routing_tests {
             Ok(())
         }
 
-        fn destroy_event_log(
+        async fn destroy_event_log(
             &self,
             _id: &[u8; 32],
         ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
@@ -3889,8 +3903,8 @@ mod pseudonym_routing_tests {
         }
     }
 
-    #[test]
-    fn buffered_application_message_runs_velocity_consequence_and_checkpoint() {
+    #[tokio::test]
+    async fn buffered_application_message_runs_velocity_consequence_and_checkpoint() {
         use crate::context::messaging_helpers::{
             deliver_plaintext_or_announcement, run_buffered_post_delivery,
         };
@@ -3953,7 +3967,8 @@ mod pseudonym_routing_tests {
             &clock,
             &event_log,
             None,
-        );
+        )
+        .await;
         // No GROW occurs on this velocity-trigger path, so no obligation is armed.
         assert!(
             obligation.is_none(),
@@ -4019,7 +4034,7 @@ mod pseudonym_routing_tests {
     // -----------------------------------------------------------------------
     // STRONGER regression: drive a buffered APPLICATION message END-TO-END
     // through a REAL buffered-drain call site so a re-introduced
-    // `if let Some(event_name) { run_buffered_post_delivery(...) }` gate is
+    // `if let Some(event_name) { run_buffered_post_delivery(...).await }` gate is
     // caught.
     //
     // The helper-contract test above calls `run_buffered_post_delivery`
@@ -4057,15 +4072,16 @@ mod pseudonym_routing_tests {
         any_append: std::sync::Arc<std::sync::atomic::AtomicBool>,
     }
 
+    #[async_trait::async_trait]
     impl crate::context::builder::ContextEventLogProvider for DrainRecordingEventLog {
-        fn init_event_log(
+        async fn init_event_log(
             &self,
             _id: &[u8; 32],
         ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
             Ok(())
         }
 
-        fn append_event(
+        async fn append_event(
             &self,
             _id: &[u8; 32],
             event: scp_event_log::EventType,
@@ -4089,7 +4105,7 @@ mod pseudonym_routing_tests {
             Ok(())
         }
 
-        fn destroy_event_log(
+        async fn destroy_event_log(
             &self,
             _id: &[u8; 32],
         ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
@@ -4247,6 +4263,7 @@ mod pseudonym_routing_tests {
             now_ms,
             &mut downward_auth_applied,
         )
+        .await
         .expect("validate_and_drain_timeouts");
         // The `SuspendAccess` action is a downward-auth GROW, so the drain
         // populated the sink; discharge it (commit performs the fail-closed persist)
@@ -4390,6 +4407,7 @@ mod pseudonym_routing_tests {
             false,
             &mut downward_auth_applied,
         )
+        .await
         .expect("deliver_message_and_drain_buffered");
         // No consequence rules are installed here, so the sink stays `None`; the
         // `take()` is a no-op that satisfies the token's Drop guard either way.

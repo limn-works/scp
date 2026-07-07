@@ -109,10 +109,10 @@ fn active_attestation(id: &str, subject: &str) -> Attestation {
 
 /// An `Active` event-log-backed Supervisor with a single context whose log
 /// carries a representative spread of subject-bearing and target-bearing leaves.
-fn build_supervisor_with_seeded_log() -> Arc<Supervisor> {
+async fn build_supervisor_with_seeded_log() -> Arc<Supervisor> {
     let provider = MerkleEventLogProvider::new();
     let ctx_bytes = scp_runtime::context::state::context_id_to_bytes(CONTEXT_ID);
-    provider.init_event_log(&ctx_bytes).expect("init log");
+    provider.init_event_log(&ctx_bytes).await.expect("init log");
 
     // Walk the log in timestamp order. Bob joins at t=100, leaves at t=400 →
     // a 300-second participation interval. Bob is assigned a role (role
@@ -156,6 +156,7 @@ fn build_supervisor_with_seeded_log() -> Arc<Supervisor> {
     for (event_type, actor, payload, ts) in appends {
         provider
             .append_event(&ctx_bytes, *event_type, actor, payload.clone(), *ts)
+            .await
             .expect("append event");
     }
 
@@ -175,9 +176,9 @@ fn build_supervisor_with_seeded_log() -> Arc<Supervisor> {
     )
 }
 
-#[test]
-fn participation_record_derives_all_facts_from_full_log() {
-    let supervisor = build_supervisor_with_seeded_log();
+#[tokio::test]
+async fn participation_record_derives_all_facts_from_full_log() {
+    let supervisor = build_supervisor_with_seeded_log().await;
 
     // Two accessible attestations for Bob (Active) + one for someone else +
     // one Revoked for Bob, to prove the count filters to subject + Active.
@@ -247,9 +248,9 @@ fn participation_record_derives_all_facts_from_full_log() {
     assert_eq!(facts.event_log_root, record.event_log_root);
 }
 
-#[test]
-fn participation_record_empty_attestations_yields_zero_count() {
-    let supervisor = build_supervisor_with_seeded_log();
+#[tokio::test]
+async fn participation_record_empty_attestations_yields_zero_count() {
+    let supervisor = build_supervisor_with_seeded_log().await;
     let record = supervisor
         .participation_record(CONTEXT_ID, SUBJECT, &[])
         .expect("participation_record computes");
@@ -300,15 +301,15 @@ fn participation_record_empty_log_errors() {
 /// contribute to context A's participation record: facts are scoped to the
 /// queried context's own log, so cross-context activity cannot inflate (or
 /// deflate) a subject's standing in an unrelated context.
-#[test]
-fn participation_record_is_context_isolated() {
+#[tokio::test]
+async fn participation_record_is_context_isolated() {
     const CONTEXT_B: &str = "ctx-participation-2c1-other";
 
     let provider = MerkleEventLogProvider::new();
     let a_bytes = scp_runtime::context::state::context_id_to_bytes(CONTEXT_ID);
     let b_bytes = scp_runtime::context::state::context_id_to_bytes(CONTEXT_B);
-    provider.init_event_log(&a_bytes).expect("init A");
-    provider.init_event_log(&b_bytes).expect("init B");
+    provider.init_event_log(&a_bytes).await.expect("init A");
+    provider.init_event_log(&b_bytes).await.expect("init B");
 
     // Context A: exactly ONE role assignment for the subject; nothing else.
     provider
@@ -319,6 +320,7 @@ fn participation_record_is_context_isolated() {
             role_payload(SUBJECT),
             100,
         )
+        .await
         .expect("append A role");
 
     // Context B: the SAME subject is far more active — three role assignments and
@@ -332,6 +334,7 @@ fn participation_record_is_context_isolated() {
                 role_payload(SUBJECT),
                 ts,
             )
+            .await
             .expect("append B role");
     }
     provider
@@ -342,6 +345,7 @@ fn participation_record_is_context_isolated() {
             gov_payload(SUBJECT),
             400,
         )
+        .await
         .expect("append B gov");
 
     let supervisor = Supervisor::with_providers(
@@ -389,15 +393,16 @@ fn participation_record_is_context_isolated() {
 /// readable.
 struct EventsButNoRootProvider;
 
+#[async_trait::async_trait]
 impl ContextEventLogProvider for EventsButNoRootProvider {
-    fn init_event_log(
+    async fn init_event_log(
         &self,
         _context_id: &[u8; 32],
     ) -> Result<(), scp_runtime::context::builder::ContextCreationError> {
         Ok(())
     }
 
-    fn append_event(
+    async fn append_event(
         &self,
         _context_id: &[u8; 32],
         _event_type: EventType,
@@ -408,7 +413,7 @@ impl ContextEventLogProvider for EventsButNoRootProvider {
         Ok(())
     }
 
-    fn destroy_event_log(
+    async fn destroy_event_log(
         &self,
         _context_id: &[u8; 32],
     ) -> Result<(), scp_runtime::context::builder::ContextCreationError> {
