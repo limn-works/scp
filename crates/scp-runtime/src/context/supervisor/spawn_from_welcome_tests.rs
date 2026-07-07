@@ -3327,12 +3327,20 @@ async fn spawn_from_welcome_application_data_round_trips_joiner_to_creator() {
         .alice_crypto
         .open(&j.ctx_bytes, &j.ctx_id, &sealed)
         .expect("alice opens bob's application ciphertext (B→A application round-trip)");
-    let env = match opened {
-        OpenResult::Application(env) => *env,
-        other => {
-            panic!("expected OpenResult::Application from a sealed app message, got {other:?}")
-        }
+    // ADR-049 §10 bans the panic family across the whole `context/` tree; the
+    // panic-ban scanner reads this `#[cfg(test)]`-gated file standalone (the gate
+    // sits on the parent `mod` in supervisor/mod.rs), so a bare `panic!` here is
+    // flagged. Assert the variant instead — a test assertion the gate accepts —
+    // then destructure the now-proven `Application` payload.
+    assert!(
+        matches!(opened, OpenResult::Application(_)),
+        "expected OpenResult::Application from a sealed app message, got {opened:?}",
+    );
+    let OpenResult::Application(env) = opened else {
+        // Unreachable: the assertion above already failed the test otherwise.
+        return;
     };
+    let env = *env;
     assert_eq!(
         env.sender_did, BOB_DID,
         "the opened application message is attributed to the joiner (bob)"
