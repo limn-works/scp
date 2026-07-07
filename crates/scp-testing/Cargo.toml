@@ -16,6 +16,7 @@ sync = ["scp-platform/sync"]
 combined = ["scp-transport/combined"]
 
 [dependencies]
+async-trait = { workspace = true }
 scp-core = { path = "../scp-core", features = ["allow_unencrypted_storage", "testing"] }
 scp-identity = { path = "../scp-identity", features = ["testing"] }
 scp-platform = { path = "../scp-platform", features = ["testing"] }

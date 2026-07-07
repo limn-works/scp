@@ -2,8 +2,9 @@
 //!
 //! The canonical production implementation is
 //! [`ProtocolRepositoryContextBridge`],
-//! which wraps `Arc<ProtocolRepository<S>>` and implements the synchronous
-//! [`ContextPersistence`] trait by bridging to the async `ProtocolRepository` methods.
+//! which wraps `Arc<ProtocolRepository<S>>` and implements the async
+//! [`ContextPersistence`] trait by `.await`-ing the async `ProtocolRepository`
+//! methods directly (ADR-049 Decision 7).
 //!
 //! This module re-exports the canonical implementation for convenience and
 //! provides an additional in-memory implementation suitable for integration
@@ -14,9 +15,11 @@
 use std::collections::HashMap;
 #[allow(
     clippy::disallowed_types,
-    reason = "sync `ContextPersistence` trait upstream; `tokio::sync::Mutex` is not usable at a sync trait boundary. Deleted in commits 4-12 of ADR-049 (actor refactor) per plan §Commit ladder; see `~/.claude/plans/generic-moseying-lightning.md`."
+    reason = "`ContextPersistence` is async (ADR-049 Decision 7), but this in-memory map's critical section is a synchronous lock→mutate→drop with NO await held across the guard, so `std::sync::Mutex` is correct — a `tokio::sync::Mutex` would add a needless async lock where none is required."
 )]
 use std::sync::Mutex;
+
+use async_trait::async_trait;
 
 use crate::context::persistence::ContextPersistence;
 use crate::context::state::ContextSnapshot;
@@ -50,14 +53,14 @@ pub use crate::store::context::ProtocolRepositoryContextBridge;
 pub struct InMemoryPersistence {
     #[allow(
         clippy::disallowed_types,
-        reason = "sync `ContextPersistence` trait upstream; `tokio::sync::Mutex` is not usable at a sync trait boundary. Deleted in commits 4-12 of ADR-049 (actor refactor) per plan §Commit ladder; see `~/.claude/plans/generic-moseying-lightning.md`."
+        reason = "`ContextPersistence` is async (ADR-049 Decision 7), but this map's critical section is a synchronous lock→mutate→drop with NO await held across the guard, so `std::sync::Mutex` is correct — a `tokio::sync::Mutex` would add a needless async lock where none is required."
     )]
     contexts: Mutex<HashMap<String, ContextSnapshot>>,
 }
 
 #[allow(
     clippy::disallowed_types,
-    reason = "sync `ContextPersistence` trait upstream; `tokio::sync::Mutex` is not usable at a sync trait boundary. Deleted in commits 4-12 of ADR-049 (actor refactor) per plan §Commit ladder; see `~/.claude/plans/generic-moseying-lightning.md`."
+    reason = "`ContextPersistence` is async (ADR-049 Decision 7), but this map's critical section is a synchronous lock→mutate→drop with NO await held across the guard, so `std::sync::Mutex` is correct — a `tokio::sync::Mutex` would add a needless async lock where none is required."
 )]
 impl InMemoryPersistence {
     /// Creates a new empty in-memory persistence provider.
@@ -75,8 +78,9 @@ impl Default for InMemoryPersistence {
     }
 }
 
+#[async_trait]
 impl ContextPersistence for InMemoryPersistence {
-    fn persist_context(
+    async fn persist_context(
         &self,
         context_id: &str,
         snapshot: &ContextSnapshot,
@@ -88,7 +92,7 @@ impl ContextPersistence for InMemoryPersistence {
         Ok(())
     }
 
-    fn load_context(
+    async fn load_context(
         &self,
         context_id: &str,
     ) -> Result<Option<ContextSnapshot>, Box<dyn std::error::Error + Send + Sync>> {
@@ -100,7 +104,7 @@ impl ContextPersistence for InMemoryPersistence {
             .cloned())
     }
 
-    fn delete_context(
+    async fn delete_context(
         &self,
         context_id: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -111,7 +115,7 @@ impl ContextPersistence for InMemoryPersistence {
         Ok(())
     }
 
-    fn list_persisted_contexts(
+    async fn list_persisted_contexts(
         &self,
     ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
         Ok(self
@@ -206,67 +210,77 @@ mod tests {
         }
     }
 
-    #[test]
-    fn persist_and_load_context_roundtrip() {
+    #[tokio::test]
+    async fn persist_and_load_context_roundtrip() {
         let persistence = InMemoryPersistence::new();
         let snapshot = test_snapshot("ctx-1");
 
-        persistence.persist_context("ctx-1", &snapshot).unwrap();
+        persistence
+            .persist_context("ctx-1", &snapshot)
+            .await
+            .unwrap();
 
-        let loaded = persistence.load_context("ctx-1").unwrap();
+        let loaded = persistence.load_context("ctx-1").await.unwrap();
         assert!(loaded.is_some());
         let loaded = loaded.unwrap();
         assert_eq!(loaded.context_id, "ctx-1");
         assert_eq!(loaded.state, ContextState::Active);
     }
 
-    #[test]
-    fn load_missing_context_returns_none() {
+    #[tokio::test]
+    async fn load_missing_context_returns_none() {
         let persistence = InMemoryPersistence::new();
-        let loaded = persistence.load_context("nonexistent").unwrap();
+        let loaded = persistence.load_context("nonexistent").await.unwrap();
         assert!(loaded.is_none());
     }
 
-    #[test]
-    fn delete_context_removes_both_stores() {
+    #[tokio::test]
+    async fn delete_context_removes_both_stores() {
         let persistence = InMemoryPersistence::new();
         let snapshot = test_snapshot("ctx-del");
 
-        persistence.persist_context("ctx-del", &snapshot).unwrap();
+        persistence
+            .persist_context("ctx-del", &snapshot)
+            .await
+            .unwrap();
 
-        persistence.delete_context("ctx-del").unwrap();
+        persistence.delete_context("ctx-del").await.unwrap();
 
-        assert!(persistence.load_context("ctx-del").unwrap().is_none());
+        assert!(persistence.load_context("ctx-del").await.unwrap().is_none());
     }
 
-    #[test]
-    fn list_persisted_contexts() {
+    #[tokio::test]
+    async fn list_persisted_contexts() {
         let persistence = InMemoryPersistence::new();
 
         persistence
             .persist_context("ctx-a", &test_snapshot("ctx-a"))
+            .await
             .unwrap();
         persistence
             .persist_context("ctx-b", &test_snapshot("ctx-b"))
+            .await
             .unwrap();
 
-        let mut list = persistence.list_persisted_contexts().unwrap();
+        let mut list = persistence.list_persisted_contexts().await.unwrap();
         list.sort();
         assert_eq!(list, vec!["ctx-a", "ctx-b"]);
     }
 
-    #[test]
-    fn persist_preserves_creation_timestamp_secs() {
+    #[tokio::test]
+    async fn persist_preserves_creation_timestamp_secs() {
         let persistence = InMemoryPersistence::new();
         let mut snapshot = test_snapshot("ctx-creation-ts");
         snapshot.creation_timestamp_secs = 1_711_000_555;
 
         persistence
             .persist_context("ctx-creation-ts", &snapshot)
+            .await
             .unwrap();
 
         let loaded = persistence
             .load_context("ctx-creation-ts")
+            .await
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -276,19 +290,19 @@ mod tests {
         );
     }
 
-    #[test]
-    fn persist_overwrites_existing() {
+    #[tokio::test]
+    async fn persist_overwrites_existing() {
         let persistence = InMemoryPersistence::new();
 
         let mut snap1 = test_snapshot("ctx-ow");
         snap1.threshold_value = 1;
-        persistence.persist_context("ctx-ow", &snap1).unwrap();
+        persistence.persist_context("ctx-ow", &snap1).await.unwrap();
 
         let mut snap2 = test_snapshot("ctx-ow");
         snap2.threshold_value = 42;
-        persistence.persist_context("ctx-ow", &snap2).unwrap();
+        persistence.persist_context("ctx-ow", &snap2).await.unwrap();
 
-        let loaded = persistence.load_context("ctx-ow").unwrap().unwrap();
+        let loaded = persistence.load_context("ctx-ow").await.unwrap().unwrap();
         assert_eq!(loaded.threshold_value, 42);
     }
 }

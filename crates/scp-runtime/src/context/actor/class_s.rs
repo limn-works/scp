@@ -293,7 +293,10 @@ use super::state::{
 };
 use crate::context::ContextHandle;
 use crate::context::governance::timeout::{DeadlockDetectionState, GovernanceTimeoutTask};
-use crate::context::messaging_helpers::{persist_state_best_effort, persist_state_fail_closed};
+use crate::context::messaging_helpers::{
+    build_snapshot_for_persist, persist_snapshot_fail_closed, persist_state_best_effort,
+    persist_state_fail_closed,
+};
 use crate::context::state::{
     AccessControlState, CommitFaultMarker, EpochState, GovernanceClassS, GovernanceState,
     MigrationState, PendingCeilingModification, PendingCommit, PendingEconomicPolicyChange,
@@ -2776,14 +2779,16 @@ impl ClassSCell {
     ///
     /// Returns `f`'s error, or [`ContextError::PersistenceFailed`].
     ///
-    pub(crate) fn commit_class_s_keep<T>(
+    pub(crate) async fn commit_class_s_keep<T>(
         &mut self,
         deps: &ActorDeps,
         context_id: &str,
         f: impl FnOnce(ClassSMut) -> Result<T, ContextError>,
     ) -> Result<T, ContextError> {
         let value = f(ClassSMut::new(&mut self.state))?;
-        persist_state_fail_closed(&self.state, deps, context_id).map(|()| value)
+        persist_state_fail_closed(&self.state, deps, context_id)
+            .await
+            .map(|()| value)
     }
 
     /// Pure-Class-S rollback on persist failure (snapshot covers ONLY the
@@ -2834,7 +2839,7 @@ impl ClassSCell {
     /// Returns `f`'s error, or [`ContextError::PersistenceFailed`] (after
     /// restoring the snapshot).
     ///
-    pub(crate) fn commit_class_s_restore<T>(
+    pub(crate) async fn commit_class_s_restore<T>(
         &mut self,
         deps: &ActorDeps,
         context_id: &str,
@@ -2843,7 +2848,7 @@ impl ClassSCell {
         let class_s_snap = self.state.class_s.snapshot();
         let gov_snap = self.state.governance.class_s.snapshot();
         let value = f(ClassSMut::new(&mut self.state))?;
-        match persist_state_fail_closed(&self.state, deps, context_id) {
+        match persist_state_fail_closed(&self.state, deps, context_id).await {
             Ok(()) => Ok(value),
             Err(persist_err) => {
                 self.restore_class_s(class_s_snap, gov_snap, deps);
@@ -2915,7 +2920,7 @@ impl ClassSCell {
         let class_s_snap = self.state.class_s.snapshot();
         let gov_snap = self.state.governance.class_s.snapshot();
         let (value, external) = f(ClassSMut::new(&mut self.state))?;
-        match persist_state_fail_closed(&self.state, deps, context_id) {
+        match persist_state_fail_closed(&self.state, deps, context_id).await {
             Ok(()) => Ok(value),
             Err(persist_err) => {
                 self.restore_class_s(class_s_snap, gov_snap, deps);
@@ -2998,7 +3003,7 @@ impl ClassSCell {
         // No Class-S snapshot: keep-direction leaves the Class-S mutation in
         // place on persist failure, so there is nothing to restore.
         let (value, external) = f(ClassSMut::new(&mut self.state))?;
-        match persist_state_fail_closed(&self.state, deps, context_id) {
+        match persist_state_fail_closed(&self.state, deps, context_id).await {
             Ok(()) => Ok(value),
             Err(persist_err) => {
                 on_persist_failure(external, ClassCMut::new(&mut self.state), deps).await;
@@ -3085,13 +3090,15 @@ impl ClassSCell {
                 durability_diverged: false,
                 err,
             })?;
-        persist_state_fail_closed(&self.state, deps, context_id).map_err(|err| {
-            AppendOutcomeError {
-                // `f`'s mutation is in memory but did not durably land.
-                durability_diverged: true,
-                err,
-            }
-        })?;
+        persist_state_fail_closed(&self.state, deps, context_id)
+            .await
+            .map_err(|err| {
+                AppendOutcomeError {
+                    // `f`'s mutation is in memory but did not durably land.
+                    durability_diverged: true,
+                    err,
+                }
+            })?;
         match after(&append_input, &self.state, deps).await {
             // `after` appended to an external sink (e.g. the event log); the
             // Class-S mutation is already durable from the persist above and
@@ -3099,7 +3106,7 @@ impl ClassSCell {
             Ok(()) => Ok(value),
             Err(after_err) => {
                 self.restore_class_s(class_s_snap, gov_snap, deps);
-                match persist_state_fail_closed(&self.state, deps, context_id) {
+                match persist_state_fail_closed(&self.state, deps, context_id).await {
                     // Rollback made durable: in-memory matches the pre-`f` value.
                     Ok(()) => Err(AppendOutcomeError {
                         durability_diverged: false,
@@ -3125,14 +3132,14 @@ impl ClassSCell {
     /// The [`ClassCMut`] view exposes no Class-S mutator, so a best-effort `f`
     /// cannot stage a Class-S transition.
     ///
-    pub(crate) fn commit_class_c_best_effort(
+    pub(crate) async fn commit_class_c_best_effort(
         &mut self,
         deps: &ActorDeps,
         context_id: &str,
         f: impl FnOnce(ClassCMut),
     ) {
         f(ClassCMut::new(&mut self.state));
-        persist_state_best_effort(&self.state, deps, context_id);
+        persist_state_best_effort(&self.state, deps, context_id).await;
     }
 
     /// NON-PERSISTING Class-C view (ADR-049 §9): construct a [`ClassCMut`]
@@ -3230,7 +3237,7 @@ impl ClassSCell {
     /// Returns `f`'s error, or [`ContextError::PersistenceFailed`] (after running
     /// `restore_on_failure`, with the KEPT field retained).
     ///
-    pub(crate) fn commit_class_s_keep_restore_split<T, S>(
+    pub(crate) async fn commit_class_s_keep_restore_split<T, S>(
         &mut self,
         deps: &ActorDeps,
         context_id: &str,
@@ -3242,7 +3249,7 @@ impl ClassSCell {
         // deliberately NOT snapshotted — keep-direction has nothing to restore).
         let restore_snap = snapshot_restore_field(&self.state.class_s);
         let value = f(ClassSMut::new(&mut self.state))?;
-        match persist_state_fail_closed(&self.state, deps, context_id) {
+        match persist_state_fail_closed(&self.state, deps, context_id).await {
             Ok(()) => Ok(value),
             Err(persist_err) => {
                 // Roll back JUST the restore-targeted field; the kept field stays
@@ -3499,12 +3506,27 @@ impl ClassSCommitToken {
     ///
     /// Returns [`ContextError::PersistenceFailed`] when the durable write fails
     /// (the in-memory Class-S mutation is retained — keep-direction).
-    pub(crate) fn commit(
+    ///
+    /// # Not `async fn` — `Send` discipline (ADR-049 Decision 7)
+    ///
+    /// This is a SYNC fn that returns a future, NOT an `async fn`. The
+    /// `&PerContextState` is consumed in the synchronous prelude
+    /// ([`build_snapshot_for_persist`]) and is NOT captured by the returned
+    /// future — which holds only the owned snapshot plus `deps` / `context_id`.
+    /// An `async fn` would keep the `&PerContextState` parameter in the future's
+    /// captured state across the `.await`; `PerContextState` is `!Sync` (it
+    /// holds a `dyn FnMut` sink), so that would make the actor's `run()` future
+    /// `!Send` and fail `tokio::spawn`. `ClassSCell` intentionally has no
+    /// `DerefMut`, so the `&mut`-capture escape hatch the combinators use is not
+    /// available here — hence the sync-prelude shape. `use<'d, 'c>` precisely
+    /// captures only the `deps` / `context_id` lifetimes (edition 2024), not the
+    /// `state` borrow.
+    pub(crate) fn commit<'d, 'c>(
         mut self,
         state: &PerContextState,
-        deps: &ActorDeps,
-        context_id: &str,
-    ) -> Result<(), ContextError> {
+        deps: &'d ActorDeps,
+        context_id: &'c str,
+    ) -> impl std::future::Future<Output = Result<(), ContextError>> + Send + use<'d, 'c> {
         debug_assert_eq!(
             self.context_id, context_id,
             "ClassSCommitToken committed against the wrong context",
@@ -3513,7 +3535,11 @@ impl ClassSCommitToken {
         // counts as committed (keep-direction: the consume stays, the error
         // propagates to the caller's reversal).
         self.consumed = true;
-        persist_state_fail_closed(state, deps, context_id)
+        // Build the owned snapshot in the SYNC prelude so the `&PerContextState`
+        // borrow is dropped before the returned future — the future then captures
+        // only the owned snapshot + `deps`/`context_id`, keeping it `Send`.
+        let snapshot = build_snapshot_for_persist(state, deps, context_id);
+        async move { persist_snapshot_fail_closed(&snapshot, deps, context_id).await }
     }
 
     /// Discharge the deferred obligation, running ONE final (possibly fallible)
@@ -3564,7 +3590,7 @@ impl ClassSCommitToken {
     /// Returns `f`'s error (after the keep-direction persist still ran), or
     /// [`ContextError::PersistenceFailed`] when the durable write fails (the
     /// in-memory mutation `f` made is retained — keep-direction).
-    pub(crate) fn discharge_with<T>(
+    pub(crate) async fn discharge_with<T>(
         mut self,
         cell: &mut ClassSCell,
         deps: &ActorDeps,
@@ -3582,7 +3608,11 @@ impl ClassSCommitToken {
         // durable; un-doing it is the unsafe direction).
         let f_result = f(ClassSMut::new(&mut cell.state));
         self.consumed = true;
-        let persist_result = persist_state_fail_closed(&cell.state, deps, context_id);
+        // Build the owned snapshot before the persist `.await` so the
+        // `&cell.state` borrow is dropped off the await point — keeps the actor
+        // future `Send` (`PerContextState` is `!Sync`; ADR-049 Decision 7).
+        let snapshot = build_snapshot_for_persist(&cell.state, deps, context_id);
+        let persist_result = persist_snapshot_fail_closed(&snapshot, deps, context_id).await;
         match (f_result, persist_result) {
             // `f` failed: the persist still ran (keep); surface `f`'s error.
             (Err(f_err), _) => Err(f_err),
@@ -5163,15 +5193,16 @@ impl ClassSCell
 
     macro_rules! impl_persistence {
         ($ty:ty, $persist_result:expr) => {
+            #[async_trait::async_trait]
             impl ContextPersistence for $ty {
-                fn persist_context(
+                async fn persist_context(
                     &self,
                     _: &str,
                     _: &crate::context::state::ContextSnapshot,
                 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     $persist_result
                 }
-                fn load_context(
+                async fn load_context(
                     &self,
                     _: &str,
                 ) -> Result<
@@ -5180,13 +5211,13 @@ impl ClassSCell
                 > {
                     Ok(None)
                 }
-                fn delete_context(
+                async fn delete_context(
                     &self,
                     _: &str,
                 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     Ok(())
                 }
-                fn list_persisted_contexts(
+                async fn list_persisted_contexts(
                     &self,
                 ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
                     Ok(Vec::new())
@@ -5198,8 +5229,9 @@ impl ClassSCell
     impl_persistence!(OkPersistence, Ok(()));
     impl_persistence!(FailPersistence, Err("induced persist failure".into()));
 
+    #[async_trait::async_trait]
     impl ContextPersistence for SpyPersistence {
-        fn persist_context(
+        async fn persist_context(
             &self,
             _: &str,
             _: &crate::context::state::ContextSnapshot,
@@ -5207,7 +5239,7 @@ impl ClassSCell
             self.persist_calls.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
-        fn load_context(
+        async fn load_context(
             &self,
             _: &str,
         ) -> Result<
@@ -5216,10 +5248,13 @@ impl ClassSCell
         > {
             Ok(None)
         }
-        fn delete_context(&self, _: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        async fn delete_context(
+            &self,
+            _: &str,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Ok(())
         }
-        fn list_persisted_contexts(
+        async fn list_persisted_contexts(
             &self,
         ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
             Ok(Vec::new())
@@ -5233,8 +5268,9 @@ impl ClassSCell
     struct SucceedThenFail {
         calls: Arc<AtomicUsize>,
     }
+    #[async_trait::async_trait]
     impl ContextPersistence for SucceedThenFail {
-        fn persist_context(
+        async fn persist_context(
             &self,
             _: &str,
             _: &crate::context::state::ContextSnapshot,
@@ -5246,7 +5282,7 @@ impl ClassSCell
                 Err("re-persist failure".into())
             }
         }
-        fn load_context(
+        async fn load_context(
             &self,
             _: &str,
         ) -> Result<
@@ -5255,10 +5291,13 @@ impl ClassSCell
         > {
             Ok(None)
         }
-        fn delete_context(&self, _: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        async fn delete_context(
+            &self,
+            _: &str,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Ok(())
         }
-        fn list_persisted_contexts(
+        async fn list_persisted_contexts(
             &self,
         ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
             Ok(Vec::new())
@@ -5375,7 +5414,7 @@ impl ClassSCell
     /// `clear_committed_reservation_idempotent` straggler-cleanup path can be
     /// exercised on a pre-seeded reservation WITHOUT the `state_mut()` escape
     /// hatch. Returns nothing; panics if the seed persist does not land.
-    fn seed_caller_reservation_for_test(
+    async fn seed_caller_reservation_for_test(
         cell: &mut ClassSCell,
         deps: &ActorDeps,
         context_id: &str,
@@ -5388,6 +5427,7 @@ impl ClassSCell
                 .insert(saga_id, record);
             Ok::<(), ContextError>(())
         })
+        .await
         .expect("seed caller reservation persists");
     }
 
@@ -5430,6 +5470,7 @@ impl ClassSCell
         // The deferred commit persists fail-closed (exactly once).
         token
             .commit(&cell, &deps, &ctx)
+            .await
             .expect("commit persists fail-closed ⇒ Ok");
         assert_eq!(
             persist_calls.load(Ordering::SeqCst),
@@ -5480,6 +5521,7 @@ impl ClassSCell
             .expect("f Ok");
         let err = token
             .commit(&cell, &deps, &ctx)
+            .await
             .expect_err("FailPersistence ⇒ commit Err");
         assert!(matches!(err, ContextError::PersistenceFailed(_)));
         assert!(
@@ -5508,7 +5550,7 @@ impl ClassSCell
             .expect("Ok");
         assert_eq!(v, 1);
         let token = token.expect("did_mutate=true ⇒ Some(token)");
-        token.commit(&cell, &deps, &ctx).expect("commit Ok");
+        token.commit(&cell, &deps, &ctx).await.expect("commit Ok");
 
         // No mutation ⇒ None (free/best-effort path stays token-free).
         let (v2, token2) = cell
@@ -5621,6 +5663,7 @@ impl ClassSCell
             .expect("the cascade armed exactly one obligation");
         token
             .commit(&cell, &deps, &ctx)
+            .await
             .expect("the single armed obligation commits fail-closed (SpyPersistence Ok)");
         assert_eq!(
             persist_calls.load(Ordering::SeqCst),
@@ -5663,6 +5706,7 @@ impl ClassSCell
             .discharge_with(&mut cell, &deps, &ctx, |_view| {
                 Err::<(), _>(ContextError::PermissionDenied("abort".into()))
             })
+            .await
             .expect_err("f Err ⇒ discharge_with surfaces it");
         assert!(matches!(err, ContextError::PermissionDenied(_)));
         assert_eq!(
@@ -5776,7 +5820,7 @@ impl ClassSCell
 
         // Discharging the armed obligation IS the §9 fail-closed persist. Under
         // FailPersistence it must surface the durability error (not a silent ack).
-        let persist = token.commit(&cell, &deps, &ctx);
+        let persist = token.commit(&cell, &deps, &ctx).await;
         let err = persist.expect_err("FailPersistence ⇒ fail-closed persist Err");
         assert!(
             matches!(err, ContextError::PersistenceFailed(_)),
@@ -5921,7 +5965,8 @@ impl ClassSCell
             None,
             Some(ClassSCommitToken::new_for_test(&ctx)),
             /* is_broadcast = */ false,
-        );
+        )
+        .await;
 
         // The single nonce-token commit covers BOTH the burned nonce and the armed
         // suspension; under FailPersistence it surfaces the §9 durability error
@@ -6077,7 +6122,7 @@ impl ClassSCell
         // Discharging the armed obligation IS the §9 fail-closed persist. Under
         // FailPersistence it must surface the durability error rather than a silent
         // coalesced ack.
-        let persist = token.commit(&cell, &deps, &ctx);
+        let persist = token.commit(&cell, &deps, &ctx).await;
         let err = persist.expect_err("FailPersistence ⇒ fail-closed persist Err");
         assert!(
             matches!(err, ContextError::PersistenceFailed(_)),
@@ -6116,6 +6161,7 @@ impl ClassSCell
                 view.class_s_mut().xctx_nonce_dedup.record([0x3Cu8; 16], 0);
                 Ok("kept")
             })
+            .await
             .expect("persist succeeds ⇒ Ok");
 
         assert_eq!(returned, "kept");
@@ -6141,10 +6187,12 @@ impl ClassSCell
         let mut cell = ClassSCell::new(fresh_state(0x12));
         let ctx = ctx_hex(0x12);
 
-        let result = cell.commit_class_s_keep(&deps, &ctx, |mut view| {
-            view.class_s_mut().xctx_nonce_dedup.record([0x3Cu8; 16], 0);
-            Ok(())
-        });
+        let result = cell
+            .commit_class_s_keep(&deps, &ctx, |mut view| {
+                view.class_s_mut().xctx_nonce_dedup.record([0x3Cu8; 16], 0);
+                Ok(())
+            })
+            .await;
 
         assert!(
             matches!(result, Err(ContextError::PersistenceFailed(_))),
@@ -6170,9 +6218,11 @@ impl ClassSCell
         let mut cell = ClassSCell::new(fresh_state(0x13));
         let ctx = ctx_hex(0x13);
 
-        let result: Result<(), ContextError> = cell.commit_class_s_keep(&deps, &ctx, |_view| {
-            Err(ContextError::PermissionDenied("rejected".to_owned()))
-        });
+        let result: Result<(), ContextError> = cell
+            .commit_class_s_keep(&deps, &ctx, |_view| {
+                Err(ContextError::PermissionDenied("rejected".to_owned()))
+            })
+            .await;
 
         assert!(
             matches!(result, Err(ContextError::PermissionDenied(_))),
@@ -6205,6 +6255,7 @@ impl ClassSCell
                     .insert(saga_a.clone(), prepared_invocation());
                 Ok(99u32)
             })
+            .await
             .expect("persist succeeds ⇒ Ok");
 
         assert_eq!(value, 99);
@@ -6224,16 +6275,18 @@ impl ClassSCell
         let ctx = ctx_hex(0x22);
         let saga_a = saga("saga-restore-rollback");
 
-        let result = cell.commit_class_s_restore(&deps, &ctx, |mut view| {
-            // Mutate Class-S: saga_pending + nonce dedup …
-            let cs = view.class_s_mut();
-            cs.saga_pending
-                .insert(saga_a.clone(), prepared_invocation());
-            cs.xctx_nonce_dedup.record([0x3Cu8; 16], 1_700_000_000);
-            // … and governance Class-S (threshold).
-            view.governance_class_s_mut().threshold_value = 7;
-            Ok(())
-        });
+        let result = cell
+            .commit_class_s_restore(&deps, &ctx, |mut view| {
+                // Mutate Class-S: saga_pending + nonce dedup …
+                let cs = view.class_s_mut();
+                cs.saga_pending
+                    .insert(saga_a.clone(), prepared_invocation());
+                cs.xctx_nonce_dedup.record([0x3Cu8; 16], 1_700_000_000);
+                // … and governance Class-S (threshold).
+                view.governance_class_s_mut().threshold_value = 7;
+                Ok(())
+            })
+            .await;
 
         assert!(
             matches!(result, Err(ContextError::PersistenceFailed(_))),
@@ -6268,9 +6321,11 @@ impl ClassSCell
         let mut cell = ClassSCell::new(fresh_state(0x23));
         let ctx = ctx_hex(0x23);
 
-        let result: Result<(), ContextError> = cell.commit_class_s_restore(&deps, &ctx, |_view| {
-            Err(ContextError::PermissionDenied("rejected".to_owned()))
-        });
+        let result: Result<(), ContextError> = cell
+            .commit_class_s_restore(&deps, &ctx, |_view| {
+                Err(ContextError::PermissionDenied("rejected".to_owned()))
+            })
+            .await;
 
         assert!(matches!(result, Err(ContextError::PermissionDenied(_))));
         assert_eq!(persist_calls.load(Ordering::SeqCst), 0);
@@ -6836,7 +6891,8 @@ impl ClassSCell
 
         cell.commit_class_c_best_effort(&deps, &ctx, move |mut view| {
             view.members_mut().insert(member_for_closure);
-        });
+        })
+        .await;
 
         assert!(
             cell.members.contains(&member),
@@ -6877,7 +6933,8 @@ impl ClassSCell
             let _ = &split.role_state;
             let _ = split.membership.count();
             let _ = split.receive_buffer.len();
-        });
+        })
+        .await;
 
         assert_eq!(
             cell.checkpoint_events_since, 3,
@@ -6914,7 +6971,8 @@ impl ClassSCell
             // no `&mut self.gov` / `class_s` accessor to reach Class-S, and the
             // whole-bucket Deref was removed.
             let _ = gov.next_proposal_seq();
-        });
+        })
+        .await;
 
         assert_eq!(
             cell.governance.cooldown_until.get(&3usize),
@@ -6943,7 +7001,8 @@ impl ClassSCell
             let gov = view.governance_class_c_mut();
             let vt = gov.velocity_tracker_mut();
             vt.record_message(&sender_for_closure, 1_700_000_000);
-        });
+        })
+        .await;
 
         assert_eq!(
             cell.governance
@@ -6971,7 +7030,8 @@ impl ClassSCell
             view.governance_class_c_mut()
                 .budget_tracker_mut()
                 .grant(&member_for_closure, Amount(500));
-        });
+        })
+        .await;
 
         assert_eq!(
             cell.governance.budget_tracker.remaining(&member),
@@ -7009,7 +7069,8 @@ impl ClassSCell
 
         cell.commit_class_c_best_effort(&deps, &ctx, move |mut view| {
             *view.governance_class_c_mut().economic_policy_mut() = Some(policy);
-        });
+        })
+        .await;
 
         assert_eq!(
             cell.governance.economic_policy,
@@ -7034,7 +7095,8 @@ impl ClassSCell
             view.receive_buffer_mut().push(ContextEvent::MemberLeft {
                 member_did: DID("did:example:left".to_owned()),
             });
-        });
+        })
+        .await;
 
         assert_eq!(
             cell.receive_buffer.len(),
@@ -7058,7 +7120,8 @@ impl ClassSCell
             view.role_state_class_c_mut()
                 .members_mut()
                 .insert(member_did);
-        });
+        })
+        .await;
 
         assert!(
             cell.role_state.members.contains(&member_for_assert),
@@ -7134,7 +7197,8 @@ impl ClassSCell
             // `member_capabilities` is READ-ONLY on this best-effort view (the F2
             // whole-`&mut` shrink accessor is deleted).
             let _ = rs.member_capabilities().len();
-        });
+        })
+        .await;
 
         assert!(
             cell.role_state.members.contains(&member),
@@ -7172,7 +7236,8 @@ impl ClassSCell
             assert!(m.get_mut(member_for_f.0.as_str()).is_some());
             let _ = m.get(member_for_f.0.as_str());
             let _ = m.count();
-        });
+        })
+        .await;
 
         assert!(
             cell.membership.contains(member.0.as_str()),
@@ -7222,6 +7287,7 @@ impl ClassSCell
                     class_s.saga_pending.retain(|k, _| keys_before.contains(k));
                 },
             )
+            .await
             .expect("persist succeeds ⇒ Ok");
 
         assert_eq!(value, 42);
@@ -7253,20 +7319,22 @@ impl ClassSCell
         let ctx = ctx_hex(0x75);
         let saga_for_f = saga("saga-split-fail");
 
-        let result = cell.commit_class_s_keep_restore_split(
-            &deps,
-            &ctx,
-            |class_s| class_s.saga_pending.keys().cloned().collect::<Vec<_>>(),
-            move |mut view| {
-                let cs = view.class_s_mut();
-                cs.xctx_nonce_dedup.record([0x3Cu8; 16], 0); // keep
-                cs.saga_pending.insert(saga_for_f, prepared_invocation()); // restore
-                Ok(())
-            },
-            |class_s, keys_before| {
-                class_s.saga_pending.retain(|k, _| keys_before.contains(k));
-            },
-        );
+        let result = cell
+            .commit_class_s_keep_restore_split(
+                &deps,
+                &ctx,
+                |class_s| class_s.saga_pending.keys().cloned().collect::<Vec<_>>(),
+                move |mut view| {
+                    let cs = view.class_s_mut();
+                    cs.xctx_nonce_dedup.record([0x3Cu8; 16], 0); // keep
+                    cs.saga_pending.insert(saga_for_f, prepared_invocation()); // restore
+                    Ok(())
+                },
+                |class_s, keys_before| {
+                    class_s.saga_pending.retain(|k, _| keys_before.contains(k));
+                },
+            )
+            .await;
 
         assert!(
             matches!(result, Err(ContextError::PersistenceFailed(_))),
@@ -7298,15 +7366,17 @@ impl ClassSCell
         let restore_ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let restore_flag = Arc::clone(&restore_ran);
 
-        let result: Result<(), ContextError> = cell.commit_class_s_keep_restore_split(
-            &deps,
-            &ctx,
-            |class_s| class_s.saga_pending.keys().cloned().collect::<Vec<_>>(),
-            |_view| Err(ContextError::PermissionDenied("rejected".to_owned())),
-            move |_class_s, _snap: Vec<_>| {
-                restore_flag.store(true, Ordering::SeqCst);
-            },
-        );
+        let result: Result<(), ContextError> = cell
+            .commit_class_s_keep_restore_split(
+                &deps,
+                &ctx,
+                |class_s| class_s.saga_pending.keys().cloned().collect::<Vec<_>>(),
+                |_view| Err(ContextError::PermissionDenied("rejected".to_owned())),
+                move |_class_s, _snap: Vec<_>| {
+                    restore_flag.store(true, Ordering::SeqCst);
+                },
+            )
+            .await;
 
         assert!(
             matches!(result, Err(ContextError::PermissionDenied(_))),
@@ -7342,6 +7412,7 @@ impl ClassSCell
                 .insert(saga_a.clone(), prepared_invocation());
             Ok(())
         })
+        .await
         .expect("persist succeeds");
         // Read through Deref before unwrap.
         assert!(cell.saga_pending().contains_key(&saga_a));
@@ -7388,7 +7459,8 @@ impl ClassSCell
             borrows
                 .budget_tracker
                 .grant(&member_for_closure, Amount(700));
-        });
+        })
+        .await;
 
         assert_eq!(
             cell.governance.budget_tracker.remaining(&member),
@@ -7426,7 +7498,7 @@ impl ClassSCell
             recorded_at_secs: 1_700_000_000,
             escrow_authorization: None,
         };
-        seed_caller_reservation_for_test(&mut cell, &deps, &ctx, saga_a.clone(), record);
+        seed_caller_reservation_for_test(&mut cell, &deps, &ctx, saga_a.clone(), record).await;
 
         // Snapshot the persist count AFTER the seed (the seed's combinator
         // persisted once, fail-closed); the clears below must add ZERO.
@@ -7493,7 +7565,8 @@ impl ClassSCell
                 !m.remove_subscriber(&sub_for_f),
                 "remove_subscriber returns false for an absent subscriber"
             );
-        });
+        })
+        .await;
 
         assert!(
             !cell.membership.contains(sub.0.as_str()),
@@ -7572,7 +7645,8 @@ impl ClassSCell
                 &ctx_id,
                 &new_ceiling,
                 ceiling_commit_meta(),
-            );
+            )
+            .await;
             assert!(
                 matches!(res, Err(ContextError::InvalidState(_))),
                 "malformed proposed ceiling entry {malformed:?} must be rejected at \
@@ -7606,7 +7680,8 @@ impl ClassSCell
             &ctx_id,
             &new_ceiling,
             ceiling_commit_meta(),
-        );
+        )
+        .await;
         assert!(
             res.is_ok(),
             "well-formed ceiling proposal must stage: {res:?}"

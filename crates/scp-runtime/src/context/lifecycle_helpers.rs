@@ -234,179 +234,182 @@ pub async fn leave_context(
     // `&mut PerContextState` the view hands back; `try_broadcast_commit_or_enqueue`
     // is passed only the three disjoint Class-C fields it mutates (via
     // `CommitBroadcastBorrows`), borrowed from that same state.
-    let should_close = cell.commit_class_s_keep(deps, &context_id, |mut view| {
-        let state = view.rest_mut();
+    let should_close = cell
+        .commit_class_s_keep(deps, &context_id, |mut view| {
+            let state = view.rest_mut();
 
-        // PR #1606 C6: refuse if a commit fault marker is set.
-        governance_helpers::check_commit_fault(state)?;
+            // PR #1606 C6: refuse if a commit fault marker is set.
+            governance_helpers::check_commit_fault(state)?;
 
-        // Authorization: self-removal always allowed; otherwise MemberRemove
-        // required.
-        if caller_did != member_did
-            && !state
-                .role_state
-                .member_has_capability(caller_did, &Capability::MemberRemove)
-        {
-            return Err(ContextError::PermissionDenied(
-                "caller lacks permission to remove this member".into(),
-            ));
-        }
-
-        let is_broadcast = state.broadcast_context.is_some();
-
-        // Crypto operations -- skip for broadcast mode (no MLS).
-        // H9: MLS group removal FIRST (hard security boundary), then sender
-        // key cleanup as best-effort. MLS removal is the cryptographic
-        // enforcement; sender key removal is defense-in-depth (§9.16).
-        if !is_broadcast {
-            let remove_output = deps.crypto.remove_member(&context_id_bytes, member_did)?;
-            if let Err(e) = deps
-                .crypto
-                .remove_member_sender_key(&context_id_bytes, member_did)
+            // Authorization: self-removal always allowed; otherwise MemberRemove
+            // required.
+            if caller_did != member_did
+                && !state
+                    .role_state
+                    .member_has_capability(caller_did, &Capability::MemberRemove)
             {
-                tracing::warn!(
-                    context_id = %context_id,
-                    member = %member_did,
-                    error = %e,
-                    "remove_member_sender_key failed after MLS removal — \
-                     sender key layer may retain stale key"
-                );
+                return Err(ContextError::PermissionDenied(
+                    "caller lacks permission to remove this member".into(),
+                ));
             }
 
-            // Broadcast the MLS Commit to remaining members so they can
-            // advance their group epoch and ratchet key material. PR #1606
-            // C6: on transport failure, the commit is durably enqueued for
-            // retry.
-            governance_helpers::try_broadcast_commit_or_enqueue(
-                governance_helpers::CommitBroadcastBorrows {
-                    pending_commits: &mut state.pending_commits,
-                    commit_fault: &mut state.commit_fault,
-                    receive_buffer: &mut state.receive_buffer,
-                },
-                deps,
+            let is_broadcast = state.broadcast_context.is_some();
+
+            // Crypto operations -- skip for broadcast mode (no MLS).
+            // H9: MLS group removal FIRST (hard security boundary), then sender
+            // key cleanup as best-effort. MLS removal is the cryptographic
+            // enforcement; sender key removal is defense-in-depth (§9.16).
+            if !is_broadcast {
+                let remove_output = deps.crypto.remove_member(&context_id_bytes, member_did)?;
+                if let Err(e) = deps
+                    .crypto
+                    .remove_member_sender_key(&context_id_bytes, member_did)
+                {
+                    tracing::warn!(
+                        context_id = %context_id,
+                        member = %member_did,
+                        error = %e,
+                        "remove_member_sender_key failed after MLS removal — \
+                         sender key layer may retain stale key"
+                    );
+                }
+
+                // Broadcast the MLS Commit to remaining members so they can
+                // advance their group epoch and ratchet key material. PR #1606
+                // C6: on transport failure, the commit is durably enqueued for
+                // retry.
+                governance_helpers::try_broadcast_commit_or_enqueue(
+                    governance_helpers::CommitBroadcastBorrows {
+                        pending_commits: &mut state.pending_commits,
+                        commit_fault: &mut state.commit_fault,
+                        receive_buffer: &mut state.receive_buffer,
+                    },
+                    deps,
+                    &context_id,
+                    remove_output.commit_bytes,
+                    &CommitOperation::LeaveContext {
+                        member_did: member_did.clone(),
+                    },
+                );
+
+                // Rotate the local sender key and distribute to remaining members
+                // (§9.16.4). M23: Non-fatal — MLS removal above is the hard
+                // security boundary. If rotation fails, log but continue.
+                if let Err(e) = deps.crypto.rotate_sender_key(&context_id_bytes) {
+                    tracing::warn!(
+                        context_id = %context_id,
+                        error = %e,
+                        "rotate_sender_key failed after leave — \
+                         remaining members retain old sender key"
+                    );
+                }
+                if let Err(e) = drain_and_deliver_sender_keys(deps, &context_id, &context_id_bytes)
+                {
+                    tracing::warn!(
+                        context_id = %context_id,
+                        error = %e,
+                        "failed to deliver rotated sender keys after leave"
+                    );
+                }
+            }
+
+            // State check + membership removal -- the actor owns state for the
+            // duration of this command, so no relock dance is required.
+            state::require_active(&state.handle)?;
+
+            // For broadcast contexts, unsubscribe from the BroadcastContext.
+            // rotate_keys=true for forward secrecy after departure.
+            if let Some(ref mut bc) = state.broadcast_context {
+                // Ignore MemberNotFound -- the member may be an author who was
+                // never a subscriber. Propagate all other errors (e.g.
+                // CryptoFailed from epoch overflow during key rotation).
+                match bc.unsubscribe(member_did, true) {
+                    Ok(_) | Err(ContextError::MemberNotFound(_)) => {}
+                    Err(e) => return Err(e),
+                }
+            }
+
+            // Capture the leaving member's role name BEFORE the membership/role
+            // strip below — the role held at departure, carried into the
+            // subject-bearing MemberLeft leaf (ADR-011 amendment) so the
+            // participation record (§7.3.2) attributes the self-leave to this
+            // member with its role context.
+            let left_role_name = state
+                .membership
+                .get(member_did.as_ref())
+                .map(|info| info.role_name.clone())
+                .unwrap_or_default();
+
+            if !state.membership.remove_member(member_did) {
+                return Err(ContextError::MemberNotFound(member_did.to_string()));
+            }
+
+            // Clean teardown of ALL per-DID role state (spec §5.6.1): members,
+            // assignments, member_capabilities, AND suspended_capabilities. Replaces
+            // the prior strip that left the departing DID's suspension dangling, so a
+            // re-admitted same-DID member no longer inherits a phantom suspension.
+            // `state.membership.remove_member` above already guarded not-found, so the
+            // `-> bool` return is unused here. Inside `commit_class_s_keep`, so the
+            // downward-auth suspension drop persists fail-closed (ADR-049 §9).
+            state.role_state.remove_member(member_did.as_ref());
+
+            // Destroy the departing member's access key (§9.17.2, ADR-038).
+            state
+                .access
+                .access_key_store
+                .remove(&context_id, member_did.as_ref());
+
+            // Drop the departing member's CEK-exclusion entry (spec §5.6.1, §9.17) —
+            // per-DID content-access state outside the role state. Mirrors
+            // `execute_remove_member`, so a re-admitted same-DID member no longer
+            // inherits a phantom read exclusion.
+            state.access.read_exclusion_list.remove(member_did);
+
+            // §9.10.4: remove the departing member's pseudonym routing ID. No-op on
+            // a broadcast context (which carries no peer registry).
+            if let Some(reg) = state.routing.peer_registry_mut() {
+                reg.remove(member_did);
+            }
+
+            // Emit MemberLeft event to receive buffer.
+            let left_event = ContextEvent::MemberLeft {
+                member_did: member_did.clone(),
+            };
+            state::emit_event_into(
+                &mut state.receive_buffer,
+                left_event,
                 &context_id,
-                remove_output.commit_bytes,
-                &CommitOperation::LeaveContext {
-                    member_did: member_did.clone(),
-                },
+                deps.event_tx.as_ref(),
             );
 
-            // Rotate the local sender key and distribute to remaining members
-            // (§9.16.4). M23: Non-fatal — MLS removal above is the hard
-            // security boundary. If rotation fails, log but continue.
-            if let Err(e) = deps.crypto.rotate_sender_key(&context_id_bytes) {
-                tracing::warn!(
-                    context_id = %context_id,
-                    error = %e,
-                    "rotate_sender_key failed after leave — \
-                     remaining members retain old sender key"
-                );
-            }
-            if let Err(e) = drain_and_deliver_sender_keys(deps, &context_id, &context_id_bytes) {
-                tracing::warn!(
-                    context_id = %context_id,
-                    error = %e,
-                    "failed to deliver rotated sender keys after leave"
-                );
-            }
-        }
+            let should_close = state.membership.count() == 0;
 
-        // State check + membership removal -- the actor owns state for the
-        // duration of this command, so no relock dance is required.
-        state::require_active(&state.handle)?;
+            // Append MemberLeft event to event log. Subject-bearing leaf (ADR-011
+            // amendment): the payload carries the affected member (`member_did`,
+            // which on a self-leave already equals `actor_did`) and its role at
+            // departure, so the leaf shape is uniform with admin-driven removals and
+            // the SDK reads `subject_did` consistently.
+            //
+            // Committer-assigned: the leaving member's clock — the source of the
+            // `created_at` on its outgoing leave commit. This is the
+            // convergent-by-construction value WHEN cross-member leaf replication
+            // lands: the receive-side append path is currently dormant, so this
+            // leaf is committer-appended-only and is NOT yet replicated to other
+            // members. Cross-member convergence of membership leaves is the forward
+            // step under ADR-051 (§7.3.1, §9.9.3).
+            deps.event_log.append_membership_change_leaf(
+                &context_id_bytes,
+                scp_event_log::EventType::MemberLeft,
+                member_did.as_ref(),
+                member_did.as_ref(),
+                &left_role_name,
+                deps.clock.now_secs(),
+            )?;
+            state.checkpoint_events_since += 1;
 
-        // For broadcast contexts, unsubscribe from the BroadcastContext.
-        // rotate_keys=true for forward secrecy after departure.
-        if let Some(ref mut bc) = state.broadcast_context {
-            // Ignore MemberNotFound -- the member may be an author who was
-            // never a subscriber. Propagate all other errors (e.g.
-            // CryptoFailed from epoch overflow during key rotation).
-            match bc.unsubscribe(member_did, true) {
-                Ok(_) | Err(ContextError::MemberNotFound(_)) => {}
-                Err(e) => return Err(e),
-            }
-        }
-
-        // Capture the leaving member's role name BEFORE the membership/role
-        // strip below — the role held at departure, carried into the
-        // subject-bearing MemberLeft leaf (ADR-011 amendment) so the
-        // participation record (§7.3.2) attributes the self-leave to this
-        // member with its role context.
-        let left_role_name = state
-            .membership
-            .get(member_did.as_ref())
-            .map(|info| info.role_name.clone())
-            .unwrap_or_default();
-
-        if !state.membership.remove_member(member_did) {
-            return Err(ContextError::MemberNotFound(member_did.to_string()));
-        }
-
-        // Clean teardown of ALL per-DID role state (spec §5.6.1): members,
-        // assignments, member_capabilities, AND suspended_capabilities. Replaces
-        // the prior strip that left the departing DID's suspension dangling, so a
-        // re-admitted same-DID member no longer inherits a phantom suspension.
-        // `state.membership.remove_member` above already guarded not-found, so the
-        // `-> bool` return is unused here. Inside `commit_class_s_keep`, so the
-        // downward-auth suspension drop persists fail-closed (ADR-049 §9).
-        state.role_state.remove_member(member_did.as_ref());
-
-        // Destroy the departing member's access key (§9.17.2, ADR-038).
-        state
-            .access
-            .access_key_store
-            .remove(&context_id, member_did.as_ref());
-
-        // Drop the departing member's CEK-exclusion entry (spec §5.6.1, §9.17) —
-        // per-DID content-access state outside the role state. Mirrors
-        // `execute_remove_member`, so a re-admitted same-DID member no longer
-        // inherits a phantom read exclusion.
-        state.access.read_exclusion_list.remove(member_did);
-
-        // §9.10.4: remove the departing member's pseudonym routing ID. No-op on
-        // a broadcast context (which carries no peer registry).
-        if let Some(reg) = state.routing.peer_registry_mut() {
-            reg.remove(member_did);
-        }
-
-        // Emit MemberLeft event to receive buffer.
-        let left_event = ContextEvent::MemberLeft {
-            member_did: member_did.clone(),
-        };
-        state::emit_event_into(
-            &mut state.receive_buffer,
-            left_event,
-            &context_id,
-            deps.event_tx.as_ref(),
-        );
-
-        let should_close = state.membership.count() == 0;
-
-        // Append MemberLeft event to event log. Subject-bearing leaf (ADR-011
-        // amendment): the payload carries the affected member (`member_did`,
-        // which on a self-leave already equals `actor_did`) and its role at
-        // departure, so the leaf shape is uniform with admin-driven removals and
-        // the SDK reads `subject_did` consistently.
-        //
-        // Committer-assigned: the leaving member's clock — the source of the
-        // `created_at` on its outgoing leave commit. This is the
-        // convergent-by-construction value WHEN cross-member leaf replication
-        // lands: the receive-side append path is currently dormant, so this
-        // leaf is committer-appended-only and is NOT yet replicated to other
-        // members. Cross-member convergence of membership leaves is the forward
-        // step under ADR-051 (§7.3.1, §9.9.3).
-        deps.event_log.append_membership_change_leaf(
-            &context_id_bytes,
-            scp_event_log::EventType::MemberLeft,
-            member_did.as_ref(),
-            member_did.as_ref(),
-            &left_role_name,
-            deps.clock.now_secs(),
-        )?;
-        state.checkpoint_events_since += 1;
-
-        Ok(should_close)
-    })?;
+            Ok(should_close)
+        })
+        .await?;
 
     // If member count reaches zero, transition to Closing. Runs AFTER the
     // fail-closed persist above, matching the prior ordering.
@@ -667,7 +670,8 @@ pub async fn close_context_with_key(
         });
 
         Ok(())
-    })?;
+    })
+    .await?;
 
     Ok(result)
 }
@@ -869,7 +873,8 @@ pub async fn join_context(
                     deps,
                     &context_id,
                     payment_err,
-                );
+                )
+                .await;
                 rollback_join_economy_ticket(cell, ticket);
                 return Err(err);
             }
@@ -895,7 +900,8 @@ pub async fn join_context(
                 deps,
                 &context_id,
                 e,
-            );
+            )
+            .await;
             if let Some(a) = auth {
                 crate::context::economy_helpers::void_paid_action(deps, a, &context_id).await;
             }
@@ -921,7 +927,8 @@ pub async fn join_context(
             deps,
             &context_id,
             e,
-        );
+        )
+        .await;
         if let Some(a) = auth {
             crate::context::economy_helpers::void_paid_action(deps, a, &context_id).await;
         }
@@ -947,7 +954,8 @@ pub async fn join_context(
             deps,
             &context_id,
             e,
-        );
+        )
+        .await;
         if let Some(a) = auth {
             crate::context::economy_helpers::void_paid_action(deps, a, &context_id).await;
         }
@@ -977,7 +985,8 @@ pub async fn join_context(
             deps,
             &context_id,
             e,
-        );
+        )
+        .await;
         if let Some(a) = auth {
             crate::context::economy_helpers::void_paid_action(deps, a, &context_id).await;
         }
@@ -1048,7 +1057,8 @@ pub async fn join_context(
             deps,
             &context_id,
             e,
-        );
+        )
+        .await;
         if let Some(a) = auth {
             crate::context::economy_helpers::void_paid_action(deps, a, &context_id).await;
         }
@@ -1096,14 +1106,15 @@ pub async fn join_context(
         // not charged for an unacknowledged join, then surface the error. The
         // consumed nonce stays consumed. `t.commit` + `void_paid_action` take a
         // shared `&PerContextState`, supplied via `&*cell`.
-        if let Err(e) = t.commit(&*cell, deps, &context_id) {
+        if let Err(e) = t.commit(&*cell, deps, &context_id).await {
             if let Some(a) = auth {
                 crate::context::economy_helpers::void_paid_action(deps, a, &context_id).await;
             }
             return Err(e);
         }
     } else {
-        crate::context::messaging_helpers::persist_state_best_effort(&*cell, deps, &context_id);
+        crate::context::messaging_helpers::persist_state_best_effort(&*cell, deps, &context_id)
+            .await;
     }
 
     // Durability has succeeded (or this is a free join): now settle the escrow.
@@ -2413,7 +2424,7 @@ pub async fn import_context(
 /// provider is configured, no snapshot exists, or the load operation
 /// fails.
 #[allow(dead_code)] // Transitive of `restore_context` — see bootstrap rationale.
-pub fn load_persisted_context_state(
+pub async fn load_persisted_context_state(
     deps: &ActorDeps,
     context_id: &str,
     preloaded_snapshot: Option<crate::context::state::ContextSnapshot>,
@@ -2435,6 +2446,7 @@ pub fn load_persisted_context_state(
         None => deps
             .persistence
             .load_context(context_id)
+            .await
             .map_err(|e| {
                 ContextError::PersistenceFailed(format!(
                     "failed to load context state for {context_id}: {e}"
@@ -2534,7 +2546,7 @@ pub async fn restore_context(
     use scp_protocol::context::membership::ReceiveBuffer;
 
     let (mut ctx_snapshot, broadcast_ctx) =
-        load_persisted_context_state(deps, context_id, preloaded_snapshot)?;
+        load_persisted_context_state(deps, context_id, preloaded_snapshot).await?;
     restore_event_log_best_effort(deps, context_id);
 
     validate_consequence_rules_for_import(
@@ -2987,13 +2999,13 @@ pub async fn restore_all_contexts(
             "no persistence provider configured".into(),
         ));
     };
-    let context_ids = persistence.list_persisted_contexts().map_err(|e| {
+    let context_ids = persistence.list_persisted_contexts().await.map_err(|e| {
         ContextError::PersistenceFailed(format!("failed to list persisted contexts: {e}"))
     })?;
 
     let mut restored = Vec::new();
     for ctx_id in &context_ids {
-        let ctx_snapshot = match persistence.load_context(ctx_id) {
+        let ctx_snapshot = match persistence.load_context(ctx_id).await {
             Ok(Some(snap)) => snap,
             Ok(None) => continue,
             Err(e) => {
@@ -3333,21 +3345,22 @@ mod restore_reconcile_tests {
     struct CapturingPersistence {
         contexts: Mutex<HashMap<String, ContextSnapshot>>,
     }
+    #[async_trait::async_trait]
     impl ContextPersistence for CapturingPersistence {
-        fn persist_context(&self, id: &str, s: &ContextSnapshot) -> Result<(), PersistErr> {
+        async fn persist_context(&self, id: &str, s: &ContextSnapshot) -> Result<(), PersistErr> {
             self.contexts
                 .lock()
                 .unwrap()
                 .insert(id.to_owned(), s.clone());
             Ok(())
         }
-        fn load_context(&self, id: &str) -> Result<Option<ContextSnapshot>, PersistErr> {
+        async fn load_context(&self, id: &str) -> Result<Option<ContextSnapshot>, PersistErr> {
             Ok(self.contexts.lock().unwrap().get(id).cloned())
         }
-        fn delete_context(&self, _id: &str) -> Result<(), PersistErr> {
+        async fn delete_context(&self, _id: &str) -> Result<(), PersistErr> {
             Ok(())
         }
-        fn list_persisted_contexts(&self) -> Result<Vec<String>, PersistErr> {
+        async fn list_persisted_contexts(&self) -> Result<Vec<String>, PersistErr> {
             Ok(self.contexts.lock().unwrap().keys().cloned().collect())
         }
     }
@@ -3356,18 +3369,19 @@ mod restore_reconcile_tests {
     /// can write through it while the test reads the harvested snapshot from the
     /// same backing store.
     struct SharedCapture(Arc<CapturingPersistence>);
+    #[async_trait::async_trait]
     impl ContextPersistence for SharedCapture {
-        fn persist_context(&self, id: &str, s: &ContextSnapshot) -> Result<(), PersistErr> {
-            self.0.persist_context(id, s)
+        async fn persist_context(&self, id: &str, s: &ContextSnapshot) -> Result<(), PersistErr> {
+            self.0.persist_context(id, s).await
         }
-        fn load_context(&self, id: &str) -> Result<Option<ContextSnapshot>, PersistErr> {
-            self.0.load_context(id)
+        async fn load_context(&self, id: &str) -> Result<Option<ContextSnapshot>, PersistErr> {
+            self.0.load_context(id).await
         }
-        fn delete_context(&self, id: &str) -> Result<(), PersistErr> {
-            self.0.delete_context(id)
+        async fn delete_context(&self, id: &str) -> Result<(), PersistErr> {
+            self.0.delete_context(id).await
         }
-        fn list_persisted_contexts(&self) -> Result<Vec<String>, PersistErr> {
-            self.0.list_persisted_contexts()
+        async fn list_persisted_contexts(&self) -> Result<Vec<String>, PersistErr> {
+            self.0.list_persisted_contexts().await
         }
     }
 
@@ -3379,17 +3393,18 @@ mod restore_reconcile_tests {
     struct ServingPersistence {
         snapshot: ContextSnapshot,
     }
+    #[async_trait::async_trait]
     impl ContextPersistence for ServingPersistence {
-        fn persist_context(&self, _id: &str, _s: &ContextSnapshot) -> Result<(), PersistErr> {
+        async fn persist_context(&self, _id: &str, _s: &ContextSnapshot) -> Result<(), PersistErr> {
             Ok(())
         }
-        fn load_context(&self, _id: &str) -> Result<Option<ContextSnapshot>, PersistErr> {
+        async fn load_context(&self, _id: &str) -> Result<Option<ContextSnapshot>, PersistErr> {
             Ok(Some(self.snapshot.clone()))
         }
-        fn delete_context(&self, _id: &str) -> Result<(), PersistErr> {
+        async fn delete_context(&self, _id: &str) -> Result<(), PersistErr> {
             Ok(())
         }
-        fn list_persisted_contexts(&self) -> Result<Vec<String>, PersistErr> {
+        async fn list_persisted_contexts(&self) -> Result<Vec<String>, PersistErr> {
             Ok(vec![])
         }
     }
@@ -3593,17 +3608,22 @@ mod restore_reconcile_tests {
     /// paid-join fail-closed persist into its error path.
     #[derive(Default)]
     struct FailingJoinPersistence;
+    #[async_trait::async_trait]
     impl ContextPersistence for FailingJoinPersistence {
-        fn persist_context(&self, _id: &str, _snap: &ContextSnapshot) -> Result<(), PersistErr> {
+        async fn persist_context(
+            &self,
+            _id: &str,
+            _snap: &ContextSnapshot,
+        ) -> Result<(), PersistErr> {
             Err("forced persist failure".into())
         }
-        fn load_context(&self, _id: &str) -> Result<Option<ContextSnapshot>, PersistErr> {
+        async fn load_context(&self, _id: &str) -> Result<Option<ContextSnapshot>, PersistErr> {
             Ok(None)
         }
-        fn delete_context(&self, _id: &str) -> Result<(), PersistErr> {
+        async fn delete_context(&self, _id: &str) -> Result<(), PersistErr> {
             Ok(())
         }
-        fn list_persisted_contexts(&self) -> Result<Vec<String>, PersistErr> {
+        async fn list_persisted_contexts(&self) -> Result<Vec<String>, PersistErr> {
             Ok(Vec::new())
         }
     }
@@ -3994,7 +4014,8 @@ mod restore_reconcile_tests {
             None,
             None,  // no spending-nonce token (free send) — keeps best-effort persist
             false, // is_broadcast
-        );
+        )
+        .await;
         let mut state = cell.into_inner();
 
         assert!(

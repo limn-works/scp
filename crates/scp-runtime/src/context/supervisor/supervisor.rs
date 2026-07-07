@@ -4323,7 +4323,7 @@ impl Supervisor {
                 "{ctx_id} (no persistence backend configured for respawn)"
             )));
         };
-        let snapshot = match persistence.load_context(ctx_id) {
+        let snapshot = match persistence.load_context(ctx_id).await {
             Ok(Some(s)) => s,
             Ok(None) => {
                 self.record_respawn_failure(ctx_id).await;
@@ -4734,7 +4734,7 @@ impl Supervisor {
         //    helper-persistence slot is the same backend the join persisted to,
         //    an unset slot means nothing durable was ever written).
         if let Some(persistence) = self.persistence_ref() {
-            let _ = persistence.delete_context(context_id);
+            let _ = persistence.delete_context(context_id).await;
         }
         removed
     }
@@ -6380,7 +6380,9 @@ impl Supervisor {
             // configured (`persistence_ref`); absent either, fall through
             // to the conservative wave-15 leave-non-terminal.
             if let Some(caller_hex) = caller_hex_from_participants.as_deref()
-                && self.caller_context_deleted_from_persistence(caller_hex)
+                && self
+                    .caller_context_deleted_from_persistence(caller_hex)
+                    .await
             {
                 let _ = self
                     .saga_journal
@@ -6629,12 +6631,12 @@ impl Supervisor {
     /// and reap it, silently over-charging it (the durable
     /// `CallerReservationRecord` would never be reversed). When in doubt, a
     /// backend MUST err toward `Err` (leave non-terminal), never `Ok(None)`.
-    fn caller_context_deleted_from_persistence(&self, caller_hex: &str) -> bool {
+    async fn caller_context_deleted_from_persistence(&self, caller_hex: &str) -> bool {
         let Some(persistence) = self.persistence_ref() else {
             // No backend ⇒ existence is unknowable; do not reap on a guess.
             return false;
         };
-        match persistence.load_context(caller_hex) {
+        match persistence.load_context(caller_hex).await {
             Ok(None) => true,
             Ok(Some(_)) => false,
             Err(err) => {
@@ -11251,7 +11253,7 @@ impl Supervisor {
         // restore) and BEFORE the irreversible `ConfirmConsume` — so a collision
         // does not even burn the single-use KeyPackage. A storage READ fault is
         // treated as fail-closed (we cannot prove the id is free, so we refuse).
-        match deps.persistence.load_context(&context_id) {
+        match deps.persistence.load_context(&context_id).await {
             Ok(None) => {}
             Ok(Some(_)) => {
                 return Err(ContextError::CreationFailed(format!(
@@ -11454,9 +11456,11 @@ impl Supervisor {
                         &state,
                         &deps,
                         &context_id,
-                    ) {
+                    )
+                    .await
+                    {
                         let _ = deps.crypto.destroy_mls_group(&context_id_bytes);
-                        let _ = deps.persistence.delete_context(&context_id);
+                        let _ = deps.persistence.delete_context(&context_id).await;
                         return Err(e);
                     }
 
@@ -11472,7 +11476,7 @@ impl Supervisor {
                     let owned_deps = deps.clone_for_spawn();
                     if let Err(e) = self.spawn_actor_with_state(state, owned_deps, None).await {
                         let _ = deps.crypto.destroy_mls_group(&context_id_bytes);
-                        let _ = deps.persistence.delete_context(&context_id);
+                        let _ = deps.persistence.delete_context(&context_id).await;
                         return Err(e);
                     }
 
@@ -11496,7 +11500,7 @@ impl Supervisor {
                     // `Ok(..)` (never `Elapsed`) once it returns, so this arm is reached
                     // only with NO registered actor for `context_id`.
                     let _ = deps.crypto.destroy_mls_group(&context_id_bytes);
-                    let _ = deps.persistence.delete_context(&context_id);
+                    let _ = deps.persistence.delete_context(&context_id).await;
                     Err(ContextError::TransportTimeout(format!(
                         "spawn-from-Welcome exceeded {:?} budget for context {context_id}",
                         Self::LIFECYCLE_TIMEOUT
@@ -13242,15 +13246,16 @@ mod tests {
     /// Production callers wire the real
     /// `ProtocolRepositoryContextBridge`.
     struct TestPersistence;
+    #[async_trait::async_trait]
     impl ContextPersistence for TestPersistence {
-        fn persist_context(
+        async fn persist_context(
             &self,
             _: &str,
             _: &crate::context::state::ContextSnapshot,
         ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Ok(())
         }
-        fn load_context(
+        async fn load_context(
             &self,
             _: &str,
         ) -> Result<
@@ -13259,10 +13264,13 @@ mod tests {
         > {
             Ok(None)
         }
-        fn delete_context(&self, _: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        async fn delete_context(
+            &self,
+            _: &str,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Ok(())
         }
-        fn list_persisted_contexts(
+        async fn list_persisted_contexts(
             &self,
         ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
             Ok(Vec::new())
@@ -15172,8 +15180,9 @@ mod tests {
     struct MapPersistence {
         contexts: Arc<DashMap<String, crate::context::state::ContextSnapshot>>,
     }
+    #[async_trait::async_trait]
     impl ContextPersistence for MapPersistence {
-        fn persist_context(
+        async fn persist_context(
             &self,
             id: &str,
             snap: &crate::context::state::ContextSnapshot,
@@ -15181,7 +15190,7 @@ mod tests {
             self.contexts.insert(id.to_owned(), snap.clone());
             Ok(())
         }
-        fn load_context(
+        async fn load_context(
             &self,
             id: &str,
         ) -> Result<
@@ -15190,10 +15199,13 @@ mod tests {
         > {
             Ok(self.contexts.get(id).map(|s| s.value().clone()))
         }
-        fn delete_context(&self, _: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        async fn delete_context(
+            &self,
+            _: &str,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Ok(())
         }
-        fn list_persisted_contexts(
+        async fn list_persisted_contexts(
             &self,
         ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
             Ok(self.contexts.iter().map(|e| e.key().clone()).collect())
@@ -15279,6 +15291,7 @@ mod tests {
         sup.persistence_ref()
             .expect("test supervisor has persistence")
             .persist_context(&ctx_key, &snap)
+            .await
             .unwrap();
         let deps = test_actor_deps(sup).await;
         // `Box::pin` keeps the large (state-carrying) spawn future off the
@@ -15567,7 +15580,7 @@ mod tests {
             !snap.routing.is_broadcast(),
             "encrypted context snapshot must carry a non-broadcast routing axis"
         );
-        persistence.persist_context(&ctx_key, &snap).unwrap();
+        persistence.persist_context(&ctx_key, &snap).await.unwrap();
 
         let deps = test_actor_deps(&sup).await;
         let handle = sup
@@ -15702,7 +15715,7 @@ mod tests {
             !snap.mls_crypto_state.is_empty(),
             "snapshot must carry crypto state so the floor guard runs on respawn"
         );
-        persistence.persist_context(&ctx_key, &snap).unwrap();
+        persistence.persist_context(&ctx_key, &snap).await.unwrap();
 
         let deps = test_actor_deps(&sup).await;
         let handle = sup
@@ -16077,6 +16090,7 @@ mod tests {
         sup.persistence_ref()
             .expect("test supervisor has persistence")
             .persist_context(&ctx_key, &snap)
+            .await
             .unwrap();
 
         let owning = DID("did:example:admin".to_owned());
@@ -16217,6 +16231,7 @@ mod tests {
         sup.persistence_ref()
             .expect("test supervisor has persistence")
             .persist_context(&ctx_key, &snap)
+            .await
             .unwrap();
 
         let owning = DID("did:example:admin".to_owned());
@@ -16353,6 +16368,7 @@ mod tests {
         sup.persistence_ref()
             .expect("test supervisor has persistence")
             .persist_context(&ctx_key, &snap)
+            .await
             .unwrap();
         let deps = test_actor_deps(&sup).await;
         let handle = Box::pin(sup.spawn_actor_with_state(state, deps, None))
@@ -16450,7 +16466,7 @@ mod tests {
 
         // Persist the pre-revocation snapshot so respawn has a baseline.
         let pre = crate::context::manager_methods::snapshot_context(&state);
-        persistence.persist_context(&ctx_key, &pre).unwrap();
+        persistence.persist_context(&ctx_key, &pre).await.unwrap();
 
         // Perform the downward-authorization transition. `execute_revoke`
         // routes the suspension through `commit_class_s_keep` (a fail-closed
@@ -16471,6 +16487,7 @@ mod tests {
                 timestamp_secs: 1_700_000_000,
             },
         )
+        .await
         .expect("execute_revoke (Both scope) must succeed");
         let state = cell.into_inner();
 
@@ -16478,6 +16495,7 @@ mod tests {
         // proving the sync persist happened inside the helper (no coalesce).
         let persisted = persistence
             .load_context(&ctx_key)
+            .await
             .unwrap()
             .expect("revocation must have been sync-persisted by the helper");
         assert!(
@@ -16512,6 +16530,7 @@ mod tests {
         // would have lost the revocation (re-granting authority).
         let after = persistence
             .load_context(&ctx_key)
+            .await
             .unwrap()
             .expect("respawned context must have a snapshot");
         assert!(
@@ -16905,7 +16924,7 @@ mod tests {
         // calls before its reply.
         state.membership.remove_member(&removed);
         state.role_state.members.remove(removed.as_ref());
-        crate::context::messaging_helpers::persist_state_best_effort(&state, &deps, &ctx_key);
+        crate::context::messaging_helpers::persist_state_best_effort(&state, &deps, &ctx_key).await;
 
         let handle = sup
             .spawn_actor_with_state(state, deps, None)
@@ -16988,6 +17007,7 @@ mod tests {
             );
         let deps = test_actor_deps(&sup).await;
         crate::context::messaging_helpers::persist_state_fail_closed(&state, &deps, &ctx_key)
+            .await
             .expect("fail-closed persist of the consumed nonce must succeed");
 
         let handle = sup
@@ -17011,6 +17031,7 @@ mod tests {
         // be rejected by the rehydrated tracker.
         let snap = persistence
             .load_context(&ctx_key)
+            .await
             .expect("load")
             .expect("snapshot present after respawn");
         assert!(
@@ -17025,15 +17046,16 @@ mod tests {
     /// persist error (not silently `Ok`) when a spending nonce was committed.
     #[derive(Default)]
     struct FailingPersistence;
+    #[async_trait::async_trait]
     impl ContextPersistence for FailingPersistence {
-        fn persist_context(
+        async fn persist_context(
             &self,
             _id: &str,
             _snap: &crate::context::state::ContextSnapshot,
         ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Err("induced persist failure".into())
         }
-        fn load_context(
+        async fn load_context(
             &self,
             _id: &str,
         ) -> Result<
@@ -17042,10 +17064,13 @@ mod tests {
         > {
             Ok(None)
         }
-        fn delete_context(&self, _: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        async fn delete_context(
+            &self,
+            _: &str,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Ok(())
         }
-        fn list_persisted_contexts(
+        async fn list_persisted_contexts(
             &self,
         ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
             Ok(Vec::new())
@@ -17106,7 +17131,8 @@ mod tests {
             // commit drives the persist (previously the `true` bool).
             Some(crate::context::actor::class_s::ClassSCommitToken::new_for_test(&ctx_key)),
             /* is_broadcast = */ false,
-        );
+        )
+        .await;
         assert!(
             matches!(paid, Err(ContextError::PersistenceFailed(_))),
             "a paid send whose spending-nonce consume cannot be persisted MUST \
@@ -17128,7 +17154,8 @@ mod tests {
             // best-effort persist, un-regressed.
             None,
             /* is_broadcast = */ false,
-        );
+        )
+        .await;
         assert!(
             free.is_ok(),
             "a free (non-spending) send must keep best-effort persist and \
@@ -17188,7 +17215,8 @@ mod tests {
 
         let res = crate::context::broadcast_helpers::block_broadcast_subscriber(
             &mut cell, &deps, &ctx_key, &author, &blocked,
-        );
+        )
+        .await;
         assert!(
             matches!(res, Err(ContextError::PersistenceFailed(_))),
             "a broadcast block whose persist fails MUST fail-closed, not return Ok: got {res:?}"
@@ -17230,7 +17258,8 @@ mod tests {
 
         let res = crate::context::broadcast_helpers::unblock_broadcast_subscriber(
             &mut cell, &deps, &ctx_key, &author, &blocked,
-        );
+        )
+        .await;
         assert!(
             res.is_ok(),
             "unblock (upward authorization) must stay best-effort and return Ok on \
@@ -17374,7 +17403,7 @@ mod tests {
 
         // Persist a pre-block baseline so the respawn has a snapshot to rehydrate.
         let pre = crate::context::manager_methods::snapshot_context(&state);
-        persistence.persist_context(&ctx_key, &pre).unwrap();
+        persistence.persist_context(&ctx_key, &pre).await.unwrap();
 
         // Drive the block through the PRODUCTION fail-closed helper (sync-persists
         // atomically into the Class-S snapshot before returning).
@@ -17382,6 +17411,7 @@ mod tests {
         crate::context::broadcast_helpers::block_broadcast_subscriber(
             &mut cell, &deps, &ctx_key, &author, &blocked,
         )
+        .await
         .expect("block must sync-persist and return Ok on a working backend");
         let state = cell.into_inner();
 
@@ -17406,6 +17436,7 @@ mod tests {
         // survived (block_list ∋ blocked) and the restored context DENIES serve.
         let after = persistence
             .load_context(&ctx_key)
+            .await
             .unwrap()
             .expect("respawned context must have a snapshot");
         let bc_snap = after
@@ -17462,7 +17493,7 @@ mod tests {
         let deps = test_actor_deps(&sup).await;
 
         let pre = crate::context::manager_methods::snapshot_context(&state);
-        persistence.persist_context(&ctx_key, &pre).unwrap();
+        persistence.persist_context(&ctx_key, &pre).await.unwrap();
 
         let mut cell = crate::context::actor::class_s::ClassSCell::new(state);
         crate::context::governance_helpers::execute_revoke(
@@ -17477,6 +17508,7 @@ mod tests {
                 timestamp_secs: 1_700_000_000,
             },
         )
+        .await
         .expect("governance ban (Read scope) must sync-persist and succeed");
         let state = cell.into_inner();
 
@@ -17498,6 +17530,7 @@ mod tests {
 
         let after = persistence
             .load_context(&ctx_key)
+            .await
             .unwrap()
             .expect("respawned context must have a snapshot");
         assert!(
@@ -17572,6 +17605,7 @@ mod tests {
                 timestamp_secs: 1_700_000_000,
             },
         )
+        .await
         .expect("governance ban (Read scope) must succeed");
         let state = cell.into_inner();
 
@@ -17649,7 +17683,8 @@ mod tests {
                 actor_did: author.as_ref(),
                 timestamp_secs: 1_700_000_000,
             },
-        );
+        )
+        .await;
         assert!(
             matches!(res, Err(ContextError::PersistenceFailed(_))),
             "a governance ban whose persist fails MUST fail-closed, not return Ok: got {res:?}"
@@ -17701,6 +17736,7 @@ mod tests {
                 timestamp_secs: 1_700_000_000,
             },
         )
+        .await
         .expect("the control ban with working persistence must succeed");
         let events: Vec<RecordedEvent> = recorder
             .events
@@ -17780,6 +17816,7 @@ mod tests {
             Some(crate::context::actor::class_s::ClassSCommitToken::new_for_test(&ctx_key)),
             /* is_broadcast = */ false,
         )
+        .await
         .expect("fail-closed finalize of the send-path consumed nonce must succeed");
         let state = cell.into_inner();
 
@@ -17801,6 +17838,7 @@ mod tests {
 
         let snap = persistence
             .load_context(&ctx_key)
+            .await
             .expect("load")
             .expect("snapshot present after respawn");
         assert!(
@@ -17846,6 +17884,7 @@ mod tests {
             .insert(executed_id, 1_700_000_000);
         let deps = test_actor_deps(&sup).await;
         crate::context::messaging_helpers::persist_state_fail_closed(&state, &deps, &ctx_key)
+            .await
             .expect("fail-closed persist of executed proposal must succeed");
 
         let handle = sup
@@ -17866,6 +17905,7 @@ mod tests {
 
         let snap = persistence
             .load_context(&ctx_key)
+            .await
             .expect("load")
             .expect("snapshot present after respawn");
         assert!(
@@ -17909,6 +17949,7 @@ mod tests {
             .insert(revoked_cid.clone());
         let deps = test_actor_deps(&sup).await;
         crate::context::messaging_helpers::persist_state_fail_closed(&state, &deps, &ctx_key)
+            .await
             .expect("fail-closed persist of revocation must succeed");
 
         let handle = sup
@@ -17929,6 +17970,7 @@ mod tests {
 
         let snap = persistence
             .load_context(&ctx_key)
+            .await
             .expect("load")
             .expect("snapshot present after respawn");
         assert!(
@@ -17980,7 +18022,10 @@ mod tests {
         // respawn could resurrect as Active.
         let active_snap = crate::context::manager_methods::snapshot_context(&state);
         assert_eq!(active_snap.state, crate::context::ContextState::Active);
-        persistence.persist_context(&ctx_key, &active_snap).unwrap();
+        persistence
+            .persist_context(&ctx_key, &active_snap)
+            .await
+            .unwrap();
 
         // Run the real close path. It drives the handle to Closing and
         // sync-persists before returning. `close_context` now takes a
@@ -17996,6 +18041,7 @@ mod tests {
         // coalesce was given the chance to run).
         let persisted = persistence
             .load_context(&ctx_key)
+            .await
             .unwrap()
             .expect("close must have sync-persisted a snapshot");
         assert_eq!(
@@ -18064,6 +18110,7 @@ mod tests {
         // primitive that arm now calls before its reply.
         state.role_state.suspend_all(target.as_ref());
         crate::context::messaging_helpers::persist_state_fail_closed(&state, &deps, &ctx_key)
+            .await
             .expect("fail-closed persist of the suspend_all transition must succeed");
 
         let handle = sup
@@ -18087,6 +18134,7 @@ mod tests {
         // ban is NOT rolled back by the crash.
         let snap = persistence
             .load_context(&ctx_key)
+            .await
             .expect("load")
             .expect("snapshot present after respawn");
         let suspended = snap
@@ -18140,6 +18188,7 @@ mod tests {
             .executed_proposals
             .insert(proposal_id, 1_700_000_000);
         crate::context::messaging_helpers::persist_state_fail_closed(&state, &deps, &ctx_key)
+            .await
             .expect("fail-closed persist of the executed-proposals marker must succeed");
 
         let handle = sup
@@ -18160,6 +18209,7 @@ mod tests {
 
         let snap = persistence
             .load_context(&ctx_key)
+            .await
             .expect("load")
             .expect("snapshot present after respawn");
         assert!(
@@ -18238,7 +18288,8 @@ mod tests {
             // driving the sequence-rollback path (previously the `true` bool).
             Some(crate::context::actor::class_s::ClassSCommitToken::new_for_test(&ctx_key)),
             /* is_broadcast = */ false,
-        );
+        )
+        .await;
         let state = cell.into_inner();
         assert!(
             matches!(result, Err(ContextError::PersistenceFailed(_))),
@@ -18390,8 +18441,9 @@ mod tests {
         always: bool,
         calls: Arc<std::sync::atomic::AtomicUsize>,
     }
+    #[async_trait::async_trait]
     impl ContextPersistence for FailContextPersistOncePersistence {
-        fn persist_context(
+        async fn persist_context(
             &self,
             id: &str,
             _snap: &crate::context::state::ContextSnapshot,
@@ -18407,7 +18459,7 @@ mod tests {
             }
             Ok(())
         }
-        fn load_context(
+        async fn load_context(
             &self,
             _id: &str,
         ) -> Result<
@@ -18416,10 +18468,13 @@ mod tests {
         > {
             Ok(None)
         }
-        fn delete_context(&self, _: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        async fn delete_context(
+            &self,
+            _: &str,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Ok(())
         }
-        fn list_persisted_contexts(
+        async fn list_persisted_contexts(
             &self,
         ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
             Ok(Vec::new())
@@ -20785,15 +20840,16 @@ mod tests {
     /// be mistaken for a permanent deletion and mis-reap a recoverable caller —
     /// see [`Supervisor::caller_context_deleted_from_persistence`]'s `Err` arm.
     struct ErringLoadPersistence;
+    #[async_trait::async_trait]
     impl ContextPersistence for ErringLoadPersistence {
-        fn persist_context(
+        async fn persist_context(
             &self,
             _: &str,
             _: &crate::context::state::ContextSnapshot,
         ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Ok(())
         }
-        fn load_context(
+        async fn load_context(
             &self,
             _: &str,
         ) -> Result<
@@ -20802,10 +20858,13 @@ mod tests {
         > {
             Err("synthetic transient storage failure on load_context".into())
         }
-        fn delete_context(&self, _: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        async fn delete_context(
+            &self,
+            _: &str,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Ok(())
         }
-        fn list_persisted_contexts(
+        async fn list_persisted_contexts(
             &self,
         ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
             Ok(Vec::new())
@@ -21060,7 +21119,9 @@ mod tests {
         // Ok(None) — empty MapPersistence ⇒ load_context returns Ok(None) ⇒ reap.
         let (sup_absent, _journal) = xctx_recovery_supervisor_with_present_contexts(&[]);
         assert!(
-            sup_absent.caller_context_deleted_from_persistence(&caller_hex),
+            sup_absent
+                .caller_context_deleted_from_persistence(&caller_hex)
+                .await,
             "Ok(None) (permanently-deleted snapshot) MUST be reaped (true)"
         );
 
@@ -21068,7 +21129,9 @@ mod tests {
         let (sup_err, _journal2) =
             xctx_recovery_supervisor_with_persistence(Box::new(ErringLoadPersistence));
         assert!(
-            !sup_err.caller_context_deleted_from_persistence(&caller_hex),
+            !sup_err
+                .caller_context_deleted_from_persistence(&caller_hex)
+                .await,
             "Err(_) (transient read failure) MUST be treated conservatively as still-present \
              (false) — never mistaken for deletion"
         );
@@ -21077,7 +21140,9 @@ mod tests {
         let (sup_present, _journal3) =
             xctx_recovery_supervisor_with_present_contexts(std::slice::from_ref(&caller_hex));
         assert!(
-            !sup_present.caller_context_deleted_from_persistence(&caller_hex),
+            !sup_present
+                .caller_context_deleted_from_persistence(&caller_hex)
+                .await,
             "Ok(Some(_)) (present-but-not-yet-restored) MUST NOT be reaped (false)"
         );
     }
@@ -21795,8 +21860,9 @@ mod tests {
             }
         }
     }
+    #[async_trait::async_trait]
     impl ContextPersistence for CapturingPersistence {
-        fn persist_context(
+        async fn persist_context(
             &self,
             id: &str,
             snap: &crate::context::state::ContextSnapshot,
@@ -21804,7 +21870,7 @@ mod tests {
             self.snapshots.insert(id.to_owned(), snap.clone());
             Ok(())
         }
-        fn load_context(
+        async fn load_context(
             &self,
             id: &str,
         ) -> Result<
@@ -21813,10 +21879,13 @@ mod tests {
         > {
             Ok(self.snapshots.get(id).map(|e| e.value().clone()))
         }
-        fn delete_context(&self, _: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        async fn delete_context(
+            &self,
+            _: &str,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Ok(())
         }
-        fn list_persisted_contexts(
+        async fn list_persisted_contexts(
             &self,
         ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
             if self.restore_enabled {

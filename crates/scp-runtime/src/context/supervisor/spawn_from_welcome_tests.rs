@@ -764,15 +764,16 @@ async fn spawn_from_welcome_group_round_trips_both_directions() {
 /// snapshot write BETWEEN key-injection and durable persist.
 struct FailingPersistence;
 
+#[async_trait::async_trait]
 impl ContextPersistence for FailingPersistence {
-    fn persist_context(
+    async fn persist_context(
         &self,
         _context_id: &str,
         _snapshot: &crate::context::state::ContextSnapshot,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Err("induced persist failure at the fail-closed snapshot write".into())
     }
-    fn load_context(
+    async fn load_context(
         &self,
         _context_id: &str,
     ) -> Result<
@@ -781,13 +782,13 @@ impl ContextPersistence for FailingPersistence {
     > {
         Ok(None)
     }
-    fn delete_context(
+    async fn delete_context(
         &self,
         _context_id: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Ok(())
     }
-    fn list_persisted_contexts(
+    async fn list_persisted_contexts(
         &self,
     ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
         Ok(Vec::new())
@@ -1316,8 +1317,9 @@ struct RecordingPersistence {
     deletes: Arc<dashmap::DashSet<String>>,
 }
 
+#[async_trait::async_trait]
 impl ContextPersistence for RecordingPersistence {
-    fn persist_context(
+    async fn persist_context(
         &self,
         context_id: &str,
         snapshot: &crate::context::state::ContextSnapshot,
@@ -1325,7 +1327,7 @@ impl ContextPersistence for RecordingPersistence {
         self.store.insert(context_id.to_owned(), snapshot.clone());
         Ok(())
     }
-    fn load_context(
+    async fn load_context(
         &self,
         context_id: &str,
     ) -> Result<
@@ -1334,7 +1336,7 @@ impl ContextPersistence for RecordingPersistence {
     > {
         Ok(self.store.get(context_id).map(|e| e.value().clone()))
     }
-    fn delete_context(
+    async fn delete_context(
         &self,
         context_id: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -1342,7 +1344,7 @@ impl ContextPersistence for RecordingPersistence {
         self.store.remove(context_id);
         Ok(())
     }
-    fn list_persisted_contexts(
+    async fn list_persisted_contexts(
         &self,
     ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
         Ok(self.store.iter().map(|e| e.key().clone()).collect())
@@ -2950,6 +2952,7 @@ async fn discard_joined_context_fully_reverses_a_welcome_join() {
     );
     assert!(
         rec.load_context(&j.ctx_id)
+            .await
             .expect("load never errors")
             .is_some(),
         "the join persisted an initial Class-S snapshot"
@@ -2988,6 +2991,7 @@ async fn discard_joined_context_fully_reverses_a_welcome_join() {
     //    issued to the backend (recorded), and a subsequent load is empty.
     assert!(
         rec.load_context(&j.ctx_id)
+            .await
             .expect("load never errors")
             .is_none(),
         "no durable snapshot remains — a restore cannot resurrect the context"

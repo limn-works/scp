@@ -206,7 +206,7 @@ async fn handle_recovery_advance_epoch(
     reply: oneshot::Sender<Result<u64, ContextError>>,
 ) -> Outcome<()> {
     let advance_fut = async {
-        crate::context::trust_recovery_helpers::recovery_advance_epoch(cell, deps, context_id)
+        crate::context::trust_recovery_helpers::recovery_advance_epoch(cell, deps, context_id).await
     };
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, advance_fut).await {

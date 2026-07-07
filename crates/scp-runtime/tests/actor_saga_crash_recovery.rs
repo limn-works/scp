@@ -39,15 +39,16 @@ use scp_runtime::context::supervisor::{
 };
 
 struct NoopPersistence;
+#[async_trait::async_trait]
 impl scp_runtime::context::persistence::ContextPersistence for NoopPersistence {
-    fn persist_context(
+    async fn persist_context(
         &self,
         _: &str,
         _: &scp_runtime::context::state::ContextSnapshot,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Ok(())
     }
-    fn load_context(
+    async fn load_context(
         &self,
         _: &str,
     ) -> Result<
@@ -56,10 +57,13 @@ impl scp_runtime::context::persistence::ContextPersistence for NoopPersistence {
     > {
         Ok(None)
     }
-    fn delete_context(&self, _: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn delete_context(
+        &self,
+        _: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Ok(())
     }
-    fn list_persisted_contexts(
+    async fn list_persisted_contexts(
         &self,
     ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
         Ok(Vec::new())

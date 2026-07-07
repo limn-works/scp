@@ -71,7 +71,9 @@ use crate::context::actor::deps::ActorDeps;
 use crate::context::actor::outcome::{Outcome, outcome_error_sketch};
 use crate::context::actor::state::PerContextState;
 use crate::context::economy_logic::{ContextRevocationChecker, KeyResolverDidResolver};
-use crate::context::messaging_helpers::persist_state_fail_closed;
+use crate::context::messaging_helpers::{
+    build_snapshot_for_persist, persist_snapshot_fail_closed, persist_state_fail_closed,
+};
 use crate::context::supervisor::saga_journal::SagaId;
 use crate::context::supervisor::saga_prepared_state::{
     CommittedToolInvocation, CrossContextToolInvocationPrepared, SagaPreparedState,
@@ -332,17 +334,27 @@ async fn dispatch_commit_phase(
             committed_timestamp_secs,
             signing_key,
             reply,
-        } => emit_divergence_marker(
-            cell,
-            deps,
-            &saga_id,
-            nonce,
-            committed_side,
-            &committed_event_id,
-            committed_timestamp_secs,
-            &signing_key,
-            reply,
-        ),
+        } => {
+            // Build the owned snapshot HERE (holding `&mut ClassSCell`) and hand
+            // it to the handler, so no `&PerContextState` is held across the
+            // handler's persist `.await` (ADR-049 Decision 7 `Send` discipline).
+            let ctx_id = cell.context_id;
+            let context_hex = hex_context_id(&ctx_id);
+            let snapshot = build_snapshot_for_persist(cell, deps, &context_hex);
+            emit_divergence_marker(
+                ctx_id,
+                snapshot,
+                deps,
+                &saga_id,
+                nonce,
+                committed_side,
+                &committed_event_id,
+                committed_timestamp_secs,
+                &signing_key,
+                reply,
+            )
+            .await
+        }
         // Prepare arms are matched in `dispatch` and never routed here. They
         // are statically unreachable; return a typed error per their reply
         // shape (NEVER panic — ADR-049 §10 handler panic ban).
@@ -473,7 +485,7 @@ async fn prepare_a(
         // SUCCESS channel (structural code), but `Outcome::err_mutated` for the
         // actor's Class-S accounting — the reply payload and the Outcome are
         // intentionally orthogonal (see the validate_outbound_caller reject).
-        let _ = persist_state_fail_closed(&*cell, deps, &context_id_hex);
+        let _ = persist_state_fail_closed(&*cell, deps, &context_id_hex).await;
         let sketch = outcome_error_sketch(&rej.error);
         let _ = reply.send(Ok(PrepareAOutcome::Rejected(rej)));
         return Outcome::err_mutated(sketch);
@@ -501,7 +513,7 @@ async fn prepare_a(
                 // at initiation); persist so it durably lands, then reply.
                 // `persist_state_fail_closed` takes a SHARED `&PerContextState`, so
                 // this reads through the cell's `Deref` (`&*cell`) — no `state_mut()`.
-                let _ = persist_state_fail_closed(&*cell, deps, &context_id_hex);
+                let _ = persist_state_fail_closed(&*cell, deps, &context_id_hex).await;
                 let sketch = outcome_error_sketch(&err);
                 let _ = reply.send(Err(err));
                 return Outcome::err_mutated(sketch);
@@ -548,12 +560,15 @@ async fn prepare_a(
     //    `commit_class_s_compensating` splits the success value `T` from the
     //    compensation handle `X` and drops `X` on success, which would drop the
     //    carrier and trip its unbalanced-drop guard. See FLAG-PREPARE-A below.
-    if let Err(persist_err) = cell.commit_class_s_restore(deps, &context_id_hex, |mut view| {
-        view.class_s_mut()
-            .xctx_caller_reservations
-            .insert(saga_id.clone(), record);
-        Ok(())
-    }) {
+    if let Err(persist_err) = cell
+        .commit_class_s_restore(deps, &context_id_hex, |mut view| {
+            view.class_s_mut()
+                .xctx_caller_reservations
+                .insert(saga_id.clone(), record);
+            Ok(())
+        })
+        .await
+    {
         // Combinator already un-inserted the record (Class-S restore). Complete
         // the RAII release: reverse the Class-C economy + void the external
         // escrow from the still-owned reservation, exactly as the prior inline
@@ -982,41 +997,44 @@ async fn prepare_b(
     // one persist, nonce kept, slot rolled back only on persist failure.
     let target_hex = hex_context_id(&req.target_context_id);
     let saga_id = req.saga_id.clone();
-    if let Err(persist_err) = cell.commit_class_s_keep_restore_split(
-        deps,
-        &target_hex,
-        // Snapshot ONLY the restore-targeted field (`saga_pending`) — the
-        // pre-`f` key set, so the failure restore removes exactly the slot `f`
-        // stages and nothing else (the kept nonce is NOT snapshotted).
-        |class_s| class_s.saga_pending.keys().cloned().collect::<Vec<_>>(),
-        |mut view| {
-            let class_s = view.class_s_mut();
-            // (a) Record the accepted nonce in B's dedup cache (freshness state
-            //     lives on B) — KEEP direction. First evict TTL-expired entries
-            //     (the mutating side-effect hoisted out of the now-read-only
-            //     freshness check) so the net effect matches the prior
-            //     "evict-then-decide-then-record under one fail-closed persist".
-            //     Both eviction and record are KEEP-direction Class-S maintenance
-            //     of `xctx_nonce_dedup` covered by this combinator's single
-            //     persist.
-            class_s.xctx_nonce_dedup.evict_expired(now_secs);
-            class_s
-                .xctx_nonce_dedup
-                .record(req.asserted_nonce, now_secs);
-            // (b) Stage the prepared projection — RESTORE direction.
-            class_s.saga_pending.insert(
-                saga_id.clone(),
-                SagaPreparedState::CrossContextToolInvocation(prepared),
-            );
-            Ok(())
-        },
-        // RESTORE on persist failure: drop any `saga_pending` key not present
-        // before `f` (i.e. the just-staged slot), so a retry re-stages cleanly.
-        // The recorded nonce is NOT restored here (KEEP direction — fail-closed).
-        |class_s, keys_before| {
-            class_s.saga_pending.retain(|k, _| keys_before.contains(k));
-        },
-    ) {
+    if let Err(persist_err) = cell
+        .commit_class_s_keep_restore_split(
+            deps,
+            &target_hex,
+            // Snapshot ONLY the restore-targeted field (`saga_pending`) — the
+            // pre-`f` key set, so the failure restore removes exactly the slot `f`
+            // stages and nothing else (the kept nonce is NOT snapshotted).
+            |class_s| class_s.saga_pending.keys().cloned().collect::<Vec<_>>(),
+            |mut view| {
+                let class_s = view.class_s_mut();
+                // (a) Record the accepted nonce in B's dedup cache (freshness state
+                //     lives on B) — KEEP direction. First evict TTL-expired entries
+                //     (the mutating side-effect hoisted out of the now-read-only
+                //     freshness check) so the net effect matches the prior
+                //     "evict-then-decide-then-record under one fail-closed persist".
+                //     Both eviction and record are KEEP-direction Class-S maintenance
+                //     of `xctx_nonce_dedup` covered by this combinator's single
+                //     persist.
+                class_s.xctx_nonce_dedup.evict_expired(now_secs);
+                class_s
+                    .xctx_nonce_dedup
+                    .record(req.asserted_nonce, now_secs);
+                // (b) Stage the prepared projection — RESTORE direction.
+                class_s.saga_pending.insert(
+                    saga_id.clone(),
+                    SagaPreparedState::CrossContextToolInvocation(prepared),
+                );
+                Ok(())
+            },
+            // RESTORE on persist failure: drop any `saga_pending` key not present
+            // before `f` (i.e. the just-staged slot), so a retry re-stages cleanly.
+            // The recorded nonce is NOT restored here (KEEP direction — fail-closed).
+            |class_s, keys_before| {
+                class_s.saga_pending.retain(|k, _| keys_before.contains(k));
+            },
+        )
+        .await
+    {
         let sketch = outcome_error_sketch(&persist_err);
         let _ = reply.send(Err(persist_err));
         // The persist just FAILED, so the recorded nonce did NOT durably land;
@@ -1701,7 +1719,7 @@ async fn commit_b_first_settle(
     // Both `f`-error and persist-failure surface as `(false, err)` (mutated =
     // false). `commit_class_s_restore` already restored Class-S on persist
     // failure (capture rolled back, slot re-staged).
-    let captured_fields = match captured {
+    let captured_fields = match captured.await {
         Ok(c) => c,
         Err(err) => return Err((false, err)),
     };
@@ -1784,15 +1802,18 @@ async fn commit_b_settle_finalize(
         // fail-closed terminal the operator / crash-recovery sweep reconciles);
         // on re-persist success the original append error surfaces as
         // `(false, append_err)`.
-        return match cell.commit_class_s_keep(deps, target_hex, |mut view| {
-            let class_s = view.class_s_mut();
-            class_s.xctx_committed_outputs.remove(saga_id);
-            class_s.saga_pending.insert(
-                saga_id.clone(),
-                SagaPreparedState::CrossContextToolInvocation(prepared),
-            );
-            Ok(())
-        }) {
+        return match cell
+            .commit_class_s_keep(deps, target_hex, |mut view| {
+                let class_s = view.class_s_mut();
+                class_s.xctx_committed_outputs.remove(saga_id);
+                class_s.saga_pending.insert(
+                    saga_id.clone(),
+                    SagaPreparedState::CrossContextToolInvocation(prepared),
+                );
+                Ok(())
+            })
+            .await
+        {
             Ok(()) => Err((false, append_err)),
             Err(persist_err) => Err((true, persist_err)),
         };
@@ -2068,14 +2089,17 @@ async fn commit_a(
     // is retried from a clean state. The settle already mutated owned economy and
     // NO `CrossContextToolInvoked` was appended, so the failure is reported
     // `err_mutated` with no orphan log entry.
-    if let Err(persist_err) = cell.commit_class_s_restore(deps, &caller_hex, |mut view| {
-        let class_s = view.class_s_mut();
-        class_s
-            .xctx_committed_invocations
-            .insert(req.saga_id.clone());
-        class_s.xctx_caller_reservations.remove(&req.saga_id);
-        Ok(())
-    }) {
+    if let Err(persist_err) = cell
+        .commit_class_s_restore(deps, &caller_hex, |mut view| {
+            let class_s = view.class_s_mut();
+            class_s
+                .xctx_committed_invocations
+                .insert(req.saga_id.clone());
+            class_s.xctx_caller_reservations.remove(&req.saga_id);
+            Ok(())
+        })
+        .await
+    {
         let sketch = outcome_error_sketch(&persist_err);
         let _ = reply.send(Err(persist_err));
         return Outcome::err_mutated(sketch);
@@ -2120,12 +2144,15 @@ async fn commit_a(
         // fail-closed terminal the operator / crash-recovery sweep reconciles).
         // Mirrors `commit_b_first_settle`'s append-failure compensation. Both arms
         // reply + return `err_mutated`.
-        let (reply_err, sketch) = match cell.commit_class_s_keep(deps, &caller_hex, |mut view| {
-            view.class_s_mut()
-                .xctx_committed_invocations
-                .remove(&req.saga_id);
-            Ok(())
-        }) {
+        let (reply_err, sketch) = match cell
+            .commit_class_s_keep(deps, &caller_hex, |mut view| {
+                view.class_s_mut()
+                    .xctx_committed_invocations
+                    .remove(&req.saga_id);
+                Ok(())
+            })
+            .await
+        {
             Ok(()) => {
                 let sketch = outcome_error_sketch(&append_err);
                 (append_err, sketch)
@@ -2385,15 +2412,18 @@ async fn abort(
     // returns the persist error without restoring — byte-identical to the prior
     // inline persist-failure arm's `err_mutated`. Removing an absent key is a
     // no-op, so the unconditional removes are safe on every arm.
-    if let Err(persist_err) = cell.commit_class_s_keep(deps, &context_hex, |mut view| {
-        let class_s = view.class_s_mut();
-        // Consume the durable caller-reservation record (no-op if absent — e.g. a
-        // target-side abort or a gen-mismatch with no record).
-        class_s.xctx_caller_reservations.remove(saga_id);
-        // Clear the target-side staged tool-session slot.
-        class_s.saga_pending.remove(saga_id);
-        Ok(())
-    }) {
+    if let Err(persist_err) = cell
+        .commit_class_s_keep(deps, &context_hex, |mut view| {
+            let class_s = view.class_s_mut();
+            // Consume the durable caller-reservation record (no-op if absent — e.g. a
+            // target-side abort or a gen-mismatch with no record).
+            class_s.xctx_caller_reservations.remove(saga_id);
+            // Clear the target-side staged tool-session slot.
+            class_s.saga_pending.remove(saga_id);
+            Ok(())
+        })
+        .await
+    {
         let sketch = outcome_error_sketch(&persist_err);
         let _ = reply.send(Err(persist_err));
         return Outcome::err_mutated(sketch);
@@ -2423,13 +2453,19 @@ async fn abort(
 /// Amendment §6 carve-out), so the timestamp MUST be this convergent value and
 /// NOT an actor-local clock read, or two honest members would derive divergent
 /// marker leaves (§9.9.3).
-// Sync: the body performs only synchronous event-log append + Class-S persist,
-// so it does not `.await`. Keeping it sync lets it take a shared
-// `&PerContextState` borrow (which is `!Send`) without making the actor future
-// `!Send` — a shared ref held across an `.await` would poison the actor task.
+// `Send` discipline (ADR-049 Decision 7): the Class-S persist is now `.await`ed
+// (async `ContextPersistence`), so this handler takes the ALREADY-BUILT owned
+// `snapshot` and the `Copy` `context_id` — NOT a `&PerContextState`. A shared
+// `&PerContextState` (`!Sync`, holds a `dyn FnMut` sink) held across the persist
+// `.await` would make the actor future `!Send` and fail `tokio::spawn`. The
+// caller builds the snapshot (holding its `&mut ClassSCell`) BEFORE calling this,
+// then hands over the owned snapshot; the event-log append targets
+// `deps.event_log` (independent of `state`), so building the snapshot first is
+// behaviour-preserving.
 #[allow(clippy::too_many_arguments)]
-fn emit_divergence_marker(
-    state: &PerContextState,
+async fn emit_divergence_marker(
+    context_id: [u8; 32],
+    snapshot: crate::context::state::ContextSnapshot,
     deps: &ActorDeps,
     saga_id: &SagaId,
     nonce: [u8; 16],
@@ -2439,7 +2475,7 @@ fn emit_divergence_marker(
     signing_key: &SigningKeyBytes,
     reply: tokio::sync::oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
-    let context_hex = hex_context_id(&state.context_id);
+    let context_hex = hex_context_id(&context_id);
 
     let key = signing_key.to_signing_key();
     let marker = match CrossContextDivergenceMarker::sign(
@@ -2481,7 +2517,7 @@ fn emit_divergence_marker(
         }
     };
     if let Err(err) = deps.event_log.append_context_event_with_payload(
-        &state.context_id,
+        &context_id,
         scp_event_log::EventType::CrossContextDivergenceMarker,
         scp_event_log::system_actors::SYSTEM_SAGA_ACTOR,
         scp_event_log::EventPayload {
@@ -2494,9 +2530,11 @@ fn emit_divergence_marker(
         return Outcome::err(sketch);
     }
 
-    // Class-S sync-persist fail-closed: the divergence record is the durable
-    // audit witness operator-repair relies on; it MUST land before acking.
-    if let Err(persist_err) = persist_state_fail_closed(state, deps, &context_hex) {
+    // Class-S persist fail-closed: the divergence record is the durable
+    // audit witness operator-repair relies on; it MUST land before acking. The
+    // `snapshot` was built by the caller (from its `&mut ClassSCell`) before this
+    // handler ran, so no `&PerContextState` is held across the persist `.await`.
+    if let Err(persist_err) = persist_snapshot_fail_closed(&snapshot, deps, &context_hex).await {
         let sketch = outcome_error_sketch(&persist_err);
         let _ = reply.send(Err(persist_err));
         return Outcome::err_mutated(sketch);
@@ -2744,15 +2782,16 @@ mod tests {
 
     macro_rules! impl_persistence {
         ($ty:ty, $persist:expr) => {
+            #[async_trait::async_trait]
             impl ContextPersistence for $ty {
-                fn persist_context(
+                async fn persist_context(
                     &self,
                     _: &str,
                     _: &crate::context::state::ContextSnapshot,
                 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     $persist
                 }
-                fn load_context(
+                async fn load_context(
                     &self,
                     _: &str,
                 ) -> Result<
@@ -2761,13 +2800,13 @@ mod tests {
                 > {
                     Ok(None)
                 }
-                fn delete_context(
+                async fn delete_context(
                     &self,
                     _: &str,
                 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     Ok(())
                 }
-                fn list_persisted_contexts(
+                async fn list_persisted_contexts(
                     &self,
                 ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
                     Ok(Vec::new())
@@ -2817,8 +2856,9 @@ mod tests {
     struct FailFirstPersistence {
         calls: std::sync::atomic::AtomicUsize,
     }
+    #[async_trait::async_trait]
     impl ContextPersistence for FailFirstPersistence {
-        fn persist_context(
+        async fn persist_context(
             &self,
             _: &str,
             _: &crate::context::state::ContextSnapshot,
@@ -2830,7 +2870,7 @@ mod tests {
                 Ok(())
             }
         }
-        fn load_context(
+        async fn load_context(
             &self,
             _: &str,
         ) -> Result<
@@ -2839,10 +2879,13 @@ mod tests {
         > {
             Ok(None)
         }
-        fn delete_context(&self, _: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        async fn delete_context(
+            &self,
+            _: &str,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Ok(())
         }
-        fn list_persisted_contexts(
+        async fn list_persisted_contexts(
             &self,
         ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
             Ok(Vec::new())
@@ -2858,8 +2901,9 @@ mod tests {
         calls: std::sync::atomic::AtomicUsize,
         fail_at: usize,
     }
+    #[async_trait::async_trait]
     impl ContextPersistence for FailNthPersistence {
-        fn persist_context(
+        async fn persist_context(
             &self,
             _: &str,
             _: &crate::context::state::ContextSnapshot,
@@ -2871,7 +2915,7 @@ mod tests {
                 Ok(())
             }
         }
-        fn load_context(
+        async fn load_context(
             &self,
             _: &str,
         ) -> Result<
@@ -2880,10 +2924,13 @@ mod tests {
         > {
             Ok(None)
         }
-        fn delete_context(&self, _: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        async fn delete_context(
+            &self,
+            _: &str,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Ok(())
         }
-        fn list_persisted_contexts(
+        async fn list_persisted_contexts(
             &self,
         ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
             Ok(Vec::new())
@@ -2934,8 +2981,9 @@ mod tests {
     struct SpyPersistence {
         persist_calls: Arc<std::sync::atomic::AtomicUsize>,
     }
+    #[async_trait::async_trait]
     impl ContextPersistence for SpyPersistence {
-        fn persist_context(
+        async fn persist_context(
             &self,
             _: &str,
             _: &crate::context::state::ContextSnapshot,
@@ -2944,7 +2992,7 @@ mod tests {
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         }
-        fn load_context(
+        async fn load_context(
             &self,
             _: &str,
         ) -> Result<
@@ -2953,10 +3001,13 @@ mod tests {
         > {
             Ok(None)
         }
-        fn delete_context(&self, _: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        async fn delete_context(
+            &self,
+            _: &str,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Ok(())
         }
-        fn list_persisted_contexts(
+        async fn list_persisted_contexts(
             &self,
         ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
             Ok(Vec::new())
@@ -4961,8 +5012,11 @@ mod tests {
         let signing = signing_key_bytes(0x99);
         let saga = SagaId("saga-divergence".to_owned());
         let (tx, rx) = oneshot::channel();
+        let ctx_hex = hex_context_id(&st.context_id);
+        let snap = build_snapshot_for_persist(&st, &deps, &ctx_hex);
         let out = emit_divergence_marker(
-            &st,
+            st.context_id,
+            snap,
             &deps,
             &saga,
             [0xAB; 16],
@@ -4974,7 +5028,8 @@ mod tests {
             1_700_000_000,
             &signing,
             tx,
-        );
+        )
+        .await;
         assert!(out.result.is_ok(), "emit: {:?}", out.result);
         rx.await.unwrap().expect("emit ack");
 

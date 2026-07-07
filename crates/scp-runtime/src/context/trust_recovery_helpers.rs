@@ -202,7 +202,7 @@ pub fn add_checkpoint_cosignature(
 /// on the actor's mailbox between awaits, but the ordering of mailbox
 /// commands means a `LifecycleControl::Pause` would have already
 /// completed by the time we resume here. Re-checking is defense-in-depth.
-pub fn recovery_advance_epoch(
+pub async fn recovery_advance_epoch(
     cell: &mut ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
@@ -293,7 +293,7 @@ pub fn recovery_advance_epoch(
     //    the next 50ms tick anyway, but the legacy path persisted
     //    inline — preserve that timing for behaviour parity. Best-effort
     //    persist of the just-mutated Class-C state via a shared read.
-    persist_state_best_effort(cell, deps, context_id);
+    persist_state_best_effort(cell, deps, context_id).await;
 
     Ok(new_epoch)
 }
@@ -444,7 +444,11 @@ pub async fn recovery_notify_contact(
 /// supervisor-scoped `MlsCryptoProvider` (matches the legacy path);
 /// this collapses into `state.mode` after the MLS provider dissolution
 /// in a later Phase 2 sub-chunk.
-fn persist_state_best_effort(state: &PerContextState, deps: &ActorDeps, context_id: &str) {
+fn persist_state_best_effort<'d, 'c>(
+    state: &PerContextState,
+    deps: &'d ActorDeps,
+    context_id: &'c str,
+) -> impl std::future::Future<Output = ()> + Send + use<'d, 'c> {
     let mut snapshot = build_snapshot_from_state(state);
 
     // Export MLS crypto state alongside the context snapshot (#645).
@@ -466,15 +470,21 @@ fn persist_state_best_effort(state: &PerContextState, deps: &ActorDeps, context_
         }
     }
 
-    if let Err(e) = deps.persistence.persist_context(context_id, &snapshot) {
-        // Best-effort persistence: log but don't fail the operation.
-        // In-memory state remains authoritative.
-        crate::metrics::record_persistence_failure();
-        tracing::warn!(
-            context_id = %context_id,
-            error = %e,
-            "failed to persist context snapshot"
-        );
+    async move {
+        if let Err(e) = deps
+            .persistence
+            .persist_context(context_id, &snapshot)
+            .await
+        {
+            // Best-effort persistence: log but don't fail the operation.
+            // In-memory state remains authoritative.
+            crate::metrics::record_persistence_failure();
+            tracing::warn!(
+                context_id = %context_id,
+                error = %e,
+                "failed to persist context snapshot"
+            );
+        }
     }
 }
 

@@ -716,8 +716,9 @@ impl InMemoryContextPersistence {
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
+#[async_trait::async_trait]
 impl ContextPersistence for InMemoryContextPersistence {
-    fn persist_context(
+    async fn persist_context(
         &self,
         context_id: &str,
         snapshot: &ContextSnapshot,
@@ -729,7 +730,7 @@ impl ContextPersistence for InMemoryContextPersistence {
         Ok(())
     }
 
-    fn load_context(&self, context_id: &str) -> Result<Option<ContextSnapshot>, BoxError> {
+    async fn load_context(&self, context_id: &str) -> Result<Option<ContextSnapshot>, BoxError> {
         let guard = self
             .contexts
             .lock()
@@ -737,7 +738,7 @@ impl ContextPersistence for InMemoryContextPersistence {
         Ok(guard.get(context_id).cloned())
     }
 
-    fn delete_context(&self, context_id: &str) -> Result<(), BoxError> {
+    async fn delete_context(&self, context_id: &str) -> Result<(), BoxError> {
         self.contexts
             .lock()
             .map_err(|e| -> BoxError { Box::new(std::io::Error::other(e.to_string())) })?
@@ -745,7 +746,7 @@ impl ContextPersistence for InMemoryContextPersistence {
         Ok(())
     }
 
-    fn list_persisted_contexts(&self) -> Result<Vec<String>, BoxError> {
+    async fn list_persisted_contexts(&self) -> Result<Vec<String>, BoxError> {
         let guard = self
             .contexts
             .lock()
@@ -760,8 +761,9 @@ impl ContextPersistence for InMemoryContextPersistence {
 /// rule prevents implementing `ContextPersistence` for `Arc<T>` directly.
 struct SharedPersistence(Arc<InMemoryContextPersistence>);
 
+#[async_trait::async_trait]
 impl ContextPersistence for SharedPersistence {
-    fn persist_context(
+    async fn persist_context(
         &self,
         context_id: &str,
         snapshot: &ContextSnapshot,
@@ -769,15 +771,15 @@ impl ContextPersistence for SharedPersistence {
         self.0.persist_context(context_id, snapshot)
     }
 
-    fn load_context(&self, context_id: &str) -> Result<Option<ContextSnapshot>, BoxError> {
+    async fn load_context(&self, context_id: &str) -> Result<Option<ContextSnapshot>, BoxError> {
         self.0.load_context(context_id)
     }
 
-    fn delete_context(&self, context_id: &str) -> Result<(), BoxError> {
+    async fn delete_context(&self, context_id: &str) -> Result<(), BoxError> {
         self.0.delete_context(context_id)
     }
 
-    fn list_persisted_contexts(&self) -> Result<Vec<String>, BoxError> {
+    async fn list_persisted_contexts(&self) -> Result<Vec<String>, BoxError> {
         self.0.list_persisted_contexts()
     }
 }
