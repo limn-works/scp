@@ -11,7 +11,6 @@
 //! - Broadcast keys → `DashMap<[u8;32], SenderKey>`
 //! - Wrapping keys (X25519, §9.16.1) → `ArcSwap<...>` for atomic rotation; the
 //!   supervisor exposes per-identity accessors that mirror the same source.
-//! - Pending Welcome-join state → `ArcSwap<Option<Arc<PendingJoinState>>>`
 //! - Taken-context tracking → `DashSet<[u8;32]>`
 //!
 //! No `std::sync::Mutex` survives in this file (CI: `clippy.toml`'s
@@ -29,10 +28,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-// `ArcSwapOption` backs the test/feature-gated `pending_joins` single-slot join
-// state only; importing it in the production build would be an unused import.
-#[cfg(any(test, feature = "testing"))]
-use arc_swap::ArcSwapOption;
 use dashmap::{DashMap, DashSet};
 
 use openmls::prelude::*;
@@ -373,25 +368,6 @@ impl std::fmt::Debug for OwnedMlsCryptoState {
     }
 }
 
-/// State retained for a pending Welcome-based join operation.
-///
-/// When [`MlsCryptoProvider::prepare_key_package_for_join`] generates a key
-/// package, the signer and provider are retained here so that a subsequent
-/// [`MlsCryptoProvider::join_from_welcome`] call can reconstruct the group.
-///
-/// Test/feature-gated alongside those two legacy methods (the only readers /
-/// writers of this state), so the production build does not carry the
-/// unbackstopped single-slot join state.
-#[cfg(any(test, feature = "testing"))]
-struct PendingJoinState {
-    /// The signing key pair for the generated key package, wrapped in
-    /// [`EagerDropSigner`] for best-effort zeroization (consistent with
-    /// [`ScpMlsGroup::signer`]).
-    signer: scp_mls::group::EagerDropSigner,
-    /// The MLS provider holding the key package's private state.
-    provider: scp_mls::InMemoryMlsProvider,
-}
-
 /// Production `ContextCryptoProvider` backed by `OpenMLS`.
 ///
 /// Manages per-context MLS groups and sender keys. Thread-safe via internal
@@ -467,23 +443,6 @@ pub struct MlsCryptoProvider {
     /// poll) is enforced at every callsite — no callsite stores the
     /// loaded `Arc` in a struct field.
     wrapping_secret_key: ArcSwap<Zeroizing<[u8; 32]>>,
-    /// Pending key package state for Welcome-based joins (§5.12.3).
-    /// `prepare_key_package_for_join` replaces any previous entry;
-    /// `join_from_welcome` takes it. `ArcSwapOption` enforces the
-    /// single-entry invariant at the type level (None = no pending
-    /// join, Some = one pending key package).
-    ///
-    /// `swap(None)` is the atomic take primitive; the consumer then
-    /// `Arc::try_unwrap`s to extract the [`PendingJoinState`]. The
-    /// provider is the sole writer of this slot — `swap` returns an
-    /// `Arc` whose strong count is 1 in the absence of concurrent
-    /// `load`s, so `try_unwrap` succeeds in the steady state.
-    ///
-    /// Test/feature-gated alongside the legacy `prepare_key_package_for_join` /
-    /// `join_from_welcome` methods that are its sole writer / reader, so the
-    /// production build carries no unbackstopped single-slot join state.
-    #[cfg(any(test, feature = "testing"))]
-    pending_joins: ArcSwapOption<PendingJoinState>,
     /// Contexts whose crypto state has been destructively moved into a
     /// [`crate::context::actor::ContextActor`] via
     /// [`Self::take_crypto_state`] (ADR-049 commit 12).
@@ -584,8 +543,6 @@ impl MlsCryptoProvider {
             broadcast_keys: DashMap::new(),
             wrapping_public_key: ArcSwap::from_pointee(wrapping_public_key),
             wrapping_secret_key: ArcSwap::from_pointee(Zeroizing::new(wrapping_secret_key)),
-            #[cfg(any(test, feature = "testing"))]
-            pending_joins: ArcSwapOption::empty(),
             taken_context_ids: DashSet::new(),
             #[cfg(any(test, feature = "testing"))]
             force_export_failure: std::sync::atomic::AtomicBool::new(false),
@@ -946,11 +903,23 @@ impl MlsCryptoProvider {
     /// slice) single-slot join path produced.
     ///
     /// The joiner's OWN sender key is generated LOCALLY here (spec §9.16.1);
-    /// it is NOT carried in the Welcome. Other members' sender keys and the
-    /// per-member access keys (§9.17) arrive later via sender-key-distribution
-    /// application messages / out-of-band exchange, so `sender_key_store`,
-    /// `member_wrapping_keys`, and `recv_sequence_tracker` start empty — the
-    /// same initial shape a fresh join produces.
+    /// it is NOT carried in the Welcome. Other members' sender keys arrive
+    /// later on demand via the PULL protocol (§9.16.2): the joiner sends a
+    /// `SenderKeyRequest` — carrying a fresh EPHEMERAL wrapping key — to each
+    /// incumbent, whose `handle_sender_key_request` seals its sender key to
+    /// that ephemeral key. So `sender_key_store` and `recv_sequence_tracker`
+    /// start empty — the same initial shape a fresh join produces.
+    ///
+    /// `member_wrapping_keys` also starts empty and, for a joiner, STAYS empty:
+    /// it caches other members' STABLE wrapping keys, which are used ONLY by the
+    /// proactive/offline PUSH path (`distribute_sender_key` / `rotate_sender_key`,
+    /// §9.16.1) and are populated on the incumbent/adder side from the added
+    /// `KeyPackage`'s leaf (`add_member_from_bytes`). openmls 0.8.1 exposes no
+    /// public way to read a remote member's `scp_wrapping_key` `LeafNode` extension
+    /// from a joined group (ADR-057; see `scp_mls::wrapping_extension`), so a
+    /// joiner cannot learn incumbents' stable keys — but it does not need them:
+    /// it reaches every incumbent through the pull protocol above, and answers
+    /// incumbents' pulls via the ephemeral key in their requests.
     ///
     /// # Refuses to overwrite a live group
     ///
@@ -1695,6 +1664,59 @@ impl MlsCryptoProvider {
         }
     }
 
+    /// Stores a member's sender key recovered from a PULL response (§9.16.2).
+    ///
+    /// This is the store half of pull-response ingest — the requester-side
+    /// counterpart to the push path's [`Self::process_incoming_sender_key`].
+    /// After this node issues a `SenderKeyRequest` and the sender answers via
+    /// [`Self::handle_sender_key_request`], the requester opens the HPKE-sealed
+    /// response with the EPHEMERAL wrapping secret it generated for the request
+    /// (via `key_protocol::open_sender_key_response`, which verifies the RFC 9180
+    /// AEAD tag and the context/sender/epoch binding) and lands the authenticated
+    /// key here. The key is therefore never injected blind: it is only reachable
+    /// by presenting a response that opens under the requester's own ephemeral
+    /// secret.
+    ///
+    /// Applies the SAME epoch monotonicity (`set_checked`) and epoch-poisoning
+    /// (`MAX_EPOCH_ADVANCE`) defenses as the push path (§9.16.1, §9.16.5), so a
+    /// stale or artificially-inflated epoch cannot rewind or wedge the store.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::CryptoFailed`] if no group is registered for
+    /// `context_id`, if `epoch` exceeds `current_epoch + MAX_EPOCH_ADVANCE`
+    /// (epoch poisoning), or if the monotonicity check rejects a rewind.
+    pub fn store_member_sender_key(
+        &self,
+        context_id: &[u8; 32],
+        sender_did: &str,
+        sender_key: SenderKey,
+        epoch: u64,
+    ) -> Result<(), ContextError> {
+        let ctx_id_hex = hex::encode(context_id);
+        // ADR-049 commit 12c.9f: lock-free `DashMap::get_mut`.
+        let mut entry = self.contexts.get_mut(context_id).ok_or_else(|| {
+            ContextError::CryptoFailed("no MLS group for this context".to_string())
+        })?;
+        let state = entry.value_mut();
+
+        // Epoch poisoning defense (mirrors `process_incoming_sender_key`):
+        // reject a claimed epoch unreasonably far above the current one so an
+        // attacker cannot set epoch=u64::MAX to permanently block future
+        // rotations via the monotonicity check.
+        let current_epoch = state.sender_key_store.epoch(&ctx_id_hex, sender_did);
+        if epoch > current_epoch.saturating_add(MAX_EPOCH_ADVANCE) {
+            return Err(ContextError::CryptoFailed(
+                "epoch poisoning: claimed epoch exceeds acceptable advance".into(),
+            ));
+        }
+        state
+            .sender_key_store
+            .set_checked(&ctx_id_hex, sender_did, sender_key, epoch)
+            .map_err(|e| ContextError::CryptoFailed(format!("epoch check failed: {e}")))?;
+        Ok(())
+    }
+
     /// Handles an incoming sender key request from a remote member.
     ///
     /// Verifies the request, checks replay protection, and HPKE-seals the
@@ -1759,13 +1781,37 @@ impl MlsCryptoProvider {
             ));
         }
 
-        // H1: Membership check — requester must be a known member (has a
-        // wrapping key registered via add_member). Prevents non-members
-        // from obtaining sender keys even if they forge a valid request.
-        if !state
-            .member_wrapping_keys
-            .contains_key(&request.requester_did)
-        {
+        // H1: Membership check — requester must be a CURRENT MLS group member,
+        // per spec §9.16.6 Mitigation 1 ("handle_sender_key_request MUST verify
+        // that the requester's DID is a current member of the context").
+        //
+        // Membership is read authoritatively from the MLS group tree — the same
+        // DID-match over `members()` that `remove_member` uses — NOT from
+        // `member_wrapping_keys`. That map only records members whose STABLE
+        // wrapping key this node happens to have cached (populated on the
+        // incumbent/adder side in `add_member_from_bytes`, from the added
+        // `KeyPackage`'s own leaf). A Welcome-joiner's map starts empty
+        // (`install_joined_group`), so gating on it would make the joiner reject
+        // every incumbent's key request and be permanently RECEIVE-ONLY. The
+        // pull protocol (§9.16.2) seals the response to the fresh EPHEMERAL
+        // `request.wrapping_pubkey` carried in the request, so the responder
+        // never needs the requester's stable key to answer — only proof that the
+        // requester is a member, which the group tree provides directly.
+        let members = state
+            .mls_group
+            .members()
+            .map_err(|e: scp_mls::error::MlsError| ContextError::CryptoFailed(e.to_string()))?;
+        let mut requester_is_member = false;
+        for member in &members {
+            if let Ok(basic_cred) = BasicCredential::try_from(member.credential.clone())
+                && let Ok(scp_cred) = ScpCredential::from_bytes(basic_cred.identity())
+                && scp_cred.did == request.requester_did
+            {
+                requester_is_member = true;
+                break;
+            }
+        }
+        if !requester_is_member {
             return Err(ContextError::CryptoFailed(
                 "sender key request from non-member".to_string(),
             ));
@@ -2324,6 +2370,21 @@ impl MlsCryptoProvider {
         result
     }
 
+    /// Test-only snapshot of the provider's identity-level X25519 wrapping
+    /// keypair (§9.16.1): `(public, secret)`. Lets the full-stack harness
+    /// publish the provider's OWN self-consistent keypair into the joiner's
+    /// `Supervisor::set_wrapping_keys` slot so the pooled `KeyPackage`'s `0xFF01`
+    /// wrapping-leaf pubkey and the secret this provider opens sender keys with
+    /// stay the SAME keypair across the reserve → `spawn_actor_from_welcome` join
+    /// migration. The wrapping SECRET never leaves the provider in a prod build.
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub fn wrapping_keypair_snapshot(&self) -> ([u8; 32], zeroize::Zeroizing<[u8; 32]>) {
+        let public = **self.wrapping_public_key.load();
+        let secret = zeroize::Zeroizing::new(***self.wrapping_secret_key.load());
+        (public, secret)
+    }
+
     /// Restores per-context cryptographic state from a previously exported
     /// byte blob (produced by [`export_crypto_state`](Self::export_crypto_state)).
     ///
@@ -2732,164 +2793,6 @@ impl MlsCryptoProvider {
                     .restore_epoch_high_water(&ctx_id_hex, &did, epoch);
             }
         }
-
-        Ok(())
-    }
-
-    /// Generates a key package for joining a group via Welcome.
-    /// Returns TLS-serialized key package bytes. The provider retains the
-    /// private state needed to process the incoming Welcome.
-    ///
-    /// Default: not supported (returns error).
-    ///
-    /// # Superseded by the actor reserve→confirm protocol
-    ///
-    /// This single-slot path (one outstanding `pending_joins` entry at a time)
-    /// is superseded by the per-identity
-    /// [`KeyPackageStoreActor`](crate::context::supervisor::key_package_actor::KeyPackageStoreActor)
-    /// reserve→confirm/cancel protocol, which tracks an arbitrary number of
-    /// concurrent reservations keyed by `ReservationId`. The join-from-welcome
-    /// spawn entrypoint has landed (core slice); this legacy provider path is now
-    /// dead and is retained only until the FFI follow-on slice lands, which
-    /// deletes it. No new call sites should use it.
-    ///
-    /// # Test/feature-gated (single-use backstop bypass)
-    ///
-    /// This legacy path generates the KP in the provider's in-memory single
-    /// slot and joins via `group::join_group_from_bytes` directly, BYPASSING the
-    /// crypto-layer consumed-init-key backstop ([`MlsBackend::join_from_welcome`]
-    /// in `ProductionMlsBackend`). Its only callers are feature-gated test seams
-    /// (the `scp-testing` fullstack harness, pulled into `scp-ffi` solely via
-    /// `allow_in_memory_custody`, which transitively enables `scp-runtime/testing`).
-    /// Gating it behind `#[cfg(any(test, feature = "testing"))]` makes the
-    /// PRODUCTION build unable to wire the unbackstopped path — production joins
-    /// MUST flow through `MlsBackend::join_from_welcome`.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ContextError::CryptoFailed`] if key package generation fails.
-    #[cfg(any(test, feature = "testing"))]
-    pub fn prepare_key_package_for_join(&self) -> Result<Vec<u8>, ContextError> {
-        use tls_codec::Serialize as TlsSerializeTrait;
-
-        let credential = self
-            .make_credential()
-            .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
-
-        // ADR-049 commit 12c.9f: load wrapping pubkey through `ArcSwap`.
-        // The provider always holds a wrapping key, so this join KP declares
-        // BOTH `0xFF01` (wrapping) and `0xFF02` (context params). The `0xFF02`
-        // declaration is mandatory to be added to an SCP context group whose
-        // `group_context` carries the `scp_context_params` extension: `OpenMLS`
-        // rejects (`valn0502`) an Add whose leaf does not declare it (§5.13.3).
-        let wrapping_pk = **self.wrapping_public_key.load();
-
-        let (kp_bundle, signer, provider) =
-            scp_mls::group::generate_key_package_with_context_params(
-                &credential,
-                Some(&wrapping_pk),
-                self.clock.as_ref(),
-            )
-            .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
-
-        let kp_bytes = kp_bundle
-            .key_package()
-            .tls_serialize_detached()
-            .map_err(|e| ContextError::CryptoFailed(format!("serializing key package: {e}")))?;
-
-        // Only one key package can be outstanding at a time.
-        // New prepare calls replace the old pending state to avoid
-        // LIFO matching errors when Welcomes arrive out of order.
-        // ADR-049 commit 12c.9f: `ArcSwapOption::store` is atomic; any
-        // prior `Some` is dropped (with its `Zeroizing` signer wrapper).
-        self.pending_joins.store(Some(Arc::new(PendingJoinState {
-            signer: scp_mls::group::EagerDropSigner::new(signer),
-            provider,
-        })));
-
-        Ok(kp_bytes)
-    }
-
-    /// Joins an MLS group from a TLS-serialized Welcome message.
-    /// Consumes the retained key package state from `prepare_key_package_for_join`.
-    ///
-    /// Default: not supported (returns error).
-    ///
-    /// # Superseded by the actor reserve→confirm protocol
-    ///
-    /// Paired with the superseded
-    /// [`Self::prepare_key_package_for_join`]: the actor-native flow reserves a
-    /// KP from the
-    /// [`KeyPackageStoreActor`](crate::context::supervisor::key_package_actor::KeyPackageStoreActor),
-    /// joins from the returned signer-state, then confirms/cancels the
-    /// reservation. The join-from-welcome spawn entrypoint has landed (core
-    /// slice); this provider path is now dead and is retained only until the FFI
-    /// follow-on slice lands, which deletes it.
-    ///
-    /// # Test/feature-gated (single-use backstop bypass)
-    ///
-    /// This legacy path calls `group::join_group_from_bytes` directly, BYPASSING
-    /// the crypto-layer consumed-init-key backstop ([`MlsBackend::join_from_welcome`]
-    /// in `ProductionMlsBackend`). Its only callers are feature-gated test seams,
-    /// so it is gated behind `#[cfg(any(test, feature = "testing"))]` to keep the
-    /// PRODUCTION build from wiring the unbackstopped path — production joins MUST
-    /// flow through `MlsBackend::join_from_welcome`.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ContextError::CryptoFailed`] if Welcome processing fails.
-    #[cfg(any(test, feature = "testing"))]
-    pub fn join_from_welcome(
-        &self,
-        context_id: &[u8; 32],
-        welcome_bytes: &[u8],
-    ) -> Result<(), ContextError> {
-        // ADR-049 commit 12c.9f: atomic take via `ArcSwapOption::swap(None)`.
-        // The provider is the sole writer; in the steady state (no
-        // concurrent reader holding a `load`-ed Arc) the returned Arc
-        // has strong count 1 and `Arc::try_unwrap` succeeds. If a
-        // concurrent reader keeps a strong reference alive we fall back
-        // to a defensive error rather than panicking — but no production
-        // call path does this today.
-        let pending_arc = self.pending_joins.swap(None).ok_or_else(|| {
-            ContextError::CryptoFailed("no pending key package for Welcome".into())
-        })?;
-        let mut entry = Arc::try_unwrap(pending_arc).map_err(|_| {
-            ContextError::CryptoFailed(
-                "pending join state still aliased — concurrent join_from_welcome racing".into(),
-            )
-        })?;
-
-        let signer = entry.signer.take().ok_or_else(|| {
-            ContextError::CryptoFailed("pending join signer already consumed".into())
-        })?;
-
-        let group = scp_mls::group::join_group_from_bytes(welcome_bytes, entry.provider, signer)
-            .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
-
-        let sender_key = generate_sender_key();
-
-        // ADR-049 commit 12c.9f: lock-free `DashMap` writes. Destroy any
-        // existing MLS group state for this context to ensure proper key
-        // material cleanup (defense-in-depth).
-        if let Some((_, mut old_state)) = self.contexts.remove(context_id) {
-            let _ = group::destroy_group(&mut old_state.mls_group);
-        }
-
-        self.contexts.insert(
-            *context_id,
-            ContextCryptoState {
-                mls_group: group,
-                sender_key,
-                sender_key_store: SenderKeyStore::new(),
-                sender_key_epoch: 1,
-                send_sequence: 0,
-                pending_distributions: Vec::new(),
-                nonce_dedup: NonceDedup::new(),
-                member_wrapping_keys: HashMap::new(),
-                recv_sequence_tracker: HashMap::new(),
-            },
-        );
 
         Ok(())
     }
@@ -4661,38 +4564,25 @@ mod tests {
     /// derive its id from a real string rather than an arbitrary 32-byte value.
     const TEST_CTX_STR: &str = "h9-ceiling-ctx";
 
-    fn setup_alice_bob_two_party() -> (MlsCryptoProvider, MlsCryptoProvider, [u8; 32], String) {
+    fn setup_alice_bob_two_party() -> (
+        Arc<MlsCryptoProvider>,
+        Arc<MlsCryptoProvider>,
+        [u8; 32],
+        String,
+    ) {
         let alice_did = TEST_DID;
         let bob_did = "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo";
-        let context_id = scp_protocol::context::context_id_bytes(TEST_CTX_STR);
-
-        let alice = MlsCryptoProvider::new(alice_did.to_string(), Arc::new(SystemClock));
-        alice.create_mls_group(&context_id).unwrap();
-        alice.generate_sender_key(&context_id).unwrap();
-
-        let bob = MlsCryptoProvider::new(bob_did.to_string(), Arc::new(SystemClock));
-        let bob_kp_bytes = bob.prepare_key_package_for_join().unwrap();
-
-        let add_output = alice
-            .add_member(&context_id, bob_did, Some(&bob_kp_bytes))
-            .unwrap();
-
-        bob.join_from_welcome(&context_id, &add_output.welcome_bytes)
-            .unwrap();
-        bob.generate_sender_key(&context_id).unwrap();
-
-        // Distribute Alice's sender key to Bob via the legitimate path.
-        // This sets `bob.sender_key_store.epoch(ctx, alice_did) = 1`,
-        // which is the H9 high-water mark.
-        alice.distribute_sender_key(&context_id, bob_did).unwrap();
-        let pending = alice
-            .drain_pending_sender_key_messages(&context_id)
-            .unwrap();
-        assert_eq!(pending.len(), 1);
-        for (_target, msg) in pending {
-            bob.process_incoming_sender_key(&context_id, alice_did, &msg)
-                .unwrap();
-        }
+        // Stand up the joined pair over the REAL reserve → creator-add → sign →
+        // HPKE-seal → spawn-from-Welcome path (the legacy provider-level
+        // prepare/join shortcut is retired). The helper also distributes Alice's
+        // sender key to Bob, so `bob.sender_key_store.epoch(ctx, alice_did) = 1` —
+        // the H9 high-water mark these tests anchor on.
+        let (alice, bob, context_id) =
+            crate::crypto::mls::two_party_test_support::stand_up_two_party(
+                TEST_CTX_STR,
+                alice_did,
+                bob_did,
+            );
 
         (alice, bob, context_id, alice_did.to_string())
     }
@@ -5280,34 +5170,21 @@ mod tests {
     /// which the string-driven helper cannot address.)
     fn setup_two_party_for_ctx_string(
         ctx_str: &str,
-    ) -> (MlsCryptoProvider, MlsCryptoProvider, [u8; 32], String) {
+    ) -> (
+        Arc<MlsCryptoProvider>,
+        Arc<MlsCryptoProvider>,
+        [u8; 32],
+        String,
+    ) {
         let alice_did = TEST_DID;
         let bob_did = "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo";
-        let context_id = scp_protocol::context::context_id_bytes(ctx_str);
-
-        let alice = MlsCryptoProvider::new(alice_did.to_string(), Arc::new(SystemClock));
-        alice.create_mls_group(&context_id).unwrap();
-        alice.generate_sender_key(&context_id).unwrap();
-
-        let bob = MlsCryptoProvider::new(bob_did.to_string(), Arc::new(SystemClock));
-        let bob_kp_bytes = bob.prepare_key_package_for_join().unwrap();
-        let add_output = alice
-            .add_member(&context_id, bob_did, Some(&bob_kp_bytes))
-            .unwrap();
-        bob.join_from_welcome(&context_id, &add_output.welcome_bytes)
-            .unwrap();
-        bob.generate_sender_key(&context_id).unwrap();
-
-        // Distribute Alice's sender key to Bob via the legitimate path so Bob
-        // can decrypt Alice's app-data sends.
-        alice.distribute_sender_key(&context_id, bob_did).unwrap();
-        let pending = alice
-            .drain_pending_sender_key_messages(&context_id)
-            .unwrap();
-        for (_target, msg) in pending {
-            bob.process_incoming_sender_key(&context_id, alice_did, &msg)
-                .unwrap();
-        }
+        // Stand up the joined pair over the REAL join path, keyed by
+        // `context_id_bytes(ctx_str)`. The helper distributes Alice's sender key
+        // to Bob so Bob can decrypt Alice's app-data sends.
+        let (alice, bob, context_id) =
+            crate::crypto::mls::two_party_test_support::stand_up_two_party(
+                ctx_str, alice_did, bob_did,
+            );
 
         (alice, bob, context_id, alice_did.to_string())
     }

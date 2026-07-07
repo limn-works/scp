@@ -69,6 +69,7 @@ pub mod context {
     pub use scp_runtime::context::app_sandbox;
     pub use scp_runtime::context::builder;
     pub use scp_runtime::context::export_import;
+    pub use scp_runtime::context::invitation_helpers;
     pub use scp_runtime::context::key_destruction;
     pub use scp_runtime::context::policy;
     pub use scp_runtime::context::providers;

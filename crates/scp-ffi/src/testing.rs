@@ -24,11 +24,10 @@
 //! production builds.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
-use scp_core::context::governance::KeyResolver;
 use scp_core::context::{Capability, ContextHandle, ContextMode, ContextParams};
 use scp_testing::fullstack::{FullStackNetwork, FullStackNode};
 
@@ -66,11 +65,6 @@ where
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let network = guard.get_or_insert_with(FullStackNetwork::new);
     f(network)
-}
-
-/// Returns a permissive key resolver that always returns `None`.
-fn permissive_key_resolver() -> KeyResolver {
-    Arc::new(|_did: &scp_did::DID, _kid: scp_did::SigningKeyId| None)
 }
 
 // ---------------------------------------------------------------------------
@@ -121,7 +115,7 @@ impl PyFullStackNode {
 fn fullstack_create_node_impl(bi: &PyBridgeInstance, did: String) -> PyFullStackNode {
     let instance_id = bi.core.instance_id();
     with_network(bi, |network| {
-        let node = network.create_node(&did, permissive_key_resolver());
+        let node = network.create_node(&did);
         PyFullStackNode {
             inner: node,
             handles: Mutex::new(HashMap::new()),
@@ -222,38 +216,43 @@ fn fullstack_add_member_impl(
         })
 }
 
-/// Joins a context by retrieving the Welcome from the shared `KeyExchange`.
+/// Joins a context from the sealed invitation the creator deposited in the
+/// shared `KeyExchange`, standing up a live, send-capable per-context ACTOR via
+/// `Supervisor::spawn_actor_from_welcome` (ADR-049 §9 2F-residual).
 ///
-/// The joiner's `E2eCryptoProvider` processes the Welcome and picks up the
-/// access/sender keys so it can DECRYPT messages from the creator. It does
-/// NOT register a per-context send `ContextHandle`: the actor-per-context
-/// model has no spawn-from-Welcome entrypoint yet (the separate
-/// Welcome-Delivery work item), so a subsequent `fullstack_send_message` on a
-/// Welcome-joined node fails closed with "context not found in node's
-/// handles". The unidirectional path (creator sends, joiner decrypts) is
-/// fully supported.
+/// The joiner opens the creator-signed, HPKE-sealed bundle under its #active
+/// split custody, installs the joined MLS group, spawns the actor, and picks up
+/// the inviter-minted access keys + HPKE-sealed sender-key distribution. The
+/// joiner IS now a registered, send-capable participant — a subsequent
+/// `fullstack_send_message` on a Welcome-joined node succeeds (bidirectional).
 fn fullstack_join_from_welcome_impl(
     bi: &PyBridgeInstance,
     node: &PyFullStackNode,
     context_id: String,
 ) -> PyResult<()> {
     crate::pyscp_check_handle!(&bi.core, node);
+    let rt = crate::runtime()?;
     // ADR-056: key the shared crypto under the canonical digest via the
     // chokepoint, never the raw routing primitive (which double-hashes a real
     // 64-hex id and would diverge from the creator's deposit slot).
     let ctx_bytes = scp_core::context::state::context_id_to_bytes(&context_id);
 
-    // ADR-049 commit 12c.9f: the joiner's MLS group, sender keys, and access
-    // keys live directly in its `E2eCryptoProvider` (the joiner has no context
-    // actor). `join_from_welcome` forms the group from the captured Welcome,
-    // picks up the inviter-minted access keys, processes the inviter's
-    // HPKE-sealed sender-key distribution, and applies any epoch-advance
-    // Commits — all real crypto.
-    node.inner
-        .join_from_welcome(&context_id, &ctx_bytes)
+    // The joiner reserves its own KeyPackage, the creator's `invite_member`
+    // seals the Welcome, and `spawn_actor_from_welcome` opens it under split
+    // custody, installs the joined group, and registers a live actor. The
+    // returned `ContextHandle` is stored in the node's handle map so a
+    // subsequent `fullstack_send_message` on this joiner resolves it — the
+    // joiner is now a bidirectional, send-capable participant.
+    let handle = rt
+        .block_on(node.inner.join_from_welcome(&context_id, &ctx_bytes))
         .map_err(|e| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("failed to join from Welcome: {e}"))
-        })
+        })?;
+    node.handles
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(context_id, handle);
+    Ok(())
 }
 
 /// Synchronises sender keys between two nodes for a given context.
@@ -371,9 +370,12 @@ fn fullstack_decrypt_message_impl<'py>(
     // ADR-056: key decryption under the canonical digest via the chokepoint,
     // never the raw routing primitive.
     let ctx_bytes = scp_core::context::state::context_id_to_bytes(&context_id);
-    let plaintext = node
-        .inner
-        .decrypt_message(&context_id, &ctx_bytes, ciphertext, &sender_did)
+    let rt = crate::runtime()?;
+    let plaintext = rt
+        .block_on(
+            node.inner
+                .decrypt_message(&context_id, &ctx_bytes, ciphertext, &sender_did),
+        )
         .map_err(|e| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("failed to decrypt message: {e}"))
         })?;

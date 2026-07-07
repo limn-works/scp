@@ -32,5 +32,11 @@ pub mod provider;
 pub mod storage;
 pub mod storage_adapter;
 
+// Shared two-party joined-pair bootstrap for provider-level unit tests (drives
+// the REAL reserve → creator-add → sign → HPKE-seal → spawn-from-Welcome join
+// path). Test-only: its sole callers are in-crate `#[cfg(test)]` fixtures.
+#[cfg(test)]
+pub(crate) mod two_party_test_support;
+
 pub use provider::MlsCryptoProvider;
 pub use storage::{MlsStorageBridge, MlsStorageBridgeError, ScpMlsProvider};

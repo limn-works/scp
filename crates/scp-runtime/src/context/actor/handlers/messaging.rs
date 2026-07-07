@@ -130,6 +130,13 @@ pub(crate) async fn dispatch(
             role,
             reply,
         } => handle_test_insert_member(cell, deps, &member_did, &role, reply),
+        #[cfg(feature = "testing")]
+        MessagingCommand::TestInstallAccessKey {
+            context_id,
+            member_did,
+            key,
+            reply,
+        } => handle_test_install_access_key(cell, &context_id, &member_did, key, reply),
         MessagingCommand::ReportDegradedMode {
             context_id,
             compat,
@@ -235,6 +242,45 @@ fn handle_test_insert_member(
     })();
     let _ = reply.send(result);
     Outcome::ok(())
+}
+
+/// Handle [`MessagingCommand::TestInstallAccessKey`] (actor-shape, test-only).
+///
+/// Stores a member's access key into the context's access key store — exactly
+/// as an executed `GenerateContextAccessKey` (or the deferred §9.17 production
+/// pull-response ingest, #2050) would for that one entry — but with a key the
+/// harness recovered through the REAL §9.17 pull round trip, not one minted
+/// locally. Rejects an inactive context so a mis-targeted test fails loudly.
+/// Routes the store through the non-persisting `class_c_view` (the run loop
+/// persists on `mutated`), mirroring [`generate_context_access_key`](crate::context::queries_helpers::generate_context_access_key).
+#[cfg(feature = "testing")]
+fn handle_test_install_access_key(
+    cell: &mut crate::context::actor::class_s::ClassSCell,
+    context_id: &str,
+    member_did: &str,
+    key: scp_protocol::crypto::access_keys::AccessKey,
+    reply: oneshot::Sender<Result<(), ContextError>>,
+) -> Outcome<()> {
+    let result = (|| {
+        crate::context::state::require_active(&cell.handle)?;
+        cell.class_c_view()
+            .access_mut()
+            .access_key_store
+            .set(context_id, member_did, key);
+        Ok(())
+    })();
+    // Mirror the reference handler
+    // [`handle_generate_context_access_key_actor`]: a successful install
+    // mutated the persisted `access_key_store`, so mark the actor dirty
+    // (`ok_mutated`) — otherwise a joiner restored from its spawn-time snapshot
+    // would lose the pulled §9.17 keys. The only error path is `require_active`
+    // failing BEFORE any write, so on error nothing was mutated (`err`).
+    let outcome = match &result {
+        Ok(()) => Outcome::ok_mutated(()),
+        Err(e) => Outcome::err(outcome_error_sketch(e)),
+    };
+    let _ = reply.send(result);
+    outcome
 }
 
 /// Handle [`MessagingCommand::SendMessage`] (actor-shape): reserve a

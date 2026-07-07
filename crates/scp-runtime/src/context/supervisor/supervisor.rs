@@ -11394,6 +11394,27 @@ impl Supervisor {
                     };
                     let handle = state.handle.clone();
 
+                    // 3a. Activate the joiner's lifecycle handle. A freshly-built
+                    //     handle is `Creating` (`ContextHandle::new`); the create and
+                    //     restore paths transition to `Active` once their group is
+                    //     installed, and a Welcome-JOINER is equally live at this point
+                    //     — its MLS group is installed (step 2) and its authority is
+                    //     verified (step 1b). Without this transition the joined context
+                    //     is stuck in `Creating`, so every `Active`-gated operation
+                    //     (send, governance, TTL) fails closed with `ContextNotActive`
+                    //     — i.e. the "live send-capable actor" this entrypoint is
+                    //     documented to stand up (§9(b)) could receive but never send.
+                    //     `state.handle` and this `handle` clone share one
+                    //     `Arc<ArcSwap<ContextState>>`, so the actor's own handle observes
+                    //     `Active` too. On a transition failure roll the installed group back
+                    //     (nothing is persisted or registered yet) and fail closed.
+                    if let Err(e) =
+                        handle.transition_to(&scp_protocol::context::ContextState::Active)
+                    {
+                        let _ = deps.crypto.destroy_mls_group(&context_id_bytes);
+                        return Err(e);
+                    }
+
                     // 3b. Entrypoint-level crypto durability check — BEFORE the persist
                     //     (BLACK-2J-03 / crypto L2 / simplifier). `build_snapshot_for_persist`
                     //     is FAIL-OPEN by design for existing members: if `export_crypto_state`
@@ -11895,6 +11916,57 @@ impl Supervisor {
         rx.await.map_err(|_| {
             ContextError::TransportFailed(
                 "Supervisor::seed_peer_pseudonym — actor reply channel closed".to_owned(),
+            )
+        })?
+    }
+
+    /// Installs a member's §9.17 access key directly into a context's access
+    /// key store via the actor mailbox — test-only.
+    ///
+    /// The full-stack test harness uses this to land an access key it obtained
+    /// through the REAL §9.17 pull (`request_access_key` →
+    /// `handle_access_key_request` → `open_access_key_response` over the harness's
+    /// simulated transport) into a Welcome-joiner's actor store, so the joiner
+    /// can wrap content CEKs for its peers on send. The production actor-loop
+    /// distribution this simulates is deferred and tracked (#2050). Gated behind
+    /// the `testing` feature — never compiled into production, never reachable
+    /// from any FFI bridge.
+    ///
+    /// # Expiry
+    ///
+    /// This seam EXPIRES with #2050. When production §9.17 distribution lands,
+    /// DELETE this method, the [`MessagingCommand::TestInstallAccessKey`]
+    /// variant + its handler, and the harness
+    /// `FullStackNode::pull_access_keys_from_creator` driver that calls it — then
+    /// confirm the Python/TS bidirectional tripwires still pass on the *production*
+    /// distribution path (not the harness stand-in). It is safe to carry until
+    /// then because it is `testing`-gated (never in a production build), has no
+    /// FFI wrapper, and is reachable only by in-process `Arc<Supervisor>` callers
+    /// (the full-stack harness), so no untrusted or cross-process caller can drive
+    /// it even in the `allow_in_memory_custody` build the tripwires use.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError`] if the context is inactive or the actor reply channel
+    ///   closes.
+    #[cfg(feature = "testing")]
+    pub async fn test_install_access_key(
+        &self,
+        context_id: &str,
+        member_did: &str,
+        key: scp_protocol::crypto::access_keys::AccessKey,
+    ) -> Result<(), ContextError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = MessagingCommand::TestInstallAccessKey {
+            context_id: context_id.to_owned(),
+            member_did: member_did.to_owned(),
+            key,
+            reply: tx,
+        };
+        self.dispatch_command(context_id, cmd).await?;
+        rx.await.map_err(|_| {
+            ContextError::TransportFailed(
+                "Supervisor::test_install_access_key — actor reply channel closed".to_owned(),
             )
         })?
     }
