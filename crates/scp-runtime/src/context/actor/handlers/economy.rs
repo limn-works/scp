@@ -184,6 +184,11 @@ async fn handle_revoke_spending_ucan(
     // bound the set (a self-issuing member can still commit many revocations of
     // self-issued, never-granted tokens; the principled bound is the separate
     // observed/granted-tokens mechanism, issue #2072).
+    //
+    // Note: because the gate keys off CURRENT membership, an issuer who has LEFT
+    // the context can no longer revoke a context-scoped token there. This is
+    // availability-conservative and security-safe: the gate can only DECLINE an
+    // otherwise-authorized revoke, never GRANT an unauthorized one.
     if !revoker_is_creator && !cell.membership.contains(revoker_did.as_str()) {
         let _ = reply.send(Err(ContextError::PermissionDenied(format!(
             "SCP-ECON-12069: revoker '{revoker_did}' is not a current member of context \
