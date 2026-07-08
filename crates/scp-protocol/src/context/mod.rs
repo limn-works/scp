@@ -333,6 +333,20 @@ pub enum ContextError {
     #[error("persistence failed: {0}")]
     PersistenceFailed(String),
 
+    /// Hydrating the global-scope spending-UCAN revocation gate from its
+    /// durable store failed at startup (spec §19.5).
+    ///
+    /// Distinct from [`Self::PersistenceFailed`] so a startup caller can tell a
+    /// GENUINE revocation-store read failure (a configured store whose
+    /// `load_all` errored) apart from the benign "no persistence provider
+    /// configured" ephemeral no-op — the former MUST fail closed (do not bring
+    /// contexts up serving paid actions with an empty revocation cache, which
+    /// would silently re-authorize a revoked global spending UCAN); the latter
+    /// stays a debug no-op. Surfaced by
+    /// `Supervisor::hydrate_revoked_spending_ucans` in `scp-runtime`.
+    #[error("spending-UCAN revocation hydration failed: {0}")]
+    RevocationHydrationFailed(String),
+
     /// A governance operation failed (proposal, vote, engine error).
     ///
     /// Returned when the [`GovernanceEngine`] reports an error during

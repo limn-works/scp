@@ -1839,9 +1839,16 @@ pub enum EconomyCommand {
         /// Carried through so the [`SpendingUcanRevokedPayload`](scp_event_log::payload::SpendingUcanRevokedPayload)
         /// leaf records which scope was revoked.
         scope: String,
-        /// DID that initiated the revocation (the token issuer or context
-        /// creator, already authorized by the `ucan_revoke` path). Stamped
-        /// as the leaf `actor_did`.
+        /// The revoked spending UCAN's issuer DID (`iss`, which for a
+        /// self-issued spending UCAN equals `aud` and the payer). The handler
+        /// authorizes the revocation against the TOKEN's scope (spec §19.5): a
+        /// context-scoped spending UCAN may be revoked only by its issuer OR by
+        /// the creator of THIS context (the scope context) — not by an arbitrary
+        /// caller-supplied context's creator.
+        issuer_did: String,
+        /// DID that initiated the revocation. Authorized by the handler against
+        /// `issuer_did`/the scope-context creator (see above) and stamped as the
+        /// leaf `actor_did`.
         revoker_did: String,
         /// Oneshot reply channel. `Ok(())` once the CID is durably in the
         /// Class-S set and the leaf is appended; `Err` on persist or append

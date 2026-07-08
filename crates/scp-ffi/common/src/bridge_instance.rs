@@ -1726,6 +1726,22 @@ impl CoreFields {
                     "restore_all_persisted_contexts: skipped (no-op is expected when persistence is not configured or no supervisor is attached)"
                 );
             }
+            Err(e @ scp_core::context::ContextError::RevocationHydrationFailed(_)) => {
+                // FAIL-CLOSED (spec §19.5): a CONFIGURED spending-UCAN revocation
+                // store whose hydration read failed. This is NOT the benign
+                // "no persistence configured" ephemeral no-op — a store IS
+                // configured and could not be read. `restore_on_startup` runs
+                // this leg FIRST, so no context actor was restored; nothing came
+                // up serving paid actions with an empty revocation cache (which
+                // would silently re-authorize a revoked global spending UCAN).
+                // Surface at warn so operators see the fail-closed startup.
+                tracing::warn!(
+                    error = %e,
+                    "restore_all_persisted_contexts: FAILED CLOSED — spending-UCAN revocation \
+                     hydration read failed; no contexts were restored (paid actions are not \
+                     served with an empty revocation cache)"
+                );
+            }
             Err(e) => {
                 // A genuine recovery failure (e.g. a saga-journal load error
                 // surfaced by the replay leg after a successful restore) is a

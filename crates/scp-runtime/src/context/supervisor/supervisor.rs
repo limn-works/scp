@@ -3464,13 +3464,31 @@ impl Supervisor {
     ///   token, used only as the home log for the best-effort audit leaf.
     /// * `encoded_token` — the raw JWT-format spending UCAN presented for
     ///   revocation.
-    /// * `revoker_did` — the DID that initiated the revocation (already
-    ///   authorized by the `ucan_revoke` path); stamped as the leaf `actor_did`.
+    /// * `revoker_did` — the DID that initiated the revocation; stamped as the
+    ///   leaf `actor_did` and scope-authorized here (see the caller contract).
+    ///
+    /// # Caller contract (authentication)
+    ///
+    /// This method performs scope-matched AUTHORIZATION (who may revoke a token
+    /// of this scope — issuer, or the scope context's creator for a
+    /// context-scoped token) but it CANNOT authenticate `revoker_did`:
+    /// `revoker_did` arrives as an unauthenticated FFI string. The caller MUST
+    /// have authenticated `revoker_did` — proven the request genuinely comes
+    /// from that principal — BEFORE calling. In the single-tenant, trusted-local
+    /// caller model (§19.5) the local SDK is that principal. **Network-facing or
+    /// multi-tenant embedders MUST bind `revoker_did` to the authenticated
+    /// principal of the request** (e.g. the connection's verified identity);
+    /// passing an attacker-controlled `revoker_did` would let the authorization
+    /// check above be satisfied by impersonation. Authorization here is
+    /// necessary but not sufficient without that upstream authentication.
     ///
     /// # Errors
     ///
     /// - [`ContextError::PermissionDenied`] if `encoded_token` is malformed,
-    ///   fails verify-before-revoke, or has no parseable spending scope.
+    ///   fails verify-before-revoke, has no parseable spending scope, or
+    ///   `revoker_did` is not authorized to revoke a token of this scope
+    ///   (issuer-only for global; issuer or scope-context creator for
+    ///   context-scoped).
     /// - [`ContextError::NotInitialized`] if the required provider
     ///   (`KeyResolver` for verify-before-revoke; `RevokedSpendingUcanStore`
     ///   for a global-scope revocation) is not configured on this instance.
@@ -3485,6 +3503,15 @@ impl Supervisor {
         encoded_token: &str,
         revoker_did: String,
     ) -> Result<(), ContextError> {
+        // Caller-contract guard (see the doc comment): `revoker_did` MUST be a
+        // non-empty, caller-authenticated principal. A blank revoker means the
+        // caller skipped authentication — a debug-build tripwire for that
+        // integration bug. (Authenticity of the string itself cannot be checked
+        // here; that is the caller's obligation.)
+        debug_assert!(
+            !revoker_did.trim().is_empty(),
+            "revoke_spending_ucan: revoker_did must be a caller-authenticated, non-empty principal"
+        );
         let parsed =
             scp_protocol::crypto::ucan::validate::parse_ucan(encoded_token).map_err(|e| {
                 ContextError::PermissionDenied(format!(
@@ -3525,10 +3552,16 @@ impl Supervisor {
             scp_protocol::crypto::ucan::spending::SpendingScope::Context(scope_context_id) => {
                 let scope_uri = format!("scp:spending:{scope_context_id}");
                 let (tx, rx) = tokio::sync::oneshot::channel();
+                // Scope-matched authorization (§19.5) happens INSIDE the scope
+                // context's actor handler, which holds the authoritative creator
+                // DID: a context-scoped token may be revoked by its issuer or by
+                // the creator of ITS scope context — never an arbitrary
+                // caller-supplied context. Pass the token's `iss` for that check.
                 let cmd = EconomyCommand::RevokeSpendingUcan {
                     context_id: scope_context_id.clone(),
                     revoked_cid: cid,
                     scope: scope_uri,
+                    issuer_did: parsed.payload.iss.clone(),
                     revoker_did,
                     reply: tx,
                 };
@@ -3541,62 +3574,121 @@ impl Supervisor {
                 })?
             }
             scp_protocol::crypto::ucan::spending::SpendingScope::Global => {
-                let store = self.revoked_spending_ucan_store_ref().ok_or_else(|| {
-                    ContextError::NotInitialized(
-                        "revoke_spending_ucan: no RevokedSpendingUcanStore provider configured \
-                         (global-scope revocation cannot be persisted)"
-                            .to_owned(),
-                    )
-                })?;
-                let iss = DID::from(parsed.payload.iss.clone());
-
-                // Durable write — the authoritative record.
-                store
-                    .record(&iss, &cid)
+                self.apply_global_spending_revocation(context_id, &parsed, cid, revoker_did)
                     .await
-                    .map_err(|e| ContextError::PersistenceFailed(e.to_string()))?;
-
-                // Mirror into the in-memory ArcSwap cache every actor's gate
-                // reads (write-locked read-modify-write, mirroring
-                // `register_local_did`'s `local_dids` mutation).
-                {
-                    let _guard = self.write_lock.lock().await;
-                    let snapshot = self.global_revoked_spending_cids.load_full();
-                    let mut updated: HashMap<DID, HashSet<String>> = (*snapshot).clone();
-                    updated.entry(iss).or_default().insert(cid.clone());
-                    self.global_revoked_spending_cids.store(Arc::new(updated));
-                }
-
-                // Best-effort convergent audit leaf (§19.6.1). The durable
-                // store + cache write above are already authoritative; a
-                // leaf-append failure is NOT rolled back.
-                if let Some(event_log) = self.event_log_ref()
-                    && let Ok(payload) = scp_event_log::payload::encode_payload(
-                        &scp_event_log::payload::SpendingUcanRevokedPayload {
-                            token_cid: cid,
-                            scope: "scp:spending:*".to_owned(),
-                        },
-                    )
-                {
-                    let context_id_bytes = crate::context::state::context_id_to_bytes(context_id);
-                    let timestamp_secs = self.clock_ref().map_or_else(
-                        || scp_clock::SystemClock.now_secs(),
-                        |c| scp_clock::Clock::now_secs(c.as_ref()),
-                    );
-                    let _ = event_log
-                        .append_context_event_with_payload(
-                            &context_id_bytes,
-                            scp_event_log::EventType::SpendingUcanRevoked,
-                            &revoker_did,
-                            payload,
-                            timestamp_secs,
-                        )
-                        .await;
-                }
-
-                Ok(())
             }
         }
+    }
+
+    /// Applies a GLOBAL-scope (`scp:spending:*`) spending-UCAN revocation:
+    /// scope-matched authorization, durable record (with expiry-GC bookkeeping),
+    /// in-memory cache mirror, and a best-effort convergent audit leaf. Split
+    /// out of [`Self::revoke_spending_ucan`] so that method stays within the
+    /// per-function line budget.
+    ///
+    /// `parsed` is the already-verified spending UCAN (verify-before-revoke ran
+    /// in the caller); `cid` is its revocation CID; `revoker_did` is the
+    /// caller-authenticated principal.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::PermissionDenied`] if `revoker_did` is not the token's
+    ///   issuer (a global token is revocable only by its self-issuing payer).
+    /// - [`ContextError::NotInitialized`] if no `RevokedSpendingUcanStore`
+    ///   provider is configured.
+    /// - [`ContextError::PersistenceFailed`] if the durable store write fails.
+    async fn apply_global_spending_revocation(
+        &self,
+        context_id: &str,
+        parsed: &scp_protocol::crypto::ucan::UcanToken,
+        cid: String,
+        revoker_did: String,
+    ) -> Result<(), ContextError> {
+        // Scope-matched authorization (§19.5): a GLOBAL (`scp:spending:*`)
+        // spending UCAN authorizes spends in ANY context, so it is NOT owned by
+        // any one context's creator. It may be revoked ONLY by its issuer —
+        // which, for a self-issued spending UCAN (`iss == aud ==` the payer), is
+        // the payer themselves. This closes the hole where any context's creator
+        // could revoke an unrelated payer's global token instance-wide by naming
+        // their own context on the caller-supplied `ucan_revoke` path.
+        if revoker_did != parsed.payload.iss {
+            return Err(ContextError::PermissionDenied(format!(
+                "SCP-ECON-12067: only the issuer ('{}') may revoke a global-scope \
+                 spending UCAN; revoker '{revoker_did}' is not the issuer",
+                parsed.payload.iss
+            )));
+        }
+        let store = self.revoked_spending_ucan_store_ref().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "revoke_spending_ucan: no RevokedSpendingUcanStore provider configured \
+                 (global-scope revocation cannot be persisted)"
+                    .to_owned(),
+            )
+        })?;
+        let iss = DID::from(parsed.payload.iss.clone());
+
+        // Expiry-GC bookkeeping (§19.5): the revocation is provably moot once the
+        // token is expiry-rejected by the gate — its `exp` plus the gate's
+        // clock-skew tolerance. `now` drives the insert-time prune of this DID's
+        // already-moot revocations, keeping the durable store bounded despite
+        // unlimited self-issuance.
+        let now_secs = self.clock_ref().map_or_else(
+            || scp_clock::SystemClock.now_secs(),
+            |c| scp_clock::Clock::now_secs(c.as_ref()),
+        );
+        let revocation_moot_after_secs = parsed.payload.exp.saturating_add(
+            scp_protocol::crypto::ucan::validate::DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+        );
+
+        // Durable write — the authoritative record.
+        store
+            .record(&iss, &cid, revocation_moot_after_secs, now_secs)
+            .await
+            .map_err(|e| ContextError::PersistenceFailed(e.to_string()))?;
+
+        // Mirror into the in-memory ArcSwap cache every actor's gate reads
+        // (write-locked read-modify-write, mirroring `register_local_did`'s
+        // `local_dids` mutation).
+        {
+            let _guard = self.write_lock.lock().await;
+            let snapshot = self.global_revoked_spending_cids.load_full();
+            let mut updated: HashMap<DID, HashSet<String>> = (*snapshot).clone();
+            updated.entry(iss).or_default().insert(cid.clone());
+            self.global_revoked_spending_cids.store(Arc::new(updated));
+        }
+
+        // Best-effort convergent audit leaf (§19.6.1). The durable store + cache
+        // write above are already authoritative; a leaf-append failure is NOT
+        // rolled back. Attribution note: a global revocation has no home context,
+        // so the leaf is emitted to the REQUESTING context (`context_id`) and its
+        // attribution there is NON-AUTHORITATIVE — the self-describing
+        // `scp:spending:*` payload scope marks it as global, and the durable
+        // store is the authoritative record, not this leaf.
+        if let Some(event_log) = self.event_log_ref()
+            && let Ok(payload) = scp_event_log::payload::encode_payload(
+                &scp_event_log::payload::SpendingUcanRevokedPayload {
+                    token_cid: cid,
+                    scope: "scp:spending:*".to_owned(),
+                },
+            )
+        {
+            let context_id_bytes = crate::context::state::context_id_to_bytes(context_id);
+            let timestamp_secs = self.clock_ref().map_or_else(
+                || scp_clock::SystemClock.now_secs(),
+                |c| scp_clock::Clock::now_secs(c.as_ref()),
+            );
+            let _ = event_log
+                .append_context_event_with_payload(
+                    &context_id_bytes,
+                    scp_event_log::EventType::SpendingUcanRevoked,
+                    &revoker_did,
+                    payload,
+                    timestamp_secs,
+                )
+                .await;
+        }
+
+        Ok(())
     }
 
     /// Dispatch a [`TrustRecoveryCommand`] to its per-context actor's mailbox
@@ -8991,11 +9083,16 @@ impl Supervisor {
     ///
     /// # Errors
     ///
+    /// - [`ContextError::RevocationHydrationFailed`] if a CONFIGURED
+    ///   spending-UCAN revocation store cannot be read. This runs FIRST and
+    ///   short-circuits before any context is restored — fail closed: no actor
+    ///   comes up serving paid actions with an empty global revocation cache.
     /// - [`ContextError::PersistenceFailed`] if the persistence provider is
-    ///   unconfigured or `list_persisted_contexts` fails. Restore runs first, so
-    ///   a restore failure short-circuits before any saga is reconciled (the
-    ///   unresolved entries stay unresolved for the next process start — fail
-    ///   closed).
+    ///   unconfigured or `list_persisted_contexts` fails. Restore runs before
+    ///   replay, so a restore failure short-circuits before any saga is
+    ///   reconciled (the unresolved entries stay unresolved for the next process
+    ///   start — fail closed). The unconfigured-persistence case is the benign
+    ///   ephemeral no-op the FFI bridge caller treats as a debug no-op.
     /// - Any [`ContextError`] surfaced by [`Self::replay_unresolved_sagas`]
     ///   (e.g. a saga-journal load failure) after a successful restore. Such a
     ///   replay failure surfaces; the still-unresolved sagas are carried to the
@@ -9008,15 +9105,21 @@ impl Supervisor {
         // compile (see the `compile_fail` doctest on `replay_unresolved_sagas`).
         // Recovery arms drive now-resident actors (the caller reversal, the
         // Commit re-send), so restore must make them resident first.
+        // Hydrate the global-scope spending-UCAN revocation gate FIRST (spec
+        // §19.5), BEFORE restoring any context actor. This is fail-closed BY
+        // CONSTRUCTION: if the configured revocation store cannot be read, the
+        // `?` short-circuits here and NO context actor is ever restored/spawned,
+        // so nothing comes up serving paid actions with an empty revocation
+        // cache (which would silently re-authorize a revoked global spending
+        // UCAN). Restoring contexts first would spawn actors that begin serving
+        // against an empty gate before this ran — fail-OPEN. The distinct
+        // `RevocationHydrationFailed` variant (vs the benign no-persistence
+        // `PersistenceFailed` restore produces) lets the bridge caller log a
+        // genuine read failure at warn while still treating an ephemeral bridge
+        // as a debug no-op.
+        self.hydrate_revoked_spending_ucans().await?;
         let restored = self.restore_all_contexts().await?;
         self.replay_unresolved_sagas(&restored).await?;
-        // Hydrate the global-scope spending-UCAN revocation gate (spec §19.5)
-        // so a revocation persisted before this restart still rejects spends
-        // after it. Propagated with `?` (rather than best-effort/log-only):
-        // an empty gate after a hydration failure is fail-OPEN for global
-        // revocations, which would silently reauthorize a revoked spending
-        // UCAN — surfacing the error keeps startup fail-closed instead.
-        self.hydrate_revoked_spending_ucans().await?;
         Ok(restored.into_ids())
     }
 
@@ -9034,17 +9137,34 @@ impl Supervisor {
     ///
     /// # Errors
     ///
-    /// Returns [`ContextError::PersistenceFailed`] if the configured store's
+    /// Returns [`ContextError::RevocationHydrationFailed`] — a DISTINCT variant,
+    /// not [`ContextError::PersistenceFailed`] — if a CONFIGURED store's
     /// [`load_all`](crate::store::revoked_spending_ucans::RevokedSpendingUcanStore::load_all)
-    /// fails.
+    /// errors. The distinct variant lets the startup caller
+    /// (`restore_all_persisted_contexts` on the FFI bridge) tell a genuine
+    /// revocation-store read failure (which MUST fail closed — see
+    /// [`Self::restore_on_startup`]) apart from the benign "no persistence
+    /// provider configured" `PersistenceFailed` an ephemeral bridge produces.
+    /// The no-store case above is `Ok(())`, not an error.
     pub async fn hydrate_revoked_spending_ucans(&self) -> Result<(), ContextError> {
         let Some(store) = self.revoked_spending_ucan_store_ref() else {
             return Ok(());
         };
+        // `now` for the load-time expiry GC (spec §19.5): already-moot revoked
+        // CIDs are pruned from the durable store and omitted from the cache.
+        let now_secs = self.clock_ref().map_or_else(
+            || scp_clock::SystemClock.now_secs(),
+            |c| scp_clock::Clock::now_secs(c.as_ref()),
+        );
         let map = store
-            .load_all()
+            .load_all(now_secs)
             .await
-            .map_err(|e| ContextError::PersistenceFailed(e.to_string()))?;
+            .map_err(|e| ContextError::RevocationHydrationFailed(e.to_string()))?;
+        // Take the same `write_lock` the incremental `revoke_spending_ucan`
+        // read-modify-write holds (ADR-049 §Decision 12) so this wholesale
+        // hydration store cannot race a concurrent single-CID revocation and
+        // clobber it (or be clobbered).
+        let _guard = self.write_lock.lock().await;
         self.global_revoked_spending_cids.store(Arc::new(map));
         Ok(())
     }
@@ -15709,11 +15829,15 @@ mod tests {
         ctx_id_bytes: [u8; 32],
     ) -> (ContextActorHandle, String) {
         let ctx_key = hex::encode(ctx_id_bytes);
-        let state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+        let mut state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
             ctx_id_bytes,
             1_700_000_000,
             DID("did:example:admin".to_owned()),
         );
+        // The empty test role state carries no creator; set it to match the
+        // fixture's admin DID so creator-keyed authorization (e.g. §19.5
+        // context-scoped spending-UCAN revocation) reads a real creator.
+        state.role_state.creator_did = "did:example:admin".to_owned();
         state
             .handle
             .transition_to(&crate::context::ContextState::Active)
@@ -18454,11 +18578,14 @@ mod tests {
         let scope = SpendingScope::Context(ctx_key.clone());
         let encoded_token = make_signed_spending_token(&payer_did, &signing_key, &scope);
 
-        let state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+        let mut state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
             ctx_id_bytes,
             1_700_000_000,
             DID("did:example:spend-revoke-admin".to_owned()),
         );
+        // §19.5 scope-matched authz reads the actor's creator DID; the empty
+        // test role state carries none, so set it to the admin/revoker here.
+        state.role_state.creator_did = "did:example:spend-revoke-admin".to_owned();
         state
             .handle
             .transition_to(&crate::context::ContextState::Active)
@@ -18579,9 +18706,11 @@ mod tests {
         let clock_dyn: Arc<dyn Clock> = Arc::new(TestClock::new(1_700_000_000));
         let persistence = MapPersistence::default();
         let ctx_id_bytes = [0xDCu8; 32];
-        let revoker_did = "did:example:global-revoke-admin".to_owned();
 
         let payer_did = "did:dht:z6MkGlobalSpendPayer".to_owned();
+        // §19.5 scope-matched authz: a GLOBAL token is revocable ONLY by its
+        // issuer (the self-issuing payer), so the revoker IS the payer.
+        let revoker_did = payer_did.clone();
         let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
         let key_resolver =
             single_payer_key_resolver(payer_did.clone(), signing_key.verifying_key());
@@ -18653,7 +18782,10 @@ mod tests {
         // Durable store also carries the record (restart durability is
         // covered end-to-end by
         // `global_revoked_set_survives_supervisor_restart_via_hydration`).
-        let durable = store.load_all().await.expect("store load_all must succeed");
+        let durable = store
+            .load_all(1_700_000_000)
+            .await
+            .expect("store load_all must succeed");
         assert!(
             durable
                 .get(&payer)
@@ -18677,9 +18809,11 @@ mod tests {
         let clock_dyn: Arc<dyn Clock> = Arc::new(TestClock::new(1_700_000_000));
         let persistence = MapPersistence::default();
         let ctx_id_bytes = [0xDDu8; 32];
-        let revoker_did = "did:example:context-scope-admin".to_owned();
 
         let payer_did = "did:dht:z6MkContextScopedPayer".to_owned();
+        // §19.5 scope-matched authz: a context-scoped token is revocable by its
+        // issuer (the self-issuing payer). Use the payer as revoker.
+        let revoker_did = payer_did.clone();
         let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
         let key_resolver =
             single_payer_key_resolver(payer_did.clone(), signing_key.verifying_key());
@@ -18791,7 +18925,10 @@ mod tests {
             global_cache_untouched,
             "a forged token must not populate the in-memory global revocation cache"
         );
-        let durable = store.load_all().await.expect("store load_all must succeed");
+        let durable = store
+            .load_all(1_700_000_000)
+            .await
+            .expect("store load_all must succeed");
         assert!(
             !durable
                 .get(&payer)
@@ -18824,8 +18961,10 @@ mod tests {
         use scp_protocol::crypto::ucan::validate::RevocationChecker;
 
         let ctx_id_bytes = [0xDFu8; 32];
-        let revoker_did = "did:example:restart-revoke-admin".to_owned();
         let payer_did = "did:dht:z6MkRestartPayer".to_owned();
+        // §19.5 scope-matched authz: a GLOBAL token is revocable only by its
+        // issuer (the self-issuing payer).
+        let revoker_did = payer_did.clone();
         let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
         let key_resolver =
             single_payer_key_resolver(payer_did.clone(), signing_key.verifying_key());
@@ -18899,6 +19038,313 @@ mod tests {
             }
             .is_revoked(&revoked_cid),
             "a hydrated global revocation must reject the token after restart"
+        );
+    }
+
+    /// A durable revocation store whose `load_all` always errors — models a
+    /// configured store whose hydration READ fails (disk error, corruption).
+    #[cfg(feature = "testing")]
+    struct FailingHydrationStore;
+
+    #[cfg(feature = "testing")]
+    #[async_trait::async_trait]
+    impl crate::store::revoked_spending_ucans::RevokedSpendingUcanStore for FailingHydrationStore {
+        async fn record(
+            &self,
+            _did: &DID,
+            _cid: &str,
+            _revocation_moot_after_secs: u64,
+            _now_secs: u64,
+        ) -> Result<(), crate::store::StoreError> {
+            Ok(())
+        }
+
+        async fn load_all(
+            &self,
+            _now_secs: u64,
+        ) -> Result<HashMap<DID, HashSet<String>>, crate::store::StoreError> {
+            Err(crate::store::StoreError::Storage(
+                scp_platform::PlatformError::StorageError(
+                    "simulated revocation-store read failure".to_owned(),
+                ),
+            ))
+        }
+    }
+
+    /// Spec §19.5 fail-closed hydration: when a CONFIGURED revocation store's
+    /// `load_all` errors at startup, `restore_on_startup` MUST fail closed — it
+    /// surfaces the DISTINCT [`ContextError::RevocationHydrationFailed`] and,
+    /// because hydration runs BEFORE context restore, NO context comes up and
+    /// the global gate cache stays empty (a silent empty cache would re-authorize
+    /// revoked global spending UCANs — fail-OPEN).
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn revocation_hydration_read_failure_fails_closed() {
+        let clock_dyn: Arc<dyn Clock> = Arc::new(TestClock::new(1_700_000_000));
+        let payer_did = "did:dht:z6MkHydrationFailPayer".to_owned();
+        let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let key_resolver =
+            single_payer_key_resolver(payer_did.clone(), signing_key.verifying_key());
+        let store: Arc<dyn crate::store::revoked_spending_ucans::RevokedSpendingUcanStore> =
+            Arc::new(FailingHydrationStore);
+        let sup = spending_revoke_supervisor(
+            clock_dyn,
+            MapPersistence::default(),
+            key_resolver,
+            Some(store),
+        );
+
+        let result = sup.restore_on_startup().await;
+        assert!(
+            matches!(result, Err(ContextError::RevocationHydrationFailed(_))),
+            "a configured store whose load_all errors must fail closed with \
+             RevocationHydrationFailed, got {result:?}"
+        );
+        // The gate cache was NOT populated with a silent empty map that would
+        // serve spends: it remains empty AND startup did not proceed to restore.
+        assert!(
+            sup.global_revoked_spending_cids_shared().load().is_empty(),
+            "a failed hydration must not leave a populated (or falsely-served) cache"
+        );
+    }
+
+    /// Spec §19.5 scope-matched authorization (global): a GLOBAL spending UCAN is
+    /// revocable ONLY by its issuer (the self-issuing payer). A context creator
+    /// who is NOT the issuer cannot revoke it — even by naming their own context
+    /// on the caller-supplied revoke path — so it cannot be revoked instance-wide
+    /// by an arbitrary third party.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn non_issuer_context_creator_cannot_revoke_global_token() {
+        use scp_protocol::crypto::ucan::revoke::compute_revocation_cid;
+        use scp_protocol::crypto::ucan::spending::SpendingScope;
+
+        let clock_dyn: Arc<dyn Clock> = Arc::new(TestClock::new(1_700_000_000));
+        let ctx_id_bytes = [0xE0u8; 32];
+        let payer_did = "did:dht:z6MkGlobalAuthzPayer".to_owned();
+        let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let key_resolver =
+            single_payer_key_resolver(payer_did.clone(), signing_key.verifying_key());
+        let storage = Arc::new(InMemoryStorage::new());
+        let store: Arc<dyn crate::store::revoked_spending_ucans::RevokedSpendingUcanStore> =
+            Arc::new(crate::store::ProtocolRepository::new_for_testing(
+                Arc::clone(&storage),
+            ));
+        let sup = spending_revoke_supervisor(
+            clock_dyn,
+            MapPersistence::default(),
+            key_resolver,
+            Some(Arc::clone(&store)),
+        );
+        // `spawn_active_with_snapshot` registers a context whose creator is
+        // `did:example:admin` — NOT the payer/issuer.
+        let (_handle, ctx_key) = spawn_active_with_snapshot(&sup, ctx_id_bytes).await;
+
+        let encoded_token =
+            make_signed_spending_token(&payer_did, &signing_key, &SpendingScope::Global);
+        let revoked_cid = compute_revocation_cid(&encoded_token);
+
+        // The context creator (genuine, non-issuer) attempts to revoke the
+        // GLOBAL token. The token is genuinely signed, so verify-before-revoke
+        // passes; the issuer-only authorization is what must reject it.
+        let result = sup
+            .revoke_spending_ucan(&ctx_key, &encoded_token, "did:example:admin".to_owned())
+            .await;
+        assert!(
+            matches!(result, Err(ContextError::PermissionDenied(_))),
+            "a non-issuer context creator must NOT be able to revoke a global token, got {result:?}"
+        );
+
+        // Nothing was recorded (durable store + in-memory cache untouched).
+        let payer = DID(payer_did);
+        assert!(
+            sup.global_revoked_spending_cids_shared()
+                .load()
+                .get(&payer)
+                .is_none(),
+            "an unauthorized global revoke must not populate the in-memory cache"
+        );
+        let durable = store
+            .load_all(1_700_000_000)
+            .await
+            .expect("store load_all must succeed");
+        assert!(
+            !durable
+                .get(&payer)
+                .is_some_and(|set| set.contains(&revoked_cid)),
+            "an unauthorized global revoke must not durably record a revocation"
+        );
+    }
+
+    /// Spec §19.5 scope-matched authorization (context): a CONTEXT-scoped
+    /// spending UCAN may be revoked by the creator of ITS scope context (a
+    /// moderation power), even when the creator is not the issuer. The
+    /// authorization keys off the actor's authoritative creator DID, not any
+    /// caller-supplied value.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn context_scoped_token_is_revocable_by_scope_context_creator() {
+        use scp_protocol::crypto::ucan::revoke::compute_revocation_cid;
+        use scp_protocol::crypto::ucan::spending::SpendingScope;
+
+        let clock_dyn: Arc<dyn Clock> = Arc::new(TestClock::new(1_700_000_000));
+        let persistence = MapPersistence::default();
+        let ctx_id_bytes = [0xE1u8; 32];
+        let payer_did = "did:dht:z6MkCtxCreatorAuthzPayer".to_owned();
+        let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let key_resolver =
+            single_payer_key_resolver(payer_did.clone(), signing_key.verifying_key());
+        let sup = spending_revoke_supervisor(clock_dyn, persistence.clone(), key_resolver, None);
+        // Scope-context creator is `did:example:admin` (from the helper).
+        let (_handle, ctx_key) = spawn_active_with_snapshot(&sup, ctx_id_bytes).await;
+
+        let scope = SpendingScope::Context(ctx_key.clone());
+        let encoded_token = make_signed_spending_token(&payer_did, &signing_key, &scope);
+        let revoked_cid = compute_revocation_cid(&encoded_token);
+
+        // The scope context's creator (NOT the issuer) revokes — authorized.
+        sup.revoke_spending_ucan(&ctx_key, &encoded_token, "did:example:admin".to_owned())
+            .await
+            .expect("the scope context creator must be able to revoke a context-scoped token");
+        let after = persistence
+            .load_context(&ctx_key)
+            .await
+            .expect("load")
+            .expect("snapshot present after revoke");
+        assert!(
+            after.revoked_spending_ucan_cids.contains(&revoked_cid),
+            "creator-authorized context-scoped revocation must reach the Class-S gate"
+        );
+
+        // An unrelated DID (neither issuer nor scope-context creator) cannot.
+        let ctx_id_bytes_2 = [0xE2u8; 32];
+        let (_handle2, ctx_key2) = spawn_active_with_snapshot(&sup, ctx_id_bytes_2).await;
+        let scope2 = SpendingScope::Context(ctx_key2.clone());
+        let encoded_token2 = make_signed_spending_token(&payer_did, &signing_key, &scope2);
+        let result = sup
+            .revoke_spending_ucan(
+                &ctx_key2,
+                &encoded_token2,
+                "did:example:unrelated-stranger".to_owned(),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(ContextError::PermissionDenied(_))),
+            "an unrelated DID must not be able to revoke a context-scoped token, got {result:?}"
+        );
+    }
+
+    /// Spec §19.5 expiry GC (global store): a global revocation whose token has
+    /// already expired (plus skew) is pruned on hydration — dropped from the
+    /// durable store and omitted from the hydrated cache — while a still-relevant
+    /// revocation is retained and keeps rejecting after restart.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn global_revocation_expiry_gc_prunes_moot_retains_relevant() {
+        use scp_protocol::crypto::ucan::revoke::compute_revocation_cid;
+        use scp_protocol::crypto::ucan::spending::SpendingScope;
+
+        // Token minted at T0 has exp = T0 + 3600 (see `make_signed_spending_token`).
+        // Its revocation is moot after exp + skew(300) = T0 + 3900.
+        let t0 = scp_clock::SystemClock.now_secs();
+        let payer_did = "did:dht:z6MkExpiryGcPayer".to_owned();
+        let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let key_resolver =
+            single_payer_key_resolver(payer_did.clone(), signing_key.verifying_key());
+        let encoded_token =
+            make_signed_spending_token(&payer_did, &signing_key, &SpendingScope::Global);
+        let revoked_cid = compute_revocation_cid(&encoded_token);
+        let storage = Arc::new(InMemoryStorage::new());
+
+        // Supervisor #1 records the revocation at ~T0.
+        {
+            let clock1: Arc<dyn Clock> = Arc::new(TestClock::new(t0));
+            let store1: Arc<dyn crate::store::revoked_spending_ucans::RevokedSpendingUcanStore> =
+                Arc::new(crate::store::ProtocolRepository::new_for_testing(
+                    Arc::clone(&storage),
+                ));
+            let sup1 = spending_revoke_supervisor(
+                clock1,
+                MapPersistence::default(),
+                key_resolver.clone(),
+                Some(store1),
+            );
+            let (_handle, ctx_key) = spawn_active_with_snapshot(&sup1, [0xE3u8; 32]).await;
+            sup1.revoke_spending_ucan(&ctx_key, &encoded_token, payer_did.clone())
+                .await
+                .expect("global revoke must succeed");
+        }
+
+        let payer = DID(payer_did);
+
+        // Hydrate at T0 + 10000 (well past exp + skew): the entry is moot ⇒ GC'd.
+        let store_gc: Arc<dyn crate::store::revoked_spending_ucans::RevokedSpendingUcanStore> =
+            Arc::new(crate::store::ProtocolRepository::new_for_testing(
+                Arc::clone(&storage),
+            ));
+        let sup2 = spending_revoke_supervisor(
+            Arc::new(TestClock::new(t0 + 10_000)),
+            MapPersistence::default(),
+            key_resolver.clone(),
+            Some(Arc::clone(&store_gc)),
+        );
+        sup2.hydrate_revoked_spending_ucans()
+            .await
+            .expect("hydration must succeed");
+        assert!(
+            sup2.global_revoked_spending_cids_shared()
+                .load()
+                .get(&payer)
+                .is_none(),
+            "an expired-token revocation must be GC'd on hydration (cache omits it)"
+        );
+        assert!(
+            !store_gc
+                .load_all(t0 + 10_000)
+                .await
+                .expect("load_all")
+                .contains_key(&payer),
+            "an expired-token revocation must be durably pruned"
+        );
+
+        // Control: a SECOND global token revoked and hydrated BEFORE its expiry
+        // is retained and still rejects.
+        let storage2 = Arc::new(InMemoryStorage::new());
+        {
+            let store3: Arc<dyn crate::store::revoked_spending_ucans::RevokedSpendingUcanStore> =
+                Arc::new(crate::store::ProtocolRepository::new_for_testing(
+                    Arc::clone(&storage2),
+                ));
+            let sup3 = spending_revoke_supervisor(
+                Arc::new(TestClock::new(t0)),
+                MapPersistence::default(),
+                key_resolver.clone(),
+                Some(store3),
+            );
+            let (_handle, ctx_key) = spawn_active_with_snapshot(&sup3, [0xE4u8; 32]).await;
+            sup3.revoke_spending_ucan(&ctx_key, &encoded_token, payer.as_ref().to_owned())
+                .await
+                .expect("global revoke must succeed");
+        }
+        let store_live: Arc<dyn crate::store::revoked_spending_ucans::RevokedSpendingUcanStore> =
+            Arc::new(crate::store::ProtocolRepository::new_for_testing(
+                Arc::clone(&storage2),
+            ));
+        let sup4 = spending_revoke_supervisor(
+            Arc::new(TestClock::new(t0 + 100)),
+            MapPersistence::default(),
+            key_resolver,
+            Some(store_live),
+        );
+        sup4.hydrate_revoked_spending_ucans()
+            .await
+            .expect("hydration must succeed");
+        assert!(
+            sup4.global_revoked_spending_cids_shared()
+                .load()
+                .get(&payer)
+                .is_some_and(|set| set.contains(&revoked_cid)),
+            "a still-relevant revocation must be retained after hydration and keep rejecting"
         );
     }
 

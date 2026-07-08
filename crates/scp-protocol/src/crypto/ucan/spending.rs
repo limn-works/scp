@@ -398,9 +398,17 @@ pub fn spending_scope_of(token: &UcanToken) -> Option<SpendingScope> {
 /// nonce/expiry/revocation checks. Deliberately omits the nonce freshness probe
 /// (which enforces ±5min of now and would reject any token older than 5 minutes
 /// at revoke time) and expiry (a human may revoke a still-genuinely-issued token
-/// regardless of remaining lifetime). This is the anti-bloat gate: only tokens
-/// actually signed by the issuer may enter the revocation stores, making them
-/// self-limiting.
+/// regardless of remaining lifetime).
+///
+/// This gate keeps FORGED tokens out of the revocation stores (only tokens
+/// actually signed by the issuer may enter), but it does NOT make the stores
+/// "self-limiting by construction": a spending UCAN is self-issued
+/// (`iss == aud ==` the payer), so a payer can mint and revoke an unbounded
+/// number of DISTINCT genuinely-signed tokens against their own DID. The
+/// revocation stores are instead bounded by **expiry-based garbage collection**
+/// (a revoked CID for an already-expired token is moot and is pruned; see
+/// `crate::store::revoked_spending_ucans` in `scp-runtime`) together with the
+/// trusted-local-caller self-governance model (§19.5).
 ///
 /// # Errors
 ///

@@ -48,6 +48,7 @@ pub(crate) async fn dispatch(
             context_id,
             revoked_cid,
             scope,
+            issuer_did,
             revoker_did,
             reply,
         } => {
@@ -57,6 +58,7 @@ pub(crate) async fn dispatch(
                 context_id,
                 revoked_cid,
                 scope,
+                issuer_did,
                 revoker_did,
                 reply,
             )
@@ -126,15 +128,37 @@ async fn handle_verify_payment_receipts(
 ///    appended. A leaf-append failure is surfaced but does NOT roll the gate
 ///    back — the safe direction (the gate stays closed; only the audit leaf is
 ///    missing).
+#[allow(clippy::too_many_arguments)]
 async fn handle_revoke_spending_ucan(
     cell: &mut ClassSCell,
     deps: &ActorDeps,
     context_id: String,
     revoked_cid: String,
     scope: String,
+    issuer_did: String,
     revoker_did: String,
     reply: tokio::sync::oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
+    // Step 0: scope-matched authorization (spec §19.5). A context-scoped
+    // spending UCAN may be revoked ONLY by its issuer (the self-issuing payer,
+    // `iss == aud`) OR by the creator of THIS context — the token's actual scope
+    // context, whose authoritative creator DID the actor holds. This closes the
+    // hole where any context's creator, by naming their own context on the
+    // caller-supplied `ucan_revoke` path, could revoke a token scoped to a
+    // DIFFERENT context. The authorization keys off the actor's own creator, not
+    // any caller-supplied value.
+    // Read the authoritative creator DID through the cell's read-only `Deref`
+    // to `PerContextState` (no `&mut` state escape hatch is needed for a read).
+    let creator_did = cell.role_state.creator_did.clone();
+    if revoker_did.as_str() != issuer_did.as_str() && revoker_did.as_str() != creator_did.as_str() {
+        let _ = reply.send(Err(ContextError::PermissionDenied(format!(
+            "SCP-ECON-12067: revoker '{revoker_did}' is neither the spending UCAN's issuer \
+             ('{issuer_did}') nor the creator of its scope context ('{creator_did}')"
+        ))));
+        // Read-only: no state mutated when authorization fails.
+        return Outcome::ok(());
+    }
+
     // Step 1: insert the CID into the Class-S gate, persisted fail-closed.
     let cid_for_leaf = revoked_cid.clone();
     let insert_result = cell
