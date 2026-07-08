@@ -422,7 +422,14 @@ pub struct SpendingCapability {
 
 **No implicit spending:** Protocol NEVER authorizes expenditure without explicit spending UCAN. Missing UCAN → `SpendingCapabilityRequired` error. Agent can still perform free actions in the context.
 
-**Revocation:** Independent of other UCANs (§7.4.4). Human discovers overspending → revoke spending UCAN → agent retains other capabilities but cannot authorize payments.
+**Revocation:** Independent of other UCANs. Human discovers overspending → revoke spending UCAN → agent retains other capabilities but cannot authorize payments. A spending UCAN is revoked through the standard UCAN revocation path (§7.2 Tier-1 revocation check; the per-context `RevocationList` resolution recorded under §00-open-questions "UCAN revocation mechanism", implemented per ADR-016 acceptance criteria 5 and 7 in `crypto/ucan/revoke.rs`). That path writes the general-purpose per-context `RevocationList` and emits a `TokenRevoked` event.
+
+The paid-action gate, however, does NOT run the general `validate_ucan` pipeline that consults the `RevocationList`; it runs the spending-specific `validate_spending_ucan_signed` pipeline, whose revocation check consults the context actor's authoritative Class-S `revoked_spending_ucan_cids` set. These are **two distinct stores**, and both MUST be written when a spending UCAN is revoked:
+
+- the **`RevocationList`** is the general UCAN-revocation store, checked at the 11-step `validate_ucan` presentation boundaries (§7.2);
+- the actor **Class-S `revoked_spending_ucan_cids`** set is the authoritative paid-action authorization gate, checked by `validate_spending_ucan_signed`.
+
+Therefore, when the revoked token is a spending UCAN — identified by its `scp:spending:{context_id}` / `scp:spending:*` attestation with the `spend` action — the revoke path MUST, in addition to writing the `RevocationList`, carry the token's revocation CID (SHA-256 of the encoded token, identical to the CID the gate computes) into the context actor's Class-S `revoked_spending_ucan_cids` set. That insertion MUST be persisted **fail-closed** before the revocation is acknowledged (a coalesce-window rollback would re-admit a spending UCAN the human observed as revoked), and MUST emit a `SpendingUcanRevoked` event (§19.6.1). A revoked spending UCAN then fails BOTH the general presentation-boundary check and the paid-action gate. Non-spending UCANs are unaffected: they write only the `RevocationList`, as before.
 
 **24-hour maximum expiry** (§9.5): Spending UCANs follow existing UCAN expiry rules. Short-lived by design — limits blast radius of compromised agents.
 
@@ -483,6 +490,8 @@ Economic governance introduces new event types for the verifiable event log (ADR
 | `EconomicPolicyChanged` | Governance updates economic policy | Old policy hash, new `EconomicPolicy`, governance justification |
 | `SpendingUcanGranted` | Human grants spending UCAN to agent | Agent key `#agent` on human's DID, `SpendingCapability` summary (amounts, window), UCAN token ID |
 | `SpendingUcanRevoked` | Human revokes spending UCAN | UCAN token ID, revocation reason |
+
+The `SpendingUcanRevoked` leaf is emitted by the spending-UCAN revoke path (§19.5): when a spending UCAN is revoked, its revocation CID is inserted — fail-closed — into the context actor's Class-S `revoked_spending_ucan_cids` set (the authoritative paid-action gate), and this leaf records the revocation (token CID + reason) in the convergent log.
 
 Of these, the economic *governance/policy* events (`EconomicPolicyChanged`, `EconomicPolicyApplied`, `SpendingUcanGranted`, `SpendingUcanRevoked`) are commit-ordered and convergent, and carry the same Merkle-tree inclusion guarantees as the other convergent `EventType` variants (governance, membership, lifecycle). `PaymentReceived` / `PaymentCaptureFailed`, by contrast, are appended by the payee on `adapter.capture()` — per-author application activity, convergent and Merkle-anchored only under ADR-051 (see the ADR-011 amendment, exclusion taxonomy §2); until then they are local `ContextEvent`s. The velocity metrics below (`ContextMessageRate`, `SenderVelocity`) are **local and self-metered** — enforced at `authorize()` by the payer's own SDK against a local spending ledger. There is no convergent velocity clock (ADR-051 §6: rate-limiting is local flow control, and a durable suspension is a governance commit whose execution *is* its record); these pricing metrics are not convergent Merkle records.
 
@@ -601,7 +610,7 @@ SCP.Identity.configureAdapter(adapter) → ()
 
 **Payment adapter trust:** Malicious adapter could falsify receipts. Mitigation: `verify()` checks against the payment rail (on-chain state, preimage hash), not the adapter's word. Receipts are signed by the payer's DID key — adapter cannot forge the payer's signature.
 
-**Spending UCAN theft:** Compromised `#agent` verification method on human's own DID spends up to `max_total` within `time_window`. Mitigation: 24-hour maximum expiry (§9.5), independent revocation (§7.4.4), conservative limits. Blast radius bounded by the UCAN's constraints — but note that under the shared-DID model (ADR-039), the blast radius extends to the human's identity reputation since agent actions are attributed to the same DID.
+**Spending UCAN theft:** Compromised `#agent` verification method on human's own DID spends up to `max_total` within `time_window`. Mitigation: 24-hour maximum expiry (§9.5), independent revocation (§7.2; carried into the paid-action gate per §19.5), conservative limits. Blast radius bounded by the UCAN's constraints — but note that under the shared-DID model (ADR-039), the blast radius extends to the human's identity reputation since agent actions are attributed to the same DID.
 
 **Privacy:** Payment adapter sees transaction metadata but not context content. For context-level payments, payment data is inside the encrypted envelope — the adapter sees amount and DIDs but not what the payment is for. For relay-level payments, the adapter sees the relay operation but not the encrypted content. For maximum privacy, Lightning's onion routing or local-only adapters.
 
