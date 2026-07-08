@@ -139,7 +139,20 @@ async fn handle_revoke_spending_ucan(
     revoker_did: String,
     reply: tokio::sync::oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
-    // Step 0: scope-matched authorization (spec §19.5). A context-scoped
+    // Step 0a: reject an empty caller principal explicitly (spec §19.5, invariant
+    // 3b). The supervisor-side `debug_assert!(!revoker_did.is_empty())` is stripped
+    // in release builds; and an empty `revoker_did` would otherwise spuriously
+    // match an empty recorded `creator_did` on the creator-authorization branch
+    // below, authorizing an unauthenticated revoke.
+    if revoker_did.trim().is_empty() {
+        let _ = reply.send(Err(ContextError::PermissionDenied(
+            "SCP-ECON-12068: revoker_did must be a non-empty, caller-authenticated principal"
+                .to_owned(),
+        )));
+        return Outcome::ok(());
+    }
+
+    // Step 0b: scope-matched authorization (spec §19.5). A context-scoped
     // spending UCAN may be revoked ONLY by its issuer (the self-issuing payer,
     // `iss == aud`) OR by the creator of THIS context — the token's actual scope
     // context, whose authoritative creator DID the actor holds. This closes the
@@ -150,12 +163,32 @@ async fn handle_revoke_spending_ucan(
     // Read the authoritative creator DID through the cell's read-only `Deref`
     // to `PerContextState` (no `&mut` state escape hatch is needed for a read).
     let creator_did = cell.role_state.creator_did.clone();
-    if revoker_did.as_str() != issuer_did.as_str() && revoker_did.as_str() != creator_did.as_str() {
+    // The creator branch requires a NON-empty recorded creator, so an empty
+    // `creator_did` can never authorize (invariant 3b).
+    let revoker_is_creator =
+        !creator_did.trim().is_empty() && revoker_did.as_str() == creator_did.as_str();
+    let revoker_is_issuer = revoker_did.as_str() == issuer_did.as_str();
+    if !revoker_is_issuer && !revoker_is_creator {
         let _ = reply.send(Err(ContextError::PermissionDenied(format!(
             "SCP-ECON-12067: revoker '{revoker_did}' is neither the spending UCAN's issuer \
              ('{issuer_did}') nor the creator of its scope context ('{creator_did}')"
         ))));
         // Read-only: no state mutated when authorization fails.
+        return Outcome::ok(());
+    }
+
+    // Step 0c: membership gate (spec §19.5, invariant 3a — defense-in-depth). The
+    // revoker must be a CURRENT member of the context; the scope-context creator
+    // remains allowed even if not a listed member. This reduces the flood surface
+    // for the convergent per-context revoked-CID set to members — it does NOT
+    // bound the set (a self-issuing member can still commit many revocations of
+    // self-issued, never-granted tokens; the principled bound is the separate
+    // observed/granted-tokens mechanism, issue #2072).
+    if !revoker_is_creator && !cell.membership.contains(revoker_did.as_str()) {
+        let _ = reply.send(Err(ContextError::PermissionDenied(format!(
+            "SCP-ECON-12069: revoker '{revoker_did}' is not a current member of context \
+             '{context_id}' — context-scoped spending-UCAN revocation is restricted to members"
+        ))));
         return Outcome::ok(());
     }
 
@@ -209,4 +242,182 @@ async fn handle_revoke_spending_ucan(
         .await;
     let _ = reply.send(append_result);
     Outcome::ok_mutated(())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use std::sync::Arc;
+
+    use scp_did::DID;
+    use scp_protocol::context::ContextError;
+
+    use super::handle_revoke_spending_ucan;
+    use crate::context::actor::class_s::ClassSCell;
+    use crate::context::actor::deps::ActorDeps;
+    use crate::context::actor::state::PerContextState;
+
+    const ADMIN: &str = "did:example:revoke-authz-admin";
+    const PAYER: &str = "did:dht:z6MkRevokeAuthzPayer";
+    const CTX_BYTES: [u8; 32] = [0xC1u8; 32];
+
+    /// Build `ActorDeps` over a working in-memory persistence + Merkle event log
+    /// so the fail-closed Class-S commit and the audit-leaf append both succeed on
+    /// the authorized paths.
+    async fn build_deps() -> ActorDeps {
+        use crate::context::providers::InMemoryPersistence;
+        use crate::context::supervisor::supervisor::Supervisor;
+
+        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+            ADMIN.to_owned(),
+            Arc::new(scp_clock::SystemClock),
+        ));
+        let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
+            Box::new(crate::context::builder::NotConfiguredTransportProvider);
+        let event_log: Box<dyn crate::context::builder::ContextEventLogProvider> =
+            Box::new(crate::context::providers::MerkleEventLogProvider::new());
+        let key_resolver: scp_protocol::context::governance::KeyResolver = Arc::new(|_, _| None);
+        let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
+            Arc::new(
+                crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
+                    scp_platform::testing::InMemoryStorage::new(),
+                )),
+            );
+        let supervisor = Supervisor::with_providers(
+            crypto,
+            transport,
+            event_log,
+            key_resolver,
+            Some(Box::new(InMemoryPersistence::new())),
+            None,
+            None,
+            Some(Arc::new(scp_clock::TestClock::new(1_700_000_000))),
+            mls_storage,
+            None, // revoked_spending_ucan_store
+        );
+        supervisor
+            .build_actor_deps(&DID(ADMIN.to_owned()))
+            .await
+            .expect("build_actor_deps")
+    }
+
+    /// Fresh Active context whose creator is ADMIN. `members` are added to the
+    /// membership set (the 3a gate reads `cell.membership`).
+    fn seed_cell(members: &[&str]) -> ClassSCell {
+        let mut state = PerContextState::new_for_test_encrypted(
+            CTX_BYTES,
+            1_700_000_000,
+            DID(ADMIN.to_owned()),
+        );
+        state.role_state.creator_did = ADMIN.to_owned();
+        for m in members {
+            state
+                .membership
+                .add_member(DID((*m).to_owned()), "member".to_owned(), Vec::new());
+        }
+        ClassSCell::new(state)
+    }
+
+    async fn revoke(
+        cell: &mut ClassSCell,
+        deps: &ActorDeps,
+        issuer_did: &str,
+        revoker_did: &str,
+    ) -> Result<(), ContextError> {
+        let ctx_key = hex::encode(CTX_BYTES);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = handle_revoke_spending_ucan(
+            cell,
+            deps,
+            ctx_key.clone(),
+            "revoked-cid".to_owned(),
+            format!("scp:spending:{ctx_key}"),
+            issuer_did.to_owned(),
+            revoker_did.to_owned(),
+            tx,
+        )
+        .await;
+        rx.await.expect("handler must send a reply")
+    }
+
+    /// Invariant 3b: an empty `revoker_did` is rejected explicitly (a
+    /// release-stripped debug_assert cannot be relied on, and an empty revoker
+    /// would otherwise match an empty creator).
+    #[tokio::test]
+    async fn revoke_rejects_empty_revoker_did() {
+        let deps = build_deps().await;
+        let mut cell = seed_cell(&[PAYER]);
+        let result = revoke(&mut cell, &deps, PAYER, "").await;
+        assert!(
+            matches!(&result, Err(ContextError::PermissionDenied(msg)) if msg.contains("SCP-ECON-12068")),
+            "empty revoker_did must be rejected with SCP-ECON-12068, got {result:?}"
+        );
+        assert!(
+            !cell
+                .governance
+                .revoked_spending_ucan_cids
+                .contains("revoked-cid"),
+            "a rejected revoke must not insert the CID into the gate"
+        );
+    }
+
+    /// Invariant 3a: a revoker who is the token's issuer but is NOT a current
+    /// member (and not the creator) is rejected — the membership gate reduces the
+    /// flood surface to members.
+    #[tokio::test]
+    async fn revoke_rejects_non_member_issuer() {
+        let deps = build_deps().await;
+        // PAYER is the issuer but NOT in the membership set.
+        let mut cell = seed_cell(&[]);
+        let result = revoke(&mut cell, &deps, PAYER, PAYER).await;
+        assert!(
+            matches!(&result, Err(ContextError::PermissionDenied(msg)) if msg.contains("SCP-ECON-12069")),
+            "a non-member issuer must be rejected with SCP-ECON-12069, got {result:?}"
+        );
+        assert!(
+            !cell
+                .governance
+                .revoked_spending_ucan_cids
+                .contains("revoked-cid")
+        );
+    }
+
+    /// Invariant 3a: a revoker who is BOTH the issuer AND a current member is
+    /// authorized — the CID lands in the gate.
+    #[tokio::test]
+    async fn revoke_allows_member_issuer() {
+        let deps = build_deps().await;
+        // The authorized path proceeds to append the audit leaf — initialize the
+        // context's event log so that Step 2 succeeds.
+        deps.event_log.init_event_log(&CTX_BYTES).await.unwrap();
+        let mut cell = seed_cell(&[PAYER]);
+        revoke(&mut cell, &deps, PAYER, PAYER)
+            .await
+            .expect("a member issuer must be authorized to revoke");
+        assert!(
+            cell.governance
+                .revoked_spending_ucan_cids
+                .contains("revoked-cid"),
+            "an authorized revoke must insert the CID into the gate"
+        );
+    }
+
+    /// The scope-context creator remains allowed even when NOT a listed member
+    /// (creator exemption on the 3a gate).
+    #[tokio::test]
+    async fn revoke_allows_creator_even_when_not_a_member() {
+        let deps = build_deps().await;
+        deps.event_log.init_event_log(&CTX_BYTES).await.unwrap();
+        // ADMIN is the creator but is NOT added to the membership set here.
+        let mut cell = seed_cell(&[]);
+        revoke(&mut cell, &deps, PAYER, ADMIN)
+            .await
+            .expect("the scope-context creator must remain allowed even if not a member");
+        assert!(
+            cell.governance
+                .revoked_spending_ucan_cids
+                .contains("revoked-cid"),
+            "the creator's revoke must insert the CID into the gate"
+        );
+    }
 }
