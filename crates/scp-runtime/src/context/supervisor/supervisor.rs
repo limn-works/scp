@@ -3750,66 +3750,47 @@ impl Supervisor {
             .await
             .map_err(|e| ContextError::PersistenceFailed(e.to_string()))?;
 
-        // Mirror into the in-memory ArcSwap cache every actor's gate reads
-        // (write-locked read-modify-write, mirroring `register_local_did`'s
-        // `local_dids` mutation).
+        // Mirror the durable revocation into the in-memory ArcSwap cache every
+        // actor's paid-action gate reads by REBUILDING it wholesale from the
+        // freshly-pruned durable store under `write_lock` — the SINGLE reload
+        // discipline `hydrate_revoked_spending_ucans` also uses (see
+        // `reload_global_revoked_cache_under_lock`).
         //
-        // Invariant 2a (spec §19.5): RE-DERIVE this DID's cache entry from the
-        // freshly-pruned durable store instead of blind-inserting the new CID. The
-        // durable `record` above already pruned this DID's already-moot entries, so
-        // `load_for_did` returns its bounded set; replacing the cache entry with it
-        // keeps the in-memory cache == the bounded durable store. A blind insert
-        // would only ever ADD, growing the cache monotonically (never dropping moot
-        // CIDs) until a restart's full hydration — contradicting the module's
-        // "expiry-bounded" contract.
+        // Invariant 2a (spec §19.5): a full `load_all` rebuild keeps the in-memory
+        // cache == the bounded durable store. A blind insert would only ever ADD,
+        // growing the cache monotonically (never dropping moot CIDs) until a
+        // restart's full hydration — contradicting the module's "expiry-bounded"
+        // contract.
         //
-        // Invariant 2b (spec §19.5): the `load_for_did` re-read and the cache store
-        // MUST be ATOMIC under `write_lock`. A GLOBAL revocation calls the
-        // supervisor DIRECTLY — it is NOT mailbox-serialized like a context-scoped
-        // revoke — so two concurrent revokes for the SAME payer DID race. If the
-        // re-read ran OUTSIDE the lock, this interleaving would silently LOSE a
-        // revocation:
-        //   A.record{A} · A.load→{A} · B.record{A,B} · B.load→{A,B} · B.store{A,B}
-        //   · A.store{A}  ← B's CID dropped from the cache (still durable), so the
-        //   gate RE-AUTHORIZES B's revoked token until the next restart (fail-OPEN).
-        // Acquiring the lock BEFORE the re-read serializes the two writers: each
-        // load happens-after its OWN `record` and runs under the lock, so whichever
-        // store commits LAST observes BOTH records. `load_for_did` does not touch
-        // `write_lock`, so acquiring it first is re-entrancy-safe. This is the
-        // identical discipline `hydrate_revoked_spending_ucans` applies around
-        // `load_all` (also invariant 2b).
-        let guard = self.write_lock.lock().await;
-        let bounded = match store.load_for_did(&iss, now_secs).await {
-            Ok(bounded) => bounded,
-            Err(e) => {
-                // Fail-closed robustness: the durable `record` above already
-                // SUCCEEDED, so this revocation IS durable. A bounding re-read
-                // failure must NEVER let the just-confirmed CID be absent from the
-                // gate cache — insert it into this DID's entry under the held lock
-                // before surfacing the error, so the revocation is both durable AND
-                // in-cache (the caller still observes the persistence error).
-                let snapshot = self.global_revoked_spending_cids.load_full();
-                let mut updated: HashMap<DID, HashSet<String>> = (*snapshot).clone();
-                updated.entry(iss.clone()).or_default().insert(cid.clone());
-                self.global_revoked_spending_cids.store(Arc::new(updated));
-                return Err(ContextError::PersistenceFailed(e.to_string()));
-            }
-        };
-        let snapshot = self.global_revoked_spending_cids.load_full();
-        let mut updated: HashMap<DID, HashSet<String>> = (*snapshot).clone();
-        if bounded.is_empty() {
-            // Defensive: the DID just recorded a (non-moot) CID, so `bounded` is
-            // normally non-empty; drop the key entirely if it somehow pruned to
-            // empty rather than leaving an empty set behind.
-            updated.remove(&iss);
-        } else {
-            updated.insert(iss.clone(), bounded);
+        // Invariant 2b (spec §19.5): the durable re-read and the cache store are
+        // ATOMIC under `write_lock` (inside the helper). A GLOBAL revocation calls
+        // the supervisor DIRECTLY — it is NOT mailbox-serialized like a
+        // context-scoped revoke — so two concurrent revokes for the SAME payer DID
+        // race. Reading and storing under the one lock serializes the writers: each
+        // reload happens-after its OWN `record`, so whichever store commits LAST
+        // reads a durable store that already contains BOTH CIDs. Without the lock a
+        // stale re-read could clobber a later-committed CID out of the cache (still
+        // durable) — re-authorizing that revoked token until restart (fail-OPEN).
+        if let Err(e) = self
+            .reload_global_revoked_cache_under_lock(store, now_secs)
+            .await
+        {
+            // Fail-closed robustness (spec §19.5): the durable `record` above
+            // already SUCCEEDED, so this revocation IS durable. A reload failure
+            // must NEVER let the just-confirmed CID be absent from the gate cache
+            // (fail-OPEN until the next hydration) — additively insert it under
+            // `write_lock` before surfacing the error, so the revocation is both
+            // durable AND in-cache (the caller still observes the persistence
+            // error). The insert is ADDITIVE (non-clobbering) and the CID is
+            // durably recorded, so any concurrent successful full reload reads a
+            // superset that also contains it — no interleaving loses it.
+            let _guard = self.write_lock.lock().await;
+            let snapshot = self.global_revoked_spending_cids.load_full();
+            let mut updated: HashMap<DID, HashSet<String>> = (*snapshot).clone();
+            updated.entry(iss.clone()).or_default().insert(cid.clone());
+            self.global_revoked_spending_cids.store(Arc::new(updated));
+            return Err(ContextError::PersistenceFailed(e.to_string()));
         }
-        self.global_revoked_spending_cids.store(Arc::new(updated));
-        // Release the write lock before the best-effort audit-leaf append below —
-        // that append needs no serialization and must not hold the cache lock
-        // across its await.
-        drop(guard);
 
         // Best-effort convergent audit leaf (§19.6.1). The durable store + cache
         // write above are already authoritative; a leaf-append failure is NOT
@@ -9277,6 +9258,50 @@ impl Supervisor {
         Ok(restored.into_ids())
     }
 
+    /// Rebuilds the ENTIRE in-memory global-scope spending-UCAN revocation cache
+    /// (`global_revoked_spending_cids`) wholesale from the durable store under
+    /// `write_lock`, then atomically `ArcSwap::store`s the freshly-rebuilt map.
+    ///
+    /// This is the ONE cache-write discipline shared by BOTH startup hydration
+    /// ([`Self::hydrate_revoked_spending_ucans`]) AND the incremental global
+    /// revocation ([`Self::apply_global_spending_revocation`]) — there is no
+    /// separate single-DID cache-update path.
+    ///
+    /// **Atomicity (spec §19.5 invariant 2b).** `write_lock` is held across BOTH
+    /// the durable [`load_all`](crate::store::revoked_spending_ucans::RevokedSpendingUcanStore::load_all)
+    /// re-read AND the cache store, so two concurrent global revocations for the
+    /// same payer cannot interleave a stale read over a fresh write and silently
+    /// drop a revocation from the cache (fail-OPEN). A global revoke calls the
+    /// supervisor DIRECTLY (it is NOT mailbox-serialized like a context-scoped
+    /// revoke), so this lock is the only serialization point.
+    ///
+    /// **Tradeoff.** An incremental global revoke now does a full `identity/`-prefix
+    /// `load_all` reload instead of a cheaper single-DID scan. Acceptable: global
+    /// revokes are rare, human-initiated, cold-path (NOT the paid-action hot path),
+    /// and the durable total is bounded by expiry-GC — so rebuilding the whole map
+    /// on each one is affordable and removes the second divergent cache-write path.
+    ///
+    /// The caller owns the fail-closed policy on error: this returns the raw
+    /// [`StoreError`](crate::store::StoreError) WITHOUT mutating the cache or the
+    /// hydration flag, so hydrate can `mark_failed` (fail the global gate closed)
+    /// and apply can additively re-insert the just-recorded CID (so a confirmed
+    /// revocation is never left uncached).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`](crate::store::StoreError) if the durable `load_all`
+    /// read fails; the cache and hydration flag are left untouched for the caller.
+    async fn reload_global_revoked_cache_under_lock(
+        &self,
+        store: &Arc<dyn crate::store::revoked_spending_ucans::RevokedSpendingUcanStore>,
+        now_secs: u64,
+    ) -> Result<(), crate::store::StoreError> {
+        let _guard = self.write_lock.lock().await;
+        let map = store.load_all(now_secs).await?;
+        self.global_revoked_spending_cids.store(Arc::new(map));
+        Ok(())
+    }
+
     /// Hydrates the in-memory global-scope spending-UCAN revocation cache
     /// (spec §19.5) from the durable [`RevokedSpendingUcanStore`] provider.
     ///
@@ -9319,18 +9344,19 @@ impl Supervisor {
             || scp_clock::SystemClock.now_secs(),
             |c| scp_clock::Clock::now_secs(c.as_ref()),
         );
-        // Hold the same `write_lock` the incremental `revoke_spending_ucan`
-        // read-modify-write holds (ADR-049 §Decision 12) across BOTH the durable
-        // `load_all` AND the cache store (invariant 2b, spec §19.5). The prior code
-        // took the lock ONLY around the store, leaving `load_all` racing a
-        // concurrent single-CID global revocation: that revoke could land its RMW
-        // between this `load_all`'s read and this store, and then be CLOBBERED by
-        // the wholesale overwrite here. Covering `load_all` too serializes the two
-        // writers, so neither clobbers the other (the earlier anti-clobber comment
-        // was false — the lock did not cover the read).
-        let _guard = self.write_lock.lock().await;
-        let map = match store.load_all(now_secs).await {
-            Ok(map) => map,
+        // Wholesale-rebuild the cache from the durable store under `write_lock`
+        // (invariant 2b) — the ONE reload discipline the incremental
+        // `apply_global_spending_revocation` path also uses.
+        match self
+            .reload_global_revoked_cache_under_lock(store, now_secs)
+            .await
+        {
+            Ok(()) => {
+                // Cache now reflects the durable store — GLOBAL-scope spends may be
+                // authorized against it (spec §19.5, invariant 1a).
+                self.global_revocation_hydration.mark_hydrated();
+                Ok(())
+            }
             Err(e) => {
                 // Fail-closed (spec §19.5, invariant 1a): a CONFIGURED store whose
                 // durable READ failed leaves the in-memory global revoked-CID cache
@@ -9339,14 +9365,9 @@ impl Supervisor {
                 // successful hydration — regardless of how the embedder handles the
                 // returned error (the FFI `resume()` path, e.g., logs and stays up).
                 self.global_revocation_hydration.mark_failed();
-                return Err(ContextError::RevocationHydrationFailed(e.to_string()));
+                Err(ContextError::RevocationHydrationFailed(e.to_string()))
             }
-        };
-        self.global_revoked_spending_cids.store(Arc::new(map));
-        // Cache now reflects the durable store — GLOBAL-scope spends may be
-        // authorized against it (spec §19.5, invariant 1a).
-        self.global_revocation_hydration.mark_hydrated();
-        Ok(())
+        }
     }
 
     /// Restore a single previously-persisted context from storage via
@@ -19269,14 +19290,6 @@ mod tests {
                 ),
             ))
         }
-
-        async fn load_for_did(
-            &self,
-            _did: &DID,
-            _now_secs: u64,
-        ) -> Result<HashSet<String>, crate::store::StoreError> {
-            Ok(HashSet::new())
-        }
     }
 
     /// Spec §19.5 fail-closed hydration: when a CONFIGURED revocation store's
@@ -19688,13 +19701,14 @@ mod tests {
     }
 
     /// Test-only [`RevokedSpendingUcanStore`] that wraps an inner store and
-    /// inserts scheduler yields in `load_for_did` AFTER reading the durable
-    /// snapshot but BEFORE returning it. This deterministically widens the
-    /// read→cache-store window the invariant-2b TOCTOU exploits: under the buggy
-    /// read-OUTSIDE-lock code a concurrent writer lands its full record+load+store
-    /// inside this window, so the stale re-read then clobbers it; under the fixed
-    /// read-UNDER-lock code these yields happen while `write_lock` is held, so the
-    /// writers serialize and no clobber is possible.
+    /// inserts scheduler yields in `load_all` AFTER reading the durable snapshot
+    /// but BEFORE returning it. This deterministically widens the
+    /// read→cache-store window the invariant-2b TOCTOU exploits: under a
+    /// hypothetical read-OUTSIDE-lock regression a concurrent writer would land its
+    /// full record+reload+store inside this window, so the stale re-read then
+    /// clobbers it; under the fixed read-UNDER-lock code
+    /// (`reload_global_revoked_cache_under_lock`) these yields happen while
+    /// `write_lock` is held, so the writers serialize and no clobber is possible.
     struct YieldOnLoadStore {
         inner: Arc<dyn crate::store::revoked_spending_ucans::RevokedSpendingUcanStore>,
     }
@@ -19717,17 +19731,9 @@ mod tests {
             &self,
             now_secs: u64,
         ) -> Result<HashMap<DID, HashSet<String>>, crate::store::StoreError> {
-            self.inner.load_all(now_secs).await
-        }
-
-        async fn load_for_did(
-            &self,
-            did: &DID,
-            now_secs: u64,
-        ) -> Result<HashSet<String>, crate::store::StoreError> {
-            let result = self.inner.load_for_did(did, now_secs).await;
+            let result = self.inner.load_all(now_secs).await;
             // Widen the read→store window so a concurrent writer can fully commit
-            // here — only clobbers under the buggy read-outside-lock code.
+            // here — only clobbers under a buggy read-outside-lock regression.
             for _ in 0..8 {
                 tokio::task::yield_now().await;
             }
@@ -19739,13 +19745,15 @@ mod tests {
     /// invariant 2b). A global revocation calls the supervisor DIRECTLY — it is
     /// NOT mailbox-serialized like a context-scoped revoke — so concurrent
     /// `revoke_spending_ucan` calls for the SAME payer DID's DISTINCT global tokens
-    /// race the cache read-modify-write. Before the invariant-2b fix the
-    /// `load_for_did` re-read ran OUTSIDE `write_lock`, so a later-committed CID
-    /// could be clobbered out of the in-memory gate cache (while staying durable),
-    /// re-authorizing that revoked token until the next restart (fail-OPEN). This
-    /// asserts EVERY concurrently-revoked CID survives in the cache. The
-    /// [`YieldOnLoadStore`] wrapper makes the pre-fix clobber reproduce
-    /// deterministically; after the fix it is race-free regardless of scheduling.
+    /// race the cache reload. The unified reload
+    /// (`reload_global_revoked_cache_under_lock`) holds `write_lock` across BOTH
+    /// the durable `load_all` re-read AND the cache store; a hypothetical
+    /// read-OUTSIDE-lock regression would let a later-committed CID be clobbered
+    /// out of the in-memory gate cache (while staying durable), re-authorizing that
+    /// revoked token until the next restart (fail-OPEN). This asserts EVERY
+    /// concurrently-revoked CID survives in the cache. The [`YieldOnLoadStore`]
+    /// wrapper makes such a clobber reproduce deterministically under a regression;
+    /// with the read under the lock it is race-free regardless of scheduling.
     #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_global_revokes_same_did_do_not_clobber_cache() {
