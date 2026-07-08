@@ -1448,6 +1448,13 @@ pub struct Supervisor {
 pub struct DurableProviders {
     saga_journal: Arc<dyn SagaJournal>,
     mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter>,
+    /// The durable global-scope spending-UCAN revocation store, derived from the
+    /// SAME `Storage` handle as the journal + `mls_storage` (spec §17.6 / §19.5).
+    /// `Some` only for the [`Self::from_handle`] production path — the
+    /// test/legacy constructors, which have no `Storage` handle, leave it `None`
+    /// (their supervisors run without global-scope revocation durability).
+    revoked_spending_ucan_store:
+        Option<Arc<dyn crate::store::revoked_spending_ucans::RevokedSpendingUcanStore>>,
 }
 
 impl DurableProviders {
@@ -1475,6 +1482,39 @@ impl DurableProviders {
         Self {
             saga_journal,
             mls_storage,
+            // The durable global-scope revocation store requires an
+            // `EncryptedStorage` backend (`ProtocolRepository::new`), which this
+            // generic `S: Storage` constructor cannot guarantee — production
+            // callers over an encrypted backend use `from_encrypted_handle` to
+            // additionally wire it. `None` here means global-scope revocation is
+            // held only in-memory (no cross-restart durability).
+            revoked_spending_ucan_store: None,
+        }
+    }
+
+    /// Same as [`Self::from_handle`], but over an **encrypted** backend, so it
+    /// ALSO derives the durable global-scope spending-UCAN revocation store
+    /// (spec §17.6 / §19.5) from the SAME handle — a global revocation persisted
+    /// through it survives restart on the same store the journal / event log /
+    /// persistence read. This is the production node/self-host constructor;
+    /// `SqliteStorage` (and `AppleStorage`) satisfy the bound.
+    #[must_use]
+    pub fn from_encrypted_handle<S>(handle: Arc<S>) -> Self
+    where
+        S: scp_platform::EncryptedStorage + 'static,
+    {
+        let saga_journal: Arc<dyn SagaJournal> = Arc::new(
+            crate::context::supervisor::ProtocolRepositorySagaJournal::new(Arc::clone(&handle)),
+        );
+        let revoked_spending_ucan_store: Arc<
+            dyn crate::store::revoked_spending_ucans::RevokedSpendingUcanStore,
+        > = Arc::new(crate::store::ProtocolRepository::new(Arc::clone(&handle)));
+        let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
+            Arc::new(crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(handle));
+        Self {
+            saga_journal,
+            mls_storage,
+            revoked_spending_ucan_store: Some(revoked_spending_ucan_store),
         }
     }
 
@@ -1496,6 +1536,7 @@ impl DurableProviders {
         Self {
             saga_journal,
             mls_storage,
+            revoked_spending_ucan_store: None,
         }
     }
 
@@ -1512,7 +1553,24 @@ impl DurableProviders {
         Self {
             saga_journal: Arc::new(NoopSagaJournal),
             mls_storage,
+            revoked_spending_ucan_store: None,
         }
+    }
+
+    /// Returns a clone of the durable global-scope spending-UCAN revocation
+    /// store derived from this pair's backend, or `None` for the test/legacy
+    /// constructors that carry no `Storage` handle.
+    ///
+    /// Mirrors [`Self::mls_storage`]: reading a half for wiring is harmless
+    /// because the only way to BUILD the store half remains [`Self::from_handle`]
+    /// over the one shared handle, so it cannot be used to wire a divergent
+    /// backend. The node's loopback supervisor uses this to wire global-scope
+    /// revocation durability over the SAME backend as the saga journal.
+    #[must_use]
+    pub fn revoked_spending_ucan_store(
+        &self,
+    ) -> Option<Arc<dyn crate::store::revoked_spending_ucans::RevokedSpendingUcanStore>> {
+        self.revoked_spending_ucan_store.clone()
     }
 
     /// Returns a read-only clone of the `mls_storage` (`OpenMLS`) view.

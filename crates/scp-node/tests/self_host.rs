@@ -252,7 +252,7 @@ async fn self_host_deploys_embedded_site_and_serves_index_over_http() {
     );
     // Durable saga journal + `mls_storage` view bound into one `DurableProviders`
     // over the SAME `Arc<SqliteStorage>`, exactly as the production binary does.
-    let durable = scp_core::context::supervisor::DurableProviders::from_handle(mls_inner);
+    let durable = scp_core::context::supervisor::DurableProviders::from_encrypted_handle(mls_inner);
 
     // -- Embedded default site (index.html + style.css + app.js), with the node
     //    DID injected into the index <head>, just like production.
@@ -356,7 +356,7 @@ async fn build_deployer(built: &BuiltNode, context_id: &str) -> scp_node::SelfHo
         SqliteStorage::new(&built.storage_dir.join("mls"), built.storage_key.as_ref())
             .expect("MLS SQLite should open"),
     );
-    let durable = scp_core::context::supervisor::DurableProviders::from_handle(mls_inner);
+    let durable = scp_core::context::supervisor::DurableProviders::from_encrypted_handle(mls_inner);
     let signing_key_handle = built.node.identity().identity().active_signing_key;
     scp_node::SelfHostDeployer::start(
         &built.node,
@@ -884,7 +884,7 @@ async fn deploy_embedded_and_assert_serves<S>(
         SqliteStorage::new(&storage_dir.join("mls"), storage_key.as_ref())
             .expect("MLS SQLite should open (distinct subdirectory)"),
     );
-    let durable = scp_core::context::supervisor::DurableProviders::from_handle(mls_inner);
+    let durable = scp_core::context::supervisor::DurableProviders::from_encrypted_handle(mls_inner);
 
     let assets = scp_node::embedded_assets(Some(&node_did));
     let expected_count = assets.len();

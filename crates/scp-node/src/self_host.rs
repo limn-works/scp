@@ -639,6 +639,12 @@ where
     // `mls_storage` so crash-recovery replay loads unresolved saga entries from
     // one store on restart — guaranteed by the `DurableProviders` newtype
     // (§17.16 / ADR-049).
+    //
+    // The global-scope spending-UCAN revocation store (spec §19.5) is derived
+    // from that SAME backend by `DurableProviders::from_handle`, so a global
+    // revocation persisted here survives restart — mirroring the FFI bridges'
+    // construction. Read it out BEFORE `durable` is moved into the constructor.
+    let revoked_spending_ucan_store = durable.revoked_spending_ucan_store();
     let supervisor = scp_core::context::supervisor::Supervisor::with_providers_and_journal(
         crypto,
         transport,
@@ -649,7 +655,7 @@ where
         Some(event_tx),
         Some(clock),
         durable,
-        None, // revoked_spending_ucan_store
+        revoked_spending_ucan_store,
     );
 
     supervisor
@@ -2162,12 +2168,14 @@ where
     // `DurableProviders` derived from the SAME `Arc<SqliteStorage>`, so
     // crash-recovery replay and the `OpenMLS` view read and write one
     // `{storage_dir}/mls` SQLCipher store and cannot diverge by construction.
-    // `DurableProviders::from_handle` is the only non-test constructor (§17.6 /
-    // §17.16 / ADR-049): a reviewer proved that deriving the two providers via
-    // separate calls let a single mutated constructor pass a fresh in-memory
+    // `DurableProviders::from_encrypted_handle` is the production constructor
+    // (§17.6 / §17.16 / ADR-049): a reviewer proved that deriving the providers
+    // via separate calls let a single mutated constructor pass a fresh in-memory
     // store to the journal while leaving every gate/test green — binding them
-    // into one newtype makes that divergence a compile error.
-    let durable = scp_core::context::supervisor::DurableProviders::from_handle(mls_inner);
+    // into one newtype makes that divergence a compile error. The encrypted
+    // variant ALSO derives the durable global-scope spending-UCAN revocation
+    // store (spec §19.5) from this SAME `Arc<SqliteStorage>`.
+    let durable = scp_core::context::supervisor::DurableProviders::from_encrypted_handle(mls_inner);
 
     let signing_key_handle = node.identity().identity().active_signing_key;
     SelfHostDeployer::start(
