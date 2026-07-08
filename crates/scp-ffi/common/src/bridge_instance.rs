@@ -2904,6 +2904,7 @@ mod tests {
             None,
             None,
             test_mls_storage(),
+            None, // revoked_spending_ucan_store
         )
     }
 
@@ -4291,6 +4292,7 @@ mod tests {
             None,
             None,
             test_mls_storage(),
+            None, // revoked_spending_ucan_store
         );
 
         let instance = CoreFields::with_persistence(persistence_for_instance);

@@ -3,7 +3,7 @@
 //! directory in ADR-049 commit 12; the helpers in
 //! [`crate::context::lifecycle_helpers`] call into these primitives.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use scp_protocol::context::ContextError;
 use scp_protocol::context::builder::ContextCreationError;
@@ -298,6 +298,7 @@ pub fn enforce_join_economy(
     context_id: &str,
     clock: &dyn scp_clock::Clock,
     key_resolver: &scp_protocol::context::governance::KeyResolver,
+    global_revoked_spending_cids: Option<&HashSet<String>>,
 ) -> Result<Option<scp_protocol::economy::types::Amount>, ContextError> {
     if scp_protocol::economy::policy::auto_accept_blocked_by_economics(
         governance.economic_policy.as_ref(),
@@ -327,6 +328,7 @@ pub fn enforce_join_economy(
         pricing,
         nonce_tracker: &mut governance.class_s.spending_nonce_tracker,
         revoked_spending_ucan_cids: &governance.revoked_spending_ucan_cids,
+        global_revoked_spending_cids,
         key_resolver,
     })
 }

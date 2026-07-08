@@ -422,6 +422,28 @@ impl ProtocolRepoVariant {
             }
         }
     }
+
+    /// Returns this variant's backing `ProtocolRepository`, erased to the
+    /// durable, DID-scoped store for revoked GLOBAL-scope spending UCANs
+    /// (spec §19.5).
+    ///
+    /// Both variants already hold an `Arc<ProtocolRepository<_>>` over the
+    /// SAME backend that feeds [`Self::event_log_provider`] and (for
+    /// `Sqlite`) `CoreFields::persistence` — so a global-scope revocation
+    /// persisted through this store survives restart on the SAME backend
+    /// those consumers read from (spec §17.6 same-backend invariant), and no
+    /// second `Storage` handle is fabricated.
+    #[must_use]
+    pub fn revoked_spending_ucan_store(
+        &self,
+    ) -> Arc<dyn scp_core::store::revoked_spending_ucans::RevokedSpendingUcanStore> {
+        match self {
+            Self::InMemory(repo) => Arc::clone(repo)
+                as Arc<dyn scp_core::store::revoked_spending_ucans::RevokedSpendingUcanStore>,
+            Self::Sqlite(repo) => Arc::clone(repo)
+                as Arc<dyn scp_core::store::revoked_spending_ucans::RevokedSpendingUcanStore>,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

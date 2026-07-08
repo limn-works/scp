@@ -226,6 +226,7 @@ pub fn build_encrypted_envelope(
 /// persist is kept. `send_message` threads the token down to `finalize_send`,
 /// which discharges it (or each early-abort path commits it before its
 /// Class-C reversal).
+#[allow(clippy::too_many_arguments)]
 pub fn enforce_send_economy(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     sender_did: &DID,
@@ -234,6 +235,7 @@ pub fn enforce_send_economy(
     context_id: &str,
     clock: &dyn Clock,
     key_resolver: &KeyResolver,
+    global_revoked_spending_cids: Option<&std::collections::HashSet<String>>,
 ) -> Result<
     (
         Option<scp_protocol::economy::types::Amount>,
@@ -267,6 +269,7 @@ pub fn enforce_send_economy(
                 pricing,
                 nonce_tracker: &mut governance.class_s.spending_nonce_tracker,
                 revoked_spending_ucan_cids: &governance.revoked_spending_ucan_cids,
+                global_revoked_spending_cids,
                 key_resolver,
             },
         )?;
@@ -985,6 +988,17 @@ pub async fn send_message(
     // branch. That token's fail-closed persist is owed on EVERY terminal path
     // below (keep-direction) — the Err arm here issues NO token (nothing was
     // consumed), so it is unchanged.
+    // Snapshot the sender's global-scope (`scp:spending:*`) revoked-CID set
+    // (spec §19.5) before entering `enforce_send_economy`'s (synchronous)
+    // combinator — cloned into an owned `HashSet` rather than holding the
+    // `ArcSwap` guard across the call, mirroring the join-path snapshot in
+    // `lifecycle_helpers.rs`.
+    let global_revoked_for_sender: Option<std::collections::HashSet<String>> = deps
+        .global_revoked_spending_cids
+        .load()
+        .get(sender_did)
+        .cloned();
+
     let (deducted_cost, mut spending_nonce_token) = match enforce_send_economy(
         cell,
         sender_did,
@@ -993,6 +1007,7 @@ pub async fn send_message(
         &context_id,
         &*deps.clock,
         &deps.key_resolver,
+        global_revoked_for_sender.as_ref(),
     ) {
         Ok(cost_and_token) => cost_and_token,
         Err(e) => {
@@ -4198,6 +4213,7 @@ mod pseudonym_routing_tests {
             None,
             Some(clock),
             mls_storage,
+            None, // revoked_spending_ucan_store
         );
         supervisor
             .build_actor_deps(&DID(ALICE.to_owned()))

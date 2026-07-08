@@ -34,6 +34,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None,
         None,
         support::example_mls_storage(),
+        None, // revoked_spending_ucan_store
     );
 
     // 2. Register two participants.

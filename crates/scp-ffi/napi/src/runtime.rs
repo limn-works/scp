@@ -965,6 +965,7 @@ pub fn init_supervisor(bi: &NapiBridgeInstance, local_did: &str) {
         persistence,
         durable,
         key_resolver_for(bi),
+        bi.protocol_repository.revoked_spending_ucan_store(),
     );
 
     bi.core.set_supervisor(supervisor_arc);
@@ -1026,6 +1027,7 @@ const EVENT_CHANNEL_CAPACITY: usize = 1024;
 /// When no consumer subscribes, emitting into the channel is a cheap no-op: the
 /// retained sender has no receivers, so `send` returns `Err` and the event is
 /// simply dropped without blocking context operations.
+#[allow(clippy::too_many_arguments)]
 fn build_supervisor_arc(
     crypto: Arc<scp_core::crypto::mls::provider::MlsCryptoProvider>,
     transport: Box<dyn ContextTransportProvider>,
@@ -1033,6 +1035,9 @@ fn build_supervisor_arc(
     persistence: Box<dyn ContextPersistence>,
     durable: scp_core::context::supervisor::DurableProviders,
     key_resolver: scp_core::context::governance::KeyResolver,
+    revoked_spending_ucan_store: Arc<
+        dyn scp_core::store::revoked_spending_ucans::RevokedSpendingUcanStore,
+    >,
 ) -> Arc<scp_core::context::supervisor::Supervisor> {
     // Enable the event broadcast channel so `subscribe_events()` yields a
     // receiver for the node webhook dispatcher (§12.10.5). The unused receiver
@@ -1055,6 +1060,7 @@ fn build_supervisor_arc(
         Some(event_tx),
         Some(clock),
         durable,
+        Some(revoked_spending_ucan_store),
     )
 }
 
@@ -1135,6 +1141,7 @@ pub fn init_supervisor_with_local_transport(bi: &NapiBridgeInstance, local_did: 
         persistence,
         durable,
         key_resolver_for(bi),
+        bi.protocol_repository.revoked_spending_ucan_store(),
     );
 
     bi.core.set_supervisor(supervisor_arc);
@@ -1200,6 +1207,7 @@ pub fn init_supervisor_with_relay_transport(
         persistence,
         durable,
         key_resolver_for(bi),
+        bi.protocol_repository.revoked_spending_ucan_store(),
     );
 
     bi.core.set_supervisor(supervisor_arc);
@@ -1329,6 +1337,7 @@ fn init_supervisor_for_test_on_with_did(bi: &NapiBridgeInstance, local_did: &str
         Box::new(NapiBridgePersistence::new()),
         durable,
         key_resolver_for(bi),
+        bi.protocol_repository.revoked_spending_ucan_store(),
     );
 
     bi.core.set_supervisor(supervisor_arc);

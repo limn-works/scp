@@ -1161,8 +1161,15 @@ fn validate_ucan_rebind(
     let revoked = state.governance.revoked_spending_ucan_cids.clone();
 
     let did_resolver = KeyResolverDidResolver::new(&deps.key_resolver);
+    // Global-scope spending-UCAN revocations (spec §19.5) are keyed by the
+    // presenting token's issuer DID, mirroring the economy-gate union check
+    // in `economy_logic::validate_spending_ucan_or_error`.
+    let global_snapshot = deps.global_revoked_spending_cids.load();
+    let global_revoked_for_issuer =
+        global_snapshot.get(&scp_did::DID::from(token.payload.iss.clone()));
     let revocation_checker = ContextRevocationChecker {
         revoked_cids: &revoked,
+        global_revoked_cids: global_revoked_for_issuer,
     };
     // The cross-context ENVELOPE replay is owned by B's `xctx_nonce_dedup`
     // (the freshness check above in `validate_freshness`); the UCAN's OWN
@@ -3067,6 +3074,7 @@ mod tests {
             None,
             None,
             mls_storage,
+            None, // revoked_spending_ucan_store
         );
         supervisor
             .build_actor_deps(&DID("did:example:saga-test-owner".to_owned()))
@@ -3112,6 +3120,7 @@ mod tests {
             None,
             None,
             mls_storage,
+            None, // revoked_spending_ucan_store
         );
         supervisor
             .build_actor_deps(&DID("did:example:saga-test-owner".to_owned()))
@@ -5322,6 +5331,7 @@ mod tests {
             None,
             None,
             mls_storage,
+            None, // revoked_spending_ucan_store
         );
         supervisor
             .build_actor_deps(&DID("did:example:saga-test-owner".to_owned()))

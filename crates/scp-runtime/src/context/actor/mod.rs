@@ -734,6 +734,7 @@ mod tests {
             None,
             None,
             mls_storage,
+            None, // revoked_spending_ucan_store
         );
 
         // `build_actor_deps` self-sources crypto/transport/event_log/clock/

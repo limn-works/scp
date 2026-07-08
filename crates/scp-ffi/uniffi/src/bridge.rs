@@ -14906,9 +14906,7 @@ impl Scp {
                 // Non-spending tokens are unaffected.
                 if scp_core::crypto::ucan::spending::is_spending_ucan(&parsed) {
                     let sup = bi.context_manager_or_error()?;
-                    let revoked_cid =
-                        scp_core::crypto::ucan::revoke::compute_revocation_cid(&token);
-                    sup.revoke_spending_ucan(&handle.context_id, revoked_cid, revoker_did)
+                    sup.revoke_spending_ucan(&handle.context_id, &token, revoker_did)
                         .await
                         .map_err(ScpError::from)?;
                 }

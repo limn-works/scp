@@ -391,6 +391,7 @@ fn bob_supervisor_with_resolver(
         None,
         None,
         fresh_mls_storage(),
+        None, // revoked_spending_ucan_store
     );
     (sup, crypto)
 }
@@ -418,6 +419,7 @@ fn alice_supervisor() -> (Arc<Supervisor>, Arc<MlsCryptoProvider>) {
         None,
         None,
         fresh_mls_storage(),
+        None, // revoked_spending_ucan_store
     );
     (sup, crypto)
 }
@@ -2497,6 +2499,7 @@ fn alice_supervisor_with_transport(
         None,
         None,
         fresh_mls_storage(),
+        None, // revoked_spending_ucan_store
     );
     (sup, crypto)
 }
@@ -3073,6 +3076,7 @@ fn bob_supervisor_with_transport(transport: Box<dyn ContextTransportProvider>) -
         None,
         None,
         fresh_mls_storage(),
+        None, // revoked_spending_ucan_store
     )
 }
 

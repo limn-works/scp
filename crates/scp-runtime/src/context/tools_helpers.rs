@@ -51,7 +51,7 @@
 //! off-lock-executor invariant the legacy lock-split protected, expressed
 //! in the actor model.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::Arc;
 
@@ -655,6 +655,16 @@ pub async fn reserve_tool_economy(
     // no budget is charged, so — exactly as before — NO fail-closed persist runs
     // (the velocity tick / hard-rate consume ride the ordinary best-effort
     // persist elsewhere); the combinator is skipped entirely.
+    // Snapshot the invoker's global-scope (`scp:spending:*`) revoked-CID set
+    // (spec §19.5) before entering the fail-closed combinator below — cloned
+    // into an owned `HashSet` rather than holding the `ArcSwap` guard across
+    // the combinator's `.await` (clippy::await_holding_lock discipline).
+    let global_revoked_for_invoker: Option<HashSet<String>> = deps
+        .global_revoked_spending_cids
+        .load()
+        .get(invoker_did)
+        .cloned();
+
     let deducted_cost = if action_cost.0 > 0 {
         let combinator_result = cell
             .commit_class_s_keep_compensating(
@@ -675,6 +685,7 @@ pub async fn reserve_tool_economy(
                             context_id,
                             &mut state.governance.class_s.spending_nonce_tracker,
                             &state.governance.revoked_spending_ucan_cids,
+                            global_revoked_for_invoker.as_ref(),
                             key_resolver,
                             clock,
                         )
@@ -1687,6 +1698,7 @@ mod tests {
                 None,
                 Some(clock),
                 mls_storage,
+                None, // revoked_spending_ucan_store
             );
             supervisor
                 .build_actor_deps(&DID(ADMIN.to_owned()))

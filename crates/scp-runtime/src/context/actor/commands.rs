@@ -1830,6 +1830,15 @@ pub enum EconomyCommand {
         /// SHA-256 revocation CID of the encoded spending UCAN — identical
         /// to the CID the gate computes via `compute_revocation_cid`.
         revoked_cid: String,
+        /// The spending UCAN's scope URI (spec §19.5), e.g.
+        /// `"scp:spending:{context_id}"`. Only the CONTEXT-scoped case
+        /// reaches this command (global-scope revocations route into the
+        /// durable [`crate::store::revoked_spending_ucans::RevokedSpendingUcanStore`]
+        /// instead — see
+        /// [`Supervisor::revoke_spending_ucan`](crate::context::supervisor::Supervisor::revoke_spending_ucan)).
+        /// Carried through so the [`SpendingUcanRevokedPayload`](scp_event_log::payload::SpendingUcanRevokedPayload)
+        /// leaf records which scope was revoked.
+        scope: String,
         /// DID that initiated the revocation (the token issuer or context
         /// creator, already authorized by the `ucan_revoke` path). Stamped
         /// as the leaf `actor_did`.

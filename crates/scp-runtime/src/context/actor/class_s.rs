@@ -5449,6 +5449,7 @@ impl ClassSCell
             None,
             None,
             mls_storage,
+            None, // revoked_spending_ucan_store
         );
         supervisor
             .build_actor_deps(&DID("did:example:class-s-cell-test".to_owned()))

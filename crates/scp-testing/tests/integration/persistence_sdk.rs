@@ -220,6 +220,7 @@ async fn context_create_persists_membership_to_sqlite() {
             Arc::new(SpawnBlockingStorageAdapter::new(Arc::new(
                 InMemoryStorage::new(),
             ))) as Arc<dyn OpenMlsStorageAdapter>,
+            None, // revoked_spending_ucan_store
         );
 
         manager.register_local_did(alice.clone()).await.unwrap();
@@ -322,6 +323,7 @@ async fn full_lifecycle_suspend_restore_roundtrip() {
             Arc::new(SpawnBlockingStorageAdapter::new(Arc::new(
                 InMemoryStorage::new(),
             ))) as Arc<dyn OpenMlsStorageAdapter>,
+            None, // revoked_spending_ucan_store
         );
 
         manager.register_local_did(alice.clone()).await.unwrap();
@@ -391,6 +393,7 @@ async fn full_lifecycle_suspend_restore_roundtrip() {
         Arc::new(SpawnBlockingStorageAdapter::new(Arc::new(
             InMemoryStorage::new(),
         ))) as Arc<dyn OpenMlsStorageAdapter>,
+        None, // revoked_spending_ucan_store
     );
 
     manager2.register_local_did(alice.clone()).await.unwrap();

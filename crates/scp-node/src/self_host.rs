@@ -649,6 +649,7 @@ where
         Some(event_tx),
         Some(clock),
         durable,
+        None, // revoked_spending_ucan_store
     );
 
     supervisor

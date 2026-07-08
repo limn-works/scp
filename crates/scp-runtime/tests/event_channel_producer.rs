@@ -155,6 +155,7 @@ fn supervisor_with_event_channel() -> (
         Some(event_tx.clone()),
         None,
         mls_storage,
+        None, // revoked_spending_ucan_store
     );
     (supervisor, event_tx)
 }

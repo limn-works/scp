@@ -47,11 +47,20 @@ pub(crate) async fn dispatch(
         EconomyCommand::RevokeSpendingUcan {
             context_id,
             revoked_cid,
+            scope,
             revoker_did,
             reply,
         } => {
-            handle_revoke_spending_ucan(cell, deps, context_id, revoked_cid, revoker_did, reply)
-                .await
+            handle_revoke_spending_ucan(
+                cell,
+                deps,
+                context_id,
+                revoked_cid,
+                scope,
+                revoker_did,
+                reply,
+            )
+            .await
         }
     }
 }
@@ -122,6 +131,7 @@ async fn handle_revoke_spending_ucan(
     deps: &ActorDeps,
     context_id: String,
     revoked_cid: String,
+    scope: String,
     revoker_did: String,
     reply: tokio::sync::oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
@@ -152,6 +162,7 @@ async fn handle_revoke_spending_ucan(
     let payload = match scp_event_log::payload::encode_payload(
         &scp_event_log::payload::SpendingUcanRevokedPayload {
             token_cid: cid_for_leaf,
+            scope,
         },
     ) {
         Ok(p) => p,

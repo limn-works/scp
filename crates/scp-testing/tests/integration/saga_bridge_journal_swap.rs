@@ -180,6 +180,7 @@ fn journal_supervisor(
         // ONE shared `InMemoryStorage` (see callers), then pairs them via the
         // test-only `for_test` constructor — production sites use `from_handle`.
         scp_core::context::supervisor::DurableProviders::for_test(journal, mls_storage),
+        None, // revoked_spending_ucan_store
     )
 }
 

@@ -6194,6 +6194,7 @@ mod commit_broadcast_retry_tests {
             None,
             Some(clock),
             mls_storage,
+            None, // revoked_spending_ucan_store
         );
         supervisor
             .build_actor_deps(&DID(ADMIN.to_owned()))

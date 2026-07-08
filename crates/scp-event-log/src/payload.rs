@@ -182,18 +182,25 @@ pub struct AccessRevokedPayload {
 /// (spec §19.5, §19.6.1).
 ///
 /// Emitted when a spending UCAN is revoked and its revocation CID is carried
-/// into the context actor's Class-S `revoked_spending_ucan_cids` paid-action
-/// gate. `token_cid` is the SHA-256 revocation CID of the encoded token (the
-/// same CID `compute_revocation_cid` produces and the gate checks) — the
-/// canonical identifier under which the token is recorded as revoked, matching
-/// the `token_cid` field of the general `TokenRevoked` leaf. The revoker DID and
-/// commit timestamp are carried as the leaf's `actor_did`/timestamp, not in this
-/// payload. Like `TokenRevoked`, the standard revoke path carries no free-text
-/// reason (§19.6.1).
+/// into either the context actor's Class-S `revoked_spending_ucan_cids`
+/// paid-action gate (context-scoped) or the durable DID-scoped
+/// `RevokedSpendingUcanStore` (global-scoped) — spec §19.5. `token_cid` is the
+/// SHA-256 revocation CID of the encoded token (the same CID
+/// `compute_revocation_cid` produces and the gate checks) — the canonical
+/// identifier under which the token is recorded as revoked, matching the
+/// `token_cid` field of the general `TokenRevoked` leaf. `scope` is the
+/// revoked spending UCAN's resource URI (`scp:spending:{context_id}` or
+/// `scp:spending:*`), recording which of the two revocation routes applied.
+/// The revoker DID and commit timestamp are carried as the leaf's
+/// `actor_did`/timestamp, not in this payload. Like `TokenRevoked`, the
+/// standard revoke path carries no free-text reason (§19.6.1).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpendingUcanRevokedPayload {
     /// The SHA-256 revocation CID of the revoked spending UCAN.
     pub token_cid: String,
+    /// The revoked spending UCAN's scope URI (`scp:spending:{context_id}` or
+    /// `scp:spending:*`).
+    pub scope: String,
 }
 
 /// Payload for
@@ -532,6 +539,20 @@ mod tests {
         assert_positional_array(&encoded.data, 1);
         let decoded: AccessRevokedPayload = decode_payload(&encoded).unwrap();
         assert_eq!(p, decoded);
+    }
+
+    #[test]
+    fn spending_ucan_revoked_round_trip() {
+        let p = SpendingUcanRevokedPayload {
+            token_cid: "b1946ac92492d2347c6235b4d2611184".to_owned(),
+            scope: "scp:spending:ctx123".to_owned(),
+        };
+        let encoded = encode_payload(&p).unwrap();
+        assert_positional_array(&encoded.data, 2);
+        let decoded: SpendingUcanRevokedPayload = decode_payload(&encoded).unwrap();
+        assert_eq!(p, decoded);
+        assert_eq!(decoded.token_cid, "b1946ac92492d2347c6235b4d2611184");
+        assert_eq!(decoded.scope, "scp:spending:ctx123");
     }
 
     #[test]

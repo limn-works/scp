@@ -1289,6 +1289,7 @@ mod equivocation_dedup_tests {
             None,
             None,
             mls_storage,
+            None, // revoked_spending_ucan_store
         );
         let deps = supervisor
             .build_actor_deps(&DID("did:example:equiv-dedup".to_owned()))

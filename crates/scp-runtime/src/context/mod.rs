@@ -277,6 +277,7 @@ pub fn test_supervisor(
         None,
         None,
         mls_storage,
+        None, // revoked_spending_ucan_store
     )
 }
 

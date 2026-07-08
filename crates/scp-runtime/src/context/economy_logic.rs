@@ -112,25 +112,41 @@ impl DidResolver for KeyResolverDidResolver<'_> {
     }
 }
 
-/// Per-context revocation checker for spending UCANs.
+/// Per-context + global revocation checker for spending UCANs (spec §19.5).
 ///
-/// Backed by an immutable borrow of the per-context `revoked_spending_ucan_cids`
-/// set. That set is populated by the
+/// A spending UCAN's scope is either a single context or global
+/// (`scp:spending:*`). Revocation is routed by scope at revoke time
+/// ([`crate::context::supervisor::Supervisor::revoke_spending_ucan`]):
+/// context-scoped CIDs land in the per-context Class-S
+/// `revoked_spending_ucan_cids` set; global-scoped CIDs land in a durable,
+/// DID-scoped store hydrated into an in-memory `ArcSwap` cache. Because a
+/// context-scoped spending UCAN can never carry a global-scope attestation
+/// (and vice versa), the gate does not need to know which store a given CID
+/// came from — it simply checks the UNION of both sets for the charged DID.
+///
+/// Backed by immutable borrows of (a) the per-context `revoked_spending_ucan_cids`
+/// set, populated by the
 /// [`EconomyCommand::RevokeSpendingUcan`](crate::context::actor::commands::EconomyCommand)
-/// handler when a spending UCAN is revoked via the FFI `ucan_revoke` path (spec
-/// §19.5): the revocation CID is inserted and persisted fail-closed, after
-/// which this checker rejects any subsequent spend presenting that token.
+/// handler when a spending UCAN is revoked via the FFI `ucan_revoke` path, and
+/// (b) the charged DID's global revoked-CID set (`None` when the DID has no
+/// global revocations recorded, or when no global-revocation store is
+/// configured on this instance).
 ///
 /// `pub(crate)` so the cross-context tool-invocation saga handler reuses the
-/// SAME per-context revocation surface for its §7 UCAN re-validation (spec
-/// §6.2.4), backed by the same `revoked_spending_ucan_cids` set.
+/// SAME per-context + global revocation surface for its §7 UCAN re-validation
+/// (spec §6.2.4).
 pub struct ContextRevocationChecker<'a> {
     pub(crate) revoked_cids: &'a HashSet<String>,
+    /// The charged DID's global-scope revoked-CID set, or `None`.
+    pub(crate) global_revoked_cids: Option<&'a HashSet<String>>,
 }
 
 impl RevocationChecker for ContextRevocationChecker<'_> {
     fn is_revoked(&self, token_cid: &str) -> bool {
         self.revoked_cids.contains(token_cid)
+            || self
+                .global_revoked_cids
+                .is_some_and(|g| g.contains(token_cid))
     }
 }
 
@@ -148,20 +164,30 @@ impl RevocationChecker for ContextRevocationChecker<'_> {
 /// - Delegation chain walk (no-op for root spending UCANs, real for
 ///   sub-delegated ones).
 /// - Expiry / not-before / 24-hour ceiling.
-/// - Revocation lookup against the per-context revoked-CID set.
+/// - Revocation lookup against the UNION of the per-context revoked-CID set
+///   and the charged DID's global-scope revoked-CID set (spec §19.5).
 /// - Nonce reservation against the per-context spending nonce tracker.
 /// - Spending-specific scope, lifetime, and parent attenuation checks.
+// The union needs both the per-context and global revoked-CID borrows on top
+// of the six verifier inputs, so this crosses the 7-arg lint threshold.
+// Grouping into a struct would only shift the arg list to the single
+// `enforce_economy` call site, which already owns an `EnforceEconomyRequest`.
+#[allow(clippy::too_many_arguments)]
 pub fn validate_spending_ucan_or_error(
     spending: &scp_protocol::crypto::ucan::UcanToken,
     actor_did: &DID,
     context_id: &str,
     nonce_tracker: &mut scp_protocol::crypto::ucan::nonce::NonceTracker<Arc<dyn scp_clock::Clock>>,
     revoked_cids: &HashSet<String>,
+    global_revoked_cids: Option<&HashSet<String>>,
     key_resolver: &KeyResolver,
     clock: &dyn scp_clock::Clock,
 ) -> Result<(), ContextError> {
     let did_resolver = KeyResolverDidResolver::new(key_resolver);
-    let revocation_checker = ContextRevocationChecker { revoked_cids };
+    let revocation_checker = ContextRevocationChecker {
+        revoked_cids,
+        global_revoked_cids,
+    };
     let proof_resolver = InMemoryProofResolver::new();
 
     let check = SpendingUcanCheck {
@@ -186,6 +212,32 @@ pub fn validate_spending_ucan_or_error(
             "SCP-ECON-12065: spending UCAN signature/replay validation failed: {e}"
         ))
     })
+}
+
+/// Verify-before-revoke wrapper (§19.5): confirms `token` is a genuinely-issued
+/// spending UCAN before its CID may enter a revocation store.
+///
+/// Deliberately narrower than [`validate_spending_ucan_or_error`] — it skips
+/// nonce freshness and expiry so a human can revoke a still-genuinely-issued
+/// token regardless of remaining lifetime or presentation recency. See
+/// [`scp_protocol::crypto::ucan::spending::verify_spending_ucan_genuine`] for
+/// the full rationale.
+///
+/// # Errors
+///
+/// Returns [`ContextError::PermissionDenied`] (`SCP-ECON-12066`) if the token
+/// is not a genuinely-issued spending UCAN.
+pub fn verify_spending_ucan_genuine_or_error(
+    token: &scp_protocol::crypto::ucan::UcanToken,
+    key_resolver: &KeyResolver,
+) -> Result<(), ContextError> {
+    let did_resolver = KeyResolverDidResolver::new(key_resolver);
+    scp_protocol::crypto::ucan::spending::verify_spending_ucan_genuine(token, &did_resolver)
+        .map_err(|e| {
+            ContextError::PermissionDenied(format!(
+                "SCP-ECON-12066: spending UCAN genuineness verification failed at revoke: {e}"
+            ))
+        })
 }
 
 /// Authorization token returned by `authorize_paid_action`.
@@ -308,15 +360,21 @@ pub struct EnforceEconomyRequest<'a> {
     pub nonce_tracker: &'a mut scp_protocol::crypto::ucan::nonce::NonceTracker<
         std::sync::Arc<dyn scp_clock::Clock>,
     >,
-    /// Per-context revoked spending-UCAN CIDs (C1, PR #1606).
-    ///
-    /// Currently always empty — spending UCAN revocation lists have not been
-    /// wired through governance. Passing the set explicitly (rather than
-    /// constructing one inside `enforce_economy`) means the only change
-    /// required when revocation lands is populating this field at call
-    /// sites. The set is consumed by `validate_spending_ucan_signed` via
-    /// the [`ContextRevocationChecker`] adapter.
+    /// Per-context revoked spending-UCAN CIDs (C1, PR #1606; populated by
+    /// [`crate::context::supervisor::Supervisor::revoke_spending_ucan`] for
+    /// CONTEXT-scoped revocations, spec §19.5). Passed explicitly (rather
+    /// than read inside `enforce_economy`) so callers control which
+    /// generation of the actor's Class-S state is consulted. The set is
+    /// consumed by `validate_spending_ucan_signed` via the
+    /// [`ContextRevocationChecker`] adapter.
     pub revoked_spending_ucan_cids: &'a HashSet<String>,
+    /// The charged DID's global-scope (`scp:spending:*`) revoked-CID set
+    /// (spec §19.5), or `None` when the DID has no global revocations
+    /// recorded (or no global-revocation store is configured on this
+    /// instance). Consumed alongside `revoked_spending_ucan_cids` by
+    /// [`ContextRevocationChecker`] as a UNION check — a spending UCAN is
+    /// revoked if its CID is in EITHER set.
+    pub global_revoked_spending_cids: Option<&'a HashSet<String>>,
     /// Resolver for the actor's UCAN signing key (C1, PR #1606).
     ///
     /// VM-aware per ADR-039: the [`KeyResolver`] takes a `(DID, SigningKeyId)`
@@ -358,6 +416,7 @@ pub fn enforce_economy(
         pricing,
         nonce_tracker,
         revoked_spending_ucan_cids,
+        global_revoked_spending_cids,
         key_resolver,
     } = req;
     // Free contexts (no `economic_policy`) do not charge at the cost layer.
@@ -468,6 +527,7 @@ pub fn enforce_economy(
             context_id,
             nonce_tracker,
             revoked_spending_ucan_cids,
+            global_revoked_spending_cids,
             key_resolver,
             clock,
         )?;

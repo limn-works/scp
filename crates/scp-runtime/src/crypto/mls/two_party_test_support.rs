@@ -268,6 +268,7 @@ pub fn bob_supervisor(
         None,
         None,
         fresh_mls_storage(),
+        None, // revoked_spending_ucan_store
     );
     (sup, crypto)
 }

@@ -34,6 +34,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None,
         None,
         support::example_mls_storage(),
+        None, // revoked_spending_ucan_store
     );
 
     // 2. Register our DID so the manager recognizes us as a local participant.

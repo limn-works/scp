@@ -825,6 +825,7 @@ impl UniffiBridgeInstance {
             persistence,
             durable,
             key_resolver_for_core(&self.core),
+            self.protocol_repository.revoked_spending_ucan_store(),
         );
 
         self.core.set_supervisor(supervisor_arc);
@@ -873,6 +874,7 @@ impl UniffiBridgeInstance {
             persistence,
             durable,
             key_resolver_for_core(&self.core),
+            self.protocol_repository.revoked_spending_ucan_store(),
         );
 
         self.core.set_supervisor(supervisor_arc);
@@ -920,6 +922,7 @@ impl UniffiBridgeInstance {
             persistence,
             durable,
             key_resolver_for_core(&self.core),
+            self.protocol_repository.revoked_spending_ucan_store(),
         );
 
         self.core.set_supervisor(supervisor_arc);
@@ -1396,6 +1399,7 @@ const EVENT_CHANNEL_CAPACITY: usize = 1024;
 /// When no consumer subscribes, emitting into the channel is a cheap no-op: the
 /// retained sender has no receivers, so `send` returns `Err` and the event is
 /// simply dropped without blocking context operations.
+#[allow(clippy::too_many_arguments)]
 fn build_supervisor(
     crypto: Arc<MlsCryptoProvider>,
     transport: Box<dyn scp_core::context::builder::ContextTransportProvider>,
@@ -1403,6 +1407,9 @@ fn build_supervisor(
     persistence: Option<Arc<dyn scp_core::context::persistence::ContextPersistence + Send + Sync>>,
     durable: scp_core::context::supervisor::DurableProviders,
     key_resolver: scp_core::context::governance::KeyResolver,
+    revoked_spending_ucan_store: Arc<
+        dyn scp_core::store::revoked_spending_ucans::RevokedSpendingUcanStore,
+    >,
 ) -> Arc<scp_core::context::supervisor::Supervisor> {
     let persistence_box: Option<Box<dyn scp_core::context::persistence::ContextPersistence>> =
         persistence.map(|shared| {
@@ -1434,6 +1441,7 @@ fn build_supervisor(
         Some(event_tx),
         Some(clock),
         durable,
+        Some(revoked_spending_ucan_store),
     )
 }
 

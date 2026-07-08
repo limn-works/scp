@@ -372,6 +372,65 @@ pub fn is_spending_ucan(token: &UcanToken) -> bool {
         .any(|att| att.with.starts_with(SPENDING_URI_PREFIX) && att.can == SPENDING_ACTION)
 }
 
+/// Returns the [`SpendingScope`] of `token`'s spending attestation.
+///
+/// `None` if `token` carries no spending attestation ([`is_spending_ucan`]
+/// would also return `false`) or the attestation's `with` URI fails to parse.
+///
+/// Structural only — like [`is_spending_ucan`], performs NO cryptographic
+/// verification. Used for *routing* decisions (spec §19.5): which revocation
+/// store a spending UCAN's CID belongs in (context-scoped Class-S set vs. the
+/// durable global store) is determined by this scope, independent of whether
+/// the token is genuinely signed.
+#[must_use]
+pub fn spending_scope_of(token: &UcanToken) -> Option<SpendingScope> {
+    let att = token
+        .payload
+        .att
+        .iter()
+        .find(|att| att.with.starts_with(SPENDING_URI_PREFIX) && att.can == SPENDING_ACTION)?;
+    SpendingScope::parse(&att.with).ok()
+}
+
+/// Verifies a token is a genuinely-issued spending UCAN (§19.5 verify-before-revoke).
+///
+/// Checks signature + `iss == aud` self-delegation + key-scope, WITHOUT the
+/// nonce/expiry/revocation checks. Deliberately omits the nonce freshness probe
+/// (which enforces ±5min of now and would reject any token older than 5 minutes
+/// at revoke time) and expiry (a human may revoke a still-genuinely-issued token
+/// regardless of remaining lifetime). This is the anti-bloat gate: only tokens
+/// actually signed by the issuer may enter the revocation stores, making them
+/// self-limiting.
+///
+/// # Errors
+///
+/// Returns [`SpendingError`] if the token header is invalid, the token is not
+/// structurally a spending UCAN, `iss != aud`, the key scope is invalid, or
+/// the Ed25519 signature does not verify.
+pub fn verify_spending_ucan_genuine<D>(
+    token: &UcanToken,
+    did_resolver: &D,
+) -> Result<(), SpendingError>
+where
+    D: super::validate::DidResolver,
+{
+    token.header.validate()?;
+    if !is_spending_ucan(token) {
+        return Err(SpendingError::SpendingCapabilityRequired(
+            "token is not a spending UCAN".to_owned(),
+        ));
+    }
+    if token.payload.iss != token.payload.aud {
+        return Err(SpendingError::Ucan(UcanError::AudienceMismatch {
+            expected: token.payload.iss.clone(),
+            actual: token.payload.aud.clone(),
+        }));
+    }
+    super::validate::validate_key_scope(token)?;
+    super::validate::verify_signature(token, did_resolver)?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Spending capability check — the spending side of AND-composition
 // ---------------------------------------------------------------------------
@@ -1400,6 +1459,44 @@ mod tests {
         assert!(global.covers_context("any-context"));
     }
 
+    #[test]
+    fn spending_scope_of_context_scoped_token() {
+        let token = make_spending_token(&sample_capability(), "scp:spending:ctx123");
+        assert_eq!(
+            spending_scope_of(&token),
+            Some(SpendingScope::Context("ctx123".to_owned()))
+        );
+    }
+
+    #[test]
+    fn spending_scope_of_global_token() {
+        let token = make_spending_token(&sample_capability(), "scp:spending:*");
+        assert_eq!(spending_scope_of(&token), Some(SpendingScope::Global));
+    }
+
+    #[test]
+    fn spending_scope_of_non_spending_token_is_none() {
+        let token = UcanToken {
+            header: super::super::UcanHeader::new(),
+            payload: UcanPayload {
+                iss: "did:dht:z6MkHuman".to_owned(),
+                aud: "did:dht:z6MkAgent".to_owned(),
+                exp: 1_700_000_000,
+                nbf: None,
+                nnc: "1699999000000-aabbccdd11223344".to_owned(),
+                att: vec![Attenuation {
+                    with: "scp:ctx:abc123/messages".to_owned(),
+                    can: "write".to_owned(),
+                }],
+                prf: vec![],
+                fct: None,
+            },
+            signature: vec![0u8; 64],
+            encoded: String::new(),
+        };
+        assert_eq!(spending_scope_of(&token), None);
+    }
+
     // -----------------------------------------------------------------------
     // Spending UCAN detection (is_spending_ucan)
     // -----------------------------------------------------------------------
@@ -1471,6 +1568,110 @@ mod tests {
             encoded: String::new(),
         };
         assert!(!is_spending_ucan(&token));
+    }
+
+    // -----------------------------------------------------------------------
+    // verify_spending_ucan_genuine (§19.5 verify-before-revoke)
+    // -----------------------------------------------------------------------
+
+    /// Builds a genuinely self-signed spending UCAN (real Ed25519 signature,
+    /// `iss == aud`, `kid: "#agent"`) plus a resolver that can verify it.
+    ///
+    /// Mirrors `scp_runtime::crypto::ucan::mint::mint_ucan`'s encode-then-sign
+    /// steps, but signs synchronously with `ed25519_dalek` directly (this
+    /// crate has no `KeyCustody`/tokio dependency) — matching the pattern used
+    /// elsewhere in this crate for signed-token tests (see
+    /// `crypto::envelope_seal` tests).
+    fn make_genuine_signed_spending_token()
+    -> (UcanToken, super::super::validate::InMemoryDidResolver) {
+        use base64::Engine;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use ed25519_dalek::Signer;
+
+        let did = "did:dht:z6MkGenuinePayer".to_owned();
+        let cap = sample_capability();
+        let scope = SpendingScope::Context("ctx123".to_owned());
+        let params = MintSpendingParams {
+            did: &did,
+            key_scope: DEFAULT_SPENDING_KEY_SCOPE,
+            scope: &scope,
+            capability: &cap,
+            lifetime_secs: 3600,
+            not_before: None,
+        };
+        let payload = mint_spending_ucan_payload(&params, &scp_clock::SystemClock).unwrap();
+        let header = super::super::UcanHeader::with_kid(DEFAULT_SPENDING_KEY_SCOPE.to_owned());
+
+        let header_json = serde_json::to_vec(&header).unwrap();
+        let payload_json = serde_json::to_vec(&payload).unwrap();
+        let header_b64 = URL_SAFE_NO_PAD.encode(&header_json);
+        let payload_b64 = URL_SAFE_NO_PAD.encode(&payload_json);
+        let signing_input = format!("{header_b64}.{payload_b64}");
+
+        let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let pk_bytes: [u8; 32] = signing_key.verifying_key().to_bytes();
+        let signature = signing_key.sign(signing_input.as_bytes());
+        let sig_b64 = URL_SAFE_NO_PAD.encode(signature.to_bytes());
+        let encoded = format!("{signing_input}.{sig_b64}");
+
+        let token = UcanToken {
+            header,
+            payload,
+            signature: signature.to_bytes().to_vec(),
+            encoded,
+        };
+
+        let resolver = super::super::validate::InMemoryDidResolver {
+            keys: std::collections::HashMap::new(),
+            kid_keys: std::iter::once(((did, DEFAULT_SPENDING_KEY_SCOPE.to_owned()), pk_bytes))
+                .collect(),
+        };
+
+        (token, resolver)
+    }
+
+    #[test]
+    fn verify_spending_ucan_genuine_accepts_real_self_signed_token() {
+        let (token, resolver) = make_genuine_signed_spending_token();
+        assert!(
+            verify_spending_ucan_genuine(&token, &resolver).is_ok(),
+            "a genuinely self-signed spending UCAN must pass verify-before-revoke"
+        );
+    }
+
+    #[test]
+    fn verify_spending_ucan_genuine_rejects_tampered_signature() {
+        let (mut token, resolver) = make_genuine_signed_spending_token();
+        // Tamper the signature bytes (both the parsed field and the encoded
+        // JWT's trailing segment, mirroring
+        // `validate_ucan_rejects_tampered_signature` in
+        // `ucan_validate_integration.rs`).
+        token.signature[0] ^= 0xFF;
+        let parts: Vec<&str> = token.encoded.split('.').collect();
+        let tampered_sig_b64 = {
+            use base64::Engine;
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&token.signature)
+        };
+        token.encoded = format!("{}.{}.{}", parts[0], parts[1], tampered_sig_b64);
+
+        let err = verify_spending_ucan_genuine(&token, &resolver).unwrap_err();
+        assert!(
+            matches!(err, SpendingError::Ucan(UcanError::SignatureInvalid)),
+            "a forged/tampered signature must be rejected: {err:?}"
+        );
+    }
+
+    #[test]
+    fn verify_spending_ucan_genuine_rejects_iss_aud_mismatch() {
+        let (mut token, resolver) = make_genuine_signed_spending_token();
+        // A token whose aud diverges from iss is not a valid self-delegation,
+        // regardless of signature validity — reject before checking the sig.
+        token.payload.aud = "did:dht:z6MkSomeoneElse".to_owned();
+        let err = verify_spending_ucan_genuine(&token, &resolver).unwrap_err();
+        assert!(
+            matches!(err, SpendingError::Ucan(UcanError::AudienceMismatch { .. })),
+            "iss != aud must be rejected: {err:?}"
+        );
     }
 
     // -----------------------------------------------------------------------

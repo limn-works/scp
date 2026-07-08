@@ -771,11 +771,14 @@ impl crate::scp::PyScp {
             let sup = crate::runtime::supervisor(bi)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
                 .clone();
-            let revoked_cid = scp_core::crypto::ucan::revoke::compute_revocation_cid(token);
             let ctx = context_id.to_owned();
+            let encoded_token = token.to_owned();
             let revoker = revoker_did.to_owned();
-            rt.block_on(async move { sup.revoke_spending_ucan(&ctx, revoked_cid, revoker).await })
-                .map_err(ScpPyError::from)?;
+            rt.block_on(async move {
+                sup.revoke_spending_ucan(&ctx, &encoded_token, revoker)
+                    .await
+            })
+            .map_err(ScpPyError::from)?;
         }
 
         Ok(())

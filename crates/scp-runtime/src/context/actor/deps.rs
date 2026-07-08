@@ -204,6 +204,19 @@ pub struct ActorDeps {
     /// handler's `deliver_incoming` body to resolve which local DID
     /// the incoming envelope addresses.
     pub local_dids: Arc<ArcSwap<HashSet<DID>>>,
+    /// Revoked GLOBAL-scope (`scp:spending:*`) spending-UCAN CIDs, grouped by
+    /// issuer/payer DID (spec §19.5). `ArcSwap` for lock-free reads on the
+    /// paid-action gate, mirroring `local_dids`. Sourced from
+    /// [`crate::context::supervisor::Supervisor::global_revoked_spending_cids_shared`]
+    /// — hydrated at supervisor construction from the durable
+    /// `RevokedSpendingUcanStore` provider (when configured) and updated on
+    /// each global-scope revocation via
+    /// [`crate::context::supervisor::Supervisor::revoke_spending_ucan`].
+    /// Context-scoped revocations do NOT touch this map — they live in the
+    /// per-context Class-S `revoked_spending_ucan_cids` set instead. The
+    /// paid-action gate checks the UNION of both (see
+    /// `crate::context::economy_logic::ContextRevocationChecker`).
+    pub global_revoked_spending_cids: Arc<ArcSwap<std::collections::HashMap<DID, HashSet<String>>>>,
     /// Unforgeable capability token proving which identity owns this
     /// actor (ADR-049 §5). Minted fresh per-actor at spawn time in
     /// [`Supervisor::build_actor_deps`](crate::context::supervisor::Supervisor::build_actor_deps)
@@ -255,6 +268,7 @@ impl ActorDeps {
             key_resolver: Arc::clone(&self.key_resolver),
             payment_adapter: self.payment_adapter.as_ref().map(Arc::clone),
             local_dids: Arc::clone(&self.local_dids),
+            global_revoked_spending_cids: Arc::clone(&self.global_revoked_spending_cids),
             // Reissue the capability token for the SAME owning identity.
             // `clone_for_spawn` holds only `&self` — a token already
             // minted by the supervisor for this context's owner — so it

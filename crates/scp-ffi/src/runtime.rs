@@ -1190,6 +1190,7 @@ fn build_supervisor(
     event_log: Box<dyn ContextEventLogProvider>,
     persistence: Option<Box<dyn ContextPersistence>>,
 ) -> Result<Arc<scp_core::context::supervisor::Supervisor>, ScpPyError> {
+    let revoked_spending_ucan_store = build_revoked_spending_ucan_store(bi);
     // Derive the durable saga journal AND the `OpenMLS` `mls_storage` view from
     // the bridge instance's SINGLE chosen `StorageProvider` (§17.6 / §17.16 /
     // ADR-049), bound into one [`DurableProviders`]. Its only non-test
@@ -1228,8 +1229,34 @@ fn build_supervisor(
             Some(event_tx),
             Some(clock),
             durable,
+            revoked_spending_ucan_store,
         ),
     )
+}
+
+/// Constructs the durable, DID-scoped store for revoked GLOBAL-scope spending
+/// UCANs (spec §19.5) from the bridge's chosen storage provider, if one was
+/// attached at construction time.
+///
+/// Mirrors [`build_event_log_provider`] / [`build_persistence_provider`]: the
+/// store is a `ProtocolRepository` over the SAME `StorageProvider` handle that
+/// backs persistence, the event log, and the saga journal, so a global-scope
+/// revocation persisted here survives restart on the SAME backend those
+/// consumers read from (spec §17.6 same-backend invariant). Returns `None`
+/// for bridge instances with no storage attached — `revoke_spending_ucan`
+/// then fails closed for global-scope revocations on that instance rather
+/// than silently accepting an un-persisted one.
+fn build_revoked_spending_ucan_store(
+    bi: &PyBridgeInstance,
+) -> Option<Arc<dyn scp_core::store::revoked_spending_ucans::RevokedSpendingUcanStore>> {
+    bi.storage_provider().map(|provider| match provider {
+        StorageProvider::InMemoryEncrypted(storage) => {
+            Arc::new(ProtocolRepository::new(Arc::clone(storage)))
+                as Arc<dyn scp_core::store::revoked_spending_ucans::RevokedSpendingUcanStore>
+        }
+        StorageProvider::Sqlite(storage) => Arc::new(ProtocolRepository::new(Arc::clone(storage)))
+            as Arc<dyn scp_core::store::revoked_spending_ucans::RevokedSpendingUcanStore>,
+    })
 }
 
 /// Builds the bridge's [`DurableProviders`] — the durable saga journal + the

@@ -25,6 +25,7 @@ pub mod event_log;
 pub mod identity;
 pub mod nonce;
 pub mod queue;
+pub mod revoked_spending_ucans;
 pub mod tls;
 pub mod tofu;
 pub mod tools;
