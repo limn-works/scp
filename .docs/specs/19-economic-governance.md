@@ -489,7 +489,7 @@ Economic governance introduces new event types for the verifiable event log (ADR
 | `PaymentReceived` | `adapter.capture()` succeeds | `PaymentReceipt` |
 | `EconomicPolicyChanged` | Governance updates economic policy | Old policy hash, new `EconomicPolicy`, governance justification |
 | `SpendingUcanGranted` | Human grants spending UCAN to agent | Agent key `#agent` on human's DID, `SpendingCapability` summary (amounts, window), UCAN token ID |
-| `SpendingUcanRevoked` | Human revokes spending UCAN | UCAN token ID, revocation reason |
+| `SpendingUcanRevoked` | Human revokes spending UCAN (CID carried into the actor Class-S `revoked_spending_ucan_cids` gate, §19.5) | Spending-UCAN revocation CID (`compute_revocation_cid`; the identifier under which the token is recorded in `revoked_spending_ucan_cids`). Revoker DID and commit timestamp are the leaf's `actor_did`/timestamp. Like `TokenRevoked`, the standard revoke path carries no free-text reason. |
 
 The `SpendingUcanRevoked` leaf is emitted by the spending-UCAN revoke path (§19.5): when a spending UCAN is revoked, its revocation CID is inserted — fail-closed — into the context actor's Class-S `revoked_spending_ucan_cids` set (the authoritative paid-action gate), and this leaf records the revocation (token CID + reason) in the convergent log.
 
