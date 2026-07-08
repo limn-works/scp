@@ -32,23 +32,34 @@
 //! components are sanitized — the sanitizer REJECTS rather than transforms, so
 //! it never silently mangles a value).
 //!
-//! # Bounding (expiry GC)
+//! # Bounding (expiry GC — this global store only)
 //!
 //! A spending UCAN is self-issued (`iss == aud == did`), so a payer can mint
 //! and then revoke an unbounded number of *distinct* tokens against their own
-//! DID — the revocation stores are NOT "self-limiting by construction". They
-//! are instead bounded by **expiry-based garbage collection**: a spending UCAN
-//! carries a ≤24-hour expiry (§9.5), and a revoked CID for an ALREADY-EXPIRED
-//! token is moot (the token is expiry-rejected by the paid-action gate
-//! regardless of whether its CID is in the set). Each record therefore carries
-//! the time after which its revocation is provably moot
+//! DID — this store is NOT "self-limiting by construction". Because it is
+//! node-local and **non-convergent** (see the module intro), it is safe to
+//! bound by **expiry-based garbage collection**: a spending UCAN carries a
+//! ≤24-hour expiry (§9.5), and a revoked CID for an ALREADY-EXPIRED token is
+//! moot (the token is expiry-rejected by the paid-action gate regardless of
+//! whether its CID is in the set). Each record therefore carries the time after
+//! which its revocation is provably moot
 //! ([`RevokedSpendingUcanRecord::revocation_moot_after_secs`]), and expired
 //! records are pruned on every [`record`](RevokedSpendingUcanStore::record)
 //! (insert) and on every [`load_all`](RevokedSpendingUcanStore::load_all)
 //! (hydration). Steady-state size is thus bounded by the number of a DID's
-//! spending UCANs revoked within the last ~24 hours, together with the
-//! trusted-local-caller self-governance model (only the payer, or a
-//! context creator for a context-scoped token, can revoke — §19.5).
+//! global spending UCANs revoked within the last ~24 hours, together with the
+//! trusted-local-caller self-governance model (only the payer can revoke a
+//! global-scope token — §19.5).
+//!
+//! This expiry-GC bound applies to **this global store only**. The per-context
+//! Class-S `revoked_spending_ucan_cids` set (context-scoped revocations) is
+//! **convergent governance state** — it converges to context members via the
+//! append-only `SpendingUcanRevoked` leaf and is covered by the signed export
+//! digest (§23.16.8) — so it is deliberately NOT time-GC'd: lazy per-instance
+//! expiry pruning would diverge members' sets and break export-digest
+//! convergence, and could not shrink the set below the immutable convergent
+//! log. Its growth is bounded by the scope-matched authorization model
+//! (issuer or scope-context creator only — SCP-ECON-12067) instead (spec §19.5).
 
 use std::collections::{HashMap, HashSet};
 
