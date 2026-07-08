@@ -1192,7 +1192,9 @@ pub struct Supervisor {
     /// issuer/payer DID (spec §19.5). Mirrors `local_dids`: wrapped in
     /// `Arc<ArcSwap<_>>` so every per-context actor shares the SAME swap
     /// cell via [`ActorDeps::global_revoked_spending_cids`] rather than a
-    /// point-in-time snapshot. Hydrated at construction from the durable
+    /// point-in-time snapshot. Hydrated at STARTUP (the first step of
+    /// [`Self::restore_on_startup`], before context restore — NOT at construction)
+    /// from the durable
     /// [`crate::store::revoked_spending_ucans::RevokedSpendingUcanStore`]
     /// provider (when configured) via [`Self::hydrate_revoked_spending_ucans`],
     /// and updated on each global-scope revocation by
@@ -1463,9 +1465,11 @@ pub struct DurableProviders {
     mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter>,
     /// The durable global-scope spending-UCAN revocation store, derived from the
     /// SAME `Storage` handle as the journal + `mls_storage` (spec §17.6 / §19.5).
-    /// `Some` only for the [`Self::from_handle`] production path — the
-    /// test/legacy constructors, which have no `Storage` handle, leave it `None`
-    /// (their supervisors run without global-scope revocation durability).
+    /// `Some` only for the [`Self::from_encrypted_handle`] production path (it
+    /// requires an `EncryptedStorage` backend for `ProtocolRepository::new`);
+    /// [`Self::from_handle`] (generic `S: Storage`) and the test/legacy
+    /// constructors leave it `None` (their supervisors run without cross-restart
+    /// global-scope revocation durability).
     revoked_spending_ucan_store:
         Option<Arc<dyn crate::store::revoked_spending_ucans::RevokedSpendingUcanStore>>,
 }
@@ -1575,10 +1579,11 @@ impl DurableProviders {
     /// constructors that carry no `Storage` handle.
     ///
     /// Mirrors [`Self::mls_storage`]: reading a half for wiring is harmless
-    /// because the only way to BUILD the store half remains [`Self::from_handle`]
-    /// over the one shared handle, so it cannot be used to wire a divergent
-    /// backend. The node's loopback supervisor uses this to wire global-scope
-    /// revocation durability over the SAME backend as the saga journal.
+    /// because the only way to BUILD the store half remains
+    /// [`Self::from_encrypted_handle`] over the one shared handle, so it cannot be
+    /// used to wire a divergent backend. The node's loopback supervisor uses this
+    /// to wire global-scope revocation durability over the SAME backend as the
+    /// saga journal.
     #[must_use]
     pub fn revoked_spending_ucan_store(
         &self,
@@ -9249,8 +9254,17 @@ impl Supervisor {
     /// ([`Self::revoked_spending_ucan_store_ref`] returns `None`): not every
     /// embedder configures global-scope spending, and the paid-action gate's
     /// `global_revoked_spending_cids` map is empty-by-default in that case
-    /// (context-scoped revocations are unaffected, they never touch this
-    /// store). Called from [`Self::restore_on_startup`] after saga replay.
+    /// (context-scoped revocations are unaffected, they never touch this store).
+    ///
+    /// **Ordering (SECURITY-CRITICAL — runs FIRST).** Called from
+    /// [`Self::restore_on_startup`] as the VERY FIRST step, BEFORE
+    /// `restore_all_contexts` and BEFORE the saga-journal replay — NOT after
+    /// either. This is fail-closed by construction: if a configured store cannot
+    /// be read, the `?` short-circuits here and NO context actor is ever
+    /// restored/spawned, so nothing comes up serving paid actions against an empty
+    /// (cold) revocation cache. Restoring contexts first would spawn actors that
+    /// begin serving before this ran — fail-OPEN. A maintainer MUST NOT reorder
+    /// this after restore/replay.
     ///
     /// [`RevokedSpendingUcanStore`]: crate::store::revoked_spending_ucans::RevokedSpendingUcanStore
     ///

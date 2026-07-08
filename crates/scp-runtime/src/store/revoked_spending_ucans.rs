@@ -71,8 +71,17 @@
 //! digest (§23.16.8) — so it is deliberately NOT time-GC'd: lazy per-instance
 //! expiry pruning would diverge members' sets and break export-digest
 //! convergence, and could not shrink the set below the immutable convergent
-//! log. Its growth is bounded by the scope-matched authorization model
-//! (issuer or scope-context creator only — SCP-ECON-12067) instead (spec §19.5).
+//! log. That set is an **accepted-unbounded convergent property**; it is NOT
+//! bounded by the authorization model. Revocation is authorized only for the
+//! token's issuer, the scope-context creator, or a current member
+//! (SCP-ECON-12067 / SCP-ECON-12069), but a context-scoped spending UCAN is
+//! **self-issued** (`iss == aud ==` the payer), so a member can mint and revoke
+//! an unbounded number of distinct genuinely-signed (even never-granted) tokens
+//! against their own DID. The membership requirement is defense-in-depth that
+//! shrinks *who* can flood the set to members — it is not a size bound. The
+//! principled bound (restricting revocation to spending UCANs actually
+//! observed/granted in the context) is a separate convergent mechanism, tracked
+//! as issue #2072 (spec §19.5).
 
 use std::collections::{HashMap, HashSet};
 
