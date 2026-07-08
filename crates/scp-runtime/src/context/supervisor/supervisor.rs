@@ -3748,11 +3748,31 @@ impl Supervisor {
         // Mirror into the in-memory ArcSwap cache every actor's gate reads
         // (write-locked read-modify-write, mirroring `register_local_did`'s
         // `local_dids` mutation).
+        //
+        // Invariant 2a (spec §19.5): RE-DERIVE this DID's cache entry from the
+        // freshly-pruned durable store instead of blind-inserting the new CID. The
+        // durable `record` above already pruned this DID's already-moot entries, so
+        // `load_for_did` returns its bounded set; replacing the cache entry with it
+        // keeps the in-memory cache == the bounded durable store. A blind insert
+        // would only ever ADD, growing the cache monotonically (never dropping moot
+        // CIDs) until a restart's full hydration — contradicting the module's
+        // "expiry-bounded" contract.
+        let bounded = store
+            .load_for_did(&iss, now_secs)
+            .await
+            .map_err(|e| ContextError::PersistenceFailed(e.to_string()))?;
         {
             let _guard = self.write_lock.lock().await;
             let snapshot = self.global_revoked_spending_cids.load_full();
             let mut updated: HashMap<DID, HashSet<String>> = (*snapshot).clone();
-            updated.entry(iss).or_default().insert(cid.clone());
+            if bounded.is_empty() {
+                // Defensive: the DID just recorded a (non-moot) CID, so `bounded` is
+                // normally non-empty; drop the key entirely if it somehow pruned to
+                // empty rather than leaving an empty set behind.
+                updated.remove(&iss);
+            } else {
+                updated.insert(iss.clone(), bounded);
+            }
             self.global_revoked_spending_cids.store(Arc::new(updated));
         }
 
@@ -9255,6 +9275,16 @@ impl Supervisor {
             || scp_clock::SystemClock.now_secs(),
             |c| scp_clock::Clock::now_secs(c.as_ref()),
         );
+        // Hold the same `write_lock` the incremental `revoke_spending_ucan`
+        // read-modify-write holds (ADR-049 §Decision 12) across BOTH the durable
+        // `load_all` AND the cache store (invariant 2b, spec §19.5). The prior code
+        // took the lock ONLY around the store, leaving `load_all` racing a
+        // concurrent single-CID global revocation: that revoke could land its RMW
+        // between this `load_all`'s read and this store, and then be CLOBBERED by
+        // the wholesale overwrite here. Covering `load_all` too serializes the two
+        // writers, so neither clobbers the other (the earlier anti-clobber comment
+        // was false — the lock did not cover the read).
+        let _guard = self.write_lock.lock().await;
         let map = match store.load_all(now_secs).await {
             Ok(map) => map,
             Err(e) => {
@@ -9268,11 +9298,6 @@ impl Supervisor {
                 return Err(ContextError::RevocationHydrationFailed(e.to_string()));
             }
         };
-        // Take the same `write_lock` the incremental `revoke_spending_ucan`
-        // read-modify-write holds (ADR-049 §Decision 12) so this wholesale
-        // hydration store cannot race a concurrent single-CID revocation and
-        // clobber it (or be clobbered).
-        let _guard = self.write_lock.lock().await;
         self.global_revoked_spending_cids.store(Arc::new(map));
         // Cache now reflects the durable store — GLOBAL-scope spends may be
         // authorized against it (spec §19.5, invariant 1a).
@@ -19179,6 +19204,14 @@ mod tests {
                     "simulated revocation-store read failure".to_owned(),
                 ),
             ))
+        }
+
+        async fn load_for_did(
+            &self,
+            _did: &DID,
+            _now_secs: u64,
+        ) -> Result<HashSet<String>, crate::store::StoreError> {
+            Ok(HashSet::new())
         }
     }
 

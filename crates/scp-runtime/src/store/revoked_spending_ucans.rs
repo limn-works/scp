@@ -51,6 +51,19 @@
 //! trusted-local-caller self-governance model (only the payer can revoke a
 //! global-scope token — §19.5).
 //!
+//! **What is bounded (durable store AND in-memory cache).** The expiry-GC above
+//! bounds the DURABLE store. The paid-action gate, however, reads an in-memory
+//! `ArcSwap` cache, not the durable store. That cache is kept bounded too: it is
+//! wholesale re-loaded (already-moot entries dropped) on hydration, and on the
+//! INCREMENTAL path a global revocation RE-DERIVES the affected DID's cache entry
+//! from the freshly-pruned durable store via
+//! [`load_for_did`](RevokedSpendingUcanStore::load_for_did) rather than
+//! blind-inserting — so the cache entry equals the DID's bounded durable set
+//! after every revocation, instead of growing monotonically until restart
+//! (invariant 2a). A DID that stops revoking retains its last-derived (already
+//! bounded) entry until the next hydration; the number of *distinct* payer DIDs
+//! is the trusted-local self-governance model's own bound.
+//!
 //! This expiry-GC bound applies to **this global store only**. The per-context
 //! Class-S `revoked_spending_ucan_cids` set (context-scoped revocations) is
 //! **convergent governance state** — it converges to context members via the
@@ -262,6 +275,47 @@ impl<S: Storage> ProtocolRepository<S> {
         }
         Ok(out)
     }
+
+    /// Loads a SINGLE DID's still-relevant revoked global spending-UCAN CIDs (the
+    /// bounded, expiry-GC'd durable set), pruning that DID's already-moot entries
+    /// as it goes.
+    ///
+    /// Used to RE-DERIVE that DID's in-memory cache entry after a global
+    /// revocation (invariant 2a, spec §19.5): the incremental cache update must
+    /// mirror the freshly-pruned durable store rather than blind-insert, so the
+    /// cache stays bounded (== the durable set) instead of growing monotonically
+    /// until the next restart's full hydration. Scoped to the DID's own
+    /// `identity/{did}/revoked_spending_ucans/` prefix — cheaper than a full
+    /// `identity/`-wide [`Self::load_all_revoked_spending_ucans`] scan on every
+    /// revocation.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Storage`] if the underlying list/read/delete fails.
+    pub async fn load_revoked_spending_ucans_for_did(
+        &self,
+        did: &DID,
+        now_secs: u64,
+    ) -> Result<HashSet<String>, StoreError> {
+        let did_prefix = format!("{}/revoked_spending_ucans/", did_prefix_component(did)?);
+        // Prune this DID's already-moot entries first, then read what remains — so
+        // the returned set is exactly the bounded durable set.
+        self.prune_moot_revoked_spending_ucans(&did_prefix, now_secs)
+            .await?;
+        let keys = self.storage.list_keys(&did_prefix).await?;
+        let mut out = HashSet::new();
+        for key in keys {
+            if !key.contains(REVOKED_SEGMENT) {
+                continue;
+            }
+            if let Some(record) = self.load_value::<RevokedSpendingUcanRecord>(&key).await?
+                && record.revocation_moot_after_secs > now_secs
+            {
+                out.insert(record.cid);
+            }
+        }
+        Ok(out)
+    }
 }
 
 /// Narrow, object-safe durable store for revoked **global-scope** spending
@@ -307,6 +361,16 @@ pub trait RevokedSpendingUcanStore: Send + Sync {
     ///
     /// Returns [`StoreError`] if the durable read/delete fails.
     async fn load_all(&self, now_secs: u64) -> Result<HashMap<DID, HashSet<String>>, StoreError>;
+
+    /// Loads a SINGLE DID's still-relevant revoked global spending-UCAN CIDs
+    /// (bounded, expiry-GC'd) — used to RE-DERIVE that DID's in-memory cache entry
+    /// after a revocation so the cache mirrors the durable store and stays bounded
+    /// (invariant 2a, spec §19.5). Prunes that DID's already-moot entries.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] if the durable list/read/delete fails.
+    async fn load_for_did(&self, did: &DID, now_secs: u64) -> Result<HashSet<String>, StoreError>;
 }
 
 #[async_trait::async_trait]
@@ -324,6 +388,11 @@ impl<S: Storage> RevokedSpendingUcanStore for ProtocolRepository<S> {
 
     async fn load_all(&self, now_secs: u64) -> Result<HashMap<DID, HashSet<String>>, StoreError> {
         self.load_all_revoked_spending_ucans(now_secs).await
+    }
+
+    async fn load_for_did(&self, did: &DID, now_secs: u64) -> Result<HashSet<String>, StoreError> {
+        self.load_revoked_spending_ucans_for_did(did, now_secs)
+            .await
     }
 }
 
@@ -585,6 +654,42 @@ mod tests {
             repo.is_revoked_spending_ucan(&d, "new-cid").await.unwrap(),
             "the freshly-recorded revocation must be retained"
         );
+    }
+
+    /// `load_for_did` (invariant 2a) returns ONLY the DID's still-relevant CIDs,
+    /// pruning already-moot entries — the bounded set used to RE-DERIVE the
+    /// in-memory cache so it mirrors the durable store rather than growing.
+    #[tokio::test]
+    async fn load_for_did_returns_bounded_set_and_prunes_moot() {
+        let repo = repo();
+        let d1 = did("did:dht:z6MkAlice");
+        let d2 = did("did:dht:z6MkBob");
+        // d1: one moot (≤1000), one live (≤9000). d2: one live — must NOT leak.
+        repo.record_revoked_spending_ucan(&d1, "d1-moot", 1_000, 500)
+            .await
+            .unwrap();
+        repo.record_revoked_spending_ucan(&d1, "d1-live", 9_000, 500)
+            .await
+            .unwrap();
+        repo.record_revoked_spending_ucan(&d2, "d2-live", 9_000, 500)
+            .await
+            .unwrap();
+
+        // Re-derive d1 at t=2000: the moot entry is dropped, the live one kept,
+        // and d2's CID never appears.
+        let d1_set = repo
+            .load_revoked_spending_ucans_for_did(&d1, 2_000)
+            .await
+            .unwrap();
+        assert_eq!(
+            d1_set,
+            HashSet::from(["d1-live".to_owned()]),
+            "load_for_did must return only the DID's still-relevant CIDs (bounded), pruning moot"
+        );
+        // The moot entry is durably pruned; the live one survives.
+        assert!(!repo.is_revoked_spending_ucan(&d1, "d1-moot").await.unwrap());
+        assert!(repo.is_revoked_spending_ucan(&d1, "d1-live").await.unwrap());
+        assert!(repo.is_revoked_spending_ucan(&d2, "d2-live").await.unwrap());
     }
 
     /// A record written WITHOUT `revocation_moot_after_secs` (an older-build /
