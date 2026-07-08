@@ -141,11 +141,14 @@ pub struct DeploySiteParams<'a, C: KeyCustody> {
     /// ADR-049).
     ///
     /// The caller builds this via
-    /// [`DurableProviders::from_handle`](scp_core::context::supervisor::DurableProviders::from_handle)
+    /// [`DurableProviders::from_encrypted_handle`](scp_core::context::supervisor::DurableProviders::from_encrypted_handle)
     /// over its chosen `Storage` backend (a `SQLite` handle distinct from the
     /// node's own storage, in production), so crash-recovery replay and the
     /// `OpenMLS` view share one backend by construction — the journal can never
-    /// be wired to a divergent store.
+    /// be wired to a divergent store. The encrypted constructor is what production
+    /// uses because it ALSO derives the durable global-scope spending-UCAN
+    /// revocation store (spec §19.5); the plain `from_handle` leaves that store
+    /// `None` (fail-open for global-scope revocation).
     pub durable: scp_core::context::supervisor::DurableProviders,
     /// The static assets to publish, in deploy order.
     pub assets: &'a [Asset],
@@ -641,9 +644,11 @@ where
     // (§17.16 / ADR-049).
     //
     // The global-scope spending-UCAN revocation store (spec §19.5) is derived
-    // from that SAME backend by `DurableProviders::from_handle`, so a global
-    // revocation persisted here survives restart — mirroring the FFI bridges'
-    // construction. Read it out BEFORE `durable` is moved into the constructor.
+    // from that SAME backend by `DurableProviders::from_encrypted_handle` (the
+    // production constructor — `from_handle` leaves the revoked store `None`,
+    // which fails open for global-scope revocation), so a global revocation
+    // persisted here survives restart — mirroring the FFI bridges' construction.
+    // Read it out BEFORE `durable` is moved into the constructor.
     let revoked_spending_ucan_store = durable.revoked_spending_ucan_store();
     let supervisor = scp_core::context::supervisor::Supervisor::with_providers_and_journal(
         crypto,
