@@ -299,6 +299,7 @@ pub fn enforce_join_economy(
     clock: &dyn scp_clock::Clock,
     key_resolver: &scp_protocol::context::governance::KeyResolver,
     global_revoked_spending_cids: Option<&HashSet<String>>,
+    global_revocation_status_known: bool,
 ) -> Result<Option<scp_protocol::economy::types::Amount>, ContextError> {
     if scp_protocol::economy::policy::auto_accept_blocked_by_economics(
         governance.economic_policy.as_ref(),
@@ -329,6 +330,7 @@ pub fn enforce_join_economy(
         nonce_tracker: &mut governance.class_s.spending_nonce_tracker,
         revoked_spending_ucan_cids: &governance.revoked_spending_ucan_cids,
         global_revoked_spending_cids,
+        global_revocation_status_known,
         key_resolver,
     })
 }

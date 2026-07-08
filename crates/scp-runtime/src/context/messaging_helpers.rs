@@ -236,6 +236,7 @@ pub fn enforce_send_economy(
     clock: &dyn Clock,
     key_resolver: &KeyResolver,
     global_revoked_spending_cids: Option<&std::collections::HashSet<String>>,
+    global_revocation_status_known: bool,
 ) -> Result<
     (
         Option<scp_protocol::economy::types::Amount>,
@@ -270,6 +271,7 @@ pub fn enforce_send_economy(
                 nonce_tracker: &mut governance.class_s.spending_nonce_tracker,
                 revoked_spending_ucan_cids: &governance.revoked_spending_ucan_cids,
                 global_revoked_spending_cids,
+                global_revocation_status_known,
                 key_resolver,
             },
         )?;
@@ -1003,6 +1005,7 @@ pub async fn send_message(
         &*deps.clock,
         &deps.key_resolver,
         global_revoked_for_sender.as_ref(),
+        deps.global_revocation_status_known(),
     ) {
         Ok(cost_and_token) => cost_and_token,
         Err(e) => {

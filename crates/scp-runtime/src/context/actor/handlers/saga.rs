@@ -1167,9 +1167,20 @@ fn validate_ucan_rebind(
     let global_snapshot = deps.global_revoked_spending_cids.load();
     let global_revoked_for_issuer =
         global_snapshot.get(&scp_did::DID::from(token.payload.iss.clone()));
+    // Fail-closed (spec §19.5, invariant 1a): if THIS proof is a GLOBAL-scope
+    // (`scp:spending:*`) spending UCAN and the global revoked-CID cache is
+    // un-hydrated on this instance, reject the cross-context re-validation rather
+    // than authorize against a possibly-cold cache. Non-spending / context-scoped
+    // proofs are unaffected.
+    let global_scope_status_unknown = !deps.global_revocation_status_known()
+        && matches!(
+            scp_protocol::crypto::ucan::spending::spending_scope_of(&token),
+            Some(scp_protocol::crypto::ucan::spending::SpendingScope::Global)
+        );
     let revocation_checker = ContextRevocationChecker {
         revoked_cids: &revoked,
         global_revoked_cids: global_revoked_for_issuer,
+        global_scope_status_unknown,
     };
     // The cross-context ENVELOPE replay is owned by B's `xctx_nonce_dedup`
     // (the freshness check above in `validate_freshness`); the UCAN's OWN

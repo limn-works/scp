@@ -139,10 +139,37 @@ pub struct ContextRevocationChecker<'a> {
     pub(crate) revoked_cids: &'a HashSet<String>,
     /// The charged DID's global-scope revoked-CID set, or `None`.
     pub(crate) global_revoked_cids: Option<&'a HashSet<String>>,
+    /// Fail-closed (spec §19.5, invariant 1a): `true` when the PRESENTED spending
+    /// UCAN is GLOBAL-scope (`scp:spending:*`) **and** the global revoked-CID
+    /// cache's hydration status is UNKNOWN (a durable store is configured but has
+    /// not been successfully hydrated on this instance). In that state the gate
+    /// cannot confirm the token is not globally revoked — its empty
+    /// `global_revoked_cids` snapshot may be a cold, un-hydrated cache — so
+    /// [`Self::is_revoked`] reports the token as revoked, rejecting the spend
+    /// rather than authorizing it against a possibly-stale set.
+    ///
+    /// This is a **required field with no default** on purpose: every construction
+    /// site (the economy paid-action gate in
+    /// [`validate_spending_ucan_or_error`] and the §7 cross-context saga
+    /// re-validation in `actor/handlers/saga.rs`) MUST compute it, so a new gate
+    /// cannot silently reintroduce the fail-open hole. Context-scoped tokens set
+    /// it `false` (their revocations are the per-context Class-S set, restored
+    /// with the context snapshot — not gated on global hydration).
+    pub(crate) global_scope_status_unknown: bool,
 }
 
 impl RevocationChecker for ContextRevocationChecker<'_> {
     fn is_revoked(&self, token_cid: &str) -> bool {
+        // Fail-closed backstop (spec §19.5): a GLOBAL-scope spending UCAN whose
+        // revocation status is unknown (configured store not hydrated) is treated
+        // as revoked. This lives at the SINGLE shared `is_revoked` chokepoint —
+        // both `validate_spending_ucan_signed` (economy gate) and `validate_ucan`
+        // (saga xctx re-validation) call it on the presented token's CID before
+        // returning success — so no paid-action path can authorize a spend whose
+        // global revocation we cannot confirm.
+        if self.global_scope_status_unknown {
+            return true;
+        }
         self.revoked_cids.contains(token_cid)
             || self
                 .global_revoked_cids
@@ -182,13 +209,24 @@ pub fn validate_spending_ucan_or_error(
     nonce_tracker: &mut scp_protocol::crypto::ucan::nonce::NonceTracker<Arc<dyn scp_clock::Clock>>,
     revoked_cids: &HashSet<String>,
     global_revoked_cids: Option<&HashSet<String>>,
+    global_revocation_status_known: bool,
     key_resolver: &KeyResolver,
     clock: &dyn scp_clock::Clock,
 ) -> Result<(), ContextError> {
     let did_resolver = KeyResolverDidResolver::new(key_resolver);
+    // Fail-closed (spec §19.5, invariant 1a): a GLOBAL-scope (`scp:spending:*`)
+    // token whose global revoked-CID cache is un-hydrated (status unknown) must be
+    // rejected — its empty snapshot cannot be trusted. Context-scoped tokens are
+    // unaffected (their revocations ride the per-context Class-S set).
+    let global_scope_status_unknown = !global_revocation_status_known
+        && matches!(
+            scp_protocol::crypto::ucan::spending::spending_scope_of(spending),
+            Some(scp_protocol::crypto::ucan::spending::SpendingScope::Global)
+        );
     let revocation_checker = ContextRevocationChecker {
         revoked_cids,
         global_revoked_cids,
+        global_scope_status_unknown,
     };
     let proof_resolver = InMemoryProofResolver::new();
 
@@ -377,6 +415,15 @@ pub struct EnforceEconomyRequest<'a> {
     /// [`ContextRevocationChecker`] as a UNION check — a spending UCAN is
     /// revoked if its CID is in EITHER set.
     pub global_revoked_spending_cids: Option<&'a HashSet<String>>,
+    /// Whether the GLOBAL-scope spending-UCAN revocation cache's hydration status
+    /// is KNOWN on this instance (spec §19.5, invariant 1a): `true` when no
+    /// durable global store is configured (empty set authoritative) or a
+    /// configured store hydrated successfully; `false` while a configured store is
+    /// un-hydrated or its hydration failed. Threaded to
+    /// [`validate_spending_ucan_or_error`] so a GLOBAL-scope spend fails closed
+    /// while the cache cannot be trusted. Sourced from
+    /// [`crate::context::actor::deps::ActorDeps::global_revocation_status_known`].
+    pub global_revocation_status_known: bool,
     /// Resolver for the actor's UCAN signing key (C1, PR #1606).
     ///
     /// VM-aware per ADR-039: the [`KeyResolver`] takes a `(DID, SigningKeyId)`
@@ -419,6 +466,7 @@ pub fn enforce_economy(
         nonce_tracker,
         revoked_spending_ucan_cids,
         global_revoked_spending_cids,
+        global_revocation_status_known,
         key_resolver,
     } = req;
     // Free contexts (no `economic_policy`) do not charge at the cost layer.
@@ -492,10 +540,8 @@ pub fn enforce_economy(
             "SCP-ECON-12060: paid action requires spending UCAN".to_owned(),
         ));
     }
-    debug_assert!(
-        spending_ucan.is_some(),
-        "spending UCAN should be Some at this point — None case returns above"
-    );
+    // `spending_ucan` is guaranteed `Some` here — the `is_none()` guard above
+    // returns otherwise.
     scp_protocol::crypto::ucan::spending::check_spending_capability(
         spending_ucan,
         scp_protocol::crypto::ucan::spending::Amount(cost.0),
@@ -530,6 +576,7 @@ pub fn enforce_economy(
             nonce_tracker,
             revoked_spending_ucan_cids,
             global_revoked_spending_cids,
+            global_revocation_status_known,
             key_resolver,
             clock,
         )?;

@@ -661,6 +661,11 @@ pub async fn reserve_tool_economy(
     // rationale.
     let global_revoked_for_invoker: Option<HashSet<String>> =
         deps.global_revoked_cids_for(invoker_did);
+    // Snapshot the global-scope revocation hydration status (spec §19.5,
+    // invariant 1a) as a plain bool before entering the combinator closure — a
+    // GLOBAL-scope spending UCAN fails closed while a configured store is
+    // un-hydrated.
+    let global_revocation_status_known = deps.global_revocation_status_known();
 
     let deducted_cost = if action_cost.0 > 0 {
         let combinator_result = cell
@@ -683,6 +688,7 @@ pub async fn reserve_tool_economy(
                             &mut state.governance.class_s.spending_nonce_tracker,
                             &state.governance.revoked_spending_ucan_cids,
                             global_revoked_for_invoker.as_ref(),
+                            global_revocation_status_known,
                             key_resolver,
                             clock,
                         )

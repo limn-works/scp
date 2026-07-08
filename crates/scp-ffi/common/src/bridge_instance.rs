@@ -1727,19 +1727,23 @@ impl CoreFields {
                 );
             }
             Err(e @ scp_core::context::ContextError::RevocationHydrationFailed(_)) => {
-                // FAIL-CLOSED (spec §19.5): a CONFIGURED spending-UCAN revocation
-                // store whose hydration read failed. This is NOT the benign
-                // "no persistence configured" ephemeral no-op — a store IS
-                // configured and could not be read. `restore_on_startup` runs
-                // this leg FIRST, so no context actor was restored; nothing came
-                // up serving paid actions with an empty revocation cache (which
-                // would silently re-authorize a revoked global spending UCAN).
-                // Surface at warn so operators see the fail-closed startup.
-                tracing::warn!(
+                // FAIL-CLOSED (spec §19.5, invariant 1a): a CONFIGURED spending-UCAN
+                // revocation store whose hydration read failed. This is NOT the
+                // benign "no persistence configured" ephemeral no-op — a store IS
+                // configured and could not be read. `restore_on_startup` runs this
+                // leg FIRST, so no context actor was restored; AND the supervisor
+                // has already flipped its shared hydration flag to `Failed`, so even
+                // if this instance stays up and a context is created/joined LATER,
+                // that actor's paid-action gate fails closed for GLOBAL-scope spends
+                // (it will NOT re-authorize a revoked global spending UCAN against an
+                // empty cache). Surface at ERROR — this is a genuine fail-closed
+                // security event, not a routine warning: paid GLOBAL-scope spending
+                // is disabled on this instance until a successful re-hydration.
+                tracing::error!(
                     error = %e,
                     "restore_all_persisted_contexts: FAILED CLOSED — spending-UCAN revocation \
-                     hydration read failed; no contexts were restored (paid actions are not \
-                     served with an empty revocation cache)"
+                     hydration read failed; no contexts were restored and the global-revocation \
+                     gate is disabled (GLOBAL-scope paid actions reject until re-hydration)"
                 );
             }
             Err(e) => {

@@ -844,6 +844,7 @@ pub async fn join_context(
                 &*deps.clock,
                 &deps.key_resolver,
                 global_revoked_for_joiner.as_ref(),
+                deps.global_revocation_status_known(),
             )?;
             // A spending-UCAN nonce is burned iff a non-zero cost was charged AND
             // a spending UCAN was presented — the same gating the Phase-5

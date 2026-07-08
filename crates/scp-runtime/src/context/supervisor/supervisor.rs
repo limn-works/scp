@@ -1200,6 +1200,19 @@ pub struct Supervisor {
     /// touch this map.
     pub(in crate::context::supervisor) global_revoked_spending_cids:
         Arc<ArcSwap<HashMap<DID, HashSet<String>>>>,
+    /// Fail-closed hydration state of `global_revoked_spending_cids` (spec §19.5,
+    /// invariant 1a). `NotConfigured` when no durable
+    /// [`RevokedSpendingUcanStore`](crate::store::revoked_spending_ucans::RevokedSpendingUcanStore)
+    /// is wired (empty global set is authoritative); flipped to `NeedsHydration`
+    /// in [`Self::with_providers_and_journal`] when a store IS configured, to
+    /// `Hydrated` on a successful [`Self::hydrate_revoked_spending_ucans`], and to
+    /// `Failed` if that hydration's durable READ errors. Cloned into every actor's
+    /// [`ActorDeps`](crate::context::actor::deps::ActorDeps) so a GLOBAL-scope
+    /// paid action fails closed while the cache cannot be trusted — including for
+    /// contexts created/joined AFTER a failed (or not-yet-run) hydration, which a
+    /// bare empty cache would otherwise fail OPEN on.
+    pub(in crate::context::supervisor) global_revocation_hydration:
+        crate::store::revoked_spending_ucans::GlobalRevocationHydration,
     /// Per-identity X25519 wrapping keys. Wrapped in `ArcSwap` so
     /// rotation is atomic; outer `DashMap` keyed by DID.
     pub(in crate::context::supervisor) wrapping_keys: DashMap<DID, ArcSwap<WrappingKeyPair>>,
@@ -1675,6 +1688,11 @@ impl Supervisor {
             standing_contexts: ArcSwap::new(Arc::new(HashMap::new())),
             local_dids: Arc::new(ArcSwap::new(Arc::new(HashSet::new()))),
             global_revoked_spending_cids: Arc::new(ArcSwap::new(Arc::new(HashMap::new()))),
+            // Default: no durable global-scope revocation store configured. A
+            // store, when wired, flips this to `NeedsHydration` in
+            // `with_providers_and_journal` (spec §19.5, invariant 1a).
+            global_revocation_hydration:
+                crate::store::revoked_spending_ucans::GlobalRevocationHydration::not_configured(),
             wrapping_keys: DashMap::new(),
             persistence,
             write_lock,
@@ -1941,6 +1959,15 @@ impl Supervisor {
         // accepting an un-persisted one.
         if let Some(store) = revoked_spending_ucan_store {
             let _ = supervisor.revoked_spending_ucan_store.set(store);
+            // A store IS configured, so the in-memory global revoked-CID cache is
+            // NOT yet authoritative — it must be hydrated from the durable store
+            // before a GLOBAL-scope paid action may be authorized. Flip the shared
+            // flag so every actor's gate fails closed for GLOBAL-scope spends until
+            // `hydrate_revoked_spending_ucans` succeeds (spec §19.5, invariant 1a).
+            // Interior mutation (the supervisor is already behind an `Arc`).
+            supervisor
+                .global_revocation_hydration
+                .mark_needs_hydration();
         }
 
         supervisor
@@ -2145,6 +2172,19 @@ impl Supervisor {
         &self,
     ) -> Arc<ArcSwap<HashMap<DID, HashSet<String>>>> {
         Arc::clone(&self.global_revoked_spending_cids)
+    }
+
+    /// Cheap clone of the shared GLOBAL-scope revocation **hydration flag** (spec
+    /// §19.5, invariant 1a), handed to [`ActorDeps`] so every per-context actor's
+    /// gate can fail closed for GLOBAL-scope spends while the cache is un-hydrated.
+    /// Shares the same `Arc<AtomicU8>` the supervisor flips in
+    /// [`Self::hydrate_revoked_spending_ucans`], so a later `Hydrated`/`Failed`
+    /// transition is observed by already-spawned actors.
+    #[must_use]
+    pub(crate) fn global_revocation_hydration_shared(
+        &self,
+    ) -> crate::store::revoked_spending_ucans::GlobalRevocationHydration {
+        self.global_revocation_hydration.clone()
     }
 
     /// Cheap reference to the supervisor's standing-context tracking
@@ -2561,6 +2601,7 @@ impl Supervisor {
             payment_adapter: self.payment_adapter_ref().map(Arc::clone),
             local_dids: self.local_dids_shared(),
             global_revoked_spending_cids: self.global_revoked_spending_cids_shared(),
+            global_revocation_hydration: self.global_revocation_hydration_shared(),
             owned_identity,
         })
     }
@@ -9214,16 +9255,28 @@ impl Supervisor {
             || scp_clock::SystemClock.now_secs(),
             |c| scp_clock::Clock::now_secs(c.as_ref()),
         );
-        let map = store
-            .load_all(now_secs)
-            .await
-            .map_err(|e| ContextError::RevocationHydrationFailed(e.to_string()))?;
+        let map = match store.load_all(now_secs).await {
+            Ok(map) => map,
+            Err(e) => {
+                // Fail-closed (spec §19.5, invariant 1a): a CONFIGURED store whose
+                // durable READ failed leaves the in-memory global revoked-CID cache
+                // UNTRUSTWORTHY. Flip the shared flag to `Failed` so every actor's
+                // paid-action gate rejects GLOBAL-scope spends until a subsequent
+                // successful hydration — regardless of how the embedder handles the
+                // returned error (the FFI `resume()` path, e.g., logs and stays up).
+                self.global_revocation_hydration.mark_failed();
+                return Err(ContextError::RevocationHydrationFailed(e.to_string()));
+            }
+        };
         // Take the same `write_lock` the incremental `revoke_spending_ucan`
         // read-modify-write holds (ADR-049 §Decision 12) so this wholesale
         // hydration store cannot race a concurrent single-CID revocation and
         // clobber it (or be clobbered).
         let _guard = self.write_lock.lock().await;
         self.global_revoked_spending_cids.store(Arc::new(map));
+        // Cache now reflects the durable store — GLOBAL-scope spends may be
+        // authorized against it (spec §19.5, invariant 1a).
+        self.global_revocation_hydration.mark_hydrated();
         Ok(())
     }
 
@@ -18624,8 +18677,7 @@ mod tests {
         let ctx_key = hex::encode(ctx_id_bytes);
         let revoker_did = "did:example:spend-revoke-admin".to_owned();
 
-        // §19.5 verify-before-revoke: the presented token must be genuinely
-        // self-signed and the resolver must resolve the payer's real key.
+        // §19.5 verify-before-revoke: genuinely self-signed token + resolver resolves the payer key.
         let payer_did = "did:dht:z6MkSpendRevokePayer".to_owned();
         let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
         let key_resolver =
@@ -18641,16 +18693,14 @@ mod tests {
             1_700_000_000,
             DID("did:example:spend-revoke-admin".to_owned()),
         );
-        // §19.5 scope-matched authz reads the actor's creator DID; the empty
-        // test role state carries none, so set it to the admin/revoker here.
+        // §19.5 scope-matched authz reads the actor's creator DID; set it to the revoker.
         state.role_state.creator_did = "did:example:spend-revoke-admin".to_owned();
         state
             .handle
             .transition_to(&crate::context::ContextState::Active)
             .unwrap();
         let mut deps = test_actor_deps(&sup).await;
-        // Swap in a RecordingEventLog (the default TestEventLog is write-only)
-        // so the SpendingUcanRevoked leaf can be read back below.
+        // Swap in a RecordingEventLog so the SpendingUcanRevoked leaf can be read back.
         let recorder = RecordingEventLog::default();
         let recorded = Arc::clone(&recorder.events);
         deps.event_log = Arc::new(recorder);
@@ -18664,6 +18714,15 @@ mod tests {
             .expect("spawn registers");
 
         let revoked_cid = compute_revocation_cid(&encoded_token);
+        // Context-scoped gate check (status known, no global set) over a Class-S set.
+        let gate_rejects = |revoked_cids: &HashSet<String>| {
+            crate::context::economy_logic::ContextRevocationChecker {
+                revoked_cids,
+                global_revoked_cids: None,
+                global_scope_status_unknown: false,
+            }
+            .is_revoked(&revoked_cid)
+        };
 
         // BEFORE: the durable gate set is empty ⇒ the token passes.
         let before = persistence
@@ -18672,11 +18731,7 @@ mod tests {
             .expect("load")
             .expect("snapshot present after initial persist");
         assert!(
-            !crate::context::economy_logic::ContextRevocationChecker {
-                revoked_cids: &before.revoked_spending_ucan_cids,
-                global_revoked_cids: None,
-            }
-            .is_revoked(&revoked_cid),
+            !gate_rejects(&before.revoked_spending_ucan_cids),
             "baseline: an un-revoked spending UCAN must pass the revocation check"
         );
 
@@ -18696,18 +18751,12 @@ mod tests {
             "revoke_spending_ucan must persist the CID into revoked_spending_ucan_cids"
         );
         assert!(
-            crate::context::economy_logic::ContextRevocationChecker {
-                revoked_cids: &after.revoked_spending_ucan_cids,
-                global_revoked_cids: None,
-            }
-            .is_revoked(&revoked_cid),
+            gate_rejects(&after.revoked_spending_ucan_cids),
             "after revocation the paid-action gate must reject the spending UCAN"
         );
 
-        // The convergent SpendingUcanRevoked leaf (§19.6.1) landed: WHICH token
-        // (CID + scope) and BY WHOM. `.map` extracts owned values from the
-        // guard within this ONE statement so the guard never spans a later
-        // `.await` or another statement (clippy::significant_drop_tightening).
+        // The convergent SpendingUcanRevoked leaf (§19.6.1) landed. `.map` extracts owned
+        // values within this ONE statement so the guard never spans an `.await`.
         let (leaf_actor, leaf_payload_bytes): (String, Vec<u8>) = recorded
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -18800,6 +18849,7 @@ mod tests {
             !crate::context::economy_logic::ContextRevocationChecker {
                 revoked_cids: &empty_context_set,
                 global_revoked_cids: before_global.get(&payer),
+                global_scope_status_unknown: false,
             }
             .is_revoked(&revoked_cid),
             "baseline: an un-revoked global spending UCAN must pass the revocation check"
@@ -18821,6 +18871,7 @@ mod tests {
             let context_b_rejects = crate::context::economy_logic::ContextRevocationChecker {
                 revoked_cids: &empty_context_set,
                 global_revoked_cids: after_global.get(&payer),
+                global_scope_status_unknown: false,
             }
             .is_revoked(&revoked_cid);
             (payer_set.contains(&revoked_cid), context_b_rejects)
@@ -18913,6 +18964,7 @@ mod tests {
             !crate::context::economy_logic::ContextRevocationChecker {
                 revoked_cids: &empty_context_b_set,
                 global_revoked_cids: global_snapshot.get(&payer),
+                global_scope_status_unknown: false,
             }
             .is_revoked(&revoked_cid),
             "a context-A-scoped revocation must not leak into context B's gate"
@@ -19093,6 +19145,7 @@ mod tests {
             crate::context::economy_logic::ContextRevocationChecker {
                 revoked_cids: &empty_context_set,
                 global_revoked_cids: hydrated.get(&payer),
+                global_scope_status_unknown: false,
             }
             .is_revoked(&revoked_cid),
             "a hydrated global revocation must reject the token after restart"
@@ -19163,6 +19216,137 @@ mod tests {
         assert!(
             sup.global_revoked_spending_cids_shared().load().is_empty(),
             "a failed hydration must not leave a populated (or falsely-served) cache"
+        );
+        // Invariant 1a: the shared flag is now Failed, so status is UNKNOWN.
+        assert!(
+            !sup.global_revocation_hydration_shared().status_known(),
+            "a failed hydration must flip the shared flag to a fail-closed (unknown) state"
+        );
+    }
+
+    /// Spec §19.5 fail-closed GATE (invariant 1a): after a CONFIGURED store's
+    /// hydration FAILS, the instance stays up (the FFI `resume()` path logs and
+    /// does not abort) — and a context created/spawned AFTERWARD must FAIL CLOSED
+    /// on a GLOBAL-scope paid action. Its gate cannot authorize a spend whose
+    /// global revocation status is unknown against a cold, empty cache. This is
+    /// the round-2 hole: the round-1 fix only covered the restore path, leaving a
+    /// subsequently-created/joined context's gate fail-OPEN. CONTEXT-scoped spends
+    /// are UNAFFECTED (their revocations ride the per-context Class-S set restored
+    /// with the context snapshot, not this global-store hydration).
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_hydration_fails_closed_for_later_context_global_spend() {
+        use scp_protocol::crypto::ucan::spending::SpendingScope;
+
+        let clock_dyn: Arc<dyn Clock> = Arc::new(TestClock::new(1_700_000_000));
+        let payer_did = "did:dht:z6MkFailClosedGatePayer".to_owned();
+        let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let key_resolver =
+            single_payer_key_resolver(payer_did.clone(), signing_key.verifying_key());
+        let store: Arc<dyn crate::store::revoked_spending_ucans::RevokedSpendingUcanStore> =
+            Arc::new(FailingHydrationStore);
+        // Clone the resolver: the supervisor consumes one, the direct gate call
+        // below reuses the other (same key view).
+        let sup = spending_revoke_supervisor(
+            clock_dyn,
+            MapPersistence::default(),
+            key_resolver.clone(),
+            Some(store),
+        );
+
+        // Hydration FAILS at startup; the instance is NOT torn down.
+        let result = sup.restore_on_startup().await;
+        assert!(
+            matches!(result, Err(ContextError::RevocationHydrationFailed(_))),
+            "hydration must fail closed, got {result:?}"
+        );
+        let status_known = sup.global_revocation_hydration_shared().status_known();
+        assert!(
+            !status_known,
+            "after a failed hydration the shared status must be UNKNOWN (fail-closed)"
+        );
+
+        // A context SPAWNED AFTER the failure shares that flag (the fix's target:
+        // a bare empty cache would fail OPEN here). The instance stayed up.
+        let (_handle, _ctx_key) = spawn_active_with_snapshot(&sup, [0xF1u8; 32]).await;
+
+        let payer = DID(payer_did.clone());
+        let empty_context_set: HashSet<String> = HashSet::new();
+        let sysclock = scp_clock::SystemClock;
+        let make_tracker = || {
+            scp_protocol::crypto::ucan::nonce::NonceTracker::new(
+                "gate-ctx".to_owned(),
+                Arc::new(scp_clock::SystemClock) as Arc<dyn Clock>,
+            )
+        };
+
+        // MAIN: a genuine GLOBAL-scope spending UCAN is REJECTED while status is
+        // unknown — even though the (cold) global cache is empty.
+        let global_token =
+            make_signed_spending_token(&payer_did, &signing_key, &SpendingScope::Global);
+        let parsed_global = scp_protocol::crypto::ucan::validate::parse_ucan(&global_token)
+            .expect("global token must parse");
+        let mut tracker = make_tracker();
+        let rejected = crate::context::economy_logic::validate_spending_ucan_or_error(
+            &parsed_global,
+            &payer,
+            "gate-ctx",
+            &mut tracker,
+            &empty_context_set,
+            None,
+            status_known, // false
+            &key_resolver,
+            &sysclock,
+        );
+        assert!(
+            matches!(rejected, Err(ContextError::PermissionDenied(_))),
+            "a GLOBAL-scope paid action must FAIL CLOSED after a failed hydration, got {rejected:?}"
+        );
+
+        // CONTROL 1: the SAME global token PASSES when status is KNOWN — proving
+        // the rejection above is caused by the fail-closed flag, not a malformed
+        // token or an unrelated gate failure.
+        let mut tracker = make_tracker();
+        let permitted_when_known = crate::context::economy_logic::validate_spending_ucan_or_error(
+            &parsed_global,
+            &payer,
+            "gate-ctx",
+            &mut tracker,
+            &empty_context_set,
+            None,
+            true, // status known ⇒ empty cache is authoritative ⇒ permit
+            &key_resolver,
+            &sysclock,
+        );
+        assert!(
+            permitted_when_known.is_ok(),
+            "control: the same global token must pass when hydration status is KNOWN — {permitted_when_known:?}"
+        );
+
+        // CONTROL 2: a CONTEXT-scoped token is UNAFFECTED by the global fail-closed
+        // flag — it passes even while global status is unknown.
+        let ctx_token = make_signed_spending_token(
+            &payer_did,
+            &signing_key,
+            &SpendingScope::Context("gate-ctx".to_owned()),
+        );
+        let parsed_ctx = scp_protocol::crypto::ucan::validate::parse_ucan(&ctx_token)
+            .expect("context token must parse");
+        let mut tracker = make_tracker();
+        let ctx_permitted = crate::context::economy_logic::validate_spending_ucan_or_error(
+            &parsed_ctx,
+            &payer,
+            "gate-ctx",
+            &mut tracker,
+            &empty_context_set,
+            None,
+            status_known, // false — but a context-scoped token is not gated on it
+            &key_resolver,
+            &sysclock,
+        );
+        assert!(
+            ctx_permitted.is_ok(),
+            "a CONTEXT-scoped spend must be UNAFFECTED by the global fail-closed flag — {ctx_permitted:?}"
         );
     }
 

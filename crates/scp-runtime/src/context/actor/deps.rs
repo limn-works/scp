@@ -217,6 +217,17 @@ pub struct ActorDeps {
     /// paid-action gate checks the UNION of both (see
     /// `crate::context::economy_logic::ContextRevocationChecker`).
     pub global_revoked_spending_cids: Arc<ArcSwap<std::collections::HashMap<DID, HashSet<String>>>>,
+    /// Fail-closed hydration state of `global_revoked_spending_cids` (spec §19.5,
+    /// invariant 1a). Shares the supervisor's `Arc<AtomicU8>` flag (see
+    /// [`crate::context::supervisor::Supervisor::global_revocation_hydration_shared`]).
+    /// The paid-action gate consults it via [`Self::global_revocation_status_known`]:
+    /// a GLOBAL-scope (`scp:spending:*`) spend fails closed while a configured
+    /// durable revocation store has not been successfully hydrated (un-hydrated or
+    /// hydration failed), so an actor spawned before/after a failed hydration
+    /// cannot authorize a global spend against a cold, empty cache. Context-scoped
+    /// spends are UNAFFECTED (their revocations ride the per-context Class-S set).
+    pub global_revocation_hydration:
+        crate::store::revoked_spending_ucans::GlobalRevocationHydration,
     /// Unforgeable capability token proving which identity owns this
     /// actor (ADR-049 §5). Minted fresh per-actor at spawn time in
     /// [`Supervisor::build_actor_deps`](crate::context::supervisor::Supervisor::build_actor_deps)
@@ -250,6 +261,19 @@ impl ActorDeps {
     #[must_use]
     pub(in crate::context) fn global_revoked_cids_for(&self, did: &DID) -> Option<HashSet<String>> {
         self.global_revoked_spending_cids.load().get(did).cloned()
+    }
+
+    /// Whether the GLOBAL-scope spending-UCAN revocation cache's hydration status
+    /// is KNOWN on this instance (spec §19.5, invariant 1a): `true` when no
+    /// durable global store is configured (empty set is authoritative) or a
+    /// configured store hydrated successfully; `false` while a configured store is
+    /// un-hydrated or its hydration failed. The paid-action gate passes this into
+    /// [`crate::context::economy_logic::validate_spending_ucan_or_error`] (and the
+    /// §7 saga re-validation reads it directly) so a GLOBAL-scope spend fails
+    /// closed while the cache cannot be trusted.
+    #[must_use]
+    pub(in crate::context) fn global_revocation_status_known(&self) -> bool {
+        self.global_revocation_hydration.status_known()
     }
 
     /// Build a fresh [`ActorDeps`] bundle by cloning every field of
@@ -286,6 +310,9 @@ impl ActorDeps {
             payment_adapter: self.payment_adapter.as_ref().map(Arc::clone),
             local_dids: Arc::clone(&self.local_dids),
             global_revoked_spending_cids: Arc::clone(&self.global_revoked_spending_cids),
+            // Shares the SAME hydration flag (cheap `Arc<AtomicU8>` clone), so the
+            // spawned actor observes later `Hydrated`/`Failed` transitions.
+            global_revocation_hydration: self.global_revocation_hydration.clone(),
             // Reissue the capability token for the SAME owning identity.
             // `clone_for_spawn` holds only `&self` — a token already
             // minted by the supervisor for this context's owner — so it

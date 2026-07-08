@@ -86,10 +86,27 @@ struct RevokedSpendingUcanRecord {
     /// tolerance the paid-action gate applies to expiry. Once `now` exceeds
     /// this, the token is expiry-rejected by the gate regardless of whether its
     /// CID remains in the revoked set, so retaining the CID only wastes space.
-    /// Defaults to `0` (immediately GC-eligible) for records written by an
-    /// older build without this field.
-    #[serde(default)]
+    ///
+    /// **Upgrade default = RETAIN (`u64::MAX`), not GC.** A record written by an
+    /// older build (or a partially-written/legacy record) that LACKS this field
+    /// deserializes to `u64::MAX` — "never moot" — via
+    /// [`retain_forever_moot_after`], so it SURVIVES rather than being dropped on
+    /// sight. Fail-closed (spec §19.5): forgetting a revocation (fail-OPEN) is the
+    /// dangerous direction; retaining one longer than strictly necessary is
+    /// harmless — the revoked token's own ≤24h expiry (§9.5) still bounds the
+    /// blast radius, and the next `record`/`load_all` that carries a real moot
+    /// time prunes it. Defaulting to `0` would have made such a legacy record
+    /// GC-eligible immediately, silently forgetting a still-live revocation.
+    #[serde(default = "retain_forever_moot_after")]
     revocation_moot_after_secs: u64,
+}
+
+/// `#[serde(default)]` provider for
+/// [`RevokedSpendingUcanRecord::revocation_moot_after_secs`]: a record missing
+/// the field is treated as "never moot" (`u64::MAX`) so it is RETAINED, never
+/// GC'd on sight (spec §19.5 fail-closed — see the field doc).
+const fn retain_forever_moot_after() -> u64 {
+    u64::MAX
 }
 
 /// Key prefix under which every identity's data (including revoked global
@@ -310,6 +327,106 @@ impl<S: Storage> RevokedSpendingUcanStore for ProtocolRepository<S> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Fail-closed hydration state (spec §19.5)
+// ---------------------------------------------------------------------------
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
+
+/// Shared hydration state of the in-memory GLOBAL-scope spending-UCAN
+/// revocation cache (spec §19.5, fail-closed).
+///
+/// The paid-action gate authorizes a GLOBAL-scope (`scp:spending:*`) spend by
+/// consulting the in-memory `global_revoked_spending_cids` cache. That cache is
+/// only trustworthy once it has been hydrated from the durable
+/// [`RevokedSpendingUcanStore`] at startup. If a configured store is NOT (yet)
+/// hydrated — because startup has not run, or its hydration READ failed — the
+/// cache may be an empty snapshot that would silently RE-AUTHORIZE a globally
+/// revoked token (fail-OPEN). This flag lets the gate distinguish "the empty set
+/// is authoritative" from "we do not yet know the revoked set" and fail closed
+/// in the latter case.
+///
+/// Cheaply cloneable (`Arc<AtomicU8>`): the supervisor holds the writer and
+/// clones a reader into every actor's [`ActorDeps`](crate::context::actor::deps::ActorDeps),
+/// so a flip to `Hydrated` (or `Failed`) after an actor has already spawned is
+/// observed by that actor's gate — the state is shared, not snapshotted.
+///
+/// **Context-scoped spends are UNAFFECTED** by this flag: their revocations live
+/// in the per-context Class-S `revoked_spending_ucan_cids` set restored with the
+/// context snapshot, not this global-store hydration.
+#[derive(Clone)]
+pub struct GlobalRevocationHydration {
+    state: Arc<AtomicU8>,
+}
+
+impl GlobalRevocationHydration {
+    /// No durable global-scope revocation store is configured on this instance —
+    /// the global revoked set is empty BY CONSTRUCTION and there is nothing to
+    /// hydrate, so GLOBAL-scope spends are NOT gated on hydration.
+    const NOT_CONFIGURED: u8 = 0;
+    /// A store IS configured but hydration has not completed successfully yet
+    /// (startup not run, or a create/join happened before `restore_on_startup`).
+    /// GLOBAL-scope spends fail closed — the revoked set is unknown.
+    const NEEDS_HYDRATION: u8 = 1;
+    /// Hydration completed successfully — the cache reflects the durable store.
+    const HYDRATED: u8 = 2;
+    /// Hydration was attempted and FAILED (store read error). GLOBAL-scope spends
+    /// fail closed until a successful re-hydration.
+    const FAILED: u8 = 3;
+
+    fn with_state(state: u8) -> Self {
+        Self {
+            state: Arc::new(AtomicU8::new(state)),
+        }
+    }
+
+    /// Construct in the [`Self::NOT_CONFIGURED`] state — no durable store wired.
+    #[must_use]
+    pub fn not_configured() -> Self {
+        Self::with_state(Self::NOT_CONFIGURED)
+    }
+
+    /// Construct in the [`Self::NEEDS_HYDRATION`] state — a durable store IS wired
+    /// but has not been hydrated yet, so GLOBAL-scope spends fail closed until
+    /// [`Self::mark_hydrated`].
+    #[must_use]
+    pub fn needs_hydration() -> Self {
+        Self::with_state(Self::NEEDS_HYDRATION)
+    }
+
+    /// Transition to [`Self::NEEDS_HYDRATION`] — a durable store was wired after
+    /// construction (the supervisor is already behind an `Arc`, so this interior
+    /// mutation flips the shared default `NotConfigured` without reassigning the
+    /// field). Idempotent store.
+    pub fn mark_needs_hydration(&self) {
+        self.state.store(Self::NEEDS_HYDRATION, Ordering::SeqCst);
+    }
+
+    /// Record a successful hydration — the cache now reflects the durable store.
+    pub fn mark_hydrated(&self) {
+        self.state.store(Self::HYDRATED, Ordering::SeqCst);
+    }
+
+    /// Record a FAILED hydration — the cache is untrustworthy; GLOBAL-scope
+    /// spends fail closed until a subsequent successful hydration.
+    pub fn mark_failed(&self) {
+        self.state.store(Self::FAILED, Ordering::SeqCst);
+    }
+
+    /// `true` iff the global revoked-CID cache may be trusted for a fail-OPEN
+    /// (permit) decision on a GLOBAL-scope spend: either no durable store is
+    /// configured (empty set is authoritative by construction) or a configured
+    /// store hydrated successfully. `false` while a configured store is
+    /// un-hydrated or its hydration failed — the gate MUST fail closed for
+    /// GLOBAL-scope spending UCANs in that case (spec §19.5).
+    #[must_use]
+    pub fn status_known(&self) -> bool {
+        let s = self.state.load(Ordering::SeqCst);
+        s == Self::NOT_CONFIGURED || s == Self::HYDRATED
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -467,6 +584,79 @@ mod tests {
         assert!(
             repo.is_revoked_spending_ucan(&d, "new-cid").await.unwrap(),
             "the freshly-recorded revocation must be retained"
+        );
+    }
+
+    /// A record written WITHOUT `revocation_moot_after_secs` (an older-build /
+    /// legacy record) must deserialize with the RETAIN default (`u64::MAX`) so it
+    /// is NOT GC'd on sight — fail-closed upgrade (spec §19.5, invariant 1b).
+    #[tokio::test]
+    async fn legacy_record_without_moot_field_is_retained_not_dropped() {
+        // Simulate a record written by an older build: the on-disk value has NO
+        // `revocation_moot_after_secs` field. `store_value` over serde_json must
+        // round-trip through the `#[serde(default = ...)]` retain default.
+        #[derive(serde::Serialize)]
+        struct LegacyRecord<'a> {
+            did: &'a str,
+            cid: &'a str,
+        }
+        let repo = repo();
+        let d = did("did:dht:z6MkPayer");
+        let key = revoked_spending_ucan_key(&d, "legacy-cid").unwrap();
+        repo.store_value(
+            &key,
+            &LegacyRecord {
+                did: d.as_ref(),
+                cid: "legacy-cid",
+            },
+        )
+        .await
+        .unwrap();
+
+        // Hydrate FAR in the future: a `0` default would GC this immediately; the
+        // `u64::MAX` retain default keeps it.
+        let all = repo
+            .load_all_revoked_spending_ucans(u64::MAX - 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            all.get(&d).map(|s| s.contains("legacy-cid")),
+            Some(true),
+            "a legacy record lacking the moot field must be RETAINED (retain-on-upgrade default), not GC'd on sight"
+        );
+    }
+
+    /// The fail-closed hydration flag (spec §19.5, invariant 1a): only
+    /// `NotConfigured` and `Hydrated` are "status known" (gate may fail open);
+    /// `NeedsHydration` and `Failed` are unknown (gate must fail closed).
+    #[test]
+    fn hydration_flag_status_known_transitions() {
+        let not_configured = GlobalRevocationHydration::not_configured();
+        assert!(
+            not_configured.status_known(),
+            "no store configured ⇒ empty set is authoritative ⇒ status known"
+        );
+
+        let flag = GlobalRevocationHydration::needs_hydration();
+        assert!(
+            !flag.status_known(),
+            "a configured-but-un-hydrated store ⇒ status UNKNOWN ⇒ fail closed"
+        );
+        flag.mark_hydrated();
+        assert!(flag.status_known(), "successful hydration ⇒ status known");
+        flag.mark_failed();
+        assert!(
+            !flag.status_known(),
+            "a FAILED hydration ⇒ status UNKNOWN ⇒ fail closed"
+        );
+
+        // The reader shares state with the writer (Arc), so a clone observes a
+        // later transition — the property the actor-gate wiring relies on.
+        let reader = flag.clone();
+        flag.mark_hydrated();
+        assert!(
+            reader.status_known(),
+            "a cloned reader must observe the writer's later mark_hydrated"
         );
     }
 }
