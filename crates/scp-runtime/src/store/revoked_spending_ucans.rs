@@ -10,10 +10,11 @@
 //! its revocation cannot be keyed by a context — it is keyed by the issuer/payer
 //! DID (spending UCANs are self-delegations, `iss == aud == did`, §19.5).
 //!
-//! This store is the durable home for those global-scope revocations. It mirrors
-//! the existing DID-scoped [`identity/{did}/adapter_credentials/`] store
-//! (`store::economy`, §19.2.4): same `ProtocolRepository<S: Storage>` backing,
-//! same `identity/{did}/...` key namespace. Enforcement is **local,
+//! This store is the durable home for those global-scope revocations. It shares
+//! the `identity/{did}/` key namespace and the same `ProtocolRepository<S: Storage>`
+//! backing used by the DID-scoped `identity/{did}/adapter_credentials/` store
+//! (`store::economy`, §19.2.4) — a namespace/backing relationship only; the
+//! record shape and access pattern are this store's own. Enforcement is **local,
 //! per-instance** self-governance (§19.5 "Enforcement location") — there is no
 //! cross-instance propagation and none is claimed; blast radius across a payer's
 //! other instances is bounded by the 24-hour spending-UCAN expiry (§9.5).
@@ -196,8 +197,10 @@ impl<S: Storage> ProtocolRepository<S> {
     /// Used to hydrate the in-memory gate cache at supervisor startup so a
     /// revocation persisted before a restart still rejects afterward. Scans the
     /// `identity/` prefix and keeps only `.../revoked_spending_ucans/...` keys,
-    /// reconstructing `(DID, cid)` from each record's raw fields (the key's
-    /// components are sanitized and not reversible).
+    /// reconstructing `(DID, cid)` from each record's raw `did`/`cid` fields
+    /// (the value carries them; the key's `sanitize_key_component` REJECTS
+    /// disallowed input rather than transforming it, so it is not relied on as a
+    /// reversible carrier).
     ///
     /// Expiry GC on hydration (spec §19.5): a record whose
     /// `revocation_moot_after_secs <= now_secs` is for an already-expiry-rejected

@@ -989,15 +989,10 @@ pub async fn send_message(
     // below (keep-direction) — the Err arm here issues NO token (nothing was
     // consumed), so it is unchanged.
     // Snapshot the sender's global-scope (`scp:spending:*`) revoked-CID set
-    // (spec §19.5) before entering `enforce_send_economy`'s (synchronous)
-    // combinator — cloned into an owned `HashSet` rather than holding the
-    // `ArcSwap` guard across the call, mirroring the join-path snapshot in
-    // `lifecycle_helpers.rs`.
-    let global_revoked_for_sender: Option<std::collections::HashSet<String>> = deps
-        .global_revoked_spending_cids
-        .load()
-        .get(sender_did)
-        .cloned();
+    // (spec §19.5) as an owned clone before `enforce_send_economy`'s
+    // (synchronous) combinator — see `ActorDeps::global_revoked_cids_for`.
+    let global_revoked_for_sender: Option<std::collections::HashSet<String>> =
+        deps.global_revoked_cids_for(sender_did);
 
     let (deducted_cost, mut spending_nonce_token) = match enforce_send_economy(
         cell,

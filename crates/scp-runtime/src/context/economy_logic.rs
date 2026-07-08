@@ -170,8 +170,10 @@ impl RevocationChecker for ContextRevocationChecker<'_> {
 /// - Spending-specific scope, lifetime, and parent attenuation checks.
 // The union needs both the per-context and global revoked-CID borrows on top
 // of the six verifier inputs, so this crosses the 7-arg lint threshold.
-// Grouping into a struct would only shift the arg list to the single
-// `enforce_economy` call site, which already owns an `EnforceEconomyRequest`.
+// Grouping into a struct would only shift the arg list to the two call sites —
+// `enforce_economy` (which already owns an `EnforceEconomyRequest`) and the §7
+// cross-context saga re-validation in `tools_helpers` — without removing any
+// argument, so the borrows stay positional here.
 #[allow(clippy::too_many_arguments)]
 pub fn validate_spending_ucan_or_error(
     spending: &scp_protocol::crypto::ucan::UcanToken,

@@ -343,6 +343,33 @@ impl StorageProvider {
             Self::Sqlite(storage) => storage.close(),
         }
     }
+
+    /// Builds the durable, DID-scoped store for revoked GLOBAL-scope spending
+    /// UCANs (spec §19.5) over THIS provider's backend — a `ProtocolRepository`
+    /// over the SAME handle that backs persistence, the event log, and the saga
+    /// journal, so a global-scope revocation persisted here survives restart on
+    /// the same backend those consumers read from (§17.6 same-backend
+    /// invariant).
+    ///
+    /// This is `PyO3`'s equivalent of
+    /// [`BridgeStorageRepo::revoked_spending_ucan_store`](scp_ffi_common::bridge_runtime::BridgeStorageRepo::revoked_spending_ucan_store)
+    /// (NAPI) — the construction lives ON the storage type rather than in a
+    /// free-standing helper. (`PyO3` retains its own `StorageProvider` enum
+    /// rather than `BridgeStorageRepo` because the two bridges' in-memory
+    /// handle types differ.)
+    #[must_use]
+    pub fn revoked_spending_ucan_store(
+        &self,
+    ) -> Arc<dyn scp_core::store::revoked_spending_ucans::RevokedSpendingUcanStore> {
+        match self {
+            Self::InMemoryEncrypted(storage) => {
+                Arc::new(ProtocolRepository::new(Arc::clone(storage)))
+                    as Arc<dyn scp_core::store::revoked_spending_ucans::RevokedSpendingUcanStore>
+            }
+            Self::Sqlite(storage) => Arc::new(ProtocolRepository::new(Arc::clone(storage)))
+                as Arc<dyn scp_core::store::revoked_spending_ucans::RevokedSpendingUcanStore>,
+        }
+    }
 }
 
 impl Storage for StorageProvider {
@@ -1190,7 +1217,9 @@ fn build_supervisor(
     event_log: Box<dyn ContextEventLogProvider>,
     persistence: Option<Box<dyn ContextPersistence>>,
 ) -> Result<Arc<scp_core::context::supervisor::Supervisor>, ScpPyError> {
-    let revoked_spending_ucan_store = build_revoked_spending_ucan_store(bi);
+    let revoked_spending_ucan_store = bi
+        .storage_provider()
+        .map(StorageProvider::revoked_spending_ucan_store);
     // Derive the durable saga journal AND the `OpenMLS` `mls_storage` view from
     // the bridge instance's SINGLE chosen `StorageProvider` (§17.6 / §17.16 /
     // ADR-049), bound into one [`DurableProviders`]. Its only non-test
@@ -1232,31 +1261,6 @@ fn build_supervisor(
             revoked_spending_ucan_store,
         ),
     )
-}
-
-/// Constructs the durable, DID-scoped store for revoked GLOBAL-scope spending
-/// UCANs (spec §19.5) from the bridge's chosen storage provider, if one was
-/// attached at construction time.
-///
-/// Mirrors [`build_event_log_provider`] / [`build_persistence_provider`]: the
-/// store is a `ProtocolRepository` over the SAME `StorageProvider` handle that
-/// backs persistence, the event log, and the saga journal, so a global-scope
-/// revocation persisted here survives restart on the SAME backend those
-/// consumers read from (spec §17.6 same-backend invariant). Returns `None`
-/// for bridge instances with no storage attached — `revoke_spending_ucan`
-/// then fails closed for global-scope revocations on that instance rather
-/// than silently accepting an un-persisted one.
-fn build_revoked_spending_ucan_store(
-    bi: &PyBridgeInstance,
-) -> Option<Arc<dyn scp_core::store::revoked_spending_ucans::RevokedSpendingUcanStore>> {
-    bi.storage_provider().map(|provider| match provider {
-        StorageProvider::InMemoryEncrypted(storage) => {
-            Arc::new(ProtocolRepository::new(Arc::clone(storage)))
-                as Arc<dyn scp_core::store::revoked_spending_ucans::RevokedSpendingUcanStore>
-        }
-        StorageProvider::Sqlite(storage) => Arc::new(ProtocolRepository::new(Arc::clone(storage)))
-            as Arc<dyn scp_core::store::revoked_spending_ucans::RevokedSpendingUcanStore>,
-    })
 }
 
 /// Builds the bridge's [`DurableProviders`] — the durable saga journal + the

@@ -235,6 +235,23 @@ pub struct ActorDeps {
 }
 
 impl ActorDeps {
+    /// Returns an OWNED clone of `did`'s global-scope (`scp:spending:*`)
+    /// revoked-CID set (spec §19.5), or `None` when the DID has no global
+    /// revocations recorded (or no global-revocation store is configured on this
+    /// instance).
+    ///
+    /// Callers snapshot into an owned `HashSet` — rather than holding the
+    /// `ArcSwap` guard — so the value can cross an `.await` inside a fail-closed
+    /// Class-S combinator without holding the lock (clippy::await_holding_lock).
+    /// The synchronous combinator call sites use the same owned-clone shape for
+    /// symmetry. Used by the send / join / tool-invoke economy paths; the
+    /// cross-context saga handler borrows through the guard synchronously and
+    /// does not use this accessor.
+    #[must_use]
+    pub(in crate::context) fn global_revoked_cids_for(&self, did: &DID) -> Option<HashSet<String>> {
+        self.global_revoked_spending_cids.load().get(did).cloned()
+    }
+
     /// Build a fresh [`ActorDeps`] bundle by cloning every field of
     /// `self` (ADR-049 Phase 2A finalization bootstrap dual-write).
     ///

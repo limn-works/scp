@@ -823,15 +823,11 @@ pub async fn join_context(
     // short-lived `class_c_view()` / `&*cell` borrows at each step (no
     // `state_mut()` escape hatch).
     // Snapshot the joiner's global-scope (`scp:spending:*`) revoked-CID set
-    // (spec §19.5) before entering the (synchronous) combinator below —
-    // `begin_class_s_conditional` never awaits, so holding the `ArcSwap`
-    // guard across the call would be sound, but the owned-clone shape keeps
-    // this call site symmetric with the async combinator sites elsewhere.
-    let global_revoked_for_joiner: Option<std::collections::HashSet<String>> = deps
-        .global_revoked_spending_cids
-        .load()
-        .get(&member_did)
-        .cloned();
+    // (spec §19.5) as an owned clone before the (synchronous) combinator below —
+    // the owned-clone shape keeps this site symmetric with the async combinator
+    // sites; see `ActorDeps::global_revoked_cids_for`.
+    let global_revoked_for_joiner: Option<std::collections::HashSet<String>> =
+        deps.global_revoked_cids_for(&member_did);
 
     let (deducted_cost, mut spending_nonce_token) =
         match cell.begin_class_s_conditional(&context_id, |mut view| {

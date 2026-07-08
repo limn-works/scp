@@ -656,14 +656,11 @@ pub async fn reserve_tool_economy(
     // (the velocity tick / hard-rate consume ride the ordinary best-effort
     // persist elsewhere); the combinator is skipped entirely.
     // Snapshot the invoker's global-scope (`scp:spending:*`) revoked-CID set
-    // (spec §19.5) before entering the fail-closed combinator below — cloned
-    // into an owned `HashSet` rather than holding the `ArcSwap` guard across
-    // the combinator's `.await` (clippy::await_holding_lock discipline).
-    let global_revoked_for_invoker: Option<HashSet<String>> = deps
-        .global_revoked_spending_cids
-        .load()
-        .get(invoker_did)
-        .cloned();
+    // (spec §19.5) as an owned clone before entering the fail-closed combinator
+    // below — see `ActorDeps::global_revoked_cids_for` for the guard-vs-await
+    // rationale.
+    let global_revoked_for_invoker: Option<HashSet<String>> =
+        deps.global_revoked_cids_for(invoker_did);
 
     let deducted_cost = if action_cost.0 > 0 {
         let combinator_result = cell
