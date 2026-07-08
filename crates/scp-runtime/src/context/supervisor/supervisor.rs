@@ -15978,6 +15978,18 @@ mod tests {
         sup: &Arc<Supervisor>,
         ctx_id_bytes: [u8; 32],
     ) -> (ContextActorHandle, String) {
+        spawn_active_with_members(sup, ctx_id_bytes, &[]).await
+    }
+
+    /// Like [`spawn_active_with_snapshot`] but seeds `members` into the context's
+    /// membership set — needed by §19.5 tests where the revoker of a
+    /// context-scoped spending UCAN must be a current member (SCP-ECON-12069) yet
+    /// is not the creator.
+    async fn spawn_active_with_members(
+        sup: &Arc<Supervisor>,
+        ctx_id_bytes: [u8; 32],
+        members: &[&str],
+    ) -> (ContextActorHandle, String) {
         let ctx_key = hex::encode(ctx_id_bytes);
         let mut state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
             ctx_id_bytes,
@@ -15988,6 +16000,11 @@ mod tests {
         // fixture's admin DID so creator-keyed authorization (e.g. §19.5
         // context-scoped spending-UCAN revocation) reads a real creator.
         state.role_state.creator_did = "did:example:admin".to_owned();
+        for m in members {
+            state
+                .membership
+                .add_member(DID((*m).to_owned()), "member".to_owned(), Vec::new());
+        }
         state
             .handle
             .transition_to(&crate::context::ContextState::Active)
@@ -18967,7 +18984,10 @@ mod tests {
             single_payer_key_resolver(payer_did.clone(), signing_key.verifying_key());
 
         let sup = spending_revoke_supervisor(clock_dyn, persistence.clone(), key_resolver, None);
-        let (_handle, ctx_key) = spawn_active_with_snapshot(&sup, ctx_id_bytes).await;
+        // The payer must be a current member to revoke a context-scoped token
+        // (SCP-ECON-12069 membership gate); the payer here is not the creator.
+        let (_handle, ctx_key) =
+            spawn_active_with_members(&sup, ctx_id_bytes, &[payer_did.as_str()]).await;
 
         let scope = SpendingScope::Context(ctx_key.clone());
         let encoded_token = make_signed_spending_token(&payer_did, &signing_key, &scope);
