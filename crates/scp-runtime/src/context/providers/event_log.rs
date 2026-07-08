@@ -767,6 +767,25 @@ impl ContextEventLogProvider for MerkleEventLogProvider {
         })
     }
 
+    async fn restore_event_log(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        // Delegate to the INHERENT method, which loads persisted entries
+        // (`persistence.load_entries`) and replays them via
+        // `rebuild_log_from_events`. Without this override, production restart
+        // (`Supervisor::restore_context` → `restore_event_log_best_effort`)
+        // dispatches through the `dyn ContextEventLogProvider` trait object and
+        // hits the trait DEFAULT (`init_event_log` = empty log), so the
+        // persisted Merkle history is silently dropped and inclusion /
+        // consistency proofs over pre-restart events fail.
+        //
+        // The fully-qualified `Self::restore_event_log(self, ..)` path resolves
+        // to the INHERENT method (inherent methods take precedence over trait
+        // methods in path syntax — same as the sibling `prune_before_checkpoint`
+        // override just below); the bare `self.restore_event_log(context_id)`
+        // method-call form would resolve back to THIS trait method and recurse
+        // infinitely.
+        Self::restore_event_log(self, context_id).await
+    }
+
     async fn prune_before_checkpoint(
         &self,
         context_id: &[u8; 32],
@@ -1210,6 +1229,112 @@ mod tests {
             assert_eq!(entries.len(), 4);
             assert_eq!(entries[3].sequence, 3);
         }
+    }
+
+    /// Regression test for the process-restart data-continuity bug: the
+    /// production restart path (`Supervisor::restore_context` →
+    /// `restore_event_log_best_effort`) dispatches through a
+    /// `&dyn ContextEventLogProvider` trait object. Before this fix, the
+    /// `impl ContextEventLogProvider for MerkleEventLogProvider` block did NOT
+    /// override `restore_event_log`, so the trait DEFAULT ran
+    /// (`init_event_log` = EMPTY log) and the persisted Merkle history was
+    /// silently dropped on every restart — inclusion/consistency proofs over
+    /// pre-restart events would then fail.
+    ///
+    /// This test MUST call `restore_event_log` THROUGH the trait object
+    /// (`&dyn ContextEventLogProvider`), not the inherent method: calling the
+    /// inherent method directly (as `restore_from_persistence` does) would pass
+    /// even with the bug present, because the inherent method always replayed
+    /// correctly. Only trait-object dispatch exercises the override.
+    #[tokio::test]
+    async fn restore_via_trait_object_replays_persisted_log() {
+        use crate::context::builder::ContextEventLogProvider;
+
+        let persistence = std::sync::Arc::new(MockEventLogPersistence::new());
+        let ctx_id = [21u8; 32];
+
+        // Pre-restart incarnation: append N events, capture the Merkle root and
+        // entry count that a correct restart must reproduce.
+        let (pre_restart_root, pre_restart_len) = {
+            let provider = MerkleEventLogProvider::with_persistence(persistence.clone());
+            provider.init_event_log(&ctx_id).await.unwrap();
+            provider
+                .append_event(
+                    &ctx_id,
+                    EventType::ContextCreated,
+                    "did:key:a",
+                    EventPayload::default(),
+                    1_700_000_000,
+                )
+                .await
+                .unwrap();
+            provider
+                .append_event(
+                    &ctx_id,
+                    EventType::MemberJoined,
+                    "did:key:b",
+                    payload_bytes(b"join"),
+                    1_700_000_001,
+                )
+                .await
+                .unwrap();
+            provider
+                .append_event(
+                    &ctx_id,
+                    EventType::MessageSent,
+                    "did:key:a",
+                    payload_bytes(b"hello"),
+                    1_700_000_002,
+                )
+                .await
+                .unwrap();
+
+            let root = provider.merkle_root(&ctx_id).unwrap();
+            let len = provider.entries(&ctx_id).unwrap().len();
+            (root, len)
+        };
+        assert_eq!(pre_restart_len, 3);
+
+        // Simulate process restart: a FRESH provider over the SAME persistence
+        // backend, restored via TRAIT-OBJECT dispatch (the production path).
+        let restored = MerkleEventLogProvider::with_persistence(persistence);
+        {
+            let via_trait: &dyn ContextEventLogProvider = &restored;
+            via_trait.restore_event_log(&ctx_id).await.unwrap();
+        }
+
+        // The rebuilt in-memory log must match the persisted history exactly:
+        // same entry count AND same Merkle root. Under the bug (empty-init
+        // default) the count would be 0 and the root the empty-tree root.
+        let restored_entries = restored.entries(&ctx_id).unwrap();
+        assert_eq!(
+            restored_entries.len(),
+            pre_restart_len,
+            "trait-object restore must replay all persisted entries"
+        );
+        assert_eq!(restored_entries[0].event_type, EventType::ContextCreated);
+        assert_eq!(restored_entries[2].event_type, EventType::MessageSent);
+        assert_eq!(
+            restored.merkle_root(&ctx_id).unwrap(),
+            pre_restart_root,
+            "trait-object restore must reproduce the pre-restart Merkle root"
+        );
+
+        // The restored log is append-capable and chains from the replayed tail.
+        let via_trait: &dyn ContextEventLogProvider = &restored;
+        via_trait
+            .append_event(
+                &ctx_id,
+                EventType::MemberLeft,
+                "did:key:b",
+                EventPayload::default(),
+                1_700_000_003,
+            )
+            .await
+            .unwrap();
+        let after_append = restored.entries(&ctx_id).unwrap();
+        assert_eq!(after_append.len(), 4);
+        assert_eq!(after_append[3].sequence, 3);
     }
 
     #[tokio::test]
