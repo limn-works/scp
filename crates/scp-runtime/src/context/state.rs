@@ -922,13 +922,16 @@ pub struct ContextSnapshot {
     /// the signed context-export digest is reproducible (§23.16.8, ADR-050),
     /// matching `executed_proposals` and `read_exclusion_list`.
     ///
-    /// NOTE (honesty): governance does not yet POPULATE this set — spending-UCAN
-    /// revocation is not wired through a governance action, so it is empty in
-    /// steady state today. Persisting it now makes the field crash-safe BY
-    /// CONSTRUCTION (Class S) so the moment revocation lands it is durable
-    /// without a separate persistence change; the prior code reset it to empty
-    /// on every restore, which would have silently dropped revocations the
-    /// instant a writer existed.
+    /// Populated by the
+    /// [`EconomyCommand::RevokeSpendingUcan`](crate::context::actor::commands::EconomyCommand)
+    /// handler (dispatched from the FFI `ucan_revoke` path via
+    /// [`Supervisor::revoke_spending_ucan`](crate::context::supervisor::Supervisor::revoke_spending_ucan)
+    /// when the revoked token is a spending UCAN, spec §19.5). Persisting it
+    /// makes the revocation crash-safe BY CONSTRUCTION (Class S) — the mutation
+    /// is written through a fail-closed persist combinator and this snapshot
+    /// field carries it across a respawn; the prior code reset it to empty on
+    /// every restore, which would silently drop revocations the instant a
+    /// writer existed.
     #[serde(default, with = "scp_protocol::serde_util::serde_sorted_set")]
     pub revoked_spending_ucan_cids: HashSet<String>,
     /// Persistent MLS Commit broadcast retry queue (PR #1606 C6).
@@ -1293,12 +1296,15 @@ pub(crate) struct GovernanceState {
     ///
     /// Consulted by `enforce_economy` via the
     /// [`super::economy::ContextRevocationChecker`] adapter when validating
-    /// spending UCANs through the full cryptographic pipeline. Currently
-    /// empty in steady state — spending UCAN revocation lists have not been
-    /// wired through governance — but the field exists so the only change
-    /// required when revocation lands is populating it (no enforcement
-    /// rewrite needed). The set is part of the governance bucket because
-    /// revocation actions are governance-driven (§19.5).
+    /// spending UCANs through the full cryptographic pipeline. Populated by the
+    /// [`EconomyCommand::RevokeSpendingUcan`](crate::context::actor::commands::EconomyCommand)
+    /// handler (dispatched from the FFI `ucan_revoke` path via
+    /// [`Supervisor::revoke_spending_ucan`](crate::context::supervisor::Supervisor::revoke_spending_ucan)
+    /// when the revoked token is a spending UCAN): the revocation CID is
+    /// inserted here and persisted fail-closed (spec §19.5). This set — NOT the
+    /// general FFI `RevocationList` — is the authoritative paid-action gate. It
+    /// is part of the governance bucket because revocation actions are
+    /// governance-driven (§19.5).
     ///
     /// ADR-049 §9 classifies this revocation set as **Class S**: a coalesce-window
     /// rollback of a revocation would re-admit a spending UCAN the caller observed

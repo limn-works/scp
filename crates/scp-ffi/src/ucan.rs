@@ -756,6 +756,28 @@ impl crate::scp::PyScp {
             .map_err(ScpPyError::from)
         })?;
 
+        // Spec §19.5: when the revoked token is a spending UCAN, its revocation
+        // must ALSO reach the owning context actor's Class-S
+        // `revoked_spending_ucan_cids` set — the authoritative paid-action gate
+        // consulted by `validate_spending_ucan_signed`. The `RevocationList`
+        // written above only gates the general `validate_ucan` presentation
+        // boundaries; without this second write a revoked spending UCAN would
+        // keep authorizing payments. Non-spending tokens are unaffected (they
+        // touch only the `RevocationList`, as before).
+        if scp_core::crypto::ucan::spending::is_spending_ucan(&parsed) {
+            use pyo3::exceptions::PyRuntimeError;
+
+            let rt = crate::runtime()?;
+            let sup = crate::runtime::supervisor(bi)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+                .clone();
+            let revoked_cid = scp_core::crypto::ucan::revoke::compute_revocation_cid(token);
+            let ctx = context_id.to_owned();
+            let revoker = revoker_did.to_owned();
+            rt.block_on(async move { sup.revoke_spending_ucan(&ctx, revoked_cid, revoker).await })
+                .map_err(ScpPyError::from)?;
+        }
+
         Ok(())
     }
 }

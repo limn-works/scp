@@ -13,7 +13,14 @@
 //! - **24-hour maximum expiry**: Spending UCANs follow the existing UCAN expiry
 //!   rules (spec section 9.5). Short-lived by design to limit blast radius.
 //! - **Independent revocation**: Spending UCANs are revoked via the standard
-//!   revocation mechanism (spec section 7.4.4) without affecting other UCANs.
+//!   UCAN revocation mechanism (spec section 7.2; per-context `RevocationList`
+//!   resolution in `00-open-questions` "UCAN revocation mechanism", ADR-016
+//!   acceptance criteria 5/7) without affecting other UCANs. Because the
+//!   paid-action gate validates through [`validate_spending_ucan_signed`]
+//!   against a context-actor Class-S revocation set — NOT the general
+//!   `RevocationList` — the revoke path additionally carries a spending UCAN's
+//!   revocation CID into that Class-S set (spec section 19.5). Use
+//!   [`is_spending_ucan`] to detect a spending UCAN at revoke time.
 //! - **Budget tracking**: Rolling window tracking of cumulative spending against
 //!   `max_total`.
 //!
@@ -336,6 +343,33 @@ impl SpendingCapability {
             can: SPENDING_ACTION.to_owned(),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Spending UCAN detection
+// ---------------------------------------------------------------------------
+
+/// Returns `true` iff `token` is a spending UCAN — i.e. it carries a spending
+/// attestation (`with` beginning `scp:spending:` and `can == "spend"`).
+///
+/// This is the authoritative structural marker used to distinguish a spending
+/// UCAN from any other UCAN. It mirrors step 1 of [`validate_spending_ucan`]
+/// (which locates the same attestation) but is a cheap, signature-free
+/// predicate: it inspects only the parsed attestations, performing NO
+/// cryptographic verification. Callers that need a trustworthy spending UCAN
+/// must still validate via [`validate_spending_ucan_signed`]; this predicate is
+/// for *routing* decisions such as "is the token being revoked a spending
+/// UCAN?" (spec §19.5) where a purely structural classification is correct —
+/// a forged token that merely *claims* a spending attestation is still, by
+/// classification, a spending UCAN, and routing its revocation CID into the
+/// paid-action gate is harmless (it can only reject, never grant).
+#[must_use]
+pub fn is_spending_ucan(token: &UcanToken) -> bool {
+    token
+        .payload
+        .att
+        .iter()
+        .any(|att| att.with.starts_with(SPENDING_URI_PREFIX) && att.can == SPENDING_ACTION)
 }
 
 // ---------------------------------------------------------------------------
@@ -1364,6 +1398,79 @@ mod tests {
         let global = SpendingScope::Global;
         assert!(global.covers_context("ctx123"));
         assert!(global.covers_context("any-context"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Spending UCAN detection (is_spending_ucan)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn is_spending_ucan_detects_context_scoped_spending_token() {
+        let token = make_spending_token(&sample_capability(), "scp:spending:ctx123");
+        assert!(
+            is_spending_ucan(&token),
+            "a token with a scp:spending:{{ctx}} / spend attestation is a spending UCAN"
+        );
+    }
+
+    #[test]
+    fn is_spending_ucan_detects_global_spending_token() {
+        let token = make_spending_token(&sample_capability(), "scp:spending:*");
+        assert!(
+            is_spending_ucan(&token),
+            "a token with a global scp:spending:* / spend attestation is a spending UCAN"
+        );
+    }
+
+    #[test]
+    fn is_spending_ucan_rejects_non_spending_token() {
+        // An ordinary action UCAN (e.g. messages:write) carries no spending
+        // attestation and must NOT be classified as a spending UCAN — the
+        // `ucan_revoke` path must leave its actor gate untouched.
+        let token = UcanToken {
+            header: super::super::UcanHeader::new(),
+            payload: UcanPayload {
+                iss: "did:dht:z6MkHuman".to_owned(),
+                aud: "did:dht:z6MkAgent".to_owned(),
+                exp: 1_700_000_000,
+                nbf: None,
+                nnc: "1699999000000-aabbccdd11223344".to_owned(),
+                att: vec![Attenuation {
+                    with: "scp:ctx:abc123/messages".to_owned(),
+                    can: "write".to_owned(),
+                }],
+                prf: vec![],
+                fct: None,
+            },
+            signature: vec![0u8; 64],
+            encoded: String::new(),
+        };
+        assert!(!is_spending_ucan(&token));
+    }
+
+    #[test]
+    fn is_spending_ucan_rejects_spending_prefix_wrong_action() {
+        // A `scp:spending:` resource with a NON-`spend` action is not a spending
+        // capability — both the prefix and the action must match.
+        let token = UcanToken {
+            header: super::super::UcanHeader::new(),
+            payload: UcanPayload {
+                iss: "did:dht:z6MkHuman".to_owned(),
+                aud: "did:dht:z6MkAgent".to_owned(),
+                exp: 1_700_000_000,
+                nbf: None,
+                nnc: "1699999000000-aabbccdd11223344".to_owned(),
+                att: vec![Attenuation {
+                    with: "scp:spending:ctx123".to_owned(),
+                    can: "read".to_owned(),
+                }],
+                prf: vec![],
+                fct: None,
+            },
+            signature: vec![0u8; 64],
+            encoded: String::new(),
+        };
+        assert!(!is_spending_ucan(&token));
     }
 
     // -----------------------------------------------------------------------

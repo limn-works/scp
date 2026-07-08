@@ -2449,6 +2449,67 @@ fn uniffi_ucan_evaluate_routes_to_core_evaluate_ucan() {
     );
 }
 
+/// Spec §19.5 (paid-action revocation gap): when the revoked token is a
+/// spending UCAN, each bridge's `ucan_revoke` path MUST — in addition to the
+/// general `RevocationList` write — carry the revocation CID into the context
+/// actor's Class-S `revoked_spending_ucan_cids` gate via
+/// `Supervisor::revoke_spending_ucan`. That Class-S set (NOT the `RevocationList`)
+/// is the ONLY store `validate_spending_ucan_signed` consults, so a bridge that
+/// dropped this second write would leave a revoked spending UCAN still able to
+/// authorize payments. Detection MUST go through the shared
+/// `spending::is_spending_ucan` predicate so all bridges classify identically.
+///
+/// These assertions pin the bridge wiring: the runtime path is covered by
+/// `revoke_spending_ucan_populates_gate_and_rejects_subsequent_spend` in
+/// `supervisor.rs`, but that test calls the Supervisor method directly and would
+/// NOT catch a bridge silently dropping the dispatch. Mirrors the `c4_*`
+/// spending-UCAN wiring assertions for `tool_invoke`.
+#[test]
+fn pyo3_ucan_revoke_wires_spending_ucan_actor_gate() {
+    let body =
+        extract_fn_body(PYO3_UCAN_SRC, "ucan_revoke").expect("PyO3 ucan_revoke body must exist");
+    assert!(
+        body.contains("is_spending_ucan"),
+        "PyO3 ucan_revoke must detect a spending UCAN via is_spending_ucan (spec §19.5)"
+    );
+    assert!(
+        body.contains("revoke_spending_ucan"),
+        "PyO3 ucan_revoke must carry a revoked spending UCAN's CID into the actor \
+         Class-S gate via Supervisor::revoke_spending_ucan (spec §19.5). Without \
+         it, a revoked spending UCAN keeps authorizing paid actions."
+    );
+}
+
+#[test]
+fn napi_ucan_revoke_wires_spending_ucan_actor_gate() {
+    let body = extract_fn_body(NAPI_UCAN_SRC, "ucan_revoke_on")
+        .expect("NAPI ucan_revoke_on body must exist");
+    assert!(
+        body.contains("is_spending_ucan"),
+        "NAPI ucan_revoke_on must detect a spending UCAN via is_spending_ucan (spec §19.5)"
+    );
+    assert!(
+        body.contains("revoke_spending_ucan"),
+        "NAPI ucan_revoke_on must carry a revoked spending UCAN's CID into the actor \
+         Class-S gate via Supervisor::revoke_spending_ucan (spec §19.5)."
+    );
+}
+
+#[test]
+fn uniffi_ucan_revoke_wires_spending_ucan_actor_gate() {
+    let body = extract_fn_body(UNIFFI_BRIDGE_SRC, "ucan_revoke")
+        .expect("UniFFI ucan_revoke body must exist");
+    assert!(
+        body.contains("is_spending_ucan"),
+        "UniFFI ucan_revoke must detect a spending UCAN via is_spending_ucan (spec §19.5)"
+    );
+    assert!(
+        body.contains("revoke_spending_ucan"),
+        "UniFFI ucan_revoke must carry a revoked spending UCAN's CID into the actor \
+         Class-S gate via Supervisor::revoke_spending_ucan (spec §19.5)."
+    );
+}
+
 /// The shared `Supervisor::participation_record` method MUST derive the record
 /// via the pure-core `compute_participation_record` over the FULL event log —
 /// not re-implement participation accounting in the runtime. This is the

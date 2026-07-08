@@ -14896,6 +14896,23 @@ impl Scp {
                     code: codes::PERM_3006.to_owned(),
                 })??;
 
+                // Spec §19.5: when the revoked token is a spending UCAN, its
+                // revocation must ALSO reach the owning context actor's Class-S
+                // `revoked_spending_ucan_cids` set — the authoritative
+                // paid-action gate consulted by `validate_spending_ucan_signed`.
+                // The `RevocationList` written above only gates the general
+                // `validate_ucan` presentation boundaries; without this second
+                // write a revoked spending UCAN would keep authorizing payments.
+                // Non-spending tokens are unaffected.
+                if scp_core::crypto::ucan::spending::is_spending_ucan(&parsed) {
+                    let sup = bi.context_manager_or_error()?;
+                    let revoked_cid =
+                        scp_core::crypto::ucan::revoke::compute_revocation_cid(&token);
+                    sup.revoke_spending_ucan(&handle.context_id, revoked_cid, revoker_did)
+                        .await
+                        .map_err(ScpError::from)?;
+                }
+
                 Ok(())
             })
             .await

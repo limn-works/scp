@@ -115,11 +115,11 @@ impl DidResolver for KeyResolverDidResolver<'_> {
 /// Per-context revocation checker for spending UCANs.
 ///
 /// Backed by an immutable borrow of the per-context `revoked_spending_ucan_cids`
-/// set. The set is empty in the current build — spending UCAN revocation lists
-/// have not yet been wired through governance — but the trait surface is
-/// real, so when revocation lands the only change required is populating the
-/// set. This is the opposite of a stub: it is the empty case of a real
-/// integration.
+/// set. That set is populated by the
+/// [`EconomyCommand::RevokeSpendingUcan`](crate::context::actor::commands::EconomyCommand)
+/// handler when a spending UCAN is revoked via the FFI `ucan_revoke` path (spec
+/// §19.5): the revocation CID is inserted and persisted fail-closed, after
+/// which this checker rejects any subsequent spend presenting that token.
 ///
 /// `pub(crate)` so the cross-context tool-invocation saga handler reuses the
 /// SAME per-context revocation surface for its §7 UCAN re-validation (spec

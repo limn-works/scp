@@ -660,7 +660,6 @@ pub(crate) async fn ucan_delegate_on(
 }
 
 /// Per-bridge-instance implementation of [`ucan_revoke`].
-#[allow(clippy::unused_async)] // napi-rs requires async for Promise return
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
 pub(crate) async fn ucan_revoke_on(
     bi: &NapiBridgeInstance,
@@ -704,6 +703,21 @@ pub(crate) async fn ucan_revoke_on(
         Ok(())
     })
     .map_err(napi::Error::from)?;
+
+    // Spec §19.5: when the revoked token is a spending UCAN, its revocation must
+    // ALSO reach the owning context actor's Class-S `revoked_spending_ucan_cids`
+    // set — the authoritative paid-action gate consulted by
+    // `validate_spending_ucan_signed`. The `RevocationList` written above only
+    // gates the general `validate_ucan` presentation boundaries; without this
+    // second write a revoked spending UCAN would keep authorizing payments.
+    // Non-spending tokens are unaffected (they touch only the `RevocationList`).
+    if scp_core::crypto::ucan::spending::is_spending_ucan(&parsed) {
+        let sup = crate::runtime::supervisor(bi)?;
+        let revoked_cid = scp_core::crypto::ucan::revoke::compute_revocation_cid(&token);
+        sup.revoke_spending_ucan(&context_id, revoked_cid, revoker_did)
+            .await
+            .map_err(ScpNapiError::from)?;
+    }
 
     Ok(())
 }

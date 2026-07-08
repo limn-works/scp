@@ -1809,6 +1809,36 @@ pub enum EconomyCommand {
         /// Oneshot reply channel. See [`VerifyPaymentReceiptsReply`].
         reply: VerifyPaymentReceiptsReply,
     },
+
+    /// Carries a revoked spending UCAN's revocation CID into the context
+    /// actor's Class-S `revoked_spending_ucan_cids` set — the authoritative
+    /// paid-action authorization gate (spec §19.5). Dispatched by the FFI
+    /// `ucan_revoke` path when the revoked token is a spending UCAN, in
+    /// addition to the general per-context `RevocationList` write.
+    ///
+    /// Mutating and **fail-closed**: the handler inserts the CID through a
+    /// Class-S persist-on-commit combinator (the insertion is persisted
+    /// before the revocation is acknowledged — a coalesce-window rollback
+    /// would re-admit a spending UCAN the human observed as revoked) and
+    /// emits an
+    /// [`EventType::SpendingUcanRevoked`](scp_event_log::EventType::SpendingUcanRevoked)
+    /// leaf (§19.6.1). See
+    /// [`handlers::economy`](crate::context::actor::handlers::economy).
+    RevokeSpendingUcan {
+        /// Target context whose actor owns the paid-action gate.
+        context_id: String,
+        /// SHA-256 revocation CID of the encoded spending UCAN — identical
+        /// to the CID the gate computes via `compute_revocation_cid`.
+        revoked_cid: String,
+        /// DID that initiated the revocation (the token issuer or context
+        /// creator, already authorized by the `ucan_revoke` path). Stamped
+        /// as the leaf `actor_did`.
+        revoker_did: String,
+        /// Oneshot reply channel. `Ok(())` once the CID is durably in the
+        /// Class-S set and the leaf is appended; `Err` on persist or append
+        /// failure (fail-closed — the in-memory revocation is retained).
+        reply: oneshot::Sender<Result<(), ContextError>>,
+    },
 }
 
 /// Payload for [`TrustRecoveryCommand::CreateGovernanceCheckpoint`].

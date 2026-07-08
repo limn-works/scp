@@ -178,6 +178,25 @@ pub struct AccessRevokedPayload {
 }
 
 /// Payload for
+/// [`EventType::SpendingUcanRevoked`](crate::EventType::SpendingUcanRevoked)
+/// (spec §19.5, §19.6.1).
+///
+/// Emitted when a spending UCAN is revoked and its revocation CID is carried
+/// into the context actor's Class-S `revoked_spending_ucan_cids` paid-action
+/// gate. `token_cid` is the SHA-256 revocation CID of the encoded token (the
+/// same CID `compute_revocation_cid` produces and the gate checks) — the
+/// canonical identifier under which the token is recorded as revoked, matching
+/// the `token_cid` field of the general `TokenRevoked` leaf. The revoker DID and
+/// commit timestamp are carried as the leaf's `actor_did`/timestamp, not in this
+/// payload. Like `TokenRevoked`, the standard revoke path carries no free-text
+/// reason (§19.6.1).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpendingUcanRevokedPayload {
+    /// The SHA-256 revocation CID of the revoked spending UCAN.
+    pub token_cid: String,
+}
+
+/// Payload for
 /// [`EventType::GovernanceActionExecuted`](crate::EventType::GovernanceActionExecuted)
 /// (ADR-031 §8; PRD SCP-269/SCP-270).
 ///

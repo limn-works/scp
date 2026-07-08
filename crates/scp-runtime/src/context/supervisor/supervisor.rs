@@ -3246,6 +3246,9 @@ impl Supervisor {
                 }
                 Some(first_str)
             }
+            // A spending-UCAN revocation always targets one named context
+            // (the actor that owns the Class-S paid-action gate).
+            EconomyCommand::RevokeSpendingUcan { context_id, .. } => Some(context_id.as_str()),
         }
     }
 
@@ -3319,7 +3322,83 @@ impl Supervisor {
                 // Verify payment receipts is a pure read — mutated=false.
                 Outcome::ok(())
             }
+            EconomyCommand::RevokeSpendingUcan {
+                context_id, reply, ..
+            } => {
+                // A spending-UCAN revocation is a Class-S mutation of the owning
+                // context actor's `revoked_spending_ucan_cids` gate — it has NO
+                // actor-less execution path. Reaching the direct dispatch means
+                // no actor is registered for `context_id`, so the revocation
+                // cannot be persisted into the gate. Fail closed: surface the
+                // error rather than silently acknowledging a revocation that
+                // never reached the paid-action authorization set (which would
+                // leave the token still able to authorize spending).
+                let _ = reply.send(Err(self.lookup_miss_error(
+                    &context_id,
+                    format!(
+                        "revoke_spending_ucan — no actor registered for context_id `{context_id}`; \
+                         spending-UCAN revocation cannot be applied to the paid-action gate"
+                    ),
+                )));
+                Outcome::ok(())
+            }
         }
+    }
+
+    /// Carry a revoked spending UCAN's revocation CID into its context actor's
+    /// Class-S `revoked_spending_ucan_cids` set — the authoritative paid-action
+    /// authorization gate (spec §19.5) — and emit the convergent
+    /// [`SpendingUcanRevoked`](scp_event_log::EventType::SpendingUcanRevoked)
+    /// leaf (§19.6.1).
+    ///
+    /// This is the ContextManager-surface entry point the FFI `ucan_revoke`
+    /// bridges call, in addition to the general per-context `RevocationList`
+    /// write, whenever the revoked token is a spending UCAN
+    /// ([`scp_protocol::crypto::ucan::spending::is_spending_ucan`]). The two
+    /// stores are disjoint: the `RevocationList` gates the general
+    /// `validate_ucan` presentation boundaries, while this Class-S set is the
+    /// ONLY store the paid-action pipeline (`validate_spending_ucan_signed`)
+    /// consults — so a spending UCAN's revocation MUST reach here or it keeps
+    /// authorizing payments.
+    ///
+    /// The mutation is applied through the per-context actor and persisted
+    /// **fail-closed** (a coalesce-window rollback would re-admit a token the
+    /// human observed as revoked). Insertion is idempotent — re-revoking the
+    /// same CID is a no-op.
+    ///
+    /// # Arguments
+    ///
+    /// * `context_id` — the context whose actor owns the paid-action gate.
+    /// * `revoked_cid` — the SHA-256 revocation CID of the encoded spending
+    ///   UCAN (`compute_revocation_cid`), identical to the CID the gate checks.
+    /// * `revoker_did` — the DID that initiated the revocation (already
+    ///   authorized by the `ucan_revoke` path); stamped as the leaf `actor_did`.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::ContextNotRegistered`] if no actor is registered for
+    ///   `context_id` (fail-closed — the revocation could not be applied).
+    /// - [`ContextError::PersistenceFailed`] / [`ContextError::EventLogFailed`]
+    ///   if the durable persist of the gate mutation or the leaf append fails.
+    pub async fn revoke_spending_ucan(
+        &self,
+        context_id: &str,
+        revoked_cid: String,
+        revoker_did: String,
+    ) -> Result<(), ContextError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = EconomyCommand::RevokeSpendingUcan {
+            context_id: context_id.to_owned(),
+            revoked_cid,
+            revoker_did,
+            reply: tx,
+        };
+        self.dispatch_economy_command(cmd).await?;
+        rx.await.map_err(|e| {
+            ContextError::ContextNotRegistered(format!(
+                "revoke_spending_ucan: actor reply channel dropped for context `{context_id}`: {e}"
+            ))
+        })?
     }
 
     /// Dispatch a [`TrustRecoveryCommand`] to its per-context actor's mailbox
@@ -17928,10 +18007,13 @@ mod tests {
     }
 
     /// ADR-049 §9 Class S: a spending-UCAN revocation MUST survive a crash
-    /// before any coalesce. The revocation set is now a persisted snapshot
-    /// field (it was previously reset to empty on every restore — a silent
+    /// before any coalesce. The revocation set is a persisted snapshot field
+    /// (it was previously reset to empty on every restore — a silent
     /// downward-authorization rollback the instant a writer existed). A respawn
-    /// that dropped it would re-admit a revoked token.
+    /// that dropped it would re-admit a revoked token. This test seeds the set
+    /// directly and asserts snapshot durability; the companion test
+    /// [`revoke_spending_ucan_populates_gate_and_rejects_subsequent_spend`]
+    /// exercises the real `Supervisor::revoke_spending_ucan` write path.
     #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn spending_ucan_revocation_survives_crash_before_coalesce() {
@@ -17953,8 +18035,9 @@ mod tests {
             .transition_to(&crate::context::ContextState::Active)
             .unwrap();
 
-        // Add a revoked CID (the mutation a future revocation handler will
-        // perform), then sync-persist fail-closed.
+        // Seed a revoked CID directly (this test isolates snapshot durability;
+        // the real write path is covered by the companion test), then
+        // sync-persist fail-closed.
         let revoked_cid = "bafyRevokedSpendingUcanCid".to_owned();
         state
             .governance
@@ -17990,6 +18073,106 @@ mod tests {
             snap.revoked_spending_ucan_cids.contains(&revoked_cid),
             "crash+respawn must NOT drop the spending-UCAN revocation"
         );
+    }
+
+    /// Spec §19.5 (the paid-action revocation gap this closes): the real
+    /// [`Supervisor::revoke_spending_ucan`] path — the ContextManager entry
+    /// point the FFI `ucan_revoke` bridges call when the revoked token is a
+    /// spending UCAN — carries the token's revocation CID into the context
+    /// actor's Class-S `revoked_spending_ucan_cids` gate, persists it
+    /// fail-closed, and the gate's `ContextRevocationChecker` (the SAME adapter
+    /// `validate_spending_ucan_signed` step F consults) then reports the token
+    /// revoked. Before this wiring the set was never populated, so the checker
+    /// always returned `false` and a "revoked" spending UCAN kept authorizing
+    /// spends — the security gap. The assertions below fail on the pre-fix code
+    /// (empty set ⇒ `is_revoked == false` after revocation).
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn revoke_spending_ucan_populates_gate_and_rejects_subsequent_spend() {
+        use scp_protocol::crypto::ucan::revoke::compute_revocation_cid;
+        use scp_protocol::crypto::ucan::validate::RevocationChecker;
+
+        let clock_dyn: Arc<dyn Clock> = Arc::new(TestClock::new(1_700_000_000));
+        let persistence = MapPersistence::default();
+        let sup = supervisor_with_clock_and_persistence(clock_dyn, Box::new(persistence.clone()));
+
+        let ctx_id_bytes = [0xDBu8; 32];
+        let ctx_key = hex::encode(ctx_id_bytes);
+        let admin = DID("did:example:spend-revoke-admin".to_owned());
+        let revoker_did = "did:example:spend-revoke-admin".to_owned();
+
+        let state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+            ctx_id_bytes,
+            1_700_000_000,
+            admin,
+        );
+        state
+            .handle
+            .transition_to(&crate::context::ContextState::Active)
+            .unwrap();
+        let deps = test_actor_deps(&sup).await;
+        // Persist the initial (empty-gate) snapshot so the baseline load below
+        // observes the actor's genuine starting state before any revocation.
+        crate::context::messaging_helpers::persist_state_fail_closed(&state, &deps, &ctx_key)
+            .await
+            .expect("initial fail-closed persist must succeed");
+        let _handle = sup
+            .spawn_actor_with_state(state, deps, None)
+            .await
+            .expect("spawn registers");
+
+        // A spending UCAN's revocation CID — the exact identifier
+        // `validate_spending_ucan_signed` step F computes over the encoded JWT.
+        let revoked_cid = compute_revocation_cid("hdr.spending-ucan-payload.sig");
+
+        // BEFORE: the durable gate set is empty, so a spend presenting this
+        // token passes the revocation check (the pre-fix steady state).
+        let before = persistence
+            .load_context(&ctx_key)
+            .await
+            .expect("load")
+            .expect("snapshot present after initial persist");
+        assert!(
+            !crate::context::economy_logic::ContextRevocationChecker {
+                revoked_cids: &before.revoked_spending_ucan_cids,
+            }
+            .is_revoked(&revoked_cid),
+            "baseline: an un-revoked spending UCAN must pass the revocation check"
+        );
+
+        // Revoke via the real ContextManager path the bridges call.
+        sup.revoke_spending_ucan(&ctx_key, revoked_cid.clone(), revoker_did)
+            .await
+            .expect("revoke_spending_ucan must succeed against a live actor");
+
+        // AFTER: the CID is durably in the Class-S gate set, and the gate's
+        // ContextRevocationChecker now reports the token revoked → a subsequent
+        // spend is REJECTED.
+        let after = persistence
+            .load_context(&ctx_key)
+            .await
+            .expect("load")
+            .expect("snapshot present after revoke");
+        assert!(
+            after.revoked_spending_ucan_cids.contains(&revoked_cid),
+            "revoke_spending_ucan must persist the CID into revoked_spending_ucan_cids"
+        );
+        assert!(
+            crate::context::economy_logic::ContextRevocationChecker {
+                revoked_cids: &after.revoked_spending_ucan_cids,
+            }
+            .is_revoked(&revoked_cid),
+            "after revocation the paid-action gate must reject the spending UCAN"
+        );
+
+        // Idempotent: re-revoking the same CID is a no-op and still succeeds.
+        sup.revoke_spending_ucan(
+            &ctx_key,
+            revoked_cid.clone(),
+            "did:example:spend-revoke-admin".to_owned(),
+        )
+        .await
+        .expect("re-revoking the same CID must be idempotent");
     }
 
     /// A lifecycle close transitions the context to `Closing` and

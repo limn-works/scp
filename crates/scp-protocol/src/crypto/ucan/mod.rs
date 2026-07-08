@@ -50,7 +50,7 @@ use serde::{Deserialize, Serialize};
 pub use capability::CapabilityUri;
 pub use spending::{
     Amount, BudgetTracker, CurrencyCode, DEFAULT_SPENDING_KEY_SCOPE, MintSpendingParams,
-    SpendingCapability, SpendingError, SpendingScope,
+    SpendingCapability, SpendingError, SpendingScope, is_spending_ucan,
 };
 
 // ---------------------------------------------------------------------------
