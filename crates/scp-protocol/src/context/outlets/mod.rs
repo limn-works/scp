@@ -11,8 +11,8 @@
 //!
 //! # Modules
 //!
-//! - [`registry`] -- Tool registration storage, `register_tool`, `update_tool`,
-//!   `verify_tool`.
+//! - [`registry`] -- Tool registration storage, `register_outlet`, `update_outlet`,
+//!   `verify_outlet`.
 //! - [`schema`] -- JSON Schema validation helpers and MCP compatibility.
 //! - `invoke` (in `scp-runtime`) -- Tool invocation with full execution lifecycle:
 //!   capability checking, schema validation, timeout, cancellation.
@@ -21,26 +21,26 @@
 //!
 //! # Types
 //!
-//! - [`ToolId`] -- Unique identifier for a registered tool.
-//! - [`ToolError`] -- Error type for tool operations.
-//! - [`ToolRegistration`] -- Full tool registration with schema, hash, test
+//! - [`OutletId`] -- Unique identifier for a registered tool.
+//! - [`OutletError`] -- Error type for tool operations.
+//! - [`OutletRegistration`] -- Full tool registration with schema, hash, test
 //!   vectors, and operator DID. (Re-exported from [`registry`].)
-//! - [`ToolSchema`] -- MCP-compatible JSON Schema for input/output.
+//! - [`OutletSchema`] -- MCP-compatible JSON Schema for input/output.
 //!   (Re-exported from [`registry`].)
-//! - [`TestVector`] -- Known input-output pair for tool verification.
+//! - [`OutletTestVector`] -- Known input-output pair for tool verification.
 //!   (Re-exported from [`registry`].)
-//! - [`ToolRegistry`] -- In-memory tool storage per context.
+//! - [`OutletRegistry`] -- In-memory tool storage per context.
 //!   (Re-exported from [`registry`].)
-//! - [`ToolRequest`] -- Tool invocation request. (Re-exported from
+//! - [`OutletRequest`] -- Tool invocation request. (Re-exported from
 //!   [`lifecycle`].)
-//! - [`ToolResponse`] -- Tool invocation response. (Re-exported from
+//! - [`OutletResponse`] -- Tool invocation response. (Re-exported from
 //!   [`lifecycle`].)
-//! - [`ToolStatus`] -- Invocation terminal status. (Re-exported from
+//! - [`OutletStatus`] -- Invocation terminal status. (Re-exported from
 //!   [`lifecycle`].)
-//! - [`ToolExecutionError`] -- Structured execution error. (Re-exported from
+//! - [`OutletExecutionError`] -- Structured execution error. (Re-exported from
 //!   [`lifecycle`].)
-//! - [`ToolErrorCode`] -- Error code enum. (Re-exported from [`lifecycle`].)
-//! - [`ToolCancel`] -- Cancellation request. (Re-exported from [`lifecycle`].)
+//! - [`OutletErrorCode`] -- Error code enum. (Re-exported from [`lifecycle`].)
+//! - [`OutletCancel`] -- Cancellation request. (Re-exported from [`lifecycle`].)
 
 pub mod cross_context_saga;
 pub mod integrity;
@@ -53,40 +53,40 @@ pub mod summary;
 use crate::context::roles;
 
 pub use cross_context_saga::{
-    CommittedSide, CrossContextDivergenceMarker, CrossContextSagaError, CrossContextToolReceipt,
+    CommittedSide, CrossContextDivergenceMarker, CrossContextOutletReceipt, CrossContextSagaError,
     XCTX_DIVERGENCE_DOMAIN, XCTX_RECEIPT_DOMAIN,
 };
 pub use lifecycle::{
-    DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS, Provenance, ToolCancel, ToolErrorCode, ToolExecutionError,
-    ToolInvokedEvent, ToolRequest, ToolResponse, ToolStatus, sha256_json,
+    DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS, OutletCancel, OutletErrorCode, OutletExecutionError,
+    OutletInvokedEvent, OutletRequest, OutletResponse, OutletStatus, Provenance, sha256_json,
 };
 pub use registry::{
-    TestVector, ToolCost, ToolRegistration, ToolRegistry, ToolSchema, ToolVerificationResult,
-    VectorResult, register_tool, update_tool, verify_tool,
+    OutletCost, OutletRegistration, OutletRegistry, OutletSchema, OutletTestVector,
+    OutletVerificationResult, VectorResult, register_outlet, update_outlet, verify_outlet,
 };
 pub use schema::{SchemaValidationError, validate_schema, validate_value_against_schema};
 
 // ---------------------------------------------------------------------------
-// ToolId
+// OutletId
 // ---------------------------------------------------------------------------
 
 /// Unique identifier for a registered tool within a context.
 ///
-/// Matches the `ToolId` type alias in `context::roles`, re-defined here for
+/// Matches the `OutletId` type alias in `context::roles`, re-defined here for
 /// module-local clarity. These are the same underlying type (`String`).
-pub type ToolId = String;
+pub type OutletId = String;
 
 use scp_did::DID;
 
 // ---------------------------------------------------------------------------
-// ToolError
+// OutletError
 // ---------------------------------------------------------------------------
 
 /// Errors produced by tool registration, update, and verification operations.
 ///
 /// See ADR-010 for error conditions.
 #[derive(Debug, thiserror::Error)]
-pub enum ToolError {
+pub enum OutletError {
     /// The registrant does not have the `ToolRegister` capability.
     #[error("registrant \"{did}\" does not have ToolRegister capability")]
     RegistrantNotAuthorized {
@@ -124,26 +124,26 @@ pub enum ToolError {
     },
 
     /// The specified tool was not found in the registry.
-    #[error("tool not found: \"{tool_id}\"")]
-    ToolNotFound {
+    #[error("tool not found: \"{outlet_id}\"")]
+    OutletNotFound {
         /// The tool ID that was not found.
-        tool_id: ToolId,
+        outlet_id: OutletId,
     },
 
     /// The tool ID in the new registration does not match the existing tool.
     #[error("tool ID mismatch: expected \"{expected}\", got \"{actual}\"")]
     ToolIdMismatch {
         /// The expected tool ID.
-        expected: ToolId,
+        expected: OutletId,
         /// The actual tool ID provided.
-        actual: ToolId,
+        actual: OutletId,
     },
 
     /// A tool with this ID is already registered.
-    #[error("tool already registered: \"{tool_id}\"")]
+    #[error("tool already registered: \"{outlet_id}\"")]
     ToolAlreadyRegistered {
         /// The duplicate tool ID.
-        tool_id: ToolId,
+        outlet_id: OutletId,
     },
 
     /// A test vector verification failed.
@@ -161,12 +161,12 @@ pub enum ToolError {
     },
 
     /// The invoker does not have the required capability.
-    #[error("invoker \"{did}\" not authorized for tool \"{tool_id}\"")]
+    #[error("invoker \"{did}\" not authorized for tool \"{outlet_id}\"")]
     InvokerNotAuthorized {
         /// The DID that attempted invocation.
         did: String,
         /// The tool ID.
-        tool_id: String,
+        outlet_id: String,
     },
 
     /// Input validation against the tool schema failed.
@@ -216,12 +216,12 @@ pub enum ToolError {
     },
 
     /// The invoker is not authorized for this cross-context interface.
-    #[error("invoker \"{did}\" not authorized for cross-context tool \"{tool_id}\"")]
+    #[error("invoker \"{did}\" not authorized for cross-context tool \"{outlet_id}\"")]
     InterfaceInvokerNotAuthorized {
         /// The DID that attempted invocation.
         did: String,
         /// The tool ID.
-        tool_id: String,
+        outlet_id: String,
     },
 
     /// Cross-context interface rate limit exceeded.
@@ -290,7 +290,7 @@ pub enum ToolError {
 
     /// Tool registration signature verification failed (M15).
     ///
-    /// The `signature` field on a [`ToolRegistration`] is a Ed25519 signature
+    /// The `signature` field on a [`OutletRegistration`] is a Ed25519 signature
     /// over the canonical registration bytes. If the signature is non-empty,
     /// it MUST verify against the registrant's signing key.
     #[error("tool registration signature verification failed: {reason}")]
@@ -348,9 +348,9 @@ pub enum ToolError {
 /// Captures the full registration metadata for auditability. Serialized into
 /// the opaque `EventPayload::data` field.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct ToolRegisteredEvent {
+pub struct OutletRegisteredEvent {
     /// The registered tool's ID.
-    pub tool_id: ToolId,
+    pub outlet_id: OutletId,
     /// The tool name.
     pub name: String,
     /// The tool description.
@@ -369,9 +369,9 @@ pub struct ToolRegisteredEvent {
 ///
 /// Records old and new implementation hashes and all changed fields.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct ToolUpdatedEvent {
+pub struct OutletUpdatedEvent {
     /// The updated tool's ID.
-    pub tool_id: ToolId,
+    pub outlet_id: OutletId,
     /// The old implementation hash before the update.
     pub old_implementation_hash: [u8; 32],
     /// The new implementation hash after the update.
@@ -389,9 +389,9 @@ pub struct ToolUpdatedEvent {
 ///
 /// Records the verification result for auditability.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct ToolVerifiedEvent {
+pub struct OutletVerifiedEvent {
     /// The verified tool's ID.
-    pub tool_id: ToolId,
+    pub outlet_id: OutletId,
     /// Number of test vectors that passed.
     pub passed: usize,
     /// Number of test vectors that failed.
@@ -409,13 +409,13 @@ pub struct ToolVerifiedEvent {
 /// Delegates to the role system's capability check. This is the integration
 /// point between the tools module and the UCAN-based role system (ADR-009).
 #[must_use]
-pub fn has_tool_register_capability(role_state: &roles::ContextRoleState, did: &str) -> bool {
+pub fn has_outlet_register_capability(role_state: &roles::ContextRoleState, did: &str) -> bool {
     role_state.member_has_capability(did, &roles::Capability::ToolRegister)
 }
 
 /// Checks whether a member has admin-level capabilities.
 ///
-/// Used by `update_tool` to verify the updater is either the tool operator
+/// Used by `update_outlet` to verify the updater is either the tool operator
 /// or an admin.
 #[must_use]
 pub fn has_admin_role(role_state: &roles::ContextRoleState, did: &str) -> bool {
@@ -426,15 +426,15 @@ pub fn has_admin_role(role_state: &roles::ContextRoleState, did: &str) -> bool {
 
 /// Returns `true` if `did` has tool invocation capability for the given tool.
 ///
-/// Checks for `ToolInvokeAll` (broader) first, then specific `ToolInvoke(tool_id)`.
+/// Checks for `ToolInvokeAll` (broader) first, then specific `ToolInvoke(outlet_id)`.
 #[must_use]
-pub fn has_tool_invoke_capability(
+pub fn has_outlet_invoke_capability(
     role_state: &roles::ContextRoleState,
     did: &str,
-    tool_id: &str,
+    outlet_id: &str,
 ) -> bool {
     if role_state.member_has_capability(did, &roles::Capability::ToolInvokeAll) {
         return true;
     }
-    role_state.member_has_capability(did, &roles::Capability::ToolInvoke(tool_id.to_owned()))
+    role_state.member_has_capability(did, &roles::Capability::ToolInvoke(outlet_id.to_owned()))
 }

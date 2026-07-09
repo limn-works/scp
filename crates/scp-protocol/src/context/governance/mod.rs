@@ -55,9 +55,9 @@ use ed25519_dalek::Signer;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::params::{Capability, ContextParams, ToolRegistration};
-use super::roles::ToolId;
-use super::tools::interface::ToolInterface;
+use super::outlets::OutletId;
+use super::outlets::interface::OutletInterface;
+use super::params::{Capability, ContextParams, OutletRegistration};
 use crate::economy::antispam::HardRateLimitConfig;
 use crate::economy::types::{Amount, EconomicPolicy};
 use scp_did::{DID, SigningKeyId};
@@ -568,12 +568,12 @@ pub enum GovernanceAction {
     /// Register a new tool in the context.
     RegisterTool {
         /// The full tool registration descriptor.
-        registration: Box<ToolRegistration>,
+        registration: Box<OutletRegistration>,
     },
     /// Remove a tool from the context.
     RemoveTool {
         /// The identifier of the tool to remove.
-        tool_id: ToolId,
+        outlet_id: OutletId,
     },
     /// Modify the capability ceiling (only if `ceiling_policy` is `Governed`).
     ModifyCeiling {
@@ -661,7 +661,7 @@ pub enum GovernanceAction {
     /// Establish a tool interface with another context (§6.2).
     EstablishToolInterface {
         /// The tool interface to establish.
-        interface: ToolInterface,
+        interface: OutletInterface,
     },
     /// Governance-triggered member reset (ADR-029, Tier 3).
     ///
@@ -2251,11 +2251,11 @@ mod tests {
                 new_role: "observer".to_owned(),
             },
             GovernanceAction::RegisterTool {
-                registration: Box::new(ToolRegistration {
-                    tool_id: "search".to_owned(),
+                registration: Box::new(OutletRegistration {
+                    outlet_id: "search".to_owned(),
                     name: "search".to_owned(),
                     description: "Search tool".to_owned(),
-                    schema: crate::context::tools::ToolSchema {
+                    schema: crate::context::outlets::OutletSchema {
                         input_schema: serde_json::json!({"type": "object"}),
                         output_schema: serde_json::json!({"type": "object"}),
                     },
@@ -2268,7 +2268,7 @@ mod tests {
                 }),
             },
             GovernanceAction::RemoveTool {
-                tool_id: "search".to_owned(),
+                outlet_id: "search".to_owned(),
             },
             GovernanceAction::ModifyCeiling {
                 new_ceiling: vec![Capability::MessagesRead],
@@ -2304,17 +2304,17 @@ mod tests {
     /// Extended governance actions (signers, interfaces, structural,
     /// content access, economic).
     fn governance_actions_extended() -> Vec<GovernanceAction> {
-        use crate::context::tools::interface::ToolInterface;
+        use crate::context::outlets::interface::OutletInterface;
 
         vec![
             GovernanceAction::AddSigner { did: carol() },
             GovernanceAction::RemoveSigner { did: carol() },
             GovernanceAction::ModifyThreshold { new_threshold: 2 },
             GovernanceAction::EstablishToolInterface {
-                interface: ToolInterface {
+                interface: OutletInterface {
                     source_context: "ctx-src".to_owned(),
                     target_context: "ctx-tgt".to_owned(),
-                    tool_id: "tool-1".to_owned(),
+                    outlet_id: "tool-1".to_owned(),
                     rate_limit: None,
                     inbound_rate_limit: None,
                     per_caller_rate_limit: None,
@@ -2816,11 +2816,11 @@ mod tests {
                 new_role: "observer".to_owned(),
             },
             GovernanceAction::RegisterTool {
-                registration: Box::new(ToolRegistration {
-                    tool_id: "calc".to_owned(),
+                registration: Box::new(OutletRegistration {
+                    outlet_id: "calc".to_owned(),
                     name: "calc".to_owned(),
                     description: "Calculator tool".to_owned(),
-                    schema: crate::context::tools::ToolSchema {
+                    schema: crate::context::outlets::OutletSchema {
                         input_schema: serde_json::json!({"type": "object"}),
                         output_schema: serde_json::json!({"type": "object"}),
                     },
@@ -2833,7 +2833,7 @@ mod tests {
                 }),
             },
             GovernanceAction::RemoveTool {
-                tool_id: "calc".to_owned(),
+                outlet_id: "calc".to_owned(),
             },
             GovernanceAction::ModifyCeiling {
                 new_ceiling: vec![Capability::MessagesRead, Capability::MessagesWrite],

@@ -2,7 +2,7 @@
 //!
 //! JCS is the canonicalization scheme for challenge preimages
 //! (`trust::challenge`), tool-registration and tool-invocation hashing
-//! (`context::tools`), and the other structured-hash paths that call
+//! (`context::outlets`), and the other structured-hash paths that call
 //! [`to_vec`] / [`to_string`] here.
 //!
 //! # Scope

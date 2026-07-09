@@ -3,14 +3,14 @@
 //! This module defines the two signed protocol types produced by the
 //! `CrossContextToolInvocation` saga's terminal paths:
 //!
-//! - [`CrossContextToolReceipt`] — the target's signed response on the return
+//! - [`CrossContextOutletReceipt`] — the target's signed response on the return
 //!   path. It is **self-verifying**: every field of the signature preimage is
 //!   carried on the receipt, so a verifier reconstructs the preimage from the
 //!   receipt alone. The one thing the receipt cannot establish about itself is
 //!   *signer authorization* — that the signing key is in fact the Active Signing
 //!   Key authorized to act for `target_context_id`. A consumer MUST resolve that
 //!   key out-of-band via the target context's membership/governance (§3, §7) and
-//!   pass it to [`CrossContextToolReceipt::verify`]; the receipt is never trusted
+//!   pass it to [`CrossContextOutletReceipt::verify`]; the receipt is never trusted
 //!   to name its own authorizing key.
 //!
 //! - [`CrossContextDivergenceMarker`] — the signed marker both sides emit on a
@@ -33,7 +33,7 @@ use sha2::{Digest, Sha256};
 
 use crate::crypto::canonical::{CanonicalField, canonical_hash};
 
-/// Domain separator for [`CrossContextToolReceipt`] signature preimages (§6.2.4, §9.18.2).
+/// Domain separator for [`CrossContextOutletReceipt`] signature preimages (§6.2.4, §9.18.2).
 pub const XCTX_RECEIPT_DOMAIN: &str = "SCP-XCTX-RECEIPT-V1:";
 
 /// Domain separator for [`CrossContextDivergenceMarker`] signature preimages (§6.2.4, §9.18.2).
@@ -126,7 +126,7 @@ fn output_hash(output_jcs: &[u8]) -> [u8; 32] {
 ///   caller log free of a large/sensitive payload while preserving a verifiable
 ///   link.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CrossContextToolReceipt {
+pub struct CrossContextOutletReceipt {
     /// Raw 32-byte digest of the initiating (caller) context.
     #[serde(with = "crate::serde_util::serde_hash_32")]
     pub caller_context_id: [u8; 32],
@@ -140,12 +140,12 @@ pub struct CrossContextToolReceipt {
     #[serde(with = "crate::serde_util::serde_nonce_16")]
     pub nonce: [u8; 16],
     /// Context-local tool registration id B executed (indexes B's own registry).
-    pub tool_registration_id: String,
+    pub outlet_registration_id: String,
     /// The output as its JCS-canonical bytes — the exact preimage of `output_hash`.
     #[serde(with = "crate::serde_util::serde_bounded_bytes")]
     pub output_jcs: Vec<u8>,
     /// The target's `ToolInvoked` event-log entry id this receipt links to.
-    pub tool_invoked_event_id: String,
+    pub outlet_invoked_event_id: String,
     /// B's re-derived inbound chain depth (`incoming + 1`), never caller-asserted.
     pub chain_depth: u8,
     /// B's Prepare-B capture instant in Unix milliseconds (staged `recorded_timestamp_ms`).
@@ -155,12 +155,12 @@ pub struct CrossContextToolReceipt {
     pub signature: [u8; 64],
 }
 
-/// The unsigned field set for [`CrossContextToolReceipt::sign`], named so the
+/// The unsigned field set for [`CrossContextOutletReceipt::sign`], named so the
 /// call site cannot transpose same-typed arguments.
 ///
-/// [`CrossContextToolReceipt::sign`] otherwise takes the two adjacent `[u8; 32]`
+/// [`CrossContextOutletReceipt::sign`] otherwise takes the two adjacent `[u8; 32]`
 /// ids (`caller_context_id` / `target_context_id`) and three `String` fields
-/// (`caller_did` / `tool_registration_id` / `tool_invoked_event_id`) as
+/// (`caller_did` / `outlet_registration_id` / `outlet_invoked_event_id`) as
 /// positional arguments — a transposition surface strictly wider than the
 /// invocation envelope the same named-field pattern already closes one layer up.
 /// A swap of any same-typed pair compiles and signs a self-consistent-but-wrong
@@ -170,10 +170,10 @@ pub struct CrossContextToolReceipt {
 /// no ordering to track.
 ///
 /// The target's Active Signing Key stays a SEPARATE parameter of
-/// [`CrossContextToolReceipt::sign`] — it is signing capability material, not a
+/// [`CrossContextOutletReceipt::sign`] — it is signing capability material, not a
 /// receipt field, so folding it in would mix the receipt's data with the
 /// capability that authorizes it.
-pub struct CrossContextToolReceiptFields {
+pub struct CrossContextOutletReceiptFields {
     /// Raw 32-byte digest of the initiating (caller) context.
     pub caller_context_id: [u8; 32],
     /// Raw 32-byte digest of the executing (target) context.
@@ -183,18 +183,18 @@ pub struct CrossContextToolReceiptFields {
     /// Staged 16-byte correlation/dedup nonce (B's copy of the wire value).
     pub nonce: [u8; 16],
     /// Context-local tool registration id B executed (indexes B's own registry).
-    pub tool_registration_id: String,
+    pub outlet_registration_id: String,
     /// The output as its JCS-canonical bytes — the exact preimage of `output_hash`.
     pub output_jcs: Vec<u8>,
     /// The target's `ToolInvoked` event-log entry id this receipt links to.
-    pub tool_invoked_event_id: String,
+    pub outlet_invoked_event_id: String,
     /// B's re-derived inbound chain depth (`incoming + 1`), never caller-asserted.
     pub chain_depth: u8,
     /// B's Prepare-B capture instant in Unix milliseconds (staged `recorded_timestamp_ms`).
     pub timestamp_ms: u64,
 }
 
-impl CrossContextToolReceipt {
+impl CrossContextOutletReceipt {
     /// Recompute `output_hash` from the carried JCS-canonical output bytes (§6.2.4).
     #[must_use]
     pub fn output_hash(&self) -> [u8; 32] {
@@ -205,8 +205,8 @@ impl CrossContextToolReceipt {
     ///
     /// Field order is **normative** (§6.2.4, *Receipt / response return path*):
     /// `Fixed32(caller_context_id)`, `Fixed32(target_context_id)`,
-    /// `VarBytes(caller_did)`, `RawBytes16(nonce)`, `VarBytes(tool_registration_id)`,
-    /// `Fixed32(output_hash)`, `VarBytes(tool_invoked_event_id)`, `U8(chain_depth)`,
+    /// `VarBytes(caller_did)`, `RawBytes16(nonce)`, `VarBytes(outlet_registration_id)`,
+    /// `Fixed32(output_hash)`, `VarBytes(outlet_invoked_event_id)`, `U8(chain_depth)`,
     /// `U64(timestamp_ms)`. `output_hash` is `SHA-256(output_jcs)`, recomputed
     /// from the carried bytes.
     ///
@@ -224,9 +224,9 @@ impl CrossContextToolReceipt {
                 CanonicalField::Fixed32(&self.target_context_id),
                 CanonicalField::VarBytes(self.caller_did.as_bytes()),
                 CanonicalField::RawBytes(&self.nonce),
-                CanonicalField::VarBytes(self.tool_registration_id.as_bytes()),
+                CanonicalField::VarBytes(self.outlet_registration_id.as_bytes()),
                 CanonicalField::Fixed32(&output_hash),
-                CanonicalField::VarBytes(self.tool_invoked_event_id.as_bytes()),
+                CanonicalField::VarBytes(self.outlet_invoked_event_id.as_bytes()),
                 CanonicalField::U8(self.chain_depth),
                 CanonicalField::U64(self.timestamp_ms),
             ],
@@ -234,7 +234,7 @@ impl CrossContextToolReceipt {
         .map_err(|e| CrossContextSagaError::PreimageConstruction(e.to_string()))
     }
 
-    /// Fields needed to construct and sign a [`CrossContextToolReceipt`].
+    /// Fields needed to construct and sign a [`CrossContextOutletReceipt`].
     ///
     /// `output_jcs` MUST already be the JCS-canonical serialization of the tool
     /// output (`jcs::to_string(output).into_bytes()`); the receipt carries those
@@ -247,16 +247,16 @@ impl CrossContextToolReceipt {
     /// cannot be built (unreachable in practice; §9.10.3 bounds messages to 256 KB).
     pub fn sign(
         target_signing_key: &SigningKey,
-        fields: CrossContextToolReceiptFields,
+        fields: CrossContextOutletReceiptFields,
     ) -> Result<Self, CrossContextSagaError> {
-        let CrossContextToolReceiptFields {
+        let CrossContextOutletReceiptFields {
             caller_context_id,
             target_context_id,
             caller_did,
             nonce,
-            tool_registration_id,
+            outlet_registration_id,
             output_jcs,
-            tool_invoked_event_id,
+            outlet_invoked_event_id,
             chain_depth,
             timestamp_ms,
         } = fields;
@@ -265,9 +265,9 @@ impl CrossContextToolReceipt {
             target_context_id,
             caller_did,
             nonce,
-            tool_registration_id,
+            outlet_registration_id,
             output_jcs,
-            tool_invoked_event_id,
+            outlet_invoked_event_id,
             chain_depth,
             timestamp_ms,
             signature: [0u8; 64],
@@ -342,7 +342,7 @@ pub struct CrossContextDivergenceMarker {
 /// self-consistent-but-wrong marker (the saga id and the committed-side event
 /// id reversed). Naming every field at the call site makes a swap a
 /// compile-visible field-name error, symmetric with
-/// [`CrossContextToolReceiptFields`]. Per the Agent-first API tenet: one flat
+/// [`CrossContextOutletReceiptFields`]. Per the Agent-first API tenet: one flat
 /// named-field object, no builder, no ordering to track.
 ///
 /// The emitting side's signing key stays a SEPARATE parameter of
@@ -415,7 +415,7 @@ impl CrossContextDivergenceMarker {
 
     /// Verify a divergence marker against the emitting side's authorized signing key.
     ///
-    /// As with [`CrossContextToolReceipt::verify`], the caller MUST resolve and
+    /// As with [`CrossContextOutletReceipt::verify`], the caller MUST resolve and
     /// pass the signing key authorized for the side that emitted the marker; this
     /// function does not trust the marker to name its own authorizing key.
     ///
@@ -465,17 +465,17 @@ mod tests {
     }
 
     /// A fixed, fully-populated receipt for byte-exactness assertions.
-    fn fixed_receipt(signing_key: &SigningKey) -> CrossContextToolReceipt {
-        CrossContextToolReceipt::sign(
+    fn fixed_receipt(signing_key: &SigningKey) -> CrossContextOutletReceipt {
+        CrossContextOutletReceipt::sign(
             signing_key,
-            CrossContextToolReceiptFields {
+            CrossContextOutletReceiptFields {
                 caller_context_id: [0x11; 32],
                 target_context_id: [0x22; 32],
                 caller_did: "did:example:caller".to_owned(),
                 nonce: [0x33; 16],
-                tool_registration_id: "calc.add".to_owned(),
+                outlet_registration_id: "calc.add".to_owned(),
                 output_jcs: br#"{"result":42}"#.to_vec(),
-                tool_invoked_event_id: "evt-tool-invoked-1".to_owned(),
+                outlet_invoked_event_id: "evt-tool-invoked-1".to_owned(),
                 chain_depth: 3,
                 timestamp_ms: 1_709_654_400_000,
             },
@@ -549,9 +549,9 @@ mod tests {
         t.nonce[0] ^= 0xFF;
         assert!(t.verify(&vk).is_err());
 
-        // tool_registration_id
+        // outlet_registration_id
         let mut t = base.clone();
-        t.tool_registration_id = "calc.sub".to_owned();
+        t.outlet_registration_id = "calc.sub".to_owned();
         assert!(t.verify(&vk).is_err());
 
         // output_jcs (changes recomputed output_hash)
@@ -559,9 +559,9 @@ mod tests {
         t.output_jcs = br#"{"result":43}"#.to_vec();
         assert!(t.verify(&vk).is_err());
 
-        // tool_invoked_event_id
+        // outlet_invoked_event_id
         let mut t = base.clone();
-        t.tool_invoked_event_id = "evt-tool-invoked-2".to_owned();
+        t.outlet_invoked_event_id = "evt-tool-invoked-2".to_owned();
         assert!(t.verify(&vk).is_err());
 
         // chain_depth
@@ -615,36 +615,36 @@ mod tests {
 
     #[test]
     fn receipt_splice_resistance_tool_registration_id_boundary() {
-        // Two receipts differing only in where the caller_did / tool_registration_id
+        // Two receipts differing only in where the caller_did / outlet_registration_id
         // boundary falls must produce different preimages — length-prefixing prevents
         // splice ambiguity that raw concatenation would admit.
         let sk = test_signing_key(0xAA);
 
-        let a = CrossContextToolReceipt::sign(
+        let a = CrossContextOutletReceipt::sign(
             &sk,
-            CrossContextToolReceiptFields {
+            CrossContextOutletReceiptFields {
                 caller_context_id: [0x11; 32],
                 target_context_id: [0x22; 32],
                 caller_did: "did:example:ab".to_owned(),
                 nonce: [0x33; 16],
-                tool_registration_id: "ctool".to_owned(),
+                outlet_registration_id: "ctool".to_owned(),
                 output_jcs: b"{}".to_vec(),
-                tool_invoked_event_id: "evt".to_owned(),
+                outlet_invoked_event_id: "evt".to_owned(),
                 chain_depth: 1,
                 timestamp_ms: 1,
             },
         )
         .expect("sign a");
-        let b = CrossContextToolReceipt::sign(
+        let b = CrossContextOutletReceipt::sign(
             &sk,
-            CrossContextToolReceiptFields {
+            CrossContextOutletReceiptFields {
                 caller_context_id: [0x11; 32],
                 target_context_id: [0x22; 32],
                 caller_did: "did:example:a".to_owned(),
                 nonce: [0x33; 16],
-                tool_registration_id: "bctool".to_owned(),
+                outlet_registration_id: "bctool".to_owned(),
                 output_jcs: b"{}".to_vec(),
-                tool_invoked_event_id: "evt".to_owned(),
+                outlet_invoked_event_id: "evt".to_owned(),
                 chain_depth: 1,
                 timestamp_ms: 1,
             },
@@ -654,40 +654,40 @@ mod tests {
         assert_ne!(
             a.signing_preimage().expect("a"),
             b.signing_preimage().expect("b"),
-            "boundary shift between caller_did and tool_registration_id must change the preimage"
+            "boundary shift between caller_did and outlet_registration_id must change the preimage"
         );
     }
 
     #[test]
     fn receipt_splice_resistance_caller_did_event_id_boundary() {
-        // Symmetric splice check across the tool_invoked_event_id VarBytes boundary.
+        // Symmetric splice check across the outlet_invoked_event_id VarBytes boundary.
         let sk = test_signing_key(0xAA);
 
-        let a = CrossContextToolReceipt::sign(
+        let a = CrossContextOutletReceipt::sign(
             &sk,
-            CrossContextToolReceiptFields {
+            CrossContextOutletReceiptFields {
                 caller_context_id: [0x11; 32],
                 target_context_id: [0x22; 32],
                 caller_did: "did".to_owned(),
                 nonce: [0x33; 16],
-                tool_registration_id: "t".to_owned(),
+                outlet_registration_id: "t".to_owned(),
                 output_jcs: b"{}".to_vec(),
-                tool_invoked_event_id: "evtX".to_owned(),
+                outlet_invoked_event_id: "evtX".to_owned(),
                 chain_depth: 1,
                 timestamp_ms: 1,
             },
         )
         .expect("sign a");
-        let b = CrossContextToolReceipt::sign(
+        let b = CrossContextOutletReceipt::sign(
             &sk,
-            CrossContextToolReceiptFields {
+            CrossContextOutletReceiptFields {
                 caller_context_id: [0x11; 32],
                 target_context_id: [0x22; 32],
                 caller_did: "did".to_owned(),
                 nonce: [0x33; 16],
-                tool_registration_id: "t".to_owned(),
+                outlet_registration_id: "t".to_owned(),
                 output_jcs: b"{}".to_vec(),
-                tool_invoked_event_id: "evt".to_owned(),
+                outlet_invoked_event_id: "evt".to_owned(),
                 chain_depth: 1,
                 timestamp_ms: 1,
             },
@@ -705,7 +705,7 @@ mod tests {
         let sk = test_signing_key(0xAA);
         let receipt = fixed_receipt(&sk);
         let json = serde_json::to_string(&receipt).expect("serialize");
-        let back: CrossContextToolReceipt = serde_json::from_str(&json).expect("deserialize");
+        let back: CrossContextOutletReceipt = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(receipt, back);
         back.verify(&sk.verifying_key())
             .expect("round-tripped receipt still verifies");
