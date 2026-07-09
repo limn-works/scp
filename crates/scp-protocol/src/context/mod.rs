@@ -23,7 +23,7 @@ pub mod promotion;
 pub mod roles;
 pub mod state_machine;
 pub mod templates;
-pub mod tools;
+pub mod outlets;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
