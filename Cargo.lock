@@ -5610,6 +5610,7 @@ dependencies = [
  "scp-mls",
  "scp-platform",
  "scp-protocol",
+ "scp-testing",
  "serde",
  "serde_bytes",
  "serde_json",
