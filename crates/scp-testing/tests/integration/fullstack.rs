@@ -864,7 +864,7 @@ async fn full_stack_relay_encrypted_roundtrip() {
     assert_eq!(blob_id.as_bytes().len(), 32, "blob_id must be 32 bytes");
     println!(
         "  [6] Published to relay (blob_id: {}...)",
-        &hex::encode(&blob_id.as_bytes()[..8])
+        hex::encode(&blob_id.as_bytes()[..8])
     );
 
     // 7. Bob receives envelope from the relay.
