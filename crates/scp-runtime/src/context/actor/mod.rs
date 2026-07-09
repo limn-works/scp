@@ -108,7 +108,7 @@ pub struct ContextActor {
     /// Stable context identifier. Kept as a `String` alongside
     /// [`PerContextState::context_id`] for tracing / logging — the
     /// `state.context_id` is the canonical `[u8; 32]` hash.
-    #[allow(dead_code)] // read into log events when the watchdog lands
+    // read by `persist_snapshot` (the coalesced-persist key) and tracing
     context_id: String,
     /// Command inbox. Paired with the `Sender` held by
     /// [`ContextActorHandle`].
@@ -150,9 +150,9 @@ pub struct ContextActor {
     governance_timeout: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
     /// Unix-ms instant of the last successful coalesced persist. The
     /// run-loop's persistence arm compares `now() - last_persisted_at`
-    /// against the coalescing window (250 ms per plan
-    /// §"Persistence coalescing") before issuing a snapshot write.
-    /// Initialized to "now" at actor construction.
+    /// against the coalescing window (50 ms — ADR-049 §Decision 9,
+    /// "Default: 50ms write-coalescing per actor") before issuing a
+    /// snapshot write. Initialized to "now" at actor construction.
     // read by the run-loop's persistence coalesce arm
     last_persisted_at: std::time::Instant,
     /// Dirty flag set when any handler's [`outcome::Outcome`] carries
@@ -516,19 +516,44 @@ impl ContextActor {
         // actor's owned state in a follow-on Phase 2 sub-chunk.
     }
 
-    /// Persistence coalesce arm. Phase 2A no-op: durable writes still
-    /// flow through the per-handler persistence helpers, so this arm
-    /// only clears the `dirty` flag (see body).
-    #[allow(clippy::unused_async, clippy::needless_pass_by_ref_mut)]
+    /// Coalesced-persistence writer. Invoked by the run loop's Arm-4
+    /// coalesce tick (`dirty && deadline reached`) and by the post-loop
+    /// final drain (`dirty` at shutdown / inbox-close) to make a burst of
+    /// coalesced Class-C mutations durable as a single snapshot write
+    /// (ADR-049 §Decision 9, "Default: 50ms write-coalescing per actor").
+    ///
+    /// Reads the actor's `PerContextState` READ-ONLY through the
+    /// [`ClassSCell`](class_s::ClassSCell)'s `Deref` — the persist never
+    /// mutates Class-S state (the cell exposes no `DerefMut`). The `&mut self`
+    /// receiver is a `Send` requirement, NOT a mutation one: the actor's
+    /// spawned `run()` future must be `Send`, and `ContextActor` is `Send` but
+    /// not `Sync` (it transitively holds a `Send`-only `FnMut`), so a
+    /// `&ContextActor` held across the `.await` would NOT be `Send`, whereas a
+    /// `&mut ContextActor` is (`&mut T: Send` needs only `T: Send`). This
+    /// mirrors the actor's other borrow-then-await methods (`dispatch`).
+    /// Delegates to
+    /// [`persist_state_best_effort`](crate::context::messaging_helpers::persist_state_best_effort),
+    /// the same best-effort path every coalesced Class-C site uses: it
+    /// builds the owned
+    /// [`ContextSnapshot`](crate::context::state::ContextSnapshot) in a
+    /// synchronous prelude BEFORE the `.await` (Decision-7 `Send`
+    /// discipline — the returned future borrows only `deps` and the
+    /// context-id, never Class-S state) and records + warns on a persist
+    /// failure internally rather than surfacing it (a ≤50 ms coalesce-
+    /// window rollback of Class-C state is acceptable per §Decision 9). No
+    /// Class-S transition *depends on* this path for durability — each
+    /// persists fail-closed at its own mutation site — but the coalesced
+    /// snapshot still serializes the whole `PerContextState` (Class-S values
+    /// included), so this write is a redundant re-persist for Class-S state
+    /// and is authoritative only for Class-C.
+    #[allow(clippy::needless_pass_by_ref_mut)] // `&mut self` is a `Send` requirement (see doc)
     async fn persist_snapshot(&mut self) {
-        // The state-owning persist path is wired in a follow-on Phase 2
-        // sub-chunk together with the snapshot-shape contract on
-        // `PerContextState`. For Phase 2A the run loop's coalesce arm
-        // simply clears `dirty` so the loop does not spin; durable
-        // writes flow through the per-handler persistence helpers
-        // (writing to the injected `ContextPersistence` provider
-        // synchronously within each handler) until the migration
-        // completes.
+        // Read-only `Deref`; the returned future captures only `deps`/`context_id`
+        // (`use<'d, 'c>`), never Class-S state.
+        let state: &state::PerContextState = &self.state;
+        let deps: &deps::ActorDeps = &self.deps;
+        let context_id: &str = &self.context_id;
+        crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id).await;
     }
 }
 
@@ -700,6 +725,17 @@ mod tests {
     /// and `actor_with_state_answers_read_query`). Extracted so each test
     /// function stays below the `too_many_lines` clippy threshold.
     async fn new_test_deps() -> deps::ActorDeps {
+        new_test_deps_with_persistence(Box::new(TestPersistence)).await
+    }
+
+    /// Same as [`new_test_deps`] but with a caller-supplied persistence
+    /// backend. Lets a test inject a recording backend and assert that a
+    /// coalesced Class-C mutation actually reaches durable storage via the
+    /// run loop's coalesced flush (ADR-049 §Decision 9; see
+    /// `coalesced_class_c_mutation_is_durable_*`).
+    async fn new_test_deps_with_persistence(
+        persistence: Box<dyn crate::context::persistence::ContextPersistence>,
+    ) -> deps::ActorDeps {
         use crate::context::supervisor::supervisor::Supervisor;
         use scp_did::DID;
         use scp_platform::testing::InMemoryStorage;
@@ -715,8 +751,6 @@ mod tests {
             Box::new(TestEventLog);
         let key_resolver: scp_protocol::context::governance::KeyResolver =
             Arc::new(|_: &scp_did::DID, _: scp_did::SigningKeyId| None);
-        let persistence: Box<dyn crate::context::persistence::ContextPersistence> =
-            Box::new(TestPersistence);
         let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
             Arc::new(
                 crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
@@ -1028,5 +1062,200 @@ mod tests {
 
         handle.send_shutdown().await.unwrap();
         actor_task.await.unwrap();
+    }
+
+    // -----------------------------------------------------------------
+    // ADR-049 §Decision 9 — coalesced Class-C persistence durability.
+    //
+    // A `class_c_view()` mutation performs NO persist at the mutation
+    // site (that is its documented contract; see
+    // `ClassSCell::class_c_view`) — durability rides ENTIRELY on the run
+    // loop's coalesced flush (`persist_snapshot`, invoked by the Arm-4
+    // coalesce tick and the post-loop final drain). These regression
+    // tests drive a real coalesced Class-C mutation through the mailbox
+    // and prove the flush actually writes it to durable storage. Before
+    // `persist_snapshot` was wired, the flush was a no-op and any
+    // mutation made only via `class_c_view()` was silently lost on
+    // shutdown/crash.
+    // -----------------------------------------------------------------
+
+    /// Persistence that RECORDS every `persist_context` snapshot, so a test
+    /// can prove a coalesced Class-C mutation reached durable storage
+    /// (ADR-049 §Decision 9). `load_context` returns the most-recent
+    /// recorded snapshot, so a respawn/restore reads the coalesced state
+    /// back. `persisted` fires once per write, letting a test await the
+    /// coalesce flush deterministically under paused tokio time.
+    #[cfg(feature = "testing")]
+    #[derive(Clone)]
+    struct RecordingPersistence {
+        // Lock-free per ADR-049 §Decision 12 (`std::sync`/`tokio::sync` mutexes
+        // are banned in this crate): the last-written snapshot lives in an
+        // `ArcSwapOption`, swapped on each write and loaded on read.
+        last: std::sync::Arc<arc_swap::ArcSwapOption<crate::context::state::ContextSnapshot>>,
+        persisted: std::sync::Arc<tokio::sync::Notify>,
+    }
+
+    #[cfg(feature = "testing")]
+    impl RecordingPersistence {
+        fn new() -> Self {
+            Self {
+                last: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
+                persisted: std::sync::Arc::new(tokio::sync::Notify::new()),
+            }
+        }
+
+        /// The most-recent persisted snapshot, or `None` if nothing was
+        /// written — exactly the bytes a respawn/restore would rehydrate.
+        fn last_snapshot(&self) -> Option<std::sync::Arc<crate::context::state::ContextSnapshot>> {
+            self.last.load_full()
+        }
+    }
+
+    #[cfg(feature = "testing")]
+    #[async_trait::async_trait]
+    impl crate::context::persistence::ContextPersistence for RecordingPersistence {
+        async fn persist_context(
+            &self,
+            _context_id: &str,
+            snapshot: &crate::context::state::ContextSnapshot,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            self.last.store(Some(std::sync::Arc::new(snapshot.clone())));
+            self.persisted.notify_one();
+            Ok(())
+        }
+        async fn load_context(
+            &self,
+            _context_id: &str,
+        ) -> Result<
+            Option<crate::context::state::ContextSnapshot>,
+            Box<dyn std::error::Error + Send + Sync>,
+        > {
+            Ok(self.last_snapshot().map(|s| (*s).clone()))
+        }
+        async fn delete_context(
+            &self,
+            _: &str,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+        async fn list_persisted_contexts(
+            &self,
+        ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(self
+                .last_snapshot()
+                .map(|s| vec![s.context_id.clone()])
+                .unwrap_or_default())
+        }
+    }
+
+    /// Send a `TestInstallAccessKey` command to `handle` for `(ctx, member)`.
+    /// The handler mutates the persisted `access_key_store` through
+    /// `class_c_view()` and reports `Outcome::ok_mutated` — a coalesced
+    /// Class-C mutation with NO co-located persist, so its durability rides
+    /// only the run loop's coalesced flush.
+    #[cfg(feature = "testing")]
+    async fn install_access_key_via_mailbox(handle: &ContextActorHandle, ctx: &str, member: &str) {
+        handle
+            .send(|reply| {
+                ContextCommand::Messaging(MessagingCommand::TestInstallAccessKey {
+                    context_id: ctx.to_owned(),
+                    member_did: member.to_owned(),
+                    key: scp_protocol::crypto::access_keys::generate_access_key(ctx, member),
+                    reply,
+                })
+            })
+            .await
+            .expect("access-key install round-trips through the state-owning actor");
+    }
+
+    /// The post-loop **final drain** persists a pending coalesced Class-C
+    /// mutation: after installing an access key (a `class_c_view()` mutation
+    /// with no co-located persist) and shutting the actor down, the drained
+    /// snapshot must carry the key, so a respawn/restore reads it back.
+    /// Regression guard for ADR-049 §Decision 9 — with `persist_snapshot` a
+    /// no-op, the drain wrote nothing and the mutation was lost on shutdown.
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn coalesced_class_c_mutation_is_durable_across_final_drain() {
+        let recorder = RecordingPersistence::new();
+        let deps = new_test_deps_with_persistence(Box::new(recorder.clone())).await;
+        let ctx = ctx_hex(0x51);
+        let member = "did:example:coalesced-drain-member";
+        let state = writable_encrypted_state(0x51, member);
+
+        let (tx, rx) = mpsc::channel::<ContextCommand>(4);
+        let actor = ContextActor::new(state, deps, rx);
+        let actor_task = tokio::spawn(actor.run());
+        let handle = ContextActorHandle::from_sender(tx);
+
+        install_access_key_via_mailbox(&handle, &ctx, member).await;
+
+        // Shutdown drives the run loop to exit; the post-loop final drain
+        // (`if self.dirty { persist_snapshot().await }`) flushes the pending
+        // snapshot. Awaiting the actor task guarantees the drain completed.
+        handle.send_shutdown().await.expect("shutdown acks");
+        actor_task.await.expect("actor task joins");
+
+        let snapshot = recorder
+            .last_snapshot()
+            .expect("final drain must have persisted a snapshot (ADR-049 §Decision 9)");
+        assert!(
+            snapshot.access_key_store.contains(&ctx, member),
+            "the coalesced access-key mutation must be durable in the drained snapshot"
+        );
+    }
+
+    /// The run loop's **Arm-4 coalesce tick** (`dirty && deadline reached`)
+    /// flushes the same pending mutation while the actor is still live —
+    /// the same `persist_snapshot` the final drain uses, reached on the
+    /// ≤50 ms `COALESCE_INTERVAL` (ADR-049 §Decision 9). Paused tokio time
+    /// advances the window deterministically, never racing the wall clock.
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn coalesced_class_c_mutation_is_durable_across_coalesce_tick() {
+        let recorder = RecordingPersistence::new();
+        let deps = new_test_deps_with_persistence(Box::new(recorder.clone())).await;
+        // Pause AFTER building deps so `build_actor_deps` runs under real
+        // time; the actor's `last_persisted_at` is captured (in
+        // `ContextActor::new`) against the now-frozen clock.
+        tokio::time::pause();
+        let ctx = ctx_hex(0x52);
+        let member = "did:example:coalesced-tick-member";
+        let state = writable_encrypted_state(0x52, member);
+
+        let (tx, rx) = mpsc::channel::<ContextCommand>(4);
+        let actor = ContextActor::new(state, deps, rx);
+        let actor_task = tokio::spawn(actor.run());
+        let handle = ContextActorHandle::from_sender(tx);
+
+        install_access_key_via_mailbox(&handle, &ctx, member).await;
+
+        // Advance virtual time past the coalescing window so Arm-4 fires while
+        // the actor is still running (no Shutdown / drain involved). Determinism
+        // comes from tokio's current-thread paused clock auto-advancing to the
+        // next timer once both tasks park — NOT from the exact `advance` amount;
+        // the `+1ms` only steps strictly past the deadline. `notify_one` stores a
+        // permit, so `notified()` below cannot miss the wakeup even if the persist
+        // lands during `advance`.
+        tokio::time::advance(COALESCE_INTERVAL + std::time::Duration::from_millis(1)).await;
+        // Bound the wait so a `persist_snapshot` regression to a no-op (no
+        // `notify_one`) fails this test in bounded VIRTUAL time instead of
+        // hanging forever (`#[tokio::test]` has no wall-clock timeout): under
+        // paused time the timeout auto-advances and returns `Err`, turning the
+        // hang into a legible assertion failure.
+        tokio::time::timeout(COALESCE_INTERVAL * 20, recorder.persisted.notified())
+            .await
+            .expect("Arm-4 coalesce tick must persist within the coalesce window");
+
+        let snapshot = recorder
+            .last_snapshot()
+            .expect("the coalesce tick must have persisted a snapshot (ADR-049 §Decision 9)");
+        assert!(
+            snapshot.access_key_store.contains(&ctx, member),
+            "the coalesced access-key mutation must be durable after the Arm-4 tick"
+        );
+
+        handle.send_shutdown().await.expect("shutdown acks");
+        actor_task.await.expect("actor task joins");
     }
 }
