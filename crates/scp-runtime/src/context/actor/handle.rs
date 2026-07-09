@@ -280,9 +280,9 @@ impl ContextActorHandle {
     /// the ack. See [`Self::send`] for error semantics.
     ///
     /// Called by the `BridgeInstanceCore::suspend` default body in
-    /// `scp_ffi_common::bridge_instance::BridgeInstanceCore` — commit 6
-    /// lands the send-path stub; the handler that processes the variant
-    /// lands with the lifecycle-control migration in commit 11.
+    /// `scp_ffi_common::bridge_instance::BridgeInstanceCore`. The handler
+    /// that processes the `Pause` variant is implemented in
+    /// [`crate::context::actor::handlers::lifecycle_control`].
     ///
     /// # Errors
     ///

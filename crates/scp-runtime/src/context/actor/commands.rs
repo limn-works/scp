@@ -2053,11 +2053,11 @@ pub struct TtlTimerPayload {
     /// `creation_timestamp_secs + params.ttl` — every member computes the
     /// identical absolute deadline, so the `ContextExpired`/`ContextClosed`
     /// leaf timestamp is convergent-by-construction (§7.3.1, §9.9.3). When
-    /// `false` (e.g. the restore/import path, whose persisted snapshot does
-    /// not yet carry the convergent creation time — a forward step under
-    /// ADR-051), the deadline is armed relative to the local clock (the prior
-    /// behaviour). Ignored by `ResetTtlTimer`, which never anchors to
-    /// creation.
+    /// `false`, the deadline is armed relative to the local clock (the prior
+    /// behaviour) — for a caller with no convergent creation base. The
+    /// initial-create, restore, and import paths all pass `true`: the
+    /// persisted snapshot carries `creation_timestamp_secs`. Ignored by
+    /// `ResetTtlTimer`, which never anchors to creation.
     pub anchor_deadline_to_creation: bool,
 }
 
@@ -3110,11 +3110,6 @@ pub enum LifecycleControlCommand {
 // Small helpers
 // ---------------------------------------------------------------------------
 
-/// Returns the oneshot reply sender for a command, consuming the command.
-/// Used by the test-only `send_not_implemented` helper on
-/// [`crate::context::actor::ContextActorHandle`] to close out a stub
-/// dispatch. Not part of the public API — the field is pattern-matched
-/// directly by the handler stubs once they migrate.
 impl ContextCommand {
     /// Internal: whether this variant is the terminal
     /// [`LifecycleControlCommand::Shutdown`]. Used by the actor's

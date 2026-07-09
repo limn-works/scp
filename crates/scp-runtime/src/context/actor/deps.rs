@@ -135,9 +135,11 @@ pub struct ActorDeps {
     /// Added in Phase 2A.1 of ADR-049 (trust_recovery domain migration)
     /// — first migrated handler that needs MLS provider state. Will
     /// remain populated through the rest of Phase 2A; eventually the
-    /// `MlsCryptoProvider` dissolves (plan §"MlsCryptoProvider
-    /// dissolution") and per-context crypto state moves entirely onto
-    /// [`crate::context::actor::state::ContextCryptoState`] inside
+    /// `MlsCryptoProvider` is reduced (plan §"MlsCryptoProvider
+    /// dissolution") to a supervisor-owned store for the Class-M
+    /// epoch/replay floors, which must outlive the actor-task unwind
+    /// (ADR-049 Decision 9); the non-floor per-context crypto state moves
+    /// onto [`crate::context::actor::state::ContextCryptoState`] inside
     /// [`crate::context::actor::state::PerContextState`].
     pub crypto: Arc<MlsCryptoProvider>,
     /// Transport provider (relay, subscription, publish).
