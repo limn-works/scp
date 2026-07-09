@@ -44,15 +44,15 @@ pub use super::roles::Capability;
 pub use super::roles::RoleDefinition;
 
 // ---------------------------------------------------------------------------
-// ToolRegistration (re-export from tools/registry module)
+// OutletRegistration (re-export from tools/registry module)
 // ---------------------------------------------------------------------------
 
-/// Re-export of the full [`ToolRegistration`] type from
-/// `tools/registry.rs`, which includes `tool_id`, `name`,
+/// Re-export of the full [`OutletRegistration`] type from
+/// `tools/registry.rs`, which includes `outlet_id`, `name`,
 /// `description`, `schema`, `implementation_hash`, `test_vectors`,
 /// `operator_did`, and `cost`. See ADR-010 in
 /// `.docs/adrs/phase-2.md`.
-pub use super::tools::ToolRegistration;
+pub use super::outlets::OutletRegistration;
 
 // ---------------------------------------------------------------------------
 // ContextMode
@@ -666,7 +666,7 @@ pub struct ContextParams {
     pub roles: Vec<RoleDefinition>,
 
     /// Initial tool registrations available within this context.
-    pub tools: Vec<ToolRegistration>,
+    pub tools: Vec<OutletRegistration>,
 
     /// Optional time-to-live. When set, the context automatically expires
     /// after this duration. Extension requires unanimous member consent.
@@ -1011,7 +1011,7 @@ mod tests {
     use std::collections::HashSet;
 
     use super::*;
-    use crate::context::tools::ToolSchema;
+    use crate::context::outlets::OutletSchema;
 
     #[test]
     fn context_mode_default_is_encrypted() {
@@ -1069,11 +1069,11 @@ mod tests {
                     capabilities: HashSet::from([Capability::MessagesRead]),
                 },
             ],
-            tools: vec![ToolRegistration {
-                tool_id: "recipe-search".to_owned(),
+            tools: vec![OutletRegistration {
+                outlet_id: "recipe-search".to_owned(),
                 name: "recipe-search".to_owned(),
                 description: "Search for recipes".to_owned(),
-                schema: ToolSchema {
+                schema: OutletSchema {
                     input_schema: serde_json::json!({"type": "object"}),
                     output_schema: serde_json::json!({"type": "object"}),
                 },
@@ -1137,11 +1137,11 @@ mod tests {
 
     #[test]
     fn tool_registration_clone_eq() {
-        let tool = ToolRegistration {
-            tool_id: "search".to_owned(),
+        let tool = OutletRegistration {
+            outlet_id: "search".to_owned(),
             name: "search".to_owned(),
             description: "Search tool".to_owned(),
-            schema: ToolSchema {
+            schema: OutletSchema {
                 input_schema: serde_json::json!({"type": "object"}),
                 output_schema: serde_json::json!({"type": "object"}),
             },

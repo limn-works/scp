@@ -17,13 +17,13 @@ pub mod membership;
 pub mod memory_scope;
 pub mod metadata;
 pub mod nesting;
+pub mod outlets;
 pub mod params;
 pub mod policy;
 pub mod promotion;
 pub mod roles;
 pub mod state_machine;
 pub mod templates;
-pub mod outlets;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -55,8 +55,8 @@ pub use nesting::{compute_ceiling_intersection, validate_child_ttl, validate_nes
 pub use params::{
     BridgeCapability, BridgeDirectionality, BridgeMetadata, Capability, CeilingPolicy, ContextMode,
     ContextParams, FieldVisibility, GovernanceModel, MemoryScope, MetadataVisibilityPolicy,
-    MigrationSource, ProjectionOverride, ProjectionPolicy, ProjectionRule, PromotionPolicy,
-    PublicMetadata, RoleDefinition, RuntimeMetadata, TemplateId, ToolRegistration,
+    MigrationSource, OutletRegistration, ProjectionOverride, ProjectionPolicy, ProjectionRule,
+    PromotionPolicy, PublicMetadata, RoleDefinition, RuntimeMetadata, TemplateId,
     decode_protocol_version, encode_protocol_version,
 };
 pub use roles::{

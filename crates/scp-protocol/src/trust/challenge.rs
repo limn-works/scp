@@ -117,7 +117,7 @@ impl ChallengeType {
 
     /// Convenience constructor for tool integrity verification challenges.
     ///
-    /// Used by [`verify_tool_integrity`](crate::context::tools::integrity::verify_tool_integrity)
+    /// Used by [`verify_outlet_integrity`](crate::context::outlets::integrity::verify_outlet_integrity)
     /// to produce [`ChallengeVerification`] results with a tool-integrity
     /// challenge type.
     #[must_use]

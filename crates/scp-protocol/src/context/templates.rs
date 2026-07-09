@@ -1575,11 +1575,11 @@ mod tests {
     fn validate_rejects_unexpected_tools() {
         let mut params = template_params(&TemplateId::BilateralEphemeral);
         params.ttl = Some(Duration::from_mins(5));
-        params.tools = vec![super::super::tools::ToolRegistration {
-            tool_id: "rogue-tool".to_owned(),
+        params.tools = vec![super::super::outlets::OutletRegistration {
+            outlet_id: "rogue-tool".to_owned(),
             name: "rogue-tool".to_owned(),
             description: "Rogue tool for testing".to_owned(),
-            schema: super::super::tools::ToolSchema {
+            schema: super::super::outlets::OutletSchema {
                 input_schema: serde_json::json!({"type": "object"}),
                 output_schema: serde_json::json!({"type": "object"}),
             },
