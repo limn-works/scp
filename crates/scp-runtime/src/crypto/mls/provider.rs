@@ -2959,6 +2959,19 @@ impl MlsCryptoProvider {
             // 2b. Overshoot ceiling: every imported recv floor (including
             // import-only senders) bounded against the merged sender-key epoch
             // floor + MAX_EPOCH_ADVANCE. One read-lock across the loop.
+            //
+            // NOTE: only the EPOCH axis is bounded here; the sequence axis is a
+            // deliberate, documented residual (#2076). No sound
+            // `MAX_SEQUENCE_ADVANCE` exists — there is no per-`(sender, epoch)`
+            // sequence high-water oracle (unlike `sender_key_store.epoch` for the
+            // epoch axis), so any constant would either false-positive legitimate
+            // high-volume catch-up imports or stop nothing; and spec §23.17.2
+            // Invariant 3 mandates accepting a floor `>= local` via max-merge. The
+            // residual — an untrusted import (creator-signed; `exporter_did ==
+            // creator_did`) setting `(valid_epoch, u64::MAX)` to silence a sender
+            // for the CURRENT epoch — is LOW: creator-gated, append-only-safe (a
+            // DoS, not a replay hole), and self-heals on the next sender-key
+            // rotation. See #2076.
             if let Some(entry) = self.contexts.get(context_id) {
                 let store = &entry.value().sender_key_store;
                 for (did, (imp_epoch, _imp_seq)) in &import_floors {
