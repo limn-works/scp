@@ -25,8 +25,8 @@ use scp_protocol::crypto::ucan::nonce;
 use scp_protocol::crypto::ucan::revoke::compute_revocation_cid;
 use scp_protocol::crypto::ucan::validate::{
     CapabilityValidation, DEFAULT_CLOCK_SKEW_TOLERANCE_SECS, InMemoryDidResolver,
-    InMemoryNonceTracker, InMemoryProofResolver, InMemoryRevocationChecker, NonceTracker,
-    ProofResolver, ValidationContext, evaluate_ucan, parse_ucan, validate_ucan,
+    InMemoryNonceTracker, InMemoryProofResolver, InMemoryRevocationChecker, NoCaveatResolver,
+    NonceTracker, ProofResolver, ValidationContext, evaluate_ucan, parse_ucan, validate_ucan,
 };
 use scp_protocol::crypto::ucan::{Attenuation, UcanError, UcanHeader, UcanPayload, UcanToken};
 
@@ -55,6 +55,10 @@ async fn setup_identity() -> (
 /// Production system clock for tests that validate against real time.
 static SYSTEM_CLOCK: scp_clock::SystemClock = scp_clock::SystemClock;
 
+/// No-op caveat resolver for tests: no token carries §7.3.8 invocation
+/// caveats, so `resolve_caveats` is a constant `None`.
+static NO_CAVEAT_RESOLVER: NoCaveatResolver = NoCaveatResolver;
+
 /// Build a [`ValidationContext`] with in-memory implementations.
 fn build_context<'a, S: std::hash::BuildHasher>(
     did_resolver: &'a InMemoryDidResolver,
@@ -77,6 +81,7 @@ fn build_context<'a, S: std::hash::BuildHasher>(
         nonce_tracker,
         revocation_checker,
         proof_resolver,
+        caveat_resolver: &NO_CAVEAT_RESOLVER,
         ceiling,
         context_creator_did,
         presenting_agent_did,
@@ -89,7 +94,7 @@ fn default_ceiling() -> HashSet<String> {
     [
         "messages:read".to_owned(),
         "messages:write".to_owned(),
-        "tool_invoke:assistant".to_owned(),
+        "outlet_call:assistant".to_owned(),
         "member:invite".to_owned(),
         "role:assign".to_owned(),
         "context:close".to_owned(),
@@ -1311,7 +1316,7 @@ async fn full_pipeline_mint_delegate_parse_validate() {
     let caps = vec![
         "messages:write".to_owned(),
         "messages:read".to_owned(),
-        "tool_invoke:assistant".to_owned(),
+        "outlet_call:assistant".to_owned(),
     ];
 
     // Creator mints root.
@@ -1434,6 +1439,7 @@ fn in_memory_proof_resolver_returns_stored_token() {
             att: vec![],
             prf: vec![],
             fct: None,
+            nb: None,
         },
         signature: vec![0u8; 64],
         encoded: "test.encoded.token".to_owned(),
@@ -1473,6 +1479,7 @@ async fn validate_ucan_rejects_self_delegation_without_key_scope() {
         }],
         prf: vec![],
         fct: None,
+        nb: None,
     };
     let header_json = serde_json::to_vec(&header).unwrap();
     let payload_json = serde_json::to_vec(&payload).unwrap();
@@ -1906,7 +1913,7 @@ async fn validate_ucan_step8_accepts_multi_attestation_all_in_ceiling() {
     let caps = vec![
         "messages:read".to_owned(),
         "messages:write".to_owned(),
-        "tool_invoke:assistant".to_owned(),
+        "outlet_call:assistant".to_owned(),
     ];
 
     let params = MintParams {

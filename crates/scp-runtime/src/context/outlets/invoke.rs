@@ -54,7 +54,7 @@ pub enum InvocationError {
 
     /// The invoker does not have the required capability.
     #[error(
-        "invoker \"{did}\" does not have ToolInvoke(\"{outlet_id}\") or ToolInvokeAll capability"
+        "invoker \"{did}\" does not have OutletCall(\"{outlet_id}\") or OutletCallAll capability"
     )]
     InvokerNotAuthorized {
         /// The DID that attempted invocation.
@@ -138,7 +138,7 @@ pub struct OutletEconomyContext<'a, S: BuildHasher = std::hash::RandomState> {
     /// Spending UCAN for spending-capability check (§19.5). `None` if no
     /// spending UCAN presented. The action capability side of AND-composition
     /// is verified UPSTREAM at the `member_has_capability` gate — see the
-    /// `ToolInvoke` / `ToolInvokeAll` check earlier in `invoke_outlet`.
+    /// `OutletCall` / `OutletCallAll` check earlier in `invoke_outlet`.
     pub spending_ucan: Option<&'a UcanToken>,
     /// Context ID for bookkeeping.
     pub context_id: &'a str,
@@ -187,8 +187,8 @@ pub struct OutletEconomyContext<'a, S: BuildHasher = std::hash::RandomState> {
 ///
 /// Execution flow:
 /// 1. Validates context state is [`Active`](ContextState::Active).
-/// 2. Validates invoker has [`ToolInvoke(outlet_id)`](Capability::ToolInvoke)
-///    or [`ToolInvokeAll`](Capability::ToolInvokeAll) capability via UCAN.
+/// 2. Validates invoker has [`OutletCall(outlet_id)`](Capability::OutletCall)
+///    or [`OutletCallAll`](Capability::OutletCallAll) capability via UCAN.
 /// 3. Looks up the tool in the registry.
 /// 4. Validates input against the tool's input schema.
 ///    - 4a. Economy: checks budget and UCAN composition (if economy context provided).
@@ -443,7 +443,7 @@ where
         });
     }
 
-    // 2. Validate invoker has ToolInvoke(outlet_id) or ToolInvokeAll capability.
+    // 2. Validate invoker has OutletCall(outlet_id) or OutletCallAll capability.
     if !has_outlet_invoke_capability(role_state, invoker_did, outlet_id) {
         return Err(InvocationError::InvokerNotAuthorized {
             did: invoker_did.to_string(),
@@ -529,7 +529,7 @@ pub(crate) fn economy_pre_check<S: BuildHasher>(
     };
     let base_cost = scp_protocol::economy::policy::evaluate_cost(
         policy,
-        &scp_protocol::economy::types::PaidActionType::ToolInvoke,
+        &scp_protocol::economy::types::PaidActionType::OutletCall,
         &economy.metrics,
     )
     .ok_or_else(|| InvocationError::BudgetExceeded {
@@ -559,7 +559,7 @@ pub(crate) fn economy_pre_check<S: BuildHasher>(
 
     // Spending UCAN check (§19.5): paid actions require a spending UCAN.
     // The action capability was already verified at step 2 via the
-    // `ToolInvoke` / `ToolInvokeAll` `member_has_capability` check — that
+    // `OutletCall` / `OutletCallAll` `member_has_capability` check — that
     // is the action side of AND-composition (see spec §19.5 layer split).
     check_outlet_spending_capability(cost, economy.spending_ucan)?;
 
@@ -879,7 +879,7 @@ pub fn post_outlet_invocation_bookkeeping<S: std::hash::BuildHasher>(
 ///
 /// Per spec §19.5, paid actions require BOTH an action capability AND a
 /// spending UCAN. The action capability is verified UPSTREAM at the
-/// `ToolInvoke` / `ToolInvokeAll` `member_has_capability` gate (see
+/// `OutletCall` / `OutletCallAll` `member_has_capability` gate (see
 /// `invoke_outlet`). This function verifies the spending side only.
 ///
 /// # Errors
@@ -895,7 +895,7 @@ pub fn check_outlet_spending_capability(
     scp_protocol::crypto::ucan::spending::check_spending_capability(
         spending_ucan,
         ucan_amount,
-        "tool:invoke",
+        "outlet:call",
     )
     .map_err(|e| InvocationError::ExecutionFailed {
         message: format!("UCAN spending capability check failed: {e}"),
@@ -998,7 +998,7 @@ pub(crate) async fn authorize_outlet_payment(
 ) -> Result<Option<crate::economy::integration::PreparedAction>, InvocationError> {
     let cost = scp_protocol::economy::policy::evaluate_cost(
         policy,
-        &scp_protocol::economy::types::PaidActionType::ToolInvoke,
+        &scp_protocol::economy::types::PaidActionType::OutletCall,
         metrics,
     );
     let Some(cost) = cost.filter(|c| c.0 > 0) else {
@@ -1006,7 +1006,7 @@ pub(crate) async fn authorize_outlet_payment(
     };
 
     let metadata = crate::economy::adapter::PaymentMetadata {
-        action_type: scp_protocol::economy::types::PaidActionType::ToolInvoke,
+        action_type: scp_protocol::economy::types::PaidActionType::OutletCall,
         context_id: Some(context_id.to_owned()),
         idempotency_key: *uuid::Uuid::new_v4().as_bytes(),
     };
@@ -1014,7 +1014,7 @@ pub(crate) async fn authorize_outlet_payment(
     let prepared = crate::economy::integration::prepare_paid_action(
         adapter,
         Some(policy),
-        scp_protocol::economy::types::PaidActionType::ToolInvoke,
+        scp_protocol::economy::types::PaidActionType::OutletCall,
         invoker_did,
         Some(context_id.to_owned()),
         metrics,
@@ -1102,7 +1102,7 @@ fn elapsed_ms(start: std::time::Instant) -> u64 {
 // Capability check helpers
 // ---------------------------------------------------------------------------
 
-/// Checks whether a member has the `ToolInvoke(outlet_id)` or `ToolInvokeAll`
+/// Checks whether a member has the `OutletCall(outlet_id)` or `OutletCallAll`
 /// capability.
 ///
 /// This is the integration point between the invocation module and the
@@ -1113,12 +1113,12 @@ pub fn has_outlet_invoke_capability(
     did: &str,
     outlet_id: &str,
 ) -> bool {
-    // Check for ToolInvokeAll first (broader permission).
-    if role_state.member_has_capability(did, &Capability::ToolInvokeAll) {
+    // Check for OutletCallAll first (broader permission).
+    if role_state.member_has_capability(did, &Capability::OutletCallAll) {
         return true;
     }
-    // Check for specific ToolInvoke(outlet_id).
-    role_state.member_has_capability(did, &Capability::ToolInvoke(outlet_id.to_owned()))
+    // Check for specific OutletCall(outlet_id).
+    role_state.member_has_capability(did, &Capability::OutletCall(outlet_id.to_owned()))
 }
 
 // ---------------------------------------------------------------------------
@@ -1128,7 +1128,7 @@ pub fn has_outlet_invoke_capability(
 /// Validates a UCAN token for tool invocation authorization.
 ///
 /// Parses the encoded JWT token and runs the full 11-step ADR-016 validation
-/// pipeline, requiring `tool_invoke:{outlet_name}` or `tool_invoke:*` capability
+/// pipeline, requiring `outlet_call:{outlet_name}` or `outlet_call:*` capability
 /// scoped to the given context.
 ///
 /// This is the primary authorization gate for tool invocations. Role-based
@@ -1161,7 +1161,7 @@ where
     S: BuildHasher,
 {
     let parsed = parse_ucan(encoded_token)?;
-    let required_cap = CapabilityUri::new(context_id, "tool_invoke", outlet_name);
+    let required_cap = CapabilityUri::new(context_id, "outlet_call", outlet_name);
     validate_ucan(&parsed, &required_cap, ctx)
 }
 
@@ -1187,8 +1187,8 @@ mod tests {
         CapabilityCeiling::new([
             Capability::MessagesRead,
             Capability::MessagesWrite,
-            Capability::ToolRegister,
-            Capability::ToolInvokeAll,
+            Capability::OutletRegister,
+            Capability::OutletCallAll,
             Capability::RoleAssign,
             Capability::MemberInvite,
             Capability::MemberRemove,
@@ -1211,7 +1211,7 @@ mod tests {
     }
 
     /// Creates a `ContextRoleState` with an additional member that has limited
-    /// capabilities (no `ToolInvoke`).
+    /// capabilities (no `OutletCall`).
     fn test_role_state_with_no_invoke_member(
         creator_did: &str,
         member_did: &str,
@@ -1359,7 +1359,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // invoke_outlet: invoker without ToolInvoke capability
+    // invoke_outlet: invoker without OutletCall capability
     // -----------------------------------------------------------------------
 
     #[tokio::test]
@@ -1715,12 +1715,12 @@ mod tests {
     fn has_tool_invoke_capability_with_specific_tool() {
         let mut role_state =
             test_role_state_with_no_invoke_member("did:dht:z6MkCreator", "did:dht:z6MkMember");
-        // Add specific ToolInvoke capability.
+        // Add specific OutletCall capability.
         role_state
             .member_capabilities
             .get_mut("did:dht:z6MkMember")
             .unwrap()
-            .insert(Capability::ToolInvoke("calculator".to_owned()));
+            .insert(Capability::OutletCall("calculator".to_owned()));
 
         assert!(has_outlet_invoke_capability(
             &role_state,
@@ -1806,7 +1806,7 @@ mod tests {
         use scp_platform::traits::{KeyCustody, KeyType};
         use scp_protocol::crypto::ucan::validate::{
             DEFAULT_CLOCK_SKEW_TOLERANCE_SECS, InMemoryDidResolver, InMemoryNonceTracker,
-            InMemoryProofResolver, InMemoryRevocationChecker, ValidationContext,
+            InMemoryProofResolver, InMemoryRevocationChecker, NoCaveatResolver, ValidationContext,
         };
 
         // Set up issuer identity.
@@ -1816,7 +1816,7 @@ mod tests {
         let pk_bytes: [u8; 32] = pubkey.as_bytes().try_into().unwrap();
         let issuer_did = format!("did:dht:z{}", zbase32::encode(pubkey.as_bytes()));
 
-        // Mint a UCAN with messages:write capability (NOT tool_invoke).
+        // Mint a UCAN with messages:write capability (NOT outlet_call).
         let caps = vec!["messages:write".to_owned()];
         let params = MintParams {
             issuer_did: &issuer_did,
@@ -1846,16 +1846,18 @@ mod tests {
         let proof_resolver = InMemoryProofResolver::new();
         let ceiling: HashSet<String> = [
             "messages:write".to_owned(),
-            "tool_invoke:calculator".to_owned(),
+            "outlet_call:calculator".to_owned(),
         ]
         .into_iter()
         .collect();
 
+        let caveat_resolver = NoCaveatResolver;
         let mut ctx = ValidationContext {
             did_resolver: &resolver,
             nonce_tracker: &mut nonce_tracker,
             revocation_checker: &revocation_checker,
             proof_resolver: &proof_resolver,
+            caveat_resolver: &caveat_resolver,
             ceiling: &ceiling,
             context_creator_did: &issuer_did,
             presenting_agent_did: "did:dht:z6MkMember",
@@ -1863,7 +1865,7 @@ mod tests {
             clock: &scp_clock::SystemClock,
         };
 
-        // validate_outlet_invocation_ucan expects tool_invoke:calculator,
+        // validate_outlet_invocation_ucan expects outlet_call:calculator,
         // but the token only has messages:write — must be rejected.
         let result =
             validate_outlet_invocation_ucan(&token.encoded, "ctx-test", "calculator", &mut ctx);
@@ -1889,7 +1891,7 @@ mod tests {
             cost_schedule: CostSchedule {
                 currency: CurrencyCode::new([85, 83, 68, 0]),
                 per_message: None,
-                per_tool_invoke: Some(Amount::new(200)),
+                per_outlet_call: Some(Amount::new(200)),
                 per_join: None,
                 per_period: None,
                 per_byte_stored: None,
@@ -1964,6 +1966,7 @@ mod tests {
                     att: vec![],
                     prf: vec![],
                     fct: Some(serde_json::Value::Object(fct)),
+                    nb: None,
                 },
                 signature: vec![0u8; 64],
                 encoded: String::new(),

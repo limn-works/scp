@@ -215,7 +215,7 @@ async fn phase2_end_to_end_integration() {
     // -----------------------------------------------------------------------
     // Step 1: Alice creates an identity and a context.
     //
-    // Context config: ceiling [messaging, tool_invoke], roles [admin, member],
+    // Context config: ceiling [messaging, outlet_call], roles [admin, member],
     // one tool "calculator", TTL 5 minutes, memory scope ephemeral.
     // -----------------------------------------------------------------------
 
@@ -228,8 +228,8 @@ async fn phase2_end_to_end_integration() {
     let ceiling = CapabilityCeiling::new([
         Capability::MessagesRead,
         Capability::MessagesWrite,
-        Capability::ToolInvokeAll,
-        Capability::ToolRegister,
+        Capability::OutletCallAll,
+        Capability::OutletRegister,
         Capability::RoleAssign,
         Capability::MemberInvite,
         Capability::MemberRemove,
@@ -241,8 +241,8 @@ async fn phase2_end_to_end_integration() {
         ceiling: vec![
             Capability::MessagesRead,
             Capability::MessagesWrite,
-            Capability::ToolInvokeAll,
-            Capability::ToolRegister,
+            Capability::OutletCallAll,
+            Capability::OutletRegister,
             Capability::RoleAssign,
             Capability::MemberInvite,
             Capability::MemberRemove,
@@ -403,7 +403,7 @@ async fn phase2_end_to_end_integration() {
     assert!(
         discovered_params
             .ceiling
-            .contains(&Capability::ToolInvokeAll)
+            .contains(&Capability::OutletCallAll)
     );
 
     // Bob joins: add to member set.
@@ -424,7 +424,7 @@ async fn phase2_end_to_end_integration() {
 
     // -----------------------------------------------------------------------
     // Step 4: Bob is assigned the "member" role with UCAN tokens for
-    //         messages:read, messages:write, tool_invoke_all.
+    //         messages:read, messages:write, outlet_call_all.
     // -----------------------------------------------------------------------
 
     let bob_tokens = assign_role(
@@ -445,7 +445,7 @@ async fn phase2_end_to_end_integration() {
     // Verify Bob has the expected capabilities.
     assert!(role_state.member_has_capability(&bob_did, &Capability::MessagesRead));
     assert!(role_state.member_has_capability(&bob_did, &Capability::MessagesWrite));
-    assert!(role_state.member_has_capability(&bob_did, &Capability::ToolInvokeAll));
+    assert!(role_state.member_has_capability(&bob_did, &Capability::OutletCallAll));
 
     // Verify Bob does NOT have admin-level capabilities.
     assert!(!role_state.member_has_capability(&bob_did, &Capability::RoleAssign));
@@ -529,7 +529,7 @@ async fn phase2_end_to_end_integration() {
     // -----------------------------------------------------------------------
     // Step 7: Bob invokes the "calculator" tool with input
     //         {"operation": "add", "a": 1, "b": 2}.
-    //         UCAN validates Bob has tool_invoke capability.
+    //         UCAN validates Bob has outlet_call capability.
     //         Tool returns {"result": 3}. Invocation is logged.
     // -----------------------------------------------------------------------
 

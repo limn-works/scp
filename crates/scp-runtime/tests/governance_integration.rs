@@ -185,12 +185,12 @@ fn new_manager() -> std::sync::Arc<Supervisor> {
 /// Standard ceiling that includes all governance-relevant capabilities.
 fn governance_ceiling() -> Vec<Capability> {
     vec![
-        Capability::new("messages:read"),
-        Capability::new("messages:write"),
-        Capability::new("role:assign"),
-        Capability::new("governance:propose"),
-        Capability::new("governance:vote"),
-        Capability::new("context:close"),
+        Capability::new("messages:read").expect("known capability"),
+        Capability::new("messages:write").expect("known capability"),
+        Capability::new("role:assign").expect("known capability"),
+        Capability::new("governance:propose").expect("known capability"),
+        Capability::new("governance:vote").expect("known capability"),
+        Capability::new("context:close").expect("known capability"),
         Capability::MemberBan,
     ]
 }
@@ -659,12 +659,12 @@ async fn governance_out_of_ceiling_action_rejected_native() {
     let ctx_id = "ctx-single-admin-out-of-ceiling";
     // Ceiling deliberately EXCLUDES `member:ban` (MemberBan).
     let ceiling = vec![
-        Capability::new("messages:read"),
-        Capability::new("messages:write"),
-        Capability::new("role:assign"),
-        Capability::new("governance:propose"),
-        Capability::new("governance:vote"),
-        Capability::new("context:close"),
+        Capability::new("messages:read").expect("known capability"),
+        Capability::new("messages:write").expect("known capability"),
+        Capability::new("role:assign").expect("known capability"),
+        Capability::new("governance:propose").expect("known capability"),
+        Capability::new("governance:vote").expect("known capability"),
+        Capability::new("context:close").expect("known capability"),
     ];
     let params = ContextParams {
         ceiling,
@@ -721,12 +721,12 @@ async fn governance_out_of_ceiling_create_child_context_rejected_native() {
     let ctx_id = "ctx-single-admin-child-out-of-ceiling";
     // Ceiling deliberately EXCLUDES ChildContextCreate (context:child:create).
     let ceiling = vec![
-        Capability::new("messages:read"),
-        Capability::new("messages:write"),
-        Capability::new("role:assign"),
-        Capability::new("governance:propose"),
-        Capability::new("governance:vote"),
-        Capability::new("context:close"),
+        Capability::new("messages:read").expect("known capability"),
+        Capability::new("messages:write").expect("known capability"),
+        Capability::new("role:assign").expect("known capability"),
+        Capability::new("governance:propose").expect("known capability"),
+        Capability::new("governance:vote").expect("known capability"),
+        Capability::new("context:close").expect("known capability"),
     ];
     let params = ContextParams {
         ceiling,
@@ -777,7 +777,7 @@ async fn governance_out_of_ceiling_create_child_context_rejected_native() {
 
 // =========================================================================
 // §9.9.3 REJECT-decision behavior for `EstablishToolInterface`.
-// Gated on `Capability::ToolInterface` in
+// Gated on `Capability::OutletInterface` in
 // `execute_establish_outlet_interface` (`governance_helpers.rs`). With the
 // capability absent from the ceiling, the action is rejected and mints ZERO
 // leaves — pinning the convergent reject all honest members must produce.
@@ -788,12 +788,12 @@ async fn governance_out_of_ceiling_establish_tool_interface_rejected_native() {
     let ctx_id = "ctx-single-admin-iface-out-of-ceiling";
     // Ceiling deliberately EXCLUDES OutletInterface (tool:interface).
     let ceiling = vec![
-        Capability::new("messages:read"),
-        Capability::new("messages:write"),
-        Capability::new("role:assign"),
-        Capability::new("governance:propose"),
-        Capability::new("governance:vote"),
-        Capability::new("context:close"),
+        Capability::new("messages:read").expect("known capability"),
+        Capability::new("messages:write").expect("known capability"),
+        Capability::new("role:assign").expect("known capability"),
+        Capability::new("governance:propose").expect("known capability"),
+        Capability::new("governance:vote").expect("known capability"),
+        Capability::new("context:close").expect("known capability"),
     ];
     let params = ContextParams {
         ceiling,
@@ -1216,8 +1216,8 @@ async fn ac9_checked_propose_requires_capability() {
     let params = ContextParams {
         // Deliberately omit governance:propose from ceiling to test permission denial.
         ceiling: vec![
-            Capability::new("messages:read"),
-            Capability::new("messages:write"),
+            Capability::new("messages:read").expect("known capability"),
+            Capability::new("messages:write").expect("known capability"),
         ],
         governance: GovernanceModel::SingleAdmin,
         ..ContextParams::default()
@@ -1345,7 +1345,7 @@ async fn execute_remove_member_clears_suspension() {
             &alice(),
             GovernanceAction::SuspendCapability {
                 did: bob(),
-                capabilities: vec![Capability::new("messages:write")],
+                capabilities: vec![Capability::new("messages:write").expect("known capability")],
             },
             &sk_alice,
         )
@@ -1464,7 +1464,7 @@ async fn execute_remove_then_readmit_regression() {
             &alice(),
             GovernanceAction::SuspendCapability {
                 did: bob(),
-                capabilities: vec![Capability::new("messages:write")],
+                capabilities: vec![Capability::new("messages:write").expect("known capability")],
             },
             &sk_alice,
         )
@@ -1473,7 +1473,10 @@ async fn execute_remove_then_readmit_regression() {
 
     // During suspension bob is denied messages:write.
     let rs = manager.get_role_state(ctx_id).await.unwrap();
-    assert!(!rs.member_has_capability(bob().as_ref(), &Capability::new("messages:write")));
+    assert!(!rs.member_has_capability(
+        bob().as_ref(),
+        &Capability::new("messages:write").expect("known capability")
+    ));
 
     // Remove.
     manager
@@ -1511,7 +1514,10 @@ async fn execute_remove_then_readmit_regression() {
 
     let rs = manager.get_role_state(ctx_id).await.unwrap();
     assert!(
-        rs.member_has_capability(bob().as_ref(), &Capability::new("messages:write")),
+        rs.member_has_capability(
+            bob().as_ref(),
+            &Capability::new("messages:write").expect("known capability")
+        ),
         "re-admitted same-DID member MUST hold the capability their role grants (spec §5.6.1)"
     );
 }
@@ -1554,7 +1560,7 @@ async fn leave_context_clears_suspension() {
             &alice(),
             GovernanceAction::SuspendCapability {
                 did: bob(),
-                capabilities: vec![Capability::new("messages:write")],
+                capabilities: vec![Capability::new("messages:write").expect("known capability")],
             },
             &sk_alice,
         )

@@ -419,8 +419,8 @@ mod tests {
         CapabilityCeiling::new([
             Capability::MessagesRead,
             Capability::MessagesWrite,
-            Capability::ToolRegister,
-            Capability::ToolInvokeAll,
+            Capability::OutletRegister,
+            Capability::OutletCallAll,
             Capability::RoleAssign,
             Capability::MemberInvite,
             Capability::MemberRemove,

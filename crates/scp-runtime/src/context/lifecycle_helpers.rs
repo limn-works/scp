@@ -3749,6 +3749,7 @@ mod restore_reconcile_tests {
             }],
             prf: vec![],
             fct: Some(serde_json::Value::Object(fct)),
+            nb: None,
         };
 
         let header_json = serde_json::to_vec(&header).expect("header serializes");
@@ -3863,7 +3864,7 @@ mod restore_reconcile_tests {
             cost_schedule: scp_protocol::economy::types::CostSchedule {
                 currency: scp_protocol::economy::types::CurrencyCode::from("USD"),
                 per_message: None,
-                per_tool_invoke: None,
+                per_outlet_call: None,
                 per_join: Some(scp_protocol::economy::types::Amount(10)),
                 per_period: None,
                 per_byte_stored: None,
@@ -4219,7 +4220,7 @@ mod restore_reconcile_tests {
             cost_schedule: scp_protocol::economy::types::CostSchedule {
                 currency: scp_protocol::economy::types::CurrencyCode::from("USD"),
                 per_message: Some(scp_protocol::economy::types::Amount(10)),
-                per_tool_invoke: None,
+                per_outlet_call: None,
                 per_join: None,
                 per_period: None,
                 per_byte_stored: None,

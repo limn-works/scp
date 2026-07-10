@@ -372,12 +372,12 @@ pub fn enforce_economy(
     // pricing formula, evaluate it against observable metrics; otherwise the
     // formula is absent and `evaluate_cost` consults the flat `CostSchedule`.
     //
-    // §19.7 escalation applies to MessageSend, ContextJoin, and ToolInvoke.
+    // §19.7 escalation applies to MessageSend, ContextJoin, and OutletCall.
     // For SubscriptionPeriod and ByteStored we delegate entirely to the
     // policy (no per-DID escalation makes sense for them).
     let escalation_eligible = matches!(
         action_type,
-        PaidActionType::MessageSend | PaidActionType::ContextJoin | PaidActionType::ToolInvoke
+        PaidActionType::MessageSend | PaidActionType::ContextJoin | PaidActionType::OutletCall
     );
 
     let velocity = velocity_tracker.get_velocity(actor_did, now);

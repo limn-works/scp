@@ -140,11 +140,11 @@ fn signing_key_for_did(did: &DID) -> ed25519_dalek::SigningKey {
 
 fn ceiling() -> Vec<Capability> {
     vec![
-        Capability::new("messages:read"),
-        Capability::new("messages:write"),
-        Capability::new("governance:propose"),
-        Capability::new("governance:vote"),
-        Capability::new("role:assign"),
+        Capability::new("messages:read").expect("known capability"),
+        Capability::new("messages:write").expect("known capability"),
+        Capability::new("governance:propose").expect("known capability"),
+        Capability::new("governance:vote").expect("known capability"),
+        Capability::new("role:assign").expect("known capability"),
     ]
 }
 

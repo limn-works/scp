@@ -26,8 +26,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 2. Build role state with tool capabilities in the ceiling.
     let ceiling = CapabilityCeiling::new([
-        Capability::ToolRegister,
-        Capability::ToolInvokeAll,
+        Capability::OutletRegister,
+        Capability::OutletCallAll,
         Capability::MessagesRead,
         Capability::MessagesWrite,
     ]);

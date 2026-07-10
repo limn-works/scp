@@ -1316,7 +1316,7 @@ mod tests {
             vec![
                 "messages:read".to_owned(),
                 "messages:write".to_owned(),
-                "tool:invoke".to_owned(),
+                "outlet:call".to_owned(),
             ],
         );
         // "viewer" removed, "moderator" added

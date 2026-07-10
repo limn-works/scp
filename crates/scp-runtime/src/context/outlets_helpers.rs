@@ -539,7 +539,7 @@ pub async fn reserve_outlet_economy(
         // the tool path. try_consume before any Phase-1 bookkeeping.
         if !gov.hard_rate_limit_mut().try_consume(invoker_did, now_secs) {
             return Err(ContextError::RateLimited {
-                resource: "tool_invoke".to_owned(),
+                resource: "outlet_call".to_owned(),
                 message: "hard rate limit exceeded for invoker".to_owned(),
                 // Token-bucket hard limit: no exact refill instant to surface.
                 retry_after_ms: None,
@@ -1368,7 +1368,7 @@ fn invocation_error_to_context(err: InvocationError) -> ContextError {
             format!("SCP-TOOL-6080: context not active: {current_state}"),
         ),
         InvocationError::InvokerNotAuthorized { did, outlet_id } => ContextError::PermissionDenied(
-            format!("SCP-TOOL-6081: invoker {did} lacks ToolInvoke({outlet_id})"),
+            format!("SCP-TOOL-6081: invoker {did} lacks OutletCall({outlet_id})"),
         ),
         InvocationError::OutletNotFound { outlet_id } => {
             ContextError::PermissionDenied(format!("SCP-TOOL-6082: tool not found: {outlet_id}"))
@@ -1617,7 +1617,7 @@ mod tests {
                 cost_schedule: CostSchedule {
                     currency: CurrencyCode::from("USD"),
                     per_message: None,
-                    per_tool_invoke: Some(Amount(50)),
+                    per_outlet_call: Some(Amount(50)),
                     per_join: None,
                     per_period: None,
                     per_byte_stored: None,
@@ -1637,7 +1637,7 @@ mod tests {
                 PreparedAction {
                     envelope: ActionEnvelope {
                         actor: invoker.clone(),
-                        action_type: PaidActionType::ToolInvoke,
+                        action_type: PaidActionType::OutletCall,
                         context_id: None,
                         authorization: Some(auth(
                             &invoker,

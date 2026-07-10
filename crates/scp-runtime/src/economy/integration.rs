@@ -524,7 +524,7 @@ mod tests {
             cost_schedule: CostSchedule {
                 currency: usd(),
                 per_message: Some(Amount(10)),
-                per_tool_invoke: Some(Amount(50)),
+                per_outlet_call: Some(Amount(50)),
                 per_join: None,
                 per_period: None,
                 per_byte_stored: None,

@@ -1594,7 +1594,7 @@ pub async fn execute_register_outlet(
     if !cell
         .role_state
         .ceiling()
-        .contains(&Capability::ToolRegister)
+        .contains(&Capability::OutletRegister)
     {
         return Err(ContextError::PermissionDenied(
             "context ceiling does not include tool registration capability".into(),
@@ -2422,7 +2422,7 @@ pub async fn execute_establish_outlet_interface(
     if !cell
         .role_state
         .ceiling()
-        .contains(&Capability::ToolInterface)
+        .contains(&Capability::OutletInterface)
     {
         return Err(ContextError::PermissionDenied(
             "context ceiling does not include tool interface capability".into(),

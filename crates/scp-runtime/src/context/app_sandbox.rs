@@ -152,7 +152,7 @@ impl CapabilityEntry {
         for action in &self.actions {
             match (category, action.as_str(), is_tool) {
                 (_, "invoke", true) => {
-                    capabilities.push(Capability::ToolInvoke(category.to_owned()));
+                    capabilities.push(Capability::OutletCall(category.to_owned()));
                 }
                 ("messaging" | "members", "read", _) => {
                     capabilities.push(Capability::MessagesRead);
@@ -161,9 +161,9 @@ impl CapabilityEntry {
                 ("members", "write" | "admin", _) => {
                     capabilities.push(Capability::MemberInvite);
                 }
-                ("tools", "invoke", _) => capabilities.push(Capability::ToolInvokeAll),
+                ("tools", "invoke", _) => capabilities.push(Capability::OutletCallAll),
                 ("tools", "register" | "admin", _) => {
-                    capabilities.push(Capability::ToolRegister);
+                    capabilities.push(Capability::OutletRegister);
                 }
                 ("governance", "write", _) => capabilities.push(Capability::GovernancePropose),
                 ("governance", "admin", _) => {
@@ -542,29 +542,29 @@ impl ScopedHandle {
         self.check_capability(&Capability::GovernanceVote)
     }
 
-    /// Checks `ToolInvokeAll` or `ToolInvoke(outlet_id)` capability.
+    /// Checks `OutletCallAll` or `OutletCall(outlet_id)` capability.
     ///
     /// # Errors
     ///
-    /// Returns `SandboxError::CapabilityDenied` if neither `ToolInvokeAll` nor
-    /// `ToolInvoke(outlet_id)` is granted.
+    /// Returns `SandboxError::CapabilityDenied` if neither `OutletCallAll` nor
+    /// `OutletCall(outlet_id)` is granted.
     pub fn check_outlet_invoke(&self, outlet_id: &str) -> Result<(), SandboxError> {
         if self
             .allowed_capabilities
-            .contains(&Capability::ToolInvokeAll)
+            .contains(&Capability::OutletCallAll)
         {
             return Ok(());
         }
-        self.check_capability(&Capability::ToolInvoke(outlet_id.to_owned()))
+        self.check_capability(&Capability::OutletCall(outlet_id.to_owned()))
     }
 
-    /// Checks `ToolRegister` capability.
+    /// Checks `OutletRegister` capability.
     ///
     /// # Errors
     ///
-    /// Returns `SandboxError::CapabilityDenied` if `ToolRegister` is not granted.
+    /// Returns `SandboxError::CapabilityDenied` if `OutletRegister` is not granted.
     pub fn check_outlet_register(&self) -> Result<(), SandboxError> {
-        self.check_capability(&Capability::ToolRegister)
+        self.check_capability(&Capability::OutletRegister)
     }
 
     /// Checks `MemberInvite` capability.
@@ -672,7 +672,7 @@ impl ScopedHandle {
     ///
     /// Returns `SandboxError::CapabilityDenied` if `OutletInterface` is not granted.
     pub fn check_outlet_interface(&self) -> Result<(), SandboxError> {
-        self.check_capability(&Capability::ToolInterface)
+        self.check_capability(&Capability::OutletInterface)
     }
 }
 
@@ -769,11 +769,11 @@ pub fn validate_declaration(
 
     for cap in &requested {
         if !ceiling_set.contains(cap) {
-            // Check if ToolInvokeAll covers ToolInvoke(specific)
-            if matches!(cap, Capability::ToolInvoke(_))
-                && ceiling_set.contains(&Capability::ToolInvokeAll)
+            // Check if OutletCallAll covers OutletCall(specific)
+            if matches!(cap, Capability::OutletCall(_))
+                && ceiling_set.contains(&Capability::OutletCallAll)
             {
-                // ToolInvokeAll in ceiling covers specific ToolInvoke
+                // OutletCallAll in ceiling covers specific OutletCall
             } else {
                 denied.push(DeniedCapability {
                     capability: cap.clone(),
@@ -782,11 +782,11 @@ pub fn validate_declaration(
             }
         }
         if !role_set.contains(cap) {
-            // Check if ToolInvokeAll covers ToolInvoke(specific)
-            if matches!(cap, Capability::ToolInvoke(_))
-                && role_set.contains(&Capability::ToolInvokeAll)
+            // Check if OutletCallAll covers OutletCall(specific)
+            if matches!(cap, Capability::OutletCall(_))
+                && role_set.contains(&Capability::OutletCallAll)
             {
-                // ToolInvokeAll in role covers specific ToolInvoke
+                // OutletCallAll in role covers specific OutletCall
             } else {
                 denied.push(DeniedCapability {
                     capability: cap.clone(),
@@ -1522,13 +1522,13 @@ mod tests {
 
     #[test]
     fn scoped_handle_check_tool_invoke_specific_granted() {
-        let handle = make_scoped_handle(vec![Capability::ToolInvoke("my_tool".to_owned())]);
+        let handle = make_scoped_handle(vec![Capability::OutletCall("my_tool".to_owned())]);
         assert!(handle.check_outlet_invoke("my_tool").is_ok());
     }
 
     #[test]
     fn scoped_handle_check_tool_invoke_specific_denied() {
-        let handle = make_scoped_handle(vec![Capability::ToolInvoke("my_tool".to_owned())]);
+        let handle = make_scoped_handle(vec![Capability::OutletCall("my_tool".to_owned())]);
         assert!(matches!(
             handle.check_outlet_invoke("other_tool"),
             Err(SandboxError::CapabilityDenied { .. })
@@ -1537,13 +1537,13 @@ mod tests {
 
     #[test]
     fn scoped_handle_check_tool_invoke_all_covers_specific() {
-        let handle = make_scoped_handle(vec![Capability::ToolInvokeAll]);
+        let handle = make_scoped_handle(vec![Capability::OutletCallAll]);
         assert!(handle.check_outlet_invoke("any_tool").is_ok());
     }
 
     #[test]
     fn scoped_handle_check_tool_register_granted() {
-        let handle = make_scoped_handle(vec![Capability::ToolRegister]);
+        let handle = make_scoped_handle(vec![Capability::OutletRegister]);
         assert!(handle.check_outlet_register().is_ok());
     }
 
@@ -1651,7 +1651,7 @@ mod tests {
 
     #[test]
     fn scoped_handle_check_tool_interface_granted() {
-        let handle = make_scoped_handle(vec![Capability::ToolInterface]);
+        let handle = make_scoped_handle(vec![Capability::OutletInterface]);
         assert!(handle.check_outlet_interface().is_ok());
     }
 
@@ -1773,7 +1773,7 @@ mod tests {
             constraints: None,
         };
         let caps = entry.to_capabilities();
-        assert_eq!(caps, vec![Capability::ToolInvokeAll]);
+        assert_eq!(caps, vec![Capability::OutletCallAll]);
     }
 
     #[test]
@@ -1784,7 +1784,7 @@ mod tests {
             constraints: None,
         };
         let caps = entry.to_capabilities();
-        assert_eq!(caps, vec![Capability::ToolInvoke("my_tool".to_owned())]);
+        assert_eq!(caps, vec![Capability::OutletCall("my_tool".to_owned())]);
     }
 
     #[test]
@@ -1917,8 +1917,8 @@ mod tests {
         sign_declaration(&mut decl, &signing_key).unwrap();
 
         // Ceiling has ToolInvokeAll, not the specific tool.
-        let ceiling = vec![Capability::ToolInvokeAll];
-        let role_caps = vec![Capability::ToolInvokeAll];
+        let ceiling = vec![Capability::OutletCallAll];
+        let role_caps = vec![Capability::OutletCallAll];
         let handle = ContextHandle::new("ctx-1".to_owned(), ContextParams::default());
 
         let result = validate_declaration(&decl, &ceiling, &role_caps, handle);
@@ -2278,7 +2278,7 @@ mod tests {
         assert!(!handle.has_capability(&Capability::MessagesRead));
         assert!(!handle.has_capability(&Capability::MessagesWrite));
         assert!(!handle.has_capability(&Capability::GovernancePropose));
-        assert!(!handle.has_capability(&Capability::ToolInvokeAll));
+        assert!(!handle.has_capability(&Capability::OutletCallAll));
     }
 
     #[test]
@@ -2407,7 +2407,7 @@ mod tests {
             Capability::MessagesRead,
             Capability::MessagesWrite,
             Capability::GovernancePropose,
-            Capability::ToolInvokeAll,
+            Capability::OutletCallAll,
             Capability::MemberInvite,
         ];
         let handle = make_scoped_handle(caps);

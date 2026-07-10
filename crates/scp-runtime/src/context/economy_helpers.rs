@@ -385,7 +385,7 @@ const fn paid_action_label(action_type: &PaidActionType) -> &'static str {
     match action_type {
         PaidActionType::MessageSend => "send_message",
         PaidActionType::ContextJoin => "join_context",
-        PaidActionType::ToolInvoke => "tool_invoke",
+        PaidActionType::OutletCall => "outlet_call",
         PaidActionType::SubscriptionPeriod => "subscription_period",
         PaidActionType::ByteStored => "byte_stored",
     }
