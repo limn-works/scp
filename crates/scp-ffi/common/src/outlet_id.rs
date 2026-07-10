@@ -68,7 +68,10 @@ mod tests {
         // unchanged (silent cross-system divergence when another layer
         // Unicode-normalises whitespace). Now splits the same as a
         // regular space.
-        assert_eq!(generate_outlet_id("Search\u{A0}Outlet"), "outlet-search-outlet");
+        assert_eq!(
+            generate_outlet_id("Search\u{A0}Outlet"),
+            "outlet-search-outlet"
+        );
         // Ideographic space (U+3000) + mixed Unicode whitespace.
         assert_eq!(generate_outlet_id("My\u{3000}Outlet"), "outlet-my-outlet");
     }

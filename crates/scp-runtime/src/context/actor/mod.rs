@@ -47,8 +47,8 @@ pub mod state;
 
 pub use commands::{
     BroadcastCommand, ContextCommand, EconomyCommand, GovernanceCommand, LifecycleCommand,
-    LifecycleControlCommand, MessagingCommand, QueriesCommand, SagaPhaseMessage, StandingCommand,
-    OutletsCommand, TrustRecoveryCommand, TtlCloseCommand,
+    LifecycleControlCommand, MessagingCommand, OutletsCommand, QueriesCommand, SagaPhaseMessage,
+    StandingCommand, TrustRecoveryCommand, TtlCloseCommand,
 };
 pub use deps::ActorDeps;
 pub use handle::{ContextActorHandle, SEND_TIMEOUT};

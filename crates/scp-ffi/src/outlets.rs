@@ -1535,8 +1535,8 @@ fn outlet_interface_expose_impl(
 
     let rate_limit = match rate_limit_json {
         Some(json) => {
-            let parsed: scp_core::context::outlets::interface::RateLimit = serde_json::from_str(json)
-                .map_err(|e| ScpPyError::ValidationError {
+            let parsed: scp_core::context::outlets::interface::RateLimit =
+                serde_json::from_str(json).map_err(|e| ScpPyError::ValidationError {
                     message: format!("invalid rate_limit_json: {e}"),
                     code: codes::VALID_7040.to_owned(),
                 })?;
@@ -2054,7 +2054,13 @@ impl crate::scp::PyScp {
         rate_limit_json: Option<&str>,
     ) -> PyResult<String> {
         let bi = &*self.inner;
-        outlet_interface_expose_impl(bi, context_id, outlet_id, target_context_id, rate_limit_json)
+        outlet_interface_expose_impl(
+            bi,
+            context_id,
+            outlet_id,
+            target_context_id,
+            rate_limit_json,
+        )
     }
 
     /// Accepts a cross-context outlet interface (§6.2.0.1 step 4).

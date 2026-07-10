@@ -43,13 +43,13 @@ use crate::mcp::{
     NapiAllowlistState, NapiMcpClientHandle, NapiMcpInvokeResult, NapiMcpServerConfig,
     NapiMcpServerHandle, NapiMcpToolInfo,
 };
+use crate::outlets::{NapiOutletDefinition, NapiOutletVerificationResult};
 use crate::runtime::{NapiBridgeInstance, SqliteKeyMaterial, StorageConfig};
 #[cfg(feature = "server")]
 use crate::server::{NapiNodeHandle, NapiRelayHandle};
 use crate::sync::NapiSyncPolicy;
 #[cfg(feature = "allow_in_memory_custody")]
 use crate::testing::NapiFullStackNode;
-use crate::outlets::{NapiOutletDefinition, NapiOutletVerificationResult};
 use crate::transport::{NapiReliabilityScore, NapiTransportManager, NapiTransportStatus};
 use crate::trust::{NapiAttestationVerificationResult, NapiChallengeResult, NapiTrustScoreResult};
 use crate::ucan::NapiUcanToken;

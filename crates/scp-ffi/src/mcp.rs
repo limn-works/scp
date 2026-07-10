@@ -3222,7 +3222,8 @@ mod tests {
         let failing_handler: crate::runtime::OutletHandler =
             std::sync::Arc::new(|_input| Err("computation exploded".to_owned()));
 
-        crate::runtime::register_outlet_handler(&bi, &ctx_id, "calculator", failing_handler).unwrap();
+        crate::runtime::register_outlet_handler(&bi, &ctx_id, "calculator", failing_handler)
+            .unwrap();
 
         let provider = FfiBridgeProvider {
             bi: Arc::downgrade(&bi),

@@ -36,10 +36,10 @@ use scp_protocol::context::governance::{
 use scp_protocol::context::membership::{
     ContextEvent, MembershipState, ReceiveBuffer, RedactedBytes,
 };
+use scp_protocol::context::outlets::interface::OutletInterface;
 use scp_protocol::context::params::GovernanceModel;
 use scp_protocol::context::params::OutletRegistration;
 use scp_protocol::context::roles::{Capability, ContextRoleState};
-use scp_protocol::context::outlets::interface::OutletInterface;
 use scp_protocol::context::{ContextError, ContextParams, ContextState};
 use scp_protocol::economy::budget::MemberBudgetTracker;
 use scp_protocol::economy::types::EconomicPolicy;

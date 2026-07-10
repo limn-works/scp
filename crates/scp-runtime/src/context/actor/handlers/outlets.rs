@@ -85,7 +85,8 @@ pub(crate) async fn dispatch(
             request,
             reply,
         } => {
-            handle_settle_outlet_economy(cell, deps, &context_id, &invoker_did, *request, reply).await
+            handle_settle_outlet_economy(cell, deps, &context_id, &invoker_did, *request, reply)
+                .await
         }
     }
 }
@@ -230,7 +231,9 @@ async fn handle_settle_outlet_economy(
     context_id: &str,
     invoker_did: &scp_did::DID,
     request: crate::context::outlets_helpers::OutletSettleRequest,
-    reply: oneshot::Sender<Result<crate::context::outlets_helpers::OutletSettleOutcome, ContextError>>,
+    reply: oneshot::Sender<
+        Result<crate::context::outlets_helpers::OutletSettleOutcome, ContextError>,
+    >,
 ) -> Outcome<()> {
     let settle_fut = crate::context::outlets_helpers::settle_outlet_economy(
         cell,

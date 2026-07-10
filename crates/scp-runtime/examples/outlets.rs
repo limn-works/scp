@@ -7,11 +7,11 @@
 //!   `cargo run -p scp-runtime --features testing --example tools`
 
 use scp_did::DID;
-use scp_protocol::context::roles::{Capability, CapabilityCeiling, ContextRoleState};
 use scp_protocol::context::outlets::lifecycle::OutletStatus;
 use scp_protocol::context::outlets::registry::{
     OutletRegistration, OutletRegistry, OutletSchema, register_outlet,
 };
+use scp_protocol::context::roles::{Capability, CapabilityCeiling, ContextRoleState};
 use scp_protocol::context::{ContextParams, ContextState};
 use scp_runtime::context::ContextHandle;
 use scp_runtime::context::outlets::invoke::invoke_outlet;

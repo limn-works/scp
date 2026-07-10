@@ -92,7 +92,7 @@ use scp_core::context::membership::KeyPackage;
 
 use scp_ffi_common::validate::{
     json_value_type_name, validate_capability_uri, validate_context_id, validate_did,
-    validate_mcp_handle, validate_relay_url, validate_outlet_id, validate_outlet_name,
+    validate_mcp_handle, validate_outlet_id, validate_outlet_name, validate_relay_url,
     validate_transport_mode, validate_ucan_token,
 };
 
@@ -4015,12 +4015,11 @@ fn validate_outlet_ucan_uniffi(
             clock: &scp_clock::SystemClock,
         };
 
-        validate_outlet_invocation_ucan(ucan_token, &handle.context_id, outlet_id, &mut ctx).map_err(
-            |e| ScpError::Permission {
+        validate_outlet_invocation_ucan(ucan_token, &handle.context_id, outlet_id, &mut ctx)
+            .map_err(|e| ScpError::Permission {
                 msg: format!("UCAN authorization failed for outlet '{outlet_id}': {e}"),
                 code: codes::PERM_3002.to_owned(),
-            },
-        )
+            })
     })
     .ok_or_else(|| ScpError::Permission {
         msg: format!("context '{}' not found in UCAN registry", handle.context_id),
@@ -4599,7 +4598,10 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
                 };
 
                 scp_core::context::outlets::validate_outlet_invocation_ucan(
-                    token, context_id, outlet_name, &mut ctx,
+                    token,
+                    context_id,
+                    outlet_name,
+                    &mut ctx,
                 )
                 .map_err(|e| {
                     tracing::warn!(
@@ -4695,9 +4697,9 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
                 .ok_or_else(|| format!("context '{context_id}' not found in handle registry"))?;
 
             let outlet_registry = handle.outlet_registry.blocking_lock();
-            let registration = outlet_registry
-                .get(outlet_name)
-                .ok_or_else(|| format!("outlet '{outlet_name}' not found in context '{context_id}'"))?;
+            let registration = outlet_registry.get(outlet_name).ok_or_else(|| {
+                format!("outlet '{outlet_name}' not found in context '{context_id}'")
+            })?;
 
             // Validate input against the outlet's input schema.
             scp_core::context::outlets::schema::validate_value_against_schema(
@@ -4745,7 +4747,9 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
                     &output,
                     &output_schema,
                 )
-                .map_err(|msg| format!("output validation failed for outlet '{outlet_name}': {msg}"))?;
+                .map_err(|msg| {
+                    format!("output validation failed for outlet '{outlet_name}': {msg}")
+                })?;
 
                 output
             }
@@ -19227,7 +19231,9 @@ mod tests {
             callback_custody: None,
             signing_key: None,
             ceiling_strings: Vec::new(),
-            outlet_registry: tokio::sync::Mutex::new(scp_core::context::outlets::OutletRegistry::new()),
+            outlet_registry: tokio::sync::Mutex::new(
+                scp_core::context::outlets::OutletRegistry::new(),
+            ),
             outlet_handlers: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             session_store: tokio::sync::Mutex::new(scp_core::context::outlets::SessionStore::new()),
             economic_policy: std::sync::Mutex::new(None),
@@ -19427,7 +19433,9 @@ mod tests {
             callback_custody: Some(callback_custody),
             signing_key: Some(key_handle),
             ceiling_strings: Vec::new(),
-            outlet_registry: tokio::sync::Mutex::new(scp_core::context::outlets::OutletRegistry::new()),
+            outlet_registry: tokio::sync::Mutex::new(
+                scp_core::context::outlets::OutletRegistry::new(),
+            ),
             outlet_handlers: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             session_store: tokio::sync::Mutex::new(scp_core::context::outlets::SessionStore::new()),
             economic_policy: std::sync::Mutex::new(None),
@@ -22481,7 +22489,9 @@ mod tests {
             callback_custody: Some(callback_custody),
             signing_key: Some(signing_key),
             ceiling_strings: Vec::new(),
-            outlet_registry: tokio::sync::Mutex::new(scp_core::context::outlets::OutletRegistry::new()),
+            outlet_registry: tokio::sync::Mutex::new(
+                scp_core::context::outlets::OutletRegistry::new(),
+            ),
             outlet_handlers: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             session_store: tokio::sync::Mutex::new(scp_core::context::outlets::SessionStore::new()),
             economic_policy: std::sync::Mutex::new(None),
@@ -23128,7 +23138,11 @@ mod tests {
 
         /// The handler-backed e2e's `RegisterTool` action (numeric `{sum, ok}`
         /// output schema).
-        fn saga_register_outlet_action_json(outlet_id: &str, outlet_name: &str, owner: &str) -> String {
+        fn saga_register_outlet_action_json(
+            outlet_id: &str,
+            outlet_name: &str,
+            owner: &str,
+        ) -> String {
             saga_register_outlet_action_json_with_output(
                 outlet_id,
                 outlet_name,
@@ -23140,7 +23154,11 @@ mod tests {
         /// Serializes the bidirectionally-approved `EstablishToolInterface`
         /// governance action (externally-tagged `GovernanceAction`; the
         /// `snake_case` `OutletInterface` `Option` fields render as JSON `null`).
-        fn saga_establish_interface_action_json(ctx_a: &str, ctx_b: &str, outlet_id: &str) -> String {
+        fn saga_establish_interface_action_json(
+            ctx_a: &str,
+            ctx_b: &str,
+            outlet_id: &str,
+        ) -> String {
             let action = serde_json::json!({
                 "EstablishToolInterface": {
                     "interface": {

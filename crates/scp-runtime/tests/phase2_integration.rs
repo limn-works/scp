@@ -33,12 +33,12 @@ use scp_event_log::tree::{self, GENESIS_PREV_HASH};
 use scp_event_log::{Event, EventLog, EventPayload, EventType};
 use scp_platform::testing::InMemoryKeyCustody;
 use scp_platform::traits::{KeyCustody, KeyType};
-use scp_protocol::context::roles::{
-    Capability, CapabilityCeiling, ContextRoleState, RoleDefinition, RoleError, assign_role,
-};
 use scp_protocol::context::outlets::lifecycle::OutletStatus;
 use scp_protocol::context::outlets::registry::{
     OutletRegistration, OutletRegistry, OutletSchema, register_outlet,
+};
+use scp_protocol::context::roles::{
+    Capability, CapabilityCeiling, ContextRoleState, RoleDefinition, RoleError, assign_role,
 };
 use scp_protocol::context::{ContextParams, ContextState, MemoryScope};
 use scp_runtime::context::ContextHandle;

@@ -27,8 +27,8 @@ use std::time::Duration;
 
 use scp_did::DID;
 use scp_protocol::context::params::{
-    Capability, ContextParams, GovernanceModel, MemoryScope, RoleDefinition, TemplateId,
-    OutletRegistration,
+    Capability, ContextParams, GovernanceModel, MemoryScope, OutletRegistration, RoleDefinition,
+    TemplateId,
 };
 
 // ---------------------------------------------------------------------------

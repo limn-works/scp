@@ -57,10 +57,10 @@ use std::sync::Arc;
 
 use scp_did::DID;
 use scp_protocol::context::ContextError;
-use scp_protocol::context::roles::ContextRoleState;
 use scp_protocol::context::outlets::OutletId;
 use scp_protocol::context::outlets::lifecycle::OutletInvokedEvent;
 use scp_protocol::context::outlets::registry::OutletRegistry;
+use scp_protocol::context::roles::ContextRoleState;
 use scp_protocol::crypto::ucan::UcanToken;
 use scp_protocol::economy::antispam::VelocityRollbackToken;
 use scp_protocol::economy::policy::ObservableMetrics;

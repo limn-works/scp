@@ -1097,9 +1097,9 @@ fn demo_signing_key(did: &scp_did::DID) -> ed25519_dalek::SigningKey {
 async fn application_layer_demo() {
     use scp_core::context::manager::ContextManager;
     use scp_core::context::membership::{ContextEvent, KeyPackage};
-    use scp_core::context::roles::{CapabilityCeiling, ContextRoleState};
     use scp_core::context::outlets::registry::{OutletRegistration, OutletRegistry, OutletSchema};
     use scp_core::context::outlets::{invoke_outlet, register_outlet};
+    use scp_core::context::roles::{CapabilityCeiling, ContextRoleState};
     use scp_core::context::{Capability, ContextParams, ContextState, GovernanceAction};
     use scp_did::DID;
 

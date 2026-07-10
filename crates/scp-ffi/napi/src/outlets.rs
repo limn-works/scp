@@ -228,18 +228,20 @@ pub(crate) async fn outlet_register_on(
 
     let cost = definition
         .cost
-        .map(|c| -> napi::Result<scp_core::context::outlets::OutletCost> {
-            // ADR-060: `OutletCost.amount` is the `Amount` newtype. The JS
-            // `bigint` marshals to an exact `u64` via the shared economy helper,
-            // preserving the full range (values above 2^53 survive intact).
-            let amount = crate::economy::amount_u64_from_bigint(&c.amount, "cost.amount")?;
-            Ok(scp_core::context::outlets::OutletCost {
-                amount: scp_core::economy::Amount(amount),
-                currency: c.currency,
-                payee: c.payee.into(),
-                cost_formula: c.cost_formula,
-            })
-        })
+        .map(
+            |c| -> napi::Result<scp_core::context::outlets::OutletCost> {
+                // ADR-060: `OutletCost.amount` is the `Amount` newtype. The JS
+                // `bigint` marshals to an exact `u64` via the shared economy helper,
+                // preserving the full range (values above 2^53 survive intact).
+                let amount = crate::economy::amount_u64_from_bigint(&c.amount, "cost.amount")?;
+                Ok(scp_core::context::outlets::OutletCost {
+                    amount: scp_core::economy::Amount(amount),
+                    currency: c.currency,
+                    payee: c.payee.into(),
+                    cost_formula: c.cost_formula,
+                })
+            },
+        )
         .transpose()?;
 
     let core_registration = scp_core::context::outlets::OutletRegistration {
@@ -583,15 +585,15 @@ pub(crate) async fn outlet_invoke_cross_context_on(
     })?;
 
     let output = crate::runtime::with_context(bi, &target_context_id, |rt| {
-        let registration = rt
-            .outlet_registry
-            .get(&outlet_id)
-            .ok_or_else(|| ScpNapiError::Outlet {
-                message: format!(
-                    "outlet '{outlet_id}' not found in target context '{target_context_id}'"
-                ),
-                code: codes::OUTLET_6002.to_owned(),
-            })?;
+        let registration =
+            rt.outlet_registry
+                .get(&outlet_id)
+                .ok_or_else(|| ScpNapiError::Outlet {
+                    message: format!(
+                        "outlet '{outlet_id}' not found in target context '{target_context_id}'"
+                    ),
+                    code: codes::OUTLET_6002.to_owned(),
+                })?;
 
         // Validate input against the outlet's input schema.
         scp_core::context::outlets::validate_value_against_schema(
@@ -1276,8 +1278,8 @@ pub(crate) async fn outlet_interface_expose_on(
 
     let rate_limit = match rate_limit_json {
         Some(ref json) => {
-            let parsed: scp_core::context::outlets::interface::RateLimit = serde_json::from_str(json)
-                .map_err(|e| {
+            let parsed: scp_core::context::outlets::interface::RateLimit =
+                serde_json::from_str(json).map_err(|e| {
                     napi::Error::from(ScpNapiError::Validation {
                         message: format!("invalid rate_limit_json: {e}"),
                         code: codes::VALID_7040.to_owned(),
@@ -2216,7 +2218,8 @@ mod tests {
 
             let handle_a = create_saga_context(&bi, &owner_identity).await;
             let handle_b = create_saga_context(&bi, &owner_identity).await;
-            let outlet_id = scp_ffi_common::outlet_id::generate_outlet_id("xctx_saga_unhosted_probe");
+            let outlet_id =
+                scp_ffi_common::outlet_id::generate_outlet_id("xctx_saga_unhosted_probe");
 
             // A syntactically valid DID that was never created on this instance.
             let unhosted_caller = "did:dht:z6MkUnhostedCallerPrincipal0001".to_owned();
@@ -2287,7 +2290,8 @@ mod tests {
             // Contexts created by `owner` ⇒ `stranger` is hosted but not a member.
             let handle_a = create_saga_context(&bi, &owner_identity).await;
             let handle_b = create_saga_context(&bi, &owner_identity).await;
-            let outlet_id = scp_ffi_common::outlet_id::generate_outlet_id("xctx_saga_nonmember_probe");
+            let outlet_id =
+                scp_ffi_common::outlet_id::generate_outlet_id("xctx_saga_nonmember_probe");
 
             let now_ms = u64::try_from(
                 std::time::SystemTime::now()

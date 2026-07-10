@@ -1727,7 +1727,11 @@ fn c4_pyo3_outlet_invoke_accepts_spending_ucan() {
 #[test]
 fn c4_napi_outlet_invoke_routes_through_invoke_outlet_with_economy() {
     assert!(
-        fn_body_contains(NAPI_TOOLS_SRC, "outlet_invoke_on", "invoke_outlet_with_economy"),
+        fn_body_contains(
+            NAPI_TOOLS_SRC,
+            "outlet_invoke_on",
+            "invoke_outlet_with_economy"
+        ),
         "NAPI outlet_invoke_on must call ContextManager::invoke_outlet_with_economy \
          (PR #1606 / C4). The previous bypass path called \
          try_consume_hard_rate_limit against the bridge-owned tool registry, \
@@ -1758,7 +1762,11 @@ fn c4_uniffi_outlet_invoke_routes_through_invoke_outlet_with_economy() {
     // `extract_fn_body` returns the first match, which is the
     // top-level `outlet_invoke` (not `outlet_invoke_cross_context`).
     assert!(
-        fn_body_contains(UNIFFI_BRIDGE_SRC, "outlet_invoke", "invoke_outlet_with_economy"),
+        fn_body_contains(
+            UNIFFI_BRIDGE_SRC,
+            "outlet_invoke",
+            "invoke_outlet_with_economy"
+        ),
         "UniFFI outlet_invoke must call ContextManager::invoke_outlet_with_economy \
          (PR #1606 / C4). The previous bypass path called \
          try_consume_hard_rate_limit against the bridge-owned tool registry, \

@@ -59,12 +59,12 @@ use std::sync::{Arc, OnceLock, RwLock};
 
 use dashmap::DashMap;
 use scp_core::context::builder::{ContextEventLogProvider, ContextTransportProvider};
+use scp_core::context::outlets::OutletRegistry;
 use scp_core::context::persistence::ContextPersistence;
 use scp_core::context::providers::{
     MerkleEventLogProvider, ProtocolRepositoryContextBridge, ProtocolRepositoryEventLogBridge,
 };
 use scp_core::context::roles::{ContextRoleState, default_ceiling};
-use scp_core::context::outlets::OutletRegistry;
 use scp_core::crypto::mls::provider::MlsCryptoProvider;
 use scp_core::crypto::ucan::nonce::NonceTracker;
 use scp_core::crypto::ucan::revoke::RevocationList;

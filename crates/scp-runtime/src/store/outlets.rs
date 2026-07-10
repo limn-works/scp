@@ -285,7 +285,10 @@ mod tests {
             .store_outlet_session("ctx-1", "sess-123", &session)
             .await
             .unwrap();
-        let loaded = store.load_outlet_session("ctx-1", "sess-123").await.unwrap();
+        let loaded = store
+            .load_outlet_session("ctx-1", "sess-123")
+            .await
+            .unwrap();
         assert_eq!(loaded, Some(session));
     }
 
@@ -312,7 +315,10 @@ mod tests {
             .await
             .unwrap();
 
-        let loaded = store.load_outlet_session("ctx-1", "sess-123").await.unwrap();
+        let loaded = store
+            .load_outlet_session("ctx-1", "sess-123")
+            .await
+            .unwrap();
         assert!(loaded.is_none());
     }
 

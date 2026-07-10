@@ -27,8 +27,8 @@ use scp_ffi_uniffi::{
     ContextParams,
     GovernanceModel,
     MemoryScope,
-    Scp,
     OutletDefinition,
+    Scp,
     // Free functions — bridge trust
     bridge_evaluate_trust,
     // Free functions — discovery
@@ -714,7 +714,10 @@ async fn outlet_register_and_verify() {
         cost: None,
     };
 
-    let outlet_id = scp.outlet_register(handle.clone(), definition).await.unwrap();
+    let outlet_id = scp
+        .outlet_register(handle.clone(), definition)
+        .await
+        .unwrap();
     assert!(!outlet_id.is_empty(), "Outlet ID should be non-empty");
 
     // Verify the registered outlet

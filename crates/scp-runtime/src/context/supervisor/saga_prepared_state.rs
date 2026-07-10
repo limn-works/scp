@@ -346,16 +346,18 @@ impl SagaPreparedStateSnapshot {
     pub fn into_prepared(self) -> SagaPreparedState {
         match self {
             Self::CrossContextOutletInvocation(snap) => {
-                SagaPreparedState::CrossContextOutletInvocation(CrossContextOutletInvocationPrepared {
-                    caller_context_id: snap.caller_context_id,
-                    target_context_id: snap.target_context_id,
-                    caller_did: DID(snap.caller_did),
-                    outlet_registration_id: snap.outlet_registration_id,
-                    ucan_proof_id: snap.ucan_proof_id,
-                    recorded_timestamp_ms: snap.recorded_timestamp_ms,
-                    recorded_nonce: snap.recorded_nonce,
-                    recorded_chain_depth: snap.recorded_chain_depth,
-                })
+                SagaPreparedState::CrossContextOutletInvocation(
+                    CrossContextOutletInvocationPrepared {
+                        caller_context_id: snap.caller_context_id,
+                        target_context_id: snap.target_context_id,
+                        caller_did: DID(snap.caller_did),
+                        outlet_registration_id: snap.outlet_registration_id,
+                        ucan_proof_id: snap.ucan_proof_id,
+                        recorded_timestamp_ms: snap.recorded_timestamp_ms,
+                        recorded_nonce: snap.recorded_nonce,
+                        recorded_chain_depth: snap.recorded_chain_depth,
+                    },
+                )
             }
         }
     }

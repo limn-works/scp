@@ -1919,8 +1919,8 @@ mod tests {
     fn class_s_and_governance_class_s_snapshot_restore_is_lossless() {
         use crate::context::supervisor::saga_journal::SagaId;
         use crate::context::supervisor::saga_prepared_state::{
-            CallerReservationRecord, CommittedOutletInvocation, CrossContextOutletInvocationPrepared,
-            SagaPreparedState,
+            CallerReservationRecord, CommittedOutletInvocation,
+            CrossContextOutletInvocationPrepared, SagaPreparedState,
         };
 
         let mut state =
