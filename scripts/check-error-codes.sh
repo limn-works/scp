@@ -95,6 +95,19 @@ cd "$REPO_ROOT"
 # Excludes: .git, target, build, node_modules, .docs (specs/ADRs use codes in prose),
 #           sdk-common.md (the definition file itself), this script, CLAUDE.md files.
 while IFS=: read -r file line_num content; do
+    # Honour the inline `SCP-CODE-OK:` exemption marker. This is the only
+    # mechanism by which a production-source line can carry a literal
+    # canonical-prefix code that is deliberately out-of-range or
+    # non-canonical: negative-test fixtures that verify the rejection path,
+    # and validator self-references where the prefix appears in a
+    # `starts_with` / `b"..."` byte comparison rather than as an emitted
+    # code. Marker must appear on the same line; whole-file exemption is
+    # intentionally not supported. Real error codes carry no marker, so this
+    # cannot be used to smuggle a genuinely mis-ranged code past the gate.
+    case "$content" in
+        *"SCP-CODE-OK:"*) continue ;;
+    esac
+
     # Extract all SCP codes from the line
     while [[ "$content" =~ SCP-([A-Z]+)-([0-9]+) ]]; do
         full_code="SCP-${BASH_REMATCH[1]}-${BASH_REMATCH[2]}"
