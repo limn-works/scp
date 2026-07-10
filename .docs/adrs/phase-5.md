@@ -637,7 +637,7 @@ Actor isolation follows the Swift 6.2 approachable concurrency rules: data carri
 
 **Package:** `bindings/swift/` published as `SCP` Swift package via GitHub releases.
 
-**Dependencies from UniFFI:** `identity_create()`, `identity_load()`, `identity_resolve()`, `context_create()`, `context_join()`, `context_leave()`, `context_close()`, `context_send()`, `context_subscribe()` (callback interface), `tool_register()`, `tool_invoke()`, `tool_verify()`, `ucan_validate()`, `ucan_mint()`, `ucan_revoke()`, `event_log_query()`, `event_log_verify()`, `transport_connect()`, `transport_disconnect()`, `transport_status()`, and the `ScpError` enum — all from `ScpBindings.swift`.
+**Dependencies from UniFFI:** `identity_create()`, `identity_load()`, `identity_resolve()`, `context_create()`, `context_join()`, `context_leave()`, `context_close()`, `context_send()`, `context_subscribe()` (callback interface), `outlet_register()`, `outlet_invoke()`, `outlet_verify()`, `ucan_validate()`, `ucan_mint()`, `ucan_revoke()`, `event_log_query()`, `event_log_verify()`, `transport_connect()`, `transport_disconnect()`, `transport_status()`, and the `ScpError` enum — all from `ScpBindings.swift`.
 
 **File layout:**
 
@@ -837,15 +837,15 @@ public actor SCPContext {
         }
     }
 
-    /// Invoke a registered tool in this context.
-    public func invoke(tool: String, input: Data) async throws -> Data {
-        let output = try await tool_invoke(handle: handle, toolId: tool, inputJson: input)
+    /// Invoke a registered outlet in this context.
+    public func invoke(outlet: String, input: Data) async throws -> Data {
+        let output = try await outlet_invoke(handle: handle, outletId: outlet, inputJson: input)
         return output
     }
 
-    /// Register a tool in this context. Returns the assigned tool ID.
-    public func registerTool(_ definition: ToolDefinition) async throws -> String {
-        try await tool_register(handle: handle, registration: definition.toRecord())
+    /// Register an outlet in this context. Returns the assigned outlet ID.
+    public func registerOutlet(_ definition: OutletDefinition) async throws -> String {
+        try await outlet_register(handle: handle, registration: definition.toRecord())
     }
 
     /// Leave this context gracefully.

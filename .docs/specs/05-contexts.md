@@ -48,15 +48,16 @@ Context creation is a multi-step operation that can fail at any point. The proto
 
 ## 5.3 Capability Ceiling
 
-Every context declares a capability ceiling at creation: the maximum set of things that can happen in this space. This ceiling bounds what tools can do, what roles can grant, and what agents can exercise. Standard capability categories include:
+Every context declares a capability ceiling at creation: the maximum set of things that can happen in this space. This ceiling bounds what outlets can do, what roles can grant, and what agents can exercise. Standard capability categories include:
 
 - **`messaging`** — text and structured data exchange
-- **`tool invocation`** — executing context-registered tools
+- **`outlet:query`** — invoking context-registered Query outlets (§5.4.2)
+- **`outlet:call`** — invoking context-registered Action outlets (§5.4.2)
 - **`media:voice`** — real-time voice communication (§10.9.1)
 - **`media:video`** — real-time video communication (§10.9.1)
 - **`media:screen_share`** — screen sharing (§10.9.1)
 - **`bridging`** — bridge connector participation (§12)
-- **`tool:interface`** — cross-context tool interface exposure (§6.2)
+- **`outlet:interface`** — cross-context outlet interface exposure (§6.2)
 - **`context:child:create`** — creating child contexts (§5.13)
 - **`member:ban`** — governance-level member removal (ban/unban). Gates whether governance can execute `RevokeAccess` / `RestoreAccess` against members (§5.9). Without this capability in the ceiling, governance cannot ban members regardless of governance model.
 
@@ -81,9 +82,11 @@ The following is the complete enumeration of the **built-in** capability categor
 |----------|-------------|----------|
 | `messages:read` | Read messages in the context | Role permission |
 | `messages:write` | Send messages to the context | Role permission |
-| `tool:register` | Register new tools in the context | Role permission |
-| `tool:invoke:*` | Invoke any registered tool | Role permission |
-| `tool:invoke:{tool_id}` | Invoke a specific tool (parameterized) | Role permission |
+| `outlet:register` | Register new outlets in the context | Role permission |
+| `outlet:query:*` | Invoke any registered Query outlet (§5.4.2) | Role permission |
+| `outlet:query:{outlet_id}` | Invoke a specific Query outlet (parameterized) | Role permission |
+| `outlet:call:*` | Invoke any registered Action outlet (§5.4.2) | Role permission |
+| `outlet:call:{outlet_id}` | Invoke a specific Action outlet (parameterized) | Role permission |
 | `member:invite` | Invite new members to the context | Role permission |
 | `member:remove` | Remove members from the context | Role permission + governance |
 | `member:ban` | Ban members (revoke read access) | Role permission + governance |
@@ -92,14 +95,14 @@ The following is the complete enumeration of the **built-in** capability categor
 | `media:video` | Real-time video communication (§10.9.1) | Role permission |
 | `media:screen_share` | Screen sharing (§10.9.1) | Role permission |
 | `bridging` | Bridge connector participation (§12) | Role permission + governance |
-| `tool:interface` | Cross-context tool interface exposure (§6.2) | Role permission |
+| `outlet:interface` | Cross-context outlet interface exposure (§6.2) | Role permission |
 | `context:child:create` | Create child contexts (§5.13) | Role permission |
 | `governance:propose` | Submit governance proposals (§5.9) | Role permission |
 | `governance:vote` | Vote on governance proposals (§5.9) | Role permission |
 | `context:close` | Close context permanently (§5.4) | Role permission + governance |
 | `metadata:edit` | Edit context operational metadata (§5.7) | Role permission + governance |
 
-**Parameterized categories.** `tool:invoke:{tool_id}` is the only parameterized category — it restricts invocation to a specific tool. `tool:invoke:*` grants invocation of all registered tools. A `tool:invoke:*` wildcard ceiling entry **covers** all `tool:invoke:{tool_id}` capabilities (wildcard coverage; distinct from the parsing rule in §5.3.1.1, under which no wildcard is ever inferred from a non-wildcard string).
+**Parameterized categories.** `outlet:query:{outlet_id}` and `outlet:call:{outlet_id}` are the parameterized categories — they restrict invocation to a specific outlet. `outlet:query:*` grants invocation of all registered Query outlets; `outlet:call:*` grants invocation of all registered Action outlets. An `outlet:query:*` wildcard ceiling entry **covers** all `outlet:query:{outlet_id}` capabilities; an `outlet:call:*` wildcard ceiling entry **covers** all `outlet:call:{outlet_id}` capabilities (wildcard coverage; distinct from the parsing rule in §5.3.1.1, under which no wildcard is ever inferred from a non-wildcard string). The two stems are independent: `outlet:query:*` does NOT grant any `outlet:call:*` capability, and vice versa (§5.4.2 classification, §6.2 amplification rule).
 
 **Category validation.** At context creation, the SDK validates that every entry in the ceiling array is well-formed per the ceiling-entry grammar below (§5.3.1.1). Built-in categories are matched exactly (case-sensitive); custom capabilities are accepted only when well-formed. Any entry that is neither a recognized built-in category nor a well-formed custom capability causes creation to fail with `InvalidCeilingCategory` error. This prevents forward-compatibility issues where an old SDK creates a context with built-in categories it cannot enforce, and it forecloses ambiguous custom entries that would otherwise require silent interpretation.
 
@@ -107,15 +110,15 @@ The following is the complete enumeration of the **built-in** capability categor
 
 A ceiling entry is **exactly one** of the following well-formed shapes:
 
-1. **A built-in category** — one of the strings in the §5.3.1 table, matched exactly and case-sensitively (including the parameterized `tool:invoke:{tool_id}` and the resource wildcard `tool:invoke:*`).
+1. **A built-in category** — one of the strings in the §5.3.1 table, matched exactly and case-sensitively (including the parameterized `outlet:query:{outlet_id}` / `outlet:call:{outlet_id}` and the resource wildcards `outlet:query:*` / `outlet:call:*`).
 2. **A custom capability** of the form `{resource}:{action}` (§7.2) — the entry contains **exactly one** colon, and both `{resource}` and `{action}` are non-empty **kebab-case tokens**: lowercase ASCII alphanumerics and hyphens, `[a-z0-9-]+` (this charset is defined here — §5.3.1.1 is the authoritative definition — and is consistent with the kebab-case naming convention for capability URIs in §7.3.4.1). Neither token may contain a colon (`:`), an asterisk (`*`), whitespace, or any other character outside the kebab-case charset.
 3. **An explicit resource wildcard** of the form `{resource}:*` — grants every action under `{resource}`. Here `{resource}` is a non-empty kebab-case token (same `[a-z0-9-]+` charset, no `:`, no `*`, no whitespace) and the action segment is the **single literal `*`**. The `*` is permitted **only** as the entire action segment of a wildcard entry: an `*` appearing in the resource position (e.g. `*:read`), or as a substring of either token (e.g. `pay*ments`, `payments:wr*`), is malformed → `InvalidCeilingCategory`. A bare `*` or `*:*` therefore never names “all resources” — there is no resource wildcard.
 
 There is **no implicit or silent wildcard.** A wildcard must be written explicitly as `:*`.
 
-**No privileged-built-in collision.** A custom entry (shape 2 or shape 3 above) is valid only if it does not name a built-in capability under **any** spelling. A custom entry's string MUST NOT denote a built-in capability — neither a built-in's user-facing colon form (e.g. `tool:invoke:*`, `tool:invoke:{tool_id}`, `bridging`, `messages:read`) nor its canonical UCAN form (e.g. `tool_invoke:*`, `bridging:*`, `context_child:create`), including the parameterized `tool_invoke:{tool_id}` family for any concrete `tool_id`. A custom entry that names a built-in under any spelling MUST be rejected at context creation with `InvalidCeilingCategory` (e.g. a custom whose string is `bridging:*` — which denotes the `bridging` built-in — is rejected). This is enforced by **canonical resolution**, not by a denylist of forbidden spellings: an entry is admitted as a custom only if resolving its string through the protocol's single canonical capability parser (`Capability::new`, defined in code at `crates/scp-protocol/src/context/roles.rs`) does **not** yield a built-in capability. Because that parser is the sole authority on which strings denote built-ins — recognizing every built-in in both colon and UCAN spelling, and the parameterized `tool_invoke:{tool_id}` family for any id — the rule is **closed by construction**: it covers every built-in spelling uniformly and extends automatically to any built-in added later, with no spelling enumeration to maintain. Resolution is applied at the point a custom is admitted, rather than testing only the entry's projected UCAN string, because the masquerade it prevents — a custom that is a distinct ceiling entry yet presents a built-in's privilege when the ceiling is consumed for capability minting — arises specifically from a `Capability` custom value (including one materialized directly from an untrusted, deserialized ceiling that never passed through the colon parser at create time). The clause is stated here as the authoritative, normative invariant so the validator can cite §5.3.1.1 and a custom capability can never masquerade as a privileged built-in.
+**No privileged-built-in collision.** A custom entry (shape 2 or shape 3 above) is valid only if it does not name a built-in capability under **any** spelling. A custom entry's string MUST NOT denote a built-in capability — neither a built-in's user-facing colon form (e.g. `outlet:query:*`, `outlet:call:*`, `outlet:call:{outlet_id}`, `bridging`, `messages:read`) nor its canonical UCAN form (e.g. `outlet_query:*`, `outlet_call:*`, `bridging:*`, `context_child:create`), including the parameterized `outlet_query:{outlet_id}` / `outlet_call:{outlet_id}` families for any concrete `outlet_id`. A custom entry that names a built-in under any spelling MUST be rejected at context creation with `InvalidCeilingCategory` (e.g. a custom whose string is `bridging:*` — which denotes the `bridging` built-in — is rejected). This is enforced by **canonical resolution**, not by a denylist of forbidden spellings: an entry is admitted as a custom only if resolving its string through the protocol's single canonical capability parser (`Capability::new`, defined in code at `crates/scp-protocol/src/context/roles.rs`) does **not** yield a built-in capability. Because that parser is the sole authority on which strings denote built-ins — recognizing every built-in in both colon and UCAN spelling, and the parameterized `outlet_query:{outlet_id}` / `outlet_call:{outlet_id}` families for any id — the rule is **closed by construction**: it covers every built-in spelling uniformly and extends automatically to any built-in added later, with no spelling enumeration to maintain. Resolution is applied at the point a custom is admitted, rather than testing only the entry's projected UCAN string, because the masquerade it prevents — a custom that is a distinct ceiling entry yet presents a built-in's privilege when the ceiling is consumed for capability minting — arises specifically from a `Capability` custom value (including one materialized directly from an untrusted, deserialized ceiling that never passed through the colon parser at create time). The clause is stated here as the authoritative, normative invariant so the validator can cite §5.3.1.1 and a custom capability can never masquerade as a privileged built-in.
 
-**No built-in-resource wildcard shadow.** A custom **shape-3 wildcard** `{resource}:*` is additionally invalid when `{resource}` is the **resource token of any built-in capability** — i.e. the `{resource}` projection (the segment before the colon in a built-in's canonical UCAN form) of any built-in (e.g. `member`, `messages`, `media`, `tool`, `role`, `governance`, `context`, `metadata`). This set is defined by the built-in capabilities themselves — the resource token of each built-in — and is **generated** from them, never a hand-maintained enumeration, so it extends automatically as built-ins are added and cannot drift from the actual built-in set. Canonical resolution alone does not catch this case: a string such as `member:*` does **not** resolve to a built-in (there is no `member:*` built-in — only `member:invite`, `member:remove`, `member:ban`), so `Capability::new("member:*")` keeps it a `Custom` and the no-collision rule above admits it. Yet because ceiling wildcard coverage treats a stored `{resource}:*` entry as covering **every** action under `{resource}`, an admitted `member:*` would silently grant the privileged built-in actions in that family (e.g. `member:ban`, which gates the governance `Revoke` action — see §7) when the ceiling is consumed for capability minting. Such a custom wildcard MUST therefore be rejected at validation with `InvalidCeilingCategory`. This is **closed by construction** over the built-in resource-token set (the same `{resource}` projection that ceiling wildcard coverage matches against), not a hardcoded denylist, so it extends automatically to any built-in added later — consistent with the "no silent wildcard / a custom can never present built-in privilege" invariant above. A custom **non-wildcard** action under a built-in resource (shape 2 — e.g. `member:promote`, `messages:archive`) remains **valid**: it grants only itself via exact match and never the built-in actions. A custom wildcard over a **non-built-in** resource (e.g. `payments:*`, `a-b-c:*`) likewise remains **valid**.
+**No built-in-resource wildcard shadow.** A custom **shape-3 wildcard** `{resource}:*` is additionally invalid when `{resource}` is the **resource token of any built-in capability** — i.e. the `{resource}` projection (the segment before the colon in a built-in's canonical UCAN form) of any built-in (e.g. `member`, `messages`, `media`, `outlet_query`, `outlet_call`, `role`, `governance`, `context`, `metadata`). This set is defined by the built-in capabilities themselves — the resource token of each built-in — and is **generated** from them, never a hand-maintained enumeration, so it extends automatically as built-ins are added and cannot drift from the actual built-in set. Canonical resolution alone does not catch this case: a string such as `member:*` does **not** resolve to a built-in (there is no `member:*` built-in — only `member:invite`, `member:remove`, `member:ban`), so `Capability::new("member:*")` keeps it a `Custom` and the no-collision rule above admits it. Yet because ceiling wildcard coverage treats a stored `{resource}:*` entry as covering **every** action under `{resource}`, an admitted `member:*` would silently grant the privileged built-in actions in that family (e.g. `member:ban`, which gates the governance `Revoke` action — see §7) when the ceiling is consumed for capability minting. Such a custom wildcard MUST therefore be rejected at validation with `InvalidCeilingCategory`. This is **closed by construction** over the built-in resource-token set (the same `{resource}` projection that ceiling wildcard coverage matches against), not a hardcoded denylist, so it extends automatically to any built-in added later — consistent with the "no silent wildcard / a custom can never present built-in privilege" invariant above. A custom **non-wildcard** action under a built-in resource (shape 2 — e.g. `member:promote`, `messages:archive`) remains **valid**: it grants only itself via exact match and never the built-in actions. A custom wildcard over a **non-built-in** resource (e.g. `payments:*`, `a-b-c:*`) likewise remains **valid**.
 
 A **single-token custom with no action** (e.g. `payments` — no colon, no action segment) is **malformed** and MUST be rejected at context creation with `InvalidCeilingCategory`. It MUST NOT be silently interpreted as `payments:*` or any other capability — silent widening would defeat the legibility tenet (§5.7), under which members see the exact ceiling they opt into.
 
@@ -133,41 +136,53 @@ When a context uses the `governed` ceiling policy and a ceiling change is approv
 4. **Activation.** After the notification period expires, the new ceiling takes effect. A `CeilingChanged` event is recorded with the old ceiling hash, new ceiling, and the governance proposal ID.
 5. **Retroactive UCAN validation.** After ceiling change activation, UCANs that reference capabilities no longer in the ceiling are automatically invalidated. The SDK MUST re-validate all cached UCANs against the new ceiling on the next action attempt.
 
-## 5.4 Tools
+## 5.4 Outlets
 
-Contexts provide tools: stateless functions that agents invoke. Tools have no identity, no agency, no ability to initiate. They take input and return output. They are scoped to their context and cannot span contexts.
+Contexts provide **outlets**: stateless functions that agents invoke. Outlets have no identity, no agency, no ability to initiate. They take input and return output. They are scoped to their context and cannot span contexts.
 
-Tools are the protocol's answer to "what about bots?" — anything that would have been a bot in a traditional system is a tool in SCP. The critical difference: tools cannot act, only respond. All agency flows through accountable agents.
+Outlets are the protocol's answer to "what about bots?" — anything that would have been a bot in a traditional system is an outlet in SCP. The critical difference: outlets cannot act, only respond. All agency flows through accountable agents.
 
-Tool registrations include:
+**Terminology rationale.** The protocol uses "outlet" where ecosystems such as MCP and function-calling LLMs use "tool". The two words describe the same wire shape (stateless input→output functions gated by schema and capability) but carry different connotations. "Tool" is agent-centric — an instrument an agent wields. "Outlet" is context-centric — a socket the context exposes, which the context governs. SCP's security boundary is the context, not the agent, so the context-centric word is the one that matches the protocol's invariants. The rename is a hard break: there are no deprecation aliases, no migration period. External interop surfaces that use the MCP vocabulary (§8.5) translate lexically at the boundary in `scp-mcp`; inside SCP everything is an outlet.
 
+Outlet registrations include:
+
+- **Kind.** `OutletKind::Query` (read-only, idempotent, cacheable) or `OutletKind::Action` (may mutate, never cached). See §5.4.2. The default is `Action` — fail-safe.
 - **Schema.** Input and output types (MCP-compatible JSON Schema — see §8.5). Machine-readable, self-documenting.
-- **Implementation hash.** Content-addressable reference to the tool's implementation. Any change to the implementation produces a new hash.
-- **Test vectors.** Known input-output pairs that define correct behavior. Any agent can call the tool with test inputs and verify outputs match. This enables continuous integrity verification (§7.3.3).
-- **Operator DID.** The identity accountable for the tool. Tool misbehavior traces to this DID.
-- **Cost metadata (optional).** Per-invocation cost declared by the tool via a `ToolCost` struct (§5.4.1), additive with context-level costs (§19.3). A tool calling an external API can pass through its cost. Tool costs carry their own payee DID, which may differ from the context payee. Tools without cost metadata are free.
+- **Implementation hash.** Content-addressable reference to the outlet's implementation. Any change to the implementation produces a new hash.
+- **Test vectors.** Known input-output pairs that define correct behavior. Any agent can call the outlet with test inputs and verify outputs match. This enables continuous integrity verification (§7.3.3).
+- **Operator DID.** The identity accountable for the outlet. Outlet misbehavior traces to this DID.
+- **Cost metadata (optional).** Per-invocation cost declared by the outlet via an `OutletCost` struct (§5.4.1), additive with context-level costs (§19.3). An outlet calling an external API can pass through its cost. Outlet costs carry their own payee DID, which may differ from the context payee. Outlets without cost metadata are free. Query outlets MUST declare either no cost or a zero-amount cost (§5.4.2 structural floor).
 
-Tool mutations (implementation hash change, schema modification, test vector update) are recorded in the context's verifiable event log (§7.3.1). Silent tool modification is not possible — any change is visible to all context members.
+Outlet mutations (implementation hash change, schema modification, test vector update, kind change) are recorded in the context's verifiable event log (§7.3.1). Silent outlet modification is not possible — any change is visible to all context members.
 
-### 5.4.1 Tool Registration Wire Format
+### 5.4.1 Outlet Registration Wire Format
 
-Tool registrations are serialized as MessagePack (§17.5) and stored in the context's tool registry. The canonical structure:
+Outlet registrations are serialized as MessagePack (§17.5) and stored in the context's outlet registry. The canonical structure:
 
 ```
-ToolRegistration {
-  tool_id:          String,          // Unique within the context. Format: [a-z0-9_-], max 128 chars.
+OutletRegistration {
+  outlet_id:        String,          // Unique within the context. Format: [a-z0-9_-], max 128 chars.
+  kind:             OutletKind,      // Query or Action. See §5.4.2. Absent = Action (fail-safe).
   name:             String,          // Human-readable name. Max 256 UTF-8 bytes.
-  description:      String,          // Tool description. Max 4096 UTF-8 bytes.
-  operator_did:     DID,             // The identity accountable for this tool.
+  description:      String,          // Outlet description. Max 4096 UTF-8 bytes.
+  operator_did:     DID,             // The identity accountable for this outlet.
   schema: {
     input:          JSONSchema,      // MCP-compatible JSON Schema for input. Max 64 KiB serialized.
     output:         JSONSchema,      // MCP-compatible JSON Schema for output. Max 64 KiB serialized.
   },
-  implementation_hash: [u8; 32],    // SHA-256 of the tool's implementation artifact (see below).
+  implementation_hash: [u8; 32],    // SHA-256 of the outlet's implementation artifact (see below).
   test_vectors:     Vec<TestVector>, // Known input-output pairs. Min 0, max 100.
-  cost:             Option<ToolCost>, // Per-invocation cost (§19.3).
+  cost:             Option<OutletCost>, // Per-invocation cost (§19.3). Query outlets: amount == 0.
+  message_catalog:  Vec<MessageTemplate>, // Wire-time message catalog. ≤ 256 entries, each template
+                                     // ≤ 1 KiB UTF-8. Covered by the V2 signature preimage via
+                                     // `catalog_hash` (below).
   registered_at:    u64,             // Unix timestamp (seconds) of registration.
-  signature:        Ed25519Signature, // Operator DID signs all fields except signature.
+  signature:        Ed25519Signature, // Operator DID signs the V2 canonical digest below.
+}
+
+OutletKind {
+  Query,   // Read-only, idempotent, cacheable. ReadOnlyInvocation guard applies (§5.4.2).
+  Action,  // May mutate context state. Never cached.
 }
 
 TestVector {
@@ -177,7 +192,13 @@ TestVector {
   description:      String,          // Human-readable description of what this tests. Max 4096 UTF-8 bytes.
 }
 
-ToolCost {
+MessageTemplate {
+  key:              String,          // Catalog key. Regex `^[a-z][a-z0-9-]{0,63}(\.[a-z][a-z0-9-]{0,63})*$`.
+                                     // Unique within a catalog.
+  template:         String,          // Pure UTF-8 string. NO interpolation slots. Max 1024 bytes.
+}
+
+OutletCost {
   amount:           Amount,          // Cost per invocation in smallest currency unit.
   currency:         CurrencyCode,    // ISO 4217 or protocol-defined.
   payee:            DID,             // Who receives payment. May differ from operator_did.
@@ -185,18 +206,91 @@ ToolCost {
 }
 ```
 
-**Implementation hash target.** The `implementation_hash` is `SHA-256(canonical_artifact)` where `canonical_artifact` depends on the tool type:
+**Implementation hash target.** The `implementation_hash` is `SHA-256(canonical_artifact)` where `canonical_artifact` depends on the outlet type:
 
-| Tool type | Hash target | Description |
+| Outlet type | Hash target | Description |
 |-----------|-------------|-------------|
 | Statically deployed (WASM, container) | SHA-256 of the binary artifact | The compiled WASM module or container image digest. Deterministic builds ensure the hash is reproducible. |
 | Source-available | SHA-256 of the source archive | A tar.gz of the source tree, files sorted lexicographically, normalized line endings (LF). |
-| Remote service (API-backed) | SHA-256 of the OpenAPI/JSON Schema spec | The canonical JSON serialization (RFC 8785) of the tool's API specification. |
+| Remote service (API-backed) | SHA-256 of the OpenAPI/JSON Schema spec | The canonical JSON serialization (RFC 8785) of the outlet's API specification. |
 | LLM-backed (non-deterministic) | SHA-256 of the system prompt + model identifier | `SHA-256(model_id || ":" || system_prompt_utf8)`. Changes to the model or system prompt change the hash. |
 
 The hash target type is NOT stored in the registration — the operator chooses what constitutes their implementation artifact. The hash provides a change-detection mechanism, not a verification mechanism. Verifiers detect changes (hash differs from registration); they do not verify what the hash covers.
 
-**Signature scope.** The operator signs `SHA-256("SCP-TOOL-REGISTRATION-V1:" || tool_id || name || operator_did || schema_hash || implementation_hash || test_vectors_hash || cost_hash || registered_at)` where `schema_hash = SHA-256(MessagePack(schema))`, `test_vectors_hash = SHA-256(MessagePack(test_vectors))`, and `cost_hash = SHA-256(MessagePack(cost))` (or `SHA-256(0x00)` if absent).
+**Signature scope.** The operator signs
+
+```
+SHA-256(
+  "SCP-OUTLET-REGISTRATION-V2:"
+  || BE32(len(outlet_id)) || outlet_id
+  || kind_byte
+  || BE32(len(name)) || name
+  || description_hash
+  || BE32(len(operator_did)) || operator_did
+  || schema_hash
+  || implementation_hash
+  || test_vectors_hash
+  || cost_hash
+  || catalog_hash
+  || registered_at_be
+)
+```
+
+where:
+
+- `kind_byte` is `0x00` for Query and `0x01` for Action (fixed 1-byte width).
+- `BE32(n)` is `n` encoded as a 4-byte big-endian unsigned integer; this length prefix precedes every variable-length field (`outlet_id`, `name`, `operator_did`) so that concatenation is unambiguous and two registrations with different field splits can never produce the same preimage.
+- `description_hash = SHA-256(description_utf8_bytes)` (32 bytes, fixed width). The `description` field is operator-authored prose displayed to prospective invokers; committing `description_hash` into the V2 preimage binds the prose to the registration signature so a silent operator edit to `description` produces a diffable registration event.
+- `schema_hash = SHA-256(MessagePack(schema))` (32 bytes, fixed width).
+- `implementation_hash` is 32 bytes, fixed width.
+- `test_vectors_hash = SHA-256(MessagePack(test_vectors))` (32 bytes).
+- `cost_hash = SHA-256(MessagePack(cost))` (32 bytes), or `SHA-256(0x00)` (32 bytes) if absent. The sentinel preserves fixed width.
+- `catalog_hash = SHA-256(MessagePack(message_catalog))` (32 bytes, fixed width). `message_catalog` is the ordered `Vec<MessageTemplate>` defined above; MessagePack serialization of an empty vector produces a 1-byte value (`0x90`) so `catalog_hash` is always well-defined. Committing the catalog into the V2 preimage binds every operator-controlled string field at registration under the signature; the catalog is NOT covered by `schema_hash`, so a separate `catalog_hash` is required.
+- `registered_at_be` is `registered_at` encoded as an 8-byte big-endian unsigned integer.
+
+The `V2` suffix, the `kind_byte` inclusion, the mandatory length prefixes on every variable-length field, and the explicit `description_hash` + `catalog_hash` terms together constitute the break from the pre-rename `SCP-TOOL-REGISTRATION-V1` domain; pre-migration signatures are not honored. The length-prefix requirement closes the "split-shift" preimage-collision class that the unprefixed pre-rename concatenation admitted (where a suffix of `outlet_id` could be reinterpreted as a prefix of `name`).
+
+### 5.4.2 Outlet Classification (Query vs Action)
+
+Outlets declare their semantic class at registration time. Classification is structural, not advisory — the runtime enforces it. It is the basis of the capability split (§5.3.1): a Query outlet is invoked under the `outlet:query` / `outlet_query` capability family; an Action outlet under `outlet:call` / `outlet_call`.
+
+**`OutletKind::Query`** — read-only, idempotent, cacheable in principle.
+
+- **Structural floor at registration.** `cost == None || cost.amount == 0`. A Query outlet MUST NOT declare a positive per-invocation cost, and `cost.cost_formula` MUST be absent (a dynamic pricing formula on an idempotent read is not coherent). Declaring a positive cost or a pricing formula at registration is a validation failure (`OutletErrorClass::Protocol::QueryCostViolation`). Registrations that fail this check are rejected before they reach the event log.
+- **ReadOnlyInvocation guard at invocation.** The runtime invokes Query outlets through a `ReadOnlyInvocation` handle that denies writes to context state (messages, roles, registry, event log, governance, economic ledgers). Any attempt by an executor to mutate through this handle returns `OutletErrorClass::Protocol::QueryViolation`.
+- **Cacheability.** Query outlets are semantically cacheable (idempotent, invoker-independent result for fixed `(outlet_id, input, implementation_hash)`). A protocol-level shared cache is **deferred** (§5.4.3); every Query invocation currently executes live. The semantic property is stable — a future cache will not change what Query outlets are, only how the runtime exploits their properties.
+- **Query-with-declared-cost is forbidden.** An outlet registered with cost amount `> 0` MUST be `Action`. Operators who want a paid read-only interface (e.g., a metered data lookup) declare it as `Action`. The protocol contract is: a Query invocation is never billed.
+- **UCAN stem.** `outlet_query:{outlet_id}` or `outlet_query:*` (see §5.4.2.1 for parser semantics).
+- **Chain depth (§6.2).** Query cross-context calls use the full `ContextParams::max_chain_depth` budget (default 8, range [1, 255]).
+
+**`OutletKind::Action`** — may mutate, never cached.
+
+- No structural cost floor; Action outlets may declare any cost.
+- No ReadOnlyInvocation guard; Action executors may mutate context state through SDK-provided handles subject to role and capability checks.
+- Never cached. Each invocation runs fresh.
+- **UCAN stem.** `outlet_call:{outlet_id}` or `outlet_call:*` (see §5.4.2.1 for parser semantics).
+- **Chain depth.** Action cross-context calls use `max(1, max_chain_depth / 2)` as their budget. Default 4 when `max_chain_depth` is default 8.
+
+**Default.** `OutletKind::Action` is the default when `kind` is absent in an otherwise-valid registration (fail-safe). SDKs SHOULD surface `kind` as a required field in application APIs even though the wire format tolerates absence.
+
+**Chain amplification rule (§6.2).** A Query outlet invocation MUST NOT transitively invoke any Action outlet through cross-context hops. The reverse is permitted — an Action invocation MAY transitively invoke Query outlets. The runtime enforces this at the cross-context consent gate: on every hop, the runtime checks `hop.kind` against the originating request's `kind` and rejects Query→Action amplification with `OutletErrorClass::Authorization::AmplificationViolation`. This prevents a "free" read from being laundered into a paid write.
+
+**Misdeclaration signal.** Any invocation that trips `QueryViolation` at runtime (an executor attempted a write inside a ReadOnlyInvocation) is recorded as an operator-attributable signal: the `OutletVerified` event for that outlet carries `integrity_ok: false` with reason `query_misdeclaration`, and participation records (§7.3.2) attribute the failure to the outlet's `operator_did`.
+
+#### 5.4.2.1 UCAN Capability Stem Parser
+
+The two stems `outlet_query:` and `outlet_call:` are parsed with a fixed two-step algorithm:
+
+1. **Literal prefix match.** The parser accepts only the literal byte sequences `outlet_query:` or `outlet_call:` (case-sensitive, UTF-8). Any other prefix — including abbreviations, trailing-colon variations, or concatenations such as `outlet_query:call:foo` — is a `Capability::new` parse failure and MUST NOT be admitted as either stem. The colon is part of the stem, not a separator.
+2. **Opaque suffix with outlet_id validation.** Everything after the prefix is the suffix. The suffix is either `*` (wildcard, matching `Capability::OutletQueryAll` / `OutletCallAll`) or a single outlet_id matching the regex `^[a-z0-9_-]{1,128}$`. No further `:` characters appear in a valid suffix; a colon in the suffix fails parsing (this blocks the `outlet_query:call:foo` parser-differential where a naive split-on-colon implementation would accept it).
+
+Bridge and SDK parsers MUST apply this algorithm identically. The single canonical parser is `Capability::new` (`crates/scp-protocol/src/context/roles.rs`); every bridge routes through it.
+
+The underscore in the wire form is deliberate: UCAN resource strings historically use `-` or `_` to disambiguate prefix from suffix, and `outlet:query:` (two colons) would require three-way parsing that invites prefix-vs-suffix ambiguity. The SDK-facing display form `outlet:query:{id}` / `outlet:call:{id}` is a pretty-print alias; it round-trips through `Capability::new` and `Capability::to_string` but is not the wire form. Pre-rename `tool:invoke:` / `tool_invoke:` / `tool:register` / `tool:interface` strings are hard-rejected (SCP-OUT-014): the parser returns a parse failure rather than mapping them onto any outlet capability.
+
+### 5.4.3 Query Result Cache (Deferred)
+
+A shared operator-signed relay-hosted Query result cache was drafted during the outlet redesign but pulled from initial scope before merge. Concrete design questions blocked it — relay-side authentication and authorization boundaries for cache reads (the cache must be membership-gated but relays are not membership-aware); interaction with per-member pseudonym routing (§9.10.4), which prevents the relay from grouping hits on a single routing ID without leaking subscribership; and the billing semantics of a paid Query operator serving an unbounded cached audience. Until the cache ships, §5.4.2 marks Query as "cacheable" as a semantic property of the kind, not as a claim that a cache exists; every Query invocation executes live. Implementations MUST NOT silently add a cache layer — a cache-like optimization that is not specified here is a protocol divergence, because it changes what the outlet-invocation event records and what the operator signs for.
 
 ## 5.5 Roles
 
@@ -223,26 +317,26 @@ Every context has a minimum set of built-in roles. Context creators MAY define a
 | Role | Permissions | Description |
 |------|------------|-------------|
 | `admin` | All capabilities in ceiling + `member:invite` + `member:remove` + `role:assign` + `governance:propose` + `governance:vote` + `metadata:edit` | Full control. The context creator is always assigned this role at creation. |
-| `moderator` | `messages:read` + `messages:write` + `tool:invoke:*` + `member:remove` + `governance:propose` | Can moderate content and members but cannot change roles or governance structure. |
-| `member` | `messages:read` + `messages:write` + `tool:invoke:*` | Standard participant. Can read, write, and use tools. |
-| `observer` | `messages:read` | Read-only access. Cannot send messages, invoke tools, or participate in governance. Observers can see all content and membership but cannot create state. |
+| `moderator` | `messages:read` + `messages:write` + `outlet:query:*` + `outlet:call:*` + `member:remove` + `governance:propose` | Can moderate content and members but cannot change roles or governance structure. |
+| `member` | `messages:read` + `messages:write` + `outlet:query:*` + `outlet:call:*` | Standard participant. Can read, write, and invoke outlets. |
+| `observer` | `messages:read` | Read-only access. Cannot send messages, invoke outlets, or participate in governance. Observers can see all content and membership but cannot create state. |
 
 **Observer role permissions (detailed):**
 
 Observers can:
 - Read all messages in the context (subject to memory scope and access key restrictions).
 - View the member list, roles, and context metadata.
-- View tool registrations and their schemas.
+- View outlet registrations and their schemas.
 - View the event log (governance actions, membership changes).
 - Leave the context voluntarily.
 
 Observers cannot:
 - Send messages or reactions.
-- Invoke tools (no `tool:invoke:*` or `tool:invoke:{id}`).
+- Invoke outlets (no `outlet:query:*`, `outlet:call:*`, `outlet:query:{id}`, or `outlet:call:{id}`).
 - Invite members.
 - Propose or vote on governance actions.
 - Modify context metadata.
-- Register or deregister tools.
+- Register or deregister outlets.
 
 **Custom roles.** Context creators define custom roles by specifying a role name (string, max 64 chars, `[a-z0-9_-]`) and a permission set (subset of the ceiling). Custom role permissions MUST be a subset of the ceiling — a custom role cannot grant capabilities beyond the ceiling. Custom roles are stored in the context's role registry (`context/{id}/role/{role_name}` per §17.3) and visible in context metadata.
 
@@ -655,7 +749,7 @@ Template: "scp:template/bilateral-persistent"
   metadata_visibility: { member_count: MemberOnly, context_age: MemberOnly, creator_identity: MemberOnly, name: PreJoin, description: MemberOnly, economic_policy: MemberOnly, tool_interface_count: MemberOnly, child_context_info: MemberOnly }
 
 Template: "scp:template/coordination"
-  ceiling:     [messages:read, messages:write, tool:invoke:*, member:ban]
+  ceiling:     [messages:read, messages:write, outlet:query:*, outlet:call:*, member:ban]
   roles:       [admin (creator), member (joiner)]
   governance:  single-admin
   memory_scope: summary
@@ -674,10 +768,10 @@ Template: "scp:template/group-discussion"
 
 Template: "scp:template/public-broadcast"
   mode:          Broadcast
-  ceiling:       [messages:read, messages:write, tool:register, tool:invoke:*]
+  ceiling:       [messages:read, messages:write, outlet:register, outlet:query:*, outlet:call:*]
   roles:
     owner:       all capabilities in ceiling + member:invite, role:assign, context:close
-    author:      messages:write, messages:read, tool:invoke:*
+    author:      messages:write, messages:read, outlet:query:*, outlet:call:*
     subscriber:  messages:read (auto-granted on DID-authenticated registration)
   governance:    single-admin
   memory_scope:  full
@@ -687,10 +781,10 @@ Template: "scp:template/public-broadcast"
 
 Template: "scp:template/gated-broadcast"
   mode:          Broadcast
-  ceiling:       [messages:read, messages:write, tool:register, tool:invoke:*]
+  ceiling:       [messages:read, messages:write, outlet:register, outlet:query:*, outlet:call:*]
   roles:
     owner:       all capabilities in ceiling + member:invite, role:assign, context:close
-    author:      messages:write, messages:read, tool:invoke:*
+    author:      messages:write, messages:read, outlet:query:*, outlet:call:*
     subscriber:  messages:read (requires admin-issued UCAN)
   governance:    single-admin
   memory_scope:  full
@@ -699,7 +793,7 @@ Template: "scp:template/gated-broadcast"
   projection_policy: { default_rule: Gated, overrides: [] }
 
 Template: "scp:template/tool-interface"
-  ceiling:       [messages:read, messages:write, tool:register, tool:invoke:*, member:ban]
+  ceiling:       [messages:read, messages:write, outlet:register, outlet:query:*, outlet:call:*, member:ban]
   roles:         [admin (creator), member (joiner)]
   governance:    single-admin
   memory_scope:  full
@@ -708,12 +802,12 @@ Template: "scp:template/tool-interface"
   metadata_visibility: all PreJoin
 
 Template: "scp:template/paid-service"
-  ceiling:       [messages:read, messages:write, tool:register, tool:invoke:*, member:ban]
+  ceiling:       [messages:read, messages:write, outlet:register, outlet:query:*, outlet:call:*, member:ban]
   ceiling_policy: immutable
   roles:         [admin (creator), member (joiner)]
   governance:    single-admin
   memory_scope:  full (receipts are provenance)
-  economic_policy: required — per_tool_invoke must be set at creation
+  economic_policy: required — per_outlet_call must be set at creation
   extends:       scp:template/tool-interface
   ttl:           optional
   metadata_visibility: { economic_policy: PreJoin, member_count: MemberOnly, all others: PreJoin }
@@ -764,13 +858,13 @@ TrustRequirement:
 Example policy: "Auto-accept `bilateral-ephemeral` contexts from any DID on my allowlist, if TTL ≤ 10 minutes, at most 5 per hour."
 
 **Security properties:**
-- Policies never auto-accept contexts with tool capabilities (ceiling containing `tool:invoke:*`). Tool access always requires explicit confirmation. This is non-overridable.
+- Policies never auto-accept contexts with outlet-invocation capabilities (ceiling containing `outlet:query:*` or `outlet:call:*`). Outlet access always requires explicit confirmation. This is non-overridable.
 - Rate limiting prevents a compromised contact from flooding auto-accepts.
 - **Auto-accept is allowlist-only.** The sole auto-accept trigger is a DID on the operator's explicit `known_did` allowlist. Co-membership in a shared context and registration/discoverability in an open registry are **NOT** trust signals and never trigger auto-accept: inferring trust from either is unsound, and discovery is how strangers *reach* you, not whom you auto-trust (consistent with §09's "from a known DID"). The allowlist has **no self-clear path** — the candidate cannot add itself to the evaluating party's allowlist; allowlist membership is set by the evaluator, not the candidate.
 - **No-default auto-accept (normative).** There is **NO** default auto-accept policy. Absent an explicit, human-configured `AutoAcceptPolicy`, every invitation prompts the human (default-deny).
 - Auto-accept policies are enforced in the SDK, not the protocol. The protocol sees a normal context join. The policy just determines whether the SDK prompts the human or acts autonomously.
 
-**No auto-accept for tool-bearing contexts.** This is a hard rule, not a default. Any context whose ceiling includes `tool:invoke:*`, `tool:invoke:{tool_id}`, or any tool-related capability requires explicit human or agent confirmation regardless of auto-accept policies. The rationale: tool access is the capability that enables cross-context data flow (§6.2). Auto-accepting it would silently expand the agent's cross-context attack surface.
+**No auto-accept for outlet-bearing contexts.** This is a hard rule, not a default. Any context whose ceiling includes `outlet:query:*`, `outlet:call:*`, `outlet:query:{outlet_id}`, `outlet:call:{outlet_id}`, or any outlet-related capability requires explicit human or agent confirmation regardless of auto-accept policies. The rationale: outlet access is the capability that enables cross-context data flow (§6.2). Auto-accepting it would silently expand the agent's cross-context attack surface.
 
 **No auto-accept for paid contexts.** This is a hard rule, not a default. Any context with an `EconomicPolicy` requiring payment (non-empty `CostSchedule`) requires explicit confirmation regardless of auto-accept policies. Agents never silently incur costs. See §19.3.
 
@@ -1084,13 +1178,13 @@ Multi-parent chain:
 A child's capability ceiling is the intersection of all parent ceilings. This is enforced at creation time and is the hard security boundary that prevents capability escalation through nesting.
 
 ```
-Parent A ceiling: [messages:read, messages:write, tool:invoke:*, media]
-Parent B ceiling: [messages:read, messages:write, tool:invoke:*]
+Parent A ceiling: [messages:read, messages:write, outlet:query:*, outlet:call:*, media]
+Parent B ceiling: [messages:read, messages:write, outlet:query:*, outlet:call:*]
 
-Child ceiling ≤ intersection = [messages:read, messages:write, tool:invoke:*]
+Child ceiling ≤ intersection = [messages:read, messages:write, outlet:query:*, outlet:call:*]
 ```
 
-The child's ceiling can be equal to or narrower than the intersection — never broader. A child that only needs messaging can declare `[messages:read, messages:write]` even if the intersection would allow tools.
+The child's ceiling can be equal to or narrower than the intersection — never broader. A child that only needs messaging can declare `[messages:read, messages:write]` even if the intersection would allow outlets.
 
 If a parent has a `governed` ceiling policy (§5.3) and its ceiling is *reduced*, the child's ceiling is retrospectively reduced to maintain the intersection invariant. If this makes the child's ceiling empty (no capabilities remain), the child closes automatically. This cascade is logged in both the parent's and child's event logs. If a parent's ceiling is *expanded*, the child's ceiling does not automatically expand — the child's own ceiling policy governs.
 

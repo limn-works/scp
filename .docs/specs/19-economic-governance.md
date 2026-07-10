@@ -72,7 +72,7 @@ pub type PaymentAdapterRef = String;
 /// Action type for which a payment is made. Used in PaymentReceipt and cost estimation.
 pub enum PaidActionType {
     MessageSend,
-    ToolInvoke,
+    OutletCall,
     ContextJoin,
     SubscriptionPeriod,
     ByteStored,
@@ -312,7 +312,7 @@ pub struct EconomicPolicy {
 pub struct CostSchedule {
     pub currency: CurrencyCode,                     // currency for all Amount fields in this schedule
     pub per_message: Option<Amount>,
-    pub per_tool_invoke: Option<Amount>,            // default for tools without own cost
+    pub per_outlet_call: Option<Amount>,            // default for Action outlets without own cost
     pub per_join: Option<Amount>,                   // one-time membership cost
     pub per_period: Option<SubscriptionCost>,       // recurring (carries its own currency for flexibility)
     pub per_byte_stored: Option<Amount>,            // storage costs
@@ -323,7 +323,7 @@ pub struct CostSchedule {
 
 **Relay-level costs**: declared in `.well-known/scp` `relay_config` (§18.3.3 extension). Separate economic relationship from in-context pricing — relay charges for transport, context charges for participation.
 
-**Economic policy is orthogonal to capability ceiling** (§5.3). Ceiling governs what CAN happen; economic policy governs what it COSTS. Not a new ceiling category. A context with `tool:invoke:*` in its ceiling and `per_tool_invoke: $0.01` in its economic policy allows tool invocations that cost $0.01 each. Removing the cost doesn't expand capabilities; adding a cost doesn't restrict them.
+**Economic policy is orthogonal to capability ceiling** (§5.3). Ceiling governs what CAN happen; economic policy governs what it COSTS. Not a new ceiling category. A context with `outlet:call:*` in its ceiling and `per_outlet_call: $0.01` in its economic policy allows Action outlet invocations that cost $0.01 each. Removing the cost doesn't expand capabilities; adding a cost doesn't restrict them.
 
 **Child context independence:** Child contexts (§5.13) do NOT inherit parent economic policy — each child's pricing is independent. A free parent can have paid children and vice versa.
 
@@ -458,7 +458,7 @@ signed_payload = receipt_id (32 bytes)
               || payee_did (UTF-8 bytes, length-prefixed with u16 big-endian)
               || amount (u64 big-endian, 8 bytes)
               || currency (4 bytes, raw CurrencyCode)
-              || action_type (u8: 0=MessageSend, 1=ToolInvoke, 2=ContextJoin,
+              || action_type (u8: 0=MessageSend, 1=OutletCall, 2=ContextJoin,
                               3=SubscriptionPeriod, 4=ByteStored)
               || context_id (32 bytes if Some, 0x00 if None)
               || adapter_id (UTF-8 bytes, length-prefixed with u16 big-endian)
@@ -561,12 +561,12 @@ All follow the legibility principle: agents see economic terms before committing
 
 Two new well-known templates:
 
-**`scp:template/paid-service`:** Tool invocation context with per-invoke cost. `economic_policy.cost_schedule.per_tool_invoke` required at creation. Single-admin governance. Extends `scp:template/tool-interface`.
+**`scp:template/paid-service`:** Action outlet invocation context with per-invoke cost. `economic_policy.cost_schedule.per_outlet_call` required at creation. Single-admin governance. Extends `scp:template/tool-interface`.
 
 Properties:
-- Ceiling: `messages:read`, `messages:write`, `tool:register`, `tool:invoke:*`
+- Ceiling: `messages:read`, `messages:write`, `outlet:register`, `outlet:query:*`, `outlet:call:*`
 - Ceiling policy: `immutable`
-- Economic policy: required, `per_tool_invoke` must be set
+- Economic policy: required, `per_outlet_call` must be set
 - Governance: single-admin
 - Memory scope: `full` (receipts are provenance)
 
@@ -683,7 +683,7 @@ This section tabulates the wire format for all economy protocol types that cross
 |-------|------|----------|-----------|
 | `currency` | `CurrencyCode` ([u8; 4]) | Yes | Currency for all costs in this schedule. |
 | `per_message` | `Amount` (u64) | No | Cost per message sent. |
-| `per_tool_invoke` | `Amount` (u64) | No | Cost per tool invocation. |
+| `per_outlet_call` | `Amount` (u64) | No | Cost per Action outlet invocation. |
 | `per_join` | `Amount` (u64) | No | One-time cost to join the context. |
 | `per_period` | `SubscriptionCost` | No | Recurring subscription cost. |
 | `per_byte_stored` | `Amount` (u64) | No | Cost per byte of stored data. |
@@ -693,7 +693,7 @@ This section tabulates the wire format for all economy protocol types that cross
 | Variant | Serde Tag | Semantics |
 |---------|-----------|-----------|
 | `MessageSend` | `"MessageSend"` | Sending a message. |
-| `ToolInvoke` | `"ToolInvoke"` | Invoking a tool. |
+| `OutletCall` | `"OutletCall"` | Invoking an Action outlet. |
 | `ContextJoin` | `"ContextJoin"` | Joining a context. |
 | `SubscriptionPeriod` | `"SubscriptionPeriod"` | Recurring subscription payment. |
 | `ByteStored` | `"ByteStored"` | Data storage. |

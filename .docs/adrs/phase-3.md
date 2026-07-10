@@ -106,10 +106,10 @@ Implement the FFI bridge in `crates/scp-ffi/src/` using PyO3 and maturin. The br
    - `py_context_send(handle, identity, payload) -> None` — sends a message.
    - `py_context_receive(handle) -> PyAsyncIterator` — returns an async iterator of incoming messages.
 
-4. **Tool bridge functions:**
-   - `py_tool_register(handle, registration) -> str` — registers a tool (returns tool ID).
-   - `py_tool_invoke(handle, tool_id, input, identity) -> PyObject` — invokes a tool (returns JSON-compatible output).
-   - `py_tool_verify(handle, tool_id) -> PyToolVerificationResult` — verifies a tool against test vectors.
+4. **Outlet bridge functions:**
+   - `outlet_register(handle, registration) -> str` — registers an outlet (returns outlet ID).
+   - `outlet_invoke(handle, outlet_id, input, identity) -> PyObject` — invokes an outlet (returns JSON-compatible output).
+   - `outlet_verify(handle, outlet_id) -> PyOutletVerificationResult` — verifies an outlet against test vectors.
 
 5. **Transport bridge functions:**
    - `py_transport_connect(relay_url) -> None` — connects to an SCP relay.
@@ -829,7 +829,7 @@ Implement comprehensive UCAN validation in `scp-core/crypto/ucan/` (Rust, buildi
    token = await mint(
        issuer=my_identity,
        audience=agent_did,
-       capabilities=["messages:write", "tool_invoke:assistant"],
+       capabilities=["messages:write", "outlet_call:assistant"],
        context=my_context,
        expiry=3600,  # seconds from now
    )
@@ -850,7 +850,7 @@ Implement comprehensive UCAN validation in `scp-core/crypto/ucan/` (Rust, buildi
    - Resource URI: `scp:ctx:{context_id}/{capability}`
    - Examples:
      - `scp:ctx:abc123/messages:write`
-     - `scp:ctx:abc123/tool_invoke:assistant`
+     - `scp:ctx:abc123/outlet_call:assistant`
      - `scp:ctx:abc123/member:invite`
      - `scp:ctx:abc123/role:assign`
      - `scp:ctx:abc123/context:close`
@@ -914,8 +914,8 @@ The ultimate acceptance criterion for Phase 3 exercises all 4 ADRs together with
 3. Alice creates a context with tools:
    ctx = await scp.Context.create(
        creator=alice,
-       ceiling=["messaging", "tool_invoke"],
-       tools=[scp.ToolDefinition(name="calculator", ...)],
+       ceiling=["messaging", "outlet_call"],
+       tools=[scp.OutletDefinition(name="calculator", ...)],
    )
    Context creation mints admin UCAN tokens for Alice (ADR-016).
    UCAN nonce is generated and tracked. Capability ceiling is set and immutable.
@@ -924,7 +924,7 @@ The ultimate acceptance criterion for Phase 3 exercises all 4 ADRs together with
    bob = await scp.Identity.create(custody="in_memory")
    membership = await ctx.join(bob)
    Bob receives member-role UCAN tokens (ADR-016). Tokens are scoped to
-   messages:read, messages:write, tool_invoke_all. UCAN signature chain
+   messages:read, messages:write, outlet_query_all, outlet_call_all. UCAN signature chain
    traces to Alice (context creator) as root authority.
 
 5. Alice sends a message — UCAN validated:
@@ -941,8 +941,8 @@ The ultimate acceptance criterion for Phase 3 exercises all 4 ADRs together with
 7. Bob invokes the calculator tool:
    result = await ctx.invoke("calculator", {"operation": "add", "a": 1, "b": 2})
    assert result == {"result": 3}
-   UCAN validates Bob has tool_invoke capability (ADR-016).
-   Tool invocation is logged in the Merkle event log.
+   UCAN validates Bob has outlet_call capability (ADR-016).
+   Outlet invocation is logged in the Merkle event log.
 
 8. Bob attempts an admin action — UCAN rejects:
    try:
@@ -975,10 +975,10 @@ The ultimate acceptance criterion for Phase 3 exercises all 4 ADRs together with
     assert proof.valid
     Merkle proof verification runs in Rust, result returned to Python (ADR-013).
 
-12. Alice revokes Bob's tool invocation capability:
-    await scp.ucan.revoke(context=ctx, token=membership.tokens["tool_invoke_all"])
+12. Alice revokes Bob's outlet invocation capability:
+    await scp.ucan.revoke(context=ctx, token=membership.tokens["outlet_call_all"])
     Revocation distributed via MLS to all members (ADR-016).
-    Bob's next tool invocation attempt fails with UcanPermissionError.
+    Bob's next outlet invocation attempt fails with UcanPermissionError.
 
 13. Throughout: Every Python async call crosses the PyO3 bridge (ADR-013),
     runs on the shared tokio runtime, and returns results as native Python
@@ -1054,7 +1054,7 @@ pub struct Coefficient(pub i64);                // fixed-point: value = raw / 1_
 pub type PaymentAdapterRef = String;            // adapter_id string
 
 pub enum PaidActionType {
-    MessageSend, ToolInvoke, ContextJoin, SubscriptionPeriod, ByteStored,
+    MessageSend, OutletCall, ContextJoin, SubscriptionPeriod, ByteStored,
 }
 
 // --- Payment adapter (§19.2.1) ---
@@ -1123,7 +1123,7 @@ pub struct EconomicPolicy {
 pub struct CostSchedule {
     pub currency: CurrencyCode,
     pub per_message: Option<Amount>,
-    pub per_tool_invoke: Option<Amount>,
+    pub per_outlet_call: Option<Amount>,
     pub per_join: Option<Amount>,
     pub per_period: Option<SubscriptionCost>,
     pub per_byte_stored: Option<Amount>,

@@ -1646,12 +1646,12 @@
       "description": "Implement UCAN-based capability ceiling enforcement and role assignment in scp-core/context/roles.rs. The capability ceiling is declared at context creation and is immutable (spec section 5.3) — it bounds the maximum set of operations possible in the context. Roles (spec section 5.5) define subsets of the ceiling that specific agents can exercise. Every action requires a valid UCAN capability token, verified mechanically. No action proceeds on identity or reputation alone.",
       "acceptanceCriteria": [
         "`CapabilityCeiling` struct with `capabilities: HashSet<Capability>`",
-        "`Capability` enum with variants: MessagesRead, MessagesWrite, ToolInvoke(ToolId), ToolInvokeAll, ToolRegister, MemberInvite, MemberRemove, RoleAssign, GovernancePropose, GovernanceVote, ContextClose, ChildContextCreate, Custom(String) — derives Debug, Clone, Hash, PartialEq, Eq",
+        "`Capability` enum with variants: MessagesRead, MessagesWrite, OutletQuery(OutletId), OutletQueryAll, OutletCall(OutletId), OutletCallAll, OutletRegister, OutletInterface, MemberInvite, MemberRemove, RoleAssign, GovernancePropose, GovernanceVote, ContextClose, ChildContextCreate, Custom(String) — derives Debug, Clone, Hash, PartialEq, Eq",
         "Mode-agnostic capabilities: MessagesRead and MessagesWrite apply to both Encrypted and Broadcast modes; ContextMode determines processing, not authorization; no new capability variants needed for broadcast mode",
         "Ceiling is set at context creation via ContextParams.ceiling; ceiling is immutable, any attempt to modify returns ContextError::CeilingImmutable; role permission sets are validated against the ceiling at role definition time — a role cannot grant capabilities outside the ceiling",
         "`RoleDefinition` struct with `name: String` and `capabilities: HashSet<Capability>`",
-        "Built-in roles always available: `admin` (all capabilities in the ceiling), `member` (MessagesRead, MessagesWrite, ToolInvokeAll), `observer` (MessagesRead only)",
-        "Broadcast-specific roles: `author` (MessagesWrite, MessagesRead, ToolInvokeAll — authors are bounded, added via RoleAssigned event), `subscriber` (MessagesRead only — in open broadcast contexts auto-granted on DID-authenticated registration following context reader-tier pattern, in gated broadcast contexts requires explicit admin-issued UCAN)",
+        "Built-in roles always available: `admin` (all capabilities in the ceiling), `member` (MessagesRead, MessagesWrite, OutletQueryAll, OutletCallAll), `observer` (MessagesRead only)",
+        "Broadcast-specific roles: `author` (MessagesWrite, MessagesRead, OutletQueryAll, OutletCallAll — authors are bounded, added via RoleAssigned event), `subscriber` (MessagesRead only — in open broadcast contexts auto-granted on DID-authenticated registration following context reader-tier pattern, in gated broadcast contexts requires explicit admin-issued UCAN)",
         "Custom roles defined at context creation with arbitrary capability subsets of the ceiling",
         "`assign_role(context: &ContextHandle, member_did: &DID, role: &str, assigner_did: &DID) -> Result<Vec<UcanToken>, ContextError>` verifies assigner has RoleAssign capability via UCAN validation; validates role exists in context's role definitions; mints UCAN tokens for each capability in the role's permission set; each token has iss = context creator DID, aud = member DID, att = [{ \"with\": \"scp:ctx:{context_id}/{capability}\", \"can\": \"invoke\" }], nnc = unique nonce; distributes tokens to member via MLS application message; revokes any previous tokens for this member (role change); appends RoleAssigned event to event log; returns the minted tokens",
         "`check_ceiling(ceiling: &CapabilityCeiling, capability: &Capability) -> bool` returns true if the capability is within the ceiling; called as part of every UCAN validation; called at role definition time to validate role permission sets",
@@ -1685,9 +1685,9 @@
         }
       ],
       "details": {
-        "CapabilityCeiling type": "```rust\npub struct CapabilityCeiling {\n    pub capabilities: HashSet<Capability>,\n}\n\n#[derive(Debug, Clone, Hash, PartialEq, Eq)]\npub enum Capability {\n    MessagesRead,\n    MessagesWrite,\n    ToolInvoke(ToolId),\n    ToolInvokeAll,\n    ToolRegister,\n    MemberInvite,\n    MemberRemove,\n    RoleAssign,\n    GovernancePropose,\n    GovernanceVote,\n    ContextClose,\n    ChildContextCreate,\n    Custom(String),\n}\n```",
+        "CapabilityCeiling type": "```rust\npub struct CapabilityCeiling {\n    pub capabilities: HashSet<Capability>,\n}\n\n#[derive(Debug, Clone, Hash, PartialEq, Eq)]\npub enum Capability {\n    MessagesRead,\n    MessagesWrite,\n    OutletQuery(OutletId),\n    OutletQueryAll,\n    OutletCall(OutletId),\n    OutletCallAll,\n    OutletRegister,\n    OutletInterface,\n    MemberInvite,\n    MemberRemove,\n    RoleAssign,\n    GovernancePropose,\n    GovernanceVote,\n    ContextClose,\n    ChildContextCreate,\n    Custom(String),\n}\n```",
         "RoleDefinition type": "```rust\npub struct RoleDefinition {\n    pub name: String,\n    pub capabilities: HashSet<Capability>,\n}\n```",
-        "Built-in roles": "- `admin` — all capabilities in the ceiling.\n- `member` — MessagesRead, MessagesWrite, ToolInvokeAll.\n- `observer` — MessagesRead only.\n\nBroadcast-specific roles:\n- `author` — MessagesWrite, MessagesRead, ToolInvokeAll. Authors are bounded. Added via RoleAssigned event.\n- `subscriber` — MessagesRead only. In open broadcast contexts (public-broadcast template), MessagesRead is auto-granted on DID-authenticated registration, following the context reader-tier pattern (§6.2.2B). In gated broadcast contexts (gated-broadcast template), MessagesRead requires an explicit admin-issued UCAN.",
+        "Built-in roles": "- `admin` — all capabilities in the ceiling.\n- `member` — MessagesRead, MessagesWrite, OutletQueryAll, OutletCallAll.\n- `observer` — MessagesRead only.\n\nBroadcast-specific roles:\n- `author` — MessagesWrite, MessagesRead, OutletQueryAll, OutletCallAll. Authors are bounded. Added via RoleAssigned event.\n- `subscriber` — MessagesRead only. In open broadcast contexts (public-broadcast template), MessagesRead is auto-granted on DID-authenticated registration, following the context reader-tier pattern (§6.2.2B). In gated broadcast contexts (gated-broadcast template), MessagesRead requires an explicit admin-issued UCAN.",
         "UCAN token format": "Each token: iss = context creator DID, aud = member DID, att = [{ \"with\": \"scp:ctx:{context_id}/{capability}\", \"can\": \"invoke\" }], nnc = unique nonce."
       },
       "result": "Already implemented in prior iteration (SCP-018 remediation). 54 tests, all acceptance criteria met."
@@ -1816,12 +1816,12 @@
         "`ToolRegistration` struct with fields: tool_id (ToolId), name (String), description (String), schema (ToolSchema — MCP-compatible JSON Schema), implementation_hash ([u8; 32] — SHA-256 of implementation), test_vectors (Vec<TestVector> — known input-output pairs), operator_did (DID — accountable identity)",
         "`ToolSchema` struct with fields: input_schema (serde_json::Value — JSON Schema for input), output_schema (serde_json::Value — JSON Schema for output)",
         "`TestVector` struct with fields: input (serde_json::Value), expected_output (serde_json::Value), description (String)",
-        "`register_tool(context: &ContextHandle, registration: ToolRegistration, registrant_did: &DID) -> Result<ToolId, ToolError>` validates registrant has ToolRegister capability via UCAN (ADR-009); validates input and output schemas are valid JSON Schema; validates implementation hash is 32 bytes; validates operator DID is resolvable; stores the tool registration in the context's tool registry; appends ToolRegistered event to event log with full registration metadata; returns the tool ID",
+        "`register_outlet(context: &ContextHandle, registration: OutletRegistration, registrant_did: &DID) -> Result<OutletId, OutletError>` validates registrant has OutletRegister capability via UCAN (ADR-009); validates input and output schemas are valid JSON Schema; validates implementation hash is 32 bytes; validates operator DID is resolvable; stores the outlet registration in the context's outlet registry; appends ToolRegistered event to event log with full registration metadata; returns the outlet ID",
         "`update_tool(context: &ContextHandle, tool_id: &ToolId, new_registration: ToolRegistration, updater_did: &DID) -> Result<(), ToolError>` validates updater is the tool's operator DID or has admin role; records old and new implementation hashes; updates the tool registration; appends ToolUpdated event to event log (includes old hash, new hash, all changed fields); tool mutations are visible to all context members",
         "`verify_tool(context: &ContextHandle, tool_id: &ToolId) -> Result<ToolVerificationResult, ToolError>` runs all test vectors against the tool; for each test vector invokes tool with test input, compares output to expected output; returns a result with per-vector pass/fail status and overall integrity assessment; appends ToolVerified event to event log",
         "JSON Schema validation helpers and MCP compatibility utilities in schema.rs",
         "Unit test: register_tool validates schemas are valid JSON Schema",
-        "Unit test: register_tool rejects registrant without ToolRegister capability",
+        "Unit test: register_outlet rejects registrant without OutletRegister capability",
         "Unit test: update_tool logs old and new hashes",
         "Unit test: verify_tool returns correct pass/fail per test vector",
         "Optional `ToolEconomicMetadata` in tool registration (§19.3): cost_per_invoke (Amount), cost_formula (Option<PricingFormula>), payee (DID, may differ from context payee). Tool-level costs are additive with context costs"
@@ -1867,7 +1867,7 @@
       ],
       "description": "Implement tool invocation with the full execution lifecycle: request/response protocol, timeout handling, cancellation, error propagation, and event log recording. Every tool invocation follows a defined lifecycle with explicit states, timeouts, and error handling. Tool execution errors are returned in ToolResponse.error, not as protocol-level errors. Schema validation failures are caught by the SDK, not the tool.",
       "acceptanceCriteria": [
-        "`invoke_tool(context: &ContextHandle, tool_id: &ToolId, input: serde_json::Value, invoker_did: &DID) -> Result<serde_json::Value, ToolError>` validates context state is Active; validates invoker has ToolInvoke(tool_id) or ToolInvokeAll capability via UCAN; validates input against the tool's input schema; calls the tool implementation; validates output against the tool's output schema; appends ToolInvoked event to event log (includes tool_id, invoker_did, input hash, output hash); returns the tool output",
+        "`invoke_outlet(context: &ContextHandle, outlet_id: &OutletId, input: serde_json::Value, invoker_did: &DID) -> Result<serde_json::Value, OutletError>` validates context state is Active; validates invoker has OutletQuery(outlet_id)/OutletQueryAll (Query) or OutletCall(outlet_id)/OutletCallAll (Action) capability via UCAN; validates input against the outlet's input schema; calls the outlet implementation; validates output against the outlet's output schema; appends ToolInvoked event to event log (includes outlet_id, invoker_did, input hash, output hash); returns the outlet output",
         "`ToolRequest` struct with fields: request_id (String — UUID v4, unique per invocation), tool_id (ToolId), invoker_did (DID), input (serde_json::Value), timeout_ms (u32 — caller-specified timeout, max: context ceiling, default: 30_000), session_id (Option<String> — for stateful sessions §6.2.1), chain_depth (u8 — cross-context chain depth, 0 for direct calls), timestamp (u64)",
         "`ToolResponse` struct with fields: request_id (String — matches the request), status (ToolStatus), output (Option<serde_json::Value>), error (Option<ToolExecutionError>), execution_time_ms (u64), provenance (Provenance)",
         "`ToolStatus` enum: Success, Error, Timeout, Cancelled",
@@ -1878,7 +1878,7 @@
         "Error propagation: tool execution errors returned in ToolResponse.error, not as protocol-level errors; schema validation failures caught by SDK not tool — SDK rejects invalid input before invoking tool and rejects invalid output before delivering response; retryable field indicates whether caller should retry",
         "Event log recording: both ToolRequest and ToolResponse recorded as events in context's event log (ADR-011); event includes request_id, tool_id, invoker_did, status, execution_time_ms, SHA256(input), SHA256(output); full input/output NOT recorded (may be large), only content hashes stored",
         "Unit test: invoke_tool rejects when context not Active",
-        "Unit test: invoke_tool rejects invoker without ToolInvoke capability",
+        "Unit test: invoke_outlet rejects invoker without OutletCall capability",
         "Unit test: input schema validation failure returns InputValidationFailed",
         "Unit test: timeout synthesizes Timeout response",
         "Unit test: cancellation returns Cancelled status"
@@ -2261,13 +2261,13 @@
       ],
       "description": "The ultimate acceptance criterion for Phase 2 exercises all 5 ADRs together with the Phase 1 crypto stack. This integration test proves: context lifecycle works, roles enforce, tools invoke, event logs verify, multi-transport routes, TTL enforces, metadata privacy measures are active, and everything composes cleanly on top of Phase 1's crypto stack.",
       "acceptanceCriteria": [
-        "Step 1: Alice creates an identity (ADR-003) and a context with ceiling [messaging, tool_invoke], roles [admin, member], one tool 'calculator', TTL 5 minutes, memory scope ephemeral (ADR-008)",
+        "Step 1: Alice creates an identity (ADR-003) and a context with ceiling [messaging, outlet_call], roles [admin, member], one outlet 'calculator', TTL 5 minutes, memory scope ephemeral (ADR-008)",
         "Step 2: The context is assigned to 3 relays via TransportManager (ADR-012)",
         "Step 3: Bob creates an identity, discovers the context, and joins (ADR-008)",
-        "Step 4: Bob is assigned the 'member' role with UCAN tokens for messages:read, messages:write, tool_invoke_all (ADR-009)",
+        "Step 4: Bob is assigned the 'member' role with UCAN tokens for messages:read, messages:write, outlet_query_all, outlet_call_all (ADR-009)",
         "Step 5: Alice sends a message. UCAN is validated. Envelope is created, multi-relay published (ADR-012). Event is logged in the Merkle tree (ADR-011).",
         "Step 6: Bob receives the message via merged subscription stream (ADR-012). Bob's SDK deduplicates across relays.",
-        "Step 7: Bob invokes the 'calculator' tool with input {\"operation\": \"add\", \"a\": 1, \"b\": 2} (ADR-010). UCAN validates Bob has tool_invoke capability. Tool returns {\"result\": 3}. Invocation is logged (ADR-011).",
+        "Step 7: Bob invokes the 'calculator' outlet with input {\"operation\": \"add\", \"a\": 1, \"b\": 2} (ADR-010). UCAN validates Bob has outlet_call capability. Outlet returns {\"result\": 3}. Invocation is logged (ADR-011).",
         "Step 8: Bob attempts to assign a role (he's a member, not admin). UCAN validation rejects — Bob lacks RoleAssign capability (ADR-009). Action is denied.",
         "Step 9: Both Alice and Bob generate consistency checkpoints (ADR-011). Merkle roots match.",
         "Step 10: TTL expires. Context transitions to Expired (ADR-008). MLS group and sender keys are destroyed. Relay deletion requests are sent for all context blobs.",
@@ -2314,7 +2314,7 @@
         }
       ],
       "details": {
-        "Full test scenario": "1. Alice creates an identity (ADR-003) and a context with ceiling [messaging, tool_invoke], roles [admin, member], one tool \"calculator\", TTL 5 minutes, memory scope ephemeral (ADR-008)\n2. The context is assigned to 3 relays via TransportManager (ADR-012)\n3. Bob creates an identity, discovers the context, and joins (ADR-008)\n4. Bob is assigned the \"member\" role with UCAN tokens for messages:read, messages:write, tool_invoke_all (ADR-009)\n5. Alice sends a message. UCAN is validated. Envelope is created, multi-relay published (ADR-012). Event is logged in the Merkle tree (ADR-011).\n6. Bob receives the message via merged subscription stream (ADR-012). Bob's SDK deduplicates across relays.\n7. Bob invokes the \"calculator\" tool with input {\"operation\": \"add\", \"a\": 1, \"b\": 2} (ADR-010). UCAN validates Bob has tool_invoke capability. Tool returns {\"result\": 3}. Invocation is logged (ADR-011).\n8. Bob attempts to assign a role (he's a member, not admin). UCAN validation rejects — Bob lacks RoleAssign capability (ADR-009). Action is denied.\n9. Both Alice and Bob generate consistency checkpoints (ADR-011). Merkle roots match.\n10. TTL expires. Context transitions to Expired (ADR-008). MLS group and sender keys are destroyed. Relay deletion requests are sent for all context blobs.\n11. The event log's Merkle tree remains — the structure (hashes, proofs) survives even though the encrypted content is now unreadable.\n12. Throughout: relay reliability is tracked, and relay sets are partitioned across contexts.",
+        "Full test scenario": "1. Alice creates an identity (ADR-003) and a context with ceiling [messaging, outlet_call], roles [admin, member], one outlet \"calculator\", TTL 5 minutes, memory scope ephemeral (ADR-008)\n2. The context is assigned to 3 relays via TransportManager (ADR-012)\n3. Bob creates an identity, discovers the context, and joins (ADR-008)\n4. Bob is assigned the \"member\" role with UCAN tokens for messages:read, messages:write, outlet_query_all, outlet_call_all (ADR-009)\n5. Alice sends a message. UCAN is validated. Envelope is created, multi-relay published (ADR-012). Event is logged in the Merkle tree (ADR-011).\n6. Bob receives the message via merged subscription stream (ADR-012). Bob's SDK deduplicates across relays.\n7. Bob invokes the \"calculator\" outlet with input {\"operation\": \"add\", \"a\": 1, \"b\": 2} (ADR-010). UCAN validates Bob has outlet_call capability. Outlet returns {\"result\": 3}. Invocation is logged (ADR-011).\n8. Bob attempts to assign a role (he's a member, not admin). UCAN validation rejects — Bob lacks RoleAssign capability (ADR-009). Action is denied.\n9. Both Alice and Bob generate consistency checkpoints (ADR-011). Merkle roots match.\n10. TTL expires. Context transitions to Expired (ADR-008). MLS group and sender keys are destroyed. Relay deletion requests are sent for all context blobs.\n11. The event log's Merkle tree remains — the structure (hashes, proofs) survives even though the encrypted content is now unreadable.\n12. Throughout: relay reliability is tracked, and relay sets are partitioned across contexts.",
         "What this proves": "Context lifecycle works, roles enforce, tools invoke, event logs verify, multi-transport routes, TTL enforces, metadata privacy measures are active, and everything composes cleanly on top of Phase 1's crypto stack."
       },
       "result": "Phase 2 integration test created at crates/scp-core/tests/phase2_integration.rs. Exercises 12-step scenario: identity creation, context lifecycle, UCAN role enforcement, tool invocation, event logging, checkpoint consistency, TTL expiry, and multi-relay transport simulation. All tests pass."
@@ -2529,7 +2529,7 @@
       "description": "Implement PyO3 bridge functions for tool registration/invocation, transport connection, UCAN token management, and event log queries. Each function maps directly to one scp-core function. Types exposed as opaque PyO3 classes with attribute access.",
       "acceptanceCriteria": [
         "`py_tool_register(handle, registration) -> str` — registers a tool (returns tool ID).",
-        "`py_tool_invoke(handle, tool_id, input, identity) -> PyObject` — invokes a tool (returns JSON-compatible output).",
+        "`outlet_invoke(handle, outlet_id, input, identity) -> PyObject` — invokes an outlet (returns JSON-compatible output).",
         "`py_tool_verify(handle, tool_id) -> PyToolVerificationResult` — verifies a tool against test vectors.",
         "`py_transport_connect(relay_url) -> None` — connects to an SCP relay.",
         "`py_transport_status() -> PyTransportStatus` — returns transport connection status.",
@@ -2540,7 +2540,7 @@
         "`py_event_log_verify(handle, claim) -> PyProof` — verifies a claim against the event log."
       ],
       "actionItems": [
-        "Create `scp-ffi/pyo3/tools.rs` with `PyToolRegistration`, `PyToolVerificationResult` pyclass definitions and bridge functions `py_tool_register`, `py_tool_invoke`, `py_tool_verify`.",
+        "Create `scp-ffi/src/outlets.rs` with `PyOutletRegistration`, `PyOutletVerificationResult` pyclass definitions and bridge functions `outlet_register`, `outlet_invoke`, `outlet_verify`.",
         "Create `scp-ffi/pyo3/transport.rs` with `PyTransportStatus` pyclass and bridge functions `py_transport_connect`, `py_transport_status`.",
         "Create `scp-ffi/pyo3/ucan.rs` with `PyUcanToken` pyclass and bridge functions `py_ucan_validate`, `py_ucan_mint`, `py_ucan_revoke`.",
         "Create `scp-ffi/pyo3/event_log.rs` with `PyEvent`, `PyProof` pyclass definitions and bridge functions `py_event_log_query`, `py_event_log_verify`.",
@@ -2677,7 +2677,7 @@
         "Implement `async def close(self, identity) -> None` delegating to `_scp_core.py_context_close`.",
         "Implement `async def send(self, message, identity=None) -> None` delegating to `_scp_core.py_context_send`.",
         "Implement `async def receive(self) -> AsyncIterator[Message]` wrapping `_scp_core.py_context_receive` as a Python async iterator.",
-        "Implement `async def invoke(self, tool, input, identity=None) -> dict` delegating to `_scp_core.py_tool_invoke`.",
+        "Implement `async def invoke(self, outlet, input, identity=None) -> dict` delegating to `_scp_core.outlet_invoke`.",
         "Implement `__aenter__` returning self and `__aexit__` that calls `leave()` if still active.",
         "Expose `.context_id` and `.state` as properties.",
         "Implement receive buffer configuration parameter in Context.create and ensure AsyncIterator wrapper respects buffer semantics from scp-core"
@@ -3090,7 +3090,7 @@
         "Capability URI parsing supports format `scp:ctx:{context_id}/{capability}`.",
         "Wildcard matching: `scp:ctx:*/messages:write` matches any context.",
         "Ceiling intersection: verify a capability is within the context's immutable capability ceiling (constant-time set membership test).",
-        "Capability examples: `scp:ctx:abc123/messages:write`, `scp:ctx:abc123/tool_invoke:assistant`, `scp:ctx:abc123/member:invite`, `scp:ctx:abc123/role:assign`, `scp:ctx:abc123/context:close`."
+        "Capability examples: `scp:ctx:abc123/messages:write`, `scp:ctx:abc123/outlet_call:assistant`, `scp:ctx:abc123/member:invite`, `scp:ctx:abc123/role:assign`, `scp:ctx:abc123/context:close`."
       ],
       "actionItems": [
         "Create `crates/scp-core/crypto/ucan/mod.rs` with `UcanToken`, `UcanHeader`, `UcanPayload`, `Attenuation` structs and re-exports.",
@@ -3114,7 +3114,7 @@
         "ucan_token": "pub struct UcanToken {\n    pub header: UcanHeader,\n    pub payload: UcanPayload,\n    pub signature: Ed25519Signature,\n    pub encoded: String,\n}\n\npub struct UcanHeader {\n    pub alg: String,    // \"EdDSA\"\n    pub typ: String,    // \"JWT\"\n    pub ucv: String,    // \"0.10.0\"\n}\n\npub struct UcanPayload {\n    pub iss: String,\n    pub aud: String,\n    pub exp: u64,\n    pub nbf: Option<u64>,\n    pub nnc: String,\n    pub att: Vec<Attenuation>,\n    pub prf: Vec<String>,\n    pub fct: Option<serde_json::Value>,\n}\n\npub struct Attenuation {\n    pub with: String,    // \"scp:ctx:{context_id}/{capability}\"\n    pub can: String,     // \"invoke\", \"read\", \"write\"\n}",
         "capability_uri_examples": [
           "scp:ctx:abc123/messages:write",
-          "scp:ctx:abc123/tool_invoke:assistant",
+          "scp:ctx:abc123/outlet_call:assistant",
           "scp:ctx:abc123/member:invite",
           "scp:ctx:abc123/role:assign",
           "scp:ctx:abc123/context:close",
@@ -3347,7 +3347,7 @@
         }
       ],
       "details": {
-        "python_usage": "from scp_sdk.ucan import validate, mint, revoke\n\ntoken = await mint(\n    issuer=my_identity,\n    audience=agent_did,\n    capabilities=[\"messages:write\", \"tool_invoke:assistant\"],\n    context=my_context,\n    expiry=3600,\n)\n\nawait validate(\n    context=my_context,\n    token=token,\n    capability=\"messages:write\",\n)\n\nawait revoke(context=my_context, token=token)\n\n# Implicit validation:\nawait context.send(\"hello\")  # Internally calls validate() before sending"
+        "python_usage": "from scp_sdk.ucan import validate, mint, revoke\n\ntoken = await mint(\n    issuer=my_identity,\n    audience=agent_did,\n    capabilities=[\"messages:write\", \"outlet_call:assistant\"],\n    context=my_context,\n    expiry=3600,\n)\n\nawait validate(\n    context=my_context,\n    token=token,\n    capability=\"messages:write\",\n)\n\nawait revoke(context=my_context, token=token)\n\n# Implicit validation:\nawait context.send(\"hello\")  # Internally calls validate() before sending"
       },
       "result": "Implemented in iteration 3"
     },
@@ -3365,16 +3365,16 @@
       "acceptanceCriteria": [
         "Install the SDK: `pip install scp-python` in a clean Python venv. No Rust toolchain. Zero compilation. Binary wheel installs in seconds.",
         "Alice creates an identity in Python: `alice = await scp.Identity.create(custody=\"in_memory\")`. Calls through: Python wrapper (ADR-014) -> PyO3 bridge (ADR-013) -> scp-core Identity::create.",
-        "Alice creates a context with tools: `ctx = await scp.Context.create(creator=alice, ceiling=[\"messaging\", \"tool_invoke\"], tools=[scp.ToolDefinition(name=\"calculator\", ...)])`. Context creation mints admin UCAN tokens for Alice (ADR-016). UCAN nonce is generated and tracked. Capability ceiling is set and immutable.",
-        "Bob creates an identity and joins the context: `bob = await scp.Identity.create(custody=\"in_memory\")`, `membership = await ctx.join(bob)`. Bob receives member-role UCAN tokens (ADR-016). Tokens are scoped to messages:read, messages:write, tool_invoke_all. UCAN signature chain traces to Alice (context creator) as root authority.",
+        "Alice creates a context with outlets: `ctx = await scp.Context.create(creator=alice, ceiling=[\"messaging\", \"outlet_call\"], tools=[scp.OutletDefinition(name=\"calculator\", ...)])`. Context creation mints admin UCAN tokens for Alice (ADR-016). UCAN nonce is generated and tracked. Capability ceiling is set and immutable.",
+        "Bob creates an identity and joins the context: `bob = await scp.Identity.create(custody=\"in_memory\")`, `membership = await ctx.join(bob)`. Bob receives member-role UCAN tokens (ADR-016). Tokens are scoped to messages:read, messages:write, outlet_query_all, outlet_call_all. UCAN signature chain traces to Alice (context creator) as root authority.",
         "Alice sends a message — UCAN validated: `await ctx.send(\"Hello from Python\", identity=alice)`. Internally: validate_ucan(ctx, alice_token, \"messages:write\") passes (ADR-016). Message flows through scp-core: sender key encrypt -> MLS encrypt -> envelope -> multi-relay publish. All via PyO3 bridge (ADR-013).",
         "Bob receives the message via async iterator: `async for msg in ctx.receive(): print(msg.content)`. Async iterator bridges tokio stream -> Python asyncio via PyO3 native async (ADR-013).",
-        "Bob invokes the calculator tool: `result = await ctx.invoke(\"calculator\", {\"operation\": \"add\", \"a\": 1, \"b\": 2})`, `assert result == {\"result\": 3}`. UCAN validates Bob has tool_invoke capability (ADR-016). Tool invocation is logged in the Merkle event log.",
+        "Bob invokes the calculator outlet: `result = await ctx.invoke(\"calculator\", {\"operation\": \"add\", \"a\": 1, \"b\": 2})`, `assert result == {\"result\": 3}`. UCAN validates Bob has outlet_call capability (ADR-016). Outlet invocation is logged in the Merkle event log.",
         "Bob attempts an admin action — UCAN rejects: `await ctx.close(identity=bob)` raises `scp.UcanPermissionError`. Bob lacks context:close capability. UCAN validation failed (ADR-016).",
         "Start an MCP server exposing Alice's SCP contexts (ADR-015): `server = await scp.mcp.serve_mcp(identity=alice, contexts=[ctx], transport=\"stdio\")`. tools/list returns namespaced tools. Admin tools visible because Alice is admin. Member tools only visible for member-role agent.",
         "MCP client invokes a tool: `tools/call(\"ctx_123/calculator\", {\"operation\": \"multiply\", \"a\": 3, \"b\": 7})` returns `{\"result\": 21}`. MCP adapter parses context namespace, validates UCAN, routes through scp-core tool invocation, returns result via JSON-RPC. The model never saw a DID, UCAN token, MLS group, or relay.",
         "Verify event log from Python: `events = await ctx.event_log.query(event_type=\"tool_invoked\")`, `proof = await ctx.event_log.verify({\"event_exists\": events[0].id})`, `assert proof.valid`. Merkle proof verification runs in Rust, result returned to Python (ADR-013).",
-        "Alice revokes Bob's tool invocation capability: `await scp.ucan.revoke(context=ctx, token=membership.tokens[\"tool_invoke_all\"])`. Revocation distributed via MLS to all members (ADR-016). Bob's next tool invocation attempt fails with UcanPermissionError.",
+        "Alice revokes Bob's outlet invocation capability: `await scp.ucan.revoke(context=ctx, token=membership.tokens[\"outlet_call_all\"])`. Revocation distributed via MLS to all members (ADR-016). Bob's next outlet invocation attempt fails with UcanPermissionError.",
         "Throughout: Every Python async call crosses the PyO3 bridge (ADR-013), runs on the shared tokio runtime, and returns results as native Python objects. No Rust concepts leak. Errors are Python exceptions. Types have full PEP 484 hints. IDE autocompletion works."
       ],
       "actionItems": [
@@ -8240,7 +8240,7 @@
         "crates/scp-core/src/context/params.rs",
         "crates/scp-core/src/context/mod.rs"
       ],
-      "description": "Add all core economic types from §19.1.1 and §19.3 to the economy module and wire them into context params.\n\n§19.1.1 Core Economic Types:\n```rust\n/// Amount in smallest currency unit. USD: cents (1 USD = 100). BTC: satoshis (1 BTC = 100_000_000).\n/// Always integer — no floating-point in economic calculations. Cross-party determinism guaranteed.\n/// Both payer and receiver evaluate the same Amount from the same inputs with identical results.\npub struct Amount(pub u64);\n\n/// ISO 4217 currency code (USD, EUR) or protocol-defined code (BTC, SAT, SOL, USDC).\npub struct CurrencyCode(pub [u8; 4]); // 3-4 character code, null-padded\n\n/// Fixed-point coefficient with 6 decimal places of precision.\n/// Value = raw / 1_000_000. Example: 1_500_000 = 1.5, 100 = 0.0001.\n/// Used in pricing formulas where fractional multipliers are needed.\n/// Both sides evaluate identically — no IEEE 754 variance.\npub struct Coefficient(pub i64);\n\n/// Subscription cost for recurring payments.\npub struct SubscriptionCost {\n    pub amount: Amount,\n    pub period: SubscriptionPeriod,\n    pub currency: CurrencyCode,\n}\n\npub enum SubscriptionPeriod {\n    Daily,\n    Weekly,\n    Monthly,\n    Custom { seconds: u64 },\n}\n```\n\n§19.3 Economic Policy:\n```rust\npub struct EconomicPolicy {\n    pub locked: bool,                              // true = immutable, false = governed (default)\n    pub cost_schedule: CostSchedule,\n    pub payment_adapters: Vec<PaymentAdapterRef>,  // accepted payment methods\n    pub pricing_formula: Option<PricingFormula>,    // for dynamic pricing (§19.4)\n    pub payee: DID,                                // who receives payments\n}\n\npub struct CostSchedule {\n    pub per_message: Option<Amount>,\n    pub per_tool_invoke: Option<Amount>,            // default for tools without own cost\n    pub per_join: Option<Amount>,                   // one-time membership cost\n    pub per_period: Option<SubscriptionCost>,       // recurring\n    pub per_byte_stored: Option<Amount>,            // storage costs\n}\n```\n\n§19.4 Dynamic Pricing types:\n```rust\npub struct PricingFormula {\n    pub base_cost: Amount,\n    pub variables: Vec<PricingVariable>,\n    pub cap: Option<Amount>,     // max cost regardless of formula\n    pub floor: Option<Amount>,   // min cost regardless of formula\n}\n\npub enum PricingVariable {\n    /// Linear multiplier: cost += (coefficient.0 * metric_value) / 1_000_000\n    Linear { metric: PricingMetric, coefficient: Coefficient },\n    /// Step function: cost += additional when metric_value exceeds threshold.\n    Step { metric: PricingMetric, thresholds: Vec<(u64, Amount)> },\n}\n\npub enum PricingMetric {\n    ContextMessageRate,    // messages/min in this context\n    MemberCount,           // current member count\n    RelayQueueDepth,       // relay-level only\n    TimeOfDay,             // UTC hour (0-23), enables off-peak pricing\n    SenderVelocity,        // sender's messages in sliding window (anti-spam)\n    StorageUsage,          // context storage in bytes\n}\n```\n\nContextParams extended with economic_policy: Option<EconomicPolicy>. Patches SCP-018 with economic governance support.",
+      "description": "Add all core economic types from §19.1.1 and §19.3 to the economy module and wire them into context params.\n\n§19.1.1 Core Economic Types:\n```rust\n/// Amount in smallest currency unit. USD: cents (1 USD = 100). BTC: satoshis (1 BTC = 100_000_000).\n/// Always integer — no floating-point in economic calculations. Cross-party determinism guaranteed.\n/// Both payer and receiver evaluate the same Amount from the same inputs with identical results.\npub struct Amount(pub u64);\n\n/// ISO 4217 currency code (USD, EUR) or protocol-defined code (BTC, SAT, SOL, USDC).\npub struct CurrencyCode(pub [u8; 4]); // 3-4 character code, null-padded\n\n/// Fixed-point coefficient with 6 decimal places of precision.\n/// Value = raw / 1_000_000. Example: 1_500_000 = 1.5, 100 = 0.0001.\n/// Used in pricing formulas where fractional multipliers are needed.\n/// Both sides evaluate identically — no IEEE 754 variance.\npub struct Coefficient(pub i64);\n\n/// Subscription cost for recurring payments.\npub struct SubscriptionCost {\n    pub amount: Amount,\n    pub period: SubscriptionPeriod,\n    pub currency: CurrencyCode,\n}\n\npub enum SubscriptionPeriod {\n    Daily,\n    Weekly,\n    Monthly,\n    Custom { seconds: u64 },\n}\n```\n\n§19.3 Economic Policy:\n```rust\npub struct EconomicPolicy {\n    pub locked: bool,                              // true = immutable, false = governed (default)\n    pub cost_schedule: CostSchedule,\n    pub payment_adapters: Vec<PaymentAdapterRef>,  // accepted payment methods\n    pub pricing_formula: Option<PricingFormula>,    // for dynamic pricing (§19.4)\n    pub payee: DID,                                // who receives payments\n}\n\npub struct CostSchedule {\n    pub per_message: Option<Amount>,\n    pub per_outlet_call: Option<Amount>,            // default for Action outlets without own cost\n    pub per_join: Option<Amount>,                   // one-time membership cost\n    pub per_period: Option<SubscriptionCost>,       // recurring\n    pub per_byte_stored: Option<Amount>,            // storage costs\n}\n```\n\n§19.4 Dynamic Pricing types:\n```rust\npub struct PricingFormula {\n    pub base_cost: Amount,\n    pub variables: Vec<PricingVariable>,\n    pub cap: Option<Amount>,     // max cost regardless of formula\n    pub floor: Option<Amount>,   // min cost regardless of formula\n}\n\npub enum PricingVariable {\n    /// Linear multiplier: cost += (coefficient.0 * metric_value) / 1_000_000\n    Linear { metric: PricingMetric, coefficient: Coefficient },\n    /// Step function: cost += additional when metric_value exceeds threshold.\n    Step { metric: PricingMetric, thresholds: Vec<(u64, Amount)> },\n}\n\npub enum PricingMetric {\n    ContextMessageRate,    // messages/min in this context\n    MemberCount,           // current member count\n    RelayQueueDepth,       // relay-level only\n    TimeOfDay,             // UTC hour (0-23), enables off-peak pricing\n    SenderVelocity,        // sender's messages in sliding window (anti-spam)\n    StorageUsage,          // context storage in bytes\n}\n```\n\nContextParams extended with economic_policy: Option<EconomicPolicy>. Patches SCP-018 with economic governance support.",
       "acceptanceCriteria": [
         "Amount struct defined as Amount(pub u64) — smallest currency unit, integer-only",
         "CurrencyCode struct defined as CurrencyCode(pub [u8; 4]) — 3-4 character code, null-padded",
@@ -8253,7 +8253,7 @@
         "EconomicPolicy struct defined with field: pricing_formula (Option<PricingFormula>)",
         "EconomicPolicy struct defined with field: payee (DID)",
         "CostSchedule struct defined with field: per_message (Option<Amount>)",
-        "CostSchedule struct defined with field: per_tool_invoke (Option<Amount>) — default for tools without own cost",
+        "CostSchedule struct defined with field: per_outlet_call (Option<Amount>) — default for Action outlets without own cost",
         "CostSchedule struct defined with field: per_join (Option<Amount>) — one-time membership cost",
         "CostSchedule struct defined with field: per_period (Option<SubscriptionCost>) — recurring",
         "CostSchedule struct defined with field: per_byte_stored (Option<Amount>) — storage costs",
@@ -8614,7 +8614,7 @@
       "description": "Implement EconomicPolicy evaluation, CostSchedule lookup, formula evaluation, ObservableMetrics collection, CostInsufficient error with metric_snapshot, and estimate_cost SDK function.\n\n§19.3 Economic Policy:\nEconomic policy is a context setting governed through the context's governance model (§5.9). Mutable by default. Changes go through governance, are logged in the event log, visible to all members, take effect after a notification period. Optional immutability lock — creator MAY lock economic policy at creation (\"always free forever\" or \"price locked at $X forever\"). The lock is itself immutable (once locked, cannot unlock).\n\nEconomic policy is orthogonal to capability ceiling (§5.3). Ceiling governs what CAN happen; economic policy governs what it COSTS. Not a new ceiling category.\n\nChild context independence: Child contexts (§5.13) do NOT inherit parent economic policy — each child's pricing is independent.\n\nAuto-accept hard rule: Auto-accept (§5.12.2) NEVER applies to contexts with economic policy requiring payment. Agents never silently incur costs. This is a hard rule, not a default — no auto-accept policy configuration can override it.\n\n§19.4 CostInsufficient:\n```rust\n/// Returned when payer's authorized amount is less than receiver's computed cost.\n/// Includes metric snapshot so payer can see why costs diverged.\npub struct CostInsufficient {\n    pub expected: Amount,              // receiver's computed cost\n    pub provided: Amount,              // payer's authorized amount\n    pub currency: CurrencyCode,\n    pub metric_snapshot: Vec<(PricingMetric, u64)>,  // receiver's observed metric values\n}\n```\n\n§19.11 SDK Surface:\nSCP.Economy.estimateCost(context, action) -> Amount — evaluates the context's pricing formula against current observable metrics.",
       "acceptanceCriteria": [
         "EconomicPolicy evaluation: given EconomicPolicy + action type, compute cost from CostSchedule",
-        "CostSchedule lookup: per_message cost returned for message actions, per_tool_invoke for tool actions, per_join for join actions",
+        "CostSchedule lookup: per_message cost returned for message actions, per_outlet_call for Action outlet actions, per_join for join actions",
         "CostSchedule lookup: per_period returned for subscription checks, per_byte_stored for storage actions",
         "When pricing_formula is Some, formula evaluation result is added to base CostSchedule cost",
         "ObservableMetrics struct defined with current values for all 6 PricingMetric variants",
@@ -8678,7 +8678,7 @@
         "ADR-033 criterion 8": "PricingFormula evaluation uses Amount(u64) and Coefficient(i64) exclusively — no f64 in any economic calculation path.",
         "ADR-033 criterion 9": "CostInsufficient error includes receiver's metric_snapshot so payer can see why costs diverged.",
         "ADR-033 criterion 10": "Auto-accept guard: ContextInvitation with EconomicPolicy requiring payment is never auto-accepted regardless of auto-accept policy configuration.",
-        "Orthogonality note": "Ceiling governs what CAN happen; economic policy governs what it COSTS. Not a new ceiling category. A context with tool:invoke:* in its ceiling and per_tool_invoke: $0.01 in its economic policy allows tool invocations that cost $0.01 each. Removing the cost doesn't expand capabilities; adding a cost doesn't restrict them."
+        "Orthogonality note": "Ceiling governs what CAN happen; economic policy governs what it COSTS. Not a new ceiling category. A context with outlet:call:* in its ceiling and per_outlet_call: $0.01 in its economic policy allows Action outlet invocations that cost $0.01 each. Removing the cost doesn't expand capabilities; adding a cost doesn't restrict them."
       },
       "result": "EconomicPolicy evaluation, CostSchedule lookup, ObservableMetrics, CostInsufficient error, estimate_cost SDK function, policy lock, auto-accept guard all implemented with comprehensive tests."
     },
@@ -9137,16 +9137,16 @@
       "files": [
         "crates/scp-core/src/context/templates.rs"
       ],
-      "description": "Register two new well-known context templates for economic governance (§19.10) and add TemplateId variants.\n\n§19.10 Context Templates:\n\npaid-service (scp:template/paid-service): Tool invocation context with per-invoke cost. economic_policy.cost_schedule.per_tool_invoke required at creation. Single-admin governance. Extends scp:template/tool-interface.\n\nProperties:\n- Ceiling: messages:read, messages:write, tool:register, tool:invoke:*\n- Ceiling policy: immutable\n- Economic policy: required, per_tool_invoke must be set\n- Governance: single-admin\n- Memory scope: full (receipts are provenance)\n\npaid-broadcast (scp:template/paid-broadcast): Subscription-based broadcast context. economic_policy.cost_schedule.per_period required at creation. Gated subscriber registration — admin grants messages:read UCAN after payment verification. Extends scp:template/gated-broadcast (§5.14.4).\n\nProperties:\n- Mode: Broadcast\n- Ceiling: messages:read, messages:write\n- Ceiling policy: immutable\n- Economic policy: required, per_period must be set\n- Subscriber admission: gated (admin-issued messages:read UCAN post-payment)\n- Memory scope: full",
+      "description": "Register two new well-known context templates for economic governance (§19.10) and add TemplateId variants.\n\n§19.10 Context Templates:\n\npaid-service (scp:template/paid-service): Action outlet invocation context with per-invoke cost. economic_policy.cost_schedule.per_outlet_call required at creation. Single-admin governance. Extends scp:template/tool-interface.\n\nProperties:\n- Ceiling: messages:read, messages:write, outlet:register, outlet:query:*, outlet:call:*\n- Ceiling policy: immutable\n- Economic policy: required, per_outlet_call must be set\n- Governance: single-admin\n- Memory scope: full (receipts are provenance)\n\npaid-broadcast (scp:template/paid-broadcast): Subscription-based broadcast context. economic_policy.cost_schedule.per_period required at creation. Gated subscriber registration — admin grants messages:read UCAN after payment verification. Extends scp:template/gated-broadcast (§5.14.4).\n\nProperties:\n- Mode: Broadcast\n- Ceiling: messages:read, messages:write\n- Ceiling policy: immutable\n- Economic policy: required, per_period must be set\n- Subscriber admission: gated (admin-issued messages:read UCAN post-payment)\n- Memory scope: full",
       "acceptanceCriteria": [
         "TemplateId enum extended with PaidService variant — maps to \"scp:template/paid-service\"",
         "TemplateId enum extended with PaidBroadcast variant — maps to \"scp:template/paid-broadcast\"",
-        "paid-service template registered with ceiling: [messages:read, messages:write, tool:register, tool:invoke:*]",
+        "paid-service template registered with ceiling: [messages:read, messages:write, outlet:register, outlet:query:*, outlet:call:*]",
         "paid-service template registered with ceiling_policy: immutable",
         "paid-service template registered with governance: single-admin",
         "paid-service template registered with memory_scope: full",
         "paid-service template requires economic_policy at creation (validation error if absent)",
-        "paid-service template requires economic_policy.cost_schedule.per_tool_invoke to be set (validation error if None)",
+        "paid-service template requires economic_policy.cost_schedule.per_outlet_call to be set (validation error if None)",
         "paid-service template extends scp:template/tool-interface — inherits tool-interface base properties",
         "paid-broadcast template registered with mode: Broadcast",
         "paid-broadcast template registered with ceiling: [messages:read, messages:write]",
@@ -9156,9 +9156,9 @@
         "paid-broadcast template requires economic_policy.cost_schedule.per_period to be set (validation error if None)",
         "paid-broadcast template extends scp:template/gated-broadcast (§5.14.4) — inherits gated-broadcast base properties",
         "paid-broadcast subscriber admission: gated (admin-issued messages:read UCAN post-payment verification)",
-        "Unit test: create context with paid-service template — valid when per_tool_invoke is set",
+        "Unit test: create context with paid-service template — valid when per_outlet_call is set",
         "Unit test: create context with paid-service template — rejected when economic_policy is absent",
-        "Unit test: create context with paid-service template — rejected when per_tool_invoke is None",
+        "Unit test: create context with paid-service template — rejected when per_outlet_call is None",
         "Unit test: create context with paid-broadcast template — valid when per_period is set",
         "Unit test: create context with paid-broadcast template — rejected when economic_policy is absent",
         "Unit test: create context with paid-broadcast template — rejected when per_period is None",
@@ -9167,9 +9167,9 @@
       ],
       "actionItems": [
         "Add PaidService and PaidBroadcast variants to TemplateId enum in crates/scp-core/src/context/templates.rs",
-        "Register paid-service template with properties: ceiling [messages:read, messages:write, tool:invoke:*], ceiling_policy immutable, governance single-admin, memory_scope full, economic_policy required",
+        "Register paid-service template with properties: ceiling [messages:read, messages:write, outlet:register, outlet:query:*, outlet:call:*], ceiling_policy immutable, governance single-admin, memory_scope full, economic_policy required",
         "Register paid-broadcast template with properties: mode Broadcast, ceiling [messages:read, messages:write], ceiling_policy immutable, memory_scope full, economic_policy required, subscriber admission gated",
-        "Implement validation for paid-service: reject creation when economic_policy is absent or per_tool_invoke is None",
+        "Implement validation for paid-service: reject creation when economic_policy is absent or per_outlet_call is None",
         "Implement validation for paid-broadcast: reject creation when economic_policy is absent or per_period is None",
         "Wire template inheritance: paid-service extends tool-interface, paid-broadcast extends gated-broadcast",
         "Write unit tests for valid creation, missing economic_policy rejection, missing required cost field rejection, TemplateId serialization"
@@ -9193,7 +9193,7 @@
         "Template inheritance": "paid-service extends scp:template/tool-interface. paid-broadcast extends scp:template/gated-broadcast (§5.14.4).",
         "Receipts as provenance": "Both templates use memory_scope: full because payment receipts are provenance records that must be retained."
       },
-      "result": "PaidService and PaidBroadcast TemplateId variants added. Validation enforces economic_policy presence and required cost fields (per_tool_invoke, per_period). Template inheritance wired. Unit tests for valid/invalid creation and serialization."
+      "result": "PaidService and PaidBroadcast TemplateId variants added. Validation enforces economic_policy presence and required cost fields (per_outlet_call, per_period). Template inheritance wired. Unit tests for valid/invalid creation and serialization."
     },
     {
       "id": "SCP-162",
@@ -9481,7 +9481,7 @@
         "transportDependency": "py_mcp_load_contexts requires relay transport (scp-transport) wiring. validate_capability and invoke_tool can be completed independently.",
         "relationship": "SCP-165 delivered the bridge wiring. This story completes the remaining stubs that SCP-165 deferred."
       },
-      "result": "validate_capability checks has_tool_invoke_capability against role state (generic wire-facing error, detailed server-side tracing::warn). invoke_tool validates input against JSON schema, returns status=validated (no handler dispatch — ToolRegistry is metadata-only). py_mcp_load_contexts returns local registry contexts via context_ids_for_member. dead_code annotations removed (added py_mcp_server_info/py_mcp_client_info introspection). All 41 scp-ffi tests pass. Residual architectural gaps tracked in #115 (invoke_tool handler dispatch) and #116 (relay-based context discovery)."
+      "result": "validate_capability checks has_outlet_call_capability against role state (generic wire-facing error, detailed server-side tracing::warn). invoke_outlet validates input against JSON schema, returns status=validated (no handler dispatch — OutletRegistry is metadata-only). py_mcp_load_contexts returns local registry contexts via context_ids_for_member. dead_code annotations removed (added py_mcp_server_info/py_mcp_client_info introspection). All 41 scp-ffi tests pass. Residual architectural gaps tracked in #115 (invoke_outlet handler dispatch) and #116 (relay-based context discovery)."
     },
     {
       "id": "SCP-211",

@@ -717,7 +717,7 @@ Implement the FFI bridge as the `crates/scp-ffi/uniffi/` crate using UniFFI proc
 
 4. **Tool bridge functions:**
    - `tool_register(handle, registration) -> String` — registers a tool (returns tool ID).
-   - `tool_invoke(handle, tool_id, input_json, identity) -> String` — invokes a tool (returns JSON string output).
+   - `outlet_invoke(handle, outlet_id, input_json, identity) -> String` — invokes an outlet (returns JSON string output).
    - `tool_verify(handle, tool_id) -> ToolVerificationResult` — verifies a tool against test vectors.
 
 5. **Transport bridge functions:**

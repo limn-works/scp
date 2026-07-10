@@ -342,9 +342,12 @@ pub struct CapabilityCeiling {
 pub enum Capability {
     MessagesRead,
     MessagesWrite,
-    ToolInvoke(ToolId),           // Invoke a specific tool
-    ToolInvokeAll,                // Invoke any registered tool
-    ToolRegister,                 // Register new tools
+    OutletQuery(OutletId),        // Invoke a specific Query outlet (read-only, §5.4.2)
+    OutletQueryAll,               // Invoke any registered Query outlet
+    OutletCall(OutletId),         // Invoke a specific Action outlet (§5.4.2)
+    OutletCallAll,                // Invoke any registered Action outlet
+    OutletRegister,               // Register new outlets
+    OutletInterface,              // Expose a cross-context outlet interface (§6.2)
     MemberInvite,                 // Invite new members
     MemberRemove,                 // Remove members
     RoleAssign,                   // Assign roles to members
@@ -376,12 +379,12 @@ pub struct RoleDefinition {
 
    Built-in roles (always available):
    - `admin` — all capabilities in the ceiling.
-   - `member` — `MessagesRead`, `MessagesWrite`, `ToolInvokeAll`.
+   - `member` — `MessagesRead`, `MessagesWrite`, `OutletQueryAll`, `OutletCallAll`.
    - `observer` — `MessagesRead` only.
    Custom roles are defined at context creation with arbitrary capability subsets of the ceiling.
 
    **Broadcast-specific roles.** Broadcast contexts (§5.14) add two roles that reuse existing primitives:
-   - `author` — `MessagesWrite`, `MessagesRead`, `ToolInvokeAll`. Authors are bounded. Added via `RoleAssigned` event.
+   - `author` — `MessagesWrite`, `MessagesRead`, `OutletQueryAll`, `OutletCallAll`. Authors are bounded. Added via `RoleAssigned` event.
    - `subscriber` — `MessagesRead` only. In open broadcast contexts (`public-broadcast` template), `MessagesRead` is auto-granted on DID-authenticated registration, following the context reader-tier pattern (§6.2.2B). In gated broadcast contexts (`gated-broadcast` template), `MessagesRead` requires an explicit admin-issued UCAN.
 
    The auto-grant subscriber pattern extends the context two-tier model — it is not a new primitive.
@@ -498,7 +501,7 @@ Implement tool registration, invocation, and cross-context interfaces in `scp-co
 ### Dependencies
 
 - **ADR-008 (Context):** Tools are scoped to contexts. Tool registration is a context operation. Tool invocation requires an active context.
-- **ADR-009 (Roles/UCAN):** Tool invocation requires `ToolInvoke(tool_id)` or `ToolInvokeAll` capability. Tool registration requires `ToolRegister` capability. Both are UCAN-validated.
+- **ADR-009 (Roles/UCAN):** Query outlet invocation requires `OutletQuery(outlet_id)` or `OutletQueryAll`; Action outlet invocation requires `OutletCall(outlet_id)` or `OutletCallAll` capability. Outlet registration requires `OutletRegister` capability. All are UCAN-validated.
 - **ADR-011 (Event Log):** Tool registrations, mutations, and invocations are recorded in the event log.
 
 ### Acceptance Criteria
@@ -529,7 +532,7 @@ pub struct TestVector {
 ```
 
 2. **`register_tool(context: &ContextHandle, registration: ToolRegistration, registrant_did: &DID) -> Result<ToolId, ToolError>`**
-   - Validates registrant has `ToolRegister` capability via UCAN (ADR-009).
+   - Validates registrant has `OutletRegister` capability via UCAN (ADR-009).
    - Validates input and output schemas are valid JSON Schema.
    - Validates implementation hash is 32 bytes.
    - Validates operator DID is resolvable.
@@ -539,7 +542,7 @@ pub struct TestVector {
 
 3. **`invoke_tool(context: &ContextHandle, tool_id: &ToolId, input: serde_json::Value, invoker_did: &DID) -> Result<serde_json::Value, ToolError>`**
    - Validates context state is `Active`.
-   - Validates invoker has `ToolInvoke(tool_id)` or `ToolInvokeAll` capability via UCAN.
+   - Validates invoker has `OutletQuery(outlet_id)`/`OutletQueryAll` (Query) or `OutletCall(outlet_id)`/`OutletCallAll` (Action) capability via UCAN.
    - Validates input against the tool's input schema.
    - Calls the tool implementation.
    - Validates output against the tool's output schema.
@@ -1287,18 +1290,18 @@ pub struct ReliabilityScore {
 The ultimate acceptance criterion for Phase 2 exercises all 5 ADRs together with the Phase 1 crypto stack:
 
 ```
-1. Alice creates an identity (ADR-003) and a context with ceiling [messaging, tool_invoke],
-   roles [admin, member], one tool "calculator", TTL 5 minutes, memory scope ephemeral (ADR-008)
+1. Alice creates an identity (ADR-003) and a context with ceiling [messaging, outlet_call],
+   roles [admin, member], one outlet "calculator", TTL 5 minutes, memory scope ephemeral (ADR-008)
 2. The context is assigned to 3 relays via TransportManager (ADR-012)
 3. Bob creates an identity, discovers the context, and joins (ADR-008)
 4. Bob is assigned the "member" role with UCAN tokens for messages:read, messages:write,
-   tool_invoke_all (ADR-009)
+   outlet_query_all, outlet_call_all (ADR-009)
 5. Alice sends a message. UCAN is validated. Envelope is created, multi-relay published (ADR-012).
    Event is logged in the Merkle tree (ADR-011).
 6. Bob receives the message via merged subscription stream (ADR-012).
    Bob's SDK deduplicates across relays.
-7. Bob invokes the "calculator" tool with input {"operation": "add", "a": 1, "b": 2} (ADR-010).
-   UCAN validates Bob has tool_invoke capability.
+7. Bob invokes the "calculator" outlet with input {"operation": "add", "a": 1, "b": 2} (ADR-010).
+   UCAN validates Bob has outlet_call capability.
    Tool returns {"result": 3}. Invocation is logged (ADR-011).
 8. Bob attempts to assign a role (he's a member, not admin). UCAN validation rejects —
    Bob lacks RoleAssign capability (ADR-009). Action is denied.

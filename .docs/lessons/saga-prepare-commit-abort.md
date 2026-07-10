@@ -48,7 +48,7 @@ The design deliberately keeps two separate durable records:
 
 The per-phase handlers run on the participant actors (`context/actor/handlers/saga.rs`):
 
-- **Prepare-A** (`prepare_a`, caller actor) — validates the caller holds `tool:interface`
+- **Prepare-A** (`prepare_a`, caller actor) — validates the caller holds `outlet:interface`
   and is an allowed caller, **stages** (does not apply) the rate-limit decrement + escrow
   reservation, Class-S sync-persists fail-closed, and replies the `Send` reservation
   handles for the FSM to hold (RAII release on abort).

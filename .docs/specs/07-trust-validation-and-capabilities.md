@@ -89,11 +89,12 @@ At **intra-context operation time**, the protocol uses a derived capability cach
 
 - **Derived from ceiling-validated UCAN tokens:** The cache is populated exclusively from tokens minted by `mint_role_tokens()` during role assignment, which are validated against the context's capability ceiling at construction time. It is never populated from unvalidated sources.
 - **Updated atomically on role change:** When `assign_role()` succeeds, the member's cached capabilities are replaced with the new role's capability set in the same operation. There is no window where stale capabilities are served.
-- **Checked on every operation:** Every context operation — `send()`, `invoke_tool()`, `close_context()`, governance actions — checks the cache via `member_has_capability()` before proceeding. A member without the required capability in cache is denied.
+- **Checked on every operation:** Every context operation — `send()`, `invoke_outlet()`, `close_context()`, governance actions — checks the cache via `member_has_capability()` before proceeding. A member without the required capability in cache is denied.
 
 Operations that check the cache include:
 - Message send: requires `MessagesWrite`
-- Tool invocation: requires `ToolInvoke(tool_id)` or `ToolInvokeAll`
+- Query outlet invocation: requires `OutletQuery(outlet_id)` or `OutletQueryAll`
+- Action outlet invocation: requires `OutletCall(outlet_id)` or `OutletCallAll`
 - Context close: requires `ContextClose`
 - Role assignment: requires `RoleAssign`
 - Member operations: requires `MemberInvite`, `MemberRemove`, etc.
@@ -776,6 +777,158 @@ Consequence mechanisms transform "do I trust this agent to behave?" into "are th
 **Convergent emission (how "automatic" and "verifiable" coexist).** A consequence is emitted by deterministic auto-derivation from the context's convergent Merkle log: every honest member, processing the same convergent event, evaluates the same rules over the same state and appends the identical consequence record at the identical position — mechanical, automatic, and identical for all members, with no proposer, vote, or per-receiver evaluation. By the convergence rule (ADR-011), a consequence is automatic *and* verifiable in the Merkle log iff its trigger input is convergent: rules keyed on convergent events (governance warning counts, role / lifecycle) produce durable, Merkle-verifiable records today; rules keyed on per-author **velocity** (message or tool *rate*, §19.7) are NOT auto-derived convergent records: a rate needs a convergent clock the protocol neither has nor needs. Rate-limiting is **local flow control** (the per-member throttle, §23.16.8 — the live spam defense, not a recorded consequence), and a durable **suspension** is a **governance consequence** (ADR-031) whose commit is both its execution and its record (ADR-051 §6) — there is no convergent velocity clock and no execute/record split. A member observing sustained local throttling auto-proposes the suspension; it commits per the context's *declared* governance model — mechanical, never an ad-hoc vote, so "automatic, not governance-discretion" holds at every stage. Honest scoping: the *trigger* is a proposer-side local observation (not a convergent input others re-verify), and the durable record forms only when the declared governance model commits — so in a SingleAdmin-abuser or sub-quorum-honest-minority configuration no durable suspension forms, though the local throttle still protects each member unconditionally.
 
 **Economic consequences** compose with participation consequences. Contexts with economic policy (§19.3) add a cost tier: escalating pricing via `SenderVelocity` (§19.7) makes high-velocity behavior increasingly expensive before participation consequences trigger. Economic and participation tiers operate independently — an agent might exhaust its spending UCAN before participation suspension, or vice versa.
+
+### 7.3.8 Invocation Caveats
+
+UCAN delegations for outlet invocation (§5.4) carry **invocation caveats** — structured, typed constraints on how a delegated capability may be exercised. Caveats live in the UCAN `nb` (not-before / attestation) field and attenuate the raw `outlet_query:*` / `outlet_call:*` capability with call-site-specific limits.
+
+**Design constraint: no DSL.** Caveats are a fixed set of typed fields, not an expression language. A DSL on delegated tokens is a parser-differential attack surface, a complexity multiplier for every SDK, and a future-compat hazard (every new operator must roll out to every SDK before the token can be honored). The fixed-field design keeps the caveat verifier small enough to fuzz to saturation and keeps delegation semantics legible to auditors.
+
+**Caveat fields.**
+
+```
+InvocationCaveats {
+  amount_max_per_call:     Option<Amount>,           // per-invocation economic ceiling (§19)
+  amount_max_cumulative:   Option<Amount>,           // cumulative ceiling across invocations
+  valid_from:              Option<u64>,              // Unix seconds; tighter than UCAN nbf
+  valid_until:             Option<u64>,              // Unix seconds; tighter than UCAN exp
+  hours_of_day:            Option<HoursOfDayMask>,   // 24-bit UTC-hour mask newtype over u32;
+                                                     // see "mask-width assertions" below
+  days_of_week:            Option<DaysOfWeekMask>,   // 7-bit weekday mask newtype over u8;
+                                                     // bit 0 = Sunday, bit 6 = Saturday
+  max_calls:               Option<u64>,              // absolute invocation cap
+  rate_window:             Option<RateWindow>,       // sliding-window rate cap
+  input_schema:            Option<JSONSchema>,       // partial schema narrowing the parent's
+                                                     // input_schema; see narrowing rules below
+  allowed_adapters:        Option<Vec<PaymentAdapterId>>,  // restrict adapters; (§19.2)
+  allowed_target_dids:     Option<Vec<DID>>,         // restrict which peer DIDs may be
+                                                     // invoked via cross-context outlets (§6.2)
+  origin_kind:             Option<OutletKind>,       // Query/Action amplification pin (§5.4.2,
+                                                     // §6.2) — MUST equal the parent's
+                                                     // origin_kind at every `narrow()` step (no
+                                                     // widening, no narrowing, no reset).
+                                                     // Permitted to be absent only at root-token
+                                                     // mint (see "Root-UCAN origin_kind
+                                                     // consistency check" below); EVERY non-root
+                                                     // delegation MUST materialize an explicit
+                                                     // value — a non-root with
+                                                     // `origin_kind = None` fails narrow with
+                                                     // `AttenuationViolation::OriginKindUnspecified`.
+}
+
+RateWindow {
+  max:         u32,   // maximum calls within the window
+  window_secs: u32,   // sliding window length in seconds; range [1, 86400]
+}
+```
+
+**Canonical model: mint materializes the complete effective set; the validator enforces per-edge and rejects absent-on-non-root.** Every NON-ROOT delegation token carries the COMPLETE re-materialized effective caveat set in its `nb`. The minting SDK is responsible for the fold: when an agent delegates, the mint takes the parent's effective set, overlays the caller-supplied narrowing fields (omitted fields inherit the parent's value, present fields tighten it), materializes an explicit `origin_kind`, validates the result against the parent via `narrow()`, and signs the complete set into the child's `nb`. The result is that a token's signed `nb` is — by construction — the fully-resolved effective caveat set, not a partial delta that a verifier must combine with ancestors.
+
+Consequently, the validator is **per-edge and stateless**: it never folds ancestor bounds at validation time (inheritance is materialized at mint, never inferred at validate). At each delegation edge it resolves the parent's and the child's `nb` and applies the per-edge rule below. A ROOT token MAY carry `nb = None` (an unconstrained root) or a root caveat set with `origin_kind = None` (rule 3 below); every NON-ROOT OUTLET token MUST carry the complete set its parent bound.
+
+**Nested `prf` (each token references only its direct parent).** The delegation chain is a nested structure: a child token's `prf` references its DIRECT parent proof only, and the validator walks the chain one hop at a time (child → direct parent → grandparent → … → root). Each edge is resolved and checked against its own immediate parent — there is no flattened "all ancestors in one `prf`" form and no cross-ancestor fold at validation.
+
+**Invocation caveats are OUTLET-SCOPED.** Invocation caveats bound outlet *invocation* and are meaningful ONLY for outlet stems (`outlet_query:*` / `outlet_query:{id}` and `outlet_call:*` / `outlet_call:{id}`). They are inapplicable to a non-outlet capability such as `messages:write`. Therefore a token whose capability set contains NO outlet stem carries NO invocation caveats — its `nb` is `None` — even when an ancestor bound outlet caveats. The mint enforces this (a non-outlet root/child mints with `nb = None`), and the validator's per-edge rule applies the same carve-out: the "child carries an outlet stem" predicate is derived from the child token's own attestations and decides whether the edge is outlet-scoped. Classification is fail-closed: an unparseable attestation URI rejects the token rather than being treated as non-outlet.
+
+**Absent field = inherited-and-materialized at mint.** Within a single token's signed `nb`, an `Option::None` field means "no constraint from this delegation level." Because the mint folds the parent's effective set into the child, a faithfully-delegated non-root OUTLET child never silently omits a field its parent bound — the mint re-materializes it. Attenuation narrows by transitioning absent → present (introducing a bound the parent lacked) or by tightening a present bound. Widening, field removal, and `origin_kind` change are rejected.
+
+**Attenuation (`narrow`).** At each delegation step, the child's caveat set is validated against the parent's. **"Each delegation step" means every parent→child edge of the delegation chain — not only the leaf→direct-parent edge, but every interior edge** (up to the root), so an interior token cannot widen a capability or relax a caveat that a more-distant ancestor bound. This is per-edge enforcement, not a validator-side fold. The validator resolves each token's `nb`, derives whether the child is an outlet edge (the child carries an outlet stem), and applies the following per-edge rule (where "the parent" is the directly-referenced proof and "the child" is the token one hop down):
+
+- **parent `Some`, child `None` → REJECT *iff the child carries an outlet stem*.** An OUTLET child whose direct parent bound caveats MUST itself carry the complete (re-materialized) set; an outlet child that carries no `nb` while its parent did is laundering the parent's bound. This is rejected as `OutletErrorClass::Authorization::AttenuationViolation`. A NON-outlet child off an outlet-caveat ancestor legitimately carries `nb = None`, so this arm ACCEPTS a non-outlet child.
+- **parent `Some`, child `Some` → `narrow(parent, child)`** over the per-field rules below. For an outlet child, `origin_kind` MUST additionally agree with the child's own stem family (Action ⇔ `outlet_call`, Query ⇔ `outlet_query`).
+- **parent `None`, child `Some` → `narrow(empty, child)`.** The root imposes no field bound, but the rule-4 requirement that a non-root child carry an explicit `origin_kind` still applies (`OriginKindUnspecified` otherwise). For an outlet child, the stem-family agreement check also applies.
+- **parent `None`, child `None` → REJECT *iff the child carries an outlet stem* (rule 4); otherwise admissible.** Every non-root OUTLET delegation MUST materialize an explicit `origin_kind` — including off an unconstrained `nb = None` root. An all-`nb = None` OUTLET chain never materializes `origin_kind` at any non-root edge and is REJECTED at the first `(None, None)` outlet edge with `AttenuationViolation::OriginKindUnspecified`. A NON-outlet `(None, None)` edge remains admissible.
+
+The child is admissible iff, for every field:
+
+- `amount_max_per_call`, `amount_max_cumulative`, `max_calls`, `rate_window.max`: child value MUST be `<=` parent value (or child MAY introduce a bound where parent had none).
+- `valid_from`: child MUST be `>=` parent.
+- `valid_until`: child MUST be `<=` parent.
+- `hours_of_day`, `days_of_week`: child MUST be a subset (`child & parent == child`).
+- `rate_window.window_secs`: child MUST be `<=` parent (shorter window = stricter).
+- `allowed_adapters`, `allowed_target_dids`: child list MUST be a subset of parent's list; child MAY introduce a list where parent had none.
+- `input_schema`: conservative syntactic narrowing only (see below).
+- `origin_kind`: **equality** (`child == parent`) PLUS **explicit on non-root**. Unlike every other field, `origin_kind` does not narrow — Query and Action are disjoint attack-surface classes, and widening or narrowing across them is forbidden (§5.4.2, §6.2). A non-root delegation whose `origin_kind` differs from its parent's fails `narrow()` with `AttenuationViolation::OriginKindMismatch`. A non-root delegation whose `origin_kind == None` fails `narrow()` with `AttenuationViolation::OriginKindUnspecified`, regardless of parent — inheritance is explicit, not ambient (see "Root-UCAN origin_kind consistency check" below for the root-only exception).
+
+**Conservative JSON Schema narrowing.** The only admissible narrowing keywords are: `enum`, `const`, `minimum`, `maximum`, `minLength`, `maxLength`, `pattern`, `required`, and `additionalProperties: false`. Any other keyword appearing newly in the child's `input_schema` triggers `OutletErrorClass::Authorization::AttenuationViolation`.
+
+For each admissible keyword the narrowing rule is:
+
+- `enum`: child is admissible iff `child.enum` is a subset of `parent.enum` (set semantics on MessagePack-normalized values).
+- `const`: child is admissible iff `child.const == parent.const`, or parent had no `const`.
+- `minimum`, `minLength`: child is admissible iff `child >= parent`.
+- `maximum`, `maxLength`: child is admissible iff `child <= parent`.
+- `required`: child is admissible iff `child.required` is a superset of `parent.required` (adding required fields narrows; removing them widens).
+- `additionalProperties: false`: admissible iff child sets it to `false` when parent did not; child MUST NOT relax `false` to `true`.
+- `pattern`: **lexical equality only.** Child is admissible iff `child.pattern == parent.pattern` as UTF-8 byte strings, or parent had no `pattern` and the child introduces one. Regex containment is PSPACE-complete in general and undecidable for the extended regex dialects typical JSON Schema consumers accept; no syntactic subsumption check is safe. An operator who wants to strictly narrow a pattern uses `enum` or a child-side refinement keyword that IS decidable (e.g., `const`).
+
+Semantic schema subsumption is undecidable in general; conservative syntactic subsetting is what delegating SDKs can implement correctly and auditors can check by eye.
+
+**Mask-width newtypes (`HoursOfDayMask`, `DaysOfWeekMask`) + `assert_mask_widths` helper.** The two bitmask fields are strongly-typed newtypes whose only constructor is `from_bits(bits) -> Option<Self>`, which rejects any input with high bits set:
+
+```
+pub struct HoursOfDayMask(u32);
+impl HoursOfDayMask {
+  pub fn from_bits(bits: u32) -> Option<Self> {
+    if bits & !0x00FF_FFFF != 0 { None } else { Some(Self(bits)) }
+  }
+  pub fn bits(&self) -> u32 { self.0 }
+}
+
+pub struct DaysOfWeekMask(u8);
+impl DaysOfWeekMask {
+  pub fn from_bits(bits: u8) -> Option<Self> {
+    if bits & !0x7F != 0 { None } else { Some(Self(bits)) }
+  }
+  pub fn bits(&self) -> u8 { self.0 }
+}
+```
+
+Because the newtypes can only be constructed via `from_bits`, it is **structurally impossible** to assemble an `InvocationCaveats` value with a malformed mask across SDK boundaries (Rust, Python, TypeScript, Swift, Kotlin). The covert-channel surface is closed at the type level, not by runtime asserts.
+
+A shared `assert_mask_widths(caveats) -> Result<(), MaskWidthError>` helper is invoked at BOTH the mint site and every narrow step, so the two call sites share a single implementation. Mint-time failure returns `SCP-TOOL-6114` (slugs `hours-of-day-high-bits-set`, `days-of-week-high-bit-set`); narrow-time failure returns `OutletErrorClass::Authorization::AttenuationViolation::MaskWidth`.
+
+**Mint limits.** At token mint time, the issuing SDK MUST enforce the following structural bounds:
+
+| Limit | Bound |
+|-------|-------|
+| Caveats per attestation | ≤ 8 populated non-`origin_kind` fields (`origin_kind` is a structural attenuation invariant and does NOT count against this cap) |
+| `input_schema` serialized size | ≤ 4 KiB |
+| `input_schema` nesting depth | ≤ 8 |
+| List-typed field length (`allowed_adapters`, `allowed_target_dids`, `enum`) | ≤ 16 entries |
+
+Mints that exceed these limits are rejected at the SDK boundary with `SCP-TOOL-6114` (`caveat-mint-limit-exceeded`). The limits exist so that caveat parsing has predictable cost and cannot be turned into a DoS vector via pathologically large attestations.
+
+**Root-UCAN `origin_kind` consistency check.** At root-token mint time (no parent delegation), the mint-time validator MUST verify that every capability in the root token belongs to the same `OutletKind`, and that `caveats.origin_kind` is compatible with that kind:
+
+1. **Single-kind stem set required.** The root token's capability set is partitioned by stem family. If the set contains stems from BOTH `outlet_query:*` / `outlet_query:{id}` AND `outlet_call:*` / `outlet_call:{id}`, mint is rejected unconditionally with `SCP-TOOL-6114` slug `origin-kind-mixed-stem-root`. A mixed-stem root with `caveats.origin_kind = None` could otherwise be exercised at one hop under one kind and at a downstream hop under the other, producing different effective `origin_kind` values for different hops in the same chain.
+2. **Stem ⇒ kind derivation on single-kind sets.** With the set guaranteed single-kind, the inferred kind is determined by the stem family: `outlet_query:*` ⇒ `Query`, `outlet_call:*` ⇒ `Action`.
+3. **Explicit `caveats.origin_kind` on the root.** The mint-time validator accepts:
+   - `caveats.origin_kind == Some(inferred_kind)` — explicit agreement with the stem.
+   - `caveats.origin_kind == None` — permitted ONLY because rule (1) has already guaranteed a single-kind set; every non-root delegation below rule (4) materializes the inferred value explicitly.
+   - `caveats.origin_kind == Some(other_kind)` — rejected with `SCP-TOOL-6114` slug `origin-kind-stem-mismatch`.
+4. **Non-root OUTLET delegations MUST materialize `origin_kind` explicitly.** A non-root OUTLET delegation whose `caveats.origin_kind == None` fails `narrow()` with `AttenuationViolation::OriginKindUnspecified` regardless of parent agreement. This applies even off an unconstrained `nb = None` root. Because invocation caveats are outlet-scoped, a NON-outlet non-root child carries `nb = None` and is NOT subject to this rule.
+
+The combination of (1) + (3) + (4) eliminates the two-kind inference escape **within a single token's delegation chain**: given any one UCAN, `origin_kind` is unambiguous at every hop, and the child-vs-parent `AttenuationViolation::OriginKindMismatch` equality check at every subsequent narrow step preserves the value unchanged through the rest of the chain.
+
+**Paired-token disclosure (Action + Query held by the same agent).** A single agent MAY legitimately hold two distinct tokens — one rooted in `outlet_query:*` with `origin_kind = Query`, another rooted in `outlet_call:*` with `origin_kind = Action` — signed by the same root issuer or by two different issuers. Rule (1) forbids a SINGLE root from carrying both stems; it does NOT forbid an agent from holding two separate rooted tokens of different kinds. When the agent exercises either token, it presents THAT token's delegation chain to the hop target; the token carries its own signed `origin_kind`, and the hop target enforces amplification rules against the presented token. There is no cross-token ambiguity: each token is self-describing.
+
+**Rule (1) is unconditional at mint and mirrored at the validator.** The mixed-stem rejection applies to EVERY outlet root regardless of whether `caveats` was supplied. And because a forged/self-signed token bypasses the mint entirely, the validator mirrors the guard on the presenting token (Step 7c below): a presenting token whose attestations span both stem families is rejected unconditionally, and a presenting token whose declared `origin_kind` contradicts its single stem family (Action ⇔ `outlet_call`, Query ⇔ `outlet_query`) is rejected. The stem ⇒ kind agreement of rule (2)/(3) is thus enforced at BOTH the mint (root-signer intent) and the validator (forged-token defense).
+
+**Runtime enforcement pipeline.** Caveats are enforced at three points in the UCAN validation pipeline:
+
+- **Step 7b (attenuation), inside the chain walk.** Every delegation edge — leaf→direct-parent AND every interior edge — checks the per-edge caveat rule above in addition to the capability subset check. A non-root OUTLET child that drops a bound its direct parent carried (parent `Some`, child `None`) is rejected; a non-root OUTLET child off an unconstrained parent (parent `None`, child `None`) is rejected for failing to materialize `origin_kind` (rule 4). A non-outlet child legitimately carries `nb = None` (outlet-scoping).
+- **Step 7c (leaf/terminus stem consistency), inside `validate_ucan`.** The per-edge checks only fire on edges (which require a parent), so a forged depth-1 (no-proof) token presented directly is never stem-checked by the chain walk. The validator therefore mirrors the mint guard on the PRESENTING token regardless of whether it carries proofs: a presenting OUTLET token whose attestations span BOTH families is rejected UNCONDITIONALLY, and a presenting token whose `nb.origin_kind` contradicts its own single stem family is rejected. A non-outlet presenting token is a no-op here.
+- **Step 11b (time-box), inside `validate_ucan`.** After `exp > now` and `nbf <= now`, the validator checks `valid_from <= now <= valid_until`, `hours_of_day & (1 << current_utc_hour) != 0`, `days_of_week & (1 << current_utc_weekday) != 0`. Failure returns `OutletErrorClass::Authorization::TimeBoxViolation`.
+- **Post-input checks, inside `invoke_outlet`.** After input schema validation, the runtime checks `input_schema` conformance, `amount_max_per_call` against the computed invocation cost, `allowed_adapters` against the negotiated adapter, `allowed_target_dids` against the cross-context target, and consults `CaveatCounterStore` for `max_calls`, `amount_max_cumulative`, and `rate_window`.
+
+**`CaveatCounterStore`.** A sibling of the nonce tracker (§9.5). Keyed by `(ucan_cid, caveat_kind)`, holds `u64` counters for `max_calls`, `amount_max_cumulative`, and sliding-window rate counters. Atomic compare-and-swap semantics prevent racing invocations from double-spending a capacity. The counter store is durable (survives restarts) and is persisted under `context/{id}/caveat_counters/{ucan_cid}` per §17.3.
+
+**Interaction with other access-control layers.** Caveats are an additive deny-surface. They never widen: they compose with `SpendingCapability` (§19), the per-member budget tracker (§19.3), `InboundPolicy`, and `OutboundPolicy` (§6.2) under logical AND. An invocation proceeds iff every layer admits it. For cross-context calls, the effective guard is `OutboundPolicy ∧ InboundPolicy ∧ caveat`. A widened caveat cannot open a capability that any other layer closes.
+
+**Orthogonality with `SpendingCapability`.** Caveats bind limits to a *delegation* — they travel with the token as it passes through delegation-chain narrowing. `SpendingCapability` (§19) binds limits to a *member* — it tracks a member's cumulative budget across all their tokens. The two mechanisms are orthogonal in binding (per-delegation vs. per-member) but coincident in enforcement (both are AND'd into the same guard at invocation time).
+
+**Revocation granularity.** Revocation is whole-token: a `UcanRevocation` event (per §7.2.1 step 10) invalidates the entire token, including all its caveats. There is NO per-caveat revocation. The rationale is simplicity — per-caveat revocation would require a second-class revocation ledger keyed by `(ucan_cid, caveat_index)` that nothing else in the protocol uses. If an operator needs to narrow a capability, they revoke and re-issue.
 
 ## 7.4 Layer 3: Attestation Authenticity
 

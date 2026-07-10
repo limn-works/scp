@@ -36,7 +36,7 @@ This means:
 Apps interact with the protocol through a **capability declaration** — a structured, machine-readable manifest of what protocol capabilities the app needs. The protocol validates the declaration against the context's capability ceiling and the user's granted permissions, then provides exactly what was requested.
 
 ```
-App → Protocol:  "I need: messaging, member_list, tool_invoke(tool_a, tool_b)"
+App → Protocol:  "I need: messaging, member_list, outlet_call(outlet_a, outlet_b)"
 Protocol → App:  "Granted. Here are your interfaces."
 
 App → Protocol:  "I need: messaging, member_list, invite_members"

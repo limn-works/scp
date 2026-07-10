@@ -971,7 +971,7 @@ Python (scp_sdk/)              PyO3 (crates/scp-ffi/pyo3/)  Rust (scp-core/)
 scp.Identity.create()    →    py_identity_create()     →    Identity::create()
 scp.Context.create()     →    py_context_create()      →    Supervisor::create_context()
 ctx.send()               →    py_context_send()        →    Context::send()
-ctx.invoke()             →    py_tool_invoke()         →    Context::invoke_tool()
+ctx.invoke()             →    outlet_invoke()          →    Context::invoke_outlet()
 ```
 
 PyO3 handles the Rust↔Python boundary: async (tokio↔asyncio), error conversion (Result↔Exception), type mapping (structs↔dataclasses). The Python layer adds ergonomics (method chaining, context managers, iterators) without reimplementing logic.

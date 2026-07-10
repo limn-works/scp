@@ -1361,8 +1361,8 @@ No sender DID. No context ID. No timestamp. No signature. The relay is a dumb pi
     "capability_token": "eyJhbGciOiJFZERTQSIs..."
   },
   "action": {
-    "type": "tool_invoke",
-    "tool": "recipe_assistant",
+    "type": "outlet_call",
+    "outlet": "recipe_assistant",
     "input": {
       "query": "butter substitute in cookies"
     }
@@ -2023,7 +2023,7 @@ SCP.Context.create(
       costSchedule: CostSchedule {
         currency: CurrencyCode,
         perMessage: Amount?,
-        perToolInvoke: Amount?,    // default for tools without own cost
+        perOutletCall: Amount?,    // default for Action outlets without own cost
         perJoin: Amount?,          // one-time membership cost
         perPeriod: SubscriptionCost?,
         perByteStored: Amount?
@@ -2049,6 +2049,6 @@ SCP.Context.inspect(
   // ... existing metadata (ceiling, governance, roles, members, mode, ttl) ...
   economicPolicy: EconomicPolicy?,  // pricing, adapters, payee — visible before opt-in
   estimatedCostPerMessage: Amount?,  // convenience: pre-computed from current formula
-  estimatedCostPerToolInvoke: Amount?
+  estimatedCostPerOutletCall: Amount?
 }
 ```

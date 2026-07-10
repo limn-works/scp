@@ -40,12 +40,12 @@ Properties:
 
 #### 6.2.0.1 Bidirectional Consent Protocol
 
-Tool interface creation requires explicit consent from both the exposing context and the consuming context. The consent protocol:
+Outlet interface creation requires explicit consent from both the exposing context and the consuming context. The consent protocol:
 
-1. **Interface proposal.** An admin in Context A proposes exposing a tool to Context B via a governance action:
+1. **Interface proposal.** An admin in Context A proposes exposing an outlet to Context B via a governance action:
    ```
-   ProposeToolInterface {
-     tool_id:        ToolId,       // Tool to expose
+   ProposeOutletInterface {
+     outlet_id:      OutletId,     // Outlet to expose
      target_context: ContextId,    // Context B
      outbound_policy: OutboundPolicy,
      max_calls_per_minute: u32,    // Rate limit for this interface
@@ -53,15 +53,15 @@ Tool interface creation requires explicit consent from both the exposing context
    ```
    This proposal follows Context A's governance model (§5.9).
 
-2. **Outbound policy validation.** Context A validates that `tool:interface` is in its ceiling (§5.3) and the proposer holds the `tool:interface` capability.
+2. **Outbound policy validation.** Context A validates that `outlet:interface` is in its ceiling (§5.3) and the proposer holds the `outlet:interface` capability.
 
 3. **Interface offer.** On governance approval, Context A publishes an `InterfaceOffer` to its event log:
    ```
    InterfaceOffer {
-     offer_id:       [u8; 32],     // SHA-256(context_a_id || tool_id || context_b_id || timestamp)
+     offer_id:       [u8; 32],     // SHA-256(context_a_id || outlet_id || context_b_id || timestamp)
      source_context: ContextId,    // Context A
      target_context: ContextId,    // Context B
-     tool_schema:    ToolRegistration, // Full tool schema (§5.4.1)
+     outlet_schema:  OutletRegistration, // Full outlet schema (§5.4.1)
      outbound_policy: OutboundPolicy,
      expires_at:     u64,          // Offer expires if not accepted within 7 days
    }
@@ -69,21 +69,21 @@ Tool interface creation requires explicit consent from both the exposing context
 
 4. **Acceptance.** A shared member carries the offer to Context B (shared-member bridging). Context B's governance decides whether to accept:
    ```
-   AcceptToolInterface {
+   AcceptOutletInterface {
      offer_id:       [u8; 32],
      inbound_policy: InboundPolicy,
    }
    ```
    This follows Context B's governance model. Acceptance creates an `InterfaceEstablished` event in both event logs.
 
-5. **Teardown.** Either context can revoke the interface at any time via governance action `RevokeToolInterface { interface_id }`. Revocation is unilateral — no consent from the other side is needed. An `InterfaceRevoked` event is recorded in the revoking context's event log.
+5. **Teardown.** Either context can revoke the interface at any time via governance action `RevokeOutletInterface { interface_id }`. Revocation is unilateral — no consent from the other side is needed. An `InterfaceRevoked` event is recorded in the revoking context's event log.
 
 **Outbound and inbound policies:**
 
 ```
 OutboundPolicy {
   allowed_callers:      Vec<DID>,   // DIDs in Context A authorized to use this interface.
-                                    // Empty = any member with tool:interface capability.
+                                    // Empty = any member with outlet:interface capability.
   max_calls_per_minute: u32,        // Rate limit from Context A's perspective.
   max_payload_bytes:    u32,        // Maximum request payload size. Default: 65536 (64 KiB).
   require_provenance:   bool,       // Whether responses must carry provenance. Default: true.
@@ -231,7 +231,7 @@ These are conventions, not mandates — contexts with discovery tools can add cu
 
 ### 6.2.3 Broadcast Context Interactions
 
-Tool interfaces (§6.2) work with broadcast contexts. A broadcast context can expose tools via the standard tool interface mechanism — the context's governance mediates, the tool schemas are declared, and calls are logged. Tool invocation requires the invoker to hold the appropriate UCAN (`ToolInvoke` or `ToolInvokeAll`), which is governed by the broadcast context's role system.
+Outlet interfaces (§6.2) work with broadcast contexts. A broadcast context can expose outlets via the standard outlet interface mechanism — the context's governance mediates, the outlet schemas are declared, and calls are logged. Outlet invocation requires the invoker to hold the appropriate UCAN — a Query outlet requires `OutletQuery(outlet_id)` or `OutletQueryAll`, an Action outlet requires `OutletCall(outlet_id)` or `OutletCallAll` (§5.4.2) — which is governed by the broadcast context's role system.
 
 **Mixed-mode nesting (§5.13).** Child contexts may have a different `ContextMode` than their parents. A Broadcast child of Encrypted parents enables public read access to curated content from a private group. An Encrypted child of Broadcast parents enables private discussion among subscribers. Ceiling inheritance, eligibility enforcement, and lifecycle coupling operate identically regardless of mode.
 
@@ -252,7 +252,7 @@ Tool interfaces (§6.2) work with broadcast contexts. A broadcast context can ex
 **`ucan_proof_id` nullability.** The wire envelope field is `<string|null>`: `null` for an ungated tool that requires no UCAN proof, or a string (the index into the target's own UCAN store) for a gated one. The wire form is normative; how a binding represents the nullable case in its own types is an implementation concern, not a protocol one.
 Normative: (1) **UCAN proof bytes are never in the envelope** — only `ucan_proof_id`, an *index* into the target's own UCAN store (this keeps the envelope and journal non-secret-bearing ⇒ public-metadata journaling only, no §9.4.3 commitment). **`ucan_proof_id` is an index, NOT an authorization.** When the target resolves it, the target MUST re-run the full §7 UCAN validation pipeline against the *carried* `caller_did`: the resolved proof's audience/subject MUST equal `caller_did`, and its capability MUST cover **this** `tool_registration_id` plus action. "The proof grants the action" is insufficient — without re-binding to `caller_did` plus tool, a caller could reference a stronger proof in the target's store that was delegated to a *different* principal (a confused-deputy privilege escalation). (2) `input` MUST satisfy the tool's registered schema structural-specificity floor (§6.2.0, §9.2.1) — degenerate broad-schema input is rejected at Prepare-B.
 
-**Prepare (caller=A, target=B; directional).** Prepare-A stages the caller side: an outbound interface rate-limit decrement (sliding window §6.2.0.2) plus an escrow reservation of the declared per-invocation cost (§19.3) — staged, not applied; it validates that the caller holds `tool:interface` and is in `OutboundPolicy.allowed_callers`. Prepare-B resolves `ucan_proof_id` and runs the full §7 validation re-bound to `caller_did` plus `tool_registration_id` (normative (1) above) plus unrevoked, validates `InboundPolicy` (source role, inbound rate, `require_spending_ucan`), validates the `input` schema, and stages a tool-session reservation; a `Rejected` on any check ⇒ `Aborting`.
+**Prepare (caller=A, target=B; directional).** Prepare-A stages the caller side: an outbound interface rate-limit decrement (sliding window §6.2.0.2) plus an escrow reservation of the declared per-invocation cost (§19.3) — staged, not applied; it validates that the caller holds `outlet:interface` and is in `OutboundPolicy.allowed_callers`. Prepare-B resolves `ucan_proof_id` and runs the full §7 validation re-bound to `caller_did` plus `tool_registration_id` (normative (1) above) plus unrevoked, validates `InboundPolicy` (source role, inbound rate, `require_spending_ucan`), validates the `input` schema, and stages a tool-session reservation; a `Rejected` on any check ⇒ `Aborting`.
 
 **Freshness / anti-replay (normative).** Prepare-B MUST reject the `CrossContextToolInvoke` unless `timestamp_ms` is within the §9.14 clock-skew tolerance AND `nonce` is absent from a bounded, TTL'd nonce-dedup cache (10,000-entry / oldest-first-eviction discipline, matching §6.2.2; the dedup TTL is set per the *Window relationship* clause below — strictly longer than the skew tolerance, not equal to it). **The target context B — the Prepare-B verifying party — owns this nonce-dedup cache**, keyed by the 16-byte `nonce`: the freshness/replay state lives where the authorization decision is made (B's actor is the authoritative validator, since Prepare-A runs on the caller's actor and cannot authoritatively dedup against B's state). The envelope carries `nonce`/`timestamp_ms` for exactly this purpose: a new saga (a fresh supervisor-minted `SagaId`) carrying a replayed `CrossContextToolInvoke` is otherwise NOT caught by `SagaId` idempotency — idempotency de-dups re-acks of the *same* saga, not a re-submission of the same invocation under a new saga.
 

@@ -152,7 +152,7 @@ async def alice():
 async def context(alice):
     async with await Context.create(
         creator=alice,
-        ceiling=["messaging", "tool_invoke"],
+        ceiling=["messaging", "outlet_call"],
     ) as ctx:
         yield ctx
 ```
