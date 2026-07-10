@@ -81,10 +81,12 @@ through `SupervisorHandle::start_saga` (see the saga coordinator).
 - `handlers/` — one module per command domain (`governance.rs`,
   `lifecycle.rs`, `messaging.rs`, `broadcast.rs`, `economy.rs`,
   `trust_recovery.rs`, `standing.rs`, `ttl_close.rs`, `tools.rs`,
-  `queries.rs`, `saga.rs`, `lifecycle_control.rs`). Each exposes a `dispatch`
+  `queries.rs`, `saga.rs`, `lifecycle_control.rs`). Most expose a `dispatch`
   taking `(&mut ClassSCell, &ActorDeps, SubCommand) -> Outcome<()>` — Class-S
   mutation flows through the cell's combinators, never a bare
-  `&mut PerContextState`.
+  `&mut PerContextState`. A few read-only domains (e.g. `standing`) take only
+  `(&ActorDeps, cmd) -> Outcome<()>`: they never mutate `PerContextState`, so
+  no `ClassSCell` is threaded through them.
 
 ### `*_helpers.rs` — domain logic bodies
 

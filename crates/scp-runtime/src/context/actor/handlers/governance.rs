@@ -5,7 +5,7 @@
 //! # Dispatch shape
 //!
 //! The actor's `run()` loop invokes [`dispatch`] with `(&mut
-//! PerContextState, &ActorDeps, GovernanceCommand)`. Every governance
+//! ClassSCell, &ActorDeps, GovernanceCommand) -> Outcome<()>`. Every governance
 //! variant has an actor-shape handler (`handle_*_actor`) that reads
 //! and mutates `state.governance` directly through the actor-shape
 //! helpers in
@@ -54,7 +54,7 @@ pub const HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
 ///
 /// Plan-conforming dispatch signature: matches the post-refactor actor
 /// `run()` loop's call shape
-/// (`handlers::governance::dispatch(state, deps, cmd).await`).
+/// (`handlers::governance::dispatch(cell, deps, cmd).await`).
 ///
 /// Every variant routes through an actor-shape `handle_*_actor` helper
 /// that reads or mutates `state.governance` directly through
