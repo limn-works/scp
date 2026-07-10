@@ -155,20 +155,20 @@ public actor Context {
     /// flows through this reference — there is no process-global
     /// façade after ADR-048 PR 4.
     ///
-    /// Internal visibility so extensions in other files (Tools.swift,
+    /// Internal visibility so extensions in other files (Outlets.swift,
     /// Governance.swift, etc.) can reach it without exposing the
     /// SDK wrapper in the public surface of the actor.
     let scp: SCP
 
     /// The identity of the local participant in this context.
     ///
-    /// Internal visibility so that extensions in other files (Tools.swift,
+    /// Internal visibility so that extensions in other files (Outlets.swift,
     /// etc.) can access the identity for UniFFI bridge calls that require it.
     let identity: Identity
 
     /// The opaque UniFFI handle to the Rust context.
     ///
-    /// Internal visibility so that extensions in other files (Tools.swift,
+    /// Internal visibility so that extensions in other files (Outlets.swift,
     /// etc.) can access the handle for UniFFI bridge calls.
     let handle: ContextHandle
 

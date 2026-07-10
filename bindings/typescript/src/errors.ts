@@ -14,7 +14,7 @@
  * | `SCP-PERM-`     | 3000-3999   | Permission errors   |
  * | `SCP-CRYPTO-`   | 4000-4999   | Crypto errors       |
  * | `SCP-TRANS-`    | 5000-5999   | Transport errors    |
- * | `SCP-TOOL-`     | 6000-6999   | Tool errors         |
+ * | `SCP-TOOL-`     | 6000-6999   | Outlet errors         |
  * | `SCP-VALID-`    | 7000-7999   | Validation errors   |
  * | `SCP-STORAGE-`  | 8000-8999   | Storage errors      |
  * | `SCP-ATTEST-`   | 9000-9999   | Attestation errors  |
@@ -107,11 +107,11 @@ export class TransportError extends ScpError {
   }
 }
 
-/** Tool registration, invocation, verification failures. */
-export class ToolError extends ScpError {
+/** Outlet registration, invocation, verification failures. */
+export class OutletError extends ScpError {
   constructor(message: string, code: string) {
     super(message, code);
-    this.name = "ToolError";
+    this.name = "OutletError";
   }
 }
 
@@ -164,12 +164,12 @@ export class EconomyError extends ScpError {
 }
 
 // ---------------------------------------------------------------------------
-// Cross-context tool-invocation saga (§6.2.4 / ADR-049 §3a) terminal errors
+// Cross-context outlet-invocation saga (§6.2.4 / ADR-049 §3a) terminal errors
 // ---------------------------------------------------------------------------
 //
 // These three subclasses surface the typed terminal space of the §6.2.4
-// cross-context tool-invocation saga. They extend `ToolError` (the saga is a
-// tool operation) and each carries the structured terminal datum the contract
+// cross-context outlet-invocation saga. They extend `OutletError` (the saga is a
+// outlet operation) and each carries the structured terminal datum the contract
 // makes load-bearing as a NAMED, read-only field. The napi bridge collapses the
 // typed `SagaError` into a single `Error` whose only payload is the
 // `ScpNapiError` Display string; `mapSagaError` reverses that string back into
@@ -183,7 +183,7 @@ export class EconomyError extends ScpError {
  * blindly retry, OR a RETRYABLE transient (rate limit / participant-actor
  * unavailable); the two are distinguished by the `SCP-SAGA-*` code.
  */
-export class SagaAbortedError extends ToolError {
+export class SagaAbortedError extends OutletError {
   /**
    * Rate-limit back-off hint in milliseconds when the tripped limiter can
    * compute one, or `null` when no precise back-off instant exists. NEVER `0`
@@ -202,7 +202,7 @@ export class SagaAbortedError extends ToolError {
  * A §6.2.4 saga exhausted its Commit retries and may have diverged (a partial
  * commit requiring operator repair).
  */
-export class SagaNeedsRepairError extends ToolError {
+export class SagaNeedsRepairError extends OutletError {
   /** The durable operator-repair handle for the diverged saga. */
   readonly sagaId: string;
 
@@ -217,7 +217,7 @@ export class SagaNeedsRepairError extends ToolError {
  * A §6.2.4 saga's participant context set overlapped an in-flight saga
  * (per-participant-context-set gating, §5.15.4).
  */
-export class SagaBusyError extends ToolError {
+export class SagaBusyError extends OutletError {
   /** The shared context id that overlapped an in-flight saga. */
   readonly contendedContext: string;
 
@@ -246,7 +246,7 @@ const ERROR_PREFIX_MAP: ReadonlyArray<readonly [string, ScpErrorConstructor]> = 
   ["SCP-PERM-", UcanPermissionError],
   ["SCP-CRYPTO-", CryptoError],
   ["SCP-TRANS-", TransportError],
-  ["SCP-TOOL-", ToolError],
+  ["SCP-TOOL-", OutletError],
   ["SCP-VALID-", ValidationError],
   ["SCP-STORAGE-", StorageError],
   ["SCP-ATTEST-", AttestationError],
@@ -295,7 +295,7 @@ export function mapBridgeError(error: unknown): ScpError {
 }
 
 /**
- * Maps a §6.2.4 cross-context tool-invocation saga terminal error onto its SDK
+ * Maps a §6.2.4 cross-context outlet-invocation saga terminal error onto its SDK
  * exception class.
  *
  * The napi bridge collapses the typed `SagaError` terminal into a single
@@ -354,7 +354,7 @@ export function mapSagaError(error: unknown): ScpError {
     }
     default:
       // An SCP-SAGA code with an unrecognized phrase → preserve classification
-      // as ToolError rather than silently dropping it.
-      return new ToolError(message, code);
+      // as OutletError rather than silently dropping it.
+      return new OutletError(message, code);
   }
 }

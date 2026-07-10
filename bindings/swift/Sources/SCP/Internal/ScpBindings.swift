@@ -2799,14 +2799,14 @@ public protocol ScpProtocol: AnyObject, Sendable {
      *
      * Routes through the module-level MCP client registry.
      */
-    func mcpClientInvoke(handle: String, toolName: String, inputJson: String, contextId: String, invokerDid: String) async throws  -> McpInvokeResult
+    func mcpClientInvoke(handle: String, outletName: String, inputJson: String, contextId: String, invokerDid: String) async throws  -> McpInvokeResult
     
     /**
      * Per-instance equivalent of the free-function `mcp_client_list_tools`.
      *
      * Routes through the module-level MCP client registry.
      */
-    func mcpClientListTools(handle: String) async throws  -> [McpToolInfo]
+    func mcpClientListTools(handle: String) async throws  -> [McpOutletInfo]
     
     /**
      * Configures THIS instance's MCP stdio subprocess allowlist.
@@ -2883,6 +2883,174 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * is supplied, it must have been minted by this `Scp`.
      */
     func nodeStartLocal(dataDir: String, identity: Identity?, passphrase: String?) async throws  -> NodeHandle
+    
+    /**
+     * Per-instance equivalent of the free-function `outlet_interface_accept`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+     * `instance_id` does not match this `SCP`'s.
+     */
+    func outletInterfaceAccept(handle: ContextHandle, interfaceJson: String) async throws  -> String
+    
+    /**
+     * Per-instance equivalent of the free-function `outlet_interface_expose`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+     * `instance_id` does not match this `SCP`'s.
+     */
+    func outletInterfaceExpose(handle: ContextHandle, outletId: String, targetContextId: String, rateLimitJson: String?) async throws  -> String
+    
+    /**
+     * Per-instance equivalent of the free-function `outlet_interface_revoke`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+     * `instance_id` does not match this `SCP`'s.
+     */
+    func outletInterfaceRevoke(handle: ContextHandle, interfaceIdHex: String) async throws  -> String
+    
+    /**
+     * Per-instance equivalent of the free-function `outlet_invoke`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` or
+     * `Identity` whose `instance_id` does not match this `SCP`'s.
+     */
+    func outletInvoke(handle: ContextHandle, outletId: String, inputJson: String, identity: Identity, ucanToken: String?, proofTokens: [String]?, spendingUcanJwt: String?) async throws  -> String
+    
+    /**
+     * Per-instance equivalent of the free-function
+     * `outlet_invoke_cross_context`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` or
+     * `Identity` whose `instance_id` does not match this `SCP`'s.
+     */
+    func outletInvokeCrossContext(sourceHandle: ContextHandle, targetHandle: ContextHandle, outletId: String, inputJson: String, identity: Identity, ucanToken: String, chainDepth: UInt8, proofTokens: [String]?) async throws  -> String
+    
+    /**
+     * Invokes a outlet across context boundaries as an atomic two-phase saga
+     * (spec §6.2.4, ADR-049 §3a).
+     *
+     * Unlike [`Self::outlet_invoke_cross_context`] (the synchronous,
+     * single-context-side path), this drives the full §6.2.4 cross-context
+     * outlet-invocation saga over the two CO-RESIDENT participant contexts
+     * (caller + target): Prepare-A / Prepare-B authorize and stage both sides,
+     * the outlet executes EXACTLY ONCE supervisor-side at Commit-B, and each
+     * side records its own event-log entry. Both contexts MUST be co-resident
+     * in this bridge instance (the cross-node child-bridge transport is
+     * separate future work).
+     *
+     * # Caller authentication (normative — §6.2.4, ADR-049 §3a)
+     *
+     * `caller_did` is bound to the bridge-authenticated principal: it MUST be
+     * an identity THIS bridge instance hosts (created here via identity
+     * creation) AND a member of the caller context. A mismatch raises
+     * [`ScpError::SagaAborted`] (`SCP-SAGA-13050`) BEFORE the saga runs — the
+     * saga never observes an unauthenticated caller. The `asserted_nonce_hex`
+     * / `timestamp_ms` / `chain_depth` REMAIN caller-supplied freshness fields
+     * (the target validates them; they are not minted here).
+     *
+     * # Trust boundary (co-resident single-tenant only)
+     *
+     * The caller-principal binding (`enforce_caller_principal_binding`) treats
+     * "hosted in this bridge instance's identity custody registry" as the
+     * channel-authenticated principal. That equivalence holds ONLY for a
+     * single-tenant, co-resident SDK process. This surface MUST NOT be exposed
+     * across a trust boundary within one process: a multi-tenant host loading
+     * multiple users' identities into one bridge instance could assert any
+     * hosted `caller_did`, since the registry cannot distinguish which tenant
+     * is making the call. The future cross-node leg needs real channel auth
+     * (ADR-049 §3a forward obligation) — it cannot reuse "is hosted here" as
+     * the authenticated-principal proof.
+     *
+     * The caller/target context-id axes are bound by the instance-affine
+     * handle pre-check: `source_handle` / `target_handle` must have been minted
+     * by THIS bridge instance (a foreign handle is rejected) before the
+     * supervisor membership / outlet-interface gates run.
+     *
+     * The receipt's signer-authorization — that the target key is
+     * governance-authorized to act for the target context (§6.2.4 "Signer
+     * authorization") — is a DOWNSTREAM receipt-consumer obligation verified
+     * when the receipt is consumed, NOT enforced at this export.
+     *
+     * # Arguments
+     *
+     * * `source_handle` — The initiating (caller) context handle.
+     * * `target_handle` — The executing (target) context handle.
+     * * `caller_did` — The initiator DID (bound to the bridge principal).
+     * * `outlet_registration_id` — The outlet to invoke across the interface.
+     * * `input_json` — Outlet input as a JSON string (schema-checked
+     * target-side); parsed to a JSON value at the boundary.
+     * * `asserted_nonce_hex` — The 16-byte §6.2.4 envelope nonce as a 32-char
+     * hex string (the freshness/dedup token).
+     * * `timestamp_ms` — Caller-asserted send time (Unix ms; freshness check).
+     * * `chain_depth` — Caller-asserted inbound provenance depth (advisory;
+     * the target re-derives `+1`).
+     * * `ucan_proof_id` — Optional id of the spending UCAN proof, resolved
+     * target-side at Prepare-B. `None` for an ungated outlet.
+     *
+     * # Returns
+     *
+     * A [`SagaResult`] on the committed terminal, carrying the
+     * supervisor-minted `saga_id`, the target's signed receipt bytes, and the
+     * captured outlet-output bytes. The `saga_id` is supervisor-minted — it is
+     * never an input.
+     *
+     * # Errors
+     *
+     * Returns one of the typed saga errors — [`ScpError::SagaAborted`] (a
+     * Prepare-phase abort that may be a permanent rejection — authorization,
+     * freshness, rate limit, or co-residency — OR a retryable transient: a rate
+     * limit, or a participant actor unavailable to complete the Prepare
+     * exchange; carries `retry_after_ms`), [`ScpError::SagaNeedsRepair`]
+     * (Commit-retry exhausted — carries the durable `saga_id` operator-repair
+     * handle), or [`ScpError::SagaBusy`] (the participant context set
+     * overlapped an in-flight saga — §5.15.4). Returns [`ScpError::Validation`]
+     * if an id/DID/outlet-id is malformed or `asserted_nonce_hex` does not
+     * decode to 16 bytes, and [`ScpError::Outlet`] if `input_json` is not valid
+     * JSON.
+     *
+     * See spec §6.2.4 and ADR-049 §3a.
+     */
+    func outletInvokeCrossContextSaga(sourceHandle: ContextHandle, targetHandle: ContextHandle, callerDid: String, outletRegistrationId: String, inputJson: String, assertedNonceHex: String, timestampMs: UInt64, chainDepth: UInt8, ucanProofId: String?) async throws  -> SagaResult
+    
+    /**
+     * Per-instance equivalent of the free-function `outlet_register`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+     * `instance_id` does not match this `SCP`'s.
+     */
+    func outletRegister(handle: ContextHandle, definition: OutletDefinition) async throws  -> String
+    
+    /**
+     * Per-instance equivalent of the free-function `outlet_session_close`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+     * `instance_id` does not match this `SCP`'s.
+     */
+    func outletSessionClose(handle: ContextHandle, sessionId: String) async throws 
+    
+    /**
+     * Per-instance equivalent of the free-function `outlet_session_create`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+     * `instance_id` does not match this `SCP`'s.
+     */
+    func outletSessionCreate(handle: ContextHandle, outletId: String, sourceContextId: String, ttlSeconds: UInt64?) async throws  -> String
+    
+    /**
+     * Per-instance equivalent of the free-function `outlet_session_invoke`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` or
+     * `Identity` whose `instance_id` does not match this `SCP`'s.
+     */
+    func outletSessionInvoke(handle: ContextHandle, sessionId: String, inputJson: String, identity: Identity, ucanToken: String, proofTokens: [String]?) async throws  -> String
+    
+    /**
+     * Per-instance equivalent of the free-function `outlet_verify`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+     * `instance_id` does not match this `SCP`'s.
+     */
+    func outletVerify(handle: ContextHandle, outletId: String) async throws  -> OutletVerificationResult
     
     /**
      * Computes the structured participation record (§7.3.2) for `subject_did`
@@ -3137,174 +3305,6 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * `instance_id` does not match this `SCP`'s.
      */
     func tombstoneMigratedContext(handle: ContextHandle) async throws 
-    
-    /**
-     * Per-instance equivalent of the free-function `tool_interface_accept`.
-     *
-     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
-     * `instance_id` does not match this `SCP`'s.
-     */
-    func toolInterfaceAccept(handle: ContextHandle, interfaceJson: String) async throws  -> String
-    
-    /**
-     * Per-instance equivalent of the free-function `tool_interface_expose`.
-     *
-     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
-     * `instance_id` does not match this `SCP`'s.
-     */
-    func toolInterfaceExpose(handle: ContextHandle, toolId: String, targetContextId: String, rateLimitJson: String?) async throws  -> String
-    
-    /**
-     * Per-instance equivalent of the free-function `tool_interface_revoke`.
-     *
-     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
-     * `instance_id` does not match this `SCP`'s.
-     */
-    func toolInterfaceRevoke(handle: ContextHandle, interfaceIdHex: String) async throws  -> String
-    
-    /**
-     * Per-instance equivalent of the free-function `tool_invoke`.
-     *
-     * Routes through `&*self.inner`. Rejects any `ContextHandle` or
-     * `Identity` whose `instance_id` does not match this `SCP`'s.
-     */
-    func toolInvoke(handle: ContextHandle, toolId: String, inputJson: String, identity: Identity, ucanToken: String?, proofTokens: [String]?, spendingUcanJwt: String?) async throws  -> String
-    
-    /**
-     * Per-instance equivalent of the free-function
-     * `tool_invoke_cross_context`.
-     *
-     * Routes through `&*self.inner`. Rejects any `ContextHandle` or
-     * `Identity` whose `instance_id` does not match this `SCP`'s.
-     */
-    func toolInvokeCrossContext(sourceHandle: ContextHandle, targetHandle: ContextHandle, toolId: String, inputJson: String, identity: Identity, ucanToken: String, chainDepth: UInt8, proofTokens: [String]?) async throws  -> String
-    
-    /**
-     * Invokes a tool across context boundaries as an atomic two-phase saga
-     * (spec §6.2.4, ADR-049 §3a).
-     *
-     * Unlike [`Self::tool_invoke_cross_context`] (the synchronous,
-     * single-context-side path), this drives the full §6.2.4 cross-context
-     * tool-invocation saga over the two CO-RESIDENT participant contexts
-     * (caller + target): Prepare-A / Prepare-B authorize and stage both sides,
-     * the tool executes EXACTLY ONCE supervisor-side at Commit-B, and each
-     * side records its own event-log entry. Both contexts MUST be co-resident
-     * in this bridge instance (the cross-node child-bridge transport is
-     * separate future work).
-     *
-     * # Caller authentication (normative — §6.2.4, ADR-049 §3a)
-     *
-     * `caller_did` is bound to the bridge-authenticated principal: it MUST be
-     * an identity THIS bridge instance hosts (created here via identity
-     * creation) AND a member of the caller context. A mismatch raises
-     * [`ScpError::SagaAborted`] (`SCP-SAGA-13050`) BEFORE the saga runs — the
-     * saga never observes an unauthenticated caller. The `asserted_nonce_hex`
-     * / `timestamp_ms` / `chain_depth` REMAIN caller-supplied freshness fields
-     * (the target validates them; they are not minted here).
-     *
-     * # Trust boundary (co-resident single-tenant only)
-     *
-     * The caller-principal binding (`enforce_caller_principal_binding`) treats
-     * "hosted in this bridge instance's identity custody registry" as the
-     * channel-authenticated principal. That equivalence holds ONLY for a
-     * single-tenant, co-resident SDK process. This surface MUST NOT be exposed
-     * across a trust boundary within one process: a multi-tenant host loading
-     * multiple users' identities into one bridge instance could assert any
-     * hosted `caller_did`, since the registry cannot distinguish which tenant
-     * is making the call. The future cross-node leg needs real channel auth
-     * (ADR-049 §3a forward obligation) — it cannot reuse "is hosted here" as
-     * the authenticated-principal proof.
-     *
-     * The caller/target context-id axes are bound by the instance-affine
-     * handle pre-check: `source_handle` / `target_handle` must have been minted
-     * by THIS bridge instance (a foreign handle is rejected) before the
-     * supervisor membership / tool-interface gates run.
-     *
-     * The receipt's signer-authorization — that the target key is
-     * governance-authorized to act for the target context (§6.2.4 "Signer
-     * authorization") — is a DOWNSTREAM receipt-consumer obligation verified
-     * when the receipt is consumed, NOT enforced at this export.
-     *
-     * # Arguments
-     *
-     * * `source_handle` — The initiating (caller) context handle.
-     * * `target_handle` — The executing (target) context handle.
-     * * `caller_did` — The initiator DID (bound to the bridge principal).
-     * * `tool_registration_id` — The tool to invoke across the interface.
-     * * `input_json` — Tool input as a JSON string (schema-checked
-     * target-side); parsed to a JSON value at the boundary.
-     * * `asserted_nonce_hex` — The 16-byte §6.2.4 envelope nonce as a 32-char
-     * hex string (the freshness/dedup token).
-     * * `timestamp_ms` — Caller-asserted send time (Unix ms; freshness check).
-     * * `chain_depth` — Caller-asserted inbound provenance depth (advisory;
-     * the target re-derives `+1`).
-     * * `ucan_proof_id` — Optional id of the spending UCAN proof, resolved
-     * target-side at Prepare-B. `None` for an ungated tool.
-     *
-     * # Returns
-     *
-     * A [`SagaResult`] on the committed terminal, carrying the
-     * supervisor-minted `saga_id`, the target's signed receipt bytes, and the
-     * captured tool-output bytes. The `saga_id` is supervisor-minted — it is
-     * never an input.
-     *
-     * # Errors
-     *
-     * Returns one of the typed saga errors — [`ScpError::SagaAborted`] (a
-     * Prepare-phase abort that may be a permanent rejection — authorization,
-     * freshness, rate limit, or co-residency — OR a retryable transient: a rate
-     * limit, or a participant actor unavailable to complete the Prepare
-     * exchange; carries `retry_after_ms`), [`ScpError::SagaNeedsRepair`]
-     * (Commit-retry exhausted — carries the durable `saga_id` operator-repair
-     * handle), or [`ScpError::SagaBusy`] (the participant context set
-     * overlapped an in-flight saga — §5.15.4). Returns [`ScpError::Validation`]
-     * if an id/DID/tool-id is malformed or `asserted_nonce_hex` does not
-     * decode to 16 bytes, and [`ScpError::Tool`] if `input_json` is not valid
-     * JSON.
-     *
-     * See spec §6.2.4 and ADR-049 §3a.
-     */
-    func toolInvokeCrossContextSaga(sourceHandle: ContextHandle, targetHandle: ContextHandle, callerDid: String, toolRegistrationId: String, inputJson: String, assertedNonceHex: String, timestampMs: UInt64, chainDepth: UInt8, ucanProofId: String?) async throws  -> SagaResult
-    
-    /**
-     * Per-instance equivalent of the free-function `tool_register`.
-     *
-     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
-     * `instance_id` does not match this `SCP`'s.
-     */
-    func toolRegister(handle: ContextHandle, definition: ToolDefinition) async throws  -> String
-    
-    /**
-     * Per-instance equivalent of the free-function `tool_session_close`.
-     *
-     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
-     * `instance_id` does not match this `SCP`'s.
-     */
-    func toolSessionClose(handle: ContextHandle, sessionId: String) async throws 
-    
-    /**
-     * Per-instance equivalent of the free-function `tool_session_create`.
-     *
-     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
-     * `instance_id` does not match this `SCP`'s.
-     */
-    func toolSessionCreate(handle: ContextHandle, toolId: String, sourceContextId: String, ttlSeconds: UInt64?) async throws  -> String
-    
-    /**
-     * Per-instance equivalent of the free-function `tool_session_invoke`.
-     *
-     * Routes through `&*self.inner`. Rejects any `ContextHandle` or
-     * `Identity` whose `instance_id` does not match this `SCP`'s.
-     */
-    func toolSessionInvoke(handle: ContextHandle, sessionId: String, inputJson: String, identity: Identity, ucanToken: String, proofTokens: [String]?) async throws  -> String
-    
-    /**
-     * Per-instance equivalent of the free-function `tool_verify`.
-     *
-     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
-     * `instance_id` does not match this `SCP`'s.
-     */
-    func toolVerify(handle: ContextHandle, toolId: String) async throws  -> ToolVerificationResult
     
     /**
      * Per-instance equivalent of the free-function `transport_connect`.
@@ -5564,13 +5564,13 @@ open func mcpClientDisconnect(handle: String)async throws   {
      *
      * Routes through the module-level MCP client registry.
      */
-open func mcpClientInvoke(handle: String, toolName: String, inputJson: String, contextId: String, invokerDid: String)async throws  -> McpInvokeResult  {
+open func mcpClientInvoke(handle: String, outletName: String, inputJson: String, contextId: String, invokerDid: String)async throws  -> McpInvokeResult  {
     return
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_scp_ffi_uniffi_fn_method_scp_mcp_client_invoke(
                     self.uniffiClonePointer(),
-                    FfiConverterString.lower(handle),FfiConverterString.lower(toolName),FfiConverterString.lower(inputJson),FfiConverterString.lower(contextId),FfiConverterString.lower(invokerDid)
+                    FfiConverterString.lower(handle),FfiConverterString.lower(outletName),FfiConverterString.lower(inputJson),FfiConverterString.lower(contextId),FfiConverterString.lower(invokerDid)
                 )
             },
             pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
@@ -5586,7 +5586,7 @@ open func mcpClientInvoke(handle: String, toolName: String, inputJson: String, c
      *
      * Routes through the module-level MCP client registry.
      */
-open func mcpClientListTools(handle: String)async throws  -> [McpToolInfo]  {
+open func mcpClientListTools(handle: String)async throws  -> [McpOutletInfo]  {
     return
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
@@ -5598,7 +5598,7 @@ open func mcpClientListTools(handle: String)async throws  -> [McpToolInfo]  {
             pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
             completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
             freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterSequenceTypeMcpToolInfo.lift,
+            liftFunc: FfiConverterSequenceTypeMcpOutletInfo.lift,
             errorHandler: FfiConverterTypeScpError_lift
         )
 }
@@ -5768,6 +5768,339 @@ open func nodeStartLocal(dataDir: String, identity: Identity?, passphrase: Strin
             completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_pointer,
             freeFunc: ffi_scp_ffi_uniffi_rust_future_free_pointer,
             liftFunc: FfiConverterTypeNodeHandle_lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `outlet_interface_accept`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+     * `instance_id` does not match this `SCP`'s.
+     */
+open func outletInterfaceAccept(handle: ContextHandle, interfaceJson: String)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_outlet_interface_accept(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(interfaceJson)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `outlet_interface_expose`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+     * `instance_id` does not match this `SCP`'s.
+     */
+open func outletInterfaceExpose(handle: ContextHandle, outletId: String, targetContextId: String, rateLimitJson: String?)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_outlet_interface_expose(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(outletId),FfiConverterString.lower(targetContextId),FfiConverterOptionString.lower(rateLimitJson)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `outlet_interface_revoke`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+     * `instance_id` does not match this `SCP`'s.
+     */
+open func outletInterfaceRevoke(handle: ContextHandle, interfaceIdHex: String)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_outlet_interface_revoke(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(interfaceIdHex)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `outlet_invoke`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` or
+     * `Identity` whose `instance_id` does not match this `SCP`'s.
+     */
+open func outletInvoke(handle: ContextHandle, outletId: String, inputJson: String, identity: Identity, ucanToken: String?, proofTokens: [String]?, spendingUcanJwt: String?)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_outlet_invoke(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(outletId),FfiConverterString.lower(inputJson),FfiConverterTypeIdentity_lower(identity),FfiConverterOptionString.lower(ucanToken),FfiConverterOptionSequenceString.lower(proofTokens),FfiConverterOptionString.lower(spendingUcanJwt)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function
+     * `outlet_invoke_cross_context`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` or
+     * `Identity` whose `instance_id` does not match this `SCP`'s.
+     */
+open func outletInvokeCrossContext(sourceHandle: ContextHandle, targetHandle: ContextHandle, outletId: String, inputJson: String, identity: Identity, ucanToken: String, chainDepth: UInt8, proofTokens: [String]?)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_outlet_invoke_cross_context(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeContextHandle_lower(sourceHandle),FfiConverterTypeContextHandle_lower(targetHandle),FfiConverterString.lower(outletId),FfiConverterString.lower(inputJson),FfiConverterTypeIdentity_lower(identity),FfiConverterString.lower(ucanToken),FfiConverterUInt8.lower(chainDepth),FfiConverterOptionSequenceString.lower(proofTokens)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Invokes a outlet across context boundaries as an atomic two-phase saga
+     * (spec §6.2.4, ADR-049 §3a).
+     *
+     * Unlike [`Self::outlet_invoke_cross_context`] (the synchronous,
+     * single-context-side path), this drives the full §6.2.4 cross-context
+     * outlet-invocation saga over the two CO-RESIDENT participant contexts
+     * (caller + target): Prepare-A / Prepare-B authorize and stage both sides,
+     * the outlet executes EXACTLY ONCE supervisor-side at Commit-B, and each
+     * side records its own event-log entry. Both contexts MUST be co-resident
+     * in this bridge instance (the cross-node child-bridge transport is
+     * separate future work).
+     *
+     * # Caller authentication (normative — §6.2.4, ADR-049 §3a)
+     *
+     * `caller_did` is bound to the bridge-authenticated principal: it MUST be
+     * an identity THIS bridge instance hosts (created here via identity
+     * creation) AND a member of the caller context. A mismatch raises
+     * [`ScpError::SagaAborted`] (`SCP-SAGA-13050`) BEFORE the saga runs — the
+     * saga never observes an unauthenticated caller. The `asserted_nonce_hex`
+     * / `timestamp_ms` / `chain_depth` REMAIN caller-supplied freshness fields
+     * (the target validates them; they are not minted here).
+     *
+     * # Trust boundary (co-resident single-tenant only)
+     *
+     * The caller-principal binding (`enforce_caller_principal_binding`) treats
+     * "hosted in this bridge instance's identity custody registry" as the
+     * channel-authenticated principal. That equivalence holds ONLY for a
+     * single-tenant, co-resident SDK process. This surface MUST NOT be exposed
+     * across a trust boundary within one process: a multi-tenant host loading
+     * multiple users' identities into one bridge instance could assert any
+     * hosted `caller_did`, since the registry cannot distinguish which tenant
+     * is making the call. The future cross-node leg needs real channel auth
+     * (ADR-049 §3a forward obligation) — it cannot reuse "is hosted here" as
+     * the authenticated-principal proof.
+     *
+     * The caller/target context-id axes are bound by the instance-affine
+     * handle pre-check: `source_handle` / `target_handle` must have been minted
+     * by THIS bridge instance (a foreign handle is rejected) before the
+     * supervisor membership / outlet-interface gates run.
+     *
+     * The receipt's signer-authorization — that the target key is
+     * governance-authorized to act for the target context (§6.2.4 "Signer
+     * authorization") — is a DOWNSTREAM receipt-consumer obligation verified
+     * when the receipt is consumed, NOT enforced at this export.
+     *
+     * # Arguments
+     *
+     * * `source_handle` — The initiating (caller) context handle.
+     * * `target_handle` — The executing (target) context handle.
+     * * `caller_did` — The initiator DID (bound to the bridge principal).
+     * * `outlet_registration_id` — The outlet to invoke across the interface.
+     * * `input_json` — Outlet input as a JSON string (schema-checked
+     * target-side); parsed to a JSON value at the boundary.
+     * * `asserted_nonce_hex` — The 16-byte §6.2.4 envelope nonce as a 32-char
+     * hex string (the freshness/dedup token).
+     * * `timestamp_ms` — Caller-asserted send time (Unix ms; freshness check).
+     * * `chain_depth` — Caller-asserted inbound provenance depth (advisory;
+     * the target re-derives `+1`).
+     * * `ucan_proof_id` — Optional id of the spending UCAN proof, resolved
+     * target-side at Prepare-B. `None` for an ungated outlet.
+     *
+     * # Returns
+     *
+     * A [`SagaResult`] on the committed terminal, carrying the
+     * supervisor-minted `saga_id`, the target's signed receipt bytes, and the
+     * captured outlet-output bytes. The `saga_id` is supervisor-minted — it is
+     * never an input.
+     *
+     * # Errors
+     *
+     * Returns one of the typed saga errors — [`ScpError::SagaAborted`] (a
+     * Prepare-phase abort that may be a permanent rejection — authorization,
+     * freshness, rate limit, or co-residency — OR a retryable transient: a rate
+     * limit, or a participant actor unavailable to complete the Prepare
+     * exchange; carries `retry_after_ms`), [`ScpError::SagaNeedsRepair`]
+     * (Commit-retry exhausted — carries the durable `saga_id` operator-repair
+     * handle), or [`ScpError::SagaBusy`] (the participant context set
+     * overlapped an in-flight saga — §5.15.4). Returns [`ScpError::Validation`]
+     * if an id/DID/outlet-id is malformed or `asserted_nonce_hex` does not
+     * decode to 16 bytes, and [`ScpError::Outlet`] if `input_json` is not valid
+     * JSON.
+     *
+     * See spec §6.2.4 and ADR-049 §3a.
+     */
+open func outletInvokeCrossContextSaga(sourceHandle: ContextHandle, targetHandle: ContextHandle, callerDid: String, outletRegistrationId: String, inputJson: String, assertedNonceHex: String, timestampMs: UInt64, chainDepth: UInt8, ucanProofId: String?)async throws  -> SagaResult  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_outlet_invoke_cross_context_saga(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeContextHandle_lower(sourceHandle),FfiConverterTypeContextHandle_lower(targetHandle),FfiConverterString.lower(callerDid),FfiConverterString.lower(outletRegistrationId),FfiConverterString.lower(inputJson),FfiConverterString.lower(assertedNonceHex),FfiConverterUInt64.lower(timestampMs),FfiConverterUInt8.lower(chainDepth),FfiConverterOptionString.lower(ucanProofId)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeSagaResult_lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `outlet_register`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+     * `instance_id` does not match this `SCP`'s.
+     */
+open func outletRegister(handle: ContextHandle, definition: OutletDefinition)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_outlet_register(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeContextHandle_lower(handle),FfiConverterTypeOutletDefinition_lower(definition)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `outlet_session_close`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+     * `instance_id` does not match this `SCP`'s.
+     */
+open func outletSessionClose(handle: ContextHandle, sessionId: String)async throws   {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_outlet_session_close(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(sessionId)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `outlet_session_create`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+     * `instance_id` does not match this `SCP`'s.
+     */
+open func outletSessionCreate(handle: ContextHandle, outletId: String, sourceContextId: String, ttlSeconds: UInt64?)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_outlet_session_create(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(outletId),FfiConverterString.lower(sourceContextId),FfiConverterOptionUInt64.lower(ttlSeconds)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `outlet_session_invoke`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` or
+     * `Identity` whose `instance_id` does not match this `SCP`'s.
+     */
+open func outletSessionInvoke(handle: ContextHandle, sessionId: String, inputJson: String, identity: Identity, ucanToken: String, proofTokens: [String]?)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_outlet_session_invoke(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(sessionId),FfiConverterString.lower(inputJson),FfiConverterTypeIdentity_lower(identity),FfiConverterString.lower(ucanToken),FfiConverterOptionSequenceString.lower(proofTokens)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `outlet_verify`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+     * `instance_id` does not match this `SCP`'s.
+     */
+open func outletVerify(handle: ContextHandle, outletId: String)async throws  -> OutletVerificationResult  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_outlet_verify(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(outletId)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeOutletVerificationResult_lift,
             errorHandler: FfiConverterTypeScpError_lift
         )
 }
@@ -6302,339 +6635,6 @@ open func tombstoneMigratedContext(handle: ContextHandle)async throws   {
             completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
             freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
             liftFunc: { $0 },
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-    
-    /**
-     * Per-instance equivalent of the free-function `tool_interface_accept`.
-     *
-     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
-     * `instance_id` does not match this `SCP`'s.
-     */
-open func toolInterfaceAccept(handle: ContextHandle, interfaceJson: String)async throws  -> String  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_method_scp_tool_interface_accept(
-                    self.uniffiClonePointer(),
-                    FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(interfaceJson)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterString.lift,
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-    
-    /**
-     * Per-instance equivalent of the free-function `tool_interface_expose`.
-     *
-     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
-     * `instance_id` does not match this `SCP`'s.
-     */
-open func toolInterfaceExpose(handle: ContextHandle, toolId: String, targetContextId: String, rateLimitJson: String?)async throws  -> String  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_method_scp_tool_interface_expose(
-                    self.uniffiClonePointer(),
-                    FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(toolId),FfiConverterString.lower(targetContextId),FfiConverterOptionString.lower(rateLimitJson)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterString.lift,
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-    
-    /**
-     * Per-instance equivalent of the free-function `tool_interface_revoke`.
-     *
-     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
-     * `instance_id` does not match this `SCP`'s.
-     */
-open func toolInterfaceRevoke(handle: ContextHandle, interfaceIdHex: String)async throws  -> String  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_method_scp_tool_interface_revoke(
-                    self.uniffiClonePointer(),
-                    FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(interfaceIdHex)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterString.lift,
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-    
-    /**
-     * Per-instance equivalent of the free-function `tool_invoke`.
-     *
-     * Routes through `&*self.inner`. Rejects any `ContextHandle` or
-     * `Identity` whose `instance_id` does not match this `SCP`'s.
-     */
-open func toolInvoke(handle: ContextHandle, toolId: String, inputJson: String, identity: Identity, ucanToken: String?, proofTokens: [String]?, spendingUcanJwt: String?)async throws  -> String  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_method_scp_tool_invoke(
-                    self.uniffiClonePointer(),
-                    FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(toolId),FfiConverterString.lower(inputJson),FfiConverterTypeIdentity_lower(identity),FfiConverterOptionString.lower(ucanToken),FfiConverterOptionSequenceString.lower(proofTokens),FfiConverterOptionString.lower(spendingUcanJwt)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterString.lift,
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-    
-    /**
-     * Per-instance equivalent of the free-function
-     * `tool_invoke_cross_context`.
-     *
-     * Routes through `&*self.inner`. Rejects any `ContextHandle` or
-     * `Identity` whose `instance_id` does not match this `SCP`'s.
-     */
-open func toolInvokeCrossContext(sourceHandle: ContextHandle, targetHandle: ContextHandle, toolId: String, inputJson: String, identity: Identity, ucanToken: String, chainDepth: UInt8, proofTokens: [String]?)async throws  -> String  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_method_scp_tool_invoke_cross_context(
-                    self.uniffiClonePointer(),
-                    FfiConverterTypeContextHandle_lower(sourceHandle),FfiConverterTypeContextHandle_lower(targetHandle),FfiConverterString.lower(toolId),FfiConverterString.lower(inputJson),FfiConverterTypeIdentity_lower(identity),FfiConverterString.lower(ucanToken),FfiConverterUInt8.lower(chainDepth),FfiConverterOptionSequenceString.lower(proofTokens)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterString.lift,
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-    
-    /**
-     * Invokes a tool across context boundaries as an atomic two-phase saga
-     * (spec §6.2.4, ADR-049 §3a).
-     *
-     * Unlike [`Self::tool_invoke_cross_context`] (the synchronous,
-     * single-context-side path), this drives the full §6.2.4 cross-context
-     * tool-invocation saga over the two CO-RESIDENT participant contexts
-     * (caller + target): Prepare-A / Prepare-B authorize and stage both sides,
-     * the tool executes EXACTLY ONCE supervisor-side at Commit-B, and each
-     * side records its own event-log entry. Both contexts MUST be co-resident
-     * in this bridge instance (the cross-node child-bridge transport is
-     * separate future work).
-     *
-     * # Caller authentication (normative — §6.2.4, ADR-049 §3a)
-     *
-     * `caller_did` is bound to the bridge-authenticated principal: it MUST be
-     * an identity THIS bridge instance hosts (created here via identity
-     * creation) AND a member of the caller context. A mismatch raises
-     * [`ScpError::SagaAborted`] (`SCP-SAGA-13050`) BEFORE the saga runs — the
-     * saga never observes an unauthenticated caller. The `asserted_nonce_hex`
-     * / `timestamp_ms` / `chain_depth` REMAIN caller-supplied freshness fields
-     * (the target validates them; they are not minted here).
-     *
-     * # Trust boundary (co-resident single-tenant only)
-     *
-     * The caller-principal binding (`enforce_caller_principal_binding`) treats
-     * "hosted in this bridge instance's identity custody registry" as the
-     * channel-authenticated principal. That equivalence holds ONLY for a
-     * single-tenant, co-resident SDK process. This surface MUST NOT be exposed
-     * across a trust boundary within one process: a multi-tenant host loading
-     * multiple users' identities into one bridge instance could assert any
-     * hosted `caller_did`, since the registry cannot distinguish which tenant
-     * is making the call. The future cross-node leg needs real channel auth
-     * (ADR-049 §3a forward obligation) — it cannot reuse "is hosted here" as
-     * the authenticated-principal proof.
-     *
-     * The caller/target context-id axes are bound by the instance-affine
-     * handle pre-check: `source_handle` / `target_handle` must have been minted
-     * by THIS bridge instance (a foreign handle is rejected) before the
-     * supervisor membership / tool-interface gates run.
-     *
-     * The receipt's signer-authorization — that the target key is
-     * governance-authorized to act for the target context (§6.2.4 "Signer
-     * authorization") — is a DOWNSTREAM receipt-consumer obligation verified
-     * when the receipt is consumed, NOT enforced at this export.
-     *
-     * # Arguments
-     *
-     * * `source_handle` — The initiating (caller) context handle.
-     * * `target_handle` — The executing (target) context handle.
-     * * `caller_did` — The initiator DID (bound to the bridge principal).
-     * * `tool_registration_id` — The tool to invoke across the interface.
-     * * `input_json` — Tool input as a JSON string (schema-checked
-     * target-side); parsed to a JSON value at the boundary.
-     * * `asserted_nonce_hex` — The 16-byte §6.2.4 envelope nonce as a 32-char
-     * hex string (the freshness/dedup token).
-     * * `timestamp_ms` — Caller-asserted send time (Unix ms; freshness check).
-     * * `chain_depth` — Caller-asserted inbound provenance depth (advisory;
-     * the target re-derives `+1`).
-     * * `ucan_proof_id` — Optional id of the spending UCAN proof, resolved
-     * target-side at Prepare-B. `None` for an ungated tool.
-     *
-     * # Returns
-     *
-     * A [`SagaResult`] on the committed terminal, carrying the
-     * supervisor-minted `saga_id`, the target's signed receipt bytes, and the
-     * captured tool-output bytes. The `saga_id` is supervisor-minted — it is
-     * never an input.
-     *
-     * # Errors
-     *
-     * Returns one of the typed saga errors — [`ScpError::SagaAborted`] (a
-     * Prepare-phase abort that may be a permanent rejection — authorization,
-     * freshness, rate limit, or co-residency — OR a retryable transient: a rate
-     * limit, or a participant actor unavailable to complete the Prepare
-     * exchange; carries `retry_after_ms`), [`ScpError::SagaNeedsRepair`]
-     * (Commit-retry exhausted — carries the durable `saga_id` operator-repair
-     * handle), or [`ScpError::SagaBusy`] (the participant context set
-     * overlapped an in-flight saga — §5.15.4). Returns [`ScpError::Validation`]
-     * if an id/DID/tool-id is malformed or `asserted_nonce_hex` does not
-     * decode to 16 bytes, and [`ScpError::Tool`] if `input_json` is not valid
-     * JSON.
-     *
-     * See spec §6.2.4 and ADR-049 §3a.
-     */
-open func toolInvokeCrossContextSaga(sourceHandle: ContextHandle, targetHandle: ContextHandle, callerDid: String, toolRegistrationId: String, inputJson: String, assertedNonceHex: String, timestampMs: UInt64, chainDepth: UInt8, ucanProofId: String?)async throws  -> SagaResult  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_method_scp_tool_invoke_cross_context_saga(
-                    self.uniffiClonePointer(),
-                    FfiConverterTypeContextHandle_lower(sourceHandle),FfiConverterTypeContextHandle_lower(targetHandle),FfiConverterString.lower(callerDid),FfiConverterString.lower(toolRegistrationId),FfiConverterString.lower(inputJson),FfiConverterString.lower(assertedNonceHex),FfiConverterUInt64.lower(timestampMs),FfiConverterUInt8.lower(chainDepth),FfiConverterOptionString.lower(ucanProofId)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterTypeSagaResult_lift,
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-    
-    /**
-     * Per-instance equivalent of the free-function `tool_register`.
-     *
-     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
-     * `instance_id` does not match this `SCP`'s.
-     */
-open func toolRegister(handle: ContextHandle, definition: ToolDefinition)async throws  -> String  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_method_scp_tool_register(
-                    self.uniffiClonePointer(),
-                    FfiConverterTypeContextHandle_lower(handle),FfiConverterTypeToolDefinition_lower(definition)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterString.lift,
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-    
-    /**
-     * Per-instance equivalent of the free-function `tool_session_close`.
-     *
-     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
-     * `instance_id` does not match this `SCP`'s.
-     */
-open func toolSessionClose(handle: ContextHandle, sessionId: String)async throws   {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_method_scp_tool_session_close(
-                    self.uniffiClonePointer(),
-                    FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(sessionId)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
-            liftFunc: { $0 },
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-    
-    /**
-     * Per-instance equivalent of the free-function `tool_session_create`.
-     *
-     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
-     * `instance_id` does not match this `SCP`'s.
-     */
-open func toolSessionCreate(handle: ContextHandle, toolId: String, sourceContextId: String, ttlSeconds: UInt64?)async throws  -> String  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_method_scp_tool_session_create(
-                    self.uniffiClonePointer(),
-                    FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(toolId),FfiConverterString.lower(sourceContextId),FfiConverterOptionUInt64.lower(ttlSeconds)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterString.lift,
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-    
-    /**
-     * Per-instance equivalent of the free-function `tool_session_invoke`.
-     *
-     * Routes through `&*self.inner`. Rejects any `ContextHandle` or
-     * `Identity` whose `instance_id` does not match this `SCP`'s.
-     */
-open func toolSessionInvoke(handle: ContextHandle, sessionId: String, inputJson: String, identity: Identity, ucanToken: String, proofTokens: [String]?)async throws  -> String  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_method_scp_tool_session_invoke(
-                    self.uniffiClonePointer(),
-                    FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(sessionId),FfiConverterString.lower(inputJson),FfiConverterTypeIdentity_lower(identity),FfiConverterString.lower(ucanToken),FfiConverterOptionSequenceString.lower(proofTokens)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterString.lift,
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-    
-    /**
-     * Per-instance equivalent of the free-function `tool_verify`.
-     *
-     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
-     * `instance_id` does not match this `SCP`'s.
-     */
-open func toolVerify(handle: ContextHandle, toolId: String)async throws  -> ToolVerificationResult  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_method_scp_tool_verify(
-                    self.uniffiClonePointer(),
-                    FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(toolId)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterTypeToolVerificationResult_lift,
             errorHandler: FfiConverterTypeScpError_lift
         )
 }
@@ -9510,19 +9510,19 @@ public func FfiConverterTypeMcpAllowlistState_lower(_ value: McpAllowlistState) 
 
 
 /**
- * Result of invoking an external MCP tool with SCP provenance.
+ * Result of invoking an external MCP outlet with SCP provenance.
  */
 public struct McpInvokeResult {
     /**
-     * Tool output content as serialized JSON.
+     * Outlet output content as serialized JSON.
      */
     public var contentJson: String
     /**
-     * Whether the tool call resulted in an error.
+     * Whether the outlet call resulted in an error.
      */
     public var isError: Bool
     /**
-     * Source of the result, formatted as `"mcp:{tool_name}"`.
+     * Source of the result, formatted as `"mcp:{outlet_name}"`.
      */
     public var source: String
     /**
@@ -9542,13 +9542,13 @@ public struct McpInvokeResult {
     // declare one manually.
     public init(
         /**
-         * Tool output content as serialized JSON.
+         * Outlet output content as serialized JSON.
          */contentJson: String, 
         /**
-         * Whether the tool call resulted in an error.
+         * Whether the outlet call resulted in an error.
          */isError: Bool, 
         /**
-         * Source of the result, formatted as `"mcp:{tool_name}"`.
+         * Source of the result, formatted as `"mcp:{outlet_name}"`.
          */source: String, 
         /**
          * DID of the invoking agent.
@@ -9651,6 +9651,105 @@ public func FfiConverterTypeMcpInvokeResult_lower(_ value: McpInvokeResult) -> R
 
 
 /**
+ * Outlet definition from an external MCP server.
+ */
+public struct McpOutletInfo {
+    /**
+     * Outlet name.
+     */
+    public var name: String
+    /**
+     * Human-readable description.
+     */
+    public var description: String
+    /**
+     * JSON Schema for outlet input (as a JSON string).
+     */
+    public var inputSchemaJson: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * Outlet name.
+         */name: String, 
+        /**
+         * Human-readable description.
+         */description: String, 
+        /**
+         * JSON Schema for outlet input (as a JSON string).
+         */inputSchemaJson: String) {
+        self.name = name
+        self.description = description
+        self.inputSchemaJson = inputSchemaJson
+    }
+}
+
+#if compiler(>=6)
+extension McpOutletInfo: Sendable {}
+#endif
+
+
+extension McpOutletInfo: Equatable, Hashable {
+    public static func ==(lhs: McpOutletInfo, rhs: McpOutletInfo) -> Bool {
+        if lhs.name != rhs.name {
+            return false
+        }
+        if lhs.description != rhs.description {
+            return false
+        }
+        if lhs.inputSchemaJson != rhs.inputSchemaJson {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(name)
+        hasher.combine(description)
+        hasher.combine(inputSchemaJson)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeMcpOutletInfo: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> McpOutletInfo {
+        return
+            try McpOutletInfo(
+                name: FfiConverterString.read(from: &buf), 
+                description: FfiConverterString.read(from: &buf), 
+                inputSchemaJson: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: McpOutletInfo, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.name, into: &buf)
+        FfiConverterString.write(value.description, into: &buf)
+        FfiConverterString.write(value.inputSchemaJson, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMcpOutletInfo_lift(_ buf: RustBuffer) throws -> McpOutletInfo {
+    return try FfiConverterTypeMcpOutletInfo.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMcpOutletInfo_lower(_ value: McpOutletInfo) -> RustBuffer {
+    return FfiConverterTypeMcpOutletInfo.lower(value)
+}
+
+
+/**
  * Configuration for starting an MCP server.
  */
 public struct McpServerConfig {
@@ -9667,11 +9766,11 @@ public struct McpServerConfig {
      */
     public var transport: String
     /**
-     * Optional JWT-encoded UCAN token for tool invocation authorization.
+     * Optional JWT-encoded UCAN token for outlet invocation authorization.
      *
      * When present, `validate_capability` runs the full 11-step ADR-016
      * validation pipeline. When absent, capability validation rejects
-     * immediately (UCAN is required for tool invocation per §6.2).
+     * immediately (UCAN is required for outlet invocation per §6.2).
      */
     public var ucanToken: String?
     /**
@@ -9692,11 +9791,11 @@ public struct McpServerConfig {
          * Transport mode: `"stdio"` or `"sse"`.
          */transport: String, 
         /**
-         * Optional JWT-encoded UCAN token for tool invocation authorization.
+         * Optional JWT-encoded UCAN token for outlet invocation authorization.
          *
          * When present, `validate_capability` runs the full 11-step ADR-016
          * validation pipeline. When absent, capability validation rejects
-         * immediately (UCAN is required for tool invocation per §6.2).
+         * immediately (UCAN is required for outlet invocation per §6.2).
          */ucanToken: String?, 
         /**
          * Optional proof tokens for UCAN delegation chain verification.
@@ -9782,105 +9881,6 @@ public func FfiConverterTypeMcpServerConfig_lift(_ buf: RustBuffer) throws -> Mc
 #endif
 public func FfiConverterTypeMcpServerConfig_lower(_ value: McpServerConfig) -> RustBuffer {
     return FfiConverterTypeMcpServerConfig.lower(value)
-}
-
-
-/**
- * Tool definition from an external MCP server.
- */
-public struct McpToolInfo {
-    /**
-     * Tool name.
-     */
-    public var name: String
-    /**
-     * Human-readable description.
-     */
-    public var description: String
-    /**
-     * JSON Schema for tool input (as a JSON string).
-     */
-    public var inputSchemaJson: String
-
-    // Default memberwise initializers are never public by default, so we
-    // declare one manually.
-    public init(
-        /**
-         * Tool name.
-         */name: String, 
-        /**
-         * Human-readable description.
-         */description: String, 
-        /**
-         * JSON Schema for tool input (as a JSON string).
-         */inputSchemaJson: String) {
-        self.name = name
-        self.description = description
-        self.inputSchemaJson = inputSchemaJson
-    }
-}
-
-#if compiler(>=6)
-extension McpToolInfo: Sendable {}
-#endif
-
-
-extension McpToolInfo: Equatable, Hashable {
-    public static func ==(lhs: McpToolInfo, rhs: McpToolInfo) -> Bool {
-        if lhs.name != rhs.name {
-            return false
-        }
-        if lhs.description != rhs.description {
-            return false
-        }
-        if lhs.inputSchemaJson != rhs.inputSchemaJson {
-            return false
-        }
-        return true
-    }
-
-    public func hash(into hasher: inout Hasher) {
-        hasher.combine(name)
-        hasher.combine(description)
-        hasher.combine(inputSchemaJson)
-    }
-}
-
-
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public struct FfiConverterTypeMcpToolInfo: FfiConverterRustBuffer {
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> McpToolInfo {
-        return
-            try McpToolInfo(
-                name: FfiConverterString.read(from: &buf), 
-                description: FfiConverterString.read(from: &buf), 
-                inputSchemaJson: FfiConverterString.read(from: &buf)
-        )
-    }
-
-    public static func write(_ value: McpToolInfo, into buf: inout [UInt8]) {
-        FfiConverterString.write(value.name, into: &buf)
-        FfiConverterString.write(value.description, into: &buf)
-        FfiConverterString.write(value.inputSchemaJson, into: &buf)
-    }
-}
-
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeMcpToolInfo_lift(_ buf: RustBuffer) throws -> McpToolInfo {
-    return try FfiConverterTypeMcpToolInfo.lift(buf)
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeMcpToolInfo_lower(_ value: McpToolInfo) -> RustBuffer {
-    return FfiConverterTypeMcpToolInfo.lower(value)
 }
 
 
@@ -10028,6 +10028,391 @@ public func FfiConverterTypeMessage_lower(_ value: Message) -> RustBuffer {
 
 
 /**
+ * Per-invocation cost metadata for a outlet (spec §5.4.1).
+ */
+public struct OutletCostDefinition {
+    /**
+     * Cost per invocation in the smallest currency unit.
+     */
+    public var amount: UInt64
+    /**
+     * ISO 4217 or protocol-defined currency code.
+     */
+    public var currency: String
+    /**
+     * DID of the payment recipient. May differ from `operator_did`.
+     */
+    public var payee: String
+    /**
+     * Optional pricing formula identifier for dynamic pricing (§19.4).
+     */
+    public var costFormula: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * Cost per invocation in the smallest currency unit.
+         */amount: UInt64, 
+        /**
+         * ISO 4217 or protocol-defined currency code.
+         */currency: String, 
+        /**
+         * DID of the payment recipient. May differ from `operator_did`.
+         */payee: String, 
+        /**
+         * Optional pricing formula identifier for dynamic pricing (§19.4).
+         */costFormula: String?) {
+        self.amount = amount
+        self.currency = currency
+        self.payee = payee
+        self.costFormula = costFormula
+    }
+}
+
+#if compiler(>=6)
+extension OutletCostDefinition: Sendable {}
+#endif
+
+
+extension OutletCostDefinition: Equatable, Hashable {
+    public static func ==(lhs: OutletCostDefinition, rhs: OutletCostDefinition) -> Bool {
+        if lhs.amount != rhs.amount {
+            return false
+        }
+        if lhs.currency != rhs.currency {
+            return false
+        }
+        if lhs.payee != rhs.payee {
+            return false
+        }
+        if lhs.costFormula != rhs.costFormula {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(amount)
+        hasher.combine(currency)
+        hasher.combine(payee)
+        hasher.combine(costFormula)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeOutletCostDefinition: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> OutletCostDefinition {
+        return
+            try OutletCostDefinition(
+                amount: FfiConverterUInt64.read(from: &buf), 
+                currency: FfiConverterString.read(from: &buf), 
+                payee: FfiConverterString.read(from: &buf), 
+                costFormula: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: OutletCostDefinition, into buf: inout [UInt8]) {
+        FfiConverterUInt64.write(value.amount, into: &buf)
+        FfiConverterString.write(value.currency, into: &buf)
+        FfiConverterString.write(value.payee, into: &buf)
+        FfiConverterOptionString.write(value.costFormula, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeOutletCostDefinition_lift(_ buf: RustBuffer) throws -> OutletCostDefinition {
+    return try FfiConverterTypeOutletCostDefinition.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeOutletCostDefinition_lower(_ value: OutletCostDefinition) -> RustBuffer {
+    return FfiConverterTypeOutletCostDefinition.lower(value)
+}
+
+
+/**
+ * Outlet definition for registration in a context.
+ *
+ * See ADR-010 (Outlet Registry) and spec §5.4.1 (Outlets).
+ */
+public struct OutletDefinition {
+    /**
+     * Human-readable outlet name.
+     */
+    public var name: String
+    /**
+     * Outlet description.
+     */
+    public var description: String
+    /**
+     * JSON Schema for outlet input (as a JSON string).
+     */
+    public var inputSchemaJson: String
+    /**
+     * JSON Schema for outlet output (as a JSON string).
+     */
+    public var outputSchemaJson: String
+    /**
+     * DID of the outlet operator (responsible party).
+     */
+    public var operatorDid: String
+    /**
+     * Test vectors for integrity verification (serialized as JSON string).
+     */
+    public var testVectorsJson: String?
+    /**
+     * SHA-256 hash of the implementation binary (32 bytes).
+     */
+    public var implementationHash: Data?
+    /**
+     * Optional per-invocation cost metadata (spec §5.4.1).
+     */
+    public var cost: OutletCostDefinition?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * Human-readable outlet name.
+         */name: String, 
+        /**
+         * Outlet description.
+         */description: String, 
+        /**
+         * JSON Schema for outlet input (as a JSON string).
+         */inputSchemaJson: String, 
+        /**
+         * JSON Schema for outlet output (as a JSON string).
+         */outputSchemaJson: String, 
+        /**
+         * DID of the outlet operator (responsible party).
+         */operatorDid: String, 
+        /**
+         * Test vectors for integrity verification (serialized as JSON string).
+         */testVectorsJson: String?, 
+        /**
+         * SHA-256 hash of the implementation binary (32 bytes).
+         */implementationHash: Data?, 
+        /**
+         * Optional per-invocation cost metadata (spec §5.4.1).
+         */cost: OutletCostDefinition?) {
+        self.name = name
+        self.description = description
+        self.inputSchemaJson = inputSchemaJson
+        self.outputSchemaJson = outputSchemaJson
+        self.operatorDid = operatorDid
+        self.testVectorsJson = testVectorsJson
+        self.implementationHash = implementationHash
+        self.cost = cost
+    }
+}
+
+#if compiler(>=6)
+extension OutletDefinition: Sendable {}
+#endif
+
+
+extension OutletDefinition: Equatable, Hashable {
+    public static func ==(lhs: OutletDefinition, rhs: OutletDefinition) -> Bool {
+        if lhs.name != rhs.name {
+            return false
+        }
+        if lhs.description != rhs.description {
+            return false
+        }
+        if lhs.inputSchemaJson != rhs.inputSchemaJson {
+            return false
+        }
+        if lhs.outputSchemaJson != rhs.outputSchemaJson {
+            return false
+        }
+        if lhs.operatorDid != rhs.operatorDid {
+            return false
+        }
+        if lhs.testVectorsJson != rhs.testVectorsJson {
+            return false
+        }
+        if lhs.implementationHash != rhs.implementationHash {
+            return false
+        }
+        if lhs.cost != rhs.cost {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(name)
+        hasher.combine(description)
+        hasher.combine(inputSchemaJson)
+        hasher.combine(outputSchemaJson)
+        hasher.combine(operatorDid)
+        hasher.combine(testVectorsJson)
+        hasher.combine(implementationHash)
+        hasher.combine(cost)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeOutletDefinition: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> OutletDefinition {
+        return
+            try OutletDefinition(
+                name: FfiConverterString.read(from: &buf), 
+                description: FfiConverterString.read(from: &buf), 
+                inputSchemaJson: FfiConverterString.read(from: &buf), 
+                outputSchemaJson: FfiConverterString.read(from: &buf), 
+                operatorDid: FfiConverterString.read(from: &buf), 
+                testVectorsJson: FfiConverterOptionString.read(from: &buf), 
+                implementationHash: FfiConverterOptionData.read(from: &buf), 
+                cost: FfiConverterOptionTypeOutletCostDefinition.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: OutletDefinition, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.name, into: &buf)
+        FfiConverterString.write(value.description, into: &buf)
+        FfiConverterString.write(value.inputSchemaJson, into: &buf)
+        FfiConverterString.write(value.outputSchemaJson, into: &buf)
+        FfiConverterString.write(value.operatorDid, into: &buf)
+        FfiConverterOptionString.write(value.testVectorsJson, into: &buf)
+        FfiConverterOptionData.write(value.implementationHash, into: &buf)
+        FfiConverterOptionTypeOutletCostDefinition.write(value.cost, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeOutletDefinition_lift(_ buf: RustBuffer) throws -> OutletDefinition {
+    return try FfiConverterTypeOutletDefinition.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeOutletDefinition_lower(_ value: OutletDefinition) -> RustBuffer {
+    return FfiConverterTypeOutletDefinition.lower(value)
+}
+
+
+/**
+ * Result of verifying a outlet against its test vectors.
+ *
+ * See ADR-010 (Outlet Registry).
+ */
+public struct OutletVerificationResult {
+    /**
+     * The verified outlet's ID.
+     */
+    public var outletId: String
+    /**
+     * `true` if all test vectors passed.
+     */
+    public var passed: Bool
+    /**
+     * Failure messages for vectors that did not pass. Empty on success.
+     */
+    public var failures: [String]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * The verified outlet's ID.
+         */outletId: String, 
+        /**
+         * `true` if all test vectors passed.
+         */passed: Bool, 
+        /**
+         * Failure messages for vectors that did not pass. Empty on success.
+         */failures: [String]) {
+        self.outletId = outletId
+        self.passed = passed
+        self.failures = failures
+    }
+}
+
+#if compiler(>=6)
+extension OutletVerificationResult: Sendable {}
+#endif
+
+
+extension OutletVerificationResult: Equatable, Hashable {
+    public static func ==(lhs: OutletVerificationResult, rhs: OutletVerificationResult) -> Bool {
+        if lhs.outletId != rhs.outletId {
+            return false
+        }
+        if lhs.passed != rhs.passed {
+            return false
+        }
+        if lhs.failures != rhs.failures {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(outletId)
+        hasher.combine(passed)
+        hasher.combine(failures)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeOutletVerificationResult: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> OutletVerificationResult {
+        return
+            try OutletVerificationResult(
+                outletId: FfiConverterString.read(from: &buf), 
+                passed: FfiConverterBool.read(from: &buf), 
+                failures: FfiConverterSequenceString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: OutletVerificationResult, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.outletId, into: &buf)
+        FfiConverterBool.write(value.passed, into: &buf)
+        FfiConverterSequenceString.write(value.failures, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeOutletVerificationResult_lift(_ buf: RustBuffer) throws -> OutletVerificationResult {
+    return try FfiConverterTypeOutletVerificationResult.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeOutletVerificationResult_lower(_ value: OutletVerificationResult) -> RustBuffer {
+    return FfiConverterTypeOutletVerificationResult.lower(value)
+}
+
+
+/**
  * Structured participation facts (§7.3.2) for a subject DID in a context.
  *
  * The scalar projection of scp-core's `ParticipationRecord`, produced by
@@ -10055,7 +10440,7 @@ public struct ParticipationRecordView {
      */
     public var governanceActionsBy: UInt64
     /**
-     * Total tool invocations across all tool types.
+     * Total outlet invocations across all outlet types.
      */
     public var toolInvocationCount: UInt64
     /**
@@ -10109,7 +10494,7 @@ public struct ParticipationRecordView {
          * Count of governance actions initiated by this identity.
          */governanceActionsBy: UInt64, 
         /**
-         * Total tool invocations across all tool types.
+         * Total outlet invocations across all outlet types.
          */toolInvocationCount: UInt64, 
         /**
          * Whether `tool_invocation_count` is anchored in the canonical Merkle log
@@ -10827,18 +11212,18 @@ public func FfiConverterTypeReservedKeyPackage_lower(_ value: ReservedKeyPackage
 
 
 /**
- * The committed terminal of a §6.2.4 cross-context tool-invocation saga
+ * The committed terminal of a §6.2.4 cross-context outlet-invocation saga
  * (ADR-049 §3a).
  *
- * Returned by [`crate::scp::Scp::tool_invoke_cross_context_saga`] on a
+ * Returned by [`crate::scp::Scp::outlet_invoke_cross_context_saga`] on a
  * `Committed` terminal. Every NON-committed terminal raises one of the typed
  * saga errors ([`ScpError::SagaAborted`] / [`ScpError::SagaNeedsRepair`] /
  * [`ScpError::SagaBusy`]) instead.
  *
  * Carries the supervisor-minted `saga_id` plus — for the committed
  * cross-context invocation — the target's signed receipt and the captured
- * tool output (spec §6.2.4 "Receipt / response return path"). The `receipt`
- * is the JCS-canonical `CrossContextToolReceipt` bytes; `output` is the
+ * outlet output (spec §6.2.4 "Receipt / response return path"). The `receipt`
+ * is the JCS-canonical `CrossContextOutletReceipt` bytes; `output` is the
  * receipt's canonical `output_jcs` bytes (the exact bytes the caller side
  * recorded a hash of). Both are surfaced as `bytes` (Swift `Data` / Kotlin
  * `ByteArray`) so a caller can verify the receipt signature and recompute
@@ -10852,7 +11237,7 @@ public struct SagaResult {
      */
     public var sagaId: String
     /**
-     * The target's signed `CrossContextToolReceipt` bytes (JCS), or `None`.
+     * The target's signed `CrossContextOutletReceipt` bytes (JCS), or `None`.
      *
      * The `receipt` is signed by the target context's LOCALLY-RESOLVED Active
      * Signing Key (the key held by its registered handle on this instance).
@@ -10867,7 +11252,7 @@ public struct SagaResult {
      */
     public var receipt: Data?
     /**
-     * The captured tool output bytes (the receipt's canonical `output_jcs`),
+     * The captured outlet output bytes (the receipt's canonical `output_jcs`),
      * or `None`.
      */
     public var output: Data?
@@ -10879,7 +11264,7 @@ public struct SagaResult {
          * The durable saga identifier (supervisor-minted, never a caller input).
          */sagaId: String, 
         /**
-         * The target's signed `CrossContextToolReceipt` bytes (JCS), or `None`.
+         * The target's signed `CrossContextOutletReceipt` bytes (JCS), or `None`.
          *
          * The `receipt` is signed by the target context's LOCALLY-RESOLVED Active
          * Signing Key (the key held by its registered handle on this instance).
@@ -10893,7 +11278,7 @@ public struct SagaResult {
          * trusted only within this instance.
          */receipt: Data?, 
         /**
-         * The captured tool output bytes (the receipt's canonical `output_jcs`),
+         * The captured outlet output bytes (the receipt's canonical `output_jcs`),
          * or `None`.
          */output: Data?) {
         self.sagaId = sagaId
@@ -11398,391 +11783,6 @@ public func FfiConverterTypeSyncPolicyResult_lift(_ buf: RustBuffer) throws -> S
 #endif
 public func FfiConverterTypeSyncPolicyResult_lower(_ value: SyncPolicyResult) -> RustBuffer {
     return FfiConverterTypeSyncPolicyResult.lower(value)
-}
-
-
-/**
- * Per-invocation cost metadata for a tool (spec §5.4.1).
- */
-public struct ToolCostDefinition {
-    /**
-     * Cost per invocation in the smallest currency unit.
-     */
-    public var amount: UInt64
-    /**
-     * ISO 4217 or protocol-defined currency code.
-     */
-    public var currency: String
-    /**
-     * DID of the payment recipient. May differ from `operator_did`.
-     */
-    public var payee: String
-    /**
-     * Optional pricing formula identifier for dynamic pricing (§19.4).
-     */
-    public var costFormula: String?
-
-    // Default memberwise initializers are never public by default, so we
-    // declare one manually.
-    public init(
-        /**
-         * Cost per invocation in the smallest currency unit.
-         */amount: UInt64, 
-        /**
-         * ISO 4217 or protocol-defined currency code.
-         */currency: String, 
-        /**
-         * DID of the payment recipient. May differ from `operator_did`.
-         */payee: String, 
-        /**
-         * Optional pricing formula identifier for dynamic pricing (§19.4).
-         */costFormula: String?) {
-        self.amount = amount
-        self.currency = currency
-        self.payee = payee
-        self.costFormula = costFormula
-    }
-}
-
-#if compiler(>=6)
-extension ToolCostDefinition: Sendable {}
-#endif
-
-
-extension ToolCostDefinition: Equatable, Hashable {
-    public static func ==(lhs: ToolCostDefinition, rhs: ToolCostDefinition) -> Bool {
-        if lhs.amount != rhs.amount {
-            return false
-        }
-        if lhs.currency != rhs.currency {
-            return false
-        }
-        if lhs.payee != rhs.payee {
-            return false
-        }
-        if lhs.costFormula != rhs.costFormula {
-            return false
-        }
-        return true
-    }
-
-    public func hash(into hasher: inout Hasher) {
-        hasher.combine(amount)
-        hasher.combine(currency)
-        hasher.combine(payee)
-        hasher.combine(costFormula)
-    }
-}
-
-
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public struct FfiConverterTypeToolCostDefinition: FfiConverterRustBuffer {
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ToolCostDefinition {
-        return
-            try ToolCostDefinition(
-                amount: FfiConverterUInt64.read(from: &buf), 
-                currency: FfiConverterString.read(from: &buf), 
-                payee: FfiConverterString.read(from: &buf), 
-                costFormula: FfiConverterOptionString.read(from: &buf)
-        )
-    }
-
-    public static func write(_ value: ToolCostDefinition, into buf: inout [UInt8]) {
-        FfiConverterUInt64.write(value.amount, into: &buf)
-        FfiConverterString.write(value.currency, into: &buf)
-        FfiConverterString.write(value.payee, into: &buf)
-        FfiConverterOptionString.write(value.costFormula, into: &buf)
-    }
-}
-
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeToolCostDefinition_lift(_ buf: RustBuffer) throws -> ToolCostDefinition {
-    return try FfiConverterTypeToolCostDefinition.lift(buf)
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeToolCostDefinition_lower(_ value: ToolCostDefinition) -> RustBuffer {
-    return FfiConverterTypeToolCostDefinition.lower(value)
-}
-
-
-/**
- * Tool definition for registration in a context.
- *
- * See ADR-010 (Tool Registry) and spec §5.4.1 (Tools).
- */
-public struct ToolDefinition {
-    /**
-     * Human-readable tool name.
-     */
-    public var name: String
-    /**
-     * Tool description.
-     */
-    public var description: String
-    /**
-     * JSON Schema for tool input (as a JSON string).
-     */
-    public var inputSchemaJson: String
-    /**
-     * JSON Schema for tool output (as a JSON string).
-     */
-    public var outputSchemaJson: String
-    /**
-     * DID of the tool operator (responsible party).
-     */
-    public var operatorDid: String
-    /**
-     * Test vectors for integrity verification (serialized as JSON string).
-     */
-    public var testVectorsJson: String?
-    /**
-     * SHA-256 hash of the implementation binary (32 bytes).
-     */
-    public var implementationHash: Data?
-    /**
-     * Optional per-invocation cost metadata (spec §5.4.1).
-     */
-    public var cost: ToolCostDefinition?
-
-    // Default memberwise initializers are never public by default, so we
-    // declare one manually.
-    public init(
-        /**
-         * Human-readable tool name.
-         */name: String, 
-        /**
-         * Tool description.
-         */description: String, 
-        /**
-         * JSON Schema for tool input (as a JSON string).
-         */inputSchemaJson: String, 
-        /**
-         * JSON Schema for tool output (as a JSON string).
-         */outputSchemaJson: String, 
-        /**
-         * DID of the tool operator (responsible party).
-         */operatorDid: String, 
-        /**
-         * Test vectors for integrity verification (serialized as JSON string).
-         */testVectorsJson: String?, 
-        /**
-         * SHA-256 hash of the implementation binary (32 bytes).
-         */implementationHash: Data?, 
-        /**
-         * Optional per-invocation cost metadata (spec §5.4.1).
-         */cost: ToolCostDefinition?) {
-        self.name = name
-        self.description = description
-        self.inputSchemaJson = inputSchemaJson
-        self.outputSchemaJson = outputSchemaJson
-        self.operatorDid = operatorDid
-        self.testVectorsJson = testVectorsJson
-        self.implementationHash = implementationHash
-        self.cost = cost
-    }
-}
-
-#if compiler(>=6)
-extension ToolDefinition: Sendable {}
-#endif
-
-
-extension ToolDefinition: Equatable, Hashable {
-    public static func ==(lhs: ToolDefinition, rhs: ToolDefinition) -> Bool {
-        if lhs.name != rhs.name {
-            return false
-        }
-        if lhs.description != rhs.description {
-            return false
-        }
-        if lhs.inputSchemaJson != rhs.inputSchemaJson {
-            return false
-        }
-        if lhs.outputSchemaJson != rhs.outputSchemaJson {
-            return false
-        }
-        if lhs.operatorDid != rhs.operatorDid {
-            return false
-        }
-        if lhs.testVectorsJson != rhs.testVectorsJson {
-            return false
-        }
-        if lhs.implementationHash != rhs.implementationHash {
-            return false
-        }
-        if lhs.cost != rhs.cost {
-            return false
-        }
-        return true
-    }
-
-    public func hash(into hasher: inout Hasher) {
-        hasher.combine(name)
-        hasher.combine(description)
-        hasher.combine(inputSchemaJson)
-        hasher.combine(outputSchemaJson)
-        hasher.combine(operatorDid)
-        hasher.combine(testVectorsJson)
-        hasher.combine(implementationHash)
-        hasher.combine(cost)
-    }
-}
-
-
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public struct FfiConverterTypeToolDefinition: FfiConverterRustBuffer {
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ToolDefinition {
-        return
-            try ToolDefinition(
-                name: FfiConverterString.read(from: &buf), 
-                description: FfiConverterString.read(from: &buf), 
-                inputSchemaJson: FfiConverterString.read(from: &buf), 
-                outputSchemaJson: FfiConverterString.read(from: &buf), 
-                operatorDid: FfiConverterString.read(from: &buf), 
-                testVectorsJson: FfiConverterOptionString.read(from: &buf), 
-                implementationHash: FfiConverterOptionData.read(from: &buf), 
-                cost: FfiConverterOptionTypeToolCostDefinition.read(from: &buf)
-        )
-    }
-
-    public static func write(_ value: ToolDefinition, into buf: inout [UInt8]) {
-        FfiConverterString.write(value.name, into: &buf)
-        FfiConverterString.write(value.description, into: &buf)
-        FfiConverterString.write(value.inputSchemaJson, into: &buf)
-        FfiConverterString.write(value.outputSchemaJson, into: &buf)
-        FfiConverterString.write(value.operatorDid, into: &buf)
-        FfiConverterOptionString.write(value.testVectorsJson, into: &buf)
-        FfiConverterOptionData.write(value.implementationHash, into: &buf)
-        FfiConverterOptionTypeToolCostDefinition.write(value.cost, into: &buf)
-    }
-}
-
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeToolDefinition_lift(_ buf: RustBuffer) throws -> ToolDefinition {
-    return try FfiConverterTypeToolDefinition.lift(buf)
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeToolDefinition_lower(_ value: ToolDefinition) -> RustBuffer {
-    return FfiConverterTypeToolDefinition.lower(value)
-}
-
-
-/**
- * Result of verifying a tool against its test vectors.
- *
- * See ADR-010 (Tool Registry).
- */
-public struct ToolVerificationResult {
-    /**
-     * The verified tool's ID.
-     */
-    public var toolId: String
-    /**
-     * `true` if all test vectors passed.
-     */
-    public var passed: Bool
-    /**
-     * Failure messages for vectors that did not pass. Empty on success.
-     */
-    public var failures: [String]
-
-    // Default memberwise initializers are never public by default, so we
-    // declare one manually.
-    public init(
-        /**
-         * The verified tool's ID.
-         */toolId: String, 
-        /**
-         * `true` if all test vectors passed.
-         */passed: Bool, 
-        /**
-         * Failure messages for vectors that did not pass. Empty on success.
-         */failures: [String]) {
-        self.toolId = toolId
-        self.passed = passed
-        self.failures = failures
-    }
-}
-
-#if compiler(>=6)
-extension ToolVerificationResult: Sendable {}
-#endif
-
-
-extension ToolVerificationResult: Equatable, Hashable {
-    public static func ==(lhs: ToolVerificationResult, rhs: ToolVerificationResult) -> Bool {
-        if lhs.toolId != rhs.toolId {
-            return false
-        }
-        if lhs.passed != rhs.passed {
-            return false
-        }
-        if lhs.failures != rhs.failures {
-            return false
-        }
-        return true
-    }
-
-    public func hash(into hasher: inout Hasher) {
-        hasher.combine(toolId)
-        hasher.combine(passed)
-        hasher.combine(failures)
-    }
-}
-
-
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public struct FfiConverterTypeToolVerificationResult: FfiConverterRustBuffer {
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ToolVerificationResult {
-        return
-            try ToolVerificationResult(
-                toolId: FfiConverterString.read(from: &buf), 
-                passed: FfiConverterBool.read(from: &buf), 
-                failures: FfiConverterSequenceString.read(from: &buf)
-        )
-    }
-
-    public static func write(_ value: ToolVerificationResult, into buf: inout [UInt8]) {
-        FfiConverterString.write(value.toolId, into: &buf)
-        FfiConverterBool.write(value.passed, into: &buf)
-        FfiConverterSequenceString.write(value.failures, into: &buf)
-    }
-}
-
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeToolVerificationResult_lift(_ buf: RustBuffer) throws -> ToolVerificationResult {
-    return try FfiConverterTypeToolVerificationResult.lift(buf)
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeToolVerificationResult_lower(_ value: ToolVerificationResult) -> RustBuffer {
-    return FfiConverterTypeToolVerificationResult.lower(value)
 }
 
 
@@ -13089,9 +13089,9 @@ public enum ScpError: Swift.Error {
     case Transport(msg: String, code: String
     )
     /**
-     * A tool operation failed (registration, invocation, verification).
+     * A outlet operation failed (registration, invocation, verification).
      */
-    case Tool(msg: String, code: String
+    case Outlet(msg: String, code: String
     )
     /**
      * Input validation failed (malformed data, schema mismatch, constraint violation).
@@ -13099,10 +13099,10 @@ public enum ScpError: Swift.Error {
     case Validation(msg: String, code: String
     )
     /**
-     * A §6.2.4 cross-context tool-invocation saga aborted at a Prepare phase.
+     * A §6.2.4 cross-context outlet-invocation saga aborted at a Prepare phase.
      *
      * Surfaces the `Aborted` terminal of
-     * `Supervisor::start_cross_context_tool_invocation_saga`. This terminal may
+     * `Supervisor::start_cross_context_outlet_invocation_saga`. This terminal may
      * be a PERMANENT rejection (authorization / freshness / rate-limit /
      * co-residency policy denial, or the §6.2.4 *Caller authentication*
      * mismatch this bridge enforces before the saga runs) OR a RETRYABLE
@@ -13205,7 +13205,7 @@ public struct FfiConverterTypeScpError: FfiConverterRustBuffer {
             msg: try FfiConverterString.read(from: &buf), 
             code: try FfiConverterString.read(from: &buf)
             )
-        case 6: return .Tool(
+        case 6: return .Outlet(
             msg: try FfiConverterString.read(from: &buf), 
             code: try FfiConverterString.read(from: &buf)
             )
@@ -13270,7 +13270,7 @@ public struct FfiConverterTypeScpError: FfiConverterRustBuffer {
             FfiConverterString.write(code, into: &buf)
             
         
-        case let .Tool(msg,code):
+        case let .Outlet(msg,code):
             writeInt(&buf, Int32(6))
             FfiConverterString.write(msg, into: &buf)
             FfiConverterString.write(code, into: &buf)
@@ -15498,6 +15498,30 @@ fileprivate struct FfiConverterOptionTypeDataProvenance: FfiConverterRustBuffer 
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeOutletCostDefinition: FfiConverterRustBuffer {
+    typealias SwiftType = OutletCostDefinition?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeOutletCostDefinition.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeOutletCostDefinition.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeReliabilityScoreRecord: FfiConverterRustBuffer {
     typealias SwiftType = ReliabilityScoreRecord?
 
@@ -15514,30 +15538,6 @@ fileprivate struct FfiConverterOptionTypeReliabilityScoreRecord: FfiConverterRus
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterTypeReliabilityScoreRecord.read(from: &buf)
-        default: throw UniffiInternalError.unexpectedOptionalTag
-        }
-    }
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-fileprivate struct FfiConverterOptionTypeToolCostDefinition: FfiConverterRustBuffer {
-    typealias SwiftType = ToolCostDefinition?
-
-    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
-        guard let value = value else {
-            writeInt(&buf, Int8(0))
-            return
-        }
-        writeInt(&buf, Int8(1))
-        FfiConverterTypeToolCostDefinition.write(value, into: &buf)
-    }
-
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
-        switch try readInt(&buf) as Int8 {
-        case 0: return nil
-        case 1: return try FfiConverterTypeToolCostDefinition.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -15695,23 +15695,23 @@ fileprivate struct FfiConverterSequenceTypeEvent: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-fileprivate struct FfiConverterSequenceTypeMcpToolInfo: FfiConverterRustBuffer {
-    typealias SwiftType = [McpToolInfo]
+fileprivate struct FfiConverterSequenceTypeMcpOutletInfo: FfiConverterRustBuffer {
+    typealias SwiftType = [McpOutletInfo]
 
-    public static func write(_ value: [McpToolInfo], into buf: inout [UInt8]) {
+    public static func write(_ value: [McpOutletInfo], into buf: inout [UInt8]) {
         let len = Int32(value.count)
         writeInt(&buf, len)
         for item in value {
-            FfiConverterTypeMcpToolInfo.write(item, into: &buf)
+            FfiConverterTypeMcpOutletInfo.write(item, into: &buf)
         }
     }
 
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [McpToolInfo] {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [McpOutletInfo] {
         let len: Int32 = try readInt(&buf)
-        var seq = [McpToolInfo]()
+        var seq = [McpOutletInfo]()
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
-            seq.append(try FfiConverterTypeMcpToolInfo.read(from: &buf))
+            seq.append(try FfiConverterTypeMcpOutletInfo.read(from: &buf))
         }
         return seq
     }
@@ -17236,10 +17236,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_client_disconnect() != 63976) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_client_invoke() != 30137) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_client_invoke() != 16053) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_client_list_tools() != 53196) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_client_list_tools() != 20301) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_configure_stdio_allowlist() != 7937) {
@@ -17267,6 +17267,39 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_node_start_local() != 59051) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_outlet_interface_accept() != 73) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_outlet_interface_expose() != 3812) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_outlet_interface_revoke() != 20193) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_outlet_invoke() != 47804) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_outlet_invoke_cross_context() != 45495) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_outlet_invoke_cross_context_saga() != 54902) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_outlet_register() != 48642) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_outlet_session_close() != 2713) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_outlet_session_create() != 284) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_outlet_session_invoke() != 37173) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_outlet_verify() != 31142) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_participation_record() != 20243) {
@@ -17354,39 +17387,6 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_tombstone_migrated_context() != 15228) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_tool_interface_accept() != 29084) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_tool_interface_expose() != 35947) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_tool_interface_revoke() != 43274) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_tool_invoke() != 31430) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_tool_invoke_cross_context() != 47346) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_tool_invoke_cross_context_saga() != 1312) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_tool_register() != 65327) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_tool_session_close() != 64711) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_tool_session_create() != 1081) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_tool_session_invoke() != 26287) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_tool_verify() != 10586) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_transport_connect() != 45064) {

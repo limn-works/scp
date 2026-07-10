@@ -51,22 +51,22 @@ class ConformanceStubBindings : NativeBindings {
     var contextSubscribeResult: Long = 100L
     var lastMessageCallback: MessageCallback? = null
 
-    var toolRegisterResult: String = "tool-001"
-    var toolRegisterError: BridgeException? = null
-    var toolInvokeResult: String = """{"output":"ok"}"""
-    var toolInvokeError: BridgeException? = null
-    var toolVerifyResult: String = """{"tool_id":"stub","passed":true,"failures":[]}"""
-    var toolVerifyError: BridgeException? = null
-    var toolInvokeCrossContextResult: String = """{"cross_context":"ok"}"""
-    var toolInvokeCrossContextError: BridgeException? = null
-    var toolInvokeCrossContextSagaResult: String = """{"saga_id":"saga-001"}"""
-    var toolInvokeCrossContextSagaError: BridgeException? = null
+    var outletRegisterResult: String = "outlet-001"
+    var outletRegisterError: BridgeException? = null
+    var outletInvokeResult: String = """{"output":"ok"}"""
+    var outletInvokeError: BridgeException? = null
+    var outletVerifyResult: String = """{"outlet_id":"stub","passed":true,"failures":[]}"""
+    var outletVerifyError: BridgeException? = null
+    var outletInvokeCrossContextResult: String = """{"cross_context":"ok"}"""
+    var outletInvokeCrossContextError: BridgeException? = null
+    var outletInvokeCrossContextSagaResult: String = """{"saga_id":"saga-001"}"""
+    var outletInvokeCrossContextSagaError: BridgeException? = null
     var lastSagaArgs: List<String>? = null
-    var toolSessionCreateResult: String = "session-001"
-    var toolSessionCreateError: BridgeException? = null
-    var toolSessionInvokeResult: String = """{"session":"ok"}"""
-    var toolSessionInvokeError: BridgeException? = null
-    var toolSessionCloseError: BridgeException? = null
+    var outletSessionCreateResult: String = "session-001"
+    var outletSessionCreateError: BridgeException? = null
+    var outletSessionInvokeResult: String = """{"session":"ok"}"""
+    var outletSessionInvokeError: BridgeException? = null
+    var outletSessionCloseError: BridgeException? = null
 
     var ucanValidateError: BridgeException? = null
     var ucanMintResult: String = "minted-token"
@@ -316,39 +316,39 @@ class ConformanceStubBindings : NativeBindings {
         """"etag":"stub-etag","deploy_id":"stub-deploy"}],""" +
         """"deploy_id":"stub-deploy"}"""
 
-    override fun toolRegister(
+    override fun outletRegister(
         contextHandle: Long,
         definitionJson: String,
     ): String {
-        toolRegisterError?.let { throw it }
-        return toolRegisterResult
+        outletRegisterError?.let { throw it }
+        return outletRegisterResult
     }
 
     @Suppress("LongParameterList")
-    override fun toolInvoke(
+    override fun outletInvoke(
         contextHandle: Long,
-        toolId: String,
+        outletId: String,
         inputJson: String,
         identityHandle: Long,
         ucanToken: String?,
         proofTokens: List<String>?,
         spendingUcan: String?,
     ): String {
-        toolInvokeError?.let { throw it }
-        return toolInvokeResult
+        outletInvokeError?.let { throw it }
+        return outletInvokeResult
     }
 
-    override fun toolVerify(
+    override fun outletVerify(
         contextHandle: Long,
-        toolId: String,
+        outletId: String,
     ): String {
-        toolVerifyError?.let { throw it }
-        return toolVerifyResult
+        outletVerifyError?.let { throw it }
+        return outletVerifyResult
     }
 
-    override fun toolInterfaceExpose(
+    override fun outletInterfaceExpose(
         contextHandle: Long,
-        toolId: String,
+        outletId: String,
         targetContextId: String,
         rateLimitJson: String?,
     ): String =
@@ -356,18 +356,18 @@ class ConformanceStubBindings : NativeBindings {
             buildJsonObject {
                 put("source_context", "ctx-src")
                 put("target_context", targetContextId)
-                put("tool_id", toolId)
+                put("outlet_id", outletId)
                 put("approved_by_source", true)
                 put("approved_by_target", false)
             },
         )
 
-    override fun toolInterfaceAccept(
+    override fun outletInterfaceAccept(
         contextHandle: Long,
         interfaceJson: String,
     ): String = interfaceJson.replace("\"approved_by_target\":false", "\"approved_by_target\":true")
 
-    override fun toolInterfaceRevoke(
+    override fun outletInterfaceRevoke(
         contextHandle: Long,
         interfaceIdHex: String,
     ): String =
@@ -380,26 +380,26 @@ class ConformanceStubBindings : NativeBindings {
         )
 
     @Suppress("LongParameterList")
-    override fun toolInvokeCrossContext(
+    override fun outletInvokeCrossContext(
         sourceContextHandle: Long,
         targetContextHandle: Long,
-        toolId: String,
+        outletId: String,
         inputJson: String,
         identityHandle: Long,
         ucanToken: String,
         chainDepth: Int,
         proofTokens: List<String>?,
     ): String {
-        toolInvokeCrossContextError?.let { throw it }
-        return toolInvokeCrossContextResult
+        outletInvokeCrossContextError?.let { throw it }
+        return outletInvokeCrossContextResult
     }
 
     @Suppress("LongParameterList")
-    override fun toolInvokeCrossContextSaga(
+    override fun outletInvokeCrossContextSaga(
         sourceContextHandle: Long,
         targetContextHandle: Long,
         callerDid: String,
-        toolRegistrationId: String,
+        outletRegistrationId: String,
         inputJson: String,
         assertedNonceHex: String,
         timestampMs: Long,
@@ -411,29 +411,29 @@ class ConformanceStubBindings : NativeBindings {
                 sourceContextHandle.toString(),
                 targetContextHandle.toString(),
                 callerDid,
-                toolRegistrationId,
+                outletRegistrationId,
                 inputJson,
                 assertedNonceHex,
                 timestampMs.toString(),
                 chainDepth.toString(),
                 ucanProofId.toString(),
             )
-        toolInvokeCrossContextSagaError?.let { throw it }
-        return toolInvokeCrossContextSagaResult
+        outletInvokeCrossContextSagaError?.let { throw it }
+        return outletInvokeCrossContextSagaResult
     }
 
-    override fun toolSessionCreate(
+    override fun outletSessionCreate(
         contextHandle: Long,
-        toolId: String,
+        outletId: String,
         sourceContextId: String,
         ttlSeconds: Long?,
     ): String {
-        toolSessionCreateError?.let { throw it }
-        return toolSessionCreateResult
+        outletSessionCreateError?.let { throw it }
+        return outletSessionCreateResult
     }
 
     @Suppress("LongParameterList")
-    override fun toolSessionInvoke(
+    override fun outletSessionInvoke(
         contextHandle: Long,
         sessionId: String,
         inputJson: String,
@@ -441,15 +441,15 @@ class ConformanceStubBindings : NativeBindings {
         ucanToken: String,
         proofTokens: List<String>?,
     ): String {
-        toolSessionInvokeError?.let { throw it }
-        return toolSessionInvokeResult
+        outletSessionInvokeError?.let { throw it }
+        return outletSessionInvokeResult
     }
 
-    override fun toolSessionClose(
+    override fun outletSessionClose(
         contextHandle: Long,
         sessionId: String,
     ) {
-        toolSessionCloseError?.let { throw it }
+        outletSessionCloseError?.let { throw it }
     }
 
     override fun ucanValidate(
@@ -554,22 +554,22 @@ class ConformanceStubBindings : NativeBindings {
         contextSendPayload = null
         contextSubscribeResult = 100L
         lastMessageCallback = null
-        toolRegisterResult = "tool-001"
-        toolRegisterError = null
-        toolInvokeResult = """{"output":"ok"}"""
-        toolInvokeError = null
-        toolVerifyResult = """{"tool_id":"stub","passed":true,"failures":[]}"""
-        toolVerifyError = null
-        toolInvokeCrossContextResult = """{"cross_context":"ok"}"""
-        toolInvokeCrossContextError = null
-        toolInvokeCrossContextSagaResult = """{"saga_id":"saga-001"}"""
-        toolInvokeCrossContextSagaError = null
+        outletRegisterResult = "outlet-001"
+        outletRegisterError = null
+        outletInvokeResult = """{"output":"ok"}"""
+        outletInvokeError = null
+        outletVerifyResult = """{"outlet_id":"stub","passed":true,"failures":[]}"""
+        outletVerifyError = null
+        outletInvokeCrossContextResult = """{"cross_context":"ok"}"""
+        outletInvokeCrossContextError = null
+        outletInvokeCrossContextSagaResult = """{"saga_id":"saga-001"}"""
+        outletInvokeCrossContextSagaError = null
         lastSagaArgs = null
-        toolSessionCreateResult = "session-001"
-        toolSessionCreateError = null
-        toolSessionInvokeResult = """{"session":"ok"}"""
-        toolSessionInvokeError = null
-        toolSessionCloseError = null
+        outletSessionCreateResult = "session-001"
+        outletSessionCreateError = null
+        outletSessionInvokeResult = """{"session":"ok"}"""
+        outletSessionInvokeError = null
+        outletSessionCloseError = null
         ucanValidateError = null
         ucanMintResult = "minted-token"
         ucanMintError = null

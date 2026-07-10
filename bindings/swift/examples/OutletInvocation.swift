@@ -1,20 +1,20 @@
-// Tool invocation: register a tool and invoke it within a context.
+// Outlet invocation: register a outlet and invoke it within a context.
 //
-// Demonstrates ToolDefinition construction and tool invocation through
+// Demonstrates OutletDefinition construction and outlet invocation through
 // an explicit `SCP` instance (ADR-048).
 
 import Foundation
 import SCP
 
 @main
-struct ToolInvocation {
+struct OutletInvocation {
     static func main() async throws {
         let scp = try SCP(storage: .inMemory)
         defer { Task { try? await scp.shutdown(timeout: 5) } }
 
         let identity = try await scp.identityCreate(custody: "in_memory")
 
-        let weatherTool = ToolDefinition(
+        let weatherOutlet = OutletDefinition(
             name: "weather",
             description: "Get current weather for a city",
             inputSchemaJson: #"{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}"#,
@@ -41,12 +41,12 @@ struct ToolInvocation {
         )
         let handle = try await scp.contextCreate(identity: identity, params: params)
 
-        let toolId = try await scp.toolRegister(handle: handle, definition: weatherTool)
-        print("Registered tool: \(toolId)")
+        let outletId = try await scp.outletRegister(handle: handle, definition: weatherOutlet)
+        print("Registered outlet: \(outletId)")
 
-        let resultJson = try await scp.toolInvoke(
+        let resultJson = try await scp.outletInvoke(
             handle: handle,
-            toolId: "weather",
+            outletId: "weather",
             inputJson: #"{"city":"Berlin"}"#,
             identity: identity,
             ucanToken: nil,

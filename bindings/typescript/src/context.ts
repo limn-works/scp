@@ -5,7 +5,7 @@
  * to a pure handle type: no `#scp` backing, no instance methods that
  * touch the bridge, no static factories other than `_fromHandle`. All
  * context lifecycle and content operations (create, join, send,
- * receive, leave, close, tool registration, governance, broadcast,
+ * receive, leave, close, outlet registration, governance, broadcast,
  * economic policy, TTL, export/import, event drain, etc.) live as
  * methods on the {@link SCP} class.
  *
@@ -269,7 +269,7 @@ export function _validateDeployId(deployId: string): void {
  * After Phase 4 PR 4 Agent B1, `Context` is a pure handle type: it
  * carries the context ID, the raw bridge handle, and the joined
  * identity DID. All lifecycle operations (`create`, `import`,
- * `leave`, `close`, `send`, `receive`, tool registration, governance,
+ * `leave`, `close`, `send`, `receive`, outlet registration, governance,
  * broadcast, economic policy, TTL, event drain, etc.) live as methods
  * on the {@link SCP} class. Pass a `Context` wherever the underlying
  * bridge call needs the context handle.

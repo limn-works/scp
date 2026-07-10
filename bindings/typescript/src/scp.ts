@@ -2013,19 +2013,19 @@ export class SCP {
   }
 
   // ───────────────────────────────────────────────────────────────────────
-  // Domain: Tool
+  // Domain: Outlet
   // ───────────────────────────────────────────────────────────────────────
 
-  async toolRegister(handle: unknown, definition: unknown): Promise<string> {
-    return await (this.#native.toolRegister as (h: unknown, d: unknown) => Promise<string>)(
+  async outletRegister(handle: unknown, definition: unknown): Promise<string> {
+    return await (this.#native.outletRegister as (h: unknown, d: unknown) => Promise<string>)(
       handle,
       definition,
     );
   }
 
-  async toolInvoke(
+  async outletInvoke(
     handle: unknown,
-    toolId: string,
+    outletId: string,
     inputJson: string,
     identityDid: string,
     ucanToken: string,
@@ -2033,7 +2033,7 @@ export class SCP {
     spendingUcanJwt?: string,
   ): Promise<string> {
     return await (
-      this.#native.toolInvoke as (
+      this.#native.outletInvoke as (
         h: unknown,
         t: string,
         i: string,
@@ -2042,20 +2042,20 @@ export class SCP {
         p: readonly string[] | undefined,
         s: string | undefined,
       ) => Promise<string>
-    )(handle, toolId, inputJson, identityDid, ucanToken, proofTokens, spendingUcanJwt);
+    )(handle, outletId, inputJson, identityDid, ucanToken, proofTokens, spendingUcanJwt);
   }
 
-  async toolVerify(handle: unknown, toolId: string): Promise<unknown> {
-    return await (this.#native.toolVerify as (h: unknown, t: string) => Promise<unknown>)(
+  async outletVerify(handle: unknown, outletId: string): Promise<unknown> {
+    return await (this.#native.outletVerify as (h: unknown, t: string) => Promise<unknown>)(
       handle,
-      toolId,
+      outletId,
     );
   }
 
-  async toolInvokeCrossContext(
+  async outletInvokeCrossContext(
     sourceHandle: unknown,
     targetHandle: unknown,
-    toolId: string,
+    outletId: string,
     inputJson: string,
     invokerDid: string,
     ucanToken: string,
@@ -2063,10 +2063,10 @@ export class SCP {
     proofTokens?: readonly string[],
   ): Promise<string> {
     return await (
-      this.#native.toolInvokeCrossContext as (
+      this.#native.outletInvokeCrossContext as (
         s: unknown,
         t: unknown,
-        tool: string,
+        outlet: string,
         input: string,
         did: string,
         ucan: string,
@@ -2076,7 +2076,7 @@ export class SCP {
     )(
       sourceHandle,
       targetHandle,
-      toolId,
+      outletId,
       inputJson,
       invokerDid,
       ucanToken,
@@ -2086,7 +2086,7 @@ export class SCP {
   }
 
   /**
-   * Runs the §6.2.4 atomic cross-context tool-invocation saga (ADR-049 §3a).
+   * Runs the §6.2.4 atomic cross-context outlet-invocation saga (ADR-049 §3a).
    *
    * The saga either commits — resolving to a {@link SagaResult} carrying the
    * supervisor-minted `sagaId` plus the target's signed receipt and captured
@@ -2109,11 +2109,11 @@ export class SCP {
    *
    * See spec §6.2.4 and ADR-049 §3a.
    */
-  async toolInvokeCrossContextSaga(
+  async outletInvokeCrossContextSaga(
     sourceHandle: unknown,
     targetHandle: unknown,
     callerDid: string,
-    toolRegistrationId: string,
+    outletRegistrationId: string,
     inputJson: string,
     assertedNonceHex: string,
     timestampMs: bigint,
@@ -2136,11 +2136,11 @@ export class SCP {
     let raw: { sagaId: string; receipt?: Uint8Array; output?: Uint8Array };
     try {
       raw = await (
-        this.#native.toolInvokeCrossContextSaga as (
+        this.#native.outletInvokeCrossContextSaga as (
           s: unknown,
           t: unknown,
           caller: string,
-          tool: string,
+          outlet: string,
           input: string,
           nonce: string,
           ts: bigint,
@@ -2151,7 +2151,7 @@ export class SCP {
         sourceHandle,
         targetHandle,
         callerDid,
-        toolRegistrationId,
+        outletRegistrationId,
         inputJson,
         assertedNonceHex,
         timestampMs,
@@ -2168,23 +2168,23 @@ export class SCP {
     };
   }
 
-  async toolSessionCreate(
+  async outletSessionCreate(
     handle: unknown,
-    toolId: string,
+    outletId: string,
     sourceContextId: string,
     ttlSeconds?: number,
   ): Promise<string> {
     return await (
-      this.#native.toolSessionCreate as (
+      this.#native.outletSessionCreate as (
         h: unknown,
         t: string,
         s: string,
         ttl: number | undefined,
       ) => Promise<string>
-    )(handle, toolId, sourceContextId, ttlSeconds);
+    )(handle, outletId, sourceContextId, ttlSeconds);
   }
 
-  async toolSessionInvoke(
+  async outletSessionInvoke(
     handle: unknown,
     sessionId: string,
     inputJson: string,
@@ -2193,7 +2193,7 @@ export class SCP {
     proofTokens?: readonly string[],
   ): Promise<string> {
     return await (
-      this.#native.toolSessionInvoke as (
+      this.#native.outletSessionInvoke as (
         h: unknown,
         sid: string,
         input: string,
@@ -2204,41 +2204,39 @@ export class SCP {
     )(handle, sessionId, inputJson, invokerDid, ucanToken, proofTokens);
   }
 
-  async toolSessionClose(handle: unknown, sessionId: string): Promise<void> {
-    await (this.#native.toolSessionClose as (h: unknown, sid: string) => Promise<void>)(
+  async outletSessionClose(handle: unknown, sessionId: string): Promise<void> {
+    await (this.#native.outletSessionClose as (h: unknown, sid: string) => Promise<void>)(
       handle,
       sessionId,
     );
   }
 
-  async toolInterfaceExpose(
+  async outletInterfaceExpose(
     handle: unknown,
-    toolId: string,
+    outletId: string,
     targetContextId: string,
     rateLimitJson?: string,
   ): Promise<string> {
     return await (
-      this.#native.toolInterfaceExpose as (
+      this.#native.outletInterfaceExpose as (
         h: unknown,
         t: string,
         tc: string,
         rl: string | undefined,
       ) => Promise<string>
-    )(handle, toolId, targetContextId, rateLimitJson);
+    )(handle, outletId, targetContextId, rateLimitJson);
   }
 
-  async toolInterfaceAccept(handle: unknown, interfaceJson: string): Promise<string> {
-    return await (this.#native.toolInterfaceAccept as (h: unknown, ij: string) => Promise<string>)(
-      handle,
-      interfaceJson,
-    );
+  async outletInterfaceAccept(handle: unknown, interfaceJson: string): Promise<string> {
+    return await (
+      this.#native.outletInterfaceAccept as (h: unknown, ij: string) => Promise<string>
+    )(handle, interfaceJson);
   }
 
-  async toolInterfaceRevoke(handle: unknown, interfaceIdHex: string): Promise<string> {
-    return await (this.#native.toolInterfaceRevoke as (h: unknown, id: string) => Promise<string>)(
-      handle,
-      interfaceIdHex,
-    );
+  async outletInterfaceRevoke(handle: unknown, interfaceIdHex: string): Promise<string> {
+    return await (
+      this.#native.outletInterfaceRevoke as (h: unknown, id: string) => Promise<string>
+    )(handle, interfaceIdHex);
   }
 
   // ───────────────────────────────────────────────────────────────────────
@@ -3114,7 +3112,7 @@ export class SCP {
 
   async mcpClientInvoke(
     handle: unknown,
-    toolName: string,
+    outletName: string,
     inputJson: string,
     contextId: string,
     invokerDid: string,
@@ -3127,7 +3125,7 @@ export class SCP {
         c: string,
         d: string,
       ) => Promise<unknown>
-    )(handle, toolName, inputJson, contextId, invokerDid);
+    )(handle, outletName, inputJson, contextId, invokerDid);
   }
 
   mcpConfigureStdioAllowlist(additionalBinaries: readonly string[]): void {

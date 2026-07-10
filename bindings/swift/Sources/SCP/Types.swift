@@ -1,6 +1,6 @@
 import Foundation
 
-// Message, ToolDefinition, and other core types are now defined by UniFFI in
+// Message, OutletDefinition, and other core types are now defined by UniFFI in
 // ScpBindings.swift. This file provides additional Swift-idiomatic convenience
 // types that do NOT conflict with UniFFI-generated types.
 
@@ -95,9 +95,9 @@ public nonisolated struct Capability: Sendable {
 
 // MARK: - TestVector
 
-/// An input/output pair used for tool conformance testing.
+/// An input/output pair used for outlet conformance testing.
 ///
-/// Mirrors `scp_core::context::tools::TestVector`. Each vector carries a
+/// Mirrors `scp_core::context::outlets::TestVector`. Each vector carries a
 /// human-readable description of what it validates, plus the input and
 /// expected output as JSON strings.
 ///

@@ -1,8 +1,8 @@
-// ToolDefinitionTest.kt — Unit tests for ToolDefinition.toJson() and ToolCost (#1203)
+// OutletDefinitionTest.kt — Unit tests for OutletDefinition.toJson() and OutletCost (#1203)
 //
-// Verifies that ToolDefinition.toJson() produces structurally valid JSON that is
+// Verifies that OutletDefinition.toJson() produces structurally valid JSON that is
 // immune to injection via untrusted string fields, and that the monetary
-// ToolCost.amount is a ULong serialized as its canonical decimal string
+// OutletCost.amount is a ULong serialized as its canonical decimal string
 // (ADR-060 native-integer money surface).
 //
 // Provenance: spec §5.4.1, ADR-010, ADR-060, issue #1203
@@ -17,11 +17,11 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
-class ToolDefinitionTest {
+class OutletDefinitionTest {
     @Test
     fun `basic round-trip`() {
         val def =
-            ToolDefinition(
+            OutletDefinition(
                 name = "calculator",
                 description = "Adds two numbers",
                 inputSchemaJson = """{"type":"object","properties":{"a":{"type":"number"}}}""",
@@ -29,7 +29,7 @@ class ToolDefinitionTest {
                 operatorDid = "did:dht:operator123",
                 testVectorsJson = """[{"input":{"a":1},"output":{"sum":1}}]""",
                 implementationHashHex = "abcdef0123456789",
-                cost = ToolCost(amount = 100uL, currency = "USD", payee = "did:dht:payee456", costFormula = "flat"),
+                cost = OutletCost(amount = 100uL, currency = "USD", payee = "did:dht:payee456", costFormula = "flat"),
             )
         val json = def.toJson()
         val obj = Json.parseToJsonElement(json).jsonObject
@@ -59,7 +59,7 @@ class ToolDefinitionTest {
     @Test
     fun `minimal definition`() {
         val def =
-            ToolDefinition(
+            OutletDefinition(
                 name = "ping",
                 description = "health check",
                 inputSchemaJson = """{}""",
@@ -80,8 +80,8 @@ class ToolDefinitionTest {
     @Test
     fun `special characters in name`() {
         val def =
-            ToolDefinition(
-                name = "tool\"with\\special\nchars",
+            OutletDefinition(
+                name = "outlet\"with\\special\nchars",
                 description = "desc\twith\ttabs",
                 inputSchemaJson = """{}""",
                 outputSchemaJson = """{}""",
@@ -90,21 +90,21 @@ class ToolDefinitionTest {
         val json = def.toJson()
         // Must parse without exception — proves structural validity
         val obj = Json.parseToJsonElement(json).jsonObject
-        assertEquals("tool\"with\\special\nchars", obj["name"]?.jsonPrimitive?.content)
+        assertEquals("outlet\"with\\special\nchars", obj["name"]?.jsonPrimitive?.content)
         assertEquals("desc\twith\ttabs", obj["description"]?.jsonPrimitive?.content)
     }
 
     @Test
     fun `special characters in cost fields`() {
         val def =
-            ToolDefinition(
-                name = "tool",
+            OutletDefinition(
+                name = "outlet",
                 description = "d",
                 inputSchemaJson = """{}""",
                 outputSchemaJson = """{}""",
                 operatorDid = "did:dht:op",
                 cost =
-                    ToolCost(
+                    OutletCost(
                         amount = 50uL,
                         currency = "US\"D",
                         payee = "did:dht:payee\u00e9\u00fc",
@@ -119,7 +119,7 @@ class ToolDefinitionTest {
 
     @Test
     fun `zero amount accepted`() {
-        val cost = ToolCost(amount = 0uL, currency = "USD", payee = "did:dht:p")
+        val cost = OutletCost(amount = 0uL, currency = "USD", payee = "did:dht:p")
         assertEquals(0uL, cost.amount)
     }
 
@@ -127,11 +127,11 @@ class ToolDefinitionTest {
     fun `full-width ULong amount survives exactly through toJson`() {
         // ULong.MAX_VALUE (2^64 - 1) exceeds Long.MAX_VALUE — a signed Long would
         // have overflowed. As the canonical decimal string it round-trips exactly.
-        val cost = ToolCost(amount = ULong.MAX_VALUE, currency = "BTC", payee = "did:dht:p")
+        val cost = OutletCost(amount = ULong.MAX_VALUE, currency = "BTC", payee = "did:dht:p")
         assertEquals(ULong.MAX_VALUE, cost.amount)
 
         val def =
-            ToolDefinition(
+            OutletDefinition(
                 name = "expensive",
                 description = "d",
                 inputSchemaJson = """{}""",
@@ -151,13 +151,13 @@ class ToolDefinitionTest {
     @Test
     fun `cost formula omission`() {
         val def =
-            ToolDefinition(
-                name = "tool",
+            OutletDefinition(
+                name = "outlet",
                 description = "d",
                 inputSchemaJson = """{}""",
                 outputSchemaJson = """{}""",
                 operatorDid = "did:dht:op",
-                cost = ToolCost(amount = 10uL, currency = "USD", payee = "did:dht:p"),
+                cost = OutletCost(amount = 10uL, currency = "USD", payee = "did:dht:p"),
             )
         val json = def.toJson()
         val costObj = Json.parseToJsonElement(json).jsonObject["cost"]?.jsonObject
@@ -169,8 +169,8 @@ class ToolDefinitionTest {
         val inputSchema = """{"type":"object","properties":{"x":{"type":"integer"}}}"""
         val outputSchema = """{"type":"array","items":{"type":"string"}}"""
         val def =
-            ToolDefinition(
-                name = "tool",
+            OutletDefinition(
+                name = "outlet",
                 description = "d",
                 inputSchemaJson = inputSchema,
                 outputSchemaJson = outputSchema,

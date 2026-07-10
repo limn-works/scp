@@ -59,7 +59,7 @@ describe("safeJsonParse", () => {
       "eventLogVerify",
       "discoveryParseAddress",
       "contextDiscover",
-      "toolInvoke",
+      "outletInvoke",
       "mcpClientListTools",
       "mcpClientInvoke",
       "provenanceAttach",

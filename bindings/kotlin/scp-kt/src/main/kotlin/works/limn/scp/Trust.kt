@@ -141,7 +141,7 @@ data class CapabilityValidation(
  * TypeScript SDK `BehavioralRecord`, and the Rust `ParticipationFacts` 1:1.
  *
  * The six leaf-derived facts (participation duration, governance actions
- * against/by, context creation, role progression, tool invocation count) come
+ * against/by, context creation, role progression, outlet invocation count) come
  * from the context's convergent Merkle event log. [attestationCount] is the one
  * exception: it is a credential-layer fact (§7.4), NOT event-log-derived, NOT
  * covered by [eventLogRoot], and **verifier-relative** (two agents may compute
@@ -152,7 +152,7 @@ data class CapabilityValidation(
  * @property governanceActionsAgainst Governance actions against this identity
  *   (the subject is the projected target).
  * @property governanceActionsBy Governance actions initiated by this identity.
- * @property toolInvocationCount Total tool invocations across all tool types.
+ * @property toolInvocationCount Total outlet invocations across all outlet types.
  * @property toolInvocationCountAnchored Whether [toolInvocationCount] is anchored
  *   in the canonical Merkle log. `false` until ADR-051 makes `ToolInvoked` a
  *   convergent leaf — consumers MUST NOT treat the count as Merkle-proven while

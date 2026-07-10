@@ -755,61 +755,61 @@ interface BroadcastBindings {
 }
 
 /**
- * Native binding functions for tool operations.
+ * Native binding functions for outlet operations.
  *
  * All methods are blocking JNA calls into Rust and must be dispatched on [Dispatchers.IO].
  */
-interface ToolBindings {
+interface OutletBindings {
     /**
-     * Registers a tool in an SCP context.
+     * Registers a outlet in an SCP context.
      *
-     * Validates the tool definition (name, input/output JSON schemas,
+     * Validates the outlet definition (name, input/output JSON schemas,
      * test vectors, implementation hash) and adds it to the context's
-     * tool registry. The context must be in `Active` state.
+     * outlet registry. The context must be in `Active` state.
      *
      * @param contextHandle Opaque handle from context create or join.
-     * @param definitionJson JSON-encoded tool definition including `name`,
+     * @param definitionJson JSON-encoded outlet definition including `name`,
      *   `description`, `input_schema_json`, `output_schema_json`,
      *   `operator_did`, and optional `test_vectors_json` and
      *   `implementation_hash`.
-     * @return The assigned tool ID string (derived from the tool name).
+     * @return The assigned outlet ID string (derived from the outlet name).
      * @throws BridgeException with `SCP-TOOL-6003` if the context is not
      *   active, with `SCP-VALID-7035`/`SCP-VALID-7036` if schemas are
      *   invalid, or with `SCP-TOOL-6001` if registration fails.
      */
-    fun toolRegister(
+    fun outletRegister(
         contextHandle: Long,
         definitionJson: String,
     ): String
 
     /**
-     * Invokes a registered tool in an SCP context.
+     * Invokes a registered outlet in an SCP context.
      *
-     * Validates the input against the tool's JSON schema, checks UCAN
+     * Validates the input against the outlet's JSON schema, checks UCAN
      * authorization via the full 11-step ADR-016 pipeline, and dispatches
-     * to the tool handler if one is registered. The context must be in
+     * to the outlet handler if one is registered. The context must be in
      * `Active` state.
      *
      * @param contextHandle Opaque handle from context create or join.
-     * @param toolId The tool's assigned ID from [toolRegister].
-     * @param inputJson JSON-encoded tool input matching the tool's
+     * @param outletId The outlet's assigned ID from [outletRegister].
+     * @param inputJson JSON-encoded outlet input matching the outlet's
      *   input schema.
      * @param identityHandle Opaque handle for the invoker's identity
      *   (used for capability checking).
      * @param ucanToken Optional JWT-encoded UCAN token authorizing the
-     *   invocation. Must contain `tool_invoke:{tool_id}` or
+     *   invocation. Must contain `tool_invoke:{outlet_id}` or
      *   `tool_invoke:*` capability.
      * @param proofTokens Optional list of encoded parent UCAN tokens
      *   for delegation chain traversal (ADR-016 step 3).
-     * @return JSON-encoded tool output.
+     * @return JSON-encoded outlet output.
      * @throws BridgeException with `SCP-TOOL-6005` if the context is not
      *   active, with `SCP-TOOL-6002` if invocation fails, or with
      *   `SCP-PERM-3001` if UCAN authorization fails.
      */
     @Suppress("LongParameterList") // FFI bridge — must match UniFFI export signature
-    fun toolInvoke(
+    fun outletInvoke(
         contextHandle: Long,
-        toolId: String,
+        outletId: String,
         inputJson: String,
         identityHandle: Long,
         ucanToken: String?,
@@ -818,93 +818,93 @@ interface ToolBindings {
     ): String
 
     /**
-     * Verifies a tool's registration status in an SCP context.
+     * Verifies a outlet's registration status in an SCP context.
      *
-     * Checks that the tool is registered and returns its verification
+     * Checks that the outlet is registered and returns its verification
      * result including whether it passed and any failure details.
      *
      * @param contextHandle Opaque handle from context create or join.
-     * @param toolId The tool's assigned ID.
-     * @return JSON-encoded verification result with `tool_id`, `passed`,
+     * @param outletId The outlet's assigned ID.
+     * @return JSON-encoded verification result with `outlet_id`, `passed`,
      *   and `failures` fields.
      * @throws BridgeException with `SCP-TOOL-6007` if the context is not
      *   active or verification encounters an error.
      */
-    fun toolVerify(
+    fun outletVerify(
         contextHandle: Long,
-        toolId: String,
+        outletId: String,
     ): String
 
     /**
-     * Exposes a tool interface for cross-context sharing (§6.2.0.1 step 1).
+     * Exposes a outlet interface for cross-context sharing (§6.2.0.1 step 1).
      *
      * @param contextHandle Opaque handle for the source context.
-     * @param toolId The ID of the tool to expose.
-     * @param targetContextId The target context to expose the tool to.
+     * @param outletId The ID of the outlet to expose.
+     * @param targetContextId The target context to expose the outlet to.
      * @param rateLimitJson Optional per-interface rate limit as JSON.
-     * @return JSON-encoded ToolInterface with `approved_by_source = true`.
+     * @return JSON-encoded OutletInterface with `approved_by_source = true`.
      * @throws BridgeException with `SCP-TOOL-6030` if the caller is not
-     *   an admin or the tool is not found.
+     *   an admin or the outlet is not found.
      */
-    fun toolInterfaceExpose(
+    fun outletInterfaceExpose(
         contextHandle: Long,
-        toolId: String,
+        outletId: String,
         targetContextId: String,
         rateLimitJson: String?,
     ): String
 
     /**
-     * Accepts a cross-context tool interface (§6.2.0.1 step 4).
+     * Accepts a cross-context outlet interface (§6.2.0.1 step 4).
      *
      * @param contextHandle Opaque handle for the target context.
-     * @param interfaceJson The ToolInterface JSON string to accept.
-     * @return JSON-encoded updated ToolInterface with `approved_by_target = true`.
+     * @param interfaceJson The OutletInterface JSON string to accept.
+     * @return JSON-encoded updated OutletInterface with `approved_by_target = true`.
      * @throws BridgeException with `SCP-TOOL-6032` if the caller is not
      *   an admin or context mismatch.
      */
-    fun toolInterfaceAccept(
+    fun outletInterfaceAccept(
         contextHandle: Long,
         interfaceJson: String,
     ): String
 
     /**
-     * Revokes a cross-context tool interface (§6.2.0.1 step 5).
+     * Revokes a cross-context outlet interface (§6.2.0.1 step 5).
      *
      * @param contextHandle Opaque handle for the revoking context.
      * @param interfaceIdHex The 32-byte interface/offer ID as hex.
      * @return JSON-encoded InterfaceRevoked event.
      * @throws BridgeException with `SCP-VALID-7042` if hex is invalid.
      */
-    fun toolInterfaceRevoke(
+    fun outletInterfaceRevoke(
         contextHandle: Long,
         interfaceIdHex: String,
     ): String
 
     /**
-     * Invokes a tool across context boundaries (spec section 6.2).
+     * Invokes a outlet across context boundaries (spec section 6.2).
      *
      * Validates UCAN authorization against the target context, chain depth,
-     * source context capability, and target context tool existence.
+     * source context capability, and target context outlet existence.
      *
      * @param sourceContextHandle Opaque handle for the calling (source) context.
-     * @param targetContextHandle Opaque handle for the context containing the tool.
-     * @param toolId The tool's assigned ID.
-     * @param inputJson JSON-encoded tool input.
+     * @param targetContextHandle Opaque handle for the context containing the outlet.
+     * @param outletId The outlet's assigned ID.
+     * @param inputJson JSON-encoded outlet input.
      * @param identityHandle Handle for the invoker's identity.
      * @param ucanToken JWT-encoded UCAN token authorizing the invocation.
      * @param chainDepth Current cross-context chain depth (0 for first hop).
      *   Context-configurable max (default 8), range 0-255 (ADR-043, spec §24.4).
      * @param proofTokens Optional parent UCAN tokens for delegation chain.
-     * @return JSON-encoded tool output.
+     * @return JSON-encoded outlet output.
      * @throws BridgeException with `SCP-TOOL-6010` if source context not active,
      *   `SCP-TOOL-6011` if target context not active, `SCP-TOOL-6012` if chain
-     *   depth exceeded, `SCP-TOOL-6002` if tool not found.
+     *   depth exceeded, `SCP-TOOL-6002` if outlet not found.
      */
     @Suppress("LongParameterList") // FFI bridge — must match UniFFI export signature
-    fun toolInvokeCrossContext(
+    fun outletInvokeCrossContext(
         sourceContextHandle: Long,
         targetContextHandle: Long,
-        toolId: String,
+        outletId: String,
         inputJson: String,
         identityHandle: Long,
         ucanToken: String,
@@ -913,7 +913,7 @@ interface ToolBindings {
     ): String
 
     /**
-     * Runs the §6.2.4 atomic cross-context tool-invocation saga (ADR-049 §3a).
+     * Runs the §6.2.4 atomic cross-context outlet-invocation saga (ADR-049 §3a).
      *
      * Blocks until the saga reaches a terminal state. On commit returns the
      * JSON-encoded saga result; otherwise throws a [BridgeException] carrying
@@ -921,10 +921,10 @@ interface ToolBindings {
      * a bridge-surfaced validation/permission code.
      *
      * @param sourceContextHandle Opaque handle for the calling (source) context.
-     * @param targetContextHandle Opaque handle for the context holding the tool.
+     * @param targetContextHandle Opaque handle for the context holding the outlet.
      * @param callerDid The invoking principal's DID.
-     * @param toolRegistrationId The target tool's cross-context registration id.
-     * @param inputJson JSON-encoded tool input.
+     * @param outletRegistrationId The target outlet's cross-context registration id.
+     * @param inputJson JSON-encoded outlet input.
      * @param assertedNonceHex The asserted replay-protection nonce as hex.
      * @param timestampMs The invocation timestamp in milliseconds.
      * @param chainDepth Current cross-context chain depth (0 for first hop),
@@ -935,11 +935,11 @@ interface ToolBindings {
      *   terminal, or a bridge validation/permission code.
      */
     @Suppress("LongParameterList") // FFI bridge — must match UniFFI export signature
-    fun toolInvokeCrossContextSaga(
+    fun outletInvokeCrossContextSaga(
         sourceContextHandle: Long,
         targetContextHandle: Long,
         callerDid: String,
-        toolRegistrationId: String,
+        outletRegistrationId: String,
         inputJson: String,
         assertedNonceHex: String,
         timestampMs: Long,
@@ -948,44 +948,44 @@ interface ToolBindings {
     ): String
 
     /**
-     * Creates a stateful tool session (spec section 6.2.1).
+     * Creates a stateful outlet session (spec section 6.2.1).
      *
      * Sessions enable multi-turn workflows with state preservation across
      * invocations. Subject to per-caller caps (default: 1000 concurrent sessions, ADR-043).
      *
-     * @param contextHandle Opaque handle for the context containing the tool.
-     * @param toolId The tool to create a session for.
+     * @param contextHandle Opaque handle for the context containing the outlet.
+     * @param outletId The outlet to create a session for.
      * @param sourceContextId The calling context ID (session cap tracked per caller).
      * @param ttlSeconds Optional time-to-live in seconds, or null for context-lifetime.
      * @return The session ID (UUID string).
      * @throws BridgeException with `SCP-TOOL-6014` if context not active,
      *   `SCP-TOOL-6015` if session cap exceeded.
      */
-    fun toolSessionCreate(
+    fun outletSessionCreate(
         contextHandle: Long,
-        toolId: String,
+        outletId: String,
         sourceContextId: String,
         ttlSeconds: Long?,
     ): String
 
     /**
-     * Invokes a tool within an active session.
+     * Invokes a outlet within an active session.
      *
      * Each call is individually governed: the invoker must present a valid
      * UCAN token. Session state is carried forward across invocations.
      *
      * @param contextHandle Opaque handle for the context containing the session.
-     * @param sessionId The session ID from [toolSessionCreate].
-     * @param inputJson JSON-encoded tool input.
+     * @param sessionId The session ID from [outletSessionCreate].
+     * @param inputJson JSON-encoded outlet input.
      * @param identityHandle Handle for the invoker's identity.
      * @param ucanToken JWT-encoded UCAN token authorizing the invocation.
      * @param proofTokens Optional parent UCAN tokens for delegation chain.
-     * @return JSON-encoded tool output.
+     * @return JSON-encoded outlet output.
      * @throws BridgeException with `SCP-TOOL-6017` if context not active,
      *   `SCP-TOOL-6018` if session not found, `SCP-TOOL-6019` if expired.
      */
     @Suppress("LongParameterList") // FFI bridge — must match UniFFI export signature
-    fun toolSessionInvoke(
+    fun outletSessionInvoke(
         contextHandle: Long,
         sessionId: String,
         inputJson: String,
@@ -995,7 +995,7 @@ interface ToolBindings {
     ): String
 
     /**
-     * Closes a stateful tool session.
+     * Closes a stateful outlet session.
      *
      * Removes the session, releasing the caller's session slot.
      *
@@ -1003,7 +1003,7 @@ interface ToolBindings {
      * @param sessionId The session ID to close.
      * @throws BridgeException with `SCP-TOOL-6021` if session not found.
      */
-    fun toolSessionClose(
+    fun outletSessionClose(
         contextHandle: Long,
         sessionId: String,
     )
@@ -1248,7 +1248,7 @@ interface InfraBindings {
  * `./scripts/generate-uniffi-kotlin.sh` (requires compiled Rust cdylib).
  *
  * Split into domain sub-interfaces ([IdentityBindings], [ContextBindings],
- * [ToolBindings], [UcanBindings], [InfraBindings]) for modularity.
+ * [OutletBindings], [UcanBindings], [InfraBindings]) for modularity.
  */
 interface NativeBindings :
     IdentityBindings,
@@ -1256,7 +1256,7 @@ interface NativeBindings :
     MembershipBindings,
     GovernanceBindings,
     BroadcastBindings,
-    ToolBindings,
+    OutletBindings,
     UcanBindings,
     InfraBindings
 
@@ -1339,8 +1339,8 @@ class CoroutineBridge(
     /** Context operations — FFI on IO, streaming via callbackFlow. */
     val context = ContextBridge(nativeBindings, this)
 
-    /** Tool operations — FFI on IO. */
-    val tools = ToolBridge(nativeBindings, this)
+    /** Outlet operations — FFI on IO. */
+    val outlets = OutletBridge(nativeBindings, this)
 
     /** UCAN operations — FFI on IO. */
     val ucan = UcanBridge(nativeBindings, this)
@@ -1735,49 +1735,49 @@ class ContextBridge internal constructor(
 }
 
 /**
- * Tool operations bridge. Wraps tool-related FFI calls as suspend functions.
+ * Outlet operations bridge. Wraps outlet-related FFI calls as suspend functions.
  */
-class ToolBridge internal constructor(
-    private val bindings: ToolBindings,
+class OutletBridge internal constructor(
+    private val bindings: OutletBindings,
     private val bridge: CoroutineBridge,
 ) {
     /**
-     * Register a tool in a context.
+     * Register a outlet in a context.
      *
      * @param contextHandle Handle from context create or join.
-     * @param definitionJson JSON-encoded tool definition.
-     * @return The assigned tool ID.
+     * @param definitionJson JSON-encoded outlet definition.
+     * @return The assigned outlet ID.
      */
     suspend fun register(
         contextHandle: Long,
         definitionJson: String,
-    ): String = bridge.ffiCall { bindings.toolRegister(contextHandle, definitionJson) }
+    ): String = bridge.ffiCall { bindings.outletRegister(contextHandle, definitionJson) }
 
     /**
-     * Invoke a registered tool in a context.
+     * Invoke a registered outlet in a context.
      *
-     * Tool invocation flows through the runtime's full economy
-     * pipeline (`ContextManager::invoke_tool_with_economy`):
+     * Outlet invocation flows through the runtime's full economy
+     * pipeline (`ContextManager::invoke_outlet_with_economy`):
      * per-invocation pricing, per-DID velocity tracking, escalation,
      * budget enforcement, payment escrow, and the Matrix-style hard
      * rate limit are all enforced inside the runtime. See PR #1606 / C4.
      *
      * @param contextHandle Handle from context create or join.
-     * @param toolId The tool's assigned ID.
-     * @param inputJson JSON-encoded tool input.
+     * @param outletId The outlet's assigned ID.
+     * @param inputJson JSON-encoded outlet input.
      * @param identityHandle Handle for the invoker's identity.
      * @param ucanToken Optional UCAN token authorizing the invocation.
      * @param proofTokens Optional parent UCAN tokens for delegation chain.
      * @param spendingUcan Optional JWT-encoded `SpendingCapability` UCAN
-     *   for paid tool invocations under spec section 19.5
+     *   for paid outlet invocations under spec section 19.5
      *   (AND-composition with the action UCAN). May be `null` for free
-     *   tools.
-     * @return JSON-encoded tool output.
+     *   outlets.
+     * @return JSON-encoded outlet output.
      */
     @Suppress("LongParameterList") // FFI bridge — must match UniFFI export signature
     suspend fun invoke(
         contextHandle: Long,
-        toolId: String,
+        outletId: String,
         inputJson: String,
         identityHandle: Long,
         ucanToken: String?,
@@ -1785,9 +1785,9 @@ class ToolBridge internal constructor(
         spendingUcan: String? = null,
     ): String =
         bridge.ffiCall {
-            bindings.toolInvoke(
+            bindings.outletInvoke(
                 contextHandle,
-                toolId,
+                outletId,
                 inputJson,
                 identityHandle,
                 ucanToken,
@@ -1797,53 +1797,53 @@ class ToolBridge internal constructor(
         }
 
     /**
-     * Verify a tool's registration status in a context.
+     * Verify a outlet's registration status in a context.
      *
      * @param contextHandle Handle from context create or join.
-     * @param toolId The tool's ID.
+     * @param outletId The outlet's ID.
      * @return JSON-encoded verification result.
      */
     suspend fun verify(
         contextHandle: Long,
-        toolId: String,
-    ): String = bridge.ffiCall { bindings.toolVerify(contextHandle, toolId) }
+        outletId: String,
+    ): String = bridge.ffiCall { bindings.outletVerify(contextHandle, outletId) }
 
     /**
-     * Expose a tool interface for cross-context sharing (§6.2.0.1 step 1).
+     * Expose a outlet interface for cross-context sharing (§6.2.0.1 step 1).
      *
      * @param contextHandle Handle for the source context.
-     * @param toolId The ID of the tool to expose.
-     * @param targetContextId The target context to expose the tool to.
+     * @param outletId The ID of the outlet to expose.
+     * @param targetContextId The target context to expose the outlet to.
      * @param rateLimitJson Optional per-interface rate limit as JSON.
-     * @return JSON-encoded ToolInterface.
+     * @return JSON-encoded OutletInterface.
      */
     suspend fun interfaceExpose(
         contextHandle: Long,
-        toolId: String,
+        outletId: String,
         targetContextId: String,
         rateLimitJson: String? = null,
     ): String =
         bridge.ffiCall {
-            bindings.toolInterfaceExpose(contextHandle, toolId, targetContextId, rateLimitJson)
+            bindings.outletInterfaceExpose(contextHandle, outletId, targetContextId, rateLimitJson)
         }
 
     /**
-     * Accept a cross-context tool interface (§6.2.0.1 step 4).
+     * Accept a cross-context outlet interface (§6.2.0.1 step 4).
      *
      * @param contextHandle Handle for the target context.
-     * @param interfaceJson The ToolInterface JSON string to accept.
-     * @return JSON-encoded updated ToolInterface.
+     * @param interfaceJson The OutletInterface JSON string to accept.
+     * @return JSON-encoded updated OutletInterface.
      */
     suspend fun interfaceAccept(
         contextHandle: Long,
         interfaceJson: String,
     ): String =
         bridge.ffiCall {
-            bindings.toolInterfaceAccept(contextHandle, interfaceJson)
+            bindings.outletInterfaceAccept(contextHandle, interfaceJson)
         }
 
     /**
-     * Revoke a cross-context tool interface (§6.2.0.1 step 5).
+     * Revoke a cross-context outlet interface (§6.2.0.1 step 5).
      *
      * @param contextHandle Handle for the revoking context.
      * @param interfaceIdHex The 32-byte interface/offer ID as hex.
@@ -1854,28 +1854,28 @@ class ToolBridge internal constructor(
         interfaceIdHex: String,
     ): String =
         bridge.ffiCall {
-            bindings.toolInterfaceRevoke(contextHandle, interfaceIdHex)
+            bindings.outletInterfaceRevoke(contextHandle, interfaceIdHex)
         }
 
     /**
-     * Invoke a tool across context boundaries (spec section 6.2).
+     * Invoke a outlet across context boundaries (spec section 6.2).
      *
      * @param sourceContextHandle Handle for the calling (source) context.
-     * @param targetContextHandle Handle for the context containing the tool.
-     * @param toolId The tool's assigned ID.
-     * @param inputJson JSON-encoded tool input.
+     * @param targetContextHandle Handle for the context containing the outlet.
+     * @param outletId The outlet's assigned ID.
+     * @param inputJson JSON-encoded outlet input.
      * @param identityHandle Handle for the invoker's identity.
      * @param ucanToken JWT-encoded UCAN token authorizing the invocation.
      * @param chainDepth Current cross-context chain depth (0 for first hop).
      *   Context-configurable max (default 8), range 0-255 (ADR-043, spec §24.4).
      * @param proofTokens Optional parent UCAN tokens for delegation chain.
-     * @return JSON-encoded tool output.
+     * @return JSON-encoded outlet output.
      */
     @Suppress("LongParameterList") // FFI bridge — must match UniFFI export signature
     suspend fun invokeCrossContext(
         sourceContextHandle: Long,
         targetContextHandle: Long,
-        toolId: String,
+        outletId: String,
         inputJson: String,
         identityHandle: Long,
         ucanToken: String,
@@ -1883,10 +1883,10 @@ class ToolBridge internal constructor(
         proofTokens: List<String>? = null,
     ): String =
         bridge.ffiCall {
-            bindings.toolInvokeCrossContext(
+            bindings.outletInvokeCrossContext(
                 sourceContextHandle,
                 targetContextHandle,
-                toolId,
+                outletId,
                 inputJson,
                 identityHandle,
                 ucanToken,
@@ -1896,17 +1896,17 @@ class ToolBridge internal constructor(
         }
 
     /**
-     * Run the §6.2.4 atomic cross-context tool-invocation saga (ADR-049 §3a).
+     * Run the §6.2.4 atomic cross-context outlet-invocation saga (ADR-049 §3a).
      *
      * Blocks until the saga reaches a terminal state. On commit returns the
      * JSON-encoded saga result; a non-committed terminal throws a
      * [BridgeException] carrying the typed `SCP-SAGA-13xxx` code.
      *
      * @param sourceContextHandle Handle for the calling (source) context.
-     * @param targetContextHandle Handle for the context holding the tool.
+     * @param targetContextHandle Handle for the context holding the outlet.
      * @param callerDid The invoking principal's DID.
-     * @param toolRegistrationId The target tool's cross-context registration id.
-     * @param inputJson JSON-encoded tool input.
+     * @param outletRegistrationId The target outlet's cross-context registration id.
+     * @param inputJson JSON-encoded outlet input.
      * @param assertedNonceHex The asserted replay-protection nonce as hex.
      * @param timestampMs The invocation timestamp in milliseconds.
      * @param chainDepth Current cross-context chain depth (0 for first hop),
@@ -1919,7 +1919,7 @@ class ToolBridge internal constructor(
         sourceContextHandle: Long,
         targetContextHandle: Long,
         callerDid: String,
-        toolRegistrationId: String,
+        outletRegistrationId: String,
         inputJson: String,
         assertedNonceHex: String,
         timestampMs: Long,
@@ -1927,11 +1927,11 @@ class ToolBridge internal constructor(
         ucanProofId: String? = null,
     ): String =
         bridge.ffiCall {
-            bindings.toolInvokeCrossContextSaga(
+            bindings.outletInvokeCrossContextSaga(
                 sourceContextHandle,
                 targetContextHandle,
                 callerDid,
-                toolRegistrationId,
+                outletRegistrationId,
                 inputJson,
                 assertedNonceHex,
                 timestampMs,
@@ -1941,34 +1941,34 @@ class ToolBridge internal constructor(
         }
 
     /**
-     * Create a stateful tool session (spec section 6.2.1).
+     * Create a stateful outlet session (spec section 6.2.1).
      *
-     * @param contextHandle Handle for the context containing the tool.
-     * @param toolId The tool to create a session for.
+     * @param contextHandle Handle for the context containing the outlet.
+     * @param outletId The outlet to create a session for.
      * @param sourceContextId The calling context ID (session cap tracked per caller).
      * @param ttlSeconds Optional time-to-live in seconds, or null for context-lifetime.
      * @return The session ID (UUID string).
      */
     suspend fun sessionCreate(
         contextHandle: Long,
-        toolId: String,
+        outletId: String,
         sourceContextId: String,
         ttlSeconds: Long? = null,
     ): String =
         bridge.ffiCall {
-            bindings.toolSessionCreate(contextHandle, toolId, sourceContextId, ttlSeconds)
+            bindings.outletSessionCreate(contextHandle, outletId, sourceContextId, ttlSeconds)
         }
 
     /**
-     * Invoke a tool within an active session.
+     * Invoke a outlet within an active session.
      *
      * @param contextHandle Handle for the context containing the session.
      * @param sessionId The session ID from [sessionCreate].
-     * @param inputJson JSON-encoded tool input.
+     * @param inputJson JSON-encoded outlet input.
      * @param identityHandle Handle for the invoker's identity.
      * @param ucanToken JWT-encoded UCAN token authorizing the invocation.
      * @param proofTokens Optional parent UCAN tokens for delegation chain.
-     * @return JSON-encoded tool output.
+     * @return JSON-encoded outlet output.
      */
     @Suppress("LongParameterList") // FFI bridge — must match UniFFI export signature
     suspend fun sessionInvoke(
@@ -1980,7 +1980,7 @@ class ToolBridge internal constructor(
         proofTokens: List<String>? = null,
     ): String =
         bridge.ffiCall {
-            bindings.toolSessionInvoke(
+            bindings.outletSessionInvoke(
                 contextHandle,
                 sessionId,
                 inputJson,
@@ -1991,7 +1991,7 @@ class ToolBridge internal constructor(
         }
 
     /**
-     * Close a stateful tool session.
+     * Close a stateful outlet session.
      *
      * @param contextHandle Handle for the context containing the session.
      * @param sessionId The session ID to close.
@@ -2001,7 +2001,7 @@ class ToolBridge internal constructor(
         sessionId: String,
     ): Unit =
         bridge.ffiCall {
-            bindings.toolSessionClose(contextHandle, sessionId)
+            bindings.outletSessionClose(contextHandle, sessionId)
         }
 }
 

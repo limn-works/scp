@@ -7,7 +7,7 @@
  * the flat `Bridge` interface was deleted from the SDK surface. The
  * previous integration suite exercised an in-memory mock `Bridge`
  * implementation that simulated the whole protocol state machine
- * (member join events, tool handlers, UCAN revocation, broadcast
+ * (member join events, outlet handlers, UCAN revocation, broadcast
  * subscribers, etc.). Those assertions tested the mock, not the SDK.
  *
  * What this file now covers, in three layers:
@@ -22,7 +22,7 @@
  *    `./mock-bridge`.
  * 3. **Real NAPI integration** — the SDK `SCP` class exercised
  *    end-to-end against the native NAPI addon and an in-process relay.
- *    Restores the Identity / Context / UCAN / Tool / Broadcast /
+ *    Restores the Identity / Context / UCAN / Outlet / Broadcast /
  *    Governance / Event-log / TTL / Storage / Error-path coverage the
  *    pre-ADR-048 mock-bridge suite owned, against the real stack so
  *    the assertions test protocol behavior rather than a simulator.
@@ -179,7 +179,7 @@ describe("ConsequenceRule wire-format encoding (encodeConsequenceRules)", () => 
             kind: "SuspendCapability",
             capabilities: [
               "MessagesWrite",
-              { kind: "ToolInvoke", toolId: "calculator" },
+              { kind: "ToolInvoke", outletId: "calculator" },
               { kind: "Custom", name: "my-custom-cap" },
             ],
           },
@@ -217,7 +217,7 @@ describe("ConsequenceRule wire-format encoding (encodeConsequenceRules)", () => 
     }>;
     expect(decoded).toHaveLength(3);
 
-    // Rule 0: MessageVelocity / Enforcement(SuspendCapability { ToolInvoke + Custom + unit })
+    // Rule 0: MessageVelocity / Enforcement(SuspendCapability { OutletInvoke + Custom + unit })
     expect(decoded[0]?.trigger).toBe("MessageVelocity");
     expect(decoded[0]?.threshold).toBe(5);
     expect(decoded[0]?.window).toEqual({ secs: 3600, nanos: 0 });
@@ -670,7 +670,7 @@ describe("createMockNativeScp / mountMockScp (harness contract)", () => {
 // What follows drives the SDK's caller-owned `SCP` class against the
 // real NAPI bridge with an in-process relay transport. The goal is the
 // same coverage the pre-ADR-048 mock-bridge suite owned — Identity,
-// Context, UCAN, Tool, Broadcast, Governance, Event log, TTL, Storage,
+// Context, UCAN, Outlet, Broadcast, Governance, Event log, TTL, Storage,
 // Error paths — but routed through the real MLS / UCAN / governance
 // pipeline so the assertions test protocol behavior rather than a
 // simulator.
@@ -1273,15 +1273,15 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
   });
 
   // -------------------------------------------------------------------
-  // 5.4 Tool lifecycle — register, invoke (with UCAN), verify, sessions
+  // 5.4 Outlet lifecycle — register, invoke (with UCAN), verify, sessions
   //
-  // Exercises the real ContextManager tool-execution path with MLS +
-  // UCAN capability enforcement. Distinct from `tools.test.ts` which
-  // focuses on the `defineToolDefinition` helper shape.
+  // Exercises the real ContextManager outlet-execution path with MLS +
+  // UCAN capability enforcement. Distinct from `outlets.test.ts` which
+  // focuses on the `defineOutletDefinition` helper shape.
   // -------------------------------------------------------------------
 
-  describe("Tool lifecycle (real NAPI)", () => {
-    // scp.toolRegister passes the definition verbatim to the native
+  describe("Outlet lifecycle (real NAPI)", () => {
+    // scp.outletRegister passes the definition verbatim to the native
     // bridge — which expects the NAPI field names (`inputSchemaJson`,
     // `outputSchemaJson`, `operatorDid`) rather than the SDK-facing
     // camelCase (`inputSchema`, `outputSchema`, `operator`). The
@@ -1296,7 +1296,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       input?: Record<string, unknown>;
       output?: Record<string, unknown>;
     }): Record<string, unknown> {
-      // The Rust tool-registration layer enforces a schema-specificity
+      // The Rust outlet-registration layer enforces a schema-specificity
       // floor (§6.2, §9.2.1): AT LEAST ONE of the input/output schemas
       // must declare ≥ 2 distinct property fields. Using a 2-field input
       // with a permissive output mirrors `real-napi.test.ts` — the
@@ -1317,10 +1317,13 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       };
     }
 
-    it("scp.toolRegister returns a tool ID", async () => {
+    it("scp.outletRegister returns a outlet ID", async () => {
       const identity = await scp.identityCreate("in_memory");
-      const ctx = await scp.contextCreate(identity, JSON.stringify({ ceiling: ["tool:register"] }));
-      const toolId = await scp.toolRegister(
+      const ctx = await scp.contextCreate(
+        identity,
+        JSON.stringify({ ceiling: ["outlet:register"] }),
+      );
+      const outletId = await scp.outletRegister(
         ctx._rawHandle,
         makeNapiToolDef({
           name: "scp-class-echo",
@@ -1328,28 +1331,28 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
           operator: identity.did,
         }),
       );
-      expect(typeof toolId).toBe("string");
-      expect(toolId.length).toBeGreaterThan(0);
+      expect(typeof outletId).toBe("string");
+      expect(outletId.length).toBeGreaterThan(0);
     });
 
-    it("scp.toolInvoke executes a registered tool with a valid UCAN", async () => {
+    it("scp.outletInvoke executes a registered outlet with a valid UCAN", async () => {
       const admin = await scp.identityCreate("in_memory");
       const member = await scp.identityCreate("in_memory");
       const ctx = await scp.contextCreate(
         admin,
-        JSON.stringify({ ceiling: ["tool:register", "tool:invoke:*"] }),
+        JSON.stringify({ ceiling: ["outlet:register", "tool:invoke:*"] }),
       );
       await scp.contextJoin(ctx._rawHandle, member.did);
-      const toolId = await scp.toolRegister(
+      const outletId = await scp.outletRegister(
         ctx._rawHandle,
         makeNapiToolDef({ name: "scp-class-add", description: "Adds", operator: admin.did }),
       );
       const ucan = (await scp.ucanMint(ctx._rawHandle, member.did, ["tool:invoke:*"])) as {
         encoded: string;
       };
-      const result = await scp.toolInvoke(
+      const result = await scp.outletInvoke(
         ctx._rawHandle,
-        toolId,
+        outletId,
         JSON.stringify({ x: 7, mode: "double" }),
         member.did,
         ucan.encoded,
@@ -1359,14 +1362,14 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       JSON.parse(result);
     });
 
-    it("scp.toolInvoke fails without a UCAN for the matching capability", async () => {
+    it("scp.outletInvoke fails without a UCAN for the matching capability", async () => {
       const admin = await scp.identityCreate("in_memory");
       const outsider = await scp.identityCreate("in_memory");
       const ctx = await scp.contextCreate(
         admin,
-        JSON.stringify({ ceiling: ["tool:register", "tool:invoke:*"] }),
+        JSON.stringify({ ceiling: ["outlet:register", "tool:invoke:*"] }),
       );
-      const toolId = await scp.toolRegister(
+      const outletId = await scp.outletRegister(
         ctx._rawHandle,
         makeNapiToolDef({
           name: "scp-class-denied",
@@ -1375,21 +1378,24 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
         }),
       );
       await expect(
-        scp.toolInvoke(ctx._rawHandle, toolId, "{}", outsider.did, ""),
+        scp.outletInvoke(ctx._rawHandle, outletId, "{}", outsider.did, ""),
       ).rejects.toThrow();
     });
 
-    it("scp.toolVerify returns a verification summary", async () => {
+    it("scp.outletVerify returns a verification summary", async () => {
       const identity = await scp.identityCreate("in_memory");
-      const ctx = await scp.contextCreate(identity, JSON.stringify({ ceiling: ["tool:register"] }));
-      const toolId = await scp.toolRegister(
+      const ctx = await scp.contextCreate(
+        identity,
+        JSON.stringify({ ceiling: ["outlet:register"] }),
+      );
+      const outletId = await scp.outletRegister(
         ctx._rawHandle,
         makeNapiToolDef({
           name: "scp-class-verify-me",
           description: "Verifiable",
           operator: identity.did,
           // 2-field input keeps us over the specificity floor; the
-          // output stays permissive so toolVerify's default payload
+          // output stays permissive so outletVerify's default payload
           // is accepted without a closed schema.
           input: {
             type: "object",
@@ -1398,7 +1404,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
           },
         }),
       );
-      const verification = (await scp.toolVerify(ctx._rawHandle, toolId)) as {
+      const verification = (await scp.outletVerify(ctx._rawHandle, outletId)) as {
         passed: boolean;
         failures: unknown[];
       };

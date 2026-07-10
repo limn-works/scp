@@ -1,14 +1,14 @@
 /**
- * Tool invocation: register a tool with test vectors and invoke it.
+ * Outlet invocation: register a outlet with test vectors and invoke it.
  *
- * Demonstrates the ToolDefinition data class, tool registration via the
- * CoroutineBridge, and tool invocation. Uses the actual Kotlin SDK API surface.
+ * Demonstrates the OutletDefinition data class, outlet registration via the
+ * CoroutineBridge, and outlet invocation. Uses the actual Kotlin SDK API surface.
  *
  * Prerequisites:
  *   implementation("works.limn:scp-kt:0.1.0")
  *
  * Usage:
- *   ./gradlew run --args="tool-invocation"
+ *   ./gradlew run --args="outlet-invocation"
  */
 
 package works.limn.scp.examples
@@ -18,15 +18,15 @@ import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.putJsonArray
 import works.limn.scp.CustodyType
-import works.limn.scp.ToolDefinition
+import works.limn.scp.OutletDefinition
 import works.limn.scp.bridge.CoroutineBridge
 
-fun toolInvocationExample(bridge: CoroutineBridge) = runBlocking {
+fun outletInvocationExample(bridge: CoroutineBridge) = runBlocking {
     val operatorHandle = bridge.identity.create(CustodyType.IN_MEMORY)
     println("Operator handle: $operatorHandle")
 
-    // Define a weather tool using the typed ToolDefinition data class
-    val weatherTool = ToolDefinition(
+    // Define a weather outlet using the typed OutletDefinition data class
+    val weatherOutlet = OutletDefinition(
         name = "weather",
         description = "Get current weather for a city",
         inputSchemaJson = """{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}""",
@@ -35,7 +35,7 @@ fun toolInvocationExample(bridge: CoroutineBridge) = runBlocking {
         testVectorsJson = """[{"input":{"city":"Berlin"},"expected":{"tempC":18,"condition":"cloudy"}}]""",
     )
 
-    // Create a context with tool capabilities
+    // Create a context with outlet capabilities
     val paramsJson = buildJsonObject {
         putJsonArray("ceiling") {
             add(JsonPrimitive("messages:read"))
@@ -48,14 +48,14 @@ fun toolInvocationExample(bridge: CoroutineBridge) = runBlocking {
     val contextHandle = bridge.context.create(operatorHandle, paramsJson)
     println("Context handle: $contextHandle")
 
-    // Register the tool via the bridge (toJson() serializes the ToolDefinition)
-    val toolId = bridge.tools.register(contextHandle, weatherTool.toJson())
-    println("Registered tool: $toolId")
+    // Register the outlet via the bridge (toJson() serializes the OutletDefinition)
+    val outletId = bridge.outlets.register(contextHandle, weatherOutlet.toJson())
+    println("Registered outlet: $outletId")
 
-    // Invoke the tool via the bridge
-    val resultJson = bridge.tools.invoke(
+    // Invoke the outlet via the bridge
+    val resultJson = bridge.outlets.invoke(
         contextHandle,
-        toolId,
+        outletId,
         """{"city":"Berlin"}""",
         operatorHandle,
         null,

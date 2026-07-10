@@ -1,9 +1,9 @@
 /**
- * Tool invocation demo.
+ * Outlet invocation demo.
  *
  * Starts an in-memory relay via the caller-owned `SCP`, creates an
- * identity, creates a context with tool capabilities, registers a tool
- * with test vectors, mints a UCAN token, invokes the tool with
+ * identity, creates a context with outlet capabilities, registers a outlet
+ * with test vectors, mints a UCAN token, invokes the outlet with
  * authorization, and reports the result.
  *
  * Post-Phase-4 (ADR-048): all bridge operations route through an
@@ -11,10 +11,10 @@
  * `Relay.startInMemory()` factory were removed — use
  * `scp.relayStartInMemory()` and `scp.ucanMint(...)`.
  *
- * Run: bun run examples/tool-invocation.ts
+ * Run: bun run examples/outlet-invocation.ts
  */
 
-import { SCP, type ToolDefinition, type UcanToken, defineToolDefinition } from "../src/index";
+import { SCP, type OutletDefinition, type UcanToken, defineOutletDefinition } from "../src/index";
 
 async function main(): Promise<void> {
   const scp = new SCP({ storage: { type: "in_memory" } });
@@ -31,8 +31,8 @@ async function main(): Promise<void> {
     // 3. Wire the bridge's transport to the relay.
     await scp.configureRelayTransport(relay.relayUrl, identity.did);
 
-    // 4. Define a tool with test vectors.
-    const weatherTool: ToolDefinition = defineToolDefinition({
+    // 4. Define a outlet with test vectors.
+    const weatherOutlet: OutletDefinition = defineOutletDefinition({
       name: "weather",
       description: "Get current weather for a city",
       inputSchema: {
@@ -57,7 +57,7 @@ async function main(): Promise<void> {
       ],
     });
 
-    // 5. Create a context with tool capabilities.
+    // 5. Create a context with outlet capabilities.
     const ctx = await scp.contextCreate(
       identity,
       JSON.stringify({
@@ -68,17 +68,17 @@ async function main(): Promise<void> {
     );
     console.log(`Context created: ${ctx.contextId}`);
 
-    // 6. Register the tool.
-    const toolId = await scp.toolRegister(ctx._rawHandle, weatherTool);
-    console.log(`Registered tool: ${toolId}`);
+    // 6. Register the outlet.
+    const outletId = await scp.outletRegister(ctx._rawHandle, weatherOutlet);
+    console.log(`Registered outlet: ${outletId}`);
 
-    // 7. Mint a UCAN token for tool invocation.
+    // 7. Mint a UCAN token for outlet invocation.
     const ucan = (await scp.ucanMint(ctx._rawHandle, identity.did, ["tool_invoke:*"])) as UcanToken;
     console.log(`UCAN minted: ${ucan.id}`);
 
-    // 8. Invoke the tool with the UCAN token.
+    // 8. Invoke the outlet with the UCAN token.
     try {
-      const result = await scp.toolInvoke(
+      const result = await scp.outletInvoke(
         ctx._rawHandle,
         "weather",
         JSON.stringify({ city: "Berlin" }),
@@ -87,7 +87,7 @@ async function main(): Promise<void> {
       );
       console.log("Weather result:", result);
     } catch (err) {
-      console.log("Tool invocation result:", err);
+      console.log("Outlet invocation result:", err);
     }
 
     // 9. Cleanup.
