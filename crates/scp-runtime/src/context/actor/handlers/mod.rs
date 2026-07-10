@@ -44,6 +44,6 @@ pub mod messaging;
 pub mod queries;
 pub mod saga;
 pub mod standing;
-pub mod tools;
+pub mod outlets;
 pub mod trust_recovery;
 pub mod ttl_close;

@@ -37,9 +37,9 @@ use scp_protocol::context::membership::{
     ContextEvent, MembershipState, ReceiveBuffer, RedactedBytes,
 };
 use scp_protocol::context::params::GovernanceModel;
-use scp_protocol::context::params::ToolRegistration;
+use scp_protocol::context::params::OutletRegistration;
 use scp_protocol::context::roles::{Capability, ContextRoleState};
-use scp_protocol::context::tools::interface::ToolInterface;
+use scp_protocol::context::outlets::interface::OutletInterface;
 use scp_protocol::context::{ContextError, ContextParams, ContextState};
 use scp_protocol::economy::budget::MemberBudgetTracker;
 use scp_protocol::economy::types::EconomicPolicy;
@@ -700,7 +700,7 @@ pub struct ContextSnapshot {
     pub ttl_remaining_secs: Option<u64>,
     /// Dynamically registered tools (beyond initial `ContextParams.tools`).
     #[serde(default)]
-    pub registered_tools: Vec<ToolRegistration>,
+    pub registered_outlets: Vec<OutletRegistration>,
     /// Members excluded from future CEK wrapping (`Revoke { access: AccessScope::Write }`).
     /// These members won't receive new content keys but retain access to
     /// historical content encrypted before the revocation (ADR-038, §9.17).
@@ -711,7 +711,7 @@ pub struct ContextSnapshot {
     pub read_exclusion_list: HashSet<DID>,
     /// Established cross-context tool interfaces (§6.2).
     #[serde(default)]
-    pub tool_interfaces: Vec<ToolInterface>,
+    pub outlet_interfaces: Vec<OutletInterface>,
     /// Governance threshold signers (for `ThresholdApproval` model).
     #[serde(default)]
     pub threshold_signers: Vec<DID>,
@@ -1055,7 +1055,7 @@ pub struct ContextSnapshot {
     /// Unlike `saga_pending` this carries no §9.4.3 non-derive barrier — the
     /// receipt + output are public protocol artifacts (no bearer bytes), so the
     /// snapshot stores the live
-    /// [`CommittedToolInvocation`](crate::context::supervisor::saga_prepared_state::CommittedToolInvocation)
+    /// [`CommittedOutletInvocation`](crate::context::supervisor::saga_prepared_state::CommittedOutletInvocation)
     /// directly. Same local-only coordination semantics: same-node restore
     /// REHYDRATES it; cross-node `import_context` / `strip_snapshot_for_public`
     /// DROP it to empty (a foreign saga must never drive local Commit replay).
@@ -1063,7 +1063,7 @@ pub struct ContextSnapshot {
     #[serde(default)]
     pub xctx_committed_outputs: HashMap<
         crate::context::supervisor::saga_journal::SagaId,
-        crate::context::supervisor::saga_prepared_state::CommittedToolInvocation,
+        crate::context::supervisor::saga_prepared_state::CommittedOutletInvocation,
     >,
 
     /// Caller-side (A-owned) durable set of COMMITTED cross-context tool
@@ -1122,7 +1122,7 @@ pub struct ContextSnapshot {
     ///
     /// **Class S** — synchronously-persisted, fail-closed, mirroring
     /// [`Self::saga_pending`]. This cache is the ONLY gate against a replayed
-    /// `CrossContextToolInvoke` envelope re-submitted under a FRESH `SagaId`
+    /// `CrossContextOutletInvoke` envelope re-submitted under a FRESH `SagaId`
     /// within the 5-minute TTL (the `SagaId` idempotency witnesses and the
     /// `xctx_committed_outputs` short-circuit only catch a SAME-`SagaId` replay).
     /// If it reinitialized empty on restore, an actor crash inside the TTL window
@@ -1238,9 +1238,9 @@ pub(crate) struct GovernanceState {
     /// Pending economic policy change awaiting notification period (§19.3).
     pub(crate) pending_economic_policy_change: Option<PendingEconomicPolicyChange>,
     /// Dynamically registered tools (beyond initial `ContextParams.tools`).
-    pub(crate) registered_tools: Vec<ToolRegistration>,
+    pub(crate) registered_outlets: Vec<OutletRegistration>,
     /// Established cross-context tool interfaces (§6.2).
-    pub(crate) tool_interfaces: Vec<ToolInterface>,
+    pub(crate) outlet_interfaces: Vec<OutletInterface>,
     /// Pruning policy override (ADR-030 §6).
     pub(crate) pruning_policy: Option<PruningPolicy>,
     /// Mutable economic policy (§19.3, ADR-033).
@@ -1596,8 +1596,8 @@ impl GovernanceState {
             deadlock: DeadlockDetectionState::default(),
             pending_ceiling_modification: None,
             pending_economic_policy_change: None,
-            registered_tools: Vec::new(),
-            tool_interfaces: Vec::new(),
+            registered_outlets: Vec::new(),
+            outlet_interfaces: Vec::new(),
             pruning_policy: None,
             economic_policy: None,
             budget_tracker: MemberBudgetTracker::new(),
@@ -1883,8 +1883,8 @@ pub(crate) fn fresh_governance_state(
         deadlock: DeadlockDetectionState::default(),
         pending_ceiling_modification: None,
         pending_economic_policy_change: None,
-        registered_tools: Vec::new(),
-        tool_interfaces: Vec::new(),
+        registered_outlets: Vec::new(),
+        outlet_interfaces: Vec::new(),
         pruning_policy: None,
         message_pricing: crate::context::lifecycle_logic::derive_message_pricing(
             params.economic_policy.as_ref(),

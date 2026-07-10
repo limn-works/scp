@@ -161,18 +161,18 @@ pub(crate) async fn dispatch(
             Outcome::ok(())
         }
 
-        QueriesCommand::HasEstablishedToolInterface {
+        QueriesCommand::HasEstablishedOutletInterface {
             context_id: _,
             source_context_hex,
             target_context_hex,
-            tool_registration_id,
+            outlet_registration_id,
             reply,
         } => {
-            let answer = queries_helpers::has_established_tool_interface(
+            let answer = queries_helpers::has_established_outlet_interface(
                 state,
                 &source_context_hex,
                 &target_context_hex,
-                &tool_registration_id,
+                &outlet_registration_id,
             );
             let _ = reply.send(Ok(answer));
             Outcome::ok(())

@@ -36,13 +36,13 @@ use scp_platform::traits::{KeyCustody, KeyType};
 use scp_protocol::context::roles::{
     Capability, CapabilityCeiling, ContextRoleState, RoleDefinition, RoleError, assign_role,
 };
-use scp_protocol::context::tools::lifecycle::ToolStatus;
-use scp_protocol::context::tools::registry::{
-    ToolRegistration, ToolRegistry, ToolSchema, register_tool,
+use scp_protocol::context::outlets::lifecycle::OutletStatus;
+use scp_protocol::context::outlets::registry::{
+    OutletRegistration, OutletRegistry, OutletSchema, register_outlet,
 };
 use scp_protocol::context::{ContextParams, ContextState, MemoryScope};
 use scp_runtime::context::ContextHandle;
-use scp_runtime::context::tools::invoke::{has_tool_invoke_capability, invoke_tool};
+use scp_runtime::context::outlets::invoke::{has_outlet_invoke_capability, invoke_outlet};
 use scp_runtime::event_log::KeyCustodySigner;
 
 // ---------------------------------------------------------------------------
@@ -258,11 +258,11 @@ async fn phase2_end_to_end_integration() {
                 capabilities: HashSet::from([Capability::MessagesRead]),
             },
         ],
-        tools: vec![ToolRegistration {
-            tool_id: "calculator".to_owned(),
+        tools: vec![OutletRegistration {
+            outlet_id: "calculator".to_owned(),
             name: "calculator".to_owned(),
             description: "Calculator tool".to_owned(),
-            schema: ToolSchema {
+            schema: OutletSchema {
                 input_schema: serde_json::json!({"type": "object"}),
                 output_schema: serde_json::json!({"type": "object"}),
             },
@@ -299,12 +299,12 @@ async fn phase2_end_to_end_integration() {
     .expect("role state creation");
 
     // Register the calculator tool.
-    let mut tool_registry = ToolRegistry::new();
-    let calc_registration = ToolRegistration {
-        tool_id: "calculator".to_owned(),
+    let mut tool_registry = OutletRegistry::new();
+    let calc_registration = OutletRegistration {
+        outlet_id: "calculator".to_owned(),
         name: "Calculator".to_owned(),
         description: "A simple arithmetic calculator".to_owned(),
-        schema: ToolSchema {
+        schema: OutletSchema {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -327,14 +327,14 @@ async fn phase2_end_to_end_integration() {
         registered_at: 0,
         signature: Vec::new(),
     };
-    let (tool_id, _tool_registered_event) = register_tool(
+    let (outlet_id, _tool_registered_event) = register_outlet(
         &mut tool_registry,
         &role_state,
         calc_registration,
         &alice_did,
     )
     .expect("tool registration");
-    assert_eq!(tool_id, "calculator");
+    assert_eq!(outlet_id, "calculator");
 
     // Initialize event logs for Alice and Bob (they share the same log in this test
     // since both see the same events -- we maintain two copies to verify consistency).
@@ -528,7 +528,7 @@ async fn phase2_end_to_end_integration() {
     // -----------------------------------------------------------------------
 
     // Verify Bob has tool invoke capability.
-    assert!(has_tool_invoke_capability(
+    assert!(has_outlet_invoke_capability(
         &role_state,
         &bob_did,
         "calculator"
@@ -536,7 +536,7 @@ async fn phase2_end_to_end_integration() {
 
     let tool_input = serde_json::json!({"operation": "add", "a": 1, "b": 2});
 
-    let (tool_output, tool_invoked_event, _consequences, _receipt) = invoke_tool(
+    let (tool_output, tool_invoked_event, _consequences, _receipt) = invoke_outlet(
         &context,
         &tool_registry,
         &role_state,
@@ -545,7 +545,7 @@ async fn phase2_end_to_end_integration() {
         &bob_did,
         None,
         calculator_executor,
-        None::<&mut scp_runtime::context::tools::invoke::ToolEconomyContext<'_>>,
+        None::<&mut scp_runtime::context::outlets::invoke::OutletEconomyContext<'_>>,
     )
     .await
     .expect("tool invocation should succeed");
@@ -556,9 +556,9 @@ async fn phase2_end_to_end_integration() {
         serde_json::json!({"result": 3.0}),
         "calculator should return 3 for 1 + 2"
     );
-    assert_eq!(tool_invoked_event.tool_id, "calculator");
+    assert_eq!(tool_invoked_event.outlet_id, "calculator");
     assert_eq!(tool_invoked_event.invoker_did, bob_did);
-    assert_eq!(tool_invoked_event.status, ToolStatus::Success);
+    assert_eq!(tool_invoked_event.status, OutletStatus::Success);
 
     // Log the ToolInvoked event.
     let tool_invoked_log_event = sign_event(

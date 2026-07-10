@@ -20,7 +20,7 @@ use ed25519_dalek::{Signer, Verifier};
 use sha2::{Digest, Sha256};
 
 use scp_did::DID;
-use scp_protocol::context::tools::interface::InterfaceOffer;
+use scp_protocol::context::outlets::interface::InterfaceOffer;
 use scp_protocol::crypto::canonical::{CanonicalField, canonical_hash, canonical_hash_bytes};
 use scp_protocol::crypto::key_continuity::{
     KeyContinuityParty, compute_key_continuity_fingerprint, fingerprint_to_decimal,
@@ -1089,13 +1089,13 @@ fn vector_28_tool_interface_offer_id() {
     println!("=== Vector 28: Tool Interface Offer ID ===");
 
     let source_context = "source-ctx-01";
-    let tool_id = "tool-abc123";
+    let outlet_id = "tool-abc123";
     let target_context = "target-ctx-02";
     let timestamp: u64 = 1_700_000_000;
 
     // Use the actual InterfaceOffer::compute_offer_id implementation.
     let offer_id =
-        InterfaceOffer::compute_offer_id(source_context, tool_id, target_context, timestamp);
+        InterfaceOffer::compute_offer_id(source_context, outlet_id, target_context, timestamp);
     print_vec("Offer ID", &offer_id);
 
     // §25.15 Vector 28: assert exact spec hex value.
@@ -1109,8 +1109,8 @@ fn vector_28_tool_interface_offer_id() {
     buf.extend_from_slice(b"SCP-OFFER-ID-V1:");
     buf.extend_from_slice(&(source_context.len() as u32).to_be_bytes());
     buf.extend_from_slice(source_context.as_bytes());
-    buf.extend_from_slice(&(tool_id.len() as u32).to_be_bytes());
-    buf.extend_from_slice(tool_id.as_bytes());
+    buf.extend_from_slice(&(outlet_id.len() as u32).to_be_bytes());
+    buf.extend_from_slice(outlet_id.as_bytes());
     buf.extend_from_slice(&(target_context.len() as u32).to_be_bytes());
     buf.extend_from_slice(target_context.as_bytes());
     buf.extend_from_slice(&timestamp.to_be_bytes());

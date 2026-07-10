@@ -286,9 +286,9 @@ pub fn snapshot_context(ctx: &PerContextState) -> ContextSnapshot {
             .copied()
             .collect(),
         ttl_remaining_secs,
-        registered_tools: ctx.governance.registered_tools.clone(),
+        registered_outlets: ctx.governance.registered_outlets.clone(),
         read_exclusion_list: ctx.access.read_exclusion_list.clone(),
-        tool_interfaces: ctx.governance.tool_interfaces.clone(),
+        outlet_interfaces: ctx.governance.outlet_interfaces.clone(),
         threshold_signers: ctx.governance.class_s.threshold_signers.clone(),
         threshold_value: ctx.governance.class_s.threshold_value,
         pruning_policy: ctx.governance.pruning_policy.clone(),

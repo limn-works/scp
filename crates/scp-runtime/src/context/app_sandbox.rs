@@ -140,10 +140,10 @@ impl CapabilityEntry {
     #[must_use]
     pub fn to_capabilities(&self) -> Vec<Capability> {
         // Extract the capability category from the resource URI.
-        // Format: scp:ctx:{context_id}/{category} or scp:ctx:{context_id}/tools/{tool_id}
+        // Format: scp:ctx:{context_id}/{category} or scp:ctx:{context_id}/tools/{outlet_id}
         let category = self.resource.rsplit('/').next().unwrap_or(&self.resource);
 
-        // Check if this is a tools/{tool_id} resource
+        // Check if this is a tools/{outlet_id} resource
         let parts: Vec<&str> = self.resource.split('/').collect();
         let is_tool = parts.len() >= 2 && parts[parts.len() - 2] == "tools";
 
@@ -542,20 +542,20 @@ impl ScopedHandle {
         self.check_capability(&Capability::GovernanceVote)
     }
 
-    /// Checks `ToolInvokeAll` or `ToolInvoke(tool_id)` capability.
+    /// Checks `ToolInvokeAll` or `ToolInvoke(outlet_id)` capability.
     ///
     /// # Errors
     ///
     /// Returns `SandboxError::CapabilityDenied` if neither `ToolInvokeAll` nor
-    /// `ToolInvoke(tool_id)` is granted.
-    pub fn check_tool_invoke(&self, tool_id: &str) -> Result<(), SandboxError> {
+    /// `ToolInvoke(outlet_id)` is granted.
+    pub fn check_outlet_invoke(&self, outlet_id: &str) -> Result<(), SandboxError> {
         if self
             .allowed_capabilities
             .contains(&Capability::ToolInvokeAll)
         {
             return Ok(());
         }
-        self.check_capability(&Capability::ToolInvoke(tool_id.to_owned()))
+        self.check_capability(&Capability::ToolInvoke(outlet_id.to_owned()))
     }
 
     /// Checks `ToolRegister` capability.
@@ -563,7 +563,7 @@ impl ScopedHandle {
     /// # Errors
     ///
     /// Returns `SandboxError::CapabilityDenied` if `ToolRegister` is not granted.
-    pub fn check_tool_register(&self) -> Result<(), SandboxError> {
+    pub fn check_outlet_register(&self) -> Result<(), SandboxError> {
         self.check_capability(&Capability::ToolRegister)
     }
 
@@ -666,12 +666,12 @@ impl ScopedHandle {
         self.check_capability(&Capability::MediaScreenShare)
     }
 
-    /// Checks `ToolInterface` capability.
+    /// Checks `OutletInterface` capability.
     ///
     /// # Errors
     ///
-    /// Returns `SandboxError::CapabilityDenied` if `ToolInterface` is not granted.
-    pub fn check_tool_interface(&self) -> Result<(), SandboxError> {
+    /// Returns `SandboxError::CapabilityDenied` if `OutletInterface` is not granted.
+    pub fn check_outlet_interface(&self) -> Result<(), SandboxError> {
         self.check_capability(&Capability::ToolInterface)
     }
 }
@@ -1523,14 +1523,14 @@ mod tests {
     #[test]
     fn scoped_handle_check_tool_invoke_specific_granted() {
         let handle = make_scoped_handle(vec![Capability::ToolInvoke("my_tool".to_owned())]);
-        assert!(handle.check_tool_invoke("my_tool").is_ok());
+        assert!(handle.check_outlet_invoke("my_tool").is_ok());
     }
 
     #[test]
     fn scoped_handle_check_tool_invoke_specific_denied() {
         let handle = make_scoped_handle(vec![Capability::ToolInvoke("my_tool".to_owned())]);
         assert!(matches!(
-            handle.check_tool_invoke("other_tool"),
+            handle.check_outlet_invoke("other_tool"),
             Err(SandboxError::CapabilityDenied { .. })
         ));
     }
@@ -1538,20 +1538,20 @@ mod tests {
     #[test]
     fn scoped_handle_check_tool_invoke_all_covers_specific() {
         let handle = make_scoped_handle(vec![Capability::ToolInvokeAll]);
-        assert!(handle.check_tool_invoke("any_tool").is_ok());
+        assert!(handle.check_outlet_invoke("any_tool").is_ok());
     }
 
     #[test]
     fn scoped_handle_check_tool_register_granted() {
         let handle = make_scoped_handle(vec![Capability::ToolRegister]);
-        assert!(handle.check_tool_register().is_ok());
+        assert!(handle.check_outlet_register().is_ok());
     }
 
     #[test]
     fn scoped_handle_check_tool_register_denied() {
         let handle = make_scoped_handle(vec![]);
         assert!(matches!(
-            handle.check_tool_register(),
+            handle.check_outlet_register(),
             Err(SandboxError::CapabilityDenied { .. })
         ));
     }
@@ -1652,7 +1652,7 @@ mod tests {
     #[test]
     fn scoped_handle_check_tool_interface_granted() {
         let handle = make_scoped_handle(vec![Capability::ToolInterface]);
-        assert!(handle.check_tool_interface().is_ok());
+        assert!(handle.check_outlet_interface().is_ok());
     }
 
     // -----------------------------------------------------------------------
@@ -1670,8 +1670,8 @@ mod tests {
         assert!(handle.check_send_message().is_err());
         assert!(handle.check_propose_governance_action().is_err());
         assert!(handle.check_governance_vote().is_err());
-        assert!(handle.check_tool_invoke("any").is_err());
-        assert!(handle.check_tool_register().is_err());
+        assert!(handle.check_outlet_invoke("any").is_err());
+        assert!(handle.check_outlet_register().is_err());
         assert!(handle.check_member_invite().is_err());
         assert!(handle.check_member_remove().is_err());
         assert!(handle.check_role_assign().is_err());
@@ -1683,7 +1683,7 @@ mod tests {
         assert!(handle.check_media_voice().is_err());
         assert!(handle.check_media_video().is_err());
         assert!(handle.check_media_screen_share().is_err());
-        assert!(handle.check_tool_interface().is_err());
+        assert!(handle.check_outlet_interface().is_err());
     }
 
     #[test]
@@ -2415,7 +2415,7 @@ mod tests {
         assert!(handle.check_read_messages().is_ok());
         assert!(handle.check_send_message().is_ok());
         assert!(handle.check_propose_governance_action().is_ok());
-        assert!(handle.check_tool_invoke("any_tool").is_ok());
+        assert!(handle.check_outlet_invoke("any_tool").is_ok());
         assert!(handle.check_member_invite().is_ok());
         // Not granted:
         assert!(handle.check_context_close().is_err());

@@ -57,12 +57,12 @@ pub(crate) mod queries_helpers;
 pub(crate) mod standing_helpers;
 pub mod state;
 pub mod supervisor;
-pub(crate) mod tools_helpers;
+pub(crate) mod outlets_helpers;
 pub(crate) mod trust_recovery_helpers;
 pub mod ttl;
 pub(crate) mod ttl_close_helpers;
 
-pub mod tools;
+pub mod outlets;
 
 use std::sync::Arc;
 

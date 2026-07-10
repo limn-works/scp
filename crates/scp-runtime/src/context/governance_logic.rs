@@ -1014,7 +1014,7 @@ mod convergence_tests {
     }
 
     #[tokio::test]
-    async fn tool_rate_triggered_consequence_adds_no_durable_leaf() {
+    async fn outlet_rate_triggered_consequence_adds_no_durable_leaf() {
         // The second non-convergent trigger — same posture as MessageVelocity.
         let (root_changed, _) = run_one(ConsequenceTrigger::ToolRateExceeded).await;
         assert!(

@@ -145,7 +145,7 @@ impl ContextActorHandle {
 
     /// Like [`Self::send`], but RECOVERS the un-delivered command when the
     /// mailbox send itself fails, so a caller that moved an unbalanced,
-    /// must-consume payload (e.g. a `ToolEconomyTicket`-bearing reservation)
+    /// must-consume payload (e.g. a `OutletEconomyTicket`-bearing reservation)
     /// into the command can reclaim and balance it instead of dropping it.
     ///
     /// [`Self::send`] builds the command, then on a full/closed mailbox drops
@@ -374,7 +374,7 @@ mod tests {
     async fn send_recover_on_failure_returns_command_on_closed_mailbox() {
         // FIX 1 core: a send to a closed mailbox RETURNS the un-delivered
         // command instead of dropping it, so a caller that moved a must-use
-        // payload (a ToolEconomyTicket-bearing reservation) into the command can
+        // payload (a OutletEconomyTicket-bearing reservation) into the command can
         // reclaim and balance it rather than tripping the ticket's drop guard.
         let (tx, rx) = mpsc::channel::<ContextCommand>(1);
         drop(rx);

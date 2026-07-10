@@ -8,31 +8,31 @@
 //! this module implements every phase handler, each running on a LOCAL actor.
 //! All phases are fully implemented AND supervisor-driven (the FSM in
 //! `supervisor/supervisor.rs` drives them end-to-end via
-//! [`Supervisor::start_cross_context_tool_invocation_saga`](crate::context::supervisor::supervisor::Supervisor::start_cross_context_tool_invocation_saga)).
+//! [`Supervisor::start_cross_context_outlet_invocation_saga`](crate::context::supervisor::supervisor::Supervisor::start_cross_context_outlet_invocation_saga)).
 //!
 //! - **Prepare-A** ([`prepare_a`]) — on the caller-context actor. Validates the
 //!   caller holds `tool:interface` and is in `OutboundPolicy.allowed_callers`,
 //!   stages (not applies) the outbound rate-limit decrement + escrow
 //!   reservation via the existing
-//!   [`reserve_tool_economy`](crate::context::tools_helpers::reserve_tool_economy)
+//!   [`reserve_outlet_economy`](crate::context::outlets_helpers::reserve_outlet_economy)
 //!   mechanism, Class-S sync-persists fail-closed, and replies the `Send`
 //!   reservation handles for the FSM to hold (RAII release on abort).
 //!
 //! - **Prepare-B** ([`prepare_b`]) — on the target-context actor. In order:
 //!   (1) resolves `ucan_proof_id` from B's own UCAN store and re-runs the full
-//!   §7 validation RE-BOUND to the carried `caller_did` + `tool_registration_id`
+//!   §7 validation RE-BOUND to the carried `caller_did` + `outlet_registration_id`
 //!   (the confused-deputy defense), (2) inbound policy, (3) input
 //!   schema-specificity floor (§9.2.1), (4) target-context binding, (5)
 //!   freshness (§9.14 skew + B's nonce-dedup cache), (6) chain-depth. Then it
 //!   captures B-controlled provenance (`recorded_timestamp_ms` = B's clock,
 //!   `recorded_nonce` = staged copy, `recorded_chain_depth` = incoming + 1),
 //!   stages the eight-field
-//!   [`CrossContextToolInvocationPrepared`] into `saga_pending`, and Class-S
+//!   [`CrossContextOutletInvocationPrepared`] into `saga_pending`, and Class-S
 //!   sync-persists fail-closed before replying.
 //!
 //! - **Commit** — split into [`commit_b_reserve`] → (supervisor-side execute) →
 //!   [`commit_b_settle`] (B records `ToolInvoked`, signs the
-//!   [`CrossContextToolReceipt`], durably captures the output keyed by `SagaId`
+//!   [`CrossContextOutletReceipt`], durably captures the output keyed by `SagaId`
 //!   for replay) and [`commit_a`] (A re-acks from the durable
 //!   `xctx_committed_invocations` witness, settles escrow, records
 //!   `CrossContextToolInvoked`), with [`commit_a_check_witness`] serving the
@@ -57,9 +57,9 @@ use scp_protocol::context::ContextError;
 use scp_protocol::crypto::ucan::UcanToken;
 use scp_protocol::crypto::ucan::validate::{DEFAULT_CLOCK_SKEW_TOLERANCE_SECS, ValidationContext};
 
-use scp_protocol::context::tools::cross_context_saga::{
+use scp_protocol::context::outlets::cross_context_saga::{
     CommittedSide, CrossContextDivergenceMarker, CrossContextDivergenceMarkerFields,
-    CrossContextToolReceipt, CrossContextToolReceiptFields,
+    CrossContextOutletReceipt, CrossContextOutletReceiptFields,
 };
 
 use crate::context::actor::commands::{
@@ -76,9 +76,9 @@ use crate::context::messaging_helpers::{
 };
 use crate::context::supervisor::saga_journal::SagaId;
 use crate::context::supervisor::saga_prepared_state::{
-    CommittedToolInvocation, CrossContextToolInvocationPrepared, SagaPreparedState,
+    CommittedOutletInvocation, CrossContextOutletInvocationPrepared, SagaPreparedState,
 };
-use crate::context::tools_helpers::reserve_tool_economy;
+use crate::context::outlets_helpers::reserve_outlet_economy;
 
 /// Eviction TTL for B's per-target cross-context-saga nonce-dedup cache
 /// ([`PerContextState::xctx_nonce_dedup`]).
@@ -206,7 +206,7 @@ async fn dispatch_prepare_phase(
             saga_id,
             caller_context_id,
             caller_did,
-            tool_registration_id,
+            outlet_registration_id,
             reply,
         } => {
             prepare_a(
@@ -215,7 +215,7 @@ async fn dispatch_prepare_phase(
                 &saga_id,
                 &caller_context_id,
                 &caller_did,
-                &tool_registration_id,
+                &outlet_registration_id,
                 reply,
             )
             .await
@@ -225,7 +225,7 @@ async fn dispatch_prepare_phase(
             caller_context_id,
             target_context_id,
             caller_did,
-            tool_registration_id,
+            outlet_registration_id,
             ucan_proof_id,
             input,
             asserted_chain_depth,
@@ -239,7 +239,7 @@ async fn dispatch_prepare_phase(
                 caller_context_id,
                 target_context_id,
                 caller_did,
-                tool_registration_id,
+                outlet_registration_id,
                 ucan_proof_id,
                 input,
                 asserted_chain_depth,
@@ -403,10 +403,10 @@ fn misrouted<T>(
 /// `OutboundPolicy.allowed_callers`, then stages (does NOT apply) the outbound
 /// rate-limit decrement + escrow reservation via the existing reserve
 /// mechanism. The escrow amount is the tool's REGISTERED per-invocation cost —
-/// [`reserve_tool_economy`] derives it from the caller context's economy policy
+/// [`reserve_outlet_economy`] derives it from the caller context's economy policy
 /// / tool registry via `economy_pre_check`, NEVER from any caller-asserted
 /// value (a caller must not declare its own cheaper cost; spec §6.2.4 / §19.3).
-/// The resulting `Send` [`ToolEconomyReservation`] is a `#[must_use]` RAII
+/// The resulting `Send` [`OutletEconomyReservation`] is a `#[must_use]` RAII
 /// carrier the FSM holds — its drop releases the held escrow/rate-limit on every
 /// terminal non-commit path. The staged saga state is Class-S sync-persisted
 /// fail-closed BEFORE the reply, so a crash in the coalesce window cannot
@@ -417,19 +417,19 @@ async fn prepare_a(
     saga_id: &SagaId,
     caller_context_id: &[u8; 32],
     caller_did: &DID,
-    tool_registration_id: &str,
+    outlet_registration_id: &str,
     reply: tokio::sync::oneshot::Sender<Result<PrepareAOutcome, ContextError>>,
 ) -> Outcome<()> {
     let context_id_hex = hex_context_id(caller_context_id);
 
     // ── PREPARE-A-SEAM (read gate via Deref + step-2 Class-C consume via view) ─
-    // The cell is held so the spending-nonce-bearing `reserve_tool_economy` leaf
+    // The cell is held so the spending-nonce-bearing `reserve_outlet_economy` leaf
     // receives it (it routes its OWN Class-S consume through a combinator). The
     // read-only outbound-caller gate reads through the cell `Deref` (`&*cell`),
     // and the §6.2.0.2 outbound-rate window consume mutates ONLY
-    // `governance.tool_interfaces` (Class-C) through the non-persisting
+    // `governance.outlet_interfaces` (Class-C) through the non-persisting
     // `class_c_view()`. The consume carries NO own persist on the SUCCESS path
-    // (it falls through to the `reserve_tool_economy` / staging combinators,
+    // (it falls through to the `reserve_outlet_economy` / staging combinators,
     // which persist it). On the over-budget REJECT path the window may have
     // partially incremented, so an EXPLICIT `persist_state_best_effort(&*cell)`
     // (a shared `&PerContextState` Deref read) lands the partial increment
@@ -452,7 +452,7 @@ async fn prepare_a(
     // accounting records the reject. The two are intentionally ORTHOGONAL: the
     // reply payload is the saga FSM's typed terminal; `Outcome::err` drives the
     // actor-local accounting and is unrelated to how the FSM lifts the reject.
-    if let Err(rej) = validate_outbound_caller(&*cell, caller_did, tool_registration_id) {
+    if let Err(rej) = validate_outbound_caller(&*cell, caller_did, outlet_registration_id) {
         let sketch = outcome_error_sketch(&rej.error);
         let _ = reply.send(Ok(PrepareAOutcome::Rejected(rej)));
         return Outcome::err(sketch);
@@ -474,7 +474,7 @@ async fn prepare_a(
         cell.class_c_view(),
         deps,
         caller_did,
-        tool_registration_id,
+        outlet_registration_id,
     ) {
         // The §6.2.0.2 consume is non-refundable: if it incremented the window
         // and THEN this branch is reached, the increment stays. (In practice a
@@ -502,19 +502,19 @@ async fn prepare_a(
     //    velocity/budget/hard-rate-limit bookkeeping via the existing reserve
     //    mechanism. The reservation holds the escrow; apply happens at Commit-A
     //    settle. The escrow amount is the tool's REGISTERED per-invocation cost
-    //    (derived by `reserve_tool_economy` from the economy policy / tool
+    //    (derived by `reserve_outlet_economy` from the economy policy / tool
     //    registry via `economy_pre_check`), NEVER a caller-asserted value — a
     //    caller must not declare its own cheaper cost. No spending UCAN is
     //    presented on the OUTBOUND leg — the inbound `require_spending_ucan`
     //    gate and §7 proof live on B's Prepare-B side.
     let now_secs = deps.clock.now_secs();
-    // `reserve_tool_economy` is the spending-nonce-bearing leaf and takes the
+    // `reserve_outlet_economy` is the spending-nonce-bearing leaf and takes the
     // cell; the prior `state` borrow has ended (NLL) so `cell` is free here.
     let reservation =
-        match reserve_tool_economy(cell, deps, &context_id_hex, caller_did, None, now_secs).await {
+        match reserve_outlet_economy(cell, deps, &context_id_hex, caller_did, None, now_secs).await {
             Ok(reservation) => reservation,
             Err(err) => {
-                // reserve_tool_economy rolls back its OWN staged bookkeeping on
+                // reserve_outlet_economy rolls back its OWN staged bookkeeping on
                 // every failure branch, so no escrow/velocity/budget leaked — and
                 // its Class-S state is rolled back too, leaving nothing security-
                 // critical to durably land here. The §6.2.0.2 budget consumed above
@@ -537,7 +537,7 @@ async fn prepare_a(
     //    "Reservation release on every terminal path"), keyed by `SagaId`,
     //    BEFORE the fail-closed persist so the deduction and the means to
     //    reverse it land atomically in the SAME Class-S snapshot. The live
-    //    `ToolEconomyReservation` RAII carrier (held by the FSM) is the
+    //    `OutletEconomyReservation` RAII carrier (held by the FSM) is the
     //    AUTHORITATIVE reversal on the live abort / Commit-A paths and dies with
     //    an actor/process crash; this record is the crash-only fallback the
     //    §17.16.4 recovery sweep's `Abort { reservation: None }` uses to reverse
@@ -563,7 +563,7 @@ async fn prepare_a(
     //    double-reverse).
     //
     //    The economy rollback that completes the §6.2.4 "Reservation release on
-    //    every terminal path" RAII contract (the `ToolEconomyTicket` MUST be
+    //    every terminal path" RAII contract (the `OutletEconomyTicket` MUST be
     //    settled or rolled back, never merely dropped — releasing the staged
     //    escrow/rate-limit/velocity/budget) is Class-C + EXTERNAL (escrow void)
     //    and runs AFTER the combinator on the Err arm, exactly as before. It is
@@ -585,13 +585,13 @@ async fn prepare_a(
         // Combinator already un-inserted the record (Class-S restore). Complete
         // the RAII release: reverse the Class-C economy + void the external
         // escrow from the still-owned reservation, exactly as the prior inline
-        // path did. `rollback_tool_economy` reverses ONLY Class-C governance
+        // path did. `rollback_outlet_economy` reverses ONLY Class-C governance
         // economy (`velocity_tracker` / `budget_tracker` / `hard_rate_limit`) +
         // an external escrow void, so it takes the field-granular `ClassCMut`
         // (non-persisting — the combinator above already persisted the Class-S
         // restore; this reversal rides the run-loop coalesce, matching the prior
         // inline no-extra-persist behaviour).
-        crate::context::tools_helpers::rollback_tool_economy(
+        crate::context::outlets_helpers::rollback_outlet_economy(
             cell.class_c_view(),
             deps,
             reservation.ticket,
@@ -603,7 +603,7 @@ async fn prepare_a(
     }
 
     // Reply with the staged reservation. The `PreparedAFields` carries the
-    // `#[must_use]` `ToolEconomyTicket`, whose `Drop` guard fires (a
+    // `#[must_use]` `OutletEconomyTicket`, whose `Drop` guard fires (a
     // `debug_assert!` panic under `--features testing`, an escrow leak in
     // release) if the value is dropped without being settled or rolled back. If
     // the supervisor's reply receiver is GONE — the §6.2.4 `dispatch_prepare_phase`
@@ -655,7 +655,7 @@ async fn prepare_a(
 fn validate_outbound_caller(
     state: &PerContextState,
     caller_did: &DID,
-    tool_registration_id: &str,
+    outlet_registration_id: &str,
 ) -> Result<(), SagaReject> {
     use scp_protocol::context::roles::Capability;
 
@@ -676,9 +676,9 @@ fn validate_outbound_caller(
     // `allowed_callers` empty ⇒ any member with the capability above.
     if let Some(interface) = state
         .governance
-        .tool_interfaces
+        .outlet_interfaces
         .iter()
-        .find(|i| i.tool_id == tool_registration_id)
+        .find(|i| i.outlet_id == outlet_registration_id)
         && let Some(outbound) = interface.outbound_policy.as_ref()
         && !outbound.allowed_callers.is_empty()
         && !outbound.allowed_callers.contains(caller_did)
@@ -688,7 +688,7 @@ fn validate_outbound_caller(
             PermissionDenied,
             "caller '{}' not in outbound allowed_callers for tool '{}'",
             caller_did,
-            tool_registration_id
+            outlet_registration_id
         ));
     }
 
@@ -696,9 +696,9 @@ fn validate_outbound_caller(
 }
 
 /// Consume one §6.2.0.2 sliding-window budget unit on the OUTBOUND interface for
-/// `tool_registration_id` — both the per-interface (`rate_limit`) AND the
+/// `outlet_registration_id` — both the per-interface (`rate_limit`) AND the
 /// per-caller (`per_caller_rate_limit`) windows, exactly as the single-context
-/// [`invoke_cross_context`](scp_protocol::context::tools::interface::invoke_cross_context)
+/// [`invoke_cross_context`](scp_protocol::context::outlets::interface::invoke_cross_context)
 /// path consumes them. Returns [`ContextError::RateLimited`] (the over-budget
 /// case) without incrementing the OTHER window when either is exhausted.
 ///
@@ -717,17 +717,17 @@ fn consume_outbound_interface_rate_limit(
     mut view: crate::context::actor::class_s::ClassCMut<'_>,
     deps: &ActorDeps,
     caller_did: &DID,
-    tool_registration_id: &str,
+    outlet_registration_id: &str,
 ) -> Result<(), SagaReject> {
     let clock = deps.clock.as_ref();
 
-    // The §6.2.0.2 outbound window lives on `governance.tool_interfaces` — a
+    // The §6.2.0.2 outbound window lives on `governance.outlet_interfaces` — a
     // Class-C field reached through the field-granular governance view.
     let Some(interface) = view
         .governance_class_c_mut()
-        .tool_interfaces_mut()
+        .outlet_interfaces_mut()
         .iter_mut()
-        .find(|i| i.tool_id == tool_registration_id)
+        .find(|i| i.outlet_id == outlet_registration_id)
     else {
         // No interface row for this tool. The target-axis authorize-before-
         // reserve gate already proved an established interface exists for the
@@ -750,7 +750,7 @@ fn consume_outbound_interface_rate_limit(
                 retry_after_ms: Some(retry_after_secs.saturating_mul(1000))
             },
             "per-interface §6.2.0.2 rate limit exceeded for tool '{}' (retry after {}s)",
-            tool_registration_id,
+            outlet_registration_id,
             retry_after_secs
         ));
     }
@@ -768,7 +768,7 @@ fn consume_outbound_interface_rate_limit(
             },
             "per-caller §6.2.0.2 rate limit exceeded for caller '{}' on tool '{}' (retry after {}s)",
             caller_did,
-            tool_registration_id,
+            outlet_registration_id,
             retry_after_secs
         ));
     }
@@ -784,8 +784,8 @@ fn consume_outbound_interface_rate_limit(
 /// and the effective rate is their `min`.
 ///
 /// The window is materialized LAZILY from
-/// [`InboundPolicy::max_calls_per_minute`](scp_protocol::context::tools::interface::InboundPolicy)
-/// into `ToolInterface::inbound_rate_limit` the first time B prepares an
+/// [`InboundPolicy::max_calls_per_minute`](scp_protocol::context::outlets::interface::InboundPolicy)
+/// into `OutletInterface::inbound_rate_limit` the first time B prepares an
 /// invocation over the interface, then carried with the interface so the
 /// window state persists. An interface with no inbound policy (unbounded by
 /// design) consumes nothing.
@@ -806,19 +806,19 @@ fn consume_outbound_interface_rate_limit(
 fn consume_inbound_interface_rate_limit(
     mut view: crate::context::actor::class_s::ClassCMut<'_>,
     deps: &ActorDeps,
-    tool_registration_id: &str,
+    outlet_registration_id: &str,
 ) -> Result<(), SagaReject> {
-    use scp_protocol::context::tools::interface::{DEFAULT_WINDOW_SECONDS, RateLimit};
+    use scp_protocol::context::outlets::interface::{DEFAULT_WINDOW_SECONDS, RateLimit};
 
     let clock = deps.clock.as_ref();
 
-    // The §6.2.0.2 inbound window lives on `governance.tool_interfaces` — a
+    // The §6.2.0.2 inbound window lives on `governance.outlet_interfaces` — a
     // Class-C field reached through the field-granular governance view.
     let Some(interface) = view
         .governance_class_c_mut()
-        .tool_interfaces_mut()
+        .outlet_interfaces_mut()
         .iter_mut()
-        .find(|i| i.tool_id == tool_registration_id)
+        .find(|i| i.outlet_id == outlet_registration_id)
     else {
         // No interface row ⇒ no configured inbound window to consume (the
         // authorize-before-reserve gate already proved an established interface
@@ -844,7 +844,7 @@ fn consume_inbound_interface_rate_limit(
              ({}/min): its dedup-TTL-window volume would approach the nonce-dedup capacity and \
              erode the §6.2.4 replay bound",
             max_per_min,
-            tool_registration_id,
+            outlet_registration_id,
             MAX_SAFE_INBOUND_CALLS_PER_MINUTE
         ));
     }
@@ -869,7 +869,7 @@ fn consume_inbound_interface_rate_limit(
             },
             "per-interface §6.2.0.2 INBOUND rate limit exceeded at Prepare-B for tool '{}' \
              (retry after {}s)",
-            tool_registration_id,
+            outlet_registration_id,
             retry_after_secs
         ));
     }
@@ -890,7 +890,7 @@ struct PrepareBRequest {
     caller_context_id: [u8; 32],
     target_context_id: [u8; 32],
     caller_did: DID,
-    tool_registration_id: String,
+    outlet_registration_id: String,
     ucan_proof_id: Option<String>,
     input: serde_json::Value,
     asserted_chain_depth: u8,
@@ -943,7 +943,7 @@ async fn prepare_b(
     //     B's INBOUND §6.2.0.2 sliding window (spec §6.2.4 "Prepare-B validates
     //     InboundPolicy (… inbound rate …)"; §6.2.0 effective min(outbound,
     //     inbound)) through the non-persisting `class_c_view()` — it mutates ONLY
-    //     `governance.tool_interfaces`. It carries NO own persist: on success its
+    //     `governance.outlet_interfaces`. It carries NO own persist: on success its
     //     window increment is persisted by the SUBSEQUENT staging combinator (one
     //     persist covers window + nonce + slot). It runs AFTER the read-only
     //     rejects (a rejected call never consumes the budget) but BEFORE the
@@ -958,7 +958,7 @@ async fn prepare_b(
     //     admitted volume. So an un-persisted `Outcome::err` is correct: the ≤50ms
     //     coalesce-window rollback re-derives the identical window on the retry.
     if let Err(rej) =
-        consume_inbound_interface_rate_limit(cell.class_c_view(), deps, &req.tool_registration_id)
+        consume_inbound_interface_rate_limit(cell.class_c_view(), deps, &req.outlet_registration_id)
     {
         // POLICY reject ⇒ `Ok(Rejected)` (structural code) on the SUCCESS
         // channel; `Outcome::err` for the actor's Class-S accounting (orthogonal).
@@ -977,11 +977,11 @@ async fn prepare_b(
     let now_secs = deps.clock.now_secs();
 
     // Stage the eight-field public-metadata projection into saga_pending.
-    let prepared = CrossContextToolInvocationPrepared {
+    let prepared = CrossContextOutletInvocationPrepared {
         caller_context_id: req.caller_context_id,
         target_context_id: req.target_context_id,
         caller_did: req.caller_did.clone(),
-        tool_registration_id: req.tool_registration_id.clone(),
+        outlet_registration_id: req.outlet_registration_id.clone(),
         // The journal projection carries a string proof id; an ungated tool
         // has no proof — the empty string is the "no proof" sentinel for the
         // public projection (the wire field is `<string|null>`).
@@ -1041,7 +1041,7 @@ async fn prepare_b(
                 // (b) Stage the prepared projection — RESTORE direction.
                 class_s.saga_pending.insert(
                     saga_id.clone(),
-                    SagaPreparedState::CrossContextToolInvocation(prepared),
+                    SagaPreparedState::CrossContextOutletInvocation(prepared),
                 );
                 Ok(())
             },
@@ -1088,7 +1088,7 @@ fn run_prepare_b_checks(
     req: &PrepareBRequest,
 ) -> Result<(), SagaReject> {
     // (1) Confused-deputy: resolve the UCAN proof from B's OWN store and re-run
-    //     full §7 validation RE-BOUND to caller_did + tool_registration_id.
+    //     full §7 validation RE-BOUND to caller_did + outlet_registration_id.
     validate_ucan_rebind(state, deps, req)?;
 
     // (2) Inbound policy: source role + require_spending_ucan (the gated-proof
@@ -1111,7 +1111,7 @@ fn run_prepare_b_checks(
             PermissionDenied,
             "target_context_id mismatch — invocation targets a different context than this \
              executing actor (tool '{}')",
-            req.tool_registration_id
+            req.outlet_registration_id
         ));
     }
 
@@ -1134,7 +1134,7 @@ fn run_prepare_b_checks(
 
 /// (1) Confused-deputy defense (spec §6.2.4 normative (1)). Resolves
 /// `ucan_proof_id` from B's OWN UCAN store and re-runs the full §7 validation
-/// RE-BOUND to the carried `caller_did` (audience) + `tool_registration_id`
+/// RE-BOUND to the carried `caller_did` (audience) + `outlet_registration_id`
 /// (capability). REUSES the single-context
 /// [`validate_ucan`](scp_protocol::crypto::ucan::validate::validate_ucan)
 /// pipeline through the same DID/revocation adapters the spending-UCAN path
@@ -1172,7 +1172,7 @@ fn validate_ucan_rebind(
     // Required capability bound to B's OWN context + THIS tool + tool_invoke.
     let target_hex = hex_context_id(&req.target_context_id);
     let required_cap =
-        CapabilityUri::new(target_hex, "tool_invoke", req.tool_registration_id.clone());
+        CapabilityUri::new(target_hex, "tool_invoke", req.outlet_registration_id.clone());
 
     // The ceiling URI set + B's context-creator are taken from B's role state.
     let ceiling = state.role_state.ceiling().to_ucan_string_set();
@@ -1216,7 +1216,7 @@ fn validate_ucan_rebind(
             PermissionDenied,
             "UCAN re-validation failed (re-bound to caller_did '{}' + tool '{}'): {}",
             req.caller_did,
-            req.tool_registration_id,
+            req.outlet_registration_id,
             e
         )
     })
@@ -1244,9 +1244,9 @@ fn validate_inbound_policy(
 ) -> Result<(), SagaReject> {
     let Some(interface) = state
         .governance
-        .tool_interfaces
+        .outlet_interfaces
         .iter()
-        .find(|i| i.tool_id == req.tool_registration_id)
+        .find(|i| i.outlet_id == req.outlet_registration_id)
     else {
         return Ok(());
     };
@@ -1269,7 +1269,7 @@ fn validate_inbound_policy(
                 req.caller_source_role
                     .as_deref()
                     .map_or_else(|| "<none>".to_owned(), |r| format!("'{r}'")),
-                req.tool_registration_id
+                req.outlet_registration_id
             ));
         }
     }
@@ -1281,7 +1281,7 @@ fn validate_inbound_policy(
             13015,
             PermissionDenied,
             "inbound policy requires a spending UCAN but none was carried for tool '{}'",
-            req.tool_registration_id
+            req.outlet_registration_id
         ));
     }
 
@@ -1290,7 +1290,7 @@ fn validate_inbound_policy(
 
 /// (3) Input schema specificity floor + input conformance (§9.2.1, §6.2.4
 /// normative (2)). REUSES the single-context
-/// [`validate_specificity_floor`](scp_protocol::context::tools::schema::validate_specificity_floor)
+/// [`validate_specificity_floor`](scp_protocol::context::outlets::schema::validate_specificity_floor)
 /// against the target tool's REGISTERED schemas — degenerate broad-schema tools
 /// that function as arbitrary message channels are rejected — and then
 /// validates the carried `input` value against the registered input schema (the
@@ -1299,21 +1299,21 @@ fn validate_input_specificity(
     state: &PerContextState,
     req: &PrepareBRequest,
 ) -> Result<(), SagaReject> {
-    use scp_protocol::context::tools::schema::{
+    use scp_protocol::context::outlets::schema::{
         validate_specificity_floor, validate_value_against_schema,
     };
 
     let Some(registration) = state
         .governance
-        .registered_tools
+        .registered_outlets
         .iter()
-        .find(|t| t.tool_id == req.tool_registration_id)
+        .find(|t| t.outlet_id == req.outlet_registration_id)
     else {
         return Err(saga_reject!(
             13016,
             PermissionDenied,
             "tool '{}' not found in target registry",
-            req.tool_registration_id
+            req.outlet_registration_id
         ));
     };
 
@@ -1328,7 +1328,7 @@ fn validate_input_specificity(
             13017,
             PermissionDenied,
             "input schema specificity floor not met for tool '{}' ({} schema has {} fields)",
-            req.tool_registration_id,
+            req.outlet_registration_id,
             side,
             fields
         )
@@ -1341,7 +1341,7 @@ fn validate_input_specificity(
             13021,
             PermissionDenied,
             "input does not conform to registered schema for tool '{}': {}",
-            req.tool_registration_id,
+            req.outlet_registration_id,
             msg
         )
     })
@@ -1389,7 +1389,7 @@ fn validate_freshness(
             "invocation timestamp outside §9.14 skew tolerance (Δ={}ms > {}ms) for tool '{}'",
             delta_ms,
             skew_ms,
-            req.tool_registration_id
+            req.outlet_registration_id
         ));
     }
 
@@ -1411,7 +1411,7 @@ fn validate_freshness(
             13019,
             PermissionDenied,
             "invocation nonce already seen in target dedup cache (replay) for tool '{}'",
-            req.tool_registration_id
+            req.outlet_registration_id
         ));
     }
     Ok(())
@@ -1433,7 +1433,7 @@ fn validate_chain_depth(state: &PerContextState, req: &PrepareBRequest) -> Resul
             "chain depth {} +1 exceeds max_chain_depth {} for tool '{}'",
             req.asserted_chain_depth,
             max_depth,
-            req.tool_registration_id
+            req.outlet_registration_id
         ));
     }
     Ok(())
@@ -1449,7 +1449,7 @@ fn validate_chain_depth(state: &PerContextState, req: &PrepareBRequest) -> Resul
 /// so it is derived deterministically from the `SagaId` rather than minted from
 /// a fresh counter. The `ToolInvoked:` prefix matches the §5.16 event-name
 /// convention so the §6.2.4 auditor can recognise the entry type.
-fn tool_invoked_event_id(saga_id: &SagaId) -> String {
+fn outlet_invoked_event_id(saga_id: &SagaId) -> String {
     format!("ToolInvoked:{}", saga_id.0)
 }
 
@@ -1482,13 +1482,13 @@ fn commit_b_reserve(
         let _ = reply.send(Ok(CommitBReserveOutcome::AlreadyCommitted {
             receipt,
             output_bytes: committed.output_bytes.clone(),
-            tool_invoked_event_id: committed.tool_invoked_event_id.clone(),
+            outlet_invoked_event_id: committed.outlet_invoked_event_id.clone(),
         }));
         return Outcome::ok(());
     }
 
     // Not yet committed: the staged prepared MUST be present (Prepare-B ran).
-    if let Some(SagaPreparedState::CrossContextToolInvocation(_)) =
+    if let Some(SagaPreparedState::CrossContextOutletInvocation(_)) =
         state.class_s.saga_pending.get(saga_id)
     {
         let _ = reply.send(Ok(CommitBReserveOutcome::ReadyToExecute));
@@ -1508,9 +1508,9 @@ fn commit_b_reserve(
 /// target actor with the executor's captured `output_bytes`.
 ///
 /// On the FIRST settle: canonicalizes the output to JCS, signs the
-/// [`CrossContextToolReceipt`] over the STAGED `recorded_nonce` /
+/// [`CrossContextOutletReceipt`] over the STAGED `recorded_nonce` /
 /// `recorded_chain_depth` / `recorded_timestamp_ms` + `output_hash` + the
-/// `SagaId`-stable `tool_invoked_event_id` using the target's Active Signing
+/// `SagaId`-stable `outlet_invoked_event_id` using the target's Active Signing
 /// Key, durably captures the receipt + output keyed by `SagaId`, appends
 /// `ToolInvoked` to the local log, clears the staged `saga_pending` slot,
 /// Class-S sync-persists fail-closed, and replies. On a REPLAY (output already
@@ -1554,7 +1554,7 @@ async fn commit_b_settle(
 /// "Crash recovery §17.16.4"): the stored receipt + output are returned
 /// verbatim. The tool is NOT re-invoked and nothing is re-signed.
 fn reemit_committed_settle(
-    committed: &CommittedToolInvocation,
+    committed: &CommittedOutletInvocation,
     reply: CommitBSettleReply,
 ) -> Outcome<()> {
     match jcs_receipt_bytes(&committed.receipt) {
@@ -1562,7 +1562,7 @@ fn reemit_committed_settle(
             let _ = reply.send(Ok(CommitBSettleOutcome {
                 receipt,
                 output_bytes: committed.output_bytes.clone(),
-                tool_invoked_event_id: committed.tool_invoked_event_id.clone(),
+                outlet_invoked_event_id: committed.outlet_invoked_event_id.clone(),
             }));
             Outcome::ok(())
         }
@@ -1603,7 +1603,7 @@ fn reemit_committed_settle(
 // and SKIP the `ToolInvoked` append forever — a missing convergent leaf on an
 // in-process retry after a survived persist failure. `then_append` exposes no
 // way to recover the owned `prepared` on its persist-failure arm (the
-// `append_input` is dropped by the early `?`), and `CrossContextToolInvocationPrepared`
+// `append_input` is dropped by the early `?`), and `CrossContextOutletInvocationPrepared`
 // is deliberately NOT `Clone` (§9.4.3 non-derive barrier), so the slot cannot be
 // reconstructed afterward. The faithful, behaviour-preserving form is therefore
 // a TWO-combinator decomposition:
@@ -1629,7 +1629,7 @@ async fn commit_b_first_settle(
     // no-slot / wrong-variant case as `(false, 13031)` with NO persist — exactly
     // as the prior inline remove+match did (the authoritative move-out happens
     // inside `f` below).
-    let Some(SagaPreparedState::CrossContextToolInvocation(peek)) =
+    let Some(SagaPreparedState::CrossContextOutletInvocation(peek)) =
         cell.class_s.saga_pending.get(saga_id)
     else {
         return Err((
@@ -1662,7 +1662,7 @@ async fn commit_b_first_settle(
         // The peek above already proved a cross-context slot is present, so this
         // match is infallible; the `else` is a defensive re-insert + 13031.
         let removed = saga_pending.remove(saga_id);
-        let Some(SagaPreparedState::CrossContextToolInvocation(prepared)) = removed else {
+        let Some(SagaPreparedState::CrossContextOutletInvocation(prepared)) = removed else {
             if let Some(other) = removed {
                 saga_pending.insert(saga_id.clone(), other);
             }
@@ -1675,14 +1675,14 @@ async fn commit_b_first_settle(
 
         // Build the signed receipt from STAGED provenance + the captured output.
         // A signing failure leaves state as found (re-insert the owned original).
-        let event_id = tool_invoked_event_id(saga_id);
+        let event_id = outlet_invoked_event_id(saga_id);
         let receipt =
             match build_signed_receipt(&prepared, output_bytes, &event_id, target_signing_key) {
                 Ok(r) => r,
                 Err(e) => {
                     view.class_s_mut().saga_pending.insert(
                         saga_id.clone(),
-                        SagaPreparedState::CrossContextToolInvocation(prepared),
+                        SagaPreparedState::CrossContextOutletInvocation(prepared),
                     );
                     return Err(e);
                 }
@@ -1696,7 +1696,7 @@ async fn commit_b_first_settle(
         let caller_did_str = prepared.caller_did.0.clone();
         let target_context_id = prepared.target_context_id;
         let caller_context_id = prepared.caller_context_id;
-        let tool_registration_id = prepared.tool_registration_id.clone();
+        let outlet_registration_id = prepared.outlet_registration_id.clone();
 
         // Order matters (provenance-integrity): the durable output capture +
         // Class-S persist land BEFORE the `ToolInvoked` event-log append. The
@@ -1716,10 +1716,10 @@ async fn commit_b_first_settle(
         // recoverable by re-inserting the owned staged slot.
         view.class_s_mut().xctx_committed_outputs.insert(
             saga_id.clone(),
-            CommittedToolInvocation {
+            CommittedOutletInvocation {
                 receipt: receipt.clone(),
                 output_bytes: canonical_output.clone(),
-                tool_invoked_event_id: event_id.clone(),
+                outlet_invoked_event_id: event_id.clone(),
             },
         );
 
@@ -1731,7 +1731,7 @@ async fn commit_b_first_settle(
             caller_did_str,
             target_context_id,
             caller_context_id,
-            tool_registration_id,
+            outlet_registration_id,
         })
     });
 
@@ -1770,18 +1770,18 @@ async fn commit_b_settle_finalize(
         caller_did_str,
         target_context_id,
         caller_context_id,
-        tool_registration_id,
+        outlet_registration_id,
     } = captured;
 
     // Append `ToolInvoked` to the local (target) log (spec §6.2.4 "Commit"):
     // caller ctx id / caller DID actor / B's re-derived depth + staged timestamp.
     // Runs ONLY after the capture + persist landed, so it appears exactly once
     // across retries.
-    let tool_invoked_payload = serde_json::json!({
+    let outlet_invoked_payload = serde_json::json!({
         "saga_id": saga_id.0,
-        "tool_invoked_event_id": event_id,
+        "outlet_invoked_event_id": event_id,
         "caller_context_id": hex_context_id(&caller_context_id),
-        "tool_registration_id": tool_registration_id,
+        "outlet_registration_id": outlet_registration_id,
         "chain_depth": receipt.chain_depth,
         "timestamp_ms": receipt.timestamp_ms,
     });
@@ -1792,15 +1792,15 @@ async fn commit_b_settle_finalize(
     // staged value B also wrote into the receipt and that a replayed Commit
     // reproduces byte-for-byte — never a fresh Commit-time `now()`, so two honest
     // members reconstruct the identical leaf (§7.3.1, §9.9.3).
-    let append_result = match serde_json::to_vec(&tool_invoked_payload) {
-        Ok(tool_invoked_payload_bytes) => {
+    let append_result = match serde_json::to_vec(&outlet_invoked_payload) {
+        Ok(outlet_invoked_payload_bytes) => {
             deps.event_log
                 .append_context_event_with_payload(
                     &target_context_id,
                     scp_event_log::EventType::ToolInvoked,
                     &caller_did_str,
                     scp_event_log::EventPayload {
-                        data: tool_invoked_payload_bytes,
+                        data: outlet_invoked_payload_bytes,
                     },
                     receipt.timestamp_ms / 1000,
                 )
@@ -1831,7 +1831,7 @@ async fn commit_b_settle_finalize(
                 class_s.xctx_committed_outputs.remove(saga_id);
                 class_s.saga_pending.insert(
                     saga_id.clone(),
-                    SagaPreparedState::CrossContextToolInvocation(prepared),
+                    SagaPreparedState::CrossContextOutletInvocation(prepared),
                 );
                 Ok(())
             })
@@ -1849,7 +1849,7 @@ async fn commit_b_settle_finalize(
     Ok(CommitBSettleOutcome {
         receipt: receipt_bytes,
         output_bytes: canonical_output,
-        tool_invoked_event_id: event_id,
+        outlet_invoked_event_id: event_id,
     })
 }
 
@@ -1859,27 +1859,27 @@ async fn commit_b_settle_finalize(
 /// receipt + canonical output + stable event id, and the `ToolInvoked` record
 /// fields. Lives only between the two combinators in that one helper.
 struct CommitBCaptured {
-    prepared: CrossContextToolInvocationPrepared,
-    receipt: CrossContextToolReceipt,
+    prepared: CrossContextOutletInvocationPrepared,
+    receipt: CrossContextOutletReceipt,
     canonical_output: Vec<u8>,
     event_id: String,
     caller_did_str: String,
     target_context_id: [u8; 32],
     caller_context_id: [u8; 32],
-    tool_registration_id: String,
+    outlet_registration_id: String,
 }
 
-/// Sign the [`CrossContextToolReceipt`] over the staged B-recorded provenance +
+/// Sign the [`CrossContextOutletReceipt`] over the staged B-recorded provenance +
 /// `SHA-256(jcs(output))` + the `SagaId`-stable event id, using the target's
 /// Active Signing Key (spec §6.2.4 "Receipt / response return path"). The
 /// output is canonicalized to JCS so the receipt is self-verifying (the
 /// verifier re-hashes the carried bytes with no re-canonicalization step).
 fn build_signed_receipt(
-    prepared: &CrossContextToolInvocationPrepared,
+    prepared: &CrossContextOutletInvocationPrepared,
     output_bytes: &[u8],
     event_id: &str,
     target_signing_key: &SigningKeyBytes,
-) -> Result<CrossContextToolReceipt, ContextError> {
+) -> Result<CrossContextOutletReceipt, ContextError> {
     // Canonicalize the executor output to JCS — the exact bytes the preimage
     // hashes and the receipt carries (Output canonicalization obligation).
     let output_value: serde_json::Value = serde_json::from_slice(output_bytes).map_err(|e| {
@@ -1895,16 +1895,16 @@ fn build_signed_receipt(
     })?;
 
     let signing_key = target_signing_key.to_signing_key();
-    CrossContextToolReceipt::sign(
+    CrossContextOutletReceipt::sign(
         &signing_key,
-        CrossContextToolReceiptFields {
+        CrossContextOutletReceiptFields {
             caller_context_id: prepared.caller_context_id,
             target_context_id: prepared.target_context_id,
             caller_did: prepared.caller_did.0.clone(),
             nonce: prepared.recorded_nonce,
-            tool_registration_id: prepared.tool_registration_id.clone(),
+            outlet_registration_id: prepared.outlet_registration_id.clone(),
             output_jcs,
-            tool_invoked_event_id: event_id.to_owned(),
+            outlet_invoked_event_id: event_id.to_owned(),
             chain_depth: prepared.recorded_chain_depth,
             timestamp_ms: prepared.recorded_timestamp_ms,
         },
@@ -1916,8 +1916,8 @@ fn build_signed_receipt(
     })
 }
 
-/// JCS-encode a [`CrossContextToolReceipt`] to the wire bytes the FSM forwards.
-fn jcs_receipt_bytes(receipt: &CrossContextToolReceipt) -> Result<Vec<u8>, ContextError> {
+/// JCS-encode a [`CrossContextOutletReceipt`] to the wire bytes the FSM forwards.
+fn jcs_receipt_bytes(receipt: &CrossContextOutletReceipt) -> Result<Vec<u8>, ContextError> {
     scp_protocol::jcs::to_vec(receipt).map_err(|e| {
         ContextError::CryptoFailed(format!(
             "SCP-SAGA-13035: Commit-B receipt serialization failed: {e}"
@@ -1950,7 +1950,7 @@ struct CommitARequest {
 /// SAME instant as B's `ToolInvoked` leaf so the two `nonce`-joined records date
 /// the one provenance edge identically. That instant is B's signed
 /// `recorded_timestamp_ms`, carried in the forwarded, already-verified
-/// `CrossContextToolReceipt` (`timestamp_ms`, in ms). Re-deriving it from the
+/// `CrossContextOutletReceipt` (`timestamp_ms`, in ms). Re-deriving it from the
 /// receipt bytes rather than any local clock keeps every honest member's leaf
 /// byte-identical (§7.3.1, §9.9.3, §6.2.4 *Recorded timestamp*).
 ///
@@ -1973,7 +1973,7 @@ fn cross_context_invoked_leaf(
     nonce: &[u8; 16],
     output_bytes: &[u8],
 ) -> Result<(u64, Vec<u8>), ContextError> {
-    let receipt: CrossContextToolReceipt =
+    let receipt: CrossContextOutletReceipt =
         serde_json::from_slice(receipt_bytes).map_err(|err| {
             ContextError::EventLogFailed(format!(
                 "SCP-SAGA-13039: CrossContextToolInvoked timestamp could not be \
@@ -2012,7 +2012,7 @@ async fn commit_a(
     req: CommitARequest,
     reply: tokio::sync::oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
-    use crate::context::tools_helpers::{ToolSettleRequest, settle_tool_economy};
+    use crate::context::outlets_helpers::{OutletSettleRequest, settle_outlet_economy};
 
     let caller_hex = hex_context_id(&req.caller_context_id);
 
@@ -2029,9 +2029,9 @@ async fn commit_a(
         // actor was despawned+respawned between Prepare-A and this replayed
         // Commit-A, refunding against the new instance's owned state would
         // corrupt the WRONG context. On a mismatch the helper voids only the
-        // external escrow and consumes the ticket (mirrors `settle_tool_economy`).
+        // external escrow and consumes the ticket (mirrors `settle_outlet_economy`).
         let class_c_economy_reversed =
-            crate::context::tools_helpers::rollback_tool_economy_generation_checked(
+            crate::context::outlets_helpers::rollback_outlet_economy_generation_checked(
                 cell.class_c_view(),
                 deps,
                 req.reservation.reservation.generation,
@@ -2077,12 +2077,12 @@ async fn commit_a(
     // Settle (capture) the escrow + outbound rate-limit reservation. The
     // reservation was staged at Prepare-A and held by the FSM; Commit-A applies
     // it via the existing single-context settle/capture path (§19.2.2).
-    let settle_request = ToolSettleRequest::Capture {
+    let settle_request = OutletSettleRequest::Capture {
         generation: req.reservation.reservation.generation,
         ticket: req.reservation.reservation.ticket,
     };
     if let Err(err) =
-        settle_tool_economy(cell, deps, &caller_hex, &req.caller_did, settle_request).await
+        settle_outlet_economy(cell, deps, &caller_hex, &req.caller_did, settle_request).await
     {
         let sketch = outcome_error_sketch(&err);
         let _ = reply.send(Err(err));
@@ -2240,7 +2240,7 @@ fn commit_a_check_witness(
 ///
 /// RAII-releases the staged reservations — escrow / outbound-RL on the CALLER
 /// side; the tool-session on the TARGET side is released by clearing the staged
-/// `saga_pending` slot (B stages no `ToolEconomyTicket`).
+/// `saga_pending` slot (B stages no `OutletEconomyTicket`).
 ///
 /// On the CALLER side the reversal source depends on whether the in-memory
 /// carrier survived:
@@ -2282,7 +2282,7 @@ async fn abort(
 ) -> Outcome<()> {
     // ── ABORT (keep direction; deferred Class-S removes hoisted into the combinator) ─
     // Abort's caller-side reversal is INTERLEAVED with order-critical async
-    // EXTERNAL effects (escrow void via `rollback_tool_economy_generation_checked`
+    // EXTERNAL effects (escrow void via `rollback_outlet_economy_generation_checked`
     // / `reverse_caller_reservation_record`) that a sync combinator `f` cannot
     // host, and the whole reversal must run BEFORE the fail-closed persist so the
     // crash-window void→persist ordering is preserved (persist-then-void would
@@ -2354,7 +2354,7 @@ async fn abort(
     let (local_rollback_ran, had_caller_record_consumed) = match reservation {
         Some(prepared) => {
             let carrier_ran =
-                crate::context::tools_helpers::rollback_tool_economy_generation_checked(
+                crate::context::outlets_helpers::rollback_outlet_economy_generation_checked(
                     cell.class_c_view(),
                     deps,
                     prepared.reservation.generation,
@@ -2376,7 +2376,7 @@ async fn abort(
             let local_ran = if carrier_ran {
                 true
             } else if let Some(ref record) = record {
-                crate::context::tools_helpers::reverse_caller_reservation_record(
+                crate::context::outlets_helpers::reverse_caller_reservation_record(
                     cell.class_c_view(),
                     deps,
                     record,
@@ -2410,7 +2410,7 @@ async fn abort(
             // Class-S removal is hoisted into the combinator `f` below.
             match cell.class_s.xctx_caller_reservations.get(saga_id).cloned() {
                 Some(record) => {
-                    let ran = crate::context::tools_helpers::reverse_caller_reservation_record(
+                    let ran = crate::context::outlets_helpers::reverse_caller_reservation_record(
                         cell.class_c_view(),
                         deps,
                         &record,
@@ -2617,7 +2617,7 @@ mod tests {
     use scp_protocol::context::ContextError;
     use scp_protocol::context::governance::KeyResolver;
     use scp_protocol::context::roles::Capability;
-    use scp_protocol::context::tools::registry::{ToolRegistration, ToolSchema};
+    use scp_protocol::context::outlets::registry::{OutletRegistration, OutletSchema};
     use scp_protocol::crypto::ucan::UcanToken;
     use tokio::sync::oneshot;
 
@@ -2644,7 +2644,7 @@ mod tests {
             PrepareAOutcome::Rejected(reject) => reject,
             PrepareAOutcome::Prepared(prepared) => {
                 // Should never happen in a reject test. The carrier holds a
-                // `#[must_use]` ToolEconomyTicket whose drop guard would panic
+                // `#[must_use]` OutletEconomyTicket whose drop guard would panic
                 // under `--features testing`; forget it so the assertion failure
                 // (not a double-panic) is what surfaces.
                 std::mem::forget(prepared);
@@ -2717,7 +2717,7 @@ mod tests {
     /// this test's invariant, and the per-interface guard, do NOT establish the
     /// aggregate replay bound. The aggregate replay bound rests instead on the
     /// channel-authenticated `caller_did` gate (spec §6.2.4 *Cache-eviction
-    /// bound*, *Caller authentication*): a replayed `CrossContextToolInvoke`
+    /// bound*, *Caller authentication*): a replayed `CrossContextOutletInvoke`
     /// must pass the supervisor's gate-1 `is_member`/`caller_did` check on the
     /// ATTACKER's OWN authenticated channel — a third party cannot present a
     /// victim's `caller_did`, and a caller replaying its own evicted invocation
@@ -2732,7 +2732,7 @@ mod tests {
     /// the channel-auth argument.)
     #[test]
     fn nonce_dedup_replay_bound_holds() {
-        use scp_protocol::context::tools::interface::DEFAULT_PER_INTERFACE_CALLS_PER_MINUTE;
+        use scp_protocol::context::outlets::interface::DEFAULT_PER_INTERFACE_CALLS_PER_MINUTE;
         use scp_protocol::crypto::sender_keys::NONCE_DEDUP_CAPACITY;
 
         // The bound is computed against the SAGA dedup TTL — the cache this
@@ -2869,7 +2869,7 @@ mod tests {
     /// Event log that COUNTS typed `ToolInvoked` appends — used to assert a
     /// Commit-B persist-retry produces EXACTLY ONE `ToolInvoked` (FIX 3).
     struct CountingEventLog {
-        tool_invoked_appends: Arc<std::sync::atomic::AtomicUsize>,
+        outlet_invoked_appends: Arc<std::sync::atomic::AtomicUsize>,
     }
     #[async_trait::async_trait]
     impl crate::context::builder::ContextEventLogProvider for CountingEventLog {
@@ -2888,7 +2888,7 @@ mod tests {
             _timestamp_secs: u64,
         ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
             if event_type == scp_event_log::EventType::ToolInvoked {
-                self.tool_invoked_appends
+                self.outlet_invoked_appends
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }
             Ok(())
@@ -3158,7 +3158,7 @@ mod tests {
     }
 
     /// An encrypted state whose `context_id == [ctx_byte; 32]`, with `member`
-    /// holding `ToolInterface`, `creator_did = creator`, and a registered tool
+    /// holding `OutletInterface`, `creator_did = creator`, and a registered tool
     /// `TOOL` with a 2-field input schema (passes the specificity floor).
     async fn target_state(ctx_byte: u8, creator: &str, member: &str) -> PerContextState {
         let mut st = PerContextState::new_for_test_encrypted(
@@ -3171,7 +3171,7 @@ mod tests {
             .expect("active");
         // creator_did binds the UCAN root issuer (validate_ucan step 4).
         st.role_state.creator_did = creator.to_owned();
-        // Grant the caller ToolInterface + ToolInvokeAll so both the outbound
+        // Grant the caller OutletInterface + ToolInvokeAll so both the outbound
         // capability gate and the ceiling (tool_invoke:*) admit the proof.
         st.role_state.members.insert(member.to_owned());
         let mut caps = HashSet::new();
@@ -3186,11 +3186,11 @@ mod tests {
                 Capability::ToolInvokeAll,
             ]))
             .expect("well-formed built-in ceiling");
-        st.governance.registered_tools.push(ToolRegistration {
-            tool_id: TOOL.to_owned(),
+        st.governance.registered_outlets.push(OutletRegistration {
+            outlet_id: TOOL.to_owned(),
             name: "Calculator".to_owned(),
             description: "adds".to_owned(),
-            schema: ToolSchema {
+            schema: OutletSchema {
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": { "a": {"type": "number"}, "b": {"type": "number"} }
@@ -3213,7 +3213,7 @@ mod tests {
     /// Mint a UCAN with `tool_invoke:TOOL` capability, issued by `creator`
     /// (the context creator = root issuer) to `audience`, scoped to the hex
     /// of `[ctx_byte; 32]`. Returns the issuer pubkey + the token.
-    async fn mint_tool_ucan(
+    async fn mint_outlet_ucan(
         ctx_byte: u8,
         creator_did: &str,
         creator_key: &scp_platform::traits::KeyHandle,
@@ -3266,7 +3266,7 @@ mod tests {
             caller_context_id: [0x99; 32],
             target_context_id: [ctx_byte; 32],
             caller_did: DID(CALLER.to_owned()),
-            tool_registration_id: TOOL.to_owned(),
+            outlet_registration_id: TOOL.to_owned(),
             ucan_proof_id,
             input: valid_input(),
             asserted_chain_depth,
@@ -3309,9 +3309,9 @@ mod tests {
         // settles it on Commit-A or releases it on a terminal non-commit path.
         // This test stands in for that terminal release (RAII contract,
         // §6.2.4 "Reservation release on every terminal path") by rolling the
-        // reservation back — dropping a live ToolEconomyTicket is a balance-
+        // reservation back — dropping a live OutletEconomyTicket is a balance-
         // invariant violation by design.
-        crate::context::tools_helpers::rollback_tool_economy(
+        crate::context::outlets_helpers::rollback_outlet_economy(
             st_cell.class_c_view(),
             &deps,
             prepared.reservation.ticket,
@@ -3324,7 +3324,7 @@ mod tests {
         let issuer = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
         let mut st = target_state(0x11, OTHER, CALLER).await;
         st.role_state.creator_did = CALLER.to_owned();
-        // Strip the ToolInterface capability.
+        // Strip the OutletInterface capability.
         st.role_state
             .member_capabilities
             .insert(CALLER.to_owned(), HashSet::new());
@@ -3356,15 +3356,15 @@ mod tests {
 
     #[tokio::test]
     async fn prepare_a_rejects_caller_not_in_allowed_callers() {
-        use scp_protocol::context::tools::interface::{OutboundPolicy, ToolInterface};
+        use scp_protocol::context::outlets::interface::{OutboundPolicy, OutletInterface};
         let issuer = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
         let mut st = target_state(0x11, OTHER, CALLER).await;
         st.role_state.creator_did = CALLER.to_owned();
         // Establish an interface whose allowed_callers excludes the caller.
-        st.governance.tool_interfaces.push(ToolInterface {
+        st.governance.outlet_interfaces.push(OutletInterface {
             source_context: hex_context_id(&[0x11; 32]),
             target_context: hex_context_id(&[0x22; 32]),
-            tool_id: TOOL.to_owned(),
+            outlet_id: TOOL.to_owned(),
             rate_limit: None,
             inbound_rate_limit: None,
             per_caller_rate_limit: None,
@@ -3433,7 +3433,7 @@ mod tests {
 
     /// FIX C (escrow reserves the REGISTERED cost, never a caller-asserted one).
     /// `prepare_a` no longer takes any caller-supplied cost — the escrow amount
-    /// is derived entirely by `reserve_tool_economy` from the context's own
+    /// is derived entirely by `reserve_outlet_economy` from the context's own
     /// economic policy. With the default (no policy ⇒ free) policy the reserve
     /// deducts NOTHING from the caller's budget, proving no caller-asserted
     /// positive cost can leak into the reservation. The compile-time absence of
@@ -3485,7 +3485,7 @@ mod tests {
              with no policy that is 0, so the budget must be untouched"
         );
 
-        crate::context::tools_helpers::rollback_tool_economy(
+        crate::context::outlets_helpers::rollback_outlet_economy(
             st_cell.class_c_view(),
             &deps,
             prepared.reservation.ticket,
@@ -3500,7 +3500,7 @@ mod tests {
     /// initiation-consumes-budget gate.
     #[tokio::test]
     async fn prepare_a_rejects_when_per_interface_rate_budget_exhausted() {
-        use scp_protocol::context::tools::interface::{RateLimit, ToolInterface};
+        use scp_protocol::context::outlets::interface::{RateLimit, OutletInterface};
         use std::time::Duration;
         let issuer = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
         let mut st = target_state(0x11, OTHER, CALLER).await;
@@ -3521,10 +3521,10 @@ mod tests {
             Duration::from_secs(1),
             deps.clock.as_ref(),
         );
-        st.governance.tool_interfaces.push(ToolInterface {
+        st.governance.outlet_interfaces.push(OutletInterface {
             source_context: hex_context_id(&[0x11; 32]),
             target_context: hex_context_id(&[0x22; 32]),
-            tool_id: TOOL.to_owned(),
+            outlet_id: TOOL.to_owned(),
             rate_limit: Some(zero_budget),
             inbound_rate_limit: None,
             per_caller_rate_limit: None,
@@ -3560,7 +3560,7 @@ mod tests {
     /// `RateLimited` (SCP-SAGA-13024), independent of the per-interface window.
     #[tokio::test]
     async fn prepare_a_rejects_when_per_caller_rate_budget_exhausted() {
-        use scp_protocol::context::tools::interface::{PerCallerRateLimit, ToolInterface};
+        use scp_protocol::context::outlets::interface::{PerCallerRateLimit, OutletInterface};
         use std::time::Duration;
         let issuer = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
         let mut st = target_state(0x11, OTHER, CALLER).await;
@@ -3574,10 +3574,10 @@ mod tests {
 
         let zero_caller_budget =
             PerCallerRateLimit::with_burst(0, Duration::from_mins(1), 0, Duration::from_secs(1));
-        st.governance.tool_interfaces.push(ToolInterface {
+        st.governance.outlet_interfaces.push(OutletInterface {
             source_context: hex_context_id(&[0x11; 32]),
             target_context: hex_context_id(&[0x22; 32]),
-            tool_id: TOOL.to_owned(),
+            outlet_id: TOOL.to_owned(),
             rate_limit: None,
             inbound_rate_limit: None,
             per_caller_rate_limit: Some(zero_caller_budget),
@@ -3622,7 +3622,7 @@ mod tests {
 
         let mut st = target_state(0x33, &creator_did, CALLER).await;
         // The proof is delegated to the CALLER (correct principal).
-        let token = mint_tool_ucan(0x33, &creator_did, &creator_handle, &custody, CALLER).await;
+        let token = mint_outlet_ucan(0x33, &creator_did, &creator_handle, &custody, CALLER).await;
         st.xctx_ucan_proofs
             .proofs
             .insert("proof-1".to_owned(), token);
@@ -3651,10 +3651,10 @@ mod tests {
             .get(&SagaId("saga-xctx-1".to_owned()))
             .unwrap();
         // Single-variant enum: the bind is irrefutable.
-        let SagaPreparedState::CrossContextToolInvocation(p) = staged;
+        let SagaPreparedState::CrossContextOutletInvocation(p) = staged;
         assert_eq!(p.target_context_id, [0x33; 32]);
         assert_eq!(p.caller_did, DID(CALLER.to_owned()));
-        assert_eq!(p.tool_registration_id, TOOL);
+        assert_eq!(p.outlet_registration_id, TOOL);
         assert_eq!(p.ucan_proof_id, "proof-1");
         assert_eq!(p.recorded_chain_depth, 3);
         assert_eq!(p.recorded_nonce, [0x42; 16]);
@@ -3667,14 +3667,14 @@ mod tests {
     /// the supervisor-resolved `caller_source_role`, never an envelope value.
     #[tokio::test]
     async fn prepare_b_rejects_caller_role_not_in_allowed_source_roles() {
-        use scp_protocol::context::tools::interface::{InboundPolicy, ToolInterface};
+        use scp_protocol::context::outlets::interface::{InboundPolicy, OutletInterface};
         let issuer = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
         // Ungated tool (no UCAN proof) on the TARGET context 0x55.
         let mut st = target_state(0x55, OTHER, CALLER).await;
-        st.governance.tool_interfaces.push(ToolInterface {
+        st.governance.outlet_interfaces.push(OutletInterface {
             source_context: hex_context_id(&[0x99; 32]),
             target_context: hex_context_id(&[0x55; 32]),
-            tool_id: TOOL.to_owned(),
+            outlet_id: TOOL.to_owned(),
             rate_limit: None,
             inbound_rate_limit: None,
             per_caller_rate_limit: None,
@@ -3720,13 +3720,13 @@ mod tests {
     /// `allowed_source_roles` is admitted (the inbound gate does not over-block).
     #[tokio::test]
     async fn prepare_b_accepts_caller_role_in_allowed_source_roles() {
-        use scp_protocol::context::tools::interface::{InboundPolicy, ToolInterface};
+        use scp_protocol::context::outlets::interface::{InboundPolicy, OutletInterface};
         let issuer = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
         let mut st = target_state(0x56, OTHER, CALLER).await;
-        st.governance.tool_interfaces.push(ToolInterface {
+        st.governance.outlet_interfaces.push(OutletInterface {
             source_context: hex_context_id(&[0x99; 32]),
             target_context: hex_context_id(&[0x56; 32]),
-            tool_id: TOOL.to_owned(),
+            outlet_id: TOOL.to_owned(),
             rate_limit: None,
             inbound_rate_limit: None,
             per_caller_rate_limit: None,
@@ -3758,11 +3758,11 @@ mod tests {
     /// onto `st` (target context `ctx_byte`), approved both sides — the fixture
     /// for the inbound-rate consume tests.
     fn push_inbound_interface(st: &mut PerContextState, ctx_byte: u8, inbound_per_min: u32) {
-        use scp_protocol::context::tools::interface::{InboundPolicy, ToolInterface};
-        st.governance.tool_interfaces.push(ToolInterface {
+        use scp_protocol::context::outlets::interface::{InboundPolicy, OutletInterface};
+        st.governance.outlet_interfaces.push(OutletInterface {
             source_context: hex_context_id(&[0x99; 32]),
             target_context: hex_context_id(&[ctx_byte; 32]),
-            tool_id: TOOL.to_owned(),
+            outlet_id: TOOL.to_owned(),
             rate_limit: None,
             inbound_rate_limit: None,
             per_caller_rate_limit: None,
@@ -3848,9 +3848,9 @@ mod tests {
         // The guard fires BEFORE materializing the window — nothing was created.
         let iface = st_cell
             .governance
-            .tool_interfaces
+            .outlet_interfaces
             .iter()
-            .find(|i| i.tool_id == TOOL)
+            .find(|i| i.outlet_id == TOOL)
             .expect("interface present");
         assert!(
             iface.inbound_rate_limit.is_none(),
@@ -3907,9 +3907,9 @@ mod tests {
         // The inbound window was materialized and one unit consumed.
         let iface = st_cell
             .governance
-            .tool_interfaces
+            .outlet_interfaces
             .iter()
-            .find(|i| i.tool_id == TOOL)
+            .find(|i| i.outlet_id == TOOL)
             .expect("interface present");
         let window = iface
             .inbound_rate_limit
@@ -3937,7 +3937,7 @@ mod tests {
 
         let mut st = target_state(0x44, &creator_did, CALLER).await;
         // Proof audience = OTHER, NOT the carried caller_did (CALLER).
-        let token = mint_tool_ucan(0x44, &creator_did, &creator_handle, &custody, OTHER).await;
+        let token = mint_outlet_ucan(0x44, &creator_did, &creator_handle, &custody, OTHER).await;
         st.xctx_ucan_proofs
             .proofs
             .insert("proof-other".to_owned(), token);
@@ -4016,7 +4016,7 @@ mod tests {
     }
 
     /// FIX 4 (BLACK-624-01): the nonce-dedup replay protection SURVIVES a crash.
-    /// A `CrossContextToolInvoke` whose nonce was accepted, then the actor
+    /// A `CrossContextOutletInvoke` whose nonce was accepted, then the actor
     /// crashes and restores from its snapshot, then the SAME envelope is
     /// re-submitted under a FRESH `SagaId`, MUST be rejected by the rehydrated
     /// nonce-dedup cache. Before this fix the cache reinitialized EMPTY on
@@ -4218,9 +4218,9 @@ mod tests {
         // (zero declared fields on both sides ⇒ below the specificity floor).
         if let Some(reg) = st
             .governance
-            .registered_tools
+            .registered_outlets
             .iter_mut()
-            .find(|t| t.tool_id == TOOL)
+            .find(|t| t.outlet_id == TOOL)
         {
             reg.schema.input_schema = serde_json::json!({ "type": "object" });
             reg.schema.output_schema = serde_json::json!({ "type": "object" });
@@ -4276,7 +4276,7 @@ mod tests {
         SigningKeyBytes::from_signing_key(&ed25519_dalek::SigningKey::from_bytes(&[seed; 32]))
     }
 
-    /// Build a valid JCS-serialized `CrossContextToolReceipt` for Commit-A
+    /// Build a valid JCS-serialized `CrossContextOutletReceipt` for Commit-A
     /// tests. Commit-A re-reads the convergent leaf timestamp from the forwarded
     /// receipt (spec §6.2.4 *Recorded timestamp*), so a Commit-A test must pass a
     /// well-formed receipt rather than a stub blob. `timestamp_ms` is B's staged
@@ -4284,16 +4284,16 @@ mod tests {
     /// `timestamp_ms / 1000`.
     fn test_receipt_bytes(timestamp_ms: u64) -> Vec<u8> {
         let target_key = ed25519_dalek::SigningKey::from_bytes(&[0x5A; 32]);
-        let receipt = CrossContextToolReceipt::sign(
+        let receipt = CrossContextOutletReceipt::sign(
             &target_key,
-            CrossContextToolReceiptFields {
+            CrossContextOutletReceiptFields {
                 caller_context_id: [0xC4; 32],
                 target_context_id: [0xEE; 32],
                 caller_did: CALLER.to_owned(),
                 nonce: [0x42; 16],
-                tool_registration_id: TOOL.to_owned(),
+                outlet_registration_id: TOOL.to_owned(),
                 output_jcs: br#"{"result":1}"#.to_vec(),
-                tool_invoked_event_id: "ToolInvoked:saga-commit-a-1".to_owned(),
+                outlet_invoked_event_id: "ToolInvoked:saga-commit-a-1".to_owned(),
                 chain_depth: 3,
                 timestamp_ms,
             },
@@ -4353,7 +4353,7 @@ mod tests {
         let settled = rx.await.unwrap().expect("settled");
 
         // The receipt verifies against the target's signing key.
-        let receipt: CrossContextToolReceipt =
+        let receipt: CrossContextOutletReceipt =
             serde_json::from_slice(&settled.receipt).expect("receipt json");
         receipt
             .verify(&target_key.to_signing_key().verifying_key())
@@ -4362,7 +4362,7 @@ mod tests {
         // (incoming 2 + 1) and the staged wire nonce.
         assert_eq!(receipt.chain_depth, 3);
         assert_eq!(receipt.nonce, [0x42; 16]);
-        assert_eq!(receipt.tool_invoked_event_id, settled.tool_invoked_event_id);
+        assert_eq!(receipt.outlet_invoked_event_id, settled.outlet_invoked_event_id);
         // The output was captured durably and the staged slot cleared.
         assert!(st_cell.class_s.xctx_committed_outputs.contains_key(&saga));
         assert!(st_cell.class_s.saga_pending.is_empty());
@@ -4395,7 +4395,7 @@ mod tests {
             .xctx_committed_outputs
             .get(&saga)
             .unwrap()
-            .tool_invoked_event_id
+            .outlet_invoked_event_id
             .clone();
 
         // Replay: a DIFFERENT output + a DIFFERENT key would re-sign divergently
@@ -4422,7 +4422,7 @@ mod tests {
             first.output_bytes, replay.output_bytes,
             "stored output re-emitted"
         );
-        assert_eq!(replay.tool_invoked_event_id, captured_event_id);
+        assert_eq!(replay.outlet_invoked_event_id, captured_event_id);
         // Reserve on a committed saga short-circuits to AlreadyCommitted.
         let (tx, rx) = oneshot::channel();
         commit_b_reserve(&st_cell, &saga, tx);
@@ -4454,7 +4454,7 @@ mod tests {
         let (tx, rx) = oneshot::channel();
         commit_b_settle(&mut st_cell, &deps, &saga, output, &target_key, tx).await;
         let settled = rx.await.unwrap().expect("settled");
-        let receipt: CrossContextToolReceipt =
+        let receipt: CrossContextOutletReceipt =
             serde_json::from_slice(&settled.receipt).expect("receipt json");
         // Self-verifying: output_hash recomputes from the carried JCS bytes.
         receipt
@@ -4843,7 +4843,7 @@ mod tests {
     /// back locally as before.
     #[tokio::test]
     async fn rollback_generation_checked_voids_external_not_local_on_mismatch() {
-        use crate::context::tools_helpers::rollback_tool_economy_generation_checked;
+        use crate::context::outlets_helpers::rollback_outlet_economy_generation_checked;
 
         let issuer = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
         let mut st = target_state(0xD1, OTHER, CALLER).await;
@@ -4876,7 +4876,7 @@ mod tests {
         );
 
         // Generations MATCH ⇒ local rollback runs.
-        let ran_local = rollback_tool_economy_generation_checked(
+        let ran_local = rollback_outlet_economy_generation_checked(
             st_cell.class_c_view(),
             &deps,
             prepared_match.reservation.generation,
@@ -4908,8 +4908,8 @@ mod tests {
 
         // Generations MISMATCH ⇒ external-only (local untouched), ticket consumed
         // (no unbalanced-drop panic). Routing through the saga `abort` handler
-        // would call `rollback_tool_economy` directly without this guard.
-        let ran_local = rollback_tool_economy_generation_checked(
+        // would call `rollback_outlet_economy` directly without this guard.
+        let ran_local = rollback_outlet_economy_generation_checked(
             st_cell.class_c_view(),
             &deps,
             stale_gen,
@@ -5050,7 +5050,7 @@ mod tests {
 
     #[tokio::test]
     async fn emit_divergence_marker_appends_verifiable_marker() {
-        use scp_protocol::context::tools::cross_context_saga::CrossContextDivergenceMarker;
+        use scp_protocol::context::outlets::cross_context_saga::CrossContextDivergenceMarker;
         let issuer = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
         let st = target_state(0xC7, OTHER, CALLER).await;
         let deps = build_deps(
@@ -5183,12 +5183,12 @@ mod tests {
 
         // Settle deps: a counting event log + a persistence that FAILS the first
         // call then succeeds. Both providers live behind the same shared counter.
-        let tool_invoked_appends = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let outlet_invoked_appends = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let settle_deps = build_deps_with_providers(
             OTHER.to_owned(),
             issuer.verifying_key(),
             Box::new(CountingEventLog {
-                tool_invoked_appends: Arc::clone(&tool_invoked_appends),
+                outlet_invoked_appends: Arc::clone(&outlet_invoked_appends),
             }),
             Box::new(FailFirstPersistence {
                 calls: std::sync::atomic::AtomicUsize::new(0),
@@ -5217,7 +5217,7 @@ mod tests {
         let err = rx.await.unwrap().expect_err("first settle persist failure");
         assert!(matches!(err, ContextError::PersistenceFailed(_)));
         assert_eq!(
-            tool_invoked_appends.load(std::sync::atomic::Ordering::SeqCst),
+            outlet_invoked_appends.load(std::sync::atomic::Ordering::SeqCst),
             0,
             "a persist failure must NOT append ToolInvoked (append is sequenced after persist)"
         );
@@ -5235,7 +5235,7 @@ mod tests {
         );
         rx.await.unwrap().expect("retry settle ack");
         assert_eq!(
-            tool_invoked_appends.load(std::sync::atomic::Ordering::SeqCst),
+            outlet_invoked_appends.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "a persist-failure-then-retry Commit-B must append ToolInvoked EXACTLY ONCE"
         );
@@ -5253,7 +5253,7 @@ mod tests {
     #[tokio::test]
     async fn commit_b_settle_persist_failure_restores_full_original_slot() {
         use crate::context::supervisor::saga_prepared_state::{
-            CrossContextToolInvocationPrepared, SagaPreparedState,
+            CrossContextOutletInvocationPrepared, SagaPreparedState,
         };
 
         let issuer = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
@@ -5262,11 +5262,11 @@ mod tests {
 
         // Stage a slot DIRECTLY with a non-empty `ucan_proof_id` (a gated tool's
         // proof index) — the field the lossy inverse used to drop.
-        let original = CrossContextToolInvocationPrepared {
+        let original = CrossContextOutletInvocationPrepared {
             caller_context_id: [0xCC; 32],
             target_context_id: [0xCB; 32],
             caller_did: DID(CALLER.to_owned()),
-            tool_registration_id: TOOL.to_owned(),
+            outlet_registration_id: TOOL.to_owned(),
             ucan_proof_id: "gated-proof-index-42".to_owned(),
             recorded_timestamp_ms: 1_700_000_000_000,
             recorded_nonce: [0x42; 16],
@@ -5274,7 +5274,7 @@ mod tests {
         };
         st.class_s.saga_pending.insert(
             saga.clone(),
-            SagaPreparedState::CrossContextToolInvocation(original),
+            SagaPreparedState::CrossContextOutletInvocation(original),
         );
 
         // Settle with a FAILING persistence: the capture rolls back and the slot
@@ -5307,7 +5307,7 @@ mod tests {
             .saga_pending
             .get(&saga)
             .expect("slot restored");
-        let SagaPreparedState::CrossContextToolInvocation(p) = restored;
+        let SagaPreparedState::CrossContextOutletInvocation(p) = restored;
         assert_eq!(
             p.ucan_proof_id, "gated-proof-index-42",
             "the restored slot must preserve ucan_proof_id (no lossy reconstruction)"
@@ -5577,7 +5577,7 @@ mod tests {
         // The helper takes the field-granular `ClassCMut`; wrap the test state in
         // a `ClassSCell` to construct the view, then read results back via Deref.
         let mut st_cell = crate::context::actor::class_s::ClassSCell::new(st);
-        let ran = crate::context::tools_helpers::reverse_caller_reservation_record(
+        let ran = crate::context::outlets_helpers::reverse_caller_reservation_record(
             st_cell.class_c_view(),
             &deps,
             &record,
@@ -5779,7 +5779,7 @@ mod tests {
 
     /// HIGH 3 (lost Prepare-A reply balances the must-use ticket): `prepare_a`
     /// durably persists the deduction + record, then replies with the
-    /// `PreparedAFields` carrying the `#[must_use]` `ToolEconomyTicket`. If the
+    /// `PreparedAFields` carrying the `#[must_use]` `OutletEconomyTicket`. If the
     /// supervisor's reply RECEIVER is gone (the §6.2.4 30s phase-timeout fired /
     /// the start was cancelled and dropped the oneshot receiver), `reply.send`
     /// returns `Err(prepared)` and the carrier would otherwise be dropped INSIDE
@@ -5824,7 +5824,7 @@ mod tests {
         drop(rx);
 
         // No panic here ⇒ the recovered ticket was balanced. (Pre-fix this
-        // unwinds on the debug_assert in `ToolEconomyTicket::drop`.)
+        // unwinds on the debug_assert in `OutletEconomyTicket::drop`.)
         let mut st_cell = crate::context::actor::class_s::ClassSCell::new(st);
         let out = prepare_a(&mut st_cell, &deps, &saga, &[0xDC; 32], &caller, TOOL, tx).await;
         assert!(

@@ -135,7 +135,7 @@ pub use saga_journal::{
     SagaJournal, SagaState, SagaTerminalState,
 };
 pub use saga_prepared_state::{
-    CrossContextToolInvocationPrepared, CrossContextToolInvocationSnapshot, SagaPreparedState,
+    CrossContextOutletInvocationPrepared, CrossContextOutletInvocationSnapshot, SagaPreparedState,
     SagaPreparedStateSnapshot,
 };
 /// The per-saga participant-context-set reservation RAII guard. Exposed only
@@ -144,7 +144,7 @@ pub use saga_prepared_state::{
 #[cfg(any(test, feature = "testing"))]
 pub use supervisor::SagaSetReservation;
 pub use supervisor::{
-    ACTOR_MAILBOX_CAPACITY, CrashWindow, CrossContextToolInvocationRequest, DurableProviders,
+    ACTOR_MAILBOX_CAPACITY, CrashWindow, CrossContextOutletInvocationRequest, DurableProviders,
     InviteMemberOutcome, MessageSigner, RestoredContexts, SagaAbortReason,
     SagaDivergenceRepairRecord, SagaError, SagaInput, SagaOutput, SagaSigningKeys, Supervisor,
     SupervisorConfig, WelcomeJoinRequest,

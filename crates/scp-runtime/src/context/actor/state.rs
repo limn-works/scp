@@ -790,8 +790,8 @@ pub struct ClassSState {
     /// Target-side (B-owned) durable capture of COMMITTED cross-context tool
     /// invocations, keyed by `SagaId` (spec §6.2.4 "Exactly-once execution with
     /// durable output capture"). Populated at Commit-B settle with the captured
-    /// tool output, the signed [`CrossContextToolReceipt`](scp_protocol::context::tools::cross_context_saga::CrossContextToolReceipt),
-    /// and the `tool_invoked_event_id`, so a Commit replayed after a crash
+    /// tool output, the signed [`CrossContextOutletReceipt`](scp_protocol::context::outlets::cross_context_saga::CrossContextOutletReceipt),
+    /// and the `outlet_invoked_event_id`, so a Commit replayed after a crash
     /// (§17.16.4) re-emits the STORED output and the IDENTICAL signed receipt —
     /// NEVER re-invoking the tool, never minting a fresh event id.
     ///
@@ -816,7 +816,7 @@ pub struct ClassSState {
     /// count; this note exists so that growth is a tracked retention decision,
     /// not a silent leak. No speculative compaction is built here.
     pub(crate) xctx_committed_outputs:
-        HashMap<SagaId, crate::context::supervisor::saga_prepared_state::CommittedToolInvocation>,
+        HashMap<SagaId, crate::context::supervisor::saga_prepared_state::CommittedOutletInvocation>,
 
     /// Caller-side (A-owned) durable set of COMMITTED cross-context tool
     /// invocations, keyed by `SagaId` (spec §6.2.4 "Commit", caller side;
@@ -851,7 +851,7 @@ pub struct ClassSState {
     /// deduction and the means to reverse it land atomically.
     ///
     /// **Why this exists.** The live
-    /// [`ToolEconomyReservation`](crate::context::tools_helpers::ToolEconomyReservation)
+    /// [`OutletEconomyReservation`](crate::context::outlets_helpers::OutletEconomyReservation)
     /// RAII carrier that normally reverses a caller reservation lives ONLY in
     /// the supervisor's in-memory saga context and dies with an actor/process
     /// crash. A `PreparingB`-window crash drives a CLEAN abort
@@ -912,7 +912,7 @@ pub struct ClassSStateSnapshot {
     pub(crate) xctx_nonce_dedup_ttl_secs: u64,
     /// Mirror of [`ClassSState::xctx_committed_outputs`].
     pub(crate) xctx_committed_outputs:
-        HashMap<SagaId, crate::context::supervisor::saga_prepared_state::CommittedToolInvocation>,
+        HashMap<SagaId, crate::context::supervisor::saga_prepared_state::CommittedOutletInvocation>,
     /// Mirror of [`ClassSState::xctx_committed_invocations`].
     pub(crate) xctx_committed_invocations: std::collections::HashSet<SagaId>,
     /// Mirror of [`ClassSState::xctx_caller_reservations`].
@@ -1259,11 +1259,11 @@ pub struct PerContextState {
 
     /// Target-side (B-owned) UCAN proof store for cross-context tool
     /// invocation (spec §6.2.4 normative (1)). Maps a `ucan_proof_id` — the
-    /// INDEX carried on the `CrossContextToolInvoke` envelope, never the proof
+    /// INDEX carried on the `CrossContextOutletInvoke` envelope, never the proof
     /// bytes — to the resolved [`UcanToken`](scp_protocol::crypto::ucan::UcanToken).
     /// At Prepare-B the target resolves the carried `ucan_proof_id` against THIS
     /// store and re-runs the full §7 validation re-bound to the carried
-    /// `caller_did` + `tool_registration_id` (the confused-deputy defense). The
+    /// `caller_did` + `outlet_registration_id` (the confused-deputy defense). The
     /// store doubles as the delegation-chain `ProofResolver` for that
     /// validation. Empty until a gated tool interface is established; the
     /// freshness/replay state ([`ClassSState::xctx_nonce_dedup`]) and this store
@@ -1919,7 +1919,7 @@ mod tests {
     fn class_s_and_governance_class_s_snapshot_restore_is_lossless() {
         use crate::context::supervisor::saga_journal::SagaId;
         use crate::context::supervisor::saga_prepared_state::{
-            CallerReservationRecord, CommittedToolInvocation, CrossContextToolInvocationPrepared,
+            CallerReservationRecord, CommittedOutletInvocation, CrossContextOutletInvocationPrepared,
             SagaPreparedState,
         };
 
@@ -1930,11 +1930,11 @@ mod tests {
         let saga_a = SagaId("saga-lossless-a".to_owned());
         state.class_s.saga_pending.insert(
             saga_a.clone(),
-            SagaPreparedState::CrossContextToolInvocation(CrossContextToolInvocationPrepared {
+            SagaPreparedState::CrossContextOutletInvocation(CrossContextOutletInvocationPrepared {
                 caller_context_id: [0x1Au8; 32],
                 target_context_id: [0x2Bu8; 32],
                 caller_did: DID("did:example:lossless-caller".to_owned()),
-                tool_registration_id: "lossless-tool-v1".to_owned(),
+                outlet_registration_id: "lossless-tool-v1".to_owned(),
                 ucan_proof_id: "lossless-ucan".to_owned(),
                 recorded_timestamp_ms: 1_700_000_000_123,
                 recorded_nonce: [0x3Cu8; 16],
@@ -1947,16 +1947,16 @@ mod tests {
             .record([0x3Cu8; 16], 1_700_000_000);
 
         let receipt =
-            scp_protocol::context::tools::cross_context_saga::CrossContextToolReceipt::sign(
+            scp_protocol::context::outlets::cross_context_saga::CrossContextOutletReceipt::sign(
                 &ed25519_dalek::SigningKey::from_bytes(&[0x4Du8; 32]),
-                scp_protocol::context::tools::cross_context_saga::CrossContextToolReceiptFields {
+                scp_protocol::context::outlets::cross_context_saga::CrossContextOutletReceiptFields {
                     caller_context_id: [0x1Au8; 32],
                     target_context_id: [0x2Bu8; 32],
                     caller_did: "did:example:lossless-caller".to_owned(),
                     nonce: [0x3Cu8; 16],
-                    tool_registration_id: "lossless-tool-v1".to_owned(),
+                    outlet_registration_id: "lossless-tool-v1".to_owned(),
                     output_jcs: br#"{"ok":1}"#.to_vec(),
-                    tool_invoked_event_id: "ToolInvoked:saga-lossless-committed".to_owned(),
+                    outlet_invoked_event_id: "ToolInvoked:saga-lossless-committed".to_owned(),
                     chain_depth: 2,
                     timestamp_ms: 1_700_000_000_123,
                 },
@@ -1965,10 +1965,10 @@ mod tests {
         let committed_saga = SagaId("saga-lossless-committed".to_owned());
         state.class_s.xctx_committed_outputs.insert(
             committed_saga.clone(),
-            CommittedToolInvocation {
+            CommittedOutletInvocation {
                 receipt,
                 output_bytes: br#"{"ok":1}"#.to_vec(),
-                tool_invoked_event_id: "ToolInvoked:saga-lossless-committed".to_owned(),
+                outlet_invoked_event_id: "ToolInvoked:saga-lossless-committed".to_owned(),
             },
         );
         state
@@ -2044,7 +2044,7 @@ mod tests {
         // saga_pending: the staged variant + its eight journaled fields survive.
         assert_eq!(state.class_s.saga_pending.len(), 1);
         // Single-variant enum: the bind is irrefutable.
-        let SagaPreparedState::CrossContextToolInvocation(inner) = state
+        let SagaPreparedState::CrossContextOutletInvocation(inner) = state
             .class_s
             .saga_pending
             .get(&saga_a)
@@ -2052,7 +2052,7 @@ mod tests {
         assert_eq!(inner.caller_context_id, [0x1Au8; 32]);
         assert_eq!(inner.target_context_id, [0x2Bu8; 32]);
         assert_eq!(inner.caller_did.0, "did:example:lossless-caller");
-        assert_eq!(inner.tool_registration_id, "lossless-tool-v1");
+        assert_eq!(inner.outlet_registration_id, "lossless-tool-v1");
         assert_eq!(inner.ucan_proof_id, "lossless-ucan");
         assert_eq!(inner.recorded_timestamp_ms, 1_700_000_000_123);
         assert_eq!(inner.recorded_nonce, [0x3Cu8; 16]);
