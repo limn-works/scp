@@ -4603,7 +4603,21 @@ mod tests {
             });
             tasks.spawn(async move {
                 // This one exits cleanly — must not be counted as panicked.
-                tokio::time::sleep(Duration::from_millis(1)).await;
+                //
+                // Uses `yield_now()` (one scheduler round-trip, then a clean
+                // exit) rather than a real-time `sleep`. A `sleep` here made
+                // the test flaky: the clean task then had to wait on the timer
+                // wheel to complete, and `drain_under_deadline` gates the
+                // outcome on a wall-clock deadline. Under CI scheduler
+                // starvation the drain could lose that race, flipping the
+                // outcome from `GracefulWithin` to `TimedOut` and blowing the
+                // `unreachable!` below — even though the panicked count itself
+                // is always correct. `yield_now()` completes without ever
+                // touching the timer wheel, so the drain finishes in a couple
+                // of poll cycles and never approaches the (generous) deadline,
+                // making the `GracefulWithin` outcome deterministic while still
+                // exercising a genuine clean-exit task the drain must not count.
+                tokio::task::yield_now().await;
             });
         }
         let outcome = instance
