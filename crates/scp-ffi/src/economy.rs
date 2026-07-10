@@ -108,7 +108,7 @@ fn parse_metrics(dict: &Bound<'_, PyDict>) -> PyResult<scp_core::economy::Observ
 ///
 /// * `policy_json` — The context's economic policy as a JSON string. Pass
 ///   empty string or `"null"` for free contexts (returns 0).
-/// * `action_type` — The action type string: `"MessageSend"`, `"ToolInvoke"`,
+/// * `action_type` — The action type string: `"MessageSend"`, `"OutletCall"`,
 ///   `"ContextJoin"`, `"SubscriptionPeriod"`, or `"ByteStored"`.
 /// * `metrics` — Dict with observable metric values: `context_message_rate`,
 ///   `member_count`, `relay_queue_depth`, `time_of_day`, `sender_velocity`,
