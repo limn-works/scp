@@ -2050,7 +2050,7 @@ pub struct OutletDefinition {
     pub cost: Option<OutletCostDefinition>,
 }
 
-/// Per-invocation cost metadata for a outlet (spec §5.4.1).
+/// Per-invocation cost metadata for an outlet (spec §5.4.1).
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct OutletCostDefinition {
     /// Cost per invocation in the smallest currency unit.
@@ -2063,7 +2063,7 @@ pub struct OutletCostDefinition {
     pub cost_formula: Option<String>,
 }
 
-/// Result of verifying a outlet against its test vectors.
+/// Result of verifying an outlet against its test vectors.
 ///
 /// See ADR-010 (Outlet Registry).
 #[derive(Debug, Clone, uniffi::Record)]
@@ -4459,7 +4459,7 @@ struct McpUniFfiBridgeProvider {
     bi: std::sync::Weak<crate::runtime::UniffiBridgeInstance>,
     agent_did: String,
     context_ids: Vec<String>,
-    /// Maximum time (in milliseconds) to wait for a outlet handler to complete.
+    /// Maximum time (in milliseconds) to wait for an outlet handler to complete.
     outlet_timeout_ms: u64,
     /// JWT-encoded UCAN token for outlet invocation authorization.
     agent_ucan_token: Option<String>,
@@ -4545,7 +4545,7 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
         // (#1549 round-2).
         let bi = self.upgrade_bi()?;
         // Primary check: UCAN token validation via the full 11-step ADR-016
-        // pipeline. Verifies the token grants tool_invoke:{tool_name} or
+        // pipeline. Verifies the token grants tool_invoke:{outlet_name} or
         // tool_invoke:* for this context.
         if let Some(ref token) = self.agent_ucan_token {
             // Build proof resolver from optional proof tokens.
@@ -13093,7 +13093,7 @@ impl Scp {
             })?
     }
 
-    /// Invokes a outlet across context boundaries as an atomic two-phase saga
+    /// Invokes an outlet across context boundaries as an atomic two-phase saga
     /// (spec §6.2.4, ADR-049 §3a).
     ///
     /// Unlike [`Self::outlet_invoke_cross_context`] (the synchronous,
@@ -20346,7 +20346,7 @@ mod tests {
         }
     }
 
-    /// `registered_at` on a outlet registered via the `UniFFI` bridge must be a
+    /// `registered_at` on an outlet registered via the `UniFFI` bridge must be a
     /// seconds-epoch timestamp, not milliseconds or hardcoded 0.
     /// Calls the actual `outlet_register` bridge function and inspects the
     /// stored `OutletRegistration`. Catches the original bug from issue #871.

@@ -172,7 +172,7 @@ class OutletsConformanceTest {
                     ConformanceFixture(
                         testId = "outlet-register-001",
                         category = "outlets",
-                        description = "Register a outlet in a context",
+                        description = "Register an outlet in a context",
                         operation = "outlet_register",
                         input =
                             mapOf(

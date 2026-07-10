@@ -2,7 +2,7 @@
  * Outlet invocation demo.
  *
  * Starts an in-memory relay via the caller-owned `SCP`, creates an
- * identity, creates a context with outlet capabilities, registers a outlet
+ * identity, creates a context with outlet capabilities, registers an outlet
  * with test vectors, mints a UCAN token, invokes the outlet with
  * authorization, and reports the result.
  *
@@ -31,7 +31,7 @@ async function main(): Promise<void> {
     // 3. Wire the bridge's transport to the relay.
     await scp.configureRelayTransport(relay.relayUrl, identity.did);
 
-    // 4. Define a outlet with test vectors.
+    // 4. Define an outlet with test vectors.
     const weatherOutlet: OutletDefinition = defineOutletDefinition({
       name: "weather",
       description: "Get current weather for a city",

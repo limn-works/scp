@@ -1532,7 +1532,7 @@ pub struct UcanContextState {
     pub outlet_registry: OutletRegistry,
     /// Registered outlet handlers keyed by outlet ID.
     ///
-    /// When a outlet is invoked, the handler is looked up here and called with
+    /// When an outlet is invoked, the handler is looked up here and called with
     /// the validated JSON input. If no handler is registered, the invocation
     /// falls back to echoing the validated input (echo mode).
     pub outlet_handlers: HashMap<String, OutletHandler>,
@@ -1824,7 +1824,7 @@ pub fn sync_ceiling_from_params(
     })
 }
 
-/// Registers a outlet handler for a outlet in a context.
+/// Registers an outlet handler for an outlet in a context.
 ///
 /// The handler will be called when the outlet is invoked. The outlet must already
 /// be registered in the context's outlet registry.

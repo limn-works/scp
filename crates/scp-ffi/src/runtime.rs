@@ -1422,7 +1422,7 @@ pub struct FfiBridgeState {
     /// Registered outlet handlers keyed by outlet ID.
     ///
     /// Python callers register callable handlers via
-    /// [`register_outlet_handler`]. When a outlet is invoked through
+    /// [`register_outlet_handler`]. When an outlet is invoked through
     /// `FfiBridgeProvider::invoke_tool`, the handler is looked up here and
     /// called with the validated JSON input. If no handler is registered,
     /// the invocation falls back to echoing the validated input.
@@ -1592,7 +1592,7 @@ pub fn context_ids_for_member(bi: &PyBridgeInstance, member_did: &str) -> Vec<St
         .collect()
 }
 
-/// Registers a outlet handler for a specific outlet in a context.
+/// Registers an outlet handler for a specific outlet in a context.
 ///
 /// The handler is a sync closure that takes JSON input and returns JSON
 /// output. It is called by `FfiBridgeProvider::invoke_tool` when the

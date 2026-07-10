@@ -28,7 +28,7 @@ async function main(): Promise<void> {
       }),
     );
 
-    // Register a outlet in the context.
+    // Register an outlet in the context.
     const outlet = defineOutletDefinition({
       name: "summarize",
       description: "Summarize text content",

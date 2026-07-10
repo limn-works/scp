@@ -2931,7 +2931,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func outletInvokeCrossContext(sourceHandle: ContextHandle, targetHandle: ContextHandle, outletId: String, inputJson: String, identity: Identity, ucanToken: String, chainDepth: UInt8, proofTokens: [String]?) async throws  -> String
     
     /**
-     * Invokes a outlet across context boundaries as an atomic two-phase saga
+     * Invokes an outlet across context boundaries as an atomic two-phase saga
      * (spec §6.2.4, ADR-049 §3a).
      *
      * Unlike [`Self::outlet_invoke_cross_context`] (the synchronous,
@@ -5899,7 +5899,7 @@ open func outletInvokeCrossContext(sourceHandle: ContextHandle, targetHandle: Co
 }
     
     /**
-     * Invokes a outlet across context boundaries as an atomic two-phase saga
+     * Invokes an outlet across context boundaries as an atomic two-phase saga
      * (spec §6.2.4, ADR-049 §3a).
      *
      * Unlike [`Self::outlet_invoke_cross_context`] (the synchronous,
@@ -10038,7 +10038,7 @@ public func FfiConverterTypeMessage_lower(_ value: Message) -> RustBuffer {
 
 
 /**
- * Per-invocation cost metadata for a outlet (spec §5.4.1).
+ * Per-invocation cost metadata for an outlet (spec §5.4.1).
  */
 public struct OutletCostDefinition {
     /**
@@ -10322,7 +10322,7 @@ public func FfiConverterTypeOutletDefinition_lower(_ value: OutletDefinition) ->
 
 
 /**
- * Result of verifying a outlet against its test vectors.
+ * Result of verifying an outlet against its test vectors.
  *
  * See ADR-010 (Outlet Registry).
  */

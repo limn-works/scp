@@ -1317,7 +1317,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       };
     }
 
-    it("scp.outletRegister returns a outlet ID", async () => {
+    it("scp.outletRegister returns an outlet ID", async () => {
       const identity = await scp.identityCreate("in_memory");
       const ctx = await scp.contextCreate(
         identity,

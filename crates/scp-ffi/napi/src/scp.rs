@@ -2940,7 +2940,7 @@ impl Scp {
         .await
     }
 
-    /// Invokes a outlet across context boundaries as an atomic two-phase saga
+    /// Invokes an outlet across context boundaries as an atomic two-phase saga
     /// (spec §6.2.4, ADR-049 §3a).
     ///
     /// Unlike [`Self::outlet_invoke_cross_context`] (the synchronous,

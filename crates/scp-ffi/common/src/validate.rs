@@ -65,10 +65,10 @@ pub const MAX_CONTEXT_ID_LEN: usize = 256;
 /// allow generous headroom for other methods.
 pub const MAX_DID_LEN: usize = 512;
 
-/// Maximum length for a outlet name.
+/// Maximum length for an outlet name.
 pub const MAX_OUTLET_NAME_LEN: usize = 256;
 
-/// Maximum length for a outlet ID (spec §5.4.1).
+/// Maximum length for an outlet ID (spec §5.4.1).
 pub const MAX_OUTLET_ID_LEN: usize = 128;
 
 /// Maximum length for a capability URI string.
@@ -312,7 +312,7 @@ pub fn validate_did(did: &str) -> Result<(), ValidationError> {
 // Outlet name / ID validation
 // ---------------------------------------------------------------------------
 
-/// Validates a outlet name string.
+/// Validates an outlet name string.
 ///
 /// Outlet names are human-readable identifiers used in outlet registration.
 /// Validation enforces:
@@ -340,7 +340,7 @@ pub fn validate_outlet_name(name: &str) -> Result<(), ValidationError> {
     Ok(())
 }
 
-/// Validates a outlet ID string.
+/// Validates an outlet ID string.
 ///
 /// Outlet IDs are derived from outlet names (e.g., `outlet-my-outlet`). Per spec
 /// §5.4.1, outlet IDs must contain only lowercase alphanumeric characters,
@@ -1544,7 +1544,7 @@ mod tests {
             registration: Box::new(OutletRegistration {
                 outlet_id: "test-outlet".to_owned(),
                 name: "outlet-{inject}".to_owned(),
-                description: "a outlet".to_owned(),
+                description: "an outlet".to_owned(),
                 schema: OutletSchema {
                     input_schema: serde_json::json!({"type": "object"}),
                     output_schema: serde_json::json!({"type": "object"}),

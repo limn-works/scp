@@ -622,7 +622,7 @@ export interface Capability {
 // Outlets
 // ---------------------------------------------------------------------------
 
-/** Definition of a outlet that can be registered in a context. */
+/** Definition of an outlet that can be registered in a context. */
 export interface OutletDefinition {
   /** Human-readable outlet name. */
   readonly name: string;
@@ -642,7 +642,7 @@ export interface OutletDefinition {
   readonly cost?: OutletCost;
 }
 
-/** Per-invocation cost metadata for a outlet (spec section 5.4.1). */
+/** Per-invocation cost metadata for an outlet (spec section 5.4.1). */
 export interface OutletCost {
   /**
    * Cost per invocation in the smallest currency unit.
@@ -674,7 +674,7 @@ export interface TestVector {
 // Outlet invocation
 // ---------------------------------------------------------------------------
 
-/** Result of verifying a outlet against its test vectors. */
+/** Result of verifying an outlet against its test vectors. */
 export interface OutletVerificationResult {
   /** The verified outlet's ID. */
   readonly outletId: string;
@@ -690,7 +690,7 @@ export interface OutletSessionResult {
   readonly sessionId: string;
 }
 
-/** Result of invoking a outlet within a stateful session, with provenance metadata (spec section 6.2.1). */
+/** Result of invoking an outlet within a stateful session, with provenance metadata (spec section 6.2.1). */
 export interface OutletSessionInvokeResult {
   /** The serialized output from the outlet invocation (JSON string). */
   readonly output: string;

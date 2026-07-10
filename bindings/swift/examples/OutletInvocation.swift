@@ -1,4 +1,4 @@
-// Outlet invocation: register a outlet and invoke it within a context.
+// Outlet invocation: register an outlet and invoke it within a context.
 //
 // Demonstrates OutletDefinition construction and outlet invocation through
 // an explicit `SCP` instance (ADR-048).

@@ -55,7 +55,7 @@ pub fn validate_did(did: &str) -> Result<(), ScpPyError> {
     scp_ffi_common::validate::validate_did(did).map_err(|e| ScpPyError::validation(e.message))
 }
 
-/// Validates a outlet name string. See [`scp_ffi_common::validate::validate_outlet_name`].
+/// Validates an outlet name string. See [`scp_ffi_common::validate::validate_outlet_name`].
 ///
 /// # Errors
 ///
@@ -65,7 +65,7 @@ pub fn validate_outlet_name(name: &str) -> Result<(), ScpPyError> {
         .map_err(|e| ScpPyError::validation(e.message))
 }
 
-/// Validates a outlet ID string. See [`scp_ffi_common::validate::validate_outlet_id`].
+/// Validates an outlet ID string. See [`scp_ffi_common::validate::validate_outlet_id`].
 ///
 /// # Errors
 ///
