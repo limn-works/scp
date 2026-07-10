@@ -634,7 +634,7 @@ mod tests {
                 subject_did,
                 1600,
                 3,
-                b"review-tool".to_vec(),
+                b"review-outlet".to_vec(),
             ),
         ];
 
@@ -675,7 +675,7 @@ mod tests {
             input
                 .participation_record
                 .tool_invocations
-                .get("review-tool"),
+                .get("review-outlet"),
             Some(&1)
         );
 

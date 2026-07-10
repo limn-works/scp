@@ -144,7 +144,7 @@ impl PyScp {
                 };
                 // Defense-in-depth: validate path string at FFI boundary
                 // (matches the project pattern for every other caller-supplied
-                // string — DID, relay URL, tool name, etc.). #1543 PR-C
+                // string — DID, relay URL, outlet name, etc.). #1543 PR-C
                 // security review found this was the lone unvalidated string
                 // input. See crates/scp-ffi/common/src/validate.rs.
                 scp_ffi_common::validate::validate_storage_path(&path_str).map_err(|e| {

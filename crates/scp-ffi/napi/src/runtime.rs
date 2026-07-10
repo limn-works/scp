@@ -35,7 +35,7 @@ use scp_core::context::builder::{ContextEventLogProvider, ContextTransportProvid
 use scp_core::context::persistence::ContextPersistence;
 use scp_core::context::roles::{ContextRoleState, default_ceiling};
 use scp_core::context::state::ContextSnapshot;
-use scp_core::context::tools::{SessionStore, ToolRegistry};
+use scp_core::context::outlets::{SessionStore, OutletRegistry};
 use scp_core::crypto::ucan::nonce::NonceTracker;
 use scp_core::crypto::ucan::revoke::RevocationList;
 use scp_core::store::ProtocolRepository;
@@ -185,7 +185,7 @@ pub struct NapiBridgeInstance {
     pub(crate) core: CoreFields,
 
     /// Per-context UCAN validation state (revocation lists, nonce trackers,
-    /// role state, tool registries, tool handlers, session stores).
+    /// role state, outlet registries, outlet handlers, session stores).
     ///
     /// Previously stored type-erased in `CoreFields::ucan_registry`. Post
     /// PR 1, the registry lives here as a typed field and is cleared by
@@ -682,9 +682,9 @@ impl Drop for NapiBridgeInstance {
     }
 }
 
-/// A tool handler is a closure that takes validated JSON input and returns
-/// JSON output or an error string. Registered via [`register_tool_handler`].
-pub type ToolHandler =
+/// A outlet handler is a closure that takes validated JSON input and returns
+/// JSON output or an error string. Registered via [`register_outlet_handler`].
+pub type OutletHandler =
     Arc<dyn Fn(serde_json::Value) -> Result<serde_json::Value, String> + Send + Sync>;
 
 // ---------------------------------------------------------------------------
@@ -1520,23 +1520,23 @@ where
 /// Per-context UCAN validation state (NAPI bridge).
 ///
 /// Wraps [`scp_ffi_common::bridge_runtime::UcanContextStateCore`] with
-/// NAPI-specific fields for tool management and role state. The core
+/// NAPI-specific fields for outlet management and role state. The core
 /// fields (revocation list, nonce tracker, ceiling, creator DID, event log)
 /// are shared with the `UniFFI` bridge (#1447).
 pub struct UcanContextState {
     /// Core UCAN validation state shared with `UniFFI` bridge.
     pub core: scp_ffi_common::bridge_runtime::UcanContextStateCore,
-    /// Role state for capability checking (tool registration, invocation).
+    /// Role state for capability checking (outlet registration, invocation).
     pub role_state: ContextRoleState,
-    /// Tool registry for this context (cross-context + session support).
-    pub tool_registry: ToolRegistry,
-    /// Registered tool handlers keyed by tool ID.
+    /// Outlet registry for this context (cross-context + session support).
+    pub outlet_registry: OutletRegistry,
+    /// Registered outlet handlers keyed by outlet ID.
     ///
-    /// When a tool is invoked, the handler is looked up here and called with
+    /// When a outlet is invoked, the handler is looked up here and called with
     /// the validated JSON input. If no handler is registered, the invocation
     /// falls back to echoing the validated input (echo mode).
-    pub tool_handlers: HashMap<String, ToolHandler>,
-    /// Session store for stateful tool sessions (spec section 6.2.1).
+    pub outlet_handlers: HashMap<String, OutletHandler>,
+    /// Session store for stateful outlet sessions (spec section 6.2.1).
     pub session_store: SessionStore,
 }
 
@@ -1623,8 +1623,8 @@ fn build_ucan_context_state(
             event_log: EventLog::new(context_id.to_owned()),
         },
         role_state,
-        tool_registry: ToolRegistry::new(),
-        tool_handlers: HashMap::new(),
+        outlet_registry: OutletRegistry::new(),
+        outlet_handlers: HashMap::new(),
         session_store: SessionStore::new(),
     })
 }
@@ -1739,7 +1739,7 @@ pub fn remove_context(bi: &NapiBridgeInstance, context_id: &str) {
 ///
 /// Must be called after any governance action that modifies role state
 /// (`ChangeRole`, `ModifyCeiling`, `AddMember`, `RemoveMember`, etc.) so that
-/// the NAPI-side copy used by UCAN/tool capability checks stays current.
+/// the NAPI-side copy used by UCAN/outlet capability checks stays current.
 ///
 /// # Errors
 ///
@@ -1795,7 +1795,7 @@ pub async fn sync_role_state_from_manager(
 /// [`ContextHandle`](scp_core::context::ContextHandle).
 ///
 /// Peer of [`sync_role_state_from_manager`] (which syncs role state); this syncs
-/// the UCAN/tool capability-check ceiling string set. Used by
+/// the UCAN/outlet capability-check ceiling string set. Used by
 /// [`crate::context::context_join_from_welcome_on`]: the joiner no longer
 /// supplies a ceiling, so the FFI state is registered with the DEFAULT ceiling as
 /// a reversible precheck, then this overwrites it with the ceiling AUTHENTICATED
@@ -1824,32 +1824,32 @@ pub fn sync_ceiling_from_params(
     })
 }
 
-/// Registers a tool handler for a tool in a context.
+/// Registers a outlet handler for a outlet in a context.
 ///
-/// The handler will be called when the tool is invoked. The tool must already
-/// be registered in the context's tool registry.
+/// The handler will be called when the outlet is invoked. The outlet must already
+/// be registered in the context's outlet registry.
 ///
 /// # Errors
 ///
-/// Returns `ScpNapiError::Context` if the context is not found or the tool
+/// Returns `ScpNapiError::Context` if the context is not found or the outlet
 /// is not registered.
-pub fn register_tool_handler(
+pub fn register_outlet_handler(
     bi: &NapiBridgeInstance,
     context_id: &str,
-    tool_id: &str,
-    handler: ToolHandler,
+    outlet_id: &str,
+    handler: OutletHandler,
 ) -> Result<(), ScpNapiError> {
     with_context(bi, context_id, |st| {
-        if st.tool_registry.get(tool_id).is_none() {
+        if st.outlet_registry.get(outlet_id).is_none() {
             return Err(ScpNapiError::Context {
                 message: format!(
-                    "tool '{tool_id}' not found in context '{context_id}' \
-                     -- register the tool before adding a handler"
+                    "outlet '{outlet_id}' not found in context '{context_id}' \
+                     -- register the outlet before adding a handler"
                 ),
                 code: codes::CTX_2023.to_owned(),
             });
         }
-        st.tool_handlers.insert(tool_id.to_owned(), handler);
+        st.outlet_handlers.insert(outlet_id.to_owned(), handler);
         Ok(())
     })
 }
@@ -1920,8 +1920,8 @@ pub fn register_test_context(bi: &NapiBridgeInstance, context_id: &str, creator_
             creator_did: creator_did.to_owned(),
         },
         role_state,
-        tool_registry: ToolRegistry::new(),
-        tool_handlers: HashMap::new(),
+        outlet_registry: OutletRegistry::new(),
+        outlet_handlers: HashMap::new(),
         session_store: SessionStore::new(),
     };
 

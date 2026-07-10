@@ -336,7 +336,7 @@ impl crate::scp::PyScp {
 /// Appends a provenance event (`ProvenanceAttached` or `ProvenanceReceived`)
 /// to the event log for the given context on the given bridge instance.
 ///
-/// Follows the unsigned-event pattern used by `ToolInvoked` in `mcp.rs`.
+/// Follows the unsigned-event pattern used by `OutletInvoked` in `mcp.rs`.
 fn append_provenance_event(
     bi: &PyBridgeInstance,
     context_id: &str,

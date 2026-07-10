@@ -13,7 +13,7 @@
 //! | `SCP-PERM-` | 3000-3999 | UCAN / permission errors |
 //! | `SCP-CRYPTO-` | 4000-4999 | Cryptographic errors |
 //! | `SCP-TRANS-` | 5000-5999 | Transport errors |
-//! | `SCP-TOOL-` | 6000-6999 | Tool errors |
+//! | `SCP-TOOL-` | 6000-6999 | Outlet errors |
 //! | `SCP-VALID-` | 7000-7999 | Validation errors |
 //!
 //! # napi-rs error model
@@ -94,9 +94,9 @@ pub enum ScpNapiError {
         code: String,
     },
 
-    /// A tool operation failed (registration, invocation, verification).
-    #[error("[{code}] tool error: {message}")]
-    Tool {
+    /// A outlet operation failed (registration, invocation, verification).
+    #[error("[{code}] outlet error: {message}")]
+    Outlet {
         /// Human-readable error message.
         message: String,
         /// Stable error code (e.g. `SCP-TOOL-6001`).
@@ -112,7 +112,7 @@ pub enum ScpNapiError {
         code: String,
     },
 
-    /// A §6.2.4 cross-context tool-invocation saga aborted at a Prepare phase
+    /// A §6.2.4 cross-context outlet-invocation saga aborted at a Prepare phase
     /// (ADR-049 §3a).
     ///
     /// This terminal surfaces a §6.2.4 saga `Aborted` and, like its `PyO3` and
@@ -229,7 +229,7 @@ impl From<scp_identity::IdentityError> for ScpNapiError {
 /// Extracts a leading `SCP-XXX-NNNN` error code from a message body, if any.
 ///
 /// Mirrors the `PyO3` bridge's `extract_scp_code` helper. Used to recover
-/// economy (12xxx) and tool-invocation (6xxx) codes embedded inside
+/// economy (12xxx) and outlet-invocation (6xxx) codes embedded inside
 /// `ContextError::PermissionDenied(String)` so TypeScript callers can
 /// check `.code` instead of string-matching the message body.
 pub(crate) fn extract_scp_code(message: &str) -> Option<String> {
@@ -333,7 +333,7 @@ impl From<scp_core::context::ContextError> for ScpNapiError {
             },
             // Recover embedded SCP-ECON-/SCP-TOOL-/SCP-PERM- codes from
             // the runtime's `PermissionDenied(String)` catch-all so the
-            // typed-envelope contract holds for tool-economy failures.
+            // typed-envelope contract holds for outlet-economy failures.
             CE::PermissionDenied(msg) => {
                 let code = extract_scp_code(msg).unwrap_or_else(|| codes::PERM_3001.to_owned());
                 if code.starts_with("SCP-PERM-") {
@@ -342,7 +342,7 @@ impl From<scp_core::context::ContextError> for ScpNapiError {
                         code,
                     }
                 } else if code.starts_with("SCP-TOOL-") {
-                    Self::Tool {
+                    Self::Outlet {
                         message: format!("{e}"),
                         code,
                     }
@@ -416,33 +416,33 @@ impl From<scp_core::context::promotion::PromotionError> for ScpNapiError {
     }
 }
 
-impl From<scp_core::context::tools::ToolError> for ScpNapiError {
-    fn from(e: scp_core::context::tools::ToolError) -> Self {
-        Self::Tool {
+impl From<scp_core::context::outlets::OutletError> for ScpNapiError {
+    fn from(e: scp_core::context::outlets::OutletError) -> Self {
+        Self::Outlet {
             message: format!(
-                "tool operation failed: {e} — check tool registration, permissions, and input schema"
+                "outlet operation failed: {e} — check outlet registration, permissions, and input schema"
             ),
-            code: codes::TOOL_6001.to_owned(),
+            code: codes::OUTLET_6001.to_owned(),
         }
     }
 }
 
-impl From<scp_core::context::tools::invoke::InvocationError> for ScpNapiError {
-    fn from(e: scp_core::context::tools::invoke::InvocationError) -> Self {
-        Self::Tool {
+impl From<scp_core::context::outlets::invoke::InvocationError> for ScpNapiError {
+    fn from(e: scp_core::context::outlets::invoke::InvocationError) -> Self {
+        Self::Outlet {
             message: format!(
-                "tool invocation failed: {e} — verify tool ID, input, and caller permissions"
+                "outlet invocation failed: {e} — verify outlet ID, input, and caller permissions"
             ),
-            code: codes::TOOL_6002.to_owned(),
+            code: codes::OUTLET_6002.to_owned(),
         }
     }
 }
 
-impl From<scp_core::context::tools::schema::SchemaValidationError> for ScpNapiError {
-    fn from(e: scp_core::context::tools::schema::SchemaValidationError) -> Self {
+impl From<scp_core::context::outlets::schema::SchemaValidationError> for ScpNapiError {
+    fn from(e: scp_core::context::outlets::schema::SchemaValidationError) -> Self {
         Self::Validation {
             message: format!(
-                "schema validation failed: {e} — check input against the tool's JSON Schema"
+                "schema validation failed: {e} — check input against the outlet's JSON Schema"
             ),
             code: codes::VALID_7001.to_owned(),
         }

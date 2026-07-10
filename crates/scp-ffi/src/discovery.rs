@@ -20,9 +20,9 @@
 //! - `PyScp::petname_get_for_context` -- Get the petname assigned to a context.
 //! - `PyScp::petname_set_context` -- Set a petname for a context.
 //! - `PyScp::petname_remove_context` -- Remove a petname from a context.
-//! - `PyScp::handle_register` -- Register a handle in a context with discovery tools.
-//! - `PyScp::handle_lookup` -- Look up a handle in a context with discovery tools.
-//! - `PyScp::handle_deregister` -- Deregister a handle from a context with discovery tools.
+//! - `PyScp::handle_register` -- Register a handle in a context with discovery outlets.
+//! - `PyScp::handle_lookup` -- Look up a handle in a context with discovery outlets.
+//! - `PyScp::handle_deregister` -- Deregister a handle from a context with discovery outlets.
 //! - `PyScp::scope_register` -- Register a scope name (§22.3.5, ADR-043).
 //! - `PyScp::scope_lookup` -- Look up a scope name (§22.3.5, ADR-043).
 //! - `PyScp::scope_deregister` -- Deregister a scope name (§22.3.5, ADR-043).
@@ -735,7 +735,7 @@ impl crate::scp::PyScp {
     // Handle registry methods (§22.3.1)
     // -----------------------------------------------------------------------
 
-    /// Registers a handle in a context with discovery tools.
+    /// Registers a handle in a context with discovery outlets.
     ///
     /// # Arguments
     ///
@@ -801,7 +801,7 @@ impl crate::scp::PyScp {
         })
     }
 
-    /// Looks up a handle in a context with discovery tools.
+    /// Looks up a handle in a context with discovery outlets.
     ///
     /// # Arguments
     ///
@@ -870,7 +870,7 @@ impl crate::scp::PyScp {
         })
     }
 
-    /// Deregisters a handle from a context with discovery tools.
+    /// Deregisters a handle from a context with discovery outlets.
     ///
     /// Only succeeds if the provided DID matches the handle owner.
     ///
@@ -943,7 +943,7 @@ fn parse_handle_target(json: &str) -> PyResult<HandleTarget> {
 impl crate::scp::PyScp {
     /// Registers a scope name in a scope registry.
     ///
-    /// Scope tools use independent structs and separate storage from handle tools.
+    /// Scope outlets use independent structs and separate storage from handle outlets.
     /// `ScopeTarget` is context-only by construction — no identity variant.
     ///
     /// # Arguments

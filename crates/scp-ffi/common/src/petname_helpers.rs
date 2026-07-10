@@ -345,7 +345,7 @@ impl HandleQuerier for LocalHandleQuerier<'_> {
         _platform: Option<&str>,
     ) -> Vec<AddressResolution> {
         // Attestation handle resolution requires querying attestation indexes
-        // in contexts with discovery tools. Not available in FFI bridge — requires
+        // in contexts with discovery outlets. Not available in FFI bridge — requires
         // context query infrastructure.
         Vec::new()
     }

@@ -743,11 +743,11 @@ pub struct PyParticipationRecord {
     /// Count of governance actions initiated by this identity.
     #[pyo3(get)]
     pub governance_actions_by: u64,
-    /// Total tool invocations across all tool types.
+    /// Total outlet invocations across all outlet types.
     #[pyo3(get)]
     pub tool_invocation_count: u64,
     /// Whether `tool_invocation_count` is anchored in the canonical Merkle log.
-    /// `false` until ADR-051 makes `ToolInvoked` a convergent leaf (§7.3.2) —
+    /// `false` until ADR-051 makes `OutletInvoked` a convergent leaf (§7.3.2) —
     /// consumers MUST NOT treat the count as Merkle-proven while this is `false`.
     #[pyo3(get)]
     pub tool_invocation_count_anchored: bool,

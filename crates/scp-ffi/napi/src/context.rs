@@ -5365,7 +5365,7 @@ fn parse_template_id_napi(
         "GroupDiscussion" => Ok(TemplateId::GroupDiscussion),
         "PublicBroadcast" => Ok(TemplateId::PublicBroadcast),
         "GatedBroadcast" => Ok(TemplateId::GatedBroadcast),
-        "scp:template/tool-interface" | "ToolInterfaceTemplate" => {
+        "scp:template/tool-interface" | "OutletInterfaceTemplate" => {
             Ok(TemplateId::ToolInterfaceTemplate)
         }
         "PaidService" => Ok(TemplateId::PaidService),

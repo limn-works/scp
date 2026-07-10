@@ -784,7 +784,7 @@ pub(crate) fn build_proof_resolver(
     Ok(BridgeProofResolver { proofs })
 }
 
-/// Public alias for `build_proof_resolver` used by `tools.rs` and `mcp.rs`.
+/// Public alias for `build_proof_resolver` used by `outlets.rs` and `mcp.rs`.
 ///
 /// Accepts the same `Option<&[String]>` parameter as the internal function.
 pub(crate) fn build_proof_resolver_from_tokens(

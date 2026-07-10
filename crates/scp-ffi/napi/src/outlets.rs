@@ -1,10 +1,10 @@
-//! napi-rs bridge for tool operations.
+//! napi-rs bridge for outlet operations.
 //!
-//! Exposes tool registration, invocation, and verification:
+//! Exposes outlet registration, invocation, and verification:
 //!
-//! - `tool_register` — Register a tool in a context.
-//! - `tool_invoke` — Invoke a tool within a context.
-//! - `tool_verify` — Verify a tool against its test vectors.
+//! - `outlet_register` — Register a outlet in a context.
+//! - `outlet_invoke` — Invoke a outlet within a context.
+//! - `outlet_verify` — Verify a outlet against its test vectors.
 //!
 //! See ADR-022 in `.docs/adrs/phase-4.md`.
 
@@ -12,19 +12,19 @@ use napi_derive::napi;
 use scp_clock::Clock;
 use scp_ffi_common::error_codes as codes;
 use scp_ffi_common::validate::{
-    validate_did, validate_tool_id, validate_tool_name, validate_ucan_token,
+    validate_did, validate_outlet_id, validate_outlet_name, validate_ucan_token,
 };
 
 use crate::context::NapiContextHandle;
 use crate::error::ScpNapiError;
 
-/// Validates a UCAN token for tool invocation authorization.
+/// Validates a UCAN token for outlet invocation authorization.
 ///
 /// Performs the full 11-step ADR-016 validation pipeline.
-fn validate_ucan_for_tool(
+fn validate_ucan_for_outlet(
     bi: &crate::runtime::NapiBridgeInstance,
     context_id: &str,
-    tool_id: &str,
+    outlet_id: &str,
     identity_did: &str,
     ucan_token: &str,
     proof_resolver: &scp_ffi_common::BridgeProofResolver,
@@ -54,46 +54,46 @@ fn validate_ucan_for_tool(
             clock: &scp_clock::SystemClock,
         };
 
-        scp_core::context::tools::validate_tool_invocation_ucan(
-            ucan_token, context_id, tool_id, &mut ctx,
+        scp_core::context::outlets::validate_outlet_invocation_ucan(
+            ucan_token, context_id, outlet_id, &mut ctx,
         )
         .map_err(|e| ScpNapiError::Permission {
-            message: format!("UCAN authorization failed for tool '{tool_id}': {e}"),
+            message: format!("UCAN authorization failed for outlet '{outlet_id}': {e}"),
             code: codes::PERM_3001.to_owned(),
         })
     })
 }
 
 // ---------------------------------------------------------------------------
-// NapiToolDefinition — tool definition for registration
+// NapiOutletDefinition — outlet definition for registration
 // ---------------------------------------------------------------------------
 
-/// Tool definition for registration in a context.
+/// Outlet definition for registration in a context.
 ///
-/// See ADR-010 (Tool Registry) and spec §5.4.1 (Tools).
+/// See ADR-010 (Outlet Registry) and spec §5.4.1 (Outlets).
 #[napi(object)]
-pub struct NapiToolDefinition {
-    /// Human-readable tool name.
+pub struct NapiOutletDefinition {
+    /// Human-readable outlet name.
     pub name: String,
-    /// Tool description.
+    /// Outlet description.
     pub description: String,
-    /// JSON Schema for tool input (as a JSON string).
+    /// JSON Schema for outlet input (as a JSON string).
     pub input_schema_json: String,
-    /// JSON Schema for tool output (as a JSON string).
+    /// JSON Schema for outlet output (as a JSON string).
     pub output_schema_json: String,
-    /// DID of the tool operator (responsible party).
+    /// DID of the outlet operator (responsible party).
     pub operator_did: String,
     /// Test vectors for integrity verification (serialized as JSON string).
     pub test_vectors_json: Option<String>,
     /// SHA-256 hash of the implementation binary (32 bytes).
     pub implementation_hash: Option<Vec<u8>>,
     /// Optional per-invocation cost metadata (spec §5.4.1).
-    pub cost: Option<NapiToolCost>,
+    pub cost: Option<NapiOutletCost>,
 }
 
-/// Per-invocation cost metadata for a tool (spec §5.4.1).
+/// Per-invocation cost metadata for a outlet (spec §5.4.1).
 #[napi(object)]
-pub struct NapiToolCost {
+pub struct NapiOutletCost {
     /// Cost per invocation in the smallest currency unit.
     ///
     /// Crosses the napi boundary as a JS `bigint` (`BigInt`) so a full `u64`
@@ -109,14 +109,14 @@ pub struct NapiToolCost {
 }
 
 // ---------------------------------------------------------------------------
-// NapiToolVerificationResult — result of tool verification
+// NapiOutletVerificationResult — result of outlet verification
 // ---------------------------------------------------------------------------
 
-/// Result of verifying a tool against its registered test vectors.
+/// Result of verifying a outlet against its registered test vectors.
 #[napi(object)]
-pub struct NapiToolVerificationResult {
-    /// The verified tool's ID.
-    pub tool_id: String,
+pub struct NapiOutletVerificationResult {
+    /// The verified outlet's ID.
+    pub outlet_id: String,
     /// `true` if all test vectors passed.
     pub passed: bool,
     /// Failure messages for vectors that did not pass. Empty on success.
@@ -124,7 +124,7 @@ pub struct NapiToolVerificationResult {
 }
 
 // ---------------------------------------------------------------------------
-// Validation helpers for tool registration inputs
+// Validation helpers for outlet registration inputs
 // ---------------------------------------------------------------------------
 
 /// Validates and parses a JSON schema string.
@@ -150,7 +150,7 @@ fn validate_schema_json(json: &str, field_name: &str) -> napi::Result<serde_json
 /// JSON returns `SCP-VALID-7037`.
 fn validate_test_vectors_json(
     json: Option<&str>,
-) -> napi::Result<Vec<scp_core::context::tools::TestVector>> {
+) -> napi::Result<Vec<scp_core::context::outlets::OutletTestVector>> {
     json.map_or_else(
         || Ok(Vec::new()),
         |s| {
@@ -188,35 +188,35 @@ fn validate_implementation_hash(bytes: Option<&[u8]>) -> napi::Result<[u8; 32]> 
 // Bridge functions
 // ---------------------------------------------------------------------------
 
-/// Per-bridge-instance implementation of [`tool_register`].
+/// Per-bridge-instance implementation of [`outlet_register`].
 #[allow(clippy::unused_async)] // preserves signature symmetry with the async free function
-pub(crate) async fn tool_register_on(
+pub(crate) async fn outlet_register_on(
     bi: &crate::runtime::NapiBridgeInstance,
     handle: &NapiContextHandle,
-    definition: NapiToolDefinition,
+    definition: NapiOutletDefinition,
 ) -> napi::Result<String> {
     crate::napi_check_handle!(&bi.core, handle);
-    validate_tool_name(&definition.name).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+    validate_outlet_name(&definition.name).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
 
     let state_str = handle.state()?;
     if state_str != "active" {
-        return Err(ScpNapiError::Tool {
+        return Err(ScpNapiError::Outlet {
             message: format!(
-                "cannot register tool in context in {state_str:?} state — context must be active"
+                "cannot register outlet in context in {state_str:?} state — context must be active"
             ),
-            code: codes::TOOL_6003.to_owned(),
+            code: codes::OUTLET_6003.to_owned(),
         }
         .into());
     }
 
-    // Ensure UCAN state is registered so the tool registry is available.
+    // Ensure UCAN state is registered so the outlet registry is available.
     crate::runtime::ensure_registered(bi, handle)?;
 
     let context_id = handle.context_id();
 
-    // Build a scp-core ToolRegistration from the NAPI definition.
-    // Shared with every other bridge via `scp_ffi_common::tool_id`.
-    let tool_id = scp_ffi_common::tool_id::generate_tool_id(&definition.name);
+    // Build a scp-core OutletRegistration from the NAPI definition.
+    // Shared with every other bridge via `scp_ffi_common::outlet_id`.
+    let outlet_id = scp_ffi_common::outlet_id::generate_outlet_id(&definition.name);
 
     let input_schema = validate_schema_json(&definition.input_schema_json, "input_schema_json")?;
     let output_schema = validate_schema_json(&definition.output_schema_json, "output_schema_json")?;
@@ -228,12 +228,12 @@ pub(crate) async fn tool_register_on(
 
     let cost = definition
         .cost
-        .map(|c| -> napi::Result<scp_core::context::tools::ToolCost> {
-            // ADR-060: `ToolCost.amount` is the `Amount` newtype. The JS
+        .map(|c| -> napi::Result<scp_core::context::outlets::OutletCost> {
+            // ADR-060: `OutletCost.amount` is the `Amount` newtype. The JS
             // `bigint` marshals to an exact `u64` via the shared economy helper,
             // preserving the full range (values above 2^53 survive intact).
             let amount = crate::economy::amount_u64_from_bigint(&c.amount, "cost.amount")?;
-            Ok(scp_core::context::tools::ToolCost {
+            Ok(scp_core::context::outlets::OutletCost {
                 amount: scp_core::economy::Amount(amount),
                 currency: c.currency,
                 payee: c.payee.into(),
@@ -242,11 +242,11 @@ pub(crate) async fn tool_register_on(
         })
         .transpose()?;
 
-    let core_registration = scp_core::context::tools::ToolRegistration {
-        tool_id,
+    let core_registration = scp_core::context::outlets::OutletRegistration {
+        outlet_id,
         name: definition.name,
         description: definition.description,
-        schema: scp_core::context::tools::ToolSchema {
+        schema: scp_core::context::outlets::OutletSchema {
             input_schema,
             output_schema,
         },
@@ -258,17 +258,17 @@ pub(crate) async fn tool_register_on(
         signature: Vec::new(),
     };
 
-    // Register the tool in the context's tool registry.
+    // Register the outlet in the context's outlet registry.
     let registered_id = crate::runtime::with_context(bi, &context_id, |rt| {
-        let (registered_id, _event) = scp_core::context::tools::register_tool(
-            &mut rt.tool_registry,
+        let (registered_id, _event) = scp_core::context::outlets::register_outlet(
+            &mut rt.outlet_registry,
             &rt.role_state,
             core_registration,
             &rt.core.creator_did.clone(),
         )
-        .map_err(|e| ScpNapiError::Tool {
-            message: format!("tool registration failed: {e}"),
-            code: codes::TOOL_6001.to_owned(),
+        .map_err(|e| ScpNapiError::Outlet {
+            message: format!("outlet registration failed: {e}"),
+            code: codes::OUTLET_6001.to_owned(),
         })?;
         Ok(registered_id)
     })
@@ -277,12 +277,12 @@ pub(crate) async fn tool_register_on(
     Ok(registered_id)
 }
 
-/// Per-bridge-instance implementation of [`tool_invoke`].
+/// Per-bridge-instance implementation of [`outlet_invoke`].
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn tool_invoke_on(
+pub(crate) async fn outlet_invoke_on(
     bi: &crate::runtime::NapiBridgeInstance,
     handle: &NapiContextHandle,
-    tool_id: String,
+    outlet_id: String,
     input_json: String,
     identity_did: String,
     ucan_token: String,
@@ -290,7 +290,7 @@ pub(crate) async fn tool_invoke_on(
     spending_ucan_jwt: Option<String>,
 ) -> napi::Result<String> {
     crate::napi_check_handle!(&bi.core, handle);
-    validate_tool_id(&tool_id).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+    validate_outlet_id(&outlet_id).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     validate_did(&identity_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     validate_ucan_token(&ucan_token).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     if let Some(jwt) = spending_ucan_jwt.as_deref() {
@@ -299,11 +299,11 @@ pub(crate) async fn tool_invoke_on(
 
     let state_str = handle.state()?;
     if state_str != "active" {
-        return Err(ScpNapiError::Tool {
+        return Err(ScpNapiError::Outlet {
             message: format!(
-                "cannot invoke tool in context in {state_str:?} state — context must be active"
+                "cannot invoke outlet in context in {state_str:?} state — context must be active"
             ),
-            code: codes::TOOL_6005.to_owned(),
+            code: codes::OUTLET_6005.to_owned(),
         }
         .into());
     }
@@ -321,10 +321,10 @@ pub(crate) async fn tool_invoke_on(
                 code: codes::PERM_3001.to_owned(),
             })
         })?;
-    validate_ucan_for_tool(
+    validate_ucan_for_outlet(
         bi,
         &context_id,
-        &tool_id,
+        &outlet_id,
         &identity_did,
         &ucan_token,
         &proof_resolver,
@@ -345,23 +345,23 @@ pub(crate) async fn tool_invoke_on(
             })
         })?;
 
-    // Snapshot the bridge-owned tool registry and (optionally) the
+    // Snapshot the bridge-owned outlet registry and (optionally) the
     // registered handler closure BEFORE entering the runtime call. The
-    // runtime requires `&ToolRegistry`; cloning the registry once is
+    // runtime requires `&OutletRegistry`; cloning the registry once is
     // cheap and avoids holding the bridge UCAN-state DashMap shard
     // lock across the runtime's three-phase lock split.
     let context_id_for_executor = context_id.clone();
-    let tool_id_for_executor = tool_id.clone();
+    let outlet_id_for_executor = outlet_id.clone();
     let identity_for_executor = identity_did.clone();
     let (registry, handler) = crate::runtime::with_context(bi, &context_id, |rt| {
         Ok((
-            rt.tool_registry.clone(),
-            rt.tool_handlers.get(&tool_id).cloned(),
+            rt.outlet_registry.clone(),
+            rt.outlet_handlers.get(&outlet_id).cloned(),
         ))
     })
     .map_err(napi::Error::from)?;
 
-    // Build the executor closure. Phase 2 of `invoke_tool_with_economy`
+    // Build the executor closure. Phase 2 of `invoke_outlet_with_economy`
     // runs WITHOUT holding the `contexts` mutex; the runtime calls the
     // executor exactly once with the validated input value.
     let executor = move |input: serde_json::Value| {
@@ -371,7 +371,7 @@ pub(crate) async fn tool_invoke_on(
             handler.map_or_else(
                 || {
                     Ok(serde_json::json!({
-                        "tool": tool_id_for_executor,
+                        "outlet": outlet_id_for_executor,
                         "context": context_id_for_executor,
                         "status": "validated",
                         "input_valid": true,
@@ -381,7 +381,7 @@ pub(crate) async fn tool_invoke_on(
                 },
                 |h| {
                     h(input).map_err(|e| {
-                        format!("tool handler for '{tool_id_for_executor}' failed: {e}")
+                        format!("outlet handler for '{outlet_id_for_executor}' failed: {e}")
                     })
                 },
             )
@@ -390,20 +390,20 @@ pub(crate) async fn tool_invoke_on(
 
     // Parse input JSON once (the runtime expects `serde_json::Value`).
     let input_value: serde_json::Value = serde_json::from_str(&input_json).map_err(|e| {
-        napi::Error::from(ScpNapiError::Tool {
+        napi::Error::from(ScpNapiError::Outlet {
             message: format!("invalid input JSON: {e}"),
-            code: codes::TOOL_6002.to_owned(),
+            code: codes::OUTLET_6002.to_owned(),
         })
     })?;
 
     let supervisor = crate::runtime::supervisor(bi)?;
     let invoker_did_typed: scp_did::DID = identity_did.into();
-    let tool_id_typed = scp_core::context::tools::ToolId::from(tool_id.as_str());
+    let outlet_id_typed = scp_core::context::outlets::OutletId::from(outlet_id.as_str());
     let outcome = supervisor
-        .invoke_tool_with_economy(
+        .invoke_outlet_with_economy(
             &context_id,
             &registry,
-            &tool_id_typed,
+            &outlet_id_typed,
             input_value,
             &invoker_did_typed,
             spending_ucan_token.as_ref(),
@@ -413,33 +413,33 @@ pub(crate) async fn tool_invoke_on(
         .await
         .map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
 
-    // The runtime built the canonical `ToolInvokedEvent`; the
+    // The runtime built the canonical `OutletInvokedEvent`; the
     // transport / event-log layer is the one responsible for signing
     // and appending it. Pull the JSON output back out for the JS
     // caller.
     serde_json::to_string(&outcome.output).map_err(|e| {
-        napi::Error::from(ScpNapiError::Tool {
-            message: format!("failed to serialize tool output: {e}"),
-            code: codes::TOOL_6006.to_owned(),
+        napi::Error::from(ScpNapiError::Outlet {
+            message: format!("failed to serialize outlet output: {e}"),
+            code: codes::OUTLET_6006.to_owned(),
         })
     })
 }
 
-/// Per-bridge-instance implementation of [`tool_verify`].
+/// Per-bridge-instance implementation of [`outlet_verify`].
 #[allow(clippy::unused_async)] // preserves signature symmetry with the async free function
-pub(crate) async fn tool_verify_on(
+pub(crate) async fn outlet_verify_on(
     bi: &crate::runtime::NapiBridgeInstance,
     handle: &NapiContextHandle,
-    tool_id: String,
-) -> napi::Result<NapiToolVerificationResult> {
+    outlet_id: String,
+) -> napi::Result<NapiOutletVerificationResult> {
     crate::napi_check_handle!(&bi.core, handle);
     let state_str = handle.state()?;
     if state_str != "active" {
-        return Err(ScpNapiError::Tool {
+        return Err(ScpNapiError::Outlet {
             message: format!(
-                "cannot verify tool in context in {state_str:?} state — context must be active"
+                "cannot verify outlet in context in {state_str:?} state — context must be active"
             ),
-            code: codes::TOOL_6007.to_owned(),
+            code: codes::OUTLET_6007.to_owned(),
         }
         .into());
     }
@@ -447,16 +447,16 @@ pub(crate) async fn tool_verify_on(
     let context_id = handle.context_id();
     crate::runtime::ensure_registered(bi, handle)?;
 
-    // Look up the tool and verify against its test vectors (matching PyO3 pattern).
+    // Look up the outlet and verify against its test vectors (matching PyO3 pattern).
     let result = crate::runtime::with_context(bi, &context_id, |rt| {
-        let (verification_result, _event) = scp_core::context::tools::verify_tool(
-            &rt.tool_registry,
-            &tool_id,
+        let (verification_result, _event) = scp_core::context::outlets::verify_outlet(
+            &rt.outlet_registry,
+            &outlet_id,
             // Identity executor: returns the expected output for each vector.
             // This validates the test vector structure; real execution verification
             // happens when a full executor is connected.
             |input| {
-                if let Some(registration) = rt.tool_registry.get(&tool_id) {
+                if let Some(registration) = rt.outlet_registry.get(&outlet_id) {
                     for vector in &registration.test_vectors {
                         if vector.input == *input {
                             return vector.expected_output.clone();
@@ -466,9 +466,9 @@ pub(crate) async fn tool_verify_on(
                 serde_json::Value::Null
             },
         )
-        .map_err(|e| ScpNapiError::Tool {
-            message: format!("tool verification failed: {e}"),
-            code: codes::TOOL_6001.to_owned(),
+        .map_err(|e| ScpNapiError::Outlet {
+            message: format!("outlet verification failed: {e}"),
+            code: codes::OUTLET_6001.to_owned(),
         })?;
 
         Ok(verification_result)
@@ -482,24 +482,24 @@ pub(crate) async fn tool_verify_on(
         .map(|r| r.description.clone())
         .collect();
 
-    Ok(NapiToolVerificationResult {
-        tool_id: result.tool_id,
+    Ok(NapiOutletVerificationResult {
+        outlet_id: result.outlet_id,
         passed: result.integrity_ok,
         failures,
     })
 }
 
 // ---------------------------------------------------------------------------
-// Cross-context tool invocation
+// Cross-context outlet invocation
 // ---------------------------------------------------------------------------
 
-/// Per-bridge-instance implementation of [`tool_invoke_cross_context`].
+/// Per-bridge-instance implementation of [`outlet_invoke_cross_context`].
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn tool_invoke_cross_context_on(
+pub(crate) async fn outlet_invoke_cross_context_on(
     bi: &crate::runtime::NapiBridgeInstance,
     source_handle: &NapiContextHandle,
     target_handle: &NapiContextHandle,
-    tool_id: String,
+    outlet_id: String,
     input_json: String,
     invoker_did: String,
     ucan_token: String,
@@ -510,22 +510,22 @@ pub(crate) async fn tool_invoke_cross_context_on(
     // Validate both contexts are active.
     let source_state = source_handle.state()?;
     if source_state != "active" {
-        return Err(ScpNapiError::Tool {
+        return Err(ScpNapiError::Outlet {
             message: format!(
-                "cannot invoke cross-context tool: source context in {source_state:?} state"
+                "cannot invoke cross-context outlet: source context in {source_state:?} state"
             ),
-            code: codes::TOOL_6010.to_owned(),
+            code: codes::OUTLET_6010.to_owned(),
         }
         .into());
     }
 
     let target_state = target_handle.state()?;
     if target_state != "active" {
-        return Err(ScpNapiError::Tool {
+        return Err(ScpNapiError::Outlet {
             message: format!(
-                "cannot invoke cross-context tool: target context in {target_state:?} state"
+                "cannot invoke cross-context outlet: target context in {target_state:?} state"
             ),
-            code: codes::TOOL_6011.to_owned(),
+            code: codes::OUTLET_6011.to_owned(),
         }
         .into());
     }
@@ -543,11 +543,11 @@ pub(crate) async fn tool_invoke_cross_context_on(
         scp_core::provenance::attach::effective_max_chain_depth(source_max)
     };
     if chain_depth > max_chain_depth {
-        return Err(ScpNapiError::Tool {
+        return Err(ScpNapiError::Outlet {
             message: format!(
                 "cross-context chain depth {chain_depth} exceeds maximum {max_chain_depth}"
             ),
-            code: codes::TOOL_6012.to_owned(),
+            code: codes::OUTLET_6012.to_owned(),
         }
         .into());
     }
@@ -565,10 +565,10 @@ pub(crate) async fn tool_invoke_cross_context_on(
                 code: codes::PERM_3001.to_owned(),
             })
         })?;
-    validate_ucan_for_tool(
+    validate_ucan_for_outlet(
         bi,
         &target_context_id,
-        &tool_id,
+        &outlet_id,
         &invoker_did,
         &ucan_token,
         &proof_resolver,
@@ -576,54 +576,54 @@ pub(crate) async fn tool_invoke_cross_context_on(
     .map_err(napi::Error::from)?;
 
     let input_value: serde_json::Value = serde_json::from_str(&input_json).map_err(|e| {
-        napi::Error::from(ScpNapiError::Tool {
+        napi::Error::from(ScpNapiError::Outlet {
             message: format!("invalid input JSON: {e}"),
-            code: codes::TOOL_6002.to_owned(),
+            code: codes::OUTLET_6002.to_owned(),
         })
     })?;
 
     let output = crate::runtime::with_context(bi, &target_context_id, |rt| {
         let registration = rt
-            .tool_registry
-            .get(&tool_id)
-            .ok_or_else(|| ScpNapiError::Tool {
+            .outlet_registry
+            .get(&outlet_id)
+            .ok_or_else(|| ScpNapiError::Outlet {
                 message: format!(
-                    "tool '{tool_id}' not found in target context '{target_context_id}'"
+                    "outlet '{outlet_id}' not found in target context '{target_context_id}'"
                 ),
-                code: codes::TOOL_6002.to_owned(),
+                code: codes::OUTLET_6002.to_owned(),
             })?;
 
-        // Validate input against the tool's input schema.
-        scp_core::context::tools::validate_value_against_schema(
+        // Validate input against the outlet's input schema.
+        scp_core::context::outlets::validate_value_against_schema(
             &input_value,
             &registration.schema.input_schema,
         )
-        .map_err(|e| ScpNapiError::Tool {
+        .map_err(|e| ScpNapiError::Outlet {
             message: format!("input validation failed: {e}"),
-            code: codes::TOOL_6002.to_owned(),
+            code: codes::OUTLET_6002.to_owned(),
         })?;
 
         // Dispatch to handler or echo mode.
-        let output = if let Some(handler) = rt.tool_handlers.get(&tool_id) {
+        let output = if let Some(handler) = rt.outlet_handlers.get(&outlet_id) {
             let handler = handler.clone();
-            let out = handler(input_value.clone()).map_err(|e| ScpNapiError::Tool {
-                message: format!("cross-context tool handler for '{tool_id}' failed: {e}"),
-                code: codes::TOOL_6002.to_owned(),
+            let out = handler(input_value.clone()).map_err(|e| ScpNapiError::Outlet {
+                message: format!("cross-context outlet handler for '{outlet_id}' failed: {e}"),
+                code: codes::OUTLET_6002.to_owned(),
             })?;
 
-            scp_core::context::tools::validate_value_against_schema(
+            scp_core::context::outlets::validate_value_against_schema(
                 &out,
                 &registration.schema.output_schema,
             )
-            .map_err(|msg| ScpNapiError::Tool {
-                message: format!("output validation failed for tool '{tool_id}': {msg}"),
-                code: codes::TOOL_6002.to_owned(),
+            .map_err(|msg| ScpNapiError::Outlet {
+                message: format!("output validation failed for outlet '{outlet_id}': {msg}"),
+                code: codes::OUTLET_6002.to_owned(),
             })?;
 
             out
         } else {
             serde_json::json!({
-                "tool": tool_id,
+                "outlet": outlet_id,
                 "source_context": source_context_id,
                 "target_context": target_context_id,
                 "status": "validated",
@@ -638,27 +638,27 @@ pub(crate) async fn tool_invoke_cross_context_on(
     .map_err(napi::Error::from)?;
 
     serde_json::to_string(&output).map_err(|e| {
-        napi::Error::from(ScpNapiError::Tool {
+        napi::Error::from(ScpNapiError::Outlet {
             message: format!("failed to serialize cross-context output: {e}"),
-            code: codes::TOOL_6013.to_owned(),
+            code: codes::OUTLET_6013.to_owned(),
         })
     })
 }
 
 // ---------------------------------------------------------------------------
-// Cross-context tool-invocation saga (§6.2.4, ADR-049 §3a)
+// Cross-context outlet-invocation saga (§6.2.4, ADR-049 §3a)
 // ---------------------------------------------------------------------------
 
-/// The committed terminal of a §6.2.4 cross-context tool-invocation saga.
+/// The committed terminal of a §6.2.4 cross-context outlet-invocation saga.
 ///
-/// Returned by [`Scp::tool_invoke_cross_context_saga`](crate::scp::Scp) on a
+/// Returned by [`Scp::outlet_invoke_cross_context_saga`](crate::scp::Scp) on a
 /// `Committed` terminal. Every NON-committed terminal rejects the Promise with
 /// a typed saga error (`SagaAborted` / `SagaNeedsRepair` / `SagaBusy`) instead.
 ///
 /// Carries the supervisor-minted `saga_id` plus — for the committed
 /// cross-context invocation — the target's signed receipt and the captured
-/// tool output (spec §6.2.4 "Receipt / response return path"). The `receipt`
-/// is the JCS-canonical `CrossContextToolReceipt` bytes; `output` is the
+/// outlet output (spec §6.2.4 "Receipt / response return path"). The `receipt`
+/// is the JCS-canonical `CrossContextOutletReceipt` bytes; `output` is the
 /// receipt's canonical `output_jcs` bytes (the exact bytes the caller side
 /// recorded a hash of). Both are surfaced as JS `Buffer` so a caller can verify
 /// the receipt signature and recompute `output_hash` without a re-serialization
@@ -667,9 +667,9 @@ pub(crate) async fn tool_invoke_cross_context_on(
 pub struct NapiSagaResult {
     /// The durable saga identifier (supervisor-minted, never a caller input).
     pub saga_id: String,
-    /// The target's signed `CrossContextToolReceipt` bytes (JCS), or `None`.
+    /// The target's signed `CrossContextOutletReceipt` bytes (JCS), or `None`.
     pub receipt: Option<napi::bindgen_prelude::Buffer>,
-    /// The captured tool output bytes (the receipt's canonical `output_jcs`),
+    /// The captured outlet output bytes (the receipt's canonical `output_jcs`),
     /// or `None`.
     pub output: Option<napi::bindgen_prelude::Buffer>,
 }
@@ -725,7 +725,7 @@ fn map_saga_error(err: scp_core::context::supervisor::SagaError) -> ScpNapiError
 /// `creator_did` is read off the context HANDLE (`creator_did()`), the
 /// authoritative owner the handle was minted with — not via the UCAN-state
 /// registry, which a freshly-created context only populates lazily on its first
-/// UCAN/tool call. `context_id` is carried only for the error message.
+/// UCAN/outlet call. `context_id` is carried only for the error message.
 async fn resolve_context_signing_key(
     bi: &crate::runtime::NapiBridgeInstance,
     creator_did: &str,
@@ -833,12 +833,12 @@ async fn enforce_caller_principal_binding(
 }
 
 /// Per-bridge-instance implementation of the §6.2.4 cross-context
-/// tool-invocation saga export.
+/// outlet-invocation saga export.
 ///
-/// See [`Scp::tool_invoke_cross_context_saga`](crate::scp::Scp) for the full
+/// See [`Scp::outlet_invoke_cross_context_saga`](crate::scp::Scp) for the full
 /// contract. The flow is, in order:
 ///
-/// 1. **Validate inputs** (active handles; well-formed ids/dids/tool-id; the
+/// 1. **Validate inputs** (active handles; well-formed ids/dids/outlet-id; the
 ///    nonce decodes to `[u8; 16]`, fail-closed on a wrong length).
 /// 2. **Caller-principal binding (§6.2.4 *Caller authentication*, normative).**
 ///    `caller_did` MUST be an identity THIS bridge instance hosts AND a member
@@ -850,45 +850,45 @@ async fn enforce_caller_principal_binding(
 ///    SHA256). Raw `Sha256` of a 64-hex id would double-hash and miss the actor.
 /// 4. **Signing keys.** Resolve each co-resident context's Active Signing Key
 ///    via the context's `creator_did`.
-/// 5. **Executor.** Snapshot the TARGET context's tool handler and build the
+/// 5. **Executor.** Snapshot the TARGET context's outlet handler and build the
 ///    `move |input| async {…}` closure the supervisor runs at Commit-B (echo
 ///    fallback when no handler is registered, matching the synchronous path).
 /// 6. Await the producer; map the terminal `SagaError` → typed bridge error,
 ///    `Committed` → [`NapiSagaResult`].
 #[allow(clippy::too_many_arguments)] // Flat §6.2.4 envelope — agent-first named params, no builder.
-pub(crate) async fn tool_invoke_cross_context_saga_on(
+pub(crate) async fn outlet_invoke_cross_context_saga_on(
     bi: &crate::runtime::NapiBridgeInstance,
     source_handle: &NapiContextHandle,
     target_handle: &NapiContextHandle,
     caller_did: String,
-    tool_registration_id: String,
+    outlet_registration_id: String,
     input_json: String,
     asserted_nonce_hex: String,
     asserted_timestamp_ms: u64,
     asserted_chain_depth: u8,
     ucan_proof_id: Option<String>,
 ) -> napi::Result<NapiSagaResult> {
-    use scp_core::context::supervisor::{CrossContextToolInvocationRequest, SagaSigningKeys};
+    use scp_core::context::supervisor::{CrossContextOutletInvocationRequest, SagaSigningKeys};
 
     crate::napi_check_handle!(&bi.core, source_handle, target_handle);
 
     let source_state = source_handle.state()?;
     if source_state != "active" {
-        return Err(ScpNapiError::Tool {
+        return Err(ScpNapiError::Outlet {
             message: format!(
                 "cannot start cross-context saga: caller context in {source_state:?} state"
             ),
-            code: codes::TOOL_6010.to_owned(),
+            code: codes::OUTLET_6010.to_owned(),
         }
         .into());
     }
     let target_state = target_handle.state()?;
     if target_state != "active" {
-        return Err(ScpNapiError::Tool {
+        return Err(ScpNapiError::Outlet {
             message: format!(
                 "cannot start cross-context saga: target context in {target_state:?} state"
             ),
-            code: codes::TOOL_6011.to_owned(),
+            code: codes::OUTLET_6011.to_owned(),
         }
         .into());
     }
@@ -903,14 +903,14 @@ pub(crate) async fn tool_invoke_cross_context_saga_on(
     scp_ffi_common::validate::validate_context_id(&target_context_id)
         .map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     validate_did(&caller_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
-    validate_tool_id(&tool_registration_id)
+    validate_outlet_id(&outlet_registration_id)
         .map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
 
     let asserted_nonce = decode_asserted_nonce(&asserted_nonce_hex)?;
     let input_value: serde_json::Value = serde_json::from_str(&input_json).map_err(|e| {
-        napi::Error::from(ScpNapiError::Tool {
+        napi::Error::from(ScpNapiError::Outlet {
             message: format!("invalid input JSON: {e}"),
-            code: codes::TOOL_6002.to_owned(),
+            code: codes::OUTLET_6002.to_owned(),
         })
     })?;
 
@@ -935,22 +935,22 @@ pub(crate) async fn tool_invoke_cross_context_saga_on(
     let caller_signing_key =
         resolve_context_signing_key(bi, &caller_creator_did, &caller_context_id).await?;
 
-    // ----- Executor: snapshot the TARGET context's tool handler --------------
+    // ----- Executor: snapshot the TARGET context's outlet handler --------------
     //
     // Snapshot the registered handler closure (an `Arc<dyn Fn>` — cloning is a
     // refcount bump) OUTSIDE the runtime call, then move it into the `FnOnce`
     // executor the supervisor runs supervisor-side at Commit-B (off the actor
     // mailbox). Falls back to a schema-only echo when no handler is registered,
     // matching the synchronous cross-context path. A target context with no
-    // FFI-side UCAN/tool state yet registered (the lazy registry is unpopulated
-    // until its first tool/UCAN call) likewise carries no handler ⇒ echo. The
-    // supervisor validates the output against the tool's registered output
+    // FFI-side UCAN/outlet state yet registered (the lazy registry is unpopulated
+    // until its first outlet/UCAN call) likewise carries no handler ⇒ echo. The
+    // supervisor validates the output against the outlet's registered output
     // schema at Commit-B, so the executor only produces the value.
     let handler = crate::runtime::with_context(bi, &target_context_id, |rt| {
-        Ok(rt.tool_handlers.get(&tool_registration_id).cloned())
+        Ok(rt.outlet_handlers.get(&outlet_registration_id).cloned())
     })
     .unwrap_or(None);
-    let tool_id_for_echo = tool_registration_id.clone();
+    let outlet_id_for_echo = outlet_registration_id.clone();
     let target_ctx_for_echo = target_context_id.clone();
     let caller_did_for_echo = caller_did.clone();
     let executor = move |value: serde_json::Value| {
@@ -960,7 +960,7 @@ pub(crate) async fn tool_invoke_cross_context_saga_on(
             handler.map_or_else(
                 || {
                     Ok(serde_json::json!({
-                        "tool": tool_id_for_echo,
+                        "outlet": outlet_id_for_echo,
                         "target_context": target_ctx_for_echo,
                         "caller_did": caller_did_for_echo,
                         "status": "validated",
@@ -971,7 +971,7 @@ pub(crate) async fn tool_invoke_cross_context_saga_on(
                 |h| {
                     h(value).map_err(|e| {
                         format!(
-                            "cross-context saga tool handler for '{tool_id_for_echo}' failed: {e}"
+                            "cross-context saga outlet handler for '{outlet_id_for_echo}' failed: {e}"
                         )
                     })
                 },
@@ -979,11 +979,11 @@ pub(crate) async fn tool_invoke_cross_context_saga_on(
         }
     };
 
-    let request = CrossContextToolInvocationRequest {
+    let request = CrossContextOutletInvocationRequest {
         caller_context_id: caller_context_bytes,
         target_context_id: target_context_bytes,
         caller_did: scp_did::DID(caller_did.clone()),
-        tool_registration_id: tool_registration_id.clone(),
+        outlet_registration_id: outlet_registration_id.clone(),
         ucan_proof_id,
         input: input_value,
         asserted_chain_depth,
@@ -994,7 +994,7 @@ pub(crate) async fn tool_invoke_cross_context_saga_on(
     // The producer drives a multi-phase saga; its future is large. Box it so
     // the held state does not bloat this bridge method's own future
     // (`clippy::large_futures`).
-    let output = Box::pin(supervisor.start_cross_context_tool_invocation_saga(
+    let output = Box::pin(supervisor.start_cross_context_outlet_invocation_saga(
         request,
         SagaSigningKeys {
             target: &target_signing_key,
@@ -1013,25 +1013,25 @@ pub(crate) async fn tool_invoke_cross_context_saga_on(
 }
 
 // ---------------------------------------------------------------------------
-// Stateful tool sessions (spec section 6.2.1)
+// Stateful outlet sessions (spec section 6.2.1)
 // ---------------------------------------------------------------------------
 
-/// Per-bridge-instance implementation of [`tool_session_create`].
-pub(crate) async fn tool_session_create_on(
+/// Per-bridge-instance implementation of [`outlet_session_create`].
+pub(crate) async fn outlet_session_create_on(
     bi: &crate::runtime::NapiBridgeInstance,
     handle: &NapiContextHandle,
-    tool_id: String,
+    outlet_id: String,
     source_context_id: String,
     ttl_seconds: Option<u32>,
 ) -> napi::Result<String> {
     crate::napi_check_handle!(&bi.core, handle);
     let state_str = handle.state()?;
     if state_str != "active" {
-        return Err(ScpNapiError::Tool {
+        return Err(ScpNapiError::Outlet {
             message: format!(
                 "cannot create session in context in {state_str:?} state — context must be active"
             ),
-            code: codes::TOOL_6014.to_owned(),
+            code: codes::OUTLET_6014.to_owned(),
         }
         .into());
     }
@@ -1046,27 +1046,27 @@ pub(crate) async fn tool_session_create_on(
             .context_params(&context_id)
             .await
             .and_then(|p| p.session_cap)
-            .unwrap_or(scp_core::context::tools::DEFAULT_SESSION_CAP_PER_CALLER) as usize
+            .unwrap_or(scp_core::context::outlets::DEFAULT_SESSION_CAP_PER_CALLER) as usize
     };
 
     crate::runtime::with_context(bi, &context_id, |rt| {
         // Enforce per-caller session cap (context-configured, ADR-043).
         let current = rt.session_store.count_by_source(&source_context_id);
         if current >= cap {
-            return Err(ScpNapiError::Tool {
+            return Err(ScpNapiError::Outlet {
                 message: format!(
                     "session cap exceeded for caller '{source_context_id}': {current} active (max {cap})"
                 ),
-                code: codes::TOOL_6015.to_owned(),
+                code: codes::OUTLET_6015.to_owned(),
             });
         }
 
         let session_id = uuid::Uuid::new_v4().to_string();
         let now_ms = scp_clock::SystemClock.now_millis();
 
-        let session = scp_core::context::tools::ToolSession {
+        let session = scp_core::context::outlets::OutletSession {
             session_id: session_id.clone(),
-            tool_id,
+            outlet_id,
             source_context: source_context_id,
             state: serde_json::Value::Null,
             created_at: now_ms,
@@ -1080,9 +1080,9 @@ pub(crate) async fn tool_session_create_on(
     .map_err(napi::Error::from)
 }
 
-/// Per-bridge-instance implementation of [`tool_session_invoke`].
+/// Per-bridge-instance implementation of [`outlet_session_invoke`].
 #[allow(clippy::unused_async)] // preserves signature symmetry with the async free function
-pub(crate) async fn tool_session_invoke_on(
+pub(crate) async fn outlet_session_invoke_on(
     bi: &crate::runtime::NapiBridgeInstance,
     handle: &NapiContextHandle,
     session_id: String,
@@ -1094,11 +1094,11 @@ pub(crate) async fn tool_session_invoke_on(
     crate::napi_check_handle!(&bi.core, handle);
     let state_str = handle.state()?;
     if state_str != "active" {
-        return Err(ScpNapiError::Tool {
+        return Err(ScpNapiError::Outlet {
             message: format!(
                 "cannot invoke session in context in {state_str:?} state — context must be active"
             ),
-            code: codes::TOOL_6017.to_owned(),
+            code: codes::OUTLET_6017.to_owned(),
         }
         .into());
     }
@@ -1106,17 +1106,17 @@ pub(crate) async fn tool_session_invoke_on(
     let context_id = handle.context_id();
     crate::runtime::ensure_registered(bi, handle)?;
 
-    // Look up the tool_id from the session before UCAN validation so we can
-    // validate against the correct tool capability.
-    let tool_id_for_ucan = crate::runtime::with_context(bi, &context_id, |rt| {
+    // Look up the outlet_id from the session before UCAN validation so we can
+    // validate against the correct outlet capability.
+    let outlet_id_for_ucan = crate::runtime::with_context(bi, &context_id, |rt| {
         let session = rt
             .session_store
             .get(&session_id)
-            .ok_or_else(|| ScpNapiError::Tool {
+            .ok_or_else(|| ScpNapiError::Outlet {
                 message: format!("session '{session_id}' not found"),
-                code: codes::TOOL_6018.to_owned(),
+                code: codes::OUTLET_6018.to_owned(),
             })?;
-        Ok(session.tool_id.clone())
+        Ok(session.outlet_id.clone())
     })
     .map_err(napi::Error::from)?;
 
@@ -1129,10 +1129,10 @@ pub(crate) async fn tool_session_invoke_on(
                 code: codes::PERM_3001.to_owned(),
             })
         })?;
-    validate_ucan_for_tool(
+    validate_ucan_for_outlet(
         bi,
         &context_id,
-        &tool_id_for_ucan,
+        &outlet_id_for_ucan,
         &invoker_did,
         &ucan_token,
         &proof_resolver,
@@ -1143,54 +1143,54 @@ pub(crate) async fn tool_session_invoke_on(
         let session = rt
             .session_store
             .get(&session_id)
-            .ok_or_else(|| ScpNapiError::Tool {
+            .ok_or_else(|| ScpNapiError::Outlet {
                 message: format!("session '{session_id}' not found"),
-                code: codes::TOOL_6018.to_owned(),
+                code: codes::OUTLET_6018.to_owned(),
             })?;
 
         // Check expiry.
         let now_ms = scp_clock::SystemClock.now_millis();
         if session.is_expired(now_ms) {
             rt.session_store.remove(&session_id);
-            return Err(ScpNapiError::Tool {
+            return Err(ScpNapiError::Outlet {
                 message: format!("session '{session_id}' has expired"),
-                code: codes::TOOL_6019.to_owned(),
+                code: codes::OUTLET_6019.to_owned(),
             });
         }
 
-        let tool_id = session.tool_id.clone();
+        let outlet_id = session.outlet_id.clone();
         let current_state = session.state.clone();
         let call_count = session.call_count;
 
         let input_value: serde_json::Value =
-            serde_json::from_str(&input_json).map_err(|e| ScpNapiError::Tool {
+            serde_json::from_str(&input_json).map_err(|e| ScpNapiError::Outlet {
                 message: format!("invalid input JSON: {e}"),
-                code: codes::TOOL_6002.to_owned(),
+                code: codes::OUTLET_6002.to_owned(),
             })?;
 
-        // Validate input against tool's input schema if tool is registered.
-        if let Some(registration) = rt.tool_registry.get(&tool_id) {
-            scp_core::context::tools::validate_value_against_schema(
+        // Validate input against outlet's input schema if outlet is registered.
+        if let Some(registration) = rt.outlet_registry.get(&outlet_id) {
+            scp_core::context::outlets::validate_value_against_schema(
                 &input_value,
                 &registration.schema.input_schema,
             )
-            .map_err(|e| ScpNapiError::Tool {
+            .map_err(|e| ScpNapiError::Outlet {
                 message: format!("input validation failed: {e}"),
-                code: codes::TOOL_6002.to_owned(),
+                code: codes::OUTLET_6002.to_owned(),
             })?;
         }
 
         // Execute via handler or echo mode.
-        let (new_state, output) = if let Some(handler) = rt.tool_handlers.get(&tool_id) {
+        let (new_state, output) = if let Some(handler) = rt.outlet_handlers.get(&outlet_id) {
             let handler = handler.clone();
-            let out = handler(input_value).map_err(|e| ScpNapiError::Tool {
-                message: format!("tool handler for '{tool_id}' failed: {e}"),
-                code: codes::TOOL_6002.to_owned(),
+            let out = handler(input_value).map_err(|e| ScpNapiError::Outlet {
+                message: format!("outlet handler for '{outlet_id}' failed: {e}"),
+                code: codes::OUTLET_6002.to_owned(),
             })?;
             (current_state, out)
         } else {
             let out = serde_json::json!({
-                "tool": tool_id,
+                "outlet": outlet_id,
                 "session_id": session_id,
                 "status": "validated",
                 "call_count": call_count + 1,
@@ -1211,16 +1211,16 @@ pub(crate) async fn tool_session_invoke_on(
     .map_err(napi::Error::from)?;
 
     serde_json::to_string(&output).map_err(|e| {
-        napi::Error::from(ScpNapiError::Tool {
+        napi::Error::from(ScpNapiError::Outlet {
             message: format!("failed to serialize session invoke output: {e}"),
-            code: codes::TOOL_6020.to_owned(),
+            code: codes::OUTLET_6020.to_owned(),
         })
     })
 }
 
-/// Per-bridge-instance implementation of [`tool_session_close`].
+/// Per-bridge-instance implementation of [`outlet_session_close`].
 #[allow(clippy::unused_async)] // preserves signature symmetry with the async free function
-pub(crate) async fn tool_session_close_on(
+pub(crate) async fn outlet_session_close_on(
     bi: &crate::runtime::NapiBridgeInstance,
     handle: &NapiContextHandle,
     session_id: String,
@@ -1231,9 +1231,9 @@ pub(crate) async fn tool_session_close_on(
 
     crate::runtime::with_context(bi, &context_id, |rt| {
         if rt.session_store.remove(&session_id).is_none() {
-            return Err(ScpNapiError::Tool {
+            return Err(ScpNapiError::Outlet {
                 message: format!("session '{session_id}' not found"),
-                code: codes::TOOL_6021.to_owned(),
+                code: codes::OUTLET_6021.to_owned(),
             });
         }
         Ok(())
@@ -1245,28 +1245,28 @@ pub(crate) async fn tool_session_close_on(
 // Bidirectional consent protocol (spec §6.2.0.1)
 // ---------------------------------------------------------------------------
 
-/// Per-bridge-instance implementation of [`tool_interface_expose`].
+/// Per-bridge-instance implementation of [`outlet_interface_expose`].
 #[allow(clippy::unused_async)] // preserves signature symmetry with the async free function
-pub(crate) async fn tool_interface_expose_on(
+pub(crate) async fn outlet_interface_expose_on(
     bi: &crate::runtime::NapiBridgeInstance,
     handle: &NapiContextHandle,
-    tool_id: String,
+    outlet_id: String,
     target_context_id: String,
     rate_limit_json: Option<String>,
 ) -> napi::Result<String> {
     crate::napi_check_handle!(&bi.core, handle);
-    scp_ffi_common::validate::validate_tool_id(&tool_id)
+    scp_ffi_common::validate::validate_outlet_id(&outlet_id)
         .map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     scp_ffi_common::validate::validate_context_id(&target_context_id)
         .map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
 
     let state_str = handle.state()?;
     if state_str != "active" {
-        return Err(ScpNapiError::Tool {
+        return Err(ScpNapiError::Outlet {
             message: format!(
-                "cannot expose tool interface in context in {state_str:?} state — context must be active"
+                "cannot expose outlet interface in context in {state_str:?} state — context must be active"
             ),
-            code: codes::TOOL_6030.to_owned(),
+            code: codes::OUTLET_6030.to_owned(),
         }
         .into());
     }
@@ -1276,7 +1276,7 @@ pub(crate) async fn tool_interface_expose_on(
 
     let rate_limit = match rate_limit_json {
         Some(ref json) => {
-            let parsed: scp_core::context::tools::interface::RateLimit = serde_json::from_str(json)
+            let parsed: scp_core::context::outlets::interface::RateLimit = serde_json::from_str(json)
                 .map_err(|e| {
                     napi::Error::from(ScpNapiError::Validation {
                         message: format!("invalid rate_limit_json: {e}"),
@@ -1294,32 +1294,32 @@ pub(crate) async fn tool_interface_expose_on(
             scp_core::context::ContextParams::default(),
         );
 
-        let interface = scp_core::context::tools::interface::expose_tool(
+        let interface = scp_core::context::outlets::interface::expose_outlet(
             context_handle.context_id(),
-            &tool_id,
+            &outlet_id,
             &target_context_id,
             &rt.role_state,
             &rt.core.creator_did,
-            &rt.tool_registry,
+            &rt.outlet_registry,
             rate_limit,
             None,
         )
-        .map_err(|e| ScpNapiError::Tool {
-            message: format!("expose_tool failed: {e}"),
-            code: codes::TOOL_6030.to_owned(),
+        .map_err(|e| ScpNapiError::Outlet {
+            message: format!("expose_outlet failed: {e}"),
+            code: codes::OUTLET_6030.to_owned(),
         })?;
 
-        serde_json::to_string(&interface).map_err(|e| ScpNapiError::Tool {
-            message: format!("failed to serialize ToolInterface: {e}"),
-            code: codes::TOOL_6031.to_owned(),
+        serde_json::to_string(&interface).map_err(|e| ScpNapiError::Outlet {
+            message: format!("failed to serialize OutletInterface: {e}"),
+            code: codes::OUTLET_6031.to_owned(),
         })
     })
     .map_err(napi::Error::from)
 }
 
-/// Per-bridge-instance implementation of [`tool_interface_accept`].
+/// Per-bridge-instance implementation of [`outlet_interface_accept`].
 #[allow(clippy::unused_async)] // preserves signature symmetry with the async free function
-pub(crate) async fn tool_interface_accept_on(
+pub(crate) async fn outlet_interface_accept_on(
     bi: &crate::runtime::NapiBridgeInstance,
     handle: &NapiContextHandle,
     interface_json: String,
@@ -1327,11 +1327,11 @@ pub(crate) async fn tool_interface_accept_on(
     crate::napi_check_handle!(&bi.core, handle);
     let state_str = handle.state()?;
     if state_str != "active" {
-        return Err(ScpNapiError::Tool {
+        return Err(ScpNapiError::Outlet {
             message: format!(
-                "cannot accept tool interface in context in {state_str:?} state — context must be active"
+                "cannot accept outlet interface in context in {state_str:?} state — context must be active"
             ),
-            code: codes::TOOL_6032.to_owned(),
+            code: codes::OUTLET_6032.to_owned(),
         }
         .into());
     }
@@ -1339,7 +1339,7 @@ pub(crate) async fn tool_interface_accept_on(
     let context_id = handle.context_id();
     crate::runtime::ensure_registered(bi, handle)?;
 
-    let mut interface: scp_core::context::tools::interface::ToolInterface =
+    let mut interface: scp_core::context::outlets::interface::OutletInterface =
         serde_json::from_str(&interface_json).map_err(|e| {
             napi::Error::from(ScpNapiError::Validation {
                 message: format!("invalid interface_json: {e}"),
@@ -1353,29 +1353,29 @@ pub(crate) async fn tool_interface_accept_on(
             scp_core::context::ContextParams::default(),
         );
 
-        scp_core::context::tools::interface::accept_tool_interface(
+        scp_core::context::outlets::interface::accept_outlet_interface(
             context_handle.context_id(),
             &mut interface,
             &rt.role_state,
             &rt.core.creator_did,
             None,
         )
-        .map_err(|e| ScpNapiError::Tool {
-            message: format!("accept_tool_interface failed: {e}"),
-            code: codes::TOOL_6032.to_owned(),
+        .map_err(|e| ScpNapiError::Outlet {
+            message: format!("accept_outlet_interface failed: {e}"),
+            code: codes::OUTLET_6032.to_owned(),
         })?;
 
-        serde_json::to_string(&interface).map_err(|e| ScpNapiError::Tool {
-            message: format!("failed to serialize ToolInterface: {e}"),
-            code: codes::TOOL_6033.to_owned(),
+        serde_json::to_string(&interface).map_err(|e| ScpNapiError::Outlet {
+            message: format!("failed to serialize OutletInterface: {e}"),
+            code: codes::OUTLET_6033.to_owned(),
         })
     })
     .map_err(napi::Error::from)
 }
 
-/// Per-bridge-instance implementation of [`tool_interface_revoke`].
+/// Per-bridge-instance implementation of [`outlet_interface_revoke`].
 #[allow(clippy::unused_async)] // preserves signature symmetry with the async free function
-pub(crate) async fn tool_interface_revoke_on(
+pub(crate) async fn outlet_interface_revoke_on(
     bi: &crate::runtime::NapiBridgeInstance,
     handle: &NapiContextHandle,
     interface_id_hex: String,
@@ -1402,16 +1402,16 @@ pub(crate) async fn tool_interface_revoke_on(
 
     let now_ms = scp_clock::SystemClock.now_millis();
 
-    let event = scp_core::context::tools::interface::revoke_tool_interface(
+    let event = scp_core::context::outlets::interface::revoke_outlet_interface(
         interface_id,
         &context_id,
         now_ms,
     );
 
     serde_json::to_string(&event).map_err(|e| {
-        napi::Error::from(ScpNapiError::Tool {
+        napi::Error::from(ScpNapiError::Outlet {
             message: format!("failed to serialize InterfaceRevoked: {e}"),
-            code: codes::TOOL_6035.to_owned(),
+            code: codes::OUTLET_6035.to_owned(),
         })
     })
 }
@@ -1580,10 +1580,10 @@ mod tests {
         assert!(msg.contains("got 0"));
     }
 
-    /// `registered_at` on a tool registered via the NAPI bridge must be a
+    /// `registered_at` on a outlet registered via the NAPI bridge must be a
     /// seconds-epoch timestamp, not milliseconds or hardcoded 0.
-    /// Calls the actual `tool_register` bridge function and inspects the
-    /// stored `ToolRegistration`. Catches the original bug from issue #871.
+    /// Calls the actual `outlet_register` bridge function and inspects the
+    /// stored `OutletRegistration`. Catches the original bug from issue #871.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn registered_at_is_seconds_epoch() {
         use crate::context::NapiContextHandle;
@@ -1594,7 +1594,7 @@ mod tests {
 
         let handle = NapiContextHandle::test_active_on(&bi, ctx_id.clone(), creator_did.to_owned());
 
-        let definition = NapiToolDefinition {
+        let definition = NapiOutletDefinition {
             name: "napi-timestamp-probe".to_owned(),
             description: "probes registered_at value".to_owned(),
             input_schema_json:
@@ -1607,16 +1607,16 @@ mod tests {
             cost: None,
         };
 
-        let tool_id = tool_register_on(&bi, &handle, definition)
+        let outlet_id = outlet_register_on(&bi, &handle, definition)
             .await
-            .expect("tool_register should succeed");
+            .expect("outlet_register should succeed");
 
         // Read the stored registration back and verify registered_at.
         let registered_at = crate::runtime::with_context(&bi, &ctx_id, |rt| {
             let reg = rt
-                .tool_registry
-                .get(&tool_id)
-                .expect("tool should exist in registry after registration");
+                .outlet_registry
+                .get(&outlet_id)
+                .expect("outlet should exist in registry after registration");
             Ok(reg.registered_at)
         })
         .unwrap();
@@ -1789,7 +1789,7 @@ mod tests {
         );
     }
 
-    /// All §6.2.4 cross-context-tool saga binding tests and their pure-string /
+    /// All §6.2.4 cross-context-outlet saga binding tests and their pure-string /
     /// DHT / governance helpers live in this single submodule gated on
     /// `allow_in_memory_custody`. Gating the module (rather than each item)
     /// covers every helper AND every future saga test added here by
@@ -1804,20 +1804,20 @@ mod tests {
         // End-to-end Committed terminal through the NAPI bridge.
         //
         // Mirrors the PyO3 e2e: an authenticated caller drives the §6.2.4
-        // cross-context tool-invocation saga to a real Committed terminal and the
+        // cross-context outlet-invocation saga to a real Committed terminal and the
         // bridge returns the committed receipt + output bytes. The setup wires the
         // two producer authorization axes:
         //
         //   1. Caller axis (gate 1): caller_did is hosted by this instance AND a
         //      member of the CALLER (source) context A — satisfied by creating A
         //      via the real context-create path with `owner` as single-admin.
-        //   2. Target axis (gate 2): a bidirectionally-approved ToolInterface
+        //   2. Target axis (gate 2): a bidirectionally-approved OutletInterface
         //      (approved_by_source && approved_by_target, source=A, target=B), which
         //      the producer queries against A's actor governance state, established
         //      IN A via a governance EstablishToolInterface action (auto-executed
         //      under single_admin).
         //
-        // Context B holds the tool registered into its ACTOR governance state (via a
+        // Context B holds the outlet registered into its ACTOR governance state (via a
         // RegisterTool governance action — the saga's Prepare-B reads it from there)
         // PLUS the FFI-side handler the executor snapshots and runs once at Commit-B.
         // The handler returns `{"sum":42,"ok":1}`, which Commit-B validates against
@@ -1833,18 +1833,18 @@ mod tests {
         // ±5min timestamp skew, so the invocation uses `SystemTime::now()`.
         // ------------------------------------------------------------------
 
-        /// Serializes a `RegisterTool` governance action for the saga tool. Mirrors
+        /// Serializes a `RegisterTool` governance action for the saga outlet. Mirrors
         /// the registered schema: 2 input + 2 output properties (clears the §9.2.1
         /// specificity floor of 2), numeric `{sum, ok}` output so Commit-B's
         /// output-schema validation accepts the handler's response.
-        fn register_tool_action_json(tool_id: &str, tool_name: &str, owner: &str) -> String {
+        fn register_outlet_action_json(outlet_id: &str, outlet_name: &str, owner: &str) -> String {
             let impl_hash = serde_json::Value::from(vec![0u8; 32]);
             let register_action = serde_json::json!({
                 "RegisterTool": {
                     "registration": {
-                        "tool_id": tool_id,
-                        "name": tool_name,
-                        "description": format!("Tool: {tool_name}"),
+                        "outlet_id": outlet_id,
+                        "name": outlet_name,
+                        "description": format!("Outlet: {outlet_name}"),
                         "schema": {
                             "input_schema": {
                                 "type": "object",
@@ -1875,13 +1875,13 @@ mod tests {
 
         /// Serializes the bidirectionally-approved `EstablishToolInterface`
         /// governance action (source=A, target=B, BOTH approvals true).
-        fn establish_interface_action_json(ctx_a: &str, ctx_b: &str, tool_id: &str) -> String {
+        fn establish_interface_action_json(ctx_a: &str, ctx_b: &str, outlet_id: &str) -> String {
             let action = serde_json::json!({
                 "EstablishToolInterface": {
                     "interface": {
                         "source_context": ctx_a,
                         "target_context": ctx_b,
-                        "tool_id": tool_id,
+                        "outlet_id": outlet_id,
                         "rate_limit": null,
                         "inbound_rate_limit": null,
                         "per_caller_rate_limit": null,
@@ -1895,14 +1895,14 @@ mod tests {
             serde_json::to_string(&action).unwrap()
         }
 
-        /// The registered tool registration definition for context B's FFI-side
+        /// The registered outlet registration definition for context B's FFI-side
         /// registry, matching the governance `RegisterTool` schema (2-in/2-out,
         /// numeric `{sum, ok}` output) so the deterministic id agrees and the
         /// handler's response validates at Commit-B.
-        fn build_napi_tool_def(tool_name: &str, owner: &str) -> NapiToolDefinition {
-            NapiToolDefinition {
-            name: tool_name.to_owned(),
-            description: format!("Tool: {tool_name}"),
+        fn build_napi_outlet_def(outlet_name: &str, owner: &str) -> NapiOutletDefinition {
+            NapiOutletDefinition {
+            name: outlet_name.to_owned(),
+            description: format!("Outlet: {outlet_name}"),
             input_schema_json:
                 r#"{"type":"object","properties":{"a":{"type":"string"},"b":{"type":"string"}}}"#
                     .to_owned(),
@@ -1996,7 +1996,7 @@ mod tests {
         }
 
         /// Full `Committed` terminal through the NAPI bridge: an authenticated
-        /// caller drives the §6.2.4 cross-context tool-invocation saga to a real
+        /// caller drives the §6.2.4 cross-context outlet-invocation saga to a real
         /// commit and the bridge returns the committed receipt + output bytes.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn xctx_saga_authenticated_caller_commits_via_governance_established_interface() {
@@ -2027,8 +2027,8 @@ mod tests {
             seed_owner_document_into_resolver(&owner_identity, &resolver_dht).await;
 
             // Context A (caller/source): ceiling carries governance:propose (so the
-            // admin can propose) and tool:interface (required by
-            // execute_establish_tool_interface's ceiling check).
+            // admin can propose) and outlet:interface (required by
+            // execute_establish_outlet_interface's ceiling check).
             let params_a = serde_json::json!({
                 "ceiling": [
                     "governance:propose",
@@ -2047,7 +2047,7 @@ mod tests {
             let ctx_a = handle_a.context_id();
 
             // Context B (target): ceiling carries governance:propose and
-            // tool:register so the saga tool can be registered into B's ACTOR
+            // outlet:register so the saga outlet can be registered into B's ACTOR
             // governance state (the saga's Prepare-B reads it from there).
             let params_b = serde_json::json!({
                 "ceiling": ["governance:propose", "tool:register"],
@@ -2060,13 +2060,13 @@ mod tests {
                 .expect("context_create B should succeed");
             let ctx_b = handle_b.context_id();
 
-            // Deterministic tool id shared across the actor registry, the interface,
+            // Deterministic outlet id shared across the actor registry, the interface,
             // and the FFI-side handler.
-            let tool_name = "xctx_saga_commit_tool";
-            let tool_id = scp_ffi_common::tool_id::generate_tool_id(tool_name);
+            let outlet_name = "xctx_saga_commit_outlet";
+            let outlet_id = scp_ffi_common::outlet_id::generate_outlet_id(outlet_name);
 
-            // Register the tool into B's ACTOR governance state.
-            let register_json = register_tool_action_json(&tool_id, tool_name, &owner);
+            // Register the outlet into B's ACTOR governance state.
+            let register_json = register_outlet_action_json(&outlet_id, outlet_name, &owner);
             crate::context::context_governance_propose_on(
                 &bi,
                 &handle_b,
@@ -2076,26 +2076,26 @@ mod tests {
             .await
             .expect("RegisterTool must auto-execute under single_admin");
 
-            // Register the tool into B's FFI-side registry (so register_tool_handler
+            // Register the outlet into B's FFI-side registry (so register_outlet_handler
             // accepts it) and attach the deterministic handler the executor runs at
             // Commit-B.
-            let ffi_tool_id =
-                tool_register_on(&bi, &handle_b, build_napi_tool_def(tool_name, &owner))
+            let ffi_outlet_id =
+                outlet_register_on(&bi, &handle_b, build_napi_outlet_def(outlet_name, &owner))
                     .await
-                    .expect("FFI tool_register should succeed");
+                    .expect("FFI outlet_register should succeed");
             assert_eq!(
-                ffi_tool_id, tool_id,
-                "FFI and governance tool ids must agree (deterministic generate_tool_id)"
+                ffi_outlet_id, outlet_id,
+                "FFI and governance outlet ids must agree (deterministic generate_outlet_id)"
             );
-            let handler: crate::runtime::ToolHandler =
+            let handler: crate::runtime::OutletHandler =
                 std::sync::Arc::new(|_input: serde_json::Value| {
                     Ok(serde_json::json!({"sum": 42, "ok": 1}))
                 });
-            crate::runtime::register_tool_handler(&bi, &ctx_b, &tool_id, handler)
-                .expect("register_tool_handler should succeed");
+            crate::runtime::register_outlet_handler(&bi, &ctx_b, &outlet_id, handler)
+                .expect("register_outlet_handler should succeed");
 
             // Establish the bidirectionally-approved interface in A via governance.
-            let interface_json = establish_interface_action_json(&ctx_a, &ctx_b, &tool_id);
+            let interface_json = establish_interface_action_json(&ctx_a, &ctx_b, &outlet_id);
             let propose_result = crate::context::context_governance_propose_on(
                 &bi,
                 &handle_a,
@@ -2120,12 +2120,12 @@ mod tests {
             // A 16-byte nonce as 32 lowercase-hex chars.
             let nonce_hex = "0123456789abcdef0123456789abcdef".to_owned();
 
-            let result = Box::pin(tool_invoke_cross_context_saga_on(
+            let result = Box::pin(outlet_invoke_cross_context_saga_on(
                 &bi,
                 &handle_a,
                 &handle_b,
                 owner.clone(),
-                tool_id.clone(),
+                outlet_id.clone(),
                 r#"{"a":"x","b":"y"}"#.to_owned(),
                 nonce_hex,
                 now_ms,
@@ -2175,7 +2175,7 @@ mod tests {
 
         /// Creates an ephemeral single-admin context owned by `owner_identity` whose
         /// ceiling carries the saga-relevant capabilities. Mirrors the e2e setup but
-        /// without the tool/interface wiring the two binding-rejection tests never
+        /// without the outlet/interface wiring the two binding-rejection tests never
         /// reach (they abort at the caller gate before the producer runs).
         async fn create_saga_context(
             bi: &std::sync::Arc<crate::runtime::NapiBridgeInstance>,
@@ -2216,7 +2216,7 @@ mod tests {
 
             let handle_a = create_saga_context(&bi, &owner_identity).await;
             let handle_b = create_saga_context(&bi, &owner_identity).await;
-            let tool_id = scp_ffi_common::tool_id::generate_tool_id("xctx_saga_unhosted_probe");
+            let outlet_id = scp_ffi_common::outlet_id::generate_outlet_id("xctx_saga_unhosted_probe");
 
             // A syntactically valid DID that was never created on this instance.
             let unhosted_caller = "did:dht:z6MkUnhostedCallerPrincipal0001".to_owned();
@@ -2231,12 +2231,12 @@ mod tests {
 
             // `NapiSagaResult` is not `Debug`, so destructure the `Err` terminal
             // explicitly rather than `expect_err`.
-            let Err(err) = Box::pin(tool_invoke_cross_context_saga_on(
+            let Err(err) = Box::pin(outlet_invoke_cross_context_saga_on(
                 &bi,
                 &handle_a,
                 &handle_b,
                 unhosted_caller,
-                tool_id,
+                outlet_id,
                 r#"{"a":"x","b":"y"}"#.to_owned(),
                 "0123456789abcdef0123456789abcdef".to_owned(),
                 now_ms,
@@ -2287,7 +2287,7 @@ mod tests {
             // Contexts created by `owner` ⇒ `stranger` is hosted but not a member.
             let handle_a = create_saga_context(&bi, &owner_identity).await;
             let handle_b = create_saga_context(&bi, &owner_identity).await;
-            let tool_id = scp_ffi_common::tool_id::generate_tool_id("xctx_saga_nonmember_probe");
+            let outlet_id = scp_ffi_common::outlet_id::generate_outlet_id("xctx_saga_nonmember_probe");
 
             let now_ms = u64::try_from(
                 std::time::SystemTime::now()
@@ -2299,12 +2299,12 @@ mod tests {
 
             // `NapiSagaResult` is not `Debug`, so destructure the `Err` terminal
             // explicitly rather than `expect_err`.
-            let Err(err) = Box::pin(tool_invoke_cross_context_saga_on(
+            let Err(err) = Box::pin(outlet_invoke_cross_context_saga_on(
                 &bi,
                 &handle_a,
                 &handle_b,
                 stranger, // hosted, but not a member of caller context A
-                tool_id,
+                outlet_id,
                 r#"{"a":"x","b":"y"}"#.to_owned(),
                 "0123456789abcdef0123456789abcdef".to_owned(),
                 now_ms,
@@ -2362,8 +2362,8 @@ mod tests {
             let handle_a = create_saga_context(&bi, &owner_identity).await;
             let handle_b = create_saga_context(&bi, &owner_identity).await;
             let ctx_a = handle_a.context_id();
-            let tool_id =
-                scp_ffi_common::tool_id::generate_tool_id("xctx_saga_member_unhosted_probe");
+            let outlet_id =
+                scp_ffi_common::outlet_id::generate_outlet_id("xctx_saga_member_unhosted_probe");
 
             // The caller is a syntactically valid DID that is NEVER `identity_create`'d
             // (so the bridge's identity registry does NOT host it — axis (a) must
@@ -2408,12 +2408,12 @@ mod tests {
 
             // `NapiSagaResult` is not `Debug`, so destructure the `Err` terminal
             // explicitly rather than `expect_err`.
-            let Err(err) = Box::pin(tool_invoke_cross_context_saga_on(
+            let Err(err) = Box::pin(outlet_invoke_cross_context_saga_on(
                 &bi,
                 &handle_a,
                 &handle_b,
                 member_but_unhosted_caller, // member of caller_ctx, but NOT hosted
-                tool_id,
+                outlet_id,
                 r#"{"a":"x","b":"y"}"#.to_owned(),
                 "0123456789abcdef0123456789abcdef".to_owned(),
                 now_ms,
