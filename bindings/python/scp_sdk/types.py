@@ -231,7 +231,10 @@ class Capability(enum.Enum):
 
     MESSAGES_READ = "messages:read"
     MESSAGES_WRITE = "messages:write"
+    #: Query outlet capability — read-only; never billed.
     OUTLET_QUERY_ALL = "outlet:query:*"
+    #: Action outlet capability — the outlet may mutate state and may incur
+    #: cost (billable).
     OUTLET_CALL_ALL = "outlet:call:*"
     OUTLET_REGISTER = "outlet:register"
     MEMBER_INVITE = "member:invite"
@@ -253,6 +256,8 @@ class Capability(enum.Enum):
     def outlet_query(outlet_id: str) -> str:
         """Return the capability string for invoking a specific Query outlet.
 
+        Query outlet capability — read-only; never billed.
+
         Since Python enums cannot carry per-instance data, parameterised
         capabilities are represented as plain strings. Per spec §5.4.2.1
         the suffix must match ``^[a-z0-9_-]{1,128}$``.
@@ -262,6 +267,9 @@ class Capability(enum.Enum):
     @staticmethod
     def outlet_call(outlet_id: str) -> str:
         """Return the capability string for invoking a specific Action outlet.
+
+        Action outlet capability — the outlet may mutate state and may
+        incur cost (billable).
 
         Since Python enums cannot carry per-instance data, parameterised
         capabilities are represented as plain strings. Per spec §5.4.2.1

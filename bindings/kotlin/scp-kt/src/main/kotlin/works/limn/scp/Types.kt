@@ -39,7 +39,11 @@ import works.limn.scp.bridge.BridgeException
 object Capability {
     const val MESSAGES_READ = "messages:read"
     const val MESSAGES_WRITE = "messages:write"
+
+    /** Query outlet capability — read-only; never billed. */
     const val OUTLET_QUERY_ALL = "outlet:query:*"
+
+    /** Action outlet capability — the outlet may mutate state and may incur cost (billable). */
     const val OUTLET_CALL_ALL = "outlet:call:*"
     const val OUTLET_REGISTER = "outlet:register"
     const val MEMBER_INVITE = "member:invite"
@@ -59,15 +63,17 @@ object Capability {
 
     /**
      * Builds the capability string for invoking a specific Query (read-only)
-     * outlet. Per spec §5.4.2.1 the [outletId] suffix must match
+     * outlet. Query outlet capability — read-only; never billed.
+     * Per spec §5.4.2.1 the [outletId] suffix must match
      * `^[a-z0-9_-]{1,128}$`.
      */
     fun outletQuery(outletId: String): String = "outlet:query:$outletId"
 
     /**
      * Builds the capability string for invoking a specific Action (mutating)
-     * outlet. Per spec §5.4.2.1 the [outletId] suffix must match
-     * `^[a-z0-9_-]{1,128}$`.
+     * outlet. Action outlet capability — the outlet may mutate state and may
+     * incur cost (billable). Per spec §5.4.2.1 the [outletId] suffix must
+     * match `^[a-z0-9_-]{1,128}$`.
      */
     fun outletCall(outletId: String): String = "outlet:call:$outletId"
 }

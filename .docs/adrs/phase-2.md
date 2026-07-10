@@ -974,8 +974,8 @@ pub enum EventType {
    >    *Scope:* this covers the **intra-context, per-author** `ToolInvoked`
    >    emission. The **cross-context tool-call saga** (§6) records its `ToolInvoked`
    >    / `CrossContextToolInvoked` within the saga's MLS-Commit phase — commit-
-   >    ordered and *convergent*, canonical by design (its `tool_invoked_event_id`
-   >    is a signed `CrossContextToolReceipt` field) — and is **not** in this
+   >    ordered and *convergent*, canonical by design (its `outlet_invoked_event_id`
+   >    is a signed `CrossContextOutletReceipt` field) — and is **not** in this
    >    per-author exclusion.
    >
    > 3. **Per-committer broadcast-retry bookkeeping (permanent — kept as an

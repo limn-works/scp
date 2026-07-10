@@ -108,7 +108,9 @@ public nonisolated struct Capability: Sendable {
     public enum Name {
         public static let messagesRead = "messages:read"
         public static let messagesWrite = "messages:write"
+        /// Query outlet capability — read-only; never billed.
         public static let outletQueryAll = "outlet:query:*"
+        /// Action outlet capability — the outlet may mutate state and may incur cost (billable).
         public static let outletCallAll = "outlet:call:*"
         public static let outletRegister = "outlet:register"
         public static let memberInvite = "member:invite"
@@ -128,15 +130,17 @@ public nonisolated struct Capability: Sendable {
     }
 
     /// Builds the capability string for invoking a specific Query (read-only)
-    /// outlet. Per spec §5.4.2.1 the `outletId` suffix must match
+    /// outlet. Query outlet capability — read-only; never billed.
+    /// Per spec §5.4.2.1 the `outletId` suffix must match
     /// `^[a-z0-9_-]{1,128}$`.
     public static func outletQuery(_ outletId: String) -> String {
         "outlet:query:\(outletId)"
     }
 
     /// Builds the capability string for invoking a specific Action (mutating)
-    /// outlet. Per spec §5.4.2.1 the `outletId` suffix must match
-    /// `^[a-z0-9_-]{1,128}$`.
+    /// outlet. Action outlet capability — the outlet may mutate state and may
+    /// incur cost (billable). Per spec §5.4.2.1 the `outletId` suffix must
+    /// match `^[a-z0-9_-]{1,128}$`.
     public static func outletCall(_ outletId: String) -> String {
         "outlet:call:\(outletId)"
     }

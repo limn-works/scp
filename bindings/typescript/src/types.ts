@@ -27,7 +27,9 @@
 export const Capabilities = {
   MESSAGES_READ: "messages:read",
   MESSAGES_WRITE: "messages:write",
+  /** Query outlet capability — read-only; never billed. */
   OUTLET_QUERY_ALL: "outlet:query:*",
+  /** Action outlet capability — the outlet may mutate state and may incur cost (billable). */
   OUTLET_CALL_ALL: "outlet:call:*",
   OUTLET_REGISTER: "outlet:register",
   MEMBER_INVITE: "member:invite",
@@ -49,6 +51,8 @@ export const Capabilities = {
 /**
  * Build the capability string for invoking a specific Query (read-only) outlet.
  *
+ * Query outlet capability — read-only; never billed.
+ *
  * Per spec §5.4.2.1 the `outletId` suffix must match `^[a-z0-9_-]{1,128}$`.
  */
 export function outletQuery(outletId: string): string {
@@ -57,6 +61,8 @@ export function outletQuery(outletId: string): string {
 
 /**
  * Build the capability string for invoking a specific Action (mutating) outlet.
+ *
+ * Action outlet capability — the outlet may mutate state and may incur cost (billable).
  *
  * Per spec §5.4.2.1 the `outletId` suffix must match `^[a-z0-9_-]{1,128}$`.
  */

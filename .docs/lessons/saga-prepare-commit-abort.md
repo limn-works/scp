@@ -53,7 +53,7 @@ The per-phase handlers run on the participant actors (`context/actor/handlers/sa
   reservation, Class-S sync-persists fail-closed, and replies the `Send` reservation
   handles for the FSM to hold (RAII release on abort).
 - **Prepare-B** (`prepare_b`, target actor) — re-runs the full §7 validation *re-bound* to
-  the carried `caller_did` + `tool_registration_id` (the confused-deputy defense),
+  the carried `caller_did` + `outlet_registration_id` (the confused-deputy defense),
   captures B-controlled provenance, stages the prepared record, Class-S sync-persists
   fail-closed, then replies.
 - **Commit** — split `commit_b_reserve` → supervisor executes → `commit_b_settle`

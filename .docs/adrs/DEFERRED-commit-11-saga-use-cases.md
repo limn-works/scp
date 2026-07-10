@@ -114,7 +114,7 @@ context but not the cross-context forwarding path:
   target's event log.
 
 **What needs specification.**
-- A new envelope type (e.g. `CrossContextToolInvoke`) with fields:
+- A new envelope type (e.g. `CrossContextOutletInvoke`) with fields:
   caller context ID, caller DID, target tool registration ID, input
   JSON, optional UCAN proof reference.
 - The transport leg: does the caller serialize and send via
@@ -122,10 +122,10 @@ context but not the cross-context forwarding path:
   cross-context relay route exist.
 - Receipt / response path: how the target's output reaches the
   caller (same envelope type on a return channel vs. separate
-  `CrossContextToolReceipt`).
+  `CrossContextOutletReceipt`).
 
 **Resolution.** The saga is produced directly by
-`Supervisor::start_cross_context_tool_invocation_saga` (running
+`Supervisor::start_cross_context_outlet_invocation_saga` (running
 supervisor-side); the dead `ToolsCommand::InitiateCrossContextToolInvocation`
 mailbox variant and its `NotImplemented` reply have been deleted. Note:
 `Supervisor::invoke_tool_with_economy` is, for a separate reason, not
@@ -321,11 +321,11 @@ downstream PR):
 
 - **Gap 2 — Cross-context tool invocation transport → RESOLVED by
   §6.2.4 (Cross-Context Tool Invocation Saga).** The
-  `CrossContextToolInvoke` envelope (UCAN carried as an *index*, not
+  `CrossContextOutletInvoke` envelope (UCAN carried as an *index*, not
   bytes; re-bound to `caller_did` plus tool at resolution to foreclose
   confused-deputy escalation), Prepare/Commit directional flow, RAII
   reservation release on every terminal path, the §9.5.1 field-
-  enumerated `CrossContextToolReceipt` signature, dual event-log
+  enumerated `CrossContextOutletReceipt` signature, dual event-log
   recording, and the signed `CrossContextDivergenceMarker` on
   `NeedsRepair`.
 
