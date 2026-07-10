@@ -1615,11 +1615,16 @@ pub enum BroadcastCommand {
     /// Subscribe a DID to a broadcast context. Mirrors
     /// [`broadcast_helpers::subscribe_broadcast`](crate::context::broadcast_helpers::subscribe_broadcast).
     ///
-    /// The validation-context-generic form of that helper carries
-    /// a `ValidationContext<'_, D, N, R, P, S>` parameter; the actor
-    /// command surface passes `None` for that slot to match the default
-    /// unvalidated path. Gated contexts with a UCAN still route through
-    /// the UCAN token's inline validation.
+    /// The validation-context-generic form of that helper carries a
+    /// `ValidationContext<'_, D, N, R, P, S>` parameter. The
+    /// `handle_subscribe_broadcast` handler builds a REAL `ValidationContext`
+    /// from actor-owned state (`KeyResolverDidResolver`,
+    /// `ContextRevocationChecker`, an owned snapshot of the per-context proof
+    /// store, the context ceiling, and creator DID) and passes `Some(&mut ctx)`,
+    /// so a gated context runs the full UCAN validation pipeline on the
+    /// presented `messages:read` token (spec §5.14.4, §07:70). The payload's
+    /// `ucan` field carries that token — `None` is valid only for an OPEN
+    /// context, which the pipeline never invokes.
     SubscribeBroadcast {
         /// Boxed owned payload.
         payload: Box<SubscribeBroadcastPayload>,

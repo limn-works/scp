@@ -4783,21 +4783,36 @@ impl crate::scp::PyScp {
     /// Subscribes a DID to a broadcast context.
     ///
     /// For open broadcast contexts, any DID can subscribe. For gated contexts,
-    /// a valid `messagesRead` UCAN is required.
+    /// a valid `messages:read` UCAN issued to `subscriber_did` by the context
+    /// admin/creator MUST be supplied as `messages_read_ucan_jwt` (spec §5.14.4);
+    /// the full UCAN validation pipeline runs on it in the actor (spec §07:70).
+    /// Omitting it for a gated context is rejected with `PermissionDenied`.
     ///
     /// # Errors
     ///
     /// Returns `RuntimeError` if the context is not active, not a broadcast
-    /// context, or if subscription fails.
-    #[pyo3(signature = (handle, subscriber_did))]
+    /// context, if `messages_read_ucan_jwt` is malformed, or if subscription
+    /// fails.
+    #[pyo3(signature = (handle, subscriber_did, messages_read_ucan_jwt=None))]
     pub fn broadcast_subscribe(
         &self,
         handle: &PyContextHandle,
         subscriber_did: &str,
+        messages_read_ucan_jwt: Option<&str>,
     ) -> PyResult<()> {
         let bi = &*self.inner;
         crate::pyscp_check_handle!(&bi.core, handle);
         validate::validate_did(subscriber_did)?;
+        // Parse the optional gated-admission `messages:read` UCAN JWT into a
+        // UcanToken; the actor runs the full validation pipeline on it.
+        let ucan_token = messages_read_ucan_jwt
+            .map(|jwt| {
+                validate::validate_ucan_token(jwt)?;
+                scp_core::crypto::ucan::validate::parse_ucan(jwt).map_err(|e| {
+                    PyRuntimeError::new_err(format!("invalid messages:read UCAN: {e}"))
+                })
+            })
+            .transpose()?;
         let rt = crate::runtime()?;
         let sup =
             crate::runtime::supervisor(bi).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
@@ -4813,7 +4828,7 @@ impl crate::scp::PyScp {
                 payload: Box::new(SubscribeBroadcastPayload {
                     context_id,
                     subscriber_did: did,
-                    ucan: None,
+                    ucan: ucan_token,
                     timestamp,
                 }),
                 reply: tx,

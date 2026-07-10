@@ -579,12 +579,16 @@ interface BroadcastBindings {
      *
      * @param contextHandle Opaque handle from context create or join.
      * @param subscriberDid DID of the entity subscribing to broadcasts.
+     * @param messagesReadUcanJwt For a GATED broadcast context, the
+     *   `messages:read` UCAN JWT issued to [subscriberDid] by the context
+     *   admin/creator (spec §5.14.4). Unused for an OPEN context.
      * @throws BridgeException if subscription fails (e.g., admission
      *   policy rejection, context not active).
      */
     fun broadcastSubscribe(
         contextHandle: Long,
         subscriberDid: String,
+        messagesReadUcanJwt: String? = null,
     )
 
     /**
@@ -2396,11 +2400,16 @@ class BroadcastBridgeOps internal constructor(
      *
      * @param contextHandle Handle from context create or join.
      * @param subscriberDid The DID subscribing to broadcasts.
+     * @param messagesReadUcanJwt For a GATED broadcast context, the
+     *   `messages:read` UCAN JWT issued to [subscriberDid] by the context
+     *   admin/creator (spec §5.14.4). Unused for an OPEN context.
      */
     suspend fun subscribe(
         contextHandle: Long,
         subscriberDid: String,
-    ): Unit = bridge.ffiCall { bindings.broadcastSubscribe(contextHandle, subscriberDid) }
+        messagesReadUcanJwt: String? = null,
+    ): Unit =
+        bridge.ffiCall { bindings.broadcastSubscribe(contextHandle, subscriberDid, messagesReadUcanJwt) }
 
     /**
      * Unsubscribe a DID from a broadcast context.

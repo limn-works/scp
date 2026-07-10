@@ -1537,10 +1537,23 @@ export class SCP {
     );
   }
 
-  async broadcastSubscribe(handle: unknown, subscriberDid: string): Promise<void> {
-    await (this.#native.broadcastSubscribe as (h: unknown, d: string) => Promise<void>)(
+  /**
+   * Subscribe a DID to a broadcast context.
+   *
+   * For a GATED broadcast context, `messagesReadUcanJwt` must carry the
+   * `messages:read` UCAN JWT issued to `subscriberDid` by the context
+   * admin/creator (spec §5.14.4); the full UCAN validation pipeline runs on it.
+   * It is unused for an OPEN context.
+   */
+  async broadcastSubscribe(
+    handle: unknown,
+    subscriberDid: string,
+    messagesReadUcanJwt?: string,
+  ): Promise<void> {
+    await (this.#native.broadcastSubscribe as (h: unknown, d: string, u?: string) => Promise<void>)(
       handle,
       subscriberDid,
+      messagesReadUcanJwt,
     );
   }
 

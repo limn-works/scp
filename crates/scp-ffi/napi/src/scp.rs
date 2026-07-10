@@ -2354,14 +2354,25 @@ impl Scp {
     }
 
     /// Per-instance equivalent of the free-function `broadcast_subscribe`.
+    ///
+    /// For a GATED broadcast context, `messagesReadUcanJwt` MUST carry the
+    /// `messages:read` JWT issued to `subscriberDid` by the context admin/creator
+    /// (spec §5.14.4).
     #[napi(js_name = "broadcastSubscribe")]
     pub async fn broadcast_subscribe(
         &self,
         handle: &NapiContextHandle,
         subscriber_did: String,
+        messages_read_ucan_jwt: Option<String>,
     ) -> napi::Result<()> {
         crate::napi_check_handle!(&self.inner.core, handle);
-        crate::context::broadcast_subscribe_on(&self.inner, handle, subscriber_did).await
+        crate::context::broadcast_subscribe_on(
+            &self.inner,
+            handle,
+            subscriber_did,
+            messages_read_ucan_jwt,
+        )
+        .await
     }
 
     /// Per-instance equivalent of the free-function `broadcast_unsubscribe`.

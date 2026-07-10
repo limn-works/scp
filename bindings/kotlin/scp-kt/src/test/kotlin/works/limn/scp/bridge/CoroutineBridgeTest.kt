@@ -1157,6 +1157,7 @@ class StubNativeBindings : NativeBindings {
     override fun broadcastSubscribe(
         contextHandle: Long,
         subscriberDid: String,
+        messagesReadUcanJwt: String?,
     ) = Unit
 
     override fun broadcastUnsubscribe(

@@ -1571,9 +1571,18 @@ class SCP:
             self._native.broadcast_publish_assets, handle, author_did, assets, deploy_id
         )
 
-    async def broadcast_subscribe(self, handle: Any, subscriber_did: str) -> Any:
-        """Delegate to ``_scp_core.SCP.broadcast_subscribe``."""
-        return await asyncio.to_thread(self._native.broadcast_subscribe, handle, subscriber_did)
+    async def broadcast_subscribe(
+        self, handle: Any, subscriber_did: str, messages_read_ucan_jwt: str | None = None
+    ) -> Any:
+        """Delegate to ``_scp_core.SCP.broadcast_subscribe``.
+
+        For a GATED broadcast context, ``messages_read_ucan_jwt`` must carry the
+        ``messages:read`` UCAN JWT issued to ``subscriber_did`` by the context
+        admin/creator (spec §5.14.4). It is unused for an OPEN context.
+        """
+        return await asyncio.to_thread(
+            self._native.broadcast_subscribe, handle, subscriber_did, messages_read_ucan_jwt
+        )
 
     async def broadcast_subscriber_count(self, handle: Any) -> Any:
         """Delegate to ``_scp_core.SCP.broadcast_subscriber_count``."""

@@ -920,6 +920,12 @@ pub async fn execute_revoke(
                 state.access.read_exclusion_list.insert(did.clone());
 
                 if let Some(ref mut bc) = state.broadcast_context {
+                    // `governance_ban_subscriber` ALWAYS records the durable ban
+                    // AND rotates every author's broadcast key (forward secrecy,
+                    // §9.5 / #2088), whether or not the DID is a current subscriber
+                    // — a non-subscriber returns `Ok` with a NON-empty rotation set.
+                    // The `MemberNotFound` arm now covers only the internal
+                    // author-not-found safety net (unreachable in practice).
                     match bc.governance_ban_subscriber(&did.0, access) {
                         Ok(r) => {
                             rotated = r.rotated_authors.len();
@@ -1057,7 +1063,20 @@ pub async fn execute_restore_access(
             suspended_set.is_none_or(|set| !capabilities.iter().any(|c| set.contains(c)));
         let read_excluded = state.access.read_exclusion_list.contains(did);
         let read_requested = capabilities.contains(&Capability::MessagesRead);
-        if nothing_suspended_for_request && !(read_requested && read_excluded) {
+        // #2088 Finding 2: a durable broadcast ban is a restorable condition too.
+        // BOTH `suspended_capabilities` and `read_exclusion_list` are wiped by the
+        // banned subject's own self-leave (`leave_context` clears role suspension
+        // and the exclusion entry) — but the durable `banned_subscribers` record
+        // survives it by design. Without this, `RestoreAccess{MessagesRead}` after
+        // a leave would short-circuit `NothingToRestore` and never reach
+        // `governance_unban_subscriber`, leaving the DID PERMANENTLY banned with no
+        // authority recovery — falsifying the "cleared ONLY by RestoreAccess"
+        // invariant. Treat an outstanding durable ban as a read-restorable signal.
+        let durably_banned = state
+            .broadcast_context
+            .as_ref()
+            .is_some_and(|bc| bc.is_banned(did.as_ref()));
+        if nothing_suspended_for_request && !(read_requested && (read_excluded || durably_banned)) {
             return Err(ContextError::NothingToRestore(format!(
                 "no suspended capabilities to restore for {did}"
             )));

@@ -482,7 +482,8 @@
           "python": true,
           "typescript": true,
           "kotlin": true,
-          "swift": true
+          "swift": true,
+          "notes": "All four SDK wrappers accept an optional messages:read UCAN JWT (Python `messages_read_ucan_jwt`, TS/Swift/Kotlin `messagesReadUcanJwt`) threaded through the bridge into SubscribeBroadcastPayload.ucan. For a GATED broadcast context this token is REQUIRED (spec §5.14.4): the actor handle_subscribe_broadcast turn builds a real ValidationContext and runs the full UCAN validation pipeline on it (spec §07:70). Omitting it for a gated context is rejected; it is unused for an OPEN context. Admission also fails closed for a governance-banned/read-revoked DID via the read_exclusion_list gate in subscribe_broadcast (uniform SUBSCRIBE_DENY_REASON), so a banned subscriber cannot replay a still-valid grant to re-appear on the roster."
         },
         {
           "name": "broadcast_publish",

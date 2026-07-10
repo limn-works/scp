@@ -535,13 +535,21 @@ class SCP internal constructor(
             deployId = deployId,
         )
 
-    /** Forwards to [NativeScp.broadcastSubscribe] on [inner]. */
+    /**
+     * Forwards to [NativeScp.broadcastSubscribe] on [inner].
+     *
+     * For a GATED broadcast context, [messagesReadUcanJwt] must carry the
+     * `messages:read` UCAN JWT issued to [subscriberDid] by the context
+     * admin/creator (spec §5.14.4). It is unused for an OPEN context.
+     */
     suspend fun broadcastSubscribe(
         handle: ContextHandle,
         subscriberDid: String,
+        messagesReadUcanJwt: String? = null,
     ) = inner.broadcastSubscribe(
         handle = handle,
         subscriberDid = subscriberDid,
+        messagesReadUcanJwt = messagesReadUcanJwt,
     )
 
     /** Forwards to [NativeScp.broadcastSubscriberCount] on [inner]. */

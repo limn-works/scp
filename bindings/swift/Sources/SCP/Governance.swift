@@ -526,17 +526,24 @@ public extension Context {
     ///
     /// - Parameters:
     ///   - subscriberDid: The DID subscribing to broadcasts.
-    ///   - subscribeFn: Bridge function override for testing.
+    ///   - messagesReadUcanJwt: For a GATED broadcast context, the `messages:read`
+    ///     UCAN JWT issued to `subscriberDid` by the context admin/creator (spec
+    ///     §5.14.4). Unused for an OPEN context.
     /// - Throws: ``ScpError/Context(msg:code:)`` if the context is not
     ///   active or not a broadcast context.
     func broadcastSubscribe(
-        subscriberDid: String
+        subscriberDid: String,
+        messagesReadUcanJwt: String? = nil
     ) async throws {
         guard state == .active else {
             throw ScpError.Context(msg: "Context is not active", code: "SCP-CTX-2001")
         }
 
-        try await scp.broadcastSubscribe(handle: handle, subscriberDid: subscriberDid)
+        try await scp.broadcastSubscribe(
+            handle: handle,
+            subscriberDid: subscriberDid,
+            messagesReadUcanJwt: messagesReadUcanJwt
+        )
     }
 
     /// Unsubscribes a DID from this broadcast context.

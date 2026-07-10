@@ -2772,16 +2772,31 @@ pub(crate) async fn context_broadcast_admission_on(
 
 /// Per-bridge-instance implementation of [`broadcast_subscribe`].
 ///
-/// Routed through the ADR-049 broadcast dispatch surface.
+/// Routed through the ADR-049 broadcast dispatch surface. For a GATED broadcast
+/// context, `messages_read_ucan_jwt` MUST carry the `messages:read` JWT issued to
+/// `subscriber_did` by the context admin/creator (spec §5.14.4); the actor runs
+/// the full UCAN validation pipeline on it (spec §07:70). It is unused for an
+/// OPEN context.
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
 pub(crate) async fn broadcast_subscribe_on(
     bi: &NapiBridgeInstance,
     handle: &NapiContextHandle,
     subscriber_did: String,
+    messages_read_ucan_jwt: Option<String>,
 ) -> napi::Result<()> {
     use scp_core::context::actor::commands::{BroadcastCommand, SubscribeBroadcastPayload};
     crate::napi_check_handle!(&bi.core, handle);
     validate_did(&subscriber_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+    // Parse the optional gated-admission `messages:read` UCAN JWT once at the
+    // bridge boundary so malformed tokens are rejected before dispatch. Mirrors
+    // the spending-UCAN parse-and-thread pattern above / the PyO3 bridge.
+    let ucan_token = messages_read_ucan_jwt
+        .as_deref()
+        .map(|jwt| {
+            scp_core::crypto::ucan::validate::parse_ucan(jwt)
+                .map_err(|e| napi::Error::from_reason(format!("invalid messages:read UCAN: {e}")))
+        })
+        .transpose()?;
     let sup = crate::runtime::supervisor(bi)?;
     let context_id = handle.context_id.clone();
     let did: DID = DID(subscriber_did);
@@ -2792,7 +2807,7 @@ pub(crate) async fn broadcast_subscribe_on(
         payload: Box::new(SubscribeBroadcastPayload {
             context_id,
             subscriber_did: did,
-            ucan: None,
+            ucan: ucan_token,
             timestamp,
         }),
         reply: tx,

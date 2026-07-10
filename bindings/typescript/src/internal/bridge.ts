@@ -139,7 +139,11 @@ export interface Bridge {
   contextMemberRole(handle: BridgeContextHandle, did: string): Promise<MemberRole | null>;
 
   // Broadcast operations
-  broadcastSubscribe(handle: BridgeContextHandle, subscriberDid: string): Promise<void>;
+  broadcastSubscribe(
+    handle: BridgeContextHandle,
+    subscriberDid: string,
+    messagesReadUcanJwt?: string,
+  ): Promise<void>;
   broadcastUnsubscribe(
     handle: BridgeContextHandle,
     subscriberDid: string,

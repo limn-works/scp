@@ -124,6 +124,18 @@ const RECONNECT_DRIVER_SRC: &str =
 const HANDLERS_MESSAGING_SRC: &str =
     include_str!("../../../../crates/scp-runtime/src/context/actor/handlers/messaging.rs");
 
+// Actor broadcast-handler source — owns `handle_subscribe_broadcast`, the
+// actor-turn body that builds a REAL UCAN `ValidationContext` from actor-owned
+// state and passes it (`Some(&mut validation_ctx)`) into
+// `broadcast_helpers::subscribe_broadcast` so a GATED broadcast context runs the
+// full `messages:read` validation pipeline (spec §5.14.4, §07:70). The
+// `gated_broadcast_subscribe_builds_real_validation_context` assertion below
+// pins this so a refactor cannot silently regress the handler back to passing
+// `None` (which made gated subscribe unreachable — every SDK gated-subscribe
+// died at the protocol's missing-UCAN reject before validation ran).
+const HANDLERS_BROADCAST_SRC: &str =
+    include_str!("../../../../crates/scp-runtime/src/context/actor/handlers/broadcast.rs");
+
 // UCAN validation pipeline source — owns `validate_ucan`, the 11-step
 // capability authorization gate. The `ucan_step8_enforces_ceiling_over_all_att`
 // assertion below pins step 8 to checking the FULL parsed attestation set
@@ -774,6 +786,84 @@ fn broadcast_open_key_calls_open_broadcast_key() {
         "PyO3 broadcast_open_key must reach open_broadcast_key (HPKE open \
          primitive), either directly or via the shared \
          open_sealed_broadcast_key helper"
+    );
+}
+
+// Gated broadcast subscribe (spec §5.14.4): the actor `handle_subscribe_broadcast`
+// turn MUST build a real UCAN `ValidationContext` from actor-owned state (the
+// production DID/revocation adapters) and pass it (`Some(&mut validation_ctx)`)
+// into `broadcast_helpers::subscribe_broadcast`, which threads it into the
+// protocol's `bc.subscribe(...)` gated arm so `validate_messages_read_ucan` runs
+// the full pipeline on the presented token (spec §07:70). Before this wiring the
+// handler passed `None`, so the protocol rejected every gated subscribe on the
+// missing-UCAN check BEFORE any validation — the capability was unreachable.
+// These assertions pin the real-`ValidationContext` construction + threading so
+// a refactor cannot silently regress to the unvalidated `None` path.
+#[test]
+fn gated_broadcast_subscribe_builds_real_validation_context() {
+    assert!(
+        fn_body_contains(
+            HANDLERS_BROADCAST_SRC,
+            "handle_subscribe_broadcast",
+            "ValidationContext {"
+        ),
+        "handle_subscribe_broadcast must construct a real ValidationContext for \
+         the gated messages:read UCAN (spec §5.14.4), not pass None"
+    );
+    assert!(
+        fn_body_contains(
+            HANDLERS_BROADCAST_SRC,
+            "handle_subscribe_broadcast",
+            "Some(&mut validation_ctx)"
+        ),
+        "handle_subscribe_broadcast must pass Some(&mut validation_ctx) into \
+         subscribe_broadcast so the gated arm can verify the UCAN — passing None \
+         makes gated subscribe unreachable"
+    );
+    assert!(
+        fn_body_contains(
+            HANDLERS_BROADCAST_SRC,
+            "handle_subscribe_broadcast",
+            "KeyResolverDidResolver::new("
+        ),
+        "handle_subscribe_broadcast must wire the production VM-aware DID→key \
+         resolver into the ValidationContext (same adapter as the saga UCAN \
+         re-validation path), not a no-op resolver"
+    );
+    // The helper must THREAD the validation context through to the protocol's
+    // gated `bc.subscribe(...)` arm (MANAGER_SRC concatenates broadcast_helpers).
+    assert!(
+        fn_body_contains(MANAGER_SRC, "subscribe_broadcast", "validation_ctx"),
+        "broadcast_helpers::subscribe_broadcast must thread validation_ctx into \
+         bc.subscribe so the protocol gated arm reaches validate_messages_read_ucan"
+    );
+    // Durable governance-ban admission gate (#2088): subscribe_broadcast MUST
+    // consult the AUTHORITATIVE durable `banned_subscribers` record via
+    // `is_banned`, so a banned DID cannot launder the ban by self-leaving (which
+    // clears `read_exclusion_list`) and replaying a retained grant. This is the
+    // primary fix; pin it so a refactor cannot silently drop the gate.
+    assert!(
+        fn_body_contains(MANAGER_SRC, "subscribe_broadcast", "is_banned("),
+        "broadcast_helpers::subscribe_broadcast must consult the durable ban record \
+         via bc.is_banned(...) at admission (fail-closed)"
+    );
+    // Defense-in-depth: RETAIN the `read_exclusion_list` consult (the SAME set the
+    // serve path checks) for a still-present read-revoked member.
+    assert!(
+        fn_body_contains(MANAGER_SRC, "subscribe_broadcast", "read_exclusion_list"),
+        "broadcast_helpers::subscribe_broadcast must retain the read_exclusion_list \
+         consult as defense-in-depth"
+    );
+    // BLACK-303: the SECOND broadcast-read grant surface — the key-request SERVE
+    // path — must ALSO consult the durable ban, else a banned author (the creator
+    // is always an author) launders the ban by requesting a broadcast key after
+    // self-leaving. Pin `is_banned` in `handle_broadcast_key_request` so the two
+    // read-grant surfaces (subscribe + serve) stay symmetric and no fourth surface
+    // opens.
+    assert!(
+        fn_body_contains(MANAGER_SRC, "handle_broadcast_key_request", "is_banned("),
+        "broadcast_helpers::handle_broadcast_key_request must consult the durable ban \
+         record via bc.is_banned(...) before granting a broadcast key (BLACK-303)"
     );
 }
 
