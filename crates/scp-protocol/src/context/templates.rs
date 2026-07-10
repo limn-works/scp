@@ -1577,14 +1577,17 @@ mod tests {
         params.ttl = Some(Duration::from_mins(5));
         params.tools = vec![super::super::outlets::OutletRegistration {
             outlet_id: "rogue-tool".to_owned(),
+            kind: crate::context::outlets::OutletKind::Action,
             name: "rogue-tool".to_owned(),
             description: "Rogue tool for testing".to_owned(),
             schema: super::super::outlets::OutletSchema {
                 input_schema: serde_json::json!({"type": "object"}),
                 output_schema: serde_json::json!({"type": "object"}),
+                aggregate_schema: None,
             },
             implementation_hash: [0u8; 32],
             test_vectors: vec![],
+            message_catalog: Vec::new(),
             operator_did: "did:dht:z6MkTestOperator".into(),
             cost: None,
             registered_at: 0,

@@ -8,6 +8,7 @@
 //!
 //! - [`serde_signature_64`] — Ed25519 signatures (exactly 64 bytes)
 //! - [`serde_hash_32`] — SHA-256 hashes (exactly 32 bytes)
+//! - [`serde_id_16`] — 128-bit opaque identifiers (exactly 16 bytes)
 //! - [`serde_pubkey_32`] — X25519 / Ed25519 public keys (exactly 32 bytes)
 //! - [`serde_hpke_sealed_48`] — HPKE-sealed sender key (exactly 48 bytes)
 //!
@@ -116,6 +117,33 @@ pub mod serde_hash_32 {
         let v: Vec<u8> = serde_bytes::deserialize(deserializer)?;
         v.try_into().map_err(|v: Vec<u8>| {
             serde::de::Error::custom(format!("expected 32-byte hash, got {} bytes", v.len()))
+        })
+    }
+}
+
+/// Serde module for `[u8; 16]` fields (128-bit opaque identifiers).
+///
+/// Same pattern as [`serde_hash_32`] but for 16-byte values.
+#[allow(clippy::missing_errors_doc)] // Serde trait impls — error semantics are self-evident.
+pub mod serde_id_16 {
+    use serde::{self, Deserializer, Serializer};
+
+    /// Serializes a 16-byte array as compact binary via `serde_bytes`.
+    pub fn serialize<S>(bytes: &[u8; 16], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serde_bytes::serialize(bytes.as_slice(), serializer)
+    }
+
+    /// Deserializes exactly 16 bytes, rejecting any other length.
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 16], D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let v: Vec<u8> = serde_bytes::deserialize(deserializer)?;
+        v.try_into().map_err(|v: Vec<u8>| {
+            serde::de::Error::custom(format!("expected 16-byte id, got {} bytes", v.len()))
         })
     }
 }

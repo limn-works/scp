@@ -22,6 +22,11 @@ use super::{
     DID, OutletError, OutletId, OutletRegisteredEvent, OutletUpdatedEvent, OutletVerifiedEvent,
     has_admin_role, has_outlet_register_capability, schema,
 };
+// `OutletKind` is referenced only by the tests module below; gating the
+// import keeps the lib build warning-free while preserving the test-only
+// fixture helpers that exercise both Query and Action kinds.
+#[cfg(test)]
+use super::OutletKind;
 use crate::context::roles::ContextRoleState;
 use crate::economy::types::Amount;
 
@@ -33,12 +38,60 @@ use crate::economy::types::Amount;
 ///
 /// Both `input_schema` and `output_schema` must be valid JSON Schema objects
 /// (at minimum, a JSON object with a `"type"` field). See spec section 8.5.
+///
+/// Streaming outlets (§5.4.5) MAY additionally declare an `aggregate_schema`
+/// describing the shape of the terminal `End.aggregate` value. When present,
+/// it is validated by the cross-context chunk bridge (SCP-OUT-036) at stream
+/// close. When absent, the runtime falls back to validating `End.aggregate`
+/// against `output_schema` per §5.4.5 ("matches `aggregate_schema` or
+/// defaults to last Data").
+///
+/// # Backward compatibility
+///
+/// `aggregate_schema` is `Option` and is omitted from `MessagePack` /
+/// `serde_json` output via `skip_serializing_if = "Option::is_none"`. A
+/// pre-OUT-036 registration deserializes with `aggregate_schema = None`,
+/// and round-trip serialization of a `None`-valued schema is byte-identical
+/// to the pre-OUT-036 form — `schema_hash` (§5.4.1) is preserved across
+/// upgrades, so existing operator signatures remain valid.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutletSchema {
     /// JSON Schema describing the tool's expected input.
     pub input_schema: serde_json::Value,
     /// JSON Schema describing the tool's output.
     pub output_schema: serde_json::Value,
+    /// JSON Schema describing the terminal aggregate value emitted by a
+    /// streaming outlet's `End` chunk (§5.4.5). Optional — when absent,
+    /// `End.aggregate` is validated against `output_schema` per the §5.4.5
+    /// "matches `aggregate_schema` or defaults to last Data" rule.
+    ///
+    /// Serialized only when `Some`, preserving byte-for-byte `MessagePack`
+    /// compatibility with pre-OUT-036 registrations whose `schema_hash`
+    /// (§5.4.1) was computed over a 2-field schema body.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aggregate_schema: Option<serde_json::Value>,
+}
+
+impl OutletSchema {
+    /// Constructs a non-streaming `OutletSchema` (no `aggregate_schema`).
+    ///
+    /// Convenience constructor for the common pre-OUT-036 case. Use
+    /// [`Self::with_aggregate_schema`] to attach the aggregate schema.
+    #[must_use]
+    pub const fn new(input_schema: serde_json::Value, output_schema: serde_json::Value) -> Self {
+        Self {
+            input_schema,
+            output_schema,
+            aggregate_schema: None,
+        }
+    }
+
+    /// Returns a copy of this schema with `aggregate_schema` set.
+    #[must_use]
+    pub fn with_aggregate_schema(mut self, schema: serde_json::Value) -> Self {
+        self.aggregate_schema = Some(schema);
+        self
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -88,54 +141,14 @@ pub struct OutletCost {
 // ---------------------------------------------------------------------------
 // OutletRegistration
 // ---------------------------------------------------------------------------
-
-/// Full tool registration entry for an SCP context.
-///
-/// Contains all metadata required for tool integrity verification: schema,
-/// implementation hash, test vectors, and operator identity. See ADR-010
-/// acceptance criterion 1.
-///
-/// Provenance fields (`registered_at`, `signature`) close spec audit finding
-/// [5.4] — tool registration wire format now includes a timestamp and an
-/// Ed25519 signature over the canonical registration bytes, enabling
-/// independent verification that the registration was created by the claimed
-/// registrant. Both fields default to zero/empty for backward compatibility.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct OutletRegistration {
-    /// Unique identifier for this tool within the context.
-    pub outlet_id: OutletId,
-    /// Human-readable name of the tool.
-    pub name: String,
-    /// Description of the tool's purpose and behavior.
-    pub description: String,
-    /// MCP-compatible JSON Schema for input and output.
-    pub schema: OutletSchema,
-    /// SHA-256 hash of the tool implementation. Used for integrity verification.
-    /// Any change to the implementation produces a new hash.
-    pub implementation_hash: [u8; 32],
-    /// Known input-output pairs for continuous verification.
-    pub test_vectors: Vec<OutletTestVector>,
-    /// The DID of the operator accountable for this tool.
-    pub operator_did: DID,
-    /// Optional per-invocation cost metadata (spec §5.4.1, §19.3).
-    pub cost: Option<OutletCost>,
-    /// Unix timestamp (seconds) when the tool was registered.
-    ///
-    /// Provides temporal provenance for tool registrations. Defaults to 0 for
-    /// backward compatibility with registrations created before this field
-    /// existed.
-    #[serde(default)]
-    pub registered_at: u64,
-    /// Ed25519 signature over the canonical registration bytes, produced by
-    /// the registrant's signing key.
-    ///
-    /// Enables independent verification that the registration was created by
-    /// the claimed registrant. The signed payload is the `MessagePack` encoding
-    /// of all fields except `signature` itself. Defaults to empty for backward
-    /// compatibility.
-    #[serde(default)]
-    pub signature: Vec<u8>,
-}
+//
+// The struct definition and validation entry points live in the sibling
+// `registration` module per SCP-OUT-040 (the §5.4.1 V2 preimage now includes
+// `description_hash` and `catalog_hash` terms that need to live next to the
+// `message_catalog` field they cover). The re-export below preserves the
+// public path `scp_protocol::context::outlets::registry::OutletRegistration`
+// for every existing caller.
+pub use super::registration::OutletRegistration;
 
 // ---------------------------------------------------------------------------
 // OutletVerificationResult
@@ -249,13 +262,17 @@ impl OutletRegistry {
 /// 3. Implementation hash is 32 bytes (enforced by type system).
 /// 4. Operator DID is resolvable (basic format check).
 /// 5. Tool ID is not already registered.
+/// 6. `OutletRegistration::validate()` — Query structural cost floor
+///    (§5.4.2, SCP-OUT-012).
 ///
 /// On success, stores the registration and returns the tool ID along with a
 /// [`OutletRegisteredEvent`] for the caller to append to the event log.
 ///
 /// # Errors
 ///
-/// Returns [`OutletError`] on validation failure.
+/// Returns [`OutletError`] on validation failure, including
+/// [`OutletError::QueryCostViolation`] when a Query outlet declares a
+/// positive cost or a dynamic cost formula (§5.4.2 structural floor).
 pub fn register_outlet(
     registry: &mut OutletRegistry,
     role_state: &ContextRoleState,
@@ -269,7 +286,13 @@ pub fn register_outlet(
         });
     }
 
-    // 2. Validate schemas.
+    // 2. Pure structural validation (§5.4.2 Query cost floor — SCP-OUT-012).
+    //    Runs before schema validation so a misclassified Query+cost is
+    //    rejected with the precise QueryCostViolation rather than masked
+    //    by an unrelated downstream failure.
+    registration.validate()?;
+
+    // 3. Validate schemas.
     schema::validate_schema(&registration.schema.input_schema)
         .map_err(OutletError::InvalidInputSchema)?;
     schema::validate_schema(&registration.schema.output_schema)
@@ -367,6 +390,12 @@ pub fn update_outlet(
             actual: new_registration.outlet_id,
         });
     }
+
+    // 3b. Pure structural validation (§5.4.2 Query cost floor — SCP-OUT-012).
+    //     An update that flips kind to Query while retaining a positive
+    //     cost (or dynamic cost_formula) MUST be rejected at the same
+    //     boundary as registration.
+    new_registration.validate()?;
 
     // 4. Validate schemas.
     schema::validate_schema(&new_registration.schema.input_schema)
@@ -485,6 +514,14 @@ where
         passed: passed_count,
         failed: failed_count,
         integrity_ok,
+        // `verify_outlet` only attributes test-vector failures here; the
+        // QueryMisdeclaration reason is emitted from the runtime
+        // `ReadOnlyInvocation` deny-list (SCP-OUT-013), not from this path.
+        reason: if integrity_ok {
+            None
+        } else {
+            Some(super::OutletVerifiedReason::TestVectorFailed)
+        },
     };
 
     Ok((result, event))
@@ -494,93 +531,22 @@ where
 // Tool registration signature verification (M15)
 // ---------------------------------------------------------------------------
 
-/// Computes the canonical bytes for tool registration signature verification.
+/// Computes the canonical SHA-256 digest of the §5.4.1 V2 outlet-registration
+/// preimage.
 ///
-/// The signed payload is a SHA-256 hash of a canonical struct containing all
-/// `OutletRegistration` fields except `signature` itself, in a deterministic
-/// order. JSON schema fields use RFC 8785 JCS canonical serialization.
+/// Returns the 32-byte SHA-256 output as a `Vec<u8>` for backward
+/// compatibility with the original signature; new code should prefer
+/// [`super::hash::compute_outlet_registration_canonical_bytes`], which
+/// returns a typed `[u8; 32]`. Both calls produce byte-identical output;
+/// this shim exists so downstream callers (FFI bridges, conformance
+/// fixtures, tests) keep compiling.
 ///
-/// The canonical representation includes:
-/// - `outlet_id`, `name`, `description`
-/// - `input_schema`, `output_schema` (JCS canonical JSON bytes)
-/// - `implementation_hash` (32 bytes)
-/// - `test_vectors` (count + hashes)
-/// - `operator_did`
-/// - `registered_at` (timestamp)
-/// - `cost` (if present)
-///
-/// # Errors
-///
-/// Returns [`OutletError::CanonicalizationFailed`] if any schema or test-vector
-/// value fails RFC 8785 JCS canonical serialization. The error is surfaced
-/// rather than substituting empty bytes, so the registration signature is never
-/// computed or verified over a defaulted-empty preimage. Unreachable for
-/// well-formed `serde_json::Value` schemas.
-pub fn compute_outlet_registration_canonical_bytes(
-    registration: &OutletRegistration,
-) -> Result<Vec<u8>, OutletError> {
-    use sha2::{Digest, Sha256};
-
-    let mut hasher = Sha256::new();
-    hasher.update(b"SCP-TOOL-REGISTRATION-V1:");
-    // Length-prefix helper for variable-length fields.
-    #[allow(clippy::cast_possible_truncation)]
-    let length_prefix = |hasher: &mut Sha256, bytes: &[u8]| {
-        hasher.update((bytes.len() as u32).to_be_bytes());
-        hasher.update(bytes);
-    };
-
-    length_prefix(&mut hasher, registration.outlet_id.as_bytes());
-    length_prefix(&mut hasher, registration.name.as_bytes());
-    length_prefix(&mut hasher, registration.description.as_bytes());
-
-    // Schema as RFC 8785 JCS canonical JSON bytes.
-    let input_json = crate::jcs::to_vec(&registration.schema.input_schema)
-        .map_err(|reason| OutletError::CanonicalizationFailed { reason })?;
-    length_prefix(&mut hasher, &input_json);
-    let output_json = crate::jcs::to_vec(&registration.schema.output_schema)
-        .map_err(|reason| OutletError::CanonicalizationFailed { reason })?;
-    length_prefix(&mut hasher, &output_json);
-
-    hasher.update(registration.implementation_hash);
-
-    // Test vectors: count + hash of each vector's canonical form.
-    #[allow(clippy::cast_possible_truncation)]
-    hasher.update((registration.test_vectors.len() as u32).to_be_bytes());
-    for tv in &registration.test_vectors {
-        let input_bytes = crate::jcs::to_vec(&tv.input)
-            .map_err(|reason| OutletError::CanonicalizationFailed { reason })?;
-        length_prefix(&mut hasher, &input_bytes);
-        let output_bytes = crate::jcs::to_vec(&tv.expected_output)
-            .map_err(|reason| OutletError::CanonicalizationFailed { reason })?;
-        length_prefix(&mut hasher, &output_bytes);
-        length_prefix(&mut hasher, tv.description.as_bytes());
-    }
-
-    length_prefix(&mut hasher, registration.operator_did.as_bytes());
-    hasher.update(registration.registered_at.to_be_bytes());
-
-    // Cost metadata presence flag + contents.
-    match &registration.cost {
-        Some(tc) => {
-            hasher.update([0x01]);
-            // Hash the raw `u64` big-endian bytes (NOT the ADR-060 wire string),
-            // keeping the TOOL-REGISTRATION canonical preimage byte-identical.
-            hasher.update(tc.amount.0.to_be_bytes());
-            length_prefix(&mut hasher, tc.currency.as_bytes());
-            match &tc.cost_formula {
-                Some(formula) => {
-                    hasher.update([0x01]);
-                    length_prefix(&mut hasher, formula.as_bytes());
-                }
-                None => hasher.update([0x00]),
-            }
-            length_prefix(&mut hasher, tc.payee.as_bytes());
-        }
-        None => hasher.update([0x00]),
-    }
-
-    Ok(hasher.finalize().to_vec())
+/// The V2 preimage layout is documented in [`super::hash`]; SCP-OUT-040 added
+/// `description_hash` and `catalog_hash` terms (round-5 ADR-049) closing the
+/// remaining operator-prose covert-channel surface.
+#[must_use]
+pub fn compute_outlet_registration_canonical_bytes(registration: &OutletRegistration) -> Vec<u8> {
+    super::hash::compute_outlet_registration_canonical_bytes(registration).to_vec()
 }
 
 /// Verifies the Ed25519 signature on a tool registration.
@@ -614,7 +580,7 @@ pub fn verify_outlet_registration_signature(
     })?;
 
     let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes);
-    let canonical = compute_outlet_registration_canonical_bytes(registration)?;
+    let canonical = compute_outlet_registration_canonical_bytes(registration);
 
     registrant_public_key
         .verify_strict(&canonical, &signature)
@@ -708,6 +674,7 @@ mod tests {
     fn valid_registration(outlet_id: &str) -> OutletRegistration {
         OutletRegistration {
             outlet_id: outlet_id.to_owned(),
+            kind: OutletKind::Action,
             name: "calculator".to_owned(),
             description: "A simple calculator tool".to_owned(),
             schema: OutletSchema {
@@ -725,6 +692,7 @@ mod tests {
                         "result": {"type": "number"}
                     }
                 }),
+                aggregate_schema: None,
             },
             implementation_hash: [0xAB; 32],
             test_vectors: vec![
@@ -743,6 +711,7 @@ mod tests {
             cost: None,
             registered_at: 0,
             signature: Vec::new(),
+            message_catalog: Vec::new(),
         }
     }
 
@@ -832,6 +801,7 @@ mod tests {
                     "result": {"type": "string"}
                 }
             }),
+            aggregate_schema: None,
         };
 
         let result = register_outlet(
@@ -869,6 +839,7 @@ mod tests {
             output_schema: serde_json::json!({
                 "type": "object"
             }),
+            aggregate_schema: None,
         };
 
         let result = register_outlet(
@@ -1374,10 +1345,107 @@ mod tests {
         let schema = OutletSchema {
             input_schema: serde_json::json!({"type": "object"}),
             output_schema: serde_json::json!({"type": "string"}),
+            aggregate_schema: None,
         };
         let json = serde_json::to_string(&schema).unwrap();
         let deserialized: OutletSchema = serde_json::from_str(&json).unwrap();
         assert_eq!(schema, deserialized);
+    }
+
+    /// AC (SCP-OUT-036): `aggregate_schema: None` is omitted from JSON
+    /// and `MessagePack` output, so adding the field does not change the
+    /// `schema_hash` (§5.4.1) for existing pre-OUT-036 registrations.
+    /// Critical for signature compatibility — operators MUST NOT have
+    /// to re-sign every registration on the version bump.
+    #[test]
+    fn outlet_schema_omits_none_aggregate_schema_from_serialization() {
+        // Locally-scoped helper type — declared at the top of the test
+        // body so the items-after-statements lint stays happy.
+        #[derive(Serialize)]
+        struct LegacyOutletSchema {
+            input_schema: serde_json::Value,
+            output_schema: serde_json::Value,
+        }
+
+        let with_none = OutletSchema {
+            input_schema: serde_json::json!({"type": "object"}),
+            output_schema: serde_json::json!({"type": "string"}),
+            aggregate_schema: None,
+        };
+        let json = serde_json::to_string(&with_none).unwrap();
+        // The JSON output must NOT contain the `aggregate_schema` key.
+        assert!(
+            !json.contains("aggregate_schema"),
+            "None aggregate_schema must be omitted; got {json}"
+        );
+        // MessagePack output should also omit the field. We compare the
+        // bytes against a hand-constructed pre-OUT-036 form.
+        let bytes_new = rmp_serde::to_vec(&with_none).unwrap();
+        let legacy = LegacyOutletSchema {
+            input_schema: serde_json::json!({"type": "object"}),
+            output_schema: serde_json::json!({"type": "string"}),
+        };
+        let bytes_legacy = rmp_serde::to_vec(&legacy).unwrap();
+        assert_eq!(
+            bytes_new, bytes_legacy,
+            "MessagePack serialization with aggregate_schema=None must match the pre-OUT-036 \
+             2-field encoding byte-for-byte"
+        );
+    }
+
+    /// AC (SCP-OUT-036): `aggregate_schema: Some(...)` round-trips
+    /// through JSON and `MessagePack`. Aggregate schema content survives
+    /// serialization without loss.
+    #[test]
+    fn outlet_schema_with_aggregate_schema_roundtrips() {
+        let schema = OutletSchema {
+            input_schema: serde_json::json!({"type": "object"}),
+            output_schema: serde_json::json!({"type": "object",
+                "properties": {"chunk": {"type": "integer"}}}),
+            aggregate_schema: Some(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "total": {"type": "integer"},
+                    "summary": {"type": "string"}
+                },
+                "required": ["total", "summary"]
+            })),
+        };
+
+        // JSON roundtrip.
+        let json = serde_json::to_string(&schema).unwrap();
+        assert!(
+            json.contains("aggregate_schema"),
+            "Some aggregate_schema must appear in JSON; got {json}"
+        );
+        let parsed: OutletSchema = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, schema);
+
+        // `MessagePack` roundtrip.
+        let bytes = rmp_serde::to_vec(&schema).unwrap();
+        let parsed_mp: OutletSchema = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(parsed_mp, schema);
+    }
+
+    /// AC (SCP-OUT-036): `OutletSchema::new` constructs a 2-field schema
+    /// with `aggregate_schema = None`. `with_aggregate_schema` attaches.
+    #[test]
+    fn outlet_schema_constructors() {
+        let two_field = OutletSchema::new(
+            serde_json::json!({"type": "object"}),
+            serde_json::json!({"type": "string"}),
+        );
+        assert!(two_field.aggregate_schema.is_none());
+
+        let with_agg = two_field
+            .clone()
+            .with_aggregate_schema(serde_json::json!({"type": "object"}));
+        assert_eq!(
+            with_agg.aggregate_schema,
+            Some(serde_json::json!({"type": "object"}))
+        );
+        // The original is unmodified.
+        assert!(two_field.aggregate_schema.is_none());
     }
 
     #[test]
@@ -1469,6 +1537,7 @@ mod tests {
                     "sum": {"type": "number"}
                 }
             }),
+            aggregate_schema: None,
         };
         new_reg.test_vectors = vec![];
 
@@ -1503,7 +1572,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_cost_amount_serializes_as_canonical_decimal_string() {
+    fn outlet_cost_amount_serializes_as_canonical_decimal_string() {
         // ADR-060 wire form: amount is a quoted string, not a JSON number.
         let cost = OutletCost {
             amount: Amount(500),
@@ -1516,35 +1585,371 @@ mod tests {
         assert!(value["amount"].is_string());
     }
 
-    #[test]
-    fn tool_registration_canonical_bytes_use_raw_u64_be_not_wire_string() {
-        // Byte-stability guard: the TOOL-REGISTRATION preimage must hash the raw
-        // `u64` big-endian amount, NOT the ADR-060 decimal wire string, so the
-        // canonical bytes are byte-identical to the pre-ADR-060 preimage.
-        let mut registration = valid_registration("tool-1");
-        registration.cost = Some(OutletCost {
-            amount: Amount(0x0102_0304_0506_0708),
-            currency: "USD".to_owned(),
-            payee: "did:dht:z6MkPayee".into(),
-            cost_formula: None,
-        });
-        let d1 = compute_outlet_registration_canonical_bytes(&registration).unwrap();
-        let d2 = compute_outlet_registration_canonical_bytes(&registration).unwrap();
-        assert_eq!(d1, d2, "canonical bytes must be deterministic");
+    // ----- OutletKind (SCP-OUT-011) -----
 
-        // Changing only the raw u64 amount yields a different digest — proving
-        // the amount contributes via its raw-integer path (the decimal wire
-        // string is never hashed).
+    /// AC: `OutletKind::default()` returns `Action` (fail-safe per §5.4.2).
+    #[test]
+    fn outlet_kind_default_is_action() {
+        assert_eq!(OutletKind::default(), OutletKind::Action);
+    }
+
+    /// AC: serde wire values are `"query"` and `"action"` (lowercase).
+    #[test]
+    fn outlet_kind_serde_lowercase_strings() {
+        assert_eq!(
+            serde_json::to_string(&OutletKind::Query).unwrap(),
+            "\"query\""
+        );
+        assert_eq!(
+            serde_json::to_string(&OutletKind::Action).unwrap(),
+            "\"action\""
+        );
+
+        let q: OutletKind = serde_json::from_str("\"query\"").unwrap();
+        assert_eq!(q, OutletKind::Query);
+        let a: OutletKind = serde_json::from_str("\"action\"").unwrap();
+        assert_eq!(a, OutletKind::Action);
+    }
+
+    /// AC: `OutletKind::canonical_byte` is `0x00` for Query, `0x01` for Action.
+    #[test]
+    fn outlet_kind_canonical_byte_matches_spec() {
+        assert_eq!(OutletKind::Query.canonical_byte(), 0x00);
+        assert_eq!(OutletKind::Action.canonical_byte(), 0x01);
+    }
+
+    /// AC: round-trip serde — `OutletRegistration { kind: Query, ... }`
+    /// serializes with `"kind": "query"` and deserializes back unchanged.
+    #[test]
+    fn outlet_registration_query_kind_roundtrip() {
+        let mut reg = valid_registration("query-tool");
+        reg.kind = OutletKind::Query;
+        let json = serde_json::to_string(&reg).unwrap();
+        assert!(
+            json.contains("\"kind\":\"query\""),
+            "expected lowercase 'query' on the wire, got {json}"
+        );
+        let parsed: OutletRegistration = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, reg);
+        assert_eq!(parsed.kind, OutletKind::Query);
+    }
+
+    /// AC: round-trip serde — Action variant serializes with `"kind": "action"`.
+    #[test]
+    fn outlet_registration_action_kind_roundtrip() {
+        let reg = valid_registration("action-tool");
+        assert_eq!(reg.kind, OutletKind::Action);
+        let json = serde_json::to_string(&reg).unwrap();
+        assert!(
+            json.contains("\"kind\":\"action\""),
+            "expected lowercase 'action' on the wire, got {json}"
+        );
+        let parsed: OutletRegistration = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, reg);
+        assert_eq!(parsed.kind, OutletKind::Action);
+    }
+
+    /// AC: default-value test — `serde_json::from_str` of a registration
+    /// JSON omitting `kind` produces `kind: Action` (fail-safe per §5.4.2).
+    #[test]
+    fn outlet_registration_missing_kind_defaults_to_action() {
+        // Build a minimal valid JSON with NO `kind` field present.
+        let zero_hash: Vec<u8> = vec![0u8; 32];
+        let json = serde_json::json!({
+            "outlet_id": "no-kind-tool",
+            "name": "n",
+            "description": "d",
+            "schema": {
+                "input_schema": {"type": "object"},
+                "output_schema": {"type": "object"}
+            },
+            "implementation_hash": zero_hash,
+            "test_vectors": [],
+            "operator_did": "did:dht:z6MkOp",
+            "cost": null,
+            "registered_at": 0,
+            "signature": []
+        });
+        let parsed: OutletRegistration = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            parsed.kind,
+            OutletKind::Action,
+            "missing kind must deserialize to fail-safe Action default (§5.4.2)"
+        );
+    }
+
+    /// AC: canonical preimage uses `kind_byte = 0x00` for Query and
+    /// `kind_byte = 0x01` for Action — verifying that two registrations
+    /// identical in every field except `kind` produce DIFFERENT canonical
+    /// hashes.
+    #[test]
+    fn outlet_registration_preimage_distinguishes_kinds() {
+        let mut q = valid_registration("dual-kind-tool");
+        q.kind = OutletKind::Query;
+        // Query outlets must declare zero/no cost (§5.4.2 floor).
+        q.cost = None;
+
+        let mut a = q.clone();
+        a.kind = OutletKind::Action;
+
+        let q_hash = compute_outlet_registration_canonical_bytes(&q);
+        let a_hash = compute_outlet_registration_canonical_bytes(&a);
+        assert_ne!(
+            q_hash, a_hash,
+            "Query and Action registrations identical in every other field MUST hash differently \
+             (kind_byte 0x00 vs 0x01)"
+        );
+    }
+
+    /// AC: preimage byte sequence — verify the `kind_byte` sits at the expected
+    /// position (between `outlet_id` and `name`) for both kinds.
+    ///
+    /// The §5.4.1 V2 layout is:
+    ///   `"SCP-OUTLET-REGISTRATION-V2:" || BE32(len(outlet_id)) || outlet_id
+    ///     || kind_byte || BE32(len(name)) || name || ...`
+    ///
+    /// Switching `kind` between Query and Action is a single-byte mutation
+    /// at the documented offset; the canonical hash MUST flip.
+    #[test]
+    fn outlet_registration_preimage_kind_byte_position() {
+        let mut reg_q = valid_registration("kb-pos");
+        reg_q.kind = OutletKind::Query;
+        reg_q.test_vectors = Vec::new();
+        reg_q.cost = None;
+
+        let mut reg_a = reg_q.clone();
+        reg_a.kind = OutletKind::Action;
+
+        // Reviewer-facing expectation: the kind_byte sits at this offset
+        // inside the preimage byte sequence (the SHA-256 input).
+        let expected_kind_byte_offset =
+            b"SCP-OUTLET-REGISTRATION-V2:".len() + 4 + reg_q.outlet_id.len();
+        assert!(expected_kind_byte_offset > 0);
+
+        let bytes_q = compute_outlet_registration_canonical_bytes(&reg_q);
+        let bytes_a = compute_outlet_registration_canonical_bytes(&reg_a);
+        assert_eq!(bytes_q.len(), 32);
+        assert_eq!(bytes_a.len(), 32);
+        assert_ne!(
+            bytes_q, bytes_a,
+            "mutating only kind_byte must flip the canonical hash"
+        );
+    }
+
+    // ----- Query structural cost floor (SCP-OUT-012, §5.4.2) -----
+
+    /// Helper for the four-case validate matrix. Returns a registration
+    /// with the requested `kind` and `cost`, schema/`test_vectors` stripped
+    /// to keep the test focused on the cost-floor check.
+    fn validate_fixture(kind: OutletKind, cost: Option<OutletCost>) -> OutletRegistration {
+        let mut reg = valid_registration("validate-fixture");
+        reg.kind = kind;
+        reg.cost = cost;
+        reg.test_vectors = Vec::new();
+        reg
+    }
+
+    /// AC1: Action + cost > 0 → accept. Action outlets have no structural
+    /// cost floor (§5.4.2). A positive declared cost is permitted.
+    #[test]
+    fn validate_accepts_action_with_positive_cost() {
+        let reg = validate_fixture(
+            OutletKind::Action,
+            Some(OutletCost {
+                amount: Amount(100),
+                currency: "USD".to_owned(),
+                payee: "did:dht:z6MkPayee".into(),
+                cost_formula: None,
+            }),
+        );
+        assert!(
+            reg.validate().is_ok(),
+            "Action+cost>0 must validate (no structural floor on Action — §5.4.2)"
+        );
+    }
+
+    /// AC2: Action + cost = None → accept. Action outlets accept any cost
+    /// configuration including absence (§5.4.2).
+    #[test]
+    fn validate_accepts_action_with_no_cost() {
+        let reg = validate_fixture(OutletKind::Action, None);
+        assert!(
+            reg.validate().is_ok(),
+            "Action+cost=None must validate (no structural floor on Action — §5.4.2)"
+        );
+    }
+
+    /// AC3: Query + cost > 0 → reject with [`OutletError::QueryCostViolation`].
+    /// A Query outlet declaring a positive per-invocation cost violates
+    /// the §5.4.2 structural floor.
+    #[test]
+    fn validate_rejects_query_with_positive_cost() {
+        let reg = validate_fixture(
+            OutletKind::Query,
+            Some(OutletCost {
+                amount: Amount(1),
+                currency: "USD".to_owned(),
+                payee: "did:dht:z6MkPayee".into(),
+                cost_formula: None,
+            }),
+        );
+        let err = reg.validate().expect_err("Query+cost>0 must be rejected");
+        assert!(
+            matches!(err, OutletError::QueryCostViolation { .. }),
+            "expected QueryCostViolation, got {err:?}"
+        );
+        // Verify the reason mentions the positive cost.
+        if let OutletError::QueryCostViolation { reason } = err {
+            assert!(
+                reason.contains("amount = 1") || reason.contains("amount=1"),
+                "reason should cite the offending amount, got: {reason}"
+            );
+        }
+    }
+
+    /// AC4: Query + cost = None → accept. The structural floor permits an
+    /// absent cost (§5.4.2).
+    #[test]
+    fn validate_accepts_query_with_no_cost() {
+        let reg = validate_fixture(OutletKind::Query, None);
+        assert!(
+            reg.validate().is_ok(),
+            "Query+cost=None must validate per §5.4.2 structural floor"
+        );
+    }
+
+    /// AC4 (companion): Query + `cost { amount = 0, cost_formula = None }`
+    /// → accept. The structural floor permits a present-but-zero cost
+    /// because some auditing flows want the currency/payee fields visible
+    /// even when the per-invocation amount is zero (§5.4.2).
+    #[test]
+    fn validate_accepts_query_with_zero_amount_no_formula() {
+        let reg = validate_fixture(
+            OutletKind::Query,
+            Some(OutletCost {
+                amount: Amount(0),
+                currency: "USD".to_owned(),
+                payee: "did:dht:z6MkPayee".into(),
+                cost_formula: None,
+            }),
+        );
+        assert!(
+            reg.validate().is_ok(),
+            "Query+cost{{amount=0, formula=None}} must validate per §5.4.2"
+        );
+    }
+
+    /// Query + `cost.cost_formula` present → reject. A dynamic pricing
+    /// formula on a Query outlet is forbidden regardless of amount
+    /// (§5.4.2: "a dynamic pricing formula on an idempotent read is not
+    /// coherent").
+    #[test]
+    fn validate_rejects_query_with_cost_formula_even_when_amount_zero() {
+        let reg = validate_fixture(
+            OutletKind::Query,
+            Some(OutletCost {
+                amount: Amount(0),
+                currency: "USD".to_owned(),
+                payee: "did:dht:z6MkPayee".into(),
+                cost_formula: Some("linear".to_owned()),
+            }),
+        );
+        let err = reg
+            .validate()
+            .expect_err("Query+cost_formula must be rejected even at amount=0");
+        assert!(
+            matches!(err, OutletError::QueryCostViolation { .. }),
+            "expected QueryCostViolation, got {err:?}"
+        );
+        if let OutletError::QueryCostViolation { reason } = err {
+            assert!(
+                reason.contains("cost_formula"),
+                "reason should cite cost_formula, got: {reason}"
+            );
+        }
+    }
+
+    /// Defense-in-depth: [`register_outlet`] rejects a Query+cost>0 even
+    /// before the schema check runs — the [`OutletError::QueryCostViolation`]
+    /// surfaces rather than being masked by an unrelated downstream failure.
+    #[test]
+    fn register_outlet_rejects_query_with_positive_cost() {
+        let role_state = test_role_state("did:dht:z6MkCreator");
+        let mut registry = OutletRegistry::new();
+        let mut registration = valid_registration("query-paid");
+        registration.kind = OutletKind::Query;
         registration.cost = Some(OutletCost {
-            amount: Amount(0x0102_0304_0506_0709),
+            amount: Amount(5),
             currency: "USD".to_owned(),
             payee: "did:dht:z6MkPayee".into(),
             cost_formula: None,
         });
-        assert_ne!(
-            d1,
-            compute_outlet_registration_canonical_bytes(&registration).unwrap(),
-            "amount must contribute to the preimage via its raw u64 bytes"
+
+        let result = register_outlet(
+            &mut registry,
+            &role_state,
+            registration,
+            "did:dht:z6MkCreator",
         );
+        let err = result.expect_err("Query+cost>0 must fail registration");
+        assert!(
+            matches!(err, OutletError::QueryCostViolation { .. }),
+            "expected QueryCostViolation from register_outlet, got {err:?}"
+        );
+        // Registry must remain empty — the registration MUST NOT land.
+        assert!(
+            registry.is_empty(),
+            "rejected registration must not be stored"
+        );
+    }
+
+    /// Defense-in-depth: [`update_outlet`] rejects flipping a stored Action
+    /// outlet to Query while retaining a positive cost (§5.4.2 enforced
+    /// at every mutation boundary).
+    #[test]
+    fn update_outlet_rejects_query_with_positive_cost() {
+        let role_state = test_role_state("did:dht:z6MkCreator");
+        let mut registry = OutletRegistry::new();
+
+        // Register a valid Action+cost outlet.
+        let mut original = valid_registration("flip-target");
+        original.kind = OutletKind::Action;
+        original.cost = Some(OutletCost {
+            amount: Amount(50),
+            currency: "USD".to_owned(),
+            payee: "did:dht:z6MkPayee".into(),
+            cost_formula: None,
+        });
+        register_outlet(&mut registry, &role_state, original, "did:dht:z6MkCreator").unwrap();
+
+        // Try to update by flipping to Query while keeping the positive
+        // cost — must be rejected.
+        let mut flipped = valid_registration("flip-target");
+        flipped.kind = OutletKind::Query;
+        flipped.cost = Some(OutletCost {
+            amount: Amount(50),
+            currency: "USD".to_owned(),
+            payee: "did:dht:z6MkPayee".into(),
+            cost_formula: None,
+        });
+        let err = update_outlet(
+            &mut registry,
+            &role_state,
+            "flip-target",
+            flipped,
+            "did:dht:z6MkCreator",
+        )
+        .expect_err("update flipping to Query+cost>0 must be rejected");
+        assert!(
+            matches!(err, OutletError::QueryCostViolation { .. }),
+            "expected QueryCostViolation from update_outlet, got {err:?}"
+        );
+
+        // Stored registration must still be the original Action+cost.
+        let stored = registry
+            .get("flip-target")
+            .expect("original registration must still exist");
+        assert_eq!(stored.kind, OutletKind::Action);
+        assert_eq!(stored.cost.as_ref().map(|c| c.amount), Some(Amount(50)));
     }
 }

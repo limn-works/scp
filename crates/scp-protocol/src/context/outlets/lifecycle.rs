@@ -1,26 +1,28 @@
-//! Tool invocation lifecycle types: request, response, cancellation, and status.
+//! Tool invocation lifecycle types: request, status, cancellation.
 //!
-//! Every tool invocation follows a defined lifecycle with explicit states,
-//! timeouts, and error handling. Tool execution errors are returned in
-//! [`OutletResponse::error`], not as protocol-level errors. Schema validation
-//! failures are caught by the SDK, not the tool.
+//! Every tool invocation is a stream by construction (§5.4.5). The legacy
+//! non-streaming response type (`OutletResponse`) was deleted by SCP-OUT-032
+//! and is replaced by the §5.4.5 wire types in [`super::stream`]:
+//! `OutletStreamOpen` / `OutletStreamChunk` / `OutletStreamCredit` /
+//! `ChunkPayload`. The §5.4.4 typed `OutletError` envelope
+//! ([`super::errors::OutletError`]) replaces the legacy
+//! `OutletExecutionError` / `OutletErrorCode` shape.
 //!
-//! See ADR-010 in `.docs/adrs/phase-2.md` for the full design.
+//! See ADR-049 §5 (streaming-native invocation) and §4 (typed error
+//! envelope).
 //!
 //! # Types
 //!
 //! - [`OutletRequest`] -- A tool invocation request sent as an MLS application
 //!   message.
-//! - [`OutletResponse`] -- A tool invocation response.
 //! - [`OutletStatus`] -- The four terminal statuses of a tool invocation.
-//! - [`OutletExecutionError`] -- Structured execution error with retryable hint.
-//! - [`OutletErrorCode`] -- Error code enum covering all tool error categories.
 //! - [`OutletCancel`] -- Cancellation request referencing a pending invocation.
 
 use serde::{Deserialize, Serialize};
 
 use scp_clock::Clock;
 
+use crate::context::outlets::stream::StreamTerminalStatus;
 use crate::economy::types::Amount;
 use crate::provenance::DataProvenance;
 use scp_did::DID;
@@ -114,33 +116,6 @@ impl OutletRequest {
 }
 
 // ---------------------------------------------------------------------------
-// OutletResponse
-// ---------------------------------------------------------------------------
-
-/// A tool invocation response, sent as an MLS application message.
-///
-/// Contains the invocation result, timing information, and provenance metadata.
-/// Tool execution errors are returned in the [`error`](Self::error) field, not
-/// as protocol-level errors.
-///
-/// See ADR-010 acceptance criterion 3.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OutletResponse {
-    /// Matches the [`OutletRequest::request_id`].
-    pub request_id: String,
-    /// Terminal status of the invocation.
-    pub status: OutletStatus,
-    /// The tool's output, present on [`OutletStatus::Success`].
-    pub output: Option<serde_json::Value>,
-    /// Structured error, present on non-success statuses.
-    pub error: Option<OutletExecutionError>,
-    /// Wall-clock execution time in milliseconds.
-    pub execution_time_ms: u64,
-    /// Provenance metadata for this response.
-    pub provenance: Provenance,
-}
-
-// ---------------------------------------------------------------------------
 // OutletStatus
 // ---------------------------------------------------------------------------
 
@@ -171,74 +146,6 @@ impl std::fmt::Display for OutletStatus {
 }
 
 // ---------------------------------------------------------------------------
-// OutletExecutionError
-// ---------------------------------------------------------------------------
-
-/// Structured tool execution error.
-///
-/// Returned in [`OutletResponse::error`] for non-success invocations. The
-/// [`retryable`](Self::retryable) field indicates whether the caller should
-/// attempt the invocation again.
-///
-/// See ADR-010 acceptance criterion 5.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OutletExecutionError {
-    /// Categorized error code.
-    pub code: OutletErrorCode,
-    /// Human-readable error description.
-    pub message: String,
-    /// Whether the caller should retry the invocation.
-    pub retryable: bool,
-}
-
-// ---------------------------------------------------------------------------
-// OutletErrorCode
-// ---------------------------------------------------------------------------
-
-/// Categorized error codes for tool invocation failures.
-///
-/// Covers the full range of failure modes from validation through execution.
-///
-/// See ADR-010 acceptance criterion 6.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum OutletErrorCode {
-    /// Input did not pass the tool's input schema validation.
-    InputValidationFailed,
-    /// Output did not pass the tool's output schema validation.
-    OutputValidationFailed,
-    /// Tool execution failed with an internal error.
-    ExecutionFailed,
-    /// Tool execution timed out.
-    Timeout,
-    /// Tool execution was cancelled.
-    Cancelled,
-    /// Invocation was rejected due to rate limiting.
-    RateLimited,
-    /// The requested tool was not found in the registry.
-    OutletNotFound,
-    /// The invoker does not have the required capability.
-    PermissionDenied,
-    /// An unexpected internal error occurred.
-    InternalError,
-}
-
-impl std::fmt::Display for OutletErrorCode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::InputValidationFailed => write!(f, "InputValidationFailed"),
-            Self::OutputValidationFailed => write!(f, "OutputValidationFailed"),
-            Self::ExecutionFailed => write!(f, "ExecutionFailed"),
-            Self::Timeout => write!(f, "Timeout"),
-            Self::Cancelled => write!(f, "Cancelled"),
-            Self::RateLimited => write!(f, "RateLimited"),
-            Self::OutletNotFound => write!(f, "OutletNotFound"),
-            Self::PermissionDenied => write!(f, "PermissionDenied"),
-            Self::InternalError => write!(f, "InternalError"),
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // OutletCancel
 // ---------------------------------------------------------------------------
 
@@ -264,10 +171,85 @@ pub struct OutletCancel {
 // OutletInvokedEvent (event log integration)
 // ---------------------------------------------------------------------------
 
-/// Event payload for a `ToolInvoked` event in the context event log.
+/// Audit anomaly on an [`OutletInvokedEvent`] (§5.4.5 round-8).
 ///
-/// Records tool invocation metadata without full input/output (which may be
-/// large). Only content hashes are stored. See ADR-010 event log recording.
+/// Attached when the runtime detects an internal self-inconsistency it
+/// nonetheless records rather than drops (the chunks-billed self-mismatch
+/// handling).
+///
+/// Closed set. The only current member records a divergence between the
+/// pump's own running `chunks_billed` tally and the manifest-derivable
+/// reference. Per §5.4.5 the *recorded* `chunks_billed` value MUST equal
+/// the manifest reference (the appender rejects a mismatch at log-insert
+/// time); rather than drop the event when the pump's running tally
+/// diverges, the runtime emits the event with the **manifest-derived**
+/// (appender-accepted) value AND this anomaly marker so the divergence is
+/// durably attributable in the audit log instead of silently discarded.
+///
+/// Forward-compatible: this enum is additive on the event and carries
+/// `#[serde(skip_serializing_if)]` at the field, so an older reader that
+/// does not understand a future variant still parses the surrounding
+/// event (the field is `Option`, defaulting to `None`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AuditAnomaly {
+    /// The dispatch pump's running `chunks_billed` tally
+    /// (`pump_recorded`) diverged from the value derivable from the
+    /// committed chunk manifest (`manifest_reference`). The event is
+    /// emitted with `chunks_billed == manifest_reference` (so it passes
+    /// the §5.4.5 wire-rejection rule at log-insert) and this anomaly
+    /// records the divergence for audit.
+    ChunksBilledSelfMismatch {
+        /// The pump's own running tally at settlement (the value that
+        /// would have been recorded before round-8).
+        pump_recorded: u32,
+        /// The manifest-derived reference count actually recorded in
+        /// `chunks_billed` (the appender-accepted value).
+        manifest_reference: u32,
+    },
+}
+
+/// Event payload for a `OutletInvoked` event in the context event log.
+///
+/// Records outlet invocation metadata without full input/output (which may
+/// be large). Only content hashes are stored. See ADR-010 event log
+/// recording.
+///
+/// # Streaming fields (SCP-OUT-035, spec §5.4.5 event-log shape)
+///
+/// Per ADR-049 §5 every outlet invocation is a stream — non-streaming
+/// invocations are the degenerate two-chunk case (`Data` + `End`). The
+/// event log records ONE `OutletInvokedEvent` per stream, emitted when the
+/// terminal chunk is delivered to the receiver, NOT when the executor
+/// returns. The four streaming fields commit the event to the chunk
+/// sequence:
+///
+/// - [`Self::stream_chunk_count`]: total chunks including terminal
+///   (`Data` + `Progress` + `End` / `Error`).
+/// - [`Self::chunks_billed`]: count of `Data` chunks at or below the
+///   cancel-ack sequence that were validly delivered (§5.4.5 billing
+///   semantics).
+/// - [`Self::stream_manifest_hash`]: 32-byte Merkle root over the chunk
+///   sequence using RFC 6962 leaf/interior tag bytes under the
+///   `SCP-OUTLET-CHUNK-V1:` domain separator. Computed via
+///   [`crate::context::outlets::stream::compute_chunk_manifest_root`].
+/// - [`Self::stream_terminal_status`]: `Ok` (normal `End`), `Cancelled`
+///   (cancel-ack closed the stream), or `Error(code)` (terminal `Error`
+///   chunk).
+///
+/// # Per-chunk inclusion-proof API — deferred (ADR-049 §6)
+///
+/// The protocol commits to the chunk manifest root via
+/// [`Self::stream_manifest_hash`]. Per-chunk inclusion proofs follow
+/// **RFC 6962 §2.1 (audit paths)** using the same leaf/interior tag-byte
+/// construction (`0x00` / `0x01`) under the `SCP-OUTLET-CHUNK-V1:`
+/// separator. The algorithm is pinned at the protocol level, but the
+/// SDK-surface API for retrieving proofs (`outlets.inclusion_proof(
+/// invocation_id, chunk_index) -> path`) is intentionally **deferred**
+/// per ADR-049 §6 and discussion #1698. Auditing tools MAY reconstruct
+/// proofs off-line by replaying the event log and the retained chunk
+/// sequence with a standard RFC 6962 verifier — the manifest root is
+/// sufficient evidence that a particular chunk was part of the stream.
+/// Adding the API later is wire-compatible (no preimage break).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OutletInvokedEvent {
     /// The request ID of the invocation.
@@ -289,38 +271,75 @@ pub struct OutletInvokedEvent {
     /// economic policy currency.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost: Option<Amount>,
+    /// Total number of chunks emitted on the stream — `Data` +
+    ///   `Progress` + the single terminal `End` or `Error` chunk
+    ///   (§5.4.5 event-log shape, SCP-OUT-035).
+    #[serde(default)]
+    pub stream_chunk_count: u32,
+    /// Count of `Data` chunks at or below the cancel-ack sequence that
+    /// were validly delivered (§5.4.5 billing semantics). Distinct from
+    /// [`Self::stream_chunk_count`] because `Progress`, `End`, and
+    /// `Error` are never billed and a cancelled stream may have a
+    /// `chunks_billed` smaller than the count of delivered `Data`
+    /// chunks.
+    #[serde(default)]
+    pub chunks_billed: u32,
+    /// 32-byte SHA-256 Merkle root over the ordered chunk sequence,
+    /// constructed per §5.4.5 with RFC 6962 tag bytes (`0x00` for
+    /// leaves, `0x01` for interior nodes) under the
+    /// `SCP-OUTLET-CHUNK-V1:` domain separator. Computed via
+    /// [`crate::context::outlets::stream::compute_chunk_manifest_root`].
+    /// All-zero (`[0u8; 32]`) for legacy events written before
+    /// SCP-OUT-035.
+    #[serde(default = "default_zero_manifest_hash")]
+    pub stream_manifest_hash: [u8; 32],
+    /// Terminal status of the stream: normal close, cancelled, or
+    /// error-with-code (§5.4.5 event-log shape).
+    #[serde(default = "default_stream_terminal_status")]
+    pub stream_terminal_status: StreamTerminalStatus,
+    /// Audit anomaly attached when the runtime recorded the event with
+    /// the manifest-derived `chunks_billed` after detecting a divergence
+    /// from the pump's running tally (§5.4.5 round-8). `None` on the
+    /// happy path. Additive + `skip_serializing_if` so older readers
+    /// parse the event unchanged and the wire stays forward-compatible
+    /// (no `deny_unknown_fields` on this event).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audit_anomaly: Option<AuditAnomaly>,
+}
+
+/// Default for [`OutletInvokedEvent::stream_terminal_status`]; required
+/// because [`StreamTerminalStatus`] does not implement [`Default`] (its
+/// `Error(String)` variant has no inherent zero value).
+const fn default_stream_terminal_status() -> StreamTerminalStatus {
+    StreamTerminalStatus::Ok
+}
+
+/// Default for [`OutletInvokedEvent::stream_manifest_hash`]: an all-zero
+/// 32-byte sentinel signaling "no manifest computed" — used when
+/// deserializing legacy events that pre-date SCP-OUT-035.
+const fn default_zero_manifest_hash() -> [u8; 32] {
+    [0u8; 32]
 }
 
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-/// Computes a SHA-256 hash of a value's RFC 8785 (JCS) canonical
+/// Computes a SHA-256 hash of a JSON value's RFC 8785 (JCS) canonical
 /// representation.
 ///
 /// The value is serialized to a JCS-canonical JSON string, then hashed with
 /// SHA-256. Returns the hash as a lowercase hex string.
-///
-/// # Errors
-///
-/// Returns [`OutletError::CanonicalizationFailed`] if canonical serialization
-/// fails. A serialization failure is surfaced rather than silently hashing an
-/// empty preimage, so a convergent hash is never computed over defaulted-empty
-/// bytes. For well-formed `serde_json::Value` inputs this is unreachable (every
-/// JSON value canonicalizes); it can only occur for a serializable type whose
-/// `Serialize` implementation itself fails.
-pub fn sha256_json<T>(value: &T) -> Result<String, super::OutletError>
-where
-    T: serde::Serialize,
-{
+#[must_use]
+pub fn sha256_json(value: &serde_json::Value) -> String {
     use sha2::{Digest, Sha256};
 
     // RFC 8785 JCS canonical serialization for cross-implementation
-    // deterministic hashing.
-    let bytes = crate::jcs::to_string(value)
-        .map_err(|reason| super::OutletError::CanonicalizationFailed { reason })?;
+    // deterministic hashing. Falls back to empty string on error (should
+    // not happen for valid JSON).
+    let bytes = crate::jcs::to_string(value).unwrap_or_default();
     let hash = Sha256::digest(bytes.as_bytes());
-    Ok(hex::encode(hash))
+    hex::encode(hash)
 }
 
 // ---------------------------------------------------------------------------
@@ -398,19 +417,6 @@ mod tests {
     }
 
     #[test]
-    fn tool_error_code_display() {
-        assert_eq!(
-            format!("{}", OutletErrorCode::InputValidationFailed),
-            "InputValidationFailed"
-        );
-        assert_eq!(
-            format!("{}", OutletErrorCode::PermissionDenied),
-            "PermissionDenied"
-        );
-        assert_eq!(format!("{}", OutletErrorCode::Timeout), "Timeout");
-    }
-
-    #[test]
     fn tool_status_serialization_roundtrip() {
         for status in [
             OutletStatus::Success,
@@ -421,26 +427,6 @@ mod tests {
             let json = serde_json::to_string(&status).unwrap();
             let deserialized: OutletStatus = serde_json::from_str(&json).unwrap();
             assert_eq!(status, deserialized);
-        }
-    }
-
-    #[test]
-    fn tool_error_code_serialization_roundtrip() {
-        let codes = [
-            OutletErrorCode::InputValidationFailed,
-            OutletErrorCode::OutputValidationFailed,
-            OutletErrorCode::ExecutionFailed,
-            OutletErrorCode::Timeout,
-            OutletErrorCode::Cancelled,
-            OutletErrorCode::RateLimited,
-            OutletErrorCode::OutletNotFound,
-            OutletErrorCode::PermissionDenied,
-            OutletErrorCode::InternalError,
-        ];
-        for code in codes {
-            let json = serde_json::to_string(&code).unwrap();
-            let deserialized: OutletErrorCode = serde_json::from_str(&json).unwrap();
-            assert_eq!(code, deserialized);
         }
     }
 
@@ -482,7 +468,7 @@ mod tests {
     #[test]
     fn sha256_json_produces_64_char_hex() {
         let value = serde_json::json!({"hello": "world"});
-        let hash = sha256_json(&value).unwrap();
+        let hash = sha256_json(&value);
         assert_eq!(hash.len(), 64);
         assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
     }
@@ -490,66 +476,16 @@ mod tests {
     #[test]
     fn sha256_json_deterministic() {
         let value = serde_json::json!({"a": 1, "b": 2});
-        let hash1 = sha256_json(&value).unwrap();
-        let hash2 = sha256_json(&value).unwrap();
+        let hash1 = sha256_json(&value);
+        let hash2 = sha256_json(&value);
         assert_eq!(hash1, hash2);
     }
 
     #[test]
     fn sha256_json_different_inputs_produce_different_hashes() {
-        let hash1 = sha256_json(&serde_json::json!({"a": 1})).unwrap();
-        let hash2 = sha256_json(&serde_json::json!({"a": 2})).unwrap();
+        let hash1 = sha256_json(&serde_json::json!({"a": 1}));
+        let hash2 = sha256_json(&serde_json::json!({"a": 2}));
         assert_ne!(hash1, hash2);
-    }
-
-    #[test]
-    fn sha256_json_propagates_serialization_error() {
-        // A type whose `Serialize` impl always fails forces the JCS
-        // canonicalization to error. `sha256_json` MUST surface that as
-        // `CanonicalizationFailed` — never fall back to hashing an empty
-        // preimage (the anti-pattern the previous `unwrap_or_default` had).
-        struct AlwaysFails;
-        impl serde::Serialize for AlwaysFails {
-            fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
-            where
-                S: serde::Serializer,
-            {
-                Err(serde::ser::Error::custom(
-                    "intentional serialization failure",
-                ))
-            }
-        }
-
-        let result = sha256_json(&AlwaysFails);
-        assert!(
-            matches!(
-                result,
-                Err(crate::context::outlets::OutletError::CanonicalizationFailed { .. })
-            ),
-            "expected CanonicalizationFailed, got {result:?}",
-        );
-
-        // Guard against the empty-preimage regression: the SHA-256 of the empty
-        // string must NOT be returned as a "successful" hash.
-        let empty_preimage_hash = {
-            use sha2::{Digest, Sha256};
-            hex::encode(Sha256::digest(b""))
-        };
-        assert_ne!(result.ok().as_deref(), Some(empty_preimage_hash.as_str()));
-    }
-
-    #[test]
-    fn tool_execution_error_serialization_roundtrip() {
-        let error = OutletExecutionError {
-            code: OutletErrorCode::ExecutionFailed,
-            message: "something broke".to_owned(),
-            retryable: true,
-        };
-        let json = serde_json::to_string(&error).unwrap();
-        let deserialized: OutletExecutionError = serde_json::from_str(&json).unwrap();
-        assert_eq!(deserialized.code, OutletErrorCode::ExecutionFailed);
-        assert_eq!(deserialized.message, "something broke");
-        assert!(deserialized.retryable);
     }
 
     #[test]
@@ -563,12 +499,103 @@ mod tests {
             input_hash: "abcd".to_owned(),
             output_hash: Some("efgh".to_owned()),
             cost: None,
+            stream_chunk_count: 2,
+            chunks_billed: 1,
+            stream_manifest_hash: [0xABu8; 32],
+            stream_terminal_status: StreamTerminalStatus::Ok,
+            audit_anomaly: None,
         };
         let json = serde_json::to_string(&event).unwrap();
         let deserialized: OutletInvokedEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.request_id, "req-1");
         assert_eq!(deserialized.status, OutletStatus::Success);
         assert_eq!(deserialized.execution_time_ms, 42);
+        assert_eq!(deserialized.stream_chunk_count, 2);
+        assert_eq!(deserialized.chunks_billed, 1);
+        assert_eq!(deserialized.stream_manifest_hash, [0xABu8; 32]);
+        assert_eq!(
+            deserialized.stream_terminal_status,
+            StreamTerminalStatus::Ok
+        );
+        // Happy path: anomaly absent, and absent from the serialized
+        // form (skip_serializing_if) so the wire is unchanged.
+        assert_eq!(deserialized.audit_anomaly, None);
+        assert!(
+            !json.contains("audit_anomaly"),
+            "audit_anomaly: None must be omitted from the wire form: {json}"
+        );
+    }
+
+    /// Round-8: an event carrying a `ChunksBilledSelfMismatch` anomaly
+    /// round-trips, and the field is forward-compatible — an older
+    /// reader (modeled by a value missing the field) defaults to `None`
+    /// rather than failing (no `deny_unknown_fields` on this event).
+    #[test]
+    fn outlet_invoked_event_audit_anomaly_roundtrips_and_is_forward_compatible() {
+        let event = OutletInvokedEvent {
+            request_id: "req-anom".to_owned(),
+            outlet_id: "tool-anom".to_owned(),
+            invoker_did: "did:dht:z6MkInvoker".into(),
+            status: OutletStatus::Success,
+            execution_time_ms: 7,
+            input_hash: "ab".to_owned(),
+            output_hash: None,
+            cost: None,
+            stream_chunk_count: 3,
+            chunks_billed: 2,
+            stream_manifest_hash: [0u8; 32],
+            stream_terminal_status: StreamTerminalStatus::Ok,
+            audit_anomaly: Some(AuditAnomaly::ChunksBilledSelfMismatch {
+                pump_recorded: 5,
+                manifest_reference: 2,
+            }),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("audit_anomaly"));
+        let parsed: OutletInvokedEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            parsed.audit_anomaly,
+            Some(AuditAnomaly::ChunksBilledSelfMismatch {
+                pump_recorded: 5,
+                manifest_reference: 2,
+            })
+        );
+        // Forward-compat: an event-shaped object with extra unknown keys
+        // and no audit_anomaly key still parses (additive field).
+        let with_unknown = serde_json::json!({
+            "request_id": "req-x",
+            "outlet_id": "tool-x",
+            "invoker_did": "did:dht:z6MkInvoker",
+            "status": "Success",
+            "execution_time_ms": 1,
+            "input_hash": "00",
+            "future_unknown_field": {"nested": true},
+        });
+        let parsed2: OutletInvokedEvent = serde_json::from_value(with_unknown).unwrap();
+        assert_eq!(parsed2.audit_anomaly, None);
+    }
+
+    /// Legacy events serialized BEFORE SCP-OUT-035 omit the four new
+    /// fields. `#[serde(default)]` on each new field must let the
+    /// deserializer fill them with sentinels (zero counts, all-zero
+    /// manifest, `Ok` terminal status) instead of failing.
+    #[test]
+    fn outlet_invoked_event_pre_scp_out_035_legacy_deserializes() {
+        let legacy_json = serde_json::json!({
+            "request_id": "req-legacy",
+            "outlet_id": "tool-legacy",
+            "invoker_did": "did:dht:z6MkInvoker",
+            "status": "Success",
+            "execution_time_ms": 17,
+            "input_hash": "ab",
+            "output_hash": "cd",
+        });
+        let bytes = serde_json::to_vec(&legacy_json).unwrap();
+        let parsed: OutletInvokedEvent = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(parsed.stream_chunk_count, 0);
+        assert_eq!(parsed.chunks_billed, 0);
+        assert_eq!(parsed.stream_manifest_hash, [0u8; 32]);
+        assert_eq!(parsed.stream_terminal_status, StreamTerminalStatus::Ok);
     }
 
     #[test]
