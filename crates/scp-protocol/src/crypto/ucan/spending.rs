@@ -345,14 +345,14 @@ impl SpendingCapability {
 /// Validates the spending side of the AND-composition required by spec §19.5.
 ///
 /// Per spec §19.5, a paid action requires BOTH (a) an action capability
-/// (e.g., `messages:write`, `tool:invoke:*`, or a context-defined custom
+/// (e.g., `messages:write`, `outlet:call:*`, or a context-defined custom
 /// capability) AND (b) a valid `SpendingCapability`. The check is split
 /// across two layers of the runtime on purpose:
 ///
 /// 1. **Action capability** — verified UPSTREAM at the capability gate via
 ///    `ContextRoleState::member_has_capability`. See the `MessagesWrite`
 ///    check in `scp-runtime/src/context/manager/messaging.rs` (send path),
-///    and the `ToolInvoke` / `ToolInvokeAll` check in
+///    and the `OutletCall` / `OutletCallAll` check in
 ///    `scp-runtime/src/context/outlets/invoke.rs` (outlet path). A member whose
 ///    role does not grant the required capability is rejected at the gate,
 ///    before this function is ever called.

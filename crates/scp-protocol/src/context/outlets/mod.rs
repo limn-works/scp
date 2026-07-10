@@ -567,13 +567,13 @@ pub struct OutletVerifiedEvent {
 // Capability check helper
 // ---------------------------------------------------------------------------
 
-/// Checks whether a member has the `ToolRegister` capability.
+/// Checks whether a member has the `OutletRegister` capability.
 ///
 /// Delegates to the role system's capability check. This is the integration
-/// point between the tools module and the UCAN-based role system (ADR-009).
+/// point between the outlets module and the UCAN-based role system (ADR-009).
 #[must_use]
 pub fn has_outlet_register_capability(role_state: &roles::ContextRoleState, did: &str) -> bool {
-    role_state.member_has_capability(did, &roles::Capability::ToolRegister)
+    role_state.member_has_capability(did, &roles::Capability::OutletRegister)
 }
 
 /// Checks whether a member has admin-level capabilities.
@@ -587,17 +587,20 @@ pub fn has_admin_role(role_state: &roles::ContextRoleState, did: &str) -> bool {
     role_state.member_has_capability(did, &roles::Capability::RoleAssign)
 }
 
-/// Returns `true` if `did` has tool invocation capability for the given tool.
+/// Returns `true` if `did` has Action-outlet call capability for the given outlet.
 ///
-/// Checks for `ToolInvokeAll` (broader) first, then specific `ToolInvoke(outlet_id)`.
+/// Checks for `OutletCallAll` (broader) first, then specific
+/// `OutletCall(outlet_id)`. This gates invocation of Action (mutating) outlets;
+/// Query (read-only) outlets are gated separately by the `OutletQuery*`
+/// capabilities (§5.4.2).
 #[must_use]
-pub fn has_outlet_invoke_capability(
+pub fn has_outlet_call_capability(
     role_state: &roles::ContextRoleState,
     did: &str,
     outlet_id: &str,
 ) -> bool {
-    if role_state.member_has_capability(did, &roles::Capability::ToolInvokeAll) {
+    if role_state.member_has_capability(did, &roles::Capability::OutletCallAll) {
         return true;
     }
-    role_state.member_has_capability(did, &roles::Capability::ToolInvoke(outlet_id.to_owned()))
+    role_state.member_has_capability(did, &roles::Capability::OutletCall(outlet_id.to_owned()))
 }

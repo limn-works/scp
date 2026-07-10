@@ -285,7 +285,7 @@ impl OutboundPolicy {
 /// Controls which roles in the source context can call and response constraints.
 /// Fields are enforced in [`invoke_cross_context`]:
 /// - `allowed_source_roles`: advisory — role-based filtering is enforced by
-///   the source context's governance engine (via `has_outlet_invoke_capability`),
+///   the source context's governance engine (via `has_outlet_call_capability`),
 ///   not repeated here. The field signals the target's expectations.
 /// - `max_calls_per_minute`: enforced by the per-interface [`RateLimit`]
 ///   (effective limit is `min(outbound, inbound)`).
@@ -298,7 +298,7 @@ impl OutboundPolicy {
 pub struct InboundPolicy {
     /// Roles in the source context whose members can call. Empty means any role.
     /// Advisory: role enforcement is the source context governance engine's
-    /// responsibility (it checks `has_outlet_invoke_capability`).
+    /// responsibility (it checks `has_outlet_call_capability`).
     pub allowed_source_roles: Vec<String>,
     /// Maximum calls per minute from the target context's perspective.
     /// Enforced by the per-interface [`RateLimit`].
@@ -1793,8 +1793,8 @@ where
         }
     }
 
-    // 5. Source context governance: invoker must have tool invoke capability.
-    if !super::has_outlet_invoke_capability(source_role_state, invoker_did, &interface.outlet_id) {
+    // 5. Source context governance: invoker must have Action-outlet call capability.
+    if !super::has_outlet_call_capability(source_role_state, invoker_did, &interface.outlet_id) {
         return Err(OutletError::InterfaceInvokerNotAuthorized {
             did: invoker_did.to_string(),
             outlet_id: interface.outlet_id.clone(),
@@ -1940,8 +1940,9 @@ mod tests {
         CapabilityCeiling::new([
             Capability::MessagesRead,
             Capability::MessagesWrite,
-            Capability::ToolRegister,
-            Capability::ToolInvokeAll,
+            Capability::OutletRegister,
+            Capability::OutletQueryAll,
+            Capability::OutletCallAll,
             Capability::RoleAssign,
             Capability::MemberInvite,
             Capability::MemberRemove,

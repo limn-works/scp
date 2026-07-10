@@ -483,8 +483,11 @@ pub type PaymentAdapterRef = String;
 pub enum PaidActionType {
     /// Sending a message in a context.
     MessageSend,
-    /// Invoking a tool.
-    ToolInvoke,
+    /// Invoking an Action outlet. Matches the `outlet_call:` UCAN stem
+    /// (§19.15.2, §5.4.2). The variant is stem-aligned, not invocation-
+    /// neutral: Query outlets are never billed (§5.4.2), so no
+    /// `PaidActionType::OutletQuery` variant exists.
+    OutletCall,
     /// Joining a context.
     ContextJoin,
     /// A subscription period payment.
@@ -600,8 +603,9 @@ pub struct CostSchedule {
     pub currency: CurrencyCode,
     /// Cost per message sent.
     pub per_message: Option<Amount>,
-    /// Default cost per tool invocation (tools without their own cost).
-    pub per_tool_invoke: Option<Amount>,
+    /// Default cost per Action-outlet invocation (outlets without their own
+    /// cost). Query outlets are never billed (§5.4.2).
+    pub per_outlet_call: Option<Amount>,
     /// One-time membership cost.
     pub per_join: Option<Amount>,
     /// Recurring subscription cost (carries its own currency).
@@ -871,7 +875,7 @@ mod tests {
             cost_schedule: CostSchedule {
                 currency: CurrencyCode::from("USD"),
                 per_message: Some(Amount(1)),
-                per_tool_invoke: Some(Amount(10)),
+                per_outlet_call: Some(Amount(10)),
                 per_join: Some(Amount(100)),
                 per_period: Some(SubscriptionCost {
                     amount: Amount(999),
@@ -911,7 +915,7 @@ mod tests {
             cost_schedule: CostSchedule {
                 currency: CurrencyCode::from("BTC"),
                 per_message: None,
-                per_tool_invoke: None,
+                per_outlet_call: None,
                 per_join: None,
                 per_period: None,
                 per_byte_stored: None,

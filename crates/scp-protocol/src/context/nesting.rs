@@ -698,7 +698,7 @@ mod tests {
         let intersection = compute_ceiling_intersection(&[parent]);
         assert!(intersection.contains(&Capability::MessagesRead));
         assert!(intersection.contains(&Capability::MessagesWrite));
-        assert!(!intersection.contains(&Capability::ToolInvokeAll));
+        assert!(!intersection.contains(&Capability::OutletCallAll));
     }
 
     #[test]
@@ -708,7 +708,7 @@ mod tests {
             &[
                 Capability::MessagesRead,
                 Capability::MessagesWrite,
-                Capability::ToolInvokeAll,
+                Capability::OutletCallAll,
             ],
             &[],
             OnSeverPolicy::EvictUniqueMembers,
@@ -723,8 +723,8 @@ mod tests {
         assert!(intersection.contains(&Capability::MessagesRead));
         assert!(intersection.contains(&Capability::MessagesWrite));
         assert!(
-            !intersection.contains(&Capability::ToolInvokeAll),
-            "ToolInvokeAll is only in parent A, not in intersection"
+            !intersection.contains(&Capability::OutletCallAll),
+            "OutletCallAll is only in parent A, not in intersection"
         );
     }
 

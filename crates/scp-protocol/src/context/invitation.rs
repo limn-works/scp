@@ -396,7 +396,7 @@ mod tests {
     fn spoofed_template_with_tool_capabilities_rejected() {
         // Invitation claims bilateral-ephemeral but includes tool capabilities.
         let mut params = bilateral_ephemeral_params(Duration::from_mins(5));
-        params.ceiling.push(Capability::ToolInvokeAll);
+        params.ceiling.push(Capability::OutletCallAll);
 
         let mut tracker = RateLimitTracker::new();
         let result = evaluate_invitation(
@@ -468,7 +468,7 @@ mod tests {
                 cost_schedule: CostSchedule {
                     currency: CurrencyCode::from("USD"),
                     per_message: Some(Amount(1)),
-                    per_tool_invoke: None,
+                    per_outlet_call: None,
                     per_join: None,
                     per_period: None,
                     per_byte_stored: None,
@@ -501,7 +501,7 @@ mod tests {
                 cost_schedule: CostSchedule {
                     currency: CurrencyCode::from("USD"),
                     per_message: Some(Amount(1)),
-                    per_tool_invoke: None,
+                    per_outlet_call: None,
                     per_join: None,
                     per_period: None,
                     per_byte_stored: None,
@@ -539,7 +539,7 @@ mod tests {
                 cost_schedule: CostSchedule {
                     currency: CurrencyCode::from("USD"),
                     per_message: Some(Amount(1)),
-                    per_tool_invoke: None,
+                    per_outlet_call: None,
                     per_join: None,
                     per_period: None,
                     per_byte_stored: None,
@@ -580,7 +580,7 @@ mod tests {
                 cost_schedule: CostSchedule {
                     currency: CurrencyCode::from("USD"),
                     per_message: None,
-                    per_tool_invoke: None,
+                    per_outlet_call: None,
                     per_join: Some(Amount(500)),
                     per_period: None,
                     per_byte_stored: None,
@@ -626,7 +626,7 @@ mod tests {
                 cost_schedule: CostSchedule {
                     currency: CurrencyCode::from("USD"),
                     per_message: Some(Amount(1)),
-                    per_tool_invoke: None,
+                    per_outlet_call: None,
                     per_join: None,
                     per_period: None,
                     per_byte_stored: None,
@@ -960,7 +960,7 @@ mod tests {
 
     #[test]
     fn tool_capabilities_block_auto_accept() {
-        // Coordination template includes ToolInvokeAll -- auto-accept should
+        // Coordination template includes OutletCallAll -- auto-accept should
         // not apply even if policy matches.
         let mut params = ContextParams::from_template(TemplateId::Coordination);
         params.ttl = Some(Duration::from_mins(5));
@@ -994,13 +994,13 @@ mod tests {
         // Spoofed template with economic policy. Template check should fail
         // before economic policy is evaluated.
         let mut params = bilateral_ephemeral_params(Duration::from_mins(5));
-        params.ceiling.push(Capability::ToolInvokeAll); // Spoofs template
+        params.ceiling.push(Capability::OutletCallAll); // Spoofs template
         params.economic_policy = Some(EconomicPolicy {
             locked: false,
             cost_schedule: CostSchedule {
                 currency: CurrencyCode::from("USD"),
                 per_message: Some(Amount(1)),
-                per_tool_invoke: None,
+                per_outlet_call: None,
                 per_join: None,
                 per_period: None,
                 per_byte_stored: None,
@@ -1035,7 +1035,7 @@ mod tests {
                 cost_schedule: CostSchedule {
                     currency: CurrencyCode::from("USD"),
                     per_message: Some(Amount(1)),
-                    per_tool_invoke: None,
+                    per_outlet_call: None,
                     per_join: None,
                     per_period: None,
                     per_byte_stored: None,
@@ -1105,7 +1105,7 @@ mod tests {
             cost_schedule: CostSchedule {
                 currency: CurrencyCode::from("USD"),
                 per_message: None,
-                per_tool_invoke: None,
+                per_outlet_call: None,
                 per_join: None,
                 per_period: None,
                 per_byte_stored: None,

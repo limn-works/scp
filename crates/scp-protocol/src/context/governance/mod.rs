@@ -2359,7 +2359,7 @@ mod tests {
                     cost_schedule: crate::economy::types::CostSchedule {
                         currency: crate::economy::types::CurrencyCode::from("USD"),
                         per_message: Some(Amount::new(1)),
-                        per_tool_invoke: None,
+                        per_outlet_call: None,
                         per_join: None,
                         per_period: None,
                         per_byte_stored: None,
@@ -2860,7 +2860,7 @@ mod tests {
                     cost_schedule: crate::economy::types::CostSchedule {
                         currency: crate::economy::types::CurrencyCode::from("USD"),
                         per_message: Some(crate::economy::types::Amount::new(1)),
-                        per_tool_invoke: None,
+                        per_outlet_call: None,
                         per_join: None,
                         per_period: None,
                         per_byte_stored: None,
@@ -3462,7 +3462,7 @@ mod tests {
             cost_schedule: crate::economy::types::CostSchedule {
                 currency: crate::economy::types::CurrencyCode::from("USD"),
                 per_message: Some(Amount::new(10)),
-                per_tool_invoke: Some(Amount::new(50)),
+                per_outlet_call: Some(Amount::new(50)),
                 per_join: None,
                 per_period: None,
                 per_byte_stored: None,

@@ -257,7 +257,7 @@ impl OutletRegistry {
 /// Registers a new tool in the context's tool registry.
 ///
 /// Validates:
-/// 1. Registrant has `ToolRegister` capability via UCAN (ADR-009).
+/// 1. Registrant has `OutletRegister` capability via UCAN (ADR-009).
 /// 2. Input and output schemas are valid JSON Schema.
 /// 3. Implementation hash is 32 bytes (enforced by type system).
 /// 4. Operator DID is resolvable (basic format check).
@@ -279,7 +279,7 @@ pub fn register_outlet(
     registration: OutletRegistration,
     registrant_did: &str,
 ) -> Result<(OutletId, OutletRegisteredEvent), OutletError> {
-    // 1. Validate registrant has ToolRegister capability.
+    // 1. Validate registrant has OutletRegister capability.
     if !has_outlet_register_capability(role_state, registrant_did) {
         return Err(OutletError::RegistrantNotAuthorized {
             did: registrant_did.to_owned(),
@@ -628,8 +628,8 @@ mod tests {
         CapabilityCeiling::new([
             Capability::MessagesRead,
             Capability::MessagesWrite,
-            Capability::ToolRegister,
-            Capability::ToolInvokeAll,
+            Capability::OutletRegister,
+            Capability::OutletCallAll,
             Capability::RoleAssign,
             Capability::MemberInvite,
             Capability::MemberRemove,
@@ -652,15 +652,15 @@ mod tests {
     }
 
     /// Creates a `ContextRoleState` with an additional member that has limited
-    /// capabilities (no `ToolRegister`).
+    /// capabilities (no `OutletRegister`).
     fn test_role_state_with_member(creator_did: &str, member_did: &str) -> ContextRoleState {
         let mut state = test_role_state(creator_did);
         state.members.insert(member_did.to_owned());
-        // Assign member role (no ToolRegister).
+        // Assign member role (no OutletRegister).
         let member_caps: HashSet<Capability> = [
             Capability::MessagesRead,
             Capability::MessagesWrite,
-            Capability::ToolInvokeAll,
+            Capability::OutletCallAll,
         ]
         .into_iter()
         .collect();

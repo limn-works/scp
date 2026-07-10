@@ -260,7 +260,7 @@ pub enum TemplateId {
     #[serde(rename = "scp:template/tool-interface")]
     ToolInterfaceTemplate,
     /// Tool invocation context with per-invoke cost. Extends `tool-interface`.
-    /// Requires `economic_policy` with `per_tool_invoke` set at creation.
+    /// Requires `economic_policy` with `per_outlet_call` set at creation.
     ///
     /// See spec section 19.10 and ADR-033.
     #[serde(rename = "scp:template/paid-service")]
@@ -1071,8 +1071,8 @@ mod tests {
         let params = ContextParams {
             mode: ContextMode::Broadcast,
             ceiling: vec![
-                Capability::new("messages:read"),
-                Capability::new("messages:write"),
+                Capability::new("messages:read").expect("known capability stem"),
+                Capability::new("messages:write").expect("known capability stem"),
             ],
             ceiling_policy: CeilingPolicy::Governed,
             promotion_policy: PromotionPolicy::Promotable,
@@ -1144,7 +1144,7 @@ mod tests {
 
     #[test]
     fn capability_new_and_name() {
-        let cap = Capability::new("messages:write");
+        let cap = Capability::new("messages:write").expect("known capability stem");
         assert_eq!(cap.name(), "messages:write");
     }
 
@@ -1246,7 +1246,7 @@ mod tests {
     fn context_params_serialization_roundtrip() {
         let params = ContextParams {
             mode: ContextMode::Encrypted,
-            ceiling: vec![Capability::new("messages:read")],
+            ceiling: vec![Capability::new("messages:read").expect("known capability stem")],
             ceiling_policy: CeilingPolicy::Immutable,
             promotion_policy: PromotionPolicy::NoPromotion,
             roles: vec![RoleDefinition {
@@ -1292,7 +1292,7 @@ mod tests {
 
         let params = ContextParams {
             mode: ContextMode::Encrypted,
-            ceiling: vec![Capability::new("messages:read")],
+            ceiling: vec![Capability::new("messages:read").expect("known capability stem")],
             ceiling_policy: CeilingPolicy::Immutable,
             promotion_policy: PromotionPolicy::NoPromotion,
             roles: vec![],
@@ -1306,7 +1306,7 @@ mod tests {
                 cost_schedule: CostSchedule {
                     currency: CurrencyCode::from("USD"),
                     per_message: Some(Amount(1)),
-                    per_tool_invoke: None,
+                    per_outlet_call: None,
                     per_join: Some(Amount(100)),
                     per_period: None,
                     per_byte_stored: None,
@@ -1499,7 +1499,7 @@ mod tests {
         // Default MetadataVisibilityPolicy has all fields PreJoin,
         // so public_metadata() should return everything.
         let params = ContextParams {
-            ceiling: vec![Capability::new("messages:read")],
+            ceiling: vec![Capability::new("messages:read").expect("known capability stem")],
             mode: ContextMode::Encrypted,
             ..ContextParams::default()
         };
@@ -1583,8 +1583,8 @@ mod tests {
         // Even with all operational fields MemberOnly, structural fields persist.
         let params = ContextParams {
             ceiling: vec![
-                Capability::new("messages:read"),
-                Capability::new("messages:write"),
+                Capability::new("messages:read").expect("known capability stem"),
+                Capability::new("messages:write").expect("known capability stem"),
             ],
             ceiling_policy: CeilingPolicy::Governed,
             mode: ContextMode::Broadcast,
@@ -1649,7 +1649,7 @@ mod tests {
             cost_schedule: CostSchedule {
                 currency: CurrencyCode::from("USD"),
                 per_message: Some(Amount(1)),
-                per_tool_invoke: None,
+                per_outlet_call: None,
                 per_join: None,
                 per_period: None,
                 per_byte_stored: None,
@@ -1772,7 +1772,7 @@ mod tests {
     #[test]
     fn public_metadata_serialization_roundtrip() {
         let params = ContextParams {
-            ceiling: vec![Capability::new("messages:read")],
+            ceiling: vec![Capability::new("messages:read").expect("known capability stem")],
             ..ContextParams::default()
         };
         let runtime = full_runtime();

@@ -92,20 +92,25 @@ pub struct AutoAcceptPolicy {
 // Hard rule checks
 // ---------------------------------------------------------------------------
 
-/// Returns `true` if the context params contain any tool-related capability
+/// Returns `true` if the context params contain any outlet-related capability
 /// in the ceiling.
 ///
-/// Tool-related capabilities: `ToolInvokeAll`, `ToolInvoke(_)`, `ToolRegister`.
+/// Outlet-related capabilities: `OutletQueryAll`, `OutletQuery(_)`,
+/// `OutletCallAll`, `OutletCall(_)`, `OutletRegister`.
 ///
 /// **Non-overridable hard constraint:** Auto-accept NEVER applies to contexts
 /// whose ceiling includes any of these capabilities. See
 /// `.docs/standards/sdk-common.md`.
 #[must_use]
-pub fn has_tool_capabilities(params: &ContextParams) -> bool {
+pub fn has_outlet_capabilities(params: &ContextParams) -> bool {
     params.ceiling.iter().any(|cap| {
         matches!(
             cap,
-            Capability::ToolInvokeAll | Capability::ToolInvoke(_) | Capability::ToolRegister
+            Capability::OutletQueryAll
+                | Capability::OutletQuery(_)
+                | Capability::OutletCallAll
+                | Capability::OutletCall(_)
+                | Capability::OutletRegister
         )
     })
 }
@@ -124,7 +129,7 @@ pub const fn requires_payment(params: &ContextParams) -> bool {
     };
     let cs = &econ.cost_schedule;
     cs.per_message.is_some()
-        || cs.per_tool_invoke.is_some()
+        || cs.per_outlet_call.is_some()
         || cs.per_join.is_some()
         || cs.per_period.is_some()
         || cs.per_byte_stored.is_some()
@@ -134,7 +139,7 @@ pub const fn requires_payment(params: &ContextParams) -> bool {
 /// Checks whether auto-accept is allowed for the given context params.
 ///
 /// Returns `false` if any hard constraint is violated:
-/// - Context ceiling includes tool-related capabilities.
+/// - Context ceiling includes outlet-related capabilities.
 /// - Context has an economic policy requiring payment.
 ///
 /// Returns `true` if auto-accept evaluation may proceed (further checks like
@@ -142,5 +147,5 @@ pub const fn requires_payment(params: &ContextParams) -> bool {
 /// responsibility).
 #[must_use]
 pub fn auto_accept_allowed(params: &ContextParams) -> bool {
-    !has_tool_capabilities(params) && !requires_payment(params)
+    !has_outlet_capabilities(params) && !requires_payment(params)
 }

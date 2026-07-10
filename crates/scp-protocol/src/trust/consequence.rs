@@ -590,7 +590,8 @@ fn validate_severity_shape(
                          index {i}",
                     )));
                 }
-                // Validate Custom(name) / ToolInvoke(id) payload strings.
+                // Validate Custom(name) / OutletQuery(id) / OutletCall(id)
+                // payload strings.
                 if let Capability::Custom(name) = cap {
                     if name.is_empty() {
                         return Err(ConsequenceValidationError(format!(
@@ -602,15 +603,26 @@ fn validate_severity_shape(
                         &format!("SuspendCapability[{i}] Custom"),
                         MAX_CONSEQUENCE_STRING_LEN,
                     )?;
-                } else if let Capability::ToolInvoke(tool_id) = cap {
-                    if tool_id.is_empty() {
+                } else if let Capability::OutletQuery(outlet_id) = cap {
+                    if outlet_id.is_empty() {
                         return Err(ConsequenceValidationError(format!(
-                            "SuspendCapability[{i}] ToolInvoke has empty tool_id",
+                            "SuspendCapability[{i}] OutletQuery has empty outlet_id",
                         )));
                     }
                     validate_consequence_string(
-                        tool_id,
-                        &format!("SuspendCapability[{i}] ToolInvoke"),
+                        outlet_id,
+                        &format!("SuspendCapability[{i}] OutletQuery"),
+                        MAX_CONSEQUENCE_STRING_LEN,
+                    )?;
+                } else if let Capability::OutletCall(outlet_id) = cap {
+                    if outlet_id.is_empty() {
+                        return Err(ConsequenceValidationError(format!(
+                            "SuspendCapability[{i}] OutletCall has empty outlet_id",
+                        )));
+                    }
+                    validate_consequence_string(
+                        outlet_id,
+                        &format!("SuspendCapability[{i}] OutletCall"),
                         MAX_CONSEQUENCE_STRING_LEN,
                     )?;
                 }
@@ -1851,19 +1863,19 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_empty_tool_invoke_payload() {
+    fn validate_rejects_empty_outlet_call_payload() {
         let rule = ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
             action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
-                capabilities: vec![Capability::ToolInvoke(String::new())],
+                capabilities: vec![Capability::OutletCall(String::new())],
             }),
             threshold: 1,
             window: Duration::from_mins(1),
         };
         let err = rule.validate().unwrap_err();
         assert!(
-            err.to_string().contains("ToolInvoke has empty tool_id"),
-            "should reject empty tool_id, got: {err}"
+            err.to_string().contains("OutletCall has empty outlet_id"),
+            "should reject empty outlet_id, got: {err}"
         );
     }
 
@@ -2181,11 +2193,11 @@ mod tests {
     }
 
     #[test]
-    fn b2_suspend_custom_tool_invoke_is_respected() {
+    fn b2_suspend_custom_outlet_call_is_respected() {
         let rule = ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
             action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
-                capabilities: vec![Capability::ToolInvoke("calculator".to_owned())],
+                capabilities: vec![Capability::OutletCall("calculator".to_owned())],
             }),
             threshold: 1,
             window: Duration::from_mins(1),
@@ -2198,7 +2210,7 @@ mod tests {
         };
         assert_eq!(
             capabilities,
-            &vec![Capability::ToolInvoke("calculator".to_owned())]
+            &vec![Capability::OutletCall("calculator".to_owned())]
         );
     }
 
@@ -2207,7 +2219,7 @@ mod tests {
         let caps = vec![
             Capability::MessagesWrite,
             Capability::GovernanceVote,
-            Capability::ToolInvoke("calculator".to_owned()),
+            Capability::OutletCall("calculator".to_owned()),
             Capability::Custom("rate_limit_bypass".to_owned()),
         ];
         let rule = ConsequenceRule {

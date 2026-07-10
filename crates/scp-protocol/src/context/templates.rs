@@ -73,7 +73,7 @@ pub enum TemplateError {
     CostFieldRequired {
         /// The template that requires the cost field.
         template: TemplateId,
-        /// The cost field that must be set (e.g., `"per_tool_invoke"`).
+        /// The cost field that must be set (e.g., `"per_outlet_call"`).
         field: &'static str,
     },
 
@@ -88,16 +88,27 @@ pub enum TemplateError {
 // ---------------------------------------------------------------------------
 
 /// Standard capability name for reading messages.
+#[cfg(test)]
 const CAP_MESSAGES_READ: &str = "messages:read";
 /// Standard capability name for writing messages.
+#[cfg(test)]
 const CAP_MESSAGES_WRITE: &str = "messages:write";
-/// Standard capability name for invoking any registered tool.
-const CAP_TOOL_INVOKE_ALL: &str = "tool:invoke:*";
-/// Standard capability name for registering new tools.
-const CAP_TOOL_REGISTER: &str = "tool:register";
+/// Standard capability name for invoking any registered Query outlet
+/// (§5.4.2).
+#[cfg(test)]
+const CAP_OUTLET_QUERY_ALL: &str = "outlet:query:*";
+/// Standard capability name for invoking any registered Action outlet
+/// (§5.4.2).
+#[cfg(test)]
+const CAP_OUTLET_CALL_ALL: &str = "outlet:call:*";
+/// Standard capability name for registering new outlets.
+#[cfg(test)]
+const CAP_OUTLET_REGISTER: &str = "outlet:register";
 /// Standard capability name for inviting new members.
+#[cfg(test)]
 const CAP_MEMBER_INVITE: &str = "member:invite";
 /// Standard capability name for banning members from a context.
+#[cfg(test)]
 const CAP_MEMBER_BAN: &str = "member:ban";
 
 // ---------------------------------------------------------------------------
@@ -108,10 +119,7 @@ const CAP_MEMBER_BAN: &str = "member:ban";
 ///
 /// Used by broadcast templates where `member:ban` is not applicable.
 fn messaging_ceiling() -> Vec<Capability> {
-    vec![
-        Capability::new(CAP_MESSAGES_READ),
-        Capability::new(CAP_MESSAGES_WRITE),
-    ]
+    vec![Capability::MessagesRead, Capability::MessagesWrite]
 }
 
 /// Returns the messaging ceiling with ban: `messages:read` + `messages:write`
@@ -121,55 +129,59 @@ fn messaging_ceiling() -> Vec<Capability> {
 /// ephemeral, bilateral persistent).
 fn messaging_ban_ceiling() -> Vec<Capability> {
     vec![
-        Capability::new(CAP_MESSAGES_READ),
-        Capability::new(CAP_MESSAGES_WRITE),
-        Capability::new(CAP_MEMBER_BAN),
+        Capability::MessagesRead,
+        Capability::MessagesWrite,
+        Capability::MemberBan,
     ]
 }
 
-/// Returns the messaging + tool invoke + ban ceiling: messaging +
-/// `tool:invoke_all` + `member:ban`.
+/// Returns the messaging + outlet invoke + ban ceiling: messaging +
+/// `outlet:query:*` + `outlet:call:*` + `member:ban`.
 ///
-/// Used by the Coordination template (spec section 5.12.1). Tools are
-/// creator-defined at creation time, so only `tool:invoke_all` is in the
-/// ceiling — members can invoke tools but not dynamically register new ones.
-fn messaging_tool_invoke_ban_ceiling() -> Vec<Capability> {
+/// Used by the Coordination template (spec section 5.12.1). Outlets are
+/// creator-defined at creation time, so registration capability is not in
+/// the ceiling — members can invoke Query and Action outlets but not
+/// dynamically register new ones.
+fn messaging_outlet_call_ban_ceiling() -> Vec<Capability> {
     vec![
-        Capability::new(CAP_MESSAGES_READ),
-        Capability::new(CAP_MESSAGES_WRITE),
-        Capability::new(CAP_TOOL_INVOKE_ALL),
-        Capability::new(CAP_MEMBER_BAN),
+        Capability::MessagesRead,
+        Capability::MessagesWrite,
+        Capability::OutletQueryAll,
+        Capability::OutletCallAll,
+        Capability::MemberBan,
     ]
 }
 
-/// Returns the messaging + full tools ceiling: messaging + `tool:invoke_all` +
-/// `tool:register`.
+/// Returns the messaging + full outlets ceiling: messaging +
+/// `outlet:query:*` + `outlet:call:*` + `outlet:register`.
 ///
 /// Used by broadcast templates (spec section 5.12.1) where participants can
-/// both invoke and register tools. Does NOT include `member:ban` — broadcast
-/// contexts do not support member banning.
+/// both invoke and register outlets. Does NOT include `member:ban` —
+/// broadcast contexts do not support member banning.
 fn messaging_tools_ceiling() -> Vec<Capability> {
     vec![
-        Capability::new(CAP_MESSAGES_READ),
-        Capability::new(CAP_MESSAGES_WRITE),
-        Capability::new(CAP_TOOL_INVOKE_ALL),
-        Capability::new(CAP_TOOL_REGISTER),
+        Capability::MessagesRead,
+        Capability::MessagesWrite,
+        Capability::OutletQueryAll,
+        Capability::OutletCallAll,
+        Capability::OutletRegister,
     ]
 }
 
-/// Returns the messaging + full tools + ban ceiling: messaging +
-/// `tool:invoke_all` + `tool:register` + `member:ban`.
+/// Returns the messaging + full outlets + ban ceiling: messaging +
+/// `outlet:query:*` + `outlet:call:*` + `outlet:register` + `member:ban`.
 ///
-/// Used by encrypted templates with full tool support (tool-interface,
-/// paid-service) where participants can invoke and register tools, and
+/// Used by encrypted templates with full outlet support (outlet-interface,
+/// paid-service) where participants can invoke and register outlets, and
 /// member banning is supported.
 fn messaging_tools_ban_ceiling() -> Vec<Capability> {
     vec![
-        Capability::new(CAP_MESSAGES_READ),
-        Capability::new(CAP_MESSAGES_WRITE),
-        Capability::new(CAP_TOOL_INVOKE_ALL),
-        Capability::new(CAP_TOOL_REGISTER),
-        Capability::new(CAP_MEMBER_BAN),
+        Capability::MessagesRead,
+        Capability::MessagesWrite,
+        Capability::OutletQueryAll,
+        Capability::OutletCallAll,
+        Capability::OutletRegister,
+        Capability::MemberBan,
     ]
 }
 
@@ -177,10 +189,10 @@ fn messaging_tools_ban_ceiling() -> Vec<Capability> {
 /// + `member:ban`.
 fn messaging_invite_ban_ceiling() -> Vec<Capability> {
     vec![
-        Capability::new(CAP_MESSAGES_READ),
-        Capability::new(CAP_MESSAGES_WRITE),
-        Capability::new(CAP_MEMBER_INVITE),
-        Capability::new(CAP_MEMBER_BAN),
+        Capability::MessagesRead,
+        Capability::MessagesWrite,
+        Capability::MemberInvite,
+        Capability::MemberBan,
     ]
 }
 
@@ -260,7 +272,7 @@ const fn member_count_hidden_visibility() -> MetadataVisibilityPolicy {
 /// | `PublicBroadcast` | Broadcast | messages + tools | No | default | Public | Optional | None |
 /// | `GatedBroadcast` | Broadcast | messages + tools | No | member_count_hidden | Gated | Optional | None |
 /// | `ToolInterfaceTemplate` | Encrypted | messages + tools + ban | Yes | default | None | Optional | None |
-/// | `PaidService` | Encrypted | messages + tools + ban | Yes | member_count_hidden | None | Optional | Required (per_tool_invoke) |
+/// | `PaidService` | Encrypted | messages + tools + ban | Yes | member_count_hidden | None | Optional | Required (per_outlet_call) |
 /// | `PaidBroadcast` | Broadcast | messages | No | member_count_hidden | Gated | Optional | Required (per_period) |
 #[must_use]
 #[allow(clippy::too_many_lines)] // one arm per template variant; splitting hurts readability
@@ -324,7 +336,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
         },
         TemplateId::Coordination => ContextParams {
             mode: ContextMode::Encrypted,
-            ceiling: messaging_tool_invoke_ban_ceiling(),
+            ceiling: messaging_outlet_call_ban_ceiling(),
             ceiling_policy: CeilingPolicy::Immutable,
             promotion_policy: PromotionPolicy::NoPromotion,
             roles: Vec::new(),
@@ -536,7 +548,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
         // to bootstrap agent discovery via standardized tool schemas (ADR-020).
         TemplateId::HandleRegistry => ContextParams {
             mode: ContextMode::Encrypted,
-            ceiling: messaging_tool_invoke_ban_ceiling(),
+            ceiling: messaging_outlet_call_ban_ceiling(),
             ceiling_policy: CeilingPolicy::Immutable,
             promotion_policy: PromotionPolicy::NoPromotion,
             roles: Vec::new(),
@@ -824,7 +836,7 @@ fn validate_governance_gaps_fields(
 
 /// Validates economic policy requirements for paid templates.
 ///
-/// - `PaidService` requires `economic_policy` with `per_tool_invoke` set.
+/// - `PaidService` requires `economic_policy` with `per_outlet_call` set.
 /// - `PaidBroadcast` requires `economic_policy` with `per_period` set.
 /// - All other templates have no economic policy requirements.
 fn validate_economic_policy_for_template(
@@ -836,10 +848,10 @@ fn validate_economic_policy_for_template(
             let policy = economic_policy.ok_or(TemplateError::EconomicPolicyRequired {
                 template: template_id,
             })?;
-            if policy.cost_schedule.per_tool_invoke.is_none() {
+            if policy.cost_schedule.per_outlet_call.is_none() {
                 return Err(TemplateError::CostFieldRequired {
                     template: template_id,
-                    field: "per_tool_invoke",
+                    field: "per_outlet_call",
                 });
             }
         }
@@ -956,7 +968,7 @@ mod tests {
     fn coordination_params_have_correct_fields() {
         let params = template_params(&TemplateId::Coordination);
         assert_eq!(params.mode, ContextMode::Encrypted);
-        assert_eq!(params.ceiling.len(), 4);
+        assert_eq!(params.ceiling.len(), 5);
         assert!(params.ceiling.iter().any(|c| c.name() == CAP_MESSAGES_READ));
         assert!(
             params
@@ -968,7 +980,13 @@ mod tests {
             params
                 .ceiling
                 .iter()
-                .any(|c| c.name() == CAP_TOOL_INVOKE_ALL)
+                .any(|c| c.name() == CAP_OUTLET_QUERY_ALL)
+        );
+        assert!(
+            params
+                .ceiling
+                .iter()
+                .any(|c| c.name() == CAP_OUTLET_CALL_ALL)
         );
         assert!(params.ceiling.iter().any(|c| c.name() == CAP_MEMBER_BAN));
         assert_eq!(params.ceiling_policy, CeilingPolicy::Immutable);
@@ -1013,7 +1031,7 @@ mod tests {
     fn public_broadcast_params_have_correct_fields() {
         let params = template_params(&TemplateId::PublicBroadcast);
         assert_eq!(params.mode, ContextMode::Broadcast);
-        assert_eq!(params.ceiling.len(), 4);
+        assert_eq!(params.ceiling.len(), 5);
         assert!(params.ceiling.iter().any(|c| c.name() == CAP_MESSAGES_READ));
         assert!(
             params
@@ -1025,9 +1043,15 @@ mod tests {
             params
                 .ceiling
                 .iter()
-                .any(|c| c.name() == CAP_TOOL_INVOKE_ALL)
+                .any(|c| c.name() == CAP_OUTLET_QUERY_ALL)
         );
-        assert!(params.ceiling.iter().any(|c| c.name() == CAP_TOOL_REGISTER));
+        assert!(
+            params
+                .ceiling
+                .iter()
+                .any(|c| c.name() == CAP_OUTLET_CALL_ALL)
+        );
+        assert!(params.ceiling.iter().any(|c| c.name() == CAP_OUTLET_REGISTER));
         assert!(!params.ceiling.iter().any(|c| c.name() == CAP_MEMBER_BAN));
         assert_eq!(params.ceiling_policy, CeilingPolicy::Immutable);
         assert_eq!(params.promotion_policy, PromotionPolicy::NoPromotion);
@@ -1054,7 +1078,7 @@ mod tests {
     fn gated_broadcast_params_have_correct_fields() {
         let params = template_params(&TemplateId::GatedBroadcast);
         assert_eq!(params.mode, ContextMode::Broadcast);
-        assert_eq!(params.ceiling.len(), 4);
+        assert_eq!(params.ceiling.len(), 5);
         assert!(params.ceiling.iter().any(|c| c.name() == CAP_MESSAGES_READ));
         assert!(
             params
@@ -1066,9 +1090,15 @@ mod tests {
             params
                 .ceiling
                 .iter()
-                .any(|c| c.name() == CAP_TOOL_INVOKE_ALL)
+                .any(|c| c.name() == CAP_OUTLET_QUERY_ALL)
         );
-        assert!(params.ceiling.iter().any(|c| c.name() == CAP_TOOL_REGISTER));
+        assert!(
+            params
+                .ceiling
+                .iter()
+                .any(|c| c.name() == CAP_OUTLET_CALL_ALL)
+        );
+        assert!(params.ceiling.iter().any(|c| c.name() == CAP_OUTLET_REGISTER));
         assert!(!params.ceiling.iter().any(|c| c.name() == CAP_MEMBER_BAN));
         assert_eq!(params.ceiling_policy, CeilingPolicy::Immutable);
         assert_eq!(params.promotion_policy, PromotionPolicy::NoPromotion);
@@ -1205,7 +1235,7 @@ mod tests {
     fn validate_rejects_wrong_ceiling() {
         let mut params = template_params(&TemplateId::BilateralEphemeral);
         params.ttl = Some(Duration::from_mins(5));
-        params.ceiling.push(Capability::new(CAP_TOOL_INVOKE_ALL));
+        params.ceiling.push(Capability::OutletCallAll);
         let err = validate_against_template(&params).unwrap_err();
         assert!(matches!(
             err,
@@ -1286,9 +1316,9 @@ mod tests {
         params.ttl = Some(Duration::from_mins(5));
         // Reverse the ceiling order
         params.ceiling = vec![
-            Capability::new(CAP_MEMBER_BAN),
-            Capability::new(CAP_MESSAGES_WRITE),
-            Capability::new(CAP_MESSAGES_READ),
+            Capability::new(CAP_MEMBER_BAN).expect("known capability"),
+            Capability::new(CAP_MESSAGES_WRITE).expect("known capability"),
+            Capability::new(CAP_MESSAGES_READ).expect("known capability"),
         ];
         assert!(validate_against_template(&params).is_ok());
     }
@@ -1299,29 +1329,29 @@ mod tests {
 
     #[test]
     fn capabilities_match_same_order() {
-        let a = vec![Capability::new("a"), Capability::new("b")];
-        let b = vec![Capability::new("a"), Capability::new("b")];
+        let a = vec![Capability::new("a").expect("known capability"), Capability::new("b").expect("known capability")];
+        let b = vec![Capability::new("a").expect("known capability"), Capability::new("b").expect("known capability")];
         assert!(capabilities_match(&a, &b));
     }
 
     #[test]
     fn capabilities_match_different_order() {
-        let a = vec![Capability::new("b"), Capability::new("a")];
-        let b = vec![Capability::new("a"), Capability::new("b")];
+        let a = vec![Capability::new("b").expect("known capability"), Capability::new("a").expect("known capability")];
+        let b = vec![Capability::new("a").expect("known capability"), Capability::new("b").expect("known capability")];
         assert!(capabilities_match(&a, &b));
     }
 
     #[test]
     fn capabilities_match_different_lengths() {
-        let a = vec![Capability::new("a")];
-        let b = vec![Capability::new("a"), Capability::new("b")];
+        let a = vec![Capability::new("a").expect("known capability")];
+        let b = vec![Capability::new("a").expect("known capability"), Capability::new("b").expect("known capability")];
         assert!(!capabilities_match(&a, &b));
     }
 
     #[test]
     fn capabilities_match_different_names() {
-        let a = vec![Capability::new("a")];
-        let b = vec![Capability::new("b")];
+        let a = vec![Capability::new("a").expect("known capability")];
+        let b = vec![Capability::new("b").expect("known capability")];
         assert!(!capabilities_match(&a, &b));
     }
 
@@ -1517,7 +1547,7 @@ mod tests {
     fn from_template_coordination_produces_valid_params() {
         let params = ContextParams::from_template(TemplateId::Coordination);
         assert_eq!(params.mode, ContextMode::Encrypted);
-        assert_eq!(params.ceiling.len(), 4);
+        assert_eq!(params.ceiling.len(), 5);
         assert_eq!(params.memory_scope, MemoryScope::Summary);
         assert_eq!(params.template_id, Some(TemplateId::Coordination));
     }
@@ -1536,7 +1566,7 @@ mod tests {
     fn from_template_public_broadcast_produces_valid_params() {
         let params = ContextParams::from_template(TemplateId::PublicBroadcast);
         assert_eq!(params.mode, ContextMode::Broadcast);
-        assert_eq!(params.ceiling.len(), 4);
+        assert_eq!(params.ceiling.len(), 5);
         assert_eq!(params.memory_scope, MemoryScope::Full);
         assert_eq!(params.template_id, Some(TemplateId::PublicBroadcast));
     }
@@ -1545,7 +1575,7 @@ mod tests {
     fn from_template_gated_broadcast_produces_valid_params() {
         let params = ContextParams::from_template(TemplateId::GatedBroadcast);
         assert_eq!(params.mode, ContextMode::Broadcast);
-        assert_eq!(params.ceiling.len(), 4);
+        assert_eq!(params.ceiling.len(), 5);
         assert_eq!(params.memory_scope, MemoryScope::Full);
         assert_eq!(params.template_id, Some(TemplateId::GatedBroadcast));
     }
@@ -1636,14 +1666,14 @@ mod tests {
     // Paid template helpers
     // -----------------------------------------------------------------------
 
-    /// Creates a minimal `EconomicPolicy` with `per_tool_invoke` set.
+    /// Creates a minimal `EconomicPolicy` with `per_outlet_call` set.
     fn paid_service_policy() -> crate::economy::EconomicPolicy {
         crate::economy::EconomicPolicy {
             locked: false,
             cost_schedule: crate::economy::CostSchedule {
                 currency: crate::economy::CurrencyCode::from("USD"),
                 per_message: None,
-                per_tool_invoke: Some(crate::economy::Amount(100)),
+                per_outlet_call: Some(crate::economy::Amount(100)),
                 per_join: None,
                 per_period: None,
                 per_byte_stored: None,
@@ -1661,7 +1691,7 @@ mod tests {
             cost_schedule: crate::economy::CostSchedule {
                 currency: crate::economy::CurrencyCode::from("USD"),
                 per_message: None,
-                per_tool_invoke: None,
+                per_outlet_call: None,
                 per_join: None,
                 per_period: Some(crate::economy::SubscriptionCost {
                     amount: crate::economy::Amount(999),
@@ -1684,7 +1714,7 @@ mod tests {
     fn paid_service_params_have_correct_fields() {
         let params = template_params(&TemplateId::PaidService);
         assert_eq!(params.mode, ContextMode::Encrypted);
-        assert_eq!(params.ceiling.len(), 5);
+        assert_eq!(params.ceiling.len(), 6);
         assert!(params.ceiling.iter().any(|c| c.name() == CAP_MESSAGES_READ));
         assert!(
             params
@@ -1696,9 +1726,15 @@ mod tests {
             params
                 .ceiling
                 .iter()
-                .any(|c| c.name() == CAP_TOOL_INVOKE_ALL)
+                .any(|c| c.name() == CAP_OUTLET_QUERY_ALL)
         );
-        assert!(params.ceiling.iter().any(|c| c.name() == CAP_TOOL_REGISTER));
+        assert!(
+            params
+                .ceiling
+                .iter()
+                .any(|c| c.name() == CAP_OUTLET_CALL_ALL)
+        );
+        assert!(params.ceiling.iter().any(|c| c.name() == CAP_OUTLET_REGISTER));
         assert!(params.ceiling.iter().any(|c| c.name() == CAP_MEMBER_BAN));
         assert_eq!(params.ceiling_policy, CeilingPolicy::Immutable);
         assert_eq!(params.promotion_policy, PromotionPolicy::NoPromotion);
@@ -1785,25 +1821,25 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // PaidService: missing per_tool_invoke rejected
+    // PaidService: missing per_outlet_call rejected
     // -----------------------------------------------------------------------
 
     #[test]
-    fn validate_paid_service_without_per_tool_invoke_rejected() {
+    fn validate_paid_service_without_per_outlet_call_rejected() {
         let mut params = template_params(&TemplateId::PaidService);
         let mut policy = paid_service_policy();
-        policy.cost_schedule.per_tool_invoke = None;
+        policy.cost_schedule.per_outlet_call = None;
         params.economic_policy = Some(policy);
         let err = validate_against_template(&params).unwrap_err();
         assert!(
             matches!(
                 err,
                 TemplateError::CostFieldRequired {
-                    field: "per_tool_invoke",
+                    field: "per_outlet_call",
                     ..
                 }
             ),
-            "expected CostFieldRequired(per_tool_invoke), got {err:?}"
+            "expected CostFieldRequired(per_outlet_call), got {err:?}"
         );
     }
 
@@ -1925,10 +1961,10 @@ mod tests {
     fn template_error_cost_field_required_display() {
         let err = TemplateError::CostFieldRequired {
             template: TemplateId::PaidService,
-            field: "per_tool_invoke",
+            field: "per_outlet_call",
         };
         let msg = format!("{err}");
-        assert!(msg.contains("per_tool_invoke"));
+        assert!(msg.contains("per_outlet_call"));
         assert!(msg.contains("PaidService"));
     }
 
@@ -1940,7 +1976,7 @@ mod tests {
     fn from_template_paid_service_produces_valid_params() {
         let params = ContextParams::from_template(TemplateId::PaidService);
         assert_eq!(params.mode, ContextMode::Encrypted);
-        assert_eq!(params.ceiling.len(), 5);
+        assert_eq!(params.ceiling.len(), 6);
         assert_eq!(params.memory_scope, MemoryScope::Full);
         assert_eq!(params.ceiling_policy, CeilingPolicy::Immutable);
         assert_eq!(params.governance, GovernanceModel::SingleAdmin);
