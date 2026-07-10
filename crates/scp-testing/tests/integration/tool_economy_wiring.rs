@@ -279,11 +279,13 @@ fn priced_policy(per_tool_invoke: u64) -> EconomicPolicy {
 fn echo_outlet() -> OutletRegistration {
     OutletRegistration {
         outlet_id: "echo".to_owned(),
+        kind: scp_core::context::outlets::OutletKind::default(),
         name: "echo".to_owned(),
         description: "echo tool for C4 wiring test".to_owned(),
         schema: OutletSchema {
             input_schema: serde_json::json!({"type": "object"}),
             output_schema: serde_json::json!({"type": "object"}),
+            aggregate_schema: None,
         },
         implementation_hash: [0u8; 32],
         test_vectors: vec![OutletTestVector {
@@ -293,6 +295,7 @@ fn echo_outlet() -> OutletRegistration {
         }],
         operator_did: DID::from("did:key:test-operator"),
         cost: None,
+        message_catalog: Vec::new(),
         registered_at: 0,
         signature: Vec::new(),
     }

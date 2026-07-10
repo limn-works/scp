@@ -3154,6 +3154,7 @@ mod tests {
             .expect("well-formed built-in ceiling");
         st.governance.registered_outlets.push(OutletRegistration {
             outlet_id: TOOL.to_owned(),
+            kind: scp_protocol::context::outlets::OutletKind::default(),
             name: "Calculator".to_owned(),
             description: "adds".to_owned(),
             schema: OutletSchema {
@@ -3165,11 +3166,13 @@ mod tests {
                     "type": "object",
                     "properties": { "result": {"type": "number"} }
                 }),
+                aggregate_schema: None,
             },
             implementation_hash: [0xAA; 32],
             test_vectors: vec![],
             operator_did: DID(creator.to_owned()),
             cost: None,
+            message_catalog: Vec::new(),
             registered_at: 0,
             signature: Vec::new(),
         });

@@ -923,9 +923,7 @@ impl ContextProvider for FfiBridgeProvider {
 
             // Clone handler Arc and output schema so we can release the lock.
             // Compute input hash before dispatch (arguments may be consumed).
-            let input_hash = scp_core::context::outlets::sha256_json(&arguments).map_err(|e| {
-                ScpPyError::context(format!("input hash canonicalization failed: {e}"))
-            })?;
+            let input_hash = scp_core::context::outlets::sha256_json(&arguments);
 
             Ok((
                 rt.outlet_handlers
@@ -1009,8 +1007,7 @@ impl ContextProvider for FfiBridgeProvider {
             }
         };
 
-        let output_hash = scp_core::context::outlets::sha256_json(&output)
-            .map_err(|e| refund(format!("output hash canonicalization failed: {e}")))?;
+        let output_hash = scp_core::context::outlets::sha256_json(&output);
 
         let outlet_event = scp_core::context::outlets::OutletInvokedEvent {
             request_id: uuid::Uuid::new_v4().to_string(),
@@ -1021,6 +1018,13 @@ impl ContextProvider for FfiBridgeProvider {
             input_hash,
             output_hash: Some(output_hash),
             cost: None,
+            // Non-streaming bridge invocation: degenerate/no-manifest
+            // streaming-field defaults matching the lifecycle serde defaults.
+            stream_chunk_count: 0,
+            chunks_billed: 0,
+            stream_manifest_hash: [0u8; 32],
+            stream_terminal_status: scp_core::context::outlets::stream::StreamTerminalStatus::Ok,
+            audit_anomaly: None,
         };
 
         let payload_data = serde_json::to_vec(&outlet_event).unwrap_or_default();
@@ -2599,6 +2603,7 @@ mod tests {
             crate::runtime::with_context(bi, &ctx_id, |rt| {
                 let registration = scp_core::context::outlets::OutletRegistration {
                     outlet_id: "calculator".to_owned(),
+                    kind: scp_core::context::outlets::OutletKind::default(),
                     name: "Calculator".to_owned(),
                     description: "A simple calculator".to_owned(),
                     schema: scp_core::context::outlets::OutletSchema {
@@ -2616,11 +2621,13 @@ mod tests {
                                 "result": {"type": "number"}
                             }
                         }),
+                        aggregate_schema: None,
                     },
                     implementation_hash: [0xAA; 32],
                     test_vectors: vec![],
                     operator_did: "did:dht:z6MkOperator".into(),
                     cost: None,
+                    message_catalog: Vec::new(),
                     registered_at: 0,
                     signature: Vec::new(),
                 };

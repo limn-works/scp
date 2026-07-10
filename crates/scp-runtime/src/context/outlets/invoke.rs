@@ -5,8 +5,8 @@
 //! UCAN capability checking, input/output schema validation, timeout
 //! enforcement, cancellation, error propagation, and event log recording.
 //!
-//! Tool execution errors are returned in [`OutletResponse::error`](scp_protocol::context::outlets::lifecycle::OutletResponse),
-//! not as protocol-level errors. Schema validation failures are caught by
+//! Tool execution errors are surfaced as [`InvocationError::ExecutionFailed`]
+//! carrying the executor's message. Schema validation failures are caught by
 //! the SDK (this module), not by the tool itself.
 //!
 //! See ADR-010 in `.docs/adrs/phase-2.md` for the full design.
@@ -24,6 +24,7 @@ use scp_protocol::context::outlets::lifecycle::{
 };
 use scp_protocol::context::outlets::registry::OutletRegistry;
 use scp_protocol::context::outlets::schema::validate_value_against_schema;
+use scp_protocol::context::outlets::stream::StreamTerminalStatus;
 use scp_protocol::context::roles::{Capability, ContextRoleState};
 use scp_protocol::crypto::ucan::capability::CapabilityUri;
 use scp_protocol::crypto::ucan::validate::{
@@ -40,8 +41,8 @@ use scp_protocol::trust::consequence::evaluate_consequence_rules;
 /// Errors produced by [`invoke_outlet`].
 ///
 /// These are protocol-level errors that prevent the invocation from being
-/// dispatched. Tool execution errors are returned inside
-/// [`OutletResponse::error`](scp_protocol::context::outlets::lifecycle::OutletResponse) instead.
+/// dispatched. Tool execution errors are surfaced as the
+/// [`ExecutionFailed`](InvocationError::ExecutionFailed) variant instead.
 #[derive(Debug, thiserror::Error)]
 pub enum InvocationError {
     /// The context is not in the Active state.
@@ -466,9 +467,7 @@ where
     // executor mutates the input object (serde_json::Value is a value type,
     // but this also protects against any future change to `F` that might
     // take the input by reference and mutate it).
-    let input_hash = sha256_json(&input).map_err(|e| InvocationError::ExecutionFailed {
-        message: format!("input hash canonicalization failed: {e}"),
-    })?;
+    let input_hash = sha256_json(&input);
 
     // 5. Execute the tool with timeout.
     let effective_timeout = timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS).min(MAX_TIMEOUT_MS);
@@ -490,9 +489,7 @@ where
     validate_value_against_schema(&output, &registration.schema.output_schema)
         .map_err(|msg| InvocationError::OutputValidationFailed { message: msg })?;
 
-    let output_hash = sha256_json(&output).map_err(|e| InvocationError::ExecutionFailed {
-        message: format!("output hash canonicalization failed: {e}"),
-    })?;
+    let output_hash = sha256_json(&output);
     let execution_time_ms = elapsed_ms(start);
 
     Ok(InvokeExecuteOutcome {
@@ -620,6 +617,16 @@ pub(crate) fn build_outlet_event(
         input_hash,
         output_hash: Some(output_hash),
         cost,
+        // Non-streaming invocation path: no chunks are produced, so the
+        // streaming event fields take their degenerate/no-manifest defaults
+        // — identical to the `#[serde(default …)]` values lifecycle.rs uses
+        // for events that pre-date the streaming taxonomy. No streaming
+        // behavior is introduced here; this is a shape reconcile only.
+        stream_chunk_count: 0,
+        chunks_billed: 0,
+        stream_manifest_hash: [0u8; 32],
+        stream_terminal_status: StreamTerminalStatus::Ok,
+        audit_anomaly: None,
     }
 }
 
@@ -732,22 +739,7 @@ where
     // 4c. Compute the input hash from the value the executor will see so
     // the resulting `OutletInvokedEvent` records it verbatim even though we
     // have to clone the input for the cancellation path.
-    let input_hash = match sha256_json(&input) {
-        Ok(hash) => hash,
-        Err(e) => {
-            void_escrow_and_rollback(
-                escrow.as_ref(),
-                escrow_parts.as_ref(),
-                action_cost,
-                &mut economy,
-                invoker_did,
-            )
-            .await;
-            return Err(InvocationError::ExecutionFailed {
-                message: format!("input hash canonicalization failed: {e}"),
-            });
-        }
-    };
+    let input_hash = sha256_json(&input);
 
     // 5. Execute with timeout and cancellation. The cancellation variant
     // keeps its own `tokio::select!` body because composing `tokio::select!`
@@ -804,22 +796,7 @@ where
         .await;
         return Err(InvocationError::OutputValidationFailed { message: msg });
     }
-    let output_hash = match sha256_json(&output) {
-        Ok(hash) => hash,
-        Err(e) => {
-            void_escrow_and_rollback(
-                escrow.as_ref(),
-                escrow_parts.as_ref(),
-                action_cost,
-                &mut economy,
-                invoker_did,
-            )
-            .await;
-            return Err(InvocationError::ExecutionFailed {
-                message: format!("output hash canonicalization failed: {e}"),
-            });
-        }
-    };
+    let output_hash = sha256_json(&output);
     let execution_time_ms = elapsed_ms(start);
     let triggered = economy
         .as_mut()
@@ -1199,6 +1176,7 @@ mod tests {
 
     use super::*;
     use scp_protocol::context::ContextParams;
+    use scp_protocol::context::outlets::OutletKind;
     use scp_protocol::context::outlets::registry::{
         OutletRegistration, OutletSchema, register_outlet,
     };
@@ -1259,6 +1237,7 @@ mod tests {
         let mut registry = OutletRegistry::new();
         let registration = OutletRegistration {
             outlet_id: "calculator".to_owned(),
+            kind: OutletKind::default(),
             name: "Calculator".to_owned(),
             description: "A simple calculator".to_owned(),
             schema: OutletSchema {
@@ -1275,11 +1254,13 @@ mod tests {
                         "result": {"type": "number"}
                     }
                 }),
+                aggregate_schema: None,
             },
             implementation_hash: [0xAA; 32],
             test_vectors: vec![],
             operator_did: "did:dht:z6MkOperator".into(),
             cost: None,
+            message_catalog: Vec::new(),
             registered_at: 0,
             signature: Vec::new(),
         };
@@ -1660,8 +1641,8 @@ mod tests {
         .unwrap();
 
         // Verify hashes are present and correct.
-        let expected_input_hash = sha256_json(&input).unwrap();
-        let expected_output_hash = sha256_json(&output).unwrap();
+        let expected_input_hash = sha256_json(&input);
+        let expected_output_hash = sha256_json(&output);
 
         assert_eq!(event.input_hash, expected_input_hash);
         assert_eq!(event.output_hash, Some(expected_output_hash));

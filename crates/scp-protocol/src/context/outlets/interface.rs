@@ -953,7 +953,7 @@ impl RateLimit {
     /// up to `burst_allowance` additional calls are permitted if they occur
     /// within `burst_window` of the first burst call (spec §6.2.0.2).
     #[allow(clippy::cast_possible_truncation)]
-    fn check_and_increment(&mut self, clock: &dyn Clock) -> bool {
+    pub fn check_and_increment(&mut self, clock: &dyn Clock) -> bool {
         let now = clock.now_millis();
         // Window durations are always far below u64::MAX milliseconds.
         let window_ms = self.window.as_millis() as u64;
@@ -1231,7 +1231,19 @@ pub struct OutletInterface {
     /// The tool being shared across contexts.
     pub outlet_id: OutletId,
     /// Optional per-interface rate limit for calls through this interface.
+    /// This is the OUTBOUND window the caller (A) consumes at Prepare-A (spec
+    /// §6.2.0.2; the source context's view of the per-interface limit).
     pub rate_limit: Option<RateLimit>,
+    /// Optional per-interface INBOUND rate limit — the TARGET's (B's) own
+    /// sliding window, consumed at Prepare-B (spec §6.2.4 "Prepare-B validates
+    /// [`InboundPolicy`] (… inbound rate …)", §6.2.0 effective `min(outbound,
+    /// inbound)`). Materialized lazily from [`InboundPolicy::max_calls_per_minute`]
+    /// the first time B prepares an invocation over this interface, then carried
+    /// here so the window state persists with the interface (same home as the
+    /// outbound `rate_limit`). `None` until first materialized; an interface
+    /// with no inbound policy (or an unbounded one) stays `None`.
+    #[serde(default)]
+    pub inbound_rate_limit: Option<RateLimit>,
     /// Per-caller rate limiter (spec §6.2.0.2). Default: 10 calls/min per caller.
     pub per_caller_rate_limit: Option<PerCallerRateLimit>,
     /// Whether the source context has approved the interface.
@@ -1425,6 +1437,9 @@ pub fn expose_tool(
         target_context: to_context.to_owned(),
         outlet_id: outlet_id.to_owned(),
         rate_limit,
+        // Inbound window is materialized lazily at Prepare-B; a freshly
+        // accepted interface has no inbound window yet.
+        inbound_rate_limit: None,
         // §6.2.0.2 per-caller default keyed to the registered kind:
         // 100/min for Query, 10/min for Action.
         per_caller_rate_limit: Some(PerCallerRateLimit::new(
@@ -2184,6 +2199,7 @@ mod tests {
             target_context: "ctx-target".to_owned(),
             outlet_id: "calculator".to_owned(),
             rate_limit: None,
+            inbound_rate_limit: None,
             per_caller_rate_limit: None,
             approved_by_source: true,
             approved_by_target: false,
@@ -2223,6 +2239,7 @@ mod tests {
             target_context: "ctx-target".to_owned(),
             outlet_id: "calculator".to_owned(),
             rate_limit: None,
+            inbound_rate_limit: None,
             per_caller_rate_limit: None,
             approved_by_source: true,
             approved_by_target: false,
@@ -2261,6 +2278,7 @@ mod tests {
             target_context: "ctx-target".to_owned(),
             outlet_id: "calculator".to_owned(),
             rate_limit: None,
+            inbound_rate_limit: None,
             per_caller_rate_limit: None,
             approved_by_source: true,
             approved_by_target: false,
@@ -2300,6 +2318,7 @@ mod tests {
             target_context: "ctx-target".to_owned(),
             outlet_id: "calculator".to_owned(),
             rate_limit: None,
+            inbound_rate_limit: None,
             per_caller_rate_limit: None,
             approved_by_source: true,
             approved_by_target: true,
@@ -2360,6 +2379,7 @@ mod tests {
             target_context: "ctx-target".to_owned(),
             outlet_id: "calculator".to_owned(),
             rate_limit: None,
+            inbound_rate_limit: None,
             per_caller_rate_limit: None,
             approved_by_source: true,
             approved_by_target: false, // Target has NOT approved
@@ -2408,6 +2428,7 @@ mod tests {
             target_context: "ctx-target".to_owned(),
             outlet_id: "calculator".to_owned(),
             rate_limit: None,
+            inbound_rate_limit: None,
             per_caller_rate_limit: None,
             approved_by_source: false, // Source has NOT approved
             approved_by_target: true,
@@ -2456,6 +2477,7 @@ mod tests {
             target_context: "ctx-target".to_owned(),
             outlet_id: "calculator".to_owned(),
             rate_limit: None,
+            inbound_rate_limit: None,
             per_caller_rate_limit: None,
             approved_by_source: false,
             approved_by_target: false,
@@ -2508,6 +2530,7 @@ mod tests {
                 Duration::from_secs(1),
                 &scp_clock::SystemClock,
             )),
+            inbound_rate_limit: None,
             per_caller_rate_limit: None,
             approved_by_source: true,
             approved_by_target: true,
@@ -2588,6 +2611,7 @@ mod tests {
             target_context: "ctx-target".to_owned(),
             outlet_id: "calculator".to_owned(),
             rate_limit: None,
+            inbound_rate_limit: None,
             per_caller_rate_limit: None,
             approved_by_source: true,
             approved_by_target: true,
@@ -2656,6 +2680,7 @@ mod tests {
             target_context: "ctx-target".to_owned(),
             outlet_id: "calculator".to_owned(),
             rate_limit: None,
+            inbound_rate_limit: None,
             per_caller_rate_limit: None,
             approved_by_source: true,
             approved_by_target: true,
@@ -2700,6 +2725,7 @@ mod tests {
             target_context: "ctx-target".to_owned(),
             outlet_id: "calculator".to_owned(),
             rate_limit: None,
+            inbound_rate_limit: None,
             per_caller_rate_limit: None,
             approved_by_source: true,
             approved_by_target: true,
@@ -2787,6 +2813,7 @@ mod tests {
                 Duration::from_mins(2),
                 &scp_clock::SystemClock,
             )),
+            inbound_rate_limit: None,
             per_caller_rate_limit: None,
             approved_by_source: true,
             approved_by_target: false,
@@ -2844,6 +2871,7 @@ mod tests {
             target_context: "ctx-target".to_owned(),
             outlet_id: "calculator".to_owned(),
             rate_limit: None,
+            inbound_rate_limit: None,
             per_caller_rate_limit: None,
             approved_by_source: true,
             approved_by_target: true,
@@ -2893,6 +2921,7 @@ mod tests {
             target_context: "ctx-target".to_owned(),
             outlet_id: "calculator".to_owned(),
             rate_limit: None,
+            inbound_rate_limit: None,
             per_caller_rate_limit: None,
             approved_by_source: true,
             approved_by_target: true,
@@ -2938,6 +2967,7 @@ mod tests {
             target_context: "ctx-target".to_owned(),
             outlet_id: "calculator".to_owned(),
             rate_limit: None,
+            inbound_rate_limit: None,
             per_caller_rate_limit: None,
             approved_by_source: true,
             approved_by_target: true,
@@ -3138,6 +3168,7 @@ mod tests {
             target_context: "ctx-target".to_owned(),
             outlet_id: "calculator".to_owned(),
             rate_limit: None,
+            inbound_rate_limit: None,
             per_caller_rate_limit: None,
             approved_by_source: true,
             approved_by_target: true,
@@ -3387,6 +3418,7 @@ mod tests {
                 Duration::from_secs(1),
                 &scp_clock::SystemClock,
             )),
+            inbound_rate_limit: None,
             per_caller_rate_limit: None,
             approved_by_source: true,
             approved_by_target: true,
@@ -3638,6 +3670,7 @@ mod tests {
             target_context: "ctx-target".to_owned(),
             outlet_id: "calculator".to_owned(),
             rate_limit: None,
+            inbound_rate_limit: None,
             per_caller_rate_limit: None,
             approved_by_source: true,
             approved_by_target: true,
@@ -3702,6 +3735,7 @@ mod tests {
             target_context: "ctx-target".to_owned(),
             outlet_id: "calculator".to_owned(),
             rate_limit: None,
+            inbound_rate_limit: None,
             per_caller_rate_limit: None,
             approved_by_source: true,
             approved_by_target: true,
@@ -4174,6 +4208,7 @@ mod tests {
             target_context: "ctx-target".to_owned(),
             outlet_id: "query-outlet".to_owned(),
             rate_limit: None,
+            inbound_rate_limit: None,
             per_caller_rate_limit: None,
             approved_by_source: true,
             approved_by_target: false,
@@ -4210,6 +4245,7 @@ mod tests {
             target_context: "ctx-target".to_owned(),
             outlet_id: "action-outlet".to_owned(),
             rate_limit: None,
+            inbound_rate_limit: None,
             per_caller_rate_limit: None,
             approved_by_source: true,
             approved_by_target: false,
@@ -4244,6 +4280,7 @@ mod tests {
             target_context: "ctx-target".to_owned(),
             outlet_id: "outlet".to_owned(),
             rate_limit: None,
+            inbound_rate_limit: None,
             per_caller_rate_limit: None,
             approved_by_source: true,
             approved_by_target: false,

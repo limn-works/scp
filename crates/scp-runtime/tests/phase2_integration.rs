@@ -260,16 +260,19 @@ async fn phase2_end_to_end_integration() {
         ],
         tools: vec![OutletRegistration {
             outlet_id: "calculator".to_owned(),
+            kind: scp_protocol::context::outlets::OutletKind::default(),
             name: "calculator".to_owned(),
             description: "Calculator tool".to_owned(),
             schema: OutletSchema {
                 input_schema: serde_json::json!({"type": "object"}),
                 output_schema: serde_json::json!({"type": "object"}),
+                aggregate_schema: None,
             },
             implementation_hash: [0u8; 32],
             test_vectors: vec![],
             operator_did: "did:dht:z6MkTestOperator".into(),
             cost: None,
+            message_catalog: Vec::new(),
             registered_at: 0,
             signature: Vec::new(),
         }],
@@ -302,6 +305,7 @@ async fn phase2_end_to_end_integration() {
     let mut tool_registry = OutletRegistry::new();
     let calc_registration = OutletRegistration {
         outlet_id: "calculator".to_owned(),
+        kind: scp_protocol::context::outlets::OutletKind::default(),
         name: "Calculator".to_owned(),
         description: "A simple arithmetic calculator".to_owned(),
         schema: OutletSchema {
@@ -319,11 +323,13 @@ async fn phase2_end_to_end_integration() {
                     "result": {"type": "number"}
                 }
             }),
+            aggregate_schema: None,
         },
         implementation_hash: [0xAB; 32],
         test_vectors: vec![],
         operator_did: alice_did.clone(),
         cost: None,
+        message_catalog: Vec::new(),
         registered_at: 0,
         signature: Vec::new(),
     };

@@ -4708,8 +4708,7 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
             )
             .map_err(|msg| format!("input validation failed for outlet '{outlet_name}': {msg}"))?;
 
-            let input_hash = scp_core::context::outlets::sha256_json(&arguments)
-                .map_err(|e| format!("input hash canonicalization failed: {e}"))?;
+            let input_hash = scp_core::context::outlets::sha256_json(&arguments);
 
             let handler_dispatch = {
                 let outlet_handlers = handle.outlet_handlers.blocking_lock();
@@ -4785,11 +4784,15 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
             status: scp_core::context::outlets::OutletStatus::Success,
             execution_time_ms: elapsed_ms,
             input_hash,
-            output_hash: Some(
-                scp_core::context::outlets::sha256_json(&output)
-                    .map_err(|e| format!("output hash canonicalization failed: {e}"))?,
-            ),
+            output_hash: Some(scp_core::context::outlets::sha256_json(&output)),
             cost: None,
+            // Non-streaming bridge invocation: degenerate/no-manifest
+            // streaming-field defaults matching the lifecycle serde defaults.
+            stream_chunk_count: 0,
+            chunks_billed: 0,
+            stream_manifest_hash: [0u8; 32],
+            stream_terminal_status: scp_core::context::outlets::stream::StreamTerminalStatus::Ok,
+            audit_anomaly: None,
         };
 
         let payload_data = serde_json::to_vec(&outlet_event).unwrap_or_default();
@@ -12658,16 +12661,19 @@ impl Scp {
 
                 let core_registration = scp_core::context::outlets::OutletRegistration {
                     outlet_id: outlet_id.clone(),
+                    kind: scp_core::context::outlets::OutletKind::default(),
                     name: definition.name,
                     description: definition.description,
                     schema: scp_core::context::outlets::OutletSchema {
                         input_schema,
                         output_schema,
+                        aggregate_schema: None,
                     },
                     implementation_hash,
                     test_vectors,
                     operator_did: definition.operator_did.into(),
                     cost,
+                    message_catalog: Vec::new(),
                     registered_at: scp_clock::Clock::now_secs(&scp_clock::SystemClock),
                     signature: Vec::new(),
                 };
@@ -13631,7 +13637,7 @@ impl Scp {
 
                 let registry = handle.outlet_registry.lock().await;
 
-                let interface = scp_core::context::outlets::interface::expose_outlet(
+                let interface = scp_core::context::outlets::interface::expose_tool(
                     context_handle.context_id(),
                     &outlet_id,
                     &target_context_id,
@@ -13642,7 +13648,7 @@ impl Scp {
                     None,
                 )
                 .map_err(|e| ScpError::Outlet {
-                    msg: format!("expose_outlet failed: {e}"),
+                    msg: format!("expose_tool failed: {e}"),
                     code: codes::OUTLET_6030.to_owned(),
                 })?;
 
@@ -13709,7 +13715,7 @@ impl Scp {
                     scp_core::context::ContextParams::default(),
                 );
 
-                scp_core::context::outlets::interface::accept_outlet_interface(
+                scp_core::context::outlets::interface::accept_tool_interface(
                     context_handle.context_id(),
                     &mut interface,
                     &role_state,
@@ -13717,7 +13723,7 @@ impl Scp {
                     None,
                 )
                 .map_err(|e| ScpError::Outlet {
-                    msg: format!("accept_outlet_interface failed: {e}"),
+                    msg: format!("accept_tool_interface failed: {e}"),
                     code: codes::OUTLET_6032.to_owned(),
                 })?;
 
@@ -13764,7 +13770,7 @@ impl Scp {
 
                 let now_ms = scp_clock::SystemClock.now_millis();
 
-                let event = scp_core::context::outlets::interface::revoke_outlet_interface(
+                let event = scp_core::context::outlets::interface::revoke_tool_interface(
                     interface_id,
                     &handle.context_id,
                     now_ms,

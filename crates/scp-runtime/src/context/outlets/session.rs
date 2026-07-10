@@ -475,6 +475,7 @@ mod tests {
         let mut registry = OutletRegistry::new();
         let registration = OutletRegistration {
             outlet_id: "calculator".to_owned(),
+            kind: scp_protocol::context::outlets::OutletKind::default(),
             name: "Calculator".to_owned(),
             description: "A simple calculator".to_owned(),
             schema: OutletSchema {
@@ -491,11 +492,13 @@ mod tests {
                         "result": {"type": "number"}
                     }
                 }),
+                aggregate_schema: None,
             },
             implementation_hash: [0xAA; 32],
             test_vectors: vec![],
             operator_did: "did:dht:z6MkOperator".into(),
             cost: None,
+            message_catalog: Vec::new(),
             registered_at: 0,
             signature: Vec::new(),
         };

@@ -117,16 +117,19 @@ fn simple_economic_policy() -> EconomicPolicy {
 fn simple_outlet_registration() -> scp_core::context::params::OutletRegistration {
     scp_core::context::params::OutletRegistration {
         outlet_id: "search".to_owned(),
+        kind: scp_core::context::outlets::OutletKind::default(),
         name: "search".to_owned(),
         description: "Search tool".to_owned(),
         schema: OutletSchema {
             input_schema: serde_json::json!({"type": "object"}),
             output_schema: serde_json::json!({"type": "object"}),
+            aggregate_schema: None,
         },
         implementation_hash: [0u8; 32],
         test_vectors: vec![],
         operator_did: DID::from("did:dht:z6MkTestOperator"),
         cost: None,
+        message_catalog: Vec::new(),
         registered_at: 0,
         signature: Vec::new(),
     }

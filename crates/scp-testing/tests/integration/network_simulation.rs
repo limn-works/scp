@@ -1344,6 +1344,7 @@ async fn application_layer_demo() {
 
     let search_tool = OutletRegistration {
         outlet_id: "search-web".to_owned(),
+        kind: scp_core::context::outlets::OutletKind::default(),
         name: "Web Search".to_owned(),
         description: "Search the web for information".to_owned(),
         schema: OutletSchema {
@@ -1365,11 +1366,13 @@ async fn application_layer_demo() {
                     "total": { "type": "integer" }
                 }
             }),
+            aggregate_schema: None,
         },
         implementation_hash: [0xAB; 32],
         test_vectors: vec![],
         operator_did: alice.clone(),
         cost: None,
+        message_catalog: Vec::new(),
         registered_at: 1_700_000_000,
         signature: vec![],
     };
@@ -1395,6 +1398,7 @@ async fn application_layer_demo() {
     // Register a second tool.
     let calc_tool = OutletRegistration {
         outlet_id: "calculator".to_owned(),
+        kind: scp_core::context::outlets::OutletKind::default(),
         name: "Calculator".to_owned(),
         description: "Perform arithmetic operations".to_owned(),
         schema: OutletSchema {
@@ -1413,11 +1417,13 @@ async fn application_layer_demo() {
                     "operation": { "type": "string" }
                 }
             }),
+            aggregate_schema: None,
         },
         implementation_hash: [0xCD; 32],
         test_vectors: vec![],
         operator_did: alice.clone(),
         cost: None,
+        message_catalog: Vec::new(),
         registered_at: 1_700_000_001,
         signature: vec![],
     };
