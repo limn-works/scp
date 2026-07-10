@@ -576,19 +576,19 @@ OP_SIGN_MESSAGE = OpSpec(
 # ---------------------------------------------------------------------------
 # op 6: outlet_register
 #
-# Register a single tool in a fresh context. The tool_id is derived
-# deterministically across all three bridges from the tool name via the
-# shared `format!("tool-{}", name.replace(' ', "-").to_lowercase())`
+# Register a single outlet in a fresh context. The outlet_id is derived
+# deterministically across all three bridges from the outlet name via the
+# shared `format!("outlet-{}", name.replace(' ', "-").to_lowercase())`
 # convention (see scp-ffi/src/outlets.rs, scp-ffi/napi/src/outlets.rs,
 # scp-ffi/uniffi/src/bridge.rs — all three
-# use the same format). That makes tool_id byte-exact for parity.
+# use the same format). That makes outlet_id byte-exact for parity.
 # ---------------------------------------------------------------------------
 
 
 # Ceiling must include `tool:register` to permit the registration action.
 _OUTLET_CEILING = ["messages:read", "messages:write", "tool:register", "tool_invoke:*"]
 _OUTLET_NAME = "parity_probe"
-_EXPECTED_OUTLET_ID = f"tool-{_OUTLET_NAME}"
+_EXPECTED_OUTLET_ID = f"outlet-{_OUTLET_NAME}"
 _OUTLET_SCHEMA: dict[str, Any] = {
     "input_schema": {
         "type": "object",
@@ -632,7 +632,7 @@ OP_OUTLET_REGISTER = OpSpec(
         },
     },
     schema=OpSchema(fields=(FieldSpec("outlet_id", "exact"),)),
-    # Spec-pin the derivation: `tool-{name-lowercased-spaces-to-dashes}`.
+    # Spec-pin the derivation: `outlet-{name-lowercased-spaces-to-dashes}`.
     # Joint drift (e.g. all bridges hash instead of format) would pass
     # parity step 3 but violate the shared convention; this locks it.
     expected_values=(("outlet_id", _EXPECTED_OUTLET_ID),),
