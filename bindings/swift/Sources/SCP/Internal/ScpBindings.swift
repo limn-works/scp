@@ -2108,8 +2108,13 @@ public protocol ScpProtocol: AnyObject, Sendable {
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
+     *
+     * For a GATED broadcast context, `messages_read_ucan_jwt` MUST carry the
+     * `messages:read` JWT issued to `subscriber_did` by the context admin/creator
+     * (spec §5.14.4); the actor runs the full UCAN validation pipeline on it
+     * (spec §07:70). It is unused for an OPEN context.
      */
-    func broadcastSubscribe(handle: ContextHandle, subscriberDid: String) async throws 
+    func broadcastSubscribe(handle: ContextHandle, subscriberDid: String, messagesReadUcanJwt: String?) async throws 
     
     /**
      * Per-instance equivalent of the free-function
@@ -3989,14 +3994,19 @@ open func broadcastPublishAssets(handle: ContextHandle, identity: Identity, asse
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
+     *
+     * For a GATED broadcast context, `messages_read_ucan_jwt` MUST carry the
+     * `messages:read` JWT issued to `subscriber_did` by the context admin/creator
+     * (spec §5.14.4); the actor runs the full UCAN validation pipeline on it
+     * (spec §07:70). It is unused for an OPEN context.
      */
-open func broadcastSubscribe(handle: ContextHandle, subscriberDid: String)async throws   {
+open func broadcastSubscribe(handle: ContextHandle, subscriberDid: String, messagesReadUcanJwt: String?)async throws   {
     return
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_scp_ffi_uniffi_fn_method_scp_broadcast_subscribe(
                     self.uniffiClonePointer(),
-                    FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(subscriberDid)
+                    FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(subscriberDid),FfiConverterOptionString.lower(messagesReadUcanJwt)
                 )
             },
             pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
@@ -17032,7 +17042,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_broadcast_publish_assets() != 39568) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_broadcast_subscribe() != 57536) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_broadcast_subscribe() != 2676) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_broadcast_subscriber_count() != 53302) {

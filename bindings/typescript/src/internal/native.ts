@@ -369,11 +369,18 @@ export function createNativeBridge(scp: SCP): Bridge {
     },
 
     // Broadcast operations
-    async broadcastSubscribe(handle: BridgeContextHandle, subscriberDid: string): Promise<void> {
-      await (native.broadcastSubscribe as (h: BridgeContextHandle, d: string) => Promise<void>)(
-        handle,
-        subscriberDid,
-      );
+    async broadcastSubscribe(
+      handle: BridgeContextHandle,
+      subscriberDid: string,
+      messagesReadUcanJwt?: string,
+    ): Promise<void> {
+      await (
+        native.broadcastSubscribe as (
+          h: BridgeContextHandle,
+          d: string,
+          u?: string,
+        ) => Promise<void>
+      )(handle, subscriberDid, messagesReadUcanJwt);
     },
 
     async broadcastUnsubscribe(

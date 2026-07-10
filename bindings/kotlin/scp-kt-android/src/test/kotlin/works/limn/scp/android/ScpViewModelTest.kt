@@ -226,7 +226,7 @@ private class TestNativeBindings : NativeBindings {
     override fun restoreAllContexts(): String = "[]"
 
     // BroadcastBindings
-    override fun broadcastSubscribe(contextHandle: Long, subscriberDid: String) = Unit
+    override fun broadcastSubscribe(contextHandle: Long, subscriberDid: String, messagesReadUcanJwt: String?) = Unit
     override fun broadcastUnsubscribe(contextHandle: Long, subscriberDid: String, rotateKeys: Boolean) = Unit
     override fun broadcastPublish(contextHandle: Long, identityHandle: Long, payload: ByteArray) = Unit
     override fun broadcastBlockSubscriber(contextHandle: Long, subscriberDid: String, blockerDid: String) = Unit

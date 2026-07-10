@@ -11521,15 +11521,34 @@ impl Scp {
     ///
     /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
     /// `instance_id` does not match this `SCP`'s.
+    ///
+    /// For a GATED broadcast context, `messages_read_ucan_jwt` MUST carry the
+    /// `messages:read` JWT issued to `subscriber_did` by the context admin/creator
+    /// (spec §5.14.4); the actor runs the full UCAN validation pipeline on it
+    /// (spec §07:70). It is unused for an OPEN context.
     pub async fn broadcast_subscribe(
         &self,
         handle: Arc<ContextHandle>,
         subscriber_did: String,
+        messages_read_ucan_jwt: Option<String>,
     ) -> Result<(), ScpError> {
         self.inner
             .core
             .check_handle(handle.instance_id())
             .map_err(ScpError::from)?;
+        // Parse the optional gated-admission `messages:read` UCAN JWT at the
+        // bridge boundary so a malformed token is rejected before dispatch.
+        let ucan_token = messages_read_ucan_jwt
+            .as_deref()
+            .map(|jwt| {
+                scp_core::crypto::ucan::validate::parse_ucan(jwt).map_err(|e| {
+                    ScpError::Permission {
+                        msg: format!("invalid messages:read UCAN: {e}"),
+                        code: codes::PERM_3002.to_owned(),
+                    }
+                })
+            })
+            .transpose()?;
         let bi = Arc::clone(&self.inner);
         runtime()
             .spawn(async move {
@@ -11545,7 +11564,7 @@ impl Scp {
                     payload: Box::new(SubscribeBroadcastPayload {
                         context_id: handle.context_id.clone(),
                         subscriber_did: did,
-                        ucan: None,
+                        ucan: ucan_token,
                         timestamp,
                     }),
                     reply: tx,

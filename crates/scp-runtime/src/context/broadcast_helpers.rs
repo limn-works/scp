@@ -79,6 +79,43 @@ where
         .params()
         .check_version_compatibility(scp_protocol::envelope::SCP_PROTOCOL_VERSION)?;
 
+    // Governance-ban admission gate (spec §5.14.4 / §5.14.8, #2088), fail-closed
+    // BEFORE any roster mutation or `MemberJoined` leaf.
+    //
+    // AUTHORITATIVE check: the durable `banned_subscribers` record on the
+    // broadcast context. A governance ban (`execute_revoke{Read}` →
+    // `governance_ban_subscriber`) removes the DID from the roster AND records it
+    // here; this record is INDEPENDENT of the subscriber registry and of
+    // `read_exclusion_list`, and is cleared ONLY by an authority via
+    // `RestoreAccess` — so it survives the banned subject's OWN self-leave and a
+    // subsequent admin `RemoveMember` (both of which clear `read_exclusion_list`
+    // for §5.6.1/§5.9 hygiene). This closes the replay-after-leave laundering the
+    // review found: a banned DID that self-leaves to clear its exclusion still
+    // cannot re-subscribe by replaying a retained `messages:read` UCAN. (The
+    // protocol `subscribe` also enforces this by construction; this is the early,
+    // uniform-reason gate.)
+    //
+    // DEFENSE-IN-DEPTH: `read_exclusion_list` still catches a STILL-PRESENT
+    // read-revoked member (§5.9 keeps them a member; they are excluded from CEK
+    // wrapping but not yet in `banned_subscribers` if never a broadcast
+    // subscriber). Both return the uniform
+    // [`SUBSCRIBE_DENY_REASON`](scp_protocol::context::broadcast::SUBSCRIBE_DENY_REASON)
+    // so the rejection does not disclose ban status.
+    if cell
+        .broadcast_context
+        .as_ref()
+        .is_some_and(|bc| bc.is_banned(subscriber_did.as_ref()))
+    {
+        return Err(ContextError::PermissionDenied(
+            scp_protocol::context::broadcast::SUBSCRIBE_DENY_REASON.to_owned(),
+        ));
+    }
+    if cell.access.read_exclusion_list.contains(subscriber_did) {
+        return Err(ContextError::PermissionDenied(
+            scp_protocol::context::broadcast::SUBSCRIBE_DENY_REASON.to_owned(),
+        ));
+    }
+
     // All in-state mutations below are Class-C (broadcast subscriber roster
     // ADD, broadcast metadata, receive buffer, checkpoint counter) with the
     // best-effort persist below — routed through the non-persisting Class-C
@@ -733,24 +770,40 @@ pub fn handle_broadcast_key_request(
         )));
     }
 
-    // Serve-path exclusion consult (defense-in-depth, §5.14.8 block-before-serve).
-    // A governance ban writes `read_exclusion_list` (Class-S, fail-closed) AND
-    // inserts the banned DID into every author's block list; both now ride the
-    // same fail-closed `ContextSnapshot`. Consult `read_exclusion_list` HERE before
-    // delegating so a banned/read-excluded requester is denied even on the narrow
-    // window where the per-author block list and the exclusion set could disagree
-    // (e.g. an author registered after the ban). Uses the SAME uniform deny reason
-    // as the protocol so denial causes stay indistinguishable (non-leakage).
-    if cell.access.read_exclusion_list.contains(requester_did) {
+    let bc = cell
+        .broadcast_context
+        .as_ref()
+        .ok_or_else(|| ContextError::MembershipFailed("not a broadcast context".into()))?;
+
+    // Durable-ban serve-path gate (§5.14.8, #2088 / BLACK-303), fail-closed before
+    // any grant. AUTHORITATIVE: the durable `banned_subscribers` record — the same
+    // authority-only-clearable signal the subscribe-admission gate uses. This
+    // catches a banned DID whom NEITHER other signal covers: a banned AUTHOR (the
+    // context creator is always an author) is never on any block list (a
+    // non-subscriber ban writes no block-list entry) and, once they self-leave,
+    // is no longer in `read_exclusion_list`. `BroadcastContext::handle_key_request`
+    // enforces this by construction for all callers; this early check keeps the
+    // runtime serve path symmetric with subscribe. Uses the uniform reason
+    // (non-leakage).
+    if bc.is_banned(requester_did.as_ref()) {
         return Ok(KeyRequestDecision::Deny {
             reason: scp_protocol::context::broadcast::KEY_REQUEST_DENY_REASON.to_owned(),
         });
     }
 
-    let bc = cell
-        .broadcast_context
-        .as_ref()
-        .ok_or_else(|| ContextError::MembershipFailed("not a broadcast context".into()))?;
+    // Serve-path exclusion consult (defense-in-depth, §5.14.8 block-before-serve)
+    // for a STILL-PRESENT read-revoked member: `read_exclusion_list` is written
+    // fail-closed on `RevokeAccess{Read}` and consulted here before the per-author
+    // block-list check. Unlike the durable ban above, this entry is CLEARED when
+    // the subject self-leaves, so it is a defense-in-depth complement — NOT the
+    // authoritative durable signal. Uses the SAME uniform deny reason (non-leakage).
+    // Disjoint shared borrow of `cell.access` (a different field than
+    // `broadcast_context`), so `bc` stays valid for the delegation below.
+    if cell.access.read_exclusion_list.contains(requester_did) {
+        return Ok(KeyRequestDecision::Deny {
+            reason: scp_protocol::context::broadcast::KEY_REQUEST_DENY_REASON.to_owned(),
+        });
+    }
 
     Ok(bc.handle_key_request(author_did, requester_did, wrapping_pubkey))
 }

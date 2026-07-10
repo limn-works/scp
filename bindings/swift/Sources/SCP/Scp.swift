@@ -341,8 +341,21 @@ public extension SCP {
     }
 
     /// Forwards to ``Scp/broadcastSubscribe`` on ``inner``.
-    func broadcastSubscribe(handle: ContextHandle, subscriberDid: String) async throws {
-        try await inner.broadcastSubscribe(handle: handle, subscriberDid: subscriberDid)
+    ///
+    /// For a GATED broadcast context, `messagesReadUcanJwt` must carry the
+    /// `messages:read` UCAN JWT issued to `subscriberDid` by the context
+    /// admin/creator (spec §5.14.4); the full UCAN validation pipeline runs on it.
+    /// It is unused for an OPEN context.
+    func broadcastSubscribe(
+        handle: ContextHandle,
+        subscriberDid: String,
+        messagesReadUcanJwt: String? = nil
+    ) async throws {
+        try await inner.broadcastSubscribe(
+            handle: handle,
+            subscriberDid: subscriberDid,
+            messagesReadUcanJwt: messagesReadUcanJwt
+        )
     }
 
     /// Forwards to ``Scp/broadcastSubscriberCount`` on ``inner``.
