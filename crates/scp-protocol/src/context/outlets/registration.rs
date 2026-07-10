@@ -375,10 +375,10 @@ impl OutletRegistration {
 mod tests {
     use super::*;
     use crate::context::outlets::hash::{catalog_hash, description_hash, schema_hash};
-    use crate::economy::types::Amount;
     use crate::context::outlets::message_catalog::{
         CATALOG_MAX_ENTRIES, MessageTemplate, empty_catalog_messagepack,
     };
+    use crate::economy::types::Amount;
     use ed25519_dalek::{Signer, SigningKey};
     use serde_json::json;
     use sha2::{Digest, Sha256};

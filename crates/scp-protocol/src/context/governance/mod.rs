@@ -2319,6 +2319,7 @@ mod tests {
                     target_context: "ctx-tgt".to_owned(),
                     outlet_id: "tool-1".to_owned(),
                     rate_limit: None,
+                    inbound_rate_limit: None,
                     per_caller_rate_limit: None,
                     approved_by_source: true,
                     approved_by_target: false,

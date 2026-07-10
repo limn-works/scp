@@ -17,7 +17,6 @@ pub mod sync;
 pub mod trust;
 pub mod uri;
 
-
 // Outlet surface re-exports (SCP-OUT-002, AC-5). `OutletId` is exported from
 // [`context::roles`]; the remaining types come from [`context::outlets`] and
 // its submodules. See §5.4.1, §5.4.5, and ADR-049.
@@ -33,6 +32,7 @@ pub mod uri;
 //   and summary into `ContextSummary` (shared with other context facets).
 //   All the concrete types are re-exported below so every story-named facade
 //   is reachable from the crate root.
+pub use context::outlets::OutletId;
 pub use context::outlets::integrity::OutletVerificationSchedule;
 pub use context::outlets::interface::OutletInterface;
 pub use context::outlets::message_catalog::{
@@ -57,7 +57,6 @@ pub use context::outlets::{
     OutletCancel, OutletError, OutletInvokedEvent, OutletKind, OutletRegisteredEvent,
     OutletRequest, OutletStatus, OutletUpdatedEvent, OutletVerifiedEvent, OutletVerifiedReason,
 };
-pub use context::outlets::OutletId;
 
 // Typed §5.4.4 OutletError envelope and supporting types (SCP-OUT-024 / ADR-049
 // §4). The `errors` submodule provides the typed envelope struct under that

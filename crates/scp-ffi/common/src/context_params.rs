@@ -288,16 +288,19 @@ fn build_outlets(outlets: &[String]) -> Vec<OutletRegistration> {
         .iter()
         .map(|name| OutletRegistration {
             outlet_id: name.clone(),
+            kind: scp_core::context::outlets::OutletKind::default(),
             name: name.clone(),
             description: String::new(),
             schema: scp_core::context::outlets::OutletSchema {
                 input_schema: serde_json::Value::Object(serde_json::Map::default()),
                 output_schema: serde_json::Value::Object(serde_json::Map::default()),
+                aggregate_schema: None,
             },
             implementation_hash: [0u8; 32],
             test_vectors: vec![],
             operator_did: scp_did::DID("did:key:placeholder".to_owned()),
             cost: None,
+            message_catalog: Vec::new(),
             registered_at: 0,
             signature: Vec::new(),
         })

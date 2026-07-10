@@ -246,16 +246,19 @@ pub(crate) async fn outlet_register_on(
 
     let core_registration = scp_core::context::outlets::OutletRegistration {
         outlet_id,
+        kind: scp_core::context::outlets::OutletKind::default(),
         name: definition.name,
         description: definition.description,
         schema: scp_core::context::outlets::OutletSchema {
             input_schema,
             output_schema,
+            aggregate_schema: None,
         },
         implementation_hash,
         test_vectors,
         operator_did: definition.operator_did.into(),
         cost,
+        message_catalog: Vec::new(),
         registered_at: scp_clock::Clock::now_secs(&scp_clock::SystemClock),
         signature: Vec::new(),
     };
@@ -1296,7 +1299,7 @@ pub(crate) async fn outlet_interface_expose_on(
             scp_core::context::ContextParams::default(),
         );
 
-        let interface = scp_core::context::outlets::interface::expose_outlet(
+        let interface = scp_core::context::outlets::interface::expose_tool(
             context_handle.context_id(),
             &outlet_id,
             &target_context_id,
@@ -1307,7 +1310,7 @@ pub(crate) async fn outlet_interface_expose_on(
             None,
         )
         .map_err(|e| ScpNapiError::Outlet {
-            message: format!("expose_outlet failed: {e}"),
+            message: format!("expose_tool failed: {e}"),
             code: codes::OUTLET_6030.to_owned(),
         })?;
 
@@ -1355,7 +1358,7 @@ pub(crate) async fn outlet_interface_accept_on(
             scp_core::context::ContextParams::default(),
         );
 
-        scp_core::context::outlets::interface::accept_outlet_interface(
+        scp_core::context::outlets::interface::accept_tool_interface(
             context_handle.context_id(),
             &mut interface,
             &rt.role_state,
@@ -1363,7 +1366,7 @@ pub(crate) async fn outlet_interface_accept_on(
             None,
         )
         .map_err(|e| ScpNapiError::Outlet {
-            message: format!("accept_outlet_interface failed: {e}"),
+            message: format!("accept_tool_interface failed: {e}"),
             code: codes::OUTLET_6032.to_owned(),
         })?;
 
@@ -1404,7 +1407,7 @@ pub(crate) async fn outlet_interface_revoke_on(
 
     let now_ms = scp_clock::SystemClock.now_millis();
 
-    let event = scp_core::context::outlets::interface::revoke_outlet_interface(
+    let event = scp_core::context::outlets::interface::revoke_tool_interface(
         interface_id,
         &context_id,
         now_ms,

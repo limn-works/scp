@@ -1543,16 +1543,19 @@ mod tests {
         let action = GovernanceAction::RegisterTool {
             registration: Box::new(OutletRegistration {
                 outlet_id: "test-outlet".to_owned(),
+                kind: scp_protocol::context::outlets::OutletKind::default(),
                 name: "outlet-{inject}".to_owned(),
                 description: "an outlet".to_owned(),
                 schema: OutletSchema {
                     input_schema: serde_json::json!({"type": "object"}),
                     output_schema: serde_json::json!({"type": "object"}),
+                    aggregate_schema: None,
                 },
                 implementation_hash: [0u8; 32],
                 test_vectors: vec![],
                 operator_did: scp_did::DID("did:dht:z6MkTest".to_owned()),
                 cost: None,
+                message_catalog: Vec::new(),
                 registered_at: 0,
                 signature: vec![],
             }),
@@ -1569,16 +1572,19 @@ mod tests {
         let action = GovernanceAction::RegisterTool {
             registration: Box::new(OutletRegistration {
                 outlet_id: "test-outlet".to_owned(),
+                kind: scp_protocol::context::outlets::OutletKind::default(),
                 name: "my-outlet".to_owned(),
                 description: "a <script>alert(1)</script> outlet".to_owned(),
                 schema: OutletSchema {
                     input_schema: serde_json::json!({"type": "object"}),
                     output_schema: serde_json::json!({"type": "object"}),
+                    aggregate_schema: None,
                 },
                 implementation_hash: [0u8; 32],
                 test_vectors: vec![],
                 operator_did: scp_did::DID("did:dht:z6MkTest".to_owned()),
                 cost: None,
+                message_catalog: Vec::new(),
                 registered_at: 0,
                 signature: vec![],
             }),

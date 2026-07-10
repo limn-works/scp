@@ -44,6 +44,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut registry = OutletRegistry::new();
     let registration = OutletRegistration {
         outlet_id: "calculator".to_owned(),
+        kind: scp_protocol::context::outlets::OutletKind::default(),
         name: "Calculator".to_owned(),
         description: "A simple arithmetic calculator".to_owned(),
         schema: OutletSchema {
@@ -63,11 +64,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 },
                 "required": ["result"]
             }),
+            aggregate_schema: None,
         },
         implementation_hash: [0xAA; 32],
         test_vectors: vec![],
         operator_did: creator.clone(),
         cost: None,
+        message_catalog: Vec::new(),
         registered_at: 0,
         signature: Vec::new(),
     };
