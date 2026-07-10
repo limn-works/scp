@@ -994,7 +994,7 @@ mod tests {
         .await
         .unwrap();
 
-        // First call by creator (has ToolInvokeAll) -- should succeed.
+        // First call by creator (has OutletCallAll) -- should succeed.
         let result = invoke_session(
             &mut store,
             &registry,

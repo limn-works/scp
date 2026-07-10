@@ -1895,7 +1895,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // ToolInvokeAll covers ToolInvoke in ceiling/role validation
+    // OutletCallAll covers OutletCall in ceiling/role validation
     // -----------------------------------------------------------------------
 
     #[test]
@@ -1916,7 +1916,7 @@ mod tests {
         };
         sign_declaration(&mut decl, &signing_key).unwrap();
 
-        // Ceiling has ToolInvokeAll, not the specific tool.
+        // Ceiling has OutletCallAll, not the specific tool.
         let ceiling = vec![Capability::OutletCallAll];
         let role_caps = vec![Capability::OutletCallAll];
         let handle = ContextHandle::new("ctx-1".to_owned(), ContextParams::default());

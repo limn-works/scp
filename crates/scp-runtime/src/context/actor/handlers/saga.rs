@@ -55,7 +55,9 @@
 use scp_did::DID;
 use scp_protocol::context::ContextError;
 use scp_protocol::crypto::ucan::UcanToken;
-use scp_protocol::crypto::ucan::validate::{DEFAULT_CLOCK_SKEW_TOLERANCE_SECS, ValidationContext};
+use scp_protocol::crypto::ucan::validate::{
+    DEFAULT_CLOCK_SKEW_TOLERANCE_SECS, NoCaveatResolver, ValidationContext,
+};
 
 use scp_protocol::context::outlets::cross_context_saga::{
     CommittedSide, CrossContextDivergenceMarker, CrossContextDivergenceMarkerFields,
@@ -663,7 +665,7 @@ fn validate_outbound_caller(
     // `tool:interface` capability (the caller is authorized to USE interfaces).
     if !state
         .role_state
-        .member_has_capability(caller_did.as_ref(), &Capability::ToolInterface)
+        .member_has_capability(caller_did.as_ref(), &Capability::OutletInterface)
     {
         return Err(saga_reject!(
             13010,
@@ -1170,11 +1172,11 @@ fn validate_ucan_rebind(
             )
         })?;
 
-    // Required capability bound to B's OWN context + THIS tool + tool_invoke.
+    // Required capability bound to B's OWN context + THIS tool + outlet_call.
     let target_hex = hex_context_id(&req.target_context_id);
     let required_cap = CapabilityUri::new(
         target_hex,
-        "tool_invoke",
+        "outlet_call",
         req.outlet_registration_id.clone(),
     );
 
@@ -1212,6 +1214,11 @@ fn validate_ucan_rebind(
         presenting_agent_did: req.caller_did.as_ref(),
         clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
         clock: deps.clock.as_ref(),
+        // Cross-context saga RE-VALIDATION of a stored delegation proof feeds
+        // the generic `validate_ucan` pipeline — NOT the outlet-open path — so
+        // caveats are resolved by the no-op resolver (classification: generic
+        // re-validation ⇒ NoCaveatResolver).
+        caveat_resolver: &NoCaveatResolver,
     };
 
     validate_ucan(&token, &required_cap, &mut ctx).map_err(|e| {
@@ -3175,19 +3182,19 @@ mod tests {
             .expect("active");
         // creator_did binds the UCAN root issuer (validate_ucan step 4).
         st.role_state.creator_did = creator.to_owned();
-        // Grant the caller OutletInterface + ToolInvokeAll so both the outbound
-        // capability gate and the ceiling (tool_invoke:*) admit the proof.
+        // Grant the caller OutletInterface + OutletCallAll so both the outbound
+        // capability gate and the ceiling (outlet_call:*) admit the proof.
         st.role_state.members.insert(member.to_owned());
         let mut caps = HashSet::new();
-        caps.insert(Capability::ToolInterface);
-        caps.insert(Capability::ToolInvokeAll);
+        caps.insert(Capability::OutletInterface);
+        caps.insert(Capability::OutletCallAll);
         st.role_state
             .member_capabilities
             .insert(member.to_owned(), caps);
         st.role_state
             .set_ceiling(scp_protocol::context::roles::CapabilityCeiling::new([
-                Capability::ToolInterface,
-                Capability::ToolInvokeAll,
+                Capability::OutletInterface,
+                Capability::OutletCallAll,
             ]))
             .expect("well-formed built-in ceiling");
         st.governance.registered_outlets.push(OutletRegistration {
@@ -3217,7 +3224,7 @@ mod tests {
         st
     }
 
-    /// Mint a UCAN with `tool_invoke:TOOL` capability, issued by `creator`
+    /// Mint a UCAN with `outlet_call:TOOL` capability, issued by `creator`
     /// (the context creator = root issuer) to `audience`, scoped to the hex
     /// of `[ctx_byte; 32]`. Returns the issuer pubkey + the token.
     async fn mint_outlet_ucan(
@@ -3228,7 +3235,7 @@ mod tests {
         audience: &str,
     ) -> UcanToken {
         let ctx_hex = hex_context_id(&[ctx_byte; 32]);
-        let caps = vec![format!("tool_invoke:{TOOL}")];
+        let caps = vec![format!("outlet_call:{TOOL}")];
         let params = MintParams {
             issuer_did: creator_did,
             issuer_key: creator_key,
@@ -3930,7 +3937,7 @@ mod tests {
 
     #[tokio::test]
     async fn prepare_b_confused_deputy_audience_mismatch_is_rejected() {
-        // The UCAN is VALID and grants tool_invoke:TOOL — but it is delegated to
+        // The UCAN is VALID and grants outlet_call:TOOL — but it is delegated to
         // a DIFFERENT principal (OTHER) than the carried caller_did (CALLER). A
         // confused-deputy attempt: the carried caller references a stronger
         // proof in B's store delegated to someone else. MUST be rejected.

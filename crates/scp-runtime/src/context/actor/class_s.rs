@@ -7168,7 +7168,7 @@ impl ClassSCell
             cost_schedule: CostSchedule {
                 currency: CurrencyCode::from("USD"),
                 per_message: None,
-                per_tool_invoke: None,
+                per_outlet_call: None,
                 per_join: None,
                 per_period: None,
                 per_byte_stored: None,

@@ -14537,7 +14537,7 @@ mod tests {
             cost_schedule: CostSchedule {
                 currency: CurrencyCode(*b"USD\0"),
                 per_message: Some(Amount(1)),
-                per_tool_invoke: None,
+                per_outlet_call: None,
                 per_join: None,
                 per_period: None,
                 per_byte_stored: None,
@@ -18559,15 +18559,15 @@ mod tests {
             .add_member(DID(caller_did.to_owned()), "member".to_owned(), Vec::new());
         st.role_state.members.insert(caller_did.to_owned());
         let mut caps = std::collections::HashSet::new();
-        caps.insert(Capability::ToolInterface);
-        caps.insert(Capability::ToolInvokeAll);
+        caps.insert(Capability::OutletInterface);
+        caps.insert(Capability::OutletCallAll);
         st.role_state
             .member_capabilities
             .insert(caller_did.to_owned(), caps);
         st.role_state
             .set_ceiling(scp_protocol::context::roles::CapabilityCeiling::new([
-                Capability::ToolInterface,
-                Capability::ToolInvokeAll,
+                Capability::OutletInterface,
+                Capability::OutletCallAll,
             ]))
             .expect("well-formed built-in ceiling");
         // Established (both-approved) outbound interface caller→target for
@@ -18592,7 +18592,7 @@ mod tests {
 
     /// Build the TARGET context state: registered `XCTX_TOOL` (2-field schemas,
     /// passing the specificity floor), `caller_did` granted OutletInterface +
-    /// ToolInvokeAll, `creator_did` the role-state creator / UCAN root issuer.
+    /// OutletCallAll, `creator_did` the role-state creator / UCAN root issuer.
     fn xctx_target_state(
         caller_did: &str,
         creator_did: &str,
@@ -18612,15 +18612,15 @@ mod tests {
             .add_member(DID(caller_did.to_owned()), "member".to_owned(), Vec::new());
         st.role_state.members.insert(caller_did.to_owned());
         let mut caps = std::collections::HashSet::new();
-        caps.insert(Capability::ToolInterface);
-        caps.insert(Capability::ToolInvokeAll);
+        caps.insert(Capability::OutletInterface);
+        caps.insert(Capability::OutletCallAll);
         st.role_state
             .member_capabilities
             .insert(caller_did.to_owned(), caps);
         st.role_state
             .set_ceiling(scp_protocol::context::roles::CapabilityCeiling::new([
-                Capability::ToolInterface,
-                Capability::ToolInvokeAll,
+                Capability::OutletInterface,
+                Capability::OutletCallAll,
             ]))
             .expect("well-formed built-in ceiling");
         st.governance.registered_outlets.push(OutletRegistration {
@@ -19479,7 +19479,7 @@ mod tests {
 
         // Proof audience = OTHER, NOT the carried caller_did.
         let ctx_hex = hex::encode(XCTX_TARGET);
-        let caps = vec![format!("tool_invoke:{XCTX_TOOL}")];
+        let caps = vec![format!("outlet_call:{XCTX_TOOL}")];
         let params = crate::crypto::ucan::mint::MintParams {
             issuer_did: &creator_did,
             issuer_key: &creator_handle,
@@ -20127,8 +20127,8 @@ mod tests {
             SagaId("saga-token-bucket".to_owned()),
             RunSagaError {
                 error: ContextError::RateLimited {
-                    resource: "tool_invoke".to_owned(),
-                    message: "SCP-ECON-12090: rate limit exceeded on tool_invoke: hard limit"
+                    resource: "outlet_call".to_owned(),
+                    message: "SCP-ECON-12090: rate limit exceeded on outlet_call: hard limit"
                         .to_owned(),
                     retry_after_ms: None,
                 },
@@ -23597,7 +23597,7 @@ mod tests {
             cost_schedule: CostSchedule {
                 currency: CurrencyCode::from("USD"),
                 per_message: None,
-                per_tool_invoke: Some(Amount(50)),
+                per_outlet_call: Some(Amount(50)),
                 per_join: None,
                 per_period: None,
                 per_byte_stored: None,
@@ -23609,7 +23609,7 @@ mod tests {
         let escrow = crate::economy::integration::PreparedAction {
             envelope: crate::economy::integration::ActionEnvelope {
                 actor: invoker.clone(),
-                action_type: PaidActionType::ToolInvoke,
+                action_type: PaidActionType::OutletCall,
                 context_id: None,
                 authorization: Some(void_counting_auth(
                     &invoker,
