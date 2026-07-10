@@ -5537,29 +5537,30 @@ impl Supervisor {
     /// Either gate failing rejects with [`ContextError::PermissionDenied`]
     /// WITHOUT reserving any context.
     ///
-    /// # Forward obligation — `caller_did` MUST be channel-authenticated at the FFI seam
+    /// # Caller authentication — bound at the FFI seam (§6.2.4)
     ///
-    /// This saga has NO production caller yet. Its channel-auth defenses — gate 1
-    /// above, the §6.2.4 *Caller authentication* clause, the aggregate
-    /// nonce-eviction replay bound (spec §6.2.4 *Cache-eviction bound*), and B's
-    /// `InboundPolicy` role check — ALL rest on `caller_did` (and
-    /// `caller_context_id`) being the AUTHENTICATED identity of the transport
-    /// leg, never an envelope-asserted value. The supervisor here only verifies
-    /// `is_member` (membership), which is NECESSARY but NOT SUFFICIENT: membership
-    /// does not by itself prove the request leg is authenticated as that member.
+    /// This saga's production callers are the FFI cross-context-saga exports
+    /// (`tool_invoke_cross_context_saga` in the PyO3, NAPI, and UniFFI
+    /// bridges). Its channel-auth defenses — gate 1 above, the §6.2.4
+    /// *Caller authentication* clause, the aggregate nonce-eviction replay
+    /// bound (spec §6.2.4 *Cache-eviction bound*), and B's `InboundPolicy`
+    /// role check — ALL rest on `caller_did` (and `caller_context_id`) being
+    /// the AUTHENTICATED identity of the transport leg, never an
+    /// envelope-asserted value. The supervisor here only verifies `is_member`
+    /// (membership), which is NECESSARY but NOT SUFFICIENT: membership does not
+    /// by itself prove the request leg is authenticated as that member.
     ///
-    /// Therefore the FFI/SDK wiring that eventually EXPOSES this saga MUST bind
-    /// `caller_did` / `caller_context_id` to the authenticated FFI principal /
-    /// channel — NOT merely to membership — per the §6.2.0 / §6.2.4
-    /// "channel-authenticated identity" requirement, before any value is passed
-    /// into this entry point. This is a forward obligation tied to the deferred
-    /// FFI surface (mirroring the ADR-049 §3a forward-obligation discipline and
-    /// the CLAUDE.md integration checklist: function → manager-surface method —
-    /// today the `Supervisor`, the checklist's wording predating the
-    /// `ContextManager` deletion — → FFI → SDK → `pipeline_wiring` assertion).
-    /// It is recorded here as the upstream
-    /// anchor; the co-resident core path does not yet have an untrusted leg, so
-    /// the obligation lands with the wiring, not in this function.
+    /// That binding IS enforced by each bridge BEFORE this entry point runs:
+    /// `enforce_caller_principal_binding` (PyO3 `src/tools.rs`, NAPI
+    /// `napi/tools.rs`, UniFFI `bridge.rs`) rejects unless `caller_did` is an
+    /// identity THAT bridge instance hosts AND a member of `caller_context_id`
+    /// — the §6.2.0 / §6.2.4 "channel-authenticated identity" requirement — so
+    /// the saga never observes an unauthenticated caller (a mismatch surfaces
+    /// the registered caller-axis terminal `SCP-SAGA-13050`). The co-resident
+    /// core path has no untrusted leg; the FFI seam is where the authenticated
+    /// principal is bound (per the ADR-049 §3a discipline and the CLAUDE.md
+    /// integration checklist: function → `Supervisor` → FFI → SDK →
+    /// `pipeline_wiring` assertion).
     ///
     /// # Errors
     ///
