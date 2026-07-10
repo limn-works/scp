@@ -599,7 +599,7 @@
           "typescript": true,
           "kotlin": true,
           "swift": true,
-          "notes": "The §6.2.4 atomic cross-context tool-invocation saga (ADR-049 §3a). Exported by all three native bridges — PyO3 tool_invoke_cross_context_saga, UniFFI tool_invoke_cross_context_saga, NAPI toolInvokeCrossContextSaga (js_name); see scripts/bridge-aliases.json (category tools). Each export binds the caller principal to the authenticated FFI identity (enforce_caller_principal_binding) before dispatching to Supervisor::start_cross_context_tool_invocation_saga, pinned by the pyo3/napi/uniffi saga-export assertions in pipeline_wiring.rs. All four SDK wrappers are live: Python (SCP.tool_invoke_cross_context_saga), TypeScript (SCP.toolInvokeCrossContextSaga), Swift (Context.invokeToolCrossContextSaga), and Kotlin (SCP.toolInvokeCrossContextSaga / ToolBridge.invokeCrossContextSaga)."
+          "notes": "The §6.2.4 atomic cross-context outlet-invocation saga (ADR-049 §3a). Exported by all three native bridges — PyO3 outlet_invoke_cross_context_saga, UniFFI outlet_invoke_cross_context_saga, NAPI outletInvokeCrossContextSaga (js_name); see scripts/bridge-aliases.json (category tools). Each export binds the caller principal to the authenticated FFI identity (enforce_caller_principal_binding) before dispatching to Supervisor::start_cross_context_outlet_invocation_saga, pinned by the pyo3/napi/uniffi saga-export assertions in pipeline_wiring.rs. All four SDK wrappers are live: Python (SCP.outlet_invoke_cross_context_saga), TypeScript (SCP.outletInvokeCrossContextSaga), Swift (Context.invokeOutletCrossContextSaga), and Kotlin (SCP.outletInvokeCrossContextSaga / OutletBridge.invokeCrossContextSaga)."
         },
         {
           "name": "session_create",
@@ -1510,17 +1510,17 @@
           }
         },
         {
-          "name": "invoke_tool_with_economy",
+          "name": "invoke_outlet_with_economy",
           "python": false,
           "typescript": false,
           "kotlin": false,
           "swift": false,
-          "notes": "Internal: ContextManager::invoke_tool_with_economy (scp-runtime/src/context/manager/tools.rs:442) wraps tool invocation with hard-rate-limit consume/refund, anti-spam velocity record/rollback, and the EconomyTicket authorize/capture/void lifecycle (F1-F5, D4 wiring). Invoked transitively from the tool invocation entry points; not a standalone SDK operation.",
+          "notes": "Internal: Supervisor::invoke_outlet_with_economy (scp-runtime/src/context/outlets_helpers.rs) wraps outlet invocation with hard-rate-limit consume/refund, anti-spam velocity record/rollback, and the EconomyTicket authorize/capture/void lifecycle (F1-F5, D4 wiring). Invoked transitively from the outlet invocation entry points; not a standalone SDK operation.",
           "exemptions": {
-            "python": "internal pipeline wiring inside tool_invoke; not a standalone SDK operation",
-            "typescript": "internal pipeline wiring inside tool_invoke; not a standalone SDK operation",
-            "kotlin": "internal pipeline wiring inside tool_invoke; not a standalone SDK operation",
-            "swift": "internal pipeline wiring inside tool_invoke; not a standalone SDK operation"
+            "python": "internal pipeline wiring inside outlet_invoke; not a standalone SDK operation",
+            "typescript": "internal pipeline wiring inside outlet_invoke; not a standalone SDK operation",
+            "kotlin": "internal pipeline wiring inside outlet_invoke; not a standalone SDK operation",
+            "swift": "internal pipeline wiring inside outlet_invoke; not a standalone SDK operation"
           }
         },
         {
@@ -1529,7 +1529,7 @@
           "typescript": false,
           "kotlin": false,
           "swift": false,
-          "notes": "Internal: ContextManager::authorize_paid_action (economy.rs:488) issues a PaidActionAuthorization handle through the configured payment adapter. Invoked transitively from enforce_economy and invoke_tool_with_economy.",
+          "notes": "Internal: ContextManager::authorize_paid_action (economy.rs:488) issues a PaidActionAuthorization handle through the configured payment adapter. Invoked transitively from enforce_economy and invoke_outlet_with_economy.",
           "exemptions": {
             "python": "internal sub-operation of enforce_economy",
             "typescript": "internal sub-operation of enforce_economy",
@@ -1580,17 +1580,17 @@
           }
         },
         {
-          "name": "velocity_tracker_record_tool_invocation",
+          "name": "velocity_tracker_record_outlet_invocation",
           "python": false,
           "typescript": false,
           "kotlin": false,
           "swift": false,
-          "notes": "Internal: invoke_tool_with_economy threads SenderVelocityTracker::record_message into the tool path so the per-DID anti-spam escalation (spec section 19.7) applies to tool invocations as well as messages. Pipeline-wiring assertion invoke_tool_with_economy_wires_escalation_and_rollback covers this.",
+          "notes": "Internal: invoke_outlet_with_economy threads SenderVelocityTracker::record_message into the outlet path so the per-DID anti-spam escalation (spec section 19.7) applies to outlet invocations as well as messages. Pipeline-wiring assertion invoke_outlet_with_economy_wires_escalation_and_rollback covers this.",
           "exemptions": {
-            "python": "internal anti-spam state mutation invoked from invoke_tool_with_economy",
-            "typescript": "internal anti-spam state mutation invoked from invoke_tool_with_economy",
-            "kotlin": "internal anti-spam state mutation invoked from invoke_tool_with_economy",
-            "swift": "internal anti-spam state mutation invoked from invoke_tool_with_economy"
+            "python": "internal anti-spam state mutation invoked from invoke_outlet_with_economy",
+            "typescript": "internal anti-spam state mutation invoked from invoke_outlet_with_economy",
+            "kotlin": "internal anti-spam state mutation invoked from invoke_outlet_with_economy",
+            "swift": "internal anti-spam state mutation invoked from invoke_outlet_with_economy"
           }
         },
         {
@@ -1641,12 +1641,12 @@
           "typescript": false,
           "kotlin": false,
           "swift": false,
-          "notes": "Internal: TokenBucketLimiter::try_consume (scp-protocol/src/economy/antispam.rs:724) is the Matrix Synapse-style defense-in-depth cap. ContextManager wires it into enforce_send_economy and invoke_tool_with_economy (D4 wiring). Pipeline-wiring assertion invoke_tool_with_economy_enforces_hard_rate_limit covers this.",
+          "notes": "Internal: TokenBucketLimiter::try_consume (scp-protocol/src/economy/antispam.rs:724) is the Matrix Synapse-style defense-in-depth cap. ContextManager wires it into enforce_send_economy and invoke_outlet_with_economy (D4 wiring). Pipeline-wiring assertion invoke_outlet_with_economy_enforces_hard_rate_limit covers this.",
           "exemptions": {
-            "python": "internal rate-limit gate inside send and tool paths, not a standalone SDK operation",
-            "typescript": "internal rate-limit gate inside send and tool paths, not a standalone SDK operation",
-            "kotlin": "internal rate-limit gate inside send and tool paths, not a standalone SDK operation",
-            "swift": "internal rate-limit gate inside send and tool paths, not a standalone SDK operation"
+            "python": "internal rate-limit gate inside send and outlet paths, not a standalone SDK operation",
+            "typescript": "internal rate-limit gate inside send and outlet paths, not a standalone SDK operation",
+            "kotlin": "internal rate-limit gate inside send and outlet paths, not a standalone SDK operation",
+            "swift": "internal rate-limit gate inside send and outlet paths, not a standalone SDK operation"
           }
         },
         {
@@ -1655,12 +1655,12 @@
           "typescript": false,
           "kotlin": false,
           "swift": false,
-          "notes": "Internal: TokenBucketLimiter::refund (antispam.rs:802) is invoked at every Phase 1 failure branch in invoke_tool_with_economy and enforce_send_economy. Dropping any branch leaks a token; pipeline-wiring assertion invoke_tool_with_economy_refunds_hard_rate_limit_on_every_phase1_failure ensures at least 3 refund sites exist on the tool path.",
+          "notes": "Internal: TokenBucketLimiter::refund (antispam.rs:802) is invoked at every Phase 1 failure branch in invoke_outlet_with_economy and enforce_send_economy. Dropping any branch leaks a token; pipeline-wiring assertion invoke_outlet_with_economy_refunds_hard_rate_limit_on_every_phase1_failure ensures at least 3 refund sites exist on the outlet path.",
           "exemptions": {
-            "python": "internal rate-limit recovery inside send and tool paths, not a standalone SDK operation",
-            "typescript": "internal rate-limit recovery inside send and tool paths, not a standalone SDK operation",
-            "kotlin": "internal rate-limit recovery inside send and tool paths, not a standalone SDK operation",
-            "swift": "internal rate-limit recovery inside send and tool paths, not a standalone SDK operation"
+            "python": "internal rate-limit recovery inside send and outlet paths, not a standalone SDK operation",
+            "typescript": "internal rate-limit recovery inside send and outlet paths, not a standalone SDK operation",
+            "kotlin": "internal rate-limit recovery inside send and outlet paths, not a standalone SDK operation",
+            "swift": "internal rate-limit recovery inside send and outlet paths, not a standalone SDK operation"
           }
         }
       ]
@@ -1795,15 +1795,15 @@
           }
         },
         {
-          "name": "register_tool_handler",
+          "name": "register_outlet_handler",
           "python": true,
           "typescript": false,
           "kotlin": false,
           "swift": false,
           "exemptions": {
-            "typescript": "register_tool_handler not exposed in TypeScript SDK",
+            "typescript": "register_outlet_handler not exposed in TypeScript SDK",
             "kotlin": "MCP module not implemented in Kotlin SDK",
-            "swift": "register_tool_handler not exposed in Swift SDK"
+            "swift": "register_outlet_handler not exposed in Swift SDK"
           }
         }
       ]
