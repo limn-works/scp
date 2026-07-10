@@ -2332,7 +2332,7 @@ mod tests {
     };
     use crate::crypto::ucan::validate::{
         DEFAULT_CLOCK_SKEW_TOLERANCE_SECS, InMemoryDidResolver, InMemoryNonceTracker,
-        InMemoryProofResolver, InMemoryRevocationChecker,
+        InMemoryProofResolver, InMemoryRevocationChecker, NoCaveatResolver,
     };
     use crate::crypto::ucan::{Attenuation, UcanHeader, UcanPayload};
     use scp_clock::Clock;
@@ -2442,6 +2442,7 @@ mod tests {
             }],
             prf: vec![],
             fct: None,
+            nb: None,
         };
 
         let header_json = serde_json::to_vec(&header).unwrap();
@@ -2659,6 +2660,7 @@ mod tests {
             presenting_agent_did: "did:example:bob",
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
             clock: &scp_clock::SystemClock,
+            caveat_resolver: &NoCaveatResolver,
         };
 
         let result = ctx
@@ -2912,6 +2914,7 @@ mod tests {
             presenting_agent_did: "did:example:bob",
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
             clock: &scp_clock::SystemClock,
+            caveat_resolver: &NoCaveatResolver,
         };
 
         let result = ctx.subscribe("did:example:bob", Some(&ucan), 1000, Some(&mut val_ctx));
@@ -2947,6 +2950,7 @@ mod tests {
                 }],
                 prf: vec![],
                 fct: None,
+                nb: None,
             };
 
             let header_json = serde_json::to_vec(&header).unwrap();
@@ -2977,6 +2981,7 @@ mod tests {
             presenting_agent_did: "did:example:bob",
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
             clock: &scp_clock::SystemClock,
+            caveat_resolver: &NoCaveatResolver,
         };
 
         let result = ctx.subscribe("did:example:bob", Some(&ucan), 1000, Some(&mut val_ctx));
@@ -3001,6 +3006,7 @@ mod tests {
             presenting_agent_did: "did:example:bob",
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
             clock: &scp_clock::SystemClock,
+            caveat_resolver: &NoCaveatResolver,
         };
 
         let result = ctx.subscribe("did:example:bob", Some(&ucan), 1000, Some(&mut val_ctx));
@@ -3458,6 +3464,7 @@ mod tests {
             presenting_agent_did: "did:example:sub1",
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
             clock: &scp_clock::SystemClock,
+            caveat_resolver: &NoCaveatResolver,
         };
         ctx.subscribe("did:example:sub1", Some(&ucan), 1000, Some(&mut val_ctx))
             .unwrap();
@@ -3524,6 +3531,7 @@ mod tests {
                 }],
                 prf: vec![],
                 fct: None,
+                nb: None,
             };
 
             let header_json = serde_json::to_vec(&header).unwrap();
@@ -3554,6 +3562,7 @@ mod tests {
             presenting_agent_did: "did:example:bob",
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
             clock: &scp_clock::SystemClock,
+            caveat_resolver: &NoCaveatResolver,
         };
 
         // With full validation, a properly signed wildcard UCAN from the
@@ -3596,6 +3605,7 @@ mod tests {
                 }],
                 prf: vec![],
                 fct: None,
+                nb: None,
             };
 
             let header_json = serde_json::to_vec(&header).unwrap();
@@ -3625,6 +3635,7 @@ mod tests {
             presenting_agent_did: "did:example:bob",
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
             clock: &scp_clock::SystemClock,
+            caveat_resolver: &NoCaveatResolver,
         };
 
         let result = ctx.subscribe("did:example:bob", Some(&ucan), 1000, Some(&mut val_ctx));
@@ -3997,6 +4008,7 @@ mod tests {
             presenting_agent_did: "did:example:bob",
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
             clock: &scp_clock::SystemClock,
+            caveat_resolver: &NoCaveatResolver,
         };
 
         let result = ctx
@@ -4514,6 +4526,7 @@ mod tests {
             presenting_agent_did: "did:example:sub1",
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
             clock: &scp_clock::SystemClock,
+            caveat_resolver: &NoCaveatResolver,
         };
 
         // Subscribe with UCAN.
@@ -5664,6 +5677,7 @@ mod tests {
             presenting_agent_did: sub_did,
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
             clock: &scp_clock::SystemClock,
+            caveat_resolver: &NoCaveatResolver,
         };
 
         let result = ctx.register_subscriber(&reg, Some(&mut val_ctx)).unwrap();
@@ -5712,6 +5726,7 @@ mod tests {
             presenting_agent_did: sub_did,
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
             clock: &scp_clock::SystemClock,
+            caveat_resolver: &NoCaveatResolver,
         };
 
         let result = ctx.register_subscriber(&reg, Some(&mut val_ctx));
@@ -5763,6 +5778,7 @@ mod tests {
             presenting_agent_did: sub_did,
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
             clock: &scp_clock::SystemClock,
+            caveat_resolver: &NoCaveatResolver,
         };
 
         let result = ctx.register_subscriber(&reg, Some(&mut val_ctx));
@@ -5810,6 +5826,7 @@ mod tests {
             presenting_agent_did: sub_did,
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
             clock: &scp_clock::SystemClock,
+            caveat_resolver: &NoCaveatResolver,
         };
 
         let result = ctx.register_subscriber(&reg, Some(&mut val_ctx));
@@ -5856,6 +5873,7 @@ mod tests {
             presenting_agent_did: sub_did,
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
             clock: &scp_clock::SystemClock,
+            caveat_resolver: &NoCaveatResolver,
         };
 
         let result = ctx.register_subscriber(&reg, Some(&mut val_ctx)).unwrap();
@@ -5904,6 +5922,7 @@ mod tests {
                 }],
                 prf: vec![],
                 fct: None,
+                nb: None,
             };
 
             let header_json = serde_json::to_vec(&header).unwrap();
@@ -5943,6 +5962,7 @@ mod tests {
             presenting_agent_did: sub_did,
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
             clock: &scp_clock::SystemClock,
+            caveat_resolver: &NoCaveatResolver,
         };
 
         let result = ctx.register_subscriber(&reg, Some(&mut val_ctx));
@@ -5984,6 +6004,7 @@ mod tests {
             presenting_agent_did: sub_did,
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
             clock: &scp_clock::SystemClock,
+            caveat_resolver: &NoCaveatResolver,
         };
 
         let result = validate_ucan(&ucan, &required_cap, &mut val_ctx);

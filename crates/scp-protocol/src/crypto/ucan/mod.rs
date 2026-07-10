@@ -221,6 +221,26 @@ pub enum UcanError {
     /// Capability URI parsing failed.
     #[error("invalid capability URI: {0}")]
     InvalidCapabilityUri(String),
+
+    /// A child delegation's invocation caveats failed the per-field
+    /// [`InvocationCaveats::narrow`](crate::trust::caveats::InvocationCaveats::narrow)
+    /// check at Step 7b (attenuation). Carries the structured
+    /// [`AttenuationViolation`](crate::trust::caveats::AttenuationViolation)
+    /// so SDK consumers can match on the exact rule that fired.
+    ///
+    /// Maps to error code [`crate::CODE_AUTHORIZATION_ATTENUATION`]
+    /// (`SCP-TOOL-6114`) with the per-violation slug from
+    /// [`crate::trust::caveats::AttenuationViolation::slug`].
+    #[error("caveat attenuation violation: {0}")]
+    CaveatAttenuationViolation(crate::trust::caveats::AttenuationViolation),
+
+    /// The presenting token's invocation caveats failed the Step 11b time-box
+    /// check (`valid_from` / `valid_until` / `hours_of_day` / `days_of_week`).
+    ///
+    /// Maps to error code [`crate::CODE_AUTHORIZATION_DENIED`]
+    /// (`SCP-TOOL-6110`) with slug `authorization.time-box-violation`.
+    #[error("caveat time-box violation: {0}")]
+    CaveatTimeBoxViolation(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -393,6 +413,16 @@ pub struct UcanPayload {
     /// Optional facts — arbitrary JSON data attached to the token.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fct: Option<serde_json::Value>,
+    /// §7.3.8 invocation caveats carried in the UCAN `nb` field. Absent when
+    /// the token carries no caveat-level constraints — preserves backward
+    /// compatibility with tokens that have no `nb` field at all.
+    ///
+    /// The wire encoding uses the spec §7.3.8 vocabulary verbatim
+    /// (`amountMaxPerCall`, `validFrom`, …) — see
+    /// [`crate::trust::caveats::InvocationCaveats`] for the field-level
+    /// serialization contract.
+    #[serde(rename = "nb", skip_serializing_if = "Option::is_none", default)]
+    pub nb: Option<crate::trust::caveats::InvocationCaveats>,
 }
 
 // ---------------------------------------------------------------------------
@@ -574,6 +604,7 @@ mod tests {
             }],
             prf: vec!["bafyreiabc123".to_owned()],
             fct: Some(serde_json::json!({"note": "test token"})),
+            nb: None,
         };
         let json = serde_json::to_string(&payload).unwrap();
         let deserialized: UcanPayload = serde_json::from_str(&json).unwrap();
@@ -591,6 +622,7 @@ mod tests {
             att: vec![],
             prf: vec![],
             fct: None,
+            nb: None,
         };
         let json = serde_json::to_string(&payload).unwrap();
         // nbf and fct should not appear in the JSON when None
@@ -633,6 +665,7 @@ mod tests {
                 }],
                 prf: vec![],
                 fct: None,
+                nb: None,
             },
             signature: vec![0u8; 64],
             encoded: "eyJ0eXAi...".to_owned(),
@@ -666,6 +699,7 @@ mod tests {
                 ],
                 prf: vec!["bafyreiabc123".to_owned()],
                 fct: Some(serde_json::json!({"role": "member"})),
+                nb: None,
             },
             signature: vec![1u8; 64],
             encoded: "header.payload.signature".to_owned(),
@@ -688,6 +722,7 @@ mod tests {
                 att: vec![],
                 prf: vec![],
                 fct: None,
+                nb: None,
             },
             signature: vec![0u8; 64],
             encoded: String::new(),
