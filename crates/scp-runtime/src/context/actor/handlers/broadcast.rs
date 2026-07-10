@@ -35,7 +35,7 @@ use std::time::Duration;
 
 use scp_protocol::context::ContextError;
 use scp_protocol::crypto::ucan::validate::{
-    DEFAULT_CLOCK_SKEW_TOLERANCE_SECS, InMemoryProofResolver, ValidationContext,
+    DEFAULT_CLOCK_SKEW_TOLERANCE_SECS, InMemoryProofResolver, NoCaveatResolver, ValidationContext,
 };
 use tokio::sync::oneshot;
 
@@ -228,6 +228,7 @@ async fn handle_subscribe_broadcast(
         presenting_agent_did: p.subscriber_did.as_ref(),
         clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
         clock: deps.clock.as_ref(),
+        caveat_resolver: &NoCaveatResolver,
     };
 
     let subscribe_fut = async {
@@ -890,6 +891,7 @@ mod tests {
             }],
             prf: vec![],
             fct: None,
+            nb: None,
         };
 
         let header_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap());

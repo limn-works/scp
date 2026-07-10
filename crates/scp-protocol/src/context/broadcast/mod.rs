@@ -2705,6 +2705,7 @@ mod tests {
                 presenting_agent_did: "did:example:bob",
                 clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
                 clock: &scp_clock::SystemClock,
+                caveat_resolver: &NoCaveatResolver,
             };
             ctx.subscribe("did:example:bob", Some(&ucan), 1000, Some(&mut val_ctx))
                 .unwrap();
@@ -2726,6 +2727,7 @@ mod tests {
                 presenting_agent_did: "did:example:bob",
                 clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
                 clock: &scp_clock::SystemClock,
+                caveat_resolver: &NoCaveatResolver,
             };
             let result = ctx.subscribe("did:example:bob", Some(&ucan), 1000, Some(&mut val_ctx));
             assert!(
@@ -2756,6 +2758,7 @@ mod tests {
                 presenting_agent_did: "did:example:bob",
                 clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
                 clock: &scp_clock::SystemClock,
+                caveat_resolver: &NoCaveatResolver,
             };
             let result = ctx.register_subscriber(&reg, Some(&mut val_ctx));
             assert!(
@@ -2785,6 +2788,7 @@ mod tests {
                 presenting_agent_did: "did:example:bob",
                 clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
                 clock: &scp_clock::SystemClock,
+                caveat_resolver: &NoCaveatResolver,
             };
             ctx.subscribe("did:example:bob", Some(&ucan), 1000, Some(&mut val_ctx))
                 .unwrap();
@@ -2814,6 +2818,7 @@ mod tests {
             presenting_agent_did: "did:example:bob",
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
             clock: &scp_clock::SystemClock,
+            caveat_resolver: &NoCaveatResolver,
         };
         let result = restored.subscribe("did:example:bob", Some(&ucan), 1000, Some(&mut val_ctx));
         assert!(
@@ -2859,6 +2864,7 @@ mod tests {
                 presenting_agent_did: "did:example:bob",
                 clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
                 clock: &scp_clock::SystemClock,
+                caveat_resolver: &NoCaveatResolver,
             };
             ctx.subscribe("did:example:bob", Some(&ucan), 1000, Some(&mut val_ctx))
                 .unwrap();
@@ -2888,6 +2894,7 @@ mod tests {
             presenting_agent_did: "did:example:bob",
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
             clock: &scp_clock::SystemClock,
+            caveat_resolver: &NoCaveatResolver,
         };
         let result = ctx
             .subscribe("did:example:bob", Some(&ucan2), 1000, Some(&mut val_ctx))
