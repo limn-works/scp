@@ -217,7 +217,7 @@ describe("ConsequenceRule wire-format encoding (encodeConsequenceRules)", () => 
     }>;
     expect(decoded).toHaveLength(3);
 
-    // Rule 0: MessageVelocity / Enforcement(SuspendCapability { OutletInvoke + Custom + unit })
+    // Rule 0: MessageVelocity / Enforcement(SuspendCapability { OutletCall + Custom + unit })
     expect(decoded[0]?.trigger).toBe("MessageVelocity");
     expect(decoded[0]?.threshold).toBe(5);
     expect(decoded[0]?.window).toEqual({ secs: 3600, nanos: 0 });

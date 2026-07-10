@@ -4677,7 +4677,7 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
                 agent = %self.agent_did,
                 outlet = %outlet_name,
                 context = %context_id,
-                "capability check failed: agent lacks OutletInvoke capability"
+                "capability check failed: agent lacks OutletCall capability"
             );
             Err("insufficient permissions to invoke outlet".to_owned())
         }

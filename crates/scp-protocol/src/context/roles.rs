@@ -225,9 +225,6 @@ impl Capability {
         if n.starts_with("outlet:invoke:") || n.starts_with("outlet_invoke:") {
             return None;
         }
-        if n == "outlet:invoke:*" || n == "outlet_invoke:*" {
-            return None;
-        }
         if n.starts_with("tool:invoke:") || n.starts_with("tool_invoke:") {
             return None;
         }

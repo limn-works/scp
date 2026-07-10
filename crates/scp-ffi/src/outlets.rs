@@ -877,7 +877,7 @@ fn outlet_invoke_cross_context_impl(
 
     if !source_has_capability {
         return Err(ScpPyError::ucan(format!(
-            "invoker '{invoker_did}' does not have OutletInvoke capability for '{outlet_id}' in source context"
+            "invoker '{invoker_did}' does not have OutletCall capability for '{outlet_id}' in source context"
         ))
         .into());
     }
@@ -1335,7 +1335,7 @@ fn outlet_session_create_impl(
 
 /// Invokes an outlet within an active session.
 ///
-/// Each call is individually governed: the invoker must hold `OutletInvoke`
+/// Each call is individually governed: the invoker must hold `OutletCall`
 /// capability and present a valid UCAN token. Session state is carried
 /// forward across invocations. The session's call count is incremented on
 /// each successful invocation.
@@ -1430,7 +1430,7 @@ fn outlet_session_invoke_impl(
             &outlet_id,
         ) {
             return Err(ScpPyError::ucan(format!(
-                "invoker '{invoker_did}' does not have OutletInvoke capability for '{outlet_id}'"
+                "invoker '{invoker_did}' does not have OutletCall capability for '{outlet_id}'"
             )));
         }
 
@@ -2004,7 +2004,7 @@ impl crate::scp::PyScp {
 
     /// Invokes an outlet within an active session.
     ///
-    /// Each call is individually governed: the invoker must hold `OutletInvoke`
+    /// Each call is individually governed: the invoker must hold `OutletCall`
     /// capability and present a valid UCAN token. Session state is carried
     /// forward across invocations.
     ///

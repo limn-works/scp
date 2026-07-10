@@ -8414,7 +8414,10 @@ class SignOnlyCustody:
             "outlet:query:calc".to_owned()
         ));
 
-        // Malformed required capability denies (fail-closed).
+        // Required capability parses to `Capability::Custom("not-a-capability")`
+        // (via the catch-all, so it is `Some`, not malformed). The deny is
+        // because the granted set (`outlet:query:*`) does not contain that
+        // Custom capability — no matching grant.
         assert!(!py_check_scoped_capability(
             vec!["outlet:query:*".to_owned()],
             "not-a-capability".to_owned()

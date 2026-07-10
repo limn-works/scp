@@ -96,7 +96,7 @@ enum class AccessScope(val rawValue: String) {
  * A capability that may be referenced inside [EnforcementSeverity.SuspendCapability].
  *
  * Mirrors `scp_protocol::context::roles::Capability`. The unit variants are
- * enumerated as [Unit]; payload-bearing variants ([OutletInvoke], [Custom]) carry
+ * enumerated as [Unit]; payload-bearing variants ([OutletCall], [Custom]) carry
  * their string field directly.
  */
 sealed class ConsequenceCapability {

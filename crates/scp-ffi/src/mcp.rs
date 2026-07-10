@@ -791,7 +791,7 @@ impl ContextProvider for FfiBridgeProvider {
                     agent = %self.agent_did,
                     outlet = %tool_name,
                     context = %context_id,
-                    "capability check failed: agent lacks OutletInvoke capability"
+                    "capability check failed: agent lacks OutletCall capability"
                 );
                 Err(ScpPyError::context(
                     "insufficient permissions to invoke outlet",
@@ -2697,7 +2697,7 @@ mod tests {
         let bi = __bi();
         let ctx_id = setup_test_context(&bi, creator, true);
 
-        // Add a member with no OutletInvoke capability.
+        // Add a member with no OutletCall capability.
         let member = "did:dht:z6MkMemberNoInvoke";
         crate::runtime::with_context(&bi, &ctx_id, |rt| {
             rt.role_state.members.insert(member.to_owned());
