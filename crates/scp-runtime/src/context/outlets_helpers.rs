@@ -1,9 +1,9 @@
-//! Tools helpers -- actor-shape signatures
-//! (ADR-049 Phase 2A.4 + Phase 2A finalization, `tools` domain).
+//! Outlet helpers -- actor-shape signatures
+//! (ADR-049 Phase 2A.4 + Phase 2A finalization, `outlet` domain).
 //!
 //! # Purpose
 //!
-//! This module hosts tools-domain helpers that actor handlers call with
+//! This module hosts outlet-domain helpers that actor handlers call with
 //! actor-owned state (`&mut PerContextState`). Two surfaces live here:
 //!
 //! 1. The hard-rate-limit consume / refund helpers

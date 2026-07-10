@@ -617,7 +617,7 @@ struct FfiBridgeProvider {
     agent_did: String,
     /// The context IDs this provider serves.
     context_ids: Vec<String>,
-    /// Maximum time (in milliseconds) to wait for a outlet handler to complete.
+    /// Maximum time (in milliseconds) to wait for an outlet handler to complete.
     ///
     /// Defaults to [`FFI_TOOL_TIMEOUT_MS`] (30 seconds). If a registered
     /// handler blocks longer than this, the invocation returns an error
@@ -626,7 +626,7 @@ struct FfiBridgeProvider {
     /// JWT-encoded UCAN token for outlet invocation authorization.
     ///
     /// When present, `validate_capability` runs the full 11-step ADR-016
-    /// validation pipeline to verify the token grants `tool_invoke:{tool_name}`
+    /// validation pipeline to verify the token grants `tool_invoke:{outlet_name}`
     /// or `tool_invoke:*` for the context. When absent, `validate_capability`
     /// rejects immediately (UCAN is required for outlet invocation).
     ///
@@ -709,7 +709,7 @@ impl ContextProvider for FfiBridgeProvider {
         // silently accepting the capability.
         let bi = self.upgrade_bi()?;
         // Primary check: UCAN token validation via the full 11-step ADR-016
-        // pipeline. Verifies the token grants tool_invoke:{tool_name} or
+        // pipeline. Verifies the token grants tool_invoke:{outlet_name} or
         // tool_invoke:* for this context.
         // See spec §6.2, §8, ADR-016, and issue #319.
         if let Some(ref token) = self.agent_ucan_token {
@@ -2228,7 +2228,7 @@ impl crate::scp::PyScp {
 // Outlet handler registration
 // ---------------------------------------------------------------------------
 
-/// Registers a Python callable as the handler for a outlet in a context.
+/// Registers a Python callable as the handler for an outlet in a context.
 ///
 /// The handler is called when the tool is invoked via MCP
 /// (`FfiBridgeProvider::invoke_tool`). It receives the outlet's validated
@@ -2578,10 +2578,10 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Helper: register a context with a outlet for FfiBridgeProvider tests.
+    // Helper: register a context with an outlet for FfiBridgeProvider tests.
     // -----------------------------------------------------------------------
 
-    /// Registers a context in the runtime registry and optionally adds a outlet.
+    /// Registers a context in the runtime registry and optionally adds an outlet.
     /// Returns a unique context ID to avoid collisions with parallel tests.
     ///
     /// Callers must pass the same `bi` they use for subsequent registry lookups;

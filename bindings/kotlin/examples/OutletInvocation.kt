@@ -1,5 +1,5 @@
 /**
- * Outlet invocation: register a outlet with test vectors and invoke it.
+ * Outlet invocation: register an outlet with test vectors and invoke it.
  *
  * Demonstrates the OutletDefinition data class, outlet registration via the
  * CoroutineBridge, and outlet invocation. Uses the actual Kotlin SDK API surface.

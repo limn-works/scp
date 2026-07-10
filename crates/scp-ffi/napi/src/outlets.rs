@@ -2,9 +2,9 @@
 //!
 //! Exposes outlet registration, invocation, and verification:
 //!
-//! - `outlet_register` — Register a outlet in a context.
-//! - `outlet_invoke` — Invoke a outlet within a context.
-//! - `outlet_verify` — Verify a outlet against its test vectors.
+//! - `outlet_register` — Register an outlet in a context.
+//! - `outlet_invoke` — Invoke an outlet within a context.
+//! - `outlet_verify` — Verify an outlet against its test vectors.
 //!
 //! See ADR-022 in `.docs/adrs/phase-4.md`.
 
@@ -91,7 +91,7 @@ pub struct NapiOutletDefinition {
     pub cost: Option<NapiOutletCost>,
 }
 
-/// Per-invocation cost metadata for a outlet (spec §5.4.1).
+/// Per-invocation cost metadata for an outlet (spec §5.4.1).
 #[napi(object)]
 pub struct NapiOutletCost {
     /// Cost per invocation in the smallest currency unit.
@@ -112,7 +112,7 @@ pub struct NapiOutletCost {
 // NapiOutletVerificationResult — result of outlet verification
 // ---------------------------------------------------------------------------
 
-/// Result of verifying a outlet against its registered test vectors.
+/// Result of verifying an outlet against its registered test vectors.
 #[napi(object)]
 pub struct NapiOutletVerificationResult {
     /// The verified outlet's ID.
@@ -1582,7 +1582,7 @@ mod tests {
         assert!(msg.contains("got 0"));
     }
 
-    /// `registered_at` on a outlet registered via the NAPI bridge must be a
+    /// `registered_at` on an outlet registered via the NAPI bridge must be a
     /// seconds-epoch timestamp, not milliseconds or hardcoded 0.
     /// Calls the actual `outlet_register` bridge function and inspects the
     /// stored `OutletRegistration`. Catches the original bug from issue #871.

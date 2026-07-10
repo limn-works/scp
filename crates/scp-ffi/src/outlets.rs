@@ -2,15 +2,15 @@
 //!
 //! Exposes SCP outlet operations to Python as methods on the `SCP` class:
 //!
-//! - `PyScp::outlet_register` — Register a outlet in a context (returns outlet ID).
-//! - `PyScp::outlet_invoke` — Invoke a outlet (returns JSON-compatible output).
-//! - `PyScp::outlet_verify` — Verify a outlet against its test vectors.
-//! - `PyScp::outlet_invoke_cross_context` — Invoke a outlet across context
+//! - `PyScp::outlet_register` — Register an outlet in a context (returns outlet ID).
+//! - `PyScp::outlet_invoke` — Invoke an outlet (returns JSON-compatible output).
+//! - `PyScp::outlet_verify` — Verify an outlet against its test vectors.
+//! - `PyScp::outlet_invoke_cross_context` — Invoke an outlet across context
 //!   boundaries.
 //! - `PyScp::outlet_session_create` — Create a stateful outlet session.
-//! - `PyScp::outlet_session_invoke` — Invoke a outlet within a session.
+//! - `PyScp::outlet_session_invoke` — Invoke an outlet within a session.
 //! - `PyScp::outlet_session_close` — Close a stateful outlet session.
-//! - `PyScp::outlet_interface_expose` — Expose a outlet interface (step 1 of
+//! - `PyScp::outlet_interface_expose` — Expose an outlet interface (step 1 of
 //!   the §6.2.0.1 bidirectional handshake).
 //! - `PyScp::outlet_interface_accept` — Accept an exposed interface (step 4).
 //! - `PyScp::outlet_interface_revoke` — Revoke an interface unilaterally.
@@ -43,7 +43,7 @@ use crate::validate;
 
 /// Outlet registration data exposed to Python.
 ///
-/// Contains the metadata needed to register a outlet in an SCP context:
+/// Contains the metadata needed to register an outlet in an SCP context:
 /// name, description, JSON Schema, and test vectors. The `schema` field
 /// is a Python dict representing the MCP-compatible JSON Schema for the
 /// outlet's input and output.
@@ -110,7 +110,7 @@ impl PyOutletRegistration {
 // PyOutletVerificationResult
 // ---------------------------------------------------------------------------
 
-/// Result of verifying a outlet against its test vectors.
+/// Result of verifying an outlet against its test vectors.
 ///
 /// Returned by `py_outlet_verify`. Contains the outlet ID, overall pass/fail
 /// status, and a list of failure messages (empty if all vectors passed).
@@ -193,7 +193,7 @@ impl PySagaResult {
 // Bridge helpers — per-bridge implementations used by PyScp methods
 // ---------------------------------------------------------------------------
 
-/// Registers a outlet in an SCP context on the given bridge instance.
+/// Registers an outlet in an SCP context on the given bridge instance.
 ///
 /// See ADR-013 §4.
 fn outlet_register_impl(
@@ -273,7 +273,7 @@ fn outlet_register_impl(
     // Extract cost metadata (optional, per spec §5.4.1).
     let cost = extract_cost(registration)?;
 
-    // Generate a outlet ID from the name (deterministic, human-readable).
+    // Generate an outlet ID from the name (deterministic, human-readable).
     // Shared with every other bridge via `scp_ffi_common::outlet_id`.
     let outlet_id = scp_ffi_common::outlet_id::generate_outlet_id(&name);
 
@@ -362,7 +362,7 @@ fn validate_outlet_ucan(
     Ok(())
 }
 
-/// Invokes a outlet within an SCP context, fully wired through the
+/// Invokes an outlet within an SCP context, fully wired through the
 /// `ContextManager::invoke_outlet_with_economy` pipeline.
 ///
 /// This is the SINGLE entry point for outlet invocation through the `PyO3`
@@ -559,7 +559,7 @@ fn outlet_invoke_impl(
     json_to_py_dict(py, &outcome.output)
 }
 
-/// Verifies a outlet against its registered test vectors.
+/// Verifies an outlet against its registered test vectors.
 ///
 /// # Arguments
 ///
@@ -786,7 +786,7 @@ fn extract_test_vectors(
 // Cross-context outlet invocation
 // ---------------------------------------------------------------------------
 
-/// Invokes a outlet across context boundaries.
+/// Invokes an outlet across context boundaries.
 ///
 /// The source context exposes the outlet and the target context accepts the
 /// interface. Both contexts must have approved the interface before calls
@@ -1321,7 +1321,7 @@ fn outlet_session_create_impl(
     Ok(session_id)
 }
 
-/// Invokes a outlet within an active session.
+/// Invokes an outlet within an active session.
 ///
 /// Each call is individually governed: the invoker must hold `OutletInvoke`
 /// capability and present a valid UCAN token. Session state is carried
@@ -1499,7 +1499,7 @@ fn outlet_session_close_impl(
 // Bidirectional consent protocol (spec §6.2.0.1)
 // ---------------------------------------------------------------------------
 
-/// Exposes a outlet interface for cross-context sharing (§6.2.0.1 step 1).
+/// Exposes an outlet interface for cross-context sharing (§6.2.0.1 step 1).
 ///
 /// The caller (admin of the source context) proposes sharing a specific outlet
 /// with a target context. The returned JSON contains the `OutletInterface` with
@@ -1690,7 +1690,7 @@ fn outlet_interface_revoke_impl(
 
 #[pymethods]
 impl crate::scp::PyScp {
-    /// Registers a outlet in an SCP context.
+    /// Registers an outlet in an SCP context.
     ///
     /// # Arguments
     ///
@@ -1718,7 +1718,7 @@ impl crate::scp::PyScp {
         outlet_register_impl(bi, context_id, registration)
     }
 
-    /// Invokes a outlet within an SCP context, fully wired through the
+    /// Invokes an outlet within an SCP context, fully wired through the
     /// `ContextManager::invoke_outlet_with_economy` pipeline.
     ///
     /// # Arguments
@@ -1775,7 +1775,7 @@ impl crate::scp::PyScp {
         )
     }
 
-    /// Verifies a outlet against its registered test vectors.
+    /// Verifies an outlet against its registered test vectors.
     ///
     /// # Arguments
     ///
@@ -1803,7 +1803,7 @@ impl crate::scp::PyScp {
         outlet_verify_impl(bi, context_id, outlet_id)
     }
 
-    /// Invokes a outlet across context boundaries.
+    /// Invokes an outlet across context boundaries.
     ///
     /// The source context exposes the outlet and the target context accepts the
     /// interface. Both contexts must have approved the interface before calls
@@ -1845,7 +1845,7 @@ impl crate::scp::PyScp {
         )
     }
 
-    /// Invokes a outlet across context boundaries as an atomic two-phase saga
+    /// Invokes an outlet across context boundaries as an atomic two-phase saga
     /// (spec §6.2.4, ADR-049 §3a).
     ///
     /// Unlike [`Self::outlet_invoke_cross_context`] (the synchronous,
@@ -1990,7 +1990,7 @@ impl crate::scp::PyScp {
         outlet_session_create_impl(bi, context_id, outlet_id, source_context_id, ttl_seconds)
     }
 
-    /// Invokes a outlet within an active session.
+    /// Invokes an outlet within an active session.
     ///
     /// Each call is individually governed: the invoker must hold `OutletInvoke`
     /// capability and present a valid UCAN token. Session state is carried
@@ -2040,7 +2040,7 @@ impl crate::scp::PyScp {
         outlet_session_close_impl(bi, context_id, session_id)
     }
 
-    /// Exposes a outlet interface for cross-context sharing (§6.2.0.1 step 1).
+    /// Exposes an outlet interface for cross-context sharing (§6.2.0.1 step 1).
     ///
     /// # Errors
     ///
@@ -2509,7 +2509,7 @@ mod tests {
     // registered_at timestamp — #871
     // -----------------------------------------------------------------------
 
-    /// `registered_at` on a outlet registered via the `PyO3` bridge must be a
+    /// `registered_at` on an outlet registered via the `PyO3` bridge must be a
     /// seconds-epoch timestamp, not milliseconds or hardcoded 0.
     /// Calls the actual `PyScp::outlet_register` bridge method and inspects the
     /// stored `OutletRegistration`. Catches the original bug from issue #871.

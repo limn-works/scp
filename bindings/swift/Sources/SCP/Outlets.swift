@@ -11,7 +11,7 @@ import Foundation
 
 // MARK: - OutletInvocationResult
 
-/// The result of invoking a outlet within an SCP context.
+/// The result of invoking an outlet within an SCP context.
 ///
 /// Contains the outlet's output payload and provenance metadata recording which
 /// agent invoked the outlet, in which context, and when.
@@ -134,7 +134,7 @@ public extension Context {
         )
     }
 
-    /// Registers a outlet in this context.
+    /// Registers an outlet in this context.
     ///
     /// Delegates to the UniFFI ``outletRegister`` bridge function.
     ///
@@ -161,7 +161,7 @@ public extension Context {
         return try await scp.outletRegister(handle: handle, definition: definition)
     }
 
-    /// Verifies a outlet against its registered test vectors.
+    /// Verifies an outlet against its registered test vectors.
     ///
     /// Delegates to the UniFFI ``outletVerify`` bridge function.
     ///
@@ -189,7 +189,7 @@ public extension Context {
         return try await scp.outletVerify(handle: handle, outletId: outlet)
     }
 
-    /// Invokes a outlet registered in a different context (cross-context).
+    /// Invokes an outlet registered in a different context (cross-context).
     ///
     /// Delegates to the UniFFI ``outletInvokeCrossContext`` bridge function.
     /// Requires bidirectional consent: the source context must allow outbound
@@ -392,7 +392,7 @@ public extension Context {
         return OutletSessionResult(sessionId: sessionId)
     }
 
-    /// Invokes a outlet within an active session.
+    /// Invokes an outlet within an active session.
     ///
     /// Delegates to the UniFFI ``outletSessionInvoke`` bridge function.
     /// Each invocation increments the session call count and checks
@@ -478,7 +478,7 @@ public extension Context {
 
     // MARK: - Bidirectional Consent Protocol (§6.2.0.1)
 
-    /// Exposes a outlet interface for cross-context sharing (step 1).
+    /// Exposes an outlet interface for cross-context sharing (step 1).
     ///
     /// The caller (admin of the source context) proposes sharing a specific
     /// outlet with a target context.

@@ -353,7 +353,7 @@ impl SpendingCapability {
 ///    `ContextRoleState::member_has_capability`. See the `MessagesWrite`
 ///    check in `scp-runtime/src/context/manager/messaging.rs` (send path),
 ///    and the `ToolInvoke` / `ToolInvokeAll` check in
-///    `scp-runtime/src/context/tools/invoke.rs` (tool path). A member whose
+///    `scp-runtime/src/context/outlets/invoke.rs` (outlet path). A member whose
 ///    role does not grant the required capability is rejected at the gate,
 ///    before this function is ever called.
 ///

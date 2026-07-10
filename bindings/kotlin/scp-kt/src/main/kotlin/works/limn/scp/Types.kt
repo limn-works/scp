@@ -114,7 +114,7 @@ enum class ShadowStatus(val rawValue: String) {
 // ---------------------------------------------------------------------------
 
 /**
- * Per-invocation cost metadata for a outlet (spec section 5.4.1).
+ * Per-invocation cost metadata for an outlet (spec section 5.4.1).
  *
  * All monetary values are in the smallest currency unit (e.g., cents
  * for USD, satoshis for BTC).
@@ -135,7 +135,7 @@ data class OutletCost(
 )
 
 /**
- * Definition of a outlet that can be registered in an SCP context.
+ * Definition of an outlet that can be registered in an SCP context.
  *
  * Provides a typed Kotlin data class for constructing outlet definitions
  * that are serialized to JSON for the FFI bridge layer.

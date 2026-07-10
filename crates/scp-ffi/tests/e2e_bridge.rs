@@ -160,7 +160,7 @@ fn create_test_context(bi: &PyBridgeInstance, creator_did: &str) -> String {
     context_id
 }
 
-/// Builds a outlet registration `PyDict` with valid schema (2+ properties).
+/// Builds an outlet registration `PyDict` with valid schema (2+ properties).
 fn build_outlet_reg<'py>(py: Python<'py>, name: &str, operator_did: &str) -> Bound<'py, PyDict> {
     let reg = PyDict::new(py);
     reg.set_item("name", name).unwrap();
@@ -1315,7 +1315,7 @@ fn cross_domain_identity_context_outlet_eventlog_provenance() {
         })
         .unwrap();
 
-        // Register a outlet using the helper.
+        // Register an outlet using the helper.
         let reg = build_outlet_reg(py, "cross_domain_outlet", &did_a);
         let outlet_id = scp.outlet_register(&ctx_id, &reg.as_borrowed()).unwrap();
         assert!(!outlet_id.is_empty());

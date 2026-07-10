@@ -228,7 +228,7 @@ describe("scp.outletInvokeCrossContext", () => {
     await scp.shutdown(1);
   });
 
-  it("invokes a outlet across contexts and returns result", async () => {
+  it("invokes an outlet across contexts and returns result", async () => {
     const identity = await scp.identityCreate("in_memory");
     const sourceHandle = await scp.contextCreate(identity, "{}");
     const targetHandle = await scp.contextCreate(identity, "{}");
@@ -693,7 +693,7 @@ describe("scp.outletSessionInvoke", () => {
     await scp.shutdown(1);
   });
 
-  it("invokes a outlet within a session and returns result with call-count provenance", async () => {
+  it("invokes an outlet within a session and returns result with call-count provenance", async () => {
     const identity = await scp.identityCreate("in_memory");
     const handle = await scp.contextCreate(identity, "{}");
     const outletId = await scp.outletRegister(handle._rawHandle, {

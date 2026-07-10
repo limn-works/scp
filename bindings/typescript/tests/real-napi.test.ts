@@ -508,7 +508,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
   // ---------------------------------------------------------------------------
 
   describe("Outlets (real NAPI)", () => {
-    test("registers a outlet and returns a outlet ID", async () => {
+    test("registers an outlet and returns an outlet ID", async () => {
       const identity = await napi.identityCreate("in_memory");
       const ctx = await napi.contextCreate(
         identity,
@@ -566,7 +566,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       expect(parsed).toBeTruthy();
     });
 
-    test("registers a outlet whose cost.amount exceeds 2^53 (bigint boundary, ADR-060)", async () => {
+    test("registers an outlet whose cost.amount exceeds 2^53 (bigint boundary, ADR-060)", async () => {
       const identity = await napi.identityCreate("in_memory");
       const ctx = await napi.contextCreate(
         identity,
@@ -627,7 +627,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       ).rejects.toThrow(/SCP-VALID-7001/);
     });
 
-    test("verifies a outlet and returns a verification result", async () => {
+    test("verifies an outlet and returns a verification result", async () => {
       const identity = await napi.identityCreate("in_memory");
       const ctx = await napi.contextCreate(
         identity,

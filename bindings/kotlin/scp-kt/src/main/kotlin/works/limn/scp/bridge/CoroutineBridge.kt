@@ -761,7 +761,7 @@ interface BroadcastBindings {
  */
 interface OutletBindings {
     /**
-     * Registers a outlet in an SCP context.
+     * Registers an outlet in an SCP context.
      *
      * Validates the outlet definition (name, input/output JSON schemas,
      * test vectors, implementation hash) and adds it to the context's
@@ -818,7 +818,7 @@ interface OutletBindings {
     ): String
 
     /**
-     * Verifies a outlet's registration status in an SCP context.
+     * Verifies an outlet's registration status in an SCP context.
      *
      * Checks that the outlet is registered and returns its verification
      * result including whether it passed and any failure details.
@@ -836,7 +836,7 @@ interface OutletBindings {
     ): String
 
     /**
-     * Exposes a outlet interface for cross-context sharing (§6.2.0.1 step 1).
+     * Exposes an outlet interface for cross-context sharing (§6.2.0.1 step 1).
      *
      * @param contextHandle Opaque handle for the source context.
      * @param outletId The ID of the outlet to expose.
@@ -881,7 +881,7 @@ interface OutletBindings {
     ): String
 
     /**
-     * Invokes a outlet across context boundaries (spec section 6.2).
+     * Invokes an outlet across context boundaries (spec section 6.2).
      *
      * Validates UCAN authorization against the target context, chain depth,
      * source context capability, and target context outlet existence.
@@ -969,7 +969,7 @@ interface OutletBindings {
     ): String
 
     /**
-     * Invokes a outlet within an active session.
+     * Invokes an outlet within an active session.
      *
      * Each call is individually governed: the invoker must present a valid
      * UCAN token. Session state is carried forward across invocations.
@@ -1742,7 +1742,7 @@ class OutletBridge internal constructor(
     private val bridge: CoroutineBridge,
 ) {
     /**
-     * Register a outlet in a context.
+     * Register an outlet in a context.
      *
      * @param contextHandle Handle from context create or join.
      * @param definitionJson JSON-encoded outlet definition.
@@ -1797,7 +1797,7 @@ class OutletBridge internal constructor(
         }
 
     /**
-     * Verify a outlet's registration status in a context.
+     * Verify an outlet's registration status in a context.
      *
      * @param contextHandle Handle from context create or join.
      * @param outletId The outlet's ID.
@@ -1809,7 +1809,7 @@ class OutletBridge internal constructor(
     ): String = bridge.ffiCall { bindings.outletVerify(contextHandle, outletId) }
 
     /**
-     * Expose a outlet interface for cross-context sharing (§6.2.0.1 step 1).
+     * Expose an outlet interface for cross-context sharing (§6.2.0.1 step 1).
      *
      * @param contextHandle Handle for the source context.
      * @param outletId The ID of the outlet to expose.
@@ -1858,7 +1858,7 @@ class OutletBridge internal constructor(
         }
 
     /**
-     * Invoke a outlet across context boundaries (spec section 6.2).
+     * Invoke an outlet across context boundaries (spec section 6.2).
      *
      * @param sourceContextHandle Handle for the calling (source) context.
      * @param targetContextHandle Handle for the context containing the outlet.
@@ -1960,7 +1960,7 @@ class OutletBridge internal constructor(
         }
 
     /**
-     * Invoke a outlet within an active session.
+     * Invoke an outlet within an active session.
      *
      * @param contextHandle Handle for the context containing the session.
      * @param sessionId The session ID from [sessionCreate].

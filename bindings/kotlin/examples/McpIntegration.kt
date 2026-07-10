@@ -40,7 +40,7 @@ fun mcpIntegrationExample(bridge: CoroutineBridge) = runBlocking {
     val contextHandle = bridge.context.create(operatorHandle, paramsJson)
     println("Context handle: $contextHandle")
 
-    // Define a outlet using the typed OutletDefinition data class.
+    // Define an outlet using the typed OutletDefinition data class.
     // OutletDefinition.toJson() serializes to the JSON format expected by the FFI bridge.
     val outlet = OutletDefinition(
         name = "summarize",
