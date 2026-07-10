@@ -261,7 +261,7 @@ impl VerificationScheduler {
     /// If the tool already has a schedule, it is replaced. The first
     /// verification is due immediately (at now).
     ///
-    pub fn schedule_outlet_verification(
+    pub fn schedule_tool_verification(
         &mut self,
         outlet_id: &str,
         interval_secs: u64,
@@ -282,7 +282,7 @@ impl VerificationScheduler {
     /// Removes the verification schedule for a tool.
     ///
     /// Returns true if a schedule was removed.
-    pub fn unschedule_outlet_verification(&mut self, outlet_id: &str) -> bool {
+    pub fn unschedule_tool_verification(&mut self, outlet_id: &str) -> bool {
         self.schedules.remove(outlet_id).is_some()
     }
 
@@ -295,7 +295,7 @@ impl VerificationScheduler {
     /// Returns all tool IDs that are due for verification at the given
     /// timestamp.
     #[must_use]
-    pub fn outlets_due_at(&self, now: u64) -> Vec<OutletId> {
+    pub fn tools_due_at(&self, now: u64) -> Vec<OutletId> {
         self.schedules
             .values()
             .filter(|s| now >= s.next_verification_at)
@@ -305,9 +305,9 @@ impl VerificationScheduler {
 
     /// Returns all tool IDs that are currently due for verification.
     #[must_use]
-    pub fn outlets_due_now(&self, clock: &dyn Clock) -> Vec<OutletId> {
+    pub fn tools_due_now(&self, clock: &dyn Clock) -> Vec<OutletId> {
         let now = clock.now_secs();
-        self.outlets_due_at(now)
+        self.tools_due_at(now)
     }
 
     /// Records that a tool was verified at the given timestamp, advancing
@@ -353,11 +353,13 @@ mod tests {
         let mut registry = OutletRegistry::new();
         let reg = OutletRegistration {
             outlet_id: outlet_id.to_owned(),
+            kind: crate::context::outlets::OutletKind::Action,
             name: format!("Test Tool {outlet_id}"),
             description: "A test tool".to_owned(),
             schema: OutletSchema {
                 input_schema: json!({"type": "object"}),
                 output_schema: json!({"type": "object"}),
+                aggregate_schema: None,
             },
             implementation_hash: [0u8; 32],
             test_vectors,
@@ -365,6 +367,7 @@ mod tests {
             cost: None,
             registered_at: 0,
             signature: Vec::new(),
+            message_catalog: Vec::new(),
         };
         registry.insert(reg);
         registry
@@ -572,14 +575,14 @@ mod tests {
         let mut scheduler = VerificationScheduler::new();
         assert!(scheduler.is_empty());
 
-        let schedule = scheduler.schedule_outlet_verification("tool-a", 300, &clock);
+        let schedule = scheduler.schedule_tool_verification("tool-a", 300, &clock);
         assert_eq!(schedule.outlet_id, "tool-a");
         assert_eq!(schedule.interval_secs, 300);
         assert!(schedule.last_verified_at.is_none());
 
         assert_eq!(scheduler.len(), 1);
 
-        let due = scheduler.outlets_due_now(&clock);
+        let due = scheduler.tools_due_now(&clock);
         assert!(due.contains(&"tool-a".to_owned()));
     }
 
@@ -587,7 +590,7 @@ mod tests {
     fn record_verification_advances_schedule() {
         let clock = scp_clock::SystemClock;
         let mut scheduler = VerificationScheduler::new();
-        scheduler.schedule_outlet_verification("tool-b", 600, &clock);
+        scheduler.schedule_tool_verification("tool-b", 600, &clock);
 
         let now = clock.now_secs();
         scheduler.record_verification("tool-b", now);
@@ -596,10 +599,10 @@ mod tests {
         assert_eq!(schedule.last_verified_at, Some(now));
         assert_eq!(schedule.next_verification_at, now + 600);
 
-        let due = scheduler.outlets_due_at(now);
+        let due = scheduler.tools_due_at(now);
         assert!(due.is_empty());
 
-        let due_later = scheduler.outlets_due_at(now + 600);
+        let due_later = scheduler.tools_due_at(now + 600);
         assert!(due_later.contains(&"tool-b".to_owned()));
     }
 
@@ -607,20 +610,20 @@ mod tests {
     fn unschedule_removes_entry() {
         let clock = scp_clock::SystemClock;
         let mut scheduler = VerificationScheduler::new();
-        scheduler.schedule_outlet_verification("tool-c", 100, &clock);
+        scheduler.schedule_tool_verification("tool-c", 100, &clock);
         assert_eq!(scheduler.len(), 1);
 
-        assert!(scheduler.unschedule_outlet_verification("tool-c"));
+        assert!(scheduler.unschedule_tool_verification("tool-c"));
         assert!(scheduler.is_empty());
-        assert!(!scheduler.unschedule_outlet_verification("tool-c"));
+        assert!(!scheduler.unschedule_tool_verification("tool-c"));
     }
 
     #[test]
     fn reschedule_replaces_existing() {
         let clock = scp_clock::SystemClock;
         let mut scheduler = VerificationScheduler::new();
-        scheduler.schedule_outlet_verification("tool-d", 100, &clock);
-        scheduler.schedule_outlet_verification("tool-d", 500, &clock);
+        scheduler.schedule_tool_verification("tool-d", 100, &clock);
+        scheduler.schedule_tool_verification("tool-d", 500, &clock);
 
         assert_eq!(scheduler.len(), 1);
         let schedule = scheduler.get_schedule("tool-d").unwrap();
@@ -631,18 +634,18 @@ mod tests {
     fn multiple_tools_due() {
         let clock = scp_clock::SystemClock;
         let mut scheduler = VerificationScheduler::new();
-        scheduler.schedule_outlet_verification("t1", 100, &clock);
-        scheduler.schedule_outlet_verification("t2", 200, &clock);
-        scheduler.schedule_outlet_verification("t3", 300, &clock);
+        scheduler.schedule_tool_verification("t1", 100, &clock);
+        scheduler.schedule_tool_verification("t2", 200, &clock);
+        scheduler.schedule_tool_verification("t3", 300, &clock);
 
-        let due = scheduler.outlets_due_now(&clock);
+        let due = scheduler.tools_due_now(&clock);
         assert_eq!(due.len(), 3);
 
         let now = clock.now_secs();
         scheduler.record_verification("t1", now);
         scheduler.record_verification("t2", now);
 
-        let due = scheduler.outlets_due_at(now);
+        let due = scheduler.tools_due_at(now);
         assert_eq!(due.len(), 1);
         assert_eq!(due[0], "t3");
     }

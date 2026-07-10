@@ -2253,14 +2253,17 @@ mod tests {
             GovernanceAction::RegisterTool {
                 registration: Box::new(OutletRegistration {
                     outlet_id: "search".to_owned(),
+                    kind: crate::context::outlets::OutletKind::Action,
                     name: "search".to_owned(),
                     description: "Search tool".to_owned(),
                     schema: crate::context::outlets::OutletSchema {
                         input_schema: serde_json::json!({"type": "object"}),
                         output_schema: serde_json::json!({"type": "object"}),
+                        aggregate_schema: None,
                     },
                     implementation_hash: [0u8; 32],
                     test_vectors: vec![],
+                    message_catalog: Vec::new(),
                     operator_did: "did:dht:z6MkTestOperator".into(),
                     cost: None,
                     registered_at: 0,
@@ -2316,7 +2319,6 @@ mod tests {
                     target_context: "ctx-tgt".to_owned(),
                     outlet_id: "tool-1".to_owned(),
                     rate_limit: None,
-                    inbound_rate_limit: None,
                     per_caller_rate_limit: None,
                     approved_by_source: true,
                     approved_by_target: false,
@@ -2818,14 +2820,17 @@ mod tests {
             GovernanceAction::RegisterTool {
                 registration: Box::new(OutletRegistration {
                     outlet_id: "calc".to_owned(),
+                    kind: crate::context::outlets::OutletKind::Action,
                     name: "calc".to_owned(),
                     description: "Calculator tool".to_owned(),
                     schema: crate::context::outlets::OutletSchema {
                         input_schema: serde_json::json!({"type": "object"}),
                         output_schema: serde_json::json!({"type": "object"}),
+                        aggregate_schema: None,
                     },
                     implementation_hash: [0u8; 32],
                     test_vectors: vec![],
+                    message_catalog: Vec::new(),
                     operator_did: "did:dht:z6MkTestOperator".into(),
                     cost: None,
                     registered_at: 0,

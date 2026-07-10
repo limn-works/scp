@@ -55,6 +55,26 @@ pub use super::roles::RoleDefinition;
 pub use super::outlets::OutletRegistration;
 
 // ---------------------------------------------------------------------------
+// OutletInterfaceDefaults (re-export — spec §6.2.0.2 classification-aware
+// rate tiers)
+// ---------------------------------------------------------------------------
+
+/// Re-export of [`super::outlets::interface::OutletInterfaceDefaults`] —
+/// the §6.2.0.2 classification-aware cross-context rate-tier defaults.
+///
+/// `OutletInterfaceDefaults::for_kind(OutletKind::Query)` returns
+/// `(per_interface = 600, per_caller = 100)`;
+/// `OutletInterfaceDefaults::for_kind(OutletKind::Action)` returns
+/// `(60, 10)` — the pre-classification baseline preserved for the Action
+/// tier per §6.2.0.2. Callers MUST use this helper rather than hardcoding
+/// `60` or `600` so a future spec revision that adjusts the tiers updates
+/// one helper and every call site follows.
+///
+/// See [`super::outlets::interface::OutletInterfaceDefaults`] for full
+/// rationale.
+pub use super::outlets::interface::OutletInterfaceDefaults;
+
+// ---------------------------------------------------------------------------
 // ContextMode
 // ---------------------------------------------------------------------------
 
@@ -1071,14 +1091,17 @@ mod tests {
             ],
             tools: vec![OutletRegistration {
                 outlet_id: "recipe-search".to_owned(),
+                kind: crate::context::outlets::OutletKind::Action,
                 name: "recipe-search".to_owned(),
                 description: "Search for recipes".to_owned(),
                 schema: OutletSchema {
                     input_schema: serde_json::json!({"type": "object"}),
                     output_schema: serde_json::json!({"type": "object"}),
+                    aggregate_schema: None,
                 },
                 implementation_hash: [0u8; 32],
                 test_vectors: vec![],
+                message_catalog: Vec::new(),
                 operator_did: "did:dht:z6MkTestOperator".into(),
                 cost: None,
                 registered_at: 0,
@@ -1139,14 +1162,17 @@ mod tests {
     fn tool_registration_clone_eq() {
         let tool = OutletRegistration {
             outlet_id: "search".to_owned(),
+            kind: crate::context::outlets::OutletKind::Action,
             name: "search".to_owned(),
             description: "Search tool".to_owned(),
             schema: OutletSchema {
                 input_schema: serde_json::json!({"type": "object"}),
                 output_schema: serde_json::json!({"type": "object"}),
+                aggregate_schema: None,
             },
             implementation_hash: [0u8; 32],
             test_vectors: vec![],
+            message_catalog: Vec::new(),
             operator_did: "did:dht:z6MkTestOperator".into(),
             cost: None,
             registered_at: 0,

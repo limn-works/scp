@@ -7,24 +7,30 @@
 //! schema, implementation hash, test vectors, and operator DID -- providing
 //! verifiable integrity (spec section 7.3.3).
 //!
-//! See ADR-010 in `.docs/adrs/phase-2.md` for the full design.
+//! See ADR-010 in `.docs/adrs/phase-2.md` for the original design and ADR-049
+//! for the streaming-native invocation redesign (§5).
 //!
 //! # Modules
 //!
-//! - [`registry`] -- Tool registration storage, `register_outlet`, `update_outlet`,
-//!   `verify_outlet`.
+//! - [`registry`] -- Tool registration storage, `register_outlet`,
+//!   `update_outlet`, `verify_outlet`.
 //! - [`schema`] -- JSON Schema validation helpers and MCP compatibility.
-//! - `invoke` (in `scp-runtime`) -- Tool invocation with full execution lifecycle:
-//!   capability checking, schema validation, timeout, cancellation.
-//! - [`lifecycle`] -- Request/response types, status codes, error codes,
-//!   cancellation, and event log integration for tool invocations.
+//! - `invoke` (in `scp-runtime`) -- Outlet invocation with full execution
+//!   lifecycle: capability checking, schema validation, timeout, cancellation.
+//! - [`lifecycle`] -- Request types, terminal status, cancellation, and event
+//!   log integration for outlet invocations.
+//! - [`stream`] -- §5.4.5 streaming wire types: `OutletStreamOpen`,
+//!   `OutletStreamChunk`, `OutletStreamCredit`, `ChunkPayload`,
+//!   `StreamTerminalStatus`. The legacy non-streaming `OutletResponse` was
+//!   deleted by the streaming-native redesign (ADR-049 §5).
 //!
 //! # Types
 //!
 //! - [`OutletId`] -- Unique identifier for a registered tool.
+//! - [`OutletKind`] -- Structural classification (`Query` / `Action`, §5.4.2).
 //! - [`OutletError`] -- Error type for tool operations.
 //! - [`OutletRegistration`] -- Full tool registration with schema, hash, test
-//!   vectors, and operator DID. (Re-exported from [`registry`].)
+//!   vectors, and operator DID. (Re-exported from [`registration`].)
 //! - [`OutletSchema`] -- MCP-compatible JSON Schema for input/output.
 //!   (Re-exported from [`registry`].)
 //! - [`OutletTestVector`] -- Known input-output pair for tool verification.
@@ -33,21 +39,25 @@
 //!   (Re-exported from [`registry`].)
 //! - [`OutletRequest`] -- Tool invocation request. (Re-exported from
 //!   [`lifecycle`].)
-//! - [`OutletResponse`] -- Tool invocation response. (Re-exported from
-//!   [`lifecycle`].)
 //! - [`OutletStatus`] -- Invocation terminal status. (Re-exported from
 //!   [`lifecycle`].)
-//! - [`OutletExecutionError`] -- Structured execution error. (Re-exported from
-//!   [`lifecycle`].)
-//! - [`OutletErrorCode`] -- Error code enum. (Re-exported from [`lifecycle`].)
 //! - [`OutletCancel`] -- Cancellation request. (Re-exported from [`lifecycle`].)
+//! - [`OutletStreamOpen`] / [`OutletStreamChunk`] / [`OutletStreamCredit`] /
+//!   [`ChunkPayload`] / [`StreamTerminalStatus`] -- §5.4.5 streaming wire
+//!   types. (Re-exported from [`stream`].)
 
 pub mod cross_context_saga;
+pub mod error_codes;
+pub mod errors;
+pub mod hash;
 pub mod integrity;
 pub mod interface;
 pub mod lifecycle;
+pub mod message_catalog;
+pub mod registration;
 pub mod registry;
 pub mod schema;
+pub mod stream;
 pub mod summary;
 
 use crate::context::roles;
@@ -56,15 +66,99 @@ pub use cross_context_saga::{
     CommittedSide, CrossContextDivergenceMarker, CrossContextOutletReceipt, CrossContextSagaError,
     XCTX_DIVERGENCE_DOMAIN, XCTX_RECEIPT_DOMAIN,
 };
-pub use lifecycle::{
-    DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS, OutletCancel, OutletErrorCode, OutletExecutionError,
-    OutletInvokedEvent, OutletRequest, OutletResponse, OutletStatus, Provenance, sha256_json,
+pub use hash::{
+    OUTLET_REGISTRATION_V2_DOMAIN, catalog_hash, compute_outlet_registration_canonical_bytes,
+    cost_hash, description_hash, outlet_registration_v2_preimage, schema_hash, test_vectors_hash,
 };
+pub use lifecycle::{
+    AuditAnomaly, DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS, OutletCancel, OutletInvokedEvent,
+    OutletRequest, OutletStatus, Provenance, sha256_json,
+};
+pub use message_catalog::{
+    CATALOG_MAX_ENTRIES, MessageTemplate, MessageTemplateError, TEMPLATE_MAX_BYTES,
+    canonical_catalog_messagepack, empty_catalog_messagepack,
+};
+pub use registration::{OutletRegistration, RegistrationError};
 pub use registry::{
-    OutletCost, OutletRegistration, OutletRegistry, OutletSchema, OutletTestVector,
-    OutletVerificationResult, VectorResult, register_outlet, update_outlet, verify_outlet,
+    OutletCost, OutletRegistry, OutletSchema, OutletTestVector, OutletVerificationResult,
+    VectorResult, register_outlet, update_outlet, verify_outlet,
 };
 pub use schema::{SchemaValidationError, validate_schema, validate_value_against_schema};
+pub use stream::{
+    CancelSigningInputs, ChunkPayload, CreditGrantSigningInputs, DEFAULT_CREDIT_WINDOW,
+    DEFAULT_STREAM_CREDIT_STALL_SECS, DEFAULT_STREAM_UCAN_RECHECK_SECS, Ed25519Signature, MlsEpoch,
+    OpenObservation, OutletStreamCancel, OutletStreamChunk, OutletStreamCredit, OutletStreamOpen,
+    RequestId, SCP_OUTLET_CANCEL_V1, SCP_OUTLET_CAVEAT_BIND_V1, SCP_OUTLET_CHUNK_SIG_V1,
+    SCP_OUTLET_CHUNK_V1, SCP_OUTLET_CREDIT_V1, SessionState, StreamRejection, StreamTerminalStatus,
+    compute_cancel_sig_preimage, compute_caveats_binding, compute_chunk_sig_preimage,
+    compute_credit_sig_preimage, evaluate_open_pinning, evaluate_revocation_recheck,
+    evaluate_session_open, sign_cancel, sign_chunk, sign_credit_grant, verify_cancel_signature,
+    verify_chunk_signature, verify_credit_signature,
+};
+
+// ---------------------------------------------------------------------------
+// OutletKind
+// ---------------------------------------------------------------------------
+
+/// Structural classification of an outlet (spec §5.4.2).
+///
+/// Every outlet declares its semantic class at registration time. The
+/// classification is structural, not advisory — the runtime enforces it.
+///
+/// - [`OutletKind::Query`] — read-only, idempotent, semantically cacheable
+///   (§5.4.2 cache property; §5.4.3 cache deferred). A Query outlet MUST
+///   declare either no cost or `cost.amount == 0` and MUST NOT carry a
+///   `cost_formula`. Invocation runs through a `ReadOnlyInvocation` handle
+///   that denies writes to context state. UCAN stem: `outlet_query:{id}`.
+/// - [`OutletKind::Action`] — may mutate context state. No structural cost
+///   floor. Invocation runs through a `MutableInvocation` handle. UCAN stem:
+///   `outlet_call:{id}`.
+///
+/// **Default.** [`OutletKind::Action`] is the fail-safe default per §5.4.2 —
+/// an undeclared kind cannot accidentally be treated as read-only. Wire
+/// deserialization that omits the `kind` field produces `Action` for the
+/// same reason.
+///
+/// **Wire form.** Serializes as the lowercase string `"query"` or `"action"`
+/// (§5.4.2 wire vocabulary). The struct field on
+/// [`registry::OutletRegistration`] is named `kind`, so the on-wire
+/// representation is `"kind": "query"` or `"kind": "action"`.
+///
+/// **Canonical preimage.** The §5.4.1 `SCP-OUTLET-REGISTRATION-V2:` preimage
+/// includes a fixed-width `kind_byte` between `outlet_id` and `name`:
+/// `0x00` for Query, `0x01` for Action.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize, Default,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum OutletKind {
+    /// Read-only, idempotent, cacheable. `ReadOnlyInvocation` guard applies
+    /// (§5.4.2). UCAN stem: `outlet_query:{id}`.
+    Query,
+    /// May mutate context state. Never cached (§5.4.2). UCAN stem:
+    /// `outlet_call:{id}`. Fail-safe default.
+    #[default]
+    Action,
+}
+
+impl OutletKind {
+    /// Returns the canonical 1-byte preimage tag for this kind per §5.4.1.
+    ///
+    /// - `OutletKind::Query` → `0x00`
+    /// - `OutletKind::Action` → `0x01`
+    ///
+    /// The byte is included verbatim in the
+    /// `SCP-OUTLET-REGISTRATION-V2:` canonical preimage between `outlet_id`
+    /// and `name`. Adding new variants in the future requires extending the
+    /// preimage rule and bumping the domain separator.
+    #[must_use]
+    pub const fn canonical_byte(self) -> u8 {
+        match self {
+            Self::Query => 0x00,
+            Self::Action => 0x01,
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // OutletId
@@ -337,6 +431,20 @@ pub enum OutletError {
         /// Human-readable description of the serialization failure.
         reason: String,
     },
+
+    /// A Query outlet violated the §5.4.2 structural cost floor (SCP-OUT-012).
+    ///
+    /// `OutletKind::Query` outlets MUST declare either no cost or a cost
+    /// whose `amount == 0`, AND MUST NOT carry a `cost_formula`. Declaring
+    /// a positive cost or a pricing formula on a Query outlet is a
+    /// validation failure rejected before the registration reaches the
+    /// event log. Maps to `OutletErrorClass::Protocol::QueryCostViolation`
+    /// per §5.4.4 (typed class lands with SCP-OUT-036/038).
+    #[error("Query outlet cost violation (§5.4.2): {reason}")]
+    QueryCostViolation {
+        /// Human-readable reason — which sub-rule was violated.
+        reason: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -385,9 +493,58 @@ pub struct OutletUpdatedEvent {
     pub changed_fields: Vec<String>,
 }
 
+/// Reason for an `OutletVerifiedEvent` integrity-failure (spec §5.4.2).
+///
+/// Disambiguates the cause of `integrity_ok == false`:
+///
+/// - [`OutletVerifiedReason::TestVectorFailed`] — one or more registered test
+///   vectors did not match the executor's output. Carries no further detail —
+///   the [`OutletVerificationResult`] alongside the event holds the per-vector
+///   results.
+/// - [`OutletVerifiedReason::QueryMisdeclaration`] — a Query outlet's executor
+///   attempted a write through `MutableInvocation` (or invoked through the
+///   wrong `OutletExecutor` half), tripping the runtime deny-list. The
+///   operator-attributable signal defined in spec §5.4.2 "Misdeclaration
+///   signal" — used by participation records (§7.3.2) to attribute the
+///   failure to the outlet's `operator_did`. Wire form: `"query-misdeclaration"`
+///   so the on-wire string matches the spec's `query_misdeclaration` slug
+///   (with the canonical kebab-case rendering used elsewhere in the
+///   `OutletErrorClass` slug taxonomy — §5.4.4).
+/// - [`OutletVerifiedReason::HandlerPanicked`] — the outlet's executor panicked
+///   inside `exec_query` / `exec_action`. The runtime catches the panic via
+///   `std::panic::catch_unwind`, recovers, and emits this signal as the §5.4.2
+///   parallel of `QueryMisdeclaration`. Per ADR-049 §148 "Every `OutletExecutor`
+///   is wrapped in `catch_unwind`. A panic inside an executor maps to
+///   `SCP-TOOL-6130` (handler-panic) with an operator-attributable
+///   integrity-failure signal." Wire form: `"handler-panicked"`. The signal
+///   attributes the failure to the outlet's `operator_did` — panics are a
+///   protocol-visible signal of operator-side defect, not an SDK-internal bug.
+///   See SCP-OUT-028.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum OutletVerifiedReason {
+    /// At least one registered test vector failed to match the executor's
+    /// output during a [`verify_outlet`](registry::verify_outlet) run.
+    TestVectorFailed,
+    /// A Query outlet's executor attempted to mutate context state through a
+    /// write-side handle (or the dispatched executor half returned
+    /// `KindMismatch`). Operator-attributable per spec §5.4.2 — wired by the
+    /// `ReadOnlyInvocation` deny-list (SCP-OUT-013).
+    QueryMisdeclaration,
+    /// The outlet's executor panicked inside `exec_query` / `exec_action`.
+    /// The runtime catches the panic via `std::panic::catch_unwind`, recovers,
+    /// and surfaces the failure as `SCP-TOOL-6130` `execution.handler-panic`.
+    /// Operator-attributable per spec §5.4.2 / ADR-049 §148 — wired by the
+    /// `invoke_outlet` panic guard (SCP-OUT-028).
+    HandlerPanicked,
+}
+
 /// Event payload for a `ToolVerified` event in the context event log.
 ///
-/// Records the verification result for auditability.
+/// Records the verification result for auditability. `reason` carries the
+/// failure category when `integrity_ok == false`; it is omitted from the
+/// wire envelope when `integrity_ok == true` per the spec §5.4.2 invariant
+/// that a successful verification has no failure reason to attribute.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct OutletVerifiedEvent {
     /// The verified tool's ID.
@@ -398,6 +555,12 @@ pub struct OutletVerifiedEvent {
     pub failed: usize,
     /// Overall integrity assessment.
     pub integrity_ok: bool,
+    /// Categorized reason for `integrity_ok == false` (spec §5.4.2
+    /// "Misdeclaration signal"). `None` when `integrity_ok == true` or when
+    /// emitted from legacy code paths that pre-date the kebab-case taxonomy.
+    /// Always `Some` when the runtime emits an integrity-failure event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<OutletVerifiedReason>,
 }
 
 // ---------------------------------------------------------------------------
