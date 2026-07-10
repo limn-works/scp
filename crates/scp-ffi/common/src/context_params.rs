@@ -14,7 +14,7 @@ use std::time::Duration;
 use scp_core::context::ContextParams;
 use scp_core::context::params::{
     CeilingPolicy, ConsequenceConfig, ContextMode, GovernanceModel, IncompleteVerificationPolicy,
-    MemoryScope, MetadataVisibilityPolicy, PromotionPolicy, RoleDefinition, ToolRegistration,
+    MemoryScope, MetadataVisibilityPolicy, PromotionPolicy, RoleDefinition, OutletRegistration,
 };
 use scp_core::context::roles::Capability;
 use scp_core::provenance::CounterpartyPolicy;
@@ -97,8 +97,8 @@ pub struct CommonContextParams {
     /// Used by `PyO3` bridge; others leave empty.
     pub roles: Vec<(String, Vec<String>)>,
 
-    /// Initial tool names. Used by `PyO3` bridge; others leave empty.
-    pub tools: Vec<String>,
+    /// Initial outlet names. Used by `PyO3` bridge; others leave empty.
+    pub outlets: Vec<String>,
 
     /// Optional template identifier (spec §5.14). Used by `PyO3` bridge.
     pub template_id: Option<String>,
@@ -155,7 +155,7 @@ pub fn build_context_params(params: &CommonContextParams) -> Result<ContextParam
         ceiling_policy,
         promotion_policy,
         roles: build_roles(&params.roles),
-        tools: build_tools(&params.tools),
+        tools: build_outlets(&params.outlets),
         ttl,
         memory_scope,
         governance,
@@ -280,17 +280,17 @@ fn build_roles(roles: &[(String, Vec<String>)]) -> Vec<RoleDefinition> {
         .collect()
 }
 
-/// Converts tool name strings into core `ToolRegistration` values with
+/// Converts outlet name strings into core `OutletRegistration` values with
 /// placeholder schemas and metadata (matching the existing `PyO3` bridge
-/// behavior for bridge-level tool declarations).
-fn build_tools(tools: &[String]) -> Vec<ToolRegistration> {
-    tools
+/// behavior for bridge-level outlet declarations).
+fn build_outlets(outlets: &[String]) -> Vec<OutletRegistration> {
+    outlets
         .iter()
-        .map(|name| ToolRegistration {
-            tool_id: name.clone(),
+        .map(|name| OutletRegistration {
+            outlet_id: name.clone(),
             name: name.clone(),
             description: String::new(),
-            schema: scp_core::context::tools::ToolSchema {
+            schema: scp_core::context::outlets::OutletSchema {
                 input_schema: serde_json::Value::Object(serde_json::Map::default()),
                 output_schema: serde_json::Value::Object(serde_json::Map::default()),
             },
@@ -321,7 +321,7 @@ fn parse_template_id(tid: &str) -> Result<scp_core::context::params::TemplateId,
         "GroupDiscussion" => Ok(TemplateId::GroupDiscussion),
         "PublicBroadcast" => Ok(TemplateId::PublicBroadcast),
         "GatedBroadcast" => Ok(TemplateId::GatedBroadcast),
-        "scp:template/tool-interface" | "ToolInterfaceTemplate" => {
+        "scp:template/tool-interface" | "OutletInterfaceTemplate" => {
             Ok(TemplateId::ToolInterfaceTemplate)
         }
         "PaidService" | "scp:template/paid-service" => Ok(TemplateId::PaidService),
@@ -535,9 +535,9 @@ mod tests {
     }
 
     #[test]
-    fn tools_converted() {
+    fn outlets_converted() {
         let ctx = build_ok(&CommonContextParams {
-            tools: vec!["calculator".to_owned()],
+            outlets: vec!["calculator".to_owned()],
             ..Default::default()
         });
         assert_eq!(ctx.tools.len(), 1);

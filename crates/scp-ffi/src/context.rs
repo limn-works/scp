@@ -185,7 +185,7 @@ impl PyContextHandle {
 /// The dict may contain any of these keys (all optional):
 /// - `ceiling` -- list of capability strings
 /// - `roles` -- dict mapping role names to lists of capability strings
-/// - `tools` -- list of tool name strings
+/// - `outlets` -- list of outlet name strings
 /// - `ttl` -- float (seconds) or `None`
 /// - `memory_scope` -- string: "ephemeral", "summary", "full"
 /// - `governance` -- string: `"single_admin"`
@@ -203,8 +203,8 @@ pub struct PyContextParams {
     ceiling: Vec<String>,
     /// Role definitions mapping role names to capability lists.
     roles: HashMap<String, Vec<String>>,
-    /// Initial tool registrations by name.
-    tools: Vec<String>,
+    /// Initial outlet registrations by name.
+    outlets: Vec<String>,
     /// Optional time-to-live in seconds.
     ttl: Option<f64>,
     /// Memory scope: "ephemeral", "summary", or "full".
@@ -249,7 +249,7 @@ impl PyContextParams {
     /// # Arguments
     ///
     /// * `params` -- A Python dict with optional keys: `ceiling`, `roles`,
-    ///   `tools`, `ttl`, `memory_scope`, `governance`, `mode`,
+    ///   `outlets`, `ttl`, `memory_scope`, `governance`, `mode`,
     ///   `ceiling_policy`, `promotion_policy`, `template_id`,
     ///   `economic_policy`.
     ///
@@ -273,8 +273,8 @@ impl PyContextParams {
     }
 
     #[getter]
-    fn tools(&self) -> Vec<String> {
-        self.tools.clone()
+    fn outlets(&self) -> Vec<String> {
+        self.outlets.clone()
     }
 
     #[getter]
@@ -373,7 +373,7 @@ impl PyContextParams {
 
     fn __repr__(&self) -> String {
         format!(
-            "PyContextParams(ceiling={:?}, roles={:?}, tools={:?}, ttl={:?}, \
+            "PyContextParams(ceiling={:?}, roles={:?}, outlets={:?}, ttl={:?}, \
              memory_scope='{}', governance='{}', mode='{}', ceiling_policy='{}', \
              promotion_policy='{}', template_id={:?}, economic_policy={:?}, \
              min_protocol_version={:?}, max_chain_depth={:?}, \
@@ -381,7 +381,7 @@ impl PyContextParams {
              consequence_rules={:?}, consequence_config={:?})",
             self.ceiling,
             self.roles,
-            self.tools,
+            self.outlets,
             self.ttl,
             self.memory_scope,
             self.governance,
@@ -441,8 +441,8 @@ impl PyContextParams {
             None => HashMap::new(),
         };
 
-        // tools: list[str] (default: empty)
-        let tools: Vec<String> = match dict.get_item("tools")? {
+        // outlets: list[str] (default: empty)
+        let outlets: Vec<String> = match dict.get_item("outlets")? {
             Some(val) => val.extract()?,
             None => Vec::new(),
         };
@@ -616,7 +616,7 @@ impl PyContextParams {
         Ok(Self {
             ceiling,
             roles,
-            tools,
+            outlets,
             ttl,
             memory_scope,
             governance,
@@ -704,7 +704,7 @@ impl PyContextParams {
                 (rd.name.clone(), caps)
             })
             .collect();
-        let tools: Vec<String> = params.tools.iter().map(|t| t.name.clone()).collect();
+        let outlets: Vec<String> = params.tools.iter().map(|t| t.name.clone()).collect();
 
         // JSON-backed projections. `None` when absent/empty/default so the
         // getters honor their "None means default/free" contract.
@@ -731,7 +731,7 @@ impl PyContextParams {
         Self {
             ceiling,
             roles,
-            tools,
+            outlets,
             ttl: params.ttl.map(|d| d.as_secs_f64()),
             memory_scope,
             governance,
@@ -1383,7 +1383,7 @@ fn drain_and_deliver(bi: &crate::runtime::PyBridgeInstance, context_id: &str) {
 /// via the FFI state registry.
 ///
 /// Used by [`Self::context_close`] (the close teardown): on a successful
-/// close the FFI bridge state is removed (so bridge tool dispatch fails
+/// close the FFI bridge state is removed (so bridge outlet dispatch fails
 /// closed for the id — defense in depth; close itself is non-terminal for
 /// the supervisor actor and does not despawn it), but the `SystemClose`
 /// event the close produces must still reach an active receiver. The
@@ -1456,7 +1456,7 @@ fn build_core_context_params(
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect(),
-        tools: py_params.tools.clone(),
+        outlets: py_params.outlets.clone(),
         template_id: py_params.template_id.clone(),
         governance_threshold: None, // PyO3 bridge uses string-only governance for now
         governance_signers: None,
@@ -1493,7 +1493,7 @@ fn build_core_context_params(
 /// `ed25519_dalek::SigningKey`. Required because the core governance
 /// lifecycle functions take `&SigningKey` directly.
 ///
-/// `pub(crate)` so the cross-context saga export in `tools.rs` can resolve
+/// `pub(crate)` so the cross-context saga export in `outlets.rs` can resolve
 /// each co-resident participant context's Active Signing Key (via that
 /// context's `creator_did`) without re-implementing the custody-export path.
 pub(crate) fn resolve_signing_key(
@@ -2103,7 +2103,7 @@ fn parse_template_id(
         "GroupDiscussion" => Ok(TemplateId::GroupDiscussion),
         "PublicBroadcast" => Ok(TemplateId::PublicBroadcast),
         "GatedBroadcast" => Ok(TemplateId::GatedBroadcast),
-        "scp:template/tool-interface" | "ToolInterfaceTemplate" => {
+        "scp:template/tool-interface" | "OutletInterfaceTemplate" => {
             Ok(TemplateId::ToolInterfaceTemplate)
         }
         "PaidService" => Ok(TemplateId::PaidService),
@@ -2254,8 +2254,8 @@ impl crate::scp::PyScp {
             parsed.clone(),
         );
 
-        // Register FFI-specific state (ToolRegistry, EventLog, RoleState, RevocationList)
-        // in the global FFI state registry so that tools/UCAN/event_log bridge functions
+        // Register FFI-specific state (OutletRegistry, EventLog, RoleState, RevocationList)
+        // in the global FFI state registry so that outlets/UCAN/event_log bridge functions
         // can look them up by context ID. Also initializes the shared ContextManager.
         crate::runtime::register_context(bi, &context_id, identity_did, &parsed.ceiling).map_err(
             |e| PyRuntimeError::new_err(format!("failed to register context state: {e}")),
@@ -2550,7 +2550,7 @@ impl crate::scp::PyScp {
                 });
             }
 
-            // Also update FFI bridge state's role_state for UCAN/tool capability checks.
+            // Also update FFI bridge state's role_state for UCAN/outlet capability checks.
             crate::runtime::with_ffi_state(bi, &context_id, |st| {
                 st.role_state.members.insert(member_did.clone());
                 Ok(())
@@ -2788,7 +2788,7 @@ impl crate::scp::PyScp {
         })
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
-        // Register the bridge-side FFI state (ToolRegistry / EventLog / RoleState)
+        // Register the bridge-side FFI state (OutletRegistry / EventLog / RoleState)
         // as a REVERSIBLE precheck BEFORE the irreversible runtime join. Mirrors
         // `context_create`, which registers FFI state first and rolls it back via
         // `remove_context` if the runtime step fails. The creator is the
@@ -3184,16 +3184,16 @@ impl crate::scp::PyScp {
         // rate limit fails open.
         //
         // The defense-in-depth value of removing the FFI bridge state (which
-        // backs `with_context` tool dispatch) is that, on a SUCCESSFUL
-        // close, the bridge tool-dispatch lookup fails closed first — once
-        // the state is gone, `with_context` returns `not found` and the tool
+        // backs `with_context` outlet dispatch) is that, on a SUCCESSFUL
+        // close, the bridge outlet-dispatch lookup fails closed first — once
+        // the state is gone, `with_context` returns `not found` and the outlet
         // cannot dispatch. To make that property honor close authorization,
         // the dispatch runs BEFORE removal: an unauthorized or otherwise
         // failing close (anything but the idempotent `ContextNotRegistered`)
         // returns early WITHOUT removing the FFI state, leaving the context
         // fully usable through this bridge instance. Restoring an already-
         // removed `FfiBridgeState` is not viable: it holds non-reconstructible
-        // live state (channel senders, registered tool handlers, sessions,
+        // live state (channel senders, registered outlet handlers, sessions,
         // the accumulated event log, nonce tracker, revocation list) that
         // `register_ffi_state` cannot rebuild — so the ordering is what
         // preserves the prior state on failure.
@@ -3260,7 +3260,7 @@ impl crate::scp::PyScp {
         }
 
         // Close succeeded (or was idempotently already closed). Remove the
-        // FFI bridge state → bridge tool dispatch fails closed for this id.
+        // FFI bridge state → bridge outlet dispatch fails closed for this id.
         crate::runtime::remove_context(bi, &handle.context_id);
 
         // Transition directly to "closed" (skipping "closing" for the bridge
@@ -7094,7 +7094,7 @@ mod tests {
         PyContextParams {
             ceiling: Vec::new(),
             roles: HashMap::new(),
-            tools: Vec::new(),
+            outlets: Vec::new(),
             ttl: None,
             memory_scope: "ephemeral".to_owned(),
             governance: "single_admin".to_owned(),

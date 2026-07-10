@@ -12,7 +12,7 @@
 //! carries a local copy (ADR-048 §7a — see commit log).
 //!
 //! These are the foundational conversion functions used by all bridge modules
-//! that pass structured data between Python and Rust (context params, tool
+//! that pass structured data between Python and Rust (context params, outlet
 //! definitions, event filters, etc.).
 //!
 //! See ADR-013 in `.docs/adrs/phase-3.md` for the full specification.

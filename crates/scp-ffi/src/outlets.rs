@@ -1,28 +1,28 @@
-//! `PyO3` bridge functions for tool registration, invocation, and verification.
+//! `PyO3` bridge functions for outlet registration, invocation, and verification.
 //!
-//! Exposes SCP tool operations to Python as methods on the `SCP` class:
+//! Exposes SCP outlet operations to Python as methods on the `SCP` class:
 //!
-//! - `PyScp::tool_register` — Register a tool in a context (returns tool ID).
-//! - `PyScp::tool_invoke` — Invoke a tool (returns JSON-compatible output).
-//! - `PyScp::tool_verify` — Verify a tool against its test vectors.
-//! - `PyScp::tool_invoke_cross_context` — Invoke a tool across context
+//! - `PyScp::outlet_register` — Register a outlet in a context (returns outlet ID).
+//! - `PyScp::outlet_invoke` — Invoke a outlet (returns JSON-compatible output).
+//! - `PyScp::outlet_verify` — Verify a outlet against its test vectors.
+//! - `PyScp::outlet_invoke_cross_context` — Invoke a outlet across context
 //!   boundaries.
-//! - `PyScp::tool_session_create` — Create a stateful tool session.
-//! - `PyScp::tool_session_invoke` — Invoke a tool within a session.
-//! - `PyScp::tool_session_close` — Close a stateful tool session.
-//! - `PyScp::tool_interface_expose` — Expose a tool interface (step 1 of
+//! - `PyScp::outlet_session_create` — Create a stateful outlet session.
+//! - `PyScp::outlet_session_invoke` — Invoke a outlet within a session.
+//! - `PyScp::outlet_session_close` — Close a stateful outlet session.
+//! - `PyScp::outlet_interface_expose` — Expose a outlet interface (step 1 of
 //!   the §6.2.0.1 bidirectional handshake).
-//! - `PyScp::tool_interface_accept` — Accept an exposed interface (step 4).
-//! - `PyScp::tool_interface_revoke` — Revoke an interface unilaterally.
+//! - `PyScp::outlet_interface_accept` — Accept an exposed interface (step 4).
+//! - `PyScp::outlet_interface_revoke` — Revoke an interface unilaterally.
 //!
 //! All free `#[pyfunction]` exports were migrated to `#[pymethods] impl PyScp`
 //! methods in Phase 4 PR 4 sub-slice E (#1549).
 //!
 //! # Types
 //!
-//! - [`PyToolRegistration`] — Tool registration data (name, description,
+//! - [`PyOutletRegistration`] — Outlet registration data (name, description,
 //!   schema, test vectors).
-//! - [`PyToolVerificationResult`] — Verification result (tool ID, pass/fail,
+//! - [`PyOutletVerificationResult`] — Verification result (outlet ID, pass/fail,
 //!   failure messages).
 //!
 //! See ADR-013 in `.docs/adrs/phase-3.md` §4 for the bridge specification.
@@ -38,29 +38,29 @@ use crate::types::{json_to_py_dict, py_dict_to_json};
 use crate::validate;
 
 // ---------------------------------------------------------------------------
-// PyToolRegistration
+// PyOutletRegistration
 // ---------------------------------------------------------------------------
 
-/// Tool registration data exposed to Python.
+/// Outlet registration data exposed to Python.
 ///
-/// Contains the metadata needed to register a tool in an SCP context:
+/// Contains the metadata needed to register a outlet in an SCP context:
 /// name, description, JSON Schema, and test vectors. The `schema` field
 /// is a Python dict representing the MCP-compatible JSON Schema for the
-/// tool's input and output.
+/// outlet's input and output.
 ///
-/// See ADR-010 (tool registration) and ADR-013 §4 (bridge layer).
-#[pyclass(name = "ToolRegistration")]
+/// See ADR-010 (outlet registration) and ADR-013 §4 (bridge layer).
+#[pyclass(name = "OutletRegistration")]
 #[derive(Debug)]
-pub struct PyToolRegistration {
-    /// Human-readable tool name.
+pub struct PyOutletRegistration {
+    /// Human-readable outlet name.
     #[pyo3(get)]
     pub name: String,
 
-    /// Tool description.
+    /// Outlet description.
     #[pyo3(get)]
     pub description: String,
 
-    /// JSON Schema for tool input/output, as a Python dict.
+    /// JSON Schema for outlet input/output, as a Python dict.
     #[pyo3(get)]
     pub schema: PyObject,
 
@@ -70,13 +70,13 @@ pub struct PyToolRegistration {
 }
 
 #[pymethods]
-impl PyToolRegistration {
-    /// Creates a new tool registration.
+impl PyOutletRegistration {
+    /// Creates a new outlet registration.
     ///
     /// # Arguments
     ///
-    /// * `name` — Human-readable tool name.
-    /// * `description` — Tool description.
+    /// * `name` — Human-readable outlet name.
+    /// * `description` — Outlet description.
     /// * `schema` — JSON Schema dict for input/output.
     /// * `test_vectors` — List of test vector dicts (each with `input`,
     ///   `expected_output`, `description`).
@@ -98,7 +98,7 @@ impl PyToolRegistration {
 
     fn __repr__(&self) -> String {
         format!(
-            "ToolRegistration(name={:?}, description={:?}, test_vectors={})",
+            "OutletRegistration(name={:?}, description={:?}, test_vectors={})",
             self.name,
             self.description,
             self.test_vectors.len()
@@ -107,19 +107,19 @@ impl PyToolRegistration {
 }
 
 // ---------------------------------------------------------------------------
-// PyToolVerificationResult
+// PyOutletVerificationResult
 // ---------------------------------------------------------------------------
 
-/// Result of verifying a tool against its test vectors.
+/// Result of verifying a outlet against its test vectors.
 ///
-/// Returned by `py_tool_verify`. Contains the tool ID, overall pass/fail
+/// Returned by `py_outlet_verify`. Contains the outlet ID, overall pass/fail
 /// status, and a list of failure messages (empty if all vectors passed).
-#[pyclass(name = "ToolVerificationResult")]
+#[pyclass(name = "OutletVerificationResult")]
 #[derive(Debug, Clone)]
-pub struct PyToolVerificationResult {
-    /// The verified tool's ID.
+pub struct PyOutletVerificationResult {
+    /// The verified outlet's ID.
     #[pyo3(get)]
-    pub tool_id: String,
+    pub outlet_id: String,
 
     /// `True` if all test vectors passed.
     #[pyo3(get)]
@@ -131,11 +131,11 @@ pub struct PyToolVerificationResult {
 }
 
 #[pymethods]
-impl PyToolVerificationResult {
+impl PyOutletVerificationResult {
     fn __repr__(&self) -> String {
         format!(
-            "ToolVerificationResult(tool_id={:?}, passed={}, failures={})",
-            self.tool_id,
+            "OutletVerificationResult(outlet_id={:?}, passed={}, failures={})",
+            self.outlet_id,
             self.passed,
             self.failures.len()
         )
@@ -143,19 +143,19 @@ impl PyToolVerificationResult {
 }
 
 // ---------------------------------------------------------------------------
-// PySagaResult (§6.2.4 cross-context tool-invocation saga — committed terminal)
+// PySagaResult (§6.2.4 cross-context outlet-invocation saga — committed terminal)
 // ---------------------------------------------------------------------------
 
-/// The committed terminal of a §6.2.4 cross-context tool-invocation saga.
+/// The committed terminal of a §6.2.4 cross-context outlet-invocation saga.
 ///
-/// Returned by [`PyScp::tool_invoke_cross_context_saga`] on a `Committed`
+/// Returned by [`PyScp::outlet_invoke_cross_context_saga`] on a `Committed`
 /// terminal. Every NON-committed terminal raises a typed saga exception
 /// (`SagaAbortedError` / `SagaNeedsRepairError` / `SagaBusyError`) instead.
 ///
 /// Carries the supervisor-minted `saga_id` plus — for the committed
 /// cross-context invocation — the target's signed receipt and the captured
-/// tool output (spec §6.2.4 "Receipt / response return path"). The `receipt`
-/// is the JCS-canonical `CrossContextToolReceipt` bytes; `output` is the
+/// outlet output (spec §6.2.4 "Receipt / response return path"). The `receipt`
+/// is the JCS-canonical `CrossContextOutletReceipt` bytes; `output` is the
 /// receipt's canonical `output_jcs` bytes (the exact bytes the caller side
 /// recorded a hash of). Both are surfaced as Python `bytes` so a caller can
 /// verify the receipt signature and recompute `output_hash` without a
@@ -167,11 +167,11 @@ pub struct PySagaResult {
     #[pyo3(get)]
     pub saga_id: String,
 
-    /// The target's signed `CrossContextToolReceipt` bytes (JCS), or `None`.
+    /// The target's signed `CrossContextOutletReceipt` bytes (JCS), or `None`.
     #[pyo3(get)]
     pub receipt: Option<Vec<u8>>,
 
-    /// The captured tool output bytes (the receipt's canonical `output_jcs`),
+    /// The captured outlet output bytes (the receipt's canonical `output_jcs`),
     /// or `None`.
     #[pyo3(get)]
     pub output: Option<Vec<u8>>,
@@ -193,10 +193,10 @@ impl PySagaResult {
 // Bridge helpers — per-bridge implementations used by PyScp methods
 // ---------------------------------------------------------------------------
 
-/// Registers a tool in an SCP context on the given bridge instance.
+/// Registers a outlet in an SCP context on the given bridge instance.
 ///
 /// See ADR-013 §4.
-fn tool_register_impl(
+fn outlet_register_impl(
     bi: &PyBridgeInstance,
     context_id: &str,
     registration: &Bound<'_, PyDict>,
@@ -218,7 +218,7 @@ fn tool_register_impl(
         .extract()?;
 
     // Validate extracted string fields at the bridge boundary.
-    validate::validate_tool_name(&name)?;
+    validate::validate_outlet_name(&name)?;
     validate::validate_did(&operator_did)?;
 
     // Extract schema as JSON. The schema dict should have `input_schema` and
@@ -266,23 +266,23 @@ fn tool_register_impl(
     // Extract test vectors (optional).
     let test_vectors = extract_test_vectors(registration)?;
 
-    // Extract implementation hash (optional, 32-byte SHA-256 of tool code).
-    // Per spec §5.4: content-addressable reference to the tool's implementation.
+    // Extract implementation hash (optional, 32-byte SHA-256 of outlet code).
+    // Per spec §5.4: content-addressable reference to the outlet's implementation.
     let implementation_hash = extract_implementation_hash(registration)?;
 
     // Extract cost metadata (optional, per spec §5.4.1).
     let cost = extract_cost(registration)?;
 
-    // Generate a tool ID from the name (deterministic, human-readable).
-    // Shared with every other bridge via `scp_ffi_common::tool_id`.
-    let tool_id = scp_ffi_common::tool_id::generate_tool_id(&name);
+    // Generate a outlet ID from the name (deterministic, human-readable).
+    // Shared with every other bridge via `scp_ffi_common::outlet_id`.
+    let outlet_id = scp_ffi_common::outlet_id::generate_outlet_id(&name);
 
-    // Build the scp-core ToolRegistration.
-    let core_registration = scp_core::context::tools::ToolRegistration {
-        tool_id,
+    // Build the scp-core OutletRegistration.
+    let core_registration = scp_core::context::outlets::OutletRegistration {
+        outlet_id,
         name,
         description,
-        schema: scp_core::context::tools::ToolSchema {
+        schema: scp_core::context::outlets::OutletSchema {
             input_schema,
             output_schema,
         },
@@ -294,30 +294,30 @@ fn tool_register_impl(
         signature: vec![],
     };
 
-    // Look up the context runtime and register the tool.
+    // Look up the context runtime and register the outlet.
     let registered_id = crate::runtime::with_context(bi, context_id, |rt| {
-        let (registered_id, _event) = scp_core::context::tools::register_tool(
-            &mut rt.tool_registry,
+        let (registered_id, _event) = scp_core::context::outlets::register_outlet(
+            &mut rt.outlet_registry,
             &rt.role_state,
             core_registration,
             &rt.creator_did.clone(),
         )
-        .map_err(|e| ScpPyError::context(format!("tool registration failed: {e}")))?;
+        .map_err(|e| ScpPyError::context(format!("outlet registration failed: {e}")))?;
         Ok(registered_id)
     })?;
 
     Ok(registered_id)
 }
 
-/// Validates a UCAN token for tool invocation authorization.
+/// Validates a UCAN token for outlet invocation authorization.
 ///
-/// Runs the full 11-step ADR-016 pipeline, requiring `tool_invoke:{tool_id}`
-/// or `tool_invoke:*` capability. Extracted to keep `tool_invoke_impl` within
+/// Runs the full 11-step ADR-016 pipeline, requiring `outlet_invoke:{outlet_id}`
+/// or `tool_invoke:*` capability. Extracted to keep `outlet_invoke_impl` within
 /// the 100-line clippy limit.
-fn validate_tool_ucan(
+fn validate_outlet_ucan(
     bi: &PyBridgeInstance,
     context_id: &str,
-    tool_id: &str,
+    outlet_id: &str,
     ucan_token: &str,
     identity_did: &str,
     proof_tokens: Option<&Vec<String>>,
@@ -350,82 +350,82 @@ fn validate_tool_ucan(
             clock: &scp_clock::SystemClock,
         };
 
-        scp_core::context::tools::validate_tool_invocation_ucan(
-            ucan_token, context_id, tool_id, &mut ctx,
+        scp_core::context::outlets::validate_outlet_invocation_ucan(
+            ucan_token, context_id, outlet_id, &mut ctx,
         )
         .map_err(|e| {
             ScpPyError::ucan(format!(
-                "UCAN authorization failed for tool '{tool_id}': {e}"
+                "UCAN authorization failed for outlet '{outlet_id}': {e}"
             ))
         })
     })?;
     Ok(())
 }
 
-/// Invokes a tool within an SCP context, fully wired through the
-/// `ContextManager::invoke_tool_with_economy` pipeline.
+/// Invokes a outlet within an SCP context, fully wired through the
+/// `ContextManager::invoke_outlet_with_economy` pipeline.
 ///
-/// This is the SINGLE entry point for tool invocation through the `PyO3`
+/// This is the SINGLE entry point for outlet invocation through the `PyO3`
 /// bridge. Every paid-action concern — per-invocation pricing, spending
 /// UCAN AND-composition (§19.5), per-DID velocity tracking, escalation
 /// (§19.7), budget enforcement, payment escrow, and the
-/// `ToolEconomyTicket` rollback discipline — is enforced by the runtime,
+/// `OutletEconomyTicket` rollback discipline — is enforced by the runtime,
 /// not by the bridge. The Matrix-style hard rate limit is consumed by
 /// the wrapper itself in Phase 1 (defense-in-depth), so the previous
 /// bridge-side `try_consume_hard_rate_limit_*` calls are no longer
 /// needed.
 ///
-/// Validates the UCAN token for tool invocation authorization before
-/// dispatching. The UCAN must contain a `tool_invoke:{tool_id}` or
+/// Validates the UCAN token for outlet invocation authorization before
+/// dispatching. The UCAN must contain a `outlet_invoke:{outlet_id}` or
 /// `tool_invoke:*` capability scoped to the context.
 ///
-/// Dispatches to a registered tool handler if one exists (registered via
-/// [`crate::runtime::register_tool_handler`]). The runtime validates
+/// Dispatches to a registered outlet handler if one exists (registered via
+/// [`crate::runtime::register_outlet_handler`]). The runtime validates
 /// input/output schemas and computes the input/output hashes for the
-/// `ToolInvokedEvent`. If no handler is registered, falls back to
+/// `OutletInvokedEvent`. If no handler is registered, falls back to
 /// returning validated input with metadata (schema-only mode), identical
 /// to `FfiBridgeProvider::invoke_tool` in `mcp.rs`.
 ///
 /// # Arguments
 ///
-/// * `context_id` — The ID of the context containing the tool.
-/// * `tool_id` — The ID of the tool to invoke.
-/// * `input` — A Python dict of input parameters matching the tool's
+/// * `context_id` — The ID of the context containing the outlet.
+/// * `outlet_id` — The ID of the outlet to invoke.
+/// * `input` — A Python dict of input parameters matching the outlet's
 ///   input schema.
 /// * `identity_did` — The DID of the invoking identity (used for
 ///   capability checking).
 /// * `ucan_token` — JWT-encoded UCAN token authorizing the invocation.
-///   Must contain `tool_invoke:{tool_id}` or `tool_invoke:*` capability.
+///   Must contain `outlet_invoke:{outlet_id}` or `tool_invoke:*` capability.
 ///   Validated using the full 11-step ADR-016 pipeline.
 /// * `spending_ucan` — Optional JWT-encoded spending UCAN
-///   (`SpendingCapability`) for paid tool invocations. Required when an
-///   `EconomicPolicy` priced the tool above zero (§19.5
-///   AND-composition). May be `None` for free tools.
+///   (`SpendingCapability`) for paid outlet invocations. Required when an
+///   `EconomicPolicy` priced the outlet above zero (§19.5
+///   AND-composition). May be `None` for free outlets.
 /// * `proof_tokens` — Optional encoded parent UCAN tokens for delegation
 ///   chain traversal (ADR-016 step 3).
 ///
 /// # Returns
 ///
-/// A Python object (dict) containing the tool's JSON-compatible output.
+/// A Python object (dict) containing the outlet's JSON-compatible output.
 ///
 /// # Errors
 ///
 /// Raises `UcanError` if the UCAN token is invalid, expired, revoked,
-/// or lacks the required tool invocation capability.
+/// or lacks the required outlet invocation capability.
 /// Raises `ContextError` (with embedded `SCP-ECON-12010` /
-/// `SCP-ECON-12061` / `SCP-ECON-12090` / tool-invocation codes) if the
+/// `SCP-ECON-12061` / `SCP-ECON-12090` / outlet-invocation codes) if the
 /// economy pre-check, budget, payment escrow, hard rate limit, or
-/// underlying tool dispatch fails. Callers should consult `.code` rather
+/// underlying outlet dispatch fails. Callers should consult `.code` rather
 /// than string-matching `.message`.
 ///
 /// See ADR-013 §4, SCP-212, spec §6.2, §8, §19.5, §19.7, ADR-016, and issue #319.
 #[allow(clippy::needless_pass_by_value)] // PyO3 requires owned Option<Vec<String>>.
 #[allow(clippy::too_many_arguments)] // Bridge mirrors the runtime's economy entry point.
-fn tool_invoke_impl(
+fn outlet_invoke_impl(
     bi: &PyBridgeInstance,
     py: Python<'_>,
     context_id: &str,
-    tool_id: &str,
+    outlet_id: &str,
     input: &Bound<'_, PyDict>,
     identity_did: &str,
     ucan_token: &str,
@@ -433,7 +433,7 @@ fn tool_invoke_impl(
     spending_ucan: Option<&str>,
 ) -> PyResult<PyObject> {
     validate::validate_context_id(context_id)?;
-    validate::validate_tool_id(tool_id)?;
+    validate::validate_outlet_id(outlet_id)?;
     validate::validate_did(identity_did)?;
     validate::validate_ucan_token(ucan_token)?;
     if let Some(jwt) = spending_ucan {
@@ -452,10 +452,10 @@ fn tool_invoke_impl(
     // nonce tracker, capability ceiling, proof resolver). The runtime
     // wrapper does NOT re-validate the action UCAN — it enforces the
     // economy/budget/spending side. See spec §6.2, §8, ADR-016, #319.
-    validate_tool_ucan(
+    validate_outlet_ucan(
         bi,
         context_id,
-        tool_id,
+        outlet_id,
         ucan_token,
         identity_did,
         proof_tokens.as_ref(),
@@ -475,31 +475,31 @@ fn tool_invoke_impl(
         })
         .transpose()?;
 
-    // Snapshot the bridge-owned tool registry and (optionally) the
+    // Snapshot the bridge-owned outlet registry and (optionally) the
     // registered handler closure BEFORE entering the runtime call. The
-    // runtime requires a `&ToolRegistry` so we clone the registry once
+    // runtime requires a `&OutletRegistry` so we clone the registry once
     // (cheap — Vec of registrations); the handler is an `Arc<dyn Fn>`
     // so cloning is a refcount bump. Doing this OUTSIDE the runtime
     // call keeps the bridge-side DashMap shard lock acquisition split
     // from the runtime's `contexts` mutex, matching the lock-split
     // discipline in `mcp.rs`.
     let ctx_id_owned = context_id.to_owned();
-    let tool_id_owned = tool_id.to_owned();
+    let outlet_id_owned = outlet_id.to_owned();
     let identity_did_owned = identity_did.to_owned();
     let (registry, handler) = crate::runtime::with_context(bi, context_id, |rt| {
         Ok((
-            rt.tool_registry.clone(),
-            rt.tool_handlers.get(tool_id).cloned(),
+            rt.outlet_registry.clone(),
+            rt.outlet_handlers.get(outlet_id).cloned(),
         ))
     })?;
 
     // Build the executor closure. The runtime invokes the executor in
-    // Phase 2 of `invoke_tool_with_economy` WITHOUT holding the
+    // Phase 2 of `invoke_outlet_with_economy` WITHOUT holding the
     // `contexts` mutex. The closure dispatches to a registered Python
     // handler when present and falls back to schema-only echo mode
     // otherwise (matching the prior PyO3 behavior).
     let ctx_id_for_executor = ctx_id_owned.clone();
-    let tool_id_for_executor = tool_id_owned.clone();
+    let outlet_id_for_executor = outlet_id_owned.clone();
     let identity_did_for_executor = identity_did_owned.clone();
     let executor = move |input: serde_json::Value| {
         let handler = handler.clone();
@@ -508,7 +508,7 @@ fn tool_invoke_impl(
             handler.map_or_else(
                 || {
                     Ok(serde_json::json!({
-                        "tool": tool_id_for_executor,
+                        "outlet": outlet_id_for_executor,
                         "context": ctx_id_for_executor,
                         "status": "validated",
                         "input_valid": true,
@@ -518,7 +518,7 @@ fn tool_invoke_impl(
                 },
                 |h| {
                     h(input).map_err(|e| {
-                        format!("tool handler for '{tool_id_for_executor}' failed: {e}")
+                        format!("outlet handler for '{outlet_id_for_executor}' failed: {e}")
                     })
                 },
             )
@@ -531,15 +531,15 @@ fn tool_invoke_impl(
     // multi-thread global runtime is safe (matches `py_context_send`).
     let supervisor = crate::runtime::supervisor(bi)?;
     let invoker_did_typed: scp_did::DID = identity_did_owned.into();
-    let tool_id_typed = scp_core::context::tools::ToolId::from(tool_id_owned.as_str());
+    let outlet_id_typed = scp_core::context::outlets::OutletId::from(outlet_id_owned.as_str());
     let rt = crate::runtime()?;
     let outcome = rt
         .block_on(async {
             supervisor
-                .invoke_tool_with_economy(
+                .invoke_outlet_with_economy(
                     &ctx_id_owned,
                     &registry,
-                    &tool_id_typed,
+                    &outlet_id_typed,
                     input_json,
                     &invoker_did_typed,
                     spending_ucan_token.as_ref(),
@@ -552,52 +552,52 @@ fn tool_invoke_impl(
 
     // Mark the time of last successful invocation for any future
     // observability hooks. (`outcome.event` carries the canonical
-    // `ToolInvokedEvent` — the transport / event-log layer is the one
+    // `OutletInvokedEvent` — the transport / event-log layer is the one
     // responsible for signing and appending to the Merkle log.)
     let _ = outcome.event;
 
     json_to_py_dict(py, &outcome.output)
 }
 
-/// Verifies a tool against its registered test vectors.
+/// Verifies a outlet against its registered test vectors.
 ///
 /// # Arguments
 ///
-/// * `context_id` — The ID of the context containing the tool.
-/// * `tool_id` — The ID of the tool to verify.
+/// * `context_id` — The ID of the context containing the outlet.
+/// * `outlet_id` — The ID of the outlet to verify.
 ///
 /// # Returns
 ///
-/// A [`PyToolVerificationResult`] with the tool ID, overall pass/fail
+/// A [`PyOutletVerificationResult`] with the outlet ID, overall pass/fail
 /// status, and any failure messages.
 ///
 /// # Errors
 ///
-/// Raises `ContextError` if the context is not connected or the tool
+/// Raises `ContextError` if the context is not connected or the outlet
 /// is not found.
 ///
 /// See ADR-013 §4.
-fn tool_verify_impl(
+fn outlet_verify_impl(
     bi: &PyBridgeInstance,
     context_id: &str,
-    tool_id: &str,
-) -> PyResult<PyToolVerificationResult> {
+    outlet_id: &str,
+) -> PyResult<PyOutletVerificationResult> {
     validate::validate_context_id(context_id)?;
-    validate::validate_tool_id(tool_id)?;
-    // Look up the context and verify the tool against its test vectors.
+    validate::validate_outlet_id(outlet_id)?;
+    // Look up the context and verify the outlet against its test vectors.
     // The executor returns the expected output (identity function) since the
-    // bridge layer has no external tool executor. This verifies the test
+    // bridge layer has no external outlet executor. This verifies the test
     // vector structure is intact.
     let result = crate::runtime::with_context(bi, context_id, |rt| {
-        let (verification_result, _event) = scp_core::context::tools::verify_tool(
-            &rt.tool_registry,
-            tool_id,
+        let (verification_result, _event) = scp_core::context::outlets::verify_outlet(
+            &rt.outlet_registry,
+            outlet_id,
             // Identity executor: returns the expected output for each vector.
             // This validates the test vector structure; real execution verification
             // happens when a full executor is connected.
             |input| {
-                // Look up the tool to find the matching test vector.
-                if let Some(registration) = rt.tool_registry.get(tool_id) {
+                // Look up the outlet to find the matching test vector.
+                if let Some(registration) = rt.outlet_registry.get(outlet_id) {
                     for vector in &registration.test_vectors {
                         if vector.input == *input {
                             return vector.expected_output.clone();
@@ -608,12 +608,12 @@ fn tool_verify_impl(
                 serde_json::Value::Null
             },
         )
-        .map_err(|e| ScpPyError::context(format!("tool verification failed: {e}")))?;
+        .map_err(|e| ScpPyError::context(format!("outlet verification failed: {e}")))?;
 
         Ok(verification_result)
     })?;
 
-    // Convert to PyToolVerificationResult.
+    // Convert to PyOutletVerificationResult.
     let failures: Vec<String> = result
         .vector_results
         .iter()
@@ -621,8 +621,8 @@ fn tool_verify_impl(
         .map(|r| r.description.clone())
         .collect();
 
-    Ok(PyToolVerificationResult {
-        tool_id: result.tool_id,
+    Ok(PyOutletVerificationResult {
+        outlet_id: result.outlet_id,
         passed: result.integrity_ok,
         failures,
     })
@@ -635,7 +635,7 @@ fn tool_verify_impl(
 /// Extracts the optional `implementation_hash` from the registration dict.
 ///
 /// Accepts a hex-encoded SHA-256 hash string (64 chars). Returns zeroed hash
-/// if not provided. Per spec §5.4: content-addressable reference to the tool's
+/// if not provided. Per spec §5.4: content-addressable reference to the outlet's
 /// implementation.
 ///
 /// Returns `SCP-VALID-7038` on validation failure (aligned with NAPI bridge).
@@ -684,7 +684,7 @@ fn extract_implementation_hash(registration: &Bound<'_, PyDict>) -> PyResult<[u8
 /// `payee` (str DID), and optional `cost_formula` (str). Per spec §5.4.1.
 fn extract_cost(
     registration: &Bound<'_, PyDict>,
-) -> PyResult<Option<scp_core::context::tools::ToolCost>> {
+) -> PyResult<Option<scp_core::context::outlets::OutletCost>> {
     let meta_obj = match registration.get_item("cost")? {
         Some(val) if !val.is_none() => val,
         _ => return Ok(None),
@@ -715,8 +715,8 @@ fn extract_cost(
         .map(|v| v.extract())
         .transpose()?;
 
-    Ok(Some(scp_core::context::tools::ToolCost {
-        // ADR-060: `ToolCost.amount` is the `Amount` newtype. Python `int` is
+    Ok(Some(scp_core::context::outlets::OutletCost {
+        // ADR-060: `OutletCost.amount` is the `Amount` newtype. Python `int` is
         // arbitrary-precision, so the FFI param stays a native `u64` and carries
         // the full smallest-unit range exactly.
         amount: scp_core::economy::Amount(amount),
@@ -734,7 +734,7 @@ fn extract_cost(
 /// Returns `SCP-VALID-7037` on validation failure (aligned with NAPI bridge).
 fn extract_test_vectors(
     registration: &Bound<'_, PyDict>,
-) -> PyResult<Vec<scp_core::context::tools::TestVector>> {
+) -> PyResult<Vec<scp_core::context::outlets::OutletTestVector>> {
     let vectors_obj = match registration.get_item("test_vectors")? {
         Some(val) if !val.is_none() => val,
         _ => return Ok(Vec::new()),
@@ -772,7 +772,7 @@ fn extract_test_vectors(
             .unwrap_or("")
             .to_owned();
 
-        result.push(scp_core::context::tools::TestVector {
+        result.push(scp_core::context::outlets::OutletTestVector {
             input,
             expected_output,
             description,
@@ -783,12 +783,12 @@ fn extract_test_vectors(
 }
 
 // ---------------------------------------------------------------------------
-// Cross-context tool invocation
+// Cross-context outlet invocation
 // ---------------------------------------------------------------------------
 
-/// Invokes a tool across context boundaries.
+/// Invokes a outlet across context boundaries.
 ///
-/// The source context exposes the tool and the target context accepts the
+/// The source context exposes the outlet and the target context accepts the
 /// interface. Both contexts must have approved the interface before calls
 /// are permitted. Rate limits and chain depth are enforced per spec section
 /// 6.2.
@@ -796,34 +796,34 @@ fn extract_test_vectors(
 /// # Arguments
 ///
 /// * `source_context_id` — The ID of the calling context.
-/// * `target_context_id` — The ID of the context containing the tool.
-/// * `tool_id` — The ID of the tool to invoke.
+/// * `target_context_id` — The ID of the context containing the outlet.
+/// * `outlet_id` — The ID of the outlet to invoke.
 /// * `input` — A Python dict of input parameters.
-/// * `invoker_did` — The DID of the participant invoking the tool.
+/// * `invoker_did` — The DID of the participant invoking the outlet.
 /// * `ucan_token` — JWT-encoded UCAN token authorizing the invocation.
-///   Must contain `tool_invoke:{tool_id}` or `tool_invoke:*` capability.
+///   Must contain `outlet_invoke:{outlet_id}` or `tool_invoke:*` capability.
 ///   Validated against the TARGET context's ceiling using the full 11-step
 ///   ADR-016 pipeline.
 /// * `chain_depth` — Current cross-context chain depth (0 for first hop).
 ///
 /// # Returns
 ///
-/// A Python object (dict) containing the tool's JSON-compatible output.
+/// A Python object (dict) containing the outlet's JSON-compatible output.
 ///
 /// # Errors
 ///
 /// Raises `UcanError` if the UCAN token is invalid, expired, revoked,
-/// or lacks the required tool invocation capability.
-/// Raises `ContextError` if either context is not connected, the tool is
+/// or lacks the required outlet invocation capability.
+/// Raises `ContextError` if either context is not connected, the outlet is
 /// not found, chain depth is exceeded, or the interface is not approved.
 #[allow(clippy::needless_pass_by_value)] // PyO3 requires owned Option<Vec<String>>.
 #[allow(clippy::too_many_arguments)] // FFI boundary: PyO3 requires explicit params
-fn tool_invoke_cross_context_impl(
+fn outlet_invoke_cross_context_impl(
     bi: &PyBridgeInstance,
     py: Python<'_>,
     source_context_id: &str,
     target_context_id: &str,
-    tool_id: &str,
+    outlet_id: &str,
     input: &Bound<'_, PyDict>,
     invoker_did: &str,
     ucan_token: &str,
@@ -832,7 +832,7 @@ fn tool_invoke_cross_context_impl(
 ) -> PyResult<PyObject> {
     validate::validate_context_id(source_context_id)?;
     validate::validate_context_id(target_context_id)?;
-    validate::validate_tool_id(tool_id)?;
+    validate::validate_outlet_id(outlet_id)?;
     validate::validate_did(invoker_did)?;
     validate::validate_ucan_token(ucan_token)?;
     if let Some(ref tokens) = proof_tokens {
@@ -845,10 +845,10 @@ fn tool_invoke_cross_context_impl(
     // Primary authorization: UCAN token validation via the full 11-step
     // ADR-016 pipeline against the TARGET context's ceiling.
     // See spec §6.2, §8, ADR-016, and issue #319.
-    validate_tool_ucan(
+    validate_outlet_ucan(
         bi,
         target_context_id,
-        tool_id,
+        outlet_id,
         ucan_token,
         invoker_did,
         proof_tokens.as_ref(),
@@ -856,16 +856,16 @@ fn tool_invoke_cross_context_impl(
 
     // Defense-in-depth: check role-state capabilities in the source context.
     let source_has_capability = crate::runtime::with_context(bi, source_context_id, |rt| {
-        Ok(scp_core::context::tools::has_tool_invoke_capability(
+        Ok(scp_core::context::outlets::has_outlet_invoke_capability(
             &rt.role_state,
             invoker_did,
-            tool_id,
+            outlet_id,
         ))
     })?;
 
     if !source_has_capability {
         return Err(ScpPyError::ucan(format!(
-            "invoker '{invoker_did}' does not have ToolInvoke capability for '{tool_id}' in source context"
+            "invoker '{invoker_did}' does not have OutletInvoke capability for '{outlet_id}' in source context"
         ))
         .into());
     }
@@ -886,44 +886,44 @@ fn tool_invoke_cross_context_impl(
         .into());
     }
 
-    // Invoke the tool in the target context with echo mode.
+    // Invoke the outlet in the target context with echo mode.
     let output_json = crate::runtime::with_context(bi, target_context_id, |rt| {
-        let registration = rt.tool_registry.get(tool_id).ok_or_else(|| {
+        let registration = rt.outlet_registry.get(outlet_id).ok_or_else(|| {
             ScpPyError::context(format!(
-                "tool '{tool_id}' not found in target context '{target_context_id}'"
+                "outlet '{outlet_id}' not found in target context '{target_context_id}'"
             ))
         })?;
 
-        // Validate input against the tool's input schema.
-        scp_core::context::tools::validate_value_against_schema(
+        // Validate input against the outlet's input schema.
+        scp_core::context::outlets::validate_value_against_schema(
             &input_json,
             &registration.schema.input_schema,
         )
         .map_err(|e| ScpPyError::validation(format!("input validation failed: {e}")))?;
 
         // Dispatch to handler or echo mode.
-        let output = if let Some(handler) = rt.tool_handlers.get(tool_id) {
+        let output = if let Some(handler) = rt.outlet_handlers.get(outlet_id) {
             let handler = handler.clone();
             let out = handler(input_json.clone()).map_err(|e| {
                 ScpPyError::context(format!(
-                    "cross-context tool handler for '{tool_id}' failed: {e}"
+                    "cross-context outlet handler for '{outlet_id}' failed: {e}"
                 ))
             })?;
 
-            scp_core::context::tools::validate_value_against_schema(
+            scp_core::context::outlets::validate_value_against_schema(
                 &out,
                 &registration.schema.output_schema,
             )
             .map_err(|msg| {
                 ScpPyError::validation(format!(
-                    "output validation failed for tool '{tool_id}': {msg}"
+                    "output validation failed for outlet '{outlet_id}': {msg}"
                 ))
             })?;
 
             out
         } else {
             serde_json::json!({
-                "tool": tool_id,
+                "outlet": outlet_id,
                 "source_context": source_context_id,
                 "target_context": target_context_id,
                 "status": "validated",
@@ -936,8 +936,8 @@ fn tool_invoke_cross_context_impl(
         Ok(output)
     })?;
 
-    // Provenance for cross-context tool invocations is now handled at the
-    // protocol level (scp-protocol::tools::invoke_cross_context). The bridge-
+    // Provenance for cross-context outlet invocations is now handled at the
+    // protocol level (scp-protocol::outlets::invoke_cross_context). The bridge-
     // level attach_cross_context_provenance was redundant and discarded its
     // result, so it has been removed.
 
@@ -945,7 +945,7 @@ fn tool_invoke_cross_context_impl(
 }
 
 // ---------------------------------------------------------------------------
-// Cross-context tool-invocation saga (§6.2.4, ADR-049 §3a)
+// Cross-context outlet-invocation saga (§6.2.4, ADR-049 §3a)
 // ---------------------------------------------------------------------------
 
 /// Maps a `SagaError` terminal (the typed §6.2.4 terminal space) onto the
@@ -1085,12 +1085,12 @@ fn enforce_caller_principal_binding(
     Ok(())
 }
 
-/// Implements the §6.2.4 cross-context tool-invocation saga export.
+/// Implements the §6.2.4 cross-context outlet-invocation saga export.
 ///
-/// See [`PyScp::tool_invoke_cross_context_saga`] for the full contract. The
+/// See [`PyScp::outlet_invoke_cross_context_saga`] for the full contract. The
 /// flow is, in order:
 ///
-/// 1. **Validate inputs** (well-formed ids/dids/tool-id; the nonce decodes to
+/// 1. **Validate inputs** (well-formed ids/dids/outlet-id; the nonce decodes to
 ///    `[u8; 16]`, fail-closed on a wrong length — a hex string is the one
 ///    canonical form).
 /// 2. **Caller-principal binding (§6.2.4 *Caller authentication*, normative).**
@@ -1107,33 +1107,33 @@ fn enforce_caller_principal_binding(
 ///    SHA256). Raw `Sha256` of a 64-hex id would double-hash and miss the actor.
 /// 4. **Signing keys.** Resolve each co-resident context's Active Signing Key
 ///    via the context's `creator_did`.
-/// 5. **Executor.** Snapshot the TARGET context's tool handler under
+/// 5. **Executor.** Snapshot the TARGET context's outlet handler under
 ///    [`with_context`](crate::runtime::with_context) and build the
 ///    non-`Send`-safe `move |input| async {…}` closure the supervisor runs
-///    supervisor-side at Commit-B (mirrors `tool_invoke_impl`'s executor
+///    supervisor-side at Commit-B (mirrors `outlet_invoke_impl`'s executor
 ///    pattern).
 /// 6. [`block_on`](tokio::runtime::Runtime::block_on) the producer; map the
 ///    terminal `SagaError` → typed bridge error, `Committed` →
 ///    [`PySagaResult`].
 #[allow(clippy::too_many_arguments)] // Flat §6.2.4 envelope — agent-first named params, no builder.
-fn tool_invoke_cross_context_saga_impl(
+fn outlet_invoke_cross_context_saga_impl(
     bi: &PyBridgeInstance,
     caller_context_id: &str,
     target_context_id: &str,
     caller_did: &str,
-    tool_registration_id: &str,
+    outlet_registration_id: &str,
     input: &Bound<'_, PyDict>,
     asserted_nonce_hex: &str,
     asserted_timestamp_ms: u64,
     asserted_chain_depth: u8,
     ucan_proof_id: Option<String>,
 ) -> PyResult<PySagaResult> {
-    use scp_core::context::supervisor::{CrossContextToolInvocationRequest, SagaSigningKeys};
+    use scp_core::context::supervisor::{CrossContextOutletInvocationRequest, SagaSigningKeys};
 
     validate::validate_context_id(caller_context_id)?;
     validate::validate_context_id(target_context_id)?;
     validate::validate_did(caller_did)?;
-    validate::validate_tool_id(tool_registration_id)?;
+    validate::validate_outlet_id(outlet_registration_id)?;
 
     let asserted_nonce = decode_asserted_nonce(asserted_nonce_hex)?;
     let input_json = py_dict_to_json(input)?;
@@ -1158,20 +1158,20 @@ fn tool_invoke_cross_context_saga_impl(
     let target_signing_key = resolve_context_signing_key(bi, target_context_id)?;
     let caller_signing_key = resolve_context_signing_key(bi, caller_context_id)?;
 
-    // ----- Executor: snapshot the TARGET context's tool handler --------------
+    // ----- Executor: snapshot the TARGET context's outlet handler --------------
     //
-    // Mirrors `tool_invoke_impl`: snapshot the registered handler closure
+    // Mirrors `outlet_invoke_impl`: snapshot the registered handler closure
     // (an `Arc<dyn Fn>` — cloning is a refcount bump) OUTSIDE the runtime call,
     // then move it into the `FnOnce` executor the supervisor runs
     // supervisor-side at Commit-B (off the actor mailbox). Falls back to a
     // schema-only echo when no handler is registered, matching the synchronous
     // cross-context path. The supervisor validates the output against the
-    // tool's registered output schema at Commit-B, so the executor only
+    // outlet's registered output schema at Commit-B, so the executor only
     // produces the value.
     let handler = crate::runtime::with_context(bi, target_context_id, |rt| {
-        Ok(rt.tool_handlers.get(tool_registration_id).cloned())
+        Ok(rt.outlet_handlers.get(outlet_registration_id).cloned())
     })?;
-    let tool_id_for_echo = tool_registration_id.to_owned();
+    let outlet_id_for_echo = outlet_registration_id.to_owned();
     let target_ctx_for_echo = target_context_id.to_owned();
     let caller_did_for_echo = caller_did.to_owned();
     let executor = move |value: serde_json::Value| {
@@ -1181,7 +1181,7 @@ fn tool_invoke_cross_context_saga_impl(
             handler.map_or_else(
                 || {
                     Ok(serde_json::json!({
-                        "tool": tool_id_for_echo,
+                        "outlet": outlet_id_for_echo,
                         "target_context": target_ctx_for_echo,
                         "caller_did": caller_did_for_echo,
                         "status": "validated",
@@ -1192,7 +1192,7 @@ fn tool_invoke_cross_context_saga_impl(
                 |h| {
                     h(value).map_err(|e| {
                         format!(
-                            "cross-context saga tool handler for '{tool_id_for_echo}' failed: {e}"
+                            "cross-context saga outlet handler for '{outlet_id_for_echo}' failed: {e}"
                         )
                     })
                 },
@@ -1200,11 +1200,11 @@ fn tool_invoke_cross_context_saga_impl(
         }
     };
 
-    let request = CrossContextToolInvocationRequest {
+    let request = CrossContextOutletInvocationRequest {
         caller_context_id: caller_context_bytes,
         target_context_id: target_context_bytes,
         caller_did: scp_did::DID(caller_did.to_owned()),
-        tool_registration_id: tool_registration_id.to_owned(),
+        outlet_registration_id: outlet_registration_id.to_owned(),
         ucan_proof_id,
         input: input_json,
         asserted_chain_depth,
@@ -1215,11 +1215,11 @@ fn tool_invoke_cross_context_saga_impl(
     // Dispatch to the producer on the global multi-thread runtime. PyO3 calls
     // are sync; the Python SDK wrapper invokes us off `asyncio.to_thread`, so
     // we are NOT inside a tokio context and `block_on` is safe (matches
-    // `tool_invoke_impl`). The saga blocks until a terminal state.
+    // `outlet_invoke_impl`). The saga blocks until a terminal state.
     let output = tokio_rt
         .block_on(async {
             supervisor
-                .start_cross_context_tool_invocation_saga(
+                .start_cross_context_outlet_invocation_saga(
                     request,
                     SagaSigningKeys {
                         target: &target_signing_key,
@@ -1239,10 +1239,10 @@ fn tool_invoke_cross_context_saga_impl(
 }
 
 // ---------------------------------------------------------------------------
-// Stateful tool sessions (spec section 6.2.1)
+// Stateful outlet sessions (spec section 6.2.1)
 // ---------------------------------------------------------------------------
 
-/// Creates a stateful tool session.
+/// Creates a stateful outlet session.
 ///
 /// Sessions enable multi-turn workflows with state preservation across
 /// invocations. Each session has a TTL and is subject to per-caller caps
@@ -1250,8 +1250,8 @@ fn tool_invoke_cross_context_saga_impl(
 ///
 /// # Arguments
 ///
-/// * `context_id` — The context containing the tool.
-/// * `tool_id` — The tool to create a session for.
+/// * `context_id` — The context containing the outlet.
+/// * `outlet_id` — The outlet to create a session for.
 /// * `source_context_id` — The calling context (session cap tracked per caller).
 /// * `ttl_seconds` — Optional time-to-live for the session, in seconds.
 ///   `None` means the session persists for the lifetime of the context
@@ -1263,24 +1263,24 @@ fn tool_invoke_cross_context_saga_impl(
 ///
 /// # Errors
 ///
-/// Raises `ContextError` if the context is not connected, the tool is
+/// Raises `ContextError` if the context is not connected, the outlet is
 /// not found, or the per-caller session cap is exceeded.
-fn tool_session_create_impl(
+fn outlet_session_create_impl(
     bi: &PyBridgeInstance,
     context_id: &str,
-    tool_id: &str,
+    outlet_id: &str,
     source_context_id: &str,
     ttl_seconds: Option<u64>,
 ) -> PyResult<String> {
     validate::validate_context_id(context_id)?;
-    validate::validate_tool_id(tool_id)?;
+    validate::validate_outlet_id(outlet_id)?;
     validate::validate_context_id(source_context_id)?;
 
     let session_id = crate::runtime::with_context(bi, context_id, |rt| {
-        // Validate tool exists.
-        if !rt.tool_registry.contains(tool_id) {
+        // Validate outlet exists.
+        if !rt.outlet_registry.contains(outlet_id) {
             return Err(ScpPyError::context(format!(
-                "tool '{tool_id}' not found in context '{context_id}'"
+                "outlet '{outlet_id}' not found in context '{context_id}'"
             )));
         }
 
@@ -1291,7 +1291,7 @@ fn tool_session_create_impl(
             tokio_rt
                 .block_on(supervisor.context_params(context_id))
                 .and_then(|p| p.session_cap)
-                .unwrap_or(scp_core::context::tools::DEFAULT_SESSION_CAP_PER_CALLER)
+                .unwrap_or(scp_core::context::outlets::DEFAULT_SESSION_CAP_PER_CALLER)
                 as usize
         };
         let current = rt.session_store.count_by_source(source_context_id);
@@ -1304,9 +1304,9 @@ fn tool_session_create_impl(
         let session_id = uuid::Uuid::new_v4().to_string();
         let now_ms = scp_clock::SystemClock.now_millis();
 
-        let session = scp_core::context::tools::ToolSession {
+        let session = scp_core::context::outlets::OutletSession {
             session_id: session_id.clone(),
-            tool_id: tool_id.to_owned(),
+            outlet_id: outlet_id.to_owned(),
             source_context: source_context_id.to_owned(),
             state: serde_json::Value::Null,
             created_at: now_ms,
@@ -1321,36 +1321,36 @@ fn tool_session_create_impl(
     Ok(session_id)
 }
 
-/// Invokes a tool within an active session.
+/// Invokes a outlet within an active session.
 ///
-/// Each call is individually governed: the invoker must hold `ToolInvoke`
+/// Each call is individually governed: the invoker must hold `OutletInvoke`
 /// capability and present a valid UCAN token. Session state is carried
 /// forward across invocations. The session's call count is incremented on
 /// each successful invocation.
 ///
 /// # Arguments
 ///
-/// * `context_id` — The context containing the tool session.
+/// * `context_id` — The context containing the outlet session.
 /// * `session_id` — The session to invoke within.
 /// * `input` — A Python dict of input parameters.
 /// * `invoker_did` — The DID of the invoker (capability checked per call).
 /// * `ucan_token` — JWT-encoded UCAN token authorizing the invocation.
-///   Must contain `tool_invoke:{tool_id}` or `tool_invoke:*` capability.
+///   Must contain `outlet_invoke:{outlet_id}` or `tool_invoke:*` capability.
 ///   Validated using the full 11-step ADR-016 pipeline.
 ///
 /// # Returns
 ///
-/// A Python object (dict) containing the tool's JSON-compatible output.
+/// A Python object (dict) containing the outlet's JSON-compatible output.
 ///
 /// # Errors
 ///
 /// Raises `UcanError` if the UCAN token is invalid, expired, revoked,
-/// or lacks the required tool invocation capability.
+/// or lacks the required outlet invocation capability.
 /// Raises `ContextError` if the session is not found, has expired, or
 /// the invoker lacks capability.
 #[allow(clippy::needless_pass_by_value)] // PyO3 requires owned Option<Vec<String>>.
 #[allow(clippy::too_many_arguments)] // FFI surface: spec-defined signature
-fn tool_session_invoke_impl(
+fn outlet_session_invoke_impl(
     bi: &PyBridgeInstance,
     py: Python<'_>,
     context_id: &str,
@@ -1370,22 +1370,22 @@ fn tool_session_invoke_impl(
     }
     let input_json = py_dict_to_json(input)?;
 
-    // Look up the tool_id from the session before UCAN validation so we can
-    // validate against the correct tool capability.
-    let tool_id_for_ucan = crate::runtime::with_context(bi, context_id, |rt| {
+    // Look up the outlet_id from the session before UCAN validation so we can
+    // validate against the correct outlet capability.
+    let outlet_id_for_ucan = crate::runtime::with_context(bi, context_id, |rt| {
         let session = rt
             .session_store
             .get(session_id)
             .ok_or_else(|| ScpPyError::context(format!("session '{session_id}' not found")))?;
-        Ok(session.tool_id.clone())
+        Ok(session.outlet_id.clone())
     })?;
 
     // Primary authorization: UCAN token validation via the full 11-step
     // ADR-016 pipeline. See spec §6.2, §8, ADR-016, and issue #319.
-    validate_tool_ucan(
+    validate_outlet_ucan(
         bi,
         context_id,
-        &tool_id_for_ucan,
+        &outlet_id_for_ucan,
         ucan_token,
         invoker_did,
         proof_tokens.as_ref(),
@@ -1407,24 +1407,24 @@ fn tool_session_invoke_impl(
             )));
         }
 
-        let tool_id = session.tool_id.clone();
+        let outlet_id = session.outlet_id.clone();
         let current_state = session.state.clone();
 
         // Defense-in-depth: check role-state capabilities in addition to the
         // UCAN layer. See §7.2 and ADR-010 for the dual-check design.
-        if !scp_core::context::tools::has_tool_invoke_capability(
+        if !scp_core::context::outlets::has_outlet_invoke_capability(
             &rt.role_state,
             invoker_did,
-            &tool_id,
+            &outlet_id,
         ) {
             return Err(ScpPyError::ucan(format!(
-                "invoker '{invoker_did}' does not have ToolInvoke capability for '{tool_id}'"
+                "invoker '{invoker_did}' does not have OutletInvoke capability for '{outlet_id}'"
             )));
         }
 
-        // Validate input against tool's input schema.
-        if let Some(registration) = rt.tool_registry.get(&tool_id) {
-            scp_core::context::tools::validate_value_against_schema(
+        // Validate input against outlet's input schema.
+        if let Some(registration) = rt.outlet_registry.get(&outlet_id) {
+            scp_core::context::outlets::validate_value_against_schema(
                 &input_json,
                 &registration.schema.input_schema,
             )
@@ -1432,15 +1432,15 @@ fn tool_session_invoke_impl(
         }
 
         // Execute via handler or echo mode, passing session state.
-        let (new_state, output) = if let Some(handler) = rt.tool_handlers.get(&tool_id) {
+        let (new_state, output) = if let Some(handler) = rt.outlet_handlers.get(&outlet_id) {
             let handler = handler.clone();
             let out = handler(input_json.clone()).map_err(|e| {
-                ScpPyError::context(format!("tool handler for '{tool_id}' failed: {e}"))
+                ScpPyError::context(format!("outlet handler for '{outlet_id}' failed: {e}"))
             })?;
             (current_state, out)
         } else {
             let out = serde_json::json!({
-                "tool": tool_id,
+                "outlet": outlet_id,
                 "session_id": session_id,
                 "status": "validated",
                 "call_count": session.call_count + 1,
@@ -1462,21 +1462,21 @@ fn tool_session_invoke_impl(
     json_to_py_dict(py, &output_json)
 }
 
-/// Closes a stateful tool session.
+/// Closes a stateful outlet session.
 ///
 /// Removes the session from the store, releasing the caller's session slot.
 /// After closing, any further invocations with this session ID will fail.
 ///
 /// # Arguments
 ///
-/// * `context_id` — The context containing the tool session.
+/// * `context_id` — The context containing the outlet session.
 /// * `session_id` — The session to close.
 ///
 /// # Errors
 ///
 /// Raises `ContextError` if the context is not connected or the session
 /// is not found.
-fn tool_session_close_impl(
+fn outlet_session_close_impl(
     bi: &PyBridgeInstance,
     context_id: &str,
     session_id: &str,
@@ -1499,43 +1499,43 @@ fn tool_session_close_impl(
 // Bidirectional consent protocol (spec §6.2.0.1)
 // ---------------------------------------------------------------------------
 
-/// Exposes a tool interface for cross-context sharing (§6.2.0.1 step 1).
+/// Exposes a outlet interface for cross-context sharing (§6.2.0.1 step 1).
 ///
-/// The caller (admin of the source context) proposes sharing a specific tool
-/// with a target context. The returned JSON contains the `ToolInterface` with
+/// The caller (admin of the source context) proposes sharing a specific outlet
+/// with a target context. The returned JSON contains the `OutletInterface` with
 /// `approved_by_source = true` and `approved_by_target = false`. The target
-/// context must call [`py_tool_interface_accept`] to complete the handshake.
+/// context must call [`py_outlet_interface_accept`] to complete the handshake.
 ///
 /// # Arguments
 ///
 /// * `context_id` — The source context ID.
-/// * `tool_id` — The ID of the tool to expose.
-/// * `target_context_id` — The target context to expose the tool to.
+/// * `outlet_id` — The ID of the outlet to expose.
+/// * `target_context_id` — The target context to expose the outlet to.
 /// * `rate_limit_json` — Optional per-interface rate limit as a JSON string.
 ///   When provided, must be a JSON object with `max_calls` (u64) and
 ///   `window_seconds` (u64) fields.
 ///
 /// # Returns
 ///
-/// A JSON string representation of the created `ToolInterface`.
+/// A JSON string representation of the created `OutletInterface`.
 ///
 /// # Errors
 ///
-/// Raises `ToolError` if the caller is not an admin or the tool is not found.
-fn tool_interface_expose_impl(
+/// Raises `OutletError` if the caller is not an admin or the outlet is not found.
+fn outlet_interface_expose_impl(
     bi: &PyBridgeInstance,
     context_id: &str,
-    tool_id: &str,
+    outlet_id: &str,
     target_context_id: &str,
     rate_limit_json: Option<&str>,
 ) -> PyResult<String> {
     validate::validate_context_id(context_id)?;
-    validate::validate_tool_id(tool_id)?;
+    validate::validate_outlet_id(outlet_id)?;
     validate::validate_context_id(target_context_id)?;
 
     let rate_limit = match rate_limit_json {
         Some(json) => {
-            let parsed: scp_core::context::tools::interface::RateLimit = serde_json::from_str(json)
+            let parsed: scp_core::context::outlets::interface::RateLimit = serde_json::from_str(json)
                 .map_err(|e| ScpPyError::ValidationError {
                     message: format!("invalid rate_limit_json: {e}"),
                     code: codes::VALID_7040.to_owned(),
@@ -1551,29 +1551,29 @@ fn tool_interface_expose_impl(
             scp_core::context::ContextParams::default(),
         );
 
-        let interface = scp_core::context::tools::interface::expose_tool(
+        let interface = scp_core::context::outlets::interface::expose_outlet(
             context_handle.context_id(),
-            &tool_id.to_owned(),
+            &outlet_id.to_owned(),
             &target_context_id.to_owned(),
             &rt.role_state,
             &rt.creator_did,
-            &rt.tool_registry,
+            &rt.outlet_registry,
             rate_limit,
             None,
         )
         .map_err(|e| ScpPyError::ContextError {
-            message: format!("expose_tool failed: {e}"),
-            code: codes::TOOL_6030.to_owned(),
+            message: format!("expose_outlet failed: {e}"),
+            code: codes::OUTLET_6030.to_owned(),
         })?;
 
         serde_json::to_string(&interface).map_err(|e| ScpPyError::ContextError {
-            message: format!("failed to serialize ToolInterface: {e}"),
-            code: codes::TOOL_6031.to_owned(),
+            message: format!("failed to serialize OutletInterface: {e}"),
+            code: codes::OUTLET_6031.to_owned(),
         })
     })?)
 }
 
-/// Accepts a cross-context tool interface (§6.2.0.1 step 4).
+/// Accepts a cross-context outlet interface (§6.2.0.1 step 4).
 ///
 /// Sets `approved_by_target = true` on the interface. Both `approved_by_source`
 /// and `approved_by_target` must be `true` before calls are permitted.
@@ -1581,25 +1581,25 @@ fn tool_interface_expose_impl(
 /// # Arguments
 ///
 /// * `context_id` — The target context ID (the one accepting).
-/// * `interface_json` — The `ToolInterface` JSON string to accept (as received
-///   from the source context's `tool_interface_expose` call).
+/// * `interface_json` — The `OutletInterface` JSON string to accept (as received
+///   from the source context's `outlet_interface_expose` call).
 ///
 /// # Returns
 ///
-/// The updated `ToolInterface` JSON string with `approved_by_target = true`.
+/// The updated `OutletInterface` JSON string with `approved_by_target = true`.
 ///
 /// # Errors
 ///
-/// Raises `ToolError` if the caller is not an admin or the interface's target
+/// Raises `OutletError` if the caller is not an admin or the interface's target
 /// context does not match `context_id`.
-fn tool_interface_accept_impl(
+fn outlet_interface_accept_impl(
     bi: &PyBridgeInstance,
     context_id: &str,
     interface_json: &str,
 ) -> PyResult<String> {
     validate::validate_context_id(context_id)?;
 
-    let mut interface: scp_core::context::tools::interface::ToolInterface =
+    let mut interface: scp_core::context::outlets::interface::OutletInterface =
         serde_json::from_str(interface_json).map_err(|e| ScpPyError::ValidationError {
             message: format!("invalid interface_json: {e}"),
             code: codes::VALID_7041.to_owned(),
@@ -1611,7 +1611,7 @@ fn tool_interface_accept_impl(
             scp_core::context::ContextParams::default(),
         );
 
-        scp_core::context::tools::interface::accept_tool_interface(
+        scp_core::context::outlets::interface::accept_outlet_interface(
             context_handle.context_id(),
             &mut interface,
             &rt.role_state,
@@ -1619,18 +1619,18 @@ fn tool_interface_accept_impl(
             None,
         )
         .map_err(|e| ScpPyError::ContextError {
-            message: format!("accept_tool_interface failed: {e}"),
-            code: codes::TOOL_6032.to_owned(),
+            message: format!("accept_outlet_interface failed: {e}"),
+            code: codes::OUTLET_6032.to_owned(),
         })?;
 
         serde_json::to_string(&interface).map_err(|e| ScpPyError::ContextError {
-            message: format!("failed to serialize ToolInterface: {e}"),
-            code: codes::TOOL_6033.to_owned(),
+            message: format!("failed to serialize OutletInterface: {e}"),
+            code: codes::OUTLET_6033.to_owned(),
         })
     })?)
 }
 
-/// Revokes a cross-context tool interface (§6.2.0.1 step 5).
+/// Revokes a cross-context outlet interface (§6.2.0.1 step 5).
 ///
 /// Either context may revoke unilaterally. Returns an `InterfaceRevoked` event
 /// for recording in the revoking context's event log.
@@ -1647,7 +1647,7 @@ fn tool_interface_accept_impl(
 /// # Errors
 ///
 /// Raises `ValidationError` if `interface_id` is not valid hex or not 32 bytes.
-fn tool_interface_revoke_impl(
+fn outlet_interface_revoke_impl(
     _bi: &PyBridgeInstance,
     context_id: &str,
     interface_id_hex: &str,
@@ -1670,7 +1670,7 @@ fn tool_interface_revoke_impl(
 
     let now_ms = scp_clock::SystemClock.now_millis();
 
-    let event = scp_core::context::tools::interface::revoke_tool_interface(
+    let event = scp_core::context::outlets::interface::revoke_outlet_interface(
         interface_id,
         &context_id.to_owned(),
         now_ms,
@@ -1678,7 +1678,7 @@ fn tool_interface_revoke_impl(
 
     let json = serde_json::to_string(&event).map_err(|e| ScpPyError::ContextError {
         message: format!("failed to serialize InterfaceRevoked: {e}"),
-        code: codes::TOOL_6035.to_owned(),
+        code: codes::OUTLET_6035.to_owned(),
     })?;
 
     Ok(json)
@@ -1690,17 +1690,17 @@ fn tool_interface_revoke_impl(
 
 #[pymethods]
 impl crate::scp::PyScp {
-    /// Registers a tool in an SCP context.
+    /// Registers a outlet in an SCP context.
     ///
     /// # Arguments
     ///
-    /// * `context_id` — The ID of the context to register the tool in.
-    /// * `registration` — A Python dict containing tool registration data
+    /// * `context_id` — The ID of the context to register the outlet in.
+    /// * `registration` — A Python dict containing outlet registration data
     ///   (name, description, schema, `test_vectors`, `operator_did`).
     ///
     /// # Returns
     ///
-    /// The tool ID (string) assigned to the registered tool.
+    /// The outlet ID (string) assigned to the registered outlet.
     ///
     /// # Errors
     ///
@@ -1708,53 +1708,53 @@ impl crate::scp::PyScp {
     /// or if registration fails.
     ///
     /// See ADR-013 §4.
-    #[pyo3(name = "tool_register")]
-    pub fn tool_register(
+    #[pyo3(name = "outlet_register")]
+    pub fn outlet_register(
         &self,
         context_id: &str,
         registration: &Bound<'_, PyDict>,
     ) -> PyResult<String> {
         let bi = &*self.inner;
-        tool_register_impl(bi, context_id, registration)
+        outlet_register_impl(bi, context_id, registration)
     }
 
-    /// Invokes a tool within an SCP context, fully wired through the
-    /// `ContextManager::invoke_tool_with_economy` pipeline.
+    /// Invokes a outlet within an SCP context, fully wired through the
+    /// `ContextManager::invoke_outlet_with_economy` pipeline.
     ///
     /// # Arguments
     ///
-    /// * `context_id` — The ID of the context containing the tool.
-    /// * `tool_id` — The ID of the tool to invoke.
-    /// * `input` — A Python dict of input parameters matching the tool's
+    /// * `context_id` — The ID of the context containing the outlet.
+    /// * `outlet_id` — The ID of the outlet to invoke.
+    /// * `input` — A Python dict of input parameters matching the outlet's
     ///   input schema.
     /// * `identity_did` — The DID of the invoking identity (used for
     ///   capability checking).
     /// * `ucan_token` — JWT-encoded UCAN token authorizing the invocation.
     /// * `proof_tokens` — Optional encoded parent UCAN tokens for delegation
     ///   chain traversal.
-    /// * `spending_ucan` — Optional JWT-encoded spending UCAN for paid tool
+    /// * `spending_ucan` — Optional JWT-encoded spending UCAN for paid outlet
     ///   invocations.
     ///
     /// # Returns
     ///
-    /// A Python object (dict) containing the tool's JSON-compatible output.
+    /// A Python object (dict) containing the outlet's JSON-compatible output.
     ///
     /// # Errors
     ///
     /// Raises `UcanError` if the UCAN token is invalid, expired, revoked,
-    /// or lacks the required tool invocation capability.
+    /// or lacks the required outlet invocation capability.
     /// Raises `ContextError` if the economy pre-check, budget, payment escrow,
-    /// hard rate limit, or underlying tool dispatch fails.
+    /// hard rate limit, or underlying outlet dispatch fails.
     ///
     /// See ADR-013 §4, SCP-212, spec §6.2, §8, §19.5, §19.7, ADR-016, #319.
-    #[pyo3(name = "tool_invoke")]
-    #[pyo3(signature = (context_id, tool_id, input, identity_did, ucan_token, proof_tokens=None, spending_ucan=None))]
+    #[pyo3(name = "outlet_invoke")]
+    #[pyo3(signature = (context_id, outlet_id, input, identity_did, ucan_token, proof_tokens=None, spending_ucan=None))]
     #[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
-    pub fn tool_invoke(
+    pub fn outlet_invoke(
         &self,
         py: Python<'_>,
         context_id: &str,
-        tool_id: &str,
+        outlet_id: &str,
         input: &Bound<'_, PyDict>,
         identity_did: &str,
         ucan_token: &str,
@@ -1762,11 +1762,11 @@ impl crate::scp::PyScp {
         spending_ucan: Option<&str>,
     ) -> PyResult<PyObject> {
         let bi = &*self.inner;
-        tool_invoke_impl(
+        outlet_invoke_impl(
             bi,
             py,
             context_id,
-            tool_id,
+            outlet_id,
             input,
             identity_did,
             ucan_token,
@@ -1775,55 +1775,55 @@ impl crate::scp::PyScp {
         )
     }
 
-    /// Verifies a tool against its registered test vectors.
+    /// Verifies a outlet against its registered test vectors.
     ///
     /// # Arguments
     ///
-    /// * `context_id` — The ID of the context containing the tool.
-    /// * `tool_id` — The ID of the tool to verify.
+    /// * `context_id` — The ID of the context containing the outlet.
+    /// * `outlet_id` — The ID of the outlet to verify.
     ///
     /// # Returns
     ///
-    /// A [`PyToolVerificationResult`] with the tool ID, overall pass/fail
+    /// A [`PyOutletVerificationResult`] with the outlet ID, overall pass/fail
     /// status, and any failure messages.
     ///
     /// # Errors
     ///
-    /// Raises `ContextError` if the context is not connected or the tool
+    /// Raises `ContextError` if the context is not connected or the outlet
     /// is not found.
     ///
     /// See ADR-013 §4.
-    #[pyo3(name = "tool_verify")]
-    pub fn tool_verify(
+    #[pyo3(name = "outlet_verify")]
+    pub fn outlet_verify(
         &self,
         context_id: &str,
-        tool_id: &str,
-    ) -> PyResult<PyToolVerificationResult> {
+        outlet_id: &str,
+    ) -> PyResult<PyOutletVerificationResult> {
         let bi = &*self.inner;
-        tool_verify_impl(bi, context_id, tool_id)
+        outlet_verify_impl(bi, context_id, outlet_id)
     }
 
-    /// Invokes a tool across context boundaries.
+    /// Invokes a outlet across context boundaries.
     ///
-    /// The source context exposes the tool and the target context accepts the
+    /// The source context exposes the outlet and the target context accepts the
     /// interface. Both contexts must have approved the interface before calls
     /// are permitted. Rate limits and chain depth are enforced per spec §6.2.
     ///
     /// # Errors
     ///
     /// Raises `UcanError` if the UCAN token is invalid, expired, revoked,
-    /// or lacks the required tool invocation capability.
-    /// Raises `ContextError` if either context is not connected, the tool is
+    /// or lacks the required outlet invocation capability.
+    /// Raises `ContextError` if either context is not connected, the outlet is
     /// not found, chain depth is exceeded, or the interface is not approved.
-    #[pyo3(name = "tool_invoke_cross_context")]
-    #[pyo3(signature = (source_context_id, target_context_id, tool_id, input, invoker_did, ucan_token, chain_depth, proof_tokens=None))]
+    #[pyo3(name = "outlet_invoke_cross_context")]
+    #[pyo3(signature = (source_context_id, target_context_id, outlet_id, input, invoker_did, ucan_token, chain_depth, proof_tokens=None))]
     #[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
-    pub fn tool_invoke_cross_context(
+    pub fn outlet_invoke_cross_context(
         &self,
         py: Python<'_>,
         source_context_id: &str,
         target_context_id: &str,
-        tool_id: &str,
+        outlet_id: &str,
         input: &Bound<'_, PyDict>,
         invoker_did: &str,
         ucan_token: &str,
@@ -1831,12 +1831,12 @@ impl crate::scp::PyScp {
         proof_tokens: Option<Vec<String>>,
     ) -> PyResult<PyObject> {
         let bi = &*self.inner;
-        tool_invoke_cross_context_impl(
+        outlet_invoke_cross_context_impl(
             bi,
             py,
             source_context_id,
             target_context_id,
-            tool_id,
+            outlet_id,
             input,
             invoker_did,
             ucan_token,
@@ -1845,14 +1845,14 @@ impl crate::scp::PyScp {
         )
     }
 
-    /// Invokes a tool across context boundaries as an atomic two-phase saga
+    /// Invokes a outlet across context boundaries as an atomic two-phase saga
     /// (spec §6.2.4, ADR-049 §3a).
     ///
-    /// Unlike [`Self::tool_invoke_cross_context`] (the synchronous,
+    /// Unlike [`Self::outlet_invoke_cross_context`] (the synchronous,
     /// single-context-side path), this drives the full §6.2.4 cross-context
-    /// tool-invocation saga over the two CO-RESIDENT participant contexts
+    /// outlet-invocation saga over the two CO-RESIDENT participant contexts
     /// (caller + target): Prepare-A / Prepare-B authorize and stage both
-    /// sides, the tool executes EXACTLY ONCE supervisor-side at Commit-B, and
+    /// sides, the outlet executes EXACTLY ONCE supervisor-side at Commit-B, and
     /// each side records its own event-log entry. Both contexts MUST be
     /// co-resident in this bridge instance (the cross-node child-bridge
     /// transport is separate future work).
@@ -1882,7 +1882,7 @@ impl crate::scp::PyScp {
     ///
     /// On the `PyO3` string-id surface the caller/target context-id axes are
     /// enforced by the supervisor gates — membership (`is_member`) for the
-    /// caller context and the governance-established tool-interface gate for the
+    /// caller context and the governance-established outlet-interface gate for the
     /// target context — rather than the instance-affine handle pre-check the
     /// NAPI/UniFFI handle-based surfaces apply. The authorization is equivalent;
     /// the difference is only that this surface carries less pre-flight
@@ -1899,21 +1899,21 @@ impl crate::scp::PyScp {
     /// * `caller_context_id` — The initiating (caller) context id.
     /// * `target_context_id` — The executing (target) context id.
     /// * `caller_did` — The initiator DID (bound to the bridge principal).
-    /// * `tool_registration_id` — The tool to invoke across the interface.
-    /// * `input` — Tool input (a Python dict; schema-checked target-side).
+    /// * `outlet_registration_id` — The outlet to invoke across the interface.
+    /// * `input` — Outlet input (a Python dict; schema-checked target-side).
     /// * `asserted_nonce_hex` — The 16-byte §6.2.4 envelope nonce as a
     ///   32-char hex string (the freshness/dedup token).
     /// * `timestamp_ms` — Caller-asserted send time (Unix ms; freshness check).
     /// * `chain_depth` — Caller-asserted inbound provenance depth (advisory;
     ///   the target re-derives `+1`).
     /// * `ucan_proof_id` — Optional id of the spending UCAN proof, resolved
-    ///   target-side at Prepare-B. `None` for an ungated tool.
+    ///   target-side at Prepare-B. `None` for an ungated outlet.
     ///
     /// # Returns
     ///
     /// A [`PySagaResult`] on the committed terminal, carrying the
     /// supervisor-minted `saga_id`, the target's signed receipt bytes, and the
-    /// captured tool-output bytes. The `saga_id` is supervisor-minted — it is
+    /// captured outlet-output bytes. The `saga_id` is supervisor-minted — it is
     /// never an input.
     ///
     /// # Errors
@@ -1925,16 +1925,16 @@ impl crate::scp::PyScp {
     /// exchange; carries `retry_after_ms`), `SagaNeedsRepairError`
     /// (Commit-retry exhausted — carries the durable `saga_id` operator-repair
     /// handle), or `SagaBusyError` (the participant context set overlapped an
-    /// in-flight saga — §5.15.4). Raises `ValidationError` if an id/DID/tool-id
+    /// in-flight saga — §5.15.4). Raises `ValidationError` if an id/DID/outlet-id
     /// is malformed or `asserted_nonce_hex` does not decode to 16 bytes.
     ///
     /// See spec §6.2.4 and ADR-049 §3a.
-    #[pyo3(name = "tool_invoke_cross_context_saga")]
+    #[pyo3(name = "outlet_invoke_cross_context_saga")]
     #[pyo3(signature = (
         caller_context_id,
         target_context_id,
         caller_did,
-        tool_registration_id,
+        outlet_registration_id,
         input,
         asserted_nonce_hex,
         timestamp_ms,
@@ -1942,12 +1942,12 @@ impl crate::scp::PyScp {
         ucan_proof_id=None,
     ))]
     #[allow(clippy::too_many_arguments)] // Flat §6.2.4 envelope — agent-first named params.
-    pub fn tool_invoke_cross_context_saga(
+    pub fn outlet_invoke_cross_context_saga(
         &self,
         caller_context_id: &str,
         target_context_id: &str,
         caller_did: &str,
-        tool_registration_id: &str,
+        outlet_registration_id: &str,
         input: &Bound<'_, PyDict>,
         asserted_nonce_hex: &str,
         timestamp_ms: u64,
@@ -1955,12 +1955,12 @@ impl crate::scp::PyScp {
         ucan_proof_id: Option<String>,
     ) -> PyResult<PySagaResult> {
         let bi = &*self.inner;
-        tool_invoke_cross_context_saga_impl(
+        outlet_invoke_cross_context_saga_impl(
             bi,
             caller_context_id,
             target_context_id,
             caller_did,
-            tool_registration_id,
+            outlet_registration_id,
             input,
             asserted_nonce_hex,
             timestamp_ms,
@@ -1969,30 +1969,30 @@ impl crate::scp::PyScp {
         )
     }
 
-    /// Creates a stateful tool session.
+    /// Creates a stateful outlet session.
     ///
     /// Sessions enable multi-turn workflows with state preservation across
     /// invocations.
     ///
     /// # Errors
     ///
-    /// Raises `ContextError` if the context is not connected, the tool is
+    /// Raises `ContextError` if the context is not connected, the outlet is
     /// not found, or the per-caller session cap is exceeded.
-    #[pyo3(name = "tool_session_create", signature = (context_id, tool_id, source_context_id, ttl_seconds=None))]
-    pub fn tool_session_create(
+    #[pyo3(name = "outlet_session_create", signature = (context_id, outlet_id, source_context_id, ttl_seconds=None))]
+    pub fn outlet_session_create(
         &self,
         context_id: &str,
-        tool_id: &str,
+        outlet_id: &str,
         source_context_id: &str,
         ttl_seconds: Option<u64>,
     ) -> PyResult<String> {
         let bi = &*self.inner;
-        tool_session_create_impl(bi, context_id, tool_id, source_context_id, ttl_seconds)
+        outlet_session_create_impl(bi, context_id, outlet_id, source_context_id, ttl_seconds)
     }
 
-    /// Invokes a tool within an active session.
+    /// Invokes a outlet within an active session.
     ///
-    /// Each call is individually governed: the invoker must hold `ToolInvoke`
+    /// Each call is individually governed: the invoker must hold `OutletInvoke`
     /// capability and present a valid UCAN token. Session state is carried
     /// forward across invocations.
     ///
@@ -2001,11 +2001,11 @@ impl crate::scp::PyScp {
     /// Raises `UcanError` if the UCAN token is invalid.
     /// Raises `ContextError` if the session is not found, has expired, or the
     /// invoker lacks capability.
-    #[pyo3(name = "tool_session_invoke")]
+    #[pyo3(name = "outlet_session_invoke")]
     #[pyo3(signature = (context_id, session_id, input, invoker_did, ucan_token, proof_tokens=None))]
     #[allow(clippy::needless_pass_by_value)]
     #[allow(clippy::too_many_arguments)] // FFI surface: spec-defined signature
-    pub fn tool_session_invoke(
+    pub fn outlet_session_invoke(
         &self,
         py: Python<'_>,
         context_id: &str,
@@ -2016,7 +2016,7 @@ impl crate::scp::PyScp {
         proof_tokens: Option<Vec<String>>,
     ) -> PyResult<PyObject> {
         let bi = &*self.inner;
-        tool_session_invoke_impl(
+        outlet_session_invoke_impl(
             bi,
             py,
             context_id,
@@ -2028,66 +2028,66 @@ impl crate::scp::PyScp {
         )
     }
 
-    /// Closes a stateful tool session.
+    /// Closes a stateful outlet session.
     ///
     /// # Errors
     ///
     /// Raises `ContextError` if the context is not connected or the session
     /// is not found.
-    #[pyo3(name = "tool_session_close")]
-    pub fn tool_session_close(&self, context_id: &str, session_id: &str) -> PyResult<()> {
+    #[pyo3(name = "outlet_session_close")]
+    pub fn outlet_session_close(&self, context_id: &str, session_id: &str) -> PyResult<()> {
         let bi = &*self.inner;
-        tool_session_close_impl(bi, context_id, session_id)
+        outlet_session_close_impl(bi, context_id, session_id)
     }
 
-    /// Exposes a tool interface for cross-context sharing (§6.2.0.1 step 1).
+    /// Exposes a outlet interface for cross-context sharing (§6.2.0.1 step 1).
     ///
     /// # Errors
     ///
-    /// Raises `ToolError` if the caller is not an admin or the tool is not found.
-    #[pyo3(name = "tool_interface_expose", signature = (context_id, tool_id, target_context_id, rate_limit_json=None))]
-    pub fn tool_interface_expose(
+    /// Raises `OutletError` if the caller is not an admin or the outlet is not found.
+    #[pyo3(name = "outlet_interface_expose", signature = (context_id, outlet_id, target_context_id, rate_limit_json=None))]
+    pub fn outlet_interface_expose(
         &self,
         context_id: &str,
-        tool_id: &str,
+        outlet_id: &str,
         target_context_id: &str,
         rate_limit_json: Option<&str>,
     ) -> PyResult<String> {
         let bi = &*self.inner;
-        tool_interface_expose_impl(bi, context_id, tool_id, target_context_id, rate_limit_json)
+        outlet_interface_expose_impl(bi, context_id, outlet_id, target_context_id, rate_limit_json)
     }
 
-    /// Accepts a cross-context tool interface (§6.2.0.1 step 4).
+    /// Accepts a cross-context outlet interface (§6.2.0.1 step 4).
     ///
     /// # Errors
     ///
-    /// Raises `ToolError` if the caller is not an admin or the interface's
+    /// Raises `OutletError` if the caller is not an admin or the interface's
     /// target context does not match `context_id`.
-    #[pyo3(name = "tool_interface_accept")]
-    pub fn tool_interface_accept(
+    #[pyo3(name = "outlet_interface_accept")]
+    pub fn outlet_interface_accept(
         &self,
         context_id: &str,
         interface_json: &str,
     ) -> PyResult<String> {
         let bi = &*self.inner;
-        tool_interface_accept_impl(bi, context_id, interface_json)
+        outlet_interface_accept_impl(bi, context_id, interface_json)
     }
 
-    /// Revokes a cross-context tool interface (§6.2.0.1 step 5).
+    /// Revokes a cross-context outlet interface (§6.2.0.1 step 5).
     ///
     /// Either context may revoke unilaterally.
     ///
     /// # Errors
     ///
     /// Raises `ValidationError` if `interface_id` is not valid hex or not 32 bytes.
-    #[pyo3(name = "tool_interface_revoke")]
-    pub fn tool_interface_revoke(
+    #[pyo3(name = "outlet_interface_revoke")]
+    pub fn outlet_interface_revoke(
         &self,
         context_id: &str,
         interface_id_hex: &str,
     ) -> PyResult<String> {
         let bi = &*self.inner;
-        tool_interface_revoke_impl(bi, context_id, interface_id_hex)
+        outlet_interface_revoke_impl(bi, context_id, interface_id_hex)
     }
 }
 
@@ -2095,9 +2095,9 @@ impl crate::scp::PyScp {
 // Module registration
 // ---------------------------------------------------------------------------
 
-/// Registers tool bridge classes on the `_scp_core` module.
+/// Registers outlet bridge classes on the `_scp_core` module.
 ///
-/// Post-migration (Phase 4 PR 4 sub-slice E), tool operations are exposed as
+/// Post-migration (Phase 4 PR 4 sub-slice E), outlet operations are exposed as
 /// methods on `SCP`. Only opaque result classes require registration here.
 ///
 /// Called from [`crate::_scp_core`] during module initialization.
@@ -2105,9 +2105,9 @@ impl crate::scp::PyScp {
 /// # Errors
 ///
 /// Returns `PyErr` if registration of classes fails.
-pub fn register_tools(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_class::<PyToolRegistration>()?;
-    m.add_class::<PyToolVerificationResult>()?;
+pub fn register_outlets(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<PyOutletRegistration>()?;
+    m.add_class::<PyOutletVerificationResult>()?;
     m.add_class::<PySagaResult>()?;
     Ok(())
 }
@@ -2146,7 +2146,7 @@ mod tests {
         pyo3::prepare_freethreaded_python();
         Python::with_gil(|py| {
             let dict = PyDict::new(py);
-            dict.set_item("name", "test-tool").unwrap();
+            dict.set_item("name", "test-outlet").unwrap();
             dict.set_item("description", "a test").unwrap();
             dict.set_item("operator_did", "did:dht:test123456789abcdefghij")
                 .unwrap();
@@ -2156,7 +2156,7 @@ mod tests {
             schema.set_item("output_schema", PyDict::new(py)).unwrap();
             dict.set_item("schema", schema).unwrap();
 
-            let result = default_scp().tool_register("ctx-test-id-000000", &dict.as_borrowed());
+            let result = default_scp().outlet_register("ctx-test-id-000000", &dict.as_borrowed());
             assert!(result.is_err(), "should reject missing input_schema");
             let err_str = format!("{}", result.unwrap_err());
             assert!(
@@ -2176,7 +2176,7 @@ mod tests {
         pyo3::prepare_freethreaded_python();
         Python::with_gil(|py| {
             let dict = PyDict::new(py);
-            dict.set_item("name", "test-tool").unwrap();
+            dict.set_item("name", "test-outlet").unwrap();
             dict.set_item("description", "a test").unwrap();
             dict.set_item("operator_did", "did:dht:test123456789abcdefghij")
                 .unwrap();
@@ -2188,7 +2188,7 @@ mod tests {
             schema.set_item("input_schema", inner).unwrap();
             dict.set_item("schema", schema).unwrap();
 
-            let result = default_scp().tool_register("ctx-test-id-000000", &dict.as_borrowed());
+            let result = default_scp().outlet_register("ctx-test-id-000000", &dict.as_borrowed());
             assert!(result.is_err(), "should reject missing output_schema");
             let err_str = format!("{}", result.unwrap_err());
             assert!(
@@ -2208,7 +2208,7 @@ mod tests {
         pyo3::prepare_freethreaded_python();
         Python::with_gil(|py| {
             let dict = PyDict::new(py);
-            dict.set_item("name", "test-tool").unwrap();
+            dict.set_item("name", "test-outlet").unwrap();
             dict.set_item("description", "a test").unwrap();
             dict.set_item("operator_did", "did:dht:test123456789abcdefghij")
                 .unwrap();
@@ -2221,7 +2221,7 @@ mod tests {
             schema.set_item("output_schema", output).unwrap();
             dict.set_item("schema", schema).unwrap();
 
-            let result = default_scp().tool_register("ctx-test-id-000000", &dict.as_borrowed());
+            let result = default_scp().outlet_register("ctx-test-id-000000", &dict.as_borrowed());
             assert!(result.is_err(), "should reject non-object input_schema");
             let err_str = format!("{}", result.unwrap_err());
             assert!(
@@ -2237,7 +2237,7 @@ mod tests {
         pyo3::prepare_freethreaded_python();
         Python::with_gil(|py| {
             let dict = PyDict::new(py);
-            dict.set_item("name", "test-tool").unwrap();
+            dict.set_item("name", "test-outlet").unwrap();
             dict.set_item("description", "a test").unwrap();
             dict.set_item("operator_did", "did:dht:test123456789abcdefghij")
                 .unwrap();
@@ -2251,7 +2251,7 @@ mod tests {
             schema.set_item("output_schema", output_list).unwrap();
             dict.set_item("schema", schema).unwrap();
 
-            let result = default_scp().tool_register("ctx-test-id-000000", &dict.as_borrowed());
+            let result = default_scp().outlet_register("ctx-test-id-000000", &dict.as_borrowed());
             assert!(result.is_err(), "should reject non-object output_schema");
             let err_str = format!("{}", result.unwrap_err());
             assert!(
@@ -2270,7 +2270,7 @@ mod tests {
     /// exercise 7037/7038 paths without tripping earlier validation.
     fn valid_registration_dict(py: Python<'_>) -> Bound<'_, PyDict> {
         let dict = PyDict::new(py);
-        dict.set_item("name", "test-tool").unwrap();
+        dict.set_item("name", "test-outlet").unwrap();
         dict.set_item("description", "a test").unwrap();
         dict.set_item("operator_did", "did:dht:test123456789abcdefghij")
             .unwrap();
@@ -2293,7 +2293,7 @@ mod tests {
             let dict = valid_registration_dict(py);
             dict.set_item("test_vectors", "not-a-list").unwrap();
 
-            let result = default_scp().tool_register("ctx-test-id-000000", &dict.as_borrowed());
+            let result = default_scp().outlet_register("ctx-test-id-000000", &dict.as_borrowed());
             assert!(result.is_err(), "should reject non-list test_vectors");
             let err_str = format!("{}", result.unwrap_err());
             assert!(
@@ -2316,7 +2316,7 @@ mod tests {
             let vectors = pyo3::types::PyList::new(py, [42i32]).unwrap();
             dict.set_item("test_vectors", vectors).unwrap();
 
-            let result = default_scp().tool_register("ctx-test-id-000000", &dict.as_borrowed());
+            let result = default_scp().outlet_register("ctx-test-id-000000", &dict.as_borrowed());
             assert!(
                 result.is_err(),
                 "should reject non-dict items in test_vectors"
@@ -2343,7 +2343,7 @@ mod tests {
             wrong_type.set_item("not", "a list").unwrap();
             dict.set_item("test_vectors", wrong_type).unwrap();
 
-            let result = default_scp().tool_register("ctx-test-id-000000", &dict.as_borrowed());
+            let result = default_scp().outlet_register("ctx-test-id-000000", &dict.as_borrowed());
             assert!(result.is_err(), "should reject dict as test_vectors");
             let err_str = format!("{}", result.unwrap_err());
             assert!(
@@ -2394,7 +2394,7 @@ mod tests {
             let dict = valid_registration_dict(py);
             dict.set_item("implementation_hash", 12345).unwrap();
 
-            let result = default_scp().tool_register("ctx-test-id-000000", &dict.as_borrowed());
+            let result = default_scp().outlet_register("ctx-test-id-000000", &dict.as_borrowed());
             assert!(
                 result.is_err(),
                 "should reject non-string implementation_hash"
@@ -2421,7 +2421,7 @@ mod tests {
             dict.set_item("implementation_hash", "abcdef0123456789abcdef0123456789")
                 .unwrap();
 
-            let result = default_scp().tool_register("ctx-test-id-000000", &dict.as_borrowed());
+            let result = default_scp().outlet_register("ctx-test-id-000000", &dict.as_borrowed());
             assert!(
                 result.is_err(),
                 "should reject wrong-length implementation_hash"
@@ -2451,7 +2451,7 @@ mod tests {
             )
             .unwrap();
 
-            let result = default_scp().tool_register("ctx-test-id-000000", &dict.as_borrowed());
+            let result = default_scp().outlet_register("ctx-test-id-000000", &dict.as_borrowed());
             assert!(
                 result.is_err(),
                 "should reject invalid hex in implementation_hash"
@@ -2503,10 +2503,10 @@ mod tests {
     // registered_at timestamp — #871
     // -----------------------------------------------------------------------
 
-    /// `registered_at` on a tool registered via the `PyO3` bridge must be a
+    /// `registered_at` on a outlet registered via the `PyO3` bridge must be a
     /// seconds-epoch timestamp, not milliseconds or hardcoded 0.
-    /// Calls the actual `PyScp::tool_register` bridge method and inspects the
-    /// stored `ToolRegistration`. Catches the original bug from issue #871.
+    /// Calls the actual `PyScp::outlet_register` bridge method and inspects the
+    /// stored `OutletRegistration`. Catches the original bug from issue #871.
     #[test]
     fn registered_at_is_seconds_epoch() {
         // Use a unique context ID to avoid collisions with concurrent tests.
@@ -2546,16 +2546,16 @@ mod tests {
             schema.set_item("output_schema", output).unwrap();
             dict.set_item("schema", schema).unwrap();
 
-            let tool_id = scp
-                .tool_register(&ctx_id, &dict.as_borrowed())
-                .expect("tool_register should succeed");
+            let outlet_id = scp
+                .outlet_register(&ctx_id, &dict.as_borrowed())
+                .expect("outlet_register should succeed");
 
             // Read the stored registration back from the runtime registry.
             let registered_at = crate::runtime::with_ffi_state(bi, &ctx_id, |state| {
                 let reg = state
-                    .tool_registry
-                    .get(&tool_id)
-                    .expect("tool should exist in registry after successful registration");
+                    .outlet_registry
+                    .get(&outlet_id)
+                    .expect("outlet should exist in registry after successful registration");
                 Ok(reg.registered_at)
             })
             .unwrap();

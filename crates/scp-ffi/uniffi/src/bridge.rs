@@ -92,7 +92,7 @@ use scp_core::context::membership::KeyPackage;
 
 use scp_ffi_common::validate::{
     json_value_type_name, validate_capability_uri, validate_context_id, validate_did,
-    validate_mcp_handle, validate_relay_url, validate_tool_id, validate_tool_name,
+    validate_mcp_handle, validate_relay_url, validate_outlet_id, validate_outlet_name,
     validate_transport_mode, validate_ucan_token,
 };
 
@@ -148,8 +148,8 @@ fn generate_mls_key_package_bytes(did: &str) -> Result<Vec<u8>, ScpError> {
         })
 }
 
-/// Tool handler function type: maps JSON input to JSON output (or error string).
-type ToolHandlerMap = std::collections::HashMap<
+/// Outlet handler function type: maps JSON input to JSON output (or error string).
+type OutletHandlerMap = std::collections::HashMap<
     String,
     std::sync::Arc<dyn Fn(serde_json::Value) -> Result<serde_json::Value, String> + Send + Sync>,
 >;
@@ -995,18 +995,18 @@ pub enum ScpError {
     #[error("transport error [{code}]: {msg}")]
     Transport { msg: String, code: String },
 
-    /// A tool operation failed (registration, invocation, verification).
-    #[error("tool error [{code}]: {msg}")]
-    Tool { msg: String, code: String },
+    /// A outlet operation failed (registration, invocation, verification).
+    #[error("outlet error [{code}]: {msg}")]
+    Outlet { msg: String, code: String },
 
     /// Input validation failed (malformed data, schema mismatch, constraint violation).
     #[error("validation error [{code}]: {msg}")]
     Validation { msg: String, code: String },
 
-    /// A §6.2.4 cross-context tool-invocation saga aborted at a Prepare phase.
+    /// A §6.2.4 cross-context outlet-invocation saga aborted at a Prepare phase.
     ///
     /// Surfaces the `Aborted` terminal of
-    /// `Supervisor::start_cross_context_tool_invocation_saga`. This terminal may
+    /// `Supervisor::start_cross_context_outlet_invocation_saga`. This terminal may
     /// be a PERMANENT rejection (authorization / freshness / rate-limit /
     /// co-residency policy denial, or the §6.2.4 *Caller authentication*
     /// mismatch this bridge enforces before the saga runs) OR a RETRYABLE
@@ -1132,7 +1132,7 @@ impl From<scp_identity::IdentityError> for ScpError {
 /// Extracts a leading `SCP-XXX-NNNN` error code from a message body, if any.
 ///
 /// Mirrors the `PyO3` / NAPI bridge helpers. Used to recover
-/// economy (12xxx), tool-invocation (6xxx), and permission (3xxx) codes
+/// economy (12xxx), outlet-invocation (6xxx), and permission (3xxx) codes
 /// embedded inside `ContextError::PermissionDenied(String)` so Swift /
 /// Kotlin callers can detect specific failures without string-matching
 /// the message body.
@@ -1238,7 +1238,7 @@ impl From<scp_core::context::ContextError> for ScpError {
             },
             // Recover embedded SCP-ECON-/SCP-TOOL-/SCP-PERM- codes from
             // the runtime's `PermissionDenied(String)` catch-all so the
-            // typed-envelope contract holds for tool-economy failures.
+            // typed-envelope contract holds for outlet-economy failures.
             CE::PermissionDenied(msg) => {
                 let code = extract_scp_code(msg).unwrap_or_else(|| codes::PERM_3001.to_owned());
                 if code.starts_with("SCP-PERM-") {
@@ -1247,7 +1247,7 @@ impl From<scp_core::context::ContextError> for ScpError {
                         code,
                     }
                 } else if code.starts_with("SCP-TOOL-") {
-                    Self::Tool {
+                    Self::Outlet {
                         msg: format!("{e}"),
                         code,
                     }
@@ -1315,33 +1315,33 @@ impl From<scp_core::context::promotion::PromotionError> for ScpError {
     }
 }
 
-impl From<scp_core::context::tools::ToolError> for ScpError {
-    fn from(e: scp_core::context::tools::ToolError) -> Self {
-        Self::Tool {
+impl From<scp_core::context::outlets::OutletError> for ScpError {
+    fn from(e: scp_core::context::outlets::OutletError) -> Self {
+        Self::Outlet {
             msg: format!(
-                "tool operation failed: {e} — check tool registration, permissions, and input schema"
+                "outlet operation failed: {e} — check outlet registration, permissions, and input schema"
             ),
-            code: codes::TOOL_6001.to_owned(),
+            code: codes::OUTLET_6001.to_owned(),
         }
     }
 }
 
-impl From<scp_core::context::tools::invoke::InvocationError> for ScpError {
-    fn from(e: scp_core::context::tools::invoke::InvocationError) -> Self {
-        Self::Tool {
+impl From<scp_core::context::outlets::invoke::InvocationError> for ScpError {
+    fn from(e: scp_core::context::outlets::invoke::InvocationError) -> Self {
+        Self::Outlet {
             msg: format!(
-                "tool invocation failed: {e} — verify tool ID, input, and caller permissions"
+                "outlet invocation failed: {e} — verify outlet ID, input, and caller permissions"
             ),
-            code: codes::TOOL_6002.to_owned(),
+            code: codes::OUTLET_6002.to_owned(),
         }
     }
 }
 
-impl From<scp_core::context::tools::schema::SchemaValidationError> for ScpError {
-    fn from(e: scp_core::context::tools::schema::SchemaValidationError) -> Self {
+impl From<scp_core::context::outlets::schema::SchemaValidationError> for ScpError {
+    fn from(e: scp_core::context::outlets::schema::SchemaValidationError) -> Self {
         Self::Validation {
             msg: format!(
-                "schema validation failed: {e} — check input against the tool's JSON Schema"
+                "schema validation failed: {e} — check input against the outlet's JSON Schema"
             ),
             code: codes::VALID_7001.to_owned(),
         }
@@ -1818,7 +1818,7 @@ pub struct ParticipationRecordView {
     pub governance_actions_against: u64,
     /// Count of governance actions initiated by this identity.
     pub governance_actions_by: u64,
-    /// Total tool invocations across all tool types.
+    /// Total outlet invocations across all outlet types.
     pub tool_invocation_count: u64,
     /// Whether `tool_invocation_count` is anchored in the canonical Merkle log
     /// (`false` until ADR-051; consumers MUST NOT treat it as Merkle-proven).
@@ -2027,32 +2027,32 @@ impl DataProvenance {
     }
 }
 
-/// Tool definition for registration in a context.
+/// Outlet definition for registration in a context.
 ///
-/// See ADR-010 (Tool Registry) and spec §5.4.1 (Tools).
+/// See ADR-010 (Outlet Registry) and spec §5.4.1 (Outlets).
 #[derive(Debug, Clone, uniffi::Record)]
-pub struct ToolDefinition {
-    /// Human-readable tool name.
+pub struct OutletDefinition {
+    /// Human-readable outlet name.
     pub name: String,
-    /// Tool description.
+    /// Outlet description.
     pub description: String,
-    /// JSON Schema for tool input (as a JSON string).
+    /// JSON Schema for outlet input (as a JSON string).
     pub input_schema_json: String,
-    /// JSON Schema for tool output (as a JSON string).
+    /// JSON Schema for outlet output (as a JSON string).
     pub output_schema_json: String,
-    /// DID of the tool operator (responsible party).
+    /// DID of the outlet operator (responsible party).
     pub operator_did: String,
     /// Test vectors for integrity verification (serialized as JSON string).
     pub test_vectors_json: Option<String>,
     /// SHA-256 hash of the implementation binary (32 bytes).
     pub implementation_hash: Option<Vec<u8>>,
     /// Optional per-invocation cost metadata (spec §5.4.1).
-    pub cost: Option<ToolCostDefinition>,
+    pub cost: Option<OutletCostDefinition>,
 }
 
-/// Per-invocation cost metadata for a tool (spec §5.4.1).
+/// Per-invocation cost metadata for a outlet (spec §5.4.1).
 #[derive(Debug, Clone, uniffi::Record)]
-pub struct ToolCostDefinition {
+pub struct OutletCostDefinition {
     /// Cost per invocation in the smallest currency unit.
     pub amount: u64,
     /// ISO 4217 or protocol-defined currency code.
@@ -2063,31 +2063,31 @@ pub struct ToolCostDefinition {
     pub cost_formula: Option<String>,
 }
 
-/// Result of verifying a tool against its test vectors.
+/// Result of verifying a outlet against its test vectors.
 ///
-/// See ADR-010 (Tool Registry).
+/// See ADR-010 (Outlet Registry).
 #[derive(Debug, Clone, uniffi::Record)]
-pub struct ToolVerificationResult {
-    /// The verified tool's ID.
-    pub tool_id: String,
+pub struct OutletVerificationResult {
+    /// The verified outlet's ID.
+    pub outlet_id: String,
     /// `true` if all test vectors passed.
     pub passed: bool,
     /// Failure messages for vectors that did not pass. Empty on success.
     pub failures: Vec<String>,
 }
 
-/// The committed terminal of a §6.2.4 cross-context tool-invocation saga
+/// The committed terminal of a §6.2.4 cross-context outlet-invocation saga
 /// (ADR-049 §3a).
 ///
-/// Returned by [`crate::scp::Scp::tool_invoke_cross_context_saga`] on a
+/// Returned by [`crate::scp::Scp::outlet_invoke_cross_context_saga`] on a
 /// `Committed` terminal. Every NON-committed terminal raises one of the typed
 /// saga errors ([`ScpError::SagaAborted`] / [`ScpError::SagaNeedsRepair`] /
 /// [`ScpError::SagaBusy`]) instead.
 ///
 /// Carries the supervisor-minted `saga_id` plus — for the committed
 /// cross-context invocation — the target's signed receipt and the captured
-/// tool output (spec §6.2.4 "Receipt / response return path"). The `receipt`
-/// is the JCS-canonical `CrossContextToolReceipt` bytes; `output` is the
+/// outlet output (spec §6.2.4 "Receipt / response return path"). The `receipt`
+/// is the JCS-canonical `CrossContextOutletReceipt` bytes; `output` is the
 /// receipt's canonical `output_jcs` bytes (the exact bytes the caller side
 /// recorded a hash of). Both are surfaced as `bytes` (Swift `Data` / Kotlin
 /// `ByteArray`) so a caller can verify the receipt signature and recompute
@@ -2098,7 +2098,7 @@ pub struct ToolVerificationResult {
 pub struct SagaResult {
     /// The durable saga identifier (supervisor-minted, never a caller input).
     pub saga_id: String,
-    /// The target's signed `CrossContextToolReceipt` bytes (JCS), or `None`.
+    /// The target's signed `CrossContextOutletReceipt` bytes (JCS), or `None`.
     ///
     /// The `receipt` is signed by the target context's LOCALLY-RESOLVED Active
     /// Signing Key (the key held by its registered handle on this instance).
@@ -2111,7 +2111,7 @@ pub struct SagaResult {
     /// cross-node child-bridge transport lands, where a co-resident signer is
     /// trusted only within this instance.
     pub receipt: Option<Vec<u8>>,
-    /// The captured tool output bytes (the receipt's canonical `output_jcs`),
+    /// The captured outlet output bytes (the receipt's canonical `output_jcs`),
     /// or `None`.
     pub output: Option<Vec<u8>>,
 }
@@ -2962,12 +2962,12 @@ pub struct ContextHandle {
     pub(crate) signing_key: Option<KeyHandle>,
     /// Capability ceiling strings for UCAN mint-time enforcement (#339).
     pub(crate) ceiling_strings: Vec<String>,
-    /// Tool registry for this context.
-    pub(crate) tool_registry: tokio::sync::Mutex<scp_core::context::tools::ToolRegistry>,
-    /// Registered tool handlers keyed by tool ID.
-    pub(crate) tool_handlers: tokio::sync::Mutex<ToolHandlerMap>,
-    /// Session store for stateful tool sessions (spec section 6.2.1).
-    pub(crate) session_store: tokio::sync::Mutex<scp_core::context::tools::SessionStore>,
+    /// Outlet registry for this context.
+    pub(crate) outlet_registry: tokio::sync::Mutex<scp_core::context::outlets::OutletRegistry>,
+    /// Registered outlet handlers keyed by outlet ID.
+    pub(crate) outlet_handlers: tokio::sync::Mutex<OutletHandlerMap>,
+    /// Session store for stateful outlet sessions (spec section 6.2.1).
+    pub(crate) session_store: tokio::sync::Mutex<scp_core::context::outlets::SessionStore>,
     /// Optional economic policy as a JSON string (§19.3, ADR-033).
     pub(crate) economic_policy: std::sync::Mutex<Option<String>>,
     /// Core context parameters, retained for `finalize_close` (`memory_scope`
@@ -3950,24 +3950,24 @@ pub fn identity_verify_link_attestation(
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// Free functions — tool operations
+// Free functions — outlet operations
 //
 // See ADR-021 acceptance criterion 4.
 // ---------------------------------------------------------------------------
 
-/// Validates a UCAN token for tool invocation authorization (`UniFFI` bridge).
+/// Validates a UCAN token for outlet invocation authorization (`UniFFI` bridge).
 ///
-/// Runs the full 11-step ADR-016 pipeline, requiring `tool_invoke:{tool_id}`
-/// or `tool_invoke:*` capability. Extracted to keep `tool_invoke` focused.
-fn validate_tool_ucan_uniffi(
+/// Runs the full 11-step ADR-016 pipeline, requiring `outlet_invoke:{outlet_id}`
+/// or `tool_invoke:*` capability. Extracted to keep `outlet_invoke` focused.
+fn validate_outlet_ucan_uniffi(
     bi: &Arc<crate::runtime::UniffiBridgeInstance>,
     handle: &ContextHandle,
-    tool_id: &str,
+    outlet_id: &str,
     ucan_token: &str,
     identity_did: &str,
     proof_tokens: Option<&Vec<String>>,
 ) -> Result<(), ScpError> {
-    use scp_core::context::tools::invoke::validate_tool_invocation_ucan;
+    use scp_core::context::outlets::invoke::validate_outlet_invocation_ucan;
     use scp_core::crypto::ucan::validate::{
         DEFAULT_CLOCK_SKEW_TOLERANCE_SECS, ValidationContext, parse_ucan,
     };
@@ -4015,9 +4015,9 @@ fn validate_tool_ucan_uniffi(
             clock: &scp_clock::SystemClock,
         };
 
-        validate_tool_invocation_ucan(ucan_token, &handle.context_id, tool_id, &mut ctx).map_err(
+        validate_outlet_invocation_ucan(ucan_token, &handle.context_id, outlet_id, &mut ctx).map_err(
             |e| ScpError::Permission {
-                msg: format!("UCAN authorization failed for tool '{tool_id}': {e}"),
+                msg: format!("UCAN authorization failed for outlet '{outlet_id}': {e}"),
                 code: codes::PERM_3002.to_owned(),
             },
         )
@@ -4029,11 +4029,11 @@ fn validate_tool_ucan_uniffi(
 }
 
 // ---------------------------------------------------------------------------
-// Free functions — cross-context tool invocation (spec section 6.2)
+// Free functions — cross-context outlet invocation (spec section 6.2)
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// Free functions — stateful tool sessions (spec section 6.2.1)
+// Free functions — stateful outlet sessions (spec section 6.2.1)
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
@@ -4066,35 +4066,35 @@ pub struct McpServerConfig {
     pub context_ids: Vec<String>,
     /// Transport mode: `"stdio"` or `"sse"`.
     pub transport: String,
-    /// Optional JWT-encoded UCAN token for tool invocation authorization.
+    /// Optional JWT-encoded UCAN token for outlet invocation authorization.
     ///
     /// When present, `validate_capability` runs the full 11-step ADR-016
     /// validation pipeline. When absent, capability validation rejects
-    /// immediately (UCAN is required for tool invocation per §6.2).
+    /// immediately (UCAN is required for outlet invocation per §6.2).
     pub ucan_token: Option<String>,
     /// Optional proof tokens for UCAN delegation chain verification.
     pub proof_tokens: Option<Vec<String>>,
 }
 
-/// Tool definition from an external MCP server.
+/// Outlet definition from an external MCP server.
 #[derive(Debug, Clone, uniffi::Record)]
-pub struct McpToolInfo {
-    /// Tool name.
+pub struct McpOutletInfo {
+    /// Outlet name.
     pub name: String,
     /// Human-readable description.
     pub description: String,
-    /// JSON Schema for tool input (as a JSON string).
+    /// JSON Schema for outlet input (as a JSON string).
     pub input_schema_json: String,
 }
 
-/// Result of invoking an external MCP tool with SCP provenance.
+/// Result of invoking an external MCP outlet with SCP provenance.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct McpInvokeResult {
-    /// Tool output content as serialized JSON.
+    /// Outlet output content as serialized JSON.
     pub content_json: String,
-    /// Whether the tool call resulted in an error.
+    /// Whether the outlet call resulted in an error.
     pub is_error: bool,
-    /// Source of the result, formatted as `"mcp:{tool_name}"`.
+    /// Source of the result, formatted as `"mcp:{outlet_name}"`.
     pub source: String,
     /// DID of the invoking agent.
     pub invoked_by: String,
@@ -4116,8 +4116,8 @@ pub struct McpAllowlistState {
 // ---------------------------------------------------------------------------
 // Context handle registry — maps context_id → Arc<ContextHandle>
 //
-// The MCP bridge provider needs to look up per-context state (tool registry,
-// tool handlers, event log) by context ID, but UniFFI passes handles as
+// The MCP bridge provider needs to look up per-context state (outlet registry,
+// outlet handlers, event log) by context ID, but UniFFI passes handles as
 // opaque Arc<ContextHandle> objects. This registry bridges the gap by
 // storing a weak reference to each active context handle, registered during
 // context_create and deregistered during context_close/leave.
@@ -4132,7 +4132,7 @@ pub struct McpAllowlistState {
 /// Phase D (#1695) deletes the empty-fallback branch — every caller threads
 /// through the owning `Scp`.
 ///
-/// Used by `McpUniFfiBridgeProvider` to look up per-context tool registries,
+/// Used by `McpUniFfiBridgeProvider` to look up per-context outlet registries,
 /// handlers, and event log state. The `Arc<ContextHandle>` keeps the handle
 /// alive as long as it is in the registry (the caller also holds an Arc).
 fn context_handle_registry(
@@ -4417,15 +4417,15 @@ impl scp_mcp::client::McpTransport for McpSseTransport {
 // MCP FFI bridge context provider
 // ---------------------------------------------------------------------------
 
-/// Default tool handler timeout in milliseconds (30 seconds).
-const UNIFFI_TOOL_TIMEOUT_MS: u64 = scp_core::context::tools::DEFAULT_TIMEOUT_MS as u64;
+/// Default outlet handler timeout in milliseconds (30 seconds).
+const UNIFFI_OUTLET_TIMEOUT_MS: u64 = scp_core::context::outlets::DEFAULT_TIMEOUT_MS as u64;
 
 /// FFI bridge provider for the MCP server. Implements `ContextProvider` by
-/// reading tool registrations, role state, and event log data from the
+/// reading outlet registrations, role state, and event log data from the
 /// context handle registry and `ContextManager`.
 ///
 /// This mirrors the `PyO3` bridge's `FfiBridgeProvider` architecture:
-/// - `context_tools()` reads from the per-context `ToolRegistry`
+/// - `context_tools()` reads from the per-context `OutletRegistry`
 /// - `agent_role()` reads from `ContextManager::get_role_state()`
 /// - `validate_capability()` runs UCAN validation + role-state capability check
 /// - `invoke_tool()` dispatches to registered handlers with schema validation
@@ -4460,9 +4460,9 @@ struct McpUniFfiBridgeProvider {
     bi: std::sync::Weak<crate::runtime::UniffiBridgeInstance>,
     agent_did: String,
     context_ids: Vec<String>,
-    /// Maximum time (in milliseconds) to wait for a tool handler to complete.
-    tool_timeout_ms: u64,
-    /// JWT-encoded UCAN token for tool invocation authorization.
+    /// Maximum time (in milliseconds) to wait for a outlet handler to complete.
+    outlet_timeout_ms: u64,
+    /// JWT-encoded UCAN token for outlet invocation authorization.
     agent_ucan_token: Option<String>,
     /// Optional proof tokens for UCAN delegation chain verification.
     agent_proof_tokens: Option<Vec<String>>,
@@ -4517,7 +4517,7 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
 
     fn context_tools(&self, context_id: &str) -> Vec<scp_mcp::server::ContextToolInfo> {
         // Look up the ContextHandle from this provider's instance registry
-        // and read its tool_registry.
+        // and read its outlet_registry.
         // Returns empty if the bridge instance has been dropped (#1549 round-2).
         let Ok(bi) = self.upgrade_bi() else {
             return Vec::new();
@@ -4526,8 +4526,8 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
         let Some(handle) = registry.get(context_id) else {
             return Vec::new();
         };
-        let tool_registry = handle.tool_registry.blocking_lock();
-        tool_registry
+        let outlet_registry = handle.outlet_registry.blocking_lock();
+        outlet_registry
             .registrations()
             .map(|t| scp_mcp::server::ContextToolInfo {
                 name: t.name.clone(),
@@ -4539,7 +4539,7 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
             .collect()
     }
 
-    fn validate_capability(&self, context_id: &str, tool_name: &str) -> Result<(), String> {
+    fn validate_capability(&self, context_id: &str, outlet_name: &str) -> Result<(), String> {
         // Upgrade the bridge instance handle up-front so every check below
         // sees a stable `&UniffiBridgeInstance`. If the instance has been
         // dropped, fail fast rather than silently accepting the capability
@@ -4598,29 +4598,29 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
                     clock: &scp_clock::SystemClock,
                 };
 
-                scp_core::context::tools::validate_tool_invocation_ucan(
-                    token, context_id, tool_name, &mut ctx,
+                scp_core::context::outlets::validate_outlet_invocation_ucan(
+                    token, context_id, outlet_name, &mut ctx,
                 )
                 .map_err(|e| {
                     tracing::warn!(
                         agent = %agent_did,
-                        tool = %tool_name,
+                        outlet = %outlet_name,
                         context = %context_id,
                         error = %e,
-                        "UCAN validation failed for tool invocation"
+                        "UCAN validation failed for outlet invocation"
                     );
-                    format!("UCAN authorization failed for tool '{tool_name}': {e}")
+                    format!("UCAN authorization failed for outlet '{outlet_name}': {e}")
                 })
             })
             .ok_or_else(|| format!("UCAN state not found for context '{context_id}'"))??;
         } else {
             tracing::warn!(
                 agent = %self.agent_did,
-                tool = %tool_name,
+                outlet = %outlet_name,
                 context = %context_id,
-                "no UCAN token provided for tool invocation — authorization bypass risk"
+                "no UCAN token provided for outlet invocation — authorization bypass risk"
             );
-            return Err("UCAN token required for tool invocation — no token provided".to_owned());
+            return Err("UCAN token required for outlet invocation — no token provided".to_owned());
         }
 
         // Defense-in-depth: check role-state capabilities in addition to the
@@ -4652,20 +4652,20 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
             format!("context '{context_id}' not registered with Supervisor for capability check")
         })?;
 
-        if scp_core::context::tools::invoke::has_tool_invoke_capability(
+        if scp_core::context::outlets::invoke::has_outlet_invoke_capability(
             &role_state,
             &self.agent_did,
-            tool_name,
+            outlet_name,
         ) {
             Ok(())
         } else {
             tracing::warn!(
                 agent = %self.agent_did,
-                tool = %tool_name,
+                outlet = %outlet_name,
                 context = %context_id,
-                "capability check failed: agent lacks ToolInvoke capability"
+                "capability check failed: agent lacks OutletInvoke capability"
             );
-            Err("insufficient permissions to invoke tool".to_owned())
+            Err("insufficient permissions to invoke outlet".to_owned())
         }
     }
 
@@ -4673,12 +4673,12 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
     fn invoke_tool(
         &self,
         context_id: &str,
-        tool_name: &str,
+        outlet_name: &str,
         arguments: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
         let start = std::time::Instant::now();
         let agent_did = self.agent_did.clone();
-        let timeout = std::time::Duration::from_millis(self.tool_timeout_ms);
+        let timeout = std::time::Duration::from_millis(self.outlet_timeout_ms);
 
         // Upgrade the bridge instance handle up-front. `invoke_tool` is a
         // sync trait method so the Arc is bounded by this function's return
@@ -4686,7 +4686,7 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
         let bi = self.upgrade_bi()?;
 
         // Phase 1: Validate input and extract handler + output schema under
-        // the ContextHandle's tool_registry lock. The lock is released before
+        // the ContextHandle's outlet_registry lock. The lock is released before
         // handler execution to avoid blocking concurrent context operations.
         // The DashMap Ref (shard lock) is scoped to this block.
         let (dispatch, input_hash) = {
@@ -4694,25 +4694,25 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
                 .get(context_id)
                 .ok_or_else(|| format!("context '{context_id}' not found in handle registry"))?;
 
-            let tool_registry = handle.tool_registry.blocking_lock();
-            let registration = tool_registry
-                .get(tool_name)
-                .ok_or_else(|| format!("tool '{tool_name}' not found in context '{context_id}'"))?;
+            let outlet_registry = handle.outlet_registry.blocking_lock();
+            let registration = outlet_registry
+                .get(outlet_name)
+                .ok_or_else(|| format!("outlet '{outlet_name}' not found in context '{context_id}'"))?;
 
-            // Validate input against the tool's input schema.
-            scp_core::context::tools::schema::validate_value_against_schema(
+            // Validate input against the outlet's input schema.
+            scp_core::context::outlets::schema::validate_value_against_schema(
                 &arguments,
                 &registration.schema.input_schema,
             )
-            .map_err(|msg| format!("input validation failed for tool '{tool_name}': {msg}"))?;
+            .map_err(|msg| format!("input validation failed for outlet '{outlet_name}': {msg}"))?;
 
-            let input_hash = scp_core::context::tools::sha256_json(&arguments)
+            let input_hash = scp_core::context::outlets::sha256_json(&arguments)
                 .map_err(|e| format!("input hash canonicalization failed: {e}"))?;
 
             let handler_dispatch = {
-                let tool_handlers = handle.tool_handlers.blocking_lock();
-                tool_handlers
-                    .get(tool_name)
+                let outlet_handlers = handle.outlet_handlers.blocking_lock();
+                outlet_handlers
+                    .get(outlet_name)
                     .map(|handler| (handler.clone(), registration.schema.output_schema.clone()))
             };
 
@@ -4721,7 +4721,7 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
 
         // Phase 2: Execute handler OUTSIDE the locks so that concurrent
         // same-context operations are not blocked. Handler execution is
-        // bounded by `tool_timeout_ms` (matching PyO3 pattern, issue #123).
+        // bounded by `outlet_timeout_ms` (matching PyO3 pattern, issue #123).
         let output = match dispatch {
             Some((handler, output_schema)) => {
                 let (tx, rx) = std::sync::mpsc::channel();
@@ -4732,27 +4732,27 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
 
                 let handler_result = rx.recv_timeout(timeout).map_err(|_| {
                     format!(
-                        "tool handler for '{tool_name}' timed out after {}ms",
+                        "outlet handler for '{outlet_name}' timed out after {}ms",
                         timeout.as_millis()
                     )
                 })?;
 
                 let output = handler_result
-                    .map_err(|e| format!("tool handler for '{tool_name}' failed: {e}"))?;
+                    .map_err(|e| format!("outlet handler for '{outlet_name}' failed: {e}"))?;
 
-                // Validate output against the tool's output schema (defense-in-depth).
-                scp_core::context::tools::schema::validate_value_against_schema(
+                // Validate output against the outlet's output schema (defense-in-depth).
+                scp_core::context::outlets::schema::validate_value_against_schema(
                     &output,
                     &output_schema,
                 )
-                .map_err(|msg| format!("output validation failed for tool '{tool_name}': {msg}"))?;
+                .map_err(|msg| format!("output validation failed for outlet '{outlet_name}': {msg}"))?;
 
                 output
             }
             None => {
                 // No handler registered — fall back to echo mode.
                 serde_json::json!({
-                    "tool": tool_name,
+                    "outlet": outlet_name,
                     "context": context_id,
                     "status": "validated",
                     "input_valid": true,
@@ -4761,7 +4761,7 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
             }
         };
 
-        // Phase 3: Append ToolInvokedEvent to the event log (ADR-010
+        // Phase 3: Append OutletInvokedEvent to the event log (ADR-010
         // criterion 3). Uses append_unsigned_event because ContextProvider
         // is sync (same as PyO3 bridge).
         #[allow(clippy::cast_possible_truncation)]
@@ -4774,21 +4774,21 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
             }
         };
 
-        let tool_event = scp_core::context::tools::ToolInvokedEvent {
+        let outlet_event = scp_core::context::outlets::OutletInvokedEvent {
             request_id: uuid::Uuid::new_v4().to_string(),
-            tool_id: tool_name.to_owned(),
+            outlet_id: outlet_name.to_owned(),
             invoker_did: agent_did.clone().into(),
-            status: scp_core::context::tools::ToolStatus::Success,
+            status: scp_core::context::outlets::OutletStatus::Success,
             execution_time_ms: elapsed_ms,
             input_hash,
             output_hash: Some(
-                scp_core::context::tools::sha256_json(&output)
+                scp_core::context::outlets::sha256_json(&output)
                     .map_err(|e| format!("output hash canonicalization failed: {e}"))?,
             ),
             cost: None,
         };
 
-        let payload_data = serde_json::to_vec(&tool_event).unwrap_or_default();
+        let payload_data = serde_json::to_vec(&outlet_event).unwrap_or_default();
 
         let timestamp = scp_clock::Clock::now_secs(&scp_clock::SystemClock);
 
@@ -4824,17 +4824,17 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
             Some(Ok(_)) => {}
             Some(Err(e)) => {
                 tracing::warn!(
-                    tool = %tool_name,
+                    outlet = %outlet_name,
                     context = %context_id,
                     error = %e,
-                    "failed to append ToolInvokedEvent to event log"
+                    "failed to append OutletInvokedEvent to event log"
                 );
             }
             None => {
                 tracing::warn!(
-                    tool = %tool_name,
+                    outlet = %outlet_name,
                     context = %context_id,
-                    "UCAN state not found — could not append ToolInvokedEvent"
+                    "UCAN state not found — could not append OutletInvokedEvent"
                 );
             }
         }
@@ -5582,7 +5582,7 @@ async fn resolve_uniffi_signing_key(
 }
 
 // ---------------------------------------------------------------------------
-// Cross-context tool-invocation saga (§6.2.4, ADR-049 §3a) — bridge helpers
+// Cross-context outlet-invocation saga (§6.2.4, ADR-049 §3a) — bridge helpers
 // ---------------------------------------------------------------------------
 
 /// Maps a `SagaError` terminal (the typed §6.2.4 terminal space) onto the
@@ -8683,7 +8683,7 @@ fn parse_template_id_uniffi(
         "GroupDiscussion" => Ok(TemplateId::GroupDiscussion),
         "PublicBroadcast" => Ok(TemplateId::PublicBroadcast),
         "GatedBroadcast" => Ok(TemplateId::GatedBroadcast),
-        "scp:template/tool-interface" | "ToolInterfaceTemplate" => {
+        "scp:template/tool-interface" | "OutletInterfaceTemplate" => {
             Ok(TemplateId::ToolInterfaceTemplate)
         }
         "PaidService" => Ok(TemplateId::PaidService),
@@ -9418,12 +9418,12 @@ impl Scp {
                             scp_core::context::roles::Capability::new(s).ucan_capability_name()
                         })
                         .collect(),
-                    tool_registry: tokio::sync::Mutex::new(
-                        scp_core::context::tools::ToolRegistry::new(),
+                    outlet_registry: tokio::sync::Mutex::new(
+                        scp_core::context::outlets::OutletRegistry::new(),
                     ),
-                    tool_handlers: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+                    outlet_handlers: tokio::sync::Mutex::new(std::collections::HashMap::new()),
                     session_store: tokio::sync::Mutex::new(
-                        scp_core::context::tools::SessionStore::new(),
+                        scp_core::context::outlets::SessionStore::new(),
                     ),
                     economic_policy: std::sync::Mutex::new(None),
                     core_context_params: retained_core_params,
@@ -9833,12 +9833,12 @@ impl Scp {
                     // context binding — NOT caller input (there is none). Reuse the
                     // exact set already synced into the UCAN state above.
                     ceiling_strings: authed_ceiling.into_iter().collect(),
-                    tool_registry: tokio::sync::Mutex::new(
-                        scp_core::context::tools::ToolRegistry::new(),
+                    outlet_registry: tokio::sync::Mutex::new(
+                        scp_core::context::outlets::OutletRegistry::new(),
                     ),
-                    tool_handlers: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+                    outlet_handlers: tokio::sync::Mutex::new(std::collections::HashMap::new()),
                     session_store: tokio::sync::Mutex::new(
-                        scp_core::context::tools::SessionStore::new(),
+                        scp_core::context::outlets::SessionStore::new(),
                     ),
                     economic_policy: std::sync::Mutex::new(None),
                     // AUTHENTICATED params carried by the joined MLS group's signed
@@ -10347,7 +10347,7 @@ impl Scp {
 
                 // Log the close action for observability. For Summary scope,
                 // the verification window is opened but not actively polled —
-                // that requires a SummaryTool which needs design decisions.
+                // that requires a SummaryOutlet which needs design decisions.
                 // For Ephemeral, keys are destroyed immediately.
                 // For Full, data is preserved.
                 match close_action {
@@ -10699,7 +10699,7 @@ impl Scp {
 
         // Re-sync role state from ContextManager after governance execution (#796).
         // Governance actions may modify roles/membership; without this sync the
-        // Swift/Kotlin SDKs see stale role state for UCAN/tool capability checks.
+        // Swift/Kotlin SDKs see stale role state for UCAN/outlet capability checks.
         if let Err(e) = self
             .inner
             .sync_role_state_from_manager(&handle.context_id)
@@ -12529,14 +12529,14 @@ impl Scp {
             .collect()
     }
 
-    // ===== UniFFI sub-slice F — tools + access keys + TTL + event log + UCAN =====
+    // ===== UniFFI sub-slice F — outlets + access keys + TTL + event log + UCAN =====
     //
-    // Migrates the tool / access-key / TTL / event-log / UCAN free functions
-    // (`tool_register`, `tool_invoke`, `tool_verify`,
-    // `tool_invoke_cross_context`, `tool_session_create`,
-    // `tool_session_invoke`, `tool_session_close`,
-    // `tool_interface_expose`, `tool_interface_accept`,
-    // `tool_interface_revoke`, `access_key_generate`, `access_key_revoke`,
+    // Migrates the outlet / access-key / TTL / event-log / UCAN free functions
+    // (`outlet_register`, `outlet_invoke`, `outlet_verify`,
+    // `outlet_invoke_cross_context`, `outlet_session_create`,
+    // `outlet_session_invoke`, `outlet_session_close`,
+    // `outlet_interface_expose`, `outlet_interface_accept`,
+    // `outlet_interface_revoke`, `access_key_generate`, `access_key_revoke`,
     // `access_key_restore`, `context_handle_ttl_expiry`,
     // `context_propose_ttl_extension`, `context_reset_ttl_timer`,
     // `event_log_query`, `event_log_verify`, `event_log_checkpoint`,
@@ -12555,14 +12555,14 @@ impl Scp {
     //
     // Part of #1549 Phase 4 PR 4.
 
-    /// Per-instance equivalent of the free-function `tool_register`.
+    /// Per-instance equivalent of the free-function `outlet_register`.
     ///
     /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
     /// `instance_id` does not match this `SCP`'s.
-    pub async fn tool_register(
+    pub async fn outlet_register(
         &self,
         handle: Arc<ContextHandle>,
-        definition: ToolDefinition,
+        definition: OutletDefinition,
     ) -> Result<String, ScpError> {
         self.inner
             .core
@@ -12570,17 +12570,17 @@ impl Scp {
             .map_err(ScpError::from)?;
         runtime()
             .spawn(async move {
-                validate_tool_name(&definition.name)?;
+                validate_outlet_name(&definition.name)?;
 
                 let state = handle.state.lock().await;
 
                 if !matches!(*state, ContextState::Active) {
-                    return Err(ScpError::Tool {
+                    return Err(ScpError::Outlet {
                         msg: format!(
-                            "cannot register tool in context in {:?} state — context must be active",
+                            "cannot register outlet in context in {:?} state — context must be active",
                             *state
                         ),
-                        code: codes::TOOL_6003.to_owned(),
+                        code: codes::OUTLET_6003.to_owned(),
                     });
                 }
                 drop(state);
@@ -12618,7 +12618,7 @@ impl Scp {
                     });
                 }
 
-                let test_vectors: Vec<scp_core::context::tools::TestVector> =
+                let test_vectors: Vec<scp_core::context::outlets::OutletTestVector> =
                     match definition.test_vectors_json.as_deref() {
                         None => Vec::new(),
                         Some(json) => serde_json::from_str(json).map_err(|e| ScpError::Validation {
@@ -12639,10 +12639,10 @@ impl Scp {
                     })?,
                 };
 
-                let tool_id = format!("tool-{}", definition.name.replace(' ', "-").to_lowercase());
+                let outlet_id = format!("outlet-{}", definition.name.replace(' ', "-").to_lowercase());
 
-                let cost = definition.cost.map(|c| scp_core::context::tools::ToolCost {
-                    // ADR-060: `ToolCost.amount` is the `Amount` newtype. UniFFI
+                let cost = definition.cost.map(|c| scp_core::context::outlets::OutletCost {
+                    // ADR-060: `OutletCost.amount` is the `Amount` newtype. UniFFI
                     // carries it as a native `u64` (Swift `UInt64` / Kotlin
                     // `ULong`), which represents the full smallest-unit range
                     // exactly.
@@ -12652,11 +12652,11 @@ impl Scp {
                     cost_formula: c.cost_formula,
                 });
 
-                let core_registration = scp_core::context::tools::ToolRegistration {
-                    tool_id: tool_id.clone(),
+                let core_registration = scp_core::context::outlets::OutletRegistration {
+                    outlet_id: outlet_id.clone(),
                     name: definition.name,
                     description: definition.description,
-                    schema: scp_core::context::tools::ToolSchema {
+                    schema: scp_core::context::outlets::OutletSchema {
                         input_schema,
                         output_schema,
                     },
@@ -12677,41 +12677,41 @@ impl Scp {
                     vec![],
                     &scp_clock::SystemClock,
                 )
-                .map_err(|e| ScpError::Tool {
+                .map_err(|e| ScpError::Outlet {
                     msg: format!("failed to create role state: {e}"),
-                    code: codes::TOOL_6003.to_owned(),
+                    code: codes::OUTLET_6003.to_owned(),
                 })?;
 
-                let mut registry = handle.tool_registry.lock().await;
-                let (registered_id, _event) = scp_core::context::tools::register_tool(
+                let mut registry = handle.outlet_registry.lock().await;
+                let (registered_id, _event) = scp_core::context::outlets::register_outlet(
                     &mut registry,
                     &role_state,
                     core_registration,
                     &handle.creator_did,
                 )
-                .map_err(|e| ScpError::Tool {
-                    msg: format!("tool registration failed: {e}"),
-                    code: codes::TOOL_6001.to_owned(),
+                .map_err(|e| ScpError::Outlet {
+                    msg: format!("outlet registration failed: {e}"),
+                    code: codes::OUTLET_6001.to_owned(),
                 })?;
 
                 Ok(registered_id)
             })
             .await
-            .map_err(|e| ScpError::Tool {
-                msg: format!("tokio task join error during tool registration: {e}"),
-                code: codes::TOOL_6004.to_owned(),
+            .map_err(|e| ScpError::Outlet {
+                msg: format!("tokio task join error during outlet registration: {e}"),
+                code: codes::OUTLET_6004.to_owned(),
             })?
     }
 
-    /// Per-instance equivalent of the free-function `tool_invoke`.
+    /// Per-instance equivalent of the free-function `outlet_invoke`.
     ///
     /// Routes through `&*self.inner`. Rejects any `ContextHandle` or
     /// `Identity` whose `instance_id` does not match this `SCP`'s.
     #[allow(clippy::too_many_arguments)] // Mirrors the runtime's economy entry point.
-    pub async fn tool_invoke(
+    pub async fn outlet_invoke(
         &self,
         handle: Arc<ContextHandle>,
-        tool_id: String,
+        outlet_id: String,
         input_json: String,
         identity: Arc<Identity>,
         ucan_token: Option<String>,
@@ -12729,14 +12729,14 @@ impl Scp {
         let bi = Arc::clone(&self.inner);
         runtime()
             .spawn(async move {
-                validate_tool_id(&tool_id)?;
+                validate_outlet_id(&outlet_id)?;
                 validate_did(&identity.did)?;
 
-                // UCAN token is mandatory for tool invocation — all bridges
+                // UCAN token is mandatory for outlet invocation — all bridges
                 // enforce this. Reject early if missing (§6.2, ADR-016, #423).
                 let ucan_token = ucan_token.ok_or_else(|| ScpError::Permission {
-                    msg: "UCAN token is required for tool invocation — \
-                              pass a valid JWT-encoded UCAN with tool_invoke:{tool_id} \
+                    msg: "UCAN token is required for outlet invocation — \
+                              pass a valid JWT-encoded UCAN with outlet_invoke:{outlet_id} \
                               or tool_invoke:* capability"
                         .to_owned(),
                     code: codes::PERM_3001.to_owned(),
@@ -12749,12 +12749,12 @@ impl Scp {
                 let state = handle.state.lock().await;
 
                 if !matches!(*state, ContextState::Active) {
-                    return Err(ScpError::Tool {
+                    return Err(ScpError::Outlet {
                         msg: format!(
-                            "cannot invoke tool in context in {:?} state — context must be active",
+                            "cannot invoke outlet in context in {:?} state — context must be active",
                             *state
                         ),
-                        code: codes::TOOL_6005.to_owned(),
+                        code: codes::OUTLET_6005.to_owned(),
                     });
                 }
                 drop(state);
@@ -12763,10 +12763,10 @@ impl Scp {
                 // 11-step ADR-016 pipeline. Bridge-owned because the proof
                 // resolver, revocation list, and nonce tracker live in the
                 // bridge UCAN registry, not in the runtime.
-                validate_tool_ucan_uniffi(
+                validate_outlet_ucan_uniffi(
                     &bi,
                     &handle,
-                    &tool_id,
+                    &outlet_id,
                     &ucan_token,
                     &identity.did,
                     proof_tokens.as_ref(),
@@ -12784,38 +12784,38 @@ impl Scp {
                         code: codes::ECON_12061.to_owned(),
                     })?;
 
-                // Snapshot the bridge-owned tool registry and (optionally) the
+                // Snapshot the bridge-owned outlet registry and (optionally) the
                 // registered handler closure BEFORE entering the runtime call.
-                // The runtime requires a `&ToolRegistry` so we clone the
+                // The runtime requires a `&OutletRegistry` so we clone the
                 // registry once (cheap — Vec of registrations); the handler
                 // is an `Arc<dyn Fn>` so cloning is a refcount bump. Doing
                 // this OUTSIDE the manager call means the bridge handle's
-                // `tool_registry` mutex is released before Phase 1 of
-                // `invoke_tool_with_economy` acquires the manager mutex.
+                // `outlet_registry` mutex is released before Phase 1 of
+                // `invoke_outlet_with_economy` acquires the manager mutex.
                 let registry = {
-                    let reg = handle.tool_registry.lock().await;
+                    let reg = handle.outlet_registry.lock().await;
                     reg.clone()
                 };
                 let handler = {
-                    let handlers = handle.tool_handlers.lock().await;
-                    handlers.get(&tool_id).cloned()
+                    let handlers = handle.outlet_handlers.lock().await;
+                    handlers.get(&outlet_id).cloned()
                 };
 
                 // Parse input JSON once (the runtime expects
                 // `serde_json::Value`).
                 let input_value: serde_json::Value =
-                    serde_json::from_str(&input_json).map_err(|e| ScpError::Tool {
+                    serde_json::from_str(&input_json).map_err(|e| ScpError::Outlet {
                         msg: format!("invalid input JSON: {e}"),
-                        code: codes::TOOL_6002.to_owned(),
+                        code: codes::OUTLET_6002.to_owned(),
                     })?;
 
                 let context_id = handle.context_id.clone();
                 let identity_did_for_executor = identity.did.clone();
-                let tool_id_for_executor = tool_id.clone();
+                let outlet_id_for_executor = outlet_id.clone();
                 let context_id_for_executor = context_id.clone();
 
                 // Build the executor closure. Phase 2 of
-                // `invoke_tool_with_economy` runs WITHOUT holding the
+                // `invoke_outlet_with_economy` runs WITHOUT holding the
                 // `contexts` mutex; the runtime calls the executor exactly
                 // once with the validated input value.
                 let executor = move |input: serde_json::Value| {
@@ -12825,7 +12825,7 @@ impl Scp {
                         handler.map_or_else(
                             || {
                                 Ok(serde_json::json!({
-                                    "tool": tool_id_for_executor,
+                                    "outlet": outlet_id_for_executor,
                                     "context": context_id_for_executor,
                                     "status": "validated",
                                     "input_valid": true,
@@ -12835,7 +12835,7 @@ impl Scp {
                             },
                             |h| {
                                 h(input).map_err(|e| {
-                                    format!("tool handler for '{tool_id_for_executor}' failed: {e}")
+                                    format!("outlet handler for '{outlet_id_for_executor}' failed: {e}")
                                 })
                             },
                         )
@@ -12844,12 +12844,12 @@ impl Scp {
 
                 let manager = bi.context_manager_expect()?;
                 let invoker_did_typed: scp_did::DID = identity.did.clone().into();
-                let tool_id_typed = scp_core::context::tools::ToolId::from(tool_id.as_str());
+                let outlet_id_typed = scp_core::context::outlets::OutletId::from(outlet_id.as_str());
                 let outcome = manager
-                    .invoke_tool_with_economy(
+                    .invoke_outlet_with_economy(
                         &context_id,
                         &registry,
-                        &tool_id_typed,
+                        &outlet_id_typed,
                         input_value,
                         &invoker_did_typed,
                         spending_ucan_token.as_ref(),
@@ -12859,31 +12859,31 @@ impl Scp {
                     .await
                     .map_err(ScpError::from)?;
 
-                // The runtime built the canonical `ToolInvokedEvent`; the
+                // The runtime built the canonical `OutletInvokedEvent`; the
                 // transport / event-log layer is responsible for signing
                 // and appending it. Pull the JSON output back out for the
                 // Swift / Kotlin caller.
-                serde_json::to_string(&outcome.output).map_err(|e| ScpError::Tool {
-                    msg: format!("failed to serialize tool output: {e}"),
-                    code: codes::TOOL_6006.to_owned(),
+                serde_json::to_string(&outcome.output).map_err(|e| ScpError::Outlet {
+                    msg: format!("failed to serialize outlet output: {e}"),
+                    code: codes::OUTLET_6006.to_owned(),
                 })
             })
             .await
-            .map_err(|e| ScpError::Tool {
-                msg: format!("tokio task join error during tool invocation: {e}"),
-                code: codes::TOOL_6006.to_owned(),
+            .map_err(|e| ScpError::Outlet {
+                msg: format!("tokio task join error during outlet invocation: {e}"),
+                code: codes::OUTLET_6006.to_owned(),
             })?
     }
 
-    /// Per-instance equivalent of the free-function `tool_verify`.
+    /// Per-instance equivalent of the free-function `outlet_verify`.
     ///
     /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
     /// `instance_id` does not match this `SCP`'s.
-    pub async fn tool_verify(
+    pub async fn outlet_verify(
         &self,
         handle: Arc<ContextHandle>,
-        tool_id: String,
-    ) -> Result<ToolVerificationResult, ScpError> {
+        outlet_id: String,
+    ) -> Result<OutletVerificationResult, ScpError> {
         self.inner
             .core
             .check_handle(handle.instance_id())
@@ -12893,40 +12893,40 @@ impl Scp {
                 let state = handle.state.lock().await;
 
                 if !matches!(*state, ContextState::Active) {
-                    return Err(ScpError::Tool {
+                    return Err(ScpError::Outlet {
                         msg: format!(
-                            "cannot verify tool in context in {:?} state — context must be active",
+                            "cannot verify outlet in context in {:?} state — context must be active",
                             *state
                         ),
-                        code: codes::TOOL_6007.to_owned(),
+                        code: codes::OUTLET_6007.to_owned(),
                     });
                 }
                 drop(state);
 
-                Ok(ToolVerificationResult {
-                    tool_id,
+                Ok(OutletVerificationResult {
+                    outlet_id,
                     passed: true,
                     failures: Vec::new(),
                 })
             })
             .await
-            .map_err(|e| ScpError::Tool {
-                msg: format!("tokio task join error during tool verification: {e}"),
-                code: codes::TOOL_6008.to_owned(),
+            .map_err(|e| ScpError::Outlet {
+                msg: format!("tokio task join error during outlet verification: {e}"),
+                code: codes::OUTLET_6008.to_owned(),
             })?
     }
 
     /// Per-instance equivalent of the free-function
-    /// `tool_invoke_cross_context`.
+    /// `outlet_invoke_cross_context`.
     ///
     /// Routes through `&*self.inner`. Rejects any `ContextHandle` or
     /// `Identity` whose `instance_id` does not match this `SCP`'s.
     #[allow(clippy::too_many_arguments)] // FFI boundary: UniFFI requires explicit params
-    pub async fn tool_invoke_cross_context(
+    pub async fn outlet_invoke_cross_context(
         &self,
         source_handle: Arc<ContextHandle>,
         target_handle: Arc<ContextHandle>,
-        tool_id: String,
+        outlet_id: String,
         input_json: String,
         identity: Arc<Identity>,
         ucan_token: String,
@@ -12951,12 +12951,12 @@ impl Scp {
                 // Validate source context is active.
                 let source_state = source_handle.state.lock().await;
                 if !matches!(*source_state, ContextState::Active) {
-                    return Err(ScpError::Tool {
+                    return Err(ScpError::Outlet {
                         msg: format!(
-                            "cannot invoke cross-context tool: source context in {:?} state",
+                            "cannot invoke cross-context outlet: source context in {:?} state",
                             *source_state
                         ),
-                        code: codes::TOOL_6010.to_owned(),
+                        code: codes::OUTLET_6010.to_owned(),
                     });
                 }
                 drop(source_state);
@@ -12964,12 +12964,12 @@ impl Scp {
                 // Validate target context is active.
                 let target_state = target_handle.state.lock().await;
                 if !matches!(*target_state, ContextState::Active) {
-                    return Err(ScpError::Tool {
+                    return Err(ScpError::Outlet {
                         msg: format!(
-                            "cannot invoke cross-context tool: target context in {:?} state",
+                            "cannot invoke cross-context outlet: target context in {:?} state",
                             *target_state
                         ),
-                        code: codes::TOOL_6011.to_owned(),
+                        code: codes::OUTLET_6011.to_owned(),
                     });
                 }
                 drop(target_state);
@@ -12984,71 +12984,71 @@ impl Scp {
                     scp_core::provenance::attach::effective_max_chain_depth(source_max)
                 };
                 if chain_depth > max_chain_depth {
-                    return Err(ScpError::Tool {
+                    return Err(ScpError::Outlet {
                         msg: format!(
                             "cross-context chain depth {chain_depth} exceeds maximum {max_chain_depth}"
                         ),
-                        code: codes::TOOL_6012.to_owned(),
+                        code: codes::OUTLET_6012.to_owned(),
                     });
                 }
 
                 // Primary authorization: UCAN token validation via the full 11-step
                 // ADR-016 pipeline against the TARGET context's ceiling.
                 // See spec §6.2, §8, ADR-016, and issue #319.
-                validate_tool_ucan_uniffi(
+                validate_outlet_ucan_uniffi(
                     &bi,
                     &target_handle,
-                    &tool_id,
+                    &outlet_id,
                     &ucan_token,
                     &identity.did,
                     proof_tokens.as_ref(),
                 )?;
 
                 let input_value: serde_json::Value =
-                    serde_json::from_str(&input_json).map_err(|e| ScpError::Tool {
+                    serde_json::from_str(&input_json).map_err(|e| ScpError::Outlet {
                         msg: format!("invalid input JSON: {e}"),
-                        code: codes::TOOL_6002.to_owned(),
+                        code: codes::OUTLET_6002.to_owned(),
                     })?;
 
-                let registry = target_handle.tool_registry.lock().await;
-                let registration = registry.get(&tool_id).ok_or_else(|| ScpError::Tool {
+                let registry = target_handle.outlet_registry.lock().await;
+                let registration = registry.get(&outlet_id).ok_or_else(|| ScpError::Outlet {
                     msg: format!(
-                        "tool '{tool_id}' not found in target context '{}'",
+                        "outlet '{outlet_id}' not found in target context '{}'",
                         target_handle.context_id
                     ),
-                    code: codes::TOOL_6002.to_owned(),
+                    code: codes::OUTLET_6002.to_owned(),
                 })?;
 
-                scp_core::context::tools::validate_value_against_schema(
+                scp_core::context::outlets::validate_value_against_schema(
                     &input_value,
                     &registration.schema.input_schema,
                 )
-                .map_err(|e| ScpError::Tool {
+                .map_err(|e| ScpError::Outlet {
                     msg: format!("input validation failed: {e}"),
-                    code: codes::TOOL_6002.to_owned(),
+                    code: codes::OUTLET_6002.to_owned(),
                 })?;
 
                 let output_schema = registration.schema.output_schema.clone();
                 drop(registry);
 
-                let handlers = target_handle.tool_handlers.lock().await;
-                let output = if let Some(handler) = handlers.get(&tool_id) {
+                let handlers = target_handle.outlet_handlers.lock().await;
+                let output = if let Some(handler) = handlers.get(&outlet_id) {
                     let handler = handler.clone();
                     drop(handlers);
-                    let out = handler(input_value.clone()).map_err(|e| ScpError::Tool {
-                        msg: format!("cross-context tool handler for '{tool_id}' failed: {e}"),
-                        code: codes::TOOL_6002.to_owned(),
+                    let out = handler(input_value.clone()).map_err(|e| ScpError::Outlet {
+                        msg: format!("cross-context outlet handler for '{outlet_id}' failed: {e}"),
+                        code: codes::OUTLET_6002.to_owned(),
                     })?;
-                    scp_core::context::tools::validate_value_against_schema(&out, &output_schema)
-                        .map_err(|msg| ScpError::Tool {
-                            msg: format!("output validation failed for tool '{tool_id}': {msg}"),
-                            code: codes::TOOL_6002.to_owned(),
+                    scp_core::context::outlets::validate_value_against_schema(&out, &output_schema)
+                        .map_err(|msg| ScpError::Outlet {
+                            msg: format!("output validation failed for outlet '{outlet_id}': {msg}"),
+                            code: codes::OUTLET_6002.to_owned(),
                         })?;
                     out
                 } else {
                     drop(handlers);
                     serde_json::json!({
-                        "tool": tool_id,
+                        "outlet": outlet_id,
                         "source_context": source_handle.context_id,
                         "target_context": target_handle.context_id,
                         "status": "validated",
@@ -13058,26 +13058,26 @@ impl Scp {
                     })
                 };
 
-                serde_json::to_string(&output).map_err(|e| ScpError::Tool {
+                serde_json::to_string(&output).map_err(|e| ScpError::Outlet {
                     msg: format!("failed to serialize cross-context output: {e}"),
-                    code: codes::TOOL_6013.to_owned(),
+                    code: codes::OUTLET_6013.to_owned(),
                 })
             })
             .await
-            .map_err(|e| ScpError::Tool {
+            .map_err(|e| ScpError::Outlet {
                 msg: format!("tokio task join error during cross-context invocation: {e}"),
-                code: codes::TOOL_6009.to_owned(),
+                code: codes::OUTLET_6009.to_owned(),
             })?
     }
 
-    /// Invokes a tool across context boundaries as an atomic two-phase saga
+    /// Invokes a outlet across context boundaries as an atomic two-phase saga
     /// (spec §6.2.4, ADR-049 §3a).
     ///
-    /// Unlike [`Self::tool_invoke_cross_context`] (the synchronous,
+    /// Unlike [`Self::outlet_invoke_cross_context`] (the synchronous,
     /// single-context-side path), this drives the full §6.2.4 cross-context
-    /// tool-invocation saga over the two CO-RESIDENT participant contexts
+    /// outlet-invocation saga over the two CO-RESIDENT participant contexts
     /// (caller + target): Prepare-A / Prepare-B authorize and stage both sides,
-    /// the tool executes EXACTLY ONCE supervisor-side at Commit-B, and each
+    /// the outlet executes EXACTLY ONCE supervisor-side at Commit-B, and each
     /// side records its own event-log entry. Both contexts MUST be co-resident
     /// in this bridge instance (the cross-node child-bridge transport is
     /// separate future work).
@@ -13108,7 +13108,7 @@ impl Scp {
     /// The caller/target context-id axes are bound by the instance-affine
     /// handle pre-check: `source_handle` / `target_handle` must have been minted
     /// by THIS bridge instance (a foreign handle is rejected) before the
-    /// supervisor membership / tool-interface gates run.
+    /// supervisor membership / outlet-interface gates run.
     ///
     /// The receipt's signer-authorization — that the target key is
     /// governance-authorized to act for the target context (§6.2.4 "Signer
@@ -13120,8 +13120,8 @@ impl Scp {
     /// * `source_handle` — The initiating (caller) context handle.
     /// * `target_handle` — The executing (target) context handle.
     /// * `caller_did` — The initiator DID (bound to the bridge principal).
-    /// * `tool_registration_id` — The tool to invoke across the interface.
-    /// * `input_json` — Tool input as a JSON string (schema-checked
+    /// * `outlet_registration_id` — The outlet to invoke across the interface.
+    /// * `input_json` — Outlet input as a JSON string (schema-checked
     ///   target-side); parsed to a JSON value at the boundary.
     /// * `asserted_nonce_hex` — The 16-byte §6.2.4 envelope nonce as a 32-char
     ///   hex string (the freshness/dedup token).
@@ -13129,13 +13129,13 @@ impl Scp {
     /// * `chain_depth` — Caller-asserted inbound provenance depth (advisory;
     ///   the target re-derives `+1`).
     /// * `ucan_proof_id` — Optional id of the spending UCAN proof, resolved
-    ///   target-side at Prepare-B. `None` for an ungated tool.
+    ///   target-side at Prepare-B. `None` for an ungated outlet.
     ///
     /// # Returns
     ///
     /// A [`SagaResult`] on the committed terminal, carrying the
     /// supervisor-minted `saga_id`, the target's signed receipt bytes, and the
-    /// captured tool-output bytes. The `saga_id` is supervisor-minted — it is
+    /// captured outlet-output bytes. The `saga_id` is supervisor-minted — it is
     /// never an input.
     ///
     /// # Errors
@@ -13148,28 +13148,28 @@ impl Scp {
     /// (Commit-retry exhausted — carries the durable `saga_id` operator-repair
     /// handle), or [`ScpError::SagaBusy`] (the participant context set
     /// overlapped an in-flight saga — §5.15.4). Returns [`ScpError::Validation`]
-    /// if an id/DID/tool-id is malformed or `asserted_nonce_hex` does not
-    /// decode to 16 bytes, and [`ScpError::Tool`] if `input_json` is not valid
+    /// if an id/DID/outlet-id is malformed or `asserted_nonce_hex` does not
+    /// decode to 16 bytes, and [`ScpError::Outlet`] if `input_json` is not valid
     /// JSON.
     ///
     /// See spec §6.2.4 and ADR-049 §3a.
     #[allow(clippy::too_many_arguments)] // Flat §6.2.4 envelope — agent-first named params, no builder.
-    pub async fn tool_invoke_cross_context_saga(
+    pub async fn outlet_invoke_cross_context_saga(
         &self,
         source_handle: Arc<ContextHandle>,
         target_handle: Arc<ContextHandle>,
         caller_did: String,
-        tool_registration_id: String,
+        outlet_registration_id: String,
         input_json: String,
         asserted_nonce_hex: String,
         timestamp_ms: u64,
         chain_depth: u8,
         ucan_proof_id: Option<String>,
     ) -> Result<SagaResult, ScpError> {
-        use scp_core::context::supervisor::{CrossContextToolInvocationRequest, SagaSigningKeys};
+        use scp_core::context::supervisor::{CrossContextOutletInvocationRequest, SagaSigningKeys};
 
         // Per-instance handle affinity: both participant handles MUST have been
-        // minted by THIS bridge instance (mirrors `tool_invoke_cross_context`).
+        // minted by THIS bridge instance (mirrors `outlet_invoke_cross_context`).
         // A foreign handle maps to `ScpError::Permission` (`SCP-PERM-3030`).
         self.inner
             .core
@@ -13189,13 +13189,13 @@ impl Scp {
         validate_context_id(&caller_context_id)?;
         validate_context_id(&target_context_id)?;
         validate_did(&caller_did)?;
-        validate_tool_id(&tool_registration_id)?;
+        validate_outlet_id(&outlet_registration_id)?;
 
         let asserted_nonce = decode_asserted_nonce(&asserted_nonce_hex)?;
         let input_value: serde_json::Value =
-            serde_json::from_str(&input_json).map_err(|e| ScpError::Tool {
+            serde_json::from_str(&input_json).map_err(|e| ScpError::Outlet {
                 msg: format!("invalid input JSON: {e}"),
-                code: codes::TOOL_6002.to_owned(),
+                code: codes::OUTLET_6002.to_owned(),
             })?;
 
         let bi = Arc::clone(&self.inner);
@@ -13232,26 +13232,26 @@ impl Scp {
                 let target_signing_key = resolve_uniffi_signing_key(&target_handle).await?;
                 let caller_signing_key = resolve_uniffi_signing_key(&source_handle).await?;
 
-                // ----- Executor: snapshot the TARGET context's tool handler --
+                // ----- Executor: snapshot the TARGET context's outlet handler --
                 //
-                // Mirrors `tool_invoke_cross_context`: snapshot the registered
+                // Mirrors `outlet_invoke_cross_context`: snapshot the registered
                 // handler closure (an `Arc<dyn Fn>` — cloning is a refcount
                 // bump) OUTSIDE the runtime call, then move it into the
                 // `FnOnce` executor the supervisor runs supervisor-side at
                 // Commit-B (off the actor mailbox). Read directly off the
                 // owned `target_handle` — no DashMap `Ref` is held across the
-                // `tool_handlers.lock().await`. Falls back to a schema-only
+                // `outlet_handlers.lock().await`. Falls back to a schema-only
                 // echo when no handler is registered, matching the synchronous
                 // cross-context path. The supervisor validates the output
-                // against the tool's registered output schema at Commit-B, so
+                // against the outlet's registered output schema at Commit-B, so
                 // the executor only produces the value.
                 let handler = target_handle
-                    .tool_handlers
+                    .outlet_handlers
                     .lock()
                     .await
-                    .get(&tool_registration_id)
+                    .get(&outlet_registration_id)
                     .cloned();
-                let tool_id_for_echo = tool_registration_id.clone();
+                let outlet_id_for_echo = outlet_registration_id.clone();
                 let target_ctx_for_echo = target_context_id.clone();
                 let caller_did_for_echo = caller_did.clone();
                 let executor = move |value: serde_json::Value| {
@@ -13261,7 +13261,7 @@ impl Scp {
                         handler.map_or_else(
                             || {
                                 Ok(serde_json::json!({
-                                    "tool": tool_id_for_echo,
+                                    "outlet": outlet_id_for_echo,
                                     "target_context": target_ctx_for_echo,
                                     "caller_did": caller_did_for_echo,
                                     "status": "validated",
@@ -13272,8 +13272,8 @@ impl Scp {
                             |h| {
                                 h(value).map_err(|e| {
                                     format!(
-                                        "cross-context saga tool handler for \
-                                         '{tool_id_for_echo}' failed: {e}"
+                                        "cross-context saga outlet handler for \
+                                         '{outlet_id_for_echo}' failed: {e}"
                                     )
                                 })
                             },
@@ -13281,11 +13281,11 @@ impl Scp {
                     }
                 };
 
-                let request = CrossContextToolInvocationRequest {
+                let request = CrossContextOutletInvocationRequest {
                     caller_context_id: caller_context_bytes,
                     target_context_id: target_context_bytes,
                     caller_did: scp_did::DID(caller_did),
-                    tool_registration_id,
+                    outlet_registration_id,
                     ucan_proof_id,
                     input: input_value,
                     asserted_chain_depth: chain_depth,
@@ -13294,7 +13294,7 @@ impl Scp {
                 };
 
                 let output = supervisor
-                    .start_cross_context_tool_invocation_saga(
+                    .start_cross_context_outlet_invocation_saga(
                         request,
                         SagaSigningKeys {
                             target: &target_signing_key,
@@ -13312,20 +13312,20 @@ impl Scp {
                 })
             })
             .await
-            .map_err(|e| ScpError::Tool {
+            .map_err(|e| ScpError::Outlet {
                 msg: format!("tokio task join error during cross-context saga: {e}"),
-                code: codes::TOOL_6009.to_owned(),
+                code: codes::OUTLET_6009.to_owned(),
             })?
     }
 
-    /// Per-instance equivalent of the free-function `tool_session_create`.
+    /// Per-instance equivalent of the free-function `outlet_session_create`.
     ///
     /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
     /// `instance_id` does not match this `SCP`'s.
-    pub async fn tool_session_create(
+    pub async fn outlet_session_create(
         &self,
         handle: Arc<ContextHandle>,
-        tool_id: String,
+        outlet_id: String,
         source_context_id: String,
         ttl_seconds: Option<u64>,
     ) -> Result<String, ScpError> {
@@ -13338,12 +13338,12 @@ impl Scp {
             .spawn(async move {
                 let state = handle.state.lock().await;
                 if !matches!(*state, ContextState::Active) {
-                    return Err(ScpError::Tool {
+                    return Err(ScpError::Outlet {
                         msg: format!(
                             "cannot create session in context in {:?} state — context must be active",
                             *state
                         ),
-                        code: codes::TOOL_6014.to_owned(),
+                        code: codes::OUTLET_6014.to_owned(),
                     });
                 }
                 drop(state);
@@ -13356,25 +13356,25 @@ impl Scp {
                     mgr.context_params(&handle.context_id)
                         .await
                         .and_then(|p| p.session_cap)
-                        .unwrap_or(scp_core::context::tools::DEFAULT_SESSION_CAP_PER_CALLER)
+                        .unwrap_or(scp_core::context::outlets::DEFAULT_SESSION_CAP_PER_CALLER)
                         as usize
                 };
                 let current = store.count_by_source(&source_context_id);
                 if current >= cap {
-                    return Err(ScpError::Tool {
+                    return Err(ScpError::Outlet {
                         msg: format!(
                             "session cap exceeded for caller '{source_context_id}': {current} active (max {cap})"
                         ),
-                        code: codes::TOOL_6015.to_owned(),
+                        code: codes::OUTLET_6015.to_owned(),
                     });
                 }
 
                 let session_id = Uuid::new_v4().to_string();
                 let now_ms = scp_clock::SystemClock.now_millis();
 
-                let session = scp_core::context::tools::ToolSession {
+                let session = scp_core::context::outlets::OutletSession {
                     session_id: session_id.clone(),
-                    tool_id,
+                    outlet_id,
                     source_context: source_context_id,
                     state: serde_json::Value::Null,
                     created_at: now_ms,
@@ -13386,17 +13386,17 @@ impl Scp {
                 Ok(session_id)
             })
             .await
-            .map_err(|e| ScpError::Tool {
+            .map_err(|e| ScpError::Outlet {
                 msg: format!("tokio task join error during session creation: {e}"),
-                code: codes::TOOL_6009.to_owned(),
+                code: codes::OUTLET_6009.to_owned(),
             })?
     }
 
-    /// Per-instance equivalent of the free-function `tool_session_invoke`.
+    /// Per-instance equivalent of the free-function `outlet_session_invoke`.
     ///
     /// Routes through `&*self.inner`. Rejects any `ContextHandle` or
     /// `Identity` whose `instance_id` does not match this `SCP`'s.
-    pub async fn tool_session_invoke(
+    pub async fn outlet_session_invoke(
         &self,
         handle: Arc<ContextHandle>,
         session_id: String,
@@ -13418,32 +13418,32 @@ impl Scp {
             .spawn(async move {
                 let state = handle.state.lock().await;
                 if !matches!(*state, ContextState::Active) {
-                    return Err(ScpError::Tool {
+                    return Err(ScpError::Outlet {
                         msg: format!(
                             "cannot invoke session in context in {:?} state — context must be active",
                             *state
                         ),
-                        code: codes::TOOL_6017.to_owned(),
+                        code: codes::OUTLET_6017.to_owned(),
                     });
                 }
                 drop(state);
 
-                // Look up tool_id from session for UCAN validation.
-                let tool_id_for_ucan = {
+                // Look up outlet_id from session for UCAN validation.
+                let outlet_id_for_ucan = {
                     let store = handle.session_store.lock().await;
-                    let session = store.get(&session_id).ok_or_else(|| ScpError::Tool {
+                    let session = store.get(&session_id).ok_or_else(|| ScpError::Outlet {
                         msg: format!("session '{session_id}' not found"),
-                        code: codes::TOOL_6018.to_owned(),
+                        code: codes::OUTLET_6018.to_owned(),
                     })?;
-                    session.tool_id.clone()
+                    session.outlet_id.clone()
                 };
 
                 // Primary authorization: UCAN token validation via the full 11-step
                 // ADR-016 pipeline. See spec §6.2, §8, ADR-016, and issue #319.
-                validate_tool_ucan_uniffi(
+                validate_outlet_ucan_uniffi(
                     &bi,
                     &handle,
-                    &tool_id_for_ucan,
+                    &outlet_id_for_ucan,
                     &ucan_token,
                     &identity.did,
                     proof_tokens.as_ref(),
@@ -13451,60 +13451,60 @@ impl Scp {
 
                 let mut store = handle.session_store.lock().await;
 
-                let session = store.get(&session_id).ok_or_else(|| ScpError::Tool {
+                let session = store.get(&session_id).ok_or_else(|| ScpError::Outlet {
                     msg: format!("session '{session_id}' not found"),
-                    code: codes::TOOL_6018.to_owned(),
+                    code: codes::OUTLET_6018.to_owned(),
                 })?;
 
                 // Check expiry.
                 let now_ms = scp_clock::SystemClock.now_millis();
                 if session.is_expired(now_ms) {
                     store.remove(&session_id);
-                    return Err(ScpError::Tool {
+                    return Err(ScpError::Outlet {
                         msg: format!("session '{session_id}' has expired"),
-                        code: codes::TOOL_6019.to_owned(),
+                        code: codes::OUTLET_6019.to_owned(),
                     });
                 }
 
-                let tool_id = session.tool_id.clone();
+                let outlet_id = session.outlet_id.clone();
                 let current_state = session.state.clone();
                 let call_count = session.call_count;
                 drop(store);
 
                 let input_value: serde_json::Value =
-                    serde_json::from_str(&input_json).map_err(|e| ScpError::Tool {
+                    serde_json::from_str(&input_json).map_err(|e| ScpError::Outlet {
                         msg: format!("invalid input JSON: {e}"),
-                        code: codes::TOOL_6002.to_owned(),
+                        code: codes::OUTLET_6002.to_owned(),
                     })?;
 
-                // Validate input against tool's input schema if tool is registered.
-                let registry = handle.tool_registry.lock().await;
-                if let Some(registration) = registry.get(&tool_id) {
-                    scp_core::context::tools::validate_value_against_schema(
+                // Validate input against outlet's input schema if outlet is registered.
+                let registry = handle.outlet_registry.lock().await;
+                if let Some(registration) = registry.get(&outlet_id) {
+                    scp_core::context::outlets::validate_value_against_schema(
                         &input_value,
                         &registration.schema.input_schema,
                     )
-                    .map_err(|e| ScpError::Tool {
+                    .map_err(|e| ScpError::Outlet {
                         msg: format!("input validation failed: {e}"),
-                        code: codes::TOOL_6002.to_owned(),
+                        code: codes::OUTLET_6002.to_owned(),
                     })?;
                 }
                 drop(registry);
 
                 // Execute via handler or echo mode.
-                let handlers = handle.tool_handlers.lock().await;
-                let (new_state, output) = if let Some(handler) = handlers.get(&tool_id) {
+                let handlers = handle.outlet_handlers.lock().await;
+                let (new_state, output) = if let Some(handler) = handlers.get(&outlet_id) {
                     let handler = handler.clone();
                     drop(handlers);
-                    let out = handler(input_value.clone()).map_err(|e| ScpError::Tool {
-                        msg: format!("tool handler for '{tool_id}' failed: {e}"),
-                        code: codes::TOOL_6002.to_owned(),
+                    let out = handler(input_value.clone()).map_err(|e| ScpError::Outlet {
+                        msg: format!("outlet handler for '{outlet_id}' failed: {e}"),
+                        code: codes::OUTLET_6002.to_owned(),
                     })?;
                     (current_state, out)
                 } else {
                     drop(handlers);
                     let out = serde_json::json!({
-                        "tool": tool_id,
+                        "outlet": outlet_id,
                         "session_id": session_id,
                         "status": "validated",
                         "call_count": call_count + 1,
@@ -13521,23 +13521,23 @@ impl Scp {
                     session.call_count = session.call_count.saturating_add(1);
                 }
 
-                serde_json::to_string(&output).map_err(|e| ScpError::Tool {
+                serde_json::to_string(&output).map_err(|e| ScpError::Outlet {
                     msg: format!("failed to serialize session invoke output: {e}"),
-                    code: codes::TOOL_6020.to_owned(),
+                    code: codes::OUTLET_6020.to_owned(),
                 })
             })
             .await
-            .map_err(|e| ScpError::Tool {
+            .map_err(|e| ScpError::Outlet {
                 msg: format!("tokio task join error during session invocation: {e}"),
-                code: codes::TOOL_6009.to_owned(),
+                code: codes::OUTLET_6009.to_owned(),
             })?
     }
 
-    /// Per-instance equivalent of the free-function `tool_session_close`.
+    /// Per-instance equivalent of the free-function `outlet_session_close`.
     ///
     /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
     /// `instance_id` does not match this `SCP`'s.
-    pub async fn tool_session_close(
+    pub async fn outlet_session_close(
         &self,
         handle: Arc<ContextHandle>,
         session_id: String,
@@ -13550,28 +13550,28 @@ impl Scp {
             .spawn(async move {
                 let mut store = handle.session_store.lock().await;
                 if store.remove(&session_id).is_none() {
-                    return Err(ScpError::Tool {
+                    return Err(ScpError::Outlet {
                         msg: format!("session '{session_id}' not found"),
-                        code: codes::TOOL_6021.to_owned(),
+                        code: codes::OUTLET_6021.to_owned(),
                     });
                 }
                 Ok(())
             })
             .await
-            .map_err(|e| ScpError::Tool {
+            .map_err(|e| ScpError::Outlet {
                 msg: format!("tokio task join error during session close: {e}"),
-                code: codes::TOOL_6009.to_owned(),
+                code: codes::OUTLET_6009.to_owned(),
             })?
     }
 
-    /// Per-instance equivalent of the free-function `tool_interface_expose`.
+    /// Per-instance equivalent of the free-function `outlet_interface_expose`.
     ///
     /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
     /// `instance_id` does not match this `SCP`'s.
-    pub async fn tool_interface_expose(
+    pub async fn outlet_interface_expose(
         &self,
         handle: Arc<ContextHandle>,
-        tool_id: String,
+        outlet_id: String,
         target_context_id: String,
         rate_limit_json: Option<String>,
     ) -> Result<String, ScpError> {
@@ -13581,23 +13581,23 @@ impl Scp {
             .map_err(ScpError::from)?;
         runtime()
             .spawn(async move {
-                validate_tool_id(&tool_id)?;
+                validate_outlet_id(&outlet_id)?;
 
                 let state = handle.state.lock().await;
                 if !matches!(*state, ContextState::Active) {
-                    return Err(ScpError::Tool {
+                    return Err(ScpError::Outlet {
                         msg: format!(
-                            "cannot expose tool interface in context in {:?} state — context must be active",
+                            "cannot expose outlet interface in context in {:?} state — context must be active",
                             *state
                         ),
-                        code: codes::TOOL_6030.to_owned(),
+                        code: codes::OUTLET_6030.to_owned(),
                     });
                 }
                 drop(state);
 
                 let rate_limit = match rate_limit_json {
                     Some(ref json) => {
-                        let parsed: scp_core::context::tools::interface::RateLimit =
+                        let parsed: scp_core::context::outlets::interface::RateLimit =
                             serde_json::from_str(json).map_err(|e| ScpError::Validation {
                                 msg: format!("invalid rate_limit_json: {e}"),
                                 code: codes::VALID_7040.to_owned(),
@@ -13615,9 +13615,9 @@ impl Scp {
                     vec![],
                     &scp_clock::SystemClock,
                 )
-                .map_err(|e| ScpError::Tool {
+                .map_err(|e| ScpError::Outlet {
                     msg: format!("failed to create role state: {e}"),
-                    code: codes::TOOL_6030.to_owned(),
+                    code: codes::OUTLET_6030.to_owned(),
                 })?;
 
                 let context_handle = scp_core::context::ContextHandle::new(
@@ -13625,11 +13625,11 @@ impl Scp {
                     scp_core::context::ContextParams::default(),
                 );
 
-                let registry = handle.tool_registry.lock().await;
+                let registry = handle.outlet_registry.lock().await;
 
-                let interface = scp_core::context::tools::interface::expose_tool(
+                let interface = scp_core::context::outlets::interface::expose_outlet(
                     context_handle.context_id(),
-                    &tool_id,
+                    &outlet_id,
                     &target_context_id,
                     &role_state,
                     &handle.creator_did,
@@ -13637,28 +13637,28 @@ impl Scp {
                     rate_limit,
                     None,
                 )
-                .map_err(|e| ScpError::Tool {
-                    msg: format!("expose_tool failed: {e}"),
-                    code: codes::TOOL_6030.to_owned(),
+                .map_err(|e| ScpError::Outlet {
+                    msg: format!("expose_outlet failed: {e}"),
+                    code: codes::OUTLET_6030.to_owned(),
                 })?;
 
-                serde_json::to_string(&interface).map_err(|e| ScpError::Tool {
-                    msg: format!("failed to serialize ToolInterface: {e}"),
-                    code: codes::TOOL_6031.to_owned(),
+                serde_json::to_string(&interface).map_err(|e| ScpError::Outlet {
+                    msg: format!("failed to serialize OutletInterface: {e}"),
+                    code: codes::OUTLET_6031.to_owned(),
                 })
             })
             .await
-            .map_err(|e| ScpError::Tool {
-                msg: format!("tokio task join error during tool_interface_expose: {e}"),
-                code: codes::TOOL_6009.to_owned(),
+            .map_err(|e| ScpError::Outlet {
+                msg: format!("tokio task join error during outlet_interface_expose: {e}"),
+                code: codes::OUTLET_6009.to_owned(),
             })?
     }
 
-    /// Per-instance equivalent of the free-function `tool_interface_accept`.
+    /// Per-instance equivalent of the free-function `outlet_interface_accept`.
     ///
     /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
     /// `instance_id` does not match this `SCP`'s.
-    pub async fn tool_interface_accept(
+    pub async fn outlet_interface_accept(
         &self,
         handle: Arc<ContextHandle>,
         interface_json: String,
@@ -13671,17 +13671,17 @@ impl Scp {
             .spawn(async move {
                 let state = handle.state.lock().await;
                 if !matches!(*state, ContextState::Active) {
-                    return Err(ScpError::Tool {
+                    return Err(ScpError::Outlet {
                         msg: format!(
-                            "cannot accept tool interface in context in {:?} state — context must be active",
+                            "cannot accept outlet interface in context in {:?} state — context must be active",
                             *state
                         ),
-                        code: codes::TOOL_6032.to_owned(),
+                        code: codes::OUTLET_6032.to_owned(),
                     });
                 }
                 drop(state);
 
-                let mut interface: scp_core::context::tools::interface::ToolInterface =
+                let mut interface: scp_core::context::outlets::interface::OutletInterface =
                     serde_json::from_str(&interface_json).map_err(|e| ScpError::Validation {
                         msg: format!("invalid interface_json: {e}"),
                         code: codes::VALID_7041.to_owned(),
@@ -13695,9 +13695,9 @@ impl Scp {
                     vec![],
                     &scp_clock::SystemClock,
                 )
-                .map_err(|e| ScpError::Tool {
+                .map_err(|e| ScpError::Outlet {
                     msg: format!("failed to create role state: {e}"),
-                    code: codes::TOOL_6032.to_owned(),
+                    code: codes::OUTLET_6032.to_owned(),
                 })?;
 
                 let context_handle = scp_core::context::ContextHandle::new(
@@ -13705,35 +13705,35 @@ impl Scp {
                     scp_core::context::ContextParams::default(),
                 );
 
-                scp_core::context::tools::interface::accept_tool_interface(
+                scp_core::context::outlets::interface::accept_outlet_interface(
                     context_handle.context_id(),
                     &mut interface,
                     &role_state,
                     &handle.creator_did,
                     None,
                 )
-                .map_err(|e| ScpError::Tool {
-                    msg: format!("accept_tool_interface failed: {e}"),
-                    code: codes::TOOL_6032.to_owned(),
+                .map_err(|e| ScpError::Outlet {
+                    msg: format!("accept_outlet_interface failed: {e}"),
+                    code: codes::OUTLET_6032.to_owned(),
                 })?;
 
-                serde_json::to_string(&interface).map_err(|e| ScpError::Tool {
-                    msg: format!("failed to serialize ToolInterface: {e}"),
-                    code: codes::TOOL_6033.to_owned(),
+                serde_json::to_string(&interface).map_err(|e| ScpError::Outlet {
+                    msg: format!("failed to serialize OutletInterface: {e}"),
+                    code: codes::OUTLET_6033.to_owned(),
                 })
             })
             .await
-            .map_err(|e| ScpError::Tool {
-                msg: format!("tokio task join error during tool_interface_accept: {e}"),
-                code: codes::TOOL_6009.to_owned(),
+            .map_err(|e| ScpError::Outlet {
+                msg: format!("tokio task join error during outlet_interface_accept: {e}"),
+                code: codes::OUTLET_6009.to_owned(),
             })?
     }
 
-    /// Per-instance equivalent of the free-function `tool_interface_revoke`.
+    /// Per-instance equivalent of the free-function `outlet_interface_revoke`.
     ///
     /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
     /// `instance_id` does not match this `SCP`'s.
-    pub async fn tool_interface_revoke(
+    pub async fn outlet_interface_revoke(
         &self,
         handle: Arc<ContextHandle>,
         interface_id_hex: String,
@@ -13760,21 +13760,21 @@ impl Scp {
 
                 let now_ms = scp_clock::SystemClock.now_millis();
 
-                let event = scp_core::context::tools::interface::revoke_tool_interface(
+                let event = scp_core::context::outlets::interface::revoke_outlet_interface(
                     interface_id,
                     &handle.context_id,
                     now_ms,
                 );
 
-                serde_json::to_string(&event).map_err(|e| ScpError::Tool {
+                serde_json::to_string(&event).map_err(|e| ScpError::Outlet {
                     msg: format!("failed to serialize InterfaceRevoked: {e}"),
-                    code: codes::TOOL_6035.to_owned(),
+                    code: codes::OUTLET_6035.to_owned(),
                 })
             })
             .await
-            .map_err(|e| ScpError::Tool {
-                msg: format!("tokio task join error during tool_interface_revoke: {e}"),
-                code: codes::TOOL_6009.to_owned(),
+            .map_err(|e| ScpError::Outlet {
+                msg: format!("tokio task join error during outlet_interface_revoke: {e}"),
+                code: codes::OUTLET_6009.to_owned(),
             })?
     }
 
@@ -15268,7 +15268,7 @@ impl Scp {
             bi: Arc::downgrade(&self.inner),
             agent_did: config.identity_did.clone(),
             context_ids: config.context_ids.clone(),
-            tool_timeout_ms: UNIFFI_TOOL_TIMEOUT_MS,
+            outlet_timeout_ms: UNIFFI_OUTLET_TIMEOUT_MS,
             agent_ucan_token: config.ucan_token.clone(),
             agent_proof_tokens: config.proof_tokens.clone(),
         };
@@ -15303,7 +15303,7 @@ impl Scp {
                         bi: sse_bi,
                         agent_did: sse_identity_did,
                         context_ids: sse_context_ids,
-                        tool_timeout_ms: UNIFFI_TOOL_TIMEOUT_MS,
+                        outlet_timeout_ms: UNIFFI_OUTLET_TIMEOUT_MS,
                         agent_ucan_token: sse_ucan_token,
                         agent_proof_tokens: sse_proof_tokens,
                     };
@@ -15467,7 +15467,7 @@ impl Scp {
     pub async fn mcp_client_list_tools(
         &self,
         handle: String,
-    ) -> Result<Vec<McpToolInfo>, ScpError> {
+    ) -> Result<Vec<McpOutletInfo>, ScpError> {
         validate_mcp_handle(&handle)?;
 
         let entry = mcp_client_registry(&self.inner)
@@ -15482,14 +15482,14 @@ impl Scp {
             code: codes::TRANS_5021.to_owned(),
         })?;
 
-        let tools = client_guard.list_tools().map_err(|e| ScpError::Transport {
+        let outlets = client_guard.list_tools().map_err(|e| ScpError::Transport {
             msg: format!("tools/list failed: {e}"),
             code: codes::TRANS_5022.to_owned(),
         })?;
 
-        Ok(tools
+        Ok(outlets
             .into_iter()
-            .map(|t| McpToolInfo {
+            .map(|t| McpOutletInfo {
                 name: t.name,
                 description: t.description.unwrap_or_default(),
                 input_schema_json: serde_json::to_string(&t.input_schema)
@@ -15505,13 +15505,13 @@ impl Scp {
     pub async fn mcp_client_invoke(
         &self,
         handle: String,
-        tool_name: String,
+        outlet_name: String,
         input_json: String,
         context_id: String,
         invoker_did: String,
     ) -> Result<McpInvokeResult, ScpError> {
         validate_mcp_handle(&handle)?;
-        validate_tool_name(&tool_name)?;
+        validate_outlet_name(&outlet_name)?;
         validate_context_id(&context_id)?;
         validate_did(&invoker_did)?;
 
@@ -15534,7 +15534,7 @@ impl Scp {
         })?;
 
         let result = client_guard
-            .invoke(&tool_name, input, &context_id, &invoker_did)
+            .invoke(&outlet_name, input, &context_id, &invoker_did)
             .map_err(|e| ScpError::Transport {
                 msg: format!("tools/call failed: {e}"),
                 code: codes::TRANS_5025.to_owned(),
@@ -19227,9 +19227,9 @@ mod tests {
             callback_custody: None,
             signing_key: None,
             ceiling_strings: Vec::new(),
-            tool_registry: tokio::sync::Mutex::new(scp_core::context::tools::ToolRegistry::new()),
-            tool_handlers: tokio::sync::Mutex::new(std::collections::HashMap::new()),
-            session_store: tokio::sync::Mutex::new(scp_core::context::tools::SessionStore::new()),
+            outlet_registry: tokio::sync::Mutex::new(scp_core::context::outlets::OutletRegistry::new()),
+            outlet_handlers: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            session_store: tokio::sync::Mutex::new(scp_core::context::outlets::SessionStore::new()),
             economic_policy: std::sync::Mutex::new(None),
             core_context_params: scp_core::context::ContextParams::default(),
             instance_id,
@@ -19427,9 +19427,9 @@ mod tests {
             callback_custody: Some(callback_custody),
             signing_key: Some(key_handle),
             ceiling_strings: Vec::new(),
-            tool_registry: tokio::sync::Mutex::new(scp_core::context::tools::ToolRegistry::new()),
-            tool_handlers: tokio::sync::Mutex::new(std::collections::HashMap::new()),
-            session_store: tokio::sync::Mutex::new(scp_core::context::tools::SessionStore::new()),
+            outlet_registry: tokio::sync::Mutex::new(scp_core::context::outlets::OutletRegistry::new()),
+            outlet_handlers: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            session_store: tokio::sync::Mutex::new(scp_core::context::outlets::SessionStore::new()),
             economic_policy: std::sync::Mutex::new(None),
             core_context_params: scp_core::context::ContextParams::default(),
             instance_id: scp.instance_id(),
@@ -19574,16 +19574,16 @@ mod tests {
         );
     }
 
-    /// `UniFFI` `tool_invoke` must reject `None` `ucan_token` with a
+    /// `UniFFI` `outlet_invoke` must reject `None` `ucan_token` with a
     /// `Permission` error. Matches `PyO3`/NAPI behavior where the token
     /// is a required non-optional parameter. See issue #423.
     #[tokio::test]
-    async fn tool_invoke_rejects_none_ucan_token() {
+    async fn outlet_invoke_rejects_none_ucan_token() {
         let scp = scp_test();
         let result = scp
-            .tool_invoke(
+            .outlet_invoke(
                 test_handle_for(&scp),
-                "test-tool".to_owned(),
+                "test-outlet".to_owned(),
                 "{}".to_owned(),
                 test_identity_for(&scp),
                 None, // No UCAN token
@@ -19938,7 +19938,7 @@ mod tests {
         assert!(json["resolution_path"]["source_id"].is_null());
     }
 
-    // -- tool_register validation: json_value_type_name via shared helper ------
+    // -- outlet_register validation: json_value_type_name via shared helper ------
 
     #[test]
     fn json_value_type_name_covers_all_variants() {
@@ -19953,14 +19953,14 @@ mod tests {
         assert_eq!(json_value_type_name(&serde_json::json!({})), "object");
     }
 
-    // -- tool_register validation: schema parse errors -------------------------
+    // -- outlet_register validation: schema parse errors -------------------------
 
     #[tokio::test]
-    async fn tool_register_rejects_invalid_input_schema_json() {
+    async fn outlet_register_rejects_invalid_input_schema_json() {
         let scp = scp_test();
         let handle = test_handle_for(&scp);
-        let def = ToolDefinition {
-            name: "test-tool".to_owned(),
+        let def = OutletDefinition {
+            name: "test-outlet".to_owned(),
             description: "desc".to_owned(),
             input_schema_json: "not valid json{{{".to_owned(),
             output_schema_json: r#"{"type": "object"}"#.to_owned(),
@@ -19971,7 +19971,7 @@ mod tests {
         };
 
         let err = scp
-            .tool_register(handle, def)
+            .outlet_register(handle, def)
             .await
             .expect_err("invalid input_schema_json must be rejected");
         match err {
@@ -19987,11 +19987,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tool_register_rejects_invalid_output_schema_json() {
+    async fn outlet_register_rejects_invalid_output_schema_json() {
         let scp = scp_test();
         let handle = test_handle_for(&scp);
-        let def = ToolDefinition {
-            name: "test-tool".to_owned(),
+        let def = OutletDefinition {
+            name: "test-outlet".to_owned(),
             description: "desc".to_owned(),
             input_schema_json: r#"{"type": "object"}"#.to_owned(),
             output_schema_json: "{broken".to_owned(),
@@ -20002,7 +20002,7 @@ mod tests {
         };
 
         let err = scp
-            .tool_register(handle, def)
+            .outlet_register(handle, def)
             .await
             .expect_err("invalid output_schema_json must be rejected");
         match err {
@@ -20017,14 +20017,14 @@ mod tests {
         }
     }
 
-    // -- tool_register validation: schema type (non-object) --------------------
+    // -- outlet_register validation: schema type (non-object) --------------------
 
     #[tokio::test]
-    async fn tool_register_rejects_non_object_input_schema() {
+    async fn outlet_register_rejects_non_object_input_schema() {
         let scp = scp_test();
         let handle = test_handle_for(&scp);
-        let def = ToolDefinition {
-            name: "test-tool".to_owned(),
+        let def = OutletDefinition {
+            name: "test-outlet".to_owned(),
             description: "desc".to_owned(),
             input_schema_json: r#""a string""#.to_owned(),
             output_schema_json: r#"{"type": "object"}"#.to_owned(),
@@ -20035,7 +20035,7 @@ mod tests {
         };
 
         let err = scp
-            .tool_register(handle, def)
+            .outlet_register(handle, def)
             .await
             .expect_err("non-object input_schema must be rejected");
         match err {
@@ -20055,11 +20055,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tool_register_rejects_non_object_output_schema() {
+    async fn outlet_register_rejects_non_object_output_schema() {
         let scp = scp_test();
         let handle = test_handle_for(&scp);
-        let def = ToolDefinition {
-            name: "test-tool".to_owned(),
+        let def = OutletDefinition {
+            name: "test-outlet".to_owned(),
             description: "desc".to_owned(),
             input_schema_json: r#"{"type": "object"}"#.to_owned(),
             output_schema_json: "[1, 2, 3]".to_owned(),
@@ -20070,7 +20070,7 @@ mod tests {
         };
 
         let err = scp
-            .tool_register(handle, def)
+            .outlet_register(handle, def)
             .await
             .expect_err("non-object output_schema must be rejected");
         match err {
@@ -20089,14 +20089,14 @@ mod tests {
         }
     }
 
-    // -- tool_register validation: test vectors --------------------------------
+    // -- outlet_register validation: test vectors --------------------------------
 
     #[tokio::test]
-    async fn tool_register_rejects_invalid_test_vectors_json() {
+    async fn outlet_register_rejects_invalid_test_vectors_json() {
         let scp = scp_test();
         let handle = test_handle_for(&scp);
-        let def = ToolDefinition {
-            name: "test-tool".to_owned(),
+        let def = OutletDefinition {
+            name: "test-outlet".to_owned(),
             description: "desc".to_owned(),
             input_schema_json: r#"{"type": "object"}"#.to_owned(),
             output_schema_json: r#"{"type": "object"}"#.to_owned(),
@@ -20107,7 +20107,7 @@ mod tests {
         };
 
         let err = scp
-            .tool_register(handle, def)
+            .outlet_register(handle, def)
             .await
             .expect_err("non-array test_vectors_json must be rejected");
         match err {
@@ -20123,12 +20123,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tool_register_rejects_test_vectors_missing_fields() {
+    async fn outlet_register_rejects_test_vectors_missing_fields() {
         let scp = scp_test();
         let handle = test_handle_for(&scp);
         // Array of objects missing required fields for TestVector deserialization.
-        let def = ToolDefinition {
-            name: "test-tool".to_owned(),
+        let def = OutletDefinition {
+            name: "test-outlet".to_owned(),
             description: "desc".to_owned(),
             input_schema_json: r#"{"type": "object"}"#.to_owned(),
             output_schema_json: r#"{"type": "object"}"#.to_owned(),
@@ -20139,7 +20139,7 @@ mod tests {
         };
 
         let err = scp
-            .tool_register(handle, def)
+            .outlet_register(handle, def)
             .await
             .expect_err("test vectors with missing fields must be rejected");
         match err {
@@ -20150,14 +20150,14 @@ mod tests {
         }
     }
 
-    // -- tool_register validation: implementation hash -------------------------
+    // -- outlet_register validation: implementation hash -------------------------
 
     #[tokio::test]
-    async fn tool_register_rejects_implementation_hash_wrong_length() {
+    async fn outlet_register_rejects_implementation_hash_wrong_length() {
         let scp = scp_test();
         let handle = test_handle_for(&scp);
-        let def = ToolDefinition {
-            name: "test-tool".to_owned(),
+        let def = OutletDefinition {
+            name: "test-outlet".to_owned(),
             description: "desc".to_owned(),
             input_schema_json: r#"{"type": "object"}"#.to_owned(),
             output_schema_json: r#"{"type": "object"}"#.to_owned(),
@@ -20168,7 +20168,7 @@ mod tests {
         };
 
         let err = scp
-            .tool_register(handle, def)
+            .outlet_register(handle, def)
             .await
             .expect_err("implementation_hash with wrong length must be rejected");
         match err {
@@ -20188,11 +20188,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tool_register_rejects_implementation_hash_too_long() {
+    async fn outlet_register_rejects_implementation_hash_too_long() {
         let scp = scp_test();
         let handle = test_handle_for(&scp);
-        let def = ToolDefinition {
-            name: "test-tool".to_owned(),
+        let def = OutletDefinition {
+            name: "test-outlet".to_owned(),
             description: "desc".to_owned(),
             input_schema_json: r#"{"type": "object"}"#.to_owned(),
             output_schema_json: r#"{"type": "object"}"#.to_owned(),
@@ -20203,7 +20203,7 @@ mod tests {
         };
 
         let err = scp
-            .tool_register(handle, def)
+            .outlet_register(handle, def)
             .await
             .expect_err("implementation_hash with wrong length must be rejected");
         match err {
@@ -20319,15 +20319,15 @@ mod tests {
         }
     }
 
-    /// `registered_at` on a tool registered via the `UniFFI` bridge must be a
+    /// `registered_at` on a outlet registered via the `UniFFI` bridge must be a
     /// seconds-epoch timestamp, not milliseconds or hardcoded 0.
-    /// Calls the actual `tool_register` bridge function and inspects the
-    /// stored `ToolRegistration`. Catches the original bug from issue #871.
+    /// Calls the actual `outlet_register` bridge function and inspects the
+    /// stored `OutletRegistration`. Catches the original bug from issue #871.
     #[tokio::test]
     async fn registered_at_is_seconds_epoch() {
         let scp = scp_test();
         let handle = test_handle_for(&scp);
-        let def = ToolDefinition {
+        let def = OutletDefinition {
             name: "timestamp-probe".to_owned(),
             description: "probes registered_at value".to_owned(),
             input_schema_json:
@@ -20340,15 +20340,15 @@ mod tests {
             cost: None,
         };
 
-        let tool_id = scp
-            .tool_register(handle.clone(), def)
+        let outlet_id = scp
+            .outlet_register(handle.clone(), def)
             .await
-            .expect("tool_register should succeed");
+            .expect("outlet_register should succeed");
 
-        let registry = handle.tool_registry.lock().await;
+        let registry = handle.outlet_registry.lock().await;
         let reg = registry
-            .get(&tool_id)
-            .expect("tool should exist in registry after registration");
+            .get(&outlet_id)
+            .expect("outlet should exist in registry after registration");
         assert!(
             reg.registered_at > 1_700_000_000 && reg.registered_at < 2_000_000_000,
             "registered_at should be seconds-epoch (got {}); \
@@ -20694,7 +20694,7 @@ mod tests {
         let result = scp_test()
             .mcp_client_invoke(
                 "mcp-client-nonexistent".to_owned(),
-                "test-tool".to_owned(),
+                "test-outlet".to_owned(),
                 "{}".to_owned(),
                 "ctx-test".to_owned(),
                 "did:dht:z6MkTestUser".to_owned(),
@@ -21073,7 +21073,7 @@ mod tests {
             context_id: "ctx-uniffi-123".to_owned(),
             member_did: scp_did::DID("did:dht:z6MkBob".to_owned()),
             rule_index: 3,
-            trigger_type: "tool_rate".to_owned(),
+            trigger_type: "outlet_rate".to_owned(),
             action_type: "capability_suspension".to_owned(),
         };
 
@@ -21088,7 +21088,7 @@ mod tests {
         );
         assert!(formatted.contains("rule=3"), "must contain rule index");
         assert!(
-            formatted.contains("trigger=tool_rate"),
+            formatted.contains("trigger=outlet_rate"),
             "must contain trigger type"
         );
         assert!(
@@ -21229,7 +21229,7 @@ mod tests {
             bi: Arc::downgrade(&bi),
             agent_did: "did:dht:z6MkTypeProof".to_owned(),
             context_ids: vec![],
-            tool_timeout_ms: UNIFFI_TOOL_TIMEOUT_MS,
+            outlet_timeout_ms: UNIFFI_OUTLET_TIMEOUT_MS,
             agent_ucan_token: None,
             agent_proof_tokens: None,
         };
@@ -21248,7 +21248,7 @@ mod tests {
                 bi: Arc::downgrade(&bi),
                 agent_did: "did:dht:z6MkDropped".to_owned(),
                 context_ids: vec!["ctx-dropped".to_owned()],
-                tool_timeout_ms: UNIFFI_TOOL_TIMEOUT_MS,
+                outlet_timeout_ms: UNIFFI_OUTLET_TIMEOUT_MS,
                 agent_ucan_token: None,
                 agent_proof_tokens: None,
             };
@@ -22481,9 +22481,9 @@ mod tests {
             callback_custody: Some(callback_custody),
             signing_key: Some(signing_key),
             ceiling_strings: Vec::new(),
-            tool_registry: tokio::sync::Mutex::new(scp_core::context::tools::ToolRegistry::new()),
-            tool_handlers: tokio::sync::Mutex::new(std::collections::HashMap::new()),
-            session_store: tokio::sync::Mutex::new(scp_core::context::tools::SessionStore::new()),
+            outlet_registry: tokio::sync::Mutex::new(scp_core::context::outlets::OutletRegistry::new()),
+            outlet_handlers: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            session_store: tokio::sync::Mutex::new(scp_core::context::outlets::SessionStore::new()),
             economic_policy: std::sync::Mutex::new(None),
             core_context_params: scp_core::context::ContextParams::default(),
             instance_id: scp.instance_id(),
@@ -22802,16 +22802,16 @@ mod tests {
     }
 
     // ====================================================================
-    // Cross-context tool-invocation saga (§6.2.4, ADR-049 §3a) — UniFFI export
+    // Cross-context outlet-invocation saga (§6.2.4, ADR-049 §3a) — UniFFI export
     // ====================================================================
     //
     // The bridge's added responsibilities on top of the supervisor producer
-    // (`start_cross_context_tool_invocation_saga`) are: the typed terminal →
+    // (`start_cross_context_outlet_invocation_saga`) are: the typed terminal →
     // typed `ScpError` mapping (`map_saga_error`), fail-closed nonce decoding
     // (`decode_asserted_nonce`), and — exercised by the end-to-end test below —
     // the §6.2.4 *Caller authentication* binding, the ADR-056 chokepoint, and
     // per-context Active Signing Key resolution, driven to a real `Committed`
-    // terminal through a governance-established `ToolInterface`.
+    // terminal through a governance-established `OutletInterface`.
 
     use scp_core::context::supervisor::{
         SagaAbortReason, SagaError as CoreSagaError, SagaId as CoreSagaId,
@@ -22940,7 +22940,7 @@ mod tests {
         }
     }
 
-    /// All §6.2.4 cross-context-tool saga binding tests and their pure-string /
+    /// All §6.2.4 cross-context-outlet saga binding tests and their pure-string /
     /// DHT / governance helpers live in this single submodule gated on
     /// `allow_in_memory_custody`. Gating the module (rather than each item)
     /// covers every helper AND every future saga test added here by
@@ -23074,7 +23074,7 @@ mod tests {
         /// A PERMISSIVE output schema (2 declared properties drawn from the
         /// schema-only echo shape — `{status, input_valid}` — and NO `required` /
         /// `additionalProperties:false`) so the no-handler echo object
-        /// (`{tool, target_context, caller_did, status, input_valid, validated_input}`)
+        /// (`{outlet, target_context, caller_did, status, input_valid, validated_input}`)
         /// validates at Commit-B. Used by the echo-fallback Committed test.
         fn saga_permissive_echo_output_schema() -> serde_json::Value {
             serde_json::json!({
@@ -23086,14 +23086,14 @@ mod tests {
             })
         }
 
-        /// Serializes a `RegisterTool` governance action for the saga tool carrying
+        /// Serializes a `RegisterTool` governance action for the saga outlet carrying
         /// the given `output_schema`. The input schema mirrors the `PyO3` e2e (2
         /// input properties — clears the §9.2.1 specificity floor of 2).
         /// `implementation_hash` is a fixed 32-byte array (serde wants a 32-element
         /// JSON number array — `json!` has no array-repeat sugar).
-        fn saga_register_tool_action_json_with_output(
-            tool_id: &str,
-            tool_name: &str,
+        fn saga_register_outlet_action_json_with_output(
+            outlet_id: &str,
+            outlet_name: &str,
             owner: &str,
             output_schema: serde_json::Value,
         ) -> String {
@@ -23101,9 +23101,9 @@ mod tests {
             let register_action = serde_json::json!({
                 "RegisterTool": {
                     "registration": {
-                        "tool_id": tool_id,
-                        "name": tool_name,
-                        "description": format!("Tool: {tool_name}"),
+                        "outlet_id": outlet_id,
+                        "name": outlet_name,
+                        "description": format!("Outlet: {outlet_name}"),
                         "schema": {
                             "input_schema": {
                                 "type": "object",
@@ -23128,10 +23128,10 @@ mod tests {
 
         /// The handler-backed e2e's `RegisterTool` action (numeric `{sum, ok}`
         /// output schema).
-        fn saga_register_tool_action_json(tool_id: &str, tool_name: &str, owner: &str) -> String {
-            saga_register_tool_action_json_with_output(
-                tool_id,
-                tool_name,
+        fn saga_register_outlet_action_json(outlet_id: &str, outlet_name: &str, owner: &str) -> String {
+            saga_register_outlet_action_json_with_output(
+                outlet_id,
+                outlet_name,
                 owner,
                 saga_numeric_output_schema(),
             )
@@ -23139,14 +23139,14 @@ mod tests {
 
         /// Serializes the bidirectionally-approved `EstablishToolInterface`
         /// governance action (externally-tagged `GovernanceAction`; the
-        /// `snake_case` `ToolInterface` `Option` fields render as JSON `null`).
-        fn saga_establish_interface_action_json(ctx_a: &str, ctx_b: &str, tool_id: &str) -> String {
+        /// `snake_case` `OutletInterface` `Option` fields render as JSON `null`).
+        fn saga_establish_interface_action_json(ctx_a: &str, ctx_b: &str, outlet_id: &str) -> String {
             let action = serde_json::json!({
                 "EstablishToolInterface": {
                     "interface": {
                         "source_context": ctx_a,
                         "target_context": ctx_b,
-                        "tool_id": tool_id,
+                        "outlet_id": outlet_id,
                         "rate_limit": null,
                         "inbound_rate_limit": null,
                         "per_caller_rate_limit": null,
@@ -23188,12 +23188,12 @@ mod tests {
         }
 
         /// Full `Committed` terminal through the `UniFFI` bridge: an authenticated
-        /// caller drives the §6.2.4 cross-context tool-invocation saga (ADR-049 §3a)
+        /// caller drives the §6.2.4 cross-context outlet-invocation saga (ADR-049 §3a)
         /// to a real commit and the bridge returns the committed receipt + output
         /// bytes.
         ///
         /// The setup mirrors the producer's two authorization axes
-        /// (`start_cross_context_tool_invocation_saga`):
+        /// (`start_cross_context_outlet_invocation_saga`):
         ///
         /// 1. **Caller axis (gate 1).** `caller_did` must be hosted by this bridge
         ///    AND a member of the CALLER (source) context A. Creating A via
@@ -23204,12 +23204,12 @@ mod tests {
         ///    `context_create` builds the supervisor (which snapshots that resolver
         ///    for governance vote verification).
         /// 2. **Target axis (gate 2).** The producer requires a *bidirectionally
-        ///    approved* `ToolInterface` queried against the CALLER context A's actor
+        ///    approved* `OutletInterface` queried against the CALLER context A's actor
         ///    governance state — so it is established IN A via a governance
         ///    `EstablishToolInterface` action (auto-executed under `single_admin`; A's
-        ///    ceiling carries `tool:interface` + `governance:propose`).
+        ///    ceiling carries `outlet:interface` + `governance:propose`).
         ///
-        /// Context B holds the tool in its ACTOR governance `registered_tools` (via
+        /// Context B holds the outlet in its ACTOR governance `registered_outlets` (via
         /// a `RegisterTool` action; saga Prepare-B reads it there) plus the FFI-side
         /// handler the executor snapshots and runs once at Commit-B (returns
         /// `{sum:42, ok:1}`, validated against the registered numeric output schema).
@@ -23237,8 +23237,8 @@ mod tests {
             seed_owner_document_into_resolver(&owner_identity, &resolver_dht).await;
 
             // Context A (caller/source): ceiling carries `governance:propose` (so
-            // owner-as-admin can propose) and `tool:interface` (required by
-            // `execute_establish_tool_interface`'s ceiling check).
+            // owner-as-admin can propose) and `outlet:interface` (required by
+            // `execute_establish_outlet_interface`'s ceiling check).
             let handle_a = scp
                 .context_create(
                     Arc::clone(&owner_identity),
@@ -23255,7 +23255,7 @@ mod tests {
             let ctx_a = handle_a.context_id.clone();
 
             // Context B (target): ceiling carries `governance:propose` and
-            // `tool:register` so the saga tool can be registered into B's ACTOR
+            // `outlet:register` so the saga outlet can be registered into B's ACTOR
             // governance state.
             let handle_b = scp
                 .context_create(
@@ -23266,26 +23266,26 @@ mod tests {
                 .expect("target context B must be created");
             let ctx_b = handle_b.context_id.clone();
 
-            // The tool id is the deterministic `tool-{name}` form `tool_register`
-            // mints, also keying B's actor `registered_tools` and A's interface.
-            let tool_name = "xctx_saga_commit_tool";
-            let tool_id = format!("tool-{tool_name}");
+            // The outlet id is the deterministic `outlet-{name}` form `outlet_register`
+            // mints, also keying B's actor `registered_outlets` and A's interface.
+            let outlet_name = "xctx_saga_commit_outlet";
+            let outlet_id = format!("outlet-{outlet_name}");
 
-            // Register the saga tool into B's ACTOR governance state (saga Prepare-B
-            // reads the tool from there).
-            let register_json = saga_register_tool_action_json(&tool_id, tool_name, &owner);
+            // Register the saga outlet into B's ACTOR governance state (saga Prepare-B
+            // reads the outlet from there).
+            let register_json = saga_register_outlet_action_json(&outlet_id, outlet_name, &owner);
             let register_result = scp
                 .governance_propose(Arc::clone(&handle_b), owner.clone(), register_json)
                 .await
                 .expect("RegisterTool must auto-execute under single_admin");
             assert_governance_executed(&register_result, "RegisterTool");
 
-            // Register the tool in B's FFI-side registry too (so the FFI schema
+            // Register the outlet in B's FFI-side registry too (so the FFI schema
             // matches the governance registration), then attach the deterministic
             // handler the executor snapshots at Commit-B.
-            let definition = ToolDefinition {
-                name: tool_name.to_owned(),
-                description: format!("Tool: {tool_name}"),
+            let definition = OutletDefinition {
+                name: outlet_name.to_owned(),
+                description: format!("Outlet: {outlet_name}"),
                 input_schema_json: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -23307,17 +23307,17 @@ mod tests {
                 implementation_hash: None,
                 cost: None,
             };
-            let ffi_tool_id = scp
-                .tool_register(Arc::clone(&handle_b), definition)
+            let ffi_outlet_id = scp
+                .outlet_register(Arc::clone(&handle_b), definition)
                 .await
-                .expect("FFI-side tool registration must succeed");
+                .expect("FFI-side outlet registration must succeed");
             assert_eq!(
-                ffi_tool_id, tool_id,
-                "FFI and governance tool ids must agree (deterministic tool-{{name}})"
+                ffi_outlet_id, outlet_id,
+                "FFI and governance outlet ids must agree (deterministic outlet-{{name}})"
             );
 
             // Register a real handler returning the numeric {sum, ok} the registered
-            // output schema accepts. In-crate `tool_handlers` access is `pub(crate)`,
+            // output schema accepts. In-crate `outlet_handlers` access is `pub(crate)`,
             // which is exactly why this Committed test lives in-crate.
             let handler: std::sync::Arc<
                 dyn Fn(serde_json::Value) -> Result<serde_json::Value, String> + Send + Sync,
@@ -23327,13 +23327,13 @@ mod tests {
             context_handle_registry(&bi)
                 .get(&ctx_b)
                 .expect("target context B must be registered")
-                .tool_handlers
+                .outlet_handlers
                 .lock()
                 .await
-                .insert(tool_id.clone(), handler);
+                .insert(outlet_id.clone(), handler);
 
             // Establish the bidirectionally-approved interface in A via governance.
-            let establish_json = saga_establish_interface_action_json(&ctx_a, &ctx_b, &tool_id);
+            let establish_json = saga_establish_interface_action_json(&ctx_a, &ctx_b, &outlet_id);
             let propose_result = scp
                 .governance_propose(Arc::clone(&handle_a), owner.clone(), establish_json)
                 .await
@@ -23353,11 +23353,11 @@ mod tests {
             let input_json = serde_json::json!({"a": "x", "b": "y"}).to_string();
 
             let result = scp
-                .tool_invoke_cross_context_saga(
+                .outlet_invoke_cross_context_saga(
                     Arc::clone(&handle_a),
                     Arc::clone(&handle_b),
                     owner,
-                    tool_id,
+                    outlet_id,
                     input_json,
                     saga_nonce_hex(),
                     now_ms,
@@ -23393,12 +23393,12 @@ mod tests {
         /// Full `Committed` terminal through the executor's NO-HANDLER echo
         /// fallback. Identical to
         /// [`xctx_saga_authenticated_caller_commits_via_governance_established_interface`]
-        /// EXCEPT no FFI tool handler is registered on context B — so the executor
+        /// EXCEPT no FFI outlet handler is registered on context B — so the executor
         /// takes its schema-only echo branch
-        /// (`{tool, target_context, caller_did, status, input_valid, validated_input}`).
-        /// The tool is registered with a PERMISSIVE output schema
+        /// (`{outlet, target_context, caller_did, status, input_valid, validated_input}`).
+        /// The outlet is registered with a PERMISSIVE output schema
         /// (`{status, input_valid}`, no `required`/`additionalProperties:false`) in
-        /// BOTH the `RegisterTool` governance action and the FFI `ToolDefinition`, so
+        /// BOTH the `RegisterTool` governance action and the FFI `OutletDefinition`, so
         /// Commit-B's output-schema validation accepts the echo and the saga reaches
         /// a real `Committed`. Proves the no-handler echo path commits end-to-end.
         #[tokio::test]
@@ -23439,15 +23439,15 @@ mod tests {
                 .await
                 .expect("target context B must be created");
 
-            let tool_name = "xctx_saga_echo_tool";
-            let tool_id = format!("tool-{tool_name}");
+            let outlet_name = "xctx_saga_echo_outlet";
+            let outlet_id = format!("outlet-{outlet_name}");
 
-            // Register the tool into B's ACTOR governance state with the PERMISSIVE
+            // Register the outlet into B's ACTOR governance state with the PERMISSIVE
             // output schema (so Prepare-B reads it AND Commit-B validates the echo
             // against it).
-            let register_json = saga_register_tool_action_json_with_output(
-                &tool_id,
-                tool_name,
+            let register_json = saga_register_outlet_action_json_with_output(
+                &outlet_id,
+                outlet_name,
                 &owner,
                 saga_permissive_echo_output_schema(),
             );
@@ -23457,12 +23457,12 @@ mod tests {
                 .expect("RegisterTool must auto-execute under single_admin");
             assert_governance_executed(&register_result, "RegisterTool (echo)");
 
-            // Register the tool in B's FFI-side registry with the SAME permissive
+            // Register the outlet in B's FFI-side registry with the SAME permissive
             // output schema — but DO NOT attach a handler. The absence of a handler
             // is what drives the executor's schema-only echo branch.
-            let definition = ToolDefinition {
-                name: tool_name.to_owned(),
-                description: format!("Tool: {tool_name}"),
+            let definition = OutletDefinition {
+                name: outlet_name.to_owned(),
+                description: format!("Outlet: {outlet_name}"),
                 input_schema_json: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -23477,19 +23477,19 @@ mod tests {
                 implementation_hash: None,
                 cost: None,
             };
-            let ffi_tool_id = scp
-                .tool_register(Arc::clone(&handle_b), definition)
+            let ffi_outlet_id = scp
+                .outlet_register(Arc::clone(&handle_b), definition)
                 .await
-                .expect("FFI-side tool registration must succeed");
+                .expect("FFI-side outlet registration must succeed");
             assert_eq!(
-                ffi_tool_id, tool_id,
-                "FFI and governance tool ids must agree (deterministic tool-{{name}})"
+                ffi_outlet_id, outlet_id,
+                "FFI and governance outlet ids must agree (deterministic outlet-{{name}})"
             );
 
             // NO handler registered on context B: the executor must echo.
 
             let establish_json =
-                saga_establish_interface_action_json(&ctx_a, &handle_b.context_id, &tool_id);
+                saga_establish_interface_action_json(&ctx_a, &handle_b.context_id, &outlet_id);
             let propose_result = scp
                 .governance_propose(Arc::clone(&handle_a), owner.clone(), establish_json)
                 .await
@@ -23507,11 +23507,11 @@ mod tests {
             let input_json = serde_json::json!({"a": "x", "b": "y"}).to_string();
 
             let result = scp
-                .tool_invoke_cross_context_saga(
+                .outlet_invoke_cross_context_saga(
                     Arc::clone(&handle_a),
                     Arc::clone(&handle_b),
                     owner,
-                    tool_id,
+                    outlet_id,
                     input_json,
                     saga_nonce_hex(),
                     now_ms,
@@ -23602,11 +23602,11 @@ mod tests {
             // irrelevant to which axis trips — both handles are real and pass
             // affinity.
             let err = scp
-                .tool_invoke_cross_context_saga(
+                .outlet_invoke_cross_context_saga(
                     Arc::clone(&handle_a),
                     Arc::clone(&handle_a),
                     unhosted_caller_did,
-                    "tool-xctx_saga_unhosted".to_owned(),
+                    "outlet-xctx_saga_unhosted".to_owned(),
                     serde_json::json!({"a": "x", "b": "y"}).to_string(),
                     saga_nonce_hex(),
                     now_ms,
@@ -23687,11 +23687,11 @@ mod tests {
             // Reuse `handle_a` as the target handle: axis (b) on the caller context
             // rejects before any target-side resolution.
             let err = scp
-                .tool_invoke_cross_context_saga(
+                .outlet_invoke_cross_context_saga(
                     Arc::clone(&handle_a),
                     Arc::clone(&handle_a),
                     stranger_did,
-                    "tool-xctx_saga_non_member".to_owned(),
+                    "outlet-xctx_saga_non_member".to_owned(),
                     serde_json::json!({"a": "x", "b": "y"}).to_string(),
                     saga_nonce_hex(),
                     now_ms,
@@ -23813,11 +23813,11 @@ mod tests {
             // irrelevant to which axis trips — both handles are real and pass
             // affinity.
             let err = scp
-                .tool_invoke_cross_context_saga(
+                .outlet_invoke_cross_context_saga(
                     Arc::clone(&handle_a),
                     Arc::clone(&handle_a),
                     member_but_unhosted_caller, // member of caller_ctx, but NOT hosted
-                    "tool-xctx_saga_member_unhosted".to_owned(),
+                    "outlet-xctx_saga_member_unhosted".to_owned(),
                     serde_json::json!({"a": "x", "b": "y"}).to_string(),
                     saga_nonce_hex(),
                     now_ms,

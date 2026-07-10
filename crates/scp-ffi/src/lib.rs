@@ -67,7 +67,7 @@ pub mod runtime;
 pub mod scp;
 pub mod scpid;
 pub mod sync;
-pub mod tools;
+pub mod outlets;
 pub mod transport;
 pub mod trust;
 pub mod types;
@@ -239,7 +239,7 @@ pub fn _scp_core(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     context::register_context(m)?;
     discovery::register_discovery(m)?;
     economy::register_economy(m)?;
-    tools::register_tools(m)?;
+    outlets::register_outlets(m)?;
     transport::register_transport(m)?;
     ucan::register_ucan(m)?;
     event_log::register_event_log(m)?;

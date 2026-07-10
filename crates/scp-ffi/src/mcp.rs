@@ -25,7 +25,7 @@
 //! The bridge delegates to real `scp-mcp` implementations:
 //!
 //! - **Server side**: `FfiBridgeProvider` implements
-//!   [`scp_mcp::server::ContextProvider`], reading tool registrations and
+//!   [`scp_mcp::server::ContextProvider`], reading outlet registrations and
 //!   context state from the scp-ffi runtime registry. The MCP server is run
 //!   on the tokio runtime via [`scp_mcp::stdio::run_stdio`] or
 //!   [`scp_mcp::sse::run_sse`].
@@ -578,13 +578,13 @@ impl McpTransport for ClientTransport {
 // FFI bridge context provider
 // ---------------------------------------------------------------------------
 
-/// Default tool handler execution timeout in milliseconds (30 seconds).
+/// Default outlet handler execution timeout in milliseconds (30 seconds).
 ///
-/// Matches [`scp_core::context::tools::DEFAULT_TIMEOUT_MS`]. If a registered
+/// Matches [`scp_core::context::outlets::DEFAULT_TIMEOUT_MS`]. If a registered
 /// handler does not return within this duration, the invocation is aborted
 /// with a timeout error. Configurable per-provider via
 /// [`FfiBridgeProvider::tool_timeout_ms`].
-const FFI_TOOL_TIMEOUT_MS: u64 = scp_core::context::tools::DEFAULT_TIMEOUT_MS as u64;
+const FFI_TOOL_TIMEOUT_MS: u64 = scp_core::context::outlets::DEFAULT_TIMEOUT_MS as u64;
 
 /// Implements [`ContextProvider`] by reading from the scp-ffi runtime registry.
 ///
@@ -617,18 +617,18 @@ struct FfiBridgeProvider {
     agent_did: String,
     /// The context IDs this provider serves.
     context_ids: Vec<String>,
-    /// Maximum time (in milliseconds) to wait for a tool handler to complete.
+    /// Maximum time (in milliseconds) to wait for a outlet handler to complete.
     ///
     /// Defaults to [`FFI_TOOL_TIMEOUT_MS`] (30 seconds). If a registered
     /// handler blocks longer than this, the invocation returns an error
     /// instead of blocking indefinitely. See issue #123.
     tool_timeout_ms: u64,
-    /// JWT-encoded UCAN token for tool invocation authorization.
+    /// JWT-encoded UCAN token for outlet invocation authorization.
     ///
     /// When present, `validate_capability` runs the full 11-step ADR-016
     /// validation pipeline to verify the token grants `tool_invoke:{tool_name}`
     /// or `tool_invoke:*` for the context. When absent, `validate_capability`
-    /// rejects immediately (UCAN is required for tool invocation).
+    /// rejects immediately (UCAN is required for outlet invocation).
     ///
     /// See spec §6.2, §8, ADR-016, and issue #319.
     agent_ucan_token: Option<String>,
@@ -686,8 +686,8 @@ impl ContextProvider for FfiBridgeProvider {
             return Vec::new();
         };
         crate::runtime::with_context(&bi, context_id, |rt| {
-            let tools = rt
-                .tool_registry
+            let outlets = rt
+                .outlet_registry
                 .registrations()
                 .map(|t| ContextToolInfo {
                     name: t.name.clone(),
@@ -697,7 +697,7 @@ impl ContextProvider for FfiBridgeProvider {
                     admin_only: false,
                 })
                 .collect();
-            Ok(tools)
+            Ok(outlets)
         })
         .unwrap_or_default()
     }
@@ -743,19 +743,19 @@ impl ContextProvider for FfiBridgeProvider {
                     clock: &scp_clock::SystemClock,
                 };
 
-                scp_core::context::tools::validate_tool_invocation_ucan(
+                scp_core::context::outlets::validate_outlet_invocation_ucan(
                     token, context_id, tool_name, &mut ctx,
                 )
                 .map_err(|e| {
                     tracing::warn!(
                         agent = %self.agent_did,
-                        tool = %tool_name,
+                        outlet = %tool_name,
                         context = %context_id,
                         error = %e,
-                        "UCAN validation failed for tool invocation"
+                        "UCAN validation failed for outlet invocation"
                     );
                     ScpPyError::ucan(format!(
-                        "UCAN authorization failed for tool '{tool_name}': {e}"
+                        "UCAN authorization failed for outlet '{tool_name}': {e}"
                     ))
                 })
             })
@@ -763,17 +763,17 @@ impl ContextProvider for FfiBridgeProvider {
         } else {
             tracing::warn!(
                 agent = %self.agent_did,
-                tool = %tool_name,
+                outlet = %tool_name,
                 context = %context_id,
-                "no UCAN token provided for tool invocation — authorization bypass risk"
+                "no UCAN token provided for outlet invocation — authorization bypass risk"
             );
-            return Err("UCAN token required for tool invocation — no token provided".to_owned());
+            return Err("UCAN token required for outlet invocation — no token provided".to_owned());
         }
 
         // Defense-in-depth: check role-state capabilities in addition to the
         // UCAN layer. See §7.2 and ADR-010 for the dual-check design.
         crate::runtime::with_context(&bi, context_id, |rt| {
-            if scp_core::context::tools::invoke::has_tool_invoke_capability(
+            if scp_core::context::outlets::invoke::has_outlet_invoke_capability(
                 &rt.role_state,
                 &self.agent_did,
                 tool_name,
@@ -783,12 +783,12 @@ impl ContextProvider for FfiBridgeProvider {
                 // Generic message for the wire — detailed info stays server-side.
                 tracing::warn!(
                     agent = %self.agent_did,
-                    tool = %tool_name,
+                    outlet = %tool_name,
                     context = %context_id,
-                    "capability check failed: agent lacks ToolInvoke capability"
+                    "capability check failed: agent lacks OutletInvoke capability"
                 );
                 Err(ScpPyError::context(
-                    "insufficient permissions to invoke tool",
+                    "insufficient permissions to invoke outlet",
                 ))
             }
         })
@@ -802,17 +802,17 @@ impl ContextProvider for FfiBridgeProvider {
         tool_name: &str,
         arguments: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
-        // Validates tool existence and input schema, then dispatches to a
+        // Validates outlet existence and input schema, then dispatches to a
         // registered handler if one exists. If no handler is registered, falls
         // back to echoing the validated input with metadata (schema-only mode).
         //
-        // After successful invocation, appends a ToolInvokedEvent to the
+        // After successful invocation, appends a OutletInvokedEvent to the
         // context's event log per ADR-010 acceptance criterion 3.
         //
         // The handler dispatch is sync because ContextProvider::invoke_tool is
         // sync and Python handlers are GIL-bound (inherently sync). The async
         // invoke_tool in scp-core is for contexts where Rust itself executes
-        // tools. See SCP-212, ADR-010, ADR-015.
+        // outlets. See SCP-212, ADR-010, ADR-015.
         //
         // IMPORTANT: The handler Arc and output schema are extracted inside the
         // DashMap shard lock (via with_context), then the lock is released
@@ -862,8 +862,8 @@ impl ContextProvider for FfiBridgeProvider {
         // Consume a hard-rate-limit token BEFORE dispatching the MCP
         // tool invocation. This path — reachable from external MCP
         // clients — does not go through
-        // `ContextManager::invoke_tool_with_economy`; it dispatches
-        // directly against the bridge-side tool registry, so without
+        // `ContextManager::invoke_outlet_with_economy`; it dispatches
+        // directly against the bridge-side outlet registry, so without
         // this hook an external client could burn relay capacity
         // regardless of the per-context rate limit.
         //
@@ -904,31 +904,31 @@ impl ContextProvider for FfiBridgeProvider {
         // returns. Also compute input hash before dispatch (arguments may
         // be consumed by the handler).
         let (dispatch, input_hash) = crate::runtime::with_context(&bi, context_id, |rt| {
-            let registration = rt.tool_registry.get(tool_name).ok_or_else(|| {
+            let registration = rt.outlet_registry.get(tool_name).ok_or_else(|| {
                 ScpPyError::context(format!(
-                    "tool '{tool_name}' not found in context '{context_id}'"
+                    "outlet '{tool_name}' not found in context '{context_id}'"
                 ))
             })?;
 
-            // Validate input against the tool's input schema.
-            scp_core::context::tools::schema::validate_value_against_schema(
+            // Validate input against the outlet's input schema.
+            scp_core::context::outlets::schema::validate_value_against_schema(
                 &arguments,
                 &registration.schema.input_schema,
             )
             .map_err(|msg| {
                 ScpPyError::validation(format!(
-                    "input validation failed for tool '{tool_name}': {msg}"
+                    "input validation failed for outlet '{tool_name}': {msg}"
                 ))
             })?;
 
             // Clone handler Arc and output schema so we can release the lock.
             // Compute input hash before dispatch (arguments may be consumed).
-            let input_hash = scp_core::context::tools::sha256_json(&arguments).map_err(|e| {
+            let input_hash = scp_core::context::outlets::sha256_json(&arguments).map_err(|e| {
                 ScpPyError::context(format!("input hash canonicalization failed: {e}"))
             })?;
 
             Ok((
-                rt.tool_handlers
+                rt.outlet_handlers
                     .get(tool_name)
                     .map(|handler| (handler.clone(), registration.schema.output_schema.clone())),
                 input_hash,
@@ -955,22 +955,22 @@ impl ContextProvider for FfiBridgeProvider {
 
                 let handler_result = rx.recv_timeout(timeout).map_err(|_| {
                     refund(format!(
-                        "tool handler for '{tool_name}' timed out after {}ms",
+                        "outlet handler for '{tool_name}' timed out after {}ms",
                         timeout.as_millis()
                     ))
                 })?;
 
                 let output = handler_result
-                    .map_err(|e| refund(format!("tool handler for '{tool_name}' failed: {e}")))?;
+                    .map_err(|e| refund(format!("outlet handler for '{tool_name}' failed: {e}")))?;
 
-                // Validate output against the tool's output schema (defense-in-depth).
-                scp_core::context::tools::schema::validate_value_against_schema(
+                // Validate output against the outlet's output schema (defense-in-depth).
+                scp_core::context::outlets::schema::validate_value_against_schema(
                     &output,
                     &output_schema,
                 )
                 .map_err(|msg| {
                     refund(format!(
-                        "output validation failed for tool '{tool_name}': {msg}"
+                        "output validation failed for outlet '{tool_name}': {msg}"
                     ))
                 })?;
 
@@ -988,14 +988,14 @@ impl ContextProvider for FfiBridgeProvider {
             }
         };
 
-        // Phase 3: Append ToolInvokedEvent to the event log (ADR-010
+        // Phase 3: Append OutletInvokedEvent to the event log (ADR-010
         // criterion 3).
         //
         // SECURITY: unsigned event — uses `append_unsigned_event` because
         // `KeyCustody::sign()` is async and we are inside the tokio runtime
         // (block_on would panic). The event is chain-validated and Merkle-
         // committed but carries an empty signature. A compromised in-process
-        // caller could inject fake ToolInvokedEvent entries. Migrate to signed
+        // caller could inject fake OutletInvokedEvent entries. Migrate to signed
         // events via `append` once async FFI signing lands (SCP-214).
         // See: crates/scp-core/src/event_log/tree.rs::append_unsigned_event
         // See: .docs/lessons/unsigned-event-mcp-bridge.md
@@ -1009,21 +1009,21 @@ impl ContextProvider for FfiBridgeProvider {
             }
         };
 
-        let output_hash = scp_core::context::tools::sha256_json(&output)
+        let output_hash = scp_core::context::outlets::sha256_json(&output)
             .map_err(|e| refund(format!("output hash canonicalization failed: {e}")))?;
 
-        let tool_event = scp_core::context::tools::ToolInvokedEvent {
+        let outlet_event = scp_core::context::outlets::OutletInvokedEvent {
             request_id: uuid::Uuid::new_v4().to_string(),
-            tool_id: tool_name.to_owned(),
+            outlet_id: tool_name.to_owned(),
             invoker_did: agent_did.clone().into(),
-            status: scp_core::context::tools::ToolStatus::Success,
+            status: scp_core::context::outlets::OutletStatus::Success,
             execution_time_ms: elapsed_ms,
             input_hash,
             output_hash: Some(output_hash),
             cost: None,
         };
 
-        let payload_data = serde_json::to_vec(&tool_event).unwrap_or_default();
+        let payload_data = serde_json::to_vec(&outlet_event).unwrap_or_default();
 
         let timestamp = scp_clock::Clock::now_secs(&scp_clock::SystemClock);
 
@@ -1079,7 +1079,7 @@ impl ContextProvider for FfiBridgeProvider {
                     let key = format!("context/{context_id}/event_data/{sequence:020}");
                     if let Err(e) = rt.block_on(storage.store(&key, &event_bytes)) {
                         tracing::warn!(
-                            tool = %tool_name,
+                            outlet = %tool_name,
                             context = %context_id,
                             error = %e,
                             "failed to persist event payload to storage"
@@ -1089,10 +1089,10 @@ impl ContextProvider for FfiBridgeProvider {
             }
             Err(e) => {
                 tracing::warn!(
-                    tool = %tool_name,
+                    outlet = %tool_name,
                     context = %context_id,
                     error = %e,
-                    "failed to append ToolInvokedEvent to event log"
+                    "failed to append OutletInvokedEvent to event log"
                 );
             }
         }
@@ -1763,7 +1763,7 @@ impl crate::scp::PyScp {
 /// Lists available tools from an external MCP server.
 ///
 /// Sends a `tools/list` JSON-RPC request to the connected MCP server and
-/// returns the tool definitions as a list of Python dicts.
+/// returns the outlet definitions as a list of Python dicts.
 ///
 /// # Arguments
 ///
@@ -1792,7 +1792,7 @@ impl crate::scp::PyScp {
         let client = Arc::clone(&entry.client);
         drop(entry); // Release the DashMap guard before blocking.
 
-        let tools = {
+        let outlets = {
             let client_guard = client
                 .lock()
                 .map_err(|e| ScpPyError::transport(format!("client lock poisoned: {e}")))?;
@@ -1801,8 +1801,8 @@ impl crate::scp::PyScp {
                 .map_err(|e| ScpPyError::transport(format!("tools/list failed: {e}")))?
         };
 
-        // Convert tool definitions to JSON array for Python.
-        let tools_json: Vec<serde_json::Value> = tools
+        // Convert outlet definitions to JSON array for Python.
+        let outlets_json: Vec<serde_json::Value> = outlets
             .iter()
             .map(|t| {
                 serde_json::json!({
@@ -1813,20 +1813,20 @@ impl crate::scp::PyScp {
             })
             .collect();
 
-        json_to_py_dict(py, &serde_json::Value::Array(tools_json))
+        json_to_py_dict(py, &serde_json::Value::Array(outlets_json))
     }
 }
 
 /// Invokes an external MCP tool with SCP provenance wrapping.
 ///
 /// Sends a `tools/call` JSON-RPC request to the external MCP server and
-/// wraps the result with provenance metadata recording the source tool,
+/// wraps the result with provenance metadata recording the source outlet,
 /// invoking agent, context, and timestamp.
 ///
 /// # Arguments
 ///
 /// * `handle` -- The client handle returned by `py_mcp_client_connect_*`.
-/// * `tool_name` -- The name of the external tool to invoke.
+/// * `tool_name` -- The name of the external outlet to invoke.
 /// * `input` -- A Python dict of input parameters.
 /// * `context_id` -- The SCP context ID for provenance tracking.
 /// * `identity_did` -- The DID of the invoking identity.
@@ -1853,7 +1853,7 @@ impl crate::scp::PyScp {
     ) -> PyResult<PyObject> {
         let bi = &*self.inner;
         validate::validate_mcp_handle(handle)?;
-        validate::validate_tool_name(tool_name)?;
+        validate::validate_outlet_name(tool_name)?;
         validate::validate_context_id(context_id)?;
         validate::validate_did(identity_did)?;
         let entry = client_registry_of(bi).get(handle).ok_or_else(|| {
@@ -1914,7 +1914,7 @@ impl crate::scp::PyScp {
 /// - `source` -- `"local"`, `"relay"`, or `"local+relay"`.
 /// - `creator_did` -- The context creator's DID (if available from runtime).
 /// - `member_count` -- Number of members (if available from runtime).
-/// - `tool_count` -- Number of registered tools (if available from runtime).
+/// - `outlet_count` -- Number of registered outlets (if available from runtime).
 /// - `relay_active` -- `True` if the relay returned blobs for this context.
 ///
 /// # Arguments
@@ -1976,12 +1976,12 @@ impl crate::scp::PyScp {
                 Ok((
                     rt.creator_did.clone(),
                     rt.role_state.members.len(),
-                    rt.tool_registry.len(),
+                    rt.outlet_registry.len(),
                 ))
             }) {
                 dict.set_item("creator_did", info.0)?;
                 dict.set_item("member_count", info.1)?;
-                dict.set_item("tool_count", info.2)?;
+                dict.set_item("outlet_count", info.2)?;
             }
 
             results.push(dict.into());
@@ -2225,35 +2225,35 @@ impl crate::scp::PyScp {
 }
 
 // ---------------------------------------------------------------------------
-// Tool handler registration
+// Outlet handler registration
 // ---------------------------------------------------------------------------
 
-/// Registers a Python callable as the handler for a tool in a context.
+/// Registers a Python callable as the handler for a outlet in a context.
 ///
 /// The handler is called when the tool is invoked via MCP
-/// (`FfiBridgeProvider::invoke_tool`). It receives the tool's validated
+/// (`FfiBridgeProvider::invoke_tool`). It receives the outlet's validated
 /// JSON input as a Python dict and must return a Python dict representing
 /// the JSON output.
 ///
-/// The tool must already be registered in the context's tool registry
-/// (via `py_tool_register`) before a handler can be attached.
+/// The outlet must already be registered in the context's outlet registry
+/// (via `py_outlet_register`) before a handler can be attached.
 ///
 /// # Arguments
 ///
-/// * `context_id` -- The context containing the tool.
-/// * `tool_name` -- The tool ID to attach the handler to.
+/// * `context_id` -- The context containing the outlet.
+/// * `tool_name` -- The outlet ID to attach the handler to.
 /// * `handler` -- A Python callable `(dict) -> dict`.
 ///
 /// # Errors
 ///
-/// Raises `ContextError` if the context or tool is not found.
+/// Raises `ContextError` if the context or outlet is not found.
 ///
 /// See SCP-212 and ADR-010 for the handler registration design.
 #[pymethods]
 impl crate::scp::PyScp {
-    #[pyo3(name = "mcp_register_tool_handler")]
+    #[pyo3(name = "mcp_register_outlet_handler")]
     #[allow(clippy::needless_pass_by_value)] // PyObject must be owned to clone_ref into the closure.
-    pub fn py_register_tool_handler(
+    pub fn py_register_outlet_handler(
         &self,
         py: Python<'_>,
         context_id: &str,
@@ -2262,7 +2262,7 @@ impl crate::scp::PyScp {
     ) -> PyResult<()> {
         let bi = &*self.inner;
         validate::validate_context_id(context_id)?;
-        validate::validate_tool_name(tool_name)?;
+        validate::validate_outlet_name(tool_name)?;
         // Verify the handler is callable before storing it.
         if !handler.bind(py).is_callable() {
             return Err(ScpPyError::validation("handler must be callable".to_owned()).into());
@@ -2271,7 +2271,7 @@ impl crate::scp::PyScp {
         // Wrap the Python callable in a Rust closure that acquires the GIL,
         // converts JSON -> Python dict, calls the handler, and converts back.
         let handler_ref = handler.clone_ref(py);
-        let rust_handler: crate::runtime::ToolHandler =
+        let rust_handler: crate::runtime::OutletHandler =
             std::sync::Arc::new(move |input: serde_json::Value| {
                 Python::with_gil(|py| {
                     // Convert serde_json::Value -> Python dict.
@@ -2286,13 +2286,13 @@ impl crate::scp::PyScp {
                     // Convert Python result back to serde_json::Value.
                     let result_dict = py_result
                         .downcast_bound::<PyDict>(py)
-                        .map_err(|_| "tool handler must return a dict".to_owned())?;
+                        .map_err(|_| "outlet handler must return a dict".to_owned())?;
                     crate::types::py_dict_to_json(result_dict)
                         .map_err(|e| format!("failed to convert handler output to JSON: {e}"))
                 })
             });
 
-        crate::runtime::register_tool_handler(bi, context_id, tool_name, rust_handler)?;
+        crate::runtime::register_outlet_handler(bi, context_id, tool_name, rust_handler)?;
         Ok(())
     }
 }
@@ -2561,7 +2561,7 @@ mod tests {
     }
 
     #[test]
-    fn ffi_bridge_provider_context_tools_empty_for_unknown_context() {
+    fn ffi_bridge_provider_context_outlets_empty_for_unknown_context() {
         let bi = __bi();
         let provider = FfiBridgeProvider {
             bi: Arc::downgrade(&bi),
@@ -2572,16 +2572,16 @@ mod tests {
 
             agent_proof_tokens: None,
         };
-        // Unknown context returns empty tool list (no panic).
-        let tools = provider.context_tools("nonexistent");
-        assert!(tools.is_empty());
+        // Unknown context returns empty outlet list (no panic).
+        let outlets = provider.context_tools("nonexistent");
+        assert!(outlets.is_empty());
     }
 
     // -----------------------------------------------------------------------
-    // Helper: register a context with a tool for FfiBridgeProvider tests.
+    // Helper: register a context with a outlet for FfiBridgeProvider tests.
     // -----------------------------------------------------------------------
 
-    /// Registers a context in the runtime registry and optionally adds a tool.
+    /// Registers a context in the runtime registry and optionally adds a outlet.
     /// Returns a unique context ID to avoid collisions with parallel tests.
     ///
     /// Callers must pass the same `bi` they use for subsequent registry lookups;
@@ -2589,19 +2589,19 @@ mod tests {
     fn setup_test_context(
         bi: &crate::runtime::PyBridgeInstance,
         creator_did: &str,
-        with_tool: bool,
+        with_outlet: bool,
     ) -> String {
         // Use a unique context ID to avoid collisions across parallel tests.
         let ctx_id = crate::types::generate_random_id("test-mcp");
         crate::runtime::register_context(bi, &ctx_id, creator_did, &[]).unwrap();
 
-        if with_tool {
+        if with_outlet {
             crate::runtime::with_context(bi, &ctx_id, |rt| {
-                let registration = scp_core::context::tools::ToolRegistration {
-                    tool_id: "calculator".to_owned(),
+                let registration = scp_core::context::outlets::OutletRegistration {
+                    outlet_id: "calculator".to_owned(),
                     name: "Calculator".to_owned(),
                     description: "A simple calculator".to_owned(),
-                    schema: scp_core::context::tools::ToolSchema {
+                    schema: scp_core::context::outlets::OutletSchema {
                         input_schema: serde_json::json!({
                             "type": "object",
                             "properties": {
@@ -2624,8 +2624,8 @@ mod tests {
                     registered_at: 0,
                     signature: Vec::new(),
                 };
-                scp_core::context::tools::register_tool(
-                    &mut rt.tool_registry,
+                scp_core::context::outlets::register_outlet(
+                    &mut rt.outlet_registry,
                     &rt.role_state,
                     registration,
                     creator_did,
@@ -2684,7 +2684,7 @@ mod tests {
         let bi = __bi();
         let ctx_id = setup_test_context(&bi, creator, true);
 
-        // Add a member with no ToolInvoke capability.
+        // Add a member with no OutletInvoke capability.
         let member = "did:dht:z6MkMemberNoInvoke";
         crate::runtime::with_context(&bi, &ctx_id, |rt| {
             rt.role_state.members.insert(member.to_owned());
@@ -2725,8 +2725,8 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn ffi_bridge_provider_invoke_tool_echo_fallback_without_handler() {
-        let creator = "did:dht:z6MkCreatorInvokeTool";
+    fn ffi_bridge_provider_invoke_outlet_echo_fallback_without_handler() {
+        let creator = "did:dht:z6MkCreatorInvokeOutlet";
         let bi = __bi();
         let ctx_id = setup_test_context(&bi, creator, true);
 
@@ -2758,12 +2758,12 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // FfiBridgeProvider::invoke_tool — appends ToolInvokedEvent to event log
+    // FfiBridgeProvider::invoke_tool — appends OutletInvokedEvent to event log
     // (ADR-010 acceptance criterion 3, issue #120)
     // -----------------------------------------------------------------------
 
     #[test]
-    fn invoke_tool_echo_mode_appends_tool_invoked_event() {
+    fn invoke_outlet_echo_mode_appends_outlet_invoked_event() {
         let creator = "did:dht:z6MkCreatorEventLog";
         let bi = __bi();
         let ctx_id = setup_test_context(&bi, creator, true);
@@ -2818,19 +2818,19 @@ mod tests {
     }
 
     #[test]
-    fn invoke_tool_with_handler_appends_tool_invoked_event() {
+    fn invoke_outlet_with_handler_appends_outlet_invoked_event() {
         let creator = "did:dht:z6MkCreatorHandlerEventLog";
         let bi = __bi();
         let ctx_id = setup_test_context(&bi, creator, true);
 
         // Register a handler.
-        let handler: crate::runtime::ToolHandler =
+        let handler: crate::runtime::OutletHandler =
             std::sync::Arc::new(|input: serde_json::Value| {
                 let a = input["a"].as_f64().unwrap_or(0.0);
                 let b = input["b"].as_f64().unwrap_or(0.0);
                 Ok(serde_json::json!({"result": a + b}))
             });
-        crate::runtime::register_tool_handler(&bi, &ctx_id, "calculator", handler).unwrap();
+        crate::runtime::register_outlet_handler(&bi, &ctx_id, "calculator", handler).unwrap();
 
         let provider = FfiBridgeProvider {
             bi: Arc::downgrade(&bi),
@@ -2868,7 +2868,7 @@ mod tests {
     }
 
     #[test]
-    fn invoke_tool_error_does_not_append_event() {
+    fn invoke_outlet_error_does_not_append_event() {
         let creator = "did:dht:z6MkCreatorNoEventOnErr";
         let bi = __bi();
         let ctx_id = setup_test_context(&bi, creator, true);
@@ -2906,7 +2906,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn ffi_bridge_provider_invoke_tool_validates_schema() {
+    fn ffi_bridge_provider_invoke_outlet_validates_schema() {
         let creator = "did:dht:z6MkCreatorSchemaVal";
         let bi = __bi();
         let ctx_id = setup_test_context(&bi, creator, true);
@@ -2948,12 +2948,12 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // FfiBridgeProvider::invoke_tool — tool not found
+    // FfiBridgeProvider::invoke_tool — outlet not found
     // -----------------------------------------------------------------------
 
     #[test]
-    fn ffi_bridge_provider_invoke_tool_rejects_unknown_tool() {
-        let creator = "did:dht:z6MkCreatorUnknownTool";
+    fn ffi_bridge_provider_invoke_outlet_rejects_unknown_outlet() {
+        let creator = "did:dht:z6MkCreatorUnknownOutlet";
         let bi = __bi();
         let ctx_id = setup_test_context(&bi, creator, false);
 
@@ -2968,11 +2968,11 @@ mod tests {
         };
 
         let result = provider.invoke_tool(&ctx_id, "nonexistent", serde_json::json!({}));
-        assert!(result.is_err(), "unknown tool should be rejected");
+        assert!(result.is_err(), "unknown outlet should be rejected");
         let err = result.unwrap_err();
         assert!(
             err.contains("not found"),
-            "error should mention tool not found: {err}"
+            "error should mention outlet not found: {err}"
         );
 
         crate::runtime::remove_context(&bi, &ctx_id);
@@ -3096,17 +3096,17 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Tool handler registration and dispatch (SCP-212)
+    // Outlet handler registration and dispatch (SCP-212)
     // -----------------------------------------------------------------------
 
     #[test]
-    fn register_tool_handler_and_invoke_dispatches_through_handler() {
+    fn register_outlet_handler_and_invoke_dispatches_through_handler() {
         let creator = "did:dht:z6MkCreatorHandler";
         let bi = __bi();
         let ctx_id = setup_test_context(&bi, creator, true);
 
         // Register a Rust handler that adds two numbers (simulates a Python handler).
-        let handler: crate::runtime::ToolHandler =
+        let handler: crate::runtime::OutletHandler =
             std::sync::Arc::new(|input: serde_json::Value| {
                 let a = input
                     .get("a")
@@ -3119,7 +3119,7 @@ mod tests {
                 Ok(serde_json::json!({"result": a + b}))
             });
 
-        crate::runtime::register_tool_handler(&bi, &ctx_id, "calculator", handler).unwrap();
+        crate::runtime::register_outlet_handler(&bi, &ctx_id, "calculator", handler).unwrap();
 
         let provider = FfiBridgeProvider {
             bi: Arc::downgrade(&bi),
@@ -3152,40 +3152,40 @@ mod tests {
     }
 
     #[test]
-    fn register_tool_handler_rejects_unregistered_tool() {
+    fn register_outlet_handler_rejects_unregistered_outlet() {
         let creator = "did:dht:z6MkCreatorHandlerReject";
         let bi = __bi();
-        let ctx_id = setup_test_context(&bi, creator, false); // No tool registered.
+        let ctx_id = setup_test_context(&bi, creator, false); // No outlet registered.
 
-        let handler: crate::runtime::ToolHandler =
+        let handler: crate::runtime::OutletHandler =
             std::sync::Arc::new(|_input| Ok(serde_json::json!({})));
 
-        let result = crate::runtime::register_tool_handler(&bi, &ctx_id, "nonexistent", handler);
+        let result = crate::runtime::register_outlet_handler(&bi, &ctx_id, "nonexistent", handler);
         assert!(
             result.is_err(),
-            "should reject handler for unregistered tool"
+            "should reject handler for unregistered outlet"
         );
         let err = format!("{}", result.unwrap_err());
         assert!(
             err.contains("not found"),
-            "error should mention tool not found: {err}"
+            "error should mention outlet not found: {err}"
         );
 
         crate::runtime::remove_context(&bi, &ctx_id);
     }
 
     #[test]
-    fn invoke_tool_with_handler_validates_output_schema() {
+    fn invoke_outlet_with_handler_validates_output_schema() {
         let creator = "did:dht:z6MkCreatorOutVal";
         let bi = __bi();
         let ctx_id = setup_test_context(&bi, creator, true);
 
         // Register a handler that returns a string instead of an object
         // (violates the output schema which requires an object).
-        let bad_handler: crate::runtime::ToolHandler =
+        let bad_handler: crate::runtime::OutletHandler =
             std::sync::Arc::new(|_input| Ok(serde_json::json!("not an object")));
 
-        crate::runtime::register_tool_handler(&bi, &ctx_id, "calculator", bad_handler).unwrap();
+        crate::runtime::register_outlet_handler(&bi, &ctx_id, "calculator", bad_handler).unwrap();
 
         let provider = FfiBridgeProvider {
             bi: Arc::downgrade(&bi),
@@ -3213,16 +3213,16 @@ mod tests {
     }
 
     #[test]
-    fn invoke_tool_handler_error_is_propagated() {
+    fn invoke_outlet_handler_error_is_propagated() {
         let creator = "did:dht:z6MkCreatorHandlerErr";
         let bi = __bi();
         let ctx_id = setup_test_context(&bi, creator, true);
 
         // Register a handler that always fails.
-        let failing_handler: crate::runtime::ToolHandler =
+        let failing_handler: crate::runtime::OutletHandler =
             std::sync::Arc::new(|_input| Err("computation exploded".to_owned()));
 
-        crate::runtime::register_tool_handler(&bi, &ctx_id, "calculator", failing_handler).unwrap();
+        crate::runtime::register_outlet_handler(&bi, &ctx_id, "calculator", failing_handler).unwrap();
 
         let provider = FfiBridgeProvider {
             bi: Arc::downgrade(&bi),
@@ -3247,22 +3247,22 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Tool handler execution timeout (issue #123)
+    // Outlet handler execution timeout (issue #123)
     // -----------------------------------------------------------------------
 
     #[test]
-    fn invoke_tool_handler_timeout_produces_clear_error() {
+    fn invoke_outlet_handler_timeout_produces_clear_error() {
         let creator = "did:dht:z6MkCreatorTimeout";
         let bi = __bi();
         let ctx_id = setup_test_context(&bi, creator, true);
 
         // Register a handler that blocks for 5 seconds (will be timed out).
-        let blocking_handler: crate::runtime::ToolHandler = std::sync::Arc::new(|_input| {
+        let blocking_handler: crate::runtime::OutletHandler = std::sync::Arc::new(|_input| {
             std::thread::sleep(std::time::Duration::from_secs(5));
             Ok(serde_json::json!({"result": 42}))
         });
 
-        crate::runtime::register_tool_handler(&bi, &ctx_id, "calculator", blocking_handler)
+        crate::runtime::register_outlet_handler(&bi, &ctx_id, "calculator", blocking_handler)
             .unwrap();
 
         let provider = FfiBridgeProvider {
@@ -3292,13 +3292,13 @@ mod tests {
     }
 
     #[test]
-    fn invoke_tool_handler_completes_within_timeout_succeeds() {
+    fn invoke_outlet_handler_completes_within_timeout_succeeds() {
         let creator = "did:dht:z6MkCreatorTimeoutOk";
         let bi = __bi();
         let ctx_id = setup_test_context(&bi, creator, true);
 
         // Register a fast handler.
-        let fast_handler: crate::runtime::ToolHandler =
+        let fast_handler: crate::runtime::OutletHandler =
             std::sync::Arc::new(|input: serde_json::Value| {
                 let a = input
                     .get("a")
@@ -3311,7 +3311,7 @@ mod tests {
                 Ok(serde_json::json!({"result": a + b}))
             });
 
-        crate::runtime::register_tool_handler(&bi, &ctx_id, "calculator", fast_handler).unwrap();
+        crate::runtime::register_outlet_handler(&bi, &ctx_id, "calculator", fast_handler).unwrap();
 
         let provider = FfiBridgeProvider {
             bi: Arc::downgrade(&bi),
@@ -3340,11 +3340,11 @@ mod tests {
     }
 
     #[test]
-    fn invoke_tool_handler_default_timeout_is_30s() {
+    fn invoke_outlet_handler_default_timeout_is_30s() {
         // Verify the default timeout constant matches scp-core.
         assert_eq!(
             FFI_TOOL_TIMEOUT_MS,
-            u64::from(scp_core::context::tools::DEFAULT_TIMEOUT_MS),
+            u64::from(scp_core::context::outlets::DEFAULT_TIMEOUT_MS),
             "FFI default timeout should match scp-core default"
         );
     }
@@ -3653,7 +3653,7 @@ mod tests {
         );
 
         // validate_capability: returns Err.
-        let vc = provider.validate_capability("ctx-dropped", "anytool");
+        let vc = provider.validate_capability("ctx-dropped", "anyoutlet");
         assert!(
             vc.is_err(),
             "validate_capability must reject when bridge is dropped"

@@ -72,7 +72,7 @@ pub struct NapiParticipationRecord {
     pub governance_actions_against: i64,
     /// Count of governance actions initiated by this identity.
     pub governance_actions_by: i64,
-    /// Total tool invocations across all tool types.
+    /// Total outlet invocations across all outlet types.
     pub tool_invocation_count: i64,
     /// Whether `tool_invocation_count` is anchored in the canonical Merkle log
     /// (`false` until ADR-051; consumers MUST NOT treat it as Merkle-proven).

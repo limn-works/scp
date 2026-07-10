@@ -55,20 +55,20 @@ pub struct NapiMcpServerConfig {
 /// Tool definition from an external MCP server.
 #[napi(object)]
 pub struct NapiMcpToolInfo {
-    /// Tool name.
+    /// Outlet name.
     pub name: String,
     /// Human-readable description.
     pub description: String,
-    /// JSON Schema for tool input (as a JSON string).
+    /// JSON Schema for outlet input (as a JSON string).
     pub input_schema_json: String,
 }
 
 /// Result of invoking an external MCP tool with SCP provenance.
 #[napi(object)]
 pub struct NapiMcpInvokeResult {
-    /// Tool output content as serialized JSON.
+    /// Outlet output content as serialized JSON.
     pub content_json: String,
-    /// Whether the tool call resulted in an error.
+    /// Whether the outlet call resulted in an error.
     pub is_error: bool,
     /// Source of the result, formatted as `"mcp:{tool_name}"`.
     pub source: String,
@@ -334,7 +334,7 @@ impl McpTransport for SseMcpTransport {
 // ---------------------------------------------------------------------------
 
 /// FFI bridge provider for the MCP server. Implements `ContextProvider` by
-/// delegating to the context manager for tool and state queries.
+/// delegating to the context manager for outlet and state queries.
 struct McpNapiBridgeProvider {
     agent_did: String,
     context_ids: Vec<String>,
@@ -384,7 +384,7 @@ impl ContextProvider for McpNapiBridgeProvider {
         _arguments: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
         Err(
-            "tool invocation through MCP server requires Supervisor tool registry integration"
+            "outlet invocation through MCP server requires Supervisor outlet registry integration"
                 .to_owned(),
         )
     }
@@ -710,14 +710,14 @@ pub(crate) async fn mcp_client_list_tools_on(
         })
     })?;
 
-    let tools = client_guard.list_tools().map_err(|e| {
+    let outlets = client_guard.list_tools().map_err(|e| {
         napi::Error::from(ScpNapiError::Transport {
             message: format!("tools/list failed: {e}"),
             code: codes::TRANS_5022.to_owned(),
         })
     })?;
 
-    Ok(tools
+    Ok(outlets
         .into_iter()
         .map(|t| NapiMcpToolInfo {
             name: t.name,

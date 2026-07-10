@@ -14,9 +14,9 @@
 //! - `petname_resolve_context` -- Resolve a petname to context IDs.
 //! - `petname_get_for_did` -- Get the petname for a DID.
 //! - `petname_get_for_context` -- Get the petname for a context.
-//! - `handle_register` -- Register a handle in a context with discovery tools.
-//! - `handle_lookup` -- Look up a handle in a context with discovery tools.
-//! - `handle_deregister` -- Deregister a handle from a context with discovery tools.
+//! - `handle_register` -- Register a handle in a context with discovery outlets.
+//! - `handle_lookup` -- Look up a handle in a context with discovery outlets.
+//! - `handle_deregister` -- Deregister a handle from a context with discovery outlets.
 //! - `address_resolve` -- Resolve an address via multi-path resolution.
 //!
 //! See ADR-020 in `.docs/adrs/phase-4.md` and spec section 22 (Addressing).

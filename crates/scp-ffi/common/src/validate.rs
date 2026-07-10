@@ -65,11 +65,11 @@ pub const MAX_CONTEXT_ID_LEN: usize = 256;
 /// allow generous headroom for other methods.
 pub const MAX_DID_LEN: usize = 512;
 
-/// Maximum length for a tool name.
-pub const MAX_TOOL_NAME_LEN: usize = 256;
+/// Maximum length for a outlet name.
+pub const MAX_OUTLET_NAME_LEN: usize = 256;
 
-/// Maximum length for a tool ID (spec §5.4.1).
-pub const MAX_TOOL_ID_LEN: usize = 128;
+/// Maximum length for a outlet ID (spec §5.4.1).
+pub const MAX_OUTLET_ID_LEN: usize = 128;
 
 /// Maximum length for a capability URI string.
 pub const MAX_CAPABILITY_URI_LEN: usize = 1024;
@@ -309,62 +309,62 @@ pub fn validate_did(did: &str) -> Result<(), ValidationError> {
 }
 
 // ---------------------------------------------------------------------------
-// Tool name / ID validation
+// Outlet name / ID validation
 // ---------------------------------------------------------------------------
 
-/// Validates a tool name string.
+/// Validates a outlet name string.
 ///
-/// Tool names are human-readable identifiers used in tool registration.
+/// Outlet names are human-readable identifiers used in outlet registration.
 /// Validation enforces:
 /// - Non-empty
-/// - Length <= [`MAX_TOOL_NAME_LEN`]
+/// - Length <= [`MAX_OUTLET_NAME_LEN`]
 /// - No control characters
 /// - No characters that could cause issues in format strings (`{`, `}`)
 ///
 /// # Errors
 ///
-/// Returns [`ValidationError`] if the tool name is empty,
+/// Returns [`ValidationError`] if the outlet name is empty,
 /// too long, contains control characters, or contains format string
 /// characters.
-pub fn validate_tool_name(name: &str) -> Result<(), ValidationError> {
-    validate_non_empty(name, "tool name", MAX_TOOL_NAME_LEN)?;
-    reject_control_chars(name, "tool name")?;
-    reject_html_special_chars(name, "tool name")?;
+pub fn validate_outlet_name(name: &str) -> Result<(), ValidationError> {
+    validate_non_empty(name, "outlet name", MAX_OUTLET_NAME_LEN)?;
+    reject_control_chars(name, "outlet name")?;
+    reject_html_special_chars(name, "outlet name")?;
 
     if name.contains('{') || name.contains('}') {
         return Err(ValidationError::new(format!(
-            "tool name must not contain '{{' or '}}' (format string risk), got {name:?}"
+            "outlet name must not contain '{{' or '}}' (format string risk), got {name:?}"
         )));
     }
 
     Ok(())
 }
 
-/// Validates a tool ID string.
+/// Validates a outlet ID string.
 ///
-/// Tool IDs are derived from tool names (e.g., `tool-my-tool`). Per spec
-/// §5.4.1, tool IDs must contain only lowercase alphanumeric characters,
+/// Outlet IDs are derived from outlet names (e.g., `outlet-my-outlet`). Per spec
+/// §5.4.1, outlet IDs must contain only lowercase alphanumeric characters,
 /// hyphens, and underscores (`[a-z0-9_-]`). Validation enforces:
 /// - Non-empty
-/// - Length <= [`MAX_TOOL_ID_LEN`] (128 chars per §5.4.1)
+/// - Length <= [`MAX_OUTLET_ID_LEN`] (128 chars per §5.4.1)
 /// - Characters restricted to `[a-z0-9_-]`
 /// - No control characters
 ///
 /// # Errors
 ///
-/// Returns [`ValidationError`] if the tool ID is empty,
+/// Returns [`ValidationError`] if the outlet ID is empty,
 /// too long, contains control characters, or contains characters outside
 /// the `[a-z0-9_-]` class.
-pub fn validate_tool_id(tool_id: &str) -> Result<(), ValidationError> {
-    validate_non_empty(tool_id, "tool_id", MAX_TOOL_ID_LEN)?;
-    reject_control_chars(tool_id, "tool_id")?;
+pub fn validate_outlet_id(outlet_id: &str) -> Result<(), ValidationError> {
+    validate_non_empty(outlet_id, "outlet_id", MAX_OUTLET_ID_LEN)?;
+    reject_control_chars(outlet_id, "outlet_id")?;
 
-    if !tool_id
+    if !outlet_id
         .chars()
         .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
     {
         return Err(ValidationError::new(format!(
-            "tool_id contains invalid characters: expected [a-z0-9_-], got {tool_id:?}"
+            "outlet_id contains invalid characters: expected [a-z0-9_-], got {outlet_id:?}"
         )));
     }
 
@@ -488,7 +488,7 @@ pub fn validate_relay_url(url: &str) -> Result<(), ValidationError> {
 ///
 /// Defense-in-depth at the FFI boundary, mirroring the project's
 /// pattern for every other caller-supplied string (DID, relay URL,
-/// tool name, etc.). The caller is in-process trusted code, but
+/// outlet name, etc.). The caller is in-process trusted code, but
 /// the consistency matters: error and tracing paths may otherwise
 /// surface unsanitized control characters from this single un-validated
 /// string into logs (log injection via embedded ANSI / CRLF).
@@ -681,7 +681,7 @@ pub fn validate_payment_adapter_ref(adapter_ref: &str) -> Result<(), ValidationE
 /// deserialization and before passing the action to the `ContextManager`.
 ///
 /// Covers role names, reason/purpose text, payment adapter refs, and
-/// nested string fields inside `ContextParams` and `ToolRegistration`.
+/// nested string fields inside `ContextParams` and `OutletRegistration`.
 ///
 /// # Errors
 ///
@@ -730,7 +730,7 @@ pub fn validate_governance_action_strings(
             validate_economic_policy_strings(policy)?;
         }
         GovernanceAction::RegisterTool { registration } => {
-            validate_tool_name(&registration.name)?;
+            validate_outlet_name(&registration.name)?;
             validate_governance_reason(&registration.description)?;
         }
         GovernanceAction::CreateChildContext { params } => {
@@ -792,16 +792,16 @@ fn validate_economic_policy_strings(
 /// Validates user-controlled string fields inside a [`ContextParams`].
 ///
 /// Checks role names in role definitions and payment adapter refs in
-/// economic policy. Tool registration names/descriptions are also validated.
+/// economic policy. Outlet registration names/descriptions are also validated.
 fn validate_context_params_strings(
     params: &scp_protocol::context::params::ContextParams,
 ) -> Result<(), ValidationError> {
     for role_def in &params.roles {
         validate_role_name(&role_def.name)?;
     }
-    for tool_reg in &params.tools {
-        validate_tool_name(&tool_reg.name)?;
-        validate_governance_reason(&tool_reg.description)?;
+    for outlet_reg in &params.tools {
+        validate_outlet_name(&outlet_reg.name)?;
+        validate_governance_reason(&outlet_reg.description)?;
     }
     if let Some(policy) = &params.economic_policy {
         validate_economic_policy_strings(policy)?;
@@ -1046,80 +1046,80 @@ mod tests {
         assert!(err.message.contains("control character"));
     }
 
-    // -- Tool name --
+    // -- Outlet name --
 
     #[test]
-    fn valid_tool_name() {
-        assert!(validate_tool_name("my-tool").is_ok());
+    fn valid_outlet_name() {
+        assert!(validate_outlet_name("my-outlet").is_ok());
     }
 
     #[test]
-    fn empty_tool_name_rejected() {
-        let err = validate_tool_name("").unwrap_err();
+    fn empty_outlet_name_rejected() {
+        let err = validate_outlet_name("").unwrap_err();
         assert!(err.message.contains("must not be empty"));
     }
 
     #[test]
-    fn tool_name_with_braces_rejected() {
-        let err = validate_tool_name("tool-{name}").unwrap_err();
+    fn outlet_name_with_braces_rejected() {
+        let err = validate_outlet_name("outlet-{name}").unwrap_err();
         assert!(err.message.contains("format string risk"));
     }
 
     #[test]
-    fn tool_name_too_long_rejected() {
-        let long_name = "a".repeat(MAX_TOOL_NAME_LEN + 1);
-        let err = validate_tool_name(&long_name).unwrap_err();
+    fn outlet_name_too_long_rejected() {
+        let long_name = "a".repeat(MAX_OUTLET_NAME_LEN + 1);
+        let err = validate_outlet_name(&long_name).unwrap_err();
         assert!(err.message.contains("exceeds maximum length"));
     }
 
-    // -- Tool ID --
+    // -- Outlet ID --
 
     #[test]
-    fn valid_tool_id() {
-        assert!(validate_tool_id("tool-my-tool").is_ok());
+    fn valid_outlet_id() {
+        assert!(validate_outlet_id("outlet-my-outlet").is_ok());
     }
 
     #[test]
-    fn valid_tool_id_with_underscores_and_digits() {
-        assert!(validate_tool_id("my_tool_42").is_ok());
+    fn valid_outlet_id_with_underscores_and_digits() {
+        assert!(validate_outlet_id("my_outlet_42").is_ok());
     }
 
     #[test]
-    fn empty_tool_id_rejected() {
-        let err = validate_tool_id("").unwrap_err();
+    fn empty_outlet_id_rejected() {
+        let err = validate_outlet_id("").unwrap_err();
         assert!(err.message.contains("must not be empty"));
     }
 
     #[test]
-    fn tool_id_with_uppercase_rejected() {
-        let err = validate_tool_id("Tool-My-Tool").unwrap_err();
+    fn outlet_id_with_uppercase_rejected() {
+        let err = validate_outlet_id("Outlet-My-Outlet").unwrap_err();
         assert!(err.message.contains("invalid characters"));
         assert!(err.message.contains("[a-z0-9_-]"));
     }
 
     #[test]
-    fn tool_id_with_spaces_rejected() {
-        let err = validate_tool_id("tool my tool").unwrap_err();
+    fn outlet_id_with_spaces_rejected() {
+        let err = validate_outlet_id("outlet my outlet").unwrap_err();
         assert!(err.message.contains("invalid characters"));
     }
 
     #[test]
-    fn tool_id_with_special_chars_rejected() {
-        let err = validate_tool_id("tool/my.tool").unwrap_err();
+    fn outlet_id_with_special_chars_rejected() {
+        let err = validate_outlet_id("outlet/my.outlet").unwrap_err();
         assert!(err.message.contains("invalid characters"));
     }
 
     #[test]
-    fn tool_id_too_long_rejected() {
-        let long_id = "a".repeat(MAX_TOOL_ID_LEN + 1);
-        let err = validate_tool_id(&long_id).unwrap_err();
+    fn outlet_id_too_long_rejected() {
+        let long_id = "a".repeat(MAX_OUTLET_ID_LEN + 1);
+        let err = validate_outlet_id(&long_id).unwrap_err();
         assert!(err.message.contains("exceeds maximum length"));
     }
 
     #[test]
-    fn tool_id_at_max_length_accepted() {
-        let id = "a".repeat(MAX_TOOL_ID_LEN);
-        assert!(validate_tool_id(&id).is_ok());
+    fn outlet_id_at_max_length_accepted() {
+        let id = "a".repeat(MAX_OUTLET_ID_LEN);
+        assert!(validate_outlet_id(&id).is_ok());
     }
 
     // -- Capability URI --
@@ -1536,16 +1536,16 @@ mod tests {
     // -- Governance action string validation --
 
     #[test]
-    fn governance_action_register_tool_braces_in_name_rejected() {
+    fn governance_action_register_outlet_braces_in_name_rejected() {
         use scp_protocol::context::governance::GovernanceAction;
-        use scp_protocol::context::tools::registry::{ToolRegistration, ToolSchema};
+        use scp_protocol::context::outlets::registry::{OutletRegistration, OutletSchema};
 
         let action = GovernanceAction::RegisterTool {
-            registration: Box::new(ToolRegistration {
-                tool_id: "test-tool".to_owned(),
-                name: "tool-{inject}".to_owned(),
-                description: "a tool".to_owned(),
-                schema: ToolSchema {
+            registration: Box::new(OutletRegistration {
+                outlet_id: "test-outlet".to_owned(),
+                name: "outlet-{inject}".to_owned(),
+                description: "a outlet".to_owned(),
+                schema: OutletSchema {
                     input_schema: serde_json::json!({"type": "object"}),
                     output_schema: serde_json::json!({"type": "object"}),
                 },
@@ -1562,16 +1562,16 @@ mod tests {
     }
 
     #[test]
-    fn governance_action_register_tool_html_in_description_rejected() {
+    fn governance_action_register_outlet_html_in_description_rejected() {
         use scp_protocol::context::governance::GovernanceAction;
-        use scp_protocol::context::tools::registry::{ToolRegistration, ToolSchema};
+        use scp_protocol::context::outlets::registry::{OutletRegistration, OutletSchema};
 
         let action = GovernanceAction::RegisterTool {
-            registration: Box::new(ToolRegistration {
-                tool_id: "test-tool".to_owned(),
-                name: "my-tool".to_owned(),
-                description: "a <script>alert(1)</script> tool".to_owned(),
-                schema: ToolSchema {
+            registration: Box::new(OutletRegistration {
+                outlet_id: "test-outlet".to_owned(),
+                name: "my-outlet".to_owned(),
+                description: "a <script>alert(1)</script> outlet".to_owned(),
+                schema: OutletSchema {
                     input_schema: serde_json::json!({"type": "object"}),
                     output_schema: serde_json::json!({"type": "object"}),
                 },
