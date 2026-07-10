@@ -1258,4 +1258,161 @@ mod tests {
         handle.send_shutdown().await.expect("shutdown acks");
         actor_task.await.expect("actor task joins");
     }
+
+    /// Regression guard for ADR-049 finding **N1** (PR-2 caller audit): a handler
+    /// that mutates Class-C via `class_c_view()` but reports `Outcome::ok`
+    /// (`mutated:false`) leaves `dirty` clear, so the run loop's Arm-4 coalesce
+    /// tick never fires and the mutation is lost on crash.
+    ///
+    /// `SeedPeerPseudonym` was exactly such a handler: it records a peer routing
+    /// pseudonym into the `Pseudonymous` registry through `class_c_view()` (NO
+    /// co-located persist) and used to return `Outcome::ok`. The PR-2 fix makes it
+    /// report `Outcome::ok_mutated` on a successful insert.
+    ///
+    /// This uses the **coalesce-tick** model (like
+    /// [`coalesced_class_c_mutation_is_durable_across_coalesce_tick`]), NOT a
+    /// shutdown drain: the drain cannot validate a handler's `mutated` flag,
+    /// because the `Shutdown` handler ITSELF reports `mutated` and dirties the
+    /// actor, so the drain fires (persisting the whole live state, which already
+    /// carries the in-memory insert) regardless of the seed handler's flag. Here
+    /// the assertion runs while the actor is STILL LIVE, off the Arm-4 tick that
+    /// fires only when `dirty` is set — so with the pre-fix `Outcome::ok` handler
+    /// `dirty` stays false, the tick never fires, and `persisted.notified()` times
+    /// out in bounded virtual time (a genuine failure, empirically verified).
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn coalesced_seed_peer_pseudonym_is_durable_across_coalesce_tick() {
+        let recorder = RecordingPersistence::new();
+        let deps = new_test_deps_with_persistence(Box::new(recorder.clone())).await;
+        // Pause AFTER building deps so `build_actor_deps` runs under real time and
+        // the actor's `last_persisted_at` is captured against the now-frozen clock.
+        tokio::time::pause();
+        let ctx = ctx_hex(0x53);
+        let member = "did:example:coalesced-seed-peer-member";
+        let pseudonym = [0x77u8; 32];
+        let state = writable_encrypted_state(0x53, member);
+
+        let (tx, rx) = mpsc::channel::<ContextCommand>(4);
+        let actor = ContextActor::new(state, deps, rx);
+        let actor_task = tokio::spawn(actor.run());
+        let handle = ContextActorHandle::from_sender(tx);
+
+        // Record a peer pseudonym — a coalesced Class-C mutation with NO co-located
+        // persist (routes through `class_c_view`). Awaiting the reply also proves
+        // the live in-memory insert succeeded.
+        handle
+            .send(|reply| {
+                ContextCommand::Messaging(MessagingCommand::SeedPeerPseudonym {
+                    context_id: ctx.clone(),
+                    member_did: scp_did::DID(member.to_owned()),
+                    pseudonym,
+                    reply,
+                })
+            })
+            .await
+            .expect("seed-peer-pseudonym round-trips through the state-owning actor");
+
+        // Advance past the coalescing window so Arm-4 fires while the actor is still
+        // running (NO shutdown/drain). With the pre-fix `Outcome::ok` handler
+        // `dirty` stays false, Arm-4 never fires, and this `notified()` times out.
+        tokio::time::advance(COALESCE_INTERVAL + std::time::Duration::from_millis(1)).await;
+        tokio::time::timeout(COALESCE_INTERVAL * 20, recorder.persisted.notified())
+            .await
+            .expect("Arm-4 coalesce tick must persist the seeded pseudonym within the window");
+
+        let snapshot = recorder
+            .last_snapshot()
+            .expect("the coalesce tick must have persisted a snapshot (ADR-049 §Decision 9 / N1)");
+        let registry = snapshot
+            .routing
+            .peer_registry()
+            .expect("the encrypted test context must persist a Pseudonymous peer registry");
+        assert_eq!(
+            registry.get(&scp_did::DID(member.to_owned())),
+            Some(&pseudonym),
+            "the coalesced peer-pseudonym mutation must be durable after the Arm-4 tick",
+        );
+
+        handle.send_shutdown().await.expect("shutdown acks");
+        actor_task.await.expect("actor task joins");
+    }
+
+    /// Regression guard for ADR-049 finding **N1** (PR-2): `TestInsertMember`
+    /// records a member — roster insert, `system_assign_role`, and membership add —
+    /// through `class_c_view()` with NO co-located persist, and used to return
+    /// `Outcome::ok` (`mutated:false`), so a `<=50ms` crash silently lost the
+    /// member. The PR-2 fix reports `Outcome::ok_mutated` on a successful insert.
+    ///
+    /// Same **coalesce-tick** model as the sibling pseudonym test (the assertion
+    /// runs while the actor is live, so the shutdown drain cannot mask a false
+    /// flag): with the pre-fix `Outcome::ok` handler `dirty` stays false, Arm-4
+    /// never fires, and `persisted.notified()` times out (empirically verified).
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn coalesced_test_insert_member_is_durable_across_coalesce_tick() {
+        use scp_protocol::context::roles::{builtin_roles, default_ceiling};
+
+        let recorder = RecordingPersistence::new();
+        let deps = new_test_deps_with_persistence(Box::new(recorder.clone())).await;
+        tokio::time::pause();
+        let ctx = ctx_hex(0x54);
+        let admin = "did:example:coalesced-insert-admin";
+        let new_member = "did:example:coalesced-insert-member";
+        let mut state = writable_encrypted_state(0x54, admin);
+        // `TestInsertMember` calls `system_assign_role("member")`, which requires
+        // that role to be DEFINED within the context ceiling. The bare test fixture
+        // starts with an empty ceiling / no role definitions, so seed the standard
+        // ceiling + built-in roles (the same "member" role a real `create_context`
+        // installs) before driving the insert.
+        let ceiling = default_ceiling();
+        state
+            .role_state
+            .set_ceiling(ceiling.clone())
+            .expect("seed the default ceiling for the member role definition");
+        for role in builtin_roles(&ceiling) {
+            state
+                .role_state
+                .role_definitions
+                .insert(role.name.clone(), role);
+        }
+
+        let (tx, rx) = mpsc::channel::<ContextCommand>(4);
+        let actor = ContextActor::new(state, deps, rx);
+        let actor_task = tokio::spawn(actor.run());
+        let handle = ContextActorHandle::from_sender(tx);
+
+        // Insert a second member — a coalesced Class-C structural mutation with NO
+        // co-located persist. Awaiting the reply proves the live insert succeeded.
+        handle
+            .send(|reply| {
+                ContextCommand::Messaging(MessagingCommand::TestInsertMember {
+                    context_id: ctx.clone(),
+                    member_did: scp_did::DID(new_member.to_owned()),
+                    role: "member".to_owned(),
+                    reply,
+                })
+            })
+            .await
+            .expect("test-insert-member round-trips through the state-owning actor");
+
+        tokio::time::advance(COALESCE_INTERVAL + std::time::Duration::from_millis(1)).await;
+        tokio::time::timeout(COALESCE_INTERVAL * 20, recorder.persisted.notified())
+            .await
+            .expect("Arm-4 coalesce tick must persist the inserted member within the window");
+
+        let snapshot = recorder
+            .last_snapshot()
+            .expect("the coalesce tick must have persisted a snapshot (ADR-049 §Decision 9 / N1)");
+        assert!(
+            snapshot.role_state.members.contains(new_member),
+            "the coalesced role-state member insert must be durable after the Arm-4 tick",
+        );
+        assert!(
+            snapshot.membership.contains(new_member),
+            "the coalesced membership add must be durable after the Arm-4 tick",
+        );
+
+        handle.send_shutdown().await.expect("shutdown acks");
+        actor_task.await.expect("actor task joins");
+    }
 }

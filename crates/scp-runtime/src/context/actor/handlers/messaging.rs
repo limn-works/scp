@@ -197,8 +197,19 @@ fn handle_seed_peer_pseudonym(
             Ok(())
         },
     );
+    // ADR-049 §Decision 9 / finding N1: the peer-registry insert is a coalesced
+    // Class-C mutation with NO co-located persist — its durability rides ENTIRELY
+    // on the run loop marking itself dirty from this handler's `mutated` flag. A
+    // successful insert therefore MUST report `ok_mutated`, else a ≤50 ms crash
+    // silently loses the seeded pseudonym. The reject arm
+    // (`NotPseudonymousContext`, a broadcast context with no peer registry) never
+    // touched the view, so it reports `err` (unmutated).
+    let outcome = match &result {
+        Ok(()) => Outcome::ok_mutated(()),
+        Err(e) => Outcome::err(outcome_error_sketch(e)),
+    };
     let _ = reply.send(result);
-    Outcome::ok(())
+    outcome
 }
 
 /// Handle [`MessagingCommand::TestInsertMember`] (actor-shape, test-only).
@@ -223,8 +234,16 @@ fn handle_test_insert_member(
     // add all route through the non-persisting `class_c_view`. A member ADD is a
     // coalesce-window-rollback-acceptable structural change (ADR-049 §9), not a
     // downward-auth GROW, so it needs no fail-closed Class-S persist.
+    // Pre-mutation gate: an inactive context rejects BEFORE any `class_c_view`
+    // write, so nothing was mutated (`err`, mutated:false). Split OUT of the
+    // closure below so this clean reject is distinguishable from a post-mutation
+    // failure.
+    if let Err(e) = crate::context::state::require_active(&cell.handle) {
+        let sketch = outcome_error_sketch(&e);
+        let _ = reply.send(Err(e));
+        return Outcome::err(sketch);
+    }
     let result = (|| {
-        crate::context::state::require_active(&cell.handle)?;
         let tokens = {
             let mut view = cell.class_c_view();
             let mut role_state = view.role_state_class_c_mut();
@@ -240,8 +259,20 @@ fn handle_test_insert_member(
         );
         Ok(())
     })();
+    // ADR-049 §Decision 9 / finding N1: the roster insert, role assignment, and
+    // membership add are coalesced Class-C mutations with NO co-located persist —
+    // durability rides on this handler's `mutated` flag. A `mutated:false` here
+    // silently lost the inserted member on a ≤50 ms crash. The `members_mut()`
+    // insert lands BEFORE the only fallible step (`system_assign_role`), so ANY
+    // error out of the closure is a PARTIAL mutation → `err_mutated` (persist the
+    // partial state so the coalesced flush keeps the snapshot in sync); success →
+    // `ok_mutated` so the member + role survive respawn.
+    let outcome = match &result {
+        Ok(()) => Outcome::ok_mutated(()),
+        Err(e) => Outcome::err_mutated(outcome_error_sketch(e)),
+    };
     let _ = reply.send(result);
-    Outcome::ok(())
+    outcome
 }
 
 /// Handle [`MessagingCommand::TestInstallAccessKey`] (actor-shape, test-only).
