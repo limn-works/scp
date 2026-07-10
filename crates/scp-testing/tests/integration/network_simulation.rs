@@ -1098,8 +1098,8 @@ async fn application_layer_demo() {
     use scp_core::context::manager::ContextManager;
     use scp_core::context::membership::{ContextEvent, KeyPackage};
     use scp_core::context::roles::{CapabilityCeiling, ContextRoleState};
-    use scp_core::context::tools::registry::{ToolRegistration, ToolRegistry, ToolSchema};
-    use scp_core::context::tools::{invoke_tool, register_tool};
+    use scp_core::context::outlets::registry::{OutletRegistration, OutletRegistry, OutletSchema};
+    use scp_core::context::outlets::{invoke_outlet, register_outlet};
     use scp_core::context::{Capability, ContextParams, ContextState, GovernanceAction};
     use scp_did::DID;
 
@@ -1340,13 +1340,13 @@ async fn application_layer_demo() {
         .unwrap();
     }
 
-    let mut tool_registry = ToolRegistry::new();
+    let mut tool_registry = OutletRegistry::new();
 
-    let search_tool = ToolRegistration {
-        tool_id: "search-web".to_owned(),
+    let search_tool = OutletRegistration {
+        outlet_id: "search-web".to_owned(),
         name: "Web Search".to_owned(),
         description: "Search the web for information".to_owned(),
-        schema: ToolSchema {
+        schema: OutletSchema {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -1375,29 +1375,29 @@ async fn application_layer_demo() {
     };
 
     println!("  Registering tool: '{}'", search_tool.name);
-    println!("    tool_id:     {}", search_tool.tool_id);
+    println!("    tool_id:     {}", search_tool.outlet_id);
     println!("    operator:    {}", search_tool.operator_did);
     println!("    input:       query (string), max_results (integer)");
     println!("    output:      results (array), total (integer)");
 
     let (tool_id, reg_event) =
-        register_tool(&mut tool_registry, &role_state, search_tool, alice.as_ref()).unwrap();
+        register_outlet(&mut tool_registry, &role_state, search_tool, alice.as_ref()).unwrap();
 
     println!("  Registered! tool_id = {tool_id}");
     println!(
         "    event: tool_id={}, registrant={}",
-        reg_event.tool_id, reg_event.registrant_did
+        reg_event.outlet_id, reg_event.registrant_did
     );
     assert_eq!(tool_registry.len(), 1);
     println!("    registry size: {}", tool_registry.len());
     println!();
 
     // Register a second tool.
-    let calc_tool = ToolRegistration {
-        tool_id: "calculator".to_owned(),
+    let calc_tool = OutletRegistration {
+        outlet_id: "calculator".to_owned(),
         name: "Calculator".to_owned(),
         description: "Perform arithmetic operations".to_owned(),
-        schema: ToolSchema {
+        schema: OutletSchema {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -1423,7 +1423,7 @@ async fn application_layer_demo() {
     };
 
     let (calc_id, _) =
-        register_tool(&mut tool_registry, &role_state, calc_tool, alice.as_ref()).unwrap();
+        register_outlet(&mut tool_registry, &role_state, calc_tool, alice.as_ref()).unwrap();
     println!("  Registered tool: 'Calculator' (id={calc_id})");
     println!("    registry size: {}", tool_registry.len());
     assert_eq!(tool_registry.len(), 2);
@@ -1444,7 +1444,7 @@ async fn application_layer_demo() {
     println!("    input: {search_input}");
 
     // The executor is a real async function that simulates the tool.
-    let (output, invoke_event, _consequences, _receipt) = invoke_tool(
+    let (output, invoke_event, _consequences, _receipt) = invoke_outlet(
         &handle,
         &tool_registry,
         &role_state,
@@ -1464,7 +1464,7 @@ async fn application_layer_demo() {
                 "total": std::cmp::min(max, 2)
             }))
         },
-        None::<&mut scp_core::context::tools::invoke::ToolEconomyContext<'_>>,
+        None::<&mut scp_core::context::outlets::invoke::OutletEconomyContext<'_>>,
     )
     .await
     .unwrap();
@@ -1472,7 +1472,7 @@ async fn application_layer_demo() {
     println!("    output: {output}");
     println!(
         "    event:  tool={}, invoker={}, duration_ms={}",
-        invoke_event.tool_id, invoke_event.invoker_did, invoke_event.execution_time_ms
+        invoke_event.outlet_id, invoke_event.invoker_did, invoke_event.execution_time_ms
     );
     assert_eq!(output["total"], 2);
     println!();
@@ -1486,7 +1486,7 @@ async fn application_layer_demo() {
     println!("  Invoking 'calculator' as Charlie:");
     println!("    input: {calc_input}");
 
-    let (calc_output, _, _consequences, _receipt) = invoke_tool(
+    let (calc_output, _, _consequences, _receipt) = invoke_outlet(
         &handle,
         &tool_registry,
         &role_state,
@@ -1512,7 +1512,7 @@ async fn application_layer_demo() {
                 "operation": op
             }))
         },
-        None::<&mut scp_core::context::tools::invoke::ToolEconomyContext<'_>>,
+        None::<&mut scp_core::context::outlets::invoke::OutletEconomyContext<'_>>,
     )
     .await
     .unwrap();

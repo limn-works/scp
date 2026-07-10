@@ -34,7 +34,7 @@ use serde::Deserialize;
 // PyO3 bridge sources
 const PYO3_IDENTITY: &str = include_str!("../../../../crates/scp-ffi/src/identity.rs");
 const PYO3_CONTEXT: &str = include_str!("../../../../crates/scp-ffi/src/context.rs");
-const PYO3_TOOLS: &str = include_str!("../../../../crates/scp-ffi/src/tools.rs");
+const PYO3_TOOLS: &str = include_str!("../../../../crates/scp-ffi/src/outlets.rs");
 const PYO3_UCAN: &str = include_str!("../../../../crates/scp-ffi/src/ucan.rs");
 const PYO3_EVENT_LOG: &str = include_str!("../../../../crates/scp-ffi/src/event_log.rs");
 const PYO3_TRANSPORT: &str = include_str!("../../../../crates/scp-ffi/src/transport.rs");
@@ -74,7 +74,7 @@ const UNIFFI_SCP: &str = include_str!("../../../../crates/scp-ffi/uniffi/src/scp
 // NAPI bridge sources
 const NAPI_IDENTITY: &str = include_str!("../../../../crates/scp-ffi/napi/src/identity.rs");
 const NAPI_CONTEXT: &str = include_str!("../../../../crates/scp-ffi/napi/src/context.rs");
-const NAPI_TOOLS: &str = include_str!("../../../../crates/scp-ffi/napi/src/tools.rs");
+const NAPI_TOOLS: &str = include_str!("../../../../crates/scp-ffi/napi/src/outlets.rs");
 const NAPI_UCAN: &str = include_str!("../../../../crates/scp-ffi/napi/src/ucan.rs");
 const NAPI_EVENT_LOG: &str = include_str!("../../../../crates/scp-ffi/napi/src/event_log.rs");
 const NAPI_TRANSPORT: &str = include_str!("../../../../crates/scp-ffi/napi/src/transport.rs");

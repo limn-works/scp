@@ -21,8 +21,8 @@ use scp_core::context::governance::{
     verify_vote,
 };
 use scp_core::context::params::{Capability, ContextParams};
-use scp_core::context::tools::ToolSchema;
-use scp_core::context::tools::interface::ToolInterface;
+use scp_core::context::outlets::OutletSchema;
+use scp_core::context::outlets::interface::OutletInterface;
 use scp_core::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
 use scp_did::DID;
 
@@ -82,11 +82,11 @@ fn governance_context_for_members(
     }
 }
 
-fn simple_tool_interface() -> ToolInterface {
-    ToolInterface {
+fn simple_outlet_interface() -> OutletInterface {
+    OutletInterface {
         source_context: "ctx-src".to_owned(),
         target_context: "ctx-tgt".to_owned(),
-        tool_id: "tool-1".to_owned(),
+        outlet_id: "tool-1".to_owned(),
         rate_limit: None,
         inbound_rate_limit: None,
         per_caller_rate_limit: None,
@@ -114,12 +114,12 @@ fn simple_economic_policy() -> EconomicPolicy {
     }
 }
 
-fn simple_tool_registration() -> scp_core::context::params::ToolRegistration {
-    scp_core::context::params::ToolRegistration {
-        tool_id: "search".to_owned(),
+fn simple_outlet_registration() -> scp_core::context::params::OutletRegistration {
+    scp_core::context::params::OutletRegistration {
+        outlet_id: "search".to_owned(),
         name: "search".to_owned(),
         description: "Search tool".to_owned(),
-        schema: ToolSchema {
+        schema: OutletSchema {
             input_schema: serde_json::json!({"type": "object"}),
             output_schema: serde_json::json!({"type": "object"}),
         },
@@ -158,10 +158,10 @@ fn all_governance_actions_for_test() -> Vec<GovernanceAction> {
             new_role: "observer".to_owned(),
         },
         GovernanceAction::RegisterTool {
-            registration: Box::new(simple_tool_registration()),
+            registration: Box::new(simple_outlet_registration()),
         },
         GovernanceAction::RemoveTool {
-            tool_id: "search".to_owned(),
+            outlet_id: "search".to_owned(),
         },
         GovernanceAction::ModifyCeiling {
             new_ceiling: vec![Capability::MessagesRead],
@@ -191,7 +191,7 @@ fn all_governance_actions_for_test() -> Vec<GovernanceAction> {
         GovernanceAction::RemoveSigner { did: carol() },
         GovernanceAction::ModifyThreshold { new_threshold: 2 },
         GovernanceAction::EstablishToolInterface {
-            interface: simple_tool_interface(),
+            interface: simple_outlet_interface(),
         },
         GovernanceAction::ResetMember {
             did: bob(),
