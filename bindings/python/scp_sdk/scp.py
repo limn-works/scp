@@ -59,7 +59,7 @@ from scp_sdk.errors import ScpError
 from scp_sdk.types import CustodyType
 
 if TYPE_CHECKING:
-    from scp_sdk.tools import SagaResult
+    from scp_sdk.outlets import SagaResult
 
     # Imported under TYPE_CHECKING only to annotate ``ucan_evaluate`` /
     # ``participation_record`` return types without a runtime circular import
@@ -1914,10 +1914,12 @@ class SCP:
         """Delegate to ``_scp_core.SCP.py_mcp_load_contexts``."""
         return await asyncio.to_thread(self._native.py_mcp_load_contexts, identity_did, _relay_url)
 
-    async def mcp_register_tool_handler(self, context_id: str, tool_name: str, handler: Any) -> Any:
-        """Delegate to ``_scp_core.SCP.mcp_register_tool_handler``."""
+    async def mcp_register_outlet_handler(
+        self, context_id: str, tool_name: str, handler: Any
+    ) -> Any:
+        """Delegate to ``_scp_core.SCP.mcp_register_outlet_handler``."""
         return await asyncio.to_thread(
-            self._native.mcp_register_tool_handler, context_id, tool_name, handler
+            self._native.mcp_register_outlet_handler, context_id, tool_name, handler
         )
 
     async def mcp_serve(
@@ -2398,51 +2400,51 @@ class SCP:
 
     # endregion Provenance
 
-    # region Tools
+    # region Outlets
 
-    async def tool_interface_accept(self, context_id: str, interface_json: str) -> Any:
-        """Delegate to ``_scp_core.SCP.tool_interface_accept``."""
+    async def outlet_interface_accept(self, context_id: str, interface_json: str) -> Any:
+        """Delegate to ``_scp_core.SCP.outlet_interface_accept``."""
         return await asyncio.to_thread(
-            self._native.tool_interface_accept, context_id, interface_json
+            self._native.outlet_interface_accept, context_id, interface_json
         )
 
-    async def tool_interface_expose(
+    async def outlet_interface_expose(
         self,
         context_id: str,
-        tool_id: str,
+        outlet_id: str,
         target_context_id: str,
         rate_limit_json: str | None = None,
     ) -> Any:
-        """Delegate to ``_scp_core.SCP.tool_interface_expose``."""
+        """Delegate to ``_scp_core.SCP.outlet_interface_expose``."""
         return await asyncio.to_thread(
-            self._native.tool_interface_expose,
+            self._native.outlet_interface_expose,
             context_id,
-            tool_id,
+            outlet_id,
             target_context_id,
             rate_limit_json,
         )
 
-    async def tool_interface_revoke(self, context_id: str, interface_id_hex: str) -> Any:
-        """Delegate to ``_scp_core.SCP.tool_interface_revoke``."""
+    async def outlet_interface_revoke(self, context_id: str, interface_id_hex: str) -> Any:
+        """Delegate to ``_scp_core.SCP.outlet_interface_revoke``."""
         return await asyncio.to_thread(
-            self._native.tool_interface_revoke, context_id, interface_id_hex
+            self._native.outlet_interface_revoke, context_id, interface_id_hex
         )
 
-    async def tool_invoke(
+    async def outlet_invoke(
         self,
         context_id: str,
-        tool_id: str,
+        outlet_id: str,
         input: dict[str, Any],
         identity_did: str,
         ucan_token: str,
         proof_tokens: list[str] | None = None,
         spending_ucan: str | None = None,
     ) -> Any:
-        """Delegate to ``_scp_core.SCP.tool_invoke``."""
+        """Delegate to ``_scp_core.SCP.outlet_invoke``."""
         return await asyncio.to_thread(
-            self._native.tool_invoke,
+            self._native.outlet_invoke,
             context_id,
-            tool_id,
+            outlet_id,
             input,
             identity_did,
             ucan_token,
@@ -2450,18 +2452,18 @@ class SCP:
             spending_ucan,
         )
 
-    async def tool_invoke_cross_context(
+    async def outlet_invoke_cross_context(
         self,
         source_context_id: str,
         target_context_id: str,
-        tool_id: str,
+        outlet_id: str,
         input: dict[str, Any],
         invoker_did: str,
         ucan_token: str,
         chain_depth: int = 0,
         proof_tokens: list[str] | None = None,
     ) -> Any:
-        """Delegate to ``_scp_core.SCP.tool_invoke_cross_context``.
+        """Delegate to ``_scp_core.SCP.outlet_invoke_cross_context``.
 
         Validates ``chain_depth`` is an integer in the closed range
         ``0..255`` (u8 on the bridge side). Rejects ``bool`` (Python's
@@ -2482,10 +2484,10 @@ class SCP:
                 code="SCP-VALID-7002",
             )
         return await asyncio.to_thread(
-            self._native.tool_invoke_cross_context,
+            self._native.outlet_invoke_cross_context,
             source_context_id,
             target_context_id,
-            tool_id,
+            outlet_id,
             input,
             invoker_did,
             ucan_token,
@@ -2493,22 +2495,22 @@ class SCP:
             proof_tokens,
         )
 
-    async def tool_invoke_cross_context_saga(
+    async def outlet_invoke_cross_context_saga(
         self,
         caller_context_id: str,
         target_context_id: str,
         caller_did: str,
-        tool_registration_id: str,
+        outlet_registration_id: str,
         input: dict[str, Any],
         asserted_nonce_hex: str,
         timestamp_ms: int,
         chain_depth: int,
         ucan_proof_id: str | None = None,
     ) -> SagaResult:
-        """Run the §6.2.4 atomic cross-context tool-invocation saga.
+        """Run the §6.2.4 atomic cross-context outlet-invocation saga.
 
-        Delegates to ``_scp_core.SCP.tool_invoke_cross_context_saga``. The
-        saga either commits — returning a :class:`~scp_sdk.tools.SagaResult`
+        Delegates to ``_scp_core.SCP.outlet_invoke_cross_context_saga``. The
+        saga either commits — returning a :class:`~scp_sdk.outlets.SagaResult`
         carrying the supervisor-minted ``saga_id`` plus the target's signed
         receipt and captured output bytes — or reaches a typed terminal,
         which is re-raised as one of the SDK saga exceptions:
@@ -2530,7 +2532,7 @@ class SCP:
         ``u8`` / ``u64`` boundaries. See spec §6.2.4 and ADR-049 §3a.
         """
         from scp_sdk.errors import ValidationError, _saga_terminal_from_bridge
-        from scp_sdk.tools import SagaResult
+        from scp_sdk.outlets import SagaResult
 
         if (
             isinstance(chain_depth, bool)
@@ -2550,11 +2552,11 @@ class SCP:
 
         try:
             native_result = await asyncio.to_thread(
-                self._native.tool_invoke_cross_context_saga,
+                self._native.outlet_invoke_cross_context_saga,
                 caller_context_id,
                 target_context_id,
                 caller_did,
-                tool_registration_id,
+                outlet_registration_id,
                 input,
                 asserted_nonce_hex,
                 timestamp_ms,
@@ -2573,18 +2575,22 @@ class SCP:
             output=native_result.output,
         )
 
-    async def tool_register(self, context_id: str, registration: dict[str, Any]) -> Any:
-        """Delegate to ``_scp_core.SCP.tool_register``."""
-        return await asyncio.to_thread(self._native.tool_register, context_id, registration)
+    async def outlet_register(self, context_id: str, registration: dict[str, Any]) -> Any:
+        """Delegate to ``_scp_core.SCP.outlet_register``."""
+        return await asyncio.to_thread(self._native.outlet_register, context_id, registration)
 
-    async def tool_session_close(self, context_id: str, session_id: str) -> Any:
-        """Delegate to ``_scp_core.SCP.tool_session_close``."""
-        return await asyncio.to_thread(self._native.tool_session_close, context_id, session_id)
+    async def outlet_session_close(self, context_id: str, session_id: str) -> Any:
+        """Delegate to ``_scp_core.SCP.outlet_session_close``."""
+        return await asyncio.to_thread(self._native.outlet_session_close, context_id, session_id)
 
-    async def tool_session_create(
-        self, context_id: str, tool_id: str, source_context_id: str, ttl_seconds: int | None = None
+    async def outlet_session_create(
+        self,
+        context_id: str,
+        outlet_id: str,
+        source_context_id: str,
+        ttl_seconds: int | None = None,
     ) -> Any:
-        """Delegate to ``_scp_core.SCP.tool_session_create``.
+        """Delegate to ``_scp_core.SCP.outlet_session_create``.
 
         Validates ``ttl_seconds`` is a non-negative integer or ``None``.
         Rejects ``bool`` (which passes ``isinstance(..., int)``) and
@@ -2601,10 +2607,14 @@ class SCP:
                 code="SCP-VALID-7002",
             )
         return await asyncio.to_thread(
-            self._native.tool_session_create, context_id, tool_id, source_context_id, ttl_seconds
+            self._native.outlet_session_create,
+            context_id,
+            outlet_id,
+            source_context_id,
+            ttl_seconds,
         )
 
-    async def tool_session_invoke(
+    async def outlet_session_invoke(
         self,
         context_id: str,
         session_id: str,
@@ -2613,9 +2623,9 @@ class SCP:
         ucan_token: str,
         proof_tokens: list[str] | None = None,
     ) -> Any:
-        """Delegate to ``_scp_core.SCP.tool_session_invoke``."""
+        """Delegate to ``_scp_core.SCP.outlet_session_invoke``."""
         return await asyncio.to_thread(
-            self._native.tool_session_invoke,
+            self._native.outlet_session_invoke,
             context_id,
             session_id,
             input,
@@ -2624,11 +2634,11 @@ class SCP:
             proof_tokens,
         )
 
-    async def tool_verify(self, context_id: str, tool_id: str) -> Any:
-        """Delegate to ``_scp_core.SCP.tool_verify``."""
-        return await asyncio.to_thread(self._native.tool_verify, context_id, tool_id)
+    async def outlet_verify(self, context_id: str, outlet_id: str) -> Any:
+        """Delegate to ``_scp_core.SCP.outlet_verify``."""
+        return await asyncio.to_thread(self._native.outlet_verify, context_id, outlet_id)
 
-    # endregion Tools
+    # endregion Outlets
 
     # region Fullstack
 

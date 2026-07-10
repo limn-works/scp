@@ -312,8 +312,8 @@ async function dispatch(req: BridgeRequest): Promise<OkResponse | ErrResponse> {
         return { id: req.id, ok: true, result: await opEventLogAppend(req) };
       case "sign_message":
         return { id: req.id, ok: true, result: await opSignMessage(req) };
-      case "tool_register":
-        return { id: req.id, ok: true, result: await opToolRegister(req) };
+      case "outlet_register":
+        return { id: req.id, ok: true, result: await opOutletRegister(req) };
       case "ucan_mint":
         return { id: req.id, ok: true, result: await opUcanMint(req) };
       case "ucan_validate_malformed":
@@ -527,10 +527,10 @@ async function opEventLogAppend(
 
 // -- ops 6-10 -------------------------------------------------------------
 
-// Shared tool registration body — pinned across bridges in
-// `seed_operations.py::OP_TOOL_REGISTER`.
-const PARITY_TOOL_NAME = "parity_probe";
-const PARITY_TOOL_SCHEMA = {
+// Shared outlet registration body — pinned across bridges in
+// `seed_operations.py::OP_OUTLET_REGISTER`.
+const PARITY_OUTLET_NAME = "parity_probe";
+const PARITY_OUTLET_SCHEMA = {
   input: {
     type: "object",
     properties: {
@@ -546,38 +546,38 @@ const PARITY_TOOL_SCHEMA = {
     },
   },
 };
-const PARITY_TOOL_CEILING = [
+const PARITY_OUTLET_CEILING = [
   "messages:read",
   "messages:write",
   "tool:register",
   "tool_invoke:*",
 ];
 
-async function opToolRegister(
+async function opOutletRegister(
   req: BridgeRequest,
 ): Promise<Record<string, unknown>> {
   requireNapi(req.bridgeMode);
-  const ceiling = (req.args.ceiling as string[]) ?? PARITY_TOOL_CEILING;
+  const ceiling = (req.args.ceiling as string[]) ?? PARITY_OUTLET_CEILING;
   const params = { name: "parity-tools", mode: "encrypted", ceiling };
   const scp = await newNapiScp();
   const identity = await scp.identityCreate("in_memory");
   const handle = await scp.contextCreate(identity, JSON.stringify(params));
-  // NapiToolDefinition fields are camelCase on the JS side (napi-rs
+  // NapiOutletDefinition fields are camelCase on the JS side (napi-rs
   // renames `input_schema_json` → `inputSchemaJson`) and expect JSON
   // STRINGS, not nested objects. Matches
-  // `crates/scp-ffi/napi/src/tools.rs::NapiToolDefinition`.
+  // `crates/scp-ffi/napi/src/outlets.rs::NapiOutletDefinition`.
   // napi-rs `Option<T>` fields are serialized from JS `undefined`, not
   // `null` — passing `null` hits the non-null `FromNapiValue<String>`
   // path and errors with "Failed to convert JavaScript value `Null`".
   // Omit optional fields entirely; napi-rs reads them as `None`.
-  const toolId = await scp.toolRegister(handle, {
-    name: PARITY_TOOL_NAME,
-    description: "parity harness probe tool",
-    inputSchemaJson: JSON.stringify(PARITY_TOOL_SCHEMA.input),
-    outputSchemaJson: JSON.stringify(PARITY_TOOL_SCHEMA.output),
+  const outletId = await scp.outletRegister(handle, {
+    name: PARITY_OUTLET_NAME,
+    description: "parity harness probe outlet",
+    inputSchemaJson: JSON.stringify(PARITY_OUTLET_SCHEMA.input),
+    outputSchemaJson: JSON.stringify(PARITY_OUTLET_SCHEMA.output),
     operatorDid: identity.did,
   });
-  return { tool_id: toolId };
+  return { outlet_id: outletId };
 }
 
 async function opUcanMint(req: BridgeRequest): Promise<Record<string, unknown>> {

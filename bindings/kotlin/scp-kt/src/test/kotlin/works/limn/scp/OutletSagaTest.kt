@@ -1,5 +1,5 @@
-// ToolSagaTest.kt — SDK-wrapper tests for the §6.2.4 cross-context
-// tool-invocation saga (ADR-049 §3a, PR-6c slice 4/4).
+// OutletSagaTest.kt — SDK-wrapper tests for the §6.2.4 cross-context
+// outlet-invocation saga (ADR-049 §3a, PR-6c slice 4/4).
 //
 // The Kotlin SDK surfaces the generated UniFFI types directly: the saga
 // terminal is the generated `SagaResult` (faithful nullable), and the
@@ -7,14 +7,14 @@
 // Unlike the Python/TS SDKs (which wrap untyped bridge errors into dedicated
 // SDK classes), there is no re-mapping layer here — the `Scp` shim forwards
 // 1:1 and the typed error propagates. Mirroring the Kotlin sibling
-// `toolInvokeCrossContext`, the wrapper carries NO client-side guards: input
+// `outletInvokeCrossContext`, the wrapper carries NO client-side guards: input
 // is already a `String`, and the u64/u8 numeric bounds are enforced by
 // `ULong`/`UByte`, so all validation lives in the Rust core.
 //
 // This suite exercises:
 //   - the public type surface (SagaResult faithful pass-through incl. null;
 //     the three typed ScpException.Saga* cases carrying their fields),
-//   - the flat `ToolBridge.invokeCrossContextSaga` conformance symbol
+//   - the flat `OutletBridge.invokeCrossContextSaga` conformance symbol
 //     (argument forwarding + BridgeException propagation), and
 //   - end-to-end argument forwarding through the real UniFFI bridge.
 //
@@ -40,7 +40,7 @@ import uniffi.scp.MemoryScope
 import uniffi.scp.SagaResult
 import uniffi.scp.ScpException
 import uniffi.scp.StorageConfig
-import uniffi.scp.ToolDefinition
+import uniffi.scp.OutletDefinition
 import works.limn.scp.bridge.BridgeException
 import works.limn.scp.bridge.CoroutineBridge
 import works.limn.scp.conformance.ConformanceStubBindings
@@ -52,7 +52,7 @@ import kotlin.test.fail
 import kotlin.time.Duration.Companion.seconds
 
 @OptIn(ExperimentalCoroutinesApi::class)
-class ToolSagaTest {
+class OutletSagaTest {
     companion object {
         private var nativeAvailable = false
         private var skipReason = ""
@@ -191,23 +191,23 @@ class ToolSagaTest {
         assertEquals("ctx-shared-42", error.contendedContext)
     }
 
-    // ── Flat ToolBridge.invokeCrossContextSaga conformance ────────────────
+    // ── Flat OutletBridge.invokeCrossContextSaga conformance ────────────────
 
     /**
-     * The coverage symbol `ToolBridge.invokeCrossContextSaga` dispatches on IO
+     * The coverage symbol `OutletBridge.invokeCrossContextSaga` dispatches on IO
      * and forwards all nine arguments to the bridge verbatim, returning the
      * JSON result unchanged.
      */
     @Test
     fun `invokeCrossContextSaga forwards all arguments and returns result`() =
         runTest(testDispatcher) {
-            stubBindings.toolInvokeCrossContextSagaResult = """{"saga_id":"saga-xyz"}"""
+            stubBindings.outletInvokeCrossContextSagaResult = """{"saga_id":"saga-xyz"}"""
             val result =
-                bridge.tools.invokeCrossContextSaga(
+                bridge.outlets.invokeCrossContextSaga(
                     sourceContextHandle = 1L,
                     targetContextHandle = 2L,
                     callerDid = "did:key:zCaller",
-                    toolRegistrationId = "reg-001",
+                    outletRegistrationId = "reg-001",
                     inputJson = """{"city":"Berlin"}""",
                     assertedNonceHex = NONCE_HEX,
                     timestampMs = 1_700_000_000_000L,
@@ -241,13 +241,13 @@ class ToolSagaTest {
     @Test
     fun `invokeCrossContextSaga forwards null ucanProofId`() =
         runTest(testDispatcher) {
-            stubBindings.toolInvokeCrossContextSagaResult = """{"saga_id":"saga-xyz"}"""
+            stubBindings.outletInvokeCrossContextSagaResult = """{"saga_id":"saga-xyz"}"""
             val result =
-                bridge.tools.invokeCrossContextSaga(
+                bridge.outlets.invokeCrossContextSaga(
                     sourceContextHandle = 1L,
                     targetContextHandle = 2L,
                     callerDid = "did:key:zCaller",
-                    toolRegistrationId = "reg-001",
+                    outletRegistrationId = "reg-001",
                     inputJson = """{"city":"Berlin"}""",
                     assertedNonceHex = NONCE_HEX,
                     timestampMs = 1_700_000_000_000L,
@@ -279,14 +279,14 @@ class ToolSagaTest {
     @Test
     fun `invokeCrossContextSaga propagates configured BridgeException`() =
         runTest(testDispatcher) {
-            stubBindings.toolInvokeCrossContextSagaError =
+            stubBindings.outletInvokeCrossContextSagaError =
                 BridgeException("participant set overlap", "SCP-SAGA-13066")
             try {
-                bridge.tools.invokeCrossContextSaga(
+                bridge.outlets.invokeCrossContextSaga(
                     sourceContextHandle = 1L,
                     targetContextHandle = 2L,
                     callerDid = "did:key:zCaller",
-                    toolRegistrationId = "reg-001",
+                    outletRegistrationId = "reg-001",
                     inputJson = "{}",
                     assertedNonceHex = NONCE_HEX,
                     timestampMs = 1_700_000_000_000L,
@@ -305,7 +305,7 @@ class ToolSagaTest {
      * into the real saga. Without bidirectional consent the supervisor reaches
      * a non-committed terminal, so the call surfaces a typed [ScpException] —
      * proving the nine arguments (both handles, `callerDid`,
-     * `toolRegistrationId`, `inputJson`, nonce, timestamp, depth, optional
+     * `outletRegistrationId`, `inputJson`, nonce, timestamp, depth, optional
      * proof) reach the real bridge.
      *
      * This is a bridge-linkage smoke test: it confirms the call reaches the
@@ -315,7 +315,7 @@ class ToolSagaTest {
      * would require committed-saga bidirectional-consent setup).
      */
     @Test
-    fun `toolInvokeCrossContextSaga reaches the real saga and surfaces a typed ScpException`() {
+    fun `outletInvokeCrossContextSaga reaches the real saga and surfaces a typed ScpException`() {
         assumeTrue(nativeAvailable, skipReason)
         runBlocking {
             val scp = SCP(StorageConfig.InMemory)
@@ -324,19 +324,19 @@ class ToolSagaTest {
                 val identity = scp.identityCreate(custody = "in_memory")
                 val source = scp.contextCreate(identity = identity, params = makeParams())
                 val target = scp.contextCreate(identity = identity, params = makeParams())
-                val toolId =
-                    scp.toolRegister(
+                val outletId =
+                    scp.outletRegister(
                         handle = target,
-                        definition = weatherTool(operatorDid = identity.did()),
+                        definition = weatherOutlet(operatorDid = identity.did()),
                     )
 
                 try {
                     val result =
-                        scp.toolInvokeCrossContextSaga(
+                        scp.outletInvokeCrossContextSaga(
                             sourceHandle = source,
                             targetHandle = target,
                             callerDid = identity.did(),
-                            toolRegistrationId = toolId,
+                            outletRegistrationId = outletId,
                             inputJson = """{"city":"Berlin","unit":"C"}""",
                             assertedNonceHex = NONCE_HEX,
                             timestampMs = System.currentTimeMillis().toULong(),
@@ -381,7 +381,7 @@ class ToolSagaTest {
                     "messages:read",
                     "messages:write",
                     "tool:invoke:*",
-                    "tool:register",
+                    "outlet:register",
                     "context:close",
                 ),
             ceilingPolicy = CeilingPolicy.IMMUTABLE,
@@ -398,8 +398,8 @@ class ToolSagaTest {
             consequenceConfigJson = null,
         )
 
-    private fun weatherTool(operatorDid: String): ToolDefinition =
-        ToolDefinition(
+    private fun weatherOutlet(operatorDid: String): OutletDefinition =
+        OutletDefinition(
             name = "weather",
             description = "Get current weather for a city",
             inputSchemaJson =

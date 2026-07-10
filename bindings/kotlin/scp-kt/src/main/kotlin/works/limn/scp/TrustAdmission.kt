@@ -271,7 +271,7 @@ enum class ParticipationFact {
     @SerialName("GovernanceActionsBy")
     GOVERNANCE_ACTIONS_BY,
 
-    /** Total tool invocations across all tool types. */
+    /** Total outlet invocations across all outlet types. */
     @SerialName("ToolInvocationCount")
     TOOL_INVOCATION_COUNT,
 
@@ -418,7 +418,7 @@ data class RequireParticipation(
  *   this identity.
  * @property governanceActionsBy Count of governance actions initiated by this
  *   identity.
- * @property toolInvocationCount Total tool invocations across all tool types.
+ * @property toolInvocationCount Total outlet invocations across all outlet types.
  * @property toolInvocationCountAnchored Whether [toolInvocationCount] is
  *   anchored in the canonical Merkle log. `false` until ADR-051 makes
  *   `ToolInvoked` a convergent leaf — consumers MUST NOT treat the count as

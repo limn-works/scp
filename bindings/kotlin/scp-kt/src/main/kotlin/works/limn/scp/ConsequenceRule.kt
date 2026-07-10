@@ -96,7 +96,7 @@ enum class AccessScope(val rawValue: String) {
  * A capability that may be referenced inside [EnforcementSeverity.SuspendCapability].
  *
  * Mirrors `scp_protocol::context::roles::Capability`. The unit variants are
- * enumerated as [Unit]; payload-bearing variants ([ToolInvoke], [Custom]) carry
+ * enumerated as [Unit]; payload-bearing variants ([OutletInvoke], [Custom]) carry
  * their string field directly.
  */
 sealed class ConsequenceCapability {
@@ -112,7 +112,7 @@ sealed class ConsequenceCapability {
     }
 
     /**
-     * Tool invocation capability for a specific registered tool.
+     * Outlet invocation capability for a specific registered outlet.
      *
      * Serializes as `{"ToolInvoke": "<id>"}` to match the Rust newtype.
      */

@@ -123,7 +123,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
   // ---------------------------------------------------------------------------
   //
   // Every test gets its own fresh `SCP` + bridge + in-memory relay so no
-  // per-test state (UCAN nonces, blocked subscribers, registered tools,
+  // per-test state (UCAN nonces, blocked subscribers, registered outlets,
   // relay messages, event-log entries) leaks into any subsequent test. The
   // per-test bootstrap measured at ~1 ms/cycle on the target hardware —
   // negligible next to the suite's overall runtime.
@@ -504,17 +504,17 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
   });
 
   // ---------------------------------------------------------------------------
-  // 4. Tools
+  // 4. Outlets
   // ---------------------------------------------------------------------------
 
-  describe("Tools (real NAPI)", () => {
-    test("registers a tool and returns a tool ID", async () => {
+  describe("Outlets (real NAPI)", () => {
+    test("registers a outlet and returns a outlet ID", async () => {
       const identity = await napi.identityCreate("in_memory");
       const ctx = await napi.contextCreate(
         identity,
-        JSON.stringify({ ceiling: ["tool:register"] }),
+        JSON.stringify({ ceiling: ["outlet:register"] }),
       );
-      const toolId = await napi.toolRegister(ctx, {
+      const outletId = await napi.outletRegister(ctx, {
         name: "echo",
         description: "Echoes input",
         inputSchema: {
@@ -529,22 +529,22 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
         },
         operator: identity.did,
       });
-      expect(typeof toolId).toBe("string");
-      expect(toolId.length).toBeGreaterThan(0);
+      expect(typeof outletId).toBe("string");
+      expect(outletId.length).toBeGreaterThan(0);
     });
 
-    test("invokes a registered tool", async () => {
+    test("invokes a registered outlet", async () => {
       const admin = await napi.identityCreate("in_memory");
       const member = await napi.identityCreate("in_memory");
       const ctx = await napi.contextCreate(
         admin,
-        JSON.stringify({ ceiling: ["tool:register", "tool:invoke:*"] }),
+        JSON.stringify({ ceiling: ["outlet:register", "tool:invoke:*"] }),
       );
       // Join member to context so they have role-based capabilities.
       await napi.contextJoin(ctx, member.did);
-      const toolId = await napi.toolRegister(ctx, {
-        name: "test-tool",
-        description: "A test tool",
+      const outletId = await napi.outletRegister(ctx, {
+        name: "test-outlet",
+        description: "A test outlet",
         inputSchema: {
           type: "object",
           properties: { x: { type: "number" }, y: { type: "number" } },
@@ -554,9 +554,9 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       });
       // Mint UCAN for the member (cross-delegation, not self).
       const ucan = await napi.ucanMint(ctx, member.did, ["tool:invoke:*"]);
-      const resultJson = await napi.toolInvoke(
+      const resultJson = await napi.outletInvoke(
         ctx,
-        toolId,
+        outletId,
         JSON.stringify({ x: 42, y: 7 }),
         member.did,
         ucan.encoded,
@@ -566,19 +566,19 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       expect(parsed).toBeTruthy();
     });
 
-    test("registers a tool whose cost.amount exceeds 2^53 (bigint boundary, ADR-060)", async () => {
+    test("registers a outlet whose cost.amount exceeds 2^53 (bigint boundary, ADR-060)", async () => {
       const identity = await napi.identityCreate("in_memory");
       const ctx = await napi.contextCreate(
         identity,
-        JSON.stringify({ ceiling: ["tool:register"] }),
+        JSON.stringify({ ceiling: ["outlet:register"] }),
       );
       // 2^53 + 1 — the first integer a JS `number` cannot hold exactly — and
       // u64::MAX. Both cross the FFI boundary as a JS `bigint`; a `number`-typed
       // cost field would have narrowed and either lost precision or thrown.
       for (const amount of [9_007_199_254_740_993n, 18_446_744_073_709_551_615n]) {
-        const toolId = await napi.toolRegister(ctx, {
-          name: `priced-tool-${amount}`,
-          description: "A tool with a large per-invocation cost",
+        const outletId = await napi.outletRegister(ctx, {
+          name: `priced-outlet-${amount}`,
+          description: "A outlet with a large per-invocation cost",
           inputSchema: {
             type: "object",
             properties: { a: { type: "string" }, b: { type: "number" } },
@@ -596,8 +596,8 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
             payee: identity.did,
           },
         });
-        expect(typeof toolId).toBe("string");
-        expect(toolId.length).toBeGreaterThan(0);
+        expect(typeof outletId).toBe("string");
+        expect(outletId.length).toBeGreaterThan(0);
       }
     });
 
@@ -605,11 +605,11 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       const identity = await napi.identityCreate("in_memory");
       const ctx = await napi.contextCreate(
         identity,
-        JSON.stringify({ ceiling: ["tool:register"] }),
+        JSON.stringify({ ceiling: ["outlet:register"] }),
       );
       await expect(
-        napi.toolRegister(ctx, {
-          name: "negative-cost-tool",
+        napi.outletRegister(ctx, {
+          name: "negative-cost-outlet",
           description: "invalid",
           inputSchema: {
             type: "object",
@@ -627,15 +627,15 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       ).rejects.toThrow(/SCP-VALID-7001/);
     });
 
-    test("verifies a tool and returns a verification result", async () => {
+    test("verifies a outlet and returns a verification result", async () => {
       const identity = await napi.identityCreate("in_memory");
       const ctx = await napi.contextCreate(
         identity,
-        JSON.stringify({ ceiling: ["tool:register"] }),
+        JSON.stringify({ ceiling: ["outlet:register"] }),
       );
-      const toolId = await napi.toolRegister(ctx, {
+      const outletId = await napi.outletRegister(ctx, {
         name: "verify-me",
-        description: "Tool for verification",
+        description: "Outlet for verification",
         inputSchema: {
           type: "object",
           properties: { query: { type: "string" }, limit: { type: "number" } },
@@ -648,7 +648,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
         },
         operator: identity.did,
       });
-      const result = await napi.toolVerify(ctx, toolId);
+      const result = await napi.outletVerify(ctx, outletId);
       expect(typeof result.passed).toBe("boolean");
       expect(Array.isArray(result.failures)).toBe(true);
     });
@@ -995,7 +995,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
               ceiling_policy: "Immutable",
               promotion_policy: "NoPromotion",
               roles: [],
-              tools: [],
+              outlets: [],
               ttl: null,
               memory_scope: "Ephemeral",
               governance: "SingleAdmin",
@@ -1085,7 +1085,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
               ceiling_policy: "Immutable",
               promotion_policy: "NoPromotion",
               roles: [],
-              tools: [],
+              outlets: [],
               ttl: null,
               memory_scope: "Ephemeral",
               governance: "SingleAdmin",
@@ -1845,26 +1845,26 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
   });
 
   // ---------------------------------------------------------------------------
-  // 14. E2E: Tools register + invoke + verify
+  // 14. E2E: Outlets register + invoke + verify
   // ---------------------------------------------------------------------------
 
-  describe("E2E tool lifecycle (real NAPI)", () => {
+  describe("E2E outlet lifecycle (real NAPI)", () => {
     test("register -> invoke -> verify", async () => {
       const admin = await napi.identityCreate("in_memory");
       const member = await napi.identityCreate("in_memory");
       const ctx = await napi.contextCreate(
         admin,
         JSON.stringify({
-          ceiling: ["tool:register", "tool:invoke:*"],
+          ceiling: ["outlet:register", "tool:invoke:*"],
         }),
       );
       // Join member so they have role-based capabilities.
       await napi.contextJoin(ctx, member.did);
 
       // Register.
-      const toolId = await napi.toolRegister(ctx, {
-        name: "e2e-tool",
-        description: "End-to-end test tool",
+      const outletId = await napi.outletRegister(ctx, {
+        name: "e2e-outlet",
+        description: "End-to-end test outlet",
         inputSchema: {
           type: "object",
           properties: { value: { type: "number" }, mode: { type: "string" } },
@@ -1875,13 +1875,13 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
         },
         operator: admin.did,
       });
-      expect(toolId).toBeTruthy();
+      expect(outletId).toBeTruthy();
 
       // Invoke (mint for member, cross-delegation).
       const ucan = await napi.ucanMint(ctx, member.did, ["tool:invoke:*"]);
-      const resultJson = await napi.toolInvoke(
+      const resultJson = await napi.outletInvoke(
         ctx,
-        toolId,
+        outletId,
         JSON.stringify({ value: 21 }),
         member.did,
         ucan.encoded,
@@ -1891,7 +1891,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       expect(result).toBeTruthy();
 
       // Verify.
-      const verification = await napi.toolVerify(ctx, toolId);
+      const verification = await napi.outletVerify(ctx, outletId);
       expect(typeof verification.passed).toBe("boolean");
       expect(Array.isArray(verification.failures)).toBe(true);
     });
@@ -2608,11 +2608,11 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
   });
 
   // ---------------------------------------------------------------------------
-  // 18. Cross-context tool-invocation saga (§6.2.4, ADR-049 §3a)
+  // 18. Cross-context outlet-invocation saga (§6.2.4, ADR-049 §3a)
   // ---------------------------------------------------------------------------
   //
   // The §6.2.4 saga export lives on the native `SCP` class as
-  // `toolInvokeCrossContextSaga`. The SDK wrapper (`SCP.toolInvokeCrossContextSaga`)
+  // `outletInvokeCrossContextSaga`. The SDK wrapper (`SCP.outletInvokeCrossContextSaga`)
   // now exists too, but these tests deliberately reach the RAW native instance
   // DIRECTLY — obtained via `__getNativeScp` against the SAME `SCP` that minted
   // the context handles — so they pin the JS-marshaling boundary (BigInt
@@ -2622,8 +2622,8 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
   // by any other instance with SCP-PERM-3030.
   //
   // The signature crossing the addon boundary is:
-  //   toolInvokeCrossContextSaga(
-  //     sourceHandle, targetHandle, callerDid, toolRegistrationId,
+  //   outletInvokeCrossContextSaga(
+  //     sourceHandle, targetHandle, callerDid, outletRegistrationId,
   //     inputJson, assertedNonceHex, timestampMs: BigInt, chainDepth: u8,
   //     ucanProofId?: string,
   //   ) => Promise<{ sagaId, receipt?, output? }>
@@ -2635,14 +2635,14 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
   // the collapse to a single `napi::Error` message string with its
   // `SCP-SAGA-{code}` + parseable structured suffix intact, so the TypeScript
   // error layer can reverse it.
-  describe("Cross-context tool-invocation saga (real NAPI)", () => {
+  describe("Cross-context outlet-invocation saga (real NAPI)", () => {
     // A 16-byte freshness nonce as the one canonical 32-char lowercase-hex
     // wire form (§6.2.4 envelope nonce).
     const NONCE_HEX = "0123456789abcdef0123456789abcdef";
 
-    // The deterministic, cross-bridge tool id form (`generate_tool_id(name)`).
-    const TOOL_NAME = "xctx_saga_ts_tool";
-    const TOOL_ID = `tool-${TOOL_NAME}`;
+    // The deterministic, cross-bridge outlet id form (`generate_tool_id(name)`).
+    const TOOL_NAME = "xctx_saga_ts_outlet";
+    const TOOL_ID = `outlet-${TOOL_NAME}`;
 
     // A near-now Unix-ms timestamp as a JS `BigInt`. Prepare-B enforces a
     // §9.14 ±5min skew, so a fixed historical value would abort with a skew
@@ -2658,7 +2658,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
     type IdentityHandle = Awaited<ReturnType<typeof napi.identityCreate>>;
     type ContextHandle = Awaited<ReturnType<typeof napi.contextCreate>>;
 
-    // The native `toolInvokeCrossContextSaga` method as it crosses the addon
+    // The native `outletInvokeCrossContextSaga` method as it crosses the addon
     // boundary, read off the raw native SCP that minted every handle below.
     // Using that exact instance is mandatory — the per-instance handle-affinity
     // guard rejects a handle minted by any other instance (SCP-PERM-3030).
@@ -2667,7 +2667,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       sourceHandle: ContextHandle,
       targetHandle: ContextHandle,
       callerDid: string,
-      toolRegistrationId: string,
+      outletRegistrationId: string,
       inputJson: string,
       assertedNonceHex: string,
       timestampMs: bigint,
@@ -2676,14 +2676,14 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
     ) => Promise<SagaResult>;
     function nativeSaga(): SagaFn {
       const raw = __getNativeScp(scpInstance) as unknown as {
-        toolInvokeCrossContextSaga: SagaFn;
+        outletInvokeCrossContextSaga: SagaFn;
       };
-      return raw.toolInvokeCrossContextSaga.bind(raw);
+      return raw.outletInvokeCrossContextSaga.bind(raw);
     }
 
     // Creates a caller (source) context A owned by `ownerDid`. A's ceiling
     // carries `governance:propose` (so the admin can propose) and
-    // `tool:interface` (required by execute_establish_tool_interface's ceiling
+    // `outlet:interface` (required by execute_establish_tool_interface's ceiling
     // check). `contextCreate` mints a real 64-hex id so the ADR-056 saga
     // chokepoint round-trips to A's actor.
     async function createCallerContext(owner: IdentityHandle): Promise<ContextHandle> {
@@ -2692,7 +2692,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
         JSON.stringify({
           ceiling: [
             "governance:propose",
-            "tool:interface",
+            "outlet:interface",
             "tools:invoke",
             "messages:read",
             "messages:write",
@@ -2704,33 +2704,33 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
     }
 
     // Creates a target (executing) context B owned by `ownerDid`. B's ceiling
-    // carries `governance:propose` + `tool:register` so the saga tool can be
+    // carries `governance:propose` + `outlet:register` so the saga outlet can be
     // registered into B's ACTOR governance state (the saga's Prepare-B reads
-    // the tool from there).
+    // the outlet from there).
     async function createTargetContext(owner: IdentityHandle): Promise<ContextHandle> {
       return napi.contextCreate(
         owner,
         JSON.stringify({
-          ceiling: ["governance:propose", "tool:register"],
+          ceiling: ["governance:propose", "outlet:register"],
           governance: "single_admin",
           memoryScope: "ephemeral",
         }),
       );
     }
 
-    // Externally-tagged `GovernanceAction::RegisterTool` for the saga tool.
+    // Externally-tagged `GovernanceAction::RegisterTool` for the saga outlet.
     // Two input + two output properties clear the §9.2.1 specificity floor of
     // 2. `implementation_hash` is a 32-element JSON number array (serde expects
     // a fixed `[u8; 32]`). `operator_did` is a required string (not nullable).
     // Registering this into B's actor state via governance is what the saga's
     // Prepare-B requires.
-    function registerToolActionJson(operatorDid: string): string {
+    function registerOutletActionJson(operatorDid: string): string {
       return JSON.stringify({
         RegisterTool: {
           registration: {
-            tool_id: TOOL_ID,
+            outlet_id: TOOL_ID,
             name: TOOL_NAME,
-            description: `Tool: ${TOOL_NAME}`,
+            description: `Outlet: ${TOOL_NAME}`,
             schema: {
               input_schema: {
                 type: "object",
@@ -2762,7 +2762,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
           interface: {
             source_context: ctxA,
             target_context: ctxB,
-            tool_id: TOOL_ID,
+            outlet_id: TOOL_ID,
             rate_limit: null,
             inbound_rate_limit: null,
             per_caller_rate_limit: null,
@@ -2874,8 +2874,8 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
     //   - RegisterTool into B's ACTOR governance state (Prepare-B reads it).
     //   - EstablishToolInterface (bidirectionally approved) into A (gate 2).
     //
-    // No tool handler is registered (the only handler-attach path is
-    // Rust-internal `register_tool_handler`, not a napi export), so the
+    // No outlet handler is registered (the only handler-attach path is
+    // Rust-internal `register_outlet_handler`, not a napi export), so the
     // supervisor-side executor runs the schema-echo fallback the FFI bridge
     // builds — the producer captures whatever the executor returns as the
     // signed `output_jcs`. The committed result object therefore marshals to a
@@ -2887,9 +2887,9 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       const ctxA = await createCallerContext(owner);
       const ctxB = await createTargetContext(owner);
 
-      // Register the saga tool into B's actor governance state (auto-executes
-      // under single_admin). The tool's operator is the owner DID.
-      await napi.contextGovernancePropose(ctxB, registerToolActionJson(owner.did), owner.did);
+      // Register the saga outlet into B's actor governance state (auto-executes
+      // under single_admin). The outlet's operator is the owner DID.
+      await napi.contextGovernancePropose(ctxB, registerOutletActionJson(owner.did), owner.did);
 
       // Establish the bidirectionally-approved interface in A (auto-executes
       // under single_admin). The id-form fields compare on the raw 64-hex

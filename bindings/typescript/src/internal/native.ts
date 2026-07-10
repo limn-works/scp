@@ -35,10 +35,10 @@ import type {
   EventFilter,
   MemberRole,
   Message,
+  OutletDefinition,
+  OutletVerificationResult,
   Proof,
   SagaResult,
-  ToolDefinition,
-  ToolVerificationResult,
   TransportStatus,
   UcanToken,
 } from "../types";
@@ -786,9 +786,12 @@ export function createNativeBridge(scp: SCP): Bridge {
       )(handle);
     },
 
-    // Tools
-    async toolRegister(handle: BridgeContextHandle, definition: ToolDefinition): Promise<string> {
-      // NapiToolDefinition has different field names from the Bridge ToolDefinition.
+    // Outlets
+    async outletRegister(
+      handle: BridgeContextHandle,
+      definition: OutletDefinition,
+    ): Promise<string> {
+      // NapiOutletDefinition has different field names from the Bridge OutletDefinition.
       const napiDef = {
         name: definition.name,
         description: definition.description,
@@ -810,27 +813,27 @@ export function createNativeBridge(scp: SCP): Bridge {
             }
           : undefined,
       };
-      const toolId = await (
-        native.toolRegister as (h: BridgeContextHandle, d: typeof napiDef) => Promise<string>
+      const outletId = await (
+        native.outletRegister as (h: BridgeContextHandle, d: typeof napiDef) => Promise<string>
       )(handle, napiDef);
-      return toolId;
+      return outletId;
     },
 
-    async toolInvoke(
+    async outletInvoke(
       handle: BridgeContextHandle,
-      toolId: string,
+      outletId: string,
       inputJson: string,
       identityDid: string,
       ucanToken: string,
       proofTokens?: readonly string[],
       spendingUcan?: string,
     ): Promise<string> {
-      // C4 (#1606): NAPI tool_invoke now routes through
-      // ContextManager.invoke_tool_with_economy. The bridge accepts an
+      // C4 (#1606): NAPI outlet_invoke now routes through
+      // ContextManager.invoke_outlet_with_economy. The bridge accepts an
       // optional spendingUcan JWT for AND-composition with the action
       // UCAN under spec section 19.5.
       const result = await (
-        native.toolInvoke as (
+        native.outletInvoke as (
           h: BridgeContextHandle,
           t: string,
           i: string,
@@ -839,54 +842,63 @@ export function createNativeBridge(scp: SCP): Bridge {
           p: readonly string[] | undefined,
           s: string | undefined,
         ) => Promise<string>
-      )(handle, toolId, inputJson, identityDid, ucanToken, proofTokens, spendingUcan);
+      )(handle, outletId, inputJson, identityDid, ucanToken, proofTokens, spendingUcan);
       return result;
     },
 
-    async toolVerify(handle: BridgeContextHandle, toolId: string): Promise<ToolVerificationResult> {
+    async outletVerify(
+      handle: BridgeContextHandle,
+      outletId: string,
+    ): Promise<OutletVerificationResult> {
       const result = await (
-        native.toolVerify as (h: BridgeContextHandle, t: string) => Promise<ToolVerificationResult>
-      )(handle, toolId);
+        native.outletVerify as (
+          h: BridgeContextHandle,
+          t: string,
+        ) => Promise<OutletVerificationResult>
+      )(handle, outletId);
       return result;
     },
 
     // Bidirectional consent protocol (§6.2.0.1)
-    async toolInterfaceExpose(
+    async outletInterfaceExpose(
       handle: BridgeContextHandle,
-      toolId: string,
+      outletId: string,
       targetContextId: string,
       rateLimitJson?: string,
     ): Promise<string> {
       return await (
-        native.toolInterfaceExpose as (
+        native.outletInterfaceExpose as (
           h: BridgeContextHandle,
           t: string,
           tc: string,
           rl?: string,
         ) => Promise<string>
-      )(handle, toolId, targetContextId, rateLimitJson);
+      )(handle, outletId, targetContextId, rateLimitJson);
     },
 
-    async toolInterfaceAccept(handle: BridgeContextHandle, interfaceJson: string): Promise<string> {
+    async outletInterfaceAccept(
+      handle: BridgeContextHandle,
+      interfaceJson: string,
+    ): Promise<string> {
       return await (
-        native.toolInterfaceAccept as (h: BridgeContextHandle, ij: string) => Promise<string>
+        native.outletInterfaceAccept as (h: BridgeContextHandle, ij: string) => Promise<string>
       )(handle, interfaceJson);
     },
 
-    async toolInterfaceRevoke(
+    async outletInterfaceRevoke(
       handle: BridgeContextHandle,
       interfaceIdHex: string,
     ): Promise<string> {
       return await (
-        native.toolInterfaceRevoke as (h: BridgeContextHandle, id: string) => Promise<string>
+        native.outletInterfaceRevoke as (h: BridgeContextHandle, id: string) => Promise<string>
       )(handle, interfaceIdHex);
     },
 
-    // Cross-context tool invocation (spec section 6.2)
-    async toolInvokeCrossContext(
+    // Cross-context outlet invocation (spec section 6.2)
+    async outletInvokeCrossContext(
       sourceHandle: BridgeContextHandle,
       targetHandle: BridgeContextHandle,
-      toolId: string,
+      outletId: string,
       inputJson: string,
       invokerDid: string,
       ucanToken: string,
@@ -894,10 +906,10 @@ export function createNativeBridge(scp: SCP): Bridge {
       proofTokens?: readonly string[],
     ): Promise<string> {
       return await (
-        native.toolInvokeCrossContext as (
+        native.outletInvokeCrossContext as (
           s: BridgeContextHandle,
           t: BridgeContextHandle,
-          tool: string,
+          outlet: string,
           input: string,
           did: string,
           ucan: string,
@@ -907,7 +919,7 @@ export function createNativeBridge(scp: SCP): Bridge {
       )(
         sourceHandle,
         targetHandle,
-        toolId,
+        outletId,
         inputJson,
         invokerDid,
         ucanToken,
@@ -916,12 +928,12 @@ export function createNativeBridge(scp: SCP): Bridge {
       );
     },
 
-    // The §6.2.4 atomic cross-context tool-invocation saga (ADR-049 §3a)
-    async toolInvokeCrossContextSaga(
+    // The §6.2.4 atomic cross-context outlet-invocation saga (ADR-049 §3a)
+    async outletInvokeCrossContextSaga(
       sourceHandle: BridgeContextHandle,
       targetHandle: BridgeContextHandle,
       callerDid: string,
-      toolRegistrationId: string,
+      outletRegistrationId: string,
       inputJson: string,
       assertedNonceHex: string,
       timestampMs: bigint,
@@ -932,11 +944,11 @@ export function createNativeBridge(scp: SCP): Bridge {
       // `Buffer` (a faithful `Uint8Array` subtype) or `undefined`. Normalize the
       // absent case to `null` — a faithful pass-through, never synthesized.
       const raw = await (
-        native.toolInvokeCrossContextSaga as (
+        native.outletInvokeCrossContextSaga as (
           s: BridgeContextHandle,
           t: BridgeContextHandle,
           caller: string,
-          tool: string,
+          outlet: string,
           input: string,
           nonce: string,
           ts: bigint,
@@ -947,7 +959,7 @@ export function createNativeBridge(scp: SCP): Bridge {
         sourceHandle,
         targetHandle,
         callerDid,
-        toolRegistrationId,
+        outletRegistrationId,
         inputJson,
         assertedNonceHex,
         timestampMs,
@@ -961,24 +973,24 @@ export function createNativeBridge(scp: SCP): Bridge {
       };
     },
 
-    // Stateful tool sessions (spec section 6.2.1)
-    async toolSessionCreate(
+    // Stateful outlet sessions (spec section 6.2.1)
+    async outletSessionCreate(
       handle: BridgeContextHandle,
-      toolId: string,
+      outletId: string,
       sourceContextId: string,
       ttlSeconds?: number,
     ): Promise<string> {
       return await (
-        native.toolSessionCreate as (
+        native.outletSessionCreate as (
           h: BridgeContextHandle,
           t: string,
           s: string,
           ttl: number | undefined,
         ) => Promise<string>
-      )(handle, toolId, sourceContextId, ttlSeconds);
+      )(handle, outletId, sourceContextId, ttlSeconds);
     },
 
-    async toolSessionInvoke(
+    async outletSessionInvoke(
       handle: BridgeContextHandle,
       sessionId: string,
       inputJson: string,
@@ -987,7 +999,7 @@ export function createNativeBridge(scp: SCP): Bridge {
       proofTokens?: readonly string[],
     ): Promise<string> {
       return await (
-        native.toolSessionInvoke as (
+        native.outletSessionInvoke as (
           h: BridgeContextHandle,
           sid: string,
           input: string,
@@ -998,8 +1010,8 @@ export function createNativeBridge(scp: SCP): Bridge {
       )(handle, sessionId, inputJson, invokerDid, ucanToken, proofTokens);
     },
 
-    async toolSessionClose(handle: BridgeContextHandle, sessionId: string): Promise<void> {
-      await (native.toolSessionClose as (h: BridgeContextHandle, sid: string) => Promise<void>)(
+    async outletSessionClose(handle: BridgeContextHandle, sessionId: string): Promise<void> {
+      await (native.outletSessionClose as (h: BridgeContextHandle, sid: string) => Promise<void>)(
         handle,
         sessionId,
       );

@@ -110,11 +110,11 @@ enum class ShadowStatus(val rawValue: String) {
 }
 
 // ---------------------------------------------------------------------------
-// Tool definitions (spec §5.4.1, ADR-010)
+// Outlet definitions (spec §5.4.1, ADR-010)
 // ---------------------------------------------------------------------------
 
 /**
- * Per-invocation cost metadata for a tool (spec section 5.4.1).
+ * Per-invocation cost metadata for a outlet (spec section 5.4.1).
  *
  * All monetary values are in the smallest currency unit (e.g., cents
  * for USD, satoshis for BTC).
@@ -124,10 +124,10 @@ enum class ShadowStatus(val rawValue: String) {
  *     native-integer money surface); unsigned by construction — a monetary
  *     amount is never negative.
  * @property currency ISO 4217 or protocol-defined currency code.
- * @property payee DID of the payment recipient. May differ from the tool operator.
+ * @property payee DID of the payment recipient. May differ from the outlet operator.
  * @property costFormula Optional pricing formula identifier for dynamic pricing (spec section 19.4).
  */
-data class ToolCost(
+data class OutletCost(
     val amount: ULong,
     val currency: String,
     val payee: String,
@@ -135,23 +135,23 @@ data class ToolCost(
 )
 
 /**
- * Definition of a tool that can be registered in an SCP context.
+ * Definition of a outlet that can be registered in an SCP context.
  *
- * Provides a typed Kotlin data class for constructing tool definitions
+ * Provides a typed Kotlin data class for constructing outlet definitions
  * that are serialized to JSON for the FFI bridge layer.
  *
- * See ADR-010 (Tool Registry) and spec section 5.4.1.
+ * See ADR-010 (Outlet Registry) and spec section 5.4.1.
  *
- * @property name Human-readable tool name.
- * @property description Tool description.
- * @property inputSchemaJson JSON Schema for tool input (as a JSON string).
- * @property outputSchemaJson JSON Schema for tool output (as a JSON string).
- * @property operatorDid DID of the tool operator (responsible party).
+ * @property name Human-readable outlet name.
+ * @property description Outlet description.
+ * @property inputSchemaJson JSON Schema for outlet input (as a JSON string).
+ * @property outputSchemaJson JSON Schema for outlet output (as a JSON string).
+ * @property operatorDid DID of the outlet operator (responsible party).
  * @property testVectorsJson Test vectors for integrity verification (serialized as JSON string).
  * @property implementationHashHex SHA-256 hash of the implementation binary as hex string.
  * @property cost Optional per-invocation cost metadata (spec section 5.4.1).
  */
-data class ToolDefinition(
+data class OutletDefinition(
     val name: String,
     val description: String,
     val inputSchemaJson: String,
@@ -159,7 +159,7 @@ data class ToolDefinition(
     val operatorDid: String,
     val testVectorsJson: String? = null,
     val implementationHashHex: String? = null,
-    val cost: ToolCost? = null,
+    val cost: OutletCost? = null,
 ) {
     /**
      * Serializes this definition to a JSON string suitable for the FFI bridge.
@@ -500,10 +500,10 @@ data class BatchPublishResult(
 // ---------------------------------------------------------------------------
 
 /**
- * A known input-output pair for tool conformance testing.
+ * A known input-output pair for outlet conformance testing.
  *
- * Mirrors `scp_core::context::tools::TestVector`. Any agent can invoke a
- * tool with test vector inputs and verify the output matches the expected
+ * Mirrors `scp_core::context::outlets::TestVector`. Any agent can invoke a
+ * outlet with test vector inputs and verify the output matches the expected
  * result.
  *
  * Provenance: spec §7.3.3, ADR-010 (phase-2)

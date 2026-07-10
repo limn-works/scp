@@ -31,14 +31,14 @@ public nonisolated enum AccessScope: String, Sendable, Codable, CaseIterable {
 ///
 /// Mirrors `scp_protocol::context::roles::Capability`. The unit variants are
 /// represented by ``unit(name:)`` carrying the variant name; payload-bearing
-/// variants ([toolInvoke], [custom]) carry their string field directly.
+/// variants ([outletInvoke], [custom]) carry their string field directly.
 public nonisolated enum ConsequenceCapability: Sendable, Codable, Equatable {
     /// A unit-variant capability. The `name` must match a Rust `Capability`
     /// enum variant name exactly, e.g. `MessagesRead`, `MessagesWrite`,
     /// `GovernanceVote`.
     case unit(name: String)
 
-    /// Tool invocation capability for a specific registered tool.
+    /// Outlet invocation capability for a specific registered outlet.
     /// Encodes as `{"ToolInvoke": "<id>"}`.
     case toolInvoke(toolId: String)
 

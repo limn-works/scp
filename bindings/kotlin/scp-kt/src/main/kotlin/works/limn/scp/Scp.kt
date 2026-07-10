@@ -40,7 +40,7 @@ import uniffi.scp.KeyCustodyProvider
 import uniffi.scp.McpAllowlistState
 import uniffi.scp.McpInvokeResult
 import uniffi.scp.McpServerConfig
-import uniffi.scp.McpToolInfo
+import uniffi.scp.McpOutletInfo
 import uniffi.scp.MessageListener
 import uniffi.scp.Proof
 import uniffi.scp.PublishResult
@@ -51,8 +51,8 @@ import uniffi.scp.SealedInvitation
 import uniffi.scp.SqliteKeyMaterial
 import uniffi.scp.StorageConfig
 import uniffi.scp.SyncPolicyResult
-import uniffi.scp.ToolDefinition
-import uniffi.scp.ToolVerificationResult
+import uniffi.scp.OutletDefinition
+import uniffi.scp.OutletVerificationResult
 import uniffi.scp.TransportManager
 import uniffi.scp.TransportStatus
 import uniffi.scp.TrustScoreResult
@@ -1385,21 +1385,21 @@ class SCP internal constructor(
     /** Forwards to [NativeScp.mcpClientInvoke] on [inner]. */
     suspend fun mcpClientInvoke(
         handle: String,
-        toolName: String,
+        outletName: String,
         inputJson: String,
         contextId: String,
         invokerDid: String,
     ): McpInvokeResult =
         inner.mcpClientInvoke(
             handle = handle,
-            toolName = toolName,
+            outletName = outletName,
             inputJson = inputJson,
             contextId = contextId,
             invokerDid = invokerDid,
         )
 
     /** Forwards to [NativeScp.mcpClientListTools] on [inner]. */
-    suspend fun mcpClientListTools(handle: String): List<McpToolInfo> = inner.mcpClientListTools(handle = handle)
+    suspend fun mcpClientListTools(handle: String): List<McpOutletInfo> = inner.mcpClientListTools(handle = handle)
 
     /** Forwards to [NativeScp.mcpConfigureStdioAllowlist] on [inner]. */
     fun mcpConfigureStdioAllowlist(additionalBinaries: List<String>) =
@@ -1660,54 +1660,54 @@ class SCP internal constructor(
     /** Forwards to [NativeScp.tombstoneMigratedContext] on [inner]. */
     suspend fun tombstoneMigratedContext(handle: ContextHandle) = inner.tombstoneMigratedContext(handle = handle)
 
-    /** Forwards to [NativeScp.toolInterfaceAccept] on [inner]. */
-    suspend fun toolInterfaceAccept(
+    /** Forwards to [NativeScp.outletInterfaceAccept] on [inner]. */
+    suspend fun outletInterfaceAccept(
         handle: ContextHandle,
         interfaceJson: String,
     ): String =
-        inner.toolInterfaceAccept(
+        inner.outletInterfaceAccept(
             handle = handle,
             interfaceJson = interfaceJson,
         )
 
-    /** Forwards to [NativeScp.toolInterfaceExpose] on [inner]. */
-    suspend fun toolInterfaceExpose(
+    /** Forwards to [NativeScp.outletInterfaceExpose] on [inner]. */
+    suspend fun outletInterfaceExpose(
         handle: ContextHandle,
-        toolId: String,
+        outletId: String,
         targetContextId: String,
         rateLimitJson: String?,
     ): String =
-        inner.toolInterfaceExpose(
+        inner.outletInterfaceExpose(
             handle = handle,
-            toolId = toolId,
+            outletId = outletId,
             targetContextId = targetContextId,
             rateLimitJson = rateLimitJson,
         )
 
-    /** Forwards to [NativeScp.toolInterfaceRevoke] on [inner]. */
-    suspend fun toolInterfaceRevoke(
+    /** Forwards to [NativeScp.outletInterfaceRevoke] on [inner]. */
+    suspend fun outletInterfaceRevoke(
         handle: ContextHandle,
         interfaceIdHex: String,
     ): String =
-        inner.toolInterfaceRevoke(
+        inner.outletInterfaceRevoke(
             handle = handle,
             interfaceIdHex = interfaceIdHex,
         )
 
-    /** Forwards to [NativeScp.toolInvoke] on [inner]. */
+    /** Forwards to [NativeScp.outletInvoke] on [inner]. */
     @Suppress("LongParameterList")
-    suspend fun toolInvoke(
+    suspend fun outletInvoke(
         handle: ContextHandle,
-        toolId: String,
+        outletId: String,
         inputJson: String,
         identity: Identity,
         ucanToken: String?,
         proofTokens: List<String>?,
         spendingUcanJwt: String?,
     ): String =
-        inner.toolInvoke(
+        inner.outletInvoke(
             handle = handle,
-            toolId = toolId,
+            outletId = outletId,
             inputJson = inputJson,
             identity = identity,
             ucanToken = ucanToken,
@@ -1715,22 +1715,22 @@ class SCP internal constructor(
             spendingUcanJwt = spendingUcanJwt,
         )
 
-    /** Forwards to [NativeScp.toolInvokeCrossContext] on [inner]. */
+    /** Forwards to [NativeScp.outletInvokeCrossContext] on [inner]. */
     @Suppress("LongParameterList")
-    suspend fun toolInvokeCrossContext(
+    suspend fun outletInvokeCrossContext(
         sourceHandle: ContextHandle,
         targetHandle: ContextHandle,
-        toolId: String,
+        outletId: String,
         inputJson: String,
         identity: Identity,
         ucanToken: String,
         chainDepth: UByte,
         proofTokens: List<String>?,
     ): String =
-        inner.toolInvokeCrossContext(
+        inner.outletInvokeCrossContext(
             sourceHandle = sourceHandle,
             targetHandle = targetHandle,
-            toolId = toolId,
+            outletId = outletId,
             inputJson = inputJson,
             identity = identity,
             ucanToken = ucanToken,
@@ -1739,9 +1739,9 @@ class SCP internal constructor(
         )
 
     /**
-     * Runs the §6.2.4 atomic cross-context tool-invocation saga (ADR-049 §3a).
+     * Runs the §6.2.4 atomic cross-context outlet-invocation saga (ADR-049 §3a).
      *
-     * Forwards 1:1 to [NativeScp.toolInvokeCrossContextSaga] on [inner]. The
+     * Forwards 1:1 to [NativeScp.outletInvokeCrossContextSaga] on [inner]. The
      * call blocks until the saga reaches a terminal state: it returns a
      * [SagaResult] on commit (carrying the supervisor-minted `sagaId` plus the
      * target's signed receipt and captured output, each `null` when absent and
@@ -1763,32 +1763,32 @@ class SCP internal constructor(
      * 9-argument arity is dictated by the bridge op.
      *
      * @param sourceHandle The calling (source) context handle.
-     * @param targetHandle The context holding the tool to invoke.
+     * @param targetHandle The context holding the outlet to invoke.
      * @param callerDid The invoking principal's DID.
-     * @param toolRegistrationId The target tool's cross-context registration id.
-     * @param inputJson JSON-encoded tool input.
+     * @param outletRegistrationId The target outlet's cross-context registration id.
+     * @param inputJson JSON-encoded outlet input.
      * @param assertedNonceHex The asserted replay-protection nonce as hex.
      * @param timestampMs The invocation timestamp in milliseconds.
      * @param chainDepth Current cross-context chain depth (0 for first hop).
      * @param ucanProofId Optional UCAN proof id for delegation-chain traversal.
      */
     @Suppress("LongParameterList")
-    suspend fun toolInvokeCrossContextSaga(
+    suspend fun outletInvokeCrossContextSaga(
         sourceHandle: ContextHandle,
         targetHandle: ContextHandle,
         callerDid: String,
-        toolRegistrationId: String,
+        outletRegistrationId: String,
         inputJson: String,
         assertedNonceHex: String,
         timestampMs: ULong,
         chainDepth: UByte,
         ucanProofId: String?,
     ): SagaResult =
-        inner.toolInvokeCrossContextSaga(
+        inner.outletInvokeCrossContextSaga(
             sourceHandle = sourceHandle,
             targetHandle = targetHandle,
             callerDid = callerDid,
-            toolRegistrationId = toolRegistrationId,
+            outletRegistrationId = outletRegistrationId,
             inputJson = inputJson,
             assertedNonceHex = assertedNonceHex,
             timestampMs = timestampMs,
@@ -1796,42 +1796,42 @@ class SCP internal constructor(
             ucanProofId = ucanProofId,
         )
 
-    /** Forwards to [NativeScp.toolRegister] on [inner]. */
-    suspend fun toolRegister(
+    /** Forwards to [NativeScp.outletRegister] on [inner]. */
+    suspend fun outletRegister(
         handle: ContextHandle,
-        definition: ToolDefinition,
+        definition: OutletDefinition,
     ): String =
-        inner.toolRegister(
+        inner.outletRegister(
             handle = handle,
             definition = definition,
         )
 
-    /** Forwards to [NativeScp.toolSessionClose] on [inner]. */
-    suspend fun toolSessionClose(
+    /** Forwards to [NativeScp.outletSessionClose] on [inner]. */
+    suspend fun outletSessionClose(
         handle: ContextHandle,
         sessionId: String,
-    ) = inner.toolSessionClose(
+    ) = inner.outletSessionClose(
         handle = handle,
         sessionId = sessionId,
     )
 
-    /** Forwards to [NativeScp.toolSessionCreate] on [inner]. */
-    suspend fun toolSessionCreate(
+    /** Forwards to [NativeScp.outletSessionCreate] on [inner]. */
+    suspend fun outletSessionCreate(
         handle: ContextHandle,
-        toolId: String,
+        outletId: String,
         sourceContextId: String,
         ttlSeconds: ULong?,
     ): String =
-        inner.toolSessionCreate(
+        inner.outletSessionCreate(
             handle = handle,
-            toolId = toolId,
+            outletId = outletId,
             sourceContextId = sourceContextId,
             ttlSeconds = ttlSeconds,
         )
 
-    /** Forwards to [NativeScp.toolSessionInvoke] on [inner]. */
+    /** Forwards to [NativeScp.outletSessionInvoke] on [inner]. */
     @Suppress("LongParameterList")
-    suspend fun toolSessionInvoke(
+    suspend fun outletSessionInvoke(
         handle: ContextHandle,
         sessionId: String,
         inputJson: String,
@@ -1839,7 +1839,7 @@ class SCP internal constructor(
         ucanToken: String,
         proofTokens: List<String>?,
     ): String =
-        inner.toolSessionInvoke(
+        inner.outletSessionInvoke(
             handle = handle,
             sessionId = sessionId,
             inputJson = inputJson,
@@ -1848,14 +1848,14 @@ class SCP internal constructor(
             proofTokens = proofTokens,
         )
 
-    /** Forwards to [NativeScp.toolVerify] on [inner]. */
-    suspend fun toolVerify(
+    /** Forwards to [NativeScp.outletVerify] on [inner]. */
+    suspend fun outletVerify(
         handle: ContextHandle,
-        toolId: String,
-    ): ToolVerificationResult =
-        inner.toolVerify(
+        outletId: String,
+    ): OutletVerificationResult =
+        inner.outletVerify(
             handle = handle,
-            toolId = toolId,
+            outletId = outletId,
         )
 
     /** Forwards to [NativeScp.transportConnect] on [inner]. */

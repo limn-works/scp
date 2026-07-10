@@ -1,28 +1,28 @@
 /**
- * Tests for the tools module.
+ * Tests for the outlets module.
  *
- * Covers tool definition construction, cross-context invocation, and
- * stateful tool sessions via the SCP class method surface.
+ * Covers outlet definition construction, cross-context invocation, and
+ * stateful outlet sessions via the SCP class method surface.
  *
  * Phase 4 PR 4 (#1549, ADR-048) deleted the free-function shims
- * (`toolInvokeCrossContext`, `toolSessionCreate`, etc.) and the stateful
+ * (`outletInvokeCrossContext`, `outletSessionCreate`, etc.) and the stateful
  * mock bridge. Tests now drive the SDK through the Proxy-backed mock
  * native handle (`mountMockScp` / `createMockNativeScp`) configuring
  * stubs that emulate the NAPI surface.
  *
- * See ADR-010 (Tool Registry), spec sections 6.2 / 6.2.1, and ADR-048.
+ * See ADR-010 (Outlet Registry), spec sections 6.2 / 6.2.1, and ADR-048.
  */
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import {
+  OutletError,
   SagaAbortedError,
   SagaBusyError,
   SagaNeedsRepairError,
-  ToolError,
   ValidationError,
 } from "../src/errors";
+import { defineOutletDefinition } from "../src/outlets";
 import type { SCP } from "../src/scp";
-import { defineToolDefinition } from "../src/tools";
 import type { SagaResult } from "../src/types";
 import { type MockNativeScp, mountMockScp } from "./mock-bridge";
 
@@ -32,8 +32,8 @@ import { type MockNativeScp, mountMockScp } from "./mock-bridge";
 
 const IDENTITY_DID = "did:dht:z6MkTestIdentity";
 
-/** Installs a baseline stub set that mirrors the NAPI tool surface. */
-function installToolStubs(native: MockNativeScp): void {
+/** Installs a baseline stub set that mirrors the NAPI outlet surface. */
+function installOutletStubs(native: MockNativeScp): void {
   native.__stub("identityCreate", async () => ({
     did: IDENTITY_DID,
     custodyType: "in_memory",
@@ -55,18 +55,18 @@ function installToolStubs(native: MockNativeScp): void {
     closedContexts.add(h.contextId);
   });
 
-  let toolCounter = 0;
-  native.__stub("toolRegister", async () => {
-    toolCounter += 1;
-    return `tool-${toolCounter}`;
+  let outletCounter = 0;
+  native.__stub("outletRegister", async () => {
+    outletCounter += 1;
+    return `outlet-${outletCounter}`;
   });
 
   native.__stub(
-    "toolInvokeCrossContext",
-    async (sourceArg, targetArg, toolIdArg, _inputJson, invokerDidArg, _ucan, depthArg) => {
+    "outletInvokeCrossContext",
+    async (sourceArg, targetArg, outletIdArg, _inputJson, invokerDidArg, _ucan, depthArg) => {
       const source = sourceArg as { contextId: string };
       const target = targetArg as { contextId: string };
-      const toolId = toolIdArg as string;
+      const outletId = outletIdArg as string;
       const invokerDid = invokerDidArg as string;
       const chainDepth = depthArg as number;
 
@@ -82,7 +82,7 @@ function installToolStubs(native: MockNativeScp): void {
         throw new Error("[SCP-TOOL-6011] target context is not active");
       }
       return JSON.stringify({
-        tool: toolId,
+        outlet: outletId,
         status: "validated",
         invoker: invokerDid,
         chainDepth,
@@ -90,11 +90,11 @@ function installToolStubs(native: MockNativeScp): void {
     },
   );
 
-  const sessions = new Map<string, { closed: boolean; callCount: number; toolId: string }>();
+  const sessions = new Map<string, { closed: boolean; callCount: number; outletId: string }>();
   let sessionCounter = 0;
 
-  native.__stub("toolSessionCreate", async (_handle, toolIdArg, _source, ttlArg) => {
-    const toolId = toolIdArg as string;
+  native.__stub("outletSessionCreate", async (_handle, outletIdArg, _source, ttlArg) => {
+    const outletId = outletIdArg as string;
     const ttl = ttlArg as number | undefined | null;
     if (ttl !== undefined && ttl !== null) {
       if (!Number.isInteger(ttl) || ttl < 0) {
@@ -103,11 +103,11 @@ function installToolStubs(native: MockNativeScp): void {
     }
     sessionCounter += 1;
     const sessionId = `session-${sessionCounter}`;
-    sessions.set(sessionId, { closed: false, callCount: 0, toolId });
+    sessions.set(sessionId, { closed: false, callCount: 0, outletId });
     return sessionId;
   });
 
-  native.__stub("toolSessionInvoke", async (_handle, sessionIdArg) => {
+  native.__stub("outletSessionInvoke", async (_handle, sessionIdArg) => {
     const sessionId = sessionIdArg as string;
     const state = sessions.get(sessionId);
     if (state === undefined) {
@@ -118,14 +118,14 @@ function installToolStubs(native: MockNativeScp): void {
     }
     state.callCount += 1;
     return JSON.stringify({
-      tool: state.toolId,
+      outlet: state.outletId,
       session_id: sessionId,
       call_count: state.callCount,
       status: "validated",
     });
   });
 
-  native.__stub("toolSessionClose", async (_handle, sessionIdArg) => {
+  native.__stub("outletSessionClose", async (_handle, sessionIdArg) => {
     const sessionId = sessionIdArg as string;
     const state = sessions.get(sessionId);
     if (state === undefined) {
@@ -136,21 +136,21 @@ function installToolStubs(native: MockNativeScp): void {
 }
 
 // ---------------------------------------------------------------------------
-// defineToolDefinition
+// defineOutletDefinition
 // ---------------------------------------------------------------------------
 
-describe("defineToolDefinition", () => {
-  it("creates a valid tool definition", () => {
-    const def = defineToolDefinition({
-      name: "test-tool",
-      description: "A test tool",
+describe("defineOutletDefinition", () => {
+  it("creates a valid outlet definition", () => {
+    const def = defineOutletDefinition({
+      name: "test-outlet",
+      description: "A test outlet",
       inputSchema: { type: "object" },
       outputSchema: { type: "object" },
       operator: "did:dht:z6MkTest",
     });
 
-    expect(def.name).toBe("test-tool");
-    expect(def.description).toBe("A test tool");
+    expect(def.name).toBe("test-outlet");
+    expect(def.description).toBe("A test outlet");
     expect(def.operator).toBe("did:dht:z6MkTest");
   });
 
@@ -158,9 +158,9 @@ describe("defineToolDefinition", () => {
     const testVectors = [{ input: { x: 1 }, expectedOutput: { y: 2 }, description: "maps x to y" }];
     const hash = new Uint8Array(32);
 
-    const def = defineToolDefinition({
-      name: "test-tool",
-      description: "A test tool",
+    const def = defineOutletDefinition({
+      name: "test-outlet",
+      description: "A test outlet",
       inputSchema: { type: "object" },
       outputSchema: { type: "object" },
       operator: "did:dht:z6MkTest",
@@ -172,11 +172,11 @@ describe("defineToolDefinition", () => {
     expect(def.implementationHash).toBe(hash);
   });
 
-  it("rejects empty tool name", () => {
+  it("rejects empty outlet name", () => {
     expect(() =>
-      defineToolDefinition({
+      defineOutletDefinition({
         name: "",
-        description: "A test tool",
+        description: "A test outlet",
         inputSchema: { type: "object" },
         outputSchema: { type: "object" },
         operator: "did:dht:z6MkTest",
@@ -184,10 +184,10 @@ describe("defineToolDefinition", () => {
     ).toThrow(ValidationError);
   });
 
-  it("rejects empty tool description", () => {
+  it("rejects empty outlet description", () => {
     expect(() =>
-      defineToolDefinition({
-        name: "test-tool",
+      defineOutletDefinition({
+        name: "test-outlet",
         description: "",
         inputSchema: { type: "object" },
         outputSchema: { type: "object" },
@@ -198,9 +198,9 @@ describe("defineToolDefinition", () => {
 
   it("rejects empty operator DID", () => {
     expect(() =>
-      defineToolDefinition({
-        name: "test-tool",
-        description: "A test tool",
+      defineOutletDefinition({
+        name: "test-outlet",
+        description: "A test outlet",
         inputSchema: { type: "object" },
         outputSchema: { type: "object" },
         operator: "",
@@ -210,10 +210,10 @@ describe("defineToolDefinition", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Cross-context tool invocation (spec section 6.2) via scp.toolInvokeCrossContext
+// Cross-context outlet invocation (spec section 6.2) via scp.outletInvokeCrossContext
 // ---------------------------------------------------------------------------
 
-describe("scp.toolInvokeCrossContext", () => {
+describe("scp.outletInvokeCrossContext", () => {
   let scp: SCP;
   let native: MockNativeScp;
 
@@ -221,19 +221,19 @@ describe("scp.toolInvokeCrossContext", () => {
     const mount = mountMockScp();
     scp = mount.scp;
     native = mount.native;
-    installToolStubs(native);
+    installOutletStubs(native);
   });
 
   afterEach(async () => {
     await scp.shutdown(1);
   });
 
-  it("invokes a tool across contexts and returns result", async () => {
+  it("invokes a outlet across contexts and returns result", async () => {
     const identity = await scp.identityCreate("in_memory");
     const sourceHandle = await scp.contextCreate(identity, "{}");
     const targetHandle = await scp.contextCreate(identity, "{}");
 
-    const toolId = await scp.toolRegister(targetHandle._rawHandle, {
+    const outletId = await scp.outletRegister(targetHandle._rawHandle, {
       name: "calculator",
       description: "Adds numbers",
       inputSchema: { type: "object" },
@@ -241,17 +241,17 @@ describe("scp.toolInvokeCrossContext", () => {
       operator: identity.did,
     });
 
-    const outputJson = await scp.toolInvokeCrossContext(
+    const outputJson = await scp.outletInvokeCrossContext(
       sourceHandle._rawHandle,
       targetHandle._rawHandle,
-      toolId,
+      outletId,
       '{"a": 1}',
       identity.did,
       "mock-ucan-token",
       0,
     );
-    const output = JSON.parse(outputJson) as { tool: string; status: string };
-    expect(output.tool).toBe(toolId);
+    const output = JSON.parse(outputJson) as { outlet: string; status: string };
+    expect(output.outlet).toBe(outletId);
     expect(output.status).toBe("validated");
   });
 
@@ -261,10 +261,10 @@ describe("scp.toolInvokeCrossContext", () => {
     const targetHandle = await scp.contextCreate(identity, "{}");
 
     await expect(
-      scp.toolInvokeCrossContext(
+      scp.outletInvokeCrossContext(
         sourceHandle._rawHandle,
         targetHandle._rawHandle,
-        "tool-test",
+        "outlet-test",
         "{}",
         identity.did,
         "token",
@@ -278,18 +278,18 @@ describe("scp.toolInvokeCrossContext", () => {
     const sourceHandle = await scp.contextCreate(identity, "{}");
     const targetHandle = await scp.contextCreate(identity, "{}");
 
-    const toolId = await scp.toolRegister(targetHandle._rawHandle, {
-      name: "deep-tool",
-      description: "Deep chain tool",
+    const outletId = await scp.outletRegister(targetHandle._rawHandle, {
+      name: "deep-outlet",
+      description: "Deep chain outlet",
       inputSchema: { type: "object" },
       outputSchema: { type: "object" },
       operator: identity.did,
     });
 
-    const outputJson = await scp.toolInvokeCrossContext(
+    const outputJson = await scp.outletInvokeCrossContext(
       sourceHandle._rawHandle,
       targetHandle._rawHandle,
-      toolId,
+      outletId,
       "{}",
       identity.did,
       "token",
@@ -305,10 +305,10 @@ describe("scp.toolInvokeCrossContext", () => {
     const targetHandle = await scp.contextCreate(identity, "{}");
 
     await expect(
-      scp.toolInvokeCrossContext(
+      scp.outletInvokeCrossContext(
         sourceHandle._rawHandle,
         targetHandle._rawHandle,
-        "tool-test",
+        "outlet-test",
         "{}",
         identity.did,
         "token",
@@ -323,10 +323,10 @@ describe("scp.toolInvokeCrossContext", () => {
     const targetHandle = await scp.contextCreate(identity, "{}");
 
     await expect(
-      scp.toolInvokeCrossContext(
+      scp.outletInvokeCrossContext(
         sourceHandle._rawHandle,
         targetHandle._rawHandle,
-        "tool-test",
+        "outlet-test",
         "{}",
         identity.did,
         "token",
@@ -343,10 +343,10 @@ describe("scp.toolInvokeCrossContext", () => {
     await scp.contextClose(sourceHandle._rawHandle, identity.did);
 
     await expect(
-      scp.toolInvokeCrossContext(
+      scp.outletInvokeCrossContext(
         sourceHandle._rawHandle,
         targetHandle._rawHandle,
-        "tool-test",
+        "outlet-test",
         "{}",
         identity.did,
         "token",
@@ -363,10 +363,10 @@ describe("scp.toolInvokeCrossContext", () => {
     await scp.contextClose(targetHandle._rawHandle, identity.did);
 
     await expect(
-      scp.toolInvokeCrossContext(
+      scp.outletInvokeCrossContext(
         sourceHandle._rawHandle,
         targetHandle._rawHandle,
-        "tool-test",
+        "outlet-test",
         "{}",
         identity.did,
         "token",
@@ -377,13 +377,13 @@ describe("scp.toolInvokeCrossContext", () => {
 });
 
 // ---------------------------------------------------------------------------
-// §6.2.4 cross-context tool-invocation saga via scp.toolInvokeCrossContextSaga
+// §6.2.4 cross-context outlet-invocation saga via scp.outletInvokeCrossContextSaga
 // ---------------------------------------------------------------------------
 
 const NONCE_HEX = "00".repeat(16);
 const TS_MS = 1_700_000_000_000n;
 
-describe("scp.toolInvokeCrossContextSaga", () => {
+describe("scp.outletInvokeCrossContextSaga", () => {
   let scp: SCP;
   let native: MockNativeScp;
 
@@ -391,7 +391,7 @@ describe("scp.toolInvokeCrossContextSaga", () => {
     const mount = mountMockScp();
     scp = mount.scp;
     native = mount.native;
-    installToolStubs(native);
+    installOutletStubs(native);
   });
 
   afterEach(async () => {
@@ -414,11 +414,11 @@ describe("scp.toolInvokeCrossContextSaga", () => {
     chainDepth?: number;
   }): Promise<SagaResult> {
     const { did, source, target } = await handles();
-    return await scp.toolInvokeCrossContextSaga(
+    return await scp.outletInvokeCrossContextSaga(
       overrides.source ?? source,
       overrides.target ?? target,
       did,
-      "tool-reg-1",
+      "outlet-reg-1",
       '{"a":1}',
       NONCE_HEX,
       overrides.timestampMs ?? TS_MS,
@@ -427,7 +427,7 @@ describe("scp.toolInvokeCrossContextSaga", () => {
   }
 
   it("commits and returns sagaId plus receipt/output bytes", async () => {
-    native.__stub("toolInvokeCrossContextSaga", async () => ({
+    native.__stub("outletInvokeCrossContextSaga", async () => ({
       sagaId: "saga-abc",
       receipt: Buffer.from([1, 2, 3]),
       output: Buffer.from([4, 5, 6]),
@@ -442,7 +442,7 @@ describe("scp.toolInvokeCrossContextSaga", () => {
   });
 
   it("surfaces an omitted receipt as null (never synthesized)", async () => {
-    native.__stub("toolInvokeCrossContextSaga", async () => ({
+    native.__stub("outletInvokeCrossContextSaga", async () => ({
       sagaId: "saga-noreceipt",
       output: Buffer.from([9]),
     }));
@@ -454,7 +454,7 @@ describe("scp.toolInvokeCrossContextSaga", () => {
   });
 
   it("surfaces an omitted output as null (never synthesized)", async () => {
-    native.__stub("toolInvokeCrossContextSaga", async () => ({
+    native.__stub("outletInvokeCrossContextSaga", async () => ({
       sagaId: "saga-nooutput",
       receipt: Buffer.from([7]),
     }));
@@ -466,26 +466,26 @@ describe("scp.toolInvokeCrossContextSaga", () => {
   });
 
   it("forwards all nine arguments to the native saga op in order", async () => {
-    native.__stub("toolInvokeCrossContextSaga", async () => ({ sagaId: "ok" }));
+    native.__stub("outletInvokeCrossContextSaga", async () => ({ sagaId: "ok" }));
 
     // Opaque sentinel handles — the wrapper forwards them verbatim.
     const source = { __h: "SRC" };
     const target = { __h: "TGT" };
     // Distinct discriminating values for the four same-typed string params so a
-    // positional swap (caller/tool-reg/input/nonce) is caught, not masked by a
+    // positional swap (caller/outlet-reg/input/nonce) is caught, not masked by a
     // shared literal.
     const callerDid = "caller-DID-aaa";
-    const toolRegistrationId = "tool-reg-bbb";
+    const outletRegistrationId = "outlet-reg-bbb";
     const inputJson = '{"in":"ccc"}';
     const assertedNonceHex = "dd".repeat(16);
     const chainDepth = 7;
     const ucanProofId = "ucan-proof-eee";
 
-    await scp.toolInvokeCrossContextSaga(
+    await scp.outletInvokeCrossContextSaga(
       source,
       target,
       callerDid,
-      toolRegistrationId,
+      outletRegistrationId,
       inputJson,
       assertedNonceHex,
       TS_MS,
@@ -493,13 +493,13 @@ describe("scp.toolInvokeCrossContextSaga", () => {
       ucanProofId,
     );
 
-    const call = native.__lastCall("toolInvokeCrossContextSaga");
+    const call = native.__lastCall("outletInvokeCrossContextSaga");
     expect(call).toBeDefined();
     expect(call?.args).toEqual([
       source,
       target,
       callerDid,
-      toolRegistrationId,
+      outletRegistrationId,
       inputJson,
       assertedNonceHex,
       TS_MS,
@@ -509,7 +509,7 @@ describe("scp.toolInvokeCrossContextSaga", () => {
   });
 
   it("accepts chainDepth at the u8 bounds (0 and 255)", async () => {
-    native.__stub("toolInvokeCrossContextSaga", async () => ({ sagaId: "ok" }));
+    native.__stub("outletInvokeCrossContextSaga", async () => ({ sagaId: "ok" }));
 
     expect((await invoke({ chainDepth: 0 })).sagaId).toBe("ok");
     expect((await invoke({ chainDepth: 255 })).sagaId).toBe("ok");
@@ -528,13 +528,13 @@ describe("scp.toolInvokeCrossContextSaga", () => {
   });
 
   it("rejects a fractional chainDepth before dispatching to native (fail-fast)", async () => {
-    native.__stub("toolInvokeCrossContextSaga", async () => ({ sagaId: "should-not-reach" }));
+    native.__stub("outletInvokeCrossContextSaga", async () => ({ sagaId: "should-not-reach" }));
 
     const err = await invoke({ chainDepth: 1.5 }).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(ValidationError);
     expect((err as ValidationError).code).toBe("SCP-VALID-7002");
     // Fail-fast: the validation guard rejects before the native saga op runs.
-    expect(native.__calls("toolInvokeCrossContextSaga")).toHaveLength(0);
+    expect(native.__calls("outletInvokeCrossContextSaga")).toHaveLength(0);
   });
 
   it("rejects a negative bigint timestampMs", async () => {
@@ -552,7 +552,7 @@ describe("scp.toolInvokeCrossContextSaga", () => {
   });
 
   it("maps the aborted Display string to SagaAbortedError with retryAfterMs", async () => {
-    native.__stub("toolInvokeCrossContextSaga", async () => {
+    native.__stub("outletInvokeCrossContextSaga", async () => {
       throw new Error("[SCP-SAGA-13067] saga aborted: rate limited (retry_after_ms=2500)");
     });
 
@@ -562,7 +562,7 @@ describe("scp.toolInvokeCrossContextSaga", () => {
   });
 
   it("maps a null retry_after_ms suffix to retryAfterMs null (never 0)", async () => {
-    native.__stub("toolInvokeCrossContextSaga", async () => {
+    native.__stub("outletInvokeCrossContextSaga", async () => {
       throw new Error("[SCP-SAGA-13067] saga aborted: hard limit (retry_after_ms=null)");
     });
 
@@ -572,7 +572,7 @@ describe("scp.toolInvokeCrossContextSaga", () => {
   });
 
   it("maps the needs-repair Display string to SagaNeedsRepairError with sagaId", async () => {
-    native.__stub("toolInvokeCrossContextSaga", async () => {
+    native.__stub("outletInvokeCrossContextSaga", async () => {
       throw new Error("[SCP-SAGA-13065] saga needs repair: diverged (saga_id=repair-77)");
     });
 
@@ -582,7 +582,7 @@ describe("scp.toolInvokeCrossContextSaga", () => {
   });
 
   it("maps the busy Display string to SagaBusyError with contendedContext", async () => {
-    native.__stub("toolInvokeCrossContextSaga", async () => {
+    native.__stub("outletInvokeCrossContextSaga", async () => {
       throw new Error("[SCP-SAGA-13066] saga busy: overlap (contended_context=ctx-shared)");
     });
 
@@ -591,13 +591,13 @@ describe("scp.toolInvokeCrossContextSaga", () => {
     expect((err as SagaBusyError).contendedContext).toBe("ctx-shared");
   });
 
-  it("maps a non-saga bridge error to ToolError (not a saga subclass)", async () => {
-    native.__stub("toolInvokeCrossContextSaga", async () => {
-      throw new Error("[SCP-TOOL-6011] tool error: target context is not active");
+  it("maps a non-saga bridge error to OutletError (not a saga subclass)", async () => {
+    native.__stub("outletInvokeCrossContextSaga", async () => {
+      throw new Error("[SCP-TOOL-6011] outlet error: target context is not active");
     });
 
     const err = await invoke({}).catch((e: unknown) => e);
-    expect(err).toBeInstanceOf(ToolError);
+    expect(err).toBeInstanceOf(OutletError);
     expect(err).not.toBeInstanceOf(SagaAbortedError);
     expect(err).not.toBeInstanceOf(SagaNeedsRepairError);
     expect(err).not.toBeInstanceOf(SagaBusyError);
@@ -605,10 +605,10 @@ describe("scp.toolInvokeCrossContextSaga", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Stateful tool sessions (spec section 6.2.1) via scp.toolSession*
+// Stateful outlet sessions (spec section 6.2.1) via scp.outletSession*
 // ---------------------------------------------------------------------------
 
-describe("scp.toolSessionCreate", () => {
+describe("scp.outletSessionCreate", () => {
   let scp: SCP;
   let native: MockNativeScp;
 
@@ -616,7 +616,7 @@ describe("scp.toolSessionCreate", () => {
     const mount = mountMockScp();
     scp = mount.scp;
     native = mount.native;
-    installToolStubs(native);
+    installOutletStubs(native);
   });
 
   afterEach(async () => {
@@ -626,15 +626,15 @@ describe("scp.toolSessionCreate", () => {
   it("creates a session and returns a session ID", async () => {
     const identity = await scp.identityCreate("in_memory");
     const handle = await scp.contextCreate(identity, "{}");
-    const toolId = await scp.toolRegister(handle._rawHandle, {
-      name: "stateful-tool",
-      description: "A stateful tool",
+    const outletId = await scp.outletRegister(handle._rawHandle, {
+      name: "stateful-outlet",
+      description: "A stateful outlet",
       inputSchema: { type: "object" },
       outputSchema: { type: "object" },
       operator: identity.did,
     });
 
-    const sessionId = await scp.toolSessionCreate(handle._rawHandle, toolId, "source-ctx-1");
+    const sessionId = await scp.outletSessionCreate(handle._rawHandle, outletId, "source-ctx-1");
     expect(typeof sessionId).toBe("string");
     expect(sessionId.length).toBeGreaterThan(0);
   });
@@ -642,15 +642,20 @@ describe("scp.toolSessionCreate", () => {
   it("creates a session with TTL", async () => {
     const identity = await scp.identityCreate("in_memory");
     const handle = await scp.contextCreate(identity, "{}");
-    const toolId = await scp.toolRegister(handle._rawHandle, {
-      name: "ttl-tool",
-      description: "TTL tool",
+    const outletId = await scp.outletRegister(handle._rawHandle, {
+      name: "ttl-outlet",
+      description: "TTL outlet",
       inputSchema: { type: "object" },
       outputSchema: { type: "object" },
       operator: identity.did,
     });
 
-    const sessionId = await scp.toolSessionCreate(handle._rawHandle, toolId, "source-ctx-1", 300);
+    const sessionId = await scp.outletSessionCreate(
+      handle._rawHandle,
+      outletId,
+      "source-ctx-1",
+      300,
+    );
     expect(typeof sessionId).toBe("string");
   });
 
@@ -659,7 +664,7 @@ describe("scp.toolSessionCreate", () => {
     const handle = await scp.contextCreate(identity, "{}");
 
     await expect(
-      scp.toolSessionCreate(handle._rawHandle, "tool-test", "source-ctx-1", -1),
+      scp.outletSessionCreate(handle._rawHandle, "outlet-test", "source-ctx-1", -1),
     ).rejects.toThrow(/SCP-VALID-7003/);
   });
 
@@ -668,12 +673,12 @@ describe("scp.toolSessionCreate", () => {
     const handle = await scp.contextCreate(identity, "{}");
 
     await expect(
-      scp.toolSessionCreate(handle._rawHandle, "tool-test", "source-ctx-1", 1.5),
+      scp.outletSessionCreate(handle._rawHandle, "outlet-test", "source-ctx-1", 1.5),
     ).rejects.toThrow(/SCP-VALID-7003/);
   });
 });
 
-describe("scp.toolSessionInvoke", () => {
+describe("scp.outletSessionInvoke", () => {
   let scp: SCP;
   let native: MockNativeScp;
 
@@ -681,26 +686,26 @@ describe("scp.toolSessionInvoke", () => {
     const mount = mountMockScp();
     scp = mount.scp;
     native = mount.native;
-    installToolStubs(native);
+    installOutletStubs(native);
   });
 
   afterEach(async () => {
     await scp.shutdown(1);
   });
 
-  it("invokes a tool within a session and returns result with call-count provenance", async () => {
+  it("invokes a outlet within a session and returns result with call-count provenance", async () => {
     const identity = await scp.identityCreate("in_memory");
     const handle = await scp.contextCreate(identity, "{}");
-    const toolId = await scp.toolRegister(handle._rawHandle, {
-      name: "session-tool",
-      description: "A session tool",
+    const outletId = await scp.outletRegister(handle._rawHandle, {
+      name: "session-outlet",
+      description: "A session outlet",
       inputSchema: { type: "object" },
       outputSchema: { type: "object" },
       operator: identity.did,
     });
 
-    const sessionId = await scp.toolSessionCreate(handle._rawHandle, toolId, "source-ctx-1");
-    const outputJson = await scp.toolSessionInvoke(
+    const sessionId = await scp.outletSessionCreate(handle._rawHandle, outletId, "source-ctx-1");
+    const outputJson = await scp.outletSessionInvoke(
       handle._rawHandle,
       sessionId,
       '{"x": 42}',
@@ -708,12 +713,12 @@ describe("scp.toolSessionInvoke", () => {
       "mock-ucan-token",
     );
     const parsed = JSON.parse(outputJson) as {
-      tool: string;
+      outlet: string;
       session_id: string;
       call_count: number;
       status: string;
     };
-    expect(parsed.tool).toBe(toolId);
+    expect(parsed.outlet).toBe(outletId);
     expect(parsed.session_id).toBe(sessionId);
     expect(parsed.call_count).toBe(1);
     expect(parsed.status).toBe("validated");
@@ -722,18 +727,18 @@ describe("scp.toolSessionInvoke", () => {
   it("increments call count across invocations", async () => {
     const identity = await scp.identityCreate("in_memory");
     const handle = await scp.contextCreate(identity, "{}");
-    const toolId = await scp.toolRegister(handle._rawHandle, {
-      name: "counter-tool",
+    const outletId = await scp.outletRegister(handle._rawHandle, {
+      name: "counter-outlet",
       description: "Counts calls",
       inputSchema: { type: "object" },
       outputSchema: { type: "object" },
       operator: identity.did,
     });
 
-    const sessionId = await scp.toolSessionCreate(handle._rawHandle, toolId, "source-ctx-1");
+    const sessionId = await scp.outletSessionCreate(handle._rawHandle, outletId, "source-ctx-1");
 
-    await scp.toolSessionInvoke(handle._rawHandle, sessionId, "{}", identity.did, "token");
-    const outputJson = await scp.toolSessionInvoke(
+    await scp.outletSessionInvoke(handle._rawHandle, sessionId, "{}", identity.did, "token");
+    const outputJson = await scp.outletSessionInvoke(
       handle._rawHandle,
       sessionId,
       "{}",
@@ -745,7 +750,7 @@ describe("scp.toolSessionInvoke", () => {
   });
 });
 
-describe("scp.toolSessionClose", () => {
+describe("scp.outletSessionClose", () => {
   let scp: SCP;
   let native: MockNativeScp;
 
@@ -753,7 +758,7 @@ describe("scp.toolSessionClose", () => {
     const mount = mountMockScp();
     scp = mount.scp;
     native = mount.native;
-    installToolStubs(native);
+    installOutletStubs(native);
   });
 
   afterEach(async () => {
@@ -763,19 +768,19 @@ describe("scp.toolSessionClose", () => {
   it("closes a session successfully", async () => {
     const identity = await scp.identityCreate("in_memory");
     const handle = await scp.contextCreate(identity, "{}");
-    const toolId = await scp.toolRegister(handle._rawHandle, {
-      name: "closable-tool",
+    const outletId = await scp.outletRegister(handle._rawHandle, {
+      name: "closable-outlet",
       description: "Can be closed",
       inputSchema: { type: "object" },
       outputSchema: { type: "object" },
       operator: identity.did,
     });
 
-    const sessionId = await scp.toolSessionCreate(handle._rawHandle, toolId, "source-ctx-1");
-    await scp.toolSessionClose(handle._rawHandle, sessionId);
+    const sessionId = await scp.outletSessionCreate(handle._rawHandle, outletId, "source-ctx-1");
+    await scp.outletSessionClose(handle._rawHandle, sessionId);
 
     await expect(
-      scp.toolSessionInvoke(handle._rawHandle, sessionId, "{}", identity.did, "token"),
+      scp.outletSessionInvoke(handle._rawHandle, sessionId, "{}", identity.did, "token"),
     ).rejects.toThrow(/SCP-TOOL-6018/);
   });
 
@@ -783,7 +788,7 @@ describe("scp.toolSessionClose", () => {
     const identity = await scp.identityCreate("in_memory");
     const handle = await scp.contextCreate(identity, "{}");
 
-    await expect(scp.toolSessionClose(handle._rawHandle, "nonexistent-session")).rejects.toThrow(
+    await expect(scp.outletSessionClose(handle._rawHandle, "nonexistent-session")).rejects.toThrow(
       /SCP-TOOL-6021/,
     );
   });

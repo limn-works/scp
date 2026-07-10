@@ -14,6 +14,7 @@ import type {
   DIDDocument,
   Event,
   Message,
+  OutletDefinition,
   ParticipationFact,
   ParticipationProfile,
   ParticipationThreshold,
@@ -21,7 +22,6 @@ import type {
   RequireParticipation,
   ResolutionPath,
   SiteConfig,
-  ToolDefinition,
   TransportStatus,
   TrustLevel,
   UcanToken,
@@ -80,8 +80,8 @@ describe("type definitions", () => {
     expect(doc.verificationMethods).toHaveLength(1);
   });
 
-  it("ToolDefinition has all required fields", () => {
-    const def: ToolDefinition = {
+  it("OutletDefinition has all required fields", () => {
+    const def: OutletDefinition = {
       name: "calculator",
       description: "Simple calculator",
       inputSchema: { type: "object" },

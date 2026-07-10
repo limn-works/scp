@@ -1,8 +1,8 @@
 @testable import SCP
 import XCTest
 
-/// Tests for the §6.2.4 cross-context tool-invocation saga SDK wrapper
-/// (`Context.invokeToolCrossContextSaga`, PR-6c slice 3/4).
+/// Tests for the §6.2.4 cross-context outlet-invocation saga SDK wrapper
+/// (`Context.invokeOutletCrossContextSaga`, PR-6c slice 3/4).
 ///
 /// The Swift SDK surfaces the generated UniFFI types directly: the saga
 /// terminal is the generated `SagaResult` (faithful nullable), and the
@@ -14,12 +14,12 @@ import XCTest
 ///   - the public type surface (SagaResult faithful pass-through incl. nil;
 ///     the three typed ScpError.Saga* cases carrying their fields), and
 ///   - the wrapper-layer guards that mirror the sibling
-///     `invokeToolCrossContext` (source-active + UTF-8 input), and
+///     `invokeOutletCrossContext` (source-active + UTF-8 input), and
 ///   - end-to-end argument forwarding through the real UniFFI bridge.
 ///
 /// The suite links the Rust binary built with `allow_in_memory_custody`, so
-/// contexts and tool registration run against the real engine.
-final class ToolSagaTests: XCTestCase {
+/// contexts and outlet registration run against the real engine.
+final class OutletSagaTests: XCTestCase {
     // Implicitly unwrapped because XCTest `setUp` initializes it before any
     // test method runs — the XCTest lifecycle guarantees non-nil.
     // swiftlint:disable:next implicitly_unwrapped_optional
@@ -41,7 +41,7 @@ final class ToolSagaTests: XCTestCase {
     private func makeParams() -> ContextParams {
         ContextParams(
             mode: .encrypted,
-            ceiling: ["messages:read", "messages:write", "tool:invoke:*", "tool:register", "context:close"],
+            ceiling: ["messages:read", "messages:write", "tool:invoke:*", "outlet:register", "context:close"],
             ceilingPolicy: .immutable,
             governance: .singleAdmin,
             memoryScope: .ephemeral,
@@ -158,7 +158,7 @@ final class ToolSagaTests: XCTestCase {
         XCTAssertEqual(contendedContext, "ctx-shared-42")
     }
 
-    // MARK: - Wrapper guards (mirror the sibling invokeToolCrossContext)
+    // MARK: - Wrapper guards (mirror the sibling invokeOutletCrossContext)
 
     /// A non-active source context is rejected before any bridge call with
     /// `ScpError.Context` `SCP-CTX-2001`.
@@ -172,10 +172,10 @@ final class ToolSagaTests: XCTestCase {
         do {
             // The source-active guard fires before the registration id is ever
             // used, so a placeholder id is sufficient to exercise it.
-            _ = try await source.invokeToolCrossContextSaga(
+            _ = try await source.invokeOutletCrossContextSaga(
                 targetContext: target,
                 callerDid: identity.did(),
-                toolRegistrationId: "placeholder-registration-id",
+                outletRegistrationId: "placeholder-registration-id",
                 input: Data(#"{"city":"Berlin"}"#.utf8),
                 assertedNonceHex: nonceHex,
                 timestampMs: nowMs(),
@@ -188,7 +188,7 @@ final class ToolSagaTests: XCTestCase {
     }
 
     /// Non-UTF-8 input is rejected at the wrapper boundary with
-    /// `ScpError.Tool` `SCP-TOOL-6001` (mirrors the sibling's UTF-8 guard).
+    /// `ScpError.Outlet` `SCP-TOOL-6001` (mirrors the sibling's UTF-8 guard).
     func testSagaRejectsNonUtf8Input() async throws {
         let identity = try await scp.identityCreate(custody: "in_memory")
         let source = try await makeContext(identity: identity)
@@ -199,17 +199,17 @@ final class ToolSagaTests: XCTestCase {
 
         do {
             // The UTF-8 guard fires before the registration id is used.
-            _ = try await source.invokeToolCrossContextSaga(
+            _ = try await source.invokeOutletCrossContextSaga(
                 targetContext: target,
                 callerDid: identity.did(),
-                toolRegistrationId: "placeholder-registration-id",
+                outletRegistrationId: "placeholder-registration-id",
                 input: badInput,
                 assertedNonceHex: nonceHex,
                 timestampMs: nowMs(),
                 chainDepth: 0
             )
-            XCTFail("expected ScpError.Tool for non-UTF-8 input")
-        } catch let ScpError.Tool(_, code) {
+            XCTFail("expected ScpError.Outlet for non-UTF-8 input")
+        } catch let ScpError.Outlet(_, code) {
             XCTAssertEqual(code, "SCP-TOOL-6001")
         }
     }
@@ -220,13 +220,13 @@ final class ToolSagaTests: XCTestCase {
     /// past both guards into the real saga. Without bidirectional consent the
     /// supervisor reaches a non-committed terminal, so the call surfaces a
     /// typed `ScpError` — never the wrapper-layer guard codes. That proves the
-    /// nine arguments (both handles, `callerDid`, `toolRegistrationId`,
+    /// nine arguments (both handles, `callerDid`, `outletRegistrationId`,
     /// `inputJson`, nonce, timestamp, depth, optional proof) reach the bridge.
     ///
     /// This is a bridge-linkage smoke test: it confirms the call reaches the
     /// real bridge past both wrapper guards, but does not assert per-argument
     /// positional fidelity (a same-typed swap, e.g. `callerDid` ↔
-    /// `toolRegistrationId`, would not be caught here — that assurance lives in
+    /// `outletRegistrationId`, would not be caught here — that assurance lives in
     /// the Rust/integration tests, since asserting it at this wrapper unit
     /// layer would require committed-saga bidirectional-consent setup).
     func testSagaForwardsArgumentsToBridge() async throws {
@@ -234,13 +234,13 @@ final class ToolSagaTests: XCTestCase {
         let identity = try await scp.identityCreate(custody: "in_memory")
         let source = try await makeContext(identity: identity)
         let target = try await makeContext(identity: identity)
-        let toolId = try await target.registerTool(weatherTool(operatorDid: identity.did()))
+        let outletId = try await target.registerOutlet(weatherOutlet(operatorDid: identity.did()))
 
         do {
-            let result = try await source.invokeToolCrossContextSaga(
+            let result = try await source.invokeOutletCrossContextSaga(
                 targetContext: target,
                 callerDid: identity.did(),
-                toolRegistrationId: toolId,
+                outletRegistrationId: outletId,
                 input: Data(#"{"city":"Berlin","unit":"C"}"#.utf8),
                 assertedNonceHex: nonceHex,
                 timestampMs: nowMs(),
@@ -252,7 +252,7 @@ final class ToolSagaTests: XCTestCase {
             XCTAssertFalse(result.sagaId.isEmpty, "committed saga must carry a sagaId")
         } catch let ScpError.Context(_, code) {
             XCTAssertNotEqual(code, "SCP-CTX-2001", "must forward past the source-active guard")
-        } catch let ScpError.Tool(_, code) {
+        } catch let ScpError.Outlet(_, code) {
             XCTAssertNotEqual(code, "SCP-TOOL-6001", "must forward past the UTF-8 guard")
         } catch {
             // Any other ScpError (e.g. a typed Saga* terminal or a
@@ -264,8 +264,8 @@ final class ToolSagaTests: XCTestCase {
 
     // MARK: - Fixtures
 
-    private func weatherTool(operatorDid: String) -> ToolDefinition {
-        ToolDefinition(
+    private func weatherOutlet(operatorDid: String) -> OutletDefinition {
+        OutletDefinition(
             name: "weather",
             description: "Get current weather for a city",
             inputSchemaJson: #"{"type":"object","properties":{"city":{"type":"string"},"unit":{"type":"string"}},"required":["city"]}"#,

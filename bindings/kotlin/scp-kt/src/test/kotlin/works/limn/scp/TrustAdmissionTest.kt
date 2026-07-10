@@ -201,8 +201,8 @@ class TrustAdmissionTest {
                         verificationId = "v-1",
                         verifierDid = "did:dht:zVerifier",
                         subjectDid = "did:dht:zResponder",
-                        capabilityUri = "scp:capability:tool-integrity/v1",
-                        challengeType = "scp:capability:tool-integrity/v1",
+                        capabilityUri = "scp:capability:outlet-integrity/v1",
+                        challengeType = "scp:capability:outlet-integrity/v1",
                         verificationMethod = ChallengeVerificationMethod.SelfAttested,
                         passed = false,
                         testCount = 3u,
@@ -244,8 +244,8 @@ class TrustAdmissionTest {
                 verificationId = "v-bad",
                 verifierDid = "did:dht:zVerifier",
                 subjectDid = "did:dht:zResponder",
-                capabilityUri = "scp:capability:tool-integrity/v1",
-                challengeType = "scp:capability:tool-integrity/v1",
+                capabilityUri = "scp:capability:outlet-integrity/v1",
+                challengeType = "scp:capability:outlet-integrity/v1",
                 verificationMethod = ChallengeVerificationMethod.SelfAttested,
                 passed = true,
                 testCount = 1u,
@@ -269,11 +269,11 @@ class TrustAdmissionTest {
     @Test
     fun `agent capabilities encode as a plain string array`() {
         assertJsonEquals(
-            """["scp:capability:messages-write/v1","scp:capability:tool-invoke/v1"]""",
+            """["scp:capability:messages-write/v1","scp:capability:outlet-invoke/v1"]""",
             encodeAgentCapabilitiesJson(
                 listOf(
                     "scp:capability:messages-write/v1",
-                    "scp:capability:tool-invoke/v1",
+                    "scp:capability:outlet-invoke/v1",
                 ),
             ),
         )
@@ -299,7 +299,7 @@ class TrustAdmissionTest {
             listOf(
                 ChallengeVerificationMethod.SelfAttested,
                 ChallengeVerificationMethod.ChallengeVerified(
-                    challengeType = "scp:capability:tool-integrity/v1",
+                    challengeType = "scp:capability:outlet-integrity/v1",
                 ),
             )
         for (method in methods) {

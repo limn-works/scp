@@ -1,17 +1,17 @@
-"""Tests for SCP Python SDK tool wrappers (cross-context invocation and sessions).
+"""Tests for SCP Python SDK outlet wrappers (cross-context invocation and sessions).
 
-Phase 4 PR 5 Agent B+C (#1549) moved the cross-context / session tool
+Phase 4 PR 5 Agent B+C (#1549) moved the cross-context / session outlet
 helpers onto :class:`scp_sdk.SCP`:
 
-- :meth:`SCP.tool_invoke_cross_context` — cross-context invocation (§6.2)
-- :meth:`SCP.tool_session_create` / :meth:`SCP.tool_session_invoke`
-  / :meth:`SCP.tool_session_close` — stateful tool sessions (§6.2.1)
+- :meth:`SCP.outlet_invoke_cross_context` — cross-context invocation (§6.2)
+- :meth:`SCP.outlet_session_create` / :meth:`SCP.outlet_session_invoke`
+  / :meth:`SCP.outlet_session_close` — stateful outlet sessions (§6.2.1)
 
 These tests verify the SCP-level surface with mocked ``_native`` bridges:
 
-- ``chain_depth`` validation in :meth:`SCP.tool_invoke_cross_context`
+- ``chain_depth`` validation in :meth:`SCP.outlet_invoke_cross_context`
   (0 OK, 255 OK, negative/overflow/float/bool rejected)
-- ``ttl_seconds`` validation in :meth:`SCP.tool_session_create`
+- ``ttl_seconds`` validation in :meth:`SCP.outlet_session_create`
   (None OK, 0 OK, negative/float/bool rejected)
 
 Tests mock the PyO3 ``_native`` bridge; no Rust extension required.
@@ -27,16 +27,16 @@ from scp_sdk.errors import (
     ContextError,
     CryptoError,
     IdentityError,
+    OutletError,
     ScpError,
-    ToolError,
     TransportError,
     UcanPermissionError,
     ValidationError,
 )
-from scp_sdk.tools import _translate_bridge_error
+from scp_sdk.outlets import _translate_bridge_error
 
 # ---------------------------------------------------------------------------
-# _translate_bridge_error tests (still in scp_sdk.tools)
+# _translate_bridge_error tests (still in scp_sdk.outlets)
 # ---------------------------------------------------------------------------
 
 
@@ -51,7 +51,7 @@ class TestTranslateBridgeError:
             ("UcanError", UcanPermissionError),
             ("CryptoError", CryptoError),
             ("TransportError", TransportError),
-            ("ToolError", ToolError),
+            ("OutletError", OutletError),
             ("ValidationError", ValidationError),
         ],
     )
@@ -99,7 +99,7 @@ def _make_scp(native: MagicMock | None = None) -> MagicMock:
 
 
 # ---------------------------------------------------------------------------
-# chain_depth validation tests (SCP.tool_invoke_cross_context)
+# chain_depth validation tests (SCP.outlet_invoke_cross_context)
 # ---------------------------------------------------------------------------
 
 
@@ -110,10 +110,10 @@ class TestChainDepthValidation:
         from scp_sdk.scp import SCP
 
         native = MagicMock()
-        native.tool_invoke_cross_context.return_value = {"ok": True}
+        native.outlet_invoke_cross_context.return_value = {"ok": True}
         scp = _make_scp(native)
 
-        result = await SCP.tool_invoke_cross_context(
+        result = await SCP.outlet_invoke_cross_context(
             scp,
             _DUMMY_CTX_SRC,
             _DUMMY_CTX_TGT,
@@ -129,10 +129,10 @@ class TestChainDepthValidation:
         from scp_sdk.scp import SCP
 
         native = MagicMock()
-        native.tool_invoke_cross_context.return_value = {"ok": True}
+        native.outlet_invoke_cross_context.return_value = {"ok": True}
         scp = _make_scp(native)
 
-        result = await SCP.tool_invoke_cross_context(
+        result = await SCP.outlet_invoke_cross_context(
             scp,
             _DUMMY_CTX_SRC,
             _DUMMY_CTX_TGT,
@@ -149,7 +149,7 @@ class TestChainDepthValidation:
 
         scp = _make_scp()
         with pytest.raises(ValidationError, match="chain_depth") as exc_info:
-            await SCP.tool_invoke_cross_context(
+            await SCP.outlet_invoke_cross_context(
                 scp,
                 _DUMMY_CTX_SRC,
                 _DUMMY_CTX_TGT,
@@ -166,7 +166,7 @@ class TestChainDepthValidation:
 
         scp = _make_scp()
         with pytest.raises(ValidationError, match="chain_depth") as exc_info:
-            await SCP.tool_invoke_cross_context(
+            await SCP.outlet_invoke_cross_context(
                 scp,
                 _DUMMY_CTX_SRC,
                 _DUMMY_CTX_TGT,
@@ -183,7 +183,7 @@ class TestChainDepthValidation:
 
         scp = _make_scp()
         with pytest.raises(ValidationError, match="chain_depth") as exc_info:
-            await SCP.tool_invoke_cross_context(
+            await SCP.outlet_invoke_cross_context(
                 scp,
                 _DUMMY_CTX_SRC,
                 _DUMMY_CTX_TGT,
@@ -200,7 +200,7 @@ class TestChainDepthValidation:
 
         scp = _make_scp()
         with pytest.raises(ValidationError, match="chain_depth") as exc_info:
-            await SCP.tool_invoke_cross_context(
+            await SCP.outlet_invoke_cross_context(
                 scp,
                 _DUMMY_CTX_SRC,
                 _DUMMY_CTX_TGT,
@@ -217,7 +217,7 @@ class TestChainDepthValidation:
 
         scp = _make_scp()
         with pytest.raises(ValidationError, match="chain_depth") as exc_info:
-            await SCP.tool_invoke_cross_context(
+            await SCP.outlet_invoke_cross_context(
                 scp,
                 _DUMMY_CTX_SRC,
                 _DUMMY_CTX_TGT,
@@ -231,7 +231,7 @@ class TestChainDepthValidation:
 
 
 # ---------------------------------------------------------------------------
-# ttl_seconds validation tests (SCP.tool_session_create)
+# ttl_seconds validation tests (SCP.outlet_session_create)
 # ---------------------------------------------------------------------------
 
 
@@ -243,10 +243,10 @@ class TestTtlSecondsValidation:
         from scp_sdk.scp import SCP
 
         native = MagicMock()
-        native.tool_session_create.return_value = "sess-new"
+        native.outlet_session_create.return_value = "sess-new"
         scp = _make_scp(native)
 
-        sid = await SCP.tool_session_create(
+        sid = await SCP.outlet_session_create(
             scp,
             _DUMMY_CTX_SRC,
             _DUMMY_TOOL,
@@ -259,10 +259,10 @@ class TestTtlSecondsValidation:
         from scp_sdk.scp import SCP
 
         native = MagicMock()
-        native.tool_session_create.return_value = "sess-new"
+        native.outlet_session_create.return_value = "sess-new"
         scp = _make_scp(native)
 
-        sid = await SCP.tool_session_create(
+        sid = await SCP.outlet_session_create(
             scp,
             _DUMMY_CTX_SRC,
             _DUMMY_TOOL,
@@ -276,7 +276,7 @@ class TestTtlSecondsValidation:
 
         scp = _make_scp()
         with pytest.raises(ValidationError, match="ttl_seconds") as exc_info:
-            await SCP.tool_session_create(
+            await SCP.outlet_session_create(
                 scp,
                 _DUMMY_CTX_SRC,
                 _DUMMY_TOOL,
@@ -290,7 +290,7 @@ class TestTtlSecondsValidation:
 
         scp = _make_scp()
         with pytest.raises(ValidationError, match="ttl_seconds") as exc_info:
-            await SCP.tool_session_create(
+            await SCP.outlet_session_create(
                 scp,
                 _DUMMY_CTX_SRC,
                 _DUMMY_TOOL,
@@ -304,7 +304,7 @@ class TestTtlSecondsValidation:
 
         scp = _make_scp()
         with pytest.raises(ValidationError, match="ttl_seconds") as exc_info:
-            await SCP.tool_session_create(
+            await SCP.outlet_session_create(
                 scp,
                 _DUMMY_CTX_SRC,
                 _DUMMY_TOOL,
@@ -318,7 +318,7 @@ class TestTtlSecondsValidation:
 
         scp = _make_scp()
         with pytest.raises(ValidationError, match="ttl_seconds") as exc_info:
-            await SCP.tool_session_create(
+            await SCP.outlet_session_create(
                 scp,
                 _DUMMY_CTX_SRC,
                 _DUMMY_TOOL,
@@ -329,43 +329,43 @@ class TestTtlSecondsValidation:
 
 
 # ---------------------------------------------------------------------------
-# Data-class exports — ToolDefinition / ToolCost / TestVector remain
+# Data-class exports — OutletDefinition / OutletCost / TestVector remain
 # ---------------------------------------------------------------------------
 
 
-class TestToolsExports:
+class TestOutletsExports:
     """Verify the remaining data-class exports survived the façade deletion."""
 
-    def test_tool_definition_exported(self) -> None:
-        from scp_sdk import tools
+    def test_outlet_definition_exported(self) -> None:
+        from scp_sdk import outlets
 
-        assert "ToolDefinition" in tools.__all__
+        assert "OutletDefinition" in outlets.__all__
 
-    def test_tool_cost_exported(self) -> None:
-        from scp_sdk import tools
+    def test_outlet_cost_exported(self) -> None:
+        from scp_sdk import outlets
 
-        assert "ToolCost" in tools.__all__
+        assert "OutletCost" in outlets.__all__
 
     def test_test_vector_exported(self) -> None:
-        from scp_sdk import tools
+        from scp_sdk import outlets
 
-        assert "TestVector" in tools.__all__
+        assert "TestVector" in outlets.__all__
 
     def test_saga_result_exported(self) -> None:
-        from scp_sdk import tools
+        from scp_sdk import outlets
 
-        assert "SagaResult" in tools.__all__
+        assert "SagaResult" in outlets.__all__
 
 
 # ---------------------------------------------------------------------------
-# Cross-context tool-invocation saga (§6.2.4 / ADR-049 §3a)
-# SCP.tool_invoke_cross_context_saga
+# Cross-context outlet-invocation saga (§6.2.4 / ADR-049 §3a)
+# SCP.outlet_invoke_cross_context_saga
 # ---------------------------------------------------------------------------
 
 _DUMMY_CTX_CALLER = "ctx-caller-001"
 _DUMMY_NONCE_HEX = "0123456789abcdef0123456789abcdef"
 _DUMMY_TS_MS = 1_700_000_000_000
-_DUMMY_REG_ID = "reg-tool-007"
+_DUMMY_REG_ID = "reg-outlet-007"
 
 
 def _committed_native(
@@ -382,7 +382,7 @@ def _committed_native(
     from types import SimpleNamespace
 
     native = MagicMock()
-    native.tool_invoke_cross_context_saga.return_value = SimpleNamespace(
+    native.outlet_invoke_cross_context_saga.return_value = SimpleNamespace(
         saga_id=saga_id, receipt=receipt, output=output
     )
     return native
@@ -397,7 +397,7 @@ async def _invoke_saga(
 ):
     from scp_sdk.scp import SCP
 
-    return await SCP.tool_invoke_cross_context_saga(
+    return await SCP.outlet_invoke_cross_context_saga(
         scp,
         _DUMMY_CTX_CALLER,
         _DUMMY_CTX_TGT,
@@ -415,7 +415,7 @@ class TestSagaHappyPath:
     """A committed saga returns a faithful :class:`SagaResult` pass-through."""
 
     async def test_committed_returns_saga_result(self) -> None:
-        from scp_sdk.tools import SagaResult
+        from scp_sdk.outlets import SagaResult
 
         scp = _make_scp(_committed_native())
 
@@ -428,7 +428,7 @@ class TestSagaHappyPath:
 
     async def test_committed_passes_through_null_receipt_and_output(self) -> None:
         """``None`` receipt/output are surfaced verbatim — never synthesized."""
-        from scp_sdk.tools import SagaResult
+        from scp_sdk.outlets import SagaResult
 
         scp = _make_scp(_committed_native(receipt=None, output=None))
 
@@ -444,7 +444,7 @@ class TestSagaHappyPath:
 
         await _invoke_saga(scp, chain_depth=7, timestamp_ms=42)
 
-        native.tool_invoke_cross_context_saga.assert_called_once_with(
+        native.outlet_invoke_cross_context_saga.assert_called_once_with(
             _DUMMY_CTX_CALLER,
             _DUMMY_CTX_TGT,
             _DUMMY_DID,
@@ -463,7 +463,7 @@ class TestSagaHappyPath:
 
         await _invoke_saga(scp, ucan_proof_id="some-proof-id")
 
-        native.tool_invoke_cross_context_saga.assert_called_once_with(
+        native.outlet_invoke_cross_context_saga.assert_called_once_with(
             _DUMMY_CTX_CALLER,
             _DUMMY_CTX_TGT,
             _DUMMY_DID,
@@ -486,7 +486,7 @@ _BridgeSagaBusy = type("SagaBusyError", (Exception,), {})
 
 def _native_raising(exc: BaseException) -> MagicMock:
     native = MagicMock()
-    native.tool_invoke_cross_context_saga.side_effect = exc
+    native.outlet_invoke_cross_context_saga.side_effect = exc
     return native
 
 
@@ -723,35 +723,35 @@ class TestSagaChainDepthValidation:
             await _invoke_saga(scp, chain_depth=-1)
         assert exc_info.value.code == "SCP-VALID-7002"
         # Fail-fast: validation MUST reject before the side-effectful saga fires.
-        scp._native.tool_invoke_cross_context_saga.assert_not_called()
+        scp._native.outlet_invoke_cross_context_saga.assert_not_called()
 
     async def test_chain_depth_256_rejected(self) -> None:
         scp = _make_scp(_committed_native())
         with pytest.raises(ValidationError, match="chain_depth") as exc_info:
             await _invoke_saga(scp, chain_depth=256)
         assert exc_info.value.code == "SCP-VALID-7002"
-        scp._native.tool_invoke_cross_context_saga.assert_not_called()
+        scp._native.outlet_invoke_cross_context_saga.assert_not_called()
 
     async def test_chain_depth_float_rejected(self) -> None:
         scp = _make_scp(_committed_native())
         with pytest.raises(ValidationError, match="chain_depth") as exc_info:
             await _invoke_saga(scp, chain_depth=1.5)  # type: ignore[arg-type]
         assert exc_info.value.code == "SCP-VALID-7002"
-        scp._native.tool_invoke_cross_context_saga.assert_not_called()
+        scp._native.outlet_invoke_cross_context_saga.assert_not_called()
 
     async def test_chain_depth_bool_true_rejected(self) -> None:
         scp = _make_scp(_committed_native())
         with pytest.raises(ValidationError, match="chain_depth") as exc_info:
             await _invoke_saga(scp, chain_depth=True)  # type: ignore[arg-type]
         assert exc_info.value.code == "SCP-VALID-7002"
-        scp._native.tool_invoke_cross_context_saga.assert_not_called()
+        scp._native.outlet_invoke_cross_context_saga.assert_not_called()
 
     async def test_chain_depth_bool_false_rejected(self) -> None:
         scp = _make_scp(_committed_native())
         with pytest.raises(ValidationError, match="chain_depth") as exc_info:
             await _invoke_saga(scp, chain_depth=False)  # type: ignore[arg-type]
         assert exc_info.value.code == "SCP-VALID-7002"
-        scp._native.tool_invoke_cross_context_saga.assert_not_called()
+        scp._native.outlet_invoke_cross_context_saga.assert_not_called()
 
 
 class TestSagaTimestampValidation:
@@ -768,21 +768,21 @@ class TestSagaTimestampValidation:
             await _invoke_saga(scp, timestamp_ms=-1)
         assert exc_info.value.code == "SCP-VALID-7002"
         # Fail-fast: validation MUST reject before the side-effectful saga fires.
-        scp._native.tool_invoke_cross_context_saga.assert_not_called()
+        scp._native.outlet_invoke_cross_context_saga.assert_not_called()
 
     async def test_timestamp_float_rejected(self) -> None:
         scp = _make_scp(_committed_native())
         with pytest.raises(ValidationError, match="timestamp_ms") as exc_info:
             await _invoke_saga(scp, timestamp_ms=1.5)  # type: ignore[arg-type]
         assert exc_info.value.code == "SCP-VALID-7002"
-        scp._native.tool_invoke_cross_context_saga.assert_not_called()
+        scp._native.outlet_invoke_cross_context_saga.assert_not_called()
 
     async def test_timestamp_bool_true_rejected(self) -> None:
         scp = _make_scp(_committed_native())
         with pytest.raises(ValidationError, match="timestamp_ms") as exc_info:
             await _invoke_saga(scp, timestamp_ms=True)  # type: ignore[arg-type]
         assert exc_info.value.code == "SCP-VALID-7002"
-        scp._native.tool_invoke_cross_context_saga.assert_not_called()
+        scp._native.outlet_invoke_cross_context_saga.assert_not_called()
 
     async def test_timestamp_bool_false_rejected(self) -> None:
         # ``False == 0`` but a bool is still rejected: the u64 boundary takes
@@ -791,25 +791,25 @@ class TestSagaTimestampValidation:
         with pytest.raises(ValidationError, match="timestamp_ms") as exc_info:
             await _invoke_saga(scp, timestamp_ms=False)  # type: ignore[arg-type]
         assert exc_info.value.code == "SCP-VALID-7002"
-        scp._native.tool_invoke_cross_context_saga.assert_not_called()
+        scp._native.outlet_invoke_cross_context_saga.assert_not_called()
 
 
 class TestSagaErrorTaxonomy:
-    """The three §6.2.4 saga terminals are ``ToolError`` subclasses.
+    """The three §6.2.4 saga terminals are ``OutletError`` subclasses.
 
-    Cross-context tool invocation is a TOOL operation, so its terminal
-    failures live under :class:`ToolError` — a caller that catches
-    ``ToolError`` catches all three. Re-parenting any of them (e.g. to a
+    Cross-context outlet invocation is a TOOL operation, so its terminal
+    failures live under :class:`OutletError` — a caller that catches
+    ``OutletError`` catches all three. Re-parenting any of them (e.g. to a
     bare ``ScpError``) would silently break that contract; these pin it.
     """
 
-    def test_saga_errors_are_tool_errors(self) -> None:
+    def test_saga_errors_are_outlet_errors(self) -> None:
         from scp_sdk.errors import (
             SagaAbortedError,
             SagaBusyError,
             SagaNeedsRepairError,
         )
 
-        assert issubclass(SagaAbortedError, ToolError)
-        assert issubclass(SagaNeedsRepairError, ToolError)
-        assert issubclass(SagaBusyError, ToolError)
+        assert issubclass(SagaAbortedError, OutletError)
+        assert issubclass(SagaNeedsRepairError, OutletError)
+        assert issubclass(SagaBusyError, OutletError)

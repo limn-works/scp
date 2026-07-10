@@ -11,7 +11,7 @@ Run:
     source .venv/bin/activate
     PYTHONPATH=bindings/python pytest bindings/python/tests/test_real_ffi.py -v
 
-Covers: identity lifecycle, context lifecycle, membership, tools, UCAN,
+Covers: identity lifecycle, context lifecycle, membership, outlets, UCAN,
 event log, discovery, and provenance through real FFI.
 """
 
@@ -489,12 +489,12 @@ class TestContext:
 
 
 # ---------------------------------------------------------------------------
-# Tools
+# Outlets
 # ---------------------------------------------------------------------------
 
 
-class TestTools:
-    """Tool registration and verification through real FFI."""
+class TestOutlets:
+    """Outlet registration and verification through real FFI."""
 
     async def test_register_and_verify(self, scp: SCP):
         alice = await scp.identity_create(CustodyType.IN_MEMORY)
@@ -506,11 +506,11 @@ class TestTools:
                 "governance": "single_admin",
             },
         )
-        tool_id = scp._native.tool_register(
+        outlet_id = scp._native.outlet_register(
             handle.context_id,
             {
-                "name": "test_tool",
-                "description": "A test tool",
+                "name": "test_outlet",
+                "description": "A test outlet",
                 "operator_did": alice.did,
                 "schema": {
                     "input_schema": {
@@ -530,10 +530,10 @@ class TestTools:
                 },
             },
         )
-        assert tool_id
-        assert len(tool_id) > 0
+        assert outlet_id
+        assert len(outlet_id) > 0
 
-        result = scp._native.tool_verify(handle.context_id, tool_id)
+        result = scp._native.outlet_verify(handle.context_id, outlet_id)
         assert result.passed
 
 

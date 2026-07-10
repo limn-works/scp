@@ -84,11 +84,11 @@ from scp_sdk.errors import (
     ContextError,
     CryptoError,
     IdentityError,
+    OutletError,
     SagaAbortedError,
     SagaBusyError,
     SagaNeedsRepairError,
     ScpError,
-    ToolError,
     TransportError,
     UcanPermissionError,
     ValidationError,
@@ -136,6 +136,12 @@ from scp_sdk.media import (
 from scp_sdk.media import (
     verify_sender_attribution as media_verify_sender_attribution,
 )
+from scp_sdk.outlets import (
+    OutletCost,
+    OutletDefinition,
+    SagaResult,
+    TestVector,
+)
 from scp_sdk.scp import (
     SCP,
     InMemoryStorage,
@@ -149,12 +155,6 @@ from scp_sdk.scp import (
 )
 from scp_sdk.server import Node, Relay
 from scp_sdk.sync import classify_offline, get_policy, run_sync
-from scp_sdk.tools import (
-    SagaResult,
-    TestVector,
-    ToolCost,
-    ToolDefinition,
-)
 from scp_sdk.transport import TransportConfig, TransportStatus
 from scp_sdk.trust import (
     ATTESTATION_TYPES,
@@ -257,6 +257,9 @@ __all__ = [
     "MemoryScope",
     "Message",
     "Node",
+    "OutletCost",
+    "OutletDefinition",
+    "OutletError",
     "ParticipationFact",
     "ParticipationProfile",
     "ParticipationThreshold",
@@ -287,9 +290,6 @@ __all__ = [
     "StorageConfig",
     "TestVector",
     "ThresholdRequirement",
-    "ToolCost",
-    "ToolDefinition",
-    "ToolError",
     "TransportConfig",
     "TransportError",
     "TransportStatus",

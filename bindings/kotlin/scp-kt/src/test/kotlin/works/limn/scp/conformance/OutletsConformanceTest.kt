@@ -1,5 +1,5 @@
-// ToolsConformanceTest.kt — Tool conformance tests for the Kotlin SDK (SCP-120)
-// Provenance: SCP-120, .docs/scaffold/shared.md "Tools" category
+// OutletsConformanceTest.kt — Outlet conformance tests for the Kotlin SDK (SCP-120)
+// Provenance: SCP-120, .docs/scaffold/shared.md "Outlets" category
 
 package works.limn.scp.conformance
 
@@ -16,16 +16,16 @@ import kotlin.test.assertEquals
 import kotlin.test.assertTrue
 
 /**
- * Cross-platform conformance tests for tool operations.
+ * Cross-platform conformance tests for outlet operations.
  *
  * Covers: register, invoke, verify test vectors, update, cross-context.
  *
- * Tool operations are exercised through the conformance dispatcher and
+ * Outlet operations are exercised through the conformance dispatcher and
  * validated against expected outputs. Error paths verify that the bridge
  * correctly propagates structured error codes from the Rust engine.
  */
 @OptIn(ExperimentalCoroutinesApi::class)
-class ToolsConformanceTest {
+class OutletsConformanceTest {
     private lateinit var stubBindings: ConformanceStubBindings
     private lateinit var bridge: CoroutineBridge
     private lateinit var dispatcher: ConformanceDispatcher
@@ -45,30 +45,30 @@ class ToolsConformanceTest {
     }
 
     @Nested
-    inner class ToolRegister {
+    inner class OutletRegister {
         @Test
-        fun `tool_register returns tool ID`() =
+        fun `outlet_register returns outlet ID`() =
             runTest(testDispatcher) {
-                stubBindings.toolRegisterResult = "tool-calc-001"
+                stubBindings.outletRegisterResult = "outlet-calc-001"
                 val result =
                     dispatcher.dispatch(
-                        "tool_register",
+                        "outlet_register",
                         mapOf(
                             "context_handle" to "10",
                             "definition" to """{"name":"calculator","schema":{}}""",
                         ),
                     )
-                assertEquals("tool-calc-001", result["tool_id"])
+                assertEquals("outlet-calc-001", result["outlet_id"])
             }
 
         @Test
-        fun `tool_register propagates error`() =
+        fun `outlet_register propagates error`() =
             runTest(testDispatcher) {
-                stubBindings.toolRegisterError =
+                stubBindings.outletRegisterError =
                     BridgeException("Context not found", "SCP-TOOL-6001")
                 val result =
                     dispatcher.dispatch(
-                        "tool_register",
+                        "outlet_register",
                         mapOf("context_handle" to "10", "definition" to "{}"),
                     )
                 assertEquals("SCP-TOOL-6001", result["error"])
@@ -76,17 +76,17 @@ class ToolsConformanceTest {
     }
 
     @Nested
-    inner class ToolInvoke {
+    inner class OutletInvoke {
         @Test
-        fun `tool_invoke returns output`() =
+        fun `outlet_invoke returns output`() =
             runTest(testDispatcher) {
-                stubBindings.toolInvokeResult = """{"result":42}"""
+                stubBindings.outletInvokeResult = """{"result":42}"""
                 val result =
                     dispatcher.dispatch(
-                        "tool_invoke",
+                        "outlet_invoke",
                         mapOf(
                             "context_handle" to "10",
-                            "tool_id" to "tool-calc-001",
+                            "outlet_id" to "outlet-calc-001",
                             "input" to """{"a":20,"b":22}""",
                         ),
                     )
@@ -94,16 +94,16 @@ class ToolsConformanceTest {
             }
 
         @Test
-        fun `tool_invoke propagates not-found error`() =
+        fun `outlet_invoke propagates not-found error`() =
             runTest(testDispatcher) {
-                stubBindings.toolInvokeError =
-                    BridgeException("Tool not registered", "SCP-TOOL-6002")
+                stubBindings.outletInvokeError =
+                    BridgeException("Outlet not registered", "SCP-TOOL-6002")
                 val result =
                     dispatcher.dispatch(
-                        "tool_invoke",
+                        "outlet_invoke",
                         mapOf(
                             "context_handle" to "10",
-                            "tool_id" to "nonexistent",
+                            "outlet_id" to "nonexistent",
                             "input" to "{}",
                         ),
                     )
@@ -112,50 +112,50 @@ class ToolsConformanceTest {
     }
 
     @Nested
-    inner class ToolVerify {
+    inner class OutletVerify {
         @Test
-        fun `tool_verify returns result for registered tool`() =
+        fun `outlet_verify returns result for registered outlet`() =
             runTest(testDispatcher) {
-                stubBindings.toolVerifyResult = """{"tool_id":"tool-calc-001","passed":true,"failures":[]}"""
+                stubBindings.outletVerifyResult = """{"outlet_id":"outlet-calc-001","passed":true,"failures":[]}"""
                 val result =
                     dispatcher.dispatch(
-                        "tool_verify",
+                        "outlet_verify",
                         mapOf(
                             "context_handle" to "10",
-                            "tool_id" to "tool-calc-001",
+                            "outlet_id" to "outlet-calc-001",
                         ),
                     )
                 assertTrue(result["result"]?.contains("\"passed\":true") == true)
             }
 
         @Test
-        fun `tool_verify returns failed result`() =
+        fun `outlet_verify returns failed result`() =
             runTest(testDispatcher) {
                 @Suppress("MaxLineLength")
-                stubBindings.toolVerifyResult =
-                    """{"tool_id":"tool-calc-001","passed":false,"failures":["signature mismatch"]}"""
+                stubBindings.outletVerifyResult =
+                    """{"outlet_id":"outlet-calc-001","passed":false,"failures":["signature mismatch"]}"""
                 val result =
                     dispatcher.dispatch(
-                        "tool_verify",
+                        "outlet_verify",
                         mapOf(
                             "context_handle" to "10",
-                            "tool_id" to "tool-calc-001",
+                            "outlet_id" to "outlet-calc-001",
                         ),
                     )
                 assertTrue(result["result"]?.contains("\"passed\":false") == true)
             }
 
         @Test
-        fun `tool_verify propagates verification error`() =
+        fun `outlet_verify propagates verification error`() =
             runTest(testDispatcher) {
-                stubBindings.toolVerifyError =
+                stubBindings.outletVerifyError =
                     BridgeException("Verification failed", "SCP-TOOL-6003")
                 val result =
                     dispatcher.dispatch(
-                        "tool_verify",
+                        "outlet_verify",
                         mapOf(
                             "context_handle" to "10",
-                            "tool_id" to "tool-calc-001",
+                            "outlet_id" to "outlet-calc-001",
                         ),
                     )
                 assertEquals("SCP-TOOL-6003", result["error"])
@@ -165,21 +165,21 @@ class ToolsConformanceTest {
     @Nested
     inner class FixtureIntegration {
         @Test
-        fun `tool register fixture matches dispatcher result`() =
+        fun `outlet register fixture matches dispatcher result`() =
             runTest(testDispatcher) {
-                stubBindings.toolRegisterResult = "tool-echo"
+                stubBindings.outletRegisterResult = "outlet-echo"
                 val fixture =
                     ConformanceFixture(
-                        testId = "tool-register-001",
-                        category = "tools",
-                        description = "Register a tool in a context",
-                        operation = "tool_register",
+                        testId = "outlet-register-001",
+                        category = "outlets",
+                        description = "Register a outlet in a context",
+                        operation = "outlet_register",
                         input =
                             mapOf(
                                 "context_handle" to "10",
                                 "definition" to """{"name":"echo"}""",
                             ),
-                        expected = mapOf("tool_id" to "tool-echo"),
+                        expected = mapOf("outlet_id" to "outlet-echo"),
                     )
                 val result =
                     dispatcher.dispatch(

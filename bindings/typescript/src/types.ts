@@ -15,8 +15,8 @@
 export interface ContextParams {
   /** Capability ceiling — maximum capabilities available in this context. */
   readonly ceiling: readonly string[];
-  /** Tool definitions to register at context creation. */
-  readonly tools?: readonly ToolDefinition[];
+  /** Outlet definitions to register at context creation. */
+  readonly outlets?: readonly OutletDefinition[];
   /** Role definitions: role name to capability list mapping. */
   readonly roles?: Readonly<Record<string, readonly string[]>>;
   /** Time-to-live in seconds. Omit for persistent contexts. */
@@ -70,17 +70,17 @@ export interface ContextParams {
 // ---------------------------------------------------------------------------
 
 /**
- * A registered tool capability (`tool:invoke:<id>`) within a context.
+ * A registered outlet capability (`tool:invoke:<id>`) within a context.
  *
- * Mirrors the `Capability::ToolInvoke(ToolId)` newtype. Carries the tool ID
+ * Mirrors the `Capability::ToolInvoke(ToolId)` newtype. Carries the outlet ID
  * (an opaque string) and serializes as `{"ToolInvoke": "id"}` to match the
  * Rust serde tagging.
  */
 export interface ToolInvokeCapability {
   /** Discriminant. */
   readonly kind: "ToolInvoke";
-  /** Opaque tool identifier matching a registered ToolDefinition. */
-  readonly toolId: string;
+  /** Opaque outlet identifier matching a registered OutletDefinition. */
+  readonly outletId: string;
 }
 
 /**
@@ -128,11 +128,11 @@ export type UnitCapability =
  * Typed capability matching `scp_protocol::context::roles::Capability`.
  *
  * Either a unit-variant string or an object discriminated by `kind` for
- * payload-bearing variants (`ToolInvoke`, `Custom`). The SDK encoder converts
+ * payload-bearing variants (`OutletInvoke`, `Custom`). The SDK encoder converts
  * each variant to the matching Rust serde JSON shape:
  *
  * - `"MessagesRead"` → `"MessagesRead"`
- * - `{ kind: "ToolInvoke", toolId: "calculator" }` → `{"ToolInvoke": "calculator"}`
+ * - `{ kind: "ToolInvoke", outletId: "calculator" }` → `{"ToolInvoke": "calculator"}`
  * - `{ kind: "Custom", name: "foo" }` → `{"Custom": "foo"}`
  */
 export type ConsequenceCapability = UnitCapability | ToolInvokeCapability | CustomCapability;
@@ -368,7 +368,7 @@ function encodeConsequenceCapability(capability: ConsequenceCapability): unknown
     return capability;
   }
   if (capability.kind === "ToolInvoke") {
-    return { ToolInvoke: capability.toolId };
+    return { ToolInvoke: capability.outletId };
   }
   if (capability.kind === "Custom") {
     return { Custom: capability.name };
@@ -619,31 +619,31 @@ export interface Capability {
 }
 
 // ---------------------------------------------------------------------------
-// Tools
+// Outlets
 // ---------------------------------------------------------------------------
 
-/** Definition of a tool that can be registered in a context. */
-export interface ToolDefinition {
-  /** Human-readable tool name. */
+/** Definition of a outlet that can be registered in a context. */
+export interface OutletDefinition {
+  /** Human-readable outlet name. */
   readonly name: string;
-  /** Tool description. */
+  /** Outlet description. */
   readonly description: string;
-  /** JSON Schema for tool input. */
+  /** JSON Schema for outlet input. */
   readonly inputSchema: Readonly<Record<string, unknown>>;
-  /** JSON Schema for tool output. */
+  /** JSON Schema for outlet output. */
   readonly outputSchema: Readonly<Record<string, unknown>>;
-  /** DID of the tool operator (responsible party) or Identity reference. */
+  /** DID of the outlet operator (responsible party) or Identity reference. */
   readonly operator: string;
   /** Test vectors for integrity verification. */
   readonly testVectors?: readonly TestVector[];
   /** SHA-256 hash of the implementation binary. */
   readonly implementationHash?: Uint8Array;
   /** Optional per-invocation cost metadata (spec section 5.4.1). */
-  readonly cost?: ToolCost;
+  readonly cost?: OutletCost;
 }
 
-/** Per-invocation cost metadata for a tool (spec section 5.4.1). */
-export interface ToolCost {
+/** Per-invocation cost metadata for a outlet (spec section 5.4.1). */
+export interface OutletCost {
   /**
    * Cost per invocation in the smallest currency unit.
    *
@@ -654,13 +654,13 @@ export interface ToolCost {
   readonly amount: bigint;
   /** ISO 4217 or protocol-defined currency code. */
   readonly currency: string;
-  /** DID of the payment recipient. May differ from the tool operator. */
+  /** DID of the payment recipient. May differ from the outlet operator. */
   readonly payee: string;
   /** Optional pricing formula identifier for dynamic pricing (spec section 19.4). */
   readonly costFormula?: string;
 }
 
-/** A test vector for tool verification. */
+/** A test vector for outlet verification. */
 export interface TestVector {
   /** Test input as a JSON object. */
   readonly input: Readonly<Record<string, unknown>>;
@@ -671,32 +671,32 @@ export interface TestVector {
 }
 
 // ---------------------------------------------------------------------------
-// Tool invocation
+// Outlet invocation
 // ---------------------------------------------------------------------------
 
-/** Result of verifying a tool against its test vectors. */
-export interface ToolVerificationResult {
-  /** The verified tool's ID. */
-  readonly toolId: string;
+/** Result of verifying a outlet against its test vectors. */
+export interface OutletVerificationResult {
+  /** The verified outlet's ID. */
+  readonly outletId: string;
   /** `true` if all test vectors passed. */
   readonly passed: boolean;
   /** Failure messages for vectors that did not pass. Empty on success. */
   readonly failures: readonly string[];
 }
 
-/** Result of creating a stateful tool session (spec section 6.2.1). */
-export interface ToolSessionResult {
+/** Result of creating a stateful outlet session (spec section 6.2.1). */
+export interface OutletSessionResult {
   /** The unique session ID (UUID). */
   readonly sessionId: string;
 }
 
-/** Result of invoking a tool within a stateful session, with provenance metadata (spec section 6.2.1). */
-export interface ToolSessionInvokeResult {
-  /** The serialized output from the tool invocation (JSON string). */
+/** Result of invoking a outlet within a stateful session, with provenance metadata (spec section 6.2.1). */
+export interface OutletSessionInvokeResult {
+  /** The serialized output from the outlet invocation (JSON string). */
   readonly output: string;
   /** The session ID this invocation was executed within. */
   readonly sessionId: string;
-  /** The context ID in which the tool was invoked. */
+  /** The context ID in which the outlet was invoked. */
   readonly contextId: string;
   /** The DID of the invoker. */
   readonly invokerDid: string;
@@ -704,9 +704,9 @@ export interface ToolSessionInvokeResult {
   readonly timestamp: number;
 }
 
-/** Result of a cross-context tool invocation (spec section 6.2). */
+/** Result of a cross-context outlet invocation (spec section 6.2). */
 export interface CrossContextInvocationResult {
-  /** The serialized output from the tool invocation (JSON string). */
+  /** The serialized output from the outlet invocation (JSON string). */
   readonly output: string;
   /** The source context ID. */
   readonly sourceContextId: string;
@@ -721,10 +721,10 @@ export interface CrossContextInvocationResult {
 }
 
 /**
- * The committed terminal of a §6.2.4 cross-context tool-invocation saga
+ * The committed terminal of a §6.2.4 cross-context outlet-invocation saga
  * (ADR-049 §3a).
  *
- * Returned by `SCP.toolInvokeCrossContextSaga` only on a `Committed` terminal —
+ * Returned by `SCP.outletInvokeCrossContextSaga` only on a `Committed` terminal —
  * every non-committed terminal rejects with a typed saga error
  * (`SagaAbortedError`, `SagaNeedsRepairError`, or `SagaBusyError`) instead.
  *
@@ -737,10 +737,10 @@ export interface CrossContextInvocationResult {
 export interface SagaResult {
   /** The durable saga identifier (supervisor-minted, never a caller input). */
   readonly sagaId: string;
-  /** The target's signed `CrossContextToolReceipt` bytes (JCS), or `null`. */
+  /** The target's signed `CrossContextOutletReceipt` bytes (JCS), or `null`. */
   readonly receipt: Uint8Array | null;
   /**
-   * The captured tool output bytes (the receipt's canonical `output_jcs`),
+   * The captured outlet output bytes (the receipt's canonical `output_jcs`),
    * or `null`.
    */
   readonly output: Uint8Array | null;
@@ -981,7 +981,7 @@ export interface BehavioralRecord {
   readonly governanceActionsAgainst: number;
   /** Count of governance actions initiated by this identity. */
   readonly governanceActionsBy: number;
-  /** Total tool invocations across all tool types. */
+  /** Total outlet invocations across all outlet types. */
   readonly toolInvocationCount: number;
   /**
    * Whether {@link toolInvocationCount} is anchored in the canonical Merkle
@@ -1228,7 +1228,7 @@ export interface ParticipationProfile {
   readonly governanceActionsAgainst: number;
   /** Count of governance actions initiated by this identity. */
   readonly governanceActionsBy: number;
-  /** Total tool invocations across all tool types. */
+  /** Total outlet invocations across all outlet types. */
   readonly toolInvocationCount: number;
   /**
    * Whether `toolInvocationCount` is anchored in the canonical Merkle log.
@@ -2091,8 +2091,8 @@ function validateCsp(csp: string): void {
 
 /** Configuration for an MCP server. */
 export interface McpServerConfig {
-  /** Tools to expose via MCP. */
-  readonly tools: readonly ToolDefinition[];
+  /** Outlets to expose via MCP. */
+  readonly outlets: readonly OutletDefinition[];
   /** Port to listen on. */
   readonly port?: number;
   /** Host to bind to. */

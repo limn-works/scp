@@ -145,7 +145,7 @@ public nonisolated struct CapabilityValidation: Sendable, Equatable {
 /// TypeScript SDK `BehavioralRecord`, and the Rust `ParticipationFacts` 1:1.
 ///
 /// The six leaf-derived facts (participation duration, governance actions
-/// against/by, context creation, role progression, tool invocation count) come
+/// against/by, context creation, role progression, outlet invocation count) come
 /// from the context's convergent Merkle event log. `attestationCount` is the
 /// one exception: it is a credential-layer fact (§7.4), NOT event-log-derived,
 /// NOT covered by `eventLogRoot`, and **verifier-relative** (two agents may
@@ -164,7 +164,7 @@ public nonisolated struct BehavioralRecord: Sendable, Equatable {
     /// Count of governance actions initiated by this identity.
     public let governanceActionsBy: UInt64
 
-    /// Total tool invocations across all tool types.
+    /// Total outlet invocations across all outlet types.
     public let toolInvocationCount: UInt64
 
     /// Whether ``toolInvocationCount`` is anchored in the canonical Merkle log.
@@ -954,7 +954,7 @@ public nonisolated enum ParticipationFact: String, Codable, Sendable, Equatable,
     case governanceActionsAgainst = "GovernanceActionsAgainst"
     /// Count of governance actions initiated by the identity.
     case governanceActionsBy = "GovernanceActionsBy"
-    /// Total tool invocations across all tool types.
+    /// Total outlet invocations across all outlet types.
     case toolInvocationCount = "ToolInvocationCount"
     /// Number of contexts created.
     case contextCreationCount = "ContextCreationCount"
@@ -1096,7 +1096,7 @@ public nonisolated struct ParticipationProfile: Codable, Sendable, Equatable {
     public let governanceActionsAgainst: UInt64
     /// Count of governance actions initiated by this identity.
     public let governanceActionsBy: UInt64
-    /// Total tool invocations across all tool types.
+    /// Total outlet invocations across all outlet types.
     public let toolInvocationCount: UInt64
     /// Whether ``toolInvocationCount`` is anchored in the canonical Merkle log.
     /// `false` until ADR-051 makes `ToolInvoked` a convergent leaf — consumers

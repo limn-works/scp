@@ -1,41 +1,41 @@
 /**
- * Tools module for the SCP TypeScript SDK.
+ * Outlets module for the SCP TypeScript SDK.
  *
- * Provides {@link defineToolDefinition} — a pure helper that builds
- * validated {@link ToolDefinition} objects for registration via
- * `Context.registerTool()`.
+ * Provides {@link defineOutletDefinition} — a pure helper that builds
+ * validated {@link OutletDefinition} objects for registration via
+ * `Context.registerOutlet()`.
  *
  * The cross-context and stateful-session entry points
- * (`toolInvokeCrossContext`, `toolSessionCreate`,
- * `toolSessionInvoke`, `toolSessionClose`) moved onto the {@link SCP}
+ * (`outletInvokeCrossContext`, `outletSessionCreate`,
+ * `outletSessionInvoke`, `outletSessionClose`) moved onto the {@link SCP}
  * class in Phase 4 PR 4 (#1549, ADR-048) as
- * `scp.toolInvokeCrossContext(...)`, `scp.toolSessionCreate(...)`,
- * `scp.toolSessionInvoke(...)`, `scp.toolSessionClose(...)`. The
+ * `scp.outletInvokeCrossContext(...)`, `scp.outletSessionCreate(...)`,
+ * `scp.outletSessionInvoke(...)`, `scp.outletSessionClose(...)`. The
  * free-function shims that predated ADR-048 were deleted in the same
  * commit.
  *
- * See ADR-010 (Tool Registry), ADR-022 in `.docs/adrs/phase-4.md`, and
+ * See ADR-010 (Outlet Registry), ADR-022 in `.docs/adrs/phase-4.md`, and
  * spec sections 6.2 / 6.2.1 for cross-context invocation and stateful sessions.
  */
 
 import { ValidationError } from "./errors";
-import type { TestVector, ToolCost, ToolDefinition } from "./types";
+import type { OutletCost, OutletDefinition, TestVector } from "./types";
 
 // ---------------------------------------------------------------------------
-// Tool definition builder
+// Outlet definition builder
 // ---------------------------------------------------------------------------
 
 /**
- * Creates a validated `ToolDefinition` object.
+ * Creates a validated `OutletDefinition` object.
  *
- * Validates required fields and returns an immutable tool definition suitable
- * for registration via `Context.registerTool()`.
+ * Validates required fields and returns an immutable outlet definition suitable
+ * for registration via `Context.registerOutlet()`.
  *
- * @param params - Tool definition parameters.
- * @returns A validated `ToolDefinition`.
+ * @param params - Outlet definition parameters.
+ * @returns A validated `OutletDefinition`.
  * @throws {ValidationError} If required fields are missing or invalid.
  */
-export function defineToolDefinition(params: {
+export function defineOutletDefinition(params: {
   readonly name: string;
   readonly description: string;
   readonly inputSchema: Readonly<Record<string, unknown>>;
@@ -43,21 +43,21 @@ export function defineToolDefinition(params: {
   readonly operator: string;
   readonly testVectors?: readonly TestVector[];
   readonly implementationHash?: Uint8Array;
-  readonly cost?: ToolCost;
-}): ToolDefinition {
+  readonly cost?: OutletCost;
+}): OutletDefinition {
   if (params.name.length === 0) {
-    throw new ValidationError("Tool name must not be empty", "SCP-VALID-7010");
+    throw new ValidationError("Outlet name must not be empty", "SCP-VALID-7010");
   }
 
   if (params.description.length === 0) {
-    throw new ValidationError("Tool description must not be empty", "SCP-VALID-7011");
+    throw new ValidationError("Outlet description must not be empty", "SCP-VALID-7011");
   }
 
   if (params.operator.length === 0) {
-    throw new ValidationError("Tool operator DID must not be empty", "SCP-VALID-7012");
+    throw new ValidationError("Outlet operator DID must not be empty", "SCP-VALID-7012");
   }
 
-  const result: ToolDefinition = {
+  const result: OutletDefinition = {
     name: params.name,
     description: params.description,
     inputSchema: params.inputSchema,
@@ -74,7 +74,7 @@ export function defineToolDefinition(params: {
   }
 
   if (params.cost !== undefined) {
-    (result as { cost: ToolCost }).cost = params.cost;
+    (result as { cost: OutletCost }).cost = params.cost;
   }
 
   return result;

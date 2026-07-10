@@ -15,13 +15,13 @@ import {
   McpError,
   mapBridgeError,
   mapSagaError,
+  OutletError,
   PermissionError,
   SagaAbortedError,
   SagaBusyError,
   SagaNeedsRepairError,
   ScpError,
   StorageError,
-  ToolError,
   TransportError,
   UcanPermissionError,
   ValidationError,
@@ -80,11 +80,11 @@ describe("ScpError hierarchy", () => {
     expect(err.name).toBe("TransportError");
   });
 
-  it("ToolError extends ScpError", () => {
-    const err = new ToolError("tool failed", "SCP-TOOL-6001");
+  it("OutletError extends ScpError", () => {
+    const err = new OutletError("outlet failed", "SCP-TOOL-6001");
     expect(err).toBeInstanceOf(ScpError);
-    expect(err).toBeInstanceOf(ToolError);
-    expect(err.name).toBe("ToolError");
+    expect(err).toBeInstanceOf(OutletError);
+    expect(err.name).toBe("OutletError");
   });
 
   it("ValidationError extends ScpError", () => {
@@ -181,9 +181,9 @@ describe("mapBridgeError", () => {
     expect(err.code).toBe("SCP-TRANS-5001");
   });
 
-  it("maps tool error codes to ToolError", () => {
-    const err = mapBridgeError(new Error("[SCP-TOOL-6001] tool error: failed"));
-    expect(err).toBeInstanceOf(ToolError);
+  it("maps outlet error codes to OutletError", () => {
+    const err = mapBridgeError(new Error("[SCP-TOOL-6001] outlet error: failed"));
+    expect(err).toBeInstanceOf(OutletError);
     expect(err.code).toBe("SCP-TOOL-6001");
   });
 
@@ -495,8 +495,8 @@ describe("mapSagaError", () => {
   });
 
   it("delegates a non-saga error to mapBridgeError", () => {
-    const err = mapSagaError(new Error("[SCP-TOOL-6011] tool error: target not active"));
-    expect(err).toBeInstanceOf(ToolError);
+    const err = mapSagaError(new Error("[SCP-TOOL-6011] outlet error: target not active"));
+    expect(err).toBeInstanceOf(OutletError);
     expect(err).not.toBeInstanceOf(SagaAbortedError);
     expect(err).not.toBeInstanceOf(SagaNeedsRepairError);
     expect(err).not.toBeInstanceOf(SagaBusyError);
@@ -514,9 +514,9 @@ describe("mapSagaError", () => {
     // The code regex is start-anchored (`^\s*\[`), so a non-saga error whose
     // {message} embeds a literal `[SCP-SAGA-…]` cannot be hijacked into a saga
     // subclass: only the leading bracket is read as the code, which here is a
-    // SCP-TOOL code, so the error delegates to mapBridgeError as a ToolError.
-    const err = mapSagaError(new Error("[SCP-TOOL-6011] tool error: see [SCP-SAGA-13067] note"));
-    expect(err).toBeInstanceOf(ToolError);
+    // SCP-TOOL code, so the error delegates to mapBridgeError as a OutletError.
+    const err = mapSagaError(new Error("[SCP-TOOL-6011] outlet error: see [SCP-SAGA-13067] note"));
+    expect(err).toBeInstanceOf(OutletError);
     expect(err).not.toBeInstanceOf(SagaAbortedError);
     expect(err).not.toBeInstanceOf(SagaNeedsRepairError);
     expect(err).not.toBeInstanceOf(SagaBusyError);
@@ -525,11 +525,11 @@ describe("mapSagaError", () => {
 
   it("falls to the default arm for a valid SCP-SAGA code with an unrecognized phrase", () => {
     // A genuine SCP-SAGA code whose phrase matches none of the three known
-    // terminals falls to the `default` arm → a generic ToolError that preserves
+    // terminals falls to the `default` arm → a generic OutletError that preserves
     // the code, rather than silently dropping it or mis-classifying it as a saga
     // subclass.
     const err = mapSagaError(new Error("[SCP-SAGA-13099] saga vanished: weird state (x=1)"));
-    expect(err).toBeInstanceOf(ToolError);
+    expect(err).toBeInstanceOf(OutletError);
     expect(err).not.toBeInstanceOf(SagaAbortedError);
     expect(err).not.toBeInstanceOf(SagaNeedsRepairError);
     expect(err).not.toBeInstanceOf(SagaBusyError);
@@ -565,14 +565,14 @@ describe("mapSagaError", () => {
     // The {message} embeds a full `[SCP-SAGA-13067] saga aborted: …` decoy after
     // the genuine prefix. The phrase regex is start-anchored (`^\s*\[`), so the
     // leading SCP-SAGA-13099 "vanished" phrase (unrecognized) forces the default
-    // arm → a generic ToolError preserving the leading code. Without the anchor,
+    // arm → a generic OutletError preserving the leading code. Without the anchor,
     // the body decoy would forge SagaAbortedError + retryAfterMs.
     const err = mapSagaError(
       new Error(
         "[SCP-SAGA-13099] saga vanished: oops [SCP-SAGA-13067] saga aborted: x (retry_after_ms=999)",
       ),
     );
-    expect(err).toBeInstanceOf(ToolError);
+    expect(err).toBeInstanceOf(OutletError);
     expect(err).not.toBeInstanceOf(SagaAbortedError);
     expect(err.code).toBe("SCP-SAGA-13099");
   });

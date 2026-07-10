@@ -1,13 +1,13 @@
-"""Tool invocation demo.
+"""Outlet invocation demo.
 
 Starts an in-memory relay, creates an identity, creates a context with
-tool capabilities, mints a UCAN token for authorization, invokes the
-tool, and verifies the result.
+outlet capabilities, mints a UCAN token for authorization, invokes the
+outlet, and verifies the result.
 
 Phase 4 PR 5 (#1549) moved every operation onto :class:`SCP` — see
 :meth:`SCP.relay_start_in_memory`, :meth:`SCP.transport_connect`,
 :meth:`SCP.identity_create`, :meth:`SCP.context_create`,
-:meth:`SCP.ucan_mint`, :meth:`SCP.tool_invoke`, and
+:meth:`SCP.ucan_mint`, :meth:`SCP.outlet_invoke`, and
 :meth:`SCP.context_close`.
 
 Requires a built native extension (``maturin develop --release``).
@@ -32,7 +32,7 @@ async def main() -> None:
         identity = await scp.identity_create(CustodyType.IN_MEMORY)
         print(f"Identity DID: {identity.did}")
 
-        # 3. Create a context with tool capabilities.
+        # 3. Create a context with outlet capabilities.
         ctx = await scp.context_create(
             identity.did,
             {
@@ -49,7 +49,7 @@ async def main() -> None:
         print(f"Context created: {ctx.context_id}")
 
         try:
-            # 4. Mint a UCAN token authorizing tool invocation.
+            # 4. Mint a UCAN token authorizing outlet invocation.
             ucan_token = await scp.ucan_mint(
                 ctx.context_id,
                 identity.did,
@@ -57,9 +57,9 @@ async def main() -> None:
             )
             print(f"UCAN minted: {ucan_token.token_id}")
 
-            # 5. Invoke the tool (requires a UCAN token).
+            # 5. Invoke the outlet (requires a UCAN token).
             try:
-                result = await scp.tool_invoke(
+                result = await scp.outlet_invoke(
                     ctx.context_id,
                     "weather",
                     {"city": "Berlin"},
@@ -68,8 +68,8 @@ async def main() -> None:
                 )
                 print(f"Weather result: {result}")
             except Exception as exc:
-                # Tool invocation may fail without a registered tool handler.
-                print(f"Tool invocation result: {exc}")
+                # Outlet invocation may fail without a registered outlet handler.
+                print(f"Outlet invocation result: {exc}")
 
             # 6. Cleanup.
             await scp.context_close(ctx._raw_handle, identity.did)

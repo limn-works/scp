@@ -1,14 +1,14 @@
-"""Tool-related dataclasses and cross-context/session wrappers for the SCP Python SDK.
+"""Outlet-related dataclasses and cross-context/session wrappers for the SCP Python SDK.
 
-Contains :class:`ToolDefinition` and :class:`TestVector`, the two types
-needed for tool registration and verification within SCP contexts, plus
-module-level async functions for cross-context tool invocation and
-stateful tool sessions:
+Contains :class:`OutletDefinition` and :class:`TestVector`, the two types
+needed for outlet registration and verification within SCP contexts, plus
+module-level async functions for cross-context outlet invocation and
+stateful outlet sessions:
 
-- :func:`invoke_cross_context` -- Invoke a tool across context boundaries.
-- :func:`session_create` -- Create a stateful tool session.
-- :func:`session_invoke` -- Invoke a tool within an active session.
-- :func:`session_close` -- Close a stateful tool session.
+- :func:`invoke_cross_context` -- Invoke an outlet across context boundaries.
+- :func:`session_create` -- Create a stateful outlet session.
+- :func:`session_invoke` -- Invoke an outlet within an active session.
+- :func:`session_close` -- Close a stateful outlet session.
 
 See ``.docs/adrs/phase-3.md`` ADR-014 acceptance criterion 3,
 ``.docs/standards/python.md`` for conventions, and spec section 6.2 /
@@ -33,10 +33,10 @@ except ImportError:
 
 
 def _resolve_bridge(scp: SCP) -> Any:
-    """Return the effective bridge object for tool operations.
+    """Return the effective bridge object for outlet operations.
 
-    Tests patch ``scp_sdk.tools._scp_core`` with a ``MagicMock`` whose
-    ``tool_*`` attributes stand in for the live bridge. In production
+    Tests patch ``scp_sdk.outlets._scp_core`` with a ``MagicMock`` whose
+    ``outlet_*`` attributes stand in for the live bridge. In production
     those attributes do not exist on the real ``_scp_core`` module
     (Phase 4 PR 4 consolidated them onto :class:`SCP`), so we fall
     through to ``scp._native`` and dispatch on the SCP instance.
@@ -60,17 +60,17 @@ def _translate_bridge_error(exc: Exception) -> Exception:
 
 @dataclass
 class TestVector:
-    """A single test vector for tool verification.
+    """A single test vector for outlet verification.
 
-    Test vectors define expected input/output pairs that a tool
-    implementation must satisfy.  They are used during tool registration
+    Test vectors define expected input/output pairs that an outlet
+    implementation must satisfy.  They are used during outlet registration
     to verify that the implementation matches its declared behaviour.
     """
 
-    #: Input data to feed the tool (JSON-compatible dict).
+    #: Input data to feed the outlet (JSON-compatible dict).
     input: dict[str, Any]
 
-    #: Expected output from the tool (JSON-compatible dict).
+    #: Expected output from the outlet (JSON-compatible dict).
     expected_output: dict[str, Any]
 
     #: Human-readable description of what this vector tests.
@@ -78,8 +78,8 @@ class TestVector:
 
 
 @dataclass
-class ToolCost:
-    """Per-invocation cost metadata for a tool (spec section 5.4.1).
+class OutletCost:
+    """Per-invocation cost metadata for an outlet (spec section 5.4.1).
 
     All monetary values are in the smallest currency unit (e.g., cents
     for USD, satoshis for BTC).
@@ -91,7 +91,7 @@ class ToolCost:
     #: ISO 4217 or protocol-defined currency code.
     currency: str
 
-    #: DID of the payment recipient.  May differ from the tool operator.
+    #: DID of the payment recipient.  May differ from the outlet operator.
     payee: str
 
     #: Optional pricing formula identifier for dynamic pricing (spec section 19.4).
@@ -99,8 +99,8 @@ class ToolCost:
 
 
 @dataclass
-class ToolDefinition:
-    """Definition of a tool registered in an SCP context.
+class OutletDefinition:
+    """Definition of an outlet registered in an SCP context.
 
     Mirrors ADR-014 acceptance criterion 3.  The ``operator`` field
     accepts either an ``Identity`` object (from ``scp_sdk.identity``,
@@ -108,7 +108,7 @@ class ToolDefinition:
 
     Example::
 
-        tool = ToolDefinition(
+        outlet = OutletDefinition(
             name="recipe_search",
             description="Search recipes by ingredients",
             input_schema={"type": "object", "properties": {"query": {"type": "string"}}},
@@ -117,20 +117,20 @@ class ToolDefinition:
         )
     """
 
-    #: Unique tool name within the context.
+    #: Unique outlet name within the context.
     name: str
 
-    #: Human-readable description of the tool's purpose.
+    #: Human-readable description of the outlet's purpose.
     description: str
 
-    #: JSON Schema describing the tool's input.
+    #: JSON Schema describing the outlet's input.
     input_schema: dict[str, Any]
 
-    #: JSON Schema describing the tool's output.
+    #: JSON Schema describing the outlet's output.
     output_schema: dict[str, Any]
 
     #: DID string or :class:`~scp_sdk.identity.Identity` object of the
-    #: tool operator.
+    #: outlet operator.
     operator: Identity | str | None
 
     #: Optional test vectors for verification.
@@ -140,19 +140,19 @@ class ToolDefinition:
     implementation_hash: bytes | None = None
 
     #: Optional per-invocation cost metadata (spec section 5.4.1).
-    cost: ToolCost | None = None
+    cost: OutletCost | None = None
 
 
 # ---------------------------------------------------------------------------
-# Cross-context tool invocation (spec section 6.2)
+# Cross-context outlet invocation (spec section 6.2)
 # ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
 class SagaResult:
-    """The committed terminal of a §6.2.4 cross-context tool-invocation saga.
+    """The committed terminal of a §6.2.4 cross-context outlet-invocation saga.
 
-    Returned by :meth:`scp_sdk.SCP.tool_invoke_cross_context_saga` only on a
+    Returned by :meth:`scp_sdk.SCP.outlet_invoke_cross_context_saga` only on a
     ``Committed`` terminal — every non-committed terminal raises a typed saga
     exception (:class:`~scp_sdk.errors.SagaAbortedError`,
     :class:`~scp_sdk.errors.SagaNeedsRepairError`, or
@@ -166,16 +166,16 @@ class SagaResult:
     #: The durable saga identifier (supervisor-minted, never a caller input).
     saga_id: str
 
-    #: The target's signed ``CrossContextToolReceipt`` bytes (JCS), or ``None``.
+    #: The target's signed ``CrossContextOutletReceipt`` bytes (JCS), or ``None``.
     receipt: bytes | None = None
 
-    #: The captured tool output bytes (the receipt's canonical ``output_jcs``),
+    #: The captured outlet output bytes (the receipt's canonical ``output_jcs``),
     #: or ``None``.
     output: bytes | None = None
 
 
 # ---------------------------------------------------------------------------
-# Stateful tool sessions (spec section 6.2.1)
+# Stateful outlet sessions (spec section 6.2.1)
 # ---------------------------------------------------------------------------
 
 
@@ -185,8 +185,8 @@ class SagaResult:
 
 
 __all__ = [
+    "OutletCost",
+    "OutletDefinition",
     "SagaResult",
     "TestVector",
-    "ToolCost",
-    "ToolDefinition",
 ]
