@@ -1465,8 +1465,8 @@ pub const RECEIVE_BUFFER_CAPACITY: usize = 1000;
 /// capabilities (all capabilities in the ceiling).
 ///
 /// `user_ceiling` contains user-provided ceiling strings in colon format
-/// (e.g. `"tool:invoke:*"`). These are converted to UCAN underscore format
-/// (e.g. `"tool_invoke:*"`) via `Capability::new` + `ucan_capability_name`.
+/// (e.g. `"outlet:call:*"`). These are converted to UCAN underscore format
+/// (e.g. `"outlet_call:*"`) via `Capability::new` + `ucan_capability_name`.
 /// Pass an empty slice to use the default ceiling.
 ///
 /// # Errors
@@ -1514,13 +1514,24 @@ pub fn register_ffi_state(
                 // still rejects a no-colon `payments` that would otherwise be widened
                 // to `payments:*`.
                 for entry in user_ceiling {
-                    scp_core::context::roles::Capability::new(entry)
-                        .validate_as_ceiling_entry()
+                    // Fail-closed: a malformed capability string (deleted
+                    // legacy outlet-invoke / pre-rename tool-invoke stems,
+                    // invalid §5.4.2.1 outlet suffix) parses to `None` and is
+                    // rejected at the FFI boundary rather than silently dropped.
+                    let cap = scp_core::context::roles::Capability::new(entry).ok_or_else(|| {
+                        ScpPyError::context(format!(
+                            "invalid capability {entry:?} in ceiling (fails §5.4.2.1 parser)"
+                        ))
+                    })?;
+                    cap.validate_as_ceiling_entry()
                         .map_err(|e| ScpPyError::context(e.to_string()))?;
                 }
                 user_ceiling
                     .iter()
-                    .map(|s| scp_core::context::roles::Capability::new(s).ucan_capability_name())
+                    .filter_map(|s| {
+                        scp_core::context::roles::Capability::new(s)
+                            .map(|c| c.ucan_capability_name())
+                    })
                     .collect::<HashSet<String>>()
             };
             let role_state =
@@ -2606,8 +2617,8 @@ mod tests {
         );
     }
 
-    /// User-provided ceiling strings in colon format (e.g. `"tool:invoke:*"`)
-    /// must be converted to UCAN underscore format (e.g. `"tool_invoke:*"`)
+    /// User-provided ceiling strings in colon format (e.g. `"outlet:call:*"`)
+    /// must be converted to UCAN underscore format (e.g. `"outlet_call:*"`)
     /// when stored in `FfiBridgeState.ceiling_strings`. Without this
     /// conversion, `mint_ucan` ceiling checks fail because the minted
     /// capability name (underscore format) doesn't match the stored
@@ -2621,10 +2632,10 @@ mod tests {
         let creator = "did:dht:z6MkCeilingConv";
 
         let user_ceiling = vec![
-            "tool:invoke:*".to_owned(),
+            "outlet:call:*".to_owned(),
             "messages:write".to_owned(),
             "context:child:create".to_owned(),
-            "tool:invoke:calculator".to_owned(),
+            "outlet:call:calculator".to_owned(),
         ];
 
         register_context(bi, &ctx_id, creator, &user_ceiling).unwrap();
@@ -2633,16 +2644,16 @@ mod tests {
 
         // Compound resources must have underscores joining their segments.
         assert!(
-            ceiling.contains("tool_invoke:*"),
-            "expected 'tool_invoke:*' but got: {ceiling:?}"
+            ceiling.contains("outlet_call:*"),
+            "expected 'outlet_call:*' but got: {ceiling:?}"
         );
         assert!(
             ceiling.contains("context_child:create"),
             "expected 'context_child:create' but got: {ceiling:?}"
         );
         assert!(
-            ceiling.contains("tool_invoke:calculator"),
-            "expected 'tool_invoke:calculator' but got: {ceiling:?}"
+            ceiling.contains("outlet_call:calculator"),
+            "expected 'outlet_call:calculator' but got: {ceiling:?}"
         );
         // Simple two-segment capabilities should pass through unchanged.
         assert!(
@@ -2651,8 +2662,8 @@ mod tests {
         );
         // Raw colon-format strings must NOT be present.
         assert!(
-            !ceiling.contains("tool:invoke:*"),
-            "raw 'tool:invoke:*' should not be in ceiling: {ceiling:?}"
+            !ceiling.contains("outlet:call:*"),
+            "raw 'outlet:call:*' should not be in ceiling: {ceiling:?}"
         );
         assert!(
             !ceiling.contains("context:child:create"),
@@ -2676,14 +2687,14 @@ mod tests {
 
         let ceiling = with_ffi_state(bi, &ctx_id, |st| Ok(st.ceiling_strings.clone())).unwrap();
 
-        // Default ceiling must include tool_invoke:* (not tool:invoke:*).
+        // Default ceiling must include outlet_call:* (not outlet:call:*).
         assert!(
-            ceiling.contains("tool_invoke:*"),
-            "default ceiling should contain 'tool_invoke:*' but got: {ceiling:?}"
+            ceiling.contains("outlet_call:*"),
+            "default ceiling should contain 'outlet_call:*' but got: {ceiling:?}"
         );
         assert!(
-            !ceiling.contains("tool:invoke:*"),
-            "default ceiling should not contain raw 'tool:invoke:*': {ceiling:?}"
+            !ceiling.contains("outlet:call:*"),
+            "default ceiling should not contain raw 'outlet:call:*': {ceiling:?}"
         );
 
         remove_context(bi, &ctx_id);
@@ -3085,10 +3096,10 @@ mod tests {
     }
 
     /// `register_context` accepts a well-formed custom ceiling entry, an explicit
-    /// `{resource}:*` wildcard, the parameterized `tool:invoke:{outlet_id}`
+    /// `{resource}:*` wildcard, the parameterized `outlet:call:{outlet_id}`
     /// built-in, and a built-in supplied in its canonical UCAN wire spelling
-    /// (`tool_invoke:*`, `context_child:create`, `bridging:*`,
-    /// `outlet_invoke:{id}`). Pins the regression where a UCAN-form built-in entry
+    /// (`outlet_call:*`, `context_child:create`, `bridging:*`,
+    /// `outlet_call:{id}`). Pins the regression where a UCAN-form built-in entry
     /// — the canonical stored ceiling spelling — was misparsed to a `Custom`
     /// lookalike and rejected with `InvalidCeilingCategory`.
     #[test]
@@ -3096,11 +3107,11 @@ mod tests {
         for good in [
             "payments:approve",
             "payments:*",
-            "tool:invoke:calc",
-            "tool:invoke:*",
+            "outlet:call:calc",
+            "outlet:call:*",
             "context:child:create",
-            "tool_invoke:*",
-            "tool_invoke:calc",
+            "outlet_call:*",
+            "outlet_call:calc",
             "context_child:create",
             "bridging:*",
         ] {

@@ -156,7 +156,7 @@ pub(crate) fn fullstack_create_context_on(
             |arr| {
                 arr.iter()
                     .filter_map(|v| v.as_str())
-                    .map(Capability::new)
+                    .filter_map(Capability::new)
                     .collect::<Vec<_>>()
             },
         );

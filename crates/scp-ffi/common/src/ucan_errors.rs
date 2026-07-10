@@ -75,10 +75,15 @@ pub const fn ucan_error_code(err: &UcanError) -> &'static str {
         | UcanError::NonceFormatInvalid(_)
         | UcanError::NonceTrackerFull(_) => codes::PERM_3001,
 
-        // Capability / delegation failures.
+        // Capability / delegation failures. The two caveat variants are
+        // per-edge caveat-narrowing (§7.3.8 Step 7b) and time-box (Step 11b)
+        // enforcement failures surfaced by the outlet-invocation validation
+        // path's `TokenNbCaveatResolver`.
         UcanError::CapabilityOutsideCeiling(_)
         | UcanError::CapabilityNotGranted(_)
         | UcanError::AttenuationViolation(_)
+        | UcanError::CaveatAttenuationViolation(_)
+        | UcanError::CaveatTimeBoxViolation(_)
         | UcanError::DelegationChainBroken(_)
         | UcanError::CircularDelegation(_) => codes::PERM_3001,
 
@@ -110,6 +115,7 @@ mod tests {
             UcanError::TokenExpired,
             UcanError::NonceReused("nonce".to_owned()),
             UcanError::CapabilityNotGranted("cap".to_owned()),
+            UcanError::CaveatTimeBoxViolation("time-box".to_owned()),
             UcanError::TokenRevoked("cid".to_owned()),
         ] {
             assert_eq!(ucan_error_code(&err), codes::PERM_3001);

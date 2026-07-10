@@ -151,7 +151,7 @@ pub fn py_media_check_capability(ceiling: Vec<String>, capability: &str) -> PyRe
     let cap = parse_media_capability(capability)?;
     let param_caps: Vec<scp_core::context::params::Capability> = ceiling
         .iter()
-        .map(scp_core::context::params::Capability::new)
+        .filter_map(scp_core::context::params::Capability::new)
         .collect();
     check_media_capability(&param_caps, &cap).map_err(media_error_to_py)?;
     Ok(true)
@@ -194,7 +194,7 @@ pub fn py_media_initiate_session(
 
     let param_caps: Vec<scp_core::context::params::Capability> = ceiling
         .iter()
-        .map(scp_core::context::params::Capability::new)
+        .filter_map(scp_core::context::params::Capability::new)
         .collect();
 
     let session = initiate_media_session(

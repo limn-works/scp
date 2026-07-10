@@ -1745,7 +1745,7 @@ mod tests {
                 Capability::MessagesRead,
                 Capability::Custom("payments:approve".to_owned()),
                 Capability::Custom("billing:*".to_owned()),
-                Capability::ToolInvokeAll,
+                Capability::OutletCallAll,
             ],
         };
         validate_governance_action_strings(&action)

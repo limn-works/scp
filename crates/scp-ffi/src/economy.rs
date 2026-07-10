@@ -36,14 +36,14 @@ use crate::validate;
 fn parse_action_type(s: &str) -> PyResult<scp_core::economy::PaidActionType> {
     match s {
         "MessageSend" | "message_send" => Ok(scp_core::economy::PaidActionType::MessageSend),
-        "ToolInvoke" | "tool_invoke" => Ok(scp_core::economy::PaidActionType::ToolInvoke),
+        "OutletCall" | "outlet_call" => Ok(scp_core::economy::PaidActionType::OutletCall),
         "ContextJoin" | "context_join" => Ok(scp_core::economy::PaidActionType::ContextJoin),
         "SubscriptionPeriod" | "subscription_period" => {
             Ok(scp_core::economy::PaidActionType::SubscriptionPeriod)
         }
         "ByteStored" | "byte_stored" => Ok(scp_core::economy::PaidActionType::ByteStored),
         _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "invalid action type: {s:?} — expected one of: MessageSend, ToolInvoke, \
+            "invalid action type: {s:?} — expected one of: MessageSend, OutletCall, \
              ContextJoin, SubscriptionPeriod, ByteStored"
         ))),
     }
@@ -547,7 +547,8 @@ mod tests {
     fn parse_action_type_all_variants() {
         assert!(parse_action_type("MessageSend").is_ok());
         assert!(parse_action_type("message_send").is_ok());
-        assert!(parse_action_type("ToolInvoke").is_ok());
+        assert!(parse_action_type("OutletCall").is_ok());
+        assert!(parse_action_type("outlet_call").is_ok());
         assert!(parse_action_type("ContextJoin").is_ok());
         assert!(parse_action_type("SubscriptionPeriod").is_ok());
         assert!(parse_action_type("ByteStored").is_ok());
@@ -561,7 +562,7 @@ mod tests {
             "cost_schedule": {
                 "currency": [85,83,68,0],
                 "per_message": "10",
-                "per_tool_invoke": null,
+                "per_outlet_call": null,
                 "per_join": null,
                 "per_period": null,
                 "per_byte_stored": null

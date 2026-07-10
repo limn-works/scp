@@ -9,6 +9,7 @@
 //!
 //! Requires the `resolvers` feature (scp-core dependency).
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use scp_core::context::ContextParams;
@@ -123,7 +124,20 @@ pub fn build_context_params(params: &CommonContextParams) -> Result<ContextParam
         "broadcast" | "Broadcast" => ContextMode::Broadcast,
         _ => ContextMode::Encrypted,
     };
-    let ceiling: Vec<Capability> = params.ceiling.iter().map(Capability::new).collect();
+    // Strict §5.4.2.1 parser — malformed outlet stems (e.g. `outlet:invoke:foo`,
+    // `outlet_query:` empty suffix, `outlet_query:FOO` uppercase, suffix > 128
+    // bytes) reject at the FFI boundary rather than silently degrading to
+    // Custom. Per SCP-OUT-014 / ADR-049 §1, the deleted legacy outlet-invoke
+    // and pre-rename tool-invoke stems have no transitional alias.
+    let ceiling: Vec<Capability> = params
+        .ceiling
+        .iter()
+        .map(|s| {
+            Capability::new(s).ok_or_else(|| {
+                format!("invalid capability {s:?} in ceiling (fails §5.4.2.1 parser)")
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
     let ceiling_policy = match params.ceiling_policy.as_str() {
         "governed" => CeilingPolicy::Governed,
         _ => CeilingPolicy::Immutable,
@@ -154,7 +168,7 @@ pub fn build_context_params(params: &CommonContextParams) -> Result<ContextParam
         ceiling,
         ceiling_policy,
         promotion_policy,
-        roles: build_roles(&params.roles),
+        roles: build_roles(&params.roles)?,
         tools: build_outlets(&params.outlets),
         ttl,
         memory_scope,
@@ -270,12 +284,24 @@ fn parse_and_validate_consequences(
 }
 
 /// Converts role name/capabilities pairs into core `RoleDefinition` values.
-fn build_roles(roles: &[(String, Vec<String>)]) -> Vec<RoleDefinition> {
+fn build_roles(roles: &[(String, Vec<String>)]) -> Result<Vec<RoleDefinition>, String> {
     roles
         .iter()
-        .map(|(name, caps)| RoleDefinition {
-            name: name.clone(),
-            capabilities: caps.iter().map(Capability::new).collect(),
+        .map(|(name, caps)| {
+            let capabilities = caps
+                .iter()
+                .map(|s| {
+                    Capability::new(s).ok_or_else(|| {
+                        format!(
+                            "invalid capability {s:?} in role {name:?} (fails §5.4.2.1 parser)"
+                        )
+                    })
+                })
+                .collect::<Result<HashSet<_>, String>>()?;
+            Ok(RoleDefinition {
+                name: name.clone(),
+                capabilities,
+            })
         })
         .collect()
 }
@@ -397,7 +423,7 @@ mod tests {
     #[test]
     fn ceiling_parsed() {
         let ctx = build_ok(&CommonContextParams {
-            ceiling: vec!["messages:write".to_owned(), "tools:invoke".to_owned()],
+            ceiling: vec!["messages:write".to_owned(), "outlet:call:*".to_owned()],
             ..Default::default()
         });
         assert_eq!(ctx.ceiling.len(), 2);

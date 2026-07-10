@@ -626,8 +626,8 @@ struct FfiBridgeProvider {
     /// JWT-encoded UCAN token for outlet invocation authorization.
     ///
     /// When present, `validate_capability` runs the full 11-step ADR-016
-    /// validation pipeline to verify the token grants `tool_invoke:{outlet_name}`
-    /// or `tool_invoke:*` for the context. When absent, `validate_capability`
+    /// validation pipeline to verify the token grants `outlet_call:{outlet_name}`
+    /// or `outlet_call:*` for the context. When absent, `validate_capability`
     /// rejects immediately (UCAN is required for outlet invocation).
     ///
     /// See spec §6.2, §8, ADR-016, and issue #319.
@@ -709,8 +709,8 @@ impl ContextProvider for FfiBridgeProvider {
         // silently accepting the capability.
         let bi = self.upgrade_bi()?;
         // Primary check: UCAN token validation via the full 11-step ADR-016
-        // pipeline. Verifies the token grants tool_invoke:{outlet_name} or
-        // tool_invoke:* for this context.
+        // pipeline. Verifies the token grants outlet_call:{outlet_name} or
+        // outlet_call:* for this context.
         // See spec §6.2, §8, ADR-016, and issue #319.
         if let Some(ref token) = self.agent_ucan_token {
             // Build proof resolver from optional proof tokens (supports delegated UCANs).
@@ -741,6 +741,12 @@ impl ContextProvider for FfiBridgeProvider {
                     clock_skew_tolerance_secs:
                         scp_core::crypto::ucan::validate::DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
                     clock: &scp_clock::SystemClock,
+                    // §5.4.5 HIGH-3 — outlet-invocation site resolves effective
+                    // caveats from each token's `nb` field so §7.3.8 Step 7b
+                    // (per-edge narrow) and Step 11b (time-box) run over the
+                    // proof chain's VALIDATED-NARROWED caveat set. Generic
+                    // validate/evaluate sites (ucan.rs) stay on `NoCaveatResolver`.
+                    caveat_resolver: &scp_core::crypto::ucan::validate::TokenNbCaveatResolver,
                 };
 
                 scp_core::context::outlets::validate_outlet_invocation_ucan(
@@ -885,7 +891,7 @@ impl ContextProvider for FfiBridgeProvider {
             &invoker_did_typed,
             now_secs,
         ) {
-            return Err("SCP-ECON-12090: rate limit exceeded on tool_invoke: \
+            return Err("SCP-ECON-12090: rate limit exceeded on outlet_invoke: \
                         hard rate limit exceeded for invoker"
                 .to_owned());
         }

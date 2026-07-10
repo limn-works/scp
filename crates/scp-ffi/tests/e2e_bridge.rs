@@ -1309,7 +1309,7 @@ fn cross_domain_identity_context_outlet_eventlog_provenance() {
         let ctx_id = create_test_context(scp.bridge_instance(), &did_a);
 
         runtime::with_context(scp.bridge_instance(), &ctx_id, |rt| {
-            rt.ceiling_strings.insert("tool_invoke:*".to_owned());
+            rt.ceiling_strings.insert("outlet_call:*".to_owned());
             rt.ceiling_strings.insert("messages:write".to_owned());
             Ok(())
         })
@@ -1880,8 +1880,8 @@ fn establish_xctx_saga_commit_preconditions(
         py,
         [
             "governance:propose",
-            "tool:interface",
-            "tools:invoke",
+            "outlet:interface",
+            "outlet:call:*",
             "messages:read",
             "messages:write",
         ],
@@ -1896,7 +1896,7 @@ fn establish_xctx_saga_commit_preconditions(
     // governance state (the saga's Prepare-B reads the outlet from B's
     // `governance.registered_outlets`, not from the FFI-side registry).
     let params_b = PyDict::new(py);
-    let ceiling_b = PyList::new(py, ["governance:propose", "tool:register"]).unwrap();
+    let ceiling_b = PyList::new(py, ["governance:propose", "outlet:register"]).unwrap();
     params_b.set_item("ceiling", ceiling_b).unwrap();
     let handle_b = scp.context_create(&owner, &params_b.as_borrowed()).unwrap();
     let ctx_b = handle_context_id(py, &handle_b);

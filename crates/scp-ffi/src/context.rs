@@ -1801,8 +1801,14 @@ fn py_validate_capability_declaration(
     let decl: CapabilityDeclaration = serde_json::from_str(&declaration_json)
         .map_err(|e| PyValueError::new_err(format!("invalid declaration JSON: {e}")))?;
 
-    let ceiling: Vec<Capability> = ceiling_capabilities.iter().map(Capability::new).collect();
-    let role_caps: Vec<Capability> = role_capabilities.iter().map(Capability::new).collect();
+    let ceiling: Vec<Capability> = ceiling_capabilities
+        .iter()
+        .filter_map(Capability::new)
+        .collect();
+    let role_caps: Vec<Capability> = role_capabilities
+        .iter()
+        .filter_map(Capability::new)
+        .collect();
 
     let handle = ContextHandle::new("validation-context".to_owned(), ContextParams::default());
 
@@ -1844,15 +1850,21 @@ fn py_check_scoped_capability(
 ) -> bool {
     use scp_core::context::roles::Capability;
 
-    let granted: HashSet<Capability> = granted_capabilities.iter().map(Capability::new).collect();
-    let required = Capability::new(&required_capability);
+    let granted: HashSet<Capability> = granted_capabilities
+        .iter()
+        .filter_map(Capability::new)
+        .collect();
+    // Fail-closed: malformed required capability -> deny.
+    let Some(required) = Capability::new(&required_capability) else {
+        return false;
+    };
 
     if granted.contains(&required) {
         return true;
     }
-    // `ToolInvokeAll` covers any `ToolInvoke(specific)`
-    if matches!(&required, Capability::ToolInvoke(_))
-        && granted.contains(&Capability::ToolInvokeAll)
+    // `OutletCallAll` covers any `OutletCall(specific)`
+    if matches!(&required, Capability::OutletCall(_))
+        && granted.contains(&Capability::OutletCallAll)
     {
         return true;
     }
@@ -6787,10 +6799,14 @@ mod tests {
         let rt = crate::runtime().unwrap();
         let params = scp_core::context::ContextParams {
             ceiling: vec![
-                scp_core::context::params::Capability::new("role:assign"),
-                scp_core::context::params::Capability::new("governance:propose"),
-                scp_core::context::params::Capability::new("governance:vote"),
-                scp_core::context::params::Capability::new("member:ban"),
+                scp_core::context::params::Capability::new("role:assign")
+                    .expect("known capability"),
+                scp_core::context::params::Capability::new("governance:propose")
+                    .expect("known capability"),
+                scp_core::context::params::Capability::new("governance:vote")
+                    .expect("known capability"),
+                scp_core::context::params::Capability::new("member:ban")
+                    .expect("known capability"),
             ],
             ..scp_core::context::ContextParams::default()
         };
@@ -8035,9 +8051,12 @@ mod tests {
 
             let params = scp_core::context::ContextParams {
                 ceiling: vec![
-                    scp_core::context::params::Capability::new("role:assign"),
-                    scp_core::context::params::Capability::new("governance:propose"),
-                    scp_core::context::params::Capability::new("governance:vote"),
+                    scp_core::context::params::Capability::new("role:assign")
+                        .expect("known capability"),
+                    scp_core::context::params::Capability::new("governance:propose")
+                        .expect("known capability"),
+                    scp_core::context::params::Capability::new("governance:vote")
+                        .expect("known capability"),
                 ],
                 ..scp_core::context::ContextParams::default()
             };

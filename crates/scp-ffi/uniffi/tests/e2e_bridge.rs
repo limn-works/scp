@@ -54,7 +54,7 @@ fn full_capability_params() -> ContextParams {
         ceiling: vec![
             "messages:read".to_owned(),
             "messages:write".to_owned(),
-            "tool:invoke:*".to_owned(),
+            "outlet:call:*".to_owned(),
             "context:close".to_owned(),
             "member:invite".to_owned(),
             "member:remove".to_owned(),
@@ -81,7 +81,7 @@ fn default_encrypted_params() -> ContextParams {
         ceiling: vec![
             "messages:read".to_owned(),
             "messages:write".to_owned(),
-            "tool:invoke:*".to_owned(),
+            "outlet:call:*".to_owned(),
         ],
         ceiling_policy: CeilingPolicy::Immutable,
         governance: GovernanceModel::SingleAdmin,

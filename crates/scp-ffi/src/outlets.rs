@@ -314,8 +314,8 @@ fn outlet_register_impl(
 
 /// Validates a UCAN token for outlet invocation authorization.
 ///
-/// Runs the full 11-step ADR-016 pipeline, requiring `outlet_invoke:{outlet_id}`
-/// or `tool_invoke:*` capability. Extracted to keep `outlet_invoke_impl` within
+/// Runs the full 11-step ADR-016 pipeline, requiring `outlet_call:{outlet_id}`
+/// or `outlet_call:*` capability. Extracted to keep `outlet_invoke_impl` within
 /// the 100-line clippy limit.
 fn validate_outlet_ucan(
     bi: &PyBridgeInstance,
@@ -351,6 +351,15 @@ fn validate_outlet_ucan(
             clock_skew_tolerance_secs:
                 scp_core::crypto::ucan::validate::DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
             clock: &scp_clock::SystemClock,
+            // §5.4.5 HIGH-3 — the outlet-invocation validation site resolves
+            // effective caveats from each token's `nb` field so §7.3.8 Step 7b
+            // (per-edge narrow) and Step 11b (time-box) run over the proof
+            // chain's VALIDATED-NARROWED caveat set, not an unverified leaf
+            // assertion. `NoCaveatResolver` returns `None` for every token, so
+            // narrowing would commit to nothing. The generic `py_ucan_validate`
+            // site (ucan.rs) and the broadcast paths stay on `NoCaveatResolver`
+            // — they are not outlet-invocation sites.
+            caveat_resolver: &scp_core::crypto::ucan::validate::TokenNbCaveatResolver,
         };
 
         scp_core::context::outlets::validate_outlet_invocation_ucan(
@@ -379,8 +388,8 @@ fn validate_outlet_ucan(
 /// needed.
 ///
 /// Validates the UCAN token for outlet invocation authorization before
-/// dispatching. The UCAN must contain a `outlet_invoke:{outlet_id}` or
-/// `tool_invoke:*` capability scoped to the context.
+/// dispatching. The UCAN must contain a `outlet_call:{outlet_id}` or
+/// `outlet_call:*` capability scoped to the context.
 ///
 /// Dispatches to a registered outlet handler if one exists (registered via
 /// [`crate::runtime::register_outlet_handler`]). The runtime validates
@@ -398,7 +407,7 @@ fn validate_outlet_ucan(
 /// * `identity_did` — The DID of the invoking identity (used for
 ///   capability checking).
 /// * `ucan_token` — JWT-encoded UCAN token authorizing the invocation.
-///   Must contain `outlet_invoke:{outlet_id}` or `tool_invoke:*` capability.
+///   Must contain `outlet_call:{outlet_id}` or `outlet_call:*` capability.
 ///   Validated using the full 11-step ADR-016 pipeline.
 /// * `spending_ucan` — Optional JWT-encoded spending UCAN
 ///   (`SpendingCapability`) for paid outlet invocations. Required when an
@@ -804,7 +813,7 @@ fn extract_test_vectors(
 /// * `input` — A Python dict of input parameters.
 /// * `invoker_did` — The DID of the participant invoking the outlet.
 /// * `ucan_token` — JWT-encoded UCAN token authorizing the invocation.
-///   Must contain `outlet_invoke:{outlet_id}` or `tool_invoke:*` capability.
+///   Must contain `outlet_call:{outlet_id}` or `outlet_call:*` capability.
 ///   Validated against the TARGET context's ceiling using the full 11-step
 ///   ADR-016 pipeline.
 /// * `chain_depth` — Current cross-context chain depth (0 for first hop).
@@ -1338,7 +1347,7 @@ fn outlet_session_create_impl(
 /// * `input` — A Python dict of input parameters.
 /// * `invoker_did` — The DID of the invoker (capability checked per call).
 /// * `ucan_token` — JWT-encoded UCAN token authorizing the invocation.
-///   Must contain `outlet_invoke:{outlet_id}` or `tool_invoke:*` capability.
+///   Must contain `outlet_call:{outlet_id}` or `outlet_call:*` capability.
 ///   Validated using the full 11-step ADR-016 pipeline.
 ///
 /// # Returns

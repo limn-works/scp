@@ -1587,8 +1587,19 @@ fn build_ucan_context_state(
         // agreement on one canonical form (BLACK-003), and still rejects a
         // no-colon `payments` that would otherwise be widened to `payments:*`.
         for entry in user_ceiling {
-            scp_core::context::roles::Capability::new(entry)
-                .validate_as_ceiling_entry()
+            // Fail-closed: a malformed capability string (deleted legacy
+            // outlet-invoke / pre-rename tool-invoke stems, invalid §5.4.2.1
+            // outlet suffix) parses to `None` and is rejected at the FFI
+            // boundary rather than silently dropped.
+            let cap = scp_core::context::roles::Capability::new(entry).ok_or_else(|| {
+                ScpNapiError::Validation {
+                    message: format!(
+                        "invalid capability {entry:?} in ceiling (fails §5.4.2.1 parser)"
+                    ),
+                    code: codes::VALID_7000.to_owned(),
+                }
+            })?;
+            cap.validate_as_ceiling_entry()
                 .map_err(|e| ScpNapiError::Validation {
                     message: e.to_string(),
                     code: codes::VALID_7000.to_owned(),
@@ -1596,7 +1607,9 @@ fn build_ucan_context_state(
         }
         user_ceiling
             .iter()
-            .map(|s| scp_core::context::roles::Capability::new(s).ucan_capability_name())
+            .filter_map(|s| {
+                scp_core::context::roles::Capability::new(s).map(|c| c.ucan_capability_name())
+            })
             .collect::<HashSet<String>>()
     };
 

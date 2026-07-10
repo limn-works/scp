@@ -3957,8 +3957,8 @@ pub fn identity_verify_link_attestation(
 
 /// Validates a UCAN token for outlet invocation authorization (`UniFFI` bridge).
 ///
-/// Runs the full 11-step ADR-016 pipeline, requiring `outlet_invoke:{outlet_id}`
-/// or `tool_invoke:*` capability. Extracted to keep `outlet_invoke` focused.
+/// Runs the full 11-step ADR-016 pipeline, requiring `outlet_call:{outlet_id}`
+/// or `outlet_call:*` capability. Extracted to keep `outlet_invoke` focused.
 fn validate_outlet_ucan_uniffi(
     bi: &Arc<crate::runtime::UniffiBridgeInstance>,
     handle: &ContextHandle,
@@ -4013,6 +4013,12 @@ fn validate_outlet_ucan_uniffi(
             presenting_agent_did: identity_did,
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
             clock: &scp_clock::SystemClock,
+            // §5.4.5 HIGH-3 — outlet-invocation site resolves effective caveats
+            // from each token's `nb` field so §7.3.8 Step 7b (per-edge narrow)
+            // and Step 11b (time-box) run over the proof chain's VALIDATED-
+            // NARROWED caveat set. Generic validate/evaluate sites stay on
+            // `NoCaveatResolver`.
+            caveat_resolver: &scp_core::crypto::ucan::validate::TokenNbCaveatResolver,
         };
 
         validate_outlet_invocation_ucan(ucan_token, &handle.context_id, outlet_id, &mut ctx)
@@ -4545,8 +4551,8 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
         // (#1549 round-2).
         let bi = self.upgrade_bi()?;
         // Primary check: UCAN token validation via the full 11-step ADR-016
-        // pipeline. Verifies the token grants tool_invoke:{outlet_name} or
-        // tool_invoke:* for this context.
+        // pipeline. Verifies the token grants outlet_call:{outlet_name} or
+        // outlet_call:* for this context.
         if let Some(ref token) = self.agent_ucan_token {
             // Build proof resolver from optional proof tokens.
             let mut proofs = std::collections::HashMap::new();
@@ -4595,6 +4601,13 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
                     clock_skew_tolerance_secs:
                         scp_core::crypto::ucan::validate::DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
                     clock: &scp_clock::SystemClock,
+                    // §5.4.5 HIGH-3 — outlet-invocation site resolves effective
+                    // caveats from each token's `nb` field so §7.3.8 Step 7b
+                    // (per-edge narrow) and Step 11b (time-box) run over the
+                    // proof chain's VALIDATED-NARROWED caveat set. Generic
+                    // validate/evaluate sites stay on `NoCaveatResolver`.
+                    caveat_resolver:
+                        &scp_core::crypto::ucan::validate::TokenNbCaveatResolver,
                 };
 
                 scp_core::context::outlets::validate_outlet_invocation_ucan(
@@ -6846,7 +6859,7 @@ pub fn media_check_capability(ceiling: Vec<String>, capability: String) -> Resul
     let cap = parse_media_capability(&capability)?;
     let param_caps: Vec<scp_core::context::params::Capability> = ceiling
         .iter()
-        .map(scp_core::context::params::Capability::new)
+        .filter_map(scp_core::context::params::Capability::new)
         .collect();
     scp_media::session::check_media_capability(&param_caps, &cap).map_err(|e| {
         ScpError::Context {
@@ -6876,7 +6889,7 @@ pub fn media_initiate_session(
 
     let param_caps: Vec<scp_core::context::params::Capability> = ceiling
         .iter()
-        .map(scp_core::context::params::Capability::new)
+        .filter_map(scp_core::context::params::Capability::new)
         .collect();
 
     let session = scp_media::session::initiate_media_session(
@@ -8044,8 +8057,14 @@ pub fn sandbox_validate_declaration(
             code: codes::VALID_7070.to_owned(),
         })?;
 
-    let ceiling: Vec<Capability> = ceiling_capabilities.iter().map(Capability::new).collect();
-    let role_caps: Vec<Capability> = role_capabilities.iter().map(Capability::new).collect();
+    let ceiling: Vec<Capability> = ceiling_capabilities
+        .iter()
+        .filter_map(Capability::new)
+        .collect();
+    let role_caps: Vec<Capability> = role_capabilities
+        .iter()
+        .filter_map(Capability::new)
+        .collect();
 
     let handle = CoreContextHandle::new("validation-context".to_owned(), ContextParams::default());
 
@@ -8090,14 +8109,21 @@ pub fn sandbox_check_capability(
     use scp_core::context::roles::Capability;
     use std::collections::HashSet;
 
-    let granted: HashSet<Capability> = granted_capabilities.iter().map(Capability::new).collect();
-    let required = Capability::new(&required_capability);
+    let granted: HashSet<Capability> = granted_capabilities
+        .iter()
+        .filter_map(Capability::new)
+        .collect();
+    // Fail-closed: malformed required capability -> deny.
+    let Some(required) = Capability::new(&required_capability) else {
+        return false;
+    };
 
     if granted.contains(&required) {
         return true;
     }
-    if matches!(&required, Capability::ToolInvoke(_))
-        && granted.contains(&Capability::ToolInvokeAll)
+    // `OutletCallAll` covers any `OutletCall(specific)`
+    if matches!(&required, Capability::OutletCall(_))
+        && granted.contains(&Capability::OutletCallAll)
     {
         return true;
     }
@@ -8495,7 +8521,7 @@ pub fn economy_evaluate_formula(
 fn parse_paid_action_type(s: &str) -> Result<scp_core::economy::PaidActionType, ScpError> {
     match s {
         "MessageSend" | "message_send" => Ok(scp_core::economy::PaidActionType::MessageSend),
-        "ToolInvoke" | "tool_invoke" => Ok(scp_core::economy::PaidActionType::ToolInvoke),
+        "OutletCall" | "outlet_call" => Ok(scp_core::economy::PaidActionType::OutletCall),
         "ContextJoin" | "context_join" => Ok(scp_core::economy::PaidActionType::ContextJoin),
         "SubscriptionPeriod" | "subscription_period" => {
             Ok(scp_core::economy::PaidActionType::SubscriptionPeriod)
@@ -8503,7 +8529,7 @@ fn parse_paid_action_type(s: &str) -> Result<scp_core::economy::PaidActionType, 
         "ByteStored" | "byte_stored" => Ok(scp_core::economy::PaidActionType::ByteStored),
         _ => Err(ScpError::Validation {
             msg: format!(
-                "invalid action type: {s:?} — expected one of: MessageSend, ToolInvoke, \
+                "invalid action type: {s:?} — expected one of: MessageSend, OutletCall, \
                  ContextJoin, SubscriptionPeriod, ByteStored"
             ),
             code: codes::VALID_7050.to_owned(),
@@ -9421,8 +9447,9 @@ impl Scp {
                     ceiling_strings: params
                         .ceiling
                         .iter()
-                        .map(|s| {
-                            scp_core::context::roles::Capability::new(s).ucan_capability_name()
+                        .filter_map(|s| {
+                            scp_core::context::roles::Capability::new(s)
+                                .map(|c| c.ucan_capability_name())
                         })
                         .collect(),
                     outlet_registry: tokio::sync::Mutex::new(
@@ -12765,8 +12792,8 @@ impl Scp {
                 // enforce this. Reject early if missing (§6.2, ADR-016, #423).
                 let ucan_token = ucan_token.ok_or_else(|| ScpError::Permission {
                     msg: "UCAN token is required for outlet invocation — \
-                              pass a valid JWT-encoded UCAN with outlet_invoke:{outlet_id} \
-                              or tool_invoke:* capability"
+                              pass a valid JWT-encoded UCAN with outlet_call:{outlet_id} \
+                              or outlet_call:* capability"
                         .to_owned(),
                     code: codes::PERM_3001.to_owned(),
                 })?;
@@ -14652,6 +14679,12 @@ impl Scp {
                             presenting_agent_did: agent_did,
                             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
                             clock: &scp_clock::SystemClock,
+                            // Generic validate site: not an outlet-invocation
+                            // path, so caveat resolution is a constant `None`
+                            // (`NoCaveatResolver`). Only outlet-invocation sites
+                            // use `TokenNbCaveatResolver`.
+                            caveat_resolver:
+                                &scp_core::crypto::ucan::validate::NoCaveatResolver,
                         };
 
                         validate_ucan(&parsed_token, &required_cap, &mut ctx).map_err(|e| {
@@ -14810,6 +14843,12 @@ impl Scp {
                             presenting_agent_did: agent_did,
                             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
                             clock: &scp_clock::SystemClock,
+                            // Generic evaluate site: not an outlet-invocation
+                            // path, so caveat resolution is a constant `None`
+                            // (`NoCaveatResolver`). Only outlet-invocation sites
+                            // use `TokenNbCaveatResolver`.
+                            caveat_resolver:
+                                &scp_core::crypto::ucan::validate::NoCaveatResolver,
                         };
 
                         evaluate_ucan(&parsed_token, required_cap.as_ref(), &ctx)
@@ -19647,7 +19686,7 @@ mod tests {
         assert!(result.is_none());
 
         // Direct set always rejects.
-        let json = r#"{"locked":false,"cost_schedule":{"currency":[85,83,68,0],"per_message":null,"per_tool_invoke":"100","per_join":null,"per_period":null,"per_byte_stored":null},"payment_adapters":[],"pricing_formula":null,"payee":"did:dht:z6MkTest"}"#;
+        let json = r#"{"locked":false,"cost_schedule":{"currency":[85,83,68,0],"per_message":null,"per_outlet_call":"100","per_join":null,"per_period":null,"per_byte_stored":null},"payment_adapters":[],"pricing_formula":null,"payee":"did:dht:z6MkTest"}"#;
         let result = scp.set_economic_policy(Arc::clone(&handle), json.to_owned());
         assert!(
             result.is_err(),
@@ -23287,8 +23326,8 @@ mod tests {
                     Arc::clone(&owner_identity),
                     saga_context_params(&[
                         "governance:propose",
-                        "tool:interface",
-                        "tools:invoke",
+                        "outlet:interface",
+                        "outlet:call:*",
                         "messages:read",
                         "messages:write",
                     ]),
@@ -23303,7 +23342,7 @@ mod tests {
             let handle_b = scp
                 .context_create(
                     Arc::clone(&owner_identity),
-                    saga_context_params(&["governance:propose", "tool:register"]),
+                    saga_context_params(&["governance:propose", "outlet:register"]),
                 )
                 .await
                 .expect("target context B must be created");
@@ -23464,8 +23503,8 @@ mod tests {
                     Arc::clone(&owner_identity),
                     saga_context_params(&[
                         "governance:propose",
-                        "tool:interface",
-                        "tools:invoke",
+                        "outlet:interface",
+                        "outlet:call:*",
                         "messages:read",
                         "messages:write",
                     ]),
@@ -23477,7 +23516,7 @@ mod tests {
             let handle_b = scp
                 .context_create(
                     Arc::clone(&owner_identity),
-                    saga_context_params(&["governance:propose", "tool:register"]),
+                    saga_context_params(&["governance:propose", "outlet:register"]),
                 )
                 .await
                 .expect("target context B must be created");
@@ -23623,7 +23662,7 @@ mod tests {
             let handle_a = scp
                 .context_create(
                     Arc::clone(&owner_identity),
-                    saga_context_params(&["governance:propose", "tools:invoke"]),
+                    saga_context_params(&["governance:propose", "outlet:call:*"]),
                 )
                 .await
                 .expect("caller context A must be created");
@@ -23714,7 +23753,7 @@ mod tests {
             let handle_a = scp
                 .context_create(
                     Arc::clone(&owner_identity),
-                    saga_context_params(&["governance:propose", "tools:invoke"]),
+                    saga_context_params(&["governance:propose", "outlet:call:*"]),
                 )
                 .await
                 .expect("caller context A must be created");
@@ -23802,7 +23841,7 @@ mod tests {
             let handle_a = scp
                 .context_create(
                     Arc::clone(&owner_identity),
-                    saga_context_params(&["governance:propose", "tools:invoke"]),
+                    saga_context_params(&["governance:propose", "outlet:call:*"]),
                 )
                 .await
                 .expect("caller context A must be created");
