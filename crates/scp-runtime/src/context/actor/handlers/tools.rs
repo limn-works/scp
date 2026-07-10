@@ -118,17 +118,16 @@ async fn handle_try_consume_hard_rate_limit(
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, consume_fut).await {
         Ok(consumed) => {
-            // `consumed == true` ⇒ token taken from the bucket OR the
-            // context is unknown (legacy pass-through contract). Both
-            // cases mutate observable state iff the context was known,
-            // so flag `ok_mutated` to be safe: a successful `true` on
-            // a known context is the dominant path.
-            let outcome = if consumed {
-                Outcome::ok_mutated(())
-            } else {
-                Outcome::ok(())
-            };
-            (outcome, Ok(consumed))
+            // `try_consume` writes Class-C on BOTH branches: a `true` consume
+            // debits the bucket; a `false` DENY still lazily materializes the
+            // limiter window and advances `last_refill` (a token refill). Both
+            // writes are idempotently re-derivable from the persisted anchor + the
+            // wall clock (never a loss, never fail-open), so the deny branch is
+            // durability-SAFE regardless of the flag. We still report `ok_mutated`
+            // UNCONDITIONALLY — mirroring `prepare_a`'s defensive reject posture —
+            // so the coalesced flush captures the refill write and a future audit
+            // does not re-flag the deny branch as a `mutated:false` Class-C site.
+            (Outcome::ok_mutated(()), Ok(consumed))
         }
         Err(_elapsed) => {
             let err = ContextError::TransportTimeout(format!(

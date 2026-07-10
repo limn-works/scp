@@ -934,10 +934,16 @@ async fn prepare_b(
     //     window increment is persisted by the SUBSEQUENT staging combinator (one
     //     persist covers window + nonce + slot). It runs AFTER the read-only
     //     rejects (a rejected call never consumes the budget) but BEFORE the
-    //     staging combinator, so a clean over-budget reject here surfaces as
-    //     `Outcome::err` (no slot staged), DISTINCT from a later persist failure's
-    //     `Outcome::err_mutated`. The over-budget / over-ceiling reject paths do
-    //     NOT mutate (no increment), so an un-persisted `Outcome::err` is correct.
+    //     staging combinator, so a clean reject here surfaces as `Outcome::err`
+    //     (no slot staged), DISTINCT from a later persist failure's
+    //     `Outcome::err_mutated`. The over-CEILING reject (13027) returns BEFORE
+    //     window materialization, so it makes no mutation at all. The over-BUDGET
+    //     reject (13026) DOES touch Class-C — it lazily materializes the inbound
+    //     window and `check_and_increment` may roll its counter — but only
+    //     idempotent, wall-clock-re-derivable state (deterministically rebuilt from
+    //     the inbound policy + clock on the next call), never a durable increment of
+    //     admitted volume. So an un-persisted `Outcome::err` is correct: the ≤50ms
+    //     coalesce-window rollback re-derives the identical window on the retry.
     if let Err(rej) =
         consume_inbound_interface_rate_limit(cell.class_c_view(), deps, &req.tool_registration_id)
     {
@@ -2011,14 +2017,15 @@ async fn commit_a(
         // Commit-A, refunding against the new instance's owned state would
         // corrupt the WRONG context. On a mismatch the helper voids only the
         // external escrow and consumes the ticket (mirrors `settle_tool_economy`).
-        crate::context::tools_helpers::rollback_tool_economy_generation_checked(
-            cell.class_c_view(),
-            deps,
-            req.reservation.reservation.generation,
-            req.reservation.reservation.ticket,
-        )
-        .await;
-        // ── COMMIT-A-REPLAY (idempotent Class-S remove, NO persist — SECURITY) ───
+        let class_c_economy_reversed =
+            crate::context::tools_helpers::rollback_tool_economy_generation_checked(
+                cell.class_c_view(),
+                deps,
+                req.reservation.reservation.generation,
+                req.reservation.reservation.ticket,
+            )
+            .await;
+        // ── COMMIT-A-REPLAY (idempotent Class-S remove, NO fail-closed persist — SECURITY) ───
         // The durable reversal record (if still present) was consumed at the
         // FIRST Commit-A; remove any straggler so it cannot reverse settled
         // state. A removal here is rare (the first Commit-A already removed it),
@@ -2033,7 +2040,25 @@ async fn commit_a(
         // rebuilt-irrelevant on respawn. It can never widen to a closure form.
         let _ = cell.clear_committed_reservation_idempotent(&req.saga_id);
         let _ = reply.send(Ok(()));
-        return Outcome::ok(());
+        // ADR-049 §Decision 9 / finding N1: on a GENERATION MATCH the
+        // generation-checked rollback above reversed Class-C economy bookkeeping
+        // (velocity / budget / hard-rate refund) through the non-persisting
+        // `class_c_view`, so its durability rides this handler's `mutated` flag —
+        // report `ok_mutated` to mark the actor dirty for the ordinary COALESCED
+        // best-effort persist. That is NOT the fail-closed write the Class-S
+        // straggler removal above deliberately rules out; a coalesced persist keeps
+        // this idempotent `Ok` re-ack infallible while still making the Class-C
+        // reversal durable. This branch is guarded-unreachable in today's FSM (a
+        // committed Commit-A leaves `prepared_a == None`, so a live reservation is
+        // not re-delivered on the same generation), but marking `mutated` keeps the
+        // handler correct-by-construction if that ever changes. On a generation
+        // MISMATCH the helper voided only external escrow and touched no Class-C
+        // field, so nothing local changed → `ok` (unmutated).
+        return if class_c_economy_reversed {
+            Outcome::ok_mutated(())
+        } else {
+            Outcome::ok(())
+        };
     }
 
     // Settle (capture) the escrow + outbound rate-limit reservation. The
