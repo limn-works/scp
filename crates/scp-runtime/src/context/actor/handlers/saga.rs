@@ -56,7 +56,7 @@ use scp_did::DID;
 use scp_protocol::context::ContextError;
 use scp_protocol::crypto::ucan::UcanToken;
 use scp_protocol::crypto::ucan::validate::{
-    DEFAULT_CLOCK_SKEW_TOLERANCE_SECS, NoCaveatResolver, ValidationContext,
+    DEFAULT_CLOCK_SKEW_TOLERANCE_SECS, TokenNbCaveatResolver, ValidationContext,
 };
 
 use scp_protocol::context::outlets::cross_context_saga::{
@@ -1214,11 +1214,16 @@ fn validate_ucan_rebind(
         presenting_agent_did: req.caller_did.as_ref(),
         clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
         clock: deps.clock.as_ref(),
-        // Cross-context saga RE-VALIDATION of a stored delegation proof feeds
-        // the generic `validate_ucan` pipeline — NOT the outlet-open path — so
-        // caveats are resolved by the no-op resolver (classification: generic
-        // re-validation ⇒ NoCaveatResolver).
-        caveat_resolver: &NoCaveatResolver,
+        // Cross-context saga RE-VALIDATION of a stored delegation proof re-checks
+        // an outlet-INVOCATION gate (`required_cap` = `outlet_call:{tool}`), so it
+        // is an outlet-invocation site and MUST resolve §7.3.8 caveats from each
+        // token's own `nb` — matching every other outlet-invocation site
+        // (ffi/outlets.rs, napi/outlets.rs, uniffi/bridge.rs). A delegated
+        // cross-context outlet token now carries a materialized `origin_kind`
+        // (`build_delegated_caveats`); `TokenNbCaveatResolver` surfaces it so the
+        // per-edge origin_kind check validates the chain instead of rejecting a
+        // resolved-`None` outlet edge (`OriginKindUnspecified`).
+        caveat_resolver: &TokenNbCaveatResolver,
     };
 
     validate_ucan(&token, &required_cap, &mut ctx).map_err(|e| {

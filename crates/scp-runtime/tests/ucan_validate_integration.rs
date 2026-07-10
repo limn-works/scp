@@ -26,7 +26,8 @@ use scp_protocol::crypto::ucan::revoke::compute_revocation_cid;
 use scp_protocol::crypto::ucan::validate::{
     CapabilityValidation, DEFAULT_CLOCK_SKEW_TOLERANCE_SECS, InMemoryDidResolver,
     InMemoryNonceTracker, InMemoryProofResolver, InMemoryRevocationChecker, NoCaveatResolver,
-    NonceTracker, ProofResolver, ValidationContext, evaluate_ucan, parse_ucan, validate_ucan,
+    NonceTracker, ProofResolver, TokenNbCaveatResolver, ValidationContext, evaluate_ucan,
+    parse_ucan, validate_ucan,
 };
 use scp_protocol::crypto::ucan::{Attenuation, UcanError, UcanHeader, UcanPayload, UcanToken};
 
@@ -2730,5 +2731,285 @@ async fn evaluate_ucan_none_vs_some_for_ungranted_invoked_capability() {
             time_bounds_valid: true,
         },
         "None must skip grant-match and report intrinsic validity: {with_none:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// §7.3.8 origin_kind materialization — mint -> delegate -> validate round-trips
+//
+// REGRESSION COVERAGE for the reachable authorization defect where the mint
+// set `nb = None` unconditionally on delegated outlet capabilities, producing
+// a token the shipped validator rejects (`OriginKindUnspecified`, rule-4).
+// `build_delegated_caveats` now materializes an explicit `origin_kind` on a
+// delegated OUTLET child (inherited/inferred from the delegated stem family).
+//
+// These sites are OUTLET-INVOCATION gates, so they resolve caveats from each
+// token's own `nb` via `TokenNbCaveatResolver` (matching the FFI outlet-open
+// paths and the cross-context saga re-validation) — the module `build_context`
+// helper uses `NoCaveatResolver`, which would not surface the materialized
+// caveats, so these tests construct the context inline.
+// ---------------------------------------------------------------------------
+
+/// Ceiling admitting both outlet families used by the round-trip tests.
+fn outlet_ceiling() -> HashSet<String> {
+    [
+        "outlet_call:assistant".to_owned(),
+        "outlet_query:reader".to_owned(),
+    ]
+    .into_iter()
+    .collect()
+}
+
+static TOKEN_NB_RESOLVER: TokenNbCaveatResolver = TokenNbCaveatResolver;
+
+/// Mint a single-family outlet ROOT, delegate the same outlet capability to a
+/// subordinate, and validate the delegated token against that outlet cap using
+/// the outlet-invocation caveat resolver. Returns the validation result plus
+/// the materialized `origin_kind` on the delegated token's `nb`.
+async fn mint_delegate_validate_outlet(
+    cap_name: &str,
+    resource: &str,
+    action: &str,
+) -> (
+    Result<(), UcanError>,
+    Option<scp_protocol::context::outlets::OutletKind>,
+) {
+    let (custody_creator, key_creator, creator_did, pk_creator) = setup_identity().await;
+    let (custody_delegator, key_delegator, delegator_did, pk_delegator) = setup_identity().await;
+    let (_custody_agent, _key_agent, agent_did, _pk_agent) = setup_identity().await;
+
+    let ctx_id = "ctx-outlet";
+    let caps = vec![cap_name.to_owned()];
+
+    // Creator mints a single-family outlet root to the delegator.
+    let root_token = mint_ucan(
+        &MintParams {
+            issuer_did: &creator_did,
+            issuer_key: &key_creator,
+            audience_did: &delegator_did,
+            context_id: ctx_id,
+            capabilities: &caps,
+            lifetime_secs: 3600,
+            not_before: None,
+            proofs: vec![],
+            facts: None,
+            key_scope: None,
+            signing_key_id: None,
+            ceiling: Some(outlet_ceiling()),
+        },
+        &custody_creator,
+        &scp_clock::SystemClock,
+    )
+    .await
+    .unwrap();
+
+    // A single-family outlet root legitimately carries nb = None (rule 3).
+    assert!(
+        root_token.payload.nb.is_none(),
+        "single-family outlet root must carry nb = None"
+    );
+
+    let root_cid = compute_cid(&root_token);
+
+    // Delegator delegates the SAME outlet capability to the agent.
+    let delegated_token = scp_runtime::crypto::ucan::mint::delegate_ucan(
+        &DelegateParams {
+            parent_token: &root_token,
+            delegator_did: &delegator_did,
+            delegator_key: &key_delegator,
+            delegatee_did: &agent_did,
+            attenuated_capabilities: &[Attenuation {
+                with: format!("scp:ctx:{ctx_id}/{resource}:{action}"),
+                can: action.to_owned(),
+            }],
+            lifetime_secs: 1800,
+            facts: None,
+            key_scope: None,
+            signing_key_id: None,
+            ceiling: Some(outlet_ceiling()),
+        },
+        &custody_delegator,
+        &scp_clock::SystemClock,
+    )
+    .await
+    .unwrap();
+
+    let materialized_kind = delegated_token
+        .payload
+        .nb
+        .as_ref()
+        .and_then(|nb| nb.origin_kind);
+
+    let resolver = InMemoryDidResolver {
+        keys: [
+            (creator_did.clone(), pk_creator),
+            (delegator_did.clone(), pk_delegator),
+        ]
+        .into_iter()
+        .collect(),
+        kid_keys: std::collections::HashMap::new(),
+    };
+    let proof_resolver = InMemoryProofResolver {
+        proofs: std::collections::HashMap::from([(root_cid, root_token)]),
+    };
+    let mut nonce_tracker = InMemoryNonceTracker::new();
+    let revocation_checker = InMemoryRevocationChecker::new();
+    let ceiling = outlet_ceiling();
+    let required_cap = CapabilityUri::new(ctx_id, resource, action);
+
+    let mut ctx = ValidationContext {
+        did_resolver: &resolver,
+        nonce_tracker: &mut nonce_tracker,
+        revocation_checker: &revocation_checker,
+        proof_resolver: &proof_resolver,
+        caveat_resolver: &TOKEN_NB_RESOLVER,
+        ceiling: &ceiling,
+        context_creator_did: &creator_did,
+        presenting_agent_did: &agent_did,
+        clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+        clock: &SYSTEM_CLOCK,
+    };
+
+    let result = validate_ucan(&delegated_token, &required_cap, &mut ctx);
+    (result, materialized_kind)
+}
+
+#[tokio::test]
+async fn delegated_outlet_call_materializes_action_origin_kind_and_validates() {
+    let (result, kind) =
+        mint_delegate_validate_outlet("outlet_call:assistant", "outlet_call", "assistant").await;
+
+    assert_eq!(
+        kind,
+        Some(scp_protocol::context::outlets::OutletKind::Action),
+        "delegated outlet_call child must materialize origin_kind = Action"
+    );
+    assert!(
+        result.is_ok(),
+        "delegated outlet_call token must PASS validation (was previously \
+         rejected with OriginKindUnspecified): {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn delegated_outlet_query_materializes_query_origin_kind_and_validates() {
+    let (result, kind) =
+        mint_delegate_validate_outlet("outlet_query:reader", "outlet_query", "reader").await;
+
+    assert_eq!(
+        kind,
+        Some(scp_protocol::context::outlets::OutletKind::Query),
+        "delegated outlet_query child must materialize origin_kind = Query"
+    );
+    assert!(
+        result.is_ok(),
+        "delegated outlet_query token must PASS validation: {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn hand_built_delegated_outlet_token_with_nb_none_is_still_rejected() {
+    // NEGATIVE: rule-4 is unchanged — an outlet delegation whose child `nb` is
+    // None must still be rejected. We reconstruct the delegated token WITHOUT
+    // the materialized `nb` (simulating the pre-fix mint / a forged token) and
+    // re-sign it so the signature is valid but `nb` is absent.
+    let (custody_creator, key_creator, creator_did, pk_creator) = setup_identity().await;
+    let (custody_delegator, key_delegator, delegator_did, pk_delegator) = setup_identity().await;
+    let (_custody_agent, _key_agent, agent_did, _pk_agent) = setup_identity().await;
+
+    let ctx_id = "ctx-outlet";
+    let caps = vec!["outlet_call:assistant".to_owned()];
+
+    let root_token = mint_ucan(
+        &MintParams {
+            issuer_did: &creator_did,
+            issuer_key: &key_creator,
+            audience_did: &delegator_did,
+            context_id: ctx_id,
+            capabilities: &caps,
+            lifetime_secs: 3600,
+            not_before: None,
+            proofs: vec![],
+            facts: None,
+            key_scope: None,
+            signing_key_id: None,
+            ceiling: Some(outlet_ceiling()),
+        },
+        &custody_creator,
+        &scp_clock::SystemClock,
+    )
+    .await
+    .unwrap();
+    let root_cid = compute_cid(&root_token);
+
+    // Build the delegated payload BY HAND with nb = None (the defect shape).
+    let mut proofs = root_token.payload.prf.clone();
+    proofs.push(root_cid.clone());
+    let payload = UcanPayload {
+        iss: delegator_did.clone(),
+        aud: agent_did.clone(),
+        exp: scp_clock::SystemClock.now_secs() + 1800,
+        nbf: None,
+        nnc: nonce::generate_nonce(&scp_clock::SystemClock),
+        att: vec![Attenuation {
+            with: format!("scp:ctx:{ctx_id}/outlet_call:assistant"),
+            can: "assistant".to_owned(),
+        }],
+        prf: proofs,
+        fct: None,
+        nb: None,
+    };
+    let header = UcanHeader::new();
+    let header_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap());
+    let payload_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap());
+    let signing_input = format!("{header_b64}.{payload_b64}");
+    let sig = custody_delegator
+        .sign(&key_delegator, signing_input.as_bytes())
+        .await
+        .unwrap();
+    let sig_b64 = URL_SAFE_NO_PAD.encode(sig.as_bytes());
+    let encoded = format!("{signing_input}.{sig_b64}");
+    let hand_built = UcanToken {
+        header,
+        payload,
+        signature: sig.into_bytes(),
+        encoded,
+    };
+
+    let resolver = InMemoryDidResolver {
+        keys: [
+            (creator_did.clone(), pk_creator),
+            (delegator_did.clone(), pk_delegator),
+        ]
+        .into_iter()
+        .collect(),
+        kid_keys: std::collections::HashMap::new(),
+    };
+    let proof_resolver = InMemoryProofResolver {
+        proofs: std::collections::HashMap::from([(root_cid, root_token)]),
+    };
+    let mut nonce_tracker = InMemoryNonceTracker::new();
+    let revocation_checker = InMemoryRevocationChecker::new();
+    let ceiling = outlet_ceiling();
+    let required_cap = CapabilityUri::new(ctx_id, "outlet_call", "assistant");
+
+    let mut ctx = ValidationContext {
+        did_resolver: &resolver,
+        nonce_tracker: &mut nonce_tracker,
+        revocation_checker: &revocation_checker,
+        proof_resolver: &proof_resolver,
+        caveat_resolver: &TOKEN_NB_RESOLVER,
+        ceiling: &ceiling,
+        context_creator_did: &creator_did,
+        presenting_agent_did: &agent_did,
+        clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+        clock: &SYSTEM_CLOCK,
+    };
+
+    let result = validate_ucan(&hand_built, &required_cap, &mut ctx);
+    assert!(
+        matches!(result, Err(UcanError::CaveatAttenuationViolation(_))),
+        "a delegated outlet token with nb = None must STILL be rejected \
+         (rule-4 unchanged): {result:?}"
     );
 }
