@@ -72,7 +72,7 @@ use crate::context::actor::outcome::{Outcome, outcome_error_sketch};
 use crate::context::actor::state::PerContextState;
 use crate::context::economy_logic::{ContextRevocationChecker, KeyResolverDidResolver};
 use crate::context::messaging_helpers::{
-    build_snapshot_for_persist, persist_snapshot_fail_closed, persist_state_fail_closed,
+    build_snapshot_for_persist, persist_snapshot_fail_closed, persist_state_best_effort,
 };
 use crate::context::supervisor::saga_journal::SagaId;
 use crate::context::supervisor::saga_prepared_state::{
@@ -431,11 +431,14 @@ async fn prepare_a(
     // `class_c_view()`. The consume carries NO own persist on the SUCCESS path
     // (it falls through to the `reserve_tool_economy` / staging combinators,
     // which persist it). On the over-budget REJECT path the window may have
-    // partially incremented, so an EXPLICIT `persist_state_fail_closed(&*cell)`
+    // partially incremented, so an EXPLICIT `persist_state_best_effort(&*cell)`
     // (a shared `&PerContextState` Deref read) lands the partial increment
-    // fail-closed before replying `err_mutated` — the conditional persist is
-    // expressed explicitly here, NOT folded into a combinator's fixed
-    // persist-on-`Ok` / persist-never shape. Each borrow ends before the next.
+    // before replying `err_mutated`. This is an already-failing terminal path:
+    // no success is acked and the only durable state is the soft Class-C
+    // increment (no Class-S state), so best-effort — not fail-closed — is the
+    // honest intent. The conditional persist is expressed explicitly here, NOT
+    // folded into a combinator's fixed persist-on-`Ok` / persist-never shape.
+    // Each borrow ends before the next.
 
     // 1. Caller must hold `tool:interface` AND be in the interface's outbound
     //    allowed_callers (empty = any member). REUSES the role-state capability
@@ -477,15 +480,19 @@ async fn prepare_a(
         // and THEN this branch is reached, the increment stays. (In practice a
         // rejection here means the window was NOT incremented — `RateLimited`
         // is the over-budget case where the call is denied.) Persist so any
-        // partial increment durably lands (fail-closed direction), then reply.
-        // `persist_state_fail_closed` reads a shared `&PerContextState` via the
+        // partial increment durably lands, then reply. This is an
+        // already-failing terminal reject: no success is acked and the only
+        // durable state is the soft Class-C anti-spam window increment (no
+        // Class-S state), so best-effort — not fail-closed — is the honest
+        // intent; a persist failure here just records the metric.
+        // `persist_state_best_effort` reads a shared `&PerContextState` via the
         // cell `Deref` (`&*cell`) — no `state_mut()`.
         //
         // POLICY reject ⇒ `Ok(PrepareAOutcome::Rejected(SagaReject))` on the
         // SUCCESS channel (structural code), but `Outcome::err_mutated` for the
         // actor's Class-S accounting — the reply payload and the Outcome are
         // intentionally orthogonal (see the validate_outbound_caller reject).
-        let _ = persist_state_fail_closed(&*cell, deps, &context_id_hex).await;
+        persist_state_best_effort(&*cell, deps, &context_id_hex).await;
         let sketch = outcome_error_sketch(&rej.error);
         let _ = reply.send(Ok(PrepareAOutcome::Rejected(rej)));
         return Outcome::err_mutated(sketch);
@@ -508,12 +515,18 @@ async fn prepare_a(
             Ok(reservation) => reservation,
             Err(err) => {
                 // reserve_tool_economy rolls back its OWN staged bookkeeping on
-                // every failure branch, so no escrow/velocity/budget leaked. The
-                // §6.2.0.2 budget consumed above is NOT rolled back (non-refundable
-                // at initiation); persist so it durably lands, then reply.
-                // `persist_state_fail_closed` takes a SHARED `&PerContextState`, so
-                // this reads through the cell's `Deref` (`&*cell`) — no `state_mut()`.
-                let _ = persist_state_fail_closed(&*cell, deps, &context_id_hex).await;
+                // every failure branch, so no escrow/velocity/budget leaked — and
+                // its Class-S state is rolled back too, leaving nothing security-
+                // critical to durably land here. The §6.2.0.2 budget consumed above
+                // is NOT rolled back (non-refundable at initiation); persist so it
+                // durably lands, then reply. This is an already-failing terminal
+                // error: no success is acked and the only durable state is the soft
+                // Class-C anti-spam window increment, so best-effort — not fail-
+                // closed — is the honest intent; a persist failure just records the
+                // metric. `persist_state_best_effort` takes a SHARED
+                // `&PerContextState`, so this reads through the cell's `Deref`
+                // (`&*cell`) — no `state_mut()`.
+                persist_state_best_effort(&*cell, deps, &context_id_hex).await;
                 let sketch = outcome_error_sketch(&err);
                 let _ = reply.send(Err(err));
                 return Outcome::err_mutated(sketch);
