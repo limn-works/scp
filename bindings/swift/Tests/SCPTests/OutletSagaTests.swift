@@ -41,7 +41,7 @@ final class OutletSagaTests: XCTestCase {
     private func makeParams() -> ContextParams {
         ContextParams(
             mode: .encrypted,
-            ceiling: ["messages:read", "messages:write", "tool:invoke:*", "outlet:register", "context:close"],
+            ceiling: ["messages:read", "messages:write", "outlet:call:*", "outlet:register", "context:close"],
             ceilingPolicy: .immutable,
             governance: .singleAdmin,
             memoryScope: .ephemeral,

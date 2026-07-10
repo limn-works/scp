@@ -22,7 +22,7 @@ async function main(): Promise<void> {
     const ctx = await scp.contextCreate(
       identity,
       JSON.stringify({
-        ceiling: ["messages:read", "messages:write", "tool:invoke:*", "tool:register"],
+        ceiling: ["messages:read", "messages:write", "outlet:call:*", "outlet:register"],
         memoryScope: "ephemeral",
         governance: "single_admin",
       }),

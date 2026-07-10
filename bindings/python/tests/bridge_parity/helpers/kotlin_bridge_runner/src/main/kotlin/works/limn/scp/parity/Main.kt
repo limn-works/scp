@@ -339,8 +339,8 @@ private const val PARITY_OUTLET_NAME = "parity_probe"
 private val PARITY_OUTLET_CEILING = listOf(
     "messages:read",
     "messages:write",
-    "tool:register",
-    "tool_invoke:*"
+    "outlet:register",
+    "outlet_call:*"
 )
 
 @Suppress("UnusedParameter")

@@ -61,7 +61,7 @@ async function main(): Promise<void> {
     const ctx = await scp.contextCreate(
       identity,
       JSON.stringify({
-        ceiling: ["messages:read", "messages:write", "tool:invoke:*", "tool:register"],
+        ceiling: ["messages:read", "messages:write", "outlet:call:*", "outlet:register"],
         memoryScope: "ephemeral",
         governance: "single_admin",
       }),
@@ -73,7 +73,7 @@ async function main(): Promise<void> {
     console.log(`Registered outlet: ${outletId}`);
 
     // 7. Mint a UCAN token for outlet invocation.
-    const ucan = (await scp.ucanMint(ctx._rawHandle, identity.did, ["tool_invoke:*"])) as UcanToken;
+    const ucan = (await scp.ucanMint(ctx._rawHandle, identity.did, ["outlet_call:*"])) as UcanToken;
     console.log(`UCAN minted: ${ucan.id}`);
 
     // 8. Invoke the outlet with the UCAN token.

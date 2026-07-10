@@ -32,8 +32,8 @@ fun mcpIntegrationExample(bridge: CoroutineBridge) = runBlocking {
         putJsonArray("ceiling") {
             add(JsonPrimitive("messages:read"))
             add(JsonPrimitive("messages:write"))
-            add(JsonPrimitive("tool:invoke:*"))
-            add(JsonPrimitive("tool:register"))
+            add(JsonPrimitive("outlet:call:*"))
+            add(JsonPrimitive("outlet:register"))
         }
     }.toString()
 

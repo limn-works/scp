@@ -17,7 +17,7 @@ struct McpIntegration {
 
         let params = ContextParams(
             mode: .encrypted,
-            ceiling: ["messages:read", "messages:write", "tool:invoke:*", "tool:register"],
+            ceiling: ["messages:read", "messages:write", "outlet:call:*", "outlet:register"],
             ceilingPolicy: .immutable,
             governance: .singleAdmin,
             memoryScope: .ephemeral,

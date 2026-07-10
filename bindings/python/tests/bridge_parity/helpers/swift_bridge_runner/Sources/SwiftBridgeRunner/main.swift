@@ -395,8 +395,8 @@ let parityOutletName = "parity_probe"
 let parityOutletCeiling = [
     "messages:read",
     "messages:write",
-    "tool:register",
-    "tool_invoke:*"
+    "outlet:register",
+    "outlet_call:*"
 ]
 
 func opOutletRegister(_ req: BridgeRequest) async throws -> [String: JSONValue] {

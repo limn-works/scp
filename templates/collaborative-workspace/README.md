@@ -32,7 +32,7 @@ shared tools, UCAN capability delegation, and governance voting.
 Roles are defined in `ContextParams.roles` at context creation and enforced
 through UCAN tokens minted per participant. Each participant receives a token
 whose capability set matches their role. Tool invocation requires presenting
-a valid UCAN token with the `tool:invoke:{toolId}` capability.
+a valid UCAN token with the `outlet:call:{toolId}` capability.
 
 ## Governance
 

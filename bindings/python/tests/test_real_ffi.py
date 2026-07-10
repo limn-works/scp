@@ -501,7 +501,7 @@ class TestOutlets:
         handle = scp._native.context_create(
             alice.did,
             {
-                "ceiling": ["messages:read", "tool:invoke:*", "tool:register"],
+                "ceiling": ["messages:read", "outlet:call:*", "outlet:register"],
                 "memory_scope": "ephemeral",
                 "governance": "single_admin",
             },

@@ -51,7 +51,7 @@ Without a relay, the template demonstrates the SDK API patterns locally -- each 
 
 ## Customization
 
-- **Capabilities**: add `TOOL_INVOKE_ALL`, `GOVERNANCE_PROPOSE`, etc. to the ceiling for richer contexts.
+- **Capabilities**: add `OUTLET_CALL_ALL`, `GOVERNANCE_PROPOSE`, etc. to the ceiling for richer contexts.
 - **Memory scope**: change `"ephemeral"` to `"full"` to retain chat history after the context closes.
 - **Governance**: pass `governance="threshold"` for multi-admin contexts that require voting.
 - **Custody**: replace `"in_memory"` with `"platform"` for production key storage.

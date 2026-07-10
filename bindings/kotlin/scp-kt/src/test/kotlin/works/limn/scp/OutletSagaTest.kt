@@ -380,7 +380,7 @@ class OutletSagaTest {
                 listOf(
                     "messages:read",
                     "messages:write",
-                    "tool:invoke:*",
+                    "outlet:call:*",
                     "outlet:register",
                     "context:close",
                 ),

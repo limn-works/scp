@@ -801,8 +801,8 @@ interface OutletBindings {
      * @param identityHandle Opaque handle for the invoker's identity
      *   (used for capability checking).
      * @param ucanToken Optional JWT-encoded UCAN token authorizing the
-     *   invocation. Must contain `tool_invoke:{outlet_id}` or
-     *   `tool_invoke:*` capability.
+     *   invocation. Must contain `outlet_call:{outlet_id}` or
+     *   `outlet_call:*` capability.
      * @param proofTokens Optional list of encoded parent UCAN tokens
      *   for delegation chain traversal (ADR-016 step 3).
      * @return JSON-encoded outlet output.
@@ -1060,7 +1060,7 @@ interface UcanBindings {
      * @param contextHandle Opaque handle from context create or join.
      * @param memberDid The DID of the member receiving the token.
      * @param capabilitiesJson JSON-encoded list of capability URI strings
-     *   to grant (e.g., `["messages:write", "tool_invoke:*"]`).
+     *   to grant (e.g., `["messages:write", "outlet_call:*"]`).
      * @return The minted UCAN token string (JWT-encoded).
      * @throws BridgeException with `SCP-VALID-7000` if `memberDid` is
      *   malformed, or with `SCP-IDENT-1017` if the context creator

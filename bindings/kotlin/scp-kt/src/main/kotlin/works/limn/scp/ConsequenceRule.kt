@@ -112,12 +112,13 @@ sealed class ConsequenceCapability {
     }
 
     /**
-     * Outlet invocation capability for a specific registered outlet.
+     * Action-outlet invocation capability for a specific registered outlet.
      *
-     * Serializes as `{"ToolInvoke": "<id>"}` to match the Rust newtype.
+     * Mirrors `Capability::OutletCall(OutletId)`. Serializes as
+     * `{"OutletCall": "<id>"}` to match the Rust newtype.
      */
-    data class ToolInvoke(val toolId: String) : ConsequenceCapability() {
-        init { require(toolId.isNotEmpty()) { "ToolInvoke tool id must not be empty" } }
+    data class OutletCall(val outletId: String) : ConsequenceCapability() {
+        init { require(outletId.isNotEmpty()) { "OutletCall outlet id must not be empty" } }
     }
 
     /**
@@ -368,6 +369,6 @@ private fun encodeSeverityElement(severity: EnforcementSeverity): JsonElement = 
 
 private fun encodeCapabilityElement(capability: ConsequenceCapability): JsonElement = when (capability) {
     is ConsequenceCapability.Unit -> JsonPrimitive(capability.name)
-    is ConsequenceCapability.ToolInvoke -> buildJsonObject { put("ToolInvoke", capability.toolId) }
+    is ConsequenceCapability.OutletCall -> buildJsonObject { put("OutletCall", capability.outletId) }
     is ConsequenceCapability.Custom -> buildJsonObject { put("Custom", capability.name) }
 }

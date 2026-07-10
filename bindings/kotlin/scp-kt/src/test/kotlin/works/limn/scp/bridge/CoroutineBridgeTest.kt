@@ -847,7 +847,7 @@ private fun h15TypedRulesFixture(): List<works.limn.scp.ConsequenceRule> {
             works.limn.scp.EnforcementSeverity.SuspendCapability(
                 listOf(
                     works.limn.scp.ConsequenceCapability.Unit("MessagesWrite"),
-                    works.limn.scp.ConsequenceCapability.ToolInvoke("calculator"),
+                    works.limn.scp.ConsequenceCapability.OutletCall("calculator"),
                     works.limn.scp.ConsequenceCapability.Custom("my-custom-cap"),
                 ),
             ),
@@ -893,8 +893,8 @@ private fun assertConsequenceRulesJson(rulesJson: String) {
         "Unit capability should serialize as bare string",
     )
     assertTrue(
-        rulesJson.contains("{\"ToolInvoke\":\"calculator\"}"),
-        "ToolInvoke newtype should serialize with the inner string",
+        rulesJson.contains("{\"OutletCall\":\"calculator\"}"),
+        "OutletCall newtype should serialize with the inner string",
     )
     assertTrue(
         rulesJson.contains("{\"Custom\":\"my-custom-cap\"}"),

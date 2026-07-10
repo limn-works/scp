@@ -24,7 +24,7 @@ public enum Economy {
     ///
     /// - Parameters:
     ///   - policyJson: Economic policy JSON string (empty or "null" for free contexts).
-    ///   - actionType: One of: "MessageSend", "ToolInvoke", "ContextJoin",
+    ///   - actionType: One of: "MessageSend", "OutletCall", "ContextJoin",
     ///     "SubscriptionPeriod", "ByteStored".
     ///   - metricsJson: Observable metrics as JSON string.
     /// - Returns: Estimated cost, or `nil` on overflow.

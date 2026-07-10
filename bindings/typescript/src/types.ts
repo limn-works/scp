@@ -8,6 +8,63 @@
  */
 
 // ---------------------------------------------------------------------------
+// Capability strings
+// ---------------------------------------------------------------------------
+
+/**
+ * Canonical protocol capability strings and parameterised constructors.
+ *
+ * These are the SDK-facing colon-separated forms accepted by `Capability::new`
+ * in Rust (e.g. `"messages:write"`, `"outlet:call:*"`) — the shape used in
+ * `ContextParams.ceiling`, role capability lists, and UCAN capability arrays.
+ * Parameterised capabilities are plain strings built by {@link outletQuery} and
+ * {@link outletCall}.
+ *
+ * The pre-rename tool-prefixed stems (invoke / register / interface) are deleted
+ * with no transitional alias; the protocol hard-rejects them at construction
+ * time (ADR-049 §1).
+ */
+export const Capabilities = {
+  MESSAGES_READ: "messages:read",
+  MESSAGES_WRITE: "messages:write",
+  OUTLET_QUERY_ALL: "outlet:query:*",
+  OUTLET_CALL_ALL: "outlet:call:*",
+  OUTLET_REGISTER: "outlet:register",
+  MEMBER_INVITE: "member:invite",
+  MEMBER_REMOVE: "member:remove",
+  ROLE_ASSIGN: "role:assign",
+  GOVERNANCE_PROPOSE: "governance:propose",
+  GOVERNANCE_VOTE: "governance:vote",
+  CONTEXT_CLOSE: "context:close",
+  CHILD_CONTEXT_CREATE: "context:child:create",
+  OUTLET_INTERFACE: "outlet:interface",
+  BRIDGING: "bridging",
+  MEDIA_VOICE: "media:voice",
+  MEDIA_VIDEO: "media:video",
+  MEDIA_SCREEN_SHARE: "media:screen_share",
+  MEMBER_BAN: "member:ban",
+  METADATA_EDIT: "metadata:edit",
+} as const;
+
+/**
+ * Build the capability string for invoking a specific Query (read-only) outlet.
+ *
+ * Per spec §5.4.2.1 the `outletId` suffix must match `^[a-z0-9_-]{1,128}$`.
+ */
+export function outletQuery(outletId: string): string {
+  return `outlet:query:${outletId}`;
+}
+
+/**
+ * Build the capability string for invoking a specific Action (mutating) outlet.
+ *
+ * Per spec §5.4.2.1 the `outletId` suffix must match `^[a-z0-9_-]{1,128}$`.
+ */
+export function outletCall(outletId: string): string {
+  return `outlet:call:${outletId}`;
+}
+
+// ---------------------------------------------------------------------------
 // Context
 // ---------------------------------------------------------------------------
 
@@ -70,15 +127,15 @@ export interface ContextParams {
 // ---------------------------------------------------------------------------
 
 /**
- * A registered outlet capability (`tool:invoke:<id>`) within a context.
+ * A registered Action-outlet capability (`outlet:call:<id>`) within a context.
  *
- * Mirrors the `Capability::ToolInvoke(ToolId)` newtype. Carries the outlet ID
- * (an opaque string) and serializes as `{"ToolInvoke": "id"}` to match the
+ * Mirrors the `Capability::OutletCall(OutletId)` newtype. Carries the outlet ID
+ * (an opaque string) and serializes as `{"OutletCall": "id"}` to match the
  * Rust serde tagging.
  */
-export interface ToolInvokeCapability {
+export interface OutletCallCapability {
   /** Discriminant. */
-  readonly kind: "ToolInvoke";
+  readonly kind: "OutletCall";
   /** Opaque outlet identifier matching a registered OutletDefinition. */
   readonly outletId: string;
 }
@@ -107,8 +164,9 @@ export interface CustomCapability {
 export type UnitCapability =
   | "MessagesRead"
   | "MessagesWrite"
-  | "ToolInvokeAll"
-  | "ToolRegister"
+  | "OutletQueryAll"
+  | "OutletCallAll"
+  | "OutletRegister"
   | "MemberInvite"
   | "MemberRemove"
   | "RoleAssign"
@@ -116,7 +174,7 @@ export type UnitCapability =
   | "GovernanceVote"
   | "ContextClose"
   | "ChildContextCreate"
-  | "ToolInterface"
+  | "OutletInterface"
   | "Bridging"
   | "MediaVoice"
   | "MediaVideo"
@@ -128,14 +186,14 @@ export type UnitCapability =
  * Typed capability matching `scp_protocol::context::roles::Capability`.
  *
  * Either a unit-variant string or an object discriminated by `kind` for
- * payload-bearing variants (`OutletInvoke`, `Custom`). The SDK encoder converts
+ * payload-bearing variants (`OutletCall`, `Custom`). The SDK encoder converts
  * each variant to the matching Rust serde JSON shape:
  *
  * - `"MessagesRead"` → `"MessagesRead"`
- * - `{ kind: "ToolInvoke", outletId: "calculator" }` → `{"ToolInvoke": "calculator"}`
+ * - `{ kind: "OutletCall", outletId: "calculator" }` → `{"OutletCall": "calculator"}`
  * - `{ kind: "Custom", name: "foo" }` → `{"Custom": "foo"}`
  */
-export type ConsequenceCapability = UnitCapability | ToolInvokeCapability | CustomCapability;
+export type ConsequenceCapability = UnitCapability | OutletCallCapability | CustomCapability;
 
 /**
  * The condition that triggers a consequence rule (ADR-017 §6).
@@ -367,8 +425,8 @@ function encodeConsequenceCapability(capability: ConsequenceCapability): unknown
   if (typeof capability === "string") {
     return capability;
   }
-  if (capability.kind === "ToolInvoke") {
-    return { ToolInvoke: capability.outletId };
+  if (capability.kind === "OutletCall") {
+    return { OutletCall: capability.outletId };
   }
   if (capability.kind === "Custom") {
     return { Custom: capability.name };

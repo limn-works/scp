@@ -134,7 +134,7 @@ describe("scp.ucanEvaluate — structured read-only diagnostic", () => {
       timeBoundsValid: true,
     }));
 
-    const result = await scp.ucanEvaluate("handle", "token-a", "did:dht:agent", "tool:invoke:*");
+    const result = await scp.ucanEvaluate("handle", "token-a", "did:dht:agent", "outlet:call:*");
     expect(result).toEqual({
       tokensValid: true,
       signaturesValid: false,

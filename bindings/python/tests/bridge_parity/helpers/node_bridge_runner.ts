@@ -549,8 +549,8 @@ const PARITY_OUTLET_SCHEMA = {
 const PARITY_OUTLET_CEILING = [
   "messages:read",
   "messages:write",
-  "tool:register",
-  "tool_invoke:*",
+  "outlet:register",
+  "outlet_call:*",
 ];
 
 async function opOutletRegister(

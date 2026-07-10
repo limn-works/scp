@@ -91,6 +91,55 @@ public nonisolated struct Capability: Sendable {
         self.name = name
         self.ceiling = ceiling
     }
+
+    // MARK: - Canonical capability strings
+
+    /// Canonical protocol capability strings.
+    ///
+    /// These are the SDK-facing colon-separated forms accepted by
+    /// `Capability::new` in Rust (e.g. `"messages:write"`, `"outlet:call:*"`) —
+    /// the shape used in context ceilings, role capability lists, and UCAN
+    /// capability arrays. Parameterised capabilities are built by
+    /// ``outletQuery(_:)`` and ``outletCall(_:)``.
+    ///
+    /// The pre-rename tool-prefixed stems (invoke / register / interface) are
+    /// deleted with no transitional alias; the protocol hard-rejects them at
+    /// construction time (ADR-049 §1).
+    public enum Name {
+        public static let messagesRead = "messages:read"
+        public static let messagesWrite = "messages:write"
+        public static let outletQueryAll = "outlet:query:*"
+        public static let outletCallAll = "outlet:call:*"
+        public static let outletRegister = "outlet:register"
+        public static let memberInvite = "member:invite"
+        public static let memberRemove = "member:remove"
+        public static let roleAssign = "role:assign"
+        public static let governancePropose = "governance:propose"
+        public static let governanceVote = "governance:vote"
+        public static let contextClose = "context:close"
+        public static let childContextCreate = "context:child:create"
+        public static let outletInterface = "outlet:interface"
+        public static let bridging = "bridging"
+        public static let mediaVoice = "media:voice"
+        public static let mediaVideo = "media:video"
+        public static let mediaScreenShare = "media:screen_share"
+        public static let memberBan = "member:ban"
+        public static let metadataEdit = "metadata:edit"
+    }
+
+    /// Builds the capability string for invoking a specific Query (read-only)
+    /// outlet. Per spec §5.4.2.1 the `outletId` suffix must match
+    /// `^[a-z0-9_-]{1,128}$`.
+    public static func outletQuery(_ outletId: String) -> String {
+        "outlet:query:\(outletId)"
+    }
+
+    /// Builds the capability string for invoking a specific Action (mutating)
+    /// outlet. Per spec §5.4.2.1 the `outletId` suffix must match
+    /// `^[a-z0-9_-]{1,128}$`.
+    public static func outletCall(_ outletId: String) -> String {
+        "outlet:call:\(outletId)"
+    }
 }
 
 // MARK: - TestVector

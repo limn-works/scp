@@ -23,6 +23,55 @@ import works.limn.scp.bridge.BridgeException
  *
  * @property rawValue Wire-format string passed to the FFI bridge.
  */
+/**
+ * Canonical protocol capability strings and parameterised constructors.
+ *
+ * These are the SDK-facing colon-separated forms accepted by `Capability::new`
+ * in Rust (e.g. `"messages:write"`, `"outlet:call:*"`) — the shape used in
+ * context ceilings, role capability lists, and UCAN capability arrays.
+ * Parameterised capabilities are plain strings built by [outletQuery] and
+ * [outletCall].
+ *
+ * The pre-rename tool-prefixed stems (invoke / register / interface) are
+ * deleted with no transitional alias; the protocol hard-rejects them at
+ * construction time (ADR-049 §1).
+ */
+object Capability {
+    const val MESSAGES_READ = "messages:read"
+    const val MESSAGES_WRITE = "messages:write"
+    const val OUTLET_QUERY_ALL = "outlet:query:*"
+    const val OUTLET_CALL_ALL = "outlet:call:*"
+    const val OUTLET_REGISTER = "outlet:register"
+    const val MEMBER_INVITE = "member:invite"
+    const val MEMBER_REMOVE = "member:remove"
+    const val ROLE_ASSIGN = "role:assign"
+    const val GOVERNANCE_PROPOSE = "governance:propose"
+    const val GOVERNANCE_VOTE = "governance:vote"
+    const val CONTEXT_CLOSE = "context:close"
+    const val CHILD_CONTEXT_CREATE = "context:child:create"
+    const val OUTLET_INTERFACE = "outlet:interface"
+    const val BRIDGING = "bridging"
+    const val MEDIA_VOICE = "media:voice"
+    const val MEDIA_VIDEO = "media:video"
+    const val MEDIA_SCREEN_SHARE = "media:screen_share"
+    const val MEMBER_BAN = "member:ban"
+    const val METADATA_EDIT = "metadata:edit"
+
+    /**
+     * Builds the capability string for invoking a specific Query (read-only)
+     * outlet. Per spec §5.4.2.1 the [outletId] suffix must match
+     * `^[a-z0-9_-]{1,128}$`.
+     */
+    fun outletQuery(outletId: String): String = "outlet:query:$outletId"
+
+    /**
+     * Builds the capability string for invoking a specific Action (mutating)
+     * outlet. Per spec §5.4.2.1 the [outletId] suffix must match
+     * `^[a-z0-9_-]{1,128}$`.
+     */
+    fun outletCall(outletId: String): String = "outlet:call:$outletId"
+}
+
 enum class CustodyType(val rawValue: String) {
     /**
      * Platform-native secure storage (Keychain on macOS/iOS, Keystore
@@ -247,10 +296,17 @@ class ScopedHandle internal constructor(
      */
     fun hasCapability(capability: String): Boolean {
         if (grantedCapabilities.contains(capability)) return true
-        // ToolInvokeAll covers any specific ToolInvoke
-        if (capability.startsWith("tool:invoke:") &&
-            capability != "tool:invoke:*" &&
-            grantedCapabilities.contains("tool:invoke:*")
+        // OutletCallAll covers any specific OutletCall.
+        if (capability.startsWith("outlet:call:") &&
+            capability != "outlet:call:*" &&
+            grantedCapabilities.contains("outlet:call:*")
+        ) {
+            return true
+        }
+        // OutletQueryAll covers any specific OutletQuery.
+        if (capability.startsWith("outlet:query:") &&
+            capability != "outlet:query:*" &&
+            grantedCapabilities.contains("outlet:query:*")
         ) {
             return true
         }

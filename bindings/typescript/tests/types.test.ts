@@ -26,7 +26,33 @@ import type {
   TrustLevel,
   UcanToken,
 } from "../src/types";
-import { validateAdmission, validateBroadcastKeyHex, validateSiteConfig } from "../src/types";
+import {
+  Capabilities,
+  outletCall,
+  outletQuery,
+  validateAdmission,
+  validateBroadcastKeyHex,
+  validateSiteConfig,
+} from "../src/types";
+
+describe("Capability strings", () => {
+  it("exposes canonical outlet capability constants", () => {
+    expect(Capabilities.OUTLET_QUERY_ALL).toBe("outlet:query:*");
+    expect(Capabilities.OUTLET_CALL_ALL).toBe("outlet:call:*");
+    expect(Capabilities.OUTLET_REGISTER).toBe("outlet:register");
+    expect(Capabilities.OUTLET_INTERFACE).toBe("outlet:interface");
+    expect(Capabilities.MESSAGES_READ).toBe("messages:read");
+    expect(Capabilities.MESSAGES_WRITE).toBe("messages:write");
+  });
+
+  it("builds parameterised outlet:call capability strings", () => {
+    expect(outletCall("calculator")).toBe("outlet:call:calculator");
+  });
+
+  it("builds parameterised outlet:query capability strings", () => {
+    expect(outletQuery("calculator")).toBe("outlet:query:calculator");
+  });
+});
 
 describe("type definitions", () => {
   it("ContextParams has required ceiling field", () => {

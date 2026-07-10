@@ -23,8 +23,8 @@ async def main() -> None:
                 "ceiling": [
                     Capability.MESSAGES_READ.value,
                     Capability.MESSAGES_WRITE.value,
-                    Capability.TOOL_INVOKE_ALL.value,
-                    Capability.TOOL_REGISTER.value,
+                    Capability.OUTLET_CALL_ALL.value,
+                    Capability.OUTLET_REGISTER.value,
                 ],
                 "memory_scope": MemoryScope.EPHEMERAL.value,
                 "governance": "single_admin",

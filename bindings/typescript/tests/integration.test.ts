@@ -179,7 +179,7 @@ describe("ConsequenceRule wire-format encoding (encodeConsequenceRules)", () => 
             kind: "SuspendCapability",
             capabilities: [
               "MessagesWrite",
-              { kind: "ToolInvoke", outletId: "calculator" },
+              { kind: "OutletCall", outletId: "calculator" },
               { kind: "Custom", name: "my-custom-cap" },
             ],
           },
@@ -226,7 +226,7 @@ describe("ConsequenceRule wire-format encoding (encodeConsequenceRules)", () => 
     };
     expect(action0.Enforcement?.SuspendCapability?.capabilities).toEqual([
       "MessagesWrite",
-      { ToolInvoke: "calculator" },
+      { OutletCall: "calculator" },
       { Custom: "my-custom-cap" },
     ]);
 
@@ -1340,14 +1340,14 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       const member = await scp.identityCreate("in_memory");
       const ctx = await scp.contextCreate(
         admin,
-        JSON.stringify({ ceiling: ["outlet:register", "tool:invoke:*"] }),
+        JSON.stringify({ ceiling: ["outlet:register", "outlet:call:*"] }),
       );
       await scp.contextJoin(ctx._rawHandle, member.did);
       const outletId = await scp.outletRegister(
         ctx._rawHandle,
         makeNapiToolDef({ name: "scp-class-add", description: "Adds", operator: admin.did }),
       );
-      const ucan = (await scp.ucanMint(ctx._rawHandle, member.did, ["tool:invoke:*"])) as {
+      const ucan = (await scp.ucanMint(ctx._rawHandle, member.did, ["outlet:call:*"])) as {
         encoded: string;
       };
       const result = await scp.outletInvoke(
@@ -1367,7 +1367,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       const outsider = await scp.identityCreate("in_memory");
       const ctx = await scp.contextCreate(
         admin,
-        JSON.stringify({ ceiling: ["outlet:register", "tool:invoke:*"] }),
+        JSON.stringify({ ceiling: ["outlet:register", "outlet:call:*"] }),
       );
       const outletId = await scp.outletRegister(
         ctx._rawHandle,

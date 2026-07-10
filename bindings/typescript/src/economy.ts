@@ -37,7 +37,7 @@ export interface ObservableMetrics {
 /** Paid action type for cost estimation. */
 export type PaidActionType =
   | "MessageSend"
-  | "ToolInvoke"
+  | "OutletCall"
   | "ContextJoin"
   | "SubscriptionPeriod"
   | "ByteStored";

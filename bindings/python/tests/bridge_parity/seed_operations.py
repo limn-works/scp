@@ -579,14 +579,14 @@ OP_SIGN_MESSAGE = OpSpec(
 # Register a single outlet in a fresh context. The outlet_id is derived
 # deterministically across all three bridges from the outlet name via the
 # shared `format!("outlet-{}", name.replace(' ', "-").to_lowercase())`
-# convention (see scp-ffi/src/outlets.rs, scp-ffi/napi/src/outlets.rs,
-# scp-ffi/uniffi/src/bridge.rs — all three
+# convention (see scp-ffi/common/src/outlet_id.rs, consumed by
+# scp-ffi/src, scp-ffi/napi/src, scp-ffi/uniffi/src/bridge.rs — all three
 # use the same format). That makes outlet_id byte-exact for parity.
 # ---------------------------------------------------------------------------
 
 
-# Ceiling must include `tool:register` to permit the registration action.
-_OUTLET_CEILING = ["messages:read", "messages:write", "tool:register", "tool_invoke:*"]
+# Ceiling must include `outlet:register` to permit the registration action.
+_OUTLET_CEILING = ["messages:read", "messages:write", "outlet:register", "outlet_call:*"]
 _OUTLET_NAME = "parity_probe"
 _EXPECTED_OUTLET_ID = f"outlet-{_OUTLET_NAME}"
 _OUTLET_SCHEMA: dict[str, Any] = {

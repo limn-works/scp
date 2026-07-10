@@ -31,16 +31,17 @@ public nonisolated enum AccessScope: String, Sendable, Codable, CaseIterable {
 ///
 /// Mirrors `scp_protocol::context::roles::Capability`. The unit variants are
 /// represented by ``unit(name:)`` carrying the variant name; payload-bearing
-/// variants ([outletInvoke], [custom]) carry their string field directly.
+/// variants ([outletCall], [custom]) carry their string field directly.
 public nonisolated enum ConsequenceCapability: Sendable, Codable, Equatable {
     /// A unit-variant capability. The `name` must match a Rust `Capability`
     /// enum variant name exactly, e.g. `MessagesRead`, `MessagesWrite`,
     /// `GovernanceVote`.
     case unit(name: String)
 
-    /// Outlet invocation capability for a specific registered outlet.
-    /// Encodes as `{"ToolInvoke": "<id>"}`.
-    case toolInvoke(toolId: String)
+    /// Action-outlet invocation capability for a specific registered outlet.
+    /// Mirrors `Capability::OutletCall(OutletId)`. Encodes as
+    /// `{"OutletCall": "<id>"}`.
+    case outletCall(outletId: String)
 
     /// Context-specific custom capability.
     /// Encodes as `{"Custom": "<name>"}`.
@@ -51,8 +52,8 @@ public nonisolated enum ConsequenceCapability: Sendable, Codable, Equatable {
         switch self {
         case let .unit(name):
             try container.encode(name)
-        case let .toolInvoke(toolId):
-            try container.encode(["ToolInvoke": toolId])
+        case let .outletCall(outletId):
+            try container.encode(["OutletCall": outletId])
         case let .custom(name):
             try container.encode(["Custom": name])
         }
@@ -65,8 +66,8 @@ public nonisolated enum ConsequenceCapability: Sendable, Codable, Equatable {
             return
         }
         let dict = try container.decode([String: String].self)
-        if let toolId = dict["ToolInvoke"] {
-            self = .toolInvoke(toolId: toolId)
+        if let outletId = dict["OutletCall"] {
+            self = .outletCall(outletId: outletId)
             return
         }
         if let name = dict["Custom"] {

@@ -73,7 +73,7 @@ struct MultiAgent {
             ceiling: [
                 "messages:read",
                 "messages:write",
-                "tool:invoke:*",
+                "outlet:call:*",
                 "member:invite",
                 "member:remove",
                 "role:assign"

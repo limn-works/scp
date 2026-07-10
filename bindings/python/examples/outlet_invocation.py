@@ -39,8 +39,8 @@ async def main() -> None:
                 "ceiling": [
                     Capability.MESSAGES_READ.value,
                     Capability.MESSAGES_WRITE.value,
-                    Capability.TOOL_INVOKE_ALL.value,
-                    Capability.TOOL_REGISTER.value,
+                    Capability.OUTLET_CALL_ALL.value,
+                    Capability.OUTLET_REGISTER.value,
                 ],
                 "memory_scope": MemoryScope.EPHEMERAL.value,
                 "governance": "single_admin",
@@ -53,7 +53,7 @@ async def main() -> None:
             ucan_token = await scp.ucan_mint(
                 ctx.context_id,
                 identity.did,
-                ["tool:invoke:*"],
+                ["outlet:call:*"],
             )
             print(f"UCAN minted: {ucan_token.token_id}")
 

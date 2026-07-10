@@ -538,7 +538,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       const member = await napi.identityCreate("in_memory");
       const ctx = await napi.contextCreate(
         admin,
-        JSON.stringify({ ceiling: ["outlet:register", "tool:invoke:*"] }),
+        JSON.stringify({ ceiling: ["outlet:register", "outlet:call:*"] }),
       );
       // Join member to context so they have role-based capabilities.
       await napi.contextJoin(ctx, member.did);
@@ -553,7 +553,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
         operator: admin.did,
       });
       // Mint UCAN for the member (cross-delegation, not self).
-      const ucan = await napi.ucanMint(ctx, member.did, ["tool:invoke:*"]);
+      const ucan = await napi.ucanMint(ctx, member.did, ["outlet:call:*"]);
       const resultJson = await napi.outletInvoke(
         ctx,
         outletId,
@@ -995,7 +995,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
               ceiling_policy: "Immutable",
               promotion_policy: "NoPromotion",
               roles: [],
-              outlets: [],
+              tools: [],
               ttl: null,
               memory_scope: "Ephemeral",
               governance: "SingleAdmin",
@@ -1085,7 +1085,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
               ceiling_policy: "Immutable",
               promotion_policy: "NoPromotion",
               roles: [],
-              outlets: [],
+              tools: [],
               ttl: null,
               memory_scope: "Ephemeral",
               governance: "SingleAdmin",
@@ -1855,7 +1855,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       const ctx = await napi.contextCreate(
         admin,
         JSON.stringify({
-          ceiling: ["outlet:register", "tool:invoke:*"],
+          ceiling: ["outlet:register", "outlet:call:*"],
         }),
       );
       // Join member so they have role-based capabilities.
@@ -1878,7 +1878,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       expect(outletId).toBeTruthy();
 
       // Invoke (mint for member, cross-delegation).
-      const ucan = await napi.ucanMint(ctx, member.did, ["tool:invoke:*"]);
+      const ucan = await napi.ucanMint(ctx, member.did, ["outlet:call:*"]);
       const resultJson = await napi.outletInvoke(
         ctx,
         outletId,
@@ -2693,7 +2693,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
           ceiling: [
             "governance:propose",
             "outlet:interface",
-            "tools:invoke",
+            "outlet:call:*",
             "messages:read",
             "messages:write",
           ],

@@ -149,7 +149,7 @@ def estimate_cost(
     Args:
         policy_json: The context's economic policy as a JSON string.
             Pass empty string or ``"null"`` for free contexts.
-        action_type: One of ``"MessageSend"``, ``"ToolInvoke"``,
+        action_type: One of ``"MessageSend"``, ``"OutletCall"``,
             ``"ContextJoin"``, ``"SubscriptionPeriod"``, ``"ByteStored"``.
         metrics: Observable metrics dict with optional keys:
             ``context_message_rate``, ``member_count``, ``relay_queue_depth``,

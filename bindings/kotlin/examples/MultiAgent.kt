@@ -63,7 +63,7 @@ fun multiAgentExample(bridge: CoroutineBridge) = runBlocking {
         putJsonArray("ceiling") {
             add(JsonPrimitive("messages:read"))
             add(JsonPrimitive("messages:write"))
-            add(JsonPrimitive("tool:invoke:*"))
+            add(JsonPrimitive("outlet:call:*"))
             add(JsonPrimitive("member:invite"))
             add(JsonPrimitive("member:remove"))
             add(JsonPrimitive("role:assign"))

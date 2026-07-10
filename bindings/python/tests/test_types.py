@@ -463,8 +463,9 @@ class TestCapability:
     def test_standard_capabilities(self) -> None:
         assert Capability.MESSAGES_READ.value == "messages:read"
         assert Capability.MESSAGES_WRITE.value == "messages:write"
-        assert Capability.TOOL_INVOKE_ALL.value == "tool:invoke:*"
-        assert Capability.TOOL_REGISTER.value == "tool:register"
+        assert Capability.OUTLET_QUERY_ALL.value == "outlet:query:*"
+        assert Capability.OUTLET_CALL_ALL.value == "outlet:call:*"
+        assert Capability.OUTLET_REGISTER.value == "outlet:register"
         assert Capability.MEMBER_INVITE.value == "member:invite"
         assert Capability.MEMBER_REMOVE.value == "member:remove"
         assert Capability.ROLE_ASSIGN.value == "role:assign"
@@ -472,7 +473,7 @@ class TestCapability:
         assert Capability.GOVERNANCE_VOTE.value == "governance:vote"
         assert Capability.CONTEXT_CLOSE.value == "context:close"
         assert Capability.CHILD_CONTEXT_CREATE.value == "context:child:create"
-        assert Capability.TOOL_INTERFACE.value == "tool:interface"
+        assert Capability.OUTLET_INTERFACE.value == "outlet:interface"
         assert Capability.BRIDGING.value == "bridging"
         assert Capability.MEDIA_VOICE.value == "media:voice"
         assert Capability.MEDIA_VIDEO.value == "media:video"
@@ -481,11 +482,15 @@ class TestCapability:
         assert Capability.METADATA_EDIT.value == "metadata:edit"
 
     def test_variant_count(self) -> None:
-        assert len(Capability) == 18
+        assert len(Capability) == 19
 
-    def test_outlet_invoke_parameterised(self) -> None:
-        cap = Capability.tool_invoke("my-outlet-id")
-        assert cap == "tool:invoke:my-outlet-id"
+    def test_outlet_call_parameterised(self) -> None:
+        cap = Capability.outlet_call("my-outlet-id")
+        assert cap == "outlet:call:my-outlet-id"
+
+    def test_outlet_query_parameterised(self) -> None:
+        cap = Capability.outlet_query("my-outlet-id")
+        assert cap == "outlet:query:my-outlet-id"
 
     def test_custom_parameterised(self) -> None:
         cap = Capability.custom("my-custom-cap")
