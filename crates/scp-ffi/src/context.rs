@@ -1862,7 +1862,7 @@ fn py_check_scoped_capability(
     granted_capabilities: Vec<String>,
     required_capability: String,
 ) -> bool {
-    use scp_core::context::roles::Capability;
+    use scp_core::context::roles::{Capability, CapabilityCeiling};
 
     let granted: HashSet<Capability> = granted_capabilities
         .iter()
@@ -1873,16 +1873,12 @@ fn py_check_scoped_capability(
         return false;
     };
 
-    if granted.contains(&required) {
-        return true;
-    }
-    // `OutletCallAll` covers any `OutletCall(specific)`
-    if matches!(&required, Capability::OutletCall(_))
-        && granted.contains(&Capability::OutletCallAll)
-    {
-        return true;
-    }
-    false
+    // Single authority: `CapabilityCeiling::contains` handles exact matches plus
+    // the disjoint wildcard families — `OutletCallAll ⊇ OutletCall(id)` and
+    // `OutletQueryAll ⊇ OutletQuery(id)` — never widening across query/call
+    // (§5.4.2). Routing through it keeps this helper fail-closed and in lockstep
+    // with UCAN ceiling validation.
+    CapabilityCeiling::new(granted).contains(&required)
 }
 
 // ---------------------------------------------------------------------------
@@ -8372,5 +8368,56 @@ class SignOnlyCustody:
 
             crate::runtime::remove_context(&bi, &ctx_id);
         });
+    }
+
+    /// `py_check_scoped_capability` routes through
+    /// [`scp_core::context::roles::CapabilityCeiling::contains`], so BOTH
+    /// wildcard families are honored symmetrically: `outlet:call:*` implies any
+    /// specific `outlet:call:id`, and `outlet:query:*` implies any specific
+    /// `outlet:query:id`. The two families stay disjoint and fail-closed — a
+    /// call-all grant never satisfies a query, a query-all grant never satisfies
+    /// a call, and neither wildcard leaks across (§5.4.2). Malformed input denies.
+    #[test]
+    fn scoped_capability_check_honors_both_wildcard_families_fail_closed() {
+        // Exact grant.
+        assert!(py_check_scoped_capability(
+            vec!["outlet:call:calc".to_owned()],
+            "outlet:call:calc".to_owned()
+        ));
+
+        // OutletCallAll ⊇ OutletCall(specific).
+        assert!(py_check_scoped_capability(
+            vec!["outlet:call:*".to_owned()],
+            "outlet:call:calc".to_owned()
+        ));
+
+        // OutletQueryAll ⊇ OutletQuery(specific) — the symmetry this fix adds.
+        assert!(py_check_scoped_capability(
+            vec!["outlet:query:*".to_owned()],
+            "outlet:query:calc".to_owned()
+        ));
+
+        // Cross-family fail-closed: call-all does NOT satisfy a query.
+        assert!(!py_check_scoped_capability(
+            vec!["outlet:call:*".to_owned()],
+            "outlet:query:calc".to_owned()
+        ));
+        // Cross-family fail-closed: query-all does NOT satisfy a call.
+        assert!(!py_check_scoped_capability(
+            vec!["outlet:query:*".to_owned()],
+            "outlet:call:calc".to_owned()
+        ));
+
+        // No matching grant denies.
+        assert!(!py_check_scoped_capability(
+            vec!["outlet:query:other".to_owned()],
+            "outlet:query:calc".to_owned()
+        ));
+
+        // Malformed required capability denies (fail-closed).
+        assert!(!py_check_scoped_capability(
+            vec!["outlet:query:*".to_owned()],
+            "not-a-capability".to_owned()
+        ));
     }
 }

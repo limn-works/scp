@@ -8133,7 +8133,7 @@ pub fn sandbox_check_capability(
     granted_capabilities: Vec<String>,
     required_capability: String,
 ) -> bool {
-    use scp_core::context::roles::Capability;
+    use scp_core::context::roles::{Capability, CapabilityCeiling};
     use std::collections::HashSet;
 
     let granted: HashSet<Capability> = granted_capabilities
@@ -8145,16 +8145,12 @@ pub fn sandbox_check_capability(
         return false;
     };
 
-    if granted.contains(&required) {
-        return true;
-    }
-    // `OutletCallAll` covers any `OutletCall(specific)`
-    if matches!(&required, Capability::OutletCall(_))
-        && granted.contains(&Capability::OutletCallAll)
-    {
-        return true;
-    }
-    false
+    // Single authority: `CapabilityCeiling::contains` handles exact matches plus
+    // the disjoint wildcard families — `OutletCallAll ⊇ OutletCall(id)` and
+    // `OutletQueryAll ⊇ OutletQuery(id)` — never widening across query/call
+    // (§5.4.2). Routing through it keeps this helper fail-closed and in lockstep
+    // with UCAN ceiling validation.
+    CapabilityCeiling::new(granted).contains(&required)
 }
 
 // ---------------------------------------------------------------------------

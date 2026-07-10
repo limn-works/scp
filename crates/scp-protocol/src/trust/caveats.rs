@@ -788,10 +788,14 @@ impl InvocationCaveats {
     ///
     /// The three counter-bearing caveats (`max_calls`,
     /// `amount_max_cumulative`, `rate_window`) are NOT checked here. Those
-    /// require atomic CAS against `CaveatCounterStore` (§7.3.8 runtime
-    /// enforcement) and live in `scp-runtime`. The runtime's
-    /// `enforce_caveat_invocation` glue calls this function FIRST so a
-    /// failure on a synchronous caveat does not consume counter capacity.
+    /// require atomic CAS against a durable counter store (`CaveatCounterStore`,
+    /// §7.3.8 runtime enforcement) that lives in `scp-runtime`. That runtime
+    /// value-caveat enforcement is a decided-but-not-yet-wired slice (§7.3.8):
+    /// this function is its specified synchronous entrypoint, and when the
+    /// counter-backed post-input glue is wired it MUST call
+    /// `check_invocation_local` FIRST so a failure on a synchronous caveat does
+    /// not consume counter capacity. There is no live divergence today because
+    /// the mint emits no value-caveats, so no in-circulation token asserts one.
     ///
     /// `negotiated_adapter` and `target_did` are `Option` to model the
     /// "no adapter selected" / "intra-context invocation" cases. Absent

@@ -548,7 +548,7 @@ impl ScopedHandle {
     ///
     /// Returns `SandboxError::CapabilityDenied` if neither `OutletCallAll` nor
     /// `OutletCall(outlet_id)` is granted.
-    pub fn check_outlet_invoke(&self, outlet_id: &str) -> Result<(), SandboxError> {
+    pub fn check_outlet_call(&self, outlet_id: &str) -> Result<(), SandboxError> {
         if self
             .allowed_capabilities
             .contains(&Capability::OutletCallAll)
@@ -1528,24 +1528,24 @@ mod tests {
     }
 
     #[test]
-    fn scoped_handle_check_tool_invoke_specific_granted() {
+    fn scoped_handle_check_outlet_call_specific_granted() {
         let handle = make_scoped_handle(vec![Capability::OutletCall("my_tool".to_owned())]);
-        assert!(handle.check_outlet_invoke("my_tool").is_ok());
+        assert!(handle.check_outlet_call("my_tool").is_ok());
     }
 
     #[test]
-    fn scoped_handle_check_tool_invoke_specific_denied() {
+    fn scoped_handle_check_outlet_call_specific_denied() {
         let handle = make_scoped_handle(vec![Capability::OutletCall("my_tool".to_owned())]);
         assert!(matches!(
-            handle.check_outlet_invoke("other_tool"),
+            handle.check_outlet_call("other_tool"),
             Err(SandboxError::CapabilityDenied { .. })
         ));
     }
 
     #[test]
-    fn scoped_handle_check_tool_invoke_all_covers_specific() {
+    fn scoped_handle_check_outlet_call_all_covers_specific() {
         let handle = make_scoped_handle(vec![Capability::OutletCallAll]);
-        assert!(handle.check_outlet_invoke("any_tool").is_ok());
+        assert!(handle.check_outlet_call("any_tool").is_ok());
     }
 
     #[test]
@@ -1677,7 +1677,7 @@ mod tests {
         assert!(handle.check_send_message().is_err());
         assert!(handle.check_propose_governance_action().is_err());
         assert!(handle.check_governance_vote().is_err());
-        assert!(handle.check_outlet_invoke("any").is_err());
+        assert!(handle.check_outlet_call("any").is_err());
         assert!(handle.check_outlet_register().is_err());
         assert!(handle.check_member_invite().is_err());
         assert!(handle.check_member_remove().is_err());
@@ -2422,7 +2422,7 @@ mod tests {
         assert!(handle.check_read_messages().is_ok());
         assert!(handle.check_send_message().is_ok());
         assert!(handle.check_propose_governance_action().is_ok());
-        assert!(handle.check_outlet_invoke("any_tool").is_ok());
+        assert!(handle.check_outlet_call("any_tool").is_ok());
         assert!(handle.check_member_invite().is_ok());
         // Not granted:
         assert!(handle.check_context_close().is_err());
