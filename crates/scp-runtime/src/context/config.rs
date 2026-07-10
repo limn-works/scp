@@ -28,7 +28,7 @@ use std::time::Duration;
 use scp_did::DID;
 use scp_protocol::context::params::{
     Capability, ContextParams, GovernanceModel, MemoryScope, RoleDefinition, TemplateId,
-    ToolRegistration,
+    OutletRegistration,
 };
 
 // ---------------------------------------------------------------------------
@@ -127,7 +127,7 @@ pub struct ContextConfig {
     /// Tool registrations available within the context. For the template path,
     /// supplied tools override the template's own tools only when non-empty
     /// (see [`ContextConfig::into_params`]).
-    pub tools: Vec<ToolRegistration>,
+    pub tools: Vec<OutletRegistration>,
 }
 
 impl ContextConfig {

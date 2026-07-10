@@ -35,9 +35,9 @@ use scp_protocol::context::governance::{
     ProposalId, ProposalStatus, PruningPolicy,
 };
 use scp_protocol::context::membership::{ContextEvent, ReceiveBuffer};
-use scp_protocol::context::params::ToolRegistration;
+use scp_protocol::context::params::OutletRegistration;
 use scp_protocol::context::roles::{self, Capability, CapabilityCeiling};
-use scp_protocol::context::tools::interface::ToolInterface;
+use scp_protocol::context::outlets::interface::OutletInterface;
 use scp_protocol::context::{ContextError, ContextParams, ContextState};
 use scp_protocol::economy::types::EconomicPolicy;
 use tracing::instrument;
@@ -1549,14 +1549,14 @@ pub async fn execute_change_role(
 }
 
 // ---------------------------------------------------------------------------
-// execute_register_tool (per-action leaf helper)
+// execute_register_outlet (per-action leaf helper)
 // ---------------------------------------------------------------------------
 
-pub async fn execute_register_tool(
+pub async fn execute_register_outlet(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
-    registration: &ToolRegistration,
+    registration: &OutletRegistration,
     meta: CommitMeta<'_>,
 ) -> Result<(), ContextError> {
     let CommitMeta {
@@ -1568,7 +1568,7 @@ pub async fn execute_register_tool(
 
     // Tool registration is an UPWARD grant (Class-C governance config). The
     // fallible guards read through the cell's `Deref` (no mutation); the
-    // `registered_tools` push (Class-C) rides `commit_class_c_best_effort`,
+    // `registered_outlets` push (Class-C) rides `commit_class_c_best_effort`,
     // preserving the prior best-effort persist exactly.
     require_active(&cell.handle)?;
 
@@ -1582,14 +1582,14 @@ pub async fn execute_register_tool(
         ));
     }
 
-    if cell.governance.registered_tools.len() >= MAX_REGISTERED_TOOLS {
+    if cell.governance.registered_outlets.len() >= MAX_REGISTERED_TOOLS {
         return Err(ContextError::LimitExceeded(format!(
             "registered tool limit of {MAX_REGISTERED_TOOLS} exceeded"
         )));
     }
     cell.commit_class_c_best_effort(deps, context_id, |mut view| {
         view.governance_class_c_mut()
-            .registered_tools_mut()
+            .registered_outlets_mut()
             .push(registration.clone());
     })
     .await;
@@ -1606,14 +1606,14 @@ pub async fn execute_register_tool(
 }
 
 // ---------------------------------------------------------------------------
-// execute_remove_tool (per-action leaf helper)
+// execute_remove_outlet (per-action leaf helper)
 // ---------------------------------------------------------------------------
 
-pub async fn execute_remove_tool(
+pub async fn execute_remove_outlet(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
-    tool_id: &str,
+    outlet_id: &str,
     meta: CommitMeta<'_>,
 ) -> Result<(), ContextError> {
     let CommitMeta {
@@ -1625,20 +1625,20 @@ pub async fn execute_remove_tool(
 
     // ADR-049 §9 Class S: removing a registered tool revokes the authority to
     // invoke it — a downward-authorization transition (the inverse of
-    // `execute_register_tool`'s upward grant). Route through `commit_class_s_keep`
+    // `execute_register_outlet`'s upward grant). Route through `commit_class_s_keep`
     // so the removal persists fail-closed (keep-direction: on persist failure the
     // tool STAYS removed — re-granting invocation of a tool the caller was told
     // was removed is the unsafe direction). The reject-before-mutate guard
     // returns `Err` from inside the closure (no persist runs); the
-    // `registered_tools` retain (Class-C) rides the SAME fail-closed persist via
+    // `registered_outlets` retain (Class-C) rides the SAME fail-closed persist via
     // `view.rest_mut()`.
     cell.commit_class_s_keep(deps, context_id, |mut view| {
         require_active(&view.handle)?;
 
         view.rest_mut()
             .governance
-            .registered_tools
-            .retain(|t| t.tool_id != tool_id);
+            .registered_outlets
+            .retain(|t| t.outlet_id != outlet_id);
         Ok(())
     })
     .await?;
@@ -2377,14 +2377,14 @@ pub async fn execute_modify_threshold(
 }
 
 // ---------------------------------------------------------------------------
-// execute_establish_tool_interface (per-action leaf helper)
+// execute_establish_outlet_interface (per-action leaf helper)
 // ---------------------------------------------------------------------------
 
-pub async fn execute_establish_tool_interface(
+pub async fn execute_establish_outlet_interface(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
-    interface: &ToolInterface,
+    interface: &OutletInterface,
     meta: CommitMeta<'_>,
 ) -> Result<(), ContextError> {
     let CommitMeta {
@@ -2395,7 +2395,7 @@ pub async fn execute_establish_tool_interface(
     let context_id_bytes = context_id_to_bytes(context_id);
 
     // Establishing a tool interface is Class-C governance config. The fallible
-    // guards read through the cell's `Deref`; the `tool_interfaces` push
+    // guards read through the cell's `Deref`; the `outlet_interfaces` push
     // (Class-C) rides `commit_class_c_best_effort`, preserving the prior
     // best-effort persist exactly.
     require_active(&cell.handle)?;
@@ -2410,14 +2410,14 @@ pub async fn execute_establish_tool_interface(
         ));
     }
 
-    if cell.governance.tool_interfaces.len() >= MAX_TOOL_INTERFACES {
+    if cell.governance.outlet_interfaces.len() >= MAX_TOOL_INTERFACES {
         return Err(ContextError::LimitExceeded(format!(
             "tool interface limit of {MAX_TOOL_INTERFACES} exceeded"
         )));
     }
     cell.commit_class_c_best_effort(deps, context_id, |mut view| {
         view.governance_class_c_mut()
-            .tool_interfaces_mut()
+            .outlet_interfaces_mut()
             .push(interface.clone());
     })
     .await;
@@ -4204,7 +4204,7 @@ pub async fn dispatch_content_governance_action(
             Ok(GovernanceActionResult::ThresholdModified)
         }
         GovernanceAction::EstablishToolInterface { interface } => {
-            execute_establish_tool_interface(
+            execute_establish_outlet_interface(
                 cell,
                 deps,
                 context_id,
@@ -4419,7 +4419,7 @@ pub async fn dispatch_context_governance_action(
             Ok(GovernanceActionResult::RoleChanged)
         }
         GovernanceAction::RegisterTool { registration } => {
-            execute_register_tool(
+            execute_register_outlet(
                 cell,
                 deps,
                 context_id,
@@ -4433,12 +4433,12 @@ pub async fn dispatch_context_governance_action(
             .await?;
             Ok(GovernanceActionResult::ToolRegistered)
         }
-        GovernanceAction::RemoveTool { tool_id } => {
-            execute_remove_tool(
+        GovernanceAction::RemoveTool { outlet_id } => {
+            execute_remove_outlet(
                 cell,
                 deps,
                 context_id,
-                tool_id,
+                outlet_id,
                 CommitMeta {
                     pid,
                     actor_did,

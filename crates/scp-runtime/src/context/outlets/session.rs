@@ -9,7 +9,7 @@
 //!
 //! # Types
 //!
-//! - [`ToolSession`] -- A single stateful tool session with TTL and call
+//! - [`OutletSession`] -- A single stateful tool session with TTL and call
 //!   tracking.
 //! - [`SessionStore`] -- In-memory session storage with TTL-based cleanup.
 //!
@@ -27,11 +27,11 @@ use serde::{Deserialize, Serialize};
 
 use scp_clock::Clock;
 
-use super::invoke::has_tool_invoke_capability;
+use super::invoke::has_outlet_invoke_capability;
 use scp_did::DID;
-use scp_protocol::context::tools::registry::ToolRegistry;
-use scp_protocol::context::tools::schema::validate_value_against_schema;
-use scp_protocol::context::tools::{ToolError, ToolId};
+use scp_protocol::context::outlets::registry::OutletRegistry;
+use scp_protocol::context::outlets::schema::validate_value_against_schema;
+use scp_protocol::context::outlets::{OutletError, OutletId};
 
 /// Default maximum concurrent sessions per calling context (spec §6.2.1, ADR-043).
 ///
@@ -47,7 +47,7 @@ use scp_protocol::context::ContextState;
 use scp_protocol::context::roles::ContextRoleState;
 
 // ---------------------------------------------------------------------------
-// ToolSession
+// OutletSession
 // ---------------------------------------------------------------------------
 
 /// A stateful tool session enabling multi-turn workflows.
@@ -59,11 +59,11 @@ use scp_protocol::context::roles::ContextRoleState;
 ///
 /// See spec section 6.2.1 and ADR-010.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToolSession {
+pub struct OutletSession {
     /// Unique identifier for this session (UUID v4).
     pub session_id: String,
     /// The tool this session is associated with.
-    pub tool_id: ToolId,
+    pub outlet_id: OutletId,
     /// The context that initiated this session.
     pub source_context: ContextId,
     /// Opaque session state, managed by the tool.
@@ -79,7 +79,7 @@ pub struct ToolSession {
     pub call_count: u64,
 }
 
-impl ToolSession {
+impl OutletSession {
     /// Returns `true` if this session has expired based on the given current
     /// timestamp (milliseconds since epoch).
     ///
@@ -107,12 +107,12 @@ impl ToolSession {
 
 /// In-memory session storage for a single SCP context.
 ///
-/// Maps session IDs to their [`ToolSession`] entries. Sessions are cleaned
+/// Maps session IDs to their [`OutletSession`] entries. Sessions are cleaned
 /// up via [`cleanup_expired`] when they exceed their TTL.
 #[derive(Debug, Clone, Default)]
 pub struct SessionStore {
     /// Active sessions, keyed by session ID.
-    sessions: HashMap<String, ToolSession>,
+    sessions: HashMap<String, OutletSession>,
 }
 
 impl SessionStore {
@@ -126,13 +126,13 @@ impl SessionStore {
 
     /// Returns the session for the given session ID, if it exists.
     #[must_use]
-    pub fn get(&self, session_id: &str) -> Option<&ToolSession> {
+    pub fn get(&self, session_id: &str) -> Option<&OutletSession> {
         self.sessions.get(session_id)
     }
 
     /// Returns a mutable reference to the session for the given session ID.
     #[must_use]
-    pub fn get_mut(&mut self, session_id: &str) -> Option<&mut ToolSession> {
+    pub fn get_mut(&mut self, session_id: &str) -> Option<&mut OutletSession> {
         self.sessions.get_mut(session_id)
     }
 
@@ -158,12 +158,12 @@ impl SessionStore {
     }
 
     /// Inserts a session into the store.
-    pub fn insert(&mut self, session: ToolSession) {
+    pub fn insert(&mut self, session: OutletSession) {
         self.sessions.insert(session.session_id.clone(), session);
     }
 
     /// Removes a session by ID. Returns the removed session if it existed.
-    pub fn remove(&mut self, session_id: &str) -> Option<ToolSession> {
+    pub fn remove(&mut self, session_id: &str) -> Option<OutletSession> {
         self.sessions.remove(session_id)
     }
 
@@ -194,7 +194,7 @@ impl SessionStore {
 /// * `store` -- The session store to add the session to.
 /// * `registry` -- The tool registry to validate the tool exists.
 /// * `context` -- The context handle (must be in Active state).
-/// * `tool_id` -- The tool to create a session for.
+/// * `outlet_id` -- The tool to create a session for.
 /// * `source_context` -- The context that initiated this session.
 /// * `ttl` -- Optional time-to-live for the session. `None` means the
 ///   session persists for the lifetime of the context.
@@ -205,7 +205,7 @@ impl SessionStore {
 ///
 /// # Errors
 ///
-/// Returns [`ToolError`] if the context is not active or the tool is not
+/// Returns [`OutletError`] if the context is not active or the tool is not
 /// found in the registry.
 // ADR-049 §Decision 12: `state` is now a synchronous lock-free ArcSwap load,
 // so this body has no `.await`. It calls no async provider trait; `async` is
@@ -218,25 +218,25 @@ impl SessionStore {
 )]
 pub async fn create_session(
     store: &mut SessionStore,
-    registry: &ToolRegistry,
+    registry: &OutletRegistry,
     context: &ContextHandle,
-    tool_id: &ToolId,
+    outlet_id: &OutletId,
     source_context: &ContextId,
     ttl: Option<Duration>,
     clock: &dyn Clock,
-) -> Result<String, ToolError> {
+) -> Result<String, OutletError> {
     // Validate context is Active.
     let state = context.state();
     if state != ContextState::Active {
-        return Err(ToolError::ContextNotActive {
+        return Err(OutletError::ContextNotActive {
             current_state: state.to_string(),
         });
     }
 
     // Validate tool exists in the registry.
-    if !registry.contains(tool_id) {
-        return Err(ToolError::ToolNotFound {
-            tool_id: tool_id.clone(),
+    if !registry.contains(outlet_id) {
+        return Err(OutletError::OutletNotFound {
+            outlet_id: outlet_id.clone(),
         });
     }
 
@@ -248,7 +248,7 @@ pub async fn create_session(
         .unwrap_or(DEFAULT_SESSION_CAP_PER_CALLER);
     let current = u32::try_from(store.count_by_source(source_context)).unwrap_or(u32::MAX);
     if current >= cap {
-        return Err(ToolError::SessionCapExceeded {
+        return Err(OutletError::SessionCapExceeded {
             source_context: source_context.clone(),
             current,
             max: cap,
@@ -258,9 +258,9 @@ pub async fn create_session(
     let session_id = uuid::Uuid::new_v4().to_string();
     let now_ms = clock.now_millis();
 
-    let session = ToolSession {
+    let session = OutletSession {
         session_id: session_id.clone(),
-        tool_id: tool_id.clone(),
+        outlet_id: outlet_id.clone(),
         source_context: source_context.clone(),
         state: serde_json::Value::Null,
         created_at: now_ms,
@@ -301,7 +301,7 @@ pub async fn create_session(
 ///
 /// # Errors
 ///
-/// Returns [`ToolError`] if:
+/// Returns [`OutletError`] if:
 /// - The context is not active.
 /// - The session is not found.
 /// - The session has expired.
@@ -311,7 +311,7 @@ pub async fn create_session(
 #[allow(clippy::too_many_arguments)]
 pub async fn invoke_session<F, Fut>(
     store: &mut SessionStore,
-    registry: &ToolRegistry,
+    registry: &OutletRegistry,
     role_state: &ContextRoleState,
     context: &ContextHandle,
     session_id: &str,
@@ -319,7 +319,7 @@ pub async fn invoke_session<F, Fut>(
     invoker_did: &DID,
     executor: F,
     clock: &dyn Clock,
-) -> Result<serde_json::Value, ToolError>
+) -> Result<serde_json::Value, OutletError>
 where
     F: FnOnce(serde_json::Value, serde_json::Value) -> Fut,
     Fut: std::future::Future<Output = Result<(serde_json::Value, serde_json::Value), String>>,
@@ -327,7 +327,7 @@ where
     // Validate context is Active.
     let ctx_state = context.state();
     if ctx_state != ContextState::Active {
-        return Err(ToolError::ContextNotActive {
+        return Err(OutletError::ContextNotActive {
             current_state: ctx_state.to_string(),
         });
     }
@@ -335,7 +335,7 @@ where
     // Look up session.
     let session = store
         .get(session_id)
-        .ok_or_else(|| ToolError::SessionNotFound {
+        .ok_or_else(|| OutletError::SessionNotFound {
             session_id: session_id.to_owned(),
         })?;
 
@@ -344,32 +344,32 @@ where
     if session.is_expired(now_ms) {
         // Remove the expired session.
         store.remove(session_id);
-        return Err(ToolError::SessionExpired {
+        return Err(OutletError::SessionExpired {
             session_id: session_id.to_owned(),
         });
     }
 
-    let tool_id = session.tool_id.clone();
+    let outlet_id = session.outlet_id.clone();
     let current_state = session.state.clone();
 
     // Per-call UCAN governance: validate invoker has ToolInvoke capability.
-    if !has_tool_invoke_capability(role_state, invoker_did, &tool_id) {
-        return Err(ToolError::InvokerNotAuthorized {
+    if !has_outlet_invoke_capability(role_state, invoker_did, &outlet_id) {
+        return Err(OutletError::InvokerNotAuthorized {
             did: invoker_did.to_string(),
-            tool_id: tool_id.clone(),
+            outlet_id: outlet_id.clone(),
         });
     }
 
     // Validate input against tool's input schema.
-    if let Some(registration) = registry.get(&tool_id) {
+    if let Some(registration) = registry.get(&outlet_id) {
         validate_value_against_schema(&input, &registration.schema.input_schema)
-            .map_err(|msg| ToolError::InputValidationFailed { message: msg })?;
+            .map_err(|msg| OutletError::InputValidationFailed { message: msg })?;
     }
 
     // Execute the tool with current session state.
     let (new_state, output) = executor(input, current_state)
         .await
-        .map_err(|msg| ToolError::ExecutionFailed { message: msg })?;
+        .map_err(|msg| OutletError::ExecutionFailed { message: msg })?;
 
     // Update session state and increment call count.
     if let Some(session) = store.get_mut(session_id) {
@@ -406,7 +406,7 @@ mod tests {
     use super::*;
     use scp_protocol::context::ContextParams;
     use scp_protocol::context::roles::{Capability, CapabilityCeiling, ContextRoleState};
-    use scp_protocol::context::tools::registry::{ToolRegistration, ToolSchema, register_tool};
+    use scp_protocol::context::outlets::registry::{OutletRegistration, OutletSchema, register_outlet};
 
     // -----------------------------------------------------------------------
     // Test helpers
@@ -466,16 +466,16 @@ mod tests {
     }
 
     /// Registers a test tool and returns the registry.
-    fn setup_registry_with_tool(
+    fn setup_registry_with_outlet(
         role_state: &ContextRoleState,
         registrant_did: &str,
-    ) -> ToolRegistry {
-        let mut registry = ToolRegistry::new();
-        let registration = ToolRegistration {
-            tool_id: "calculator".to_owned(),
+    ) -> OutletRegistry {
+        let mut registry = OutletRegistry::new();
+        let registration = OutletRegistration {
+            outlet_id: "calculator".to_owned(),
             name: "Calculator".to_owned(),
             description: "A simple calculator".to_owned(),
-            schema: ToolSchema {
+            schema: OutletSchema {
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -497,7 +497,7 @@ mod tests {
             registered_at: 0,
             signature: Vec::new(),
         };
-        register_tool(&mut registry, role_state, registration, registrant_did).unwrap();
+        register_outlet(&mut registry, role_state, registration, registrant_did).unwrap();
         registry
     }
 
@@ -530,14 +530,14 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // ToolSession::is_expired
+    // OutletSession::is_expired
     // -----------------------------------------------------------------------
 
     #[test]
     fn session_not_expired_within_ttl() {
-        let session = ToolSession {
+        let session = OutletSession {
             session_id: "sess-1".to_owned(),
-            tool_id: "tool-1".to_owned(),
+            outlet_id: "tool-1".to_owned(),
             source_context: "ctx-src".to_owned(),
             state: serde_json::Value::Null,
             created_at: 1000,
@@ -550,9 +550,9 @@ mod tests {
 
     #[test]
     fn session_expired_past_ttl() {
-        let session = ToolSession {
+        let session = OutletSession {
             session_id: "sess-1".to_owned(),
-            tool_id: "tool-1".to_owned(),
+            outlet_id: "tool-1".to_owned(),
             source_context: "ctx-src".to_owned(),
             state: serde_json::Value::Null,
             created_at: 1000,
@@ -565,9 +565,9 @@ mod tests {
 
     #[test]
     fn session_expired_at_exact_ttl_boundary() {
-        let session = ToolSession {
+        let session = OutletSession {
             session_id: "sess-1".to_owned(),
-            tool_id: "tool-1".to_owned(),
+            outlet_id: "tool-1".to_owned(),
             source_context: "ctx-src".to_owned(),
             state: serde_json::Value::Null,
             created_at: 1000,
@@ -580,9 +580,9 @@ mod tests {
 
     #[test]
     fn session_with_none_ttl_never_expires() {
-        let session = ToolSession {
+        let session = OutletSession {
             session_id: "sess-1".to_owned(),
-            tool_id: "tool-1".to_owned(),
+            outlet_id: "tool-1".to_owned(),
             source_context: "ctx-src".to_owned(),
             state: serde_json::Value::Null,
             created_at: 1000,
@@ -615,9 +615,9 @@ mod tests {
         let mut store = SessionStore::new();
 
         // Session 1: created at 1000, TTL 60s -- expires at 61000.
-        store.insert(ToolSession {
+        store.insert(OutletSession {
             session_id: "sess-active".to_owned(),
-            tool_id: "tool-1".to_owned(),
+            outlet_id: "tool-1".to_owned(),
             source_context: "ctx-src".to_owned(),
             state: serde_json::Value::Null,
             created_at: 1000,
@@ -626,9 +626,9 @@ mod tests {
         });
 
         // Session 2: created at 1000, TTL 10s -- expires at 11000.
-        store.insert(ToolSession {
+        store.insert(OutletSession {
             session_id: "sess-expired".to_owned(),
-            tool_id: "tool-1".to_owned(),
+            outlet_id: "tool-1".to_owned(),
             source_context: "ctx-src".to_owned(),
             state: serde_json::Value::Null,
             created_at: 1000,
@@ -654,7 +654,7 @@ mod tests {
     async fn create_session_returns_valid_session_id() {
         let creator_did = "did:dht:z6MkCreator";
         let role_state = test_role_state(creator_did);
-        let registry = setup_registry_with_tool(&role_state, creator_did);
+        let registry = setup_registry_with_outlet(&role_state, creator_did);
         let context = active_context();
         let mut store = SessionStore::new();
 
@@ -679,7 +679,7 @@ mod tests {
         // Verify session is stored.
         assert_eq!(store.len(), 1);
         let session = store.get(&session_id).unwrap();
-        assert_eq!(session.tool_id, "calculator");
+        assert_eq!(session.outlet_id, "calculator");
         assert_eq!(session.source_context, "ctx-source");
         assert_eq!(session.call_count, 0);
         assert_eq!(session.ttl, Some(Duration::from_mins(5)));
@@ -690,7 +690,7 @@ mod tests {
     async fn create_session_rejects_when_context_not_active() {
         let creator_did = "did:dht:z6MkCreator";
         let role_state = test_role_state(creator_did);
-        let registry = setup_registry_with_tool(&role_state, creator_did);
+        let registry = setup_registry_with_outlet(&role_state, creator_did);
         let context = ContextHandle::new("ctx-creating".to_owned(), ContextParams::default());
         let mut store = SessionStore::new();
 
@@ -707,7 +707,7 @@ mod tests {
 
         assert!(result.is_err());
         assert!(
-            matches!(result.unwrap_err(), ToolError::ContextNotActive { .. }),
+            matches!(result.unwrap_err(), OutletError::ContextNotActive { .. }),
             "expected ContextNotActive"
         );
     }
@@ -716,7 +716,7 @@ mod tests {
     async fn create_session_rejects_unknown_tool() {
         let creator_did = "did:dht:z6MkCreator";
         let role_state = test_role_state(creator_did);
-        let registry = setup_registry_with_tool(&role_state, creator_did);
+        let registry = setup_registry_with_outlet(&role_state, creator_did);
         let context = active_context();
         let mut store = SessionStore::new();
 
@@ -733,8 +733,8 @@ mod tests {
 
         assert!(result.is_err());
         assert!(
-            matches!(result.unwrap_err(), ToolError::ToolNotFound { .. }),
-            "expected ToolNotFound"
+            matches!(result.unwrap_err(), OutletError::OutletNotFound { .. }),
+            "expected OutletNotFound"
         );
     }
 
@@ -746,7 +746,7 @@ mod tests {
     async fn create_session_rejects_when_caller_cap_exceeded() {
         let creator_did = "did:dht:z6MkCreator";
         let role_state = test_role_state(creator_did);
-        let registry = setup_registry_with_tool(&role_state, creator_did);
+        let registry = setup_registry_with_outlet(&role_state, creator_did);
         // Use a context with session_cap = Some(5) for a manageable test.
         let params = ContextParams {
             session_cap: Some(5),
@@ -794,7 +794,7 @@ mod tests {
         assert!(
             matches!(
                 err,
-                ToolError::SessionCapExceeded {
+                OutletError::SessionCapExceeded {
                     current: 5,
                     max: 5,
                     ..
@@ -816,7 +816,7 @@ mod tests {
     async fn create_session_allows_different_callers_independently() {
         let creator_did = "did:dht:z6MkCreator";
         let role_state = test_role_state(creator_did);
-        let registry = setup_registry_with_tool(&role_state, creator_did);
+        let registry = setup_registry_with_outlet(&role_state, creator_did);
         // Use session_cap = Some(3) for a manageable test.
         let params = ContextParams {
             session_cap: Some(3),
@@ -867,14 +867,14 @@ mod tests {
     async fn invoke_session_on_expired_session_returns_error() {
         let creator_did = "did:dht:z6MkCreator";
         let role_state = test_role_state(creator_did);
-        let registry = setup_registry_with_tool(&role_state, creator_did);
+        let registry = setup_registry_with_outlet(&role_state, creator_did);
         let context = active_context();
         let mut store = SessionStore::new();
 
         // Insert a session that is already expired (TTL = 0).
-        store.insert(ToolSession {
+        store.insert(OutletSession {
             session_id: "sess-expired".to_owned(),
-            tool_id: "calculator".to_owned(),
+            outlet_id: "calculator".to_owned(),
             source_context: "ctx-source".to_owned(),
             state: serde_json::Value::Null,
             created_at: 0,
@@ -898,7 +898,7 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
-            matches!(err, ToolError::SessionExpired { .. }),
+            matches!(err, OutletError::SessionExpired { .. }),
             "expected SessionExpired, got {err:?}"
         );
 
@@ -915,27 +915,27 @@ mod tests {
         let mut store = SessionStore::new();
 
         // Insert 3 sessions with different TTLs.
-        store.insert(ToolSession {
+        store.insert(OutletSession {
             session_id: "sess-1".to_owned(),
-            tool_id: "tool-1".to_owned(),
+            outlet_id: "tool-1".to_owned(),
             source_context: "ctx-src".to_owned(),
             state: serde_json::Value::Null,
             created_at: 1000,
             ttl: Some(Duration::from_secs(10)), // Expires at 11000ms
             call_count: 0,
         });
-        store.insert(ToolSession {
+        store.insert(OutletSession {
             session_id: "sess-2".to_owned(),
-            tool_id: "tool-1".to_owned(),
+            outlet_id: "tool-1".to_owned(),
             source_context: "ctx-src".to_owned(),
             state: serde_json::Value::Null,
             created_at: 1000,
             ttl: Some(Duration::from_secs(30)), // Expires at 31000ms
             call_count: 0,
         });
-        store.insert(ToolSession {
+        store.insert(OutletSession {
             session_id: "sess-3".to_owned(),
-            tool_id: "tool-1".to_owned(),
+            outlet_id: "tool-1".to_owned(),
             source_context: "ctx-src".to_owned(),
             state: serde_json::Value::Null,
             created_at: 1000,
@@ -971,7 +971,7 @@ mod tests {
         let creator_did = "did:dht:z6MkCreator";
         let member_did = "did:dht:z6MkMember";
         let role_state = test_role_state_with_no_invoke_member(creator_did, member_did);
-        let registry = setup_registry_with_tool(&role_state, creator_did);
+        let registry = setup_registry_with_outlet(&role_state, creator_did);
         let context = active_context();
         let mut store = SessionStore::new();
 
@@ -1024,7 +1024,7 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
-            matches!(err, ToolError::InvokerNotAuthorized { .. }),
+            matches!(err, OutletError::InvokerNotAuthorized { .. }),
             "expected InvokerNotAuthorized, got {err:?}"
         );
     }
@@ -1037,7 +1037,7 @@ mod tests {
     async fn invoke_session_returns_error_for_unknown_session() {
         let creator_did = "did:dht:z6MkCreator";
         let role_state = test_role_state(creator_did);
-        let registry = setup_registry_with_tool(&role_state, creator_did);
+        let registry = setup_registry_with_outlet(&role_state, creator_did);
         let context = active_context();
         let mut store = SessionStore::new();
 
@@ -1056,7 +1056,7 @@ mod tests {
 
         assert!(result.is_err());
         assert!(
-            matches!(result.unwrap_err(), ToolError::SessionNotFound { .. }),
+            matches!(result.unwrap_err(), OutletError::SessionNotFound { .. }),
             "expected SessionNotFound"
         );
     }
@@ -1069,7 +1069,7 @@ mod tests {
     async fn invoke_session_increments_call_count_and_updates_state() {
         let creator_did = "did:dht:z6MkCreator";
         let role_state = test_role_state(creator_did);
-        let registry = setup_registry_with_tool(&role_state, creator_did);
+        let registry = setup_registry_with_outlet(&role_state, creator_did);
         let context = active_context();
         let mut store = SessionStore::new();
 
@@ -1135,14 +1135,14 @@ mod tests {
     async fn invoke_session_rejects_when_context_not_active() {
         let creator_did = "did:dht:z6MkCreator";
         let role_state = test_role_state(creator_did);
-        let registry = setup_registry_with_tool(&role_state, creator_did);
+        let registry = setup_registry_with_outlet(&role_state, creator_did);
         let context = ContextHandle::new("ctx-creating".to_owned(), ContextParams::default());
         let mut store = SessionStore::new();
 
         // Insert a session directly.
-        store.insert(ToolSession {
+        store.insert(OutletSession {
             session_id: "sess-1".to_owned(),
-            tool_id: "calculator".to_owned(),
+            outlet_id: "calculator".to_owned(),
             source_context: "ctx-source".to_owned(),
             state: serde_json::Value::Null,
             created_at: scp_clock::SystemClock.now_millis(),
@@ -1165,20 +1165,20 @@ mod tests {
 
         assert!(result.is_err());
         assert!(
-            matches!(result.unwrap_err(), ToolError::ContextNotActive { .. }),
+            matches!(result.unwrap_err(), OutletError::ContextNotActive { .. }),
             "expected ContextNotActive"
         );
     }
 
     // -----------------------------------------------------------------------
-    // ToolSession serialization roundtrip
+    // OutletSession serialization roundtrip
     // -----------------------------------------------------------------------
 
     #[test]
-    fn tool_session_serialization_roundtrip() {
-        let session = ToolSession {
+    fn outlet_session_serialization_roundtrip() {
+        let session = OutletSession {
             session_id: "sess-abc".to_owned(),
-            tool_id: "tool-1".to_owned(),
+            outlet_id: "tool-1".to_owned(),
             source_context: "ctx-src".to_owned(),
             state: serde_json::json!({"key": "value"}),
             created_at: 1_000_000,
@@ -1186,9 +1186,9 @@ mod tests {
             call_count: 42,
         };
         let json = serde_json::to_string(&session).unwrap();
-        let deserialized: ToolSession = serde_json::from_str(&json).unwrap();
+        let deserialized: OutletSession = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.session_id, "sess-abc");
-        assert_eq!(deserialized.tool_id, "tool-1");
+        assert_eq!(deserialized.outlet_id, "tool-1");
         assert_eq!(deserialized.source_context, "ctx-src");
         assert_eq!(deserialized.call_count, 42);
     }
@@ -1201,7 +1201,7 @@ mod tests {
     async fn invoke_session_propagates_execution_failure() {
         let creator_did = "did:dht:z6MkCreator";
         let role_state = test_role_state(creator_did);
-        let registry = setup_registry_with_tool(&role_state, creator_did);
+        let registry = setup_registry_with_outlet(&role_state, creator_did);
         let context = active_context();
         let mut store = SessionStore::new();
 
@@ -1238,7 +1238,7 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
-            matches!(err, ToolError::ExecutionFailed { .. }),
+            matches!(err, OutletError::ExecutionFailed { .. }),
             "expected ExecutionFailed, got {err:?}"
         );
         assert!(err.to_string().contains("computation exploded"));

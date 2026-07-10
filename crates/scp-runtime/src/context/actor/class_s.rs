@@ -312,12 +312,12 @@ use scp_protocol::context::governance::{
     GovernanceEngine, GovernanceProposal, ProposalId, PruningPolicy,
 };
 use scp_protocol::context::membership::{MemberInfo, MembershipState, ReceiveBuffer};
-use scp_protocol::context::params::ToolRegistration;
+use scp_protocol::context::params::OutletRegistration;
 use scp_protocol::context::roles::{
     Capability, CapabilityCeiling, ContextRoleClassCParts, ContextRoleState, RoleAssignment,
     RoleDefinition, RoleError, UcanToken,
 };
-use scp_protocol::context::tools::interface::ToolInterface;
+use scp_protocol::context::outlets::interface::OutletInterface;
 use scp_protocol::crypto::ucan::validate::InMemoryProofResolver;
 use scp_protocol::economy::antispam::{
     ContextMessagePricingConfig, SenderVelocityTracker, TokenBucketLimiter,
@@ -936,9 +936,9 @@ pub(crate) struct GovernanceClassCMut<'a> {
     /// `&mut` to the pending economic policy change (§19.3).
     pending_economic_policy_change: &'a mut Option<PendingEconomicPolicyChange>,
     /// `&mut` to the dynamically registered tools list (§5.9).
-    registered_tools: &'a mut Vec<ToolRegistration>,
+    registered_outlets: &'a mut Vec<OutletRegistration>,
     /// `&mut` to the cross-context tool interfaces list (§6.2).
-    tool_interfaces: &'a mut Vec<ToolInterface>,
+    outlet_interfaces: &'a mut Vec<OutletInterface>,
     /// `&mut` to the pruning policy override (ADR-030 §6).
     pruning_policy: &'a mut Option<PruningPolicy>,
     /// `&mut` to the last-known-member set for departure detection.
@@ -959,7 +959,7 @@ pub(crate) struct GovernanceClassCMut<'a> {
 
 #[allow(
     dead_code,
-    reason = "ADR-049 §9 scaffolding: the field-granular Class-C governance accessors (`velocity_tracker_mut`, `budget_tracker_mut`, `cooldown_until_mut`, `economic_policy_mut`, `next_proposal_seq`, `next_proposal_seq_mut`, `engine_mut`, `approved_proposals_mut`, `freeze_mut`, `timeout_task_mut`, `deadlock_mut`, `pending_ceiling_modification_mut`, `pending_economic_policy_change_mut`, `registered_tools_mut`, `tool_interfaces_mut`, `pruning_policy_mut`, `last_known_members_mut`, `pending_epoch_resets_mut`, `consequence_rules_mut`, `participation_cache_mut`, `message_pricing_mut`, `hard_rate_limit_mut`, `proposal_timestamps_mut`, `evict_stale_entries`, `detection_borrows`) get their first PRODUCTION callers when the best-effort handlers + `ConsequenceStateSplit` / economy-compensation paths migrate onto the combinators. Exercised by this module's unit tests now."
+    reason = "ADR-049 §9 scaffolding: the field-granular Class-C governance accessors (`velocity_tracker_mut`, `budget_tracker_mut`, `cooldown_until_mut`, `economic_policy_mut`, `next_proposal_seq`, `next_proposal_seq_mut`, `engine_mut`, `approved_proposals_mut`, `freeze_mut`, `timeout_task_mut`, `deadlock_mut`, `pending_ceiling_modification_mut`, `pending_economic_policy_change_mut`, `registered_outlets_mut`, `outlet_interfaces_mut`, `pruning_policy_mut`, `last_known_members_mut`, `pending_epoch_resets_mut`, `consequence_rules_mut`, `participation_cache_mut`, `message_pricing_mut`, `hard_rate_limit_mut`, `proposal_timestamps_mut`, `evict_stale_entries`, `detection_borrows`) get their first PRODUCTION callers when the best-effort handlers + `ConsequenceStateSplit` / economy-compensation paths migrate onto the combinators. Exercised by this module's unit tests now."
 )]
 impl<'a> GovernanceClassCMut<'a> {
     /// Wrap a borrowed [`GovernanceState`] by DESTRUCTURING it into the
@@ -996,8 +996,8 @@ impl<'a> GovernanceClassCMut<'a> {
             deadlock,
             pending_ceiling_modification,
             pending_economic_policy_change,
-            registered_tools,
-            tool_interfaces,
+            registered_outlets,
+            outlet_interfaces,
             pruning_policy,
             last_known_members,
             pending_epoch_resets,
@@ -1026,8 +1026,8 @@ impl<'a> GovernanceClassCMut<'a> {
             deadlock,
             pending_ceiling_modification,
             pending_economic_policy_change,
-            registered_tools,
-            tool_interfaces,
+            registered_outlets,
+            outlet_interfaces,
             pruning_policy,
             last_known_members,
             pending_epoch_resets,
@@ -1132,14 +1132,14 @@ impl<'a> GovernanceClassCMut<'a> {
 
     /// `&mut` access to the dynamically registered tools list (§5.9). Class-C
     /// structural governance configuration.
-    pub(crate) const fn registered_tools_mut(&mut self) -> &mut Vec<ToolRegistration> {
-        self.registered_tools
+    pub(crate) const fn registered_outlets_mut(&mut self) -> &mut Vec<OutletRegistration> {
+        self.registered_outlets
     }
 
     /// `&mut` access to the cross-context tool interfaces list (§6.2). Class-C
     /// structural governance configuration.
-    pub(crate) const fn tool_interfaces_mut(&mut self) -> &mut Vec<ToolInterface> {
-        self.tool_interfaces
+    pub(crate) const fn outlet_interfaces_mut(&mut self) -> &mut Vec<OutletInterface> {
+        self.outlet_interfaces
     }
 
     /// `&mut` access to the pruning policy override (ADR-030 §6). Class-C
@@ -1270,8 +1270,8 @@ impl<'a> GovernanceClassCMut<'a> {
             deadlock: &mut *self.deadlock,
             pending_ceiling_modification: &mut *self.pending_ceiling_modification,
             pending_economic_policy_change: &mut *self.pending_economic_policy_change,
-            registered_tools: &mut *self.registered_tools,
-            tool_interfaces: &mut *self.tool_interfaces,
+            registered_outlets: &mut *self.registered_outlets,
+            outlet_interfaces: &mut *self.outlet_interfaces,
             pruning_policy: &mut *self.pruning_policy,
             last_known_members: &mut *self.last_known_members,
             pending_epoch_resets: &mut *self.pending_epoch_resets,
@@ -2972,7 +2972,7 @@ impl ClassSCell {
     /// - charges an in-memory Class-C / external reservation that DID NOT
     ///   durably land and so must be reversed.
     ///
-    /// This is the shape of `reserve_tool_economy`: it consumes a spending-UCAN
+    /// This is the shape of `reserve_outlet_economy`: it consumes a spending-UCAN
     /// nonce (Class-S — kept) while charging the `budget_tracker` /
     /// `velocity_tracker` / `hard_rate_limit` (Class-C — reversed on persist
     /// failure, because the reservation the caller is being charged for did not
@@ -5495,16 +5495,16 @@ impl ClassSCell
         crate::context::supervisor::saga_journal::SagaId(id.to_owned())
     }
 
-    /// Build a `CrossContextToolInvocation` prepared-state for `saga_pending`.
+    /// Build a `CrossContextOutletInvocation` prepared-state for `saga_pending`.
     fn prepared_invocation() -> crate::context::supervisor::saga_prepared_state::SagaPreparedState {
         use crate::context::supervisor::saga_prepared_state::{
-            CrossContextToolInvocationPrepared, SagaPreparedState,
+            CrossContextOutletInvocationPrepared, SagaPreparedState,
         };
-        SagaPreparedState::CrossContextToolInvocation(CrossContextToolInvocationPrepared {
+        SagaPreparedState::CrossContextOutletInvocation(CrossContextOutletInvocationPrepared {
             caller_context_id: [0x1Au8; 32],
             target_context_id: [0x2Bu8; 32],
             caller_did: DID("did:example:caller".to_owned()),
-            tool_registration_id: "tool-v1".to_owned(),
+            outlet_registration_id: "tool-v1".to_owned(),
             ucan_proof_id: "ucan-1".to_owned(),
             recorded_timestamp_ms: 1_700_000_000_123,
             recorded_nonce: [0x3Cu8; 16],

@@ -167,7 +167,7 @@ name = "context"
 required-features = ["testing"]
 
 [[example]]
-name = "tools"
+name = "outlets"
 required-features = ["testing"]
 
 [[example]]

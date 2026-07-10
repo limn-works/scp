@@ -9,13 +9,13 @@
 //! 1. The hard-rate-limit consume / refund helpers
 //!    ([`try_consume_hard_rate_limit`], [`refund_hard_rate_limit`]).
 //! 2. The economy-pipeline split for tool invocation
-//!    ([`reserve_tool_economy`], [`settle_tool_economy_capture`],
-//!    [`rollback_tool_economy`]) plus the supervisor-side orchestrator
-//!    [`invoke_tool_with_economy`].
+//!    ([`reserve_outlet_economy`], [`settle_outlet_economy_capture`],
+//!    [`rollback_outlet_economy`]) plus the supervisor-side orchestrator
+//!    [`invoke_outlet_with_economy`].
 //!
-//! # The `invoke_tool_with_economy` actor split (Phase 2A finalization)
+//! # The `invoke_outlet_with_economy` actor split (Phase 2A finalization)
 //!
-//! The legacy `invoke_tool_with_economy` ran the entire economy pipeline
+//! The legacy `invoke_outlet_with_economy` ran the entire economy pipeline
 //! under the `contexts` `DashMap` mutex (Phase 1 reserve), dropped the
 //! lock, ran the executor off-lock (Phase 2), then re-locked for
 //! post-invocation bookkeeping (Phase 3). ADR-049 deletes the `DashMap`,
@@ -26,23 +26,23 @@
 //! actor mailbox. The economy bookkeeping, by contrast, is `Send` and
 //! mutates owned [`PerContextState`]. The split therefore runs:
 //!
-//! - **Phase 1 (reserve)** — [`reserve_tool_economy`] runs INSIDE the
-//!   actor handler ([`ToolsCommand::ReserveToolEconomy`]) on
+//! - **Phase 1 (reserve)** — [`reserve_outlet_economy`] runs INSIDE the
+//!   actor handler ([`OutletsCommand::ReserveOutletEconomy`]) on
 //!   `&mut PerContextState`. It consumes the hard rate limit, records the
 //!   velocity entry, runs the economy pre-check, deducts budget,
 //!   authorizes the payment escrow, and returns a `Send`
-//!   [`ToolEconomyReservation`] (context handle + role-state snapshot +
-//!   the in-flight [`ToolEconomyTicket`]).
+//!   [`OutletEconomyReservation`] (context handle + role-state snapshot +
+//!   the in-flight [`OutletEconomyTicket`]).
 //! - **Phase 2 (execute)** — the supervisor-side orchestrator
-//!   [`invoke_tool_with_economy`] runs the non-`Send` executor through
-//!   [`invoke_tool_execute_and_validate`] BETWEEN the two mailbox
+//!   [`invoke_outlet_with_economy`] runs the non-`Send` executor through
+//!   [`invoke_outlet_execute_and_validate`] BETWEEN the two mailbox
 //!   round-trips. No lock is held; the actor is free to process other
 //!   commands.
 //! - **Phase 3 (settle)** — on executor success
-//!   [`settle_tool_economy_capture`] runs inside the actor
-//!   ([`ToolsCommand::SettleToolEconomy`]) to perform post-invocation
+//!   [`settle_outlet_economy_capture`] runs inside the actor
+//!   ([`OutletsCommand::SettleOutletEconomy`]) to perform post-invocation
 //!   bookkeeping + consequence enforcement + payment capture; on
-//!   executor failure [`rollback_tool_economy`] voids the escrow and
+//!   executor failure [`rollback_outlet_economy`] voids the escrow and
 //!   reverses budget / velocity / rate-limit.
 //!
 //! Splitting reserve/execute/settle keeps state mutation actor-exclusive
@@ -58,9 +58,9 @@ use std::sync::Arc;
 use scp_did::DID;
 use scp_protocol::context::ContextError;
 use scp_protocol::context::roles::ContextRoleState;
-use scp_protocol::context::tools::ToolId;
-use scp_protocol::context::tools::lifecycle::ToolInvokedEvent;
-use scp_protocol::context::tools::registry::ToolRegistry;
+use scp_protocol::context::outlets::OutletId;
+use scp_protocol::context::outlets::lifecycle::OutletInvokedEvent;
+use scp_protocol::context::outlets::registry::OutletRegistry;
 use scp_protocol::crypto::ucan::UcanToken;
 use scp_protocol::economy::antispam::VelocityRollbackToken;
 use scp_protocol::economy::policy::ObservableMetrics;
@@ -68,9 +68,9 @@ use scp_protocol::economy::types::Amount;
 
 use crate::context::ContextHandle;
 use crate::context::actor::deps::ActorDeps;
-use crate::context::tools::invoke::{
-    self, InvocationError, InvokeExecuteOutcome, ToolEconomyContext, build_tool_event,
-    economy_pre_check, invoke_tool_execute_and_validate, post_tool_invocation_bookkeeping,
+use crate::context::outlets::invoke::{
+    self, InvocationError, InvokeExecuteOutcome, OutletEconomyContext, build_outlet_event,
+    economy_pre_check, invoke_outlet_execute_and_validate, post_outlet_invocation_bookkeeping,
 };
 use crate::economy::adapter::PaymentReceipt;
 use crate::economy::integration::PreparedAction;
@@ -111,17 +111,17 @@ pub fn refund_hard_rate_limit(mut view: crate::context::actor::class_s::ClassCMu
 }
 
 // ---------------------------------------------------------------------------
-// ManagedToolInvocationOutput
+// ManagedOutletInvocationOutput
 // ---------------------------------------------------------------------------
 
 /// Result of a successful managed tool invocation. Returned to the FFI
-/// bridges by [`invoke_tool_with_economy`].
+/// bridges by [`invoke_outlet_with_economy`].
 #[derive(Debug)]
-pub struct ManagedToolInvocationOutput {
+pub struct ManagedOutletInvocationOutput {
     /// Tool output JSON.
     pub output: serde_json::Value,
     /// Event to append to the event log.
-    pub event: ToolInvokedEvent,
+    pub event: OutletInvokedEvent,
     /// Consequences triggered by the invocation.
     pub consequences: Vec<scp_protocol::trust::consequence::TriggeredConsequence>,
     /// Payment receipt when a payment adapter is configured.
@@ -129,20 +129,20 @@ pub struct ManagedToolInvocationOutput {
 }
 
 // ---------------------------------------------------------------------------
-// ToolEconomyTicket — the in-flight economy bookkeeping bundle
+// OutletEconomyTicket — the in-flight economy bookkeeping bundle
 // ---------------------------------------------------------------------------
 
 /// Phase-1 bookkeeping bundle for a tool invocation in flight. Crosses
-/// the actor mailbox inside a [`ToolEconomyReservation`]: produced by
-/// [`reserve_tool_economy`] (actor), carried through the executor
-/// (supervisor), then consumed by [`settle_tool_economy_capture`] /
-/// [`rollback_tool_economy`] (actor).
+/// the actor mailbox inside a [`OutletEconomyReservation`]: produced by
+/// [`reserve_outlet_economy`] (actor), carried through the executor
+/// (supervisor), then consumed by [`settle_outlet_economy_capture`] /
+/// [`rollback_outlet_economy`] (actor).
 ///
 /// The `#[must_use]` + `Drop` debug-assert invariant catches any future
 /// refactor that leaks an unbalanced budget deduction or velocity entry.
 /// All fields are `Send` so the ticket can cross the mailbox boundary.
-#[must_use = "ToolEconomyTicket must be committed or rolled back — dropping leaks budget, velocity, and escrow state"]
-pub struct ToolEconomyTicket {
+#[must_use = "OutletEconomyTicket must be committed or rolled back — dropping leaks budget, velocity, and escrow state"]
+pub struct OutletEconomyTicket {
     actor_did: DID,
     deducted_cost: Option<Amount>,
     velocity_token: VelocityRollbackToken,
@@ -153,9 +153,9 @@ pub struct ToolEconomyTicket {
     consumed: bool,
 }
 
-impl std::fmt::Debug for ToolEconomyTicket {
+impl std::fmt::Debug for OutletEconomyTicket {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ToolEconomyTicket")
+        f.debug_struct("OutletEconomyTicket")
             .field("actor_did", &self.actor_did)
             .field("deducted_cost", &self.deducted_cost)
             .field(
@@ -167,30 +167,30 @@ impl std::fmt::Debug for ToolEconomyTicket {
     }
 }
 
-impl Drop for ToolEconomyTicket {
+impl Drop for OutletEconomyTicket {
     fn drop(&mut self) {
         if !self.consumed {
             tracing::error!(
                 actor_did = %self.actor_did,
                 cost = ?self.deducted_cost,
-                "ToolEconomyTicket dropped without commit or rollback — budget, velocity, and escrow state may be inconsistent"
+                "OutletEconomyTicket dropped without commit or rollback — budget, velocity, and escrow state may be inconsistent"
             );
             debug_assert!(
                 false,
-                "ToolEconomyTicket dropped without commit or rollback for actor {}",
+                "OutletEconomyTicket dropped without commit or rollback for actor {}",
                 self.actor_did
             );
         }
     }
 }
 
-fn commit_tool_economy_ticket(mut ticket: ToolEconomyTicket) -> Option<Amount> {
+fn commit_outlet_economy_ticket(mut ticket: OutletEconomyTicket) -> Option<Amount> {
     ticket.consumed = true;
     ticket.needs_hard_rate_limit_refund = false;
     ticket.deducted_cost
 }
 
-impl ToolEconomyTicket {
+impl OutletEconomyTicket {
     /// Test-only constructor for an escrow-free ticket carrying a budget
     /// deduction. Used by supervisor-level settle tests that cannot reach
     /// the private ticket fields. No payment escrow ⇒
@@ -213,7 +213,7 @@ impl ToolEconomyTicket {
 
     /// Test-only constructor for an escrow-BEARING ticket carrying a budget
     /// deduction and a captured policy, so the capture path
-    /// ([`settle_tool_economy_capture`]) actually runs payment capture against a
+    /// ([`settle_outlet_economy_capture`]) actually runs payment capture against a
     /// supplied adapter. Used by the RED-CS3 tool-settle fail-closed test, which
     /// pairs this with a failing-capture adapter to exercise the
     /// payment-capture-failure early-return path.
@@ -254,7 +254,7 @@ impl ToolEconomyTicket {
         payment_adapter: Option<&Arc<dyn crate::economy::adapter::PaymentAdapterDyn>>,
     ) {
         if let (Some(adapter), Some(prepared)) = (payment_adapter, self.escrow.as_ref()) {
-            invoke::void_tool_escrow(adapter.as_ref(), prepared).await;
+            invoke::void_outlet_escrow(adapter.as_ref(), prepared).await;
         }
         // The context-local budget/velocity/rate-limit bookkeeping is
         // gone with the actor; mark consumed so the unbalanced-ticket
@@ -264,16 +264,16 @@ impl ToolEconomyTicket {
     }
 
     /// Synchronous last-resort consume for a sync, deps-less reply path
-    /// (the [`reply_tools_not_registered`] backstop) that cannot `.await`
+    /// (the [`reply_outlets_not_registered`] backstop) that cannot `.await`
     /// to void the escrow. Marks the ticket consumed so its Drop balance
     /// guard does not fire, and logs at ERROR if an external escrow hold
     /// is being abandoned without a void. This path is unreachable for
-    /// `SettleToolEconomy` through `dispatch_tools_command` (which voids
+    /// `SettleOutletEconomy` through `dispatch_outlets_command` (which voids
     /// the escrow async before reaching the sync reply); it exists only
     /// as defense-in-depth so no future caller can resurrect the
     /// ticket-drop panic.
     ///
-    /// [`reply_tools_not_registered`]: crate::context::supervisor::Supervisor
+    /// [`reply_outlets_not_registered`]: crate::context::supervisor::Supervisor
     pub fn consume_abandoning_escrow(mut self) {
         if self.escrow.is_some() {
             tracing::error!(
@@ -356,7 +356,7 @@ impl ToolEconomyTicket {
 /// every terminal path"), used EXCLUSIVELY by the crash-recovery abort path
 /// (`Abort { None }`) where the in-memory RAII carrier died with the crash.
 /// (The LIVE `Abort { Some }` and Commit-A paths reverse via the carrier
-/// through [`rollback_tool_economy_generation_checked`], NOT this function — so
+/// through [`rollback_outlet_economy_generation_checked`], NOT this function — so
 /// this is the crash-recovery-only path and has exactly one production caller.)
 ///
 /// Reverses the local budget / velocity / hard-rate-limit AND voids the
@@ -379,7 +379,7 @@ impl ToolEconomyTicket {
 /// The confused-deputy concern the generation check addresses — a DIFFERENT
 /// instance replacing the state between reserve and settle — belongs to the
 /// LIVE reserve→settle race, which the carrier path
-/// ([`rollback_tool_economy_generation_checked`]) handles. It does not apply
+/// ([`rollback_outlet_economy_generation_checked`]) handles. It does not apply
 /// here: there is no "replaced instance" on the crash path, only the same
 /// context's state restored from its own consistent snapshot. Routing by
 /// `context_id` and keying every reversal by `record.actor_did` is what
@@ -432,20 +432,20 @@ pub async fn reverse_caller_reservation_record(
 }
 
 // ---------------------------------------------------------------------------
-// ToolEconomyReservation — the Send payload that crosses the mailbox
+// OutletEconomyReservation — the Send payload that crosses the mailbox
 // ---------------------------------------------------------------------------
 
 /// The `Send` output of the Phase-1 economy reserve. Produced by
-/// [`reserve_tool_economy`] inside the actor, carried by the supervisor
+/// [`reserve_outlet_economy`] inside the actor, carried by the supervisor
 /// orchestrator across the non-`Send` executor, and handed back into the
 /// actor for Phase 3 settle.
 ///
 /// Carries the context handle + role-state snapshot (the executor's
-/// off-lock inputs) and the in-flight [`ToolEconomyTicket`].
-#[must_use = "a ToolEconomyReservation must be settled (capture) or rolled back — dropping leaks the held ticket"]
-pub struct ToolEconomyReservation {
+/// off-lock inputs) and the in-flight [`OutletEconomyTicket`].
+#[must_use = "a OutletEconomyReservation must be settled (capture) or rolled back — dropping leaks the held ticket"]
+pub struct OutletEconomyReservation {
     /// Context handle snapshot — the executor reads lifecycle state and
-    /// the supervisor passes it to [`invoke_tool_execute_and_validate`].
+    /// the supervisor passes it to [`invoke_outlet_execute_and_validate`].
     pub handle: ContextHandle,
     /// Role-state snapshot for the capability re-check inside the
     /// off-lock executor path.
@@ -459,19 +459,19 @@ pub struct ToolEconomyReservation {
     /// write to the WRONG context instance.
     pub generation: u64,
     /// In-flight economy bookkeeping carried through the executor.
-    pub ticket: ToolEconomyTicket,
+    pub ticket: OutletEconomyTicket,
 }
 
-impl std::fmt::Debug for ToolEconomyReservation {
+impl std::fmt::Debug for OutletEconomyReservation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ToolEconomyReservation")
+        f.debug_struct("OutletEconomyReservation")
             .field("ticket", &self.ticket)
             .finish_non_exhaustive()
     }
 }
 
 // ---------------------------------------------------------------------------
-// Phase 1: reserve_tool_economy (actor handler entry point)
+// Phase 1: reserve_outlet_economy (actor handler entry point)
 // ---------------------------------------------------------------------------
 
 /// Phase 1 of the tool economy pipeline, run inside the per-context
@@ -482,7 +482,7 @@ impl std::fmt::Debug for ToolEconomyReservation {
 /// On any failure branch the hard-rate-limit token is refunded inline
 /// (and velocity rolled back / budget reversed as applicable) so a
 /// rejected reservation leaves observable state unchanged. On success
-/// returns a `Send` [`ToolEconomyReservation`] the supervisor carries
+/// returns a `Send` [`OutletEconomyReservation`] the supervisor carries
 /// across the executor.
 ///
 /// # Errors
@@ -490,14 +490,14 @@ impl std::fmt::Debug for ToolEconomyReservation {
 /// Propagates [`ContextError`] for rate-limit, budget, spending-UCAN, and
 /// escrow-authorization failures.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-pub async fn reserve_tool_economy(
+pub async fn reserve_outlet_economy(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     invoker_did: &DID,
     spending_ucan: Option<&UcanToken>,
     now_secs: u64,
-) -> Result<ToolEconomyReservation, ContextError> {
+) -> Result<OutletEconomyReservation, ContextError> {
     // ADR-049 §9 Class-S cell seam. The spending-nonce consume + budget charge
     // + fail-closed persist on the PAID path are routed through
     // `commit_class_s_keep_compensating` below; the pre-persist bookkeeping that
@@ -590,7 +590,7 @@ pub async fn reserve_tool_economy(
             // error arm's `velocity_tracker_mut` rollback (NLL).
             let pre_check_result = {
                 let borrows = view.governance_class_c_mut().economy_pre_check_borrows();
-                let economy = ToolEconomyContext {
+                let economy = OutletEconomyContext {
                     economic_policy: borrows.economic_policy.as_ref(),
                     budget_tracker: borrows.budget_tracker,
                     spending_ucan,
@@ -791,7 +791,7 @@ pub async fn reserve_tool_economy(
     // above; this reserve error arm injects no extra persist).
     let escrow = match (economic_policy.as_ref(), payment_adapter.as_ref()) {
         (Some(policy), Some(adapter)) => {
-            match invoke::authorize_tool_payment(
+            match invoke::authorize_outlet_payment(
                 adapter.as_ref(),
                 policy,
                 context_id,
@@ -817,7 +817,7 @@ pub async fn reserve_tool_economy(
         _ => None,
     };
 
-    let ticket = ToolEconomyTicket {
+    let ticket = OutletEconomyTicket {
         actor_did: invoker_did.clone(),
         deducted_cost,
         velocity_token,
@@ -829,7 +829,7 @@ pub async fn reserve_tool_economy(
     };
 
     // `generation` is a Class-C structural field read through the cell `Deref`.
-    Ok(ToolEconomyReservation {
+    Ok(OutletEconomyReservation {
         handle,
         role_state,
         generation: cell.generation,
@@ -838,7 +838,7 @@ pub async fn reserve_tool_economy(
 }
 
 // ---------------------------------------------------------------------------
-// Phase 3a: settle_tool_economy_capture (actor handler entry point)
+// Phase 3a: settle_outlet_economy_capture (actor handler entry point)
 // ---------------------------------------------------------------------------
 
 /// Phase 3 of the tool economy pipeline on executor SUCCESS, run inside
@@ -860,7 +860,7 @@ pub async fn reserve_tool_economy(
 /// guard on a path that legitimately must still persist, or losing the obligation
 /// entirely — the RED-CS3 hole). With the token living in the caller's `Option`,
 /// passed by `&mut`, an early `return Err` here does NOT drop it; the cell-holding
-/// caller ([`settle_tool_economy`]) commits it fail-closed AFTER the call
+/// caller ([`settle_outlet_economy`]) commits it fail-closed AFTER the call
 /// regardless of Ok/Err. On payment-capture failure the ticket is reversed (budget
 /// / velocity / rate-limit) and the error surfaced; the in-memory downward-auth
 /// mutation is NOT reversed (keep-direction).
@@ -869,12 +869,12 @@ pub async fn reserve_tool_economy(
 ///
 /// Propagates [`ContextError::PermissionDenied`] when payment capture
 /// fails after a successful execution.
-pub async fn settle_tool_economy_capture(
+pub async fn settle_outlet_economy_capture(
     mut view: crate::context::actor::class_s::ClassCMut<'_>,
     deps: &ActorDeps,
     context_id: &str,
     invoker_did: &DID,
-    ticket: ToolEconomyTicket,
+    ticket: OutletEconomyTicket,
     downward_auth_sink: &mut Option<crate::context::actor::class_s::ClassSCommitToken>,
 ) -> Result<
     (
@@ -901,7 +901,7 @@ pub async fn settle_tool_economy_capture(
         .consequence_rules_mut()
         .clone();
 
-    let consequences = post_tool_invocation_bookkeeping(
+    let consequences = post_outlet_invocation_bookkeeping(
         &events_for_consequences,
         invoker_did,
         context_id,
@@ -948,7 +948,7 @@ pub async fn settle_tool_economy_capture(
         ticket.policy_for_capture.as_ref(),
     ) {
         (Some(adapter), Some(prepared), policy_opt) => {
-            match invoke::complete_tool_payment(
+            match invoke::complete_outlet_payment(
                 adapter.as_ref(),
                 policy_opt,
                 prepared,
@@ -980,18 +980,18 @@ pub async fn settle_tool_economy_capture(
         _ => None,
     };
 
-    let _cost = commit_tool_economy_ticket(ticket);
+    let _cost = commit_outlet_economy_ticket(ticket);
     Ok((consequences, payment_receipt))
 }
 
 // ---------------------------------------------------------------------------
-// Phase 3b: rollback_tool_economy (actor handler entry point)
+// Phase 3b: rollback_outlet_economy (actor handler entry point)
 // ---------------------------------------------------------------------------
 
 /// Phase 3 of the tool economy pipeline on executor FAILURE, run inside
 /// the per-context actor on owned state. Voids any payment escrow hold,
 /// then reverses the velocity entry, budget deduction, and hard-rate-limit
-/// token consumed by [`reserve_tool_economy`].
+/// token consumed by [`reserve_outlet_economy`].
 /// Generation-checked Phase-3 rollback. Reverses the reservation against THIS
 /// actor's owned state ONLY if the reservation's `generation` still matches the
 /// live actor's `state.generation`; on a MISMATCH the actor was despawned and a
@@ -1001,24 +1001,24 @@ pub async fn settle_tool_economy_capture(
 /// confused-deputy write to the WRONG context instance. On mismatch it voids
 /// only the EXTERNAL escrow (the real payment hold the prior instance authorized
 /// at reserve) and consumes the ticket — exactly mirroring
-/// [`settle_tool_economy`]'s generation guard, but for the failure/abort path.
+/// [`settle_outlet_economy`]'s generation guard, but for the failure/abort path.
 ///
 /// This is the rollback-path counterpart the saga abort handler and the
 /// Commit-A idempotency-replay branch use: those paths previously called
-/// [`rollback_tool_economy`] directly, which writes local state
+/// [`rollback_outlet_economy`] directly, which writes local state
 /// unconditionally and would corrupt a respawned (gen N→N+1) instance's economy
 /// state. Returns `true` when the local rollback ran (generations matched),
 /// `false` when only the external escrow was voided (mismatch).
-pub async fn rollback_tool_economy_generation_checked(
+pub async fn rollback_outlet_economy_generation_checked(
     mut view: crate::context::actor::class_s::ClassCMut<'_>,
     deps: &ActorDeps,
     reservation_generation: u64,
-    ticket: ToolEconomyTicket,
+    ticket: OutletEconomyTicket,
 ) -> bool {
     // `generation` is a Class-C structural field reached through the view; read
     // it via the field-granular accessor (the view holds no whole `&mut`).
     if reservation_generation != *view.generation_mut() {
-        // Confused-deputy guard (mirrors `settle_tool_economy`): the reservation
+        // Confused-deputy guard (mirrors `settle_outlet_economy`): the reservation
         // belongs to a now-replaced actor instance. Void only the external
         // escrow and consume; the context-local bookkeeping lived in the gone
         // instance's `PerContextState` and must NOT be touched here.
@@ -1027,20 +1027,20 @@ pub async fn rollback_tool_economy_generation_checked(
             .await;
         return false;
     }
-    rollback_tool_economy(view, deps, ticket).await;
+    rollback_outlet_economy(view, deps, ticket).await;
     true
 }
 
-pub async fn rollback_tool_economy(
+pub async fn rollback_outlet_economy(
     mut view: crate::context::actor::class_s::ClassCMut<'_>,
     deps: &ActorDeps,
-    mut ticket: ToolEconomyTicket,
+    mut ticket: OutletEconomyTicket,
 ) {
     ticket.consumed = true;
 
     if let (Some(adapter), Some(prepared)) = (deps.payment_adapter.as_ref(), ticket.escrow.as_ref())
     {
-        invoke::void_tool_escrow(adapter.as_ref(), prepared).await;
+        invoke::void_outlet_escrow(adapter.as_ref(), prepared).await;
     }
 
     // Reverse the Class-C governance economy bookkeeping through the
@@ -1060,7 +1060,7 @@ pub async fn rollback_tool_economy(
 }
 
 // ---------------------------------------------------------------------------
-// Supervisor-side orchestrator: invoke_tool_with_economy
+// Supervisor-side orchestrator: invoke_outlet_with_economy
 // ---------------------------------------------------------------------------
 
 /// Invokes a tool under the full economy pipeline without holding any
@@ -1068,19 +1068,19 @@ pub async fn rollback_tool_economy(
 /// actor model.
 ///
 /// Orchestrates the three-phase split: dispatch the Phase-1
-/// [`ToolsCommand::ReserveToolEconomy`](crate::context::actor::commands::ToolsCommand::ReserveToolEconomy)
+/// [`OutletsCommand::ReserveOutletEconomy`](crate::context::actor::commands::OutletsCommand::ReserveOutletEconomy)
 /// to the context actor (economy reserve on owned state), run the
 /// non-`Send` executor supervisor-side via
-/// [`invoke_tool_execute_and_validate`], then dispatch the Phase-3
-/// [`ToolsCommand::SettleToolEconomy`](crate::context::actor::commands::ToolsCommand::SettleToolEconomy)
+/// [`invoke_outlet_execute_and_validate`], then dispatch the Phase-3
+/// [`OutletsCommand::SettleOutletEconomy`](crate::context::actor::commands::OutletsCommand::SettleOutletEconomy)
 /// (capture on success / rollback on failure). The economy bookkeeping
 /// never crosses the mailbox as anything but a `Send`
-/// [`ToolEconomyReservation`]; the executor never crosses the mailbox at
+/// [`OutletEconomyReservation`]; the executor never crosses the mailbox at
 /// all.
 ///
 /// `reserve` / `settle` are caller-supplied closures that perform the
 /// mailbox round-trips (the supervisor owns the actor registry and the
-/// command-construction surface); this keeps `tools_helpers` free of a
+/// command-construction surface); this keeps `outlets_helpers` free of a
 /// `&Supervisor` dependency while concentrating the lock-split sequencing
 /// in one place.
 ///
@@ -1089,30 +1089,30 @@ pub async fn rollback_tool_economy(
 /// Propagates every error variant the reserve / settle handlers and the
 /// executor emit (`ContextNotRegistered`, `PermissionDenied`,
 /// `RateLimited`, schema/economy/UCAN failures).
-// Mirrors the FFI tool-invocation surface (registry/tool_id/input/
+// Mirrors the FFI tool-invocation surface (registry/outlet_id/input/
 // invoker_did/timeout_ms/executor) plus the two phase-handoff closures;
 // bundling them would only obscure the lock-split sequencing.
 #[allow(clippy::too_many_arguments)]
-pub async fn invoke_tool_with_economy<Reserve, ReserveFut, Settle, SettleFut, F, Fut>(
-    registry: &ToolRegistry,
-    tool_id: &ToolId,
+pub async fn invoke_outlet_with_economy<Reserve, ReserveFut, Settle, SettleFut, F, Fut>(
+    registry: &OutletRegistry,
+    outlet_id: &OutletId,
     input: serde_json::Value,
     invoker_did: &DID,
     timeout_ms: Option<u32>,
     reserve: Reserve,
     settle: Settle,
     executor: F,
-) -> Result<ManagedToolInvocationOutput, ContextError>
+) -> Result<ManagedOutletInvocationOutput, ContextError>
 where
     Reserve: FnOnce() -> ReserveFut,
-    ReserveFut: Future<Output = Result<ToolEconomyReservation, ContextError>>,
-    Settle: FnOnce(ToolSettleRequest) -> SettleFut,
-    SettleFut: Future<Output = Result<ToolSettleOutcome, ContextError>>,
+    ReserveFut: Future<Output = Result<OutletEconomyReservation, ContextError>>,
+    Settle: FnOnce(OutletSettleRequest) -> SettleFut,
+    SettleFut: Future<Output = Result<OutletSettleOutcome, ContextError>>,
     F: FnOnce(serde_json::Value) -> Fut,
     Fut: Future<Output = Result<serde_json::Value, String>>,
 {
     // Phase 1 — economy reserve runs inside the actor on owned state.
-    let ToolEconomyReservation {
+    let OutletEconomyReservation {
         handle,
         role_state,
         generation,
@@ -1122,11 +1122,11 @@ where
     // Phase 2 — run the non-Send executor supervisor-side, OFF the actor
     // mailbox, so the actor is free to process other commands and a
     // misbehaving tool cannot stall the per-context actor loop.
-    let outcome = match invoke_tool_execute_and_validate(
+    let outcome = match invoke_outlet_execute_and_validate(
         &handle,
         registry,
         &role_state,
-        tool_id,
+        outlet_id,
         input,
         invoker_did,
         timeout_ms,
@@ -1141,11 +1141,11 @@ where
             // is unreachable (the actor was despawned during the off-
             // mailbox executor window) the closure is responsible for
             // voiding the external escrow + consuming the ticket (see
-            // `settle_tool_economy_via_actor`), but we still surface the
+            // `settle_outlet_economy_via_actor`), but we still surface the
             // failure to logs — a settle that cannot run is an economy
             // anomaly the operator must see.
             if let Err(settle_err) =
-                settle(ToolSettleRequest::Rollback { generation, ticket }).await
+                settle(OutletSettleRequest::Rollback { generation, ticket }).await
             {
                 tracing::error!(
                     rollback_error = %settle_err,
@@ -1166,14 +1166,14 @@ where
 
     // Phase 3 (capture) — post-invocation bookkeeping + payment capture
     // in the actor.
-    let ToolSettleOutcome {
+    let OutletSettleOutcome {
         consequences,
         payment_receipt,
         cost,
-    } = settle(ToolSettleRequest::Capture { generation, ticket }).await?;
+    } = settle(OutletSettleRequest::Capture { generation, ticket }).await?;
 
-    let event = build_tool_event(
-        tool_id,
+    let event = build_outlet_event(
+        outlet_id,
         invoker_did,
         execution_time_ms,
         input_hash,
@@ -1181,7 +1181,7 @@ where
         cost,
     );
 
-    Ok(ManagedToolInvocationOutput {
+    Ok(ManagedOutletInvocationOutput {
         output,
         event,
         consequences,
@@ -1190,10 +1190,10 @@ where
 }
 
 /// Phase-3 settle request handed to the supervisor-supplied `settle`
-/// closure by [`invoke_tool_with_economy`], and carried into the actor
-/// via [`ToolsCommand::SettleToolEconomy`](crate::context::actor::commands::ToolsCommand::SettleToolEconomy).
+/// closure by [`invoke_outlet_with_economy`], and carried into the actor
+/// via [`OutletsCommand::SettleOutletEconomy`](crate::context::actor::commands::OutletsCommand::SettleOutletEconomy).
 #[derive(Debug)]
-pub enum ToolSettleRequest {
+pub enum OutletSettleRequest {
     /// Executor succeeded — capture payment + run post-invocation
     /// bookkeeping.
     Capture {
@@ -1202,7 +1202,7 @@ pub enum ToolSettleRequest {
         /// generation no longer matches.
         generation: u64,
         /// The in-flight economy ticket from Phase 1.
-        ticket: ToolEconomyTicket,
+        ticket: OutletEconomyTicket,
     },
     /// Executor failed — void escrow + reverse budget / velocity /
     /// rate-limit.
@@ -1212,11 +1212,11 @@ pub enum ToolSettleRequest {
         /// generation no longer matches.
         generation: u64,
         /// The in-flight economy ticket from Phase 1.
-        ticket: ToolEconomyTicket,
+        ticket: OutletEconomyTicket,
     },
 }
 
-impl ToolSettleRequest {
+impl OutletSettleRequest {
     /// The spawn-generation the reservation was made against.
     #[must_use]
     pub const fn generation(&self) -> u64 {
@@ -1229,7 +1229,7 @@ impl ToolSettleRequest {
     /// supervisor orchestrator when the actor is unreachable so it can
     /// void the external escrow and consume the ticket locally rather
     /// than dropping it (escrow leak + unbalanced-ticket panic).
-    pub fn into_ticket(self) -> ToolEconomyTicket {
+    pub fn into_ticket(self) -> OutletEconomyTicket {
         match self {
             Self::Capture { ticket, .. } | Self::Rollback { ticket, .. } => ticket,
         }
@@ -1237,34 +1237,34 @@ impl ToolSettleRequest {
 }
 
 /// Phase-3 capture outcome returned by the supervisor-supplied `settle`
-/// closure to [`invoke_tool_with_economy`].
+/// closure to [`invoke_outlet_with_economy`].
 #[derive(Debug, Default)]
-pub struct ToolSettleOutcome {
+pub struct OutletSettleOutcome {
     /// Consequences triggered by the invocation.
     pub consequences: Vec<scp_protocol::trust::consequence::TriggeredConsequence>,
     /// Payment receipt when a payment adapter is configured.
     pub payment_receipt: Option<PaymentReceipt>,
-    /// Committed action cost for inclusion in the `ToolInvokedEvent`.
+    /// Committed action cost for inclusion in the `OutletInvokedEvent`.
     pub cost: Option<Amount>,
 }
 
 /// Single Phase-3 settle entry point for the actor
-/// [`SettleToolEconomy`](crate::context::actor::commands::ToolsCommand::SettleToolEconomy)
+/// [`SettleOutletEconomy`](crate::context::actor::commands::OutletsCommand::SettleOutletEconomy)
 /// handler. Dispatches the request to
-/// [`settle_tool_economy_capture`] (success) or [`rollback_tool_economy`]
-/// (failure) on owned state and assembles the [`ToolSettleOutcome`].
+/// [`settle_outlet_economy_capture`] (success) or [`rollback_outlet_economy`]
+/// (failure) on owned state and assembles the [`OutletSettleOutcome`].
 ///
 /// # Errors
 ///
 /// Propagates the capture path's [`ContextError`] on payment-capture
 /// failure. The rollback path is infallible.
-pub async fn settle_tool_economy(
+pub async fn settle_outlet_economy(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     invoker_did: &DID,
-    request: ToolSettleRequest,
-) -> Result<ToolSettleOutcome, ContextError> {
+    request: OutletSettleRequest,
+) -> Result<OutletSettleOutcome, ContextError> {
     // Confused-deputy guard: the reservation was made against a specific
     // actor-instance generation. If this actor's generation differs, the
     // original instance was despawned and a NEW instance respawned for
@@ -1291,7 +1291,7 @@ pub async fn settle_tool_economy(
     }
 
     match request {
-        ToolSettleRequest::Capture { ticket, .. } => {
+        OutletSettleRequest::Capture { ticket, .. } => {
             // Read the committed cost before the ticket is consumed by
             // the capture path so it can be threaded into the event.
             let cost = ticket.deducted_cost;
@@ -1300,7 +1300,7 @@ pub async fn settle_tool_economy(
             // state, membership, and the checkpoint counter in ADDITION to the
             // Class-C governance economy fields. `class_c_view()` hands out a
             // `ClassCMut` holding all of those as disjoint field references;
-            // `consequence_split()` (inside `settle_tool_economy_capture`) yields
+            // `consequence_split()` (inside `settle_outlet_economy_capture`) yields
             // the `ConsequenceStateSplit` shape (consequence-only GROW role view)
             // with NO whole `&mut PerContextState` and NO Class-S reach. Evaluation
             // coalesces
@@ -1317,7 +1317,7 @@ pub async fn settle_tool_economy(
             let mut downward_auth_obligation: Option<
                 crate::context::actor::class_s::ClassSCommitToken,
             > = None;
-            let capture_result = settle_tool_economy_capture(
+            let capture_result = settle_outlet_economy_capture(
                 cell.class_c_view(),
                 deps,
                 context_id,
@@ -1349,15 +1349,15 @@ pub async fn settle_tool_economy(
                 });
             }
             let (consequences, payment_receipt) = capture_result?;
-            Ok(ToolSettleOutcome {
+            Ok(OutletSettleOutcome {
                 consequences,
                 payment_receipt,
                 cost,
             })
         }
-        ToolSettleRequest::Rollback { ticket, .. } => {
-            rollback_tool_economy(cell.class_c_view(), deps, ticket).await;
-            Ok(ToolSettleOutcome::default())
+        OutletSettleRequest::Rollback { ticket, .. } => {
+            rollback_outlet_economy(cell.class_c_view(), deps, ticket).await;
+            Ok(OutletSettleOutcome::default())
         }
     }
 }
@@ -1367,11 +1367,11 @@ fn invocation_error_to_context(err: InvocationError) -> ContextError {
         InvocationError::ContextNotActive { current_state } => ContextError::PermissionDenied(
             format!("SCP-TOOL-6080: context not active: {current_state}"),
         ),
-        InvocationError::InvokerNotAuthorized { did, tool_id } => ContextError::PermissionDenied(
-            format!("SCP-TOOL-6081: invoker {did} lacks ToolInvoke({tool_id})"),
+        InvocationError::InvokerNotAuthorized { did, outlet_id } => ContextError::PermissionDenied(
+            format!("SCP-TOOL-6081: invoker {did} lacks ToolInvoke({outlet_id})"),
         ),
-        InvocationError::ToolNotFound { tool_id } => {
-            ContextError::PermissionDenied(format!("SCP-TOOL-6082: tool not found: {tool_id}"))
+        InvocationError::OutletNotFound { outlet_id } => {
+            ContextError::PermissionDenied(format!("SCP-TOOL-6082: tool not found: {outlet_id}"))
         }
         InvocationError::InputValidationFailed { message } => ContextError::PermissionDenied(
             format!("SCP-TOOL-6083: input schema validation failed: {message}"),
@@ -1436,11 +1436,11 @@ mod tests {
         assert!(try_consume_hard_rate_limit(cell.class_c_view(), &did, 10));
     }
 
-    fn ticket_with_budget(did: &DID) -> ToolEconomyTicket {
-        ToolEconomyTicket::new_for_test_no_escrow(did.clone())
+    fn ticket_with_budget(did: &DID) -> OutletEconomyTicket {
+        OutletEconomyTicket::new_for_test_no_escrow(did.clone())
     }
 
-    /// `ToolSettleRequest::generation()` reports the reservation's
+    /// `OutletSettleRequest::generation()` reports the reservation's
     /// generation for both variants, and `into_ticket()` hands the inner
     /// ticket back so the orchestrator can reverse it on an unreachable
     /// settle.
@@ -1448,7 +1448,7 @@ mod tests {
     fn settle_request_exposes_generation_and_ticket() {
         let did = test_did();
 
-        let capture = ToolSettleRequest::Capture {
+        let capture = OutletSettleRequest::Capture {
             generation: 42,
             ticket: ticket_with_budget(&did),
         };
@@ -1457,7 +1457,7 @@ mod tests {
         // fire (no escrow ⇒ pure consume).
         capture.into_ticket().consume_abandoning_escrow();
 
-        let rollback = ToolSettleRequest::Rollback {
+        let rollback = OutletSettleRequest::Rollback {
             generation: 7,
             ticket: ticket_with_budget(&did),
         };
@@ -1466,7 +1466,7 @@ mod tests {
     }
 
     /// The unreachable-actor reversal path
-    /// (`ToolEconomyTicket::void_external_and_consume`) must consume the
+    /// (`OutletEconomyTicket::void_external_and_consume`) must consume the
     /// ticket so its `#[must_use]` Drop balance guard does not fire — a
     /// dropped unbalanced ticket would `debug_assert!`-panic. With no
     /// payment adapter there is no external escrow to void, so this is a
@@ -1482,7 +1482,7 @@ mod tests {
     /// ADR-049 §9 (RED-CS3): the tool-settle CAPTURE-FAILURE path must NOT
     /// strand an applied capability suspension on best-effort persistence.
     /// A consequence suspends the invoker in memory BEFORE the fallible payment
-    /// capture; if capture then fails, `settle_tool_economy_capture` returns
+    /// capture; if capture then fails, `settle_outlet_economy_capture` returns
     /// `Err` early — so the suspension obligation is carried on a CALLER-OWNED
     /// `&mut Option<ClassSCommitToken>` token sink (not a returned token the `?`
     /// would strand/drop). This test drives the capture path with a FAILING adapter
@@ -1491,7 +1491,7 @@ mod tests {
     /// suspension is retained in memory. Without the fix (a returned token) the
     /// obligation would be stranded by the `?`.
     #[allow(clippy::unwrap_used, clippy::expect_used, clippy::similar_names)]
-    mod tool_settle_fail_closed {
+    mod outlet_settle_fail_closed {
         use std::sync::Arc;
         use std::time::Duration;
 
@@ -1521,7 +1521,7 @@ mod tests {
         const CTX_BYTE: u8 = 0x7c;
 
         /// A payment adapter whose `capture` ALWAYS fails — the path that drives
-        /// `complete_tool_payment` into its error arm. `verify_authorization`
+        /// `complete_outlet_payment` into its error arm. `verify_authorization`
         /// must succeed first (it runs before capture in `process_paid_action`).
         struct FailingCaptureAdapter;
         impl PaymentAdapter for FailingCaptureAdapter {
@@ -1630,9 +1630,9 @@ mod tests {
 
         /// An escrow-bearing ticket whose capture will run (escrow + policy set),
         /// carrying a budget deduction. Consumed by the capture path.
-        fn escrow_ticket() -> super::super::ToolEconomyTicket {
+        fn escrow_ticket() -> super::super::OutletEconomyTicket {
             let invoker = DID(INVOKER.to_owned());
-            super::super::ToolEconomyTicket::new_for_test_with_escrow(
+            super::super::OutletEconomyTicket::new_for_test_with_escrow(
                 invoker.clone(),
                 PreparedAction {
                     envelope: ActionEnvelope {
@@ -1682,7 +1682,7 @@ mod tests {
                 transport,
                 event_log,
                 key_resolver,
-                Some(Box::new(super::FailToolPersistence)),
+                Some(Box::new(super::FailOutletPersistence)),
                 Some(payment_adapter),
                 None,
                 Some(clock),
@@ -1734,16 +1734,16 @@ mod tests {
         /// the surfaced error reflects the §9 durability failure (over the
         /// capture error) and the suspension is retained in memory.
         #[tokio::test]
-        async fn tool_settle_capture_failure_persists_suspension_fail_closed() {
+        async fn outlet_settle_capture_failure_persists_suspension_fail_closed() {
             let deps = build_deps().await;
             let mut cell = ClassSCell::new(seed_state());
             let ctx_str = hex::encode([CTX_BYTE; 32]);
 
-            let request = super::super::ToolSettleRequest::Capture {
+            let request = super::super::OutletSettleRequest::Capture {
                 generation: cell.generation,
                 ticket: escrow_ticket(),
             };
-            let result = super::super::settle_tool_economy(
+            let result = super::super::settle_outlet_economy(
                 &mut cell,
                 &deps,
                 &ctx_str,
@@ -1778,10 +1778,10 @@ mod tests {
 
     /// Persistence whose `persist_context` ALWAYS fails — drives the tool-settle
     /// fail-closed path. Defined at the `tests` module scope so the nested
-    /// `tool_settle_fail_closed` module can reference it via `super::`.
-    struct FailToolPersistence;
+    /// `outlet_settle_fail_closed` module can reference it via `super::`.
+    struct FailOutletPersistence;
     #[async_trait::async_trait]
-    impl crate::context::persistence::ContextPersistence for FailToolPersistence {
+    impl crate::context::persistence::ContextPersistence for FailOutletPersistence {
         async fn persist_context(
             &self,
             _: &str,

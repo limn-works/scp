@@ -1311,13 +1311,13 @@ pub async fn send_message(
     // `spending_nonce_tracker` — security-critical monotonic state that does
     // NOT survive an actor crash. It MUST be durably persisted (fail-closed)
     // BEFORE this paid send is acknowledged to the caller, exactly as the
-    // structurally-identical TOOL-INVOKE path does in `reserve_tool_economy`.
+    // structurally-identical TOOL-INVOKE path does in `reserve_outlet_economy`.
     // A best-effort (coalesced) persist would let an actor crash in the ≤50ms
     // coalesce window roll the consume back, freshening the spending UCAN's
     // nonce after the caller already saw the send succeed — a replay /
     // double-spend window. `finalize_send` therefore persists fail-closed when
     // a spending nonce was committed for THIS send (mirroring the exact gating
-    // `reserve_tool_economy` uses: `deducted_cost.is_some() &&
+    // `reserve_outlet_economy` uses: `deducted_cost.is_some() &&
     // spending_ucan.is_some()`); on persist failure it returns an error and we
     // REVERSE the economy reservation (budget / velocity / rate-limit) and void
     // the escrow hold below — leaving the consumed nonce CONSUMED (the
@@ -2125,7 +2125,7 @@ fn record_send_participation(
 /// final persist is the token's FAIL-CLOSED `commit`: a persist failure returns
 /// [`ContextError::PersistenceFailed`] so the paid send is NOT acknowledged
 /// while its nonce-consume is unpersisted, exactly mirroring the tool-invoke
-/// path in `reserve_tool_economy`. When `None`, the persist stays best-effort
+/// path in `reserve_outlet_economy`. When `None`, the persist stays best-effort
 /// (Class C) — the common path is not regressed. The token is consumed on EVERY
 /// path `finalize_send` can take (the TTL-expiry arm commits it too — a late TTL
 /// expiry must still persist the burned nonce, keep-direction).
@@ -2651,8 +2651,8 @@ pub fn build_snapshot_from_state(
         freeze: _freeze,
         pending_ceiling_modification: _pending_ceiling_modification,
         pending_economic_policy_change: _pending_economic_policy_change,
-        registered_tools: _registered_tools,
-        tool_interfaces: _tool_interfaces,
+        registered_outlets: _registered_tools,
+        outlet_interfaces: _tool_interfaces,
         pruning_policy: _pruning_policy,
         economic_policy: _economic_policy,
         budget_tracker: _budget_tracker,
@@ -2710,9 +2710,9 @@ pub fn build_snapshot_from_state(
             .copied()
             .collect(),
         ttl_remaining_secs,
-        registered_tools: state.governance.registered_tools.clone(),
+        registered_outlets: state.governance.registered_outlets.clone(),
         read_exclusion_list: state.access.read_exclusion_list.clone(),
-        tool_interfaces: state.governance.tool_interfaces.clone(),
+        outlet_interfaces: state.governance.outlet_interfaces.clone(),
         threshold_signers: state.governance.class_s.threshold_signers.clone(),
         threshold_value: state.governance.class_s.threshold_value,
         pruning_policy: state.governance.pruning_policy.clone(),
@@ -2815,7 +2815,7 @@ pub(in crate::context) fn saga_pending_snapshot(
 /// Build the Class-S snapshot projection of the actor's COMMITTED
 /// cross-context tool-invocation captures (spec §6.2.4 "Exactly-once
 /// execution with durable output capture"; ADR-049 §9). The live
-/// [`CommittedToolInvocation`](crate::context::supervisor::saga_prepared_state::CommittedToolInvocation)
+/// [`CommittedOutletInvocation`](crate::context::supervisor::saga_prepared_state::CommittedOutletInvocation)
 /// carries no §9.4.3 bearer bytes (public receipt + output), so — unlike
 /// [`saga_pending_snapshot`] — the snapshot stores it directly via `Clone`.
 /// Used at every snapshot builder so a crash between Commit-B capture and the
@@ -2825,7 +2825,7 @@ pub(in crate::context) fn xctx_committed_outputs_snapshot(
     state: &PerContextState,
 ) -> std::collections::HashMap<
     crate::context::supervisor::saga_journal::SagaId,
-    crate::context::supervisor::saga_prepared_state::CommittedToolInvocation,
+    crate::context::supervisor::saga_prepared_state::CommittedOutletInvocation,
 > {
     state.class_s.xctx_committed_outputs.clone()
 }
@@ -2878,7 +2878,7 @@ pub(in crate::context) fn xctx_caller_reservations_snapshot(
 /// to a plain `{nonce → first-seen secs}` map via `entries()`. Persisting it at
 /// every snapshot builder makes the replay-protection cache CRASH-SURVIVING: a
 /// restart no longer reopens the 5-minute window for a fresh-`SagaId` replay of
-/// a `CrossContextToolInvoke` (BLACK-624-01). Same-node restore rehydrates it;
+/// a `CrossContextOutletInvoke` (BLACK-624-01). Same-node restore rehydrates it;
 /// cross-node export/import drops it to empty (B's freshness state has no
 /// authority on a foreign node).
 pub(in crate::context) fn xctx_nonce_dedup_snapshot(

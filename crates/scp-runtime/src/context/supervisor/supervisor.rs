@@ -44,7 +44,7 @@ use scp_protocol::context::membership::ContextEvent;
 use crate::context::actor::commands::{
     BroadcastCommand, ContextCommand, EconomyCommand, GovernanceCommand, LifecycleCommand,
     MessagingCommand, PrepareAOutcome, PrepareBOutcome, QueriesCommand, SagaReject,
-    StandingCommand, ToolsCommand, TrustRecoveryCommand, TtlCloseCommand, saga_reject,
+    StandingCommand, OutletsCommand, TrustRecoveryCommand, TtlCloseCommand, saga_reject,
 };
 use crate::context::actor::handle::ContextActorHandle;
 use crate::context::actor::outcome::Outcome;
@@ -56,7 +56,7 @@ use crate::context::supervisor::saga_journal::{
     JournalEntry, SagaId, SagaJournal, SagaState, SagaTerminalState,
 };
 use crate::economy::adapter::PaymentAdapterDyn;
-use scp_protocol::context::tools::cross_context_saga::CrossContextToolReceipt;
+use scp_protocol::context::outlets::cross_context_saga::CrossContextOutletReceipt;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
@@ -72,13 +72,13 @@ pub const ACTOR_MAILBOX_CAPACITY: usize = 256;
 // SagaInput / SagaOutput — plan §"Cross-context saga protocol"
 // ---------------------------------------------------------------------------
 
-/// Construction seal for [`SagaInput::CrossContextToolInvocation`]. A field of
+/// Construction seal for [`SagaInput::CrossContextOutletInvocation`]. A field of
 /// this type makes the variant un-constructible outside this module: the seal's
 /// single field is PRIVATE, so no `CrossContextSagaSeal { .. }` literal is
 /// possible outside `supervisor.rs`, and the only constructor
 /// ([`Self::new`]) is module-private. A cross-context tool invocation can
 /// therefore only be started via
-/// [`Supervisor::start_cross_context_tool_invocation_saga`] — the sole entry
+/// [`Supervisor::start_cross_context_outlet_invocation_saga`] — the sole entry
 /// point that supplies the supervisor-side executor + signing keys. The variant
 /// remains freely pattern-matchable (`{ .. }`) everywhere; only its
 /// construction is sealed.
@@ -92,7 +92,7 @@ pub struct CrossContextSagaSeal(());
 
 impl CrossContextSagaSeal {
     /// Mint the seal. Module-private: only `supervisor.rs` can construct it, so
-    /// only `supervisor.rs` can construct a `CrossContextToolInvocation` input.
+    /// only `supervisor.rs` can construct a `CrossContextOutletInvocation` input.
     const fn new() -> Self {
         Self(())
     }
@@ -186,25 +186,25 @@ impl RestoredContexts {
 /// later is a compile error at every call site — the default branch is
 /// not permitted.
 ///
-/// # Construction of `CrossContextToolInvocation` is sealed
+/// # Construction of `CrossContextOutletInvocation` is sealed
 ///
-/// The `CrossContextToolInvocation` variant carries a private
+/// The `CrossContextOutletInvocation` variant carries a private
 /// [`CrossContextSagaSeal`] guard field, so it CANNOT be constructed outside
 /// this module: an external caller cannot name the seal type to build the
 /// variant. This makes a "construct it, then hand it to the generic
 /// [`Supervisor::start_saga`]" misuse a COMPILE error rather than a runtime
 /// abort — a cross-context tool invocation can only be started through the
-/// dedicated [`Supervisor::start_cross_context_tool_invocation_saga`], which is
+/// dedicated [`Supervisor::start_cross_context_outlet_invocation_saga`], which is
 /// the only entry point that can supply the supervisor-side tool executor and
 /// the target/caller Active Signing Keys the FSM needs (Agent-first API tenet:
 /// a required choice the type system can enforce must not be skippable). The
 /// generic `start_saga` therefore only ever receives a publicly-constructible
 /// input — the executor-less misuse path that aborts in Prepare-A. External
-/// pattern-matching on `CrossContextToolInvocation { .. }` is still allowed;
+/// pattern-matching on `CrossContextOutletInvocation { .. }` is still allowed;
 /// only construction is sealed.
 pub enum SagaInput {
     /// Cross-context tool invocation.
-    CrossContextToolInvocation {
+    CrossContextOutletInvocation {
         /// Calling context.
         caller_context_id: [u8; 32],
         /// Target context that hosts the tool registration being invoked.
@@ -218,7 +218,7 @@ pub enum SagaInput {
         caller_did: DID,
         /// Tool registration to invoke — a context-LOCAL identifier indexing
         /// B's own tool registry.
-        tool_registration_id: String,
+        outlet_registration_id: String,
         /// UCAN proof reference — an INDEX into B's own UCAN store, never the
         /// proof bytes (spec §6.2.4 normative (1)). `None` for an ungated tool.
         ucan_proof_id: Option<String>,
@@ -242,7 +242,7 @@ pub enum SagaInput {
         /// variant cannot be built outside this module because the field's
         /// type is module-private, so the only way to start a cross-context
         /// tool-invocation saga is the dedicated
-        /// [`Supervisor::start_cross_context_tool_invocation_saga`], which
+        /// [`Supervisor::start_cross_context_outlet_invocation_saga`], which
         /// supplies the executor + signing keys the generic `start_saga`
         /// cannot.
         _seal: CrossContextSagaSeal,
@@ -250,9 +250,9 @@ pub enum SagaInput {
     /// Test-only saga whose Prepare phases succeed and whose Commit phase
     /// ALWAYS fails, so the FSM runs all the way to Committing, exhausts the
     /// commit-retry budget, and lands in `NeedsRepair`. The sole production
-    /// saga (`CrossContextToolInvocation`) reaches its real Prepare/Commit
+    /// saga (`CrossContextOutletInvocation`) reaches its real Prepare/Commit
     /// dispatch only via
-    /// [`Supervisor::start_cross_context_tool_invocation_saga`]; driven through
+    /// [`Supervisor::start_cross_context_outlet_invocation_saga`]; driven through
     /// the generic `start_saga`, an executor-less input aborts at Prepare-A
     /// with `InvalidState` (no executor) and never reaches Committing. So this
     /// variant remains the ONLY way to drive `start_saga` to a real
@@ -269,7 +269,7 @@ pub enum SagaInput {
 
 #[cfg(any(test, feature = "testing"))]
 impl SagaInput {
-    /// Test-only constructor for a `CrossContextToolInvocation` input whose only
+    /// Test-only constructor for a `CrossContextOutletInvocation` input whose only
     /// load-bearing fields are the `{caller, target}` participant context set
     /// (every other field is a fixed placeholder). It exists so the
     /// per-participant-context-set GATING tests — which drive a cross-context
@@ -278,18 +278,18 @@ impl SagaInput {
     /// variant the production seal otherwise forbids. It is gated behind
     /// `test`/`testing` so no production FFI build can reach it: a production
     /// cross-context saga is started ONLY via
-    /// [`Supervisor::start_cross_context_tool_invocation_saga`], which supplies
+    /// [`Supervisor::start_cross_context_outlet_invocation_saga`], which supplies
     /// the executor + signing keys.
     #[must_use]
     pub fn test_cross_context_for_gating(
         caller_context_id: [u8; 32],
         target_context_id: [u8; 32],
     ) -> Self {
-        Self::CrossContextToolInvocation {
+        Self::CrossContextOutletInvocation {
             caller_context_id,
             target_context_id,
             caller_did: DID("did:example:caller".to_owned()),
-            tool_registration_id: "tool-1".to_owned(),
+            outlet_registration_id: "tool-1".to_owned(),
             ucan_proof_id: None,
             input: serde_json::json!({}),
             asserted_chain_depth: 0,
@@ -308,12 +308,12 @@ impl SagaInput {
 pub struct SagaOutput {
     /// Durable saga identifier; usable as a handle into the journal.
     pub saga_id: SagaId,
-    /// The target's signed `CrossContextToolReceipt` bytes (JCS), present
-    /// for a committed `CrossContextToolInvocation` saga. `None` for saga
+    /// The target's signed `CrossContextOutletReceipt` bytes (JCS), present
+    /// for a committed `CrossContextOutletInvocation` saga. `None` for saga
     /// inputs that produce no receipt (e.g. the test-only NeedsRepair driver).
     pub receipt: Option<Vec<u8>>,
     /// The captured tool output bytes (the receipt's canonical `output_jcs`),
-    /// present for a committed `CrossContextToolInvocation` saga. The exact
+    /// present for a committed `CrossContextOutletInvocation` saga. The exact
     /// bytes the caller (A) side recorded a hash of. `None` otherwise.
     pub output: Option<Vec<u8>>,
 }
@@ -323,7 +323,7 @@ pub struct SagaOutput {
 /// the `SCP-SAGA-*` taxonomy WITHOUT parsing message strings.
 ///
 /// Returned only by
-/// [`Supervisor::start_cross_context_tool_invocation_saga`]. A `Committed`
+/// [`Supervisor::start_cross_context_outlet_invocation_saga`]. A `Committed`
 /// terminal is the `Ok(SagaOutput)` arm; every NON-committed terminal is one of
 /// these variants, so a bridge's exhaustive `match` is forced to handle every
 /// terminal:
@@ -451,7 +451,7 @@ pub enum SagaAbortReason {
 /// FSM's internal [`ContextError`] (the type the saga FSM and the saga
 /// integration tests depend on) PLUS whether the saga reached `NeedsRepair`, so
 /// the boundary methods can lift it: `start_saga` discards the flag and
-/// propagates the `ContextError`; `start_cross_context_tool_invocation_saga`
+/// propagates the `ContextError`; `start_cross_context_outlet_invocation_saga`
 /// lifts both into the typed [`SagaError`]. Not exposed — the FSM contract stays
 /// `ContextError` internally.
 struct RunSagaError {
@@ -476,7 +476,7 @@ struct RunSagaError {
 ///
 /// Boxed as a trait object so [`Supervisor::run_saga_fsm`] stays
 /// non-generic across saga inputs that have no executor (e.g. the
-/// test-only NeedsRepair driver); only the `CrossContextToolInvocation`
+/// test-only NeedsRepair driver); only the `CrossContextOutletInvocation`
 /// arm consumes it. The future is boxed for the same reason. The closure is
 /// `FnOnce` — it executes the tool exactly once (§6.2.4 "Exactly-once
 /// execution"); a replayed Commit short-circuits before reaching it via
@@ -487,9 +487,9 @@ struct RunSagaError {
 /// means it is never embedded in a [`ContextCommand`] and never run on the
 /// actor task — it runs supervisor-side. The closure itself IS `Send` (it
 /// captures `Send` tool-handler state, exactly like the closures
-/// [`Supervisor::invoke_tool_with_economy`] takes), so the saga future stays
+/// [`Supervisor::invoke_outlet_with_economy`] takes), so the saga future stays
 /// `Send` and the block-until-terminal saga can be driven from a spawned task.
-type SagaToolExecutor<'a> = Box<
+type SagaOutletExecutor<'a> = Box<
     dyn FnOnce(
             serde_json::Value,
         ) -> std::pin::Pin<
@@ -501,7 +501,7 @@ type SagaToolExecutor<'a> = Box<
 /// Shorthand for the cross-context tool-invocation prepared state reconstructed
 /// from a journal entry's evidence (spec §6.2.4 "Crash recovery §17.16.4").
 type XctxPrepared =
-    crate::context::supervisor::saga_prepared_state::CrossContextToolInvocationPrepared;
+    crate::context::supervisor::saga_prepared_state::CrossContextOutletInvocationPrepared;
 
 /// Outcome of a §17.16.4 Commit-in-progress recovery re-drive. The crash
 /// recovery re-drives the idempotent Commit-B and re-acks Commit-A from the
@@ -563,7 +563,7 @@ type DivergenceMarkerPlan = (
 );
 
 /// Per-saga phase-data context threaded through [`Supervisor::run_saga_fsm`]
-/// for a `CrossContextToolInvocation` saga (spec §6.2.4).
+/// for a `CrossContextOutletInvocation` saga (spec §6.2.4).
 ///
 /// The generic FSM (journal, retry, NeedsRepair, abort, gating) stays
 /// data-agnostic; this carrier holds the cross-context-specific inputs the
@@ -595,7 +595,7 @@ struct CrossContextSagaCtx<'a> {
     /// Channel-authenticated caller DID (spec §6.2.4 "Caller authentication").
     caller_did: DID,
     /// Context-local tool registration id (indexes B's registry).
-    tool_registration_id: String,
+    outlet_registration_id: String,
     /// UCAN proof index into B's store (`None` ⇒ ungated tool).
     ucan_proof_id: Option<String>,
     /// Tool input — validated at Prepare-B, executed at Commit-B.
@@ -625,7 +625,7 @@ struct CrossContextSagaCtx<'a> {
     /// signs its OWN marker into its OWN log under its OWN Active Signing Key.
     caller_signing_key: ed25519_dalek::SigningKey,
     /// The supervisor-side tool executor, taken once at Commit-B.
-    executor: Option<SagaToolExecutor<'a>>,
+    executor: Option<SagaOutletExecutor<'a>>,
     /// The captured tool output bytes, stashed the moment the executor runs
     /// ONCE (Commit-B first execute), so a transient Commit-B SETTLE failure is
     /// retryable WITHOUT re-invoking the tool (spec §6.2.4 "Exactly-once
@@ -670,7 +670,7 @@ struct CrossContextSagaCtx<'a> {
 /// carried INSIDE the signed receipt (`receipt`), so it is not duplicated
 /// here — an auditor reads it from the verified receipt.
 struct CommittedSagaArtifacts {
-    /// JCS bytes of the target's signed `CrossContextToolReceipt`.
+    /// JCS bytes of the target's signed `CrossContextOutletReceipt`.
     receipt: Vec<u8>,
     /// The captured tool output bytes (the receipt's canonical `output_jcs`).
     output: Vec<u8>,
@@ -698,7 +698,7 @@ pub struct SagaDivergenceRepairRecord {
     /// marker could not be appended into its own log.
     pub unreachable_context_hex: String,
     /// Which side committed (caller or target).
-    pub committed_side: scp_protocol::context::tools::cross_context_saga::CommittedSide,
+    pub committed_side: scp_protocol::context::outlets::cross_context_saga::CommittedSide,
     /// The committed-side `ToolInvoked` / `CrossContextToolInvoked` event id.
     pub committed_event_id: String,
     /// The 16-byte correlation nonce joining the two event-log records.
@@ -971,7 +971,7 @@ fn spawn_kp_actor_watchdog_task(
 }
 
 /// Flat, named-field request for
-/// [`Supervisor::start_cross_context_tool_invocation_saga`] (spec §6.2.4).
+/// [`Supervisor::start_cross_context_outlet_invocation_saga`] (spec §6.2.4).
 ///
 /// Carries the §6.2.4 invocation envelope field set by **value**. Replaces a
 /// long positional argument list whose adjacent `[u8; 32]` ids
@@ -987,7 +987,7 @@ fn spawn_kp_actor_watchdog_task(
 /// never holds; the executor is a non-`Send` closure), so folding them onto the
 /// wire request would mix envelope fields with capabilities.
 #[derive(Debug, Clone)]
-pub struct CrossContextToolInvocationRequest {
+pub struct CrossContextOutletInvocationRequest {
     /// Raw 32-byte id of the caller (initiating) context.
     pub caller_context_id: [u8; 32],
     /// Raw 32-byte id of the target (executing) context.
@@ -995,7 +995,7 @@ pub struct CrossContextToolInvocationRequest {
     /// Channel-authenticated DID of the initiator.
     pub caller_did: DID,
     /// Registration id of the tool being invoked across the interface.
-    pub tool_registration_id: String,
+    pub outlet_registration_id: String,
     /// Optional id of the spending UCAN proof, resolved target-side at
     /// Prepare-B. `None` for an ungated tool.
     pub ucan_proof_id: Option<String>,
@@ -1089,7 +1089,7 @@ pub struct WelcomeJoinRequest {
 /// adjacent positional `&SigningKey` parameters a swap would compile and stay
 /// self-consistent (verification uses whichever key was supplied), silently
 /// signing each side's divergence marker under the wrong key — the same
-/// confused-deputy footgun the named-field [`CrossContextToolInvocationRequest`]
+/// confused-deputy footgun the named-field [`CrossContextOutletInvocationRequest`]
 /// foreclosed one layer up for the `[u8; 32]` ids. Naming the role at the call
 /// site (`SagaSigningKeys { target: &…, caller: &… }`) makes a swap a visible
 /// field-name error, not a silent miscapture. Per the Agent-first API tenet:
@@ -1097,11 +1097,11 @@ pub struct WelcomeJoinRequest {
 ///
 /// The keys are held by reference (the entry point clones each into the
 /// FSM-carried context); they are capabilities, NOT envelope data, so they stay
-/// off the wire [`CrossContextToolInvocationRequest`].
+/// off the wire [`CrossContextOutletInvocationRequest`].
 #[derive(Debug, Clone, Copy)]
 pub struct SagaSigningKeys<'a> {
     /// The target context's Active Signing Key. Signs the
-    /// [`CrossContextToolReceipt`](scp_protocol::context::tools::cross_context_saga::CrossContextToolReceipt)
+    /// [`CrossContextOutletReceipt`](scp_protocol::context::outlets::cross_context_saga::CrossContextOutletReceipt)
     /// and the TARGET-side divergence marker on a one-sided `NeedsRepair`.
     pub target: &'a ed25519_dalek::SigningKey,
     /// The caller context's Active Signing Key. Signs the CALLER-side divergence
@@ -1346,10 +1346,10 @@ pub struct Supervisor {
     /// the first post-restart `start_saga` can race it.
     ///
     /// REPLAY RESERVATION RECONSTRUCTION — the journal participant record for a
-    /// `CrossContextToolInvocation` (built by [`saga_input_participants`])
+    /// `CrossContextOutletInvocation` (built by [`saga_input_participants`])
     /// deliberately does NOT persist `target_context_id` ("Leave the journal
     /// shape UNCHANGED"): it records only `{caller_context_id, caller_did,
-    /// tool_registration_id}`. But the gating set
+    /// outlet_registration_id}`. But the gating set
     /// ([`saga_participant_context_set`]) is `{caller, target}`. A naïve replay
     /// that rebuilds reservations from the participant record alone could only
     /// re-reserve `{caller}`, NOT `{caller, target}` — leaving the `target`
@@ -1357,7 +1357,7 @@ pub struct Supervisor {
     /// concurrently, defeating the §5.15.4 cross-context serialization for the
     /// recovery window. This gap is CLOSED via **option (a)**: the
     /// `PreparingB` / `Committing` journal entries carry the eight-field
-    /// `CrossContextToolInvocationPrepared` evidence (which embeds BOTH
+    /// `CrossContextOutletInvocationPrepared` evidence (which embeds BOTH
     /// `caller_context_id` AND `target_context_id`), so
     /// [`Self::reconstruct_xctx_prepared`] rebuilds the COMPLETE `{caller,
     /// target}` set from the evidence — see [`Self::xctx_prepared_evidence_bytes`].
@@ -3802,7 +3802,7 @@ impl Supervisor {
             | QueriesCommand::MemberRole { .. }
             | QueriesCommand::ContextParams { .. }
             | QueriesCommand::GetRoleState { .. }
-            | QueriesCommand::HasEstablishedToolInterface { .. }
+            | QueriesCommand::HasEstablishedOutletInterface { .. }
             | QueriesCommand::PendingCommits { .. }
             | QueriesCommand::CommitFault { .. }
             | QueriesCommand::LocalMlsEpoch { .. }
@@ -4911,19 +4911,19 @@ impl Supervisor {
         }
     }
 
-    /// Dispatch a [`ToolsCommand`] to its per-context actor's mailbox
+    /// Dispatch a [`OutletsCommand`] to its per-context actor's mailbox
     /// (ADR-049 commit 11 / plan row 11).
     ///
     /// Covers the hard-rate-limit consume / refund helpers that FFI
     /// bridges call from their tool-dispatch paths. The cross-context
     /// tool-invocation saga (spec §6.2.4) is produced directly by
-    /// [`Supervisor::start_cross_context_tool_invocation_saga`](crate::context::supervisor::Supervisor::start_cross_context_tool_invocation_saga),
+    /// [`Supervisor::start_cross_context_outlet_invocation_saga`](crate::context::supervisor::Supervisor::start_cross_context_outlet_invocation_saga),
     /// not via the actor mailbox: that saga's
     /// [`SagaSigningKeys`]
     /// are borrowed (non-`'static`) `&ed25519_dalek::SigningKey`
     /// references that cannot move into a `'static` mailbox message,
     /// even though its executor is itself `Send + 'static`. Note that
-    /// [`Supervisor::invoke_tool_with_economy`](crate::context::supervisor::Supervisor::invoke_tool_with_economy)
+    /// [`Supervisor::invoke_outlet_with_economy`](crate::context::supervisor::Supervisor::invoke_outlet_with_economy)
     /// is not migrated here for a distinct reason: its generic executor
     /// closure carries no `Send` bound, so it cannot cross the actor
     /// mailbox at all.
@@ -4933,29 +4933,29 @@ impl Supervisor {
     /// - [`ContextError::NotInitialized`] if no
     ///   [`Supervisor`](crate::context::supervisor::Supervisor) has
     ///   been attached yet.
-    pub async fn dispatch_tools_command(
+    pub async fn dispatch_outlets_command(
         &self,
-        cmd: ToolsCommand,
+        cmd: OutletsCommand,
     ) -> Result<Outcome<()>, ContextError> {
         // Try the actor mailbox first. Post-Step-B every valid context
         // has a registered actor, so the per-context tools handlers run
         // on the actor. Reaching the fallback means no actor is
         // registered for the target context — surface a typed
         // `ContextNotRegistered` on the command's reply oneshot.
-        if let Some(actor) = self.lookup(Self::tools_command_context_id(&cmd)) {
-            return Self::dispatch_via_mailbox(&actor, ContextCommand::Tools(cmd)).await;
+        if let Some(actor) = self.lookup(Self::outlets_command_context_id(&cmd)) {
+            return Self::dispatch_via_mailbox(&actor, ContextCommand::Outlets(cmd)).await;
         }
 
-        // No-actor settle backstop: a `SettleToolEconomy` carries an
-        // in-flight `ToolEconomyTicket` (held external payment escrow +
+        // No-actor settle backstop: a `SettleOutletEconomy` carries an
+        // in-flight `OutletEconomyTicket` (held external payment escrow +
         // the `#[must_use]`/Drop balance invariant). The sync
-        // `reply_tools_not_registered` cannot `.await` to void the escrow
+        // `reply_outlets_not_registered` cannot `.await` to void the escrow
         // and would DROP the ticket. The primary defense is the no-actor
-        // pre-check in `settle_tool_economy_via_actor`; this handles the
+        // pre-check in `settle_outlet_economy_via_actor`; this handles the
         // residual TOCTOU where the actor is despawned between that
         // pre-check and here. Reclaim the ticket, void its external
         // escrow, consume it, and reply with the typed error.
-        if let ToolsCommand::SettleToolEconomy {
+        if let OutletsCommand::SettleOutletEconomy {
             context_id,
             request,
             reply,
@@ -4986,15 +4986,15 @@ impl Supervisor {
             return Ok(Outcome::err(sketch));
         }
 
-        Ok(Self::reply_tools_not_registered(cmd))
+        Ok(Self::reply_outlets_not_registered(cmd))
     }
 
-    /// Reply to a [`ToolsCommand`] whose target context has no registered
+    /// Reply to a [`OutletsCommand`] whose target context has no registered
     /// actor with a typed [`ContextError::ContextNotRegistered`] on the
     /// variant's reply oneshot.
-    fn reply_tools_not_registered(cmd: ToolsCommand) -> Outcome<()> {
+    fn reply_outlets_not_registered(cmd: OutletsCommand) -> Outcome<()> {
         match cmd {
-            ToolsCommand::TryConsumeHardRateLimit {
+            OutletsCommand::TryConsumeHardRateLimit {
                 context_id, reply, ..
             } => {
                 let err = ContextError::ContextNotRegistered(context_id);
@@ -5002,7 +5002,7 @@ impl Supervisor {
                 let _ = reply.send(Err(err));
                 Outcome::err(sketch)
             }
-            ToolsCommand::RefundHardRateLimit {
+            OutletsCommand::RefundHardRateLimit {
                 context_id, reply, ..
             } => {
                 let err = ContextError::ContextNotRegistered(context_id);
@@ -5010,7 +5010,7 @@ impl Supervisor {
                 let _ = reply.send(Err(err));
                 Outcome::err(sketch)
             }
-            ToolsCommand::ReserveToolEconomy {
+            OutletsCommand::ReserveOutletEconomy {
                 context_id, reply, ..
             } => {
                 let err = ContextError::ContextNotRegistered(context_id);
@@ -5018,13 +5018,13 @@ impl Supervisor {
                 let _ = reply.send(Err(err));
                 Outcome::err(sketch)
             }
-            ToolsCommand::SettleToolEconomy {
+            OutletsCommand::SettleOutletEconomy {
                 context_id,
                 request,
                 reply,
                 ..
             } => {
-                // Defense-in-depth backstop: `dispatch_tools_command`
+                // Defense-in-depth backstop: `dispatch_outlets_command`
                 // voids the escrow async before reaching this sync path,
                 // so this arm is unreachable for a real settle. If a
                 // future caller does route here, consume the ticket so
@@ -5442,12 +5442,12 @@ impl Supervisor {
     ///
     /// # Sole production saga
     ///
-    /// `CrossContextToolInvocation` is the only production saga — its
+    /// `CrossContextOutletInvocation` is the only production saga — its
     /// end-to-end Prepare/Commit dispatch over the two co-resident participant
     /// actors lands here (spec §6.2.4); drive it via
-    /// [`Self::start_cross_context_tool_invocation_saga`], which supplies the
+    /// [`Self::start_cross_context_outlet_invocation_saga`], which supplies the
     /// supervisor-side tool executor and the target's Active Signing Key.
-    /// Calling `start_saga` directly with a `CrossContextToolInvocation` input
+    /// Calling `start_saga` directly with a `CrossContextOutletInvocation` input
     /// (no executor / signing key) is a misuse: the FSM aborts at Prepare-A with
     /// a typed [`ContextError::InvalidState`] because it has no way to execute
     /// the tool or sign the receipt.
@@ -5462,13 +5462,13 @@ impl Supervisor {
     ///   participant context set overlaps an in-flight saga's reserved set.
     ///   Disjoint sets run concurrently (ADR-049 §3a, spec §5.15.4).
     /// - [`ContextError::InvalidState`] on the executor-less
-    ///   `CrossContextToolInvocation` misuse path, or on journal I/O failure.
+    ///   `CrossContextOutletInvocation` misuse path, or on journal I/O failure.
     pub async fn start_saga(&self, input: SagaInput) -> Result<SagaOutput, ContextError> {
         // Per-participant-context-set reservation (ADR-049 §3a, spec §5.15.4):
         // acquire the gating reservation HERE on the start path (the gate
         // requires the reserve call to live in `start_saga`'s body), then drive
         // the FSM under it. No executor / signing key: the generic entry point
-        // cannot drive a `CrossContextToolInvocation` Commit (it has no way to
+        // cannot drive a `CrossContextOutletInvocation` Commit (it has no way to
         // run the tool or sign the receipt) — the cross-context arm's prepare
         // dispatch aborts with a typed error.
         let context_set = saga_participant_context_set(&input);
@@ -5496,7 +5496,7 @@ impl Supervisor {
     ///
     /// `signing_keys` carries the two Active Signing Keys named by role
     /// ([`SagaSigningKeys`]): `target` signs the
-    /// [`CrossContextToolReceipt`](scp_protocol::context::tools::cross_context_saga::CrossContextToolReceipt)
+    /// [`CrossContextOutletReceipt`](scp_protocol::context::outlets::cross_context_saga::CrossContextOutletReceipt)
     /// and the TARGET-side divergence marker on a one-sided `NeedsRepair`;
     /// `caller` signs the CALLER-side divergence marker on `NeedsRepair`. Each
     /// side signs its own marker into its own log. The named fields make a
@@ -5524,8 +5524,8 @@ impl Supervisor {
     ///    cannot name (and thereby reserve / deny) a caller context it does not
     ///    belong to.
     /// 2. **Target axis.** The caller context is verified to hold a
-    ///    bidirectionally-approved `ToolInterface` to `target_context_id` for
-    ///    `tool_registration_id` (the §6.2.0.1 standing consent the §6.2.4
+    ///    bidirectionally-approved `OutletInterface` to `target_context_id` for
+    ///    `outlet_registration_id` (the §6.2.0.1 standing consent the §6.2.4
     ///    invocation rides — §6.2.4 does NOT create the interface). Without this,
     ///    a caller who is a member of its OWN context could name an arbitrary
     ///    victim `target_context_id` and reserve the victim's saga slot before
@@ -5569,7 +5569,7 @@ impl Supervisor {
     ///
     /// - [`SagaError::Aborted`] on any Prepare-phase abort — the initiator
     ///   is not a member of `caller_context_id`, no established interface to
-    ///   `target_context_id` exists for `tool_registration_id`, a participant
+    ///   `target_context_id` exists for `outlet_registration_id`, a participant
     ///   actor is not co-resident, a participant actor is unavailable to
     ///   complete the Prepare exchange, or any §6.2.4 authorization / freshness
     ///   / rate-limit check rejects. The structured [`SagaAbortReason`]
@@ -5584,9 +5584,9 @@ impl Supervisor {
     ///   repair).
     /// - [`SagaError::Busy`] on a participant-context-set overlap with an
     ///   in-flight saga (spec §5.15.4).
-    pub async fn start_cross_context_tool_invocation_saga<F, Fut>(
+    pub async fn start_cross_context_outlet_invocation_saga<F, Fut>(
         &self,
-        request: CrossContextToolInvocationRequest,
+        request: CrossContextOutletInvocationRequest,
         signing_keys: SagaSigningKeys<'_>,
         executor: F,
     ) -> Result<SagaOutput, SagaError>
@@ -5594,11 +5594,11 @@ impl Supervisor {
         F: FnOnce(serde_json::Value) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'static,
     {
-        let CrossContextToolInvocationRequest {
+        let CrossContextOutletInvocationRequest {
             caller_context_id,
             target_context_id,
             caller_did,
-            tool_registration_id,
+            outlet_registration_id,
             ucan_proof_id,
             input,
             asserted_chain_depth,
@@ -5635,7 +5635,7 @@ impl Supervisor {
         // WITHOUT reserving so the wedge is foreclosed.
         let target_hex = hex::encode(target_context_id);
         if !self
-            .has_established_tool_interface(&caller_hex, &target_hex, &tool_registration_id)
+            .has_established_outlet_interface(&caller_hex, &target_hex, &outlet_registration_id)
             .await
         {
             // Target-axis authorize-before-reserve rejection ⇒ `Aborted`
@@ -5647,7 +5647,7 @@ impl Supervisor {
                 message: format!(
                     "cross-context saga from caller context '{caller_hex}' to target context \
                      '{target_hex}' has no established interface for tool \
-                     '{tool_registration_id}' — not authorized to invoke (and not authorized to \
+                     '{outlet_registration_id}' — not authorized to invoke (and not authorized to \
                      reserve the target's saga slot)"
                 ),
             });
@@ -5669,14 +5669,14 @@ impl Supervisor {
 
         // Box the executor into the non-generic FSM-carried trait object. The
         // closure runs supervisor-side at Commit-B (off the actor mailbox).
-        let boxed_executor: SagaToolExecutor<'_> =
+        let boxed_executor: SagaOutletExecutor<'_> =
             Box::new(move |v: serde_json::Value| Box::pin(executor(v)) as _);
 
         let ctx = CrossContextSagaCtx {
             caller_context_id,
             target_context_id,
             caller_did: caller_did.clone(),
-            tool_registration_id: tool_registration_id.clone(),
+            outlet_registration_id: outlet_registration_id.clone(),
             ucan_proof_id: ucan_proof_id.clone(),
             input: input.clone(),
             asserted_chain_depth,
@@ -5694,11 +5694,11 @@ impl Supervisor {
             reached_needs_repair: false,
         };
 
-        let saga_input = SagaInput::CrossContextToolInvocation {
+        let saga_input = SagaInput::CrossContextOutletInvocation {
             caller_context_id,
             target_context_id,
             caller_did,
-            tool_registration_id,
+            outlet_registration_id,
             ucan_proof_id,
             input,
             asserted_chain_depth,
@@ -5746,7 +5746,7 @@ impl Supervisor {
     ///   STRUCTURALLY off the variant as an `Option`: `Some(ms)` is the
     ///   §6.2.0.2 sliding-window's computed back-off; `None` means the limiter
     ///   has no precise back-off instant (the token-bucket hard limit — which
-    ///   the Prepare-A `reserve_tool_economy` path DOES reach as a saga abort)
+    ///   the Prepare-A `reserve_outlet_economy` path DOES reach as a saga abort)
     ///   and the caller should apply its own conservative back-off. The `None`
     ///   is propagated, never coerced to `0` (a `0` would read as "retry
     ///   immediately" and re-trip the same hard limit). A Prepare-phase
@@ -5804,9 +5804,9 @@ impl Supervisor {
     /// identical).
     ///
     /// * `reached_needs_repair == true` — HOLD the escrow reserved for operator
-    ///   repair. The [`ToolEconomyReservation`]'s `#[must_use]` drop guard would
+    ///   repair. The [`OutletEconomyReservation`]'s `#[must_use]` drop guard would
     ///   normally fire on an unbalanced drop, so
-    ///   [`hold_external_for_repair`](crate::context::tools_helpers::ToolEconomyTicket::hold_external_for_repair)
+    ///   [`hold_external_for_repair`](crate::context::outlets_helpers::OutletEconomyTicket::hold_external_for_repair)
     ///   marks the carrier consumed WITHOUT voiding the external escrow (the
     ///   operation may have partially committed — B executed and charged — so
     ///   auto-voiding here would be a free-execution exploit).
@@ -5821,7 +5821,7 @@ impl Supervisor {
     ) {
         if reached_needs_repair {
             // Leave the reservation HELD for operator repair. The
-            // `ToolEconomyReservation`'s `#[must_use]` drop guard would
+            // `OutletEconomyReservation`'s `#[must_use]` drop guard would
             // normally fire on an unbalanced drop, so settle it as a
             // divergence-held escrow that defers to operator repair rather
             // than releasing or consuming it.
@@ -5855,9 +5855,9 @@ impl Supervisor {
     /// and released on EVERY terminal (Committed / Aborted / NeedsRepair) AND on
     /// a panic-unwind through `run_saga_fsm`, so a stuck saga never wedges
     /// unrelated, disjoint sagas. `xctx` carries the cross-context executor +
-    /// phase-data when the saga is a wired `CrossContextToolInvocation`; it is
+    /// phase-data when the saga is a wired `CrossContextOutletInvocation`; it is
     /// `None` for the executor-less test inputs (the `TestForceNeedsRepair`
-    /// variant, or a `CrossContextToolInvocation` driven through the generic
+    /// variant, or a `CrossContextOutletInvocation` driven through the generic
     /// `start_saga` without an executor).
     async fn run_saga(
         &self,
@@ -5912,7 +5912,7 @@ impl Supervisor {
 
         // Whether the FSM drove the saga to `NeedsRepair` (commit-retry
         // exhaustion) — read BEFORE `xctx` is consumed below. The public
-        // boundary lift ([`Self::start_cross_context_tool_invocation_saga`])
+        // boundary lift ([`Self::start_cross_context_outlet_invocation_saga`])
         // reads this to distinguish a `NeedsRepair` terminal (carrying the
         // `saga_id`) from a plain `Aborted` on the FSM error path. `false` for
         // the generic / test inputs that carry no `xctx`.
@@ -6045,7 +6045,7 @@ impl Supervisor {
     /// (`hex::encode(derive_standing_context_digest(..))`), NOT the
     /// `"standing-"`-prefixed actor-registry id. Lets a gating overlap test
     /// feed an arbitrary deterministic `[u8; 32]` context key into a
-    /// `CrossContextToolInvocation` saga's context field, proving overlap
+    /// `CrossContextOutletInvocation` saga's context field, proving overlap
     /// detection is pure set-membership (ADR-049 §3a, spec §5.15.4 / §5.15.8).
     #[cfg(any(test, feature = "testing"))]
     #[must_use]
@@ -6321,7 +6321,7 @@ impl Supervisor {
         // entry names a caller context in `participants[0]` — i.e. it is a
         // real cross-context entry (per `saga_input_participants`, an xctx
         // entry is the triple `[hex(caller_context_id), caller_did,
-        // tool_registration_id]`: length 3 with a 64-hex first element).
+        // outlet_registration_id]`: length 3 with a 64-hex first element).
         // This identity is carried by the PLAINTEXT participant record,
         // INDEPENDENT of the (separately-serialized) evidence blob, so it
         // survives an evidence that is corrupt / truncated / unparseable.
@@ -6556,7 +6556,7 @@ impl Supervisor {
     /// journal entry's `evidence` (spec §6.2.4 "Crash recovery §17.16.4").
     ///
     /// The evidence is the `MessagePack` of the eight-field
-    /// [`CrossContextToolInvocationPrepared`](crate::context::supervisor::saga_prepared_state::CrossContextToolInvocationPrepared)
+    /// [`CrossContextOutletInvocationPrepared`](crate::context::supervisor::saga_prepared_state::CrossContextOutletInvocationPrepared)
     /// wire — carrying BOTH the `caller_context_id` AND the `target_context_id`
     /// (option (a) — closing the [`saga_input_participants`] caller-only gap) plus
     /// the staged provenance. Decoding it yields the FULL `{caller, target}`
@@ -6564,23 +6564,23 @@ impl Supervisor {
     /// Returns `None` if the entry is not a cross-context saga (its evidence
     /// does not decode), e.g. a test entry.
     fn reconstruct_xctx_prepared(entry: &JournalEntry) -> Option<XctxPrepared> {
-        use crate::context::supervisor::saga_prepared_state::CrossContextToolInvocationPrepared;
+        use crate::context::supervisor::saga_prepared_state::CrossContextOutletInvocationPrepared;
         if entry.evidence.is_empty() {
             return None;
         }
-        CrossContextToolInvocationPrepared::from_evidence_bytes(entry.evidence.as_slice()).ok()
+        CrossContextOutletInvocationPrepared::from_evidence_bytes(entry.evidence.as_slice()).ok()
     }
 
     /// Returns the caller context id (raw-digest hex) named in a journal
     /// entry's PLAINTEXT participant record iff the entry is a cross-context
     /// tool-invocation saga, else `None`.
     ///
-    /// Per [`saga_input_participants`], a `CrossContextToolInvocation` entry's
+    /// Per [`saga_input_participants`], a `CrossContextOutletInvocation` entry's
     /// participants are exactly the triple
-    /// `[hex(caller_context_id), caller_did, tool_registration_id]` — length 3
+    /// `[hex(caller_context_id), caller_did, outlet_registration_id]` — length 3
     /// with a 64-char lowercase-hex first element (the caller's raw-digest
     /// context id, the canonical `lookup` / persistence key).
-    /// `CrossContextToolInvocation` is the only multi-context saga; the sole
+    /// `CrossContextOutletInvocation` is the only multi-context saga; the sole
     /// other input (`TestForceNeedsRepair`) records a single-element set.
     ///
     /// This is used ONLY on a `PreparingA` or `PreparingB` entry whose evidence
@@ -6800,7 +6800,7 @@ impl Supervisor {
         prepared: &XctxPrepared,
     ) -> CommitInProgressResolution {
         use crate::context::actor::commands::SagaPhaseMessage;
-        use scp_protocol::context::tools::cross_context_saga::CommittedSide;
+        use scp_protocol::context::outlets::cross_context_saga::CommittedSide;
         let caller_hex = hex::encode(prepared.caller_context_id);
         // This fn is only reached after Commit-B re-emitted `AlreadyCommitted` —
         // the TARGET side has durably committed `ToolInvoked`. Every arm below
@@ -6955,7 +6955,7 @@ impl Supervisor {
     /// The FSM is saga-type-agnostic — it owns the journal write-ordering,
     /// phase transitions, commit-retry/back-off, `NeedsRepair` accounting, and
     /// abort sequencing. `xctx` threads the per-phase data hand-off for a
-    /// `CrossContextToolInvocation` saga (spec §6.2.4): Prepare-A's reservation,
+    /// `CrossContextOutletInvocation` saga (spec §6.2.4): Prepare-A's reservation,
     /// Prepare-B's recorded provenance, and Commit-B's captured receipt/output
     /// flow A→B→Commit through it. `None` for the executor-less test inputs.
     async fn run_saga_fsm(
@@ -6977,7 +6977,7 @@ impl Supervisor {
 
         // 2. PreparingA — dispatch to the caller actor (a wired
         //    cross-context saga), succeed trivially (the `TestForceNeedsRepair`
-        //    test variant), or fail `InvalidState` (a `CrossContextToolInvocation`
+        //    test variant), or fail `InvalidState` (a `CrossContextOutletInvocation`
         //    driven through `start_saga` without an executor). On failure the
         //    FSM transitions
         //    directly to Aborted, releasing any side that prepared, and
@@ -7003,7 +7003,7 @@ impl Supervisor {
 
         // 3. PreparingB — journal the FULL `{caller, target}` evidence (option
         //    (a) from the `reserved_saga_contexts` field doc): the
-        //    `CrossContextToolInvocationPrepared` wire carries BOTH context ids,
+        //    `CrossContextOutletInvocationPrepared` wire carries BOTH context ids,
         //    so a crash-recovery replay can rebuild the complete participant set
         //    + the staged provenance (spec §6.2.4 "Crash recovery §17.16.4").
         //    `saga_input_participants` deliberately omits `target_context_id`
@@ -7042,7 +7042,7 @@ impl Supervisor {
         //    Re-journal the evidence now that Prepare-B has recorded B's
         //    authoritative provenance (clock / nonce / re-derived depth): a
         //    Commit-in-progress crash-recovery replay (§17.16.4) reconstructs
-        //    the staged `CrossContextToolInvocationPrepared` from THIS evidence
+        //    the staged `CrossContextOutletInvocationPrepared` from THIS evidence
         //    to re-drive the idempotent Commit.
         let committing_evidence = xctx
             .as_deref()
@@ -7150,7 +7150,7 @@ impl Supervisor {
     /// ([ADR-049](crate) §7; a timeout maps to
     /// [`ContextError::TransportTimeout`]).
     ///
-    /// For `CrossContextToolInvocation` the FSM routes the per-phase message to
+    /// For `CrossContextOutletInvocation` the FSM routes the per-phase message to
     /// the co-resident participant actor and threads the reply into `xctx`:
     /// Prepare-A → caller actor → hold `PreparedAFields`; Prepare-B → target
     /// actor → hold `PreparedBFields`. A missing executor context for a
@@ -7167,15 +7167,15 @@ impl Supervisor {
 
         let dispatch_fut = async {
             match input {
-                SagaInput::CrossContextToolInvocation { .. } => {
+                SagaInput::CrossContextOutletInvocation { .. } => {
                     let Some(ctx) = xctx else {
                         // Supervisor-axis reject (code known locally): 13051.
                         return Err(saga_reject!(
                             13051,
                             InvalidState,
-                            "saga Prepare{:?} — CrossContextToolInvocation requires the \
+                            "saga Prepare{:?} — CrossContextOutletInvocation requires the \
                              supervisor-side executor + signing key; call \
-                             start_cross_context_tool_invocation_saga, not start_saga",
+                             start_cross_context_outlet_invocation_saga, not start_saga",
                             phase
                         ));
                     };
@@ -7228,7 +7228,7 @@ impl Supervisor {
         let saga_id = saga_id.clone();
         let caller_context_id = ctx.caller_context_id;
         let caller_did = ctx.caller_did.clone();
-        let tool_registration_id = ctx.tool_registration_id.clone();
+        let outlet_registration_id = ctx.outlet_registration_id.clone();
 
         // The mailbox `send` reply is `Result<PrepareAOutcome, ContextError>`: a
         // dropped receiver / mailbox failure auto-wraps codeless via `From`; a
@@ -7240,7 +7240,7 @@ impl Supervisor {
                     saga_id,
                     caller_context_id,
                     caller_did,
-                    tool_registration_id,
+                    outlet_registration_id,
                     reply,
                 })
             })
@@ -7280,7 +7280,7 @@ impl Supervisor {
         let caller_context_id = ctx.caller_context_id;
         let target_context_id = ctx.target_context_id;
         let caller_did = ctx.caller_did.clone();
-        let tool_registration_id = ctx.tool_registration_id.clone();
+        let outlet_registration_id = ctx.outlet_registration_id.clone();
         let ucan_proof_id = ctx.ucan_proof_id.clone();
         let input = ctx.input.clone();
         let asserted_chain_depth = ctx.asserted_chain_depth;
@@ -7298,7 +7298,7 @@ impl Supervisor {
                     caller_context_id,
                     target_context_id,
                     caller_did,
-                    tool_registration_id,
+                    outlet_registration_id,
                     ucan_proof_id,
                     input,
                     asserted_chain_depth,
@@ -7321,7 +7321,7 @@ impl Supervisor {
     /// Commit with 3x retry: 500ms, 1s, 2s. Returns the final error after
     /// retries are exhausted (→ `NeedsRepair`). The `TestForceNeedsRepair`
     /// variant always fails (driving the retry-exhaustion path); a wired
-    /// `CrossContextToolInvocation` runs the real two-side Commit.
+    /// `CrossContextOutletInvocation` runs the real two-side Commit.
     async fn commit_with_retry(
         &self,
         saga_id: &SagaId,
@@ -7363,7 +7363,7 @@ impl Supervisor {
 
     /// Dispatch the Commit phase under the 30s per-attempt timeout.
     ///
-    /// For a wired `CrossContextToolInvocation` this drives the §6.2.4 Commit:
+    /// For a wired `CrossContextOutletInvocation` this drives the §6.2.4 Commit:
     /// Commit-B reserve → run the executor supervisor-side → Commit-B settle →
     /// Commit-A, ordered B then A. `TestForceNeedsRepair` always fails.
     async fn dispatch_commit_phase(
@@ -7376,10 +7376,10 @@ impl Supervisor {
 
         let dispatch_fut = async {
             match input {
-                SagaInput::CrossContextToolInvocation { .. } => {
+                SagaInput::CrossContextOutletInvocation { .. } => {
                     let Some(ctx) = xctx else {
                         return Err(ContextError::InvalidState(
-                            "SCP-SAGA-13054: saga Commit — CrossContextToolInvocation requires \
+                            "SCP-SAGA-13054: saga Commit — CrossContextOutletInvocation requires \
                              the supervisor-side executor context (start_saga misuse)"
                                 .to_owned(),
                         ));
@@ -7457,7 +7457,7 @@ impl Supervisor {
         Ok(())
     }
 
-    /// Verify B's signed [`CrossContextToolReceipt`] against the Active Signing
+    /// Verify B's signed [`CrossContextOutletReceipt`] against the Active Signing
     /// Key authorized for `target_context_id` (spec §6.2.4 "Signer
     /// authorization", normative MUST) and return the parsed receipt for the
     /// Commit-A binding.
@@ -7472,12 +7472,12 @@ impl Supervisor {
         saga_id: &SagaId,
         ctx: &CrossContextSagaCtx<'_>,
         receipt_bytes: &[u8],
-    ) -> Result<CrossContextToolReceipt, ContextError> {
-        let receipt: CrossContextToolReceipt =
+    ) -> Result<CrossContextOutletReceipt, ContextError> {
+        let receipt: CrossContextOutletReceipt =
             serde_json::from_slice(receipt_bytes).map_err(|e| {
                 ContextError::CryptoFailed(format!(
                     "SCP-SAGA-13063: cross-context saga Commit — target receipt for saga '{}' \
-                     is not a decodable CrossContextToolReceipt: {e}",
+                     is not a decodable CrossContextOutletReceipt: {e}",
                     saga_id.0
                 ))
             })?;
@@ -7522,16 +7522,16 @@ impl Supervisor {
 
         match reserve {
             // Replay: the tool already executed; re-use the stored capture. The
-            // `tool_invoked_event_id` is carried inside the signed receipt; we
+            // `outlet_invoked_event_id` is carried inside the signed receipt; we
             // ALSO record it in `ctx` so a subsequent Commit-A failure → NeedsRepair
             // knows the TARGET committed and which event id its
             // `CrossContextDivergenceMarker` must name (spec §6.2.4).
             CommitBReserveOutcome::AlreadyCommitted {
                 receipt,
                 output_bytes,
-                tool_invoked_event_id,
+                outlet_invoked_event_id,
             } => {
-                ctx.committed_b_tool_invoked_event_id = Some(tool_invoked_event_id);
+                ctx.committed_b_tool_invoked_event_id = Some(outlet_invoked_event_id);
                 Ok((receipt, output_bytes))
             }
             // First execution: run the executor supervisor-side, then settle.
@@ -7611,7 +7611,7 @@ impl Supervisor {
         let CommitBSettleOutcome {
             receipt,
             output_bytes,
-            tool_invoked_event_id,
+            outlet_invoked_event_id,
         } = target
             .send(move |reply| {
                 ContextCommand::SagaPhase(SagaPhaseMessage::CommitBSettle {
@@ -7625,7 +7625,7 @@ impl Supervisor {
         // Commit-B has landed durably: record the target's `ToolInvoked` event
         // id so a later Commit-A failure → NeedsRepair knows the TARGET side
         // committed and which event id the divergence marker must name.
-        ctx.committed_b_tool_invoked_event_id = Some(tool_invoked_event_id);
+        ctx.committed_b_tool_invoked_event_id = Some(outlet_invoked_event_id);
         Ok((receipt, output_bytes))
     }
 
@@ -7636,7 +7636,7 @@ impl Supervisor {
     /// Ticket-safe + witness-driven re-drive (review wave-1):
     ///
     /// - **Held reservation present** — the normal path. The `#[must_use]`
-    ///   reservation (holding the `ToolEconomyTicket` whose `Drop` debug-asserts
+    ///   reservation (holding the `OutletEconomyTicket` whose `Drop` debug-asserts
     ///   on an unbalanced drop) is sent via [`ContextActorHandle::send_recover_on_failure`].
     ///   If the mailbox SEND itself fails (the actor died between `lookup` and
     ///   send, or the mailbox stayed full for the 30s `SEND_TIMEOUT`), the
@@ -7664,7 +7664,7 @@ impl Supervisor {
         saga_id: &SagaId,
         ctx: &mut CrossContextSagaCtx<'_>,
         receipt_bytes: &[u8],
-        receipt: &CrossContextToolReceipt,
+        receipt: &CrossContextOutletReceipt,
     ) -> Result<(), ContextError> {
         use crate::context::actor::commands::SagaPhaseMessage;
 
@@ -7861,7 +7861,7 @@ impl Supervisor {
     /// for operator repair) and `prepared_a` is intentionally left untouched.
     async fn emit_divergence_markers(&self, saga_id: &SagaId, plan: DivergenceMarkerPlan) {
         use crate::context::actor::commands::SagaPhaseMessage;
-        use scp_protocol::context::tools::cross_context_saga::CommittedSide;
+        use scp_protocol::context::outlets::cross_context_saga::CommittedSide;
 
         // The OWNED plan was extracted by the SYNC [`Self::divergence_marker_plan`]
         // at the (sync) FSM call site — NO `&CrossContextSagaCtx` borrow spans the
@@ -8031,7 +8031,7 @@ impl Supervisor {
         &self,
         saga_id: &SagaId,
         unreachable_context_hex: &str,
-        committed_side: scp_protocol::context::tools::cross_context_saga::CommittedSide,
+        committed_side: scp_protocol::context::outlets::cross_context_saga::CommittedSide,
         committed_event_id: &str,
         nonce: [u8; 16],
     ) {
@@ -8104,7 +8104,7 @@ impl Supervisor {
 
     /// Build the journal `evidence` bytes for a cross-context tool-invocation
     /// saga — the `MessagePack` of the eight-field
-    /// [`CrossContextToolInvocationPrepared`](crate::context::supervisor::saga_prepared_state::CrossContextToolInvocationPrepared)
+    /// [`CrossContextOutletInvocationPrepared`](crate::context::supervisor::saga_prepared_state::CrossContextOutletInvocationPrepared)
     /// wire (spec §6.2.4 "Public-metadata journaling"). Carries BOTH the caller
     /// AND target context ids (option (a) — closing the
     /// [`saga_input_participants`] caller-only gap) plus the staged provenance,
@@ -8115,15 +8115,15 @@ impl Supervisor {
     /// (`ctx.prepared_b`); before that, the caller-asserted nonce / depth stand
     /// in (B re-derives them at Prepare-B, and the PreparingB-state replay arm
     /// only ever ABORTS — it never re-drives a Commit, so it does not depend on
-    /// the recorded values). Returns `None` for a non-`CrossContextToolInvocation`
+    /// the recorded values). Returns `None` for a non-`CrossContextOutletInvocation`
     /// input (the test-only `TestForceNeedsRepair` variant carries no `xctx`).
     fn xctx_prepared_evidence_bytes(
         input: &SagaInput,
         ctx: &CrossContextSagaCtx<'_>,
     ) -> Option<Vec<u8>> {
-        use crate::context::supervisor::saga_prepared_state::CrossContextToolInvocationPrepared;
+        use crate::context::supervisor::saga_prepared_state::CrossContextOutletInvocationPrepared;
         // Only the cross-context variant journals prepared evidence.
-        if !matches!(input, SagaInput::CrossContextToolInvocation { .. }) {
+        if !matches!(input, SagaInput::CrossContextOutletInvocation { .. }) {
             return None;
         }
         let (recorded_timestamp_ms, recorded_nonce, recorded_chain_depth) =
@@ -8146,11 +8146,11 @@ impl Supervisor {
                     )
                 },
             );
-        let prepared = CrossContextToolInvocationPrepared {
+        let prepared = CrossContextOutletInvocationPrepared {
             caller_context_id: ctx.caller_context_id,
             target_context_id: ctx.target_context_id,
             caller_did: ctx.caller_did.clone(),
-            tool_registration_id: ctx.tool_registration_id.clone(),
+            outlet_registration_id: ctx.outlet_registration_id.clone(),
             // The wire mirror carries a non-optional `ucan_proof_id`; an ungated
             // tool (no proof) maps to the empty string (round-trips to `None`
             // semantics via an empty proof reference on reconstruction).
@@ -8267,7 +8267,7 @@ impl Supervisor {
     ///   via a `Abort { Some }` so the actor rolls the held escrow + LOCAL
     ///   budget / velocity / hard-rate-limit back (the generation-checked
     ///   carrier rollback). Taking it out of `ctx` ensures the
-    ///   `ToolEconomyTicket` is settled-or-rolled-back exactly once.
+    ///   `OutletEconomyTicket` is settled-or-rolled-back exactly once.
     ///
     ///   If that send FAILS (mailbox full for the full `SEND_TIMEOUT`, or the
     ///   inbox is closed) the carrier never reached the actor, so its
@@ -8332,7 +8332,7 @@ impl Supervisor {
             if let Some(caller) = self.lookup(&caller_hex) {
                 let abort_saga_id = saga_id.clone();
                 // The Abort command carries the `#[must_use]` reservation (whose
-                // `ToolEconomyTicket` debug-asserts on an unbalanced drop). Use
+                // `OutletEconomyTicket` debug-asserts on an unbalanced drop). Use
                 // `send_recover_on_failure` — NOT the plain `send`, which drops
                 // the built command (and its ticket) INSIDE the send on a
                 // full/closed mailbox → a Drop panic under `--features testing`
@@ -8481,7 +8481,7 @@ impl Supervisor {
     /// Best-effort TARGET-side leg of a cross-context-saga abort: send
     /// `Abort { reservation: None }` so the target actor clears its staged
     /// `saga_pending` slot (releasing the session reservation). The target stages
-    /// no `ToolEconomyTicket`, so a failed/undelivered send strands nothing — the
+    /// no `OutletEconomyTicket`, so a failed/undelivered send strands nothing — the
     /// next §17.16.4 crash-recovery sweep clears the slot — hence this never
     /// affects the caller-side reversal verdict. A `lookup` miss is a clean no-op
     /// (the despawned actor's snapshot carries the staged slot for the sweep).
@@ -9650,31 +9650,31 @@ impl Supervisor {
     }
 
     /// Returns `true` iff the caller context `source_context_hex` holds a
-    /// bidirectionally-approved `ToolInterface` to `target_context_hex` for
-    /// `tool_registration_id` (spec §6.2.0.1 standing consent). Routes through
+    /// bidirectionally-approved `OutletInterface` to `target_context_hex` for
+    /// `outlet_registration_id` (spec §6.2.0.1 standing consent). Routes through
     /// the CALLER context's actor mailbox via [`Self::dispatch_query`].
     ///
     /// The query is addressed to the caller context (the initiator is a member
     /// of it, already authorized) and reads that context's own
-    /// `tool_interfaces`, so it is the target-side authorize-before-reserve gate
-    /// for [`Self::start_cross_context_tool_invocation_saga`]: a caller cannot
+    /// `outlet_interfaces`, so it is the target-side authorize-before-reserve gate
+    /// for [`Self::start_cross_context_outlet_invocation_saga`]: a caller cannot
     /// name a victim `target_context_id` it has no established interface with
     /// (spec §6.2.4 "Target-context binding" rides the §6.2.0.1 consent — it
     /// does NOT create it). `false` on an unknown context or no matching
     /// both-approved interface.
     #[must_use]
-    pub async fn has_established_tool_interface(
+    pub async fn has_established_outlet_interface(
         &self,
         source_context_hex: &str,
         target_context_hex: &str,
-        tool_registration_id: &str,
+        outlet_registration_id: &str,
     ) -> bool {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let cmd = QueriesCommand::HasEstablishedToolInterface {
+        let cmd = QueriesCommand::HasEstablishedOutletInterface {
             context_id: source_context_hex.to_owned(),
             source_context_hex: source_context_hex.to_owned(),
             target_context_hex: target_context_hex.to_owned(),
-            tool_registration_id: tool_registration_id.to_owned(),
+            outlet_registration_id: outlet_registration_id.to_owned(),
             reply: tx,
         };
         if self.dispatch_query(cmd).await.is_err() {
@@ -10009,8 +10009,8 @@ impl Supervisor {
     /// Async hard-rate-limit consume routed through the per-context
     /// actor mailbox.
     ///
-    /// Builds a [`ToolsCommand::TryConsumeHardRateLimit`], dispatches it
-    /// through [`Self::dispatch_tools_command`] (which routes to the
+    /// Builds a [`OutletsCommand::TryConsumeHardRateLimit`], dispatches it
+    /// through [`Self::dispatch_outlets_command`] (which routes to the
     /// target context's actor — the actor owns its
     /// [`PerContextState`](crate::context::actor::state::PerContextState)
     /// hard-rate-limit bucket), and awaits the embedded reply oneshot.
@@ -10029,7 +10029,7 @@ impl Supervisor {
         now_secs: u64,
     ) -> bool {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        let cmd = ToolsCommand::TryConsumeHardRateLimit {
+        let cmd = OutletsCommand::TryConsumeHardRateLimit {
             context_id: context_id.to_owned(),
             did: did.clone(),
             now_secs,
@@ -10037,9 +10037,9 @@ impl Supervisor {
         };
         // Dispatch returns the dispatch-level Outcome; the typed answer
         // arrives on `reply_rx`. An unregistered context replies
-        // `Err(ContextNotRegistered)` (see `reply_tools_not_registered`)
+        // `Err(ContextNotRegistered)` (see `reply_outlets_not_registered`)
         // which we fold to the legacy `true` pass-through.
-        if self.dispatch_tools_command(cmd).await.is_err() {
+        if self.dispatch_outlets_command(cmd).await.is_err() {
             return true;
         }
         match reply_rx.await {
@@ -10054,18 +10054,18 @@ impl Supervisor {
     /// unknown-context contract).
     ///
     /// Mirrors [`Self::try_consume_hard_rate_limit`]; builds a
-    /// [`ToolsCommand::RefundHardRateLimit`], dispatches it to the actor,
+    /// [`OutletsCommand::RefundHardRateLimit`], dispatches it to the actor,
     /// and awaits the reply. The reply error (e.g. `ContextNotRegistered`)
     /// is swallowed — a refund against an absent bucket is a no-op, not a
     /// failure the caller can act on.
     pub(crate) async fn refund_hard_rate_limit(&self, context_id: &str, did: &DID) {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        let cmd = ToolsCommand::RefundHardRateLimit {
+        let cmd = OutletsCommand::RefundHardRateLimit {
             context_id: context_id.to_owned(),
             did: did.clone(),
             reply: reply_tx,
         };
-        if self.dispatch_tools_command(cmd).await.is_err() {
+        if self.dispatch_outlets_command(cmd).await.is_err() {
             return;
         }
         let _ = reply_rx.await;
@@ -10079,7 +10079,7 @@ impl Supervisor {
     /// # Sync-shape exception (ADR-049 §7)
     ///
     /// The method signature is `fn`, not `async fn` — FFI callers
-    /// (the MCP `invoke_tool` sync trait method in particular) invoke
+    /// (the MCP `invoke_outlet` sync trait method in particular) invoke
     /// it from outside a tokio task and cannot `.await`. The body
     /// bridges sync → async exactly like
     /// [`Self::shutdown_all_contexts_sync`]: it inspects the ambient
@@ -10115,7 +10115,7 @@ impl Supervisor {
                     // Multi-thread runtime: `block_in_place` is valid;
                     // re-enter the runtime to await the actor reply.
                     RuntimeFlavor::MultiThread => {
-                        // ADR-049 §7 FFI sync rate-limit allowlist — the MCP `invoke_tool`
+                        // ADR-049 §7 FFI sync rate-limit allowlist — the MCP `invoke_outlet`
                         // sync trait method cannot `.await`; the actor-mailbox consume is
                         // awaited on the ambient multi-thread runtime.
                         let fut = self.try_consume_hard_rate_limit(context_id, did, now_secs);
@@ -10161,7 +10161,7 @@ impl Supervisor {
                 use tokio::runtime::RuntimeFlavor;
                 match handle.runtime_flavor() {
                     RuntimeFlavor::MultiThread => {
-                        // ADR-049 §7 FFI sync rate-limit allowlist — the MCP `invoke_tool`
+                        // ADR-049 §7 FFI sync rate-limit allowlist — the MCP `invoke_outlet`
                         // refund path is sync and cannot `.await`; the actor-mailbox refund
                         // is awaited on the ambient multi-thread runtime.
                         let fut = self.refund_hard_rate_limit(context_id, did);
@@ -10228,41 +10228,41 @@ impl Supervisor {
         rx.recv().unwrap_or(false)
     }
 
-    /// Dispatch the Phase-1 [`ToolsCommand::ReserveToolEconomy`] to the
+    /// Dispatch the Phase-1 [`OutletsCommand::ReserveOutletEconomy`] to the
     /// target context's actor and await the `Send` reservation.
     ///
     /// # Errors
     ///
     /// [`ContextError::ContextNotRegistered`] when no actor is registered
     /// for `context_id`; otherwise any error the reserve handler emits.
-    async fn reserve_tool_economy_via_actor(
+    async fn reserve_outlet_economy_via_actor(
         &self,
         context_id: &str,
         invoker_did: &DID,
         spending_ucan: Option<&scp_protocol::crypto::ucan::UcanToken>,
         now_secs: u64,
-    ) -> Result<crate::context::tools_helpers::ToolEconomyReservation, ContextError> {
+    ) -> Result<crate::context::outlets_helpers::OutletEconomyReservation, ContextError> {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        let cmd = ToolsCommand::ReserveToolEconomy {
+        let cmd = OutletsCommand::ReserveOutletEconomy {
             context_id: context_id.to_owned(),
             invoker_did: invoker_did.clone(),
             spending_ucan: spending_ucan.map(|u| Box::new(u.clone())),
             now_secs,
             reply: reply_tx,
         };
-        self.dispatch_tools_command(cmd).await?;
+        self.dispatch_outlets_command(cmd).await?;
         reply_rx
             .await
             .map_err(|_| {
                 ContextError::TransportFailed(
-                    "Supervisor::reserve_tool_economy_via_actor — actor reply channel closed"
+                    "Supervisor::reserve_outlet_economy_via_actor — actor reply channel closed"
                         .to_owned(),
                 )
             })?
             .map(|boxed| *boxed)
     }
 
-    /// Dispatch the Phase-3 [`ToolsCommand::SettleToolEconomy`] to the
+    /// Dispatch the Phase-3 [`OutletsCommand::SettleOutletEconomy`] to the
     /// target context's actor and await the settle outcome.
     ///
     /// # Errors
@@ -10270,19 +10270,19 @@ impl Supervisor {
     /// [`ContextError::ContextNotRegistered`] when no actor is registered
     /// for `context_id`; otherwise any error the settle handler emits
     /// (payment-capture failure).
-    async fn settle_tool_economy_via_actor(
+    async fn settle_outlet_economy_via_actor(
         &self,
         context_id: &str,
         invoker_did: &DID,
-        request: crate::context::tools_helpers::ToolSettleRequest,
-    ) -> Result<crate::context::tools_helpers::ToolSettleOutcome, ContextError> {
+        request: crate::context::outlets_helpers::OutletSettleRequest,
+    ) -> Result<crate::context::outlets_helpers::OutletSettleOutcome, ContextError> {
         // No-actor pre-check: the reserve→execute→settle split runs the
         // executor OFF the actor mailbox, so the owning actor can be
         // despawned (shutdown / node teardown / import replace) during
         // that window. If no actor is registered now, the per-context
         // settle can never run, and routing the command through
-        // `dispatch_tools_command` would hand the ticket to
-        // `reply_tools_not_registered`, which DROPS it — leaking the
+        // `dispatch_outlets_command` would hand the ticket to
+        // `reply_outlets_not_registered`, which DROPS it — leaking the
         // external payment escrow and tripping the ticket's unbalanced-
         // Drop guard. Instead, reclaim the ticket here (supervisor-side,
         // where the payment adapter is reachable), void the external
@@ -10309,16 +10309,16 @@ impl Supervisor {
         }
 
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        let cmd = ToolsCommand::SettleToolEconomy {
+        let cmd = OutletsCommand::SettleOutletEconomy {
             context_id: context_id.to_owned(),
             invoker_did: invoker_did.clone(),
             request: Box::new(request),
             reply: reply_tx,
         };
-        self.dispatch_tools_command(cmd).await?;
+        self.dispatch_outlets_command(cmd).await?;
         reply_rx.await.map_err(|_| {
             ContextError::TransportFailed(
-                "Supervisor::settle_tool_economy_via_actor — actor reply channel closed".to_owned(),
+                "Supervisor::settle_outlet_economy_via_actor — actor reply channel closed".to_owned(),
             )
         })?
     }
@@ -10326,10 +10326,10 @@ impl Supervisor {
     /// Invoke a tool under the full economy pipeline (actor model).
     ///
     /// Orchestrates the three-phase split through
-    /// [`crate::context::tools_helpers::invoke_tool_with_economy`]: the
+    /// [`crate::context::outlets_helpers::invoke_outlet_with_economy`]: the
     /// economy reserve (Phase 1) and settle (Phase 3) run inside the
     /// per-context actor on owned state via the
-    /// [`ToolsCommand::ReserveToolEconomy`] / [`ToolsCommand::SettleToolEconomy`]
+    /// [`OutletsCommand::ReserveOutletEconomy`] / [`OutletsCommand::SettleOutletEconomy`]
     /// mailbox commands; the non-`Send` `executor` closure (Phase 2) runs
     /// here, supervisor-side, BETWEEN the two mailbox round-trips. No
     /// per-context lock is held across the executor — the actor is free
@@ -10341,17 +10341,17 @@ impl Supervisor {
     /// the executor emit (`ContextNotRegistered`, `PermissionDenied`,
     /// `RateLimited`, schema/economy/UCAN failures).
     #[allow(clippy::too_many_arguments)] // matches legacy signature 1:1
-    pub async fn invoke_tool_with_economy<F, Fut>(
+    pub async fn invoke_outlet_with_economy<F, Fut>(
         &self,
         context_id: &str,
-        registry: &scp_protocol::context::tools::registry::ToolRegistry,
-        tool_id: &scp_protocol::context::tools::ToolId,
+        registry: &scp_protocol::context::outlets::registry::OutletRegistry,
+        outlet_id: &scp_protocol::context::outlets::OutletId,
         input: serde_json::Value,
         invoker_did: &DID,
         spending_ucan: Option<&scp_protocol::crypto::ucan::UcanToken>,
         timeout_ms: Option<u32>,
         executor: F,
-    ) -> Result<crate::context::tools_helpers::ManagedToolInvocationOutput, ContextError>
+    ) -> Result<crate::context::outlets_helpers::ManagedOutletInvocationOutput, ContextError>
     where
         F: FnOnce(serde_json::Value) -> Fut,
         Fut: std::future::Future<Output = Result<serde_json::Value, String>>,
@@ -10365,15 +10365,15 @@ impl Supervisor {
             })?
             .now_secs();
 
-        crate::context::tools_helpers::invoke_tool_with_economy(
+        crate::context::outlets_helpers::invoke_outlet_with_economy(
             registry,
-            tool_id,
+            outlet_id,
             input,
             invoker_did,
             timeout_ms,
             // Phase 1 — reserve via the actor mailbox.
             || {
-                self.reserve_tool_economy_via_actor(
+                self.reserve_outlet_economy_via_actor(
                     context_id,
                     invoker_did,
                     spending_ucan,
@@ -10381,7 +10381,7 @@ impl Supervisor {
                 )
             },
             // Phase 3 — settle (capture / rollback) via the actor mailbox.
-            |request| self.settle_tool_economy_via_actor(context_id, invoker_did, request),
+            |request| self.settle_outlet_economy_via_actor(context_id, invoker_did, request),
             executor,
         )
         .await
@@ -10739,7 +10739,7 @@ impl Supervisor {
             let facts = crate::context::invitation_helpers::SnapshotRuntimeFacts {
                 member_count,
                 creator_did: Some(creator_did.clone()),
-                tool_count: Some(u64::try_from(params.tools.len()).unwrap_or(u64::MAX)),
+                outlet_count: Some(u64::try_from(params.tools.len()).unwrap_or(u64::MAX)),
                 ..crate::context::invitation_helpers::SnapshotRuntimeFacts::default()
             };
             let metadata_snapshot =
@@ -12646,13 +12646,13 @@ impl Supervisor {
         }
     }
 
-    /// Extract the target context_id from a [`ToolsCommand`].
-    const fn tools_command_context_id(cmd: &ToolsCommand) -> &str {
+    /// Extract the target context_id from a [`OutletsCommand`].
+    const fn outlets_command_context_id(cmd: &OutletsCommand) -> &str {
         match cmd {
-            ToolsCommand::TryConsumeHardRateLimit { context_id, .. }
-            | ToolsCommand::RefundHardRateLimit { context_id, .. }
-            | ToolsCommand::ReserveToolEconomy { context_id, .. }
-            | ToolsCommand::SettleToolEconomy { context_id, .. } => context_id.as_str(),
+            OutletsCommand::TryConsumeHardRateLimit { context_id, .. }
+            | OutletsCommand::RefundHardRateLimit { context_id, .. }
+            | OutletsCommand::ReserveOutletEconomy { context_id, .. }
+            | OutletsCommand::SettleOutletEconomy { context_id, .. } => context_id.as_str(),
         }
     }
 
@@ -12673,7 +12673,7 @@ impl Supervisor {
             | QueriesCommand::MemberRole { context_id, .. }
             | QueriesCommand::ContextParams { context_id, .. }
             | QueriesCommand::GetRoleState { context_id, .. }
-            | QueriesCommand::HasEstablishedToolInterface { context_id, .. }
+            | QueriesCommand::HasEstablishedOutletInterface { context_id, .. }
             | QueriesCommand::PendingCommits { context_id, .. }
             | QueriesCommand::CommitFault { context_id, .. }
             | QueriesCommand::LocalMlsEpoch { context_id, .. }
@@ -12784,7 +12784,7 @@ enum SagaPhase {
 /// carried separately (via [`SagaState`]).
 fn saga_input_participants(input: &SagaInput) -> Vec<String> {
     match input {
-        SagaInput::CrossContextToolInvocation {
+        SagaInput::CrossContextOutletInvocation {
             caller_context_id,
             // `target_context_id` is part of the gating participant set
             // (see `saga_participant_context_set`), NOT the journal
@@ -12794,12 +12794,12 @@ fn saga_input_participants(input: &SagaInput) -> Vec<String> {
             // ucan_proof_id, asserted freshness/depth, declared_cost) are
             // never journaled — only the caller-side provenance triple is.
             caller_did,
-            tool_registration_id,
+            outlet_registration_id,
             ..
         } => vec![
             hex::encode(caller_context_id),
             caller_did.to_string(),
-            tool_registration_id.clone(),
+            outlet_registration_id.clone(),
         ],
         #[cfg(any(test, feature = "testing"))]
         SagaInput::TestForceNeedsRepair { context_id } => vec![hex::encode(context_id)],
@@ -12836,10 +12836,10 @@ fn saga_input_participants(input: &SagaInput) -> Vec<String> {
 /// concurrently, breaking the §5.15.4 serialization the §5.15.8 anti-griefing
 /// argument depends on).
 ///
-/// - `CrossContextToolInvocation` → `{caller, target}` context ids.
+/// - `CrossContextOutletInvocation` → `{caller, target}` context ids.
 fn saga_participant_context_set(input: &SagaInput) -> Vec<String> {
     let raw: Vec<String> = match input {
-        SagaInput::CrossContextToolInvocation {
+        SagaInput::CrossContextOutletInvocation {
             caller_context_id,
             target_context_id,
             ..
@@ -12878,7 +12878,7 @@ fn saga_participant_context_set(input: &SagaInput) -> Vec<String> {
 /// type) so recovery resolution also overwrites prior on-disk evidence.
 const fn saga_input_is_secret_bearing(input: &SagaInput) -> bool {
     match input {
-        SagaInput::CrossContextToolInvocation { .. } => false,
+        SagaInput::CrossContextOutletInvocation { .. } => false,
         // The test-only NeedsRepair driver carries no bearer material.
         #[cfg(any(test, feature = "testing"))]
         SagaInput::TestForceNeedsRepair { .. } => false,
@@ -12992,7 +12992,7 @@ fn reply_with_soft_default(cmd: QueriesCommand) {
             let _ = reply.send(Ok(None));
         }
         // An unknown caller context holds no established interface.
-        QueriesCommand::HasEstablishedToolInterface { reply, .. } => {
+        QueriesCommand::HasEstablishedOutletInterface { reply, .. } => {
             let _ = reply.send(Ok(false));
         }
         // Legacy `pending_commits` returns an empty `Vec`.
@@ -13379,7 +13379,7 @@ mod tests {
 
     #[tokio::test]
     async fn start_saga_returns_invalid_state_for_executorless_input() {
-        // Driving a `CrossContextToolInvocation` through the generic
+        // Driving a `CrossContextOutletInvocation` through the generic
         // `start_saga` (no supervisor-side executor / signing key) is a
         // misuse — the FSM journals Initiated + PreparingA then fails the
         // Prepare-A dispatch with InvalidState (SCP-SAGA-13051), rolls back
@@ -13872,7 +13872,7 @@ mod tests {
     /// A Phase-3 tool-economy settle that finds NO registered actor for
     /// its context (the actor was despawned during the off-mailbox
     /// executor window) must NOT silently drop the in-flight ticket:
-    /// `settle_tool_economy_via_actor` reclaims the ticket, voids its
+    /// `settle_outlet_economy_via_actor` reclaims the ticket, voids its
     /// external escrow (none here), consumes it so the `#[must_use]` Drop
     /// balance guard does not `debug_assert!`-panic, and returns a typed
     /// `ContextNotRegistered`. Reaching the assertions without a panic
@@ -13883,16 +13883,16 @@ mod tests {
         let invoker = DID("did:example:invoker".to_owned());
 
         // A settle request for a context that has no actor registered.
-        let ticket = crate::context::tools_helpers::ToolEconomyTicket::new_for_test_no_escrow(
+        let ticket = crate::context::outlets_helpers::OutletEconomyTicket::new_for_test_no_escrow(
             invoker.clone(),
         );
-        let request = crate::context::tools_helpers::ToolSettleRequest::Rollback {
+        let request = crate::context::outlets_helpers::OutletSettleRequest::Rollback {
             generation: 1,
             ticket,
         };
 
         let result = supervisor_arc
-            .settle_tool_economy_via_actor("ctx-never-registered", &invoker, request)
+            .settle_outlet_economy_via_actor("ctx-never-registered", &invoker, request)
             .await;
 
         assert!(
@@ -14109,8 +14109,8 @@ mod tests {
             event_log_merkle_root: [0u8; 32],
             executed_proposals: HashSet::new(),
             ttl_remaining_secs: None,
-            registered_tools: Vec::new(),
-            tool_interfaces: Vec::new(),
+            registered_outlets: Vec::new(),
+            outlet_interfaces: Vec::new(),
             threshold_signers: Vec::new(),
             threshold_value: 0,
             pruning_policy: None,
@@ -16678,12 +16678,12 @@ mod tests {
             crate::context::supervisor::saga_journal::SagaId("saga-class-s-xctx".to_owned());
         state.class_s.saga_pending.insert(
             xctx_saga_id.clone(),
-            crate::context::supervisor::saga_prepared_state::SagaPreparedState::CrossContextToolInvocation(
-                crate::context::supervisor::saga_prepared_state::CrossContextToolInvocationPrepared {
+            crate::context::supervisor::saga_prepared_state::SagaPreparedState::CrossContextOutletInvocation(
+                crate::context::supervisor::saga_prepared_state::CrossContextOutletInvocationPrepared {
                     caller_context_id: [0x5Au8; 32],
                     target_context_id: [0x6Bu8; 32],
                     caller_did: DID("did:example:class-s-caller".to_owned()),
-                    tool_registration_id: "class-s-tool-v1".to_owned(),
+                    outlet_registration_id: "class-s-tool-v1".to_owned(),
                     ucan_proof_id: "class-s-ucan-token".to_owned(),
                     recorded_timestamp_ms: 1_700_000_000_456,
                     recorded_nonce: [0xC7u8; 16],
@@ -16700,16 +16700,16 @@ mod tests {
         let committed_saga_id =
             crate::context::supervisor::saga_journal::SagaId("saga-class-s-committed".to_owned());
         let committed_receipt =
-            scp_protocol::context::tools::cross_context_saga::CrossContextToolReceipt::sign(
+            scp_protocol::context::outlets::cross_context_saga::CrossContextOutletReceipt::sign(
                 &ed25519_dalek::SigningKey::from_bytes(&[0x3Cu8; 32]),
-                scp_protocol::context::tools::cross_context_saga::CrossContextToolReceiptFields {
+                scp_protocol::context::outlets::cross_context_saga::CrossContextOutletReceiptFields {
                     caller_context_id: [0x5Au8; 32],
                     target_context_id: [0x6Bu8; 32],
                     caller_did: "did:example:class-s-caller".to_owned(),
                     nonce: [0xC7u8; 16],
-                    tool_registration_id: "class-s-tool-v1".to_owned(),
+                    outlet_registration_id: "class-s-tool-v1".to_owned(),
                     output_jcs: br#"{"result":42}"#.to_vec(),
-                    tool_invoked_event_id: "ToolInvoked:saga-class-s-committed".to_owned(),
+                    outlet_invoked_event_id: "ToolInvoked:saga-class-s-committed".to_owned(),
                     chain_depth: 4,
                     timestamp_ms: 1_700_000_000_456,
                 },
@@ -16717,10 +16717,10 @@ mod tests {
             .expect("Class-S committed receipt signs");
         state.class_s.xctx_committed_outputs.insert(
             committed_saga_id.clone(),
-            crate::context::supervisor::saga_prepared_state::CommittedToolInvocation {
+            crate::context::supervisor::saga_prepared_state::CommittedOutletInvocation {
                 receipt: committed_receipt.clone(),
                 output_bytes: br#"{"result":42}"#.to_vec(),
-                tool_invoked_event_id: "ToolInvoked:saga-class-s-committed".to_owned(),
+                outlet_invoked_event_id: "ToolInvoked:saga-class-s-committed".to_owned(),
             },
         );
         state
@@ -16822,11 +16822,11 @@ mod tests {
         // `SagaPreparedStateSnapshot` is a single-variant enum, so the bind is
         // irrefutable — the round-trip preserving the cross-context variant is
         // guaranteed by construction; here we assert the field-level fidelity.
-        let SagaPreparedStateSnapshot::CrossContextToolInvocation(snap) = xctx_snap;
+        let SagaPreparedStateSnapshot::CrossContextOutletInvocation(snap) = xctx_snap;
         assert_eq!(snap.caller_context_id, [0x5Au8; 32]);
         assert_eq!(snap.target_context_id, [0x6Bu8; 32]);
         assert_eq!(snap.caller_did, "did:example:class-s-caller");
-        assert_eq!(snap.tool_registration_id, "class-s-tool-v1");
+        assert_eq!(snap.outlet_registration_id, "class-s-tool-v1");
         assert_eq!(snap.ucan_proof_id, "class-s-ucan-token");
         assert_eq!(snap.recorded_timestamp_ms, 1_700_000_000_456);
         assert_eq!(snap.recorded_nonce, [0xC7u8; 16]);
@@ -16841,7 +16841,7 @@ mod tests {
             .clone()
             .into_prepared();
         // Single-variant enum: the bind is irrefutable.
-        let SagaPreparedState::CrossContextToolInvocation(p) = rehydrated;
+        let SagaPreparedState::CrossContextOutletInvocation(p) = rehydrated;
         assert_eq!(p.recorded_chain_depth, 4);
         assert_eq!(p.caller_did, DID("did:example:class-s-caller".to_owned()));
 
@@ -16860,7 +16860,7 @@ mod tests {
             "Class S: the signed receipt must round-trip byte-for-byte (replay reproducibility)"
         );
         assert_eq!(
-            restored_committed.tool_invoked_event_id,
+            restored_committed.outlet_invoked_event_id,
             "ToolInvoked:saga-class-s-committed"
         );
         assert_eq!(
@@ -16977,7 +16977,7 @@ mod tests {
 
     /// ADR-049 §9 Class S: a consumed spending-UCAN nonce MUST survive a crash
     /// before any coalesce. The nonce-consume is sync-persisted (fail-closed)
-    /// inside `reserve_tool_economy` BEFORE the reservation is acknowledged; a
+    /// inside `reserve_outlet_economy` BEFORE the reservation is acknowledged; a
     /// respawn that re-opened the consumed nonce would let the spending UCAN be
     /// replayed. Asserted through the persisted snapshot the respawn rehydrates
     /// from (the nonce-tracker entry must be present post-crash).
@@ -17006,7 +17006,7 @@ mod tests {
         // same `(first_seen, token_expiry)` shape `snapshot_entries` persists),
         // with a far-future expiry so the restore-time prune keeps it. This is
         // the post-`commit_spending_ucan_nonce` state. Then sync-persist via the
-        // SAME fail-closed primitive `reserve_tool_economy` calls before reply.
+        // SAME fail-closed primitive `reserve_outlet_economy` calls before reply.
         // Nonce format is `{unix_millis}-{16_byte_hex}` (see `generate_nonce`).
         let consumed_nonce = "1700000000000-0123456789abcdef0123456789abcdef".to_owned();
         let mut seed_entries = std::collections::HashMap::new();
@@ -18326,7 +18326,7 @@ mod tests {
     // two co-resident actors (slice 5: supervisor FSM dispatch).
     //
     // These drive the REAL FSM through
-    // `start_cross_context_tool_invocation_saga` over two actors spawned
+    // `start_cross_context_outlet_invocation_saga` over two actors spawned
     // in ONE supervisor (caller + target), with the supervisor-side tool
     // executor running between Commit-B reserve and settle.
     // -----------------------------------------------------------------
@@ -18536,7 +18536,7 @@ mod tests {
 
     /// Build the CALLER context state: `caller_did` is a member (so the
     /// authorize-before-reserve `is_member` check passes) holding
-    /// `ToolInterface` (so Prepare-A's outbound gate passes). `creator_did` is
+    /// `OutletInterface` (so Prepare-A's outbound gate passes). `creator_did` is
     /// the role-state creator.
     fn xctx_caller_state(
         caller_did: &str,
@@ -18571,11 +18571,11 @@ mod tests {
         // Established (both-approved) outbound interface caller→target for
         // XCTX_TOOL, so the target-axis authorize-before-reserve gate (gate 2)
         // passes. Source/target ids are the hex id-form §6.2.4 stores.
-        st.governance.tool_interfaces.push(
-            scp_protocol::context::tools::interface::ToolInterface {
+        st.governance.outlet_interfaces.push(
+            scp_protocol::context::outlets::interface::OutletInterface {
                 source_context: hex::encode(XCTX_CALLER),
                 target_context: hex::encode(XCTX_TARGET),
-                tool_id: XCTX_TOOL.to_owned(),
+                outlet_id: XCTX_TOOL.to_owned(),
                 rate_limit: None,
                 inbound_rate_limit: None,
                 per_caller_rate_limit: None,
@@ -18589,14 +18589,14 @@ mod tests {
     }
 
     /// Build the TARGET context state: registered `XCTX_TOOL` (2-field schemas,
-    /// passing the specificity floor), `caller_did` granted ToolInterface +
+    /// passing the specificity floor), `caller_did` granted OutletInterface +
     /// ToolInvokeAll, `creator_did` the role-state creator / UCAN root issuer.
     fn xctx_target_state(
         caller_did: &str,
         creator_did: &str,
     ) -> crate::context::actor::state::PerContextState {
         use scp_protocol::context::roles::Capability;
-        use scp_protocol::context::tools::registry::{ToolRegistration, ToolSchema};
+        use scp_protocol::context::outlets::registry::{OutletRegistration, OutletSchema};
         let mut st = crate::context::actor::state::PerContextState::new_for_test_encrypted(
             XCTX_TARGET,
             1_700_000_000,
@@ -18621,11 +18621,11 @@ mod tests {
                 Capability::ToolInvokeAll,
             ]))
             .expect("well-formed built-in ceiling");
-        st.governance.registered_tools.push(ToolRegistration {
-            tool_id: XCTX_TOOL.to_owned(),
+        st.governance.registered_outlets.push(OutletRegistration {
+            outlet_id: XCTX_TOOL.to_owned(),
             name: "Calculator".to_owned(),
             description: "adds".to_owned(),
-            schema: ToolSchema {
+            schema: OutletSchema {
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": { "a": {"type": "number"}, "b": {"type": "number"} }
@@ -18811,12 +18811,12 @@ mod tests {
         caller_did: &str,
         now_ms: u64,
         nonce: [u8; 16],
-    ) -> CrossContextToolInvocationRequest {
-        CrossContextToolInvocationRequest {
+    ) -> CrossContextOutletInvocationRequest {
+        CrossContextOutletInvocationRequest {
             caller_context_id: XCTX_CALLER,
             target_context_id: XCTX_TARGET,
             caller_did: DID(caller_did.to_owned()),
-            tool_registration_id: XCTX_TOOL.to_owned(),
+            outlet_registration_id: XCTX_TOOL.to_owned(),
             ucan_proof_id: None,
             input: serde_json::json!({ "a": 1, "b": 2 }),
             asserted_chain_depth: 2,
@@ -18875,7 +18875,7 @@ mod tests {
         };
         let now_ms = supervisor.clock_ref().expect("clock").now_millis();
         supervisor
-            .start_cross_context_tool_invocation_saga(
+            .start_cross_context_outlet_invocation_saga(
                 xctx_request(caller_did, now_ms, nonce),
                 SagaSigningKeys {
                     target: &target_signing,
@@ -19137,7 +19137,7 @@ mod tests {
         };
         let now_ms = supervisor.clock_ref().expect("clock").now_millis();
         let result = supervisor
-            .start_cross_context_tool_invocation_saga(
+            .start_cross_context_outlet_invocation_saga(
                 xctx_request(caller_did, now_ms, [0x44u8; 16]),
                 SagaSigningKeys {
                     target: &target_signing,
@@ -19307,7 +19307,7 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::too_many_lines)] // full happy-path E2E: drive + receipt + dual-log assertions
     async fn xctx_saga_happy_path_commits_and_executes_once() {
-        use scp_protocol::context::tools::cross_context_saga::CrossContextToolReceipt;
+        use scp_protocol::context::outlets::cross_context_saga::CrossContextOutletReceipt;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         let creator_did = "did:dht:z6MkXctxHappyCreator".to_owned();
@@ -19347,12 +19347,12 @@ mod tests {
         let now_ms = supervisor.clock_ref().expect("clock").now_millis();
         let nonce = [0x42u8; 16];
         let output = supervisor
-            .start_cross_context_tool_invocation_saga(
-                CrossContextToolInvocationRequest {
+            .start_cross_context_outlet_invocation_saga(
+                CrossContextOutletInvocationRequest {
                     caller_context_id: XCTX_CALLER,
                     target_context_id: XCTX_TARGET,
                     caller_did: DID(caller_did.to_owned()),
-                    tool_registration_id: XCTX_TOOL.to_owned(),
+                    outlet_registration_id: XCTX_TOOL.to_owned(),
                     ucan_proof_id: None, // ungated tool — no UCAN proof
                     input: serde_json::json!({ "a": 1, "b": 2 }),
                     asserted_chain_depth: 2,
@@ -19378,7 +19378,7 @@ mod tests {
         // The receipt + output are surfaced.
         let receipt_bytes = output.receipt.expect("committed saga surfaces a receipt");
         let output_bytes = output.output.expect("committed saga surfaces the output");
-        let receipt: CrossContextToolReceipt =
+        let receipt: CrossContextOutletReceipt =
             serde_json::from_slice(&receipt_bytes).expect("receipt decodes");
         // The receipt is signed by the target's key over B-recorded provenance.
         assert!(
@@ -19388,7 +19388,7 @@ mod tests {
         assert_eq!(receipt.target_context_id, XCTX_TARGET);
         assert_eq!(receipt.caller_context_id, XCTX_CALLER);
         assert_eq!(receipt.nonce, nonce);
-        assert_eq!(receipt.tool_registration_id, XCTX_TOOL);
+        assert_eq!(receipt.outlet_registration_id, XCTX_TOOL);
         // B re-derived chain depth = incoming(2) + 1.
         assert_eq!(receipt.chain_depth, 3);
         // The output is the canonical tool result.
@@ -19409,7 +19409,7 @@ mod tests {
         // `nonce`-joined records date the one provenance edge identically, and
         // every honest member reconstructs the same leaf (§7.3.1, §9.9.3).
         let expected_leaf_secs = receipt.timestamp_ms / 1000;
-        let tool_invoked = events
+        let outlet_invoked = events
             .iter()
             .find(|(id, event_type, _, _, _)| {
                 *id == XCTX_TARGET && *event_type == scp_event_log::EventType::ToolInvoked
@@ -19417,10 +19417,10 @@ mod tests {
             .expect("target log must carry a ToolInvoked record");
         // The target's record carries B's re-derived chain depth + the saga id.
         let ti_payload: serde_json::Value =
-            serde_json::from_slice(&tool_invoked.3).expect("ToolInvoked payload");
+            serde_json::from_slice(&outlet_invoked.3).expect("ToolInvoked payload");
         assert_eq!(ti_payload["chain_depth"], serde_json::json!(3));
         // Convergent leaf timestamp (NOT a per-member clock read).
-        assert_eq!(tool_invoked.4, expected_leaf_secs);
+        assert_eq!(outlet_invoked.4, expected_leaf_secs);
         let xctx_invoked = events
             .iter()
             .find(|(id, event_type, _, _, _)| {
@@ -19516,12 +19516,12 @@ mod tests {
 
         let now_ms = supervisor.clock_ref().expect("clock").now_millis();
         let err = supervisor
-            .start_cross_context_tool_invocation_saga(
-                CrossContextToolInvocationRequest {
+            .start_cross_context_outlet_invocation_saga(
+                CrossContextOutletInvocationRequest {
                     caller_context_id: XCTX_CALLER,
                     target_context_id: XCTX_TARGET,
                     caller_did: DID(caller_did.to_owned()),
-                    tool_registration_id: XCTX_TOOL.to_owned(),
+                    outlet_registration_id: XCTX_TOOL.to_owned(),
                     ucan_proof_id: Some("proof-other".to_owned()),
                     input: serde_json::json!({ "a": 1, "b": 2 }),
                     asserted_chain_depth: 1,
@@ -19558,12 +19558,12 @@ mod tests {
         // ActorBusy (it aborts again at Prepare-B, NOT with SagaBusy).
         let now_ms2 = supervisor.clock_ref().expect("clock").now_millis();
         let err2 = supervisor
-            .start_cross_context_tool_invocation_saga(
-                CrossContextToolInvocationRequest {
+            .start_cross_context_outlet_invocation_saga(
+                CrossContextOutletInvocationRequest {
                     caller_context_id: XCTX_CALLER,
                     target_context_id: XCTX_TARGET,
                     caller_did: DID(caller_did.to_owned()),
-                    tool_registration_id: XCTX_TOOL.to_owned(),
+                    outlet_registration_id: XCTX_TOOL.to_owned(),
                     ucan_proof_id: Some("proof-other".to_owned()),
                     input: serde_json::json!({ "a": 1, "b": 2 }),
                     asserted_chain_depth: 1,
@@ -19592,7 +19592,7 @@ mod tests {
     ///
     /// Determinism: spawn a live caller+target pair (so the supervisor-side
     /// authorize-before-reserve gates — `is_member` and
-    /// `has_established_tool_interface`, both of which route through the CALLER
+    /// `has_established_outlet_interface`, both of which route through the CALLER
     /// actor's mailbox — and Prepare-A, which also dispatches to the caller, all
     /// pass), then swap ONLY the TARGET registry handle for a closed-inbox one
     /// (`from_sender(tx)` with the receiver dropped). `lookup(target_hex)` still
@@ -19627,12 +19627,12 @@ mod tests {
         let now_ms = supervisor.clock_ref().expect("clock").now_millis();
 
         let err = supervisor
-            .start_cross_context_tool_invocation_saga(
-                CrossContextToolInvocationRequest {
+            .start_cross_context_outlet_invocation_saga(
+                CrossContextOutletInvocationRequest {
                     caller_context_id: XCTX_CALLER,
                     target_context_id: XCTX_TARGET,
                     caller_did: DID(caller_did.to_owned()),
-                    tool_registration_id: XCTX_TOOL.to_owned(),
+                    outlet_registration_id: XCTX_TOOL.to_owned(),
                     ucan_proof_id: None,
                     input: serde_json::json!({ "a": 1, "b": 2 }),
                     asserted_chain_depth: 1,
@@ -19715,12 +19715,12 @@ mod tests {
         // The caller names the VICTIM target it has NO established interface
         // with. The saga MUST reject at the target-axis gate, before reserving.
         let err = supervisor
-            .start_cross_context_tool_invocation_saga(
-                CrossContextToolInvocationRequest {
+            .start_cross_context_outlet_invocation_saga(
+                CrossContextOutletInvocationRequest {
                     caller_context_id: XCTX_CALLER,
                     target_context_id: XCTX_VICTIM,
                     caller_did: DID(caller_did.to_owned()),
-                    tool_registration_id: XCTX_TOOL.to_owned(),
+                    outlet_registration_id: XCTX_TOOL.to_owned(),
                     ucan_proof_id: None,
                     input: serde_json::json!({ "a": 1, "b": 2 }),
                     asserted_chain_depth: 1,
@@ -19752,11 +19752,11 @@ mod tests {
         // genuinely involves the victim target can still reserve it. (We exercise
         // the SAME reservation critical section the start path uses.)
         let legit =
-            supervisor.test_reserve_saga_context_set(&SagaInput::CrossContextToolInvocation {
+            supervisor.test_reserve_saga_context_set(&SagaInput::CrossContextOutletInvocation {
                 caller_context_id: [0xC1u8; 32],
                 target_context_id: XCTX_VICTIM,
                 caller_did: DID("did:dht:zLegit".to_owned()),
-                tool_registration_id: "legit-tool".to_owned(),
+                outlet_registration_id: "legit-tool".to_owned(),
                 ucan_proof_id: None,
                 input: serde_json::json!({}),
                 asserted_chain_depth: 0,
@@ -19789,11 +19789,11 @@ mod tests {
         // Hold the {caller, target} set in flight via the production reservation
         // primitive (same critical section start_saga uses).
         let held = supervisor
-            .test_reserve_saga_context_set(&SagaInput::CrossContextToolInvocation {
+            .test_reserve_saga_context_set(&SagaInput::CrossContextOutletInvocation {
                 caller_context_id: XCTX_CALLER,
                 target_context_id: XCTX_TARGET,
                 caller_did: DID(caller_did.to_owned()),
-                tool_registration_id: XCTX_TOOL.to_owned(),
+                outlet_registration_id: XCTX_TOOL.to_owned(),
                 ucan_proof_id: None,
                 input: serde_json::json!({}),
                 asserted_chain_depth: 0,
@@ -19809,12 +19809,12 @@ mod tests {
         let caller_signing = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
         let now_ms = supervisor.clock_ref().expect("clock").now_millis();
         let err = supervisor
-            .start_cross_context_tool_invocation_saga(
-                CrossContextToolInvocationRequest {
+            .start_cross_context_outlet_invocation_saga(
+                CrossContextOutletInvocationRequest {
                     caller_context_id: XCTX_CALLER,
                     target_context_id: XCTX_TARGET,
                     caller_did: DID(caller_did.to_owned()),
-                    tool_registration_id: XCTX_TOOL.to_owned(),
+                    outlet_registration_id: XCTX_TOOL.to_owned(),
                     ucan_proof_id: None,
                     input: serde_json::json!({ "a": 1, "b": 2 }),
                     asserted_chain_depth: 1,
@@ -20110,7 +20110,7 @@ mod tests {
         }
     }
 
-    /// The token-bucket hard rate limit (`reserve_tool_economy` on the saga's
+    /// The token-bucket hard rate limit (`reserve_outlet_economy` on the saga's
     /// Prepare-A path) returns `ContextError::RateLimited { retry_after_ms:
     /// None, .. }` — it has no precise refill instant. Lifting it MUST propagate
     /// the `None` through to `SagaAbortReason::RateLimited`, never coerce it to
@@ -20321,12 +20321,12 @@ mod tests {
 
         let now_ms = supervisor.clock_ref().expect("clock").now_millis();
         let output = supervisor
-            .start_cross_context_tool_invocation_saga(
-                CrossContextToolInvocationRequest {
+            .start_cross_context_outlet_invocation_saga(
+                CrossContextOutletInvocationRequest {
                     caller_context_id: XCTX_CALLER,
                     target_context_id: XCTX_TARGET,
                     caller_did: DID(caller_did.to_owned()),
-                    tool_registration_id: XCTX_TOOL.to_owned(),
+                    outlet_registration_id: XCTX_TOOL.to_owned(),
                     ucan_proof_id: None,
                     input: serde_json::json!({ "a": 1, "b": 2 }),
                     asserted_chain_depth: 1,
@@ -20354,12 +20354,12 @@ mod tests {
         //
         // The supervisor minted a fresh SagaId internally; the durable capture
         // is keyed by it. The receipt carries the SagaId-stable
-        // `tool_invoked_event_id` (`ToolInvoked:<saga_id>`), so recover the
+        // `outlet_invoked_event_id` (`ToolInvoked:<saga_id>`), so recover the
         // saga id from it.
-        let receipt: scp_protocol::context::tools::cross_context_saga::CrossContextToolReceipt =
+        let receipt: scp_protocol::context::outlets::cross_context_saga::CrossContextOutletReceipt =
             serde_json::from_slice(&output.receipt.expect("receipt")).expect("decode");
         let saga_id_str = receipt
-            .tool_invoked_event_id
+            .outlet_invoked_event_id
             .strip_prefix("ToolInvoked:")
             .expect("event id carries the saga id")
             .to_owned();
@@ -20409,7 +20409,7 @@ mod tests {
     /// is a never-called no-op (divergence emission never runs the tool).
     fn divergence_ctx<'a>(
         nonce: [u8; 16],
-        tool_invoked_event_id: String,
+        outlet_invoked_event_id: String,
         target_signing: &ed25519_dalek::SigningKey,
         caller_signing: &ed25519_dalek::SigningKey,
         caller_did: &str,
@@ -20418,7 +20418,7 @@ mod tests {
             caller_context_id: XCTX_CALLER,
             target_context_id: XCTX_TARGET,
             caller_did: DID(caller_did.to_owned()),
-            tool_registration_id: XCTX_TOOL.to_owned(),
+            outlet_registration_id: XCTX_TOOL.to_owned(),
             ucan_proof_id: None,
             input: serde_json::json!({ "a": 1, "b": 2 }),
             asserted_chain_depth: 2,
@@ -20443,7 +20443,7 @@ mod tests {
                 recorded_chain_depth: 3,
             }),
             committed: None,
-            committed_b_tool_invoked_event_id: Some(tool_invoked_event_id),
+            committed_b_tool_invoked_event_id: Some(outlet_invoked_event_id),
             reached_needs_repair: false,
         }
     }
@@ -20482,7 +20482,7 @@ mod tests {
     /// supervisor-level repair record.
     #[tokio::test]
     async fn xctx_needs_repair_emits_dual_signed_divergence_markers() {
-        use scp_protocol::context::tools::cross_context_saga::{
+        use scp_protocol::context::outlets::cross_context_saga::{
             CommittedSide, CrossContextDivergenceMarker,
         };
 
@@ -20630,7 +20630,7 @@ mod tests {
         assert_eq!(repair[0].nonce, nonce);
         assert_eq!(
             repair[0].committed_side,
-            scp_protocol::context::tools::cross_context_saga::CommittedSide::Target
+            scp_protocol::context::outlets::cross_context_saga::CommittedSide::Target
         );
 
         // The reachable TARGET side still recorded into its own log.
@@ -20659,7 +20659,7 @@ mod tests {
     #[tokio::test]
     async fn supervisor_repair_record_survives_restart() {
         use crate::context::supervisor::saga_journal::{ProtocolRepositorySagaJournal, SagaId};
-        use scp_protocol::context::tools::cross_context_saga::CommittedSide;
+        use scp_protocol::context::outlets::cross_context_saga::CommittedSide;
 
         // Shared durable storage so a second supervisor sees the first's writes.
         let storage = Arc::new(InMemoryStorage::new());
@@ -20773,20 +20773,20 @@ mod tests {
     }
 
     /// §17.16.4 participant-set reconstruction (option (a)): the journaled
-    /// `CrossContextToolInvocationPrepared` evidence carries BOTH context ids, so
+    /// `CrossContextOutletInvocationPrepared` evidence carries BOTH context ids, so
     /// a crash-recovery replay reconstructs the FULL `{caller, target}`
     /// participant set — NOT the caller-only journal triple. Proves the
     /// reservation-gap the field doc flags is closed.
     #[test]
     fn xctx_replay_reconstructs_full_participant_set() {
         use crate::context::supervisor::saga_journal::{JournalEntry, SagaId, SagaState};
-        use crate::context::supervisor::saga_prepared_state::CrossContextToolInvocationPrepared;
+        use crate::context::supervisor::saga_prepared_state::CrossContextOutletInvocationPrepared;
 
-        let prepared = CrossContextToolInvocationPrepared {
+        let prepared = CrossContextOutletInvocationPrepared {
             caller_context_id: XCTX_CALLER,
             target_context_id: XCTX_TARGET,
             caller_did: DID("did:dht:z6MkReconCaller".to_owned()),
-            tool_registration_id: XCTX_TOOL.to_owned(),
+            outlet_registration_id: XCTX_TOOL.to_owned(),
             ucan_proof_id: String::new(),
             recorded_timestamp_ms: 1_700_000_111,
             recorded_nonce: [0x66u8; 16],
@@ -21169,7 +21169,7 @@ mod tests {
     #[tokio::test]
     async fn xctx_replay_commit_in_progress_reemits_without_reinvoke() {
         use crate::context::supervisor::saga_journal::{JournalEntry, SagaId, SagaState};
-        use crate::context::supervisor::saga_prepared_state::CrossContextToolInvocationPrepared;
+        use crate::context::supervisor::saga_prepared_state::CrossContextOutletInvocationPrepared;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         let creator_did = "did:dht:z6MkXctxReplay2Creator".to_owned();
@@ -21194,12 +21194,12 @@ mod tests {
         let now_ms = supervisor.clock_ref().expect("clock").now_millis();
         let nonce = [0x42u8; 16];
         let output = supervisor
-            .start_cross_context_tool_invocation_saga(
-                CrossContextToolInvocationRequest {
+            .start_cross_context_outlet_invocation_saga(
+                CrossContextOutletInvocationRequest {
                     caller_context_id: XCTX_CALLER,
                     target_context_id: XCTX_TARGET,
                     caller_did: DID(caller_did.to_owned()),
-                    tool_registration_id: XCTX_TOOL.to_owned(),
+                    outlet_registration_id: XCTX_TOOL.to_owned(),
                     ucan_proof_id: None,
                     input: serde_json::json!({ "a": 1, "b": 2 }),
                     asserted_chain_depth: 2,
@@ -21217,10 +21217,10 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1, "tool ran once");
 
         // Recover the committed saga id from the receipt.
-        let receipt: scp_protocol::context::tools::cross_context_saga::CrossContextToolReceipt =
+        let receipt: scp_protocol::context::outlets::cross_context_saga::CrossContextOutletReceipt =
             serde_json::from_slice(&output.receipt.expect("receipt")).expect("decode");
         let saga_id_str = receipt
-            .tool_invoked_event_id
+            .outlet_invoked_event_id
             .strip_prefix("ToolInvoked:")
             .expect("event id carries saga id")
             .to_owned();
@@ -21228,11 +21228,11 @@ mod tests {
 
         // Build a Commit-in-progress journal entry whose evidence carries the
         // full {caller, target} prepared state, then run the recovery re-drive.
-        let prepared = CrossContextToolInvocationPrepared {
+        let prepared = CrossContextOutletInvocationPrepared {
             caller_context_id: XCTX_CALLER,
             target_context_id: XCTX_TARGET,
             caller_did: DID(caller_did.to_owned()),
-            tool_registration_id: XCTX_TOOL.to_owned(),
+            outlet_registration_id: XCTX_TOOL.to_owned(),
             ucan_proof_id: String::new(),
             recorded_timestamp_ms: now_ms,
             recorded_nonce: nonce,
@@ -21270,7 +21270,7 @@ mod tests {
     #[tokio::test]
     async fn xctx_commit_in_progress_with_witness_resolves_committed() {
         use crate::context::supervisor::saga_journal::SagaId;
-        use crate::context::supervisor::saga_prepared_state::CrossContextToolInvocationPrepared;
+        use crate::context::supervisor::saga_prepared_state::CrossContextOutletInvocationPrepared;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         let creator_did = "did:dht:z6MkXctxWitnessCreator".to_owned();
@@ -21295,12 +21295,12 @@ mod tests {
         let now_ms = supervisor.clock_ref().expect("clock").now_millis();
         let nonce = [0x42u8; 16];
         let out = supervisor
-            .start_cross_context_tool_invocation_saga(
-                CrossContextToolInvocationRequest {
+            .start_cross_context_outlet_invocation_saga(
+                CrossContextOutletInvocationRequest {
                     caller_context_id: XCTX_CALLER,
                     target_context_id: XCTX_TARGET,
                     caller_did: DID(caller_did.to_owned()),
-                    tool_registration_id: XCTX_TOOL.to_owned(),
+                    outlet_registration_id: XCTX_TOOL.to_owned(),
                     ucan_proof_id: None,
                     input: serde_json::json!({ "a": 1, "b": 2 }),
                     asserted_chain_depth: 2,
@@ -21319,20 +21319,20 @@ mod tests {
 
         // Recover the committed saga id from the receipt — its A-side witness is
         // present in the (still-live) caller actor.
-        let receipt: scp_protocol::context::tools::cross_context_saga::CrossContextToolReceipt =
+        let receipt: scp_protocol::context::outlets::cross_context_saga::CrossContextOutletReceipt =
             serde_json::from_slice(&out.receipt.expect("receipt")).expect("decode");
         let saga_id_str = receipt
-            .tool_invoked_event_id
+            .outlet_invoked_event_id
             .strip_prefix("ToolInvoked:")
             .expect("event id carries saga id")
             .to_owned();
         let saga_id = SagaId(saga_id_str);
 
-        let prepared = CrossContextToolInvocationPrepared {
+        let prepared = CrossContextOutletInvocationPrepared {
             caller_context_id: XCTX_CALLER,
             target_context_id: XCTX_TARGET,
             caller_did: DID(caller_did.to_owned()),
-            tool_registration_id: XCTX_TOOL.to_owned(),
+            outlet_registration_id: XCTX_TOOL.to_owned(),
             ucan_proof_id: String::new(),
             recorded_timestamp_ms: now_ms,
             recorded_nonce: nonce,
@@ -21377,7 +21377,7 @@ mod tests {
     #[tokio::test]
     async fn xctx_commit_in_progress_one_sided_records_supervisor_repair() {
         use crate::context::supervisor::saga_journal::SagaId;
-        use crate::context::supervisor::saga_prepared_state::CrossContextToolInvocationPrepared;
+        use crate::context::supervisor::saga_prepared_state::CrossContextOutletInvocationPrepared;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         let creator_did = "did:dht:z6MkXctxOneSidedCreator".to_owned();
@@ -21402,12 +21402,12 @@ mod tests {
         let now_ms = supervisor.clock_ref().expect("clock").now_millis();
         let nonce = [0x77u8; 16];
         let out = supervisor
-            .start_cross_context_tool_invocation_saga(
-                CrossContextToolInvocationRequest {
+            .start_cross_context_outlet_invocation_saga(
+                CrossContextOutletInvocationRequest {
                     caller_context_id: XCTX_CALLER,
                     target_context_id: XCTX_TARGET,
                     caller_did: DID(caller_did.to_owned()),
-                    tool_registration_id: XCTX_TOOL.to_owned(),
+                    outlet_registration_id: XCTX_TOOL.to_owned(),
                     ucan_proof_id: None,
                     input: serde_json::json!({ "a": 1, "b": 2 }),
                     asserted_chain_depth: 2,
@@ -21423,10 +21423,10 @@ mod tests {
             .await
             .expect("saga commits");
 
-        let receipt: scp_protocol::context::tools::cross_context_saga::CrossContextToolReceipt =
+        let receipt: scp_protocol::context::outlets::cross_context_saga::CrossContextOutletReceipt =
             serde_json::from_slice(&out.receipt.expect("receipt")).expect("decode");
         let saga_id_str = receipt
-            .tool_invoked_event_id
+            .outlet_invoked_event_id
             .strip_prefix("ToolInvoked:")
             .expect("event id carries saga id")
             .to_owned();
@@ -21439,11 +21439,11 @@ mod tests {
             "despawn caller actor (A unreachable post-crash)"
         );
 
-        let prepared = CrossContextToolInvocationPrepared {
+        let prepared = CrossContextOutletInvocationPrepared {
             caller_context_id: XCTX_CALLER,
             target_context_id: XCTX_TARGET,
             caller_did: DID(caller_did.to_owned()),
-            tool_registration_id: XCTX_TOOL.to_owned(),
+            outlet_registration_id: XCTX_TOOL.to_owned(),
             ucan_proof_id: String::new(),
             recorded_timestamp_ms: now_ms,
             recorded_nonce: nonce,
@@ -21482,7 +21482,7 @@ mod tests {
         assert_eq!(repair[0].nonce, nonce);
         assert_eq!(
             repair[0].committed_side,
-            scp_protocol::context::tools::cross_context_saga::CommittedSide::Target
+            scp_protocol::context::outlets::cross_context_saga::CommittedSide::Target
         );
     }
 
@@ -21495,8 +21495,8 @@ mod tests {
     #[tokio::test]
     async fn xctx_commit_a_rejects_receipt_signed_by_wrong_key() {
         use crate::context::supervisor::saga_journal::SagaId;
-        use scp_protocol::context::tools::cross_context_saga::{
-            CrossContextToolReceipt, CrossContextToolReceiptFields,
+        use scp_protocol::context::outlets::cross_context_saga::{
+            CrossContextOutletReceipt, CrossContextOutletReceiptFields,
         };
 
         let authorized = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
@@ -21514,16 +21514,16 @@ mod tests {
         );
 
         // A receipt signed by the ATTACKER key (not authorized for the target).
-        let forged = CrossContextToolReceipt::sign(
+        let forged = CrossContextOutletReceipt::sign(
             &attacker,
-            CrossContextToolReceiptFields {
+            CrossContextOutletReceiptFields {
                 caller_context_id: XCTX_CALLER,
                 target_context_id: XCTX_TARGET,
                 caller_did: "did:dht:z6MkWrongKeyCaller".to_owned(),
                 nonce,
-                tool_registration_id: XCTX_TOOL.to_owned(),
+                outlet_registration_id: XCTX_TOOL.to_owned(),
                 output_jcs: br#"{"result":3}"#.to_vec(),
-                tool_invoked_event_id: "ToolInvoked:wrong-key-saga".to_owned(),
+                outlet_invoked_event_id: "ToolInvoked:wrong-key-saga".to_owned(),
                 chain_depth: 3,
                 timestamp_ms: 1_700_000_000,
             },
@@ -21543,16 +21543,16 @@ mod tests {
         );
 
         // Sanity: the SAME receipt signed by the AUTHORIZED key verifies.
-        let valid = CrossContextToolReceipt::sign(
+        let valid = CrossContextOutletReceipt::sign(
             &authorized,
-            CrossContextToolReceiptFields {
+            CrossContextOutletReceiptFields {
                 caller_context_id: XCTX_CALLER,
                 target_context_id: XCTX_TARGET,
                 caller_did: "did:dht:z6MkWrongKeyCaller".to_owned(),
                 nonce,
-                tool_registration_id: XCTX_TOOL.to_owned(),
+                outlet_registration_id: XCTX_TOOL.to_owned(),
                 output_jcs: br#"{"result":3}"#.to_vec(),
-                tool_invoked_event_id: "ToolInvoked:wrong-key-saga".to_owned(),
+                outlet_invoked_event_id: "ToolInvoked:wrong-key-saga".to_owned(),
                 chain_depth: 3,
                 timestamp_ms: 1_700_000_000,
             },
@@ -21612,12 +21612,12 @@ mod tests {
 
         let now_ms = supervisor.clock_ref().expect("clock").now_millis();
         let output = supervisor
-            .start_cross_context_tool_invocation_saga(
-                CrossContextToolInvocationRequest {
+            .start_cross_context_outlet_invocation_saga(
+                CrossContextOutletInvocationRequest {
                     caller_context_id: XCTX_CALLER,
                     target_context_id: XCTX_TARGET,
                     caller_did: DID(caller_did.to_owned()),
-                    tool_registration_id: XCTX_TOOL.to_owned(),
+                    outlet_registration_id: XCTX_TOOL.to_owned(),
                     ucan_proof_id: None,
                     input: serde_json::json!({ "a": 1, "b": 2 }),
                     asserted_chain_depth: 2,
@@ -21656,8 +21656,8 @@ mod tests {
     /// re-drive Commit-A.
     #[tokio::test]
     async fn xctx_commit_a_send_failure_recovers_ticket_for_retry() {
-        use scp_protocol::context::tools::cross_context_saga::{
-            CrossContextToolReceipt, CrossContextToolReceiptFields,
+        use scp_protocol::context::outlets::cross_context_saga::{
+            CrossContextOutletReceipt, CrossContextOutletReceiptFields,
         };
 
         let creator_did = "did:dht:z6MkXctxSendFailCreator".to_owned();
@@ -21679,7 +21679,7 @@ mod tests {
             caller_context_id: XCTX_CALLER,
             target_context_id: XCTX_TARGET,
             caller_did: DID(caller_did.to_owned()),
-            tool_registration_id: XCTX_TOOL.to_owned(),
+            outlet_registration_id: XCTX_TOOL.to_owned(),
             ucan_proof_id: None,
             input: serde_json::json!({ "a": 1, "b": 2 }),
             asserted_chain_depth: 2,
@@ -21710,16 +21710,16 @@ mod tests {
 
         // Build a verified receipt signed by the target's authorized key (the
         // Commit-A path passes the VERIFIED receipt; we mirror that here).
-        let receipt = CrossContextToolReceipt::sign(
+        let receipt = CrossContextOutletReceipt::sign(
             &target_signing,
-            CrossContextToolReceiptFields {
+            CrossContextOutletReceiptFields {
                 caller_context_id: XCTX_CALLER,
                 target_context_id: XCTX_TARGET,
                 caller_did: caller_did.to_owned(),
                 nonce,
-                tool_registration_id: XCTX_TOOL.to_owned(),
+                outlet_registration_id: XCTX_TOOL.to_owned(),
                 output_jcs: br#"{"result":3}"#.to_vec(),
-                tool_invoked_event_id: "ToolInvoked:send-fail-saga".to_owned(),
+                outlet_invoked_event_id: "ToolInvoked:send-fail-saga".to_owned(),
                 chain_depth: 3,
                 timestamp_ms: 1_700_000_000,
             },
@@ -21791,7 +21791,7 @@ mod tests {
             caller_context_id: XCTX_CALLER,
             target_context_id: XCTX_TARGET,
             caller_did: DID(caller_did.to_owned()),
-            tool_registration_id: XCTX_TOOL.to_owned(),
+            outlet_registration_id: XCTX_TOOL.to_owned(),
             ucan_proof_id: None,
             input: serde_json::json!({ "a": 1, "b": 2 }),
             asserted_chain_depth: 2,
@@ -22029,7 +22029,7 @@ mod tests {
             caller_context_id: XCTX_CALLER,
             target_context_id: XCTX_TARGET,
             caller_did: DID(caller_did.to_owned()),
-            tool_registration_id: XCTX_TOOL.to_owned(),
+            outlet_registration_id: XCTX_TOOL.to_owned(),
             ucan_proof_id: None,
             input: serde_json::json!({ "a": 1, "b": 2 }),
             asserted_chain_depth: 2,
@@ -22288,7 +22288,7 @@ mod tests {
         let target_signing = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
         let caller_signing = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
         // The genuine FSM cross-context participants shape: the caller-provenance
-        // TRIPLE `[caller_hex, caller_did, tool_id]` (`saga_input_participants`),
+        // TRIPLE `[caller_hex, caller_did, outlet_id]` (`saga_input_participants`),
         // length 3 with a 64-hex first element — the xctx-caller path the
         // 2-element wave-15 tests do NOT exercise (they take the evidence-
         // reconstruction route).
@@ -22302,7 +22302,7 @@ mod tests {
             caller_context_id: XCTX_CALLER,
             target_context_id: XCTX_TARGET,
             caller_did: DID(caller_did.to_owned()),
-            tool_registration_id: XCTX_TOOL.to_owned(),
+            outlet_registration_id: XCTX_TOOL.to_owned(),
             ucan_proof_id: None,
             input: serde_json::json!({ "a": 1, "b": 2 }),
             asserted_chain_depth: 2,
@@ -22420,7 +22420,7 @@ mod tests {
             caller_context_id: XCTX_CALLER,
             target_context_id: XCTX_TARGET,
             caller_did: DID(caller_did.to_owned()),
-            tool_registration_id: XCTX_TOOL.to_owned(),
+            outlet_registration_id: XCTX_TOOL.to_owned(),
             ucan_proof_id: None,
             input: serde_json::json!({ "a": 1, "b": 2 }),
             asserted_chain_depth: 2,
@@ -22559,7 +22559,7 @@ mod tests {
             caller_context_id: XCTX_CALLER,
             target_context_id: XCTX_TARGET,
             caller_did: DID(caller_did.to_owned()),
-            tool_registration_id: XCTX_TOOL.to_owned(),
+            outlet_registration_id: XCTX_TOOL.to_owned(),
             ucan_proof_id: None,
             input: serde_json::json!({ "a": 1, "b": 2 }),
             asserted_chain_depth: 2,
@@ -22664,7 +22664,7 @@ mod tests {
     /// caller. Drives the SINGLE production startup entry point
     /// [`Supervisor::restore_on_startup`] (NOT `recover_saga_entry` directly)
     /// over a REAL persistence provider and asserts the xctx-caller-reversal path
-    /// (the genuine length-3 `[caller_hex, caller_did, tool_id]` triple →
+    /// (the genuine length-3 `[caller_hex, caller_did, outlet_id]` triple →
     /// `recover_preparing_b_entry` → `redrive_caller_local_reversal`) ends the
     /// journal entry TERMINAL-`Aborted` with the caller's LOCAL economy refund
     /// DELIVERED (the durable `CallerReservationRecord` consumed, the
@@ -22963,7 +22963,7 @@ mod tests {
     /// The fix routes `PreparingA` through the SAME record-keyed reversal-and-
     /// confirm path as `PreparingB` (`recover_preparing_b_entry`). A `PreparingA`
     /// xctx entry journals the SAME caller-provenance TRIPLE
-    /// (`saga_input_participants`: `[caller_hex, caller_did, tool_id]`) and EMPTY
+    /// (`saga_input_participants`: `[caller_hex, caller_did, outlet_id]`) and EMPTY
     /// evidence (`&[]`), so `reconstruct_xctx_prepared` returns `None` and the
     /// participant-keyed `redrive_caller_local_reversal` reverses the caller's
     /// LOCAL economy from the durable record. RESIDENT caller (this test): the
@@ -22989,7 +22989,7 @@ mod tests {
         let caller_signing = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
         let saga_id = SagaId("wave23-preparing-a-resident-saga".to_owned());
         // The REAL FSM journals a cross-context entry's participants as the
-        // caller-provenance TRIPLE `[caller_hex, caller_did, tool_id]`
+        // caller-provenance TRIPLE `[caller_hex, caller_did, outlet_id]`
         // (`saga_input_participants`), NOT the 2-element `[caller, target]` set
         // the wave-15 PreparingB tests hand-built (they relied on the
         // evidence-reconstruction path). A PreparingA entry has EMPTY evidence, so
@@ -23005,7 +23005,7 @@ mod tests {
             caller_context_id: XCTX_CALLER,
             target_context_id: XCTX_TARGET,
             caller_did: DID(caller_did.to_owned()),
-            tool_registration_id: XCTX_TOOL.to_owned(),
+            outlet_registration_id: XCTX_TOOL.to_owned(),
             ucan_proof_id: None,
             input: serde_json::json!({ "a": 1, "b": 2 }),
             asserted_chain_depth: 2,
@@ -23151,7 +23151,7 @@ mod tests {
             caller_context_id: XCTX_CALLER,
             target_context_id: XCTX_TARGET,
             caller_did: DID(caller_did.to_owned()),
-            tool_registration_id: XCTX_TOOL.to_owned(),
+            outlet_registration_id: XCTX_TOOL.to_owned(),
             ucan_proof_id: None,
             input: serde_json::json!({ "a": 1, "b": 2 }),
             asserted_chain_depth: 2,
@@ -23293,7 +23293,7 @@ mod tests {
             caller_context_id: XCTX_CALLER,
             target_context_id: XCTX_TARGET,
             caller_did: DID(caller_did.to_owned()),
-            tool_registration_id: XCTX_TOOL.to_owned(),
+            outlet_registration_id: XCTX_TOOL.to_owned(),
             ucan_proof_id: None,
             input: serde_json::json!({ "a": 1, "b": 2 }),
             asserted_chain_depth: 2,
@@ -23396,7 +23396,7 @@ mod tests {
     async fn xctx_replay_prepare_in_progress_releases_and_discards() {
         use crate::context::actor::commands::SagaPhaseMessage;
         use crate::context::supervisor::saga_journal::SagaId;
-        use crate::context::supervisor::saga_prepared_state::CrossContextToolInvocationPrepared;
+        use crate::context::supervisor::saga_prepared_state::CrossContextOutletInvocationPrepared;
 
         let creator_did = "did:dht:z6MkXctxPrepReplayCreator".to_owned();
         let creator_key = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]).verifying_key();
@@ -23424,7 +23424,7 @@ mod tests {
                     caller_context_id: XCTX_CALLER,
                     target_context_id: XCTX_TARGET,
                     caller_did: prepare_did,
-                    tool_registration_id: XCTX_TOOL.to_owned(),
+                    outlet_registration_id: XCTX_TOOL.to_owned(),
                     ucan_proof_id: None,
                     input: serde_json::json!({ "a": 1, "b": 2 }),
                     asserted_chain_depth: 2,
@@ -23439,11 +23439,11 @@ mod tests {
 
         // Run the Prepare-in-progress recovery re-drive: it aborts the prepared
         // side(s), releasing the target's staged `saga_pending` slot.
-        let prepared = CrossContextToolInvocationPrepared {
+        let prepared = CrossContextOutletInvocationPrepared {
             caller_context_id: XCTX_CALLER,
             target_context_id: XCTX_TARGET,
             caller_did: DID(caller_did.to_owned()),
-            tool_registration_id: XCTX_TOOL.to_owned(),
+            outlet_registration_id: XCTX_TOOL.to_owned(),
             ucan_proof_id: String::new(),
             recorded_timestamp_ms: 1,
             recorded_nonce: [0x99u8; 16],
@@ -23495,8 +23495,8 @@ mod tests {
         // its `#[must_use]` drop guard does not fire (no panic). The semantic
         // difference from voiding is documented + asserted by the no-panic drop:
         // had the carrier been dropped WITHOUT being consumed, the debug-assert
-        // in `ToolEconomyTicket::drop` would fire.
-        let ticket = crate::context::tools_helpers::ToolEconomyTicket::new_for_test_no_escrow(DID(
+        // in `OutletEconomyTicket::drop` would fire.
+        let ticket = crate::context::outlets_helpers::OutletEconomyTicket::new_for_test_no_escrow(DID(
             "did:dht:z6MkHoldRepair".to_owned(),
         ));
         ticket.hold_external_for_repair();
@@ -23616,10 +23616,10 @@ mod tests {
             },
             evaluated_cost: Amount(50),
         };
-        let ticket = crate::context::tools_helpers::ToolEconomyTicket::new_for_test_with_escrow(
+        let ticket = crate::context::outlets_helpers::OutletEconomyTicket::new_for_test_with_escrow(
             invoker, escrow, policy,
         );
-        let reservation = crate::context::tools_helpers::ToolEconomyReservation {
+        let reservation = crate::context::outlets_helpers::OutletEconomyReservation {
             handle,
             role_state,
             generation: 1,
@@ -23715,8 +23715,8 @@ mod tests {
         )
         .unwrap();
         let ticket =
-            crate::context::tools_helpers::ToolEconomyTicket::new_for_test_no_escrow(invoker);
-        let reservation = crate::context::tools_helpers::ToolEconomyReservation {
+            crate::context::outlets_helpers::OutletEconomyTicket::new_for_test_no_escrow(invoker);
+        let reservation = crate::context::outlets_helpers::OutletEconomyReservation {
             handle,
             role_state,
             generation: 1,

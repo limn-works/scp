@@ -778,7 +778,7 @@ async fn governance_out_of_ceiling_create_child_context_rejected_native() {
 // =========================================================================
 // §9.9.3 REJECT-decision behavior for `EstablishToolInterface`.
 // Gated on `Capability::ToolInterface` in
-// `execute_establish_tool_interface` (`governance_helpers.rs`). With the
+// `execute_establish_outlet_interface` (`governance_helpers.rs`). With the
 // capability absent from the ceiling, the action is rejected and mints ZERO
 // leaves — pinning the convergent reject all honest members must produce.
 // =========================================================================
@@ -786,7 +786,7 @@ async fn governance_out_of_ceiling_create_child_context_rejected_native() {
 async fn governance_out_of_ceiling_establish_tool_interface_rejected_native() {
     let manager = new_manager_with_real_event_log();
     let ctx_id = "ctx-single-admin-iface-out-of-ceiling";
-    // Ceiling deliberately EXCLUDES ToolInterface (tool:interface).
+    // Ceiling deliberately EXCLUDES OutletInterface (tool:interface).
     let ceiling = vec![
         Capability::new("messages:read"),
         Capability::new("messages:write"),
@@ -808,7 +808,7 @@ async fn governance_out_of_ceiling_establish_tool_interface_rejected_native() {
     let action: GovernanceAction = serde_json::from_value(serde_json::json!({
         "EstablishToolInterface": {"interface": {
             "source_context": "ctx-src", "target_context": "ctx-tgt",
-            "tool_id": "tool-1", "rate_limit": null, "per_caller_rate_limit": null,
+            "outlet_id": "tool-1", "rate_limit": null, "per_caller_rate_limit": null,
             "approved_by_source": false, "approved_by_target": false,
             "outbound_policy": null, "inbound_policy": null
         }}

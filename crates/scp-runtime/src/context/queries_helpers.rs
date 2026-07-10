@@ -249,8 +249,8 @@ pub fn get_role_state(state: &PerContextState) -> ContextRoleState {
 }
 
 /// Returns `true` iff this context holds a bidirectionally-approved
-/// [`ToolInterface`](scp_protocol::context::tools::interface::ToolInterface)
-/// from `source_context_hex` to `target_context_hex` for `tool_registration_id`
+/// [`OutletInterface`](scp_protocol::context::outlets::interface::OutletInterface)
+/// from `source_context_hex` to `target_context_hex` for `outlet_registration_id`
 /// (spec §6.2.0.1 standing consent / §6.2.4 target-side authorize-before-reserve).
 ///
 /// Both `approved_by_source` AND `approved_by_target` must be set — a one-sided
@@ -259,18 +259,18 @@ pub fn get_role_state(state: &PerContextState) -> ContextRoleState {
 /// fields are compared on the raw 64-hex digest form the establishing flow
 /// stored (spec §6.2.4 id-form rule).
 #[must_use]
-pub fn has_established_tool_interface(
+pub fn has_established_outlet_interface(
     state: &PerContextState,
     source_context_hex: &str,
     target_context_hex: &str,
-    tool_registration_id: &str,
+    outlet_registration_id: &str,
 ) -> bool {
-    state.governance.tool_interfaces.iter().any(|i| {
+    state.governance.outlet_interfaces.iter().any(|i| {
         i.approved_by_source
             && i.approved_by_target
             && i.source_context == source_context_hex
             && i.target_context == target_context_hex
-            && i.tool_id == tool_registration_id
+            && i.outlet_id == outlet_registration_id
     })
 }
 

@@ -2272,8 +2272,8 @@ pub async fn import_context(
             // the §5.3.2 / §19.3 notification window on import.
             pending_ceiling_modification: sanitized_pending_ceiling_modification,
             pending_economic_policy_change: sanitized_pending_economic_policy_change,
-            registered_tools: export.snapshot.registered_tools,
-            tool_interfaces: export.snapshot.tool_interfaces,
+            registered_outlets: export.snapshot.registered_outlets,
+            outlet_interfaces: export.snapshot.outlet_interfaces,
             pruning_policy: export.snapshot.pruning_policy,
             message_pricing: validated_message_pricing,
             hard_rate_limit: scp_protocol::economy::antispam::TokenBucketLimiter::from_snapshot(
@@ -2821,8 +2821,8 @@ pub async fn restore_context(
             deadlock: DeadlockDetectionState::default(),
             pending_ceiling_modification: ctx_snapshot.pending_ceiling_modification,
             pending_economic_policy_change: ctx_snapshot.pending_economic_policy_change,
-            registered_tools: ctx_snapshot.registered_tools,
-            tool_interfaces: ctx_snapshot.tool_interfaces,
+            registered_outlets: ctx_snapshot.registered_outlets,
+            outlet_interfaces: ctx_snapshot.outlet_interfaces,
             pruning_policy: ctx_snapshot.pruning_policy,
             message_pricing: validated_message_pricing,
             hard_rate_limit: scp_protocol::economy::antispam::TokenBucketLimiter::from_snapshot(
@@ -2914,7 +2914,7 @@ pub async fn restore_context(
                 .collect(),
             // ADR-049 §9 Class S: same-node restore REHYDRATES B's anti-replay
             // nonce-dedup cache (spec §6.2.4 "Freshness / anti-replay"). It is the
-            // ONLY gate against a fresh-`SagaId` replay of a `CrossContextToolInvoke`
+            // ONLY gate against a fresh-`SagaId` replay of a `CrossContextOutletInvoke`
             // within the dedup TTL; reinitializing it empty on restore would let
             // a crash inside the window re-open a charging-tool replay (BLACK-624-01).
             // Per-entry TTL is pruned lazily on the next freshness check. Cross-node
@@ -2930,7 +2930,7 @@ pub async fn restore_context(
             // durable Commit-B output captures (spec §6.2.4 "Exactly-once execution
             // with durable output capture") so a Commit replayed after a crash
             // re-emits the STORED output + the IDENTICAL receipt rather than
-            // re-invoking the tool. The live `CommittedToolInvocation` is public (no
+            // re-invoking the tool. The live `CommittedOutletInvocation` is public (no
             // §9.4.3 bearer), so the snapshot stores it directly — no mirror.
             xctx_committed_outputs: ctx_snapshot.xctx_committed_outputs,
             xctx_committed_invocations: ctx_snapshot.xctx_committed_invocations,
