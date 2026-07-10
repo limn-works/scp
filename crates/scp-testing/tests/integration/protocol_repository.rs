@@ -209,9 +209,9 @@ async fn delete_context_removes_all_associated_state() {
     store.store_context_params(ctx, b"params").await.unwrap();
     store.store_membership(ctx, &did, "member").await.unwrap();
     store.store_role(ctx, "admin", b"role-data").await.unwrap();
-    store.store_tool(ctx, "tool-1", b"tool-reg").await.unwrap();
+    store.store_outlet(ctx, "tool-1", b"tool-reg").await.unwrap();
     store
-        .store_tool_session(ctx, "sess-1", b"sess-data")
+        .store_outlet_session(ctx, "sess-1", b"sess-data")
         .await
         .unwrap();
     store
@@ -231,10 +231,10 @@ async fn delete_context_removes_all_associated_state() {
     assert!(store.load_context_params(ctx).await.unwrap().is_none());
     assert!(store.load_membership(ctx, &did).await.unwrap().is_none());
     assert!(store.load_role(ctx, "admin").await.unwrap().is_none());
-    assert!(store.load_tool(ctx, "tool-1").await.unwrap().is_none());
+    assert!(store.load_outlet(ctx, "tool-1").await.unwrap().is_none());
     assert!(
         store
-            .load_tool_session(ctx, "sess-1")
+            .load_outlet_session(ctx, "sess-1")
             .await
             .unwrap()
             .is_none()
@@ -726,27 +726,27 @@ async fn tool_store_load_list_delete_roundtrip() {
     let ctx = "ctx-tools";
 
     store
-        .store_tool(ctx, "calculator", b"calc-reg")
+        .store_outlet(ctx, "calculator", b"calc-reg")
         .await
         .unwrap();
     store
-        .store_tool(ctx, "search", b"search-reg")
+        .store_outlet(ctx, "search", b"search-reg")
         .await
         .unwrap();
 
     // Load.
     assert_eq!(
-        store.load_tool(ctx, "calculator").await.unwrap(),
+        store.load_outlet(ctx, "calculator").await.unwrap(),
         Some(b"calc-reg".to_vec())
     );
 
     // List.
-    let tools = store.list_tools(ctx).await.unwrap();
+    let tools = store.list_outlets(ctx).await.unwrap();
     assert_eq!(tools, vec!["calculator", "search"]);
 
     // Delete.
-    store.delete_tool(ctx, "calculator").await.unwrap();
-    assert!(store.load_tool(ctx, "calculator").await.unwrap().is_none());
+    store.delete_outlet(ctx, "calculator").await.unwrap();
+    assert!(store.load_outlet(ctx, "calculator").await.unwrap().is_none());
 }
 
 #[tokio::test]
@@ -754,20 +754,20 @@ async fn tools_are_context_scoped() {
     let store = make_store();
 
     store
-        .store_tool("ctx-1", "tool-abc", b"data-1")
+        .store_outlet("ctx-1", "tool-abc", b"data-1")
         .await
         .unwrap();
     store
-        .store_tool("ctx-2", "tool-abc", b"data-2")
+        .store_outlet("ctx-2", "tool-abc", b"data-2")
         .await
         .unwrap();
 
     assert_eq!(
-        store.load_tool("ctx-1", "tool-abc").await.unwrap(),
+        store.load_outlet("ctx-1", "tool-abc").await.unwrap(),
         Some(b"data-1".to_vec())
     );
     assert_eq!(
-        store.load_tool("ctx-2", "tool-abc").await.unwrap(),
+        store.load_outlet("ctx-2", "tool-abc").await.unwrap(),
         Some(b"data-2".to_vec())
     );
 }
@@ -778,19 +778,19 @@ async fn tool_session_store_load_delete_roundtrip() {
     let ctx = "ctx-sessions";
 
     store
-        .store_tool_session(ctx, "sess-1", b"session-state")
+        .store_outlet_session(ctx, "sess-1", b"session-state")
         .await
         .unwrap();
 
     assert_eq!(
-        store.load_tool_session(ctx, "sess-1").await.unwrap(),
+        store.load_outlet_session(ctx, "sess-1").await.unwrap(),
         Some(b"session-state".to_vec())
     );
 
-    store.delete_tool_session(ctx, "sess-1").await.unwrap();
+    store.delete_outlet_session(ctx, "sess-1").await.unwrap();
     assert!(
         store
-            .load_tool_session(ctx, "sess-1")
+            .load_outlet_session(ctx, "sess-1")
             .await
             .unwrap()
             .is_none()
@@ -811,7 +811,7 @@ async fn context_isolation_between_modules() {
         .await
         .unwrap();
     store
-        .store_tool("ctx-2", "tool-1", b"tool-data")
+        .store_outlet("ctx-2", "tool-1", b"tool-data")
         .await
         .unwrap();
     store
@@ -820,7 +820,7 @@ async fn context_isolation_between_modules() {
         .unwrap();
 
     // Each context only has its own data.
-    assert!(store.load_tool("ctx-1", "tool-1").await.unwrap().is_none());
+    assert!(store.load_outlet("ctx-1", "tool-1").await.unwrap().is_none());
     assert!(
         store
             .load_ucan_token("ctx-1", "tok-1")
@@ -837,7 +837,7 @@ async fn context_isolation_between_modules() {
             .is_none()
     );
     assert!(store.load_context_state("ctx-3").await.unwrap().is_none());
-    assert!(store.load_tool("ctx-3", "tool-1").await.unwrap().is_none());
+    assert!(store.load_outlet("ctx-3", "tool-1").await.unwrap().is_none());
 }
 
 // =========================================================================

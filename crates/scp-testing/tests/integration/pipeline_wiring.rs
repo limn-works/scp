@@ -36,7 +36,7 @@ const MANAGER_SRC: &str = concat!(
     include_str!("../../../../crates/scp-runtime/src/context/lifecycle_helpers.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/governance_helpers.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/standing_helpers.rs"),
-    include_str!("../../../../crates/scp-runtime/src/context/tools_helpers.rs"),
+    include_str!("../../../../crates/scp-runtime/src/context/outlets_helpers.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/broadcast_helpers.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/queries_helpers.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/economy_helpers.rs"),
@@ -57,14 +57,14 @@ const SUPERVISOR_SRC: &str =
     include_str!("../../../../crates/scp-runtime/src/context/supervisor/supervisor.rs");
 
 // FFI bridge sources. PR #1606 / C4 wired all 3 of these to
-// `ContextManager::invoke_tool_with_economy` so per-invocation pricing,
+// `ContextManager::invoke_outlet_with_economy` so per-invocation pricing,
 // spending UCAN, velocity tracking, budget enforcement, and the hard
 // rate limit are enforced for Python / Node / Swift / Kotlin clients.
-// The structural assertions in `c4_tool_invoke_economy_*` below pin
+// The structural assertions in `c4_outlet_invoke_economy_*` below pin
 // the bridge → runtime delegation so a future refactor cannot silently
 // regress to the bypass path.
-const PYO3_TOOLS_SRC: &str = include_str!("../../../../crates/scp-ffi/src/tools.rs");
-const NAPI_TOOLS_SRC: &str = include_str!("../../../../crates/scp-ffi/napi/src/tools.rs");
+const PYO3_TOOLS_SRC: &str = include_str!("../../../../crates/scp-ffi/src/outlets.rs");
+const NAPI_TOOLS_SRC: &str = include_str!("../../../../crates/scp-ffi/napi/src/outlets.rs");
 const UNIFFI_BRIDGE_SRC: &str = include_str!("../../../../crates/scp-ffi/uniffi/src/bridge.rs");
 
 // NAPI context bridge — the only bridge with a live relay subscribe loop
@@ -191,7 +191,7 @@ const NAPI_TRUST_SRC: &str = include_str!("../../../../crates/scp-ffi/napi/src/t
 // (ADR-049 §3a) was wired through all three native bridges: one per-bridge
 // structural assertion (PyO3 / NAPI / UniFFI) pins each export body to the
 // caller-principal binding, the ADR-056 `context_id_to_bytes` keying chokepoint,
-// AND the `start_cross_context_tool_invocation_saga` producer. Pure coverage
+// AND the `start_cross_context_outlet_invocation_saga` producer. Pure coverage
 // expansion locking the new export wiring into the ratchet floor.
 // Raised 44 -> 48 when the typed `participation_record` op (§7.3.2) added four
 // routing assertions: `Supervisor::participation_record` → core
@@ -1571,70 +1571,70 @@ fn governance_enforces_economic_policy() {
 // --- Per-DID anti-spam escalation for tool invocations (§19.7) ---
 
 #[test]
-fn invoke_tool_with_economy_wires_escalation_and_rollback() {
+fn invoke_outlet_with_economy_wires_escalation_and_rollback() {
     // ADR-049 actor split: the Phase-1 economy reserve runs on actor-owned
-    // state in `reserve_tool_economy`. It must (a) record the new velocity
+    // state in `reserve_outlet_economy`. It must (a) record the new velocity
     // entry so compute_escalated_cost sees it, (b) thread the per-context
-    // velocity_tracker and message_pricing into ToolEconomyContext, and the
-    // Phase-3 `rollback_tool_economy` must roll back the velocity entry on
-    // executor failure. The orchestrator `invoke_tool_with_economy` runs the
+    // velocity_tracker and message_pricing into OutletEconomyContext, and the
+    // Phase-3 `rollback_outlet_economy` must roll back the velocity entry on
+    // executor failure. The orchestrator `invoke_outlet_with_economy` runs the
     // tool executor between the two phases.
     assert!(
-        fn_body_contains(MANAGER_SRC, "reserve_tool_economy", "record_message"),
-        "reserve_tool_economy must record the invocation for velocity tracking"
+        fn_body_contains(MANAGER_SRC, "reserve_outlet_economy", "record_message"),
+        "reserve_outlet_economy must record the invocation for velocity tracking"
     );
     assert!(
-        fn_body_contains(MANAGER_SRC, "reserve_tool_economy", "velocity_tracker"),
-        "reserve_tool_economy must thread velocity_tracker into ToolEconomyContext"
+        fn_body_contains(MANAGER_SRC, "reserve_outlet_economy", "velocity_tracker"),
+        "reserve_outlet_economy must thread velocity_tracker into OutletEconomyContext"
     );
     assert!(
-        fn_body_contains(MANAGER_SRC, "reserve_tool_economy", "message_pricing"),
-        "reserve_tool_economy must thread message_pricing into ToolEconomyContext"
+        fn_body_contains(MANAGER_SRC, "reserve_outlet_economy", "message_pricing"),
+        "reserve_outlet_economy must thread message_pricing into OutletEconomyContext"
     );
     assert!(
-        fn_body_contains(MANAGER_SRC, "rollback_tool_economy", ".rollback("),
-        "rollback_tool_economy must roll back the velocity entry on executor failure \
+        fn_body_contains(MANAGER_SRC, "rollback_outlet_economy", ".rollback("),
+        "rollback_outlet_economy must roll back the velocity entry on executor failure \
          via the F5 identity-based `rollback(token)` API"
     );
     // The orchestrator runs the tool executor between reserve and settle.
     assert!(
         fn_body_contains(
             MANAGER_SRC,
-            "invoke_tool_with_economy",
-            "invoke_tool_execute_and_validate"
+            "invoke_outlet_with_economy",
+            "invoke_outlet_execute_and_validate"
         ),
-        "invoke_tool_with_economy must run the executor via invoke_tool_execute_and_validate \
+        "invoke_outlet_with_economy must run the executor via invoke_outlet_execute_and_validate \
          between the reserve (Phase 1) and settle (Phase 3) mailbox round-trips"
     );
 }
 
-/// D4: the Phase-1 reserve (`reserve_tool_economy`) must reference the
+/// D4: the Phase-1 reserve (`reserve_outlet_economy`) must reference the
 /// hard rate limit. Enforced structurally so a future refactor cannot
 /// silently drop the Matrix Synapse–style defense-in-depth cap on the
 /// tool path.
 #[test]
-fn invoke_tool_with_economy_enforces_hard_rate_limit() {
+fn invoke_outlet_with_economy_enforces_hard_rate_limit() {
     assert!(
-        fn_body_contains(MANAGER_SRC, "reserve_tool_economy", "hard_rate_limit"),
-        "reserve_tool_economy must reference hard_rate_limit so the Matrix Synapse–style \
+        fn_body_contains(MANAGER_SRC, "reserve_outlet_economy", "hard_rate_limit"),
+        "reserve_outlet_economy must reference hard_rate_limit so the Matrix Synapse–style \
          defense-in-depth cap is enforced on the tool path (D4)"
     );
     assert!(
-        fn_body_contains(MANAGER_SRC, "reserve_tool_economy", "try_consume"),
-        "reserve_tool_economy must call try_consume on the hard rate limit token bucket \
+        fn_body_contains(MANAGER_SRC, "reserve_outlet_economy", "try_consume"),
+        "reserve_outlet_economy must call try_consume on the hard rate limit token bucket \
          before any Phase 1 bookkeeping — mirrors enforce_send_economy at messaging.rs:346"
     );
 }
 
-/// D4: every Phase 1 failure branch in `reserve_tool_economy` MUST refund
+/// D4: every Phase 1 failure branch in `reserve_outlet_economy` MUST refund
 /// the hard rate limit token. We expect at least 3 inline refund sites:
 /// `economy_pre_check` failure, `record_spend` failure, and
-/// `authorize_tool_payment` failure. Dropping any branch leaks a
+/// `authorize_outlet_payment` failure. Dropping any branch leaks a
 /// rate-limit token on failure.
 #[test]
-fn invoke_tool_with_economy_refunds_hard_rate_limit_on_every_phase1_failure() {
-    let body = extract_fn_body(MANAGER_SRC, "reserve_tool_economy")
-        .expect("reserve_tool_economy body must exist");
+fn invoke_outlet_with_economy_refunds_hard_rate_limit_on_every_phase1_failure() {
+    let body = extract_fn_body(MANAGER_SRC, "reserve_outlet_economy")
+        .expect("reserve_outlet_economy body must exist");
     // The hard-rate-limit token is refunded through the field-granular Class-C
     // governance view (`hard_rate_limit_mut().refund(..)`) on every Phase-1
     // failure branch (ADR-049 §9). Match the accessor form so a renamed bucket
@@ -1642,20 +1642,20 @@ fn invoke_tool_with_economy_refunds_hard_rate_limit_on_every_phase1_failure() {
     let refund_sites = body.matches("hard_rate_limit_mut().refund").count();
     assert!(
         refund_sites >= 3,
-        "reserve_tool_economy must have at least 3 inline hard_rate_limit_mut().refund sites \
-         (economy_pre_check failure, record_spend failure, authorize_tool_payment failure); \
+        "reserve_outlet_economy must have at least 3 inline hard_rate_limit_mut().refund sites \
+         (economy_pre_check failure, record_spend failure, authorize_outlet_payment failure); \
          found {refund_sites}. Dropping any branch leaks a rate-limit token on failure."
     );
 }
 
 #[test]
-fn invoke_tool_with_economy_releases_lock_before_executor() {
+fn invoke_outlet_with_economy_releases_lock_before_executor() {
     // ADR-049 actor-split invariant (supersedes the legacy lock_context /
     // relock_context generation-guard mechanism, which is gone with the
     // `contexts` DashMap): the caller-supplied non-Send executor must run
     // OUTSIDE the per-context actor — between the Phase-1 economy reserve and
     // the Phase-3 settle. The economy bookkeeping that mutates per-context
-    // state lives entirely in `reserve_tool_economy` / `settle_tool_economy`
+    // state lives entirely in `reserve_outlet_economy` / `settle_outlet_economy`
     // (which run on `&mut PerContextState` inside the actor); the executor
     // never crosses the actor mailbox and never holds per-context state
     // exclusively. A mis-behaving tool executor blocked every concurrent
@@ -1666,13 +1666,13 @@ fn invoke_tool_with_economy_releases_lock_before_executor() {
     //   (1) hands the reserve closure to the helper (Phase 1),
     //   (2) hands the settle closure to the helper (Phase 3), and
     //   (3) runs the executor (Phase 2) between them.
-    let body = extract_fn_body(MANAGER_SRC, "invoke_tool_with_economy")
-        .expect("invoke_tool_with_economy body must exist");
+    let body = extract_fn_body(MANAGER_SRC, "invoke_outlet_with_economy")
+        .expect("invoke_outlet_with_economy body must exist");
     assert!(
         body.contains("reserve()")
             && body.contains("settle(")
-            && body.contains("invoke_tool_execute_and_validate"),
-        "invoke_tool_with_economy must run the reserve (Phase 1) and settle (Phase 3) \
+            && body.contains("invoke_outlet_execute_and_validate"),
+        "invoke_outlet_with_economy must run the reserve (Phase 1) and settle (Phase 3) \
          mailbox round-trips around the off-actor executor (Phase 2) so the non-Send tool \
          executor never holds per-context state exclusively"
     );
@@ -1680,7 +1680,7 @@ fn invoke_tool_with_economy_releases_lock_before_executor() {
     // (Capture) and failure (Rollback) branches.
     assert!(
         body.contains("Capture") && body.contains("Rollback"),
-        "invoke_tool_with_economy must settle via Capture on executor success and Rollback \
+        "invoke_outlet_with_economy must settle via Capture on executor success and Rollback \
          on executor failure"
     );
 }
@@ -1754,11 +1754,11 @@ fn native_execute_governance_action_resolves_proposal_by_id_from_engine() {
 // C4 (#1606) — Bridge tool-invoke economy wiring
 //
 // All 3 FFI bridges (PyO3, NAPI, UniFFI) MUST route tool
-// invocation through `ContextManager::invoke_tool_with_economy`. The
+// invocation through `ContextManager::invoke_outlet_with_economy`. The
 // previous bypass path called `try_consume_hard_rate_limit_*` directly
 // against the bridge-owned tool registry, which disabled per-invocation
 // pricing, spending UCAN AND-composition, velocity tracking, budget
-// enforcement, and the `ToolEconomyTicket` lifecycle for Python /
+// enforcement, and the `OutletEconomyTicket` lifecycle for Python /
 // Node / Swift / Kotlin clients.
 //
 // These structural assertions catch any future regression to the
@@ -1768,20 +1768,20 @@ fn native_execute_governance_action_resolves_proposal_by_id_from_engine() {
 // ---------------------------------------------------------------------------
 
 // Phase 4 PR 4 (#1549 façade deletion) renamed the PyO3 free function
-// `py_tool_invoke` → `#[pymethods] impl PyScp { pub fn tool_invoke(&self, ...) }`
-// delegating to the private `tool_invoke_impl` free function that
-// carries the real wiring. The assertion targets `tool_invoke_impl` —
+// `py_outlet_invoke` → `#[pymethods] impl PyScp { pub fn outlet_invoke(&self, ...) }`
+// delegating to the private `outlet_invoke_impl` free function that
+// carries the real wiring. The assertion targets `outlet_invoke_impl` —
 // the implementation body — so a refactor cannot silently regress to a
 // bypass path even if the public method signature is preserved.
 #[test]
-fn c4_pyo3_tool_invoke_routes_through_invoke_tool_with_economy() {
+fn c4_pyo3_outlet_invoke_routes_through_invoke_outlet_with_economy() {
     assert!(
         fn_body_contains(
             PYO3_TOOLS_SRC,
-            "tool_invoke_impl",
-            "invoke_tool_with_economy"
+            "outlet_invoke_impl",
+            "invoke_outlet_with_economy"
         ),
-        "PyO3 tool_invoke_impl must call ContextManager::invoke_tool_with_economy \
+        "PyO3 outlet_invoke_impl must call ContextManager::invoke_outlet_with_economy \
          (PR #1606 / C4). Calling try_consume_hard_rate_limit_blocking against \
          a bridge-owned registry instead disables per-invocation pricing, \
          spending UCAN, velocity tracking, and budget enforcement for Python \
@@ -1790,35 +1790,35 @@ fn c4_pyo3_tool_invoke_routes_through_invoke_tool_with_economy() {
 }
 
 #[test]
-fn c4_pyo3_tool_invoke_accepts_spending_ucan() {
+fn c4_pyo3_outlet_invoke_accepts_spending_ucan() {
     // The bridge MUST accept the spending UCAN parameter — the
-    // runtime's `invoke_tool_with_economy` requires it for §19.5
+    // runtime's `invoke_outlet_with_economy` requires it for §19.5
     // AND-composition on paid actions.
-    let body = extract_fn_body(PYO3_TOOLS_SRC, "tool_invoke_impl")
-        .expect("tool_invoke_impl body must exist");
+    let body = extract_fn_body(PYO3_TOOLS_SRC, "outlet_invoke_impl")
+        .expect("outlet_invoke_impl body must exist");
     assert!(
         body.contains("spending_ucan"),
-        "PyO3 tool_invoke_impl must accept and forward a spending UCAN argument \
+        "PyO3 outlet_invoke_impl must accept and forward a spending UCAN argument \
          (PR #1606 / C4). Without it, paid tool invocations skip the §19.5 \
          AND-composition check."
     );
     assert!(
         body.contains("parse_ucan"),
-        "PyO3 tool_invoke_impl must parse the spending UCAN JWT into a UcanToken \
-         before passing it to invoke_tool_with_economy."
+        "PyO3 outlet_invoke_impl must parse the spending UCAN JWT into a UcanToken \
+         before passing it to invoke_outlet_with_economy."
     );
 }
 
 // Phase 4 PR 4 moved the NAPI free-function export into
-// `impl Scp { pub async fn tool_invoke(&self, ...) }` that delegates to
-// `tool_invoke_on` in `tools.rs`. The wiring (spending_ucan_jwt parse +
-// `invoke_tool_with_economy` call) lives on the `tool_invoke_on` helper,
+// `impl Scp { pub async fn outlet_invoke(&self, ...) }` that delegates to
+// `outlet_invoke_on` in `outlets.rs`. The wiring (spending_ucan_jwt parse +
+// `invoke_outlet_with_economy` call) lives on the `outlet_invoke_on` helper,
 // so that is the function we assert against.
 #[test]
-fn c4_napi_tool_invoke_routes_through_invoke_tool_with_economy() {
+fn c4_napi_outlet_invoke_routes_through_invoke_outlet_with_economy() {
     assert!(
-        fn_body_contains(NAPI_TOOLS_SRC, "tool_invoke_on", "invoke_tool_with_economy"),
-        "NAPI tool_invoke_on must call ContextManager::invoke_tool_with_economy \
+        fn_body_contains(NAPI_TOOLS_SRC, "outlet_invoke_on", "invoke_outlet_with_economy"),
+        "NAPI outlet_invoke_on must call ContextManager::invoke_outlet_with_economy \
          (PR #1606 / C4). The previous bypass path called \
          try_consume_hard_rate_limit against the bridge-owned tool registry, \
          disabling per-invocation pricing, spending UCAN, velocity tracking, \
@@ -1827,29 +1827,29 @@ fn c4_napi_tool_invoke_routes_through_invoke_tool_with_economy() {
 }
 
 #[test]
-fn c4_napi_tool_invoke_accepts_spending_ucan() {
-    let body = extract_fn_body(NAPI_TOOLS_SRC, "tool_invoke_on")
-        .expect("NAPI tool_invoke_on body must exist");
+fn c4_napi_outlet_invoke_accepts_spending_ucan() {
+    let body = extract_fn_body(NAPI_TOOLS_SRC, "outlet_invoke_on")
+        .expect("NAPI outlet_invoke_on body must exist");
     assert!(
         body.contains("spending_ucan_jwt"),
-        "NAPI tool_invoke_on must accept and forward a spending_ucan_jwt argument \
+        "NAPI outlet_invoke_on must accept and forward a spending_ucan_jwt argument \
          (PR #1606 / C4). Without it, paid tool invocations skip the §19.5 \
          AND-composition check."
     );
     assert!(
         body.contains("parse_ucan"),
-        "NAPI tool_invoke_on must parse the spending UCAN JWT into a UcanToken \
-         before passing it to invoke_tool_with_economy."
+        "NAPI outlet_invoke_on must parse the spending UCAN JWT into a UcanToken \
+         before passing it to invoke_outlet_with_economy."
     );
 }
 
 #[test]
-fn c4_uniffi_tool_invoke_routes_through_invoke_tool_with_economy() {
+fn c4_uniffi_outlet_invoke_routes_through_invoke_outlet_with_economy() {
     // `extract_fn_body` returns the first match, which is the
-    // top-level `tool_invoke` (not `tool_invoke_cross_context`).
+    // top-level `outlet_invoke` (not `outlet_invoke_cross_context`).
     assert!(
-        fn_body_contains(UNIFFI_BRIDGE_SRC, "tool_invoke", "invoke_tool_with_economy"),
-        "UniFFI tool_invoke must call ContextManager::invoke_tool_with_economy \
+        fn_body_contains(UNIFFI_BRIDGE_SRC, "outlet_invoke", "invoke_outlet_with_economy"),
+        "UniFFI outlet_invoke must call ContextManager::invoke_outlet_with_economy \
          (PR #1606 / C4). The previous bypass path called \
          try_consume_hard_rate_limit against the bridge-owned tool registry, \
          disabling per-invocation pricing, spending UCAN, velocity tracking, \
@@ -1858,19 +1858,19 @@ fn c4_uniffi_tool_invoke_routes_through_invoke_tool_with_economy() {
 }
 
 #[test]
-fn c4_uniffi_tool_invoke_accepts_spending_ucan() {
-    let body = extract_fn_body(UNIFFI_BRIDGE_SRC, "tool_invoke")
-        .expect("UniFFI tool_invoke body must exist");
+fn c4_uniffi_outlet_invoke_accepts_spending_ucan() {
+    let body = extract_fn_body(UNIFFI_BRIDGE_SRC, "outlet_invoke")
+        .expect("UniFFI outlet_invoke body must exist");
     assert!(
         body.contains("spending_ucan_jwt"),
-        "UniFFI tool_invoke must accept and forward a spending_ucan_jwt argument \
+        "UniFFI outlet_invoke must accept and forward a spending_ucan_jwt argument \
          (PR #1606 / C4). Without it, paid tool invocations skip the §19.5 \
          AND-composition check."
     );
     assert!(
         body.contains("parse_ucan"),
-        "UniFFI tool_invoke must parse the spending UCAN JWT into a UcanToken \
-         before passing it to invoke_tool_with_economy."
+        "UniFFI outlet_invoke must parse the spending UCAN JWT into a UcanToken \
+         before passing it to invoke_outlet_with_economy."
     );
 }
 
@@ -2683,7 +2683,7 @@ fn uniffi_check_capability_requirements_routes_to_core() {
 // §6.2.4 cross-context tool-invocation saga — FFI export wiring (ADR-049 §3a)
 // ===========================================================================
 //
-// Each native bridge's `tool_invoke_cross_context_saga` export MUST, before the
+// Each native bridge's `outlet_invoke_cross_context_saga` export MUST, before the
 // saga can run:
 //   (a) bind the caller principal — `enforce_caller_principal_binding`, which
 //       authenticates the hosted caller via `identity_registry_contains` and
@@ -2693,7 +2693,7 @@ fn uniffi_check_capability_requirements_routes_to_core() {
 //       ADR-056 keying chokepoint `context_id_to_bytes` (a raw re-hash would
 //       double-hash a 64-hex id and key a non-existent actor slot); and
 //   (c) dispatch to the merged producer
-//       `start_cross_context_tool_invocation_saga`.
+//       `start_cross_context_outlet_invocation_saga`.
 //
 // These pin the bridge bodies so a refactor cannot silently sever any of the
 // three from the export — e.g. drop the principal binding (replay/forgery),
@@ -2707,7 +2707,7 @@ fn pyo3_saga_export_wires_binding_chokepoint_and_producer() {
     assert!(
         fn_body_contains(
             PYO3_TOOLS_SRC,
-            "tool_invoke_cross_context_saga_impl",
+            "outlet_invoke_cross_context_saga_impl",
             "enforce_caller_principal_binding(",
         ),
         "PyO3 cross-context saga export must bind the caller principal via \
@@ -2716,7 +2716,7 @@ fn pyo3_saga_export_wires_binding_chokepoint_and_producer() {
     assert!(
         fn_body_contains(
             PYO3_TOOLS_SRC,
-            "tool_invoke_cross_context_saga_impl",
+            "outlet_invoke_cross_context_saga_impl",
             "context_id_to_bytes(",
         ),
         "PyO3 cross-context saga export must convert ids via the ADR-056 \
@@ -2725,11 +2725,11 @@ fn pyo3_saga_export_wires_binding_chokepoint_and_producer() {
     assert!(
         fn_body_contains(
             PYO3_TOOLS_SRC,
-            "tool_invoke_cross_context_saga_impl",
-            "start_cross_context_tool_invocation_saga(",
+            "outlet_invoke_cross_context_saga_impl",
+            "start_cross_context_outlet_invocation_saga(",
         ),
         "PyO3 cross-context saga export must dispatch to the producer \
-         start_cross_context_tool_invocation_saga"
+         start_cross_context_outlet_invocation_saga"
     );
     // The principal-binding helper itself must authenticate the hosted caller
     // (registry membership + context membership), so the (a) edge is meaningful.
@@ -2753,7 +2753,7 @@ fn napi_saga_export_wires_binding_chokepoint_and_producer() {
     assert!(
         fn_body_contains(
             NAPI_TOOLS_SRC,
-            "tool_invoke_cross_context_saga_on",
+            "outlet_invoke_cross_context_saga_on",
             "enforce_caller_principal_binding(",
         ),
         "NAPI cross-context saga export must bind the caller principal via \
@@ -2762,7 +2762,7 @@ fn napi_saga_export_wires_binding_chokepoint_and_producer() {
     assert!(
         fn_body_contains(
             NAPI_TOOLS_SRC,
-            "tool_invoke_cross_context_saga_on",
+            "outlet_invoke_cross_context_saga_on",
             "context_id_to_bytes(",
         ),
         "NAPI cross-context saga export must convert ids via the ADR-056 \
@@ -2771,11 +2771,11 @@ fn napi_saga_export_wires_binding_chokepoint_and_producer() {
     assert!(
         fn_body_contains(
             NAPI_TOOLS_SRC,
-            "tool_invoke_cross_context_saga_on",
-            "start_cross_context_tool_invocation_saga(",
+            "outlet_invoke_cross_context_saga_on",
+            "start_cross_context_outlet_invocation_saga(",
         ),
         "NAPI cross-context saga export must dispatch to the producer \
-         start_cross_context_tool_invocation_saga"
+         start_cross_context_outlet_invocation_saga"
     );
     assert!(
         fn_body_contains(
@@ -2797,7 +2797,7 @@ fn uniffi_saga_export_wires_binding_chokepoint_and_producer() {
     assert!(
         fn_body_contains(
             UNIFFI_BRIDGE_SRC,
-            "tool_invoke_cross_context_saga",
+            "outlet_invoke_cross_context_saga",
             "enforce_caller_principal_binding(",
         ),
         "UniFFI cross-context saga export must bind the caller principal via \
@@ -2806,7 +2806,7 @@ fn uniffi_saga_export_wires_binding_chokepoint_and_producer() {
     assert!(
         fn_body_contains(
             UNIFFI_BRIDGE_SRC,
-            "tool_invoke_cross_context_saga",
+            "outlet_invoke_cross_context_saga",
             "context_id_to_bytes(",
         ),
         "UniFFI cross-context saga export must convert ids via the ADR-056 \
@@ -2815,11 +2815,11 @@ fn uniffi_saga_export_wires_binding_chokepoint_and_producer() {
     assert!(
         fn_body_contains(
             UNIFFI_BRIDGE_SRC,
-            "tool_invoke_cross_context_saga",
-            "start_cross_context_tool_invocation_saga(",
+            "outlet_invoke_cross_context_saga",
+            "start_cross_context_outlet_invocation_saga(",
         ),
         "UniFFI cross-context saga export must dispatch to the producer \
-         start_cross_context_tool_invocation_saga"
+         start_cross_context_outlet_invocation_saga"
     );
     // UniFFI authenticates the hosted caller against the per-instance custody
     // registry (`identity_custody_registry(bi).contains_key`) rather than the

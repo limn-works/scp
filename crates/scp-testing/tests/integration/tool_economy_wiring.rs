@@ -13,18 +13,18 @@
 
 //! C4 (#1606) — Bridge tool-invoke economy wiring integration test.
 //!
-//! Verifies that `ContextManager::invoke_tool_with_economy` — the SINGLE
+//! Verifies that `ContextManager::invoke_outlet_with_economy` — the SINGLE
 //! entry point all 3 FFI bridges (PyO3, NAPI, UniFFI) now route
 //! through after the C4 fix — actually deducts per-invocation cost from
 //! the per-DID budget tracker, increments the per-DID velocity counter,
-//! returns the executor output, and produces a `ToolInvokedEvent` with
+//! returns the executor output, and produces a `OutletInvokedEvent` with
 //! the correct cost.
 //!
 //! Before C4 the bridges bypassed this method entirely and tools cost
 //! ZERO from a Python/Node/Swift/Kotlin client's perspective regardless
 //! of `EconomicPolicy`. The pipeline_wiring assertions cover the
 //! structural fact that the bridge tool-invoke functions now CALL
-//! `invoke_tool_with_economy`; this test covers the runtime semantics
+//! `invoke_outlet_with_economy`; this test covers the runtime semantics
 //! that the bridges' delegations now inherit.
 //!
 //! The mock providers below mirror the pattern used in
@@ -40,8 +40,10 @@ use scp_core::context::builder::{
 };
 use scp_core::context::governance::KeyResolver;
 use scp_core::context::manager::ContextManager;
-use scp_core::context::tools::ToolId;
-use scp_core::context::tools::registry::{TestVector, ToolRegistration, ToolRegistry, ToolSchema};
+use scp_core::context::outlets::OutletId;
+use scp_core::context::outlets::registry::{
+    OutletRegistration, OutletRegistry, OutletSchema, OutletTestVector,
+};
 use scp_core::context::{
     AddMemberOutput, Capability, ContextError, ContextParams, RemoveMemberOutput,
 };
@@ -240,7 +242,7 @@ fn signing_key_for_did(did: &DID) -> ed25519_dalek::SigningKey {
 // Helpers — fixture builders.
 // ---------------------------------------------------------------------------
 
-fn governance_params_with_tools() -> ContextParams {
+fn governance_params_with_outlets() -> ContextParams {
     ContextParams {
         ceiling: vec![
             Capability::new("messages:read"),
@@ -274,17 +276,17 @@ fn priced_policy(per_tool_invoke: u64) -> EconomicPolicy {
     }
 }
 
-fn echo_tool() -> ToolRegistration {
-    ToolRegistration {
-        tool_id: "echo".to_owned(),
+fn echo_outlet() -> OutletRegistration {
+    OutletRegistration {
+        outlet_id: "echo".to_owned(),
         name: "echo".to_owned(),
         description: "echo tool for C4 wiring test".to_owned(),
-        schema: ToolSchema {
+        schema: OutletSchema {
             input_schema: serde_json::json!({"type": "object"}),
             output_schema: serde_json::json!({"type": "object"}),
         },
         implementation_hash: [0u8; 32],
-        test_vectors: vec![TestVector {
+        test_vectors: vec![OutletTestVector {
             input: serde_json::json!({}),
             expected_output: serde_json::json!({}),
             description: "noop".to_owned(),
@@ -420,11 +422,11 @@ fn signed_spending_ucan_for(actor_did: &DID) -> scp_core::crypto::ucan::UcanToke
 }
 
 // ---------------------------------------------------------------------------
-// Test 1: invoke_tool_with_economy deducts budget and records velocity
+// Test 1: invoke_outlet_with_economy deducts budget and records velocity
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn invoke_tool_with_economy_deducts_budget_and_records_velocity() {
+async fn invoke_outlet_with_economy_deducts_budget_and_records_velocity() {
     // C1b: happy-path invocations now require a fully signed spending UCAN
     // bound to the invoker DID. Use mock_key_resolver so validate_spending_ucan_signed
     // can resolve the verifying key, and signed_spending_ucan_for to produce a
@@ -439,7 +441,7 @@ async fn invoke_tool_with_economy_deducts_budget_and_records_velocity() {
 
     let invoker = DID::from("did:key:invoker");
     let context_id = "ctx-c4-tool-economy".to_owned();
-    let mut params = governance_params_with_tools();
+    let mut params = governance_params_with_outlets();
     params.economic_policy = Some(priced_policy(7));
 
     let _handle = manager
@@ -453,8 +455,8 @@ async fn invoke_tool_with_economy_deducts_budget_and_records_velocity() {
         .grant_budget_for_test(&context_id, &invoker, Amount::new(1_000))
         .await;
 
-    let mut registry = ToolRegistry::new();
-    registry.insert(echo_tool());
+    let mut registry = OutletRegistry::new();
+    registry.insert(echo_outlet());
 
     // Fully signed UCAN bound to the invoker, matching mock_key_resolver.
     let spending_ucan = signed_spending_ucan_for(&invoker);
@@ -475,10 +477,10 @@ async fn invoke_tool_with_economy_deducts_budget_and_records_velocity() {
     // now route through after C4. The closure echoes the input back
     // so we can also verify the executor is invoked.
     let outcome = manager
-        .invoke_tool_with_economy(
+        .invoke_outlet_with_economy(
             &context_id,
             &registry,
-            &ToolId::from("echo"),
+            &OutletId::from("echo"),
             serde_json::json!({"hello": "world"}),
             &invoker,
             Some(&spending_ucan),
@@ -486,7 +488,7 @@ async fn invoke_tool_with_economy_deducts_budget_and_records_velocity() {
             |input: serde_json::Value| async move { Ok(serde_json::json!({"echoed": input})) },
         )
         .await
-        .expect("invoke_tool_with_economy must succeed for free-budget paid tool");
+        .expect("invoke_outlet_with_economy must succeed for free-budget paid tool");
 
     // Verify the executor ran and produced the expected output.
     assert_eq!(
@@ -504,7 +506,7 @@ async fn invoke_tool_with_economy_deducts_budget_and_records_velocity() {
     assert_eq!(
         budget_before.value() - budget_after.value(),
         7,
-        "invoke_tool_with_economy must deduct the per_tool_invoke cost (7) from the per-DID budget — \
+        "invoke_outlet_with_economy must deduct the per_tool_invoke cost (7) from the per-DID budget — \
          got {} -> {}",
         budget_before.value(),
         budget_after.value()
@@ -517,23 +519,23 @@ async fn invoke_tool_with_economy_deducts_budget_and_records_velocity() {
         .await;
     assert!(
         velocity_after > velocity_before,
-        "invoke_tool_with_economy must record one velocity entry per call \
+        "invoke_outlet_with_economy must record one velocity entry per call \
          (before={velocity_before}, after={velocity_after})"
     );
 
-    // Verify the ToolInvokedEvent carries the deducted cost.
+    // Verify the OutletInvokedEvent carries the deducted cost.
     assert_eq!(
         outcome.event.cost.map(scp_core::economy::Amount::value),
         Some(7),
-        "ToolInvokedEvent.cost must reflect the deducted per-invocation cost"
+        "OutletInvokedEvent.cost must reflect the deducted per-invocation cost"
     );
     assert_eq!(
-        outcome.event.tool_id, "echo",
-        "ToolInvokedEvent.tool_id must match the invoked tool"
+        outcome.event.outlet_id, "echo",
+        "OutletInvokedEvent.outlet_id must match the invoked outlet"
     );
     assert_eq!(
         outcome.event.invoker_did, invoker,
-        "ToolInvokedEvent.invoker_did must match the invoker"
+        "OutletInvokedEvent.invoker_did must match the invoker"
     );
 
     // Sanity-check: no payment receipt was produced (no payment
@@ -545,11 +547,11 @@ async fn invoke_tool_with_economy_deducts_budget_and_records_velocity() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 2: invoke_tool_with_economy rejects insufficient budget
+// Test 2: invoke_outlet_with_economy rejects insufficient budget
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn invoke_tool_with_economy_rejects_insufficient_budget() {
+async fn invoke_outlet_with_economy_rejects_insufficient_budget() {
     // ADR-049 commit 12c.9c — wrap with `attach_test_supervisor`.
     let manager = scp_core::context::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto),
@@ -560,7 +562,7 @@ async fn invoke_tool_with_economy_rejects_insufficient_budget() {
 
     let invoker = DID::from("did:key:invoker");
     let context_id = "ctx-c4-budget-rejected".to_owned();
-    let mut params = governance_params_with_tools();
+    let mut params = governance_params_with_outlets();
     // Price the tool above any granted budget.
     params.economic_policy = Some(priced_policy(100));
 
@@ -572,15 +574,15 @@ async fn invoke_tool_with_economy_rejects_insufficient_budget() {
     // Grant ZERO budget — the per-DID budget tracker has no entry for
     // the invoker, so `has_budget` returns false and the pre-check
     // must reject the invocation.
-    let mut registry = ToolRegistry::new();
-    registry.insert(echo_tool());
+    let mut registry = OutletRegistry::new();
+    registry.insert(echo_outlet());
     let spending_ucan = dummy_spending_ucan();
 
     let result = manager
-        .invoke_tool_with_economy(
+        .invoke_outlet_with_economy(
             &context_id,
             &registry,
-            &ToolId::from("echo"),
+            &OutletId::from("echo"),
             serde_json::json!({}),
             &invoker,
             Some(&spending_ucan),

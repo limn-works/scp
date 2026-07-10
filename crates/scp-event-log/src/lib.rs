@@ -414,7 +414,7 @@ pub enum EventType {
     // these WITHIN the saga's MLS-Commit phase: they are commit-ordered,
     // convergent, durable leaves — every honest member processing the same
     // saga commit produces the byte-identical leaf (committer-assigned
-    // timestamp drawn from B's signed `CrossContextToolReceipt`). The
+    // timestamp drawn from B's signed `CrossContextOutletReceipt`). The
     // committed-side event id is itself a signed receipt field, so the
     // record is canonical by design. See spec §6.2.4 "Dual event-log
     // recording".
