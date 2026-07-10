@@ -1698,9 +1698,10 @@ fn generate_initial_access_key_store(
 // ---------------------------------------------------------------------------
 
 /// §23.17 Invariant 3/4 — the SINGLE floor-guarded crypto-restore path for
-/// import. Captures per-sender epoch floors BEFORE teardown, tears down the
-/// old crypto, restores the incoming `mls_state` (if any), then validates that
-/// no per-sender floor regresses and merges the local floors back (max-merge).
+/// import. Captures per-sender epoch floors AND receive-side sequence floors
+/// (§23.17.3) BEFORE teardown, tears down the old crypto, restores the incoming
+/// `mls_state` (if any), then validates that neither per-sender floor regresses
+/// and merges the local floors back (max-merge).
 /// Rolls the restored crypto back on a regression so no half-restored or
 /// floor-regressed state persists. EVERY import crypto-restore site — the
 /// actor-side `PrepareForReplace` handler AND the supervisor-side fresh /
@@ -1736,6 +1737,12 @@ pub(in crate::context) fn restore_crypto_state_with_floor_guard(
     // provider, so these live pre-crash floors are still authoritative and are
     // the max-merge input (Class M, ADR-049 §9).
     let local_epoch_floors = deps.crypto.export_sender_key_epochs(ctx_id_bytes);
+    // §23.17.3 receive-side twin: capture the LIVE per-sender recv-sequence
+    // floors (the intra-epoch anti-replay high-water) BEFORE teardown, for the
+    // same reason as the epoch floors — a warm respawn would otherwise reload
+    // them VERBATIM from the ≤50ms-stale coalesced snapshot and roll an
+    // intra-epoch replay floor backward (ADR-049 §9 Class M).
+    let local_recv_floors = deps.crypto.export_recv_sequence_floors(ctx_id_bytes);
 
     let _ = deps.crypto.destroy_mls_group(ctx_id_bytes);
     let _ = deps.crypto.destroy_sender_key(ctx_id_bytes);
@@ -1756,6 +1763,22 @@ pub(in crate::context) fn restore_crypto_state_with_floor_guard(
         ctx_id_bytes,
         local_epoch_floors,
         scp_protocol::crypto::sender_keys::MAX_EPOCH_ADVANCE,
+        trusted_local,
+    ) {
+        let _ = deps.crypto.destroy_mls_group(ctx_id_bytes);
+        let _ = deps.crypto.destroy_sender_key(ctx_id_bytes);
+        return Err(e);
+    }
+
+    // §23.17.3 Inv 2/3/4 (receive-side twin): merge the live recv-sequence
+    // floors back with the SAME rollback-on-Err discipline. `trusted_local=true`
+    // max-merges and proceeds (Inv 2 — respawn of own snapshot); `false` rejects
+    // any regression (Inv 3 — untrusted peer import). The applied floor is never
+    // below the live floor (Inv 4). Roll back on failure so no floor-regressed
+    // state persists.
+    if let Err(e) = deps.crypto.validate_and_merge_recv_sequence_floors(
+        ctx_id_bytes,
+        local_recv_floors,
         trusted_local,
     ) {
         let _ = deps.crypto.destroy_mls_group(ctx_id_bytes);

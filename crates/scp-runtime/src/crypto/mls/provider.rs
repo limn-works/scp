@@ -2796,6 +2796,221 @@ impl MlsCryptoProvider {
 
         Ok(())
     }
+
+    /// Returns the per-sender receive-side sequence floors for a given context.
+    ///
+    /// Each `(sender_did, (last_epoch, last_sequence))` pair is the highest
+    /// `(epoch, sequence)` accepted from that participant — the intra-epoch
+    /// anti-replay floor (spec §23.17.3). The floor order is LEXICOGRAPHIC on
+    /// `(epoch, sequence)`: a higher epoch dominates; at an equal epoch a higher
+    /// sequence dominates (`(u64, u64)` derives this ordering).
+    ///
+    /// This is the receive-side twin of [`Self::export_sender_key_epochs`]. It
+    /// is called by `restore_crypto_state_with_floor_guard` to capture the LIVE
+    /// floors **before** destroying existing crypto state so the incoming
+    /// snapshot can be validated/merged against them. A mailbox/handle despawn
+    /// does NOT tear down the supervisor-owned crypto provider, so these live
+    /// pre-crash floors are still authoritative on a warm respawn.
+    ///
+    /// Returns an empty `Vec` when the context has no crypto state (never
+    /// created / evicted / owned by an actor) — the cold-restart case, where
+    /// there is nothing to merge against.
+    pub fn export_recv_sequence_floors(&self, context_id: &[u8; 32]) -> Vec<(String, (u64, u64))> {
+        // ADR-049 commit 12c.9f: lock-free `DashMap::get`.
+        let Some(entry) = self.contexts.get(context_id) else {
+            return Vec::new();
+        };
+        entry
+            .value()
+            .recv_sequence_tracker
+            .iter()
+            .map(|(did, floor)| (did.clone(), *floor))
+            .collect()
+    }
+
+    /// Merges the per-sender receive-side sequence floors of the just-restored
+    /// crypto state against the captured live `local_floors`, applying a
+    /// max-merge so `max(local, restored)` is the effective floor for every
+    /// sender (spec §23.17.3; Invariant 2 `max(snapshot, retained)` / Invariant
+    /// 4 append-only dominance — "Gaps are bugs"). This is the receive-side twin
+    /// of [`Self::validate_and_merge_epoch_floors`]: the sender-key EPOCH
+    /// high-water is already max-merged there; the `recv_sequence_tracker` is
+    /// the missing twin that a warm respawn would otherwise reload VERBATIM from
+    /// the ≤50ms-stale coalesced snapshot, rolling an intra-epoch replay floor
+    /// BACKWARD (ADR-049 §9 Class M).
+    ///
+    /// Call this AFTER `restore_crypto_state`, passing the floors captured via
+    /// [`Self::export_recv_sequence_floors`] **before** the destroy+restore
+    /// cycle.
+    ///
+    /// The per-sender floor order is LEXICOGRAPHIC on `(epoch, sequence)`: a
+    /// higher epoch wins; at an equal epoch a higher sequence wins.
+    ///
+    /// `trusted_local` selects the spec §23.17.2 lower-bound policy:
+    /// - `true` (Invariant 2 — restoring the node's OWN snapshot: crash
+    ///   recovery / actor respawn / process restart): a restored floor BELOW the
+    ///   live floor is the expected coalesce-lag case; max-merge and PROCEED,
+    ///   never reject (rejecting would fail the respawn and poison a healthy
+    ///   context).
+    /// - `false` (Invariant 3 — importing an UNTRUSTED peer snapshot): reject
+    ///   the entire merge if ANY restored floor regresses below its live floor
+    ///   (snapshot-mediated replay guard), OR if any imported recv floor's epoch
+    ///   overshoots the sender's already-merged sender-key epoch floor by more
+    ///   than `MAX_EPOCH_ADVANCE` (epoch-poisoning guard — mirrors the epoch
+    ///   twin, so a malicious exporter cannot set a third party's recv floor to
+    ///   `epoch = u64::MAX` and permanently lock that sender out).
+    ///
+    /// Either way the applied floor is `max(live, restored)` per sender and is
+    /// NEVER below the live floor (Invariant 4). Local-only senders absent from
+    /// the snapshot retain their live floor; senders present only in the
+    /// snapshot keep their imported floor.
+    ///
+    /// A cold-restart no-op when `local_floors` is empty (same rationale as
+    /// [`Self::validate_and_merge_epoch_floors`]: no live floors to merge or
+    /// regress against; the snapshot loads verbatim under the same
+    /// at-rest-storage trust boundary).
+    ///
+    /// No state is mutated on failure (atomic, both paths).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::SnapshotFloorRegression`] with
+    /// `resource: "recv_sequence"` on the import path only. Each
+    /// `per_sender_deltas` entry reports either the counter that rolled back
+    /// (`(local_epoch, incoming_epoch)` when the epoch regressed, else
+    /// `(local_sequence, incoming_sequence)` at an equal epoch) or, for an
+    /// overshoot, `(ceiling, incoming_epoch)` where `ceiling` is the enforced
+    /// `sender_key_epoch + MAX_EPOCH_ADVANCE` bound.
+    // Parameter type `Vec<(String, (u64, u64))>` mirrors the by-value ownership
+    // convention of `validate_and_merge_epoch_floors` (captured live floors are
+    // consumed into the merge).
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn validate_and_merge_recv_sequence_floors(
+        &self,
+        context_id: &[u8; 32],
+        local_floors: Vec<(String, (u64, u64))>,
+        trusted_local: bool,
+    ) -> Result<(), ContextError> {
+        // Cold-restart no-op (spec §23.17.2 / ADR-049 §9): with no captured live
+        // floors there is nothing to merge or regress against, so the snapshot's
+        // floors load verbatim. Class M monotonicity still holds on every WARM
+        // respawn, where this runs with non-empty live floors.
+        if local_floors.is_empty() {
+            return Ok(());
+        }
+
+        // Step 1: read the imported (restored) recv-sequence floors. In the real
+        // flow `restore_crypto_state` has already written these from the snapshot
+        // bytes into the live `recv_sequence_tracker`.
+        // ADR-049 commit 12c.9f: lock-free `DashMap::get`.
+        let import_floors: HashMap<String, (u64, u64)> = self
+            .contexts
+            .get(context_id)
+            .map_or_else(HashMap::new, |entry| {
+                entry.value().recv_sequence_tracker.clone()
+            });
+
+        // Step 2: validate the UNTRUSTED import path (two guards, mirroring the
+        // sender-key epoch twin `validate_and_merge_epoch_floors` /
+        // `SenderKeyStore::merge_incoming_epochs`). The TRUSTED-LOCAL respawn
+        // path gets NEITHER — a lower restored floor is the expected coalesce-lag
+        // case (Invariant 2) and a healthy respawn must never be rejected.
+        //
+        // 2a. Regression guard (Invariant 3, replay): a restored floor
+        //     lexicographically below the captured live floor for a sender
+        //     present in BOTH is a snapshot-mediated replay vector. `(u64, u64)`
+        //     compares lexicographically, so `<` is exactly the
+        //     `(epoch, sequence)` floor order.
+        //
+        // 2b. Epoch-poisoning overshoot ceiling (mirrors the epoch twin's
+        //     `MAX_EPOCH_ADVANCE` bound): an imported recv floor whose epoch
+        //     exceeds the sender's ALREADY-MERGED sender-key epoch floor by more
+        //     than `MAX_EPOCH_ADVANCE` is rejected, so a signature-valid but
+        //     malicious/compromised exporter cannot set a third party's recv
+        //     floor to `epoch = u64::MAX` and permanently lock that sender out.
+        //     The bound is keyed off `sender_key_store.epoch(ctx, did)` — the
+        //     epoch floor `validate_and_merge_epoch_floors` (which runs BEFORE
+        //     this merge in `restore_crypto_state_with_floor_guard`) has already
+        //     max-merged and validated. Keying off THAT (a) covers senders
+        //     present only in the import (no live recv floor to bound against),
+        //     and (b) avoids false-positives on legitimate imports (a real recv
+        //     floor tracks the real sender-key epoch). `saturating_add` clamps
+        //     the bound at `u64::MAX`.
+        if !trusted_local {
+            let ctx_id_hex = hex::encode(context_id);
+            let mut per_sender_deltas: Vec<(String, u64, u64)> = Vec::new();
+
+            // 2a. Regression: senders present in both live and import.
+            for (did, live_floor) in &local_floors {
+                if let Some(import_floor) = import_floors.get(did)
+                    && import_floor < live_floor
+                {
+                    // Report whichever counter rolled back: the epoch if the
+                    // epoch regressed, else the sequence (equal-epoch case).
+                    let (local_scalar, incoming_scalar) = if import_floor.0 < live_floor.0 {
+                        (live_floor.0, import_floor.0)
+                    } else {
+                        (live_floor.1, import_floor.1)
+                    };
+                    per_sender_deltas.push((did.clone(), local_scalar, incoming_scalar));
+                }
+            }
+
+            // 2b. Overshoot ceiling: every imported recv floor (including
+            // import-only senders) bounded against the merged sender-key epoch
+            // floor + MAX_EPOCH_ADVANCE. One read-lock across the loop.
+            //
+            // NOTE: only the EPOCH axis is bounded here; the sequence axis is a
+            // deliberate, documented residual (#2076). No sound
+            // `MAX_SEQUENCE_ADVANCE` exists — there is no per-`(sender, epoch)`
+            // sequence high-water oracle (unlike `sender_key_store.epoch` for the
+            // epoch axis), so any constant would either false-positive legitimate
+            // high-volume catch-up imports or stop nothing; and spec §23.17.2
+            // Invariant 3 mandates accepting a floor `>= local` via max-merge. The
+            // residual — an untrusted import (creator-signed; `exporter_did ==
+            // creator_did`) setting `(valid_epoch, u64::MAX)` to silence a sender
+            // for the CURRENT epoch — is LOW: creator-gated, append-only-safe (a
+            // DoS, not a replay hole), and self-heals on the next sender-key
+            // rotation. See #2076.
+            if let Some(entry) = self.contexts.get(context_id) {
+                let store = &entry.value().sender_key_store;
+                for (did, (imp_epoch, _imp_seq)) in &import_floors {
+                    let ceiling = store
+                        .epoch(&ctx_id_hex, did)
+                        .saturating_add(MAX_EPOCH_ADVANCE);
+                    if *imp_epoch > ceiling {
+                        // local = the ceiling (bound), incoming = the overshoot.
+                        per_sender_deltas.push((did.clone(), ceiling, *imp_epoch));
+                    }
+                }
+            }
+
+            if !per_sender_deltas.is_empty() {
+                return Err(ContextError::SnapshotFloorRegression {
+                    resource: "recv_sequence".to_owned(),
+                    per_sender_deltas,
+                });
+            }
+        }
+
+        // Step 3: apply `max(live, restored)` per sender back into the real
+        // tracker. A sender in `local_floors` but absent from the import snapshot
+        // retains its live floor (Invariant 4 append-only dominance); a sender
+        // present only in the import snapshot keeps its imported floor (untouched
+        // here). Lexicographic `max` on `(u64, u64)`.
+        // ADR-049 commit 12c.9f: lock-free `DashMap::get_mut`.
+        if let Some(mut entry) = self.contexts.get_mut(context_id) {
+            let tracker = &mut entry.value_mut().recv_sequence_tracker;
+            for (did, live_floor) in local_floors {
+                let merged = tracker
+                    .get(&did)
+                    .map_or(live_floor, |restored| (*restored).max(live_floor));
+                tracker.insert(did, merged);
+            }
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -4220,6 +4435,343 @@ mod tests {
         assert!(
             merged.iter().any(|(d, e)| d == frank_did && *e == 7),
             "Frank's local-only floor (7) must be retained (Invariant 4)"
+        );
+    }
+
+    // ---- §23.17.3 receive-side sequence-floor twin -----------------------
+
+    #[test]
+    fn validate_and_merge_recv_sequence_floors_max_merges_on_restore() {
+        // §23.17.3 Invariant 2 (own-snapshot restore) — the TRUSTED-LOCAL
+        // RESPAWN path (`trusted_local = true`): when the captured LIVE recv
+        // floor is AHEAD of the ≤50ms-stale coalesced snapshot, the merge MUST
+        // keep the higher LIVE `(epoch, sequence)` and never lower it — a
+        // rolled-back intra-epoch replay floor is the bug this corrects
+        // (ADR-049 §9 Class M). The floor order is lexicographic on
+        // `(epoch, sequence)`: a higher epoch dominates even a higher stale
+        // sequence.
+        let provider = make_provider();
+        let ctx_id = make_context_id();
+        provider.create_mls_group(&ctx_id).unwrap();
+        provider.generate_sender_key(&ctx_id).unwrap();
+
+        let dave_did = "did:dht:z6MkDaveDaveDaveDaveDaveDaveDaveDaveDaveDa";
+
+        // Live floor for Dave is (epoch 5, seq 20) — advanced just before crash.
+        {
+            let mut entry = provider.contexts.get_mut(&ctx_id).unwrap();
+            entry
+                .value_mut()
+                .recv_sequence_tracker
+                .insert(dave_did.to_owned(), (5, 20));
+        }
+        let live_floors = provider.export_recv_sequence_floors(&ctx_id);
+
+        // The restored (coalesced) snapshot carries a LOWER epoch (3) for Dave,
+        // even though its sequence (999) is higher — lexicographically stale.
+        {
+            let mut entry = provider.contexts.get_mut(&ctx_id).unwrap();
+            entry
+                .value_mut()
+                .recv_sequence_tracker
+                .insert(dave_did.to_owned(), (3, 999));
+        }
+
+        provider
+            .validate_and_merge_recv_sequence_floors(&ctx_id, live_floors, true)
+            .expect(
+                "a respawn from a coalesce-lagged snapshot must max-merge and proceed, not fail",
+            );
+
+        let merged = provider.export_recv_sequence_floors(&ctx_id);
+        assert!(
+            merged.iter().any(|(d, f)| d == dave_did && *f == (5, 20)),
+            "Dave's recv floor must stay the higher LIVE value (5, 20), never the stale (3, 999)"
+        );
+    }
+
+    #[test]
+    fn validate_and_merge_recv_sequence_floors_equal_epoch_keeps_higher_live_sequence() {
+        // §23.17.3: at an EQUAL epoch the higher LIVE sequence must win. This is
+        // the core intra-epoch anti-replay case: a stale snapshot at the same
+        // epoch but a lower sequence must not roll the sequence floor back on a
+        // trusted-local respawn.
+        let provider = make_provider();
+        let ctx_id = make_context_id();
+        provider.create_mls_group(&ctx_id).unwrap();
+        provider.generate_sender_key(&ctx_id).unwrap();
+
+        let dave_did = "did:dht:z6MkDaveDaveDaveDaveDaveDaveDaveDaveDaveDa";
+
+        // Live floor: (epoch 7, seq 200).
+        {
+            let mut entry = provider.contexts.get_mut(&ctx_id).unwrap();
+            entry
+                .value_mut()
+                .recv_sequence_tracker
+                .insert(dave_did.to_owned(), (7, 200));
+        }
+        let live_floors = provider.export_recv_sequence_floors(&ctx_id);
+
+        // Stale snapshot: same epoch, lower sequence.
+        {
+            let mut entry = provider.contexts.get_mut(&ctx_id).unwrap();
+            entry
+                .value_mut()
+                .recv_sequence_tracker
+                .insert(dave_did.to_owned(), (7, 50));
+        }
+
+        provider
+            .validate_and_merge_recv_sequence_floors(&ctx_id, live_floors, true)
+            .expect("equal-epoch lower-sequence snapshot must max-merge and proceed");
+
+        let merged = provider.export_recv_sequence_floors(&ctx_id);
+        assert!(
+            merged.iter().any(|(d, f)| d == dave_did && *f == (7, 200)),
+            "Dave's recv floor must keep the higher LIVE sequence (7, 200), never (7, 50)"
+        );
+    }
+
+    #[test]
+    fn validate_and_merge_recv_sequence_floors_rejects_regression_on_import() {
+        // §23.17.3 Invariant 3 (replay guard) — the UNTRUSTED IMPORT path
+        // (`trusted_local = false`): an imported peer snapshot whose per-sender
+        // recv floor is lexicographically BELOW the live floor must be rejected
+        // entirely (snapshot-mediated replay vector). Mirrors the epoch-floor
+        // import guard.
+        let provider = make_provider();
+        let ctx_id = make_context_id();
+        provider.create_mls_group(&ctx_id).unwrap();
+        provider.generate_sender_key(&ctx_id).unwrap();
+
+        let dave_did = "did:dht:z6MkDaveDaveDaveDaveDaveDaveDaveDaveDaveDa";
+
+        // Live floor: (epoch 12, seq 100).
+        {
+            let mut entry = provider.contexts.get_mut(&ctx_id).unwrap();
+            entry
+                .value_mut()
+                .recv_sequence_tracker
+                .insert(dave_did.to_owned(), (12, 100));
+        }
+        let live_floors = provider.export_recv_sequence_floors(&ctx_id);
+
+        // Restored crypto carries a LOWER sequence (40) at the same epoch.
+        {
+            let mut entry = provider.contexts.get_mut(&ctx_id).unwrap();
+            entry
+                .value_mut()
+                .recv_sequence_tracker
+                .insert(dave_did.to_owned(), (12, 40));
+        }
+
+        let err = provider
+            .validate_and_merge_recv_sequence_floors(&ctx_id, live_floors, false)
+            .expect_err(
+                "an import recv-floor regression ((12,40) < live (12,100)) must be rejected",
+            );
+        match err {
+            ContextError::SnapshotFloorRegression {
+                resource,
+                per_sender_deltas,
+            } => {
+                assert_eq!(resource, "recv_sequence");
+                assert!(
+                    per_sender_deltas
+                        .iter()
+                        .any(|(d, local, incoming)| d == dave_did
+                            && *local == 100
+                            && *incoming == 40),
+                    "delta must report the rolled-back sequence (local 100, incoming 40), got {per_sender_deltas:?}"
+                );
+            }
+            other => panic!("expected SnapshotFloorRegression, got {other:?}"),
+        }
+
+        // The live floor must be untouched after a rejected import.
+        let after = provider.export_recv_sequence_floors(&ctx_id);
+        assert!(
+            after.iter().any(|(d, f)| d == dave_did && *f == (12, 40)),
+            "rejected import must not have merged; the tracker keeps whatever restore wrote"
+        );
+    }
+
+    #[test]
+    fn validate_and_merge_recv_sequence_floors_retains_local_only_sender() {
+        // §23.17.3 Invariant 4 (append-only dominance): a sender present in the
+        // captured LIVE floors but ABSENT from the restored snapshot must retain
+        // its live floor, while a sender the snapshot advances is max-merged
+        // upward. Exercised on the untrusted-import path (a non-regressing
+        // advance is accepted).
+        let provider = make_provider();
+        let ctx_id = make_context_id();
+        provider.create_mls_group(&ctx_id).unwrap();
+        provider.generate_sender_key(&ctx_id).unwrap();
+
+        let dave_did = "did:dht:z6MkDaveDaveDaveDaveDaveDaveDaveDaveDaveDa";
+        let erin_did = "did:dht:z6MkErinErinErinErinErinErinErinErinErinEr";
+
+        // Live floors: Dave=(4, 30), Erin=(7, 90).
+        {
+            let mut entry = provider.contexts.get_mut(&ctx_id).unwrap();
+            let tracker = &mut entry.value_mut().recv_sequence_tracker;
+            tracker.insert(dave_did.to_owned(), (4, 30));
+            tracker.insert(erin_did.to_owned(), (7, 90));
+        }
+        let live_floors = provider.export_recv_sequence_floors(&ctx_id);
+
+        // Restored snapshot advances Dave to (9, 5) and omits Erin entirely.
+        {
+            let mut entry = provider.contexts.get_mut(&ctx_id).unwrap();
+            let tracker = &mut entry.value_mut().recv_sequence_tracker;
+            tracker.insert(dave_did.to_owned(), (9, 5));
+            tracker.remove(erin_did);
+        }
+
+        provider
+            .validate_and_merge_recv_sequence_floors(&ctx_id, live_floors, false)
+            .expect("a non-regressing recv-floor restore must be accepted and max-merged");
+
+        let merged = provider.export_recv_sequence_floors(&ctx_id);
+        assert!(
+            merged.iter().any(|(d, f)| d == dave_did && *f == (9, 5)),
+            "Dave's floor must advance to the higher restored value (9, 5)"
+        );
+        assert!(
+            merged.iter().any(|(d, f)| d == erin_did && *f == (7, 90)),
+            "Erin's local-only floor (7, 90) must be retained (Invariant 4)"
+        );
+    }
+
+    #[test]
+    fn validate_and_merge_recv_sequence_floors_rejects_overshoot_on_import() {
+        // §23.17.3 Invariant 3 (epoch-poisoning guard) — the UNTRUSTED IMPORT
+        // path: an imported recv floor whose EPOCH overshoots the sender's
+        // already-merged sender-key epoch floor by more than MAX_EPOCH_ADVANCE
+        // must be rejected, so a signature-valid but malicious/compromised
+        // exporter cannot pin a third party's recv floor at epoch = u64::MAX and
+        // permanently lock that sender out. Mirrors the epoch twin's
+        // `validate_and_merge_epoch_floors_restore_rejects_overshoot`. The bound
+        // is keyed off `sender_key_store.epoch(ctx, did)` — the epoch floor the
+        // epoch merge has already validated (it runs BEFORE this merge in
+        // `restore_crypto_state_with_floor_guard`), which also covers senders
+        // present only in the import.
+        let provider = make_provider();
+        let ctx_id = make_context_id();
+        provider.create_mls_group(&ctx_id).unwrap();
+        provider.generate_sender_key(&ctx_id).unwrap();
+
+        let dave_did = "did:dht:z6MkDaveDaveDaveDaveDaveDaveDaveDaveDaveDa";
+        let ctx_id_hex = hex::encode(ctx_id);
+
+        // Sender-key epoch floor for Dave is 1 (already max-merged by the epoch
+        // twin). Live recv floor (1, 10) keeps `local_floors` non-empty (not the
+        // cold-restart no-op).
+        {
+            let mut entry = provider.contexts.get_mut(&ctx_id).unwrap();
+            let state = entry.value_mut();
+            state
+                .sender_key_store
+                .restore_epoch_high_water(&ctx_id_hex, dave_did, 1);
+            state
+                .recv_sequence_tracker
+                .insert(dave_did.to_owned(), (1, 10));
+        }
+        let live_floors = provider.export_recv_sequence_floors(&ctx_id);
+
+        // Restore writes a recv floor whose epoch overshoots the ceiling
+        // (sender_key_epoch 1 + MAX_EPOCH_ADVANCE).
+        let overshoot_epoch = 1 + MAX_EPOCH_ADVANCE + 1;
+        {
+            let mut entry = provider.contexts.get_mut(&ctx_id).unwrap();
+            entry
+                .value_mut()
+                .recv_sequence_tracker
+                .insert(dave_did.to_owned(), (overshoot_epoch, 5));
+        }
+
+        let err = provider
+            .validate_and_merge_recv_sequence_floors(&ctx_id, live_floors, false)
+            .expect_err("an imported recv epoch overshooting the ceiling must be rejected");
+        match err {
+            ContextError::SnapshotFloorRegression {
+                resource,
+                per_sender_deltas,
+            } => {
+                assert_eq!(resource, "recv_sequence");
+                assert!(
+                    per_sender_deltas
+                        .iter()
+                        .any(|(d, ceiling, incoming)| d == dave_did
+                            && *ceiling == 1 + MAX_EPOCH_ADVANCE
+                            && *incoming == overshoot_epoch),
+                    "overshoot delta must report (ceiling, incoming_epoch), got {per_sender_deltas:?}"
+                );
+            }
+            other => panic!("expected SnapshotFloorRegression, got {other:?}"),
+        }
+
+        // Atomic reject: no merge applied — the tracker still holds exactly what
+        // restore wrote (the overshoot), unmodified.
+        let after = provider.export_recv_sequence_floors(&ctx_id);
+        assert!(
+            after
+                .iter()
+                .any(|(d, f)| d == dave_did && *f == (overshoot_epoch, 5)),
+            "a rejected overshoot must not merge; the tracker is unchanged"
+        );
+    }
+
+    #[test]
+    fn validate_and_merge_recv_sequence_floors_accepts_within_ceiling_import() {
+        // No false-positive: an imported recv floor whose epoch is within
+        // `sender_key_epoch + MAX_EPOCH_ADVANCE` is ACCEPTED on the untrusted
+        // path. The boundary is inclusive (only `> ceiling` rejects).
+        let provider = make_provider();
+        let ctx_id = make_context_id();
+        provider.create_mls_group(&ctx_id).unwrap();
+        provider.generate_sender_key(&ctx_id).unwrap();
+
+        let dave_did = "did:dht:z6MkDaveDaveDaveDaveDaveDaveDaveDaveDaveDa";
+        let ctx_id_hex = hex::encode(ctx_id);
+
+        // Sender-key epoch floor 5; live recv floor (5, 20).
+        {
+            let mut entry = provider.contexts.get_mut(&ctx_id).unwrap();
+            let state = entry.value_mut();
+            state
+                .sender_key_store
+                .restore_epoch_high_water(&ctx_id_hex, dave_did, 5);
+            state
+                .recv_sequence_tracker
+                .insert(dave_did.to_owned(), (5, 20));
+        }
+        let live_floors = provider.export_recv_sequence_floors(&ctx_id);
+
+        // Restore advances the recv floor to EXACTLY the ceiling epoch
+        // (5 + MAX_EPOCH_ADVANCE) — allowed.
+        let ceiling_epoch = 5 + MAX_EPOCH_ADVANCE;
+        {
+            let mut entry = provider.contexts.get_mut(&ctx_id).unwrap();
+            entry
+                .value_mut()
+                .recv_sequence_tracker
+                .insert(dave_did.to_owned(), (ceiling_epoch, 0));
+        }
+
+        provider
+            .validate_and_merge_recv_sequence_floors(&ctx_id, live_floors, false)
+            .expect(
+                "a recv floor at exactly the ceiling epoch must be accepted (no false-positive)",
+            );
+
+        let merged = provider.export_recv_sequence_floors(&ctx_id);
+        assert!(
+            merged
+                .iter()
+                .any(|(d, f)| d == dave_did && *f == (ceiling_epoch, 0)),
+            "the within-ceiling import must merge to the higher (ceiling_epoch, 0)"
         );
     }
 
