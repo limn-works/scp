@@ -4666,7 +4666,7 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
             format!("context '{context_id}' not registered with Supervisor for capability check")
         })?;
 
-        if scp_core::context::outlets::invoke::has_outlet_invoke_capability(
+        if scp_core::context::outlets::invoke::has_outlet_call_capability(
             &role_state,
             &self.agent_did,
             outlet_name,
@@ -6858,8 +6858,15 @@ pub fn media_check_capability(ceiling: Vec<String>, capability: String) -> Resul
     let cap = parse_media_capability(&capability)?;
     let param_caps: Vec<scp_core::context::params::Capability> = ceiling
         .iter()
-        .filter_map(scp_core::context::params::Capability::new)
-        .collect();
+        .map(|s| {
+            scp_core::context::params::Capability::new(s).ok_or_else(|| ScpError::Validation {
+                msg: format!(
+                    "invalid capability {s:?} in ceiling (fails §5.4.2.1 parser) (use \"outlet:call:*\" for actions, \"outlet:query:*\" for reads)"
+                ),
+                code: codes::VALID_7000.to_owned(),
+            })
+        })
+        .collect::<Result<Vec<_>, ScpError>>()?;
     scp_media::session::check_media_capability(&param_caps, &cap).map_err(|e| {
         ScpError::Context {
             msg: e.to_string(),
@@ -6888,8 +6895,15 @@ pub fn media_initiate_session(
 
     let param_caps: Vec<scp_core::context::params::Capability> = ceiling
         .iter()
-        .filter_map(scp_core::context::params::Capability::new)
-        .collect();
+        .map(|s| {
+            scp_core::context::params::Capability::new(s).ok_or_else(|| ScpError::Validation {
+                msg: format!(
+                    "invalid capability {s:?} in ceiling (fails §5.4.2.1 parser) (use \"outlet:call:*\" for actions, \"outlet:query:*\" for reads)"
+                ),
+                code: codes::VALID_7000.to_owned(),
+            })
+        })
+        .collect::<Result<Vec<_>, ScpError>>()?;
 
     let session = scp_media::session::initiate_media_session(
         context_id,
@@ -8058,12 +8072,26 @@ pub fn sandbox_validate_declaration(
 
     let ceiling: Vec<Capability> = ceiling_capabilities
         .iter()
-        .filter_map(Capability::new)
-        .collect();
+        .map(|s| {
+            Capability::new(s).ok_or_else(|| ScpError::Validation {
+                msg: format!(
+                    "invalid capability {s:?} in ceiling (fails §5.4.2.1 parser) (use \"outlet:call:*\" for actions, \"outlet:query:*\" for reads)"
+                ),
+                code: codes::VALID_7000.to_owned(),
+            })
+        })
+        .collect::<Result<Vec<_>, ScpError>>()?;
     let role_caps: Vec<Capability> = role_capabilities
         .iter()
-        .filter_map(Capability::new)
-        .collect();
+        .map(|s| {
+            Capability::new(s).ok_or_else(|| ScpError::Validation {
+                msg: format!(
+                    "invalid capability {s:?} in role (fails §5.4.2.1 parser) (use \"outlet:call:*\" for actions, \"outlet:query:*\" for reads)"
+                ),
+                code: codes::VALID_7000.to_owned(),
+            })
+        })
+        .collect::<Result<Vec<_>, ScpError>>()?;
 
     let handle = CoreContextHandle::new("validation-context".to_owned(), ContextParams::default());
 

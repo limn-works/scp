@@ -1521,7 +1521,7 @@ pub fn register_ffi_state(
                     let cap =
                         scp_core::context::roles::Capability::new(entry).ok_or_else(|| {
                             ScpPyError::context(format!(
-                                "invalid capability {entry:?} in ceiling (fails §5.4.2.1 parser)"
+                                "invalid capability {entry:?} in ceiling (fails §5.4.2.1 parser) (use \"outlet:call:*\" for actions, \"outlet:query:*\" for reads)"
                             ))
                         })?;
                     cap.validate_as_ceiling_entry()

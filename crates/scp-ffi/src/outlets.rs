@@ -868,7 +868,7 @@ fn outlet_invoke_cross_context_impl(
 
     // Defense-in-depth: check role-state capabilities in the source context.
     let source_has_capability = crate::runtime::with_context(bi, source_context_id, |rt| {
-        Ok(scp_core::context::outlets::has_outlet_invoke_capability(
+        Ok(scp_core::context::outlets::has_outlet_call_capability(
             &rt.role_state,
             invoker_did,
             outlet_id,
@@ -1424,7 +1424,7 @@ fn outlet_session_invoke_impl(
 
         // Defense-in-depth: check role-state capabilities in addition to the
         // UCAN layer. See §7.2 and ADR-010 for the dual-check design.
-        if !scp_core::context::outlets::has_outlet_invoke_capability(
+        if !scp_core::context::outlets::has_outlet_call_capability(
             &rt.role_state,
             invoker_did,
             &outlet_id,

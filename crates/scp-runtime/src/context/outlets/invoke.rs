@@ -25,7 +25,7 @@ use scp_protocol::context::outlets::lifecycle::{
 use scp_protocol::context::outlets::registry::OutletRegistry;
 use scp_protocol::context::outlets::schema::validate_value_against_schema;
 use scp_protocol::context::outlets::stream::StreamTerminalStatus;
-use scp_protocol::context::roles::{Capability, ContextRoleState};
+use scp_protocol::context::roles::ContextRoleState;
 use scp_protocol::crypto::ucan::capability::CapabilityUri;
 use scp_protocol::crypto::ucan::validate::{
     DidResolver, NonceTracker, ProofResolver, RevocationChecker, ValidationContext, parse_ucan,
@@ -187,8 +187,10 @@ pub struct OutletEconomyContext<'a, S: BuildHasher = std::hash::RandomState> {
 ///
 /// Execution flow:
 /// 1. Validates context state is [`Active`](ContextState::Active).
-/// 2. Validates invoker has [`OutletCall(outlet_id)`](Capability::OutletCall)
-///    or [`OutletCallAll`](Capability::OutletCallAll) capability via UCAN.
+/// 2. Validates invoker has
+///    [`OutletCall(outlet_id)`](scp_protocol::context::roles::Capability::OutletCall)
+///    or [`OutletCallAll`](scp_protocol::context::roles::Capability::OutletCallAll)
+///    capability via UCAN.
 /// 3. Looks up the tool in the registry.
 /// 4. Validates input against the tool's input schema.
 ///    - 4a. Economy: checks budget and UCAN composition (if economy context provided).
@@ -253,7 +255,7 @@ where
             current_state: state.to_string(),
         });
     }
-    if !has_outlet_invoke_capability(role_state, invoker_did, outlet_id) {
+    if !has_outlet_call_capability(role_state, invoker_did, outlet_id) {
         return Err(InvocationError::InvokerNotAuthorized {
             did: invoker_did.to_string(),
             outlet_id: outlet_id.to_owned(),
@@ -444,7 +446,7 @@ where
     }
 
     // 2. Validate invoker has OutletCall(outlet_id) or OutletCallAll capability.
-    if !has_outlet_invoke_capability(role_state, invoker_did, outlet_id) {
+    if !has_outlet_call_capability(role_state, invoker_did, outlet_id) {
         return Err(InvocationError::InvokerNotAuthorized {
             did: invoker_did.to_string(),
             outlet_id: outlet_id.to_owned(),
@@ -679,7 +681,7 @@ where
             current_state: state.to_string(),
         });
     }
-    if !has_outlet_invoke_capability(role_state, invoker_did, outlet_id) {
+    if !has_outlet_call_capability(role_state, invoker_did, outlet_id) {
         return Err(InvocationError::InvokerNotAuthorized {
             did: invoker_did.to_string(),
             outlet_id: outlet_id.to_owned(),
@@ -1106,19 +1108,17 @@ fn elapsed_ms(start: std::time::Instant) -> u64 {
 /// capability.
 ///
 /// This is the integration point between the invocation module and the
-/// UCAN-based role system (ADR-009).
+/// UCAN-based role system (ADR-009). It is a thin wrapper that delegates to
+/// [`scp_protocol::context::outlets::has_outlet_call_capability`] — the single
+/// source of truth for outlet-call capability checks — so the runtime and
+/// protocol layers cannot drift.
 #[must_use]
-pub fn has_outlet_invoke_capability(
+pub fn has_outlet_call_capability(
     role_state: &ContextRoleState,
     did: &str,
     outlet_id: &str,
 ) -> bool {
-    // Check for OutletCallAll first (broader permission).
-    if role_state.member_has_capability(did, &Capability::OutletCallAll) {
-        return true;
-    }
-    // Check for specific OutletCall(outlet_id).
-    role_state.member_has_capability(did, &Capability::OutletCall(outlet_id.to_owned()))
+    scp_protocol::context::outlets::has_outlet_call_capability(role_state, did, outlet_id)
 }
 
 // ---------------------------------------------------------------------------
@@ -1132,7 +1132,7 @@ pub fn has_outlet_invoke_capability(
 /// scoped to the given context.
 ///
 /// This is the primary authorization gate for tool invocations. Role-based
-/// `has_outlet_invoke_capability` remains as defense-in-depth.
+/// `has_outlet_call_capability` remains as defense-in-depth.
 ///
 /// # Arguments
 ///
@@ -1180,7 +1180,7 @@ mod tests {
     use scp_protocol::context::outlets::registry::{
         OutletRegistration, OutletSchema, register_outlet,
     };
-    use scp_protocol::context::roles::{CapabilityCeiling, ContextRoleState};
+    use scp_protocol::context::roles::{Capability, CapabilityCeiling, ContextRoleState};
 
     /// Creates a test capability ceiling with all capabilities.
     fn test_ceiling() -> CapabilityCeiling {
@@ -1687,13 +1687,13 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // has_outlet_invoke_capability
+    // has_outlet_call_capability
     // -----------------------------------------------------------------------
 
     #[test]
-    fn has_tool_invoke_capability_returns_true_for_invoke_all() {
+    fn has_outlet_call_capability_returns_true_for_invoke_all() {
         let role_state = test_role_state("did:dht:z6MkCreator");
-        assert!(has_outlet_invoke_capability(
+        assert!(has_outlet_call_capability(
             &role_state,
             "did:dht:z6MkCreator",
             "any-tool"
@@ -1701,10 +1701,10 @@ mod tests {
     }
 
     #[test]
-    fn has_tool_invoke_capability_returns_false_without_capability() {
+    fn has_outlet_call_capability_returns_false_without_capability() {
         let role_state =
             test_role_state_with_no_invoke_member("did:dht:z6MkCreator", "did:dht:z6MkMember");
-        assert!(!has_outlet_invoke_capability(
+        assert!(!has_outlet_call_capability(
             &role_state,
             "did:dht:z6MkMember",
             "calculator"
@@ -1712,7 +1712,7 @@ mod tests {
     }
 
     #[test]
-    fn has_tool_invoke_capability_with_specific_tool() {
+    fn has_outlet_call_capability_with_specific_tool() {
         let mut role_state =
             test_role_state_with_no_invoke_member("did:dht:z6MkCreator", "did:dht:z6MkMember");
         // Add specific OutletCall capability.
@@ -1722,13 +1722,13 @@ mod tests {
             .unwrap()
             .insert(Capability::OutletCall("calculator".to_owned()));
 
-        assert!(has_outlet_invoke_capability(
+        assert!(has_outlet_call_capability(
             &role_state,
             "did:dht:z6MkMember",
             "calculator"
         ));
         // But not for a different tool.
-        assert!(!has_outlet_invoke_capability(
+        assert!(!has_outlet_call_capability(
             &role_state,
             "did:dht:z6MkMember",
             "other-tool"

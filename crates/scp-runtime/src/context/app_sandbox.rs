@@ -140,17 +140,17 @@ impl CapabilityEntry {
     #[must_use]
     pub fn to_capabilities(&self) -> Vec<Capability> {
         // Extract the capability category from the resource URI.
-        // Format: scp:ctx:{context_id}/{category} or scp:ctx:{context_id}/tools/{outlet_id}
+        // Format: scp:ctx:{context_id}/{category} or scp:ctx:{context_id}/outlets/{outlet_id}
         let category = self.resource.rsplit('/').next().unwrap_or(&self.resource);
 
-        // Check if this is a tools/{outlet_id} resource
+        // Check if this is an outlets/{outlet_id} resource
         let parts: Vec<&str> = self.resource.split('/').collect();
-        let is_tool = parts.len() >= 2 && parts[parts.len() - 2] == "tools";
+        let is_outlet = parts.len() >= 2 && parts[parts.len() - 2] == "outlets";
 
         let mut capabilities = Vec::new();
 
         for action in &self.actions {
-            match (category, action.as_str(), is_tool) {
+            match (category, action.as_str(), is_outlet) {
                 (_, "invoke", true) => {
                     capabilities.push(Capability::OutletCall(category.to_owned()));
                 }
@@ -161,8 +161,8 @@ impl CapabilityEntry {
                 ("members", "write" | "admin", _) => {
                     capabilities.push(Capability::MemberInvite);
                 }
-                ("tools", "invoke", _) => capabilities.push(Capability::OutletCallAll),
-                ("tools", "register" | "admin", _) => {
+                ("outlets", "invoke", _) => capabilities.push(Capability::OutletCallAll),
+                ("outlets", "register" | "admin", _) => {
                     capabilities.push(Capability::OutletRegister);
                 }
                 ("governance", "write", _) => capabilities.push(Capability::GovernancePropose),
@@ -769,11 +769,16 @@ pub fn validate_declaration(
 
     for cap in &requested {
         if !ceiling_set.contains(cap) {
-            // Check if OutletCallAll covers OutletCall(specific)
-            if matches!(cap, Capability::OutletCall(_))
-                && ceiling_set.contains(&Capability::OutletCallAll)
+            // The "All"-covers-specific shortcut mirrors `CapabilityCeiling::contains`
+            // (roles.rs): `OutletCallAll` covers `OutletCall(id)` and `OutletQueryAll`
+            // covers `OutletQuery(id)`. The two classes are disjoint (query ≠ call,
+            // §5.4.2), so each wildcard only covers its own family.
+            if (matches!(cap, Capability::OutletCall(_))
+                && ceiling_set.contains(&Capability::OutletCallAll))
+                || (matches!(cap, Capability::OutletQuery(_))
+                    && ceiling_set.contains(&Capability::OutletQueryAll))
             {
-                // OutletCallAll in ceiling covers specific OutletCall
+                // A wildcard in the ceiling covers this specific capability.
             } else {
                 denied.push(DeniedCapability {
                     capability: cap.clone(),
@@ -782,11 +787,13 @@ pub fn validate_declaration(
             }
         }
         if !role_set.contains(cap) {
-            // Check if OutletCallAll covers OutletCall(specific)
-            if matches!(cap, Capability::OutletCall(_))
-                && role_set.contains(&Capability::OutletCallAll)
+            // Same "All"-covers-specific shortcut for the role's granted set.
+            if (matches!(cap, Capability::OutletCall(_))
+                && role_set.contains(&Capability::OutletCallAll))
+                || (matches!(cap, Capability::OutletQuery(_))
+                    && role_set.contains(&Capability::OutletQueryAll))
             {
-                // OutletCallAll in role covers specific OutletCall
+                // A wildcard in the role covers this specific capability.
             } else {
                 denied.push(DeniedCapability {
                     capability: cap.clone(),
@@ -1766,9 +1773,9 @@ mod tests {
     }
 
     #[test]
-    fn capability_entry_tools_invoke() {
+    fn capability_entry_outlets_invoke() {
         let entry = CapabilityEntry {
-            resource: "scp:ctx:test/tools".to_owned(),
+            resource: "scp:ctx:test/outlets".to_owned(),
             actions: vec!["invoke".to_owned()],
             constraints: None,
         };
@@ -1777,14 +1784,14 @@ mod tests {
     }
 
     #[test]
-    fn capability_entry_specific_tool() {
+    fn capability_entry_specific_outlet() {
         let entry = CapabilityEntry {
-            resource: "scp:ctx:test/tools/my_tool".to_owned(),
+            resource: "scp:ctx:test/outlets/my_outlet".to_owned(),
             actions: vec!["invoke".to_owned()],
             constraints: None,
         };
         let caps = entry.to_capabilities();
-        assert_eq!(caps, vec![Capability::OutletCall("my_tool".to_owned())]);
+        assert_eq!(caps, vec![Capability::OutletCall("my_outlet".to_owned())]);
     }
 
     #[test]
@@ -1899,15 +1906,15 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn tool_invoke_all_covers_specific_tool_in_ceiling() {
+    fn outlet_call_all_covers_specific_outlet_in_ceiling() {
         let (signing_key, did) = test_keypair();
         let mut decl = CapabilityDeclaration {
             scp_version: "1.0".to_owned(),
             app_id: did.clone(),
-            app_name: "Tool App".to_owned(),
+            app_name: "Outlet App".to_owned(),
             app_version: "1.0.0".to_owned(),
             capabilities: vec![CapabilityEntry {
-                resource: "scp:ctx:test/tools/specific_tool".to_owned(),
+                resource: "scp:ctx:test/outlets/specific_outlet".to_owned(),
                 actions: vec!["invoke".to_owned()],
                 constraints: None,
             }],
@@ -1916,7 +1923,7 @@ mod tests {
         };
         sign_declaration(&mut decl, &signing_key).unwrap();
 
-        // Ceiling has OutletCallAll, not the specific tool.
+        // Ceiling has OutletCallAll, not the specific outlet.
         let ceiling = vec![Capability::OutletCallAll];
         let role_caps = vec![Capability::OutletCallAll];
         let handle = ContextHandle::new("ctx-1".to_owned(), ContextParams::default());
@@ -2377,7 +2384,7 @@ mod tests {
                     }),
                 },
                 CapabilityEntry {
-                    resource: "scp:ctx:test/tools/scheduler".to_owned(),
+                    resource: "scp:ctx:test/outlets/scheduler".to_owned(),
                     actions: vec!["invoke".to_owned()],
                     constraints: Some(CapabilityConstraint {
                         max_message_size: None,

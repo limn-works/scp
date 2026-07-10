@@ -779,7 +779,7 @@ impl ContextProvider for FfiBridgeProvider {
         // Defense-in-depth: check role-state capabilities in addition to the
         // UCAN layer. See §7.2 and ADR-010 for the dual-check design.
         crate::runtime::with_context(&bi, context_id, |rt| {
-            if scp_core::context::outlets::invoke::has_outlet_invoke_capability(
+            if scp_core::context::outlets::invoke::has_outlet_call_capability(
                 &rt.role_state,
                 &self.agent_did,
                 tool_name,

@@ -42,7 +42,7 @@ use scp_protocol::context::roles::{
 };
 use scp_protocol::context::{ContextParams, ContextState, MemoryScope};
 use scp_runtime::context::ContextHandle;
-use scp_runtime::context::outlets::invoke::{has_outlet_invoke_capability, invoke_outlet};
+use scp_runtime::context::outlets::invoke::{has_outlet_call_capability, invoke_outlet};
 use scp_runtime::event_log::KeyCustodySigner;
 
 // ---------------------------------------------------------------------------
@@ -534,7 +534,7 @@ async fn phase2_end_to_end_integration() {
     // -----------------------------------------------------------------------
 
     // Verify Bob has tool invoke capability.
-    assert!(has_outlet_invoke_capability(
+    assert!(has_outlet_call_capability(
         &role_state,
         &bob_did,
         "calculator"

@@ -1786,8 +1786,10 @@ fn build_batch_publish_dict(
 ///
 /// # Errors
 ///
-/// Returns `PyValueError` if the declaration JSON is malformed, or
-/// `PyRuntimeError` if serialization of the result fails.
+/// Returns `PyValueError` if the declaration JSON is malformed or if any
+/// `ceiling`/`role` capability string fails the §5.4.2.1 parser (fail-loud —
+/// malformed entries are rejected, not silently dropped), or `PyRuntimeError`
+/// if serialization of the result fails.
 #[pyfunction]
 fn py_validate_capability_declaration(
     declaration_json: String,
@@ -1803,12 +1805,24 @@ fn py_validate_capability_declaration(
 
     let ceiling: Vec<Capability> = ceiling_capabilities
         .iter()
-        .filter_map(Capability::new)
-        .collect();
+        .map(|s| {
+            Capability::new(s).ok_or_else(|| {
+                PyValueError::new_err(format!(
+                    "invalid capability {s:?} in ceiling (fails §5.4.2.1 parser) (use \"outlet:call:*\" for actions, \"outlet:query:*\" for reads)"
+                ))
+            })
+        })
+        .collect::<PyResult<Vec<_>>>()?;
     let role_caps: Vec<Capability> = role_capabilities
         .iter()
-        .filter_map(Capability::new)
-        .collect();
+        .map(|s| {
+            Capability::new(s).ok_or_else(|| {
+                PyValueError::new_err(format!(
+                    "invalid capability {s:?} in role (fails §5.4.2.1 parser) (use \"outlet:call:*\" for actions, \"outlet:query:*\" for reads)"
+                ))
+            })
+        })
+        .collect::<PyResult<Vec<_>>>()?;
 
     let handle = ContextHandle::new("validation-context".to_owned(), ContextParams::default());
 

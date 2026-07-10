@@ -151,8 +151,17 @@ pub fn py_media_check_capability(ceiling: Vec<String>, capability: &str) -> PyRe
     let cap = parse_media_capability(capability)?;
     let param_caps: Vec<scp_core::context::params::Capability> = ceiling
         .iter()
-        .filter_map(scp_core::context::params::Capability::new)
-        .collect();
+        .map(|s| {
+            scp_core::context::params::Capability::new(s).ok_or_else(|| {
+                PyErr::from(ScpPyError::ValidationError {
+                    message: format!(
+                        "invalid capability {s:?} in ceiling (fails §5.4.2.1 parser) (use \"outlet:call:*\" for actions, \"outlet:query:*\" for reads)"
+                    ),
+                    code: codes::VALID_7000.to_string(),
+                })
+            })
+        })
+        .collect::<PyResult<Vec<_>>>()?;
     check_media_capability(&param_caps, &cap).map_err(media_error_to_py)?;
     Ok(true)
 }
@@ -194,8 +203,17 @@ pub fn py_media_initiate_session(
 
     let param_caps: Vec<scp_core::context::params::Capability> = ceiling
         .iter()
-        .filter_map(scp_core::context::params::Capability::new)
-        .collect();
+        .map(|s| {
+            scp_core::context::params::Capability::new(s).ok_or_else(|| {
+                PyErr::from(ScpPyError::ValidationError {
+                    message: format!(
+                        "invalid capability {s:?} in ceiling (fails §5.4.2.1 parser) (use \"outlet:call:*\" for actions, \"outlet:query:*\" for reads)"
+                    ),
+                    code: codes::VALID_7000.to_string(),
+                })
+            })
+        })
+        .collect::<PyResult<Vec<_>>>()?;
 
     let session = initiate_media_session(
         context_id,

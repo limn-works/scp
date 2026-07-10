@@ -76,7 +76,7 @@ The capability declaration uses JSON Schema (MCP-compatible) with SCP-specific e
       "actions": ["read"]
     },
     {
-      "resource": "scp:ctx:{context_id}/tools/{tool_id}",
+      "resource": "scp:ctx:{context_id}/outlets/{outlet_id}",
       "actions": ["invoke"],
       "constraints": {
         "max_invocations_per_minute": 60
@@ -97,7 +97,7 @@ The capability declaration uses JSON Schema (MCP-compatible) with SCP-specific e
 | `app_name` | string | Yes | Human-readable app name. Maximum 128 UTF-8 bytes. |
 | `app_version` | string | Yes | App version. SemVer format (`MAJOR.MINOR.PATCH`). |
 | `capabilities` | array | Yes | List of requested capabilities. Each entry specifies a resource URI and actions. Minimum 1 entry, maximum 64 entries. |
-| `capabilities[].resource` | string | Yes | SCP resource URI. Format: `scp:ctx:{context_id}/{capability_category}` or `scp:ctx:{context_id}/tools/{tool_id}` for specific tools. The `{context_id}` is a template variable resolved at binding time. |
+| `capabilities[].resource` | string | Yes | SCP resource URI. Format: `scp:ctx:{context_id}/{capability_category}` or `scp:ctx:{context_id}/outlets/{outlet_id}` for specific outlets. The `{context_id}` is a template variable resolved at binding time. |
 | `capabilities[].actions` | array | Yes | Actions requested on the resource: `"read"`, `"write"`, `"invoke"`, `"admin"`. Minimum 1 action. |
 | `capabilities[].constraints` | object | No | Optional constraints on the capability (rate limits, size limits, type restrictions). App-defined; the protocol validates that constraints are a subset of the context's ceiling. |
 | `min_role` | string | Yes | Minimum context role required for this app to function. Built-in roles: `"observer"`, `"member"`, `"moderator"`, `"admin"` (§5.5). Contexts may also define custom roles; apps targeting custom roles should use the custom role name here. |

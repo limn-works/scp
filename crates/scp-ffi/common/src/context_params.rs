@@ -134,7 +134,9 @@ pub fn build_context_params(params: &CommonContextParams) -> Result<ContextParam
         .iter()
         .map(|s| {
             Capability::new(s).ok_or_else(|| {
-                format!("invalid capability {s:?} in ceiling (fails §5.4.2.1 parser)")
+                format!(
+                    "invalid capability {s:?} in ceiling (fails §5.4.2.1 parser) (use \"outlet:call:*\" for actions, \"outlet:query:*\" for reads)"
+                )
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
@@ -292,7 +294,9 @@ fn build_roles(roles: &[(String, Vec<String>)]) -> Result<Vec<RoleDefinition>, S
                 .iter()
                 .map(|s| {
                     Capability::new(s).ok_or_else(|| {
-                        format!("invalid capability {s:?} in role {name:?} (fails §5.4.2.1 parser)")
+                        format!(
+                            "invalid capability {s:?} in role {name:?} (fails §5.4.2.1 parser) (use \"outlet:call:*\" for actions, \"outlet:query:*\" for reads)"
+                        )
                     })
                 })
                 .collect::<Result<HashSet<_>, String>>()?;

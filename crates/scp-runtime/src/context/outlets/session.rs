@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 
 use scp_clock::Clock;
 
-use super::invoke::has_outlet_invoke_capability;
+use super::invoke::has_outlet_call_capability;
 use scp_did::DID;
 use scp_protocol::context::outlets::registry::OutletRegistry;
 use scp_protocol::context::outlets::schema::validate_value_against_schema;
@@ -353,7 +353,7 @@ where
     let current_state = session.state.clone();
 
     // Per-call UCAN governance: validate invoker has ToolInvoke capability.
-    if !has_outlet_invoke_capability(role_state, invoker_did, &outlet_id) {
+    if !has_outlet_call_capability(role_state, invoker_did, &outlet_id) {
         return Err(OutletError::InvokerNotAuthorized {
             did: invoker_did.to_string(),
             outlet_id: outlet_id.clone(),

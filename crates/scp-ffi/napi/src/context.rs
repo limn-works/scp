@@ -4981,12 +4981,24 @@ pub(crate) fn validate_capability_declaration_on(
 
     let ceiling: Vec<Capability> = ceiling_capabilities
         .iter()
-        .filter_map(Capability::new)
-        .collect();
+        .map(|s| {
+            Capability::new(s).ok_or_else(|| {
+                NapiError::from_reason(format!(
+                    "invalid capability {s:?} in ceiling (fails §5.4.2.1 parser) (use \"outlet:call:*\" for actions, \"outlet:query:*\" for reads)"
+                ))
+            })
+        })
+        .collect::<napi::Result<Vec<_>>>()?;
     let role_caps: Vec<Capability> = role_capabilities
         .iter()
-        .filter_map(Capability::new)
-        .collect();
+        .map(|s| {
+            Capability::new(s).ok_or_else(|| {
+                NapiError::from_reason(format!(
+                    "invalid capability {s:?} in role (fails §5.4.2.1 parser) (use \"outlet:call:*\" for actions, \"outlet:query:*\" for reads)"
+                ))
+            })
+        })
+        .collect::<napi::Result<Vec<_>>>()?;
 
     let handle = ContextHandle::new("validation-context".to_owned(), ContextParams::default());
 

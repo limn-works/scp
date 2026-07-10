@@ -1594,7 +1594,7 @@ fn build_ucan_context_state(
             let cap = scp_core::context::roles::Capability::new(entry).ok_or_else(|| {
                 ScpNapiError::Validation {
                     message: format!(
-                        "invalid capability {entry:?} in ceiling (fails §5.4.2.1 parser)"
+                        "invalid capability {entry:?} in ceiling (fails §5.4.2.1 parser) (use \"outlet:call:*\" for actions, \"outlet:query:*\" for reads)"
                     ),
                     code: codes::VALID_7000.to_owned(),
                 }
