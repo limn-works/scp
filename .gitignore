@@ -45,3 +45,8 @@ bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/internal/
 bindings/python/tests/bridge_parity/helpers/kotlin_bridge_runner/.gradle/
 bindings/python/tests/bridge_parity/helpers/kotlin_bridge_runner/build/
 bindings/python/tests/bridge_parity/helpers/swift_bridge_runner/.build/
+
+# ADR-049 Decision 14 perf_baseline harness — per-environment runtime artifact
+# recorded by the default `--test perf_baseline` run; never committed (one box's
+# numbers must not become a cross-machine gate reference).
+crates/scp-runtime/tests/perf_baseline.json
