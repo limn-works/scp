@@ -18,13 +18,13 @@ use std::time::Duration;
 use crate::context::ContextHandle;
 use scp_did::DID;
 use scp_protocol::context::ContextState;
-use scp_protocol::context::roles::{Capability, ContextRoleState};
 use scp_protocol::context::outlets::OutletId;
 use scp_protocol::context::outlets::lifecycle::{
     DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS, OutletInvokedEvent, OutletStatus, sha256_json,
 };
 use scp_protocol::context::outlets::registry::OutletRegistry;
 use scp_protocol::context::outlets::schema::validate_value_against_schema;
+use scp_protocol::context::roles::{Capability, ContextRoleState};
 use scp_protocol::crypto::ucan::capability::CapabilityUri;
 use scp_protocol::crypto::ucan::validate::{
     DidResolver, NonceTracker, ProofResolver, RevocationChecker, ValidationContext, parse_ucan,
@@ -292,7 +292,8 @@ where
     // 4b. Payment escrow (#1537, #1596): authorize (escrow hold) BEFORE tool execution.
     let escrow_parts = extract_escrow_parts(&economy);
     let mut escrow = if let Some((adapter, policy, metrics, ctx_id)) = &escrow_parts {
-        match authorize_outlet_payment(adapter.as_ref(), policy, ctx_id, invoker_did, metrics).await {
+        match authorize_outlet_payment(adapter.as_ref(), policy, ctx_id, invoker_did, metrics).await
+        {
             Ok(prepared) => prepared,
             Err(auth_err) => {
                 void_escrow_and_rollback(
@@ -709,7 +710,8 @@ where
     // 4b. Payment escrow (#1537, #1596): authorize (escrow hold) BEFORE tool execution.
     let escrow_parts = extract_escrow_parts(&economy);
     let mut escrow = if let Some((adapter, policy, metrics, ctx_id)) = &escrow_parts {
-        match authorize_outlet_payment(adapter.as_ref(), policy, ctx_id, invoker_did, metrics).await {
+        match authorize_outlet_payment(adapter.as_ref(), policy, ctx_id, invoker_did, metrics).await
+        {
             Ok(prepared) => prepared,
             Err(auth_err) => {
                 void_escrow_and_rollback(
@@ -1129,7 +1131,11 @@ fn elapsed_ms(start: std::time::Instant) -> u64 {
 /// This is the integration point between the invocation module and the
 /// UCAN-based role system (ADR-009).
 #[must_use]
-pub fn has_outlet_invoke_capability(role_state: &ContextRoleState, did: &str, outlet_id: &str) -> bool {
+pub fn has_outlet_invoke_capability(
+    role_state: &ContextRoleState,
+    did: &str,
+    outlet_id: &str,
+) -> bool {
     // Check for ToolInvokeAll first (broader permission).
     if role_state.member_has_capability(did, &Capability::ToolInvokeAll) {
         return true;
@@ -1193,8 +1199,10 @@ mod tests {
 
     use super::*;
     use scp_protocol::context::ContextParams;
+    use scp_protocol::context::outlets::registry::{
+        OutletRegistration, OutletSchema, register_outlet,
+    };
     use scp_protocol::context::roles::{CapabilityCeiling, ContextRoleState};
-    use scp_protocol::context::outlets::registry::{OutletRegistration, OutletSchema, register_outlet};
 
     /// Creates a test capability ceiling with all capabilities.
     fn test_ceiling() -> CapabilityCeiling {

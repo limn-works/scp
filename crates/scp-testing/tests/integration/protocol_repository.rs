@@ -209,7 +209,10 @@ async fn delete_context_removes_all_associated_state() {
     store.store_context_params(ctx, b"params").await.unwrap();
     store.store_membership(ctx, &did, "member").await.unwrap();
     store.store_role(ctx, "admin", b"role-data").await.unwrap();
-    store.store_outlet(ctx, "tool-1", b"tool-reg").await.unwrap();
+    store
+        .store_outlet(ctx, "tool-1", b"tool-reg")
+        .await
+        .unwrap();
     store
         .store_outlet_session(ctx, "sess-1", b"sess-data")
         .await
@@ -746,7 +749,13 @@ async fn tool_store_load_list_delete_roundtrip() {
 
     // Delete.
     store.delete_outlet(ctx, "calculator").await.unwrap();
-    assert!(store.load_outlet(ctx, "calculator").await.unwrap().is_none());
+    assert!(
+        store
+            .load_outlet(ctx, "calculator")
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -820,7 +829,13 @@ async fn context_isolation_between_modules() {
         .unwrap();
 
     // Each context only has its own data.
-    assert!(store.load_outlet("ctx-1", "tool-1").await.unwrap().is_none());
+    assert!(
+        store
+            .load_outlet("ctx-1", "tool-1")
+            .await
+            .unwrap()
+            .is_none()
+    );
     assert!(
         store
             .load_ucan_token("ctx-1", "tok-1")
@@ -837,7 +852,13 @@ async fn context_isolation_between_modules() {
             .is_none()
     );
     assert!(store.load_context_state("ctx-3").await.unwrap().is_none());
-    assert!(store.load_outlet("ctx-3", "tool-1").await.unwrap().is_none());
+    assert!(
+        store
+            .load_outlet("ctx-3", "tool-1")
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 // =========================================================================

@@ -43,8 +43,8 @@ use scp_protocol::context::membership::ContextEvent;
 
 use crate::context::actor::commands::{
     BroadcastCommand, ContextCommand, EconomyCommand, GovernanceCommand, LifecycleCommand,
-    MessagingCommand, PrepareAOutcome, PrepareBOutcome, QueriesCommand, SagaReject,
-    StandingCommand, OutletsCommand, TrustRecoveryCommand, TtlCloseCommand, saga_reject,
+    MessagingCommand, OutletsCommand, PrepareAOutcome, PrepareBOutcome, QueriesCommand, SagaReject,
+    StandingCommand, TrustRecoveryCommand, TtlCloseCommand, saga_reject,
 };
 use crate::context::actor::handle::ContextActorHandle;
 use crate::context::actor::outcome::Outcome;
@@ -10319,7 +10319,8 @@ impl Supervisor {
         self.dispatch_outlets_command(cmd).await?;
         reply_rx.await.map_err(|_| {
             ContextError::TransportFailed(
-                "Supervisor::settle_outlet_economy_via_actor — actor reply channel closed".to_owned(),
+                "Supervisor::settle_outlet_economy_via_actor — actor reply channel closed"
+                    .to_owned(),
             )
         })?
     }
@@ -18596,8 +18597,8 @@ mod tests {
         caller_did: &str,
         creator_did: &str,
     ) -> crate::context::actor::state::PerContextState {
-        use scp_protocol::context::roles::Capability;
         use scp_protocol::context::outlets::registry::{OutletRegistration, OutletSchema};
+        use scp_protocol::context::roles::Capability;
         let mut st = crate::context::actor::state::PerContextState::new_for_test_encrypted(
             XCTX_TARGET,
             1_700_000_000,
@@ -23497,9 +23498,9 @@ mod tests {
         // difference from voiding is documented + asserted by the no-panic drop:
         // had the carrier been dropped WITHOUT being consumed, the debug-assert
         // in `OutletEconomyTicket::drop` would fire.
-        let ticket = crate::context::outlets_helpers::OutletEconomyTicket::new_for_test_no_escrow(DID(
-            "did:dht:z6MkHoldRepair".to_owned(),
-        ));
+        let ticket = crate::context::outlets_helpers::OutletEconomyTicket::new_for_test_no_escrow(
+            DID("did:dht:z6MkHoldRepair".to_owned()),
+        );
         ticket.hold_external_for_repair();
         // Reaching here without a drop-guard panic proves the carrier was marked
         // consumed (held for repair), not leaked.

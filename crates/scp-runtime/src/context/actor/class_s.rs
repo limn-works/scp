@@ -312,12 +312,12 @@ use scp_protocol::context::governance::{
     GovernanceEngine, GovernanceProposal, ProposalId, PruningPolicy,
 };
 use scp_protocol::context::membership::{MemberInfo, MembershipState, ReceiveBuffer};
+use scp_protocol::context::outlets::interface::OutletInterface;
 use scp_protocol::context::params::OutletRegistration;
 use scp_protocol::context::roles::{
     Capability, CapabilityCeiling, ContextRoleClassCParts, ContextRoleState, RoleAssignment,
     RoleDefinition, RoleError, UcanToken,
 };
-use scp_protocol::context::outlets::interface::OutletInterface;
 use scp_protocol::crypto::ucan::validate::InMemoryProofResolver;
 use scp_protocol::economy::antispam::{
     ContextMessagePricingConfig, SenderVelocityTracker, TokenBucketLimiter,

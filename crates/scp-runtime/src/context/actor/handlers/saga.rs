@@ -74,11 +74,11 @@ use crate::context::economy_logic::{ContextRevocationChecker, KeyResolverDidReso
 use crate::context::messaging_helpers::{
     build_snapshot_for_persist, persist_snapshot_fail_closed, persist_state_best_effort,
 };
+use crate::context::outlets_helpers::reserve_outlet_economy;
 use crate::context::supervisor::saga_journal::SagaId;
 use crate::context::supervisor::saga_prepared_state::{
     CommittedOutletInvocation, CrossContextOutletInvocationPrepared, SagaPreparedState,
 };
-use crate::context::outlets_helpers::reserve_outlet_economy;
 
 /// Eviction TTL for B's per-target cross-context-saga nonce-dedup cache
 /// ([`PerContextState::xctx_nonce_dedup`]).
@@ -511,7 +511,8 @@ async fn prepare_a(
     // `reserve_outlet_economy` is the spending-nonce-bearing leaf and takes the
     // cell; the prior `state` borrow has ended (NLL) so `cell` is free here.
     let reservation =
-        match reserve_outlet_economy(cell, deps, &context_id_hex, caller_did, None, now_secs).await {
+        match reserve_outlet_economy(cell, deps, &context_id_hex, caller_did, None, now_secs).await
+        {
             Ok(reservation) => reservation,
             Err(err) => {
                 // reserve_outlet_economy rolls back its OWN staged bookkeeping on
@@ -1171,8 +1172,11 @@ fn validate_ucan_rebind(
 
     // Required capability bound to B's OWN context + THIS tool + tool_invoke.
     let target_hex = hex_context_id(&req.target_context_id);
-    let required_cap =
-        CapabilityUri::new(target_hex, "tool_invoke", req.outlet_registration_id.clone());
+    let required_cap = CapabilityUri::new(
+        target_hex,
+        "tool_invoke",
+        req.outlet_registration_id.clone(),
+    );
 
     // The ceiling URI set + B's context-creator are taken from B's role state.
     let ceiling = state.role_state.ceiling().to_ucan_string_set();
@@ -2616,8 +2620,8 @@ mod tests {
     use scp_platform::traits::{KeyCustody, KeyType};
     use scp_protocol::context::ContextError;
     use scp_protocol::context::governance::KeyResolver;
-    use scp_protocol::context::roles::Capability;
     use scp_protocol::context::outlets::registry::{OutletRegistration, OutletSchema};
+    use scp_protocol::context::roles::Capability;
     use scp_protocol::crypto::ucan::UcanToken;
     use tokio::sync::oneshot;
 
@@ -3500,7 +3504,7 @@ mod tests {
     /// initiation-consumes-budget gate.
     #[tokio::test]
     async fn prepare_a_rejects_when_per_interface_rate_budget_exhausted() {
-        use scp_protocol::context::outlets::interface::{RateLimit, OutletInterface};
+        use scp_protocol::context::outlets::interface::{OutletInterface, RateLimit};
         use std::time::Duration;
         let issuer = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
         let mut st = target_state(0x11, OTHER, CALLER).await;
@@ -3560,7 +3564,7 @@ mod tests {
     /// `RateLimited` (SCP-SAGA-13024), independent of the per-interface window.
     #[tokio::test]
     async fn prepare_a_rejects_when_per_caller_rate_budget_exhausted() {
-        use scp_protocol::context::outlets::interface::{PerCallerRateLimit, OutletInterface};
+        use scp_protocol::context::outlets::interface::{OutletInterface, PerCallerRateLimit};
         use std::time::Duration;
         let issuer = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
         let mut st = target_state(0x11, OTHER, CALLER).await;
@@ -4362,7 +4366,10 @@ mod tests {
         // (incoming 2 + 1) and the staged wire nonce.
         assert_eq!(receipt.chain_depth, 3);
         assert_eq!(receipt.nonce, [0x42; 16]);
-        assert_eq!(receipt.outlet_invoked_event_id, settled.outlet_invoked_event_id);
+        assert_eq!(
+            receipt.outlet_invoked_event_id,
+            settled.outlet_invoked_event_id
+        );
         // The output was captured durably and the staged slot cleared.
         assert!(st_cell.class_s.xctx_committed_outputs.contains_key(&saga));
         assert!(st_cell.class_s.saga_pending.is_empty());

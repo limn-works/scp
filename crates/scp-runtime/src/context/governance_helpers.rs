@@ -35,9 +35,9 @@ use scp_protocol::context::governance::{
     ProposalId, ProposalStatus, PruningPolicy,
 };
 use scp_protocol::context::membership::{ContextEvent, ReceiveBuffer};
+use scp_protocol::context::outlets::interface::OutletInterface;
 use scp_protocol::context::params::OutletRegistration;
 use scp_protocol::context::roles::{self, Capability, CapabilityCeiling};
-use scp_protocol::context::outlets::interface::OutletInterface;
 use scp_protocol::context::{ContextError, ContextParams, ContextState};
 use scp_protocol::economy::types::EconomicPolicy;
 use tracing::instrument;

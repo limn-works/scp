@@ -2269,8 +2269,9 @@ pub enum OutletsCommand {
         request: Box<crate::context::outlets_helpers::OutletSettleRequest>,
         /// Oneshot reply channel carrying the Phase-3 settle outcome
         /// (consequences + receipt + committed cost).
-        reply:
-            oneshot::Sender<Result<crate::context::outlets_helpers::OutletSettleOutcome, ContextError>>,
+        reply: oneshot::Sender<
+            Result<crate::context::outlets_helpers::OutletSettleOutcome, ContextError>,
+        >,
     },
 }
 

@@ -20,9 +20,9 @@ use scp_core::context::governance::{
     ProposalStatus, PruningPolicy, SingleAdminEngine, VoteType, actions_conflict, sign_vote,
     verify_vote,
 };
-use scp_core::context::params::{Capability, ContextParams};
 use scp_core::context::outlets::OutletSchema;
 use scp_core::context::outlets::interface::OutletInterface;
+use scp_core::context::params::{Capability, ContextParams};
 use scp_core::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
 use scp_did::DID;
 

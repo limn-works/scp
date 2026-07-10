@@ -14,7 +14,7 @@ use std::time::Duration;
 use scp_core::context::ContextParams;
 use scp_core::context::params::{
     CeilingPolicy, ConsequenceConfig, ContextMode, GovernanceModel, IncompleteVerificationPolicy,
-    MemoryScope, MetadataVisibilityPolicy, PromotionPolicy, RoleDefinition, OutletRegistration,
+    MemoryScope, MetadataVisibilityPolicy, OutletRegistration, PromotionPolicy, RoleDefinition,
 };
 use scp_core::context::roles::Capability;
 use scp_core::provenance::CounterpartyPolicy;

@@ -405,8 +405,10 @@ mod tests {
 
     use super::*;
     use scp_protocol::context::ContextParams;
+    use scp_protocol::context::outlets::registry::{
+        OutletRegistration, OutletSchema, register_outlet,
+    };
     use scp_protocol::context::roles::{Capability, CapabilityCeiling, ContextRoleState};
-    use scp_protocol::context::outlets::registry::{OutletRegistration, OutletSchema, register_outlet};
 
     // -----------------------------------------------------------------------
     // Test helpers
