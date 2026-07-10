@@ -292,9 +292,7 @@ fn build_roles(roles: &[(String, Vec<String>)]) -> Result<Vec<RoleDefinition>, S
                 .iter()
                 .map(|s| {
                     Capability::new(s).ok_or_else(|| {
-                        format!(
-                            "invalid capability {s:?} in role {name:?} (fails §5.4.2.1 parser)"
-                        )
+                        format!("invalid capability {s:?} in role {name:?} (fails §5.4.2.1 parser)")
                     })
                 })
                 .collect::<Result<HashSet<_>, String>>()?;

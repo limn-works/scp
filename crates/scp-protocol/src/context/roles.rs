@@ -5788,7 +5788,11 @@ mod tests {
         for cap in &originals {
             let displayed = cap.to_string();
             let reparsed = Capability::new(&displayed);
-            assert_eq!(reparsed.as_ref(), Some(cap), "round-trip failed for {cap:?}");
+            assert_eq!(
+                reparsed.as_ref(),
+                Some(cap),
+                "round-trip failed for {cap:?}"
+            );
         }
     }
 

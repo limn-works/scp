@@ -6805,8 +6805,7 @@ mod tests {
                     .expect("known capability"),
                 scp_core::context::params::Capability::new("governance:vote")
                     .expect("known capability"),
-                scp_core::context::params::Capability::new("member:ban")
-                    .expect("known capability"),
+                scp_core::context::params::Capability::new("member:ban").expect("known capability"),
             ],
             ..scp_core::context::ContextParams::default()
         };
@@ -7384,7 +7383,7 @@ mod tests {
             default_params(),
         );
 
-        let json = r#"{"locked":false,"cost_schedule":{"currency":[85,83,68,0],"per_message":"1","per_tool_invoke":null,"per_join":null,"per_period":null,"per_byte_stored":null},"payment_adapters":[],"pricing_formula":null,"payee":"did:dht:z6MkPayee"}"#;
+        let json = r#"{"locked":false,"cost_schedule":{"currency":[85,83,68,0],"per_message":"1","per_outlet_call":null,"per_join":null,"per_period":null,"per_byte_stored":null},"payment_adapters":[],"pricing_formula":null,"payee":"did:dht:z6MkPayee"}"#;
         let scp = crate::scp::PyScp::new_in_memory_for_test();
         let result = scp.set_economic_policy(&mut handle, json);
         assert!(
@@ -7414,7 +7413,7 @@ mod tests {
 
     #[test]
     fn get_economic_policy_some() {
-        let json = r#"{"locked":false,"cost_schedule":{"currency":[85,83,68,0],"per_message":"1","per_tool_invoke":null,"per_join":null,"per_period":null,"per_byte_stored":null},"payment_adapters":[],"pricing_formula":null,"payee":"did:dht:z6MkPayee"}"#;
+        let json = r#"{"locked":false,"cost_schedule":{"currency":[85,83,68,0],"per_message":"1","per_outlet_call":null,"per_join":null,"per_period":null,"per_byte_stored":null},"payment_adapters":[],"pricing_formula":null,"payee":"did:dht:z6MkPayee"}"#;
         let scp = crate::scp::PyScp::new_in_memory_for_test();
         let handle = PyContextHandle::new(
             &scp.inner,

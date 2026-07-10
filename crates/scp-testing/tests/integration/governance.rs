@@ -103,7 +103,7 @@ fn simple_economic_policy() -> EconomicPolicy {
         cost_schedule: CostSchedule {
             currency: CurrencyCode::from("USD"),
             per_message: Some(Amount::new(1)),
-            per_tool_invoke: None,
+            per_outlet_call: None,
             per_join: None,
             per_period: None,
             per_byte_stored: None,

@@ -4606,8 +4606,7 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
                     // (per-edge narrow) and Step 11b (time-box) run over the
                     // proof chain's VALIDATED-NARROWED caveat set. Generic
                     // validate/evaluate sites stay on `NoCaveatResolver`.
-                    caveat_resolver:
-                        &scp_core::crypto::ucan::validate::TokenNbCaveatResolver,
+                    caveat_resolver: &scp_core::crypto::ucan::validate::TokenNbCaveatResolver,
                 };
 
                 scp_core::context::outlets::validate_outlet_invocation_ucan(
@@ -14683,8 +14682,7 @@ impl Scp {
                             // path, so caveat resolution is a constant `None`
                             // (`NoCaveatResolver`). Only outlet-invocation sites
                             // use `TokenNbCaveatResolver`.
-                            caveat_resolver:
-                                &scp_core::crypto::ucan::validate::NoCaveatResolver,
+                            caveat_resolver: &scp_core::crypto::ucan::validate::NoCaveatResolver,
                         };
 
                         validate_ucan(&parsed_token, &required_cap, &mut ctx).map_err(|e| {
@@ -14847,8 +14845,7 @@ impl Scp {
                             // path, so caveat resolution is a constant `None`
                             // (`NoCaveatResolver`). Only outlet-invocation sites
                             // use `TokenNbCaveatResolver`.
-                            caveat_resolver:
-                                &scp_core::crypto::ucan::validate::NoCaveatResolver,
+                            caveat_resolver: &scp_core::crypto::ucan::validate::NoCaveatResolver,
                         };
 
                         evaluate_ucan(&parsed_token, required_cap.as_ref(), &ctx)

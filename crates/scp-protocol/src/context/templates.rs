@@ -1051,7 +1051,12 @@ mod tests {
                 .iter()
                 .any(|c| c.name() == CAP_OUTLET_CALL_ALL)
         );
-        assert!(params.ceiling.iter().any(|c| c.name() == CAP_OUTLET_REGISTER));
+        assert!(
+            params
+                .ceiling
+                .iter()
+                .any(|c| c.name() == CAP_OUTLET_REGISTER)
+        );
         assert!(!params.ceiling.iter().any(|c| c.name() == CAP_MEMBER_BAN));
         assert_eq!(params.ceiling_policy, CeilingPolicy::Immutable);
         assert_eq!(params.promotion_policy, PromotionPolicy::NoPromotion);
@@ -1098,7 +1103,12 @@ mod tests {
                 .iter()
                 .any(|c| c.name() == CAP_OUTLET_CALL_ALL)
         );
-        assert!(params.ceiling.iter().any(|c| c.name() == CAP_OUTLET_REGISTER));
+        assert!(
+            params
+                .ceiling
+                .iter()
+                .any(|c| c.name() == CAP_OUTLET_REGISTER)
+        );
         assert!(!params.ceiling.iter().any(|c| c.name() == CAP_MEMBER_BAN));
         assert_eq!(params.ceiling_policy, CeilingPolicy::Immutable);
         assert_eq!(params.promotion_policy, PromotionPolicy::NoPromotion);
@@ -1329,22 +1339,37 @@ mod tests {
 
     #[test]
     fn capabilities_match_same_order() {
-        let a = vec![Capability::new("a").expect("known capability"), Capability::new("b").expect("known capability")];
-        let b = vec![Capability::new("a").expect("known capability"), Capability::new("b").expect("known capability")];
+        let a = vec![
+            Capability::new("a").expect("known capability"),
+            Capability::new("b").expect("known capability"),
+        ];
+        let b = vec![
+            Capability::new("a").expect("known capability"),
+            Capability::new("b").expect("known capability"),
+        ];
         assert!(capabilities_match(&a, &b));
     }
 
     #[test]
     fn capabilities_match_different_order() {
-        let a = vec![Capability::new("b").expect("known capability"), Capability::new("a").expect("known capability")];
-        let b = vec![Capability::new("a").expect("known capability"), Capability::new("b").expect("known capability")];
+        let a = vec![
+            Capability::new("b").expect("known capability"),
+            Capability::new("a").expect("known capability"),
+        ];
+        let b = vec![
+            Capability::new("a").expect("known capability"),
+            Capability::new("b").expect("known capability"),
+        ];
         assert!(capabilities_match(&a, &b));
     }
 
     #[test]
     fn capabilities_match_different_lengths() {
         let a = vec![Capability::new("a").expect("known capability")];
-        let b = vec![Capability::new("a").expect("known capability"), Capability::new("b").expect("known capability")];
+        let b = vec![
+            Capability::new("a").expect("known capability"),
+            Capability::new("b").expect("known capability"),
+        ];
         assert!(!capabilities_match(&a, &b));
     }
 
@@ -1734,7 +1759,12 @@ mod tests {
                 .iter()
                 .any(|c| c.name() == CAP_OUTLET_CALL_ALL)
         );
-        assert!(params.ceiling.iter().any(|c| c.name() == CAP_OUTLET_REGISTER));
+        assert!(
+            params
+                .ceiling
+                .iter()
+                .any(|c| c.name() == CAP_OUTLET_REGISTER)
+        );
         assert!(params.ceiling.iter().any(|c| c.name() == CAP_MEMBER_BAN));
         assert_eq!(params.ceiling_policy, CeilingPolicy::Immutable);
         assert_eq!(params.promotion_policy, PromotionPolicy::NoPromotion);

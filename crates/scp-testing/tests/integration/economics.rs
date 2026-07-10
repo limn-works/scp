@@ -144,7 +144,7 @@ async fn cost_schedule_lookup() {
     let schedule = CostSchedule {
         currency: CurrencyCode::from("USD"),
         per_message: Some(Amount::new(1)),
-        per_tool_invoke: Some(Amount::new(10)),
+        per_outlet_call: Some(Amount::new(10)),
         per_join: Some(Amount::new(100)),
         per_period: None,
         per_byte_stored: Some(Amount::new(2)),
@@ -155,7 +155,7 @@ async fn cost_schedule_lookup() {
         Some(Amount::new(1))
     );
     assert_eq!(
-        lookup_cost(&schedule, &PaidActionType::ToolInvoke),
+        lookup_cost(&schedule, &PaidActionType::OutletCall),
         Some(Amount::new(10))
     );
     assert_eq!(
@@ -249,7 +249,7 @@ async fn economic_policy_lock() {
         cost_schedule: CostSchedule {
             currency: CurrencyCode::from("USD"),
             per_message: None,
-            per_tool_invoke: None,
+            per_outlet_call: None,
             per_join: None,
             per_period: None,
             per_byte_stored: None,
@@ -426,7 +426,7 @@ async fn payment_receipt_fields() {
         payee: DID::from("did:dht:z6MkBob"),
         amount: Amount::new(42_000),
         currency: CurrencyCode::from("USD"),
-        action_type: PaidActionType::ToolInvoke,
+        action_type: PaidActionType::OutletCall,
         context_id: Some("ctx-123".to_owned()),
         adapter_id: "x402".to_owned(),
         adapter_proof: vec![0x01, 0x02, 0x03],
@@ -441,7 +441,7 @@ async fn payment_receipt_fields() {
     assert_eq!(receipt.payee, DID::from("did:dht:z6MkBob"));
     assert_eq!(receipt.amount, Amount::new(42_000));
     assert_eq!(receipt.currency, CurrencyCode::from("USD"));
-    assert_eq!(receipt.action_type, PaidActionType::ToolInvoke);
+    assert_eq!(receipt.action_type, PaidActionType::OutletCall);
     assert_eq!(receipt.context_id.as_deref(), Some("ctx-123"));
     assert_eq!(receipt.adapter_id, "x402");
     assert_eq!(receipt.adapter_proof, vec![0x01, 0x02, 0x03]);

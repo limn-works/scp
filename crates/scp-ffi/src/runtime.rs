@@ -1518,11 +1518,12 @@ pub fn register_ffi_state(
                     // legacy outlet-invoke / pre-rename tool-invoke stems,
                     // invalid §5.4.2.1 outlet suffix) parses to `None` and is
                     // rejected at the FFI boundary rather than silently dropped.
-                    let cap = scp_core::context::roles::Capability::new(entry).ok_or_else(|| {
-                        ScpPyError::context(format!(
-                            "invalid capability {entry:?} in ceiling (fails §5.4.2.1 parser)"
-                        ))
-                    })?;
+                    let cap =
+                        scp_core::context::roles::Capability::new(entry).ok_or_else(|| {
+                            ScpPyError::context(format!(
+                                "invalid capability {entry:?} in ceiling (fails §5.4.2.1 parser)"
+                            ))
+                        })?;
                     cap.validate_as_ceiling_entry()
                         .map_err(|e| ScpPyError::context(e.to_string()))?;
                 }

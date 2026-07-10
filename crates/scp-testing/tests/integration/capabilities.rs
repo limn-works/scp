@@ -20,8 +20,8 @@ use scp_core::crypto::ucan::capability::{
 };
 use scp_core::crypto::ucan::revoke::compute_revocation_cid;
 use scp_core::crypto::ucan::validate::{
-    InMemoryDidResolver, InMemoryProofResolver, InMemoryRevocationChecker, NonceTracker,
-    ValidationContext,
+    InMemoryDidResolver, InMemoryProofResolver, InMemoryRevocationChecker, NoCaveatResolver,
+    NonceTracker, ValidationContext,
 };
 use scp_core::crypto::ucan::{Attenuation, UcanError, UcanHeader, UcanPayload};
 use scp_did::SigningKeyId;
@@ -171,6 +171,7 @@ async fn mint_validate_roundtrip() {
         presenting_agent_did: &audience_did,
         clock_skew_tolerance_secs: 300,
         clock: &scp_clock::SystemClock,
+        caveat_resolver: &NoCaveatResolver,
     };
 
     let result = validate_ucan(&token, &required, &mut ctx);
@@ -502,6 +503,7 @@ async fn delegation_chain() {
         presenting_agent_did: &leaf_did,
         clock_skew_tolerance_secs: 300,
         clock: &scp_clock::SystemClock,
+        caveat_resolver: &NoCaveatResolver,
     };
 
     let result = validate_ucan(&mid_token, &required, &mut ctx);
@@ -609,6 +611,7 @@ async fn broken_delegation_chain() {
         presenting_agent_did: &mid_did,
         clock_skew_tolerance_secs: 300,
         clock: &scp_clock::SystemClock,
+        caveat_resolver: &NoCaveatResolver,
     };
 
     let result = validate_ucan(&mid_token, &required, &mut ctx);
@@ -642,6 +645,7 @@ async fn revocation_cid_deterministic() {
         }],
         prf: vec![],
         fct: None,
+        nb: None,
     };
 
     // compute_revocation_cid takes a raw JWT string (header.payload.signature).
@@ -670,6 +674,7 @@ async fn revocation_cid_deterministic() {
         att: vec![],
         prf: vec![],
         fct: None,
+        nb: None,
     };
     let diff_json = serde_json::to_string(&different_payload).unwrap();
     let token2 = format!(

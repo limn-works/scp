@@ -245,27 +245,27 @@ fn signing_key_for_did(did: &DID) -> ed25519_dalek::SigningKey {
 fn governance_params_with_outlets() -> ContextParams {
     ContextParams {
         ceiling: vec![
-            Capability::new("messages:read"),
-            Capability::new("messages:write"),
-            Capability::new("role:assign"),
-            Capability::new("governance:propose"),
-            Capability::new("governance:vote"),
-            Capability::new("member:ban"),
-            Capability::new("context:close"),
-            Capability::ToolRegister,
-            Capability::ToolInvokeAll,
+            Capability::new("messages:read").expect("known capability"),
+            Capability::new("messages:write").expect("known capability"),
+            Capability::new("role:assign").expect("known capability"),
+            Capability::new("governance:propose").expect("known capability"),
+            Capability::new("governance:vote").expect("known capability"),
+            Capability::new("member:ban").expect("known capability"),
+            Capability::new("context:close").expect("known capability"),
+            Capability::OutletRegister,
+            Capability::OutletCallAll,
         ],
         ..ContextParams::default()
     }
 }
 
-fn priced_policy(per_tool_invoke: u64) -> EconomicPolicy {
+fn priced_policy(per_outlet_call: u64) -> EconomicPolicy {
     EconomicPolicy {
         locked: false,
         cost_schedule: CostSchedule {
             currency: CurrencyCode::from("USD"),
             per_message: Some(Amount::new(1)),
-            per_tool_invoke: Some(Amount::new(per_tool_invoke)),
+            per_outlet_call: Some(Amount::new(per_outlet_call)),
             per_join: Some(Amount::new(1)),
             per_period: None,
             per_byte_stored: None,
@@ -347,6 +347,7 @@ fn dummy_spending_ucan() -> scp_core::crypto::ucan::UcanToken {
             }],
             prf: vec![],
             fct: Some(serde_json::Value::Object(fct)),
+            nb: None,
         },
         signature: vec![],
         encoded: "test.spending.ucan".to_owned(),
@@ -403,6 +404,7 @@ fn signed_spending_ucan_for(actor_did: &DID) -> scp_core::crypto::ucan::UcanToke
         }],
         prf: vec![],
         fct: Some(serde_json::Value::Object(fct)),
+        nb: None,
     };
 
     let header_json = serde_json::to_vec(&header).expect("header serializes");
@@ -509,7 +511,7 @@ async fn invoke_outlet_with_economy_deducts_budget_and_records_velocity() {
     assert_eq!(
         budget_before.value() - budget_after.value(),
         7,
-        "invoke_outlet_with_economy must deduct the per_tool_invoke cost (7) from the per-DID budget — \
+        "invoke_outlet_with_economy must deduct the per_outlet_call cost (7) from the per-DID budget — \
          got {} -> {}",
         budget_before.value(),
         budget_after.value()

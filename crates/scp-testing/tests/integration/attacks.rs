@@ -929,6 +929,7 @@ async fn ucan_expired_token_rejected() {
         presenting_agent_did: audience_did,
         clock_skew_tolerance_secs: 0, // No tolerance to ensure expiry is detected
         clock: &scp_clock::SystemClock,
+        caveat_resolver: &scp_core::crypto::ucan::validate::NoCaveatResolver,
     };
 
     let result = validate_ucan(&token, &required_cap, &mut ctx);
@@ -1030,6 +1031,7 @@ async fn ucan_nonce_replay_rejected() {
             presenting_agent_did: audience_did,
             clock_skew_tolerance_secs: 300,
             clock: &scp_clock::SystemClock,
+            caveat_resolver: &scp_core::crypto::ucan::validate::NoCaveatResolver,
         };
         let result = validate_ucan(&token, &required_cap, &mut ctx);
         assert!(
@@ -1050,6 +1052,7 @@ async fn ucan_nonce_replay_rejected() {
             presenting_agent_did: audience_did,
             clock_skew_tolerance_secs: 300,
             clock: &scp_clock::SystemClock,
+            caveat_resolver: &scp_core::crypto::ucan::validate::NoCaveatResolver,
         };
         let result = validate_ucan(&token, &required_cap, &mut ctx);
         assert!(result.is_err(), "replayed nonce should be rejected");
@@ -1083,8 +1086,8 @@ async fn observer_role_cannot_write() {
         "observer must NOT have MessagesWrite"
     );
     assert!(
-        !observer.capabilities.contains(&Capability::ToolInvokeAll),
-        "observer must NOT have ToolInvokeAll"
+        !observer.capabilities.contains(&Capability::OutletCallAll),
+        "observer must NOT have OutletCallAll"
     );
     assert!(
         !observer
@@ -1589,6 +1592,7 @@ async fn ucan_kid_scope_mismatch_rejected() {
         presenting_agent_did: &issuer_did,
         clock_skew_tolerance_secs: 300,
         clock: &scp_clock::SystemClock,
+        caveat_resolver: &scp_core::crypto::ucan::validate::NoCaveatResolver,
     };
 
     let result = validate_ucan(&token, &required_cap, &mut ctx);
@@ -1648,6 +1652,7 @@ async fn ucan_kid_scope_mismatch_rejected() {
         presenting_agent_did: &issuer_did,
         clock_skew_tolerance_secs: 300,
         clock: &scp_clock::SystemClock,
+        caveat_resolver: &scp_core::crypto::ucan::validate::NoCaveatResolver,
     };
 
     let result_2 = validate_ucan(&token, &required_cap_2, &mut ctx_2);

@@ -1111,8 +1111,7 @@ impl UniffiBridgeInstance {
                         .is_some_and(|c| c.validate_as_ceiling_entry().is_ok())
                 })
                 .filter_map(|s| {
-                    scp_core::context::roles::Capability::new(s)
-                        .map(|c| c.ucan_capability_name())
+                    scp_core::context::roles::Capability::new(s).map(|c| c.ucan_capability_name())
                 })
                 .collect::<HashSet<String>>()
         };
