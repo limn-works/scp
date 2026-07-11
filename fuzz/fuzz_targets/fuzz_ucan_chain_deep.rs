@@ -58,7 +58,8 @@ use sha2::{Digest, Sha256};
 use scp_protocol::crypto::ucan::capability::CapabilityUri;
 use scp_protocol::crypto::ucan::validate::{
     DEFAULT_CLOCK_SKEW_TOLERANCE_SECS, InMemoryDidResolver, InMemoryNonceTracker,
-    InMemoryProofResolver, InMemoryRevocationChecker, ValidationContext, validate_ucan,
+    InMemoryProofResolver, InMemoryRevocationChecker, NoCaveatResolver, ValidationContext,
+    validate_ucan,
 };
 use scp_protocol::crypto::ucan::{Attenuation, UcanHeader, UcanPayload, UcanToken};
 
@@ -123,6 +124,7 @@ fn build_token(
         }],
         prf,
         fct: None,
+        nb: None,
     };
 
     let header = UcanHeader::new();
@@ -266,6 +268,7 @@ fuzz_target!(|input: FuzzChainInput| {
         presenting_agent_did: &leaf_aud_did,
         clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
         clock: &clock,
+        caveat_resolver: &NoCaveatResolver,
     };
 
     // I1: must not panic.
@@ -309,6 +312,7 @@ fuzz_target!(|input: FuzzChainInput| {
         presenting_agent_did: &did_for(1),
         clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
         clock: &clock,
+        caveat_resolver: &NoCaveatResolver,
     };
     // I8: chain with > 32 prf entries MUST be rejected (not panic).
     // The proofs won't resolve (DelegationChainBroken) before depth is even

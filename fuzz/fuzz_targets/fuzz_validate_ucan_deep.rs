@@ -32,7 +32,8 @@ use scp_protocol::crypto::ucan::capability::CapabilityUri;
 use scp_protocol::crypto::ucan::revoke::compute_revocation_cid;
 use scp_protocol::crypto::ucan::validate::{
     DEFAULT_CLOCK_SKEW_TOLERANCE_SECS, InMemoryDidResolver, InMemoryNonceTracker,
-    InMemoryProofResolver, InMemoryRevocationChecker, ValidationContext, validate_ucan,
+    InMemoryProofResolver, InMemoryRevocationChecker, NoCaveatResolver, ValidationContext,
+    validate_ucan,
 };
 use scp_protocol::crypto::ucan::{Attenuation, UcanHeader, UcanPayload, UcanToken};
 
@@ -131,6 +132,7 @@ fn build_signed_token(
         }],
         prf: vec![],
         fct: None,
+        nb: None,
     };
 
     let header_json = serde_json::to_string(&header).expect("header serialization must succeed");
@@ -204,6 +206,7 @@ fuzz_target!(|input: FuzzValidationInput| {
         presenting_agent_did: FUZZ_AUDIENCE_DID,
         clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
         clock: &clock,
+        caveat_resolver: &NoCaveatResolver,
     };
 
     // I1: must not panic on any input.
