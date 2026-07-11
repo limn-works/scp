@@ -403,7 +403,7 @@ Depends on:
 State:
   • All protocol state flows through ProtocolRepository to Storage:
     context state, membership, sender keys, event logs, nonces,
-    DID cache, TOFU records, tools, sessions, relay scores, identity
+    DID cache, TOFU records, outlets, sessions, relay scores, identity
 ```
 
 **Context Manager** — the central coordinator:
@@ -414,7 +414,7 @@ Responsibilities:
   • ContextMode dispatch: Encrypted (MLS) vs. Broadcast (per-author keys, §5.14)
   • Membership tracking (who's in, what role)
   • Role and capability ceiling enforcement
-  • Tool registration and invocation routing
+  • Outlet registration and invocation routing
   • Governance proposal processing
   • TTL timer management and expiry handling
   • Memory scope enforcement (key destruction triggers)
@@ -495,7 +495,7 @@ Responsibilities:
   • Local contact index — cache of resolved DID documents for instant lookup
 
 Depends on:
-  • Context Manager (contexts with discovery tools are standard contexts — join, tool invocation)
+  • Context Manager (contexts with discovery tools are standard contexts — join, outlet invocation)
   • Identity Manager (DID resolution for capability lookup, DID document updates)
   • Transport Adapter (DID document publication)
 
@@ -642,9 +642,9 @@ Build order follows the dependency graph bottom-up: platform traits → transpor
 
 ### 2.4 Context Nesting
 
-Contexts can form parent-child relationships (spec §5.13, ADR-008). A child context is a full context — its own MLS group, event log, governance, roles, tools, ceiling, and membership — structurally and cryptographically linked to one or more parents.
+Contexts can form parent-child relationships (spec §5.13, ADR-008). A child context is a full context — its own MLS group, event log, governance, roles, outlets, ceiling, and membership — structurally and cryptographically linked to one or more parents.
 
-**Single-parent nesting** creates sub-spaces within a context: per-task rooms, per-topic channels, breakout sessions. The child narrows the parent's scope. **Multi-parent nesting** creates a governed bridge between contexts — a shared collaboration space where members from different parent contexts interact as peers. This is the symmetric complement to tool interfaces (§6.2): tool interfaces are asymmetric and per-call; multi-parent children are symmetric and persistent.
+**Single-parent nesting** creates sub-spaces within a context: per-task rooms, per-topic channels, breakout sessions. The child narrows the parent's scope. **Multi-parent nesting** creates a governed bridge between contexts — a shared collaboration space where members from different parent contexts interact as peers. This is the symmetric complement to outlet interfaces (§6.2): outlet interfaces are asymmetric and per-call; multi-parent children are symmetric and persistent.
 
 **Ceiling inheritance.** A child's capability ceiling must be less than or equal to the intersection of all parent ceilings. This is enforced at creation time and prevents capability escalation through nesting. If a parent ceiling shrinks post-creation, the child ceiling is retrospectively reduced to maintain the invariant.
 
@@ -652,7 +652,7 @@ Contexts can form parent-child relationships (spec §5.13, ADR-008). A child con
 
 **Lifecycle coupling.** No orphans: when the last parent closes, the child closes regardless of configuration. TTL inheritance bounds a child's TTL by the minimum parent TTL. Each parent's `on_sever` behavior is configurable independently — `cascade_close` (child closes), `evict_unique_members` (remove members eligible only through the severed parent), or `preserve_membership` (child continues, members keep their seats).
 
-**Parent governance configuration.** Per-parent authority is configured at creation time and immutable thereafter. Configurable permissions include `canCloseChild`, `canEvictMembers`, `canRestrictCeiling`, and `requiresApprovalFor` (governance changes, tool registration, ceiling changes, membership changes). Both parents see and consent to each other's configuration before the child is created.
+**Parent governance configuration.** Per-parent authority is configured at creation time and immutable thereafter. Configurable permissions include `canCloseChild`, `canEvictMembers`, `canRestrictCeiling`, and `requiresApprovalFor` (governance changes, outlet registration, ceiling changes, membership changes). Both parents see and consent to each other's configuration before the child is created.
 
 **Cryptographic binding.** Parent context IDs and the content hash of the parent governance configuration are included in the MLS `group_context` extensions field. The child's `group_id` is derived from this `group_context`, making the parent lineage part of the cryptographic group identity. Lineage is unforgeable — claiming different parents would require a different MLS group. Two independent verification paths (MLS `group_context` and Merkle-tree event log) must both be compromised to forge lineage.
 
@@ -917,14 +917,14 @@ identity = await scp.Identity.create(custody="platform")
 # Create a context
 ctx = await scp.Context.create(
     creator=identity,
-    ceiling=["messaging", "tool_invocation"],
-    tools=[scp.Tool("assistant", schema={"query": "string"})],
+    ceiling=["messaging", "outlet_invocation"],
+    outlets=[scp.Outlet("assistant", schema={"query": "string"})],
 )
 
 # Agent sends a message
 await ctx.send("Hello from Python")
 
-# Agent invokes a tool
+# Agent invokes an outlet
 result = await ctx.invoke("assistant", {"query": "help me"})
 ```
 
@@ -955,7 +955,7 @@ from scp.integrations.langchain import SCPToolkit
 # Create SCP toolkit for LangChain agent
 toolkit = SCPToolkit(identity=my_identity, contexts=[ctx_a, ctx_b])
 
-# Returns LangChain-compatible tools for each SCP context tool
+# Returns LangChain-compatible tools for each SCP context outlet
 tools = toolkit.get_tools()
 
 # Use with any LangChain agent
@@ -1007,8 +1007,8 @@ let identity = try await SCP.Identity.create(custody: .secureEnclave)
 
 let quest = try await SCP.Context.create(
     creator: identity,
-    ceiling: [.messaging, .toolInvocation, .media],
-    tools: [guideAssistant, stepTracker],
+    ceiling: [.messaging, .outletInvocation, .media],
+    outlets: [guideAssistant, stepTracker],
     metadata: .init(name: "Thai Cooking Quest", isPublic: true)
 )
 
@@ -1073,7 +1073,7 @@ Deliverable: ~500 lines of Rust. Two terminals exchanging encrypted messages.
 Build:
   • scp-core/context/ — create, join, leave, close state machine
   • scp-core/context/ — role assignment, capability ceiling enforcement
-  • scp-core/context/ — tool registration and invocation
+  • scp-core/context/ — outlet registration and invocation
   • scp-core/event_log/ — Merkle tree, append, prove, verify
   • scp-core/store/ — Full ProtocolRepository with all domain methods (§17.4)
   • scp-platform/ — SqliteStorage (bundled-sqlcipher, WAL mode — §17.6)
@@ -1087,7 +1087,7 @@ Build:
     open and gated subscriber registration, TTL enforcement for broadcast contexts
 
 Test:
-  • Two devices create context, exchange messages, invoke tools
+  • Two devices create context, exchange messages, invoke outlets
   • Role enforcement: member can't do admin things
   • Event log integrity verification
   • Multi-relay delivery (send to 3 relays, receive from any)
@@ -1123,8 +1123,8 @@ Build:
 Test:
   • `pip install scp-python` on clean Python venv
   • 20-line agent script works
-  • MCP server exposes SCP tools to Claude/GPT
-  • Integration test: LangChain agent using SCP tools
+  • MCP server exposes SCP outlets to Claude/GPT
+  • Integration test: LangChain agent using SCP outlets
   • FFI conformance: storage_conformance!() and key_custody_conformance!() pass
     through PyO3 bridge — verifies the FFI layer doesn't corrupt trait contracts
 
@@ -1144,7 +1144,7 @@ Deliverable: Working Python SDK on PyPI. Open source. Agents can use SCP.
 Build:
   • scp-core/trust/ — four-layer evaluation, behavioral records
   • scp-core/context/ — advanced memory scope policies (basic TTL enforcement is Phase 2)
-  • scp-core/discovery/ — tool-interface discovery (§6.2.2)
+  • scp-core/discovery/ — outlet-interface discovery (§6.2.2)
   • scp-core/discovery/scope.rs — scope registration tools: ScopeRegistry, validate_scope_name, scope_register/lookup/deregister (§22.3.5, ADR-043)
   • scp-core/provenance/ — data provenance tagging
   • crates/scp-ffi/uniffi/ — UniFFI definitions (prepares Swift/Kotlin)
@@ -1157,7 +1157,7 @@ Test:
     TTL inheritance, memory scope enforcement across multi-parent children
   • Trust evaluation: behavioral records persisted via ProtocolRepository, trust scores
     affect context admission decisions, tested through N-party simulation
-  • Discovery: tool-interface discovery (§6.2.2) returns correct results across
+  • Discovery: outlet-interface discovery (§6.2.2) returns correct results across
     contexts with different capability ceilings
   • TypeScript: same test suite as Python, in TypeScript
 
