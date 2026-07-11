@@ -1101,7 +1101,7 @@ fn vector_28_outlet_interface_offer_id() {
     // §25.15 Vector 28: assert exact spec hex value.
     assert_eq!(
         hex(&offer_id),
-        "b9f0cd497bede455c99c995c16eb2a0a2bc013a94cdd744dfd5ddbcd73791d53"
+        "ea9ce09b497405e8c160c8d0d57067c726092866f6d1ec541e8e6081a5328733"
     );
 
     // Also verify via manual construction to confirm the implementation matches.

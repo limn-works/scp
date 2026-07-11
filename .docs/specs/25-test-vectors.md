@@ -657,32 +657,32 @@ Result: did:pseudo:a1545542cd8834cc0599f07e5c730dee3005c01097dde63abf906110f1a8e
 
 The pseudonym is deterministic: the same (key, context, DID) triple always produces the same pseudonym. Different keys or contexts produce unrelated pseudonyms for the same DID.
 
-## 25.15 Tool Interface Offer ID Vectors (§6.2.0.1)
+## 25.15 Outlet Interface Offer ID Vectors (§6.2.0.1)
 
 Domain: `"SCP-OFFER-ID-V1:"`
 
-### Vector 28: Tool Interface Offer ID
+### Vector 28: Outlet Interface Offer ID
 
-`compute_offer_id` derives a deterministic 32-byte offer ID from the source context, tool ID, target context, and timestamp.
+`compute_offer_id` derives a deterministic 32-byte offer ID from the source context, outlet ID, target context, and timestamp.
 
 ```
 Input:
   source_context:  "source-ctx-01"
-  outlet_id:         "tool-abc123"
+  outlet_id:         "outlet-abc123"
   target_context:  "target-ctx-02"
   timestamp:       1700000000
 
 Canonical hash input:
   "SCP-OFFER-ID-V1:"                            (16 bytes, no length prefix)
   || BE32(13) || "source-ctx-01"                 (4 + 13 = 17 bytes)
-  || BE32(11) || "tool-abc123"                   (4 + 11 = 15 bytes)
+  || BE32(13) || "outlet-abc123"                 (4 + 13 = 17 bytes)
   || BE32(13) || "target-ctx-02"                 (4 + 13 = 17 bytes)
   || BE64(1700000000)                            (8 bytes)
 
-Total: 16 + 17 + 15 + 17 + 8 = 73 bytes
+Total: 16 + 17 + 17 + 17 + 8 = 75 bytes
 
 Expected SHA-256:
-  0xb9f0cd497bede455c99c995c16eb2a0a2bc013a94cdd744dfd5ddbcd73791d53
+  0xea9ce09b497405e8c160c8d0d57067c726092866f6d1ec541e8e6081a5328733
 ```
 
 ## 25.16 Attestation ID Vectors (§3.5.2)
