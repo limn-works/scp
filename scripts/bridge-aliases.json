@@ -365,7 +365,7 @@
     },
     {
       "canonical": "outlet_register",
-      "category": "tools",
+      "category": "outlets",
       "pyo3": [
         "py_outlet_register",
         "outlet_register"
@@ -379,7 +379,7 @@
     },
     {
       "canonical": "outlet_invoke",
-      "category": "tools",
+      "category": "outlets",
       "pyo3": [
         "py_outlet_invoke",
         "outlet_invoke"
@@ -393,7 +393,7 @@
     },
     {
       "canonical": "outlet_verify",
-      "category": "tools",
+      "category": "outlets",
       "pyo3": [
         "py_outlet_verify",
         "outlet_verify"
@@ -407,7 +407,7 @@
     },
     {
       "canonical": "outlet_invoke_cross_context",
-      "category": "tools",
+      "category": "outlets",
       "pyo3": [
         "py_outlet_invoke_cross_context",
         "outlet_invoke_cross_context"
@@ -421,7 +421,7 @@
     },
     {
       "canonical": "outlet_invoke_cross_context_saga",
-      "category": "tools",
+      "category": "outlets",
       "pyo3": [
         "outlet_invoke_cross_context_saga"
       ],
@@ -434,7 +434,7 @@
     },
     {
       "canonical": "outlet_session_create",
-      "category": "tools",
+      "category": "outlets",
       "pyo3": [
         "py_outlet_session_create",
         "outlet_session_create"
@@ -448,7 +448,7 @@
     },
     {
       "canonical": "outlet_session_invoke",
-      "category": "tools",
+      "category": "outlets",
       "pyo3": [
         "py_outlet_session_invoke",
         "outlet_session_invoke"
@@ -462,7 +462,7 @@
     },
     {
       "canonical": "outlet_session_close",
-      "category": "tools",
+      "category": "outlets",
       "pyo3": [
         "py_outlet_session_close",
         "outlet_session_close"
@@ -2457,7 +2457,7 @@
     },
     {
       "canonical": "outlet_interface_expose",
-      "category": "tools",
+      "category": "outlets",
       "pyo3": [
         "outlet_interface_expose"
       ],
@@ -2470,7 +2470,7 @@
     },
     {
       "canonical": "outlet_interface_accept",
-      "category": "tools",
+      "category": "outlets",
       "pyo3": [
         "outlet_interface_accept"
       ],
@@ -2483,7 +2483,7 @@
     },
     {
       "canonical": "outlet_interface_revoke",
-      "category": "tools",
+      "category": "outlets",
       "pyo3": [
         "outlet_interface_revoke"
       ],

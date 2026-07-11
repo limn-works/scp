@@ -566,67 +566,67 @@ ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
     },
     # Tools -- all SDKs use the outlet-prefixed method name for the renamed
     # outlet domain (outlet_register / outletRegister / ...).
-    ("Tools", "register"): {
+    ("Outlets", "register"): {
         "python": ["outlet_register"],
         "typescript": ["outletRegister"],
         "kotlin": ["outletRegister"],
         "swift": ["outletRegister"],
     },
-    ("Tools", "invoke"): {
+    ("Outlets", "invoke"): {
         "python": ["outlet_invoke"],
         "typescript": ["outletInvoke"],
         "kotlin": ["outletInvoke"],
         "swift": ["outletInvoke"],
     },
-    ("Tools", "verify"): {
+    ("Outlets", "verify"): {
         "python": ["outlet_verify"],
         "typescript": ["outletVerify"],
         "kotlin": ["outletVerify"],
         "swift": ["outletVerify"],
     },
-    ("Tools", "invoke_cross_context"): {
+    ("Outlets", "invoke_cross_context"): {
         "python": ["outlet_invoke_cross_context"],
         "typescript": ["outletInvokeCrossContext"],
         "kotlin": ["outletInvokeCrossContext"],
         "swift": ["outletInvokeCrossContext"],
     },
-    ("Tools", "invoke_cross_context_saga"): {
+    ("Outlets", "invoke_cross_context_saga"): {
         "python": ["outlet_invoke_cross_context_saga"],
         "typescript": ["outletInvokeCrossContextSaga"],
         "kotlin": ["outletInvokeCrossContextSaga"],
         "swift": ["outletInvokeCrossContextSaga"],
     },
-    ("Tools", "session_create"): {
+    ("Outlets", "session_create"): {
         "python": ["outlet_session_create"],
         "typescript": ["outletSessionCreate"],
         "kotlin": ["outletSessionCreate"],
         "swift": ["outletSessionCreate"],
     },
-    ("Tools", "session_invoke"): {
+    ("Outlets", "session_invoke"): {
         "python": ["outlet_session_invoke"],
         "typescript": ["outletSessionInvoke"],
         "kotlin": ["outletSessionInvoke"],
         "swift": ["outletSessionInvoke"],
     },
-    ("Tools", "session_close"): {
+    ("Outlets", "session_close"): {
         "python": ["outlet_session_close"],
         "typescript": ["outletSessionClose"],
         "kotlin": ["outletSessionClose"],
         "swift": ["outletSessionClose"],
     },
-    ("Tools", "interface_expose"): {
+    ("Outlets", "interface_expose"): {
         "python": ["outlet_interface_expose"],
         "typescript": ["outletInterfaceExpose"],
         "kotlin": ["outletInterfaceExpose"],
         "swift": ["outletInterfaceExpose"],
     },
-    ("Tools", "interface_accept"): {
+    ("Outlets", "interface_accept"): {
         "python": ["outlet_interface_accept"],
         "typescript": ["outletInterfaceAccept"],
         "kotlin": ["outletInterfaceAccept"],
         "swift": ["outletInterfaceAccept"],
     },
-    ("Tools", "interface_revoke"): {
+    ("Outlets", "interface_revoke"): {
         "python": ["outlet_interface_revoke"],
         "typescript": ["outletInterfaceRevoke"],
         "kotlin": ["outletInterfaceRevoke"],

@@ -564,7 +564,7 @@
       ]
     },
     {
-      "domain": "Tools",
+      "domain": "Outlets",
       "operations": [
         {
           "name": "register",
