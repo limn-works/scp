@@ -709,8 +709,10 @@ impl ContextProvider for FfiBridgeProvider {
         // silently accepting the capability.
         let bi = self.upgrade_bi()?;
         // Primary check: UCAN token validation via the full 11-step ADR-016
-        // pipeline. Verifies the token grants outlet_call:{outlet_name} or
-        // outlet_call:* for this context.
+        // pipeline. Verifies the token grants the outlet's kind-appropriate stem
+        // — outlet_query:{outlet_name}/outlet_query:* for Query outlets,
+        // outlet_call:{outlet_name}/outlet_call:* for Action outlets
+        // (SCP-OUT-014, §5.4.2) — for this context.
         // See spec §6.2, §8, ADR-016, and issue #319.
         if let Some(ref token) = self.agent_ucan_token {
             // Build proof resolver from optional proof tokens (supports delegated UCANs).
@@ -796,10 +798,21 @@ impl ContextProvider for FfiBridgeProvider {
         // Defense-in-depth: check role-state capabilities in addition to the
         // UCAN layer. See §7.2 and ADR-010 for the dual-check design.
         crate::runtime::with_context(&bi, context_id, |rt| {
-            if scp_core::context::outlets::invoke::has_outlet_call_capability(
+            // SCP-OUT-014: select the kind-appropriate split stem from the
+            // outlet's registered kind — OutletQuery for Query outlets,
+            // OutletCall for Action outlets (§5.4.2). The two stems are
+            // independent, so a Query grant never authorizes an Action call and
+            // vice versa. An outlet absent from the registry defaults to the
+            // Action stem (the UCAN gate above already required registration).
+            let outlet_kind = rt
+                .outlet_registry
+                .get(tool_name)
+                .map_or(scp_core::context::outlets::OutletKind::Action, |r| r.kind);
+            if scp_core::context::outlets::invoke::has_outlet_invocation_capability(
                 &rt.role_state,
                 &self.agent_did,
                 tool_name,
+                outlet_kind,
             ) {
                 Ok(())
             } else {
@@ -808,7 +821,7 @@ impl ContextProvider for FfiBridgeProvider {
                     agent = %self.agent_did,
                     outlet = %tool_name,
                     context = %context_id,
-                    "capability check failed: agent lacks OutletCall capability"
+                    "capability check failed: agent lacks the required outlet invocation capability"
                 );
                 Err(ScpPyError::context(
                     "insufficient permissions to invoke outlet",
@@ -2745,6 +2758,140 @@ mod tests {
         assert!(
             err.contains("UCAN token required"),
             "error should mention UCAN requirement: {err}"
+        );
+
+        crate::runtime::remove_context(&bi, &ctx_id);
+    }
+
+    // -----------------------------------------------------------------------
+    // FfiBridgeProvider::validate_capability — kind-aware defense-in-depth gate
+    // (SCP-OUT-014, §5.4.2). Proves the MCP bridge's role-state check reads the
+    // outlet's registered kind from the runtime registry and dispatches to the
+    // matching split stem: a Query outlet is DENIED to an OutletCall-only member
+    // and ALLOWED to an OutletQuery-only member. This exercises the exact
+    // registry-kind read + `has_outlet_invocation_capability` dispatch the fixed
+    // gate at mcp.rs performs against real bridge state (registered outlet +
+    // role_state). The full through-`validate_capability` path additionally
+    // requires a valid 11-step UCAN token; that primary layer is covered by the
+    // #319 UCAN tests, and the shared gate is covered end-to-end by the runtime
+    // `invoke_query_session_*` test.
+    #[test]
+    #[allow(clippy::too_many_lines)] // End-to-end query-gate test: register + role-state + two-member gate assertions.
+    fn ffi_bridge_provider_validate_capability_query_kind_selects_query_stem() {
+        use scp_core::context::roles::Capability;
+
+        let creator = "did:dht:z6MkCreatorQueryStem";
+        let member = "did:dht:z6MkMemberQueryStem";
+        let bi = __bi();
+        // Register the context WITHOUT the default calculator outlet — we add a
+        // Query-kind one explicitly below.
+        let ctx_id = setup_test_context(&bi, creator, false);
+
+        // Register a QUERY-kind outlet and add a member holding ONLY the
+        // Action-class OutletCall grant.
+        crate::runtime::with_context(&bi, &ctx_id, |rt| {
+            let registration = scp_core::context::outlets::OutletRegistration {
+                outlet_id: "lookup".to_owned(),
+                kind: scp_core::context::outlets::OutletKind::Query,
+                name: "Lookup".to_owned(),
+                description: "A read-only lookup".to_owned(),
+                schema: scp_core::context::outlets::OutletSchema {
+                    input_schema: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string"},
+                            "limit": {"type": "number"}
+                        }
+                    }),
+                    output_schema: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "results": {"type": "array"}
+                        }
+                    }),
+                    aggregate_schema: None,
+                },
+                implementation_hash: [0xAA; 32],
+                test_vectors: vec![],
+                operator_did: "did:dht:z6MkOperator".into(),
+                cost: None,
+                message_catalog: Vec::new(),
+                registered_at: 0,
+                signature: Vec::new(),
+            };
+            scp_core::context::outlets::register_outlet(
+                &mut rt.outlet_registry,
+                &rt.role_state,
+                registration,
+                creator,
+            )
+            .map_err(|e| crate::error::ScpPyError::context(format!("{e}")))?;
+
+            rt.role_state.members.insert(member.to_owned());
+            rt.role_state.member_capabilities.insert(
+                member.to_owned(),
+                std::iter::once(Capability::OutletCall("lookup".to_owned())).collect(),
+            );
+            Ok(())
+        })
+        .unwrap();
+
+        // The MCP defense-in-depth gate reads the registered kind and dispatches
+        // via `has_outlet_invocation_capability`. An OutletCall-only member is
+        // DENIED on a Query outlet because the two stems are independent.
+        let denied = crate::runtime::with_context(&bi, &ctx_id, |rt| {
+            let kind = rt
+                .outlet_registry
+                .get("lookup")
+                .map_or(scp_core::context::outlets::OutletKind::Action, |r| r.kind);
+            assert_eq!(
+                kind,
+                scp_core::context::outlets::OutletKind::Query,
+                "outlet must round-trip as Query through the bridge registry"
+            );
+            Ok(
+                scp_core::context::outlets::invoke::has_outlet_invocation_capability(
+                    &rt.role_state,
+                    member,
+                    "lookup",
+                    kind,
+                ),
+            )
+        })
+        .unwrap();
+        assert!(
+            !denied,
+            "Query outlet must be denied to a member holding only OutletCall"
+        );
+
+        // Grant the Query-class capability → ALLOWED.
+        crate::runtime::with_context(&bi, &ctx_id, |rt| {
+            rt.role_state
+                .member_capabilities
+                .get_mut(member)
+                .unwrap()
+                .insert(Capability::OutletQuery("lookup".to_owned()));
+            Ok(())
+        })
+        .unwrap();
+        let allowed = crate::runtime::with_context(&bi, &ctx_id, |rt| {
+            let kind = rt
+                .outlet_registry
+                .get("lookup")
+                .map_or(scp_core::context::outlets::OutletKind::Action, |r| r.kind);
+            Ok(
+                scp_core::context::outlets::invoke::has_outlet_invocation_capability(
+                    &rt.role_state,
+                    member,
+                    "lookup",
+                    kind,
+                ),
+            )
+        })
+        .unwrap();
+        assert!(
+            allowed,
+            "Query outlet must be allowed once the member holds OutletQuery"
         );
 
         crate::runtime::remove_context(&bi, &ctx_id);

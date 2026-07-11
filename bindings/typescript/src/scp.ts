@@ -57,6 +57,7 @@ import type {
   ConsequenceRule,
   EventLogEntry,
   InviteMemberOutcome,
+  OutletDefinition,
   ParticipationProfile,
   RequireParticipation,
   SagaResult,
@@ -2029,11 +2030,33 @@ export class SCP {
   // Domain: Outlet
   // ───────────────────────────────────────────────────────────────────────
 
-  async outletRegister(handle: unknown, definition: unknown): Promise<string> {
-    return await (this.#native.outletRegister as (h: unknown, d: unknown) => Promise<string>)(
-      handle,
-      definition,
-    );
+  async outletRegister(handle: unknown, definition: OutletDefinition): Promise<string> {
+    // `#native` is the raw napi addon, whose `NapiOutletDefinition` uses
+    // different field names than the public `OutletDefinition` (JSON-string
+    // schemas, `operatorDid`). Convert here — mirrors `internal/native.ts`.
+    const napiDef = {
+      name: definition.name,
+      description: definition.description,
+      kind: definition.kind,
+      inputSchemaJson: JSON.stringify(definition.inputSchema),
+      outputSchemaJson: JSON.stringify(definition.outputSchema),
+      operatorDid: definition.operator,
+      testVectorsJson: definition.testVectors ? JSON.stringify(definition.testVectors) : undefined,
+      implementationHash: definition.implementationHash
+        ? Array.from(definition.implementationHash)
+        : undefined,
+      cost: definition.cost
+        ? {
+            amount: definition.cost.amount,
+            currency: definition.cost.currency,
+            payee: definition.cost.payee,
+            costFormula: definition.cost.costFormula,
+          }
+        : undefined,
+    };
+    return await (
+      this.#native.outletRegister as (h: unknown, d: typeof napiDef) => Promise<string>
+    )(handle, napiDef);
   }
 
   async outletInvoke(

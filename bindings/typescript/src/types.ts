@@ -690,7 +690,7 @@ export interface Capability {
  * Outlet semantic class (spec section 5.4.2). A Query outlet is a read-only
  * lookup; an Action outlet may cause side effects. Crosses the FFI wire as the
  * lowercase string `"query"` or `"action"` — identical across all four
- * bindings and the UCAN capability-stem preimage (SCP-OUT-017).
+ * bindings and the UCAN capability-stem preimage (SCP-OUT-014).
  */
 export type OutletKind = "query" | "action";
 

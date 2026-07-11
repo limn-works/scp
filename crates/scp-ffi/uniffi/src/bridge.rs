@@ -4582,8 +4582,10 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
         // (#1549 round-2).
         let bi = self.upgrade_bi()?;
         // Primary check: UCAN token validation via the full 11-step ADR-016
-        // pipeline. Verifies the token grants outlet_call:{outlet_name} or
-        // outlet_call:* for this context.
+        // pipeline. Verifies the token grants the outlet's kind-appropriate stem
+        // — outlet_query:{outlet_name}/outlet_query:* for Query outlets,
+        // outlet_call:{outlet_name}/outlet_call:* for Action outlets
+        // (SCP-OUT-014, §5.4.2) — for this context.
         if let Some(ref token) = self.agent_ucan_token {
             // Build proof resolver from optional proof tokens.
             let mut proofs = std::collections::HashMap::new();
@@ -4703,10 +4705,27 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
             format!("context '{context_id}' not registered with Supervisor for capability check")
         })?;
 
-        if scp_core::context::outlets::invoke::has_outlet_call_capability(
+        // SCP-OUT-014: select the kind-appropriate split stem from the outlet's
+        // registered kind — OutletQuery for Query outlets, OutletCall for Action
+        // outlets (§5.4.2). The two stems are independent, so a Query grant never
+        // authorizes an Action call and vice versa. An outlet absent from the
+        // registry defaults to the Action stem (the UCAN gate above already
+        // required registration).
+        let outlet_kind = {
+            let handle = context_handle_registry(&bi)
+                .get(context_id)
+                .ok_or_else(|| format!("context '{context_id}' not found in handle registry"))?;
+            let registry = handle.outlet_registry.blocking_lock();
+            registry
+                .get(outlet_name)
+                .map_or(scp_core::context::outlets::OutletKind::Action, |r| r.kind)
+        };
+
+        if scp_core::context::outlets::invoke::has_outlet_invocation_capability(
             &role_state,
             &self.agent_did,
             outlet_name,
+            outlet_kind,
         ) {
             Ok(())
         } else {
@@ -4714,7 +4733,7 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
                 agent = %self.agent_did,
                 outlet = %outlet_name,
                 context = %context_id,
-                "capability check failed: agent lacks OutletCall capability"
+                "capability check failed: agent lacks the required outlet invocation capability"
             );
             Err("insufficient permissions to invoke outlet".to_owned())
         }

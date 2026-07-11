@@ -53,7 +53,7 @@ import {
 import { IdentityAttestation, RevocationStatus } from "../src/identity";
 import { SCP } from "../src/scp";
 import type { Relay } from "../src/server";
-import type { ConsequenceRule as ConsequenceRuleTypeAlias } from "../src/types";
+import type { ConsequenceRule as ConsequenceRuleTypeAlias, OutletDefinition } from "../src/types";
 import { createMockNativeScp, mountMockScp } from "./mock-bridge";
 
 /**
@@ -1281,13 +1281,10 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
   // -------------------------------------------------------------------
 
   describe("Outlet lifecycle (real NAPI)", () => {
-    // scp.outletRegister passes the definition verbatim to the native
-    // bridge — which expects the NAPI field names (`inputSchemaJson`,
-    // `outputSchemaJson`, `operatorDid`) rather than the SDK-facing
-    // camelCase (`inputSchema`, `outputSchema`, `operator`). The
-    // `internal/native.ts` Bridge wrapper is the layer that performs
-    // the rename — callers of the SCP class directly must build the
-    // NAPI shape themselves. These tests exercise the direct surface.
+    // scp.outletRegister accepts the public `OutletDefinition` shape and
+    // converts it to the NAPI field names internally (mirroring
+    // `internal/native.ts`), so these tests build the SDK-facing camelCase
+    // shape (`inputSchema`/`outputSchema` objects, `operator`).
 
     function makeNapiToolDef(args: {
       name: string;
@@ -1296,7 +1293,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       kind?: "query" | "action";
       input?: Record<string, unknown>;
       output?: Record<string, unknown>;
-    }): Record<string, unknown> {
+    }): OutletDefinition {
       // The Rust outlet-registration layer enforces a schema-specificity
       // floor (§6.2, §9.2.1): AT LEAST ONE of the input/output schemas
       // must declare ≥ 2 distinct property fields. Using a 2-field input
@@ -1307,15 +1304,13 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
         name: args.name,
         description: args.description,
         kind: args.kind ?? "action",
-        inputSchemaJson: JSON.stringify(
-          args.input ?? {
-            type: "object",
-            properties: { x: { type: "number" }, mode: { type: "string" } },
-            required: ["x", "mode"],
-          },
-        ),
-        outputSchemaJson: JSON.stringify(args.output ?? { type: "object" }),
-        operatorDid: args.operator,
+        inputSchema: args.input ?? {
+          type: "object",
+          properties: { x: { type: "number" }, mode: { type: "string" } },
+          required: ["x", "mode"],
+        },
+        outputSchema: args.output ?? { type: "object" },
+        operator: args.operator,
       };
     }
 

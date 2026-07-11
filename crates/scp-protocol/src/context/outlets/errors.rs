@@ -1,7 +1,9 @@
-//! Typed `OutletError` envelope, `OutletErrorClass`, `RetryPolicy`,
-//! `ContextHop`, `CatalogKey`, and `OutletErrorConstructionFailed` per spec
-//! §5.4.4 ("Outlet Error Taxonomy"). (Governed by spec §5.4.4 alone; this is
-//! unrelated to ADR-049's `SCP-SAGA-*` cross-context-saga terminal codes.)
+//! Typed `OutletError` envelope and companion types per spec §5.4.4.
+//!
+//! Covers `OutletErrorClass`, `RetryPolicy`, `ContextHop`, `CatalogKey`, and
+//! `OutletErrorConstructionFailed` ("Outlet Error Taxonomy"). Governed by spec
+//! §5.4.4 alone; this is unrelated to ADR-049's `SCP-SAGA-*` cross-context-saga
+//! terminal codes.
 //!
 //! These are the **structured error types** the §5.4.4 wire envelope is built
 //! from. The `OutletError` struct in this module is the typed envelope —

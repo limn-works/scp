@@ -27,11 +27,11 @@ use serde::{Deserialize, Serialize};
 
 use scp_clock::Clock;
 
-use super::invoke::has_outlet_call_capability;
+use super::invoke::has_outlet_invocation_capability;
 use scp_did::DID;
 use scp_protocol::context::outlets::registry::OutletRegistry;
 use scp_protocol::context::outlets::schema::validate_value_against_schema;
-use scp_protocol::context::outlets::{OutletError, OutletId};
+use scp_protocol::context::outlets::{OutletError, OutletId, OutletKind};
 
 /// Default maximum concurrent sessions per calling context (spec §6.2.1, ADR-043).
 ///
@@ -352,8 +352,15 @@ where
     let outlet_id = session.outlet_id.clone();
     let current_state = session.state.clone();
 
-    // Per-call UCAN governance: validate invoker has ToolInvoke capability.
-    if !has_outlet_call_capability(role_state, invoker_did, &outlet_id) {
+    // Per-call governance: validate invoker holds the kind-appropriate split
+    // capability. Query outlets require OutletQuery(id)/OutletQueryAll, Action
+    // outlets require OutletCall(id)/OutletCallAll (SCP-OUT-014, §5.4.2). The
+    // outlet's registered kind is the authority; an outlet absent from the
+    // registry defaults to the Action stem (fail-closed toward the call cap).
+    let outlet_kind = registry
+        .get(&outlet_id)
+        .map_or(OutletKind::Action, |registration| registration.kind);
+    if !has_outlet_invocation_capability(role_state, invoker_did, &outlet_id, outlet_kind) {
         return Err(OutletError::InvokerNotAuthorized {
             did: invoker_did.to_string(),
             outlet_id: outlet_id.clone(),
@@ -476,6 +483,49 @@ mod tests {
         let registration = OutletRegistration {
             outlet_id: "calculator".to_owned(),
             kind: scp_protocol::context::outlets::OutletKind::default(),
+            name: "Calculator".to_owned(),
+            description: "A simple calculator".to_owned(),
+            schema: OutletSchema {
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "a": {"type": "number"},
+                        "b": {"type": "number"}
+                    }
+                }),
+                output_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "result": {"type": "number"}
+                    }
+                }),
+                aggregate_schema: None,
+            },
+            implementation_hash: [0xAA; 32],
+            test_vectors: vec![],
+            operator_did: "did:dht:z6MkOperator".into(),
+            cost: None,
+            message_catalog: Vec::new(),
+            registered_at: 0,
+            signature: Vec::new(),
+        };
+        register_outlet(&mut registry, role_state, registration, registrant_did).unwrap();
+        registry
+    }
+
+    /// Registers a `calculator` outlet of the given [`OutletKind`] (SCP-OUT-014)
+    /// and returns the registry. Mirrors [`setup_registry_with_outlet`] but lets
+    /// the caller pick Query vs Action so the split-capability gate can be
+    /// exercised end-to-end through the session path.
+    fn setup_registry_with_kind(
+        role_state: &ContextRoleState,
+        registrant_did: &str,
+        kind: OutletKind,
+    ) -> OutletRegistry {
+        let mut registry = OutletRegistry::new();
+        let registration = OutletRegistration {
+            outlet_id: "calculator".to_owned(),
+            kind,
             name: "Calculator".to_owned(),
             description: "A simple calculator".to_owned(),
             schema: OutletSchema {
@@ -1130,6 +1180,88 @@ mod tests {
         assert_eq!(session.call_count, 2);
         // Session state should have two entries.
         assert_eq!(session.state.as_array().unwrap().len(), 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // invoke_session: end-to-end split-capability gate (SCP-OUT-014, §5.4.2).
+    // Proves the session path honours the outlet's registered kind: a Query
+    // outlet is DENIED to a member holding only OutletCall and ALLOWED once the
+    // member holds OutletQuery. Guards the wiring at session.rs:363.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn invoke_query_session_denied_with_call_cap_allowed_with_query_cap() {
+        let creator = "did:dht:z6MkCreator";
+        let member = "did:dht:z6MkMember";
+
+        // Creator (admin) registers a QUERY-kind outlet.
+        let mut role_state = test_role_state(creator);
+        role_state.members.insert(member.to_owned());
+        let registry = setup_registry_with_kind(&role_state, creator, OutletKind::Query);
+        let context = active_context();
+        let mut store = SessionStore::new();
+
+        let session_id = create_session(
+            &mut store,
+            &registry,
+            &context,
+            &"calculator".to_owned(),
+            &"ctx-source".to_owned(),
+            Some(Duration::from_mins(5)),
+            &scp_clock::SystemClock,
+        )
+        .await
+        .unwrap();
+
+        // Member holds ONLY the Action-class OutletCall grant → DENIED, because
+        // the outlet is registered as Query and the two stems are independent.
+        role_state.member_capabilities.insert(
+            member.to_owned(),
+            std::iter::once(Capability::OutletCall("calculator".to_owned())).collect(),
+        );
+        let denied = invoke_session(
+            &mut store,
+            &registry,
+            &role_state,
+            &context,
+            &session_id,
+            serde_json::json!({"a": 1, "b": 2}),
+            &DID::from(member),
+            add_executor,
+            &scp_clock::SystemClock,
+        )
+        .await;
+        assert!(
+            matches!(
+                denied.unwrap_err(),
+                OutletError::InvokerNotAuthorized { .. }
+            ),
+            "Query session must be denied to a member holding only OutletCall"
+        );
+
+        // Grant the Query-class capability → ALLOWED.
+        role_state
+            .member_capabilities
+            .get_mut(member)
+            .unwrap()
+            .insert(Capability::OutletQuery("calculator".to_owned()));
+        let allowed = invoke_session(
+            &mut store,
+            &registry,
+            &role_state,
+            &context,
+            &session_id,
+            serde_json::json!({"a": 1, "b": 2}),
+            &DID::from(member),
+            add_executor,
+            &scp_clock::SystemClock,
+        )
+        .await;
+        assert!(
+            allowed.is_ok(),
+            "Query session must be allowed once the member holds OutletQuery: {:?}",
+            allowed.err()
+        );
     }
 
     // -----------------------------------------------------------------------

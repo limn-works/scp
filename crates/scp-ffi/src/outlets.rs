@@ -866,9 +866,11 @@ fn extract_test_vectors(
 /// * `input` — A Python dict of input parameters.
 /// * `invoker_did` — The DID of the participant invoking the outlet.
 /// * `ucan_token` — JWT-encoded UCAN token authorizing the invocation.
-///   Must contain `outlet_call:{outlet_id}` or `outlet_call:*` capability.
-///   Validated against the TARGET context's ceiling using the full 11-step
-///   ADR-016 pipeline.
+///   Must contain the TARGET outlet's kind-appropriate stem —
+///   `outlet_query:{outlet_id}`/`outlet_query:*` for Query outlets,
+///   `outlet_call:{outlet_id}`/`outlet_call:*` for Action outlets (SCP-OUT-014,
+///   §5.4.2). Validated against the TARGET context's ceiling using the full
+///   11-step ADR-016 pipeline.
 /// * `chain_depth` — Current cross-context chain depth (0 for first hop).
 ///
 /// # Returns
@@ -883,6 +885,7 @@ fn extract_test_vectors(
 /// not found, chain depth is exceeded, or the interface is not approved.
 #[allow(clippy::needless_pass_by_value)] // PyO3 requires owned Option<Vec<String>>.
 #[allow(clippy::too_many_arguments)] // FFI boundary: PyO3 requires explicit params
+#[allow(clippy::too_many_lines)] // Sequential cross-context flow: validate + kind-aware gate + depth + dispatch.
 fn outlet_invoke_cross_context_impl(
     bi: &PyBridgeInstance,
     py: Python<'_>,
@@ -919,18 +922,43 @@ fn outlet_invoke_cross_context_impl(
         proof_tokens.as_ref(),
     )?;
 
-    // Defense-in-depth: check role-state capabilities in the source context.
+    // Resolve the TARGET outlet's registered kind so the source-context
+    // governance check below selects the matching split stem (SCP-OUT-014,
+    // §5.4.2). JUDGMENT: this source-context gate authorizes the invoker to
+    // initiate a cross-context call to the TARGET outlet — it is gating THAT
+    // outlet's invocation, not a distinct source-only authority — so the stems
+    // must stay independent on this surface too: a source member invoking a
+    // TARGET Query outlet needs OutletQuery, an Action outlet needs OutletCall.
+    // The target registry is the authority for the outlet's kind (it is
+    // registered there, not in the source); `validate_outlet_ucan` above already
+    // guaranteed the outlet exists in the target context.
+    let target_outlet_kind = crate::runtime::with_context(bi, target_context_id, |rt| {
+        rt.outlet_registry
+            .get(outlet_id)
+            .map(|r| r.kind)
+            .ok_or_else(|| {
+                ScpPyError::context(format!(
+                    "outlet '{outlet_id}' not found in target context '{target_context_id}'"
+                ))
+            })
+    })?;
+
+    // Defense-in-depth: check role-state capabilities in the source context
+    // using the kind-appropriate split stem for the target outlet.
     let source_has_capability = crate::runtime::with_context(bi, source_context_id, |rt| {
-        Ok(scp_core::context::outlets::has_outlet_call_capability(
-            &rt.role_state,
-            invoker_did,
-            outlet_id,
-        ))
+        Ok(
+            scp_core::context::outlets::has_outlet_invocation_capability(
+                &rt.role_state,
+                invoker_did,
+                outlet_id,
+                target_outlet_kind,
+            ),
+        )
     })?;
 
     if !source_has_capability {
         return Err(ScpPyError::ucan(format!(
-            "invoker '{invoker_did}' does not have OutletCall capability for '{outlet_id}' in source context"
+            "invoker '{invoker_did}' does not have invocation capability for '{outlet_id}' in source context"
         ))
         .into());
     }
@@ -1388,10 +1416,12 @@ fn outlet_session_create_impl(
 
 /// Invokes an outlet within an active session.
 ///
-/// Each call is individually governed: the invoker must hold `OutletCall`
-/// capability and present a valid UCAN token. Session state is carried
-/// forward across invocations. The session's call count is incremented on
-/// each successful invocation.
+/// Each call is individually governed: the invoker must hold the outlet's
+/// kind-appropriate split capability (`OutletQuery`/`OutletQueryAll` for Query
+/// outlets, `OutletCall`/`OutletCallAll` for Action outlets — SCP-OUT-014,
+/// §5.4.2) and present a valid UCAN token. Session state is carried forward
+/// across invocations. The session's call count is incremented on each
+/// successful invocation.
 ///
 /// # Arguments
 ///
@@ -1400,8 +1430,10 @@ fn outlet_session_create_impl(
 /// * `input` — A Python dict of input parameters.
 /// * `invoker_did` — The DID of the invoker (capability checked per call).
 /// * `ucan_token` — JWT-encoded UCAN token authorizing the invocation.
-///   Must contain `outlet_call:{outlet_id}` or `outlet_call:*` capability.
-///   Validated using the full 11-step ADR-016 pipeline.
+///   Must contain the outlet's kind-appropriate stem — `outlet_query:{outlet_id}`
+///   or `outlet_query:*` for Query outlets, `outlet_call:{outlet_id}` or
+///   `outlet_call:*` for Action outlets (SCP-OUT-014, §5.4.2). Validated using
+///   the full 11-step ADR-016 pipeline.
 ///
 /// # Returns
 ///
@@ -1476,14 +1508,25 @@ fn outlet_session_invoke_impl(
         let current_state = session.state.clone();
 
         // Defense-in-depth: check role-state capabilities in addition to the
-        // UCAN layer. See §7.2 and ADR-010 for the dual-check design.
-        if !scp_core::context::outlets::has_outlet_call_capability(
+        // UCAN layer. See §7.2 and ADR-010 for the dual-check design. Select the
+        // kind-appropriate split stem from the outlet's registered kind
+        // (SCP-OUT-014, §5.4.2): OutletQuery for Query outlets, OutletCall for
+        // Action outlets. The two stems are independent, so a Query grant never
+        // authorizes an Action call and vice versa. An outlet absent from the
+        // registry defaults to the Action stem (the UCAN gate above already
+        // required registration).
+        let outlet_kind = rt
+            .outlet_registry
+            .get(&outlet_id)
+            .map_or(scp_core::context::outlets::OutletKind::Action, |r| r.kind);
+        if !scp_core::context::outlets::has_outlet_invocation_capability(
             &rt.role_state,
             invoker_did,
             &outlet_id,
+            outlet_kind,
         ) {
             return Err(ScpPyError::ucan(format!(
-                "invoker '{invoker_did}' does not have OutletCall capability for '{outlet_id}'"
+                "invoker '{invoker_did}' does not have invocation capability for '{outlet_id}'"
             )));
         }
 

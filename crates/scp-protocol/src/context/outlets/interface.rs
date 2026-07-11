@@ -285,8 +285,9 @@ impl OutboundPolicy {
 /// Controls which roles in the source context can call and response constraints.
 /// Fields are enforced in [`invoke_cross_context`]:
 /// - `allowed_source_roles`: advisory — role-based filtering is enforced by
-///   the source context's governance engine (via `has_outlet_call_capability`),
-///   not repeated here. The field signals the target's expectations.
+///   the source context's governance engine (via the kind-aware
+///   `has_outlet_invocation_capability`), not repeated here. The field signals
+///   the target's expectations.
 /// - `max_calls_per_minute`: enforced by the per-interface [`RateLimit`]
 ///   (effective limit is `min(outbound, inbound)`).
 /// - `max_response_bytes`: response size checked after execution.
@@ -298,7 +299,8 @@ impl OutboundPolicy {
 pub struct InboundPolicy {
     /// Roles in the source context whose members can call. Empty means any role.
     /// Advisory: role enforcement is the source context governance engine's
-    /// responsibility (it checks `has_outlet_call_capability`).
+    /// responsibility (it checks the kind-aware
+    /// `has_outlet_invocation_capability`).
     pub allowed_source_roles: Vec<String>,
     /// Maximum calls per minute from the target context's perspective.
     /// Enforced by the per-interface [`RateLimit`].
@@ -1793,8 +1795,25 @@ where
         }
     }
 
-    // 5. Source context governance: invoker must have Action-outlet call capability.
-    if !super::has_outlet_call_capability(source_role_state, invoker_did, &interface.outlet_id) {
+    // 5. Source context governance: the invoker (a member of the SOURCE context)
+    // must hold the kind-appropriate split capability for the TARGET outlet.
+    // JUDGMENT: this gate authorizes initiating a cross-context call to the
+    // TARGET outlet — it gates THAT outlet's invocation, not a distinct
+    // source-only authority — so per spec §5.4.2 the two stems stay independent
+    // on this surface too: a Query target requires OutletQuery(id)/OutletQueryAll
+    // and an Action target requires OutletCall(id)/OutletCallAll. The target
+    // registry is the authority for the outlet's kind; an outlet absent from it
+    // defaults to the Action stem so the existence check in step 6 produces the
+    // OutletNotFound error rather than this gate.
+    let target_kind = target_registry
+        .get(&interface.outlet_id)
+        .map_or(OutletKind::Action, |registration| registration.kind);
+    if !super::has_outlet_invocation_capability(
+        source_role_state,
+        invoker_did,
+        &interface.outlet_id,
+        target_kind,
+    ) {
         return Err(OutletError::InterfaceInvokerNotAuthorized {
             did: invoker_did.to_string(),
             outlet_id: interface.outlet_id.clone(),
