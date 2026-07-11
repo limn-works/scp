@@ -515,7 +515,9 @@ describe("mapSagaError", () => {
     // {message} embeds a literal `[SCP-SAGA-…]` cannot be hijacked into a saga
     // subclass: only the leading bracket is read as the code, which here is a
     // SCP-OUTLET code, so the error delegates to mapBridgeError as a OutletError.
-    const err = mapSagaError(new Error("[SCP-OUTLET-6011] outlet error: see [SCP-SAGA-13067] note"));
+    const err = mapSagaError(
+      new Error("[SCP-OUTLET-6011] outlet error: see [SCP-SAGA-13067] note"),
+    );
     expect(err).toBeInstanceOf(OutletError);
     expect(err).not.toBeInstanceOf(SagaAbortedError);
     expect(err).not.toBeInstanceOf(SagaNeedsRepairError);
