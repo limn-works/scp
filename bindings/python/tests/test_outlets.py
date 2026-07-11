@@ -86,7 +86,7 @@ class TestTranslateBridgeError:
 
 _DUMMY_CTX_SRC = "ctx-source-001"
 _DUMMY_CTX_TGT = "ctx-target-002"
-_DUMMY_TOOL = "calculator"
+_DUMMY_OUTLET = "calculator"
 _DUMMY_DID = "did:dht:z6MkAlice"
 _DUMMY_UCAN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJFZERTQSJ9.test"
 
@@ -117,7 +117,7 @@ class TestChainDepthValidation:
             scp,
             _DUMMY_CTX_SRC,
             _DUMMY_CTX_TGT,
-            _DUMMY_TOOL,
+            _DUMMY_OUTLET,
             {},
             _DUMMY_DID,
             _DUMMY_UCAN,
@@ -136,7 +136,7 @@ class TestChainDepthValidation:
             scp,
             _DUMMY_CTX_SRC,
             _DUMMY_CTX_TGT,
-            _DUMMY_TOOL,
+            _DUMMY_OUTLET,
             {},
             _DUMMY_DID,
             _DUMMY_UCAN,
@@ -153,7 +153,7 @@ class TestChainDepthValidation:
                 scp,
                 _DUMMY_CTX_SRC,
                 _DUMMY_CTX_TGT,
-                _DUMMY_TOOL,
+                _DUMMY_OUTLET,
                 {},
                 _DUMMY_DID,
                 _DUMMY_UCAN,
@@ -170,7 +170,7 @@ class TestChainDepthValidation:
                 scp,
                 _DUMMY_CTX_SRC,
                 _DUMMY_CTX_TGT,
-                _DUMMY_TOOL,
+                _DUMMY_OUTLET,
                 {},
                 _DUMMY_DID,
                 _DUMMY_UCAN,
@@ -187,7 +187,7 @@ class TestChainDepthValidation:
                 scp,
                 _DUMMY_CTX_SRC,
                 _DUMMY_CTX_TGT,
-                _DUMMY_TOOL,
+                _DUMMY_OUTLET,
                 {},
                 _DUMMY_DID,
                 _DUMMY_UCAN,
@@ -204,7 +204,7 @@ class TestChainDepthValidation:
                 scp,
                 _DUMMY_CTX_SRC,
                 _DUMMY_CTX_TGT,
-                _DUMMY_TOOL,
+                _DUMMY_OUTLET,
                 {},
                 _DUMMY_DID,
                 _DUMMY_UCAN,
@@ -221,7 +221,7 @@ class TestChainDepthValidation:
                 scp,
                 _DUMMY_CTX_SRC,
                 _DUMMY_CTX_TGT,
-                _DUMMY_TOOL,
+                _DUMMY_OUTLET,
                 {},
                 _DUMMY_DID,
                 _DUMMY_UCAN,
@@ -249,7 +249,7 @@ class TestTtlSecondsValidation:
         sid = await SCP.outlet_session_create(
             scp,
             _DUMMY_CTX_SRC,
-            _DUMMY_TOOL,
+            _DUMMY_OUTLET,
             _DUMMY_CTX_TGT,
             None,
         )
@@ -265,7 +265,7 @@ class TestTtlSecondsValidation:
         sid = await SCP.outlet_session_create(
             scp,
             _DUMMY_CTX_SRC,
-            _DUMMY_TOOL,
+            _DUMMY_OUTLET,
             _DUMMY_CTX_TGT,
             0,
         )
@@ -279,7 +279,7 @@ class TestTtlSecondsValidation:
             await SCP.outlet_session_create(
                 scp,
                 _DUMMY_CTX_SRC,
-                _DUMMY_TOOL,
+                _DUMMY_OUTLET,
                 _DUMMY_CTX_TGT,
                 -1,
             )
@@ -293,7 +293,7 @@ class TestTtlSecondsValidation:
             await SCP.outlet_session_create(
                 scp,
                 _DUMMY_CTX_SRC,
-                _DUMMY_TOOL,
+                _DUMMY_OUTLET,
                 _DUMMY_CTX_TGT,
                 3.14,  # type: ignore[arg-type]
             )
@@ -307,7 +307,7 @@ class TestTtlSecondsValidation:
             await SCP.outlet_session_create(
                 scp,
                 _DUMMY_CTX_SRC,
-                _DUMMY_TOOL,
+                _DUMMY_OUTLET,
                 _DUMMY_CTX_TGT,
                 True,  # type: ignore[arg-type]
             )
@@ -321,7 +321,7 @@ class TestTtlSecondsValidation:
             await SCP.outlet_session_create(
                 scp,
                 _DUMMY_CTX_SRC,
-                _DUMMY_TOOL,
+                _DUMMY_OUTLET,
                 _DUMMY_CTX_TGT,
                 False,  # type: ignore[arg-type]
             )
@@ -805,7 +805,7 @@ class TestSagaTimestampValidation:
 class TestSagaErrorTaxonomy:
     """The three §6.2.4 saga terminals are ``OutletError`` subclasses.
 
-    Cross-context outlet invocation is a TOOL operation, so its terminal
+    Cross-context outlet invocation is a OUTLET operation, so its terminal
     failures live under :class:`OutletError` — a caller that catches
     ``OutletError`` catches all three. Re-parenting any of them (e.g. to a
     bare ``ScpError``) would silently break that contract; these pin it.

@@ -147,7 +147,7 @@ Cross-platform conformance test suite (SCP-120) validating the Kotlin SDK API co
 | `IdentityConformanceTest` | create, load, resolve |
 | `ContextConformanceTest` | create, join, leave, close, state machine transitions |
 | `MessagingConformanceTest` | send, receive (Flow subscription), sequence ordering |
-| `ToolsConformanceTest` | register, invoke, verify test vectors |
+| `OutletsConformanceTest` | register, invoke, verify test vectors |
 | `UcanConformanceTest` | validate, mint, revoke, delegate, nonce replay, ceiling enforcement |
 | `TransportConformanceTest` | connect, status |
 | `EventLogConformanceTest` | query, verify proof |

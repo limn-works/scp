@@ -32,7 +32,7 @@ Single-file bridge (`bridge.rs`) containing all UniFFI exports. Key function gro
 | Broadcast | `broadcast_subscribe`, `broadcast_unsubscribe`, `broadcast_publish`, `broadcast_block_subscriber`, `broadcast_handle_key_request`, `broadcast_subscriber_count`, `broadcast_is_subscriber`, `broadcast_admission` |
 | TTL | `context_handle_ttl_expiry`, `context_propose_ttl_extension`, `context_reset_ttl_timer` |
 | Local DID | `register_local_did`, `is_local_did` |
-| Tools | `outlet_register`, `outlet_invoke`, `outlet_verify` |
+| Outlets | `outlet_register`, `outlet_invoke`, `outlet_verify` |
 | UCAN | `ucan_validate`, `ucan_mint`, `ucan_revoke` |
 | Event Log | `event_log_query`, `event_log_verify` |
 | Transport | `transport_connect`, `transport_disconnect`, `transport_status` |
