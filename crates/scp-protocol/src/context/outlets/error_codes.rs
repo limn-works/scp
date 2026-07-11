@@ -4,7 +4,7 @@
 //! This registry is governed solely by spec §5.4.4. It is unrelated to
 //! ADR-049's error taxonomy, which covers the distinct `SCP-SAGA-*`
 //! (`13000-13999`) cross-context-saga terminal-state codes — a separate range
-//! from this outlet-error `SCP-TOOL-61xx` sub-block.
+//! from this outlet-error sub-block.
 //!
 //! # Background
 //!
