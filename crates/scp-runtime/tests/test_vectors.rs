@@ -1115,7 +1115,7 @@ fn vector_28_outlet_interface_offer_id() {
     buf.extend_from_slice(target_context.as_bytes());
     buf.extend_from_slice(&timestamp.to_be_bytes());
 
-    assert_eq!(buf.len(), 73, "offer ID input must be 73 bytes per §25.15");
+    assert_eq!(buf.len(), 75, "offer ID input must be 75 bytes per §25.15");
 
     let manual_hash: [u8; 32] = Sha256::digest(&buf).into();
     assert_eq!(
