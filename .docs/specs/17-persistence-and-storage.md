@@ -102,7 +102,7 @@ context/{context_id}/event_meta/count
 context/{context_id}/event_meta/root
 context/{context_id}/event_tree/{level}/{index}
 context/{context_id}/merkle_event_log/{seq:020d}
-context/{context_id}/tool/{tool_id}
+context/{context_id}/tool/{outlet_id}
 context/{context_id}/tool_session/{session_id}
 context/{context_id}/ucan_token/{token_id}
 context/{context_id}/ucan_revocation/{token_id}
@@ -240,9 +240,9 @@ impl<S: Storage> ProtocolRepository<S> {
     pub async fn load_tofu_record(&self, did: &DID) -> Result<Option<Vec<u8>>, StoreError>;
 
     // --- Tools ---
-    pub async fn store_tool(&self, context_id: &ContextId, tool_id: &ToolId, registration: &[u8]) -> Result<(), StoreError>;
-    pub async fn load_tool(&self, context_id: &ContextId, tool_id: &ToolId) -> Result<Option<Vec<u8>>, StoreError>;
-    pub async fn list_tools(&self, context_id: &ContextId) -> Result<Vec<ToolId>, StoreError>;
+    pub async fn store_tool(&self, context_id: &ContextId, outlet_id: &OutletId, registration: &[u8]) -> Result<(), StoreError>;
+    pub async fn load_tool(&self, context_id: &ContextId, outlet_id: &OutletId) -> Result<Option<Vec<u8>>, StoreError>;
+    pub async fn list_tools(&self, context_id: &ContextId) -> Result<Vec<OutletId>, StoreError>;
 
     // --- Tool sessions ---
     pub async fn store_tool_session(&self, context_id: &ContextId, session_id: &str, session: &[u8]) -> Result<(), StoreError>;

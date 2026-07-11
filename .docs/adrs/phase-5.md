@@ -649,7 +649,7 @@ bindings/swift/
       SCP.swift                       # SCP actor — top-level entry point, identity + transport init
       Identity.swift                  # SCPIdentity actor, DIDDocument struct
       Context.swift                   # SCPContext actor, AsyncStream<Message>, lifecycle
-      Tools.swift                     # ToolDefinition, TestVector, ToolVerificationResult structs
+      Tools.swift                     # ToolDefinition, TestVector, OutletVerificationResult structs
       Trust.swift                     # evaluateTrust(), TrustEvaluation struct
       EventLog.swift                  # SCPEventLog class (nonisolated), Event, Proof, Checkpoint
       Transport.swift                 # TransportConfig struct, transport connection helpers
@@ -1239,7 +1239,7 @@ private func makeMessageStream(handle: ContextHandle) -> AsyncStream<Message> {
 | `Sources/SCP/SCP.swift` | `SCP` actor — top-level entry point, `create()` factory, `createContext()`, `joinContext()` |
 | `Sources/SCP/Identity.swift` | `SCPIdentity` actor — DID, `load()`, `resolve()`, `rotateKey()` |
 | `Sources/SCP/Context.swift` | `SCPContext` actor — `send()`, `messages` stream, `invoke()`, `registerTool()`, `leave()`, `close()`, `deinit` |
-| `Sources/SCP/Tools.swift` | `ToolDefinition`, `TestVector`, `ToolVerificationResult` nonisolated structs |
+| `Sources/SCP/Tools.swift` | `ToolDefinition`, `TestVector`, `OutletVerificationResult` nonisolated structs |
 | `Sources/SCP/Trust.swift` | `evaluateTrust()`, `TrustEvaluation` struct |
 | `Sources/SCP/EventLog.swift` | `SCPEventLog` (nonisolated class), `Event`, `Proof`, `Checkpoint` structs |
 | `Sources/SCP/Transport.swift` | `TransportConfig` struct, transport connection helpers |

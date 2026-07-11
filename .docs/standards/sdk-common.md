@@ -98,10 +98,10 @@ holds `13050-13099`, so the two layers never contend for the same number.
 | `SCP-SAGA-13037` | handler | Divergence-marker serialization failed |
 | `SCP-SAGA-13038` | handler | Saga phase reached the wrong dispatch helper |
 | `SCP-SAGA-13050` | supervisor | Initiator is not a member of the named caller context (caller-axis authorize-before-reserve) |
-| `SCP-SAGA-13051` | supervisor | Prepare — `CrossContextToolInvocation` reached `start_saga` without an executor context |
+| `SCP-SAGA-13051` | supervisor | Prepare — `CrossContextOutletInvocation` reached `start_saga` without an executor context |
 | `SCP-SAGA-13052` | supervisor | Prepare-A — caller context is not a co-resident actor |
 | `SCP-SAGA-13053` | supervisor | Prepare-B — target context is not a co-resident actor |
-| `SCP-SAGA-13054` | supervisor | Commit — `CrossContextToolInvocation` reached `start_saga` without an executor context |
+| `SCP-SAGA-13054` | supervisor | Commit — `CrossContextOutletInvocation` reached `start_saga` without an executor context |
 | `SCP-SAGA-13055` | supervisor | Commit-B — target context is not a co-resident actor |
 | `SCP-SAGA-13056` | supervisor | Commit-B — executor already consumed but no output stashed (coordinator bug) |
 | `SCP-SAGA-13057` | supervisor | Commit-B — cross-context tool executor failed |

@@ -454,7 +454,7 @@ pub struct MetadataVisibilityPolicy {
     pub name: FieldVisibility,
     pub description: FieldVisibility,
     pub economic_policy: FieldVisibility,
-    pub tool_interface_count: FieldVisibility,
+    pub outlet_interface_count: FieldVisibility,
     pub child_context_info: FieldVisibility,
 }
 
@@ -787,7 +787,7 @@ Template: "scp:template/bilateral-ephemeral"
   memory_scope: ephemeral
   ttl:         required (creator sets duration, no default — forces intentionality)
   tools:       none
-  metadata_visibility: { member_count: MemberOnly, context_age: MemberOnly, creator_identity: MemberOnly, name: PreJoin, description: MemberOnly, economic_policy: MemberOnly, tool_interface_count: MemberOnly, child_context_info: MemberOnly }
+  metadata_visibility: { member_count: MemberOnly, context_age: MemberOnly, creator_identity: MemberOnly, name: PreJoin, description: MemberOnly, economic_policy: MemberOnly, outlet_interface_count: MemberOnly, child_context_info: MemberOnly }
 
 Template: "scp:template/bilateral-persistent"
   ceiling:     [messages:read, messages:write, member:ban]
@@ -796,7 +796,7 @@ Template: "scp:template/bilateral-persistent"
   memory_scope: full
   ttl:         none
   tools:       none
-  metadata_visibility: { member_count: MemberOnly, context_age: MemberOnly, creator_identity: MemberOnly, name: PreJoin, description: MemberOnly, economic_policy: MemberOnly, tool_interface_count: MemberOnly, child_context_info: MemberOnly }
+  metadata_visibility: { member_count: MemberOnly, context_age: MemberOnly, creator_identity: MemberOnly, name: PreJoin, description: MemberOnly, economic_policy: MemberOnly, outlet_interface_count: MemberOnly, child_context_info: MemberOnly }
 
 Template: "scp:template/coordination"
   ceiling:     [messages:read, messages:write, outlet:query:*, outlet:call:*, member:ban]
@@ -805,7 +805,7 @@ Template: "scp:template/coordination"
   memory_scope: summary
   ttl:         required (creator sets duration)
   tools:       creator-defined at creation
-  metadata_visibility: { member_count: MemberOnly, context_age: MemberOnly, creator_identity: MemberOnly, name: PreJoin, description: MemberOnly, economic_policy: MemberOnly, tool_interface_count: MemberOnly, child_context_info: MemberOnly }
+  metadata_visibility: { member_count: MemberOnly, context_age: MemberOnly, creator_identity: MemberOnly, name: PreJoin, description: MemberOnly, economic_policy: MemberOnly, outlet_interface_count: MemberOnly, child_context_info: MemberOnly }
 
 Template: "scp:template/group-discussion"
   ceiling:     [messages:read, messages:write, member:invite, member:ban]
@@ -814,7 +814,7 @@ Template: "scp:template/group-discussion"
   memory_scope: full
   ttl:         optional
   tools:       none
-  metadata_visibility: { member_count: PreJoin, context_age: MemberOnly, creator_identity: PreJoin, name: PreJoin, description: PreJoin, economic_policy: MemberOnly, tool_interface_count: MemberOnly, child_context_info: MemberOnly }
+  metadata_visibility: { member_count: PreJoin, context_age: MemberOnly, creator_identity: PreJoin, name: PreJoin, description: PreJoin, economic_policy: MemberOnly, outlet_interface_count: MemberOnly, child_context_info: MemberOnly }
 
 Template: "scp:template/public-broadcast"
   mode:          Broadcast
@@ -842,7 +842,7 @@ Template: "scp:template/gated-broadcast"
   metadata_visibility: { member_count: MemberOnly, all others: PreJoin }
   projection_policy: { default_rule: Gated, overrides: [] }
 
-Template: "scp:template/tool-interface"
+Template: "scp:template/outlet-interface"
   ceiling:       [messages:read, messages:write, outlet:register, outlet:query:*, outlet:call:*, member:ban]
   roles:         [admin (creator), member (joiner)]
   governance:    single-admin
@@ -858,7 +858,7 @@ Template: "scp:template/paid-service"
   governance:    single-admin
   memory_scope:  full (receipts are provenance)
   economic_policy: required — per_outlet_call must be set at creation
-  extends:       scp:template/tool-interface
+  extends:       scp:template/outlet-interface
   ttl:           optional
   metadata_visibility: { economic_policy: PreJoin, member_count: MemberOnly, all others: PreJoin }
 

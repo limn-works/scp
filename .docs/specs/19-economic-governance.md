@@ -561,7 +561,7 @@ All follow the legibility principle: agents see economic terms before committing
 
 Two new well-known templates:
 
-**`scp:template/paid-service`:** Action outlet invocation context with per-invoke cost. `economic_policy.cost_schedule.per_outlet_call` required at creation. Single-admin governance. Extends `scp:template/tool-interface`.
+**`scp:template/paid-service`:** Action outlet invocation context with per-invoke cost. `economic_policy.cost_schedule.per_outlet_call` required at creation. Single-admin governance. Extends `scp:template/outlet-interface`.
 
 Properties:
 - Ceiling: `messages:read`, `messages:write`, `outlet:register`, `outlet:query:*`, `outlet:call:*`

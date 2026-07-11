@@ -360,7 +360,7 @@ Note: The vectors above use abstract `data` leaves to pin the RFC 6962 tree cons
 
 ### Vector 32: Typed-Leaf KAT (closed `EventType` taxonomy)
 
-Each leaf is `SHA-256(0x00 || rmp_serde(Event))` over a canonical `scp_event_log::Event` whose `event_type` is one of the closed 77-variant `EventType` taxonomy (ADR-011 AC1 + typed-event unification Amendment + the cross-context-saga event model — Amendment §6 added `CrossContextToolInvoked` (tag 76) and spec §6.2.4 added `CrossContextDivergenceMarker` (tag 77)). The events are signed with a fixed Ed25519 key (RFC 8032 deterministic signatures), so the full-event MessagePack bytes — and therefore the leaf hashes — are reproducible across runs and implementations. Structured payloads are encoded with positional `rmp_serde::to_vec` of the per-variant payload struct (`scp_event_log::payload`); the two opaque payloads carry the documented `key=value;…` bytes shown.
+Each leaf is `SHA-256(0x00 || rmp_serde(Event))` over a canonical `scp_event_log::Event` whose `event_type` is one of the closed 77-variant `EventType` taxonomy (ADR-011 AC1 + typed-event unification Amendment + the cross-context-saga event model — Amendment §6 added `CrossContextOutletInvoked` (tag 76) and spec §6.2.4 added `CrossContextDivergenceMarker` (tag 77)). The events are signed with a fixed Ed25519 key (RFC 8032 deterministic signatures), so the full-event MessagePack bytes — and therefore the leaf hashes — are reproducible across runs and implementations. Structured payloads are encoded with positional `rmp_serde::to_vec` of the per-variant payload struct (`scp_event_log::payload`); the two opaque payloads carry the documented `key=value;…` bytes shown.
 
 ```
 Signing key seed (32 bytes): 0x0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20
@@ -668,7 +668,7 @@ Domain: `"SCP-OFFER-ID-V1:"`
 ```
 Input:
   source_context:  "source-ctx-01"
-  tool_id:         "tool-abc123"
+  outlet_id:         "tool-abc123"
   target_context:  "target-ctx-02"
   timestamp:       1700000000
 

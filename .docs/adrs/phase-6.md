@@ -1230,7 +1230,7 @@ dependencies {
 | `src/main/kotlin/works/limn/scp/Scp.kt` | `Scp` class — top-level entry point, `create()` factory, `createContext()`, `joinContext()` |
 | `src/main/kotlin/works/limn/scp/Identity.kt` | `Identity` class — `did`, `custodyType`, `load()`, `resolve()`, `rotateKey()`; `DIDDocument` data class |
 | `src/main/kotlin/works/limn/scp/Context.kt` | `Context` class — `send()`, `receiveFlow()`, `invokeTool()`, `registerTool()`, `leave()`, `closeContext()`, `AutoCloseable` |
-| `src/main/kotlin/works/limn/scp/Tools.kt` | `ToolDefinition`, `TestVector`, `ToolVerificationResult` data classes |
+| `src/main/kotlin/works/limn/scp/Tools.kt` | `ToolDefinition`, `TestVector`, `OutletVerificationResult` data classes |
 | `src/main/kotlin/works/limn/scp/Trust.kt` | `evaluateTrust()`, `TrustEvaluation` data class |
 | `src/main/kotlin/works/limn/scp/EventLog.kt` | `EventLog` class, `Event`, `Proof`, `Checkpoint` data classes |
 | `src/main/kotlin/works/limn/scp/Transport.kt` | `TransportConfig` data class, transport helpers |
@@ -1797,7 +1797,7 @@ pub struct ContextStateSnapshot {
     /// TTL remaining (None if no TTL or if persistent).
     pub ttl_remaining_secs: Option<u64>,
     /// Registered tools.
-    pub tools: Vec<ToolRegistration>,
+    pub tools: Vec<OutletRegistration>,
     /// Active sender key epochs per member.
     pub sender_key_epochs: Vec<(DID, u64)>,
     /// Current MLS epoch (None for Broadcast contexts).
@@ -1858,7 +1858,7 @@ pub struct EventTypeRetention {
     /// time-based policy).
     pub structural_retention_multiplier: f64,  // Default: 3.0x the base retention
 
-    /// Operational events: MessageSent, ToolInvoked, ToolVerified,
+    /// Operational events: MessageSent, OutletInvoked, OutletVerified,
     /// ConsistencyCheckpoint, KeyEpochAdvance, AbsenceProofRequested.
     /// These are retained for the base retention period.
     pub operational_retention_multiplier: f64,  // Default: 1.0x
@@ -2553,9 +2553,9 @@ pub enum GovernanceAction {
     /// Change a member's role.
     ChangeRole { did: DID, new_role: RoleName },
     /// Register a new tool.
-    RegisterTool { registration: ToolRegistration },
+    RegisterOutlet { registration: OutletRegistration },
     /// Remove a tool.
-    RemoveTool { tool_id: ToolId },
+    RemoveOutlet { outlet_id: OutletId },
     /// Modify the capability ceiling (only if ceiling_policy is Governed).
     ModifyCeiling { new_ceiling: Vec<Capability> },
     /// Close the context.
@@ -2575,7 +2575,7 @@ pub enum GovernanceAction {
     /// Create a child context (§5.13).
     CreateChildContext { params: Box<ContextParams> },
     /// Establish a tool interface with another context (§6.2).
-    EstablishToolInterface { interface: ToolInterface },
+    EstablishOutletInterface { interface: OutletInterface },
     /// Initiate governance-triggered member reset (ADR-029).
     ResetMember { did: DID, reason: String },
     /// Resolve a governance conflict (see section 7).
@@ -3015,7 +3015,7 @@ GovernanceActionExecuted {
 --- Majority test ---
 22. Create a context with Majority governance, min_participation: 0.5.
     Members: Alice, Bob, Carol, Dave, Eve (5 eligible voters).
-23. Alice proposes RegisterTool { ... }.
+23. Alice proposes RegisterOutlet { ... }.
 24. Alice, Bob, Carol approve (3/5 > 50%). Early resolution -> Approved.
 
 --- Deadlock recovery test ---

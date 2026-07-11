@@ -174,7 +174,7 @@ Implement the FFI bridge in `crates/scp-ffi/src/` using PyO3 and maturin. The br
 | `crates/scp-ffi/src/lib.rs` | PyO3 module definition, `#[pymodule]` entry point, tokio runtime initialization |
 | `crates/scp-ffi/src/identity.rs` | `PyIdentity`, `PyDIDDocument` classes, identity bridge functions |
 | `crates/scp-ffi/src/context.rs` | `PyContextHandle`, `PyContextParams` classes, context bridge functions |
-| `crates/scp-ffi/src/tools.rs` | Tool bridge functions, `PyToolRegistration`, `PyToolVerificationResult` |
+| `crates/scp-ffi/src/tools.rs` | Tool bridge functions, `PyOutletRegistration`, `PyOutletVerificationResult` |
 | `crates/scp-ffi/src/transport.rs` | Transport bridge functions, `PyTransportStatus` |
 | `crates/scp-ffi/src/ucan.rs` | UCAN bridge functions, `PyUcanToken` |
 | `crates/scp-ffi/src/event_log.rs` | Event log bridge functions, `PyEvent`, `PyProof` |
@@ -389,7 +389,7 @@ Implement the Python SDK as the `scp_sdk` package in `bindings/python/scp_sdk/`.
    class TransportError(ScpError):
        """Network or relay communication failure."""
 
-   class ToolError(ScpError):
+   class OutletError(ScpError):
        """Tool registration, invocation, or verification failure."""
 
    class ValidationError(ScpError):

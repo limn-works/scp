@@ -66,7 +66,7 @@ pub struct ParticipationRecord {
     pub context_id: ContextId,
     pub participation_count: u64,
     pub participation_duration_seconds: u64,
-    pub tool_invocations: HashMap<ToolId, u64>,
+    pub tool_invocations: HashMap<OutletId, u64>,
     pub governance_actions_by: Vec<GovernanceActionSummary>,
     pub governance_actions_against: Vec<GovernanceActionSummary>,
     pub role_history: Vec<RoleTransition>,
@@ -94,7 +94,7 @@ pub struct Attestation {
 pub enum AttestationType {
     IdentityLink,
     CapabilityDelegation,
-    ToolIntegrity,
+    OutletIntegrity,
     AgentCapability,
     Endorsement,
     RoleAssignment,
@@ -129,7 +129,7 @@ pub struct ConsequenceRule {
 
 pub enum ConsequenceTrigger {
     MessageVelocity,
-    ToolRateExceeded,
+    OutletRateExceeded,
     WarningCount,
     Custom(String),
 }
@@ -718,7 +718,7 @@ Implement the FFI bridge as the `crates/scp-ffi/uniffi/` crate using UniFFI proc
 4. **Tool bridge functions:**
    - `tool_register(handle, registration) -> String` — registers a tool (returns tool ID).
    - `outlet_invoke(handle, outlet_id, input_json, identity) -> String` — invokes an outlet (returns JSON string output).
-   - `tool_verify(handle, tool_id) -> ToolVerificationResult` — verifies a tool against test vectors.
+   - `tool_verify(handle, outlet_id) -> OutletVerificationResult` — verifies a tool against test vectors.
 
 5. **Transport bridge functions:**
    - `transport_connect(relay_url) -> void` — connects to an SCP relay.
@@ -774,7 +774,7 @@ Implement the FFI bridge as the `crates/scp-ffi/uniffi/` crate using UniFFI proc
     | `Message` | `#[derive(uniffi::Record)]` | `struct Message` | `data class Message` |
     | `DIDDocument` | `#[derive(uniffi::Record)]` | `struct DIDDocument` | `data class DIDDocument` |
     | `ToolDefinition` | `#[derive(uniffi::Record)]` | `struct ToolDefinition` | `data class ToolDefinition` |
-    | `ToolVerificationResult` | `#[derive(uniffi::Record)]` | `struct ToolVerificationResult` | `data class ToolVerificationResult` |
+    | `OutletVerificationResult` | `#[derive(uniffi::Record)]` | `struct OutletVerificationResult` | `data class OutletVerificationResult` |
     | `TransportStatus` | `#[derive(uniffi::Record)]` | `struct TransportStatus` | `data class TransportStatus` |
     | `Event` | `#[derive(uniffi::Record)]` | `struct Event` | `data class Event` |
     | `Proof` | `#[derive(uniffi::Record)]` | `struct Proof` | `data class Proof` |
@@ -1180,7 +1180,7 @@ export class ContextError extends ScpError { override name = "ContextError" as c
 export class UcanPermissionError extends ScpError { override name = "UcanPermissionError" as const; } // named to avoid shadowing the JS global `PermissionError`
 export class CryptoError extends ScpError { override name = "CryptoError" as const; }
 export class TransportError extends ScpError { override name = "TransportError" as const; }
-export class ToolError extends ScpError { override name = "ToolError" as const; }
+export class OutletError extends ScpError { override name = "OutletError" as const; }
 export class ValidationError extends ScpError { override name = "ValidationError" as const; }
 ```
 
@@ -1290,7 +1290,7 @@ Rust errors from both bridge crates are mapped to these classes via the bridge l
    const toolId = await ctx.invokeTool("tool-id", { input: "value" }, identity);
    ```
    - `ctx.invokeTool(toolId, input, identity)` invokes a registered tool and returns JSON output.
-   - Invoking a non-existent tool throws `ToolError` with code `SCP-OUTLET-6001`.
+   - Invoking a non-existent tool throws `OutletError` with code `SCP-OUTLET-6001`.
    - Tool registration: `await ctx.registerTool(toolDefinition)` returns a tool ID string.
 
 5. **UCAN API:**
@@ -1558,7 +1558,7 @@ Initial protocol registry defines 28 challenge capabilities across 10 categories
 | Category | Capabilities |
 |----------|-------------|
 | Safety & Security | `prompt-injection-resistance/v1`, `content-safety/v1`, `privacy-compliance/v1`, `credential-handling/v1` |
-| Schema & Protocol Compliance | `schema-validation/v1`, `tool-schema-compliance/v1`, `output-format-compliance/v1` |
+| Schema & Protocol Compliance | `schema-validation/v1`, `outlet-schema-compliance/v1`, `output-format-compliance/v1` |
 | Behavioral Compliance | `rate-limit-compliance/v1`, `instruction-adherence/v1`, `context-policy-adherence/v1`, `graceful-degradation/v1` |
 | Operational | `latency-compliance/v1` (param: `max_ms`), `idempotency/v1`, `multilingual/v1` (param: `languages`) |
 | Spending / Commerce | `spending-compliance/v1`, `cost-awareness/v1` |

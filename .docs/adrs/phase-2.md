@@ -190,7 +190,7 @@ pub struct ContextParams {
     pub ceiling_policy: CeilingPolicy,   // Whether the ceiling is immutable or governed (§5.3)
     pub promotion_policy: PromotionPolicy, // Whether context promotion is allowed (§5.10)
     pub roles: Vec<RoleDefinition>,      // Role definitions with permission sets
-    pub tools: Vec<ToolRegistration>,    // Initial tool registrations
+    pub tools: Vec<OutletRegistration>,    // Initial tool registrations
     pub ttl: Option<Duration>,           // Optional TTL
     pub memory_scope: MemoryScope,       // Ephemeral, Summary, or Full
     pub governance: GovernanceModel,     // Single-admin for Phase 2
@@ -506,11 +506,11 @@ Implement tool registration, invocation, and cross-context interfaces in `scp-co
 
 ### Acceptance Criteria
 
-1. **`ToolRegistration` struct:**
+1. **`OutletRegistration` struct:**
 
 ```rust
-pub struct ToolRegistration {
-    pub tool_id: ToolId,
+pub struct OutletRegistration {
+    pub outlet_id: OutletId,
     pub name: String,
     pub description: String,
     pub schema: ToolSchema,              // MCP-compatible JSON Schema
@@ -531,22 +531,22 @@ pub struct TestVector {
 }
 ```
 
-2. **`register_tool(context: &ContextHandle, registration: ToolRegistration, registrant_did: &DID) -> Result<ToolId, ToolError>`**
+2. **`register_tool(context: &ContextHandle, registration: OutletRegistration, registrant_did: &DID) -> Result<OutletId, OutletError>`**
    - Validates registrant has `OutletRegister` capability via UCAN (ADR-009).
    - Validates input and output schemas are valid JSON Schema.
    - Validates implementation hash is 32 bytes.
    - Validates operator DID is resolvable.
    - Stores the tool registration in the context's tool registry.
-   - Appends `ToolRegistered` event to event log with full registration metadata.
+   - Appends `OutletRegistered` event to event log with full registration metadata.
    - Returns the tool ID.
 
-3. **`invoke_tool(context: &ContextHandle, tool_id: &ToolId, input: serde_json::Value, invoker_did: &DID) -> Result<serde_json::Value, ToolError>`**
+3. **`invoke_tool(context: &ContextHandle, outlet_id: &OutletId, input: serde_json::Value, invoker_did: &DID) -> Result<serde_json::Value, OutletError>`**
    - Validates context state is `Active`.
    - Validates invoker has `OutletQuery(outlet_id)`/`OutletQueryAll` (Query) or `OutletCall(outlet_id)`/`OutletCallAll` (Action) capability via UCAN.
    - Validates input against the tool's input schema.
    - Calls the tool implementation.
    - Validates output against the tool's output schema.
-   - Appends `ToolInvoked` event to event log (includes tool_id, invoker_did, input hash, output hash).
+   - Appends `OutletInvoked` event to event log (includes outlet_id, invoker_did, input hash, output hash).
    - Returns the tool output.
 
 **Tool execution lifecycle:**
@@ -557,7 +557,7 @@ Every tool invocation follows a defined lifecycle with explicit states, timeouts
 /// A tool invocation request, sent as an MLS application message.
 pub struct ToolRequest {
     pub request_id: String,          // UUID v4, unique per invocation
-    pub tool_id: ToolId,
+    pub outlet_id: OutletId,
     pub invoker_did: DID,
     pub input: serde_json::Value,
     pub timeout_ms: u32,             // Caller-specified timeout (max: context ceiling, default: 30_000)
@@ -579,12 +579,12 @@ pub struct ToolResponse {
 pub enum ToolStatus { Success, Error, Timeout, Cancelled }
 
 pub struct ToolExecutionError {
-    pub code: ToolErrorCode,
+    pub code: OutletErrorCode,
     pub message: String,
     pub retryable: bool,
 }
 
-pub enum ToolErrorCode {
+pub enum OutletErrorCode {
     InputValidationFailed, OutputValidationFailed, ExecutionFailed,
     Timeout, Cancelled, RateLimited, ToolNotFound, PermissionDenied, InternalError,
 }
@@ -607,37 +607,37 @@ pub enum ToolErrorCode {
 
 **Event log recording:**
 - `ToolRequest` and `ToolResponse` are both recorded as events in the context's event log (ADR-011).
-- The event includes: `request_id`, `tool_id`, `invoker_did`, `status`, `execution_time_ms`, `SHA256(input)`, `SHA256(output)`. Full input/output is NOT recorded (may be large); only content hashes are stored.
+- The event includes: `request_id`, `outlet_id`, `invoker_did`, `status`, `execution_time_ms`, `SHA256(input)`, `SHA256(output)`. Full input/output is NOT recorded (may be large); only content hashes are stored.
 
-4. **`update_tool(context: &ContextHandle, tool_id: &ToolId, new_registration: ToolRegistration, updater_did: &DID) -> Result<(), ToolError>`**
+4. **`update_tool(context: &ContextHandle, outlet_id: &OutletId, new_registration: OutletRegistration, updater_did: &DID) -> Result<(), OutletError>`**
    - Validates updater is the tool's operator DID or has admin role.
    - Records old and new implementation hashes.
    - Updates the tool registration.
-   - Appends `ToolUpdated` event to event log (includes old hash, new hash, all changed fields).
+   - Appends `OutletUpdated` event to event log (includes old hash, new hash, all changed fields).
    - Tool mutations are visible to all context members.
 
-5. **`verify_tool(context: &ContextHandle, tool_id: &ToolId) -> Result<ToolVerificationResult, ToolError>`**
+5. **`verify_tool(context: &ContextHandle, outlet_id: &OutletId) -> Result<OutletVerificationResult, OutletError>`**
    - Runs all test vectors against the tool.
    - For each test vector: invoke tool with test input, compare output to expected output.
    - Returns a result with per-vector pass/fail status and overall integrity assessment.
-   - Appends `ToolVerified` event to event log.
+   - Appends `OutletVerified` event to event log.
 
 6. **Cross-context tool interfaces:**
 
 ```rust
-pub struct ToolInterface {
+pub struct OutletInterface {
     pub source_context: ContextId,      // Context exposing the tool
     pub target_context: ContextId,      // Context consuming the tool
-    pub tool_id: ToolId,                // Which tool is exposed
+    pub outlet_id: OutletId,                // Which tool is exposed
     pub rate_limit: Option<RateLimit>,  // Calls per time window
     pub approved_by_source: bool,       // Source context opted in
     pub approved_by_target: bool,       // Target context opted in
 }
 ```
 
-   - **`expose_tool(context: &ContextHandle, tool_id: &ToolId, to_context: &ContextId) -> Result<ToolInterface, ToolError>`**: Initiates a tool interface proposal from the source context. Requires admin capability.
-   - **`accept_tool_interface(context: &ContextHandle, interface: &ToolInterface) -> Result<(), ToolError>`**: Target context accepts the interface. Requires admin capability. Both `approved_by_source` and `approved_by_target` must be true before calls are permitted.
-   - **`invoke_cross_context(source_context: &ContextHandle, interface: &ToolInterface, input: serde_json::Value, invoker_did: &DID) -> Result<serde_json::Value, ToolError>`**: Invokes a tool across context boundaries. Source context governance checks outbound. Target context governance checks inbound. Both event logs record the call with provenance.
+   - **`expose_tool(context: &ContextHandle, outlet_id: &OutletId, to_context: &ContextId) -> Result<OutletInterface, OutletError>`**: Initiates a tool interface proposal from the source context. Requires admin capability.
+   - **`accept_tool_interface(context: &ContextHandle, interface: &OutletInterface) -> Result<(), OutletError>`**: Target context accepts the interface. Requires admin capability. Both `approved_by_source` and `approved_by_target` must be true before calls are permitted.
+   - **`invoke_cross_context(source_context: &ContextHandle, interface: &OutletInterface, input: serde_json::Value, invoker_did: &DID) -> Result<serde_json::Value, OutletError>`**: Invokes a tool across context boundaries. Source context governance checks outbound. Target context governance checks inbound. Both event logs record the call with provenance.
    - Rate limiting enforced per interface.
 
 7. **Stateful tool sessions (spec section 6.2.1):**
@@ -645,7 +645,7 @@ pub struct ToolInterface {
 ```rust
 pub struct ToolSession {
     pub session_id: String,
-    pub tool_id: ToolId,
+    pub outlet_id: OutletId,
     pub source_context: ContextId,
     pub state: serde_json::Value,       // Opaque session state
     pub created_at: u64,
@@ -654,8 +654,8 @@ pub struct ToolSession {
 }
 ```
 
-   - **`create_session(context: &ContextHandle, tool_id: &ToolId, source_context: &ContextId, ttl: Duration) -> Result<String, ToolError>`**: Creates a new session. Returns session ID.
-   - **`invoke_session(context: &ContextHandle, session_id: &str, input: serde_json::Value) -> Result<serde_json::Value, ToolError>`**: Invokes a tool within an active session. Each call is individually governed. Session state is updated by the tool.
+   - **`create_session(context: &ContextHandle, outlet_id: &OutletId, source_context: &ContextId, ttl: Duration) -> Result<String, OutletError>`**: Creates a new session. Returns session ID.
+   - **`invoke_session(context: &ContextHandle, session_id: &str, input: serde_json::Value) -> Result<serde_json::Value, OutletError>`**: Invokes a tool within an active session. Each call is individually governed. Session state is updated by the tool.
    - **Session cleanup:** Background task removes sessions past their TTL. Session state is internal to the tool's context.
 
 ### Scope
@@ -664,10 +664,10 @@ pub struct ToolSession {
 
 | File | Purpose |
 |------|---------|
-| `mod.rs` | Module root, `ToolId` type, re-exports |
-| `registry.rs` | `ToolRegistration`, tool storage per context, `register_tool`, `update_tool`, `verify_tool` |
+| `mod.rs` | Module root, `OutletId` type, re-exports |
+| `registry.rs` | `OutletRegistration`, tool storage per context, `register_tool`, `update_tool`, `verify_tool` |
 | `invoke.rs` | `invoke_tool`, input/output schema validation, tool dispatch |
-| `interface.rs` | `ToolInterface`, `expose_tool`, `accept_tool_interface`, `invoke_cross_context`, rate limiting |
+| `interface.rs` | `OutletInterface`, `expose_tool`, `accept_tool_interface`, `invoke_cross_context`, rate limiting |
 | `session.rs` | `ToolSession`, `create_session`, `invoke_session`, TTL cleanup task |
 | `schema.rs` | JSON Schema validation helpers, MCP compatibility utilities |
 | `lifecycle.rs` | `ToolRequest`, `ToolResponse`, `ToolCancel`, `ToolStatus`, timeout management, cancellation handling |
@@ -780,11 +780,11 @@ pub enum EventType {
     RoleAssigned,
     TokenRevoked,
     MessageSent,                  // per-author application activity; convergent canonical leaf in the ADR-051 end state, local ContextEvent until then
-    ToolRegistered,
-    ToolUpdated,
-    ToolInvoked,                  // per-author application activity; see MessageSent (ADR-051 causal-DAG ordering)
-    ToolVerified,
-    ToolInterfaceEstablished,
+    OutletRegistered,
+    OutletUpdated,
+    OutletInvoked,                  // per-author application activity; see MessageSent (ADR-051 causal-DAG ordering)
+    OutletVerified,
+    OutletInterfaceEstablished,
     GovernanceAction,
     ConsistencyCheckpoint,
     AbsenceProofRequested,
@@ -831,7 +831,7 @@ pub enum EventType {
     HardRateLimitModified,        // ModifyHardRateLimit §19.7 D4
     EconomicPolicyLocked,         // LockEconomicPolicy §19.3
     ContextMigrationStarted,      // ProposeContextMigration §5.11A grace start
-    ToolRemoved,                  // RemoveTool; pairs with ToolRegistered
+    OutletRemoved,                  // RemoveOutlet; pairs with OutletRegistered
     PruningPolicyModified,        // ModifyPruningPolicy ADR-030 §6
     CommitBroadcasted,            // MLS commit broadcast record §9.9 reconciliation
     CommitBroadcastPending,       // deferred-commit queue record
@@ -957,7 +957,7 @@ pub enum EventType {
    >    unification removes those append sites.
    >
    > 2. **Per-author application activity (interim — canonical in the ADR-051 end
-   >    state).** `MessageSent`, `ToolInvoked`, and the payment receipts
+   >    state).** `MessageSent`, `OutletInvoked`, and the payment receipts
    >    `PaymentReceived` / `PaymentCaptureFailed` (appended by the payee on
    >    `adapter.capture()`) are appended only by their author/payee, keyed by a
    >    *per-author* sequence, with no global order: each member's log holds only
@@ -969,11 +969,11 @@ pub enum EventType {
    >    frontier), and every member linearizes the same DAG identically — at which
    >    point they re-enter the canonical log as convergent leaves. Until ADR-051
    >    lands they are local. (The §25 KAT vectors already carry no `MessageSent` /
-   >    `ToolInvoked` / `PaymentReceived` leaf, consistent with this.)
+   >    `OutletInvoked` / `PaymentReceived` leaf, consistent with this.)
    >
-   >    *Scope:* this covers the **intra-context, per-author** `ToolInvoked`
-   >    emission. The **cross-context tool-call saga** (§6) records its `ToolInvoked`
-   >    / `CrossContextToolInvoked` within the saga's MLS-Commit phase — commit-
+   >    *Scope:* this covers the **intra-context, per-author** `OutletInvoked`
+   >    emission. The **cross-context tool-call saga** (§6) records its `OutletInvoked`
+   >    / `CrossContextOutletInvoked` within the saga's MLS-Commit phase — commit-
    >    ordered and *convergent*, canonical by design (its `outlet_invoked_event_id`
    >    is a signed `CrossContextOutletReceipt` field) — and is **not** in this
    >    per-author exclusion.
@@ -1023,7 +1023,7 @@ pub enum EventType {
    > commits per the context's *declared* governance model (mechanical, not an ad-hoc
    > vote — §7.3.7's "automatic, not governance-discretion" preserved). See ADR-051 §6.
    >
-   > **Other derived per-author facts.** `tool_invocation_count` (§7.3.2) is a
+   > **Other derived per-author facts.** `outlet_invocation_count` (§7.3.2) is a
    > convergent *count* over the causal DAG (ADR-051) — no clock; interim-local
    > (`anchored=false`) until that DAG lands. Economic `SenderVelocity` /
    > `ContextMessageRate` pricing (§19.7) is enforced at `authorize()` by the payer's

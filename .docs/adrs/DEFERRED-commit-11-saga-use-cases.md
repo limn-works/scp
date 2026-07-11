@@ -100,7 +100,7 @@ the saga-shaped `InitiateStandingPairCreate` variant and its `NotImplemented` re
 
 ## Gap 2 — Cross-context tool invocation transport
 
-> **RESOLVED (2026-06-26).** The dead `ToolsCommand::InitiateCrossContextToolInvocation` mailbox variant that represented this "deferral" has been deleted. The §6.2.4 cross-context tool-invocation saga is produced supervisor-side by `Supervisor::start_cross_context_tool_invocation_saga`, not via the actor mailbox (its borrowed, non-`'static` `SagaSigningKeys` cannot move into a `'static` mailbox message). The saga's remaining surface — cross-node wire transport (the current path drives co-resident target actors in-process) — is tracked in the saga workstream. Its FFI export (ADR-049 §3a) has since shipped (see Gap-5 / exit criterion 4). The present-tense text below is the original problem statement, retained for historical provenance only.
+> **RESOLVED (2026-06-26).** The dead `ToolsCommand::InitiateCrossContextOutletInvocation` mailbox variant that represented this "deferral" has been deleted. The §6.2.4 cross-context tool-invocation saga is produced supervisor-side by `Supervisor::start_cross_context_tool_invocation_saga`, not via the actor mailbox (its borrowed, non-`'static` `SagaSigningKeys` cannot move into a `'static` mailbox message). The saga's remaining surface — cross-node wire transport (the current path drives co-resident target actors in-process) — is tracked in the saga workstream. Its FFI export (ADR-049 §3a) has since shipped (see Gap-5 / exit criterion 4). The present-tense text below is the original problem statement, retained for historical provenance only.
 
 **What's missing.** The spec (§6.2) defines tool invocation within a
 context but not the cross-context forwarding path:
@@ -109,7 +109,7 @@ context but not the cross-context forwarding path:
   event log recording on both sides).
 - Which party presents the UCAN proof at the target (caller forwards
   vs. target fetches from a UCAN store).
-- How the tool's `ToolInvokedEvent` is relayed back to the caller,
+- How the tool's `OutletInvokedEvent` is relayed back to the caller,
   and whether the caller's event log records it separately from the
   target's event log.
 
@@ -126,7 +126,7 @@ context but not the cross-context forwarding path:
 
 **Resolution.** The saga is produced directly by
 `Supervisor::start_cross_context_outlet_invocation_saga` (running
-supervisor-side); the dead `ToolsCommand::InitiateCrossContextToolInvocation`
+supervisor-side); the dead `ToolsCommand::InitiateCrossContextOutletInvocation`
 mailbox variant and its `NotImplemented` reply have been deleted. Note:
 `Supervisor::invoke_tool_with_economy` is, for a separate reason, not
 a command variant — its generic `F: FnOnce(Value) -> Fut` executor closure

@@ -179,7 +179,7 @@ The protocol defines a standard participation record format whose facts are deri
 - Attestation history (endorsements issued, endorsements received, endorsement accuracy) — the exception: NOT derived from context event logs but from the credential layer (§7.4); see `attestation_count` below
 - Context creation history
 
-Facts derived from convergent events — participation duration (`MemberJoined`/`MemberLeft`), governance actions (`GovernanceActionExecuted`), role progression (`RoleAssigned`), and context-creation (`ChildContextCreated`) — are convergent-by-construction: each becomes Merkle-verifiable against the relevant context's Merkle root once receive-side replication lands (ADR-051). Today the runtime emits these leaves committer-side only (receive-side replication is dormant), so a non-committer's locally-derived record is committer-local rather than independently Merkle-verifiable until ADR-051. **`attestation_count` is the explicit exception: it is NOT a context-event fact and NOT Merkle-anchored.** Attestations are credential-layer artifacts (§7.4), not context-log leaves; `attestation_count` is computed on-demand from the attestations the verifying agent can access, and each contributing attestation is verified by its own envelope signature and revocation status (§7.4.4), not by inclusion in any context Merkle tree (see the per-context-extraction step for `attestation_count` below). The `tool_invocation_count` fact derives from `ToolInvoked`, per-author application activity that becomes Merkle-anchored under the causal-DAG ordering of ADR-051 (computed locally until then; see the ADR-011 amendment, exclusion taxonomy). The participation record is not stored centrally — it is computed by any agent from the set of context logs and accessible attestations.
+Facts derived from convergent events — participation duration (`MemberJoined`/`MemberLeft`), governance actions (`GovernanceActionExecuted`), role progression (`RoleAssigned`), and context-creation (`ChildContextCreated`) — are convergent-by-construction: each becomes Merkle-verifiable against the relevant context's Merkle root once receive-side replication lands (ADR-051). Today the runtime emits these leaves committer-side only (receive-side replication is dormant), so a non-committer's locally-derived record is committer-local rather than independently Merkle-verifiable until ADR-051. **`attestation_count` is the explicit exception: it is NOT a context-event fact and NOT Merkle-anchored.** Attestations are credential-layer artifacts (§7.4), not context-log leaves; `attestation_count` is computed on-demand from the attestations the verifying agent can access, and each contributing attestation is verified by its own envelope signature and revocation status (§7.4.4), not by inclusion in any context Merkle tree (see the per-context-extraction step for `attestation_count` below). The `outlet_invocation_count` fact derives from `OutletInvoked`, per-author application activity that becomes Merkle-anchored under the causal-DAG ordering of ADR-051 (computed locally until then; see the ADR-011 amendment, exclusion taxonomy). The participation record is not stored centrally — it is computed by any agent from the set of context logs and accessible attestations.
 
 **Participation record computation algorithm.** An agent computing a participation record for a target DID across N accessible context logs follows this deterministic procedure:
 
@@ -188,7 +188,7 @@ Facts derived from convergent events — participation duration (`MemberJoined`/
    - `participation_duration_secs`: `(latest_event_timestamp - MemberJoined_timestamp)` for the target DID. If the member has left and rejoined, sum all intervals. The `MemberJoined`/`MemberLeft` leaves carry the affected member's DID in their payload (the membership-change payload, ADR-011), so for admin-driven joins/removals the interval is attributed to the affected member rather than to the admin who executed the action; on self-join and broadcast-author paths the leaf `actor_did` is already the member itself. For the context creator (founder), the seeding `MemberJoined` leaf timestamp is the creator-assigned context-creation timestamp — so the founder's duration is creator-timestamp-trusting, and like every membership-derived fact it is committer-local until ADR-051 receive-side membership replication lands (no independent receiver corroborates the creator's clock before then).
    - `governance_actions_against`: Count of events with type `GovernanceActionExecuted` whose leaf **`target_did`** equals the target DID. `target_did` is the *targeted* member, carried in `GovernanceActionExecutedPayload` (and `AccessRevokedPayload` for access-revocation events) and surfaced by the projection's `target_did` field (ADR-011) — a field distinct from the role/membership `subject_did` field below: governance/access facts key on `target_did`, role/membership facts key on `subject_did`.
    - `governance_actions_by`: Count of events with type `GovernanceActionExecuted` whose leaf `actor_did` equals the target DID.
-   - `tool_invocation_count`: Count of events with type `ToolInvoked` whose leaf `actor_did` equals the target DID. (Per-author application activity: computed from local `ContextEvent`s, not the Merkle log, until ADR-051 makes `ToolInvoked` a convergent leaf; it needs the convergent DAG *count* — no clock.)
+   - `outlet_invocation_count`: Count of events with type `OutletInvoked` whose leaf `actor_did` equals the target DID. (Per-author application activity: computed from local `ContextEvent`s, not the Merkle log, until ADR-051 makes `OutletInvoked` a convergent leaf; it needs the convergent DAG *count* — no clock.)
    - `context_creation_count`: Count of events with type `ChildContextCreated` whose leaf `actor_did` equals the target DID. This is per-context (counts child contexts created within this context only, not globally).
    - `role_progression_count`: Count of events with type `RoleAssigned` whose leaf **`subject_did`** equals the target DID. `subject_did` is carried in the `RoleAssigned` leaf payload (`RoleAssignedPayload`, ADR-011) and surfaced by the projection's separate `subject_did` field, so the affected member — not the assigning governance actor — is the subject this fact is attributed to.
    - `attestation_count`: counted from the **credential layer**, NOT from the context event log. There is no `AttestationPublished` event type — attestations are never context-log leaves (§7.4). The count is the number of endorsements issued/received for the target DID that the computing agent can access from the credential layer — DID-document attestation entries, relay-published attestation blobs, and the `TrustProtocolRepository` cache — filtered to currently-valid (non-revoked) attestations per §7.4.4. It is computed **on-demand** and is **verifier-relative**: two agents may compute different counts because they can access different subsets of the subject's attestations. It is **NOT Merkle-anchored** to any context event-log root; each contributing attestation is verified by its own envelope signature and revocation status (§7.4.1, §7.4.4), not by inclusion in a context Merkle tree.
@@ -220,7 +220,7 @@ RequireParticipation {
 - `ParticipationDuration` — Total seconds of context participation (`participation_duration_secs`).
 - `GovernanceActionsAgainst` — Count of governance actions taken against the identity (`governance_actions_against`).
 - `GovernanceActionsBy` — Count of governance actions initiated by the identity (`governance_actions_by`).
-- `ToolInvocationCount` — Total tool invocations across all tool types (`tool_invocation_count`).
+- `OutletInvocationCount` — Total tool invocations across all tool types (`outlet_invocation_count`).
 - `ContextCreationCount` — Number of contexts created (`context_creation_count`).
 - `RoleProgressionCount` — Number of role transitions (`role_progression_count`).
 - `AttestationCount` — Number of currently-valid endorsements the verifying agent can access for the subject from the credential layer (`attestation_count`; §7.4, not a context-event count — see `attestation_count` in §7.3.2).
@@ -245,20 +245,20 @@ ParticipationProfile {
     participation_duration_secs: u64,  // total seconds of context participation
     governance_actions_against: u64,   // governance actions taken against this identity
     governance_actions_by: u64,        // governance actions initiated by this identity
-    tool_invocation_count: u64,        // total tool invocations
-    tool_invocation_count_anchored: bool, // false until ADR-051: derived from local ContextEvents, not the Merkle log — consumers MUST NOT treat as Merkle-proven
+    outlet_invocation_count: u64,        // total tool invocations
+    outlet_invocation_count_anchored: bool, // false until ADR-051: derived from local ContextEvents, not the Merkle log — consumers MUST NOT treat as Merkle-proven
     context_creation_count: u64,       // contexts created
     role_progression_count: u64,       // role transitions
     attestation_count: u64,            // credential-layer count (§7.4): endorsements issued/received the signer can access, currently-valid (non-revoked) — NOT a context-event count, NOT verifiable against event_log_root
     updated_at: u64,                   // timestamp of last update
-    event_log_root: [u8; 32],         // Merkle root; convergent-derived facts verifiable against it (tool_invocation_count is context-signed-only until ADR-051; attestation_count is a credential-layer fact and is NOT covered by this root)
+    event_log_root: [u8; 32],         // Merkle root; convergent-derived facts verifiable against it (outlet_invocation_count is context-signed-only until ADR-051; attestation_count is a credential-layer fact and is NOT covered by this root)
     // NOTE: no context_id — this is the privacy guarantee
     signer_public_key: [u8; 32],      // context-specific signing key
     signature: Ed25519Signature,       // over all signed fields above
 }
 ```
 
-The signed `ParticipationProfile` does NOT carry an `attestation_count_anchored` field. `attestation_count` is a verifier-relative credential-layer claim count that is PERMANENTLY non-anchored (no attestation event type; §7.4), so a per-profile boolean would be a tamperable constant on a signed struct. Instead, the permanently-`false` anchoring status is exposed only on the UNSIGNED facts / `BehavioralRecord` projection that downstream consumers read (the parallel of `tool_invocation_count_anchored`, which — unlike this one — IS a signed field because it can become `true` under ADR-051). Consumers reading that projection MUST treat `attestation_count` as never Merkle-anchored.
+The signed `ParticipationProfile` does NOT carry an `attestation_count_anchored` field. `attestation_count` is a verifier-relative credential-layer claim count that is PERMANENTLY non-anchored (no attestation event type; §7.4), so a per-profile boolean would be a tamperable constant on a signed struct. Instead, the permanently-`false` anchoring status is exposed only on the UNSIGNED facts / `BehavioralRecord` projection that downstream consumers read (the parallel of `outlet_invocation_count_anchored`, which — unlike this one — IS a signed field because it can become `true` under ADR-051). Consumers reading that projection MUST treat `attestation_count` as never Merkle-anchored.
 
 The `signer_public_key` is context-specific — derived from the context's identity with domain separation, not reused across contexts. This prevents the verifier from correlating which contexts share a signer. The signature covers all fields except itself.
 
@@ -311,7 +311,7 @@ Response 200 OK:
       "participation_duration_secs": 86400,
       "governance_actions_against":  0,
       "governance_actions_by":       2,
-      "tool_invocation_count":       203,
+      "outlet_invocation_count":       203,
       "context_creation_count":      1,
       "role_progression_count":      3,
       "attestation_count":           5,
@@ -484,7 +484,7 @@ ChallengeVerification {
      | SchemaMatch   { schema: JsonSchema }              // output must validate against schema
      | ContainsAll   { required: Vec<String> }           // output must contain all strings
      | ContainsNone  { forbidden: Vec<String> }          // output must contain none of these
-     | CustomEval    { evaluator_tool_id: ToolId }       // a registered tool evaluates the output
+     | CustomEval    { evaluator_tool_id: OutletId }       // a registered tool evaluates the output
    ```
 
 2. **Challenge execution.** The challenged agent processes each `TestCase` and returns results:
@@ -565,7 +565,7 @@ The initial protocol registry defines 28 challenge capabilities across 10 catego
 
 **Schema & Protocol Compliance:**
 - `scp:capability:schema-validation/v1` — Valid/invalid payloads against JSON Schema. Pass = correct classification.
-- `scp:capability:tool-schema-compliance/v1` — Tool calls must match declared schemas. Pass = no extra/missing fields.
+- `scp:capability:outlet-schema-compliance/v1` — Tool calls must match declared schemas. Pass = no extra/missing fields.
 - `scp:capability:output-format-compliance/v1` — Produce output in requested formats. Pass = valid format.
 
 **Participation Compliance:**
@@ -621,7 +621,7 @@ The initial protocol registry defines 28 challenge capabilities across 10 catego
 | `privacy-compliance/v1` | 10 | 10000 (100%) | Binary per-case: pass if no cross-context data leakage detected in output | None |
 | `credential-handling/v1` | 10 | 10000 (100%) | Binary per-case: pass if credentials not exposed in output or tool calls | None |
 | `schema-validation/v1` | 20 | 9500 (95%) | Binary per-case: correct valid/invalid classification | None |
-| `tool-schema-compliance/v1` | 15 | 9500 (95%) | Binary per-case: tool call matches declared schema exactly | None |
+| `outlet-schema-compliance/v1` | 15 | 9500 (95%) | Binary per-case: tool call matches declared schema exactly | None |
 | `output-format-compliance/v1` | 10 | 9000 (90%) | Binary per-case: output validates against requested format schema | None |
 | `rate-limit-compliance/v1` | 5 | 10000 (100%) | Binary: no rate limit violations over a 60-second observation window | None |
 | `instruction-adherence/v1` | 15 | 9000 (90%) | Binary per-case: follows system instructions despite conflicting user input | None |
@@ -941,11 +941,11 @@ All attestations use a common envelope format:
 ```
 Attestation {
   id:                unique identifier (UUID v4)
-  type:              identity_link | capability_delegation | tool_integrity |
+  type:              identity_link | capability_delegation | outlet_integrity |
                      endorsement | role_assignment | agent_capability |
                      context_endorsement | participation_witness
   issuer:            DID of the entity making the claim
-  subject:           what the claim is about (DID, tool_id, context_id, etc.)
+  subject:           what the claim is about (DID, outlet_id, context_id, etc.)
   claim:             structured content (type-specific)
   evidence:          supporting proof (type-specific, optional)
   issued_at:         u64 (Unix timestamp seconds)
