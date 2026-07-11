@@ -188,7 +188,7 @@ class CoroutineBridgeTest {
         @Test
         fun `discriminated-union variant names are pinned`() {
             assertEquals(
-                listOf("MessageVelocity", "ToolRateExceeded", "WarningCount", "Custom"),
+                listOf("MessageVelocity", "OutletRateExceeded", "WarningCount", "Custom"),
                 works.limn.scp.CONSEQUENCE_TRIGGER_VARIANT_NAMES,
             )
             assertEquals(

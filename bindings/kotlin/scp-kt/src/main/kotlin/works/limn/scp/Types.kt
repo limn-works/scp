@@ -33,7 +33,7 @@ import uniffi.scp.OutletKind
  * Parameterised capabilities are plain strings built by [outletQuery] and
  * [outletCall].
  *
- * The pre-rename tool-prefixed stems (invoke / register / interface) are
+ * The pre-rename outlet-prefixed stems (invoke / register / interface) are
  * deleted with no transitional alias; the protocol hard-rejects them at
  * construction time (ADR-049 §1).
  */

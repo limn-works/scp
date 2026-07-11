@@ -194,7 +194,7 @@ public let enforcementSeverityVariantNames: [String] = [
 /// The variant names are pinned in ``CONSEQUENCE_TRIGGER_VARIANT_NAMES``.
 public nonisolated enum ConsequenceTrigger: Sendable, Codable, Equatable {
     case messageVelocity
-    case toolRateExceeded
+    case outletRateExceeded
     case warningCount
     case custom(key: String)
 
@@ -203,8 +203,8 @@ public nonisolated enum ConsequenceTrigger: Sendable, Codable, Equatable {
         switch self {
         case .messageVelocity:
             try container.encode("MessageVelocity")
-        case .toolRateExceeded:
-            try container.encode("ToolRateExceeded")
+        case .outletRateExceeded:
+            try container.encode("OutletRateExceeded")
         case .warningCount:
             try container.encode("WarningCount")
         case let .custom(key):
@@ -219,8 +219,8 @@ public nonisolated enum ConsequenceTrigger: Sendable, Codable, Equatable {
             case "MessageVelocity":
                 self = .messageVelocity
                 return
-            case "ToolRateExceeded":
-                self = .toolRateExceeded
+            case "OutletRateExceeded":
+                self = .outletRateExceeded
                 return
             case "WarningCount":
                 self = .warningCount
@@ -247,7 +247,7 @@ public nonisolated enum ConsequenceTrigger: Sendable, Codable, Equatable {
 /// Frozen list of ``ConsequenceTrigger`` variant short names.
 public let consequenceTriggerVariantNames: [String] = [
     "MessageVelocity",
-    "ToolRateExceeded",
+    "OutletRateExceeded",
     "WarningCount",
     "Custom"
 ]

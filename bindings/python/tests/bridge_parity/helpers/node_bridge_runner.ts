@@ -558,7 +558,7 @@ async function opOutletRegister(
 ): Promise<Record<string, unknown>> {
   requireNapi(req.bridgeMode);
   const ceiling = (req.args.ceiling as string[]) ?? PARITY_OUTLET_CEILING;
-  const params = { name: "parity-tools", mode: "encrypted", ceiling };
+  const params = { name: "parity-outlets", mode: "encrypted", ceiling };
   const scp = await newNapiScp();
   const identity = await scp.identityCreate("in_memory");
   const handle = await scp.contextCreate(identity, JSON.stringify(params));

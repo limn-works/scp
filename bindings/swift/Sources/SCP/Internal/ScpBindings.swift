@@ -10470,12 +10470,12 @@ public struct ParticipationRecordView {
     /**
      * Total outlet invocations across all outlet types.
      */
-    public var toolInvocationCount: UInt64
+    public var outletInvocationCount: UInt64
     /**
-     * Whether `tool_invocation_count` is anchored in the canonical Merkle log
+     * Whether `outlet_invocation_count` is anchored in the canonical Merkle log
      * (`false` until ADR-051; consumers MUST NOT treat it as Merkle-proven).
      */
-    public var toolInvocationCountAnchored: Bool
+    public var outletInvocationCountAnchored: Bool
     /**
      * Number of contexts created by the subject (`ChildContextCreated`).
      */
@@ -10493,7 +10493,7 @@ public struct ParticipationRecordView {
      * Whether `attestation_count` is anchored in / verifiable against a context
      * Merkle root. Always `false` — credential-layer, verifier-relative (§7.4),
      * never a context-event-log count (§7.3.2). Parallel of
-     * `tool_invocation_count_anchored`.
+     * `outlet_invocation_count_anchored`.
      */
     public var attestationCountAnchored: Bool
     /**
@@ -10523,11 +10523,11 @@ public struct ParticipationRecordView {
          */governanceActionsBy: UInt64, 
         /**
          * Total outlet invocations across all outlet types.
-         */toolInvocationCount: UInt64, 
+         */outletInvocationCount: UInt64, 
         /**
-         * Whether `tool_invocation_count` is anchored in the canonical Merkle log
+         * Whether `outlet_invocation_count` is anchored in the canonical Merkle log
          * (`false` until ADR-051; consumers MUST NOT treat it as Merkle-proven).
-         */toolInvocationCountAnchored: Bool, 
+         */outletInvocationCountAnchored: Bool, 
         /**
          * Number of contexts created by the subject (`ChildContextCreated`).
          */contextCreationCount: UInt64, 
@@ -10542,7 +10542,7 @@ public struct ParticipationRecordView {
          * Whether `attestation_count` is anchored in / verifiable against a context
          * Merkle root. Always `false` — credential-layer, verifier-relative (§7.4),
          * never a context-event-log count (§7.3.2). Parallel of
-         * `tool_invocation_count_anchored`.
+         * `outlet_invocation_count_anchored`.
          */attestationCountAnchored: Bool, 
         /**
          * Unix timestamp (seconds) when the record was computed.
@@ -10554,8 +10554,8 @@ public struct ParticipationRecordView {
         self.participationDurationSecs = participationDurationSecs
         self.governanceActionsAgainst = governanceActionsAgainst
         self.governanceActionsBy = governanceActionsBy
-        self.toolInvocationCount = toolInvocationCount
-        self.toolInvocationCountAnchored = toolInvocationCountAnchored
+        self.outletInvocationCount = outletInvocationCount
+        self.outletInvocationCountAnchored = outletInvocationCountAnchored
         self.contextCreationCount = contextCreationCount
         self.roleProgressionCount = roleProgressionCount
         self.attestationCount = attestationCount
@@ -10584,10 +10584,10 @@ extension ParticipationRecordView: Equatable, Hashable {
         if lhs.governanceActionsBy != rhs.governanceActionsBy {
             return false
         }
-        if lhs.toolInvocationCount != rhs.toolInvocationCount {
+        if lhs.outletInvocationCount != rhs.outletInvocationCount {
             return false
         }
-        if lhs.toolInvocationCountAnchored != rhs.toolInvocationCountAnchored {
+        if lhs.outletInvocationCountAnchored != rhs.outletInvocationCountAnchored {
             return false
         }
         if lhs.contextCreationCount != rhs.contextCreationCount {
@@ -10616,8 +10616,8 @@ extension ParticipationRecordView: Equatable, Hashable {
         hasher.combine(participationDurationSecs)
         hasher.combine(governanceActionsAgainst)
         hasher.combine(governanceActionsBy)
-        hasher.combine(toolInvocationCount)
-        hasher.combine(toolInvocationCountAnchored)
+        hasher.combine(outletInvocationCount)
+        hasher.combine(outletInvocationCountAnchored)
         hasher.combine(contextCreationCount)
         hasher.combine(roleProgressionCount)
         hasher.combine(attestationCount)
@@ -10640,8 +10640,8 @@ public struct FfiConverterTypeParticipationRecordView: FfiConverterRustBuffer {
                 participationDurationSecs: FfiConverterUInt64.read(from: &buf), 
                 governanceActionsAgainst: FfiConverterUInt64.read(from: &buf), 
                 governanceActionsBy: FfiConverterUInt64.read(from: &buf), 
-                toolInvocationCount: FfiConverterUInt64.read(from: &buf), 
-                toolInvocationCountAnchored: FfiConverterBool.read(from: &buf), 
+                outletInvocationCount: FfiConverterUInt64.read(from: &buf), 
+                outletInvocationCountAnchored: FfiConverterBool.read(from: &buf), 
                 contextCreationCount: FfiConverterUInt64.read(from: &buf), 
                 roleProgressionCount: FfiConverterUInt64.read(from: &buf), 
                 attestationCount: FfiConverterUInt64.read(from: &buf), 
@@ -10656,8 +10656,8 @@ public struct FfiConverterTypeParticipationRecordView: FfiConverterRustBuffer {
         FfiConverterUInt64.write(value.participationDurationSecs, into: &buf)
         FfiConverterUInt64.write(value.governanceActionsAgainst, into: &buf)
         FfiConverterUInt64.write(value.governanceActionsBy, into: &buf)
-        FfiConverterUInt64.write(value.toolInvocationCount, into: &buf)
-        FfiConverterBool.write(value.toolInvocationCountAnchored, into: &buf)
+        FfiConverterUInt64.write(value.outletInvocationCount, into: &buf)
+        FfiConverterBool.write(value.outletInvocationCountAnchored, into: &buf)
         FfiConverterUInt64.write(value.contextCreationCount, into: &buf)
         FfiConverterUInt64.write(value.roleProgressionCount, into: &buf)
         FfiConverterUInt64.write(value.attestationCount, into: &buf)

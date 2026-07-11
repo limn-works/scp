@@ -48,8 +48,8 @@ enum class AttestationType(val wireName: String) {
     /** Delegates a capability to another DID. */
     CAPABILITY_DELEGATION("CapabilityDelegation"),
 
-    /** Attests to the integrity of a tool. */
-    TOOL_INTEGRITY("ToolIntegrity"),
+    /** Attests to the integrity of a outlet. */
+    OUTLET_INTEGRITY("OutletIntegrity"),
 
     /** Attests to an agent's capability. */
     AGENT_CAPABILITY("AgentCapability"),

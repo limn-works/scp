@@ -616,7 +616,7 @@ def template_get_params(template_id: str) -> dict[str, Any]:
     Args:
         template_id: One of ``BilateralEphemeral``, ``BilateralPersistent``,
             ``Coordination``, ``GroupDiscussion``, ``PublicBroadcast``,
-            ``GatedBroadcast``, ``scp:template/tool-interface``,
+            ``GatedBroadcast``, ``scp:template/outlet-interface``,
             ``PaidService``, ``PaidBroadcast``, ``HandleRegistry``.
 
     Returns:

@@ -20,7 +20,7 @@
  * Parameterised capabilities are plain strings built by {@link outletQuery} and
  * {@link outletCall}.
  *
- * The pre-rename tool-prefixed stems (invoke / register / interface) are deleted
+ * The pre-rename outlet-prefixed stems (invoke / register / interface) are deleted
  * with no transitional alias; the protocol hard-rejects them at construction
  * time (ADR-049 §1).
  */
@@ -213,7 +213,7 @@ export type ConsequenceCapability = UnitCapability | OutletCallCapability | Cust
  */
 export type ConsequenceTrigger =
   | { readonly kind: "MessageVelocity" }
-  | { readonly kind: "ToolRateExceeded" }
+  | { readonly kind: "OutletRateExceeded" }
   | { readonly kind: "WarningCount" }
   | { readonly kind: "Custom"; readonly key: string };
 
@@ -223,7 +223,7 @@ export type ConsequenceTrigger =
  */
 export const CONSEQUENCE_TRIGGER_VARIANTS = [
   "MessageVelocity",
-  "ToolRateExceeded",
+  "OutletRateExceeded",
   "WarningCount",
   "Custom",
 ] as const satisfies readonly ConsequenceTrigger["kind"][];
@@ -371,7 +371,7 @@ function encodeConsequenceRule(rule: ConsequenceRule): Record<string, unknown> {
 function encodeConsequenceTrigger(trigger: ConsequenceTrigger): unknown {
   switch (trigger.kind) {
     case "MessageVelocity":
-    case "ToolRateExceeded":
+    case "OutletRateExceeded":
     case "WarningCount":
       return trigger.kind;
     case "Custom":
@@ -517,8 +517,8 @@ export type GovernanceActionResult =
   | "MemberAdded"
   | "MemberRemoved"
   | "RoleChanged"
-  | "ToolRegistered"
-  | "ToolRemoved"
+  | "OutletRegistered"
+  | "OutletRemoved"
   | "CeilingModified"
   | "ContextClosed"
   | "TtlExtended"
@@ -528,7 +528,7 @@ export type GovernanceActionResult =
   | "SignerRemoved"
   | "ThresholdModified"
   | "ChildContextCreated"
-  | "ToolInterfaceEstablished"
+  | "OutletInterfaceEstablished"
   | "MemberReset"
   | "ConflictResolved"
   | "ContextPromoted"
@@ -1059,14 +1059,14 @@ export interface BehavioralRecord {
   /** Count of governance actions initiated by this identity. */
   readonly governanceActionsBy: number;
   /** Total outlet invocations across all outlet types. */
-  readonly toolInvocationCount: number;
+  readonly outletInvocationCount: number;
   /**
-   * Whether {@link toolInvocationCount} is anchored in the canonical Merkle
-   * log. `false` until ADR-051 makes `ToolInvoked` a convergent leaf
+   * Whether {@link outletInvocationCount} is anchored in the canonical Merkle
+   * log. `false` until ADR-051 makes `OutletInvoked` a convergent leaf
    * (§7.3.2; ADR-011 amendment exclusion taxonomy §2). Consumers MUST NOT
    * treat the count as Merkle-proven while this is `false`.
    */
-  readonly toolInvocationCountAnchored: boolean;
+  readonly outletInvocationCountAnchored: boolean;
   /** Number of contexts created by the subject (`ChildContextCreated`). */
   readonly contextCreationCount: number;
   /** Number of role transitions for the subject (`RoleAssigned`). */
@@ -1082,7 +1082,7 @@ export interface BehavioralRecord {
    * Whether {@link attestationCount} is anchored in / verifiable against a
    * context Merkle root. Always `false`: it is a credential-layer,
    * verifier-relative fact (§7.4), never a context-event-log count (§7.3.2).
-   * The parallel of {@link toolInvocationCountAnchored}; consumers MUST NOT
+   * The parallel of {@link outletInvocationCountAnchored}; consumers MUST NOT
    * treat the count as Merkle-proven while this is `false`.
    */
   readonly attestationCountAnchored: boolean;
@@ -1265,7 +1265,7 @@ export type ParticipationFact =
   | "ParticipationDuration"
   | "GovernanceActionsAgainst"
   | "GovernanceActionsBy"
-  | "ToolInvocationCount"
+  | "OutletInvocationCount"
   | "ContextCreationCount"
   | "RoleProgressionCount"
   | "AttestationCount";
@@ -1306,16 +1306,16 @@ export interface ParticipationProfile {
   /** Count of governance actions initiated by this identity. */
   readonly governanceActionsBy: number;
   /** Total outlet invocations across all outlet types. */
-  readonly toolInvocationCount: number;
+  readonly outletInvocationCount: number;
   /**
-   * Whether `toolInvocationCount` is anchored in the canonical Merkle log.
+   * Whether `outletInvocationCount` is anchored in the canonical Merkle log.
    *
-   * `false` until ADR-051 makes `ToolInvoked` a convergent leaf: the count is
+   * `false` until ADR-051 makes `OutletInvoked` a convergent leaf: the count is
    * computed from per-author local events, not the Merkle log (§7.3.2; ADR-011
    * amendment exclusion taxonomy §2). Consumers MUST NOT treat the count as
    * Merkle-proven while this is `false`.
    */
-  readonly toolInvocationCountAnchored: boolean;
+  readonly outletInvocationCountAnchored: boolean;
   /** Number of contexts created. */
   readonly contextCreationCount: number;
   /** Number of role transitions. */
@@ -1414,8 +1414,8 @@ export function encodeParticipationProfile(profiles: readonly ParticipationProfi
       participation_duration_secs: p.participationDurationSecs,
       governance_actions_against: p.governanceActionsAgainst,
       governance_actions_by: p.governanceActionsBy,
-      tool_invocation_count: p.toolInvocationCount,
-      tool_invocation_count_anchored: p.toolInvocationCountAnchored,
+      outlet_invocation_count: p.outletInvocationCount,
+      outlet_invocation_count_anchored: p.outletInvocationCountAnchored,
       context_creation_count: p.contextCreationCount,
       role_progression_count: p.roleProgressionCount,
       attestation_count: p.attestationCount,
@@ -1606,7 +1606,7 @@ export function encodeChallengeVerifications(
 export type AttestationType =
   | "IdentityLink"
   | "CapabilityDelegation"
-  | "ToolIntegrity"
+  | "OutletIntegrity"
   | "AgentCapability"
   | "Endorsement"
   | "RoleAssignment"
@@ -1620,7 +1620,7 @@ export type AttestationType =
 export const ATTESTATION_TYPE_VARIANTS = [
   "IdentityLink",
   "CapabilityDelegation",
-  "ToolIntegrity",
+  "OutletIntegrity",
   "AgentCapability",
   "Endorsement",
   "RoleAssignment",

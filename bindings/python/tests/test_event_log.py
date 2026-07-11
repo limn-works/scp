@@ -341,7 +341,7 @@ class TestScpEventLogQuery:
         scp = _make_scp(native)
 
         filter_dict = {
-            "event_type": "ToolInvoked",
+            "event_type": "OutletInvoked",
             "actor_did": "did:dht:z6MkBob",
             "after_timestamp": 1_700_000_000.0,
         }

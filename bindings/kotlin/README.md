@@ -2,7 +2,7 @@
 
 > `works.limn:scp-kt` -- Shared Context Protocol for Kotlin
 
-Cryptographic identity, encrypted contexts, capability-based auth, and tool invocation for AI agents. Built on Rust via UniFFI with Kotlin coroutines.
+Cryptographic identity, encrypted contexts, capability-based auth, and outlet invocation for AI agents. Built on Rust via UniFFI with Kotlin coroutines.
 
 ## Install
 
@@ -68,8 +68,8 @@ See [`examples/`](./examples/) for runnable code:
 | File | Description |
 |------|-------------|
 | `BasicMessaging.kt` | Create identity, context, send/receive messages |
-| `ToolInvocation.kt` | Register and invoke a tool with test vectors |
-| `McpIntegration.kt` | Expose SCP tools via MCP JSON-RPC server |
+| `OutletInvocation.kt` | Register and invoke a outlet with test vectors |
+| `McpIntegration.kt` | Expose SCP outlets via MCP JSON-RPC server |
 | `MultiAgent.kt` | Coordinate multiple agents in a shared context |
 
 ## Error Handling

@@ -38,30 +38,30 @@ scp-mcp = "scp_sdk.mcp:cli_main"
 Repository = "https://github.com/limn-scp/scp-protocol-core"
 Documentation = "https://scp.dev/docs"
 
-[tool.pytest.ini_options]
+[outlet.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
 markers = [
   "parity: cross-bridge runtime parity test (ADR-046)",
 ]
 
-[tool.ruff]
+[outlet.ruff]
 target-version = "py312"
 line-length = 100
 
-[tool.ruff.lint]
+[outlet.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "RUF"]
 # UP040/UP047: PEP 695 `type` statement and type params require Python 3.12+; we support 3.10+.
 # The `X: TypeAlias = ...` annotation is the only type-alias form legal on 3.10/3.11.
 ignore = ["UP040", "UP047"]
 
-[tool.mypy]
+[outlet.mypy]
 python_version = "3.12"
 strict = true
 warn_return_any = true
 warn_unused_configs = true
 
-[tool.maturin]
+[outlet.maturin]
 features = ["extension-module"]
 manifest-path = "../../crates/scp-ffi/Cargo.toml"
 module-name = "scp_sdk._scp_core"

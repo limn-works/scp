@@ -7,7 +7,7 @@ an SCP context.  Trust evaluation is a four-layer model:
 1. **Protocol Enforcement** -- mechanical pass/fail (UCAN validity,
    signatures, capability ceiling, nonce, revocation, and expiry).
 2. **Behavioral Validation** -- verified facts from the event log
-   (participation history, governance actions, tool usage).
+   (participation history, governance actions, outlet usage).
 3. **Attestation Authenticity** -- verified signatures and evidence
    freshness from attestations.
 
@@ -186,13 +186,13 @@ class BehavioralRecord:
     ``BehavioralRecord`` interface and the Rust ``ParticipationFacts`` 1:1.
 
     The six leaf-derived facts (participation duration, governance actions
-    against/by, context creation, role progression, tool invocation count)
+    against/by, context creation, role progression, outlet invocation count)
     come from the context's convergent Merkle event log.
     ``attestation_count`` is the one exception: it is a credential-layer fact
     (§7.4), NOT event-log-derived and NOT covered by ``event_log_root``, and
     is **verifier-relative** (two agents may compute different counts from
-    different accessible attestation sets). ``tool_invocation_count_anchored``
-    stays ``False`` until ADR-051 makes ``ToolInvoked`` a convergent leaf.
+    different accessible attestation sets). ``outlet_invocation_count_anchored``
+    stays ``False`` until ADR-051 makes ``OutletInvoked`` a convergent leaf.
     """
 
     #: The DID whose participation is summarized.
@@ -208,14 +208,14 @@ class BehavioralRecord:
     #: Count of governance actions initiated by this identity.
     governance_actions_by: int = 0
 
-    #: Total tool invocations across all tool types.
-    tool_invocation_count: int = 0
+    #: Total outlet invocations across all outlet types.
+    outlet_invocation_count: int = 0
 
-    #: Whether ``tool_invocation_count`` is anchored in the canonical Merkle
-    #: log. ``False`` until ADR-051 makes ``ToolInvoked`` a convergent leaf —
+    #: Whether ``outlet_invocation_count`` is anchored in the canonical Merkle
+    #: log. ``False`` until ADR-051 makes ``OutletInvoked`` a convergent leaf —
     #: consumers MUST NOT treat the count as Merkle-proven while this is
     #: ``False``.
-    tool_invocation_count_anchored: bool = False
+    outlet_invocation_count_anchored: bool = False
 
     #: Number of contexts created by the subject (``ChildContextCreated``).
     context_creation_count: int = 0
@@ -230,7 +230,7 @@ class BehavioralRecord:
     #: Whether ``attestation_count`` is anchored in / verifiable against a
     #: context Merkle root. Always ``False``: it is a credential-layer,
     #: verifier-relative fact (§7.4), never a context-event-log count (§7.3.2).
-    #: The parallel of ``tool_invocation_count_anchored`` — consumers MUST NOT
+    #: The parallel of ``outlet_invocation_count_anchored`` — consumers MUST NOT
     #: treat the count as Merkle-proven while this is ``False``.
     attestation_count_anchored: bool = False
 
@@ -320,7 +320,7 @@ PARTICIPATION_FACT_VARIANTS: frozenset[str] = frozenset(
         "ParticipationDuration",
         "GovernanceActionsAgainst",
         "GovernanceActionsBy",
-        "ToolInvocationCount",
+        "OutletInvocationCount",
         "ContextCreationCount",
         "RoleProgressionCount",
         "AttestationCount",
@@ -352,7 +352,7 @@ class ParticipationFact:
     - ``"ParticipationDuration"`` -- total seconds of context participation.
     - ``"GovernanceActionsAgainst"`` -- actions taken against the identity.
     - ``"GovernanceActionsBy"`` -- actions initiated by the identity.
-    - ``"ToolInvocationCount"`` -- total tool invocations.
+    - ``"OutletInvocationCount"`` -- total outlet invocations.
     - ``"ContextCreationCount"`` -- number of contexts created.
     - ``"RoleProgressionCount"`` -- number of role transitions.
     - ``"AttestationCount"`` -- number of attestation events.
@@ -437,15 +437,15 @@ class ParticipationProfile:
     #: Count of governance actions initiated by this identity.
     governance_actions_by: int = 0
 
-    #: Total tool invocations across all tool types.
-    tool_invocation_count: int = 0
+    #: Total outlet invocations across all outlet types.
+    outlet_invocation_count: int = 0
 
-    #: Whether ``tool_invocation_count`` is anchored in the canonical Merkle
-    #: log. ``False`` until ADR-051 makes ``ToolInvoked`` a convergent leaf:
+    #: Whether ``outlet_invocation_count`` is anchored in the canonical Merkle
+    #: log. ``False`` until ADR-051 makes ``OutletInvoked`` a convergent leaf:
     #: the count is computed from per-author local events, not the Merkle log
     #: (§7.3.2; ADR-011 amendment exclusion taxonomy §2). Consumers MUST NOT
     #: treat the count as Merkle-proven while this is ``False``.
-    tool_invocation_count_anchored: bool = False
+    outlet_invocation_count_anchored: bool = False
 
     #: Number of contexts created.
     context_creation_count: int = 0
@@ -477,7 +477,7 @@ class ParticipationProfile:
             "participation_duration_secs",
             "governance_actions_against",
             "governance_actions_by",
-            "tool_invocation_count",
+            "outlet_invocation_count",
             "context_creation_count",
             "role_progression_count",
             "attestation_count",
@@ -525,8 +525,8 @@ class ParticipationProfile:
             "participation_duration_secs": self.participation_duration_secs,
             "governance_actions_against": self.governance_actions_against,
             "governance_actions_by": self.governance_actions_by,
-            "tool_invocation_count": self.tool_invocation_count,
-            "tool_invocation_count_anchored": self.tool_invocation_count_anchored,
+            "outlet_invocation_count": self.outlet_invocation_count,
+            "outlet_invocation_count_anchored": self.outlet_invocation_count_anchored,
             "context_creation_count": self.context_creation_count,
             "role_progression_count": self.role_progression_count,
             "attestation_count": self.attestation_count,
@@ -1123,7 +1123,7 @@ ATTESTATION_TYPES: frozenset[str] = frozenset(
     {
         "IdentityLink",
         "CapabilityDelegation",
-        "ToolIntegrity",
+        "OutletIntegrity",
         "AgentCapability",
         "Endorsement",
         "RoleAssignment",
@@ -1321,8 +1321,8 @@ def _participation_record_from(
         participation_duration_secs=record.participation_duration_secs,
         governance_actions_against=record.governance_actions_against,
         governance_actions_by=record.governance_actions_by,
-        tool_invocation_count=record.tool_invocation_count,
-        tool_invocation_count_anchored=record.tool_invocation_count_anchored,
+        outlet_invocation_count=record.outlet_invocation_count,
+        outlet_invocation_count_anchored=record.outlet_invocation_count_anchored,
         context_creation_count=record.context_creation_count,
         role_progression_count=record.role_progression_count,
         attestation_count=record.attestation_count,

@@ -102,7 +102,7 @@ public nonisolated struct Capability: Sendable {
     /// capability arrays. Parameterised capabilities are built by
     /// ``outletQuery(_:)`` and ``outletCall(_:)``.
     ///
-    /// The pre-rename tool-prefixed stems (invoke / register / interface) are
+    /// The pre-rename outlet-prefixed stems (invoke / register / interface) are
     /// deleted with no transitional alias; the protocol hard-rejects them at
     /// construction time (ADR-049 §1).
     public enum Name {

@@ -369,7 +369,7 @@ export interface OperationalMetadata {
   name: string | null;
   description: string | null;
   economic_policy: string | null;
-  tool_count: number | null;
+  outlet_count: number | null;
   child_contexts: string[] | null;
 }
 

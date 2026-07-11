@@ -40,8 +40,8 @@ sealed class ConsequenceTrigger {
     /** Rate of [scp_event_log::EventType::MessageSent] events for the subject. */
     data object MessageVelocity : ConsequenceTrigger()
 
-    /** Rate of [scp_event_log::EventType::ToolInvoked] events for the subject. */
-    data object ToolRateExceeded : ConsequenceTrigger()
+    /** Rate of [scp_event_log::EventType::OutletInvoked] events for the subject. */
+    data object OutletRateExceeded : ConsequenceTrigger()
 
     /** Count of governance actions targeting the subject. */
     data object WarningCount : ConsequenceTrigger()
@@ -68,7 +68,7 @@ sealed class ConsequenceTrigger {
  */
 val CONSEQUENCE_TRIGGER_VARIANT_NAMES: List<String> = listOf(
     "MessageVelocity",
-    "ToolRateExceeded",
+    "OutletRateExceeded",
     "WarningCount",
     "Custom",
 )
@@ -330,7 +330,7 @@ private fun encodeConsequenceRuleElement(rule: ConsequenceRule): JsonObject =
 
 private fun encodeTriggerElement(trigger: ConsequenceTrigger): JsonElement = when (trigger) {
     ConsequenceTrigger.MessageVelocity -> JsonPrimitive("MessageVelocity")
-    ConsequenceTrigger.ToolRateExceeded -> JsonPrimitive("ToolRateExceeded")
+    ConsequenceTrigger.OutletRateExceeded -> JsonPrimitive("OutletRateExceeded")
     ConsequenceTrigger.WarningCount -> JsonPrimitive("WarningCount")
     is ConsequenceTrigger.Custom -> buildJsonObject { put("Custom", trigger.key) }
 }

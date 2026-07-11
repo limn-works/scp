@@ -47,7 +47,7 @@ final class TrustAdmissionEncoderTests: XCTestCase {
                 verificationLevel: .challengeVerified
             ),
             CapabilityRequirement(
-                capability: "scp:capability:tool-invoke/v1",
+                capability: "scp:capability:outlet-invoke/v1",
                 verificationLevel: .selfAttested
             )
         ]
@@ -57,7 +57,7 @@ final class TrustAdmissionEncoderTests: XCTestCase {
             """
             [
               {"capability":"scp:capability:messages-write/v1","verification_level":"ChallengeVerified"},
-              {"capability":"scp:capability:tool-invoke/v1","verification_level":"SelfAttested"}
+              {"capability":"scp:capability:outlet-invoke/v1","verification_level":"SelfAttested"}
             ]
             """
         )
@@ -104,7 +104,7 @@ final class TrustAdmissionEncoderTests: XCTestCase {
         ]
         for (threshold, expected) in cases {
             let req = RequireParticipation(
-                fact: .toolInvocationCount,
+                fact: .outletInvocationCount,
                 threshold: threshold,
                 maxAgeSecs: 0,
                 minContexts: 0
@@ -124,8 +124,8 @@ final class TrustAdmissionEncoderTests: XCTestCase {
             participationDurationSecs: 7200,
             governanceActionsAgainst: 0,
             governanceActionsBy: 3,
-            toolInvocationCount: 9,
-            toolInvocationCountAnchored: false,
+            outletInvocationCount: 9,
+            outletInvocationCountAnchored: false,
             contextCreationCount: 1,
             roleProgressionCount: 2,
             attestationCount: 4,
@@ -144,8 +144,8 @@ final class TrustAdmissionEncoderTests: XCTestCase {
         XCTAssertEqual(first["participation_duration_secs"] as? Int, 7200)
         XCTAssertEqual(first["governance_actions_against"] as? Int, 0)
         XCTAssertEqual(first["governance_actions_by"] as? Int, 3)
-        XCTAssertEqual(first["tool_invocation_count"] as? Int, 9)
-        XCTAssertEqual(first["tool_invocation_count_anchored"] as? Bool, false)
+        XCTAssertEqual(first["outlet_invocation_count"] as? Int, 9)
+        XCTAssertEqual(first["outlet_invocation_count_anchored"] as? Bool, false)
         XCTAssertEqual(first["context_creation_count"] as? Int, 1)
         XCTAssertEqual(first["role_progression_count"] as? Int, 2)
         XCTAssertEqual(first["attestation_count"] as? Int, 4)
@@ -248,8 +248,8 @@ final class TrustAdmissionEncoderTests: XCTestCase {
             participationDurationSecs: 0,
             governanceActionsAgainst: 0,
             governanceActionsBy: 0,
-            toolInvocationCount: 0,
-            toolInvocationCountAnchored: false,
+            outletInvocationCount: 0,
+            outletInvocationCountAnchored: false,
             contextCreationCount: 0,
             roleProgressionCount: 0,
             attestationCount: 0,
@@ -304,11 +304,11 @@ final class TrustAdmissionEncoderTests: XCTestCase {
     func testAgentCapabilitiesEncodeAsStringArray() throws {
         let json = try encodeAgentCapabilitiesJson([
             "scp:capability:messages-write/v1",
-            "scp:capability:tool-invoke/v1"
+            "scp:capability:outlet-invoke/v1"
         ])
         assertJSONEqual(
             json,
-            #"["scp:capability:messages-write/v1","scp:capability:tool-invoke/v1"]"#
+            #"["scp:capability:messages-write/v1","scp:capability:outlet-invoke/v1"]"#
         )
     }
 
@@ -329,7 +329,7 @@ final class TrustAdmissionEncoderTests: XCTestCase {
     func testVerificationMethodRoundTripsThroughDecode() throws {
         let methods: [ChallengeVerificationMethod] = [
             .selfAttested,
-            .challengeVerified(challengeType: "scp:capability:tool-integrity/v1")
+            .challengeVerified(challengeType: "scp:capability:outlet-integrity/v1")
         ]
         for method in methods {
             let data = try JSONEncoder().encode(method)
@@ -405,8 +405,8 @@ final class TrustAdmissionCallThroughTests: XCTestCase {
             participationDurationSecs: 7200,
             governanceActionsAgainst: 0,
             governanceActionsBy: 0,
-            toolInvocationCount: 0,
-            toolInvocationCountAnchored: false,
+            outletInvocationCount: 0,
+            outletInvocationCountAnchored: false,
             contextCreationCount: 0,
             roleProgressionCount: 0,
             attestationCount: 0,

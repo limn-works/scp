@@ -107,8 +107,8 @@ class TestParticipationProfile:
         assert profile.participation_duration_secs == 0
         assert profile.governance_actions_against == 0
         assert profile.governance_actions_by == 0
-        assert profile.tool_invocation_count == 0
-        assert profile.tool_invocation_count_anchored is False
+        assert profile.outlet_invocation_count == 0
+        assert profile.outlet_invocation_count_anchored is False
         assert profile.context_creation_count == 0
         assert profile.role_progression_count == 0
         assert profile.attestation_count == 0
@@ -138,11 +138,11 @@ class TestParticipationProfile:
                 governance_actions_by=-1,
             )
 
-    def test_negative_tool_invocation_count_rejected(self) -> None:
-        with pytest.raises(ValueError, match="tool_invocation_count must be non-negative"):
+    def test_negative_outlet_invocation_count_rejected(self) -> None:
+        with pytest.raises(ValueError, match="outlet_invocation_count must be non-negative"):
             ParticipationProfile(
                 subject_did="did:dht:z6MkTest",
-                tool_invocation_count=-1,
+                outlet_invocation_count=-1,
             )
 
     def test_negative_context_creation_count_rejected(self) -> None:
@@ -280,8 +280,8 @@ class TestToBridgeDict:
             participation_duration_secs=3600,
             governance_actions_against=2,
             governance_actions_by=5,
-            tool_invocation_count=10,
-            tool_invocation_count_anchored=True,
+            outlet_invocation_count=10,
+            outlet_invocation_count_anchored=True,
             context_creation_count=3,
             role_progression_count=1,
             attestation_count=7,
@@ -296,8 +296,8 @@ class TestToBridgeDict:
         assert d["participation_duration_secs"] == 3600
         assert d["governance_actions_against"] == 2
         assert d["governance_actions_by"] == 5
-        assert d["tool_invocation_count"] == 10
-        assert d["tool_invocation_count_anchored"] is True
+        assert d["outlet_invocation_count"] == 10
+        assert d["outlet_invocation_count_anchored"] is True
         assert d["context_creation_count"] == 3
         assert d["role_progression_count"] == 1
         assert d["attestation_count"] == 7
@@ -308,14 +308,14 @@ class TestToBridgeDict:
 
     def test_require_participation_bridge_dict(self) -> None:
         req = RequireParticipation(
-            fact=ParticipationFact(name="ToolInvocationCount"),
+            fact=ParticipationFact(name="OutletInvocationCount"),
             threshold=ParticipationThreshold(operator="GreaterThan", value=50),
             max_age_secs=7200,
             min_contexts=3,
         )
         d = req._to_bridge_dict()
 
-        assert d["fact"] == "ToolInvocationCount"
+        assert d["fact"] == "OutletInvocationCount"
         assert d["threshold"] == {"GreaterThan": 50}
         assert d["max_age_secs"] == 7200
         assert d["min_contexts"] == 3
@@ -383,7 +383,7 @@ class TestVerifyParticipationRequirements:
         profiles = [ParticipationProfile(subject_did="did:dht:z6MkBob")]
         requirements = [
             RequireParticipation(
-                fact=ParticipationFact(name="ToolInvocationCount"),
+                fact=ParticipationFact(name="OutletInvocationCount"),
                 threshold=ParticipationThreshold(operator="AtLeast", value=100),
             ),
         ]

@@ -2,7 +2,7 @@
 
 > `SCP` -- Shared Context Protocol for Swift
 
-Cryptographic identity, encrypted contexts, capability-based auth, and tool invocation for AI agents. Built on Rust via UniFFI, distributed as XCFramework.
+Cryptographic identity, encrypted contexts, capability-based auth, and outlet invocation for AI agents. Built on Rust via UniFFI, distributed as XCFramework.
 
 ## Install
 
@@ -66,8 +66,8 @@ See [`examples/`](./examples/) for runnable code:
 | File | Description |
 |------|-------------|
 | `BasicMessaging.swift` | Create identity, context, send/receive messages |
-| `ToolInvocation.swift` | Register and invoke a tool with test vectors |
-| `McpIntegration.swift` | Expose SCP tools via MCP JSON-RPC server |
+| `OutletInvocation.swift` | Register and invoke a outlet with test vectors |
+| `McpIntegration.swift` | Expose SCP outlets via MCP JSON-RPC server |
 | `MultiAgent.swift` | Coordinate multiple agents in a shared context |
 
 ## Error Handling

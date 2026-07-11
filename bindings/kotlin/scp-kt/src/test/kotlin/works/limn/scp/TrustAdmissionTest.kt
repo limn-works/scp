@@ -30,8 +30,8 @@ class TrustAdmissionTest {
             participationDurationSecs = 3600uL,
             governanceActionsAgainst = 0uL,
             governanceActionsBy = 1uL,
-            toolInvocationCount = 150uL,
-            toolInvocationCountAnchored = false,
+            outletInvocationCount = 150uL,
+            outletInvocationCountAnchored = false,
             contextCreationCount = 2uL,
             roleProgressionCount = 3uL,
             attestationCount = 4uL,
@@ -104,7 +104,7 @@ class TrustAdmissionTest {
                 encodeRequireParticipationJson(
                     listOf(
                         RequireParticipation(
-                            fact = ParticipationFact.TOOL_INVOCATION_COUNT,
+                            fact = ParticipationFact.OUTLET_INVOCATION_COUNT,
                             threshold = threshold,
                             maxAgeSecs = 1uL,
                             minContexts = 1u,
@@ -125,8 +125,8 @@ class TrustAdmissionTest {
               "participation_duration_secs":3600,
               "governance_actions_against":0,
               "governance_actions_by":1,
-              "tool_invocation_count":150,
-              "tool_invocation_count_anchored":false,
+              "outlet_invocation_count":150,
+              "outlet_invocation_count_anchored":false,
               "context_creation_count":2,
               "role_progression_count":3,
               "attestation_count":4,

@@ -292,7 +292,7 @@ describe("ConsequenceRule wire-format encoding (encodeConsequenceRules)", () => 
     const types = await import("../src/types");
     expect(types.CONSEQUENCE_TRIGGER_VARIANTS).toEqual([
       "MessageVelocity",
-      "ToolRateExceeded",
+      "OutletRateExceeded",
       "WarningCount",
       "Custom",
     ]);

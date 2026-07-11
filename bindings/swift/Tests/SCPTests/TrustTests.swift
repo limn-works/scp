@@ -70,8 +70,8 @@ final class TrustTests: XCTestCase {
             participationDurationSecs: 3600,
             governanceActionsAgainst: 1,
             governanceActionsBy: 2,
-            toolInvocationCount: 5,
-            toolInvocationCountAnchored: false,
+            outletInvocationCount: 5,
+            outletInvocationCountAnchored: false,
             contextCreationCount: 1,
             roleProgressionCount: 3,
             attestationCount: 4,
@@ -84,8 +84,8 @@ final class TrustTests: XCTestCase {
         XCTAssertEqual(record.participationDurationSecs, 3600)
         XCTAssertEqual(record.governanceActionsAgainst, 1)
         XCTAssertEqual(record.governanceActionsBy, 2)
-        XCTAssertEqual(record.toolInvocationCount, 5)
-        XCTAssertFalse(record.toolInvocationCountAnchored)
+        XCTAssertEqual(record.outletInvocationCount, 5)
+        XCTAssertFalse(record.outletInvocationCountAnchored)
         XCTAssertEqual(record.contextCreationCount, 1)
         XCTAssertEqual(record.roleProgressionCount, 3)
         XCTAssertEqual(record.attestationCount, 4)
@@ -102,8 +102,8 @@ final class TrustTests: XCTestCase {
         XCTAssertEqual(record.participationDurationSecs, 0)
         XCTAssertEqual(record.governanceActionsAgainst, 0)
         XCTAssertEqual(record.governanceActionsBy, 0)
-        XCTAssertEqual(record.toolInvocationCount, 0)
-        XCTAssertFalse(record.toolInvocationCountAnchored)
+        XCTAssertEqual(record.outletInvocationCount, 0)
+        XCTAssertFalse(record.outletInvocationCountAnchored)
         XCTAssertEqual(record.contextCreationCount, 0)
         XCTAssertEqual(record.roleProgressionCount, 0)
         XCTAssertEqual(record.attestationCount, 0)

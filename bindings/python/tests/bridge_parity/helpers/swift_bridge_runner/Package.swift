@@ -1,4 +1,4 @@
-// swift-tools-version: 6.2
+// swift-outlets-version: 6.2
 // SPDX-License-Identifier: MIT
 //
 // Swift parity runner for the ADR-046 bridge parity harness.

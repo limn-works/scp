@@ -892,7 +892,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
     // C3c (Phase 2C-2): the Layer-2 behavioral record is now the TYPED
     // participation record (§7.3.2) RECEIVED from the shared Rust core via
     // `participationRecord` — the SDK no longer classifies raw events
-    // client-side, so the divergence-prone per-binding `toolInvocations` map is
+    // client-side, so the divergence-prone per-binding `outletInvocations` map is
     // gone. The record exposes the flattened `ParticipationFacts` 1:1.
     //
     // After create+join the context's supervisor Merkle log holds convergent
@@ -901,7 +901,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
     // does NOT throw. This test pins the baseline record SHAPE on a context with
     // no governance activity yet: a real Merkle root, a real `computedAt`,
     // `attestationCount == 0` (no attestations supplied — credential-layer, §7.4),
-    // `toolInvocationCountAnchored == false` (ADR-051), and the obsolete
+    // `outletInvocationCountAnchored == false` (ADR-051), and the obsolete
     // client-side fields absent. The per-fact governance/role COUNTS being
     // exercised live (and asserted non-zero) is the job of the affirmative test
     // below — the runtime DOES populate the ADR-011-amendment subject-bearing
@@ -929,13 +929,13 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       expect(record.eventLogRoot).toMatch(/^[0-9a-f]{64}$/);
       expect(record.eventLogRoot).not.toBe("0".repeat(64));
       expect(record.computedAt).toBeGreaterThan(0);
-      // `tool_invocation_count` is never Merkle-anchored until ADR-051 (§7.3.2).
-      expect(record.toolInvocationCountAnchored).toBe(false);
+      // `outlet_invocation_count` is never Merkle-anchored until ADR-051 (§7.3.2).
+      expect(record.outletInvocationCountAnchored).toBe(false);
       // No cached attestations supplied → credential-layer count is 0 (§7.4),
       // honest and verifier-relative — the SDK fabricates none.
       expect(record.attestationCount).toBe(0);
       // The obsolete client-side fields are gone from the typed shape.
-      expect((record as unknown as Record<string, unknown>).toolInvocations).toBeUndefined();
+      expect((record as unknown as Record<string, unknown>).outletInvocations).toBeUndefined();
       expect((record as unknown as Record<string, unknown>).participationCount).toBeUndefined();
     });
 
@@ -1000,7 +1000,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
               ceiling_policy: "Immutable",
               promotion_policy: "NoPromotion",
               roles: [],
-              tools: [],
+              outlets: [],
               ttl: null,
               memory_scope: "Ephemeral",
               governance: "SingleAdmin",
@@ -1027,8 +1027,8 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       // Credential-layer / anchoring invariants hold for both subjects.
       expect(adminRecord.attestationCount).toBe(0);
       expect(memberRecord.attestationCount).toBe(0);
-      expect(adminRecord.toolInvocationCountAnchored).toBe(false);
-      expect(memberRecord.toolInvocationCountAnchored).toBe(false);
+      expect(adminRecord.outletInvocationCountAnchored).toBe(false);
+      expect(memberRecord.outletInvocationCountAnchored).toBe(false);
       // Real Merkle root over the convergent governance leaves.
       expect(adminRecord.eventLogRoot).toMatch(/^[0-9a-f]{64}$/);
       expect(adminRecord.eventLogRoot).not.toBe("0".repeat(64));
@@ -1090,7 +1090,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
               ceiling_policy: "Immutable",
               promotion_policy: "NoPromotion",
               roles: [],
-              tools: [],
+              outlets: [],
               ttl: null,
               memory_scope: "Ephemeral",
               governance: "SingleAdmin",
@@ -1110,8 +1110,8 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       const counts = (r: BehavioralRecord) => ({
         governanceActionsAgainst: r.governanceActionsAgainst,
         governanceActionsBy: r.governanceActionsBy,
-        toolInvocationCount: r.toolInvocationCount,
-        toolInvocationCountAnchored: r.toolInvocationCountAnchored,
+        outletInvocationCount: r.outletInvocationCount,
+        outletInvocationCountAnchored: r.outletInvocationCountAnchored,
         contextCreationCount: r.contextCreationCount,
         roleProgressionCount: r.roleProgressionCount,
         attestationCount: r.attestationCount,
@@ -1120,8 +1120,8 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       expect(counts(adminRec)).toEqual({
         governanceActionsAgainst: 0,
         governanceActionsBy: 3,
-        toolInvocationCount: 0,
-        toolInvocationCountAnchored: false,
+        outletInvocationCount: 0,
+        outletInvocationCountAnchored: false,
         contextCreationCount: 1,
         roleProgressionCount: 0,
         attestationCount: 0,
@@ -1130,8 +1130,8 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       expect(counts(memberRec)).toEqual({
         governanceActionsAgainst: 1,
         governanceActionsBy: 0,
-        toolInvocationCount: 0,
-        toolInvocationCountAnchored: false,
+        outletInvocationCount: 0,
+        outletInvocationCountAnchored: false,
         contextCreationCount: 0,
         roleProgressionCount: 1,
         attestationCount: 0,
@@ -1172,8 +1172,8 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       expect(record.participationDurationSecs).toBe(0);
       expect(record.governanceActionsAgainst).toBe(0);
       expect(record.governanceActionsBy).toBe(0);
-      expect(record.toolInvocationCount).toBe(0);
-      expect(record.toolInvocationCountAnchored).toBe(false);
+      expect(record.outletInvocationCount).toBe(0);
+      expect(record.outletInvocationCountAnchored).toBe(false);
       expect(record.contextCreationCount).toBe(0);
       expect(record.roleProgressionCount).toBe(0);
       expect(record.attestationCount).toBe(0);
@@ -2646,9 +2646,9 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
     // wire form (§6.2.4 envelope nonce).
     const NONCE_HEX = "0123456789abcdef0123456789abcdef";
 
-    // The deterministic, cross-bridge outlet id form (`generate_tool_id(name)`).
-    const TOOL_NAME = "xctx_saga_ts_outlet";
-    const TOOL_ID = `outlet-${TOOL_NAME}`;
+    // The deterministic, cross-bridge outlet id form (`generate_outlet_id(name)`).
+    const OUTLET_NAME = "xctx_saga_ts_outlet";
+    const OUTLET_ID = `outlet-${OUTLET_NAME}`;
 
     // A near-now Unix-ms timestamp as a JS `BigInt`. Prepare-B enforces a
     // §9.14 ±5min skew, so a fixed historical value would abort with a skew
@@ -2689,7 +2689,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
 
     // Creates a caller (source) context A owned by `ownerDid`. A's ceiling
     // carries `governance:propose` (so the admin can propose) and
-    // `outlet:interface` (required by execute_establish_tool_interface's ceiling
+    // `outlet:interface` (required by execute_establish_outlet_interface's ceiling
     // check). `contextCreate` mints a real 64-hex id so the ADR-056 saga
     // chokepoint round-trips to A's actor.
     async function createCallerContext(owner: IdentityHandle): Promise<ContextHandle> {
@@ -2724,7 +2724,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       );
     }
 
-    // Externally-tagged `GovernanceAction::RegisterTool` for the saga outlet.
+    // Externally-tagged `GovernanceAction::RegisterOutlet` for the saga outlet.
     // Two input + two output properties clear the §9.2.1 specificity floor of
     // 2. `implementation_hash` is a 32-element JSON number array (serde expects
     // a fixed `[u8; 32]`). `operator_did` is a required string (not nullable).
@@ -2732,11 +2732,11 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
     // Prepare-B requires.
     function registerOutletActionJson(operatorDid: string): string {
       return JSON.stringify({
-        RegisterTool: {
+        RegisterOutlet: {
           registration: {
-            outlet_id: TOOL_ID,
-            name: TOOL_NAME,
-            description: `Outlet: ${TOOL_NAME}`,
+            outlet_id: OUTLET_ID,
+            name: OUTLET_NAME,
+            description: `Outlet: ${OUTLET_NAME}`,
             schema: {
               input_schema: {
                 type: "object",
@@ -2758,17 +2758,17 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       });
     }
 
-    // Externally-tagged `GovernanceAction::EstablishToolInterface`, source=A,
+    // Externally-tagged `GovernanceAction::EstablishOutletInterface`, source=A,
     // target=B, BOTH approvals true. The producer's gate 2 queries this
     // bidirectionally-approved interface against the CALLER context A's actor
     // governance state, so it is established IN A.
     function establishInterfaceActionJson(ctxA: string, ctxB: string): string {
       return JSON.stringify({
-        EstablishToolInterface: {
+        EstablishOutletInterface: {
           interface: {
             source_context: ctxA,
             target_context: ctxB,
-            outlet_id: TOOL_ID,
+            outlet_id: OUTLET_ID,
             rate_limit: null,
             inbound_rate_limit: null,
             per_caller_rate_limit: null,
@@ -2801,7 +2801,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
         ctxA,
         ctxB,
         owner.did,
-        TOOL_ID,
+        OUTLET_ID,
         JSON.stringify({ a: "x", b: "y" }),
         NONCE_HEX,
         nowMsBigInt(),
@@ -2850,7 +2850,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
           ctxA,
           ctxB,
           foreignCallerDid,
-          TOOL_ID,
+          OUTLET_ID,
           JSON.stringify({ a: "x", b: "y" }),
           NONCE_HEX,
           nowMsBigInt(),
@@ -2877,8 +2877,8 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
     // Establishes the full saga precondition entirely through the addon's
     // governance surface (no Rust-internal handler hook is reachable from JS):
     //
-    //   - RegisterTool into B's ACTOR governance state (Prepare-B reads it).
-    //   - EstablishToolInterface (bidirectionally approved) into A (gate 2).
+    //   - RegisterOutlet into B's ACTOR governance state (Prepare-B reads it).
+    //   - EstablishOutletInterface (bidirectionally approved) into A (gate 2).
     //
     // No outlet handler is registered (the only handler-attach path is
     // Rust-internal `register_outlet_handler`, not a napi export), so the
@@ -2910,7 +2910,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
         ctxA,
         ctxB,
         owner.did,
-        TOOL_ID,
+        OUTLET_ID,
         JSON.stringify({ a: "x", b: "y" }),
         NONCE_HEX,
         nowMsBigInt(),
@@ -2988,8 +2988,8 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
         participationDurationSecs: 3_600,
         governanceActionsAgainst: 0,
         governanceActionsBy: 1,
-        toolInvocationCount: 150,
-        toolInvocationCountAnchored: false,
+        outletInvocationCount: 150,
+        outletInvocationCountAnchored: false,
         contextCreationCount: 2,
         roleProgressionCount: 3,
         attestationCount: 4,
@@ -3012,8 +3012,8 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
         participationDurationSecs: 3_600,
         governanceActionsAgainst: 0,
         governanceActionsBy: 0,
-        toolInvocationCount: 0,
-        toolInvocationCountAnchored: false,
+        outletInvocationCount: 0,
+        outletInvocationCountAnchored: false,
         contextCreationCount: 0,
         roleProgressionCount: 0,
         attestationCount: 0,

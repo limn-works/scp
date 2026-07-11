@@ -16,7 +16,7 @@
 #
 # Prerequisites:
 #   - Rust toolchain with Apple targets (auto-installed if missing)
-#   - Xcode command-line tools (xcodebuild, lipo)
+#   - Xcode command-line outlets (xcodebuild, lipo)
 
 set -euo pipefail
 
@@ -129,8 +129,8 @@ mkdir -p "$BINDINGS_DIR"
 # ---------------------------------------------------------------------------
 
 command -v cargo >/dev/null 2>&1 || die "cargo not found. Install the Rust toolchain."
-command -v xcodebuild >/dev/null 2>&1 || die "xcodebuild not found. Install Xcode command-line tools."
-command -v lipo >/dev/null 2>&1 || die "lipo not found. Install Xcode command-line tools."
+command -v xcodebuild >/dev/null 2>&1 || die "xcodebuild not found. Install Xcode command-line outlets."
+command -v lipo >/dev/null 2>&1 || die "lipo not found. Install Xcode command-line outlets."
 
 # Verify all Rust targets are installed
 for target in "${ALL_TARGETS[@]}"; do

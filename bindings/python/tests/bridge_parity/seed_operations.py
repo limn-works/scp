@@ -605,7 +605,7 @@ def _py_outlet_register(ctx: OpContext) -> dict[str, Any]:
     scp, identity = ctx.attached_scp()
     handle = scp.context_create(
         identity.did,
-        {"name": "parity-tools", "mode": "encrypted", "ceiling": _OUTLET_CEILING},
+        {"name": "parity-outlets", "mode": "encrypted", "ceiling": _OUTLET_CEILING},
     )
     outlet_id = scp.outlet_register(
         handle.context_id,

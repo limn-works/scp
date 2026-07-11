@@ -224,7 +224,7 @@ class Capability(enum.Enum):
     ``Custom(name)``) are produced by the :meth:`outlet_query`,
     :meth:`outlet_call`, and :meth:`custom` static helpers.
 
-    The pre-rename tool-prefixed capability stems (invoke / register /
+    The pre-rename outlet-prefixed capability stems (invoke / register /
     interface) are deleted with no transitional alias; the protocol
     hard-rejects them at construction time (ADR-049 §1).
     """

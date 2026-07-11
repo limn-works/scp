@@ -3,7 +3,7 @@
 // The Capability helpers are pure Kotlin string construction and do not
 // require the native UniFFI binary.
 //
-// Provenance: §5.4.2 (outlet capabilities), ADR-049 §1 (tool→outlet rename)
+// Provenance: §5.4.2 (outlet capabilities), ADR-049 §1 (outlet→outlet rename)
 
 package works.limn.scp
 

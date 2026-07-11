@@ -894,7 +894,7 @@ class TestDiscovery:
 
     async def test_create_query(self):
         result = _scp_core.discovery_create_query(
-            ["tool:search"],
+            ["outlet:search"],
             ["rust"],
             None,
         )
@@ -1110,7 +1110,7 @@ class TestTrust:
             "ceiling_policy": "Immutable",
             "promotion_policy": "NoPromotion",
             "roles": [],
-            "tools": [],
+            "outlets": [],
             "ttl": None,
             "memory_scope": "Ephemeral",
             "governance": "SingleAdmin",
@@ -1138,8 +1138,8 @@ class TestTrust:
         # Credential-layer / anchoring invariants hold for both subjects.
         assert admin_record.attestation_count == 0
         assert member_record.attestation_count == 0
-        assert admin_record.tool_invocation_count_anchored is False
-        assert member_record.tool_invocation_count_anchored is False
+        assert admin_record.outlet_invocation_count_anchored is False
+        assert member_record.outlet_invocation_count_anchored is False
         # attestation_count is credential-layer (§7.4), never Merkle-anchored.
         assert admin_record.attestation_count_anchored is False
         assert member_record.attestation_count_anchored is False

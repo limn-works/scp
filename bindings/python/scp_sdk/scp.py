@@ -1862,7 +1862,7 @@ class SCP:
         return await asyncio.to_thread(self._native.py_mcp_client_info, raw)
 
     async def mcp_client_invoke(
-        self, handle: Any, tool_name: str, input: dict[str, Any], context_id: str, identity_did: str
+        self, handle: Any, outlet_name: str, input: dict[str, Any], context_id: str, identity_did: str
     ) -> Any:
         """Delegate to ``_scp_core.SCP.py_mcp_client_invoke``.
 
@@ -1875,7 +1875,7 @@ class SCP:
         raw = await asyncio.to_thread(
             self._native.py_mcp_client_invoke,
             raw_handle,
-            tool_name,
+            outlet_name,
             input,
             context_id,
             identity_did,
@@ -1915,11 +1915,11 @@ class SCP:
         return await asyncio.to_thread(self._native.py_mcp_load_contexts, identity_did, _relay_url)
 
     async def mcp_register_outlet_handler(
-        self, context_id: str, tool_name: str, handler: Any
+        self, context_id: str, outlet_name: str, handler: Any
     ) -> Any:
         """Delegate to ``_scp_core.SCP.mcp_register_outlet_handler``."""
         return await asyncio.to_thread(
-            self._native.mcp_register_outlet_handler, context_id, tool_name, handler
+            self._native.mcp_register_outlet_handler, context_id, outlet_name, handler
         )
 
     async def mcp_serve(

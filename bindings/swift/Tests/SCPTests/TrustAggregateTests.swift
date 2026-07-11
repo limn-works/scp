@@ -146,7 +146,7 @@ final class TrustAggregateEncoderTests: XCTestCase {
 
     func testAllAttestationTypesEncodeAsBareVariantStrings() {
         let expected = [
-            "IdentityLink", "CapabilityDelegation", "ToolIntegrity", "AgentCapability",
+            "IdentityLink", "CapabilityDelegation", "OutletIntegrity", "AgentCapability",
             "Endorsement", "RoleAssignment", "ContextEndorsement", "ParticipationWitness"
         ]
         XCTAssertEqual(AttestationType.allCases.map(\.rawValue).sorted(), expected.sorted())

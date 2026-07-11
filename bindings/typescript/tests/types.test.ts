@@ -288,7 +288,7 @@ describe("type definitions", () => {
       "ParticipationDuration",
       "GovernanceActionsAgainst",
       "GovernanceActionsBy",
-      "ToolInvocationCount",
+      "OutletInvocationCount",
       "ContextCreationCount",
       "RoleProgressionCount",
       "AttestationCount",
@@ -313,8 +313,8 @@ describe("type definitions", () => {
       participationDurationSecs: 3600,
       governanceActionsAgainst: 2,
       governanceActionsBy: 5,
-      toolInvocationCount: 10,
-      toolInvocationCountAnchored: false,
+      outletInvocationCount: 10,
+      outletInvocationCountAnchored: false,
       contextCreationCount: 3,
       roleProgressionCount: 1,
       attestationCount: 7,
@@ -327,8 +327,8 @@ describe("type definitions", () => {
     expect(profile.participationDurationSecs).toBe(3600);
     expect(profile.governanceActionsAgainst).toBe(2);
     expect(profile.governanceActionsBy).toBe(5);
-    expect(profile.toolInvocationCount).toBe(10);
-    expect(profile.toolInvocationCountAnchored).toBe(false);
+    expect(profile.outletInvocationCount).toBe(10);
+    expect(profile.outletInvocationCountAnchored).toBe(false);
     expect(profile.contextCreationCount).toBe(3);
     expect(profile.roleProgressionCount).toBe(1);
     expect(profile.attestationCount).toBe(7);
@@ -352,12 +352,12 @@ describe("type definitions", () => {
 
   it("RequireParticipation with GreaterThan threshold", () => {
     const requirement: RequireParticipation = {
-      fact: "ToolInvocationCount",
+      fact: "OutletInvocationCount",
       threshold: { GreaterThan: 50 },
       maxAgeSecs: 7200,
       minContexts: 3,
     };
-    expect(requirement.fact).toBe("ToolInvocationCount");
+    expect(requirement.fact).toBe("OutletInvocationCount");
     expect(requirement.maxAgeSecs).toBe(7200);
     expect(requirement.minContexts).toBe(3);
   });

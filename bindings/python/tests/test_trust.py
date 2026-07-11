@@ -456,8 +456,8 @@ class TestBehavioralRecord:
         assert br.participation_duration_secs == 0
         assert br.governance_actions_against == 0
         assert br.governance_actions_by == 0
-        assert br.tool_invocation_count == 0
-        assert br.tool_invocation_count_anchored is False
+        assert br.outlet_invocation_count == 0
+        assert br.outlet_invocation_count_anchored is False
         assert br.context_creation_count == 0
         assert br.role_progression_count == 0
         assert br.attestation_count == 0
@@ -471,7 +471,7 @@ class TestBehavioralRecord:
         for obsolete in (
             "contexts_participated",
             "total_duration",
-            "tool_invocations",
+            "outlet_invocations",
             "role_history",
             "endorsement_accuracy",
         ):
@@ -486,8 +486,8 @@ class _FakeParticipationRecord:
         self.participation_duration_secs = 0
         self.governance_actions_against = 0
         self.governance_actions_by = 0
-        self.tool_invocation_count = 0
-        self.tool_invocation_count_anchored = False
+        self.outlet_invocation_count = 0
+        self.outlet_invocation_count_anchored = False
         self.context_creation_count = 0
         self.role_progression_count = 0
         self.attestation_count = 0
@@ -509,8 +509,8 @@ class TestParticipationRecordWrapper:
             participation_duration_secs=300,
             governance_actions_against=2,
             governance_actions_by=3,
-            tool_invocation_count=4,
-            tool_invocation_count_anchored=False,
+            outlet_invocation_count=4,
+            outlet_invocation_count_anchored=False,
             context_creation_count=1,
             role_progression_count=5,
             attestation_count=0,
@@ -525,8 +525,8 @@ class TestParticipationRecordWrapper:
         assert record.participation_duration_secs == 300
         assert record.governance_actions_against == 2
         assert record.governance_actions_by == 3
-        assert record.tool_invocation_count == 4
-        assert record.tool_invocation_count_anchored is False
+        assert record.outlet_invocation_count == 4
+        assert record.outlet_invocation_count_anchored is False
         assert record.context_creation_count == 1
         assert record.role_progression_count == 5
         assert record.attestation_count == 0
@@ -635,8 +635,8 @@ class TestParticipationRecordWrapper:
         assert isinstance(record, BehavioralRecord)
         assert record.subject_did == "did:dht:zsubject"
         assert record.participation_duration_secs == 0
-        assert record.tool_invocation_count == 0
-        assert record.tool_invocation_count_anchored is False
+        assert record.outlet_invocation_count == 0
+        assert record.outlet_invocation_count_anchored is False
         assert record.attestation_count == 0
         assert record.attestation_count_anchored is False
         assert record.event_log_root == ""
@@ -855,7 +855,7 @@ class TestVerifyParticipationRequirements:
     def test_max_age_secs_default(self) -> None:
         """RequireParticipation defaults max_age_secs to 3600."""
         req = RequireParticipation(
-            fact=ParticipationFact(name="ToolInvocationCount"),
+            fact=ParticipationFact(name="OutletInvocationCount"),
             threshold=ParticipationThreshold(operator="Equals", value=10),
         )
         assert req.max_age_secs == 3600
@@ -907,7 +907,7 @@ class TestU64UpperBoundValidation:
             "participation_duration_secs",
             "governance_actions_against",
             "governance_actions_by",
-            "tool_invocation_count",
+            "outlet_invocation_count",
             "context_creation_count",
             "role_progression_count",
             "attestation_count",
@@ -926,7 +926,7 @@ class TestU64UpperBoundValidation:
             "participation_duration_secs",
             "governance_actions_against",
             "governance_actions_by",
-            "tool_invocation_count",
+            "outlet_invocation_count",
             "context_creation_count",
             "role_progression_count",
             "attestation_count",
