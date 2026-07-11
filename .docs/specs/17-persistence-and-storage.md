@@ -102,8 +102,8 @@ context/{context_id}/event_meta/count
 context/{context_id}/event_meta/root
 context/{context_id}/event_tree/{level}/{index}
 context/{context_id}/merkle_event_log/{seq:020d}
-context/{context_id}/tool/{outlet_id}
-context/{context_id}/tool_session/{session_id}
+context/{context_id}/outlet/{outlet_id}
+context/{context_id}/outlet_session/{session_id}
 context/{context_id}/ucan_token/{token_id}
 context/{context_id}/ucan_revocation/{token_id}
 context/{context_id}/broadcast_state
@@ -239,15 +239,15 @@ impl<S: Storage> ProtocolRepository<S> {
     pub async fn store_tofu_record(&self, did: &DID, record: &[u8]) -> Result<(), StoreError>;
     pub async fn load_tofu_record(&self, did: &DID) -> Result<Option<Vec<u8>>, StoreError>;
 
-    // --- Tools ---
-    pub async fn store_tool(&self, context_id: &ContextId, outlet_id: &OutletId, registration: &[u8]) -> Result<(), StoreError>;
-    pub async fn load_tool(&self, context_id: &ContextId, outlet_id: &OutletId) -> Result<Option<Vec<u8>>, StoreError>;
-    pub async fn list_tools(&self, context_id: &ContextId) -> Result<Vec<OutletId>, StoreError>;
+    // --- Outlets ---
+    pub async fn store_outlet(&self, context_id: &ContextId, outlet_id: &OutletId, registration: &[u8]) -> Result<(), StoreError>;
+    pub async fn load_outlet(&self, context_id: &ContextId, outlet_id: &OutletId) -> Result<Option<Vec<u8>>, StoreError>;
+    pub async fn list_outlets(&self, context_id: &ContextId) -> Result<Vec<OutletId>, StoreError>;
 
-    // --- Tool sessions ---
-    pub async fn store_tool_session(&self, context_id: &ContextId, session_id: &str, session: &[u8]) -> Result<(), StoreError>;
-    pub async fn load_tool_session(&self, context_id: &ContextId, session_id: &str) -> Result<Option<Vec<u8>>, StoreError>;
-    pub async fn delete_tool_session(&self, context_id: &ContextId, session_id: &str) -> Result<(), StoreError>;
+    // --- Outlet sessions ---
+    pub async fn store_outlet_session(&self, context_id: &ContextId, session_id: &str, session: &[u8]) -> Result<(), StoreError>;
+    pub async fn load_outlet_session(&self, context_id: &ContextId, session_id: &str) -> Result<Option<Vec<u8>>, StoreError>;
+    pub async fn delete_outlet_session(&self, context_id: &ContextId, session_id: &str) -> Result<(), StoreError>;
 
     // --- Relay scores ---
     pub async fn store_relay_score(&self, relay_url: &str, score: &[u8]) -> Result<(), StoreError>;
@@ -309,7 +309,7 @@ scp-core/src/store/
     identity.rs     # Identity documents, private state, TOFU, DID cache
     nonce.rs        # UCAN nonce tracking, pruning
     tls.rs          # TLS certificate chain + private key (§18.6.3)
-    tools.rs        # Tool registration, sessions
+    outlets.rs        # Outlet registration, sessions
     transport.rs    # Relay scores, key packages
     economy.rs      # Economic policy, payment receipts, spending UCANs, adapter credentials
 ```
@@ -335,7 +335,7 @@ Every value written by `ProtocolRepository` is wrapped in `StoredValue`. On read
 **Context export integrity (signed snapshot).** A portable `ContextExport` (the serialized form produced for backup, migration, or device transfer) carries TWO independent integrity protections, both verified on import before any state is restored:
 
 1. **Event-log Merkle chain** — the serialized event-log entries are hash-chained and the export records the Merkle root; import recomputes and compares it (tamper detection on the event history).
-2. **Signed snapshot** — the *entire* embedded context snapshot is bound by an Ed25519 `snapshot_signature`, computed and verified **exactly as specified in §23.16.8 (Signed Context Export)**: Ed25519 over `SHA-256("SCP-CONTEXT-EXPORT-V1:" || scope-tag-byte || JCS(ContextSnapshot))`, where `scope-tag-byte` is the single export-scope discriminant (`0x00` for `Full`, `0x01` for `Public`) placed immediately after the domain separator and before the JCS bytes, and `JCS` is the RFC 8785 canonical-JSON serialization of the whole snapshot. Binding the scope byte into the preimage means a tampered envelope `scope` field fails signature verification by construction (§23.16.8, ADR-050). The export domain separator `"SCP-CONTEXT-EXPORT-V1:"` is deliberately distinct from the §23.16.4 sync-delta separator `"SCP-CONTEXT-SNAPSHOT-V1:"` so that an export signature can never be confused with a sync-delta signature under the same creator key (§9.18.2). The signature is produced by the snapshot's `creator_did` `#active`/`#agent` custody key (ADR-039); on import the verifying key is resolved from `creator_did`, the envelope's `exporter_did` MUST equal `creator_did`, and the signature MUST verify before any state is restored. The signature covers every trusted field the importer restores verbatim — role ceilings, member/suspended capabilities, role assignments, threshold signers and value, governance model configuration, economic policy, consequence rules, read-exclusion list, access-key store, pending ceiling modification, and tool registrations — not only membership and parameters. A subset hash (such as the §23.16.4 sync-delta recipe) would leave those fields forgeable and MUST NOT be used for export. Per-instance anti-abuse and accounting state carried in the snapshot is signed but intentionally wiped or sanitized on import (§23.16.8).
+2. **Signed snapshot** — the *entire* embedded context snapshot is bound by an Ed25519 `snapshot_signature`, computed and verified **exactly as specified in §23.16.8 (Signed Context Export)**: Ed25519 over `SHA-256("SCP-CONTEXT-EXPORT-V1:" || scope-tag-byte || JCS(ContextSnapshot))`, where `scope-tag-byte` is the single export-scope discriminant (`0x00` for `Full`, `0x01` for `Public`) placed immediately after the domain separator and before the JCS bytes, and `JCS` is the RFC 8785 canonical-JSON serialization of the whole snapshot. Binding the scope byte into the preimage means a tampered envelope `scope` field fails signature verification by construction (§23.16.8, ADR-050). The export domain separator `"SCP-CONTEXT-EXPORT-V1:"` is deliberately distinct from the §23.16.4 sync-delta separator `"SCP-CONTEXT-SNAPSHOT-V1:"` so that an export signature can never be confused with a sync-delta signature under the same creator key (§9.18.2). The signature is produced by the snapshot's `creator_did` `#active`/`#agent` custody key (ADR-039); on import the verifying key is resolved from `creator_did`, the envelope's `exporter_did` MUST equal `creator_did`, and the signature MUST verify before any state is restored. The signature covers every trusted field the importer restores verbatim — role ceilings, member/suspended capabilities, role assignments, threshold signers and value, governance model configuration, economic policy, consequence rules, read-exclusion list, access-key store, pending ceiling modification, and outlet registrations — not only membership and parameters. A subset hash (such as the §23.16.4 sync-delta recipe) would leave those fields forgeable and MUST NOT be used for export. Per-instance anti-abuse and accounting state carried in the snapshot is signed but intentionally wiped or sanitized on import (§23.16.8).
 
 The export format `version` is incremented when this integrity envelope changes (the scope-bound full-snapshot signed construction is native export `version` 4); imports reject any version that is not the current signed format with a dedicated *version* error surfaced as `SCP-CTX-2094`, which is distinct from a signature-verification failure (`SCP-CTX-2093`). See §23.16.8 for the canonical construction and the importer's normative verification and authorization requirements, and §23.17 for the sequence-floor invariants that imports must additionally enforce.
 
@@ -863,7 +863,7 @@ These test the protocol layer's use of storage, not the storage adapters themsel
 | Test | Verifies |
 |------|----------|
 | `context_lifecycle_persists` | Create context, store state, reload from storage, verify state matches |
-| `context_delete_removes_all` | Create context with members, events, tools. `delete_context` removes everything. Verify no keys with context prefix remain. |
+| `context_delete_removes_all` | Create context with members, events, outlets. `delete_context` removes everything. Verify no keys with context prefix remain. |
 | `event_log_range_query` | Append 100 events, load range 50-75, verify correct events in order |
 | `nonce_replay_rejected` | Record nonce, attempt same nonce again, verify rejection |
 | `nonce_pruning` | Record nonce with short expiry, advance time, prune, verify nonce is gone |
@@ -976,7 +976,7 @@ This ordering is sound because every recovery arm that must reach a live actor n
 For each unresolved saga:
 
 - Pre-Prepare states (no actor committed): discard.
-- Prepare-in-progress with one actor already Prepared: abort the Prepared actor (idempotent); discard. **Exception — a cross-context saga whose caller deduction was durably staged (normative, §6.2.4).** For a cross-context tool saga, Prepare-A **durably** persists the caller's velocity/budget/hard-rate-limit deduction **and** its `CallerReservationRecord` **before** the FSM journals the `PreparingB` entry, so a crash can leave a `PreparingA` **or** `PreparingB` journal over a **LIVE durable caller reservation**. For such an entry the recovery does **NOT** unconditionally discard: it reverses the caller's LOCAL economy from the durable `CallerReservationRecord` (the same reversal the live abort performs) and confirms delivery, writing **terminal-`Aborted` only** on a **confirmed reversal** (caller acknowledged `SettledOrAbsent`) **or** a **permanently-deleted caller context**. Because context restore precedes this reconcile (above), the caller is RESIDENT when the reversal is driven, so on the normal startup pass the reversal is delivered in-pass and the entry reaches terminal-`Aborted` with the refund applied. The journal is left **non-terminal** ONLY in the **genuinely-undeliverable** case — the caller context failed to restore, or its persistence existence cannot be confirmed (a transient read error is treated conservatively as "still present," never reaped) — and is then carried to the NEXT process start, whose restore-then-replay pass re-drives it. Marking terminal while a refund is outstanding would strand the durable deduction forever (this scan re-drives only non-terminal journals) — a permanent caller over-charge plus escrow leak. This crash-only path applies to both `PreparingA` and `PreparingB`; it does not alter the live abort path, where the in-process RAII reservation guard remains authoritative. A non-cross-context Prepare-in-progress entry has nothing to reverse and discards as above.
+- Prepare-in-progress with one actor already Prepared: abort the Prepared actor (idempotent); discard. **Exception — a cross-context saga whose caller deduction was durably staged (normative, §6.2.4).** For a cross-context outlet saga, Prepare-A **durably** persists the caller's velocity/budget/hard-rate-limit deduction **and** its `CallerReservationRecord` **before** the FSM journals the `PreparingB` entry, so a crash can leave a `PreparingA` **or** `PreparingB` journal over a **LIVE durable caller reservation**. For such an entry the recovery does **NOT** unconditionally discard: it reverses the caller's LOCAL economy from the durable `CallerReservationRecord` (the same reversal the live abort performs) and confirms delivery, writing **terminal-`Aborted` only** on a **confirmed reversal** (caller acknowledged `SettledOrAbsent`) **or** a **permanently-deleted caller context**. Because context restore precedes this reconcile (above), the caller is RESIDENT when the reversal is driven, so on the normal startup pass the reversal is delivered in-pass and the entry reaches terminal-`Aborted` with the refund applied. The journal is left **non-terminal** ONLY in the **genuinely-undeliverable** case — the caller context failed to restore, or its persistence existence cannot be confirmed (a transient read error is treated conservatively as "still present," never reaped) — and is then carried to the NEXT process start, whose restore-then-replay pass re-drives it. Marking terminal while a refund is outstanding would strand the durable deduction forever (this scan re-drives only non-terminal journals) — a permanent caller over-charge plus escrow leak. This crash-only path applies to both `PreparingA` and `PreparingB`; it does not alter the live abort path, where the in-process RAII reservation guard remains authoritative. A non-cross-context Prepare-in-progress entry has nothing to reverse and discards as above.
 - Commit-in-progress: re-send Commit to all participants; participants deduplicate by saga identifier.
 - `NeedsRepair`: surface via a metric (e.g., `saga_repair_needed`); operator retries via a repair command, or the saga is resolved on next process start after the underlying cause is addressed.
 - **Corrupt, torn, or undecodable entry (normative).** An entry whose framing fails the integrity check (§17.16.1 length-prefix + checksum) — a torn write, bit-rot, or otherwise undecodable record — is surfaced via the same `saga_repair_needed` metric, SKIPPED for operator repair, and the sweep CONTINUES. A single unrecoverable entry MUST NOT abort recovery of the remaining sagas: the scan recovers every other unresolved saga and never silently falls back to an earlier-seq entry for the corrupt saga (which could resurrect stale pre-commit state). The corrupt saga is neither replayed nor marked resolved; it awaits operator repair.
