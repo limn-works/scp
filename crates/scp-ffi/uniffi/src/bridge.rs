@@ -15685,7 +15685,7 @@ impl Scp {
         })?;
 
         let outlets = client_guard.list_tools().map_err(|e| ScpError::Transport {
-            msg: format!("outlets/list failed: {e}"),
+            msg: format!("tools/list failed: {e}"),
             code: codes::TRANS_5022.to_owned(),
         })?;
 
@@ -15738,7 +15738,7 @@ impl Scp {
         let result = client_guard
             .invoke(&outlet_name, input, &context_id, &invoker_did)
             .map_err(|e| ScpError::Transport {
-                msg: format!("outlets/call failed: {e}"),
+                msg: format!("tools/call failed: {e}"),
                 code: codes::TRANS_5025.to_owned(),
             })?;
 

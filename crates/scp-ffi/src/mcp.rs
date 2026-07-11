@@ -1803,7 +1803,7 @@ impl crate::scp::PyScp {
 
 /// Lists available outlets from an external MCP server.
 ///
-/// Sends a `outlets/list` JSON-RPC request to the connected MCP server and
+/// Sends a `tools/list` JSON-RPC request to the connected MCP server and
 /// returns the outlet definitions as a list of Python dicts.
 ///
 /// # Arguments
@@ -1829,7 +1829,7 @@ impl crate::scp::PyScp {
             ScpPyError::transport(format!("MCP client handle '{handle}' not found"))
         })?;
 
-        // Send the real outlets/list request via the MCP client.
+        // Send the real tools/list request via the MCP client.
         let client = Arc::clone(&entry.client);
         drop(entry); // Release the DashMap guard before blocking.
 
@@ -1839,7 +1839,7 @@ impl crate::scp::PyScp {
                 .map_err(|e| ScpPyError::transport(format!("client lock poisoned: {e}")))?;
             client_guard
                 .list_tools()
-                .map_err(|e| ScpPyError::transport(format!("outlets/list failed: {e}")))?
+                .map_err(|e| ScpPyError::transport(format!("tools/list failed: {e}")))?
         };
 
         // Convert outlet definitions to JSON array for Python.
@@ -1860,7 +1860,7 @@ impl crate::scp::PyScp {
 
 /// Invokes an external MCP outlet with SCP provenance wrapping.
 ///
-/// Sends a `outlets/call` JSON-RPC request to the external MCP server and
+/// Sends a `tools/call` JSON-RPC request to the external MCP server and
 /// wraps the result with provenance metadata recording the source outlet,
 /// invoking agent, context, and timestamp.
 ///
@@ -1907,14 +1907,14 @@ impl crate::scp::PyScp {
         // Convert input to JSON.
         let input_json = py_dict_to_json(input)?;
 
-        // Send the real outlets/call request via the MCP client.
+        // Send the real tools/call request via the MCP client.
         let result = {
             let client_guard = client
                 .lock()
                 .map_err(|e| ScpPyError::transport(format!("client lock poisoned: {e}")))?;
             client_guard
                 .invoke(outlet_name, input_json, context_id, identity_did)
-                .map_err(|e| ScpPyError::transport(format!("outlets/call failed: {e}")))?
+                .map_err(|e| ScpPyError::transport(format!("tools/call failed: {e}")))?
         };
 
         // Convert the McpToolResult to a Python dict.

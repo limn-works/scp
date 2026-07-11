@@ -712,7 +712,7 @@ pub(crate) async fn mcp_client_list_tools_on(
 
     let outlets = client_guard.list_tools().map_err(|e| {
         napi::Error::from(ScpNapiError::Transport {
-            message: format!("outlets/list failed: {e}"),
+            message: format!("tools/list failed: {e}"),
             code: codes::TRANS_5022.to_owned(),
         })
     })?;
@@ -768,7 +768,7 @@ pub(crate) async fn mcp_client_invoke_on(
         .invoke(&outlet_name, input, &context_id, &invoker_did)
         .map_err(|e| {
             napi::Error::from(ScpNapiError::Transport {
-                message: format!("outlets/call failed: {e}"),
+                message: format!("tools/call failed: {e}"),
                 code: codes::TRANS_5025.to_owned(),
             })
         })?;

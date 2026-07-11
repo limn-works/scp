@@ -1862,7 +1862,12 @@ class SCP:
         return await asyncio.to_thread(self._native.py_mcp_client_info, raw)
 
     async def mcp_client_invoke(
-        self, handle: Any, outlet_name: str, input: dict[str, Any], context_id: str, identity_did: str
+        self,
+        handle: Any,
+        outlet_name: str,
+        input: dict[str, Any],
+        context_id: str,
+        identity_did: str,
     ) -> Any:
         """Delegate to ``_scp_core.SCP.py_mcp_client_invoke``.
 
