@@ -19,7 +19,7 @@
  */
 
 import { ValidationError } from "./errors";
-import type { OutletCost, OutletDefinition, TestVector } from "./types";
+import type { OutletCost, OutletDefinition, OutletKind, TestVector } from "./types";
 
 // ---------------------------------------------------------------------------
 // Outlet definition builder
@@ -38,6 +38,7 @@ import type { OutletCost, OutletDefinition, TestVector } from "./types";
 export function defineOutletDefinition(params: {
   readonly name: string;
   readonly description: string;
+  readonly kind: OutletKind;
   readonly inputSchema: Readonly<Record<string, unknown>>;
   readonly outputSchema: Readonly<Record<string, unknown>>;
   readonly operator: string;
@@ -60,6 +61,7 @@ export function defineOutletDefinition(params: {
   const result: OutletDefinition = {
     name: params.name,
     description: params.description,
+    kind: params.kind,
     inputSchema: params.inputSchema,
     outputSchema: params.outputSchema,
     operator: params.operator,

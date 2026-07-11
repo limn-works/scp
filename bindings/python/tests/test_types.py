@@ -24,7 +24,7 @@ from scp_sdk.errors import (
     UcanPermissionError,
     ValidationError,
 )
-from scp_sdk.outlets import OutletDefinition, TestVector
+from scp_sdk.outlets import OutletDefinition, OutletKind, TestVector
 from scp_sdk.types import (
     Capability,
     CeilingPolicy,
@@ -317,6 +317,7 @@ class TestOutletDefinition:
         outlet = OutletDefinition(
             name="recipe_search",
             description="Search recipes by ingredients",
+            kind=OutletKind.Action,
             input_schema={"type": "object"},
             output_schema={"type": "object"},
             operator="did:dht:z6MkOperator",
@@ -337,6 +338,7 @@ class TestOutletDefinition:
         outlet = OutletDefinition(
             name="recipe_search",
             description="Search recipes",
+            kind=OutletKind.Action,
             input_schema={},
             output_schema={},
             operator="did:dht:z6MkOp",
@@ -350,6 +352,7 @@ class TestOutletDefinition:
         outlet = OutletDefinition(
             name="hasher",
             description="Hash outlet",
+            kind=OutletKind.Action,
             input_schema={},
             output_schema={},
             operator="did:dht:z6MkOp",
@@ -361,11 +364,100 @@ class TestOutletDefinition:
         outlet = OutletDefinition(
             name="t",
             description="d",
+            kind=OutletKind.Action,
             input_schema={},
             output_schema={},
             operator="did:dht:z6MkSomeone",
         )
         assert isinstance(outlet.operator, str)
+
+    def test_outlet_definition_kind_required(self) -> None:
+        import pytest
+
+        with pytest.raises(TypeError):
+            OutletDefinition(  # type: ignore[call-arg]
+                name="t",
+                description="d",
+                input_schema={},
+                output_schema={},
+                operator="did:dht:z6MkSomeone",
+            )
+
+    def test_outlet_definition_to_dict_query_kind(self) -> None:
+        outlet = OutletDefinition(
+            name="recipe_search",
+            description="Search recipes",
+            kind=OutletKind.Query,
+            input_schema={"type": "object"},
+            output_schema={"type": "object"},
+            operator="did:dht:z6MkOperator",
+        )
+        payload = outlet.to_dict()
+        assert payload["kind"] == "query"
+        assert payload["name"] == "recipe_search"
+        assert payload["description"] == "Search recipes"
+        assert payload["operator_did"] == "did:dht:z6MkOperator"
+        assert payload["schema"] == {
+            "input_schema": {"type": "object"},
+            "output_schema": {"type": "object"},
+        }
+        # Optional fields are omitted when unset.
+        assert "test_vectors" not in payload
+        assert "implementation_hash" not in payload
+        assert "cost" not in payload
+
+    def test_outlet_definition_to_dict_action_kind_and_optionals(self) -> None:
+        tv = TestVector(input={"q": "x"}, expected_output={"r": 1}, description="d")
+        outlet = OutletDefinition(
+            name="do_thing",
+            description="An action outlet",
+            kind=OutletKind.Action,
+            input_schema={},
+            output_schema={},
+            operator="did:dht:z6MkOp",
+            test_vectors=[tv],
+            implementation_hash=b"\xde\xad\xbe\xef",
+        )
+        payload = outlet.to_dict()
+        assert payload["kind"] == "action"
+        assert payload["test_vectors"] == [
+            {"input": {"q": "x"}, "expected_output": {"r": 1}, "description": "d"}
+        ]
+        # implementation_hash crosses the bridge as a hex string, not raw bytes.
+        assert payload["implementation_hash"] == "deadbeef"
+
+    def test_outlet_kind_parse(self) -> None:
+        import pytest
+
+        from scp_sdk.errors import ValidationError
+
+        assert OutletKind.parse("query") is OutletKind.Query
+        assert OutletKind.parse("action") is OutletKind.Action
+        assert OutletKind.parse(OutletKind.Query) is OutletKind.Query
+        with pytest.raises(ValidationError) as excinfo:
+            OutletKind.parse("bogus")
+        assert excinfo.value.code == "SCP-VALID-7050"
+
+    async def test_outlet_register_accepts_typed_definition(self) -> None:
+        from unittest.mock import MagicMock
+
+        from scp_sdk.scp import SCP
+
+        scp = MagicMock()
+        scp._native.outlet_register.return_value = "outlet-do_thing"
+        outlet = OutletDefinition(
+            name="do_thing",
+            description="An action outlet",
+            kind=OutletKind.Query,
+            input_schema={},
+            output_schema={},
+            operator="did:dht:z6MkOp",
+        )
+        result = await SCP.outlet_register(scp, "ctx-123", outlet)
+        assert result == "outlet-do_thing"
+        # The bridge received the serialized dict with the wire kind string.
+        (_ctx, payload), _kwargs = scp._native.outlet_register.call_args
+        assert payload["kind"] == "query"
 
 
 # -----------------------------------------------------------------------

@@ -272,6 +272,7 @@ export type {
   Message,
   OutletCost,
   OutletDefinition,
+  OutletKind,
   OutletSessionInvokeResult,
   OutletSessionResult,
   OutletVerificationResult,

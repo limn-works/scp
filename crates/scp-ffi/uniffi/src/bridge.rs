@@ -2027,6 +2027,32 @@ impl DataProvenance {
     }
 }
 
+/// Outlet semantic class (§5.4.2).
+///
+/// `Query` is read-only and idempotent (UCAN stem `outlet_query:{id}`);
+/// `Action` may mutate state (UCAN stem `outlet_call:{id}`). The registered
+/// kind selects which capability stem is required to invoke the outlet.
+///
+/// Surfaced across the `UniFFI` bindings as `OutletKind`: Swift exposes it as
+/// an enum with `.query` / `.action` cases; Kotlin as an enum with `QUERY` /
+/// `ACTION` variants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum OutletKind {
+    /// Read-only, idempotent. UCAN stem `outlet_query:{id}`.
+    Query,
+    /// May mutate state. UCAN stem `outlet_call:{id}`. §5.4.2 fail-safe default.
+    Action,
+}
+
+impl From<OutletKind> for scp_core::context::outlets::OutletKind {
+    fn from(k: OutletKind) -> Self {
+        match k {
+            OutletKind::Query => Self::Query,
+            OutletKind::Action => Self::Action,
+        }
+    }
+}
+
 /// Outlet definition for registration in a context.
 ///
 /// See ADR-010 (Outlet Registry) and spec §5.4.1 (Outlets).
@@ -2036,6 +2062,10 @@ pub struct OutletDefinition {
     pub name: String,
     /// Outlet description.
     pub description: String,
+    /// Outlet semantic class (Query vs Action — §5.4.2). Selects the UCAN
+    /// capability stem required to invoke the outlet. Surfaced as a required
+    /// field on the Swift/Kotlin SDK `OutletDefinition`.
+    pub kind: OutletKind,
     /// JSON Schema for outlet input (as a JSON string).
     pub input_schema_json: String,
     /// JSON Schema for outlet output (as a JSON string).
@@ -3963,6 +3993,7 @@ fn validate_outlet_ucan_uniffi(
     bi: &Arc<crate::runtime::UniffiBridgeInstance>,
     handle: &ContextHandle,
     outlet_id: &str,
+    kind: scp_core::context::outlets::OutletKind,
     ucan_token: &str,
     identity_did: &str,
     proof_tokens: Option<&Vec<String>>,
@@ -4021,7 +4052,7 @@ fn validate_outlet_ucan_uniffi(
             caveat_resolver: &scp_core::crypto::ucan::validate::TokenNbCaveatResolver,
         };
 
-        validate_outlet_invocation_ucan(ucan_token, &handle.context_id, outlet_id, &mut ctx)
+        validate_outlet_invocation_ucan(ucan_token, &handle.context_id, outlet_id, kind, &mut ctx)
             .map_err(|e| ScpError::Permission {
                 msg: format!("UCAN authorization failed for outlet '{outlet_id}': {e}"),
                 code: codes::PERM_3002.to_owned(),
@@ -4566,17 +4597,22 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
             }
             let proof_resolver = scp_ffi_common::BridgeProofResolver { proofs };
 
-            // Ensure UCAN state is registered for this context.
-            // Scope the DashMap Ref so the shard lock is released before
-            // entering with_ucan_state (which uses a different DashMap).
-            {
+            // Ensure UCAN state is registered for this context, and read the
+            // outlet's registered kind so the UCAN check selects the correct
+            // split stem (SCP-OUT-014). Scope the DashMap Ref so the shard lock
+            // is released before entering with_ucan_state (a different DashMap).
+            let outlet_kind_for_ucan = {
                 let handle = context_handle_registry(&bi)
                     .get(context_id)
                     .ok_or_else(|| {
                         format!("context '{context_id}' not found in handle registry")
                     })?;
                 bi.ensure_ucan_registered(context_id, &handle.creator_did, &handle.ceiling_strings);
-            }
+                let registry = handle.outlet_registry.blocking_lock();
+                registry.get(outlet_name).map(|r| r.kind).ok_or_else(|| {
+                    format!("outlet '{outlet_name}' not registered in context '{context_id}'")
+                })?
+            };
 
             let agent_did = self.agent_did.clone();
             bi.with_ucan_state(context_id, |ucan_state| {
@@ -4613,6 +4649,7 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
                     token,
                     context_id,
                     outlet_name,
+                    outlet_kind_for_ucan,
                     &mut ctx,
                 )
                 .map_err(|e| {
@@ -12730,7 +12767,9 @@ impl Scp {
 
                 let core_registration = scp_core::context::outlets::OutletRegistration {
                     outlet_id: outlet_id.clone(),
-                    kind: scp_core::context::outlets::OutletKind::default(),
+                    // §5.4.2: caller-supplied semantic class selects the
+                    // invocation capability stem (`outlet_query:` vs `outlet_call:`).
+                    kind: definition.kind.into(),
                     name: definition.name,
                     description: definition.description,
                     schema: scp_core::context::outlets::OutletSchema {
@@ -12838,6 +12877,23 @@ impl Scp {
                 }
                 drop(state);
 
+                // SCP-OUT-014: select the split capability stem from the
+                // outlet's registered kind — `outlet_query:{id}` for Query
+                // outlets, `outlet_call:{id}` for Action outlets.
+                let outlet_kind_for_ucan = {
+                    let registry = handle.outlet_registry.lock().await;
+                    registry
+                        .get(&outlet_id)
+                        .map(|r| r.kind)
+                        .ok_or_else(|| ScpError::Outlet {
+                            msg: format!(
+                                "outlet '{outlet_id}' not registered in context '{}'",
+                                handle.context_id
+                            ),
+                            code: codes::OUTLET_6002.to_owned(),
+                        })?
+                };
+
                 // Primary authorization: UCAN token validation via the full
                 // 11-step ADR-016 pipeline. Bridge-owned because the proof
                 // resolver, revocation list, and nonce tracker live in the
@@ -12846,6 +12902,7 @@ impl Scp {
                     &bi,
                     &handle,
                     &outlet_id,
+                    outlet_kind_for_ucan,
                     &ucan_token,
                     &identity.did,
                     proof_tokens.as_ref(),
@@ -13071,6 +13128,23 @@ impl Scp {
                     });
                 }
 
+                // SCP-OUT-014: select the split stem from the TARGET-side
+                // registered kind — the outlet being invoked lives in the
+                // target context.
+                let outlet_kind_for_ucan = {
+                    let registry = target_handle.outlet_registry.lock().await;
+                    registry
+                        .get(&outlet_id)
+                        .map(|r| r.kind)
+                        .ok_or_else(|| ScpError::Outlet {
+                            msg: format!(
+                                "outlet '{outlet_id}' not registered in target context '{}'",
+                                target_handle.context_id
+                            ),
+                            code: codes::OUTLET_6002.to_owned(),
+                        })?
+                };
+
                 // Primary authorization: UCAN token validation via the full 11-step
                 // ADR-016 pipeline against the TARGET context's ceiling.
                 // See spec §6.2, §8, ADR-016, and issue #319.
@@ -13078,6 +13152,7 @@ impl Scp {
                     &bi,
                     &target_handle,
                     &outlet_id,
+                    outlet_kind_for_ucan,
                     &ucan_token,
                     &identity.did,
                     proof_tokens.as_ref(),
@@ -13517,12 +13592,29 @@ impl Scp {
                     session.outlet_id.clone()
                 };
 
+                // SCP-OUT-014: select the split capability stem from the
+                // session outlet's registered kind.
+                let outlet_kind_for_ucan = {
+                    let registry = handle.outlet_registry.lock().await;
+                    registry
+                        .get(&outlet_id_for_ucan)
+                        .map(|r| r.kind)
+                        .ok_or_else(|| ScpError::Outlet {
+                            msg: format!(
+                                "outlet '{outlet_id_for_ucan}' not registered in context '{}'",
+                                handle.context_id
+                            ),
+                            code: codes::OUTLET_6002.to_owned(),
+                        })?
+                };
+
                 // Primary authorization: UCAN token validation via the full 11-step
                 // ADR-016 pipeline. See spec §6.2, §8, ADR-016, and issue #319.
                 validate_outlet_ucan_uniffi(
                     &bi,
                     &handle,
                     &outlet_id_for_ucan,
+                    outlet_kind_for_ucan,
                     &ucan_token,
                     &identity.did,
                     proof_tokens.as_ref(),
@@ -20055,6 +20147,7 @@ mod tests {
         let def = OutletDefinition {
             name: "test-outlet".to_owned(),
             description: "desc".to_owned(),
+            kind: OutletKind::Action,
             input_schema_json: "not valid json{{{".to_owned(),
             output_schema_json: r#"{"type": "object"}"#.to_owned(),
             test_vectors_json: None,
@@ -20086,6 +20179,7 @@ mod tests {
         let def = OutletDefinition {
             name: "test-outlet".to_owned(),
             description: "desc".to_owned(),
+            kind: OutletKind::Action,
             input_schema_json: r#"{"type": "object"}"#.to_owned(),
             output_schema_json: "{broken".to_owned(),
             test_vectors_json: None,
@@ -20119,6 +20213,7 @@ mod tests {
         let def = OutletDefinition {
             name: "test-outlet".to_owned(),
             description: "desc".to_owned(),
+            kind: OutletKind::Action,
             input_schema_json: r#""a string""#.to_owned(),
             output_schema_json: r#"{"type": "object"}"#.to_owned(),
             test_vectors_json: None,
@@ -20154,6 +20249,7 @@ mod tests {
         let def = OutletDefinition {
             name: "test-outlet".to_owned(),
             description: "desc".to_owned(),
+            kind: OutletKind::Action,
             input_schema_json: r#"{"type": "object"}"#.to_owned(),
             output_schema_json: "[1, 2, 3]".to_owned(),
             test_vectors_json: None,
@@ -20191,6 +20287,7 @@ mod tests {
         let def = OutletDefinition {
             name: "test-outlet".to_owned(),
             description: "desc".to_owned(),
+            kind: OutletKind::Action,
             input_schema_json: r#"{"type": "object"}"#.to_owned(),
             output_schema_json: r#"{"type": "object"}"#.to_owned(),
             test_vectors_json: Some(r#"{"not": "an array"}"#.to_owned()),
@@ -20223,6 +20320,7 @@ mod tests {
         let def = OutletDefinition {
             name: "test-outlet".to_owned(),
             description: "desc".to_owned(),
+            kind: OutletKind::Action,
             input_schema_json: r#"{"type": "object"}"#.to_owned(),
             output_schema_json: r#"{"type": "object"}"#.to_owned(),
             test_vectors_json: Some(r#"[{"bad": "entry"}]"#.to_owned()),
@@ -20252,6 +20350,7 @@ mod tests {
         let def = OutletDefinition {
             name: "test-outlet".to_owned(),
             description: "desc".to_owned(),
+            kind: OutletKind::Action,
             input_schema_json: r#"{"type": "object"}"#.to_owned(),
             output_schema_json: r#"{"type": "object"}"#.to_owned(),
             test_vectors_json: None,
@@ -20287,6 +20386,7 @@ mod tests {
         let def = OutletDefinition {
             name: "test-outlet".to_owned(),
             description: "desc".to_owned(),
+            kind: OutletKind::Action,
             input_schema_json: r#"{"type": "object"}"#.to_owned(),
             output_schema_json: r#"{"type": "object"}"#.to_owned(),
             test_vectors_json: None,
@@ -20423,6 +20523,7 @@ mod tests {
         let def = OutletDefinition {
             name: "timestamp-probe".to_owned(),
             description: "probes registered_at value".to_owned(),
+            kind: OutletKind::Action,
             input_schema_json:
                 r#"{"type":"object","properties":{"a":{"type":"string"},"b":{"type":"number"}}}"#
                     .to_owned(),
@@ -20448,6 +20549,45 @@ mod tests {
              milliseconds would be ~1.7 trillion, hardcoded 0 would fail lower bound",
             reg.registered_at
         );
+    }
+
+    /// SCP-OUT-014: a `Query`-kind definition round-trips through the `UniFFI`
+    /// bridge — the stored `OutletRegistration.kind` reflects the caller-
+    /// supplied kind, which the invocation gate and UCAN stem selection read.
+    #[tokio::test]
+    async fn register_query_outlet_round_trips_kind() {
+        let scp = scp_test();
+        let handle = test_handle_for(&scp);
+        let def = OutletDefinition {
+            name: "query-probe".to_owned(),
+            description: "probes kind round-trip".to_owned(),
+            kind: OutletKind::Query,
+            input_schema_json:
+                r#"{"type":"object","properties":{"a":{"type":"string"},"b":{"type":"number"}}}"#
+                    .to_owned(),
+            output_schema_json: r#"{"type":"object"}"#.to_owned(),
+            test_vectors_json: None,
+            implementation_hash: None,
+            operator_did: "did:dht:z6MkTestUser".to_owned(),
+            cost: None,
+        };
+
+        let outlet_id = scp
+            .outlet_register(handle.clone(), def)
+            .await
+            .expect("outlet_register should succeed");
+
+        let registry = handle.outlet_registry.lock().await;
+        let reg = registry.get(&outlet_id).expect("registered");
+        assert_eq!(reg.kind, scp_core::context::outlets::OutletKind::Query);
+    }
+
+    /// The `UniFFI` `OutletKind` → core `OutletKind` mapping is exact.
+    #[test]
+    fn uniffi_outlet_kind_maps_to_core() {
+        use scp_core::context::outlets::OutletKind as CoreKind;
+        assert_eq!(CoreKind::from(OutletKind::Query), CoreKind::Query);
+        assert_eq!(CoreKind::from(OutletKind::Action), CoreKind::Action);
     }
 
     // -----------------------------------------------------------------------
@@ -23389,6 +23529,7 @@ mod tests {
             let definition = OutletDefinition {
                 name: outlet_name.to_owned(),
                 description: format!("Outlet: {outlet_name}"),
+                kind: OutletKind::Action,
                 input_schema_json: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -23566,6 +23707,7 @@ mod tests {
             let definition = OutletDefinition {
                 name: outlet_name.to_owned(),
                 description: format!("Outlet: {outlet_name}"),
+                kind: OutletKind::Action,
                 input_schema_json: serde_json::json!({
                     "type": "object",
                     "properties": {

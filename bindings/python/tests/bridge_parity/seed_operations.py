@@ -612,6 +612,7 @@ def _py_outlet_register(ctx: OpContext) -> dict[str, Any]:
         {
             "name": _OUTLET_NAME,
             "description": "parity harness probe outlet",
+            "kind": "action",
             "operator_did": identity.did,
             "schema": _OUTLET_SCHEMA,
         },
@@ -627,6 +628,7 @@ OP_OUTLET_REGISTER = OpSpec(
         "args": {
             "name": _OUTLET_NAME,
             "description": "parity harness probe outlet",
+            "kind": "action",
             "schema": _OUTLET_SCHEMA,
             "ceiling": _OUTLET_CEILING,
         },

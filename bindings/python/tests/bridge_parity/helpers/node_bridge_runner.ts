@@ -573,6 +573,10 @@ async function opOutletRegister(
   const outletId = await scp.outletRegister(handle, {
     name: PARITY_OUTLET_NAME,
     description: "parity harness probe outlet",
+    // Action = the historical default; keeps the deterministic outlet_id and
+    // UCAN-stem preimage identical to pre-`kind` parity fixtures. Override via
+    // the op payload to exercise Query outlets.
+    kind: (req.args.kind as "query" | "action") ?? "action",
     inputSchemaJson: JSON.stringify(PARITY_OUTLET_SCHEMA.input),
     outputSchemaJson: JSON.stringify(PARITY_OUTLET_SCHEMA.output),
     operatorDid: identity.did,

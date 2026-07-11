@@ -1293,6 +1293,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       name: string;
       description: string;
       operator: string;
+      kind?: "query" | "action";
       input?: Record<string, unknown>;
       output?: Record<string, unknown>;
     }): Record<string, unknown> {
@@ -1305,6 +1306,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       return {
         name: args.name,
         description: args.description,
+        kind: args.kind ?? "action",
         inputSchemaJson: JSON.stringify(
           args.input ?? {
             type: "object",

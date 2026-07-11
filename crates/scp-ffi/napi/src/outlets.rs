@@ -30,6 +30,18 @@ fn validate_ucan_for_outlet(
     proof_resolver: &scp_ffi_common::BridgeProofResolver,
 ) -> Result<(), ScpNapiError> {
     crate::runtime::with_context(bi, context_id, |rt| {
+        // SCP-OUT-014: select the split capability stem from the outlet's
+        // registered kind — `outlet_query:{id}` for Query outlets,
+        // `outlet_call:{id}` for Action outlets.
+        let outlet_kind_for_ucan = rt
+            .outlet_registry
+            .get(outlet_id)
+            .map(|r| r.kind)
+            .ok_or_else(|| ScpNapiError::Permission {
+                message: format!("outlet '{outlet_id}' not registered in context '{context_id}'"),
+                code: codes::PERM_3001.to_owned(),
+            })?;
+
         let production_resolver = crate::runtime::did_resolver(bi);
         let did_resolver = scp_ffi_common::DispatchDidResolver::new(
             production_resolver.map(std::convert::AsRef::as_ref),
@@ -61,13 +73,48 @@ fn validate_ucan_for_outlet(
         };
 
         scp_core::context::outlets::validate_outlet_invocation_ucan(
-            ucan_token, context_id, outlet_id, &mut ctx,
+            ucan_token,
+            context_id,
+            outlet_id,
+            outlet_kind_for_ucan,
+            &mut ctx,
         )
         .map_err(|e| ScpNapiError::Permission {
             message: format!("UCAN authorization failed for outlet '{outlet_id}': {e}"),
             code: codes::PERM_3001.to_owned(),
         })
     })
+}
+
+// ---------------------------------------------------------------------------
+// NapiOutletKind — outlet semantic class (Query vs Action) — §5.4.2
+// ---------------------------------------------------------------------------
+
+/// Outlet semantic class (§5.4.2).
+///
+/// Crosses the NAPI boundary as the lowercase string `"query"` / `"action"`,
+/// matching the §5.4.2 wire vocabulary used by the spec, the canonical
+/// preimage, and every other bridge. Surfaced to TypeScript as `OutletKind`.
+///
+/// - `Query` — read-only, idempotent. UCAN stem `outlet_query:{id}`.
+/// - `Action` — may mutate state. UCAN stem `outlet_call:{id}`. §5.4.2
+///   fail-safe default.
+#[napi(string_enum = "lowercase", js_name = "OutletKind")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NapiOutletKind {
+    /// Read-only, idempotent. UCAN stem `outlet_query:{id}`.
+    Query,
+    /// May mutate state. UCAN stem `outlet_call:{id}`. §5.4.2 fail-safe default.
+    Action,
+}
+
+impl From<NapiOutletKind> for scp_core::context::outlets::OutletKind {
+    fn from(k: NapiOutletKind) -> Self {
+        match k {
+            NapiOutletKind::Query => Self::Query,
+            NapiOutletKind::Action => Self::Action,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -83,6 +130,10 @@ pub struct NapiOutletDefinition {
     pub name: String,
     /// Outlet description.
     pub description: String,
+    /// Outlet semantic class (Query vs Action — §5.4.2). Selects the UCAN
+    /// capability stem required to invoke the outlet. Surfaced as a required
+    /// field on the TypeScript SDK's `OutletDefinition`.
+    pub kind: NapiOutletKind,
     /// JSON Schema for outlet input (as a JSON string).
     pub input_schema_json: String,
     /// JSON Schema for outlet output (as a JSON string).
@@ -252,7 +303,9 @@ pub(crate) async fn outlet_register_on(
 
     let core_registration = scp_core::context::outlets::OutletRegistration {
         outlet_id,
-        kind: scp_core::context::outlets::OutletKind::default(),
+        // §5.4.2: the caller-supplied semantic class selects the invocation
+        // capability stem (`outlet_query:` vs `outlet_call:`).
+        kind: definition.kind.into(),
         name: definition.name,
         description: definition.description,
         schema: scp_core::context::outlets::OutletSchema {
@@ -1608,6 +1661,7 @@ mod tests {
         let definition = NapiOutletDefinition {
             name: "napi-timestamp-probe".to_owned(),
             description: "probes registered_at value".to_owned(),
+            kind: NapiOutletKind::Action,
             input_schema_json:
                 r#"{"type":"object","properties":{"a":{"type":"string"},"b":{"type":"number"}}}"#
                     .to_owned(),
@@ -1640,6 +1694,53 @@ mod tests {
 
         // Clean up global state.
         crate::runtime::remove_context(&bi, &ctx_id);
+    }
+
+    /// SCP-OUT-014: a `Query`-kind definition round-trips through the bridge —
+    /// the stored `OutletRegistration.kind` reflects the caller-supplied kind,
+    /// which is what the invocation gate and UCAN stem selection read back.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn register_query_outlet_round_trips_kind() {
+        use crate::context::NapiContextHandle;
+
+        let bi = std::sync::Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
+        let ctx_id = format!("ctx-napi-kind-test-{}", std::process::id());
+        let creator_did = "did:dht:z6MkNapiKindTest";
+        let handle = NapiContextHandle::test_active_on(&bi, ctx_id.clone(), creator_did.to_owned());
+
+        let definition = NapiOutletDefinition {
+            name: "napi-query-probe".to_owned(),
+            description: "probes kind round-trip".to_owned(),
+            kind: NapiOutletKind::Query,
+            input_schema_json:
+                r#"{"type":"object","properties":{"a":{"type":"string"},"b":{"type":"number"}}}"#
+                    .to_owned(),
+            output_schema_json: r#"{"type":"object"}"#.to_owned(),
+            test_vectors_json: None,
+            implementation_hash: None,
+            operator_did: creator_did.to_owned(),
+            cost: None,
+        };
+
+        let outlet_id = outlet_register_on(&bi, &handle, definition)
+            .await
+            .expect("outlet_register should succeed");
+
+        let kind = crate::runtime::with_context(&bi, &ctx_id, |rt| {
+            Ok(rt.outlet_registry.get(&outlet_id).expect("registered").kind)
+        })
+        .unwrap();
+        assert_eq!(kind, scp_core::context::outlets::OutletKind::Query);
+
+        crate::runtime::remove_context(&bi, &ctx_id);
+    }
+
+    /// The `NapiOutletKind` → core `OutletKind` mapping is exact.
+    #[test]
+    fn napi_outlet_kind_maps_to_core() {
+        use scp_core::context::outlets::OutletKind;
+        assert_eq!(OutletKind::from(NapiOutletKind::Query), OutletKind::Query);
+        assert_eq!(OutletKind::from(NapiOutletKind::Action), OutletKind::Action);
     }
 
     // ------------------------------------------------------------------
@@ -1914,6 +2015,7 @@ mod tests {
             NapiOutletDefinition {
             name: outlet_name.to_owned(),
             description: format!("Outlet: {outlet_name}"),
+            kind: NapiOutletKind::Action,
             input_schema_json:
                 r#"{"type":"object","properties":{"a":{"type":"string"},"b":{"type":"string"}}}"#
                     .to_owned(),

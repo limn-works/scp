@@ -255,17 +255,20 @@ where
             current_state: state.to_string(),
         });
     }
-    if !has_outlet_call_capability(role_state, invoker_did, outlet_id) {
-        return Err(InvocationError::InvokerNotAuthorized {
-            did: invoker_did.to_string(),
-            outlet_id: outlet_id.to_owned(),
-        });
-    }
+    // SCP-OUT-014: resolve the registration first so the capability check can
+    // branch on the outlet's registered kind — Query outlets require the
+    // `outlet_query` stem, Action outlets require `outlet_call`.
     let registration = registry
         .get(outlet_id)
         .ok_or_else(|| InvocationError::OutletNotFound {
             outlet_id: outlet_id.to_owned(),
         })?;
+    if !has_outlet_invocation_capability(role_state, invoker_did, outlet_id, registration.kind) {
+        return Err(InvocationError::InvokerNotAuthorized {
+            did: invoker_did.to_string(),
+            outlet_id: outlet_id.to_owned(),
+        });
+    }
     validate_value_against_schema(&input, &registration.schema.input_schema)
         .map_err(|msg| InvocationError::InputValidationFailed { message: msg })?;
 
@@ -445,20 +448,23 @@ where
         });
     }
 
-    // 2. Validate invoker has OutletCall(outlet_id) or OutletCallAll capability.
-    if !has_outlet_call_capability(role_state, invoker_did, outlet_id) {
-        return Err(InvocationError::InvokerNotAuthorized {
-            did: invoker_did.to_string(),
-            outlet_id: outlet_id.to_owned(),
-        });
-    }
-
-    // 3. Look up the tool in the registry.
+    // 2. Look up the tool in the registry first, so the capability check can
+    //    branch on the outlet's registered kind (SCP-OUT-014).
     let registration = registry
         .get(outlet_id)
         .ok_or_else(|| InvocationError::OutletNotFound {
             outlet_id: outlet_id.to_owned(),
         })?;
+
+    // 3. Validate invoker holds the kind-appropriate split capability —
+    //    OutletQuery(outlet_id)/OutletQueryAll for Query outlets,
+    //    OutletCall(outlet_id)/OutletCallAll for Action outlets (§5.4.2).
+    if !has_outlet_invocation_capability(role_state, invoker_did, outlet_id, registration.kind) {
+        return Err(InvocationError::InvokerNotAuthorized {
+            did: invoker_did.to_string(),
+            outlet_id: outlet_id.to_owned(),
+        });
+    }
 
     // 4. Validate input against the tool's input schema.
     validate_value_against_schema(&input, &registration.schema.input_schema)
@@ -681,17 +687,20 @@ where
             current_state: state.to_string(),
         });
     }
-    if !has_outlet_call_capability(role_state, invoker_did, outlet_id) {
-        return Err(InvocationError::InvokerNotAuthorized {
-            did: invoker_did.to_string(),
-            outlet_id: outlet_id.to_owned(),
-        });
-    }
+    // SCP-OUT-014: resolve the registration first so the capability check can
+    // branch on the outlet's registered kind — Query outlets require the
+    // `outlet_query` stem, Action outlets require `outlet_call`.
     let registration = registry
         .get(outlet_id)
         .ok_or_else(|| InvocationError::OutletNotFound {
             outlet_id: outlet_id.to_owned(),
         })?;
+    if !has_outlet_invocation_capability(role_state, invoker_did, outlet_id, registration.kind) {
+        return Err(InvocationError::InvokerNotAuthorized {
+            did: invoker_did.to_string(),
+            outlet_id: outlet_id.to_owned(),
+        });
+    }
     validate_value_against_schema(&input, &registration.schema.input_schema)
         .map_err(|msg| InvocationError::InputValidationFailed { message: msg })?;
 
@@ -1121,6 +1130,43 @@ pub fn has_outlet_call_capability(
     scp_protocol::context::outlets::has_outlet_call_capability(role_state, did, outlet_id)
 }
 
+/// Checks whether a member has the `OutletQuery(outlet_id)` or `OutletQueryAll`
+/// capability (Query outlets — SCP-OUT-014, spec §5.4.2).
+///
+/// Mirror of [`has_outlet_call_capability`] for the Query-class stem. Thin
+/// wrapper delegating to the single source of truth in
+/// [`scp_protocol::context::outlets::has_outlet_query_capability`] so runtime
+/// and protocol layers cannot drift.
+#[must_use]
+pub fn has_outlet_query_capability(
+    role_state: &ContextRoleState,
+    did: &str,
+    outlet_id: &str,
+) -> bool {
+    scp_protocol::context::outlets::has_outlet_query_capability(role_state, did, outlet_id)
+}
+
+/// Checks whether a member holds the kind-appropriate split capability for
+/// invoking an outlet.
+///
+/// Selects between [`has_outlet_call_capability`] (Action) and
+/// [`has_outlet_query_capability`] (Query) based on the outlet's registered
+/// [`scp_protocol::context::outlets::OutletKind`]. Per spec §5.4.2 the two
+/// stems are independent — `OutletQueryAll` must not authorize an Action call
+/// and vice versa. This is the defense-in-depth role-state gate that mirrors
+/// the primary UCAN stem selection in [`validate_outlet_invocation_ucan`].
+#[must_use]
+pub fn has_outlet_invocation_capability(
+    role_state: &ContextRoleState,
+    did: &str,
+    outlet_id: &str,
+    kind: scp_protocol::context::outlets::OutletKind,
+) -> bool {
+    scp_protocol::context::outlets::has_outlet_invocation_capability(
+        role_state, did, outlet_id, kind,
+    )
+}
+
 // ---------------------------------------------------------------------------
 // UCAN validation at tool invocation boundary (#319)
 // ---------------------------------------------------------------------------
@@ -1128,17 +1174,24 @@ pub fn has_outlet_call_capability(
 /// Validates a UCAN token for tool invocation authorization.
 ///
 /// Parses the encoded JWT token and runs the full 11-step ADR-016 validation
-/// pipeline, requiring `outlet_call:{outlet_name}` or `outlet_call:*` capability
-/// scoped to the given context.
+/// pipeline. The required capability stem is selected from the outlet's
+/// registered [`scp_protocol::context::outlets::OutletKind`] (SCP-OUT-014):
+/// `outlet_query:{outlet_id}` / `outlet_query:*` for Query outlets and
+/// `outlet_call:{outlet_id}` / `outlet_call:*` for Action outlets. The two
+/// stems are independent, so a cross-class delegation (e.g. parent
+/// `outlet_query:*` → child `outlet_call:x`) is rejected automatically because
+/// the `CapabilityUri` `resource` strings differ.
 ///
 /// This is the primary authorization gate for tool invocations. Role-based
-/// `has_outlet_call_capability` remains as defense-in-depth.
+/// `has_outlet_invocation_capability` remains as defense-in-depth.
 ///
 /// # Arguments
 ///
 /// * `encoded_token` — JWT-encoded UCAN token.
 /// * `context_id` — The context ID the tool belongs to.
 /// * `outlet_name` — The name of the tool being invoked.
+/// * `kind` — The outlet's registered [`scp_protocol::context::outlets::OutletKind`],
+///   which selects the required capability stem.
 /// * `ctx` — The validation context with resolvers, trackers, and ceiling.
 ///
 /// # Errors
@@ -1146,11 +1199,12 @@ pub fn has_outlet_call_capability(
 /// Returns [`UcanError`] if the token is malformed, expired, revoked, lacks
 /// the required capability, or fails any of the 11 validation steps.
 ///
-/// See spec §6.2, §8, ADR-016, and issue #319.
+/// See spec §6.2, §8, §5.4.2, ADR-016, and issue #319.
 pub fn validate_outlet_invocation_ucan<D, N, R, P, S>(
     encoded_token: &str,
     context_id: &str,
     outlet_name: &str,
+    kind: scp_protocol::context::outlets::OutletKind,
     ctx: &mut ValidationContext<'_, D, N, R, P, S>,
 ) -> Result<(), UcanError>
 where
@@ -1161,7 +1215,17 @@ where
     S: BuildHasher,
 {
     let parsed = parse_ucan(encoded_token)?;
-    let required_cap = CapabilityUri::new(context_id, "outlet_call", outlet_name);
+    // SCP-OUT-014: pick the split stem from the outlet's registered kind.
+    // Query outlets require `outlet_query:{id}` (or wildcard `outlet_query:*`);
+    // Action outlets require `outlet_call:{id}` (or wildcard `outlet_call:*`).
+    // Cross-class delegations (parent `outlet_query:*` → child `outlet_call:x`)
+    // are rejected automatically by `CapabilityUri::matches` because the
+    // `resource` strings differ.
+    let resource = match kind {
+        scp_protocol::context::outlets::OutletKind::Query => "outlet_query",
+        scp_protocol::context::outlets::OutletKind::Action => "outlet_call",
+    };
+    let required_cap = CapabilityUri::new(context_id, resource, outlet_name);
     validate_ucan(&parsed, &required_cap, ctx)
 }
 
@@ -1265,6 +1329,50 @@ mod tests {
             signature: Vec::new(),
         };
         register_outlet(&mut registry, role_state, registration, registrant_did).unwrap();
+        registry
+    }
+
+    /// Registers a `calculator` outlet with the given [`OutletKind`] in a fresh
+    /// registry — used to prove the kind round-trips and gates invocation.
+    fn setup_registry_with_kind(
+        role_state: &ContextRoleState,
+        registrant_did: &str,
+        kind: OutletKind,
+    ) -> OutletRegistry {
+        let mut registry = OutletRegistry::new();
+        let registration = OutletRegistration {
+            outlet_id: "calculator".to_owned(),
+            kind,
+            name: "Calculator".to_owned(),
+            description: "A simple calculator".to_owned(),
+            schema: OutletSchema {
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "a": {"type": "number"},
+                        "b": {"type": "number"}
+                    }
+                }),
+                output_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "result": {"type": "number"}
+                    }
+                }),
+                aggregate_schema: None,
+            },
+            implementation_hash: [0xAA; 32],
+            test_vectors: vec![],
+            operator_did: "did:dht:z6MkOperator".into(),
+            cost: None,
+            message_catalog: Vec::new(),
+            registered_at: 0,
+            signature: Vec::new(),
+        };
+        register_outlet(&mut registry, role_state, registration, registrant_did).unwrap();
+        // The registered kind must round-trip through the registry — this is
+        // what the invoke gate and the UCAN stem selection read back.
+        assert_eq!(registry.get("calculator").unwrap().kind, kind);
         registry
     }
 
@@ -1736,6 +1844,127 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // has_outlet_invocation_capability — kind-aware split-capability gate
+    // (SCP-OUT-014, spec §5.4.2). The two stems are INDEPENDENT: a Query
+    // outlet cannot be invoked with an Action (OutletCall) grant and vice
+    // versa. This is the defense-in-depth mirror of the UCAN stem selection.
+    // -----------------------------------------------------------------------
+
+    /// A Query outlet requires `OutletQuery` — an `OutletCall` grant (Action
+    /// class) does NOT authorize it.
+    #[test]
+    fn query_outlet_denies_call_capability_allows_query_capability() {
+        let creator = "did:dht:z6MkCreator";
+        let member = "did:dht:z6MkMember";
+        let mut role_state = test_role_state_with_no_invoke_member(creator, member);
+        // Member holds ONLY the Action-class OutletCall grant.
+        role_state
+            .member_capabilities
+            .get_mut(member)
+            .unwrap()
+            .insert(Capability::OutletCall("calculator".to_owned()));
+        assert!(
+            !has_outlet_invocation_capability(&role_state, member, "calculator", OutletKind::Query),
+            "OutletCall must NOT authorize a Query-class invocation"
+        );
+        // Granting the Query-class capability authorizes it.
+        role_state
+            .member_capabilities
+            .get_mut(member)
+            .unwrap()
+            .insert(Capability::OutletQuery("calculator".to_owned()));
+        assert!(
+            has_outlet_invocation_capability(&role_state, member, "calculator", OutletKind::Query),
+            "OutletQuery must authorize a Query-class invocation"
+        );
+    }
+
+    /// An Action outlet requires `OutletCall` — an `OutletQuery` grant (Query
+    /// class) does NOT authorize it.
+    #[test]
+    fn action_outlet_denies_query_capability_allows_call_capability() {
+        let creator = "did:dht:z6MkCreator";
+        let member = "did:dht:z6MkMember";
+        let mut role_state = test_role_state_with_no_invoke_member(creator, member);
+        // Member holds ONLY the Query-class OutletQuery grant.
+        role_state
+            .member_capabilities
+            .get_mut(member)
+            .unwrap()
+            .insert(Capability::OutletQuery("calculator".to_owned()));
+        assert!(
+            !has_outlet_invocation_capability(
+                &role_state,
+                member,
+                "calculator",
+                OutletKind::Action
+            ),
+            "OutletQuery must NOT authorize an Action-class invocation"
+        );
+        role_state
+            .member_capabilities
+            .get_mut(member)
+            .unwrap()
+            .insert(Capability::OutletCall("calculator".to_owned()));
+        assert!(
+            has_outlet_invocation_capability(&role_state, member, "calculator", OutletKind::Action),
+            "OutletCall must authorize an Action-class invocation"
+        );
+    }
+
+    /// The wildcard grants are independent too: `OutletCallAll` authorizes any
+    /// Action but no Query; `OutletQueryAll` authorizes any Query but no Action.
+    #[test]
+    fn wildcard_call_and_query_grants_are_independent() {
+        let creator = "did:dht:z6MkCreator";
+        let member = "did:dht:z6MkMember";
+
+        let mut with_call_all = test_role_state_with_no_invoke_member(creator, member);
+        with_call_all
+            .member_capabilities
+            .get_mut(member)
+            .unwrap()
+            .insert(Capability::OutletCallAll);
+        assert!(has_outlet_invocation_capability(
+            &with_call_all,
+            member,
+            "anything",
+            OutletKind::Action
+        ));
+        assert!(
+            !has_outlet_invocation_capability(
+                &with_call_all,
+                member,
+                "anything",
+                OutletKind::Query
+            ),
+            "OutletCallAll must NOT authorize a Query invocation"
+        );
+
+        let mut with_query_all = test_role_state_with_no_invoke_member(creator, member);
+        with_query_all
+            .member_capabilities
+            .get_mut(member)
+            .unwrap()
+            .insert(Capability::OutletQueryAll);
+        assert!(has_outlet_invocation_capability(
+            &with_query_all,
+            member,
+            "anything",
+            OutletKind::Query
+        ));
+        assert!(
+            !has_outlet_invocation_capability(
+                &with_query_all,
+                member,
+                "anything",
+                OutletKind::Action
+            ),
+            "OutletQueryAll must NOT authorize an Action invocation"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // invoke_outlet: timeout is clamped to protocol maximum
     // -----------------------------------------------------------------------
 
@@ -1763,6 +1992,135 @@ mod tests {
         .await;
 
         assert!(result.is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // invoke_outlet: end-to-end query-capability gate (SCP-OUT-014). Proves the
+    // OutletQuery path actually works: a Query outlet is DENIED with only
+    // OutletCall and ALLOWED with OutletQuery. Symmetric guard for Action.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn invoke_query_outlet_denied_with_call_cap_allowed_with_query_cap() {
+        let creator = "did:dht:z6MkCreator";
+        let member = "did:dht:z6MkMember";
+
+        // Creator (admin) registers a QUERY-kind outlet; kind round-trips.
+        let mut role_state = test_role_state(creator);
+        role_state.members.insert(member.to_owned());
+        let registry = setup_registry_with_kind(&role_state, creator, OutletKind::Query);
+        let context = active_context();
+
+        // Member holds ONLY the Action-class OutletCall grant → DENIED, because
+        // the outlet is registered as Query and the two stems are independent.
+        role_state.member_capabilities.insert(
+            member.to_owned(),
+            std::iter::once(Capability::OutletCall("calculator".to_owned())).collect(),
+        );
+        let denied = invoke_outlet(
+            &context,
+            &registry,
+            &role_state,
+            &"calculator".to_owned(),
+            serde_json::json!({"a": 1, "b": 2}),
+            &DID::from(member),
+            None,
+            add_executor,
+            None::<&mut OutletEconomyContext<'_>>,
+        )
+        .await;
+        assert!(
+            matches!(
+                denied.unwrap_err(),
+                InvocationError::InvokerNotAuthorized { .. }
+            ),
+            "Query outlet must be denied to a member holding only OutletCall"
+        );
+
+        // Grant the Query-class capability → ALLOWED.
+        role_state
+            .member_capabilities
+            .get_mut(member)
+            .unwrap()
+            .insert(Capability::OutletQuery("calculator".to_owned()));
+        let allowed = invoke_outlet(
+            &context,
+            &registry,
+            &role_state,
+            &"calculator".to_owned(),
+            serde_json::json!({"a": 1, "b": 2}),
+            &DID::from(member),
+            None,
+            add_executor,
+            None::<&mut OutletEconomyContext<'_>>,
+        )
+        .await;
+        assert!(
+            allowed.is_ok(),
+            "Query outlet must be allowed once the member holds OutletQuery: {:?}",
+            allowed.err()
+        );
+    }
+
+    #[tokio::test]
+    async fn invoke_action_outlet_denied_with_query_cap_allowed_with_call_cap() {
+        let creator = "did:dht:z6MkCreator";
+        let member = "did:dht:z6MkMember";
+
+        let mut role_state = test_role_state(creator);
+        role_state.members.insert(member.to_owned());
+        // ACTION-kind outlet.
+        let registry = setup_registry_with_kind(&role_state, creator, OutletKind::Action);
+        let context = active_context();
+
+        // Member holds ONLY the Query-class grant → DENIED for an Action outlet.
+        role_state.member_capabilities.insert(
+            member.to_owned(),
+            std::iter::once(Capability::OutletQuery("calculator".to_owned())).collect(),
+        );
+        let denied = invoke_outlet(
+            &context,
+            &registry,
+            &role_state,
+            &"calculator".to_owned(),
+            serde_json::json!({"a": 1, "b": 2}),
+            &DID::from(member),
+            None,
+            add_executor,
+            None::<&mut OutletEconomyContext<'_>>,
+        )
+        .await;
+        assert!(
+            matches!(
+                denied.unwrap_err(),
+                InvocationError::InvokerNotAuthorized { .. }
+            ),
+            "Action outlet must be denied to a member holding only OutletQuery"
+        );
+
+        // Grant the Action-class capability → ALLOWED.
+        role_state
+            .member_capabilities
+            .get_mut(member)
+            .unwrap()
+            .insert(Capability::OutletCall("calculator".to_owned()));
+        let allowed = invoke_outlet(
+            &context,
+            &registry,
+            &role_state,
+            &"calculator".to_owned(),
+            serde_json::json!({"a": 1, "b": 2}),
+            &DID::from(member),
+            None,
+            add_executor,
+            None::<&mut OutletEconomyContext<'_>>,
+        )
+        .await;
+        assert!(
+            allowed.is_ok(),
+            "Action outlet must be allowed once the member holds OutletCall: {:?}",
+            allowed.err()
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1865,10 +2223,16 @@ mod tests {
             clock: &scp_clock::SystemClock,
         };
 
-        // validate_outlet_invocation_ucan expects outlet_call:calculator,
-        // but the token only has messages:write — must be rejected.
-        let result =
-            validate_outlet_invocation_ucan(&token.encoded, "ctx-test", "calculator", &mut ctx);
+        // validate_outlet_invocation_ucan expects outlet_call:calculator
+        // (Action kind), but the token only has messages:write — must be
+        // rejected.
+        let result = validate_outlet_invocation_ucan(
+            &token.encoded,
+            "ctx-test",
+            "calculator",
+            OutletKind::Action,
+            &mut ctx,
+        );
 
         assert!(
             result.is_err(),
@@ -1878,6 +2242,135 @@ mod tests {
         assert!(
             matches!(err, UcanError::CapabilityNotGranted(..)),
             "expected CapabilityNotGranted, got {err:?}"
+        );
+    }
+
+    /// SCP-OUT-014 primary gate: `validate_outlet_invocation_ucan` selects the
+    /// capability stem from the outlet's registered kind. A token carrying only
+    /// `outlet_call:calculator` must be REJECTED for a Query outlet and ACCEPTED
+    /// for an Action outlet; a token carrying only `outlet_query:calculator`
+    /// must be ACCEPTED for a Query outlet and REJECTED for an Action outlet.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // two token mints + four validation assertions
+    async fn validate_outlet_invocation_ucan_selects_stem_by_kind() {
+        use crate::crypto::ucan::mint::{MintParams, mint_ucan};
+        use scp_platform::testing::InMemoryKeyCustody;
+        use scp_platform::traits::{KeyCustody, KeyType};
+        use scp_protocol::crypto::ucan::validate::{
+            DEFAULT_CLOCK_SKEW_TOLERANCE_SECS, InMemoryDidResolver, InMemoryNonceTracker,
+            InMemoryProofResolver, InMemoryRevocationChecker, NoCaveatResolver, ValidationContext,
+        };
+
+        let custody = InMemoryKeyCustody::new();
+        let key_handle = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let pubkey = custody.public_key(&key_handle).await.unwrap();
+        let pk_bytes: [u8; 32] = pubkey.as_bytes().try_into().unwrap();
+        let issuer_did = format!("did:dht:z{}", zbase32::encode(pubkey.as_bytes()));
+
+        // Mint two tokens: one with the Action stem, one with the Query stem.
+        let call_caps = vec!["outlet_call:calculator".to_owned()];
+        let call_params = MintParams {
+            issuer_did: &issuer_did,
+            issuer_key: &key_handle,
+            audience_did: "did:dht:z6MkMember",
+            context_id: "ctx-test",
+            capabilities: &call_caps,
+            lifetime_secs: 3600,
+            not_before: None,
+            proofs: vec![],
+            facts: None,
+            key_scope: None,
+            signing_key_id: None,
+            ceiling: None,
+        };
+        let call_token = mint_ucan(&call_params, &custody, &scp_clock::SystemClock)
+            .await
+            .unwrap();
+
+        let query_caps = vec!["outlet_query:calculator".to_owned()];
+        let query_params = MintParams {
+            issuer_did: &issuer_did,
+            issuer_key: &key_handle,
+            audience_did: "did:dht:z6MkMember",
+            context_id: "ctx-test",
+            capabilities: &query_caps,
+            lifetime_secs: 3600,
+            not_before: None,
+            proofs: vec![],
+            facts: None,
+            key_scope: None,
+            signing_key_id: None,
+            ceiling: None,
+        };
+        let query_token = mint_ucan(&query_params, &custody, &scp_clock::SystemClock)
+            .await
+            .unwrap();
+
+        let ceiling: HashSet<String> = [
+            "outlet_call:calculator".to_owned(),
+            "outlet_query:calculator".to_owned(),
+        ]
+        .into_iter()
+        .collect();
+
+        // Helper that validates a token against a given outlet kind. A fresh
+        // nonce tracker per call avoids single-use nonce rejections.
+        let validate = |encoded: String, kind: OutletKind| {
+            let resolver = InMemoryDidResolver {
+                keys: std::iter::once((issuer_did.clone(), pk_bytes)).collect(),
+                kid_keys: std::collections::HashMap::new(),
+            };
+            let ceiling = ceiling.clone();
+            let issuer_did = issuer_did.clone();
+            async move {
+                let mut nonce_tracker = InMemoryNonceTracker::new();
+                let revocation_checker = InMemoryRevocationChecker::new();
+                let proof_resolver = InMemoryProofResolver::new();
+                let caveat_resolver = NoCaveatResolver;
+                let mut ctx = ValidationContext {
+                    did_resolver: &resolver,
+                    nonce_tracker: &mut nonce_tracker,
+                    revocation_checker: &revocation_checker,
+                    proof_resolver: &proof_resolver,
+                    caveat_resolver: &caveat_resolver,
+                    ceiling: &ceiling,
+                    context_creator_did: &issuer_did,
+                    presenting_agent_did: "did:dht:z6MkMember",
+                    clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+                    clock: &scp_clock::SystemClock,
+                };
+                validate_outlet_invocation_ucan(&encoded, "ctx-test", "calculator", kind, &mut ctx)
+            }
+        };
+
+        // Action token: accepted for Action, rejected for Query.
+        assert!(
+            validate(call_token.encoded.clone(), OutletKind::Action)
+                .await
+                .is_ok(),
+            "outlet_call token must satisfy an Action outlet"
+        );
+        assert!(
+            matches!(
+                validate(call_token.encoded.clone(), OutletKind::Query).await,
+                Err(UcanError::CapabilityNotGranted(..))
+            ),
+            "outlet_call token must NOT satisfy a Query outlet"
+        );
+
+        // Query token: accepted for Query, rejected for Action.
+        assert!(
+            validate(query_token.encoded.clone(), OutletKind::Query)
+                .await
+                .is_ok(),
+            "outlet_query token must satisfy a Query outlet"
+        );
+        assert!(
+            matches!(
+                validate(query_token.encoded.clone(), OutletKind::Action).await,
+                Err(UcanError::CapabilityNotGranted(..))
+            ),
+            "outlet_query token must NOT satisfy an Action outlet"
         );
     }
 

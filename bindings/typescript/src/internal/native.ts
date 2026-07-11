@@ -795,6 +795,7 @@ export function createNativeBridge(scp: SCP): Bridge {
       const napiDef = {
         name: definition.name,
         description: definition.description,
+        kind: definition.kind,
         inputSchemaJson: JSON.stringify(definition.inputSchema),
         outputSchemaJson: JSON.stringify(definition.outputSchema),
         operatorDid: definition.operator,

@@ -17,6 +17,7 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.putJsonArray
+import uniffi.scp.OutletKind
 import works.limn.scp.CustodyType
 import works.limn.scp.OutletDefinition
 import works.limn.scp.bridge.CoroutineBridge
@@ -29,6 +30,7 @@ fun outletInvocationExample(bridge: CoroutineBridge) = runBlocking {
     val weatherOutlet = OutletDefinition(
         name = "weather",
         description = "Get current weather for a city",
+        kind = OutletKind.ACTION,
         inputSchemaJson = """{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}""",
         outputSchemaJson = """{"type":"object","properties":{"tempC":{"type":"number"},"condition":{"type":"string"}}}""",
         operatorDid = "did:dht:z6MkOperator",

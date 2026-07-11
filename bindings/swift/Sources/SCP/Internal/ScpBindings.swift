@@ -10165,6 +10165,12 @@ public struct OutletDefinition {
      */
     public var description: String
     /**
+     * Outlet semantic class (Query vs Action — §5.4.2). Selects the UCAN
+     * capability stem required to invoke the outlet. Surfaced as a required
+     * field on the Swift/Kotlin SDK `OutletDefinition`.
+     */
+    public var kind: OutletKind
+    /**
      * JSON Schema for outlet input (as a JSON string).
      */
     public var inputSchemaJson: String
@@ -10199,6 +10205,11 @@ public struct OutletDefinition {
          * Outlet description.
          */description: String, 
         /**
+         * Outlet semantic class (Query vs Action — §5.4.2). Selects the UCAN
+         * capability stem required to invoke the outlet. Surfaced as a required
+         * field on the Swift/Kotlin SDK `OutletDefinition`.
+         */kind: OutletKind, 
+        /**
          * JSON Schema for outlet input (as a JSON string).
          */inputSchemaJson: String, 
         /**
@@ -10218,6 +10229,7 @@ public struct OutletDefinition {
          */cost: OutletCostDefinition?) {
         self.name = name
         self.description = description
+        self.kind = kind
         self.inputSchemaJson = inputSchemaJson
         self.outputSchemaJson = outputSchemaJson
         self.operatorDid = operatorDid
@@ -10238,6 +10250,9 @@ extension OutletDefinition: Equatable, Hashable {
             return false
         }
         if lhs.description != rhs.description {
+            return false
+        }
+        if lhs.kind != rhs.kind {
             return false
         }
         if lhs.inputSchemaJson != rhs.inputSchemaJson {
@@ -10264,6 +10279,7 @@ extension OutletDefinition: Equatable, Hashable {
     public func hash(into hasher: inout Hasher) {
         hasher.combine(name)
         hasher.combine(description)
+        hasher.combine(kind)
         hasher.combine(inputSchemaJson)
         hasher.combine(outputSchemaJson)
         hasher.combine(operatorDid)
@@ -10284,6 +10300,7 @@ public struct FfiConverterTypeOutletDefinition: FfiConverterRustBuffer {
             try OutletDefinition(
                 name: FfiConverterString.read(from: &buf), 
                 description: FfiConverterString.read(from: &buf), 
+                kind: FfiConverterTypeOutletKind.read(from: &buf), 
                 inputSchemaJson: FfiConverterString.read(from: &buf), 
                 outputSchemaJson: FfiConverterString.read(from: &buf), 
                 operatorDid: FfiConverterString.read(from: &buf), 
@@ -10296,6 +10313,7 @@ public struct FfiConverterTypeOutletDefinition: FfiConverterRustBuffer {
     public static func write(_ value: OutletDefinition, into buf: inout [UInt8]) {
         FfiConverterString.write(value.name, into: &buf)
         FfiConverterString.write(value.description, into: &buf)
+        FfiConverterTypeOutletKind.write(value.kind, into: &buf)
         FfiConverterString.write(value.inputSchemaJson, into: &buf)
         FfiConverterString.write(value.outputSchemaJson, into: &buf)
         FfiConverterString.write(value.operatorDid, into: &buf)
@@ -13053,6 +13071,93 @@ public func FfiConverterTypeMemoryScope_lower(_ value: MemoryScope) -> RustBuffe
 
 
 extension MemoryScope: Equatable, Hashable {}
+
+
+
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Outlet semantic class (§5.4.2).
+ *
+ * `Query` is read-only and idempotent (UCAN stem `outlet_query:{id}`);
+ * `Action` may mutate state (UCAN stem `outlet_call:{id}`). The registered
+ * kind selects which capability stem is required to invoke the outlet.
+ *
+ * Surfaced across the `UniFFI` bindings as `OutletKind`: Swift exposes it as
+ * an enum with `.query` / `.action` cases; Kotlin as an enum with `QUERY` /
+ * `ACTION` variants.
+ */
+
+public enum OutletKind {
+    
+    /**
+     * Read-only, idempotent. UCAN stem `outlet_query:{id}`.
+     */
+    case query
+    /**
+     * May mutate state. UCAN stem `outlet_call:{id}`. §5.4.2 fail-safe default.
+     */
+    case action
+}
+
+
+#if compiler(>=6)
+extension OutletKind: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeOutletKind: FfiConverterRustBuffer {
+    typealias SwiftType = OutletKind
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> OutletKind {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .query
+        
+        case 2: return .action
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: OutletKind, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .query:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .action:
+            writeInt(&buf, Int32(2))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeOutletKind_lift(_ buf: RustBuffer) throws -> OutletKind {
+    return try FfiConverterTypeOutletKind.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeOutletKind_lower(_ value: OutletKind) -> RustBuffer {
+    return FfiConverterTypeOutletKind.lower(value)
+}
+
+
+extension OutletKind: Equatable, Hashable {}
 
 
 

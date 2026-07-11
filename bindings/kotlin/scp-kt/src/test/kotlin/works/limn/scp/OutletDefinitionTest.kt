@@ -5,7 +5,7 @@
 // OutletCost.amount is a ULong serialized as its canonical decimal string
 // (ADR-060 native-integer money surface).
 //
-// Provenance: spec §5.4.1, ADR-010, ADR-060, issue #1203
+// Provenance: spec §5.4.1, §5.4.2, ADR-010, ADR-060, issue #1203
 
 package works.limn.scp
 
@@ -13,6 +13,7 @@ import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import org.junit.jupiter.api.Test
+import uniffi.scp.OutletKind
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
@@ -24,6 +25,7 @@ class OutletDefinitionTest {
             OutletDefinition(
                 name = "calculator",
                 description = "Adds two numbers",
+                kind = OutletKind.ACTION,
                 inputSchemaJson = """{"type":"object","properties":{"a":{"type":"number"}}}""",
                 outputSchemaJson = """{"type":"object","properties":{"sum":{"type":"number"}}}""",
                 operatorDid = "did:dht:operator123",
@@ -36,6 +38,9 @@ class OutletDefinitionTest {
 
         assertEquals("calculator", obj["name"]?.jsonPrimitive?.content)
         assertEquals("Adds two numbers", obj["description"]?.jsonPrimitive?.content)
+        // §5.4.2 wire vocabulary: Action serializes as the lowercase "action".
+        assertEquals("action", obj["kind"]?.jsonPrimitive?.content)
+        assertEquals(true, obj["kind"]?.jsonPrimitive?.isString)
         assertEquals("did:dht:operator123", obj["operator_did"]?.jsonPrimitive?.content)
         assertEquals("abcdef0123456789", obj["implementation_hash"]?.jsonPrimitive?.content)
 
@@ -57,11 +62,34 @@ class OutletDefinitionTest {
     }
 
     @Test
+    fun `query kind serializes with the query wire string`() {
+        // §5.4.2: a Query outlet must serialize its kind as the lowercase
+        // "query" wire token — the spelling the Rust bridge deserializes to
+        // OutletKind::Query, which selects the outlet_query:{id} UCAN stem.
+        val def =
+            OutletDefinition(
+                name = "weather-lookup",
+                description = "Read-only weather query",
+                kind = OutletKind.QUERY,
+                inputSchemaJson = """{"type":"object","properties":{"city":{"type":"string"}}}""",
+                outputSchemaJson = """{"type":"object","properties":{"tempC":{"type":"number"}}}""",
+                operatorDid = "did:dht:weatherop",
+            )
+        val json = def.toJson()
+        val obj = Json.parseToJsonElement(json).jsonObject
+
+        assertEquals("query", obj["kind"]?.jsonPrimitive?.content)
+        assertEquals(true, obj["kind"]?.jsonPrimitive?.isString)
+        assertEquals("weather-lookup", obj["name"]?.jsonPrimitive?.content)
+    }
+
+    @Test
     fun `minimal definition`() {
         val def =
             OutletDefinition(
                 name = "ping",
                 description = "health check",
+                kind = OutletKind.ACTION,
                 inputSchemaJson = """{}""",
                 outputSchemaJson = """{}""",
                 operatorDid = "did:dht:op1",
@@ -71,6 +99,7 @@ class OutletDefinitionTest {
 
         assertEquals("ping", obj["name"]?.jsonPrimitive?.content)
         assertEquals("health check", obj["description"]?.jsonPrimitive?.content)
+        assertEquals("action", obj["kind"]?.jsonPrimitive?.content)
         assertEquals("did:dht:op1", obj["operator_did"]?.jsonPrimitive?.content)
         assertFalse(obj.containsKey("test_vectors_json"))
         assertFalse(obj.containsKey("implementation_hash"))
@@ -83,6 +112,7 @@ class OutletDefinitionTest {
             OutletDefinition(
                 name = "outlet\"with\\special\nchars",
                 description = "desc\twith\ttabs",
+                kind = OutletKind.ACTION,
                 inputSchemaJson = """{}""",
                 outputSchemaJson = """{}""",
                 operatorDid = "did:dht:op",
@@ -100,6 +130,7 @@ class OutletDefinitionTest {
             OutletDefinition(
                 name = "outlet",
                 description = "d",
+                kind = OutletKind.ACTION,
                 inputSchemaJson = """{}""",
                 outputSchemaJson = """{}""",
                 operatorDid = "did:dht:op",
@@ -107,14 +138,14 @@ class OutletDefinitionTest {
                     OutletCost(
                         amount = 50uL,
                         currency = "US\"D",
-                        payee = "did:dht:payee\u00e9\u00fc",
+                        payee = "did:dht:payeeéü",
                     ),
             )
         val json = def.toJson()
         val obj = Json.parseToJsonElement(json).jsonObject
         val costObj = obj["cost"]?.jsonObject
         assertEquals("US\"D", costObj?.get("currency")?.jsonPrimitive?.content)
-        assertEquals("did:dht:payee\u00e9\u00fc", costObj?.get("payee")?.jsonPrimitive?.content)
+        assertEquals("did:dht:payeeéü", costObj?.get("payee")?.jsonPrimitive?.content)
     }
 
     @Test
@@ -134,6 +165,7 @@ class OutletDefinitionTest {
             OutletDefinition(
                 name = "expensive",
                 description = "d",
+                kind = OutletKind.ACTION,
                 inputSchemaJson = """{}""",
                 outputSchemaJson = """{}""",
                 operatorDid = "did:dht:op",
@@ -154,6 +186,7 @@ class OutletDefinitionTest {
             OutletDefinition(
                 name = "outlet",
                 description = "d",
+                kind = OutletKind.ACTION,
                 inputSchemaJson = """{}""",
                 outputSchemaJson = """{}""",
                 operatorDid = "did:dht:op",
@@ -172,6 +205,7 @@ class OutletDefinitionTest {
             OutletDefinition(
                 name = "outlet",
                 description = "d",
+                kind = OutletKind.ACTION,
                 inputSchemaJson = inputSchema,
                 outputSchemaJson = outputSchema,
                 operatorDid = "did:dht:op",

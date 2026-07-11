@@ -346,6 +346,14 @@ class TestOutletsExports:
 
         assert "OutletCost" in outlets.__all__
 
+    def test_outlet_kind_exported(self) -> None:
+        import scp_sdk
+        from scp_sdk import outlets
+
+        assert "OutletKind" in outlets.__all__
+        assert "OutletKind" in scp_sdk.__all__
+        assert scp_sdk.OutletKind is outlets.OutletKind
+
     def test_test_vector_exported(self) -> None:
         from scp_sdk import outlets
 

@@ -719,6 +719,19 @@ impl ContextProvider for FfiBridgeProvider {
                     .map_err(|e| format!("failed to build proof resolver: {e}"))?;
 
             crate::runtime::with_context(&bi, context_id, |rt| {
+                // SCP-OUT-014: select the split capability stem from the
+                // outlet's registered kind — `outlet_query:{id}` for Query
+                // outlets, `outlet_call:{id}` for Action outlets.
+                let outlet_kind_for_ucan = rt
+                    .outlet_registry
+                    .get(tool_name)
+                    .map(|r| r.kind)
+                    .ok_or_else(|| {
+                        ScpPyError::ucan(format!(
+                            "outlet '{tool_name}' not registered in context '{context_id}'"
+                        ))
+                    })?;
+
                 let production_resolver = crate::runtime::did_resolver(&bi);
                 let did_resolver = crate::bridge_adapters::DispatchDidResolver::new(
                     production_resolver.map(std::convert::AsRef::as_ref),
@@ -750,7 +763,11 @@ impl ContextProvider for FfiBridgeProvider {
                 };
 
                 scp_core::context::outlets::validate_outlet_invocation_ucan(
-                    token, context_id, tool_name, &mut ctx,
+                    token,
+                    context_id,
+                    tool_name,
+                    outlet_kind_for_ucan,
+                    &mut ctx,
                 )
                 .map_err(|e| {
                     tracing::warn!(

@@ -686,12 +686,25 @@ export interface Capability {
 // Outlets
 // ---------------------------------------------------------------------------
 
+/**
+ * Outlet semantic class (spec section 5.4.2). A Query outlet is a read-only
+ * lookup; an Action outlet may cause side effects. Crosses the FFI wire as the
+ * lowercase string `"query"` or `"action"` — identical across all four
+ * bindings and the UCAN capability-stem preimage (SCP-OUT-017).
+ */
+export type OutletKind = "query" | "action";
+
 /** Definition of an outlet that can be registered in a context. */
 export interface OutletDefinition {
   /** Human-readable outlet name. */
   readonly name: string;
   /** Outlet description. */
   readonly description: string;
+  /**
+   * Outlet semantic class (spec section 5.4.2). REQUIRED — omitting `kind` is
+   * a TypeScript compile error; the NAPI bridge re-enforces it at runtime.
+   */
+  readonly kind: OutletKind;
   /** JSON Schema for outlet input. */
   readonly inputSchema: Readonly<Record<string, unknown>>;
   /** JSON Schema for outlet output. */

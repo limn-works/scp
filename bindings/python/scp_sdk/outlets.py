@@ -17,10 +17,11 @@ See ``.docs/adrs/phase-3.md`` ADR-014 acceptance criterion 3,
 
 from __future__ import annotations
 
+import enum
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from scp_sdk.errors import BRIDGE_ERROR_MAP, ContextError
+from scp_sdk.errors import BRIDGE_ERROR_MAP, ContextError, ValidationError
 
 if TYPE_CHECKING:
     from scp_sdk.identity import Identity
@@ -56,6 +57,52 @@ def _translate_bridge_error(exc: Exception) -> Exception:
     """
     sdk_cls = BRIDGE_ERROR_MAP.get(type(exc).__name__, ContextError)
     return sdk_cls(str(exc))
+
+
+# ---------------------------------------------------------------------------
+# OutletKind — outlet semantic class (Query vs Action), §5.4.2.
+# ---------------------------------------------------------------------------
+
+
+class OutletKind(enum.Enum):
+    """Outlet semantic class (§5.4.2).
+
+    ``Query`` outlets are read-only and idempotent (UCAN stem
+    ``outlet_query:{id}``); ``Action`` outlets may mutate state (UCAN stem
+    ``outlet_call:{id}``).
+
+    Required at the SDK surface across all 4 bindings. Crosses the bridge
+    boundary as the lowercase string ``"query"`` / ``"action"`` matching the
+    §5.4.2 wire vocabulary.
+    """
+
+    Query = "query"
+    Action = "action"
+
+    @classmethod
+    def parse(cls, value: OutletKind | str) -> OutletKind:
+        """Coerce ``value`` to an :class:`OutletKind` instance.
+
+        Accepts an existing :class:`OutletKind` (returned unchanged) or
+        the lowercase string ``"query"`` / ``"action"`` matching the
+        §5.4.2 wire vocabulary. Other values raise
+        :class:`~scp_sdk.errors.ValidationError` (code ``SCP-VALID-7050``).
+        """
+        if isinstance(value, cls):
+            return value
+        if isinstance(value, str):
+            try:
+                return cls(value)
+            except ValueError as exc:
+                raise ValidationError(
+                    f"OutletKind must be 'query' or 'action' (§5.4.2 wire vocabulary), "
+                    f"got {value!r}",
+                    code="SCP-VALID-7050",
+                ) from exc
+        raise ValidationError(
+            f"OutletKind must be an OutletKind or str, got {type(value).__name__}",
+            code="SCP-VALID-7050",
+        )
 
 
 @dataclass
@@ -98,19 +145,27 @@ class OutletCost:
     cost_formula: str | None = None
 
 
-@dataclass
+@dataclass(kw_only=True)
 class OutletDefinition:
-    """Definition of an outlet registered in an SCP context.
+    """Definition of an outlet registered in an SCP context (§5.4.1).
 
     Mirrors ADR-014 acceptance criterion 3.  The ``operator`` field
     accepts either an ``Identity`` object (from ``scp_sdk.identity``,
     defined in a separate story) or a plain DID string.
+
+    ``kind`` is REQUIRED — there is no default. All 4 SDKs surface
+    :class:`OutletKind` as a required field; the dataclass is keyword-only,
+    so omitting ``kind`` raises :class:`TypeError` from the dataclass
+    machinery. It selects the outlet's UCAN capability stem
+    (``outlet_query:{id}`` for :attr:`OutletKind.Query`,
+    ``outlet_call:{id}`` for :attr:`OutletKind.Action`; §5.4.2).
 
     Example::
 
         outlet = OutletDefinition(
             name="recipe_search",
             description="Search recipes by ingredients",
+            kind=OutletKind.Query,
             input_schema={"type": "object", "properties": {"query": {"type": "string"}}},
             output_schema={"type": "object", "properties": {"results": {"type": "array"}}},
             operator="did:dht:z6MkOperator",
@@ -122,6 +177,10 @@ class OutletDefinition:
 
     #: Human-readable description of the outlet's purpose.
     description: str
+
+    #: Outlet semantic class (Query vs Action, §5.4.2). REQUIRED — selects the
+    #: outlet's UCAN capability stem.
+    kind: OutletKind
 
     #: JSON Schema describing the outlet's input.
     input_schema: dict[str, Any]
@@ -141,6 +200,59 @@ class OutletDefinition:
 
     #: Optional per-invocation cost metadata (spec section 5.4.1).
     cost: OutletCost | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize to the registration dict the PyO3 bridge expects.
+
+        Produces the exact key shape consumed by
+        ``scp-ffi/src/outlets.rs::outlet_register_impl`` and its
+        ``extract_*`` helpers:
+
+        - ``name`` / ``description`` — strings.
+        - ``kind`` — the lowercase §5.4.2 wire string (``self.kind.value``).
+        - ``operator_did`` — the operator's DID: ``operator.did`` when
+          ``operator`` is an :class:`~scp_sdk.identity.Identity`, otherwise
+          the string itself.
+        - ``schema`` — ``{"input_schema": …, "output_schema": …}``.
+        - ``test_vectors`` — list of ``{input, expected_output, description}``
+          dicts (present only when set).
+        - ``implementation_hash`` — 64-char lowercase hex string (the bridge's
+          ``extract_implementation_hash`` decodes hex, not raw bytes; present
+          only when set).
+        - ``cost`` — ``{amount, currency, payee, cost_formula}`` (present only
+          when set).
+        """
+        operator = self.operator
+        operator_did = operator.did if hasattr(operator, "did") else operator
+        result: dict[str, Any] = {
+            "name": self.name,
+            "description": self.description,
+            "kind": self.kind.value,
+            "operator_did": operator_did,
+            "schema": {
+                "input_schema": self.input_schema,
+                "output_schema": self.output_schema,
+            },
+        }
+        if self.test_vectors is not None:
+            result["test_vectors"] = [
+                {
+                    "input": tv.input,
+                    "expected_output": tv.expected_output,
+                    "description": tv.description,
+                }
+                for tv in self.test_vectors
+            ]
+        if self.implementation_hash is not None:
+            result["implementation_hash"] = self.implementation_hash.hex()
+        if self.cost is not None:
+            result["cost"] = {
+                "amount": self.cost.amount,
+                "currency": self.cost.currency,
+                "payee": self.cost.payee,
+                "cost_formula": self.cost.cost_formula,
+            }
+        return result
 
 
 # ---------------------------------------------------------------------------
@@ -187,6 +299,7 @@ class SagaResult:
 __all__ = [
     "OutletCost",
     "OutletDefinition",
+    "OutletKind",
     "SagaResult",
     "TestVector",
 ]

@@ -124,8 +124,9 @@ pub mod context {
         pub use scp_protocol::context::outlets::*;
         pub use scp_runtime::context::outlets::invoke;
         pub use scp_runtime::context::outlets::invoke::{
-            InvocationError, has_outlet_call_capability, invoke_outlet,
-            invoke_outlet_with_cancellation, validate_outlet_invocation_ucan,
+            InvocationError, has_outlet_call_capability, has_outlet_invocation_capability,
+            has_outlet_query_capability, invoke_outlet, invoke_outlet_with_cancellation,
+            validate_outlet_invocation_ucan,
         };
         pub use scp_runtime::context::outlets::session;
         pub use scp_runtime::context::outlets::session::{

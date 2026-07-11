@@ -273,6 +273,10 @@ fn outlet_register_impl(
     // Extract cost metadata (optional, per spec §5.4.1).
     let cost = extract_cost(registration)?;
 
+    // Extract the outlet kind (Query vs Action — §5.4.2). Absent maps to the
+    // fail-safe default `Action`; the SDK surfaces it as required.
+    let kind = extract_kind(registration)?;
+
     // Generate an outlet ID from the name (deterministic, human-readable).
     // Shared with every other bridge via `scp_ffi_common::outlet_id`.
     let outlet_id = scp_ffi_common::outlet_id::generate_outlet_id(&name);
@@ -280,7 +284,7 @@ fn outlet_register_impl(
     // Build the scp-core OutletRegistration.
     let core_registration = scp_core::context::outlets::OutletRegistration {
         outlet_id,
-        kind: scp_core::context::outlets::OutletKind::default(),
+        kind,
         name,
         description,
         schema: scp_core::context::outlets::OutletSchema {
@@ -329,6 +333,20 @@ fn validate_outlet_ucan(
         crate::ucan::build_proof_resolver_from_tokens(proof_tokens.map(Vec::as_slice))?;
 
     crate::runtime::with_context(bi, context_id, |rt| {
+        // SCP-OUT-014: select the split capability stem from the outlet's
+        // registered kind. `outlet_query:{id}` for Query outlets,
+        // `outlet_call:{id}` for Action outlets — the two stems are
+        // independent, so a Query grant never authorizes an Action call.
+        let outlet_kind_for_ucan = rt
+            .outlet_registry
+            .get(outlet_id)
+            .map(|r| r.kind)
+            .ok_or_else(|| {
+                ScpPyError::ucan(format!(
+                    "outlet '{outlet_id}' not registered in context '{context_id}'"
+                ))
+            })?;
+
         let production_resolver = crate::runtime::did_resolver(bi);
         let did_resolver = crate::bridge_adapters::DispatchDidResolver::new(
             production_resolver.map(std::convert::AsRef::as_ref),
@@ -363,7 +381,11 @@ fn validate_outlet_ucan(
         };
 
         scp_core::context::outlets::validate_outlet_invocation_ucan(
-            ucan_token, context_id, outlet_id, &mut ctx,
+            ucan_token,
+            context_id,
+            outlet_id,
+            outlet_kind_for_ucan,
+            &mut ctx,
         )
         .map_err(|e| {
             ScpPyError::ucan(format!(
@@ -736,6 +758,37 @@ fn extract_cost(
         payee: payee.into(),
         cost_formula,
     }))
+}
+
+/// Extracts the outlet `kind` from the registration dict (§5.4.2).
+///
+/// Accepts the lowercase strings `"query"` or `"action"` (the §5.4.2 wire
+/// vocabulary shared by the spec, the canonical preimage, and every other
+/// bridge). Per spec §5.4.1 the field is optional on the wire and absence
+/// (or an explicit `None`) maps to the fail-safe default `OutletKind::Action`.
+/// The Python SDK (`scp_sdk.outlets.OutletDefinition`) surfaces `kind` as a
+/// required field, so a well-formed SDK registration always supplies it; the
+/// bridge tolerance here only affects direct bridge callers. A present-but-
+/// unrecognized value is a hard `ValidationError` — silently downgrading an
+/// unknown class to `Action` would mask an SDK bug.
+fn extract_kind(
+    registration: &Bound<'_, PyDict>,
+) -> PyResult<scp_core::context::outlets::OutletKind> {
+    use scp_core::context::outlets::OutletKind;
+    let Some(val) = registration.get_item("kind")?.filter(|v| !v.is_none()) else {
+        return Ok(OutletKind::default());
+    };
+    let s: String = val
+        .extract()
+        .map_err(|_| ScpPyError::validation("'kind' must be a string".to_owned()))?;
+    match s.as_str() {
+        "query" => Ok(OutletKind::Query),
+        "action" => Ok(OutletKind::Action),
+        other => Err(ScpPyError::validation(format!(
+            "'kind' must be 'query' or 'action' (§5.4.2 wire vocabulary), got {other:?}"
+        ))
+        .into()),
+    }
 }
 
 /// Extracts test vectors from the registration dict's `test_vectors` field.
@@ -2367,6 +2420,66 @@ mod tests {
             assert!(
                 err_str.contains(codes::VALID_7037),
                 "error should contain SCP-VALID-7037, got: {err_str}"
+            );
+        });
+    }
+
+    /// `extract_kind` maps the lowercase wire strings to `OutletKind`.
+    #[test]
+    fn extract_kind_parses_query_and_action() {
+        use scp_core::context::outlets::OutletKind;
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let dict = valid_registration_dict(py);
+            dict.set_item("kind", "query").unwrap();
+            assert_eq!(
+                extract_kind(&dict.as_borrowed()).unwrap(),
+                OutletKind::Query
+            );
+            dict.set_item("kind", "action").unwrap();
+            assert_eq!(
+                extract_kind(&dict.as_borrowed()).unwrap(),
+                OutletKind::Action
+            );
+        });
+    }
+
+    /// `extract_kind` defaults to the fail-safe `Action` when `kind` is absent
+    /// or explicitly `None` (§5.4.1 wire tolerance; the SDK surfaces it required).
+    #[test]
+    fn extract_kind_defaults_to_action_when_absent() {
+        use scp_core::context::outlets::OutletKind;
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let dict = valid_registration_dict(py);
+            // No `kind` key.
+            assert_eq!(
+                extract_kind(&dict.as_borrowed()).unwrap(),
+                OutletKind::Action
+            );
+            // Explicit None.
+            dict.set_item("kind", py.None()).unwrap();
+            assert_eq!(
+                extract_kind(&dict.as_borrowed()).unwrap(),
+                OutletKind::Action
+            );
+        });
+    }
+
+    /// `extract_kind` rejects an unrecognized string rather than silently
+    /// downgrading it to `Action`.
+    #[test]
+    fn extract_kind_rejects_unknown_value() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let dict = valid_registration_dict(py);
+            dict.set_item("kind", "readonly").unwrap();
+            let result = extract_kind(&dict.as_borrowed());
+            assert!(result.is_err(), "unknown kind must be rejected");
+            let err_str = format!("{}", result.unwrap_err());
+            assert!(
+                err_str.contains("kind"),
+                "error should mention 'kind', got: {err_str}"
             );
         });
     }

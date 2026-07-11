@@ -32,6 +32,7 @@ async function main(): Promise<void> {
     const outlet = defineOutletDefinition({
       name: "summarize",
       description: "Summarize text content",
+      kind: "action",
       inputSchema: {
         type: "object",
         properties: { text: { type: "string" } },

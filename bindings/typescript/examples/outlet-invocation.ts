@@ -35,6 +35,7 @@ async function main(): Promise<void> {
     const weatherOutlet: OutletDefinition = defineOutletDefinition({
       name: "weather",
       description: "Get current weather for a city",
+      kind: "action",
       inputSchema: {
         type: "object",
         properties: { city: { type: "string" } },

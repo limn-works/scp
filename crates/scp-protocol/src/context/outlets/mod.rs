@@ -604,3 +604,45 @@ pub fn has_outlet_call_capability(
     }
     role_state.member_has_capability(did, &roles::Capability::OutletCall(outlet_id.to_owned()))
 }
+
+/// Returns `true` if `did` has Query-outlet call capability for the given outlet.
+///
+/// Mirror of [`has_outlet_call_capability`] for the Query-class stem
+/// (SCP-OUT-014, spec §5.4.2). Checks for `OutletQueryAll` (broader) first,
+/// then specific `OutletQuery(outlet_id)`. The two stems are independent: an
+/// `OutletQueryAll` grant must NOT authorize an Action call, and vice versa
+/// (§6.2 amplification rule). The runtime selects between the two via the
+/// outlet's registered [`OutletKind`] — see [`has_outlet_invocation_capability`].
+#[must_use]
+pub fn has_outlet_query_capability(
+    role_state: &roles::ContextRoleState,
+    did: &str,
+    outlet_id: &str,
+) -> bool {
+    if role_state.member_has_capability(did, &roles::Capability::OutletQueryAll) {
+        return true;
+    }
+    role_state.member_has_capability(did, &roles::Capability::OutletQuery(outlet_id.to_owned()))
+}
+
+/// Returns `true` if `did` holds the kind-appropriate split capability for
+/// invoking an outlet.
+///
+/// Selects between [`has_outlet_call_capability`] (Action) and
+/// [`has_outlet_query_capability`] (Query) based on the outlet's registered
+/// [`OutletKind`]. Per spec §5.4.2 the two stems are independent —
+/// `OutletQueryAll` must not authorize an Action call and `OutletCallAll` must
+/// not authorize a Query call. This is the single dispatch point that keeps the
+/// runtime invoke sites from having to branch on kind by hand.
+#[must_use]
+pub fn has_outlet_invocation_capability(
+    role_state: &roles::ContextRoleState,
+    did: &str,
+    outlet_id: &str,
+    kind: OutletKind,
+) -> bool {
+    match kind {
+        OutletKind::Query => has_outlet_query_capability(role_state, did, outlet_id),
+        OutletKind::Action => has_outlet_call_capability(role_state, did, outlet_id),
+    }
+}

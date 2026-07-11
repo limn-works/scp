@@ -413,6 +413,7 @@ func opOutletRegister(_ req: BridgeRequest) async throws -> [String: JSONValue] 
         definition: OutletDefinition(
             name: parityOutletName,
             description: "parity harness probe outlet",
+            kind: .action,
             inputSchemaJson: inputSchema,
             outputSchemaJson: outputSchema,
             operatorDid: identity.did(),

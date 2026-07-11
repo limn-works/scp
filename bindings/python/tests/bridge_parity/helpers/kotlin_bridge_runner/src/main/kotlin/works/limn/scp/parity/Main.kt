@@ -358,6 +358,7 @@ private suspend fun opOutletRegister(args: JsonObject): JsonObject =
             uniffi.scp.OutletDefinition(
                 name = PARITY_OUTLET_NAME,
                 description = "parity harness probe outlet",
+                kind = uniffi.scp.OutletKind.ACTION,
                 inputSchemaJson = inputSchema,
                 outputSchemaJson = outputSchema,
                 operatorDid = identity.did(),

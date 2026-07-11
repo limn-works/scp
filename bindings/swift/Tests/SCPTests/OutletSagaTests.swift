@@ -268,6 +268,7 @@ final class OutletSagaTests: XCTestCase {
         OutletDefinition(
             name: "weather",
             description: "Get current weather for a city",
+            kind: .action,
             inputSchemaJson: #"{"type":"object","properties":{"city":{"type":"string"},"unit":{"type":"string"}},"required":["city"]}"#,
             outputSchemaJson: #"{"type":"object","properties":{"tempC":{"type":"number"},"condition":{"type":"string"}}}"#,
             operatorDid: operatorDid,

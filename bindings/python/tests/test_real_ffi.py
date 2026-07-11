@@ -511,6 +511,7 @@ class TestOutlets:
             {
                 "name": "test_outlet",
                 "description": "A test outlet",
+                "kind": "action",
                 "operator_did": alice.did,
                 "schema": {
                     "input_schema": {

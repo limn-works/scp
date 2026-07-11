@@ -14,6 +14,7 @@ import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonObject
 import works.limn.scp.bridge.BridgeException
+import uniffi.scp.OutletKind
 
 /**
  * Key custody method for identity key management (spec section 3.2).
@@ -199,6 +200,11 @@ data class OutletCost(
  *
  * @property name Human-readable outlet name.
  * @property description Outlet description.
+ * @property kind Outlet semantic class (Query vs Action — spec §5.4.2). Selects
+ *   the UCAN capability stem required to invoke the outlet (`outlet_query:{id}`
+ *   for [OutletKind.QUERY], `outlet_call:{id}` for [OutletKind.ACTION]). Required —
+ *   [OutletKind.ACTION] is the fail-safe default an undeclared kind must never
+ *   silently adopt, so callers declare it explicitly.
  * @property inputSchemaJson JSON Schema for outlet input (as a JSON string).
  * @property outputSchemaJson JSON Schema for outlet output (as a JSON string).
  * @property operatorDid DID of the outlet operator (responsible party).
@@ -209,6 +215,7 @@ data class OutletCost(
 data class OutletDefinition(
     val name: String,
     val description: String,
+    val kind: OutletKind,
     val inputSchemaJson: String,
     val outputSchemaJson: String,
     val operatorDid: String,
@@ -227,6 +234,16 @@ data class OutletDefinition(
             buildJsonObject {
                 put("name", name)
                 put("description", description)
+                // §5.4.2 wire vocabulary: lowercase "query" / "action". The Rust
+                // OutletKind deserializes this exact spelling (serde
+                // rename_all = "lowercase").
+                put(
+                    "kind",
+                    when (kind) {
+                        OutletKind.QUERY -> "query"
+                        OutletKind.ACTION -> "action"
+                    },
+                )
                 put("input_schema_json", Json.parseToJsonElement(inputSchemaJson))
                 put("output_schema_json", Json.parseToJsonElement(outputSchemaJson))
                 put("operator_did", operatorDid)

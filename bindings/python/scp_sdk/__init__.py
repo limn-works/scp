@@ -139,6 +139,7 @@ from scp_sdk.media import (
 from scp_sdk.outlets import (
     OutletCost,
     OutletDefinition,
+    OutletKind,
     SagaResult,
     TestVector,
 )
@@ -260,6 +261,7 @@ __all__ = [
     "OutletCost",
     "OutletDefinition",
     "OutletError",
+    "OutletKind",
     "ParticipationFact",
     "ParticipationProfile",
     "ParticipationThreshold",

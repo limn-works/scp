@@ -517,6 +517,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       const outletId = await napi.outletRegister(ctx, {
         name: "echo",
         description: "Echoes input",
+        kind: "action",
         inputSchema: {
           type: "object",
           properties: { input: { type: "string" }, mode: { type: "string" } },
@@ -545,6 +546,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       const outletId = await napi.outletRegister(ctx, {
         name: "test-outlet",
         description: "A test outlet",
+        kind: "action",
         inputSchema: {
           type: "object",
           properties: { x: { type: "number" }, y: { type: "number" } },
@@ -579,6 +581,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
         const outletId = await napi.outletRegister(ctx, {
           name: `priced-outlet-${amount}`,
           description: "A outlet with a large per-invocation cost",
+          kind: "action",
           inputSchema: {
             type: "object",
             properties: { a: { type: "string" }, b: { type: "number" } },
@@ -611,6 +614,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
         napi.outletRegister(ctx, {
           name: "negative-cost-outlet",
           description: "invalid",
+          kind: "action",
           inputSchema: {
             type: "object",
             properties: { a: { type: "string" }, b: { type: "number" } },
@@ -636,6 +640,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       const outletId = await napi.outletRegister(ctx, {
         name: "verify-me",
         description: "Outlet for verification",
+        kind: "action",
         inputSchema: {
           type: "object",
           properties: { query: { type: "string" }, limit: { type: "number" } },
@@ -1865,6 +1870,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       const outletId = await napi.outletRegister(ctx, {
         name: "e2e-outlet",
         description: "End-to-end test outlet",
+        kind: "action",
         inputSchema: {
           type: "object",
           properties: { value: { type: "number" }, mode: { type: "string" } },

@@ -37,6 +37,7 @@ import uniffi.scp.ContextMode
 import uniffi.scp.ContextParams
 import uniffi.scp.GovernanceModel
 import uniffi.scp.MemoryScope
+import uniffi.scp.OutletKind
 import uniffi.scp.SagaResult
 import uniffi.scp.ScpException
 import uniffi.scp.StorageConfig
@@ -402,6 +403,7 @@ class OutletSagaTest {
         OutletDefinition(
             name = "weather",
             description = "Get current weather for a city",
+            kind = OutletKind.ACTION,
             inputSchemaJson =
                 """{"type":"object","properties":{"city":{"type":"string"},""" +
                     """"unit":{"type":"string"}},"required":["city"]}""",

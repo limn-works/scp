@@ -28,6 +28,7 @@ use scp_ffi_uniffi::{
     GovernanceModel,
     MemoryScope,
     OutletDefinition,
+    OutletKind,
     Scp,
     // Free functions — bridge trust
     bridge_evaluate_trust,
@@ -703,6 +704,7 @@ async fn outlet_register_and_verify() {
     let definition = OutletDefinition {
         name: "calculator".to_owned(),
         description: "A simple calculator outlet".to_owned(),
+        kind: OutletKind::Action,
         input_schema_json:
             r#"{"type":"object","properties":{"a":{"type":"number"},"b":{"type":"number"}}}"#
                 .to_owned(),

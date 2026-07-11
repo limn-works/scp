@@ -106,6 +106,7 @@ pub use bridge::{
     MemoryScope,
     Message,
     OutletDefinition,
+    OutletKind,
     OutletVerificationResult,
     Proof,
     ScpError,

@@ -110,11 +110,13 @@ describe("type definitions", () => {
     const def: OutletDefinition = {
       name: "calculator",
       description: "Simple calculator",
+      kind: "action",
       inputSchema: { type: "object" },
       outputSchema: { type: "object" },
       operator: "did:dht:z6MkTest",
     };
     expect(def.name).toBe("calculator");
+    expect(def.kind).toBe("action");
   });
 
   it("UcanToken has all required fields", () => {

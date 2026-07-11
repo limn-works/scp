@@ -144,6 +144,7 @@ describe("defineOutletDefinition", () => {
     const def = defineOutletDefinition({
       name: "test-outlet",
       description: "A test outlet",
+      kind: "action",
       inputSchema: { type: "object" },
       outputSchema: { type: "object" },
       operator: "did:dht:z6MkTest",
@@ -151,7 +152,21 @@ describe("defineOutletDefinition", () => {
 
     expect(def.name).toBe("test-outlet");
     expect(def.description).toBe("A test outlet");
+    expect(def.kind).toBe("action");
     expect(def.operator).toBe("did:dht:z6MkTest");
+  });
+
+  it("threads kind: 'query' onto the built definition", () => {
+    const def = defineOutletDefinition({
+      name: "lookup-outlet",
+      description: "A read-only query outlet",
+      kind: "query",
+      inputSchema: { type: "object" },
+      outputSchema: { type: "object" },
+      operator: "did:dht:z6MkTest",
+    });
+
+    expect(def.kind).toBe("query");
   });
 
   it("includes optional fields when provided", () => {
@@ -161,6 +176,7 @@ describe("defineOutletDefinition", () => {
     const def = defineOutletDefinition({
       name: "test-outlet",
       description: "A test outlet",
+      kind: "action",
       inputSchema: { type: "object" },
       outputSchema: { type: "object" },
       operator: "did:dht:z6MkTest",
@@ -177,6 +193,7 @@ describe("defineOutletDefinition", () => {
       defineOutletDefinition({
         name: "",
         description: "A test outlet",
+        kind: "action",
         inputSchema: { type: "object" },
         outputSchema: { type: "object" },
         operator: "did:dht:z6MkTest",
@@ -189,6 +206,7 @@ describe("defineOutletDefinition", () => {
       defineOutletDefinition({
         name: "test-outlet",
         description: "",
+        kind: "action",
         inputSchema: { type: "object" },
         outputSchema: { type: "object" },
         operator: "did:dht:z6MkTest",
@@ -201,6 +219,7 @@ describe("defineOutletDefinition", () => {
       defineOutletDefinition({
         name: "test-outlet",
         description: "A test outlet",
+        kind: "action",
         inputSchema: { type: "object" },
         outputSchema: { type: "object" },
         operator: "",
@@ -236,6 +255,7 @@ describe("scp.outletInvokeCrossContext", () => {
     const outletId = await scp.outletRegister(targetHandle._rawHandle, {
       name: "calculator",
       description: "Adds numbers",
+      kind: "action",
       inputSchema: { type: "object" },
       outputSchema: { type: "object" },
       operator: identity.did,
@@ -281,6 +301,7 @@ describe("scp.outletInvokeCrossContext", () => {
     const outletId = await scp.outletRegister(targetHandle._rawHandle, {
       name: "deep-outlet",
       description: "Deep chain outlet",
+      kind: "action",
       inputSchema: { type: "object" },
       outputSchema: { type: "object" },
       operator: identity.did,
@@ -629,6 +650,7 @@ describe("scp.outletSessionCreate", () => {
     const outletId = await scp.outletRegister(handle._rawHandle, {
       name: "stateful-outlet",
       description: "A stateful outlet",
+      kind: "action",
       inputSchema: { type: "object" },
       outputSchema: { type: "object" },
       operator: identity.did,
@@ -645,6 +667,7 @@ describe("scp.outletSessionCreate", () => {
     const outletId = await scp.outletRegister(handle._rawHandle, {
       name: "ttl-outlet",
       description: "TTL outlet",
+      kind: "action",
       inputSchema: { type: "object" },
       outputSchema: { type: "object" },
       operator: identity.did,
@@ -699,6 +722,7 @@ describe("scp.outletSessionInvoke", () => {
     const outletId = await scp.outletRegister(handle._rawHandle, {
       name: "session-outlet",
       description: "A session outlet",
+      kind: "action",
       inputSchema: { type: "object" },
       outputSchema: { type: "object" },
       operator: identity.did,
@@ -730,6 +754,7 @@ describe("scp.outletSessionInvoke", () => {
     const outletId = await scp.outletRegister(handle._rawHandle, {
       name: "counter-outlet",
       description: "Counts calls",
+      kind: "action",
       inputSchema: { type: "object" },
       outputSchema: { type: "object" },
       operator: identity.did,
@@ -771,6 +796,7 @@ describe("scp.outletSessionClose", () => {
     const outletId = await scp.outletRegister(handle._rawHandle, {
       name: "closable-outlet",
       description: "Can be closed",
+      kind: "action",
       inputSchema: { type: "object" },
       outputSchema: { type: "object" },
       operator: identity.did,

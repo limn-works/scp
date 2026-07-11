@@ -59,7 +59,7 @@ from scp_sdk.errors import ScpError
 from scp_sdk.types import CustodyType
 
 if TYPE_CHECKING:
-    from scp_sdk.outlets import SagaResult
+    from scp_sdk.outlets import OutletDefinition, SagaResult
 
     # Imported under TYPE_CHECKING only to annotate ``ucan_evaluate`` /
     # ``participation_record`` return types without a runtime circular import
@@ -2575,9 +2575,23 @@ class SCP:
             output=native_result.output,
         )
 
-    async def outlet_register(self, context_id: str, registration: dict[str, Any]) -> Any:
-        """Delegate to ``_scp_core.SCP.outlet_register``."""
-        return await asyncio.to_thread(self._native.outlet_register, context_id, registration)
+    async def outlet_register(
+        self, context_id: str, registration: OutletDefinition | dict[str, Any]
+    ) -> Any:
+        """Register an outlet in a context via ``_scp_core.SCP.outlet_register``.
+
+        Accepts a typed :class:`~scp_sdk.outlets.OutletDefinition` (converted to
+        the bridge registration dict via
+        :meth:`~scp_sdk.outlets.OutletDefinition.to_dict`, which emits the
+        required §5.4.2 ``kind`` wire string) or a raw registration ``dict``
+        (passed through unchanged, e.g. for the bridge-parity harness).
+        """
+        from scp_sdk.outlets import OutletDefinition
+
+        payload = (
+            registration.to_dict() if isinstance(registration, OutletDefinition) else registration
+        )
+        return await asyncio.to_thread(self._native.outlet_register, context_id, payload)
 
     async def outlet_session_close(self, context_id: str, session_id: str) -> Any:
         """Delegate to ``_scp_core.SCP.outlet_session_close``."""
