@@ -564,7 +564,7 @@ ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
         "kotlin": ["broadcastOpenKey"],
         "swift": ["broadcastOpenKey"],
     },
-    # Tools -- all SDKs use the outlet-prefixed method name for the renamed
+    # Outlets -- all SDKs use the outlet-prefixed method name for the renamed
     # outlet domain (outlet_register / outletRegister / ...).
     ("Outlets", "register"): {
         "python": ["outlet_register"],
