@@ -9,7 +9,7 @@
 //! It restores the deleted WASM bridge's `PerContextState` shape — a pull-based
 //! `drain_events` model and a committer-assigned event-log timestamp — while
 //! holding only the **participant message-path** fields (ADR-057 scope fence:
-//! no governance/economy/tools/broadcast state).
+//! no governance/economy/outlets/broadcast state).
 
 use std::collections::{HashMap, VecDeque};
 

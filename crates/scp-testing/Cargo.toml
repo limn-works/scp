@@ -225,8 +225,8 @@ name = "pipeline_wiring"
 path = "tests/integration/pipeline_wiring.rs"
 
 [[test]]
-name = "tool_economy_wiring"
-path = "tests/integration/tool_economy_wiring.rs"
+name = "outlet_economy_wiring"
+path = "tests/integration/outlet_economy_wiring.rs"
 
 [[test]]
 name = "reconnect_sync"

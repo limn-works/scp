@@ -22,7 +22,7 @@
 //! # Scope fence (ADR-057, mechanically enforced)
 //!
 //! The driver covers the **participant message path only**. Economy, governance
-//! voting, broadcast hosting, cross-context saga coordination, tools,
+//! voting, broadcast hosting, cross-context saga coordination, outlets,
 //! discovery, and UCAN minting are node-side and out of scope — they require
 //! always-on hosts and would regrow the driver toward the deleted 15.5K-line
 //! manager. The fence is enforced **by the dependency graph**, not prose: this

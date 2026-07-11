@@ -868,11 +868,11 @@ async fn end_to_end_network_demo() {
 }
 
 // =========================================================================
-// DEMO 2: Application Layer — ContextManager, Tools, Governance
+// DEMO 2: Application Layer — ContextManager, Outlets, Governance
 // =========================================================================
 
 /// Mock crypto provider — returns payload as-is (no real encryption).
-/// The `ContextManager` pipeline, tool system, governance engine, and role
+/// The `ContextManager` pipeline, outlet system, governance engine, and role
 /// system are all 100% real. Only the MLS/sender-key operations are mocked.
 #[derive(Default)]
 struct DemoCrypto;
@@ -1105,7 +1105,7 @@ async fn application_layer_demo() {
 
     println!();
     println!("╔══════════════════════════════════════════════════════════════╗");
-    println!("║     SCP APPLICATION LAYER — CONTEXT, TOOLS, GOVERNANCE     ║");
+    println!("║     SCP APPLICATION LAYER — CONTEXT, OUTLETS, GOVERNANCE     ║");
     println!("╚══════════════════════════════════════════════════════════════╝");
     println!();
 
@@ -1290,13 +1290,13 @@ async fn application_layer_demo() {
     println!();
 
     // =====================================================================
-    // PHASE 4: Tool Registration
+    // PHASE 4: Outlet Registration
     // =====================================================================
-    println!("━━━ PHASE 4: Tool Registration ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    println!("━━━ PHASE 4: Outlet Registration ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!();
 
     // Build the role state directly — ContextManager tracks this internally,
-    // but for the free-function tool API we need to construct it.
+    // but for the free-function outlet API we need to construct it.
     let ceiling = CapabilityCeiling::new(vec![
         Capability::new("messages:read").expect("known capability"),
         Capability::new("messages:write").expect("known capability"),
@@ -1317,7 +1317,7 @@ async fn application_layer_demo() {
     )
     .unwrap();
 
-    // Add Bob and Charlie as members with "member" role (ToolInvokeAll capability).
+    // Add Bob and Charlie as members with "member" role (OutletInvokeAll capability).
     {
         use scp_core::context::roles::assign_role;
         role_state.members.insert(bob.as_ref().to_owned());
@@ -1340,9 +1340,9 @@ async fn application_layer_demo() {
         .unwrap();
     }
 
-    let mut tool_registry = OutletRegistry::new();
+    let mut outlet_registry = OutletRegistry::new();
 
-    let search_tool = OutletRegistration {
+    let search_outlet = OutletRegistration {
         outlet_id: "search-web".to_owned(),
         kind: scp_core::context::outlets::OutletKind::default(),
         name: "Web Search".to_owned(),
@@ -1377,26 +1377,26 @@ async fn application_layer_demo() {
         signature: vec![],
     };
 
-    println!("  Registering tool: '{}'", search_tool.name);
-    println!("    tool_id:     {}", search_tool.outlet_id);
-    println!("    operator:    {}", search_tool.operator_did);
+    println!("  Registering outlet: '{}'", search_outlet.name);
+    println!("    outlet_id:     {}", search_outlet.outlet_id);
+    println!("    operator:    {}", search_outlet.operator_did);
     println!("    input:       query (string), max_results (integer)");
     println!("    output:      results (array), total (integer)");
 
-    let (tool_id, reg_event) =
-        register_outlet(&mut tool_registry, &role_state, search_tool, alice.as_ref()).unwrap();
+    let (outlet_id, reg_event) =
+        register_outlet(&mut outlet_registry, &role_state, search_outlet, alice.as_ref()).unwrap();
 
-    println!("  Registered! tool_id = {tool_id}");
+    println!("  Registered! outlet_id = {outlet_id}");
     println!(
-        "    event: tool_id={}, registrant={}",
+        "    event: outlet_id={}, registrant={}",
         reg_event.outlet_id, reg_event.registrant_did
     );
-    assert_eq!(tool_registry.len(), 1);
-    println!("    registry size: {}", tool_registry.len());
+    assert_eq!(outlet_registry.len(), 1);
+    println!("    registry size: {}", outlet_registry.len());
     println!();
 
-    // Register a second tool.
-    let calc_tool = OutletRegistration {
+    // Register a second outlet.
+    let calc_outlet = OutletRegistration {
         outlet_id: "calculator".to_owned(),
         kind: scp_core::context::outlets::OutletKind::default(),
         name: "Calculator".to_owned(),
@@ -1429,16 +1429,16 @@ async fn application_layer_demo() {
     };
 
     let (calc_id, _) =
-        register_outlet(&mut tool_registry, &role_state, calc_tool, alice.as_ref()).unwrap();
-    println!("  Registered tool: 'Calculator' (id={calc_id})");
-    println!("    registry size: {}", tool_registry.len());
-    assert_eq!(tool_registry.len(), 2);
+        register_outlet(&mut outlet_registry, &role_state, calc_outlet, alice.as_ref()).unwrap();
+    println!("  Registered outlet: 'Calculator' (id={calc_id})");
+    println!("    registry size: {}", outlet_registry.len());
+    assert_eq!(outlet_registry.len(), 2);
     println!();
 
     // =====================================================================
-    // PHASE 5: Tool Invocation
+    // PHASE 5: Outlet Invocation
     // =====================================================================
-    println!("━━━ PHASE 5: Tool Invocation ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    println!("━━━ PHASE 5: Outlet Invocation ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!();
 
     let search_input = serde_json::json!({
@@ -1449,17 +1449,17 @@ async fn application_layer_demo() {
     println!("  Invoking 'search-web' as Bob:");
     println!("    input: {search_input}");
 
-    // The executor is a real async function that simulates the tool.
+    // The executor is a real async function that simulates the outlet.
     let (output, invoke_event, _consequences, _receipt) = invoke_outlet(
         &handle,
-        &tool_registry,
+        &outlet_registry,
         &role_state,
         &"search-web".to_owned(),
         search_input,
         &bob,
         Some(5000),
         |input| async move {
-            // Simulate a web search — this is the tool's actual executor.
+            // Simulate a web search — this is the outlet's actual executor.
             let query = input["query"].as_str().unwrap_or("unknown");
             let max = input["max_results"].as_u64().unwrap_or(10);
             Ok(serde_json::json!({
@@ -1477,7 +1477,7 @@ async fn application_layer_demo() {
 
     println!("    output: {output}");
     println!(
-        "    event:  tool={}, invoker={}, duration_ms={}",
+        "    event:  outlet={}, invoker={}, duration_ms={}",
         invoke_event.outlet_id, invoke_event.invoker_did, invoke_event.execution_time_ms
     );
     assert_eq!(output["total"], 2);
@@ -1494,7 +1494,7 @@ async fn application_layer_demo() {
 
     let (calc_output, _, _consequences, _receipt) = invoke_outlet(
         &handle,
-        &tool_registry,
+        &outlet_registry,
         &role_state,
         &"calculator".to_owned(),
         calc_input,
@@ -1612,13 +1612,13 @@ async fn application_layer_demo() {
     println!("║    1. Context creation via ContextManager (real lifecycle)  ║");
     println!("║    2. Membership: join, verify, member_count, is_member    ║");
     println!("║    3. Messaging: send_message, drain_events                ║");
-    println!("║    4. Tool registration (schema validation, capability ck) ║");
-    println!("║    5. Tool invocation (real async executors, timeouts)     ║");
+    println!("║    4. Outlet registration (schema validation, capability ck) ║");
+    println!("║    5. Outlet invocation (real async executors, timeouts)     ║");
     println!("║    6. Governance: propose + execute (SingleAdmin engine)   ║");
     println!("║    7. Context close via governance action                  ║");
     println!("║                                                            ║");
     println!("║  What's real vs mocked:                                    ║");
-    println!("║    REAL: ContextManager, tool registry, schema validation, ║");
+    println!("║    REAL: ContextManager, outlet registry, schema validation, ║");
     println!("║          role system, capability checks, governance engine, ║");
     println!("║          event log, membership state, context lifecycle    ║");
     println!("║    MOCK: MLS group ops, sender key ops, relay transport    ║");

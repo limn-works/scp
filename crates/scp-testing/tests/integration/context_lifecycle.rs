@@ -134,7 +134,7 @@ async fn context_params_defaults() {
     assert_eq!(params.ceiling_policy, CeilingPolicy::Immutable);
     assert_eq!(params.promotion_policy, PromotionPolicy::NoPromotion);
     assert!(params.roles.is_empty());
-    assert!(params.tools.is_empty());
+    assert!(params.outlets.is_empty());
     assert!(params.ttl.is_none());
     assert_eq!(params.memory_scope, MemoryScope::Ephemeral);
     assert_eq!(params.governance, GovernanceModel::SingleAdmin);
@@ -163,7 +163,7 @@ async fn context_params_all_fields() {
         ceiling_policy: CeilingPolicy::Governed,
         promotion_policy: PromotionPolicy::Promotable,
         roles: Vec::new(),
-        tools: Vec::new(),
+        outlets: Vec::new(),
         ttl: Some(Duration::from_hours(1)),
         memory_scope: MemoryScope::Full,
         governance: GovernanceModel::SingleAdmin,
@@ -211,7 +211,7 @@ async fn context_params_backward_compat() {
         "ceiling_policy": "Immutable",
         "promotion_policy": "NoPromotion",
         "roles": [],
-        "tools": [],
+        "outlets": [],
         "ttl": null,
         "memory_scope": "Ephemeral",
         "governance": "SingleAdmin",
@@ -240,7 +240,7 @@ async fn all_template_ids() {
         TemplateId::GroupDiscussion,
         TemplateId::PublicBroadcast,
         TemplateId::GatedBroadcast,
-        TemplateId::ToolInterfaceTemplate,
+        TemplateId::OutletInterfaceTemplate,
         TemplateId::PaidService,
         TemplateId::PaidBroadcast,
         TemplateId::HandleRegistry,
@@ -359,8 +359,8 @@ async fn all_capability_variants() {
         (Capability::MediaScreenShare, "media:screen_share"),
         (Capability::MemberBan, "member:ban"),
         (
-            Capability::OutletCall("my-tool".to_owned()),
-            "outlet:call:my-tool",
+            Capability::OutletCall("my-outlet".to_owned()),
+            "outlet:call:my-outlet",
         ),
         (Capability::Custom("special".to_owned()), "special"),
     ];
@@ -383,8 +383,8 @@ async fn all_capability_variants() {
         Capability::ContextClose
     );
     assert_eq!(
-        Capability::new("outlet:call:my-tool").expect("known capability"),
-        Capability::OutletCall("my-tool".to_owned())
+        Capability::new("outlet:call:my-outlet").expect("known capability"),
+        Capability::OutletCall("my-outlet".to_owned())
     );
     assert_eq!(
         Capability::new("unknown-cap").expect("known capability"),
@@ -428,7 +428,7 @@ async fn builtin_roles_capabilities() {
     assert!(!observer.capabilities.contains(&Capability::MessagesWrite));
     assert_eq!(observer.capabilities.len(), 1);
 
-    // Member gets MessagesRead, MessagesWrite, ToolInvokeAll
+    // Member gets MessagesRead, MessagesWrite, OutletInvokeAll
     let member = builtin_member(&ceiling);
     assert_eq!(member.name, "member");
     assert!(member.capabilities.contains(&Capability::MessagesRead));
@@ -584,7 +584,7 @@ async fn ceiling_intersection() {
 
     let intersection = compute_ceiling_intersection(&[parent_a, parent_b]);
 
-    // Only MessagesRead, ToolInvokeAll, and ChildContextCreate are in both
+    // Only MessagesRead, OutletInvokeAll, and ChildContextCreate are in both
     assert!(intersection.contains(&Capability::MessagesRead));
     assert!(intersection.contains(&Capability::OutletCallAll));
     assert!(intersection.contains(&Capability::ChildContextCreate));

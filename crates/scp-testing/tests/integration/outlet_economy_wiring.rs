@@ -1,5 +1,5 @@
 // ADR-049 commit 12c.9e: ContextCryptoProvider trait deleted. MockCrypto
-// here reimplements that trait for unit-test coverage of tool economy
+// here reimplements that trait for unit-test coverage of outlet economy
 // wiring. Rewiring to real `MlsCryptoProvider` requires backend injection
 // (12c.9f). File gated until then.
 #![cfg(any())]
@@ -11,7 +11,7 @@
     clippy::too_many_lines
 )]
 
-//! C4 (#1606) — Bridge tool-invoke economy wiring integration test.
+//! C4 (#1606) — Bridge outlet-invoke economy wiring integration test.
 //!
 //! Verifies that `ContextManager::invoke_outlet_with_economy` — the SINGLE
 //! entry point all 3 FFI bridges (PyO3, NAPI, UniFFI) now route
@@ -20,10 +20,10 @@
 //! returns the executor output, and produces a `OutletInvokedEvent` with
 //! the correct cost.
 //!
-//! Before C4 the bridges bypassed this method entirely and tools cost
+//! Before C4 the bridges bypassed this method entirely and outlets cost
 //! ZERO from a Python/Node/Swift/Kotlin client's perspective regardless
 //! of `EconomicPolicy`. The pipeline_wiring assertions cover the
-//! structural fact that the bridge tool-invoke functions now CALL
+//! structural fact that the bridge outlet-invoke functions now CALL
 //! `invoke_outlet_with_economy`; this test covers the runtime semantics
 //! that the bridges' delegations now inherit.
 //!
@@ -281,7 +281,7 @@ fn echo_outlet() -> OutletRegistration {
         outlet_id: "echo".to_owned(),
         kind: scp_core::context::outlets::OutletKind::default(),
         name: "echo".to_owned(),
-        description: "echo tool for C4 wiring test".to_owned(),
+        description: "echo outlet for C4 wiring test".to_owned(),
         schema: OutletSchema {
             input_schema: serde_json::json!({"type": "object"}),
             output_schema: serde_json::json!({"type": "object"}),
@@ -445,7 +445,7 @@ async fn invoke_outlet_with_economy_deducts_budget_and_records_velocity() {
     ));
 
     let invoker = DID::from("did:key:invoker");
-    let context_id = "ctx-c4-tool-economy".to_owned();
+    let context_id = "ctx-c4-outlet-economy".to_owned();
     let mut params = governance_params_with_outlets();
     params.economic_policy = Some(priced_policy(7));
 
@@ -493,7 +493,7 @@ async fn invoke_outlet_with_economy_deducts_budget_and_records_velocity() {
             |input: serde_json::Value| async move { Ok(serde_json::json!({"echoed": input})) },
         )
         .await
-        .expect("invoke_outlet_with_economy must succeed for free-budget paid tool");
+        .expect("invoke_outlet_with_economy must succeed for free-budget paid outlet");
 
     // Verify the executor ran and produced the expected output.
     assert_eq!(
@@ -568,7 +568,7 @@ async fn invoke_outlet_with_economy_rejects_insufficient_budget() {
     let invoker = DID::from("did:key:invoker");
     let context_id = "ctx-c4-budget-rejected".to_owned();
     let mut params = governance_params_with_outlets();
-    // Price the tool above any granted budget.
+    // Price the outlet above any granted budget.
     params.economic_policy = Some(priced_policy(100));
 
     let _handle = manager

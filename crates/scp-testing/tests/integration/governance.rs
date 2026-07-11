@@ -86,7 +86,7 @@ fn simple_outlet_interface() -> OutletInterface {
     OutletInterface {
         source_context: "ctx-src".to_owned(),
         target_context: "ctx-tgt".to_owned(),
-        outlet_id: "tool-1".to_owned(),
+        outlet_id: "outlet-1".to_owned(),
         rate_limit: None,
         inbound_rate_limit: None,
         per_caller_rate_limit: None,
@@ -119,7 +119,7 @@ fn simple_outlet_registration() -> scp_core::context::params::OutletRegistration
         outlet_id: "search".to_owned(),
         kind: scp_core::context::outlets::OutletKind::default(),
         name: "search".to_owned(),
-        description: "Search tool".to_owned(),
+        description: "Search outlet".to_owned(),
         schema: OutletSchema {
             input_schema: serde_json::json!({"type": "object"}),
             output_schema: serde_json::json!({"type": "object"}),
@@ -160,10 +160,10 @@ fn all_governance_actions_for_test() -> Vec<GovernanceAction> {
             did: bob(),
             new_role: "observer".to_owned(),
         },
-        GovernanceAction::RegisterTool {
+        GovernanceAction::RegisterOutlet {
             registration: Box::new(simple_outlet_registration()),
         },
-        GovernanceAction::RemoveTool {
+        GovernanceAction::RemoveOutlet {
             outlet_id: "search".to_owned(),
         },
         GovernanceAction::ModifyCeiling {
@@ -193,7 +193,7 @@ fn all_governance_actions_for_test() -> Vec<GovernanceAction> {
         GovernanceAction::AddSigner { did: carol() },
         GovernanceAction::RemoveSigner { did: carol() },
         GovernanceAction::ModifyThreshold { new_threshold: 2 },
-        GovernanceAction::EstablishToolInterface {
+        GovernanceAction::EstablishOutletInterface {
             interface: simple_outlet_interface(),
         },
         GovernanceAction::ResetMember {
@@ -233,7 +233,7 @@ fn all_governance_actions_for_test() -> Vec<GovernanceAction> {
         GovernanceAction::ApproveSpend {
             spender: bob(),
             amount: Amount::new(1000),
-            purpose: "tool costs".to_owned(),
+            purpose: "outlet costs".to_owned(),
         },
         GovernanceAction::LockEconomicPolicy,
         GovernanceAction::ProposeContextMigration {
