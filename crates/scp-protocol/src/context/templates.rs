@@ -158,7 +158,7 @@ fn messaging_outlet_call_ban_ceiling() -> Vec<Capability> {
 /// Used by broadcast templates (spec section 5.12.1) where participants can
 /// both invoke and register outlets. Does NOT include `member:ban` —
 /// broadcast contexts do not support member banning.
-fn messaging_tools_ceiling() -> Vec<Capability> {
+fn messaging_outlets_ceiling() -> Vec<Capability> {
     vec![
         Capability::MessagesRead,
         Capability::MessagesWrite,
@@ -174,7 +174,7 @@ fn messaging_tools_ceiling() -> Vec<Capability> {
 /// Used by encrypted templates with full outlet support (outlet-interface,
 /// paid-service) where participants can invoke and register outlets, and
 /// member banning is supported.
-fn messaging_tools_ban_ceiling() -> Vec<Capability> {
+fn messaging_outlets_ban_ceiling() -> Vec<Capability> {
     vec![
         Capability::MessagesRead,
         Capability::MessagesWrite,
@@ -213,7 +213,7 @@ const fn private_encrypted_visibility() -> MetadataVisibilityPolicy {
         name: FieldVisibility::PreJoin,
         description: FieldVisibility::MemberOnly,
         economic_policy: FieldVisibility::MemberOnly,
-        tool_interface_count: FieldVisibility::MemberOnly,
+        outlet_interface_count: FieldVisibility::MemberOnly,
         child_context_info: FieldVisibility::MemberOnly,
     }
 }
@@ -230,7 +230,7 @@ const fn group_discussion_visibility() -> MetadataVisibilityPolicy {
         name: FieldVisibility::PreJoin,
         description: FieldVisibility::PreJoin,
         economic_policy: FieldVisibility::MemberOnly,
-        tool_interface_count: FieldVisibility::MemberOnly,
+        outlet_interface_count: FieldVisibility::MemberOnly,
         child_context_info: FieldVisibility::MemberOnly,
     }
 }
@@ -247,7 +247,7 @@ const fn member_count_hidden_visibility() -> MetadataVisibilityPolicy {
         name: FieldVisibility::PreJoin,
         description: FieldVisibility::PreJoin,
         economic_policy: FieldVisibility::PreJoin,
-        tool_interface_count: FieldVisibility::PreJoin,
+        outlet_interface_count: FieldVisibility::PreJoin,
         child_context_info: FieldVisibility::PreJoin,
     }
 }
@@ -269,10 +269,10 @@ const fn member_count_hidden_visibility() -> MetadataVisibilityPolicy {
 /// | `BilateralPersistent` | Encrypted | messages + ban | Yes | private | None | Forbidden | None |
 /// | `Coordination` | Encrypted | messages + invoke + ban | Yes | private | None | Required | None |
 /// | `GroupDiscussion` | Encrypted | messages + invite + ban | Yes | group | None | Optional | None |
-/// | `PublicBroadcast` | Broadcast | messages + tools | No | default | Public | Optional | None |
-/// | `GatedBroadcast` | Broadcast | messages + tools | No | member_count_hidden | Gated | Optional | None |
-/// | `ToolInterfaceTemplate` | Encrypted | messages + tools + ban | Yes | default | None | Optional | None |
-/// | `PaidService` | Encrypted | messages + tools + ban | Yes | member_count_hidden | None | Optional | Required (per_outlet_call) |
+/// | `PublicBroadcast` | Broadcast | messages + outlets | No | default | Public | Optional | None |
+/// | `GatedBroadcast` | Broadcast | messages + outlets | No | member_count_hidden | Gated | Optional | None |
+/// | `OutletInterfaceTemplate` | Encrypted | messages + outlets + ban | Yes | default | None | Optional | None |
+/// | `PaidService` | Encrypted | messages + outlets + ban | Yes | member_count_hidden | None | Optional | Required (per_outlet_call) |
 /// | `PaidBroadcast` | Broadcast | messages | No | member_count_hidden | Gated | Optional | Required (per_period) |
 #[must_use]
 #[allow(clippy::too_many_lines)] // one arm per template variant; splitting hurts readability
@@ -284,7 +284,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             ceiling_policy: CeilingPolicy::Immutable,
             promotion_policy: PromotionPolicy::NoPromotion,
             roles: Vec::new(),
-            tools: Vec::new(),
+            outlets: Vec::new(),
             ttl: None,
             memory_scope: MemoryScope::Ephemeral,
             governance: GovernanceModel::SingleAdmin,
@@ -312,7 +312,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             ceiling_policy: CeilingPolicy::Immutable,
             promotion_policy: PromotionPolicy::NoPromotion,
             roles: Vec::new(),
-            tools: Vec::new(),
+            outlets: Vec::new(),
             ttl: None,
             memory_scope: MemoryScope::Full,
             governance: GovernanceModel::SingleAdmin,
@@ -340,7 +340,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             ceiling_policy: CeilingPolicy::Immutable,
             promotion_policy: PromotionPolicy::NoPromotion,
             roles: Vec::new(),
-            tools: Vec::new(),
+            outlets: Vec::new(),
             ttl: None,
             memory_scope: MemoryScope::Summary,
             governance: GovernanceModel::SingleAdmin,
@@ -368,7 +368,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             ceiling_policy: CeilingPolicy::Immutable,
             promotion_policy: PromotionPolicy::Promotable,
             roles: Vec::new(),
-            tools: Vec::new(),
+            outlets: Vec::new(),
             ttl: None,
             memory_scope: MemoryScope::Full,
             governance: GovernanceModel::SingleAdmin,
@@ -392,11 +392,11 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
         },
         TemplateId::PublicBroadcast => ContextParams {
             mode: ContextMode::Broadcast,
-            ceiling: messaging_tools_ceiling(),
+            ceiling: messaging_outlets_ceiling(),
             ceiling_policy: CeilingPolicy::Immutable,
             promotion_policy: PromotionPolicy::NoPromotion,
             roles: Vec::new(),
-            tools: Vec::new(),
+            outlets: Vec::new(),
             ttl: None,
             memory_scope: MemoryScope::Full,
             governance: GovernanceModel::SingleAdmin,
@@ -423,11 +423,11 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
         },
         TemplateId::GatedBroadcast => ContextParams {
             mode: ContextMode::Broadcast,
-            ceiling: messaging_tools_ceiling(),
+            ceiling: messaging_outlets_ceiling(),
             ceiling_policy: CeilingPolicy::Immutable,
             promotion_policy: PromotionPolicy::NoPromotion,
             roles: Vec::new(),
-            tools: Vec::new(),
+            outlets: Vec::new(),
             ttl: None,
             memory_scope: MemoryScope::Full,
             governance: GovernanceModel::SingleAdmin,
@@ -452,17 +452,17 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             consequence_config: ConsequenceConfig::default(),
             sybil_policy: None,
         },
-        TemplateId::ToolInterfaceTemplate => ContextParams {
+        TemplateId::OutletInterfaceTemplate => ContextParams {
             mode: ContextMode::Encrypted,
-            ceiling: messaging_tools_ban_ceiling(),
+            ceiling: messaging_outlets_ban_ceiling(),
             ceiling_policy: CeilingPolicy::Immutable,
             promotion_policy: PromotionPolicy::NoPromotion,
             roles: Vec::new(),
-            tools: Vec::new(),
+            outlets: Vec::new(),
             ttl: None,
             memory_scope: MemoryScope::Full,
             governance: GovernanceModel::SingleAdmin,
-            template_id: Some(TemplateId::ToolInterfaceTemplate),
+            template_id: Some(TemplateId::OutletInterfaceTemplate),
             economic_policy: None,
             metadata_visibility: MetadataVisibilityPolicy::default(),
             projection_policy: None,
@@ -480,15 +480,15 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             consequence_config: ConsequenceConfig::default(),
             sybil_policy: None,
         },
-        // Extends scp:template/tool-interface -- same ceiling and governance,
+        // Extends scp:template/outlet-interface -- same ceiling and governance,
         // but economic_policy is caller-provided and validated separately.
         TemplateId::PaidService => ContextParams {
             mode: ContextMode::Encrypted,
-            ceiling: messaging_tools_ban_ceiling(),
+            ceiling: messaging_outlets_ban_ceiling(),
             ceiling_policy: CeilingPolicy::Immutable,
             promotion_policy: PromotionPolicy::NoPromotion,
             roles: Vec::new(),
-            tools: Vec::new(),
+            outlets: Vec::new(),
             ttl: None,
             memory_scope: MemoryScope::Full,
             governance: GovernanceModel::SingleAdmin,
@@ -518,7 +518,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             ceiling_policy: CeilingPolicy::Immutable,
             promotion_policy: PromotionPolicy::NoPromotion,
             roles: Vec::new(),
-            tools: Vec::new(),
+            outlets: Vec::new(),
             ttl: None,
             memory_scope: MemoryScope::Full,
             governance: GovernanceModel::SingleAdmin,
@@ -543,16 +543,16 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             consequence_config: ConsequenceConfig::default(),
             sybil_policy: None,
         },
-        // Context: encrypted mode with messaging + tool invocation
+        // Context: encrypted mode with messaging + outlet invocation
         // ceiling. Discoverable by default so it can be found via DHT. Used
-        // to bootstrap agent discovery via standardized tool schemas (ADR-020).
+        // to bootstrap agent discovery via standardized outlet schemas (ADR-020).
         TemplateId::HandleRegistry => ContextParams {
             mode: ContextMode::Encrypted,
             ceiling: messaging_outlet_call_ban_ceiling(),
             ceiling_policy: CeilingPolicy::Immutable,
             promotion_policy: PromotionPolicy::NoPromotion,
             roles: Vec::new(),
-            tools: Vec::new(),
+            outlets: Vec::new(),
             ttl: None,
             memory_scope: MemoryScope::Full,
             governance: GovernanceModel::SingleAdmin,
@@ -617,7 +617,7 @@ const fn ttl_policy(template_id: TemplateId) -> TtlPolicy {
         TemplateId::GroupDiscussion
         | TemplateId::PublicBroadcast
         | TemplateId::GatedBroadcast
-        | TemplateId::ToolInterfaceTemplate
+        | TemplateId::OutletInterfaceTemplate
         | TemplateId::PaidService
         | TemplateId::PaidBroadcast
         | TemplateId::HandleRegistry => TtlPolicy::Optional,
@@ -738,13 +738,13 @@ pub fn validate_against_template(params: &ContextParams) -> Result<(), TemplateE
         });
     }
 
-    // Tools
-    if params.tools != expected.tools {
+    // Outlets
+    if params.outlets != expected.outlets {
         return Err(TemplateError::Mismatch {
             template: *template_id,
-            field: "tools",
-            expected: format!("{:?}", expected.tools),
-            actual: format!("{:?}", params.tools),
+            field: "outlets",
+            expected: format!("{:?}", expected.outlets),
+            actual: format!("{:?}", params.outlets),
         });
     }
 
@@ -930,7 +930,7 @@ mod tests {
         assert_eq!(params.ceiling_policy, CeilingPolicy::Immutable);
         assert_eq!(params.promotion_policy, PromotionPolicy::NoPromotion);
         assert!(params.roles.is_empty());
-        assert!(params.tools.is_empty());
+        assert!(params.outlets.is_empty());
         assert!(params.ttl.is_none());
         assert_eq!(params.memory_scope, MemoryScope::Ephemeral);
         assert_eq!(params.governance, GovernanceModel::SingleAdmin);
@@ -955,7 +955,7 @@ mod tests {
         assert_eq!(params.ceiling_policy, CeilingPolicy::Immutable);
         assert_eq!(params.promotion_policy, PromotionPolicy::NoPromotion);
         assert!(params.roles.is_empty());
-        assert!(params.tools.is_empty());
+        assert!(params.outlets.is_empty());
         assert!(params.ttl.is_none());
         assert_eq!(params.memory_scope, MemoryScope::Full);
         assert_eq!(params.governance, GovernanceModel::SingleAdmin);
@@ -992,7 +992,7 @@ mod tests {
         assert_eq!(params.ceiling_policy, CeilingPolicy::Immutable);
         assert_eq!(params.promotion_policy, PromotionPolicy::NoPromotion);
         assert!(params.roles.is_empty());
-        assert!(params.tools.is_empty());
+        assert!(params.outlets.is_empty());
         assert!(params.ttl.is_none());
         assert_eq!(params.memory_scope, MemoryScope::Summary);
         assert_eq!(params.governance, GovernanceModel::SingleAdmin);
@@ -1018,7 +1018,7 @@ mod tests {
         assert_eq!(params.ceiling_policy, CeilingPolicy::Immutable);
         assert_eq!(params.promotion_policy, PromotionPolicy::Promotable);
         assert!(params.roles.is_empty());
-        assert!(params.tools.is_empty());
+        assert!(params.outlets.is_empty());
         assert!(params.ttl.is_none());
         assert_eq!(params.memory_scope, MemoryScope::Full);
         assert_eq!(params.governance, GovernanceModel::SingleAdmin);
@@ -1061,7 +1061,7 @@ mod tests {
         assert_eq!(params.ceiling_policy, CeilingPolicy::Immutable);
         assert_eq!(params.promotion_policy, PromotionPolicy::NoPromotion);
         assert!(params.roles.is_empty());
-        assert!(params.tools.is_empty());
+        assert!(params.outlets.is_empty());
         assert!(params.ttl.is_none());
         assert_eq!(params.memory_scope, MemoryScope::Full);
         assert_eq!(params.governance, GovernanceModel::SingleAdmin);
@@ -1113,7 +1113,7 @@ mod tests {
         assert_eq!(params.ceiling_policy, CeilingPolicy::Immutable);
         assert_eq!(params.promotion_policy, PromotionPolicy::NoPromotion);
         assert!(params.roles.is_empty());
-        assert!(params.tools.is_empty());
+        assert!(params.outlets.is_empty());
         assert!(params.ttl.is_none());
         assert_eq!(params.memory_scope, MemoryScope::Full);
         assert_eq!(params.governance, GovernanceModel::SingleAdmin);
@@ -1400,7 +1400,7 @@ mod tests {
             TemplateId::GroupDiscussion,
             TemplateId::PublicBroadcast,
             TemplateId::GatedBroadcast,
-            TemplateId::ToolInterfaceTemplate,
+            TemplateId::OutletInterfaceTemplate,
             TemplateId::PaidService,
             TemplateId::PaidBroadcast,
             TemplateId::HandleRegistry,
@@ -1537,7 +1537,7 @@ mod tests {
             TemplateId::GroupDiscussion,
             TemplateId::PublicBroadcast,
             TemplateId::GatedBroadcast,
-            TemplateId::ToolInterfaceTemplate,
+            TemplateId::OutletInterfaceTemplate,
             TemplateId::PaidService,
             TemplateId::PaidBroadcast,
             TemplateId::HandleRegistry,
@@ -1606,7 +1606,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // validate_against_template: roles and tools validation
+    // validate_against_template: roles and outlets validation
     // -----------------------------------------------------------------------
 
     #[test]
@@ -1627,14 +1627,14 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_unexpected_tools() {
+    fn validate_rejects_unexpected_outlets() {
         let mut params = template_params(&TemplateId::BilateralEphemeral);
         params.ttl = Some(Duration::from_mins(5));
-        params.tools = vec![super::super::outlets::OutletRegistration {
-            outlet_id: "rogue-tool".to_owned(),
+        params.outlets = vec![super::super::outlets::OutletRegistration {
+            outlet_id: "rogue-outlet".to_owned(),
             kind: crate::context::outlets::OutletKind::Action,
-            name: "rogue-tool".to_owned(),
-            description: "Rogue tool for testing".to_owned(),
+            name: "rogue-outlet".to_owned(),
+            description: "Rogue outlet for testing".to_owned(),
             schema: super::super::outlets::OutletSchema {
                 input_schema: serde_json::json!({"type": "object"}),
                 output_schema: serde_json::json!({"type": "object"}),
@@ -1651,7 +1651,7 @@ mod tests {
         let err = validate_against_template(&params).unwrap_err();
         assert!(matches!(
             err,
-            TemplateError::Mismatch { field: "tools", .. }
+            TemplateError::Mismatch { field: "outlets", .. }
         ));
     }
 
@@ -1769,7 +1769,7 @@ mod tests {
         assert_eq!(params.ceiling_policy, CeilingPolicy::Immutable);
         assert_eq!(params.promotion_policy, PromotionPolicy::NoPromotion);
         assert!(params.roles.is_empty());
-        assert!(params.tools.is_empty());
+        assert!(params.outlets.is_empty());
         assert!(params.ttl.is_none());
         assert_eq!(params.memory_scope, MemoryScope::Full);
         assert_eq!(params.governance, GovernanceModel::SingleAdmin);
@@ -1800,7 +1800,7 @@ mod tests {
         assert_eq!(params.ceiling_policy, CeilingPolicy::Immutable);
         assert_eq!(params.promotion_policy, PromotionPolicy::NoPromotion);
         assert!(params.roles.is_empty());
-        assert!(params.tools.is_empty());
+        assert!(params.outlets.is_empty());
         assert!(params.ttl.is_none());
         assert_eq!(params.memory_scope, MemoryScope::Full);
         assert_eq!(params.governance, GovernanceModel::SingleAdmin);
@@ -2054,7 +2054,7 @@ mod tests {
             TemplateId::BilateralPersistent,
             TemplateId::Coordination,
             TemplateId::GroupDiscussion,
-            TemplateId::ToolInterfaceTemplate,
+            TemplateId::OutletInterfaceTemplate,
             TemplateId::PaidService,
             TemplateId::HandleRegistry,
         ];
@@ -2134,8 +2134,8 @@ mod tests {
     }
 
     #[test]
-    fn tool_interface_has_all_pre_join_visibility() {
-        let params = template_params(&TemplateId::ToolInterfaceTemplate);
+    fn outlet_interface_has_all_pre_join_visibility() {
+        let params = template_params(&TemplateId::OutletInterfaceTemplate);
         assert_eq!(
             params.metadata_visibility,
             MetadataVisibilityPolicy::default()
@@ -2180,7 +2180,7 @@ mod tests {
             TemplateId::BilateralPersistent,
             TemplateId::Coordination,
             TemplateId::GroupDiscussion,
-            TemplateId::ToolInterfaceTemplate,
+            TemplateId::OutletInterfaceTemplate,
             TemplateId::PaidService,
             TemplateId::HandleRegistry,
         ];

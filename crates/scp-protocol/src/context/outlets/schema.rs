@@ -1,6 +1,6 @@
 //! JSON Schema validation helpers and MCP compatibility utilities.
 //!
-//! Provides structural validation for JSON Schema objects used in tool
+//! Provides structural validation for JSON Schema objects used in outlet
 //! registration and full JSON Schema validation (via the `jsonschema` crate)
 //! for validating values against schemas at runtime. Schema structure checks
 //! verify that schemas are JSON objects with a `"type"` field.
@@ -8,7 +8,7 @@
 //! enforcement (properties, required, additionalProperties, items,
 //! numeric/string constraints, etc.).
 //!
-//! MCP compatibility: tool schemas follow the MCP (Model Context Protocol)
+//! MCP compatibility: outlet schemas follow the MCP (Model Context Protocol)
 //! JSON Schema convention where both input and output are described as
 //! JSON Schema objects. See spec section 8.5 and ADR-010.
 
@@ -116,7 +116,7 @@ pub fn validate_value_against_schema(value: &Value, schema: &Value) -> Result<()
 /// Minimum number of distinct property fields required by the schema
 /// specificity floor (spec section 6.2, 9.2.1).
 ///
-/// Prevents degenerate broad-schema tools that function as arbitrary
+/// Prevents degenerate broad-schema outlets that function as arbitrary
 /// message channels. At least one of the input or output schemas must
 /// declare this many distinct property fields.
 pub const MIN_SCHEMA_FIELDS: usize = 2;
@@ -134,7 +134,7 @@ pub fn count_schema_fields(schema: &Value) -> usize {
         .map_or(0, serde_json::Map::len)
 }
 
-/// Validates the schema specificity floor for a tool registration.
+/// Validates the schema specificity floor for a outlet registration.
 ///
 /// At least one of the input or output schemas must declare at least
 /// [`MIN_SCHEMA_FIELDS`] distinct property fields. This prevents
@@ -178,7 +178,7 @@ const fn json_type_name(value: &Value) -> &'static str {
 
 /// Creates a minimal valid JSON Schema for an object type.
 ///
-/// Utility for test code and tool registration where a simple object schema
+/// Utility for test code and outlet registration where a simple object schema
 /// is needed.
 #[must_use]
 pub fn object_schema() -> Value {
@@ -519,7 +519,7 @@ mod tests {
             "type": "string",
             "maxLength": 3
         });
-        let value = serde_json::json!("toolong");
+        let value = serde_json::json!("outletong");
         assert!(validate_value_against_schema(&value, &schema).is_err());
     }
 

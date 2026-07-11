@@ -1,7 +1,7 @@
-//! Cross-context tool invocation saga signed types (spec §6.2.4).
+//! Cross-context outlet invocation saga signed types (spec §6.2.4).
 //!
 //! This module defines the two signed protocol types produced by the
-//! `CrossContextToolInvocation` saga's terminal paths:
+//! `CrossContextOutletInvocation` saga's terminal paths:
 //!
 //! - [`CrossContextOutletReceipt`] — the target's signed response on the return
 //!   path. It is **self-verifying**: every field of the signature preimage is
@@ -24,7 +24,7 @@
 //! which would be splice-ambiguous across the variable-length string fields.
 //!
 //! Domain separators (registered in §9.18.2):
-//! - `"SCP-XCTX-RECEIPT-V1:"` — cross-context tool receipt signing.
+//! - `"SCP-XCTX-RECEIPT-V1:"` — cross-context outlet receipt signing.
 //! - `"SCP-XCTX-DIVERGENCE-V1:"` — cross-context divergence marker signing.
 
 use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
@@ -70,9 +70,9 @@ pub enum CrossContextSagaError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CommittedSide {
-    /// The initiating (caller) context committed its `CrossContextToolInvoked` record.
+    /// The initiating (caller) context committed its `CrossContextOutletInvoked` record.
     Caller,
-    /// The executing (target) context committed its `ToolInvoked` record.
+    /// The executing (target) context committed its `OutletInvoked` record.
     Target,
 }
 
@@ -100,7 +100,7 @@ fn output_hash(output_jcs: &[u8]) -> [u8; 32] {
     Sha256::digest(output_jcs).into()
 }
 
-/// The target's signed response on the cross-context tool invocation return path
+/// The target's signed response on the cross-context outlet invocation return path
 /// (§6.2.4, *Receipt / response return path*).
 ///
 /// The receipt carries every field of its signature preimage plus the target's
@@ -115,7 +115,7 @@ fn output_hash(output_jcs: &[u8]) -> [u8; 32] {
 /// - `nonce` — the staged 16-byte correlation/dedup token (B's copy of the wire
 ///   nonce). It is the join key between the two event-log records.
 /// - `chain_depth` — **B's re-derived inbound depth** (`incoming + 1`), identical
-///   to the value B wrote into `ToolInvoked`, never the caller-asserted envelope
+///   to the value B wrote into `OutletInvoked`, never the caller-asserted envelope
 ///   value. A `u8` per §6.2.0 (`max_chain_depth` range `[1, 255]`).
 /// - `timestamp_ms` — **B's Prepare-B capture instant** (the staged
 ///   `recorded_timestamp_ms`, "when the target accepted the call"), never the
@@ -131,7 +131,7 @@ pub struct CrossContextOutletReceipt {
     #[serde(with = "crate::serde_util::serde_hash_32")]
     pub caller_context_id: [u8; 32],
     /// Raw 32-byte digest of the executing (target) context — the context B
-    /// verified and executed the tool in.
+    /// verified and executed the outlet in.
     #[serde(with = "crate::serde_util::serde_hash_32")]
     pub target_context_id: [u8; 32],
     /// The caller principal DID the receipt is issued to (confused-deputy binding).
@@ -139,12 +139,12 @@ pub struct CrossContextOutletReceipt {
     /// Staged 16-byte correlation/dedup nonce (B's copy of the wire value).
     #[serde(with = "crate::serde_util::serde_nonce_16")]
     pub nonce: [u8; 16],
-    /// Context-local tool registration id B executed (indexes B's own registry).
+    /// Context-local outlet registration id B executed (indexes B's own registry).
     pub outlet_registration_id: String,
     /// The output as its JCS-canonical bytes — the exact preimage of `output_hash`.
     #[serde(with = "crate::serde_util::serde_bounded_bytes")]
     pub output_jcs: Vec<u8>,
-    /// The target's `ToolInvoked` event-log entry id this receipt links to.
+    /// The target's `OutletInvoked` event-log entry id this receipt links to.
     pub outlet_invoked_event_id: String,
     /// B's re-derived inbound chain depth (`incoming + 1`), never caller-asserted.
     pub chain_depth: u8,
@@ -182,11 +182,11 @@ pub struct CrossContextOutletReceiptFields {
     pub caller_did: String,
     /// Staged 16-byte correlation/dedup nonce (B's copy of the wire value).
     pub nonce: [u8; 16],
-    /// Context-local tool registration id B executed (indexes B's own registry).
+    /// Context-local outlet registration id B executed (indexes B's own registry).
     pub outlet_registration_id: String,
     /// The output as its JCS-canonical bytes — the exact preimage of `output_hash`.
     pub output_jcs: Vec<u8>,
-    /// The target's `ToolInvoked` event-log entry id this receipt links to.
+    /// The target's `OutletInvoked` event-log entry id this receipt links to.
     pub outlet_invoked_event_id: String,
     /// B's re-derived inbound chain depth (`incoming + 1`), never caller-asserted.
     pub chain_depth: u8,
@@ -236,7 +236,7 @@ impl CrossContextOutletReceipt {
 
     /// Fields needed to construct and sign a [`CrossContextOutletReceipt`].
     ///
-    /// `output_jcs` MUST already be the JCS-canonical serialization of the tool
+    /// `output_jcs` MUST already be the JCS-canonical serialization of the outlet
     /// output (`jcs::to_string(output).into_bytes()`); the receipt carries those
     /// exact bytes so the verifier can recompute `output_hash` without
     /// re-canonicalizing (§6.2.4 Output canonicalization obligation).
@@ -277,7 +277,7 @@ impl CrossContextOutletReceipt {
         Ok(receipt)
     }
 
-    /// Verify a cross-context tool receipt (§6.2.4).
+    /// Verify a cross-context outlet receipt (§6.2.4).
     ///
     /// Verification performs, in order:
     /// 1. recompute `output_hash` from the carried JCS-canonical output bytes;
@@ -475,7 +475,7 @@ mod tests {
                 nonce: [0x33; 16],
                 outlet_registration_id: "calc.add".to_owned(),
                 output_jcs: br#"{"result":42}"#.to_vec(),
-                outlet_invoked_event_id: "evt-tool-invoked-1".to_owned(),
+                outlet_invoked_event_id: "evt-outlet-invoked-1".to_owned(),
                 chain_depth: 3,
                 timestamp_ms: 1_709_654_400_000,
             },
@@ -501,8 +501,8 @@ mod tests {
         h.update(8u32.to_be_bytes()); // len("calc.add")
         h.update(b"calc.add");
         h.update(output_hash); // Fixed32(output_hash)
-        h.update(18u32.to_be_bytes()); // len("evt-tool-invoked-1")
-        h.update(b"evt-tool-invoked-1");
+        h.update(18u32.to_be_bytes()); // len("evt-outlet-invoked-1")
+        h.update(b"evt-outlet-invoked-1");
         h.update([3u8]); // U8(chain_depth)
         h.update(1_709_654_400_000u64.to_be_bytes()); // U64(timestamp_ms)
         let expected: [u8; 32] = h.finalize().into();
@@ -561,7 +561,7 @@ mod tests {
 
         // outlet_invoked_event_id
         let mut t = base.clone();
-        t.outlet_invoked_event_id = "evt-tool-invoked-2".to_owned();
+        t.outlet_invoked_event_id = "evt-outlet-invoked-2".to_owned();
         assert!(t.verify(&vk).is_err());
 
         // chain_depth
@@ -614,7 +614,7 @@ mod tests {
     }
 
     #[test]
-    fn receipt_splice_resistance_tool_registration_id_boundary() {
+    fn receipt_splice_resistance_outlet_registration_id_boundary() {
         // Two receipts differing only in where the caller_did / outlet_registration_id
         // boundary falls must produce different preimages — length-prefixing prevents
         // splice ambiguity that raw concatenation would admit.
@@ -627,7 +627,7 @@ mod tests {
                 target_context_id: [0x22; 32],
                 caller_did: "did:example:ab".to_owned(),
                 nonce: [0x33; 16],
-                outlet_registration_id: "ctool".to_owned(),
+                outlet_registration_id: "coutlet".to_owned(),
                 output_jcs: b"{}".to_vec(),
                 outlet_invoked_event_id: "evt".to_owned(),
                 chain_depth: 1,
@@ -642,7 +642,7 @@ mod tests {
                 target_context_id: [0x22; 32],
                 caller_did: "did:example:a".to_owned(),
                 nonce: [0x33; 16],
-                outlet_registration_id: "bctool".to_owned(),
+                outlet_registration_id: "bcoutlet".to_owned(),
                 output_jcs: b"{}".to_vec(),
                 outlet_invoked_event_id: "evt".to_owned(),
                 chain_depth: 1,

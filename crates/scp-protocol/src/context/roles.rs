@@ -2556,7 +2556,7 @@ mod tests {
         let caps = vec![
             Capability::MessagesRead,
             Capability::MessagesWrite,
-            Capability::OutletCall("tool-1".to_owned()),
+            Capability::OutletCall("outlet-1".to_owned()),
             Capability::OutletCallAll,
             Capability::OutletRegister,
             Capability::MemberInvite,
@@ -2581,7 +2581,7 @@ mod tests {
 
     #[test]
     fn capability_clone_preserves_equality() {
-        let cap = Capability::OutletCall("my-tool".to_owned());
+        let cap = Capability::OutletCall("my-outlet".to_owned());
         let cloned = cap.clone();
         assert_eq!(cap, cloned);
     }
@@ -2638,7 +2638,7 @@ mod tests {
         let standard_caps = vec![
             Capability::MessagesRead,
             Capability::MessagesWrite,
-            Capability::OutletCall("my-tool".to_owned()),
+            Capability::OutletCall("my-outlet".to_owned()),
             Capability::OutletCallAll,
             Capability::OutletRegister,
             Capability::MemberInvite,
@@ -2762,18 +2762,18 @@ mod tests {
     #[test]
     fn ceiling_outlet_call_all_implies_specific_call() {
         let ceiling = CapabilityCeiling::new([Capability::OutletCallAll, Capability::MessagesRead]);
-        assert!(ceiling.contains(&Capability::OutletCall("any-tool".to_owned())));
-        assert!(ceiling.contains(&Capability::OutletCall("another-tool".to_owned())));
+        assert!(ceiling.contains(&Capability::OutletCall("any-outlet".to_owned())));
+        assert!(ceiling.contains(&Capability::OutletCall("another-outlet".to_owned())));
     }
 
     #[test]
     fn ceiling_specific_call_does_not_imply_all() {
         let ceiling = CapabilityCeiling::new([
-            Capability::OutletCall("specific-tool".to_owned()),
+            Capability::OutletCall("specific-outlet".to_owned()),
             Capability::MessagesRead,
         ]);
-        assert!(ceiling.contains(&Capability::OutletCall("specific-tool".to_owned())));
-        assert!(!ceiling.contains(&Capability::OutletCall("other-tool".to_owned())));
+        assert!(ceiling.contains(&Capability::OutletCall("specific-outlet".to_owned())));
+        assert!(!ceiling.contains(&Capability::OutletCall("other-outlet".to_owned())));
         assert!(!ceiling.contains(&Capability::OutletCallAll));
     }
 
@@ -2826,7 +2826,7 @@ mod tests {
         let ceiling = CapabilityCeiling::new([Capability::OutletCallAll]);
         assert!(check_ceiling(
             &ceiling,
-            &Capability::OutletCall("test-tool".to_owned())
+            &Capability::OutletCall("test-outlet".to_owned())
         ));
     }
 
@@ -5693,7 +5693,7 @@ mod tests {
 
     #[test]
     fn out014_capability_new_returns_none_for_pre_rename_tool_forms() {
-        // The pre-rename `tool:*` legacy forms are removed with no transitional
+        // The pre-rename `outlet:*` legacy forms are removed with no transitional
         // alias (SCP-OUT-002 / SCP-OUT-014).
         assert_eq!(Capability::new("tool:invoke:foo"), None);
         assert_eq!(Capability::new("tool:invoke:*"), None);

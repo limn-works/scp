@@ -1,45 +1,45 @@
-//! Standard tool schemas, parameter/result types, and registration events for
-//! contexts with discovery tools.
+//! Standard outlet schemas, parameter/result types, and registration events for
+//! contexts with discovery outlets.
 //!
-//! These are standard SCP contexts equipped with standardized tool
+//! These are standard SCP contexts equipped with standardized outlet
 //! schemas for agent search, registration, and deregistration. This module
-//! defines the canonical tool names, typed parameters, result envelopes, and
+//! defines the canonical outlet names, typed parameters, result envelopes, and
 //! registration event payloads.
 //!
-//! Standard tool schemas (conventions per ADR-020):
+//! Standard outlet schemas (conventions per ADR-020):
 //! - `agent_search(query) -> { results }` -- search the registry.
 //! - `agent_register(did, capabilities, metadata) -> { registered, entry_id }` -- register an agent.
 //! - `agent_deregister(did) -> { removed }` -- deregister an agent.
 //!
-//! Custom tools (reputation scoring, category browsing, geographic filtering)
+//! Custom outlets (reputation scoring, category browsing, geographic filtering)
 //! are allowed beyond the standard set.
 //!
 //! See ADR-020 in `.docs/adrs/phase-4.md`, acceptance criteria 3-10.
 
 use serde::{Deserialize, Serialize};
 
-use super::handles::{TOOL_HANDLE_DEREGISTER, TOOL_HANDLE_LOOKUP, TOOL_HANDLE_REGISTER};
-use super::scope::{TOOL_SCOPE_DEREGISTER, TOOL_SCOPE_LOOKUP, TOOL_SCOPE_REGISTER};
+use super::handles::{OUTLET_HANDLE_DEREGISTER, OUTLET_HANDLE_LOOKUP, OUTLET_HANDLE_REGISTER};
+use super::scope::{OUTLET_SCOPE_DEREGISTER, OUTLET_SCOPE_LOOKUP, OUTLET_SCOPE_REGISTER};
 use super::{DID, RegistrationEntry};
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
-/// Standard tool name for agent search.
-pub const TOOL_AGENT_SEARCH: &str = "agent_search";
+/// Standard outlet name for agent search.
+pub const OUTLET_AGENT_SEARCH: &str = "agent_search";
 
-/// Standard tool name for agent registration.
-pub const TOOL_AGENT_REGISTER: &str = "agent_register";
+/// Standard outlet name for agent registration.
+pub const OUTLET_AGENT_REGISTER: &str = "agent_register";
 
-/// Standard tool name for agent deregistration.
-pub const TOOL_AGENT_DEREGISTER: &str = "agent_deregister";
+/// Standard outlet name for agent deregistration.
+pub const OUTLET_AGENT_DEREGISTER: &str = "agent_deregister";
 
 // ---------------------------------------------------------------------------
 // AgentSearchParams
 // ---------------------------------------------------------------------------
 
-/// Parameters for the `agent_search` standard tool.
+/// Parameters for the `agent_search` standard outlet.
 ///
 /// All fields are optional filters. An empty query matches all entries.
 ///
@@ -59,7 +59,7 @@ pub struct AgentSearchParams {
 // AgentSearchResult
 // ---------------------------------------------------------------------------
 
-/// Result of an `agent_search` tool invocation.
+/// Result of an `agent_search` outlet invocation.
 ///
 /// See ADR-020 acceptance criterion 3.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -74,7 +74,7 @@ pub struct AgentSearchResult {
 // AgentRegisterParams
 // ---------------------------------------------------------------------------
 
-/// Parameters for the `agent_register` standard tool.
+/// Parameters for the `agent_register` standard outlet.
 ///
 /// Sent as a DID-signed request by a reader. A writer verifies the signature
 /// and records the registration in the event log as an application message.
@@ -95,7 +95,7 @@ pub struct AgentRegisterParams {
 // AgentRegisterResult
 // ---------------------------------------------------------------------------
 
-/// Result of an `agent_register` tool invocation.
+/// Result of an `agent_register` outlet invocation.
 ///
 /// See ADR-020 acceptance criterion 5.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -110,9 +110,9 @@ pub struct AgentRegisterResult {
 // AgentDeregisterParams
 // ---------------------------------------------------------------------------
 
-/// Parameters for the `agent_deregister` standard tool.
+/// Parameters for the `agent_deregister` standard outlet.
 ///
-/// Privacy: registration is withdrawable via this tool. The agent must
+/// Privacy: registration is withdrawable via this outlet. The agent must
 /// authenticate as the entry owner.
 ///
 /// See ADR-020 acceptance criterion 9.
@@ -126,7 +126,7 @@ pub struct AgentDeregisterParams {
 // AgentDeregisterResult
 // ---------------------------------------------------------------------------
 
-/// Result of an `agent_deregister` tool invocation.
+/// Result of an `agent_deregister` outlet invocation.
 ///
 /// See ADR-020 acceptance criterion 9.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -174,10 +174,10 @@ pub enum RegistrationEvent {
 }
 
 // ---------------------------------------------------------------------------
-// Standard tool schemas (JSON)
+// Standard outlet schemas (JSON)
 // ---------------------------------------------------------------------------
 
-/// Returns the JSON Schema for the `agent_search` tool.
+/// Returns the JSON Schema for the `agent_search` outlet.
 #[must_use]
 pub fn agent_search_schema() -> serde_json::Value {
     serde_json::json!({
@@ -201,7 +201,7 @@ pub fn agent_search_schema() -> serde_json::Value {
     })
 }
 
-/// Returns the JSON Schema for the `agent_register` tool.
+/// Returns the JSON Schema for the `agent_register` outlet.
 #[must_use]
 pub fn agent_register_schema() -> serde_json::Value {
     serde_json::json!({
@@ -225,7 +225,7 @@ pub fn agent_register_schema() -> serde_json::Value {
     })
 }
 
-/// Returns the JSON Schema for the `agent_deregister` tool.
+/// Returns the JSON Schema for the `agent_deregister` outlet.
 #[must_use]
 pub fn agent_deregister_schema() -> serde_json::Value {
     serde_json::json!({
@@ -244,21 +244,21 @@ pub fn agent_deregister_schema() -> serde_json::Value {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-/// Returns whether a tool name matches one of the standard discovery tool
+/// Returns whether a outlet name matches one of the standard discovery outlet
 /// names.
 #[must_use]
-pub fn is_standard_tool(name: &str) -> bool {
+pub fn is_standard_outlet(name: &str) -> bool {
     matches!(
         name,
-        TOOL_AGENT_SEARCH
-            | TOOL_AGENT_REGISTER
-            | TOOL_AGENT_DEREGISTER
-            | TOOL_SCOPE_REGISTER
-            | TOOL_SCOPE_LOOKUP
-            | TOOL_SCOPE_DEREGISTER
-            | TOOL_HANDLE_REGISTER
-            | TOOL_HANDLE_LOOKUP
-            | TOOL_HANDLE_DEREGISTER
+        OUTLET_AGENT_SEARCH
+            | OUTLET_AGENT_REGISTER
+            | OUTLET_AGENT_DEREGISTER
+            | OUTLET_SCOPE_REGISTER
+            | OUTLET_SCOPE_LOOKUP
+            | OUTLET_SCOPE_DEREGISTER
+            | OUTLET_HANDLE_REGISTER
+            | OUTLET_HANDLE_LOOKUP
+            | OUTLET_HANDLE_DEREGISTER
     )
 }
 
@@ -269,14 +269,14 @@ pub fn is_standard_tool(name: &str) -> bool {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
-    use super::super::handles::{TOOL_HANDLE_DEREGISTER, TOOL_HANDLE_LOOKUP, TOOL_HANDLE_REGISTER};
-    use super::super::scope::{TOOL_SCOPE_DEREGISTER, TOOL_SCOPE_LOOKUP, TOOL_SCOPE_REGISTER};
+    use super::super::handles::{OUTLET_HANDLE_DEREGISTER, OUTLET_HANDLE_LOOKUP, OUTLET_HANDLE_REGISTER};
+    use super::super::scope::{OUTLET_SCOPE_DEREGISTER, OUTLET_SCOPE_LOOKUP, OUTLET_SCOPE_REGISTER};
     use super::*;
 
     const AGENT_A_DID: &str = "did:dht:z6MkAgentA";
     const WRITER_DID: &str = "did:dht:z6MkWriter";
 
-    // -- Standard tool schemas --------------------------------------------
+    // -- Standard outlet schemas --------------------------------------------
 
     #[test]
     fn agent_search_schema_is_valid_json_object() {
@@ -385,25 +385,25 @@ mod tests {
         assert_eq!(event, deserialized);
     }
 
-    // -- is_standard_tool -------------------------------------------------
+    // -- is_standard_outlet -------------------------------------------------
 
     #[test]
-    fn is_standard_tool_detects_standard_names() {
-        // agent tools
-        assert!(is_standard_tool(TOOL_AGENT_SEARCH));
-        assert!(is_standard_tool(TOOL_AGENT_REGISTER));
-        assert!(is_standard_tool(TOOL_AGENT_DEREGISTER));
-        // scope tools
-        assert!(is_standard_tool(TOOL_SCOPE_REGISTER));
-        assert!(is_standard_tool(TOOL_SCOPE_LOOKUP));
-        assert!(is_standard_tool(TOOL_SCOPE_DEREGISTER));
-        // handle tools
-        assert!(is_standard_tool(TOOL_HANDLE_REGISTER));
-        assert!(is_standard_tool(TOOL_HANDLE_LOOKUP));
-        assert!(is_standard_tool(TOOL_HANDLE_DEREGISTER));
+    fn is_standard_outlet_detects_standard_names() {
+        // agent outlets
+        assert!(is_standard_outlet(OUTLET_AGENT_SEARCH));
+        assert!(is_standard_outlet(OUTLET_AGENT_REGISTER));
+        assert!(is_standard_outlet(OUTLET_AGENT_DEREGISTER));
+        // scope outlets
+        assert!(is_standard_outlet(OUTLET_SCOPE_REGISTER));
+        assert!(is_standard_outlet(OUTLET_SCOPE_LOOKUP));
+        assert!(is_standard_outlet(OUTLET_SCOPE_DEREGISTER));
+        // handle outlets
+        assert!(is_standard_outlet(OUTLET_HANDLE_REGISTER));
+        assert!(is_standard_outlet(OUTLET_HANDLE_LOOKUP));
+        assert!(is_standard_outlet(OUTLET_HANDLE_DEREGISTER));
         // negative cases
-        assert!(!is_standard_tool("custom_tool"));
-        assert!(!is_standard_tool(""));
+        assert!(!is_standard_outlet("custom_outlet"));
+        assert!(!is_standard_outlet(""));
     }
 
     // -- AgentSearchResult serialization ----------------------------------

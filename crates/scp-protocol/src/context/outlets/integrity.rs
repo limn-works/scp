@@ -1,4 +1,4 @@
-//! Schema-based tool integrity verification and scheduling.
+//! Schema-based outlet integrity verification and scheduling.
 //!
 //! Extends the exact-match [`verify_outlet`](super::verify_outlet) with
 //! schema-based verification that checks structural compatibility (same keys,
@@ -6,7 +6,7 @@
 //! [`ChallengeVerification`] results for integration with the trust subsystem.
 //!
 //! Also provides [`VerificationScheduler`] for periodic re-verification
-//! with configurable intervals per tool.
+//! with configurable intervals per outlet.
 //!
 //! See issue #367.
 
@@ -87,10 +87,10 @@ pub struct SchemaVectorResult {
     pub mismatch_detail: Option<String>,
 }
 
-/// Result of schema-based tool integrity verification.
+/// Result of schema-based outlet integrity verification.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SchemaVerificationResult {
-    /// The tool that was verified.
+    /// The outlet that was verified.
     pub outlet_id: OutletId,
     /// Per-vector results.
     pub vector_results: Vec<SchemaVectorResult>,
@@ -98,7 +98,7 @@ pub struct SchemaVerificationResult {
     pub integrity_ok: bool,
 }
 
-/// Verifies a tool's integrity using schema-based output comparison.
+/// Verifies a outlet's integrity using schema-based output comparison.
 ///
 /// Unlike [`verify_outlet`](super::verify_outlet) which requires exact value
 /// equality, this function checks that the actual output is *structurally
@@ -111,7 +111,7 @@ pub struct SchemaVerificationResult {
 ///
 /// # Errors
 ///
-/// Returns [`OutletError::OutletNotFound`] if the tool is not in the registry.
+/// Returns [`OutletError::OutletNotFound`] if the outlet is not in the registry.
 pub fn verify_outlet_integrity<F>(
     registry: &OutletRegistry,
     outlet_id: &str,
@@ -158,17 +158,17 @@ where
 
     let now = clock.now_secs();
 
-    let challenge_id = format!("tool-integrity-{outlet_id}-{now}");
+    let challenge_id = format!("outlet-integrity-{outlet_id}-{now}");
 
     let verification = ChallengeVerification {
         verification_id: challenge_id,
         verifier_did: verifier_did.clone(),
         subject_did: operator_did,
-        capability_uri: "scp:capability:tool-integrity/v1".to_string(),
-        context_id: None, // Tool integrity checks are context-independent
-        challenge_type: ChallengeType::tool_integrity(),
+        capability_uri: "scp:capability:outlet-integrity/v1".to_string(),
+        context_id: None, // Outlet integrity checks are context-independent
+        challenge_type: ChallengeType::outlet_integrity(),
         verification_method: VerificationMethod::ChallengeVerified {
-            challenge_type: ChallengeType::tool_integrity(),
+            challenge_type: ChallengeType::outlet_integrity(),
         },
         passed: integrity_ok,
         score: None,
@@ -219,13 +219,13 @@ pub fn schema_result_to_outlet_result(
 }
 
 // ---------------------------------------------------------------------------
-// Tool verification scheduling
+// Outlet verification scheduling
 // ---------------------------------------------------------------------------
 
-/// A scheduled verification entry for a tool.
+/// A scheduled verification entry for a outlet.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OutletVerificationSchedule {
-    /// The tool to verify.
+    /// The outlet to verify.
     pub outlet_id: OutletId,
     /// Verification interval in seconds.
     pub interval_secs: u64,
@@ -236,14 +236,14 @@ pub struct OutletVerificationSchedule {
     pub next_verification_at: u64,
 }
 
-/// Manager for periodic tool verification schedules.
+/// Manager for periodic outlet verification schedules.
 ///
-/// Tracks per-tool verification intervals and determines which tools are
+/// Tracks per-outlet verification intervals and determines which outlets are
 /// due for re-verification. The caller is responsible for actually executing
 /// the verifications -- this type only tracks scheduling state.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct VerificationScheduler {
-    /// Scheduled verification entries keyed by tool ID.
+    /// Scheduled verification entries keyed by outlet ID.
     schedules: HashMap<OutletId, OutletVerificationSchedule>,
 }
 
@@ -256,12 +256,12 @@ impl VerificationScheduler {
         }
     }
 
-    /// Schedules periodic verification for a tool.
+    /// Schedules periodic verification for a outlet.
     ///
-    /// If the tool already has a schedule, it is replaced. The first
+    /// If the outlet already has a schedule, it is replaced. The first
     /// verification is due immediately (at now).
     ///
-    pub fn schedule_tool_verification(
+    pub fn schedule_outlet_verification(
         &mut self,
         outlet_id: &str,
         interval_secs: u64,
@@ -279,23 +279,23 @@ impl VerificationScheduler {
         &self.schedules[&key]
     }
 
-    /// Removes the verification schedule for a tool.
+    /// Removes the verification schedule for a outlet.
     ///
     /// Returns true if a schedule was removed.
-    pub fn unschedule_tool_verification(&mut self, outlet_id: &str) -> bool {
+    pub fn unschedule_outlet_verification(&mut self, outlet_id: &str) -> bool {
         self.schedules.remove(outlet_id).is_some()
     }
 
-    /// Returns the schedule for a tool, if any.
+    /// Returns the schedule for a outlet, if any.
     #[must_use]
     pub fn get_schedule(&self, outlet_id: &str) -> Option<&OutletVerificationSchedule> {
         self.schedules.get(outlet_id)
     }
 
-    /// Returns all tool IDs that are due for verification at the given
+    /// Returns all outlet IDs that are due for verification at the given
     /// timestamp.
     #[must_use]
-    pub fn tools_due_at(&self, now: u64) -> Vec<OutletId> {
+    pub fn outlets_due_at(&self, now: u64) -> Vec<OutletId> {
         self.schedules
             .values()
             .filter(|s| now >= s.next_verification_at)
@@ -303,14 +303,14 @@ impl VerificationScheduler {
             .collect()
     }
 
-    /// Returns all tool IDs that are currently due for verification.
+    /// Returns all outlet IDs that are currently due for verification.
     #[must_use]
-    pub fn tools_due_now(&self, clock: &dyn Clock) -> Vec<OutletId> {
+    pub fn outlets_due_now(&self, clock: &dyn Clock) -> Vec<OutletId> {
         let now = clock.now_secs();
-        self.tools_due_at(now)
+        self.outlets_due_at(now)
     }
 
-    /// Records that a tool was verified at the given timestamp, advancing
+    /// Records that a outlet was verified at the given timestamp, advancing
     /// the next verification time.
     pub fn record_verification(&mut self, outlet_id: &str, verified_at: u64) {
         if let Some(schedule) = self.schedules.get_mut(outlet_id) {
@@ -319,13 +319,13 @@ impl VerificationScheduler {
         }
     }
 
-    /// Returns the number of scheduled tools.
+    /// Returns the number of scheduled outlets.
     #[must_use]
     pub fn len(&self) -> usize {
         self.schedules.len()
     }
 
-    /// Returns true if no tools are scheduled.
+    /// Returns true if no outlets are scheduled.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.schedules.is_empty()
@@ -354,8 +354,8 @@ mod tests {
         let reg = OutletRegistration {
             outlet_id: outlet_id.to_owned(),
             kind: crate::context::outlets::OutletKind::Action,
-            name: format!("Test Tool {outlet_id}"),
-            description: "A test tool".to_owned(),
+            name: format!("Test Outlet {outlet_id}"),
+            description: "A test outlet".to_owned(),
             schema: OutletSchema {
                 input_schema: json!({"type": "object"}),
                 output_schema: json!({"type": "object"}),
@@ -463,9 +463,9 @@ mod tests {
         assert!(
             verification
                 .verification_id
-                .starts_with("tool-integrity-calc-")
+                .starts_with("outlet-integrity-calc-")
         );
-        assert_eq!(verification.challenge_type, ChallengeType::tool_integrity());
+        assert_eq!(verification.challenge_type, ChallengeType::outlet_integrity());
     }
 
     #[test]
@@ -502,7 +502,7 @@ mod tests {
     }
 
     #[test]
-    fn verify_integrity_tool_not_found() {
+    fn verify_integrity_outlet_not_found() {
         let registry = OutletRegistry::new();
         let verifier = DID::from("did:dht:verifier");
 
@@ -575,77 +575,77 @@ mod tests {
         let mut scheduler = VerificationScheduler::new();
         assert!(scheduler.is_empty());
 
-        let schedule = scheduler.schedule_tool_verification("tool-a", 300, &clock);
-        assert_eq!(schedule.outlet_id, "tool-a");
+        let schedule = scheduler.schedule_outlet_verification("outlet-a", 300, &clock);
+        assert_eq!(schedule.outlet_id, "outlet-a");
         assert_eq!(schedule.interval_secs, 300);
         assert!(schedule.last_verified_at.is_none());
 
         assert_eq!(scheduler.len(), 1);
 
-        let due = scheduler.tools_due_now(&clock);
-        assert!(due.contains(&"tool-a".to_owned()));
+        let due = scheduler.outlets_due_now(&clock);
+        assert!(due.contains(&"outlet-a".to_owned()));
     }
 
     #[test]
     fn record_verification_advances_schedule() {
         let clock = scp_clock::SystemClock;
         let mut scheduler = VerificationScheduler::new();
-        scheduler.schedule_tool_verification("tool-b", 600, &clock);
+        scheduler.schedule_outlet_verification("outlet-b", 600, &clock);
 
         let now = clock.now_secs();
-        scheduler.record_verification("tool-b", now);
+        scheduler.record_verification("outlet-b", now);
 
-        let schedule = scheduler.get_schedule("tool-b").unwrap();
+        let schedule = scheduler.get_schedule("outlet-b").unwrap();
         assert_eq!(schedule.last_verified_at, Some(now));
         assert_eq!(schedule.next_verification_at, now + 600);
 
-        let due = scheduler.tools_due_at(now);
+        let due = scheduler.outlets_due_at(now);
         assert!(due.is_empty());
 
-        let due_later = scheduler.tools_due_at(now + 600);
-        assert!(due_later.contains(&"tool-b".to_owned()));
+        let due_later = scheduler.outlets_due_at(now + 600);
+        assert!(due_later.contains(&"outlet-b".to_owned()));
     }
 
     #[test]
     fn unschedule_removes_entry() {
         let clock = scp_clock::SystemClock;
         let mut scheduler = VerificationScheduler::new();
-        scheduler.schedule_tool_verification("tool-c", 100, &clock);
+        scheduler.schedule_outlet_verification("outlet-c", 100, &clock);
         assert_eq!(scheduler.len(), 1);
 
-        assert!(scheduler.unschedule_tool_verification("tool-c"));
+        assert!(scheduler.unschedule_outlet_verification("outlet-c"));
         assert!(scheduler.is_empty());
-        assert!(!scheduler.unschedule_tool_verification("tool-c"));
+        assert!(!scheduler.unschedule_outlet_verification("outlet-c"));
     }
 
     #[test]
     fn reschedule_replaces_existing() {
         let clock = scp_clock::SystemClock;
         let mut scheduler = VerificationScheduler::new();
-        scheduler.schedule_tool_verification("tool-d", 100, &clock);
-        scheduler.schedule_tool_verification("tool-d", 500, &clock);
+        scheduler.schedule_outlet_verification("outlet-d", 100, &clock);
+        scheduler.schedule_outlet_verification("outlet-d", 500, &clock);
 
         assert_eq!(scheduler.len(), 1);
-        let schedule = scheduler.get_schedule("tool-d").unwrap();
+        let schedule = scheduler.get_schedule("outlet-d").unwrap();
         assert_eq!(schedule.interval_secs, 500);
     }
 
     #[test]
-    fn multiple_tools_due() {
+    fn multiple_outlets_due() {
         let clock = scp_clock::SystemClock;
         let mut scheduler = VerificationScheduler::new();
-        scheduler.schedule_tool_verification("t1", 100, &clock);
-        scheduler.schedule_tool_verification("t2", 200, &clock);
-        scheduler.schedule_tool_verification("t3", 300, &clock);
+        scheduler.schedule_outlet_verification("t1", 100, &clock);
+        scheduler.schedule_outlet_verification("t2", 200, &clock);
+        scheduler.schedule_outlet_verification("t3", 300, &clock);
 
-        let due = scheduler.tools_due_now(&clock);
+        let due = scheduler.outlets_due_now(&clock);
         assert_eq!(due.len(), 3);
 
         let now = clock.now_secs();
         scheduler.record_verification("t1", now);
         scheduler.record_verification("t2", now);
 
-        let due = scheduler.tools_due_at(now);
+        let due = scheduler.outlets_due_at(now);
         assert_eq!(due.len(), 1);
         assert_eq!(due[0], "t3");
     }

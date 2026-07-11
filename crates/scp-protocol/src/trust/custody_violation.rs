@@ -66,7 +66,7 @@ pub enum ActionCategory {
 
     /// Operational actions — agent key (`#agent`) permitted.
     ///
-    /// Includes: messaging, tool invocation, member management, role
+    /// Includes: messaging, outlet invocation, member management, role
     /// assignment, context operations, spending, and all other non-DID-
     /// document actions.
     CategoryB,

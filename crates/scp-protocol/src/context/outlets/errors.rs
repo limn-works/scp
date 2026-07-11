@@ -1476,7 +1476,7 @@ mod tests {
     /// `SCP-CODE-OK:` exemption — a test fixture proving the rejection path.
     const INVALID_SUBBLOCK_CODE: &str = "SCP-OUTLET-7000"; // SCP-CODE-OK: negative-test fixture (§5.4.4 sub-block rejection)
     /// Negative-test input — a non-canonical-prefix code. The first segment
-    /// after `SCP-` (`TOOL`) is not in the `sdk-common.md` allowlist since the
+    /// after `SCP-` (`OUTLET`) is not in the `sdk-common.md` allowlist since the
     /// outlet error domain was renamed to the canonical `SCP-OUTLET-` prefix.
     /// Phase 1 skips this line via the inline `SCP-CODE-OK:` exemption.
     const NON_CANONICAL_PREFIX_CODE: &str = "SCP-TOOL-6100"; // SCP-CODE-OK: negative-test fixture (non-canonical prefix rejection)

@@ -1,7 +1,7 @@
-//! Default summary tool for generating structured context summaries.
+//! Default summary outlet for generating structured context summaries.
 //!
 //! Produces a structured JSON summary from a context's event log, including
-//! participant DIDs, message counts, time range, tool invocations, and
+//! participant DIDs, message counts, time range, outlet invocations, and
 //! governance actions. Registered by default in the `summary` context template.
 //!
 //! See issue #365 and spec §5.11.
@@ -17,7 +17,7 @@ use scp_did::DID;
 // ContextSummary
 // ---------------------------------------------------------------------------
 
-/// Structured output from the default summary tool.
+/// Structured output from the default summary outlet.
 ///
 /// All fields are deterministically derived from the event log. The output
 /// schema is a `serde_json::Value` with a well-defined structure.
@@ -31,7 +31,7 @@ pub struct ContextSummary {
     pub first_event_at: Option<u64>,
     /// Unix timestamp (seconds) of the last event.
     pub last_event_at: Option<u64>,
-    /// Tool invocation counts: tool name -> invocation count.
+    /// Outlet invocation counts: outlet name -> invocation count.
     pub outlet_invocations: HashMap<String, u64>,
     /// Governance actions taken, with counts.
     pub governance_actions: HashMap<String, u64>,
@@ -43,7 +43,7 @@ pub struct ContextSummary {
 ///
 /// Events are expected as `(event_name, timestamp, optional_did)` tuples
 /// extracted from the event log. The function parses event names to extract
-/// participant, tool, and governance metadata.
+/// participant, outlet, and governance metadata.
 ///
 /// # Arguments
 ///
@@ -85,8 +85,8 @@ pub fn generate_summary(events: &[(String, u64)]) -> ContextSummary {
             if let Some(did) = event_name.strip_prefix("MemberJoined:") {
                 participants.entry(did.to_owned()).or_insert(0);
             }
-        } else if event_name.starts_with("ToolInvoked") {
-            if let Some(outlet_name) = event_name.strip_prefix("ToolInvoked:") {
+        } else if event_name.starts_with("OutletInvoked") {
+            if let Some(outlet_name) = event_name.strip_prefix("OutletInvoked:") {
                 *outlet_invocations
                     .entry(outlet_name.to_owned())
                     .or_insert(0) += 1;
@@ -119,7 +119,7 @@ pub fn generate_summary(events: &[(String, u64)]) -> ContextSummary {
 
 /// Converts a [`ContextSummary`] to a `serde_json::Value` with a defined schema.
 ///
-/// The output is a JSON object matching the MCP-compatible tool output schema.
+/// The output is a JSON object matching the MCP-compatible outlet output schema.
 #[must_use]
 pub fn summary_to_json(summary: &ContextSummary) -> serde_json::Value {
     json!({
@@ -133,7 +133,7 @@ pub fn summary_to_json(summary: &ContextSummary) -> serde_json::Value {
     })
 }
 
-/// Returns the MCP-compatible JSON Schema for the default summary tool output.
+/// Returns the MCP-compatible JSON Schema for the default summary outlet output.
 #[must_use]
 pub fn summary_output_schema() -> serde_json::Value {
     json!({
@@ -177,9 +177,9 @@ pub fn summary_output_schema() -> serde_json::Value {
     })
 }
 
-/// Returns the MCP-compatible JSON Schema for the default summary tool input.
+/// Returns the MCP-compatible JSON Schema for the default summary outlet input.
 ///
-/// The tool accepts no input (the event log is implicit). The input schema is
+/// The outlet accepts no input (the event log is implicit). The input schema is
 /// an empty object for MCP compatibility.
 #[must_use]
 pub fn summary_input_schema() -> serde_json::Value {
@@ -235,11 +235,11 @@ mod tests {
     }
 
     #[test]
-    fn generate_summary_with_tools_and_governance() {
+    fn generate_summary_with_outlets_and_governance() {
         let events = vec![
-            ("ToolInvoked:search".to_owned(), 100),
-            ("ToolInvoked:search".to_owned(), 101),
-            ("ToolInvoked:generate".to_owned(), 102),
+            ("OutletInvoked:search".to_owned(), 100),
+            ("OutletInvoked:search".to_owned(), 101),
+            ("OutletInvoked:generate".to_owned(), 102),
             ("GovernanceAction:RoleAssign".to_owned(), 103),
             ("GovernanceAction:RoleAssign".to_owned(), 104),
             ("GovernanceAction:MemberBan".to_owned(), 105),
@@ -258,7 +258,7 @@ mod tests {
                 let name = match i % 4 {
                     0 => format!("MemberJoined:did:dht:user{i}"),
                     1 => format!("MessageSent:did:dht:user{i}"),
-                    2 => format!("ToolInvoked:tool{i}"),
+                    2 => format!("OutletInvoked:outlet{i}"),
                     _ => format!("GovernanceAction:action{i}"),
                 };
                 (name, 1000 + i)

@@ -393,8 +393,8 @@ mod tests {
     }
 
     #[test]
-    fn spoofed_template_with_tool_capabilities_rejected() {
-        // Invitation claims bilateral-ephemeral but includes tool capabilities.
+    fn spoofed_template_with_outlet_capabilities_rejected() {
+        // Invitation claims bilateral-ephemeral but includes outlet capabilities.
         let mut params = bilateral_ephemeral_params(Duration::from_mins(5));
         params.ceiling.push(Capability::OutletCallAll);
 
@@ -955,11 +955,11 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Hard rule: tool capabilities block auto-accept
+    // Hard rule: outlet capabilities block auto-accept
     // -----------------------------------------------------------------------
 
     #[test]
-    fn tool_capabilities_block_auto_accept() {
+    fn outlet_capabilities_block_auto_accept() {
         // Coordination template includes OutletCallAll -- auto-accept should
         // not apply even if policy matches.
         let mut params = ContextParams::from_template(TemplateId::Coordination);
@@ -981,7 +981,7 @@ mod tests {
             &mut tracker,
             &SystemClock,
         );
-        // Tool capabilities block auto-accept; falls through to PromptAgent.
+        // Outlet capabilities block auto-accept; falls through to PromptAgent.
         assert_eq!(result.unwrap(), EvaluationDecision::PromptAgent);
     }
 

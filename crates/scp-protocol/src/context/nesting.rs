@@ -1,7 +1,7 @@
 //! Context nesting: parent-child relationships for SCP contexts (spec section 5.13).
 //!
 //! A child context is a full context -- its own MLS group, event log, governance,
-//! roles, tools, ceiling, and membership -- that is structurally and
+//! roles, outlets, ceiling, and membership -- that is structurally and
 //! cryptographically linked to one or more parent contexts. The parent
 //! relationship constrains the child:
 //!
@@ -75,8 +75,8 @@ pub enum OnSeverPolicy {
 pub enum ApprovalRequirement {
     /// Changes to the child's governance model.
     GovernanceChange,
-    /// New tools registered in the child.
-    ToolRegistration,
+    /// New outlets registered in the child.
+    OutletRegistration,
     /// Modifications to the child's capability ceiling (only applicable
     /// if the child has `Governed` ceiling policy).
     CeilingChange,
@@ -1350,7 +1350,7 @@ mod tests {
             can_restrict_ceiling: true,
             requires_approval_for: [
                 ApprovalRequirement::GovernanceChange,
-                ApprovalRequirement::ToolRegistration,
+                ApprovalRequirement::OutletRegistration,
             ]
             .into_iter()
             .collect(),
@@ -1381,7 +1381,7 @@ mod tests {
     fn approval_requirement_variants_are_distinct() {
         let variants = [
             ApprovalRequirement::GovernanceChange,
-            ApprovalRequirement::ToolRegistration,
+            ApprovalRequirement::OutletRegistration,
             ApprovalRequirement::CeilingChange,
             ApprovalRequirement::MembershipChange,
         ];

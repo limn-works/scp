@@ -284,7 +284,7 @@ impl InvitationBundle {
     ///
     /// Note: fields that exist only in `context_params` and have no
     /// `structural` counterpart — notably `consequence_rules` /
-    /// `consequence_config`, `economic_policy` detail, `tools` — cannot diverge
+    /// `consequence_config`, `economic_policy` detail, `outlets` — cannot diverge
     /// in this VIEW and are therefore not checked here; they are authenticated
     /// solely by the bundle signature over `genesis_params_hash`.
     ///

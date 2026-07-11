@@ -3,7 +3,7 @@
 //!
 //! This module implements the UCAN token data structures and capability URI
 //! parsing specified by ADR-016 in `.docs/adrs/phase-3.md`. Every protocol
-//! action in an SCP context — message send, tool invocation, member management,
+//! action in an SCP context — message send, outlet invocation, member management,
 //! role change — requires a valid UCAN token with matching capabilities.
 //!
 //! # Types
@@ -356,7 +356,7 @@ impl Default for UcanHeader {
 ///
 /// Each attenuation specifies a resource URI and an action. The resource URI
 /// follows the SCP capability URI format: `scp:ctx:{context_id}/{resource}:{action}`,
-/// where compound resources use underscores (e.g. `tool_invoke`, `context_child`).
+/// where compound resources use underscores (e.g. `outlet_invoke`, `context_child`).
 ///
 /// The `can` field holds the action portion (e.g. `"*"`, `"calculator"`,
 /// `"write"`, `"propose"`). See [`CapabilityUri`]

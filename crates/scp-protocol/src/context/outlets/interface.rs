@@ -1,18 +1,18 @@
-//! Cross-context tool interfaces with bidirectional consent and rate limiting.
+//! Cross-context outlet interfaces with bidirectional consent and rate limiting.
 //!
-//! Implements spec section 6.2: cross-context tool interfaces allow structured
-//! interaction across context boundaries. The context governs the tool call,
+//! Implements spec section 6.2: cross-context outlet interfaces allow structured
+//! interaction across context boundaries. The context governs the outlet call,
 //! not the agent. Both source and target contexts must explicitly approve the
 //! interface before any calls are permitted.
 //!
 //! # Flow
 //!
-//! 1. Source context admin calls [`expose_tool`] to propose sharing a tool.
+//! 1. Source context admin calls [`expose_outlet`] to propose sharing a outlet.
 //!    This creates a [`ProposeOutletInterface`] governance action.
 //! 2. On governance approval, an [`InterfaceOffer`] is published (7-day expiry).
-//! 3. Target context admin calls [`accept_tool_interface`] with an
+//! 3. Target context admin calls [`accept_outlet_interface`] with an
 //!    [`InboundPolicy`] to accept.
-//! 4. Either context may call [`revoke_tool_interface`] to tear down.
+//! 4. Either context may call [`revoke_outlet_interface`] to tear down.
 //! 5. Participants invoke via [`invoke_cross_context`], which checks both
 //!    approvals, enforces dual rate limits, and records events in both contexts.
 //!
@@ -126,7 +126,7 @@ pub const OFFER_EXPIRY_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 ///
 /// **Explicit values preserved.** This helper is *only* consulted when the
 /// caller omitted a `max_calls_per_minute`. Builder functions
-/// ([`expose_tool`], [`accept_tool_interface`], [`create_interface_offer`])
+/// ([`expose_outlet`], [`accept_outlet_interface`], [`create_interface_offer`])
 /// pass any caller-supplied `OutboundPolicy` / `InboundPolicy` through
 /// untouched — only when the policy is `None` or carries a defaulted-by-kind
 /// value do these defaults apply (spec §6.2.0.2 "Both tiers are
@@ -171,8 +171,8 @@ impl OutletInterfaceDefaults {
     /// returning a sentinel.
     ///
     /// See [`OutletInterfaceDefaults::tuple_for_kind`] for the direct
-    /// `(u32, u32)` tuple shape used by `expose_tool` /
-    /// `accept_tool_interface` / `create_interface_offer` when filling in
+    /// `(u32, u32)` tuple shape used by `expose_outlet` /
+    /// `accept_outlet_interface` / `create_interface_offer` when filling in
     /// a missing `max_calls_per_minute`.
     #[must_use]
     pub const fn for_kind(kind: OutletKind) -> Self {
@@ -212,7 +212,7 @@ impl OutletInterfaceDefaults {
 // OutboundPolicy (§6.2.0.1)
 // ---------------------------------------------------------------------------
 
-/// Policy set by the exposing context (Context A) for a tool interface.
+/// Policy set by the exposing context (Context A) for a outlet interface.
 ///
 /// Controls who can call through the interface and under what constraints.
 /// All fields are enforced in [`invoke_cross_context`]:
@@ -280,7 +280,7 @@ impl OutboundPolicy {
 // InboundPolicy (§6.2.0.1)
 // ---------------------------------------------------------------------------
 
-/// Policy set by the consuming context (Context B) for a tool interface.
+/// Policy set by the consuming context (Context B) for a outlet interface.
 ///
 /// Controls which roles in the source context can call and response constraints.
 /// Fields are enforced in [`invoke_cross_context`]:
@@ -351,12 +351,12 @@ impl InboundPolicy {
 // Consent protocol events (§6.2.0.1)
 // ---------------------------------------------------------------------------
 
-/// Governance action: propose exposing a tool to another context (§6.2.0.1 step 1).
+/// Governance action: propose exposing a outlet to another context (§6.2.0.1 step 1).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProposeOutletInterface {
-    /// The tool to expose.
+    /// The outlet to expose.
     pub outlet_id: OutletId,
-    /// The context to expose the tool to.
+    /// The context to expose the outlet to.
     pub target_context: ContextId,
     /// Outbound policy for the interface.
     pub outbound_policy: OutboundPolicy,
@@ -364,16 +364,16 @@ pub struct ProposeOutletInterface {
     pub max_calls_per_minute: u32,
 }
 
-/// Published after governance approval of a tool interface proposal (§6.2.0.1 step 3).
+/// Published after governance approval of a outlet interface proposal (§6.2.0.1 step 3).
 ///
-/// The offer carries the full tool schema and outbound policy. It expires after
+/// The offer carries the full outlet schema and outbound policy. It expires after
 /// 7 days if not accepted.
 ///
 /// **Kind-aware default rate tier (§6.2.0.2).** The
 /// [`outbound_policy.max_calls_per_minute`](OutboundPolicy::max_calls_per_minute)
 /// field on this offer carries the §6.2.0.2 default keyed to
 /// [`outlet_schema.kind`](OutletRegistration::kind) when the source
-/// context's `expose_tool` call did not pass an explicit
+/// context's `expose_outlet` call did not pass an explicit
 /// [`OutboundPolicy`]: 600 calls/min for [`OutletKind::Query`] and 60
 /// calls/min for [`OutletKind::Action`]. When the source context provided
 /// an explicit policy, that policy's `max_calls_per_minute` is preserved
@@ -385,19 +385,19 @@ pub struct InterfaceOffer {
     /// `SHA-256("SCP-OFFER-ID-V1:" || len(source_context_id) || source_context_id || len(outlet_id) || outlet_id || len(target_context_id) || target_context_id || timestamp)`.
     /// Domain-separated and length-prefixed (4-byte big-endian) to prevent collisions.
     pub offer_id: [u8; 32],
-    /// The context exposing the tool.
+    /// The context exposing the outlet.
     pub source_context: ContextId,
-    /// The context the tool is offered to.
+    /// The context the outlet is offered to.
     pub target_context: ContextId,
-    /// Full tool registration (schema, metadata). The
+    /// Full outlet registration (schema, metadata). The
     /// [`OutletRegistration::kind`] field on this schema selects the
     /// §6.2.0.2 default rate tier carried in
     /// [`outbound_policy`](Self::outbound_policy) when no caller-supplied
-    /// policy was provided to [`expose_tool`] / [`create_interface_offer`].
+    /// policy was provided to [`expose_outlet`] / [`create_interface_offer`].
     pub outlet_schema: OutletRegistration,
     /// Outbound policy set by the source context (§6.2.0.1, §6.2.0.2).
     ///
-    /// When the source context's `expose_tool` call omitted an explicit
+    /// When the source context's `expose_outlet` call omitted an explicit
     /// [`OutboundPolicy`], this field holds the §6.2.0.2 kind-aware default
     /// derived via [`OutboundPolicy::for_kind`]
     /// (`outlet_schema.kind` → tier): 600 calls/min for `Query`, 60
@@ -443,7 +443,7 @@ impl InterfaceOffer {
     }
 }
 
-/// Governance action: accept a tool interface offer (§6.2.0.1 step 4).
+/// Governance action: accept a outlet interface offer (§6.2.0.1 step 4).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AcceptOutletInterface {
     /// The offer being accepted (must match an outstanding `InterfaceOffer`).
@@ -452,7 +452,7 @@ pub struct AcceptOutletInterface {
     pub inbound_policy: InboundPolicy,
 }
 
-/// Governance action: revoke a tool interface (§6.2.0.1 step 5).
+/// Governance action: revoke a outlet interface (§6.2.0.1 step 5).
 ///
 /// Either context can revoke unilaterally. Recorded in the revoking context's
 /// event log as an `InterfaceRevoked` event.
@@ -525,7 +525,7 @@ pub struct InterfaceEstablished {
     pub source_context: ContextId,
     /// Target context.
     pub target_context: ContextId,
-    /// Tool being shared.
+    /// Outlet being shared.
     pub outlet_id: OutletId,
     /// Unix timestamp (ms) when established.
     pub established_at: u64,
@@ -877,7 +877,7 @@ fn rotation_preimage_hash(
 // RateLimit
 // ---------------------------------------------------------------------------
 
-/// Rate limit configuration for a cross-context tool interface.
+/// Rate limit configuration for a cross-context outlet interface.
 ///
 /// Tracks the maximum number of calls permitted within a sliding time window.
 /// The `current_count` and `window_start` fields are mutable state that is
@@ -1044,7 +1044,7 @@ pub struct CallerState {
     pub burst_window_start: u64,
 }
 
-/// Per-caller rate limiter for cross-context tool interfaces (spec §6.2.0.2).
+/// Per-caller rate limiter for cross-context outlet interfaces (spec §6.2.0.2).
 ///
 /// Tracks per-DID call counts independently of the per-interface limit.
 /// Default: 10 calls/minute per caller. Prevents a single caller from
@@ -1217,20 +1217,20 @@ impl PerCallerRateLimit {
 // OutletInterface
 // ---------------------------------------------------------------------------
 
-/// A cross-context tool interface with bidirectional consent and dual policies.
+/// A cross-context outlet interface with bidirectional consent and dual policies.
 ///
 /// Represents an agreement between two contexts to share access to a specific
-/// tool. Both contexts must approve the interface before any calls are
+/// outlet. Both contexts must approve the interface before any calls are
 /// permitted. Dual rate limiting (per-interface + per-caller) is enforced.
 ///
 /// See ADR-010 section 6 and spec section 6.2, §6.2.0.1, §6.2.0.2.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OutletInterface {
-    /// The context exposing (sourcing) the tool.
+    /// The context exposing (sourcing) the outlet.
     pub source_context: ContextId,
-    /// The context consuming (targeting) the tool.
+    /// The context consuming (targeting) the outlet.
     pub target_context: ContextId,
-    /// The tool being shared across contexts.
+    /// The outlet being shared across contexts.
     pub outlet_id: OutletId,
     /// Optional per-interface rate limit for calls through this interface.
     /// This is the OUTBOUND window the caller (A) consumes at Prepare-A (spec
@@ -1329,16 +1329,16 @@ pub struct AcceptOutletInterfaceProposal {
 // CrossContextEvent (event log integration)
 // ---------------------------------------------------------------------------
 
-/// Event payload for a cross-context tool invocation in the event log.
+/// Event payload for a cross-context outlet invocation in the event log.
 ///
 /// Both source and target contexts record this event to maintain full
 /// provenance of cross-context calls. See protocol tenet 1: "Provenance
 /// everywhere."
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CrossContextToolEvent {
+pub struct CrossContextOutletEvent {
     /// UUID v4 request identifier.
     pub request_id: String,
-    /// The tool that was invoked.
+    /// The outlet that was invoked.
     pub outlet_id: OutletId,
     /// The context that initiated the call (source).
     pub source_context: ContextId,
@@ -1361,15 +1361,15 @@ pub struct CrossContextToolEvent {
 }
 
 // ---------------------------------------------------------------------------
-// expose_tool
+// expose_outlet
 // ---------------------------------------------------------------------------
 
-/// Initiates a cross-context tool interface proposal from the source context.
+/// Initiates a cross-context outlet interface proposal from the source context.
 ///
-/// The caller (admin of the source context) proposes sharing a specific tool
+/// The caller (admin of the source context) proposes sharing a specific outlet
 /// with the target context. The returned [`OutletInterface`] has
 /// `approved_by_source = true` and `approved_by_target = false`. The target
-/// context must call [`accept_tool_interface`] to complete the handshake.
+/// context must call [`accept_outlet_interface`] to complete the handshake.
 ///
 /// Creates the interface with an [`OutboundPolicy`] (set by source context) and
 /// a per-caller rate limit derived from the registered outlet's
@@ -1382,11 +1382,11 @@ pub struct CrossContextToolEvent {
 /// # Arguments
 ///
 /// * `context` - The source context handle.
-/// * `outlet_id` - The ID of the tool to expose.
+/// * `outlet_id` - The ID of the outlet to expose.
 /// * `to_context` - The target context ID.
 /// * `role_state` - The source context's role state for capability checking.
 /// * `admin_did` - The DID of the admin proposing the interface.
-/// * `registry` - The source context's tool registry.
+/// * `registry` - The source context's outlet registry.
 /// * `rate_limit` - Optional per-interface rate limit. When `None`, no
 ///   per-interface counter is installed (the per-caller counter still
 ///   applies; spec §6.2.0.2 leaves the per-interface counter optional —
@@ -1399,9 +1399,9 @@ pub struct CrossContextToolEvent {
 /// # Errors
 ///
 /// Returns [`OutletError::InterfaceAdminRequired`] if the caller is not an admin.
-/// Returns [`OutletError::OutletNotFound`] if the tool is not in the registry.
+/// Returns [`OutletError::OutletNotFound`] if the outlet is not in the registry.
 #[allow(clippy::too_many_arguments)]
-pub fn expose_tool(
+pub fn expose_outlet(
     context_id: &str,
     outlet_id: &OutletId,
     to_context: &ContextId,
@@ -1418,7 +1418,7 @@ pub fn expose_tool(
         });
     }
 
-    // Verify the tool exists in the source context's registry and recover
+    // Verify the outlet exists in the source context's registry and recover
     // its declared OutletKind. The kind drives the §6.2.0.2 default rate
     // tier — Query gets 600/100, Action gets 60/10 — when the caller did
     // not supply an explicit `outbound_policy` or `rate_limit`. Reading
@@ -1458,14 +1458,14 @@ pub fn expose_tool(
     })
 }
 
-/// Creates an [`InterfaceOffer`] from an approved tool interface proposal.
+/// Creates an [`InterfaceOffer`] from an approved outlet interface proposal.
 ///
 /// Called after the source context's governance has approved the proposal.
-/// The offer includes the full tool schema and expires after 7 days.
+/// The offer includes the full outlet schema and expires after 7 days.
 ///
 /// **Kind-aware default (§6.2.0.2).** When the source `interface` has no
 /// `outbound_policy` set, the helper fills one in from
-/// [`OutboundPolicy::for_kind`] keyed to `tool_registration.kind` so the
+/// [`OutboundPolicy::for_kind`] keyed to `outlet_registration.kind` so the
 /// published offer's `max_calls_per_minute` matches the §6.2.0.2 tier
 /// (Query → 600/min, Action → 60/min). When the interface already carries
 /// an `outbound_policy`, that policy is passed through unchanged — explicit
@@ -1473,8 +1473,8 @@ pub fn expose_tool(
 ///
 /// # Arguments
 ///
-/// * `interface` - The approved tool interface.
-/// * `tool_registration` - Full tool registration from the registry. Its
+/// * `interface` - The approved outlet interface.
+/// * `outlet_registration` - Full outlet registration from the registry. Its
 ///   `kind` field selects the §6.2.0.2 default rate tier when the
 ///   interface omits an `outbound_policy`.
 /// * `timestamp_ms` - Current timestamp in milliseconds.
@@ -1485,7 +1485,7 @@ pub fn expose_tool(
 #[must_use]
 pub fn create_interface_offer(
     interface: &OutletInterface,
-    tool_registration: &OutletRegistration,
+    outlet_registration: &OutletRegistration,
     timestamp_ms: u64,
 ) -> InterfaceOffer {
     let offer_id = InterfaceOffer::compute_offer_id(
@@ -1503,19 +1503,19 @@ pub fn create_interface_offer(
     let outbound_policy = interface
         .outbound_policy
         .clone()
-        .unwrap_or_else(|| OutboundPolicy::for_kind(tool_registration.kind));
+        .unwrap_or_else(|| OutboundPolicy::for_kind(outlet_registration.kind));
 
     InterfaceOffer {
         offer_id,
         source_context: interface.source_context.clone(),
         target_context: interface.target_context.clone(),
-        outlet_schema: tool_registration.clone(),
+        outlet_schema: outlet_registration.clone(),
         outbound_policy,
         expires_at: timestamp_ms.saturating_add(OFFER_EXPIRY_MS),
     }
 }
 
-/// Revokes an established tool interface (§6.2.0.1 step 5).
+/// Revokes an established outlet interface (§6.2.0.1 step 5).
 ///
 /// Either context can revoke unilaterally. Returns an [`InterfaceRevoked`]
 /// event to be recorded in the revoking context's event log.
@@ -1526,7 +1526,7 @@ pub fn create_interface_offer(
 /// * `revoking_context` - The context performing the revocation.
 /// * `timestamp_ms` - Current timestamp in milliseconds.
 #[must_use]
-pub fn revoke_tool_interface(
+pub fn revoke_outlet_interface(
     interface_id: [u8; 32],
     revoking_context: &ContextId,
     timestamp_ms: u64,
@@ -1539,10 +1539,10 @@ pub fn revoke_tool_interface(
 }
 
 // ---------------------------------------------------------------------------
-// accept_tool_interface
+// accept_outlet_interface
 // ---------------------------------------------------------------------------
 
-/// Target context accepts a cross-context tool interface.
+/// Target context accepts a cross-context outlet interface.
 ///
 /// Sets `approved_by_target = true` and attaches the target's
 /// [`InboundPolicy`]. Both `approved_by_source` and `approved_by_target`
@@ -1555,7 +1555,7 @@ pub fn revoke_tool_interface(
 /// back to [`InboundPolicy::default()`] — the §5.4.2 fail-safe Action tier
 /// (60 calls/min). Callers that already know the accepted outlet's
 /// [`OutletKind`] (typically from the matched [`InterfaceOffer::outlet_schema`])
-/// SHOULD use [`accept_tool_interface_with_kind`] instead so the §6.2.0.2
+/// SHOULD use [`accept_outlet_interface_with_kind`] instead so the §6.2.0.2
 /// default lines up with the kind (Query → 600/min, Action → 60/min). When
 /// `inbound_policy` is `Some`, that policy is preserved verbatim regardless
 /// of kind (AC5).
@@ -1563,7 +1563,7 @@ pub fn revoke_tool_interface(
 /// # Arguments
 ///
 /// * `context` - The target context handle.
-/// * `interface` - The tool interface to accept (mutated in place).
+/// * `interface` - The outlet interface to accept (mutated in place).
 /// * `role_state` - The target context's role state for capability checking.
 /// * `admin_did` - The DID of the admin accepting the interface.
 /// * `inbound_policy` - Optional inbound policy (defaults to [`InboundPolicy::default()`]).
@@ -1573,14 +1573,14 @@ pub fn revoke_tool_interface(
 /// Returns [`OutletError::InterfaceAdminRequired`] if the caller is not an admin.
 /// Returns [`OutletError::InterfaceContextMismatch`] if the interface's target
 /// context does not match the provided context handle.
-pub fn accept_tool_interface(
+pub fn accept_outlet_interface(
     context_id: &str,
     interface: &mut OutletInterface,
     role_state: &ContextRoleState,
     admin_did: &str,
     inbound_policy: Option<InboundPolicy>,
 ) -> Result<(), OutletError> {
-    accept_tool_interface_with_kind(
+    accept_outlet_interface_with_kind(
         context_id,
         interface,
         role_state,
@@ -1590,9 +1590,9 @@ pub fn accept_tool_interface(
     )
 }
 
-/// Kind-aware variant of [`accept_tool_interface`] (spec §6.2.0.2).
+/// Kind-aware variant of [`accept_outlet_interface`] (spec §6.2.0.2).
 ///
-/// Identical to [`accept_tool_interface`] except that when `inbound_policy`
+/// Identical to [`accept_outlet_interface`] except that when `inbound_policy`
 /// is `None` and `kind` is `Some`, the helper fills in
 /// [`InboundPolicy::for_kind`] keyed to that [`OutletKind`] so the accept
 /// side's default `max_calls_per_minute` matches the §6.2.0.2 tier (Query
@@ -1610,11 +1610,11 @@ pub fn accept_tool_interface(
 ///
 /// # Errors
 ///
-/// Same as [`accept_tool_interface`]:
+/// Same as [`accept_outlet_interface`]:
 /// [`OutletError::InterfaceAdminRequired`] when the caller is not an admin
 /// and [`OutletError::InterfaceContextMismatch`] when the interface's
 /// target context does not match the provided context handle.
-pub fn accept_tool_interface_with_kind(
+pub fn accept_outlet_interface_with_kind(
     context_id: &str,
     interface: &mut OutletInterface,
     role_state: &ContextRoleState,
@@ -1654,32 +1654,32 @@ pub fn accept_tool_interface_with_kind(
 // invoke_cross_context
 // ---------------------------------------------------------------------------
 
-/// Invokes a tool across context boundaries.
+/// Invokes a outlet across context boundaries.
 ///
 /// Performs the following checks:
 /// 1. Chain depth against the source context's configured max (spec §24.4).
 /// 2. Both `approved_by_source` and `approved_by_target` must be `true`.
 /// 3. Per-interface rate limit is checked (spec §6.2.0.2).
 /// 4. Per-caller rate limit is checked independently (spec §6.2.0.2).
-/// 5. Source context governance checks outbound (invoker has tool invoke
+/// 5. Source context governance checks outbound (invoker has outlet invoke
 ///    capability in source context).
-/// 6. Target context governance checks inbound (tool exists in target
+/// 6. Target context governance checks inbound (outlet exists in target
 ///    registry and target context is active).
 ///
-/// Returns the tool output along with event payloads for both the source
+/// Returns the outlet output along with event payloads for both the source
 /// and target event logs.
 ///
 /// # Arguments
 ///
 /// * `source_context` - The source context handle.
-/// * `interface` - The cross-context tool interface (mutated for rate limit
+/// * `interface` - The cross-context outlet interface (mutated for rate limit
 ///   tracking).
-/// * `input` - JSON input to pass to the tool.
-/// * `invoker_did` - The DID of the participant invoking the tool.
+/// * `input` - JSON input to pass to the outlet.
+/// * `invoker_did` - The DID of the participant invoking the outlet.
 /// * `source_role_state` - Source context role state for governance checks.
-/// * `target_registry` - Target context tool registry.
+/// * `target_registry` - Target context outlet registry.
 /// * `chain_depth` - Current cross-context chain depth (0 for first hop).
-/// * `executor` - Synchronous executor for the tool (returns Result).
+/// * `executor` - Synchronous executor for the outlet (returns Result).
 ///
 /// # Errors
 ///
@@ -1713,8 +1713,8 @@ pub fn invoke_cross_context<F>(
 ) -> Result<
     (
         serde_json::Value,
-        CrossContextToolEvent,
-        CrossContextToolEvent,
+        CrossContextOutletEvent,
+        CrossContextOutletEvent,
     ),
     OutletError,
 >
@@ -1820,14 +1820,14 @@ where
         });
     }
 
-    // 6. Target context governance: tool must exist in target registry.
+    // 6. Target context governance: outlet must exist in target registry.
     if !target_registry.contains(&interface.outlet_id) {
         return Err(OutletError::OutletNotFound {
             outlet_id: interface.outlet_id.clone(),
         });
     }
 
-    // 7. Execute the tool.
+    // 7. Execute the outlet.
     let output =
         executor(input).map_err(|msg| OutletError::InterfaceExecutionFailed { message: msg })?;
 
@@ -1853,7 +1853,7 @@ where
     Ok((output, source_event, target_event))
 }
 
-/// Constructs [`DataProvenance`] for a cross-context tool invocation (§7.7.1).
+/// Constructs [`DataProvenance`] for a cross-context outlet invocation (§7.7.1).
 ///
 /// When `chain_depth > 0`, synthesizes a minimal existing provenance record so
 /// [`attach_provenance`] correctly increments the chain depth and extends the
@@ -1893,19 +1893,19 @@ fn build_invocation_provenance(
 }
 
 /// Builds matched event payloads for the source and target contexts of a
-/// cross-context tool invocation. Both events share the same `request_id`.
+/// cross-context outlet invocation. Both events share the same `request_id`.
 fn build_cross_context_events(
     interface: &OutletInterface,
     input: &serde_json::Value,
     output: &serde_json::Value,
     invoker_did: &DID,
     provenance: &DataProvenance,
-) -> (CrossContextToolEvent, CrossContextToolEvent) {
+) -> (CrossContextOutletEvent, CrossContextOutletEvent) {
     let request_id = uuid::Uuid::new_v4().to_string();
     let input_hash = sha256_json(input);
     let output_hash = Some(sha256_json(output));
 
-    let source_event = CrossContextToolEvent {
+    let source_event = CrossContextOutletEvent {
         request_id: request_id.clone(),
         outlet_id: interface.outlet_id.clone(),
         source_context: interface.source_context.clone(),
@@ -1917,7 +1917,7 @@ fn build_cross_context_events(
         provenance: Some(provenance.clone()),
     };
 
-    let target_event = CrossContextToolEvent {
+    let target_event = CrossContextOutletEvent {
         request_id,
         outlet_id: interface.outlet_id.clone(),
         source_context: interface.source_context.clone(),
@@ -1984,7 +1984,7 @@ mod tests {
     }
 
     /// Creates a `ContextRoleState` with an additional member that has limited
-    /// capabilities (no admin, no tool invoke).
+    /// capabilities (no admin, no outlet invoke).
     fn test_role_state_with_non_admin_member(
         context_id: &str,
         creator_did: &str,
@@ -2007,8 +2007,8 @@ mod tests {
         context_id.to_owned()
     }
 
-    /// Creates a valid tool registration and registers it in a fresh registry.
-    fn setup_registry_with_tool(
+    /// Creates a valid outlet registration and registers it in a fresh registry.
+    fn setup_registry_with_outlet(
         role_state: &ContextRoleState,
         registrant_did: &str,
     ) -> OutletRegistry {
@@ -2055,7 +2055,7 @@ mod tests {
             members: vec![DID::from(member_did)],
             discovery_method: DiscoveryMethod::OutOfBand,
             data_age: Duration::from_secs(0),
-            purpose: Some("cross-context tool invocation".to_owned()),
+            purpose: Some("cross-context outlet invocation".to_owned()),
             counterparty_policy: CounterpartyPolicy::Full,
         }
     }
@@ -2074,17 +2074,17 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // expose_tool: happy path
+    // expose_outlet: happy path
     // -----------------------------------------------------------------------
 
     #[test]
-    fn expose_tool_creates_interface_with_source_approved() {
+    fn expose_outlet_creates_interface_with_source_approved() {
         let admin_did = "did:dht:z6MkAdmin";
         let source_role_state = test_role_state("ctx-source", admin_did);
         let source_context = test_context_id("ctx-source");
-        let registry = setup_registry_with_tool(&source_role_state, admin_did);
+        let registry = setup_registry_with_outlet(&source_role_state, admin_did);
 
-        let interface = expose_tool(
+        let interface = expose_outlet(
             &source_context,
             &"calculator".to_owned(),
             &"ctx-target".to_owned(),
@@ -2109,19 +2109,19 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // expose_tool: requires admin capability
+    // expose_outlet: requires admin capability
     // -----------------------------------------------------------------------
 
     #[test]
-    fn expose_tool_requires_admin_capability() {
+    fn expose_outlet_requires_admin_capability() {
         let admin_did = "did:dht:z6MkAdmin";
         let member_did = "did:dht:z6MkMember";
         let source_role_state =
             test_role_state_with_non_admin_member("ctx-source", admin_did, member_did);
         let source_context = test_context_id("ctx-source");
-        let registry = setup_registry_with_tool(&source_role_state, admin_did);
+        let registry = setup_registry_with_outlet(&source_role_state, admin_did);
 
-        let result = expose_tool(
+        let result = expose_outlet(
             &source_context,
             &"calculator".to_owned(),
             &"ctx-target".to_owned(),
@@ -2141,17 +2141,17 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // expose_tool: tool not found
+    // expose_outlet: outlet not found
     // -----------------------------------------------------------------------
 
     #[test]
-    fn expose_tool_rejects_nonexistent_tool() {
+    fn expose_outlet_rejects_nonexistent_outlet() {
         let admin_did = "did:dht:z6MkAdmin";
         let source_role_state = test_role_state("ctx-source", admin_did);
         let source_context = test_context_id("ctx-source");
         let registry = OutletRegistry::new(); // Empty registry
 
-        let result = expose_tool(
+        let result = expose_outlet(
             &source_context,
             &"nonexistent".to_owned(),
             &"ctx-target".to_owned(),
@@ -2170,18 +2170,18 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // expose_tool: with rate limit
+    // expose_outlet: with rate limit
     // -----------------------------------------------------------------------
 
     #[test]
-    fn expose_tool_includes_rate_limit_when_provided() {
+    fn expose_outlet_includes_rate_limit_when_provided() {
         let admin_did = "did:dht:z6MkAdmin";
         let source_role_state = test_role_state("ctx-source", admin_did);
         let source_context = test_context_id("ctx-source");
-        let registry = setup_registry_with_tool(&source_role_state, admin_did);
+        let registry = setup_registry_with_outlet(&source_role_state, admin_did);
 
         let rate_limit = RateLimit::new(10, Duration::from_mins(1), &scp_clock::SystemClock);
-        let interface = expose_tool(
+        let interface = expose_outlet(
             &source_context,
             &"calculator".to_owned(),
             &"ctx-target".to_owned(),
@@ -2205,11 +2205,11 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // accept_tool_interface: happy path
+    // accept_outlet_interface: happy path
     // -----------------------------------------------------------------------
 
     #[test]
-    fn accept_tool_interface_sets_approved_by_target() {
+    fn accept_outlet_interface_sets_approved_by_target() {
         let admin_did = "did:dht:z6MkAdmin";
         let target_role_state = test_role_state("ctx-target", admin_did);
         let target_context = test_context_id("ctx-target");
@@ -2227,7 +2227,7 @@ mod tests {
             inbound_policy: None,
         };
 
-        let result = accept_tool_interface(
+        let result = accept_outlet_interface(
             &target_context,
             &mut interface,
             &target_role_state,
@@ -2243,11 +2243,11 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // accept_tool_interface: requires admin capability
+    // accept_outlet_interface: requires admin capability
     // -----------------------------------------------------------------------
 
     #[test]
-    fn accept_tool_interface_requires_admin_capability() {
+    fn accept_outlet_interface_requires_admin_capability() {
         let admin_did = "did:dht:z6MkAdmin";
         let member_did = "did:dht:z6MkMember";
         let target_role_state =
@@ -2267,7 +2267,7 @@ mod tests {
             inbound_policy: None,
         };
 
-        let result = accept_tool_interface(
+        let result = accept_outlet_interface(
             &target_context,
             &mut interface,
             &target_role_state,
@@ -2284,11 +2284,11 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // accept_tool_interface: context mismatch
+    // accept_outlet_interface: context mismatch
     // -----------------------------------------------------------------------
 
     #[test]
-    fn accept_tool_interface_rejects_context_mismatch() {
+    fn accept_outlet_interface_rejects_context_mismatch() {
         let admin_did = "did:dht:z6MkAdmin";
         let target_role_state = test_role_state("ctx-wrong", admin_did);
         let target_context = test_context_id("ctx-wrong");
@@ -2306,7 +2306,7 @@ mod tests {
             inbound_policy: None,
         };
 
-        let result = accept_tool_interface(
+        let result = accept_outlet_interface(
             &target_context,
             &mut interface,
             &target_role_state,
@@ -2331,7 +2331,7 @@ mod tests {
         let source_role_state = test_role_state("ctx-source", admin_did);
         let source_context = test_context_id("ctx-source");
         let target_role_state = test_role_state("ctx-target", admin_did);
-        let target_registry = setup_registry_with_tool(&target_role_state, admin_did);
+        let target_registry = setup_registry_with_outlet(&target_role_state, admin_did);
 
         let mut interface = OutletInterface {
             source_context: "ctx-source".to_owned(),
@@ -2392,7 +2392,7 @@ mod tests {
         let source_role_state = test_role_state("ctx-source", admin_did);
         let source_context = test_context_id("ctx-source");
         let target_role_state = test_role_state("ctx-target", admin_did);
-        let target_registry = setup_registry_with_tool(&target_role_state, admin_did);
+        let target_registry = setup_registry_with_outlet(&target_role_state, admin_did);
 
         let mut interface = OutletInterface {
             source_context: "ctx-source".to_owned(),
@@ -2441,7 +2441,7 @@ mod tests {
         let source_role_state = test_role_state("ctx-source", admin_did);
         let source_context = test_context_id("ctx-source");
         let target_role_state = test_role_state("ctx-target", admin_did);
-        let target_registry = setup_registry_with_tool(&target_role_state, admin_did);
+        let target_registry = setup_registry_with_outlet(&target_role_state, admin_did);
 
         let mut interface = OutletInterface {
             source_context: "ctx-source".to_owned(),
@@ -2490,7 +2490,7 @@ mod tests {
         let source_role_state = test_role_state("ctx-source", admin_did);
         let source_context = test_context_id("ctx-source");
         let target_role_state = test_role_state("ctx-target", admin_did);
-        let target_registry = setup_registry_with_tool(&target_role_state, admin_did);
+        let target_registry = setup_registry_with_outlet(&target_role_state, admin_did);
 
         let mut interface = OutletInterface {
             source_context: "ctx-source".to_owned(),
@@ -2536,7 +2536,7 @@ mod tests {
         let source_role_state = test_role_state("ctx-source", admin_did);
         let source_context = test_context_id("ctx-source");
         let target_role_state = test_role_state("ctx-target", admin_did);
-        let target_registry = setup_registry_with_tool(&target_role_state, admin_did);
+        let target_registry = setup_registry_with_outlet(&target_role_state, admin_did);
 
         let mut interface = OutletInterface {
             source_context: "ctx-source".to_owned(),
@@ -2624,7 +2624,7 @@ mod tests {
         let source_role_state = test_role_state("ctx-source", admin_did);
         let source_context = test_context_id("ctx-source");
         let target_role_state = test_role_state("ctx-target", admin_did);
-        let target_registry = setup_registry_with_tool(&target_role_state, admin_did);
+        let target_registry = setup_registry_with_outlet(&target_role_state, admin_did);
 
         let mut interface = OutletInterface {
             source_context: "ctx-source".to_owned(),
@@ -2693,7 +2693,7 @@ mod tests {
             test_role_state_with_non_admin_member("ctx-source", admin_did, member_did);
         let source_context = test_context_id("ctx-source");
         let target_role_state = test_role_state("ctx-target", admin_did);
-        let target_registry = setup_registry_with_tool(&target_role_state, admin_did);
+        let target_registry = setup_registry_with_outlet(&target_role_state, admin_did);
 
         let mut interface = OutletInterface {
             source_context: "ctx-source".to_owned(),
@@ -2730,11 +2730,11 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // invoke_cross_context: tool not found in target
+    // invoke_cross_context: outlet not found in target
     // -----------------------------------------------------------------------
 
     #[test]
-    fn invoke_cross_context_rejects_when_tool_not_in_target_registry() {
+    fn invoke_cross_context_rejects_when_outlet_not_in_target_registry() {
         let admin_did = "did:dht:z6MkAdmin";
         let source_role_state = test_role_state("ctx-source", admin_did);
         let source_context = test_context_id("ctx-source");
@@ -2823,11 +2823,11 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn tool_interface_serialization_roundtrip() {
+    fn outlet_interface_serialization_roundtrip() {
         let interface = OutletInterface {
             source_context: "ctx-a".to_owned(),
             target_context: "ctx-b".to_owned(),
-            outlet_id: "tool-1".to_owned(),
+            outlet_id: "outlet-1".to_owned(),
             rate_limit: Some(RateLimit::new(
                 50,
                 Duration::from_mins(2),
@@ -2844,19 +2844,19 @@ mod tests {
         let deserialized: OutletInterface = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.source_context, "ctx-a");
         assert_eq!(deserialized.target_context, "ctx-b");
-        assert_eq!(deserialized.outlet_id, "tool-1");
+        assert_eq!(deserialized.outlet_id, "outlet-1");
         assert!(deserialized.approved_by_source);
         assert!(!deserialized.approved_by_target);
         assert!(deserialized.rate_limit.is_some());
     }
 
     // -----------------------------------------------------------------------
-    // CrossContextToolEvent: serialization roundtrip
+    // CrossContextOutletEvent: serialization roundtrip
     // -----------------------------------------------------------------------
 
     #[test]
-    fn cross_context_tool_event_serialization_roundtrip() {
-        let event = CrossContextToolEvent {
+    fn cross_context_outlet_event_serialization_roundtrip() {
+        let event = CrossContextOutletEvent {
             request_id: "req-1".to_owned(),
             outlet_id: "calculator".to_owned(),
             source_context: "ctx-a".to_owned(),
@@ -2868,7 +2868,7 @@ mod tests {
             provenance: None,
         };
         let json = serde_json::to_string(&event).unwrap();
-        let deserialized: CrossContextToolEvent = serde_json::from_str(&json).unwrap();
+        let deserialized: CrossContextOutletEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.request_id, "req-1");
         assert_eq!(deserialized.outlet_id, "calculator");
         assert_eq!(deserialized.status, OutletStatus::Success);
@@ -2884,7 +2884,7 @@ mod tests {
         let source_role_state = test_role_state("ctx-source", admin_did);
         let source_context = test_context_id("ctx-source");
         let target_role_state = test_role_state("ctx-target", admin_did);
-        let target_registry = setup_registry_with_tool(&target_role_state, admin_did);
+        let target_registry = setup_registry_with_outlet(&target_role_state, admin_did);
 
         let mut interface = OutletInterface {
             source_context: "ctx-source".to_owned(),
@@ -2934,7 +2934,7 @@ mod tests {
         let source_role_state = test_role_state("ctx-source", admin_did);
         let source_context = test_context_id("ctx-source");
         let target_role_state = test_role_state("ctx-target", admin_did);
-        let target_registry = setup_registry_with_tool(&target_role_state, admin_did);
+        let target_registry = setup_registry_with_outlet(&target_role_state, admin_did);
 
         let mut interface = OutletInterface {
             source_context: "ctx-source".to_owned(),
@@ -2980,7 +2980,7 @@ mod tests {
         let source_role_state = test_role_state("ctx-source", admin_did);
         let source_context = test_context_id("ctx-source");
         let target_role_state = test_role_state("ctx-target", admin_did);
-        let target_registry = setup_registry_with_tool(&target_role_state, admin_did);
+        let target_registry = setup_registry_with_outlet(&target_role_state, admin_did);
 
         let mut interface = OutletInterface {
             source_context: "ctx-source".to_owned(),
@@ -3123,15 +3123,15 @@ mod tests {
 
     #[test]
     fn interface_offer_id_is_deterministic() {
-        let id1 = InterfaceOffer::compute_offer_id("ctx-a", "tool-1", "ctx-b", 1000);
-        let id2 = InterfaceOffer::compute_offer_id("ctx-a", "tool-1", "ctx-b", 1000);
+        let id1 = InterfaceOffer::compute_offer_id("ctx-a", "outlet-1", "ctx-b", 1000);
+        let id2 = InterfaceOffer::compute_offer_id("ctx-a", "outlet-1", "ctx-b", 1000);
         assert_eq!(id1, id2);
     }
 
     #[test]
     fn interface_offer_id_differs_for_different_inputs() {
-        let id1 = InterfaceOffer::compute_offer_id("ctx-a", "tool-1", "ctx-b", 1000);
-        let id2 = InterfaceOffer::compute_offer_id("ctx-a", "tool-1", "ctx-b", 2000);
+        let id1 = InterfaceOffer::compute_offer_id("ctx-a", "outlet-1", "ctx-b", 1000);
+        let id2 = InterfaceOffer::compute_offer_id("ctx-a", "outlet-1", "ctx-b", 2000);
         assert_ne!(id1, id2);
     }
 
@@ -3181,7 +3181,7 @@ mod tests {
         let source_context = "ctx-source".to_owned();
         let source_max_chain_depth = Some(1u8);
         let target_role_state = test_role_state("ctx-target", admin_did);
-        let target_registry = setup_registry_with_tool(&target_role_state, admin_did);
+        let target_registry = setup_registry_with_outlet(&target_role_state, admin_did);
 
         let mut interface = OutletInterface {
             source_context: "ctx-source".to_owned(),
@@ -3245,9 +3245,9 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn revoke_tool_interface_creates_event() {
+    fn revoke_outlet_interface_creates_event() {
         let interface_id = [0xAB; 32];
-        let event = revoke_tool_interface(interface_id, &"ctx-a".to_owned(), 5000);
+        let event = revoke_outlet_interface(interface_id, &"ctx-a".to_owned(), 5000);
         assert_eq!(event.interface_id, interface_id);
         assert_eq!(event.revoking_context, "ctx-a");
         assert_eq!(event.revoked_at, 5000);
@@ -3424,7 +3424,7 @@ mod tests {
         let source_role_state = test_role_state("ctx-source", admin_did);
         let source_context = test_context_id("ctx-source");
         let target_role_state = test_role_state("ctx-target", admin_did);
-        let target_registry = setup_registry_with_tool(&target_role_state, admin_did);
+        let target_registry = setup_registry_with_outlet(&target_role_state, admin_did);
 
         // Base limit: 2 calls, burst allowance: 5.
         let mut interface = OutletInterface {
@@ -3683,7 +3683,7 @@ mod tests {
         let source_role_state = test_role_state("ctx-source", admin_did);
         let source_context = test_context_id("ctx-source");
         let target_role_state = test_role_state("ctx-target", admin_did);
-        let target_registry = setup_registry_with_tool(&target_role_state, admin_did);
+        let target_registry = setup_registry_with_outlet(&target_role_state, admin_did);
 
         let mut interface = OutletInterface {
             source_context: "ctx-source".to_owned(),
@@ -3748,7 +3748,7 @@ mod tests {
         let source_role_state = test_role_state("ctx-source", admin_did);
         let source_context = test_context_id("ctx-source");
         let target_role_state = test_role_state("ctx-target", admin_did);
-        let target_registry = setup_registry_with_tool(&target_role_state, admin_did);
+        let target_registry = setup_registry_with_outlet(&target_role_state, admin_did);
 
         let mut interface = OutletInterface {
             source_context: "ctx-source".to_owned(),
@@ -3815,8 +3815,8 @@ mod tests {
     // AC7: cargo test --workspace succeeds (covered by these tests + workspace)
 
     /// Helper: construct an [`OutletRegistration`] with the given kind for
-    /// SCP-OUT-016 tests. Mirrors `setup_registry_with_tool` but parameterised
-    /// on `kind` so the AC3/AC4 tests can register Query *and* Action tools.
+    /// SCP-OUT-016 tests. Mirrors `setup_registry_with_outlet` but parameterised
+    /// on `kind` so the AC3/AC4 tests can register Query *and* Action outlets.
     fn registration_for_kind(outlet_id: &str, kind: OutletKind) -> OutletRegistration {
         OutletRegistration {
             outlet_id: outlet_id.to_owned(),
@@ -3888,7 +3888,7 @@ mod tests {
     /// AC3: When an [`InterfaceOffer`] is built for a Query outlet and the
     /// caller omits `max_calls_per_minute`, the runtime writes 600.
     ///
-    /// Verifies the full path: `expose_tool` (no `outbound_policy`) →
+    /// Verifies the full path: `expose_outlet` (no `outbound_policy`) →
     /// `create_interface_offer` → `offer.outbound_policy.max_calls_per_minute`.
     #[test]
     fn ac3_interface_offer_for_query_writes_600_when_caller_omits_value() {
@@ -3898,7 +3898,7 @@ mod tests {
 
         // Caller omits both rate_limit AND outbound_policy — the runtime
         // must derive the kind-aware default.
-        let interface = expose_tool(
+        let interface = expose_outlet(
             "ctx-source",
             &"query-outlet".to_owned(),
             &"ctx-target".to_owned(),
@@ -3914,7 +3914,7 @@ mod tests {
         let interface_outbound = interface
             .outbound_policy
             .as_ref()
-            .expect("outbound_policy must be populated by expose_tool");
+            .expect("outbound_policy must be populated by expose_outlet");
         assert_eq!(
             interface_outbound.max_calls_per_minute, 600,
             "Query interface omitted-policy default must be 600 (§6.2.0.2)"
@@ -3950,7 +3950,7 @@ mod tests {
         let role_state = test_role_state("ctx-source", admin_did);
         let registry = registry_with_kind("action-outlet", OutletKind::Action);
 
-        let interface = expose_tool(
+        let interface = expose_outlet(
             "ctx-source",
             &"action-outlet".to_owned(),
             &"ctx-target".to_owned(),
@@ -3966,7 +3966,7 @@ mod tests {
         let interface_outbound = interface
             .outbound_policy
             .as_ref()
-            .expect("outbound_policy must be populated by expose_tool");
+            .expect("outbound_policy must be populated by expose_outlet");
         assert_eq!(
             interface_outbound.max_calls_per_minute, 60,
             "Action interface omitted-policy default must be 60 (§6.2.0.2)"
@@ -3999,7 +3999,7 @@ mod tests {
     /// Drives both Query and Action paths with caller-supplied
     /// `OutboundPolicy` values that diverge from the §6.2.0.2 defaults
     /// (a Query outlet with the Action default, and an Action outlet with
-    /// a one-off custom value). After `expose_tool` and
+    /// a one-off custom value). After `expose_outlet` and
     /// `create_interface_offer` the explicit value MUST round-trip
     /// untouched.
     #[test]
@@ -4017,7 +4017,7 @@ mod tests {
             max_payload_bytes: 65_536,
             require_provenance: true,
         };
-        let interface = expose_tool(
+        let interface = expose_outlet(
             "ctx-source",
             &"query-outlet".to_owned(),
             &"ctx-target".to_owned(),
@@ -4053,7 +4053,7 @@ mod tests {
             max_payload_bytes: 65_536,
             require_provenance: true,
         };
-        let interface2 = expose_tool(
+        let interface2 = expose_outlet(
             "ctx-source",
             &"action-outlet".to_owned(),
             &"ctx-target".to_owned(),
@@ -4214,12 +4214,12 @@ mod tests {
         assert_eq!(policy, InboundPolicy::default());
     }
 
-    /// `accept_tool_interface_with_kind(Some(Query))` writes 600 inbound when
+    /// `accept_outlet_interface_with_kind(Some(Query))` writes 600 inbound when
     /// the caller omits an inbound policy. This is the symmetric AC3 on the
     /// accept side: `min(outbound, inbound) = 600` when both sides default
     /// to the Query tier.
     #[test]
-    fn accept_tool_interface_with_kind_uses_kind_default_for_query() {
+    fn accept_outlet_interface_with_kind_uses_kind_default_for_query() {
         let admin_did = "did:dht:z6MkAdmin";
         let role_state = test_role_state("ctx-target", admin_did);
 
@@ -4236,7 +4236,7 @@ mod tests {
             inbound_policy: None,
         };
 
-        accept_tool_interface_with_kind(
+        accept_outlet_interface_with_kind(
             "ctx-target",
             &mut interface,
             &role_state,
@@ -4253,10 +4253,10 @@ mod tests {
         );
     }
 
-    /// `accept_tool_interface_with_kind(Some(Action))` writes 60 inbound,
+    /// `accept_outlet_interface_with_kind(Some(Action))` writes 60 inbound,
     /// matching the §5.4.2 fail-safe default.
     #[test]
-    fn accept_tool_interface_with_kind_uses_kind_default_for_action() {
+    fn accept_outlet_interface_with_kind_uses_kind_default_for_action() {
         let admin_did = "did:dht:z6MkAdmin";
         let role_state = test_role_state("ctx-target", admin_did);
 
@@ -4273,7 +4273,7 @@ mod tests {
             inbound_policy: None,
         };
 
-        accept_tool_interface_with_kind(
+        accept_outlet_interface_with_kind(
             "ctx-target",
             &mut interface,
             &role_state,
@@ -4287,11 +4287,11 @@ mod tests {
         assert_eq!(inbound.max_calls_per_minute, 60);
     }
 
-    /// `accept_tool_interface_with_kind(None, None)` falls back to the
+    /// `accept_outlet_interface_with_kind(None, None)` falls back to the
     /// §5.4.2 fail-safe Action default — backwards-compatible with the
-    /// kind-blind `accept_tool_interface` wrapper.
+    /// kind-blind `accept_outlet_interface` wrapper.
     #[test]
-    fn accept_tool_interface_with_kind_none_falls_back_to_action_default() {
+    fn accept_outlet_interface_with_kind_none_falls_back_to_action_default() {
         let admin_did = "did:dht:z6MkAdmin";
         let role_state = test_role_state("ctx-target", admin_did);
 
@@ -4308,7 +4308,7 @@ mod tests {
             inbound_policy: None,
         };
 
-        accept_tool_interface_with_kind(
+        accept_outlet_interface_with_kind(
             "ctx-target",
             &mut interface,
             &role_state,
@@ -4335,7 +4335,7 @@ mod tests {
         let role_state = test_role_state("ctx-source", admin_did);
         let registry = registry_with_kind("query-outlet", OutletKind::Query);
 
-        let interface = expose_tool(
+        let interface = expose_outlet(
             "ctx-source",
             &"query-outlet".to_owned(),
             &"ctx-target".to_owned(),
@@ -4479,7 +4479,7 @@ mod tests {
 
         let mut log = EventLog::new("ctx-source-A".to_owned());
         let signed = sign_event(
-            EventType::ToolInterfaceEstablished,
+            EventType::OutletInterfaceEstablished,
             &actor_did,
             1_700_000_000,
             0,

@@ -1791,7 +1791,7 @@ mod tests {
         let action = GovernanceAction::ApproveSpend {
             spender: alice(),
             amount: crate::economy::types::Amount::new(1000),
-            purpose: "tool costs".to_owned(),
+            purpose: "outlet costs".to_owned(),
         };
 
         let (proposal, _) = engine.propose(&alice(), action, &ctx, &sk_alice()).unwrap();

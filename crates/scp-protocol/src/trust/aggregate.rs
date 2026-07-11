@@ -1177,11 +1177,11 @@ mod tests {
             make_event(EventType::MessageSent, "did:key:alice", 1000, 0, vec![]),
             make_event(EventType::MessageSent, "did:key:alice", 1500, 1, vec![]),
             make_event(
-                EventType::ToolInvoked,
+                EventType::OutletInvoked,
                 "did:key:alice",
                 1600,
                 2,
-                b"my-tool".to_vec(),
+                b"my-outlet".to_vec(),
             ),
         ];
 
@@ -1220,7 +1220,7 @@ mod tests {
         assert_eq!(input.participation_record.context_id, "ctx-1");
         assert_eq!(input.participation_record.participation_count, 3);
         assert_eq!(
-            input.participation_record.tool_invocations.get("my-tool"),
+            input.participation_record.outlet_invocations.get("my-outlet"),
             Some(&1)
         );
 
@@ -1484,7 +1484,7 @@ mod tests {
                 window: Duration::from_mins(1),
             },
             ConsequenceRule {
-                trigger: super::super::consequence::ConsequenceTrigger::ToolRateExceeded,
+                trigger: super::super::consequence::ConsequenceTrigger::OutletRateExceeded,
                 action: super::super::consequence::ConsequenceAction::AssignRole {
                     to_role: "observer".to_owned(),
                 },
@@ -1531,14 +1531,14 @@ mod tests {
     fn threshold_counts_with_empty_attestor_set() {
         let mut requirements = HashMap::new();
         requirements.insert(
-            AttestationType::ToolIntegrity,
+            AttestationType::OutletIntegrity,
             ThresholdRequirement::new(2, 3, 0.5),
         );
 
         let attestor_sets = HashMap::new();
 
         let counts = compute_threshold_counts(&requirements, &attestor_sets);
-        let (met, required) = counts.get(&AttestationType::ToolIntegrity).unwrap();
+        let (met, required) = counts.get(&AttestationType::OutletIntegrity).unwrap();
         assert_eq!(*met, 0);
         assert_eq!(*required, 2);
     }
@@ -1551,7 +1551,7 @@ mod tests {
             ThresholdRequirement::new(2, 3, 0.0),
         );
         requirements.insert(
-            AttestationType::ToolIntegrity,
+            AttestationType::OutletIntegrity,
             ThresholdRequirement::new(1, 2, 0.0),
         );
 
@@ -1577,8 +1577,8 @@ mod tests {
         assert_eq!(*met, 1);
         assert_eq!(*required, 2);
 
-        // ToolIntegrity: 0 met (no attestors), 1 required.
-        let (met, required) = counts.get(&AttestationType::ToolIntegrity).unwrap();
+        // OutletIntegrity: 0 met (no attestors), 1 required.
+        let (met, required) = counts.get(&AttestationType::OutletIntegrity).unwrap();
         assert_eq!(*met, 0);
         assert_eq!(*required, 1);
     }

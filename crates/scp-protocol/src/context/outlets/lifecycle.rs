@@ -1,6 +1,6 @@
-//! Tool invocation lifecycle types: request, status, cancellation.
+//! Outlet invocation lifecycle types: request, status, cancellation.
 //!
-//! Every tool invocation is a stream by construction (§5.4.5). The legacy
+//! Every outlet invocation is a stream by construction (§5.4.5). The legacy
 //! non-streaming response type (`OutletResponse`) was deleted by SCP-OUT-032
 //! and is replaced by the §5.4.5 wire types in [`super::stream`]:
 //! `OutletStreamOpen` / `OutletStreamChunk` / `OutletStreamCredit` /
@@ -13,9 +13,9 @@
 //!
 //! # Types
 //!
-//! - [`OutletRequest`] -- A tool invocation request sent as an MLS application
+//! - [`OutletRequest`] -- A outlet invocation request sent as an MLS application
 //!   message.
-//! - [`OutletStatus`] -- The four terminal statuses of a tool invocation.
+//! - [`OutletStatus`] -- The four terminal statuses of a outlet invocation.
 //! - [`OutletCancel`] -- Cancellation request referencing a pending invocation.
 
 use serde::{Deserialize, Serialize};
@@ -27,10 +27,10 @@ use crate::economy::types::Amount;
 use crate::provenance::DataProvenance;
 use scp_did::DID;
 
-/// Type alias for tool invocation provenance.
+/// Type alias for outlet invocation provenance.
 ///
 /// Uses the existing [`DataProvenance`] from the provenance module to carry
-/// verifiable origin metadata on every tool response. See protocol tenet 1:
+/// verifiable origin metadata on every outlet response. See protocol tenet 1:
 /// "Provenance everywhere."
 pub type Provenance = DataProvenance;
 
@@ -38,7 +38,7 @@ pub type Provenance = DataProvenance;
 // Constants
 // ---------------------------------------------------------------------------
 
-/// Default timeout for tool invocations in milliseconds (30 seconds).
+/// Default timeout for outlet invocations in milliseconds (30 seconds).
 pub const DEFAULT_TIMEOUT_MS: u32 = 30_000;
 
 /// Hard protocol maximum timeout in milliseconds (5 minutes / 300 seconds).
@@ -48,9 +48,9 @@ pub const MAX_TIMEOUT_MS: u32 = 300_000;
 // OutletRequest
 // ---------------------------------------------------------------------------
 
-/// A tool invocation request, sent as an MLS application message.
+/// A outlet invocation request, sent as an MLS application message.
 ///
-/// Contains all metadata needed to dispatch a tool invocation including
+/// Contains all metadata needed to dispatch a outlet invocation including
 /// caller-specified timeout, optional session context, and cross-context
 /// chain depth.
 ///
@@ -59,11 +59,11 @@ pub const MAX_TIMEOUT_MS: u32 = 300_000;
 pub struct OutletRequest {
     /// UUID v4, unique per invocation.
     pub request_id: String,
-    /// The tool to invoke.
+    /// The outlet to invoke.
     pub outlet_id: String,
     /// The DID of the invoker.
     pub invoker_did: DID,
-    /// The input to pass to the tool.
+    /// The input to pass to the outlet.
     pub input: serde_json::Value,
     /// Caller-specified timeout in milliseconds.
     ///
@@ -71,7 +71,7 @@ pub struct OutletRequest {
     /// Maximum: configurable per-context, hard protocol maximum
     /// [`MAX_TIMEOUT_MS`] (300,000ms / 5 minutes).
     pub timeout_ms: u32,
-    /// Optional session ID for stateful tool sessions (spec section 6.2.1).
+    /// Optional session ID for stateful outlet sessions (spec section 6.2.1).
     pub session_id: Option<String>,
     /// Cross-context chain depth (0 for direct calls).
     pub chain_depth: u8,
@@ -119,18 +119,18 @@ impl OutletRequest {
 // OutletStatus
 // ---------------------------------------------------------------------------
 
-/// Terminal status of a tool invocation.
+/// Terminal status of a outlet invocation.
 ///
 /// See ADR-010 acceptance criterion 4.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OutletStatus {
-    /// Tool executed successfully and produced output.
+    /// Outlet executed successfully and produced output.
     Success,
-    /// Tool execution failed with an error.
+    /// Outlet execution failed with an error.
     Error,
-    /// Tool execution timed out before producing a response.
+    /// Outlet execution timed out before producing a response.
     Timeout,
-    /// Tool execution was cancelled by the invoker.
+    /// Outlet execution was cancelled by the invoker.
     Cancelled,
 }
 
@@ -149,10 +149,10 @@ impl std::fmt::Display for OutletStatus {
 // OutletCancel
 // ---------------------------------------------------------------------------
 
-/// Cancellation request for a pending tool invocation.
+/// Cancellation request for a pending outlet invocation.
 ///
 /// The invoker MAY send a `OutletCancel` referencing the `request_id` of a
-/// pending invocation. Cancellation is best-effort: if the tool responds
+/// pending invocation. Cancellation is best-effort: if the outlet responds
 /// with [`OutletStatus::Success`] before the cancel is processed, the success
 /// response takes precedence.
 ///
@@ -245,7 +245,7 @@ pub enum AuditAnomaly {
 /// separator. The algorithm is pinned at the protocol level, but the
 /// SDK-surface API for retrieving proofs (`outlets.inclusion_proof(
 /// invocation_id, chunk_index) -> path`) is intentionally **deferred**
-/// per ADR-049 §6 and discussion #1698. Auditing tools MAY reconstruct
+/// per ADR-049 §6 and discussion #1698. Auditing outlets MAY reconstruct
 /// proofs off-line by replaying the event log and the retained chunk
 /// sequence with a standard RFC 6962 verifier — the manifest root is
 /// sufficient evidence that a particular chunk was part of the stream.
@@ -254,7 +254,7 @@ pub enum AuditAnomaly {
 pub struct OutletInvokedEvent {
     /// The request ID of the invocation.
     pub request_id: String,
-    /// The tool that was invoked.
+    /// The outlet that was invoked.
     pub outlet_id: String,
     /// The DID of the invoker.
     pub invoker_did: DID,
@@ -267,7 +267,7 @@ pub struct OutletInvokedEvent {
     /// SHA-256 hash of the output (hex-encoded), if output was produced.
     pub output_hash: Option<String>,
     /// Cost attributed to this invocation (§19.3). `None` for free contexts
-    /// or tools without per-invocation cost. Value is in the context's
+    /// or outlets without per-invocation cost. Value is in the context's
     /// economic policy currency.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost: Option<Amount>,
@@ -352,9 +352,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tool_request_new_generates_uuid_v4() {
+    fn outlet_request_new_generates_uuid_v4() {
         let request = OutletRequest::new(
-            "tool-1".to_owned(),
+            "outlet-1".to_owned(),
             "did:dht:z6MkInvoker".into(),
             serde_json::json!({"x": 1}),
             &scp_clock::SystemClock,
@@ -369,9 +369,9 @@ mod tests {
     }
 
     #[test]
-    fn tool_request_clamp_timeout_below_context_max() {
+    fn outlet_request_clamp_timeout_below_context_max() {
         let mut request = OutletRequest::new(
-            "tool-1".to_owned(),
+            "outlet-1".to_owned(),
             "did:dht:z6MkInvoker".into(),
             serde_json::json!({}),
             &scp_clock::SystemClock,
@@ -382,9 +382,9 @@ mod tests {
     }
 
     #[test]
-    fn tool_request_clamp_timeout_above_context_max() {
+    fn outlet_request_clamp_timeout_above_context_max() {
         let mut request = OutletRequest::new(
-            "tool-1".to_owned(),
+            "outlet-1".to_owned(),
             "did:dht:z6MkInvoker".into(),
             serde_json::json!({}),
             &scp_clock::SystemClock,
@@ -395,9 +395,9 @@ mod tests {
     }
 
     #[test]
-    fn tool_request_clamp_timeout_respects_protocol_maximum() {
+    fn outlet_request_clamp_timeout_respects_protocol_maximum() {
         let mut request = OutletRequest::new(
-            "tool-1".to_owned(),
+            "outlet-1".to_owned(),
             "did:dht:z6MkInvoker".into(),
             serde_json::json!({}),
             &scp_clock::SystemClock,
@@ -409,7 +409,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_status_display() {
+    fn outlet_status_display() {
         assert_eq!(format!("{}", OutletStatus::Success), "Success");
         assert_eq!(format!("{}", OutletStatus::Error), "Error");
         assert_eq!(format!("{}", OutletStatus::Timeout), "Timeout");
@@ -417,7 +417,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_status_serialization_roundtrip() {
+    fn outlet_status_serialization_roundtrip() {
         for status in [
             OutletStatus::Success,
             OutletStatus::Error,
@@ -431,10 +431,10 @@ mod tests {
     }
 
     #[test]
-    fn tool_request_serialization_roundtrip() {
+    fn outlet_request_serialization_roundtrip() {
         let request = OutletRequest {
             request_id: "abc-123".to_owned(),
-            outlet_id: "tool-1".to_owned(),
+            outlet_id: "outlet-1".to_owned(),
             invoker_did: "did:dht:z6MkInvoker".into(),
             input: serde_json::json!({"a": 1}),
             timeout_ms: 5_000,
@@ -445,14 +445,14 @@ mod tests {
         let json = serde_json::to_string(&request).unwrap();
         let deserialized: OutletRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.request_id, "abc-123");
-        assert_eq!(deserialized.outlet_id, "tool-1");
+        assert_eq!(deserialized.outlet_id, "outlet-1");
         assert_eq!(deserialized.timeout_ms, 5_000);
         assert_eq!(deserialized.chain_depth, 2);
         assert_eq!(deserialized.session_id.as_deref(), Some("sess-1"));
     }
 
     #[test]
-    fn tool_cancel_serialization_roundtrip() {
+    fn outlet_cancel_serialization_roundtrip() {
         let cancel = OutletCancel {
             request_id: "req-1".to_owned(),
             invoker_did: "did:dht:z6MkInvoker".into(),
@@ -489,10 +489,10 @@ mod tests {
     }
 
     #[test]
-    fn tool_invoked_event_serialization_roundtrip() {
+    fn outlet_invoked_event_serialization_roundtrip() {
         let event = OutletInvokedEvent {
             request_id: "req-1".to_owned(),
-            outlet_id: "tool-1".to_owned(),
+            outlet_id: "outlet-1".to_owned(),
             invoker_did: "did:dht:z6MkInvoker".into(),
             status: OutletStatus::Success,
             execution_time_ms: 42,
@@ -534,7 +534,7 @@ mod tests {
     fn outlet_invoked_event_audit_anomaly_roundtrips_and_is_forward_compatible() {
         let event = OutletInvokedEvent {
             request_id: "req-anom".to_owned(),
-            outlet_id: "tool-anom".to_owned(),
+            outlet_id: "outlet-anom".to_owned(),
             invoker_did: "did:dht:z6MkInvoker".into(),
             status: OutletStatus::Success,
             execution_time_ms: 7,
@@ -564,7 +564,7 @@ mod tests {
         // and no audit_anomaly key still parses (additive field).
         let with_unknown = serde_json::json!({
             "request_id": "req-x",
-            "outlet_id": "tool-x",
+            "outlet_id": "outlet-x",
             "invoker_did": "did:dht:z6MkInvoker",
             "status": "Success",
             "execution_time_ms": 1,
@@ -583,7 +583,7 @@ mod tests {
     fn outlet_invoked_event_pre_scp_out_035_legacy_deserializes() {
         let legacy_json = serde_json::json!({
             "request_id": "req-legacy",
-            "outlet_id": "tool-legacy",
+            "outlet_id": "outlet-legacy",
             "invoker_did": "did:dht:z6MkInvoker",
             "status": "Success",
             "execution_time_ms": 17,

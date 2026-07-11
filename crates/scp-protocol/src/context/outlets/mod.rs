@@ -1,9 +1,9 @@
-//! Tool registration, schema validation, invocation lifecycle, and verification
+//! Outlet registration, schema validation, invocation lifecycle, and verification
 //! for SCP contexts.
 //!
-//! Tools are stateless functions scoped to a context (spec section 5.4). They
+//! Outlets are stateless functions scoped to a context (spec section 5.4). They
 //! have MCP-compatible JSON Schema interfaces (spec section 8.5), making them
-//! interoperable with existing MCP tooling. Every tool registration includes
+//! interoperable with existing MCP tooling. Every outlet registration includes
 //! schema, implementation hash, test vectors, and operator DID -- providing
 //! verifiable integrity (spec section 7.3.3).
 //!
@@ -12,7 +12,7 @@
 //!
 //! # Modules
 //!
-//! - [`registry`] -- Tool registration storage, `register_outlet`,
+//! - [`registry`] -- Outlet registration storage, `register_outlet`,
 //!   `update_outlet`, `verify_outlet`.
 //! - [`schema`] -- JSON Schema validation helpers and MCP compatibility.
 //! - `invoke` (in `scp-runtime`) -- Outlet invocation with full execution
@@ -26,18 +26,18 @@
 //!
 //! # Types
 //!
-//! - [`OutletId`] -- Unique identifier for a registered tool.
+//! - [`OutletId`] -- Unique identifier for a registered outlet.
 //! - [`OutletKind`] -- Structural classification (`Query` / `Action`, §5.4.2).
-//! - [`OutletError`] -- Error type for tool operations.
-//! - [`OutletRegistration`] -- Full tool registration with schema, hash, test
+//! - [`OutletError`] -- Error type for outlet operations.
+//! - [`OutletRegistration`] -- Full outlet registration with schema, hash, test
 //!   vectors, and operator DID. (Re-exported from [`registration`].)
 //! - [`OutletSchema`] -- MCP-compatible JSON Schema for input/output.
 //!   (Re-exported from [`registry`].)
-//! - [`OutletTestVector`] -- Known input-output pair for tool verification.
+//! - [`OutletTestVector`] -- Known input-output pair for outlet verification.
 //!   (Re-exported from [`registry`].)
-//! - [`OutletRegistry`] -- In-memory tool storage per context.
+//! - [`OutletRegistry`] -- In-memory outlet storage per context.
 //!   (Re-exported from [`registry`].)
-//! - [`OutletRequest`] -- Tool invocation request. (Re-exported from
+//! - [`OutletRequest`] -- Outlet invocation request. (Re-exported from
 //!   [`lifecycle`].)
 //! - [`OutletStatus`] -- Invocation terminal status. (Re-exported from
 //!   [`lifecycle`].)
@@ -164,7 +164,7 @@ impl OutletKind {
 // OutletId
 // ---------------------------------------------------------------------------
 
-/// Unique identifier for a registered tool within a context.
+/// Unique identifier for a registered outlet within a context.
 ///
 /// Matches the `OutletId` type alias in `context::roles`, re-defined here for
 /// module-local clarity. These are the same underlying type (`String`).
@@ -176,30 +176,30 @@ use scp_did::DID;
 // OutletError
 // ---------------------------------------------------------------------------
 
-/// Errors produced by tool registration, update, and verification operations.
+/// Errors produced by outlet registration, update, and verification operations.
 ///
 /// See ADR-010 for error conditions.
 #[derive(Debug, thiserror::Error)]
 pub enum OutletError {
-    /// The registrant does not have the `ToolRegister` capability.
-    #[error("registrant \"{did}\" does not have ToolRegister capability")]
+    /// The registrant does not have the `OutletRegister` capability.
+    #[error("registrant \"{did}\" does not have OutletRegister capability")]
     RegistrantNotAuthorized {
         /// The DID that attempted registration without authorization.
         did: String,
     },
 
-    /// The updater is not the tool's operator and does not have admin role.
-    #[error("updater \"{did}\" is not the tool operator and lacks admin role")]
+    /// The updater is not the outlet's operator and does not have admin role.
+    #[error("updater \"{did}\" is not the outlet operator and lacks admin role")]
     UpdaterNotAuthorized {
         /// The DID that attempted the update without authorization.
         did: String,
     },
 
-    /// The tool's input schema failed validation.
+    /// The outlet's input schema failed validation.
     #[error("invalid input schema: {0}")]
     InvalidInputSchema(#[source] SchemaValidationError),
 
-    /// The tool's output schema failed validation.
+    /// The outlet's output schema failed validation.
     #[error("invalid output schema: {0}")]
     InvalidOutputSchema(#[source] SchemaValidationError),
 
@@ -217,26 +217,26 @@ pub enum OutletError {
         did: String,
     },
 
-    /// The specified tool was not found in the registry.
-    #[error("tool not found: \"{outlet_id}\"")]
+    /// The specified outlet was not found in the registry.
+    #[error("outlet not found: \"{outlet_id}\"")]
     OutletNotFound {
-        /// The tool ID that was not found.
+        /// The outlet ID that was not found.
         outlet_id: OutletId,
     },
 
-    /// The tool ID in the new registration does not match the existing tool.
-    #[error("tool ID mismatch: expected \"{expected}\", got \"{actual}\"")]
-    ToolIdMismatch {
-        /// The expected tool ID.
+    /// The outlet ID in the new registration does not match the existing outlet.
+    #[error("outlet ID mismatch: expected \"{expected}\", got \"{actual}\"")]
+    OutletIdMismatch {
+        /// The expected outlet ID.
         expected: OutletId,
-        /// The actual tool ID provided.
+        /// The actual outlet ID provided.
         actual: OutletId,
     },
 
-    /// A tool with this ID is already registered.
-    #[error("tool already registered: \"{outlet_id}\"")]
-    ToolAlreadyRegistered {
-        /// The duplicate tool ID.
+    /// A outlet with this ID is already registered.
+    #[error("outlet already registered: \"{outlet_id}\"")]
+    OutletAlreadyRegistered {
+        /// The duplicate outlet ID.
         outlet_id: OutletId,
     },
 
@@ -255,22 +255,22 @@ pub enum OutletError {
     },
 
     /// The invoker does not have the required capability.
-    #[error("invoker \"{did}\" not authorized for tool \"{outlet_id}\"")]
+    #[error("invoker \"{did}\" not authorized for outlet \"{outlet_id}\"")]
     InvokerNotAuthorized {
         /// The DID that attempted invocation.
         did: String,
-        /// The tool ID.
+        /// The outlet ID.
         outlet_id: String,
     },
 
-    /// Input validation against the tool schema failed.
+    /// Input validation against the outlet schema failed.
     #[error("input validation failed: {message}")]
     InputValidationFailed {
         /// Human-readable description of the validation failure.
         message: String,
     },
 
-    /// Tool execution failed.
+    /// Outlet execution failed.
     #[error("execution failed: {message}")]
     ExecutionFailed {
         /// Human-readable description of the execution failure.
@@ -291,8 +291,8 @@ pub enum OutletError {
         session_id: String,
     },
 
-    /// Admin capability is required for cross-context tool interfaces.
-    #[error("admin capability required for tool interface: {did}")]
+    /// Admin capability is required for cross-context outlet interfaces.
+    #[error("admin capability required for outlet interface: {did}")]
     InterfaceAdminRequired {
         /// The DID that attempted the operation.
         did: String,
@@ -300,7 +300,7 @@ pub enum OutletError {
 
     /// The interface has not been approved by both sides.
     #[error(
-        "tool interface not fully approved (source: {source_approved}, target: {target_approved})"
+        "outlet interface not fully approved (source: {source_approved}, target: {target_approved})"
     )]
     InterfaceNotApproved {
         /// Whether the source context approved.
@@ -310,11 +310,11 @@ pub enum OutletError {
     },
 
     /// The invoker is not authorized for this cross-context interface.
-    #[error("invoker \"{did}\" not authorized for cross-context tool \"{outlet_id}\"")]
+    #[error("invoker \"{did}\" not authorized for cross-context outlet \"{outlet_id}\"")]
     InterfaceInvokerNotAuthorized {
         /// The DID that attempted invocation.
         did: String,
-        /// The tool ID.
+        /// The outlet ID.
         outlet_id: String,
     },
 
@@ -332,7 +332,7 @@ pub enum OutletError {
     },
 
     /// Context ID mismatch in cross-context interface.
-    #[error("context mismatch in tool interface: expected {expected}, got {actual}")]
+    #[error("context mismatch in outlet interface: expected {expected}, got {actual}")]
     InterfaceContextMismatch {
         /// The expected context ID.
         expected: String,
@@ -347,7 +347,7 @@ pub enum OutletError {
         message: String,
     },
 
-    /// The cross-context tool call chain depth exceeded the maximum.
+    /// The cross-context outlet call chain depth exceeded the maximum.
     #[error("chain depth {depth} exceeds maximum {max_depth}")]
     ChainDepthExceeded {
         /// The current chain depth.
@@ -369,7 +369,7 @@ pub enum OutletError {
         max: u32,
     },
 
-    /// The tool schema does not meet the specificity floor (spec section 6.2, 9.2.1).
+    /// The outlet schema does not meet the specificity floor (spec section 6.2, 9.2.1).
     #[error(
         "schema specificity floor not met: {side} schema has {field_count} distinct fields, minimum {min_fields} required"
     )]
@@ -382,12 +382,12 @@ pub enum OutletError {
         min_fields: usize,
     },
 
-    /// Tool registration signature verification failed (M15).
+    /// Outlet registration signature verification failed (M15).
     ///
     /// The `signature` field on a [`OutletRegistration`] is a Ed25519 signature
     /// over the canonical registration bytes. If the signature is non-empty,
     /// it MUST verify against the registrant's signing key.
-    #[error("tool registration signature verification failed: {reason}")]
+    #[error("outlet registration signature verification failed: {reason}")]
     SignatureVerificationFailed {
         /// Human-readable description of the failure.
         reason: String,
@@ -419,7 +419,7 @@ pub enum OutletError {
     },
 
     /// Canonical serialization (RFC 8785 JCS) of a value failed while computing
-    /// a convergent hash (e.g., a tool-invocation input/output hash).
+    /// a convergent hash (e.g., a outlet-invocation input/output hash).
     ///
     /// A convergent identity/hash must never be silently computed over
     /// defaulted-empty bytes: the error is surfaced instead of substituting an
@@ -448,37 +448,37 @@ pub enum OutletError {
 }
 
 // ---------------------------------------------------------------------------
-// ToolEvent (event log integration types)
+// OutletEvent (event log integration types)
 // ---------------------------------------------------------------------------
 
-/// Event payload for a `ToolRegistered` event in the context event log.
+/// Event payload for a `OutletRegistered` event in the context event log.
 ///
 /// Captures the full registration metadata for auditability. Serialized into
 /// the opaque `EventPayload::data` field.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct OutletRegisteredEvent {
-    /// The registered tool's ID.
+    /// The registered outlet's ID.
     pub outlet_id: OutletId,
-    /// The tool name.
+    /// The outlet name.
     pub name: String,
-    /// The tool description.
+    /// The outlet description.
     pub description: String,
     /// SHA-256 implementation hash.
     pub implementation_hash: [u8; 32],
-    /// The operator DID responsible for the tool.
+    /// The operator DID responsible for the outlet.
     pub operator_did: DID,
-    /// The DID of the registrant who registered the tool.
+    /// The DID of the registrant who registered the outlet.
     pub registrant_did: DID,
     /// Number of test vectors included.
     pub test_vector_count: usize,
 }
 
-/// Event payload for a `ToolUpdated` event in the context event log.
+/// Event payload for a `OutletUpdated` event in the context event log.
 ///
 /// Records old and new implementation hashes and all changed fields.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct OutletUpdatedEvent {
-    /// The updated tool's ID.
+    /// The updated outlet's ID.
     pub outlet_id: OutletId,
     /// The old implementation hash before the update.
     pub old_implementation_hash: [u8; 32],
@@ -539,7 +539,7 @@ pub enum OutletVerifiedReason {
     HandlerPanicked,
 }
 
-/// Event payload for a `ToolVerified` event in the context event log.
+/// Event payload for a `OutletVerified` event in the context event log.
 ///
 /// Records the verification result for auditability. `reason` carries the
 /// failure category when `integrity_ok == false`; it is omitted from the
@@ -547,7 +547,7 @@ pub enum OutletVerifiedReason {
 /// that a successful verification has no failure reason to attribute.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct OutletVerifiedEvent {
-    /// The verified tool's ID.
+    /// The verified outlet's ID.
     pub outlet_id: OutletId,
     /// Number of test vectors that passed.
     pub passed: usize,
@@ -578,7 +578,7 @@ pub fn has_outlet_register_capability(role_state: &roles::ContextRoleState, did:
 
 /// Checks whether a member has admin-level capabilities.
 ///
-/// Used by `update_outlet` to verify the updater is either the tool operator
+/// Used by `update_outlet` to verify the updater is either the outlet operator
 /// or an admin.
 #[must_use]
 pub fn has_admin_role(role_state: &roles::ContextRoleState, did: &str) -> bool {

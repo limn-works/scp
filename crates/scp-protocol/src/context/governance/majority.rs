@@ -2390,7 +2390,7 @@ mod tests {
         let action = GovernanceAction::ApproveSpend {
             spender: bob(),
             amount: crate::economy::types::Amount::new(5000),
-            purpose: "tool budget".to_owned(),
+            purpose: "outlet budget".to_owned(),
         };
 
         let (proposal, _) = engine.propose(&alice(), action, &ctx, &sk_alice()).unwrap();

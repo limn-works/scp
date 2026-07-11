@@ -713,7 +713,7 @@ mod tests {
             "scp:capability:privacy-compliance/v1",
             "scp:capability:credential-handling/v1",
             "scp:capability:schema-validation/v1",
-            "scp:capability:tool-schema-compliance/v1",
+            "scp:capability:outlet-schema-compliance/v1",
             "scp:capability:output-format-compliance/v1",
             "scp:capability:rate-limit-compliance/v1",
             "scp:capability:instruction-adherence/v1",

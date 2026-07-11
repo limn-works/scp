@@ -292,7 +292,7 @@ impl PublishableKeyDestructionAttestation {
 ///
 /// Per spec §5.11: "Durable metadata persists: who participated, when, the
 /// declared purpose, participation contributions (participation counts,
-/// tool invocations), and discovery provenance."
+/// outlet invocations), and discovery provenance."
 ///
 /// Content and messages are NOT included — they are destroyed with the keys.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

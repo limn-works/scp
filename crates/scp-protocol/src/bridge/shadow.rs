@@ -76,7 +76,7 @@ pub const VERIFIED_IDENTITY_CAPABILITIES: &[&str] = &[
     "member.invite",
     "member.remove",
     "context.configure",
-    "tool.register",
+    "outlet.register",
 ];
 
 // ---------------------------------------------------------------------------

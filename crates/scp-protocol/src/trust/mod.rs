@@ -63,11 +63,11 @@ use scp_did::DID;
 // Type aliases
 // ---------------------------------------------------------------------------
 
-/// A tool identifier string.
+/// A outlet identifier string.
 ///
-/// Matches the `ToolId` type alias in `context::roles`, but redefined here
+/// Matches the `OutletId` type alias in `context::roles`, but redefined here
 /// to avoid coupling the trust module to the context module's internals.
-pub type ToolId = String;
+pub type OutletId = String;
 
 // ---------------------------------------------------------------------------
 // TrustError
@@ -348,8 +348,8 @@ pub enum AttestationType {
     IdentityLink,
     /// Delegates a capability to another DID.
     CapabilityDelegation,
-    /// Attests to the integrity of a tool.
-    ToolIntegrity,
+    /// Attests to the integrity of a outlet.
+    OutletIntegrity,
     /// Attests to an agent's capability.
     AgentCapability,
     /// A general endorsement.
@@ -368,7 +368,7 @@ pub const fn attestation_type_tag(at: &AttestationType) -> u16 {
     match at {
         AttestationType::IdentityLink => 0,
         AttestationType::CapabilityDelegation => 1,
-        AttestationType::ToolIntegrity => 2,
+        AttestationType::OutletIntegrity => 2,
         AttestationType::AgentCapability => 3,
         AttestationType::Endorsement => 4,
         AttestationType::RoleAssignment => 5,

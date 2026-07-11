@@ -1,4 +1,4 @@
-//! Tool-interface discovery for SCP — pure protocol types.
+//! Outlet-interface discovery for SCP — pure protocol types.
 //!
 //! `DiscoveryError` and pure module declarations.
 //! Async modules (addressing, search, `did_capabilities`, bootstrap, `dht_context`)
@@ -51,7 +51,7 @@ pub struct DataProvenance {
 // DiscoveryQuery
 // ---------------------------------------------------------------------------
 
-/// A search query for contexts with discovery tools.
+/// A search query for contexts with discovery outlets.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DiscoveryQuery {
     /// Filter by capability strings.
@@ -94,7 +94,7 @@ pub struct DiscoveryResultEntry {
 // RegistrationEntry
 // ---------------------------------------------------------------------------
 
-/// A registered agent entry in a context with discovery tools.
+/// A registered agent entry in a context with discovery outlets.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RegistrationEntry {
     /// The registered agent's DID.

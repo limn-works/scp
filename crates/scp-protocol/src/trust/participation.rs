@@ -26,20 +26,20 @@ use scp_event_log::payload::{GovernanceActionExecutedPayload, decode_payload, pr
 use scp_event_log::{ContextId, Event, EventType};
 
 use super::attestation::{Attestation, RevocationStatus};
-use super::{AttestationReference, GovernanceActionSummary, RoleTransition, ToolId, TrustError};
+use super::{AttestationReference, GovernanceActionSummary, RoleTransition, OutletId, TrustError};
 
 // ---------------------------------------------------------------------------
 // Anchoring flags — single source of truth
 // ---------------------------------------------------------------------------
 
-/// Whether `tool_invocation_count` is anchored in the canonical Merkle log.
+/// Whether `outlet_invocation_count` is anchored in the canonical Merkle log.
 ///
-/// `false` until ADR-051 makes `ToolInvoked` a convergent leaf: the count is
+/// `false` until ADR-051 makes `OutletInvoked` a convergent leaf: the count is
 /// computed from per-author local `ContextEvent`s, not the Merkle log (spec
 /// §7.3.2; ADR-011 amendment exclusion taxonomy). Defined ONCE so the unsigned
 /// [`ParticipationFacts`] view and the signed [`ParticipationProfile`] cannot
 /// drift in what they advertise.
-pub const TOOL_INVOCATION_COUNT_ANCHORED: bool = false;
+pub const OUTLET_INVOCATION_COUNT_ANCHORED: bool = false;
 
 /// Whether `attestation_count` is anchored in / verifiable against a context
 /// Merkle root.
@@ -48,7 +48,7 @@ pub const TOOL_INVOCATION_COUNT_ANCHORED: bool = false;
 /// verifier-relative fact — there is no attestation event type, and each
 /// contributing attestation is verified by its own envelope signature and
 /// revocation status (§7.4.1, §7.4.4), NOT by inclusion in any context Merkle
-/// tree (spec §7.3.2). Distinct from [`TOOL_INVOCATION_COUNT_ANCHORED`], which
+/// tree (spec §7.3.2). Distinct from [`OUTLET_INVOCATION_COUNT_ANCHORED`], which
 /// flips once ADR-051 lands; this one never does.
 pub const ATTESTATION_COUNT_ANCHORED: bool = false;
 
@@ -84,9 +84,9 @@ pub struct ParticipationRecord {
     /// sum multiple intervals.
     pub participation_duration_seconds: u64,
 
-    /// Tool invocations by tool ID. The tool ID is extracted from the event
-    /// payload's first bytes when the event type is `ToolInvoked`.
-    pub tool_invocations: HashMap<ToolId, u64>,
+    /// Outlet invocations by outlet ID. The outlet ID is extracted from the event
+    /// payload's first bytes when the event type is `OutletInvoked`.
+    pub outlet_invocations: HashMap<OutletId, u64>,
 
     /// Governance actions performed by the subject.
     pub governance_actions_by: Vec<GovernanceActionSummary>,
@@ -122,7 +122,7 @@ pub struct ParticipationRecord {
 
 /// The scalar (count-flattened) projection of a [`ParticipationRecord`].
 ///
-/// [`ParticipationRecord`] carries rich collections (`tool_invocations`
+/// [`ParticipationRecord`] carries rich collections (`outlet_invocations`
 /// `HashMap`, `governance_actions_*` / `role_history` / `attestation_history`
 /// `Vec`s) that are awkward to convey verbatim across the FFI boundary and that
 /// every SDK would otherwise have to re-aggregate into counts — re-introducing
@@ -167,17 +167,17 @@ pub struct ParticipationFacts {
     /// Count of governance actions initiated by this identity.
     pub governance_actions_by: u64,
 
-    /// Total tool invocations across all tool types.
-    pub tool_invocation_count: u64,
+    /// Total outlet invocations across all outlet types.
+    pub outlet_invocation_count: u64,
 
-    /// Whether `tool_invocation_count` is anchored in the canonical Merkle log.
+    /// Whether `outlet_invocation_count` is anchored in the canonical Merkle log.
     ///
-    /// `false` until ADR-051 makes `ToolInvoked` a convergent leaf: the count is
+    /// `false` until ADR-051 makes `OutletInvoked` a convergent leaf: the count is
     /// computed from per-author local `ContextEvent`s, not the Merkle log
     /// (spec §7.3.2; ADR-011 amendment exclusion taxonomy §2). Truth-in-
     /// advertising — consumers MUST NOT treat the count as Merkle-proven while
     /// this is `false`.
-    pub tool_invocation_count_anchored: bool,
+    pub outlet_invocation_count_anchored: bool,
 
     /// Number of contexts created by the subject (`ChildContextCreated`).
     pub context_creation_count: u64,
@@ -210,7 +210,7 @@ pub struct ParticipationFacts {
     /// count — there is no attestation event type, and each contributing
     /// attestation is verified by its own envelope signature/revocation, not by
     /// Merkle inclusion (spec §7.3.2). The parallel of
-    /// `tool_invocation_count_anchored`, present so the non-anchored,
+    /// `outlet_invocation_count_anchored`, present so the non-anchored,
     /// verifier-relative nature is mechanically visible to consumers rather than
     /// implicit.
     pub attestation_count_anchored: bool,
@@ -227,20 +227,20 @@ impl From<&ParticipationRecord> for ParticipationFacts {
     ///
     /// This is the SAME reduction [`produce_participation_profile`] applies when
     /// building a signed [`ParticipationProfile`] (`.len()` over the governance /
-    /// role / attestation `Vec`s; `.values().sum()` over the `tool_invocations`
-    /// `HashMap`); `tool_invocation_count_anchored` is `false` until ADR-051
+    /// role / attestation `Vec`s; `.values().sum()` over the `outlet_invocations`
+    /// `HashMap`); `outlet_invocation_count_anchored` is `false` until ADR-051
     /// (spec §7.3.2).
     fn from(record: &ParticipationRecord) -> Self {
-        let tool_invocation_count: u64 = record.tool_invocations.values().sum();
+        let outlet_invocation_count: u64 = record.outlet_invocations.values().sum();
         Self {
             subject_did: record.subject_did.clone(),
             participation_duration_secs: record.participation_duration_seconds,
             governance_actions_against: record.governance_actions_against.len() as u64,
             governance_actions_by: record.governance_actions_by.len() as u64,
-            tool_invocation_count,
-            // `tool_invocation_count` is summed from local `ToolInvoked`
+            outlet_invocation_count,
+            // `outlet_invocation_count` is summed from local `OutletInvoked`
             // `ContextEvent`s, not the Merkle log, until ADR-051 (spec §7.3.2).
-            tool_invocation_count_anchored: TOOL_INVOCATION_COUNT_ANCHORED,
+            outlet_invocation_count_anchored: OUTLET_INVOCATION_COUNT_ANCHORED,
             context_creation_count: record.context_creation_count,
             role_progression_count: record.role_history.len() as u64,
             attestation_count: record.attestation_history.len() as u64,
@@ -312,7 +312,7 @@ pub fn compute_participation_record(
     }
 
     let mut participation_count: u64 = 0;
-    let mut tool_invocations: HashMap<ToolId, u64> = HashMap::new();
+    let mut outlet_invocations: HashMap<OutletId, u64> = HashMap::new();
     let mut governance_actions_by: Vec<GovernanceActionSummary> = Vec::new();
     let mut governance_actions_against: Vec<GovernanceActionSummary> = Vec::new();
     let mut role_history: Vec<RoleTransition> = Vec::new();
@@ -337,9 +337,9 @@ pub fn compute_participation_record(
         }
 
         match event.event_type {
-            EventType::ToolInvoked if is_subject => {
-                let tool_id = extract_tool_id_from_payload(&event.payload.data);
-                *tool_invocations.entry(tool_id).or_insert(0) += 1;
+            EventType::OutletInvoked if is_subject => {
+                let outlet_id = extract_outlet_id_from_payload(&event.payload.data);
+                *outlet_invocations.entry(outlet_id).or_insert(0) += 1;
             }
 
             EventType::GovernanceActionExecuted => record_governance_action(
@@ -413,7 +413,7 @@ pub fn compute_participation_record(
         context_id: context_id.to_owned(),
         participation_count,
         participation_duration_seconds: duration_secs,
-        tool_invocations,
+        outlet_invocations,
         governance_actions_by,
         governance_actions_against,
         role_history,
@@ -485,12 +485,12 @@ pub const fn meets_threshold(record: &ParticipationRecord) -> bool {
 // Payload extraction helpers
 // ---------------------------------------------------------------------------
 
-/// Extracts a tool ID from a `ToolInvoked` event payload.
+/// Extracts a outlet ID from a `OutletInvoked` event payload.
 ///
-/// Convention: the payload data starts with a UTF-8 tool ID string, terminated
+/// Convention: the payload data starts with a UTF-8 outlet ID string, terminated
 /// by a null byte or the end of data. If the payload is empty or not valid
 /// UTF-8, returns `"unknown"`.
-fn extract_tool_id_from_payload(data: &[u8]) -> ToolId {
+fn extract_outlet_id_from_payload(data: &[u8]) -> OutletId {
     let end = data.iter().position(|&b| b == 0).unwrap_or(data.len());
     std::str::from_utf8(&data[..end])
         .unwrap_or("unknown")
@@ -593,8 +593,8 @@ pub enum ParticipationFact {
     GovernanceActionsAgainst,
     /// Count of governance actions initiated by the identity.
     GovernanceActionsBy,
-    /// Total tool invocations across all tool types.
-    ToolInvocationCount,
+    /// Total outlet invocations across all outlet types.
+    OutletInvocationCount,
     /// Number of contexts created.
     ContextCreationCount,
     /// Number of role transitions.
@@ -620,7 +620,7 @@ impl ParticipationFact {
             Self::ParticipationDuration => profile.participation_duration_secs,
             Self::GovernanceActionsAgainst => profile.governance_actions_against,
             Self::GovernanceActionsBy => profile.governance_actions_by,
-            Self::ToolInvocationCount => profile.tool_invocation_count,
+            Self::OutletInvocationCount => profile.outlet_invocation_count,
             Self::ContextCreationCount => profile.context_creation_count,
             Self::RoleProgressionCount => profile.role_progression_count,
             Self::AttestationCount => profile.attestation_count,
@@ -706,18 +706,18 @@ pub struct ParticipationProfile {
     /// Count of governance actions initiated by this identity.
     pub governance_actions_by: u64,
 
-    /// Total tool invocations across all tool types.
-    pub tool_invocation_count: u64,
+    /// Total outlet invocations across all outlet types.
+    pub outlet_invocation_count: u64,
 
-    /// Whether `tool_invocation_count` is anchored in the canonical Merkle log.
+    /// Whether `outlet_invocation_count` is anchored in the canonical Merkle log.
     ///
-    /// `false` until ADR-051 makes `ToolInvoked` a convergent leaf: the count is
+    /// `false` until ADR-051 makes `OutletInvoked` a convergent leaf: the count is
     /// computed from per-author local `ContextEvent`s, not the Merkle log
     /// (spec §7.3.2; ADR-011 amendment exclusion taxonomy §2). Truth-in-
     /// advertising — consumers MUST NOT treat the count as Merkle-proven while
     /// this is `false`. The flag is part of the signed preimage so it cannot be
     /// stripped from a signed profile.
-    pub tool_invocation_count_anchored: bool,
+    pub outlet_invocation_count_anchored: bool,
 
     /// Number of contexts created.
     pub context_creation_count: u64,
@@ -761,8 +761,8 @@ impl ParticipationProfile {
     /// - `participation_duration_secs` (u64 big-endian)
     /// - `governance_actions_against` (u64 big-endian)
     /// - `governance_actions_by` (u64 big-endian)
-    /// - `tool_invocation_count` (u64 big-endian)
-    /// - `tool_invocation_count_anchored` (1 byte: 0 or 1)
+    /// - `outlet_invocation_count` (u64 big-endian)
+    /// - `outlet_invocation_count_anchored` (1 byte: 0 or 1)
     /// - `context_creation_count` (u64 big-endian)
     /// - `role_progression_count` (u64 big-endian)
     /// - `attestation_count` (u64 big-endian)
@@ -773,7 +773,7 @@ impl ParticipationProfile {
     pub fn signable_bytes(&self) -> Vec<u8> {
         let did_bytes = self.subject_did.as_bytes();
         // domain separator + 4 (length prefix) + did_bytes.len() + 8*8 (eight
-        // u64 fields) + 1 (tool_invocation_count_anchored byte) + 32 + 32
+        // u64 fields) + 1 (outlet_invocation_count_anchored byte) + 32 + 32
         let capacity = DOMAIN_PARTICIPATION_V1.len() + 4 + did_bytes.len() + 64 + 1 + 64;
         let mut buf = Vec::with_capacity(capacity);
 
@@ -789,10 +789,10 @@ impl ParticipationProfile {
         buf.extend_from_slice(&self.participation_duration_secs.to_be_bytes());
         buf.extend_from_slice(&self.governance_actions_against.to_be_bytes());
         buf.extend_from_slice(&self.governance_actions_by.to_be_bytes());
-        buf.extend_from_slice(&self.tool_invocation_count.to_be_bytes());
+        buf.extend_from_slice(&self.outlet_invocation_count.to_be_bytes());
         // Truth-in-advertising flag (spec §7.3.2) — one byte in the signed
         // preimage so a signed profile binds whether the count is Merkle-anchored.
-        buf.push(u8::from(self.tool_invocation_count_anchored));
+        buf.push(u8::from(self.outlet_invocation_count_anchored));
         buf.extend_from_slice(&self.context_creation_count.to_be_bytes());
         buf.extend_from_slice(&self.role_progression_count.to_be_bytes());
         buf.extend_from_slice(&self.attestation_count.to_be_bytes());
@@ -1243,10 +1243,10 @@ pub fn produce_participation_profile(
         participation_duration_secs: facts.participation_duration_secs,
         governance_actions_against: facts.governance_actions_against,
         governance_actions_by: facts.governance_actions_by,
-        tool_invocation_count: facts.tool_invocation_count,
-        // `tool_invocation_count` is summed from local `ToolInvoked`
+        outlet_invocation_count: facts.outlet_invocation_count,
+        // `outlet_invocation_count` is summed from local `OutletInvoked`
         // `ContextEvent`s, not the Merkle log, until ADR-051 (spec §7.3.2).
-        tool_invocation_count_anchored: facts.tool_invocation_count_anchored,
+        outlet_invocation_count_anchored: facts.outlet_invocation_count_anchored,
         context_creation_count: facts.context_creation_count,
         role_progression_count: facts.role_progression_count,
         attestation_count: facts.attestation_count,
@@ -1353,35 +1353,35 @@ mod tests {
     }
 
     #[test]
-    fn compute_tracks_tool_invocations() {
+    fn compute_tracks_outlet_invocations() {
         let events = vec![
             make_event(
-                EventType::ToolInvoked,
+                EventType::OutletInvoked,
                 "did:key:alice",
                 1000,
                 0,
-                b"tool-search\0extra".to_vec(),
+                b"outlet-search\0extra".to_vec(),
             ),
             make_event(
-                EventType::ToolInvoked,
+                EventType::OutletInvoked,
                 "did:key:alice",
                 1001,
                 1,
-                b"tool-search".to_vec(),
+                b"outlet-search".to_vec(),
             ),
             make_event(
-                EventType::ToolInvoked,
+                EventType::OutletInvoked,
                 "did:key:alice",
                 1002,
                 2,
-                b"tool-execute".to_vec(),
+                b"outlet-execute".to_vec(),
             ),
             make_event(
-                EventType::ToolInvoked,
+                EventType::OutletInvoked,
                 "did:key:bob",
                 1003,
                 3,
-                b"tool-search".to_vec(),
+                b"outlet-search".to_vec(),
             ),
         ];
 
@@ -1389,9 +1389,9 @@ mod tests {
             compute_participation_record(&events, "did:key:alice", "ctx-1", [0u8; 32], 2000, &[])
                 .unwrap();
 
-        assert_eq!(record.tool_invocations.len(), 2);
-        assert_eq!(record.tool_invocations.get("tool-search"), Some(&2));
-        assert_eq!(record.tool_invocations.get("tool-execute"), Some(&1));
+        assert_eq!(record.outlet_invocations.len(), 2);
+        assert_eq!(record.outlet_invocations.get("outlet-search"), Some(&2));
+        assert_eq!(record.outlet_invocations.get("outlet-execute"), Some(&1));
     }
 
     #[test]
@@ -1885,7 +1885,7 @@ mod tests {
         // Record is valid but all counts are zero.
         assert_eq!(record.participation_count, 0);
         assert_eq!(record.participation_duration_seconds, 0);
-        assert!(record.tool_invocations.is_empty());
+        assert!(record.outlet_invocations.is_empty());
         assert!(record.governance_actions_by.is_empty());
         assert!(record.governance_actions_against.is_empty());
         assert!(record.role_history.is_empty());
@@ -1960,18 +1960,18 @@ mod tests {
                 b"hi".to_vec(),
             ),
             make_event(
-                EventType::ToolInvoked,
+                EventType::OutletInvoked,
                 "did:key:alice",
                 1006,
                 6,
-                b"search-tool".to_vec(),
+                b"search-outlet".to_vec(),
             ),
             make_event(
-                EventType::ToolInvoked,
+                EventType::OutletInvoked,
                 "did:key:alice",
                 1007,
                 7,
-                b"search-tool".to_vec(),
+                b"search-outlet".to_vec(),
             ),
             make_event(
                 EventType::GovernanceActionExecuted,
@@ -2000,11 +2000,11 @@ mod tests {
         .unwrap();
 
         // Alice's events: ChildContextCreated, MemberJoined, RoleAssigned (actor),
-        // MessageSent, 2x ToolInvoked, GovernanceActionExecuted = 7.
+        // MessageSent, 2x OutletInvoked, GovernanceActionExecuted = 7.
         assert_eq!(record.participation_count, 7);
         // Open MemberJoined interval (1001) → latest event ts (1008) = 7.
         assert_eq!(record.participation_duration_seconds, 7);
-        assert_eq!(record.tool_invocations.get("search-tool"), Some(&2));
+        assert_eq!(record.outlet_invocations.get("search-outlet"), Some(&2));
         assert_eq!(record.governance_actions_by.len(), 1);
         assert_eq!(record.governance_actions_against.len(), 0);
         // Alice assigned bob's role — subject is bob, not alice.
@@ -2017,21 +2017,21 @@ mod tests {
     }
 
     #[test]
-    fn extract_tool_id_handles_null_terminated() {
+    fn extract_outlet_id_handles_null_terminated() {
         assert_eq!(
-            extract_tool_id_from_payload(b"my-tool\0extra-data"),
-            "my-tool"
+            extract_outlet_id_from_payload(b"my-outlet\0extra-data"),
+            "my-outlet"
         );
     }
 
     #[test]
-    fn extract_tool_id_handles_no_null() {
-        assert_eq!(extract_tool_id_from_payload(b"my-tool"), "my-tool");
+    fn extract_outlet_id_handles_no_null() {
+        assert_eq!(extract_outlet_id_from_payload(b"my-outlet"), "my-outlet");
     }
 
     #[test]
-    fn extract_tool_id_handles_empty() {
-        assert_eq!(extract_tool_id_from_payload(b""), "");
+    fn extract_outlet_id_handles_empty() {
+        assert_eq!(extract_outlet_id_from_payload(b""), "");
     }
 
     // -----------------------------------------------------------------------
@@ -2045,8 +2045,8 @@ mod tests {
             participation_duration_secs: 86400,
             governance_actions_against: 2,
             governance_actions_by: 5,
-            tool_invocation_count: 203,
-            tool_invocation_count_anchored: false,
+            outlet_invocation_count: 203,
+            outlet_invocation_count_anchored: false,
             context_creation_count: 3,
             role_progression_count: 4,
             attestation_count: 10,
@@ -2064,7 +2064,7 @@ mod tests {
             ParticipationFact::ParticipationDuration,
             ParticipationFact::GovernanceActionsAgainst,
             ParticipationFact::GovernanceActionsBy,
-            ParticipationFact::ToolInvocationCount,
+            ParticipationFact::OutletInvocationCount,
             ParticipationFact::ContextCreationCount,
             ParticipationFact::RoleProgressionCount,
             ParticipationFact::AttestationCount,
@@ -2101,7 +2101,7 @@ mod tests {
             5
         );
         assert_eq!(
-            ParticipationFact::ToolInvocationCount.extract_value(&profile),
+            ParticipationFact::OutletInvocationCount.extract_value(&profile),
             203
         );
         assert_eq!(
@@ -2175,7 +2175,7 @@ mod tests {
     fn signable_bytes_changes_with_fields() {
         let profile1 = make_profile();
         let mut profile2 = make_profile();
-        profile2.tool_invocation_count = 999;
+        profile2.outlet_invocation_count = 999;
 
         assert_ne!(profile1.signable_bytes(), profile2.signable_bytes());
     }
@@ -2196,38 +2196,38 @@ mod tests {
         let did_len = "did:key:test".len();
         let domain_len = b"SCP-PARTICIPATION-V1:".len();
         // domain separator + 4 (length prefix) + did_len + 8*8 (8 u64 fields)
-        // + 1 (tool_invocation_count_anchored byte) + 32 + 32
+        // + 1 (outlet_invocation_count_anchored byte) + 32 + 32
         let expected = domain_len + 4 + did_len + 64 + 1 + 64;
         assert_eq!(bytes.len(), expected);
     }
 
     #[test]
-    fn signable_bytes_changes_with_tool_invocation_count_anchored() {
+    fn signable_bytes_changes_with_outlet_invocation_count_anchored() {
         // The truth-in-advertising flag is part of the signed preimage (spec
         // §7.3.2), so two profiles differing ONLY in it produce different
         // `signable_bytes` — a signature cannot be transplanted between an
         // anchored and an unanchored claim.
         let mut profile_false = make_profile();
-        profile_false.tool_invocation_count_anchored = false;
+        profile_false.outlet_invocation_count_anchored = false;
         let mut profile_true = make_profile();
-        profile_true.tool_invocation_count_anchored = true;
+        profile_true.outlet_invocation_count_anchored = true;
 
         assert_ne!(
             profile_false.signable_bytes(),
             profile_true.signable_bytes(),
-            "flipping tool_invocation_count_anchored MUST change the signed preimage"
+            "flipping outlet_invocation_count_anchored MUST change the signed preimage"
         );
     }
 
     #[test]
-    fn signature_binds_tool_invocation_count_anchored() {
+    fn signature_binds_outlet_invocation_count_anchored() {
         use ed25519_dalek::{Signer, Verifier};
 
         let signing_key = test_signing_key(7);
         let verifying_key = signing_key.verifying_key();
 
         let mut profile = make_profile();
-        profile.tool_invocation_count_anchored = false;
+        profile.outlet_invocation_count_anchored = false;
         profile.signer_public_key = verifying_key.to_bytes();
         let sig = signing_key.sign(&profile.signable_bytes());
         profile.signature = sig.to_bytes();
@@ -2242,7 +2242,7 @@ mod tests {
         // Flipping the flag (without re-signing) breaks verification — the
         // signature is bound to the anchored bit.
         let mut tampered = profile;
-        tampered.tool_invocation_count_anchored = true;
+        tampered.outlet_invocation_count_anchored = true;
         assert!(
             verifying_key
                 .verify(&tampered.signable_bytes(), &sig)
@@ -2262,8 +2262,8 @@ mod tests {
             participation_duration_secs: 0,
             governance_actions_against: 0,
             governance_actions_by: 0,
-            tool_invocation_count: 0,
-            tool_invocation_count_anchored: false,
+            outlet_invocation_count: 0,
+            outlet_invocation_count_anchored: false,
             context_creation_count: 0,
             role_progression_count: 0,
             attestation_count: 0,
@@ -2277,7 +2277,7 @@ mod tests {
     #[test]
     fn require_participation_struct_fields() {
         let req = RequireParticipation {
-            fact: ParticipationFact::ToolInvocationCount,
+            fact: ParticipationFact::OutletInvocationCount,
             threshold: ParticipationThreshold::AtLeast(100),
             max_age_secs: 86400,
             min_contexts: 3,
@@ -2360,7 +2360,7 @@ mod tests {
             ParticipationFact::ParticipationDuration,
             ParticipationFact::GovernanceActionsAgainst,
             ParticipationFact::GovernanceActionsBy,
-            ParticipationFact::ToolInvocationCount,
+            ParticipationFact::OutletInvocationCount,
             ParticipationFact::ContextCreationCount,
             ParticipationFact::RoleProgressionCount,
             ParticipationFact::AttestationCount,
@@ -2409,8 +2409,8 @@ mod tests {
             participation_duration_secs: ov.participation_duration_secs.unwrap_or(86400),
             governance_actions_against: ov.governance_actions_against.unwrap_or(2),
             governance_actions_by: ov.governance_actions_by.unwrap_or(5),
-            tool_invocation_count: ov.tool_invocation_count.unwrap_or(203),
-            tool_invocation_count_anchored: ov.tool_invocation_count_anchored.unwrap_or(false),
+            outlet_invocation_count: ov.outlet_invocation_count.unwrap_or(203),
+            outlet_invocation_count_anchored: ov.outlet_invocation_count_anchored.unwrap_or(false),
             context_creation_count: ov.context_creation_count.unwrap_or(3),
             role_progression_count: ov.role_progression_count.unwrap_or(4),
             attestation_count: ov.attestation_count.unwrap_or(10),
@@ -2432,8 +2432,8 @@ mod tests {
         participation_duration_secs: Option<u64>,
         governance_actions_against: Option<u64>,
         governance_actions_by: Option<u64>,
-        tool_invocation_count: Option<u64>,
-        tool_invocation_count_anchored: Option<bool>,
+        outlet_invocation_count: Option<u64>,
+        outlet_invocation_count_anchored: Option<bool>,
         context_creation_count: Option<u64>,
         role_progression_count: Option<u64>,
         attestation_count: Option<u64>,
@@ -2460,7 +2460,7 @@ mod tests {
         let key = test_signing_key(1);
         let statement = make_signed_profile(&key, "", 1_700_000_000, None);
         let req = RequireParticipation {
-            fact: ParticipationFact::ToolInvocationCount,
+            fact: ParticipationFact::OutletInvocationCount,
             threshold: ParticipationThreshold::AtLeast(100),
             max_age_secs: 3600,
             min_contexts: 1,
@@ -2493,7 +2493,7 @@ mod tests {
         let statement = make_signed_profile(&key, "did:key:alice", 1_700_000_000, None);
 
         let req = RequireParticipation {
-            fact: ParticipationFact::ToolInvocationCount,
+            fact: ParticipationFact::OutletInvocationCount,
             threshold: ParticipationThreshold::AtLeast(100),
             max_age_secs: 3600,
             min_contexts: 1,
@@ -2511,7 +2511,7 @@ mod tests {
 
         let reqs = vec![
             RequireParticipation {
-                fact: ParticipationFact::ToolInvocationCount,
+                fact: ParticipationFact::OutletInvocationCount,
                 threshold: ParticipationThreshold::AtLeast(100),
                 max_age_secs: 3600,
                 min_contexts: 1,
@@ -2537,7 +2537,7 @@ mod tests {
         statement.signature[0] ^= 0xFF;
 
         let req = RequireParticipation {
-            fact: ParticipationFact::ToolInvocationCount,
+            fact: ParticipationFact::OutletInvocationCount,
             threshold: ParticipationThreshold::AtLeast(100),
             max_age_secs: 3600,
             min_contexts: 1,
@@ -2562,13 +2562,13 @@ mod tests {
             "did:key:alice",
             1_700_000_000,
             Some(ProfileOverrides {
-                tool_invocation_count: Some(50), // below threshold
+                outlet_invocation_count: Some(50), // below threshold
                 ..Default::default()
             }),
         );
 
         let req = RequireParticipation {
-            fact: ParticipationFact::ToolInvocationCount,
+            fact: ParticipationFact::OutletInvocationCount,
             threshold: ParticipationThreshold::AtLeast(100),
             max_age_secs: 3600,
             min_contexts: 1,
@@ -2578,7 +2578,7 @@ mod tests {
             verify_participation_requirements(1_700_000_100, "did:key:alice", &[req], &[statement]);
         match result {
             Err(ParticipationAdmissionError::ThresholdNotMet { fact, value, .. }) => {
-                assert_eq!(fact, ParticipationFact::ToolInvocationCount);
+                assert_eq!(fact, ParticipationFact::OutletInvocationCount);
                 assert_eq!(value, 50);
             }
             other => panic!("expected ThresholdNotMet, got {other:?}"),
@@ -2591,7 +2591,7 @@ mod tests {
         let statement = make_signed_profile(&key, "did:key:alice", 1_700_000_000, None);
 
         let req = RequireParticipation {
-            fact: ParticipationFact::ToolInvocationCount,
+            fact: ParticipationFact::OutletInvocationCount,
             threshold: ParticipationThreshold::AtLeast(100),
             max_age_secs: 3600,
             min_contexts: 1,
@@ -2607,7 +2607,7 @@ mod tests {
                 current_time,
                 max_age_secs,
             }) => {
-                assert_eq!(fact, ParticipationFact::ToolInvocationCount);
+                assert_eq!(fact, ParticipationFact::OutletInvocationCount);
                 assert_eq!(newest_updated_at, 1_700_000_000);
                 assert_eq!(current_time, 1_700_010_000);
                 assert_eq!(max_age_secs, 3600);
@@ -2624,7 +2624,7 @@ mod tests {
         let statement = make_signed_profile(&key, "did:key:alice", 1_700_003_600, None);
 
         let req = RequireParticipation {
-            fact: ParticipationFact::ToolInvocationCount,
+            fact: ParticipationFact::OutletInvocationCount,
             threshold: ParticipationThreshold::AtLeast(100),
             max_age_secs: 3600,
             min_contexts: 1,
@@ -2650,7 +2650,7 @@ mod tests {
         let statement = make_signed_profile(&key, "did:key:alice", 1_700_000_060, None);
 
         let req = RequireParticipation {
-            fact: ParticipationFact::ToolInvocationCount,
+            fact: ParticipationFact::OutletInvocationCount,
             threshold: ParticipationThreshold::AtLeast(100),
             max_age_secs: 3600,
             min_contexts: 1,
@@ -2670,7 +2670,7 @@ mod tests {
         let statement = make_signed_profile(&key, "did:key:alice", 1_700_000_000, None);
 
         let req = RequireParticipation {
-            fact: ParticipationFact::ToolInvocationCount,
+            fact: ParticipationFact::OutletInvocationCount,
             threshold: ParticipationThreshold::AtLeast(100),
             max_age_secs: 3600,
             min_contexts: 3, // need 3, only have 1
@@ -2697,7 +2697,7 @@ mod tests {
         let s2 = make_signed_profile(&key, "did:key:alice", 1_700_000_001, None);
 
         let req = RequireParticipation {
-            fact: ParticipationFact::ToolInvocationCount,
+            fact: ParticipationFact::OutletInvocationCount,
             threshold: ParticipationThreshold::AtLeast(100),
             max_age_secs: 3600,
             min_contexts: 2, // need 2 distinct signers
@@ -2727,7 +2727,7 @@ mod tests {
         let s3 = make_signed_profile(&key3, "did:key:alice", 1_700_000_000, None);
 
         let req = RequireParticipation {
-            fact: ParticipationFact::ToolInvocationCount,
+            fact: ParticipationFact::OutletInvocationCount,
             threshold: ParticipationThreshold::AtLeast(100),
             max_age_secs: 3600,
             min_contexts: 3,
@@ -2745,7 +2745,7 @@ mod tests {
     #[test]
     fn verify_empty_statements_with_requirements_fails() {
         let req = RequireParticipation {
-            fact: ParticipationFact::ToolInvocationCount,
+            fact: ParticipationFact::OutletInvocationCount,
             threshold: ParticipationThreshold::AtLeast(100),
             max_age_secs: 3600,
             min_contexts: 1,
@@ -2770,7 +2770,7 @@ mod tests {
         let s2 = make_signed_profile(&key2, "did:key:alice", 1_700_003_500, None);
 
         let req = RequireParticipation {
-            fact: ParticipationFact::ToolInvocationCount,
+            fact: ParticipationFact::OutletInvocationCount,
             threshold: ParticipationThreshold::AtLeast(100),
             max_age_secs: 3600,
             min_contexts: 2, // need 2, but only 1 is fresh
@@ -2797,7 +2797,7 @@ mod tests {
             "did:key:alice",
             1_700_000_000,
             Some(ProfileOverrides {
-                tool_invocation_count: Some(200),
+                outlet_invocation_count: Some(200),
                 context_creation_count: Some(1), // below threshold for 2nd req
                 ..Default::default()
             }),
@@ -2805,7 +2805,7 @@ mod tests {
 
         let reqs = vec![
             RequireParticipation {
-                fact: ParticipationFact::ToolInvocationCount,
+                fact: ParticipationFact::OutletInvocationCount,
                 threshold: ParticipationThreshold::AtLeast(100),
                 max_age_secs: 3600,
                 min_contexts: 1,
@@ -2840,7 +2840,7 @@ mod tests {
         let victim_profile = make_signed_profile(&key, "did:key:victim", 1_700_000_000, None);
 
         let req = RequireParticipation {
-            fact: ParticipationFact::ToolInvocationCount,
+            fact: ParticipationFact::OutletInvocationCount,
             threshold: ParticipationThreshold::AtLeast(100),
             max_age_secs: 3600,
             min_contexts: 1,
@@ -2869,7 +2869,7 @@ mod tests {
         let victim_profile = make_signed_profile(&key, "did:key:victim", 1_700_000_000, None);
 
         let req = RequireParticipation {
-            fact: ParticipationFact::ToolInvocationCount,
+            fact: ParticipationFact::OutletInvocationCount,
             threshold: ParticipationThreshold::AtLeast(100),
             max_age_secs: 3600,
             min_contexts: 1,
@@ -2899,7 +2899,7 @@ mod tests {
         let victim_c = make_signed_profile(&key3, "did:key:victim", 1_700_000_000, None);
 
         let req = RequireParticipation {
-            fact: ParticipationFact::ToolInvocationCount,
+            fact: ParticipationFact::OutletInvocationCount,
             threshold: ParticipationThreshold::AtLeast(100),
             max_age_secs: 3600,
             min_contexts: 2,
@@ -2939,25 +2939,25 @@ mod tests {
                 make_membership_payload(actor_did, "member"),
             ),
             make_event(
-                EventType::ToolInvoked,
+                EventType::OutletInvoked,
                 actor_did,
                 1002,
                 2,
-                b"tool-a".to_vec(),
+                b"outlet-a".to_vec(),
             ),
             make_event(
-                EventType::ToolInvoked,
+                EventType::OutletInvoked,
                 actor_did,
                 1003,
                 3,
-                b"tool-b".to_vec(),
+                b"outlet-b".to_vec(),
             ),
             make_event(
-                EventType::ToolInvoked,
+                EventType::OutletInvoked,
                 actor_did,
                 1004,
                 4,
-                b"tool-a".to_vec(),
+                b"outlet-a".to_vec(),
             ),
             // Governance action BY the member (targets someone else).
             make_event(
@@ -3022,7 +3022,7 @@ mod tests {
         assert_eq!(profile.participation_duration_secs, 99);
         assert_eq!(profile.governance_actions_by, 1);
         assert_eq!(profile.governance_actions_against, 1);
-        assert_eq!(profile.tool_invocation_count, 3); // tool-a x2 + tool-b x1
+        assert_eq!(profile.outlet_invocation_count, 3); // outlet-a x2 + outlet-b x1
         assert_eq!(profile.context_creation_count, 1);
         assert_eq!(profile.role_progression_count, 1);
         // attestation_count from the supplied credential-layer attestation set.
@@ -3205,13 +3205,13 @@ mod tests {
         )
         .unwrap();
 
-        // Add more tool invocations.
+        // Add more outlet invocations.
         events.push(make_event(
-            EventType::ToolInvoked,
+            EventType::OutletInvoked,
             "did:key:alice",
             1200,
             10,
-            b"tool-c".to_vec(),
+            b"outlet-c".to_vec(),
         ));
 
         let profile_v2 = produce_participation_profile(
@@ -3229,8 +3229,8 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(profile_v1.tool_invocation_count, 3);
-        assert_eq!(profile_v2.tool_invocation_count, 4);
+        assert_eq!(profile_v1.outlet_invocation_count, 3);
+        assert_eq!(profile_v2.outlet_invocation_count, 4);
         assert_eq!(profile_v2.updated_at, 6000);
         assert_ne!(profile_v1.signature, profile_v2.signature);
         // Signer key stays the same (same context).
@@ -3463,8 +3463,8 @@ mod tests {
         );
         assert_eq!(facts.role_progression_count, 1);
         assert_eq!(
-            facts.tool_invocation_count,
-            record.tool_invocations.values().sum::<u64>()
+            facts.outlet_invocation_count,
+            record.outlet_invocations.values().sum::<u64>()
         );
         assert_eq!(
             facts.attestation_count,
@@ -3480,8 +3480,8 @@ mod tests {
         assert_eq!(facts.computed_at, record.computed_at);
         assert_eq!(facts.event_log_root, record.event_log_root);
         assert_eq!(facts.subject_did.as_ref(), member);
-        // Tool count is never Merkle-anchored until ADR-051.
-        assert!(!facts.tool_invocation_count_anchored);
+        // Outlet count is never Merkle-anchored until ADR-051.
+        assert!(!facts.outlet_invocation_count_anchored);
     }
 
     #[test]

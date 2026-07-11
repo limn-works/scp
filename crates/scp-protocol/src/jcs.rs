@@ -1,7 +1,7 @@
 //! RFC 8785 JSON Canonicalization Scheme (JCS).
 //!
 //! JCS is the canonicalization scheme for challenge preimages
-//! (`trust::challenge`), tool-registration and tool-invocation hashing
+//! (`trust::challenge`), outlet-registration and outlet-invocation hashing
 //! (`context::outlets`), and the other structured-hash paths that call
 //! [`to_vec`] / [`to_string`] here.
 //!
