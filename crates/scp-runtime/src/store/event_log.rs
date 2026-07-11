@@ -907,7 +907,11 @@ mod tests {
     #[tokio::test]
     async fn store_and_load_event_data_roundtrip() {
         let store = make_store();
-        let event = make_test_event(0, scp_event_log::EventType::OutletInvoked, "did:dht:z6MkTest");
+        let event = make_test_event(
+            0,
+            scp_event_log::EventType::OutletInvoked,
+            "did:dht:z6MkTest",
+        );
         let bytes = serialize_event(&event);
 
         store.store_event_data("ctx-1", 0, &bytes).await.unwrap();
@@ -961,7 +965,11 @@ mod tests {
     async fn append_event_full_stores_both_hash_and_payload() {
         let store = make_store();
         let hash = test_hash(0xAB);
-        let event = make_test_event(0, scp_event_log::EventType::OutletInvoked, "did:dht:z6MkTest");
+        let event = make_test_event(
+            0,
+            scp_event_log::EventType::OutletInvoked,
+            "did:dht:z6MkTest",
+        );
         let bytes = serialize_event(&event);
 
         store

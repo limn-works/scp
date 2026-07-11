@@ -1383,8 +1383,13 @@ async fn application_layer_demo() {
     println!("    input:       query (string), max_results (integer)");
     println!("    output:      results (array), total (integer)");
 
-    let (outlet_id, reg_event) =
-        register_outlet(&mut outlet_registry, &role_state, search_outlet, alice.as_ref()).unwrap();
+    let (outlet_id, reg_event) = register_outlet(
+        &mut outlet_registry,
+        &role_state,
+        search_outlet,
+        alice.as_ref(),
+    )
+    .unwrap();
 
     println!("  Registered! outlet_id = {outlet_id}");
     println!(
@@ -1428,8 +1433,13 @@ async fn application_layer_demo() {
         signature: vec![],
     };
 
-    let (calc_id, _) =
-        register_outlet(&mut outlet_registry, &role_state, calc_outlet, alice.as_ref()).unwrap();
+    let (calc_id, _) = register_outlet(
+        &mut outlet_registry,
+        &role_state,
+        calc_outlet,
+        alice.as_ref(),
+    )
+    .unwrap();
     println!("  Registered outlet: 'Calculator' (id={calc_id})");
     println!("    registry size: {}", outlet_registry.len());
     assert_eq!(outlet_registry.len(), 2);

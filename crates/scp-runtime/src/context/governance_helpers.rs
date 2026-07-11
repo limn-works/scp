@@ -52,7 +52,7 @@ use crate::context::state::{
     CEILING_CHANGE_NOTIFICATION_PERIOD_SECS, CommitFaultMarker, CommitOperation,
     ContentKeysRotatedResult, ECONOMIC_POLICY_NOTIFICATION_PERIOD_SECS,
     EXECUTED_PROPOSALS_TTL_SECS, GovernanceActionResult, GovernanceReconfiguredResult,
-    MAX_PENDING_COMMITS, MAX_REGISTERED_OUTLETS, MAX_THRESHOLD_SIGNERS, MAX_OUTLET_INTERFACES,
+    MAX_OUTLET_INTERFACES, MAX_PENDING_COMMITS, MAX_REGISTERED_OUTLETS, MAX_THRESHOLD_SIGNERS,
     MigrationProposedResult, MigrationState, PendingCeilingModification, PendingCommit,
     PendingEconomicPolicyChange, ProposalOutcome, RestoreAccessResult, RevokeResult,
     SuspendMemberResult, commit_retry_backoff, context_id_to_bytes, emit_event_into,

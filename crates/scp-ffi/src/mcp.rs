@@ -994,8 +994,9 @@ impl ContextProvider for FfiBridgeProvider {
                     ))
                 })?;
 
-                let output = handler_result
-                    .map_err(|e| refund(format!("outlet handler for '{outlet_name}' failed: {e}")))?;
+                let output = handler_result.map_err(|e| {
+                    refund(format!("outlet handler for '{outlet_name}' failed: {e}"))
+                })?;
 
                 // Validate output against the outlet's output schema (defense-in-depth).
                 scp_core::context::outlets::schema::validate_value_against_schema(

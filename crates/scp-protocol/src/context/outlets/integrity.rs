@@ -465,7 +465,10 @@ mod tests {
                 .verification_id
                 .starts_with("outlet-integrity-calc-")
         );
-        assert_eq!(verification.challenge_type, ChallengeType::outlet_integrity());
+        assert_eq!(
+            verification.challenge_type,
+            ChallengeType::outlet_integrity()
+        );
     }
 
     #[test]

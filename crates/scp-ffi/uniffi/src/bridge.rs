@@ -10786,7 +10786,9 @@ impl Scp {
                     GovernanceActionResult::SignerRemoved => "SignerRemoved",
                     GovernanceActionResult::ThresholdModified => "ThresholdModified",
                     GovernanceActionResult::ChildContextCreated => "ChildContextCreated",
-                    GovernanceActionResult::OutletInterfaceEstablished => "OutletInterfaceEstablished",
+                    GovernanceActionResult::OutletInterfaceEstablished => {
+                        "OutletInterfaceEstablished"
+                    }
                     GovernanceActionResult::MemberReset => "MemberReset",
                     GovernanceActionResult::ConflictResolved => "ConflictResolved",
                     GovernanceActionResult::ContextPromoted => "ContextPromoted",

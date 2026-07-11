@@ -451,7 +451,10 @@ async fn participation_validation_works_with_checkpointed_log() {
     assert_eq!(bob_record.participation_duration_seconds, 9);
     // Bob's outlet invocations: execute-outlet x1.
     assert_eq!(bob_record.outlet_invocations.len(), 1);
-    assert_eq!(bob_record.outlet_invocations.get("execute-outlet"), Some(&1));
+    assert_eq!(
+        bob_record.outlet_invocations.get("execute-outlet"),
+        Some(&1)
+    );
     // Bob is the projected target of Alice's adverse governance action.
     assert_eq!(bob_record.governance_actions_against.len(), 1);
     // Bob is the projected subject of the role assignment.

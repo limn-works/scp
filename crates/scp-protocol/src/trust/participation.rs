@@ -26,7 +26,7 @@ use scp_event_log::payload::{GovernanceActionExecutedPayload, decode_payload, pr
 use scp_event_log::{ContextId, Event, EventType};
 
 use super::attestation::{Attestation, RevocationStatus};
-use super::{AttestationReference, GovernanceActionSummary, RoleTransition, OutletId, TrustError};
+use super::{AttestationReference, GovernanceActionSummary, OutletId, RoleTransition, TrustError};
 
 // ---------------------------------------------------------------------------
 // Anchoring flags — single source of truth

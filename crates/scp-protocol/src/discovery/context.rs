@@ -269,8 +269,12 @@ pub fn is_standard_outlet(name: &str) -> bool {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
-    use super::super::handles::{OUTLET_HANDLE_DEREGISTER, OUTLET_HANDLE_LOOKUP, OUTLET_HANDLE_REGISTER};
-    use super::super::scope::{OUTLET_SCOPE_DEREGISTER, OUTLET_SCOPE_LOOKUP, OUTLET_SCOPE_REGISTER};
+    use super::super::handles::{
+        OUTLET_HANDLE_DEREGISTER, OUTLET_HANDLE_LOOKUP, OUTLET_HANDLE_REGISTER,
+    };
+    use super::super::scope::{
+        OUTLET_SCOPE_DEREGISTER, OUTLET_SCOPE_LOOKUP, OUTLET_SCOPE_REGISTER,
+    };
     use super::*;
 
     const AGENT_A_DID: &str = "did:dht:z6MkAgentA";

@@ -1651,7 +1651,10 @@ mod tests {
         let err = validate_against_template(&params).unwrap_err();
         assert!(matches!(
             err,
-            TemplateError::Mismatch { field: "outlets", .. }
+            TemplateError::Mismatch {
+                field: "outlets",
+                ..
+            }
         ));
     }
 

@@ -519,8 +519,20 @@ async fn consequence_rules_evaluation() {
         make_event(EventType::MessageSent, alice, 950, 0, vec![]),
         make_event(EventType::MessageSent, alice, 960, 1, vec![]),
         make_event(EventType::MessageSent, alice, 970, 2, vec![]),
-        make_event(EventType::OutletInvoked, alice, 980, 3, b"outlet-a".to_vec()),
-        make_event(EventType::OutletInvoked, alice, 990, 4, b"outlet-b".to_vec()),
+        make_event(
+            EventType::OutletInvoked,
+            alice,
+            980,
+            3,
+            b"outlet-a".to_vec(),
+        ),
+        make_event(
+            EventType::OutletInvoked,
+            alice,
+            990,
+            4,
+            b"outlet-b".to_vec(),
+        ),
     ];
 
     let triggered = evaluate_consequence_rules(&rules, &events, alice, 1000, 1000);
@@ -942,7 +954,13 @@ async fn participation_profile_produce_verify() {
             membership_payload(alice, "member"),
         ),
         make_event(EventType::MessageSent, alice, 2000, 1, vec![]),
-        make_event(EventType::OutletInvoked, alice, 3000, 2, b"outlet-x\0".to_vec()),
+        make_event(
+            EventType::OutletInvoked,
+            alice,
+            3000,
+            2,
+            b"outlet-x\0".to_vec(),
+        ),
     ];
 
     let profile = produce_participation_profile(

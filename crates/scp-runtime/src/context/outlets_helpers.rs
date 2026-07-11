@@ -1370,9 +1370,9 @@ fn invocation_error_to_context(err: InvocationError) -> ContextError {
         InvocationError::InvokerNotAuthorized { did, outlet_id } => ContextError::PermissionDenied(
             format!("SCP-OUTLET-6081: invoker {did} lacks OutletCall({outlet_id})"),
         ),
-        InvocationError::OutletNotFound { outlet_id } => {
-            ContextError::PermissionDenied(format!("SCP-OUTLET-6082: outlet not found: {outlet_id}"))
-        }
+        InvocationError::OutletNotFound { outlet_id } => ContextError::PermissionDenied(format!(
+            "SCP-OUTLET-6082: outlet not found: {outlet_id}"
+        )),
         InvocationError::InputValidationFailed { message } => ContextError::PermissionDenied(
             format!("SCP-OUTLET-6083: input schema validation failed: {message}"),
         ),
@@ -1385,9 +1385,9 @@ fn invocation_error_to_context(err: InvocationError) -> ContextError {
         InvocationError::Timeout { timeout_ms } => ContextError::PermissionDenied(format!(
             "SCP-OUTLET-6086: outlet execution timed out after {timeout_ms}ms"
         )),
-        InvocationError::Cancelled => {
-            ContextError::PermissionDenied("SCP-OUTLET-6087: outlet invocation cancelled".to_owned())
-        }
+        InvocationError::Cancelled => ContextError::PermissionDenied(
+            "SCP-OUTLET-6087: outlet invocation cancelled".to_owned(),
+        ),
         InvocationError::BudgetExceeded {
             did,
             cost,
