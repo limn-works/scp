@@ -679,24 +679,24 @@ SCP.Outlet.update(
     testVectors: [TestVector]?,
     implementationHash: ContentHash?
   }
-) → ToolUpdateResult {
+) → OutletUpdateResult {
   previousHash: ContentHash,
   newHash: ContentHash,
   eventID: EventID
 }
 ```
 
-Only the tool's operator (or context admin) can update. Schema changes that break existing test vectors are rejected. The event log records both the old and new implementation hashes for auditability.
+Only the outlet's operator (or context admin) can update. Schema changes that break existing test vectors are rejected. The event log records both the old and new implementation hashes for auditability.
 
-### Cross-Context Tool Interface (§6.2)
+### Cross-Context Outlet Interface (§6.2)
 
 Both contexts opt in. Calls carry provenance including chain depth. Schema constraints enforce structural specificity (no unbounded string-only interfaces, minimum two distinct fields). Chain depth limit (default: 8, context-configurable via `ContextParams::max_chain_depth`, ADR-043) prevents amplification.
 
 ```
-// Context A exposes a tool to Context B
+// Context A exposes an outlet to Context B
 SCP.OutletInterface.expose(
   from: contextA,
-  tool: "ingredient_database",
+  outlet: "ingredient_database",
   to: contextB,
   permissions: .readOnly
 ) → InterfaceID
@@ -729,16 +729,16 @@ SCP.OutletInterface.call(
 // Per-caller session cap (default: 1000, context-configurable via ContextParams::session_cap, ADR-043) prevents exhaustion. Optional session TTL.
 ```
 
-### Revoke Tool Interface
+### Revoke Outlet Interface
 
-Either side can revoke a cross-context tool interface. Revocation is a governance action — it requires admin role or governance approval in the revoking context. Active sessions on the interface are terminated. Revocation is recorded in the event logs of both contexts.
+Either side can revoke a cross-context outlet interface. Revocation is a governance action — it requires admin role or governance approval in the revoking context. Active sessions on the interface are terminated. Revocation is recorded in the event logs of both contexts.
 
 ```
 SCP.OutletInterface.revoke(
   interface: InterfaceID,
   as: Identity,                      // must have admin role or governance authority
   reason: String?                    // recorded in event log
-) → ToolInterfaceRevocationResult {
+) → OutletInterfaceRevocationResult {
   interfaceID: InterfaceID,
   revokedBy: DID,
   revokedAt: Timestamp,
@@ -749,7 +749,7 @@ SCP.OutletInterface.revoke(
 
 Revocation is permanent for the given `InterfaceID`. To re-establish the interface, a new `SCP.OutletInterface.expose()` call is required, producing a new `InterfaceID`. Both contexts must opt in again.
 
-**Two cross-context mechanisms** (§6.1). Tool interfaces are asymmetric (caller/tool). Multi-parent child contexts (§5.13) are symmetric — a shared space where members from different parent contexts interact as peers. Use tool interfaces for service calls; use multi-parent children for collaboration.
+**Two cross-context mechanisms** (§6.1). Outlet interfaces are asymmetric (caller/outlet). Multi-parent child contexts (§5.13) are symmetric — a shared space where members from different parent contexts interact as peers. Use outlet interfaces for service calls; use multi-parent children for collaboration.
 
 ---
 
@@ -764,7 +764,7 @@ SCP.Capability.grant(
   from: Identity,
   to: agentID,
   context: contextID,
-  capabilities: [.messaging, .toolInvocation("recipe_assistant"), .invite],
+  capabilities: [.messaging, .outletInvocation("recipe_assistant"), .invite],
   expiry: Date?,
   constraints: { maxInvocationsPerHour: 100 }?
 ) → UCANToken
@@ -819,7 +819,7 @@ SCP.Trust.evaluate(
     contextsParticipated: Int,
     totalDuration: Duration,
     governanceActionsAgainst: Int,
-    toolInvocations: { type: String, count: Int }[],
+    outletInvocations: { type: String, count: Int }[],
     roleHistory: [RoleChange],
     endorsementAccuracy: Float?    // how accurate are their endorsements
   }?,
@@ -858,11 +858,11 @@ General-purpose attestation creation and verification. Common envelope, many typ
 ```
 // Create any attestation type
 SCP.Attestation.create(
-  type: .identityLink | .capabilityDelegation | .toolIntegrity
+  type: .identityLink | .capabilityDelegation | .outletIntegrity
       | .agentCapability | .endorsement | .roleAssignment
       | .contextEndorsement,
   issuer: DID,
-  subject: DID | ToolID | ContextID,
+  subject: DID | OutletID | ContextID,
   claim: TypeSpecificClaim,
   evidence: TypeSpecificEvidence?,
   expiry: Date?,
@@ -898,7 +898,7 @@ SCP.Governance.propose(
   context: contextID,
   proposer: agentID,
   change: .addTool(OutletDefinition)
-        | .removeTool(toolName)
+        | .removeOutlet(outletName)
         | .modifyRole(name, [Capability])
         | .addRole(name, [Capability])
         | .removeMember(DID)
@@ -1000,12 +1000,12 @@ SCP.App.declare(
     requiredCapabilities: [
       .messaging,
       .memberList,
-      .toolInvocation(["guide_assistant", "step_tracker"]),
+      .outletInvocation(["guide_assistant", "step_tracker"]),
       .media(.images, .video),
       .contextMetadata
     ],
     optionalCapabilities: [
-      .toolInvocation(["calendar_sync"]),
+      .outletInvocation(["calendar_sync"]),
       .crossContextInterface
     ]
   },
@@ -1016,7 +1016,7 @@ SCP.App.declare(
   denied: [Capability],            // what exceeded role or ceiling
   interfaces: {                    // ready-to-use protocol interfaces
     messaging: MessagingInterface,
-    tools: { name: ToolInterface },
+    outlets: { name: OutletInterface },
     members: MemberListInterface,
     ...
   }
@@ -1076,8 +1076,8 @@ SCP.EventLog.query(
   filter: .all
         | .since(Date)
         | .byActor(DID)
-        | .byType(.message | .toolInvocation | .membershipChange | .roleChange
-                  | .governanceAction | .toolMutation | .consequenceTriggered)
+        | .byType(.message | .outletInvocation | .membershipChange | .roleChange
+                  | .governanceAction | .outletMutation | .consequenceTriggered)
 ) → EventStream { events: [VerifiableEvent], merkleRoot: Hash }
 
 // Verify a specific claim against the log
@@ -1085,7 +1085,7 @@ SCP.EventLog.verify(
   context: contextID,
   claim: .memberNeverEjected(did: carolDID)
        | .ceilingUnchangedSince(date)
-       | .toolRegisteredBy(tool: "recipe_assistant", operator: DID)
+       | .outletRegisteredBy(outlet: "recipe_assistant", operator: DID)
        | .eventExists(eventID)
 ) → Proof { valid: Bool, merkleProof: MerkleProof }
 ```
@@ -1094,19 +1094,19 @@ SCP.EventLog.verify(
 
 ## 10. Use Cases Mapped to APIs
 
-### Use Case: Creating a Collaborative Context with Tools
+### Use Case: Creating a Collaborative Context with Outlets
 
 ```swift
 // 1. Create quest as context
 let quest = try await SCP.Context.create(
   creator: alice,
-  ceiling: [.messaging, .media, .toolInvocation, .progressTracking],
+  ceiling: [.messaging, .media, .outletInvocation, .progressTracking],
   governance: .singleAdmin,
-  tools: [guideAssistant, stepTracker, mediaUpload],
+  outlets: [guideAssistant, stepTracker, mediaUpload],
   roles: [
     "admin": [.all],
-    "member": [.messaging, .toolInvocation, .media, .progressTracking],
-    "guide": [.messaging, .toolInvocation, .suggestSteps]
+    "member": [.messaging, .outletInvocation, .media, .progressTracking],
+    "guide": [.messaging, .outletInvocation, .suggestSteps]
   ],
   admissionRequirements: { minAccountAge: .days(7) },
   metadata: { name: "Learn to Cook Thai Food", public: true }
@@ -1121,7 +1121,7 @@ try await SCP.Context.addMember(
 
 // 3. Alice's agent invokes the guide
 let advice = try await alice.agent.invoke(
-  tool: "guide_assistant",
+  outlet: "guide_assistant",
   input: { query: "where do I start with Thai cooking?" }
 )
 ```
@@ -1131,7 +1131,7 @@ let advice = try await alice.agent.invoke(
 ```swift
 // 1. Bob inspects before joining
 let meta = try await SCP.Context.inspect(questContextID)
-// Bob sees: ceiling, his role would be "member", tools available,
+// Bob sees: ceiling, his role would be "member", outlets available,
 // 47 members, created 3 weeks ago, Alice is creator,
 // admission requires 7-day-old account
 
@@ -1146,7 +1146,7 @@ let membership = try await SCP.Context.join(
 // 3. Bob's agent participates
 try await membership.send(content: "Just made my first green curry!")
 let tips = try await membership.invoke(
-  tool: "guide_assistant",
+  outlet: "guide_assistant",
   input: { query: "my curry is too watery, help" }
 )
 ```
@@ -1160,14 +1160,14 @@ let tips = try await membership.invoke(
 let app = try await SCP.App.declare(
   manifest: AppManifest {
     name: "Minimal Quest Tracker",
-    requiredCapabilities: [.messaging, .toolInvocation(["step_tracker"])],
+    requiredCapabilities: [.messaging, .outletInvocation(["step_tracker"])],
     protocolVersion: "scp/1.0"
   },
   context: myQuestID,
   agent: alice.agentID
 )
 // Protocol validates against ceiling + role, grants interfaces
-// Generated app uses app.interfaces.messaging and app.interfaces.tools
+// Generated app uses app.interfaces.messaging and app.interfaces.outlets
 // Everything else (identity, encryption, trust) is invisible
 ```
 
@@ -1236,13 +1236,13 @@ Blocking and removal are distinct operations sharing the same cryptographic infr
 ### Cross-Context: Quest Uses External Knowledge Base
 
 ```swift
-// A cooking school runs a recipe database as a context with tools
+// A cooking school runs a recipe database as a context with outlets
 // Alice's quest context wants access to it
 
-// 1. Cooking school exposes their tool
+// 1. Cooking school exposes their outlet
 let interface = try await SCP.OutletInterface.expose(
   from: cookingSchoolContext,
-  tool: "recipe_database",
+  outlet: "recipe_database",
   to: aliceQuestContext,
   permissions: .readOnly
 )
@@ -1383,17 +1383,17 @@ No sender DID. No context ID. No timestamp. No signature. The relay is a dumb pi
   "protocol": "scp/1.0",
   "type": "context_metadata",
   "context": "ctx:z6Mkq8...",
-  "ceiling": ["messaging", "media", "tool_invocation", "progress_tracking"],
+  "ceiling": ["messaging", "media", "outlet_invocation", "progress_tracking"],
   "governance": {
     "model": "single_admin",
     "admin": "did:dht:z6MkpT..."
   },
   "roles": {
     "admin": { "capabilities": ["*"] },
-    "member": { "capabilities": ["messaging", "tool_invocation", "media"] },
-    "guide": { "capabilities": ["messaging", "tool_invocation", "suggest_steps"] }
+    "member": { "capabilities": ["messaging", "outlet_invocation", "media"] },
+    "guide": { "capabilities": ["messaging", "outlet_invocation", "suggest_steps"] }
   },
-  "tools": [
+  "outlets": [
     {
       "name": "guide_assistant",
       "description": "AI cooking guide",
@@ -1417,7 +1417,7 @@ No sender DID. No context ID. No timestamp. No signature. The relay is a dumb pi
   "ttl": null,
   "memory_scope": "full",
   "template_id": null,
-  "tool_interface_count": { "inbound": 3, "outbound": 1 },
+  "outlet_interface_count": { "inbound": 3, "outbound": 1 },
   "parents": null,
   "members": 47,
   "created": "2026-01-20T10:00:00Z",
@@ -1434,7 +1434,7 @@ No sender DID. No context ID. No timestamp. No signature. The relay is a dumb pi
     "iss": "did:dht:z6MkpT...",
     "aud": "agent:z6MkpT:ctx:z6Mkq8...",
     "att": [
-      { "with": "scp:ctx:z6Mkq8/tool/recipe_assistant", "can": "invoke" },
+      { "with": "scp:ctx:z6Mkq8/outlets/recipe_assistant", "can": "invoke" },
       { "with": "scp:ctx:z6Mkq8/messages", "can": "write" },
       { "with": "scp:ctx:z6Mkq8/members", "can": "read" }
     ],
@@ -1524,7 +1524,7 @@ DataProvenance {
 Provenance is attached automatically by the protocol when data crosses context boundaries through protocol mechanisms.
 
 ```
-// Cross-context tool call carries provenance automatically
+// Cross-context outlet call carries provenance automatically
 let result = try await SCP.OutletInterface.call(
   interface: interfaceID,
   agent: agentInContextB,
@@ -1536,7 +1536,7 @@ let result = try await SCP.OutletInterface.call(
     sourceType: .persistent,
     counterparties: [contextA.members],
     purpose: "Recipe database",
-    discoveryMethod: .outOfBand,     // tool interface discovery
+    discoveryMethod: .outOfBand,     // outlet interface discovery
     age: .zero,                      // live query
     memoryScope: .full
   }
@@ -1668,7 +1668,7 @@ Implementation specifics that require Tier 1/Tier 2 design work:
 - **~~Capability declaration format.~~** ✅ **Resolved.** JSON Schema (MCP-compatible) with SCP-specific extensions. §8.4 specifies the contract; §8.5 establishes MCP compatibility. See `00-open-questions.md`.
 - **~~Offline/local-first.~~** ✅ **Resolved.** ADR-029 specifies offline/sync strategy. §23 specifies the full sync protocol. Three-tier recovery (local replay, peer sync, governance-triggered reset).
 - **~~Governance interface.~~** ✅ **Resolved.** ADR-031 specifies multi-admin governance. `GovernanceEngine` trait with `SingleAdmin`, `Threshold`, `Majority`, and `Unanimity` models. 30 governance action types. §5.9 specifies the governance proposal lifecycle.
-- **~~Summary generation protocol.~~** ✅ **Resolved.** §5.11 specifies memory scope enforcement including summary lifecycle: pre-close generation, 300-second verification window, key destruction. Summary format defined by context tools/governance.
+- **~~Summary generation protocol.~~** ✅ **Resolved.** §5.11 specifies memory scope enforcement including summary lifecycle: pre-close generation, 300-second verification window, key destruction. Summary format defined by context outlets/governance.
 - **~~Context promotion.~~** ✅ **Resolved.** §5.10 specifies `PromotionPolicy` (declared at creation, immutable). Same context with TTL removed. Requires unanimous consent. `PromoteContext` governance action in ADR-031.
 
 ---
@@ -1910,7 +1910,7 @@ Evaluate a context's pricing formula against current observable metrics.
 ```
 SCP.Economy.estimateCost(
   context: ContextID,
-  action: PaidActionType           // .message | .toolInvoke | .join | .period | .byteStored
+  action: PaidActionType           // .message | .outletInvoke | .join | .period | .byteStored
 ) → CostEstimate {
   amount: Amount,
   currency: CurrencyCode,
