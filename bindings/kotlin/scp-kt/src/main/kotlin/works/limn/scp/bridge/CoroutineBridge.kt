@@ -777,9 +777,9 @@ interface OutletBindings {
      *   `operator_did`, and optional `test_vectors_json` and
      *   `implementation_hash`.
      * @return The assigned outlet ID string (derived from the outlet name).
-     * @throws BridgeException with `SCP-TOOL-6003` if the context is not
+     * @throws BridgeException with `SCP-OUTLET-6003` if the context is not
      *   active, with `SCP-VALID-7035`/`SCP-VALID-7036` if schemas are
-     *   invalid, or with `SCP-TOOL-6001` if registration fails.
+     *   invalid, or with `SCP-OUTLET-6001` if registration fails.
      */
     fun outletRegister(
         contextHandle: Long,
@@ -806,8 +806,8 @@ interface OutletBindings {
      * @param proofTokens Optional list of encoded parent UCAN tokens
      *   for delegation chain traversal (ADR-016 step 3).
      * @return JSON-encoded outlet output.
-     * @throws BridgeException with `SCP-TOOL-6005` if the context is not
-     *   active, with `SCP-TOOL-6002` if invocation fails, or with
+     * @throws BridgeException with `SCP-OUTLET-6005` if the context is not
+     *   active, with `SCP-OUTLET-6002` if invocation fails, or with
      *   `SCP-PERM-3001` if UCAN authorization fails.
      */
     @Suppress("LongParameterList") // FFI bridge — must match UniFFI export signature
@@ -831,7 +831,7 @@ interface OutletBindings {
      * @param outletId The outlet's assigned ID.
      * @return JSON-encoded verification result with `outlet_id`, `passed`,
      *   and `failures` fields.
-     * @throws BridgeException with `SCP-TOOL-6007` if the context is not
+     * @throws BridgeException with `SCP-OUTLET-6007` if the context is not
      *   active or verification encounters an error.
      */
     fun outletVerify(
@@ -847,7 +847,7 @@ interface OutletBindings {
      * @param targetContextId The target context to expose the outlet to.
      * @param rateLimitJson Optional per-interface rate limit as JSON.
      * @return JSON-encoded OutletInterface with `approved_by_source = true`.
-     * @throws BridgeException with `SCP-TOOL-6030` if the caller is not
+     * @throws BridgeException with `SCP-OUTLET-6030` if the caller is not
      *   an admin or the outlet is not found.
      */
     fun outletInterfaceExpose(
@@ -863,7 +863,7 @@ interface OutletBindings {
      * @param contextHandle Opaque handle for the target context.
      * @param interfaceJson The OutletInterface JSON string to accept.
      * @return JSON-encoded updated OutletInterface with `approved_by_target = true`.
-     * @throws BridgeException with `SCP-TOOL-6032` if the caller is not
+     * @throws BridgeException with `SCP-OUTLET-6032` if the caller is not
      *   an admin or context mismatch.
      */
     fun outletInterfaceAccept(
@@ -900,9 +900,9 @@ interface OutletBindings {
      *   Context-configurable max (default 8), range 0-255 (ADR-043, spec §24.4).
      * @param proofTokens Optional parent UCAN tokens for delegation chain.
      * @return JSON-encoded outlet output.
-     * @throws BridgeException with `SCP-TOOL-6010` if source context not active,
-     *   `SCP-TOOL-6011` if target context not active, `SCP-TOOL-6012` if chain
-     *   depth exceeded, `SCP-TOOL-6002` if outlet not found.
+     * @throws BridgeException with `SCP-OUTLET-6010` if source context not active,
+     *   `SCP-OUTLET-6011` if target context not active, `SCP-OUTLET-6012` if chain
+     *   depth exceeded, `SCP-OUTLET-6002` if outlet not found.
      */
     @Suppress("LongParameterList") // FFI bridge — must match UniFFI export signature
     fun outletInvokeCrossContext(
@@ -962,8 +962,8 @@ interface OutletBindings {
      * @param sourceContextId The calling context ID (session cap tracked per caller).
      * @param ttlSeconds Optional time-to-live in seconds, or null for context-lifetime.
      * @return The session ID (UUID string).
-     * @throws BridgeException with `SCP-TOOL-6014` if context not active,
-     *   `SCP-TOOL-6015` if session cap exceeded.
+     * @throws BridgeException with `SCP-OUTLET-6014` if context not active,
+     *   `SCP-OUTLET-6015` if session cap exceeded.
      */
     fun outletSessionCreate(
         contextHandle: Long,
@@ -985,8 +985,8 @@ interface OutletBindings {
      * @param ucanToken JWT-encoded UCAN token authorizing the invocation.
      * @param proofTokens Optional parent UCAN tokens for delegation chain.
      * @return JSON-encoded outlet output.
-     * @throws BridgeException with `SCP-TOOL-6017` if context not active,
-     *   `SCP-TOOL-6018` if session not found, `SCP-TOOL-6019` if expired.
+     * @throws BridgeException with `SCP-OUTLET-6017` if context not active,
+     *   `SCP-OUTLET-6018` if session not found, `SCP-OUTLET-6019` if expired.
      */
     @Suppress("LongParameterList") // FFI bridge — must match UniFFI export signature
     fun outletSessionInvoke(
@@ -1005,7 +1005,7 @@ interface OutletBindings {
      *
      * @param contextHandle Opaque handle for the context containing the session.
      * @param sessionId The session ID to close.
-     * @throws BridgeException with `SCP-TOOL-6021` if session not found.
+     * @throws BridgeException with `SCP-OUTLET-6021` if session not found.
      */
     fun outletSessionClose(
         contextHandle: Long,

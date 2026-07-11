@@ -81,7 +81,7 @@ describe("ScpError hierarchy", () => {
   });
 
   it("OutletError extends ScpError", () => {
-    const err = new OutletError("outlet failed", "SCP-TOOL-6001");
+    const err = new OutletError("outlet failed", "SCP-OUTLET-6001");
     expect(err).toBeInstanceOf(ScpError);
     expect(err).toBeInstanceOf(OutletError);
     expect(err.name).toBe("OutletError");
@@ -182,9 +182,9 @@ describe("mapBridgeError", () => {
   });
 
   it("maps outlet error codes to OutletError", () => {
-    const err = mapBridgeError(new Error("[SCP-TOOL-6001] outlet error: failed"));
+    const err = mapBridgeError(new Error("[SCP-OUTLET-6001] outlet error: failed"));
     expect(err).toBeInstanceOf(OutletError);
-    expect(err.code).toBe("SCP-TOOL-6001");
+    expect(err.code).toBe("SCP-OUTLET-6001");
   });
 
   it("maps validation error codes to ValidationError", () => {
@@ -495,12 +495,12 @@ describe("mapSagaError", () => {
   });
 
   it("delegates a non-saga error to mapBridgeError", () => {
-    const err = mapSagaError(new Error("[SCP-TOOL-6011] outlet error: target not active"));
+    const err = mapSagaError(new Error("[SCP-OUTLET-6011] outlet error: target not active"));
     expect(err).toBeInstanceOf(OutletError);
     expect(err).not.toBeInstanceOf(SagaAbortedError);
     expect(err).not.toBeInstanceOf(SagaNeedsRepairError);
     expect(err).not.toBeInstanceOf(SagaBusyError);
-    expect(err.code).toBe("SCP-TOOL-6011");
+    expect(err.code).toBe("SCP-OUTLET-6011");
   });
 
   it("delegates a code-less string to mapBridgeError", () => {
@@ -514,13 +514,13 @@ describe("mapSagaError", () => {
     // The code regex is start-anchored (`^\s*\[`), so a non-saga error whose
     // {message} embeds a literal `[SCP-SAGA-…]` cannot be hijacked into a saga
     // subclass: only the leading bracket is read as the code, which here is a
-    // SCP-TOOL code, so the error delegates to mapBridgeError as a OutletError.
-    const err = mapSagaError(new Error("[SCP-TOOL-6011] outlet error: see [SCP-SAGA-13067] note"));
+    // SCP-OUTLET code, so the error delegates to mapBridgeError as a OutletError.
+    const err = mapSagaError(new Error("[SCP-OUTLET-6011] outlet error: see [SCP-SAGA-13067] note"));
     expect(err).toBeInstanceOf(OutletError);
     expect(err).not.toBeInstanceOf(SagaAbortedError);
     expect(err).not.toBeInstanceOf(SagaNeedsRepairError);
     expect(err).not.toBeInstanceOf(SagaBusyError);
-    expect(err.code).toBe("SCP-TOOL-6011");
+    expect(err.code).toBe("SCP-OUTLET-6011");
   });
 
   it("falls to the default arm for a valid SCP-SAGA code with an unrecognized phrase", () => {

@@ -11,7 +11,7 @@
 # Canonical prefixes and ranges:
 #   SCP-IDENT-   1000-1999    SCP-CTX-     2000-2999
 #   SCP-PERM-    3000-3999    SCP-CRYPTO-  4000-4999
-#   SCP-TRANS-   5000-5999    SCP-TOOL-    6000-6999
+#   SCP-TRANS-   5000-5999    SCP-OUTLET-  6000-6999
 #   SCP-VALID-   7000-7999    SCP-STORAGE- 8000-8999
 #   SCP-ATTEST-  9000-9999    SCP-MCP-     10000-10999
 #
@@ -55,7 +55,7 @@ check_code() {
         SCP-PERM)     [[ $num -ge 3000 && $num -le 3999 ]] || { echo "VIOLATION: $file:$line_num: $code — PERM range is 3000-3999"; VIOLATIONS=$((VIOLATIONS + 1)); } ;;
         SCP-CRYPTO)   [[ $num -ge 4000 && $num -le 4999 ]] || { echo "VIOLATION: $file:$line_num: $code — CRYPTO range is 4000-4999"; VIOLATIONS=$((VIOLATIONS + 1)); } ;;
         SCP-TRANS)    [[ $num -ge 5000 && $num -le 5999 ]] || { echo "VIOLATION: $file:$line_num: $code — TRANS range is 5000-5999"; VIOLATIONS=$((VIOLATIONS + 1)); } ;;
-        SCP-TOOL)     [[ $num -ge 6000 && $num -le 6999 ]] || { echo "VIOLATION: $file:$line_num: $code — TOOL range is 6000-6999"; VIOLATIONS=$((VIOLATIONS + 1)); } ;;
+        SCP-OUTLET)   [[ $num -ge 6000 && $num -le 6999 ]] || { echo "VIOLATION: $file:$line_num: $code — OUTLET range is 6000-6999"; VIOLATIONS=$((VIOLATIONS + 1)); } ;;
         SCP-VALID)    [[ $num -ge 7000 && $num -le 7999 ]] || { echo "VIOLATION: $file:$line_num: $code — VALID range is 7000-7999"; VIOLATIONS=$((VIOLATIONS + 1)); } ;;
         SCP-STORAGE)  [[ $num -ge 8000 && $num -le 8999 ]] || { echo "VIOLATION: $file:$line_num: $code — STORAGE range is 8000-8999"; VIOLATIONS=$((VIOLATIONS + 1)); } ;;
         SCP-ATTEST)   [[ $num -ge 9000 && $num -le 9999 ]] || { echo "VIOLATION: $file:$line_num: $code — ATTEST range is 9000-9999"; VIOLATIONS=$((VIOLATIONS + 1)); } ;;
@@ -200,7 +200,7 @@ while IFS=: read -r file line_num content; do
         *) continue ;;
     esac
 
-    while [[ "$content" =~ SCP-(IDENT|CTX|PERM|CRYPTO|TRANS|TOOL|VALID|STORAGE|ATTEST|MCP|GOV|ECON|SAGA)-([0-9]+) ]]; do
+    while [[ "$content" =~ SCP-(IDENT|CTX|PERM|CRYPTO|TRANS|OUTLET|VALID|STORAGE|ATTEST|MCP|GOV|ECON|SAGA)-([0-9]+) ]]; do
         prefix="${BASH_REMATCH[1]}"
         number="${BASH_REMATCH[2]}"
         full_code="SCP-${prefix}-${number}"
@@ -264,7 +264,7 @@ while IFS=: read -r file line_num content; do
         content="${content#*"$full_code"}"
     done
 done < <(
-    grep -rnE 'SCP-(IDENT|CTX|PERM|CRYPTO|TRANS|TOOL|VALID|STORAGE|ATTEST|MCP|GOV|ECON|SAGA)-[0-9]+' \
+    grep -rnE 'SCP-(IDENT|CTX|PERM|CRYPTO|TRANS|OUTLET|VALID|STORAGE|ATTEST|MCP|GOV|ECON|SAGA)-[0-9]+' \
         --include='*.rs' \
         --include='*.kt' \
         --include='*.swift' \

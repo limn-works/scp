@@ -182,13 +182,13 @@ class GovernanceConformanceTest {
         fun `outlet error codes are reachable`() =
             runTest(testDispatcher) {
                 stubBindings.outletInvokeError =
-                    BridgeException("test", "SCP-TOOL-6001")
+                    BridgeException("test", "SCP-OUTLET-6001")
                 val result =
                     dispatcher.dispatch(
                         "outlet_invoke",
                         mapOf("context_handle" to "1", "outlet_id" to "t"),
                     )
-                assertEquals("SCP-TOOL-6001", result["error"])
+                assertEquals("SCP-OUTLET-6001", result["error"])
             }
 
         @Test

@@ -553,7 +553,7 @@ pub struct InterfaceEstablished {
     /// context-id pair and the acceptance epoch so a signature for one
     /// interface cannot be reused for another. Verified at event-log append
     /// time — failure rejects the establishment with
-    /// `authorization.ikm-signature-invalid` (`SCP-TOOL-6110`).
+    /// `authorization.ikm-signature-invalid` (`SCP-OUTLET-6110`).
     pub ikm_a_sig: Ed25519Signature,
     /// Target context's (Context B's) exporter-derived IKM at accept time
     /// (§6.2.0.1 step 4 "Step 1 — accept-time IKM derivation"). Symmetric to
@@ -696,7 +696,7 @@ pub struct InterfaceSaltRotated {
     /// event that justifies this rotation. Verifier rejects when this id
     /// does not reference a prior, valid admin-removal event targeting
     /// `trigger_removal_did` within the same or prior epoch — slug
-    /// `authorization.salt-rotation-unjustified` (`SCP-TOOL-6115`).
+    /// `authorization.salt-rotation-unjustified` (`SCP-OUTLET-6115`).
     pub removal_event_id: [u8; 32],
 }
 
@@ -772,7 +772,7 @@ pub fn sign_interface_rotation(
 /// - [`RotationVerifyError::VerificationFailed`] when the cryptographic
 ///   verification returns an error. Maps to the §6.2.0.1 round-6
 ///   verifier-rule rejection slug `authorization.salt-rotation-unjustified`
-///   (`SCP-TOOL-6115`) when fired at event-log append time alongside the
+///   (`SCP-OUTLET-6115`) when fired at event-log append time alongside the
 ///   removal-event-binding checks.
 #[allow(clippy::similar_names, clippy::too_many_arguments)]
 pub fn verify_interface_rotation(

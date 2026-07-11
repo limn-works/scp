@@ -67,8 +67,8 @@ pub const MAX_LIST_ENTRIES: usize = 16;
 pub const MAX_RATE_WINDOW_SECS: u32 = 86_400;
 
 /// Numeric error code for mint-time and mask-width caveat failures (§7.3.8).
-/// Allocated within the SCP-TOOL-6100..6199 sub-block.
-pub const CAVEAT_MINT_LIMIT_EXCEEDED_CODE: &str = "SCP-TOOL-6114";
+/// Allocated within the SCP-OUTLET-6100..6199 sub-block.
+pub const CAVEAT_MINT_LIMIT_EXCEEDED_CODE: &str = "SCP-OUTLET-6114";
 
 // ---------------------------------------------------------------------------
 // HoursOfDayMask
@@ -1713,7 +1713,7 @@ fn narrow_schema_structural_descent(
 /// [`InvocationCaveats::try_new`] or [`InvocationCaveats::try_new_for_root`].
 ///
 /// All variants surface as protocol error code
-/// [`CAVEAT_MINT_LIMIT_EXCEEDED_CODE`] (`SCP-TOOL-6114`); the variant
+/// [`CAVEAT_MINT_LIMIT_EXCEEDED_CODE`] (`SCP-OUTLET-6114`); the variant
 /// determines the slug.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CaveatMintError {
@@ -2265,7 +2265,7 @@ pub enum CaveatSerError {
 /// `OutletError` envelope without re-mapping the variant by string.
 ///
 /// All variants under this enum map to the
-/// [`crate::CODE_AUTHORIZATION_DENIED`] (`SCP-TOOL-6110`) code; the slug
+/// [`crate::CODE_AUTHORIZATION_DENIED`] (`SCP-OUTLET-6110`) code; the slug
 /// is what disambiguates the failure mode in the wire envelope.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CheckInvocationError {
@@ -2273,7 +2273,7 @@ pub enum CheckInvocationError {
     /// conformance check. Slug: `input.schema-violation`.
     ///
     /// Note: although `input_schema` failures could plausibly fall under
-    /// the `Input` class (`SCP-TOOL-6120`), §7.3.8 categorises every
+    /// the `Input` class (`SCP-OUTLET-6120`), §7.3.8 categorises every
     /// caveat-driven rejection under `Authorization` because the failure
     /// is a delegation-bound constraint, not a malformed-input error.
     /// The SDK error envelope receives the Authorization class with the
@@ -2643,13 +2643,13 @@ mod tests {
 
     #[test]
     fn try_new_error_codes_and_slugs() {
-        // SCP-TOOL-6114 / 'caveat-mint-limit-exceeded' wired.
+        // SCP-OUTLET-6114 / 'caveat-mint-limit-exceeded' wired.
         let many = caveats_with_eight_non_origin_fields();
         let mut nine = many;
         nine.input_schema = Some(json!({"type": "string"}));
         let err = InvocationCaveats::try_new(nine).unwrap_err();
         assert_eq!(err.code(), CAVEAT_MINT_LIMIT_EXCEEDED_CODE);
-        assert_eq!(err.code(), "SCP-TOOL-6114");
+        assert_eq!(err.code(), "SCP-OUTLET-6114");
         assert_eq!(err.slug(), "caveat-mint-limit-exceeded");
     }
 

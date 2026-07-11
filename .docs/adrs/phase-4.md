@@ -1290,7 +1290,7 @@ Rust errors from both bridge crates are mapped to these classes via the bridge l
    const toolId = await ctx.invokeTool("tool-id", { input: "value" }, identity);
    ```
    - `ctx.invokeTool(toolId, input, identity)` invokes a registered tool and returns JSON output.
-   - Invoking a non-existent tool throws `ToolError` with code `SCP-TOOL-6001`.
+   - Invoking a non-existent tool throws `ToolError` with code `SCP-OUTLET-6001`.
    - Tool registration: `await ctx.registerTool(toolDefinition)` returns a tool ID string.
 
 5. **UCAN API:**

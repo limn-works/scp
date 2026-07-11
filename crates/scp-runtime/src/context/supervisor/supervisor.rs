@@ -4970,13 +4970,13 @@ impl Supervisor {
                 .await;
             // Route through `lookup_miss_error`: a poisoned / silently-dead
             // context surfaces `ContextPoisoned` / `ActorCrashed`, while a
-            // genuinely-unknown context keeps the rich SCP-TOOL-6089
+            // genuinely-unknown context keeps the rich SCP-OUTLET-6089
             // not-registered diagnostic (escrow already voided above, so the
             // ticket-balance invariant holds on every branch) (ADR-049 §10).
             let err = self.lookup_miss_error(
                 &context_id,
                 format!(
-                    "SCP-TOOL-6089: tool-economy settle for context '{context_id}' found no \
+                    "SCP-OUTLET-6089: tool-economy settle for context '{context_id}' found no \
                      registered actor (reserved generation {generation}); escrow voided, \
                      reservation not captured"
                 ),
@@ -10296,13 +10296,13 @@ impl Supervisor {
                 .await;
             // Route through `lookup_miss_error`: a poisoned / silently-dead
             // context surfaces `ContextPoisoned` / `ActorCrashed`, while a
-            // genuinely-unknown context keeps the rich SCP-TOOL-6089
+            // genuinely-unknown context keeps the rich SCP-OUTLET-6089
             // not-registered diagnostic (escrow already voided above)
             // (ADR-049 §10).
             return Err(self.lookup_miss_error(
                 context_id,
                 format!(
-                    "SCP-TOOL-6089: tool-economy settle for context '{context_id}' found no \
+                    "SCP-OUTLET-6089: tool-economy settle for context '{context_id}' found no \
                      registered actor (reserved generation {generation}); escrow voided, \
                      reservation not captured"
                 ),

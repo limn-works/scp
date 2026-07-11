@@ -13,7 +13,7 @@
 //! | `SCP-PERM-` | 3000-3999 | UCAN / permission errors |
 //! | `SCP-CRYPTO-` | 4000-4999 | Cryptographic errors |
 //! | `SCP-TRANS-` | 5000-5999 | Transport errors |
-//! | `SCP-TOOL-` | 6000-6999 | Outlet errors |
+//! | `SCP-OUTLET-` | 6000-6999 | Outlet errors |
 //! | `SCP-VALID-` | 7000-7999 | Validation errors |
 //!
 //! # napi-rs error model
@@ -99,7 +99,7 @@ pub enum ScpNapiError {
     Outlet {
         /// Human-readable error message.
         message: String,
-        /// Stable error code (e.g. `SCP-TOOL-6001`).
+        /// Stable error code (e.g. `SCP-OUTLET-6001`).
         code: String,
     },
 
@@ -331,7 +331,7 @@ impl From<scp_core::context::ContextError> for ScpNapiError {
                 message: format!("{e}"),
                 code: codes::CTX_2137.to_owned(),
             },
-            // Recover embedded SCP-ECON-/SCP-TOOL-/SCP-PERM- codes from
+            // Recover embedded SCP-ECON-/SCP-OUTLET-/SCP-PERM- codes from
             // the runtime's `PermissionDenied(String)` catch-all so the
             // typed-envelope contract holds for outlet-economy failures.
             CE::PermissionDenied(msg) => {
@@ -341,7 +341,7 @@ impl From<scp_core::context::ContextError> for ScpNapiError {
                         message: format!("{e}"),
                         code,
                     }
-                } else if code.starts_with("SCP-TOOL-") {
+                } else if code.starts_with("SCP-OUTLET-") {
                     Self::Outlet {
                         message: format!("{e}"),
                         code,

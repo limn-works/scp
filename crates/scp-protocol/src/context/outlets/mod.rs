@@ -515,7 +515,7 @@ pub struct OutletUpdatedEvent {
 ///   `std::panic::catch_unwind`, recovers, and emits this signal as the §5.4.2
 ///   parallel of `QueryMisdeclaration`. Per ADR-049 §148 "Every `OutletExecutor`
 ///   is wrapped in `catch_unwind`. A panic inside an executor maps to
-///   `SCP-TOOL-6130` (handler-panic) with an operator-attributable
+///   `SCP-OUTLET-6130` (handler-panic) with an operator-attributable
 ///   integrity-failure signal." Wire form: `"handler-panicked"`. The signal
 ///   attributes the failure to the outlet's `operator_did` — panics are a
 ///   protocol-visible signal of operator-side defect, not an SDK-internal bug.
@@ -533,7 +533,7 @@ pub enum OutletVerifiedReason {
     QueryMisdeclaration,
     /// The outlet's executor panicked inside `exec_query` / `exec_action`.
     /// The runtime catches the panic via `std::panic::catch_unwind`, recovers,
-    /// and surfaces the failure as `SCP-TOOL-6130` `execution.handler-panic`.
+    /// and surfaces the failure as `SCP-OUTLET-6130` `execution.handler-panic`.
     /// Operator-attributable per spec §5.4.2 / ADR-049 §148 — wired by the
     /// `invoke_outlet` panic guard (SCP-OUT-028).
     HandlerPanicked,

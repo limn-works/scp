@@ -886,7 +886,7 @@ impl DaysOfWeekMask {
 
 Because the newtypes can only be constructed via `from_bits`, it is **structurally impossible** to assemble an `InvocationCaveats` value with a malformed mask across SDK boundaries (Rust, Python, TypeScript, Swift, Kotlin). The covert-channel surface is closed at the type level, not by runtime asserts.
 
-A shared `assert_mask_widths(caveats) -> Result<(), MaskWidthError>` helper is invoked at BOTH the mint site and every narrow step, so the two call sites share a single implementation. Mint-time failure returns `SCP-TOOL-6114` (slugs `hours-of-day-high-bits-set`, `days-of-week-high-bit-set`); narrow-time failure returns `OutletErrorClass::Authorization::AttenuationViolation::MaskWidth`.
+A shared `assert_mask_widths(caveats) -> Result<(), MaskWidthError>` helper is invoked at BOTH the mint site and every narrow step, so the two call sites share a single implementation. Mint-time failure returns `SCP-OUTLET-6114` (slugs `hours-of-day-high-bits-set`, `days-of-week-high-bit-set`); narrow-time failure returns `OutletErrorClass::Authorization::AttenuationViolation::MaskWidth`.
 
 **Mint limits.** At token mint time, the issuing SDK MUST enforce the following structural bounds:
 
@@ -897,16 +897,16 @@ A shared `assert_mask_widths(caveats) -> Result<(), MaskWidthError>` helper is i
 | `input_schema` nesting depth | ≤ 8 |
 | List-typed field length (`allowed_adapters`, `allowed_target_dids`, `enum`) | ≤ 16 entries |
 
-Mints that exceed these limits are rejected at the SDK boundary with `SCP-TOOL-6114` (`caveat-mint-limit-exceeded`). The limits exist so that caveat parsing has predictable cost and cannot be turned into a DoS vector via pathologically large attestations.
+Mints that exceed these limits are rejected at the SDK boundary with `SCP-OUTLET-6114` (`caveat-mint-limit-exceeded`). The limits exist so that caveat parsing has predictable cost and cannot be turned into a DoS vector via pathologically large attestations.
 
 **Root-UCAN `origin_kind` consistency check.** At root-token mint time (no parent delegation), the mint-time validator MUST verify that every capability in the root token belongs to the same `OutletKind`, and that `caveats.origin_kind` is compatible with that kind:
 
-1. **Single-kind stem set required.** The root token's capability set is partitioned by stem family. If the set contains stems from BOTH `outlet_query:*` / `outlet_query:{id}` AND `outlet_call:*` / `outlet_call:{id}`, mint is rejected unconditionally with `SCP-TOOL-6114` slug `origin-kind-mixed-stem-root`. A mixed-stem root with `caveats.origin_kind = None` could otherwise be exercised at one hop under one kind and at a downstream hop under the other, producing different effective `origin_kind` values for different hops in the same chain.
+1. **Single-kind stem set required.** The root token's capability set is partitioned by stem family. If the set contains stems from BOTH `outlet_query:*` / `outlet_query:{id}` AND `outlet_call:*` / `outlet_call:{id}`, mint is rejected unconditionally with `SCP-OUTLET-6114` slug `origin-kind-mixed-stem-root`. A mixed-stem root with `caveats.origin_kind = None` could otherwise be exercised at one hop under one kind and at a downstream hop under the other, producing different effective `origin_kind` values for different hops in the same chain.
 2. **Stem ⇒ kind derivation on single-kind sets.** With the set guaranteed single-kind, the inferred kind is determined by the stem family: `outlet_query:*` ⇒ `Query`, `outlet_call:*` ⇒ `Action`.
 3. **Explicit `caveats.origin_kind` on the root.** The mint-time validator accepts:
    - `caveats.origin_kind == Some(inferred_kind)` — explicit agreement with the stem.
    - `caveats.origin_kind == None` — permitted ONLY because rule (1) has already guaranteed a single-kind set; every non-root delegation below rule (4) materializes the inferred value explicitly.
-   - `caveats.origin_kind == Some(other_kind)` — rejected with `SCP-TOOL-6114` slug `origin-kind-stem-mismatch`.
+   - `caveats.origin_kind == Some(other_kind)` — rejected with `SCP-OUTLET-6114` slug `origin-kind-stem-mismatch`.
 4. **Non-root OUTLET delegations MUST materialize `origin_kind` explicitly.** A non-root OUTLET delegation whose `caveats.origin_kind == None` fails `narrow()` with `AttenuationViolation::OriginKindUnspecified` regardless of parent agreement. This applies even off an unconstrained `nb = None` root. Because invocation caveats are outlet-scoped, a NON-outlet non-root child carries `nb = None` and is NOT subject to this rule.
 
 The combination of (1) + (3) + (4) eliminates the two-kind inference escape **within a single token's delegation chain**: given any one UCAN, `origin_kind` is unambiguous at every hop, and the child-vs-parent `AttenuationViolation::OriginKindMismatch` equality check at every subsequent narrow step preserves the value unchanged through the rest of the chain.

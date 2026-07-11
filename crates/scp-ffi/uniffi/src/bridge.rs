@@ -1236,7 +1236,7 @@ impl From<scp_core::context::ContextError> for ScpError {
                 msg: format!("{e}"),
                 code: codes::CTX_2137.to_owned(),
             },
-            // Recover embedded SCP-ECON-/SCP-TOOL-/SCP-PERM- codes from
+            // Recover embedded SCP-ECON-/SCP-OUTLET-/SCP-PERM- codes from
             // the runtime's `PermissionDenied(String)` catch-all so the
             // typed-envelope contract holds for outlet-economy failures.
             CE::PermissionDenied(msg) => {
@@ -1246,7 +1246,7 @@ impl From<scp_core::context::ContextError> for ScpError {
                         msg: format!("{e}"),
                         code,
                     }
-                } else if code.starts_with("SCP-TOOL-") {
+                } else if code.starts_with("SCP-OUTLET-") {
                     Self::Outlet {
                         msg: format!("{e}"),
                         code,

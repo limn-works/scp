@@ -127,7 +127,7 @@ class TestSiblingErrorClassCodePreservation:
             (UcanPermissionError, "SCP-PERM-3001"),
             (CryptoError, "SCP-CRYPTO-4001"),
             (TransportError, "SCP-TRANS-5001"),
-            (OutletError, "SCP-TOOL-6001"),
+            (OutletError, "SCP-OUTLET-6001"),
             (ValidationError, "SCP-VALID-7001"),
         ],
     )

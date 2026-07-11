@@ -76,10 +76,10 @@ function installOutletStubs(native: MockNativeScp): void {
         );
       }
       if (closedContexts.has(source.contextId)) {
-        throw new Error("[SCP-TOOL-6010] source context is not active");
+        throw new Error("[SCP-OUTLET-6010] source context is not active");
       }
       if (closedContexts.has(target.contextId)) {
-        throw new Error("[SCP-TOOL-6011] target context is not active");
+        throw new Error("[SCP-OUTLET-6011] target context is not active");
       }
       return JSON.stringify({
         outlet: outletId,
@@ -111,10 +111,10 @@ function installOutletStubs(native: MockNativeScp): void {
     const sessionId = sessionIdArg as string;
     const state = sessions.get(sessionId);
     if (state === undefined) {
-      throw new Error("[SCP-TOOL-6020] session does not exist");
+      throw new Error("[SCP-OUTLET-6020] session does not exist");
     }
     if (state.closed) {
-      throw new Error("[SCP-TOOL-6018] session is closed");
+      throw new Error("[SCP-OUTLET-6018] session is closed");
     }
     state.callCount += 1;
     return JSON.stringify({
@@ -129,7 +129,7 @@ function installOutletStubs(native: MockNativeScp): void {
     const sessionId = sessionIdArg as string;
     const state = sessions.get(sessionId);
     if (state === undefined) {
-      throw new Error("[SCP-TOOL-6021] session does not exist");
+      throw new Error("[SCP-OUTLET-6021] session does not exist");
     }
     state.closed = true;
   });
@@ -356,7 +356,7 @@ describe("scp.outletInvokeCrossContext", () => {
     ).rejects.toThrow(/SCP-VALID-7002/);
   });
 
-  it("surfaces SCP-TOOL-6010 when source context is not active", async () => {
+  it("surfaces SCP-OUTLET-6010 when source context is not active", async () => {
     const identity = await scp.identityCreate("in_memory");
     const sourceHandle = await scp.contextCreate(identity, "{}");
     const targetHandle = await scp.contextCreate(identity, "{}");
@@ -373,10 +373,10 @@ describe("scp.outletInvokeCrossContext", () => {
         "token",
         0,
       ),
-    ).rejects.toThrow(/SCP-TOOL-6010/);
+    ).rejects.toThrow(/SCP-OUTLET-6010/);
   });
 
-  it("surfaces SCP-TOOL-6011 when target context is not active", async () => {
+  it("surfaces SCP-OUTLET-6011 when target context is not active", async () => {
     const identity = await scp.identityCreate("in_memory");
     const sourceHandle = await scp.contextCreate(identity, "{}");
     const targetHandle = await scp.contextCreate(identity, "{}");
@@ -393,7 +393,7 @@ describe("scp.outletInvokeCrossContext", () => {
         "token",
         0,
       ),
-    ).rejects.toThrow(/SCP-TOOL-6011/);
+    ).rejects.toThrow(/SCP-OUTLET-6011/);
   });
 });
 
@@ -614,7 +614,7 @@ describe("scp.outletInvokeCrossContextSaga", () => {
 
   it("maps a non-saga bridge error to OutletError (not a saga subclass)", async () => {
     native.__stub("outletInvokeCrossContextSaga", async () => {
-      throw new Error("[SCP-TOOL-6011] outlet error: target context is not active");
+      throw new Error("[SCP-OUTLET-6011] outlet error: target context is not active");
     });
 
     const err = await invoke({}).catch((e: unknown) => e);
@@ -807,7 +807,7 @@ describe("scp.outletSessionClose", () => {
 
     await expect(
       scp.outletSessionInvoke(handle._rawHandle, sessionId, "{}", identity.did, "token"),
-    ).rejects.toThrow(/SCP-TOOL-6018/);
+    ).rejects.toThrow(/SCP-OUTLET-6018/);
   });
 
   it("rejects closing a non-existent session", async () => {
@@ -815,7 +815,7 @@ describe("scp.outletSessionClose", () => {
     const handle = await scp.contextCreate(identity, "{}");
 
     await expect(scp.outletSessionClose(handle._rawHandle, "nonexistent-session")).rejects.toThrow(
-      /SCP-TOOL-6021/,
+      /SCP-OUTLET-6021/,
     );
   });
 });

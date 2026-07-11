@@ -13,7 +13,7 @@ ScpError (root)
 ├── PermissionError      — UCAN capability validation failures (Python: `UcanPermissionError` to avoid shadowing `builtins.PermissionError`)
 ├── CryptoError          — Encryption, decryption, signature failures
 ├── TransportError       — Network, relay, connection failures
-├── ToolError            — Tool registration, invocation, verification failures
+├── OutletError          — Outlet registration, invocation, verification failures
 └── ValidationError      — Input validation, schema, parameter failures
 ```
 
@@ -35,7 +35,7 @@ ScpError (root)
 | `SCP-PERM-` | 3000-3999 |
 | `SCP-CRYPTO-` | 4000-4999 |
 | `SCP-TRANS-` | 5000-5999 |
-| `SCP-TOOL-` | 6000-6999 |
+| `SCP-OUTLET-` | 6000-6999 |
 | `SCP-VALID-` | 7000-7999 |
 | `SCP-STORAGE-` | 8000-8999 |
 | `SCP-ATTEST-` | 9000-9999 |

@@ -65,13 +65,13 @@ class OutletsConformanceTest {
         fun `outlet_register propagates error`() =
             runTest(testDispatcher) {
                 stubBindings.outletRegisterError =
-                    BridgeException("Context not found", "SCP-TOOL-6001")
+                    BridgeException("Context not found", "SCP-OUTLET-6001")
                 val result =
                     dispatcher.dispatch(
                         "outlet_register",
                         mapOf("context_handle" to "10", "definition" to "{}"),
                     )
-                assertEquals("SCP-TOOL-6001", result["error"])
+                assertEquals("SCP-OUTLET-6001", result["error"])
             }
     }
 
@@ -97,7 +97,7 @@ class OutletsConformanceTest {
         fun `outlet_invoke propagates not-found error`() =
             runTest(testDispatcher) {
                 stubBindings.outletInvokeError =
-                    BridgeException("Outlet not registered", "SCP-TOOL-6002")
+                    BridgeException("Outlet not registered", "SCP-OUTLET-6002")
                 val result =
                     dispatcher.dispatch(
                         "outlet_invoke",
@@ -107,7 +107,7 @@ class OutletsConformanceTest {
                             "input" to "{}",
                         ),
                     )
-                assertEquals("SCP-TOOL-6002", result["error"])
+                assertEquals("SCP-OUTLET-6002", result["error"])
             }
     }
 
@@ -149,7 +149,7 @@ class OutletsConformanceTest {
         fun `outlet_verify propagates verification error`() =
             runTest(testDispatcher) {
                 stubBindings.outletVerifyError =
-                    BridgeException("Verification failed", "SCP-TOOL-6003")
+                    BridgeException("Verification failed", "SCP-OUTLET-6003")
                 val result =
                     dispatcher.dispatch(
                         "outlet_verify",
@@ -158,7 +158,7 @@ class OutletsConformanceTest {
                             "outlet_id" to "outlet-calc-001",
                         ),
                     )
-                assertEquals("SCP-TOOL-6003", result["error"])
+                assertEquals("SCP-OUTLET-6003", result["error"])
             }
     }
 

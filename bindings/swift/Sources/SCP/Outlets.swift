@@ -114,7 +114,7 @@ public extension Context {
         guard let inputJson = String(data: input, encoding: .utf8) else {
             throw ScpError.Outlet(
                 msg: "Outlet input is not valid UTF-8",
-                code: "SCP-TOOL-6001"
+                code: "SCP-OUTLET-6001"
             )
         }
         let outputJson = try await scp.outletInvoke(
@@ -232,7 +232,7 @@ public extension Context {
         guard let inputJson = String(data: input, encoding: .utf8) else {
             throw ScpError.Outlet(
                 msg: "Outlet input is not valid UTF-8",
-                code: "SCP-TOOL-6001"
+                code: "SCP-OUTLET-6001"
             )
         }
         let targetHandle = targetContext.handle
@@ -304,8 +304,8 @@ public extension Context {
     ///   ``ScpError/SagaBusy(msg:code:contendedContext:)`` on a non-committed
     ///   terminal; ``ScpError/Context(msg:code:)`` (`SCP-CTX-2001`) if the
     ///   source context is not active; ``ScpError/Outlet(msg:code:)``
-    ///   (`SCP-TOOL-6001`) if the input is not valid UTF-8;
-    ///   ``ScpError/Outlet(msg:code:)`` (`SCP-TOOL-6002`, propagated from the
+    ///   (`SCP-OUTLET-6001`) if the input is not valid UTF-8;
+    ///   ``ScpError/Outlet(msg:code:)`` (`SCP-OUTLET-6002`, propagated from the
     ///   bridge) if `input` is valid UTF-8 but not valid JSON;
     ///   ``ScpError/Validation(msg:code:)`` (propagated from the bridge) if
     ///   `assertedNonceHex` is not 16-byte hex, or `callerDid` /
@@ -336,7 +336,7 @@ public extension Context {
         guard let inputJson = String(data: input, encoding: .utf8) else {
             throw ScpError.Outlet(
                 msg: "Outlet input is not valid UTF-8",
-                code: "SCP-TOOL-6001"
+                code: "SCP-OUTLET-6001"
             )
         }
         let targetHandle = targetContext.handle
@@ -429,7 +429,7 @@ public extension Context {
         guard let inputJson = String(data: input, encoding: .utf8) else {
             throw ScpError.Outlet(
                 msg: "Outlet input is not valid UTF-8",
-                code: "SCP-TOOL-6001"
+                code: "SCP-OUTLET-6001"
             )
         }
         let outputJson = try await scp.outletSessionInvoke(

@@ -1284,7 +1284,7 @@ pub async fn settle_outlet_economy(
             .void_external_and_consume(deps.payment_adapter.as_ref())
             .await;
         return Err(ContextError::ContextNotRegistered(format!(
-            "SCP-TOOL-6088: tool-economy settle for context '{context_id}' landed on a replaced \
+            "SCP-OUTLET-6088: tool-economy settle for context '{context_id}' landed on a replaced \
              actor instance (reserved generation {expected}, live generation {actual}); escrow \
              voided, reservation not captured"
         )));
@@ -1365,28 +1365,28 @@ pub async fn settle_outlet_economy(
 fn invocation_error_to_context(err: InvocationError) -> ContextError {
     match err {
         InvocationError::ContextNotActive { current_state } => ContextError::PermissionDenied(
-            format!("SCP-TOOL-6080: context not active: {current_state}"),
+            format!("SCP-OUTLET-6080: context not active: {current_state}"),
         ),
         InvocationError::InvokerNotAuthorized { did, outlet_id } => ContextError::PermissionDenied(
-            format!("SCP-TOOL-6081: invoker {did} lacks OutletCall({outlet_id})"),
+            format!("SCP-OUTLET-6081: invoker {did} lacks OutletCall({outlet_id})"),
         ),
         InvocationError::OutletNotFound { outlet_id } => {
-            ContextError::PermissionDenied(format!("SCP-TOOL-6082: tool not found: {outlet_id}"))
+            ContextError::PermissionDenied(format!("SCP-OUTLET-6082: tool not found: {outlet_id}"))
         }
         InvocationError::InputValidationFailed { message } => ContextError::PermissionDenied(
-            format!("SCP-TOOL-6083: input schema validation failed: {message}"),
+            format!("SCP-OUTLET-6083: input schema validation failed: {message}"),
         ),
         InvocationError::OutputValidationFailed { message } => ContextError::PermissionDenied(
-            format!("SCP-TOOL-6084: output schema validation failed: {message}"),
+            format!("SCP-OUTLET-6084: output schema validation failed: {message}"),
         ),
         InvocationError::ExecutionFailed { message } => ContextError::PermissionDenied(format!(
-            "SCP-TOOL-6085: tool execution failed: {message}"
+            "SCP-OUTLET-6085: tool execution failed: {message}"
         )),
         InvocationError::Timeout { timeout_ms } => ContextError::PermissionDenied(format!(
-            "SCP-TOOL-6086: tool execution timed out after {timeout_ms}ms"
+            "SCP-OUTLET-6086: tool execution timed out after {timeout_ms}ms"
         )),
         InvocationError::Cancelled => {
-            ContextError::PermissionDenied("SCP-TOOL-6087: tool invocation cancelled".to_owned())
+            ContextError::PermissionDenied("SCP-OUTLET-6087: tool invocation cancelled".to_owned())
         }
         InvocationError::BudgetExceeded {
             did,

@@ -41,7 +41,7 @@
 //!
 //! Use [`OutletError::new`] — the constructor enforces:
 //!
-//! - `code` is `SCP-TOOL-NNNN` where the trailing 4 digits fall in the §5.4.4
+//! - `code` is `SCP-OUTLET-NNNN` where the trailing 4 digits fall in the §5.4.4
 //!   6100-6199 sub-block.
 //! - `slug` regex `^[a-z][a-z0-9-]{0,63}(\.[a-z][a-z0-9-]{0,63})*$`.
 //! - `catalog_key` is registered in the outlet's catalog (rejected with
@@ -232,7 +232,7 @@ pub fn validate_catalog_key(key: &str) -> bool {
 #[serde(rename_all = "kebab-case")]
 pub enum OutletErrorClass {
     /// Registration / validation / classification violations
-    /// (`SCP-TOOL-6100..6109`). Examples: `query-cost-violation`,
+    /// (`SCP-OUTLET-6100..6109`). Examples: `query-cost-violation`,
     /// `query-violation`, `query-misdeclaration`, `outlet-not-registered`,
     /// `kind-mismatch`, `amplification-violation`,
     /// `protocol.catalog-rotation-too-frequent`, `protocol.stream-already-open`,
@@ -240,7 +240,7 @@ pub enum OutletErrorClass {
     /// `protocol.unknown-session`.
     Protocol,
     /// UCAN, caveat, role, capability, amplification denials
-    /// (`SCP-TOOL-6110..6119`). Examples: `authorization.denied`,
+    /// (`SCP-OUTLET-6110..6119`). Examples: `authorization.denied`,
     /// `authorization.expired`, `authorization.revoked`,
     /// `authorization.attenuation-violation`, `authorization.mint-limit-exceeded`,
     /// `authorization.adapter-not-allowed`, `authorization.revoked-mid-stream`,
@@ -252,34 +252,34 @@ pub enum OutletErrorClass {
     /// `attenuation.origin-kind-unspecified`, `attenuation.mask-width-violation`.
     Authorization,
     /// Schema, size, type, enum, range violations on input
-    /// (`SCP-TOOL-6120..6129`). Examples: `input.schema-violation`,
+    /// (`SCP-OUTLET-6120..6129`). Examples: `input.schema-violation`,
     /// `input.too-large`, `input.not-serializable`, `input.estimate-exceeds-bound`.
     Input,
     /// Timeout, panic, resource-exhaustion, non-determinism, stream gaps
-    /// (`SCP-TOOL-6130..6139`). Examples: `execution.handler-panic`,
+    /// (`SCP-OUTLET-6130..6139`). Examples: `execution.handler-panic`,
     /// `execution.timeout`, `execution.non-deterministic`,
     /// `execution.credit-exhausted`, `execution.credit-stall`,
     /// `execution.stream-gap`, `execution.cancel-ack-timeout`.
     Execution,
     /// Output schema/size/non-serializable/redaction violations
-    /// (`SCP-TOOL-6140..6149`). Examples: `output.schema-violation`,
+    /// (`SCP-OUTLET-6140..6149`). Examples: `output.schema-violation`,
     /// `output.too-large`, `output.not-serializable`.
     Output,
     /// Budget, insufficient funds, adapter failure, pricing, escrow overflow
-    /// (`SCP-TOOL-6150..6159` plus the cross-class slug
+    /// (`SCP-OUTLET-6150..6159` plus the cross-class slug
     /// `protocol.interface-spam-cost`). Examples: `economic.insufficient-funds`,
     /// `economic.adapter-failure`, `economic.pricing-formula-error`,
     /// `economic.budget-exceeded`, `economic.escrow-overflow`.
     Economic,
     /// Relay unavailable, cross-context bridge failure, rate limiting,
-    /// concurrency caps (`SCP-TOOL-6160..6169`). Examples:
+    /// concurrency caps (`SCP-OUTLET-6160..6169`). Examples:
     /// `transport.relay-unavailable`, `transport.cross-context-bridge-failure`,
     /// `transport.rate-limited`, `transport.concurrent-streams-per-invoker`,
     /// `transport.concurrent-streams-per-origin-invoker`,
     /// `transport.concurrent-streams-per-outlet`.
     Transport,
     /// Deregistration, suspension, ceiling, consequence-active
-    /// (`SCP-TOOL-6170..6179`). Examples: `governance.outlet-deregistered`,
+    /// (`SCP-OUTLET-6170..6179`). Examples: `governance.outlet-deregistered`,
     /// `governance.outlet-suspended`, `governance.ceiling-exceeded`,
     /// `governance.consequence-active`.
     Governance,
@@ -633,7 +633,7 @@ pub const MAX_TRAIL_PAD_HMAC_LABEL: &[u8] = b"SCP-OUTLET-HOP-PAD-V1:";
 /// [`ContextHop`], [`CatalogKey`]) all derive `Eq` as the prose specified.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OutletError {
-    /// `SCP-TOOL-NNNN` where `NNNN` falls in the §5.4.4 6100-6199 sub-block
+    /// `SCP-OUTLET-NNNN` where `NNNN` falls in the §5.4.4 6100-6199 sub-block
     /// (tag 1). Validated by [`OutletError::new`].
     #[serde(rename = "1")]
     pub code: String,
@@ -718,7 +718,7 @@ pub struct OutletError {
 ///   [`OutletErrorConstructionFailed::UnregisteredMessageKey`] at
 ///   construction time.
 /// - `class` — [`OutletErrorClass`] root class (§5.4.4 tag 3).
-/// - `code` — `SCP-TOOL-NNNN` with `NNNN` in the §5.4.4 6100-6199
+/// - `code` — `SCP-OUTLET-NNNN` with `NNNN` in the §5.4.4 6100-6199
 ///   sub-block.
 /// - `slug` — `^[a-z][a-z0-9-]{0,63}(\.[a-z][a-z0-9-]{0,63})*$`.
 /// - `retry` — [`RetryPolicy`].
@@ -759,7 +759,7 @@ pub struct OutletErrorNewOpts<'a> {
     pub registered_keys: &'a [CatalogKey],
     /// Root [`OutletErrorClass`] (§5.4.4 tag 3).
     pub class: OutletErrorClass,
-    /// `SCP-TOOL-NNNN` per the §5.4.4 6100-6199 sub-block.
+    /// `SCP-OUTLET-NNNN` per the §5.4.4 6100-6199 sub-block.
     pub code: &'a str,
     /// Slug per `^[a-z][a-z0-9-]{0,63}(\.[a-z][a-z0-9-]{0,63})*$`.
     pub slug: &'a str,
@@ -1096,7 +1096,7 @@ fn compute_wire_message(
 
 /// Validates an [`OutletError::code`] against the §5.4.4 6100-6199 sub-block.
 ///
-/// Accepts `SCP-TOOL-NNNN` where `NNNN` is exactly 4 ASCII digits and the
+/// Accepts `SCP-OUTLET-NNNN` where `NNNN` is exactly 4 ASCII digits and the
 /// 4-digit number falls in the closed range \[6100, 6199\].
 #[must_use]
 pub fn validate_outlet_error_code(code: &str) -> bool {
@@ -1104,15 +1104,15 @@ pub fn validate_outlet_error_code(code: &str) -> bool {
     // is exempt from `scripts/check-error-codes.sh` Phase 1 via the inline
     // marker below — this is a validator self-reference (the function
     // checks inputs against this prefix), not an emitted error code.
-    const PREFIX: &[u8] = b"SCP-TOOL-61"; // SCP-CODE-OK: validator self-reference (§5.4.4 prefix check)
-    if code.len() != 13 {
+    const PREFIX: &[u8] = b"SCP-OUTLET-61"; // SCP-CODE-OK: validator self-reference (§5.4.4 prefix check)
+    if code.len() != 15 {
         return false;
     }
     let bytes = code.as_bytes();
     if !bytes.starts_with(PREFIX) {
         return false;
     }
-    let tail = &bytes[11..];
+    let tail = &bytes[13..];
     tail.iter().all(u8::is_ascii_digit)
 }
 
@@ -1129,7 +1129,7 @@ pub fn validate_outlet_error_code(code: &str) -> bool {
 pub enum OutletErrorConstructionFailed {
     /// `code` failed the §5.4.4 6100-6199 sub-block check.
     #[error(
-        "malformed OutletError code \"{code}\" — must be SCP-TOOL-NNNN with NNNN in [6100, 6199]"
+        "malformed OutletError code \"{code}\" — must be SCP-OUTLET-NNNN with NNNN in [6100, 6199]"
     )]
     MalformedCode {
         /// The invalid code.
@@ -1287,7 +1287,7 @@ mod tests {
             catalog_key: &key,
             registered_keys: &registered,
             class: OutletErrorClass::Authorization,
-            code: "SCP-TOOL-6110",
+            code: "SCP-OUTLET-6110",
             slug: "authorization.denied",
             retry: RetryPolicy::Never,
             detail: Some(DetailBody::Authorization {
@@ -1377,7 +1377,7 @@ mod tests {
         let hop = ContextHop {
             context_id: "ctx-a".to_owned(),
             hop_index: 0,
-            wrapped_code: "SCP-TOOL-6110".to_owned(),
+            wrapped_code: "SCP-OUTLET-6110".to_owned(),
         };
         let json = serde_json::to_string(&hop).unwrap();
         assert!(json.contains("\"context_id\""));
@@ -1390,7 +1390,7 @@ mod tests {
         let hop = ContextHop {
             context_id: "ctx-b".to_owned(),
             hop_index: 7,
-            wrapped_code: "SCP-TOOL-6130".to_owned(),
+            wrapped_code: "SCP-OUTLET-6130".to_owned(),
         };
         let bytes = rmp_serde::to_vec_named(&hop).unwrap();
         let back: ContextHop = rmp_serde::from_slice(&bytes).unwrap();
@@ -1474,11 +1474,12 @@ mod tests {
     /// outside the §5.4.4 6100-6199 sub-block. Phase 1 of the error-code CI
     /// gate (`scripts/check-error-codes.sh`) skips this line via the inline
     /// `SCP-CODE-OK:` exemption — a test fixture proving the rejection path.
-    const INVALID_SUBBLOCK_CODE: &str = "SCP-TOOL-7000"; // SCP-CODE-OK: negative-test fixture (§5.4.4 sub-block rejection)
+    const INVALID_SUBBLOCK_CODE: &str = "SCP-OUTLET-7000"; // SCP-CODE-OK: negative-test fixture (§5.4.4 sub-block rejection)
     /// Negative-test input — a non-canonical-prefix code. The first segment
-    /// after `SCP-` is not in the `sdk-common.md` allowlist. Phase 1 skips
-    /// this line via the inline `SCP-CODE-OK:` exemption.
-    const NON_CANONICAL_PREFIX_CODE: &str = "SCP-OUTLET-6100"; // SCP-CODE-OK: negative-test fixture (non-canonical prefix rejection)
+    /// after `SCP-` (`TOOL`) is not in the `sdk-common.md` allowlist since the
+    /// outlet error domain was renamed to the canonical `SCP-OUTLET-` prefix.
+    /// Phase 1 skips this line via the inline `SCP-CODE-OK:` exemption.
+    const NON_CANONICAL_PREFIX_CODE: &str = "SCP-TOOL-6100"; // SCP-CODE-OK: negative-test fixture (non-canonical prefix rejection)
 
     #[test]
     fn constructor_validates_code_regex() {
@@ -1521,7 +1522,7 @@ mod tests {
             catalog_key: &key,
             registered_keys: &registered,
             class: OutletErrorClass::Authorization,
-            code: "SCP-TOOL-6110",
+            code: "SCP-OUTLET-6110",
             slug: "Authorization.Denied", // uppercase — invalid
             retry: RetryPolicy::Never,
             detail: Some(DetailBody::Authorization {
@@ -1562,7 +1563,7 @@ mod tests {
             // Mismatch: 6110 is the Authorization-class code per the registry,
             // but the caller-supplied class is Input.
             class: OutletErrorClass::Input,
-            code: "SCP-TOOL-6110",
+            code: "SCP-OUTLET-6110",
             slug: "authorization.denied",
             retry: RetryPolicy::Never,
             detail: None,
@@ -1575,7 +1576,7 @@ mod tests {
                 expected,
                 actual,
             }) => {
-                assert_eq!(code_or_slug, "SCP-TOOL-6110");
+                assert_eq!(code_or_slug, "SCP-OUTLET-6110");
                 assert_eq!(expected, OutletErrorClass::Authorization);
                 assert_eq!(actual, OutletErrorClass::Input);
             }
@@ -1606,7 +1607,7 @@ mod tests {
             // (6160) but a mismatched Authorization class. The slug check
             // (which runs after the code check) surfaces the diagnostic.
             class: OutletErrorClass::Authorization,
-            code: "SCP-TOOL-6160",
+            code: "SCP-OUTLET-6160",
             slug: "transport.relay-unavailable",
             retry: RetryPolicy::WithBackoff {
                 min: Duration::from_secs(1),
@@ -1623,7 +1624,7 @@ mod tests {
                 actual,
             }) => {
                 // Code 6160 is Transport — the code check rejects first.
-                assert_eq!(code_or_slug, "SCP-TOOL-6160");
+                assert_eq!(code_or_slug, "SCP-OUTLET-6160");
                 assert_eq!(expected, OutletErrorClass::Transport);
                 assert_eq!(actual, OutletErrorClass::Authorization);
             }
@@ -1649,7 +1650,7 @@ mod tests {
             registered_keys: &registered,
             class: OutletErrorClass::Authorization,
             // 6180 is reserved per §5.4.4 — no registry class.
-            code: "SCP-TOOL-6180", // SCP-CODE-OK: SCP-OUT-025 reserved-range fixture (slug-only mismatch).
+            code: "SCP-OUTLET-6180",
             slug: "execution.handler-panic",
             retry: RetryPolicy::Never,
             detail: None,
@@ -1686,7 +1687,7 @@ mod tests {
             catalog_key: &key,
             registered_keys: &registered,
             class: OutletErrorClass::Execution,
-            code: "SCP-TOOL-6130",
+            code: "SCP-OUTLET-6130",
             slug: "execution.handler-panic",
             retry: RetryPolicy::Never,
             detail: None,
@@ -1695,7 +1696,7 @@ mod tests {
         })
         .expect("registry-aligned construction must succeed");
         assert_eq!(env.class, OutletErrorClass::Execution);
-        assert_eq!(env.code, "SCP-TOOL-6130");
+        assert_eq!(env.code, "SCP-OUTLET-6130");
         assert_eq!(env.slug, "execution.handler-panic");
     }
 
@@ -1715,7 +1716,7 @@ mod tests {
             catalog_key: &key,
             registered_keys: &registered,
             class: OutletErrorClass::Authorization,
-            code: "SCP-TOOL-6110",
+            code: "SCP-OUTLET-6110",
             slug: "AUTHORIZATION.DENIED", // uppercase — fails §5.4.4 regex
             retry: RetryPolicy::Never,
             detail: None,
@@ -1749,7 +1750,7 @@ mod tests {
             catalog_key: &key,
             registered_keys: &registered,
             class: OutletErrorClass::Authorization,
-            code: "SCP-TOOL-6100",
+            code: "SCP-OUTLET-6100",
             slug: "query-cost-violation", // Protocol-class per registry
             retry: RetryPolicy::Never,
             detail: None,
@@ -1772,25 +1773,23 @@ mod tests {
         // Positive-test fixture for the range validator. 6199 is a §5.4.4
         // reserved-gap that the range validator must accept even though no
         // CODE_* constant is allocated for it.
-        let valid_codes: [&str; 3] = [
-            "SCP-TOOL-6100",
-            "SCP-TOOL-6110",
-            "SCP-TOOL-6199", // SCP-CODE-OK: §5.4.4 reserved-gap range-validator fixture
-        ];
+        let valid_codes: [&str; 3] = ["SCP-OUTLET-6100", "SCP-OUTLET-6110", "SCP-OUTLET-6199"];
         for code in valid_codes {
             assert!(validate_outlet_error_code(code), "expected valid: {code}");
         }
-        // Negative-test inputs. Phase 1 of `scripts/check-error-codes.sh`
-        // skips lines carrying the inline `SCP-CODE-OK:` marker so that
-        // these fixture values — which intentionally fall outside the
-        // §5.4.4 6100-6199 sub-block — do not trip the range check.
+        // Negative-test inputs for the Rust sub-block validator (accepts only
+        // 6100-6199). The `609x` / `620x` literals below sit inside the broader
+        // `check-error-codes.sh` range (6000-6999), so they pass Phase 1 with
+        // no `SCP-CODE-OK:` marker; only `INVALID_SUBBLOCK_CODE` (out of range)
+        // and `NON_CANONICAL_PREFIX_CODE` (non-canonical prefix) carry the
+        // marker on their `const` definitions above.
         let invalid_codes: [&str; 6] = [
-            "SCP-TOOL-6099",       // SCP-CODE-OK: negative-test fixture (below §5.4.4 sub-block)
-            "SCP-TOOL-6200",       // SCP-CODE-OK: negative-test fixture (above §5.4.4 sub-block)
-            INVALID_SUBBLOCK_CODE, // 7-prefix variant outside the sub-block
+            "SCP-OUTLET-6099",
+            "SCP-OUTLET-6200",
+            INVALID_SUBBLOCK_CODE,     // 7-prefix variant outside the sub-block
             NON_CANONICAL_PREFIX_CODE, // non-canonical prefix segment
-            "scp-tool-6100",       // wrong case
-            "",                    // empty
+            "scp-outlet-6100",         // wrong case
+            "",                        // empty
         ];
         for code in invalid_codes {
             assert!(
@@ -1817,7 +1816,7 @@ mod tests {
             catalog_key: &unknown,
             registered_keys: &registered,
             class: OutletErrorClass::Authorization,
-            code: "SCP-TOOL-6110",
+            code: "SCP-OUTLET-6110",
             slug: "authorization.denied",
             retry: RetryPolicy::Never,
             detail: Some(DetailBody::Authorization {
@@ -1870,7 +1869,7 @@ mod tests {
             catalog_key: &key,
             registered_keys: &registered,
             class: OutletErrorClass::Protocol,
-            code: "SCP-TOOL-6100",
+            code: "SCP-OUTLET-6100",
             slug: "protocol.query-cost-violation",
             retry: RetryPolicy::Never,
             detail: Some(DetailBody::FieldViolation {
@@ -1904,7 +1903,7 @@ mod tests {
             catalog_key: &key,
             registered_keys: &registered,
             class: OutletErrorClass::Execution,
-            code: "SCP-TOOL-6130",
+            code: "SCP-OUTLET-6130",
             slug: "execution.handler-panic",
             retry: RetryPolicy::Never,
             detail: Some(DetailBody::ExecutionPanic {
@@ -2068,7 +2067,7 @@ mod tests {
         err.source_chain = vec![ContextHop {
             context_id: "ctx-x".to_owned(),
             hop_index: 0,
-            wrapped_code: "SCP-TOOL-6110".to_owned(),
+            wrapped_code: "SCP-OUTLET-6110".to_owned(),
         }];
         let bytes = rmp_serde::to_vec_named(&err).unwrap();
         let back: OutletError = rmp_serde::from_slice(&bytes).unwrap();
@@ -2082,7 +2081,7 @@ mod tests {
         err.source_chain = vec![ContextHop {
             context_id: "ctx-y".to_owned(),
             hop_index: 1,
-            wrapped_code: "SCP-TOOL-6130".to_owned(),
+            wrapped_code: "SCP-OUTLET-6130".to_owned(),
         }];
         let bytes = serde_json::to_vec(&err).unwrap();
         let back: OutletError = serde_json::from_slice(&bytes).unwrap();
@@ -2221,12 +2220,12 @@ mod tests {
             ContextHop {
                 context_id: "ctx-0".to_owned(),
                 hop_index: 0,
-                wrapped_code: "SCP-TOOL-6110".to_owned(),
+                wrapped_code: "SCP-OUTLET-6110".to_owned(),
             },
             ContextHop {
                 context_id: "ctx-1".to_owned(),
                 hop_index: 1,
-                wrapped_code: "SCP-TOOL-6130".to_owned(),
+                wrapped_code: "SCP-OUTLET-6130".to_owned(),
             },
         ];
         let bytes = rmp_serde::to_vec_named(&err).unwrap();
@@ -2305,7 +2304,7 @@ mod tests {
         let mut pairs: Vec<(rmpv::Value, rmpv::Value)> = vec![
             (
                 rmpv::Value::String("1".into()),
-                rmpv::Value::String("SCP-TOOL-6110".into()),
+                rmpv::Value::String("SCP-OUTLET-6110".into()),
             ),
             (
                 rmpv::Value::String("2".into()),

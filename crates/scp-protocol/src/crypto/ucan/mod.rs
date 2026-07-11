@@ -229,7 +229,7 @@ pub enum UcanError {
     /// so SDK consumers can match on the exact rule that fired.
     ///
     /// Maps to error code [`crate::CODE_AUTHORIZATION_ATTENUATION`]
-    /// (`SCP-TOOL-6114`) with the per-violation slug from
+    /// (`SCP-OUTLET-6114`) with the per-violation slug from
     /// [`crate::trust::caveats::AttenuationViolation::slug`].
     #[error("caveat attenuation violation: {0}")]
     CaveatAttenuationViolation(crate::trust::caveats::AttenuationViolation),
@@ -238,7 +238,7 @@ pub enum UcanError {
     /// check (`valid_from` / `valid_until` / `hours_of_day` / `days_of_week`).
     ///
     /// Maps to error code [`crate::CODE_AUTHORIZATION_DENIED`]
-    /// (`SCP-TOOL-6110`) with slug `authorization.time-box-violation`.
+    /// (`SCP-OUTLET-6110`) with slug `authorization.time-box-violation`.
     #[error("caveat time-box violation: {0}")]
     CaveatTimeBoxViolation(String),
 }

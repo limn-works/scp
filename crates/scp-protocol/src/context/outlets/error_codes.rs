@@ -1,5 +1,5 @@
 //! Compact `OutletError` code allocation and per-class slug taxonomy in the
-//! `SCP-TOOL-6100..6199` sub-block per spec §5.4.4 ("Outlet Error Taxonomy").
+//! `SCP-OUTLET-6100..6199` sub-block per spec §5.4.4 ("Outlet Error Taxonomy").
 //!
 //! This registry is governed solely by spec §5.4.4. It is unrelated to
 //! ADR-049's error taxonomy, which covers the distinct `SCP-SAGA-*`
@@ -26,25 +26,25 @@
 //!
 //! | Code | Class | Default slug | Slugs covered (§5.4.4 + round-4/5/6) |
 //! |------|-------|--------------|--------------------------------------|
-//! | [`CODE_PROTOCOL_VIOLATION`] (`SCP-TOOL-6100`) | `Protocol` | `protocol.violation` | `query-cost-violation`, `query-violation`, `kind-mismatch`, `amplification-violation`, `structural-floor-violation`, `schema-immutability-violation`, `query-misdeclaration`, `protocol.catalog-rotation-too-frequent`, `protocol.stream-already-open`, `protocol.violation` |
-//! | [`CODE_PROTOCOL_SESSION`] (`SCP-TOOL-6101`) | `Protocol` | `protocol.session-id-conflict` | `protocol.session-id-conflict`, `protocol.malformed-session-id`, `protocol.unknown-session`, `protocol.context-closed-mid-stream`, `protocol.stream-already-closed` |
-//! | [`CODE_AUTHORIZATION_DENIED`] (`SCP-TOOL-6110`) | `Authorization` | `authorization.denied` | `authorization.denied` (oracle-collapse target), `authorization.expired`, `authorization.revoked`, `authorization.missing`, `authorization.attenuation-violation`, `authorization.mint-limit-exceeded`, `authorization.time-box-violation`, `authorization.rate-exceeded`, `authorization.cumulative-exceeded`, `authorization.adapter-not-allowed`, `authorization.revoked-mid-stream`, `authorization.credit-stream-mismatch`, `authorization.ikm-signature-invalid`, `authorization.credit-replay` |
-//! | [`CODE_AUTHORIZATION_ATTENUATION`] (`SCP-TOOL-6114`) | `Authorization` | `attenuation.mask-width-violation` | `attenuation.caveat-mint-limit-exceeded`, `attenuation.hours-of-day-high-bits-set`, `attenuation.days-of-week-high-bit-set`, `attenuation.origin-kind-stem-mismatch`, `attenuation.origin-kind-mixed-stem-root`, `attenuation.origin-kind-unspecified`, `attenuation.mask-width-violation` |
-//! | [`CODE_AUTHORIZATION_SALT_ROTATION`] (`SCP-TOOL-6115`) | `Authorization` | `authorization.salt-rotation-unjustified` | `authorization.salt-rotation-unjustified` |
-//! | [`CODE_INPUT_VIOLATION`] (`SCP-TOOL-6120`) | `Input` | `input.schema-violation` | `input.schema-violation`, `input.too-large`, `input.not-serializable`, `input.estimate-exceeds-bound` |
-//! | [`CODE_EXECUTION_FAULT`] (`SCP-TOOL-6130`) | `Execution` | `execution.handler-panic` | `execution.handler-panic`, `execution.timeout`, `execution.non-deterministic` |
-//! | [`CODE_EXECUTION_CREDIT`] (`SCP-TOOL-6131`) | `Execution` | `execution.credit-exhausted` | `execution.credit-exhausted`, `execution.stream-gap`, `execution.stream-cap-exhausted` |
-//! | [`CODE_EXECUTION_CREDIT_STALL`] (`SCP-TOOL-6133`) | `Execution` | `execution.credit-stall` | `execution.credit-stall` |
-//! | [`CODE_EXECUTION_CANCEL_ACK_TIMEOUT`] (`SCP-TOOL-6135`) | `Execution` | `execution.cancel-ack-timeout` | `execution.cancel-ack-timeout` |
-//! | [`CODE_OUTPUT_VIOLATION`] (`SCP-TOOL-6140`) | `Output` | `output.schema-violation` | `output.schema-violation`, `output.too-large`, `output.not-serializable` |
-//! | [`CODE_ECONOMIC_FAULT`] (`SCP-TOOL-6150`) | `Economic` | `economic.insufficient-funds` | `economic.insufficient-funds`, `economic.adapter-failure`, `economic.pricing-formula-error`, `economic.budget-exceeded`, `economic.escrow-overflow`, `protocol.interface-spam-cost` (cross-class slug, Economic class) |
-//! | [`CODE_TRANSPORT_FAULT`] (`SCP-TOOL-6160`) | `Transport` | `transport.relay-unavailable` | `transport.relay-unavailable`, `transport.cross-context-bridge-failure`, `transport.rate-limited`, `transport.concurrent-streams-per-invoker`, `transport.concurrent-streams-per-origin-invoker`, `transport.concurrent-streams-per-outlet` |
-//! | [`CODE_GOVERNANCE_FAULT`] (`SCP-TOOL-6170`) | `Governance` | `governance.outlet-deregistered` | `governance.outlet-deregistered`, `governance.outlet-suspended`, `governance.ceiling-exceeded`, `governance.consequence-active` |
+//! | [`CODE_PROTOCOL_VIOLATION`] (`SCP-OUTLET-6100`) | `Protocol` | `protocol.violation` | `query-cost-violation`, `query-violation`, `kind-mismatch`, `amplification-violation`, `structural-floor-violation`, `schema-immutability-violation`, `query-misdeclaration`, `protocol.catalog-rotation-too-frequent`, `protocol.stream-already-open`, `protocol.violation` |
+//! | [`CODE_PROTOCOL_SESSION`] (`SCP-OUTLET-6101`) | `Protocol` | `protocol.session-id-conflict` | `protocol.session-id-conflict`, `protocol.malformed-session-id`, `protocol.unknown-session`, `protocol.context-closed-mid-stream`, `protocol.stream-already-closed` |
+//! | [`CODE_AUTHORIZATION_DENIED`] (`SCP-OUTLET-6110`) | `Authorization` | `authorization.denied` | `authorization.denied` (oracle-collapse target), `authorization.expired`, `authorization.revoked`, `authorization.missing`, `authorization.attenuation-violation`, `authorization.mint-limit-exceeded`, `authorization.time-box-violation`, `authorization.rate-exceeded`, `authorization.cumulative-exceeded`, `authorization.adapter-not-allowed`, `authorization.revoked-mid-stream`, `authorization.credit-stream-mismatch`, `authorization.ikm-signature-invalid`, `authorization.credit-replay` |
+//! | [`CODE_AUTHORIZATION_ATTENUATION`] (`SCP-OUTLET-6114`) | `Authorization` | `attenuation.mask-width-violation` | `attenuation.caveat-mint-limit-exceeded`, `attenuation.hours-of-day-high-bits-set`, `attenuation.days-of-week-high-bit-set`, `attenuation.origin-kind-stem-mismatch`, `attenuation.origin-kind-mixed-stem-root`, `attenuation.origin-kind-unspecified`, `attenuation.mask-width-violation` |
+//! | [`CODE_AUTHORIZATION_SALT_ROTATION`] (`SCP-OUTLET-6115`) | `Authorization` | `authorization.salt-rotation-unjustified` | `authorization.salt-rotation-unjustified` |
+//! | [`CODE_INPUT_VIOLATION`] (`SCP-OUTLET-6120`) | `Input` | `input.schema-violation` | `input.schema-violation`, `input.too-large`, `input.not-serializable`, `input.estimate-exceeds-bound` |
+//! | [`CODE_EXECUTION_FAULT`] (`SCP-OUTLET-6130`) | `Execution` | `execution.handler-panic` | `execution.handler-panic`, `execution.timeout`, `execution.non-deterministic` |
+//! | [`CODE_EXECUTION_CREDIT`] (`SCP-OUTLET-6131`) | `Execution` | `execution.credit-exhausted` | `execution.credit-exhausted`, `execution.stream-gap`, `execution.stream-cap-exhausted` |
+//! | [`CODE_EXECUTION_CREDIT_STALL`] (`SCP-OUTLET-6133`) | `Execution` | `execution.credit-stall` | `execution.credit-stall` |
+//! | [`CODE_EXECUTION_CANCEL_ACK_TIMEOUT`] (`SCP-OUTLET-6135`) | `Execution` | `execution.cancel-ack-timeout` | `execution.cancel-ack-timeout` |
+//! | [`CODE_OUTPUT_VIOLATION`] (`SCP-OUTLET-6140`) | `Output` | `output.schema-violation` | `output.schema-violation`, `output.too-large`, `output.not-serializable` |
+//! | [`CODE_ECONOMIC_FAULT`] (`SCP-OUTLET-6150`) | `Economic` | `economic.insufficient-funds` | `economic.insufficient-funds`, `economic.adapter-failure`, `economic.pricing-formula-error`, `economic.budget-exceeded`, `economic.escrow-overflow`, `protocol.interface-spam-cost` (cross-class slug, Economic class) |
+//! | [`CODE_TRANSPORT_FAULT`] (`SCP-OUTLET-6160`) | `Transport` | `transport.relay-unavailable` | `transport.relay-unavailable`, `transport.cross-context-bridge-failure`, `transport.rate-limited`, `transport.concurrent-streams-per-invoker`, `transport.concurrent-streams-per-origin-invoker`, `transport.concurrent-streams-per-outlet` |
+//! | [`CODE_GOVERNANCE_FAULT`] (`SCP-OUTLET-6170`) | `Governance` | `governance.outlet-deregistered` | `governance.outlet-deregistered`, `governance.outlet-suspended`, `governance.ceiling-exceeded`, `governance.consequence-active` |
 //!
-//! Codes `SCP-TOOL-6111`, `SCP-TOOL-6112`, `SCP-TOOL-6113`, `SCP-TOOL-6116..=6119`,
-//! `SCP-TOOL-6121..=6129`, `SCP-TOOL-6132`, `SCP-TOOL-6134`, `SCP-TOOL-6136..=6139`,
-//! `SCP-TOOL-6141..=6149`, `SCP-TOOL-6151..=6159`, `SCP-TOOL-6161..=6169`,
-//! `SCP-TOOL-6171..=6179`, and `SCP-TOOL-6180..=6199` are **reserved** within
+//! Codes `SCP-OUTLET-6111`, `SCP-OUTLET-6112`, `SCP-OUTLET-6113`, `SCP-OUTLET-6116..=6119`,
+//! `SCP-OUTLET-6121..=6129`, `SCP-OUTLET-6132`, `SCP-OUTLET-6134`, `SCP-OUTLET-6136..=6139`,
+//! `SCP-OUTLET-6141..=6149`, `SCP-OUTLET-6151..=6159`, `SCP-OUTLET-6161..=6169`,
+//! `SCP-OUTLET-6171..=6179`, and `SCP-OUTLET-6180..=6199` are **reserved** within
 //! the §5.4.4 6100-6199 sub-block. Reserved codes return [`None`] from every
 //! lookup function below.
 //!
@@ -69,22 +69,23 @@ use crate::context::outlets::errors::{OutletErrorClass, RetryPolicy, validate_ca
 // Code constants — §5.4.4 6100-6199 sub-block
 // ---------------------------------------------------------------------------
 //
-// Every constant below is a literal `SCP-TOOL-NNNN` string in the sub-block.
-// The `// SCP-CODE-OK:` exemption marker on each line tells
-// `scripts/check-error-codes.sh` Phase 1 that the literal is a registry
-// constant (always in-range, by inspection), not an emitted error code that
-// would need separate range validation.
+// Every constant below is a literal `SCP-OUTLET-NNNN` string in the sub-block.
+// These carry no `SCP-CODE-OK:` exemption marker: the canonical `SCP-OUTLET-`
+// prefix with a number in the 6000-6999 range passes `check-error-codes.sh`
+// Phase 1 on its own. The marker is reserved for lines the gate would
+// otherwise reject — out-of-range / non-canonical negative-test fixtures and
+// validator self-references (see the tests below and `errors.rs`).
 
-/// `SCP-TOOL-6100` — Protocol-class registration / validation / classification.
+/// `SCP-OUTLET-6100` — Protocol-class registration / validation / classification.
 ///
 /// Default slug `protocol.violation`. Slugs: `query-cost-violation`,
 /// `query-violation`, `kind-mismatch`, `amplification-violation`,
 /// `structural-floor-violation`, `schema-immutability-violation`,
 /// `query-misdeclaration`, `protocol.catalog-rotation-too-frequent`,
 /// `protocol.stream-already-open`. See §5.4.4.
-pub const CODE_PROTOCOL_VIOLATION: &str = "SCP-TOOL-6100"; // SCP-CODE-OK: §5.4.4 registry constant (Protocol class)
+pub const CODE_PROTOCOL_VIOLATION: &str = "SCP-OUTLET-6100";
 
-/// `SCP-TOOL-6101` — Protocol-class session-id format and uniqueness.
+/// `SCP-OUTLET-6101` — Protocol-class session-id format and uniqueness.
 ///
 /// Default slug `protocol.session-id-conflict`. Slugs:
 /// `protocol.session-id-conflict`, `protocol.malformed-session-id`,
@@ -92,17 +93,17 @@ pub const CODE_PROTOCOL_VIOLATION: &str = "SCP-TOOL-6100"; // SCP-CODE-OK: §5.4
 /// (round-8 context teardown mid-stream), `protocol.stream-already-closed`
 /// (control-plane call after terminal). See §6.2.1.1(a) (round-5
 /// `UUIDv7`) and §5.4.4.
-pub const CODE_PROTOCOL_SESSION: &str = "SCP-TOOL-6101"; // SCP-CODE-OK: §5.4.4 registry constant (Protocol class)
+pub const CODE_PROTOCOL_SESSION: &str = "SCP-OUTLET-6101";
 
-/// `SCP-TOOL-6110` — Authorization-class denial (UCAN, caveat, capability).
+/// `SCP-OUTLET-6110` — Authorization-class denial (UCAN, caveat, capability).
 ///
 /// The §5.4.4 query-oracle-collapse target — a caller missing both stems on
 /// the target outlet receives this code with slug `authorization.denied`
 /// regardless of whether the outlet is registered, deregistered, or has
 /// never existed. Default slug `authorization.denied`. See §5.4.4.
-pub const CODE_AUTHORIZATION_DENIED: &str = "SCP-TOOL-6110"; // SCP-CODE-OK: §5.4.4 registry constant (Authorization class)
+pub const CODE_AUTHORIZATION_DENIED: &str = "SCP-OUTLET-6110";
 
-/// `SCP-TOOL-6114` — Authorization-class attenuation sub-class.
+/// `SCP-OUTLET-6114` — Authorization-class attenuation sub-class.
 ///
 /// Round-4 split: violations of the attenuation invariants surface here so
 /// the operator-side retry/log path can distinguish them from the catch-all
@@ -114,59 +115,59 @@ pub const CODE_AUTHORIZATION_DENIED: &str = "SCP-TOOL-6110"; // SCP-CODE-OK: §5
 /// `attenuation.origin-kind-mixed-stem-root`,
 /// `attenuation.origin-kind-unspecified`,
 /// `attenuation.mask-width-violation`. See §5.4.4 + §7.3.8.
-pub const CODE_AUTHORIZATION_ATTENUATION: &str = "SCP-TOOL-6114"; // SCP-CODE-OK: §5.4.4 registry constant (Authorization attenuation sub-class)
+pub const CODE_AUTHORIZATION_ATTENUATION: &str = "SCP-OUTLET-6114";
 
-/// `SCP-TOOL-6115` — Authorization-class round-6 salt-rotation rejection.
+/// `SCP-OUTLET-6115` — Authorization-class round-6 salt-rotation rejection.
 ///
 /// Round-6 `InterfaceSaltRotated` rejection where the rotation cites no
 /// qualifying admin-removal event (§6.2.0.1 `SCP-OUTLET-IKM-ROTATE-V1:`
 /// preimage). Default slug `authorization.salt-rotation-unjustified`.
 /// See §5.4.4 round-6.
-pub const CODE_AUTHORIZATION_SALT_ROTATION: &str = "SCP-TOOL-6115"; // SCP-CODE-OK: §5.4.4 registry constant (Authorization salt-rotation)
+pub const CODE_AUTHORIZATION_SALT_ROTATION: &str = "SCP-OUTLET-6115";
 
-/// `SCP-TOOL-6120` — Input-class schema / size / type violations.
+/// `SCP-OUTLET-6120` — Input-class schema / size / type violations.
 ///
 /// Default slug `input.schema-violation`. Slugs: `input.schema-violation`,
 /// `input.too-large`, `input.not-serializable`,
 /// `input.estimate-exceeds-bound` (round-4 stream open
 /// `estimated_chunk_count` cap). See §5.4.4.
-pub const CODE_INPUT_VIOLATION: &str = "SCP-TOOL-6120"; // SCP-CODE-OK: §5.4.4 registry constant (Input class)
+pub const CODE_INPUT_VIOLATION: &str = "SCP-OUTLET-6120";
 
-/// `SCP-TOOL-6130` — Execution-class handler-side fault.
+/// `SCP-OUTLET-6130` — Execution-class handler-side fault.
 ///
 /// Covers handler panic, timeout, non-determinism. Default slug
 /// `execution.handler-panic`. Slugs: `execution.handler-panic`,
 /// `execution.timeout`, `execution.non-deterministic`. See §5.4.4.
-pub const CODE_EXECUTION_FAULT: &str = "SCP-TOOL-6130"; // SCP-CODE-OK: §5.4.4 registry constant (Execution class)
+pub const CODE_EXECUTION_FAULT: &str = "SCP-OUTLET-6130";
 
-/// `SCP-TOOL-6131` — Execution-class credit-stream / resource-exhaustion.
+/// `SCP-OUTLET-6131` — Execution-class credit-stream / resource-exhaustion.
 ///
 /// Distinct from the catch-all execution fault. Default slug
 /// `execution.credit-exhausted`. Slugs: `execution.credit-exhausted`,
 /// `execution.stream-gap`, `execution.stream-cap-exhausted` (round-8
 /// node-level concurrent-pump ceiling). See §5.4.4 + §5.4.5 streaming.
-pub const CODE_EXECUTION_CREDIT: &str = "SCP-TOOL-6131"; // SCP-CODE-OK: §5.4.4 registry constant (Execution credit class)
+pub const CODE_EXECUTION_CREDIT: &str = "SCP-OUTLET-6131";
 
-/// `SCP-TOOL-6133` — Execution-class credit-stall (round-4 split).
+/// `SCP-OUTLET-6133` — Execution-class credit-stall (round-4 split).
 ///
 /// Dedicated code per round-4 cancel-ack vs. credit-stall split. Default
 /// slug `execution.credit-stall`. See §5.4.4 round-4.
-pub const CODE_EXECUTION_CREDIT_STALL: &str = "SCP-TOOL-6133"; // SCP-CODE-OK: §5.4.4 registry constant (Execution credit-stall)
+pub const CODE_EXECUTION_CREDIT_STALL: &str = "SCP-OUTLET-6133";
 
-/// `SCP-TOOL-6135` — Execution-class cancel-ack-timeout (round-4).
+/// `SCP-OUTLET-6135` — Execution-class cancel-ack-timeout (round-4).
 ///
 /// Round-4 cancel-ack timer expiration (§5.4.5 cancel-ack timer). Default
 /// slug `execution.cancel-ack-timeout`. See §5.4.4 round-4.
-pub const CODE_EXECUTION_CANCEL_ACK_TIMEOUT: &str = "SCP-TOOL-6135"; // SCP-CODE-OK: §5.4.4 registry constant (Execution cancel-ack-timeout)
+pub const CODE_EXECUTION_CANCEL_ACK_TIMEOUT: &str = "SCP-OUTLET-6135";
 
-/// `SCP-TOOL-6140` — Output-class schema / size / redaction violations.
+/// `SCP-OUTLET-6140` — Output-class schema / size / redaction violations.
 ///
 /// Default slug `output.schema-violation`. Slugs:
 /// `output.schema-violation`, `output.too-large`, `output.not-serializable`.
 /// See §5.4.4.
-pub const CODE_OUTPUT_VIOLATION: &str = "SCP-TOOL-6140"; // SCP-CODE-OK: §5.4.4 registry constant (Output class)
+pub const CODE_OUTPUT_VIOLATION: &str = "SCP-OUTLET-6140";
 
-/// `SCP-TOOL-6150` — Economic-class fee / budget / adapter / pricing failure.
+/// `SCP-OUTLET-6150` — Economic-class fee / budget / adapter / pricing failure.
 ///
 /// Includes the cross-class `protocol.interface-spam-cost` slug (§6.2.0.1
 /// quadratic fee — Economic class even though the slug carries a
@@ -176,24 +177,24 @@ pub const CODE_OUTPUT_VIOLATION: &str = "SCP-TOOL-6140"; // SCP-CODE-OK: §5.4.4
 /// `economic.pricing-formula-error`, `economic.budget-exceeded`,
 /// `economic.escrow-overflow`, `protocol.interface-spam-cost`. See §5.4.4 +
 /// §6.2.0.1.
-pub const CODE_ECONOMIC_FAULT: &str = "SCP-TOOL-6150"; // SCP-CODE-OK: §5.4.4 registry constant (Economic class)
+pub const CODE_ECONOMIC_FAULT: &str = "SCP-OUTLET-6150";
 
-/// `SCP-TOOL-6160` — Transport-class relay / bridge / concurrency-cap failure.
+/// `SCP-OUTLET-6160` — Transport-class relay / bridge / concurrency-cap failure.
 ///
 /// Default slug `transport.relay-unavailable`. Slugs:
 /// `transport.relay-unavailable`, `transport.cross-context-bridge-failure`,
 /// `transport.rate-limited`, `transport.concurrent-streams-per-invoker`,
 /// `transport.concurrent-streams-per-origin-invoker`,
 /// `transport.concurrent-streams-per-outlet`. See §5.4.4 + §5.4.5.
-pub const CODE_TRANSPORT_FAULT: &str = "SCP-TOOL-6160"; // SCP-CODE-OK: §5.4.4 registry constant (Transport class)
+pub const CODE_TRANSPORT_FAULT: &str = "SCP-OUTLET-6160";
 
-/// `SCP-TOOL-6170` — Governance-class deregistration / suspension / ceiling.
+/// `SCP-OUTLET-6170` — Governance-class deregistration / suspension / ceiling.
 ///
 /// Default slug `governance.outlet-deregistered`. Slugs:
 /// `governance.outlet-deregistered`, `governance.outlet-suspended`,
 /// `governance.ceiling-exceeded`, `governance.consequence-active`.
 /// See §5.4.4.
-pub const CODE_GOVERNANCE_FAULT: &str = "SCP-TOOL-6170"; // SCP-CODE-OK: §5.4.4 registry constant (Governance class)
+pub const CODE_GOVERNANCE_FAULT: &str = "SCP-OUTLET-6170";
 
 /// All allocated codes in the §5.4.4 6100-6199 sub-block, in canonical order.
 ///
@@ -262,7 +263,7 @@ pub const SLUG_PROTOCOL_UNKNOWN_SESSION: &str = "protocol.unknown-session";
 /// Slug `protocol.context-closed-mid-stream` — round-8 context teardown.
 ///
 /// Context evict/leave race during an active stream. Shares
-/// [`CODE_PROTOCOL_SESSION`] (`SCP-TOOL-6101`) with the other
+/// [`CODE_PROTOCOL_SESSION`] (`SCP-OUTLET-6101`) with the other
 /// Protocol-session conditions; carries the Protocol class (NOT
 /// Authorization) so a context teardown is never recorded as a UCAN
 /// revocation. See §5.4.5 "Context teardown vs. revocation (round 8)".
@@ -272,7 +273,7 @@ pub const SLUG_PROTOCOL_CONTEXT_CLOSED_MID_STREAM: &str = "protocol.context-clos
 /// Surfaced when a control-plane method (`grant_credit`, `cancel`,
 /// `terminate`) is invoked against a stream that has already reached a
 /// terminal chunk (`End` / `Error{terminal:true}` / cancel-ack). Shares
-/// [`CODE_PROTOCOL_SESSION`] (`SCP-TOOL-6101`) with the other
+/// [`CODE_PROTOCOL_SESSION`] (`SCP-OUTLET-6101`) with the other
 /// Protocol-session-lifecycle conditions (`protocol.unknown-session`,
 /// `protocol.context-closed-mid-stream`) — a post-terminal control-plane
 /// call is a session-lifecycle violation, not an authorization failure,
@@ -365,7 +366,7 @@ pub const SLUG_EXECUTION_STREAM_GAP: &str = "execution.stream-gap";
 /// Slug `execution.stream-cap-exhausted` — round-8 pump ceiling.
 ///
 /// Node-level concurrent-pump ceiling. Shares [`CODE_EXECUTION_CREDIT`]
-/// (`SCP-TOOL-6131`) with the other Execution-class resource-exhaustion
+/// (`SCP-OUTLET-6131`) with the other Execution-class resource-exhaustion
 /// conditions; emitted at `OutletStreamOpen` acceptance when the
 /// per-instance pump ceiling (`max_concurrent_outlet_stream_pumps`) is
 /// already saturated. See §5.4.5 "Node-level concurrent-pump ceiling
@@ -482,10 +483,10 @@ pub fn validate_slug(slug: &str) -> Result<(), SlugError> {
 // Code → class
 // ---------------------------------------------------------------------------
 
-/// Returns the [`OutletErrorClass`] for an allocated `SCP-TOOL-NNNN` code.
+/// Returns the [`OutletErrorClass`] for an allocated `SCP-OUTLET-NNNN` code.
 ///
 /// Returns [`None`] for any reserved or out-of-sub-block code (e.g.,
-/// `SCP-TOOL-6180`, `SCP-TOOL-6111`, `SCP-TOOL-6099`, malformed input).
+/// `SCP-OUTLET-6180`, `SCP-OUTLET-6111`, `SCP-OUTLET-6099`, malformed input).
 #[must_use]
 pub fn error_code_to_class(code: &str) -> Option<OutletErrorClass> {
     match code {
@@ -734,12 +735,12 @@ mod tests {
         }
     }
 
-    /// AC: "an unallocated code (e.g. SCP-TOOL-6180) returns None from all
+    /// AC: "an unallocated code (e.g. SCP-OUTLET-6180) returns None from all
     /// three lookup functions."
     #[test]
     fn unallocated_codes_return_none_from_all_lookups() {
-        // SCP-TOOL-6180 is in the §5.4.4 reserved range 6180-6199.
-        let unallocated = "SCP-TOOL-6180"; // SCP-CODE-OK: §5.4.4 reserved-range fixture (6180-6199)
+        // SCP-OUTLET-6180 is in the §5.4.4 reserved range 6180-6199.
+        let unallocated = "SCP-OUTLET-6180";
         assert_eq!(error_code_to_class(unallocated), None);
         assert_eq!(error_code_to_default_slug(unallocated), None);
         assert_eq!(error_code_to_retry_policy(unallocated), None);
@@ -749,8 +750,10 @@ mod tests {
     #[test]
     fn reserved_range_6180_6199_has_zero_allocations() {
         for tail in 6180..=6199_u16 {
-            // SCP-CODE-OK: §5.4.4 reserved-range fixture (6180-6199)
-            let code = format!("SCP-TOOL-{tail}");
+            // §5.4.4 reserved-range fixture (6180-6199). The `{tail}`
+            // interpolation is not a literal code, so the range check does
+            // not scan it — no `SCP-CODE-OK:` marker needed.
+            let code = format!("SCP-OUTLET-{tail}");
             assert_eq!(
                 error_code_to_class(&code),
                 None,
@@ -776,15 +779,15 @@ mod tests {
         // 6111-6113, 6116-6119, 6132, 6134, 6136-6139, 6141-6149, 6151-6159,
         // 6161-6169, 6171-6179 are all reserved gaps within the sub-block.
         let reserved_in_block = [
-            "SCP-TOOL-6111", // SCP-CODE-OK: §5.4.4 reserved-gap fixture
-            "SCP-TOOL-6112", // SCP-CODE-OK: §5.4.4 reserved-gap fixture
-            "SCP-TOOL-6116", // SCP-CODE-OK: §5.4.4 reserved-gap fixture
-            "SCP-TOOL-6132", // SCP-CODE-OK: §5.4.4 reserved-gap fixture
-            "SCP-TOOL-6134", // SCP-CODE-OK: §5.4.4 reserved-gap fixture
-            "SCP-TOOL-6141", // SCP-CODE-OK: §5.4.4 reserved-gap fixture
-            "SCP-TOOL-6151", // SCP-CODE-OK: §5.4.4 reserved-gap fixture
-            "SCP-TOOL-6161", // SCP-CODE-OK: §5.4.4 reserved-gap fixture
-            "SCP-TOOL-6171", // SCP-CODE-OK: §5.4.4 reserved-gap fixture
+            "SCP-OUTLET-6111",
+            "SCP-OUTLET-6112",
+            "SCP-OUTLET-6116",
+            "SCP-OUTLET-6132",
+            "SCP-OUTLET-6134",
+            "SCP-OUTLET-6141",
+            "SCP-OUTLET-6151",
+            "SCP-OUTLET-6161",
+            "SCP-OUTLET-6171",
         ];
         for code in reserved_in_block {
             assert_eq!(error_code_to_class(code), None);
@@ -798,13 +801,13 @@ mod tests {
     #[test]
     fn out_of_block_codes_return_none() {
         let candidates = [
-            "SCP-TOOL-6099",  // SCP-CODE-OK: out-of-sub-block fixture (below 6100)
-            "SCP-TOOL-6200",  // SCP-CODE-OK: out-of-sub-block fixture (above 6199)
-            "SCP-TOOL-7000",  // SCP-CODE-OK: out-of-sub-block fixture (other range)
-            "SCP-IDENT-1001", // SCP-CODE-OK: cross-prefix fixture (not Outlet)
-            "scp-tool-6110",  // SCP-CODE-OK: lowercase fixture (canonical prefix is uppercase)
+            "SCP-OUTLET-6099",
+            "SCP-OUTLET-6200",
+            "SCP-OUTLET-7000", // SCP-CODE-OK: out-of-sub-block fixture (other range)
+            "SCP-IDENT-1001",
+            "scp-outlet-6110", // lowercase fixture (canonical prefix is uppercase)
             "",
-            "SCP-TOOL-",
+            "SCP-OUTLET-",
         ];
         for code in candidates {
             assert_eq!(
@@ -825,7 +828,7 @@ mod tests {
     /// receiver still sees `authorization.denied` for the
     /// `AmplificationViolation` collapse since they don't hold both stems).
     /// Only when both stems are held does the slug differentiate. The code
-    /// stays `SCP-TOOL-6110` across all three.
+    /// stays `SCP-OUTLET-6110` across all three.
     #[test]
     fn oracle_collapse_returns_same_code_different_slugs() {
         // Caller holds neither stem: collapse hides distinguishability.
@@ -839,7 +842,7 @@ mod tests {
         assert_eq!(code_neither, CODE_AUTHORIZATION_DENIED);
         assert_eq!(code_one, CODE_AUTHORIZATION_DENIED);
         assert_eq!(code_both, CODE_AUTHORIZATION_DENIED);
-        // All three carry SCP-TOOL-6110 — the oracle-collapse property.
+        // All three carry SCP-OUTLET-6110 — the oracle-collapse property.
         assert_eq!(code_neither, code_one);
         assert_eq!(code_one, code_both);
 
@@ -1142,7 +1145,7 @@ mod tests {
         // `protocol.stream-already-closed` is the stream-lifecycle guard
         // raised when a control-plane method runs after the stream reached
         // a terminal chunk. It shares the Protocol-session code band
-        // (SCP-TOOL-6101) with `protocol.unknown-session` and
+        // (SCP-OUTLET-6101) with `protocol.unknown-session` and
         // `protocol.context-closed-mid-stream` — a post-terminal call is a
         // session-lifecycle violation, NOT an authorization failure, so it
         // must resolve to the Protocol class and pass the §5.4.4 regex.
@@ -1295,7 +1298,7 @@ mod tests {
         // Every entry is in the §5.4.4 6100-6199 sub-block.
         for code in ALL_CODES {
             assert!(
-                code.starts_with("SCP-TOOL-61"), // SCP-CODE-OK: prefix self-check (validator self-reference, §5.4.4 6100-6199)
+                code.starts_with("SCP-OUTLET-61"), // SCP-CODE-OK: prefix self-check (validator self-reference, §5.4.4 6100-6199)
                 "code {code} not in §5.4.4 6100-6199 sub-block"
             );
             // Numeric-tail extraction: must parse as 4 digits in [6100, 6199].

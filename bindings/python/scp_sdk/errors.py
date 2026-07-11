@@ -91,7 +91,7 @@ class TransportError(ScpError):
 class OutletError(ScpError):
     """Outlet registration, invocation, or verification failure."""
 
-    _default_code: str = "SCP-TOOL-6000"
+    _default_code: str = "SCP-OUTLET-6000"
 
 
 class ValidationError(ScpError):

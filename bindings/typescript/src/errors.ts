@@ -14,7 +14,7 @@
  * | `SCP-PERM-`     | 3000-3999   | Permission errors   |
  * | `SCP-CRYPTO-`   | 4000-4999   | Crypto errors       |
  * | `SCP-TRANS-`    | 5000-5999   | Transport errors    |
- * | `SCP-TOOL-`     | 6000-6999   | Outlet errors         |
+ * | `SCP-OUTLET-`     | 6000-6999   | Outlet errors         |
  * | `SCP-VALID-`    | 7000-7999   | Validation errors   |
  * | `SCP-STORAGE-`  | 8000-8999   | Storage errors      |
  * | `SCP-ATTEST-`   | 9000-9999   | Attestation errors  |
@@ -246,7 +246,7 @@ const ERROR_PREFIX_MAP: ReadonlyArray<readonly [string, ScpErrorConstructor]> = 
   ["SCP-PERM-", UcanPermissionError],
   ["SCP-CRYPTO-", CryptoError],
   ["SCP-TRANS-", TransportError],
-  ["SCP-TOOL-", OutletError],
+  ["SCP-OUTLET-", OutletError],
   ["SCP-VALID-", ValidationError],
   ["SCP-STORAGE-", StorageError],
   ["SCP-ATTEST-", AttestationError],

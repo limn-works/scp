@@ -440,7 +440,7 @@ impl From<scp_identity::IdentityError> for ScpPyError {
 /// `ContextManager::invoke_outlet_with_economy` and several other paths
 /// surface category-specific error codes inside `PermissionDenied(String)`
 /// (e.g. `"SCP-ECON-12010: budget exceeded for ..."`,
-/// `"SCP-TOOL-6080: context not active: ..."`). Without this parser the
+/// `"SCP-OUTLET-6080: context not active: ..."`). Without this parser the
 /// bridge would bucket every such error under the generic `SCP-CTX-2001`
 /// envelope and Python callers would have to string-match the message
 /// body. This helper preserves the existing typed-envelope contract by

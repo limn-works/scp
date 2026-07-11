@@ -188,7 +188,7 @@ final class OutletSagaTests: XCTestCase {
     }
 
     /// Non-UTF-8 input is rejected at the wrapper boundary with
-    /// `ScpError.Outlet` `SCP-TOOL-6001` (mirrors the sibling's UTF-8 guard).
+    /// `ScpError.Outlet` `SCP-OUTLET-6001` (mirrors the sibling's UTF-8 guard).
     func testSagaRejectsNonUtf8Input() async throws {
         let identity = try await scp.identityCreate(custody: "in_memory")
         let source = try await makeContext(identity: identity)
@@ -210,7 +210,7 @@ final class OutletSagaTests: XCTestCase {
             )
             XCTFail("expected ScpError.Outlet for non-UTF-8 input")
         } catch let ScpError.Outlet(_, code) {
-            XCTAssertEqual(code, "SCP-TOOL-6001")
+            XCTAssertEqual(code, "SCP-OUTLET-6001")
         }
     }
 
@@ -253,7 +253,7 @@ final class OutletSagaTests: XCTestCase {
         } catch let ScpError.Context(_, code) {
             XCTAssertNotEqual(code, "SCP-CTX-2001", "must forward past the source-active guard")
         } catch let ScpError.Outlet(_, code) {
-            XCTAssertNotEqual(code, "SCP-TOOL-6001", "must forward past the UTF-8 guard")
+            XCTAssertNotEqual(code, "SCP-OUTLET-6001", "must forward past the UTF-8 guard")
         } catch {
             // Any other ScpError (e.g. a typed Saga* terminal or a
             // supervisor-side rejection) means the call reached the real

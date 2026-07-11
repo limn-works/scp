@@ -392,7 +392,7 @@ pub enum ChunkPayload {
     },
     /// Error chunk. `terminal: true` closes the stream.
     Error {
-        /// `SCP-TOOL-NNNN` error code (§5.4.4).
+        /// `SCP-OUTLET-NNNN` error code (§5.4.4).
         code: String,
         /// Operator-supplied human message (typically the catalog
         /// template — see SCP-OUT-040).
@@ -854,7 +854,7 @@ pub fn verify_cancel_signature(
 ///
 /// On the wire this is an externally-tagged enum: `Ok` and `Cancelled`
 /// serialize as bare strings (`"Ok"`, `"Cancelled"`), and `Error(code)`
-/// serializes as a single-key object `{"Error":"SCP-TOOL-NNNN"}`. The
+/// serializes as a single-key object `{"Error":"SCP-OUTLET-NNNN"}`. The
 /// `OutletInvokedEvent` field that carries this value uses the same
 /// serde representation across all four FFI bridges (`PyO3` / NAPI /
 /// `UniFFI` / WASM).
@@ -864,7 +864,7 @@ pub enum StreamTerminalStatus {
     Ok,
     /// Stream terminated with [`ChunkPayload::Error`] or with a
     /// runtime-forced terminal chunk. The wrapped string is the
-    /// `code` carried by the terminal chunk (e.g., `SCP-TOOL-6130`).
+    /// `code` carried by the terminal chunk (e.g., `SCP-OUTLET-6130`).
     Error(String),
     /// Stream was cancelled (the cancel-ack chunk closed it).
     Cancelled,
@@ -889,19 +889,19 @@ pub enum StreamTerminalStatus {
 /// Spec §5.4.5 defines exactly three framework-side termination causes:
 ///
 /// - "Revocation re-check cadence (receiver-side)" → [`RevokedMidStream`]
-///   (slug `authorization.revoked-mid-stream`, code `SCP-TOOL-6110`). The
+///   (slug `authorization.revoked-mid-stream`, code `SCP-OUTLET-6110`). The
 ///   receiver-side SDK framework periodic UCAN re-check observes the
 ///   opening token revoked since stream open and force-closes within
 ///   `stream_ucan_recheck_secs`.
 /// - "Cancellation and billing boundary" → [`CancelAckTimeout`] (slug
-///   `execution.cancel-ack-timeout`, code `SCP-TOOL-6135`). The executor
+///   `execution.cancel-ack-timeout`, code `SCP-OUTLET-6135`). The executor
 ///   failed to emit a terminal chunk within `stream_cancel_ack_secs`
 ///   after `OutletCancel` arrival.
 /// - Credit-stall timer → [`CreditStall`] (slug `execution.credit-stall`,
-///   code `SCP-TOOL-6133`). The credit window remained at zero past
+///   code `SCP-OUTLET-6133`). The credit window remained at zero past
 ///   `stream_credit_stall_secs` and no fresh grant arrived.
 /// - Context teardown (round 8) → [`ContextClosedMidStream`] (slug
-///   `protocol.context-closed-mid-stream`, code `SCP-TOOL-6101`,
+///   `protocol.context-closed-mid-stream`, code `SCP-OUTLET-6101`,
 ///   Protocol class). The hosting context was closed or the operator
 ///   was evicted/left while the stream was active. Distinct from
 ///   [`RevokedMidStream`] (Authorization class) — the invoker's UCAN
@@ -925,21 +925,21 @@ pub enum StreamTerminalStatus {
 /// [`ContextClosedMidStream`]: Self::ContextClosedMidStream
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TerminateReason {
-    /// `authorization.revoked-mid-stream` / `SCP-TOOL-6110` — UCAN
+    /// `authorization.revoked-mid-stream` / `SCP-OUTLET-6110` — UCAN
     /// revocation re-check observed the opening token revoked since
     /// stream open. The receiver-side SDK framework drives this path
     /// via the periodic re-check loop.
     RevokedMidStream,
-    /// `execution.cancel-ack-timeout` / `SCP-TOOL-6135` — executor failed
+    /// `execution.cancel-ack-timeout` / `SCP-OUTLET-6135` — executor failed
     /// to emit a terminal chunk within `stream_cancel_ack_secs` after
     /// `OutletCancel` arrival. The framework forces the stream closed
     /// at the next-to-emit sequence (§5.4.5 cancel-ack timer).
     CancelAckTimeout,
-    /// `execution.credit-stall` / `SCP-TOOL-6133` — credit window
+    /// `execution.credit-stall` / `SCP-OUTLET-6133` — credit window
     /// remained at zero past `stream_credit_stall_secs` and no fresh
     /// grant arrived. The framework forces the stream closed.
     CreditStall,
-    /// `protocol.context-closed-mid-stream` / `SCP-TOOL-6101`
+    /// `protocol.context-closed-mid-stream` / `SCP-OUTLET-6101`
     /// (Protocol class) — the hosting context was closed or the
     /// operator was evicted/left while the stream was active (round 8).
     /// Distinct from [`Self::RevokedMidStream`]: the invoker's UCAN was
@@ -947,7 +947,7 @@ pub enum TerminateReason {
     /// precedence over revocation when both are observable in the same
     /// re-check tick.
     ContextClosedMidStream,
-    /// `execution.credit-exhausted` / `SCP-TOOL-6131` (Execution class)
+    /// `execution.credit-exhausted` / `SCP-OUTLET-6131` (Execution class)
     /// — the §5.4.5:758 HARD cumulative billable-chunk ceiling
     /// (`min(credit_window, max_calls)`) was reached. The framework
     /// terminates the stream because no further billable chunk may flow
@@ -977,7 +977,7 @@ impl TerminateReason {
         }
     }
 
-    /// Returns the §5.4.4 `SCP-TOOL-NNNN` code for this termination
+    /// Returns the §5.4.4 `SCP-OUTLET-NNNN` code for this termination
     /// cause. Static; never caller-derived.
     #[must_use]
     pub const fn code(&self) -> &'static str {
@@ -1206,7 +1206,7 @@ pub struct SessionState<'a> {
 /// [`evaluate_revocation_recheck`].
 ///
 /// Each variant carries the §5.4.4 `OutletErrorClass`, allocated code
-/// (`SCP-TOOL-NNNN`), and slug — enough for the runtime to construct the
+/// (`SCP-OUTLET-NNNN`), and slug — enough for the runtime to construct the
 /// wire `OutletError` envelope and for SDK adapters to surface the
 /// failure in their idiomatic typed-error tree.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -1256,7 +1256,7 @@ impl StreamRejection {
         }
     }
 
-    /// Returns the allocated `SCP-TOOL-NNNN` code (§5.4.4 / SCP-OUT-025).
+    /// Returns the allocated `SCP-OUTLET-NNNN` code (§5.4.4 / SCP-OUT-025).
     #[must_use]
     pub const fn code(&self) -> &'static str {
         match self {
@@ -1619,7 +1619,7 @@ mod tests {
     fn chunk_payload_is_terminal_error_terminal_only() {
         assert!(
             ChunkPayload::Error {
-                code: "SCP-TOOL-6130".into(),
+                code: "SCP-OUTLET-6130".into(),
                 message: "panic".into(),
                 terminal: true,
             }
@@ -1627,7 +1627,7 @@ mod tests {
         );
         assert!(
             !ChunkPayload::Error {
-                code: "SCP-TOOL-6130".into(),
+                code: "SCP-OUTLET-6130".into(),
                 message: "warn".into(),
                 terminal: false,
             }
@@ -1642,7 +1642,7 @@ mod tests {
     #[test]
     fn stream_terminal_status_three_variants() {
         let _ = StreamTerminalStatus::Ok;
-        let _ = StreamTerminalStatus::Error("SCP-TOOL-6130".into());
+        let _ = StreamTerminalStatus::Error("SCP-OUTLET-6130".into());
         let _ = StreamTerminalStatus::Cancelled;
     }
 
@@ -1650,7 +1650,7 @@ mod tests {
     fn stream_terminal_status_serde_roundtrip() {
         let cases = [
             StreamTerminalStatus::Ok,
-            StreamTerminalStatus::Error("SCP-TOOL-6135".into()),
+            StreamTerminalStatus::Error("SCP-OUTLET-6135".into()),
             StreamTerminalStatus::Cancelled,
         ];
         for status in cases {
@@ -2269,7 +2269,7 @@ mod tests {
     #[test]
     fn chunk_payload_type_first_error() {
         let p = ChunkPayload::Error {
-            code: "SCP-TOOL-6130".into(),
+            code: "SCP-OUTLET-6130".into(),
             message: "x".into(),
             terminal: true,
         };
@@ -2324,7 +2324,7 @@ mod tests {
         // Error with body keys 'code', 'message', 'terminal' — 'c' is
         // close to 'a'.
         let p_e = ChunkPayload::Error {
-            code: "SCP-TOOL-6130".into(),
+            code: "SCP-OUTLET-6130".into(),
             message: "x".into(),
             terminal: false,
         };
@@ -2637,7 +2637,7 @@ mod tests {
         );
     }
 
-    /// Each `TerminateReason` variant maps to the `SCP-TOOL-NNNN` code
+    /// Each `TerminateReason` variant maps to the `SCP-OUTLET-NNNN` code
     /// allocated to its §5.4.4 class. Same regression-pinning rationale
     /// as the slug test.
     #[test]

@@ -132,7 +132,7 @@ class TestExceptionSubclasses:
         assert isinstance(err, ScpError)
 
     def test_outlet_error_default_code(self) -> None:
-        assert OutletError("x").code == "SCP-TOOL-6000"
+        assert OutletError("x").code == "SCP-OUTLET-6000"
 
     def test_validation_error_is_scp_error(self) -> None:
         err = ValidationError("schema mismatch")
