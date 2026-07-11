@@ -382,7 +382,7 @@ fn kat_events() -> Vec<Event> {
                 app_did: "did:key:app".to_owned(),
                 app_name: "Scheduler".to_owned(),
                 app_version: "1.0.0".to_owned(),
-                capabilities: vec!["tool:invoke:*".to_owned()],
+                capabilities: vec!["outlet:call:*".to_owned()],
             }),
         ),
         (
