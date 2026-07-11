@@ -8,7 +8,7 @@ The PyO3 FFI bridge (`crates/scp-ffi/src/runtime.rs`) uses process-global static
 
 ## Affected Statics
 
-- `CONTEXT_REGISTRY` — maps context IDs to `ContextRuntime` (tool registries, event logs, role state, UCAN state)
+- `CONTEXT_REGISTRY` — maps context IDs to `ContextRuntime` (outlet registries, event logs, role state, UCAN state)
 - `KNOWN_CONTEXTS` — maps context IDs to `KnownContext` (routing IDs, relay URLs, member DIDs)
 - `RELAY_CONNECTION` — single shared relay adapter
 - `IDENTITY_ROUTING_SECRETS` (inside `get_or_create_routing_secret`) — maps identity DIDs to 32-byte secrets

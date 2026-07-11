@@ -165,13 +165,13 @@ SCP.Context.create(
   creator: Identity,
   template: .bilateralEphemeral     // messages only, ephemeral, TTL required
           | .bilateralPersistent    // messages only, full memory, no TTL
-          | .coordination           // messages + tools, summary memory, TTL required
+          | .coordination           // messages + outlets, summary memory, TTL required
           | .groupDiscussion        // messages + invite, full memory, optional TTL
           | .publicBroadcast        // broadcast mode, auto-granted subscriber reads, optional TTL
           | .gatedBroadcast,        // broadcast mode, admin-issued subscriber reads, optional TTL
   peer: DID?,                       // for bilateral templates — handles invitation internally
   ttl: Duration?,                   // required for some templates, optional for others
-  tools: [ToolDefinition]?          // only for templates that allow tools (coordination)
+  outlets: [OutletDefinition]?      // only for templates that allow outlets (coordination)
 ) → Context { contextID, creatorDID, templateID, ceiling, roles, governance, ttl?, memoryScope }
 ```
 
@@ -188,7 +188,7 @@ SCP.Context.create(
             | .multiSig(threshold: Int, admins: [DID])
             | .consensus
             | .custom(GovernanceModel),
-  tools: [ToolDefinition],
+  outlets: [OutletDefinition],
   roles: {
     "admin":    [Capability],
     "member":   [Capability],
@@ -237,13 +237,13 @@ SCP.Context.createChild(
   roles: { ... },
   ttl: Duration?,                  // must be ≤ minimum parent TTL (if parents have TTLs)
   memoryScope: MemoryScope,
-  tools: [ToolDefinition]?,
+  outlets: [OutletDefinition]?,
   parentGovernanceConfig: {        // per parent — what authority each parent retains
     [contextID]: ParentGovernanceConfig {
       canCloseChild: Bool,
       canEvictMembers: Bool,
       canRestrictCeiling: Bool,
-      requiresApprovalFor: [.governanceChange | .toolRegistration | .ceilingChange | .membershipChange],
+      requiresApprovalFor: [.governanceChange | .outletRegistration | .ceilingChange | .membershipChange],
       onSever: .evictUniqueMembers | .cascadeClose | .preserveMembership
     }
   }
@@ -290,7 +290,7 @@ SCP.Context.setAutoAcceptPolicy(
 
 **No default:** absent an explicit, human-configured `AutoAcceptPolicy`, every invitation prompts the human (default-deny).
 
-**Hard rule (non-overridable):** Auto-accept never applies to contexts with tool capabilities in the ceiling. Tool access always requires explicit confirmation.
+**Hard rule (non-overridable):** Auto-accept never applies to contexts with outlet capabilities in the ceiling. Outlet access always requires explicit confirmation.
 
 ### Inspect (before opt-in)
 
@@ -312,8 +312,8 @@ SCP.Context.inspect(
   age: Date,
   ttl: Duration?,                  // time-to-live if set (§5.10)
   memoryScope: MemoryScope,        // ephemeral, summary, or full (§5.11)
-  tools: [ToolMetadata],          // name, description, input/output schema
-  toolInterfaceCount: { inbound: Int, outbound: Int },  // active cross-context interfaces (§6.2)
+  outlets: [OutletMetadata],      // name, description, input/output schema
+  outletInterfaceCount: { inbound: Int, outbound: Int },  // active cross-context interfaces (§6.2)
   bridges: [BridgeInfo]?,         // active bridge connectors, if any
   // For child contexts (§5.13):
   parents: [{
@@ -404,11 +404,11 @@ Stream incoming messages and events from a context. The stream stays open as lon
 SCP.Context.receive(
   context: contextID,
   as: Identity,
-  filter: .all | .messages | .events | .toolResults
+  filter: .all | .messages | .events | .outletResults
 ) → AsyncStream<ContextEvent> {
   message: Message?,
   event: ProtocolEvent?,
-  toolResult: ToolResult?
+  outletResult: OutletResult?
 }
 ```
 
@@ -567,15 +567,15 @@ agent.send(
   attachments: [Attachment]?
 ) → MessageReceipt
 
-// Invoke a context tool
+// Invoke a context outlet
 agent.invoke(
-  tool: "recipe_assistant",
+  outlet: "recipe_assistant",
   input: { "query": "butter substitute" }
-) → ToolResult
+) → OutletResult
 
 // Read context state
 agent.read(
-  resource: .members | .messages(since:) | .toolList | .metadata
+  resource: .members | .messages(since:) | .outletList | .metadata
          | .eventLog(since:)       // verifiable event history
          | .behavioralRecord(did:) // behavioral facts for a member
 ) → Resource
@@ -603,14 +603,14 @@ SCP.Agent.challenge(
 
 ---
 
-## 4. Tools (within a context)
+## 4. Outlets (within a context)
 
 ### Define
 
-Tools are stateless functions. Registered at context creation or added by admin. MCP-compatible schemas.
+Outlets are stateless functions. Registered at context creation or added by admin. MCP-compatible schemas.
 
 ```
-SCP.Tool.define(
+SCP.Outlet.define(
   name: "recipe_assistant",
   description: "Answers cooking questions",
   input: JSONSchema {              // MCP-compatible
@@ -628,32 +628,32 @@ SCP.Tool.define(
     input: { query: "Is butter dairy?" },
     expectedOutput: { answer: "Yes, butter is a dairy product.", sources: [] }
   }],
-  operator: DID                    // who's accountable for this tool
+  operator: DID                    // who's accountable for this outlet
 )
 ```
 
 ### Invoke
 
 ```
-SCP.Tool.invoke(
+SCP.Outlet.invoke(
   context: contextID,
   agent: agentID,                  // who's calling (validated against role)
-  tool: "recipe_assistant",
+  outlet: "recipe_assistant",
   input: { query: "butter substitute" }
-) → ToolResult { output, provenance }
+) → OutletResult { output, provenance }
 ```
 
 Provenance is attached automatically: which context, which agent invoked, timestamp.
 
-### Verify Tool Integrity (§7.3.3)
+### Verify Outlet Integrity (§7.3.3)
 
-Any agent can test a tool against its registered test vectors at any time.
+Any agent can test an outlet against its registered test vectors at any time.
 
 ```
-SCP.Tool.verify(
+SCP.Outlet.verify(
   context: contextID,
-  tool: "recipe_assistant"
-) → ToolVerification {
+  outlet: "recipe_assistant"
+) → OutletVerification {
   allTestsPassed: Bool,
   testsRun: Int,
   testsPassed: Int,
@@ -665,13 +665,13 @@ SCP.Tool.verify(
 
 ### Update
 
-Update a tool's registration (schema, description, test vectors, implementation hash). Records the change in the context event log.
+Update an outlet's registration (schema, description, test vectors, implementation hash). Records the change in the context event log.
 
 ```
-SCP.Tool.update(
+SCP.Outlet.update(
   context: contextID,
   agent: agentID,
-  tool: "recipe_assistant",
+  outlet: "recipe_assistant",
   changes: {
     description: String?,
     input: JSONSchema?,
@@ -694,7 +694,7 @@ Both contexts opt in. Calls carry provenance including chain depth. Schema const
 
 ```
 // Context A exposes a tool to Context B
-SCP.ToolInterface.expose(
+SCP.OutletInterface.expose(
   from: contextA,
   tool: "ingredient_database",
   to: contextB,
@@ -702,11 +702,11 @@ SCP.ToolInterface.expose(
 ) → InterfaceID
 
 // Context B invokes it
-SCP.ToolInterface.call(
+SCP.OutletInterface.call(
   interface: interfaceID,
   agent: agentInContextB,          // must have permission in B to use interfaces
   input: { search: "miso paste" }
-) → ToolResult {
+) → OutletResult {
   output,
   provenance: DataProvenance {
     sourceContext: contextA,
@@ -717,12 +717,12 @@ SCP.ToolInterface.call(
 }
 
 // Stateful sessions (§6.2.1) — optional multi-turn interactions
-SCP.ToolInterface.call(
+SCP.OutletInterface.call(
   interface: interfaceID,
   agent: agentInContextB,
   sessionID: "sched:abc123"?,      // continue existing session (opaque to caller)
   input: { action: "propose", times: ["Tue 3pm"] }
-) → ToolResult {
+) → OutletResult {
   output: { sessionID: "sched:abc123", status: "pending" },
   provenance: DataProvenance { ... }
 }
@@ -734,7 +734,7 @@ SCP.ToolInterface.call(
 Either side can revoke a cross-context tool interface. Revocation is a governance action — it requires admin role or governance approval in the revoking context. Active sessions on the interface are terminated. Revocation is recorded in the event logs of both contexts.
 
 ```
-SCP.ToolInterface.revoke(
+SCP.OutletInterface.revoke(
   interface: InterfaceID,
   as: Identity,                      // must have admin role or governance authority
   reason: String?                    // recorded in event log
@@ -747,7 +747,7 @@ SCP.ToolInterface.revoke(
 }
 ```
 
-Revocation is permanent for the given `InterfaceID`. To re-establish the interface, a new `SCP.ToolInterface.expose()` call is required, producing a new `InterfaceID`. Both contexts must opt in again.
+Revocation is permanent for the given `InterfaceID`. To re-establish the interface, a new `SCP.OutletInterface.expose()` call is required, producing a new `InterfaceID`. Both contexts must opt in again.
 
 **Two cross-context mechanisms** (§6.1). Tool interfaces are asymmetric (caller/tool). Multi-parent child contexts (§5.13) are symmetric — a shared space where members from different parent contexts interact as peers. Use tool interfaces for service calls; use multi-parent children for collaboration.
 
@@ -897,7 +897,7 @@ Context settings changes go through governance.
 SCP.Governance.propose(
   context: contextID,
   proposer: agentID,
-  change: .addTool(ToolDefinition)
+  change: .addTool(OutletDefinition)
         | .removeTool(toolName)
         | .modifyRole(name, [Capability])
         | .addRole(name, [Capability])
@@ -1240,7 +1240,7 @@ Blocking and removal are distinct operations sharing the same cryptographic infr
 // Alice's quest context wants access to it
 
 // 1. Cooking school exposes their tool
-let interface = try await SCP.ToolInterface.expose(
+let interface = try await SCP.OutletInterface.expose(
   from: cookingSchoolContext,
   tool: "recipe_database",
   to: aliceQuestContext,
@@ -1248,7 +1248,7 @@ let interface = try await SCP.ToolInterface.expose(
 )
 
 // 2. Alice's agent in her quest can now query it
-let recipes = try await SCP.ToolInterface.call(
+let recipes = try await SCP.OutletInterface.call(
   interface: interface.id,
   agent: alice.agentInQuest,
   input: { search: "green curry", difficulty: "beginner" }
@@ -1525,11 +1525,11 @@ Provenance is attached automatically by the protocol when data crosses context b
 
 ```
 // Cross-context tool call carries provenance automatically
-let result = try await SCP.ToolInterface.call(
+let result = try await SCP.OutletInterface.call(
   interface: interfaceID,
   agent: agentInContextB,
   input: { search: "miso paste" }
-) → ToolResult {
+) → OutletResult {
   output: { ... },
   provenance: DataProvenance {
     sourceContext: contextA,
