@@ -292,6 +292,56 @@ The underscore in the wire form is deliberate: UCAN resource strings historicall
 
 A shared operator-signed relay-hosted Query result cache was drafted during the outlet redesign but pulled from initial scope before merge. Concrete design questions blocked it — relay-side authentication and authorization boundaries for cache reads (the cache must be membership-gated but relays are not membership-aware); interaction with per-member pseudonym routing (§9.10.4), which prevents the relay from grouping hits on a single routing ID without leaking subscribership; and the billing semantics of a paid Query operator serving an unbounded cached audience. Until the cache ships, §5.4.2 marks Query as "cacheable" as a semantic property of the kind, not as a claim that a cache exists; every Query invocation executes live. Implementations MUST NOT silently add a cache layer — a cache-like optimization that is not specified here is a protocol divergence, because it changes what the outlet-invocation event records and what the operator signs for.
 
+### 5.4.4 Outlet Error Taxonomy
+
+Every outlet failure — at registration, authorization, input validation, execution, output validation, billing, transport, or governance — surfaces as a single typed envelope, the `OutletError`. The taxonomy is deliberately **compact**: a small, fixed set of numeric codes carries the machine-actionable class of failure, and a dot-separated **slug** carries the fine-grained distinction. New failure conditions are minted as new slugs under an existing code, not as new codes. This keeps the code space bounded and stable across protocol rounds while still letting operators and SDKs disambiguate to the exact condition.
+
+> **Provenance note.** This section documents the error registry the reference implementation ships in `crates/scp-protocol/src/context/outlets/error_codes.rs` and the envelope in `outlets/errors.rs`. It was authored to describe the shipped behavior faithfully; where §5.4.2 already names conditions (`query-cost-violation`, `query-violation`, `amplification-violation`), those names are the Protocol/Authorization-class slugs defined here.
+
+**Error classes.** Every `OutletError` carries exactly one of **eight** root classes (`OutletErrorClass`). The class is the coarse routing key; SDKs render it as a sealed type (Python subclass tree, TypeScript tagged union, Swift `enum`, Kotlin sealed class). On the wire the class is the lowercase variant name (`"protocol"`, `"authorization"`, …). Each class owns a contiguous decimal code sub-range inside the `SCP-TOOL-6100..6199` block:
+
+| Class | Code range | Meaning |
+|-------|-----------|---------|
+| `Protocol` | `6100..6109` | Registration, validation, classification, session-lifecycle violations. |
+| `Authorization` | `6110..6119` | UCAN / caveat / capability / attenuation / amplification denials. |
+| `Input` | `6120..6129` | Input schema, size, type, range violations. |
+| `Execution` | `6130..6139` | Handler panic, timeout, non-determinism, credit/stream exhaustion, cancel-ack timeout. |
+| `Output` | `6140..6149` | Output schema, size, serialization violations. |
+| `Economic` | `6150..6159` | Budget, insufficient funds, adapter failure, pricing, escrow overflow. |
+| `Transport` | `6160..6169` | Relay unavailable, cross-context bridge failure, rate limiting, concurrency caps. |
+| `Governance` | `6170..6179` | Deregistration, suspension, ceiling exceeded, active consequence. |
+
+**The compact code registry.** Only fourteen codes are allocated across the `6100..6199` sub-block — the design target is "compact," roughly one to two codes per class. Every allocated code has a class, a canonical **default slug**, and a default retry policy:
+
+| Code | Class | Default slug | Default retry |
+|------|-------|--------------|---------------|
+| `SCP-TOOL-6100` | `Protocol` | `protocol.violation` | Never |
+| `SCP-TOOL-6101` | `Protocol` | `protocol.session-id-conflict` | Never |
+| `SCP-TOOL-6110` | `Authorization` | `authorization.denied` | Never |
+| `SCP-TOOL-6114` | `Authorization` | `attenuation.mask-width-violation` | Never |
+| `SCP-TOOL-6115` | `Authorization` | `authorization.salt-rotation-unjustified` | Never |
+| `SCP-TOOL-6120` | `Input` | `input.schema-violation` | Never |
+| `SCP-TOOL-6130` | `Execution` | `execution.handler-panic` | Never |
+| `SCP-TOOL-6131` | `Execution` | `execution.credit-exhausted` | Immediate |
+| `SCP-TOOL-6133` | `Execution` | `execution.credit-stall` | Backoff 1s..30s |
+| `SCP-TOOL-6135` | `Execution` | `execution.cancel-ack-timeout` | Never |
+| `SCP-TOOL-6140` | `Output` | `output.schema-violation` | Never |
+| `SCP-TOOL-6150` | `Economic` | `economic.insufficient-funds` | Never |
+| `SCP-TOOL-6160` | `Transport` | `transport.relay-unavailable` | Backoff 1s..30s |
+| `SCP-TOOL-6170` | `Governance` | `governance.outlet-deregistered` | Never |
+
+Every other code in `6100..6199` — the intra-class gaps (`6111`, `6132`, …) and the reserved tail `6180..6199` — is **unallocated**. The registry lookups (`error_code_to_class`, `error_code_to_default_slug`, `error_code_to_retry_policy`) return "none" for any unallocated or out-of-sub-block code. Reserving the gaps lets future conditions that genuinely need a distinct *code* (rather than a new slug under an existing code) take a stable number without renumbering.
+
+**Slugs.** The slug is the fine-grained condition name. It MUST match the regex `^[a-z][a-z0-9-]{0,63}(\.[a-z][a-z0-9-]{0,63})*$` — lowercase ASCII, dot-separated, each segment 1–64 characters and starting with a letter. Multi-segment slugs are normal (`transport.concurrent-streams-per-invoker`, `attenuation.mask-width-violation`). A slug's leading segment is normally the lowercased class name (`authorization.*` under `Authorization`, `execution.*` under `Execution`), so a slug maps deterministically back to its class via `slug_to_class`. Multiple slugs share one code: e.g. `SCP-TOOL-6110` covers `authorization.denied`, `authorization.expired`, `authorization.revoked`, `authorization.missing`, `authorization.attenuation-violation`, and the caveat-enforcement slugs (`authorization.mint-limit-exceeded`, `authorization.time-box-violation`, `authorization.rate-exceeded`, `authorization.cumulative-exceeded`, `authorization.adapter-not-allowed`), while the distinct attenuation-invariant failures (`attenuation.*`) get their own code `SCP-TOOL-6114` so operators can filter them apart from the catch-all denial.
+
+**Cross-class slug (exception).** `protocol.interface-spam-cost` carries a `protocol.` prefix but maps to the **`Economic`** class (code `SCP-TOOL-6150`): the failure is an economic one (the §6.2.0.1 quadratic anti-spam fee was insufficient), but the *rule* that sets the fee lives at the protocol layer, so the slug keeps the rule's home for searchability while the class records the true semantics. It is the single slug whose leading segment does not equal its class name.
+
+**Query-oracle collapse (`authorization.denied`).** Code `SCP-TOOL-6110` with slug `authorization.denied` is the deliberate collapse target for the query-oracle protection. A caller that lacks the disambiguating capability stem on a target outlet receives exactly this `(code, slug)` pair regardless of whether the outlet is registered, deregistered, or has never existed — the error is identical across all three, so a probing caller cannot use error variation to enumerate which outlets exist. Only a caller holding the requisite stems ever sees a differentiated slug (e.g. `authorization.attenuation-violation`). The *code* stays `SCP-TOOL-6110` in every case; only the slug varies, and only for callers already authorized to see the distinction.
+
+**Retry guidance.** Every envelope carries a `RetryPolicy` (`Never`, `Immediate`, `After{delay}`, `WithBackoff{min,max}`) so a caller can decide to retry without re-classifying the error. Deterministic rejections (Protocol, Authorization, Input, Output, Economic, Governance, and broken-handler Execution faults) default to `Never` — retrying the same request reproduces the error. Idempotent credit exhaustion (`SCP-TOOL-6131`) defaults to `Immediate` (the framework refreshes credits). Back-pressure conditions — credit-stall (`SCP-TOOL-6133`) and transport faults (`SCP-TOOL-6160`) — default to `WithBackoff` over `1s..30s`. Receivers MAY override the default from contextual signals (e.g. a `transport.rate-limited` envelope carrying a `retry_after_secs` hint).
+
+**Envelope wire form.** The `OutletError` serializes as a `MessagePack` map with numeric field tags: `1` code, `2` slug, `3` class, `4` message, `5` retry, `6` typed per-class detail, `8` cross-context source-chain, `11` `pad_nonce`, `12` `registration_event_id`. Tags `7`, `9`, `10` are reserved; tags `13+` are reserved for future extension. Any unknown tag (`7`/`9`/`10`/`13+`) is preserved verbatim and round-trips byte-identical, so an old SDK never drops a field a newer emitter added. The `detail` (tag 6) is a typed shape selected by the class (each class declares its expected detail shape; a class with no detail omits the tag, and a shape mismatch is rejected at construction). The `message` (tag 4) is `HMAC-SHA-256(outlet_message_key, catalog_key)[..32]` — the on-wire message is opaque to non-members, who cannot reverse it; members look up the registered `message_catalog` under the `registration_event_id` (tag 12) to recover the human-readable template. `pad_nonce` (tag 11) is a fresh per-envelope CSPRNG nonce that keys the pseudonymization of the cross-context hop trail; both `pad_nonce` and `registration_event_id` are emitted **unconditionally** (never omitted) so their presence cannot itself act as a side-channel oracle.
+
 ## 5.5 Roles
 
 Contexts define roles with specific permission sets within the capability ceiling. Roles determine which tools an agent can invoke, what data it can access, whether it can invite others, modify settings, etc.

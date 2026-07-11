@@ -370,7 +370,7 @@ pub struct Attenuation {
     ///
     /// Examples:
     /// - `"scp:ctx:abc123/messages:write"`
-    /// - `"scp:ctx:abc123/tool_invoke:*"`
+    /// - `"scp:ctx:abc123/outlet_call:*"`
     /// - `"scp:ctx:*/messages:write"` (wildcard — all contexts)
     pub with: String,
     /// Action on the resource (e.g. `"*"`, `"write"`, `"calculator"`,
@@ -579,7 +579,7 @@ mod tests {
     #[test]
     fn attenuation_clone_eq() {
         let att = Attenuation {
-            with: "scp:ctx:abc123/tool_invoke:assistant".to_owned(),
+            with: "scp:ctx:abc123/outlet_call:assistant".to_owned(),
             can: "invoke".to_owned(),
         };
         let cloned = att.clone();

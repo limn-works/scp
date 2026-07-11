@@ -1,6 +1,7 @@
 //! Typed `OutletError` envelope, `OutletErrorClass`, `RetryPolicy`,
 //! `ContextHop`, `CatalogKey`, and `OutletErrorConstructionFailed` per spec
-//! §5.4.4 ("Outlet Error Taxonomy") and ADR-049 §4.
+//! §5.4.4 ("Outlet Error Taxonomy"). (Governed by spec §5.4.4 alone; this is
+//! unrelated to ADR-049's `SCP-SAGA-*` cross-context-saga terminal codes.)
 //!
 //! These are the **structured error types** the §5.4.4 wire envelope is built
 //! from. The `OutletError` struct in this module is the typed envelope —
@@ -323,7 +324,7 @@ impl OutletErrorClass {
 }
 
 // ---------------------------------------------------------------------------
-// RetryPolicy — §5.4.4 / ADR-049 §4
+// RetryPolicy — §5.4.4
 // ---------------------------------------------------------------------------
 
 /// Retry guidance carried by an [`OutletError`] (§5.4.4 tag 5).
@@ -595,7 +596,7 @@ pub const MAX_TRAIL_PAD_HMAC_LABEL: &[u8] = b"SCP-OUTLET-HOP-PAD-V1:";
 // OutletError — typed §5.4.4 envelope (struct form)
 // ---------------------------------------------------------------------------
 
-/// Typed [`OutletError`] envelope per spec §5.4.4 and ADR-049 §4.
+/// Typed [`OutletError`] envelope per spec §5.4.4.
 ///
 /// Constructed via [`OutletError::new`] which enforces all §5.4.4 invariants
 /// (code regex, slug regex, catalog-key registration, HMAC over catalog key,

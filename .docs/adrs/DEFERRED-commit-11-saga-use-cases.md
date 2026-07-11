@@ -221,9 +221,9 @@ The saga surface requires a decision on the caller's wait model:
 
 **Status (resolved).** RESOLVED — the FFI saga surface is shipped. Each
 bridge (PyO3, UniFFI, napi) exposes the block-until-terminal public method
-`tool_invoke_cross_context_saga` for the sole live saga (§6.2.4). This is
+`outlet_invoke_cross_context_saga` for the sole live saga (§6.2.4). This is
 the public FFI entry; it drives the supervisor's internal
-`start_cross_context_tool_invocation_saga` and returns only after the saga
+`start_cross_context_outlet_invocation_saga` and returns only after the saga
 reaches a terminal state. On the committed terminal it returns a
 `SagaResult` struct carrying the supervisor-minted `SagaId` (UUIDv4 string —
 the gap's subject) plus the target's signed receipt bytes and the captured

@@ -1,6 +1,10 @@
 //! Compact `OutletError` code allocation and per-class slug taxonomy in the
-//! `SCP-TOOL-6100..6199` sub-block per spec §5.4.4 ("Outlet Error Taxonomy")
-//! and ADR-049 §4.
+//! `SCP-TOOL-6100..6199` sub-block per spec §5.4.4 ("Outlet Error Taxonomy").
+//!
+//! This registry is governed solely by spec §5.4.4. It is unrelated to
+//! ADR-049's error taxonomy, which covers the distinct `SCP-SAGA-*`
+//! (`13000-13999`) cross-context-saga terminal-state codes — a separate range
+//! from this outlet-error `SCP-TOOL-61xx` sub-block.
 //!
 //! # Background
 //!
