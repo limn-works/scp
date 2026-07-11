@@ -501,7 +501,7 @@ mod tests {
         h.update(8u32.to_be_bytes()); // len("calc.add")
         h.update(b"calc.add");
         h.update(output_hash); // Fixed32(output_hash)
-        h.update(18u32.to_be_bytes()); // len("evt-outlet-invoked-1")
+        h.update(20u32.to_be_bytes()); // len("evt-outlet-invoked-1")
         h.update(b"evt-outlet-invoked-1");
         h.update([3u8]); // U8(chain_depth)
         h.update(1_709_654_400_000u64.to_be_bytes()); // U64(timestamp_ms)
