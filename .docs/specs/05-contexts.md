@@ -4,15 +4,15 @@
 
 All interaction happens within contexts. There is no concept of off-context communication at the protocol level. A context is a bounded, governed space — a cryptographic entity with its own key material, event log (append-only Merkle tree), governance model, membership roster, and capability ceiling. Contexts operate in one of two modes: **Encrypted** (one MLS group per context, sender-side keys, full forward secrecy) or **Broadcast** (per-author broadcast keys, no MLS, mandatory subscriber registration). The mode is set at creation and is immutable. A group chat is a context. A collaborative quest is a context. A generated Discord alternative is a context. DMs are a two-party context. An entire app's backend is a context (or set of contexts).
 
-**Contexts are spaces, not actors.** They do not initiate, do not act, and have no agency. They hold the rules, the keys, and the audit trail. Agents (always bound to humans, §4) do the acting within them. Tools (§5.4) do the computing within them. The context itself is passive infrastructure.
+**Contexts are spaces, not actors.** They do not initiate, do not act, and have no agency. They hold the rules, the keys, and the audit trail. Agents (always bound to humans, §4) do the acting within them. Outlets (§5.4) do the computing within them. The context itself is passive infrastructure.
 
 **Contexts are runtime objects, not infrastructure to deploy.** Creating a context is a runtime operation (~5-15ms local computation, ~200ms wall clock with network — see §5.12.4). Contexts are created, used, and destroyed during normal application operation. They survive process restarts (state is persisted) but are created as fluidly as opening a connection.
 
-**Contexts are where apps live.** What people experience as "an app" is a composite: a context (or set of contexts) + members + tools + data (§8.1). Long-lived contexts with no TTL host persistent applications — games, workspaces, social platforms. Ephemeral contexts with TTL host bounded tasks. The context is the app's lifecycle boundary. Protocol state (membership, roles, trust) is portable and survives app death; app state is the app's concern (§8.3).
+**Contexts are where apps live.** What people experience as "an app" is a composite: a context (or set of contexts) + members + outlets + data (§8.1). Long-lived contexts with no TTL host persistent applications — games, workspaces, social platforms. Ephemeral contexts with TTL host bounded tasks. The context is the app's lifecycle boundary. Protocol state (membership, roles, trust) is portable and survives app death; app state is the app's concern (§8.3).
 
-**Every context contains:** a capability ceiling (§5.3), roles with permission sets (§5.5), a governance model (§5.9), tools (§5.4), an optional TTL (§5.10), a memory scope (§5.11), and transparent metadata visible before opt-in (§5.7). These are all declared at creation. Contexts may be created from well-known templates (§5.12) for common patterns or from explicit parameters. Contexts can have parent-child relationships (§5.13) for sub-spaces and governed cross-context bridges.
+**Every context contains:** a capability ceiling (§5.3), roles with permission sets (§5.5), a governance model (§5.9), outlets (§5.4), an optional TTL (§5.10), a memory scope (§5.11), and transparent metadata visible before opt-in (§5.7). These are all declared at creation. Contexts may be created from well-known templates (§5.12) for common patterns or from explicit parameters. Contexts can have parent-child relationships (§5.13) for sub-spaces and governed cross-context bridges.
 
-**Two protocol-level mechanisms allow information to cross context boundaries:** tool interfaces (§6.2) for asymmetric, structured, request/response interactions, and multi-parent child contexts (§5.13) for symmetric collaboration. Both require governance consent from all involved contexts. Agent isolation is absolute — no agent instance spans contexts (§6.1).
+**Two protocol-level mechanisms allow information to cross context boundaries:** outlet interfaces (§6.2) for asymmetric, structured, request/response interactions, and multi-parent child contexts (§5.13) for symmetric collaboration. Both require governance consent from all involved contexts. Agent isolation is absolute — no agent instance spans contexts (§6.1).
 
 ## 5.2 Creation
 
@@ -344,7 +344,7 @@ Every other code in `6100..6199` — the intra-class gaps (`6111`, `6132`, …) 
 
 ## 5.5 Roles
 
-Contexts define roles with specific permission sets within the capability ceiling. Roles determine which tools an agent can invoke, what data it can access, whether it can invite others, modify settings, etc.
+Contexts define roles with specific permission sets within the capability ceiling. Roles determine which outlets an agent can invoke, what data it can access, whether it can invite others, modify settings, etc.
 
 Properties of roles:
 
@@ -358,7 +358,7 @@ Properties of roles:
 - **Author** — holds `messages:write` UCAN. Can publish broadcast-key-encrypted content. Authors are bounded (added via `role:assigned` events with role `author`). Each author maintains their own broadcast key with an independent epoch counter.
 - **Subscriber** — holds `messages:read` (auto-granted on DID-authenticated registration in open broadcast contexts, or requiring an explicit admin-issued UCAN in gated broadcast contexts). Subscribers receive author broadcast keys on request. Subscribers are unbounded.
 
-The author/subscriber distinction mirrors the writer/reader two-tier model from contexts with discovery tools (§6.2.2B). Open broadcast subscriber registration follows the same DID-authenticated pattern as context reader-tier access.
+The author/subscriber distinction mirrors the writer/reader two-tier model from contexts with discovery outlets (§6.2.2B). Open broadcast subscriber registration follows the same DID-authenticated pattern as context reader-tier access.
 
 ### 5.5.1 Default Role Set
 
@@ -432,7 +432,7 @@ Structural fields are always public regardless of `MetadataVisibilityPolicy`. Th
 - Name
 - Description
 - Economic policy, if set (§19.3) — pricing, accepted adapters, payee
-- Active tool interface count (inbound and outbound, §6.2, §9.2.1)
+- Active outlet interface count (inbound and outbound, §6.2, §9.2.1)
 - For child contexts (§5.13): parent context IDs, parent metadata summaries, parent governance configuration, and the prospective member's eligibility basis (§5.13.6)
 
 Each operational field has a visibility of `PreJoin` (visible to anyone with the context_id) or `MemberOnly` (visible only to context members). The `MetadataVisibilityPolicy` is declared at context creation and follows the context's ceiling policy — immutable or governed via `ModifyCeiling`.
@@ -586,8 +586,8 @@ Content access actions go through the context's governance model (propose/vote/e
 
 | Collection | Maximum | Rationale |
 |-----------|---------|-----------|
-| `registered_tools` | 256 per context | Tools are heavyweight registrations; 256 exceeds any practical context |
-| `tool_interfaces` | 256 per context | Cross-context interfaces are bilateral agreements; 256 exceeds any practical context |
+| `registered_outlets` | 256 per context | Outlets are heavyweight registrations; 256 exceeds any practical context |
+| `outlet_interfaces` | 256 per context | Cross-context interfaces are bilateral agreements; 256 exceeds any practical context |
 | `threshold_signers` | 64 per context | Signers participate in quorum; >64 is operationally impractical |
 | `suspended_capabilities[did]` | No artificial cap | Naturally bounded by ceiling cardinality — at most one entry per capability per member |
 | `read_exclusion_list` | No artificial cap | Naturally bounded by membership count — cannot exclude non-members from CEK wrapping |
@@ -663,7 +663,7 @@ Contexts gain a declared memory scope — what happens to the context's data whe
 
 Three scopes:
 
-**Ephemeral.** Context encryption keys are destroyed on close AND the SDK issues deletion requests to relays for all encrypted event data associated with the context. Content is physically unreadable (keys destroyed) and actively cleaned up (ciphertext deleted where relays comply). Durable metadata persists: who participated, when, the declared purpose, participation contributions (participation counts, tool invocations), and discovery provenance. An agent's local orchestration (above the protocol boundary) may retain information from the interaction, but any data the agent subsequently uses elsewhere carries provenance at the protocol level: "sourced from closed ephemeral context."
+**Ephemeral.** Context encryption keys are destroyed on close AND the SDK issues deletion requests to relays for all encrypted event data associated with the context. Content is physically unreadable (keys destroyed) and actively cleaned up (ciphertext deleted where relays comply). Durable metadata persists: who participated, when, the declared purpose, participation contributions (participation counts, outlet invocations), and discovery provenance. An agent's local orchestration (above the protocol boundary) may retain information from the interaction, but any data the agent subsequently uses elsewhere carries provenance at the protocol level: "sourced from closed ephemeral context."
 
 Relay deletion is best-effort — relays are untrusted infrastructure and cannot be forced to delete. Defense in depth: even if a relay retains the encrypted blobs, the keys are destroyed and the data is unreadable. Relay compliance with deletion requests is tracked as part of relay reliability scoring (§9.9.2) — relays that retain data they were asked to delete are scored lower and deprioritized for future context creation.
 
@@ -684,7 +684,7 @@ EphemeralDeletionRequest {
 
 The relay verifies the signature and MAY verify the close proof against its cached event log state. Relays SHOULD process deletion requests within 60 seconds. The relay responds with a `DeletionAcknowledgement` containing the count of blobs deleted. The SDK retries failed deletion requests with exponential backoff (initial 5s, max 300s, 5 retries) and records relay compliance for reliability scoring.
 
-**Summary.** Context produces a structured summary on close. Full content is destroyed (keys destroyed as with ephemeral). The summary persists with full provenance. Both parties can verify the summary against the event log before keys are destroyed. The summary format is defined by the context (via tools or governance), not by the protocol — the protocol provides the lifecycle hooks (pre-close summary generation, verification window, key destruction) but does not prescribe summary content.
+**Summary.** Context produces a structured summary on close. Full content is destroyed (keys destroyed as with ephemeral). The summary persists with full provenance. Both parties can verify the summary against the event log before keys are destroyed. The summary format is defined by the context (via outlets or governance), not by the protocol — the protocol provides the lifecycle hooks (pre-close summary generation, verification window, key destruction) but does not prescribe summary content.
 
 The **verification window** is the period between summary generation and key destruction during which members can verify the summary against the full event log. The verification window duration is 300 seconds (5 minutes). During this window: (a) the summary is published as a signed MLS application message, (b) all members can read the full event log and compare it against the summary, (c) any member can raise a `SummaryDisputed` event if the summary is inaccurate, (d) after 300 seconds with no dispute, key destruction proceeds automatically. If a dispute is raised, key destruction is paused until the dispute is resolved through governance. Disputes that are not resolved within 24 hours result in key destruction proceeding anyway — the 24-hour limit prevents indefinite postponement of an ephemeral context's destruction guarantee.
 
@@ -742,7 +742,7 @@ If `auto_invite` is true, the initiating admin sends bulk invitations to all cur
 After migration is approved, the source context enters a **read-only grace period**:
 
 - **Duration:** Configurable in the proposal. RECOMMENDED default: 7 days.
-- **Read-only semantics:** No new messages, tool invocations, or governance actions (except `ProposeContextMigration` cancellation) are accepted. Members can still read existing content and retrieve history.
+- **Read-only semantics:** No new messages, outlet invocations, or governance actions (except `ProposeContextMigration` cancellation) are accepted. Members can still read existing content and retrieve history.
 - **Purpose:** Gives all members time to discover the migration, evaluate the destination, join if desired, and retrieve any data they need from the source.
 - **Event log entry:** `ContextMigrationStarted { destination_id, grace_period_end }` is emitted when the grace period begins.
 
@@ -773,7 +773,7 @@ If the source context has child contexts (§5.13):
 
 ## 5.12 Context Templates and Lightweight Creation
 
-Context creation requires specifying a ceiling, roles, governance model, memory scope, TTL, and tools. For durable, bespoke contexts this is appropriate — the creator is designing a space. But contexts must also be cheap and disposable. If "spin up a quick context" requires manual configuration of six parameters, agents will route around the protocol for lightweight coordination. Context templates solve this.
+Context creation requires specifying a ceiling, roles, governance model, memory scope, TTL, and outlets. For durable, bespoke contexts this is appropriate — the creator is designing a space. But contexts must also be cheap and disposable. If "spin up a quick context" requires manual configuration of six parameters, agents will route around the protocol for lightweight coordination. Context templates solve this.
 
 ### 5.12.1 Well-Known Templates
 
@@ -786,7 +786,7 @@ Template: "scp:template/bilateral-ephemeral"
   governance:  single-admin
   memory_scope: ephemeral
   ttl:         required (creator sets duration, no default — forces intentionality)
-  tools:       none
+  outlets:       none
   metadata_visibility: { member_count: MemberOnly, context_age: MemberOnly, creator_identity: MemberOnly, name: PreJoin, description: MemberOnly, economic_policy: MemberOnly, outlet_interface_count: MemberOnly, child_context_info: MemberOnly }
 
 Template: "scp:template/bilateral-persistent"
@@ -795,7 +795,7 @@ Template: "scp:template/bilateral-persistent"
   governance:  single-admin
   memory_scope: full
   ttl:         none
-  tools:       none
+  outlets:       none
   metadata_visibility: { member_count: MemberOnly, context_age: MemberOnly, creator_identity: MemberOnly, name: PreJoin, description: MemberOnly, economic_policy: MemberOnly, outlet_interface_count: MemberOnly, child_context_info: MemberOnly }
 
 Template: "scp:template/coordination"
@@ -804,7 +804,7 @@ Template: "scp:template/coordination"
   governance:  single-admin
   memory_scope: summary
   ttl:         required (creator sets duration)
-  tools:       creator-defined at creation
+  outlets:       creator-defined at creation
   metadata_visibility: { member_count: MemberOnly, context_age: MemberOnly, creator_identity: MemberOnly, name: PreJoin, description: MemberOnly, economic_policy: MemberOnly, outlet_interface_count: MemberOnly, child_context_info: MemberOnly }
 
 Template: "scp:template/group-discussion"
@@ -813,7 +813,7 @@ Template: "scp:template/group-discussion"
   governance:  single-admin
   memory_scope: full
   ttl:         optional
-  tools:       none
+  outlets:       none
   metadata_visibility: { member_count: PreJoin, context_age: MemberOnly, creator_identity: PreJoin, name: PreJoin, description: PreJoin, economic_policy: MemberOnly, outlet_interface_count: MemberOnly, child_context_info: MemberOnly }
 
 Template: "scp:template/public-broadcast"
@@ -848,7 +848,7 @@ Template: "scp:template/outlet-interface"
   governance:    single-admin
   memory_scope:  full
   ttl:           optional
-  tools:         creator-defined at creation
+  outlets:         creator-defined at creation
   metadata_visibility: all PreJoin
 
 Template: "scp:template/paid-service"
@@ -937,7 +937,7 @@ sdk.create_context(params: ContextParams {
   governance: SingleAdmin,
   memory_scope: Ephemeral,
   ttl: Duration::minutes(5),
-  tools: [],
+  outlets: [],
   template_id: None,                  // No template — custom params
 }) → ContextHandle
 ```
@@ -964,7 +964,7 @@ InvitationBundle {
                                           // authority from: governance, ceiling, ceiling_policy,
                                           // roles, mode, ttl, memory_scope, economic_policy
                                           // (including payee), consequence_rules and the
-                                          // allow_automatic_access_revocation opt-in, tools, and
+                                          // allow_automatic_access_revocation opt-in, outlets, and
                                           // every other authority-relevant field. This is the
                                           // authenticated authority source (see Signature scope);
                                           // the joiner enforces from it, never from the lossy
@@ -990,7 +990,7 @@ MetadataSnapshot {
 }
 ```
 
-**Signature scope.** The creator signs `SHA-256("SCP-INVITATION-BUNDLE-V1:" || context_id || creator_did || relay_urls_hash || welcome_message_hash || key_material_hash || genesis_params_hash || metadata_snapshot_hash)`. The raw `context_id` and `creator_did` are encoded per the §9.5.1 length-prefixed rules (4-byte big-endian length prefix followed by UTF-8 bytes). Each `_hash` is the 32-byte SHA-256 output `SHA-256(canonical_json_jcs(field))` over the corresponding field — RFC 8785 (JCS) canonical JSON — inserted raw into the preimage (a fixed 32-byte value carries no length prefix, per §9.5.1). In particular `genesis_params_hash = SHA-256(canonical_json_jcs(context_params))` binds the **complete genesis `ContextParams`** into the signature, so the signature authenticates the full authority the joiner enforces — governance, ceiling, ceiling_policy, roles, mode, ttl, memory_scope, economic_policy (including payee), consequence_rules and the `allow_automatic_access_revocation` opt-in, tools, and every other authority-relevant field — not merely the lossy `metadata_snapshot` (which omits economic-policy detail and consequence rules). `metadata_snapshot_hash` remains signed so the display / auto-accept view cannot be tampered independently of the authority it must agree with. The signature uses the creator's Active Signing Key (`#active`).
+**Signature scope.** The creator signs `SHA-256("SCP-INVITATION-BUNDLE-V1:" || context_id || creator_did || relay_urls_hash || welcome_message_hash || key_material_hash || genesis_params_hash || metadata_snapshot_hash)`. The raw `context_id` and `creator_did` are encoded per the §9.5.1 length-prefixed rules (4-byte big-endian length prefix followed by UTF-8 bytes). Each `_hash` is the 32-byte SHA-256 output `SHA-256(canonical_json_jcs(field))` over the corresponding field — RFC 8785 (JCS) canonical JSON — inserted raw into the preimage (a fixed 32-byte value carries no length prefix, per §9.5.1). In particular `genesis_params_hash = SHA-256(canonical_json_jcs(context_params))` binds the **complete genesis `ContextParams`** into the signature, so the signature authenticates the full authority the joiner enforces — governance, ceiling, ceiling_policy, roles, mode, ttl, memory_scope, economic_policy (including payee), consequence_rules and the `allow_automatic_access_revocation` opt-in, outlets, and every other authority-relevant field — not merely the lossy `metadata_snapshot` (which omits economic-policy detail and consequence rules). `metadata_snapshot_hash` remains signed so the display / auto-accept view cannot be tampered independently of the authority it must agree with. The signature uses the creator's Active Signing Key (`#active`).
 
 **Canonicalization rationale.** Per-field hashes use RFC 8785 canonical JSON (JCS), matching the cross-implementation canonical-hashing mandate in §9.5 (§09-security-model.md) and the §5.13.3 `0xFF02` extension precedent. MessagePack has no canonical form standard — field ordering varies by library, so it cannot guarantee byte-identical output across independent SDK implementations; JCS provides a formal canonicalization standard that can. This ensures two implementations that serialize the same logical field produce identical signed bytes and therefore verify each other's signatures. (The bundle's MessagePack transport envelope is unaffected: the signed preimage is built from JCS field hashes, not from the MessagePack envelope bytes, so the transport encoding never enters the signature.)
 
@@ -998,7 +998,7 @@ MetadataSnapshot {
 1. Resolve `creator_did` and verify `signature` against the creator's `#active` public key.
 2. Verify `metadata_snapshot.structural` is consistent with `context_params`. Both are inside the same creator signature, so a divergence is a signed self-contradiction — reject. This blocks a creator from displaying benign structural values for the auto-accept check while enforcing hostile ones.
 3. Validate the structural authority (`metadata_snapshot.structural`, equivalently the corresponding `context_params` fields) against the invitee's auto-accept policy (§5.12.2).
-4. For the fields the `0xFF02` MLS group-context extension commits (the genesis `creator_did`, governance, ceiling, ceiling_policy, mode, parent lineage — §5.13.3), verify `context_params` and `creator_did` match the committed extension carried in `welcome_message`. In particular, the bundle's `creator_did` MUST equal the committed genesis `creator_did` (§5.13.3 rule 8): the bundle signature alone proves only that the SIGNER authored the bundle, not that the signer is the group's real creator/admin — an in-context member could sign a bundle naming an arbitrary `creator_did`, which is why the creator identity is anchored in the MLS-committed extension, not the signature. Authority for those fields is anchored in the MLS-committed extension; the bundle signature additionally authenticates the remaining genesis params (roles, ttl, memory_scope, economic_policy, consequence_rules, tools) that `0xFF02` does not commit.
+4. For the fields the `0xFF02` MLS group-context extension commits (the genesis `creator_did`, governance, ceiling, ceiling_policy, mode, parent lineage — §5.13.3), verify `context_params` and `creator_did` match the committed extension carried in `welcome_message`. In particular, the bundle's `creator_did` MUST equal the committed genesis `creator_did` (§5.13.3 rule 8): the bundle signature alone proves only that the SIGNER authored the bundle, not that the signer is the group's real creator/admin — an in-context member could sign a bundle naming an arbitrary `creator_did`, which is why the creator identity is anchored in the MLS-committed extension, not the signature. Authority for those fields is anchored in the MLS-committed extension; the bundle signature additionally authenticates the remaining genesis params (roles, ttl, memory_scope, economic_policy, consequence_rules, outlets) that `0xFF02` does not commit.
 5. If accepted, install authority from the verified `context_params` and process `welcome_message` via MLS to join the group (Encrypted contexts) or initialize subscriber state (Broadcast contexts).
 6. Use `context_metadata_key` to derive the metadata routing ID for ongoing metadata retrieval.
 
@@ -1199,7 +1199,7 @@ An agent typically has a standing context with every peer it communicates with r
 
 ## 5.13 Context Nesting
 
-Contexts can have parent-child relationships. A child context is a full context — its own MLS group, event log, governance, roles, tools, ceiling, and membership — that is structurally and cryptographically linked to one or more parent contexts. The parent relationship constrains the child (ceiling inheritance, lifecycle coupling, membership eligibility), is visible in metadata, and is bound into the child's MLS group identity so that lineage cannot be forged or rewritten after creation.
+Contexts can have parent-child relationships. A child context is a full context — its own MLS group, event log, governance, roles, outlets, ceiling, and membership — that is structurally and cryptographically linked to one or more parent contexts. The parent relationship constrains the child (ceiling inheritance, lifecycle coupling, membership eligibility), is visible in metadata, and is bound into the child's MLS group identity so that lineage cannot be forged or rewritten after creation.
 
 Nesting serves two distinct purposes depending on parent count:
 
@@ -1323,7 +1323,7 @@ Alice (in A + B) → sdk.create_child_context(
 
 **B. Coordinated creation across contexts.** Alice is in A with creation rights. Bob is in B with creation rights. Neither is in the other's context. They coordinate (via a bilateral context, shared context, or out-of-band) to create child C.
 
-Coordination uses an intrinsic tool call available within each context's governance. Alice invokes the child-creation tool in A with the proposed child params and the list of co-parents. A's governance evaluates and, if approved, publishes a **child creation proposal** — a signed, content-addressed record of the approved params. Bob does the same in B. The protocol matches proposals by their content hash: when all proposed parents have published matching proposals (identical child params), the child is created.
+Coordination uses an intrinsic outlet call available within each context's governance. Alice invokes the child-creation outlet in A with the proposed child params and the list of co-parents. A's governance evaluates and, if approved, publishes a **child creation proposal** — a signed, content-addressed record of the approved params. Bob does the same in B. The protocol matches proposals by their content hash: when all proposed parents have published matching proposals (identical child params), the child is created.
 
 **Proposal format and matching algorithm:**
 
@@ -1365,22 +1365,22 @@ All parents' SDKs subscribe to this routing address. When an SDK observes propos
 - A new coordination attempt requires new governance proposals in all parents — expired approvals are not reusable.
 
 ```
-Alice (in A) → invokes child creation tool → A's governance approves
+Alice (in A) → invokes child creation outlet → A's governance approves
              → A publishes proposal { match_hash, parent_list, approval_sig }
-Bob (in B)   → invokes child creation tool → B's governance approves
+Bob (in B)   → invokes child creation outlet → B's governance approves
              → B publishes proposal { match_hash, parent_list, approval_sig }
 SDK observes matching proposals from all parents
 → Child C created
 → Both Alice and Bob are initial members
 ```
 
-This reuses the existing tool call model — no new protocol primitive. The child creation tool is intrinsic to contexts that include the `context:child:createCreate` capability in their ceiling.
+This reuses the existing outlet call model — no new protocol primitive. The child creation outlet is intrinsic to contexts that include the `context:child:createCreate` capability in their ceiling.
 
 **C. Member proposal without creation rights.** Alice is in A but her role doesn't include creation rights. She proposes the child through A's governance (§5.9). A's governance evaluates and either approves or rejects the proposal. If approved, the governance itself authorizes the creation on A's behalf. Same process on B's side.
 
 **Creation protocol:**
 
-1. **Initiator constructs child params:** ceiling (must be ≤ intersection of parent ceilings), governance model, roles, TTL (must be ≤ minimum parent TTL if parents have TTLs), memory scope, tools, and the parent governance configuration (§5.13.4).
+1. **Initiator constructs child params:** ceiling (must be ≤ intersection of parent ceilings), governance model, roles, TTL (must be ≤ minimum parent TTL if parents have TTLs), memory scope, outlets, and the parent governance configuration (§5.13.4).
 2. **Governance proposal sent to each parent.** The proposal includes the full child params plus the list of all proposed parents. Each parent's governance evaluates independently.
 3. **All parents approve.** The child context is created. Creation is logged in every parent's event log and in the child's event log.
 4. **Any parent rejects.** Creation fails. No child is created. The rejection is not logged (the proposal never materialized).
@@ -1443,7 +1443,7 @@ ParentGovernanceConfig {
   can_restrict_ceiling:  Bool    // Can this parent further restrict the child's ceiling?
   requires_approval_for: [       // What child operations require this parent's approval?
     | governanceChange           // Child governance model changes
-    | toolRegistration           // New tools added to child
+    | outletRegistration           // New outlets added to child
     | ceilingChange              // Child ceiling modifications (only applicable if child has `governed` ceiling policy, §5.3)
     | membershipChange           // Members added/removed
   ]
@@ -1484,8 +1484,8 @@ Parent B config: { same as A }
 Parent A config: { can_close: true, can_evict: false, can_restrict: false,
                    requires_approval_for: [], on_sever: .cascade_close }
 Parent B config: { can_close: false, can_evict: false, can_restrict: true,
-                   requires_approval_for: [toolRegistration], on_sever: .cascade_close }
-// A can shut down the relationship. B controls the tools (it's the service provider).
+                   requires_approval_for: [outletRegistration], on_sever: .cascade_close }
+// A can shut down the relationship. B controls the outlets (it's the service provider).
 // If either severs, the child closes entirely.
 ```
 
@@ -1534,7 +1534,7 @@ Child context metadata (§5.7) includes all standard context metadata plus:
 - **Parent governance configuration.** What authority each parent has over the child (§5.13.4).
 - **Eligibility basis.** Which parent(s) the prospective member would join through.
 
-This means a member evaluating whether to join a child sees: "This is a child of contexts A and B. A has 30 members, single-admin governance, ceiling [msg, tools]. B has 15 members, multi-sig governance, ceiling [msg]. The child's ceiling is [msg]. Parent A can close the child unilaterally. Parent B cannot. If A severs, members from A only are evicted."
+This means a member evaluating whether to join a child sees: "This is a child of contexts A and B. A has 30 members, single-admin governance, ceiling [msg, outlets]. B has 15 members, multi-sig governance, ceiling [msg]. The child's ceiling is [msg]. Parent A can close the child unilaterally. Parent B cannot. If A severs, members from A only are evicted."
 
 Full legibility before opt-in applies to nesting relationships the same as everything else in the protocol. No hidden parent governance. No undisclosed co-parents.
 
@@ -1544,19 +1544,19 @@ Full legibility before opt-in applies to nesting relationships the same as every
 
 **Standing contexts.** A standing context (§5.12.6) between Alice and Bob can be modeled as a multi-parent child of whatever context(s) Alice and Bob share. This is not required — standing contexts remain lightweight bilateral contexts that work without nesting. But if structural governance over the standing context is desired (a parent context's governance should have authority over the channel), nesting provides that.
 
-**Tool interfaces.** Tool interfaces (§6.2) and multi-parent children serve different purposes and coexist:
+**Outlet interfaces.** Outlet interfaces (§6.2) and multi-parent children serve different purposes and coexist:
 
-| | Tool interface | Multi-parent child |
+| | Outlet interface | Multi-parent child |
 |---|---|---|
-| Relationship | Asymmetric (caller/tool) | Symmetric (peers) |
-| Data flow | Structured (schema-declared) | Full context (messages, tools, everything) |
+| Relationship | Asymmetric (caller/outlet) | Symmetric (peers) |
+| Data flow | Structured (schema-declared) | Full context (messages, outlets, everything) |
 | Governance | Both contexts govern each call | Configured at creation, child self-governs |
 | Duration | Per-call (or per-session) | Persistent (until closed or TTL) |
 | Use case | Service calls, data queries | Collaboration, negotiation, ongoing peer interaction |
 
-A context might use both: tool interfaces for structured service queries and a multi-parent child for ongoing collaboration with the same counterpart.
+A context might use both: outlet interfaces for structured service queries and a multi-parent child for ongoing collaboration with the same counterpart.
 
-**Provenance.** Data originating in a child context carries provenance (§7.7) that includes the child's parent lineage. When data from a child crosses another context boundary (via tool interface or further nesting), the provenance chain includes the child and its parents. This makes the trust basis structurally legible: "this data came from a child of A and B" tells the receiver more than "this data came from some context."
+**Provenance.** Data originating in a child context carries provenance (§7.7) that includes the child's parent lineage. When data from a child crosses another context boundary (via outlet interface or further nesting), the provenance chain includes the child and its parents. This makes the trust basis structurally legible: "this data came from a child of A and B" tells the receiver more than "this data came from some context."
 
 **Auto-accept and child contexts.** Child-context eligibility (§5.13.2) is a cryptographically-enforced **floor** on *who can reach you* with a child invitation — a child can only be offered by a context you are already a verified member of (relay-enforced, §5.13.2), not an SDK honor system. It is **not** a trust signal and does **not** trigger auto-accept. Auto-accepting a child invitation follows the same §5.12.2 rule as any other context: the inviter's DID MUST be on the operator's `known_did` allowlist, with the ceiling/TTL caps the policy specifies; otherwise the invitation prompts the human (default-deny). Co-membership in a parent is the floor that lets the invitation reach you, never a substitute for the allowlist.
 
@@ -1617,7 +1617,7 @@ Where `context_id` and `author_did` are UTF-8 bytes, each preceded by a 4-byte b
 
 ### 5.14.3 Subscriber Registration
 
-Broadcast contexts reuse the two-tier membership model from contexts with discovery tools (§6.2.2B):
+Broadcast contexts reuse the two-tier membership model from contexts with discovery outlets (§6.2.2B):
 
 - **Writer tier (authors):** Hold `messages:write` UCAN. Bounded. Manage content and key distribution.
 - **Reader tier (subscribers):** DID-authenticated (open) or UCAN-authenticated (gated). Unbounded. Receive author broadcast keys on request.
@@ -1779,7 +1779,7 @@ Reuses existing event types wherever possible. Only one genuinely new type:
 Broadcast contexts are discoverable through four mechanisms:
 
 1. **DID document service endpoint.** Authors MAY publish an `SCPBroadcastContext` service entry in their DID document with the context ID and relay URLs.
-2. **Contexts with discovery tools.** Authors register broadcast contexts via `agent_register` in contexts with discovery tools (§6.2.2B), with metadata indicating the context mode.
+2. **Contexts with discovery outlets.** Authors register broadcast contexts via `agent_register` in contexts with discovery outlets (§6.2.2B), with metadata indicating the context mode.
 3. **`.well-known/scp`.** Operators MAY list broadcast contexts in their `.well-known/scp` document (§18.3). Only broadcast context IDs may be listed — encrypted context IDs MUST NOT appear (§9.10 metadata privacy).
 4. **Out-of-band URI.** The universal context URI format (§18.4) is used for sharing context references: `scp://context/<context_id_hex>?relay=<url>&mode=broadcast`. The legacy format `scp://broadcast/<context_id_hex>?relay=<url>` is accepted as an alias and normalized to the universal format.
 
@@ -1839,7 +1839,7 @@ The security invariant governing which operations belong in the sync-persisted t
 
 ### 5.15.4 Cross-Context Operations Use Sagas
 
-Operations spanning **2+ distinct** contexts — currently just cross-context tool invocation (§6.2.4) — execute as coordinated sagas driven by a supervisor that never allows contexts to await each other directly. (Standing-pair creation, §5.15.8, is **not** a saga: a standing pair is one MLS context with two members, so it is single-context async creation synchronized by MLS + the event-log consistency layer, with no cross-context atomicity to coordinate.) Phase states and the predicates that select among their outgoing transitions:
+Operations spanning **2+ distinct** contexts — currently just cross-context outlet invocation (§6.2.4) — execute as coordinated sagas driven by a supervisor that never allows contexts to await each other directly. (Standing-pair creation, §5.15.8, is **not** a saga: a standing pair is one MLS context with two members, so it is single-context async creation synchronized by MLS + the event-log consistency layer, with no cross-context atomicity to coordinate.) Phase states and the predicates that select among their outgoing transitions:
 
 ```
 Initiated --[supervisor begins Prepare]--> PreparingA
@@ -1854,11 +1854,11 @@ Aborting   --[all participants ack Abort]--> Aborted (terminal)
 
 Each phase transition is synchronously persisted to a durable journal (§17.16) before any outbound effect of that phase — including the phase message dispatched to the next participating actor — is visible. Journal durability is the gate; the subsequent phase message and any other observer channel (§5.15.3) follow after the journal's durable acknowledgment. On process restart the supervisor replays unresolved journal entries.
 
-Concurrent sagas are serialized at the granularity of their **participant context set**, not supervisor-wide. A saga reserves the set of contexts it spans (one `saga_pending` slot per context-actor); a second saga whose participant set is disjoint proceeds concurrently, while a second saga whose participant set **overlaps** — shares **at least one** context with — an in-flight saga is rejected with a typed **saga-busy** error (the contended context's slot is already held; surfaced consistently across bindings). Overlap is non-empty participant-set intersection: sharing a single context is sufficient to conflict, so two sagas that share only one common context (e.g. two cross-context tool invocations that share a common target context) serialize at that shared context and never run concurrently. A `NeedsRepair` outcome **releases** the concurrency reservation: an operator action still resolves the divergence, but a stuck saga MUST NOT wedge unrelated sagas. (`NeedsRepair` is **FSM-terminal** — the automatic retry machine stops there, per the FSM above — but is **not a *resolved* state**: §17.16.1's unresolved-saga scan still loads it for crash-recovery and it is cleared only by operator repair or on the next process start (§17.16). A tool-invoke divergence (§6.2.4) can therefore stay unresolved until then — which is exactly why the concurrency reservation is released the moment the saga reaches `NeedsRepair`, rather than held until resolution.)
+Concurrent sagas are serialized at the granularity of their **participant context set**, not supervisor-wide. A saga reserves the set of contexts it spans (one `saga_pending` slot per context-actor); a second saga whose participant set is disjoint proceeds concurrently, while a second saga whose participant set **overlaps** — shares **at least one** context with — an in-flight saga is rejected with a typed **saga-busy** error (the contended context's slot is already held; surfaced consistently across bindings). Overlap is non-empty participant-set intersection: sharing a single context is sufficient to conflict, so two sagas that share only one common context (e.g. two cross-context outlet invocations that share a common target context) serialize at that shared context and never run concurrently. A `NeedsRepair` outcome **releases** the concurrency reservation: an operator action still resolves the divergence, but a stuck saga MUST NOT wedge unrelated sagas. (`NeedsRepair` is **FSM-terminal** — the automatic retry machine stops there, per the FSM above — but is **not a *resolved* state**: §17.16.1's unresolved-saga scan still loads it for crash-recovery and it is cleared only by operator repair or on the next process start (§17.16). A outlet-invoke divergence (§6.2.4) can therefore stay unresolved until then — which is exactly why the concurrency reservation is released the moment the saga reaches `NeedsRepair`, rather than held until resolution.)
 
 Commit retry budget: three retries (500 ms / 1 s / 2 s delays), then terminal `NeedsRepair` requiring operator action or process restart. No indefinite retry loop.
 
-There is currently **no** secret-bearing saga; §9.4.3 stands as the contract any future secret-bearing saga MUST satisfy. The single saga — cross-context tool invocation (§6.2.4) — is public-metadata-only: its journal and envelopes carry no bearer material (the tool invocation carries a UCAN *index*, not the token). It marks resolution with `secret_bearing=false`, so no synchronous on-disk evidence overwrite is required. (Standing-pair creation is not a saga and journals nothing — §5.15.8.)
+There is currently **no** secret-bearing saga; §9.4.3 stands as the contract any future secret-bearing saga MUST satisfy. The single saga — cross-context outlet invocation (§6.2.4) — is public-metadata-only: its journal and envelopes carry no bearer material (the outlet invocation carries a UCAN *index*, not the token). It marks resolution with `secret_bearing=false`, so no synchronous on-disk evidence overwrite is required. (Standing-pair creation is not a saga and journals nothing — §5.15.8.)
 
 ### 5.15.5 Governance is Single-Context
 
@@ -1888,7 +1888,7 @@ A **standing pair** is the `bilateral-persistent` context two identities create 
 - **Ok-return contract.** `Ok` means the **initiator's replica is created and the Welcome dispatched** — it does **NOT** imply the peer joined. Offline / slow / blocking / declining peers all yield the identical `Ok` (no synchronous confirmation).
 - **Send-gating caveat.** Any party that obtains its replica via Welcome-join can join and **decrypt** but **cannot SEND** until the Phase-2E spawn-from-Welcome entrypoint lands.
 
-> **Provenance (correction, 2026-06-18; length-prefix adopted 2026-06-24).** §5.15.8 was previously specified as a two-phase-commit cross-context saga (originally authored as the standing-pair saga). That was a miscategorization: a 2-member MLS group is one context, replica sync is MLS + the event-log consistency layer, and a saga coordinates atomicity across **2+ distinct** contexts sharing no sync protocol — which a standing pair is not. The sole genuine cross-context saga is §6.2.4 (cross-context tool invocation). See ADR-049 §3 / §3a / §3b. (The prior claim that unconditional length-prefix injectivity "would add no security" is **retracted**: the colon-join was always the sole structural isolation anchor for `derived_context_id`; the `group_id` removed in the saga-cut was the *saga's* separate MLS group identifier, not an isolation co-anchor.) **The length-prefix framing is now ADOPTED here (Alec 2026-06-24), not deferred:** the *Determinism precondition* derivation uses the §9.5.1 length-prefixed form, making injectivity unconditional and retiring the **colon-freedom method-admission dependence** (§3.8.1 RETAINS a method-admission gate for canonical *agreement* — what length-prefix retired is only the colon-freedom injectivity assumption) — see *Injectivity invariant* below. The code helper `derive_standing_context_digest` currently colon-joins and is updated to the length-prefixed form in the downstream standing-pair implementation PR; the spec leads here, and because the standing-pair creation path is not yet wired, there is **no live divergence** to reconcile.
+> **Provenance (correction, 2026-06-18; length-prefix adopted 2026-06-24).** §5.15.8 was previously specified as a two-phase-commit cross-context saga (originally authored as the standing-pair saga). That was a miscategorization: a 2-member MLS group is one context, replica sync is MLS + the event-log consistency layer, and a saga coordinates atomicity across **2+ distinct** contexts sharing no sync protocol — which a standing pair is not. The sole genuine cross-context saga is §6.2.4 (cross-context outlet invocation). See ADR-049 §3 / §3a / §3b. (The prior claim that unconditional length-prefix injectivity "would add no security" is **retracted**: the colon-join was always the sole structural isolation anchor for `derived_context_id`; the `group_id` removed in the saga-cut was the *saga's* separate MLS group identifier, not an isolation co-anchor.) **The length-prefix framing is now ADOPTED here (Alec 2026-06-24), not deferred:** the *Determinism precondition* derivation uses the §9.5.1 length-prefixed form, making injectivity unconditional and retiring the **colon-freedom method-admission dependence** (§3.8.1 RETAINS a method-admission gate for canonical *agreement* — what length-prefix retired is only the colon-freedom injectivity assumption) — see *Injectivity invariant* below. The code helper `derive_standing_context_digest` currently colon-joins and is updated to the length-prefixed form in the downstream standing-pair implementation PR; the spec leads here, and because the standing-pair creation path is not yet wired, there is **no live divergence** to reconcile.
 
 **Determinism precondition.** The id is a pure function of the two DIDs, **length-prefixed** per the §9.5.1 variable-length-bytes rule:
 ```
@@ -1919,7 +1919,7 @@ The bound-creator check (§9.7.1) requires **BOTH** the creator leaf's `ScpCrede
 1. **Initiator (A) creates the group.** A recomputes `derived_context_id` and validates: (a) it is not already Active under the id (else the *Get-or-create idempotency* path applies — bare existence is not auto-failure); (b) `peer_did` is canonically **distinct from A's own DID** (using §3.8.1 canonical form on both sides; a self-pair is rejected with the same generic/typed malformed-peer rejection as any malformed peer DID, disclosing nothing). **Sybil non-credit (normative, §9.3 cross-ref):** beyond the self-pair guard, a standing pair between **two distinct DIDs the same operator controls** MUST NOT count toward §9.3 earned-capacity participation records — otherwise a Sybil operator could self-deal two of their own DIDs into participation credit. This is the same **not-self-created** discriminator §9.3 applies to participation records (a participation record only counts from a context the counting identity did not itself create/admin); a two-party context both of whose members the operator controls is self-dealt and does not earn capacity for either. (c) the `bilateral-persistent` template params are well-formed (§5.12.1); (d) `peer_did` resolves to a well-formed DID document with an Active Signing Key (§3) and is not blocked; (e) A's provider holds no group under the id (the `Entry::Vacant` guard; collision ⇒ error). On success A creates a **1-leaf** MLS group plus a fresh sender key.
 2. **Add the peer.** A fetches B's published `KeyPackage` and `add_member`s B, producing a **Welcome**. B's KeyPackage single-use is enforced at B's *join* by the fused-join two-anchor mechanism (ADR-049 §9) — no Prepare-time reservation.
 3. **Publish / register (A).** A publishes the group, emits the **InvitationBundle** (carrying the MLS Welcome as its `welcome_message`, §5.12.3.1) to B's personal routing id (the §5.12.3.3 invitations routing id) asynchronously (A does not block on B), so it rides the §5.12.3.3 invitation-delivery path and inherits the InvitationBundle 7-day relay-retention TTL (`welcome_ttl`, default — read by the reaper, item (d)); registers the context **Active**, appends the creation to its event log, and records the peer via `register_standing_context`.
-4. **Peer (B) receives the Welcome and applies the consent gate on receipt** (*before* joining): (a0) **`derived_context_id` agreement (cross-party canonicalization check, defense-in-depth)** — B MUST **re-derive** the standing-pair `derived_context_id` from its **own** inputs (`local_did = B`, `peer_did = A`, each in §3.8.1 canonical form, sorted, length-prefixed per *Determinism precondition*) and verify it **equals** the context id the inbound InvitationBundle / Welcome binds. A mismatch — which can only arise from a DID-canonicalization divergence between A and B (e.g. an exotic did:web encoding the two sides normalize differently) — ⇒ **reject the Welcome (do NOT join)**, surfacing the same generic rejection as any other consent reject (no synchronous "Rejected" reply, per *Block-privacy* below). This is the **receive-side canonicalization backstop** §3.8.1's did:web residual relies on: it converts an **honest** DID-canonicalization divergence between A and B (the only way B's locally-derived id and the bundle's asserted `context_id` differ when A is honest) from a silent split-brain into a clean local rejection (routed through the generic consent-reject, leaking nothing). It is **not** a cryptographic cross-party agreement proof — `InvitationBundle.context_id` (§5.12.3.1) is a creator-asserted, creator-signed label, not a value bound to the DID pair, so a *malicious* A can always label the bundle with the id B will derive. Agreement against a dishonest creator on the collision path rests on the §9.7.1 bound-creator check and MLS membership binding (below), not on this equality test. **Non-mismatch resolution outcomes (a0).** If B cannot resolve or canonicalize `creator_did` (A's DID) at all — distinct from an id *mismatch* — the outcome is determined by the failure kind: a **transient** resolution failure (e.g. the DHT is momentarily unreachable) is a **retryable deferral**, NOT a permanent reject — B re-attempts within the `welcome_ttl` window rather than discarding the Welcome; a **permanent** un-canonicalizable-method case (a DID method that admits no canonical string form — the §3.8.1 fail-loud method-admission gate) is a **reject**. Neither path is ever a silent join: a still-pending transient deferral simply does not join yet, and a permanent failure rejects through the same generic consent-reject as a mismatch. (a) **block list** — refuse if A is globally blocked (§3.7.1 `is_globally_blocked`); (b) **default-deny for strangers (allowlist-or-prompt)** — a standing-pair Welcome from a **stranger** is **default-deny** (non-overridable, carrying the **same non-overridable intent** as §5.12.2's tool-bearing rule: a conformant SDK MUST NOT let an `AutoAcceptPolicy` override the deny), justified by the pair's `memory_scope: full` sensitivity (§5.12.1). It MAY be auto-joined **ONLY** if A's DID is on the operator's `known_did` allowlist (§5.12.2 — the sole auto-accept trigger); otherwise B joins **only after explicit human approval**. This default-deny is a **MUST on conformant implementations at the SDK consent-gate layer**, not protocol-layer enforcement. If B's policy configures an `AutoAcceptPolicy` whose `known_did` allowlist contains A, B MAY auto-join; else B joins only after explicit approval. The gate is applied by the **joining peer on Welcome receipt**, never as a synchronous Prepare-B reply: on accept B joins (single-use enforced at join), registers Active, appends, and runs `register_standing_context`; on reject B simply **never joins** — no synchronous "Rejected" reply.
+4. **Peer (B) receives the Welcome and applies the consent gate on receipt** (*before* joining): (a0) **`derived_context_id` agreement (cross-party canonicalization check, defense-in-depth)** — B MUST **re-derive** the standing-pair `derived_context_id` from its **own** inputs (`local_did = B`, `peer_did = A`, each in §3.8.1 canonical form, sorted, length-prefixed per *Determinism precondition*) and verify it **equals** the context id the inbound InvitationBundle / Welcome binds. A mismatch — which can only arise from a DID-canonicalization divergence between A and B (e.g. an exotic did:web encoding the two sides normalize differently) — ⇒ **reject the Welcome (do NOT join)**, surfacing the same generic rejection as any other consent reject (no synchronous "Rejected" reply, per *Block-privacy* below). This is the **receive-side canonicalization backstop** §3.8.1's did:web residual relies on: it converts an **honest** DID-canonicalization divergence between A and B (the only way B's locally-derived id and the bundle's asserted `context_id` differ when A is honest) from a silent split-brain into a clean local rejection (routed through the generic consent-reject, leaking nothing). It is **not** a cryptographic cross-party agreement proof — `InvitationBundle.context_id` (§5.12.3.1) is a creator-asserted, creator-signed label, not a value bound to the DID pair, so a *malicious* A can always label the bundle with the id B will derive. Agreement against a dishonest creator on the collision path rests on the §9.7.1 bound-creator check and MLS membership binding (below), not on this equality test. **Non-mismatch resolution outcomes (a0).** If B cannot resolve or canonicalize `creator_did` (A's DID) at all — distinct from an id *mismatch* — the outcome is determined by the failure kind: a **transient** resolution failure (e.g. the DHT is momentarily unreachable) is a **retryable deferral**, NOT a permanent reject — B re-attempts within the `welcome_ttl` window rather than discarding the Welcome; a **permanent** un-canonicalizable-method case (a DID method that admits no canonical string form — the §3.8.1 fail-loud method-admission gate) is a **reject**. Neither path is ever a silent join: a still-pending transient deferral simply does not join yet, and a permanent failure rejects through the same generic consent-reject as a mismatch. (a) **block list** — refuse if A is globally blocked (§3.7.1 `is_globally_blocked`); (b) **default-deny for strangers (allowlist-or-prompt)** — a standing-pair Welcome from a **stranger** is **default-deny** (non-overridable, carrying the **same non-overridable intent** as §5.12.2's outlet-bearing rule: a conformant SDK MUST NOT let an `AutoAcceptPolicy` override the deny), justified by the pair's `memory_scope: full` sensitivity (§5.12.1). It MAY be auto-joined **ONLY** if A's DID is on the operator's `known_did` allowlist (§5.12.2 — the sole auto-accept trigger); otherwise B joins **only after explicit human approval**. This default-deny is a **MUST on conformant implementations at the SDK consent-gate layer**, not protocol-layer enforcement. If B's policy configures an `AutoAcceptPolicy` whose `known_did` allowlist contains A, B MAY auto-join; else B joins only after explicit approval. The gate is applied by the **joining peer on Welcome receipt**, never as a synchronous Prepare-B reply: on accept B joins (single-use enforced at join), registers Active, appends, and runs `register_standing_context`; on reject B simply **never joins** — no synchronous "Rejected" reply.
 
 #### Threat model and operational contracts
 
@@ -1948,4 +1948,4 @@ The bound-creator check (§9.7.1) requires **BOTH** the creator leaf's `ScpCrede
 
 **`AlreadyExists` is not an existence oracle.** An `AlreadyExists` for an id the caller is **not a verified member of** MUST NOT return `Ok` (it would leak that a pair between two DIDs exists — the contact graph is private local bookkeeping, §5.12.6). The non-member path MUST return a response **indistinguishable in value AND timing** from the generic rejection any other failure returns — it MUST be constant-time with respect to existence, because an existence-dependent latency branch is itself a 1-bit oracle even when the returned value is identical. The typed `AlreadyExists`→`Ok` outcome is reserved **strictly** for verified-self-membership. **Implementer mechanism:** resolve membership **first**, then branch only on *membership* — a non-member and a no-such-context input traverse the same fixed-cost lookup work (`derived_context_id` resolution + membership check) and return the same generic rejection; existence MUST NOT be a branch the latency depends on. The §5.12.5 found-vs-create latency hint (`~0ms` found vs `~200ms` create) applies **only to a verified member's own pair** on the success path, never to the constant-time non-member path. **Reachability (defense-in-depth scope).** The non-member path is reachable **only** via a **raw-`derived_context_id`** join/resolve attempt, never via `standing_context(peer)` itself: `standing_context(peer)` derives the id from the **caller's own DID** + `peer` (sorted, length-prefixed, *Determinism precondition*), so the caller is a pair member **by construction** and cannot address a pair it is not in. The constant-time non-member defense thus guards a raw-`derived_context_id` entry point rather than the `standing_context(peer)` surface — and because `derived_context_id` is publicly computable from any two DIDs (see *Anti-spam* above), that raw entry point is a **concretely reachable** existence-probe surface: the value-AND-timing constant-time requirement on it is **load-bearing for any binding that accepts a raw context id**, not optional hardening.
 
-Cross-refs: §5.12.6 (standing contexts / contact graph; private local bookkeeping), §5.12.1 (`bilateral-persistent` template), §5.12.2 (`AutoAcceptPolicy` / `TrustRequirement` — allowlist-only), §5.12.3.3 (InvitationBundle relay-retention TTL), §5.12.5 (found-vs-create latency hint), §3.8.1 (canonical DID string form for deterministic derivation), §3.7.1 (block list / severance — sender-key rotation), §9.3 (Sybil resistance / earned capacity), §9.5.1 (length-prefix framing), §9.6.1 (did:dht self-certification / z-base-32 canonical form), §9.7.1 (MLS-to-SCP Concept Mapping — KeyPackage-signature / DID-VM binding rule), §9.16.3 (sender key rotation), §17 (event-log consistency / checkpoints), §6.2.4 (cross-context tool invocation saga), ADR-049 §3 / §3a / §9 / §10 / §Follow-ups (single-context async creation, not a saga; fused-join single-use; auto-revive; spawn-from-Welcome).
+Cross-refs: §5.12.6 (standing contexts / contact graph; private local bookkeeping), §5.12.1 (`bilateral-persistent` template), §5.12.2 (`AutoAcceptPolicy` / `TrustRequirement` — allowlist-only), §5.12.3.3 (InvitationBundle relay-retention TTL), §5.12.5 (found-vs-create latency hint), §3.8.1 (canonical DID string form for deterministic derivation), §3.7.1 (block list / severance — sender-key rotation), §9.3 (Sybil resistance / earned capacity), §9.5.1 (length-prefix framing), §9.6.1 (did:dht self-certification / z-base-32 canonical form), §9.7.1 (MLS-to-SCP Concept Mapping — KeyPackage-signature / DID-VM binding rule), §9.16.3 (sender key rotation), §17 (event-log consistency / checkpoints), §6.2.4 (cross-context outlet invocation saga), ADR-049 §3 / §3a / §9 / §10 / §Follow-ups (single-context async creation, not a saga; fused-join single-use; auto-revive; spawn-from-Welcome).
