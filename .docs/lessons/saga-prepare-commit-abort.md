@@ -6,11 +6,11 @@ reconciled. For the *admission* question — "should this even be a saga?" — r
 
 ## One saga survives
 
-There is exactly one cross-context saga in the system: **cross-context tool invocation**
+There is exactly one cross-context saga in the system: **cross-context outlet invocation**
 (spec §6.2.4). Three other arms that ADR-049 originally enumerated (custody handover,
 standing-pair creation, broadcast hosting) were category errors and were withdrawn — see
 the admission lesson. So everything below is written for the single surviving arm: the
-caller's economy reservation and the target's tool execution must be **both-or-neither**
+caller's economy reservation and the target's outlet execution must be **both-or-neither**
 across two distinct context-actors.
 
 ## The FSM
@@ -57,7 +57,7 @@ The per-phase handlers run on the participant actors (`context/actor/handlers/sa
   captures B-controlled provenance, stages the prepared record, Class-S sync-persists
   fail-closed, then replies.
 - **Commit** — split `commit_b_reserve` → supervisor executes → `commit_b_settle`
-  (B records `ToolInvoked`, signs the receipt, durably captures output keyed by `SagaId`)
+  (B records `OutletInvoked`, signs the receipt, durably captures output keyed by `SagaId`)
   and `commit_a` (A re-acks from the durable witness, settles escrow). Every commit step is
   **idempotent by `SagaId`** — a replayed Commit short-circuits.
 - **Abort** (`abort`) — releases the staged reservations, from the live RAII carrier or the
