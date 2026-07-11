@@ -1,22 +1,22 @@
-//! Stateful tool sessions (spec section 6.2.1).
+//! Stateful outlet sessions (spec section 6.2.1).
 //!
 //! Enables multi-turn workflows via session IDs, TTLs, and per-call
-//! governance. Session state lives in the tool's context, not the caller's.
+//! governance. Session state lives in the outlet's context, not the caller's.
 //! Each call within a session is individually governed (UCAN validated per
 //! call).
 //!
-//! See ADR-010 in `.docs/adrs/phase-2.md`, section "Stateful tool sessions".
+//! See ADR-010 in `.docs/adrs/phase-2.md`, section "Stateful outlet sessions".
 //!
 //! # Types
 //!
-//! - [`OutletSession`] -- A single stateful tool session with TTL and call
+//! - [`OutletSession`] -- A single stateful outlet session with TTL and call
 //!   tracking.
 //! - [`SessionStore`] -- In-memory session storage with TTL-based cleanup.
 //!
 //! # Functions
 //!
 //! - [`create_session`] -- Creates a new session and returns its ID.
-//! - [`invoke_session`] -- Invokes a tool within an active session with
+//! - [`invoke_session`] -- Invokes a outlet within an active session with
 //!   per-call UCAN governance.
 //! - [`cleanup_expired`] -- Removes all sessions past their TTL.
 
@@ -50,9 +50,9 @@ use scp_protocol::context::roles::ContextRoleState;
 // OutletSession
 // ---------------------------------------------------------------------------
 
-/// A stateful tool session enabling multi-turn workflows.
+/// A stateful outlet session enabling multi-turn workflows.
 ///
-/// Session state lives in the tool's context, not the caller's. Each call
+/// Session state lives in the outlet's context, not the caller's. Each call
 /// within a session is individually governed via UCAN capability checks.
 /// Sessions have an optional TTL. Sessions without a TTL persist for
 /// the lifetime of the context (spec section 6.2.1).
@@ -62,11 +62,11 @@ use scp_protocol::context::roles::ContextRoleState;
 pub struct OutletSession {
     /// Unique identifier for this session (UUID v4).
     pub session_id: String,
-    /// The tool this session is associated with.
+    /// The outlet this session is associated with.
     pub outlet_id: OutletId,
     /// The context that initiated this session.
     pub source_context: ContextId,
-    /// Opaque session state, managed by the tool.
+    /// Opaque session state, managed by the outlet.
     pub state: serde_json::Value,
     /// Unix timestamp (milliseconds since epoch) when the session was created.
     pub created_at: u64,
@@ -183,18 +183,18 @@ impl SessionStore {
 // create_session
 // ---------------------------------------------------------------------------
 
-/// Creates a new stateful tool session.
+/// Creates a new stateful outlet session.
 ///
-/// Generates a UUID v4 session ID, validates the tool exists in the registry,
+/// Generates a UUID v4 session ID, validates the outlet exists in the registry,
 /// and stores the session with the given TTL. The initial session state is
 /// `serde_json::Value::Null`.
 ///
 /// # Arguments
 ///
 /// * `store` -- The session store to add the session to.
-/// * `registry` -- The tool registry to validate the tool exists.
+/// * `registry` -- The outlet registry to validate the outlet exists.
 /// * `context` -- The context handle (must be in Active state).
-/// * `outlet_id` -- The tool to create a session for.
+/// * `outlet_id` -- The outlet to create a session for.
 /// * `source_context` -- The context that initiated this session.
 /// * `ttl` -- Optional time-to-live for the session. `None` means the
 ///   session persists for the lifetime of the context.
@@ -205,16 +205,16 @@ impl SessionStore {
 ///
 /// # Errors
 ///
-/// Returns [`OutletError`] if the context is not active or the tool is not
+/// Returns [`OutletError`] if the context is not active or the outlet is not
 /// found in the registry.
 // ADR-049 §Decision 12: `state` is now a synchronous lock-free ArcSwap load,
 // so this body has no `.await`. It calls no async provider trait; `async` is
 // retained purely for API symmetry with the genuinely-async `invoke_session`
-// (which awaits the tool executor) and as the stable ContextManager tool API
+// (which awaits the outlet executor) and as the stable ContextManager outlet API
 // contract — not for any pending provider await.
 #[allow(
     clippy::unused_async,
-    reason = "kept async for API symmetry with the async invoke_session and the stable tool API contract; body has no await and calls no async provider"
+    reason = "kept async for API symmetry with the async invoke_session and the stable outlet API contract; body has no await and calls no async provider"
 )]
 pub async fn create_session(
     store: &mut SessionStore,
@@ -233,7 +233,7 @@ pub async fn create_session(
         });
     }
 
-    // Validate tool exists in the registry.
+    // Validate outlet exists in the registry.
     if !registry.contains(outlet_id) {
         return Err(OutletError::OutletNotFound {
             outlet_id: outlet_id.clone(),
@@ -277,27 +277,27 @@ pub async fn create_session(
 // invoke_session
 // ---------------------------------------------------------------------------
 
-/// Invokes a tool within an active session.
+/// Invokes a outlet within an active session.
 ///
 /// Each call is individually governed: UCAN capability is validated per
-/// invocation. The session's call count is incremented and the tool executor
+/// invocation. The session's call count is incremented and the outlet executor
 /// may update the session state.
 ///
 /// # Arguments
 ///
 /// * `store` -- The session store containing the session.
-/// * `registry` -- The tool registry for schema validation.
+/// * `registry` -- The outlet registry for schema validation.
 /// * `role_state` -- The context's role state for UCAN validation.
 /// * `context` -- The context handle (must be in Active state).
 /// * `session_id` -- The session to invoke within.
-/// * `input` -- The input to pass to the tool.
+/// * `input` -- The input to pass to the outlet.
 /// * `invoker_did` -- The DID of the invoker (UCAN validated per call).
-/// * `executor` -- The tool execution function. Receives the input and
+/// * `executor` -- The outlet execution function. Receives the input and
 ///   current session state, returns new session state and output.
 ///
 /// # Returns
 ///
-/// The tool output on success.
+/// The outlet output on success.
 ///
 /// # Errors
 ///
@@ -307,7 +307,7 @@ pub async fn create_session(
 /// - The session has expired.
 /// - The invoker does not have the required capability.
 /// - Input validation fails.
-/// - The tool execution fails.
+/// - The outlet execution fails.
 #[allow(clippy::too_many_arguments)]
 pub async fn invoke_session<F, Fut>(
     store: &mut SessionStore,
@@ -367,13 +367,13 @@ where
         });
     }
 
-    // Validate input against tool's input schema.
+    // Validate input against outlet's input schema.
     if let Some(registration) = registry.get(&outlet_id) {
         validate_value_against_schema(&input, &registration.schema.input_schema)
             .map_err(|msg| OutletError::InputValidationFailed { message: msg })?;
     }
 
-    // Execute the tool with current session state.
+    // Execute the outlet with current session state.
     let (new_state, output) = executor(input, current_state)
         .await
         .map_err(|msg| OutletError::ExecutionFailed { message: msg })?;
@@ -449,7 +449,7 @@ mod tests {
         .unwrap()
     }
 
-    /// Creates a `ContextRoleState` with a member that has no tool invoke
+    /// Creates a `ContextRoleState` with a member that has no outlet invoke
     /// capability.
     fn test_role_state_with_no_invoke_member(
         creator_did: &str,
@@ -474,7 +474,7 @@ mod tests {
         handle
     }
 
-    /// Registers a test tool and returns the registry.
+    /// Registers a test outlet and returns the registry.
     fn setup_registry_with_outlet(
         role_state: &ContextRoleState,
         registrant_did: &str,
@@ -592,7 +592,7 @@ mod tests {
     fn session_not_expired_within_ttl() {
         let session = OutletSession {
             session_id: "sess-1".to_owned(),
-            outlet_id: "tool-1".to_owned(),
+            outlet_id: "outlet-1".to_owned(),
             source_context: "ctx-src".to_owned(),
             state: serde_json::Value::Null,
             created_at: 1000,
@@ -607,7 +607,7 @@ mod tests {
     fn session_expired_past_ttl() {
         let session = OutletSession {
             session_id: "sess-1".to_owned(),
-            outlet_id: "tool-1".to_owned(),
+            outlet_id: "outlet-1".to_owned(),
             source_context: "ctx-src".to_owned(),
             state: serde_json::Value::Null,
             created_at: 1000,
@@ -622,7 +622,7 @@ mod tests {
     fn session_expired_at_exact_ttl_boundary() {
         let session = OutletSession {
             session_id: "sess-1".to_owned(),
-            outlet_id: "tool-1".to_owned(),
+            outlet_id: "outlet-1".to_owned(),
             source_context: "ctx-src".to_owned(),
             state: serde_json::Value::Null,
             created_at: 1000,
@@ -637,7 +637,7 @@ mod tests {
     fn session_with_none_ttl_never_expires() {
         let session = OutletSession {
             session_id: "sess-1".to_owned(),
-            outlet_id: "tool-1".to_owned(),
+            outlet_id: "outlet-1".to_owned(),
             source_context: "ctx-src".to_owned(),
             state: serde_json::Value::Null,
             created_at: 1000,
@@ -672,7 +672,7 @@ mod tests {
         // Session 1: created at 1000, TTL 60s -- expires at 61000.
         store.insert(OutletSession {
             session_id: "sess-active".to_owned(),
-            outlet_id: "tool-1".to_owned(),
+            outlet_id: "outlet-1".to_owned(),
             source_context: "ctx-src".to_owned(),
             state: serde_json::Value::Null,
             created_at: 1000,
@@ -683,7 +683,7 @@ mod tests {
         // Session 2: created at 1000, TTL 10s -- expires at 11000.
         store.insert(OutletSession {
             session_id: "sess-expired".to_owned(),
-            outlet_id: "tool-1".to_owned(),
+            outlet_id: "outlet-1".to_owned(),
             source_context: "ctx-src".to_owned(),
             state: serde_json::Value::Null,
             created_at: 1000,
@@ -768,7 +768,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_session_rejects_unknown_tool() {
+    async fn create_session_rejects_unknown_outlet() {
         let creator_did = "did:dht:z6MkCreator";
         let role_state = test_role_state(creator_did);
         let registry = setup_registry_with_outlet(&role_state, creator_did);
@@ -779,7 +779,7 @@ mod tests {
             &mut store,
             &registry,
             &context,
-            &"nonexistent-tool".to_owned(),
+            &"nonexistent-outlet".to_owned(),
             &"ctx-source".to_owned(),
             Some(Duration::from_mins(5)),
             &scp_clock::SystemClock,
@@ -972,7 +972,7 @@ mod tests {
         // Insert 3 sessions with different TTLs.
         store.insert(OutletSession {
             session_id: "sess-1".to_owned(),
-            outlet_id: "tool-1".to_owned(),
+            outlet_id: "outlet-1".to_owned(),
             source_context: "ctx-src".to_owned(),
             state: serde_json::Value::Null,
             created_at: 1000,
@@ -981,7 +981,7 @@ mod tests {
         });
         store.insert(OutletSession {
             session_id: "sess-2".to_owned(),
-            outlet_id: "tool-1".to_owned(),
+            outlet_id: "outlet-1".to_owned(),
             source_context: "ctx-src".to_owned(),
             state: serde_json::Value::Null,
             created_at: 1000,
@@ -990,7 +990,7 @@ mod tests {
         });
         store.insert(OutletSession {
             session_id: "sess-3".to_owned(),
-            outlet_id: "tool-1".to_owned(),
+            outlet_id: "outlet-1".to_owned(),
             source_context: "ctx-src".to_owned(),
             state: serde_json::Value::Null,
             created_at: 1000,
@@ -1063,7 +1063,7 @@ mod tests {
         );
         assert_eq!(result.unwrap(), serde_json::json!({"result": 3.0}));
 
-        // Second call by member (no ToolInvoke capability) -- should fail.
+        // Second call by member (no OutletInvoke capability) -- should fail.
         let result = invoke_session(
             &mut store,
             &registry,
@@ -1315,7 +1315,7 @@ mod tests {
     fn outlet_session_serialization_roundtrip() {
         let session = OutletSession {
             session_id: "sess-abc".to_owned(),
-            outlet_id: "tool-1".to_owned(),
+            outlet_id: "outlet-1".to_owned(),
             source_context: "ctx-src".to_owned(),
             state: serde_json::json!({"key": "value"}),
             created_at: 1_000_000,
@@ -1325,7 +1325,7 @@ mod tests {
         let json = serde_json::to_string(&session).unwrap();
         let deserialized: OutletSession = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.session_id, "sess-abc");
-        assert_eq!(deserialized.outlet_id, "tool-1");
+        assert_eq!(deserialized.outlet_id, "outlet-1");
         assert_eq!(deserialized.source_context, "ctx-src");
         assert_eq!(deserialized.call_count, 42);
     }

@@ -15,7 +15,7 @@
 //! - `role_progression_count` — `RoleAssigned` leaves for the subject.
 //! - `participation_duration_secs` — `MemberJoined`→`MemberLeft` interval.
 //! - `context_creation_count` — `ChildContextCreated` by the subject.
-//! - `tool_invocation_count_anchored == false` (ADR-051 not yet landed).
+//! - `outlet_invocation_count_anchored == false` (ADR-051 not yet landed).
 //! - `attestation_count` — accessible, currently-valid attestations for the
 //!   subject (the credential-layer fact, §7.4), filtered to subject + Active.
 
@@ -230,7 +230,7 @@ async fn participation_record_derives_all_facts_from_full_log() {
     // Merkle root must be the provider's real root (non-zero, log non-empty).
     assert_ne!(record.event_log_root, [0u8; 32]);
 
-    // The scalar projection flattens identically; tool count is not Merkle-
+    // The scalar projection flattens identically; outlet count is not Merkle-
     // anchored (ADR-051 not landed).
     let facts = ParticipationFacts::from(&record);
     assert_eq!(facts.governance_actions_against, 1);
@@ -239,10 +239,10 @@ async fn participation_record_derives_all_facts_from_full_log() {
     assert_eq!(facts.participation_duration_secs, 300);
     assert_eq!(facts.context_creation_count, 1);
     assert_eq!(facts.attestation_count, 2);
-    assert_eq!(facts.tool_invocation_count, 0);
+    assert_eq!(facts.outlet_invocation_count, 0);
     assert!(
-        !facts.tool_invocation_count_anchored,
-        "tool count is not Merkle-anchored until ADR-051"
+        !facts.outlet_invocation_count_anchored,
+        "outlet count is not Merkle-anchored until ADR-051"
     );
     assert_eq!(facts.subject_did.as_ref(), SUBJECT);
     assert_eq!(facts.event_log_root, record.event_log_root);

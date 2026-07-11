@@ -1081,15 +1081,15 @@ fn vector_27_did_pseudonymization() {
 }
 
 // ---------------------------------------------------------------------------
-// §25.15 Tool Interface Offer ID Vectors
+// §25.15 Outlet Interface Offer ID Vectors
 // ---------------------------------------------------------------------------
 
 #[test]
-fn vector_28_tool_interface_offer_id() {
-    println!("=== Vector 28: Tool Interface Offer ID ===");
+fn vector_28_outlet_interface_offer_id() {
+    println!("=== Vector 28: Outlet Interface Offer ID ===");
 
     let source_context = "source-ctx-01";
-    let outlet_id = "tool-abc123";
+    let outlet_id = "outlet-abc123";
     let target_context = "target-ctx-02";
     let timestamp: u64 = 1_700_000_000;
 

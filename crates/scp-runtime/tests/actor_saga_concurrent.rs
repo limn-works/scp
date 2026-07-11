@@ -86,7 +86,7 @@ fn test_supervisor() -> Arc<Supervisor> {
     ))
 }
 
-/// A cross-context tool-invocation saga over the given caller/target
+/// A cross-context outlet-invocation saga over the given caller/target
 /// contexts. Its participant context set is `{caller, target}`. The
 /// envelope fields are placeholders — these gating tests never reach
 /// Prepare-B (no co-resident actors), so only the two context ids (the

@@ -5,7 +5,7 @@
 //! honest members at the same log position MUST derive the same
 //! `event_log_merkle_root`. For that to hold, the canonical Merkle log may carry
 //! only **convergent** events — those every honest member appends identically.
-//! `MessageSent` / `ToolInvoked` / the payment receipts are per-author,
+//! `MessageSent` / `OutletInvoked` / the payment receipts are per-author,
 //! non-convergent, so they are excluded from the durable log and surfaced only
 //! as local `ContextEvent`s.
 //!

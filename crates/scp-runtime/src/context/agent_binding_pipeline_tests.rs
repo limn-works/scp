@@ -416,7 +416,7 @@ mod live_supervisor_send {
     // Test-only recording transport: the `Mutex<Vec<...>>` capture buffer is
     // written/read exclusively from the synchronous `ContextTransportProvider`
     // trait methods (and the test body), never held across an `.await`, so a
-    // plain `std::sync::Mutex` is the correct tool. The runtime's actor path
+    // plain `std::sync::Mutex` is the correct outlet. The runtime's actor path
     // bans it (ADR-049); test fixtures are explicitly exempt — same exemption
     // the `CapturingPersistence` fixture takes. See crates/scp-runtime/clippy.toml.
     #![allow(clippy::disallowed_types)]

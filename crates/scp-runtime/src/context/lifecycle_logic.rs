@@ -177,7 +177,7 @@ pub fn validate_consequence_rules_for_import(
 /// Returns the spec §19.7 default per-DID message pricing configuration.
 ///
 /// Every context now uses the same baseline: per-DID escalating cost for
-/// `MessageSend`, `ContextJoin`, and `ToolInvoke`, plus the Matrix-style
+/// `MessageSend`, `ContextJoin`, and `OutletInvoke`, plus the Matrix-style
 /// hard rate limit. The `_economic_policy` parameter is intentionally
 /// unused — it is kept in the signature so call-sites stay symmetrical
 /// with the old `derive_relay_pricing_config` while documenting that

@@ -3243,7 +3243,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn mint_ucan_tool_invoke_produces_underscore_resource() {
+    async fn mint_ucan_outlet_invoke_produces_underscore_resource() {
         // Minting with the colon-format name "outlet:call:*" must produce
         // a UCAN URI with resource "outlet_call", not "outlet".
         let (custody, key_handle, issuer_did) = setup_custody().await;
@@ -3277,7 +3277,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mint_ucan_tool_invoke_specific_produces_underscore_resource() {
+    async fn mint_ucan_outlet_invoke_specific_produces_underscore_resource() {
         let (custody, key_handle, issuer_did) = setup_custody().await;
         let caps = vec!["outlet:call:calculator".to_owned()];
 
@@ -3375,7 +3375,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mint_ucan_tool_invoke_passes_ceiling_check() {
+    async fn mint_ucan_outlet_invoke_passes_ceiling_check() {
         // A ceiling with UCAN-format entries must accept outlet:call:* capabilities.
         let (custody, key_handle, issuer_did) = setup_custody().await;
         let caps = vec!["outlet:call:*".to_owned()];
@@ -3407,7 +3407,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mint_ucan_tool_invoke_rejected_when_not_in_ceiling() {
+    async fn mint_ucan_outlet_invoke_rejected_when_not_in_ceiling() {
         let (custody, key_handle, issuer_did) = setup_custody().await;
         let caps = vec!["outlet:call:*".to_owned()];
 

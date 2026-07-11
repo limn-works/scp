@@ -1,13 +1,13 @@
-//! Tool invocation with full execution lifecycle.
+//! Outlet invocation with full execution lifecycle.
 //!
 //! Implements [`invoke_outlet`]: the primary entry point for executing a
-//! registered tool within an SCP context. Handles context state validation,
+//! registered outlet within an SCP context. Handles context state validation,
 //! UCAN capability checking, input/output schema validation, timeout
 //! enforcement, cancellation, error propagation, and event log recording.
 //!
-//! Tool execution errors are surfaced as [`InvocationError::ExecutionFailed`]
+//! Outlet execution errors are surfaced as [`InvocationError::ExecutionFailed`]
 //! carrying the executor's message. Schema validation failures are caught by
-//! the SDK (this module), not by the tool itself.
+//! the SDK (this module), not by the outlet itself.
 //!
 //! See ADR-010 in `.docs/adrs/phase-2.md` for the full design.
 
@@ -41,7 +41,7 @@ use scp_protocol::trust::consequence::evaluate_consequence_rules;
 /// Errors produced by [`invoke_outlet`].
 ///
 /// These are protocol-level errors that prevent the invocation from being
-/// dispatched. Tool execution errors are surfaced as the
+/// dispatched. Outlet execution errors are surfaced as the
 /// [`ExecutionFailed`](InvocationError::ExecutionFailed) variant instead.
 #[derive(Debug, thiserror::Error)]
 pub enum InvocationError {
@@ -59,44 +59,44 @@ pub enum InvocationError {
     InvokerNotAuthorized {
         /// The DID that attempted invocation.
         did: String,
-        /// The tool they tried to invoke.
+        /// The outlet they tried to invoke.
         outlet_id: String,
     },
 
-    /// The tool was not found in the registry.
-    #[error("tool not found: \"{outlet_id}\"")]
+    /// The outlet was not found in the registry.
+    #[error("outlet not found: \"{outlet_id}\"")]
     OutletNotFound {
-        /// The tool ID that was not found.
+        /// The outlet ID that was not found.
         outlet_id: String,
     },
 
-    /// Input validation failed against the tool's input schema.
+    /// Input validation failed against the outlet's input schema.
     #[error("input validation failed: {message}")]
     InputValidationFailed {
         /// Description of the validation failure.
         message: String,
     },
 
-    /// Output validation failed against the tool's output schema.
+    /// Output validation failed against the outlet's output schema.
     #[error("output validation failed: {message}")]
     OutputValidationFailed {
         /// Description of the validation failure.
         message: String,
     },
 
-    /// The tool execution timed out.
-    #[error("tool execution timed out after {timeout_ms}ms")]
+    /// The outlet execution timed out.
+    #[error("outlet execution timed out after {timeout_ms}ms")]
     Timeout {
         /// The timeout that was exceeded.
         timeout_ms: u32,
     },
 
-    /// The tool execution was cancelled.
-    #[error("tool execution was cancelled")]
+    /// The outlet execution was cancelled.
+    #[error("outlet execution was cancelled")]
     Cancelled,
 
-    /// The tool execution failed.
-    #[error("tool execution failed: {message}")]
+    /// The outlet execution failed.
+    #[error("outlet execution failed: {message}")]
     ExecutionFailed {
         /// Description of the execution failure.
         message: String,
@@ -104,7 +104,7 @@ pub enum InvocationError {
 
     /// The invoker's spending budget has been exceeded (§19.5, ADR-033).
     ///
-    /// Returned when the context has an economic policy with a per-tool-invoke
+    /// Returned when the context has an economic policy with a per-outlet-invoke
     /// cost and the invoker's cumulative spending would exceed their
     /// governance-approved budget.
     ///
@@ -113,7 +113,7 @@ pub enum InvocationError {
     BudgetExceeded {
         /// The DID that attempted invocation.
         did: String,
-        /// The cost of the tool invocation.
+        /// The cost of the outlet invocation.
         cost: u64,
         /// The remaining budget for the invoker.
         remaining: u64,
@@ -121,10 +121,10 @@ pub enum InvocationError {
 }
 
 // ---------------------------------------------------------------------------
-// Economy context for tool invocation
+// Economy context for outlet invocation
 // ---------------------------------------------------------------------------
 
-/// Optional economy parameters for tool invocation.
+/// Optional economy parameters for outlet invocation.
 ///
 /// When provided, `invoke_outlet` enforces budget checks before execution
 /// and performs post-invocation bookkeeping (participation record update,
@@ -163,18 +163,18 @@ pub struct OutletEconomyContext<'a, S: BuildHasher = std::hash::RandomState> {
     /// Optional payment adapter for the 9-step payment flow (spec §19.2.2, #1537).
     ///
     /// When `Some`, `invoke_outlet` runs `prepare_paid_action` + `process_paid_action`
-    /// before tool execution. When `None`, only budget enforcement runs.
+    /// before outlet execution. When `None`, only budget enforcement runs.
     pub payment_adapter: Option<std::sync::Arc<dyn crate::economy::adapter::PaymentAdapterDyn>>,
     /// Observable metrics for dynamic cost evaluation. Populated from
-    /// `PerContextState` by the caller so that tool economy uses real
+    /// `PerContextState` by the caller so that outlet economy uses real
     /// metrics instead of zeros.
     pub metrics: scp_protocol::economy::policy::ObservableMetrics,
-    /// Per-DID velocity tracker (spec §19.4) for tool-invoke escalation.
+    /// Per-DID velocity tracker (spec §19.4) for outlet-invoke escalation.
     /// `None` skips per-DID escalation; pricing baseline (if any) still
     /// applies through the policy formula or `message_pricing.base_cost`.
     pub velocity_tracker: Option<&'a scp_protocol::economy::antispam::SenderVelocityTracker>,
     /// Per-DID message pricing config (spec §19.7). Carries base cost,
-    /// escalation thresholds, and floor/cap. When `Some`, tool invocations
+    /// escalation thresholds, and floor/cap. When `Some`, outlet invocations
     /// participate in the same per-DID anti-spam regime as message sends.
     pub message_pricing: Option<&'a scp_protocol::economy::antispam::ContextMessagePricingConfig>,
 }
@@ -183,7 +183,7 @@ pub struct OutletEconomyContext<'a, S: BuildHasher = std::hash::RandomState> {
 // invoke_outlet
 // ---------------------------------------------------------------------------
 
-/// Invokes a tool within a context, performing full lifecycle validation.
+/// Invokes a outlet within a context, performing full lifecycle validation.
 ///
 /// Execution flow:
 /// 1. Validates context state is [`Active`](ContextState::Active).
@@ -191,19 +191,19 @@ pub struct OutletEconomyContext<'a, S: BuildHasher = std::hash::RandomState> {
 ///    [`OutletCall(outlet_id)`](scp_protocol::context::roles::Capability::OutletCall)
 ///    or [`OutletCallAll`](scp_protocol::context::roles::Capability::OutletCallAll)
 ///    capability via UCAN.
-/// 3. Looks up the tool in the registry.
-/// 4. Validates input against the tool's input schema.
+/// 3. Looks up the outlet in the registry.
+/// 4. Validates input against the outlet's input schema.
 ///    - 4a. Economy: checks budget and UCAN composition (if economy context provided).
-/// 5. Calls the tool implementation via the `executor` function.
-/// 6. Validates output against the tool's output schema.
+/// 5. Calls the outlet implementation via the `executor` function.
+/// 6. Validates output against the outlet's output schema.
 ///    - 6a. Post-invocation bookkeeping — participation + consequences.
 /// 7. Builds a [`OutletInvokedEvent`] for the caller to append to the event log.
-/// 8. Returns the tool output and any triggered consequences.
+/// 8. Returns the outlet output and any triggered consequences.
 ///
 /// # Timeout handling
 ///
-/// The `timeout_ms` parameter specifies the maximum time to wait for the tool
-/// to complete. If the tool does not complete within the timeout, a
+/// The `timeout_ms` parameter specifies the maximum time to wait for the outlet
+/// to complete. If the outlet does not complete within the timeout, a
 /// [`InvocationError::Timeout`] is returned. The timeout is clamped to the
 /// hard protocol maximum of [`MAX_TIMEOUT_MS`] (300,000ms / 5 minutes).
 ///
@@ -243,7 +243,7 @@ where
     F: FnOnce(serde_json::Value) -> Fut,
     Fut: Future<Output = Result<serde_json::Value, String>>,
 {
-    // 1-4. Validate context state, capability, tool registration, and input
+    // 1-4. Validate context state, capability, outlet registration, and input
     // schema BEFORE deducting budget. The helper
     // `invoke_outlet_execute_and_validate` runs the same checks again after the
     // economy pre-check — this is intentional redundancy so direct callers
@@ -295,7 +295,7 @@ where
         None => None,
     };
 
-    // 4b. Payment escrow (#1537, #1596): authorize (escrow hold) BEFORE tool execution.
+    // 4b. Payment escrow (#1537, #1596): authorize (escrow hold) BEFORE outlet execution.
     let escrow_parts = extract_escrow_parts(&economy);
     let mut escrow = if let Some((adapter, policy, metrics, ctx_id)) = &escrow_parts {
         match authorize_outlet_payment(adapter.as_ref(), policy, ctx_id, invoker_did, metrics).await
@@ -317,7 +317,7 @@ where
         None
     };
 
-    // 5-6. Execute the tool with timeout and validate the output. Delegates
+    // 5-6. Execute the outlet with timeout and validate the output. Delegates
     // to the shared `invoke_outlet_execute_and_validate` helper so the manager
     // wrapper can share the exact same execution path.
     let outcome = match invoke_outlet_execute_and_validate(
@@ -382,13 +382,13 @@ where
 }
 
 /// Outcome of [`invoke_outlet_execute_and_validate`] — the pure-execution half
-/// of tool invocation shared between direct callers and the
+/// of outlet invocation shared between direct callers and the
 /// [`ContextManager::invoke_outlet_with_economy`](crate::context::ContextManager::invoke_outlet_with_economy)
 /// wrapper. Captures everything needed to build a [`OutletInvokedEvent`]
 /// without re-running the executor or rehashing the payloads.
 #[derive(Debug)]
 pub(crate) struct InvokeExecuteOutcome {
-    /// The tool output value (already schema-validated).
+    /// The outlet output value (already schema-validated).
     pub output: serde_json::Value,
     /// SHA-256 hash of the input JSON (hex-encoded). Computed from the input
     /// the executor actually saw, before execution.
@@ -403,10 +403,10 @@ pub(crate) struct InvokeExecuteOutcome {
     pub execution_time_ms: u64,
 }
 
-/// Runs steps 1-6 of tool invocation without any economy state.
+/// Runs steps 1-6 of outlet invocation without any economy state.
 ///
-/// This helper is the off-lock execution half of tool invocation. It
-/// performs: context-state check, capability check, tool lookup, input
+/// This helper is the off-lock execution half of outlet invocation. It
+/// performs: context-state check, capability check, outlet lookup, input
 /// schema validation, executor dispatch under a bounded timeout, and
 /// output schema validation. It deliberately takes NO economy context
 /// and touches no governance state so that
@@ -448,7 +448,7 @@ where
         });
     }
 
-    // 2. Look up the tool in the registry first, so the capability check can
+    // 2. Look up the outlet in the registry first, so the capability check can
     //    branch on the outlet's registered kind (SCP-OUT-014).
     let registration = registry
         .get(outlet_id)
@@ -466,7 +466,7 @@ where
         });
     }
 
-    // 4. Validate input against the tool's input schema.
+    // 4. Validate input against the outlet's input schema.
     validate_value_against_schema(&input, &registration.schema.input_schema)
         .map_err(|msg| InvocationError::InputValidationFailed { message: msg })?;
 
@@ -477,7 +477,7 @@ where
     // take the input by reference and mutate it).
     let input_hash = sha256_json(&input);
 
-    // 5. Execute the tool with timeout.
+    // 5. Execute the outlet with timeout.
     let effective_timeout = timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS).min(MAX_TIMEOUT_MS);
     let timeout_duration = Duration::from_millis(u64::from(effective_timeout));
     let execution_result = tokio::time::timeout(timeout_duration, executor(input)).await;
@@ -493,7 +493,7 @@ where
         }
     };
 
-    // 6. Validate output against the tool's output schema.
+    // 6. Validate output against the outlet's output schema.
     validate_value_against_schema(&output, &registration.schema.output_schema)
         .map_err(|msg| InvocationError::OutputValidationFailed { message: msg })?;
 
@@ -638,13 +638,13 @@ pub(crate) fn build_outlet_event(
     }
 }
 
-/// Invokes a tool with cancellation support.
+/// Invokes a outlet with cancellation support.
 ///
 /// Same as [`invoke_outlet`] but accepts a cancellation future. If the
-/// cancellation future resolves before the tool completes, the invocation
+/// cancellation future resolves before the outlet completes, the invocation
 /// returns [`InvocationError::Cancelled`].
 ///
-/// Cancellation is best-effort: if the tool completes before the cancel
+/// Cancellation is best-effort: if the outlet completes before the cancel
 /// signal, the successful result is returned.
 ///
 /// # Errors
@@ -680,7 +680,7 @@ where
 {
     let start = std::time::Instant::now();
 
-    // 1-4: Validate context, capability, tool, schema (same as invoke_outlet).
+    // 1-4: Validate context, capability, outlet, schema (same as invoke_outlet).
     let state = context.state();
     if state != ContextState::Active {
         return Err(InvocationError::ContextNotActive {
@@ -725,7 +725,7 @@ where
         None => None,
     };
 
-    // 4b. Payment escrow (#1537, #1596): authorize (escrow hold) BEFORE tool execution.
+    // 4b. Payment escrow (#1537, #1596): authorize (escrow hold) BEFORE outlet execution.
     let escrow_parts = extract_escrow_parts(&economy);
     let mut escrow = if let Some((adapter, policy, metrics, ctx_id)) = &escrow_parts {
         match authorize_outlet_payment(adapter.as_ref(), policy, ctx_id, invoker_did, metrics).await
@@ -838,9 +838,9 @@ where
 
 /// Post-invocation bookkeeping: participation record update and consequence evaluation.
 ///
-/// Called after a successful tool invocation to update governance state.
+/// Called after a successful outlet invocation to update governance state.
 /// `compute_participation_record` refreshes the cache for proposer eligibility
-/// (#1530). `evaluate_consequence_rules` checks whether the tool invocation
+/// (#1530). `evaluate_consequence_rules` checks whether the outlet invocation
 /// triggered any consequence rules (#1531).
 pub fn post_outlet_invocation_bookkeeping<S: std::hash::BuildHasher>(
     events: &[scp_event_log::Event],
@@ -855,7 +855,7 @@ pub fn post_outlet_invocation_bookkeeping<S: std::hash::BuildHasher>(
     >,
     consequence_rules: &[scp_protocol::trust::consequence::ConsequenceRule],
 ) -> Vec<scp_protocol::trust::consequence::TriggeredConsequence> {
-    // Update participation record after tool execution (#1530).
+    // Update participation record after outlet execution (#1530).
     if !events.is_empty()
         && let Ok(record) = scp_protocol::trust::participation::compute_participation_record(
             events,
@@ -864,7 +864,7 @@ pub fn post_outlet_invocation_bookkeeping<S: std::hash::BuildHasher>(
             [0u8; 32],
             now,
             // attestation_count is a credential-layer, verifier-relative fact
-            // (§7.3.2); this tool-invoke path gates only on participation_count
+            // (§7.3.2); this outlet-invoke path gates only on participation_count
             // and has no attestation-cache access, so it passes an empty
             // accessible-attestation set (count 0) by design — NOT a stub.
             &[],
@@ -873,7 +873,7 @@ pub fn post_outlet_invocation_bookkeeping<S: std::hash::BuildHasher>(
         participation_cache.insert(invoker_did.to_string(), record);
     }
 
-    // Evaluate consequence rules after tool execution (#1531).
+    // Evaluate consequence rules after outlet execution (#1531).
     // The caller is responsible for enforcing triggered consequences via
     // enforce_triggered_consequences on the PerContextState.
     evaluate_consequence_rules(
@@ -885,7 +885,7 @@ pub fn post_outlet_invocation_bookkeeping<S: std::hash::BuildHasher>(
     )
 }
 
-/// Validates the spending side of AND-composition for paid tool invocations
+/// Validates the spending side of AND-composition for paid outlet invocations
 /// (spec §19.5).
 ///
 /// Per spec §19.5, paid actions require BOTH an action capability AND a
@@ -928,7 +928,7 @@ fn extract_escrow_parts<S: BuildHasher>(
     Some((adapter, policy, metrics, context_id))
 }
 
-/// Completes the escrow payment after successful tool execution, or rolls back
+/// Completes the escrow payment after successful outlet execution, or rolls back
 /// the budget on capture failure.
 ///
 /// Returns the payment receipt (if any). On capture failure, rolls back budget
@@ -967,7 +967,7 @@ type EscrowParts = (
     String,
 );
 
-/// Voids the payment escrow and rolls back budget on tool failure.
+/// Voids the payment escrow and rolls back budget on outlet failure.
 ///
 /// Combines the void + rollback pattern that appears in every failure branch
 /// of `invoke_outlet` and `invoke_outlet_with_cancellation`.
@@ -989,16 +989,16 @@ async fn void_escrow_and_rollback<S: BuildHasher>(
 }
 
 // ---------------------------------------------------------------------------
-// Escrow payment flow for tool invocations (#1537)
+// Escrow payment flow for outlet invocations (#1537)
 // ---------------------------------------------------------------------------
 
-/// Authorizes a tool payment (escrow step 1).
+/// Authorizes a outlet payment (escrow step 1).
 ///
 /// Creates an escrow hold via `prepare_paid_action`. Returns the prepared
 /// action for later completion or voiding. Returns `None` when cost is zero
 /// or no payment is needed.
 ///
-/// Called BEFORE tool execution. On success, the caller must eventually call
+/// Called BEFORE outlet execution. On success, the caller must eventually call
 /// `complete_outlet_payment` or `void_outlet_escrow`.
 pub(crate) async fn authorize_outlet_payment(
     adapter: &dyn crate::economy::adapter::PaymentAdapterDyn,
@@ -1042,9 +1042,9 @@ pub(crate) async fn authorize_outlet_payment(
     Ok(Some(prepared))
 }
 
-/// Completes a tool payment (escrow step 2: capture).
+/// Completes a outlet payment (escrow step 2: capture).
 ///
-/// Called AFTER successful tool execution. Captures the escrowed payment
+/// Called AFTER successful outlet execution. Captures the escrowed payment
 /// and returns the receipt.
 pub(crate) async fn complete_outlet_payment(
     adapter: &dyn crate::economy::adapter::PaymentAdapterDyn,
@@ -1061,23 +1061,23 @@ pub(crate) async fn complete_outlet_payment(
     )
     .await
     .map_err(|_| InvocationError::ExecutionFailed {
-        message: "payment capture failed after successful tool execution".to_owned(),
+        message: "payment capture failed after successful outlet execution".to_owned(),
     })?;
 
     if let Some(receipt) = &processed.receipt {
         tracing::debug!(
             receipt_id = %hex::encode(receipt.receipt_id),
             adapter_id = %receipt.adapter_id,
-            "tool invocation payment receipt captured"
+            "outlet invocation payment receipt captured"
         );
     }
 
     Ok(processed.receipt)
 }
 
-/// Voids a tool payment escrow on failure.
+/// Voids a outlet payment escrow on failure.
 ///
-/// Called when tool execution fails (error, timeout, cancellation) to
+/// Called when outlet execution fails (error, timeout, cancellation) to
 /// release the escrow hold. Best-effort — logs but does not propagate
 /// void failures.
 pub(crate) async fn void_outlet_escrow(
@@ -1087,7 +1087,7 @@ pub(crate) async fn void_outlet_escrow(
     if let Some(ref authorization) = prepared.envelope.authorization
         && let Err(e) = adapter.void_dyn(authorization).await
     {
-        tracing::warn!("failed to void tool payment escrow: {e}");
+        tracing::warn!("failed to void outlet payment escrow: {e}");
     }
 }
 
@@ -1168,10 +1168,10 @@ pub fn has_outlet_invocation_capability(
 }
 
 // ---------------------------------------------------------------------------
-// UCAN validation at tool invocation boundary (#319)
+// UCAN validation at outlet invocation boundary (#319)
 // ---------------------------------------------------------------------------
 
-/// Validates a UCAN token for tool invocation authorization.
+/// Validates a UCAN token for outlet invocation authorization.
 ///
 /// Parses the encoded JWT token and runs the full 11-step ADR-016 validation
 /// pipeline. The required capability stem is selected from the outlet's
@@ -1182,14 +1182,14 @@ pub fn has_outlet_invocation_capability(
 /// `outlet_query:*` → child `outlet_call:x`) is rejected automatically because
 /// the `CapabilityUri` `resource` strings differ.
 ///
-/// This is the primary authorization gate for tool invocations. Role-based
+/// This is the primary authorization gate for outlet invocations. Role-based
 /// `has_outlet_invocation_capability` remains as defense-in-depth.
 ///
 /// # Arguments
 ///
 /// * `encoded_token` — JWT-encoded UCAN token.
-/// * `context_id` — The context ID the tool belongs to.
-/// * `outlet_name` — The name of the tool being invoked.
+/// * `context_id` — The context ID the outlet belongs to.
+/// * `outlet_name` — The name of the outlet being invoked.
 /// * `kind` — The outlet's registered [`scp_protocol::context::outlets::OutletKind`],
 ///   which selects the required capability stem.
 /// * `ctx` — The validation context with resolvers, trackers, and ceiling.
@@ -1282,7 +1282,7 @@ mod tests {
     ) -> ContextRoleState {
         let mut state = test_role_state(creator_did);
         state.members.insert(member_did.to_owned());
-        // Assign only MessagesRead/Write, no tool invoke.
+        // Assign only MessagesRead/Write, no outlet invoke.
         let member_caps: HashSet<Capability> =
             [Capability::MessagesRead, Capability::MessagesWrite]
                 .into_iter()
@@ -1293,7 +1293,7 @@ mod tests {
         state
     }
 
-    /// Creates a valid tool registration and registers it in a fresh registry.
+    /// Creates a valid outlet registration and registers it in a fresh registry.
     fn setup_registry_with_outlet(
         role_state: &ContextRoleState,
         registrant_did: &str,
@@ -1401,7 +1401,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn invoke_tool_succeeds_with_valid_invocation() {
+    async fn invoke_outlet_succeeds_with_valid_invocation() {
         let creator_did = "did:dht:z6MkCreator";
         let role_state = test_role_state(creator_did);
         let registry = setup_registry_with_outlet(&role_state, creator_did);
@@ -1436,7 +1436,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn invoke_tool_rejects_when_context_not_active() {
+    async fn invoke_outlet_rejects_when_context_not_active() {
         let creator_did = "did:dht:z6MkCreator";
         let role_state = test_role_state(creator_did);
         let registry = setup_registry_with_outlet(&role_state, creator_did);
@@ -1471,7 +1471,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn invoke_tool_rejects_invoker_without_tool_invoke_capability() {
+    async fn invoke_outlet_rejects_invoker_without_outlet_invoke_capability() {
         let creator_did = "did:dht:z6MkCreator";
         let member_did = "did:dht:z6MkMember";
         let role_state = test_role_state_with_no_invoke_member(creator_did, member_did);
@@ -1500,11 +1500,11 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // invoke_outlet: tool not found
+    // invoke_outlet: outlet not found
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn invoke_tool_rejects_unknown_tool() {
+    async fn invoke_outlet_rejects_unknown_outlet() {
         let creator_did = "did:dht:z6MkCreator";
         let role_state = test_role_state(creator_did);
         let registry = OutletRegistry::new(); // Empty registry
@@ -1514,7 +1514,7 @@ mod tests {
             &context,
             &registry,
             &role_state,
-            &"nonexistent-tool".to_owned(),
+            &"nonexistent-outlet".to_owned(),
             serde_json::json!({}),
             &DID::from(creator_did),
             None,
@@ -1536,7 +1536,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn invoke_tool_rejects_invalid_input_schema() {
+    async fn invoke_outlet_rejects_invalid_input_schema() {
         let creator_did = "did:dht:z6MkCreator";
         let role_state = test_role_state(creator_did);
         let registry = setup_registry_with_outlet(&role_state, creator_did);
@@ -1569,7 +1569,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn invoke_tool_timeout_synthesizes_timeout_error() {
+    async fn invoke_outlet_timeout_synthesizes_timeout_error() {
         let creator_did = "did:dht:z6MkCreator";
         let role_state = test_role_state(creator_did);
         let registry = setup_registry_with_outlet(&role_state, creator_did);
@@ -1607,7 +1607,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn invoke_tool_cancellation_returns_cancelled_status() {
+    async fn invoke_outlet_cancellation_returns_cancelled_status() {
         let creator_did = "did:dht:z6MkCreator";
         let role_state = test_role_state(creator_did);
         let registry = setup_registry_with_outlet(&role_state, creator_did);
@@ -1651,7 +1651,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn invoke_tool_execution_failure_propagates_error() {
+    async fn invoke_outlet_execution_failure_propagates_error() {
         let creator_did = "did:dht:z6MkCreator";
         let role_state = test_role_state(creator_did);
         let registry = setup_registry_with_outlet(&role_state, creator_did);
@@ -1689,7 +1689,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn invoke_tool_rejects_invalid_output_schema() {
+    async fn invoke_outlet_rejects_invalid_output_schema() {
         let creator_did = "did:dht:z6MkCreator";
         let role_state = test_role_state(creator_did);
         let registry = setup_registry_with_outlet(&role_state, creator_did);
@@ -1726,7 +1726,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn invoke_tool_event_contains_hashes_not_full_data() {
+    async fn invoke_outlet_event_contains_hashes_not_full_data() {
         let creator_did = "did:dht:z6MkCreator";
         let role_state = test_role_state(creator_did);
         let registry = setup_registry_with_outlet(&role_state, creator_did);
@@ -1765,7 +1765,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn invoke_tool_rejects_closing_context() {
+    async fn invoke_outlet_rejects_closing_context() {
         let creator_did = "did:dht:z6MkCreator";
         let role_state = test_role_state(creator_did);
         let registry = setup_registry_with_outlet(&role_state, creator_did);
@@ -1804,7 +1804,7 @@ mod tests {
         assert!(has_outlet_call_capability(
             &role_state,
             "did:dht:z6MkCreator",
-            "any-tool"
+            "any-outlet"
         ));
     }
 
@@ -1820,7 +1820,7 @@ mod tests {
     }
 
     #[test]
-    fn has_outlet_call_capability_with_specific_tool() {
+    fn has_outlet_call_capability_with_specific_outlet() {
         let mut role_state =
             test_role_state_with_no_invoke_member("did:dht:z6MkCreator", "did:dht:z6MkMember");
         // Add specific OutletCall capability.
@@ -1835,11 +1835,11 @@ mod tests {
             "did:dht:z6MkMember",
             "calculator"
         ));
-        // But not for a different tool.
+        // But not for a different outlet.
         assert!(!has_outlet_call_capability(
             &role_state,
             "did:dht:z6MkMember",
-            "other-tool"
+            "other-outlet"
         ));
     }
 
@@ -1969,7 +1969,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn invoke_tool_clamps_timeout_to_protocol_maximum() {
+    async fn invoke_outlet_clamps_timeout_to_protocol_maximum() {
         let creator_did = "did:dht:z6MkCreator";
         let role_state = test_role_state(creator_did);
         let registry = setup_registry_with_outlet(&role_state, creator_did);
@@ -2136,10 +2136,10 @@ mod tests {
 
         let err = InvocationError::InvokerNotAuthorized {
             did: "did:dht:test".into(),
-            outlet_id: "tool-1".to_owned(),
+            outlet_id: "outlet-1".to_owned(),
         };
         assert!(err.to_string().contains("did:dht:test"));
-        assert!(err.to_string().contains("tool-1"));
+        assert!(err.to_string().contains("outlet-1"));
 
         let err = InvocationError::OutletNotFound {
             outlet_id: "missing".to_owned(),
@@ -2154,11 +2154,11 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // validate_outlet_invocation_ucan: rejects non-tool capability (#319)
+    // validate_outlet_invocation_ucan: rejects non-outlet capability (#319)
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn validate_tool_invocation_ucan_rejects_non_tool_capability() {
+    async fn validate_outlet_invocation_ucan_rejects_non_outlet_capability() {
         use crate::crypto::ucan::mint::{MintParams, mint_ucan};
         use scp_platform::testing::InMemoryKeyCustody;
         use scp_platform::traits::{KeyCustody, KeyType};
@@ -2236,7 +2236,7 @@ mod tests {
 
         assert!(
             result.is_err(),
-            "UCAN with messages:write must be rejected for tool invocation"
+            "UCAN with messages:write must be rejected for outlet invocation"
         );
         let err = result.unwrap_err();
         assert!(
@@ -2374,9 +2374,9 @@ mod tests {
         );
     }
 
-    // budget_exceeded on tool invocation returns BudgetExceeded
+    // budget_exceeded on outlet invocation returns BudgetExceeded
     #[tokio::test]
-    async fn budget_exceeded_tool_invoke() {
+    async fn budget_exceeded_outlet_invoke() {
         use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
 
         let policy = EconomicPolicy {
@@ -2396,7 +2396,7 @@ mod tests {
 
         let invoker: DID = "did:key:invoker".into();
         let mut tracker = scp_protocol::economy::budget::MemberBudgetTracker::new();
-        // Grant only 100 budget but tool costs 200.
+        // Grant only 100 budget but outlet costs 200.
         tracker.grant(&invoker, Amount::new(100));
 
         // Budget enforcement is now inline in economy_pre_check via invoke_outlet.
@@ -2411,9 +2411,9 @@ mod tests {
         // `invoke_outlet_with_economy` wrapper on `ContextManager` which
         // populates `sender_velocity` from the live velocity tracker via
         // `velocity_tracker.get_velocity(invoker_did, now_secs)` at
-        // `crates/scp-runtime/src/context/manager/tools.rs` (see the
-        // `invoke_tool_with_economy_wires_escalation_and_rollback` and
-        // `invoke_tool_with_economy_releases_lock_before_executor`
+        // `crates/scp-runtime/src/context/manager/outlets.rs` (see the
+        // `invoke_outlet_with_economy_wires_escalation_and_rollback` and
+        // `invoke_outlet_with_economy_releases_lock_before_executor`
         // structural assertions in
         // `crates/scp-testing/tests/integration/pipeline_wiring.rs` which
         // pin the real wiring, and the behavioural escalation test in

@@ -41,7 +41,7 @@ use scp_protocol::context::ContextError;
 ///   could forge membership/roles/params. Distinguished from a signature
 ///   failure by a dedicated `version` error.
 /// - `2`: signed export over an **enumerated subset** of the snapshot
-///   (membership / role-definitions / params / tool-names + Merkle root +
+///   (membership / role-definitions / params / outlet-names + Merkle root +
 ///   exporter DID + version), the §23.16.4 sync-delta hash recipe.
 ///   **Rejected on import** — the subset left the trusted governance,
 ///   economic, access-key, and ceiling fields that `import_context` restores
@@ -307,7 +307,7 @@ impl ContextExport {
     /// per-member and suspended capabilities, threshold set/value, governance
     /// model configuration, economic policy, consequence rules,
     /// read-exclusion list, access-key store, pending ceiling modification,
-    /// and tool registrations — is in the signed preimage, so none of them is
+    /// and outlet registrations — is in the signed preimage, so none of them is
     /// forgeable. The earlier v2 enumerated-subset recipe (§23.16.4) left
     /// those fields unsigned; it is no longer used for export.
     ///
@@ -1794,7 +1794,7 @@ mod tests {
                 "MemberJoined",
                 "RoleAssigned",
                 "MessageSent",
-                "ToolInvoked",
+                "OutletInvoked",
             ],
         )
         .await;

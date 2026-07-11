@@ -8,7 +8,7 @@
 //!
 //! 1. The hard-rate-limit consume / refund helpers
 //!    ([`try_consume_hard_rate_limit`], [`refund_hard_rate_limit`]).
-//! 2. The economy-pipeline split for tool invocation
+//! 2. The economy-pipeline split for outlet invocation
 //!    ([`reserve_outlet_economy`], [`settle_outlet_economy_capture`],
 //!    [`rollback_outlet_economy`]) plus the supervisor-side orchestrator
 //!    [`invoke_outlet_with_economy`].
@@ -21,7 +21,7 @@
 //! post-invocation bookkeeping (Phase 3). ADR-049 deletes the `DashMap`,
 //! so per-context state now lives ONLY inside the per-context actor.
 //!
-//! The tool executor is a non-`Send` generic `FnOnce` closure (FFI
+//! The outlet executor is a non-`Send` generic `FnOnce` closure (FFI
 //! bridges supply GIL-bound / JS-bound closures) that cannot cross the
 //! actor mailbox. The economy bookkeeping, by contrast, is `Send` and
 //! mutates owned [`PerContextState`]. The split therefore runs:
@@ -114,11 +114,11 @@ pub fn refund_hard_rate_limit(mut view: crate::context::actor::class_s::ClassCMu
 // ManagedOutletInvocationOutput
 // ---------------------------------------------------------------------------
 
-/// Result of a successful managed tool invocation. Returned to the FFI
+/// Result of a successful managed outlet invocation. Returned to the FFI
 /// bridges by [`invoke_outlet_with_economy`].
 #[derive(Debug)]
 pub struct ManagedOutletInvocationOutput {
-    /// Tool output JSON.
+    /// Outlet output JSON.
     pub output: serde_json::Value,
     /// Event to append to the event log.
     pub event: OutletInvokedEvent,
@@ -132,7 +132,7 @@ pub struct ManagedOutletInvocationOutput {
 // OutletEconomyTicket — the in-flight economy bookkeeping bundle
 // ---------------------------------------------------------------------------
 
-/// Phase-1 bookkeeping bundle for a tool invocation in flight. Crosses
+/// Phase-1 bookkeeping bundle for a outlet invocation in flight. Crosses
 /// the actor mailbox inside a [`OutletEconomyReservation`]: produced by
 /// [`reserve_outlet_economy`] (actor), carried through the executor
 /// (supervisor), then consumed by [`settle_outlet_economy_capture`] /
@@ -214,7 +214,7 @@ impl OutletEconomyTicket {
     /// Test-only constructor for an escrow-BEARING ticket carrying a budget
     /// deduction and a captured policy, so the capture path
     /// ([`settle_outlet_economy_capture`]) actually runs payment capture against a
-    /// supplied adapter. Used by the RED-CS3 tool-settle fail-closed test, which
+    /// supplied adapter. Used by the RED-CS3 outlet-settle fail-closed test, which
     /// pairs this with a failing-capture adapter to exercise the
     /// payment-capture-failure early-return path.
     #[cfg(any(test, feature = "testing"))]
@@ -278,7 +278,7 @@ impl OutletEconomyTicket {
         if self.escrow.is_some() {
             tracing::error!(
                 actor_did = %self.actor_did,
-                "tool-economy ticket consumed on a sync no-actor reply path that cannot void \
+                "outlet-economy ticket consumed on a sync no-actor reply path that cannot void \
                  payment escrow — an external payment hold may leak. This backstop should be \
                  unreachable; the async settle path voids escrow first."
             );
@@ -474,7 +474,7 @@ impl std::fmt::Debug for OutletEconomyReservation {
 // Phase 1: reserve_outlet_economy (actor handler entry point)
 // ---------------------------------------------------------------------------
 
-/// Phase 1 of the tool economy pipeline, run inside the per-context
+/// Phase 1 of the outlet economy pipeline, run inside the per-context
 /// actor on owned state. Consumes the hard rate limit, records the
 /// velocity entry, runs the economy pre-check, deducts budget, validates
 /// the spending UCAN, and authorizes the payment escrow.
@@ -536,7 +536,7 @@ pub async fn reserve_outlet_economy(
         let gov = view.governance_class_c_mut();
 
         // Hard rate limit — the Matrix Synapse–style defense-in-depth cap on
-        // the tool path. try_consume before any Phase-1 bookkeeping.
+        // the outlet path. try_consume before any Phase-1 bookkeeping.
         if !gov.hard_rate_limit_mut().try_consume(invoker_did, now_secs) {
             return Err(ContextError::RateLimited {
                 resource: "outlet_call".to_owned(),
@@ -841,7 +841,7 @@ pub async fn reserve_outlet_economy(
 // Phase 3a: settle_outlet_economy_capture (actor handler entry point)
 // ---------------------------------------------------------------------------
 
-/// Phase 3 of the tool economy pipeline on executor SUCCESS, run inside
+/// Phase 3 of the outlet economy pipeline on executor SUCCESS, run inside
 /// the per-context actor on owned state. Performs post-invocation
 /// participation bookkeeping + consequence enforcement, then captures the
 /// escrowed payment, and finally commits the ticket.
@@ -988,7 +988,7 @@ pub async fn settle_outlet_economy_capture(
 // Phase 3b: rollback_outlet_economy (actor handler entry point)
 // ---------------------------------------------------------------------------
 
-/// Phase 3 of the tool economy pipeline on executor FAILURE, run inside
+/// Phase 3 of the outlet economy pipeline on executor FAILURE, run inside
 /// the per-context actor on owned state. Voids any payment escrow hold,
 /// then reverses the velocity entry, budget deduction, and hard-rate-limit
 /// token consumed by [`reserve_outlet_economy`].
@@ -1063,7 +1063,7 @@ pub async fn rollback_outlet_economy(
 // Supervisor-side orchestrator: invoke_outlet_with_economy
 // ---------------------------------------------------------------------------
 
-/// Invokes a tool under the full economy pipeline without holding any
+/// Invokes a outlet under the full economy pipeline without holding any
 /// per-context lock across the executor future (spec §19.7), in the
 /// actor model.
 ///
@@ -1089,7 +1089,7 @@ pub async fn rollback_outlet_economy(
 /// Propagates every error variant the reserve / settle handlers and the
 /// executor emit (`ContextNotRegistered`, `PermissionDenied`,
 /// `RateLimited`, schema/economy/UCAN failures).
-// Mirrors the FFI tool-invocation surface (registry/outlet_id/input/
+// Mirrors the FFI outlet-invocation surface (registry/outlet_id/input/
 // invoker_did/timeout_ms/executor) plus the two phase-handoff closures;
 // bundling them would only obscure the lock-split sequencing.
 #[allow(clippy::too_many_arguments)]
@@ -1121,7 +1121,7 @@ where
 
     // Phase 2 — run the non-Send executor supervisor-side, OFF the actor
     // mailbox, so the actor is free to process other commands and a
-    // misbehaving tool cannot stall the per-context actor loop.
+    // misbehaving outlet cannot stall the per-context actor loop.
     let outcome = match invoke_outlet_execute_and_validate(
         &handle,
         registry,
@@ -1150,7 +1150,7 @@ where
                 tracing::error!(
                     rollback_error = %settle_err,
                     executor_error = %err,
-                    "tool-economy rollback settle failed after executor error; the settle \
+                    "outlet-economy rollback settle failed after executor error; the settle \
                      closure must have voided any external escrow and consumed the ticket"
                 );
             }
@@ -1284,7 +1284,7 @@ pub async fn settle_outlet_economy(
             .void_external_and_consume(deps.payment_adapter.as_ref())
             .await;
         return Err(ContextError::ContextNotRegistered(format!(
-            "SCP-OUTLET-6088: tool-economy settle for context '{context_id}' landed on a replaced \
+            "SCP-OUTLET-6088: outlet-economy settle for context '{context_id}' landed on a replaced \
              actor instance (reserved generation {expected}, live generation {actual}); escrow \
              voided, reservation not captured"
         )));
@@ -1343,7 +1343,7 @@ pub async fn settle_outlet_economy(
                 return Err(match capture_result {
                     Ok(_) => persist_err,
                     Err(capture_err) => ContextError::PersistenceFailed(format!(
-                        "{persist_err} (after a tool-settle payment-capture failure: \
+                        "{persist_err} (after a outlet-settle payment-capture failure: \
                          {capture_err})"
                     )),
                 });
@@ -1371,7 +1371,7 @@ fn invocation_error_to_context(err: InvocationError) -> ContextError {
             format!("SCP-OUTLET-6081: invoker {did} lacks OutletCall({outlet_id})"),
         ),
         InvocationError::OutletNotFound { outlet_id } => {
-            ContextError::PermissionDenied(format!("SCP-OUTLET-6082: tool not found: {outlet_id}"))
+            ContextError::PermissionDenied(format!("SCP-OUTLET-6082: outlet not found: {outlet_id}"))
         }
         InvocationError::InputValidationFailed { message } => ContextError::PermissionDenied(
             format!("SCP-OUTLET-6083: input schema validation failed: {message}"),
@@ -1380,13 +1380,13 @@ fn invocation_error_to_context(err: InvocationError) -> ContextError {
             format!("SCP-OUTLET-6084: output schema validation failed: {message}"),
         ),
         InvocationError::ExecutionFailed { message } => ContextError::PermissionDenied(format!(
-            "SCP-OUTLET-6085: tool execution failed: {message}"
+            "SCP-OUTLET-6085: outlet execution failed: {message}"
         )),
         InvocationError::Timeout { timeout_ms } => ContextError::PermissionDenied(format!(
-            "SCP-OUTLET-6086: tool execution timed out after {timeout_ms}ms"
+            "SCP-OUTLET-6086: outlet execution timed out after {timeout_ms}ms"
         )),
         InvocationError::Cancelled => {
-            ContextError::PermissionDenied("SCP-OUTLET-6087: tool invocation cancelled".to_owned())
+            ContextError::PermissionDenied("SCP-OUTLET-6087: outlet invocation cancelled".to_owned())
         }
         InvocationError::BudgetExceeded {
             did,
@@ -1404,7 +1404,7 @@ mod tests {
     use crate::context::actor::state::PerContextState;
 
     fn test_did() -> DID {
-        DID::from("did:test:tools-rate-limit")
+        DID::from("did:test:outlets-rate-limit")
     }
 
     fn test_admin() -> DID {
@@ -1479,7 +1479,7 @@ mod tests {
         // No panic on Drop ⇒ the ticket was consumed.
     }
 
-    /// ADR-049 §9 (RED-CS3): the tool-settle CAPTURE-FAILURE path must NOT
+    /// ADR-049 §9 (RED-CS3): the outlet-settle CAPTURE-FAILURE path must NOT
     /// strand an applied capability suspension on best-effort persistence.
     /// A consequence suspends the invoker in memory BEFORE the fallible payment
     /// capture; if capture then fails, `settle_outlet_economy_capture` returns
@@ -1515,9 +1515,9 @@ mod tests {
         use crate::economy::integration::{ActionEnvelope, PreparedAction};
         use scp_protocol::economy::types::{Amount, CurrencyCode, PaidActionType};
 
-        const ADMIN: &str = "did:dht:z6MkAdminToolSettle";
-        const INVOKER: &str = "did:dht:z6MkInvokerToolSettle";
-        const PAYEE: &str = "did:dht:z6MkPayeeToolSettle";
+        const ADMIN: &str = "did:dht:z6MkAdminOutletSettle";
+        const INVOKER: &str = "did:dht:z6MkInvokerOutletSettle";
+        const PAYEE: &str = "did:dht:z6MkPayeeOutletSettle";
         const CTX_BYTE: u8 = 0x7c;
 
         /// A payment adapter whose `capture` ALWAYS fails — the path that drives
@@ -1760,14 +1760,14 @@ mod tests {
                     result,
                     Err(crate::context::ContextError::PersistenceFailed(_))
                 ),
-                "a tool-settle whose capture fails AFTER a consequence suspension must \
+                "a outlet-settle whose capture fails AFTER a consequence suspension must \
                  still persist the suspension fail-closed; a failing persist surfaces \
                  PersistenceFailed; got {result:?}"
             );
             let suspended = cell
                 .role_state
                 .suspended_for(INVOKER)
-                .expect("INVOKER must have been suspended by the tool-rate consequence");
+                .expect("INVOKER must have been suspended by the outlet-rate consequence");
             assert!(
                 suspended.contains(&Capability::MessagesWrite),
                 "the suspended capability is retained in memory (keep-direction) even \
@@ -1776,7 +1776,7 @@ mod tests {
         }
     }
 
-    /// Persistence whose `persist_context` ALWAYS fails — drives the tool-settle
+    /// Persistence whose `persist_context` ALWAYS fails — drives the outlet-settle
     /// fail-closed path. Defined at the `tests` module scope so the nested
     /// `outlet_settle_fail_closed` module can reference it via `super::`.
     struct FailOutletPersistence;

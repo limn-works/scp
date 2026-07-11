@@ -133,7 +133,7 @@ pub struct ContextSnapshot {
     /// copy and fetch the full params only if they differ.
     pub params_hash: [u8; 32],
 
-    /// Tool registrations active at snapshot time.
+    /// Outlet registrations active at snapshot time.
     pub outlet_names: Vec<String>,
 
     /// DID of the snapshot creator (for verification).
@@ -319,10 +319,10 @@ pub struct SnapshotDelta {
     /// Role definitions that were removed.
     pub removed_role_definitions: Vec<String>,
 
-    /// Tools that were added.
+    /// Outlets that were added.
     pub added_outlets: Vec<String>,
 
-    /// Tools that were removed.
+    /// Outlets that were removed.
     pub removed_outlets: Vec<String>,
 
     /// Whether context parameters changed (params hash differs).
@@ -636,7 +636,7 @@ pub fn compute_delta(
         }
     }
 
-    // Tool changes
+    // Outlet changes
     let old_outlets: HashSet<&str> = old.outlet_names.iter().map(String::as_str).collect();
     let new_outlets: HashSet<&str> = new.outlet_names.iter().map(String::as_str).collect();
 
@@ -681,7 +681,7 @@ pub fn compute_delta(
 /// updated state.
 ///
 /// This function mutates the local snapshot in-place, applying membership
-/// changes, role definition updates, tool changes, and advancing the event
+/// changes, role definition updates, outlet changes, and advancing the event
 /// log state. MLS epoch is advanced but actual MLS group rebuild is the
 /// caller's responsibility (see [`determine_mls_recovery`]).
 ///
@@ -739,15 +739,15 @@ pub fn apply_delta(
         local_state.role_definitions.remove(name);
     }
 
-    // Apply tool changes
-    let mut tools: HashSet<String> = local_state.outlet_names.drain(..).collect();
+    // Apply outlet changes
+    let mut outlets: HashSet<String> = local_state.outlet_names.drain(..).collect();
     for name in &delta.added_outlets {
-        tools.insert(name.clone());
+        outlets.insert(name.clone());
     }
     for name in &delta.removed_outlets {
-        tools.remove(name);
+        outlets.remove(name);
     }
-    local_state.outlet_names = tools.into_iter().collect();
+    local_state.outlet_names = outlets.into_iter().collect();
     local_state.outlet_names.sort();
 
     // Advance event log state
@@ -1276,7 +1276,7 @@ mod tests {
     }
 
     #[test]
-    fn compute_delta_tool_changes() {
+    fn compute_delta_outlet_changes() {
         let mut old = make_snapshot("ctx-1", 1, Some(10), 100, [1u8; 32], vec![]);
         old.outlet_names = vec!["search".to_owned(), "translate".to_owned()];
 
@@ -1421,7 +1421,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_delta_removes_member_and_tools() {
+    fn apply_delta_removes_member_and_outlets() {
         let mut local = make_snapshot(
             "ctx-1",
             1,
@@ -1680,7 +1680,7 @@ mod tests {
             ],
             role_definition_changes: BTreeMap::new(),
             removed_role_definitions: vec![],
-            added_outlets: vec!["new-tool".to_owned()],
+            added_outlets: vec!["new-outlet".to_owned()],
             removed_outlets: vec![],
             params_changed: true,
             events_added: 400,
@@ -1865,7 +1865,7 @@ mod tests {
     #[test]
     fn stress_multi_day_epoch_gap_with_role_changes() {
         // Simulate a 5-day offline period: 300 epoch advances, role changes,
-        // tools added/removed, params changed.
+        // outlets added/removed, params changed.
         let mut old = make_snapshot(
             "ctx-days",
             1,
@@ -1913,7 +1913,7 @@ mod tests {
         assert!(delta.params_changed);
         assert_eq!(delta.events_added, 6000);
 
-        // Tools: +summarize, +code-review, -translate
+        // Outlets: +summarize, +code-review, -translate
         assert_eq!(delta.added_outlets.len(), 2);
         assert_eq!(delta.removed_outlets.len(), 1);
 

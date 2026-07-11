@@ -52,7 +52,7 @@ use crate::context::state::{
     CEILING_CHANGE_NOTIFICATION_PERIOD_SECS, CommitFaultMarker, CommitOperation,
     ContentKeysRotatedResult, ECONOMIC_POLICY_NOTIFICATION_PERIOD_SECS,
     EXECUTED_PROPOSALS_TTL_SECS, GovernanceActionResult, GovernanceReconfiguredResult,
-    MAX_PENDING_COMMITS, MAX_REGISTERED_TOOLS, MAX_THRESHOLD_SIGNERS, MAX_TOOL_INTERFACES,
+    MAX_PENDING_COMMITS, MAX_REGISTERED_OUTLETS, MAX_THRESHOLD_SIGNERS, MAX_OUTLET_INTERFACES,
     MigrationProposedResult, MigrationState, PendingCeilingModification, PendingCommit,
     PendingEconomicPolicyChange, ProposalOutcome, RestoreAccessResult, RevokeResult,
     SuspendMemberResult, commit_retry_backoff, context_id_to_bytes, emit_event_into,
@@ -1585,7 +1585,7 @@ pub async fn execute_register_outlet(
     } = meta;
     let context_id_bytes = context_id_to_bytes(context_id);
 
-    // Tool registration is an UPWARD grant (Class-C governance config). The
+    // Outlet registration is an UPWARD grant (Class-C governance config). The
     // fallible guards read through the cell's `Deref` (no mutation); the
     // `registered_outlets` push (Class-C) rides `commit_class_c_best_effort`,
     // preserving the prior best-effort persist exactly.
@@ -1597,13 +1597,13 @@ pub async fn execute_register_outlet(
         .contains(&Capability::OutletRegister)
     {
         return Err(ContextError::PermissionDenied(
-            "context ceiling does not include tool registration capability".into(),
+            "context ceiling does not include outlet registration capability".into(),
         ));
     }
 
-    if cell.governance.registered_outlets.len() >= MAX_REGISTERED_TOOLS {
+    if cell.governance.registered_outlets.len() >= MAX_REGISTERED_OUTLETS {
         return Err(ContextError::LimitExceeded(format!(
-            "registered tool limit of {MAX_REGISTERED_TOOLS} exceeded"
+            "registered outlet limit of {MAX_REGISTERED_OUTLETS} exceeded"
         )));
     }
     cell.commit_class_c_best_effort(deps, context_id, |mut view| {
@@ -1615,7 +1615,7 @@ pub async fn execute_register_outlet(
     deps.event_log
         .append_context_event(
             &context_id_bytes,
-            scp_event_log::EventType::ToolRegistered,
+            scp_event_log::EventType::OutletRegistered,
             actor_did,
             timestamp_secs,
         )
@@ -1642,11 +1642,11 @@ pub async fn execute_remove_outlet(
     } = meta;
     let context_id_bytes = context_id_to_bytes(context_id);
 
-    // ADR-049 §9 Class S: removing a registered tool revokes the authority to
+    // ADR-049 §9 Class S: removing a registered outlet revokes the authority to
     // invoke it — a downward-authorization transition (the inverse of
     // `execute_register_outlet`'s upward grant). Route through `commit_class_s_keep`
     // so the removal persists fail-closed (keep-direction: on persist failure the
-    // tool STAYS removed — re-granting invocation of a tool the caller was told
+    // outlet STAYS removed — re-granting invocation of a outlet the caller was told
     // was removed is the unsafe direction). The reject-before-mutate guard
     // returns `Err` from inside the closure (no persist runs); the
     // `registered_outlets` retain (Class-C) rides the SAME fail-closed persist via
@@ -1664,7 +1664,7 @@ pub async fn execute_remove_outlet(
     deps.event_log
         .append_context_event(
             &context_id_bytes,
-            scp_event_log::EventType::ToolRemoved,
+            scp_event_log::EventType::OutletRemoved,
             actor_did,
             timestamp_secs,
         )
@@ -2413,7 +2413,7 @@ pub async fn execute_establish_outlet_interface(
     } = meta;
     let context_id_bytes = context_id_to_bytes(context_id);
 
-    // Establishing a tool interface is Class-C governance config. The fallible
+    // Establishing a outlet interface is Class-C governance config. The fallible
     // guards read through the cell's `Deref`; the `outlet_interfaces` push
     // (Class-C) rides `commit_class_c_best_effort`, preserving the prior
     // best-effort persist exactly.
@@ -2425,13 +2425,13 @@ pub async fn execute_establish_outlet_interface(
         .contains(&Capability::OutletInterface)
     {
         return Err(ContextError::PermissionDenied(
-            "context ceiling does not include tool interface capability".into(),
+            "context ceiling does not include outlet interface capability".into(),
         ));
     }
 
-    if cell.governance.outlet_interfaces.len() >= MAX_TOOL_INTERFACES {
+    if cell.governance.outlet_interfaces.len() >= MAX_OUTLET_INTERFACES {
         return Err(ContextError::LimitExceeded(format!(
-            "tool interface limit of {MAX_TOOL_INTERFACES} exceeded"
+            "outlet interface limit of {MAX_OUTLET_INTERFACES} exceeded"
         )));
     }
     cell.commit_class_c_best_effort(deps, context_id, |mut view| {
@@ -2443,7 +2443,7 @@ pub async fn execute_establish_outlet_interface(
     deps.event_log
         .append_context_event(
             &context_id_bytes,
-            scp_event_log::EventType::ToolInterfaceEstablished,
+            scp_event_log::EventType::OutletInterfaceEstablished,
             actor_did,
             timestamp_secs,
         )
@@ -4222,7 +4222,7 @@ pub async fn dispatch_content_governance_action(
             .await?;
             Ok(GovernanceActionResult::ThresholdModified)
         }
-        GovernanceAction::EstablishToolInterface { interface } => {
+        GovernanceAction::EstablishOutletInterface { interface } => {
             execute_establish_outlet_interface(
                 cell,
                 deps,
@@ -4235,7 +4235,7 @@ pub async fn dispatch_content_governance_action(
                 },
             )
             .await?;
-            Ok(GovernanceActionResult::ToolInterfaceEstablished)
+            Ok(GovernanceActionResult::OutletInterfaceEstablished)
         }
         GovernanceAction::ResetMember { did, reason } => {
             execute_reset_member(
@@ -4330,8 +4330,8 @@ pub async fn dispatch_content_governance_action(
         | GovernanceAction::AddMember { .. }
         | GovernanceAction::RemoveMember { .. }
         | GovernanceAction::ChangeRole { .. }
-        | GovernanceAction::RegisterTool { .. }
-        | GovernanceAction::RemoveTool { .. }
+        | GovernanceAction::RegisterOutlet { .. }
+        | GovernanceAction::RemoveOutlet { .. }
         | GovernanceAction::ModifyCeiling { .. }
         | GovernanceAction::CloseContext { .. }
         | GovernanceAction::TransferAdmin { .. }
@@ -4437,7 +4437,7 @@ pub async fn dispatch_context_governance_action(
             .await?;
             Ok(GovernanceActionResult::RoleChanged)
         }
-        GovernanceAction::RegisterTool { registration } => {
+        GovernanceAction::RegisterOutlet { registration } => {
             execute_register_outlet(
                 cell,
                 deps,
@@ -4450,9 +4450,9 @@ pub async fn dispatch_context_governance_action(
                 },
             )
             .await?;
-            Ok(GovernanceActionResult::ToolRegistered)
+            Ok(GovernanceActionResult::OutletRegistered)
         }
-        GovernanceAction::RemoveTool { outlet_id } => {
+        GovernanceAction::RemoveOutlet { outlet_id } => {
             execute_remove_outlet(
                 cell,
                 deps,
@@ -4465,7 +4465,7 @@ pub async fn dispatch_context_governance_action(
                 },
             )
             .await?;
-            Ok(GovernanceActionResult::ToolRemoved)
+            Ok(GovernanceActionResult::OutletRemoved)
         }
         GovernanceAction::ModifyCeiling { new_ceiling } => {
             execute_modify_ceiling(
@@ -4587,7 +4587,7 @@ pub async fn dispatch_context_governance_action(
         GovernanceAction::AddSigner { .. }
         | GovernanceAction::RemoveSigner { .. }
         | GovernanceAction::ModifyThreshold { .. }
-        | GovernanceAction::EstablishToolInterface { .. }
+        | GovernanceAction::EstablishOutletInterface { .. }
         | GovernanceAction::ResetMember { .. }
         | GovernanceAction::ResolveConflict { .. }
         | GovernanceAction::RotateContentKeys { .. }
@@ -4873,8 +4873,8 @@ pub async fn dispatch_governance_action(
         GovernanceAction::AddMember { .. }
         | GovernanceAction::RemoveMember { .. }
         | GovernanceAction::ChangeRole { .. }
-        | GovernanceAction::RegisterTool { .. }
-        | GovernanceAction::RemoveTool { .. }
+        | GovernanceAction::RegisterOutlet { .. }
+        | GovernanceAction::RemoveOutlet { .. }
         | GovernanceAction::ModifyCeiling { .. }
         | GovernanceAction::CloseContext { .. }
         | GovernanceAction::TransferAdmin { .. }
@@ -4883,7 +4883,7 @@ pub async fn dispatch_governance_action(
         | GovernanceAction::AddSigner { .. }
         | GovernanceAction::RemoveSigner { .. }
         | GovernanceAction::ModifyThreshold { .. }
-        | GovernanceAction::EstablishToolInterface { .. }
+        | GovernanceAction::EstablishOutletInterface { .. }
         | GovernanceAction::ResetMember { .. }
         | GovernanceAction::ResolveConflict { .. }
         | GovernanceAction::RotateContentKeys { .. }
@@ -5975,7 +5975,7 @@ pub fn translate_timeout_events(
     clippy::expect_used,
     // Test-only capturing persistence: the `Mutex<Option<ContextSnapshot>>` is
     // never held across `.await` (the write is a synchronous store inside the
-    // trait method), so a plain `std::sync::Mutex` is the right tool. The
+    // trait method), so a plain `std::sync::Mutex` is the right outlet. The
     // runtime's actor path bans it (ADR-049); test fixtures are exempt, mirroring
     // the sibling `CapturingPersistence` in `lifecycle_helpers.rs`.
     clippy::disallowed_types

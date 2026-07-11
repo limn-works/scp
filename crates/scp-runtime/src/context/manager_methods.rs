@@ -15,7 +15,7 @@
 //! This module hoists the cross-domain infrastructure methods that the
 //! existing per-domain `*_helpers.rs` files reach via `mgr.X(...)`. The
 //! per-domain helpers (lifecycle, messaging, broadcast, governance,
-//! economy, queries, standing, tools, `trust_recovery`) all need access to
+//! economy, queries, standing, outlets, `trust_recovery`) all need access to
 //! the same per-context lock primitives, persistence shortcuts, broadcast
 //! initialization, payment-failure event recording, and operational gauge
 //! updates — methods that don't fit into a single domain's helper file.
@@ -48,7 +48,7 @@
 //!
 //! The per-context lock primitives and the `contexts` `DashMap` they read
 //! were deleted in the ADR-049 Phase 2A finalization once the last
-//! `&Supervisor` caller (the legacy tools economy wrapper) moved to the
+//! `&Supervisor` caller (the legacy outlets economy wrapper) moved to the
 //! actor-split economy reserve/settle path. Per-context state now lives
 //! only inside the per-context actor; the helpers below remain because
 //! they mailbox the actors or touch supervisor-scoped provider slots.

@@ -1529,15 +1529,15 @@ mod tests {
 
     #[test]
     fn scoped_handle_check_outlet_call_specific_granted() {
-        let handle = make_scoped_handle(vec![Capability::OutletCall("my_tool".to_owned())]);
-        assert!(handle.check_outlet_call("my_tool").is_ok());
+        let handle = make_scoped_handle(vec![Capability::OutletCall("my_outlet".to_owned())]);
+        assert!(handle.check_outlet_call("my_outlet").is_ok());
     }
 
     #[test]
     fn scoped_handle_check_outlet_call_specific_denied() {
-        let handle = make_scoped_handle(vec![Capability::OutletCall("my_tool".to_owned())]);
+        let handle = make_scoped_handle(vec![Capability::OutletCall("my_outlet".to_owned())]);
         assert!(matches!(
-            handle.check_outlet_call("other_tool"),
+            handle.check_outlet_call("other_outlet"),
             Err(SandboxError::CapabilityDenied { .. })
         ));
     }
@@ -1545,17 +1545,17 @@ mod tests {
     #[test]
     fn scoped_handle_check_outlet_call_all_covers_specific() {
         let handle = make_scoped_handle(vec![Capability::OutletCallAll]);
-        assert!(handle.check_outlet_call("any_tool").is_ok());
+        assert!(handle.check_outlet_call("any_outlet").is_ok());
     }
 
     #[test]
-    fn scoped_handle_check_tool_register_granted() {
+    fn scoped_handle_check_outlet_register_granted() {
         let handle = make_scoped_handle(vec![Capability::OutletRegister]);
         assert!(handle.check_outlet_register().is_ok());
     }
 
     #[test]
-    fn scoped_handle_check_tool_register_denied() {
+    fn scoped_handle_check_outlet_register_denied() {
         let handle = make_scoped_handle(vec![]);
         assert!(matches!(
             handle.check_outlet_register(),
@@ -1657,7 +1657,7 @@ mod tests {
     }
 
     #[test]
-    fn scoped_handle_check_tool_interface_granted() {
+    fn scoped_handle_check_outlet_interface_granted() {
         let handle = make_scoped_handle(vec![Capability::OutletInterface]);
         assert!(handle.check_outlet_interface().is_ok());
     }
@@ -2422,7 +2422,7 @@ mod tests {
         assert!(handle.check_read_messages().is_ok());
         assert!(handle.check_send_message().is_ok());
         assert!(handle.check_propose_governance_action().is_ok());
-        assert!(handle.check_outlet_call("any_tool").is_ok());
+        assert!(handle.check_outlet_call("any_outlet").is_ok());
         assert!(handle.check_member_invite().is_ok());
         // Not granted:
         assert!(handle.check_context_close().is_err());

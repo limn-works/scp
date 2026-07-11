@@ -307,7 +307,7 @@ impl<S: Storage> ProtocolRepository<S> {
     /// Deletes all stored state for a context.
     ///
     /// Removes all keys under `context/{context_id}/` including state,
-    /// params, memberships, roles, events, tools, etc. Returns the
+    /// params, memberships, roles, events, outlets, etc. Returns the
     /// number of keys deleted.
     ///
     /// See spec section 17.3 on context cleanup via `delete_prefix`.

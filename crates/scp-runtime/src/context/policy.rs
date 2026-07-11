@@ -226,10 +226,10 @@ mod tests {
             .unwrap();
     }
 
-    // --- Hard rule: tool capabilities ---
+    // --- Hard rule: outlet capabilities ---
 
     #[test]
-    fn tool_capability_blocks_auto_accept() {
+    fn outlet_capability_blocks_auto_accept() {
         let params = ContextParams {
             ceiling: vec![
                 Capability::MessagesRead,
@@ -243,7 +243,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_invoke_specific_blocks_auto_accept() {
+    fn outlet_invoke_specific_blocks_auto_accept() {
         let params = ContextParams {
             ceiling: vec![
                 Capability::MessagesRead,
@@ -256,7 +256,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_register_blocks_auto_accept() {
+    fn outlet_register_blocks_auto_accept() {
         let params = ContextParams {
             ceiling: vec![Capability::MessagesRead, Capability::OutletRegister],
             ..ContextParams::default()
@@ -266,7 +266,7 @@ mod tests {
     }
 
     #[test]
-    fn no_tool_capability_allows_auto_accept() {
+    fn no_outlet_capability_allows_auto_accept() {
         let params = ContextParams {
             ceiling: vec![Capability::MessagesRead, Capability::MessagesWrite],
             ..ContextParams::default()
@@ -373,7 +373,7 @@ mod tests {
     // --- Combined hard rules ---
 
     #[test]
-    fn tool_and_payment_both_block_auto_accept() {
+    fn outlet_and_payment_both_block_auto_accept() {
         let params = ContextParams {
             ceiling: vec![
                 Capability::MessagesRead,

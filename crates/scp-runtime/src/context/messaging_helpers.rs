@@ -1311,7 +1311,7 @@ pub async fn send_message(
     // `spending_nonce_tracker` — security-critical monotonic state that does
     // NOT survive an actor crash. It MUST be durably persisted (fail-closed)
     // BEFORE this paid send is acknowledged to the caller, exactly as the
-    // structurally-identical TOOL-INVOKE path does in `reserve_outlet_economy`.
+    // structurally-identical OUTLET-INVOKE path does in `reserve_outlet_economy`.
     // A best-effort (coalesced) persist would let an actor crash in the ≤50ms
     // coalesce window roll the consume back, freshening the spending UCAN's
     // nonce after the caller already saw the send succeed — a replay /
@@ -2124,7 +2124,7 @@ fn record_send_participation(
 /// actor crash), and `None` for a free / non-spending send. When `Some`, the
 /// final persist is the token's FAIL-CLOSED `commit`: a persist failure returns
 /// [`ContextError::PersistenceFailed`] so the paid send is NOT acknowledged
-/// while its nonce-consume is unpersisted, exactly mirroring the tool-invoke
+/// while its nonce-consume is unpersisted, exactly mirroring the outlet-invoke
 /// path in `reserve_outlet_economy`. When `None`, the persist stays best-effort
 /// (Class C) — the common path is not regressed. The token is consumed on EVERY
 /// path `finalize_send` can take (the TTL-expiry arm commits it too — a late TTL
@@ -2651,8 +2651,8 @@ pub fn build_snapshot_from_state(
         freeze: _freeze,
         pending_ceiling_modification: _pending_ceiling_modification,
         pending_economic_policy_change: _pending_economic_policy_change,
-        registered_outlets: _registered_tools,
-        outlet_interfaces: _tool_interfaces,
+        registered_outlets: _registered_outlets,
+        outlet_interfaces: _outlet_interfaces,
         pruning_policy: _pruning_policy,
         economic_policy: _economic_policy,
         budget_tracker: _budget_tracker,
@@ -2813,14 +2813,14 @@ pub(in crate::context) fn saga_pending_snapshot(
 }
 
 /// Build the Class-S snapshot projection of the actor's COMMITTED
-/// cross-context tool-invocation captures (spec §6.2.4 "Exactly-once
+/// cross-context outlet-invocation captures (spec §6.2.4 "Exactly-once
 /// execution with durable output capture"; ADR-049 §9). The live
 /// [`CommittedOutletInvocation`](crate::context::supervisor::saga_prepared_state::CommittedOutletInvocation)
 /// carries no §9.4.3 bearer bytes (public receipt + output), so — unlike
 /// [`saga_pending_snapshot`] — the snapshot stores it directly via `Clone`.
 /// Used at every snapshot builder so a crash between Commit-B capture and the
 /// next coalesced write cannot lose the durable output (which would re-invoke
-/// the tool on replay).
+/// the outlet on replay).
 pub(in crate::context) fn xctx_committed_outputs_snapshot(
     state: &PerContextState,
 ) -> std::collections::HashMap<
@@ -2831,7 +2831,7 @@ pub(in crate::context) fn xctx_committed_outputs_snapshot(
 }
 
 /// Build the Class-S snapshot projection of the actor's caller-side (A-owned)
-/// COMMITTED cross-context tool-invocation witness set (spec §6.2.4 "Commit",
+/// COMMITTED cross-context outlet-invocation witness set (spec §6.2.4 "Commit",
 /// caller side; §17.16.4 crash recovery; ADR-049 §9). The live
 /// [`PerContextState::xctx_committed_invocations`](crate::context::actor::state::PerContextState::xctx_committed_invocations)
 /// is a `{SagaId}` idempotency-witness set carrying no §9.4.3 bearer bytes, so —

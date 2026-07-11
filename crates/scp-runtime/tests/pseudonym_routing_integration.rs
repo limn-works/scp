@@ -5,7 +5,7 @@
     clippy::large_futures,
     // Test-only recording transport: `send_message` is a synchronous trait
     // method, so a plain `std::sync::Mutex` (never held across `.await`) is the
-    // right tool. The runtime's actor path bans it (ADR-049); test fixtures are
+    // right outlet. The runtime's actor path bans it (ADR-049); test fixtures are
     // explicitly exempt. See crates/scp-runtime/clippy.toml.
     clippy::disallowed_types
 )]

@@ -742,7 +742,7 @@ async fn governance_out_of_ceiling_create_child_context_rejected_native() {
     let action: GovernanceAction = serde_json::from_value(serde_json::json!({
         "CreateChildContext": {"params": {
             "mode": "Encrypted", "ceiling": [], "ceiling_policy": "Immutable",
-            "promotion_policy": "NoPromotion", "roles": [], "tools": [],
+            "promotion_policy": "NoPromotion", "roles": [], "outlets": [],
             "ttl": null, "memory_scope": "Ephemeral", "governance": "SingleAdmin",
             "template_id": null
         }}
@@ -776,17 +776,17 @@ async fn governance_out_of_ceiling_create_child_context_rejected_native() {
 }
 
 // =========================================================================
-// §9.9.3 REJECT-decision behavior for `EstablishToolInterface`.
+// §9.9.3 REJECT-decision behavior for `EstablishOutletInterface`.
 // Gated on `Capability::OutletInterface` in
 // `execute_establish_outlet_interface` (`governance_helpers.rs`). With the
 // capability absent from the ceiling, the action is rejected and mints ZERO
 // leaves — pinning the convergent reject all honest members must produce.
 // =========================================================================
 #[tokio::test]
-async fn governance_out_of_ceiling_establish_tool_interface_rejected_native() {
+async fn governance_out_of_ceiling_establish_outlet_interface_rejected_native() {
     let manager = new_manager_with_real_event_log();
     let ctx_id = "ctx-single-admin-iface-out-of-ceiling";
-    // Ceiling deliberately EXCLUDES OutletInterface (tool:interface).
+    // Ceiling deliberately EXCLUDES OutletInterface (outlet:interface).
     let ceiling = vec![
         Capability::new("messages:read").expect("known capability"),
         Capability::new("messages:write").expect("known capability"),
@@ -806,14 +806,14 @@ async fn governance_out_of_ceiling_establish_tool_interface_rejected_native() {
         .unwrap();
 
     let action: GovernanceAction = serde_json::from_value(serde_json::json!({
-        "EstablishToolInterface": {"interface": {
+        "EstablishOutletInterface": {"interface": {
             "source_context": "ctx-src", "target_context": "ctx-tgt",
-            "outlet_id": "tool-1", "rate_limit": null, "per_caller_rate_limit": null,
+            "outlet_id": "outlet-1", "rate_limit": null, "per_caller_rate_limit": null,
             "approved_by_source": false, "approved_by_target": false,
             "outbound_policy": null, "inbound_policy": null
         }}
     }))
-    .expect("EstablishToolInterface action deserializes");
+    .expect("EstablishOutletInterface action deserializes");
 
     let sk_alice = signing_key_for_did(&alice());
     let result = manager
@@ -821,7 +821,7 @@ async fn governance_out_of_ceiling_establish_tool_interface_rejected_native() {
         .await;
     assert!(
         result.is_err(),
-        "an out-of-ceiling EstablishToolInterface (tool:interface not in ceiling) MUST be \
+        "an out-of-ceiling EstablishOutletInterface (outlet:interface not in ceiling) MUST be \
          rejected by native — the convergent reject all honest members must produce (§9.9.3; ADR-031 §8)"
     );
 
@@ -836,7 +836,7 @@ async fn governance_out_of_ceiling_establish_tool_interface_rejected_native() {
         .count();
     assert_eq!(
         executed, 0,
-        "a rejected out-of-ceiling EstablishToolInterface MUST mint ZERO GovernanceActionExecuted \
+        "a rejected out-of-ceiling EstablishOutletInterface MUST mint ZERO GovernanceActionExecuted \
          leaves on native"
     );
 }

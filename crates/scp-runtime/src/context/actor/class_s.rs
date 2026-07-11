@@ -192,7 +192,7 @@
 //!   [`crate::context::governance_logic::enforce_triggered_consequences`] returns a
 //!   downward-auth flag and the cell-holding caller persists the already-applied
 //!   mutation **fail-closed** (keep-direction) before acking, in every production
-//!   consequence site (send / receive / tool-settle / periodic sweep; governance
+//!   consequence site (send / receive / outlet-settle / periodic sweep; governance
 //!   execution was already fail-closed via its `ClassSCommitToken`). Consequence
 //!   EVALUATION stays best-effort / coalesced — only the rare downward-auth OUTCOME
 //!   is fail-closed.
@@ -617,7 +617,7 @@ pub(crate) struct ClassCMut<'a> {
     /// `&mut` to the per-sender receive-sequence high-water marks (Class-C).
     recv_tracker: &'a mut RecvSequenceTracker,
     /// `&mut` to the reconstructable cross-context UCAN proof store (Class-C /
-    /// §6.2.4). Interface state repopulated when the tool interface is
+    /// §6.2.4). Interface state repopulated when the outlet interface is
     /// re-established — explicitly NOT the Class-S freshness/replay witness.
     xctx_ucan_proofs: &'a mut InMemoryProofResolver,
     /// `&mut` to the in-flight broadcast-publish reservations (Class-C).
@@ -935,9 +935,9 @@ pub(crate) struct GovernanceClassCMut<'a> {
     pending_ceiling_modification: &'a mut Option<PendingCeilingModification>,
     /// `&mut` to the pending economic policy change (§19.3).
     pending_economic_policy_change: &'a mut Option<PendingEconomicPolicyChange>,
-    /// `&mut` to the dynamically registered tools list (§5.9).
+    /// `&mut` to the dynamically registered outlets list (§5.9).
     registered_outlets: &'a mut Vec<OutletRegistration>,
-    /// `&mut` to the cross-context tool interfaces list (§6.2).
+    /// `&mut` to the cross-context outlet interfaces list (§6.2).
     outlet_interfaces: &'a mut Vec<OutletInterface>,
     /// `&mut` to the pruning policy override (ADR-030 §6).
     pruning_policy: &'a mut Option<PruningPolicy>,
@@ -1130,13 +1130,13 @@ impl<'a> GovernanceClassCMut<'a> {
         self.pending_economic_policy_change
     }
 
-    /// `&mut` access to the dynamically registered tools list (§5.9). Class-C
+    /// `&mut` access to the dynamically registered outlets list (§5.9). Class-C
     /// structural governance configuration.
     pub(crate) const fn registered_outlets_mut(&mut self) -> &mut Vec<OutletRegistration> {
         self.registered_outlets
     }
 
-    /// `&mut` access to the cross-context tool interfaces list (§6.2). Class-C
+    /// `&mut` access to the cross-context outlet interfaces list (§6.2). Class-C
     /// structural governance configuration.
     pub(crate) const fn outlet_interfaces_mut(&mut self) -> &mut Vec<OutletInterface> {
         self.outlet_interfaces
@@ -2140,7 +2140,7 @@ pub(crate) struct ConsequenceStateSplit<'a> {
 
 #[allow(
     dead_code,
-    reason = "ADR-049 §9 / RED-CS3: cell-free + cell-holding builders for the consequence split. `from_state` is the cell-free governance-helper path; `ClassCMut::consequence_split` is the cell-holding receive/send/tool/sweep path."
+    reason = "ADR-049 §9 / RED-CS3: cell-free + cell-holding builders for the consequence split. `from_state` is the cell-free governance-helper path; `ClassCMut::consequence_split` is the cell-holding receive/send/outlet/sweep path."
 )]
 impl<'a> ConsequenceStateSplit<'a> {
     /// Build a [`ConsequenceStateSplit`] DIRECTLY from a `&mut PerContextState`,
@@ -2556,7 +2556,7 @@ impl<'a> ClassCMut<'a> {
     }
 
     /// `&mut` access to the reconstructable cross-context UCAN proof store
-    /// (Class-C / §6.2.4). Interface state repopulated when the tool interface is
+    /// (Class-C / §6.2.4). Interface state repopulated when the outlet interface is
     /// re-established — explicitly NOT the Class-S freshness/replay witness
     /// (`class_s.xctx_nonce_dedup`), so best-effort rollback is acceptable.
     pub(crate) const fn xctx_ucan_proofs_mut(&mut self) -> &mut InMemoryProofResolver {
@@ -2635,7 +2635,7 @@ impl<'a> ClassCMut<'a> {
     /// Produce the CONSEQUENCE-ENGINE split (ADR-049 §9 / RED-CS3 / R1): identical
     /// disjoint borrows to [`Self::split_class_c`], but `role_state` is the
     /// GROW-capable [`ConsequenceRoleStateMut`]. Used by the consequence sites
-    /// (receive / send / tool-settle / periodic sweep), whose cell-holding caller
+    /// (receive / send / outlet-settle / periodic sweep), whose cell-holding caller
     /// persists any applied downward-auth GROW / demotion FAIL-CLOSED.
     ///
     /// NOTE — this method, like [`Self::split_class_c`], is on the best-effort
@@ -3039,10 +3039,10 @@ impl ClassSCell {
     /// and report the outcome (ADR-049 §9).
     ///
     /// For a Class-S mutation that must be paired with a follow-on durable append
-    /// which can itself fail. This is the shape of the cross-context tool-invoke
+    /// which can itself fail. This is the shape of the cross-context outlet-invoke
     /// "Commit" path (spec §6.2.4): `f` captures the committed output into Class-S
     /// (`xctx_committed_outputs`) and persists it; `after` then appends a
-    /// `ToolInvoked` record to the EVENT LOG. That append targets the event-log
+    /// `OutletInvoked` record to the EVENT LOG. That append targets the event-log
     /// adapter on [`ActorDeps`] (`deps.event_log`) — an EXTERNAL durable sink. It
     /// is NOT an in-state [`PerContextState`] mutation: the live persist snapshot
     /// (`build_snapshot_from_state`) hard-codes `event_log_merkle_root` to zero
@@ -5504,7 +5504,7 @@ impl ClassSCell
             caller_context_id: [0x1Au8; 32],
             target_context_id: [0x2Bu8; 32],
             caller_did: DID("did:example:caller".to_owned()),
-            outlet_registration_id: "tool-v1".to_owned(),
+            outlet_registration_id: "outlet-v1".to_owned(),
             ucan_proof_id: "ucan-1".to_owned(),
             recorded_timestamp_ms: 1_700_000_000_123,
             recorded_nonce: [0x3Cu8; 16],

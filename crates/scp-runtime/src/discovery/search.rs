@@ -1,7 +1,7 @@
 //! Unified discovery search with result merging.
 //!
 //! Implements `unified_search` per ADR-020 acceptance criterion 7: search local
-//! contact cache (instant), query each known context (parallel tool
+//! contact cache (instant), query each known context (parallel outlet
 //! calls), merge, deduplicate, and rank results. Returns results with
 //! provenance per entry.
 //!
@@ -41,7 +41,7 @@ pub trait ContactCache {
 
 /// Trait for querying a remote context.
 ///
-/// Each known context is queried via its `agent_search` tool
+/// Each known context is queried via its `agent_search` outlet
 /// endpoint. Implementations handle the network transport and response
 /// parsing.
 #[allow(async_fn_in_trait)]
@@ -154,7 +154,7 @@ fn query_to_search_params(query: &DiscoveryQuery) -> AgentSearchParams {
     }
 }
 
-/// Queries multiple contexts with discovery tools in parallel, collecting successful
+/// Queries multiple contexts with discovery outlets in parallel, collecting successful
 /// results. Individual failures are silently tolerated.
 #[allow(clippy::future_not_send)] // async trait methods don't support Send bounds
 async fn query_contexts_parallel<Q: ContextQuerier>(
@@ -180,7 +180,7 @@ async fn query_contexts_parallel<Q: ContextQuerier>(
 }
 
 /// Deduplicates entries by DID, keeping the entry with the highest relevance
-/// score. When scores tie, the entry with provenance from a context with discovery tools
+/// score. When scores tie, the entry with provenance from a context with discovery outlets
 /// (non-local) is preferred over local cache entries.
 fn deduplicate_entries(entries: Vec<DiscoveryResultEntry>) -> Vec<DiscoveryResultEntry> {
     let mut by_did: HashMap<DID, DiscoveryResultEntry> = HashMap::new();
@@ -219,7 +219,7 @@ fn deduplicate_entries(entries: Vec<DiscoveryResultEntry>) -> Vec<DiscoveryResul
 /// Scoring factors:
 /// - Capability match ratio: fraction of queried capabilities the entry has.
 /// - Keyword match count: number of keywords that appear in capabilities or DID.
-/// - Source bonus: entries from contexts with discovery tools get a small boost.
+/// - Source bonus: entries from contexts with discovery outlets get a small boost.
 ///
 /// Entries are sorted by descending relevance score.
 fn rank_entries(

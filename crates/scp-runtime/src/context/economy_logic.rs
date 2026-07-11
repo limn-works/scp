@@ -3,7 +3,7 @@
 //! Implements the correct 9-step payment integration as an escrow pattern:
 //! 1. `authorize_paid_action` — evaluates cost, checks spending UCAN,
 //!    checks budget, calls adapter.authorize (escrow). Returns authorization.
-//! 2. The caller performs the action (encrypt, MLS add, tool execute).
+//! 2. The caller performs the action (encrypt, MLS add, outlet execute).
 //! 3. `complete_paid_action` — captures payment, stores receipt, records spend.
 //! 4. `void_paid_action` — voids authorization, rolls back budget on failure.
 //!
@@ -59,7 +59,7 @@ use crate::economy::integration::{self, IntegrationError};
 /// surfaces as a signature failure — closing the C1 attack where a fabricated
 /// UCAN with no real signer was accepted.
 ///
-/// Public so the cross-context tool-invocation saga handler
+/// Public so the cross-context outlet-invocation saga handler
 /// ([`crate::context::actor::handlers::saga`]) reuses the SAME VM-aware DID→key
 /// adapter for its §7 UCAN re-validation (spec §6.2.4), rather than
 /// reimplementing the `#active`/`#agent` resolution and so producing a divergent
@@ -121,7 +121,7 @@ impl DidResolver for KeyResolverDidResolver<'_> {
 /// set. This is the opposite of a stub: it is the empty case of a real
 /// integration.
 ///
-/// `pub(crate)` so the cross-context tool-invocation saga handler reuses the
+/// `pub(crate)` so the cross-context outlet-invocation saga handler reuses the
 /// SAME per-context revocation surface for its §7 UCAN re-validation (spec
 /// §6.2.4), backed by the same `revoked_spending_ucan_cids` set.
 pub struct ContextRevocationChecker<'a> {

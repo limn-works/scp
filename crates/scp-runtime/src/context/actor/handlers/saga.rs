@@ -1,6 +1,6 @@
 //! Saga-phase handlers — see
 //! [`SagaPhaseMessage`](crate::context::actor::commands::SagaPhaseMessage)
-//! and spec §6.2.4 (cross-context tool-invocation saga).
+//! and spec §6.2.4 (cross-context outlet-invocation saga).
 //!
 //! # What runs here
 //!
@@ -11,7 +11,7 @@
 //! [`Supervisor::start_cross_context_outlet_invocation_saga`](crate::context::supervisor::supervisor::Supervisor::start_cross_context_outlet_invocation_saga)).
 //!
 //! - **Prepare-A** ([`prepare_a`]) — on the caller-context actor. Validates the
-//!   caller holds `tool:interface` and is in `OutboundPolicy.allowed_callers`,
+//!   caller holds `outlet:interface` and is in `OutboundPolicy.allowed_callers`,
 //!   stages (not applies) the outbound rate-limit decrement + escrow
 //!   reservation via the existing
 //!   [`reserve_outlet_economy`](crate::context::outlets_helpers::reserve_outlet_economy)
@@ -31,11 +31,11 @@
 //!   sync-persists fail-closed before replying.
 //!
 //! - **Commit** — split into [`commit_b_reserve`] → (supervisor-side execute) →
-//!   [`commit_b_settle`] (B records `ToolInvoked`, signs the
+//!   [`commit_b_settle`] (B records `OutletInvoked`, signs the
 //!   [`CrossContextOutletReceipt`], durably captures the output keyed by `SagaId`
 //!   for replay) and [`commit_a`] (A re-acks from the durable
 //!   `xctx_committed_invocations` witness, settles escrow, records
-//!   `CrossContextToolInvoked`), with [`commit_a_check_witness`] serving the
+//!   `CrossContextOutletInvoked`), with [`commit_a_check_witness`] serving the
 //!   §17.16.4 recovery witness query — all idempotent by `SagaId`.
 //!
 //! - **Abort** ([`abort`]) — releases the staged reservations (live carrier or
@@ -401,12 +401,12 @@ fn misrouted<T>(
 /// Prepare-A handler (spec §6.2.4 "Prepare", caller side). Runs on the LOCAL
 /// caller-context actor on owned state.
 ///
-/// Validates that the caller holds `tool:interface` and is in the interface's
+/// Validates that the caller holds `outlet:interface` and is in the interface's
 /// `OutboundPolicy.allowed_callers`, then stages (does NOT apply) the outbound
 /// rate-limit decrement + escrow reservation via the existing reserve
-/// mechanism. The escrow amount is the tool's REGISTERED per-invocation cost —
+/// mechanism. The escrow amount is the outlet's REGISTERED per-invocation cost —
 /// [`reserve_outlet_economy`] derives it from the caller context's economy policy
-/// / tool registry via `economy_pre_check`, NEVER from any caller-asserted
+/// / outlet registry via `economy_pre_check`, NEVER from any caller-asserted
 /// value (a caller must not declare its own cheaper cost; spec §6.2.4 / §19.3).
 /// The resulting `Send` [`OutletEconomyReservation`] is a `#[must_use]` RAII
 /// carrier the FSM holds — its drop releases the held escrow/rate-limit on every
@@ -442,7 +442,7 @@ async fn prepare_a(
     // folded into a combinator's fixed persist-on-`Ok` / persist-never shape.
     // Each borrow ends before the next.
 
-    // 1. Caller must hold `tool:interface` AND be in the interface's outbound
+    // 1. Caller must hold `outlet:interface` AND be in the interface's outbound
     //    allowed_callers (empty = any member). REUSES the role-state capability
     //    surface (`member_has_capability`) and the `OutboundPolicy.allowed_callers`
     //    enforcement shape `invoke_cross_context` uses for the single-context path.
@@ -503,8 +503,8 @@ async fn prepare_a(
     // 3. Stage (not apply) the escrow reservation + the actor-owned
     //    velocity/budget/hard-rate-limit bookkeeping via the existing reserve
     //    mechanism. The reservation holds the escrow; apply happens at Commit-A
-    //    settle. The escrow amount is the tool's REGISTERED per-invocation cost
-    //    (derived by `reserve_outlet_economy` from the economy policy / tool
+    //    settle. The escrow amount is the outlet's REGISTERED per-invocation cost
+    //    (derived by `reserve_outlet_economy` from the economy policy / outlet
     //    registry via `economy_pre_check`), NEVER a caller-asserted value — a
     //    caller must not declare its own cheaper cost. No spending UCAN is
     //    presented on the OUTBOUND leg — the inbound `require_spending_ucan`
@@ -652,7 +652,7 @@ async fn prepare_a(
 }
 
 /// Validate the Prepare-A outbound caller gate: the caller holds
-/// `tool:interface` and is in the established interface's
+/// `outlet:interface` and is in the established interface's
 /// `OutboundPolicy.allowed_callers` (empty = any holder). Returns a typed
 /// `SCP-SAGA-13xxx` rejection otherwise.
 fn validate_outbound_caller(
@@ -662,7 +662,7 @@ fn validate_outbound_caller(
 ) -> Result<(), SagaReject> {
     use scp_protocol::context::roles::Capability;
 
-    // `tool:interface` capability (the caller is authorized to USE interfaces).
+    // `outlet:interface` capability (the caller is authorized to USE interfaces).
     if !state
         .role_state
         .member_has_capability(caller_did.as_ref(), &Capability::OutletInterface)
@@ -670,12 +670,12 @@ fn validate_outbound_caller(
         return Err(saga_reject!(
             13010,
             PermissionDenied,
-            "caller '{}' lacks tool:interface capability for cross-context invocation",
+            "caller '{}' lacks outlet:interface capability for cross-context invocation",
             caller_did
         ));
     }
 
-    // Outbound policy: the interface whose source tool is this registration.
+    // Outbound policy: the interface whose source outlet is this registration.
     // `allowed_callers` empty ⇒ any member with the capability above.
     if let Some(interface) = state
         .governance
@@ -689,7 +689,7 @@ fn validate_outbound_caller(
         return Err(saga_reject!(
             13011,
             PermissionDenied,
-            "caller '{}' not in outbound allowed_callers for tool '{}'",
+            "caller '{}' not in outbound allowed_callers for outlet '{}'",
             caller_did,
             outlet_registration_id
         ));
@@ -732,9 +732,9 @@ fn consume_outbound_interface_rate_limit(
         .iter_mut()
         .find(|i| i.outlet_id == outlet_registration_id)
     else {
-        // No interface row for this tool. The target-axis authorize-before-
+        // No interface row for this outlet. The target-axis authorize-before-
         // reserve gate already proved an established interface exists for the
-        // (caller, target, tool) triple before the saga reserved, so a missing
+        // (caller, target, outlet) triple before the saga reserved, so a missing
         // row here is not the unauthorized-target case; there is simply no
         // configured §6.2.0.2 window to consume (unbounded by design).
         return Ok(());
@@ -749,10 +749,10 @@ fn consume_outbound_interface_rate_limit(
         return Err(saga_reject!(
             13023,
             RateLimited {
-                resource: "tool_interface".to_owned(),
+                resource: "outlet_interface".to_owned(),
                 retry_after_ms: Some(retry_after_secs.saturating_mul(1000))
             },
-            "per-interface §6.2.0.2 rate limit exceeded for tool '{}' (retry after {}s)",
+            "per-interface §6.2.0.2 rate limit exceeded for outlet '{}' (retry after {}s)",
             outlet_registration_id,
             retry_after_secs
         ));
@@ -766,10 +766,10 @@ fn consume_outbound_interface_rate_limit(
         return Err(saga_reject!(
             13024,
             RateLimited {
-                resource: "tool_interface_caller".to_owned(),
+                resource: "outlet_interface_caller".to_owned(),
                 retry_after_ms: Some(retry_after_secs.saturating_mul(1000))
             },
-            "per-caller §6.2.0.2 rate limit exceeded for caller '{}' on tool '{}' (retry after {}s)",
+            "per-caller §6.2.0.2 rate limit exceeded for caller '{}' on outlet '{}' (retry after {}s)",
             caller_did,
             outlet_registration_id,
             retry_after_secs
@@ -843,7 +843,7 @@ fn consume_inbound_interface_rate_limit(
         return Err(saga_reject!(
             13027,
             PermissionDenied,
-            "interface inbound rate {}/min for tool '{}' exceeds the cache-eviction-safe ceiling \
+            "interface inbound rate {}/min for outlet '{}' exceeds the cache-eviction-safe ceiling \
              ({}/min): its dedup-TTL-window volume would approach the nonce-dedup capacity and \
              erode the §6.2.4 replay bound",
             max_per_min,
@@ -867,10 +867,10 @@ fn consume_inbound_interface_rate_limit(
         return Err(saga_reject!(
             13026,
             RateLimited {
-                resource: "tool_interface_inbound".to_owned(),
+                resource: "outlet_interface_inbound".to_owned(),
                 retry_after_ms: Some(retry_after_secs.saturating_mul(1000))
             },
-            "per-interface §6.2.0.2 INBOUND rate limit exceeded at Prepare-B for tool '{}' \
+            "per-interface §6.2.0.2 INBOUND rate limit exceeded at Prepare-B for outlet '{}' \
              (retry after {}s)",
             outlet_registration_id,
             retry_after_secs
@@ -985,7 +985,7 @@ async fn prepare_b(
         target_context_id: req.target_context_id,
         caller_did: req.caller_did.clone(),
         outlet_registration_id: req.outlet_registration_id.clone(),
-        // The journal projection carries a string proof id; an ungated tool
+        // The journal projection carries a string proof id; an ungated outlet
         // has no proof — the empty string is the "no proof" sentinel for the
         // public projection (the wire field is `<string|null>`).
         ucan_proof_id: req.ucan_proof_id.clone().unwrap_or_default(),
@@ -1113,7 +1113,7 @@ fn run_prepare_b_checks(
             13014,
             PermissionDenied,
             "target_context_id mismatch — invocation targets a different context than this \
-             executing actor (tool '{}')",
+             executing actor (outlet '{}')",
             req.outlet_registration_id
         ));
     }
@@ -1144,7 +1144,7 @@ fn run_prepare_b_checks(
 /// uses, so a stronger proof delegated to a DIFFERENT principal is rejected
 /// (audience mismatch) exactly as the single-context path would reject it.
 ///
-/// An ungated tool carries `ucan_proof_id = None` and presents no proof — there
+/// An ungated outlet carries `ucan_proof_id = None` and presents no proof — there
 /// is nothing to confuse, so the check is a no-op for that case.
 fn validate_ucan_rebind(
     state: &PerContextState,
@@ -1155,7 +1155,7 @@ fn validate_ucan_rebind(
     use scp_protocol::crypto::ucan::validate::{ProofResolver, validate_ucan};
 
     let Some(proof_id) = req.ucan_proof_id.as_deref() else {
-        return Ok(()); // ungated tool — no proof to re-bind
+        return Ok(()); // ungated outlet — no proof to re-bind
     };
 
     // Resolve the proof from B's OWN store (the index, NOT proof bytes).
@@ -1172,7 +1172,7 @@ fn validate_ucan_rebind(
             )
         })?;
 
-    // Required capability bound to B's OWN context + THIS tool + outlet_call.
+    // Required capability bound to B's OWN context + THIS outlet + outlet_call.
     let target_hex = hex_context_id(&req.target_context_id);
     let required_cap = CapabilityUri::new(
         target_hex,
@@ -1215,7 +1215,7 @@ fn validate_ucan_rebind(
         clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
         clock: deps.clock.as_ref(),
         // Cross-context saga RE-VALIDATION of a stored delegation proof re-checks
-        // an outlet-INVOCATION gate (`required_cap` = `outlet_call:{tool}`), so it
+        // an outlet-INVOCATION gate (`required_cap` = `outlet_call:{outlet}`), so it
         // is an outlet-invocation site and MUST resolve §7.3.8 caveats from each
         // token's own `nb` — matching every other outlet-invocation site
         // (ffi/outlets.rs, napi/outlets.rs, uniffi/bridge.rs). A delegated
@@ -1230,7 +1230,7 @@ fn validate_ucan_rebind(
         saga_reject!(
             13013,
             PermissionDenied,
-            "UCAN re-validation failed (re-bound to caller_did '{}' + tool '{}'): {}",
+            "UCAN re-validation failed (re-bound to caller_did '{}' + outlet '{}'): {}",
             req.caller_did,
             req.outlet_registration_id,
             e
@@ -1281,7 +1281,7 @@ fn validate_inbound_policy(
             return Err(saga_reject!(
                 13025,
                 PermissionDenied,
-                "caller role {} is not in inbound allowed_source_roles for tool '{}'",
+                "caller role {} is not in inbound allowed_source_roles for outlet '{}'",
                 req.caller_source_role
                     .as_deref()
                     .map_or_else(|| "<none>".to_owned(), |r| format!("'{r}'")),
@@ -1296,7 +1296,7 @@ fn validate_inbound_policy(
         return Err(saga_reject!(
             13015,
             PermissionDenied,
-            "inbound policy requires a spending UCAN but none was carried for tool '{}'",
+            "inbound policy requires a spending UCAN but none was carried for outlet '{}'",
             req.outlet_registration_id
         ));
     }
@@ -1307,10 +1307,10 @@ fn validate_inbound_policy(
 /// (3) Input schema specificity floor + input conformance (§9.2.1, §6.2.4
 /// normative (2)). REUSES the single-context
 /// [`validate_specificity_floor`](scp_protocol::context::outlets::schema::validate_specificity_floor)
-/// against the target tool's REGISTERED schemas — degenerate broad-schema tools
+/// against the target outlet's REGISTERED schemas — degenerate broad-schema outlets
 /// that function as arbitrary message channels are rejected — and then
 /// validates the carried `input` value against the registered input schema (the
-/// same `validate_value_against_schema` the single-context tool path applies).
+/// same `validate_value_against_schema` the single-context outlet path applies).
 fn validate_input_specificity(
     state: &PerContextState,
     req: &PrepareBRequest,
@@ -1328,12 +1328,12 @@ fn validate_input_specificity(
         return Err(saga_reject!(
             13016,
             PermissionDenied,
-            "tool '{}' not found in target registry",
+            "outlet '{}' not found in target registry",
             req.outlet_registration_id
         ));
     };
 
-    // Floor: degenerate broad-schema tools are rejected (independent of the
+    // Floor: degenerate broad-schema outlets are rejected (independent of the
     // concrete input value).
     validate_specificity_floor(
         &registration.schema.input_schema,
@@ -1343,7 +1343,7 @@ fn validate_input_specificity(
         saga_reject!(
             13017,
             PermissionDenied,
-            "input schema specificity floor not met for tool '{}' ({} schema has {} fields)",
+            "input schema specificity floor not met for outlet '{}' ({} schema has {} fields)",
             req.outlet_registration_id,
             side,
             fields
@@ -1356,7 +1356,7 @@ fn validate_input_specificity(
         saga_reject!(
             13021,
             PermissionDenied,
-            "input does not conform to registered schema for tool '{}': {}",
+            "input does not conform to registered schema for outlet '{}': {}",
             req.outlet_registration_id,
             msg
         )
@@ -1402,7 +1402,7 @@ fn validate_freshness(
         return Err(saga_reject!(
             13018,
             PermissionDenied,
-            "invocation timestamp outside §9.14 skew tolerance (Δ={}ms > {}ms) for tool '{}'",
+            "invocation timestamp outside §9.14 skew tolerance (Δ={}ms > {}ms) for outlet '{}'",
             delta_ms,
             skew_ms,
             req.outlet_registration_id
@@ -1426,7 +1426,7 @@ fn validate_freshness(
         return Err(saga_reject!(
             13019,
             PermissionDenied,
-            "invocation nonce already seen in target dedup cache (replay) for tool '{}'",
+            "invocation nonce already seen in target dedup cache (replay) for outlet '{}'",
             req.outlet_registration_id
         ));
     }
@@ -1446,7 +1446,7 @@ fn validate_chain_depth(state: &PerContextState, req: &PrepareBRequest) -> Resul
         return Err(saga_reject!(
             13020,
             PermissionDenied,
-            "chain depth {} +1 exceeds max_chain_depth {} for tool '{}'",
+            "chain depth {} +1 exceeds max_chain_depth {} for outlet '{}'",
             req.asserted_chain_depth,
             max_depth,
             req.outlet_registration_id
@@ -1459,14 +1459,14 @@ fn validate_chain_depth(state: &PerContextState, req: &PrepareBRequest) -> Resul
 // Commit-B — target-context actor (split reserve / settle, spec §6.2.4)
 // ---------------------------------------------------------------------------
 
-/// Derive the `SagaId`-stable `ToolInvoked` event-log entry id (spec §6.2.4
+/// Derive the `SagaId`-stable `OutletInvoked` event-log entry id (spec §6.2.4
 /// "`SagaId`-idempotent event-log append"). The id MUST be reproducible from
 /// durable state on a replayed Commit — it is a signed receipt-preimage field —
 /// so it is derived deterministically from the `SagaId` rather than minted from
-/// a fresh counter. The `ToolInvoked:` prefix matches the §5.16 event-name
+/// a fresh counter. The `OutletInvoked:` prefix matches the §5.16 event-name
 /// convention so the §6.2.4 auditor can recognise the entry type.
 fn outlet_invoked_event_id(saga_id: &SagaId) -> String {
-    format!("ToolInvoked:{}", saga_id.0)
+    format!("OutletInvoked:{}", saga_id.0)
 }
 
 /// Commit-B reserve half (spec §6.2.4 "Commit", split-execution model). Runs on
@@ -1475,9 +1475,9 @@ fn outlet_invoked_event_id(saga_id: &SagaId) -> String {
 ///
 /// Idempotency (§6.2.4 / §17.16.4): if this `SagaId`'s output was already
 /// captured (a replayed Commit), reply [`CommitBReserveOutcome::AlreadyCommitted`]
-/// with the STORED output + receipt + event id — the tool is NEVER re-invoked.
+/// with the STORED output + receipt + event id — the outlet is NEVER re-invoked.
 /// Otherwise the staged `saga_pending` slot for this `SagaId` MUST be a
-/// cross-context tool invocation; reply [`CommitBReserveOutcome::ReadyToExecute`].
+/// cross-context outlet invocation; reply [`CommitBReserveOutcome::ReadyToExecute`].
 ///
 /// Read-only — no mutation, no Class-S persist.
 fn commit_b_reserve(
@@ -1512,7 +1512,7 @@ fn commit_b_reserve(
     }
     let err = ContextError::InvalidState(format!(
         "SCP-SAGA-13030: Commit-B reserve for saga '{}' found no staged cross-context \
-         tool-invocation prepared state (Prepare-B never ran, or the slot was rolled back)",
+         outlet-invocation prepared state (Prepare-B never ran, or the slot was rolled back)",
         saga_id.0
     ));
     let sketch = outcome_error_sketch(&err);
@@ -1528,7 +1528,7 @@ fn commit_b_reserve(
 /// `recorded_chain_depth` / `recorded_timestamp_ms` + `output_hash` + the
 /// `SagaId`-stable `outlet_invoked_event_id` using the target's Active Signing
 /// Key, durably captures the receipt + output keyed by `SagaId`, appends
-/// `ToolInvoked` to the local log, clears the staged `saga_pending` slot,
+/// `OutletInvoked` to the local log, clears the staged `saga_pending` slot,
 /// Class-S sync-persists fail-closed, and replies. On a REPLAY (output already
 /// captured) re-emits the STORED bytes verbatim — no re-invoke, no re-append,
 /// no re-sign.
@@ -1568,7 +1568,7 @@ async fn commit_b_settle(
 
 /// Re-emit a durably-captured Commit-B settle on a replay (spec §6.2.4
 /// "Crash recovery §17.16.4"): the stored receipt + output are returned
-/// verbatim. The tool is NOT re-invoked and nothing is re-signed.
+/// verbatim. The outlet is NOT re-invoked and nothing is re-signed.
 fn reemit_committed_settle(
     committed: &CommittedOutletInvocation,
     reply: CommitBSettleReply,
@@ -1591,14 +1591,14 @@ fn reemit_committed_settle(
 }
 
 /// First (non-replay) Commit-B settle: sign the receipt over the STAGED
-/// provenance + captured output, append `ToolInvoked`, durably capture the
+/// provenance + captured output, append `OutletInvoked`, durably capture the
 /// output keyed by `SagaId`, clear the staged slot, and Class-S persist
 /// fail-closed. Returns the settle outcome (the caller sends the reply).
 ///
 /// On a persist failure the durable capture + staged slot are rolled back so a
 /// retried settle re-runs cleanly. The error is returned as `(mutated, err)`:
 /// `mutated == false` for the pre-append failures (no staged slot — 13031; or
-/// receipt signing — 13032-13034), `true` once the `ToolInvoked` append has
+/// receipt signing — 13032-13034), `true` once the `OutletInvoked` append has
 /// run (the event log was touched even if the durable capture was rolled back).
 // Sync wrapper preserved for the existing call shape; the body is now `async`
 // (the combinators are `async`-friendly but the persists here are sync — the
@@ -1616,7 +1616,7 @@ fn reemit_committed_settle(
 // `saga_pending` slot so a retried settle sees `ReadyToExecute` and re-runs.
 // Keeping the capture (the `then_append` behaviour) would make the next
 // `commit_b_reserve` report `AlreadyCommitted` against an in-memory-only capture
-// and SKIP the `ToolInvoked` append forever — a missing convergent leaf on an
+// and SKIP the `OutletInvoked` append forever — a missing convergent leaf on an
 // in-process retry after a survived persist failure. `then_append` exposes no
 // way to recover the owned `prepared` on its persist-failure arm (the
 // `append_input` is dropped by the early `?`), and `CrossContextOutletInvocationPrepared`
@@ -1652,7 +1652,7 @@ async fn commit_b_first_settle(
             false,
             ContextError::InvalidState(format!(
                 "SCP-SAGA-13031: Commit-B settle for saga '{}' found no staged cross-context \
-                 tool-invocation prepared state",
+                 outlet-invocation prepared state",
                 saga_id.0
             )),
         ));
@@ -1684,7 +1684,7 @@ async fn commit_b_first_settle(
             }
             return Err(ContextError::InvalidState(format!(
                 "SCP-SAGA-13031: Commit-B settle for saga '{}' found no staged cross-context \
-                 tool-invocation prepared state",
+                 outlet-invocation prepared state",
                 saga_id.0
             )));
         };
@@ -1706,7 +1706,7 @@ async fn commit_b_first_settle(
         // The receipt's JCS output bytes are the canonical preimage A re-hashes.
         let canonical_output = receipt.output_jcs.clone();
 
-        // Snapshot the fields the ToolInvoked record needs. `recorded_chain_depth`
+        // Snapshot the fields the OutletInvoked record needs. `recorded_chain_depth`
         // / `recorded_timestamp_ms` are B's staged values (never re-read from
         // wire).
         let caller_did_str = prepared.caller_did.0.clone();
@@ -1715,15 +1715,15 @@ async fn commit_b_first_settle(
         let outlet_registration_id = prepared.outlet_registration_id.clone();
 
         // Order matters (provenance-integrity): the durable output capture +
-        // Class-S persist land BEFORE the `ToolInvoked` event-log append. The
+        // Class-S persist land BEFORE the `OutletInvoked` event-log append. The
         // event log is a SEPARATE provider not covered by
         // `persist_state_fail_closed` and the append is NOT provider-idempotent,
         // so appending FIRST would double-append on a persist-failure retry: a
         // persist failure rolls the capture back and re-stages the slot, the next
         // reserve reports `ReadyToExecute`, and `commit_b_first_settle` re-runs —
-        // re-appending a SECOND `ToolInvoked` for one saga. Appending only after
+        // re-appending a SECOND `OutletInvoked` for one saga. Appending only after
         // the capture + persist succeed makes a persist failure leave NO orphan
-        // log entry, so the retry produces exactly one `ToolInvoked`.
+        // log entry, so the retry produces exactly one `OutletInvoked`.
 
         // Durably capture the output + signed receipt keyed by SagaId (§6.2.4
         // "Exactly-once execution with durable output capture"). The staged slot
@@ -1759,13 +1759,13 @@ async fn commit_b_first_settle(
         Err(err) => return Err((false, err)),
     };
 
-    // (2) Append `ToolInvoked` + finalize (split out to keep this helper within
+    // (2) Append `OutletInvoked` + finalize (split out to keep this helper within
     // the per-function line budget).
     commit_b_settle_finalize(cell, deps, saga_id, &target_hex, captured_fields).await
 }
 
 /// Post-capture half of [`commit_b_first_settle`] (step 2): append the
-/// `ToolInvoked` event-log leaf, and on append failure roll the capture back +
+/// `OutletInvoked` event-log leaf, and on append failure roll the capture back +
 /// re-stage the owned slot + RE-PERSIST via [`ClassSCell::commit_class_s_keep`].
 /// Split out of [`commit_b_first_settle`] only to stay within the per-function
 /// line budget — the behaviour is exactly the prior inline append path. See
@@ -1789,7 +1789,7 @@ async fn commit_b_settle_finalize(
         outlet_registration_id,
     } = captured;
 
-    // Append `ToolInvoked` to the local (target) log (spec §6.2.4 "Commit"):
+    // Append `OutletInvoked` to the local (target) log (spec §6.2.4 "Commit"):
     // caller ctx id / caller DID actor / B's re-derived depth + staged timestamp.
     // Runs ONLY after the capture + persist landed, so it appears exactly once
     // across retries.
@@ -1801,7 +1801,7 @@ async fn commit_b_settle_finalize(
         "chain_depth": receipt.chain_depth,
         "timestamp_ms": receipt.timestamp_ms,
     });
-    // CONVERGENT committer-assigned leaf timestamp: the saga's `ToolInvoked` is a
+    // CONVERGENT committer-assigned leaf timestamp: the saga's `OutletInvoked` is a
     // commit-ordered convergent durable leaf (ADR-011 Amendment §6 carve-out),
     // NOT a per-author-excluded event. Draw the timestamp from B's signed
     // `recorded_timestamp_ms` (the receipt's `timestamp_ms`, in ms) — the single
@@ -1813,7 +1813,7 @@ async fn commit_b_settle_finalize(
             deps.event_log
                 .append_context_event_with_payload(
                     &target_context_id,
-                    scp_event_log::EventType::ToolInvoked,
+                    scp_event_log::EventType::OutletInvoked,
                     &caller_did_str,
                     scp_event_log::EventPayload {
                         data: outlet_invoked_payload_bytes,
@@ -1823,7 +1823,7 @@ async fn commit_b_settle_finalize(
                 .await
         }
         Err(e) => Err(ContextError::EventLogFailed(format!(
-            "SCP-SAGA-13038: ToolInvoked payload serialization failed: {e}"
+            "SCP-SAGA-13038: OutletInvoked payload serialization failed: {e}"
         ))),
     };
 
@@ -1833,7 +1833,7 @@ async fn commit_b_settle_finalize(
         // RE-PERSIST so the rolled-back state is durable — otherwise the next
         // reserve would see the already-persisted capture, report
         // `AlreadyCommitted`, and SKIP the append forever (a missing
-        // `ToolInvoked`). With the compensating re-persist, the retry sees
+        // `OutletInvoked`). With the compensating re-persist, the retry sees
         // `ReadyToExecute` and re-runs settle, appending exactly once. The
         // rollback+re-persist is a fail-closed Class-S commit of the rolled-back
         // state — `commit_class_s_keep` keeps it on a re-persist failure (matching
@@ -1872,7 +1872,7 @@ async fn commit_b_settle_finalize(
 /// The data `commit_b_first_settle`'s capture combinator (`f`) produces for the
 /// post-persist event-log append + reply: the OWNED original `prepared` (so the
 /// append-failure compensation can re-stage the slot losslessly), the signed
-/// receipt + canonical output + stable event id, and the `ToolInvoked` record
+/// receipt + canonical output + stable event id, and the `OutletInvoked` record
 /// fields. Lives only between the two combinators in that one helper.
 struct CommitBCaptured {
     prepared: CrossContextOutletInvocationPrepared,
@@ -1900,7 +1900,7 @@ fn build_signed_receipt(
     // hashes and the receipt carries (Output canonicalization obligation).
     let output_value: serde_json::Value = serde_json::from_slice(output_bytes).map_err(|e| {
         ContextError::CryptoFailed(format!(
-            "SCP-SAGA-13032: Commit-B tool output is not valid JSON, cannot canonicalize \
+            "SCP-SAGA-13032: Commit-B outlet output is not valid JSON, cannot canonicalize \
              for the receipt: {e}"
         ))
     })?;
@@ -1958,12 +1958,12 @@ struct CommitARequest {
     output_bytes: Vec<u8>,
 }
 
-/// Builds the caller-side `CrossContextToolInvoked` leaf: its CONVERGENT
+/// Builds the caller-side `CrossContextOutletInvoked` leaf: its CONVERGENT
 /// committer-assigned timestamp (seconds) + its JSON payload bytes.
 ///
 /// The caller-side record is a commit-ordered convergent durable leaf (ADR-011
 /// Amendment §6 carve-out), NOT a per-author-excluded event. It MUST hash the
-/// SAME instant as B's `ToolInvoked` leaf so the two `nonce`-joined records date
+/// SAME instant as B's `OutletInvoked` leaf so the two `nonce`-joined records date
 /// the one provenance edge identically. That instant is B's signed
 /// `recorded_timestamp_ms`, carried in the forwarded, already-verified
 /// `CrossContextOutletReceipt` (`timestamp_ms`, in ms). Re-deriving it from the
@@ -1992,7 +1992,7 @@ fn cross_context_invoked_leaf(
     let receipt: CrossContextOutletReceipt =
         serde_json::from_slice(receipt_bytes).map_err(|err| {
             ContextError::EventLogFailed(format!(
-                "SCP-SAGA-13039: CrossContextToolInvoked timestamp could not be \
+                "SCP-SAGA-13039: CrossContextOutletInvoked timestamp could not be \
                  read from the receipt: {err}"
             ))
         })?;
@@ -2006,7 +2006,7 @@ fn cross_context_invoked_leaf(
     });
     let invoked_payload_bytes = serde_json::to_vec(&invoked_payload).map_err(|err| {
         ContextError::EventLogFailed(format!(
-            "SCP-SAGA-13040: CrossContextToolInvoked payload serialization failed: {err}"
+            "SCP-SAGA-13040: CrossContextOutletInvoked payload serialization failed: {err}"
         ))
     })?;
     Ok((invoked_leaf_secs, invoked_payload_bytes))
@@ -2016,7 +2016,7 @@ fn cross_context_invoked_leaf(
 /// caller-context actor.
 ///
 /// Settles the escrow + outbound-rate-limit reservation staged at Prepare-A
-/// (§19.2.2), appends `CrossContextToolInvoked` referencing the target ctx id +
+/// (§19.2.2), appends `CrossContextOutletInvoked` referencing the target ctx id +
 /// the SAME `nonce` (the join key between the two records, §6.2.4 "Dual
 /// event-log recording"), Class-S sync-persists fail-closed, and acks.
 /// Idempotent by `SagaId`: a replay re-acks without re-settling or re-appending
@@ -2107,10 +2107,10 @@ async fn commit_a(
 
     // Order matters (provenance-integrity), mirroring `commit_b_first_settle`:
     // the idempotency witness + Class-S persist land BEFORE the
-    // `CrossContextToolInvoked` event-log append. The event log is a SEPARATE
+    // `CrossContextOutletInvoked` event-log append. The event log is a SEPARATE
     // provider not covered by `persist_state_fail_closed` and the append is NOT
     // provider-idempotent, so appending FIRST (the inverse, B-side-documented
-    // hazard) would leave a DURABLE A-side `CrossContextToolInvoked` orphan when
+    // hazard) would leave a DURABLE A-side `CrossContextOutletInvoked` orphan when
     // the post-append persist fails: the witness is rolled back, but the log
     // entry already landed — an A-without-B record that B's log denies and that
     // `divergence_marker_plan` (keyed off the B-committed event id) would not
@@ -2119,7 +2119,7 @@ async fn commit_a(
 
     // Order matters (provenance-integrity), mirroring `commit_b_first_settle`:
     // the idempotency witness + Class-S persist land BEFORE the
-    // `CrossContextToolInvoked` event-log append. The same persist-fail-direction
+    // `CrossContextOutletInvoked` event-log append. The same persist-fail-direction
     // mismatch as `commit_b_first_settle` applies here, so this site uses the SAME
     // two-combinator decomposition — see FLAG-COMMIT-B. `commit_class_s_then_append`
     // would KEEP the witness on a persist failure; Commit-A must RESTORE it (roll
@@ -2145,7 +2145,7 @@ async fn commit_a(
     // reverse already-settled state. On persist failure `commit_class_s_restore`
     // rolls BOTH back together (witness removed, record re-inserted) and the saga
     // is retried from a clean state. The settle already mutated owned economy and
-    // NO `CrossContextToolInvoked` was appended, so the failure is reported
+    // NO `CrossContextOutletInvoked` was appended, so the failure is reported
     // `err_mutated` with no orphan log entry.
     if let Err(persist_err) = cell
         .commit_class_s_restore(deps, &caller_hex, |mut view| {
@@ -2163,7 +2163,7 @@ async fn commit_a(
         return Outcome::err_mutated(sketch);
     }
 
-    // (2) Build the convergent `CrossContextToolInvoked` leaf (timestamp + payload
+    // (2) Build the convergent `CrossContextOutletInvoked` leaf (timestamp + payload
     // bytes) from the forwarded receipt + request. A malformed receipt or
     // serialization failure here is a post-witness fault handled by the SAME
     // witness-only rollback + re-persist as the append-failure path below.
@@ -2179,7 +2179,7 @@ async fn commit_a(
             deps.event_log
                 .append_context_event_with_payload(
                     &req.caller_context_id,
-                    scp_event_log::EventType::CrossContextToolInvoked,
+                    scp_event_log::EventType::CrossContextOutletInvoked,
                     req.caller_did.as_ref(),
                     scp_event_log::EventPayload {
                         data: invoked_payload_bytes,
@@ -2197,7 +2197,7 @@ async fn commit_a(
         // re-inserted the witness but NOT the record) and RE-PERSIST so the
         // rolled-back state is durable — otherwise the next Commit-A would see the
         // already-persisted witness, re-ack as committed, and SKIP the append
-        // forever (a missing `CrossContextToolInvoked`). With the compensating
+        // forever (a missing `CrossContextOutletInvoked`). With the compensating
         // re-persist, a retry re-runs Commit-A and appends exactly once. The
         // rollback+re-persist is a fail-closed Class-S commit — `commit_class_s_keep`
         // keeps it on a re-persist failure (witness stays durable, a genuine
@@ -2255,7 +2255,7 @@ fn commit_a_check_witness(
 /// Runs on EITHER side's local actor.
 ///
 /// RAII-releases the staged reservations — escrow / outbound-RL on the CALLER
-/// side; the tool-session on the TARGET side is released by clearing the staged
+/// side; the outlet-session on the TARGET side is released by clearing the staged
 /// `saga_pending` slot (B stages no `OutletEconomyTicket`).
 ///
 /// On the CALLER side the reversal source depends on whether the in-memory
@@ -2439,7 +2439,7 @@ async fn abort(
         }
     };
 
-    // TARGET side: whether a staged tool-session slot is present (cleared below).
+    // TARGET side: whether a staged outlet-session slot is present (cleared below).
     // Peeked (not yet removed) so the no-mutation gate can decide BEFORE the
     // combinator; the actual clear is the combinator `f`'s Class-S mutation. A
     // missing slot is a clean no-op (the gate skips the combinator, and there is
@@ -2478,7 +2478,7 @@ async fn abort(
             // Consume the durable caller-reservation record (no-op if absent — e.g. a
             // target-side abort or a gen-mismatch with no record).
             class_s.xctx_caller_reservations.remove(saga_id);
-            // Clear the target-side staged tool-session slot.
+            // Clear the target-side staged outlet-session slot.
             class_s.saga_pending.remove(saga_id);
             Ok(())
         })
@@ -2508,7 +2508,7 @@ async fn abort(
 ///
 /// `committed_timestamp_secs` is the CONVERGENT committer-assigned leaf
 /// timestamp — B's staged `recorded_timestamp_ms / 1000`, the same convergent
-/// instant the committed-side `ToolInvoked` leaf carries (spec §6.2.4 *Recorded
+/// instant the committed-side `OutletInvoked` leaf carries (spec §6.2.4 *Recorded
 /// timestamp*). The marker is a commit-ordered convergent durable leaf (ADR-011
 /// Amendment §6 carve-out), so the timestamp MUST be this convergent value and
 /// NOT an actor-local clock read, or two honest members would derive divergent
@@ -2609,7 +2609,7 @@ async fn emit_divergence_marker(
 }
 
 /// Lowercase-hex of `SHA-256(jcs(output))` — the verifiable link from the
-/// caller's `CrossContextToolInvoked` record to the receipt's `output_hash`
+/// caller's `CrossContextOutletInvoked` record to the receipt's `output_hash`
 /// without journaling the (possibly large/sensitive) output (§6.2.4).
 fn hex_output_hash(output_bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
@@ -2648,7 +2648,7 @@ mod tests {
 
     const CALLER: &str = "did:dht:z6MkCallerPrincipalXX";
     const OTHER: &str = "did:dht:z6MkOtherPrincipalXXX";
-    const TOOL: &str = "calculator-v1";
+    const OUTLET: &str = "calculator-v1";
 
     /// Destructure a Prepare-A reply expecting a §6.2.4 POLICY reject. A policy
     /// reject rides `Ok(PrepareAOutcome::Rejected(SagaReject))` on the SUCCESS
@@ -2882,8 +2882,8 @@ mod tests {
     impl_persistence!(OkPersistence, Ok(()));
     impl_persistence!(FailPersistence, Err("induced persist failure".into()));
 
-    /// Event log that COUNTS typed `ToolInvoked` appends — used to assert a
-    /// Commit-B persist-retry produces EXACTLY ONE `ToolInvoked` (FIX 3).
+    /// Event log that COUNTS typed `OutletInvoked` appends — used to assert a
+    /// Commit-B persist-retry produces EXACTLY ONE `OutletInvoked` (FIX 3).
     struct CountingEventLog {
         outlet_invoked_appends: Arc<std::sync::atomic::AtomicUsize>,
     }
@@ -2903,7 +2903,7 @@ mod tests {
             _payload: scp_event_log::EventPayload,
             _timestamp_secs: u64,
         ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
-            if event_type == scp_event_log::EventType::ToolInvoked {
+            if event_type == scp_event_log::EventType::OutletInvoked {
                 self.outlet_invoked_appends
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }
@@ -2961,7 +2961,7 @@ mod tests {
     /// Persistence that SUCCEEDS every call EXCEPT the `fail_at` (0-based) call,
     /// which FAILS — drives the Commit-A witness-persist-failure path: Prepare-A's
     /// own persists (reserve + Prepare-A tail) succeed, then the Commit-A
-    /// idempotency-witness persist fails, proving the `CrossContextToolInvoked`
+    /// idempotency-witness persist fails, proving the `CrossContextOutletInvoked`
     /// append is sequenced AFTER (and gated on) that persist.
     struct FailNthPersistence {
         calls: std::sync::atomic::AtomicUsize,
@@ -3003,9 +3003,9 @@ mod tests {
         }
     }
 
-    /// Event log that COUNTS typed `CrossContextToolInvoked` appends (the
+    /// Event log that COUNTS typed `CrossContextOutletInvoked` appends (the
     /// A-side record) — used to assert a Commit-A whose witness-persist FAILS
-    /// appends NO `CrossContextToolInvoked` orphan (the append is gated behind
+    /// appends NO `CrossContextOutletInvoked` orphan (the append is gated behind
     /// the successful witness persist).
     struct CrossContextCountingEventLog {
         xctx_invoked_appends: Arc<std::sync::atomic::AtomicUsize>,
@@ -3026,7 +3026,7 @@ mod tests {
             _payload: scp_event_log::EventPayload,
             _timestamp_secs: u64,
         ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
-            if event_type == scp_event_log::EventType::CrossContextToolInvoked {
+            if event_type == scp_event_log::EventType::CrossContextOutletInvoked {
                 self.xctx_invoked_appends
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }
@@ -3174,8 +3174,8 @@ mod tests {
     }
 
     /// An encrypted state whose `context_id == [ctx_byte; 32]`, with `member`
-    /// holding `OutletInterface`, `creator_did = creator`, and a registered tool
-    /// `TOOL` with a 2-field input schema (passes the specificity floor).
+    /// holding `OutletInterface`, `creator_did = creator`, and a registered outlet
+    /// `OUTLET` with a 2-field input schema (passes the specificity floor).
     async fn target_state(ctx_byte: u8, creator: &str, member: &str) -> PerContextState {
         let mut st = PerContextState::new_for_test_encrypted(
             [ctx_byte; 32],
@@ -3203,7 +3203,7 @@ mod tests {
             ]))
             .expect("well-formed built-in ceiling");
         st.governance.registered_outlets.push(OutletRegistration {
-            outlet_id: TOOL.to_owned(),
+            outlet_id: OUTLET.to_owned(),
             kind: scp_protocol::context::outlets::OutletKind::default(),
             name: "Calculator".to_owned(),
             description: "adds".to_owned(),
@@ -3229,7 +3229,7 @@ mod tests {
         st
     }
 
-    /// Mint a UCAN with `outlet_call:TOOL` capability, issued by `creator`
+    /// Mint a UCAN with `outlet_call:OUTLET` capability, issued by `creator`
     /// (the context creator = root issuer) to `audience`, scoped to the hex
     /// of `[ctx_byte; 32]`. Returns the issuer pubkey + the token.
     async fn mint_outlet_ucan(
@@ -3240,7 +3240,7 @@ mod tests {
         audience: &str,
     ) -> UcanToken {
         let ctx_hex = hex_context_id(&[ctx_byte; 32]);
-        let caps = vec![format!("outlet_call:{TOOL}")];
+        let caps = vec![format!("outlet_call:{OUTLET}")];
         let params = MintParams {
             issuer_did: creator_did,
             issuer_key: creator_key,
@@ -3285,7 +3285,7 @@ mod tests {
             caller_context_id: [0x99; 32],
             target_context_id: [ctx_byte; 32],
             caller_did: DID(CALLER.to_owned()),
-            outlet_registration_id: TOOL.to_owned(),
+            outlet_registration_id: OUTLET.to_owned(),
             ucan_proof_id,
             input: valid_input(),
             asserted_chain_depth,
@@ -3318,7 +3318,7 @@ mod tests {
             &SagaId("prep-a-accepts".to_owned()),
             &[0x11; 32],
             &DID(CALLER.to_owned()),
-            TOOL,
+            OUTLET,
             tx,
         )
         .await;
@@ -3339,7 +3339,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepare_a_rejects_caller_without_tool_interface() {
+    async fn prepare_a_rejects_caller_without_outlet_interface() {
         let issuer = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
         let mut st = target_state(0x11, OTHER, CALLER).await;
         st.role_state.creator_did = CALLER.to_owned();
@@ -3362,7 +3362,7 @@ mod tests {
             &SagaId("prep-a-no-iface".to_owned()),
             &[0x11; 32],
             &DID(CALLER.to_owned()),
-            TOOL,
+            OUTLET,
             tx,
         )
         .await;
@@ -3383,7 +3383,7 @@ mod tests {
         st.governance.outlet_interfaces.push(OutletInterface {
             source_context: hex_context_id(&[0x11; 32]),
             target_context: hex_context_id(&[0x22; 32]),
-            outlet_id: TOOL.to_owned(),
+            outlet_id: OUTLET.to_owned(),
             rate_limit: None,
             inbound_rate_limit: None,
             per_caller_rate_limit: None,
@@ -3410,7 +3410,7 @@ mod tests {
             &SagaId("prep-a-not-allowed".to_owned()),
             &[0x11; 32],
             &DID(CALLER.to_owned()),
-            TOOL,
+            OUTLET,
             tx,
         )
         .await;
@@ -3441,7 +3441,7 @@ mod tests {
             &SagaId("prep-a-failclose".to_owned()),
             &[0x11; 32],
             &DID(CALLER.to_owned()),
-            TOOL,
+            OUTLET,
             tx,
         )
         .await;
@@ -3484,7 +3484,7 @@ mod tests {
             &SagaId("prep-a-cost".to_owned()),
             &[0x11; 32],
             &DID(CALLER.to_owned()),
-            TOOL,
+            OUTLET,
             tx,
         )
         .await;
@@ -3543,7 +3543,7 @@ mod tests {
         st.governance.outlet_interfaces.push(OutletInterface {
             source_context: hex_context_id(&[0x11; 32]),
             target_context: hex_context_id(&[0x22; 32]),
-            outlet_id: TOOL.to_owned(),
+            outlet_id: OUTLET.to_owned(),
             rate_limit: Some(zero_budget),
             inbound_rate_limit: None,
             per_caller_rate_limit: None,
@@ -3561,7 +3561,7 @@ mod tests {
             &SagaId("prep-a-iface-rl".to_owned()),
             &[0x11; 32],
             &DID(CALLER.to_owned()),
-            TOOL,
+            OUTLET,
             tx,
         )
         .await;
@@ -3596,7 +3596,7 @@ mod tests {
         st.governance.outlet_interfaces.push(OutletInterface {
             source_context: hex_context_id(&[0x11; 32]),
             target_context: hex_context_id(&[0x22; 32]),
-            outlet_id: TOOL.to_owned(),
+            outlet_id: OUTLET.to_owned(),
             rate_limit: None,
             inbound_rate_limit: None,
             per_caller_rate_limit: Some(zero_caller_budget),
@@ -3614,7 +3614,7 @@ mod tests {
             &SagaId("prep-a-caller-rl".to_owned()),
             &[0x11; 32],
             &DID(CALLER.to_owned()),
-            TOOL,
+            OUTLET,
             tx,
         )
         .await;
@@ -3673,14 +3673,14 @@ mod tests {
         let SagaPreparedState::CrossContextOutletInvocation(p) = staged;
         assert_eq!(p.target_context_id, [0x33; 32]);
         assert_eq!(p.caller_did, DID(CALLER.to_owned()));
-        assert_eq!(p.outlet_registration_id, TOOL);
+        assert_eq!(p.outlet_registration_id, OUTLET);
         assert_eq!(p.ucan_proof_id, "proof-1");
         assert_eq!(p.recorded_chain_depth, 3);
         assert_eq!(p.recorded_nonce, [0x42; 16]);
     }
 
     /// FIX B.2 (`InboundPolicy.allowed_source_roles` enforced at Prepare-B). An
-    /// ungated tool whose interface restricts `allowed_source_roles` to a set
+    /// ungated outlet whose interface restricts `allowed_source_roles` to a set
     /// that does NOT contain the channel-authenticated caller's role rejects
     /// with SCP-SAGA-13025 and stages nothing — the role is evaluated against
     /// the supervisor-resolved `caller_source_role`, never an envelope value.
@@ -3688,12 +3688,12 @@ mod tests {
     async fn prepare_b_rejects_caller_role_not_in_allowed_source_roles() {
         use scp_protocol::context::outlets::interface::{InboundPolicy, OutletInterface};
         let issuer = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
-        // Ungated tool (no UCAN proof) on the TARGET context 0x55.
+        // Ungated outlet (no UCAN proof) on the TARGET context 0x55.
         let mut st = target_state(0x55, OTHER, CALLER).await;
         st.governance.outlet_interfaces.push(OutletInterface {
             source_context: hex_context_id(&[0x99; 32]),
             target_context: hex_context_id(&[0x55; 32]),
-            outlet_id: TOOL.to_owned(),
+            outlet_id: OUTLET.to_owned(),
             rate_limit: None,
             inbound_rate_limit: None,
             per_caller_rate_limit: None,
@@ -3745,7 +3745,7 @@ mod tests {
         st.governance.outlet_interfaces.push(OutletInterface {
             source_context: hex_context_id(&[0x99; 32]),
             target_context: hex_context_id(&[0x56; 32]),
-            outlet_id: TOOL.to_owned(),
+            outlet_id: OUTLET.to_owned(),
             rate_limit: None,
             inbound_rate_limit: None,
             per_caller_rate_limit: None,
@@ -3773,7 +3773,7 @@ mod tests {
         expect_prepared_b(rx.await.unwrap(), "an allowed role must be admitted");
     }
 
-    /// Push a `TOOL` interface with the given inbound `max_calls_per_minute`
+    /// Push a `OUTLET` interface with the given inbound `max_calls_per_minute`
     /// onto `st` (target context `ctx_byte`), approved both sides — the fixture
     /// for the inbound-rate consume tests.
     fn push_inbound_interface(st: &mut PerContextState, ctx_byte: u8, inbound_per_min: u32) {
@@ -3781,7 +3781,7 @@ mod tests {
         st.governance.outlet_interfaces.push(OutletInterface {
             source_context: hex_context_id(&[0x99; 32]),
             target_context: hex_context_id(&[ctx_byte; 32]),
-            outlet_id: TOOL.to_owned(),
+            outlet_id: OUTLET.to_owned(),
             rate_limit: None,
             inbound_rate_limit: None,
             per_caller_rate_limit: None,
@@ -3818,11 +3818,11 @@ mod tests {
         let mut st_cell = crate::context::actor::class_s::ClassSCell::new(st);
         // Drain the base + burst budget (1 base + 5 burst = 6 admitted).
         for i in 0..6 {
-            consume_inbound_interface_rate_limit(st_cell.class_c_view(), &deps, TOOL)
+            consume_inbound_interface_rate_limit(st_cell.class_c_view(), &deps, OUTLET)
                 .unwrap_or_else(|e| panic!("call {i} within budget must be admitted: {e:?}"));
         }
         // The next consume exhausts the window ⇒ typed SCP-SAGA-13026.
-        let reject = consume_inbound_interface_rate_limit(st_cell.class_c_view(), &deps, TOOL)
+        let reject = consume_inbound_interface_rate_limit(st_cell.class_c_view(), &deps, OUTLET)
             .expect_err("inbound window exhausted must reject");
         assert_eq!(reject.code, Some(13026));
         assert!(
@@ -3856,7 +3856,7 @@ mod tests {
         .await;
 
         let mut st_cell = crate::context::actor::class_s::ClassSCell::new(st);
-        let reject = consume_inbound_interface_rate_limit(st_cell.class_c_view(), &deps, TOOL)
+        let reject = consume_inbound_interface_rate_limit(st_cell.class_c_view(), &deps, OUTLET)
             .expect_err("an inbound ceiling above the eviction-safe limit must reject");
         assert_eq!(reject.code, Some(13027));
         assert!(
@@ -3869,7 +3869,7 @@ mod tests {
             .governance
             .outlet_interfaces
             .iter()
-            .find(|i| i.outlet_id == TOOL)
+            .find(|i| i.outlet_id == OUTLET)
             .expect("interface present");
         assert!(
             iface.inbound_rate_limit.is_none(),
@@ -3894,7 +3894,7 @@ mod tests {
         .await;
 
         let mut st_cell = crate::context::actor::class_s::ClassSCell::new(st);
-        consume_inbound_interface_rate_limit(st_cell.class_c_view(), &deps, TOOL)
+        consume_inbound_interface_rate_limit(st_cell.class_c_view(), &deps, OUTLET)
             .expect("the maximum safe inbound ceiling must be admitted");
     }
 
@@ -3906,7 +3906,7 @@ mod tests {
     async fn prepare_b_through_path_materializes_and_consumes_inbound_window() {
         let issuer = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
         let mut st = target_state(0x5A, OTHER, CALLER).await;
-        // Ungated tool with a safe inbound ceiling.
+        // Ungated outlet with a safe inbound ceiling.
         push_inbound_interface(&mut st, 0x5A, 60);
         let deps = build_deps(
             OTHER.to_owned(),
@@ -3928,7 +3928,7 @@ mod tests {
             .governance
             .outlet_interfaces
             .iter()
-            .find(|i| i.outlet_id == TOOL)
+            .find(|i| i.outlet_id == OUTLET)
             .expect("interface present");
         let window = iface
             .inbound_rate_limit
@@ -3942,7 +3942,7 @@ mod tests {
 
     #[tokio::test]
     async fn prepare_b_confused_deputy_audience_mismatch_is_rejected() {
-        // The UCAN is VALID and grants outlet_call:TOOL — but it is delegated to
+        // The UCAN is VALID and grants outlet_call:OUTLET — but it is delegated to
         // a DIFFERENT principal (OTHER) than the carried caller_did (CALLER). A
         // confused-deputy attempt: the carried caller references a stronger
         // proof in B's store delegated to someone else. MUST be rejected.
@@ -4137,7 +4137,7 @@ mod tests {
         let saga = SagaId("saga-same-node-restore".to_owned());
         let (tx, rx) = oneshot::channel();
         let mut st_cell = crate::context::actor::class_s::ClassSCell::new(st);
-        prepare_a(&mut st_cell, &deps, &saga, &[0x6B; 32], &caller, TOOL, tx).await;
+        prepare_a(&mut st_cell, &deps, &saga, &[0x6B; 32], &caller, OUTLET, tx).await;
         let prepared_a = expect_prepared_a(rx.await.unwrap(), "prepared-A");
         let staged = st_cell
             .class_s
@@ -4233,13 +4233,13 @@ mod tests {
     async fn prepare_b_rejects_degenerate_broad_input_schema() {
         let issuer = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
         let mut st = target_state(0x99, OTHER, CALLER).await;
-        // Replace the registered tool's schemas with degenerate broad ones
+        // Replace the registered outlet's schemas with degenerate broad ones
         // (zero declared fields on both sides ⇒ below the specificity floor).
         if let Some(reg) = st
             .governance
             .registered_outlets
             .iter_mut()
-            .find(|t| t.outlet_id == TOOL)
+            .find(|t| t.outlet_id == OUTLET)
         {
             reg.schema.input_schema = serde_json::json!({ "type": "object" });
             reg.schema.output_schema = serde_json::json!({ "type": "object" });
@@ -4276,7 +4276,7 @@ mod tests {
         let now_ms = deps.clock.now_millis();
 
         let (tx, rx) = oneshot::channel();
-        // Ungated tool (no proof) so every other check passes and we reach the
+        // Ungated outlet (no proof) so every other check passes and we reach the
         // Class-S persist, which fails.
         let req = prepare_b_request(0xAA, None, 1, now_ms);
         let mut st_cell = crate::context::actor::class_s::ClassSCell::new(st);
@@ -4310,9 +4310,9 @@ mod tests {
                 target_context_id: [0xEE; 32],
                 caller_did: CALLER.to_owned(),
                 nonce: [0x42; 16],
-                outlet_registration_id: TOOL.to_owned(),
+                outlet_registration_id: OUTLET.to_owned(),
                 output_jcs: br#"{"result":1}"#.to_vec(),
-                outlet_invoked_event_id: "ToolInvoked:saga-commit-a-1".to_owned(),
+                outlet_invoked_event_id: "OutletInvoked:saga-commit-a-1".to_owned(),
                 chain_depth: 3,
                 timestamp_ms,
             },
@@ -4322,7 +4322,7 @@ mod tests {
     }
 
     /// Stage a Prepare-B slot for `saga_id` by running the real `prepare_b`
-    /// (ungated tool) so Commit-B has the B-recorded provenance to sign over.
+    /// (ungated outlet) so Commit-B has the B-recorded provenance to sign over.
     async fn stage_prepared_b(
         cell: &mut crate::context::actor::class_s::ClassSCell,
         deps: &ActorDeps,
@@ -4362,7 +4362,7 @@ mod tests {
             CommitBReserveOutcome::ReadyToExecute
         ));
 
-        // Settle: capture output, append ToolInvoked, sign a verifiable receipt.
+        // Settle: capture output, append OutletInvoked, sign a verifiable receipt.
         let target_key = signing_key_bytes(0x55);
         let output = br#"{"result":42}"#.to_vec();
         let (tx, rx) = oneshot::channel();
@@ -4421,7 +4421,7 @@ mod tests {
             .clone();
 
         // Replay: a DIFFERENT output + a DIFFERENT key would re-sign divergently
-        // if the tool were re-invoked — but the replay re-emits the STORED
+        // if the outlet were re-invoked — but the replay re-emits the STORED
         // capture, so the receipt + event id are byte-for-byte identical.
         let (tx, rx) = oneshot::channel();
         let out = commit_b_settle(
@@ -4510,7 +4510,7 @@ mod tests {
             &saga,
             &[0xC4; 32],
             &DID(CALLER.to_owned()),
-            TOOL,
+            OUTLET,
             tx,
         )
         .await;
@@ -4543,7 +4543,7 @@ mod tests {
             &saga,
             &[0xC4; 32],
             &DID(CALLER.to_owned()),
-            TOOL,
+            OUTLET,
             tx2,
         )
         .await;
@@ -4566,7 +4566,7 @@ mod tests {
 
     /// Provenance-integrity (regression): a Commit-A whose idempotency-witness
     /// Class-S persist FAILS must NOT durably append the A-side
-    /// `CrossContextToolInvoked` record. The append is sequenced AFTER (and gated
+    /// `CrossContextOutletInvoked` record. The append is sequenced AFTER (and gated
     /// on) the witness persist — mirroring `commit_b_first_settle` — so a persist
     /// failure leaves NO orphan A-side "the call happened" record that B's log
     /// denies (the silent one-sided A-record / reverse-direction repudiation
@@ -4598,7 +4598,7 @@ mod tests {
             &saga,
             &[0xC7; 32],
             &DID(CALLER.to_owned()),
-            TOOL,
+            OUTLET,
             tx,
         )
         .await;
@@ -4648,12 +4648,12 @@ mod tests {
             .expect_err("commit-a must fail-close on witness persist");
         assert!(matches!(err, ContextError::PersistenceFailed(_)));
 
-        // No orphan A-side record: the `CrossContextToolInvoked` append is gated
+        // No orphan A-side record: the `CrossContextOutletInvoked` append is gated
         // behind the (failed) witness persist, so it NEVER ran.
         assert_eq!(
             xctx_invoked_appends.load(std::sync::atomic::Ordering::SeqCst),
             0,
-            "a witness-persist failure must NOT append CrossContextToolInvoked \
+            "a witness-persist failure must NOT append CrossContextOutletInvoked \
              (append is sequenced after the witness persist)"
         );
         // The witness is not left set — a retry re-acks from the absent witness.
@@ -4717,7 +4717,7 @@ mod tests {
             &saga,
             &[0xC6; 32],
             &DID(CALLER.to_owned()),
-            TOOL,
+            OUTLET,
             tx,
         )
         .await;
@@ -4779,7 +4779,7 @@ mod tests {
         // persists the deduction once via the spy).
         let (tx, rx) = oneshot::channel();
         let mut st_cell = crate::context::actor::class_s::ClassSCell::new(st);
-        prepare_a(&mut st_cell, &deps, &saga, &[0xC8; 32], &caller, TOOL, tx).await;
+        prepare_a(&mut st_cell, &deps, &saga, &[0xC8; 32], &caller, OUTLET, tx).await;
         let prepared_a = expect_prepared_a(rx.await.unwrap(), "prepared-A");
 
         // Reserve actually moved owned economy state (else the test proves
@@ -4886,7 +4886,7 @@ mod tests {
             &SagaId("genmismatch-1".to_owned()),
             &[0xD1; 32],
             &DID(CALLER.to_owned()),
-            TOOL,
+            OUTLET,
             tx,
         )
         .await;
@@ -4916,7 +4916,7 @@ mod tests {
             &SagaId("genmismatch-2".to_owned()),
             &[0xD1; 32],
             &DID(CALLER.to_owned()),
-            TOOL,
+            OUTLET,
             tx,
         )
         .await;
@@ -4991,7 +4991,7 @@ mod tests {
         let saga = SagaId("saga-abort-stale-gen".to_owned());
         let (tx, rx) = oneshot::channel();
         let mut st_cell = crate::context::actor::class_s::ClassSCell::new(st);
-        prepare_a(&mut st_cell, &deps, &saga, &[0xD2; 32], &caller, TOOL, tx).await;
+        prepare_a(&mut st_cell, &deps, &saga, &[0xD2; 32], &caller, OUTLET, tx).await;
         let prepared = expect_prepared_a(rx.await.unwrap(), "prepared-A");
         // Prepare-A staged the durable record + moved owned economy.
         assert!(
@@ -5181,18 +5181,18 @@ mod tests {
     }
 
     /// FIX 3 (provenance-integrity): a Commit-B persist FAILURE followed by a
-    /// successful RETRY appends EXACTLY ONE `ToolInvoked`. The `ToolInvoked`
+    /// successful RETRY appends EXACTLY ONE `OutletInvoked`. The `OutletInvoked`
     /// event-log append (a separate, non-idempotent provider) is sequenced AFTER
     /// the durable capture + Class-S persist succeed, so a persist failure leaves
     /// no orphan log entry to double-append on retry.
     #[tokio::test]
-    async fn commit_b_persist_retry_appends_tool_invoked_exactly_once() {
+    async fn commit_b_persist_retry_appends_outlet_invoked_exactly_once() {
         let issuer = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
         let st = target_state(0xCD, OTHER, CALLER).await;
         let saga = SagaId("saga-persist-retry-once".to_owned());
 
         // Stage Prepare-B with an Ok persistence + a throwaway event log (the
-        // stage append is a `Prepared`-class event, not `ToolInvoked`).
+        // stage append is a `Prepared`-class event, not `OutletInvoked`).
         let stage_deps = build_deps(
             OTHER.to_owned(),
             issuer.verifying_key(),
@@ -5221,7 +5221,7 @@ mod tests {
         let signing = signing_key_bytes(0xAA);
 
         // FIRST settle: the persist fails BEFORE the append — capture rolled back,
-        // staged slot restored, and (FIX 3) NO `ToolInvoked` appended.
+        // staged slot restored, and (FIX 3) NO `OutletInvoked` appended.
         let (tx, rx) = oneshot::channel();
         let out = commit_b_settle(
             &mut st_cell,
@@ -5241,13 +5241,13 @@ mod tests {
         assert_eq!(
             outlet_invoked_appends.load(std::sync::atomic::Ordering::SeqCst),
             0,
-            "a persist failure must NOT append ToolInvoked (append is sequenced after persist)"
+            "a persist failure must NOT append OutletInvoked (append is sequenced after persist)"
         );
         assert!(!st_cell.class_s.xctx_committed_outputs.contains_key(&saga));
         assert!(st_cell.class_s.saga_pending.contains_key(&saga));
 
         // RETRY settle on the SAME deps (the persistence now succeeds): capture
-        // lands, persist succeeds, and `ToolInvoked` appends EXACTLY ONCE.
+        // lands, persist succeeds, and `OutletInvoked` appends EXACTLY ONCE.
         let (tx, rx) = oneshot::channel();
         let out = commit_b_settle(&mut st_cell, &settle_deps, &saga, output, &signing, tx).await;
         assert!(
@@ -5259,7 +5259,7 @@ mod tests {
         assert_eq!(
             outlet_invoked_appends.load(std::sync::atomic::Ordering::SeqCst),
             1,
-            "a persist-failure-then-retry Commit-B must append ToolInvoked EXACTLY ONCE"
+            "a persist-failure-then-retry Commit-B must append OutletInvoked EXACTLY ONCE"
         );
         assert!(st_cell.class_s.xctx_committed_outputs.contains_key(&saga));
         assert!(!st_cell.class_s.saga_pending.contains_key(&saga));
@@ -5268,7 +5268,7 @@ mod tests {
     /// FIX 6 (simplifier): a Commit-B settle persist-failure rollback RE-INSERTS
     /// the OWNED ORIGINAL staged slot verbatim — no lossy reconstruction. The
     /// deleted `reprepare_from_receipt` rebuilt the slot from the receipt and
-    /// DROPPED `ucan_proof_id` (the receipt does not carry it), so a gated tool's
+    /// DROPPED `ucan_proof_id` (the receipt does not carry it), so a gated outlet's
     /// restored slot lost its proof index. This stages a slot with a non-empty
     /// `ucan_proof_id`, fails the settle persist, and asserts the restored slot
     /// preserves the proof index byte-for-byte.
@@ -5282,13 +5282,13 @@ mod tests {
         let mut st = target_state(0xCB, OTHER, CALLER).await;
         let saga = SagaId("saga-settle-restore-full".to_owned());
 
-        // Stage a slot DIRECTLY with a non-empty `ucan_proof_id` (a gated tool's
+        // Stage a slot DIRECTLY with a non-empty `ucan_proof_id` (a gated outlet's
         // proof index) — the field the lossy inverse used to drop.
         let original = CrossContextOutletInvocationPrepared {
             caller_context_id: [0xCC; 32],
             target_context_id: [0xCB; 32],
             caller_did: DID(CALLER.to_owned()),
-            outlet_registration_id: TOOL.to_owned(),
+            outlet_registration_id: OUTLET.to_owned(),
             ucan_proof_id: "gated-proof-index-42".to_owned(),
             recorded_timestamp_ms: 1_700_000_000_000,
             recorded_nonce: [0x42; 16],
@@ -5439,7 +5439,7 @@ mod tests {
         let saga = SagaId("saga-crash-recovery-refund".to_owned());
         let (tx, rx) = oneshot::channel();
         let mut st_cell = crate::context::actor::class_s::ClassSCell::new(st);
-        prepare_a(&mut st_cell, &deps, &saga, &[0xD8; 32], &caller, TOOL, tx).await;
+        prepare_a(&mut st_cell, &deps, &saga, &[0xD8; 32], &caller, OUTLET, tx).await;
         let prepared_a = expect_prepared_a(rx.await.unwrap(), "prepared-A");
         // The durable record landed.
         assert!(
@@ -5654,7 +5654,7 @@ mod tests {
         let saga = SagaId("saga-live-no-double".to_owned());
         let (tx, rx) = oneshot::channel();
         let mut st_cell = crate::context::actor::class_s::ClassSCell::new(st);
-        prepare_a(&mut st_cell, &deps, &saga, &[0xDA; 32], &caller, TOOL, tx).await;
+        prepare_a(&mut st_cell, &deps, &saga, &[0xDA; 32], &caller, OUTLET, tx).await;
         let prepared_a = expect_prepared_a(rx.await.unwrap(), "prepared-A");
         assert!(st_cell.class_s.xctx_caller_reservations.contains_key(&saga));
 
@@ -5734,7 +5734,7 @@ mod tests {
         let saga = SagaId("saga-commit-a-consumes".to_owned());
         let (tx, rx) = oneshot::channel();
         let mut st_cell = crate::context::actor::class_s::ClassSCell::new(st);
-        prepare_a(&mut st_cell, &deps, &saga, &[0xDB; 32], &caller, TOOL, tx).await;
+        prepare_a(&mut st_cell, &deps, &saga, &[0xDB; 32], &caller, OUTLET, tx).await;
         let prepared_a = expect_prepared_a(rx.await.unwrap(), "prepared-A");
         assert!(st_cell.class_s.xctx_caller_reservations.contains_key(&saga));
         // After Prepare-A the hard-rate-limit token is consumed (below burst).
@@ -5848,7 +5848,7 @@ mod tests {
         // No panic here ⇒ the recovered ticket was balanced. (Pre-fix this
         // unwinds on the debug_assert in `OutletEconomyTicket::drop`.)
         let mut st_cell = crate::context::actor::class_s::ClassSCell::new(st);
-        let out = prepare_a(&mut st_cell, &deps, &saga, &[0xDC; 32], &caller, TOOL, tx).await;
+        let out = prepare_a(&mut st_cell, &deps, &saga, &[0xDC; 32], &caller, OUTLET, tx).await;
         assert!(
             out.result.is_ok(),
             "prepare_a with a dropped reply receiver must still complete: {:?}",

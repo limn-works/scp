@@ -62,7 +62,7 @@ through `SupervisorHandle::start_saga` (see the saga coordinator).
 - `commands.rs` — the `ContextCommand` outer enum and its 12 domain
   sub-enums (`MessagingCommand`, `LifecycleCommand`, `GovernanceCommand`,
   `BroadcastCommand`, `EconomyCommand`, `TrustRecoveryCommand`,
-  `StandingCommand`, `TtlCloseCommand`, `ToolsCommand`, `QueriesCommand`,
+  `StandingCommand`, `TtlCloseCommand`, `OutletsCommand`, `QueriesCommand`,
   `SagaPhaseMessage`, `LifecycleControlCommand`). Each variant carries its
   reply channel.
 - `handle.rs` — `ContextActorHandle`, the caller-side bounded-mailbox wrapper
@@ -80,7 +80,7 @@ through `SupervisorHandle::start_saga` (see the saga coordinator).
   that tells the actor when to mark state dirty.
 - `handlers/` — one module per command domain (`governance.rs`,
   `lifecycle.rs`, `messaging.rs`, `broadcast.rs`, `economy.rs`,
-  `trust_recovery.rs`, `standing.rs`, `ttl_close.rs`, `tools.rs`,
+  `trust_recovery.rs`, `standing.rs`, `ttl_close.rs`, `outlets.rs`,
   `queries.rs`, `saga.rs`, `lifecycle_control.rs`). Most expose a `dispatch`
   taking `(&mut ClassSCell, &ActorDeps, SubCommand) -> Outcome<()>` — Class-S
   mutation flows through the cell's combinators, never a bare
@@ -94,7 +94,7 @@ The substance of each domain lives beside the actor, in large helper modules
 that the handlers call: `governance_helpers.rs`, `lifecycle_helpers.rs`,
 `messaging_helpers.rs`, `trust_recovery_helpers.rs`, `broadcast_helpers.rs`,
 `economy_helpers.rs` / `economy_logic.rs`, `queries_helpers.rs`,
-`tools_helpers.rs`, `standing_helpers.rs`, `ttl.rs` / `ttl_close_helpers.rs`.
+`outlets_helpers.rs`, `standing_helpers.rs`, `ttl.rs` / `ttl_close_helpers.rs`.
 Keeping the bodies here keeps the handler modules thin dispatch shells. The
 MLS commit-broadcast retry queue (§9 fail-closed, see
 `src/crypto/mls/README.md`) lives in `governance_helpers.rs` +
@@ -109,7 +109,7 @@ MLS commit-broadcast retry queue (§9 fail-closed, see
 - `providers/` — production provider impls (`MerkleEventLogProvider`,
   the `ProtocolRepository` persistence bridges).
 - `export_import.rs`, `persistence.rs`, `key_destruction.rs`, `policy.rs`,
-  `app_sandbox.rs`, `governance/`, `tools/` — feature-specific surfaces.
+  `app_sandbox.rs`, `governance/`, `outlets/` — feature-specific surfaces.
 - `mod.rs` — `ContextHandle` (the thread-safe lifecycle handle callers hold)
   and the `test_supervisor` convenience constructor.
 

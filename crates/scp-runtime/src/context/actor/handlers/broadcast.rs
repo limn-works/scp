@@ -173,10 +173,10 @@ async fn handle_subscribe_broadcast(
     // carries a single token, not a proof bundle, so a subscriber cannot even
     // supply parent proofs), and there is NO intra-context `messages:read`
     // delegation proof store — the only runtime proof store, `xctx_ucan_proofs`,
-    // is the CROSS-context tool-invocation saga store (empty outside an active
-    // saga) and holds `tool_invoke` proofs, NOT read grants. So we deliberately
+    // is the CROSS-context outlet-invocation saga store (empty outside an active
+    // saga) and holds `outlet_invoke` proofs, NOT read grants. So we deliberately
     // do NOT clone `xctx_ucan_proofs` here (that would risk cross-contaminating a
-    // read-grant validation with unrelated tool proofs). `verify_delegation_chain`
+    // read-grant validation with unrelated outlet proofs). `verify_delegation_chain`
     // no-ops on a root token's empty `prf`, so this empty resolver is never
     // consulted on the supported path; an out-of-spec DELEGATED grant instead
     // fails closed (`DelegationChainBroken`) — the correct rejection.

@@ -56,7 +56,7 @@ use serde::{Deserialize, Serialize};
 
 /// Prepared (Prepare-time) snapshot for an in-flight saga.
 ///
-/// The sole production saga is cross-context tool invocation (spec §6.2.4);
+/// The sole production saga is cross-context outlet invocation (spec §6.2.4);
 /// the other contemplated saga types (custody handover, standing-pair create,
 /// broadcast hosting handshake) were all withdrawn as category errors
 /// (ADR-049 §3/§3b), so today this carries a single variant.
@@ -73,17 +73,17 @@ use serde::{Deserialize, Serialize};
 /// **Non-derives.** No `Clone`, `Debug`, `Display`, `Serialize`,
 /// `Deserialize` — see module-level documentation for rationale.
 pub enum SagaPreparedState {
-    /// Cross-context tool invocation. The UCAN proof bytes are NOT carried
+    /// Cross-context outlet invocation. The UCAN proof bytes are NOT carried
     /// here — only the proof's identifier — to keep the prepared-state non-
     /// secret-bearing.
     CrossContextOutletInvocation(CrossContextOutletInvocationPrepared),
 }
 
 // ---------------------------------------------------------------------------
-// Cross-context tool invocation
+// Cross-context outlet invocation
 // ---------------------------------------------------------------------------
 
-/// Staged state for a cross-context tool-invocation saga.
+/// Staged state for a cross-context outlet-invocation saga.
 ///
 /// This is the **public-metadata journal projection** of the
 /// `CrossContextOutletInvoke` envelope (spec §6.2.4 "Public-metadata
@@ -133,20 +133,20 @@ pub struct CrossContextOutletInvocationPrepared {
     /// states for both context ids.
     pub caller_context_id: [u8; 32],
     /// Target context ID — B's own context, the context in which B executes
-    /// the tool (the verified `target_context` of the established interface,
+    /// the outlet (the verified `target_context` of the established interface,
     /// §6.2.4 "Target-context binding"). Raw 32-byte digest, same id-form as
     /// `caller_context_id`.
     pub target_context_id: [u8; 32],
     /// Calling DID.
     pub caller_did: DID,
-    /// Tool registration ID (target tool's stable identifier). Context-LOCAL
-    /// — it indexes B's own tool registry.
+    /// Outlet registration ID (target outlet's stable identifier). Context-LOCAL
+    /// — it indexes B's own outlet registry.
     pub outlet_registration_id: String,
     /// UCAN proof reference (token ID), NOT the proof bytes. Resolved
     /// against the receiving actor's UCAN store at Commit time.
     pub ucan_proof_id: String,
     /// B's wall-clock value captured ONCE at Prepare-B (§6.2.4 "Recorded
-    /// timestamp"). Both the Commit-time `ToolInvoked` record and the
+    /// timestamp"). Both the Commit-time `OutletInvoked` record and the
     /// receipt signature draw `timestamp_ms` from this single staged value;
     /// it is NOT the caller-asserted envelope `timestamp_ms`.
     pub recorded_timestamp_ms: u64,
@@ -178,7 +178,7 @@ pub struct CrossContextOutletInvocationPrepared {
 ///
 /// `dead_code` is allowed: this wire mirror and the `to_evidence_bytes` /
 /// `from_evidence_bytes` helpers below are the journal-evidence path for the
-/// cross-context tool-invocation saga, consumed when the saga dispatch
+/// cross-context outlet-invocation saga, consumed when the saga dispatch
 /// wiring lands in a follow-on PR. The unit tests exercise the round-trip
 /// now.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -190,7 +190,7 @@ pub(in crate::context) struct CrossContextOutletInvocationPreparedWire {
     pub target_context_id: [u8; 32],
     /// `caller_did.0`.
     pub caller_did: String,
-    /// Context-local tool registration id.
+    /// Context-local outlet registration id.
     pub outlet_registration_id: String,
     /// UCAN proof reference (token id), not the proof bytes.
     pub ucan_proof_id: String,
@@ -303,7 +303,7 @@ pub struct CrossContextOutletInvocationSnapshot {
     pub target_context_id: [u8; 32],
     /// `caller_did.0`.
     pub caller_did: String,
-    /// Context-local tool registration id.
+    /// Context-local outlet registration id.
     pub outlet_registration_id: String,
     /// UCAN proof reference (token id), not the proof bytes.
     pub ucan_proof_id: String,
@@ -364,17 +364,17 @@ impl SagaPreparedStateSnapshot {
 }
 
 // ---------------------------------------------------------------------------
-// Committed cross-context tool-invocation capture (spec §6.2.4)
+// Committed cross-context outlet-invocation capture (spec §6.2.4)
 // ---------------------------------------------------------------------------
 
-/// Durable, `SagaId`-keyed capture of a COMMITTED cross-context tool
+/// Durable, `SagaId`-keyed capture of a COMMITTED cross-context outlet
 /// invocation, held on the TARGET (B) actor (spec §6.2.4 "Exactly-once
 /// execution with durable output capture").
 ///
-/// The tool executes **exactly once**; its output + the signed
+/// The outlet executes **exactly once**; its output + the signed
 /// [`CrossContextOutletReceipt`] are captured here so a Commit replayed after a
 /// crash (§17.16.4) re-emits the STORED output and re-emits the IDENTICAL
-/// signed receipt — **never re-invoking the tool** and never minting a fresh
+/// signed receipt — **never re-invoking the outlet** and never minting a fresh
 /// `outlet_invoked_event_id`. Both the receipt and the raw output are reproduced
 /// byte-for-byte from this record.
 ///
@@ -382,12 +382,12 @@ impl SagaPreparedStateSnapshot {
 /// [`PerContextState.xctx_committed_outputs`](crate::context::actor::state::PerContextState::xctx_committed_outputs)
 /// and synchronously persisted fail-closed (ADR-049 §9) the same way
 /// `saga_pending` is — a crash that rolled the capture back behind an acked
-/// Commit-B would let a replayed Commit re-invoke the tool, breaking the
+/// Commit-B would let a replayed Commit re-invoke the outlet, breaking the
 /// exactly-once guarantee.
 ///
-/// **Not bearer-bearing.** The receipt and tool output are public protocol
+/// **Not bearer-bearing.** The receipt and outlet output are public protocol
 /// artifacts (the receipt is the signed return-path response; the output is
-/// the tool result A already receives). There is no §9.4.3 secret here, so —
+/// the outlet result A already receives). There is no §9.4.3 secret here, so —
 /// unlike [`SagaPreparedState`] — this type derives `Serialize`/`Clone`
 /// directly and rides the public [`ContextSnapshot`](crate::context::state::ContextSnapshot)
 /// surface without a separate mirror.
@@ -397,17 +397,17 @@ pub struct CommittedOutletInvocation {
     /// event id. Re-emitted verbatim on a replayed Commit so the signature
     /// preimage reproduces byte-for-byte.
     pub receipt: scp_protocol::context::outlets::cross_context_saga::CrossContextOutletReceipt,
-    /// The captured tool output bytes — the receipt's `output_jcs`, stored
+    /// The captured outlet output bytes — the receipt's `output_jcs`, stored
     /// alongside so a replay re-emits the exact output A originally received.
     #[serde(with = "scp_protocol::serde_util::serde_bounded_bytes")]
     pub output_bytes: Vec<u8>,
-    /// The `SagaId`-stable `ToolInvoked` event-log entry id (also carried on
+    /// The `SagaId`-stable `OutletInvoked` event-log entry id (also carried on
     /// the receipt; stored explicitly so a replay re-acks the same id without
     /// re-deriving it).
     pub outlet_invoked_event_id: String,
 }
 
-/// Caller-side (A-owned) durable reversal record for a cross-context tool
+/// Caller-side (A-owned) durable reversal record for a cross-context outlet
 /// invocation's Prepare-A economy reservation (spec §6.2.4 "Reservation release
 /// on every terminal path").
 ///
@@ -516,7 +516,7 @@ mod tests {
     }
 
     #[test]
-    fn cross_context_tool_invocation_constructs() {
+    fn cross_context_outlet_invocation_constructs() {
         let state =
             SagaPreparedState::CrossContextOutletInvocation(CrossContextOutletInvocationPrepared {
                 caller_context_id: [5u8; 32],
@@ -541,7 +541,7 @@ mod tests {
     }
 
     #[test]
-    fn cross_context_tool_invocation_evidence_round_trips_all_eight_fields() {
+    fn cross_context_outlet_invocation_evidence_round_trips_all_eight_fields() {
         let original = CrossContextOutletInvocationPrepared {
             caller_context_id: [0x11u8; 32],
             target_context_id: [0x22u8; 32],
@@ -565,7 +565,7 @@ mod tests {
     }
 
     #[test]
-    fn cross_context_tool_invocation_wire_round_trips_via_messagepack() {
+    fn cross_context_outlet_invocation_wire_round_trips_via_messagepack() {
         // Exercises the explicit Wire mirror directly, matching the
         // §9.4.3 non-derive discipline: the live enum stays non-Serialize,
         // serialization flows only through the Wire type.
@@ -603,10 +603,10 @@ mod tests {
 
     /// The Class-S snapshot mirror (ADR-049 §9 line 144) must serialize, then
     /// deserialize, then rehydrate to an identical live `SagaPreparedState`.
-    /// Same round-trip for the cross-context tool-invocation variant — all
+    /// Same round-trip for the cross-context outlet-invocation variant — all
     /// eight journaled fields must survive (§6.2.4 public-metadata journaling).
     #[test]
-    fn snapshot_mirror_round_trips_cross_context_tool() {
+    fn snapshot_mirror_round_trips_cross_context_outlet() {
         let prepared =
             SagaPreparedState::CrossContextOutletInvocation(CrossContextOutletInvocationPrepared {
                 caller_context_id: [0x1Au8; 32],

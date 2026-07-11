@@ -228,7 +228,7 @@ mod tests {
         let pubkey = custody.public_key(&signing_key).await.unwrap();
 
         let provenance = Provenance {
-            source: "test-tool".into(),
+            source: "test-outlet".into(),
             upstream_hash: Some("abc123".into()),
         };
 
@@ -327,7 +327,7 @@ mod tests {
         let pubkey = custody.public_key(&signing_key).await.unwrap();
 
         let provenance = Provenance {
-            source: "original-tool".into(),
+            source: "original-outlet".into(),
             upstream_hash: None,
         };
 

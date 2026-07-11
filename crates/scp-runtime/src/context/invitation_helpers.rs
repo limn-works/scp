@@ -52,7 +52,7 @@ pub(crate) struct SnapshotRuntimeFacts {
     pub name: Option<String>,
     /// Human-readable context description, if any.
     pub description: Option<String>,
-    /// Number of registered tool interfaces.
+    /// Number of registered outlet interfaces.
     pub outlet_count: Option<u64>,
     /// Child context ids, if this is a parent context.
     pub child_contexts: Option<Vec<String>>,
@@ -125,7 +125,7 @@ pub(crate) fn build_metadata_snapshot(
                 .as_ref()
                 .map(summarize_economic_policy),
         ),
-        tool_count: filter(vis.tool_interface_count, facts.outlet_count),
+        outlet_count: filter(vis.outlet_interface_count, facts.outlet_count),
         child_contexts: filter(vis.child_context_info, facts.child_contexts),
     };
     MetadataSnapshot {

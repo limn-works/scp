@@ -750,7 +750,7 @@ pub struct ClassSState {
     pub(crate) saga_pending: HashMap<SagaId, SagaPreparedState>,
 
     /// Target-side (B-owned) anti-replay nonce-dedup cache for cross-context
-    /// tool invocation (spec §6.2.4 "Freshness / anti-replay"). Keyed by the
+    /// outlet invocation (spec §6.2.4 "Freshness / anti-replay"). Keyed by the
     /// 16-byte envelope `nonce`; bounded 10,000-entry / 5-minute-TTL /
     /// oldest-first eviction (the same [`NonceDedup`] discipline §6.2.2 uses).
     /// **B — the Prepare-B verifying party — owns this cache**: the
@@ -787,17 +787,17 @@ pub struct ClassSState {
     /// silently erode the eviction-based bound.
     pub(crate) xctx_nonce_dedup: NonceDedup,
 
-    /// Target-side (B-owned) durable capture of COMMITTED cross-context tool
+    /// Target-side (B-owned) durable capture of COMMITTED cross-context outlet
     /// invocations, keyed by `SagaId` (spec §6.2.4 "Exactly-once execution with
     /// durable output capture"). Populated at Commit-B settle with the captured
-    /// tool output, the signed [`CrossContextOutletReceipt`](scp_protocol::context::outlets::cross_context_saga::CrossContextOutletReceipt),
+    /// outlet output, the signed [`CrossContextOutletReceipt`](scp_protocol::context::outlets::cross_context_saga::CrossContextOutletReceipt),
     /// and the `outlet_invoked_event_id`, so a Commit replayed after a crash
     /// (§17.16.4) re-emits the STORED output and the IDENTICAL signed receipt —
-    /// NEVER re-invoking the tool, never minting a fresh event id.
+    /// NEVER re-invoking the outlet, never minting a fresh event id.
     ///
     /// **Class S** — synchronously persisted fail-closed (ADR-049 §9), the same
     /// discipline as [`Self::saga_pending`]: a crash that rolled the capture
-    /// back behind an acked Commit-B would re-invoke the tool on replay and
+    /// back behind an acked Commit-B would re-invoke the outlet on replay and
     /// re-sign a divergent receipt, breaking the exactly-once + receipt-
     /// reproducibility guarantees. Survives same-node restore; dropped (like
     /// `saga_pending`) on cross-node export/import — a foreign node must never
@@ -818,13 +818,13 @@ pub struct ClassSState {
     pub(crate) xctx_committed_outputs:
         HashMap<SagaId, crate::context::supervisor::saga_prepared_state::CommittedOutletInvocation>,
 
-    /// Caller-side (A-owned) durable set of COMMITTED cross-context tool
+    /// Caller-side (A-owned) durable set of COMMITTED cross-context outlet
     /// invocations, keyed by `SagaId` (spec §6.2.4 "Commit", caller side;
-    /// §17.16.4 crash recovery: "A re-acks its `CrossContextToolInvoked` append
+    /// §17.16.4 crash recovery: "A re-acks its `CrossContextOutletInvoked` append
     /// and re-settles escrow as a no-op"). Commit-A inserts the `SagaId` here as
     /// the idempotency witness BEFORE acking; a replayed Commit-A finds the
     /// witness and re-acks without re-settling the escrow or re-appending the
-    /// `CrossContextToolInvoked` record.
+    /// `CrossContextOutletInvoked` record.
     ///
     /// **Class S** — synchronously persisted fail-closed (ADR-049 §9): without
     /// it, a crash that rolled the witness back behind an acked Commit-A would
@@ -843,7 +843,7 @@ pub struct ClassSState {
     pub(crate) xctx_committed_invocations: std::collections::HashSet<SagaId>,
 
     /// Caller-side (A-owned) durable reversal records for in-flight
-    /// cross-context tool-invocation Prepare-A reservations, keyed by `SagaId`
+    /// cross-context outlet-invocation Prepare-A reservations, keyed by `SagaId`
     /// (spec §6.2.4 "Reservation release on every terminal path"). Prepare-A
     /// inserts a [`CallerReservationRecord`](crate::context::supervisor::saga_prepared_state::CallerReservationRecord)
     /// here in the SAME Class-S snapshot as the velocity / budget /
@@ -1257,7 +1257,7 @@ pub struct PerContextState {
     /// Per-sender receive-sequence high-water marks for anti-replay.
     pub recv_tracker: RecvSequenceTracker,
 
-    /// Target-side (B-owned) UCAN proof store for cross-context tool
+    /// Target-side (B-owned) UCAN proof store for cross-context outlet
     /// invocation (spec §6.2.4 normative (1)). Maps a `ucan_proof_id` — the
     /// INDEX carried on the `CrossContextOutletInvoke` envelope, never the proof
     /// bytes — to the resolved [`UcanToken`](scp_protocol::crypto::ucan::UcanToken).
@@ -1265,12 +1265,12 @@ pub struct PerContextState {
     /// store and re-runs the full §7 validation re-bound to the carried
     /// `caller_did` + `outlet_registration_id` (the confused-deputy defense). The
     /// store doubles as the delegation-chain `ProofResolver` for that
-    /// validation. Empty until a gated tool interface is established; the
+    /// validation. Empty until a gated outlet interface is established; the
     /// freshness/replay state ([`ClassSState::xctx_nonce_dedup`]) and this store
     /// both live where the authorization decision is made — on B's actor.
     ///
     /// Not part of the Class-S snapshot: it is reconstructable interface state
-    /// repopulated when the tool interface is (re-)established, never
+    /// repopulated when the outlet interface is (re-)established, never
     /// authorization secrecy whose coalesce-window rollback re-opens a replay.
     pub xctx_ucan_proofs: InMemoryProofResolver,
 
@@ -1731,14 +1731,14 @@ mod tests {
         assert_eq!(send_tracker.last_issued(), 0);
         let _ = recv_tracker.last_seen(&DID("did:example:any".to_owned()));
         assert!(saga_pending.is_empty());
-        // B-owned cross-context tool-invoke validation state starts empty: no
+        // B-owned cross-context outlet-invoke validation state starts empty: no
         // UCAN proofs indexed, no nonces seen (spec §6.2.4).
         assert!(xctx_ucan_proofs.proofs.is_empty());
         {
             let mut dedup = xctx_nonce_dedup;
             assert!(!dedup.is_replayed(&[0u8; 16], 0));
         }
-        // No committed cross-context tool invocations on a fresh context
+        // No committed cross-context outlet invocations on a fresh context
         // (target-side durable output capture + caller-side commit witness).
         assert!(xctx_committed_outputs.is_empty());
         assert!(xctx_committed_invocations.is_empty());
@@ -1934,7 +1934,7 @@ mod tests {
                 caller_context_id: [0x1Au8; 32],
                 target_context_id: [0x2Bu8; 32],
                 caller_did: DID("did:example:lossless-caller".to_owned()),
-                outlet_registration_id: "lossless-tool-v1".to_owned(),
+                outlet_registration_id: "lossless-outlet-v1".to_owned(),
                 ucan_proof_id: "lossless-ucan".to_owned(),
                 recorded_timestamp_ms: 1_700_000_000_123,
                 recorded_nonce: [0x3Cu8; 16],
@@ -1954,9 +1954,9 @@ mod tests {
                     target_context_id: [0x2Bu8; 32],
                     caller_did: "did:example:lossless-caller".to_owned(),
                     nonce: [0x3Cu8; 16],
-                    outlet_registration_id: "lossless-tool-v1".to_owned(),
+                    outlet_registration_id: "lossless-outlet-v1".to_owned(),
                     output_jcs: br#"{"ok":1}"#.to_vec(),
-                    outlet_invoked_event_id: "ToolInvoked:saga-lossless-committed".to_owned(),
+                    outlet_invoked_event_id: "OutletInvoked:saga-lossless-committed".to_owned(),
                     chain_depth: 2,
                     timestamp_ms: 1_700_000_000_123,
                 },
@@ -1968,7 +1968,7 @@ mod tests {
             CommittedOutletInvocation {
                 receipt,
                 output_bytes: br#"{"ok":1}"#.to_vec(),
-                outlet_invoked_event_id: "ToolInvoked:saga-lossless-committed".to_owned(),
+                outlet_invoked_event_id: "OutletInvoked:saga-lossless-committed".to_owned(),
             },
         );
         state
@@ -2052,7 +2052,7 @@ mod tests {
         assert_eq!(inner.caller_context_id, [0x1Au8; 32]);
         assert_eq!(inner.target_context_id, [0x2Bu8; 32]);
         assert_eq!(inner.caller_did.0, "did:example:lossless-caller");
-        assert_eq!(inner.outlet_registration_id, "lossless-tool-v1");
+        assert_eq!(inner.outlet_registration_id, "lossless-outlet-v1");
         assert_eq!(inner.ucan_proof_id, "lossless-ucan");
         assert_eq!(inner.recorded_timestamp_ms, 1_700_000_000_123);
         assert_eq!(inner.recorded_nonce, [0x3Cu8; 16]);

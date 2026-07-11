@@ -699,7 +699,7 @@ pub struct ReJoinPlan {
 /// - Their DID and identity
 /// - Their role in the context (re-assigned by admin during re-add)
 /// - Their event log history up to the last known epoch
-/// - Context metadata (params, tools, ceiling)
+/// - Context metadata (params, outlets, ceiling)
 ///
 /// The reset member loses:
 /// - Access to messages encrypted in skipped epochs (forward secrecy)
@@ -715,7 +715,7 @@ pub struct StatePreservation {
     pub local_merkle_root: [u8; 32],
     /// Context metadata (params hash) to verify continuity.
     pub params_hash: [u8; 32],
-    /// Tool names active at reset time.
+    /// Outlet names active at reset time.
     pub active_outlets: Vec<String>,
     /// Membership roster at reset time (DID -> role name).
     pub membership_roster: BTreeMap<String, String>,
@@ -1522,7 +1522,7 @@ mod tests {
                 local_event_count: 1000,
                 local_merkle_root: [1u8; 32],
                 params_hash: [2u8; 32],
-                active_outlets: vec!["tool-a".to_owned()],
+                active_outlets: vec!["outlet-a".to_owned()],
                 membership_roster: BTreeMap::from([
                     ("did:alice".to_owned(), "admin".to_owned()),
                     ("did:bob".to_owned(), "member".to_owned()),
@@ -1537,7 +1537,7 @@ mod tests {
         assert_eq!(plan.last_known_epoch, 50);
         assert_eq!(plan.state_preservation.role_to_restore, "member");
         assert_eq!(plan.state_preservation.local_event_count, 1000);
-        assert_eq!(plan.state_preservation.active_outlets, vec!["tool-a"]);
+        assert_eq!(plan.state_preservation.active_outlets, vec!["outlet-a"]);
         assert_eq!(plan.state_preservation.membership_roster.len(), 2);
         assert!(matches!(
             plan.inflight_handling,
@@ -2022,7 +2022,7 @@ mod tests {
                 local_event_count: 50_000,
                 local_merkle_root: [99u8; 32],
                 params_hash: [88u8; 32],
-                active_outlets: (0..20).map(|i| format!("tool-{i}")).collect(),
+                active_outlets: (0..20).map(|i| format!("outlet-{i}")).collect(),
                 membership_roster: roster,
                 invalidated_proposals: 0,
             },

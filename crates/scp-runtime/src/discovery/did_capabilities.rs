@@ -2,7 +2,7 @@
 //!
 //! Extracts `SCPCapabilities` service entries from DID documents resolved via
 //! `did:dht`. Any agent can publish capabilities in their DID document -- zero
-//! setup, zero registration, zero dependency on contexts with discovery tools.
+//! setup, zero registration, zero dependency on contexts with discovery outlets.
 //!
 //! Each individual capability string within an `SCPCapabilities` service
 //! endpoint is a validated [`CapabilityUri`] (ADR-041, §7.3.4.1). The

@@ -447,7 +447,7 @@ impl ContextActor {
                 handlers::ttl_close::dispatch(cell, deps, sub).await
             }
             ContextCommand::Outlets(sub) => {
-                // Phase 2A.4 -- tools domain migrated to the
+                // Phase 2A.4 -- outlets domain migrated to the
                 // actor-shape handler for mailbox-routed hard-rate
                 // helpers. `Supervisor::dispatch_outlets_command` is
                 // mailbox-first: a missing actor surfaces a typed

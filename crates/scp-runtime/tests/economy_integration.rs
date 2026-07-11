@@ -23,7 +23,7 @@
 //! 8. Free relays MUST always exist in bootstrap list
 //! 9. Auto-accept never applies to paid contexts
 //!
-//! Integration flow: create context with `EconomicPolicy` -> register tool with cost
+//! Integration flow: create context with `EconomicPolicy` -> register outlet with cost
 //! -> grant spending UCAN -> verify spending checks -> verify receipt provenance
 //! -> test auto-accept rejection -> test `SpendingCapabilityRequired`
 //! -> test dynamic pricing -> test anti-spam escalation -> verify free relay exists.
@@ -200,7 +200,7 @@ fn payee_did() -> DID {
     DID::from("did:dht:z6MkPayee")
 }
 
-/// Creates a paid economic policy with per-message and per-tool-invoke costs.
+/// Creates a paid economic policy with per-message and per-outlet-invoke costs.
 fn paid_policy() -> EconomicPolicy {
     EconomicPolicy {
         locked: false,
@@ -548,7 +548,7 @@ async fn invariant_2_authorize_capture_after_spending_check() {
 /// Paid actions with no spending UCAN are rejected.
 ///
 /// (Action capability is verified at the gate layer upstream per spec §19.5
-/// — see the `MessagesWrite` / `ToolInvoke` `member_has_capability` checks
+/// — see the `MessagesWrite` / `OutletInvoke` `member_has_capability` checks
 /// in the manager modules. This test exercises only the spending side.)
 #[test]
 fn invariant_2_spending_capability_paid_action_rejected_without_ucan() {
@@ -1347,15 +1347,15 @@ async fn integration_full_lifecycle() {
         .unwrap();
     let msg_receipt = adapter.capture(&msg_auth).await.unwrap();
 
-    // Step 3: Evaluate tool cost, authorize, capture.
-    let tool_cost = evaluate_cost(&policy, &PaidActionType::OutletCall, &metrics).unwrap();
-    assert_eq!(tool_cost, Amount(50));
+    // Step 3: Evaluate outlet cost, authorize, capture.
+    let outlet_cost = evaluate_cost(&policy, &PaidActionType::OutletCall, &metrics).unwrap();
+    assert_eq!(outlet_cost, Amount(50));
 
-    let tool_auth = adapter
+    let outlet_auth = adapter
         .authorize(
             &payer_did(),
             &payee_did(),
-            tool_cost,
+            outlet_cost,
             usd(),
             PaymentMetadata {
                 action_type: PaidActionType::OutletCall,
@@ -1365,12 +1365,12 @@ async fn integration_full_lifecycle() {
         )
         .await
         .unwrap();
-    let tool_receipt = adapter.capture(&tool_auth).await.unwrap();
+    let outlet_receipt = adapter.capture(&outlet_auth).await.unwrap();
 
     // Step 4: Verify receipts in payment history (invariant 4). `payment_history`
     // reads the per-context local receipt buffer (PaymentReceived is excluded
     // from the canonical Merkle log per ADR-011 amendment exclusion taxonomy §2).
-    let receipts = vec![msg_receipt, tool_receipt];
+    let receipts = vec![msg_receipt, outlet_receipt];
 
     let history = payment_history(&receipts, None);
     assert_eq!(history.len(), 2);

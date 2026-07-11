@@ -1105,7 +1105,7 @@ pub async fn join_context(
     // nonce in Phase 1 (`enforce_join_economy` → `enforce_economy` →
     // `commit_spending_ucan_nonce`, mutating the actor-owned
     // `spending_nonce_tracker`) — the same Class-S monotonic state the
-    // message-send and tool-invoke paths persist fail-closed. A best-effort
+    // message-send and outlet-invoke paths persist fail-closed. A best-effort
     // persist here would let an actor crash in the ≤50ms coalesce window roll
     // the nonce-consume back, freshening the spending UCAN's nonce after the
     // joiner already saw the join succeed (replay / double-spend). Persist
@@ -1504,7 +1504,7 @@ pub async fn create_context(
     // ADR-056: `PerContextState.context_id` is the canonical 32-byte DIGEST.
     // For a real context id (`hex(digest)`) DECODE recovers the digest — it
     // does NOT re-hash the already-hex-encoded digest. This is what the
-    // §6.2.4 cross-context tool saga compares `target_context_id` against on
+    // §6.2.4 cross-context outlet saga compares `target_context_id` against on
     // the wire, and the bytes the creation crypto (builder) keys under.
     let context_id_bytes = state::context_id_to_bytes(&context_id);
     let actor_members: HashSet<DID> = initial_members.clone();
@@ -1584,8 +1584,8 @@ pub async fn create_context(
         // tree above is the proof-generation surface and is populated
         // lazily by the messaging handler.
         recv_tracker: RecvSequenceTracker::new(),
-        // B-owned cross-context tool-invoke validation state (spec §6.2.4):
-        // fresh on creation/import; repopulated when a gated tool interface is
+        // B-owned cross-context outlet-invoke validation state (spec §6.2.4):
+        // fresh on creation/import; repopulated when a gated outlet interface is
         // established. Not rehydrated from any snapshot — reconstructable
         // interface state, never authorization secrecy.
         xctx_ucan_proofs: scp_protocol::crypto::ucan::validate::InMemoryProofResolver::new(),
@@ -2397,8 +2397,8 @@ pub async fn import_context(
         // strips it to empty; a full import deliberately drops it too so a
         // foreign saga cannot drive local Commit/Abort.
         recv_tracker: RecvSequenceTracker::new(),
-        // B-owned cross-context tool-invoke validation state (spec §6.2.4):
-        // fresh on creation/import; repopulated when a gated tool interface is
+        // B-owned cross-context outlet-invoke validation state (spec §6.2.4):
+        // fresh on creation/import; repopulated when a gated outlet interface is
         // established. Not rehydrated from any snapshot — reconstructable
         // interface state, never authorization secrecy.
         xctx_ucan_proofs: scp_protocol::crypto::ucan::validate::InMemoryProofResolver::new(),
@@ -2926,7 +2926,7 @@ pub async fn restore_context(
         // scratchpad is genuinely transient and restarts fresh.
         recv_tracker: RecvSequenceTracker::new(),
         // B-owned UCAN proof index (spec §6.2.4) is NOT in the Class-S snapshot:
-        // it is reconstructable interface state, repopulated when the tool
+        // it is reconstructable interface state, repopulated when the outlet
         // interface is (re-)established.
         xctx_ucan_proofs: scp_protocol::crypto::ucan::validate::InMemoryProofResolver::new(),
         class_s: crate::context::actor::state::ClassSState {
@@ -2939,7 +2939,7 @@ pub async fn restore_context(
             // nonce-dedup cache (spec §6.2.4 "Freshness / anti-replay"). It is the
             // ONLY gate against a fresh-`SagaId` replay of a `CrossContextOutletInvoke`
             // within the dedup TTL; reinitializing it empty on restore would let
-            // a crash inside the window re-open a charging-tool replay (BLACK-624-01).
+            // a crash inside the window re-open a charging-outlet replay (BLACK-624-01).
             // Per-entry TTL is pruned lazily on the next freshness check. Cross-node
             // import drops it (the snapshot field is empty), so a foreign node starts
             // its own window. Rehydrated with the SAGA dedup TTL (strictly longer
@@ -2953,7 +2953,7 @@ pub async fn restore_context(
             // durable Commit-B output captures (spec §6.2.4 "Exactly-once execution
             // with durable output capture") so a Commit replayed after a crash
             // re-emits the STORED output + the IDENTICAL receipt rather than
-            // re-invoking the tool. The live `CommittedOutletInvocation` is public (no
+            // re-invoking the outlet. The live `CommittedOutletInvocation` is public (no
             // §9.4.3 bearer), so the snapshot stores it directly — no mirror.
             xctx_committed_outputs: ctx_snapshot.xctx_committed_outputs,
             xctx_committed_invocations: ctx_snapshot.xctx_committed_invocations,
@@ -3305,7 +3305,7 @@ mod restore_reconcile_tests {
         clippy::too_many_lines,
         // Test-only capturing persistence: the `Mutex<HashMap>` is never held
         // across `.await` (writes/reads are synchronous trait methods), so a
-        // plain `std::sync::Mutex` is the right tool. The runtime's actor path
+        // plain `std::sync::Mutex` is the right outlet. The runtime's actor path
         // bans it (ADR-049); test fixtures are explicitly exempt. See
         // crates/scp-runtime/clippy.toml.
         clippy::disallowed_types
@@ -3691,7 +3691,7 @@ mod restore_reconcile_tests {
     }
 
     /// Derive a `did:key` DID + matching signing key (the same convention the
-    /// FFI tool-economy harness uses), so a `key_resolver` can resolve the
+    /// FFI outlet-economy harness uses), so a `key_resolver` can resolve the
     /// issuer's verifying key for spending-UCAN signature verification.
     fn join_keypair() -> (DID, ed25519_dalek::SigningKey) {
         use std::fmt::Write;

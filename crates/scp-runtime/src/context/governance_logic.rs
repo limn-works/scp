@@ -106,7 +106,7 @@ async fn append_consequence_event(
 /// providers, scope identifiers, and pre-evaluated rule data into one
 /// struct keeps the public function signature within the
 /// `clippy::too_many_arguments` budget while preserving the explicit
-/// names that callers (`messaging.rs`, `tools.rs`, `governance.rs`,
+/// names that callers (`messaging.rs`, `outlets.rs`, `governance.rs`,
 /// the periodic timer) need at construction time.
 pub struct EnforceConsequencesCtx<'a> {
     pub context_id: &'a str,
@@ -141,7 +141,7 @@ pub struct EnforceConsequencesCtx<'a> {
 /// Merkle entry **iff its trigger is convergent** — `WarningCount` / `Custom`
 /// (governance counts), tested via
 /// [`is_convergent_trigger`](scp_protocol::trust::consequence::is_convergent_trigger).
-/// `MessageVelocity` / `ToolRateExceeded` are non-convergent (a rate needs a
+/// `MessageVelocity` / `OutletRateExceeded` are non-convergent (a rate needs a
 /// clock the protocol neither has nor needs); their consequences are
 /// **buffer-only** — local enforcement still runs and the `ContextEvent` is
 /// still emitted, but **no durable leaf** is minted, because a per-receiver,
@@ -261,7 +261,7 @@ async fn process_one_triggered_consequence(
     // emission"): a consequence leaf is a durable Merkle entry ONLY when its
     // trigger input is convergent — `WarningCount` / `Custom` (governance
     // counts), keyed on the enum via `is_convergent_trigger`, never on a string.
-    // `MessageVelocity` / `ToolRateExceeded` are non-convergent (a rate needs a
+    // `MessageVelocity` / `OutletRateExceeded` are non-convergent (a rate needs a
     // clock the protocol has none of), so their consequences are buffer-only
     // `ContextEvent`s — local enforcement still runs, but no durable leaf is
     // minted (a leaf would diverge across honest members and break §9.9.3). A
@@ -1016,10 +1016,10 @@ mod convergence_tests {
     #[tokio::test]
     async fn outlet_rate_triggered_consequence_adds_no_durable_leaf() {
         // The second non-convergent trigger — same posture as MessageVelocity.
-        let (root_changed, _) = run_one(ConsequenceTrigger::ToolRateExceeded).await;
+        let (root_changed, _) = run_one(ConsequenceTrigger::OutletRateExceeded).await;
         assert!(
             !root_changed,
-            "a ToolRateExceeded-triggered consequence is non-convergent (ADR-051 §6) \
+            "a OutletRateExceeded-triggered consequence is non-convergent (ADR-051 §6) \
              and MUST NOT mint a durable Merkle leaf"
         );
     }

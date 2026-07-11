@@ -926,9 +926,9 @@ mod tests {
         // Identity domain
         store.store_identity_document(&did, b"doc").await.unwrap();
 
-        // Tools domain
+        // Outlets domain
         store
-            .store_outlet("ctx-valid", "tool-ok", b"reg")
+            .store_outlet("ctx-valid", "outlet-ok", b"reg")
             .await
             .unwrap();
 

@@ -125,7 +125,7 @@ pub struct ActionEnvelope {
     /// Payment authorization, if this action requires payment.
     /// `None` for free actions.
     pub authorization: Option<PaymentAuthorization>,
-    /// Opaque action payload (message content, tool invocation, etc.).
+    /// Opaque action payload (message content, outlet invocation, etc.).
     pub payload: Vec<u8>,
 }
 

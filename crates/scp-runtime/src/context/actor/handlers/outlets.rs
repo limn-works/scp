@@ -1,4 +1,4 @@
-//! Tools handlers — see
+//! Outlets handlers — see
 //! [`OutletsCommand`](crate::context::actor::commands::OutletsCommand)
 //! and spec §19 (economic governance) / §19.7 (anti-spam cost
 //! escalation); hard rate limits §6.2.0.2.
@@ -7,7 +7,7 @@
 //!
 //! The handler's primary entry point [`dispatch`] takes
 //! `(&mut ClassSCell, &ActorDeps, OutletsCommand)` and routes the
-//! actor-owned hard-rate-limit helpers plus the tool-economy reserve /
+//! actor-owned hard-rate-limit helpers plus the outlet-economy reserve /
 //! settle phases through [`crate::context::outlets_helpers`] (the Class-C
 //! mutations flow through the cell's non-persisting `class_c_view()`). The
 //! economy
@@ -16,14 +16,14 @@
 //! mailbox round-trips (see
 //! [`crate::context::outlets_helpers::invoke_outlet_with_economy`]).
 //!
-//! The cross-context tool invocation saga (§6.2.4) is produced directly by
+//! The cross-context outlet invocation saga (§6.2.4) is produced directly by
 //! [`Supervisor::start_cross_context_outlet_invocation_saga`](crate::context::supervisor::Supervisor::start_cross_context_outlet_invocation_saga) — it does not
 //! cross the actor mailbox because its
 //! [`SagaSigningKeys`](crate::context::supervisor::SagaSigningKeys) are
 //! borrowed (non-`'static`) `&ed25519_dalek::SigningKey` references that
 //! cannot move into a `'static` mailbox message (its executor, by
 //! contrast, is `Send + 'static`). A distinct constraint keeps the
-//! tool-economy executor off the mailbox:
+//! outlet-economy executor off the mailbox:
 //! [`Supervisor::invoke_outlet_with_economy`](crate::context::supervisor::Supervisor::invoke_outlet_with_economy)
 //! takes a generic non-`Send` executor closure that cannot cross the
 //! actor mailbox, so its economy bookkeeping is split into the
@@ -40,7 +40,7 @@ use crate::context::actor::commands::OutletsCommand;
 use crate::context::actor::deps::ActorDeps;
 use crate::context::actor::outcome::{Outcome, outcome_error_sketch};
 
-/// Per-call transport budget for tools handlers. Plan §"Transport
+/// Per-call transport budget for outlets handlers. Plan §"Transport
 /// timeouts inside actor handlers": 30 seconds.
 pub const HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -171,7 +171,7 @@ async fn handle_refund_hard_rate_limit(
     outcome
 }
 
-/// Handle [`OutletsCommand::ReserveOutletEconomy`] — Phase 1 of the tool
+/// Handle [`OutletsCommand::ReserveOutletEconomy`] — Phase 1 of the outlet
 /// economy pipeline. Delegates to
 /// [`outlets_helpers::reserve_outlet_economy`](crate::context::outlets_helpers::reserve_outlet_economy)
 /// on owned state under a 30s timeout. On success replies with the
@@ -220,7 +220,7 @@ async fn handle_reserve_outlet_economy(
     outcome
 }
 
-/// Handle [`OutletsCommand::SettleOutletEconomy`] — Phase 3 of the tool
+/// Handle [`OutletsCommand::SettleOutletEconomy`] — Phase 3 of the outlet
 /// economy pipeline. Delegates to
 /// [`outlets_helpers::settle_outlet_economy`](crate::context::outlets_helpers::settle_outlet_economy)
 /// on owned state under a 30s timeout.
