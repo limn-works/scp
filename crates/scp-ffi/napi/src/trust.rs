@@ -73,10 +73,10 @@ pub struct NapiParticipationRecord {
     /// Count of governance actions initiated by this identity.
     pub governance_actions_by: i64,
     /// Total outlet invocations across all outlet types.
-    pub tool_invocation_count: i64,
-    /// Whether `tool_invocation_count` is anchored in the canonical Merkle log
+    pub outlet_invocation_count: i64,
+    /// Whether `outlet_invocation_count` is anchored in the canonical Merkle log
     /// (`false` until ADR-051; consumers MUST NOT treat it as Merkle-proven).
-    pub tool_invocation_count_anchored: bool,
+    pub outlet_invocation_count_anchored: bool,
     /// Number of contexts created by the subject.
     pub context_creation_count: i64,
     /// Number of role transitions for the subject.
@@ -87,7 +87,7 @@ pub struct NapiParticipationRecord {
     /// Whether `attestation_count` is anchored in / verifiable against a context
     /// Merkle root. Always `false` — credential-layer, verifier-relative (§7.4),
     /// never a context-event-log count (§7.3.2). Parallel of
-    /// `tool_invocation_count_anchored`.
+    /// `outlet_invocation_count_anchored`.
     pub attestation_count_anchored: bool,
     /// Unix timestamp (seconds) when the record was computed.
     pub computed_at: i64,
@@ -103,8 +103,8 @@ impl From<&scp_core::trust::ParticipationFacts> for NapiParticipationRecord {
             participation_duration_secs: f.participation_duration_secs as i64,
             governance_actions_against: f.governance_actions_against as i64,
             governance_actions_by: f.governance_actions_by as i64,
-            tool_invocation_count: f.tool_invocation_count as i64,
-            tool_invocation_count_anchored: f.tool_invocation_count_anchored,
+            outlet_invocation_count: f.outlet_invocation_count as i64,
+            outlet_invocation_count_anchored: f.outlet_invocation_count_anchored,
             context_creation_count: f.context_creation_count as i64,
             role_progression_count: f.role_progression_count as i64,
             attestation_count: f.attestation_count as i64,
@@ -1465,8 +1465,8 @@ mod tests {
             participation_duration_secs: 300,
             governance_actions_against: 1,
             governance_actions_by: 2,
-            tool_invocation_count: 5,
-            tool_invocation_count_anchored: false,
+            outlet_invocation_count: 5,
+            outlet_invocation_count_anchored: false,
             context_creation_count: 1,
             role_progression_count: 3,
             attestation_count: 2,
@@ -1479,8 +1479,8 @@ mod tests {
         assert_eq!(view.participation_duration_secs, 300);
         assert_eq!(view.governance_actions_against, 1);
         assert_eq!(view.governance_actions_by, 2);
-        assert_eq!(view.tool_invocation_count, 5);
-        assert!(!view.tool_invocation_count_anchored);
+        assert_eq!(view.outlet_invocation_count, 5);
+        assert!(!view.outlet_invocation_count_anchored);
         assert_eq!(view.context_creation_count, 1);
         assert_eq!(view.role_progression_count, 3);
         assert_eq!(view.attestation_count, 2);

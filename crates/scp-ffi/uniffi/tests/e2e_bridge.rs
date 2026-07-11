@@ -848,7 +848,7 @@ async fn discovery_normalize_trims_whitespace() {
 async fn discovery_create_query_produces_json() {
     let _scp = Scp::new_in_memory_for_test();
     let result = discovery_create_query(
-        Some(vec!["tool:search".to_owned()]),
+        Some(vec!["outlet:search".to_owned()]),
         Some(vec!["rust".to_owned()]),
         None,
     )

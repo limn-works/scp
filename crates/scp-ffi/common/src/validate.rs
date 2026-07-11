@@ -729,7 +729,7 @@ pub fn validate_governance_action_strings(
         GovernanceAction::SetEconomicPolicy { policy } => {
             validate_economic_policy_strings(policy)?;
         }
-        GovernanceAction::RegisterTool { registration } => {
+        GovernanceAction::RegisterOutlet { registration } => {
             validate_outlet_name(&registration.name)?;
             validate_governance_reason(&registration.description)?;
         }
@@ -757,7 +757,7 @@ pub fn validate_governance_action_strings(
         GovernanceAction::RemoveMember { reason: None, .. }
         | GovernanceAction::CloseContext { reason: None, .. }
         | GovernanceAction::RotateContentKeys { reason: None, .. }
-        | GovernanceAction::RemoveTool { .. }
+        | GovernanceAction::RemoveOutlet { .. }
         | GovernanceAction::ExtendTtl { .. }
         | GovernanceAction::TransferAdmin { .. }
         | GovernanceAction::RevokeAccess { .. }
@@ -766,7 +766,7 @@ pub fn validate_governance_action_strings(
         | GovernanceAction::AddSigner { .. }
         | GovernanceAction::RemoveSigner { .. }
         | GovernanceAction::ModifyThreshold { .. }
-        | GovernanceAction::EstablishToolInterface { .. }
+        | GovernanceAction::EstablishOutletInterface { .. }
         | GovernanceAction::ResolveConflict { .. }
         | GovernanceAction::PromoteContext
         | GovernanceAction::SuspendCapability { .. }
@@ -799,7 +799,7 @@ fn validate_context_params_strings(
     for role_def in &params.roles {
         validate_role_name(&role_def.name)?;
     }
-    for outlet_reg in &params.tools {
+    for outlet_reg in &params.outlets {
         validate_outlet_name(&outlet_reg.name)?;
         validate_governance_reason(&outlet_reg.description)?;
     }
@@ -1540,7 +1540,7 @@ mod tests {
         use scp_protocol::context::governance::GovernanceAction;
         use scp_protocol::context::outlets::registry::{OutletRegistration, OutletSchema};
 
-        let action = GovernanceAction::RegisterTool {
+        let action = GovernanceAction::RegisterOutlet {
             registration: Box::new(OutletRegistration {
                 outlet_id: "test-outlet".to_owned(),
                 kind: scp_protocol::context::outlets::OutletKind::default(),
@@ -1569,7 +1569,7 @@ mod tests {
         use scp_protocol::context::governance::GovernanceAction;
         use scp_protocol::context::outlets::registry::{OutletRegistration, OutletSchema};
 
-        let action = GovernanceAction::RegisterTool {
+        let action = GovernanceAction::RegisterOutlet {
             registration: Box::new(OutletRegistration {
                 outlet_id: "test-outlet".to_owned(),
                 kind: scp_protocol::context::outlets::OutletKind::default(),

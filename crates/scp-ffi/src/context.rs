@@ -412,7 +412,7 @@ const VALID_TEMPLATE_IDS: &[&str] = &[
     "GroupDiscussion",
     "PublicBroadcast",
     "GatedBroadcast",
-    "scp:template/tool-interface",
+    "scp:template/outlet-interface",
     "scp:template/paid-service",
     "scp:template/paid-broadcast",
     "HandleRegistry",
@@ -704,7 +704,7 @@ impl PyContextParams {
                 (rd.name.clone(), caps)
             })
             .collect();
-        let outlets: Vec<String> = params.tools.iter().map(|t| t.name.clone()).collect();
+        let outlets: Vec<String> = params.outlets.iter().map(|t| t.name.clone()).collect();
 
         // JSON-backed projections. `None` when absent/empty/default so the
         // getters honor their "None means default/free" contract.
@@ -2040,7 +2040,7 @@ pub fn py_metadata_record_from_json(json_str: String) -> PyResult<String> {
 /// - `"GroupDiscussion"`
 /// - `"PublicBroadcast"`
 /// - `"GatedBroadcast"`
-/// - `"scp:template/tool-interface"`
+/// - `"scp:template/outlet-interface"`
 /// - `"PaidService"`
 /// - `"PaidBroadcast"`
 /// - `"HandleRegistry"`
@@ -2125,8 +2125,8 @@ fn parse_template_id(
         "GroupDiscussion" => Ok(TemplateId::GroupDiscussion),
         "PublicBroadcast" => Ok(TemplateId::PublicBroadcast),
         "GatedBroadcast" => Ok(TemplateId::GatedBroadcast),
-        "scp:template/tool-interface" | "OutletInterfaceTemplate" => {
-            Ok(TemplateId::ToolInterfaceTemplate)
+        "scp:template/outlet-interface" | "OutletInterfaceTemplate" => {
+            Ok(TemplateId::OutletInterfaceTemplate)
         }
         "PaidService" => Ok(TemplateId::PaidService),
         "PaidBroadcast" => Ok(TemplateId::PaidBroadcast),
@@ -2137,7 +2137,7 @@ fn parse_template_id(
         _ => Err(crate::error::ScpPyError::validation(format!(
             "unknown template ID: {template_id:?} — valid values: BilateralEphemeral, \
              BilateralPersistent, Coordination, GroupDiscussion, PublicBroadcast, \
-             GatedBroadcast, scp:template/tool-interface, PaidService, PaidBroadcast, \
+             GatedBroadcast, scp:template/outlet-interface, PaidService, PaidBroadcast, \
              HandleRegistry, scp:template/handle-registry, DiscoveryContext, \
              scp:template/discovery-context"
         ))),
@@ -3866,8 +3866,8 @@ impl crate::scp::PyScp {
                 GovernanceActionResult::MemberAdded { .. } => "MemberAdded",
                 GovernanceActionResult::MemberRemoved => "MemberRemoved",
                 GovernanceActionResult::RoleChanged => "RoleChanged",
-                GovernanceActionResult::ToolRegistered => "ToolRegistered",
-                GovernanceActionResult::ToolRemoved => "ToolRemoved",
+                GovernanceActionResult::OutletRegistered => "OutletRegistered",
+                GovernanceActionResult::OutletRemoved => "OutletRemoved",
                 GovernanceActionResult::CeilingModified => "CeilingModified",
                 GovernanceActionResult::ContextClosed => "ContextClosed",
                 GovernanceActionResult::TtlExtended => "TtlExtended",
@@ -3877,7 +3877,7 @@ impl crate::scp::PyScp {
                 GovernanceActionResult::SignerRemoved => "SignerRemoved",
                 GovernanceActionResult::ThresholdModified => "ThresholdModified",
                 GovernanceActionResult::ChildContextCreated => "ChildContextCreated",
-                GovernanceActionResult::ToolInterfaceEstablished => "ToolInterfaceEstablished",
+                GovernanceActionResult::OutletInterfaceEstablished => "OutletInterfaceEstablished",
                 GovernanceActionResult::MemberReset => "MemberReset",
                 GovernanceActionResult::ConflictResolved => "ConflictResolved",
                 GovernanceActionResult::ContextPromoted => "ContextPromoted",

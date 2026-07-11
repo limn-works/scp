@@ -32,7 +32,7 @@ Single-file bridge (`bridge.rs`) containing all UniFFI exports. Key function gro
 | Broadcast | `broadcast_subscribe`, `broadcast_unsubscribe`, `broadcast_publish`, `broadcast_block_subscriber`, `broadcast_handle_key_request`, `broadcast_subscriber_count`, `broadcast_is_subscriber`, `broadcast_admission` |
 | TTL | `context_handle_ttl_expiry`, `context_propose_ttl_extension`, `context_reset_ttl_timer` |
 | Local DID | `register_local_did`, `is_local_did` |
-| Tools | `tool_register`, `tool_invoke`, `tool_verify` |
+| Tools | `outlet_register`, `outlet_invoke`, `outlet_verify` |
 | UCAN | `ucan_validate`, `ucan_mint`, `ucan_revoke` |
 | Event Log | `event_log_query`, `event_log_verify` |
 | Transport | `transport_connect`, `transport_disconnect`, `transport_status` |
@@ -47,7 +47,7 @@ Single-file bridge (`bridge.rs`) containing all UniFFI exports. Key function gro
 ### Error Mapping
 
 `ScpError` enum with variants mapping to Swift `throws` / Kotlin exceptions:
-- `Identity`, `Context`, `Permission`, `Crypto`, `Transport`, `Tool`, `Validation`
+- `Identity`, `Context`, `Permission`, `Crypto`, `Transport`, `Outlet`, `Validation`
 - Each variant carries `message` (human-readable) and `code` (SCP-{CATEGORY}-{NUMBER})
 - Comprehensive `From<>` impls for all scp-core error types (15+ conversions)
 

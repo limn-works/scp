@@ -128,7 +128,7 @@ pub fn build_context_params(params: &CommonContextParams) -> Result<ContextParam
     // `outlet_query:` empty suffix, `outlet_query:FOO` uppercase, suffix > 128
     // bytes) reject at the FFI boundary rather than silently degrading to
     // Custom. Per SCP-OUT-014 / ADR-049 §1, the deleted legacy outlet-invoke
-    // and pre-rename tool-invoke stems have no transitional alias.
+    // and pre-rename outlet-invoke stems have no transitional alias.
     let ceiling: Vec<Capability> = params
         .ceiling
         .iter()
@@ -171,7 +171,7 @@ pub fn build_context_params(params: &CommonContextParams) -> Result<ContextParam
         ceiling_policy,
         promotion_policy,
         roles: build_roles(&params.roles)?,
-        tools: build_outlets(&params.outlets),
+        outlets: build_outlets(&params.outlets),
         ttl,
         memory_scope,
         governance,
@@ -352,8 +352,8 @@ fn parse_template_id(tid: &str) -> Result<scp_core::context::params::TemplateId,
         "GroupDiscussion" => Ok(TemplateId::GroupDiscussion),
         "PublicBroadcast" => Ok(TemplateId::PublicBroadcast),
         "GatedBroadcast" => Ok(TemplateId::GatedBroadcast),
-        "scp:template/tool-interface" | "OutletInterfaceTemplate" => {
-            Ok(TemplateId::ToolInterfaceTemplate)
+        "scp:template/outlet-interface" | "OutletInterfaceTemplate" => {
+            Ok(TemplateId::OutletInterfaceTemplate)
         }
         "PaidService" | "scp:template/paid-service" => Ok(TemplateId::PaidService),
         "PaidBroadcast" | "scp:template/paid-broadcast" => Ok(TemplateId::PaidBroadcast),
@@ -364,7 +364,7 @@ fn parse_template_id(tid: &str) -> Result<scp_core::context::params::TemplateId,
         _ => Err(format!(
             "unknown template ID: {tid:?} — valid values: BilateralEphemeral, \
              BilateralPersistent, Coordination, GroupDiscussion, PublicBroadcast, \
-             GatedBroadcast, scp:template/tool-interface, PaidService, PaidBroadcast, \
+             GatedBroadcast, scp:template/outlet-interface, PaidService, PaidBroadcast, \
              HandleRegistry, scp:template/handle-registry, DiscoveryContext, \
              scp:template/discovery-context"
         )),
@@ -539,7 +539,7 @@ mod tests {
     #[test]
     fn template_id_parsed_serde_form() {
         let ctx = build_ok(&CommonContextParams {
-            template_id: Some("scp:template/tool-interface".to_owned()),
+            template_id: Some("scp:template/outlet-interface".to_owned()),
             ..Default::default()
         });
         assert!(ctx.template_id.is_some());
@@ -571,8 +571,8 @@ mod tests {
             outlets: vec!["calculator".to_owned()],
             ..Default::default()
         });
-        assert_eq!(ctx.tools.len(), 1);
-        assert_eq!(ctx.tools[0].name, "calculator");
+        assert_eq!(ctx.outlets.len(), 1);
+        assert_eq!(ctx.outlets[0].name, "calculator");
     }
 
     #[test]

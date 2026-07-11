@@ -1820,7 +1820,7 @@ fn handle_context_id(py: Python<'_>, handle: &PyContextHandle) -> String {
 ///    that it queries against the CALLER context A's actor governance state
 ///    (`has_established_outlet_interface`, `queries_helpers.rs`) — NOT context B's.
 ///    So the interface is established IN A, via a governance
-///    `EstablishToolInterface` action proposed by A's admin (auto-executed under
+///    `EstablishOutletInterface` action proposed by A's admin (auto-executed under
 ///    `single_admin`). `execute_establish_outlet_interface` (`governance_helpers.rs`)
 ///    pushes the interface verbatim into A's `governance.outlet_interfaces`, and
 ///    additionally requires A's ceiling to contain `outlet:interface` — which the
@@ -1912,7 +1912,7 @@ fn establish_xctx_saga_commit_preconditions(
     // Prepare-B finds it.
     let register_json = register_outlet_action_json(&outlet_id, outlet_name, &owner);
     scp.governance_propose(&handle_b, &owner, &register_json)
-        .expect("RegisterTool must auto-execute under single_admin");
+        .expect("RegisterOutlet must auto-execute under single_admin");
 
     // The executor snapshots the handler from the FFI-side `outlet_handlers`
     // at Commit-B. `register_outlet_handler` requires the outlet to exist in
@@ -1932,7 +1932,7 @@ fn establish_xctx_saga_commit_preconditions(
     let action_json = establish_interface_action_json(&ctx_a, &ctx_b, &outlet_id);
     let propose_result = scp
         .governance_propose(&handle_a, &owner, &action_json)
-        .expect("EstablishToolInterface must auto-execute under single_admin");
+        .expect("EstablishOutletInterface must auto-execute under single_admin");
     assert!(
         !propose_result.is_empty(),
         "governance_propose must return a non-empty result JSON"
@@ -1941,7 +1941,7 @@ fn establish_xctx_saga_commit_preconditions(
     (scp, ctx_a, ctx_b, owner, outlet_id)
 }
 
-/// Serializes a `RegisterTool` governance action for the saga outlet. The schema
+/// Serializes a `RegisterOutlet` governance action for the saga outlet. The schema
 /// mirrors `build_outlet_reg`: 2 input + 2 output properties (clears the §9.2.1
 /// specificity floor of 2), numeric `{sum, ok}` output (so Commit-B's
 /// output-schema validation accepts the handler's response). `implementation_hash`
@@ -1950,7 +1950,7 @@ fn establish_xctx_saga_commit_preconditions(
 fn register_outlet_action_json(outlet_id: &str, outlet_name: &str, owner: &str) -> String {
     let impl_hash = serde_json::Value::from(vec![0u8; 32]);
     let register_action = serde_json::json!({
-        "RegisterTool": {
+        "RegisterOutlet": {
             "registration": {
                 "outlet_id": outlet_id,
                 "name": outlet_name,
@@ -1983,13 +1983,13 @@ fn register_outlet_action_json(outlet_id: &str, outlet_name: &str, owner: &str) 
     serde_json::to_string(&register_action).unwrap()
 }
 
-/// Serializes the bidirectionally-approved `EstablishToolInterface` governance
+/// Serializes the bidirectionally-approved `EstablishOutletInterface` governance
 /// action. Externally-tagged `GovernanceAction` (no serde rename) → the
-/// `EstablishToolInterface` variant wraps the `snake_case` `OutletInterface` struct;
+/// `EstablishOutletInterface` variant wraps the `snake_case` `OutletInterface` struct;
 /// the `Option` fields render as JSON `null`.
 fn establish_interface_action_json(ctx_a: &str, ctx_b: &str, outlet_id: &str) -> String {
     let action = serde_json::json!({
-        "EstablishToolInterface": {
+        "EstablishOutletInterface": {
             "interface": {
                 "source_context": ctx_a,
                 "target_context": ctx_b,

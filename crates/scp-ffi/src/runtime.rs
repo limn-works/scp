@@ -1515,7 +1515,7 @@ pub fn register_ffi_state(
                 // to `payments:*`.
                 for entry in user_ceiling {
                     // Fail-closed: a malformed capability string (deleted
-                    // legacy outlet-invoke / pre-rename tool-invoke stems,
+                    // legacy outlet-invoke / pre-rename outlet-invoke stems,
                     // invalid §5.4.2.1 outlet suffix) parses to `None` and is
                     // rejected at the FFI boundary rather than silently dropped.
                     let cap =

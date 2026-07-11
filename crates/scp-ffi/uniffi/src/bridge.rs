@@ -1819,10 +1819,10 @@ pub struct ParticipationRecordView {
     /// Count of governance actions initiated by this identity.
     pub governance_actions_by: u64,
     /// Total outlet invocations across all outlet types.
-    pub tool_invocation_count: u64,
-    /// Whether `tool_invocation_count` is anchored in the canonical Merkle log
+    pub outlet_invocation_count: u64,
+    /// Whether `outlet_invocation_count` is anchored in the canonical Merkle log
     /// (`false` until ADR-051; consumers MUST NOT treat it as Merkle-proven).
-    pub tool_invocation_count_anchored: bool,
+    pub outlet_invocation_count_anchored: bool,
     /// Number of contexts created by the subject (`ChildContextCreated`).
     pub context_creation_count: u64,
     /// Number of role transitions for the subject.
@@ -1833,7 +1833,7 @@ pub struct ParticipationRecordView {
     /// Whether `attestation_count` is anchored in / verifiable against a context
     /// Merkle root. Always `false` — credential-layer, verifier-relative (§7.4),
     /// never a context-event-log count (§7.3.2). Parallel of
-    /// `tool_invocation_count_anchored`.
+    /// `outlet_invocation_count_anchored`.
     pub attestation_count_anchored: bool,
     /// Unix timestamp (seconds) when the record was computed.
     pub computed_at: u64,
@@ -1848,8 +1848,8 @@ impl From<&scp_core::trust::ParticipationFacts> for ParticipationRecordView {
             participation_duration_secs: f.participation_duration_secs,
             governance_actions_against: f.governance_actions_against,
             governance_actions_by: f.governance_actions_by,
-            tool_invocation_count: f.tool_invocation_count,
-            tool_invocation_count_anchored: f.tool_invocation_count_anchored,
+            outlet_invocation_count: f.outlet_invocation_count,
+            outlet_invocation_count_anchored: f.outlet_invocation_count_anchored,
             context_creation_count: f.context_creation_count,
             role_progression_count: f.role_progression_count,
             attestation_count: f.attestation_count,
@@ -4882,7 +4882,7 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
             };
 
             let event = scp_event_log::Event {
-                event_type: scp_event_log::EventType::ToolInvoked,
+                event_type: scp_event_log::EventType::OutletInvoked,
                 actor_did: agent_did.into(),
                 timestamp,
                 sequence,
@@ -8795,8 +8795,8 @@ fn parse_template_id_uniffi(
         "GroupDiscussion" => Ok(TemplateId::GroupDiscussion),
         "PublicBroadcast" => Ok(TemplateId::PublicBroadcast),
         "GatedBroadcast" => Ok(TemplateId::GatedBroadcast),
-        "scp:template/tool-interface" | "OutletInterfaceTemplate" => {
-            Ok(TemplateId::ToolInterfaceTemplate)
+        "scp:template/outlet-interface" | "OutletInterfaceTemplate" => {
+            Ok(TemplateId::OutletInterfaceTemplate)
         }
         "PaidService" => Ok(TemplateId::PaidService),
         "PaidBroadcast" => Ok(TemplateId::PaidBroadcast),
@@ -8808,7 +8808,7 @@ fn parse_template_id_uniffi(
             msg: format!(
                 "unknown template ID: {template_id:?} — valid values: BilateralEphemeral, \
                  BilateralPersistent, Coordination, GroupDiscussion, PublicBroadcast, \
-                 GatedBroadcast, scp:template/tool-interface, PaidService, PaidBroadcast, \
+                 GatedBroadcast, scp:template/outlet-interface, PaidService, PaidBroadcast, \
                  HandleRegistry, scp:template/handle-registry, DiscoveryContext, \
                  scp:template/discovery-context"
             ),
@@ -10775,8 +10775,8 @@ impl Scp {
                     GovernanceActionResult::MemberAdded { .. } => "MemberAdded",
                     GovernanceActionResult::MemberRemoved => "MemberRemoved",
                     GovernanceActionResult::RoleChanged => "RoleChanged",
-                    GovernanceActionResult::ToolRegistered => "ToolRegistered",
-                    GovernanceActionResult::ToolRemoved => "ToolRemoved",
+                    GovernanceActionResult::OutletRegistered => "OutletRegistered",
+                    GovernanceActionResult::OutletRemoved => "OutletRemoved",
                     GovernanceActionResult::CeilingModified => "CeilingModified",
                     GovernanceActionResult::ContextClosed => "ContextClosed",
                     GovernanceActionResult::TtlExtended => "TtlExtended",
@@ -10786,7 +10786,7 @@ impl Scp {
                     GovernanceActionResult::SignerRemoved => "SignerRemoved",
                     GovernanceActionResult::ThresholdModified => "ThresholdModified",
                     GovernanceActionResult::ChildContextCreated => "ChildContextCreated",
-                    GovernanceActionResult::ToolInterfaceEstablished => "ToolInterfaceEstablished",
+                    GovernanceActionResult::OutletInterfaceEstablished => "OutletInterfaceEstablished",
                     GovernanceActionResult::MemberReset => "MemberReset",
                     GovernanceActionResult::ConflictResolved => "ConflictResolved",
                     GovernanceActionResult::ContextPromoted => "ContextPromoted",
@@ -13817,7 +13817,7 @@ impl Scp {
 
                 let registry = handle.outlet_registry.lock().await;
 
-                let interface = scp_core::context::outlets::interface::expose_tool(
+                let interface = scp_core::context::outlets::interface::expose_outlet(
                     context_handle.context_id(),
                     &outlet_id,
                     &target_context_id,
@@ -13828,7 +13828,7 @@ impl Scp {
                     None,
                 )
                 .map_err(|e| ScpError::Outlet {
-                    msg: format!("expose_tool failed: {e}"),
+                    msg: format!("expose_outlet failed: {e}"),
                     code: codes::OUTLET_6030.to_owned(),
                 })?;
 
@@ -13895,7 +13895,7 @@ impl Scp {
                     scp_core::context::ContextParams::default(),
                 );
 
-                scp_core::context::outlets::interface::accept_tool_interface(
+                scp_core::context::outlets::interface::accept_outlet_interface(
                     context_handle.context_id(),
                     &mut interface,
                     &role_state,
@@ -13903,7 +13903,7 @@ impl Scp {
                     None,
                 )
                 .map_err(|e| ScpError::Outlet {
-                    msg: format!("accept_tool_interface failed: {e}"),
+                    msg: format!("accept_outlet_interface failed: {e}"),
                     code: codes::OUTLET_6032.to_owned(),
                 })?;
 
@@ -13950,7 +13950,7 @@ impl Scp {
 
                 let now_ms = scp_clock::SystemClock.now_millis();
 
-                let event = scp_core::context::outlets::interface::revoke_tool_interface(
+                let event = scp_core::context::outlets::interface::revoke_outlet_interface(
                     interface_id,
                     &handle.context_id,
                     now_ms,
@@ -15683,7 +15683,7 @@ impl Scp {
         })?;
 
         let outlets = client_guard.list_tools().map_err(|e| ScpError::Transport {
-            msg: format!("tools/list failed: {e}"),
+            msg: format!("outlets/list failed: {e}"),
             code: codes::TRANS_5022.to_owned(),
         })?;
 
@@ -15736,7 +15736,7 @@ impl Scp {
         let result = client_guard
             .invoke(&outlet_name, input, &context_id, &invoker_did)
             .map_err(|e| ScpError::Transport {
-                msg: format!("tools/call failed: {e}"),
+                msg: format!("outlets/call failed: {e}"),
                 code: codes::TRANS_5025.to_owned(),
             })?;
 
@@ -19388,8 +19388,8 @@ mod tests {
             participation_duration_secs: 300,
             governance_actions_against: 1,
             governance_actions_by: 2,
-            tool_invocation_count: 5,
-            tool_invocation_count_anchored: false,
+            outlet_invocation_count: 5,
+            outlet_invocation_count_anchored: false,
             context_creation_count: 1,
             role_progression_count: 3,
             attestation_count: 2,
@@ -19402,8 +19402,8 @@ mod tests {
         assert_eq!(view.participation_duration_secs, 300);
         assert_eq!(view.governance_actions_against, 1);
         assert_eq!(view.governance_actions_by, 2);
-        assert_eq!(view.tool_invocation_count, 5);
-        assert!(!view.tool_invocation_count_anchored);
+        assert_eq!(view.outlet_invocation_count, 5);
+        assert!(!view.outlet_invocation_count_anchored);
         assert_eq!(view.context_creation_count, 1);
         assert_eq!(view.role_progression_count, 3);
         assert_eq!(view.attestation_count, 2);
@@ -23340,7 +23340,7 @@ mod tests {
             })
         }
 
-        /// Serializes a `RegisterTool` governance action for the saga outlet carrying
+        /// Serializes a `RegisterOutlet` governance action for the saga outlet carrying
         /// the given `output_schema`. The input schema mirrors the `PyO3` e2e (2
         /// input properties — clears the §9.2.1 specificity floor of 2).
         /// `implementation_hash` is a fixed 32-byte array (serde wants a 32-element
@@ -23353,7 +23353,7 @@ mod tests {
         ) -> String {
             let impl_hash = serde_json::Value::from(vec![0u8; 32]);
             let register_action = serde_json::json!({
-                "RegisterTool": {
+                "RegisterOutlet": {
                     "registration": {
                         "outlet_id": outlet_id,
                         "name": outlet_name,
@@ -23380,7 +23380,7 @@ mod tests {
             serde_json::to_string(&register_action).unwrap()
         }
 
-        /// The handler-backed e2e's `RegisterTool` action (numeric `{sum, ok}`
+        /// The handler-backed e2e's `RegisterOutlet` action (numeric `{sum, ok}`
         /// output schema).
         fn saga_register_outlet_action_json(
             outlet_id: &str,
@@ -23395,7 +23395,7 @@ mod tests {
             )
         }
 
-        /// Serializes the bidirectionally-approved `EstablishToolInterface`
+        /// Serializes the bidirectionally-approved `EstablishOutletInterface`
         /// governance action (externally-tagged `GovernanceAction`; the
         /// `snake_case` `OutletInterface` `Option` fields render as JSON `null`).
         fn saga_establish_interface_action_json(
@@ -23404,7 +23404,7 @@ mod tests {
             outlet_id: &str,
         ) -> String {
             let action = serde_json::json!({
-                "EstablishToolInterface": {
+                "EstablishOutletInterface": {
                     "interface": {
                         "source_context": ctx_a,
                         "target_context": ctx_b,
@@ -23468,11 +23468,11 @@ mod tests {
         /// 2. **Target axis (gate 2).** The producer requires a *bidirectionally
         ///    approved* `OutletInterface` queried against the CALLER context A's actor
         ///    governance state — so it is established IN A via a governance
-        ///    `EstablishToolInterface` action (auto-executed under `single_admin`; A's
+        ///    `EstablishOutletInterface` action (auto-executed under `single_admin`; A's
         ///    ceiling carries `outlet:interface` + `governance:propose`).
         ///
         /// Context B holds the outlet in its ACTOR governance `registered_outlets` (via
-        /// a `RegisterTool` action; saga Prepare-B reads it there) plus the FFI-side
+        /// a `RegisterOutlet` action; saga Prepare-B reads it there) plus the FFI-side
         /// handler the executor snapshots and runs once at Commit-B (returns
         /// `{sum:42, ok:1}`, validated against the registered numeric output schema).
         #[tokio::test]
@@ -23539,8 +23539,8 @@ mod tests {
             let register_result = scp
                 .governance_propose(Arc::clone(&handle_b), owner.clone(), register_json)
                 .await
-                .expect("RegisterTool must auto-execute under single_admin");
-            assert_governance_executed(&register_result, "RegisterTool");
+                .expect("RegisterOutlet must auto-execute under single_admin");
+            assert_governance_executed(&register_result, "RegisterOutlet");
 
             // Register the outlet in B's FFI-side registry too (so the FFI schema
             // matches the governance registration), then attach the deterministic
@@ -23600,8 +23600,8 @@ mod tests {
             let propose_result = scp
                 .governance_propose(Arc::clone(&handle_a), owner.clone(), establish_json)
                 .await
-                .expect("EstablishToolInterface must auto-execute under single_admin");
-            assert_governance_executed(&propose_result, "EstablishToolInterface");
+                .expect("EstablishOutletInterface must auto-execute under single_admin");
+            assert_governance_executed(&propose_result, "EstablishOutletInterface");
 
             // A near-now timestamp: Prepare-B enforces a §9.14 ±5min skew tolerance,
             // so a fixed historical timestamp would abort.
@@ -23661,7 +23661,7 @@ mod tests {
         /// (`{outlet, target_context, caller_did, status, input_valid, validated_input}`).
         /// The outlet is registered with a PERMISSIVE output schema
         /// (`{status, input_valid}`, no `required`/`additionalProperties:false`) in
-        /// BOTH the `RegisterTool` governance action and the FFI `OutletDefinition`, so
+        /// BOTH the `RegisterOutlet` governance action and the FFI `OutletDefinition`, so
         /// Commit-B's output-schema validation accepts the echo and the saga reaches
         /// a real `Committed`. Proves the no-handler echo path commits end-to-end.
         #[tokio::test]
@@ -23717,8 +23717,8 @@ mod tests {
             let register_result = scp
                 .governance_propose(Arc::clone(&handle_b), owner.clone(), register_json)
                 .await
-                .expect("RegisterTool must auto-execute under single_admin");
-            assert_governance_executed(&register_result, "RegisterTool (echo)");
+                .expect("RegisterOutlet must auto-execute under single_admin");
+            assert_governance_executed(&register_result, "RegisterOutlet (echo)");
 
             // Register the outlet in B's FFI-side registry with the SAME permissive
             // output schema — but DO NOT attach a handler. The absence of a handler
@@ -23757,8 +23757,8 @@ mod tests {
             let propose_result = scp
                 .governance_propose(Arc::clone(&handle_a), owner.clone(), establish_json)
                 .await
-                .expect("EstablishToolInterface must auto-execute under single_admin");
-            assert_governance_executed(&propose_result, "EstablishToolInterface (echo)");
+                .expect("EstablishOutletInterface must auto-execute under single_admin");
+            assert_governance_executed(&propose_result, "EstablishOutletInterface (echo)");
 
             let now_ms = u64::try_from(
                 std::time::SystemTime::now()

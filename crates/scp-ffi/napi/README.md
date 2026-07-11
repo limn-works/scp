@@ -54,7 +54,7 @@ released or the deadline elapses.
 | `scpid.rs` | SCPID stateless DID authentication (§3.11) |
 | `server.rs` | Relay / application-node server startup (wraps `scp-ffi-common::server`) |
 | `sync.rs` | Offline sync classification |
-| `tools.rs` | Tool register, invoke, verify |
+| `outlets.rs` | Outlet register, invoke, verify |
 | `transport.rs` | Relay connect, disconnect, status |
 | `trust.rs` | Trust evaluation |
 | `ucan.rs` | UCAN validate, mint, revoke |

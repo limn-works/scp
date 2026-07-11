@@ -745,12 +745,12 @@ pub struct PyParticipationRecord {
     pub governance_actions_by: u64,
     /// Total outlet invocations across all outlet types.
     #[pyo3(get)]
-    pub tool_invocation_count: u64,
-    /// Whether `tool_invocation_count` is anchored in the canonical Merkle log.
+    pub outlet_invocation_count: u64,
+    /// Whether `outlet_invocation_count` is anchored in the canonical Merkle log.
     /// `false` until ADR-051 makes `OutletInvoked` a convergent leaf (§7.3.2) —
     /// consumers MUST NOT treat the count as Merkle-proven while this is `false`.
     #[pyo3(get)]
-    pub tool_invocation_count_anchored: bool,
+    pub outlet_invocation_count_anchored: bool,
     /// Number of contexts created by the subject (`ChildContextCreated`).
     #[pyo3(get)]
     pub context_creation_count: u64,
@@ -764,7 +764,7 @@ pub struct PyParticipationRecord {
     /// Whether `attestation_count` is anchored in / verifiable against a context
     /// Merkle root. Always `false` — it is a credential-layer, verifier-relative
     /// fact (§7.4), never a context-event-log count (§7.3.2). The parallel of
-    /// `tool_invocation_count_anchored`, surfaced so the non-anchored nature is
+    /// `outlet_invocation_count_anchored`, surfaced so the non-anchored nature is
     /// mechanically visible.
     #[pyo3(get)]
     pub attestation_count_anchored: bool,
@@ -783,8 +783,8 @@ impl From<&scp_core::trust::ParticipationFacts> for PyParticipationRecord {
             participation_duration_secs: f.participation_duration_secs,
             governance_actions_against: f.governance_actions_against,
             governance_actions_by: f.governance_actions_by,
-            tool_invocation_count: f.tool_invocation_count,
-            tool_invocation_count_anchored: f.tool_invocation_count_anchored,
+            outlet_invocation_count: f.outlet_invocation_count,
+            outlet_invocation_count_anchored: f.outlet_invocation_count_anchored,
             context_creation_count: f.context_creation_count,
             role_progression_count: f.role_progression_count,
             attestation_count: f.attestation_count,
@@ -801,15 +801,15 @@ impl PyParticipationRecord {
         format!(
             "ParticipationRecord(subject_did={}, participation_duration_secs={}, \
              governance_actions_against={}, governance_actions_by={}, \
-             tool_invocation_count={}, tool_invocation_count_anchored={}, \
+             outlet_invocation_count={}, outlet_invocation_count_anchored={}, \
              context_creation_count={}, role_progression_count={}, \
              attestation_count={}, attestation_count_anchored={})",
             self.subject_did,
             self.participation_duration_secs,
             self.governance_actions_against,
             self.governance_actions_by,
-            self.tool_invocation_count,
-            self.tool_invocation_count_anchored,
+            self.outlet_invocation_count,
+            self.outlet_invocation_count_anchored,
             self.context_creation_count,
             self.role_progression_count,
             self.attestation_count,
@@ -1741,8 +1741,8 @@ mod tests {
             participation_duration_secs: 300,
             governance_actions_against: 1,
             governance_actions_by: 2,
-            tool_invocation_count: 5,
-            tool_invocation_count_anchored: false,
+            outlet_invocation_count: 5,
+            outlet_invocation_count_anchored: false,
             context_creation_count: 1,
             role_progression_count: 3,
             attestation_count: 2,
@@ -1755,8 +1755,8 @@ mod tests {
         assert_eq!(view.participation_duration_secs, 300);
         assert_eq!(view.governance_actions_against, 1);
         assert_eq!(view.governance_actions_by, 2);
-        assert_eq!(view.tool_invocation_count, 5);
-        assert!(!view.tool_invocation_count_anchored);
+        assert_eq!(view.outlet_invocation_count, 5);
+        assert!(!view.outlet_invocation_count_anchored);
         assert_eq!(view.context_creation_count, 1);
         assert_eq!(view.role_progression_count, 3);
         assert_eq!(view.attestation_count, 2);

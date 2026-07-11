@@ -1358,7 +1358,7 @@ pub(crate) async fn outlet_interface_expose_on(
             scp_core::context::ContextParams::default(),
         );
 
-        let interface = scp_core::context::outlets::interface::expose_tool(
+        let interface = scp_core::context::outlets::interface::expose_outlet(
             context_handle.context_id(),
             &outlet_id,
             &target_context_id,
@@ -1369,7 +1369,7 @@ pub(crate) async fn outlet_interface_expose_on(
             None,
         )
         .map_err(|e| ScpNapiError::Outlet {
-            message: format!("expose_tool failed: {e}"),
+            message: format!("expose_outlet failed: {e}"),
             code: codes::OUTLET_6030.to_owned(),
         })?;
 
@@ -1417,7 +1417,7 @@ pub(crate) async fn outlet_interface_accept_on(
             scp_core::context::ContextParams::default(),
         );
 
-        scp_core::context::outlets::interface::accept_tool_interface(
+        scp_core::context::outlets::interface::accept_outlet_interface(
             context_handle.context_id(),
             &mut interface,
             &rt.role_state,
@@ -1425,7 +1425,7 @@ pub(crate) async fn outlet_interface_accept_on(
             None,
         )
         .map_err(|e| ScpNapiError::Outlet {
-            message: format!("accept_tool_interface failed: {e}"),
+            message: format!("accept_outlet_interface failed: {e}"),
             code: codes::OUTLET_6032.to_owned(),
         })?;
 
@@ -1466,7 +1466,7 @@ pub(crate) async fn outlet_interface_revoke_on(
 
     let now_ms = scp_clock::SystemClock.now_millis();
 
-    let event = scp_core::context::outlets::interface::revoke_tool_interface(
+    let event = scp_core::context::outlets::interface::revoke_outlet_interface(
         interface_id,
         &context_id,
         now_ms,
@@ -1926,11 +1926,11 @@ mod tests {
         //   2. Target axis (gate 2): a bidirectionally-approved OutletInterface
         //      (approved_by_source && approved_by_target, source=A, target=B), which
         //      the producer queries against A's actor governance state, established
-        //      IN A via a governance EstablishToolInterface action (auto-executed
+        //      IN A via a governance EstablishOutletInterface action (auto-executed
         //      under single_admin).
         //
         // Context B holds the outlet registered into its ACTOR governance state (via a
-        // RegisterTool governance action — the saga's Prepare-B reads it from there)
+        // RegisterOutlet governance action — the saga's Prepare-B reads it from there)
         // PLUS the FFI-side handler the executor snapshots and runs once at Commit-B.
         // The handler returns `{"sum":42,"ok":1}`, which Commit-B validates against
         // the registered numeric `{sum, ok}` output schema before committing.
@@ -1945,14 +1945,14 @@ mod tests {
         // ±5min timestamp skew, so the invocation uses `SystemTime::now()`.
         // ------------------------------------------------------------------
 
-        /// Serializes a `RegisterTool` governance action for the saga outlet. Mirrors
+        /// Serializes a `RegisterOutlet` governance action for the saga outlet. Mirrors
         /// the registered schema: 2 input + 2 output properties (clears the §9.2.1
         /// specificity floor of 2), numeric `{sum, ok}` output so Commit-B's
         /// output-schema validation accepts the handler's response.
         fn register_outlet_action_json(outlet_id: &str, outlet_name: &str, owner: &str) -> String {
             let impl_hash = serde_json::Value::from(vec![0u8; 32]);
             let register_action = serde_json::json!({
-                "RegisterTool": {
+                "RegisterOutlet": {
                     "registration": {
                         "outlet_id": outlet_id,
                         "name": outlet_name,
@@ -1985,11 +1985,11 @@ mod tests {
             serde_json::to_string(&register_action).unwrap()
         }
 
-        /// Serializes the bidirectionally-approved `EstablishToolInterface`
+        /// Serializes the bidirectionally-approved `EstablishOutletInterface`
         /// governance action (source=A, target=B, BOTH approvals true).
         fn establish_interface_action_json(ctx_a: &str, ctx_b: &str, outlet_id: &str) -> String {
             let action = serde_json::json!({
-                "EstablishToolInterface": {
+                "EstablishOutletInterface": {
                     "interface": {
                         "source_context": ctx_a,
                         "target_context": ctx_b,
@@ -2008,7 +2008,7 @@ mod tests {
         }
 
         /// The registered outlet registration definition for context B's FFI-side
-        /// registry, matching the governance `RegisterTool` schema (2-in/2-out,
+        /// registry, matching the governance `RegisterOutlet` schema (2-in/2-out,
         /// numeric `{sum, ok}` output) so the deterministic id agrees and the
         /// handler's response validates at Commit-B.
         fn build_napi_outlet_def(outlet_name: &str, owner: &str) -> NapiOutletDefinition {
@@ -2134,7 +2134,7 @@ mod tests {
             let owner = owner_identity.inner.did.clone();
 
             // Seed the owner's DID document into the per-instance resolver's store
-            // so governance vote verification (RegisterTool / EstablishToolInterface
+            // so governance vote verification (RegisterOutlet / EstablishOutletInterface
             // auto-execute under single_admin) can resolve the proposer's public
             // key. Without this the resolver is empty and the propose below fails.
             seed_owner_document_into_resolver(&owner_identity, &resolver_dht).await;
@@ -2187,7 +2187,7 @@ mod tests {
                 owner.clone(),
             )
             .await
-            .expect("RegisterTool must auto-execute under single_admin");
+            .expect("RegisterOutlet must auto-execute under single_admin");
 
             // Register the outlet into B's FFI-side registry (so register_outlet_handler
             // accepts it) and attach the deterministic handler the executor runs at
@@ -2216,7 +2216,7 @@ mod tests {
                 owner.clone(),
             )
             .await
-            .expect("EstablishToolInterface must auto-execute under single_admin");
+            .expect("EstablishOutletInterface must auto-execute under single_admin");
             assert!(
                 !propose_result.is_empty(),
                 "governance_propose must return a non-empty result JSON"

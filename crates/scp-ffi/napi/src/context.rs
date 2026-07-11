@@ -5388,8 +5388,8 @@ fn parse_template_id_napi(
         "GroupDiscussion" => Ok(TemplateId::GroupDiscussion),
         "PublicBroadcast" => Ok(TemplateId::PublicBroadcast),
         "GatedBroadcast" => Ok(TemplateId::GatedBroadcast),
-        "scp:template/tool-interface" | "OutletInterfaceTemplate" => {
-            Ok(TemplateId::ToolInterfaceTemplate)
+        "scp:template/outlet-interface" | "OutletInterfaceTemplate" => {
+            Ok(TemplateId::OutletInterfaceTemplate)
         }
         "PaidService" => Ok(TemplateId::PaidService),
         "PaidBroadcast" => Ok(TemplateId::PaidBroadcast),
@@ -5401,7 +5401,7 @@ fn parse_template_id_napi(
             message: format!(
                 "unknown template ID: {template_id:?} — valid values: BilateralEphemeral, \
                  BilateralPersistent, Coordination, GroupDiscussion, PublicBroadcast, \
-                 GatedBroadcast, scp:template/tool-interface, PaidService, PaidBroadcast, \
+                 GatedBroadcast, scp:template/outlet-interface, PaidService, PaidBroadcast, \
                  HandleRegistry, scp:template/handle-registry, DiscoveryContext, \
                  scp:template/discovery-context"
             ),

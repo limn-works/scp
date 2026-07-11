@@ -9,6 +9,6 @@ description = "SCP (Shared Context Protocol) Python SDK — cryptographic identi
 requires-python = ">=3.9"
 license = { text = "MIT OR Apache-2.0" }
 
-[tool.maturin]
+[outlet.maturin]
 features = ["extension-module"]
 module-name = "scp_sdk._scp_core"
