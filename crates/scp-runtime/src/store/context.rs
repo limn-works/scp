@@ -1305,7 +1305,7 @@ mod tests {
             role_state,
             event_log_merkle_root: [0u8; 32],
             executed_proposals: std::collections::HashSet::new(),
-            ttl_remaining_secs: Some(300),
+            ttl_deadline_secs: Some(300),
             registered_outlets: Vec::new(),
             read_exclusion_list: std::collections::HashSet::new(),
             outlet_interfaces: Vec::new(),
@@ -1368,7 +1368,7 @@ mod tests {
         let loaded = loaded.unwrap();
         assert_eq!(loaded.context_id, "ctx-snap-1");
         assert_eq!(loaded.state, scp_protocol::context::ContextState::Active);
-        assert_eq!(loaded.ttl_remaining_secs, Some(300));
+        assert_eq!(loaded.ttl_deadline_secs, Some(300));
         assert!(loaded.membership.contains("did:dht:z6MkCreator"));
     }
 
@@ -1418,7 +1418,7 @@ mod tests {
         let loaded = loaded.unwrap();
         assert_eq!(loaded.context_id, "ctx-snap-1");
         assert_eq!(loaded.state, scp_protocol::context::ContextState::Active);
-        assert_eq!(loaded.ttl_remaining_secs, Some(300));
+        assert_eq!(loaded.ttl_deadline_secs, Some(300));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]

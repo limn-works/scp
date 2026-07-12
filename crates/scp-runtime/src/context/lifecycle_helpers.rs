@@ -44,17 +44,17 @@
 //! [`SupervisorHandle`](crate::context::supervisor::handle::SupervisorHandle)):
 //!
 //! - [`create_context`] — full create body; builds and registers a fresh `PerContextState`.
-//! - [`finalize_create`] — gauges + governance timeout + persistence + TTL timer post-creation.
+//! - [`finalize_create`] — gauges + persistence + TTL timer post-creation.
 //! - [`import_context`] — full import body (validate, restore crypto, build `PerContextState`, register).
 //! - [`load_persisted_context_state`] — load context snapshot and broadcast state from persistence.
-//! - [`restore_context`] — rebuild `PerContextState` from snapshot + register + start governance timeout + spawn TTL.
+//! - [`restore_context`] — rebuild `PerContextState` from snapshot + register + arm TTL deadline.
 //!
-//! `finalize_create` installs the governance-timeout task via
-//! [`governance_helpers::start_governance_timeout_task`](crate::context::governance_helpers::start_governance_timeout_task),
-//! which mailboxes
-//! [`GovernanceCommand::StartTimeoutTask`](crate::context::actor::commands::GovernanceCommand::StartTimeoutTask)
-//! to the freshly-spawned per-context actor — no shim escape, no
-//! `DashMap` iteration.
+//! Governance timeouts are ACTOR-OWNED (ADR-049 Decision-1 / finding A3):
+//! the freshly-spawned per-context actor's `reconcile_timers` arms a 60 s
+//! interval while the context is `Active`, so the bootstrap paths do NOT
+//! install a governance-timeout task. They still arm the TTL deadline via
+//! `SupervisorHandle::dispatch_start_ttl_timer` (which records
+//! `state.ttl.timer.deadline_unix_secs` for the actor's TTL arm).
 //!
 //! # Supervisor-iterating sweep entry points
 //!
@@ -89,7 +89,7 @@ use crate::context::actor::state::{
     ContextCryptoState, ContextLifecycleState, ContextModeState, ContextRouting, PerContextState,
     RecvSequenceTracker,
 };
-use crate::context::governance::timeout::{DeadlockDetectionState, GovernanceTimeoutTask};
+use crate::context::governance::timeout::DeadlockDetectionState;
 use crate::context::governance_helpers;
 use crate::context::state::{
     self, AccessControlState, CommitOperation, EpochState, GovernanceState, TtlState,
@@ -631,8 +631,14 @@ pub async fn close_context_with_key(
             );
         }
 
-        state.ttl.timer.cancel();
-        state.governance.timeout_task.cancel();
+        // TTL + governance timers are actor-owned arms (ADR-049 finding A3):
+        // the actor's `reconcile_timers` clears the governance interval once
+        // this close leaves `Active`, and disarms the one-shot TTL arm on a
+        // non-Active context. Clear the recorded TTL deadline HERE (durably, in
+        // the fail-closed snapshot) so a stale absolute deadline cannot fire
+        // against the closed context on a later restore and despawn it —
+        // re-opening this very close window (BUG-1).
+        state.ttl.timer.deadline_unix_secs = None;
         // Drop broadcast context state -- keys are zeroed by Zeroize.
         state.broadcast_context = None;
 
@@ -1655,23 +1661,22 @@ pub async fn finalize_create(
     handle: &ContextHandle,
 ) {
     deps.supervisor.update_context_gauges().await;
-    // Install the governance-timeout interval task on the freshly-spawned
-    // actor via the mailbox (registry + EvaluateTimeouts tick — no
-    // DashMap reach).
-    crate::context::governance_helpers::start_governance_timeout_task(&deps.supervisor, context_id)
-        .await;
+    // The governance-timeout interval is ACTOR-OWNED (ADR-049 Decision-1 /
+    // finding A3): the freshly-spawned actor's `reconcile_timers` arms a
+    // 60 s interval while the context is `Active` — no bootstrap mailbox
+    // install is needed.
     deps.supervisor
         .persist_context_and_broadcast(context_id)
         .await;
-    if let Some(duration) = ttl_duration {
+    if ttl_duration.is_some() {
         // Install the TTL timer by mailboxing StartTtlTimer to the
         // freshly-spawned actor: the actor owns `state.ttl.timer` and
         // installs the timer task on its own state (registry + mailbox
         // tick — no DashMap reach).
         deps.supervisor
-            // Create path: anchor the convergent expiry deadline on the
-            // creator-assigned creation timestamp + params.ttl.
-            .dispatch_start_ttl_timer(context_id, handle.params().clone(), duration, true)
+            // Create path: no explicit deadline — the actor handler derives the
+            // convergent `creation_timestamp_secs + params.ttl` deadline.
+            .dispatch_start_ttl_timer(context_id, handle.params().clone(), None)
             .await;
     }
 }
@@ -1867,7 +1872,9 @@ pub(in crate::context) fn verify_scp_context_binding(
 /// restores crypto state with the epoch-floor regression guard
 /// ([`restore_crypto_state_with_floor_guard`]), builds a fresh
 /// `PerContextState` from the snapshot, and spawns an owned-state actor.
-/// Re-spawns the TTL timer if the export carried `ttl_remaining_secs`.
+/// Re-spawns the TTL timer if the context carries a finite `params.ttl`,
+/// re-arming the absolute convergent `ttl_deadline_secs` (or its
+/// `creation + ttl` fallback).
 ///
 /// # Errors
 ///
@@ -1898,6 +1905,46 @@ pub async fn import_context(
     // `ContextError::SnapshotSignatureInvalid`, distinct from the event-log
     // Merkle failure and from the version gate.
     crate::context::export_import::validate_export_for_import(&export, verifying_key)?;
+
+    // SINGLE-SOURCE TTL-DEADLINE (ADR-049 §9, E3): reject a future-dated
+    // `creation_timestamp_secs` BEFORE any side effect. The create base is the
+    // prune-immune `creation_timestamp_secs + params.ttl` from the creator-signed
+    // snapshot. `creation_timestamp_secs` is authenticated (the export signature +
+    // `exporter_did == creator_did` binding were verified in
+    // `validate_export_for_import` above), but a MALICIOUS creator can still
+    // future-date their OWN creation instant to smuggle a long absolute
+    // key-destruction deadline (`future + ttl`). A future-dated creation is
+    // malformed — REJECT the import fail-closed HERE, at the very top, so the
+    // rejection is genuinely SIDE-EFFECT-FREE: it must run BEFORE
+    // `restore_crypto_state_with_floor_guard` (which installs an MLS group AND
+    // sets the §23.17 replay floor from the future-dated snapshot epoch) and
+    // BEFORE `import_event_log_data` (which persists the foreign log). Rejecting
+    // AFTER those would orphan a resident MLS group + a persisted foreign log with
+    // no teardown, and — worse — the replay floor already pinned from the
+    // future-dated epoch could floor-reject a later LEGITIMATE import/restore of
+    // the same context_id (griefing/DoS). This check only reads the (already
+    // signature-validated) `creation_timestamp_secs` and the local clock, both
+    // available immediately. A small clock-skew tolerance mirrors the anti-spam
+    // snapshot validators below so a benignly-ahead exporter clock is not
+    // rejected. (Forged `TtlExtended` EXTENSION leaves beyond consent remain the
+    // creator-trust boundary cross-member convergence catches — the
+    // import-legibility follow-up, #2102.)
+    {
+        let now_for_future_date_gate = deps.clock.now_secs();
+        if export.snapshot.creation_timestamp_secs
+            > now_for_future_date_gate
+                .saturating_add(scp_protocol::economy::antispam::SNAPSHOT_CLOCK_SKEW_TOLERANCE_SECS)
+        {
+            return Err(ContextError::PersistenceFailed(format!(
+                "import: creation_timestamp_secs {} is future-dated beyond import time {} \
+                 (+{}s skew tolerance) — refusing a malformed export that could smuggle a \
+                 long TTL key-destruction deadline (ADR-049 §9)",
+                export.snapshot.creation_timestamp_secs,
+                now_for_future_date_gate,
+                scp_protocol::economy::antispam::SNAPSHOT_CLOCK_SKEW_TOLERANCE_SECS,
+            )));
+        }
+    }
 
     // `import_context` reconstructs authoritative context state and is only
     // meaningful for a full-scope export. A public-scope export
@@ -2127,6 +2174,13 @@ pub async fn import_context(
     // "pre-consume" future capacity) are rejected; stale entries
     // are clamped. Matches restore_context policy verbatim.
     let now_for_validation = deps.clock.now_secs();
+
+    // NOTE: the future-dated `creation_timestamp_secs` reject (ADR-049 §9, E3) was
+    // hoisted to the TOP of `import_context` (right after
+    // `validate_export_for_import`) so it runs BEFORE any crypto/event-log side
+    // effect — see that block for the full rationale (F2). It is NOT re-checked
+    // here.
+
     let hrl_config = export
         .snapshot
         .hard_rate_limit_config
@@ -2261,14 +2315,16 @@ pub async fn import_context(
         // creator-signed export snapshot (§7.3.1, §9.9.3). The signature and the
         // `exporter_did == creator_did` binding were verified in
         // `validate_export_for_import` before we reach this builder, so the value
-        // is authenticated. We do NOT re-pin it to importer-local `now()`
-        // (unlike the `pending_*` `observed_at` timestamps below): its only
-        // consumer is the TTL expiry deadline (`creation + ttl`, an UPPER bound),
-        // where backdating only shortens the lifetime (fail-safe) and
-        // future-dating is bounded by `ttl`. Re-pinning would re-introduce the
-        // import-time divergence this field exists to close. The TTL timer is
-        // armed with `anchor_deadline_to_creation = true` (convergent arming)
-        // below.
+        // is authenticated. Pass-4e (ADR-049 §9, E1/E3): this field IS the TTL
+        // deadline BASE — `convergent_ttl_deadline` derives the arm from
+        // `creation_timestamp_secs + params.ttl` (re-armed below), NOT from the
+        // prunable event-log `ContextCreated` leaf. A malicious creator cannot
+        // smuggle a long absolute key-destruction deadline via a future-dated
+        // base because a future-dated `creation_timestamp_secs` is REJECTED at the
+        // top of `import_context` (the E3 future-date gate) — the durable fix that
+        // replaced pass-4d's in-memory `min(genesis_ts, import_now)` genesis-leaf
+        // clamp (which was reversed on the next restart). There is NO clamp on
+        // this path anymore; the reject is the whole guard.
         creation_timestamp_secs: export.snapshot.creation_timestamp_secs,
         generation: 0, // assigned by SupervisorHandle on insert.
         handle: handle.clone(),
@@ -2288,7 +2344,6 @@ pub async fn import_context(
             next_proposal_seq: 0,
             approved_proposals: HashMap::new(),
             freeze: export.snapshot.governance_freeze,
-            timeout_task: GovernanceTimeoutTask::new(),
             deadlock: DeadlockDetectionState::default(),
             // SECURITY: `observed_at` re-pinned to local import time (see the
             // sanitization above) so a backdated signed export cannot collapse
@@ -2438,33 +2493,49 @@ pub async fn import_context(
 
     deps.supervisor.update_context_gauges().await;
 
-    // Start governance timeout task (ADR-031 §5) via the actor mailbox.
-    crate::context::governance_helpers::start_governance_timeout_task(
-        &deps.supervisor,
-        &context_id,
-    )
-    .await;
+    // Governance timeouts (ADR-031 §5) are ACTOR-OWNED (ADR-049
+    // Decision-1 / finding A3): the spawned actor's `reconcile_timers`
+    // arms the 60 s interval while `Active` — no bootstrap install needed.
 
     // 8. Persist if persistence is configured.
     deps.supervisor
         .persist_context_and_broadcast(&context_id)
         .await;
 
-    // 9. Re-spawn TTL timer if there was remaining TTL. Mailbox
-    // StartTtlTimer to the freshly-spawned actor (registry + mailbox
-    // tick — no DashMap reach).
-    if let Some(remaining_secs) = export.snapshot.ttl_remaining_secs {
-        let duration = std::time::Duration::from_secs(remaining_secs);
+    // 9. Re-arm the TTL timer through the partitioned single-source deadline
+    // (ADR-049 §9). The create BASE + PROMOTION come from the PRUNE-IMMUNE,
+    // creator-signed snapshot: the base is `export.snapshot.creation_timestamp_secs
+    // + params.ttl`, and a promoted import has `params.ttl == None` ⇒ `None` (no
+    // arm), disarming a promoted import at the source (H1) — no `memory_scope`
+    // gate. `creation_timestamp_secs` is authenticated (the export signature +
+    // `exporter_did == creator_did` binding were verified in
+    // `validate_export_for_import`) AND is REJECTED above if future-dated beyond
+    // import time (E3), so a malicious creator cannot smuggle a long absolute
+    // key-destruction deadline via the base. The prunable log (Merkle-validated
+    // against the creator-signed `snapshot.event_log_merkle_root` before any field
+    // was read — verify-before-restore, ADR-050) is read ONLY for the fail-safe
+    // `TtlExtended` extension term. This DISSOLVES the M3 attack class: a malicious
+    // exporter could sign an over-long `ttl_deadline_secs` scalar (`creation + 1yr`
+    // while `params.ttl = 1h`), but the scalar is never consulted — the base is
+    // `creation + 1h`.
+    //
+    // KNOWN RESIDUAL (import-legibility surface, tracked in #2102 — NOT closed
+    // here): the fail-safe extension term is read from the foreign log WITHOUT
+    // leaf-level authentication, so a forged `TtlExtended` leaf with a far-future
+    // `new_deadline_unix` can LENGTHEN the imported deadline beyond consent. That
+    // is the creator-trust boundary cross-member convergence catches (an honest
+    // member's log carries no such leaf); durable leaf-level authz is deferred
+    // with the rest of the import-legibility surface (#2102). The base-future-
+    // dating + pruning vectors pass-4d listed here are CLOSED (E1/E3).
+    let import_log_entries: Vec<scp_event_log::Event> =
+        rmp_serde::from_slice(&export.event_log_data).unwrap_or_default();
+    if let Some(deadline) = crate::context::ttl_close_helpers::convergent_ttl_deadline(
+        &import_log_entries,
+        export.snapshot.creation_timestamp_secs,
+        handle.params().ttl.map(|t| t.as_secs()),
+    ) {
         deps.supervisor
-            // Import path: arm the CONVERGENT deadline. The signed export
-            // snapshot now carries the creator-assigned `creation_timestamp_secs`
-            // (consumed verbatim above), so the importer reconstructs the
-            // identical `creation + ttl` deadline every member computes (§7.3.1,
-            // §9.9.3). `duration` remains the local sleep interval (= the
-            // persisted `ttl_remaining_secs`); only the recorded leaf deadline is
-            // the convergent value, so a timer-fired `ContextExpired`/
-            // `ContextClosed` leaf no longer diverges by importer-local skew.
-            .dispatch_start_ttl_timer(&context_id, handle.params().clone(), duration, true)
+            .dispatch_start_ttl_timer(&context_id, handle.params().clone(), Some(deadline))
             .await;
     }
 
@@ -2571,7 +2642,8 @@ async fn restore_event_log_best_effort(deps: &ActorDeps, context_id: &str) {
 /// [`SupervisorHandle::spawn_actor_with_state`](crate::context::supervisor::handle::SupervisorHandle::spawn_actor_with_state),
 /// which spawns an actor that OWNS the rehydrated state and registers
 /// its handle in the supervisor registry (no legacy contexts `DashMap`
-/// write). Re-spawns the TTL timer if `ttl_remaining_secs` is `Some`.
+/// write). Re-spawns the TTL timer if the context carries a finite
+/// `params.ttl`, re-arming the absolute convergent deadline.
 ///
 /// `preloaded_snapshot` lets the watchdog respawn path
 /// (`Supervisor::respawn_from_snapshot`) hand in the `ContextSnapshot` it
@@ -2593,7 +2665,7 @@ pub async fn restore_context(
     handle: &ContextHandle,
     preloaded_snapshot: Option<crate::context::state::ContextSnapshot>,
 ) -> Result<(), ContextError> {
-    use crate::context::governance::timeout::{DeadlockDetectionState, GovernanceTimeoutTask};
+    use crate::context::governance::timeout::DeadlockDetectionState;
     use crate::context::lifecycle_logic::{
         derive_message_pricing, sanitize_cooldown_until, validate_consequence_rules_for_import,
     };
@@ -2643,7 +2715,32 @@ pub async fn restore_context(
         now_for_cooldown,
         "restore",
     );
-    let ttl_remaining = ctx_snapshot.ttl_remaining_secs;
+    // Resolve the ABSOLUTE convergent TTL re-arm deadline through the partitioned
+    // single-source deadline (§5.10 / §5.10.1, ADR-049 §9). The create BASE and
+    // PROMOTION come from the PRUNE-IMMUNE snapshot (`creation_timestamp_secs` +
+    // `params.ttl`): a finite `params.ttl` ⇒ base `creation + ttl`; a promoted
+    // context has `params.ttl == None` ⇒ `None` (no re-arm), and that promotion
+    // signal survives even a fully-pruned log. The prunable event log (hydrated by
+    // `restore_event_log_best_effort` above) is read ONLY for the fail-safe
+    // `TtlExtended` extension term (losing one only shortens). This REPLACES the
+    // old trio of independent sources: the persisted `ttl_deadline_secs` scalar
+    // (now a runtime cache, re-derived here, not trusted), the `creation + ttl`
+    // `.or_else` fallback, and the `memory_scope != Full` gate at the dispatch
+    // site (H1). `creation_timestamp_secs` is captured here — before the
+    // per-context builder consumes `ctx_snapshot` fields — off the `Copy` field.
+    let restore_ctx_id_bytes = context_id_to_bytes(context_id);
+    let restore_creation_ts = ctx_snapshot.creation_timestamp_secs;
+    let restore_log_entries = deps
+        .event_log
+        .event_log_entries(&restore_ctx_id_bytes)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let restore_ttl_deadline = crate::context::ttl_close_helpers::convergent_ttl_deadline(
+        &restore_log_entries,
+        restore_creation_ts,
+        handle.params().ttl.map(|t| t.as_secs()),
+    );
 
     let governance_engine =
         restore_governance_engine_from_snapshot(&ctx_snapshot, Arc::clone(&deps.key_resolver))?;
@@ -2822,8 +2919,8 @@ pub async fn restore_context(
         // expiry deadline (`creation + ttl`) identical to what the context had
         // before the restart, so the timer-fired `ContextExpired`/`ContextClosed`
         // leaf stays convergent across members (§7.3.1, §9.9.3). The TTL timer is
-        // re-armed with `anchor_deadline_to_creation = true` (convergent arming)
-        // below.
+        // re-armed below on the ABSOLUTE convergent deadline (the persisted
+        // `ttl_deadline_secs`, or the `creation + ttl` fallback).
         creation_timestamp_secs: ctx_snapshot.creation_timestamp_secs,
         // Placeholder — `spawn_actor_with_state` overwrites this
         // unconditionally with a fresh monotonic `spawn_generation`
@@ -2840,7 +2937,6 @@ pub async fn restore_context(
                 .max(ctx_snapshot.approved_proposals.len() as u64),
             approved_proposals: ctx_snapshot.approved_proposals,
             freeze: ctx_snapshot.governance_freeze,
-            timeout_task: GovernanceTimeoutTask::new(),
             deadlock: DeadlockDetectionState::default(),
             pending_ceiling_modification: ctx_snapshot.pending_ceiling_modification,
             pending_economic_policy_change: ctx_snapshot.pending_economic_policy_change,
@@ -2982,24 +3078,25 @@ pub async fn restore_context(
         .await
         .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
 
-    // Start governance timeout task (ADR-031 §5) via the actor mailbox.
-    crate::context::governance_helpers::start_governance_timeout_task(&deps.supervisor, context_id)
-        .await;
+    // Governance timeouts (ADR-031 §5) are ACTOR-OWNED (ADR-049
+    // Decision-1 / finding A3): the spawned actor's `reconcile_timers`
+    // arms the 60 s interval while `Active` — no bootstrap install needed.
 
-    // Re-spawn TTL timer if there was remaining TTL. Mailbox
-    // StartTtlTimer to the freshly-spawned actor (registry + mailbox
-    // tick — no DashMap reach).
-    if let Some(remaining_secs) = ttl_remaining {
-        let duration = std::time::Duration::from_secs(remaining_secs);
+    // Re-arm the TTL timer from the single authoritative source. Mailbox
+    // StartTtlTimer to the freshly-spawned actor (registry + mailbox tick — no
+    // DashMap reach) IFF the `convergent_ttl_deadline` computed above
+    // (`restore_ttl_deadline`) is `Some`. A `None` means either no finite TTL or
+    // a PROMOTED context — in both cases the timer stays disarmed. Pass-4e
+    // (ADR-049 §9): the disarm decision reads `params.ttl == None` (the SOLE
+    // prune-immune promotion authority), NOT the `ContextPromoted` event-log leaf
+    // — that leaf is a RECORD only and is not consulted for the arm. This is the
+    // H1 fix at the source: it replaces the fragile `memory_scope != Full` gate
+    // (which mis-classified a created-`Full`+ttl broadcast context as permanent
+    // and left it stuck-open). A past deadline arms a `sleep(0)` idempotent
+    // re-close, which is correct.
+    if let Some(deadline) = restore_ttl_deadline {
         deps.supervisor
-            // Restore path: arm the CONVERGENT deadline. The persisted snapshot
-            // now carries the creator-assigned `creation_timestamp_secs`
-            // (restored verbatim above), so the reloaded timer records the same
-            // `creation + ttl` deadline it had before the restart (§7.3.1,
-            // §9.9.3). `duration` remains the local sleep interval (= the
-            // persisted `ttl_remaining_secs`); only the recorded leaf deadline is
-            // the convergent value.
-            .dispatch_start_ttl_timer(context_id, handle.params().clone(), duration, true)
+            .dispatch_start_ttl_timer(context_id, handle.params().clone(), Some(deadline))
             .await;
     }
 
@@ -3242,15 +3339,14 @@ pub async fn shutdown_all_contexts(supervisor: &crate::context::supervisor::Supe
 
     supervisor.clear_wrapping_keys();
 
-    if let Some(task_set) = supervisor.task_set_ref() {
-        let mut tasks = task_set.lock().await;
-        tasks.abort_all();
-    }
+    // No supervisor timer JoinSet to abort: TTL / governance timers are
+    // ACTOR-OWNED arms (ADR-049 finding A3). Despawning each actor above
+    // drops its inbox sender, so its `run()` loop exits and its owned timer
+    // arms are dropped with the task — no separate teardown needed.
 
     tracing::info!(
         removed_count = context_ids.len(),
-        "shutdown: removed all contexts via actor mailbox, cleared identity registries, \
-         and aborted background tasks"
+        "shutdown: removed all contexts via actor mailbox and cleared identity registries"
     );
 }
 

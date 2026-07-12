@@ -263,7 +263,9 @@ pub async fn persist_context_and_broadcast(supervisor: &Supervisor, context_id: 
 /// Must be called while the contexts mutex is held (snapshot under lock).
 pub fn snapshot_context(ctx: &PerContextState) -> ContextSnapshot {
     let state = ctx.handle.state();
-    let ttl_remaining_secs = ctx.ttl.timer.remaining_secs();
+    // Absolute convergent deadline persisted verbatim (ADR-049 §9) — see
+    // `messaging_helpers::build_snapshot_from_state`.
+    let ttl_deadline_secs = ctx.ttl.timer.deadline_unix_secs;
     // Capture grace entries for transactional persistence (§23.11).
     // On clock error, persist an empty vec — the recovery path will
     // treat the missing entries as expired (conservative: forward secrecy
@@ -285,7 +287,7 @@ pub fn snapshot_context(ctx: &PerContextState) -> ContextSnapshot {
             .keys()
             .copied()
             .collect(),
-        ttl_remaining_secs,
+        ttl_deadline_secs,
         registered_outlets: ctx.governance.registered_outlets.clone(),
         read_exclusion_list: ctx.access.read_exclusion_list.clone(),
         outlet_interfaces: ctx.governance.outlet_interfaces.clone(),

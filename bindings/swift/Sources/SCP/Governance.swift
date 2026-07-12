@@ -856,13 +856,16 @@ public extension Context {
 
     /// Resets the TTL timer after a successful unanimous extension.
     ///
-    /// Cancels the old timer and spawns a new one with the given duration.
+    /// EXTENDS the existing convergent TTL deadline by `newSeconds`
+    /// (`oldDeadline + newSeconds`), not a local `now + newSeconds`, so the
+    /// re-armed expiry timestamp stays convergent across members (§7.3.1). It
+    /// does not cancel/respawn a task — the TTL timer is an actor-owned arm.
+    /// A no-op on a context with no armed TTL (no recorded deadline to extend).
     /// Call this after ``proposeTtlExtension(memberDid:proposedSeconds:proposeTtlExtensionFn:)``
     /// returns `true`.
     ///
     /// - Parameters:
-    ///   - newSeconds: The new TTL duration in seconds.
-    ///   - resetTtlTimerFn: Bridge function override for testing.
+    ///   - newSeconds: The additional TTL duration in seconds to extend by.
     /// - Throws: ``ScpError/Context(msg:code:)`` if the context is not active.
     func resetTtlTimer(
         newSeconds: UInt64

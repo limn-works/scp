@@ -14,11 +14,10 @@ use scp_core::context::nesting::ParentRef;
 use scp_core::context::params::{
     CeilingPolicy, ConsequenceConfig, GovernanceModel, MemoryScope, PromotionPolicy,
 };
-use scp_core::context::ttl::{TtlError, TtlPolicy};
 use scp_core::context::{
     Capability, CapabilityCeiling, ContextError, ContextHandle, ContextMode, ContextParams,
     ContextState, ExtensionConsentMode, MembershipState, TemplateId, TtlExtensionProposal,
-    builtin_admin, builtin_author, builtin_member, builtin_observer, builtin_subscriber, check_ttl,
+    builtin_admin, builtin_author, builtin_member, builtin_observer, builtin_subscriber,
     compute_ceiling_intersection, consent_mode_for_member_count, template_params,
     validate_child_ttl, validate_nesting_depth,
 };
@@ -446,31 +445,6 @@ async fn builtin_roles_capabilities() {
     assert_eq!(subscriber.name, "subscriber");
     assert!(subscriber.capabilities.contains(&Capability::MessagesRead));
     assert!(!subscriber.capabilities.contains(&Capability::MessagesWrite));
-}
-
-// ---------------------------------------------------------------------------
-// 14. ttl_check
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn ttl_check() {
-    // No TTL policy: always valid
-    assert!(check_ttl(1000, TtlPolicy::None, None, 999_999).is_ok());
-
-    // Finite TTL, not expired
-    let created_at = 1000;
-    let ttl = TtlPolicy::Finite(Duration::from_hours(1));
-    assert!(check_ttl(created_at, ttl, None, 2000).is_ok());
-
-    // Finite TTL, expired (now >= created_at + ttl_secs)
-    let result = check_ttl(created_at, ttl, None, 5000);
-    assert!(result.is_err());
-    assert!(matches!(result.unwrap_err(), TtlError::Expired));
-
-    // Extended TTL: extended_until takes precedence
-    assert!(check_ttl(created_at, ttl, Some(6000), 5500).is_ok());
-    let result = check_ttl(created_at, ttl, Some(6000), 6001);
-    assert!(result.is_err());
 }
 
 // ---------------------------------------------------------------------------

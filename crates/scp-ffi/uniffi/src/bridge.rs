@@ -14155,8 +14155,19 @@ impl Scp {
             })?
     }
 
-    /// Per-instance equivalent of the free-function
-    /// `context_reset_ttl_timer`.
+    /// Resets the TTL timer after a successful unanimous extension.
+    ///
+    /// EXTENDS the existing convergent TTL deadline by `new_seconds`
+    /// (`old_deadline + new_seconds`), NOT a local `now + new_seconds` — every
+    /// member adds the same duration to the same recorded deadline, so the
+    /// re-armed `ContextExpired`/`ContextClosed` leaf timestamp stays convergent
+    /// across members (§7.3.1). It does NOT cancel/respawn a task: the TTL timer
+    /// is an actor-owned arm and `reconcile_timers` re-derives the one-shot sleep
+    /// from the new recorded deadline (ADR-049 finding A3).
+    ///
+    /// NO-OP on a context with no armed TTL (`deadline_unix_secs == None`): with
+    /// no recorded deadline there is no TTL to extend, so the disarmed timer
+    /// stays disarmed rather than arming a long-past deadline (H2).
     ///
     /// Routes through `&*self.inner`. Silently returns when the handle's
     /// `instance_id` does not match this `SCP`'s (matches the free-function
@@ -14176,9 +14187,9 @@ impl Scp {
                 context_id: handle.context_id.clone(),
                 params: scp_core::context::ContextParams::default(),
                 duration,
-                // Ignored by ResetTtlTimer (extension reset never anchors to
-                // creation).
-                anchor_deadline_to_creation: false,
+                // Ignored by ResetTtlTimer (which extends the existing
+                // convergent deadline by `duration`, not an absolute override).
+                deadline_override: None,
             }),
             reply: tx,
         };

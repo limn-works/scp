@@ -1373,49 +1373,11 @@ pub enum GovernanceCommand {
         /// legacy method's no-error contract).
         reply: oneshot::Sender<Result<(), ContextError>>,
     },
-
-    /// Sweep: run one tick of the governance timeout / consequence
-    /// pipeline for THIS actor's context. Mirrors the per-context body of
-    /// `start_governance_timeout_task_legacy` (Phase 1 through Phase 5).
-    ///
-    /// Dispatched per-actor by the supervisor's iterating sweep entry
-    /// point
-    /// [`governance_helpers::start_governance_timeout_task`](crate::context::governance_helpers::start_governance_timeout_task)
-    /// which still owns timer spawn (the per-actor governance-timeout
-    /// task lands in Phase 2B per ADR-049). For now, the spawn-time
-    /// closure dispatches this command on each tick instead of
-    /// reaching into the supervisor's `contexts` DashMap directly.
-    ///
-    /// Reply carries `Ok(continue_loop)` — `true` to keep ticking,
-    /// `false` to stop (context closing or removed). Matches the
-    /// legacy timer closure's `bool` return.
-    EvaluateTimeouts {
-        /// Oneshot reply channel. `Ok(true)` continues the timer loop;
-        /// `Ok(false)` stops it.
-        reply: oneshot::Sender<Result<bool, ContextError>>,
-    },
-
-    /// Install (or reinstall) THIS actor's governance-timeout interval
-    /// task on actor-owned state.
-    ///
-    /// The handler spawns the 60-second interval loop onto the
-    /// supervisor's tracked `task_set` via
-    /// [`SupervisorHandle::tracked_spawn`](crate::context::supervisor::handle::SupervisorHandle::tracked_spawn)
-    /// and stores its cancel `Notify` + `AbortHandle` on
-    /// `state.governance.timeout_task`. On each wake the task resolves
-    /// the owning actor through
-    /// [`SupervisorHandle::lookup`](crate::context::supervisor::handle::SupervisorHandle::lookup)
-    /// and mailboxes [`Self::EvaluateTimeouts`] — no `&Supervisor` /
-    /// `contexts` DashMap reach, no stale-generation gate.
-    ///
-    /// Dispatched by the lifecycle bootstrap paths (`finalize_create`,
-    /// `restore_context`, `import_context`) after actor spawn, since
-    /// those hold only `&ActorDeps` (no `&mut state`).
-    StartTimeoutTask {
-        /// Oneshot reply channel. `Ok(())` once the interval task is
-        /// installed.
-        reply: oneshot::Sender<Result<(), ContextError>>,
-    },
+    // NOTE (ADR-049 Decision-1 / finding A3): the former `EvaluateTimeouts`
+    // and `StartTimeoutTask` variants were retired. The governance-timeout
+    // sweep is now ACTOR-OWNED — `ContextActor`'s `governance_timeout`
+    // interval arm calls `handlers::governance::evaluate_governance_timeouts`
+    // directly, with no supervisor-driven `task_set` spawn or mailbox hop.
 }
 
 /// Reply-channel type alias for [`BroadcastCommand::SubscribeBroadcast`].
@@ -2046,24 +2008,28 @@ pub struct TtlContextPayload {
 pub struct TtlTimerPayload {
     /// Context identifier string.
     pub context_id: String,
-    /// Context params — used to rebuild the ephemeral handle that
-    /// the timer task will pass to `run_ttl_expiry_with_retries`.
+    /// Context params — for `StartTtlTimer` the TTL duration (`params.ttl`)
+    /// supplies the convergent `creation + ttl` expiry deadline the handler
+    /// falls back to when no explicit `deadline_override` is given.
     pub params: scp_protocol::context::params::ContextParams,
-    /// TTL duration. Fires relative to the dispatcher's clock for
-    /// `StartTtlTimer`; the replacement duration for
-    /// `ResetTtlTimer`.
+    /// The replacement/additional TTL duration for `ResetTtlTimer` — the agreed
+    /// extension added to the EXISTING recorded deadline (`old_deadline +
+    /// duration`, §7.3.1 convergent bilateral reset). Ignored by
+    /// `StartTtlTimer`, which records an absolute `deadline_override` instead.
     pub duration: std::time::Duration,
-    /// When `true` (the initial-create `StartTtlTimer` path), the handler
-    /// records a CONVERGENT expiry deadline anchored on the actor's
-    /// `creation_timestamp_secs + params.ttl` — every member computes the
-    /// identical absolute deadline, so the `ContextExpired`/`ContextClosed`
-    /// leaf timestamp is convergent-by-construction (§7.3.1, §9.9.3). When
-    /// `false`, the deadline is armed relative to the local clock (the prior
-    /// behaviour) — for a caller with no convergent creation base. The
-    /// initial-create, restore, and import paths all pass `true`: the
-    /// persisted snapshot carries `creation_timestamp_secs`. Ignored by
-    /// `ResetTtlTimer`, which never anchors to creation.
-    pub anchor_deadline_to_creation: bool,
+    /// Absolute convergent expiry deadline to record for `StartTtlTimer`, as a
+    /// [`ConvergentDeadline`](crate::context::ttl_close_helpers::ConvergentDeadline)
+    /// — the transient arming-seam newtype, carried in-process across this
+    /// (never-serialized) mailbox command, NEVER persisted (B2). `Some(d)`
+    /// installs `d` verbatim — the restore/import paths pass the deadline derived
+    /// from the SINGLE authoritative source (the event log) via
+    /// `convergent_ttl_deadline`, so a prior extension survives and a
+    /// `None`-remaining Active snapshot still re-arms (D1/D2). `None` (the
+    /// initial-create / spawn-from-Welcome path) defers to the handler's
+    /// create-base derivation. Every member computes the identical absolute
+    /// deadline, so the `ContextExpired`/`ContextClosed` leaf timestamp is
+    /// convergent-by-construction (§7.3.1, §9.9.3). Ignored by `ResetTtlTimer`.
+    pub deadline_override: Option<crate::context::ttl_close_helpers::ConvergentDeadline>,
 }
 
 /// See [`ContextCommand::TtlClose`]. Real variants land in commit 9 of
@@ -2073,45 +2039,28 @@ pub struct TtlTimerPayload {
 /// surface one-to-one. The handler shim delegates to the legacy method
 /// under the hood.
 ///
-/// **TTL timer specifics (commit 9 scope).** The post-refactor
-/// architecture turns the TTL timer into a `select!` arm in
-/// [`ContextActor::run`](crate::context::actor::ContextActor). Commit 9
-/// keeps the timer spawned from the legacy
-/// [`Supervisor`](crate::context::supervisor::Supervisor) internals
-/// (`spawn_ttl_timer`); the handler variants here respond to
-/// caller-initiated TTL commands (extend, finalize, explicit expiry)
-/// synchronously. Full timer-owning actor logic migrates with plan row
-/// 11.
+/// **TTL timer specifics (ADR-049 finding A3).** The TTL timer is an
+/// ACTOR-OWNED `select!` arm in
+/// [`ContextActor::run`](crate::context::actor::ContextActor): the arming
+/// variants here (`StartTtlTimer` / `ResetTtlTimer` / `ExtendTtl`) record the
+/// convergent `state.ttl.timer.deadline_unix_secs`, and the actor's
+/// `reconcile_timers` derives a one-shot `sleep` from it and runs the expiry
+/// pipeline on wake — no supervisor-spawned timer task.
 pub enum TtlCloseCommand {
-    /// Fires a single TTL tick on THIS actor: evaluate whether the
-    /// context's TTL has elapsed and, if so, run the close pipeline on the
-    /// actor-owned state.
+    // NOTE (ADR-049 Decision-1 / finding A3): the former `FireTimer`
+    // variant was retired. TTL expiry is now driven by an ACTOR-OWNED
+    // one-shot timer arm — `ContextActor::reconcile_timers` arms a `sleep`
+    // against `state.ttl.timer.deadline_unix_secs` and `on_ttl_tick` runs
+    // `ttl_close_helpers::handle_ttl_expiry` directly, with no
+    // supervisor-driven `task_set` spawn or mailbox tick. The arming
+    // variants below (`StartTtlTimer` / `ResetTtlTimer` / `ExtendTtl`)
+    // still record the deadline the actor arm reconciles against.
+    /// Records the TTL expiry deadline for the given context on actor-owned
+    /// state via `ttl_close_helpers::start_ttl_timer` at `create_context` /
+    /// `restore_context` time. The actor's `reconcile_timers` re-derives the
+    /// one-shot expiry sleep from it.
     ///
-    /// Sent by the per-context TTL timer task (spawned at
-    /// `create_context` / `restore_context` time) on each wake. The task
-    /// holds no `&Supervisor` and reads no DashMap; it resolves the actor
-    /// via [`Supervisor::lookup`](crate::context::supervisor::Supervisor::lookup)
-    /// (lock-free registry) and mailboxes this command. A `lookup → None`
-    /// (actor gone) replaces the legacy stale-generation gate: the timer
-    /// task stops when the context's actor no longer exists.
-    ///
-    /// Replaces the legacy `spawn_ttl_timer_legacy` task that probed
-    /// `contexts_arc.get(ctx).generation` for the stale-gen gate and held
-    /// the supervisor's `task_set` (ADR-049 Phase 2A finalization — DashMap
-    /// removal). The handler operates on the actor's owned `&mut state`.
-    FireTimer {
-        /// Oneshot reply channel. `Ok(true)` iff the timer should keep
-        /// running (context still open); `Ok(false)` once the close
-        /// pipeline has fired so the task can exit.
-        reply: oneshot::Sender<Result<bool, ContextError>>,
-    },
-
-    /// Spawns (or respawns) the TTL timer for the given context with a
-    /// caller-supplied duration. Installed on actor-owned state by
-    /// `ttl_close_helpers::spawn_ttl_timer` at `create_context` /
-    /// `restore_context` time.
-    ///
-    /// `Ok(())` once the timer has been successfully installed.
+    /// `Ok(())` once the deadline has been recorded.
     StartTtlTimer {
         /// Boxed owned payload — see [`TtlTimerPayload`].
         payload: Box<TtlTimerPayload>,
@@ -2154,10 +2103,13 @@ pub enum TtlCloseCommand {
     /// Executes a caller-initiated TTL expiry. Mirrors
     /// [`handle_ttl_expiry`](crate::context::ttl_close_helpers::handle_ttl_expiry).
     ///
-    /// In commit 9 this is the explicit-expiry entry point; the timer
-    /// task spawned by `StartTtlTimer` still runs the automatic path
-    /// internally. Commit 11 converges both paths onto the actor's
-    /// `select!` arm.
+    /// This is the EXPLICIT-expiry entry point (an FFI
+    /// `context_handle_ttl_expiry` request); the AUTOMATIC path is driven
+    /// off the actor-owned TTL timer arm in `ContextActor::run()`
+    /// (`on_ttl_tick`), which reconciles a one-shot sleep against the
+    /// deadline `StartTtlTimer` records — no supervisor-spawned timer task.
+    /// Both paths run the same actor-owned expiry pipeline against the
+    /// actor's real state.
     ExecuteTtlClose {
         /// Boxed owned payload — see [`TtlContextPayload`].
         payload: Box<TtlContextPayload>,

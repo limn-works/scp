@@ -292,7 +292,7 @@ use super::state::{
     WelcomeProcessing,
 };
 use crate::context::ContextHandle;
-use crate::context::governance::timeout::{DeadlockDetectionState, GovernanceTimeoutTask};
+use crate::context::governance::timeout::DeadlockDetectionState;
 use crate::context::messaging_helpers::{persist_state_best_effort, persist_state_fail_closed};
 use crate::context::state::{
     AccessControlState, CommitFaultMarker, EpochState, GovernanceClassS, GovernanceState,
@@ -927,8 +927,6 @@ pub(crate) struct GovernanceClassCMut<'a> {
     next_proposal_seq: &'a mut u64,
     /// `&mut` to the governance freeze state (ADR-031 §7).
     freeze: &'a mut Option<(ProposalId, ProposalId, u64)>,
-    /// `&mut` to the governance timeout task handle (SCP-271, ADR-031 §5).
-    timeout_task: &'a mut GovernanceTimeoutTask,
     /// `&mut` to the per-context deadlock detection state (ADR-031 §10).
     deadlock: &'a mut DeadlockDetectionState,
     /// `&mut` to the pending ceiling modification (M7, §5.3.2).
@@ -959,7 +957,7 @@ pub(crate) struct GovernanceClassCMut<'a> {
 
 #[allow(
     dead_code,
-    reason = "ADR-049 §9 scaffolding: the field-granular Class-C governance accessors (`velocity_tracker_mut`, `budget_tracker_mut`, `cooldown_until_mut`, `economic_policy_mut`, `next_proposal_seq`, `next_proposal_seq_mut`, `engine_mut`, `approved_proposals_mut`, `freeze_mut`, `timeout_task_mut`, `deadlock_mut`, `pending_ceiling_modification_mut`, `pending_economic_policy_change_mut`, `registered_outlets_mut`, `outlet_interfaces_mut`, `pruning_policy_mut`, `last_known_members_mut`, `pending_epoch_resets_mut`, `consequence_rules_mut`, `participation_cache_mut`, `message_pricing_mut`, `hard_rate_limit_mut`, `proposal_timestamps_mut`, `evict_stale_entries`, `detection_borrows`) get their first PRODUCTION callers when the best-effort handlers + `ConsequenceStateSplit` / economy-compensation paths migrate onto the combinators. Exercised by this module's unit tests now."
+    reason = "ADR-049 §9 scaffolding: the field-granular Class-C governance accessors (`velocity_tracker_mut`, `budget_tracker_mut`, `cooldown_until_mut`, `economic_policy_mut`, `next_proposal_seq`, `next_proposal_seq_mut`, `engine_mut`, `approved_proposals_mut`, `freeze_mut`, `deadlock_mut`, `pending_ceiling_modification_mut`, `pending_economic_policy_change_mut`, `registered_outlets_mut`, `outlet_interfaces_mut`, `pruning_policy_mut`, `last_known_members_mut`, `pending_epoch_resets_mut`, `consequence_rules_mut`, `participation_cache_mut`, `message_pricing_mut`, `hard_rate_limit_mut`, `proposal_timestamps_mut`, `evict_stale_entries`, `detection_borrows`) get their first PRODUCTION callers when the best-effort handlers + `ConsequenceStateSplit` / economy-compensation paths migrate onto the combinators. Exercised by this module's unit tests now."
 )]
 impl<'a> GovernanceClassCMut<'a> {
     /// Wrap a borrowed [`GovernanceState`] by DESTRUCTURING it into the
@@ -992,7 +990,6 @@ impl<'a> GovernanceClassCMut<'a> {
             approved_proposals,
             next_proposal_seq,
             freeze,
-            timeout_task,
             deadlock,
             pending_ceiling_modification,
             pending_economic_policy_change,
@@ -1022,7 +1019,6 @@ impl<'a> GovernanceClassCMut<'a> {
             approved_proposals,
             next_proposal_seq,
             freeze,
-            timeout_task,
             deadlock,
             pending_ceiling_modification,
             pending_economic_policy_change,
@@ -1100,12 +1096,6 @@ impl<'a> GovernanceClassCMut<'a> {
     /// structural liveness state.
     pub(crate) const fn freeze_mut(&mut self) -> &mut Option<(ProposalId, ProposalId, u64)> {
         self.freeze
-    }
-
-    /// `&mut` access to the governance timeout task handle (SCP-271, ADR-031 §5).
-    /// Class-C: a transient task handle, not durable authorization state.
-    pub(crate) const fn timeout_task_mut(&mut self) -> &mut GovernanceTimeoutTask {
-        self.timeout_task
     }
 
     /// `&mut` access to the per-context deadlock detection state (ADR-031 §10).
@@ -1266,7 +1256,6 @@ impl<'a> GovernanceClassCMut<'a> {
             approved_proposals: &mut *self.approved_proposals,
             next_proposal_seq: &mut *self.next_proposal_seq,
             freeze: &mut *self.freeze,
-            timeout_task: &mut *self.timeout_task,
             deadlock: &mut *self.deadlock,
             pending_ceiling_modification: &mut *self.pending_ceiling_modification,
             pending_economic_policy_change: &mut *self.pending_economic_policy_change,

@@ -4709,6 +4709,18 @@ pub(crate) async fn context_propose_ttl_extension_on(
 
 /// Per-bridge-instance implementation of [`context_reset_ttl_timer`].
 ///
+/// EXTENDS the existing convergent TTL deadline by `new_duration_secs`
+/// (`old_deadline + new_duration_secs`), NOT a local `now + duration` — every
+/// member adds the same duration to the same recorded deadline, so the re-armed
+/// `ContextExpired`/`ContextClosed` leaf timestamp stays convergent across
+/// members (§7.3.1). It does NOT cancel/respawn a task: the TTL timer is an
+/// actor-owned arm and `reconcile_timers` re-derives the one-shot sleep from the
+/// new recorded deadline (ADR-049 finding A3).
+///
+/// NO-OP on a context with no armed TTL (`deadline_unix_secs == None`): with no
+/// recorded deadline there is no TTL to extend, so the disarmed timer stays
+/// disarmed rather than arming a long-past deadline (H2).
+///
 /// Routed through the ADR-049 TTL-close dispatch surface. Requires a core
 /// handle and a new duration.
 pub(crate) async fn context_reset_ttl_timer_on(
@@ -4727,9 +4739,9 @@ pub(crate) async fn context_reset_ttl_timer_on(
             context_id: core_handle.context_id().to_owned(),
             params: core_handle.params().clone(),
             duration,
-            // Ignored by ResetTtlTimer (extension reset never anchors to
-            // creation).
-            anchor_deadline_to_creation: false,
+            // Ignored by ResetTtlTimer (which extends the existing convergent
+            // deadline by `duration`, not an absolute override).
+            deadline_override: None,
         }),
         reply: tx,
     };

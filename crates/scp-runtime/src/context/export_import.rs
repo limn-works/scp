@@ -721,7 +721,7 @@ fn strip_snapshot_for_public(snapshot: &ContextSnapshot) -> Result<ContextSnapsh
         role_state,
         event_log_merkle_root: [0u8; 32],
         executed_proposals: HashSet::new(),
-        ttl_remaining_secs: snapshot.ttl_remaining_secs,
+        ttl_deadline_secs: snapshot.ttl_deadline_secs,
         registered_outlets: Vec::new(),
         read_exclusion_list: HashSet::new(),
         outlet_interfaces: Vec::new(),
@@ -958,7 +958,7 @@ mod tests {
             role_state,
             event_log_merkle_root: [0u8; 32],
             executed_proposals: HashSet::new(),
-            ttl_remaining_secs: None,
+            ttl_deadline_secs: None,
             registered_outlets: Vec::new(),
             outlet_interfaces: Vec::new(),
             threshold_signers: Vec::new(),
@@ -1237,7 +1237,7 @@ mod tests {
             create_event_log_data(&ctx_id_bytes, &["E1", "E2", "E3", "E4", "E5"]).await;
 
         let mut snapshot = test_snapshot("ctx-roundtrip-3");
-        snapshot.ttl_remaining_secs = Some(3600);
+        snapshot.ttl_deadline_secs = Some(3600);
         snapshot.threshold_value = 42;
 
         let export = create_export(
@@ -1253,7 +1253,7 @@ mod tests {
         let bytes = serialize_export(&export).unwrap();
         let decoded = deserialize_export(&bytes).unwrap();
 
-        assert_eq!(decoded.snapshot.ttl_remaining_secs, Some(3600));
+        assert_eq!(decoded.snapshot.ttl_deadline_secs, Some(3600));
         assert_eq!(decoded.snapshot.threshold_value, 42);
         assert_eq!(decoded.scope, ExportScope::Full);
         assert_eq!(decoded.exporter_did.as_ref(), TEST_CREATOR_DID);
@@ -2807,8 +2807,9 @@ mod tests {
     /// TTL expiry deadline from the SAME convergent `creation_timestamp_secs`
     /// carried in the snapshot — i.e. the deadline is a function of the signed
     /// creation time and the TTL only, never of importer-local `now()`. This is
-    /// the convergence the import/restore arming (`anchor_deadline_to_creation =
-    /// true`) relies on.
+    /// the convergence the import/restore arming (the resolved absolute
+    /// `deadline_override`, `creation + ttl` when no persisted deadline exists)
+    /// relies on.
     #[test]
     fn skewed_importers_derive_identical_ttl_deadline_from_snapshot() {
         use crate::context::ttl_close_helpers::convergent_ttl_deadline_secs;
@@ -2830,62 +2831,44 @@ mod tests {
             "importers reading the same convergent creation time must agree on the deadline"
         );
         assert_eq!(
-            alice_deadline,
+            alice_deadline.map(crate::context::ttl_close_helpers::ConvergentDeadline::as_secs),
             Some(1_700_000_000 + 86_400),
             "the deadline must be creation_timestamp_secs + ttl, not a local-clock value"
         );
     }
 
-    /// Cross-bridge convergence with a FUTURE-dated creation time: when the
-    /// signed snapshot's `creation_timestamp_secs` is strictly GREATER than the
-    /// importer's local `now` (legitimate clock skew within the ±5-min tolerance,
-    /// or a creator that stamped a slightly-future creation), the native importer
-    /// consumes the field VERBATIM (it does NOT clamp to importer-`now`) and arms
-    /// `creation + ttl` (`handle_ttl_expiry` stamps `creation.saturating_add(ttl)`
-    /// with no `now` clamp), so every honest importer of the same snapshot records
-    /// the IDENTICAL `ContextExpired` leaf and converges its event-log root at
-    /// equal event count. A residual importer-`now` clamp on any side would stamp
-    /// the SHORTER `now + ttl`, diverging the leaf (§7.3.1, §9.9.3).
+    /// The create-base PRIMITIVE (`convergent_ttl_deadline_secs`) consumes its
+    /// creation-time argument VERBATIM (`creation + ttl`) — the prune-immune base
+    /// of the partitioned single-source deadline (ADR-049 §9), used both at
+    /// context creation and inside `convergent_ttl_deadline`. On the UNTRUSTED
+    /// cross-node IMPORT path the same `snapshot.creation_timestamp_secs` feeds the
+    /// base, but a future-dated creation is REJECTED at the import boundary (E3),
+    /// so no clamp is needed here. This test pins ONLY the create-base primitive.
     #[test]
-    fn future_dated_creation_is_consumed_verbatim() {
+    fn create_base_primitive_is_verbatim() {
         use crate::context::ttl_close_helpers::convergent_ttl_deadline_secs;
 
-        // Importer's local clock; the snapshot creation is 2 minutes in its
-        // future (well within the ±5-min skew tolerance).
-        let importer_now = 1_700_000_000_u64;
-        let creation = importer_now + 120;
+        let creation = 1_700_000_120_u64;
         let ttl = 86_400_u64;
-        assert!(
-            creation > importer_now,
-            "test precondition: snapshot creation must be in the importer's future"
-        );
 
-        let mut snapshot = test_snapshot("ctx-future-creation-verbatim");
+        let mut snapshot = test_snapshot("ctx-create-base-verbatim");
         snapshot.creation_timestamp_secs = creation;
 
-        // Native deadline from the verbatim snapshot field. There is no
-        // importer-`now` clamp anywhere on this path.
-        let native_deadline =
-            convergent_ttl_deadline_secs(snapshot.creation_timestamp_secs, Some(ttl));
+        // Create-base primitive: `creation + ttl` verbatim, no clamp.
+        let base = convergent_ttl_deadline_secs(snapshot.creation_timestamp_secs, Some(ttl));
         assert_eq!(
-            native_deadline,
+            base.map(crate::context::ttl_close_helpers::ConvergentDeadline::as_secs),
             Some(creation + ttl),
-            "native must arm creation + ttl verbatim, NOT a clamped importer_now + ttl"
-        );
-        assert_ne!(
-            native_deadline,
-            Some(importer_now + ttl),
-            "a clamp to importer_now would have produced this SHORTER deadline — the bug FIX 1 closes"
+            "the create-base primitive arms creation + ttl verbatim"
         );
 
-        // Independent verbatim deadline math for the SAME field (mirrors
-        // `handle_ttl_expiry`'s `creation.saturating_add(ttl)` consumption).
+        // Independent verbatim deadline math for the SAME field.
         let verbatim_deadline = creation.saturating_add(ttl);
         assert_eq!(
-            native_deadline,
+            base.map(crate::context::ttl_close_helpers::ConvergentDeadline::as_secs),
             Some(verbatim_deadline),
-            "every honest importer of the same future-dated signed snapshot \
-             must derive the IDENTICAL TTL deadline"
+            "every member computing the create base from the same convergent \
+             creation time derives the IDENTICAL deadline"
         );
     }
 }

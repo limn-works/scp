@@ -212,6 +212,37 @@ impl std::fmt::Display for ContextState {
     }
 }
 
+impl ContextState {
+    /// Returns `true` for the PERMANENT-terminal states — the states from which
+    /// no further transition is ever permitted and the context id is finished
+    /// for good: `Expired`, `Closed`, and `Tombstoned` (see the state-machine
+    /// doc above; ADR-008 / spec §5.11A).
+    ///
+    /// This is the closed-by-construction predicate for "a durable snapshot in
+    /// this state must never be resurrected" — used by the actor's TTL-expiry
+    /// despawn gate ([`crate::context`] consumers in `scp-runtime`) and the B8
+    /// create-time terminal-snapshot precheck. The `match` is EXHAUSTIVE so
+    /// adding a future `ContextState` variant is a compile error here until its
+    /// terminality is decided, rather than silently falling outside an ad-hoc
+    /// `matches!(…)` set.
+    ///
+    /// Deliberately EXCLUDES the transient/recoverable states:
+    /// - `Closing` / `MigratingOut` — in-progress transitions that still resolve
+    ///   to a terminal state (or back to `Active`); callers that must also treat
+    ///   those as "not live" keep their own `Closing`-inclusive checks.
+    /// - `Poisoned` — dormant but RECOVERABLE via operator-driven respawn
+    ///   (ADR-049 §10); it is not a permanent tombstone.
+    #[must_use]
+    pub const fn is_terminal(&self) -> bool {
+        match self {
+            Self::Expired | Self::Closed | Self::Tombstoned => true,
+            Self::Creating | Self::Active | Self::Closing | Self::MigratingOut | Self::Poisoned => {
+                false
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // ContextError
 // ---------------------------------------------------------------------------
