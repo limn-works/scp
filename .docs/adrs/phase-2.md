@@ -531,7 +531,7 @@ pub struct TestVector {
 }
 ```
 
-2. **`register_tool(context: &ContextHandle, registration: OutletRegistration, registrant_did: &DID) -> Result<OutletId, OutletError>`**
+2. **`register_outlet(context: &ContextHandle, registration: OutletRegistration, registrant_did: &DID) -> Result<OutletId, OutletError>`**
    - Validates registrant has `OutletRegister` capability via UCAN (ADR-009).
    - Validates input and output schemas are valid JSON Schema.
    - Validates implementation hash is 32 bytes.
@@ -540,7 +540,7 @@ pub struct TestVector {
    - Appends `OutletRegistered` event to event log with full registration metadata.
    - Returns the outlet ID.
 
-3. **`invoke_tool(context: &ContextHandle, outlet_id: &OutletId, input: serde_json::Value, invoker_did: &DID) -> Result<serde_json::Value, OutletError>`**
+3. **`invoke_outlet(context: &ContextHandle, outlet_id: &OutletId, input: serde_json::Value, invoker_did: &DID) -> Result<serde_json::Value, OutletError>`**
    - Validates context state is `Active`.
    - Validates invoker has `OutletQuery(outlet_id)`/`OutletQueryAll` (Query) or `OutletCall(outlet_id)`/`OutletCallAll` (Action) capability via UCAN.
    - Validates input against the outlet's input schema.
@@ -609,14 +609,14 @@ pub enum OutletErrorCode {
 - `OutletRequest` and `OutletResponse` are both recorded as events in the context's event log (ADR-011).
 - The event includes: `request_id`, `outlet_id`, `invoker_did`, `status`, `execution_time_ms`, `SHA256(input)`, `SHA256(output)`. Full input/output is NOT recorded (may be large); only content hashes are stored.
 
-4. **`update_tool(context: &ContextHandle, outlet_id: &OutletId, new_registration: OutletRegistration, updater_did: &DID) -> Result<(), OutletError>`**
+4. **`update_outlet(context: &ContextHandle, outlet_id: &OutletId, new_registration: OutletRegistration, updater_did: &DID) -> Result<(), OutletError>`**
    - Validates updater is the outlet's operator DID or has admin role.
    - Records old and new implementation hashes.
    - Updates the outlet registration.
    - Appends `OutletUpdated` event to event log (includes old hash, new hash, all changed fields).
    - Outlet mutations are visible to all context members.
 
-5. **`verify_tool(context: &ContextHandle, outlet_id: &OutletId) -> Result<OutletVerificationResult, OutletError>`**
+5. **`verify_outlet(context: &ContextHandle, outlet_id: &OutletId) -> Result<OutletVerificationResult, OutletError>`**
    - Runs all test vectors against the outlet.
    - For each test vector: invoke outlet with test input, compare output to expected output.
    - Returns a result with per-vector pass/fail status and overall integrity assessment.
@@ -636,7 +636,7 @@ pub struct OutletInterface {
 ```
 
    - **`expose_outlet(context: &ContextHandle, outlet_id: &OutletId, to_context: &ContextId) -> Result<OutletInterface, OutletError>`**: Initiates an outlet interface proposal from the source context. Requires admin capability.
-   - **`accept_tool_interface(context: &ContextHandle, interface: &OutletInterface) -> Result<(), OutletError>`**: Target context accepts the interface. Requires admin capability. Both `approved_by_source` and `approved_by_target` must be true before calls are permitted.
+   - **`accept_outlet_interface(context: &ContextHandle, interface: &OutletInterface) -> Result<(), OutletError>`**: Target context accepts the interface. Requires admin capability. Both `approved_by_source` and `approved_by_target` must be true before calls are permitted.
    - **`invoke_cross_context(source_context: &ContextHandle, interface: &OutletInterface, input: serde_json::Value, invoker_did: &DID) -> Result<serde_json::Value, OutletError>`**: Invokes an outlet across context boundaries. Source context governance checks outbound. Target context governance checks inbound. Both event logs record the call with provenance.
    - Rate limiting enforced per interface.
 
@@ -667,7 +667,7 @@ pub struct OutletSession {
 | `mod.rs` | Module root, `OutletId` type, re-exports |
 | `registry.rs` | `OutletRegistration`, outlet storage per context, `register_outlet`, `update_outlet`, `verify_outlet` |
 | `invoke.rs` | `invoke_outlet`, input/output schema validation, outlet dispatch |
-| `interface.rs` | `OutletInterface`, `expose_tool`, `accept_tool_interface`, `invoke_cross_context`, rate limiting |
+| `interface.rs` | `OutletInterface`, `expose_outlet`, `accept_outlet_interface`, `invoke_cross_context`, rate limiting |
 | `session.rs` | `OutletSession`, `create_session`, `invoke_session`, TTL cleanup task |
 | `schema.rs` | JSON Schema validation helpers, MCP compatibility utilities |
 | `lifecycle.rs` | `OutletRequest`, `OutletResponse`, `OutletCancel`, `OutletStatus`, timeout management, cancellation handling |
