@@ -8,7 +8,7 @@ This is not the same as local data import. Local import (scraping your own data,
 
 ## 12.2 Bridge Connectors as Protocol Entities
 
-A bridge connector is a registered protocol entity — distinct from agents, tools, and contexts. It translates between an external platform's native protocol and SCP's protocol semantics.
+A bridge connector is a registered protocol entity — distinct from agents, outlets, and contexts. It translates between an external platform's native protocol and SCP's protocol semantics.
 
 ```
 ┌───────────────────────────────────────────────────────────────────┐
@@ -876,7 +876,7 @@ The security benefit of self-hosting is operational, not protocol-level: the cre
 
 ## 12.12 Wire Format Tables
 
-This section tabulates the wire format for all bridge protocol types that cross the network. All types use serde serialization (JSON for tool call payloads, MessagePack for MLS application messages and event log entries). An independent implementer MUST implement these types with exactly the field names, types, and semantics shown below. All constants referenced here are defined in §9.18.
+This section tabulates the wire format for all bridge protocol types that cross the network. All types use serde serialization (JSON for outlet call payloads, MessagePack for MLS application messages and event log entries). An independent implementer MUST implement these types with exactly the field names, types, and semantics shown below. All constants referenced here are defined in §9.18.
 
 ### 12.12.1 Core Bridge Entities
 

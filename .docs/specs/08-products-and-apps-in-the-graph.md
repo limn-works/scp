@@ -4,7 +4,7 @@
 
 An app is not a protocol entity. It has no DID, is not an agent, and is not a context. The protocol has no `App` type.
 
-What people experience as "an app" is a composite: a context (or set of contexts) + its members + its data + the backend, hosting, and relays that support it. The client is just the visible surface. The app's identity is the whole gestalt — the community, the infrastructure, the accumulated state. This is a philosophical identity, not a codified one. The protocol doesn't need to model it because the constituent parts (contexts, members, tools, data, capability declarations) are already first-class. The app emerges from their composition.
+What people experience as "an app" is a composite: a context (or set of contexts) + its members + its data + the backend, hosting, and relays that support it. The client is just the visible surface. The app's identity is the whole gestalt — the community, the infrastructure, the accumulated state. This is a philosophical identity, not a codified one. The protocol doesn't need to model it because the constituent parts (contexts, members, outlets, data, capability declarations) are already first-class. The app emerges from their composition.
 
 What the protocol *does* ensure is that this emergent identity never becomes lock-in: protocol state is portable (§8.3), clients are switchable, and no app owns the social graph.
 
@@ -12,13 +12,13 @@ What the protocol *does* ensure is that this emergent identity never becomes loc
 
 Apps declare what capabilities they need from the protocol. The protocol provides them. The interface is self-documenting and machine-readable, optimized for agent consumption rather than human developers hand-coding against it.
 
-Apps can be any shape: thick clients with minimal protocol reliance, thin shells that are mostly protocol, or anything in between. The protocol doesn't care. It provides identity, social graph, contexts, tools, trust, and transport. The app decides what to use.
+Apps can be any shape: thick clients with minimal protocol reliance, thin shells that are mostly protocol, or anything in between. The protocol doesn't care. It provides identity, social graph, contexts, outlets, trust, and transport. The app decides what to use.
 
 ## 8.3 Context Portability and State Layering
 
 State in SCP exists at two layers:
 
-**Protocol state** — membership, roles, capability tokens, tool registrations, governance model, content history, trust relationships. This belongs to the protocol and the context, not to any app. It is portable, app-independent, and survives app death. Any app that declares the right capabilities can attach to an existing context and access its protocol state.
+**Protocol state** — membership, roles, capability tokens, outlet registrations, governance model, content history, trust relationships. This belongs to the protocol and the context, not to any app. It is portable, app-independent, and survives app death. Any app that declares the right capabilities can attach to an existing context and access its protocol state.
 
 **App state** — data structures, configurations, and artifacts specific to a particular app's functionality. A game's world state. A project tracker's task board. A collaborative document's edit history. This belongs to the app. It may live in the context (stored via protocol data primitives) or entirely outside it (in the app's own infrastructure). The protocol doesn't claim ownership of app state, and apps are free to manage it however they choose.
 
@@ -109,7 +109,7 @@ The capability declaration uses JSON Schema (MCP-compatible) with SCP-specific e
 2. Verify `signature` against `app_id`.
 3. For each requested capability, check that the capability category exists in the context's ceiling (§5.3) AND the agent's role includes the requested actions.
 4. If all capabilities are grantable, the declaration is accepted. If any capability is denied, the entire declaration is rejected (all-or-nothing). The rejection response includes a `denied_capabilities` array listing which capabilities failed and why.
-5. The validated declaration is stored in the context's tool registry for auditability.
+5. The validated declaration is stored in the context's outlet registry for auditability.
 
 ### 8.4.2 SDK-Level Enforcement
 
@@ -147,8 +147,8 @@ MCP (Model Context Protocol) defines how AI models connect to tools and data sou
 │                                                        │
 │  MCP server (local side) ←→ SCP participant (network) │
 │                                                        │
-│  - Exposes context tools as MCP tool schemas          │
-│  - Filters tools by role + capability tokens          │
+│  - Exposes context outlets as MCP tool schemas        │
+│  - Filters outlets by role + capability tokens          │
 │  - Signs with #active or #agent from human's DID      │
 │  - Encrypts/decrypts context envelopes                │
 │  - Surfaces context events as MCP resources           │
@@ -156,7 +156,7 @@ MCP (Model Context Protocol) defines how AI models connect to tools and data sou
                      │ SCP Protocol (encrypted, over transport)
                      │
 ┌────────────────────▼─────────────────────────────────┐
-│  SCP Context [tools, roles, members, governance]      │
+│  SCP Context [outlets, roles, members, governance]      │
 └──────────────────────────────────────────────────────┘
 ```
 
@@ -164,21 +164,21 @@ The SCP agent is a translation layer: an MCP server from the model's perspective
 
 **Any MCP-compatible model participates in SCP without modification.** The model doesn't need to know about DIDs, capability tokens, encryption, or context governance. It sees tools. "Send a message" is a tool call. "Read recent messages" is a tool call. "Invoke the scheduling tool" is a tool call. The agent handles everything SCP-specific.
 
-**SCP tool schemas should use MCP's format.** If SCP defines its tool interface using MCP-compatible JSON schemas, then SCP context tools are natively MCP-compatible with zero translation. The agent passes tool schemas through directly. This is a concrete design decision: SCP tool definitions should be a superset of MCP tool definitions, adding SCP-specific metadata (context scope, capability requirements, provenance) while keeping the core schema MCP-compatible.
+**SCP outlet schemas should use MCP's format.** If SCP defines its outlet interface using MCP-compatible JSON schemas, then SCP context outlets are natively MCP-compatible with zero translation. The agent passes outlet schemas through directly. This is a concrete design decision: SCP outlet definitions should be a superset of MCP tool definitions, adding SCP-specific metadata (context scope, capability requirements, provenance) while keeping the core schema MCP-compatible.
 
-**Capability filtering happens at the agent.** MCP has no concept of access control — configured tools are available. SCP tools are capability-gated by role. The agent resolves this by exposing only the tools the human's role permits. Tools the agent lacks capability for are never surfaced to the model — from the model's perspective, they don't exist.
+**Capability filtering happens at the agent.** MCP has no concept of access control — configured tools are available. SCP outlets are capability-gated by role. The agent resolves this by exposing only the outlets the human's role permits. Outlets the agent lacks capability for are never surfaced to the model — from the model's perspective, they don't exist.
 
 ```
-Context tools:             Admin's agent MCP surface:    Member's agent MCP surface:
+Context outlets:             Admin's agent MCP surface:    Member's agent MCP surface:
 
-  tool_a (admin+)            tool_a ✓                      (not exposed)
-  tool_b (member+)           tool_b ✓                      tool_b ✓
-  tool_c (member+)           tool_c ✓                      tool_c ✓
-  tool_d (observer+)         tool_d ✓                      tool_d ✓
+  outlet_a (admin+)            outlet_a ✓                      (not exposed)
+  outlet_b (member+)           outlet_b ✓                      outlet_b ✓
+  outlet_c (member+)           outlet_c ✓                      outlet_c ✓
+  outlet_d (observer+)         outlet_d ✓                      outlet_d ✓
 ```
 
-**Multi-context as namespaced MCP tools.** A human in multiple contexts has their agent expose tools from all contexts, namespaced by context. The model sees `context_a/send_message`, `context_b/schedule_meeting`. The agent routes each call to the right context, with the right tokens, over the right encrypted channel.
+**Multi-context as namespaced MCP tools.** A human in multiple contexts has their agent expose outlets from all contexts, namespaced by context. The model sees `context_a/send_message`, `context_b/schedule_meeting`. The agent routes each call to the right context, with the right tokens, over the right encrypted channel.
 
-**MCP provides the local wiring. SCP provides the social infrastructure.** MCP solves "how does an AI model connect to tools on this machine." SCP solves "how do those tools exist in a multi-party, trust-evaluated, persistent, access-controlled social space." MCP has no identity, trust, multi-party coordination, or persistence. SCP provides all of these. Together, they give any MCP-speaking model access to SCP's social infrastructure without either protocol needing to change.
+**MCP provides the local wiring. SCP provides the social infrastructure.** MCP solves "how does an AI model connect to tools on this machine." SCP solves "how do those outlets exist in a multi-party, trust-evaluated, persistent, access-controlled social space." MCP has no identity, trust, multi-party coordination, or persistence. SCP provides all of these. Together, they give any MCP-speaking model access to SCP's social infrastructure without either protocol needing to change.
 
 **BYOA benefit.** "Bring your own agent" (§4.4) means users choose their own AI model. MCP compatibility means any MCP-speaking model works — Claude, GPT, Gemini, open-source local models, or anything future. The SCP agent handles protocol mechanics. The model handles reasoning. The user chooses both independently.

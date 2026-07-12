@@ -2,7 +2,7 @@
 
 ## 4.1 Core Principle
 
-Humans and their bound agents are the only actors in the system. Every action on the protocol — every message, every tool invocation, every state change — is traceable to a human(s) as an action they took or their attributed agent took. There are no anonymous actors or unaccountable software participants.
+Humans and their bound agents are the only actors in the system. Every action on the protocol — every message, every outlet invocation, every state change — is traceable to a human(s) as an action they took or their attributed agent took. There are no anonymous actors or unaccountable software participants.
 
 ## 4.2 Binding
 
@@ -103,7 +103,7 @@ What this means for the ecosystem:
 
 ## 4.6 Agents Are Consumers, Not Enforcers
 
-Human-bound agents are **protocol consumers** — the same identity as their human, distinguished only by verification method (`#agent` vs `#active`), but consumers nonetheless. They use apps. They use context tools. They interact with contexts through the protocol. They have zero responsibility for enforcing protocol rules.
+Human-bound agents are **protocol consumers** — the same identity as their human, distinguished only by verification method (`#agent` vs `#active`), but consumers nonetheless. They use apps. They use context outlets. They interact with contexts through the protocol. They have zero responsibility for enforcing protocol rules.
 
 The protocol enforces itself — through cryptography (encryption-as-access-control, key tree exclusion for blocks, capability token validation) and through the SDK that builders use to construct conformant apps. Agents do not enforce blocking, role permissions, capability ceilings, or any other protocol rule. The protocol and its cryptographic guarantees handle enforcement. Apps built on the SDK inherit those guarantees. Agents and humans consume those apps.
 
@@ -119,7 +119,7 @@ The human coordinates locally. On the user's machine, agents share state freely,
 
 This eliminates: cross-context infection via agent memory, runaway agent coordination at the protocol level, the need for bridging rate limits, metastatic growth patterns through agent connections.
 
-**No direct agent-to-agent primitive.** The protocol does not and will not include a mechanism for agents to contact agents they share no context with. This was considered in depth (see planning-session-03.md for the full analysis, planning-session-06.md §2 for the rejection rationale) and rejected. The core reasoning: context isolation is the security boundary, and any mechanism that lets agents bypass it — even a "governed" one with rate limits and trust evaluation — reintroduces the attack surface isolation was designed to eliminate. Cross-context interaction uses tool interfaces (§6.2) for asymmetric service calls, multi-parent child contexts (§5.13) for symmetric collaboration, and standing bilateral contexts (§5.12.6) for persistent direct communication. All three require existing context membership or human facilitation. Agents that need new relationships require their humans to arrange them.
+**No direct agent-to-agent primitive.** The protocol does not and will not include a mechanism for agents to contact agents they share no context with. This was considered in depth (see planning-session-03.md for the full analysis, planning-session-06.md §2 for the rejection rationale) and rejected. The core reasoning: context isolation is the security boundary, and any mechanism that lets agents bypass it — even a "governed" one with rate limits and trust evaluation — reintroduces the attack surface isolation was designed to eliminate. Cross-context interaction uses outlet interfaces (§6.2) for asymmetric service calls, multi-parent child contexts (§5.13) for symmetric collaboration, and standing bilateral contexts (§5.12.6) for persistent direct communication. All three require existing context membership or human facilitation. Agents that need new relationships require their humans to arrange them.
 
 ## 4.8 Agent Fleet
 

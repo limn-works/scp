@@ -1467,7 +1467,7 @@ Tests that verify the protocol layer's typed domain methods (§17.4) correctly p
 | Test | Verifies |
 |------|----------|
 | `context_lifecycle_persists` | Create context, store state, reload from storage, verify state matches |
-| `context_delete_removes_all` | Create context with members, events, tools. `delete_context` removes everything. Verify no keys with context prefix remain |
+| `context_delete_removes_all` | Create context with members, events, outlets. `delete_context` removes everything. Verify no keys with context prefix remain |
 | `event_log_range_query` | Append 100 events, load range 50-75, verify correct events in order |
 | `nonce_replay_rejected` | Record nonce, attempt same nonce again, verify rejection |
 | `nonce_pruning` | Record nonce with short expiry, advance clock, prune, verify nonce is gone |

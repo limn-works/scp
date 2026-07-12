@@ -26,14 +26,14 @@
    │         │   │          │   │         │   │         │
    │ Agent·A │   │ Agent·B  │   │ Agent·C │   │ Agent·D │
    │ [roles] │   │ [roles]  │   │ [roles] │   │ [roles] │
-   │ [tools] │   │ [tools]  │   │ [tools] │   │ [tools] │
+   │ [outlets] │   │ [outlets]  │   │ [outlets] │   │ [outlets] │
    └─────────┘   └──────────┘   └─────────┘   └─────────┘
         ▲               ▲              ▲              ▲
         │               │              │              │
         ╳               ╳              ╳              ╳
    No protocol-level communication between agents across contexts.
    Agent isolation is absolute — agents are separate instances per context.
-   Information may cross context boundaries only through opt-in tool interfaces (§6.2)
+   Information may cross context boundaries only through opt-in outlet interfaces (§6.2)
    or multi-parent child contexts (§5.13). See §2.3.
 ```
 
@@ -54,18 +54,18 @@ The **protocol boundary** encompasses everything that touches the network — co
 │  ┌─────────────────────────────────────────────────┐     │
 │  │ ROLES                                           │     │
 │  │                                                 │     │
-│  │  admin ──── [full tool access, invite, config]  │     │
-│  │  member ─── [standard tool access, read/write]  │     │
-│  │  observer ─ [read only, limited tools]          │     │
+│  │  admin ──── [full outlet access, invite, config]  │     │
+│  │  member ─── [standard outlet access, read/write]  │     │
+│  │  observer ─ [read only, limited outlets]          │     │
 │  │  (custom) ─ [context-defined permissions]       │     │
 │  └─────────────────────────────────────────────────┘     │
 │                                                          │
 │  ┌─────────────────────────────────────────────────┐     │
-│  │ TOOLS (stateless functions)                     │     │
+│  │ OUTLETS (stateless functions)                     │     │
 │  │                                                 │     │
-│  │  tool_a(input) → output                         │     │
-│  │  tool_b(input) → output                         │     │
-│  │  tool_c(input) → output                         │     │
+│  │  outlet_a(input) → output                         │     │
+│  │  outlet_b(input) → output                         │     │
+│  │  outlet_c(input) → output                         │     │
 │  │                                                 │     │
 │  │  No identity. No agency. No initiation.         │     │
 │  │  Invoked by agents according to their role.     │     │
@@ -99,8 +99,8 @@ The **protocol boundary** encompasses everything that touches the network — co
 ```
   ┌───────────┐                              ┌───────────┐
   │ Context A │                              │ Context B │
-  │           │    Tool Interface (opt-in)    │           │
-  │   tools ──┼──────── stateless call ──────┼── tools   │
+  │           │    Outlet Interface (opt-in)    │           │
+  │   outlets ──┼──────── stateless call ──────┼── outlets   │
   │           │                              │           │
   │  Alice·A  │              ╳               │  Alice·B  │
   │           │     (agents CANNOT cross)    │           │
@@ -122,23 +122,23 @@ The **protocol boundary** encompasses everything that touches the network — co
   Two protocol-level mechanisms allow information to cross
   context boundaries:
 
-  1. TOOL INTERFACES (asymmetric, §6.2):
+  1. OUTLET INTERFACES (asymmetric, §6.2):
      - Both contexts explicitly opt in (mutual consent)
      - Calls are stateless (with optional sessions)
-     - Data flows through declared tool schemas
+     - Data flows through declared outlet schemas
      - Every call is logged in the verifiable event log
      - Results carry provenance
 
   2. MULTI-PARENT CHILD CONTEXTS (symmetric, §5.13):
      - All parents' governance explicitly consents
-     - Child is a full context (messages, tools, roles)
+     - Child is a full context (messages, outlets, roles)
      - Child ceiling ≤ intersection of parent ceilings
      - Members from different parents interact as peers
      - Lifecycle coupled to parents (no orphans)
 
   Both are controlled crossings, not breaches of isolation.
   Agent isolation remains absolute: no agent instance spans contexts.
-  Tool interfaces expose only what schemas declare.
+  Outlet interfaces expose only what schemas declare.
   Child contexts are independent MLS groups with their own keys.
 ```
 
@@ -157,14 +157,14 @@ The **protocol boundary** encompasses everything that touches the network — co
 │  │ Granted per-agent, per-context, per-capability:      │     │
 │  │                                                      │     │
 │  │   Agent·A in Context·1:                              │     │
-│  │     ✓ invoke tool_x                                  │     │
+│  │     ✓ invoke outlet_x                                  │     │
 │  │     ✓ read member list                               │     │
 │  │     ✗ invite new members                             │     │
 │  │     ✗ modify context settings                        │     │
 │  │                                                      │     │
 │  │   Agent·B in Context·2:                              │     │
-│  │     ✓ invoke tool_y                                  │     │
-│  │     ✓ invoke tool_z                                  │     │
+│  │     ✓ invoke outlet_y                                  │     │
+│  │     ✓ invoke outlet_z                                  │     │
 │  │     ✓ invite new members                             │     │
 │  │     ✗ modify context settings                        │     │
 │  │                                                      │     │
@@ -216,7 +216,7 @@ The **protocol boundary** encompasses everything that touches the network — co
 │                                                                  │
 │                     SOCIAL CONTEXT LAYER ◀── the novel work      │
 │                                                                  │
-│   Contexts, agents, tools, roles, trust semantics.               │
+│   Contexts, agents, outlets, roles, trust semantics.               │
 │   Agent-native social infrastructure.                            │
 │   No existing protocol does this.                                │
 │                                                                  │

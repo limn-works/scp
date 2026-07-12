@@ -372,7 +372,7 @@ Events (append order; each prev_hash = previous leaf hash, genesis = [0u8;32]):
 
   seq 0  AppBound                 ts 1700000000
          payload = rmp(AppBoundPayload{ app_did:"did:key:app", app_name:"Scheduler",
-                       app_version:"1.0.0", capabilities:["tool:invoke:*"] })
+                       app_version:"1.0.0", capabilities:["outlet:call:*"] })
          leaf = 0xe0c0691d264ca38d086375a0274afb630e9bbb906f2e12e0112adf4d1b4fcd38
 
   seq 1  SpendApproved            ts 1700000001

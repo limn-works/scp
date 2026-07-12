@@ -86,11 +86,11 @@ scaffolds/                       Clonable barebones project setups
 
 templates/                       Clonable working applications for common use cases
 ├── chat/                        Two-party encrypted chat (Python CLI)
-├── agent-tool-provider/         Agent exposing tools via SCP context + MCP
-├── collaborative-workspace/     Multi-party context with roles and tools
+├── agent-tool-provider/         Agent exposing outlets via SCP context + MCP
+├── collaborative-workspace/     Multi-party context with roles and outlets
 ├── personal-relay/              Self-hosted relay with auto-TLS
 ├── broadcast-feed/              Broadcast context with subscriber management
-└── cross-context-bridge/        Tool interface bridging two contexts
+└── cross-context-bridge/        Outlet interface bridging two contexts
 
 bindings/python/README.md      ✓ Python SDK: install, quickstart, platform notes
 bindings/swift/README.md       ✓ Swift SDK: install, quickstart, platform notes
@@ -174,7 +174,7 @@ Minimal, runnable examples in each target language demonstrating:
 1. **Identity creation** — Create a DID, inspect it
 2. **Context creation** — Create a context with governance parameters
 3. **Message exchange** — Two participants send and receive encrypted messages
-4. **Tool invocation** — Register and invoke a tool within a context
+4. **Outlet invocation** — Register and invoke a outlet within a context
 
 Each example should be:
 - Self-contained (single file or minimal project)
@@ -235,7 +235,7 @@ Each public item MUST have:
 - **`# Panics`** section if the function can panic (even in debug builds).
 - **`# Safety`** section for any `unsafe` code (SCP uses `#![forbid(unsafe_code)]` so this should not apply).
 - **Spec cross-references** where the item implements a specific spec section. Format: `See §N.M in the SCP specification.`
-- **Example usage** for key entry-point functions (identity creation, context operations, messaging, tool invocation). Use `# Examples` with ```` ```rust ```` code blocks that compile under `cargo test --doc`.
+- **Example usage** for key entry-point functions (identity creation, context operations, messaging, outlet invocation). Use `# Examples` with ```` ```rust ```` code blocks that compile under `cargo test --doc`.
 
 ### 21.8.3 scp-core Documentation Targets
 
@@ -286,7 +286,7 @@ Not a replacement for `.docs/architecture.md` — a reading guide for it:
 1. **Start here** — The 5 concepts you need (contexts, DIDs, UCANs, MLS, relays)
 2. **Crate map** — Which crate does what, dependency graph, where to find things
 3. **Reading order** — Suggested path through specs and ADRs
-4. **Key flows** — Context creation, message send, tool invocation (simplified, with file references)
+4. **Key flows** — Context creation, message send, outlet invocation (simplified, with file references)
 5. **Glossary** — Protocol-specific terms with one-line definitions
 
 ## 21.10 P1: Generated API Reference
@@ -454,11 +454,11 @@ Each template is a complete, running application that demonstrates a real use ca
 | Template | Language(s) | What it is |
 |---|---|---|
 | `templates/chat/` | Python | Two-party encrypted chat (Python CLI) |
-| `templates/agent-tool-provider/` | Python | Agent exposing tools via SCP context with MCP bridge |
-| `templates/collaborative-workspace/` | TypeScript | Multi-party context with roles, tools, and governance |
+| `templates/agent-tool-provider/` | Python | Agent exposing outlets via SCP context with MCP bridge |
+| `templates/collaborative-workspace/` | TypeScript | Multi-party context with roles, outlets, and governance |
 | `templates/personal-relay/` | Rust | Self-hosted relay with automatic TLS and DID publishing |
 | `templates/broadcast-feed/` | Python | Broadcast context (§5.14) with subscriber management |
-| `templates/cross-context-bridge/` | Rust | Tool interface bridging two contexts (§6.2) |
+| `templates/cross-context-bridge/` | Rust | Outlet interface bridging two contexts (§6.2) |
 
 Templates are **functional** — they solve a real problem out of the box. An agent studying a template understands not just how SCP works mechanically but how it's used to build real things.
 
