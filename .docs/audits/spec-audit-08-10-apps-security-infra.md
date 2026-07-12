@@ -10,7 +10,7 @@
 
 - **Category**: Missing wire format details
 - **Location**: Section 8.4
-- **What's missing**: The section describes the capability declaration as "a structured, machine-readable manifest" but provides zero wire format. No JSON schema. No field names. No version envelope. No example beyond pseudocode fragments like `"I need: messaging, member_list, tool_invoke(tool_a, tool_b)"`. The open-questions file (00-open-questions.md) marks this resolved by saying it uses "JSON Schema (MCP-compatible)" with "resource URIs (`scp:ctx:{context_id}/{capability}`)" but no actual schema definition exists anywhere.
+- **What's missing**: The section describes the capability declaration as "a structured, machine-readable manifest" but provides zero wire format. No JSON schema. No field names. No version envelope. No example beyond pseudocode fragments like `"I need: messaging, member_list, outlet_invoke(outlet_a, outlet_b)"`. The open-questions file (00-open-questions.md) marks this resolved by saying it uses "JSON Schema (MCP-compatible)" with "resource URIs (`scp:ctx:{context_id}/{capability}`)" but no actual schema definition exists anywhere.
 - **Why it matters**: An implementor cannot build capability declaration parsing, validation, or exchange without guessing the format. Two independent implementations will produce incompatible declarations. Since the declaration is described as the "boundary that makes generated apps safe," this is a security-relevant gap -- the safety boundary has no concrete shape.
 - **Severity**: HIGH
 
@@ -60,8 +60,8 @@
 
 - **Category**: Security-relevant omissions
 - **Location**: Section 8.5
-- **What's missing**: "Capability filtering happens at the agent." The agent exposes only permitted tools. But: what prevents a compromised or malicious agent from calling tools it filtered out of the MCP surface? The filtering is described as an MCP presentation concern, not a protocol enforcement point. If the agent has MLS membership, it has access to all context messages regardless of what it exposes via MCP. There is no enforcement at the protocol level -- it is entirely trust-the-agent.
-- **Why it matters**: The text says "tools the agent lacks capability for are never surfaced to the model" but the agent software itself has full context access. A compromised agent runtime can invoke any tool regardless of its MCP surface presentation. The "boundary that makes generated apps safe" is the agent's code quality, not the protocol.
+- **What's missing**: "Capability filtering happens at the agent." The agent exposes only permitted outlets. But: what prevents a compromised or malicious agent from calling outlets it filtered out of the MCP surface? The filtering is described as an MCP presentation concern, not a protocol enforcement point. If the agent has MLS membership, it has access to all context messages regardless of what it exposes via MCP. There is no enforcement at the protocol level -- it is entirely trust-the-agent.
+- **Why it matters**: The text says "outlets the agent lacks capability for are never surfaced to the model" but the agent software itself has full context access. A compromised agent runtime can invoke any outlet regardless of its MCP surface presentation. The "boundary that makes generated apps safe" is the agent's code quality, not the protocol.
 - **Severity**: MEDIUM
 
 ---
@@ -94,18 +94,18 @@
 
 - **Category**: Missing constants/defaults
 - **Location**: Section 9.3
-- **What's missing**: "New identities start with limited capabilities -- restricted context creation, limited participation slots, constrained tool invocation rates. Capacity grows through participation history, participation records, and time." No concrete defaults for any of these limits. How many contexts can a new identity create? What is the initial participation slot count? What tool invocation rate applies to a brand-new DID? How does capacity grow -- linearly, logarithmically? What are the thresholds? The open-questions file says this is resolved and "scoring is not protocol-level" but the protocol specifies earned capacity as a defense mechanism with zero concrete parameters.
+- **What's missing**: "New identities start with limited capabilities -- restricted context creation, limited participation slots, constrained outlet invocation rates. Capacity grows through participation history, participation records, and time." No concrete defaults for any of these limits. How many contexts can a new identity create? What is the initial participation slot count? What outlet invocation rate applies to a brand-new DID? How does capacity grow -- linearly, logarithmically? What are the thresholds? The open-questions file says this is resolved and "scoring is not protocol-level" but the protocol specifies earned capacity as a defense mechanism with zero concrete parameters.
 - **Why it matters**: Without protocol-level defaults, a new deployment has zero Sybil resistance at Layer 1. Every implementation must invent its own thresholds, making the security guarantee non-uniform and the interoperability story broken (context A says "you need 30 days of history" using its custom formula; context B says "you need 5 contexts" using a different formula -- neither can validate the other's claim). The spec delegates to "product-layer" but provides no protocol-level floor.
 - **Severity**: HIGH
 
 ---
 
-### [9.2.1] Tool Interface Rate Limit Defaults Missing
+### [9.2.1] Outlet Interface Rate Limit Defaults Missing
 
 - **Category**: Missing constants/defaults
 - **Location**: Section 9.2.1, item 3 (line 69)
-- **What's missing**: "Each context enforces rate limits on both inbound and outbound tool calls within a sliding time window." No default rate. No window size. No specification of what the rate limit unit is (calls/second? calls/minute?). No maximum or minimum values. No behavior when rate is exceeded (drop? queue? error response?).
-- **Why it matters**: Rate limiting is described as the primary defense against chained tool call amplification. Without defaults, a new context has no rate limiting until an administrator manually configures one. The amplification attack described in the spec is unmitigated by default.
+- **What's missing**: "Each context enforces rate limits on both inbound and outbound outlet calls within a sliding time window." No default rate. No window size. No specification of what the rate limit unit is (calls/second? calls/minute?). No maximum or minimum values. No behavior when rate is exceeded (drop? queue? error response?).
+- **Why it matters**: Rate limiting is described as the primary defense against chained outlet call amplification. Without defaults, a new context has no rate limiting until an administrator manually configures one. The amplification attack described in the spec is unmitigated by default.
 - **Severity**: HIGH
 
 ---
@@ -520,7 +520,7 @@
 
 - **Category**: Missing wire format details
 - **Location**: Section 10.9 (line 314)
-- **What's missing**: "A context that needs presence registers a presence tool. A context that needs typing indicators includes them as ephemeral events." No specification of what an "ephemeral event" is in the context of the event log. Are ephemeral events committed to the Merkle tree? If so, they are permanent (contradicting "ephemeral"). If not, they bypass the event log entirely and need their own delivery mechanism. No specification of TTL for ephemeral events, no wire format, no delivery guarantee.
+- **What's missing**: "A context that needs presence registers a presence outlet. A context that needs typing indicators includes them as ephemeral events." No specification of what an "ephemeral event" is in the context of the event log. Are ephemeral events committed to the Merkle tree? If so, they are permanent (contradicting "ephemeral"). If not, they bypass the event log entirely and need their own delivery mechanism. No specification of TTL for ephemeral events, no wire format, no delivery guarantee.
 - **Why it matters**: "Ephemeral events" are mentioned as a mechanism without definition. An implementor has no way to know whether to use MLS application messages, a separate channel, or something else.
 - **Severity**: MEDIUM
 
@@ -595,15 +595,15 @@ Total findings: **1 CRITICAL, 16 HIGH, 18 MEDIUM, 5 LOW**.
 ### [9.3] Earned Capacity Has No Protocol-Level Defaults
 - **Category**: Missing constants/defaults
 - **Location**: `09-security-model.md` line 180
-- **What's missing**: "New identities start with limited capabilities -- restricted context creation, limited participation slots, constrained tool invocation rates." No initial limits specified. No growth curve. No thresholds. No protocol-level floor.
+- **What's missing**: "New identities start with limited capabilities -- restricted context creation, limited participation slots, constrained outlet invocation rates." No initial limits specified. No growth curve. No thresholds. No protocol-level floor.
 - **Why it matters**: Without defaults, a fresh deployment has zero Sybil resistance at Layer 1. The spec delegates to "product-layer" but the security model depends on this constraint existing.
 - **Severity**: HIGH
 
-### [9.2.1] Tool Interface Rate Limit Defaults Missing
+### [9.2.1] Outlet Interface Rate Limit Defaults Missing
 - **Category**: Missing constants/defaults
 - **Location**: `09-security-model.md` line 69
-- **What's missing**: "Each context enforces rate limits on both inbound and outbound tool calls within a sliding time window." No default rate, no window size, no unit, no behavior on exceeding.
-- **Why it matters**: Rate limiting is the primary defense against chained tool call amplification (described in the same section). Without defaults, the defense is advisory.
+- **What's missing**: "Each context enforces rate limits on both inbound and outbound outlet calls within a sliding time window." No default rate, no window size, no unit, no behavior on exceeding.
+- **Why it matters**: Rate limiting is the primary defense against chained outlet call amplification (described in the same section). Without defaults, the defense is advisory.
 - **Severity**: HIGH
 
 ### [9.9.3] Equivocation Response Undefined

@@ -368,8 +368,8 @@ The most severe gaps are: (1) the social/device recovery protocol in section 3.3
 ### [03-IDENTITY] "Earned capacity" system referenced but never specified
 
 - **Category**: Underspecified algorithms
-- **Location**: Section 9.3, line 180 (cross-referenced from section 3.5/3.6) -- "New identities start with limited capabilities -- restricted context creation, limited participation slots, constrained tool invocation rates."
-- **What's missing**: No specification of initial capacity values, growth rates, or capacity thresholds. What are the default limits for a new identity? How many contexts can a new DID create? How many participation slots? What tool invocation rate? How does capacity grow (linearly? exponentially? step functions?)? What inputs drive growth?
+- **Location**: Section 9.3, line 180 (cross-referenced from section 3.5/3.6) -- "New identities start with limited capabilities -- restricted context creation, limited participation slots, constrained outlet invocation rates."
+- **What's missing**: No specification of initial capacity values, growth rates, or capacity thresholds. What are the default limits for a new identity? How many contexts can a new DID create? How many participation slots? What outlet invocation rate? How does capacity grow (linearly? exponentially? step functions?)? What inputs drive growth?
 - **Why it matters**: The open questions document marks this as resolved with the note that "earned capacity scoring is a product-layer concern, not a protocol-level specification." But section 9.3 states capacity limits as protocol properties ("restricted context creation, limited participation slots"), not product features. If the protocol does not enforce capacity limits, the Sybil resistance mechanism described in section 9.3 does not work as described. This is a coherence issue between the spec's claims and its explicit deferral.
 - **Severity**: HIGH
 
@@ -397,11 +397,11 @@ The most severe gaps are: (1) the social/device recovery protocol in section 3.3
 - **Why it matters**: A DID document that approaches the 256KB blob limit would be expensive to resolve and process. The spec should either specify a DID document size limit or acknowledge the growth trajectory.
 - **Severity**: LOW
 
-### [02-SYSTEM-DESIGN] Cross-context tool interface "mutual consent" -- governance approval protocol for interfaces not specified in section 2
+### [02-SYSTEM-DESIGN] Cross-context outlet interface "mutual consent" -- governance approval protocol for interfaces not specified in section 2
 
 - **Category**: Vague requirements
 - **Location**: Section 2.3, line 125 -- "Both contexts explicitly opt in (mutual consent)"
-- **What's missing**: Section 2.3 describes mutual consent for tool interfaces but defers the protocol to section 6.2. The issue is that section 2.3 presents this as a simple property ("both contexts opt in") when the actual protocol requires governance approval, schema validation, and interface registration -- none of which is mentioned in section 2's framing. An implementor reading only section 2 would not understand the complexity.
+- **What's missing**: Section 2.3 describes mutual consent for outlet interfaces but defers the protocol to section 6.2. The issue is that section 2.3 presents this as a simple property ("both contexts opt in") when the actual protocol requires governance approval, schema validation, and interface registration -- none of which is mentioned in section 2's framing. An implementor reading only section 2 would not understand the complexity.
 - **Why it matters**: The section 2 description understates the requirements. This is a specification documentation issue rather than a protocol gap, but it could lead to incomplete implementations.
 - **Severity**: LOW
 
