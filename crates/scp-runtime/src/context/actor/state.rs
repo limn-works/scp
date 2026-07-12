@@ -999,10 +999,9 @@ impl ClassSState {
 /// and their helper modules — there is no dead code here, and no
 /// `#[allow(dead_code)]` is applied. The private-type sub-state fields
 /// are all live: `governance` (e.g. `handlers/governance.rs` off
-/// `state.governance.engine`, and `handlers/lifecycle.rs` cancelling
-/// `state.governance.timeout_task`), `epoch` (`handlers/trust_recovery.rs`
-/// reading `state.epoch.mls_epoch`), `ttl` (`handlers/lifecycle.rs`
-/// cancelling `state.ttl.timer`), and `access` (the governance,
+/// `state.governance.engine`), `epoch` (`handlers/trust_recovery.rs`
+/// reading `state.epoch.mls_epoch`), `ttl` (`ContextActor::reconcile_timers`
+/// reading `state.ttl.timer.deadline_unix_secs`), and `access` (the governance,
 /// messaging, and queries helpers reading `state.access.access_key_store`
 /// and `state.access.read_exclusion_list`).
 pub struct PerContextState {
@@ -1572,6 +1571,46 @@ mod tests {
         let bc_json = serde_json::to_string(&ContextRouting::Broadcast).expect("serialize");
         let bc_back: ContextRouting = serde_json::from_str(&bc_json).expect("deserialize");
         assert!(bc_back.is_broadcast());
+    }
+
+    /// B1 (serde): `ContextSnapshot` persists the ABSOLUTE convergent
+    /// `ttl_deadline_secs` (mapped from `state.ttl.timer.deadline_unix_secs`)
+    /// and round-trips it verbatim. A legacy snapshot lacking the field (it
+    /// predates `ttl_deadline_secs`, having carried the retired RELATIVE
+    /// `ttl_remaining_secs`) decodes as `None` via `#[serde(default)]`, so the
+    /// restore path falls back to the `creation + ttl` re-derivation.
+    #[test]
+    fn snapshot_roundtrip_preserves_ttl_deadline_secs() {
+        const T0: u64 = 1_700_000_000;
+        const DEADLINE: u64 = T0 + 3600;
+
+        let mut state = PerContextState::new_for_test_encrypted([0x77u8; 32], T0, test_admin());
+        state.ttl.timer.deadline_unix_secs = Some(DEADLINE);
+        let snap = crate::context::manager_methods::snapshot_context(&state);
+        assert_eq!(
+            snap.ttl_deadline_secs,
+            Some(DEADLINE),
+            "snapshot must carry the absolute deadline off the live timer"
+        );
+
+        // Full serde round-trip preserves the absolute deadline verbatim.
+        let json = serde_json::to_string(&snap).expect("serialize snapshot");
+        let back: crate::context::state::ContextSnapshot =
+            serde_json::from_str(&json).expect("deserialize snapshot");
+        assert_eq!(back.ttl_deadline_secs, Some(DEADLINE));
+
+        // Legacy snapshot: the field is simply absent (predates this field).
+        let mut value: serde_json::Value = serde_json::from_str(&json).expect("to value");
+        value
+            .as_object_mut()
+            .expect("snapshot is a JSON object")
+            .remove("ttl_deadline_secs");
+        let legacy: crate::context::state::ContextSnapshot =
+            serde_json::from_value(value).expect("legacy snapshot decodes with the field absent");
+        assert_eq!(
+            legacy.ttl_deadline_secs, None,
+            "a legacy snapshot lacking ttl_deadline_secs must decode as None (#[serde(default)])"
+        );
     }
 
     #[test]

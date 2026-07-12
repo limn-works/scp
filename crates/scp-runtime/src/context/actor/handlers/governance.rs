@@ -203,12 +203,6 @@ async fn dispatch_state(
         GovernanceCommand::ProcessPendingCommits { reply } => {
             Box::pin(handle_process_pending_commits_actor(cell, deps, reply)).await
         }
-        GovernanceCommand::EvaluateTimeouts { reply } => {
-            Box::pin(handle_evaluate_timeouts_actor(cell, deps, reply)).await
-        }
-        GovernanceCommand::StartTimeoutTask { reply } => {
-            handle_start_timeout_task_actor(cell, deps, reply).await
-        }
     }
 }
 
@@ -1124,24 +1118,23 @@ async fn handle_process_pending_commits_actor(
     Outcome::ok_mutated(())
 }
 
-/// Handle [`GovernanceCommand::EvaluateTimeouts`] (actor-shape).
+/// Run one tick of the governance timeout / consequence pipeline for
+/// THIS actor's context (phases 1 through 5), on actor-owned state.
 ///
-/// Per-actor body of the relocated sweep. Runs one tick of the
-/// governance timeout / consequence pipeline for THIS actor's context.
-/// Mirrors the per-context body of `start_governance_timeout_task_legacy`
-/// — phases 1 through 5.
+/// Called by the actor's own `governance_timeout` interval arm
+/// ([`ContextActor::on_governance_timeout`](crate::context::actor::ContextActor))
+/// each 60 s wake — the ACTOR-OWNED replacement for the retired
+/// supervisor-driven `EvaluateTimeouts` mailbox hop (ADR-049 Decision-1
+/// / finding A3).
 ///
-/// Replies `Ok(true)` to continue the supervisor's timer loop, `Ok(false)`
-/// to stop (context closing or removed; matches the legacy timer
-/// closure's `bool` return). The supervisor-side timer-spawn entry point
-/// in [`governance_helpers::start_governance_timeout_task`](crate::context::governance_helpers::start_governance_timeout_task)
-/// drives the cadence; per-actor governance-timeout actors land in Phase
-/// 2B per ADR-049.
-async fn handle_evaluate_timeouts_actor(
+/// Returns `Outcome<bool>`: `Ok(true)` keeps the interval ticking,
+/// `Ok(false)` signals stop (context no longer `Active`) so the caller
+/// nulls the interval. `mutated` marks the actor dirty for the coalesced
+/// persist, matching the retired mailbox handler's dirty semantics.
+pub(crate) async fn evaluate_governance_timeouts(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
-    reply: oneshot::Sender<Result<bool, ContextError>>,
-) -> Outcome<()> {
+) -> Outcome<bool> {
     use std::collections::HashSet;
 
     use scp_did::DID;
@@ -1160,11 +1153,10 @@ async fn handle_evaluate_timeouts_actor(
     // flushes after the handler reports `mutated`).
     let current_state = cell.handle.state();
     if current_state != scp_protocol::context::ContextState::Active {
-        // Not Active = context closing, stop the loop. (The former
-        // write-contended `None` branch is gone: the lock-free `ArcSwap`
-        // read can never fail, so there is no "retry next tick" case.)
-        let _ = reply.send(Ok(false));
-        return Outcome::ok(());
+        // Not Active = context closing / terminal, stop the interval. (The
+        // lock-free `ArcSwap` read can never fail, so there is no
+        // "retry next tick" contended case.)
+        return Outcome::ok(false);
     }
 
     let gov_ctx = build_governance_context(&*cell, deps.clock.as_ref());
@@ -1259,28 +1251,7 @@ async fn handle_evaluate_timeouts_actor(
     ))
     .await;
 
-    let _ = reply.send(Ok(true));
-    Outcome::ok_mutated(())
-}
-
-/// Handle [`GovernanceCommand::StartTimeoutTask`] (actor-shape).
-///
-/// Installs the per-context governance-timeout interval task on
-/// actor-owned `state.governance.timeout_task` via the actor-shape
-/// [`governance_helpers::spawn_governance_timeout_task`](crate::context::governance_helpers::spawn_governance_timeout_task).
-/// The spawned loop mailboxes [`GovernanceCommand::EvaluateTimeouts`]
-/// back to THIS actor each tick — no DashMap reach, no generation gate.
-///
-/// Awaits the `tracked_spawn` task_set push so the abort handle is
-/// installed on `state.governance.timeout_task` before replying.
-async fn handle_start_timeout_task_actor(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
-    deps: &ActorDeps,
-    reply: oneshot::Sender<Result<(), ContextError>>,
-) -> Outcome<()> {
-    crate::context::governance_helpers::spawn_governance_timeout_task(cell, deps).await;
-    let _ = reply.send(Ok(()));
-    Outcome::ok_mutated(())
+    Outcome::ok_mutated(true)
 }
 
 #[cfg(test)]

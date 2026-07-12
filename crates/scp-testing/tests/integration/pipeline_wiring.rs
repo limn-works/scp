@@ -136,6 +136,12 @@ const HANDLERS_MESSAGING_SRC: &str =
 const HANDLERS_BROADCAST_SRC: &str =
     include_str!("../../../../crates/scp-runtime/src/context/actor/handlers/broadcast.rs");
 
+// ContextActor run-loop source — owns `run()`, `reconcile_timers`,
+// `on_ttl_tick`, `on_governance_timeout` (the ACTOR-OWNED timer arms,
+// ADR-049 Decision-1 / finding A3). Pinned by
+// `actor_owned_timer_arms_reconcile_from_state`.
+const ACTOR_MOD_SRC: &str = include_str!("../../../../crates/scp-runtime/src/context/actor/mod.rs");
+
 // UCAN validation pipeline source — owns `validate_ucan`, the 11-step
 // capability authorization gate. The `ucan_step8_enforces_ceiling_over_all_att`
 // assertion below pins step 8 to checking the FULL parsed attestation set
@@ -1082,60 +1088,60 @@ fn import_context_is_actor_native_not_dashmap_dual_write() {
     // variant were unhandled), so no string assertion is needed for those.
 }
 
-// Timer level: the actor-shape TTL timer helpers install the timer on
-// actor-owned state via `ttl_close_helpers::spawn_ttl_timer` (registry +
-// `FireTimer` mailbox tick), NOT the legacy `spawn_ttl_timer_legacy`
-// DashMap-reading task. ADR-049 Phase 2A finalization (timer → actor
-// registry + mailbox). Additive assertion — pins the actor-shape call so
-// a future refactor cannot regress the timer back to the legacy
-// `&Supervisor` / `contexts` DashMap path.
+// Timer level (ADR-049 Decision-1 / finding A3 — APPROVED enforcement
+// retarget): the TTL + governance timers are ACTOR-OWNED arms reconciled
+// from owned state inside the actor's own `run()` loop, NOT
+// supervisor-driven `task_set` spawns that mailbox a `FireTimer` /
+// `EvaluateTimeouts` tick. This assertion REPLACES the two retired
+// assertions (`ttl_timer_helpers_call_actor_shape_spawn_not_legacy`,
+// `lifecycle_bootstrap_installs_timers_via_mailbox_not_legacy`) that pinned
+// the now-superseded supervisor-mailbox timer mechanism. It pins the REAL
+// new mechanism (body-scoped, not a dead string-match) so a refactor cannot
+// silently regress the arms back to a supervisor-spawned timer task.
 #[test]
-fn ttl_timer_helpers_call_actor_shape_spawn_not_legacy() {
+fn actor_owned_timer_arms_reconcile_from_state() {
+    // The run loop reconciles the actor-owned timer arms every turn.
     assert!(
-        fn_body_contains(MANAGER_SRC, "start_ttl_timer", "spawn_ttl_timer(")
-            && !fn_body_contains(MANAGER_SRC, "start_ttl_timer", "spawn_ttl_timer_legacy("),
-        "ttl_close_helpers::start_ttl_timer must install via the actor-shape \
-         spawn_ttl_timer (registry + FireTimer tick), not spawn_ttl_timer_legacy"
+        fn_body_contains(ACTOR_MOD_SRC, "run", "reconcile_timers"),
+        "ContextActor::run() must call reconcile_timers() to arm the actor-owned timers"
     );
+    // reconcile_timers derives the TTL arm from the convergent deadline and
+    // arms BOTH owned timer fields (ttl_timer + governance_timeout).
     assert!(
-        fn_body_contains(MANAGER_SRC, "reset_ttl_timer", "spawn_ttl_timer(")
-            && !fn_body_contains(MANAGER_SRC, "reset_ttl_timer", "spawn_ttl_timer_legacy("),
-        "ttl_close_helpers::reset_ttl_timer must install via the actor-shape \
-         spawn_ttl_timer (registry + FireTimer tick), not spawn_ttl_timer_legacy"
+        fn_body_contains(ACTOR_MOD_SRC, "reconcile_timers", "deadline_unix_secs")
+            && fn_body_contains(ACTOR_MOD_SRC, "reconcile_timers", "ttl_timer")
+            && fn_body_contains(ACTOR_MOD_SRC, "reconcile_timers", "governance_timeout"),
+        "reconcile_timers must arm ttl_timer/governance_timeout from \
+         state.ttl.timer.deadline_unix_secs"
     );
-}
-
-// Timer level: the lifecycle bootstrap paths install timers by mailboxing
-// the freshly-spawned actor (`dispatch_start_ttl_timer` /
-// `start_governance_timeout_task` → StartTimeoutTask), NOT by reaching the
-// legacy `spawn_ttl_timer_legacy` / `start_governance_timeout_task_legacy`
-// `&Supervisor` helpers. ADR-049 Phase 2A finalization. Additive.
-#[test]
-fn lifecycle_bootstrap_installs_timers_via_mailbox_not_legacy() {
-    for fn_name in ["finalize_create", "restore_context", "import_context"] {
-        assert!(
-            !fn_body_contains(MANAGER_SRC, fn_name, "spawn_ttl_timer_legacy("),
-            "lifecycle_helpers::{fn_name} must not reach the legacy \
-             spawn_ttl_timer_legacy — install the TTL timer via the actor \
-             mailbox (dispatch_start_ttl_timer)"
-        );
-    }
-    // The non-legacy governance-timeout entry point installs via the
-    // actor mailbox (StartTimeoutTask), not the legacy DashMap-reading
-    // spawn dance.
+    // The TTL tick runs the actor-shape expiry pipeline directly on owned
+    // state (no FireTimer mailbox hop).
+    assert!(
+        fn_body_contains(ACTOR_MOD_SRC, "on_ttl_tick", "handle_ttl_expiry"),
+        "on_ttl_tick must run ttl_close_helpers::handle_ttl_expiry on owned state"
+    );
+    // The governance tick runs the shared sweep directly on owned state (no
+    // EvaluateTimeouts mailbox hop).
     assert!(
         fn_body_contains(
-            MANAGER_SRC,
-            "start_governance_timeout_task",
-            "StartTimeoutTask"
-        ) && !fn_body_contains(
-            MANAGER_SRC,
-            "start_governance_timeout_task",
-            "start_governance_timeout_task_legacy("
+            ACTOR_MOD_SRC,
+            "on_governance_timeout",
+            "evaluate_governance_timeouts"
         ),
-        "governance_helpers::start_governance_timeout_task must dispatch \
-         StartTimeoutTask to the actor, not delegate to the legacy \
-         start_governance_timeout_task_legacy DashMap spawn dance"
+        "on_governance_timeout must run handlers::governance::evaluate_governance_timeouts \
+         on owned state"
+    );
+    // No retired supervisor-driven timer residue: the timer helpers no longer
+    // spawn onto a shared `task_set` via `tracked_spawn`, and the supervisor
+    // no longer exposes the `task_set` accessor.
+    assert!(
+        !MANAGER_SRC.contains("tracked_spawn"),
+        "the retired supervisor-driven timer spawn (tracked_spawn) must be gone from the \
+         timer helpers"
+    );
+    assert!(
+        !SUPERVISOR_SRC.contains("task_set_ref"),
+        "the supervisor's timer task_set accessor (task_set_ref) must be retired"
     );
 }
 

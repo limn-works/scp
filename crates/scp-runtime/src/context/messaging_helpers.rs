@@ -2676,9 +2676,6 @@ pub fn build_snapshot_from_state(
                 spending_nonce_tracker: _spending_nonce_tracker,
             },
         // --- Transient: deliberately NOT persisted (rebuilt at restore). ---
-        // `timeout_task`: governance-timer handle, re-installed by the actor
-        // registry on respawn (no durable identity to preserve).
-        timeout_task: _timeout_task_transient,
         // `deadlock`: per-context deadlock-detection scratch state, recomputed
         // from the live proposal set after restore.
         deadlock: _deadlock_transient,
@@ -2691,7 +2688,10 @@ pub fn build_snapshot_from_state(
     } = &state.governance;
 
     let context_state_value = state.handle.state();
-    let ttl_remaining_secs = state.ttl.timer.remaining_secs();
+    // Persist the ABSOLUTE convergent deadline verbatim (ADR-049 §9): restore/
+    // import re-arm the SAME instant, so a create-window `None` re-derives from
+    // `creation + ttl` and a prior extension is not recomputed away (D1/D2).
+    let ttl_deadline_secs = state.ttl.timer.deadline_unix_secs;
     let grace_entries = state.epoch.grace_store.to_grace_entries();
 
     crate::context::state::ContextSnapshot {
@@ -2709,7 +2709,7 @@ pub fn build_snapshot_from_state(
             .keys()
             .copied()
             .collect(),
-        ttl_remaining_secs,
+        ttl_deadline_secs,
         registered_outlets: state.governance.registered_outlets.clone(),
         read_exclusion_list: state.access.read_exclusion_list.clone(),
         outlet_interfaces: state.governance.outlet_interfaces.clone(),

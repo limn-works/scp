@@ -162,7 +162,7 @@ mod tests {
             role_state,
             event_log_merkle_root: [0u8; 32],
             executed_proposals: HashSet::default(),
-            ttl_remaining_secs: None,
+            ttl_deadline_secs: None,
             registered_outlets: Vec::new(),
             read_exclusion_list: HashSet::default(),
             outlet_interfaces: Vec::new(),

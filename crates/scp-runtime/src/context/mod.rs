@@ -142,12 +142,20 @@ impl ContextHandle {
         &self.params
     }
 
-    /// Transitions the memory scope to `Full` during context promotion
-    /// (§5.10). This is the only spec-authorized mutation of `ContextParams`
-    /// after creation — promotion changes the opt-in contract from ephemeral
-    /// to persistent.
-    pub const fn promote_memory_scope(&mut self) {
+    /// Applies the spec §5.10 promotion mutation to `ContextParams`: memory scope
+    /// transitions to `Full` AND the TTL is REMOVED (`ttl = None`). This is the
+    /// only spec-authorized mutation of `ContextParams` after creation —
+    /// promotion changes the opt-in contract from ephemeral to persistent, and a
+    /// promoted context is permanent (no TTL).
+    ///
+    /// Clearing `ttl` here is the prune-immune promotion authority for the
+    /// single-source TTL-deadline invariant (ADR-049 §9): `convergent_ttl_deadline`
+    /// reads `params.ttl == None` as "promoted ⇒ no arm", so the promotion signal
+    /// lives in the persisted snapshot params, NOT the prunable `ContextPromoted`
+    /// event-log leaf (which remains only as the promotion RECORD).
+    pub const fn promote_params(&mut self) {
         self.params.memory_scope = params::MemoryScope::Full;
+        self.params.ttl = None;
     }
 
     /// Returns the context's current lifecycle state.

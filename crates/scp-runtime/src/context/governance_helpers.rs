@@ -14,16 +14,13 @@
 //!
 //! Phase 2A.8 lands as a multi-commit ladder. Each commit migrates a
 //! group of related helpers, wiring the actor-shape
-//! `handlers::governance::dispatch` arms incrementally. Five
-//! supervisor-scoped helpers (`start_governance_timeout_task`,
-//! `evaluate_periodic_consequences`, `process_pending_commits`,
-//! `compute_commit_retry_outcomes`, `apply_commit_retry_outcomes`)
-//! inherently iterate the contexts `DashMap` and have no actor-shape
-//! twin — they remain in
-//! [`crate::context::governance_helpers_legacy`] until the legacy
-//! contexts map dissolves at Phase 2A finalization.
-
-use std::sync::Arc;
+//! `handlers::governance::dispatch` arms incrementally. The
+//! supervisor-scoped sweep helpers (`evaluate_periodic_consequences`,
+//! `process_pending_commits`, `compute_commit_retry_outcomes`,
+//! `apply_commit_retry_outcomes`) iterate the actor registry and drive
+//! each context's per-actor sweep body through its mailbox. (Governance
+//! timeouts are an ACTOR-OWNED interval arm — ADR-049 finding A3 — not a
+//! supervisor-spawned task.)
 
 use scp_clock::Clock;
 use scp_did::DID;
@@ -312,8 +309,14 @@ pub async fn tombstone_migrated_context(
         };
         emit(state, tombstone_event, context_id, deps);
 
-        state.ttl.timer.cancel();
-        state.governance.timeout_task.cancel();
+        // TTL + governance timers are actor-owned arms (ADR-049 finding A3);
+        // the tombstone leaves the context non-Active so `reconcile_timers`
+        // clears the governance interval and disarms the TTL arm. Clear the
+        // recorded TTL deadline HERE (durably, in the fail-closed snapshot) so a
+        // stale absolute deadline cannot fire against the tombstoned context on
+        // a later restore and despawn it — which would defeat tombstone finality
+        // by making the id re-creatable (BUG-1).
+        state.ttl.timer.deadline_unix_secs = None;
         state.broadcast_context = None;
         state.migration_state = None;
         // M7: Participation decay on tombstone (#1530).
@@ -1832,8 +1835,14 @@ pub async fn execute_close_context(
     // cleanup (Class-C) rides the fail-closed persist via `view.rest_mut()`.
     cell.commit_class_s_keep(deps, context_id, |mut view| {
         let state = view.rest_mut();
-        state.ttl.timer.cancel();
-        state.governance.timeout_task.cancel();
+        // TTL + governance timers are actor-owned arms (ADR-049 finding A3):
+        // this close leaves the context non-Active so `reconcile_timers`
+        // clears the governance interval and disarms the TTL arm. Clear the
+        // recorded TTL deadline HERE (durably, in the fail-closed snapshot) so a
+        // stale absolute deadline cannot fire against the closed context on a
+        // later restore and despawn it (BUG-1) — mirroring
+        // `execute_promote_context`.
+        state.ttl.timer.deadline_unix_secs = None;
         state.broadcast_context = None;
         state.governance.decay_participation();
         Ok(())
@@ -1915,73 +1924,33 @@ pub async fn execute_extend_ttl(
     drop(approval_dids);
     drop(member_dids);
 
-    let now = deps.clock.now_secs();
-    // Snapshot the context handle for the re-armed timer BEFORE taking the
-    // Class-C view (read via `Deref`).
-    let handle = cell.handle.clone();
-
-    // Coalesced TTL-timer re-arm: the timer fields are Class-C / structural
-    // (SCP-021). A single non-persisting Class-C view borrow holds `&mut ttl`
-    // across the `start_ttl_timer(...).await`, then drops before the best-effort
-    // persist — no fail-closed strengthening, no extra persist injected.
-    let (old_dl, new_dl) = {
-        let mut view = cell.class_c_view();
-        let ttl = view.ttl_mut();
-        ttl.timer.cancel();
-        let old_dl = ttl.timer.deadline_unix_secs.unwrap_or(0);
-        let remaining_secs = ttl.timer.deadline_unix_secs.as_mut().map(|deadline| {
-            *deadline = deadline.saturating_add(additional_secs);
-            deadline.saturating_sub(now)
-        });
-        let new_dl = ttl.timer.deadline_unix_secs.unwrap_or(0);
-        ttl.timer.cancel = Arc::new(tokio::sync::Notify::new());
-        ttl.timer.task = None;
-
-        // Phase 2A.6 Option B: actor-shape ttl_close_helpers::start_ttl_timer
-        // exists. Call it if a remaining duration is set.
-        if let Some(secs) = remaining_secs {
-            crate::context::ttl_close_helpers::start_ttl_timer(
-                // ADR-049 §9: `start_ttl_timer` was narrowed from
-                // `&mut PerContextState` to `&mut TtlTimer` so the ttl_close actor
-                // handler can reach it through the non-persisting Class-C view; the
-                // governance path passes the same timer directly. Behaviour
-                // unchanged — the helper only ever touched `state.ttl.timer`.
-                &mut ttl.timer,
-                deps,
-                context_id,
-                std::time::Duration::from_secs(secs),
-                // The extended deadline `new_dl` was computed convergently above as
-                // `old_deadline + additional_secs` (anchored on the prior
-                // convergent deadline). Pass it through as the override so the
-                // re-armed timer records that convergent value — not the local
-                // arm-time `now + remaining` — on the `ContextExpired` leaf.
-                Some(new_dl),
-                handle,
-            )
-            .await;
-        }
-        (old_dl, new_dl)
-    };
+    // Leaf-atomic TTL extension (ADR-049 §9, B3): raise the log-derived
+    // convergent deadline by `additional_secs`, mutate the recorded (actor-owned,
+    // §A3) timer AND append the matching `TtlExtended` leaf from the SAME
+    // resolved value, via the shared `extend_ttl_deadline_and_record` combinator
+    // (also used by the bilateral `reset_ttl_timer` path) so a deadline mutation
+    // can never drift from its convergent leaf. The combinator derives the
+    // current deadline from the single authoritative source (the log), extends
+    // it (`old_deadline + additional_secs`, convergent across members), and
+    // stamps the leaf with the committer-assigned `timestamp_secs`
+    // (`proposal.created_at`). A context whose log yields no convergent deadline
+    // has no TTL to extend ⇒ no-op, no leaf. The append is best-effort/fail-safe
+    // (a lost leaf re-derives the shorter un-extended base on restore).
+    crate::context::ttl_close_helpers::extend_ttl_deadline_and_record(
+        cell,
+        deps.event_log.as_ref(),
+        &context_id_bytes,
+        actor_did,
+        additional_secs,
+        crate::context::ttl_close_helpers::ExtensionLeaf::Governance {
+            proposal_id,
+            committer_timestamp_secs: timestamp_secs,
+            consenting_members: consenting,
+        },
+    )
+    .await;
 
     crate::context::messaging_helpers::persist_state_best_effort(&*cell, deps, context_id).await;
-
-    let extended_payload =
-        scp_event_log::payload::encode_payload(&scp_event_log::payload::TtlExtendedPayload {
-            old_deadline_unix: old_dl,
-            new_deadline_unix: new_dl,
-            proposal_id,
-            consenting_members: consenting,
-        })
-        .map_err(|e| ContextError::EventLogFailed(e.to_string()))?;
-    deps.event_log
-        .append_context_event_with_payload(
-            &context_id_bytes,
-            scp_event_log::EventType::TtlExtended,
-            actor_did,
-            extended_payload,
-            timestamp_secs,
-        )
-        .await?;
     *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
@@ -2730,11 +2699,28 @@ pub async fn execute_promote_context(
     } = meta;
     let context_id_bytes = context_id_to_bytes(context_id);
 
-    // Promotion clears the TTL timer + promotes the handle's memory scope —
-    // both Class-C structural state. The active-state + promotable-policy +
-    // unanimity guards read through the cell's `Deref`; the `ttl` / `handle`
-    // mutations ride `commit_class_c_best_effort`, preserving the prior
-    // best-effort persist exactly.
+    // Promotion clears the TTL timer + applies the §5.10 params mutation
+    // (memory scope → Full AND `params.ttl` → None). Clearing `params.ttl` is the
+    // SOLE prune-immune promotion authority for the single-source TTL-deadline
+    // invariant (ADR-049 §9): the deadline reader derives "promoted ⇒ no arm" from
+    // `params.ttl == None` and does NOT read the `ContextPromoted` leaf for the
+    // arm. That makes the params mutation SECURITY-CRITICAL: if a best-effort
+    // persist of it silently fails and the actor crashes before a later
+    // re-persist, a respawn reads a stale `params.ttl = Some` snapshot, re-arms
+    // the TTL, and destroys the keys of a context members unanimously voted
+    // permanent (the fail-DANGEROUS direction §9 names). Route the mutation
+    // through the FAIL-CLOSED Class-S combinator `commit_class_s_keep` (the same
+    // tier `execute_close_context` uses; the two now genuinely mirror each other)
+    // so a persist failure surfaces as an error rather than leaving a re-armable
+    // stale snapshot. Keep-direction: on persist failure the promotion STAYS
+    // (re-arming a context voted permanent is the unsafe direction). The
+    // active-state + promotable-policy + unanimity guards read through the cell's
+    // `Deref` before the commit; the `ttl` / `handle` mutations ride the
+    // fail-closed persist via `view.rest_mut()`. The `ContextPromoted` leaf is
+    // appended AFTER the durable persist succeeds, and remains only a RECORD (it
+    // is NOT read back to disarm the TTL — re-adding a leaf-fallback read would
+    // let a forged/spurious leaf make a finite context never expire, the other
+    // fail-dangerous direction pass-4e closed).
     require_active(&cell.handle)?;
 
     if !matches!(
@@ -2761,13 +2747,17 @@ pub async fn execute_promote_context(
     drop(member_dids);
     drop(approval_dids);
 
-    cell.commit_class_c_best_effort(deps, context_id, |mut view| {
-        let ttl = view.ttl_mut();
-        ttl.timer.cancel();
-        ttl.timer.deadline_unix_secs = None;
-        view.handle_mut().promote_memory_scope();
+    cell.commit_class_s_keep(deps, context_id, |mut view| {
+        let state = view.rest_mut();
+        // Clear the recorded deadline so the actor-owned TTL arm disarms on the
+        // next `reconcile_timers` (ADR-049 finding A3; no task to cancel).
+        state.ttl.timer.deadline_unix_secs = None;
+        // §5.10 params mutation: memory scope → Full AND `params.ttl` → None (the
+        // prune-immune promotion authority the deadline reader consults).
+        state.handle.promote_params();
+        Ok(())
     })
-    .await;
+    .await?;
     deps.event_log
         .append_context_event(
             &context_id_bytes,
@@ -5655,11 +5645,12 @@ pub async fn keep_broadcast_failure(
 /// replied or its mailbox is gone.
 ///
 /// First bulk-iterator caller lands in Phase 2B per ADR-049 — the
-/// per-context governance-timeout task's tick closure already
-/// dispatches the per-actor variant directly via the actor mailbox
-/// (see `start_governance_timeout_task_legacy`'s Phase 4), so the
-/// supervisor-scope sweep is only needed for FFI bridge "evaluate
-/// now" operations or test fixtures that drive deterministic ticks.
+/// per-actor `EvaluatePeriodicConsequences` body is also invoked
+/// directly (Phase 4) by the ACTOR-OWNED governance-timeout sweep
+/// ([`handlers::governance::evaluate_governance_timeouts`](crate::context::actor::handlers::governance),
+/// ADR-049 finding A3), so this supervisor-scope bulk sweep is only
+/// needed for FFI bridge "evaluate now" operations or test fixtures that
+/// drive deterministic ticks.
 #[allow(
     dead_code,
     reason = "first bulk-iterator caller lands in Phase 2B per ADR-049 — \
@@ -5725,169 +5716,6 @@ pub async fn process_pending_commits(supervisor: &crate::context::supervisor::Su
             continue;
         }
         let _ = rx.await;
-    }
-}
-
-/// Sweep entry point: run one tick of the governance timeout pipeline
-/// for a single context (target supplied by the caller — the
-/// supervisor's spawn-time per-context timer task).
-///
-/// This is the per-tick body that the spawn-time governance-timeout
-/// task invokes. Unlike the bulk sweeps above, this entry point
-/// targets a single named context (the timer's own); the
-/// supervisor-iterating shape is reserved for the bulk consequence /
-/// commit sweeps.
-///
-/// Dispatches
-/// [`GovernanceCommand::EvaluateTimeouts`](crate::context::actor::commands::GovernanceCommand::EvaluateTimeouts)
-/// to the named actor and returns whether the timer loop should
-/// continue (`true`) or stop (`false`). Matches the legacy timer
-/// closure's `bool` return.
-///
-/// Returns `false` if the actor cannot be reached (mailbox closed or
-/// no actor registered for `context_id`) — the timer loop stops in
-/// that case, matching the legacy `contexts.get(ctx_id) = None ->
-/// return false` semantics (registry-based replacement for the
-/// stale-generation gate).
-async fn tick_governance_timeout(
-    supervisor: &crate::context::supervisor::handle::SupervisorHandle,
-    context_id: &str,
-) -> bool {
-    use crate::context::actor::commands::{ContextCommand, GovernanceCommand};
-
-    let Some(actor) = supervisor.lookup(context_id) else {
-        return false;
-    };
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    let cmd = ContextCommand::Governance(GovernanceCommand::EvaluateTimeouts { reply: tx });
-    if actor
-        .send_with_timeout(cmd, crate::context::actor::SEND_TIMEOUT)
-        .await
-        .is_err()
-    {
-        return false;
-    }
-    match rx.await {
-        Ok(Ok(b)) => b,
-        _ => false,
-    }
-}
-
-/// Spawn (or respawn) THIS context's governance-timeout interval task on
-/// actor-owned state.
-///
-/// Replaces `start_governance_timeout_task_legacy`: the new interval
-/// loop holds no `&Supervisor` and reads no `contexts` `DashMap`. On each
-/// 60-second wake it resolves the owning actor via
-/// [`SupervisorHandle::lookup`](crate::context::supervisor::handle::SupervisorHandle::lookup)
-/// and mailboxes
-/// [`GovernanceCommand::EvaluateTimeouts`](crate::context::actor::commands::GovernanceCommand::EvaluateTimeouts),
-/// whose actor handler runs all five timeout phases (proposal
-/// resolution, deadlock detection, event writeback, consequence
-/// evaluation, commit-retry drain) on the actor's owned `&mut state`. A
-/// `lookup → None` / mailbox failure stops the loop — the registry-based
-/// replacement for the legacy stale-generation gate.
-///
-/// The loop is spawned onto the supervisor's tracked `task_set` via
-/// [`SupervisorHandle::tracked_spawn`](crate::context::supervisor::handle::SupervisorHandle::tracked_spawn);
-/// its cancel `Notify` + `AbortHandle` are installed on
-/// `state.governance.timeout_task` via
-/// [`GovernanceTimeoutTask::install`](crate::context::governance::timeout::GovernanceTimeoutTask::install),
-/// which aborts any prior task first (cancel/reset semantics preserved).
-///
-/// `tracked_spawn` is awaited (it acquires the `task_set` mutex) so the
-/// abort handle is available to install before returning. Called from
-/// the actor handler for
-/// [`GovernanceCommand::StartTimeoutTask`](crate::context::actor::commands::GovernanceCommand::StartTimeoutTask).
-pub async fn spawn_governance_timeout_task(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
-    deps: &ActorDeps,
-) {
-    use crate::context::governance::timeout::TIMEOUT_CHECK_INTERVAL_SECS;
-
-    // Reads of the context id go through the cell's `Deref`; no whole-state
-    // `&mut` is taken across the spawn `.await`.
-    let context_id = cell.handle.context_id().to_owned();
-    let supervisor = deps.supervisor.clone();
-    let cancel = std::sync::Arc::new(tokio::sync::Notify::new());
-
-    let loop_cancel = std::sync::Arc::clone(&cancel);
-    let loop_fut = async move {
-        loop {
-            tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(
-                    TIMEOUT_CHECK_INTERVAL_SECS,
-                )) => {
-                    if !tick_governance_timeout(&supervisor, &context_id).await {
-                        break;
-                    }
-                }
-                () = loop_cancel.notified() => {
-                    break;
-                }
-            }
-        }
-    };
-
-    // Spawn onto the supervisor's tracked task_set and install the
-    // cancel signal + abort handle on actor-owned state. In the degraded
-    // no-task-set config `tracked_spawn` returns `None`; nothing to
-    // install (matches the legacy `task_set_ref() == None` early-return).
-    // Coalesced: the timeout-task handle is Class-C / structural (a transient
-    // abort handle, not durable authorization state) — installed through the
-    // non-persisting Class-C view AFTER the spawn `.await` resolves, with no
-    // per-site persist injected.
-    if let Some(abort) = deps.supervisor.tracked_spawn(loop_fut).await {
-        cell.class_c_view()
-            .governance_class_c_mut()
-            .timeout_task_mut()
-            .install(cancel, abort);
-    }
-}
-
-/// Sweep entry point retained as the non-legacy module surface for the
-/// lifecycle bootstrap. Mailboxes
-/// [`GovernanceCommand::StartTimeoutTask`](crate::context::actor::commands::GovernanceCommand::StartTimeoutTask)
-/// to the freshly-spawned actor, which installs the interval task on its
-/// owned `state.governance.timeout_task` via
-/// [`spawn_governance_timeout_task`].
-///
-/// Best-effort: a `lookup → None` (actor not yet registered) or
-/// mailbox-send failure is logged and skipped — the governance-timeout
-/// task is a background facility, not part of the create/restore success
-/// contract.
-pub async fn start_governance_timeout_task(
-    supervisor: &crate::context::supervisor::handle::SupervisorHandle,
-    context_id: &str,
-) {
-    use crate::context::actor::commands::{ContextCommand, GovernanceCommand};
-
-    let Some(actor) = supervisor.lookup(context_id) else {
-        tracing::warn!(
-            context_id,
-            "start_governance_timeout_task: no actor registered — timeout task not installed"
-        );
-        return;
-    };
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    let cmd = ContextCommand::Governance(GovernanceCommand::StartTimeoutTask { reply: tx });
-    if actor
-        .send_with_timeout(cmd, crate::context::actor::SEND_TIMEOUT)
-        .await
-        .is_err()
-    {
-        tracing::warn!(
-            context_id,
-            "start_governance_timeout_task: mailbox send failed — timeout task not installed"
-        );
-        return;
-    }
-    if let Ok(Err(e)) = rx.await {
-        tracing::warn!(
-            context_id,
-            error = %e,
-            "start_governance_timeout_task: actor reported timeout-task install failure"
-        );
     }
 }
 
@@ -6615,6 +6443,79 @@ mod commit_broadcast_retry_tests {
         assert!(
             commit_fault.is_none(),
             "commit_fault stays clear below the queue cap"
+        );
+    }
+
+    // -- F1: promotion persists FAIL-CLOSED, keep-direction -----------------
+
+    /// F1 (promotion persists FAIL-CLOSED): a promotion whose durable persist
+    /// FAILS must SURFACE the error to the caller (not swallow it best-effort),
+    /// while KEEPING the promotion in memory (keep-direction). The retired
+    /// best-effort path returned `Ok` on a silent persist failure, leaving a
+    /// stale `params.ttl = Some` snapshot on disk that a crash+restart would
+    /// re-arm — destroying the keys of a context members unanimously voted
+    /// permanent (ADR-049 §9 fail-DANGEROUS direction). Routing the mutation
+    /// through `commit_class_s_keep` makes the failure observable AND retains the
+    /// disarmed/promoted in-memory state so a successful re-persist carries it.
+    #[tokio::test]
+    async fn promote_context_persist_failure_is_fail_closed_and_kept() {
+        use scp_protocol::context::ContextState;
+        use scp_protocol::context::params::{MemoryScope, PromotionPolicy};
+
+        let deps = build_deps(
+            Box::new(RecordingTransport {
+                sends: Arc::new(AtomicUsize::new(0)),
+                fail: false,
+            }),
+            Box::new(FailPersistence),
+        )
+        .await;
+
+        // Active, Promotable, finite ttl with an armed absolute deadline — the
+        // exact shape whose promotion, if lost, would re-arm on restart.
+        let mut state = fresh_state();
+        state.handle = crate::context::ContextHandle::new(
+            ctx_hex(),
+            ContextParams {
+                promotion_policy: PromotionPolicy::Promotable,
+                ttl: Some(std::time::Duration::from_secs(500)),
+                ..Default::default()
+            },
+        );
+        state
+            .handle
+            .transition_to(&ContextState::Active)
+            .expect("Creating → Active is a valid transition");
+        state.ttl.timer.deadline_unix_secs = Some(1_700_000_500);
+        let mut cell = ClassSCell::new(state);
+
+        let meta = super::CommitMeta {
+            pid: [0u8; 32],
+            actor_did: ADMIN,
+            timestamp_secs: 1_700_000_000,
+        };
+        // Empty membership ⇒ unanimity is trivially satisfied with no approvals.
+        let result = super::execute_promote_context(&mut cell, &deps, &ctx_hex(), &[], meta).await;
+
+        assert!(
+            matches!(result, Err(ContextError::PersistenceFailed(_))),
+            "a promotion whose persist fails must surface fail-closed (F1), got {result:?}"
+        );
+        // Keep-direction: the promotion is RETAINED in memory so a re-persist
+        // carries it — it is NOT rolled back to a re-armable `ttl = Some` state.
+        assert_eq!(
+            cell.handle.params().ttl,
+            None,
+            "promotion kept: params.ttl cleared (the SOLE prune-immune disarm authority)"
+        );
+        assert_eq!(
+            cell.handle.params().memory_scope,
+            MemoryScope::Full,
+            "promotion kept: memory_scope → Full"
+        );
+        assert_eq!(
+            cell.ttl.timer.deadline_unix_secs, None,
+            "promotion kept: the armed absolute deadline is disarmed in memory"
         );
     }
 }

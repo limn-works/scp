@@ -13,20 +13,19 @@
 //! [`Supervisor::dispatch_ttl_close_command`](crate::context::supervisor::supervisor::Supervisor::dispatch_ttl_close_command)
 //! routes it here.
 //!
-//! # Timer ownership
+//! # Timer ownership (ADR-049 Decision-1 / finding A3)
 //!
-//! The actor-shape `start_ttl_timer` / `reset_ttl_timer` install the
-//! TTL timer on actor-owned `state.ttl.timer` via
-//! [`ttl_close_helpers::spawn_ttl_timer`](crate::context::ttl_close_helpers):
-//! the task is spawned onto the supervisor's tracked `task_set` through
-//! [`SupervisorHandle::tracked_spawn`](crate::context::supervisor::handle::SupervisorHandle::tracked_spawn)
-//! and, on fire, resolves the owning actor through
-//! [`SupervisorHandle::lookup`](crate::context::supervisor::handle::SupervisorHandle::lookup)
-//! and mailboxes [`TtlCloseCommand::FireTimer`] — no `&Supervisor` /
-//! `contexts` DashMap reach. See the
+//! The TTL timer is an ACTOR-OWNED arm. The actor-shape `start_ttl_timer`
+//! / `reset_ttl_timer` record the convergent
+//! `state.ttl.timer.deadline_unix_secs` on actor-owned state via
+//! [`ttl_close_helpers::start_ttl_timer`](crate::context::ttl_close_helpers)
+//! — they no longer spawn a supervisor `task_set` timer task. The actor's
+//! own `run()` loop reconciles a one-shot `sleep` against that deadline
+//! (`ContextActor::reconcile_timers`) and runs the expiry pipeline
+//! (`on_ttl_tick` → [`ttl_close_helpers::handle_ttl_expiry`](crate::context::ttl_close_helpers))
+//! on wake, with no `&Supervisor` / mailbox hop. See the
 //! [`crate::context::ttl_close_helpers`] module-level doc for the full
-//! rationale (ADR-049 Phase 2A finalization — timer → actor registry +
-//! mailbox tick).
+//! rationale.
 //!
 //! # Transport-timeout budget
 //!
@@ -41,7 +40,6 @@ use std::time::Duration;
 use scp_protocol::context::ContextError;
 use tokio::sync::oneshot;
 
-use crate::context::ContextHandle;
 use crate::context::actor::class_s::ClassSCell;
 use crate::context::actor::commands::TtlCloseCommand;
 use crate::context::actor::deps::ActorDeps;
@@ -64,19 +62,9 @@ pub(crate) async fn dispatch(
     cmd: TtlCloseCommand,
 ) -> Outcome<()> {
     match cmd {
-        TtlCloseCommand::FireTimer { reply } => handle_fire_timer(cell, deps, reply).await,
         TtlCloseCommand::StartTtlTimer { payload, reply } => {
             let p = *payload;
-            handle_start_ttl_timer(
-                cell,
-                deps,
-                p.context_id,
-                p.params,
-                p.duration,
-                p.anchor_deadline_to_creation,
-                reply,
-            )
-            .await
+            handle_start_ttl_timer(cell, &p.params, p.deadline_override, reply)
         }
         TtlCloseCommand::ExtendTtl {
             context_id,
@@ -86,15 +74,15 @@ pub(crate) async fn dispatch(
         } => handle_extend_ttl(cell, deps, context_id, member_did, proposed_duration, reply).await,
         TtlCloseCommand::ResetTtlTimer { payload, reply } => {
             let p = *payload;
-            handle_reset_ttl_timer(cell, deps, p.context_id, p.params, p.duration, reply).await
+            handle_reset_ttl_timer(cell, deps, p.context_id, p.duration, reply).await
         }
         TtlCloseCommand::ExecuteTtlClose { payload, reply } => {
             let p = *payload;
-            handle_execute_ttl_close(cell, deps, p.context_id, p.params, reply).await
+            handle_execute_ttl_close(cell, deps, p.context_id, reply).await
         }
         TtlCloseCommand::FinalizeClose { payload, reply } => {
             let p = *payload;
-            handle_finalize_close(cell, deps, p.context_id, p.params, reply).await
+            handle_finalize_close(cell, deps, p.context_id, reply).await
         }
     }
 }
@@ -105,74 +93,48 @@ pub(crate) async fn dispatch(
 
 /// Handle [`TtlCloseCommand::StartTtlTimer`] against actor-owned state.
 ///
-/// Routes to [`crate::context::ttl_close_helpers::start_ttl_timer`],
-/// which installs the timer on `state.ttl.timer` via the actor-shape
-/// `spawn_ttl_timer` (tracked `task_set` spawn + registry-resolved
-/// `FireTimer` tick). The timer itself has no inherent timeout, but we
-/// still wrap it so a pathological mailbox / task-set contention storm
-/// cannot block the dispatcher indefinitely.
-async fn handle_start_ttl_timer(
+/// Records the convergent TTL expiry deadline on `state.ttl.timer` via
+/// [`crate::context::ttl_close_helpers::start_ttl_timer`]. This is a
+/// SYNCHRONOUS deadline write (ADR-049 finding A3): the actor's
+/// `reconcile_timers` derives the one-shot expiry sleep from the recorded
+/// deadline, so there is no transport/task work to time-bound here.
+fn handle_start_ttl_timer(
     cell: &mut ClassSCell,
-    deps: &ActorDeps,
-    context_id: String,
-    params: scp_protocol::context::params::ContextParams,
-    duration: std::time::Duration,
-    anchor_deadline_to_creation: bool,
+    params: &scp_protocol::context::params::ContextParams,
+    deadline_override: Option<crate::context::ttl_close_helpers::ConvergentDeadline>,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
-    // Derive the CONVERGENT expiry deadline from the actor-owned convergent
-    // creation timestamp + the TTL duration in the context params (both
-    // convergent across members), so the timer-fired
-    // `ContextExpired`/`ContextClosed` leaf timestamp converges (§7.3.1,
-    // §9.9.3). The initial-create, restore, and import paths all pass `true`:
-    // the snapshot now carries the convergent creation time, so
-    // `state.creation_timestamp_secs` is the authentic creator-assigned value on
-    // every path (verbatim from the creator-signed snapshot on import). Callers
-    // that genuinely have no convergent base pass `false` and arm relative to
-    // the local clock (`None`).
-    let deadline_override = if anchor_deadline_to_creation {
+    // Resolve the ABSOLUTE convergent expiry deadline to record, as a
+    // [`ConvergentDeadline`](crate::context::ttl_close_helpers::ConvergentDeadline)
+    // (the arming-seam newtype). `Some` is the explicit deadline supplied by the
+    // restore/import paths — derived from the SINGLE authoritative source (the
+    // log) via `convergent_ttl_deadline`, so a prior extension survives and a
+    // `None`-remaining Active snapshot still re-arms (D1/D2). `None` (the
+    // initial-create / spawn-from-Welcome path) falls back to the convergent
+    // create base `creation_timestamp_secs + params.ttl`: at create there is no
+    // log yet, but the just-written `ContextCreated` leaf carries the identical
+    // value, so arming via the create-base primitive is convergent (§7.3.1,
+    // §9.9.3). `creation_timestamp_secs` is the authentic creator-assigned value
+    // on every path (verbatim from the creator-signed snapshot on import).
+    let deadline = deadline_override.or_else(|| {
         crate::context::ttl_close_helpers::convergent_ttl_deadline_secs(
             cell.creation_timestamp_secs,
             params.ttl.map(|ttl| ttl.as_secs()),
         )
-    } else {
-        None
-    };
+    });
 
-    let handle = ContextHandle::new(context_id.clone(), params);
-    if let Err(e) = handle.transition_to(&scp_protocol::context::ContextState::Active) {
-        let sketch = outcome_error_sketch(&e);
-        let _ = reply.send(Err(e));
-        return Outcome::err(sketch);
+    // The TTL timer is Class-C; record the deadline through the non-persisting
+    // Class-C view (no `state_mut`, ADR-049 §9). A `None` here means the context
+    // carries no finite TTL, so there is nothing to arm.
+    if let Some(deadline) = deadline {
+        crate::context::ttl_close_helpers::start_ttl_timer(
+            &mut cell.class_c_view().ttl_mut().timer,
+            deadline,
+        );
     }
 
-    // The TTL timer is Class-C; `start_ttl_timer` takes the narrow
-    // `&mut TtlTimer` reached through the non-persisting Class-C view (no
-    // `state_mut`). The view borrow spans the timeout await and ends when
-    // the match arm completes (ADR-049 §9).
-    let mut view = cell.class_c_view();
-    let spawn_fut = crate::context::ttl_close_helpers::start_ttl_timer(
-        &mut view.ttl_mut().timer,
-        deps,
-        &context_id,
-        duration,
-        deadline_override,
-        handle,
-    );
-
-    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, spawn_fut).await {
-        Ok(()) => (Outcome::ok_mutated(()), Ok(())),
-        Err(_elapsed) => {
-            let err = ContextError::TransportTimeout(format!(
-                "start_ttl_timer exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
-            ));
-            let sketch = outcome_error_sketch(&err);
-            (Outcome::err_mutated(sketch), Err(err))
-        }
-    };
-
-    let _ = reply.send(reply_result);
-    outcome
+    let _ = reply.send(Ok(()));
+    Outcome::ok_mutated(())
 }
 
 /// Handle [`TtlCloseCommand::ExtendTtl`] against actor-owned state.
@@ -218,28 +180,21 @@ async fn handle_extend_ttl(
 }
 
 /// Handle [`TtlCloseCommand::ResetTtlTimer`] against actor-owned state.
+///
+/// Re-records the TTL deadline (a Class-C write) and persists best-effort via
+/// [`crate::context::ttl_close_helpers::reset_ttl_timer`]. The persist is the
+/// only I/O, so the `HANDLER_TIMEOUT` wrap bounds it (ADR-049 finding A3 — the
+/// deadline itself is re-derived into a one-shot sleep by the actor's
+/// `reconcile_timers`, no task is spawned).
 async fn handle_reset_ttl_timer(
     cell: &mut ClassSCell,
     deps: &ActorDeps,
     context_id: String,
-    params: scp_protocol::context::params::ContextParams,
     new_duration: std::time::Duration,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
-    let handle = ContextHandle::new(context_id.clone(), params);
-    if let Err(e) = handle.transition_to(&scp_protocol::context::ContextState::Active) {
-        let sketch = outcome_error_sketch(&e);
-        let _ = reply.send(Err(e));
-        return Outcome::err(sketch);
-    }
-
-    let reset_fut = crate::context::ttl_close_helpers::reset_ttl_timer(
-        cell,
-        deps,
-        &context_id,
-        new_duration,
-        handle,
-    );
+    let reset_fut =
+        crate::context::ttl_close_helpers::reset_ttl_timer(cell, deps, &context_id, new_duration);
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, reset_fut).await {
         Ok(()) => (Outcome::ok_mutated(()), Ok(())),
@@ -257,109 +212,105 @@ async fn handle_reset_ttl_timer(
 }
 
 /// Handle [`TtlCloseCommand::ExecuteTtlClose`] against actor-owned state.
+///
+/// # B10 — operates on the actor's REAL handle
+///
+/// The prior implementation built a THROWAWAY `ContextHandle::new(context_id,
+/// params)`, transitioned IT to `Active`, and ran `handle_ttl_expiry` against
+/// that detached handle — so an FFI `context_handle_ttl_expiry` transitioned a
+/// disconnected FSM while the actor's OWN persisted state stayed `Active`. This
+/// version drives the actor's real `cell.handle` (a clone shares the same
+/// `Arc<ArcSwap<ContextState>>`), so the FFI path transitions and FAIL-CLOSED
+/// persists the actor's own terminal `Expired` state — the same SEC-1 treatment
+/// as [`on_ttl_tick`](crate::context::actor). No `transition_to(Active)`: the
+/// live actor is already `Active`, and `apply_ttl_terminal_transition` moves
+/// `Active`/`Expired` → `Expired`.
+///
+/// No timeout wraps the whole call: `handle_ttl_expiry` bounds ONLY its
+/// relay/event-log I/O internally, running the fail-closed terminal persist
+/// OUTSIDE that bound (SEC-1). A single command dispatch threads no on-actor
+/// retry state, so `prior_completed` starts at `0`.
 async fn handle_execute_ttl_close(
     cell: &mut ClassSCell,
     deps: &ActorDeps,
     context_id: String,
-    params: scp_protocol::context::params::ContextParams,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
-    let handle = ContextHandle::new(context_id.clone(), params);
-    if let Err(e) = handle.transition_to(&scp_protocol::context::ContextState::Active) {
-        let sketch = outcome_error_sketch(&e);
-        let _ = reply.send(Err(e));
-        return Outcome::err(sketch);
-    }
+    let handle = cell.handle.clone();
 
-    let expiry_fut = crate::context::ttl_close_helpers::handle_ttl_expiry(cell, deps, &handle);
+    let outcome =
+        crate::context::ttl_close_helpers::handle_ttl_expiry(cell, deps, &handle, 0).await;
 
-    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, expiry_fut).await {
-        Ok(Ok(())) => (Outcome::ok_mutated(()), Ok(())),
-        Ok(Err(e)) => {
-            let sketch = outcome_error_sketch(&e);
-            (Outcome::err_mutated(sketch), Err(e))
-        }
-        Err(_elapsed) => {
-            let err = ContextError::TransportTimeout(format!(
-                "handle_ttl_expiry exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
-            ));
-            let sketch = outcome_error_sketch(&err);
-            (Outcome::err_mutated(sketch), Err(err))
-        }
+    // Surface the inner error the prior second discard-the-error path swallowed
+    // (B10 / Risk 5): a fail-closed terminal-persist failure OR an incomplete
+    // cleanup is reported to the FFI caller (and logged), rather than silently
+    // reporting success.
+    let reply_result: Result<(), ContextError> = if let Err(e) = outcome.persist_result {
+        Err(e)
+    } else if outcome.result.has_failures() {
+        let msg = outcome.result.errors().join("; ");
+        Err(
+            if !outcome.result.mls_destroyed() || !outcome.result.sender_key_destroyed() {
+                ContextError::CryptoFailed(msg)
+            } else {
+                ContextError::EventLogFailed(msg)
+            },
+        )
+    } else {
+        Ok(())
     };
 
-    let _ = reply.send(reply_result);
-    outcome
-}
-
-/// Handle [`TtlCloseCommand::FireTimer`] against actor-owned state.
-///
-/// Per-context TTL-timer tick. Sent by the per-context timer task on
-/// each wake (see
-/// [`ttl_close_helpers::spawn_ttl_timer`](crate::context::ttl_close_helpers::spawn_ttl_timer))
-/// once the configured TTL duration elapses. Runs the actor-shape
-/// expiry pipeline
-/// ([`ttl_close_helpers::handle_ttl_expiry`](crate::context::ttl_close_helpers::handle_ttl_expiry))
-/// against owned `&mut state`: it cancels the governance-timeout task,
-/// decays participation, emits the `Expired` / `ExpiryFailed` event, and
-/// persists best-effort.
-///
-/// Replaces the legacy `spawn_ttl_timer_legacy` task's inline expiry tail
-/// that locked the `contexts` DashMap entry and applied a stale-generation
-/// gate (ADR-049 Phase 2A finalization — DashMap removal). The
-/// generation gate is gone: the timer task resolves the actor via
-/// [`Supervisor::lookup`](crate::context::supervisor::Supervisor::lookup),
-/// so a despawned actor (context gone / recreated) is never reached, and
-/// the actor owns its state for the whole turn (no concurrent
-/// close-and-recreate window).
-///
-/// Reply: `Ok(false)` — the expiry pipeline has fired, so the timer task
-/// stops after this tick. (The reply currently always reports "do not
-/// continue"; a future repeating-timer variant would return `Ok(true)`.)
-async fn handle_fire_timer(
-    cell: &mut ClassSCell,
-    deps: &ActorDeps,
-    reply: oneshot::Sender<Result<bool, ContextError>>,
-) -> Outcome<()> {
-    let handle = cell.handle.clone();
-    let expiry_fut = crate::context::ttl_close_helpers::handle_ttl_expiry(cell, deps, &handle);
-
-    match tokio::time::timeout(HANDLER_TIMEOUT, expiry_fut).await {
-        Ok(Ok(())) => {
-            let _ = reply.send(Ok(false));
-            Outcome::ok_mutated(())
-        }
-        Ok(Err(e)) => {
-            let sketch = outcome_error_sketch(&e);
-            let _ = reply.send(Err(e));
-            Outcome::err_mutated(sketch)
-        }
-        Err(_elapsed) => {
-            let context_id = handle.context_id().to_owned();
-            let err = ContextError::TransportTimeout(format!(
-                "TTL FireTimer expiry exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
-            ));
-            let sketch = outcome_error_sketch(&err);
-            let _ = reply.send(Err(err));
-            Outcome::err_mutated(sketch)
-        }
+    if let Err(ref e) = reply_result {
+        tracing::error!(
+            context_id = %context_id,
+            error = %e,
+            "ExecuteTtlClose did not fully complete (fail-closed persist and/or \
+             cleanup); FSM not rolled back (SEC-1 / B10)"
+        );
     }
+
+    let outcome_sink = match &reply_result {
+        Ok(()) => Outcome::ok_mutated(()),
+        Err(e) => Outcome::err_mutated(outcome_error_sketch(e)),
+    };
+    let _ = reply.send(reply_result);
+    outcome_sink
 }
 
 /// Handle [`TtlCloseCommand::FinalizeClose`] against actor-owned state.
+///
+/// # Operates on the actor's REAL handle
+///
+/// The prior implementation built a THROWAWAY `ContextHandle::new(context_id,
+/// params)`, force-transitioned IT to `Closing`, and ran `finalize_close`
+/// against that detached handle — so an FFI `context_finalize_close` mutated a
+/// disconnected FSM while the actor's OWN persisted state stayed unchanged
+/// (the same detached-handle bug class the pass-2 `handle_execute_ttl_close`
+/// fix cured; in fact `Creating → Closing` is an INVALID transition, so the
+/// detached path could only ever error). This version drives the actor's real
+/// `cell.handle` (a clone shares the same `Arc<ArcSwap<ContextState>>`), so the
+/// cooperative-close finalization transitions the actor's own `Closing →
+/// Closed` state and destroys keys / deletes the snapshot against the live
+/// context.
+///
+/// No forced `transition_to(Closing)` on a detached handle: per the documented
+/// FFI contract the context must ALREADY be in `Closing` (a prior
+/// `close_context`), and [`ttl_close_helpers::finalize_close`] —
+/// via [`ttl::finalize_close`](crate::context::ttl::finalize_close) — performs
+/// the `Closing → Closed` transition itself, returning `InvalidTransition` if
+/// the context is not in `Closing`, exactly the FFI error contract.
+/// `ttl::finalize_close` validates that transition BEFORE destroying any key
+/// material, so a non-`Closing` context destroys nothing.
 async fn handle_finalize_close(
     cell: &mut ClassSCell,
     deps: &ActorDeps,
     context_id: String,
-    params: scp_protocol::context::params::ContextParams,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
-    let handle = ContextHandle::new(context_id.clone(), params);
-    if let Err(e) = handle.transition_to(&scp_protocol::context::ContextState::Closing) {
-        let sketch = outcome_error_sketch(&e);
-        let _ = reply.send(Err(e));
-        return Outcome::err(sketch);
-    }
+    // Drive the actor's REAL handle (a clone shares the same
+    // `Arc<ArcSwap<ContextState>>` as `cell.handle`), NOT a detached throwaway,
+    // so the `Closing → Closed` transition lands on the live context.
+    let handle = cell.handle.clone();
 
     let finalize_fut = crate::context::ttl_close_helpers::finalize_close(cell, deps, &handle);
 
@@ -399,5 +350,122 @@ fn outcome_error_sketch(err: &ContextError) -> ContextError {
         ContextError::MembershipFailed(msg) => ContextError::MembershipFailed(msg.clone()),
         ContextError::EventLogFailed(msg) => ContextError::EventLogFailed(msg.clone()),
         other => ContextError::CryptoFailed(format!("{other}")),
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use std::sync::Arc;
+
+    use scp_did::DID;
+    use tokio::sync::oneshot;
+
+    use crate::context::actor::class_s::ClassSCell;
+    use crate::context::actor::deps::ActorDeps;
+    use crate::context::actor::state::PerContextState;
+    use crate::context::builder::ContextEventLogProvider;
+    use crate::context::providers::MerkleEventLogProvider;
+
+    const ADMIN: &str = "did:dht:z6MkTtlFinalizeAdmin";
+    const CTX_BYTE: u8 = 0xfc;
+
+    /// Builds a minimal `ActorDeps` with an in-memory Merkle event log so the
+    /// real-handle `finalize_close` path can append its `ContextClosed` leaf.
+    async fn build_deps() -> ActorDeps {
+        use crate::context::supervisor::supervisor::Supervisor;
+        use scp_platform::testing::InMemoryStorage;
+
+        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+            ADMIN.to_owned(),
+            Arc::new(scp_clock::SystemClock),
+        ));
+        let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
+            Box::new(crate::context::builder::NotConfiguredTransportProvider);
+        let event_log: Box<dyn ContextEventLogProvider> = Box::new(MerkleEventLogProvider::new());
+        let key_resolver: scp_protocol::context::governance::KeyResolver = Arc::new(|_, _| None);
+        let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
+            Arc::new(
+                crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
+                    InMemoryStorage::new(),
+                )),
+            );
+        let clock: Arc<dyn scp_clock::Clock> = Arc::new(scp_clock::TestClock::new(1_700_000_000));
+        let supervisor = Supervisor::with_providers(
+            crypto,
+            transport,
+            event_log,
+            key_resolver,
+            None,
+            None,
+            None,
+            Some(clock),
+            mls_storage,
+        );
+        supervisor
+            .build_actor_deps(&DID(ADMIN.to_owned()))
+            .await
+            .expect("build_actor_deps")
+    }
+
+    /// B10-sibling regression: `FinalizeClose` MUST drive the actor's REAL
+    /// `cell.handle` (the shared `Arc<ArcSwap<ContextState>>`), transitioning the
+    /// LIVE context `Closing → Closed` — not a detached throwaway handle.
+    ///
+    /// Pre-fix the handler built a `ContextHandle::new(context_id, params)` in
+    /// `Creating` and force-transitioned IT to `Closing` (an INVALID
+    /// `Creating → Closing` transition, so the handler errored), while the
+    /// actor's own `cell.handle` stayed in `Closing`. This test seeds the real
+    /// handle in `Closing`, dispatches `FinalizeClose`, and asserts the reply is
+    /// `Ok` AND the REAL handle is now `Closed` — both of which fail pre-fix.
+    #[tokio::test]
+    async fn finalize_close_transitions_real_context_state() {
+        let deps = build_deps().await;
+
+        let context_id_bytes = [CTX_BYTE; 32];
+
+        let state = PerContextState::new_for_test_encrypted(
+            context_id_bytes,
+            1_700_000_000,
+            DID(ADMIN.to_owned()),
+        );
+        // The handle's own context-id string (the 64-hex of `context_id_bytes`);
+        // `finalize_close` re-derives the same keying bytes from it.
+        let context_id = state.handle.context_id().to_owned();
+        // Real cooperative-close precondition: the live context is in `Closing`
+        // (a prior `close_context` drove `Active → Closing`).
+        state
+            .handle
+            .transition_to(&crate::context::ContextState::Active)
+            .unwrap();
+        state
+            .handle
+            .transition_to(&crate::context::ContextState::Closing)
+            .unwrap();
+
+        // The real-handle path appends a `ContextClosed` leaf; init the log so
+        // the Merkle append succeeds.
+        deps.event_log
+            .init_event_log(&context_id_bytes)
+            .await
+            .expect("init event log");
+
+        let mut cell = ClassSCell::new(state);
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let _outcome = super::handle_finalize_close(&mut cell, &deps, context_id, reply_tx).await;
+
+        let reply = reply_rx.await.expect("handler replies");
+        assert!(
+            reply.is_ok(),
+            "FinalizeClose on a real Closing handle must succeed: {reply:?}"
+        );
+        assert_eq!(
+            cell.handle.state(),
+            crate::context::ContextState::Closed,
+            "FinalizeClose MUST transition the actor's REAL handle to Closed \
+             (pre-fix it mutated a detached throwaway and left the live handle \
+             in Closing)"
+        );
     }
 }

@@ -19,7 +19,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use super::ContextHandle;
-use super::governance::timeout::{DeadlockDetectionState, GovernanceTimeoutTask};
+use super::governance::timeout::DeadlockDetectionState;
 use super::ttl::{TtlExtension, TtlTimer};
 use scp_clock::Clock;
 use scp_did::DID;
@@ -695,9 +695,24 @@ pub struct ContextSnapshot {
     /// context-export digest is reproducible (§23.16.8, ADR-050).
     #[serde(with = "scp_protocol::serde_util::serde_sorted_set")]
     pub executed_proposals: HashSet<ProposalId>,
-    /// Remaining TTL in seconds, if a TTL timer was active. `None` if no
-    /// TTL was configured or the timer was not running.
-    pub ttl_remaining_secs: Option<u64>,
+    /// Absolute TTL expiry deadline in Unix seconds, if a TTL timer was armed.
+    /// `None` if no TTL was configured.
+    ///
+    /// Persisted as the CONVERGENT `state.ttl.timer.deadline_unix_secs`
+    /// (`creation_timestamp_secs + params.ttl`, or an already-extended
+    /// convergent deadline) — an ABSOLUTE instant, identical across members,
+    /// NOT a relative remaining-time. Restore/import re-arm the SAME absolute
+    /// deadline the context held before the restart, so (a) the create-window
+    /// stays closed (a `None`-remaining Active snapshot still re-arms via the
+    /// `creation + ttl` fallback) and (b) a prior TTL extension is preserved
+    /// verbatim rather than being silently recomputed back to `creation + ttl`
+    /// (ADR-049 §9, D1/D2).
+    ///
+    /// `#[serde(default)]` so a legacy snapshot that predates this field (it
+    /// carried the retired RELATIVE remaining-seconds field) decodes as `None`
+    /// and falls back to the `creation + ttl` re-derivation on restore.
+    #[serde(default)]
+    pub ttl_deadline_secs: Option<u64>,
     /// Dynamically registered outlets (beyond initial `ContextParams.outlets`).
     #[serde(default)]
     pub registered_outlets: Vec<OutletRegistration>,
@@ -1229,8 +1244,6 @@ pub(crate) struct GovernanceState {
     /// Governance freeze state due to simultaneous conflicts (ADR-031 §7).
     /// Contains the conflicting proposal IDs and freeze start timestamp.
     pub(crate) freeze: Option<(ProposalId, ProposalId, u64)>,
-    /// Governance timeout task (SCP-271, ADR-031 §5).
-    pub(crate) timeout_task: GovernanceTimeoutTask,
     /// Per-context deadlock detection tracking (ADR-031 §10).
     pub(crate) deadlock: DeadlockDetectionState,
     /// Pending ceiling modification awaiting notification period (M7, §5.3.2).
@@ -1592,7 +1605,6 @@ impl GovernanceState {
             approved_proposals: HashMap::new(),
             next_proposal_seq: 0,
             freeze: None,
-            timeout_task: GovernanceTimeoutTask::new(),
             deadlock: DeadlockDetectionState::default(),
             pending_ceiling_modification: None,
             pending_economic_policy_change: None,
@@ -1879,7 +1891,6 @@ pub(crate) fn fresh_governance_state(
         // H10: fresh contexts start with a zero monotonic counter.
         next_proposal_seq: 0,
         freeze: None,
-        timeout_task: GovernanceTimeoutTask::new(),
         deadlock: DeadlockDetectionState::default(),
         pending_ceiling_modification: None,
         pending_economic_policy_change: None,

@@ -75,7 +75,7 @@ pub mod context {
     pub use scp_runtime::context::providers;
     pub use scp_runtime::context::ttl;
     pub use scp_runtime::context::ttl::{
-        ExtensionConsentMode, TtlExtensionProposal, check_ttl, consent_mode_for_member_count,
+        ExtensionConsentMode, TtlExtensionProposal, consent_mode_for_member_count,
     };
     // Key runtime types re-exported at this level.
     pub use scp_protocol::context::builder::{

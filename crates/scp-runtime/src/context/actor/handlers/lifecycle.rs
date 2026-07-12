@@ -596,19 +596,15 @@ fn handle_shutdown_self_actor(
             "failed to destroy MLS group during shutdown — may already be gone"
         );
     }
-    // Cancel any per-actor background tasks (TTL timer + governance
-    // timeout). These hold task handles inside `state` directly;
-    // cancelling them here mirrors the legacy `_legacy` body's
-    // `task_set.abort_all()` except scoped to this actor's tasks
-    // rather than the supervisor's global set. All `&state` reads happen HERE,
-    // in the synchronous prelude, before the async tail below.
-    state.ttl.timer.cancel();
-    state.governance.timeout_task.cancel();
+    // No per-actor background timer tasks to cancel: the TTL + governance
+    // timers are ACTOR-OWNED arms reconciled inside `ContextActor::run()`
+    // (ADR-049 finding A3). This close leaves the context non-`Active`, so the
+    // actor's `reconcile_timers` clears the governance interval on its next
+    // turn, and the one-shot TTL arm is a no-op on a non-Active context.
 
     // Clone the event-log provider `Arc` so the async tail owns it (no `&deps`
     // borrow crosses the await). The event-log destroy still runs after the
-    // MLS-group destroy (secrets zeroize before structure); the task cancels
-    // touch no secret material.
+    // MLS-group destroy (secrets zeroize before structure).
     let event_log = std::sync::Arc::clone(&deps.event_log);
     async move {
         if let Err(e) = event_log.destroy_event_log(&ctx_id_bytes).await {

@@ -491,22 +491,30 @@ impl SupervisorHandle {
     /// entry from `Supervisor::actors` under the supervisor's
     /// `write_lock` so concurrent registrations cannot race.
     ///
-    /// Used by [`crate::context::lifecycle_helpers::import_context`] —
-    /// import overwrites an existing context, so the prior actor's
-    /// mailbox is shut down before the fresh actor is spawned. The
-    /// handle's [`Drop`](crate::context::actor::handle::ContextActorHandle)
-    /// closes the underlying `mpsc::Sender`, which causes the actor
-    /// task's `run()` loop to exit on the next inbox-empty poll.
+    /// Two callers:
+    /// - `import_context` — import overwrites an existing context, so the
+    ///   prior actor's mailbox is shut down before the fresh actor is
+    ///   spawned.
+    /// - `ContextActor::run()` on a terminal TTL self-expiry — the actor
+    ///   despawns its OWN registry handle (`&self.context_id`) before
+    ///   breaking the run loop, so the dead-but-registered handle does not
+    ///   linger (the watchdog deliberately leaves clean `Ok(())` exits
+    ///   registered to avoid racing PrepareForReplace; ADR-049 finding A3).
+    ///
+    /// Removing the entry drops the registered
+    /// [`ContextActorHandle`](crate::context::actor::handle::ContextActorHandle),
+    /// whose `Drop` closes the `mpsc::Sender`, so the actor task's `run()`
+    /// loop exits on the next inbox-empty poll (a no-op when the caller is
+    /// the exiting actor itself).
     ///
     /// Returns `true` if a handle was registered and removed,
     /// `false` if no entry existed for `context_id`.
     ///
     /// # Visibility
     ///
-    /// `pub(in crate::context)` — the import-bootstrap path is the
-    /// only caller. Removed when the actor map is the sole context
-    /// registry and `Supervisor::contexts` is deleted.
-    #[allow(dead_code)]
+    /// `pub(in crate::context)` — reachable by lifecycle bootstrap and by
+    /// the actor's own run loop, not by handler bodies under
+    /// `actor/handlers/`.
     pub(in crate::context) async fn despawn_actor(&self, context_id: &str) -> bool {
         self.supervisor.despawn_actor(context_id).await
     }
@@ -565,68 +573,38 @@ impl SupervisorHandle {
     }
 
     // -----------------------------------------------------------------
-    // Timer-task surface (ADR-049 Phase 2A finalization — TTL +
-    // governance timer → actor registry + mailbox tick).
+    // Actor-resolution surface.
     //
-    // Per-context timer tasks (TTL expiry, governance timeout) are
-    // supervisor-scoped infrastructure: they are spawned onto the
-    // supervisor's `task_set` so shutdown can abort them, and on each
-    // wake they resolve the target actor through the lock-free `actors`
-    // registry and mailbox a tick command (`TtlCloseCommand::FireTimer`
-    // / `GovernanceCommand::EvaluateTimeouts`). A `lookup → None`
-    // (despawned actor) replaces the legacy stale-generation gate: the
-    // timer stops cleanly when the context's actor no longer exists.
+    // `lookup` resolves a `context_id` to the owning `ContextActorHandle`
+    // through the lock-free `actors` registry. It is used by the
+    // supervisor-side dispatch routing (`dispatch_*_command`) and the
+    // bootstrap TTL-arm dispatch (`dispatch_start_ttl_timer`). It is NOT a
+    // timer surface: TTL + governance timers are ACTOR-OWNED arms
+    // reconciled inside `ContextActor::run()` (ADR-049 Decision-1 /
+    // finding A3), so no detached timer task resolves actors this way.
     //
     // `lookup` is the ONE place a `SupervisorHandle` yields a
     // `ContextActorHandle`. It does NOT breach the "actors cannot reach
-    // sibling actors" contract: the caller is a detached timer task, not
-    // a handler running inside another actor's dispatch turn. Visibility
-    // is `pub(in crate::context)` so only `crate::context` infra (the
-    // timer-spawn helpers in `ttl_close_helpers` / `governance_helpers`)
-    // can reach it — handler bodies under `actor/handlers/` are
-    // `pub`-only consumers of the handle and cannot name this method.
+    // sibling actors" contract: the callers are supervisor-side dispatch
+    // and bootstrap helpers, not a handler running inside another actor's
+    // dispatch turn. Visibility is `pub(in crate::context)` so only
+    // `crate::context` infra can reach it — handler bodies under
+    // `actor/handlers/` are `pub`-only consumers of the handle and cannot
+    // name this method.
     // -----------------------------------------------------------------
 
     /// Resolve the actor handle for `context_id` through the lock-free
     /// `Supervisor::actors` registry. Returns `None` if no actor is
     /// registered (context gone / not yet spawned).
     ///
-    /// Used by the per-context timer tasks to mailbox their tick command
-    /// to the owning actor. See the timer-task surface comment above for
-    /// why this is the single sanctioned `ContextActorHandle` yield.
+    /// See the actor-resolution surface comment above for why this is the
+    /// single sanctioned `ContextActorHandle` yield.
     #[must_use]
     pub(in crate::context) fn lookup(
         &self,
         context_id: &str,
     ) -> Option<crate::context::actor::handle::ContextActorHandle> {
         self.supervisor.lookup(context_id)
-    }
-
-    /// Spawn `fut` onto the supervisor's shared `task_set` JoinSet so the
-    /// task is tracked and aborted on supervisor shutdown. Returns the
-    /// task's [`AbortHandle`](tokio::task::AbortHandle) so the caller can
-    /// store it on actor-owned timer state for cancel/reset.
-    ///
-    /// Returns `None` if the supervisor has no task set (built via
-    /// [`Supervisor::new`] / `for_query_shim` rather than
-    /// [`Supervisor::with_providers`]); in that degraded configuration no
-    /// background timer can be spawned, matching the legacy
-    /// `task_set_ref() == None` early-return.
-    ///
-    /// Lock note: acquires the `task_set` mutex only to call
-    /// `JoinSet::spawn` (a synchronous push), then releases it. This is a
-    /// supervisor-scoped write-path lock, not a read-path lock — ADR-049
-    /// §12 (no `Mutex`/`RwLock` on read paths) is not implicated.
-    pub(in crate::context) async fn tracked_spawn<F>(
-        &self,
-        fut: F,
-    ) -> Option<tokio::task::AbortHandle>
-    where
-        F: std::future::Future<Output = ()> + Send + 'static,
-    {
-        let task_set_arc = std::sync::Arc::clone(self.supervisor.task_set_ref()?);
-        let mut task_set = task_set_arc.lock().await;
-        Some(task_set.spawn(fut))
     }
 
     /// Install the per-context TTL timer for `context_id` by mailboxing
@@ -642,23 +620,24 @@ impl SupervisorHandle {
     /// installation to the actor through this mailbox dispatch.
     ///
     /// Best-effort: a `lookup → None` (actor not yet registered) or a
-    /// mailbox-send failure is logged and skipped — the timer is a
-    /// background facility, not part of the create/restore success
-    /// contract (matching the legacy `spawn_ttl_timer_legacy`
-    /// no-actor / no-task-set early-returns).
+    /// mailbox-send failure is logged and skipped — arming the TTL deadline
+    /// is a background facility, not part of the create/restore success
+    /// contract. (The actor's own `reconcile_timers` arms the one-shot TTL
+    /// sleep from the recorded `deadline_unix_secs`; ADR-049 finding A3.)
     pub(in crate::context) async fn dispatch_start_ttl_timer(
         &self,
         context_id: &str,
         params: scp_protocol::context::params::ContextParams,
-        duration: std::time::Duration,
-        // `true` for both the initial-create path and the restore/import path:
-        // anchor the convergent expiry deadline on the actor's
-        // `creation_timestamp_secs + params.ttl`. The signed snapshot carries
-        // the convergent creator-assigned creation time, consumed verbatim on
-        // import, so import/restore arms identically to create. `false` arms
-        // relative to the local clock and is used only when no convergent
-        // creation time is available. See `TtlTimerPayload`.
-        anchor_deadline_to_creation: bool,
+        // The ABSOLUTE convergent expiry deadline to record, as a
+        // [`ConvergentDeadline`](crate::context::ttl_close_helpers::ConvergentDeadline)
+        // — the arming-seam newtype that can only be minted from the single
+        // authoritative source (B1). `None` (initial-create / spawn-from-Welcome)
+        // lets the actor handler derive the convergent create base
+        // `creation_timestamp_secs + params.ttl`. The restore/import paths pass
+        // `Some` — the deadline `convergent_ttl_deadline` derived from the event
+        // log — so a prior extension survives and a `None`-remaining Active
+        // snapshot still re-arms (D1/D2). See `TtlTimerPayload::deadline_override`.
+        deadline_override: Option<crate::context::ttl_close_helpers::ConvergentDeadline>,
     ) {
         use crate::context::actor::commands::{ContextCommand, TtlCloseCommand, TtlTimerPayload};
 
@@ -674,8 +653,11 @@ impl SupervisorHandle {
             payload: Box::new(TtlTimerPayload {
                 context_id: context_id.to_owned(),
                 params,
-                duration,
-                anchor_deadline_to_creation,
+                // Vestigial for `StartTtlTimer` — only `ResetTtlTimer` reads
+                // `duration` (as the extension amount). The absolute deadline is
+                // carried by `deadline_override`.
+                duration: std::time::Duration::ZERO,
+                deadline_override,
             }),
             reply: reply_tx,
         });

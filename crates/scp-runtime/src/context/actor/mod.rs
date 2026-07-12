@@ -69,15 +69,79 @@ pub use scp_protocol::context::ContextError;
 // ContextActor — the per-context dispatch loop
 // ---------------------------------------------------------------------------
 
+use std::pin::Pin;
 use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
+use tokio::time::{Interval, MissedTickBehavior, Sleep};
 
 /// Coalesced-persistence interval. ADR-049 §Decision 9 (50 ms): a
 /// burst of mutations that all complete within this window collapse to
 /// a single durable snapshot write. The actor's `run()` loop wakes on
 /// this interval iff `dirty == true` and writes the latest snapshot.
 const COALESCE_INTERVAL: Duration = Duration::from_millis(50);
+
+/// BASE backoff before retrying an INCOMPLETE TTL expiry (SEC-1 / ADR-049 §9
+/// amendment; M2). When [`ContextActor::on_ttl_tick`] leaves the context
+/// terminal (`Expired`) but a cleanup step (key destruction, event-log append)
+/// or the fail-closed terminal persist did not complete, the actor stays alive
+/// and re-arms [`ContextActor::ttl_expiry_retry`], then re-runs the expiry
+/// carrying the prior `completed_steps` so only the failed step re-executes.
+///
+/// The delay grows EXPONENTIALLY from this base —
+/// `TTL_EXPIRY_RETRY_BASE · 2^(n−1)` for the n-th consecutive incomplete
+/// attempt — capped at [`TTL_EXPIRY_RETRY_CAP`], so a persistently-failing
+/// dependency (a wedged storage/event-log backend) does not spin the
+/// single-threaded actor at a fixed 5 s forever. This is genuinely bounded
+/// backoff (pre-M2 it was a fixed, uncapped 5 s that the comment nonetheless
+/// called "bounded backoff").
+const TTL_EXPIRY_RETRY_BASE: Duration = Duration::from_secs(5);
+
+/// Upper bound on the exponential TTL-expiry retry backoff (M2). Caps
+/// `TTL_EXPIRY_RETRY_BASE · 2^(n−1)` so the retry cadence settles at a modest
+/// steady-state interval rather than growing without bound.
+const TTL_EXPIRY_RETRY_CAP: Duration = Duration::from_mins(5);
+
+/// Number of consecutive incomplete TTL-expiry attempts after which the actor
+/// emits an operator-visible, rate-limited `error!` signal (M2). A terminal
+/// actor stuck retrying this long indicates a genuinely-wedged local dependency
+/// (event log / storage) — an OPERATIONAL fault that must be observable, not
+/// silently spun. Fail-closed is preserved: the actor still never despawns with
+/// an undurable terminal state.
+const TTL_EXPIRY_STUCK_THRESHOLD: u32 = 12;
+
+/// Bounded exponential backoff for the n-th (1-based) consecutive incomplete
+/// TTL-expiry attempt (M2): `TTL_EXPIRY_RETRY_BASE · 2^(n−1)`, saturating at
+/// `TTL_EXPIRY_RETRY_CAP`. `retries == 0` is treated as the first attempt.
+fn ttl_expiry_retry_backoff(retries: u32) -> Duration {
+    // Cap the shift well under 64 so `1u64 << shift` cannot overflow; the `.min`
+    // against the cap below makes any shift past the cap-crossing point a no-op.
+    let shift = retries.saturating_sub(1).min(32);
+    let secs = TTL_EXPIRY_RETRY_BASE
+        .as_secs()
+        .saturating_mul(1u64 << shift)
+        .min(TTL_EXPIRY_RETRY_CAP.as_secs());
+    Duration::from_secs(secs)
+}
+
+/// Governance-timeout evaluation cadence (60 s). Re-exported from
+/// [`crate::context::governance::timeout::TIMEOUT_CHECK_INTERVAL_SECS`]
+/// so the actor-owned `governance_timeout` interval fires on the exact
+/// cadence the retired supervisor-driven timer task used (ADR-049
+/// Decision-1 / finding A3 — the timer becomes an actor-owned arm).
+const GOVERNANCE_TIMEOUT_SECS: u64 =
+    crate::context::governance::timeout::TIMEOUT_CHECK_INTERVAL_SECS;
+
+/// Fairness bound (ADR-049 §10 liveness defense-in-depth): the run loop's
+/// `select!` is `biased` (inbox first for shutdown determinism), so a
+/// saturated inbox would otherwise starve the actor-owned TTL / governance /
+/// persist arms — a member flooding messages could delay THAT context's own
+/// TTL close or governance-consequence (e.g. their own demotion). After this
+/// many back-to-back inbox dispatches the loop disables the inbox arm for one
+/// iteration so the timer/persist arms get a guaranteed poll (see `run()`).
+/// Not a correctness crutch for tokio's coop budget — an explicit,
+/// documented bound on a security-liveness property.
+const MAX_CONSECUTIVE_INBOX: u32 = 32;
 
 /// Encode a 32-byte context ID as lowercase hex. Matches the string
 /// form used throughout the supervisor-side dispatch shim
@@ -96,14 +160,14 @@ fn hex_encode_context_id(id: &[u8; 32]) -> String {
 /// Per-context actor. Owns one [`PerContextState`] by move and processes
 /// commands from its inbox one at a time.
 ///
-/// See plan §"ContextActor" for the full shape. The `run()` loop
-/// dispatches state-bearing commands through `dispatch_state` to the
-/// real per-domain handlers. Some run-loop arms remain no-ops pending
-/// the Phase 2 finalization sub-chunks that retire the supervisor-side
-/// timer/persistence paths — TTL expiry and governance timeouts are
-/// driven by the supervisor's timer `task_set`, and persistence flows
-/// through the per-handler persistence helpers, until those paths
-/// migrate onto the actor's owned state.
+/// See plan §"ContextActor" for the full shape. The `run()` loop dispatches
+/// state-bearing commands through `dispatch_state` to the real per-domain
+/// handlers, and drives the ACTOR-OWNED timer arms directly off owned state
+/// (ADR-049 finding A3): the TTL-expiry arm and the governance-timeout arm each
+/// reconcile a one-shot / interval sleep against the deadlines recorded on
+/// `PerContextState` and run their pipeline on wake — there is no
+/// supervisor-side timer `task_set` and no mailbox hop. Persistence flows
+/// through the Class-S / Class-C combinators on the actor's owned `ClassSCell`.
 pub struct ContextActor {
     /// Stable context identifier. Kept as a `String` alongside
     /// [`PerContextState::context_id`] for tracing / logging — the
@@ -128,26 +192,66 @@ pub struct ContextActor {
     /// construction time.
     // read by the run-loop's dispatch/dispatch_state path
     deps: deps::ActorDeps,
-    /// TTL expiry interval timer. `None` until the supervisor-side TTL
-    /// timer path (`task_set`-spawned timers that mailbox
-    /// `TtlCloseCommand::FireTimer`) migrates onto the run-loop's
-    /// `select!` TTL arm in a follow-on Phase 2 sub-chunk; the arm and
-    /// its no-op `on_ttl_tick` body exist so that migration is purely
-    /// additive.
-    // read by the run-loop's TTL select! arm
-    ttl_timer: Option<tokio::time::Interval>,
-    /// Governance proposal timeout deadline. `None` until the
-    /// supervisor-side governance timeout path migrates onto the
-    /// run-loop's `select!` arm in a follow-on Phase 2 sub-chunk (the
-    /// arm and its no-op `on_governance_timeout` body exist so that
-    /// migration is purely additive).
+    /// One-shot TTL-expiry timer, ACTOR-OWNED (ADR-049 Decision-1 /
+    /// finding A3). Armed by [`Self::reconcile_timers`] from the
+    /// convergent `state.ttl.timer.deadline_unix_secs`; `None` when the
+    /// context has no pending TTL deadline. Fires exactly once —
+    /// [`Self::on_ttl_tick`] runs the best-effort expiry pipeline and the
+    /// actor exits on the resulting terminal (`Expired`) state (anti-
+    /// resurrection only respawns `Active` snapshots, so a re-derive from
+    /// the convergent deadline on any later restore re-fires idempotently).
     ///
-    /// Note — `tokio::time::Sleep` is `!Unpin` so the field holds a
-    /// pinned box. Constructing the future upfront (even unused)
-    /// keeps the run-loop's `select!` arm shape stable as the
-    /// migration lands.
-    // read by the run-loop's governance select! arm
-    governance_timeout: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+    /// A derived cache of owned state: [`Self::reconcile_timers`] re-arms
+    /// only when the deadline changes (tracked by [`Self::ttl_armed_deadline`]),
+    /// so repeated reconciles are cheap no-ops. `tokio::time::Sleep` is
+    /// `!Unpin`, so the field holds a pinned box.
+    // read by the run-loop's TTL select! arm; armed by reconcile_timers
+    ttl_timer: Option<Pin<Box<Sleep>>>,
+    /// Governance-timeout interval (60 s), ACTOR-OWNED (ADR-049
+    /// Decision-1 / finding A3). Armed by [`Self::reconcile_timers`]
+    /// while the context is `Active`; each tick runs the governance
+    /// timeout / consequence sweep on owned state via
+    /// [`Self::on_governance_timeout`], which nulls the interval when the
+    /// sweep signals stop (context no longer `Active`). Re-armed by a
+    /// later reconcile if the context returns to `Active`.
+    // read by the run-loop's governance select! arm; armed by reconcile_timers
+    governance_timeout: Option<Interval>,
+    /// The `state.ttl.timer.deadline_unix_secs` value the current
+    /// [`Self::ttl_timer`] arm was derived from. [`Self::reconcile_timers`]
+    /// compares this against the live deadline and re-arms the one-shot
+    /// sleep only when it changes — the idempotence guard that keeps
+    /// per-turn reconciliation from resetting an already-correct arm.
+    // read + written by reconcile_timers
+    ttl_armed_deadline: Option<u64>,
+    /// The `completed_steps` bitmask of the in-progress TTL expiry, carried
+    /// across on-actor retries (SEC-1 / ADR-049 §9 amendment). When
+    /// [`Self::on_ttl_tick`] cannot finish the terminal cleanup (a transient
+    /// key-destruction failure, an event-log stall, or a fail-closed persist
+    /// failure), the actor is kept alive and this bitmask records which steps
+    /// DID land so the retry re-runs ONLY the failed step. `0` until the first
+    /// expiry attempt; reset only implicitly by actor teardown on completion.
+    // read + written by on_ttl_tick
+    ttl_expiry_completed: u8,
+    /// Bounded retry arm for an INCOMPLETE TTL expiry (SEC-1). Set by
+    /// [`Self::on_ttl_tick`] when the expiry left the context terminal
+    /// (`Expired`) but the cleanup did not fully complete or the terminal
+    /// persist failed — the actor must NOT despawn (else a destroyed-but-
+    /// unrecorded key or an undurable terminal state is lost). Independent of
+    /// the `is_active`-gated [`Self::ttl_timer`] (which `reconcile_timers`
+    /// clears once the context leaves `Active`); `reconcile_timers` never
+    /// touches this arm. `tokio::time::Sleep` is `!Unpin`, so a pinned box.
+    // read by the run-loop's TTL-expiry-retry select! arm; armed by on_ttl_tick
+    ttl_expiry_retry: Option<Pin<Box<Sleep>>>,
+    /// Count of CONSECUTIVE incomplete TTL-expiry attempts (M2). Drives the
+    /// bounded exponential backoff for [`Self::ttl_expiry_retry`]
+    /// (`TTL_EXPIRY_RETRY_BASE · 2^(n−1)`, capped at `TTL_EXPIRY_RETRY_CAP`) and
+    /// the operator-visible stuck-actor signal once it crosses
+    /// [`TTL_EXPIRY_STUCK_THRESHOLD`]. Incremented each time `on_ttl_tick`
+    /// re-arms the retry; reset to `0` when the expiry completes. Fail-closed is
+    /// preserved — the actor NEVER despawns with an undurable terminal state; a
+    /// permanently-wedged local event log is surfaced, not silently dropped.
+    // read + written by on_ttl_tick
+    ttl_expiry_retries: u32,
     /// Unix-ms instant of the last successful coalesced persist. The
     /// run-loop's persistence arm compares `now() - last_persisted_at`
     /// against the coalescing window (50 ms — ADR-049 §Decision 9,
@@ -160,6 +264,13 @@ pub struct ContextActor {
     /// Initialized `false` at actor construction.
     // read by the run-loop's persistence coalesce arm
     dirty: bool,
+    /// Count of consecutive inbox dispatches since a timer/persist arm last
+    /// got a turn. The `biased` `select!` prioritizes the inbox; this counter
+    /// bounds that priority so a saturated inbox cannot starve the timer arms
+    /// (see [`MAX_CONSECUTIVE_INBOX`] + the fairness fall-through arm in
+    /// `run()`). Reset to 0 whenever a non-inbox arm fires.
+    // read + written by the run-loop's fairness bound
+    consecutive_inbox: u32,
 }
 
 impl ContextActor {
@@ -176,9 +287,10 @@ impl ContextActor {
     ///
     /// # Construction of auxiliary fields
     ///
-    /// - `ttl_timer`, `governance_timeout` start as `None`. Handler
-    ///   migrations arm them lazily on first use (TTL config present,
-    ///   governance proposal landed).
+    /// - `ttl_timer`, `governance_timeout`, `ttl_armed_deadline` start as
+    ///   `None`. The run loop's [`Self::reconcile_timers`] arms them from
+    ///   owned state at the top of every turn (TTL from
+    ///   `state.ttl.timer.deadline_unix_secs`, governance while `Active`).
     /// - `last_persisted_at` starts at `Instant::now()` so a fresh
     ///   actor's first coalescing window runs for the full duration
     ///   before the first persist.
@@ -210,8 +322,13 @@ impl ContextActor {
             deps,
             ttl_timer: None,
             governance_timeout: None,
+            ttl_armed_deadline: None,
+            ttl_expiry_completed: 0,
+            ttl_expiry_retry: None,
+            ttl_expiry_retries: 0,
             last_persisted_at: Instant::now(),
             dirty: false,
+            consecutive_inbox: 0,
         }
     }
 
@@ -237,13 +354,26 @@ impl ContextActor {
         // computes the deadline as `last_persisted_at + COALESCE_INTERVAL`
         // — which is in the future relative to actor-spawn `now()`.
         loop {
+            // Reconcile the ACTOR-OWNED timer arms from owned state before
+            // every select (top of run() + after each dispatch, since a
+            // dispatch loops back to here). Cheap: re-arms only when the
+            // convergent TTL deadline changes or the `Active` state flips
+            // (ADR-049 Decision-1 / finding A3).
+            self.reconcile_timers();
+
             tokio::select! {
                 biased;
 
                 // --- Arm 1: inbox ----------------------------------
-                maybe_cmd = self.inbox.recv() => {
+                // Fairness: disable the inbox arm for one iteration once it
+                // has monopolized `MAX_CONSECUTIVE_INBOX` turns, so the timer
+                // / persist arms below get a guaranteed poll (see the
+                // fall-through Arm 5). `biased` shutdown priority is preserved
+                // whenever the inbox is enabled.
+                maybe_cmd = self.inbox.recv(), if self.consecutive_inbox < MAX_CONSECUTIVE_INBOX => {
                     match maybe_cmd {
                         Some(cmd) => {
+                            self.consecutive_inbox += 1;
                             // Shutdown is unconditionally terminal: the
                             // actor always exits after dispatch.
                             let is_shutdown = matches!(
@@ -291,27 +421,84 @@ impl ContextActor {
                     }
                 }
 
-                // --- Arm 2: TTL timer ------------------------------
+                // --- Arm 2: TTL timer (one-shot) -------------------
                 () = async {
                     match self.ttl_timer.as_mut() {
-                        Some(timer) => {
-                            let _ = timer.tick().await;
-                        }
+                        // `Pin<Box<Sleep>>` is a one-shot future: awaiting
+                        // the pinned mutable reference resolves once the
+                        // convergent deadline elapses.
+                        Some(sleep) => sleep.as_mut().await,
                         None => std::future::pending::<()>().await,
                     }
                 }, if self.ttl_timer.is_some() => {
-                    self.on_ttl_tick().await;
+                    self.consecutive_inbox = 0;
+                    // Run the best-effort expiry pipeline; break the run loop
+                    // when it lands the context in a terminal state so the
+                    // actor task exits (anti-resurrection prevents re-spawn).
+                    if self.on_ttl_tick().await {
+                        // Despawn our OWN registry handle before exiting.
+                        // Nothing else will: the watchdog deliberately leaves
+                        // clean `Ok(())` exits registered (supervisor.rs
+                        // `actor_watchdog`) to avoid racing an in-flight
+                        // PrepareForReplace, and — unlike the Shutdown /
+                        // PrepareForReplace breaks, which have an external
+                        // caller that despawns/replaces — an internal TTL exit
+                        // has none. Without this the dead-but-registered handle
+                        // lingers in `actors`, so `read_context_state` reports
+                        // `None` (closed mailbox) instead of the persisted
+                        // `Expired`, and the context id cannot be re-created.
+                        // `despawn_actor` removes our OWN registry entry
+                        // (`&self.context_id`) under the supervisor write lock;
+                        // safe to call from here — the actor holds no lock, and
+                        // the removal has no `.await` while the lock is held.
+                        self.deps.supervisor.despawn_actor(&self.context_id).await;
+                        break;
+                    }
                 }
 
-                // --- Arm 3: governance timeout ---------------------
+                // --- Arm 2b: TTL expiry retry (bounded exponential backoff) ----
+                // Fires only when a prior `on_ttl_tick` left the context terminal
+                // but the cleanup did not fully complete or the fail-closed
+                // terminal persist failed (SEC-1). Re-runs the expiry carrying
+                // the prior `completed_steps` so ONLY the failed step re-executes;
+                // despawns once the expiry is complete AND durable. The backoff
+                // grows exponentially (base 5 s, capped at 300 s) per consecutive
+                // incomplete attempt, and a stuck actor is surfaced via an
+                // operator-visible signal (M2). Independent of the `is_active`-
+                // gated `ttl_timer` (disarmed once the FSM leaves `Active`), so
+                // `reconcile_timers` cannot clobber this arm.
+                () = async {
+                    match self.ttl_expiry_retry.as_mut() {
+                        Some(sleep) => sleep.as_mut().await,
+                        None => std::future::pending::<()>().await,
+                    }
+                }, if self.ttl_expiry_retry.is_some() => {
+                    self.consecutive_inbox = 0;
+                    // Clear the fired retry arm; `on_ttl_tick` re-arms it if the
+                    // expiry is still incomplete.
+                    self.ttl_expiry_retry = None;
+                    if self.on_ttl_tick().await {
+                        // Same internal-TTL-exit despawn as Arm 2: no external
+                        // despawner for a timer-driven terminal exit.
+                        self.deps.supervisor.despawn_actor(&self.context_id).await;
+                        break;
+                    }
+                }
+
+                // --- Arm 3: governance timeout (60s interval) ------
                 () = async {
                     match self.governance_timeout.as_mut() {
-                        Some(pinned) => pinned.as_mut().await,
+                        Some(interval) => {
+                            let _ = interval.tick().await;
+                        }
                         None => std::future::pending::<()>().await,
                     }
                 }, if self.governance_timeout.is_some() => {
+                    self.consecutive_inbox = 0;
+                    // The interval auto-refires every 60 s;
+                    // `on_governance_timeout` nulls it only when the sweep
+                    // signals stop (context no longer `Active`).
                     self.on_governance_timeout().await;
-                    self.governance_timeout = None;
                 }
 
                 // --- Arm 4: persistence coalesce -------------------
@@ -320,9 +507,22 @@ impl ContextActor {
                         self.last_persisted_at + COALESCE_INTERVAL
                     )
                 ), if self.dirty => {
+                    self.consecutive_inbox = 0;
                     self.persist_snapshot().await;
                     self.last_persisted_at = Instant::now();
                     self.dirty = false;
+                }
+
+                // --- Arm 5: fairness fall-through ------------------
+                // Reached only when the inbox arm is disabled for its fairness
+                // iteration AND no timer/persist arm was ready. Immediately
+                // resets the budget so normal inbox-first dispatch resumes
+                // next turn — this is the fall-through that prevents a
+                // deadlock (with the inbox disabled and nothing else ready the
+                // loop would otherwise block forever).
+                () = std::future::ready(()),
+                    if self.consecutive_inbox >= MAX_CONSECUTIVE_INBOX => {
+                    self.consecutive_inbox = 0;
                 }
             }
         }
@@ -491,29 +691,278 @@ impl ContextActor {
         }
     }
 
-    /// Drive the TTL-timer arm. Phase 2A leaves the body empty: TTL
-    /// expiry is driven by the supervisor's timer `task_set`, which
-    /// spawns a per-context TTL timer that mailboxes
-    /// `TtlCloseCommand::FireTimer` to this actor — until a future
-    /// Phase 2 sub-chunk moves the timer onto the actor's own
-    /// `ttl_timer` arm. The arm exists here so that migration is purely
-    /// additive.
+    /// Reconcile the ACTOR-OWNED timer arms from owned state (ADR-049
+    /// Decision-1 / finding A3). The arms are a derived cache of owned
+    /// state, reconciled at the top of every `run()` turn:
     ///
-    /// `_state`/`_deps` allow: future migrations read them; for now the
-    /// method is a no-op.
-    #[allow(clippy::unused_async, clippy::needless_pass_by_ref_mut)]
-    async fn on_ttl_tick(&mut self) {
-        // No-op until the TTL handler migrates to the actor's owned
-        // state in a follow-on Phase 2 sub-chunk.
+    /// - **TTL**: while the context is `Active`, arms a one-shot `sleep` for the
+    ///   remaining time to the convergent `state.ttl.timer.deadline_unix_secs`.
+    ///   Re-arms only when that deadline changes (guarded by
+    ///   [`Self::ttl_armed_deadline`]), so per-turn reconciliation never resets
+    ///   an already-correct arm. A `None` deadline clears the arm; a past
+    ///   deadline arms `sleep(0)` (fires immediately — a restore past the
+    ///   deadline re-closes idempotently). Once the context leaves `Active`
+    ///   (close / tombstone / promote / expiry), the arm is unconditionally
+    ///   cleared so a stale deadline cannot fire against a terminal context and
+    ///   despawn it (BUG-1) — symmetric to the governance interval's gate.
+    /// - **Governance**: arms a 60 s interval while the context is
+    ///   `Active`; clears it once the context is not `Active`. The
+    ///   `is_none()` guard keeps a frequently-dispatched actor from
+    ///   continually resetting (and thus never firing) the interval.
+    ///
+    /// `reconcile_timers` only re-runs when a `select!` arm fires (top of
+    /// each loop turn), so an off-actor `Active` transition with no subsequent
+    /// command won't arm the governance interval until the next arm/command.
+    /// That is harmless: governance work arrives as commands (a vote/proposal
+    /// wakes the inbox arm, which loops back through here), so the interval is
+    /// armed before any timeout-relevant work can accrue.
+    fn reconcile_timers(&mut self) {
+        // `Copy` snapshot so the immutable borrow of `state` ends before the
+        // timer-field writes below.
+        let desired_deadline = self.state.ttl.timer.deadline_unix_secs;
+        // Lock-free atomic load of the lifecycle FSM (ADR-049 §10 — the
+        // handle caches state in an `ArcSwap`, so this read never blocks).
+        let is_active = self.state.handle.state() == scp_protocol::context::ContextState::Active;
+
+        // TTL one-shot arm — armed ONLY while the context is `Active`, mirroring
+        // the governance interval's `is_active` gate below (BUG-1). A close /
+        // tombstone / promote clears `deadline_unix_secs` inside its
+        // fail-closed commit, but a stale arm could otherwise still fire against
+        // an already-terminal context and despawn it — re-opening the
+        // `close_context_with_key` window and defeating tombstone finality. When
+        // NOT `Active`, unconditionally disarm. When `Active`, re-derive only
+        // when the convergent deadline changes (StartTtlTimer / ResetTtlTimer /
+        // ExtendTtl rewrote it); the clock read lives INSIDE the re-arm branch,
+        // needed only on a re-arm, not on the common per-turn no-op path.
+        if is_active {
+            if desired_deadline != self.ttl_armed_deadline {
+                self.ttl_armed_deadline = desired_deadline;
+                let now_secs = self.deps.clock.now_secs();
+                self.ttl_timer = desired_deadline.map(|deadline| {
+                    let remaining = deadline.saturating_sub(now_secs);
+                    Box::pin(tokio::time::sleep(Duration::from_secs(remaining)))
+                });
+            }
+        } else {
+            self.ttl_timer = None;
+            self.ttl_armed_deadline = None;
+        }
+
+        // Governance 60 s interval — armed only while Active.
+        if is_active {
+            if self.governance_timeout.is_none() {
+                // First tick after a full interval (not immediately),
+                // matching the retired supervisor timer's initial sleep.
+                let mut interval = tokio::time::interval_at(
+                    tokio::time::Instant::now() + Duration::from_secs(GOVERNANCE_TIMEOUT_SECS),
+                    Duration::from_secs(GOVERNANCE_TIMEOUT_SECS),
+                );
+                // A stalled actor must not accrue a burst of catch-up ticks.
+                interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+                self.governance_timeout = Some(interval);
+            }
+        } else {
+            self.governance_timeout = None;
+        }
     }
 
-    /// Drive the governance-timeout arm. Same migration shape as
-    /// `on_ttl_tick`: the legacy supervisor still drives governance
-    /// timeouts; the arm here is a no-op until the migration lands.
-    #[allow(clippy::unused_async, clippy::needless_pass_by_ref_mut)]
+    /// Drive the TTL expiry (SEC-1 / ADR-049 §9 amendment): run the
+    /// fail-closed-before-teardown expiry pipeline on owned state, clear the
+    /// fired arm, and report whether the actor may DESPAWN — i.e. the context
+    /// reached a terminal lifecycle state, the cleanup fully completed, AND the
+    /// terminal `Expired` state is durably persisted.
+    ///
+    /// Called from BOTH the one-shot TTL arm (Arm 2) and the bounded
+    /// [`Self::ttl_expiry_retry`] arm (Arm 2b). The TTL terminal transition +
+    /// key destruction are Class-S fail-closed (persisted BEFORE this can return
+    /// `true` → despawn), so a hostile-relay stall cannot cancel the durable
+    /// terminal state and re-open a resurrection window. The relay/event-log I/O
+    /// is bounded inside `handle_ttl_expiry`; the fail-closed persist runs
+    /// outside that bound.
+    ///
+    /// # Retry (SEC-1)
+    ///
+    /// On an INCOMPLETE expiry (a transient key-destruction failure, an
+    /// event-log stall, or a fail-closed persist failure) the context is still
+    /// terminal but the actor must NOT despawn — a destroyed-but-unrecorded key
+    /// or an undurable terminal state would be lost. The actor keeps itself
+    /// alive, stores the partial `completed_steps` in
+    /// [`Self::ttl_expiry_completed`], and re-arms [`Self::ttl_expiry_retry`] so
+    /// a later tick re-runs ONLY the failed step. The prior code silently
+    /// discarded the inner error and despawned unconditionally on `Expired`.
+    async fn on_ttl_tick(&mut self) -> bool {
+        // Clone the handle first so the `&state.handle` read does not
+        // overlap the `&mut state` expiry borrow. `state`/`deps` are
+        // disjoint fields, so the simultaneous borrows below are allowed.
+        let handle = self.state.handle.clone();
+
+        // Run the fail-closed expiry, carrying the completed-steps bitmask from
+        // any prior attempt so only the failed step re-runs. `handle_ttl_expiry`
+        // wraps ONLY the relay/event-log I/O in `timeout(HANDLER_TIMEOUT)`; the
+        // fail-closed terminal persist runs OUTSIDE that bound (SEC-1), so NO
+        // outer timeout here (an outer wrap would re-expose the persist to
+        // relay-stall cancellation — the exact bug this pass fixes).
+        let outcome = crate::context::ttl_close_helpers::handle_ttl_expiry(
+            &mut self.state,
+            &self.deps,
+            &handle,
+            self.ttl_expiry_completed,
+        )
+        .await;
+
+        // Persist the running completed-steps bitmask so a retry re-runs only
+        // the failed step.
+        self.ttl_expiry_completed = outcome.result.completed_steps();
+
+        // The one-shot arm has fired. Clear it. (A retry, if needed, is armed on
+        // the dedicated `ttl_expiry_retry` arm below — the `is_active`-gated
+        // `ttl_timer` is disarmed by `reconcile_timers` once the FSM leaves
+        // `Active`.)
+        self.ttl_timer = None;
+        self.dirty = true;
+
+        // Surface the inner errors that the prior code silently discarded
+        // (SEC-1): a fail-closed terminal-persist failure and/or an incomplete
+        // cleanup. `error!`-level so a stuck expiry is visible in production.
+        if let Err(ref persist_err) = outcome.persist_result {
+            tracing::error!(
+                context_id = %self.context_id,
+                error = %persist_err,
+                "TTL terminal Expired persist failed (fail-closed, keep-direction); \
+                 keeping actor alive to retry — FSM NOT rolled back (SEC-1)"
+            );
+        }
+        if outcome.result.is_aborted() {
+            // A3: the single-source deadline was None (promotion / no-TTL /
+            // absent-genesis log) — a DELIBERATE benign no-op, NOT a failed
+            // cleanup. `handle_ttl_expiry` already logged the abort and cleared
+            // the stale deadline; do not emit the misleading "retrying" error
+            // below (nothing failed and no retry is armed — the FSM stays
+            // Active/non-terminal, so the else-branch disarms).
+        } else if outcome.result.has_failures() {
+            tracing::error!(
+                context_id = %self.context_id,
+                result = %outcome.result,
+                "TTL expiry cleanup incomplete; keeping actor alive to retry the \
+                 failed step (SEC-1)"
+            );
+        }
+
+        // Terminal-exit signal: TTL expiry transitions the context to the
+        // terminal `Expired` state. `state()` is a lock-free atomic load
+        // (ADR-049 §10). `ContextState::is_terminal()` is the closed-by-
+        // construction permanent-terminal predicate (`Expired | Closed |
+        // Tombstoned`; N5) — an exhaustive match, so a future variant forces a
+        // terminality decision here rather than silently falling outside an
+        // ad-hoc set.
+        let terminal = handle.state().is_terminal();
+
+        // DESPAWN only when the context is terminal AND the cleanup fully
+        // completed AND the terminal `Expired` state is DURABLE (persist ok).
+        // Any weaker condition would either lose an undestroyed key (incomplete
+        // cleanup) or let a crash resurrect the context as `Active` against a
+        // stale snapshot (undurable terminal state) — the SEC-1 window.
+        if terminal && outcome.result.is_complete() && outcome.persist_result.is_ok() {
+            // Clear the retry arm (a prior incomplete attempt may have armed it)
+            // before reporting terminal so `run()` despawns cleanly. Reset the
+            // retry counter — the expiry converged.
+            self.ttl_expiry_retry = None;
+            self.ttl_expiry_retries = 0;
+            return true;
+        }
+
+        if terminal {
+            // Terminal but not fully durable/complete: KEEP the actor alive and
+            // re-arm a bounded retry so a later tick re-runs the failed step
+            // (SEC-1). Independent of the `is_active`-gated `ttl_timer`
+            // (disarmed now the FSM is terminal); `reconcile_timers` never
+            // touches this arm.
+            //
+            // Bounded EXPONENTIAL backoff (M2): the delay grows
+            // `TTL_EXPIRY_RETRY_BASE · 2^(n−1)` capped at `TTL_EXPIRY_RETRY_CAP`,
+            // so a permanently-wedged local dependency does not spin the actor
+            // at a fixed 5 s forever. Fail-closed direction is preserved — the
+            // actor still never despawns with an undurable terminal state.
+            //
+            // ACCEPTED crash-window residuals at this pending-retry point
+            // (ADR-049 §9 TTL carve-out; NOT resurrection or an access-control
+            // bypass — the persisted snapshot is already TERMINAL, restore skips
+            // non-`Active` contexts, and B8 refuses re-create):
+            //  - L2 (black-hat P3-005): the retry state (that a `ContextExpired`
+            //    leaf append is still pending) lives only in this resident
+            //    actor's `ttl_expiry_completed` bitmask, not the persisted
+            //    snapshot. A crash DURING the pending retry drops the
+            //    not-yet-appended leaf — a missing PROVENANCE leaf only; the
+            //    context stays terminal for good.
+            //  - L4 (security): when key destruction itself is the still-failing
+            //    step, a crash here can leave that context's key material
+            //    ORPHANED in MLS storage. This is a STORAGE-HYGIENE residual —
+            //    the ciphertext is already unreadable to non-holders and the
+            //    context is terminal, so no access-control property is broken.
+            // Both are accepted this pass; a restore-path reconciliation
+            // (re-append the terminal leaf / re-destroy orphaned terminal-snapshot
+            // keys) is possible FUTURE hardening, not built here.
+            self.ttl_expiry_retries = self.ttl_expiry_retries.saturating_add(1);
+            let backoff = ttl_expiry_retry_backoff(self.ttl_expiry_retries);
+
+            // Operator-visible stuck signal (M2): once the actor has retried this
+            // many times without converging, the terminal cleanup is wedged on a
+            // genuinely-failing local dependency (event log / storage) — an
+            // OPERATIONAL fault that must be observable, not silently spun. Emit
+            // a rate-limited `error!` (only at the threshold and every
+            // `TTL_EXPIRY_STUCK_THRESHOLD` retries thereafter) so it is loud but
+            // not log-spam.
+            if self.ttl_expiry_retries >= TTL_EXPIRY_STUCK_THRESHOLD
+                && self
+                    .ttl_expiry_retries
+                    .is_multiple_of(TTL_EXPIRY_STUCK_THRESHOLD)
+            {
+                tracing::error!(
+                    context_id = %self.context_id,
+                    retries = self.ttl_expiry_retries,
+                    backoff = ?backoff,
+                    result = %outcome.result,
+                    "TTL expiry terminal cleanup STUCK: {} consecutive incomplete \
+                     attempts — a local dependency (event log / storage) is wedged. \
+                     The actor stays alive fail-closed and keeps retrying; operator \
+                     intervention required (M2)",
+                    self.ttl_expiry_retries,
+                );
+            }
+
+            self.ttl_expiry_retry = Some(Box::pin(tokio::time::sleep(backoff)));
+        } else {
+            // Non-terminal fire (a Closing / MigratingOut context whose expiry
+            // did NOT reach a terminal leaf): drop `ttl_armed_deadline` so the
+            // next `reconcile_timers` re-evaluates the arm from live state
+            // rather than treating the (unchanged) deadline as already-armed and
+            // never re-firing (SEC-2). Belt-and-suspenders — the `is_active`
+            // gate in `reconcile_timers` already disarms a non-`Active` context.
+            self.ttl_armed_deadline = None;
+        }
+
+        false
+    }
+
+    /// Drive the governance-timeout interval: run one sweep of the timeout
+    /// / consequence pipeline on owned state and null the interval when the
+    /// sweep signals stop (context no longer `Active`). A later reconcile
+    /// re-arms it if the context returns to `Active`.
     async fn on_governance_timeout(&mut self) {
-        // No-op until the governance timeout handler migrates to the
-        // actor's owned state in a follow-on Phase 2 sub-chunk.
+        // `state`/`deps` are disjoint fields — simultaneous borrows are ok.
+        let outcome =
+            handlers::governance::evaluate_governance_timeouts(&mut self.state, &self.deps).await;
+        if outcome.mutated {
+            self.dirty = true;
+        }
+        // `Ok(false)` (context closing / not Active) stops the interval;
+        // `Ok(true)` keeps the 60 s cadence auto-refiring. The actor owns its
+        // state exclusively, so there is no lock contention to retry — the
+        // sweep either records progress (`Ok(true)`) or signals stop
+        // (`Ok(false)`).
+        if !matches!(outcome.result, Ok(true)) {
+            self.governance_timeout = None;
+        }
     }
 
     /// Coalesced-persistence writer. Invoked by the run loop's Arm-4
@@ -659,6 +1108,35 @@ mod tests {
     /// Accepts every call, returns OK for every append, never appends
     /// anything to a real log — the 12b.2a dispatch does not exercise
     /// the event-log path, so the stub is never actually touched.
+    /// The convergent creation instant the TTL-expiry actor tests use — matches
+    /// the `1_700_000_000` passed to `new_for_test_encrypted` / the past-deadline
+    /// helper. Post pass-4e (E1) the create base is the PRUNE-IMMUNE snapshot
+    /// `creation_timestamp_secs + params.ttl`; the test states set
+    /// `creation_timestamp_secs` to this value via `new_for_test_encrypted`, so
+    /// `convergent_ttl_deadline` yields `T0 + params.ttl` (not `None`, which would
+    /// ABORT the expiry per A3). The seeded genesis leaf below is realistic history
+    /// but is no longer read for the base.
+    #[cfg(feature = "testing")]
+    const TTL_TEST_CREATION_TS: u64 = 1_700_000_000;
+
+    /// A genesis `ContextCreated` leaf at [`TTL_TEST_CREATION_TS`], returned by the
+    /// expiry-test event-log doubles' `event_log_entries`. Post pass-4e the
+    /// derivation does NOT read this leaf for the base (the base is the prune-immune
+    /// snapshot `creation_timestamp_secs + params.ttl`); it is retained so the test
+    /// histories stay realistic.
+    #[cfg(feature = "testing")]
+    fn ttl_seed_created_leaf() -> scp_event_log::Event {
+        scp_event_log::Event {
+            event_type: scp_event_log::EventType::ContextCreated,
+            actor_did: scp_did::DID("did:example:ttl-test-creator".to_owned()),
+            timestamp: TTL_TEST_CREATION_TS,
+            sequence: 0,
+            payload: scp_event_log::EventPayload::default(),
+            prev_hash: [0u8; 32],
+            signature: Vec::new(),
+        }
+    }
+
     struct TestEventLog;
     #[async_trait::async_trait]
     impl crate::context::builder::ContextEventLogProvider for TestEventLog {
@@ -683,6 +1161,14 @@ mod tests {
             _id: &[u8; 32],
         ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
             Ok(())
+        }
+        #[cfg(feature = "testing")]
+        fn event_log_entries(
+            &self,
+            _id: &[u8; 32],
+        ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
+        {
+            Ok(Some(vec![ttl_seed_created_leaf()]))
         }
     }
 
@@ -1414,5 +1900,645 @@ mod tests {
 
         handle.send_shutdown().await.expect("shutdown acks");
         actor_task.await.expect("actor task joins");
+    }
+
+    // -----------------------------------------------------------------
+    // SEC-1 / ADR-049 §9 amendment — fail-closed TTL expiry before teardown.
+    //
+    // These drive the actor's real run loop through a TTL fire and assert the
+    // SEC-1 properties: the terminal `Expired` state is persisted FAIL-CLOSED
+    // OUTSIDE the relay/event-log transport timeout (so a hostile-relay stall
+    // cannot cancel the durable transition and re-open a resurrection window),
+    // and an INCOMPLETE expiry keeps the actor alive to retry (carrying the
+    // completed-steps bitmask) rather than despawning with unfinished cleanup.
+    // -----------------------------------------------------------------
+
+    /// Build `ActorDeps` with caller-supplied transport + event-log providers
+    /// (the SEC-1 tests inject a stalling / flaky event log) plus persistence.
+    /// Mirrors [`new_test_deps_with_persistence`].
+    #[cfg(feature = "testing")]
+    async fn new_test_deps_with_providers(
+        persistence: Box<dyn crate::context::persistence::ContextPersistence>,
+        transport: Box<dyn crate::context::builder::ContextTransportProvider>,
+        event_log: Box<dyn crate::context::builder::ContextEventLogProvider>,
+    ) -> deps::ActorDeps {
+        use crate::context::supervisor::supervisor::Supervisor;
+        use scp_did::DID;
+        use scp_platform::testing::InMemoryStorage;
+        use std::sync::Arc;
+
+        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+            "did:dht:z6MktestSec1Ttl".to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
+        ));
+        let key_resolver: scp_protocol::context::governance::KeyResolver =
+            Arc::new(|_: &scp_did::DID, _: scp_did::SigningKeyId| None);
+        let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
+            Arc::new(
+                crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
+                    InMemoryStorage::new(),
+                )),
+            );
+
+        let supervisor = Supervisor::with_providers(
+            crypto,
+            transport,
+            event_log,
+            key_resolver,
+            Some(persistence),
+            None,
+            None,
+            None,
+            mls_storage,
+        );
+
+        supervisor
+            .build_actor_deps(&DID("did:example:sec1-ttl-test".to_owned()))
+            .await
+            .expect("build_actor_deps")
+    }
+
+    /// Event log whose `append_event` STALLS forever — models a hostile relay /
+    /// wedged event-log sink that a `timeout(HANDLER_TIMEOUT)` must bound.
+    #[cfg(feature = "testing")]
+    struct StallingEventLog;
+    #[cfg(feature = "testing")]
+    #[async_trait::async_trait]
+    impl crate::context::builder::ContextEventLogProvider for StallingEventLog {
+        async fn init_event_log(
+            &self,
+            _id: &[u8; 32],
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            Ok(())
+        }
+        async fn append_event(
+            &self,
+            _id: &[u8; 32],
+            _event: scp_event_log::EventType,
+            _actor: &str,
+            _payload: scp_event_log::EventPayload,
+            _timestamp_secs: u64,
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            std::future::pending::<()>().await;
+            Ok(())
+        }
+        async fn destroy_event_log(
+            &self,
+            _id: &[u8; 32],
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            Ok(())
+        }
+        // Reading is fast (a seeded genesis leaf) even though `append` stalls; the
+        // deadline base comes from the prune-immune snapshot so expiry proceeds
+        // (A3). The STALL is exercised on `append_event`, the op under test.
+        fn event_log_entries(
+            &self,
+            _id: &[u8; 32],
+        ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
+        {
+            Ok(Some(vec![ttl_seed_created_leaf()]))
+        }
+    }
+
+    /// Event log whose `append_event` FAILS on the first attempt then succeeds —
+    /// a transient cleanup-step failure the actor must retry. (Key destruction
+    /// itself is not independently injectable: `MlsCryptoProvider::destroy_*`
+    /// are inherent DashMap ops that always return `Ok`; a transient event-log
+    /// failure exercises the IDENTICAL incomplete-cleanup → keep-alive → retry
+    /// path SEC-1ii guards.)
+    #[cfg(feature = "testing")]
+    #[derive(Clone, Default)]
+    struct FlakyEventLog {
+        // `Arc`-shared so the test keeps a handle to read the counters while the
+        // deps own a `Box<dyn …>` clone.
+        attempts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        successes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+    #[cfg(feature = "testing")]
+    #[async_trait::async_trait]
+    impl crate::context::builder::ContextEventLogProvider for FlakyEventLog {
+        async fn init_event_log(
+            &self,
+            _id: &[u8; 32],
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            Ok(())
+        }
+        async fn append_event(
+            &self,
+            _id: &[u8; 32],
+            _event: scp_event_log::EventType,
+            _actor: &str,
+            _payload: scp_event_log::EventPayload,
+            _timestamp_secs: u64,
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            use std::sync::atomic::Ordering;
+            let n = self.attempts.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                return Err(
+                    scp_protocol::context::builder::ContextCreationError::EventLogFailed(
+                        "fixture: transient event-log append failure (first attempt)".to_owned(),
+                    ),
+                );
+            }
+            self.successes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn destroy_event_log(
+            &self,
+            _id: &[u8; 32],
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            Ok(())
+        }
+        // Reading returns a seeded genesis leaf (realistic history); the deadline
+        // base comes from the prune-immune snapshot so expiry proceeds (A3). The
+        // transient FAILURE under test is on `append_event`, not the read.
+        fn event_log_entries(
+            &self,
+            _id: &[u8; 32],
+        ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
+        {
+            Ok(Some(vec![ttl_seed_created_leaf()]))
+        }
+    }
+
+    /// Build an `Active` encrypted test state with the TTL deadline already in
+    /// the past, so `reconcile_timers` arms a `sleep(0)` that fires the TTL
+    /// expiry on the actor's first loop turn (no `advance` needed to fire it).
+    #[cfg(feature = "testing")]
+    fn active_state_with_past_ttl(ctx_byte: u8, now_secs: u64) -> state::PerContextState {
+        let context_id_hex = hex_encode_context_id(&[ctx_byte; 32]);
+        let mut state = state::PerContextState::new_for_test_encrypted(
+            [ctx_byte; 32],
+            TTL_TEST_CREATION_TS,
+            scp_did::DID("did:example:sec1-admin".to_owned()),
+        );
+        // A finite params.ttl so the single-source `convergent_ttl_deadline`
+        // (prune-immune snapshot `creation_timestamp_secs + params.ttl`) yields a
+        // real base. Without
+        // a finite ttl AND a genesis leaf the derivation is `None` and
+        // `handle_ttl_expiry` ABORTS (A3), so the scalar-armed expiry never fires.
+        state.handle = crate::context::ContextHandle::new(
+            context_id_hex,
+            scp_protocol::context::params::ContextParams {
+                ttl: Some(std::time::Duration::from_hours(1)),
+                ..Default::default()
+            },
+        );
+        state
+            .handle
+            .transition_to(&scp_protocol::context::ContextState::Active)
+            .expect("transition test handle to Active");
+        // Deadline in the past ⇒ `reconcile_timers` derives `remaining = 0`.
+        state.ttl.timer.deadline_unix_secs = Some(now_secs.saturating_sub(1));
+        state
+    }
+
+    /// SEC-1i (MUST FAIL pre-fix): with the event-log I/O stalling past
+    /// `HANDLER_TIMEOUT`, the terminal `Expired` state is persisted FAIL-CLOSED
+    /// BEFORE the actor could tear down, and the actor stays alive to retry the
+    /// unfinished cleanup. Pre-fix, the terminal persist was best-effort AFTER
+    /// the timed-out I/O (so a relay stall cancelled it, leaving only a
+    /// post-despawn coalesce drain to record `Expired` — a resurrection window)
+    /// AND the actor despawned unconditionally on `Expired` (mailbox closed).
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn ttl_expiry_persists_before_despawn_with_stalling_transport() {
+        let recorder = RecordingPersistence::new();
+        let deps = new_test_deps_with_providers(
+            Box::new(recorder.clone()),
+            Box::new(crate::context::builder::NotConfiguredTransportProvider),
+            Box::new(StallingEventLog),
+        )
+        .await;
+        tokio::time::pause();
+
+        let now = deps.clock.now_secs();
+        let state = active_state_with_past_ttl(0x71, now);
+        let ctx = hex_encode_context_id(&[0x71u8; 32]);
+
+        let (tx, rx) = mpsc::channel::<ContextCommand>(4);
+        let actor = ContextActor::new(state, deps, rx);
+        let actor_task = tokio::spawn(actor.run());
+        let handle = ContextActorHandle::from_sender(tx);
+
+        // The fail-closed Phase-1 persist runs BEFORE (and outside) the stalling
+        // I/O, so it lands without any `advance`. A bounded virtual guard turns a
+        // regression (no fail-closed persist) into a legible failure, not a hang.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            recorder.persisted.notified(),
+        )
+        .await
+        .expect("the terminal Expired state must be persisted fail-closed (SEC-1)");
+
+        let snap = recorder
+            .last_snapshot()
+            .expect("fail-closed persist recorded a snapshot");
+        assert_eq!(
+            snap.state,
+            scp_protocol::context::ContextState::Expired,
+            "the durable snapshot must be Expired BEFORE any teardown — anti-resurrection \
+             keys off this (a stale Active snapshot would resurrect on respawn)"
+        );
+
+        // Advance past the I/O transport budget so the stalled event-log append
+        // times out. Post-fix: cleanup is incomplete ⇒ the actor keeps itself
+        // alive and re-arms a retry (it does NOT despawn). Pre-fix: the actor
+        // despawned here (mailbox closed).
+        tokio::time::advance(
+            handlers::ttl_close::HANDLER_TIMEOUT + std::time::Duration::from_secs(1),
+        )
+        .await;
+
+        let state_after = handle
+            .send(|reply| {
+                ContextCommand::Queries(QueriesCommand::ReadContextState {
+                    context_id: ctx.clone(),
+                    reply,
+                })
+            })
+            .await
+            .expect("actor is still alive after an INCOMPLETE expiry (SEC-1 keep-alive)");
+        assert_eq!(
+            state_after,
+            scp_protocol::context::ContextState::Expired,
+            "the still-alive actor reports the terminal Expired state"
+        );
+
+        drop(handle);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), actor_task).await;
+    }
+
+    /// M2 (bounded exponential TTL-expiry backoff): the retry delay grows
+    /// `base · 2^(n−1)` and saturates at the cap — it is genuinely bounded, not
+    /// the pre-fix fixed-5 s/uncapped schedule the comment mislabelled "bounded
+    /// backoff". A pure-function test — NOT gated on `testing` (it needs no
+    /// testing-only helpers).
+    #[test]
+    fn ttl_expiry_retry_backoff_is_bounded_exponential() {
+        // 0 and 1 both map to the base (first attempt).
+        assert_eq!(ttl_expiry_retry_backoff(0), TTL_EXPIRY_RETRY_BASE);
+        assert_eq!(ttl_expiry_retry_backoff(1), TTL_EXPIRY_RETRY_BASE);
+        // Doubles each attempt: 5, 10, 20, 40, 80, 160 s.
+        assert_eq!(ttl_expiry_retry_backoff(2), Duration::from_secs(10));
+        assert_eq!(ttl_expiry_retry_backoff(3), Duration::from_secs(20));
+        assert_eq!(ttl_expiry_retry_backoff(4), Duration::from_secs(40));
+        assert_eq!(ttl_expiry_retry_backoff(5), Duration::from_secs(80));
+        assert_eq!(ttl_expiry_retry_backoff(6), Duration::from_secs(160));
+        // Saturates at the cap and NEVER exceeds it, even for pathological n.
+        assert_eq!(ttl_expiry_retry_backoff(7), TTL_EXPIRY_RETRY_CAP);
+        assert_eq!(ttl_expiry_retry_backoff(100), TTL_EXPIRY_RETRY_CAP);
+        assert_eq!(ttl_expiry_retry_backoff(u32::MAX), TTL_EXPIRY_RETRY_CAP);
+        assert!(ttl_expiry_retry_backoff(u32::MAX) <= TTL_EXPIRY_RETRY_CAP);
+    }
+
+    /// M2 companion (multi-round backoff across two incomplete retries): two
+    /// consecutive retries grow the delay `base → 2·base` — asserting
+    /// `backoff(2) == 10 s` (double the 5 s base) so the exponential schedule is
+    /// exercised across MORE than one round, not just the first.
+    #[test]
+    fn ttl_expiry_retry_backoff_grows_across_two_rounds() {
+        // Round 1 (retry #1) uses the base; round 2 (retry #2) doubles it.
+        assert_eq!(ttl_expiry_retry_backoff(1), TTL_EXPIRY_RETRY_BASE);
+        assert_eq!(ttl_expiry_retry_backoff(2), TTL_EXPIRY_RETRY_BASE * 2);
+        assert_eq!(ttl_expiry_retry_backoff(2), Duration::from_secs(10));
+        // Strictly increasing across the two rounds (genuinely exponential).
+        assert!(ttl_expiry_retry_backoff(2) > ttl_expiry_retry_backoff(1));
+    }
+
+    /// SEC-1ii (MUST FAIL pre-fix): an INCOMPLETE cleanup (a transient event-log
+    /// append failure) keeps the actor alive; a bounded retry re-runs ONLY the
+    /// failed step (carrying `prior_completed`) until the expiry is complete and
+    /// durable, and only THEN despawns. Pre-fix, `on_ttl_tick` discarded the
+    /// inner error and despawned on `Expired` after ONE attempt — the append
+    /// never succeeded (0 successful appends).
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn incomplete_cleanup_keeps_actor_alive_and_retries() {
+        use std::sync::atomic::Ordering;
+
+        let recorder = RecordingPersistence::new();
+        // `FlakyEventLog` is `Arc`-shared internally, so a clone handed to the
+        // deps and the clone kept here observe the SAME counters.
+        let flaky = FlakyEventLog::default();
+        let deps = new_test_deps_with_providers(
+            Box::new(recorder.clone()),
+            Box::new(crate::context::builder::NotConfiguredTransportProvider),
+            Box::new(flaky.clone()),
+        )
+        .await;
+        tokio::time::pause();
+
+        let now = deps.clock.now_secs();
+        let state = active_state_with_past_ttl(0x72, now);
+
+        let (tx, rx) = mpsc::channel::<ContextCommand>(4);
+        let actor = ContextActor::new(state, deps, rx);
+        let actor_task = tokio::spawn(actor.run());
+        let handle = ContextActorHandle::from_sender(tx);
+
+        // First attempt fires immediately: transition Expired + fail-closed
+        // persist land, but the event-log append fails ⇒ incomplete ⇒ retry
+        // armed, actor stays alive.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            recorder.persisted.notified(),
+        )
+        .await
+        .expect("first attempt persists the terminal state fail-closed");
+
+        // Drive the bounded retry: it re-runs ONLY the failed event-log append
+        // (transition + key destruction were carried in `prior_completed`), which
+        // now succeeds ⇒ complete + durable ⇒ despawn. The handle is held across
+        // this so the actor does NOT exit early via inbox-close (a dropped handle
+        // makes `biased` Arm 1 `recv()→None→break` win over the retry arm); the
+        // retry's own despawn is what ends the task.
+        // The FIRST retry uses the base backoff (`ttl_expiry_retry_backoff(1)`).
+        tokio::time::advance(ttl_expiry_retry_backoff(1) + std::time::Duration::from_secs(1)).await;
+
+        // The actor despawns once the retry completes — its task joins.
+        tokio::time::timeout(std::time::Duration::from_secs(2), actor_task)
+            .await
+            .expect("the actor task exits after a COMPLETE + durable expiry")
+            .expect("actor task joins cleanly");
+        drop(handle);
+
+        assert_eq!(
+            flaky.successes.load(Ordering::SeqCst),
+            1,
+            "the failed event-log append must be RETRIED to exactly one success \
+             (SEC-1ii); pre-fix the actor despawned after the first failure (0 successes)"
+        );
+        assert_eq!(
+            flaky.attempts.load(Ordering::SeqCst),
+            2,
+            "exactly two append attempts: the transient failure + the single retry \
+             (retry re-runs ONLY the failed step)"
+        );
+    }
+
+    /// B10 (MUST FAIL pre-fix): the FFI `ExecuteTtlClose` path must transition
+    /// and FAIL-CLOSED persist the ACTOR's OWN state to `Expired`. Pre-fix,
+    /// `handle_execute_ttl_close` built a THROWAWAY `ContextHandle`, transitioned
+    /// IT, and left the actor's real `cell.handle` (and persisted snapshot)
+    /// `Active`.
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn execute_ttl_close_transitions_real_context_state() {
+        let recorder = RecordingPersistence::new();
+        let deps = new_test_deps_with_providers(
+            Box::new(recorder.clone()),
+            Box::new(crate::context::builder::NotConfiguredTransportProvider),
+            Box::new(TestEventLog),
+        )
+        .await;
+
+        let ctx = hex_encode_context_id(&[0x74u8; 32]);
+        let mut state = state::PerContextState::new_for_test_encrypted(
+            [0x74u8; 32],
+            TTL_TEST_CREATION_TS,
+            scp_did::DID("did:example:sec1-admin".to_owned()),
+        );
+        // Finite params.ttl so the single-source `convergent_ttl_deadline`
+        // (prune-immune snapshot `creation_timestamp_secs + ttl`) yields a real
+        // deadline; otherwise `handle_ttl_expiry` ABORTS (A3) and the FFI
+        // ExecuteTtlClose would no-op instead of transitioning to Expired.
+        state.handle = crate::context::ContextHandle::new(
+            ctx.clone(),
+            scp_protocol::context::params::ContextParams {
+                ttl: Some(std::time::Duration::from_hours(1)),
+                ..Default::default()
+            },
+        );
+        state
+            .handle
+            .transition_to(&scp_protocol::context::ContextState::Active)
+            .expect("transition to Active");
+
+        let (tx, rx) = mpsc::channel::<ContextCommand>(4);
+        let actor = ContextActor::new(state, deps, rx);
+        let actor_task = tokio::spawn(actor.run());
+        let handle = ContextActorHandle::from_sender(tx);
+
+        handle
+            .send(|reply| {
+                ContextCommand::TtlClose(
+                    crate::context::actor::commands::TtlCloseCommand::ExecuteTtlClose {
+                        payload: Box::new(crate::context::actor::commands::TtlContextPayload {
+                            context_id: ctx.clone(),
+                            params: scp_protocol::context::params::ContextParams::default(),
+                        }),
+                        reply,
+                    },
+                )
+            })
+            .await
+            .expect("ExecuteTtlClose replies Ok on the real handle");
+
+        // The actor's REAL lifecycle state is now Expired (pre-fix: still Active,
+        // because only a throwaway handle was transitioned).
+        let live_state = handle
+            .send(|reply| {
+                ContextCommand::Queries(QueriesCommand::ReadContextState {
+                    context_id: ctx.clone(),
+                    reply,
+                })
+            })
+            .await
+            .expect("read the actor's real lifecycle state");
+        assert_eq!(
+            live_state,
+            scp_protocol::context::ContextState::Expired,
+            "ExecuteTtlClose must transition the ACTOR's real handle to Expired (B10)"
+        );
+
+        // ...and the fail-closed persist recorded that Expired state durably.
+        let snap = recorder
+            .last_snapshot()
+            .expect("ExecuteTtlClose fail-closed persist recorded a snapshot");
+        assert_eq!(
+            snap.state,
+            scp_protocol::context::ContextState::Expired,
+            "ExecuteTtlClose must FAIL-CLOSED persist the actor's Expired state (B10 + SEC-1)"
+        );
+
+        handle.send_shutdown().await.expect("shutdown acks");
+        actor_task.await.expect("actor task joins");
+    }
+
+    /// Persistence double that FAILS the FIRST fail-closed persist of a terminal
+    /// `Expired` snapshot, then succeeds — so a test can exercise the Phase-1
+    /// persist-failure branch of `handle_ttl_expiry` (L1). Non-`Expired`
+    /// persists (e.g. any coalesced pre-expiry write) always succeed, so the
+    /// injected failure targets exactly the terminal fail-closed persist.
+    #[cfg(feature = "testing")]
+    #[derive(Clone, Default)]
+    struct FailFirstExpiredPersist {
+        expired_attempts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        first_fail_observed: std::sync::Arc<tokio::sync::Notify>,
+        last: std::sync::Arc<arc_swap::ArcSwapOption<crate::context::state::ContextSnapshot>>,
+    }
+    #[cfg(feature = "testing")]
+    #[async_trait::async_trait]
+    impl crate::context::persistence::ContextPersistence for FailFirstExpiredPersist {
+        async fn persist_context(
+            &self,
+            _context_id: &str,
+            snapshot: &crate::context::state::ContextSnapshot,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            use std::sync::atomic::Ordering;
+            if snapshot.state == scp_protocol::context::ContextState::Expired {
+                let n = self.expired_attempts.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    // The FIRST terminal Expired persist fails fail-closed.
+                    self.first_fail_observed.notify_one();
+                    return Err("fixture: first terminal Expired persist fails".into());
+                }
+            }
+            self.last.store(Some(std::sync::Arc::new(snapshot.clone())));
+            Ok(())
+        }
+        async fn load_context(
+            &self,
+            _context_id: &str,
+        ) -> Result<
+            Option<crate::context::state::ContextSnapshot>,
+            Box<dyn std::error::Error + Send + Sync>,
+        > {
+            Ok(self.last.load_full().map(|s| (*s).clone()))
+        }
+        async fn delete_context(
+            &self,
+            _: &str,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+        async fn list_persisted_contexts(
+            &self,
+        ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(self
+                .last
+                .load_full()
+                .map(|s| vec![s.context_id.clone()])
+                .unwrap_or_default())
+        }
+    }
+
+    /// Event-log double that always succeeds and COUNTS `ContextExpired` append
+    /// attempts — the observable leaf whose gating L1 asserts.
+    #[cfg(feature = "testing")]
+    #[derive(Clone, Default)]
+    struct ContextExpiredAppendCounter {
+        context_expired_appends: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+    #[cfg(feature = "testing")]
+    #[async_trait::async_trait]
+    impl crate::context::builder::ContextEventLogProvider for ContextExpiredAppendCounter {
+        async fn init_event_log(
+            &self,
+            _id: &[u8; 32],
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            Ok(())
+        }
+        async fn append_event(
+            &self,
+            _id: &[u8; 32],
+            event_type: scp_event_log::EventType,
+            _actor: &str,
+            _payload: scp_event_log::EventPayload,
+            _timestamp_secs: u64,
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            if event_type == scp_event_log::EventType::ContextExpired {
+                self.context_expired_appends
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            Ok(())
+        }
+        async fn destroy_event_log(
+            &self,
+            _id: &[u8; 32],
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            Ok(())
+        }
+        // Seed a genesis leaf (realistic history); the deadline base comes from the
+        // prune-immune snapshot so expiry proceeds (A3) rather than aborting — the
+        // L1 gating under test is the persist→leaf ordering, not the derivation.
+        fn event_log_entries(
+            &self,
+            _id: &[u8; 32],
+        ) -> Result<Option<Vec<scp_event_log::Event>>, scp_protocol::context::ContextError>
+        {
+            Ok(Some(vec![ttl_seed_created_leaf()]))
+        }
+    }
+
+    /// L1 (leaf append gated on the fail-closed persist succeeding): a Phase-1
+    /// terminal-`Expired` persist FAILURE must NOT append the observable
+    /// `ContextExpired` leaf that round — the leaf must announce only a DURABLE
+    /// terminal state. The actor stays alive (keep-direction) and the bounded
+    /// retry re-runs persist + append; once the persist succeeds the leaf appears
+    /// exactly once. Pre-fix, Phase 2 ran unconditionally, so the leaf was
+    /// appended ahead of the durable terminal snapshot.
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn phase1_persist_failure_defers_leaf_append_until_durable() {
+        use std::sync::atomic::Ordering;
+
+        let persistence = FailFirstExpiredPersist::default();
+        let counter = ContextExpiredAppendCounter::default();
+        let deps = new_test_deps_with_providers(
+            Box::new(persistence.clone()),
+            Box::new(crate::context::builder::NotConfiguredTransportProvider),
+            Box::new(counter.clone()),
+        )
+        .await;
+        tokio::time::pause();
+
+        let now = deps.clock.now_secs();
+        let state = active_state_with_past_ttl(0x77, now);
+
+        let (tx, rx) = mpsc::channel::<ContextCommand>(4);
+        let actor = ContextActor::new(state, deps, rx);
+        let actor_task = tokio::spawn(actor.run());
+        let handle = ContextActorHandle::from_sender(tx);
+
+        // First attempt fires immediately: transition Expired + key destruction
+        // land, but the fail-closed Expired persist FAILS ⇒ Phase 2 (leaf append)
+        // is skipped this round ⇒ actor stays alive with a retry armed.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            persistence.first_fail_observed.notified(),
+        )
+        .await
+        .expect("the first terminal Expired persist is attempted (and fails)");
+
+        assert_eq!(
+            counter.context_expired_appends.load(Ordering::SeqCst),
+            0,
+            "no ContextExpired leaf may be appended while the terminal Expired \
+             persist is not durable (L1)"
+        );
+
+        // Drive the bounded retry: the persist now succeeds ⇒ Phase 2 runs ⇒ the
+        // leaf appends (exactly once) ⇒ complete + durable ⇒ despawn.
+        tokio::time::advance(ttl_expiry_retry_backoff(1) + std::time::Duration::from_secs(1)).await;
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), actor_task)
+            .await
+            .expect("the actor task exits after a COMPLETE + durable expiry")
+            .expect("actor task joins cleanly");
+        drop(handle);
+
+        assert_eq!(
+            counter.context_expired_appends.load(Ordering::SeqCst),
+            1,
+            "the ContextExpired leaf must appear EXACTLY ONCE, only after a retry \
+             whose fail-closed persist succeeded (L1)"
+        );
+        assert!(
+            persistence.expired_attempts.load(Ordering::SeqCst) >= 2,
+            "the terminal Expired persist must have been retried after its first \
+             failure (L1)"
+        );
     }
 }

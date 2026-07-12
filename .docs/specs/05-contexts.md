@@ -657,6 +657,8 @@ TTL extension is a governance action with additional consent requirements beyond
 
 **Bilateral context shortcut.** For two-party contexts, TTL extension requires only the other party's consent (the proposer's consent is implicit in the proposal). No governance proposal is needed — a direct `TTLExtensionConsent` exchange suffices.
 
+**Leaf convergence.** The `TTLExtended` leaf must be byte-identical across every member that records it, or their event-log Merkle roots diverge. Every field is therefore a convergent quantity: the old/new deadlines and the (lexicographically sorted) consenting-members list are convergent by construction; the leaf's own `timestamp` field is the committer-assigned proposal instant for the governance path, and — for the bilateral shortcut, which has no signed governance proposal — the convergent **pre-extension deadline** (the old deadline), NOT a per-member wall-clock `now()`. (This is a convergence key only; the TTL deadline is always derived from the leaf's `new_deadline_unix` payload field, never from the leaf `timestamp`. See ADR-049 §9, the single-source TTL-deadline invariant.)
+
 ## 5.11 Memory Scope
 
 Contexts gain a declared memory scope — what happens to the context's data when it closes or expires. Memory scope is set at creation and visible in context metadata (visible before opt-in).

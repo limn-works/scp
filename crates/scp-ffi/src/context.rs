@@ -5798,7 +5798,17 @@ impl crate::scp::PyScp {
 
     /// Resets the TTL timer after a successful unanimous extension.
     ///
-    /// Cancels the old timer and spawns a new one with the given duration.
+    /// EXTENDS the existing convergent TTL deadline by `new_seconds`
+    /// (`old_deadline + new_seconds`), NOT a local `now + new_seconds` — every
+    /// member adds the same duration to the same recorded deadline, so the
+    /// re-armed `ContextExpired`/`ContextClosed` leaf timestamp stays convergent
+    /// across members (§7.3.1). It does NOT cancel/respawn a task: the TTL timer
+    /// is an actor-owned arm and `reconcile_timers` re-derives the one-shot sleep
+    /// from the new recorded deadline (ADR-049 finding A3).
+    ///
+    /// NO-OP on a context with no armed TTL (`deadline_unix_secs == None`): a
+    /// context with no recorded deadline has no TTL to extend, so the disarmed
+    /// timer stays disarmed rather than arming a long-past deadline (H2).
     #[pyo3(signature = (handle, new_seconds))]
     pub fn context_reset_ttl_timer(
         &self,
@@ -5823,9 +5833,10 @@ impl crate::scp::PyScp {
                     context_id,
                     params: core_params,
                     duration,
-                    // Ignored by ResetTtlTimer (extension reset never anchors to
-                    // creation).
-                    anchor_deadline_to_creation: false,
+                    // Ignored by ResetTtlTimer (which extends the existing
+                    // convergent deadline by `duration`, not an absolute
+                    // override).
+                    deadline_override: None,
                 }),
                 reply: tx,
             };

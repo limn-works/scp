@@ -938,9 +938,9 @@ impl CrashWindow {
 /// compiler try to fetch an opaque type's hidden type within its own
 /// defining scope (unsupported); moving the spawn into this free fn —
 /// whose only relationship to the cycle is a plain `tokio::spawn` call —
-/// breaks that self-reference. The actor task is NOT placed on the
-/// supervisor's timer `task_set`; the watchdog owns its `JoinHandle`
-/// directly.
+/// breaks that self-reference. The watchdog owns its `JoinHandle`
+/// directly (TTL / governance timers are actor-owned arms — ADR-049
+/// finding A3 — so no supervisor timer JoinSet exists).
 fn spawn_actor_watchdog_task(
     supervisor: Arc<Supervisor>,
     ctx_id: String,
@@ -958,8 +958,9 @@ fn spawn_actor_watchdog_task(
 /// the same reason: the watchdog reaches `Supervisor::kp_actor_watchdog` →
 /// `Supervisor::respawn_kp_actor` → `Supervisor::key_package_store_for` →
 /// (spawn), which forms a self-referential async cycle the compiler refuses to
-/// resolve when spawned inline. The KP actor task is NOT placed on the
-/// supervisor's timer `task_set`; the watchdog owns its `JoinHandle` directly.
+/// resolve when spawned inline. The watchdog owns its `JoinHandle` directly
+/// (no supervisor timer JoinSet exists — timers are actor-owned arms, ADR-049
+/// finding A3).
 fn spawn_kp_actor_watchdog_task(
     supervisor: Arc<Supervisor>,
     identity: DID,
@@ -1316,12 +1317,6 @@ pub struct Supervisor {
     /// external consumers. Empty `OnceLock` means "no channel
     /// configured".
     event_tx: OnceLock<tokio::sync::broadcast::Sender<(String, ContextEvent)>>,
-    /// Shared task set for TTL timers + governance timeouts.
-    #[allow(
-        clippy::disallowed_types,
-        reason = "ADR-049 §Decision 12 allow-list: guards the shared JoinSet of spawned TTL/governance-timeout tasks. Touched only on spawn/reap, never on a per-command read path."
-    )]
-    task_set: OnceLock<Arc<tokio::sync::Mutex<tokio::task::JoinSet<()>>>>,
     /// OpenMLS storage adapter — the bridge's chosen Storage, erased once via
     /// `SpawnBlockingStorageAdapter`. Runtime NEVER defaults this. Lock-free
     /// read per ADR-049 §Decision 12.
@@ -1637,7 +1632,6 @@ impl Supervisor {
             key_resolver: OnceLock::new(),
             payment_adapter: OnceLock::new(),
             event_tx: OnceLock::new(),
-            task_set: OnceLock::new(),
             mls_storage: OnceLock::new(),
             reserved_saga_contexts,
             // Generation 0 is never stamped onto a live actor (the first
@@ -1846,12 +1840,6 @@ impl Supervisor {
         if let Some(tx) = event_tx {
             let _ = supervisor.event_tx.set(tx);
         }
-        #[allow(
-            clippy::disallowed_types,
-            reason = "ADR-049 §Decision 12 allow-list: guards the shared JoinSet of spawned TTL/governance-timeout tasks; touched only on spawn/reap, not a per-command read."
-        )]
-        let task_set = Arc::new(tokio::sync::Mutex::new(tokio::task::JoinSet::new()));
-        let _ = supervisor.task_set.set(task_set);
         // A2 — attach the durable consumed-init-key set to the shared MLS
         // backend so `join_from_welcome` enforces the crypto-layer single-use
         // backstop on EVERY join path (independent of the KeyPackage actor's
@@ -1991,19 +1979,6 @@ impl Supervisor {
         self.event_tx
             .get()
             .map(tokio::sync::broadcast::Sender::subscribe)
-    }
-
-    /// Cheap reference to the supervisor's shared task-set. Returns
-    /// `None` if [`Self::with_providers`] was not used.
-    #[must_use]
-    #[allow(
-        clippy::disallowed_types,
-        reason = "ADR-049 §Decision 12 allow-list: exposes the shared TTL/governance-timeout JoinSet holder (see the `task_set` field); accessor is cold, not a per-command read."
-    )]
-    pub(crate) fn task_set_ref(
-        &self,
-    ) -> Option<&Arc<tokio::sync::Mutex<tokio::task::JoinSet<()>>>> {
-        self.task_set.get()
     }
 
     /// Cheap reference to the supervisor's OpenMLS storage adapter
@@ -2732,6 +2707,74 @@ impl Supervisor {
                         return Outcome::err_mutated(sketch);
                     }
                 };
+                // B8 — Create-time terminal-snapshot precheck (squatting /
+                // tombstone-finality). Under the already-held
+                // `bootstrap_spawn_lock`, mirror Precheck-D
+                // (spawn-from-Welcome): refuse `CreateContext` over a DURABLE
+                // snapshot whose lifecycle `state` is TERMINAL (`Expired` /
+                // `Closed` / `Tombstoned`). Such an id is finished for good —
+                // re-creating it would resurrect an expired/closed/tombstoned
+                // context under a fresh actor, defeating tombstone-finality
+                // (the "expired/tombstoned id re-creatable" residual,
+                // black-hat). A storage READ fault refuses fail-closed (we
+                // cannot prove the id is free). TERMINAL states ONLY: an absent
+                // snapshot (`None`) or a NON-terminal one still creates — a
+                // standing context legitimately re-creates over a
+                // non-terminal/absent id and resets its crash window.
+                //
+                // PROVENANCE — this precheck INTENTIONALLY does NOT fire on the
+                // standing-context path. A standing (deterministic-id) pair
+                // reaches `create_context` DIRECTLY via `standing_context` →
+                // `create_context` and never through this `CreateContext`
+                // dispatch arm, so it bypasses B8 by construction. That
+                // asymmetry is CORRECT and settled: a reaped / never-joined
+                // standing handle AUTO-REVIVES under its deterministic id on the
+                // next `standing_context(peer)` contact — standing pairs carry
+                // NO permanent tombstone, and blocking is enforced via the
+                // block-list / §3.7.1 severance (sender-key rotation), not via
+                // context finality (ADR-049 §10 "Standing-context auto-revive
+                // residual (BLACK-002 ACCEPTED, settled)"; spec 05-contexts.md
+                // §5.12). B8 tombstone-finality applies ONLY to the explicit
+                // `CreateContext` create flow, which is exactly this arm.
+                //
+                // `ContextState::is_terminal()` is the closed-by-construction
+                // permanent-terminal predicate (`Expired | Closed | Tombstoned`;
+                // N5) — an exhaustive match, so a future variant forces a
+                // terminality decision at its definition rather than silently
+                // slipping past this ad-hoc set.
+                match deps.persistence.load_context(&context_id).await {
+                    Ok(Some(snapshot)) if snapshot.state.is_terminal() => {
+                        let msg = format!(
+                            "create_context refused: a durable {:?} snapshot already exists \
+                             for '{context_id}' — a terminal (expired/closed/tombstoned) \
+                             context id is final and MUST NOT be re-created (tombstone \
+                             finality)",
+                            snapshot.state
+                        );
+                        let err =
+                            scp_protocol::context::builder::ContextCreationError::CreationFailed(
+                                msg.clone(),
+                            );
+                        let _ = reply.send(Err(err));
+                        return Outcome::err_mutated(ContextError::CreationFailed(msg));
+                    }
+                    // Absent snapshot or a NON-terminal one — proceed (standing
+                    // re-create reuses a non-terminal/absent id).
+                    Ok(_) => {}
+                    Err(e) => {
+                        let msg = format!(
+                            "create_context: cannot verify durable terminal-state precheck \
+                             for '{context_id}' (snapshot existence read failed: {e}) — \
+                             refusing fail-closed"
+                        );
+                        let err =
+                            scp_protocol::context::builder::ContextCreationError::CreationFailed(
+                                msg.clone(),
+                            );
+                        let _ = reply.send(Err(err));
+                        return Outcome::err_mutated(ContextError::PersistenceFailed(msg));
+                    }
+                }
                 let fut = crate::context::lifecycle_helpers::create_context(
                     &deps,
                     p.context_id,
@@ -3112,13 +3155,10 @@ impl Supervisor {
         // handler-side `dispatch_from_shim` and the dead `_legacy`
         // bodies have been deleted; every command's target actor must
         // be spawned before dispatch reaches this method.
-        let Some(ctx_id) = Self::ttl_close_command_context_id(&cmd) else {
-            return Err(ContextError::ContextNotRegistered(
-                "dispatch_ttl_close_command — variant has no per-context routing target \
-                 (FireTimer resolves its own actor); mailbox-only after Phase 2A finalization"
-                    .to_owned(),
-            ));
-        };
+        // Total: every `TtlCloseCommand` variant carries a routable
+        // `context_id` (the `FireTimer` variant was retired — ADR-049
+        // finding A3), so there is no no-target error branch.
+        let ctx_id = Self::ttl_close_command_context_id(&cmd);
         let actor = self.lookup(ctx_id).ok_or_else(|| {
             self.lookup_miss_error(
                 ctx_id,
@@ -4042,9 +4082,10 @@ impl Supervisor {
         // Hand the owned state + deps into the actor task. The spawned
         // future captures both by move; neither escapes the actor's scope.
         // KEEP the JoinHandle (the pre-watchdog spawn dropped it, silently
-        // swallowing panics and wedging the context). Actor tasks are NOT
-        // added to `task_set` — that JoinSet drives TTL / governance
-        // timers; the watchdog owns this handle directly.
+        // swallowing panics and wedging the context). The watchdog owns this
+        // handle directly. TTL / governance timers are ACTOR-OWNED arms
+        // (ADR-049 finding A3), reconciled inside the actor's own `run()`
+        // loop — no separate supervisor timer JoinSet exists.
         let inbox = rx;
         let join = tokio::spawn(async move {
             Box::pin(crate::context::actor::ContextActor::new(state, deps, inbox).run()).await;
@@ -11557,22 +11598,19 @@ impl Supervisor {
         // a LIVE actor.
         let handle = spawn_outcome?;
 
-        // Finalization: gauges, governance-timeout tick, TTL timer — the same
-        // post-spawn wiring `finalize_create` installs, reached through the
-        // supervisor registry (the snapshot was already persisted fail-closed
-        // above, so no additional persist is needed here).
+        // Finalization: gauges + TTL timer — the same post-spawn wiring
+        // `finalize_create` installs, reached through the supervisor registry
+        // (the snapshot was already persisted fail-closed above, so no
+        // additional persist is needed here). The governance-timeout interval
+        // is ACTOR-OWNED (ADR-049 Decision-1 / finding A3): the spawned actor's
+        // `reconcile_timers` arms it while `Active` — no bootstrap install.
         deps.supervisor.update_context_gauges().await;
-        crate::context::governance_helpers::start_governance_timeout_task(
-            &deps.supervisor,
-            &context_id,
-        )
-        .await;
-        if let Some(duration) = params.ttl {
-            // Joiner anchors the convergent expiry deadline on the same
-            // creator-assigned creation-timestamp basis the creator used
-            // (`anchor_deadline_to_creation = true`).
+        if params.ttl.is_some() {
+            // Joiner arms with no explicit deadline — the actor handler derives
+            // the convergent expiry deadline on the same creator-assigned
+            // `creation_timestamp_secs + params.ttl` basis the creator used.
             deps.supervisor
-                .dispatch_start_ttl_timer(&context_id, params.clone(), duration, true)
+                .dispatch_start_ttl_timer(&context_id, params.clone(), None)
                 .await;
         }
 
@@ -12582,22 +12620,17 @@ impl Supervisor {
     /// helper can route through the per-context actor's mailbox. The
     /// boxed-payload variants (`StartTtlTimer` / `ResetTtlTimer` /
     /// `ExecuteTtlClose` / `FinalizeClose`) destructure their payloads to
-    /// expose the embedded `context_id`. Only [`TtlCloseCommand::FireTimer`]
-    /// returns `None` (it resolves its own actor and has no routable
-    /// `context_id` field).
-    const fn ttl_close_command_context_id(cmd: &TtlCloseCommand) -> Option<&str> {
+    /// expose the embedded `context_id`. Every variant carries a routable
+    /// `context_id` (the former `FireTimer` variant was retired — TTL
+    /// expiry is now an actor-owned arm, ADR-049 finding A3), so this is
+    /// total (unlike the sibling `governance_command_context_id`).
+    const fn ttl_close_command_context_id(cmd: &TtlCloseCommand) -> &str {
         match cmd {
-            TtlCloseCommand::ExtendTtl { context_id, .. } => Some(context_id.as_str()),
+            TtlCloseCommand::ExtendTtl { context_id, .. } => context_id.as_str(),
             TtlCloseCommand::StartTtlTimer { payload, .. }
-            | TtlCloseCommand::ResetTtlTimer { payload, .. } => Some(payload.context_id.as_str()),
+            | TtlCloseCommand::ResetTtlTimer { payload, .. } => payload.context_id.as_str(),
             TtlCloseCommand::ExecuteTtlClose { payload, .. }
-            | TtlCloseCommand::FinalizeClose { payload, .. } => Some(payload.context_id.as_str()),
-            // `FireTimer` carries no `context_id` field: the per-context
-            // TTL timer task resolves the actor itself via
-            // [`Self::lookup`] and mailboxes the command through the
-            // returned handle, so it never routes through
-            // `dispatch_ttl_close_command`.
-            TtlCloseCommand::FireTimer { .. } => None,
+            | TtlCloseCommand::FinalizeClose { payload, .. } => payload.context_id.as_str(),
         }
     }
 
@@ -12638,14 +12671,11 @@ impl Supervisor {
             // decided at the iteration site (one command per known
             // actor). Returning `None` here keeps `dispatch_governance_command`
             // from accepting them — sweeps must use the iterating helpers.
+            // (The former `EvaluateTimeouts` / `StartTimeoutTask` variants
+            // were retired: governance timeouts are now an actor-owned arm,
+            // ADR-049 finding A3.)
             GovernanceCommand::EvaluatePeriodicConsequences { .. }
-            | GovernanceCommand::ProcessPendingCommits { .. }
-            | GovernanceCommand::EvaluateTimeouts { .. }
-            // `StartTimeoutTask` is dispatched directly to the owning
-            // actor by `start_governance_timeout_task` (lookup + send),
-            // not through `dispatch_governance_command`. Returning `None`
-            // keeps the routed-dispatch path from accepting it.
-            | GovernanceCommand::StartTimeoutTask { .. } => None,
+            | GovernanceCommand::ProcessPendingCommits { .. } => None,
         }
     }
 
@@ -13495,6 +13525,140 @@ mod tests {
         }
     }
 
+    /// An event-log double PRE-SEEDED with a fixed entry history, returned
+    /// verbatim by `event_log_entries`. Its `restore_event_log` is the trait
+    /// default (a no-op `init_event_log`), so the seeded entries SURVIVE the
+    /// restore path — letting restore re-arm tests exercise the single-source
+    /// `convergent_ttl_deadline` against a real leaf history (a `ContextPromoted`
+    /// disarm, a `TtlExtended` raise) without standing up a full Merkle provider.
+    #[derive(Clone)]
+    struct SeededEventLog {
+        #[allow(clippy::disallowed_types)]
+        entries: Arc<std::sync::Mutex<Vec<scp_event_log::Event>>>,
+    }
+    impl SeededEventLog {
+        fn new(entries: Vec<scp_event_log::Event>) -> Self {
+            Self {
+                entries: Arc::new(std::sync::Mutex::new(entries)),
+            }
+        }
+    }
+    #[async_trait::async_trait]
+    impl crate::context::builder::ContextEventLogProvider for SeededEventLog {
+        async fn init_event_log(
+            &self,
+            _id: &[u8; 32],
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            Ok(())
+        }
+        async fn append_event(
+            &self,
+            _id: &[u8; 32],
+            event_type: scp_event_log::EventType,
+            actor: &str,
+            payload: scp_event_log::EventPayload,
+            timestamp_secs: u64,
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            {
+                let mut entries = self
+                    .entries
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let sequence = entries.len() as u64;
+                entries.push(scp_event_log::Event {
+                    event_type,
+                    actor_did: DID(actor.to_owned()),
+                    timestamp: timestamp_secs,
+                    sequence,
+                    payload,
+                    prev_hash: [0u8; 32],
+                    signature: Vec::new(),
+                });
+            }
+            Ok(())
+        }
+        async fn destroy_event_log(
+            &self,
+            _id: &[u8; 32],
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            Ok(())
+        }
+        fn event_log_entries(
+            &self,
+            _id: &[u8; 32],
+        ) -> Result<Option<Vec<scp_event_log::Event>>, ContextError> {
+            Ok(Some(
+                self.entries
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone(),
+            ))
+        }
+    }
+
+    /// The convergent creation instant every TTL restore/re-arm test uses as
+    /// `T0`. Post pass-4e the create base is the PRUNE-IMMUNE snapshot
+    /// `creation_timestamp_secs + params.ttl` (E1), which these tests set to `T0`
+    /// via `new_for_test_encrypted(_, T0, _)`; the genesis leaf's own `timestamp`
+    /// is NO LONGER read for the base. This constant is kept aligned with `T0` so
+    /// seeded leaves remain realistic, though the derivation ignores it.
+    const SEEDED_CREATION_TS: u64 = 1_700_000_000;
+
+    /// A genesis `ContextCreated` leaf for [`SeededEventLog`] histories. Post
+    /// pass-4e the deadline derivation does NOT read this leaf (base + promotion
+    /// come from the prune-immune snapshot; the log is read only for `TtlExtended`
+    /// leaves) — it is retained so restore/expiry histories stay realistic and to
+    /// prove the base is unaffected by its presence/absence.
+    fn seeded_context_created(sequence: u64) -> scp_event_log::Event {
+        scp_event_log::Event {
+            event_type: scp_event_log::EventType::ContextCreated,
+            actor_did: DID("did:example:seeded-creator".to_owned()),
+            timestamp: SEEDED_CREATION_TS,
+            sequence,
+            payload: scp_event_log::EventPayload::default(),
+            prev_hash: [0u8; 32],
+            signature: Vec::new(),
+        }
+    }
+
+    /// Bare `ContextPromoted` leaf for [`SeededEventLog`] histories. Post pass-4e
+    /// this leaf is the event-log RECORD of promotion but is NOT read for the arm
+    /// decision (promotion is `params.ttl == None`, the prune-immune authority);
+    /// tests seed it to prove a stray promotion leaf does not move the deadline.
+    fn seeded_context_promoted(sequence: u64) -> scp_event_log::Event {
+        scp_event_log::Event {
+            event_type: scp_event_log::EventType::ContextPromoted,
+            actor_did: DID("did:example:seeded-creator".to_owned()),
+            timestamp: 0,
+            sequence,
+            payload: scp_event_log::EventPayload::default(),
+            prev_hash: [0u8; 32],
+            signature: Vec::new(),
+        }
+    }
+
+    /// `TtlExtended` leaf carrying `new_deadline_unix` for [`SeededEventLog`]
+    /// histories.
+    fn seeded_ttl_extended(sequence: u64, old_dl: u64, new_dl: u64) -> scp_event_log::Event {
+        let payload =
+            scp_event_log::payload::encode_payload(&scp_event_log::payload::TtlExtendedPayload {
+                old_deadline_unix: old_dl,
+                new_deadline_unix: new_dl,
+                proposal_id: [0u8; 32],
+                consenting_members: vec!["did:example:seeded-member".to_owned()],
+            })
+            .expect("encode TtlExtendedPayload");
+        scp_event_log::Event {
+            event_type: scp_event_log::EventType::TtlExtended,
+            actor_did: DID("did:example:seeded-creator".to_owned()),
+            timestamp: 0,
+            sequence,
+            payload,
+            prev_hash: [0u8; 32],
+            signature: Vec::new(),
+        }
+    }
+
     /// Build a supervisor with minimal providers so
     /// [`test_actor_deps`] can construct `ActorDeps` via the real
     /// `build_actor_deps` path. The plain `test_supervisor` helper
@@ -13686,126 +13850,1893 @@ mod tests {
         handle.send_shutdown().await.unwrap();
     }
 
-    /// End-to-end: a TTL timer installed via the actor mailbox
-    /// (`SupervisorHandle::dispatch_start_ttl_timer` →
-    /// `TtlCloseCommand::StartTtlTimer` → actor-shape
-    /// `ttl_close_helpers::spawn_ttl_timer`) actually fires after its
-    /// duration: the spawned timer task resolves the owning actor via
-    /// `Supervisor::lookup` and mailboxes `TtlCloseCommand::FireTimer`,
-    /// whose handler runs the expiry pipeline on owned state and
-    /// transitions the context `Active → Expired`. Proves the
-    /// registry + mailbox-tick timer path (ADR-049 Phase 2A
-    /// finalization) end-to-end, with no `contexts` DashMap reach.
-    #[tokio::test]
-    async fn dispatch_start_ttl_timer_fires_and_expires_context() {
-        use crate::context::supervisor::handle::SupervisorHandle;
+    /// End-to-end (ADR-049 Decision-1 / finding A3): the ACTOR-OWNED TTL
+    /// arm fires from owned state — NO supervisor `task_set` spawn and NO
+    /// `FireTimer` mailbox hop. The actor's `run()` loop reconciles a
+    /// one-shot `sleep` against `state.ttl.timer.deadline_unix_secs`
+    /// (`reconcile_timers`), fires `on_ttl_tick` → the expiry pipeline on
+    /// owned state (`Active → Expired`), and breaks the loop on the
+    /// terminal state so the actor task exits (its mailbox closes).
+    ///
+    /// Paused tokio time: the deadline is armed `TTL_SECS` ahead of the
+    /// actor's clock and the fire is driven by `advance`, not wall-clock
+    /// sleeping.
+    #[tokio::test(start_paused = true)]
+    #[allow(clippy::too_many_lines)] // inline recording provider + 4-part post-expiry contract
+    async fn actor_owned_ttl_arm_fires_and_despawns_self() {
+        use async_trait::async_trait;
+
+        use crate::context::persistence::ContextPersistence;
+        use crate::context::state::ContextSnapshot;
+
+        type PersistErr = Box<dyn std::error::Error + Send + Sync>;
+
+        /// Captures the last persisted snapshot's state so the test can prove
+        /// the terminal `Expired` state is DURABLE even though the actor
+        /// despawned (its live mailbox is gone, so `read_context_state`
+        /// returns `None` — the Expired signal lives in the snapshot).
+        struct RecordingPersistence {
+            // Test-only capture; the guard is never held across `.await`.
+            #[allow(clippy::disallowed_types)]
+            last_state: Arc<std::sync::Mutex<Option<scp_protocol::context::ContextState>>>,
+        }
+        #[async_trait]
+        impl ContextPersistence for RecordingPersistence {
+            async fn persist_context(
+                &self,
+                _context_id: &str,
+                snapshot: &ContextSnapshot,
+            ) -> Result<(), PersistErr> {
+                *self.last_state.lock().unwrap() = Some(snapshot.state.clone());
+                Ok(())
+            }
+            async fn load_context(
+                &self,
+                _context_id: &str,
+            ) -> Result<Option<ContextSnapshot>, PersistErr> {
+                Ok(None)
+            }
+            async fn delete_context(&self, _context_id: &str) -> Result<(), PersistErr> {
+                Ok(())
+            }
+            async fn list_persisted_contexts(&self) -> Result<Vec<String>, PersistErr> {
+                Ok(Vec::new())
+            }
+        }
+
+        const TTL_SECS: u64 = 30;
 
         let supervisor_arc = supervisor_with_providers();
-        let deps = test_actor_deps(&supervisor_arc).await;
+        let mut deps = test_actor_deps(&supervisor_arc).await;
+        #[allow(clippy::disallowed_types)]
+        let last_state: Arc<std::sync::Mutex<Option<scp_protocol::context::ContextState>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        deps.persistence = Arc::new(RecordingPersistence {
+            last_state: Arc::clone(&last_state),
+        });
+        // The expiry pipeline derives its `ContextExpired` leaf timestamp from the
+        // partitioned single-source deadline; a finite params.ttl (below) yields
+        // the prune-immune snapshot base `creation_timestamp_secs + ttl`, so the
+        // derivation is `Some` and the expiry proceeds (a `params.ttl == None`
+        // would make `handle_ttl_expiry` ABORT, A3). The seeded genesis leaf is
+        // realistic history but is no longer read for the base.
+        deps.event_log = Arc::new(SeededEventLog::new(vec![seeded_context_created(0)]));
 
         let ctx_id_bytes = [0x7Au8; 32];
         let ctx_key = hex::encode(ctx_id_bytes);
-        let state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+        let mut state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
             ctx_id_bytes,
             1_700_000_000,
             DID("did:example:admin".to_owned()),
         );
-        // Clone the shared handle BEFORE moving state into the actor so
-        // we can observe the actor's FSM transitions from this test.
-        // The actor's `state.handle` must be `Active` for the FireTimer
-        // expiry pipeline to run (it rejects non-Active contexts), so
-        // drive the shared handle to `Active` up front — the production
-        // create path leaves the context Active before the timer fires.
+        // Finite params.ttl so the single-source deadline derives (prune-immune
+        // snapshot base `creation_timestamp_secs + ttl`); the scalar below
+        // independently drives the one-shot sleep timing.
+        state.handle = crate::context::ContextHandle::new(
+            ctx_key.clone(),
+            scp_protocol::context::params::ContextParams {
+                ttl: Some(std::time::Duration::from_secs(TTL_SECS)),
+                ..Default::default()
+            },
+        );
+        // Arm a convergent TTL deadline `TTL_SECS` ahead of the actor's own
+        // clock. `reconcile_timers` derives the one-shot sleep from this.
+        state.ttl.timer.deadline_unix_secs = Some(deps.clock.now_secs() + TTL_SECS);
+
+        // Clone the shared handle BEFORE moving state into the actor so we
+        // can observe the FSM transition. Must be `Active` for the expiry
+        // pipeline (it rejects non-Active contexts).
         let observed_handle = state.handle.clone();
         observed_handle
             .transition_to(&crate::context::ContextState::Active)
             .unwrap();
 
-        let actor_handle = supervisor_arc
+        supervisor_arc
             .spawn_actor_with_state(state, deps, None)
             .await
             .expect("spawn_actor_with_state: fresh context id registers");
         assert!(supervisor_arc.lookup(&ctx_key).is_some());
 
-        // Install a short TTL timer through the capability-reduced
-        // handle: StartTtlTimer → actor-shape `spawn_ttl_timer` installs
-        // the timer task on owned state.
-        let sup_handle = SupervisorHandle::wrap(Arc::clone(&supervisor_arc));
-        sup_handle
-            .dispatch_start_ttl_timer(
-                &ctx_key,
-                scp_protocol::context::ContextParams::default(),
-                std::time::Duration::from_millis(50),
-                true,
-            )
-            .await;
+        // Let the actor reach its `select!` and arm the sleep, then confirm
+        // it has NOT fired before the deadline.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
         assert_eq!(
             observed_handle.state(),
             crate::context::ContextState::Active,
-            "context must remain Active immediately after the timer is installed"
+            "context must remain Active before its TTL deadline"
         );
 
-        // Wait for the timer to fire and the FireTimer expiry pipeline
-        // to run. Poll the shared handle until it leaves `Active`.
-        let expired = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            loop {
-                if observed_handle.state() != crate::context::ContextState::Active {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        // Advance past the deadline (but before the 60s governance interval)
+        // and drive the actor until the TTL arm fires the expiry pipeline.
+        tokio::time::advance(std::time::Duration::from_secs(TTL_SECS + 1)).await;
+        let mut expired = false;
+        for _ in 0..64 {
+            if observed_handle.state() == crate::context::ContextState::Expired {
+                expired = true;
+                break;
             }
-        })
-        .await;
+            tokio::task::yield_now().await;
+        }
         assert!(
-            expired.is_ok(),
-            "TTL timer task must fire FireTimer and move the context out of Active"
-        );
-        assert_eq!(
-            observed_handle.state(),
-            crate::context::ContextState::Expired,
-            "FireTimer expiry pipeline must transition the context to Expired"
+            expired,
+            "the actor-owned TTL arm must fire on_ttl_tick and expire the context"
         );
 
-        actor_handle.send_shutdown().await.unwrap();
+        // Despawn-on-terminal: the actor despawns its OWN registry handle and
+        // exits. Poll until the registry entry is gone.
+        let mut despawned = false;
+        for _ in 0..64 {
+            if supervisor_arc.lookup(&ctx_key).is_none() {
+                despawned = true;
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            despawned,
+            "on terminal TTL expiry the actor must despawn its own registry handle \
+             (no dead-but-registered zombie)"
+        );
+
+        // Post-expiry contract (ADR-049 finding A3): the actor is fully gone,
+        // so `read_context_state` returns `None` (NOT a hung/closed mailbox
+        // read, and NOT a stale live `Expired`). The old design left the actor
+        // alive to answer `Expired`, but that leaked the actor forever AND
+        // blocked re-creation (duplicate rejection); despawn trades the live
+        // read for a durable snapshot + re-creatability.
+        assert_eq!(
+            supervisor_arc.read_context_state(&ctx_key).await,
+            None,
+            "a despawned expired context reads as None (unknown), not a zombie"
+        );
+
+        // The terminal `Expired` state is DURABLE — it was captured in the
+        // persisted snapshot before the actor exited (so the signal is not
+        // lost; anti-resurrection will not respawn an `Expired` snapshot).
+        assert_eq!(
+            *last_state.lock().unwrap(),
+            Some(crate::context::ContextState::Expired),
+            "the durable snapshot must record the terminal Expired state"
+        );
+
+        // Re-creatable: with the zombie gone, a fresh actor can register under
+        // the same context id (the duplicate-rejection no longer trips).
+        let deps2 = test_actor_deps(&supervisor_arc).await;
+        let fresh = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+            ctx_id_bytes,
+            1_700_000_000,
+            DID("did:example:admin".to_owned()),
+        );
+        supervisor_arc
+            .spawn_actor_with_state(fresh, deps2, None)
+            .await
+            .expect("after despawn, the expired context id must be re-creatable");
     }
 
-    /// `GovernanceCommand::StartTimeoutTask` installs the per-context
-    /// governance-timeout interval task on the spawned actor's owned
-    /// state (actor-shape `governance_helpers::spawn_governance_timeout_task`
-    /// → `tracked_spawn` onto the supervisor's `task_set` → install on
-    /// `state.governance.timeout_task`). Asserts the handler replies
-    /// `Ok(())`, proving the install path runs end-to-end on a
-    /// registered actor with no `contexts` DashMap reach (ADR-049
-    /// Phase 2A finalization).
-    #[tokio::test]
-    async fn start_timeout_task_installs_on_actor() {
+    /// The ACTOR-OWNED governance-timeout interval fires the sweep from the
+    /// actor's own `run()` loop (ADR-049 Decision-1 / finding A3) — no
+    /// supervisor `task_set` spawn, no `EvaluateTimeouts` mailbox hop. The
+    /// sweep marks the actor dirty, which the coalesced-persist arm flushes;
+    /// a recording persistence provider observes that a persist lands after
+    /// the 60s tick. Transitioning the context out of `Active` then stops
+    /// the interval: no further governance-driven persist accrues.
+    #[tokio::test(start_paused = true)]
+    async fn actor_owned_governance_interval_fires_and_stops_when_not_active() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use async_trait::async_trait;
+
+        use crate::context::persistence::ContextPersistence;
+        use crate::context::state::ContextSnapshot;
+
+        type PersistErr = Box<dyn std::error::Error + Send + Sync>;
+
+        /// Counts `persist_context` calls so the test can observe the
+        /// governance sweep marking the actor dirty (→ coalesced persist).
+        struct CountingPersistence {
+            persists: Arc<AtomicUsize>,
+        }
+        #[async_trait]
+        impl ContextPersistence for CountingPersistence {
+            async fn persist_context(
+                &self,
+                _context_id: &str,
+                _snapshot: &ContextSnapshot,
+            ) -> Result<(), PersistErr> {
+                self.persists.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+            async fn load_context(
+                &self,
+                _context_id: &str,
+            ) -> Result<Option<ContextSnapshot>, PersistErr> {
+                Ok(None)
+            }
+            async fn delete_context(&self, _context_id: &str) -> Result<(), PersistErr> {
+                Ok(())
+            }
+            async fn list_persisted_contexts(&self) -> Result<Vec<String>, PersistErr> {
+                Ok(Vec::new())
+            }
+        }
+
         let supervisor_arc = supervisor_with_providers();
-        let deps = test_actor_deps(&supervisor_arc).await;
+        let mut deps = test_actor_deps(&supervisor_arc).await;
+        let persists = Arc::new(AtomicUsize::new(0));
+        deps.persistence = Arc::new(CountingPersistence {
+            persists: Arc::clone(&persists),
+        });
 
         let ctx_id_bytes = [0x6Bu8; 32];
-        let ctx_key = hex::encode(ctx_id_bytes);
         let state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
             ctx_id_bytes,
             1_700_000_000,
             DID("did:example:admin".to_owned()),
         );
+        // No TTL deadline: only the governance interval is armed.
+        let observed_handle = state.handle.clone();
+        observed_handle
+            .transition_to(&crate::context::ContextState::Active)
+            .unwrap();
 
-        let actor_handle = supervisor_arc
+        let _actor_handle = supervisor_arc
             .spawn_actor_with_state(state, deps, None)
             .await
             .expect("spawn_actor_with_state: fresh context id registers");
-        assert!(supervisor_arc.lookup(&ctx_key).is_some());
 
-        // Dispatch StartTimeoutTask and observe the install reply.
-        let reply = actor_handle
-            .send(|reply| ContextCommand::Governance(GovernanceCommand::StartTimeoutTask { reply }))
-            .await;
+        // Let the actor arm the 60s governance interval.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        let before = persists.load(Ordering::SeqCst);
+
+        // Advance past one governance interval (+ the 50ms coalesce window)
+        // and drive the actor until the sweep-driven persist lands.
+        tokio::time::advance(std::time::Duration::from_secs(61)).await;
+        let mut fired = false;
+        for _ in 0..64 {
+            if persists.load(Ordering::SeqCst) > before {
+                fired = true;
+                break;
+            }
+            tokio::time::advance(std::time::Duration::from_millis(60)).await;
+            tokio::task::yield_now().await;
+        }
         assert!(
-            reply.is_ok(),
-            "StartTimeoutTask must install the governance-timeout task and reply Ok(()): {reply:?}"
+            fired,
+            "the actor-owned governance interval must fire the sweep (marking dirty → persist)"
         );
 
-        actor_handle.send_shutdown().await.unwrap();
+        // Move the context out of `Active`: the next sweep signals stop and
+        // the actor nulls its interval, so no further governance-driven
+        // persist accrues over the subsequent intervals.
+        observed_handle
+            .transition_to(&crate::context::ContextState::Closing)
+            .unwrap();
+        // Let the actor reconcile (the Closing state clears the interval) and
+        // drain the one already-pending tick.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(std::time::Duration::from_secs(61)).await;
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        let after_close = persists.load(Ordering::SeqCst);
+        tokio::time::advance(std::time::Duration::from_mins(3)).await;
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            persists.load(Ordering::SeqCst),
+            after_close,
+            "no governance-driven persist may accrue once the context is not Active \
+             (the interval was nulled)"
+        );
+    }
+
+    /// D1 (create-window stuck-open): restoring an `Active` snapshot that
+    /// carries a persisted convergent `ttl_deadline_secs` re-arms the
+    /// actor-owned TTL arm to that ABSOLUTE deadline. The real
+    /// `restore_context` respawn path resolves the deadline, mailboxes
+    /// `StartTtlTimer`, and `reconcile_timers` arms the one-shot sleep; once
+    /// paused time is advanced past the deadline the context transitions
+    /// `Active → Expired`.
+    #[tokio::test(start_paused = true)]
+    async fn restore_rearms_ttl_from_convergent_deadline() {
+        const T0: u64 = 1_700_000_000;
+        const TTL_SECS: u64 = 30;
+
+        let clock_dyn: Arc<dyn Clock> = Arc::new(TestClock::new(T0));
+        let persistence = MapPersistence::default();
+        // E1: restore re-arms from the partitioned single-source deadline. The
+        // create base is the PRUNE-IMMUNE snapshot `creation_timestamp_secs (= T0)
+        // + params.ttl`, so the base is `T0 + TTL_SECS` regardless of the log. The
+        // seeded genesis leaf is realistic history but no longer sources the base.
+        let event_log = SeededEventLog::new(vec![seeded_context_created(0)]);
+        let sup = supervisor_with_clock_persistence_and_event_log(
+            clock_dyn,
+            Box::new(persistence.clone()),
+            Box::new(event_log),
+        );
+
+        let ctx_id_bytes = [0x51u8; 32];
+        let ctx_key = hex::encode(ctx_id_bytes);
+        let admin = DID("did:example:restore-ttl-admin".to_owned());
+
+        let mut state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+            ctx_id_bytes,
+            T0,
+            admin.clone(),
+        );
+        // Give the context a finite params TTL and install the convergent
+        // absolute deadline (`creation + ttl`) the live context held.
+        state.handle = crate::context::ContextHandle::new(
+            ctx_key.clone(),
+            scp_protocol::context::params::ContextParams {
+                ttl: Some(std::time::Duration::from_secs(TTL_SECS)),
+                ..Default::default()
+            },
+        );
+        state.ttl.timer.deadline_unix_secs = Some(T0 + TTL_SECS);
+        state
+            .handle
+            .transition_to(&crate::context::ContextState::Active)
+            .unwrap();
+
+        // Persist the Active snapshot (captures `ttl_deadline_secs`), then drive
+        // the REAL restore path.
+        let snap = crate::context::manager_methods::snapshot_context(&state);
+        assert_eq!(
+            snap.ttl_deadline_secs,
+            Some(T0 + TTL_SECS),
+            "snapshot must carry the absolute convergent deadline"
+        );
+        persistence.persist_context(&ctx_key, &snap).await.unwrap();
+
+        sup.respawn_from_snapshot(&ctx_key, &admin)
+            .await
+            .expect("respawn must restore the Active snapshot");
+        assert!(
+            sup.lookup(&ctx_key).is_some(),
+            "restored actor must be resident"
+        );
+
+        // Let the actor reach its `select!` and arm the sleep; it must NOT have
+        // fired before the deadline.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            sup.read_context_state(&ctx_key).await,
+            Some(crate::context::ContextState::Active),
+            "restored context must remain Active before its re-armed deadline"
+        );
+
+        // Advance past the re-armed deadline (before the 60s governance
+        // interval) and drive the actor until the TTL arm fires + despawns.
+        tokio::time::advance(std::time::Duration::from_secs(TTL_SECS + 1)).await;
+        let mut despawned = false;
+        for _ in 0..64 {
+            if sup.lookup(&ctx_key).is_none() {
+                despawned = true;
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            despawned,
+            "the re-armed TTL arm must fire and despawn the restored context"
+        );
+        let persisted = persistence
+            .load_context(&ctx_key)
+            .await
+            .unwrap()
+            .expect("expiry must persist a durable snapshot");
+        assert_eq!(
+            persisted.state,
+            crate::context::ContextState::Expired,
+            "the re-armed TTL arm must drive the restored context to Expired"
+        );
+    }
+
+    /// D1 (create-window stuck-open, REGRESSION GATE): restoring an `Active`
+    /// snapshot that carries NO persisted `ttl_deadline_secs` (`None`) but a
+    /// finite `params.ttl` must still re-arm — from the convergent
+    /// `creation + ttl` fallback — and expire.
+    ///
+    /// Pre-fix this FAILED: the restore path gated the re-arm on
+    /// `if let Some(remaining) = snapshot.ttl_remaining_secs`, so a `None`
+    /// remaining (an Active snapshot persisted before the timer was recorded)
+    /// skipped arming entirely and the context stayed open forever. The fix
+    /// gates on `params.ttl.is_some()` and falls back to `creation + ttl`, so
+    /// the context still expires.
+    #[tokio::test(start_paused = true)]
+    async fn restore_active_with_no_ttl_remaining() {
+        const T0: u64 = 1_700_000_000;
+        const TTL_SECS: u64 = 30;
+
+        let clock_dyn: Arc<dyn Clock> = Arc::new(TestClock::new(T0));
+        let persistence = MapPersistence::default();
+        // E1: the create base is the PRUNE-IMMUNE snapshot `creation_timestamp_secs
+        // (= T0) + params.ttl` — NOT a log leaf. So `convergent_ttl_deadline`
+        // derives `T0 + TTL_SECS` and re-arms (D1) even though the persisted
+        // `ttl_deadline_secs` scalar is None. The seeded genesis leaf is realistic
+        // history; an empty log would derive the SAME base from the snapshot.
+        let event_log = SeededEventLog::new(vec![seeded_context_created(0)]);
+        let sup = supervisor_with_clock_persistence_and_event_log(
+            clock_dyn,
+            Box::new(persistence.clone()),
+            Box::new(event_log),
+        );
+
+        let ctx_id_bytes = [0x52u8; 32];
+        let ctx_key = hex::encode(ctx_id_bytes);
+        let admin = DID("did:example:restore-noremaining-admin".to_owned());
+
+        let mut state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+            ctx_id_bytes,
+            T0,
+            admin.clone(),
+        );
+        state.handle = crate::context::ContextHandle::new(
+            ctx_key.clone(),
+            scp_protocol::context::params::ContextParams {
+                ttl: Some(std::time::Duration::from_secs(TTL_SECS)),
+                // Ephemeral scope with a live TTL (`params.ttl == Some`) ⇒
+                // `convergent_ttl_deadline` derives the `creation + ttl` base and
+                // re-arms (D1). The promotion-disarm case (`params.ttl == None`)
+                // is covered by `restore_promoted_context_does_not_re_expire`.
+                memory_scope: scp_protocol::context::params::MemoryScope::Ephemeral,
+                ..Default::default()
+            },
+        );
+        // No recorded deadline: model an Active snapshot persisted before the
+        // TTL arm was recorded.
+        state.ttl.timer.deadline_unix_secs = None;
+        state
+            .handle
+            .transition_to(&crate::context::ContextState::Active)
+            .unwrap();
+
+        let snap = crate::context::manager_methods::snapshot_context(&state);
+        assert_eq!(
+            snap.ttl_deadline_secs, None,
+            "snapshot carries no absolute deadline (the create-window case)"
+        );
+        persistence.persist_context(&ctx_key, &snap).await.unwrap();
+
+        sup.respawn_from_snapshot(&ctx_key, &admin)
+            .await
+            .expect("respawn must restore the Active snapshot");
+
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            sup.read_context_state(&ctx_key).await,
+            Some(crate::context::ContextState::Active),
+            "restored context must be Active before the fallback deadline"
+        );
+
+        // Advance past the `creation + ttl` fallback deadline; it must fire.
+        tokio::time::advance(std::time::Duration::from_secs(TTL_SECS + 1)).await;
+        let mut despawned = false;
+        for _ in 0..64 {
+            if sup.lookup(&ctx_key).is_none() {
+                despawned = true;
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            despawned,
+            "a None-remaining Active snapshot must re-arm via creation+ttl and expire (D1)"
+        );
+        let persisted = persistence
+            .load_context(&ctx_key)
+            .await
+            .unwrap()
+            .expect("expiry must persist a durable snapshot");
+        assert_eq!(persisted.state, crate::context::ContextState::Expired);
+    }
+
+    /// H1/E2 (promote→re-expiry, REGRESSION GATE — prune-safe rewrite): restoring
+    /// a PROMOTED context (`params.ttl == None`, the prune-immune promotion
+    /// authority set by `execute_promote_context` per §5.10) must NOT re-arm a TTL
+    /// timer — a promoted context is permanent. Crucially this must hold even with
+    /// an EMPTY event log: the promotion signal lives in the snapshot params, not
+    /// a prunable `ContextPromoted` leaf, so pruning the log cannot resurrect the
+    /// TTL. A stray `ContextPromoted` leaf is ALSO seeded to prove it is not read.
+    ///
+    /// Pre-redesign the restore re-arm read `params.ttl` + a `memory_scope`
+    /// heuristic (pass-4d read the prunable `ContextPromoted` leaf). Pass-4e reads
+    /// the prune-immune `params.ttl == None`, so the timer stays disarmed past the
+    /// stale `creation + ttl` instant with no `memory_scope` gate — and survives a
+    /// pruned log.
+    #[tokio::test(start_paused = true)]
+    async fn restore_promoted_context_does_not_re_expire() {
+        const T0: u64 = 1_700_000_000;
+        const STALE_TTL: u64 = 30;
+
+        let clock_dyn: Arc<dyn Clock> = Arc::new(TestClock::new(T0));
+        let persistence = MapPersistence::default();
+        // A leaf history that carries a stray `ContextPromoted` leaf (the RECORD)
+        // AND no `ContextCreated` base — i.e. a partially-pruned log. Neither is
+        // read for the arm: promotion is `params.ttl == None` in the snapshot.
+        let event_log = SeededEventLog::new(vec![seeded_context_promoted(1)]);
+        let sup = supervisor_with_clock_persistence_and_event_log(
+            clock_dyn,
+            Box::new(persistence.clone()),
+            Box::new(event_log),
+        );
+
+        let ctx_id_bytes = [0x5Au8; 32];
+        let ctx_key = hex::encode(ctx_id_bytes);
+        let admin = DID("did:example:restore-promoted-admin".to_owned());
+
+        let mut state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+            ctx_id_bytes,
+            T0,
+            admin.clone(),
+        );
+        // Model a PROMOTED context exactly as `execute_promote_context` leaves it:
+        // `params.ttl == None` (TTL removed, §5.10) and scope `Full`. Deliberately
+        // leave a STALE non-`None` recorded deadline scalar (`T0 + STALE_TTL`) —
+        // the STRONGER case: even with a live-looking cached deadline, restore must
+        // derive `None` from the prune-immune `params.ttl == None` and NOT re-arm.
+        state.handle = crate::context::ContextHandle::new(
+            ctx_key.clone(),
+            scp_protocol::context::params::ContextParams {
+                ttl: None,
+                memory_scope: scp_protocol::context::params::MemoryScope::Full,
+                ..Default::default()
+            },
+        );
+        state.ttl.timer.deadline_unix_secs = Some(T0 + STALE_TTL);
+        state
+            .handle
+            .transition_to(&crate::context::ContextState::Active)
+            .unwrap();
+
+        let snap = crate::context::manager_methods::snapshot_context(&state);
+        persistence.persist_context(&ctx_key, &snap).await.unwrap();
+
+        sup.respawn_from_snapshot(&ctx_key, &admin)
+            .await
+            .expect("respawn must restore the promoted Active snapshot");
+
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            sup.read_context_state(&ctx_key).await,
+            Some(crate::context::ContextState::Active),
+            "the restored promoted context must be Active"
+        );
+
+        // Advance WELL past the stale `creation + ttl` (T0 + 30) instant — a
+        // re-armed timer would have fired and destroyed the context here. The
+        // promoted context must remain resident and Active.
+        tokio::time::advance(std::time::Duration::from_secs(STALE_TTL + 5)).await;
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            sup.lookup(&ctx_key).is_some(),
+            "a promoted context (params.ttl == None) must NOT be re-armed and \
+             destroyed on restore, even with a pruned log (H1/E2)"
+        );
+        assert_eq!(
+            sup.read_context_state(&ctx_key).await,
+            Some(crate::context::ContextState::Active),
+            "a promoted context stays Active past the stale creation+ttl instant (H1/E2)"
+        );
+    }
+
+    /// H1 companion (created `Full`+ttl broadcast re-arms, REGRESSION GATE): a
+    /// context CREATED with `memory_scope == Full` AND a finite `params.ttl`
+    /// (e.g. a broadcast context — `Full` is its only supported scope) and NO
+    /// `ContextPromoted` leaf MUST re-arm and expire. The retired
+    /// `memory_scope != Full` gate WRONGLY skipped this context (mistaking a
+    /// created-`Full` context for a promoted one), leaving it stuck open. The
+    /// single-source derivation distinguishes them: no `ContextPromoted` leaf ⇒
+    /// `creation + ttl` base ⇒ re-arm.
+    #[tokio::test(start_paused = true)]
+    async fn restore_created_full_scope_with_ttl_re_arms() {
+        const T0: u64 = 1_700_000_000;
+        const TTL_SECS: u64 = 30;
+
+        let clock_dyn: Arc<dyn Clock> = Arc::new(TestClock::new(T0));
+        let persistence = MapPersistence::default();
+        // Created `Full`+ttl: the log has `ContextCreated` but NO
+        // `ContextPromoted` — so the TTL is live.
+        let event_log = SeededEventLog::new(vec![seeded_context_created(0)]);
+        let sup = supervisor_with_clock_persistence_and_event_log(
+            clock_dyn,
+            Box::new(persistence.clone()),
+            Box::new(event_log),
+        );
+
+        let ctx_id_bytes = [0x5Fu8; 32];
+        let ctx_key = hex::encode(ctx_id_bytes);
+        let admin = DID("did:example:restore-full-ttl-admin".to_owned());
+
+        let mut state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+            ctx_id_bytes,
+            T0,
+            admin.clone(),
+        );
+        state.handle = crate::context::ContextHandle::new(
+            ctx_key.clone(),
+            scp_protocol::context::params::ContextParams {
+                ttl: Some(std::time::Duration::from_secs(TTL_SECS)),
+                // Created `Full` scope (NOT promoted) — the case the old gate
+                // mis-classified.
+                memory_scope: scp_protocol::context::params::MemoryScope::Full,
+                ..Default::default()
+            },
+        );
+        state.ttl.timer.deadline_unix_secs = Some(T0 + TTL_SECS);
+        state
+            .handle
+            .transition_to(&crate::context::ContextState::Active)
+            .unwrap();
+
+        let snap = crate::context::manager_methods::snapshot_context(&state);
+        persistence.persist_context(&ctx_key, &snap).await.unwrap();
+
+        sup.respawn_from_snapshot(&ctx_key, &admin)
+            .await
+            .expect("respawn must restore the Active snapshot");
+
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            sup.read_context_state(&ctx_key).await,
+            Some(crate::context::ContextState::Active),
+            "a created Full+ttl context must be Active before its deadline"
+        );
+
+        // Advance past the re-armed `creation + ttl`; it MUST fire (the old
+        // memory_scope gate would have left it stuck open).
+        tokio::time::advance(std::time::Duration::from_secs(TTL_SECS + 1)).await;
+        let mut despawned = false;
+        for _ in 0..64 {
+            if sup.lookup(&ctx_key).is_none() {
+                despawned = true;
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            despawned,
+            "a created Full-scope context WITH a ttl (no ContextPromoted leaf) must \
+             re-arm and expire — the retired memory_scope gate wrongly skipped it (H1)"
+        );
+        let persisted = persistence
+            .load_context(&ctx_key)
+            .await
+            .unwrap()
+            .expect("expiry must persist a durable snapshot");
+        assert_eq!(persisted.state, crate::context::ContextState::Expired);
+    }
+
+    /// D2 (extension-preserved-on-restore, REGRESSION GATE — single-source
+    /// rewrite): restoring an `Active` context whose event log records a
+    /// `TtlExtended` leaf pushing the deadline beyond `creation + ttl` must
+    /// re-arm to the EXTENDED absolute deadline — derived from the log, never
+    /// recomputed back to `creation + ttl`.
+    ///
+    /// The redesign reads the extension from the single authoritative source
+    /// (the `TtlExtended` leaf's `new_deadline_unix`), not the persisted scalar.
+    /// The still-Active assertion past `creation + ttl` but before the extended
+    /// deadline catches a regression that dropped the extension.
+    #[tokio::test(start_paused = true)]
+    async fn restore_preserves_extended_ttl_deadline() {
+        const T0: u64 = 1_700_000_000;
+        const TTL_SECS: u64 = 20;
+        // Extended 30s beyond the original `creation + ttl` (= T0 + 20).
+        const EXTENDED_DEADLINE: u64 = T0 + 50;
+
+        let clock_dyn: Arc<dyn Clock> = Arc::new(TestClock::new(T0));
+        let persistence = MapPersistence::default();
+        // The event log records the prior unanimous extension: `ContextCreated`
+        // then `TtlExtended` to `EXTENDED_DEADLINE`. `convergent_ttl_deadline`
+        // derives `max(creation+ttl, extended)` = `EXTENDED_DEADLINE`.
+        let event_log = SeededEventLog::new(vec![
+            seeded_context_created(0),
+            seeded_ttl_extended(1, T0 + TTL_SECS, EXTENDED_DEADLINE),
+        ]);
+        let sup = supervisor_with_clock_persistence_and_event_log(
+            clock_dyn,
+            Box::new(persistence.clone()),
+            Box::new(event_log),
+        );
+
+        let ctx_id_bytes = [0x53u8; 32];
+        let ctx_key = hex::encode(ctx_id_bytes);
+        let admin = DID("did:example:restore-extended-admin".to_owned());
+
+        let mut state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+            ctx_id_bytes,
+            T0,
+            admin.clone(),
+        );
+        state.handle = crate::context::ContextHandle::new(
+            ctx_key.clone(),
+            scp_protocol::context::params::ContextParams {
+                ttl: Some(std::time::Duration::from_secs(TTL_SECS)),
+                ..Default::default()
+            },
+        );
+        // A prior unanimous extension pushed the deadline out past creation+ttl.
+        state.ttl.timer.deadline_unix_secs = Some(EXTENDED_DEADLINE);
+        state
+            .handle
+            .transition_to(&crate::context::ContextState::Active)
+            .unwrap();
+
+        let snap = crate::context::manager_methods::snapshot_context(&state);
+        assert_eq!(snap.ttl_deadline_secs, Some(EXTENDED_DEADLINE));
+        persistence.persist_context(&ctx_key, &snap).await.unwrap();
+
+        sup.respawn_from_snapshot(&ctx_key, &admin)
+            .await
+            .expect("respawn must restore the Active snapshot");
+
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        // Advance PAST the original creation+ttl (T0+20) but BEFORE the extended
+        // deadline (T0+50): a context restored to creation+ttl would already
+        // have expired here; the fixed context is still Active.
+        tokio::time::advance(std::time::Duration::from_secs(TTL_SECS + 5)).await; // → T0+25
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            sup.read_context_state(&ctx_key).await,
+            Some(crate::context::ContextState::Active),
+            "restore must preserve the EXTENDED deadline, not recompute creation+ttl (D2)"
+        );
+
+        // Advance past the extended deadline: now it must fire.
+        tokio::time::advance(std::time::Duration::from_secs(30)).await; // → T0+55
+        let mut despawned = false;
+        for _ in 0..64 {
+            if sup.lookup(&ctx_key).is_none() {
+                despawned = true;
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            despawned,
+            "the extended TTL arm must fire once paused time passes the extended deadline"
+        );
+        let persisted = persistence
+            .load_context(&ctx_key)
+            .await
+            .unwrap()
+            .expect("expiry must persist a durable snapshot");
+        assert_eq!(persisted.state, crate::context::ContextState::Expired);
+    }
+
+    /// BUG-1 (stale TTL arm on Closed/Tombstoned, REGRESSION GATE): once a
+    /// context leaves `Active`, a stale recorded deadline must NOT arm and fire
+    /// — firing on a terminal context would despawn it, re-opening the close
+    /// window and defeating tombstone finality. Also asserts the close path
+    /// clears `deadline_unix_secs` durably in the fail-closed snapshot.
+    ///
+    /// Pre-fix this FAILED two ways: (1) `reconcile_timers` armed the TTL
+    /// one-shot regardless of state, so a stale deadline fired `on_ttl_tick` on
+    /// a Closed/Tombstoned context → terminal → despawn; (2) the close/tombstone
+    /// closures never cleared `deadline_unix_secs`, so a later restore re-armed
+    /// the stale deadline. The `is_active` gate + the in-closure clear fix both.
+    #[tokio::test(start_paused = true)]
+    #[allow(clippy::too_many_lines)]
+    async fn stale_ttl_arm_does_not_fire_on_closed_or_tombstoned() {
+        use scp_protocol::context::roles::Capability;
+
+        const T0: u64 = 1_700_000_000;
+        const STALE_TTL: u64 = 30;
+
+        // --- Part (a): reconcile disarms a stale deadline on a terminal actor.
+        // Drive both Closed and Tombstoned; neither may despawn on the stale arm.
+        for (tag, terminal_edges) in [
+            (
+                0xC1u8,
+                &[
+                    crate::context::ContextState::Closing,
+                    crate::context::ContextState::Closed,
+                ][..],
+            ),
+            (
+                0xC2u8,
+                &[
+                    crate::context::ContextState::MigratingOut,
+                    crate::context::ContextState::Tombstoned,
+                ][..],
+            ),
+        ] {
+            let clock_dyn: Arc<dyn Clock> = Arc::new(TestClock::new(T0));
+            // Inject a counting event log: if the stale arm fired against the
+            // terminal context, `handle_ttl_expiry`'s Phase-2 append would record
+            // a `ContextExpired` leaf. Asserting ZERO such appends isolates the
+            // reconcile `is_active` gate — the actor-resident assertion alone is
+            // independently guaranteed by the SEC-1 keep-alive path and would
+            // pass even if the gate regressed (N3).
+            let expiry_counter = ContextExpiredAppendCounter::default();
+            let sup = supervisor_with_clock_persistence_and_event_log(
+                clock_dyn,
+                Box::new(MapPersistence::default()),
+                Box::new(expiry_counter.clone()),
+            );
+
+            let ctx_id_bytes = [tag; 32];
+            let ctx_key = hex::encode(ctx_id_bytes);
+            let admin = DID("did:example:stale-arm-admin".to_owned());
+
+            let mut state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+                ctx_id_bytes,
+                T0,
+                admin.clone(),
+            );
+            // A stale absolute deadline lingering from when the context was Active.
+            state.ttl.timer.deadline_unix_secs = Some(T0 + STALE_TTL);
+            state
+                .handle
+                .transition_to(&crate::context::ContextState::Active)
+                .unwrap();
+            for edge in terminal_edges {
+                state.handle.transition_to(edge).unwrap();
+            }
+
+            let deps = test_actor_deps(&sup).await;
+            sup.spawn_actor_with_state(state, deps, None)
+                .await
+                .expect("spawn a terminal-state actor for the reconcile-gate check");
+            assert!(sup.lookup(&ctx_key).is_some());
+
+            // Advance well past the stale deadline. The `is_active` gate must keep
+            // the arm disarmed, so the actor never fires + never despawns.
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+            tokio::time::advance(std::time::Duration::from_secs(STALE_TTL + 5)).await;
+            for _ in 0..64 {
+                tokio::task::yield_now().await;
+            }
+            assert!(
+                sup.lookup(&ctx_key).is_some(),
+                "a stale TTL deadline must NOT fire against a terminal context and despawn it (BUG-1)"
+            );
+            // The distinguishing signal (N3): the expiry pipeline never ran, so
+            // no `ContextExpired` leaf was appended against the terminal context.
+            // A regressed `is_active` reconcile gate would fire `on_ttl_tick` →
+            // `handle_ttl_expiry` → `finish_ttl_expiry_io` and record one here.
+            assert_eq!(
+                expiry_counter
+                    .context_expired_appends
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "the stale TTL arm must NOT drive a ContextExpired append against a \
+                 terminal context — a non-zero count means the is_active reconcile \
+                 gate regressed (N3)"
+            );
+        }
+
+        // --- Part (b): the close path clears the recorded deadline durably.
+        let clock_dyn: Arc<dyn Clock> = Arc::new(TestClock::new(T0));
+        let persistence = MapPersistence::default();
+        let sup = supervisor_with_clock_and_persistence(clock_dyn, Box::new(persistence.clone()));
+
+        let ctx_id_bytes = [0xC3u8; 32];
+        let ctx_key = hex::encode(ctx_id_bytes);
+        let admin = DID("did:example:stale-arm-close-admin".to_owned());
+
+        let mut state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+            ctx_id_bytes,
+            T0,
+            admin.clone(),
+        );
+        // SingleAdmin close gate: the initiator must hold ContextClose.
+        state
+            .role_state
+            .member_capabilities
+            .entry(admin.0.clone())
+            .or_default()
+            .insert(Capability::ContextClose);
+        state.ttl.timer.deadline_unix_secs = Some(T0 + STALE_TTL);
+        state
+            .handle
+            .transition_to(&crate::context::ContextState::Active)
+            .unwrap();
+
+        let deps = test_actor_deps(&sup).await;
+        let handle_clone = state.handle.clone();
+        let mut cell = crate::context::actor::class_s::ClassSCell::new(state);
+        crate::context::lifecycle_helpers::close_context(&mut cell, &deps, &handle_clone, &admin)
+            .await
+            .expect("close_context must succeed for a SingleAdmin context");
+        assert_eq!(
+            cell.ttl.timer.deadline_unix_secs, None,
+            "the close closure must clear the recorded TTL deadline in memory (BUG-1)"
+        );
+        // The clear is DURABLE: the fail-closed close persist wrote a snapshot
+        // whose ttl_deadline_secs is None, so a later restore cannot re-arm a
+        // stale deadline against the closed context.
+        let persisted = persistence
+            .load_context(&ctx_key)
+            .await
+            .unwrap()
+            .expect("close must fail-closed persist a snapshot");
+        assert_eq!(
+            persisted.ttl_deadline_secs, None,
+            "the durable close snapshot must carry no TTL deadline (BUG-1)"
+        );
+    }
+
+    /// B7 (bilateral reset uses convergent deadline, REGRESSION GATE): a
+    /// unanimous TTL extension re-records `old_deadline + additional` — the
+    /// convergent absolute instant every member computes — NOT the local
+    /// arm-time `now + additional`.
+    ///
+    /// Pre-fix this FAILED: `reset_ttl_timer` armed `now + new_duration` off the
+    /// dispatcher's local clock, which diverges across members under clock skew.
+    /// Choosing `old_deadline != now` makes the two formulas disagree, so
+    /// asserting the recorded deadline equals `old_deadline + additional`
+    /// (and not `now + additional`) catches the local-clock regression.
+    #[tokio::test]
+    async fn bilateral_reset_uses_convergent_deadline() {
+        const T0: u64 = 1_700_000_000;
+        // Finite create TTL whose prune-immune snapshot base (`creation_timestamp_secs
+        // (= T0) + this ttl`) is the current convergent deadline the reset extends.
+        // The reset derives `old` through `convergent_ttl_deadline` (snapshot base +
+        // fail-safe log extensions), not the scalar cache.
+        const CREATE_TTL: u64 = 500;
+        const OLD_DEADLINE: u64 = T0 + CREATE_TTL;
+        const ADDITIONAL: u64 = 100;
+
+        let clock_dyn: Arc<dyn Clock> = Arc::new(TestClock::new(T0));
+        // Seed the genesis `ContextCreated` leaf so `convergent_ttl_deadline`
+        // derives `T0 + CREATE_TTL = OLD_DEADLINE`.
+        let event_log = SeededEventLog::new(vec![seeded_context_created(0)]);
+        let sup = supervisor_with_clock_persistence_and_event_log(
+            clock_dyn,
+            Box::new(MapPersistence::default()),
+            Box::new(event_log),
+        );
+        let deps = test_actor_deps(&sup).await;
+        assert_eq!(
+            deps.clock.now_secs(),
+            T0,
+            "deps clock is the injected TestClock"
+        );
+
+        let ctx_id_bytes = [0x57u8; 32];
+        let ctx_key = hex::encode(ctx_id_bytes);
+        let admin = DID("did:example:bilateral-reset-admin".to_owned());
+
+        let mut state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+            ctx_id_bytes,
+            T0,
+            admin,
+        );
+        // Finite params.ttl so the log-derived base is `T0 + CREATE_TTL`; the
+        // scalar cache is seeded to the same value (consistent state).
+        state.handle = crate::context::ContextHandle::new(
+            ctx_key.clone(),
+            scp_protocol::context::params::ContextParams {
+                ttl: Some(std::time::Duration::from_secs(CREATE_TTL)),
+                ..Default::default()
+            },
+        );
+        state.ttl.timer.deadline_unix_secs = Some(OLD_DEADLINE);
+        let mut cell = crate::context::actor::class_s::ClassSCell::new(state);
+
+        crate::context::ttl_close_helpers::reset_ttl_timer(
+            &mut cell,
+            &deps,
+            &ctx_key,
+            std::time::Duration::from_secs(ADDITIONAL),
+        )
+        .await;
+
+        assert_eq!(
+            cell.ttl.timer.deadline_unix_secs,
+            Some(OLD_DEADLINE + ADDITIONAL),
+            "bilateral reset must record old_deadline + additional (convergent)"
+        );
+        assert_ne!(
+            cell.ttl.timer.deadline_unix_secs,
+            Some(T0 + ADDITIONAL),
+            "bilateral reset must NOT record now + additional (local-clock, divergent)"
+        );
+    }
+
+    /// H2 (reset on a no-TTL context, REGRESSION GATE): `reset_ttl_timer` on a
+    /// context with NO recorded deadline (`deadline_unix_secs == None`) must be
+    /// a no-op — it must NOT arm a deadline.
+    ///
+    /// Pre-fix this FAILED: `reset_ttl_timer` computed
+    /// `old_dl = deadline.unwrap_or(0); new_dl = old_dl + duration`, so a
+    /// no-TTL context (`None` deadline) armed `0 + duration ≈ 1970` — a
+    /// long-past instant → immediate `sleep(0)` expiry / key destruction,
+    /// reachable via the FFI `context_reset_ttl_timer` op. The fix only re-arms
+    /// when a deadline is actually recorded (mirrors `execute_extend_ttl`).
+    #[tokio::test]
+    async fn reset_ttl_on_no_ttl_context_does_not_expire() {
+        const T0: u64 = 1_700_000_000;
+        const ADDITIONAL: u64 = 100;
+
+        let clock_dyn: Arc<dyn Clock> = Arc::new(TestClock::new(T0));
+        // Recording event log so we can assert NO leaf was appended for a no-op.
+        let event_log = SeededEventLog::new(Vec::new());
+        let entries_handle = event_log.entries.clone();
+        let sup = supervisor_with_clock_persistence_and_event_log(
+            clock_dyn,
+            Box::new(MapPersistence::default()),
+            Box::new(event_log),
+        );
+        let deps = test_actor_deps(&sup).await;
+
+        let ctx_id_bytes = [0x5Bu8; 32];
+        let ctx_key = hex::encode(ctx_id_bytes);
+        let admin = DID("did:example:reset-no-ttl-admin".to_owned());
+
+        let mut state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+            ctx_id_bytes,
+            T0,
+            admin,
+        );
+        // No recorded deadline: a context with no live TTL arm.
+        state.ttl.timer.deadline_unix_secs = None;
+        let mut cell = crate::context::actor::class_s::ClassSCell::new(state);
+
+        crate::context::ttl_close_helpers::reset_ttl_timer(
+            &mut cell,
+            &deps,
+            &ctx_key,
+            std::time::Duration::from_secs(ADDITIONAL),
+        )
+        .await;
+
+        assert_eq!(
+            cell.ttl.timer.deadline_unix_secs, None,
+            "reset on a no-TTL context must NOT arm a deadline (H2); pre-fix it \
+             armed `0 + additional ≈ 1970`, an immediate-expiry sleep(0)"
+        );
+        // A no-op reset mutates no deadline, so it emits NO `TtlExtended` leaf.
+        let leaf_count = entries_handle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|e| e.event_type == scp_event_log::EventType::TtlExtended)
+            .count();
+        assert_eq!(
+            leaf_count, 0,
+            "a no-op reset (no deadline to extend) must NOT append a TtlExtended leaf"
+        );
+    }
+
+    /// Single-source invariant (reset emits a leaf): `reset_ttl_timer` on a
+    /// context WITH a recorded deadline both extends the deadline
+    /// (`old + additional`) AND appends a `TtlExtended` leaf recording the
+    /// `(old, new)` transition (§5.10.1 step 5). Without the leaf a
+    /// reset-extension would live only in the runtime scalar and be LOST on the
+    /// next restore/import — the deadline-source-of-truth bug this redesign
+    /// closes. Parity with the governance `execute_extend_ttl` path.
+    #[tokio::test]
+    async fn reset_ttl_timer_emits_ttl_extended_leaf() {
+        const T0: u64 = 1_700_000_000;
+        // Finite create TTL whose prune-immune snapshot base (`creation_timestamp_secs
+        // (= T0) + ttl`) is the current convergent deadline the reset extends (the
+        // reset derives `old` through `convergent_ttl_deadline`, not the scalar cache).
+        const CREATE_TTL: u64 = 500;
+        const OLD_DEADLINE: u64 = T0 + CREATE_TTL;
+        const ADDITIONAL: u64 = 100;
+        const NEW_DEADLINE: u64 = OLD_DEADLINE + ADDITIONAL;
+
+        let clock_dyn: Arc<dyn Clock> = Arc::new(TestClock::new(T0));
+        let event_log = SeededEventLog::new(vec![seeded_context_created(0)]);
+        let entries_handle = event_log.entries.clone();
+        let sup = supervisor_with_clock_persistence_and_event_log(
+            clock_dyn,
+            Box::new(MapPersistence::default()),
+            Box::new(event_log),
+        );
+        let deps = test_actor_deps(&sup).await;
+
+        let ctx_id_bytes = [0x58u8; 32];
+        let ctx_key = hex::encode(ctx_id_bytes);
+        let admin = DID("did:example:reset-leaf-admin".to_owned());
+
+        let mut state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+            ctx_id_bytes,
+            T0,
+            admin,
+        );
+        // Finite params.ttl so the log-derived base is `OLD_DEADLINE`; the scalar
+        // cache is seeded to the same value (consistent state).
+        state.handle = crate::context::ContextHandle::new(
+            ctx_key.clone(),
+            scp_protocol::context::params::ContextParams {
+                ttl: Some(std::time::Duration::from_secs(CREATE_TTL)),
+                ..Default::default()
+            },
+        );
+        state.ttl.timer.deadline_unix_secs = Some(OLD_DEADLINE);
+        // Record a member's consent so the leaf's `consenting_members` is
+        // populated (the propose→reset activation flow).
+        state.ttl.extension = Some(crate::context::ttl::TtlExtension::new(
+            std::time::Duration::from_secs(ADDITIONAL),
+            1,
+        ));
+        state
+            .ttl
+            .extension
+            .as_mut()
+            .unwrap()
+            .add_consent(DID("did:example:reset-consenter".to_owned()));
+        let mut cell = crate::context::actor::class_s::ClassSCell::new(state);
+
+        crate::context::ttl_close_helpers::reset_ttl_timer(
+            &mut cell,
+            &deps,
+            &ctx_key,
+            std::time::Duration::from_secs(ADDITIONAL),
+        )
+        .await;
+
+        assert_eq!(
+            cell.ttl.timer.deadline_unix_secs,
+            Some(NEW_DEADLINE),
+            "reset extends the recorded convergent deadline by the duration"
+        );
+
+        let extended: Vec<(u64, u64, Vec<String>)> = entries_handle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|e| e.event_type == scp_event_log::EventType::TtlExtended)
+            .filter_map(|e| {
+                scp_event_log::payload::decode_payload::<
+                    scp_event_log::payload::TtlExtendedPayload,
+                >(&e.payload)
+                .ok()
+            })
+            .map(|p| {
+                (
+                    p.old_deadline_unix,
+                    p.new_deadline_unix,
+                    p.consenting_members,
+                )
+            })
+            .collect();
+        assert_eq!(
+            extended,
+            vec![(
+                OLD_DEADLINE,
+                NEW_DEADLINE,
+                vec!["did:example:reset-consenter".to_owned()]
+            )],
+            "reset must append exactly one TtlExtended leaf recording (old, new) and \
+             the consenting members (§5.10.1 step 5)"
+        );
+    }
+
+    /// A2 + `consented_dids` sort gate: two honest members with WILDLY different
+    /// local clocks but IDENTICAL convergent state (same genesis leaf, same
+    /// params.ttl, same 2-member consent tally) must append BYTE-IDENTICAL
+    /// `TtlExtended` leaves on a bilateral reset — required for their Merkle
+    /// roots to converge. This gates BOTH the A2 fix (the leaf `timestamp` is the
+    /// convergent PRE-extension deadline `old`, NOT local `now()`) AND the
+    /// `TtlExtension::consented_dids` sort (the leaf's `consenting_members` is a
+    /// lexicographically-sorted, per-process-`RandomState`-independent list).
+    #[tokio::test]
+    async fn two_members_reset_leaves_are_byte_identical() {
+        const T0: u64 = 1_700_000_000;
+        const CREATE_TTL: u64 = 500;
+        const OLD_DEADLINE: u64 = T0 + CREATE_TTL;
+        const ADDITIONAL: u64 = 100;
+
+        // Run one member's reset under local clock `now`, returning the appended
+        // `TtlExtended` leaf. The two consenters are inserted in OPPOSITE orders on
+        // the two members to exercise the sort (a per-`HashSet` `RandomState` can
+        // otherwise iterate them differently).
+        async fn member_reset_leaf(now: u64, insert_alpha_first: bool) -> scp_event_log::Event {
+            let clock_dyn: Arc<dyn Clock> = Arc::new(TestClock::new(now));
+            let event_log = SeededEventLog::new(vec![seeded_context_created(0)]);
+            let entries_handle = event_log.entries.clone();
+            let sup = supervisor_with_clock_persistence_and_event_log(
+                clock_dyn,
+                Box::new(MapPersistence::default()),
+                Box::new(event_log),
+            );
+            let deps = test_actor_deps(&sup).await;
+
+            let ctx_id_bytes = [0x60u8; 32];
+            let ctx_key = hex::encode(ctx_id_bytes);
+            // Same creator DID on both members ⇒ the leaf `actor_did` converges.
+            let admin = DID("did:example:reset-converge-admin".to_owned());
+            let mut state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+                ctx_id_bytes,
+                T0,
+                admin,
+            );
+            state.handle = crate::context::ContextHandle::new(
+                ctx_key.clone(),
+                scp_protocol::context::params::ContextParams {
+                    ttl: Some(std::time::Duration::from_secs(CREATE_TTL)),
+                    ..Default::default()
+                },
+            );
+            state.ttl.timer.deadline_unix_secs = Some(OLD_DEADLINE);
+            let mut ext = crate::context::ttl::TtlExtension::new(
+                std::time::Duration::from_secs(ADDITIONAL),
+                2,
+            );
+            let alpha = DID("did:example:m-alpha".to_owned());
+            let bravo = DID("did:example:m-bravo".to_owned());
+            if insert_alpha_first {
+                ext.add_consent(alpha);
+                ext.add_consent(bravo);
+            } else {
+                ext.add_consent(bravo);
+                ext.add_consent(alpha);
+            }
+            state.ttl.extension = Some(ext);
+            let mut cell = crate::context::actor::class_s::ClassSCell::new(state);
+
+            crate::context::ttl_close_helpers::reset_ttl_timer(
+                &mut cell,
+                &deps,
+                &ctx_key,
+                std::time::Duration::from_secs(ADDITIONAL),
+            )
+            .await;
+
+            entries_handle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .find(|e| e.event_type == scp_event_log::EventType::TtlExtended)
+                .cloned()
+                .expect("reset appended a TtlExtended leaf")
+        }
+
+        let leaf_a = member_reset_leaf(T0, true).await;
+        let leaf_b = member_reset_leaf(T0 + 9_999_999, false).await;
+
+        assert_eq!(
+            leaf_a.timestamp, OLD_DEADLINE,
+            "the reset leaf timestamp is the convergent PRE-extension deadline (A2), not local now()"
+        );
+        assert_eq!(
+            leaf_a.timestamp, leaf_b.timestamp,
+            "clock-skewed members must stamp the SAME leaf timestamp (A2)"
+        );
+        assert_eq!(
+            leaf_a.actor_did, leaf_b.actor_did,
+            "same creator ⇒ same actor"
+        );
+        assert_eq!(leaf_a.sequence, leaf_b.sequence, "same log position");
+        assert_eq!(
+            leaf_a.payload, leaf_b.payload,
+            "identical (old, new, proposal_id, SORTED consenting_members) ⇒ byte-identical payload"
+        );
+        // Prove the sorted, canonical consent list explicitly (the sort gate).
+        let decoded = scp_event_log::payload::decode_payload::<
+            scp_event_log::payload::TtlExtendedPayload,
+        >(&leaf_a.payload)
+        .expect("decode TtlExtendedPayload");
+        assert_eq!(
+            decoded.consenting_members,
+            vec![
+                "did:example:m-alpha".to_owned(),
+                "did:example:m-bravo".to_owned(),
+            ],
+            "consenting_members must be lexicographically SORTED (convergent across members)"
+        );
+    }
+
+    /// A3/E2 (expiry aborts on `None`): if a TTL timer fires against a context
+    /// whose partitioned single-source deadline is `None` (here a PROMOTED context
+    /// — `params.ttl == None` per §5.10 — whose STALE scalar still holds a live
+    /// deadline), `handle_ttl_expiry` must ABORT: NO terminal transition, NO key
+    /// destruction, NO `ContextExpired` leaf, and the stale cached deadline CLEARED
+    /// so `reconcile_timers` disarms. A stray `ContextPromoted` leaf is seeded to
+    /// prove the abort comes from `params.ttl == None`, not the (prunable) leaf.
+    /// Pre-fix a `None` deadline was masked into `clock.now()` and the expiry
+    /// destroyed keys.
+    #[tokio::test]
+    async fn ttl_expiry_aborts_when_convergent_deadline_is_none() {
+        const T0: u64 = 1_700_000_000;
+        const STALE_TTL: u64 = 30;
+
+        let clock_dyn: Arc<dyn Clock> = Arc::new(TestClock::new(T0));
+        let event_log =
+            SeededEventLog::new(vec![seeded_context_created(0), seeded_context_promoted(1)]);
+        let entries_handle = event_log.entries.clone();
+        let sup = supervisor_with_clock_persistence_and_event_log(
+            clock_dyn,
+            Box::new(MapPersistence::default()),
+            Box::new(event_log),
+        );
+        let deps = test_actor_deps(&sup).await;
+
+        let ctx_id_bytes = [0x61u8; 32];
+        let ctx_key = hex::encode(ctx_id_bytes);
+        let admin = DID("did:example:expiry-abort-admin".to_owned());
+        let mut state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+            ctx_id_bytes,
+            T0,
+            admin,
+        );
+        state.handle = crate::context::ContextHandle::new(
+            ctx_key.clone(),
+            scp_protocol::context::params::ContextParams {
+                // Promoted ⇒ TTL removed (§5.10): `params.ttl == None` is the
+                // prune-immune authority that drives the derivation to `None`.
+                ttl: None,
+                memory_scope: scp_protocol::context::params::MemoryScope::Full,
+                ..Default::default()
+            },
+        );
+        // A STALE non-`None` recorded deadline (params.ttl == None ⇒ derive None).
+        state.ttl.timer.deadline_unix_secs = Some(T0 + STALE_TTL);
+        state
+            .handle
+            .transition_to(&crate::context::ContextState::Active)
+            .unwrap();
+        let mut cell = crate::context::actor::class_s::ClassSCell::new(state);
+        let handle = cell.handle.clone();
+
+        let outcome =
+            crate::context::ttl_close_helpers::handle_ttl_expiry(&mut cell, &deps, &handle, 0)
+                .await;
+
+        assert!(
+            !outcome.result.is_complete(),
+            "an aborted expiry is NOT a completed expiry"
+        );
+        assert_eq!(
+            cell.handle.state(),
+            crate::context::ContextState::Active,
+            "the FSM must stay Active — no terminal Expired transition off a None deadline (A3)"
+        );
+        assert_eq!(
+            cell.ttl.timer.deadline_unix_secs, None,
+            "the stale cached deadline must be cleared so reconcile_timers disarms (A3)"
+        );
+        let expired_leaves = entries_handle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|e| e.event_type == scp_event_log::EventType::ContextExpired)
+            .count();
+        assert_eq!(
+            expired_leaves, 0,
+            "no ContextExpired leaf may be appended when the expiry aborts (A3)"
+        );
+    }
+
+    /// F4 (finalize_close stamps the ACTUAL close time, not the TTL deadline):
+    /// `finalize_close` is the EXPLICIT Closing→Closed path (FFI
+    /// `context_finalize_close`). For a context with a LIVE finite `params.ttl`
+    /// closed BEFORE it expires, the convergent TTL deadline (`creation + ttl`) is
+    /// a FUTURE instant unrelated to when the close happened — stamping it would
+    /// record a future close time. The `ContextClosed` leaf must instead carry the
+    /// actual local close instant (`clock.now_secs()`). (The timer-driven expiry
+    /// path stamps a `ContextExpired` leaf off the convergent deadline and never
+    /// reaches `finalize_close`; cross-member convergence of an explicit governance
+    /// close is anchored by the prior `ContextClosing` committer leaf.)
+    #[tokio::test]
+    async fn finalize_close_explicit_stamps_actual_close_time() {
+        const T0: u64 = 1_700_000_000;
+        const CREATE_TTL: u64 = 500;
+        // Close time is BEFORE the finite TTL deadline (`T0 + CREATE_TTL`), so the
+        // convergent deadline is a FUTURE instant. `now` is the actual close time.
+        const NOW_CLOSE: u64 = T0 + 100;
+        const FUTURE_TTL_DEADLINE: u64 = T0 + CREATE_TTL;
+
+        let clock_dyn: Arc<dyn Clock> = Arc::new(TestClock::new(NOW_CLOSE));
+        let event_log = SeededEventLog::new(vec![seeded_context_created(0)]);
+        let entries_handle = event_log.entries.clone();
+        let sup = supervisor_with_clock_persistence_and_event_log(
+            clock_dyn,
+            Box::new(MapPersistence::default()),
+            Box::new(event_log),
+        );
+        let deps = test_actor_deps(&sup).await;
+
+        let ctx_id_bytes = [0x62u8; 32];
+        let ctx_key = hex::encode(ctx_id_bytes);
+        let admin = DID("did:example:finalize-actual-close-admin".to_owned());
+        let mut state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+            ctx_id_bytes,
+            T0,
+            admin,
+        );
+        // `Full` scope so finalize destroys no keys; a LIVE finite ttl whose
+        // convergent deadline (`T0 + CREATE_TTL`) lies in the FUTURE relative to
+        // the close instant, so the old code would (wrongly) stamp that future
+        // deadline.
+        state.handle = crate::context::ContextHandle::new(
+            ctx_key.clone(),
+            scp_protocol::context::params::ContextParams {
+                ttl: Some(std::time::Duration::from_secs(CREATE_TTL)),
+                memory_scope: scp_protocol::context::params::MemoryScope::Full,
+                ..Default::default()
+            },
+        );
+        // finalize_close requires the context to be in `Closing`.
+        state
+            .handle
+            .transition_to(&crate::context::ContextState::Active)
+            .unwrap();
+        state
+            .handle
+            .transition_to(&crate::context::ContextState::Closing)
+            .unwrap();
+        let mut cell = crate::context::actor::class_s::ClassSCell::new(state);
+        let handle = cell.handle.clone();
+
+        crate::context::ttl_close_helpers::finalize_close(&mut cell, &deps, &handle)
+            .await
+            .expect("finalize_close on a Closing context succeeds");
+
+        let closed_ts = entries_handle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .find(|e| e.event_type == scp_event_log::EventType::ContextClosed)
+            .map(|e| e.timestamp)
+            .expect("finalize_close appended a ContextClosed leaf");
+        assert_eq!(
+            closed_ts, NOW_CLOSE,
+            "an explicit close must stamp the ACTUAL close time (now), not the TTL deadline (F4)"
+        );
+        assert_ne!(
+            closed_ts, FUTURE_TTL_DEADLINE,
+            "an explicit close of a live finite-ttl context must NOT stamp the future \
+             creation+ttl deadline (F4)"
+        );
+    }
+
+    /// An event-log double that FAILS the first append (modelling a transient
+    /// event-log failure that forces a TTL-expiry retry), then STORES and
+    /// returns every subsequent append so a test can read the timestamp the
+    /// retry stamped on the `ContextExpired` leaf.
+    #[derive(Clone, Default)]
+    struct FailFirstThenRecordEventLog {
+        #[allow(clippy::disallowed_types)]
+        entries: Arc<std::sync::Mutex<Vec<scp_event_log::Event>>>,
+        fail_next: Arc<std::sync::atomic::AtomicBool>,
+    }
+    #[async_trait::async_trait]
+    impl crate::context::builder::ContextEventLogProvider for FailFirstThenRecordEventLog {
+        async fn init_event_log(
+            &self,
+            _id: &[u8; 32],
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            Ok(())
+        }
+        async fn append_event(
+            &self,
+            _id: &[u8; 32],
+            event_type: scp_event_log::EventType,
+            actor: &str,
+            payload: scp_event_log::EventPayload,
+            timestamp_secs: u64,
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            if self
+                .fail_next
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                // Model a transient failure: DO NOT record, so the retry sees no
+                // terminal leaf and re-appends.
+                return Err(
+                    scp_protocol::context::builder::ContextCreationError::EventLogFailed(
+                        "induced transient event-log append failure".to_owned(),
+                    ),
+                );
+            }
+            self.entries
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(scp_event_log::Event {
+                    event_type,
+                    actor_did: DID(actor.to_owned()),
+                    timestamp: timestamp_secs,
+                    sequence: 0,
+                    payload,
+                    prev_hash: [0u8; 32],
+                    signature: Vec::new(),
+                });
+            Ok(())
+        }
+        async fn destroy_event_log(
+            &self,
+            _id: &[u8; 32],
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            Ok(())
+        }
+        fn event_log_entries(
+            &self,
+            _id: &[u8; 32],
+        ) -> Result<Option<Vec<scp_event_log::Event>>, ContextError> {
+            Ok(Some(
+                self.entries
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone(),
+            ))
+        }
+    }
+
+    /// M1 (retry stamps the convergent deadline, REGRESSION GATE): when the
+    /// FIRST TTL-expiry attempt's `ContextExpired` append fails and a RETRY
+    /// performs the actual append, the stamped leaf timestamp must be the
+    /// CONVERGENT deadline (`creation + ttl`), NOT the retry-time clock.
+    ///
+    /// Pre-fix this FAILED: `handle_ttl_expiry` read the leaf timestamp as
+    /// `deadline_unix_secs.unwrap_or(now())` at the top; Phase 1 cleared
+    /// `deadline_unix_secs` to `None`, so the retry re-read `None` → the local
+    /// `now()` clock. Under clock skew that diverges from the deadline a member
+    /// who appended on its first try stamped (§7.3.1/§9.9.3). The fix re-derives
+    /// the convergent deadline from `creation + ttl` (+ recorded extensions) on
+    /// the retry, independent of the cleared field.
+    #[tokio::test]
+    async fn retry_stamps_convergent_leaf_timestamp() {
+        const T0: u64 = 1_700_000_000;
+        const TTL_SECS: u64 = 3_600;
+        const CONVERGENT_DEADLINE: u64 = T0 + TTL_SECS;
+        // The actor's LOCAL clock is far from the convergent deadline — a
+        // `now()`-stamped retry would record THIS, not `CONVERGENT_DEADLINE`.
+        const NOW_SKEWED: u64 = T0 + 1_000_000;
+
+        // Seed the genesis `ContextCreated` leaf (`T0`) so the single-source
+        // `convergent_ttl_deadline` derives the base `T0 + TTL_SECS =
+        // CONVERGENT_DEADLINE` (A1) — the value the retry must stamp regardless of
+        // the cleared scalar and the skewed clock.
+        let event_log = FailFirstThenRecordEventLog {
+            entries: Arc::new(std::sync::Mutex::new(vec![seeded_context_created(0)])),
+            fail_next: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        };
+        let clock_dyn: Arc<dyn Clock> = Arc::new(TestClock::new(NOW_SKEWED));
+
+        // Build a supervisor with the skewed clock AND the fail-first event log.
+        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+            "did:dht:z6MktestM1Convergent".to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
+        ));
+        let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
+            Box::new(crate::context::builder::NotConfiguredTransportProvider);
+        let key_resolver: KeyResolver = Arc::new(|_: &DID, _: scp_did::SigningKeyId| None);
+        let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
+            Arc::new(
+                crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
+                    InMemoryStorage::new(),
+                )),
+            );
+        let sup = Supervisor::with_providers(
+            crypto,
+            transport,
+            Box::new(event_log.clone()),
+            key_resolver,
+            Some(Box::new(MapPersistence::default())),
+            None,
+            None,
+            Some(clock_dyn),
+            mls_storage,
+        );
+        let deps = test_actor_deps(&sup).await;
+
+        let ctx_id_bytes = [0x5Cu8; 32];
+        let ctx_key = hex::encode(ctx_id_bytes);
+        let admin = DID("did:example:m1-convergent-admin".to_owned());
+
+        // A `Full`-scope context: expiry needs no key destruction, so the only
+        // completeness-critical step gated on the event log is the leaf append.
+        let mut state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+            ctx_id_bytes,
+            T0,
+            admin.clone(),
+        );
+        state.handle = crate::context::ContextHandle::new(
+            ctx_key.clone(),
+            scp_protocol::context::params::ContextParams {
+                ttl: Some(std::time::Duration::from_secs(TTL_SECS)),
+                memory_scope: scp_protocol::context::params::MemoryScope::Full,
+                ..Default::default()
+            },
+        );
+        state.ttl.timer.deadline_unix_secs = Some(CONVERGENT_DEADLINE);
+        state
+            .handle
+            .transition_to(&crate::context::ContextState::Active)
+            .unwrap();
+        let mut cell = crate::context::actor::class_s::ClassSCell::new(state);
+        let handle = cell.handle.clone();
+
+        // First attempt: append FAILS ⇒ incomplete. Phase 1 clears the recorded
+        // deadline.
+        let out1 =
+            crate::context::ttl_close_helpers::handle_ttl_expiry(&mut cell, &deps, &handle, 0)
+                .await;
+        assert!(
+            !out1.result.is_complete(),
+            "first attempt's append must fail (forcing a retry): {}",
+            out1.result
+        );
+        assert_eq!(
+            cell.ttl.timer.deadline_unix_secs, None,
+            "Phase 1 clears the recorded convergent deadline"
+        );
+
+        // Retry: the recorded deadline is gone, so the leaf timestamp must be
+        // RE-DERIVED as `creation + ttl` — NOT the skewed local clock.
+        let out2 = crate::context::ttl_close_helpers::handle_ttl_expiry(
+            &mut cell,
+            &deps,
+            &handle,
+            out1.result.completed_steps(),
+        )
+        .await;
+        assert!(
+            out2.result.is_complete(),
+            "retry re-appends the ContextExpired leaf ⇒ complete: {}",
+            out2.result
+        );
+
+        let expired: Vec<u64> = {
+            let entries = event_log
+                .entries
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            entries
+                .iter()
+                .filter(|e| e.event_type == scp_event_log::EventType::ContextExpired)
+                .map(|e| e.timestamp)
+                .collect()
+        };
+        assert_eq!(
+            expired,
+            vec![CONVERGENT_DEADLINE],
+            "the retry must stamp the CONVERGENT deadline (creation+ttl), not the \
+             skewed retry-time clock ({NOW_SKEWED}) (M1)"
+        );
+    }
+
+    /// M1 companion (retry stamps a RESET-EXTENDED convergent deadline): when the
+    /// live deadline was pushed out by a `reset_ttl_timer` extension (now recorded
+    /// as a `TtlExtended` leaf), a failed-then-retried `ContextExpired` append
+    /// must stamp the EXTENDED deadline — re-derived from the log's `TtlExtended`
+    /// leaf, not the create base and not the skewed retry-time clock. This proves
+    /// the single-source terminal-leaf derivation reads reset extensions too (the
+    /// whole point of making reset emit a leaf).
+    #[tokio::test]
+    async fn retry_stamps_reset_extended_convergent_deadline() {
+        const T0: u64 = 1_700_000_000;
+        const TTL_SECS: u64 = 3_600;
+        const BASE_DEADLINE: u64 = T0 + TTL_SECS;
+        // A reset extension pushed the deadline out beyond the create base.
+        const EXTENDED_DEADLINE: u64 = BASE_DEADLINE + 1_000;
+        const NOW_SKEWED: u64 = T0 + 5_000_000;
+
+        // Pre-seed the log with the create + reset-extension leaves so the
+        // derivation reconstructs the EXTENDED deadline.
+        let event_log = FailFirstThenRecordEventLog {
+            entries: Arc::new(std::sync::Mutex::new(vec![
+                seeded_context_created(0),
+                seeded_ttl_extended(1, BASE_DEADLINE, EXTENDED_DEADLINE),
+            ])),
+            fail_next: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        };
+        let clock_dyn: Arc<dyn Clock> = Arc::new(TestClock::new(NOW_SKEWED));
+
+        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+            "did:dht:z6MktestM1Reset".to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
+        ));
+        let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
+            Box::new(crate::context::builder::NotConfiguredTransportProvider);
+        let key_resolver: KeyResolver = Arc::new(|_: &DID, _: scp_did::SigningKeyId| None);
+        let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
+            Arc::new(
+                crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
+                    InMemoryStorage::new(),
+                )),
+            );
+        let sup = Supervisor::with_providers(
+            crypto,
+            transport,
+            Box::new(event_log.clone()),
+            key_resolver,
+            Some(Box::new(MapPersistence::default())),
+            None,
+            None,
+            Some(clock_dyn),
+            mls_storage,
+        );
+        let deps = test_actor_deps(&sup).await;
+
+        let ctx_id_bytes = [0x5Du8; 32];
+        let ctx_key = hex::encode(ctx_id_bytes);
+        let admin = DID("did:example:m1-reset-admin".to_owned());
+
+        let mut state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+            ctx_id_bytes,
+            T0,
+            admin.clone(),
+        );
+        state.handle = crate::context::ContextHandle::new(
+            ctx_key.clone(),
+            scp_protocol::context::params::ContextParams {
+                ttl: Some(std::time::Duration::from_secs(TTL_SECS)),
+                memory_scope: scp_protocol::context::params::MemoryScope::Full,
+                ..Default::default()
+            },
+        );
+        state.ttl.timer.deadline_unix_secs = Some(EXTENDED_DEADLINE);
+        state
+            .handle
+            .transition_to(&crate::context::ContextState::Active)
+            .unwrap();
+        let mut cell = crate::context::actor::class_s::ClassSCell::new(state);
+        let handle = cell.handle.clone();
+
+        let out1 =
+            crate::context::ttl_close_helpers::handle_ttl_expiry(&mut cell, &deps, &handle, 0)
+                .await;
+        assert!(
+            !out1.result.is_complete(),
+            "first attempt's append must fail (forcing a retry): {}",
+            out1.result
+        );
+
+        let out2 = crate::context::ttl_close_helpers::handle_ttl_expiry(
+            &mut cell,
+            &deps,
+            &handle,
+            out1.result.completed_steps(),
+        )
+        .await;
+        assert!(
+            out2.result.is_complete(),
+            "retry re-appends the ContextExpired leaf ⇒ complete: {}",
+            out2.result
+        );
+
+        let expired: Vec<u64> = {
+            let entries = event_log
+                .entries
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            entries
+                .iter()
+                .filter(|e| e.event_type == scp_event_log::EventType::ContextExpired)
+                .map(|e| e.timestamp)
+                .collect()
+        };
+        assert_eq!(
+            expired,
+            vec![EXTENDED_DEADLINE],
+            "the retry must stamp the RESET-EXTENDED convergent deadline derived from \
+             the TtlExtended leaf, not the create base ({BASE_DEADLINE}) or the skewed \
+             clock ({NOW_SKEWED})"
+        );
+    }
+
+    /// Reconcile idempotency: repeated per-turn reconciliation against an
+    /// UNCHANGED deadline must not drift or duplicate the one-shot arm — the
+    /// timer still fires exactly at the deadline despite many intervening
+    /// run-loop turns (each dispatched query re-runs `reconcile_timers`).
+    #[tokio::test(start_paused = true)]
+    async fn reconcile_timers_idempotent_no_rearm_when_deadline_unchanged() {
+        const T0: u64 = 1_700_000_000;
+        const TTL_SECS: u64 = 40;
+
+        let clock_dyn: Arc<dyn Clock> = Arc::new(TestClock::new(T0));
+        let persistence = MapPersistence::default();
+        // The expiry pipeline derives its leaf timestamp / abort decision from the
+        // partitioned single-source deadline — the prune-immune snapshot base
+        // `creation_timestamp_secs (= T0) + TTL_SECS` (matching the armed scalar).
+        let event_log = SeededEventLog::new(vec![seeded_context_created(0)]);
+        let sup = supervisor_with_clock_persistence_and_event_log(
+            clock_dyn,
+            Box::new(persistence.clone()),
+            Box::new(event_log),
+        );
+
+        let ctx_id_bytes = [0x56u8; 32];
+        let ctx_key = hex::encode(ctx_id_bytes);
+        let admin = DID("did:example:reconcile-idem-admin".to_owned());
+
+        let mut state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+            ctx_id_bytes,
+            T0,
+            admin.clone(),
+        );
+        // Finite params.ttl so the single-source deadline derives (prune-immune
+        // snapshot base) and the expiry does not ABORT (A3).
+        state.handle = crate::context::ContextHandle::new(
+            ctx_key.clone(),
+            scp_protocol::context::params::ContextParams {
+                ttl: Some(std::time::Duration::from_secs(TTL_SECS)),
+                ..Default::default()
+            },
+        );
+        state.ttl.timer.deadline_unix_secs = Some(T0 + TTL_SECS);
+        state
+            .handle
+            .transition_to(&crate::context::ContextState::Active)
+            .unwrap();
+
+        let deps = test_actor_deps(&sup).await;
+        sup.spawn_actor_with_state(state, deps, None)
+            .await
+            .expect("spawn Active actor with a fixed TTL deadline");
+
+        // Force many run-loop turns (hence reconcile passes) BELOW the deadline,
+        // advancing only a little each time. The unchanged deadline must not
+        // cause a premature fire.
+        for _ in 0..12 {
+            assert_eq!(
+                sup.read_context_state(&ctx_key).await,
+                Some(crate::context::ContextState::Active),
+                "the arm must not fire early despite repeated reconciliation"
+            );
+            tokio::time::advance(std::time::Duration::from_secs(1)).await;
+            tokio::task::yield_now().await;
+        }
+
+        // Advance past the (unchanged) deadline: it must still fire exactly once.
+        tokio::time::advance(std::time::Duration::from_secs(TTL_SECS)).await;
+        let mut despawned = false;
+        for _ in 0..64 {
+            if sup.lookup(&ctx_key).is_none() {
+                despawned = true;
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            despawned,
+            "the arm must still fire at the deadline after many idempotent reconciliations"
+        );
+        let persisted = persistence
+            .load_context(&ctx_key)
+            .await
+            .unwrap()
+            .expect("expiry must persist a durable snapshot");
+        assert_eq!(persisted.state, crate::context::ContextState::Expired);
     }
 
     #[tokio::test]
@@ -14150,7 +16081,7 @@ mod tests {
             role_state,
             event_log_merkle_root: [0u8; 32],
             executed_proposals: HashSet::new(),
-            ttl_remaining_secs: None,
+            ttl_deadline_secs: None,
             registered_outlets: Vec::new(),
             outlet_interfaces: Vec::new(),
             threshold_signers: Vec::new(),
@@ -14663,6 +16594,343 @@ mod tests {
             applied_after_period,
             "the change MUST become effective once the re-pinned notification window \
              (import_time + PERIOD) has elapsed"
+        );
+    }
+
+    /// Builds Merkle event-log bytes with a `ContextCreated` genesis followed by
+    /// a `TtlExtended` leaf carrying `extended_deadline_unix` — a COMPLETE
+    /// history recording a valid TTL extension, for the M3 import tests.
+    async fn create_event_log_data_with_extension(
+        context_id_bytes: &[u8; 32],
+        extended_deadline_unix: u64,
+    ) -> Vec<u8> {
+        use crate::context::builder::ContextEventLogProvider;
+        let provider = crate::context::providers::event_log::MerkleEventLogProvider::new();
+        provider.init_event_log(context_id_bytes).await.unwrap();
+        provider
+            .append_event(
+                context_id_bytes,
+                scp_event_log::EventType::ContextCreated,
+                "",
+                scp_event_log::EventPayload::default(),
+                1_700_000_000,
+            )
+            .await
+            .unwrap();
+        let payload =
+            scp_event_log::payload::encode_payload(&scp_event_log::payload::TtlExtendedPayload {
+                old_deadline_unix: 0,
+                new_deadline_unix: extended_deadline_unix,
+                proposal_id: [0u8; 32],
+                consenting_members: Vec::new(),
+            })
+            .unwrap();
+        provider
+            .append_event(
+                context_id_bytes,
+                scp_event_log::EventType::TtlExtended,
+                "",
+                payload,
+                1_700_000_000,
+            )
+            .await
+            .unwrap();
+        provider.export_event_log_entries(context_id_bytes).unwrap()
+    }
+
+    /// A supervisor with a caller-supplied clock + persistence AND the REAL
+    /// [`MerkleEventLogProvider`](crate::context::providers::event_log::MerkleEventLogProvider)
+    /// (which supports event-log import) so the M3 import tests can import a
+    /// full export whose `event_log_data` is non-empty.
+    fn supervisor_with_clock_persistence_and_merkle_log(
+        clock: Arc<dyn Clock>,
+        persistence: Box<dyn ContextPersistence>,
+    ) -> Arc<Supervisor> {
+        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+            "did:dht:z6MktestM3Import".to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
+        ));
+        let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
+            Box::new(crate::context::builder::NotConfiguredTransportProvider);
+        let event_log: Box<dyn crate::context::builder::ContextEventLogProvider> =
+            Box::new(crate::context::providers::event_log::MerkleEventLogProvider::new());
+        let key_resolver: KeyResolver = Arc::new(|_: &DID, _: scp_did::SigningKeyId| None);
+        let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
+            Arc::new(
+                crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
+                    InMemoryStorage::new(),
+                )),
+            );
+        Supervisor::with_providers(
+            crypto,
+            transport,
+            event_log,
+            key_resolver,
+            Some(persistence),
+            None,
+            None,
+            Some(clock),
+            mls_storage,
+        )
+    }
+
+    /// M3 (import ignores an over-long scalar, derives the prune-immune base —
+    /// REGRESSION GATE, prune-safe rewrite): a validly SIGNED export with a
+    /// Merkle-valid log `[ContextCreated]` (no extension), `params.ttl = 1h`, but a
+    /// persisted `ttl_deadline_secs = creation + 1yr` (a malicious exporter
+    /// smuggling a window extension) must arm `creation + 1h` on import — the
+    /// over-long persisted scalar is NEVER read.
+    ///
+    /// The redesign dissolves this attack class WITHOUT a clamp: the deadline base
+    /// is the prune-immune, creator-signed `snapshot.creation_timestamp_secs +
+    /// params.ttl` (= `creation + 1h`, no `TtlExtended` leaf to raise it), so the
+    /// attacker-controlled `ttl_deadline_secs` scalar cannot extend the window
+    /// (§7.3.1 / §9.9.3). `creation_timestamp_secs` is itself rejected if
+    /// future-dated (E3), so the base cannot be smuggled long either. The context
+    /// expires at `creation + 1h`.
+    #[tokio::test(start_paused = true)]
+    async fn import_ignores_over_long_scalar_derives_from_log() {
+        const T0: u64 = 1_700_000_000;
+        const TTL_SECS: u64 = 3_600; // 1h
+        const ONE_YEAR: u64 = 31_536_000;
+
+        let clock_dyn: Arc<dyn Clock> = Arc::new(TestClock::new(T0));
+        let persistence = MapPersistence::default();
+        let sup = supervisor_with_clock_persistence_and_merkle_log(
+            clock_dyn,
+            Box::new(persistence.clone()),
+        );
+
+        let creator = "did:key:m3-clamp-creator";
+        let context_id = "m3-clamp-over-long-ctx";
+        let ctx_id_bytes = crate::context::state::context_id_to_bytes(context_id);
+
+        let mut snapshot = import_test_snapshot(context_id, creator);
+        snapshot.context_params.ttl = Some(std::time::Duration::from_secs(TTL_SECS));
+        // Attacker signs an over-long deadline far beyond `creation + ttl`.
+        snapshot.ttl_deadline_secs = Some(T0 + ONE_YEAR);
+
+        // COMPLETE history (genesis present) with NO extension leaf.
+        let event_log_data =
+            create_event_log_data(&ctx_id_bytes, &[scp_event_log::EventType::ContextCreated]).await;
+
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let verifying_key = signing_key.verifying_key();
+        let export = crate::context::export_import::create_export(
+            snapshot,
+            event_log_data,
+            DID(creator.to_owned()),
+            crate::context::export_import::ExportScope::Full,
+            &scp_clock::SystemClock,
+            |hash: &[u8; 32]| {
+                use ed25519_dalek::Signer;
+                Ok::<_, std::convert::Infallible>(signing_key.sign(hash).to_bytes())
+            },
+        )
+        .expect("build a valid signed full export");
+
+        sup.import_context(export, &verifying_key, None)
+            .await
+            .expect("a valid signed export imports successfully");
+
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            sup.read_context_state(context_id).await,
+            Some(crate::context::ContextState::Active),
+            "the imported context is Active before its snapshot-base deadline"
+        );
+
+        // Advance PAST the snapshot-base `creation + ttl` (T0 + 3600) but FAR
+        // before the persisted `creation + 1yr`: an arm off the over-long scalar
+        // would still be Active here; the prune-immune snapshot-base arm fires and
+        // (fail-closed) transitions to Expired.
+        tokio::time::advance(std::time::Duration::from_secs(TTL_SECS + 1)).await;
+        let mut expired = false;
+        for _ in 0..128 {
+            if matches!(
+                sup.read_context_state(context_id).await,
+                Some(crate::context::ContextState::Expired) | None
+            ) {
+                expired = true;
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            expired,
+            "import must arm the prune-immune snapshot base creation+ttl (ignoring the \
+             over-long scalar) and expire (M3); pre-fix it armed creation+1yr and stayed Active"
+        );
+    }
+
+    /// E3 (import rejects a future-dated creation timestamp — REGRESSION GATE): a
+    /// validly SIGNED export whose `creation_timestamp_secs` is dated FAR beyond
+    /// the importer's clock is MALFORMED — a malicious creator future-dating their
+    /// OWN creation instant to smuggle a long absolute key-destruction deadline
+    /// (`future + ttl`) via the prune-immune create base. The import must be
+    /// REJECTED fail-closed at the boundary (before any poisoned base is
+    /// persisted), NOT clamped in memory (pass-4d's clamp was reversed on the next
+    /// restart). This is the durable base-future-dating fix (ADR-049 §9).
+    ///
+    /// F2 (the reject is SIDE-EFFECT-FREE): the future-date gate is hoisted to the
+    /// TOP of `import_context` — ABOVE `restore_crypto_state_with_floor_guard`
+    /// (installs the MLS group + sets the replay floor) and
+    /// `import_event_log_data` (persists the foreign log). This test additionally
+    /// asserts the rejected import leaves NO persisted foreign event log; before
+    /// the hoist, the reject ran AFTER `import_event_log_data`, orphaning the
+    /// foreign `ContextCreated` leaf (and, with a non-empty crypto blob, a resident
+    /// group + a replay floor pinned from the future-dated epoch that could
+    /// floor-reject a later LEGITIMATE re-import — griefing/DoS).
+    #[tokio::test]
+    async fn import_rejects_future_dated_creation_timestamp() {
+        const T0: u64 = 1_700_000_000;
+        const TTL_SECS: u64 = 3_600;
+        const ONE_YEAR: u64 = 31_536_000;
+
+        let clock_dyn: Arc<dyn Clock> = Arc::new(TestClock::new(T0));
+        let persistence = MapPersistence::default();
+        let sup = supervisor_with_clock_persistence_and_merkle_log(
+            clock_dyn,
+            Box::new(persistence.clone()),
+        );
+
+        let creator = "did:key:e3-future-creator";
+        let context_id = "e3-future-dated-ctx";
+        let ctx_id_bytes = crate::context::state::context_id_to_bytes(context_id);
+
+        let mut snapshot = import_test_snapshot(context_id, creator);
+        snapshot.context_params.ttl = Some(std::time::Duration::from_secs(TTL_SECS));
+        // Malicious: creation instant dated a year into the importer's future — a
+        // `creation + ttl` base a year+1h out.
+        snapshot.creation_timestamp_secs = T0 + ONE_YEAR;
+
+        let event_log_data =
+            create_event_log_data(&ctx_id_bytes, &[scp_event_log::EventType::ContextCreated]).await;
+
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[11u8; 32]);
+        let verifying_key = signing_key.verifying_key();
+        let export = crate::context::export_import::create_export(
+            snapshot,
+            event_log_data,
+            DID(creator.to_owned()),
+            crate::context::export_import::ExportScope::Full,
+            &scp_clock::SystemClock,
+            |hash: &[u8; 32]| {
+                use ed25519_dalek::Signer;
+                Ok::<_, std::convert::Infallible>(signing_key.sign(hash).to_bytes())
+            },
+        )
+        .expect("build a valid signed full export");
+
+        let result = sup.import_context(export, &verifying_key, None).await;
+        assert!(
+            result.is_err(),
+            "a future-dated creation_timestamp_secs must be rejected fail-closed (E3)"
+        );
+        // No poisoned base persisted: the rejected import leaves no resident actor.
+        assert!(
+            sup.lookup(context_id).is_none(),
+            "a rejected future-dated import must not leave a resident actor"
+        );
+        // F2: the reject is SIDE-EFFECT-FREE — the foreign event log was NOT
+        // persisted. Before the hoist, `import_event_log_data` ran before the
+        // reject and orphaned the foreign `ContextCreated` leaf.
+        let persisted_log = sup
+            .event_log_entries(&ctx_id_bytes)
+            .expect("event-log query succeeds");
+        assert!(
+            persisted_log.is_none_or(|entries| entries.is_empty()),
+            "a rejected future-dated import must not persist the foreign event log (F2)"
+        );
+    }
+
+    /// M3 companion (a valid extension survives import, REGRESSION GATE): an
+    /// export whose history records a `TtlExtended` leaf pushing the deadline to
+    /// `creation + 2h` must arm the EXTENDED deadline on import — the fail-safe
+    /// extension term raises the prune-immune snapshot base, so a validly extended
+    /// deadline (`ttl_deadline_secs = creation + 2h`, `params.ttl = 1h`) survives
+    /// (preserves D2). The context must still be Active past `creation + 1h`.
+    #[tokio::test(start_paused = true)]
+    async fn import_preserves_extended_deadline_with_history() {
+        const T0: u64 = 1_700_000_000;
+        const TTL_SECS: u64 = 3_600; // 1h
+        const EXTENDED_DEADLINE: u64 = T0 + 7_200; // creation + 2h
+
+        let clock_dyn: Arc<dyn Clock> = Arc::new(TestClock::new(T0));
+        let persistence = MapPersistence::default();
+        let sup = supervisor_with_clock_persistence_and_merkle_log(
+            clock_dyn,
+            Box::new(persistence.clone()),
+        );
+
+        let creator = "did:key:m3-preserve-creator";
+        let context_id = "m3-preserve-extended-ctx";
+        let ctx_id_bytes = crate::context::state::context_id_to_bytes(context_id);
+
+        let mut snapshot = import_test_snapshot(context_id, creator);
+        snapshot.context_params.ttl = Some(std::time::Duration::from_secs(TTL_SECS));
+        // The VALID extended deadline (within the log-recorded bound).
+        snapshot.ttl_deadline_secs = Some(EXTENDED_DEADLINE);
+
+        // COMPLETE history recording the extension to `creation + 2h`.
+        let event_log_data =
+            create_event_log_data_with_extension(&ctx_id_bytes, EXTENDED_DEADLINE).await;
+
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[10u8; 32]);
+        let verifying_key = signing_key.verifying_key();
+        let export = crate::context::export_import::create_export(
+            snapshot,
+            event_log_data,
+            DID(creator.to_owned()),
+            crate::context::export_import::ExportScope::Full,
+            &scp_clock::SystemClock,
+            |hash: &[u8; 32]| {
+                use ed25519_dalek::Signer;
+                Ok::<_, std::convert::Infallible>(signing_key.sign(hash).to_bytes())
+            },
+        )
+        .expect("build a valid signed full export");
+
+        sup.import_context(export, &verifying_key, None)
+            .await
+            .expect("a valid signed export imports successfully");
+
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+
+        // Advance PAST the un-extended `creation + ttl` (T0 + 3600) but BEFORE
+        // the extended deadline (T0 + 7200): a wrongly-clamped arm would have
+        // expired at 3600; the correctly-preserved extended arm is still Active.
+        tokio::time::advance(std::time::Duration::from_secs(TTL_SECS + 1_000)).await; // → T0+4600
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            sup.read_context_state(context_id).await,
+            Some(crate::context::ContextState::Active),
+            "a validly-extended deadline (recorded in the log) must NOT be clamped \
+             below the extension on import (M3 / D2)"
+        );
+
+        // And it DOES expire once the extended deadline passes.
+        tokio::time::advance(std::time::Duration::from_mins(50)).await; // +3000s → T0+7600 > 7200
+        let mut expired = false;
+        for _ in 0..128 {
+            if matches!(
+                sup.read_context_state(context_id).await,
+                Some(crate::context::ContextState::Expired) | None
+            ) {
+                expired = true;
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            expired,
+            "the imported context expires at its (preserved) extended deadline"
         );
     }
 
@@ -15282,6 +17550,18 @@ mod tests {
         clock: Arc<dyn Clock>,
         persistence: Box<dyn ContextPersistence>,
     ) -> Arc<Supervisor> {
+        supervisor_with_clock_persistence_and_event_log(clock, persistence, Box::new(TestEventLog))
+    }
+
+    /// [`supervisor_with_clock_and_persistence`] with a caller-supplied event-log
+    /// provider, for tests that assert what did (or did NOT) reach the durable
+    /// event log — e.g. injecting a [`ContextExpiredAppendCounter`] to prove the
+    /// TTL-expiry pipeline never ran against a terminal context (N3).
+    fn supervisor_with_clock_persistence_and_event_log(
+        clock: Arc<dyn Clock>,
+        persistence: Box<dyn ContextPersistence>,
+        event_log: Box<dyn crate::context::builder::ContextEventLogProvider>,
+    ) -> Arc<Supervisor> {
         // Install the global capture subscriber so the payload-redaction
         // test can observe the watchdog's log (emitted on a worker thread).
         install_capture_subscriber();
@@ -15291,8 +17571,6 @@ mod tests {
         ));
         let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
             Box::new(crate::context::builder::NotConfiguredTransportProvider);
-        let event_log: Box<dyn crate::context::builder::ContextEventLogProvider> =
-            Box::new(TestEventLog);
         let key_resolver: KeyResolver = Arc::new(|_: &DID, _: scp_did::SigningKeyId| None);
         let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
             Arc::new(
@@ -15311,6 +17589,117 @@ mod tests {
             Some(clock),
             mls_storage,
         )
+    }
+
+    /// Event-log double that COUNTS `ContextExpired` append attempts (N3). A TTL
+    /// arm that (wrongly) fired against a terminal context would drive
+    /// `handle_ttl_expiry`'s Phase-2 `finish_ttl_expiry_io`, which appends a
+    /// `ContextExpired` leaf — so a non-zero count is the distinguishing signal
+    /// that the `is_active` reconcile gate regressed. Every other call is a
+    /// success no-op.
+    #[derive(Clone, Default)]
+    struct ContextExpiredAppendCounter {
+        context_expired_appends: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    #[async_trait::async_trait]
+    impl crate::context::builder::ContextEventLogProvider for ContextExpiredAppendCounter {
+        async fn init_event_log(
+            &self,
+            _id: &[u8; 32],
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            Ok(())
+        }
+        async fn append_event(
+            &self,
+            _id: &[u8; 32],
+            event_type: scp_event_log::EventType,
+            _actor: &str,
+            _payload: scp_event_log::EventPayload,
+            _timestamp_secs: u64,
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            if event_type == scp_event_log::EventType::ContextExpired {
+                self.context_expired_appends
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            Ok(())
+        }
+        async fn destroy_event_log(
+            &self,
+            _id: &[u8; 32],
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            Ok(())
+        }
+    }
+
+    /// B8 — create-time terminal-snapshot precheck (tombstone finality). A
+    /// `CreateContext` over a DURABLE snapshot whose lifecycle state is TERMINAL
+    /// (`Expired` / `Closed` / `Tombstoned`) is REFUSED fail-closed: re-creating
+    /// such an id would resurrect a finished (expired/closed/tombstoned) context
+    /// under a fresh actor, defeating tombstone finality. Each terminal state is
+    /// exercised.
+    #[tokio::test]
+    async fn create_after_terminal_snapshot_is_refused() {
+        use scp_protocol::context::ContextState;
+
+        let creator = "did:dht:z6MkB8CreateTerminalCreator";
+        let ctx_id = "b8-terminal-precheck-ctx";
+
+        for terminal in [
+            ContextState::Expired,
+            ContextState::Closed,
+            ContextState::Tombstoned,
+        ] {
+            let map = MapPersistence::default();
+            let mut snap = import_test_snapshot(ctx_id, creator);
+            snap.state = terminal.clone();
+            map.contexts.insert(ctx_id.to_owned(), snap);
+
+            let clock: Arc<dyn Clock> = Arc::new(scp_clock::TestClock::new(1_700_000_000));
+            let sup = supervisor_with_clock_and_persistence(clock, Box::new(map));
+
+            let result = sup
+                .create_context(
+                    ctx_id.to_owned(),
+                    scp_protocol::context::ContextParams::default(),
+                    DID(creator.to_owned()),
+                    None,
+                )
+                .await;
+
+            let err = result.expect_err(&format!(
+                "create over a durable {terminal:?} snapshot must be REFUSED (tombstone finality)"
+            ));
+            let msg = err.to_string();
+            assert!(
+                msg.contains("terminal") && msg.contains("tombstone finality"),
+                "refusal must cite terminal/tombstone finality for {terminal:?}, got: {msg}"
+            );
+        }
+    }
+
+    /// B8 counter-case: an ABSENT snapshot (no durable state for the id — the
+    /// standing-context / fresh-create path) is NOT blocked by the terminal
+    /// precheck. The create proceeds past the precheck and succeeds.
+    #[tokio::test]
+    async fn create_over_absent_snapshot_still_creates() {
+        let creator = "did:dht:z6MkB8CreateAbsentCreator";
+        let ctx_id = "b8-absent-precheck-ctx";
+
+        // Empty persistence: `load_context` ⇒ `Ok(None)`.
+        let map = MapPersistence::default();
+        let clock: Arc<dyn Clock> = Arc::new(scp_clock::TestClock::new(1_700_000_000));
+        let sup = supervisor_with_clock_and_persistence(clock, Box::new(map));
+
+        let handle = sup
+            .create_context(
+                ctx_id.to_owned(),
+                scp_protocol::context::ContextParams::default(),
+                DID(creator.to_owned()),
+                None,
+            )
+            .await
+            .expect("create over an ABSENT snapshot must succeed (precheck allows it)");
+        assert_eq!(handle.context_id(), ctx_id);
     }
 
     /// Drive a panic into the actor via the testing-only seam and wait for
