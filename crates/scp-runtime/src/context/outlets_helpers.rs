@@ -2034,4 +2034,552 @@ mod tests {
             Ok(Vec::new())
         }
     }
+
+    /// §7.3.8 value-caveat runtime-enforcement KATs.
+    ///
+    /// Covers (1) the pure `consume_caveat_counters` helper (all-or-nothing
+    /// across kinds, per-`ucan_cid` isolation, Authorization-class slug
+    /// mapping); (2) the TOKEN-SOURCE correctness — effective caveats are
+    /// sourced from the INVOCATION UCAN's `nb`, never from `spending_ucan`
+    /// (`nb: None` on a spending token yields no caveats, which is exactly why
+    /// the earlier `spending_ucan`-sourced resolution silently dropped every
+    /// caveat); (3) the Class-S snapshot round-trip; and (4) end-to-end
+    /// enforcement driven through `reserve_outlet_economy` (the actor-shape
+    /// reserve seam where the gate lives) for the free-path counter bounds,
+    /// the synchronous local bounds, the sync-before-counter ordering, and the
+    /// no-rollback (KEEP-on-persist-failure) guarantee.
+    #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    mod caveat_enforcement {
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        use scp_did::DID;
+        use scp_protocol::crypto::ucan::validate::{CaveatResolver, TokenNbCaveatResolver};
+        use scp_protocol::crypto::ucan::{UcanHeader, UcanPayload, UcanToken};
+        use scp_protocol::economy::types::Amount;
+        use scp_protocol::trust::caveats::{InvocationCaveats, RateWindow};
+
+        use crate::context::ContextError;
+        use crate::context::ContextState;
+        use crate::context::actor::class_s::ClassSCell;
+        use crate::context::actor::deps::ActorDeps;
+        use crate::context::actor::state::PerContextState;
+        use crate::trust::caveat_counters::CaveatCounters;
+
+        const INVOKER: &str = "did:dht:z6MkCaveatInvoker";
+        const CTX_BYTE: u8 = 0xCA;
+
+        fn ctx_key() -> String {
+            hex::encode([CTX_BYTE; 32])
+        }
+
+        fn max_calls_caveats(cap: u64) -> InvocationCaveats {
+            let mut c = InvocationCaveats::empty();
+            c.max_calls = Some(cap);
+            c
+        }
+
+        // -------------------------------------------------------------------
+        // Pure `consume_caveat_counters` helper
+        // -------------------------------------------------------------------
+
+        /// All-or-nothing across counter kinds: a consume that ADMITS on
+        /// `max_calls` but REJECTS on `amount_max_cumulative` must leave the map
+        /// UNCHANGED — the earlier kind's increment is never stranded (the
+        /// helper mutates a clone and writes back only on full success).
+        #[test]
+        fn consume_caveat_counters_is_all_or_nothing_across_kinds() {
+            let cid = "cid-aon";
+            let mut counters: HashMap<String, CaveatCounters> = HashMap::new();
+            counters.insert(
+                cid.to_owned(),
+                CaveatCounters {
+                    amount_cumulative_used: 3,
+                    ..Default::default()
+                },
+            );
+            let mut caveats = InvocationCaveats::empty();
+            caveats.max_calls = Some(5); // admits (0 -> 1)
+            caveats.amount_max_cumulative = Some(Amount::new(3)); // 3 + 1 > 3 rejects
+            let err = super::super::consume_caveat_counters(
+                &mut counters,
+                cid,
+                &caveats,
+                Amount::new(1),
+                1_000,
+            )
+            .expect_err("amount cap already met — the consume must reject");
+            assert!(
+                format!("{err}").contains("amountMaxCumulative"),
+                "must reject on the amount kind: {err}"
+            );
+            let rec = &counters[cid];
+            assert_eq!(
+                rec.max_calls_used, 0,
+                "max_calls must NOT be incremented when a later kind rejects (all-or-nothing)"
+            );
+            assert_eq!(
+                rec.amount_cumulative_used, 3,
+                "the amount counter must be unchanged on reject"
+            );
+        }
+
+        /// Counters are keyed by `ucan_cid`: exhausting one delegation's cap
+        /// leaves every other delegation's counters untouched.
+        #[test]
+        fn consume_caveat_counters_isolates_per_ucan_cid() {
+            let mut counters: HashMap<String, CaveatCounters> = HashMap::new();
+            let caveats = max_calls_caveats(1);
+            super::super::consume_caveat_counters(&mut counters, "cid-a", &caveats, Amount::new(0), 1)
+                .expect("cid-a first admits");
+            super::super::consume_caveat_counters(&mut counters, "cid-b", &caveats, Amount::new(0), 1)
+                .expect("cid-b is independent and admits");
+            assert_eq!(counters["cid-a"].max_calls_used, 1);
+            assert_eq!(counters["cid-b"].max_calls_used, 1);
+            super::super::consume_caveat_counters(&mut counters, "cid-a", &caveats, Amount::new(0), 1)
+                .expect_err("cid-a second exceeds its cap");
+            assert_eq!(
+                counters["cid-b"].max_calls_used, 1,
+                "cid-b must be unaffected by cid-a's exhaustion"
+            );
+        }
+
+        /// A `CounterExhausted` maps to the Authorization-class caveat-violation
+        /// code (`SCP-OUTLET-6110`) carrying the §7.3.8 slug of the kind that
+        /// fired.
+        #[test]
+        fn consume_caveat_counters_maps_exhaustion_to_authorization_slug() {
+            let mut counters: HashMap<String, CaveatCounters> = HashMap::new();
+            let caveats = max_calls_caveats(1);
+            super::super::consume_caveat_counters(&mut counters, "cid", &caveats, Amount::new(0), 1)
+                .expect("first admits");
+            let err = super::super::consume_caveat_counters(
+                &mut counters,
+                "cid",
+                &caveats,
+                Amount::new(0),
+                1,
+            )
+            .expect_err("second exceeds cap");
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("SCP-OUTLET-6110") && msg.contains("maxCalls"),
+                "exhaustion must map to the Authorization code + kind slug: {msg}"
+            );
+        }
+
+        // -------------------------------------------------------------------
+        // Token-source correctness (resolver)
+        // -------------------------------------------------------------------
+
+        fn ucan_with_nb(nb: Option<InvocationCaveats>) -> UcanToken {
+            UcanToken {
+                header: UcanHeader::new(),
+                payload: UcanPayload {
+                    iss: INVOKER.to_owned(),
+                    aud: "did:dht:z6MkCaveatCtx".to_owned(),
+                    exp: 9_999_999_999,
+                    nbf: None,
+                    nnc: "0-00000000000000000000000000000000".to_owned(),
+                    att: vec![],
+                    prf: vec![],
+                    fct: None,
+                    nb,
+                },
+                signature: vec![],
+                encoded: "header.payload.sig".to_owned(),
+            }
+        }
+
+        /// THE token-source KAT. The value-caveats live in the INVOCATION UCAN's
+        /// `nb`; a spending UCAN (§19.5 economy token) carries `nb: None`. The
+        /// resolver the bridges use reads exactly the `nb` field, so the
+        /// invocation token IS the caveat source and a spending token yields
+        /// NONE — the precise reason the prior `spending_ucan`-sourced
+        /// resolution left §7.3.8 caveats entirely inert.
+        #[test]
+        fn caveats_sourced_from_invocation_nb_never_from_spending_ucan() {
+            let caveats = max_calls_caveats(2);
+            let invocation = ucan_with_nb(Some(caveats.clone()));
+            let spending = ucan_with_nb(None);
+            assert_eq!(
+                TokenNbCaveatResolver.resolve_caveats(&invocation),
+                Some(caveats),
+                "the invocation UCAN's nb must resolve to its caveats"
+            );
+            assert_eq!(
+                TokenNbCaveatResolver.resolve_caveats(&spending),
+                None,
+                "a spending UCAN (nb None) must resolve to NO caveats — never a source"
+            );
+        }
+
+        // -------------------------------------------------------------------
+        // Class-S snapshot round-trip
+        // -------------------------------------------------------------------
+
+        /// Consumed counters survive a Class-S snapshot → clear → restore cycle
+        /// (the on-disk `ContextSnapshot` mirror rehydrates them after a crash).
+        #[test]
+        fn caveat_counters_survive_class_s_snapshot_round_trip() {
+            let mut state = active_state();
+            state.class_s.caveat_counters.insert(
+                "cid-snap".to_owned(),
+                CaveatCounters {
+                    max_calls_used: 3,
+                    amount_cumulative_used: 42,
+                    rate_window_timestamps: vec![1, 2, 3],
+                },
+            );
+            let snap = state.class_s.snapshot();
+            state.class_s.caveat_counters.clear();
+            assert!(state.class_s.caveat_counters.is_empty());
+            state.class_s.restore(snap);
+            let rec = &state.class_s.caveat_counters["cid-snap"];
+            assert_eq!(rec.max_calls_used, 3);
+            assert_eq!(rec.amount_cumulative_used, 42);
+            assert_eq!(rec.rate_window_timestamps, vec![1, 2, 3]);
+        }
+
+        // -------------------------------------------------------------------
+        // End-to-end enforcement via `reserve_outlet_economy`
+        // -------------------------------------------------------------------
+
+        /// Persistence double whose `persist_context` always SUCCEEDS — the
+        /// happy path for the counter consume's fail-closed persist.
+        struct OkPersistence;
+        #[async_trait::async_trait]
+        impl crate::context::persistence::ContextPersistence for OkPersistence {
+            async fn persist_context(
+                &self,
+                _: &str,
+                _: &crate::context::state::ContextSnapshot,
+            ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+                Ok(())
+            }
+            async fn load_context(
+                &self,
+                _: &str,
+            ) -> Result<
+                Option<crate::context::state::ContextSnapshot>,
+                Box<dyn std::error::Error + Send + Sync>,
+            > {
+                Ok(None)
+            }
+            async fn delete_context(
+                &self,
+                _: &str,
+            ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+                Ok(())
+            }
+            async fn list_persisted_contexts(
+                &self,
+            ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+                Ok(Vec::new())
+            }
+        }
+
+        async fn build_deps(
+            persistence: Box<dyn crate::context::persistence::ContextPersistence>,
+        ) -> ActorDeps {
+            use crate::context::supervisor::supervisor::Supervisor;
+            use scp_platform::testing::InMemoryStorage;
+
+            let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+                INVOKER.to_owned(),
+                Arc::new(scp_clock::SystemClock),
+            ));
+            let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
+                Box::new(crate::context::builder::NotConfiguredTransportProvider);
+            let event_log: Box<dyn crate::context::builder::ContextEventLogProvider> =
+                Box::new(crate::context::providers::MerkleEventLogProvider::new());
+            let key_resolver: scp_protocol::context::governance::KeyResolver =
+                Arc::new(|_, _| None);
+            let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
+                Arc::new(
+                    crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(
+                        Arc::new(InMemoryStorage::new()),
+                    ),
+                );
+            let clock: Arc<dyn scp_clock::Clock> =
+                Arc::new(scp_clock::TestClock::new(1_700_000_000));
+            // No payment adapter: a free outlet (action_cost == 0) whose
+            // counter consume rides the dedicated free-path commit_class_s_keep.
+            let supervisor = Supervisor::with_providers(
+                crypto,
+                transport,
+                event_log,
+                key_resolver,
+                Some(persistence),
+                None,
+                None,
+                Some(clock),
+                mls_storage,
+            );
+            supervisor
+                .build_actor_deps(&DID(INVOKER.to_owned()))
+                .await
+                .expect("build_actor_deps")
+        }
+
+        fn active_state() -> PerContextState {
+            let state = PerContextState::new_for_test_encrypted(
+                [CTX_BYTE; 32],
+                1_700_000_000,
+                DID(INVOKER.to_owned()),
+            );
+            state
+                .handle
+                .transition_to(&ContextState::Active)
+                .expect("transition to Active");
+            state
+        }
+
+        /// Drive one reserve step. On success, consume the returned ticket (its
+        /// `#[must_use]` Drop balance guard would otherwise fire); the counter
+        /// consume already committed as Class-S BEFORE the ticket was built, and
+        /// the void does not touch `caveat_counters`.
+        async fn reserve_step(
+            cell: &mut ClassSCell,
+            deps: &ActorDeps,
+            caveats: Option<&InvocationCaveats>,
+            cid: Option<&str>,
+            input: &serde_json::Value,
+            now: u64,
+        ) -> Result<(), ContextError> {
+            let reservation = super::super::reserve_outlet_economy(
+                cell,
+                deps,
+                &ctx_key(),
+                &DID(INVOKER.to_owned()),
+                None,
+                caveats,
+                cid,
+                input,
+                now,
+            )
+            .await?;
+            reservation.ticket.void_external_and_consume(None).await;
+            Ok(())
+        }
+
+        /// `max_calls` (counter bound): the first invocation admits and consumes
+        /// the single slot; the second is rejected as `maxCalls`. Sourced from
+        /// the `effective_caveats` param — exactly what the bridge derives from
+        /// the invocation UCAN's `nb`.
+        #[tokio::test]
+        async fn reserve_free_path_enforces_max_calls() {
+            let deps = build_deps(Box::new(OkPersistence)).await;
+            let mut cell = ClassSCell::new(active_state());
+            let caveats = max_calls_caveats(1);
+            let cid = "cid-mc";
+            let input = serde_json::json!({});
+            reserve_step(&mut cell, &deps, Some(&caveats), Some(cid), &input, 1_700_000_100)
+                .await
+                .expect("first invocation within max_calls=1 must admit");
+            let err =
+                reserve_step(&mut cell, &deps, Some(&caveats), Some(cid), &input, 1_700_000_101)
+                    .await
+                    .expect_err("second invocation must exceed max_calls=1");
+            assert!(
+                format!("{err}").contains("maxCalls"),
+                "reject must name the maxCalls caveat: {err}"
+            );
+            assert_eq!(
+                cell.class_s.caveat_counters[cid].max_calls_used, 1,
+                "exactly one call consumed"
+            );
+        }
+
+        /// TOKEN-SOURCE at the reserve seam: the reserve enforces the
+        /// `effective_caveats` param and consults NO other token's `nb`. With
+        /// caveats present the cap is enforced; with `effective_caveats == None`
+        /// (the invocation UCAN carried no `nb`) NO cap exists and every call
+        /// admits, creating no counter record.
+        #[tokio::test]
+        async fn reserve_enforces_effective_caveats_param_not_spending_nb() {
+            let deps = build_deps(Box::new(OkPersistence)).await;
+            let input = serde_json::json!({});
+
+            let mut cell = ClassSCell::new(active_state());
+            let caveats = max_calls_caveats(1);
+            reserve_step(&mut cell, &deps, Some(&caveats), Some("cid-src"), &input, 1_700_000_100)
+                .await
+                .expect("admit");
+            reserve_step(&mut cell, &deps, Some(&caveats), Some("cid-src"), &input, 1_700_000_101)
+                .await
+                .expect_err("cap enforced when sourced from the invocation caveats");
+
+            let mut cell2 = ClassSCell::new(active_state());
+            for i in 0..3 {
+                reserve_step(&mut cell2, &deps, None, None, &input, 1_700_000_200 + i)
+                    .await
+                    .expect("no invocation caveats => always admit");
+            }
+            assert!(
+                cell2.class_s.caveat_counters.is_empty(),
+                "no caveats resolved => no counter record — reserve never fabricates caveats"
+            );
+        }
+
+        /// Sync-first ordering: a bad `input_schema` is rejected by the
+        /// synchronous local check BEFORE the `max_calls` counter is touched, so
+        /// the single slot survives for a subsequent conforming call.
+        #[tokio::test]
+        async fn reserve_sync_check_precedes_counter_consume() {
+            let deps = build_deps(Box::new(OkPersistence)).await;
+            let mut cell = ClassSCell::new(active_state());
+            let mut caveats = InvocationCaveats::empty();
+            caveats.max_calls = Some(1);
+            caveats.input_schema = Some(serde_json::json!({
+                "type": "object",
+                "required": ["x"],
+                "properties": {"x": {"type": "string"}}
+            }));
+            let cid = "cid-order";
+            let err = reserve_step(
+                &mut cell,
+                &deps,
+                Some(&caveats),
+                Some(cid),
+                &serde_json::json!({}),
+                1_700_000_100,
+            )
+            .await
+            .expect_err("input missing required 'x' must reject on the schema");
+            assert!(
+                format!("{err}").contains("input"),
+                "must reject on the input_schema sync check: {err}"
+            );
+            assert!(
+                !cell.class_s.caveat_counters.contains_key(cid),
+                "a sync-rejected call must NOT create or consume a counter record"
+            );
+            reserve_step(
+                &mut cell,
+                &deps,
+                Some(&caveats),
+                Some(cid),
+                &serde_json::json!({"x": "ok"}),
+                1_700_000_101,
+            )
+            .await
+            .expect("conforming input within max_calls=1 must admit — the rejected call spent nothing");
+            assert_eq!(
+                cell.class_s.caveat_counters[cid].max_calls_used, 1,
+                "the single slot was consumed only by the conforming call"
+            );
+        }
+
+        /// `rate_window` (counter bound): admits until the window cap, then
+        /// rejects as `rateWindow`.
+        #[tokio::test]
+        async fn reserve_free_path_enforces_rate_window() {
+            let deps = build_deps(Box::new(OkPersistence)).await;
+            let mut cell = ClassSCell::new(active_state());
+            let mut caveats = InvocationCaveats::empty();
+            caveats.rate_window = Some(RateWindow {
+                max: 1,
+                window_secs: 100,
+            });
+            let cid = "cid-rw";
+            let input = serde_json::json!({});
+            reserve_step(&mut cell, &deps, Some(&caveats), Some(cid), &input, 1_700_000_100)
+                .await
+                .expect("first within the rate window admits");
+            let err =
+                reserve_step(&mut cell, &deps, Some(&caveats), Some(cid), &input, 1_700_000_101)
+                    .await
+                    .expect_err("second within the same window exceeds max=1");
+            assert!(
+                format!("{err}").contains("rateWindow"),
+                "reject must name the rateWindow caveat: {err}"
+            );
+        }
+
+        /// `allowed_target_dids` (sync bound): single-shot same-context passes
+        /// `target_did = None`, so a populated allow-list is unsatisfiable and
+        /// fail-closed rejects — touching no counter.
+        #[tokio::test]
+        async fn reserve_sync_rejects_disallowed_target_did() {
+            let deps = build_deps(Box::new(OkPersistence)).await;
+            let mut cell = ClassSCell::new(active_state());
+            let mut caveats = InvocationCaveats::empty();
+            caveats.allowed_target_dids = Some(vec![DID::from("did:dht:z6MkOtherTarget")]);
+            let err = reserve_step(
+                &mut cell,
+                &deps,
+                Some(&caveats),
+                Some("cid-target"),
+                &serde_json::json!({}),
+                1_700_000_100,
+            )
+            .await
+            .expect_err("populated allowed_target_dids must reject a same-context call");
+            assert!(
+                format!("{err}").contains("SCP-OUTLET-6110"),
+                "target-DID reject must surface a caveat violation: {err}"
+            );
+            assert!(
+                cell.class_s.caveat_counters.is_empty(),
+                "a sync reject touches no counter"
+            );
+        }
+
+        /// `allowed_adapters` (sync bound): the free path negotiates no payment
+        /// adapter, so a populated adapter allow-list is unsatisfiable and
+        /// fail-closed rejects.
+        #[tokio::test]
+        async fn reserve_sync_rejects_disallowed_adapter() {
+            let deps = build_deps(Box::new(OkPersistence)).await;
+            let mut cell = ClassSCell::new(active_state());
+            let mut caveats = InvocationCaveats::empty();
+            caveats.allowed_adapters = Some(vec!["x402".to_owned()]);
+            let err = reserve_step(
+                &mut cell,
+                &deps,
+                Some(&caveats),
+                Some("cid-adapter"),
+                &serde_json::json!({}),
+                1_700_000_100,
+            )
+            .await
+            .expect_err("populated allowed_adapters must reject when no adapter is negotiated");
+            assert!(
+                format!("{err}").contains("SCP-OUTLET-6110"),
+                "adapter reject must surface a caveat violation: {err}"
+            );
+        }
+
+        /// No-rollback: the free-path counter consume rides a fail-closed
+        /// `commit_class_s_keep`. A persist FAILURE surfaces an error to the
+        /// caller, but the consumed cap is KEPT in memory (a consumed cap must
+        /// never un-consume — ADR-049 §9). No ticket is built on this path, so
+        /// there is no Drop-guard obligation.
+        #[tokio::test]
+        async fn reserve_counter_consume_is_kept_on_persist_failure() {
+            let deps = build_deps(Box::new(super::FailOutletPersistence)).await;
+            let mut cell = ClassSCell::new(active_state());
+            let caveats = max_calls_caveats(1);
+            let cid = "cid-keep";
+            let err = reserve_step(
+                &mut cell,
+                &deps,
+                Some(&caveats),
+                Some(cid),
+                &serde_json::json!({}),
+                1_700_000_100,
+            )
+            .await
+            .expect_err("a persist failure must surface fail-closed");
+            assert!(
+                format!("{err}").to_lowercase().contains("persist"),
+                "expected a fail-closed persistence error: {err}"
+            );
+            assert_eq!(
+                cell.class_s.caveat_counters[cid].max_calls_used, 1,
+                "the consumed cap must be KEPT across the persist failure (no un-consume)"
+            );
+        }
+    }
 }
