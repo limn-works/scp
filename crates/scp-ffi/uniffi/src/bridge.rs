@@ -12941,6 +12941,37 @@ impl Scp {
                         code: codes::ECON_12061.to_owned(),
                     })?;
 
+                // §7.3.8 value-caveat resolution. The invocation caveats live
+                // in the `nb` of the VALIDATED INVOCATION UCAN (`ucan_token`,
+                // the token granting the `outlet_call:*` / `outlet_query:*`
+                // capability) — NOT the spending UCAN, which is a SEPARATE
+                // economy token (§19.5). `narrow()` folds every parent's
+                // value-caveats into the leaf, so the leaf's `nb` IS the
+                // effective, validated-narrowed caveat set. Parsed from the
+                // same token string `validate_outlet_ucan_uniffi` validated
+                // above; `ucan_cid` (present iff caveats are) keys the owned
+                // Class-S counters to this invocation delegation's revocation
+                // CID.
+                let invocation_ucan_token =
+                    scp_core::crypto::ucan::validate::parse_ucan(&ucan_token).map_err(|e| {
+                        ScpError::Permission {
+                            msg: format!(
+                                "invalid invocation UCAN for outlet '{outlet_id}': {e}"
+                            ),
+                            code: codes::PERM_3001.to_owned(),
+                        }
+                    })?;
+                let effective_caveats = {
+                    use scp_core::crypto::ucan::validate::CaveatResolver as _;
+                    scp_core::crypto::ucan::validate::TokenNbCaveatResolver
+                        .resolve_caveats(&invocation_ucan_token)
+                };
+                let invocation_ucan_cid = effective_caveats.as_ref().map(|_| {
+                    scp_core::crypto::ucan::revoke::compute_revocation_cid(
+                        &invocation_ucan_token.encoded,
+                    )
+                });
+
                 // Snapshot the bridge-owned outlet registry and (optionally) the
                 // registered handler closure BEFORE entering the runtime call.
                 // The runtime requires a `&OutletRegistry` so we clone the
@@ -13010,6 +13041,8 @@ impl Scp {
                         input_value,
                         &invoker_did_typed,
                         spending_ucan_token.as_ref(),
+                        effective_caveats,
+                        invocation_ucan_cid,
                         None,
                         executor,
                     )

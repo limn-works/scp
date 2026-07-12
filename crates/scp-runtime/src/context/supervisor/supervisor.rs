@@ -10434,6 +10434,8 @@ impl Supervisor {
         input: serde_json::Value,
         invoker_did: &DID,
         spending_ucan: Option<&scp_protocol::crypto::ucan::UcanToken>,
+        effective_caveats: Option<scp_protocol::trust::caveats::InvocationCaveats>,
+        ucan_cid: Option<String>,
         timeout_ms: Option<u32>,
         executor: F,
     ) -> Result<crate::context::outlets_helpers::ManagedOutletInvocationOutput, ContextError>
@@ -10450,22 +10452,21 @@ impl Supervisor {
             })?
             .now_secs();
 
-        // §7.3.8 value-caveat resolution — RUNTIME-SIDE, at the supervisor edge.
-        // The invocation-authorizing token in the single-shot same-context path
-        // is the presented `spending_ucan`; its signed `nb` field carries the
-        // VALIDATED-NARROWED effective caveats (a delegation inherits its
-        // parents' value-caveats through `narrow()`). Resolving here — via
-        // `TokenNbCaveatResolver`, from the token the runtime already holds —
-        // rather than accepting a caveat set from the FFI means no bridge can
-        // present a wider caveat set than the token it signs (there is no FFI
-        // signature to widen). The counter key is the token's revocation CID.
-        let (effective_caveats, ucan_cid) = spending_ucan.map_or((None, None), |token| {
-            use scp_protocol::crypto::ucan::validate::CaveatResolver as _;
-            let caveats = scp_protocol::crypto::ucan::validate::TokenNbCaveatResolver
-                .resolve_caveats(token);
-            let cid = scp_protocol::crypto::ucan::revoke::compute_revocation_cid(&token.encoded);
-            (caveats, Some(cid))
-        });
+        // §7.3.8 value-caveat enforcement. `effective_caveats` / `ucan_cid` are
+        // resolved by the CALLER (the FFI bridge) from the VALIDATED INVOCATION
+        // UCAN — the token that grants the `outlet_call:*` / `outlet_query:*`
+        // capability — whose signed `nb` field carries the VALIDATED-NARROWED
+        // effective caveats (a delegation inherits its parents' value-caveats
+        // through `narrow()`, so the leaf `nb` IS the effective narrowed set).
+        // The bridge captures them at the `validate_outlet_invocation_ucan`
+        // site, where it has already parsed and validated that token against
+        // the proof chain. They are NOT re-derived from `spending_ucan` — that
+        // is a SEPARATE economy token (§19.5) whose `nb` does NOT carry
+        // invocation caveats — and `ucan_cid` keys the owned Class-S counters
+        // to the invocation delegation's revocation CID. When the invocation
+        // UCAN carried no caveats (or a surface authorizes purely via
+        // role-state) both are `None` and the counter gate stays inert.
+        //
         // The reserve phase needs the input to check it against the caveat's
         // `input_schema`; the executor phase (below) consumes the original, so
         // clone once for the reserve mailbox round-trip.
