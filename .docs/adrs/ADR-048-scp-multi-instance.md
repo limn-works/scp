@@ -116,7 +116,7 @@ Covered spawn sites (all three bridges):
 - `FfiBridgeProvider.bi` / `McpUniFfiBridgeProvider.bi` — MCP server providers — `Weak<BridgeInstance>` field; every `ContextProvider` trait method `upgrade()`s and returns safe defaults when the upgrade fails.
 - `py_mcp_serve` / `mcp_server_create` — stdio/SSE server loops capture `sse_bi: Weak<BridgeInstance>`, select on `cancel_token.cancelled()` alongside `read_line().await`.
 
-Short-lived tasks (single-await-then-return) are allowed to hold an `Arc` for the duration of their work; they cannot delay Drop by more than one event. Tool-invocation paths are bounded by `FFI_TOOL_TIMEOUT_MS` (30 s) at the sync `recv_timeout` barrier, so a misbehaving tool handler delays Drop by at most one invocation's timeout.
+Short-lived tasks (single-await-then-return) are allowed to hold an `Arc` for the duration of their work; they cannot delay Drop by more than one event. Outlet-invocation paths are bounded by `FFI_OUTLET_TIMEOUT_MS` (30 s) at the sync `recv_timeout` barrier, so a misbehaving outlet handler delays Drop by at most one invocation's timeout.
 
 Regression tests at `crates/scp-ffi/src/transport.rs::tests`, `crates/scp-ffi/src/mcp.rs::tests`, and `crates/scp-ffi/uniffi/src/bridge.rs::tests` assert (a) `Arc::strong_count(&bi) == 1` while the task is parked, and (b) `weak.upgrade().is_none()` once the caller-held `Arc` drops — proving `impl Drop for BridgeInstance` runs and `emergency_cancel_tasks` propagates.
 
