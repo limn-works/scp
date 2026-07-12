@@ -1165,7 +1165,7 @@ private func makeMessageStream(handle: ContextHandle) -> AsyncStream<Message> {
 8. **Outlet operations:**
 
    ```swift
-   let outletId = try await context.registerTool(OutletDefinition(
+   let outletId = try await context.registerOutlet(OutletDefinition(
        name: "summarize",
        description: "Summarize text",
        inputSchema: #"{"type":"object","properties":{"text":{"type":"string"}}}"#,
@@ -1238,7 +1238,7 @@ private func makeMessageStream(handle: ContextHandle) -> AsyncStream<Message> {
 | `Package.swift` | SPM package definition — binary XCFramework target + SCP source target + test target |
 | `Sources/SCP/SCP.swift` | `SCP` actor — top-level entry point, `create()` factory, `createContext()`, `joinContext()` |
 | `Sources/SCP/Identity.swift` | `SCPIdentity` actor — DID, `load()`, `resolve()`, `rotateKey()` |
-| `Sources/SCP/Context.swift` | `SCPContext` actor — `send()`, `messages` stream, `invoke()`, `registerTool()`, `leave()`, `close()`, `deinit` |
+| `Sources/SCP/Context.swift` | `SCPContext` actor — `send()`, `messages` stream, `invoke()`, `registerOutlet()`, `leave()`, `close()`, `deinit` |
 | `Sources/SCP/Outlets.swift` | `OutletDefinition`, `TestVector`, `OutletVerificationResult` nonisolated structs |
 | `Sources/SCP/Trust.swift` | `evaluateTrust()`, `TrustEvaluation` struct |
 | `Sources/SCP/EventLog.swift` | `SCPEventLog` (nonisolated class), `Event`, `Proof`, `Checkpoint` structs |
