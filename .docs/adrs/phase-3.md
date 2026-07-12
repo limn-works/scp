@@ -2,7 +2,7 @@
 
 **Date:** February 22, 2026
 **Phase goal:** `pip install scp-python` works. Python agents use SCP. MCP bridge connects any MCP-compatible model to SCP contexts.
-**Deliverable:** Python SDK on PyPI, MCP adapter, UCAN validation in SDK. Two Python agents on different machines exchange encrypted messages, invoke tools, and expose SCP contexts as MCP tools.
+**Deliverable:** Python SDK on PyPI, MCP adapter, UCAN validation in SDK. Two Python agents on different machines exchange encrypted messages, invoke outlets, and expose SCP contexts as MCP tools.
 **Timeline:** Weeks 9-12
 **Dependencies between ADRs:**
 
@@ -64,7 +64,7 @@ Implement the FFI bridge in `crates/scp-ffi/src/` using PyO3 and maturin. The br
 ### Dependencies
 
 - **All Phase 1 ADRs (ADR-001 through ADR-007):** The bridge exposes MLS operations, envelope creation, DID identity, transport, sender keys, and platform adapters to Python.
-- **All Phase 2 ADRs (ADR-008 through ADR-012):** The bridge exposes context lifecycle, role/UCAN enforcement, tool registration/invocation, event log queries, and multi-transport routing to Python.
+- **All Phase 2 ADRs (ADR-008 through ADR-012):** The bridge exposes context lifecycle, role/UCAN enforcement, outlet registration/invocation, event log queries, and multi-transport routing to Python.
 
 ### Acceptance Criteria
 
@@ -174,7 +174,7 @@ Implement the FFI bridge in `crates/scp-ffi/src/` using PyO3 and maturin. The br
 | `crates/scp-ffi/src/lib.rs` | PyO3 module definition, `#[pymodule]` entry point, tokio runtime initialization |
 | `crates/scp-ffi/src/identity.rs` | `PyIdentity`, `PyDIDDocument` classes, identity bridge functions |
 | `crates/scp-ffi/src/context.rs` | `PyContextHandle`, `PyContextParams` classes, context bridge functions |
-| `crates/scp-ffi/src/tools.rs` | Tool bridge functions, `PyOutletRegistration`, `PyOutletVerificationResult` |
+| `crates/scp-ffi/src/outlets.rs` | Outlet bridge functions, `PyOutletRegistration`, `PyOutletVerificationResult` |
 | `crates/scp-ffi/src/transport.rs` | Transport bridge functions, `PyTransportStatus` |
 | `crates/scp-ffi/src/ucan.rs` | UCAN bridge functions, `PyUcanToken` |
 | `crates/scp-ffi/src/event_log.rs` | Event log bridge functions, `PyEvent`, `PyProof` |
@@ -205,7 +205,7 @@ Implement the Python SDK as the `scp_sdk` package in `bindings/python/scp_sdk/`.
 - **Pure Python wrappers, not logic reimplementation:** The wrapper layer contains zero protocol logic. It delegates everything to `_scp_core`. This means there is one implementation of every operation (Rust), wrapped in Pythonic ergonomics (Python). No divergence, no duplication, no consistency bugs between languages.
 - **Context managers for resource lifecycle:** SCP contexts, identities, and transport connections hold resources (MLS group state, WebSocket connections, key material). Python's `async with` pattern ensures cleanup on scope exit, even on exceptions. This prevents resource leaks in long-running agent processes.
 - **Type hints for the agent ecosystem:** Agent frameworks (LangChain, CrewAI) and modern Python tooling (mypy, pyright, VS Code) rely on type hints for autocompletion, documentation, and static analysis. Full PEP 484 annotations make the SDK immediately accessible to these tools and workflows.
-- **Dataclass-based configuration:** Python dataclasses provide clean, typed configuration objects (ContextParams, ToolDefinition, etc.) with defaults, validation, and serialization. They are more Pythonic than raw dicts and more lightweight than Pydantic for this use case.
+- **Dataclass-based configuration:** Python dataclasses provide clean, typed configuration objects (ContextParams, OutletDefinition, etc.) with defaults, validation, and serialization. They are more Pythonic than raw dicts and more lightweight than Pydantic for this use case.
 
 ### Implementation
 
@@ -269,7 +269,7 @@ Implement the Python SDK as the `scp_sdk` package in `bindings/python/scp_sdk/`.
            cls,
            creator: Identity,
            ceiling: list[str],
-           tools: list[ToolDefinition] | None = None,
+           outlets: list[OutletDefinition] | None = None,
            roles: dict[str, list[str]] | None = None,
            ttl: float | None = None,
            memory_scope: str = "full",
@@ -298,8 +298,8 @@ Implement the Python SDK as the `scp_sdk` package in `bindings/python/scp_sdk/`.
            """Async iterator of incoming messages."""
            ...
 
-       async def invoke(self, tool: str, input: dict, identity: Identity | None = None) -> dict:
-           """Invoke a tool in this context."""
+       async def invoke(self, outlet: str, input: dict, identity: Identity | None = None) -> dict:
+           """Invoke a outlet in this context."""
            ...
 
        async def __aenter__(self) -> "Context":
@@ -337,11 +337,11 @@ Implement the Python SDK as the `scp_sdk` package in `bindings/python/scp_sdk/`.
    `continuation.yield`/`finish`), and Kotlin (ADR-027: `callbackFlow`/`awaitClose`) receive
    specifications.
 
-3. **`ToolDefinition` dataclass:**
+3. **`OutletDefinition` dataclass:**
 
    ```python
    @dataclass
-   class ToolDefinition:
+   class OutletDefinition:
        name: str
        description: str
        input_schema: dict       # JSON Schema
@@ -390,7 +390,7 @@ Implement the Python SDK as the `scp_sdk` package in `bindings/python/scp_sdk/`.
        """Network or relay communication failure."""
 
    class OutletError(ScpError):
-       """Tool registration, invocation, or verification failure."""
+       """Outlet registration, invocation, or verification failure."""
 
    class ValidationError(ScpError):
        """Input validation failure (schema, parameters)."""
@@ -444,7 +444,7 @@ Implement the Python SDK as the `scp_sdk` package in `bindings/python/scp_sdk/`.
    # scp_sdk/__init__.py
    from scp_sdk.identity import Identity
    from scp_sdk.context import Context
-   from scp_sdk.tools import ToolDefinition, TestVector
+   from scp_sdk.outlets import OutletDefinition, TestVector
    from scp_sdk.trust import evaluate_trust
    from scp_sdk.errors import ScpError, IdentityError, ContextError, ...
 
@@ -488,7 +488,7 @@ Implement the Python SDK as the `scp_sdk` package in `bindings/python/scp_sdk/`.
 | `scp_sdk/__init__.py` | Package root, re-exports, version, top-level convenience |
 | `scp_sdk/identity.py` | `Identity` class, `DIDDocument`, identity operations |
 | `scp_sdk/context.py` | `Context` class, `Membership`, async context manager, message streaming |
-| `scp_sdk/tools.py` | `ToolDefinition`, `TestVector`, `ToolVerification` dataclasses |
+| `scp_sdk/outlets.py` | `OutletDefinition`, `TestVector`, `OutletVerification` dataclasses |
 | `scp_sdk/trust.py` | `evaluate_trust()`, `TrustEvaluation` dataclass |
 | `scp_sdk/event_log.py` | `EventLog` class, `Event`, `Proof`, `Checkpoint` dataclasses |
 | `scp_sdk/errors.py` | Exception hierarchy, error code constants |
@@ -510,16 +510,16 @@ Implement the Python SDK as the `scp_sdk` package in `bindings/python/scp_sdk/`.
 
 MCP (Model Context Protocol) defines how AI models connect to tools and data sources locally via JSON-RPC (spec section 8.5). The SCP agent acts as an MCP server from the model's perspective and an SCP protocol participant from the network's perspective. Any MCP-compatible model (Claude, GPT, Gemini, open-source models) can participate in SCP contexts without knowing SCP exists — it sees MCP tools namespaced by context, calls them, and gets results. The MCP adapter is the translation layer that makes this work (architecture.md section 1.3).
 
-The adapter must map SCP tool interfaces to MCP tool definitions, filter tools by the agent's role and UCAN capabilities (so models never see tools they cannot access), handle MCP protocol mechanics (JSON-RPC over stdio or SSE), and route tool invocations through the SCP protocol engine with full authentication, encryption, and provenance.
+The adapter must map SCP outlet interfaces to MCP tool definitions, filter outlets by the agent's role and UCAN capabilities (so models never see outlets they cannot access), handle MCP protocol mechanics (JSON-RPC over stdio or SSE), and route outlet invocations through the SCP protocol engine with full authentication, encryption, and provenance.
 
 ### Decision
 
-Implement the MCP adapter as the `scp-mcp` crate (Rust) with a Python interface via the PyO3 bridge (ADR-013) and Python wrappers (ADR-014). The adapter implements both MCP server mode (SCP agent exposes tools to a local model) and MCP client mode (SCP agent consumes external MCP tools and wraps them with SCP provenance). The primary interface for Python users is `scp_sdk.mcp.serve_mcp()`, which starts an MCP server that dynamically exposes tools from the agent's active SCP contexts.
+Implement the MCP adapter as the `scp-mcp` crate (Rust) with a Python interface via the PyO3 bridge (ADR-013) and Python wrappers (ADR-014). The adapter implements both MCP server mode (SCP agent exposes outlets to a local model) and MCP client mode (SCP agent consumes external MCP tools and wraps them with SCP provenance). The primary interface for Python users is `scp_sdk.mcp.serve_mcp()`, which starts an MCP server that dynamically exposes outlets from the agent's active SCP contexts.
 
 ### Rationale
 
-- **MCP server as the model-facing surface:** The model calls MCP tools. The adapter translates each tool call into an SCP context operation (message send, tool invocation, event log query). The model never handles DIDs, UCANs, encryption, or transport. This separation is critical — it means every existing MCP-compatible model works with SCP with zero integration effort (spec section 8.5).
-- **Capability filtering at the adapter:** MCP has no access control concept — all configured tools are available. SCP tools are capability-gated by role. The adapter resolves this by querying the agent's UCAN capabilities and exposing only permitted tools to the model. Tools the agent lacks capability for are invisible to the model (spec section 8.5, "capability filtering happens at the agent").
+- **MCP server as the model-facing surface:** The model calls MCP tools. The adapter translates each tool call into an SCP context operation (message send, outlet invocation, event log query). The model never handles DIDs, UCANs, encryption, or transport. This separation is critical — it means every existing MCP-compatible model works with SCP with zero integration effort (spec section 8.5).
+- **Capability filtering at the adapter:** MCP has no access control concept — all configured tools are available. SCP outlets are capability-gated by role. The adapter resolves this by querying the agent's UCAN capabilities and exposing only permitted outlets to the model. Outlets the agent lacks capability for are invisible to the model (spec section 8.5, "capability filtering happens at the agent").
 - **Context-namespaced tools:** Tools are namespaced by context: `context_a/send_message`, `context_a/guide_assistant`, `context_b/schedule_meeting`. This gives the model a flat tool surface that implicitly encodes context scoping. The adapter parses the namespace prefix, routes to the correct context, and handles the SCP protocol mechanics.
 - **Dual transport: stdio and SSE:** MCP supports two transport modes. stdio (standard input/output) is the default for local integrations (Claude Code, Cursor). SSE (Server-Sent Events over HTTP) supports remote and web-based integrations. The adapter supports both.
 - **MCP client mode:** An SCP agent can also consume tools from external MCP servers (non-SCP tools). When it does, the adapter wraps the tool call with SCP provenance metadata: "this result came from external MCP tool X, invoked by agent Y in context Z." This maintains SCP's provenance-everywhere principle (spec section 1, principle 3) even for external tool calls.
@@ -536,9 +536,9 @@ Implement the MCP adapter as the `scp-mcp` crate (Rust) with a Python interface 
 ### Dependencies
 
 - **ADR-013 (PyO3 Bridge):** The MCP adapter is exposed to Python through the bridge layer.
-- **ADR-014 (Python SDK Wrappers):** The `scp_sdk.mcp` module uses SDK wrapper types (Identity, Context, ToolDefinition).
-- **ADR-010 (Tools):** Tool registration and invocation flow through the context tool registry.
-- **ADR-009 (Roles/UCAN):** Capability filtering requires UCAN validation to determine which tools the agent can access.
+- **ADR-014 (Python SDK Wrappers):** The `scp_sdk.mcp` module uses SDK wrapper types (Identity, Context, OutletDefinition).
+- **ADR-010 (Outlets):** Outlet registration and invocation flow through the context outlet registry.
+- **ADR-009 (Roles/UCAN):** Capability filtering requires UCAN validation to determine which outlets the agent can access.
 
 ### Acceptance Criteria
 
@@ -558,7 +558,7 @@ Implement the MCP adapter as the `scp-mcp` crate (Rust) with a Python interface 
    - `tools/list` JSON-RPC method returns all tools the agent can access across all active contexts.
    - Tools are namespaced: `{ "name": "context_a/guide_assistant", "inputSchema": {...} }`.
    - Built-in tools per context: `{context}/send_message`, `{context}/read_messages`, `{context}/list_members`.
-   - Context-registered tools: `{context}/{tool_name}` for each tool in the context's tool registry.
+   - Context-registered outlets: `{context}/{tool_name}` for each outlet in the context's outlet registry.
    - Capability filtering: only tools the agent's role permits are listed. An agent with `member` role does not see admin-only tools.
 
 2. **MCP server — tool invocation:**
@@ -577,12 +577,12 @@ Implement the MCP adapter as the `scp-mcp` crate (Rust) with a Python interface 
    ```
 
    - The adapter parses the context namespace prefix.
-   - Validates the agent's UCAN capability for the target tool in the target context.
-   - Routes the invocation through the SCP context's tool invocation path (ADR-010).
-   - Input is validated against the tool's input schema.
-   - Output is validated against the tool's output schema.
+   - Validates the agent's UCAN capability for the target outlet in the target context.
+   - Routes the invocation through the SCP context's outlet invocation path (ADR-010).
+   - Input is validated against the outlet's input schema.
+   - Output is validated against the outlet's output schema.
    - Provenance is attached to the result.
-   - The JSON-RPC response contains the tool output as content.
+   - The JSON-RPC response contains the outlet output as content.
    - Errors are returned as JSON-RPC error responses with descriptive messages.
 
 3. **MCP server — resource listing (context events):**
@@ -669,7 +669,7 @@ Implement the MCP adapter as the `scp-mcp` crate (Rust) with a Python interface 
 
 ### Context
 
-UCAN (User Controlled Authorization Networks) tokens are the capability enforcement mechanism for SCP (spec section 7.2). Every protocol action — message send, tool invocation, member management, role change — requires a valid UCAN token. Tokens are bearer tokens with cryptographic delegation chains, mandatory nonces for replay prevention (spec section 9.5), and independent revocability. The UCAN validation module in the SDK is the enforcement point: it verifies signature chains, capability scoping, nonce uniqueness, revocation status, expiry, and ceiling compliance on every action.
+UCAN (User Controlled Authorization Networks) tokens are the capability enforcement mechanism for SCP (spec section 7.2). Every protocol action — message send, outlet invocation, member management, role change — requires a valid UCAN token. Tokens are bearer tokens with cryptographic delegation chains, mandatory nonces for replay prevention (spec section 9.5), and independent revocability. The UCAN validation module in the SDK is the enforcement point: it verifies signature chains, capability scoping, nonce uniqueness, revocation status, expiry, and ceiling compliance on every action.
 
 Phase 2 (ADR-009) defined the role assignment and capability ceiling enforcement architecture. This ADR specifies the SDK-level UCAN validation implementation that Python (and other language) SDK users interact with — the validation logic exposed through the PyO3 bridge and used by the MCP adapter for capability filtering.
 
@@ -679,7 +679,7 @@ Implement comprehensive UCAN validation in `scp-core/crypto/ucan/` (Rust, buildi
 
 ### Rationale
 
-- **Two-tier validation design (spec section 7.2):** The implementation uses a two-tier capability validation model. **Tier 1** (full 11-step UCAN chain validation) runs at token presentation boundaries: role assignment, cross-context tool invocation, and broadcast admission. **Tier 2** (capability cache check via `ContextRoleState::member_has_capability`) runs at intra-context operation time — every `send()`, `invoke_tool()`, governance action, etc. checks the derived capability cache. The cache is populated exclusively from Tier 1-validated tokens and updated atomically on role change. This preserves the security invariant (every cached capability traces to a validated UCAN chain) while providing O(1) capability lookup on the hot path. Revocation takes effect at the next Tier 1 boundary or role reassignment. **Cache risk:** cross-context revocation (not currently implemented) would bypass the local cache — a cache invalidation mechanism would be needed if this is added.
+- **Two-tier validation design (spec section 7.2):** The implementation uses a two-tier capability validation model. **Tier 1** (full 11-step UCAN chain validation) runs at token presentation boundaries: role assignment, cross-context outlet invocation, and broadcast admission. **Tier 2** (capability cache check via `ContextRoleState::member_has_capability`) runs at intra-context operation time — every `send()`, `invoke_outlet()`, governance action, etc. checks the derived capability cache. The cache is populated exclusively from Tier 1-validated tokens and updated atomically on role change. This preserves the security invariant (every cached capability traces to a validated UCAN chain) while providing O(1) capability lookup on the hot path. Revocation takes effect at the next Tier 1 boundary or role reassignment. **Cache risk:** cross-context revocation (not currently implemented) would bypass the local cache — a cache invalidation mechanism would be needed if this is added.
 - **Attenuation chain verification:** UCAN tokens support delegation — Alice delegates to Bob, who delegates to Carol. Each delegation can attenuate (narrow) capabilities. The validation module must verify the complete chain: every signature valid (using the `kid` at each link to resolve the correct verification method, ADR-039), every delegation narrower than or equal to its parent, root issuer is the context creator. Attenuation violations (a delegatee claiming broader capabilities than delegated) must be rejected.
 - **Nonce uniqueness for replay prevention (spec section 9.5):** Every UCAN token includes a mandatory `nnc` (nonce) field. The SDK tracks seen nonces per context and rejects duplicates. Without nonce tracking, a captured UCAN could be replayed to authorize actions the human never intended. Nonces are pruned after 24 hours to bound storage.
 - **Ceiling integration:** UCAN capabilities are bounded by the context's immutable capability ceiling (spec section 5.3). A valid UCAN chain that grants a capability outside the ceiling is rejected. Ceiling checking is a constant-time set membership test, performed as part of every validation.
@@ -911,11 +911,11 @@ The ultimate acceptance criterion for Phase 3 exercises all 4 ADRs together with
    alice = await scp.Identity.create(custody="in_memory")
    Calls through: Python wrapper (ADR-014) → PyO3 bridge (ADR-013) → scp-core Identity::create
 
-3. Alice creates a context with tools:
+3. Alice creates a context with outlets:
    ctx = await scp.Context.create(
        creator=alice,
        ceiling=["messaging", "outlet_call"],
-       tools=[scp.OutletDefinition(name="calculator", ...)],
+       outlets=[scp.OutletDefinition(name="calculator", ...)],
    )
    Context creation mints admin UCAN tokens for Alice (ADR-016).
    UCAN nonce is generated and tracked. Capability ceiling is set and immutable.
@@ -938,7 +938,7 @@ The ultimate acceptance criterion for Phase 3 exercises all 4 ADRs together with
        print(msg.content)  # "Hello from Python"
    Async iterator bridges tokio stream → Python asyncio via PyO3 native async (ADR-013).
 
-7. Bob invokes the calculator tool:
+7. Bob invokes the calculator outlet:
    result = await ctx.invoke("calculator", {"operation": "add", "a": 1, "b": 2})
    assert result == {"result": 3}
    UCAN validates Bob has outlet_call capability (ADR-016).
@@ -966,11 +966,11 @@ The ultimate acceptance criterion for Phase 3 exercises all 4 ADRs together with
     tools/call("ctx_123/calculator", {"operation": "multiply", "a": 3, "b": 7})
     → {"result": 21}
     The MCP adapter (ADR-015) parses the context namespace, validates UCAN,
-    routes through scp-core tool invocation, returns the result via JSON-RPC.
+    routes through scp-core outlet invocation, returns the result via JSON-RPC.
     The model never saw a DID, UCAN token, MLS group, or relay.
 
 11. Verify event log from Python:
-    events = await ctx.event_log.query(event_type="tool_invoked")
+    events = await ctx.event_log.query(event_type="outlet_invoked")
     proof = await ctx.event_log.verify({"event_exists": events[0].id})
     assert proof.valid
     Merkle proof verification runs in Rust, result returned to Python (ADR-013).
@@ -986,7 +986,7 @@ The ultimate acceptance criterion for Phase 3 exercises all 4 ADRs together with
     full PEP 484 hints. IDE autocompletion works.
 ```
 
-This test proves: pip install works without Rust, the 20-line agent works, async Python wraps Rust correctly, UCAN enforces on every action, MCP exposes SCP tools to any model, the event log is queryable from Python, and the full Phase 1 + Phase 2 Rust stack is accessible through a Pythonic API.
+This test proves: pip install works without Rust, the 20-line agent works, async Python wraps Rust correctly, UCAN enforces on every action, MCP exposes SCP outlets to any model, the event log is queryable from Python, and the full Phase 1 + Phase 2 Rust stack is accessible through a Pythonic API.
 
 ---
 
@@ -1016,7 +1016,7 @@ No existing standard combines UCAN delegation chains with payment semantics. L40
 
 5. **Authorize-then-capture and invoice-then-preimage** as canonical flow patterns: two models that cover x402/Stripe (auth-capture) and Lightning/L402 (invoice-preimage). Both map onto the `PaymentAdapter` trait.
 
-6. **Three independent economic levels**: relay (transport), context (participation), tool (per-invocation). Each with its own payee, pricing, and adapter configuration. Free is default at all levels.
+6. **Three independent economic levels**: relay (transport), context (participation), outlet (per-invocation). Each with its own payee, pricing, and adapter configuration. Free is default at all levels.
 
 7. **Phase 3 delivery**: All protocol components (trait, policy, UCAN type, receipts, formulas) compose Phase 1 + Phase 2 primitives. No new crypto. Community adapters (x402, Lightning, SPL, Stripe) are Phase 4+.
 
@@ -1233,7 +1233,7 @@ pub struct RefundConfirmation {
 **Negative (acknowledged trade-offs):**
 - Payment adapter adds a new trait surface for SDK implementers to understand, increasing onboarding complexity.
 - Integer-only arithmetic limits coefficient precision to 6 decimal places — sufficient for pricing but not for all financial calculations.
-- No protocol-level subscription lifecycle — subscription billing must be implemented by contexts/tools, potentially leading to inconsistent experiences.
+- No protocol-level subscription lifecycle — subscription billing must be implemented by contexts/outlets, potentially leading to inconsistent experiences.
 - `TestAdapter` is in-memory only — developers must find/implement production adapters separately (by design, but adds friction).
 - Pricing formula divergence between payer and receiver (due to metric observation timing) creates retry overhead, even with the `CostInsufficient` metric snapshot mechanism.
 
