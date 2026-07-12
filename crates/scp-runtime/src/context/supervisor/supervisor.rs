@@ -1237,6 +1237,22 @@ pub struct Supervisor {
     /// first time an actor for that context crashes. Lock-free reads via
     /// `DashMap` per ADR-049 §Decision 12.
     pub(in crate::context::supervisor) crash_windows: DashMap<String, CrashWindow>,
+    /// Test-only completion signal for the KeyPackage-actor watchdog.
+    ///
+    /// A monotonically-incrementing counter bumped by [`Self::kp_actor_watchdog`]
+    /// exactly once per crash it fully processes — AFTER the crash is recorded in
+    /// `crash_windows` AND after the respawn-or-poison decision has taken effect
+    /// (dead handle removed + fresh actor respawned, or the identity poisoned).
+    ///
+    /// This lets the KP-poison/recovery tests wait for the *event* (the watchdog
+    /// observing a crash and settling its state) rather than polling
+    /// `is_context_poisoned` against a wall-clock budget. A bounded poll can
+    /// starve under CPU load and false-timeout; awaiting this watch signal
+    /// cannot — it settles precisely when the watchdog has done its work. Gated
+    /// behind `testing` so production builds carry neither the field nor the
+    /// `send_modify` call (zero overhead, no behavior change).
+    #[cfg(feature = "testing")]
+    pub(in crate::context::supervisor) kp_watchdog_processed_tx: tokio::sync::watch::Sender<u64>,
     /// Supervisor-level divergence repair journal (spec §6.2.4 "Dual event-log
     /// recording"): the fallback witnesses recorded when a `NeedsRepair` side is
     /// UNREACHABLE and its signed [`SagaDivergenceRepairRecord`] could not be
@@ -1603,6 +1619,13 @@ impl Supervisor {
             key_package_stores: DashMap::new(),
             health_config,
             crash_windows: DashMap::new(),
+            // Test-only KP-watchdog completion signal (see field docs). The
+            // paired receiver is created on demand via `kp_watchdog_processed_tx.subscribe()`;
+            // dropping the initial one here is fine — `watch::Sender::send_modify`
+            // notifies regardless of live receivers, and `subscribe()` reads the
+            // current value.
+            #[cfg(feature = "testing")]
+            kp_watchdog_processed_tx: tokio::sync::watch::channel(0u64).0,
             saga_repair_records: DashMap::new(),
             // ADR-049 commit 12 — providers lifted from
             // ContextManager. Populated by `with_providers`.
@@ -4231,6 +4254,12 @@ impl Supervisor {
                 crash_count = count,
                 "key-package actor poisoned; exceeded respawn budget, operator intervention required"
             );
+            // Test-only: the crash is recorded and the identity is poisoned —
+            // signal completion so a waiting test observes the settled state
+            // without polling a wall-clock budget. Compiles to nothing (and the
+            // field does not exist) in production builds.
+            #[cfg(feature = "testing")]
+            self.kp_watchdog_processed_tx.send_modify(|n| *n += 1);
             return;
         }
 
@@ -4251,6 +4280,12 @@ impl Supervisor {
                 "key-package actor respawned; reconciling from durable storage"
             );
         }
+        // Test-only: the crash is recorded and the respawn attempt has
+        // completed (fresh handle inserted, or the failure logged + recorded) —
+        // signal completion. Compiles to nothing (and the field does not exist)
+        // in production builds.
+        #[cfg(feature = "testing")]
+        self.kp_watchdog_processed_tx.send_modify(|n| *n += 1);
     }
 
     /// Respawn a context's actor from its persisted snapshot (ADR-049 §10).
@@ -13506,26 +13541,31 @@ mod tests {
         )
     }
 
-    /// Poll `cond` every 5ms until it returns `true` or a generous deadline
-    /// (~8s) elapses; returns whether it settled. Replaces fixed
-    /// `sleep(20ms)×50` (~1s) poison-respawn poll loops, which are flaky on
-    /// loaded CI: a short fixed budget can expire before the watchdog task is
-    /// scheduled. The CrashWindow budget math stays deterministic; only the
-    /// WALL-CLOCK wait for the watchdog to be scheduled is widened. The tighter
-    /// 5ms interval keeps the common (fast) case responsive while the long
-    /// deadline removes the false-timeout tail.
+    /// Block until the KP-actor watchdog has FULLY processed one more crash than
+    /// `baseline` — the [`Supervisor::kp_watchdog_processed_tx`] counter value
+    /// captured *before* the panic was induced.
+    ///
+    /// The watchdog bumps the counter exactly once per crash, AFTER it has
+    /// recorded the crash in `crash_windows` and settled the respawn-or-poison
+    /// decision (see [`Supervisor::kp_actor_watchdog`]). So when this returns,
+    /// the crash is durably reflected in supervisor state — the test can assert
+    /// on `is_context_poisoned` / `crash_count` with no polling.
+    ///
+    /// This is the deterministic fix for the load-induced flake: it waits on the *event*
+    /// (`watch::Receiver::changed`), never a wall-clock budget, so it CANNOT
+    /// false-timeout when the watchdog task is scheduled late under CPU load —
+    /// the exact tail that made the previous bounded `poll_until` wait flaky. A
+    /// genuinely stuck watchdog surfaces as a harness-level hang (a real bug),
+    /// not a probabilistic assertion failure. `watch` version-tracking makes the
+    /// wait immune to lost wakeups even if the bump lands between the borrow and
+    /// the `changed()` await.
     #[cfg(feature = "testing")]
-    async fn poll_until<F: Fn() -> bool>(cond: F) -> bool {
-        // ~8s ceiling = 1600 iterations × 5ms. Far above any realistic watchdog
-        // scheduling delay, but still bounded so a genuinely stuck test fails
-        // rather than hangs.
-        for _ in 0..1600 {
-            if cond() {
-                return true;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    async fn await_kp_crash_processed(rx: &mut tokio::sync::watch::Receiver<u64>, baseline: u64) {
+        while *rx.borrow_and_update() <= baseline {
+            rx.changed()
+                .await
+                .expect("supervisor kp-watchdog completion channel stays open");
         }
-        cond()
     }
 
     /// Structural: a supervisor built through the production
@@ -14844,19 +14884,19 @@ mod tests {
     /// per-identity crash window, and the actor is respawned — a subsequent
     /// `key_package_store_for` resolves a fresh, live handle.
     ///
-    /// Runs on a 2-worker multi-thread runtime (rather than the default
-    /// current-thread `#[tokio::test]`) so the background supervisor watchdog
-    /// task has a dedicated worker and cannot be starved by the polling loop on
-    /// the same single worker. Combined with the serial `supervisor-watchdog-
-    /// poison` nextest test-group (`.config/nextest.toml`), this removes the
-    /// CPU-starvation tail that made the bounded `poll_until` wait flaky under
-    /// the fully-saturated `cargo nextest run --workspace` load.
+    /// Deterministic by construction: the test awaits the watchdog's completion
+    /// signal ([`Supervisor::kp_watchdog_processed_tx`]) rather than polling
+    /// `crash_windows` against a wall-clock budget, so it cannot false-timeout
+    /// under CPU load (the load-induced flake). The 2-worker multi-thread runtime
+    /// lets the `tokio::spawn`'d watchdog task make progress concurrently with
+    /// the test task while the latter awaits the signal.
     #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn kp_actor_watchdog_records_panic_and_respawns() {
         let supervisor = supervisor_with_providers();
         let did = DID("did:dht:z6MkKpWatchdog".to_owned());
         let poison_key = format!("kp::{}", did.0);
+        let mut watchdog = supervisor.kp_watchdog_processed_tx.subscribe();
 
         let handle = supervisor
             .key_package_store_for(&did)
@@ -14864,24 +14904,25 @@ mod tests {
             .expect("kp store resolves");
 
         // Induce a panic through the testing-only seam. The watchdog catches
-        // it, records a crash, removes the dead handle, and respawns.
+        // it, records a crash, removes the dead handle, and respawns. Capture
+        // the completion counter BEFORE inducing so we wait for exactly this
+        // crash's bump.
+        let baseline = *watchdog.borrow_and_update();
         handle
             .send_induce_panic("kp-panic-sentinel")
             .await
             .expect("induce-panic command is accepted");
 
-        // Wait for the watchdog to record the crash + respawn. Use `poll_until`
-        // (5ms interval, generous ~8s ceiling) rather than a fixed
-        // `sleep(20ms)×50` loop, which is flaky on loaded CI when the watchdog
-        // task is scheduled late — matching the sibling poison tests.
-        let recorded = poll_until(|| {
+        // Deterministic wait: settles the instant the watchdog finishes
+        // recording the crash + respawning — no polling, no timeout.
+        await_kp_crash_processed(&mut watchdog, baseline).await;
+        assert!(
             supervisor
                 .crash_windows
                 .get(&poison_key)
-                .is_some_and(|w| w.crash_count() >= 1)
-        })
-        .await;
-        assert!(recorded, "watchdog must record the KP-actor panic");
+                .is_some_and(|w| w.crash_count() >= 1),
+            "watchdog must record the KP-actor panic"
+        );
         assert!(
             !supervisor.is_context_poisoned(&poison_key),
             "a single crash must not poison the identity"
@@ -14901,41 +14942,49 @@ mod tests {
     /// Three KP-actor panics within the budget window poison the identity; the
     /// next `key_package_store_for` surfaces a typed `ContextPoisoned` error.
     ///
-    /// Runs on a 2-worker multi-thread runtime (rather than the default
-    /// current-thread `#[tokio::test]`) so the background supervisor watchdog
-    /// task has a dedicated worker and cannot be starved by the polling loop on
-    /// the same single worker. Combined with the serial `supervisor-watchdog-
-    /// poison` nextest test-group (`.config/nextest.toml`), this removes the
-    /// CPU-starvation tail that made the bounded `poll_until` wait flaky under
-    /// the fully-saturated `cargo nextest run --workspace` load.
+    /// Deterministic by construction: after each induced panic the test awaits
+    /// the watchdog's completion signal ([`Supervisor::kp_watchdog_processed_tx`])
+    /// — which fires only after the crash is recorded and the respawn-or-poison
+    /// decision has taken effect — instead of polling `is_context_poisoned`
+    /// against a wall-clock budget. So once the loop completes the `record`ed
+    /// third crash, the poison flag is GUARANTEED set (no post-loop poll), and
+    /// the assertions cannot false-timeout under CPU load (the load-induced
+    /// flake). The 2-worker multi-thread runtime lets the `tokio::spawn`'d
+    /// watchdog task run concurrently while the test awaits the signal.
     #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn kp_actor_poisons_after_budget() {
         let supervisor = supervisor_with_providers();
         let did = DID("did:dht:z6MkKpPoison".to_owned());
         let poison_key = format!("kp::{}", did.0);
+        let mut watchdog = supervisor.kp_watchdog_processed_tx.subscribe();
 
         for _ in 0..CRASH_POISON_THRESHOLD {
-            // Resolve (get-or-respawn) and induce a panic.
-            match supervisor.key_package_store_for(&did).await {
-                Ok(handle) => {
-                    let _ = handle.send_induce_panic("kp-poison-sentinel").await;
-                }
-                Err(ContextError::ContextPoisoned(_)) => break,
-                Err(e) => panic!("unexpected error before poison: {e:?}"),
-            }
-            // Let the watchdog process this crash before inducing the next.
-            poll_until(|| {
-                supervisor.crash_windows.get(&poison_key).is_some_and(|w| {
-                    w.is_poisoned() || !supervisor.key_package_stores.contains_key(&did)
-                })
-            })
-            .await;
+            // Resolve (get-or-respawn) the live actor. Poison is set only AFTER
+            // the final crash is recorded (below), so no resolution inside the
+            // loop can observe it — a `ContextPoisoned` here would be a bug.
+            let handle = supervisor
+                .key_package_store_for(&did)
+                .await
+                .expect("live actor resolves before the budget is exhausted");
+
+            // Capture the completion counter, induce the panic, then wait for
+            // exactly this crash's watchdog bump before inducing the next.
+            let baseline = *watchdog.borrow_and_update();
+            handle
+                .send_induce_panic("kp-poison-sentinel")
+                .await
+                .expect("induce-panic command is accepted by the live actor");
+            await_kp_crash_processed(&mut watchdog, baseline).await;
         }
 
-        // Wait for the poison flag to settle.
-        let poisoned = poll_until(|| supervisor.is_context_poisoned(&poison_key)).await;
-        assert!(poisoned, "identity must poison after the crash budget");
+        // The watchdog's completion signal for the third crash fired only after
+        // `CrashWindow::record` flipped the poison flag, so it is already set —
+        // asserted directly, with no polling.
+        assert!(
+            supervisor.is_context_poisoned(&poison_key),
+            "identity must poison after the crash budget"
+        );
 
         // The next resolution surfaces a typed poison error.
         match supervisor.key_package_store_for(&did).await {
@@ -14952,38 +15001,39 @@ mod tests {
     /// snapshot respawn (there is no KP context-snapshot). After recovery the
     /// identity resolves a live handle again.
     ///
-    /// Runs on a 2-worker multi-thread runtime (rather than the default
-    /// current-thread `#[tokio::test]`) so the background supervisor watchdog
-    /// task has a dedicated worker and cannot be starved by the polling loop on
-    /// the same single worker. Combined with the serial `supervisor-watchdog-
-    /// poison` nextest test-group (`.config/nextest.toml`), this removes the
-    /// CPU-starvation tail that made the bounded `poll_until` wait flaky under
-    /// the fully-saturated `cargo nextest run --workspace` load.
+    /// Deterministic by construction: the poison precondition is driven by
+    /// awaiting the watchdog's completion signal
+    /// ([`Supervisor::kp_watchdog_processed_tx`]) after each induced panic,
+    /// rather than polling `is_context_poisoned` against a wall-clock budget —
+    /// so it cannot false-timeout under CPU load (the load-induced flake). The
+    /// 2-worker multi-thread runtime lets the `tokio::spawn`'d watchdog task run
+    /// concurrently while the test awaits the signal.
     #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn clear_kp_poison_recovers_poisoned_actor() {
         let supervisor = supervisor_with_providers();
         let did = DID("did:dht:z6MkKpClearPoison".to_owned());
         let poison_key = format!("kp::{}", did.0);
+        let mut watchdog = supervisor.kp_watchdog_processed_tx.subscribe();
 
-        // Drive the actor to the poison threshold.
+        // Drive the actor to the poison threshold, waiting for each crash to be
+        // fully processed before inducing the next.
         for _ in 0..CRASH_POISON_THRESHOLD {
-            match supervisor.key_package_store_for(&did).await {
-                Ok(handle) => {
-                    let _ = handle.send_induce_panic("kp-clear-sentinel").await;
-                }
-                Err(ContextError::ContextPoisoned(_)) => break,
-                Err(e) => panic!("unexpected error before poison: {e:?}"),
-            }
-            poll_until(|| {
-                supervisor.crash_windows.get(&poison_key).is_some_and(|w| {
-                    w.is_poisoned() || !supervisor.key_package_stores.contains_key(&did)
-                })
-            })
-            .await;
+            let handle = supervisor
+                .key_package_store_for(&did)
+                .await
+                .expect("live actor resolves before the budget is exhausted");
+            let baseline = *watchdog.borrow_and_update();
+            handle
+                .send_induce_panic("kp-clear-sentinel")
+                .await
+                .expect("induce-panic command is accepted by the live actor");
+            await_kp_crash_processed(&mut watchdog, baseline).await;
         }
-        let poisoned = poll_until(|| supervisor.is_context_poisoned(&poison_key)).await;
-        assert!(poisoned, "precondition: identity poisoned after the budget");
+        assert!(
+            supervisor.is_context_poisoned(&poison_key),
+            "precondition: identity poisoned after the budget"
+        );
 
         // Operator recovery: clear the KP poison and re-resolve.
         supervisor
