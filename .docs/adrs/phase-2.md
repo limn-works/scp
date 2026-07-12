@@ -1,8 +1,8 @@
 # Phase 2 Architecture Decision Records — Context + Transport
 
 **Date:** February 22, 2026
-**Phase goal:** Full context lifecycle over real transport. Two devices create contexts, exchange messages, invoke tools, verify event logs, and route across multiple relays.
-**Deliverable:** Context state machine, UCAN-enforced roles, tool registration/invocation, verifiable event logs, multi-transport routing.
+**Phase goal:** Full context lifecycle over real transport. Two devices create contexts, exchange messages, invoke outlets, verify event logs, and route across multiple relays.
+**Deliverable:** Context state machine, UCAN-enforced roles, outlet registration/invocation, verifiable event logs, multi-transport routing.
 **Timeline:** Weeks 5-8
 **Dependencies between ADRs:**
 
@@ -18,7 +18,7 @@ ADR-001 (MLS)      ADR-002 (Envelope)     ADR-005 (Transport Trait)
       ADR-009 (Roles/UCAN)              ADR-012 (Multi-Transport)
            |
            v
-      ADR-010 (Tools)
+      ADR-010 (Outlets)
 ```
 
 Build order: ADR-008 + ADR-011 (parallel, both depend on Phase 1) --> ADR-009 --> ADR-010 --> ADR-012 (independent of context internals, depends only on Phase 1 transport)
@@ -31,9 +31,9 @@ Build order: ADR-008 + ADR-011 (parallel, both depend on Phase 1) --> ADR-009 --
 
 ### Context
 
-The context is the fundamental interaction primitive in SCP. All communication, tool invocation, role assignment, and governance happens within a context. A context is backed by exactly one MLS group (spec section 9.7.1: MLS Group = SCP Context). The Context Manager is the central coordinator of the protocol engine (architecture.md section 2.2): it owns the state machine, membership tracking, role enforcement, tool routing, TTL management, and memory scope enforcement.
+The context is the fundamental interaction primitive in SCP. All communication, outlet invocation, role assignment, and governance happens within a context. A context is backed by exactly one MLS group (spec section 9.7.1: MLS Group = SCP Context). The Context Manager is the central coordinator of the protocol engine (architecture.md section 2.2): it owns the state machine, membership tracking, role enforcement, outlet routing, TTL management, and memory scope enforcement.
 
-Phase 1 proved the crypto stack works (MLS groups, envelopes, transport). Phase 2 wraps that crypto in the context abstraction — the user-facing unit of interaction that carries governance, roles, tools, and lifecycle semantics on top of the raw encryption.
+Phase 1 proved the crypto stack works (MLS groups, envelopes, transport). Phase 2 wraps that crypto in the context abstraction — the user-facing unit of interaction that carries governance, roles, outlets, and lifecycle semantics on top of the raw encryption.
 
 ### Decision
 
@@ -41,8 +41,8 @@ Implement the context lifecycle as a five-state finite state machine in `scp-cor
 
 ### Rationale
 
-- **Explicit state machine over implicit flags:** A context's lifecycle has well-defined phases with different permitted operations. An explicit state machine makes illegal state transitions unrepresentable. You cannot invoke a tool in a `Closed` context or add members to an `Expired` context — the state machine rejects the operation before it reaches the crypto layer.
-- **Creating state:** Context creation is not atomic. The creator must: (1) define the context parameters (ceiling, roles, tools, TTL, memory scope, governance model), (2) create the MLS group, (3) generate the initial sender key (ADR-007), (4) publish to transport. The `Creating` state holds the context while these steps complete. If any step fails, the context never reaches `Active`.
+- **Explicit state machine over implicit flags:** A context's lifecycle has well-defined phases with different permitted operations. An explicit state machine makes illegal state transitions unrepresentable. You cannot invoke a outlet in a `Closed` context or add members to an `Expired` context — the state machine rejects the operation before it reaches the crypto layer.
+- **Creating state:** Context creation is not atomic. The creator must: (1) define the context parameters (ceiling, roles, outlets, TTL, memory scope, governance model), (2) create the MLS group, (3) generate the initial sender key (ADR-007), (4) publish to transport. The `Creating` state holds the context while these steps complete. If any step fails, the context never reaches `Active`.
 - **Closing vs Closed:** Context closure is a multi-step process: (1) notify all members, (2) process final events, (3) generate summary if memory scope is `Summary`, (4) destroy MLS group state and sender keys. The `Closing` state gives members a window to process final events and verify the summary before keys are destroyed. Once `Closed`, key material is gone and content is physically unreadable (for ephemeral/summary scopes).
 - **Expired as separate terminal state:** TTL expiry is distinct from intentional close. An expired context skips the cooperative closing window — TTL is a hard deadline (spec section 5.10). The governance model cannot override it. Extension requires unanimous consent from all members.
 - **Every transition logged:** State transitions are protocol events recorded in the Merkle event log. This makes context lifecycle history verifiable — any member can prove when the context was created, when it closed, and who initiated each transition.
@@ -94,7 +94,7 @@ Invalid transitions (must return error):
    Context creation uses a **two-phase commit** pattern: validate all preconditions, then execute with rollback on failure.
 
    **Phase 1 — Validate (no side effects):**
-   - Validates `ContextParams`: ceiling, roles, tools, TTL, memory scope, governance model.
+   - Validates `ContextParams`: ceiling, roles, outlets, TTL, memory scope, governance model.
    - If `template_id` is present, validates all params match the template definition exactly.
    - Validates the creator's identity is valid and the signing key is accessible.
    - Validates transport is connected and at least one relay is reachable.
@@ -190,7 +190,7 @@ pub struct ContextParams {
     pub ceiling_policy: CeilingPolicy,   // Whether the ceiling is immutable or governed (§5.3)
     pub promotion_policy: PromotionPolicy, // Whether context promotion is allowed (§5.10)
     pub roles: Vec<RoleDefinition>,      // Role definitions with permission sets
-    pub tools: Vec<OutletRegistration>,    // Initial tool registrations
+    pub outlets: Vec<OutletRegistration>,    // Initial outlet registrations
     pub ttl: Option<Duration>,           // Optional TTL
     pub memory_scope: MemoryScope,       // Ephemeral, Summary, or Full
     pub governance: GovernanceModel,     // Single-admin for Phase 2
@@ -258,7 +258,7 @@ pub enum ContextMode {
 pub enum TemplateId {
     BilateralEphemeral,   // Messaging-only, ephemeral, TTL required
     BilateralPersistent,  // Messaging-only, full memory, no TTL
-    Coordination,         // Messaging + tools, summary memory, TTL required
+    Coordination,         // Messaging + outlets, summary memory, TTL required
     GroupDiscussion,      // Messaging + invites, full memory, optional TTL
     PublicBroadcast,      // Broadcast mode, open subscriber registration (§5.14)
     GatedBroadcast,       // Broadcast mode, UCAN-gated subscriber access (§5.14)
@@ -304,7 +304,7 @@ UCAN (User Controlled Authorization Networks) tokens provide the mechanism: per-
 
 ### Decision
 
-Implement UCAN-based capability enforcement in `scp-core/context/` and `scp-core/crypto/`. Every context operation — message send, tool invocation, member management, role change, governance action — requires a valid UCAN token. Tokens are issued at role assignment, scoped to the context and the role's permission set, and validated on every call. The ceiling is set at context creation; its mutability is determined by the `CeilingPolicy` declared at creation (ADR-008): `Immutable` (default, cannot change) or `Governed` (modifiable through governance). The ceiling policy itself is immutable.
+Implement UCAN-based capability enforcement in `scp-core/context/` and `scp-core/crypto/`. Every context operation — message send, outlet invocation, member management, role change, governance action — requires a valid UCAN token. Tokens are issued at role assignment, scoped to the context and the role's permission set, and validated on every call. The ceiling is set at context creation; its mutability is determined by the `CeilingPolicy` declared at creation (ADR-008): `Immutable` (default, cannot change) or `Governed` (modifiable through governance). The ceiling policy itself is immutable.
 
 ### Rationale
 
@@ -467,27 +467,27 @@ pub struct RoleDefinition {
 
 ---
 
-## ADR-010: Tool Registration and Invocation
+## ADR-010: Outlet Registration and Invocation
 
 **Status:** Decided
 
 ### Context
 
-Tools are stateless functions scoped to a context (spec section 5.4). They are the protocol's answer to "bots" — tools cannot initiate, only respond. All agency flows through accountable agents. Tools have MCP-compatible JSON Schema interfaces (spec section 8.5), making them interoperable with existing MCP tooling. Every tool registration includes schema, implementation hash, test vectors, and operator DID — providing verifiable integrity (spec section 7.3.3).
+Outlets are stateless functions scoped to a context (spec section 5.4). They are the protocol's answer to "bots" — outlets cannot initiate, only respond. All agency flows through accountable agents. Outlets have MCP-compatible JSON Schema interfaces (spec section 8.5), making them interoperable with existing MCP tooling. Every outlet registration includes schema, implementation hash, test vectors, and operator DID — providing verifiable integrity (spec section 7.3.3).
 
-Cross-context tool interfaces (spec section 6.2) allow structured interaction across context boundaries with bidirectional consent. The context governs the tool call, not the agent. Stateful tool sessions (spec section 6.2.1) enable multi-turn workflows via session IDs, TTLs, and per-call governance.
+Cross-context outlet interfaces (spec section 6.2) allow structured interaction across context boundaries with bidirectional consent. The context governs the outlet call, not the agent. Stateful outlet sessions (spec section 6.2.1) enable multi-turn workflows via session IDs, TTLs, and per-call governance.
 
 ### Decision
 
-Implement tool registration, invocation, and cross-context interfaces in `scp-core/context/tools/`. Tools are registered with full metadata (schema, hash, test vectors, operator DID), invoked through UCAN-enforced capability checks, and logged in the event log. Cross-context tool interfaces require explicit bidirectional opt-in at the context level. Stateful sessions are tracked by the tool's context with per-session TTLs.
+Implement outlet registration, invocation, and cross-context interfaces in `scp-core/context/outlets/`. Outlets are registered with full metadata (schema, hash, test vectors, operator DID), invoked through UCAN-enforced capability checks, and logged in the event log. Cross-context outlet interfaces require explicit bidirectional opt-in at the context level. Stateful sessions are tracked by the outlet's context with per-session TTLs.
 
 ### Rationale
 
-- **MCP-compatible schema:** Tools use JSON Schema for input/output definitions (spec section 8.5). This means any MCP-compatible model can invoke SCP tools through the MCP adapter (architecture.md section 1.4) without modification. Schema compatibility is a requirement, not a nice-to-have.
-- **Implementation hash for integrity:** The content-addressable hash of a tool's implementation is recorded at registration. Any change to the implementation produces a new hash, which is recorded as a mutation event in the event log. Silent tool modification is impossible — all members see the change (spec section 5.4).
-- **Test vectors for continuous verification:** Any agent can call a tool with test vector inputs and verify outputs match (spec section 7.3.3). This enables threshold confidence: if N agents independently verify, the tool is almost certainly behaving correctly.
-- **Context governs, not agent (spec section 6.2):** Cross-context tool calls are mediated by both contexts. An agent in Context A requests a tool call to Context B. Context A's governance decides whether to permit the outbound call. Context B's governance decides whether to permit the inbound call. The agent never directly touches the other context.
-- **Stateful sessions (spec section 6.2.1):** Multi-turn workflows (scheduling, negotiation) need state across calls. Session state lives in the tool's context, not the caller's. Each call in a session is individually governed. Sessions have TTLs to prevent resource leaks.
+- **MCP-compatible schema:** Outlets use JSON Schema for input/output definitions (spec section 8.5). This means any MCP-compatible model can invoke SCP outlets through the MCP adapter (architecture.md section 1.4) without modification. Schema compatibility is a requirement, not a nice-to-have.
+- **Implementation hash for integrity:** The content-addressable hash of a outlet's implementation is recorded at registration. Any change to the implementation produces a new hash, which is recorded as a mutation event in the event log. Silent outlet modification is impossible — all members see the change (spec section 5.4).
+- **Test vectors for continuous verification:** Any agent can call a outlet with test vector inputs and verify outputs match (spec section 7.3.3). This enables threshold confidence: if N agents independently verify, the outlet is almost certainly behaving correctly.
+- **Context governs, not agent (spec section 6.2):** Cross-context outlet calls are mediated by both contexts. An agent in Context A requests a outlet call to Context B. Context A's governance decides whether to permit the outbound call. Context B's governance decides whether to permit the inbound call. The agent never directly touches the other context.
+- **Stateful sessions (spec section 6.2.1):** Multi-turn workflows (scheduling, negotiation) need state across calls. Session state lives in the outlet's context, not the caller's. Each call in a session is individually governed. Sessions have TTLs to prevent resource leaks.
 
 ### Implementation
 
@@ -495,14 +495,14 @@ Implement tool registration, invocation, and cross-context interfaces in `scp-co
 - **Schema validation:** `jsonschema` crate for JSON Schema validation
 - **Hashing:** SHA-256 via `sha2` crate for implementation hashes
 - **Crate:** `scp-core`
-- **Module:** `scp-core/context/tools/`
+- **Module:** `scp-core/context/outlets/`
 - **Session storage:** In-memory HashMap with TTL-based cleanup, keyed by session ID.
 
 ### Dependencies
 
-- **ADR-008 (Context):** Tools are scoped to contexts. Tool registration is a context operation. Tool invocation requires an active context.
+- **ADR-008 (Context):** Outlets are scoped to contexts. Outlet registration is a context operation. Outlet invocation requires an active context.
 - **ADR-009 (Roles/UCAN):** Query outlet invocation requires `OutletQuery(outlet_id)` or `OutletQueryAll`; Action outlet invocation requires `OutletCall(outlet_id)` or `OutletCallAll` capability. Outlet registration requires `OutletRegister` capability. All are UCAN-validated.
-- **ADR-011 (Event Log):** Tool registrations, mutations, and invocations are recorded in the event log.
+- **ADR-011 (Event Log):** Outlet registrations, mutations, and invocations are recorded in the event log.
 
 ### Acceptance Criteria
 
@@ -513,13 +513,13 @@ pub struct OutletRegistration {
     pub outlet_id: OutletId,
     pub name: String,
     pub description: String,
-    pub schema: ToolSchema,              // MCP-compatible JSON Schema
+    pub schema: OutletSchema,              // MCP-compatible JSON Schema
     pub implementation_hash: [u8; 32],   // SHA-256 of implementation
     pub test_vectors: Vec<TestVector>,   // Known input-output pairs
     pub operator_did: DID,               // Accountable identity
 }
 
-pub struct ToolSchema {
+pub struct OutletSchema {
     pub input_schema: serde_json::Value,   // JSON Schema for input
     pub output_schema: serde_json::Value,  // JSON Schema for output
 }
@@ -536,26 +536,26 @@ pub struct TestVector {
    - Validates input and output schemas are valid JSON Schema.
    - Validates implementation hash is 32 bytes.
    - Validates operator DID is resolvable.
-   - Stores the tool registration in the context's tool registry.
+   - Stores the outlet registration in the context's outlet registry.
    - Appends `OutletRegistered` event to event log with full registration metadata.
-   - Returns the tool ID.
+   - Returns the outlet ID.
 
 3. **`invoke_tool(context: &ContextHandle, outlet_id: &OutletId, input: serde_json::Value, invoker_did: &DID) -> Result<serde_json::Value, OutletError>`**
    - Validates context state is `Active`.
    - Validates invoker has `OutletQuery(outlet_id)`/`OutletQueryAll` (Query) or `OutletCall(outlet_id)`/`OutletCallAll` (Action) capability via UCAN.
-   - Validates input against the tool's input schema.
-   - Calls the tool implementation.
-   - Validates output against the tool's output schema.
+   - Validates input against the outlet's input schema.
+   - Calls the outlet implementation.
+   - Validates output against the outlet's output schema.
    - Appends `OutletInvoked` event to event log (includes outlet_id, invoker_did, input hash, output hash).
-   - Returns the tool output.
+   - Returns the outlet output.
 
-**Tool execution lifecycle:**
+**Outlet execution lifecycle:**
 
-Every tool invocation follows a defined lifecycle with explicit states, timeouts, and error handling.
+Every outlet invocation follows a defined lifecycle with explicit states, timeouts, and error handling.
 
 ```rust
-/// A tool invocation request, sent as an MLS application message.
-pub struct ToolRequest {
+/// A outlet invocation request, sent as an MLS application message.
+pub struct OutletRequest {
     pub request_id: String,          // UUID v4, unique per invocation
     pub outlet_id: OutletId,
     pub invoker_did: DID,
@@ -566,19 +566,19 @@ pub struct ToolRequest {
     pub timestamp: u64,
 }
 
-/// A tool invocation response, sent as an MLS application message.
-pub struct ToolResponse {
+/// A outlet invocation response, sent as an MLS application message.
+pub struct OutletResponse {
     pub request_id: String,          // Matches the request
-    pub status: ToolStatus,
+    pub status: OutletStatus,
     pub output: Option<serde_json::Value>,
-    pub error: Option<ToolExecutionError>,
+    pub error: Option<OutletExecutionError>,
     pub execution_time_ms: u64,
     pub provenance: Provenance,
 }
 
-pub enum ToolStatus { Success, Error, Timeout, Cancelled }
+pub enum OutletStatus { Success, Error, Timeout, Cancelled }
 
-pub struct ToolExecutionError {
+pub struct OutletExecutionError {
     pub code: OutletErrorCode,
     pub message: String,
     pub retryable: bool,
@@ -586,64 +586,64 @@ pub struct ToolExecutionError {
 
 pub enum OutletErrorCode {
     InputValidationFailed, OutputValidationFailed, ExecutionFailed,
-    Timeout, Cancelled, RateLimited, ToolNotFound, PermissionDenied, InternalError,
+    Timeout, Cancelled, RateLimited, OutletNotFound, PermissionDenied, InternalError,
 }
 ```
 
 **Timeout handling:**
-- Every tool invocation has a timeout. Callers specify `timeout_ms` in the request (default: 30,000ms, maximum: configurable per-context, hard protocol maximum: 300,000ms / 5 minutes).
-- The invoking SDK starts a timer on request submission. If no `ToolResponse` arrives before the timer fires, the SDK synthesizes a `ToolResponse` with `status: Timeout` and delivers it to the caller.
+- Every outlet invocation has a timeout. Callers specify `timeout_ms` in the request (default: 30,000ms, maximum: configurable per-context, hard protocol maximum: 300,000ms / 5 minutes).
+- The invoking SDK starts a timer on request submission. If no `OutletResponse` arrives before the timer fires, the SDK synthesizes a `OutletResponse` with `status: Timeout` and delivers it to the caller.
 - Timeout is a client-side contract, not a server-side enforcement.
 
 **Cancellation protocol:**
-- The invoker MAY send a `ToolCancel { request_id, invoker_did, timestamp }` message referencing the `request_id`.
-- On receiving `ToolCancel`, the tool's execution environment SHOULD terminate the invocation and respond with `status: Cancelled`.
-- Cancellation is best-effort. If the tool responds with `Success` before the cancel is processed, the success response takes precedence.
+- The invoker MAY send a `OutletCancel { request_id, invoker_did, timestamp }` message referencing the `request_id`.
+- On receiving `OutletCancel`, the outlet's execution environment SHOULD terminate the invocation and respond with `status: Cancelled`.
+- Cancellation is best-effort. If the outlet responds with `Success` before the cancel is processed, the success response takes precedence.
 
 **Error propagation:**
-- Tool execution errors are returned in `ToolResponse.error`, not as protocol-level errors.
-- Schema validation failures are caught by the SDK, not the tool. The SDK rejects invalid input before invoking the tool and rejects invalid output before delivering the response.
+- Outlet execution errors are returned in `OutletResponse.error`, not as protocol-level errors.
+- Schema validation failures are caught by the SDK, not the outlet. The SDK rejects invalid input before invoking the outlet and rejects invalid output before delivering the response.
 - The `retryable` field indicates whether the caller should attempt the invocation again.
 
 **Event log recording:**
-- `ToolRequest` and `ToolResponse` are both recorded as events in the context's event log (ADR-011).
+- `OutletRequest` and `OutletResponse` are both recorded as events in the context's event log (ADR-011).
 - The event includes: `request_id`, `outlet_id`, `invoker_did`, `status`, `execution_time_ms`, `SHA256(input)`, `SHA256(output)`. Full input/output is NOT recorded (may be large); only content hashes are stored.
 
 4. **`update_tool(context: &ContextHandle, outlet_id: &OutletId, new_registration: OutletRegistration, updater_did: &DID) -> Result<(), OutletError>`**
-   - Validates updater is the tool's operator DID or has admin role.
+   - Validates updater is the outlet's operator DID or has admin role.
    - Records old and new implementation hashes.
-   - Updates the tool registration.
+   - Updates the outlet registration.
    - Appends `OutletUpdated` event to event log (includes old hash, new hash, all changed fields).
-   - Tool mutations are visible to all context members.
+   - Outlet mutations are visible to all context members.
 
 5. **`verify_tool(context: &ContextHandle, outlet_id: &OutletId) -> Result<OutletVerificationResult, OutletError>`**
-   - Runs all test vectors against the tool.
-   - For each test vector: invoke tool with test input, compare output to expected output.
+   - Runs all test vectors against the outlet.
+   - For each test vector: invoke outlet with test input, compare output to expected output.
    - Returns a result with per-vector pass/fail status and overall integrity assessment.
    - Appends `OutletVerified` event to event log.
 
-6. **Cross-context tool interfaces:**
+6. **Cross-context outlet interfaces:**
 
 ```rust
 pub struct OutletInterface {
-    pub source_context: ContextId,      // Context exposing the tool
-    pub target_context: ContextId,      // Context consuming the tool
-    pub outlet_id: OutletId,                // Which tool is exposed
+    pub source_context: ContextId,      // Context exposing the outlet
+    pub target_context: ContextId,      // Context consuming the outlet
+    pub outlet_id: OutletId,                // Which outlet is exposed
     pub rate_limit: Option<RateLimit>,  // Calls per time window
     pub approved_by_source: bool,       // Source context opted in
     pub approved_by_target: bool,       // Target context opted in
 }
 ```
 
-   - **`expose_tool(context: &ContextHandle, outlet_id: &OutletId, to_context: &ContextId) -> Result<OutletInterface, OutletError>`**: Initiates a tool interface proposal from the source context. Requires admin capability.
+   - **`expose_outlet(context: &ContextHandle, outlet_id: &OutletId, to_context: &ContextId) -> Result<OutletInterface, OutletError>`**: Initiates a outlet interface proposal from the source context. Requires admin capability.
    - **`accept_tool_interface(context: &ContextHandle, interface: &OutletInterface) -> Result<(), OutletError>`**: Target context accepts the interface. Requires admin capability. Both `approved_by_source` and `approved_by_target` must be true before calls are permitted.
-   - **`invoke_cross_context(source_context: &ContextHandle, interface: &OutletInterface, input: serde_json::Value, invoker_did: &DID) -> Result<serde_json::Value, OutletError>`**: Invokes a tool across context boundaries. Source context governance checks outbound. Target context governance checks inbound. Both event logs record the call with provenance.
+   - **`invoke_cross_context(source_context: &ContextHandle, interface: &OutletInterface, input: serde_json::Value, invoker_did: &DID) -> Result<serde_json::Value, OutletError>`**: Invokes a outlet across context boundaries. Source context governance checks outbound. Target context governance checks inbound. Both event logs record the call with provenance.
    - Rate limiting enforced per interface.
 
-7. **Stateful tool sessions (spec section 6.2.1):**
+7. **Stateful outlet sessions (spec section 6.2.1):**
 
 ```rust
-pub struct ToolSession {
+pub struct OutletSession {
     pub session_id: String,
     pub outlet_id: OutletId,
     pub source_context: ContextId,
@@ -655,8 +655,8 @@ pub struct ToolSession {
 ```
 
    - **`create_session(context: &ContextHandle, outlet_id: &OutletId, source_context: &ContextId, ttl: Duration) -> Result<String, OutletError>`**: Creates a new session. Returns session ID.
-   - **`invoke_session(context: &ContextHandle, session_id: &str, input: serde_json::Value) -> Result<serde_json::Value, OutletError>`**: Invokes a tool within an active session. Each call is individually governed. Session state is updated by the tool.
-   - **Session cleanup:** Background task removes sessions past their TTL. Session state is internal to the tool's context.
+   - **`invoke_session(context: &ContextHandle, session_id: &str, input: serde_json::Value) -> Result<serde_json::Value, OutletError>`**: Invokes a outlet within an active session. Each call is individually governed. Session state is updated by the outlet.
+   - **Session cleanup:** Background task removes sessions past their TTL. Session state is internal to the outlet's context.
 
 ### Scope
 
@@ -665,12 +665,12 @@ pub struct ToolSession {
 | File | Purpose |
 |------|---------|
 | `mod.rs` | Module root, `OutletId` type, re-exports |
-| `registry.rs` | `OutletRegistration`, tool storage per context, `register_tool`, `update_tool`, `verify_tool` |
-| `invoke.rs` | `invoke_tool`, input/output schema validation, tool dispatch |
+| `registry.rs` | `OutletRegistration`, outlet storage per context, `register_outlet`, `update_outlet`, `verify_outlet` |
+| `invoke.rs` | `invoke_outlet`, input/output schema validation, outlet dispatch |
 | `interface.rs` | `OutletInterface`, `expose_tool`, `accept_tool_interface`, `invoke_cross_context`, rate limiting |
-| `session.rs` | `ToolSession`, `create_session`, `invoke_session`, TTL cleanup task |
+| `session.rs` | `OutletSession`, `create_session`, `invoke_session`, TTL cleanup task |
 | `schema.rs` | JSON Schema validation helpers, MCP compatibility utilities |
-| `lifecycle.rs` | `ToolRequest`, `ToolResponse`, `ToolCancel`, `ToolStatus`, timeout management, cancellation handling |
+| `lifecycle.rs` | `OutletRequest`, `OutletResponse`, `OutletCancel`, `OutletStatus`, timeout management, cancellation handling |
 
 **Estimated functions:** ~18-22 public functions, ~12-15 internal helpers.
 
@@ -972,7 +972,7 @@ pub enum EventType {
    >    `OutletInvoked` / `PaymentReceived` leaf, consistent with this.)
    >
    >    *Scope:* this covers the **intra-context, per-author** `OutletInvoked`
-   >    emission. The **cross-context tool-call saga** (§6) records its `OutletInvoked`
+   >    emission. The **cross-context outlet-call saga** (§6) records its `OutletInvoked`
    >    / `CrossContextOutletInvoked` within the saga's MLS-Commit phase — commit-
    >    ordered and *convergent*, canonical by design (its `outlet_invoked_event_id`
    >    is a signed `CrossContextOutletReceipt` field) — and is **not** in this
@@ -1302,7 +1302,7 @@ The ultimate acceptance criterion for Phase 2 exercises all 5 ADRs together with
    Bob's SDK deduplicates across relays.
 7. Bob invokes the "calculator" outlet with input {"operation": "add", "a": 1, "b": 2} (ADR-010).
    UCAN validates Bob has outlet_call capability.
-   Tool returns {"result": 3}. Invocation is logged (ADR-011).
+   Outlet returns {"result": 3}. Invocation is logged (ADR-011).
 8. Bob attempts to assign a role (he's a member, not admin). UCAN validation rejects —
    Bob lacks RoleAssign capability (ADR-009). Action is denied.
 9. Both Alice and Bob generate consistency checkpoints (ADR-011). Merkle roots match.
@@ -1314,7 +1314,7 @@ The ultimate acceptance criterion for Phase 2 exercises all 5 ADRs together with
     is tracked, and relay sets are partitioned across contexts.
 ```
 
-This test proves: context lifecycle works, roles enforce, tools invoke, event logs verify, multi-transport routes, TTL enforces, metadata privacy measures are active, and everything composes cleanly on top of Phase 1's crypto stack.
+This test proves: context lifecycle works, roles enforce, outlets invoke, event logs verify, multi-transport routes, TTL enforces, metadata privacy measures are active, and everything composes cleanly on top of Phase 1's crypto stack.
 
 ---
 
@@ -1971,7 +1971,7 @@ The relay's `/scp/v1` route is served on the node's existing TLS-terminated **Fu
 
 UCAN capability validation has two distinct consumers with two distinct needs (§7.2.1):
 
-- An **enforcement gate** that must fail closed at a token-presentation boundary (cross-context tool invocation, broadcast admission, role assignment). This is `validate_ucan` (`crates/scp-protocol/src/crypto/ucan/validate.rs`): the 11-step Tier-1 pipeline that returns `Ok(())` or a specific `UcanError`, and — critically — **records the nonce** (step 9, `NonceTracker::check_and_record`) as a side effect, consuming it for replay defense.
+- An **enforcement gate** that must fail closed at a token-presentation boundary (cross-context outlet invocation, broadcast admission, role assignment). This is `validate_ucan` (`crates/scp-protocol/src/crypto/ucan/validate.rs`): the 11-step Tier-1 pipeline that returns `Ok(())` or a specific `UcanError`, and — critically — **records the nonce** (step 9, `NonceTracker::check_and_record`) as a side effect, consuming it for replay defense.
 - A **diagnostic** that must report *which* checks passed without enforcing anything and without mutating state — for a trust signal an SDK surfaces to a caller deciding whether to proceed. This is `evaluate_ucan` (same file): it runs the identical sub-checks but returns a structured `CapabilityValidation` record of six per-stage booleans (`tokens_valid`, `signatures_valid`, `within_ceiling`, `nonce_valid`, `not_revoked`, `time_bounds_valid`), never throws, and probes the nonce **read-only** (`NonceTracker::check_replay`, never `record`), so it is safe to call repeatedly on the same token without burning its nonce.
 
 The Rust core plus all three FFI bridges already expose `evaluate_ucan` as the structured op `ucan_evaluate` returning `CapabilityValidation` (PyO3 `crates/scp-ffi/src/ucan.rs`; NAPI `crates/scp-ffi/napi/src/ucan.rs` + `scp.rs`; UniFFI `CapabilityValidationRecord`; the WASM bridge was removed per ADR-055 (`.docs/adrs/phase-4.md`)). The structured substrate exists at every layer below the SDK wrapper. At the time this ADR was written, the capability matrix (`.docs/standards/sdk-capability-matrix.json`, `UCAN.evaluate`) recorded this as bridge-present, SDK-wrapper-pending, with exemptions explicitly naming "the C3c SDK-parity follow-up."

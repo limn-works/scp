@@ -1841,7 +1841,7 @@
       "sources": [
         {
           "file": ".docs/adrs/phase-2.md",
-          "section": "## ADR-010: Tool Registration and Invocation"
+          "section": "## ADR-010: Outlet Registration and Invocation"
         },
         {
           "file": ".docs/specs/19-economic-governance.md",
@@ -1900,7 +1900,7 @@
       "sources": [
         {
           "file": ".docs/adrs/phase-2.md",
-          "section": "## ADR-010: Tool Registration and Invocation"
+          "section": "## ADR-010: Outlet Registration and Invocation"
         }
       ],
       "details": {
@@ -1953,7 +1953,7 @@
       "sources": [
         {
           "file": ".docs/adrs/phase-2.md",
-          "section": "## ADR-010: Tool Registration and Invocation"
+          "section": "## ADR-010: Outlet Registration and Invocation"
         }
       ],
       "details": {
@@ -1996,7 +1996,7 @@
       "sources": [
         {
           "file": ".docs/adrs/phase-2.md",
-          "section": "## ADR-010: Tool Registration and Invocation"
+          "section": "## ADR-010: Outlet Registration and Invocation"
         }
       ],
       "details": {
@@ -9561,7 +9561,7 @@
       "sources": [
         {
           "file": ".docs/adrs/phase-2.md",
-          "section": "## ADR-010: Tool Registration and Invocation"
+          "section": "## ADR-010: Outlet Registration and Invocation"
         }
       ],
       "result": "Tool handler registration and dispatch wired. Python callables stored as closures in runtime registry. FfiBridgeProvider dispatches to handlers. Commit 8d4c405.",
