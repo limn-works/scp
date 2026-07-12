@@ -795,7 +795,7 @@ class Context internal constructor(internal val handle: ContextHandle) : AutoClo
         handle.invokeOutlet(outletId, inputJson)
     }
 
-    /** Register a outlet in this context. Returns the assigned outlet ID. */
+    /** Register an outlet in this context. Returns the assigned outlet ID. */
     suspend fun registerOutlet(definition: OutletDefinition): String = withContext(Dispatchers.IO) {
         handle.registerOutlet(definition.toRecord())
     }
@@ -2554,7 +2554,7 @@ pub enum GovernanceAction {
     ChangeRole { did: DID, new_role: RoleName },
     /// Register a new outlet.
     RegisterOutlet { registration: OutletRegistration },
-    /// Remove a outlet.
+    /// Remove an outlet.
     RemoveOutlet { outlet_id: OutletId },
     /// Modify the capability ceiling (only if ceiling_policy is Governed).
     ModifyCeiling { new_ceiling: Vec<Capability> },
@@ -2574,7 +2574,7 @@ pub enum GovernanceAction {
     ModifyThreshold { new_threshold: u32 },
     /// Create a child context (§5.13).
     CreateChildContext { params: Box<ContextParams> },
-    /// Establish a outlet interface with another context (§6.2).
+    /// Establish an outlet interface with another context (§6.2).
     EstablishOutletInterface { interface: OutletInterface },
     /// Initiate governance-triggered member reset (ADR-029).
     ResetMember { did: DID, reason: String },

@@ -205,7 +205,7 @@ The most concerning patterns are: (1) a cryptographic construction error in ADR-
 ### [ADR-020] M8: Two-Tier Membership Write/Read Isolation Not Cryptographically Enforced
 - **Category**: Missing security analysis
 - **Location**: ADR-020, acceptance criteria 4-5
-- **What's missing**: Writers are MLS members; readers are not. But the ADR does not specify how readers query the context without MLS membership. If readers send requests through the relay, they can observe MLS ciphertext. If they query through a outlet endpoint, how is that endpoint authenticated and how does it access the MLS-encrypted registration data?
+- **What's missing**: Writers are MLS members; readers are not. But the ADR does not specify how readers query the context without MLS membership. If readers send requests through the relay, they can observe MLS ciphertext. If they query through an outlet endpoint, how is that endpoint authenticated and how does it access the MLS-encrypted registration data?
 - **Why it matters**: The two-tier model's security properties depend on a reader-query mechanism that is not defined.
 - **Severity**: MEDIUM
 

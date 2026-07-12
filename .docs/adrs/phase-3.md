@@ -299,7 +299,7 @@ Implement the Python SDK as the `scp_sdk` package in `bindings/python/scp_sdk/`.
            ...
 
        async def invoke(self, outlet: str, input: dict, identity: Identity | None = None) -> dict:
-           """Invoke a outlet in this context."""
+           """Invoke an outlet in this context."""
            ...
 
        async def __aenter__(self) -> "Context":

@@ -41,7 +41,7 @@ Implement the context lifecycle as a five-state finite state machine in `scp-cor
 
 ### Rationale
 
-- **Explicit state machine over implicit flags:** A context's lifecycle has well-defined phases with different permitted operations. An explicit state machine makes illegal state transitions unrepresentable. You cannot invoke a outlet in a `Closed` context or add members to an `Expired` context — the state machine rejects the operation before it reaches the crypto layer.
+- **Explicit state machine over implicit flags:** A context's lifecycle has well-defined phases with different permitted operations. An explicit state machine makes illegal state transitions unrepresentable. You cannot invoke an outlet in a `Closed` context or add members to an `Expired` context — the state machine rejects the operation before it reaches the crypto layer.
 - **Creating state:** Context creation is not atomic. The creator must: (1) define the context parameters (ceiling, roles, outlets, TTL, memory scope, governance model), (2) create the MLS group, (3) generate the initial sender key (ADR-007), (4) publish to transport. The `Creating` state holds the context while these steps complete. If any step fails, the context never reaches `Active`.
 - **Closing vs Closed:** Context closure is a multi-step process: (1) notify all members, (2) process final events, (3) generate summary if memory scope is `Summary`, (4) destroy MLS group state and sender keys. The `Closing` state gives members a window to process final events and verify the summary before keys are destroyed. Once `Closed`, key material is gone and content is physically unreadable (for ephemeral/summary scopes).
 - **Expired as separate terminal state:** TTL expiry is distinct from intentional close. An expired context skips the cooperative closing window — TTL is a hard deadline (spec section 5.10). The governance model cannot override it. Extension requires unanimous consent from all members.
@@ -484,9 +484,9 @@ Implement outlet registration, invocation, and cross-context interfaces in `scp-
 ### Rationale
 
 - **MCP-compatible schema:** Outlets use JSON Schema for input/output definitions (spec section 8.5). This means any MCP-compatible model can invoke SCP outlets through the MCP adapter (architecture.md section 1.4) without modification. Schema compatibility is a requirement, not a nice-to-have.
-- **Implementation hash for integrity:** The content-addressable hash of a outlet's implementation is recorded at registration. Any change to the implementation produces a new hash, which is recorded as a mutation event in the event log. Silent outlet modification is impossible — all members see the change (spec section 5.4).
-- **Test vectors for continuous verification:** Any agent can call a outlet with test vector inputs and verify outputs match (spec section 7.3.3). This enables threshold confidence: if N agents independently verify, the outlet is almost certainly behaving correctly.
-- **Context governs, not agent (spec section 6.2):** Cross-context outlet calls are mediated by both contexts. An agent in Context A requests a outlet call to Context B. Context A's governance decides whether to permit the outbound call. Context B's governance decides whether to permit the inbound call. The agent never directly touches the other context.
+- **Implementation hash for integrity:** The content-addressable hash of an outlet's implementation is recorded at registration. Any change to the implementation produces a new hash, which is recorded as a mutation event in the event log. Silent outlet modification is impossible — all members see the change (spec section 5.4).
+- **Test vectors for continuous verification:** Any agent can call an outlet with test vector inputs and verify outputs match (spec section 7.3.3). This enables threshold confidence: if N agents independently verify, the outlet is almost certainly behaving correctly.
+- **Context governs, not agent (spec section 6.2):** Cross-context outlet calls are mediated by both contexts. An agent in Context A requests an outlet call to Context B. Context A's governance decides whether to permit the outbound call. Context B's governance decides whether to permit the inbound call. The agent never directly touches the other context.
 - **Stateful sessions (spec section 6.2.1):** Multi-turn workflows (scheduling, negotiation) need state across calls. Session state lives in the outlet's context, not the caller's. Each call in a session is individually governed. Sessions have TTLs to prevent resource leaks.
 
 ### Implementation
@@ -554,7 +554,7 @@ pub struct TestVector {
 Every outlet invocation follows a defined lifecycle with explicit states, timeouts, and error handling.
 
 ```rust
-/// A outlet invocation request, sent as an MLS application message.
+/// An outlet invocation request, sent as an MLS application message.
 pub struct OutletRequest {
     pub request_id: String,          // UUID v4, unique per invocation
     pub outlet_id: OutletId,
@@ -566,7 +566,7 @@ pub struct OutletRequest {
     pub timestamp: u64,
 }
 
-/// A outlet invocation response, sent as an MLS application message.
+/// An outlet invocation response, sent as an MLS application message.
 pub struct OutletResponse {
     pub request_id: String,          // Matches the request
     pub status: OutletStatus,
@@ -635,9 +635,9 @@ pub struct OutletInterface {
 }
 ```
 
-   - **`expose_outlet(context: &ContextHandle, outlet_id: &OutletId, to_context: &ContextId) -> Result<OutletInterface, OutletError>`**: Initiates a outlet interface proposal from the source context. Requires admin capability.
+   - **`expose_outlet(context: &ContextHandle, outlet_id: &OutletId, to_context: &ContextId) -> Result<OutletInterface, OutletError>`**: Initiates an outlet interface proposal from the source context. Requires admin capability.
    - **`accept_tool_interface(context: &ContextHandle, interface: &OutletInterface) -> Result<(), OutletError>`**: Target context accepts the interface. Requires admin capability. Both `approved_by_source` and `approved_by_target` must be true before calls are permitted.
-   - **`invoke_cross_context(source_context: &ContextHandle, interface: &OutletInterface, input: serde_json::Value, invoker_did: &DID) -> Result<serde_json::Value, OutletError>`**: Invokes a outlet across context boundaries. Source context governance checks outbound. Target context governance checks inbound. Both event logs record the call with provenance.
+   - **`invoke_cross_context(source_context: &ContextHandle, interface: &OutletInterface, input: serde_json::Value, invoker_did: &DID) -> Result<serde_json::Value, OutletError>`**: Invokes an outlet across context boundaries. Source context governance checks outbound. Target context governance checks inbound. Both event logs record the call with provenance.
    - Rate limiting enforced per interface.
 
 7. **Stateful outlet sessions (spec section 6.2.1):**
@@ -655,7 +655,7 @@ pub struct OutletSession {
 ```
 
    - **`create_session(context: &ContextHandle, outlet_id: &OutletId, source_context: &ContextId, ttl: Duration) -> Result<String, OutletError>`**: Creates a new session. Returns session ID.
-   - **`invoke_session(context: &ContextHandle, session_id: &str, input: serde_json::Value) -> Result<serde_json::Value, OutletError>`**: Invokes a outlet within an active session. Each call is individually governed. Session state is updated by the outlet.
+   - **`invoke_session(context: &ContextHandle, session_id: &str, input: serde_json::Value) -> Result<serde_json::Value, OutletError>`**: Invokes an outlet within an active session. Each call is individually governed. Session state is updated by the outlet.
    - **Session cleanup:** Background task removes sessions past their TTL. Session state is internal to the outlet's context.
 
 ### Scope

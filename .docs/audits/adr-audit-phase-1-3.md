@@ -249,8 +249,8 @@ That said, a line-by-line read reveals 47 distinct specification gaps. The most 
 
 - **Category**: Decisions without implementation guidance
 - **Location**: ADR-010, Acceptance Criterion 3 (phase-2.md:538-539)
-- **What's missing**: "Calls the outlet implementation." How? The ADR defines the request/response protocol, schema validation, event logging, and UCAN authorization. But it never specifies how a outlet implementation is actually executed. Is it a function pointer? A WASM sandbox? A subprocess? An HTTP call? The `operator_did` field suggests the outlet runs externally, but the execution boundary is not defined.
-- **Why it matters**: Outlet execution is the actual security boundary. A outlet that executes arbitrary code in the SDK process is fundamentally different from a sandboxed WASM module. The ADR specifies everything around the outlet but not the outlet itself.
+- **What's missing**: "Calls the outlet implementation." How? The ADR defines the request/response protocol, schema validation, event logging, and UCAN authorization. But it never specifies how an outlet implementation is actually executed. Is it a function pointer? A WASM sandbox? A subprocess? An HTTP call? The `operator_did` field suggests the outlet runs externally, but the execution boundary is not defined.
+- **Why it matters**: Outlet execution is the actual security boundary. An outlet that executes arbitrary code in the SDK process is fundamentally different from a sandboxed WASM module. The ADR specifies everything around the outlet but not the outlet itself.
 - **Severity**: MEDIUM
 
 ### [ADR-011] Absence Proof Sorted Index Is Not Part of Merkle Tree

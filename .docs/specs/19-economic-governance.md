@@ -319,7 +319,7 @@ pub struct CostSchedule {
 }
 ```
 
-**Outlet-level costs**: declared in outlet registration (§5.4), additive with context costs. A outlet calling an external API can pass through its cost. Outlet costs carry their own payee DID (may differ from context payee).
+**Outlet-level costs**: declared in outlet registration (§5.4), additive with context costs. An outlet calling an external API can pass through its cost. Outlet costs carry their own payee DID (may differ from context payee).
 
 **Relay-level costs**: declared in `.well-known/scp` `relay_config` (§18.3.3 extension). Separate economic relationship from in-context pricing — relay charges for transport, context charges for participation.
 

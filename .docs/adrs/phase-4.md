@@ -716,9 +716,9 @@ Implement the FFI bridge as the `crates/scp-ffi/uniffi/` crate using UniFFI proc
    - `ContextHandle` is an opaque object interface exposing: `context_id() -> String`, `state() -> String`.
 
 4. **Outlet bridge functions:**
-   - `outlet_register(handle, registration) -> String` — registers a outlet (returns outlet ID).
+   - `outlet_register(handle, registration) -> String` — registers an outlet (returns outlet ID).
    - `outlet_invoke(handle, outlet_id, input_json, identity) -> String` — invokes an outlet (returns JSON string output).
-   - `outlet_verify(handle, outlet_id) -> OutletVerificationResult` — verifies a outlet against test vectors.
+   - `outlet_verify(handle, outlet_id) -> OutletVerificationResult` — verifies an outlet against test vectors.
 
 5. **Transport bridge functions:**
    - `transport_connect(relay_url) -> void` — connects to an SCP relay.
@@ -1291,7 +1291,7 @@ Rust errors from both bridge crates are mapped to these classes via the bridge l
    ```
    - `ctx.invokeOutlet(outletId, input, identity)` invokes a registered outlet and returns JSON output.
    - Invoking a non-existent outlet throws `OutletError` with code `SCP-OUTLET-6001`.
-   - Outlet registration: `await ctx.registerOutlet(outletDefinition)` returns a outlet ID string.
+   - Outlet registration: `await ctx.registerOutlet(outletDefinition)` returns an outlet ID string.
 
 5. **UCAN API:**
    ```typescript

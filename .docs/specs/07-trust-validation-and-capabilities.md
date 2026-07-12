@@ -66,7 +66,7 @@ Every protocol action is zero-trust. Capability enforcement uses a two-tier vali
 Full 11-step UCAN validation (ADR-016 criterion 2) runs at **token presentation boundaries** — the points where a UCAN token is first introduced or must be re-verified:
 
 - **Role assignment:** When a member is assigned a role, the assigner's `RoleAssign` capability is checked via cache, and `mint_role_tokens()` creates a capability token for each capability in the role definition. These tokens are the lightweight `context::roles::UcanToken` type (`iss`, `aud`, `att`, `nnc`) — a deliberately distinct type from the JWT-encoded `crypto::ucan::UcanToken` (`header`, `payload`, `signature`, `encoded`) that the 11-step pipeline consumes. They are validated against the context's capability ceiling at construction time — the same all-attestations rule applies at mint time (every capability in the role definition must be within the ceiling) and at presentation time (step 8) — and inserted directly into the `member_capabilities` cache. **They carry no per-token signature by design, and this is complete — not deferred.** The role token is never serialized as a bearer credential (the MLS leaf credential's `ucan_token` is `None` in all production paths), never crosses a trust boundary, and is structurally incapable of entering the Tier-1 pipeline (which accepts only the JWT `crypto::ucan::UcanToken`; there is no conversion path between the two types). Its authority is grounded in the signed source that performs the assignment — context creation for the creator's admin role, and the signed `AddMember`/`AssignRole` governance action (the `SignedVote` approval chain executed by `system_assign_role`) for every subsequent assignment — and, when role state is synced, in the signed context snapshot (ADR-050) that carries it. Each member derives its own `member_capabilities` cache locally from these signed governance events, so a capability cannot be forged by presenting a token; a per-token signature would be redundant with the governance signature that already authorizes the assignment. See `assign_role()` in `context/roles.rs`.
-- **Cross-context outlet invocation:** When one context invokes a outlet exposed by another context, the invoker presents a UCAN that is fully validated against the target context's ceiling and the invoker's delegation chain.
+- **Cross-context outlet invocation:** When one context invokes an outlet exposed by another context, the invoker presents a UCAN that is fully validated against the target context's ceiling and the invoker's delegation chain.
 - **Broadcast admission:** Gated broadcast contexts (§5.14.4) require a valid `messages:read` UCAN from subscribers. The full validation pipeline runs on the presented token. See `register_subscriber()` in `context/broadcast.rs`.
 
 The 11 validation steps are:
@@ -401,20 +401,20 @@ This says: "No governance actions against you in the last 90 days (verified via 
 
 SCP outlets are stateless functions with broadly deterministic behavior — consistent behavior and output format for a given input, though not necessarily token-for-token identical output. An LLM-backed outlet that answers cooking questions in a consistent schema is "stateless" in the protocol's sense. This makes outlet integrity **testable** at the participation level.
 
-When a outlet is registered with a context, the registration includes:
+When an outlet is registered with a context, the registration includes:
 
 - Schema (input and output types, MCP-compatible JSON Schema)
 - Implementation hash (content-addressable reference to the implementation)
 - Test vectors (known input-output pairs that define correct behavior)
 - Operator DID (who registered the outlet and is accountable for it)
 
-Any agent can verify a outlet's integrity at any time by:
+Any agent can verify an outlet's integrity at any time by:
 
 1. Calling the outlet with test vector inputs
 2. Comparing outputs against expected values
 3. Verifying the implementation hash hasn't changed since registration
 
-Test vectors verify participation conformance and schema compliance, not exact string matching. A outlet that returns a correct answer in a valid schema passes, even if the phrasing differs between invocations. If outputs diverge from expected behavior: the outlet has been modified or compromised. Detectable, attributable to the operator.
+Test vectors verify participation conformance and schema compliance, not exact string matching. An outlet that returns a correct answer in a valid schema passes, even if the phrasing differs between invocations. If outputs diverge from expected behavior: the outlet has been modified or compromised. Detectable, attributable to the operator.
 
 Multiple agents verifying independently creates threshold confidence. If 10 agents all get expected outputs, the outlet is almost certainly behaving correctly. This is continuous validation, not a one-time trust decision.
 
@@ -460,7 +460,7 @@ ChallengeVerification {
 
 **Challenge suite protocol.** The protocol for administering a challenge:
 
-1. **Challenge initiation.** A verifier (context admin, peer agent, or dedicated verification service) sends a `ChallengeRequest` as a outlet call within a shared context:
+1. **Challenge initiation.** A verifier (context admin, peer agent, or dedicated verification service) sends a `ChallengeRequest` as an outlet call within a shared context:
    ```
    ChallengeRequest {
      challenge_id:    [u8; 32],        // random, unique per challenge session
@@ -748,7 +748,7 @@ The threshold count and verification are mechanical. The trust component shrinks
 
 A claim verified once is a fact about the past. A claim that must be continuously renewed is a fact about the present.
 
-The protocol defines standard renewal intervals by attestation type. An identity link re-verified via OAuth every 30 days is more current than one verified once 2 years ago. A outlet integrity check run weekly is more trustworthy than one run at registration.
+The protocol defines standard renewal intervals by attestation type. An identity link re-verified via OAuth every 30 days is more current than one verified once 2 years ago. An outlet integrity check run weekly is more trustworthy than one run at registration.
 
 Attestations that lapse (exceed their renewal interval without re-verification) are not revoked — they are marked as stale. Agents factor staleness into evaluation. Fresh attestation = high validation confidence. Stale attestation = degraded confidence, approaching trust-only.
 

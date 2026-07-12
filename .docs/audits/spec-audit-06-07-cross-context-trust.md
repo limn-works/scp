@@ -22,7 +22,7 @@ The most significant gap pattern is this: the specs describe *what* the protocol
 ### [6.2.0] Bidirectional Consent Mechanism Undefined
 - **Category**: Underspecified algorithms
 - **Location**: Section 6.2.0 (line 32) and Section 6.2 (line 26)
-- **What's missing**: "Both contexts opt in explicitly (bidirectional consent at the context level)" -- but the consent mechanism is never defined. How does Context A express that it wants to expose a outlet to Context B? How does Context B accept? Is there a handshake protocol? Is it governance-gated on both sides? What message types are exchanged? What happens if Context A publishes a outlet interface but Context B never consents? Is there a pending state? Can consent be withdrawn? What event types represent interface creation and teardown?
+- **What's missing**: "Both contexts opt in explicitly (bidirectional consent at the context level)" -- but the consent mechanism is never defined. How does Context A express that it wants to expose an outlet to Context B? How does Context B accept? Is there a handshake protocol? Is it governance-gated on both sides? What message types are exchanged? What happens if Context A publishes an outlet interface but Context B never consents? Is there a pending state? Can consent be withdrawn? What event types represent interface creation and teardown?
 - **Why it matters**: Without a specified consent protocol, the "bidirectional consent" guarantee is aspirational, not mechanical. An implementor must invent the entire interface lifecycle.
 - **Severity**: HIGH
 
@@ -51,14 +51,14 @@ The most significant gap pattern is this: the specs describe *what* the protocol
 ### [6.2] Schema Specificity Floor -- No Recursive Depth Check
 - **Category**: Missing edge cases
 - **Location**: Section 6.2 (line 38), cross-ref with Section 9.2.1
-- **What's missing**: The schema specificity floor requires "at least two distinct fields in either input or output." But there is no specification of maximum schema complexity, maximum nesting depth, or maximum total size of a outlet schema. An attacker could register a outlet with a deeply nested schema containing thousands of fields, causing parsing overhead on every invocation check. There is also no prohibition on `additionalProperties: true` in JSON Schema, which would allow arbitrary extra fields despite the structural constraint.
+- **What's missing**: The schema specificity floor requires "at least two distinct fields in either input or output." But there is no specification of maximum schema complexity, maximum nesting depth, or maximum total size of an outlet schema. An attacker could register an outlet with a deeply nested schema containing thousands of fields, causing parsing overhead on every invocation check. There is also no prohibition on `additionalProperties: true` in JSON Schema, which would allow arbitrary extra fields despite the structural constraint.
 - **Why it matters**: The structural constraint prevents trivial messaging-pipe outlets but does not prevent computationally expensive schema validation or schema-level DoS.
 - **Severity**: MEDIUM
 
 ### [6.2.1] Session Identifier Format Undefined
 - **Category**: Missing wire format details
 - **Location**: Section 6.2.1 (lines 43-59)
-- **What's missing**: Session identifiers are described as "opaque" (line 57) but no format constraints are specified. Maximum length? Character set? Who generates them (caller or outlet context)? Are they unique across contexts or only within a outlet? The example shows `"sched:abc123"` suggesting a prefix convention but this is not normative. Can a caller forge a session_id to hijack another caller's session?
+- **What's missing**: Session identifiers are described as "opaque" (line 57) but no format constraints are specified. Maximum length? Character set? Who generates them (caller or outlet context)? Are they unique across contexts or only within an outlet? The example shows `"sched:abc123"` suggesting a prefix convention but this is not normative. Can a caller forge a session_id to hijack another caller's session?
 - **Why it matters**: Without format constraints, session IDs could be used as a covert data channel (arbitrary-length strings). Without uniqueness guarantees, session hijacking between callers is possible. Without a generation rule, two callers could collide.
 - **Severity**: MEDIUM
 
@@ -115,7 +115,7 @@ The most significant gap pattern is this: the specs describe *what* the protocol
 ### [6.2.2B] Inclusion Proof Format
 - **Category**: Missing wire format details
 - **Location**: Section 6.2.2B (line 110)
-- **What's missing**: "Readers can request inclusion proofs to verify their registration was recorded." The format of these inclusion proofs is not defined. What is the Merkle tree structure? What hash algorithm? What is the proof response format? How does the reader request a proof -- via a outlet call or a dedicated protocol message?
+- **What's missing**: "Readers can request inclusion proofs to verify their registration was recorded." The format of these inclusion proofs is not defined. What is the Merkle tree structure? What hash algorithm? What is the proof response format? How does the reader request a proof -- via an outlet call or a dedicated protocol message?
 - **Why it matters**: Inclusion proofs are the mechanism by which readers verify registry integrity. Without a specified format, implementations will produce incompatible proofs.
 - **Severity**: MEDIUM
 
@@ -224,7 +224,7 @@ The most significant gap pattern is this: the specs describe *what* the protocol
 ### [7.3.3] Test Vector Format Not Specified
 - **Category**: Missing wire format details
 - **Location**: Section 7.3.3 (lines 228-249)
-- **What's missing**: "Test vectors (known input-output pairs that define correct behavior)" -- no format is specified. Are test vectors JSON? Are they stored in the outlet registration? How are non-deterministic outputs handled (the spec says "not exact string matching" but does not define the comparison algorithm)? How many test vectors are required? Can a outlet register with zero test vectors? Is there a maximum count?
+- **What's missing**: "Test vectors (known input-output pairs that define correct behavior)" -- no format is specified. Are test vectors JSON? Are they stored in the outlet registration? How are non-deterministic outputs handled (the spec says "not exact string matching" but does not define the comparison algorithm)? How many test vectors are required? Can an outlet register with zero test vectors? Is there a maximum count?
 - **Why it matters**: Outlet verification is a key Layer 2 mechanism. Without specified test vector format and comparison semantics, different agents will reach different conclusions about outlet integrity from the same test vectors.
 - **Severity**: MEDIUM
 
@@ -245,7 +245,7 @@ The most significant gap pattern is this: the specs describe *what* the protocol
 ### [7.3.4] Challenge Suite Protocol Not Specified
 - **Category**: Underspecified algorithms
 - **Location**: Section 7.3.4 (lines 253-263)
-- **What's missing**: "A context or peer agent can issue a challenge: a set of test cases." No challenge protocol is defined. How does a challenger initiate a challenge? Is it a outlet call? A dedicated message type? What is the request format? What is the response format? How does the challenger determine pass/fail? Is there a timeout? What happens if the challenged agent refuses or times out? Is there a standard for "the agent passed"?
+- **What's missing**: "A context or peer agent can issue a challenge: a set of test cases." No challenge protocol is defined. How does a challenger initiate a challenge? Is it an outlet call? A dedicated message type? What is the request format? What is the response format? How does the challenger determine pass/fail? Is there a timeout? What happens if the challenged agent refuses or times out? Is there a standard for "the agent passed"?
 - **Why it matters**: Without a challenge protocol, the 27 listed challenge capabilities are aspirational categories, not testable properties.
 - **Severity**: HIGH
 
@@ -308,7 +308,7 @@ The most significant gap pattern is this: the specs describe *what* the protocol
 ### [7.4.1] Attestation `evidence` Field Type-Specific Formats Undefined
 - **Category**: Missing wire format details
 - **Location**: Section 7.4.1 (line 433)
-- **What's missing**: `evidence: supporting proof (type-specific, optional)` -- the type-specific evidence formats are not defined for any attestation type. What is the evidence format for an identity link? For a outlet integrity attestation? For an endorsement? Section 7.4.2 describes each type's evidence at a high level ("OAuth, signed post, DNS record" for identity links) but does not specify the structured format.
+- **What's missing**: `evidence: supporting proof (type-specific, optional)` -- the type-specific evidence formats are not defined for any attestation type. What is the evidence format for an identity link? For an outlet integrity attestation? For an endorsement? Section 7.4.2 describes each type's evidence at a high level ("OAuth, signed post, DNS record" for identity links) but does not specify the structured format.
 - **Why it matters**: Evidence is what enables automated verification (Layer 3). Without specified formats, verification of evidence across implementations is impossible.
 - **Severity**: MEDIUM
 
@@ -343,7 +343,7 @@ The most significant gap pattern is this: the specs describe *what* the protocol
 ### [7.7.1] DataProvenance `counterparties` Privacy Leak
 - **Category**: Security-relevant omissions
 - **Location**: Section 7.7.1 (line 515)
-- **What's missing**: `counterparties: [DID]` lists all DIDs in the source interaction. When data flows through a outlet call from Context A to Context B, Context B's members see the full DID list of Context A's participants. This reveals Context A's membership to Context B. The spec does not analyze this privacy implication or provide a mechanism to redact counterparties.
+- **What's missing**: `counterparties: [DID]` lists all DIDs in the source interaction. When data flows through an outlet call from Context A to Context B, Context B's members see the full DID list of Context A's participants. This reveals Context A's membership to Context B. The spec does not analyze this privacy implication or provide a mechanism to redact counterparties.
 - **Why it matters**: Counterparty revelation violates context isolation expectations. A member of a private context might not consent to their DID being revealed in provenance records to unknown contexts.
 - **Severity**: HIGH
 

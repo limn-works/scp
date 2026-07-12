@@ -104,7 +104,7 @@ the saga-shaped `InitiateStandingPairCreate` variant and its `NotImplemented` re
 
 **What's missing.** The spec (§6.2) defines outlet invocation within a
 context but not the cross-context forwarding path:
-- Wire format for forwarding a outlet invocation from the calling
+- Wire format for forwarding an outlet invocation from the calling
   context to the target context (envelope type, sender identity,
   event log recording on both sides).
 - Which party presents the UCAN proof at the target (caller forwards

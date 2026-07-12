@@ -112,14 +112,14 @@ The core pattern throughout: **the spec describes what should happen but not how
 ### [5.4] Outlet Registration Wire Format Not Defined
 - **Category**: Missing wire format details
 - **Location**: §5.4, lines 55-63
-- **What's missing**: Outlet registrations list 5 fields (schema, implementation hash, test vectors, operator DID, cost metadata) but don't specify: the serialization format for outlet registrations, the schema for test vectors (what structure? how are inputs and outputs represented?), the hash algorithm for implementation hash, how cost metadata is serialized, or the maximum size of a outlet registration.
+- **What's missing**: Outlet registrations list 5 fields (schema, implementation hash, test vectors, operator DID, cost metadata) but don't specify: the serialization format for outlet registrations, the schema for test vectors (what structure? how are inputs and outputs represented?), the hash algorithm for implementation hash, how cost metadata is serialized, or the maximum size of an outlet registration.
 - **Why it matters**: Outlets are a core protocol primitive. Two implementations serializing outlet registrations differently would produce different implementation hashes and different event log entries.
 - **Severity**: HIGH
 
 ### [5.4] Outlet Implementation Hash: Hash of What?
 - **Category**: Underspecified algorithms
 - **Location**: §5.4, line 58
-- **What's missing**: "Content-addressable reference to the outlet's implementation." Hash of what bytes? The source code? A compiled binary? A serialized description? A outlet that's a remote HTTP endpoint has no local implementation to hash. Is this the hash of the outlet's schema + endpoint URL? Or the hash of the executable code? The spec doesn't say.
+- **What's missing**: "Content-addressable reference to the outlet's implementation." Hash of what bytes? The source code? A compiled binary? A serialized description? An outlet that's a remote HTTP endpoint has no local implementation to hash. Is this the hash of the outlet's schema + endpoint URL? Or the hash of the executable code? The spec doesn't say.
 - **Why it matters**: If the implementation hash is the integrity anchor for outlet verification, the preimage must be precisely defined. Different implementations hashing different preimages will produce incompatible hashes.
 - **Severity**: HIGH
 

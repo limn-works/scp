@@ -174,7 +174,7 @@ Minimal, runnable examples in each target language demonstrating:
 1. **Identity creation** — Create a DID, inspect it
 2. **Context creation** — Create a context with governance parameters
 3. **Message exchange** — Two participants send and receive encrypted messages
-4. **Outlet invocation** — Register and invoke a outlet within a context
+4. **Outlet invocation** — Register and invoke an outlet within a context
 
 Each example should be:
 - Self-contained (single file or minimal project)
