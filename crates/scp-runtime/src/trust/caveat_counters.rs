@@ -204,7 +204,7 @@ impl CaveatCounters {
     ///
     /// Idempotent against underflow: a release larger than the recorded usage
     /// clamps to `0` rather than wrapping.
-    pub fn release(&mut self, kind: CaveatKind, amount: u64) {
+    pub const fn release(&mut self, kind: CaveatKind, amount: u64) {
         match kind {
             CaveatKind::AmountCumulative => {
                 self.amount_cumulative_used = self.amount_cumulative_used.saturating_sub(amount);
@@ -252,7 +252,7 @@ pub fn prune_expired_window_entries(timestamps: &mut Vec<u64>, now: u64, window_
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::panic)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 

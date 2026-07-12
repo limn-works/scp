@@ -455,6 +455,7 @@ fn validate_outlet_ucan(
 /// See ADR-013 §4, SCP-212, spec §6.2, §8, §19.5, §19.7, ADR-016, and issue #319.
 #[allow(clippy::needless_pass_by_value)] // PyO3 requires owned Option<Vec<String>>.
 #[allow(clippy::too_many_arguments)] // Bridge mirrors the runtime's economy entry point.
+#[allow(clippy::too_many_lines)] // §7.3.8 caveat resolution + executor closure + 3-phase dispatch.
 fn outlet_invoke_impl(
     bi: &PyBridgeInstance,
     py: Python<'_>,
