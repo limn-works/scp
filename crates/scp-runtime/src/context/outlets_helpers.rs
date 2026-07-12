@@ -472,6 +472,31 @@ impl std::fmt::Debug for OutletEconomyReservation {
     }
 }
 
+/// §7.3.8 fail-closed coupling of the validated-narrowed effective invocation
+/// caveats to the revocation CID of the delegation that carried them.
+///
+/// The counter-bearing consume ([`consume_caveat_counters`]) needs BOTH the
+/// caveat set (to know which caps to enforce) AND the `ucan_cid` (the
+/// per-delegation counter key). Bundling them into one value makes "caveats
+/// present ⟹ cid present" a COMPILE-TIME invariant rather than a three-bridge
+/// convention: a caveat set for which
+/// [`InvocationCaveats::has_counter_bearing_caveat`] is `true` can never reach
+/// the counter gate without its counter key, so the fail-closed contract on
+/// that method cannot be silently skipped by a `(Some(caveats), None)` pair.
+///
+/// Minted at the FFI bridge from the ONE validated invocation UCAN: the
+/// `caveats` come from that token's `nb` (via `TokenNbCaveatResolver`), the
+/// `ucan_cid` from `compute_revocation_cid` over the same token — the two are
+/// derived together, from the same token, or the whole binding is `None`.
+#[derive(Debug, Clone)]
+pub struct InvocationCaveatBinding {
+    /// The validated-narrowed effective invocation caveats (the leaf `nb`).
+    pub caveats: InvocationCaveats,
+    /// Revocation CID of the invocation UCAN — the per-delegation key for the
+    /// owned Class-S caveat counters.
+    pub ucan_cid: String,
+}
+
 // ---------------------------------------------------------------------------
 // Phase 1: reserve_outlet_economy (actor handler entry point)
 // ---------------------------------------------------------------------------
@@ -493,13 +518,14 @@ impl std::fmt::Debug for OutletEconomyReservation {
 /// escrow-authorization failures.
 /// # §7.3.8 value-caveat enforcement
 ///
-/// When `effective_caveats` is `Some` (the VALIDATED INVOCATION UCAN — the
+/// When `caveat_binding` is `Some` (the VALIDATED INVOCATION UCAN — the
 /// token granting `outlet_call:*` / `outlet_query:*` — carried a
 /// validated-narrowed `nb` caveat set, resolved by the FFI bridge via
 /// `TokenNbCaveatResolver` at its `validate_outlet_invocation_ucan` site and
-/// threaded here as an internal runtime param; NOT sourced from `spending_ucan`,
-/// a separate §19.5 economy token), this function runs the two-stage §7.3.8
-/// gate:
+/// threaded here as an internal runtime param, bundled with the delegation's
+/// `ucan_cid` so "caveats present ⟹ cid present" holds by construction; NOT
+/// sourced from `spending_ucan`, a separate §19.5 economy token), this function
+/// runs the two-stage §7.3.8 gate:
 ///
 /// 1. [`InvocationCaveats::check_invocation_local`] — the SYNCHRONOUS stateless
 ///    checks (`input_schema` / `amount_max_per_call` / `allowed_adapters` /
@@ -524,8 +550,7 @@ pub async fn reserve_outlet_economy(
     context_id: &str,
     invoker_did: &DID,
     spending_ucan: Option<&UcanToken>,
-    effective_caveats: Option<&InvocationCaveats>,
-    ucan_cid: Option<&str>,
+    caveat_binding: Option<&InvocationCaveatBinding>,
     input: &serde_json::Value,
     now_secs: u64,
 ) -> Result<OutletEconomyReservation, ContextError> {
@@ -678,7 +703,8 @@ pub async fn reserve_outlet_economy(
         // is populated therefore cannot authorize a same-context call, which is
         // the correct fail-closed behaviour (cross-context targets are a later
         // slice).
-        if let Some(caveats) = effective_caveats {
+        if let Some(binding) = caveat_binding {
+            let caveats = &binding.caveats;
             let negotiated_adapter: Option<PaymentAdapterRef> =
                 payment_adapter.as_ref().map(|a| a.adapter_id().to_owned());
             if let Err(err) = caveats.check_invocation_local(
@@ -813,12 +839,12 @@ pub async fn reserve_outlet_economy(
                     // partial increment never persists. On success the record
                     // rides the fail-closed persist below and is KEPT on persist
                     // failure (a consumed cap must never un-consume).
-                    if let (Some(caveats), Some(cid)) = (effective_caveats, ucan_cid)
-                        && caveats.has_counter_bearing_caveat()
+                    if let Some(binding) = caveat_binding
+                        && binding.caveats.has_counter_bearing_caveat()
                         && let Err(err) = consume_caveat_counters(
                             &mut state.class_s.caveat_counters,
-                            cid,
-                            caveats,
+                            &binding.ucan_cid,
+                            &binding.caveats,
                             action_cost,
                             now_secs,
                         )
@@ -887,16 +913,16 @@ pub async fn reserve_outlet_economy(
         // tick + hard-rate token are refunded (they were consumed in the Class-C
         // pre-block above and, on this path, would otherwise ride only the
         // best-effort coalesce persist).
-        if let (Some(caveats), Some(cid)) = (effective_caveats, ucan_cid)
-            && caveats.has_counter_bearing_caveat()
+        if let Some(binding) = caveat_binding
+            && binding.caveats.has_counter_bearing_caveat()
         {
             let consume_result = cell
                 .commit_class_s_keep(deps, context_id, |mut view| {
                     let state = view.rest_mut();
                     consume_caveat_counters(
                         &mut state.class_s.caveat_counters,
-                        cid,
-                        caveats,
+                        &binding.ucan_cid,
+                        &binding.caveats,
                         action_cost,
                         now_secs,
                     )
@@ -2061,6 +2087,7 @@ mod tests {
         use scp_protocol::economy::types::Amount;
         use scp_protocol::trust::caveats::{InvocationCaveats, RateWindow};
 
+        use super::super::InvocationCaveatBinding;
         use crate::context::ContextError;
         use crate::context::ContextState;
         use crate::context::actor::class_s::ClassSCell;
@@ -2373,14 +2400,19 @@ mod tests {
             input: &serde_json::Value,
             now: u64,
         ) -> Result<(), ContextError> {
+            // Mirror the bridge: caveats + cid are minted together from the
+            // ONE invocation UCAN, so they bundle into one binding or neither.
+            let binding = caveats.zip(cid).map(|(c, id)| InvocationCaveatBinding {
+                caveats: c.clone(),
+                ucan_cid: id.to_owned(),
+            });
             let reservation = super::super::reserve_outlet_economy(
                 cell,
                 deps,
                 &ctx_key(),
                 &DID(INVOKER.to_owned()),
                 None,
-                caveats,
-                cid,
+                binding.as_ref(),
                 input,
                 now,
             )

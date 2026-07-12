@@ -525,14 +525,24 @@ fn outlet_invoke_impl(
                 "invalid invocation UCAN for outlet '{outlet_id}': {e}"
             ))
         })?;
-    let effective_caveats = {
+    // Mint the caveats and their counter key TOGETHER, from the ONE validated
+    // invocation token, into a single `InvocationCaveatBinding` — the `ucan_cid`
+    // is computed only inside `.map` over the resolved caveats, so the runtime
+    // receives "caveats present ⟹ cid present" by construction (§7.3.8
+    // fail-closed coupling), not as a bridge-side convention.
+    let caveat_binding = {
         use scp_core::crypto::ucan::validate::CaveatResolver as _;
         scp_core::crypto::ucan::validate::TokenNbCaveatResolver
             .resolve_caveats(&invocation_ucan_token)
+            .map(
+                |caveats| scp_core::context::outlets::InvocationCaveatBinding {
+                    caveats,
+                    ucan_cid: scp_core::crypto::ucan::revoke::compute_revocation_cid(
+                        &invocation_ucan_token.encoded,
+                    ),
+                },
+            )
     };
-    let invocation_ucan_cid = effective_caveats.as_ref().map(|_| {
-        scp_core::crypto::ucan::revoke::compute_revocation_cid(&invocation_ucan_token.encoded)
-    });
 
     // Snapshot the bridge-owned outlet registry and (optionally) the
     // registered handler closure BEFORE entering the runtime call. The
@@ -602,8 +612,7 @@ fn outlet_invoke_impl(
                     input_json,
                     &invoker_did_typed,
                     spending_ucan_token.as_ref(),
-                    effective_caveats,
-                    invocation_ucan_cid,
+                    caveat_binding,
                     None,
                     executor,
                 )

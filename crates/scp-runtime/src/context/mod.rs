@@ -72,6 +72,12 @@ use scp_protocol::context::params;
 use scp_protocol::context::{ContextError, ContextParams, ContextState, transition};
 
 pub use config::{ContextConfig, ContextCreation};
+// §7.3.8: the caveat/CID coupling type the FFI bridges mint from the validated
+// invocation UCAN and thread into `Supervisor::invoke_outlet_with_economy`. The
+// enclosing `outlets_helpers` module is `pub(crate)`; this single type is the
+// only member the bridges must NAME, so it is re-exported here (and through
+// `scp_core::context::outlets`) while the rest of the helpers stay internal.
+pub use outlets_helpers::InvocationCaveatBinding;
 
 // ---------------------------------------------------------------------------
 // ContextHandle

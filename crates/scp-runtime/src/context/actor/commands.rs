@@ -2195,24 +2195,27 @@ pub enum OutletsCommand {
         /// Optional spending UCAN for paid actions (§19.5). Boxed so the
         /// variant payload stays pointer-sized.
         spending_ucan: Option<Box<scp_protocol::crypto::ucan::UcanToken>>,
-        /// §7.3.8 validated-narrowed effective invocation caveats, resolved by
-        /// the FFI bridge (via `TokenNbCaveatResolver`) from the `nb` field of
-        /// the VALIDATED INVOCATION UCAN — the token granting the
-        /// `outlet_call:*` / `outlet_query:*` capability, captured at the
-        /// bridge's `validate_outlet_invocation_ucan` site. NOT sourced from
+        /// §7.3.8 validated-narrowed effective invocation caveats bundled with
+        /// the revocation CID (the owned Class-S counter key) of the delegation
+        /// that carried them, resolved by the FFI bridge (via
+        /// `TokenNbCaveatResolver` + `compute_revocation_cid`) from the ONE
+        /// VALIDATED INVOCATION UCAN — the token granting the `outlet_call:*` /
+        /// `outlet_query:*` capability, captured at the bridge's
+        /// `validate_outlet_invocation_ucan` site. NOT sourced from
         /// `spending_ucan` (a separate §19.5 economy token whose `nb` carries
         /// no invocation caveats). `narrow()` folds every parent's value-caveats
         /// into the leaf, so the leaf `nb` IS the effective narrowed set. The
-        /// caveat bundle is an internal runtime-API param: the SDK-facing FFI
+        /// caveats and CID are bundled into one
+        /// [`InvocationCaveatBinding`](crate::context::outlets_helpers::InvocationCaveatBinding)
+        /// so "caveats present ⟹ cid present" holds by construction — a
+        /// counter-bearing caveat can never reach the gate without its counter
+        /// key. The bundle is an internal runtime-API param: the SDK-facing FFI
         /// export signature is unchanged, so an external caller cannot widen the
         /// caveat set without forging the invocation UCAN. `None` when the
         /// invocation UCAN carried no caveats. Boxed to keep the variant payload
         /// pointer-sized.
-        effective_caveats: Option<Box<scp_protocol::trust::caveats::InvocationCaveats>>,
-        /// Revocation CID of the invocation UCAN, the key for this delegation's
-        /// owned Class-S caveat counters. `None` when the invocation UCAN
-        /// carried no caveats.
-        ucan_cid: Option<String>,
+        caveat_binding:
+            Option<Box<crate::context::outlets_helpers::InvocationCaveatBinding>>,
         /// The invocation input, checked against the caveat's `input_schema`
         /// by the §7.3.8 synchronous local gate. Boxed to keep the variant
         /// payload pointer-sized.
