@@ -2641,6 +2641,75 @@ mod tests {
         assert_eq!(decoded_record, &record);
     }
 
+    /// §7.3.8 value-caveat counters (Class S) are declared "durable across
+    /// restarts by riding the context snapshot (ADR-049 §9)". That durability
+    /// crosses the SERIALIZATION boundary — the on-disk `MessagePack` bytes,
+    /// not just an in-memory `ClassSState::snapshot()` clone — so this test
+    /// exercises the actual persistence codec (`rmp_serde::to_vec_named` /
+    /// `from_slice`, the path `ContextPersistence::persist_context` / `load`
+    /// use). A populated per-`ucan_cid` counter record MUST round-trip
+    /// value-stable, or a crash+respawn would silently reset a consumed cap and
+    /// re-open the spend / rate window the counter exists to close.
+    #[test]
+    fn caveat_counters_persistence_roundtrips_value_stable() {
+        use crate::trust::caveat_counters::CaveatCounters;
+
+        let mut snapshot = test_snapshot("ctx-caveat-counters-roundtrip");
+        snapshot.caveat_counters.insert(
+            "bafy-invocation-ucan-cid".to_owned(),
+            CaveatCounters {
+                max_calls_used: 3,
+                amount_cumulative_used: 42,
+                rate_window_timestamps: vec![1, 2, 3],
+            },
+        );
+
+        // MessagePack persistence round-trip (the path used by
+        // ContextPersistence::persist_context / load).
+        let bytes = rmp_serde::to_vec_named(&snapshot).unwrap();
+        let decoded: ContextSnapshot = rmp_serde::from_slice(&bytes).unwrap();
+
+        assert_eq!(decoded.caveat_counters.len(), 1);
+        let decoded_record = decoded
+            .caveat_counters
+            .get("bafy-invocation-ucan-cid")
+            .expect("the caveat-counter record survives the persistence round-trip");
+        // Value-stable: every field (including the sorted rate-window vector)
+        // is byte-for-byte equal via the derived `PartialEq`.
+        assert_eq!(decoded_record.max_calls_used, 3);
+        assert_eq!(decoded_record.amount_cumulative_used, 42);
+        assert_eq!(decoded_record.rate_window_timestamps, vec![1, 2, 3]);
+    }
+
+    /// §7.3.8 caveat counters are LOCAL-instance economic accounting with no
+    /// authority on a foreign node, so `strip_snapshot_for_public` MUST drop
+    /// them from a public-scope export (identical to the budget tracker and the
+    /// xctx witnesses) — a public snapshot is never imported back into a live
+    /// encrypted context, so stripping re-opens no spend/rate window. This
+    /// pins the redaction so a future field addition cannot silently leak a
+    /// caller's consumed-capacity accounting to a pre-join observer.
+    #[test]
+    fn strip_snapshot_for_public_drops_caveat_counters() {
+        use crate::trust::caveat_counters::CaveatCounters;
+
+        let mut snapshot = test_snapshot("ctx-caveat-counters-strip");
+        snapshot.caveat_counters.insert(
+            "bafy-invocation-ucan-cid".to_owned(),
+            CaveatCounters {
+                max_calls_used: 7,
+                amount_cumulative_used: 100,
+                rate_window_timestamps: vec![10, 20],
+            },
+        );
+
+        let stripped =
+            strip_snapshot_for_public(&snapshot).expect("public strip builds a minimal snapshot");
+        assert!(
+            stripped.caveat_counters.is_empty(),
+            "a public export must never carry local caveat-counter accounting"
+        );
+    }
+
     /// Caller-side reservation records are LOCAL-node economy state with no
     /// authority on a foreign node, so `strip_snapshot_for_public` MUST drop
     /// them — a public observer / importer must never be handed the means to
