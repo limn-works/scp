@@ -2,7 +2,7 @@
 //!
 //! These tests exercise the public API surface of `scp-ffi` from an
 //! integration test crate. They cover: identity registry, context
-//! lifecycle, tools, UCAN, event log, discovery, provenance, bridge
+//! lifecycle, outlets, UCAN, event log, discovery, provenance, bridge
 //! trust, sync, and trust engine.
 //!
 //! For `ContextManager` methods that require complex types (`join_context`,
@@ -160,11 +160,11 @@ fn create_test_context(bi: &PyBridgeInstance, creator_did: &str) -> String {
     context_id
 }
 
-/// Builds a tool registration `PyDict` with valid schema (2+ properties).
-fn build_tool_reg<'py>(py: Python<'py>, name: &str, operator_did: &str) -> Bound<'py, PyDict> {
+/// Builds an outlet registration `PyDict` with valid schema (2+ properties).
+fn build_outlet_reg<'py>(py: Python<'py>, name: &str, operator_did: &str) -> Bound<'py, PyDict> {
     let reg = PyDict::new(py);
     reg.set_item("name", name).unwrap();
-    reg.set_item("description", format!("Tool: {name}"))
+    reg.set_item("description", format!("Outlet: {name}"))
         .unwrap();
     reg.set_item("operator_did", operator_did).unwrap();
     let schema = PyDict::new(py);
@@ -375,11 +375,11 @@ fn context_create_establishes_mls_group() {
 }
 
 // ============================================================================
-// Tool registration and verification
+// Outlet registration and verification
 // ============================================================================
 
 #[test]
-fn tool_register_and_verify() {
+fn outlet_register_and_verify() {
     Python::with_gil(|py| {
         let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
         runtime::init_context_manager_for_test(scp.bridge_instance());
@@ -387,8 +387,8 @@ fn tool_register_and_verify() {
         let ctx_id = create_test_context(scp.bridge_instance(), &did);
 
         let reg = PyDict::new(py);
-        reg.set_item("name", "test_tool").unwrap();
-        reg.set_item("description", "A test tool").unwrap();
+        reg.set_item("name", "test_outlet").unwrap();
+        reg.set_item("description", "A test outlet").unwrap();
         reg.set_item("operator_did", &did).unwrap();
 
         let schema = PyDict::new(py);
@@ -425,21 +425,21 @@ fn tool_register_and_verify() {
         let tv_list = PyList::new(py, &[tv]).unwrap();
         reg.set_item("test_vectors", tv_list).unwrap();
 
-        let tool_id = scp.tool_register(&ctx_id, &reg.as_borrowed()).unwrap();
-        assert!(tool_id.contains("test_tool"));
+        let outlet_id = scp.outlet_register(&ctx_id, &reg.as_borrowed()).unwrap();
+        assert!(outlet_id.contains("test_outlet"));
 
-        let result = scp.tool_verify(&ctx_id, &tool_id).unwrap();
+        let result = scp.outlet_verify(&ctx_id, &outlet_id).unwrap();
         assert!(result.passed);
         assert!(result.failures.is_empty());
     });
 }
 
 #[test]
-fn tool_register_rejects_invalid_context() {
+fn outlet_register_rejects_invalid_context() {
     setup();
     Python::with_gil(|py| {
         let reg = PyDict::new(py);
-        reg.set_item("name", "orphan_tool").unwrap();
+        reg.set_item("name", "orphan_outlet").unwrap();
         reg.set_item("description", "No context").unwrap();
         reg.set_item("operator_did", "did:key:test").unwrap();
         let schema = PyDict::new(py);
@@ -448,13 +448,13 @@ fn tool_register_rejects_invalid_context() {
         reg.set_item("schema", schema).unwrap();
 
         let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
-        let result = scp.tool_register("nonexistent-ctx", &reg.as_borrowed());
+        let result = scp.outlet_register("nonexistent-ctx", &reg.as_borrowed());
         assert!(result.is_err());
     });
 }
 
 #[test]
-fn tool_register_rejects_empty_name() {
+fn outlet_register_rejects_empty_name() {
     Python::with_gil(|py| {
         let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
         runtime::init_context_manager_for_test(scp.bridge_instance());
@@ -463,14 +463,14 @@ fn tool_register_rejects_empty_name() {
 
         let reg = PyDict::new(py);
         reg.set_item("name", "").unwrap();
-        reg.set_item("description", "bad tool").unwrap();
+        reg.set_item("description", "bad outlet").unwrap();
         reg.set_item("operator_did", &did).unwrap();
         let schema = PyDict::new(py);
         schema.set_item("input_schema", PyDict::new(py)).unwrap();
         schema.set_item("output_schema", PyDict::new(py)).unwrap();
         reg.set_item("schema", schema).unwrap();
 
-        let result = scp.tool_register(&ctx_id, &reg.as_borrowed());
+        let result = scp.outlet_register(&ctx_id, &reg.as_borrowed());
         assert!(result.is_err());
     });
 }
@@ -1294,12 +1294,12 @@ fn verify_participation_requirements_empty_passes() {
 }
 
 // ============================================================================
-// Cross-domain: Identity -> Context -> Tool -> UCAN -> EventLog
+// Cross-domain: Identity -> Context -> Outlet -> UCAN -> EventLog
 // ============================================================================
 
 #[test]
-fn cross_domain_identity_context_tool_eventlog_provenance() {
-    // Cross-domain flow test: identity -> context -> tool -> event log -> provenance.
+fn cross_domain_identity_context_outlet_eventlog_provenance() {
+    // Cross-domain flow test: identity -> context -> outlet -> event log -> provenance.
     // Does NOT call functions requiring the crate-internal global runtime
     // (py_ucan_mint, py_event_log_checkpoint). Those are tested in unit tests.
     Python::with_gil(|py| {
@@ -1309,19 +1309,19 @@ fn cross_domain_identity_context_tool_eventlog_provenance() {
         let ctx_id = create_test_context(scp.bridge_instance(), &did_a);
 
         runtime::with_context(scp.bridge_instance(), &ctx_id, |rt| {
-            rt.ceiling_strings.insert("tool_invoke:*".to_owned());
+            rt.ceiling_strings.insert("outlet_call:*".to_owned());
             rt.ceiling_strings.insert("messages:write".to_owned());
             Ok(())
         })
         .unwrap();
 
-        // Register a tool using the helper.
-        let reg = build_tool_reg(py, "cross_domain_tool", &did_a);
-        let tool_id = scp.tool_register(&ctx_id, &reg.as_borrowed()).unwrap();
-        assert!(!tool_id.is_empty());
+        // Register an outlet using the helper.
+        let reg = build_outlet_reg(py, "cross_domain_outlet", &did_a);
+        let outlet_id = scp.outlet_register(&ctx_id, &reg.as_borrowed()).unwrap();
+        assert!(!outlet_id.is_empty());
 
-        // Verify tool.
-        let vr = scp.tool_verify(&ctx_id, &tool_id).unwrap();
+        // Verify outlet.
+        let vr = scp.outlet_verify(&ctx_id, &outlet_id).unwrap();
         assert!(vr.passed);
 
         // Append an event and query.
@@ -1376,11 +1376,11 @@ fn cross_domain_identity_context_tool_eventlog_provenance() {
 // `bindings/python/tests/test_scp_class.py::test_with_storage_rejects_unknown_type`).
 
 // ============================================================================
-// Cross-context tool-invocation saga (§6.2.4, ADR-049 §3a) — PyO3 export
+// Cross-context outlet-invocation saga (§6.2.4, ADR-049 §3a) — PyO3 export
 // ============================================================================
 //
 // These tests exercise what the PyO3 bridge ADDS on top of the supervisor
-// producer (`start_cross_context_tool_invocation_saga`), whose committed /
+// producer (`start_cross_context_outlet_invocation_saga`), whose committed /
 // abort / busy / rate-limit / co-residency paths are covered in
 // `crates/scp-runtime` integration tests (the full `Committed` path needs the
 // actor-state interface establishment those tests inject directly, which has
@@ -1432,16 +1432,16 @@ fn create_test_context_with_id(bi: &PyBridgeInstance, creator_did: &str, context
     });
 }
 
-/// Registers a minimal `{a,b} -> {sum,ok}` tool in `context_id`, returning the
-/// tool registration id. Reuses the shared [`build_tool_reg`] schema.
-fn register_saga_tool(
+/// Registers a minimal `{a,b} -> {sum,ok}` outlet in `context_id`, returning the
+/// outlet registration id. Reuses the shared [`build_outlet_reg`] schema.
+fn register_saga_outlet(
     py: Python<'_>,
     scp: &_scp_core::scp::PyScp,
     context_id: &str,
     operator_did: &str,
 ) -> String {
-    let reg = build_tool_reg(py, "xctx_saga_tool", operator_did);
-    scp.tool_register(context_id, &reg.as_borrowed()).unwrap()
+    let reg = build_outlet_reg(py, "xctx_saga_outlet", operator_did);
+    scp.outlet_register(context_id, &reg.as_borrowed()).unwrap()
 }
 
 /// A valid 16-byte nonce as a 32-char hex string.
@@ -1465,7 +1465,7 @@ fn xctx_saga_unhosted_caller_rejected_before_saga() {
         let target_ctx = random_64hex_context_id();
         create_test_context_with_id(bi, &owner, &caller_ctx);
         create_test_context_with_id(bi, &owner, &target_ctx);
-        let tool_id = register_saga_tool(py, &scp, &target_ctx, &owner);
+        let outlet_id = register_saga_outlet(py, &scp, &target_ctx, &owner);
 
         // A syntactically valid DID that was never created on this instance.
         let unhosted_caller = "did:dht:z6MkUnhostedCallerPrincipal0001";
@@ -1475,11 +1475,11 @@ fn xctx_saga_unhosted_caller_rejected_before_saga() {
         input.set_item("b", "y").unwrap();
 
         let err = scp
-            .tool_invoke_cross_context_saga(
+            .outlet_invoke_cross_context_saga(
                 &caller_ctx,
                 &target_ctx,
                 unhosted_caller,
-                &tool_id,
+                &outlet_id,
                 &input.as_borrowed(),
                 &nonce_hex(),
                 1_700_000_000_000,
@@ -1521,18 +1521,18 @@ fn xctx_saga_hosted_non_member_caller_rejected() {
         let target_ctx = random_64hex_context_id();
         create_test_context_with_id(bi, &owner, &caller_ctx);
         create_test_context_with_id(bi, &owner, &target_ctx);
-        let tool_id = register_saga_tool(py, &scp, &target_ctx, &owner);
+        let outlet_id = register_saga_outlet(py, &scp, &target_ctx, &owner);
 
         let input = PyDict::new(py);
         input.set_item("a", "x").unwrap();
         input.set_item("b", "y").unwrap();
 
         let err = scp
-            .tool_invoke_cross_context_saga(
+            .outlet_invoke_cross_context_saga(
                 &caller_ctx,
                 &target_ctx,
                 &stranger, // hosted, but not a member of caller_ctx
-                &tool_id,
+                &outlet_id,
                 &input.as_borrowed(),
                 &nonce_hex(),
                 1_700_000_000_000,
@@ -1591,7 +1591,7 @@ fn xctx_saga_member_but_unhosted_caller_rejected_by_hosted_axis() {
         let bi = scp.bridge_instance();
 
         // `owner` is a hosted identity used only to create the TARGET context and
-        // register the saga tool (the tool operator must be a member of B).
+        // register the saga outlet (the outlet operator must be a member of B).
         let owner = create_test_identity(bi);
 
         // The caller is a syntactically valid DID that CREATES `caller_ctx` —
@@ -1607,7 +1607,7 @@ fn xctx_saga_member_but_unhosted_caller_rejected_by_hosted_axis() {
         // Caller context is CREATED BY the unhosted caller → caller is a member.
         create_test_context_with_id(bi, &member_but_unhosted_caller, &caller_ctx);
         create_test_context_with_id(bi, &owner, &target_ctx);
-        let tool_id = register_saga_tool(py, &scp, &target_ctx, &owner);
+        let outlet_id = register_saga_outlet(py, &scp, &target_ctx, &owner);
 
         // Precondition: the supervisor MUST see the caller as a member of
         // `caller_ctx` (axis (b) passes), while the bridge's identity registry
@@ -1628,11 +1628,11 @@ fn xctx_saga_member_but_unhosted_caller_rejected_by_hosted_axis() {
         input.set_item("b", "y").unwrap();
 
         let err = scp
-            .tool_invoke_cross_context_saga(
+            .outlet_invoke_cross_context_saga(
                 &caller_ctx,
                 &target_ctx,
                 &member_but_unhosted_caller, // member of caller_ctx, but NOT hosted
-                &tool_id,
+                &outlet_id,
                 &input.as_borrowed(),
                 &nonce_hex(),
                 1_700_000_000_000,
@@ -1686,18 +1686,18 @@ fn xctx_saga_authenticated_caller_reaches_target_axis_gate() {
         let target_ctx = random_64hex_context_id();
         create_test_context_with_id(bi, &owner, &caller_ctx);
         create_test_context_with_id(bi, &owner, &target_ctx);
-        let tool_id = register_saga_tool(py, &scp, &target_ctx, &owner);
+        let outlet_id = register_saga_outlet(py, &scp, &target_ctx, &owner);
 
         let input = PyDict::new(py);
         input.set_item("a", "x").unwrap();
         input.set_item("b", "y").unwrap();
 
         let err = scp
-            .tool_invoke_cross_context_saga(
+            .outlet_invoke_cross_context_saga(
                 &caller_ctx,
                 &target_ctx,
                 &owner, // hosted AND a member of caller_ctx (its creator)
-                &tool_id,
+                &outlet_id,
                 &input.as_borrowed(),
                 &nonce_hex(),
                 1_700_000_000_000,
@@ -1727,15 +1727,15 @@ fn xctx_saga_authenticated_caller_reaches_target_axis_gate() {
 // reachable from the bridge's PUBLIC surface. The producer evaluates the
 // target-axis interface gate (SCP-SAGA-13062) BEFORE it attempts the
 // participant-context-set reservation (supervisor.rs:
-// `start_cross_context_tool_invocation_saga` runs gate 1 → gate 2 → reserve).
-// Establishing the actor-state `ToolInterface` that gate 2 requires has no
-// bridge-public wiring (the bridge's `tool_interface_expose`/`accept` write
-// only the FFI-side copy, not the actor's `governance.tool_interfaces`), so a
+// `start_cross_context_outlet_invocation_saga` runs gate 1 → gate 2 → reserve).
+// Establishing the actor-state `OutletInterface` that gate 2 requires has no
+// bridge-public wiring (the bridge's `outlet_interface_expose`/`accept` write
+// only the FFI-side copy, not the actor's `governance.outlet_interfaces`), so a
 // bridge caller cannot pass gate 2 and therefore can never reach the
 // reservation step to observe `SagaBusy`. The producer's actual `SagaBusy`
 // terminal is covered in `crates/scp-runtime` integration tests; the bridge's
 // SOLE added responsibility for the Busy terminal is the typed-error mapping,
-// which is unit-tested directly in `tools.rs`
+// which is unit-tested directly in `outlets.rs`
 // (`map_saga_error` → `SagaBusyError` with the structured `contended_context`).
 
 /// Fail-closed nonce decoding: a malformed `asserted_nonce_hex` (wrong length)
@@ -1753,7 +1753,7 @@ fn xctx_saga_malformed_nonce_rejected_fail_closed() {
         let target_ctx = random_64hex_context_id();
         create_test_context_with_id(bi, &owner, &caller_ctx);
         create_test_context_with_id(bi, &owner, &target_ctx);
-        let tool_id = register_saga_tool(py, &scp, &target_ctx, &owner);
+        let outlet_id = register_saga_outlet(py, &scp, &target_ctx, &owner);
 
         let input = PyDict::new(py);
         input.set_item("a", "x").unwrap();
@@ -1762,11 +1762,11 @@ fn xctx_saga_malformed_nonce_rejected_fail_closed() {
         // 8 bytes, not 16.
         let short_nonce = "0011223344556677";
         let err = scp
-            .tool_invoke_cross_context_saga(
+            .outlet_invoke_cross_context_saga(
                 &caller_ctx,
                 &target_ctx,
                 &owner,
-                &tool_id,
+                &outlet_id,
                 &input.as_borrowed(),
                 short_nonce,
                 1_700_000_000_000,
@@ -1802,44 +1802,44 @@ fn handle_context_id(py: Python<'_>, handle: &PyContextHandle) -> String {
 }
 
 /// Builds and wires the full saga precondition through the `PyO3` bridge:
-/// owner identity, caller context A, target context B, the tool registered into
+/// owner identity, caller context A, target context B, the outlet registered into
 /// both B's actor governance state and the FFI-side registry (with a
-/// deterministic handler), and the bidirectionally-approved `ToolInterface`
-/// established in A. Returns `(scp, ctx_a, ctx_b, owner, tool_id)` so the
+/// deterministic handler), and the bidirectionally-approved `OutletInterface`
+/// established in A. Returns `(scp, ctx_a, ctx_b, owner, outlet_id)` so the
 /// `#[test]` body can invoke the saga and assert its terminal state. All setup
 /// lives here; every assertion stays in the test.
 ///
 /// The setup mirrors the producer's two authorization axes
-/// (`start_cross_context_tool_invocation_saga`, supervisor.rs):
+/// (`start_cross_context_outlet_invocation_saga`, supervisor.rs):
 ///
 /// 1. **Caller axis (gate 1).** `caller_did` must be hosted by this bridge AND a
 ///    member of the CALLER (source) context A. Creating A via `context_create`
 ///    with `owner` as the single-admin creator satisfies both.
 /// 2. **Target axis (gate 2).** The producer requires a *bidirectionally
-///    approved* `ToolInterface` (`approved_by_source && approved_by_target`)
+///    approved* `OutletInterface` (`approved_by_source && approved_by_target`)
 ///    that it queries against the CALLER context A's actor governance state
-///    (`has_established_tool_interface`, `queries_helpers.rs`) — NOT context B's.
+///    (`has_established_outlet_interface`, `queries_helpers.rs`) — NOT context B's.
 ///    So the interface is established IN A, via a governance
-///    `EstablishToolInterface` action proposed by A's admin (auto-executed under
-///    `single_admin`). `execute_establish_tool_interface` (`governance_helpers.rs`)
-///    pushes the interface verbatim into A's `governance.tool_interfaces`, and
-///    additionally requires A's ceiling to contain `tool:interface` — which the
+///    `EstablishOutletInterface` action proposed by A's admin (auto-executed under
+///    `single_admin`). `execute_establish_outlet_interface` (`governance_helpers.rs`)
+///    pushes the interface verbatim into A's `governance.outlet_interfaces`, and
+///    additionally requires A's ceiling to contain `outlet:interface` — which the
 ///    admin role grants because A's ceiling lists it. The three id-form fields
-///    (`source_context` = A, `target_context` = B, `tool_id` = the registration
+///    (`source_context` = A, `target_context` = B, `outlet_id` = the registration
 ///    id) are compared on the raw 64-hex digest form, so they must equal A/B/id
 ///    exactly, with BOTH approvals `true`.
 ///
-/// Context B holds the registered tool plus the handler the executor snapshots
-/// and runs once at Commit-B (`rt.tool_handlers.get(tool_id)`, tools.rs). The
+/// Context B holds the registered outlet plus the handler the executor snapshots
+/// and runs once at Commit-B (`rt.outlet_handlers.get(outlet_id)`, outlets.rs). The
 /// handler returns `{"sum": 42, "ok": 1}`, which Commit-B validates against the
-/// tool's registered numeric `{sum, ok}` output schema (from `build_tool_reg`)
+/// outlet's registered numeric `{sum, ok}` output schema (from `build_outlet_reg`)
 /// before committing. The committed output bytes therefore decode to that JSON.
 fn establish_xctx_saga_commit_preconditions(
     py: Python<'_>,
 ) -> (_scp_core::scp::PyScp, String, String, String, String) {
     // Initializes the process-global tokio runtime the bridge methods
     // (`identity_create`, `context_create`, `governance_propose`,
-    // `tool_invoke_cross_context_saga`) block on.
+    // `outlet_invoke_cross_context_saga`) block on.
     setup();
     let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
     let bi = scp.bridge_instance();
@@ -1871,7 +1871,7 @@ fn establish_xctx_saga_commit_preconditions(
 
     // Context A (caller/source). Its ceiling carries the two load-bearing
     // capabilities: `governance:propose` (so `owner`, as admin, can propose)
-    // and `tool:interface` (required by `execute_establish_tool_interface`'s
+    // and `outlet:interface` (required by `execute_establish_outlet_interface`'s
     // ceiling check). The remaining entries are harmless. `context_create`
     // generates a real 64-hex id, so the ADR-056 saga chokepoint round-trips
     // to A's actor.
@@ -1880,8 +1880,8 @@ fn establish_xctx_saga_commit_preconditions(
         py,
         [
             "governance:propose",
-            "tool:interface",
-            "tools:invoke",
+            "outlet:interface",
+            "outlet:call:*",
             "messages:read",
             "messages:write",
         ],
@@ -1892,69 +1892,69 @@ fn establish_xctx_saga_commit_preconditions(
     let ctx_a = handle_context_id(py, &handle_a);
 
     // Context B (target). Its ceiling carries `governance:propose` and
-    // `tool:register` so the saga tool can be registered into B's ACTOR
-    // governance state (the saga's Prepare-B reads the tool from B's
-    // `governance.registered_tools`, not from the FFI-side registry).
+    // `outlet:register` so the saga outlet can be registered into B's ACTOR
+    // governance state (the saga's Prepare-B reads the outlet from B's
+    // `governance.registered_outlets`, not from the FFI-side registry).
     let params_b = PyDict::new(py);
-    let ceiling_b = PyList::new(py, ["governance:propose", "tool:register"]).unwrap();
+    let ceiling_b = PyList::new(py, ["governance:propose", "outlet:register"]).unwrap();
     params_b.set_item("ceiling", ceiling_b).unwrap();
     let handle_b = scp.context_create(&owner, &params_b.as_borrowed()).unwrap();
     let ctx_b = handle_context_id(py, &handle_b);
 
-    // The tool id is the deterministic `generate_tool_id(name)` form shared
-    // by all bridges. The same id keys (a) B's actor `registered_tools`
+    // The outlet id is the deterministic `generate_outlet_id(name)` form shared
+    // by all bridges. The same id keys (a) B's actor `registered_outlets`
     // (saga Prepare-B), (b) the interface in A (saga gate 2), and (c) the
     // FFI-side handler the executor snapshots at Commit-B.
-    let tool_name = "xctx_saga_commit_tool";
-    let tool_id = format!("tool-{tool_name}");
+    let outlet_name = "xctx_saga_commit_outlet";
+    let outlet_id = format!("outlet-{outlet_name}");
 
-    // Register the saga tool into B's ACTOR governance state so the saga's
+    // Register the saga outlet into B's ACTOR governance state so the saga's
     // Prepare-B finds it.
-    let register_json = register_tool_action_json(&tool_id, tool_name, &owner);
+    let register_json = register_outlet_action_json(&outlet_id, outlet_name, &owner);
     scp.governance_propose(&handle_b, &owner, &register_json)
-        .expect("RegisterTool must auto-execute under single_admin");
+        .expect("RegisterOutlet must auto-execute under single_admin");
 
-    // The executor snapshots the handler from the FFI-side `tool_handlers`
-    // at Commit-B. `register_tool_handler` requires the tool to exist in
-    // the FFI-side `tool_registry`, so register it there too (same id), then
+    // The executor snapshots the handler from the FFI-side `outlet_handlers`
+    // at Commit-B. `register_outlet_handler` requires the outlet to exist in
+    // the FFI-side `outlet_registry`, so register it there too (same id), then
     // attach a deterministic handler returning the numeric `{sum, ok}`.
-    let reg = build_tool_reg(py, tool_name, &owner);
-    let ffi_tool_id = scp.tool_register(&ctx_b, &reg.as_borrowed()).unwrap();
+    let reg = build_outlet_reg(py, outlet_name, &owner);
+    let ffi_outlet_id = scp.outlet_register(&ctx_b, &reg.as_borrowed()).unwrap();
     assert_eq!(
-        ffi_tool_id, tool_id,
-        "FFI and governance tool ids must agree (deterministic generate_tool_id)"
+        ffi_outlet_id, outlet_id,
+        "FFI and governance outlet ids must agree (deterministic generate_outlet_id)"
     );
-    let handler: runtime::ToolHandler =
+    let handler: runtime::OutletHandler =
         Arc::new(|_input: serde_json::Value| Ok(serde_json::json!({"sum": 42, "ok": 1})));
-    runtime::register_tool_handler(bi, &ctx_b, &tool_id, handler).unwrap();
+    runtime::register_outlet_handler(bi, &ctx_b, &outlet_id, handler).unwrap();
 
     // Establish the bidirectionally-approved interface in A via governance.
-    let action_json = establish_interface_action_json(&ctx_a, &ctx_b, &tool_id);
+    let action_json = establish_interface_action_json(&ctx_a, &ctx_b, &outlet_id);
     let propose_result = scp
         .governance_propose(&handle_a, &owner, &action_json)
-        .expect("EstablishToolInterface must auto-execute under single_admin");
+        .expect("EstablishOutletInterface must auto-execute under single_admin");
     assert!(
         !propose_result.is_empty(),
         "governance_propose must return a non-empty result JSON"
     );
 
-    (scp, ctx_a, ctx_b, owner, tool_id)
+    (scp, ctx_a, ctx_b, owner, outlet_id)
 }
 
-/// Serializes a `RegisterTool` governance action for the saga tool. The schema
-/// mirrors `build_tool_reg`: 2 input + 2 output properties (clears the §9.2.1
+/// Serializes a `RegisterOutlet` governance action for the saga outlet. The schema
+/// mirrors `build_outlet_reg`: 2 input + 2 output properties (clears the §9.2.1
 /// specificity floor of 2), numeric `{sum, ok}` output (so Commit-B's
 /// output-schema validation accepts the handler's response). `implementation_hash`
 /// is a fixed `[u8; 32]`; serde expects a 32-element JSON number array (the
 /// `json!` macro has no array-repeat sugar).
-fn register_tool_action_json(tool_id: &str, tool_name: &str, owner: &str) -> String {
+fn register_outlet_action_json(outlet_id: &str, outlet_name: &str, owner: &str) -> String {
     let impl_hash = serde_json::Value::from(vec![0u8; 32]);
     let register_action = serde_json::json!({
-        "RegisterTool": {
+        "RegisterOutlet": {
             "registration": {
-                "tool_id": tool_id,
-                "name": tool_name,
-                "description": format!("Tool: {tool_name}"),
+                "outlet_id": outlet_id,
+                "name": outlet_name,
+                "description": format!("Outlet: {outlet_name}"),
                 "schema": {
                     "input_schema": {
                         "type": "object",
@@ -1983,17 +1983,17 @@ fn register_tool_action_json(tool_id: &str, tool_name: &str, owner: &str) -> Str
     serde_json::to_string(&register_action).unwrap()
 }
 
-/// Serializes the bidirectionally-approved `EstablishToolInterface` governance
+/// Serializes the bidirectionally-approved `EstablishOutletInterface` governance
 /// action. Externally-tagged `GovernanceAction` (no serde rename) → the
-/// `EstablishToolInterface` variant wraps the `snake_case` `ToolInterface` struct;
+/// `EstablishOutletInterface` variant wraps the `snake_case` `OutletInterface` struct;
 /// the `Option` fields render as JSON `null`.
-fn establish_interface_action_json(ctx_a: &str, ctx_b: &str, tool_id: &str) -> String {
+fn establish_interface_action_json(ctx_a: &str, ctx_b: &str, outlet_id: &str) -> String {
     let action = serde_json::json!({
-        "EstablishToolInterface": {
+        "EstablishOutletInterface": {
             "interface": {
                 "source_context": ctx_a,
                 "target_context": ctx_b,
-                "tool_id": tool_id,
+                "outlet_id": outlet_id,
                 "rate_limit": null,
                 "inbound_rate_limit": null,
                 "per_caller_rate_limit": null,
@@ -2008,15 +2008,15 @@ fn establish_interface_action_json(ctx_a: &str, ctx_b: &str, tool_id: &str) -> S
 }
 
 /// Full `Committed` terminal through the `PyO3` bridge: an authenticated caller
-/// drives the §6.2.4 cross-context tool-invocation saga to a real commit and
+/// drives the §6.2.4 cross-context outlet-invocation saga to a real commit and
 /// the bridge returns the committed receipt + output bytes. See
 /// `establish_xctx_saga_commit_preconditions` for the setup it depends on.
 #[test]
 fn xctx_saga_authenticated_caller_commits_via_governance_established_interface() {
     Python::with_gil(|py| {
-        let (scp, ctx_a, ctx_b, owner, tool_id) = establish_xctx_saga_commit_preconditions(py);
+        let (scp, ctx_a, ctx_b, owner, outlet_id) = establish_xctx_saga_commit_preconditions(py);
 
-        // Invoke the saga from A → B with the authenticated caller. The tool's
+        // Invoke the saga from A → B with the authenticated caller. The outlet's
         // input schema wants string `a`/`b`.
         let input = PyDict::new(py);
         input.set_item("a", "x").unwrap();
@@ -2033,11 +2033,11 @@ fn xctx_saga_authenticated_caller_commits_via_governance_established_interface()
         .unwrap();
 
         let result = scp
-            .tool_invoke_cross_context_saga(
+            .outlet_invoke_cross_context_saga(
                 &ctx_a,
                 &ctx_b,
                 &owner,
-                &tool_id,
+                &outlet_id,
                 &input.as_borrowed(),
                 &nonce_hex(),
                 now_ms,

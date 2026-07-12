@@ -97,7 +97,7 @@ pub trait EventLogSigner: Send + Sync {
 /// governance-action-coverage, lifecycle/migration, content-access, economic,
 /// consequence-enforcement, commit-broadcast-reconciliation, compromise-recovery,
 /// and app-sandbox-binding variants; the cross-context-saga event model
-/// (ADR-011 Amendment §6 for `CrossContextToolInvoked`; spec §6.2.4 for
+/// (ADR-011 Amendment §6 for `CrossContextOutletInvoked`; spec §6.2.4 for
 /// `CrossContextDivergenceMarker`) added the 2 `CrossContext*` variants. This is a CLOSED set with no catch-all
 /// variant: every protocol action that produces a verifiable Merkle-log entry
 /// is one of these variants.
@@ -125,16 +125,16 @@ pub enum EventType {
     TokenRevoked,
     /// A message was sent within the context.
     MessageSent,
-    /// A tool was registered in the context.
-    ToolRegistered,
-    /// A tool registration was updated.
-    ToolUpdated,
-    /// A tool was invoked.
-    ToolInvoked,
-    /// A tool invocation result was verified.
-    ToolVerified,
-    /// A tool interface was established.
-    ToolInterfaceEstablished,
+    /// A outlet was registered in the context.
+    OutletRegistered,
+    /// A outlet registration was updated.
+    OutletUpdated,
+    /// A outlet was invoked.
+    OutletInvoked,
+    /// A outlet invocation result was verified.
+    OutletVerified,
+    /// A outlet interface was established.
+    OutletInterfaceEstablished,
     /// A governance action was executed (legacy variant, see also
     /// `GovernanceActionExecuted`).
     GovernanceAction,
@@ -284,9 +284,9 @@ pub enum EventType {
     /// A context migration started (`ProposeContextMigration` §5.11A grace
     /// start).
     ContextMigrationStarted,
-    /// A tool was removed (`RemoveTool`; pairs with
-    /// [`EventType::ToolRegistered`]).
-    ToolRemoved,
+    /// A outlet was removed (`RemoveOutlet`; pairs with
+    /// [`EventType::OutletRegistered`]).
+    OutletRemoved,
     /// The pruning policy was modified (`ModifyPruningPolicy` ADR-030 §6).
     PruningPolicyModified,
     /// An MLS commit was broadcast (commit broadcast record §9.9
@@ -407,29 +407,29 @@ pub enum EventType {
     AppUnbound,
 
     // -------------------------------------------------------------------
-    // Cross-context tool-call saga event types (ADR-011 Amendment §6
+    // Cross-context outlet-call saga event types (ADR-011 Amendment §6
     // carve-out; `.docs/adrs/phase-2.md`). UNLIKE the intra-context,
-    // per-author `ToolInvoked` emission (excluded as non-convergent under
-    // the §2 per-author exclusion), the cross-context tool-call saga records
+    // per-author `OutletInvoked` emission (excluded as non-convergent under
+    // the §2 per-author exclusion), the cross-context outlet-call saga records
     // these WITHIN the saga's MLS-Commit phase: they are commit-ordered,
     // convergent, durable leaves — every honest member processing the same
     // saga commit produces the byte-identical leaf (committer-assigned
-    // timestamp drawn from B's signed `CrossContextToolReceipt`). The
+    // timestamp drawn from B's signed `CrossContextOutletReceipt`). The
     // committed-side event id is itself a signed receipt field, so the
     // record is canonical by design. See spec §6.2.4 "Dual event-log
     // recording".
     // -------------------------------------------------------------------
-    /// A cross-context tool call was recorded on the CALLER side (spec
+    /// A cross-context outlet call was recorded on the CALLER side (spec
     /// §6.2.4 "Dual event-log recording"; ADR-011 Amendment §6 carve-out).
     ///
     /// A convergent, commit-ordered durable leaf — NOT a per-author-excluded
     /// event. Emitted by the caller-side actor at Commit-A referencing the
     /// target context id and the same `nonce` as the target's
-    /// [`EventType::ToolInvoked`] record, so an auditor joins the two into one
+    /// [`EventType::OutletInvoked`] record, so an auditor joins the two into one
     /// provenance edge. The committer-assigned leaf timestamp is the target's
     /// signed-receipt `timestamp_ms` (B's staged Prepare-B instant), so two
     /// honest members reconstruct the identical leaf.
-    CrossContextToolInvoked,
+    CrossContextOutletInvoked,
     /// A one-sided cross-context saga commit was made durably auditable (spec
     /// §6.2.4 "Dual event-log recording"; ADR-011 Amendment §6 carve-out).
     ///
@@ -439,7 +439,7 @@ pub enum EventType {
     /// committed-side event id (a signed `CrossContextDivergenceMarker`
     /// payload). The committer-assigned leaf timestamp is the target's staged
     /// `recorded_timestamp_ms` (the same convergent instant the committed-side
-    /// [`EventType::ToolInvoked`] leaf carries), so the marker leaf is
+    /// [`EventType::OutletInvoked`] leaf carries), so the marker leaf is
     /// byte-identical across honest members.
     CrossContextDivergenceMarker,
 }
@@ -733,11 +733,11 @@ mod tests {
             EventType::RoleAssigned,
             EventType::TokenRevoked,
             EventType::MessageSent,
-            EventType::ToolRegistered,
-            EventType::ToolUpdated,
-            EventType::ToolInvoked,
-            EventType::ToolVerified,
-            EventType::ToolInterfaceEstablished,
+            EventType::OutletRegistered,
+            EventType::OutletUpdated,
+            EventType::OutletInvoked,
+            EventType::OutletVerified,
+            EventType::OutletInterfaceEstablished,
             EventType::GovernanceAction,
             EventType::ConsistencyCheckpoint,
             EventType::AbsenceProofRequested,
@@ -779,7 +779,7 @@ mod tests {
             EventType::HardRateLimitModified,
             EventType::EconomicPolicyLocked,
             EventType::ContextMigrationStarted,
-            EventType::ToolRemoved,
+            EventType::OutletRemoved,
             EventType::PruningPolicyModified,
             EventType::CommitBroadcasted,
             EventType::CommitBroadcastPending,
@@ -799,7 +799,7 @@ mod tests {
             EventType::RecoveryEpochAdvanced,
             EventType::AppBound,
             EventType::AppUnbound,
-            EventType::CrossContextToolInvoked,
+            EventType::CrossContextOutletInvoked,
             EventType::CrossContextDivergenceMarker,
         ]
     }

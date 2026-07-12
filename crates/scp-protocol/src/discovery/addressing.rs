@@ -14,9 +14,9 @@ pub const MAX_LOCAL_PART_LENGTH: usize = 64;
 
 /// The target of a handle registration -- what the handle points to.
 ///
-/// Used when registering handles in a context with discovery tools via `handle_register`.
+/// Used when registering handles in a context with discovery outlets via `handle_register`.
 ///
-/// See §22.3.1 Handle Tools.
+/// See §22.3.1 Handle Outlets.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum HandleTarget {
     /// The handle points to a DID (identity address).

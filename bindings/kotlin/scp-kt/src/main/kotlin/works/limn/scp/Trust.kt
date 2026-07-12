@@ -141,7 +141,7 @@ data class CapabilityValidation(
  * TypeScript SDK `BehavioralRecord`, and the Rust `ParticipationFacts` 1:1.
  *
  * The six leaf-derived facts (participation duration, governance actions
- * against/by, context creation, role progression, tool invocation count) come
+ * against/by, context creation, role progression, outlet invocation count) come
  * from the context's convergent Merkle event log. [attestationCount] is the one
  * exception: it is a credential-layer fact (§7.4), NOT event-log-derived, NOT
  * covered by [eventLogRoot], and **verifier-relative** (two agents may compute
@@ -152,9 +152,9 @@ data class CapabilityValidation(
  * @property governanceActionsAgainst Governance actions against this identity
  *   (the subject is the projected target).
  * @property governanceActionsBy Governance actions initiated by this identity.
- * @property toolInvocationCount Total tool invocations across all tool types.
- * @property toolInvocationCountAnchored Whether [toolInvocationCount] is anchored
- *   in the canonical Merkle log. `false` until ADR-051 makes `ToolInvoked` a
+ * @property outletInvocationCount Total outlet invocations across all outlet types.
+ * @property outletInvocationCountAnchored Whether [outletInvocationCount] is anchored
+ *   in the canonical Merkle log. `false` until ADR-051 makes `OutletInvoked` a
  *   convergent leaf — consumers MUST NOT treat the count as Merkle-proven while
  *   this is `false`.
  * @property contextCreationCount Contexts created by the subject (`ChildContextCreated`).
@@ -172,8 +172,8 @@ data class BehavioralRecord(
     val participationDurationSecs: ULong,
     val governanceActionsAgainst: ULong,
     val governanceActionsBy: ULong,
-    val toolInvocationCount: ULong,
-    val toolInvocationCountAnchored: Boolean,
+    val outletInvocationCount: ULong,
+    val outletInvocationCountAnchored: Boolean,
     val contextCreationCount: ULong,
     val roleProgressionCount: ULong,
     val attestationCount: ULong,
@@ -189,8 +189,8 @@ data class BehavioralRecord(
                 participationDurationSecs = view.participationDurationSecs,
                 governanceActionsAgainst = view.governanceActionsAgainst,
                 governanceActionsBy = view.governanceActionsBy,
-                toolInvocationCount = view.toolInvocationCount,
-                toolInvocationCountAnchored = view.toolInvocationCountAnchored,
+                outletInvocationCount = view.outletInvocationCount,
+                outletInvocationCountAnchored = view.outletInvocationCountAnchored,
                 contextCreationCount = view.contextCreationCount,
                 roleProgressionCount = view.roleProgressionCount,
                 attestationCount = view.attestationCount,
@@ -211,8 +211,8 @@ data class BehavioralRecord(
                 participationDurationSecs = 0uL,
                 governanceActionsAgainst = 0uL,
                 governanceActionsBy = 0uL,
-                toolInvocationCount = 0uL,
-                toolInvocationCountAnchored = false,
+                outletInvocationCount = 0uL,
+                outletInvocationCountAnchored = false,
                 contextCreationCount = 0uL,
                 roleProgressionCount = 0uL,
                 attestationCount = 0uL,

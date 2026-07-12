@@ -12,7 +12,7 @@
 //! ```
 //!
 //! - `context_id`: The context identifier, or `*` for wildcard (all contexts).
-//! - `resource`: The resource type (e.g., `messages`, `tool_invoke`, `member`,
+//! - `resource`: The resource type (e.g., `messages`, `outlet_call`, `member`,
 //!   `role`, `context`).
 //! - `action`: The action on the resource (e.g., `read`, `write`, `invite`,
 //!   `assign`, `close`, `assistant`).
@@ -69,7 +69,7 @@ use super::UcanError;
 pub struct CapabilityUri {
     /// The context identifier, or `None` for wildcard (`*`).
     context_id: Option<String>,
-    /// The resource type (e.g., `"messages"`, `"tool_invoke"`, `"member"`).
+    /// The resource type (e.g., `"messages"`, `"outlet_call"`, `"member"`).
     resource: String,
     /// The action on the resource (e.g., `"read"`, `"write"`, `"invite"`).
     action: String,
@@ -108,7 +108,7 @@ impl CapabilityUri {
         self.context_id.as_deref()
     }
 
-    /// Returns the resource type (e.g., `"messages"`, `"tool_invoke"`).
+    /// Returns the resource type (e.g., `"messages"`, `"outlet_call"`).
     #[must_use]
     pub fn resource(&self) -> &str {
         &self.resource
@@ -118,6 +118,24 @@ impl CapabilityUri {
     #[must_use]
     pub fn action(&self) -> &str {
         &self.action
+    }
+
+    /// Returns `true` if this capability's resource is an outlet stem
+    /// (`outlet_query` or `outlet_call`).
+    ///
+    /// Outlet stems are the ONLY capabilities that the §7.3.8 invocation
+    /// caveats (`max_calls`, `amount_max_*`, `rate_window`, `origin_kind`,
+    /// `valid_*`, `hours_of_day`, `days_of_week`, `allowed_adapters`,
+    /// `allowed_target_dids`, `input_schema`) scope to: those caveats bound
+    /// outlet *invocation* and are meaningless on a non-outlet capability
+    /// (e.g. `messages:write`). A token whose capability set contains NO
+    /// outlet stem therefore carries NO invocation caveats — its `nb` MUST be
+    /// `None`. This classifier is the single shared predicate used by both the
+    /// delegation mint and the per-edge validator to decide whether an edge is
+    /// "outlet scoped" so the two stay symmetric (§5.4.2, SCP-OUT-014).
+    #[must_use]
+    pub fn is_outlet_stem(&self) -> bool {
+        matches!(self.resource.as_str(), "outlet_query" | "outlet_call")
     }
 
     /// Returns `true` if this is a wildcard URI (`scp:ctx:*/{capability}`).
@@ -148,8 +166,8 @@ impl CapabilityUri {
     /// A wildcard URI matches any URI with the same resource and action.
     /// A specific URI matches only URIs with the same context ID, resource,
     /// and action. A wildcard action (`"*"`) on the granting URI matches any
-    /// action on the same resource (e.g., `tool_invoke:*` grants
-    /// `tool_invoke:calculator`).
+    /// action on the same resource (e.g., `outlet_call:*` grants
+    /// `outlet_call:calculator`).
     ///
     /// This is used during capability matching in UCAN validation: a token's
     /// attenuation must match the required capability.
@@ -181,12 +199,12 @@ impl CapabilityUri {
     /// Checks if this capability is within the context's capability ceiling.
     ///
     /// The ceiling is a set of capability names in `{resource}:{action}` format
-    /// (e.g., `"messages:write"`, `"tool_invoke:assistant"`). This performs a
+    /// (e.g., `"messages:write"`, `"outlet_call:assistant"`). This performs a
     /// constant-time set membership test as specified by ADR-016.
     ///
     /// A wildcard entry `{resource}:*` in the ceiling covers all actions on
-    /// that resource. For example, `"tool_invoke:*"` in the ceiling allows
-    /// `tool_invoke:calculator`, `tool_invoke:assistant`, etc.
+    /// that resource. For example, `"outlet_call:*"` in the ceiling allows
+    /// `outlet_call:calculator`, `outlet_call:assistant`, etc.
     ///
     /// # Arguments
     ///
@@ -201,6 +219,37 @@ impl CapabilityUri {
         // Check for wildcard: {resource}:* covers all actions on this resource.
         ceiling.contains(&format!("{}:*", self.resource))
     }
+}
+
+/// Returns `true` if ANY attestation in `att` carries an outlet stem
+/// (`outlet_query:*` / `outlet_call:*`) resource.
+///
+/// This is the §7.3.8 "outlet-scoped" classifier for a whole capability set,
+/// shared verbatim by the delegation mint and the per-edge validator so the
+/// two never diverge. Invocation caveats are outlet-scoped: a token whose
+/// capability set contains no outlet stem carries no invocation caveats and
+/// MUST have `nb = None`. A token that DOES carry an outlet stem is on an
+/// "outlet edge" and its `nb` participates in the full §7.3.8 narrowing /
+/// `origin_kind`-materialization gate.
+///
+/// # Errors
+///
+/// Fail-closed: returns [`UcanError::MalformedToken`] if any attestation URI
+/// is unparseable, so a corrupted/forged attestation can never be silently
+/// treated as "non-outlet" (which would let it launder an ancestor's caveats).
+pub fn att_set_has_outlet_stem(att: &[super::Attenuation]) -> Result<bool, UcanError> {
+    for a in att {
+        let uri: CapabilityUri = a.with.parse().map_err(|e: UcanError| {
+            UcanError::MalformedToken(format!(
+                "unparseable capability URI '{}' while classifying outlet scope: {e}",
+                a.with
+            ))
+        })?;
+        if uri.is_outlet_stem() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 impl FromStr for CapabilityUri {
@@ -370,10 +419,10 @@ mod tests {
     }
 
     #[test]
-    fn parse_tool_invoke_assistant() {
-        let uri: CapabilityUri = "scp:ctx:abc123/tool_invoke:assistant".parse().unwrap();
+    fn parse_outlet_call_assistant() {
+        let uri: CapabilityUri = "scp:ctx:abc123/outlet_call:assistant".parse().unwrap();
         assert_eq!(uri.context_id(), Some("abc123"));
-        assert_eq!(uri.resource(), "tool_invoke");
+        assert_eq!(uri.resource(), "outlet_call");
         assert_eq!(uri.action(), "assistant");
     }
 
@@ -497,7 +546,7 @@ mod tests {
         let uris = [
             "scp:ctx:abc123/messages:write",
             "scp:ctx:abc123/messages:read",
-            "scp:ctx:abc123/tool_invoke:assistant",
+            "scp:ctx:abc123/outlet_call:assistant",
             "scp:ctx:abc123/member:invite",
             "scp:ctx:abc123/role:assign",
             "scp:ctx:abc123/context:close",
@@ -607,40 +656,40 @@ mod tests {
 
     #[test]
     fn matches_wildcard_action_grants_specific_action() {
-        // tool_invoke:* grants tool_invoke:calculator (#1326)
-        let granted = CapabilityUri::new("abc123", "tool_invoke", "*");
-        let required = CapabilityUri::new("abc123", "tool_invoke", "calculator");
+        // outlet_call:* grants outlet_call:calculator (#1326)
+        let granted = CapabilityUri::new("abc123", "outlet_call", "*");
+        let required = CapabilityUri::new("abc123", "outlet_call", "calculator");
         assert!(granted.matches(&required));
     }
 
     #[test]
     fn matches_wildcard_action_grants_any_action_on_same_resource() {
-        let granted = CapabilityUri::new("abc123", "tool_invoke", "*");
-        let required_a = CapabilityUri::new("abc123", "tool_invoke", "assistant");
-        let required_b = CapabilityUri::new("abc123", "tool_invoke", "calculator");
+        let granted = CapabilityUri::new("abc123", "outlet_call", "*");
+        let required_a = CapabilityUri::new("abc123", "outlet_call", "assistant");
+        let required_b = CapabilityUri::new("abc123", "outlet_call", "calculator");
         assert!(granted.matches(&required_a));
         assert!(granted.matches(&required_b));
     }
 
     #[test]
     fn matches_wildcard_action_does_not_cross_resources() {
-        let granted = CapabilityUri::new("abc123", "tool_invoke", "*");
+        let granted = CapabilityUri::new("abc123", "outlet_call", "*");
         let required = CapabilityUri::new("abc123", "messages", "write");
         assert!(!granted.matches(&required));
     }
 
     #[test]
     fn matches_wildcard_action_with_wildcard_context() {
-        let granted = CapabilityUri::wildcard("tool_invoke", "*");
-        let required = CapabilityUri::new("any-ctx", "tool_invoke", "calculator");
+        let granted = CapabilityUri::wildcard("outlet_call", "*");
+        let required = CapabilityUri::new("any-ctx", "outlet_call", "calculator");
         assert!(granted.matches(&required));
     }
 
     #[test]
     fn matches_specific_action_does_not_satisfy_wildcard_action_requirement() {
         // A specific grant cannot satisfy a wildcard action requirement.
-        let granted = CapabilityUri::new("abc123", "tool_invoke", "calculator");
-        let required = CapabilityUri::new("abc123", "tool_invoke", "*");
+        let granted = CapabilityUri::new("abc123", "outlet_call", "calculator");
+        let required = CapabilityUri::new("abc123", "outlet_call", "*");
         assert!(!granted.matches(&required));
     }
 
@@ -653,7 +702,7 @@ mod tests {
         let ceiling: HashSet<String> = [
             "messages:read".to_owned(),
             "messages:write".to_owned(),
-            "tool_invoke:assistant".to_owned(),
+            "outlet_call:assistant".to_owned(),
         ]
         .into_iter()
         .collect();
@@ -690,15 +739,15 @@ mod tests {
 
     #[test]
     fn is_within_ceiling_wildcard_action_covers_specific() {
-        // "tool_invoke:*" in ceiling allows tool_invoke:calculator (#1326)
-        let ceiling: HashSet<String> = ["tool_invoke:*".to_owned()].into_iter().collect();
-        let uri = CapabilityUri::new("abc123", "tool_invoke", "calculator");
+        // "outlet_call:*" in ceiling allows outlet_call:calculator (#1326)
+        let ceiling: HashSet<String> = ["outlet_call:*".to_owned()].into_iter().collect();
+        let uri = CapabilityUri::new("abc123", "outlet_call", "calculator");
         assert!(uri.is_within_ceiling(&ceiling));
     }
 
     #[test]
     fn is_within_ceiling_wildcard_action_does_not_cross_resources() {
-        let ceiling: HashSet<String> = ["tool_invoke:*".to_owned()].into_iter().collect();
+        let ceiling: HashSet<String> = ["outlet_call:*".to_owned()].into_iter().collect();
         let uri = CapabilityUri::new("abc123", "messages", "write");
         assert!(!uri.is_within_ceiling(&ceiling));
     }
@@ -707,12 +756,12 @@ mod tests {
     fn is_within_ceiling_exact_match_preferred_over_wildcard() {
         // Both exact and wildcard are present — exact match takes the fast path.
         let ceiling: HashSet<String> = [
-            "tool_invoke:calculator".to_owned(),
-            "tool_invoke:*".to_owned(),
+            "outlet_call:calculator".to_owned(),
+            "outlet_call:*".to_owned(),
         ]
         .into_iter()
         .collect();
-        let uri = CapabilityUri::new("abc123", "tool_invoke", "calculator");
+        let uri = CapabilityUri::new("abc123", "outlet_call", "calculator");
         assert!(uri.is_within_ceiling(&ceiling));
     }
 
@@ -725,7 +774,7 @@ mod tests {
         let ceiling: HashSet<String> = [
             "messages:read".to_owned(),
             "messages:write".to_owned(),
-            "tool_invoke:assistant".to_owned(),
+            "outlet_call:assistant".to_owned(),
         ]
         .into_iter()
         .collect();
@@ -885,7 +934,7 @@ mod tests {
         fn arb_resource() -> impl Strategy<Value = String> {
             prop_oneof![
                 Just("messages".to_owned()),
-                Just("tool_invoke".to_owned()),
+                Just("outlet_call".to_owned()),
                 Just("member".to_owned()),
                 Just("role".to_owned()),
                 Just("context".to_owned()),

@@ -8,7 +8,7 @@ surface with mocked ``_native`` objects:
 - :class:`Context` / :class:`Membership` data-class shape
 - :meth:`SCP.context_create` forwards Pythonic parameters correctly
 - :meth:`SCP.context_join` / ``context_leave`` / ``context_close`` /
-  ``context_send`` / ``context_receive`` / ``tool_invoke`` dispatch
+  ``context_send`` / ``context_receive`` / ``outlet_invoke`` dispatch
 - :meth:`SCP.evaluate_invitation` with ``spending_json``
 - Consequence event message types
 
@@ -181,7 +181,7 @@ class TestScpContextCreate:
         params = {
             "ceiling": ["messages:read", "messages:write"],
             "roles": {"admin": ["context:close"]},
-            "tools": [],
+            "outlets": [],
             "ttl": 300.0,
             "memory_scope": "full",
             "governance": "single_admin",
@@ -339,16 +339,16 @@ class TestScpContextCreate:
         await SCP.context_create(scp, "did:dht:z6MkAlice", {"ceiling": [], "roles": {}})
         assert native.context_create.call_args[0][1]["roles"] == {}
 
-    async def test_accepts_empty_tools(self) -> None:
-        """H14: an explicit empty tools list must round-trip as an empty list."""
+    async def test_accepts_empty_outlets(self) -> None:
+        """H14: an explicit empty outlets list must round-trip as an empty list."""
         from scp_sdk.scp import SCP
 
         native = MagicMock()
         native.context_create.return_value = _MockHandle()
         scp = _make_scp(native)
 
-        await SCP.context_create(scp, "did:dht:z6MkAlice", {"ceiling": [], "tools": []})
-        assert native.context_create.call_args[0][1]["tools"] == []
+        await SCP.context_create(scp, "did:dht:z6MkAlice", {"ceiling": [], "outlets": []})
+        assert native.context_create.call_args[0][1]["outlets"] == []
 
 
 # ---------------------------------------------------------------------------
@@ -455,12 +455,12 @@ class TestScpContextSend:
 
 
 # ---------------------------------------------------------------------------
-# SCP.tool_invoke — dispatch tests
+# SCP.outlet_invoke — dispatch tests
 # ---------------------------------------------------------------------------
 
 
-class TestScpToolInvoke:
-    """Verify :meth:`SCP.tool_invoke` (AC 3, 12).
+class TestScpOutletInvoke:
+    """Verify :meth:`SCP.outlet_invoke` (AC 3, 12).
 
     The PyO3 bridge requires ``ucan_token`` (5th positional), an optional
     ``proof_tokens`` (6th), and an optional ``spending_ucan`` (7th).
@@ -472,10 +472,10 @@ class TestScpToolInvoke:
 
         native = MagicMock()
         expected = {"recipes": ["cake", "pie"], "count": 2}
-        native.tool_invoke.return_value = expected
+        native.outlet_invoke.return_value = expected
         scp = _make_scp(native)
 
-        result = await SCP.tool_invoke(
+        result = await SCP.outlet_invoke(
             scp,
             "ctx-test-abc123",
             "recipe_search",
@@ -492,20 +492,20 @@ class TestScpToolInvoke:
         from scp_sdk.scp import SCP
 
         native = MagicMock()
-        native.tool_invoke.return_value = {}
+        native.outlet_invoke.return_value = {}
         scp = _make_scp(native)
 
         ucan = "eyJ0eXAiOiJKV1QiLCJhbGciOiJFZERTQSJ9.payload.signature"
-        await SCP.tool_invoke(
+        await SCP.outlet_invoke(
             scp,
             "ctx-test-abc123",
-            "tool",
+            "outlet",
             {"key": "val"},
             "did:dht:z6MkAlice",
             ucan,
         )
 
-        call_args = native.tool_invoke.call_args[0]
+        call_args = native.outlet_invoke.call_args[0]
         assert call_args[4] == ucan
 
     async def test_invoke_passes_proof_tokens(self) -> None:
@@ -513,21 +513,21 @@ class TestScpToolInvoke:
         from scp_sdk.scp import SCP
 
         native = MagicMock()
-        native.tool_invoke.return_value = {}
+        native.outlet_invoke.return_value = {}
         scp = _make_scp(native)
 
         proofs = ["proof-a", "proof-b"]
-        await SCP.tool_invoke(
+        await SCP.outlet_invoke(
             scp,
             "ctx-test-abc123",
-            "tool",
+            "outlet",
             {},
             "did:dht:z6MkAlice",
             "tok",
             proofs,
         )
 
-        call_args = native.tool_invoke.call_args[0]
+        call_args = native.outlet_invoke.call_args[0]
         assert call_args[5] == ["proof-a", "proof-b"]
 
     async def test_invoke_spending_ucan_default_none(self) -> None:
@@ -535,19 +535,19 @@ class TestScpToolInvoke:
         from scp_sdk.scp import SCP
 
         native = MagicMock()
-        native.tool_invoke.return_value = {}
+        native.outlet_invoke.return_value = {}
         scp = _make_scp(native)
 
-        await SCP.tool_invoke(
+        await SCP.outlet_invoke(
             scp,
             "ctx-test-abc123",
-            "tool",
+            "outlet",
             {},
             "did:dht:z6MkAlice",
             "tok",
         )
 
-        call_args = native.tool_invoke.call_args[0]
+        call_args = native.outlet_invoke.call_args[0]
         assert call_args[6] is None
 
     async def test_invoke_passes_spending_ucan(self) -> None:
@@ -555,14 +555,14 @@ class TestScpToolInvoke:
         from scp_sdk.scp import SCP
 
         native = MagicMock()
-        native.tool_invoke.return_value = {}
+        native.outlet_invoke.return_value = {}
         scp = _make_scp(native)
 
         spending = "eyJ0eXAiOiJKV1QiLCJhbGciOiJFZERTQSJ9.spending.sig"
-        await SCP.tool_invoke(
+        await SCP.outlet_invoke(
             scp,
             "ctx-test-abc123",
-            "paid_tool",
+            "paid_outlet",
             {"amount": 100},
             "did:dht:z6MkAlice",
             "tok",
@@ -570,7 +570,7 @@ class TestScpToolInvoke:
             spending,
         )
 
-        call_args = native.tool_invoke.call_args[0]
+        call_args = native.outlet_invoke.call_args[0]
         assert call_args[6] == spending
 
 

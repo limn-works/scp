@@ -160,7 +160,7 @@ fn fullstack_create_context_impl(
             |arr| {
                 arr.iter()
                     .filter_map(|v| v.as_str())
-                    .map(Capability::new)
+                    .filter_map(Capability::new)
                     .collect::<Vec<_>>()
             },
         );

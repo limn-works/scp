@@ -217,17 +217,26 @@ class MemberRole(enum.Enum):
 class Capability(enum.Enum):
     """Protocol-defined capabilities within an SCP context.
 
-    Mirrors ``scp_core::context::roles::Capability``.  Values use the
-    colon-separated format expected by ``Capability::new()`` in Rust
-    (e.g. ``"messages:write"``).  Parameterised variants
-    (``ToolInvoke(tool_id)``, ``Custom(name)``) are produced by the
-    :meth:`tool_invoke` and :meth:`custom` static helpers.
+    Mirrors ``scp_core::context::roles::Capability``. Values use the
+    SDK-facing colon-separated format expected by ``Capability::new`` in
+    Rust (e.g. ``"messages:write"``, ``"outlet:call:*"``). Parameterised
+    variants (``OutletQuery(outlet_id)``, ``OutletCall(outlet_id)``,
+    ``Custom(name)``) are produced by the :meth:`outlet_query`,
+    :meth:`outlet_call`, and :meth:`custom` static helpers.
+
+    The pre-rename outlet-prefixed capability stems (invoke / register /
+    interface) are deleted with no transitional alias; the protocol
+    hard-rejects them at construction time (ADR-049 §1).
     """
 
     MESSAGES_READ = "messages:read"
     MESSAGES_WRITE = "messages:write"
-    TOOL_INVOKE_ALL = "tool:invoke:*"
-    TOOL_REGISTER = "tool:register"
+    #: Query outlet capability — read-only; never billed.
+    OUTLET_QUERY_ALL = "outlet:query:*"
+    #: Action outlet capability — the outlet may mutate state and may incur
+    #: cost (billable).
+    OUTLET_CALL_ALL = "outlet:call:*"
+    OUTLET_REGISTER = "outlet:register"
     MEMBER_INVITE = "member:invite"
     MEMBER_REMOVE = "member:remove"
     ROLE_ASSIGN = "role:assign"
@@ -235,7 +244,7 @@ class Capability(enum.Enum):
     GOVERNANCE_VOTE = "governance:vote"
     CONTEXT_CLOSE = "context:close"
     CHILD_CONTEXT_CREATE = "context:child:create"
-    TOOL_INTERFACE = "tool:interface"
+    OUTLET_INTERFACE = "outlet:interface"
     BRIDGING = "bridging"
     MEDIA_VOICE = "media:voice"
     MEDIA_VIDEO = "media:video"
@@ -244,13 +253,29 @@ class Capability(enum.Enum):
     METADATA_EDIT = "metadata:edit"
 
     @staticmethod
-    def tool_invoke(tool_id: str) -> str:
-        """Return the capability string for invoking a specific tool.
+    def outlet_query(outlet_id: str) -> str:
+        """Return the capability string for invoking a specific Query outlet.
+
+        Query outlet capability — read-only; never billed.
 
         Since Python enums cannot carry per-instance data, parameterised
-        capabilities are represented as plain strings.
+        capabilities are represented as plain strings. Per spec §5.4.2.1
+        the suffix must match ``^[a-z0-9_-]{1,128}$``.
         """
-        return f"tool:invoke:{tool_id}"
+        return f"outlet:query:{outlet_id}"
+
+    @staticmethod
+    def outlet_call(outlet_id: str) -> str:
+        """Return the capability string for invoking a specific Action outlet.
+
+        Action outlet capability — the outlet may mutate state and may
+        incur cost (billable).
+
+        Since Python enums cannot carry per-instance data, parameterised
+        capabilities are represented as plain strings. Per spec §5.4.2.1
+        the suffix must match ``^[a-z0-9_-]{1,128}$``.
+        """
+        return f"outlet:call:{outlet_id}"
 
     @staticmethod
     def custom(name: str) -> str:

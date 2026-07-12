@@ -215,13 +215,13 @@ class ConformanceRunnerTest {
             }
 
         @Test
-        fun `dispatcher handles all tool operations`() =
+        fun `dispatcher handles all outlet operations`() =
             runTest(testDispatcher) {
-                assertDispatchSucceeds("tool_register", mapOf("context_handle" to "10"))
-                assertDispatchSucceeds("tool_invoke", mapOf("context_handle" to "10", "identity_handle" to "1"))
+                assertDispatchSucceeds("outlet_register", mapOf("context_handle" to "10"))
+                assertDispatchSucceeds("outlet_invoke", mapOf("context_handle" to "10", "identity_handle" to "1"))
                 assertDispatchSucceeds(
-                    "tool_verify",
-                    mapOf("context_handle" to "10", "tool_id" to "t"),
+                    "outlet_verify",
+                    mapOf("context_handle" to "10", "outlet_id" to "t"),
                 )
             }
 
@@ -298,15 +298,15 @@ class ConformanceRunnerTest {
                 expected = mapOf("status" to "sent"),
             ),
             ConformanceFixture(
-                testId = "roundtrip-tool-001",
-                category = "tools",
-                description = "Register tool",
-                operation = "tool_register",
+                testId = "roundtrip-outlet-001",
+                category = "outlets",
+                description = "Register outlet",
+                operation = "outlet_register",
                 input = mapOf(
                     "context_handle" to "10",
                     "definition" to "{}",
                 ),
-                expected = mapOf("tool_id" to "tool-001"),
+                expected = mapOf("outlet_id" to "outlet-001"),
             ),
         )
 

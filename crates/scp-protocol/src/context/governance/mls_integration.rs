@@ -61,7 +61,7 @@ pub enum MlsImpact {
 ///
 /// `AddMember`, `RemoveMember`, and `Revoke` require MLS group operations (in
 /// encrypted contexts, revocation removes the member from the MLS group).
-/// All other governance actions (role changes, settings changes, tool
+/// All other governance actions (role changes, settings changes, outlet
 /// registration, `RestoreAccess`, etc.) operate at the governance layer
 /// without touching MLS state. `RestoreAccess` is `NoMlsChange` because
 /// re-adding a member to the MLS group is a separate flow.
@@ -94,8 +94,8 @@ pub const fn classify_action(action: &GovernanceAction) -> MlsImpact {
         // affect MLS group membership (ADR-031 §8). Application-level
         // suspensions (SuspendCapability, SuspendAccess) do NOT touch MLS.
         GovernanceAction::ChangeRole { .. }
-        | GovernanceAction::RegisterTool { .. }
-        | GovernanceAction::RemoveTool { .. }
+        | GovernanceAction::RegisterOutlet { .. }
+        | GovernanceAction::RemoveOutlet { .. }
         | GovernanceAction::ModifyCeiling { .. }
         | GovernanceAction::CloseContext { .. }
         | GovernanceAction::ExtendTtl { .. }
@@ -108,7 +108,7 @@ pub const fn classify_action(action: &GovernanceAction) -> MlsImpact {
         | GovernanceAction::AddSigner { .. }
         | GovernanceAction::RemoveSigner { .. }
         | GovernanceAction::ModifyThreshold { .. }
-        | GovernanceAction::EstablishToolInterface { .. }
+        | GovernanceAction::EstablishOutletInterface { .. }
         | GovernanceAction::ResolveConflict { .. }
         | GovernanceAction::PromoteContext
         | GovernanceAction::RotateContentKeys { .. }
@@ -498,7 +498,7 @@ mod tests {
     use crate::context::governance::{
         AccessScope, GovernanceAction, GovernanceProposal, ProposalStatus, VoteType, sign_vote,
     };
-    use crate::context::params::{Capability, ContextParams, ToolRegistration};
+    use crate::context::params::{Capability, ContextParams, OutletRegistration};
     use scp_did::DID;
 
     fn alice() -> DID {
@@ -605,18 +605,21 @@ mod tests {
     }
 
     #[test]
-    fn classify_register_tool_is_no_mls_change() {
-        let action = GovernanceAction::RegisterTool {
-            registration: Box::new(ToolRegistration {
-                tool_id: "search".to_owned(),
+    fn classify_register_outlet_is_no_mls_change() {
+        let action = GovernanceAction::RegisterOutlet {
+            registration: Box::new(OutletRegistration {
+                outlet_id: "search".to_owned(),
+                kind: crate::context::outlets::OutletKind::Action,
                 name: "search".to_owned(),
-                description: "Search tool".to_owned(),
-                schema: crate::context::tools::ToolSchema {
+                description: "Search outlet".to_owned(),
+                schema: crate::context::outlets::OutletSchema {
                     input_schema: serde_json::json!({"type": "object"}),
                     output_schema: serde_json::json!({"type": "object"}),
+                    aggregate_schema: None,
                 },
                 implementation_hash: [0u8; 32],
                 test_vectors: vec![],
+                message_catalog: Vec::new(),
                 operator_did: "did:dht:z6MkTestOperator".into(),
                 cost: None,
                 registered_at: 0,
@@ -627,9 +630,9 @@ mod tests {
     }
 
     #[test]
-    fn classify_remove_tool_is_no_mls_change() {
-        let action = GovernanceAction::RemoveTool {
-            tool_id: "search".to_owned(),
+    fn classify_remove_outlet_is_no_mls_change() {
+        let action = GovernanceAction::RemoveOutlet {
+            outlet_id: "search".to_owned(),
         };
         assert_eq!(classify_action(&action), MlsImpact::NoMlsChange);
     }

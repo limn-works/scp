@@ -1240,7 +1240,7 @@ DidDocument.verification_method = [
 - Root UCAN issuance — requires `#active`. Root UCANs are the origin of all delegation chains; an agent that can issue root UCANs can grant itself arbitrary capabilities. Sub-delegation (minting scoped UCANs from an existing delegation) is Category B.
 
 **Category B — User-Configurable:** All operational actions. Human sets defaults and limits per agent via UCAN `fct.scp_agent_permissions`.
-- Messaging, blocking, context creation/joining, tool invocation, sub-UCAN minting, governance voting, spending — all configurable by the human with protocol defaults (messaging allowed, most other actions denied by default).
+- Messaging, blocking, context creation/joining, outlet invocation, sub-UCAN minting, governance voting, spending — all configurable by the human with protocol defaults (messaging allowed, most other actions denied by default).
 
 **Category C — Context-Configurable:** Per-context restrictions on agent actions via existing governance mechanisms (no new primitives).
 - `agent_keys_allowed: false` — no agents in this context

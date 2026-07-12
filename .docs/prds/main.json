@@ -1386,7 +1386,7 @@
         "`ContextState` enum with variants: `Creating`, `Active`, `Closing`, `Closed`, `Expired` — derives Debug, Clone, PartialEq, Eq, Serialize, Deserialize",
         "Valid transitions enforced: `Creating -> Active` (MLS group formed, initial parameters committed, context published), `Active -> Closing` (close initiated by admin or close-capable role), `Active -> Expired` (TTL elapsed, automatic, no governance override), `Closing -> Closed` (all members processed final events, summary generated if applicable, keys destroyed)",
         "Invalid transitions return error: `Closed -> *` (terminal), `Expired -> *` (terminal), `Creating -> Closing` (never active, just drop), `Closing -> Active` (no re-opening)",
-        "`ContextParams` struct with fields: mode (ContextMode), ceiling (Vec<Capability>), ceiling_policy (CeilingPolicy), promotion_policy (PromotionPolicy), roles (Vec<RoleDefinition>), tools (Vec<ToolRegistration>), ttl (Option<Duration>), memory_scope (MemoryScope), governance (GovernanceModel), template_id (Option<TemplateId>)",
+        "`ContextParams` struct with fields: mode (ContextMode), ceiling (Vec<Capability>), ceiling_policy (CeilingPolicy), promotion_policy (PromotionPolicy), roles (Vec<RoleDefinition>), tools (Vec<OutletRegistration>), ttl (Option<Duration>), memory_scope (MemoryScope), governance (GovernanceModel), template_id (Option<TemplateId>)",
         "`CeilingPolicy` enum: `Immutable` (default, ceiling fixed at creation, any attempt to modify returns `ContextError::CeilingImmutable`), `Governed` (ceiling can be modified through governance, can only be narrowed never expanded beyond original creation ceiling)",
         "`PromotionPolicy` enum: `NoPromotion` (context cannot be promoted, immutable lifecycle constraints), `Promotable` (context can be promoted through governance approval)",
         "`ContextMode` enum: `Encrypted` (MLS-backed, sender-side keys, full forward secrecy, default), `Broadcast` (per-author broadcast keys, no MLS, mandatory subscriber registration §5.14) — immutable after creation",
@@ -1423,7 +1423,7 @@
       ],
       "details": {
         "State machine definition": "```rust\n#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]\npub enum ContextState {\n    Creating,\n    Active,\n    Closing,\n    Closed,\n    Expired,\n}\n```\n\nValid transitions:\n- `Creating -> Active` — MLS group formed, initial parameters committed, context published.\n- `Active -> Closing` — Close initiated by admin (governance) or close-capable role.\n- `Active -> Expired` — TTL elapsed. Automatic. No governance override.\n- `Closing -> Closed` — All members processed final events, summary generated (if applicable), keys destroyed.\n\nInvalid transitions (must return error):\n- `Closed -> *` (terminal)\n- `Expired -> *` (terminal)\n- `Creating -> Closing` (never active, just drop)\n- `Closing -> Active` (no re-opening)",
-        "ContextParams struct": "```rust\npub struct ContextParams {\n    pub mode: ContextMode,\n    pub ceiling: Vec<Capability>,\n    pub ceiling_policy: CeilingPolicy,\n    pub promotion_policy: PromotionPolicy,\n    pub roles: Vec<RoleDefinition>,\n    pub tools: Vec<ToolRegistration>,\n    pub ttl: Option<Duration>,\n    pub memory_scope: MemoryScope,\n    pub governance: GovernanceModel,\n    pub template_id: Option<TemplateId>,\n}\n```",
+        "ContextParams struct": "```rust\npub struct ContextParams {\n    pub mode: ContextMode,\n    pub ceiling: Vec<Capability>,\n    pub ceiling_policy: CeilingPolicy,\n    pub promotion_policy: PromotionPolicy,\n    pub roles: Vec<RoleDefinition>,\n    pub tools: Vec<OutletRegistration>,\n    pub ttl: Option<Duration>,\n    pub memory_scope: MemoryScope,\n    pub governance: GovernanceModel,\n    pub template_id: Option<TemplateId>,\n}\n```",
         "CeilingPolicy enum": "```rust\npub enum CeilingPolicy {\n    Immutable,\n    Governed,\n}\n```\nImmutable: Ceiling is fixed at creation. Any attempt to modify returns `ContextError::CeilingImmutable`. Default and security-conservative choice.\nGoverned: Ceiling can be modified through governance model. Can only be narrowed (capabilities removed), never expanded beyond the original creation ceiling.",
         "PromotionPolicy enum": "```rust\npub enum PromotionPolicy {\n    NoPromotion,\n    Promotable,\n}\n```",
         "ContextMode enum": "```rust\npub enum ContextMode {\n    Encrypted,\n    Broadcast,\n}\n```\nEncrypted: MLS-backed, sender-side keys, full forward secrecy (default).\nBroadcast: Per-author broadcast keys, no MLS, mandatory subscriber registration (§5.14).",
@@ -1646,12 +1646,12 @@
       "description": "Implement UCAN-based capability ceiling enforcement and role assignment in scp-core/context/roles.rs. The capability ceiling is declared at context creation and is immutable (spec section 5.3) — it bounds the maximum set of operations possible in the context. Roles (spec section 5.5) define subsets of the ceiling that specific agents can exercise. Every action requires a valid UCAN capability token, verified mechanically. No action proceeds on identity or reputation alone.",
       "acceptanceCriteria": [
         "`CapabilityCeiling` struct with `capabilities: HashSet<Capability>`",
-        "`Capability` enum with variants: MessagesRead, MessagesWrite, ToolInvoke(ToolId), ToolInvokeAll, ToolRegister, MemberInvite, MemberRemove, RoleAssign, GovernancePropose, GovernanceVote, ContextClose, ChildContextCreate, Custom(String) — derives Debug, Clone, Hash, PartialEq, Eq",
+        "`Capability` enum with variants: MessagesRead, MessagesWrite, OutletQuery(OutletId), OutletQueryAll, OutletCall(OutletId), OutletCallAll, OutletRegister, OutletInterface, MemberInvite, MemberRemove, RoleAssign, GovernancePropose, GovernanceVote, ContextClose, ChildContextCreate, Custom(String) — derives Debug, Clone, Hash, PartialEq, Eq",
         "Mode-agnostic capabilities: MessagesRead and MessagesWrite apply to both Encrypted and Broadcast modes; ContextMode determines processing, not authorization; no new capability variants needed for broadcast mode",
         "Ceiling is set at context creation via ContextParams.ceiling; ceiling is immutable, any attempt to modify returns ContextError::CeilingImmutable; role permission sets are validated against the ceiling at role definition time — a role cannot grant capabilities outside the ceiling",
         "`RoleDefinition` struct with `name: String` and `capabilities: HashSet<Capability>`",
-        "Built-in roles always available: `admin` (all capabilities in the ceiling), `member` (MessagesRead, MessagesWrite, ToolInvokeAll), `observer` (MessagesRead only)",
-        "Broadcast-specific roles: `author` (MessagesWrite, MessagesRead, ToolInvokeAll — authors are bounded, added via RoleAssigned event), `subscriber` (MessagesRead only — in open broadcast contexts auto-granted on DID-authenticated registration following context reader-tier pattern, in gated broadcast contexts requires explicit admin-issued UCAN)",
+        "Built-in roles always available: `admin` (all capabilities in the ceiling), `member` (MessagesRead, MessagesWrite, OutletQueryAll, OutletCallAll), `observer` (MessagesRead only)",
+        "Broadcast-specific roles: `author` (MessagesWrite, MessagesRead, OutletQueryAll, OutletCallAll — authors are bounded, added via RoleAssigned event), `subscriber` (MessagesRead only — in open broadcast contexts auto-granted on DID-authenticated registration following context reader-tier pattern, in gated broadcast contexts requires explicit admin-issued UCAN)",
         "Custom roles defined at context creation with arbitrary capability subsets of the ceiling",
         "`assign_role(context: &ContextHandle, member_did: &DID, role: &str, assigner_did: &DID) -> Result<Vec<UcanToken>, ContextError>` verifies assigner has RoleAssign capability via UCAN validation; validates role exists in context's role definitions; mints UCAN tokens for each capability in the role's permission set; each token has iss = context creator DID, aud = member DID, att = [{ \"with\": \"scp:ctx:{context_id}/{capability}\", \"can\": \"invoke\" }], nnc = unique nonce; distributes tokens to member via MLS application message; revokes any previous tokens for this member (role change); appends RoleAssigned event to event log; returns the minted tokens",
         "`check_ceiling(ceiling: &CapabilityCeiling, capability: &Capability) -> bool` returns true if the capability is within the ceiling; called as part of every UCAN validation; called at role definition time to validate role permission sets",
@@ -1685,9 +1685,9 @@
         }
       ],
       "details": {
-        "CapabilityCeiling type": "```rust\npub struct CapabilityCeiling {\n    pub capabilities: HashSet<Capability>,\n}\n\n#[derive(Debug, Clone, Hash, PartialEq, Eq)]\npub enum Capability {\n    MessagesRead,\n    MessagesWrite,\n    ToolInvoke(ToolId),\n    ToolInvokeAll,\n    ToolRegister,\n    MemberInvite,\n    MemberRemove,\n    RoleAssign,\n    GovernancePropose,\n    GovernanceVote,\n    ContextClose,\n    ChildContextCreate,\n    Custom(String),\n}\n```",
+        "CapabilityCeiling type": "```rust\npub struct CapabilityCeiling {\n    pub capabilities: HashSet<Capability>,\n}\n\n#[derive(Debug, Clone, Hash, PartialEq, Eq)]\npub enum Capability {\n    MessagesRead,\n    MessagesWrite,\n    OutletQuery(OutletId),\n    OutletQueryAll,\n    OutletCall(OutletId),\n    OutletCallAll,\n    OutletRegister,\n    OutletInterface,\n    MemberInvite,\n    MemberRemove,\n    RoleAssign,\n    GovernancePropose,\n    GovernanceVote,\n    ContextClose,\n    ChildContextCreate,\n    Custom(String),\n}\n```",
         "RoleDefinition type": "```rust\npub struct RoleDefinition {\n    pub name: String,\n    pub capabilities: HashSet<Capability>,\n}\n```",
-        "Built-in roles": "- `admin` — all capabilities in the ceiling.\n- `member` — MessagesRead, MessagesWrite, ToolInvokeAll.\n- `observer` — MessagesRead only.\n\nBroadcast-specific roles:\n- `author` — MessagesWrite, MessagesRead, ToolInvokeAll. Authors are bounded. Added via RoleAssigned event.\n- `subscriber` — MessagesRead only. In open broadcast contexts (public-broadcast template), MessagesRead is auto-granted on DID-authenticated registration, following the context reader-tier pattern (§6.2.2B). In gated broadcast contexts (gated-broadcast template), MessagesRead requires an explicit admin-issued UCAN.",
+        "Built-in roles": "- `admin` — all capabilities in the ceiling.\n- `member` — MessagesRead, MessagesWrite, OutletQueryAll, OutletCallAll.\n- `observer` — MessagesRead only.\n\nBroadcast-specific roles:\n- `author` — MessagesWrite, MessagesRead, OutletQueryAll, OutletCallAll. Authors are bounded. Added via RoleAssigned event.\n- `subscriber` — MessagesRead only. In open broadcast contexts (public-broadcast template), MessagesRead is auto-granted on DID-authenticated registration, following the context reader-tier pattern (§6.2.2B). In gated broadcast contexts (gated-broadcast template), MessagesRead requires an explicit admin-issued UCAN.",
         "UCAN token format": "Each token: iss = context creator DID, aud = member DID, att = [{ \"with\": \"scp:ctx:{context_id}/{capability}\", \"can\": \"invoke\" }], nnc = unique nonce."
       },
       "result": "Already implemented in prior iteration (SCP-018 remediation). 54 tests, all acceptance criteria met."
@@ -1813,22 +1813,22 @@
       ],
       "description": "Implement tool registration and schema validation in scp-core/context/tools/. Tools are stateless functions scoped to a context (spec section 5.4). They have MCP-compatible JSON Schema interfaces (spec section 8.5), making them interoperable with existing MCP tooling. Every tool registration includes schema, implementation hash, test vectors, and operator DID — providing verifiable integrity (spec section 7.3.3).",
       "acceptanceCriteria": [
-        "`ToolRegistration` struct with fields: tool_id (ToolId), name (String), description (String), schema (ToolSchema — MCP-compatible JSON Schema), implementation_hash ([u8; 32] — SHA-256 of implementation), test_vectors (Vec<TestVector> — known input-output pairs), operator_did (DID — accountable identity)",
+        "`OutletRegistration` struct with fields: outlet_id (OutletId), name (String), description (String), schema (ToolSchema — MCP-compatible JSON Schema), implementation_hash ([u8; 32] — SHA-256 of implementation), test_vectors (Vec<TestVector> — known input-output pairs), operator_did (DID — accountable identity)",
         "`ToolSchema` struct with fields: input_schema (serde_json::Value — JSON Schema for input), output_schema (serde_json::Value — JSON Schema for output)",
         "`TestVector` struct with fields: input (serde_json::Value), expected_output (serde_json::Value), description (String)",
-        "`register_tool(context: &ContextHandle, registration: ToolRegistration, registrant_did: &DID) -> Result<ToolId, ToolError>` validates registrant has ToolRegister capability via UCAN (ADR-009); validates input and output schemas are valid JSON Schema; validates implementation hash is 32 bytes; validates operator DID is resolvable; stores the tool registration in the context's tool registry; appends ToolRegistered event to event log with full registration metadata; returns the tool ID",
-        "`update_tool(context: &ContextHandle, tool_id: &ToolId, new_registration: ToolRegistration, updater_did: &DID) -> Result<(), ToolError>` validates updater is the tool's operator DID or has admin role; records old and new implementation hashes; updates the tool registration; appends ToolUpdated event to event log (includes old hash, new hash, all changed fields); tool mutations are visible to all context members",
-        "`verify_tool(context: &ContextHandle, tool_id: &ToolId) -> Result<ToolVerificationResult, ToolError>` runs all test vectors against the tool; for each test vector invokes tool with test input, compares output to expected output; returns a result with per-vector pass/fail status and overall integrity assessment; appends ToolVerified event to event log",
+        "`register_outlet(context: &ContextHandle, registration: OutletRegistration, registrant_did: &DID) -> Result<OutletId, OutletError>` validates registrant has OutletRegister capability via UCAN (ADR-009); validates input and output schemas are valid JSON Schema; validates implementation hash is 32 bytes; validates operator DID is resolvable; stores the outlet registration in the context's outlet registry; appends OutletRegistered event to event log with full registration metadata; returns the outlet ID",
+        "`update_tool(context: &ContextHandle, outlet_id: &OutletId, new_registration: OutletRegistration, updater_did: &DID) -> Result<(), OutletError>` validates updater is the tool's operator DID or has admin role; records old and new implementation hashes; updates the tool registration; appends OutletUpdated event to event log (includes old hash, new hash, all changed fields); tool mutations are visible to all context members",
+        "`verify_tool(context: &ContextHandle, outlet_id: &OutletId) -> Result<OutletVerificationResult, OutletError>` runs all test vectors against the tool; for each test vector invokes tool with test input, compares output to expected output; returns a result with per-vector pass/fail status and overall integrity assessment; appends OutletVerified event to event log",
         "JSON Schema validation helpers and MCP compatibility utilities in schema.rs",
         "Unit test: register_tool validates schemas are valid JSON Schema",
-        "Unit test: register_tool rejects registrant without ToolRegister capability",
+        "Unit test: register_outlet rejects registrant without OutletRegister capability",
         "Unit test: update_tool logs old and new hashes",
         "Unit test: verify_tool returns correct pass/fail per test vector",
         "Optional `ToolEconomicMetadata` in tool registration (§19.3): cost_per_invoke (Amount), cost_formula (Option<PricingFormula>), payee (DID, may differ from context payee). Tool-level costs are additive with context costs"
       ],
       "actionItems": [
-        "Create `crates/scp-core/context/tools/mod.rs` with ToolId type, module re-exports",
-        "Create `crates/scp-core/context/tools/registry.rs` with ToolRegistration, ToolSchema, TestVector structs, tool storage per context, register_tool, update_tool, verify_tool functions",
+        "Create `crates/scp-core/context/tools/mod.rs` with OutletId type, module re-exports",
+        "Create `crates/scp-core/context/tools/registry.rs` with OutletRegistration, ToolSchema, TestVector structs, tool storage per context, register_tool, update_tool, verify_tool functions",
         "Create `crates/scp-core/context/tools/schema.rs` with JSON Schema validation helpers using jsonschema crate, MCP compatibility utilities",
         "Integrate with UCAN validation from ADR-009 for capability checks",
         "Write unit tests for registration, update, verification, and schema validation"
@@ -1841,7 +1841,7 @@
       "sources": [
         {
           "file": ".docs/adrs/phase-2.md",
-          "section": "## ADR-010: Tool Registration and Invocation"
+          "section": "## ADR-010: Outlet Registration and Invocation"
         },
         {
           "file": ".docs/specs/19-economic-governance.md",
@@ -1849,7 +1849,7 @@
         }
       ],
       "details": {
-        "ToolRegistration struct": "```rust\npub struct ToolRegistration {\n    pub tool_id: ToolId,\n    pub name: String,\n    pub description: String,\n    pub schema: ToolSchema,\n    pub implementation_hash: [u8; 32],\n    pub test_vectors: Vec<TestVector>,\n    pub operator_did: DID,\n}\n\npub struct ToolSchema {\n    pub input_schema: serde_json::Value,\n    pub output_schema: serde_json::Value,\n}\n\npub struct TestVector {\n    pub input: serde_json::Value,\n    pub expected_output: serde_json::Value,\n    pub description: String,\n}\n```",
+        "OutletRegistration struct": "```rust\npub struct OutletRegistration {\n    pub outlet_id: OutletId,\n    pub name: String,\n    pub description: String,\n    pub schema: ToolSchema,\n    pub implementation_hash: [u8; 32],\n    pub test_vectors: Vec<TestVector>,\n    pub operator_did: DID,\n}\n\npub struct ToolSchema {\n    pub input_schema: serde_json::Value,\n    pub output_schema: serde_json::Value,\n}\n\npub struct TestVector {\n    pub input: serde_json::Value,\n    pub expected_output: serde_json::Value,\n    pub description: String,\n}\n```",
         "Implementation notes": "Language: Rust. Schema validation: jsonschema crate for JSON Schema validation. Hashing: SHA-256 via sha2 crate for implementation hashes. Crate: scp-core. Module: scp-core/context/tools/."
       },
       "result": "Tool registration types, schema validation, registry with 48 tests"
@@ -1867,25 +1867,25 @@
       ],
       "description": "Implement tool invocation with the full execution lifecycle: request/response protocol, timeout handling, cancellation, error propagation, and event log recording. Every tool invocation follows a defined lifecycle with explicit states, timeouts, and error handling. Tool execution errors are returned in ToolResponse.error, not as protocol-level errors. Schema validation failures are caught by the SDK, not the tool.",
       "acceptanceCriteria": [
-        "`invoke_tool(context: &ContextHandle, tool_id: &ToolId, input: serde_json::Value, invoker_did: &DID) -> Result<serde_json::Value, ToolError>` validates context state is Active; validates invoker has ToolInvoke(tool_id) or ToolInvokeAll capability via UCAN; validates input against the tool's input schema; calls the tool implementation; validates output against the tool's output schema; appends ToolInvoked event to event log (includes tool_id, invoker_did, input hash, output hash); returns the tool output",
-        "`ToolRequest` struct with fields: request_id (String — UUID v4, unique per invocation), tool_id (ToolId), invoker_did (DID), input (serde_json::Value), timeout_ms (u32 — caller-specified timeout, max: context ceiling, default: 30_000), session_id (Option<String> — for stateful sessions §6.2.1), chain_depth (u8 — cross-context chain depth, 0 for direct calls), timestamp (u64)",
+        "`invoke_outlet(context: &ContextHandle, outlet_id: &OutletId, input: serde_json::Value, invoker_did: &DID) -> Result<serde_json::Value, OutletError>` validates context state is Active; validates invoker has OutletQuery(outlet_id)/OutletQueryAll (Query) or OutletCall(outlet_id)/OutletCallAll (Action) capability via UCAN; validates input against the outlet's input schema; calls the outlet implementation; validates output against the outlet's output schema; appends OutletInvoked event to event log (includes outlet_id, invoker_did, input hash, output hash); returns the outlet output",
+        "`ToolRequest` struct with fields: request_id (String — UUID v4, unique per invocation), outlet_id (OutletId), invoker_did (DID), input (serde_json::Value), timeout_ms (u32 — caller-specified timeout, max: context ceiling, default: 30_000), session_id (Option<String> — for stateful sessions §6.2.1), chain_depth (u8 — cross-context chain depth, 0 for direct calls), timestamp (u64)",
         "`ToolResponse` struct with fields: request_id (String — matches the request), status (ToolStatus), output (Option<serde_json::Value>), error (Option<ToolExecutionError>), execution_time_ms (u64), provenance (Provenance)",
         "`ToolStatus` enum: Success, Error, Timeout, Cancelled",
-        "`ToolExecutionError` struct with fields: code (ToolErrorCode), message (String), retryable (bool)",
-        "`ToolErrorCode` enum: InputValidationFailed, OutputValidationFailed, ExecutionFailed, Timeout, Cancelled, RateLimited, ToolNotFound, PermissionDenied, InternalError",
+        "`ToolExecutionError` struct with fields: code (OutletErrorCode), message (String), retryable (bool)",
+        "`OutletErrorCode` enum: InputValidationFailed, OutputValidationFailed, ExecutionFailed, Timeout, Cancelled, RateLimited, ToolNotFound, PermissionDenied, InternalError",
         "Timeout handling: every invocation has a timeout; callers specify timeout_ms in the request (default: 30,000ms, maximum: configurable per-context, hard protocol maximum: 300,000ms / 5 minutes); invoking SDK starts timer on request submission; if no ToolResponse arrives before timer fires, SDK synthesizes ToolResponse with status: Timeout; timeout is client-side contract, not server-side enforcement",
         "Cancellation protocol: invoker MAY send ToolCancel { request_id, invoker_did, timestamp } referencing the request_id; on receiving ToolCancel the tool's execution environment SHOULD terminate the invocation and respond with status: Cancelled; cancellation is best-effort — if tool responds with Success before cancel is processed, success takes precedence",
         "Error propagation: tool execution errors returned in ToolResponse.error, not as protocol-level errors; schema validation failures caught by SDK not tool — SDK rejects invalid input before invoking tool and rejects invalid output before delivering response; retryable field indicates whether caller should retry",
-        "Event log recording: both ToolRequest and ToolResponse recorded as events in context's event log (ADR-011); event includes request_id, tool_id, invoker_did, status, execution_time_ms, SHA256(input), SHA256(output); full input/output NOT recorded (may be large), only content hashes stored",
+        "Event log recording: both ToolRequest and ToolResponse recorded as events in context's event log (ADR-011); event includes request_id, outlet_id, invoker_did, status, execution_time_ms, SHA256(input), SHA256(output); full input/output NOT recorded (may be large), only content hashes stored",
         "Unit test: invoke_tool rejects when context not Active",
-        "Unit test: invoke_tool rejects invoker without ToolInvoke capability",
+        "Unit test: invoke_outlet rejects invoker without OutletCall capability",
         "Unit test: input schema validation failure returns InputValidationFailed",
         "Unit test: timeout synthesizes Timeout response",
         "Unit test: cancellation returns Cancelled status"
       ],
       "actionItems": [
         "Create `crates/scp-core/context/tools/invoke.rs` with invoke_tool function, input/output schema validation using jsonschema crate, tool dispatch",
-        "Create `crates/scp-core/context/tools/lifecycle.rs` with ToolRequest, ToolResponse, ToolCancel, ToolStatus, ToolExecutionError, ToolErrorCode types, timeout management with tokio timers, cancellation handling",
+        "Create `crates/scp-core/context/tools/lifecycle.rs` with ToolRequest, ToolResponse, ToolCancel, ToolStatus, ToolExecutionError, OutletErrorCode types, timeout management with tokio timers, cancellation handling",
         "Implement event log recording with content hashes (SHA-256 of input/output, not full content)",
         "Implement timeout handling: spawn tokio timer, synthesize Timeout response on expiry",
         "Implement cancellation: ToolCancel message handling, best-effort termination",
@@ -1900,16 +1900,16 @@
       "sources": [
         {
           "file": ".docs/adrs/phase-2.md",
-          "section": "## ADR-010: Tool Registration and Invocation"
+          "section": "## ADR-010: Outlet Registration and Invocation"
         }
       ],
       "details": {
-        "ToolRequest struct": "```rust\npub struct ToolRequest {\n    pub request_id: String,\n    pub tool_id: ToolId,\n    pub invoker_did: DID,\n    pub input: serde_json::Value,\n    pub timeout_ms: u32,\n    pub session_id: Option<String>,\n    pub chain_depth: u8,\n    pub timestamp: u64,\n}\n```",
+        "ToolRequest struct": "```rust\npub struct ToolRequest {\n    pub request_id: String,\n    pub outlet_id: OutletId,\n    pub invoker_did: DID,\n    pub input: serde_json::Value,\n    pub timeout_ms: u32,\n    pub session_id: Option<String>,\n    pub chain_depth: u8,\n    pub timestamp: u64,\n}\n```",
         "ToolResponse struct": "```rust\npub struct ToolResponse {\n    pub request_id: String,\n    pub status: ToolStatus,\n    pub output: Option<serde_json::Value>,\n    pub error: Option<ToolExecutionError>,\n    pub execution_time_ms: u64,\n    pub provenance: Provenance,\n}\n```",
         "Timeout handling": "Every tool invocation has a timeout. Callers specify timeout_ms in the request (default: 30,000ms, maximum: configurable per-context, hard protocol maximum: 300,000ms / 5 minutes). The invoking SDK starts a timer on request submission. If no ToolResponse arrives before the timer fires, the SDK synthesizes a ToolResponse with status: Timeout and delivers it to the caller. Timeout is a client-side contract, not a server-side enforcement.",
         "Cancellation protocol": "The invoker MAY send a ToolCancel { request_id, invoker_did, timestamp } message referencing the request_id. On receiving ToolCancel, the tool's execution environment SHOULD terminate the invocation and respond with status: Cancelled. Cancellation is best-effort. If the tool responds with Success before the cancel is processed, the success response takes precedence.",
         "Error propagation": "Tool execution errors are returned in ToolResponse.error, not as protocol-level errors. Schema validation failures are caught by the SDK, not the tool. The SDK rejects invalid input before invoking the tool and rejects invalid output before delivering the response. The retryable field indicates whether the caller should attempt the invocation again.",
-        "Event log recording": "ToolRequest and ToolResponse are both recorded as events in the context's event log (ADR-011). The event includes: request_id, tool_id, invoker_did, status, execution_time_ms, SHA256(input), SHA256(output). Full input/output is NOT recorded (may be large); only content hashes are stored."
+        "Event log recording": "ToolRequest and ToolResponse are both recorded as events in the context's event log (ADR-011). The event includes: request_id, outlet_id, invoker_did, status, execution_time_ms, SHA256(input), SHA256(output). Full input/output is NOT recorded (may be large); only content hashes are stored."
       },
       "result": "Tool invocation lifecycle with timeout and cancellation. 33 new tests."
     },
@@ -1925,10 +1925,10 @@
       ],
       "description": "Implement cross-context tool interfaces (spec section 6.2) that allow structured interaction across context boundaries with bidirectional consent. The context governs the tool call, not the agent. An agent in Context A requests a tool call to Context B. Context A's governance decides whether to permit the outbound call. Context B's governance decides whether to permit the inbound call. The agent never directly touches the other context. Rate limiting is enforced per interface.",
       "acceptanceCriteria": [
-        "`ToolInterface` struct with fields: source_context (ContextId — context exposing the tool), target_context (ContextId — context consuming the tool), tool_id (ToolId — which tool is exposed), rate_limit (Option<RateLimit> — calls per time window), approved_by_source (bool — source context opted in), approved_by_target (bool — target context opted in)",
-        "`expose_tool(context: &ContextHandle, tool_id: &ToolId, to_context: &ContextId) -> Result<ToolInterface, ToolError>` initiates a tool interface proposal from the source context; requires admin capability",
-        "`accept_tool_interface(context: &ContextHandle, interface: &ToolInterface) -> Result<(), ToolError>` target context accepts the interface; requires admin capability; both approved_by_source and approved_by_target must be true before calls are permitted",
-        "`invoke_cross_context(source_context: &ContextHandle, interface: &ToolInterface, input: serde_json::Value, invoker_did: &DID) -> Result<serde_json::Value, ToolError>` invokes a tool across context boundaries; source context governance checks outbound; target context governance checks inbound; both event logs record the call with provenance",
+        "`OutletInterface` struct with fields: source_context (ContextId — context exposing the tool), target_context (ContextId — context consuming the tool), outlet_id (OutletId — which tool is exposed), rate_limit (Option<RateLimit> — calls per time window), approved_by_source (bool — source context opted in), approved_by_target (bool — target context opted in)",
+        "`expose_tool(context: &ContextHandle, outlet_id: &OutletId, to_context: &ContextId) -> Result<OutletInterface, OutletError>` initiates a tool interface proposal from the source context; requires admin capability",
+        "`accept_tool_interface(context: &ContextHandle, interface: &OutletInterface) -> Result<(), OutletError>` target context accepts the interface; requires admin capability; both approved_by_source and approved_by_target must be true before calls are permitted",
+        "`invoke_cross_context(source_context: &ContextHandle, interface: &OutletInterface, input: serde_json::Value, invoker_did: &DID) -> Result<serde_json::Value, OutletError>` invokes a tool across context boundaries; source context governance checks outbound; target context governance checks inbound; both event logs record the call with provenance",
         "Rate limiting enforced per interface",
         "Unit test: expose_tool requires admin capability",
         "Unit test: invoke_cross_context fails when only one side has approved",
@@ -1936,7 +1936,7 @@
         "Unit test: both event logs record the cross-context call with provenance"
       ],
       "actionItems": [
-        "Create `crates/scp-core/context/tools/interface.rs` with ToolInterface struct, RateLimit type",
+        "Create `crates/scp-core/context/tools/interface.rs` with OutletInterface struct, RateLimit type",
         "Implement expose_tool: admin capability check, interface proposal creation with approved_by_source = true",
         "Implement accept_tool_interface: admin capability check on target, set approved_by_target = true",
         "Implement invoke_cross_context: bidirectional governance check, tool invocation, dual event log recording with provenance",
@@ -1953,11 +1953,11 @@
       "sources": [
         {
           "file": ".docs/adrs/phase-2.md",
-          "section": "## ADR-010: Tool Registration and Invocation"
+          "section": "## ADR-010: Outlet Registration and Invocation"
         }
       ],
       "details": {
-        "ToolInterface struct": "```rust\npub struct ToolInterface {\n    pub source_context: ContextId,\n    pub target_context: ContextId,\n    pub tool_id: ToolId,\n    pub rate_limit: Option<RateLimit>,\n    pub approved_by_source: bool,\n    pub approved_by_target: bool,\n}\n```"
+        "OutletInterface struct": "```rust\npub struct OutletInterface {\n    pub source_context: ContextId,\n    pub target_context: ContextId,\n    pub outlet_id: OutletId,\n    pub rate_limit: Option<RateLimit>,\n    pub approved_by_source: bool,\n    pub approved_by_target: bool,\n}\n```"
       }
     },
     {
@@ -1972,9 +1972,9 @@
       ],
       "description": "Implement stateful tool sessions (spec section 6.2.1) that enable multi-turn workflows via session IDs, TTLs, and per-call governance. Session state lives in the tool's context, not the caller's. Each call in a session is individually governed. Sessions have TTLs to prevent resource leaks. Background task removes sessions past their TTL.",
       "acceptanceCriteria": [
-        "`ToolSession` struct with fields: session_id (String), tool_id (ToolId), source_context (ContextId), state (serde_json::Value — opaque session state), created_at (u64), ttl (Duration), call_count (u64)",
-        "`create_session(context: &ContextHandle, tool_id: &ToolId, source_context: &ContextId, ttl: Duration) -> Result<String, ToolError>` creates a new session; returns session ID",
-        "`invoke_session(context: &ContextHandle, session_id: &str, input: serde_json::Value) -> Result<serde_json::Value, ToolError>` invokes a tool within an active session; each call is individually governed; session state is updated by the tool",
+        "`ToolSession` struct with fields: session_id (String), outlet_id (OutletId), source_context (ContextId), state (serde_json::Value — opaque session state), created_at (u64), ttl (Duration), call_count (u64)",
+        "`create_session(context: &ContextHandle, outlet_id: &OutletId, source_context: &ContextId, ttl: Duration) -> Result<String, OutletError>` creates a new session; returns session ID",
+        "`invoke_session(context: &ContextHandle, session_id: &str, input: serde_json::Value) -> Result<serde_json::Value, OutletError>` invokes a tool within an active session; each call is individually governed; session state is updated by the tool",
         "Session cleanup: background task removes sessions past their TTL; session state is internal to the tool's context",
         "Session storage: in-memory HashMap with TTL-based cleanup, keyed by session ID",
         "Unit test: create_session returns valid session ID",
@@ -1996,11 +1996,11 @@
       "sources": [
         {
           "file": ".docs/adrs/phase-2.md",
-          "section": "## ADR-010: Tool Registration and Invocation"
+          "section": "## ADR-010: Outlet Registration and Invocation"
         }
       ],
       "details": {
-        "ToolSession struct": "```rust\npub struct ToolSession {\n    pub session_id: String,\n    pub tool_id: ToolId,\n    pub source_context: ContextId,\n    pub state: serde_json::Value,\n    pub created_at: u64,\n    pub ttl: Duration,\n    pub call_count: u64,\n}\n```"
+        "ToolSession struct": "```rust\npub struct ToolSession {\n    pub session_id: String,\n    pub outlet_id: OutletId,\n    pub source_context: ContextId,\n    pub state: serde_json::Value,\n    pub created_at: u64,\n    pub ttl: Duration,\n    pub call_count: u64,\n}\n```"
       }
     },
     {
@@ -2018,7 +2018,7 @@
       "acceptanceCriteria": [
         "`EventLog` struct with fields: leaves (Vec<[u8; 32]> — SHA-256 hashes of events), tree (Vec<Vec<[u8; 32]>> — interior node layers), context_id (ContextId)",
         "`Event` struct with fields: event_type (EventType), actor_did (DID), timestamp (u64), sequence (u64 — monotonic event sequence within this log), payload (EventPayload — type-specific data), prev_hash ([u8; 32] — hash of the previous event for hash chain), signature (Ed25519Signature)",
-        "`EventType` enum with all 18 variants: ContextCreated, ContextClosing, ContextClosed, ContextExpired, MemberJoined, MemberLeft, RoleAssigned, TokenRevoked, MessageSent, ToolRegistered, ToolUpdated, ToolInvoked, ToolVerified, ToolInterfaceEstablished, GovernanceAction, ConsistencyCheckpoint, AbsenceProofRequested, MemberBlocked (ADR-007: signed block notification), KeyEpochAdvance (ADR-007: sender key epoch rotation, shared across Encrypted and Broadcast modes)",
+        "`EventType` enum with all 18 variants: ContextCreated, ContextClosing, ContextClosed, ContextExpired, MemberJoined, MemberLeft, RoleAssigned, TokenRevoked, MessageSent, OutletRegistered, OutletUpdated, OutletInvoked, OutletVerified, OutletInterfaceEstablished, GovernanceAction, ConsistencyCheckpoint, AbsenceProofRequested, MemberBlocked (ADR-007: signed block notification), KeyEpochAdvance (ADR-007: sender key epoch rotation, shared across Encrypted and Broadcast modes)",
         "`append(log: &mut EventLog, event: Event) -> Result<u64, EventLogError>` computes leaf_hash = SHA256(serialize(event)); verifies event.prev_hash matches the hash of the last leaf (hash chain integrity); verifies event signature against event.actor_did; appends leaf hash to the tree; recomputes affected interior nodes; returns the leaf index (position in the log)",
         "`root(log: &EventLog) -> [u8; 32]` returns the current Merkle root hash of the log; O(1) — the root is always maintained as the log is appended to",
         "`event_count(log: &EventLog) -> u64` returns the number of events in the log",
@@ -2052,7 +2052,7 @@
       "details": {
         "EventLog struct": "```rust\npub struct EventLog {\n    leaves: Vec<[u8; 32]>,\n    tree: Vec<Vec<[u8; 32]>>,\n    context_id: ContextId,\n}\n```",
         "Event struct": "```rust\n#[derive(Debug, Clone, Serialize, Deserialize)]\npub struct Event {\n    pub event_type: EventType,\n    pub actor_did: DID,\n    pub timestamp: u64,\n    pub sequence: u64,\n    pub payload: EventPayload,\n    pub prev_hash: [u8; 32],\n    pub signature: Ed25519Signature,\n}\n```",
-        "EventType enum": "```rust\n#[derive(Debug, Clone, Serialize, Deserialize)]\npub enum EventType {\n    ContextCreated,\n    ContextClosing,\n    ContextClosed,\n    ContextExpired,\n    MemberJoined,\n    MemberLeft,\n    RoleAssigned,\n    TokenRevoked,\n    MessageSent,\n    ToolRegistered,\n    ToolUpdated,\n    ToolInvoked,\n    ToolVerified,\n    ToolInterfaceEstablished,\n    GovernanceAction,\n    ConsistencyCheckpoint,\n    AbsenceProofRequested,\n    MemberBlocked,\n    KeyEpochAdvance,\n}\n```",
+        "EventType enum": "```rust\n#[derive(Debug, Clone, Serialize, Deserialize)]\npub enum EventType {\n    ContextCreated,\n    ContextClosing,\n    ContextClosed,\n    ContextExpired,\n    MemberJoined,\n    MemberLeft,\n    RoleAssigned,\n    TokenRevoked,\n    MessageSent,\n    OutletRegistered,\n    OutletUpdated,\n    OutletInvoked,\n    OutletVerified,\n    OutletInterfaceEstablished,\n    GovernanceAction,\n    ConsistencyCheckpoint,\n    AbsenceProofRequested,\n    MemberBlocked,\n    KeyEpochAdvance,\n}\n```",
         "Implementation notes": "Language: Rust. Hashing: SHA-256 via sha2 crate. Storage: In-memory for Phase 2 initial development, backed by ProtocolRepository (§17.4) for persistence. Event log keys follow convention in §17.3: context/{context_id}/event/{seq:020d} for events, context/{context_id}/event_tree/{level}/{index} for Merkle tree nodes. Crate: scp-core. Module: scp-core/event_log/. Proof format: Binary serialization of inclusion proof paths (sibling hashes + left/right indicators)."
       }
     },
@@ -2261,13 +2261,13 @@
       ],
       "description": "The ultimate acceptance criterion for Phase 2 exercises all 5 ADRs together with the Phase 1 crypto stack. This integration test proves: context lifecycle works, roles enforce, tools invoke, event logs verify, multi-transport routes, TTL enforces, metadata privacy measures are active, and everything composes cleanly on top of Phase 1's crypto stack.",
       "acceptanceCriteria": [
-        "Step 1: Alice creates an identity (ADR-003) and a context with ceiling [messaging, tool_invoke], roles [admin, member], one tool 'calculator', TTL 5 minutes, memory scope ephemeral (ADR-008)",
+        "Step 1: Alice creates an identity (ADR-003) and a context with ceiling [messaging, outlet_call], roles [admin, member], one outlet 'calculator', TTL 5 minutes, memory scope ephemeral (ADR-008)",
         "Step 2: The context is assigned to 3 relays via TransportManager (ADR-012)",
         "Step 3: Bob creates an identity, discovers the context, and joins (ADR-008)",
-        "Step 4: Bob is assigned the 'member' role with UCAN tokens for messages:read, messages:write, tool_invoke_all (ADR-009)",
+        "Step 4: Bob is assigned the 'member' role with UCAN tokens for messages:read, messages:write, outlet_query_all, outlet_call_all (ADR-009)",
         "Step 5: Alice sends a message. UCAN is validated. Envelope is created, multi-relay published (ADR-012). Event is logged in the Merkle tree (ADR-011).",
         "Step 6: Bob receives the message via merged subscription stream (ADR-012). Bob's SDK deduplicates across relays.",
-        "Step 7: Bob invokes the 'calculator' tool with input {\"operation\": \"add\", \"a\": 1, \"b\": 2} (ADR-010). UCAN validates Bob has tool_invoke capability. Tool returns {\"result\": 3}. Invocation is logged (ADR-011).",
+        "Step 7: Bob invokes the 'calculator' outlet with input {\"operation\": \"add\", \"a\": 1, \"b\": 2} (ADR-010). UCAN validates Bob has outlet_call capability. Outlet returns {\"result\": 3}. Invocation is logged (ADR-011).",
         "Step 8: Bob attempts to assign a role (he's a member, not admin). UCAN validation rejects — Bob lacks RoleAssign capability (ADR-009). Action is denied.",
         "Step 9: Both Alice and Bob generate consistency checkpoints (ADR-011). Merkle roots match.",
         "Step 10: TTL expires. Context transitions to Expired (ADR-008). MLS group and sender keys are destroyed. Relay deletion requests are sent for all context blobs.",
@@ -2314,7 +2314,7 @@
         }
       ],
       "details": {
-        "Full test scenario": "1. Alice creates an identity (ADR-003) and a context with ceiling [messaging, tool_invoke], roles [admin, member], one tool \"calculator\", TTL 5 minutes, memory scope ephemeral (ADR-008)\n2. The context is assigned to 3 relays via TransportManager (ADR-012)\n3. Bob creates an identity, discovers the context, and joins (ADR-008)\n4. Bob is assigned the \"member\" role with UCAN tokens for messages:read, messages:write, tool_invoke_all (ADR-009)\n5. Alice sends a message. UCAN is validated. Envelope is created, multi-relay published (ADR-012). Event is logged in the Merkle tree (ADR-011).\n6. Bob receives the message via merged subscription stream (ADR-012). Bob's SDK deduplicates across relays.\n7. Bob invokes the \"calculator\" tool with input {\"operation\": \"add\", \"a\": 1, \"b\": 2} (ADR-010). UCAN validates Bob has tool_invoke capability. Tool returns {\"result\": 3}. Invocation is logged (ADR-011).\n8. Bob attempts to assign a role (he's a member, not admin). UCAN validation rejects — Bob lacks RoleAssign capability (ADR-009). Action is denied.\n9. Both Alice and Bob generate consistency checkpoints (ADR-011). Merkle roots match.\n10. TTL expires. Context transitions to Expired (ADR-008). MLS group and sender keys are destroyed. Relay deletion requests are sent for all context blobs.\n11. The event log's Merkle tree remains — the structure (hashes, proofs) survives even though the encrypted content is now unreadable.\n12. Throughout: relay reliability is tracked, and relay sets are partitioned across contexts.",
+        "Full test scenario": "1. Alice creates an identity (ADR-003) and a context with ceiling [messaging, outlet_call], roles [admin, member], one outlet \"calculator\", TTL 5 minutes, memory scope ephemeral (ADR-008)\n2. The context is assigned to 3 relays via TransportManager (ADR-012)\n3. Bob creates an identity, discovers the context, and joins (ADR-008)\n4. Bob is assigned the \"member\" role with UCAN tokens for messages:read, messages:write, outlet_query_all, outlet_call_all (ADR-009)\n5. Alice sends a message. UCAN is validated. Envelope is created, multi-relay published (ADR-012). Event is logged in the Merkle tree (ADR-011).\n6. Bob receives the message via merged subscription stream (ADR-012). Bob's SDK deduplicates across relays.\n7. Bob invokes the \"calculator\" outlet with input {\"operation\": \"add\", \"a\": 1, \"b\": 2} (ADR-010). UCAN validates Bob has outlet_call capability. Outlet returns {\"result\": 3}. Invocation is logged (ADR-011).\n8. Bob attempts to assign a role (he's a member, not admin). UCAN validation rejects — Bob lacks RoleAssign capability (ADR-009). Action is denied.\n9. Both Alice and Bob generate consistency checkpoints (ADR-011). Merkle roots match.\n10. TTL expires. Context transitions to Expired (ADR-008). MLS group and sender keys are destroyed. Relay deletion requests are sent for all context blobs.\n11. The event log's Merkle tree remains — the structure (hashes, proofs) survives even though the encrypted content is now unreadable.\n12. Throughout: relay reliability is tracked, and relay sets are partitioned across contexts.",
         "What this proves": "Context lifecycle works, roles enforce, tools invoke, event logs verify, multi-transport routes, TTL enforces, metadata privacy measures are active, and everything composes cleanly on top of Phase 1's crypto stack."
       },
       "result": "Phase 2 integration test created at crates/scp-core/tests/phase2_integration.rs. Exercises 12-step scenario: identity creation, context lifecycle, UCAN role enforcement, tool invocation, event logging, checkpoint consistency, TTL expiry, and multi-relay transport simulation. All tests pass."
@@ -2529,8 +2529,8 @@
       "description": "Implement PyO3 bridge functions for tool registration/invocation, transport connection, UCAN token management, and event log queries. Each function maps directly to one scp-core function. Types exposed as opaque PyO3 classes with attribute access.",
       "acceptanceCriteria": [
         "`py_tool_register(handle, registration) -> str` — registers a tool (returns tool ID).",
-        "`py_tool_invoke(handle, tool_id, input, identity) -> PyObject` — invokes a tool (returns JSON-compatible output).",
-        "`py_tool_verify(handle, tool_id) -> PyToolVerificationResult` — verifies a tool against test vectors.",
+        "`outlet_invoke(handle, outlet_id, input, identity) -> PyObject` — invokes an outlet (returns JSON-compatible output).",
+        "`py_tool_verify(handle, outlet_id) -> PyOutletVerificationResult` — verifies a tool against test vectors.",
         "`py_transport_connect(relay_url) -> None` — connects to an SCP relay.",
         "`py_transport_status() -> PyTransportStatus` — returns transport connection status.",
         "`py_ucan_validate(handle, token, capability) -> None` — validates a UCAN token (raises exception on failure).",
@@ -2540,7 +2540,7 @@
         "`py_event_log_verify(handle, claim) -> PyProof` — verifies a claim against the event log."
       ],
       "actionItems": [
-        "Create `scp-ffi/pyo3/tools.rs` with `PyToolRegistration`, `PyToolVerificationResult` pyclass definitions and bridge functions `py_tool_register`, `py_tool_invoke`, `py_tool_verify`.",
+        "Create `scp-ffi/src/outlets.rs` with `PyOutletRegistration`, `PyOutletVerificationResult` pyclass definitions and bridge functions `outlet_register`, `outlet_invoke`, `outlet_verify`.",
         "Create `scp-ffi/pyo3/transport.rs` with `PyTransportStatus` pyclass and bridge functions `py_transport_connect`, `py_transport_status`.",
         "Create `scp-ffi/pyo3/ucan.rs` with `PyUcanToken` pyclass and bridge functions `py_ucan_validate`, `py_ucan_mint`, `py_ucan_revoke`.",
         "Create `scp-ffi/pyo3/event_log.rs` with `PyEvent`, `PyProof` pyclass definitions and bridge functions `py_event_log_query`, `py_event_log_verify`.",
@@ -2557,7 +2557,7 @@
         }
       ],
       "details": {},
-      "result": "PyToolRegistration, PyToolVerificationResult, PyTransportStatus, PyUcanToken, PyEvent, PyProof types + 10 bridge functions across tools.rs, transport.rs, ucan.rs, event_log.rs"
+      "result": "PyOutletRegistration, PyOutletVerificationResult, PyTransportStatus, PyUcanToken, PyEvent, PyProof types + 10 bridge functions across tools.rs, transport.rs, ucan.rs, event_log.rs"
     },
     {
       "id": "SCP-041",
@@ -2579,7 +2579,7 @@
       "actionItems": [
         "Generate or manually author `_scp_core.pyi` stub file with complete type annotations for all bridge functions and pyclass types.",
         "Include annotations for all identity, context, tool, transport, UCAN, and event log bridge functions.",
-        "Include annotations for all opaque type classes (PyIdentity, PyDIDDocument, PyContextHandle, PyContextParams, PyToolRegistration, PyToolVerificationResult, PyTransportStatus, PyUcanToken, PyEvent, PyProof).",
+        "Include annotations for all opaque type classes (PyIdentity, PyDIDDocument, PyContextHandle, PyContextParams, PyOutletRegistration, PyOutletVerificationResult, PyTransportStatus, PyUcanToken, PyEvent, PyProof).",
         "Verify stubs work with mypy and pyright for static analysis."
       ],
       "blockedBy": [
@@ -2677,7 +2677,7 @@
         "Implement `async def close(self, identity) -> None` delegating to `_scp_core.py_context_close`.",
         "Implement `async def send(self, message, identity=None) -> None` delegating to `_scp_core.py_context_send`.",
         "Implement `async def receive(self) -> AsyncIterator[Message]` wrapping `_scp_core.py_context_receive` as a Python async iterator.",
-        "Implement `async def invoke(self, tool, input, identity=None) -> dict` delegating to `_scp_core.py_tool_invoke`.",
+        "Implement `async def invoke(self, outlet, input, identity=None) -> dict` delegating to `_scp_core.outlet_invoke`.",
         "Implement `__aenter__` returning self and `__aexit__` that calls `leave()` if still active.",
         "Expose `.context_id` and `.state` as properties.",
         "Implement receive buffer configuration parameter in Context.create and ensure AsyncIterator wrapper respects buffer semantics from scp-core"
@@ -2720,13 +2720,13 @@
         "`UcanPermissionError(ScpError)` — UCAN capability validation failure.",
         "`CryptoError(ScpError)` — Encryption, decryption, or signature failure.",
         "`TransportError(ScpError)` — Network or relay communication failure.",
-        "`ToolError(ScpError)` — Tool registration, invocation, or verification failure.",
+        "`OutletError(ScpError)` — Tool registration, invocation, or verification failure.",
         "`ValidationError(ScpError)` — Input validation failure (schema, parameters).",
         "Every exception includes a human-readable message and machine-readable error code.",
         "Exceptions wrap the corresponding bridge-level `ScpPyError` variants."
       ],
       "actionItems": [
-        "Create `bindings/python/scp_sdk/errors.py` with `ScpError`, `IdentityError`, `ContextError`, `UcanPermissionError`, `CryptoError`, `TransportError`, `ToolError`, `ValidationError` exception classes.",
+        "Create `bindings/python/scp_sdk/errors.py` with `ScpError`, `IdentityError`, `ContextError`, `UcanPermissionError`, `CryptoError`, `TransportError`, `OutletError`, `ValidationError` exception classes.",
         "Add machine-readable error code attribute to each exception.",
         "Create `bindings/python/scp_sdk/tools.py` with `ToolDefinition` and `TestVector` dataclasses.",
         "Create `bindings/python/scp_sdk/types.py` with `Message`, `Provenance`, `Capability` dataclasses and shared enums.",
@@ -2807,7 +2807,7 @@
       "acceptanceCriteria": [
         "Top-level imports: `import scp_sdk` or `from scp_sdk import Identity, Context` work.",
         "The `scp` namespace alias: `import scp_sdk as scp` enables the 20-line agent from architecture.md section 3.1.",
-        "Re-exports: Identity, Context, ToolDefinition, TestVector, evaluate_trust, ScpError, IdentityError, ContextError, UcanPermissionError, CryptoError, TransportError, ToolError, ValidationError.",
+        "Re-exports: Identity, Context, ToolDefinition, TestVector, evaluate_trust, ScpError, IdentityError, ContextError, UcanPermissionError, CryptoError, TransportError, OutletError, ValidationError.",
         "`__version__ = \"0.1.0\"` declared.",
         "`py.typed` PEP 561 marker file exists.",
         "`pyproject.toml` declares package metadata, version, Python >=3.10 constraint, optional dependencies `[langchain]` and `[mcp]`.",
@@ -3090,7 +3090,7 @@
         "Capability URI parsing supports format `scp:ctx:{context_id}/{capability}`.",
         "Wildcard matching: `scp:ctx:*/messages:write` matches any context.",
         "Ceiling intersection: verify a capability is within the context's immutable capability ceiling (constant-time set membership test).",
-        "Capability examples: `scp:ctx:abc123/messages:write`, `scp:ctx:abc123/tool_invoke:assistant`, `scp:ctx:abc123/member:invite`, `scp:ctx:abc123/role:assign`, `scp:ctx:abc123/context:close`."
+        "Capability examples: `scp:ctx:abc123/messages:write`, `scp:ctx:abc123/outlet_call:assistant`, `scp:ctx:abc123/member:invite`, `scp:ctx:abc123/role:assign`, `scp:ctx:abc123/context:close`."
       ],
       "actionItems": [
         "Create `crates/scp-core/crypto/ucan/mod.rs` with `UcanToken`, `UcanHeader`, `UcanPayload`, `Attenuation` structs and re-exports.",
@@ -3114,7 +3114,7 @@
         "ucan_token": "pub struct UcanToken {\n    pub header: UcanHeader,\n    pub payload: UcanPayload,\n    pub signature: Ed25519Signature,\n    pub encoded: String,\n}\n\npub struct UcanHeader {\n    pub alg: String,    // \"EdDSA\"\n    pub typ: String,    // \"JWT\"\n    pub ucv: String,    // \"0.10.0\"\n}\n\npub struct UcanPayload {\n    pub iss: String,\n    pub aud: String,\n    pub exp: u64,\n    pub nbf: Option<u64>,\n    pub nnc: String,\n    pub att: Vec<Attenuation>,\n    pub prf: Vec<String>,\n    pub fct: Option<serde_json::Value>,\n}\n\npub struct Attenuation {\n    pub with: String,    // \"scp:ctx:{context_id}/{capability}\"\n    pub can: String,     // \"invoke\", \"read\", \"write\"\n}",
         "capability_uri_examples": [
           "scp:ctx:abc123/messages:write",
-          "scp:ctx:abc123/tool_invoke:assistant",
+          "scp:ctx:abc123/outlet_call:assistant",
           "scp:ctx:abc123/member:invite",
           "scp:ctx:abc123/role:assign",
           "scp:ctx:abc123/context:close",
@@ -3347,7 +3347,7 @@
         }
       ],
       "details": {
-        "python_usage": "from scp_sdk.ucan import validate, mint, revoke\n\ntoken = await mint(\n    issuer=my_identity,\n    audience=agent_did,\n    capabilities=[\"messages:write\", \"tool_invoke:assistant\"],\n    context=my_context,\n    expiry=3600,\n)\n\nawait validate(\n    context=my_context,\n    token=token,\n    capability=\"messages:write\",\n)\n\nawait revoke(context=my_context, token=token)\n\n# Implicit validation:\nawait context.send(\"hello\")  # Internally calls validate() before sending"
+        "python_usage": "from scp_sdk.ucan import validate, mint, revoke\n\ntoken = await mint(\n    issuer=my_identity,\n    audience=agent_did,\n    capabilities=[\"messages:write\", \"outlet_call:assistant\"],\n    context=my_context,\n    expiry=3600,\n)\n\nawait validate(\n    context=my_context,\n    token=token,\n    capability=\"messages:write\",\n)\n\nawait revoke(context=my_context, token=token)\n\n# Implicit validation:\nawait context.send(\"hello\")  # Internally calls validate() before sending"
       },
       "result": "Implemented in iteration 3"
     },
@@ -3365,16 +3365,16 @@
       "acceptanceCriteria": [
         "Install the SDK: `pip install scp-python` in a clean Python venv. No Rust toolchain. Zero compilation. Binary wheel installs in seconds.",
         "Alice creates an identity in Python: `alice = await scp.Identity.create(custody=\"in_memory\")`. Calls through: Python wrapper (ADR-014) -> PyO3 bridge (ADR-013) -> scp-core Identity::create.",
-        "Alice creates a context with tools: `ctx = await scp.Context.create(creator=alice, ceiling=[\"messaging\", \"tool_invoke\"], tools=[scp.ToolDefinition(name=\"calculator\", ...)])`. Context creation mints admin UCAN tokens for Alice (ADR-016). UCAN nonce is generated and tracked. Capability ceiling is set and immutable.",
-        "Bob creates an identity and joins the context: `bob = await scp.Identity.create(custody=\"in_memory\")`, `membership = await ctx.join(bob)`. Bob receives member-role UCAN tokens (ADR-016). Tokens are scoped to messages:read, messages:write, tool_invoke_all. UCAN signature chain traces to Alice (context creator) as root authority.",
+        "Alice creates a context with outlets: `ctx = await scp.Context.create(creator=alice, ceiling=[\"messaging\", \"outlet_call\"], tools=[scp.OutletDefinition(name=\"calculator\", ...)])`. Context creation mints admin UCAN tokens for Alice (ADR-016). UCAN nonce is generated and tracked. Capability ceiling is set and immutable.",
+        "Bob creates an identity and joins the context: `bob = await scp.Identity.create(custody=\"in_memory\")`, `membership = await ctx.join(bob)`. Bob receives member-role UCAN tokens (ADR-016). Tokens are scoped to messages:read, messages:write, outlet_query_all, outlet_call_all. UCAN signature chain traces to Alice (context creator) as root authority.",
         "Alice sends a message — UCAN validated: `await ctx.send(\"Hello from Python\", identity=alice)`. Internally: validate_ucan(ctx, alice_token, \"messages:write\") passes (ADR-016). Message flows through scp-core: sender key encrypt -> MLS encrypt -> envelope -> multi-relay publish. All via PyO3 bridge (ADR-013).",
         "Bob receives the message via async iterator: `async for msg in ctx.receive(): print(msg.content)`. Async iterator bridges tokio stream -> Python asyncio via PyO3 native async (ADR-013).",
-        "Bob invokes the calculator tool: `result = await ctx.invoke(\"calculator\", {\"operation\": \"add\", \"a\": 1, \"b\": 2})`, `assert result == {\"result\": 3}`. UCAN validates Bob has tool_invoke capability (ADR-016). Tool invocation is logged in the Merkle event log.",
+        "Bob invokes the calculator outlet: `result = await ctx.invoke(\"calculator\", {\"operation\": \"add\", \"a\": 1, \"b\": 2})`, `assert result == {\"result\": 3}`. UCAN validates Bob has outlet_call capability (ADR-016). Outlet invocation is logged in the Merkle event log.",
         "Bob attempts an admin action — UCAN rejects: `await ctx.close(identity=bob)` raises `scp.UcanPermissionError`. Bob lacks context:close capability. UCAN validation failed (ADR-016).",
         "Start an MCP server exposing Alice's SCP contexts (ADR-015): `server = await scp.mcp.serve_mcp(identity=alice, contexts=[ctx], transport=\"stdio\")`. tools/list returns namespaced tools. Admin tools visible because Alice is admin. Member tools only visible for member-role agent.",
         "MCP client invokes a tool: `tools/call(\"ctx_123/calculator\", {\"operation\": \"multiply\", \"a\": 3, \"b\": 7})` returns `{\"result\": 21}`. MCP adapter parses context namespace, validates UCAN, routes through scp-core tool invocation, returns result via JSON-RPC. The model never saw a DID, UCAN token, MLS group, or relay.",
         "Verify event log from Python: `events = await ctx.event_log.query(event_type=\"tool_invoked\")`, `proof = await ctx.event_log.verify({\"event_exists\": events[0].id})`, `assert proof.valid`. Merkle proof verification runs in Rust, result returned to Python (ADR-013).",
-        "Alice revokes Bob's tool invocation capability: `await scp.ucan.revoke(context=ctx, token=membership.tokens[\"tool_invoke_all\"])`. Revocation distributed via MLS to all members (ADR-016). Bob's next tool invocation attempt fails with UcanPermissionError.",
+        "Alice revokes Bob's outlet invocation capability: `await scp.ucan.revoke(context=ctx, token=membership.tokens[\"outlet_call_all\"])`. Revocation distributed via MLS to all members (ADR-016). Bob's next outlet invocation attempt fails with UcanPermissionError.",
         "Throughout: Every Python async call crosses the PyO3 bridge (ADR-013), runs on the shared tokio runtime, and returns results as native Python objects. No Rust concepts leak. Errors are Python exceptions. Types have full PEP 484 hints. IDE autocompletion works."
       ],
       "actionItems": [
@@ -3540,7 +3540,7 @@
       "description": "Implement `scp-core/trust/` module root with `TrustInput` struct and re-exports, plus `ParticipationRecord` and `compute_participation_record` in participation.rs. Participation records are computed locally from event logs (not stored centrally) — any agent computes from accessible logs. Two agents may compute different records from different event log views — this is correct behavior, not a bug. The trust engine provides validated inputs for agent-level evaluation — it does not produce trust 'scores.'",
       "acceptanceCriteria": [
         "TrustInput struct defined with fields: verified_attestations (Vec<Attestation>), participation_record (ParticipationRecord), challenge_results (Vec<(ChallengeRequest, ChallengeResponse)>), consequence_structure (Vec<ConsequenceRule>), threshold_counts (HashMap<AttestationType, (u32, u32)>)",
-        "ParticipationRecord struct defined with fields: subject_did (DID), context_id (ContextId), participation_count (u64), participation_duration_seconds (u64), tool_invocations (HashMap<ToolId, u64>), governance_actions_by (Vec<GovernanceActionSummary>), governance_actions_against (Vec<GovernanceActionSummary>), role_history (Vec<RoleTransition>), attestation_history (Vec<AttestationReference>), context_creation_count (u64), computed_at (u64), event_log_root ([u8; 32])",
+        "ParticipationRecord struct defined with fields: subject_did (DID), context_id (ContextId), participation_count (u64), participation_duration_seconds (u64), tool_invocations (HashMap<OutletId, u64>), governance_actions_by (Vec<GovernanceActionSummary>), governance_actions_against (Vec<GovernanceActionSummary>), role_history (Vec<RoleTransition>), attestation_history (Vec<AttestationReference>), context_creation_count (u64), computed_at (u64), event_log_root ([u8; 32])",
         "compute_participation_record(event_log, subject_did) -> Result<ParticipationRecord, TrustError> scans event log entries for the subject DID",
         "compute_participation_record computes the leaf-derived facts from the event log (participation count/duration, tool invocations by type/frequency, governance actions against/by identity, role progression, context creation history) and populates attestation history from the credential layer (§7.4) — attestation_history/attestation_count is the one exception that is NOT event-log-derived and NOT covered by event_log_root (there is no AttestationPublished event type; attestations are credential-layer artifacts threaded in by the caller, verifier-relative)",
         "compute_participation_record captures the Merkle root at computation time for verifiability",
@@ -3552,7 +3552,7 @@
         "Create crates/scp-core/trust/participation.rs with ParticipationRecord struct and supporting types (GovernanceActionSummary, RoleTransition, AttestationReference)",
         "Implement compute_participation_record that scans event log for subject DID entries",
         "Implement participation count and duration computation from MemberJoined/MemberLeft events",
-        "Implement tool invocation frequency computation from ToolInvoked events",
+        "Implement tool invocation frequency computation from OutletInvoked events",
         "Implement governance action extraction (actions by and against subject)",
         "Implement role history extraction from RoleAssigned events",
         "Implement attestation history population from the credential layer (§7.4), NOT from event-log entries — attestation_history is the credential-layer exception, sourced from accessible, currently-valid endorsements rather than context-log leaves",
@@ -3575,7 +3575,7 @@
         "estimatedFunctions": "~5 public functions, ~4 internal helpers",
         "rustTypes": {
           "TrustInput": "pub struct TrustInput { pub verified_attestations: Vec<Attestation>, pub participation_record: ParticipationRecord, pub challenge_results: Vec<(ChallengeRequest, ChallengeResponse)>, pub consequence_structure: Vec<ConsequenceRule>, pub threshold_counts: HashMap<AttestationType, (u32, u32)> }",
-          "ParticipationRecord": "pub struct ParticipationRecord { pub subject_did: DID, pub context_id: ContextId, pub participation_count: u64, pub participation_duration_seconds: u64, pub tool_invocations: HashMap<ToolId, u64>, pub governance_actions_by: Vec<GovernanceActionSummary>, pub governance_actions_against: Vec<GovernanceActionSummary>, pub role_history: Vec<RoleTransition>, pub attestation_history: Vec<AttestationReference>, pub context_creation_count: u64, pub computed_at: u64, pub event_log_root: [u8; 32] }"
+          "ParticipationRecord": "pub struct ParticipationRecord { pub subject_did: DID, pub context_id: ContextId, pub participation_count: u64, pub participation_duration_seconds: u64, pub tool_invocations: HashMap<OutletId, u64>, pub governance_actions_by: Vec<GovernanceActionSummary>, pub governance_actions_against: Vec<GovernanceActionSummary>, pub role_history: Vec<RoleTransition>, pub attestation_history: Vec<AttestationReference>, pub context_creation_count: u64, pub computed_at: u64, pub event_log_root: [u8; 32] }"
         }
       }
     },
@@ -3592,7 +3592,7 @@
       "description": "Implement attestation types and verification logic. Common attestation envelope (§7.4.1) enables generic verification logic and interoperable attestation exchange. Attestation freshness evaluates renewal interval — stale attestations (past renewal interval but not expired) are degraded, not revoked. Threshold attestation checks N-of-M requirements with independence scoring.",
       "acceptanceCriteria": [
         "Attestation struct defined with fields: id (String), attestation_type (AttestationType), issuer (DID), subject (DID), claim (serde_json::Value), evidence (Option<AttestationEvidence>), issued_at (u64), expires_at (Option<u64>), renewal_interval (Option<Duration>), revocation_status (RevocationStatus), signature (Ed25519Signature)",
-        "AttestationType enum with variants: IdentityLink, CapabilityDelegation, ToolIntegrity, AgentCapability, Endorsement, RoleAssignment, ContextEndorsement, ParticipationWitness",
+        "AttestationType enum with variants: IdentityLink, CapabilityDelegation, OutletIntegrity, AgentCapability, Endorsement, RoleAssignment, ContextEndorsement, ParticipationWitness",
         "ThresholdRequirement struct with fields: required_count (u32), total_attestors (u32), independence_threshold (f64)",
         "verify_attestation(attestation) -> Result<(), TrustError> verifies Ed25519 signature against issuer's public key (resolved via DID)",
         "verify_attestation validates evidence per attestation type",
@@ -3637,7 +3637,7 @@
         ],
         "rustTypes": {
           "Attestation": "pub struct Attestation { pub id: String, pub attestation_type: AttestationType, pub issuer: DID, pub subject: DID, pub claim: serde_json::Value, pub evidence: Option<AttestationEvidence>, pub issued_at: u64, pub expires_at: Option<u64>, pub renewal_interval: Option<Duration>, pub revocation_status: RevocationStatus, pub signature: Ed25519Signature }",
-          "AttestationType": "pub enum AttestationType { IdentityLink, CapabilityDelegation, ToolIntegrity, AgentCapability, Endorsement, RoleAssignment, ContextEndorsement, ParticipationWitness }",
+          "AttestationType": "pub enum AttestationType { IdentityLink, CapabilityDelegation, OutletIntegrity, AgentCapability, Endorsement, RoleAssignment, ContextEndorsement, ParticipationWitness }",
           "ThresholdRequirement": "pub struct ThresholdRequirement { pub required_count: u32, pub total_attestors: u32, pub independence_threshold: f64 }"
         }
       },
@@ -3705,7 +3705,7 @@
       "description": "Implement consequence rules that are declared at context creation and protocol-enforced. Consequences are part of the opt-in contract — visible before joining, protocol-enforced, verifiable. No hidden penalties. Consequence rules check trigger conditions against event log data within the rule's time window.",
       "acceptanceCriteria": [
         "ConsequenceRule struct defined with fields: trigger (ConsequenceTrigger), action (ConsequenceAction), threshold (u64), window (Duration)",
-        "ConsequenceTrigger enum with variants: MessageVelocity, ToolRateExceeded, WarningCount, Custom(String)",
+        "ConsequenceTrigger enum with variants: MessageVelocity, OutletRateExceeded, WarningCount, Custom(String)",
         "ConsequenceAction enum with variants: CapabilitySuspension(Vec<Capability>), AccessRevocation, RoleDemotion { to_role: String }",
         "evaluate_consequence_rules(rules, event_log, subject_did) -> Vec<TriggeredConsequence> checks each rule's trigger condition against event log data within the rule's time window",
         "Message velocity threshold triggers capability suspension",
@@ -3717,7 +3717,7 @@
         "Create crates/scp-core/trust/consequence.rs with ConsequenceRule, ConsequenceTrigger, ConsequenceAction, TriggeredConsequence types",
         "Implement evaluate_consequence_rules that iterates rules and checks triggers against event log",
         "Implement MessageVelocity trigger: count messages in time window, compare to threshold",
-        "Implement ToolRateExceeded trigger: count tool invocations in time window, compare to threshold",
+        "Implement OutletRateExceeded trigger: count tool invocations in time window, compare to threshold",
         "Implement WarningCount trigger: count warning events in time window, compare to threshold",
         "Implement Custom trigger: match custom trigger string against event log entries",
         "Collect triggering evidence (event references) for each triggered consequence",
@@ -3738,7 +3738,7 @@
         "estimatedFunctions": "~3 public functions, ~4 internal helpers",
         "rustTypes": {
           "ConsequenceRule": "pub struct ConsequenceRule { pub trigger: ConsequenceTrigger, pub action: ConsequenceAction, pub threshold: u64, pub window: Duration }",
-          "ConsequenceTrigger": "pub enum ConsequenceTrigger { MessageVelocity, ToolRateExceeded, WarningCount, Custom(String) }",
+          "ConsequenceTrigger": "pub enum ConsequenceTrigger { MessageVelocity, OutletRateExceeded, WarningCount, Custom(String) }",
           "ConsequenceAction": "pub enum ConsequenceAction { CapabilitySuspension(Vec<Capability>), AccessRevocation, RoleDemotion { to_role: String } }"
         }
       },
@@ -4192,7 +4192,7 @@
       "sources": [
         {
           "file": ".docs/adrs/phase-4.md",
-          "section": "## ADR-020: Tool-Interface Discovery"
+          "section": "## ADR-020: Outlet-Interface Discovery"
         }
       ],
       "details": {
@@ -4260,7 +4260,7 @@
       "sources": [
         {
           "file": ".docs/adrs/phase-4.md",
-          "section": "## ADR-020: Tool-Interface Discovery"
+          "section": "## ADR-020: Outlet-Interface Discovery"
         }
       ],
       "details": {
@@ -4309,7 +4309,7 @@
       "sources": [
         {
           "file": ".docs/adrs/phase-4.md",
-          "section": "## ADR-020: Tool-Interface Discovery"
+          "section": "## ADR-020: Outlet-Interface Discovery"
         }
       ],
       "details": {
@@ -4348,7 +4348,7 @@
       "sources": [
         {
           "file": ".docs/adrs/phase-4.md",
-          "section": "## ADR-020: Tool-Interface Discovery"
+          "section": "## ADR-020: Outlet-Interface Discovery"
         }
       ],
       "details": {
@@ -8240,7 +8240,7 @@
         "crates/scp-core/src/context/params.rs",
         "crates/scp-core/src/context/mod.rs"
       ],
-      "description": "Add all core economic types from §19.1.1 and §19.3 to the economy module and wire them into context params.\n\n§19.1.1 Core Economic Types:\n```rust\n/// Amount in smallest currency unit. USD: cents (1 USD = 100). BTC: satoshis (1 BTC = 100_000_000).\n/// Always integer — no floating-point in economic calculations. Cross-party determinism guaranteed.\n/// Both payer and receiver evaluate the same Amount from the same inputs with identical results.\npub struct Amount(pub u64);\n\n/// ISO 4217 currency code (USD, EUR) or protocol-defined code (BTC, SAT, SOL, USDC).\npub struct CurrencyCode(pub [u8; 4]); // 3-4 character code, null-padded\n\n/// Fixed-point coefficient with 6 decimal places of precision.\n/// Value = raw / 1_000_000. Example: 1_500_000 = 1.5, 100 = 0.0001.\n/// Used in pricing formulas where fractional multipliers are needed.\n/// Both sides evaluate identically — no IEEE 754 variance.\npub struct Coefficient(pub i64);\n\n/// Subscription cost for recurring payments.\npub struct SubscriptionCost {\n    pub amount: Amount,\n    pub period: SubscriptionPeriod,\n    pub currency: CurrencyCode,\n}\n\npub enum SubscriptionPeriod {\n    Daily,\n    Weekly,\n    Monthly,\n    Custom { seconds: u64 },\n}\n```\n\n§19.3 Economic Policy:\n```rust\npub struct EconomicPolicy {\n    pub locked: bool,                              // true = immutable, false = governed (default)\n    pub cost_schedule: CostSchedule,\n    pub payment_adapters: Vec<PaymentAdapterRef>,  // accepted payment methods\n    pub pricing_formula: Option<PricingFormula>,    // for dynamic pricing (§19.4)\n    pub payee: DID,                                // who receives payments\n}\n\npub struct CostSchedule {\n    pub per_message: Option<Amount>,\n    pub per_tool_invoke: Option<Amount>,            // default for tools without own cost\n    pub per_join: Option<Amount>,                   // one-time membership cost\n    pub per_period: Option<SubscriptionCost>,       // recurring\n    pub per_byte_stored: Option<Amount>,            // storage costs\n}\n```\n\n§19.4 Dynamic Pricing types:\n```rust\npub struct PricingFormula {\n    pub base_cost: Amount,\n    pub variables: Vec<PricingVariable>,\n    pub cap: Option<Amount>,     // max cost regardless of formula\n    pub floor: Option<Amount>,   // min cost regardless of formula\n}\n\npub enum PricingVariable {\n    /// Linear multiplier: cost += (coefficient.0 * metric_value) / 1_000_000\n    Linear { metric: PricingMetric, coefficient: Coefficient },\n    /// Step function: cost += additional when metric_value exceeds threshold.\n    Step { metric: PricingMetric, thresholds: Vec<(u64, Amount)> },\n}\n\npub enum PricingMetric {\n    ContextMessageRate,    // messages/min in this context\n    MemberCount,           // current member count\n    RelayQueueDepth,       // relay-level only\n    TimeOfDay,             // UTC hour (0-23), enables off-peak pricing\n    SenderVelocity,        // sender's messages in sliding window (anti-spam)\n    StorageUsage,          // context storage in bytes\n}\n```\n\nContextParams extended with economic_policy: Option<EconomicPolicy>. Patches SCP-018 with economic governance support.",
+      "description": "Add all core economic types from §19.1.1 and §19.3 to the economy module and wire them into context params.\n\n§19.1.1 Core Economic Types:\n```rust\n/// Amount in smallest currency unit. USD: cents (1 USD = 100). BTC: satoshis (1 BTC = 100_000_000).\n/// Always integer — no floating-point in economic calculations. Cross-party determinism guaranteed.\n/// Both payer and receiver evaluate the same Amount from the same inputs with identical results.\npub struct Amount(pub u64);\n\n/// ISO 4217 currency code (USD, EUR) or protocol-defined code (BTC, SAT, SOL, USDC).\npub struct CurrencyCode(pub [u8; 4]); // 3-4 character code, null-padded\n\n/// Fixed-point coefficient with 6 decimal places of precision.\n/// Value = raw / 1_000_000. Example: 1_500_000 = 1.5, 100 = 0.0001.\n/// Used in pricing formulas where fractional multipliers are needed.\n/// Both sides evaluate identically — no IEEE 754 variance.\npub struct Coefficient(pub i64);\n\n/// Subscription cost for recurring payments.\npub struct SubscriptionCost {\n    pub amount: Amount,\n    pub period: SubscriptionPeriod,\n    pub currency: CurrencyCode,\n}\n\npub enum SubscriptionPeriod {\n    Daily,\n    Weekly,\n    Monthly,\n    Custom { seconds: u64 },\n}\n```\n\n§19.3 Economic Policy:\n```rust\npub struct EconomicPolicy {\n    pub locked: bool,                              // true = immutable, false = governed (default)\n    pub cost_schedule: CostSchedule,\n    pub payment_adapters: Vec<PaymentAdapterRef>,  // accepted payment methods\n    pub pricing_formula: Option<PricingFormula>,    // for dynamic pricing (§19.4)\n    pub payee: DID,                                // who receives payments\n}\n\npub struct CostSchedule {\n    pub per_message: Option<Amount>,\n    pub per_outlet_call: Option<Amount>,            // default for Action outlets without own cost\n    pub per_join: Option<Amount>,                   // one-time membership cost\n    pub per_period: Option<SubscriptionCost>,       // recurring\n    pub per_byte_stored: Option<Amount>,            // storage costs\n}\n```\n\n§19.4 Dynamic Pricing types:\n```rust\npub struct PricingFormula {\n    pub base_cost: Amount,\n    pub variables: Vec<PricingVariable>,\n    pub cap: Option<Amount>,     // max cost regardless of formula\n    pub floor: Option<Amount>,   // min cost regardless of formula\n}\n\npub enum PricingVariable {\n    /// Linear multiplier: cost += (coefficient.0 * metric_value) / 1_000_000\n    Linear { metric: PricingMetric, coefficient: Coefficient },\n    /// Step function: cost += additional when metric_value exceeds threshold.\n    Step { metric: PricingMetric, thresholds: Vec<(u64, Amount)> },\n}\n\npub enum PricingMetric {\n    ContextMessageRate,    // messages/min in this context\n    MemberCount,           // current member count\n    RelayQueueDepth,       // relay-level only\n    TimeOfDay,             // UTC hour (0-23), enables off-peak pricing\n    SenderVelocity,        // sender's messages in sliding window (anti-spam)\n    StorageUsage,          // context storage in bytes\n}\n```\n\nContextParams extended with economic_policy: Option<EconomicPolicy>. Patches SCP-018 with economic governance support.",
       "acceptanceCriteria": [
         "Amount struct defined as Amount(pub u64) — smallest currency unit, integer-only",
         "CurrencyCode struct defined as CurrencyCode(pub [u8; 4]) — 3-4 character code, null-padded",
@@ -8253,7 +8253,7 @@
         "EconomicPolicy struct defined with field: pricing_formula (Option<PricingFormula>)",
         "EconomicPolicy struct defined with field: payee (DID)",
         "CostSchedule struct defined with field: per_message (Option<Amount>)",
-        "CostSchedule struct defined with field: per_tool_invoke (Option<Amount>) — default for tools without own cost",
+        "CostSchedule struct defined with field: per_outlet_call (Option<Amount>) — default for Action outlets without own cost",
         "CostSchedule struct defined with field: per_join (Option<Amount>) — one-time membership cost",
         "CostSchedule struct defined with field: per_period (Option<SubscriptionCost>) — recurring",
         "CostSchedule struct defined with field: per_byte_stored (Option<Amount>) — storage costs",
@@ -8614,7 +8614,7 @@
       "description": "Implement EconomicPolicy evaluation, CostSchedule lookup, formula evaluation, ObservableMetrics collection, CostInsufficient error with metric_snapshot, and estimate_cost SDK function.\n\n§19.3 Economic Policy:\nEconomic policy is a context setting governed through the context's governance model (§5.9). Mutable by default. Changes go through governance, are logged in the event log, visible to all members, take effect after a notification period. Optional immutability lock — creator MAY lock economic policy at creation (\"always free forever\" or \"price locked at $X forever\"). The lock is itself immutable (once locked, cannot unlock).\n\nEconomic policy is orthogonal to capability ceiling (§5.3). Ceiling governs what CAN happen; economic policy governs what it COSTS. Not a new ceiling category.\n\nChild context independence: Child contexts (§5.13) do NOT inherit parent economic policy — each child's pricing is independent.\n\nAuto-accept hard rule: Auto-accept (§5.12.2) NEVER applies to contexts with economic policy requiring payment. Agents never silently incur costs. This is a hard rule, not a default — no auto-accept policy configuration can override it.\n\n§19.4 CostInsufficient:\n```rust\n/// Returned when payer's authorized amount is less than receiver's computed cost.\n/// Includes metric snapshot so payer can see why costs diverged.\npub struct CostInsufficient {\n    pub expected: Amount,              // receiver's computed cost\n    pub provided: Amount,              // payer's authorized amount\n    pub currency: CurrencyCode,\n    pub metric_snapshot: Vec<(PricingMetric, u64)>,  // receiver's observed metric values\n}\n```\n\n§19.11 SDK Surface:\nSCP.Economy.estimateCost(context, action) -> Amount — evaluates the context's pricing formula against current observable metrics.",
       "acceptanceCriteria": [
         "EconomicPolicy evaluation: given EconomicPolicy + action type, compute cost from CostSchedule",
-        "CostSchedule lookup: per_message cost returned for message actions, per_tool_invoke for tool actions, per_join for join actions",
+        "CostSchedule lookup: per_message cost returned for message actions, per_outlet_call for Action outlet actions, per_join for join actions",
         "CostSchedule lookup: per_period returned for subscription checks, per_byte_stored for storage actions",
         "When pricing_formula is Some, formula evaluation result is added to base CostSchedule cost",
         "ObservableMetrics struct defined with current values for all 6 PricingMetric variants",
@@ -8678,7 +8678,7 @@
         "ADR-033 criterion 8": "PricingFormula evaluation uses Amount(u64) and Coefficient(i64) exclusively — no f64 in any economic calculation path.",
         "ADR-033 criterion 9": "CostInsufficient error includes receiver's metric_snapshot so payer can see why costs diverged.",
         "ADR-033 criterion 10": "Auto-accept guard: ContextInvitation with EconomicPolicy requiring payment is never auto-accepted regardless of auto-accept policy configuration.",
-        "Orthogonality note": "Ceiling governs what CAN happen; economic policy governs what it COSTS. Not a new ceiling category. A context with tool:invoke:* in its ceiling and per_tool_invoke: $0.01 in its economic policy allows tool invocations that cost $0.01 each. Removing the cost doesn't expand capabilities; adding a cost doesn't restrict them."
+        "Orthogonality note": "Ceiling governs what CAN happen; economic policy governs what it COSTS. Not a new ceiling category. A context with outlet:call:* in its ceiling and per_outlet_call: $0.01 in its economic policy allows Action outlet invocations that cost $0.01 each. Removing the cost doesn't expand capabilities; adding a cost doesn't restrict them."
       },
       "result": "EconomicPolicy evaluation, CostSchedule lookup, ObservableMetrics, CostInsufficient error, estimate_cost SDK function, policy lock, auto-accept guard all implemented with comprehensive tests."
     },
@@ -9137,17 +9137,17 @@
       "files": [
         "crates/scp-core/src/context/templates.rs"
       ],
-      "description": "Register two new well-known context templates for economic governance (§19.10) and add TemplateId variants.\n\n§19.10 Context Templates:\n\npaid-service (scp:template/paid-service): Tool invocation context with per-invoke cost. economic_policy.cost_schedule.per_tool_invoke required at creation. Single-admin governance. Extends scp:template/tool-interface.\n\nProperties:\n- Ceiling: messages:read, messages:write, tool:register, tool:invoke:*\n- Ceiling policy: immutable\n- Economic policy: required, per_tool_invoke must be set\n- Governance: single-admin\n- Memory scope: full (receipts are provenance)\n\npaid-broadcast (scp:template/paid-broadcast): Subscription-based broadcast context. economic_policy.cost_schedule.per_period required at creation. Gated subscriber registration — admin grants messages:read UCAN after payment verification. Extends scp:template/gated-broadcast (§5.14.4).\n\nProperties:\n- Mode: Broadcast\n- Ceiling: messages:read, messages:write\n- Ceiling policy: immutable\n- Economic policy: required, per_period must be set\n- Subscriber admission: gated (admin-issued messages:read UCAN post-payment)\n- Memory scope: full",
+      "description": "Register two new well-known context templates for economic governance (§19.10) and add TemplateId variants.\n\n§19.10 Context Templates:\n\npaid-service (scp:template/paid-service): Action outlet invocation context with per-invoke cost. economic_policy.cost_schedule.per_outlet_call required at creation. Single-admin governance. Extends scp:template/outlet-interface.\n\nProperties:\n- Ceiling: messages:read, messages:write, outlet:register, outlet:query:*, outlet:call:*\n- Ceiling policy: immutable\n- Economic policy: required, per_outlet_call must be set\n- Governance: single-admin\n- Memory scope: full (receipts are provenance)\n\npaid-broadcast (scp:template/paid-broadcast): Subscription-based broadcast context. economic_policy.cost_schedule.per_period required at creation. Gated subscriber registration — admin grants messages:read UCAN after payment verification. Extends scp:template/gated-broadcast (§5.14.4).\n\nProperties:\n- Mode: Broadcast\n- Ceiling: messages:read, messages:write\n- Ceiling policy: immutable\n- Economic policy: required, per_period must be set\n- Subscriber admission: gated (admin-issued messages:read UCAN post-payment)\n- Memory scope: full",
       "acceptanceCriteria": [
         "TemplateId enum extended with PaidService variant — maps to \"scp:template/paid-service\"",
         "TemplateId enum extended with PaidBroadcast variant — maps to \"scp:template/paid-broadcast\"",
-        "paid-service template registered with ceiling: [messages:read, messages:write, tool:register, tool:invoke:*]",
+        "paid-service template registered with ceiling: [messages:read, messages:write, outlet:register, outlet:query:*, outlet:call:*]",
         "paid-service template registered with ceiling_policy: immutable",
         "paid-service template registered with governance: single-admin",
         "paid-service template registered with memory_scope: full",
         "paid-service template requires economic_policy at creation (validation error if absent)",
-        "paid-service template requires economic_policy.cost_schedule.per_tool_invoke to be set (validation error if None)",
-        "paid-service template extends scp:template/tool-interface — inherits tool-interface base properties",
+        "paid-service template requires economic_policy.cost_schedule.per_outlet_call to be set (validation error if None)",
+        "paid-service template extends scp:template/outlet-interface — inherits tool-interface base properties",
         "paid-broadcast template registered with mode: Broadcast",
         "paid-broadcast template registered with ceiling: [messages:read, messages:write]",
         "paid-broadcast template registered with ceiling_policy: immutable",
@@ -9156,9 +9156,9 @@
         "paid-broadcast template requires economic_policy.cost_schedule.per_period to be set (validation error if None)",
         "paid-broadcast template extends scp:template/gated-broadcast (§5.14.4) — inherits gated-broadcast base properties",
         "paid-broadcast subscriber admission: gated (admin-issued messages:read UCAN post-payment verification)",
-        "Unit test: create context with paid-service template — valid when per_tool_invoke is set",
+        "Unit test: create context with paid-service template — valid when per_outlet_call is set",
         "Unit test: create context with paid-service template — rejected when economic_policy is absent",
-        "Unit test: create context with paid-service template — rejected when per_tool_invoke is None",
+        "Unit test: create context with paid-service template — rejected when per_outlet_call is None",
         "Unit test: create context with paid-broadcast template — valid when per_period is set",
         "Unit test: create context with paid-broadcast template — rejected when economic_policy is absent",
         "Unit test: create context with paid-broadcast template — rejected when per_period is None",
@@ -9167,9 +9167,9 @@
       ],
       "actionItems": [
         "Add PaidService and PaidBroadcast variants to TemplateId enum in crates/scp-core/src/context/templates.rs",
-        "Register paid-service template with properties: ceiling [messages:read, messages:write, tool:invoke:*], ceiling_policy immutable, governance single-admin, memory_scope full, economic_policy required",
+        "Register paid-service template with properties: ceiling [messages:read, messages:write, outlet:register, outlet:query:*, outlet:call:*], ceiling_policy immutable, governance single-admin, memory_scope full, economic_policy required",
         "Register paid-broadcast template with properties: mode Broadcast, ceiling [messages:read, messages:write], ceiling_policy immutable, memory_scope full, economic_policy required, subscriber admission gated",
-        "Implement validation for paid-service: reject creation when economic_policy is absent or per_tool_invoke is None",
+        "Implement validation for paid-service: reject creation when economic_policy is absent or per_outlet_call is None",
         "Implement validation for paid-broadcast: reject creation when economic_policy is absent or per_period is None",
         "Wire template inheritance: paid-service extends tool-interface, paid-broadcast extends gated-broadcast",
         "Write unit tests for valid creation, missing economic_policy rejection, missing required cost field rejection, TemplateId serialization"
@@ -9190,10 +9190,10 @@
       ],
       "details": {
         "ADR-033 criterion 13": "paid-service and paid-broadcast context templates defined with required economic policy fields.",
-        "Template inheritance": "paid-service extends scp:template/tool-interface. paid-broadcast extends scp:template/gated-broadcast (§5.14.4).",
+        "Template inheritance": "paid-service extends scp:template/outlet-interface. paid-broadcast extends scp:template/gated-broadcast (§5.14.4).",
         "Receipts as provenance": "Both templates use memory_scope: full because payment receipts are provenance records that must be retained."
       },
-      "result": "PaidService and PaidBroadcast TemplateId variants added. Validation enforces economic_policy presence and required cost fields (per_tool_invoke, per_period). Template inheritance wired. Unit tests for valid/invalid creation and serialization."
+      "result": "PaidService and PaidBroadcast TemplateId variants added. Validation enforces economic_policy presence and required cost fields (per_outlet_call, per_period). Template inheritance wired. Unit tests for valid/invalid creation and serialization."
     },
     {
       "id": "SCP-162",
@@ -9451,7 +9451,7 @@
       "description": "Residual stubs from SCP-165 / GitHub #106. The MCP bridge wiring is complete (SCP-165 done), but two FfiBridgeProvider trait methods remain stubbed: (1) validate_capability always returns Ok(()) — no capability checking at the MCP layer, relying solely on UCAN for authorization, (2) invoke_tool returns stub JSON — tool invocations are accepted but not executed. Additionally, py_mcp_load_contexts returns an empty list because relay transport is not yet wired for context discovery.\n\nUCAN (SCP-164) provides the primary authorization boundary, so these stubs are defense-in-depth gaps, not security-breaking. However, they should be completed for layered security and full MCP functionality.\n\nSee GitHub issue #106 (remaining acceptance criteria).",
       "acceptanceCriteria": [
         "FfiBridgeProvider::validate_capability performs real capability checking against context role state and ceiling",
-        "FfiBridgeProvider::invoke_tool executes real tool invocations via ToolRegistry and returns actual results",
+        "FfiBridgeProvider::invoke_tool executes real tool invocations via OutletRegistry and returns actual results",
         "py_mcp_load_contexts queries relay via scp-transport for active contexts",
         "#[allow(dead_code)] annotations removed from MCP state structs if any remain",
         "Test: invoke_tool returns real tool output (not stub JSON)",
@@ -9460,7 +9460,7 @@
       ],
       "actionItems": [
         "Implement validate_capability in FfiBridgeProvider using context role state and capability ceiling from ContextRuntime",
-        "Implement invoke_tool in FfiBridgeProvider using ToolRegistry from ContextRuntime",
+        "Implement invoke_tool in FfiBridgeProvider using OutletRegistry from ContextRuntime",
         "Wire py_mcp_load_contexts to scp-transport relay query",
         "Remove #[allow(dead_code)] annotations from MCP state structs",
         "Write unit tests for validate_capability and invoke_tool",
@@ -9481,7 +9481,7 @@
         "transportDependency": "py_mcp_load_contexts requires relay transport (scp-transport) wiring. validate_capability and invoke_tool can be completed independently.",
         "relationship": "SCP-165 delivered the bridge wiring. This story completes the remaining stubs that SCP-165 deferred."
       },
-      "result": "validate_capability checks has_tool_invoke_capability against role state (generic wire-facing error, detailed server-side tracing::warn). invoke_tool validates input against JSON schema, returns status=validated (no handler dispatch — ToolRegistry is metadata-only). py_mcp_load_contexts returns local registry contexts via context_ids_for_member. dead_code annotations removed (added py_mcp_server_info/py_mcp_client_info introspection). All 41 scp-ffi tests pass. Residual architectural gaps tracked in #115 (invoke_tool handler dispatch) and #116 (relay-based context discovery)."
+      "result": "validate_capability checks has_outlet_call_capability against role state (generic wire-facing error, detailed server-side tracing::warn). invoke_outlet validates input against JSON schema, returns status=validated (no handler dispatch — OutletRegistry is metadata-only). py_mcp_load_contexts returns local registry contexts via context_ids_for_member. dead_code annotations removed (added py_mcp_server_info/py_mcp_client_info introspection). All 41 scp-ffi tests pass. Residual architectural gaps tracked in #115 (invoke_outlet handler dispatch) and #116 (relay-based context discovery)."
     },
     {
       "id": "SCP-211",
@@ -9541,7 +9541,7 @@
         "crates/scp-ffi/src/mcp.rs",
         "crates/scp-core/src/context/tools/invoke.rs"
       ],
-      "description": "FfiBridgeProvider::invoke_tool validates input schema but cannot dispatch to actual tool handlers. ToolRegistry stores metadata only (no handler functions). The real invoke_tool in scp-core accepts an executor: F parameter injected by the caller. Need to design a handler registration mechanism at the FFI layer so Python callers can register callable tool handlers that Rust can dispatch to. Also need to handle the sync→async boundary (ContextProvider trait is sync, scp-core invoke is async).",
+      "description": "FfiBridgeProvider::invoke_tool validates input schema but cannot dispatch to actual tool handlers. OutletRegistry stores metadata only (no handler functions). The real invoke_tool in scp-core accepts an executor: F parameter injected by the caller. Need to design a handler registration mechanism at the FFI layer so Python callers can register callable tool handlers that Rust can dispatch to. Also need to handle the sync→async boundary (ContextProvider trait is sync, scp-core invoke is async).",
       "acceptanceCriteria": [
         "Python tool handlers can be registered via PyO3 and stored in the runtime registry",
         "FfiBridgeProvider::invoke_tool dispatches through scp-core invoke with the registered handler",
@@ -9561,7 +9561,7 @@
       "sources": [
         {
           "file": ".docs/adrs/phase-2.md",
-          "section": "## ADR-010: Tool Registration and Invocation"
+          "section": "## ADR-010: Outlet Registration and Invocation"
         }
       ],
       "result": "Tool handler registration and dispatch wired. Python callables stored as closures in runtime registry. FfiBridgeProvider dispatches to handlers. Commit 8d4c405.",
@@ -10409,22 +10409,22 @@
         "bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/Trust.kt",
         "bindings/kotlin/scp-kt/src/test/kotlin/works/limn/scp/TrustTest.kt"
       ],
-      "description": "Spec §7.3.2 defines a participation record as a set of verifiable facts about a subject DID in a context. Six of those facts are leaf-derived from the context's convergent Merkle event log — participation duration (MemberJoined/MemberLeft), governance actions against (events whose projected target_did is the subject), governance actions by (events whose actor_did is the subject), context creation (ChildContextCreated by the subject), role progression (RoleAssigned whose leaf subject_did is the subject), and tool invocation count (ToolInvoked). The seventh, attestation_count, is the explicit exception: it is a credential-layer fact (§7.4), NOT derived from the event log and NOT covered by event_log_root — there is no AttestationPublished/AttestationRevoked event type (ADR-011 amendment exclusion taxonomy), so it is computed on-demand from the accessible, currently-valid attestations the verifying agent can reach and is therefore verifier-relative. tool_invocation_count is per-author application activity that is NOT yet Merkle-anchored: it stays anchored=false until ADR-051 (causal-DAG application-event ordering) makes ToolInvoked a convergent leaf. The typed participation_record op (Supervisor::participation_record gathering the full unfiltered event log + Merkle root, projected to the twelve-field ParticipationFacts and surfaced as PyParticipationRecord / NapiParticipationRecord / UniFFI ParticipationRecordView) already exists at the Rust core and the PyO3, NAPI, and UniFFI bridges (landed in Phase 2C-1; origin: the C3c SDK-wiring follow-up). Before that op, the Python and TypeScript SDKs recomputed Layer 2 of evaluate_trust/evaluateTrust client-side from a per-actor event-log query — hardcoding contexts_participated=1 / participationCount=rawEvents.length and participation_duration=0, classifying events by an eventType string the queryable payload does not reliably carry, and bucketing every ToolInvoked under a literal key — two independent reimplementations that diverge by construction. This story is the SDK rebuild: replace the client-side Layer-2 computation in both SDKs with a call to the typed participation_record op so both bindings RECEIVE the identical Rust-computed record; reshape the Python BehavioralRecord dataclass and the TypeScript BehavioralRecord interface to the twelve typed fields (snake_case in Python, camelCase in TypeScript) reconciled to §7.3.2.1; and add the public participation_record / participationRecord SDK wrappers. Per the per-SDK-idiom lesson, ALL FOUR bindings expose an idiomatic participation_record wrapper returning the twelve-field BehavioralRecord: the lesson governs HOW each binding surfaces the op, never WHETHER it does. The UniFFI bridge already exports ParticipationRecordView, so the Swift and Kotlin SDKs add the idiomatic sugar (SCP.participationRecord plus a BehavioralRecord type) on top of it, at parity with Python and TypeScript. evaluate_trust/evaluateTrust pass an empty cached-attestation set (no attestation set is available in their inputs), so attestation_count honestly reflects only what the bridge can source from its own persistent trust store — the SDK never fabricates attestations.",
+      "description": "Spec §7.3.2 defines a participation record as a set of verifiable facts about a subject DID in a context. Six of those facts are leaf-derived from the context's convergent Merkle event log — participation duration (MemberJoined/MemberLeft), governance actions against (events whose projected target_did is the subject), governance actions by (events whose actor_did is the subject), context creation (ChildContextCreated by the subject), role progression (RoleAssigned whose leaf subject_did is the subject), and tool invocation count (OutletInvoked). The seventh, attestation_count, is the explicit exception: it is a credential-layer fact (§7.4), NOT derived from the event log and NOT covered by event_log_root — there is no AttestationPublished/AttestationRevoked event type (ADR-011 amendment exclusion taxonomy), so it is computed on-demand from the accessible, currently-valid attestations the verifying agent can reach and is therefore verifier-relative. outlet_invocation_count is per-author application activity that is NOT yet Merkle-anchored: it stays anchored=false until ADR-051 (causal-DAG application-event ordering) makes OutletInvoked a convergent leaf. The typed participation_record op (Supervisor::participation_record gathering the full unfiltered event log + Merkle root, projected to the twelve-field ParticipationFacts and surfaced as PyParticipationRecord / NapiParticipationRecord / UniFFI ParticipationRecordView) already exists at the Rust core and the PyO3, NAPI, and UniFFI bridges (landed in Phase 2C-1; origin: the C3c SDK-wiring follow-up). Before that op, the Python and TypeScript SDKs recomputed Layer 2 of evaluate_trust/evaluateTrust client-side from a per-actor event-log query — hardcoding contexts_participated=1 / participationCount=rawEvents.length and participation_duration=0, classifying events by an eventType string the queryable payload does not reliably carry, and bucketing every OutletInvoked under a literal key — two independent reimplementations that diverge by construction. This story is the SDK rebuild: replace the client-side Layer-2 computation in both SDKs with a call to the typed participation_record op so both bindings RECEIVE the identical Rust-computed record; reshape the Python BehavioralRecord dataclass and the TypeScript BehavioralRecord interface to the twelve typed fields (snake_case in Python, camelCase in TypeScript) reconciled to §7.3.2.1; and add the public participation_record / participationRecord SDK wrappers. Per the per-SDK-idiom lesson, ALL FOUR bindings expose an idiomatic participation_record wrapper returning the twelve-field BehavioralRecord: the lesson governs HOW each binding surfaces the op, never WHETHER it does. The UniFFI bridge already exports ParticipationRecordView, so the Swift and Kotlin SDKs add the idiomatic sugar (SCP.participationRecord plus a BehavioralRecord type) on top of it, at parity with Python and TypeScript. evaluate_trust/evaluateTrust pass an empty cached-attestation set (no attestation set is available in their inputs), so attestation_count honestly reflects only what the bridge can source from its own persistent trust store — the SDK never fabricates attestations.",
       "acceptanceCriteria": [
         "scp-runtime exposes Supervisor::participation_record(context_id, subject_did, accessible_attestations) returning scp_protocol::trust::ParticipationRecord, gathering the FULL unfiltered event-log entry set (so governance_actions_against, which counts events whose projected target is the subject, is not undercounted) and the log's Merkle root, and delegating to the pure-core compute_participation_record (grep finds the fn signature in crates/scp-runtime/src/context/supervisor/supervisor.rs)",
-        "The typed participation_record op is exported by the PyO3 bridge (PyScp::participation_record returning PyParticipationRecord), the NAPI bridge (Scp.participationRecord js_name returning NapiParticipationRecord), and the UniFFI bridge (Scp::participation_record returning ParticipationRecordView), each carrying the twelve fields subject_did, participation_duration_secs, governance_actions_against, governance_actions_by, tool_invocation_count, tool_invocation_count_anchored, context_creation_count, role_progression_count, attestation_count, attestation_count_anchored, computed_at, and event_log_root (grep finds PyParticipationRecord, NapiParticipationRecord, and ParticipationRecordView)",
+        "The typed participation_record op is exported by the PyO3 bridge (PyScp::participation_record returning PyParticipationRecord), the NAPI bridge (Scp.participationRecord js_name returning NapiParticipationRecord), and the UniFFI bridge (Scp::participation_record returning ParticipationRecordView), each carrying the twelve fields subject_did, participation_duration_secs, governance_actions_against, governance_actions_by, outlet_invocation_count, outlet_invocation_count_anchored, context_creation_count, role_progression_count, attestation_count, attestation_count_anchored, computed_at, and event_log_root (grep finds PyParticipationRecord, NapiParticipationRecord, and ParticipationRecordView)",
         "RoleAssigned, MemberJoined, and MemberLeft leaf payloads carry a projected subject_did so role_progression_count and participation duration attribute to the affected member (not the assigning/acting governance actor): the projection surfaces subject_did and compute_participation_record counts RoleAssigned by leaf subject_did per §7.3.2 (a unit test asserts role_progression_count attributes to the role's subject, not the actor)",
-        "bindings/python/scp_sdk/trust.py exposes a public participation_record wrapper that calls the PyO3 participation_record op and returns a BehavioralRecord dataclass whose twelve fields are exactly subject_did, participation_duration_secs, governance_actions_against, governance_actions_by, tool_invocation_count, tool_invocation_count_anchored, context_creation_count, role_progression_count, attestation_count, attestation_count_anchored, computed_at, and event_log_root; the dataclass no longer defines contexts_participated, total_duration, tool_invocations, role_history, or endorsement_accuracy (grep -c each returns 0 in trust.py)",
+        "bindings/python/scp_sdk/trust.py exposes a public participation_record wrapper that calls the PyO3 participation_record op and returns a BehavioralRecord dataclass whose twelve fields are exactly subject_did, participation_duration_secs, governance_actions_against, governance_actions_by, outlet_invocation_count, outlet_invocation_count_anchored, context_creation_count, role_progression_count, attestation_count, attestation_count_anchored, computed_at, and event_log_root; the dataclass no longer defines contexts_participated, total_duration, tool_invocations, role_history, or endorsement_accuracy (grep -c each returns 0 in trust.py)",
         "bindings/python/scp_sdk/trust.py evaluate_trust derives its Layer-2 behavioral_record from the participation_record op (no instance.event_log_query call and no client-side event classification remain in evaluate_trust; grep finds zero event_log_query and zero contexts_participated=1 in evaluate_trust), and Layer 1 (ucan_evaluate) and Layer 3 (attestations) are unchanged",
-        "bindings/typescript/src/types.ts defines the BehavioralRecord interface with exactly the twelve camelCase fields subjectDid, participationDurationSecs, governanceActionsAgainst, governanceActionsBy, toolInvocationCount, toolInvocationCountAnchored, contextCreationCount, roleProgressionCount, attestationCount, attestationCountAnchored, computedAt, and eventLogRoot; the obsolete toolInvocations, participationCount, and participationDurationSeconds fields are removed (grep -c each returns 0 in types.ts)",
-        "bindings/typescript/src/scp.ts exposes a public participationRecord method on the SCP class that calls this.#native.participationRecord routed through the mapBridgeError chokepoint and returns the typed BehavioralRecord, and evaluateTrust derives its Layer-2 behavioralRecord from participationRecord with no eventLogQuery call and no eventType === \"GovernanceActionAgainst\"/\"ToolInvoked\" string classification remaining in evaluateTrust (grep finds zero GovernanceActionAgainst and zero participationCount = in scp.ts evaluateTrust)",
+        "bindings/typescript/src/types.ts defines the BehavioralRecord interface with exactly the twelve camelCase fields subjectDid, participationDurationSecs, governanceActionsAgainst, governanceActionsBy, outletInvocationCount, outletInvocationCountAnchored, contextCreationCount, roleProgressionCount, attestationCount, attestationCountAnchored, computedAt, and eventLogRoot; the obsolete toolInvocations, participationCount, and participationDurationSeconds fields are removed (grep -c each returns 0 in types.ts)",
+        "bindings/typescript/src/scp.ts exposes a public participationRecord method on the SCP class that calls this.#native.participationRecord routed through the mapBridgeError chokepoint and returns the typed BehavioralRecord, and evaluateTrust derives its Layer-2 behavioralRecord from participationRecord with no eventLogQuery call and no eventType === \"GovernanceActionAgainst\"/\"OutletInvoked\" string classification remaining in evaluateTrust (grep finds zero GovernanceActionAgainst and zero participationCount = in scp.ts evaluateTrust)",
         "attestation_count is sourced from the credential layer, not the event log: the bridge participation_record impls source the subject's accessible, currently-valid attestations from the bridge's own ProtocolRepository trust store (verified_attestations over the concrete storage backend), and evaluate_trust/evaluateTrust pass an empty cached-attestation set so attestation_count is 0 when no attestations are available (a real-FFI/real-napi test that creates a context with governance activity but no attestations asserts attestation_count == 0)",
-        "tool_invocation_count_anchored is false in the computed record (a real-FFI/real-napi test asserts the field is False/false), reflecting that ToolInvoked is per-author application activity not yet Merkle-anchored until ADR-051",
+        "outlet_invocation_count_anchored is false in the computed record (a real-FFI/real-napi test asserts the field is False/false), reflecting that OutletInvoked is per-author application activity not yet Merkle-anchored until ADR-051",
         "A cross-SDK parity assertion exists: a test builds the same context and subject and asserts the Python participation_record and the TypeScript participationRecord produce identical values for every one of the twelve fields (the divergence-killer — both SDKs receive the same Rust-computed record)",
         "A real-FFI Python test (bindings/python/tests/test_real_ffi.py) and a real-napi TypeScript test (bindings/typescript/tests/real-napi.test.ts) build a multi-member context, perform governance actions (add member, change role, remove member) and child-context creation, and assert the leaf-derived facts move accordingly (governance_actions_by and/or governance_actions_against > 0, role_progression_count > 0, context_creation_count matches the child contexts created); the real-addon tests run unskipped",
         "The capability matrix .docs/standards/sdk-capability-matrix.json flips the participation_record python, typescript, kotlin, and swift cells all to true and removes every exemption on that row (the kotlin and swift idiomatic SDK wrappers now exist over the UniFFI ParticipationRecordView export), and python3.12 scripts/check-sdk-coverage.py exits 0",
         "All local gates pass: cargo clippy --workspace --all-targets with the in-memory-custody/testing feature set is green; in bindings/typescript with the .node addon built bun run check && bun run lint && bun test succeed; in bindings/python python3.12 -m ruff check . && python3.12 -m ruff format --check . && python3.12 -m pytest tests/ succeed with DYLD_LIBRARY_PATH set; and python3.12 scripts/validate-prd.py exits 0",
-        "The Swift and Kotlin SDKs expose participation_record idiomatically at parity with Python/TypeScript: bindings/swift/Sources/SCP/Trust.swift defines a BehavioralRecord struct with exactly the twelve fields (subjectDid, participationDurationSecs, governanceActionsAgainst, governanceActionsBy, toolInvocationCount, toolInvocationCountAnchored, contextCreationCount, roleProgressionCount, attestationCount, attestationCountAnchored, computedAt, eventLogRoot) and a public SCP.participationRecord method returning it; bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/Trust.kt defines a BehavioralRecord data class with the same twelve fields and bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/Scp.kt exposes an SCP.participationRecord method returning it (grep finds participationRecord and BehavioralRecord in those files); both SDKs' evaluateTrust derives its Layer-2 behavioral record from the typed op and folds the empty-log SCP-CTX-2076 case into a zeroed record"
+        "The Swift and Kotlin SDKs expose participation_record idiomatically at parity with Python/TypeScript: bindings/swift/Sources/SCP/Trust.swift defines a BehavioralRecord struct with exactly the twelve fields (subjectDid, participationDurationSecs, governanceActionsAgainst, governanceActionsBy, outletInvocationCount, outletInvocationCountAnchored, contextCreationCount, roleProgressionCount, attestationCount, attestationCountAnchored, computedAt, eventLogRoot) and a public SCP.participationRecord method returning it; bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/Trust.kt defines a BehavioralRecord data class with the same twelve fields and bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/Scp.kt exposes an SCP.participationRecord method returning it (grep finds participationRecord and BehavioralRecord in those files); both SDKs' evaluateTrust derives its Layer-2 behavioral record from the typed op and folds the empty-log SCP-CTX-2076 case into a zeroed record"
       ],
       "sources": [
         {
@@ -10449,12 +10449,12 @@
         "Reshape bindings/python/scp_sdk/trust.py BehavioralRecord to the twelve typed fields, add the public participation_record wrapper over the PyO3 op, and rewrite evaluate_trust Layer 2 to consume it (deleting the event_log_query + client-side classification block); pass an empty cached-attestation set",
         "Reshape bindings/typescript/src/types.ts BehavioralRecord to the twelve camelCase fields, add the public participationRecord method on the SCP class routed through mapBridgeError, and rewrite evaluateTrust Layer 2 to consume it (deleting the eventLogQuery + classification block); pass an empty cached-attestation set",
         "Flip the participation_record python and typescript capability-matrix cells to true, remove their exemptions, and rewrite the kotlin/swift exemptions to the UniFFI-only convention; run scripts/check-sdk-coverage.py",
-        "Add real-FFI (Python) and real-napi (TypeScript) tests covering governance actions, child-context creation, attestation_count == 0, and tool_invocation_count_anchored == false; remove obsolete toolInvocations-map and client-side-classify tests; add the cross-SDK parity assertion that Python and TypeScript yield identical field values",
+        "Add real-FFI (Python) and real-napi (TypeScript) tests covering governance actions, child-context creation, attestation_count == 0, and outlet_invocation_count_anchored == false; remove obsolete toolInvocations-map and client-side-classify tests; add the cross-SDK parity assertion that Python and TypeScript yield identical field values",
         "Run all local gates (cargo clippy with the feature set, bun check/lint/test with the addon built, ruff + pytest with DYLD, check-sdk-coverage.py, validate-prd.py) and confirm green before opening the PR"
       ],
       "details": {
         "origin": "The typed participation_record op (core + PyO3 + NAPI + UniFFI) landed in Phase 2C-1 on this branch; this story is the SDK-consumption rebuild (Phase 2C-2) that makes the Python and TypeScript SDKs receive the Rust-computed record instead of recomputing Layer 2 client-side.",
-        "outOfScope": "tool_invocation_count_anchored stays false until ADR-051 makes ToolInvoked a convergent leaf; flipping it to true is ADR-051 work, not this story."
+        "outOfScope": "outlet_invocation_count_anchored stays false until ADR-051 makes OutletInvoked a convergent leaf; flipping it to true is ADR-051 work, not this story."
       }
     }
   ]

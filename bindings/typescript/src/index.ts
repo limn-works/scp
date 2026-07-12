@@ -33,7 +33,7 @@
  * (`Identity`, `Context`, `Relay`, `Node`) to pure handle types. The
  * module-level free-function shims and class-level instance/static
  * method fan-out were deleted. Pure helpers that do not touch bridge
- * state (e.g. {@link defineToolDefinition}, {@link parseAddress})
+ * state (e.g. {@link defineOutletDefinition}, {@link parseAddress})
  * remain as free functions.
  *
  * @packageDocumentation
@@ -66,10 +66,10 @@ export type {
 export { Context } from "./context";
 
 // ---------------------------------------------------------------------------
-// Tools
+// Outlets
 // ---------------------------------------------------------------------------
 
-export { defineToolDefinition } from "./tools";
+export { defineOutletDefinition } from "./outlets";
 
 // ---------------------------------------------------------------------------
 // Trust — types only (entry points moved to SCP)
@@ -219,13 +219,13 @@ export {
   McpError,
   mapBridgeError,
   mapSagaError,
+  OutletError,
   PermissionError,
   SagaAbortedError,
   SagaBusyError,
   SagaNeedsRepairError,
   ScpError,
   StorageError,
-  ToolError,
   TransportError,
   UcanPermissionError,
   ValidationError,
@@ -270,6 +270,12 @@ export type {
   McpServerConfig,
   MemberRole,
   Message,
+  OutletCost,
+  OutletDefinition,
+  OutletKind,
+  OutletSessionInvokeResult,
+  OutletSessionResult,
+  OutletVerificationResult,
   ParticipationFact,
   ParticipationProfile,
   ParticipationThreshold,
@@ -284,11 +290,6 @@ export type {
   SiteConfig,
   TestVector,
   ThresholdRequirement,
-  ToolCost,
-  ToolDefinition,
-  ToolSessionInvokeResult,
-  ToolSessionResult,
-  ToolVerificationResult,
   TransportConfig,
   TransportStatus,
   TrustEvaluation,
@@ -298,7 +299,15 @@ export type {
   VerificationMethod,
 } from "./types";
 
-export { allValid, validateAdmission, validateBroadcastKeyHex, validateSiteConfig } from "./types";
+export {
+  allValid,
+  Capabilities,
+  outletCall,
+  outletQuery,
+  validateAdmission,
+  validateBroadcastKeyHex,
+  validateSiteConfig,
+} from "./types";
 
 // ---------------------------------------------------------------------------
 // Internal — bridge target detection (read-only, for diagnostics)

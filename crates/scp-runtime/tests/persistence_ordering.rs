@@ -255,9 +255,9 @@ fn bob() -> DID {
 /// capability that gets suspended off `bob`).
 fn suspension_ceiling() -> Vec<Capability> {
     vec![
-        Capability::new("messages:read"),
-        Capability::new("messages:write"),
-        Capability::new("governance:propose"),
+        Capability::new("messages:read").expect("known capability"),
+        Capability::new("messages:write").expect("known capability"),
+        Capability::new("governance:propose").expect("known capability"),
         Capability::GovernanceVote,
         Capability::MemberBan,
     ]

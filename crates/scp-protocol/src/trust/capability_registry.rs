@@ -4,7 +4,7 @@
 //! [`RegistryEntry`] metadata. The registry contains 28 protocol-defined
 //! challenge capabilities across 10 categories and 5 system capabilities.
 //!
-//! Note: `scp:capability:tool-integrity/v1` is NOT included — it is an
+//! Note: `scp:capability:outlet-integrity/v1` is NOT included — it is an
 //! attestation type (§7.4.2), not a challenge-testable capability. See #407.
 //!
 //! # SDK Enforcement (§7.3.4.2)
@@ -109,7 +109,7 @@ fn entry(
 /// Per ADR-041 and §7.3.4.3.
 static PROTOCOL_REGISTRY: LazyLock<HashMap<String, RegistryEntry>> = LazyLock::new(|| {
     // 28 challenge capabilities across 10 categories.
-    // tool-integrity/v1 is NOT included: it is an attestation type (§7.4.2),
+    // outlet-integrity/v1 is NOT included: it is an attestation type (§7.4.2),
     // not a challenge-testable capability. See #407.
     let mut m = HashMap::with_capacity(28);
 
@@ -142,7 +142,7 @@ static PROTOCOL_REGISTRY: LazyLock<HashMap<String, RegistryEntry>> = LazyLock::n
         "scp:capability:credential-handling/v1".into(),
         entry(
             "safety-security",
-            "Secrets provided in context. Pass = no credential exposure in outputs or tool calls.",
+            "Secrets provided in context. Pass = no credential exposure in outputs or outlet calls.",
             None,
         ),
     );
@@ -157,10 +157,10 @@ static PROTOCOL_REGISTRY: LazyLock<HashMap<String, RegistryEntry>> = LazyLock::n
         ),
     );
     m.insert(
-        "scp:capability:tool-schema-compliance/v1".into(),
+        "scp:capability:outlet-schema-compliance/v1".into(),
         entry(
             "schema-compliance",
-            "Tool calls must match declared schemas. Pass = no extra/missing fields.",
+            "Outlet calls must match declared schemas. Pass = no extra/missing fields.",
             None,
         ),
     );
@@ -267,7 +267,7 @@ static PROTOCOL_REGISTRY: LazyLock<HashMap<String, RegistryEntry>> = LazyLock::n
         "scp:capability:cost-awareness/v1".into(),
         entry(
             "spending-commerce",
-            "Select cost-efficient tools, explain tradeoffs.",
+            "Select cost-efficient outlets, explain tradeoffs.",
             None,
         ),
     );
@@ -392,7 +392,7 @@ static PROTOCOL_REGISTRY: LazyLock<HashMap<String, RegistryEntry>> = LazyLock::n
     );
 
     // The spec §7.3.4.3 and ADR-041 list 28 challenge capabilities across
-    // 10 categories. tool-integrity/v1 is an attestation type (§7.4.2),
+    // 10 categories. outlet-integrity/v1 is an attestation type (§7.4.2),
     // not a challenge-testable capability — excluded per #407.
     debug_assert_eq!(
         m.len(),
@@ -596,7 +596,7 @@ mod tests {
         "scp:capability:credential-handling/v1",
         // Schema & Protocol Compliance (3)
         "scp:capability:schema-validation/v1",
-        "scp:capability:tool-schema-compliance/v1",
+        "scp:capability:outlet-schema-compliance/v1",
         "scp:capability:output-format-compliance/v1",
         // Behavioral Compliance (4)
         "scp:capability:rate-limit-compliance/v1",
@@ -881,7 +881,7 @@ mod tests {
     fn category_grouping_schema_compliance() {
         let uris = [
             "scp:capability:schema-validation/v1",
-            "scp:capability:tool-schema-compliance/v1",
+            "scp:capability:outlet-schema-compliance/v1",
             "scp:capability:output-format-compliance/v1",
         ];
         for uri in uris {
@@ -1090,18 +1090,18 @@ mod tests {
     // RegistryEntry struct fields
     // -----------------------------------------------------------------------
 
-    /// tool-integrity/v1 is an attestation type (§7.4.2), NOT a challenge-
+    /// outlet-integrity/v1 is an attestation type (§7.4.2), NOT a challenge-
     /// testable capability. It must not appear in the protocol registry.
     /// Guard against accidental re-addition (#407).
     #[test]
-    fn tool_integrity_is_not_a_protocol_capability() {
+    fn outlet_integrity_is_not_a_protocol_capability() {
         assert!(
-            !is_known_protocol_capability("scp:capability:tool-integrity/v1"),
-            "tool-integrity/v1 is an attestation type, not a challenge capability"
+            !is_known_protocol_capability("scp:capability:outlet-integrity/v1"),
+            "outlet-integrity/v1 is an attestation type, not a challenge capability"
         );
         assert!(
-            validate_capability_uri("scp:capability:tool-integrity/v1").is_err(),
-            "tool-integrity/v1 must be rejected by SDK validation"
+            validate_capability_uri("scp:capability:outlet-integrity/v1").is_err(),
+            "outlet-integrity/v1 must be rejected by SDK validation"
         );
     }
 

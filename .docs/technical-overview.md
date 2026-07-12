@@ -30,13 +30,13 @@ All interaction happens within contexts. There is no off-context communication a
 - An append-only Merkle event log (every action is verifiable)
 - A governance model (roles, permissions, capability ceiling)
 - A membership roster
-- Tools (stateless, schema-declared, content-addressable)
+- Outlets (stateless, schema-declared, content-addressable)
 
 Two modes, set immutably at creation:
 - Encrypted — one MLS group per context, sender-side keys, full forward secrecy. Bounded membership (~500 practical limit from MLS epoch costs).
 - Broadcast — per-author AES-256 broadcast keys, no MLS. Unlimited subscriber scale. Authors are public.
 
-Contexts are runtime objects (~5-15ms local computation, ~200ms with network). They're created as fluidly as opening a connection. Apps are composites of contexts + members + tools + data.
+Contexts are runtime objects (~5-15ms local computation, ~200ms with network). They're created as fluidly as opening a connection. Apps are composites of contexts + members + outlets + data.
 
 Key governance concepts:
 - Capability ceiling — upper bound on what's possible in the context, declared at creation. Ceiling policy is either `immutable` (default, cannot change) or `governed` (modifiable through governance, changes logged and visible to all members)
@@ -95,8 +95,8 @@ Trust evaluation runs through four layers, from hardest to softest:
 | Layer | What | How |
 |---|---|---|
 | 1. Protocol Enforcement | UCAN validation, signatures, ceilings, roles | 100% validation, 0% trust |
-| 2. Behavioral Validation | Merkle event logs, behavioral records, tool verification, challenge-response, consequence mechanisms | Mostly validation, grows over time |
-| 3. Attestation Authenticity | Signature verification on claims (identity links, endorsements, tool integrity) | Verified as real, not as true |
+| 2. Behavioral Validation | Merkle event logs, behavioral records, outlet verification, challenge-response, consequence mechanisms | Mostly validation, grows over time |
+| 3. Attestation Authenticity | Signature verification on claims (identity links, endorsements, outlet integrity) | Verified as real, not as true |
 | 4. Trust Evaluation | Agent-level judgment for new identities, non-testable capabilities, novel situations | Shrinks as behavioral data grows |
 
 **The critical property:** the trust surface shrinks over time. New identities start trust-heavy. As they participate, behavioral records accumulate, and validation replaces trust.
@@ -105,7 +105,7 @@ Trust evaluation runs through four layers, from hardest to softest:
 
 Agents are absolutely isolated per context. No protocol-level cross-context awareness. Two mechanisms exist for data to cross boundaries:
 
-1. **Tool interfaces** — asymmetric, request/response. Context A calls a tool in Context B through a shared member's local SDK. Both contexts' governance gates every call. Schema-declared, rate-limited,
+1. **Outlet interfaces** — asymmetric, request/response. Context A calls an outlet in Context B through a shared member's local SDK. Both contexts' governance gates every call. Schema-declared, rate-limited,
   auditable, carries provenance. Supports stateful sessions (multi-turn negotiation via session IDs).
 2. **Multi-parent child contexts** — symmetric. A new context with two parents that inherits the intersection of their capability ceilings. Members from both parents interact as peers in the child.
 
@@ -146,11 +146,11 @@ crates/
 
 ### What makes it different
 
-- **Contexts, not channels.** A context is a governed, encrypted, auditable space with its own key material, Merkle log, and tool surface. It's the security boundary, lifecycle boundary, and governance
+- **Contexts, not channels.** A context is a governed, encrypted, auditable space with its own key material, Merkle log, and outlet surface. It's the security boundary, lifecycle boundary, and governance
 boundary all in one.
 - **Encryption IS access control.** No relay or server enforces membership — the math does. Relays are untrusted dumb pipes.
 - **No operator required.** If Limn disappears tomorrow, SCP works exactly as designed. DID resolution via DHT, relays are commodity storage, governance is per-context.
-- **Provenance everywhere.** Not a feature — a core protocol property. Every message, tool output, attestation, and cross-context transfer is traceable.
+- **Provenance everywhere.** Not a feature — a core protocol property. Every message, outlet output, attestation, and cross-context transfer is traceable.
 - **Human accountability.** Every agent chains back to a human DID. The protocol provides the mechanism; contexts decide the requirement.
 - **Trust decays into validation.** New identities require trust. Established identities are validated by behavioral records from Merkle-verified event logs. The system gets more secure over time.
 
@@ -447,18 +447,18 @@ After any recovery: UCAN revocation, KeyPackage rotation, contact notification, 
 
 #### Templates and lightweight creation
 
-Creating a context from scratch means specifying a ceiling, roles, governance model, memory scope, TTL, and tools. That's the right level of control for a carefully designed space, but most contexts are routine. Templates are the fast path — named parameter bundles with fixed, predictable configurations. The protocol defines 10 well-known templates:
+Creating a context from scratch means specifying a ceiling, roles, governance model, memory scope, TTL, and outlets. That's the right level of control for a carefully designed space, but most contexts are routine. Templates are the fast path — named parameter bundles with fixed, predictable configurations. The protocol defines 10 well-known templates:
 
 | Template | Mode | Purpose |
 |---|---|---|
 | `bilateral-ephemeral` | Encrypted | Quick DM with a time limit. Keys destroyed on expiry. |
 | `bilateral-persistent` | Encrypted | Standing DM channel, no expiry. |
-| `coordination` | Encrypted | Time-boxed task context with tools. Summary memory scope. |
+| `coordination` | Encrypted | Time-boxed task context with outlets. Summary memory scope. |
 | `group-discussion` | Encrypted | Group chat with invites. Full persistence. |
 | `public-broadcast` | Broadcast | Open feed — anyone can subscribe on DID authentication alone. |
 | `gated-broadcast` | Broadcast | Feed with access control — admin issues subscriber UCANs. |
-| `tool-interface` | Encrypted | Cross-context tool exposure point. |
-| `paid-service` | Encrypted | Tool context with per-invocation cost. Extends `tool-interface`. |
+| `outlet-interface` | Encrypted | Cross-context outlet exposure point. |
+| `paid-service` | Encrypted | Outlet context with per-invocation cost. Extends `outlet-interface`. |
 | `paid-broadcast` | Broadcast | Subscription feed. Extends `gated-broadcast`. |
 | `handle-registry` | Encrypted | Context that serves human-readable handles. |
 
@@ -469,7 +469,7 @@ Templates are protocol constants, not extensible. A template ID in context metad
 Agents can configure rules for automatic context acceptance — the SDK joins without human confirmation when conditions are met. The only auto-accept trigger is a DID on the operator's explicit allowlist; co-membership and discoverability are not trust signals. Absent an explicit policy, every invitation prompts the human (default-deny). Example: "auto-accept `bilateral-ephemeral` from DIDs on my allowlist, if TTL is under 10 minutes, at most 5 per hour."
 
 Two hard rules that cannot be overridden by any policy:
-- **No auto-accept for tool-bearing contexts.** Tool access enables cross-context data flow. Auto-accepting it would silently expand the agent's attack surface.
+- **No auto-accept for outlet-bearing contexts.** Outlet access enables cross-context data flow. Auto-accepting it would silently expand the agent's attack surface.
 - **No auto-accept for paid contexts.** Agents never silently incur costs.
 
 #### Standing contexts
@@ -506,10 +506,10 @@ Protocol-enforced limits:
 
 #### Apps in SCP
 
-An app is not a protocol entity. There is no `App` type, no app DID, no app registration. What people experience as "an app" is a composite of contexts + members + tools + data. The protocol doesn't model it because the constituent parts are already first-class.
+An app is not a protocol entity. There is no `App` type, no app DID, no app registration. What people experience as "an app" is a composite of contexts + members + outlets + data. The protocol doesn't model it because the constituent parts are already first-class.
 
 State exists at two layers:
-- **Protocol state** — membership, roles, capability tokens, tool registrations, governance, content history, trust. This belongs to the protocol. It's portable and survives app death.
+- **Protocol state** — membership, roles, capability tokens, outlet registrations, governance, content history, trust. This belongs to the protocol. It's portable and survives app death.
 - **App state** — game world state, task boards, edit history. This belongs to the app.
 
 This separation is the anti-lock-in mechanism. If you leave an app, you keep your membership, roles, trust relationships, identity, and social graph. You lose app state only if the app doesn't make it portable. Different members of the same context can use different client apps simultaneously — they share protocol state and each has their own app-layer experience.
@@ -523,7 +523,7 @@ AI Model (any MCP-speaking model)
     ↕ MCP (JSON-RPC, local)
 SCP Agent (translation layer)
     ↕ SCP Protocol (encrypted, over transport)
-Context [tools, roles, members, governance]
+Context [outlets, roles, members, governance]
 ```
 
 The agent handles everything SCP-specific: capability filtering (only exposes tools the human's role permits), DID signing, encryption, context routing. Tools from multiple contexts appear as namespaced MCP tools — `context_a/send_message`, `context_b/schedule_meeting`. Any MCP-compatible model (Claude, GPT, Gemini, local models) participates in SCP without modification.
@@ -564,14 +564,14 @@ Economic governance is entirely optional. Free operation is the default — no e
 | Level | Who sets it | What it covers | Visibility |
 |---|---|---|---|
 | **Relay** | Relay operator | Transport (bandwidth, storage, routing) | `.well-known/scp` relay config, visible before connecting |
-| **Context** | Context creator/governance | Participation (messages, tools, membership) | Context metadata, visible before joining |
-| **Tool** | Tool operator | Per-invocation cost, additive with context costs | Tool registration metadata |
+| **Context** | Context creator/governance | Participation (messages, outlets, membership) | Context metadata, visible before joining |
+| **Outlet** | Outlet operator | Per-invocation cost, additive with context costs | Outlet registration metadata |
 
 Each level is independent. A free context on a paid relay costs only the relay fee. A paid context on a free relay costs only the context fee.
 
 #### Spending UCANs
 
-Paid actions require two capabilities in conjunction: an action UCAN (`messagesWrite`, `toolInvoke`, etc.) and a spending UCAN. Both are independently verified before any paid action proceeds.
+Paid actions require two capabilities in conjunction: an action UCAN (`messagesWrite`, `outletInvoke`, etc.) and a spending UCAN. Both are independently verified before any paid action proceeds.
 
 Spending UCANs support delegation with attenuation — a human grants their agent $100/day, the agent can sub-delegate $10/day to a sub-task. Revocation is independent: revoke the spending UCAN and the agent retains all other capabilities but cannot authorize payments. 24-hour maximum expiry limits blast radius.
 
@@ -590,7 +590,7 @@ The protocol doesn't claim to solve sybil (one person, many identities) — it m
 
 1. **Device attestation.** Hardware-backed attestation (Apple App Attest, Google Play Integrity) ties DID creation to physical devices. One device = one DID. Doesn't prove one human (someone with two phones gets two identities), but makes identity creation cost the price of a device.
 
-2. **Earned capacity.** New identities start limited — restricted context creation, limited participation slots, constrained tool invocation rates. Capacity grows through participation history and time. Sybil accounts are cheap to create but expensive to make useful.
+2. **Earned capacity.** New identities start limited — restricted context creation, limited participation slots, constrained outlet invocation rates. Capacity grows through participation history and time. Sybil accounts are cheap to create but expensive to make useful.
 
 3. **Context-level thresholds.** Each context sets its own admission requirements — behavioral history, endorsements, attestations. A casual group chat requires just a valid DID. A high-trust financial context might require 6 months of history, 3 independent endorsements, and challenge-verified capabilities.
 

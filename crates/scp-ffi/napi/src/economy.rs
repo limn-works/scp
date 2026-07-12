@@ -47,14 +47,14 @@ pub(crate) fn amount_u64_from_bigint(amount: &BigInt, field: &str) -> napi::Resu
 fn parse_action_type(s: &str) -> Result<scp_core::economy::PaidActionType, napi::Error> {
     match s {
         "MessageSend" | "message_send" => Ok(scp_core::economy::PaidActionType::MessageSend),
-        "ToolInvoke" | "tool_invoke" => Ok(scp_core::economy::PaidActionType::ToolInvoke),
+        "OutletCall" | "outlet_call" => Ok(scp_core::economy::PaidActionType::OutletCall),
         "ContextJoin" | "context_join" => Ok(scp_core::economy::PaidActionType::ContextJoin),
         "SubscriptionPeriod" | "subscription_period" => {
             Ok(scp_core::economy::PaidActionType::SubscriptionPeriod)
         }
         "ByteStored" | "byte_stored" => Ok(scp_core::economy::PaidActionType::ByteStored),
         _ => Err(validation_error(&format!(
-            "invalid action type: {s:?} — expected one of: MessageSend, ToolInvoke, \
+            "invalid action type: {s:?} — expected one of: MessageSend, OutletCall, \
              ContextJoin, SubscriptionPeriod, ByteStored"
         ))),
     }

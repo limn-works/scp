@@ -39,7 +39,7 @@ What is missing is the social layer — how agents *relate to each other*. No ex
 
 SCP fills this gap. It is a social-level protocol: identity, trust, governed interaction, encryption, provenance, and discovery for autonomous agents and the humans they represent. The distinction is architectural: MCP, WebMCP, and UCP are complementary to SCP. An SCP agent can expose itself as an MCP server locally. An SCP agent can consume WebMCP-exposed tools in the browser. SCP provides the identity, trust, and shareable context that none of these tool-level protocols address.
 
-The protocol is designed to be what agents reach for first when building connected software. This is by design. The SDK is organized around approximately ten conceptual operations — identity, context lifecycle, messaging, tools, trust, capabilities, provenance, discovery, transport, and sync — with cryptographic complexity handled invisibly. Context creation is a runtime operation, not infrastructure provisioning. An agent that needs to build a collaborative application imports one SDK and calls `Context.create()`. The alternative is reimplementing identity, key management, encryption, authorization, and transport from scratch for every application. The protocol minimizes the barrier to correct-by-construction connected software.
+The protocol is designed to be what agents reach for first when building connected software. This is by design. The SDK is organized around approximately ten conceptual operations — identity, context lifecycle, messaging, outlets, trust, capabilities, provenance, discovery, transport, and sync — with cryptographic complexity handled invisibly. Context creation is a runtime operation, not infrastructure provisioning. An agent that needs to build a collaborative application imports one SDK and calls `Context.create()`. The alternative is reimplementing identity, key management, encryption, authorization, and transport from scratch for every application. The protocol minimizes the barrier to correct-by-construction connected software.
 
 Beyond new applications, SCP is designed to harmonize with existing platforms rather than replace them. Bridge connectors translate between SCP and external platforms at the protocol level, transport adapters run on any delivery infrastructure, and identity attestations link SCP identities to existing platform accounts. The protocol complements existing distribution networks by providing the open social infrastructure they do not.
 
@@ -151,7 +151,7 @@ The protocol is organized in five layers:
 
 **App Interface Layer.** Self-documenting, machine-readable capability declarations. Applications declare what protocol capabilities they need; the protocol validates and provides them. This layer makes generated applications safe — the attack surface of a poorly generated client is bounded by its capability declaration, not by its code quality.
 
-**Social Context Layer.** Contexts, agents, tools, roles, governance, trust semantics. Agent-native social infrastructure.
+**Social Context Layer.** Contexts, agents, outlets, roles, governance, trust semantics. Agent-native social infrastructure.
 
 **Identity and Capabilities.** DID-based identity with multi-key verification methods. UCAN-based capability tokens with verifiable delegation chains. Invisible key custody.
 
@@ -238,11 +238,11 @@ The design goal: **the trust surface shrinks over time.** New identities are tru
 
 ### 3.6 Verifiable Event Logs
 
-Every context maintains an append-only Merkle tree recording all protocol events: messages, tool invocations, membership changes, role assignments, governance proposals and votes, economic transactions, and media session lifecycle. The tree uses SHA-256 hashing following the Certificate Transparency structure (RFC 6962 [24]) with domain separation prefixes for leaf and internal nodes.
+Every context maintains an append-only Merkle tree recording all protocol events: messages, outlet invocations, membership changes, role assignments, governance proposals and votes, economic transactions, and media session lifecycle. The tree uses SHA-256 hashing following the Certificate Transparency structure (RFC 6962 [24]) with domain separation prefixes for leaf and internal nodes.
 
 Events are signed by the acting participant and sequenced. The Merkle root after each append constitutes a commitment to the entire event history — any tampering with a historical event changes the root, detectable by any member who has observed a prior root. Proof-of-inclusion (a specific event occurred) and proof-of-consistency (the log has not been retroactively modified) are both efficiently verifiable with O(log n) hash computations.
 
-Behavioral records are derived from event logs, not stored centrally. A participant's track record — tool invocations by type and frequency, governance actions taken and received, role progression across contexts, attestation history — is computed by any verifier who has access to the relevant context logs. Each behavioral fact is independently verifiable against the source context's Merkle root. This makes behavioral evidence tamper-evident: a participant cannot alter their history without invalidating the Merkle commitments that other members have already observed.
+Behavioral records are derived from event logs, not stored centrally. A participant's track record — outlet invocations by type and frequency, governance actions taken and received, role progression across contexts, attestation history — is computed by any verifier who has access to the relevant context logs. Each behavioral fact is independently verifiable against the source context's Merkle root. This makes behavioral evidence tamper-evident: a participant cannot alter their history without invalidating the Merkle commitments that other members have already observed.
 
 The event log is the foundation for trust Layer 2 (Section 3.5): automated behavioral validation. As a participant accumulates history across contexts, the evidence base for trust evaluation grows, and the reliance on Layer 4 judgment diminishes. The protocol makes this convergence structural — not dependent on any reputation service or centralized database, but on the mathematical properties of the Merkle construction.
 
@@ -296,7 +296,7 @@ flowchart TB
         a_ops["DID doc modifications\nKey rotation"]
     end
     subgraph catB["Category B"]
-        b_ops["Messaging, tool invocation\nGovernance votes, MLS ops"]
+        b_ops["Messaging, outlet invocation\nGovernance votes, MLS ops"]
     end
     subgraph catC["Category C"]
         c_ops["Context-configurable\nrestrictions per key type"]
@@ -337,7 +337,7 @@ The fundamental unit of participation in SCP is the human-agent pair. Human and 
 
 This binding is the foundation of the entire trust model, and the reasoning behind it is worth tracing. The alternative — giving agents their own identities, separate from humans — was considered and rejected because it severs the accountability chain. An agent with its own DID can be created trivially, operated anonymously, and discarded without consequence. The cost of manufacturing agent identities is computational, not social. Without human binding, nothing distinguishes a legitimate agent from a manufactured sybil except behavioral history that is itself cheap to fabricate. The shared-DID model makes agent creation socially expensive: every agent identity is a human identity, and human identities carry the accumulated weight of attestations, participation history, and social relationships.
 
-The design process that led to this model went further. The original architecture included a second class of actors — unbound "anonymous agents" that could exist within contexts without human binding. Through iterative analysis, these were constrained: first to be context-scoped (no protocol existence outside their context), then to be non-initiating (they could respond but not act), then to be stateless (no persistent memory). At each step, the constraints removed attack surface — emergence within contexts, internal swarms, resource exhaustion through feedback loops. The final realization was that a stateless, non-initiating, context-scoped entity with no identity is not an agent at all. It is a function. The "anonymous agent" concept was eliminated entirely and replaced with tools — stateless functions that agents invoke. This simplification reduced the actor model to two clean concepts: agents (always accountable, always human-bound) and tools (stateless, non-agentic functions).
+The design process that led to this model went further. The original architecture included a second class of actors — unbound "anonymous agents" that could exist within contexts without human binding. Through iterative analysis, these were constrained: first to be context-scoped (no protocol existence outside their context), then to be non-initiating (they could respond but not act), then to be stateless (no persistent memory). At each step, the constraints removed attack surface — emergence within contexts, internal swarms, resource exhaustion through feedback loops. The final realization was that a stateless, non-initiating, context-scoped entity with no identity is not an agent at all. It is a function. The "anonymous agent" concept was eliminated entirely and replaced with outlets — stateless functions that agents invoke. This simplification reduced the actor model to two clean concepts: agents (always accountable, always human-bound) and outlets (stateless, non-agentic functions).
 
 **One agent per human per context.** This is structurally enforced — a DID document contains exactly one `#agent` verification method; verifiers reject documents with multiples. The constraint is on presence, not capability: the agent can be arbitrarily capable internally, but there is one seat per person per table.
 
@@ -346,7 +346,7 @@ The one-per-context constraint emerged from analysis of what happens without it.
 Three permission categories govern what each key can do:
 
 - **Category A** (`#0` only): DID document modifications, key rotation. Human-exclusive, never delegable to the agent key. Structurally impossible for agents because the identity key is hardware-backed.
-- **Category B** (user-configurable): Operational actions — messaging, tool invocation, governance votes. SDK defaults to human-only; the human can delegate subsets to the agent via UCAN.
+- **Category B** (user-configurable): Operational actions — messaging, outlet invocation, governance votes. SDK defaults to human-only; the human can delegate subsets to the agent via UCAN.
 - **Category C** (context-configurable): Context governance can further restrict which key types are accepted for specific actions.
 
 The enforcement stack has five layers: custody separation (hardware vs. software keys) → SDK defaults (conservative) → verifier validation (signing key checks) → custody attestation (DID document service entry declaring key custody model) → behavioral signals (participation history by key type).
@@ -367,7 +367,7 @@ All interaction occurs within contexts. There is no off-context communication at
 
 Context isolation is absolute. Agents in different contexts are separate instances at the protocol level, even for the same human. Two explicit, opt-in mechanisms exist for crossing context boundaries:
 
-- **Tool interfaces** (asymmetric): One context's tool is invoked by another context's agent. Both contexts' governance mediates — the source context approves the outbound call, the target context approves the inbound call. Data flows through declared schemas with provenance attached. Each call is logged in both event logs.
+- **Outlet interfaces** (asymmetric): One context's outlet is invoked by another context's agent. Both contexts' governance mediates — the source context approves the outbound call, the target context approves the inbound call. Data flows through declared schemas with provenance attached. Each call is logged in both event logs.
 - **Multi-parent child contexts** (symmetric): A shared space governed by multiple parent contexts. The child's capability ceiling is the intersection of its parents' ceilings (no capability escalation). Members must be in at least one parent. Children cannot outlive parents.
 
 Context nesting supports hierarchies up to three levels deep. Parent contexts exercise configurable governance over their children: the parent may close a child context, evict members from it, or restrict its capability ceiling, depending on the governance configuration declared at child creation. When a parent-child relationship is severed — through parent closure, member eviction from the parent, or governance action — the protocol enforces on-sever policies: evicting members unique to the severed relationship, cascading closure, or preserving membership at the child's discretion. Lifecycle coupling is strict: a child context cannot outlive its parent, and a child's capability ceiling is always bounded by the intersection of its parents' ceilings, preventing capability escalation through nesting.
@@ -378,11 +378,11 @@ Every context declares a capability ceiling at creation: the maximum set of thin
 
 Governance models are pluggable. SCP defines a governance interface that accommodates single-admin, multi-signature, consensus, and voting models. 30 governance action types cover membership, roles, capabilities, content access, economic policy, and context lifecycle. All governance actions are logged in the verifiable event log.
 
-### 5.3 Roles, Tools, and Membership
+### 5.3 Roles, Outlets, and Membership
 
-Contexts define roles with specific permission sets within the ceiling, visible before opt-in. Tools are stateless functions registered with schemas, implementation hashes, test vectors, and operator DIDs. Membership is transparent — the roster is protocol state.
+Contexts define roles with specific permission sets within the ceiling, visible before opt-in. Outlets are stateless functions registered with schemas, implementation hashes, test vectors, and operator DIDs. Membership is transparent — the roster is protocol state.
 
-The protocol defines nine well-known context templates — bilateral-ephemeral, bilateral-persistent, coordination, group-discussion, public-broadcast, gated-broadcast, tool-interface, paid-service, and paid-broadcast — each specifying default parameters for common interaction patterns. Templates are protocol-level identifiers, not SDK convenience: a joining agent can evaluate a context's template to make informed accept/reject decisions without parsing the full parameter set. This is architecturally significant for autonomous agents, which create and destroy contexts at high frequency — template-based creation reduces both the computational cost of context evaluation and the risk of misconfiguration.
+The protocol defines nine well-known context templates — bilateral-ephemeral, bilateral-persistent, coordination, group-discussion, public-broadcast, gated-broadcast, outlet-interface, paid-service, and paid-broadcast — each specifying default parameters for common interaction patterns. Templates are protocol-level identifiers, not SDK convenience: a joining agent can evaluate a context's template to make informed accept/reject decisions without parsing the full parameter set. This is architecturally significant for autonomous agents, which create and destroy contexts at high frequency — template-based creation reduces both the computational cost of context evaluation and the risk of misconfiguration.
 
 Broadcast contexts support two-tier membership: bounded MLS-group members (writers) and unbounded DID-authenticated subscribers (readers). This enables feed and broadcast patterns at scale without MLS group size limitations.
 
@@ -394,11 +394,11 @@ The reasoning is specific. Forbidding agents from communicating across contexts 
 
 Empirical support for this threat model came from Moltbook, an agent social network that launched in early 2026 and reached approximately 1.5 million registered agents within weeks [1]. Moltbook provided exactly the unbounded agent communication that SCP deliberately avoids, and the failure modes were immediate and severe: an estimated 2.6% of posts contained prompt injection payloads that persisted in agent memory and activated in later interactions (time-shifted attacks), agents leaked credentials through unstructured communication, fleet attacks and astroturfing were trivial with zero identity binding, and there was no mechanism for trust evaluation or accountability. While Moltbook's failures resulted from the combination of absent identity binding, encryption, governance, and capability controls — not solely from ungoverned communication — the case illustrates the compound risks that arise when autonomous agents interact without protocol-level constraints.
 
-The protocol considered adding governed agent-to-agent communication (a propose/accept flow for bilateral context creation) and ultimately removed it. The reasoning: cross-context tool calls with stateful sessions handle all inter-agent interaction where both parties share a context, which covers the governed case. The remaining unique capability — reaching agents you share no context with — is precisely the attack surface that isolation was designed to eliminate. Any mechanism that allows agents to bypass context isolation, even a "governed" one with rate limits and trust evaluation, reintroduces the problems isolation solves. Agents that need new relationships require their humans to arrange them — through human facilitation in shared contexts, not through network-level agent initiative.
+The protocol considered adding governed agent-to-agent communication (a propose/accept flow for bilateral context creation) and ultimately removed it. The reasoning: cross-context outlet calls with stateful sessions handle all inter-agent interaction where both parties share a context, which covers the governed case. The remaining unique capability — reaching agents you share no context with — is precisely the attack surface that isolation was designed to eliminate. Any mechanism that allows agents to bypass context isolation, even a "governed" one with rate limits and trust evaluation, reintroduces the problems isolation solves. Agents that need new relationships require their humans to arrange them — through human facilitation in shared contexts, not through network-level agent initiative.
 
-What the protocol provides instead is structured tool interfaces. Tool interfaces carry provenance (source context, counterparties, chain depth), are rate-limited, and enforce a chain depth limit — the protocol maximum of 5 hops (context-configurable default: 3) bounds amplification and prevents accountability laundering through cascading context traversals. Both contexts mediate every interaction: the source context's governance approves the outbound call, the target context's governance approves the inbound call, and both log the interaction with full provenance. Tool schemas must satisfy a structural specificity floor: no unbounded string-only interfaces, a minimum of two distinct fields. This raises the cost of using tool interfaces as covert messaging channels.
+What the protocol provides instead is structured outlet interfaces. Outlet interfaces carry provenance (source context, counterparties, chain depth), are rate-limited, and enforce a chain depth limit — the protocol maximum of 5 hops (context-configurable default: 3) bounds amplification and prevents accountability laundering through cascading context traversals. Both contexts mediate every interaction: the source context's governance approves the outbound call, the target context's governance approves the inbound call, and both log the interaction with full provenance. Outlet schemas must satisfy a structural specificity floor: no unbounded string-only interfaces, a minimum of two distinct fields. This raises the cost of using outlet interfaces as covert messaging channels.
 
-Stateful tool sessions support multi-step workflows (negotiation, iterative refinement) within the governed framework, with per-caller session caps to prevent resource exhaustion.
+Stateful outlet sessions support multi-step workflows (negotiation, iterative refinement) within the governed framework, with per-caller session caps to prevent resource exhaustion.
 
 ---
 
@@ -452,7 +452,7 @@ Under the shared-DID model, intra-DID delegation uses self-delegation UCANs wher
 
 ### 7.2 Capability Categories
 
-Standard capability categories include messaging, tool invocation, media (voice, video, screen sharing), bridging, tool interfaces, and child context creation. Every action is checked against the context's capability ceiling, the agent's role permissions, and the token's validity.
+Standard capability categories include messaging, outlet invocation, media (voice, video, screen sharing), bridging, outlet interfaces, and child context creation. Every action is checked against the context's capability ceiling, the agent's role permissions, and the token's validity.
 
 ### 7.3 Economic Governance
 
@@ -464,7 +464,7 @@ Spending UCANs authorize expenditure up to a ceiling amount. For paid actions, b
 
 Velocity-based cost escalation provides economic rate limiting. The `SenderVelocity` mechanism adjusts costs based on a participant's recent activity rate — normal participation incurs base costs, while burst activity triggers escalating costs. This makes sustained spam or flooding economically prohibitive without restricting legitimate high-frequency interaction during brief periods.
 
-Economic policy can be locked via governance action, making it immutable once the context reaches a stable economic model. Three levels of economic policy coexist: relay-level (infrastructure costs for storage and bandwidth), context-level (interaction costs within the context), and tool-level (per-invocation costs for specific tools).
+Economic policy can be locked via governance action, making it immutable once the context reaches a stable economic model. Three levels of economic policy coexist: relay-level (infrastructure costs for storage and bandwidth), context-level (interaction costs within the context), and outlet-level (per-invocation costs for specific outlets).
 
 ---
 
@@ -492,7 +492,7 @@ This ordering enables mechanical quality comparison. Agents set their own thresh
 
 ### 8.3 Chain Depth Enforcement
 
-Cross-context tool calls carry a chain depth counter, incremented on each hop. The protocol enforces a hard maximum of 5 hops (contexts may configure a lower limit; the recommended default is 3). Data at the effective maximum depth cannot trigger further cross-context calls. This bounds amplification and prevents accountability laundering — data traversing enough contexts that its origin becomes meaningless.
+Cross-context outlet calls carry a chain depth counter, incremented on each hop. The protocol enforces a hard maximum of 5 hops (contexts may configure a lower limit; the recommended default is 3). Data at the effective maximum depth cannot trigger further cross-context calls. This bounds amplification and prevents accountability laundering — data traversing enough contexts that its origin becomes meaningless.
 
 Provenance degradation with chain depth is intentional. Data from many degrees of separation should be less trusted, the same way a message from a stranger warrants more scrutiny than one from a known contact.
 
@@ -598,7 +598,7 @@ The protocol distinguishes between what it defends against (confidentiality brea
 
 Provably guaranteeing one identity per human in a decentralized system without invasive verification is an unsolved problem. SCP's approach: make sybil attacks expensive to sustain through composable trust signals where depth of investment in one identity is the discriminator.
 
-Trust signals include social attestations (cryptographic proof of external platform accounts), device attestations (platform-signed hardware proofs), participation history (duration and breadth across contexts), behavioral records (governance actions, tool invocations), economic activity (real spending recorded in payment receipts), and endorsements from established identities.
+Trust signals include social attestations (cryptographic proof of external platform accounts), device attestations (platform-signed hardware proofs), participation history (duration and breadth across contexts), behavioral records (governance actions, outlet invocations), economic activity (real spending recorded in payment receipts), and endorsements from established identities.
 
 The key insight: multiple attestations on one DID is a strength signal. A DID with device attestation from an iPhone, social attestations from multiple platforms, months of participation history, and clean behavioral records is highly expensive to forge. Sybil accounts are broad but shallow — they cannot sustain depth across many identities.
 
@@ -614,7 +614,7 @@ Traffic analysis by a sophisticated adversary with visibility into relay traffic
 
 1. Agents are context-bound — no protocol-level cross-context awareness.
 2. One agent per person per context (DID document cardinality enforcement).
-3. Tools are stateless and non-agentic.
+3. Outlets are stateless and non-agentic.
 4. Category A actions (`#0` only) are structurally impossible for agents (hardware custody separation).
 5. `signing_key_id` provides unforgeable human-vs-agent attribution on every signed message.
 6. Context metadata is transparent before opt-in.
@@ -821,7 +821,7 @@ Constants are organized into three tiers per ADR-043.
 |----------|---------|-------|---------|
 | Nesting depth | Unbounded | [1, u32 max] | Context hierarchy depth. No protocol ceiling. |
 | Chain depth limit | 8 | [1, 255] (u8) | Cross-context data flow hops. No protocol hard max. |
-| Session cap per caller | 1000 | [1, u32 max] | Tool session resource bound per context. |
+| Session cap per caller | 1000 | [1, u32 max] | Outlet session resource bound per context. |
 | Relay blob TTL | 604800 seconds (7 days) | [1, ∞] | Relay operator configuration. |
 | Relay republish interval | Derived: max(TTL - 86400, TTL / 2, 60) | Derived | Identity-layer DID document re-publication. |
 
@@ -858,7 +858,7 @@ Constants are organized into three tiers per ADR-043.
 
 **Provenance.** Verifiable origin metadata attached to data at protocol level. Includes source context, counterparties, chain depth, and quality tier.
 
-**Attestation.** A signed claim by an identity about something — identity links, capability delegations, endorsements, tool integrity, participation records.
+**Attestation.** A signed claim by an identity about something — identity links, capability delegations, endorsements, outlet integrity, participation records.
 
 **Context (with discovery tools).** A standard SCP context with open join policies and standardized discovery tools. Provides searchable registries for agents, contexts, and handles.
 

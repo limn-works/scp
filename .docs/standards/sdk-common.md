@@ -13,7 +13,7 @@ ScpError (root)
 ├── PermissionError      — UCAN capability validation failures (Python: `UcanPermissionError` to avoid shadowing `builtins.PermissionError`)
 ├── CryptoError          — Encryption, decryption, signature failures
 ├── TransportError       — Network, relay, connection failures
-├── ToolError            — Tool registration, invocation, verification failures
+├── OutletError          — Outlet registration, invocation, verification failures
 └── ValidationError      — Input validation, schema, parameter failures
 ```
 
@@ -35,7 +35,7 @@ ScpError (root)
 | `SCP-PERM-` | 3000-3999 |
 | `SCP-CRYPTO-` | 4000-4999 |
 | `SCP-TRANS-` | 5000-5999 |
-| `SCP-TOOL-` | 6000-6999 |
+| `SCP-OUTLET-` | 6000-6999 |
 | `SCP-VALID-` | 7000-7999 |
 | `SCP-STORAGE-` | 8000-8999 |
 | `SCP-ATTEST-` | 9000-9999 |
@@ -71,7 +71,7 @@ holds `13050-13099`, so the two layers never contend for the same number.
 | `SCP-SAGA-13000` | protocol | Canonical preimage construction exceeded the length-prefix ceiling |
 | `SCP-SAGA-13001` | protocol | Ed25519 saga signature failed verification |
 | `SCP-SAGA-13002` | protocol | Malformed Ed25519 verifying key |
-| `SCP-SAGA-13010` | handler | Caller lacks `tool:interface` capability (outbound) |
+| `SCP-SAGA-13010` | handler | Caller lacks `outlet:interface` capability (outbound) |
 | `SCP-SAGA-13011` | handler | Caller not in outbound `allowed_callers` |
 | `SCP-SAGA-13012` | handler | `ucan_proof_id` not resolvable in target proof store |
 | `SCP-SAGA-13013` | handler | UCAN re-validation failed (confused-deputy re-bind) |
@@ -98,10 +98,10 @@ holds `13050-13099`, so the two layers never contend for the same number.
 | `SCP-SAGA-13037` | handler | Divergence-marker serialization failed |
 | `SCP-SAGA-13038` | handler | Saga phase reached the wrong dispatch helper |
 | `SCP-SAGA-13050` | supervisor | Initiator is not a member of the named caller context (caller-axis authorize-before-reserve) |
-| `SCP-SAGA-13051` | supervisor | Prepare — `CrossContextToolInvocation` reached `start_saga` without an executor context |
+| `SCP-SAGA-13051` | supervisor | Prepare — `CrossContextOutletInvocation` reached `start_saga` without an executor context |
 | `SCP-SAGA-13052` | supervisor | Prepare-A — caller context is not a co-resident actor |
 | `SCP-SAGA-13053` | supervisor | Prepare-B — target context is not a co-resident actor |
-| `SCP-SAGA-13054` | supervisor | Commit — `CrossContextToolInvocation` reached `start_saga` without an executor context |
+| `SCP-SAGA-13054` | supervisor | Commit — `CrossContextOutletInvocation` reached `start_saga` without an executor context |
 | `SCP-SAGA-13055` | supervisor | Commit-B — target context is not a co-resident actor |
 | `SCP-SAGA-13056` | supervisor | Commit-B — executor already consumed but no output stashed (coordinator bug) |
 | `SCP-SAGA-13057` | supervisor | Commit-B — cross-context tool executor failed |
@@ -324,7 +324,7 @@ let ctx = sdk.create_context(ContextConfig {
     ttl: Some(Duration::from_secs(3600)),
     tools: vec![recipe_search, nutrition_lookup],
     ..ContextConfig::defaults(ContextCreation::Explicit {
-        ceiling: vec![Capability::MessagesRead, Capability::MessagesWrite, Capability::ToolInvokeAll],
+        ceiling: vec![Capability::MessagesRead, Capability::MessagesWrite, Capability::OutletQueryAll, Capability::OutletCallAll],
         roles: vec![admin_role, member_role, observer_role],
         governance: Governance::SingleAdmin,
         memory_scope: MemoryScope::Summary,
@@ -367,7 +367,7 @@ sdk.set_auto_accept_policy(
 
 **No default:** absent an explicit, human-configured policy, every invitation prompts the agent/human (default-deny). `known_did` is the only auto-accept trigger; co-membership and discoverability are not trust signals.
 
-**Hard constraint (all SDKs, non-overridable):** Auto-accept policies NEVER apply to contexts whose ceiling includes any tool-related capability (`ToolInvokeAll`, `ToolInvokeSpecific`, `ToolRegister`). Tool-bearing contexts always require explicit confirmation. This is enforced in the SDK and cannot be disabled by configuration.
+**Hard constraint (all SDKs, non-overridable):** Auto-accept policies NEVER apply to contexts whose ceiling includes any outlet-related capability (`OutletQueryAll`, `OutletQuery(_)`, `OutletCallAll`, `OutletCall(_)`, `OutletRegister`). Outlet-bearing contexts always require explicit confirmation. This is enforced in the SDK and cannot be disabled by configuration.
 
 ### Auto-accept persistence
 

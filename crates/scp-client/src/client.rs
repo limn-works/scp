@@ -18,7 +18,7 @@
 //! Participant message path ONLY: create / generate-key-package / add-member /
 //! join / send / receive-decrypt / process-commit / close, plus the event-log
 //! leaves for those events. No economy, governance voting, broadcast hosting,
-//! cross-context saga coordination, tools, discovery, or UCAN minting — those
+//! cross-context saga coordination, outlets, discovery, or UCAN minting — those
 //! require always-on hosts and live node-side. The fence is enforced
 //! mechanically by the crate's dependency set (no `scp-runtime` /
 //! `scp-identity` / `tokio`).

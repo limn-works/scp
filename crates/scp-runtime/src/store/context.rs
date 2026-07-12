@@ -307,7 +307,7 @@ impl<S: Storage> ProtocolRepository<S> {
     /// Deletes all stored state for a context.
     ///
     /// Removes all keys under `context/{context_id}/` including state,
-    /// params, memberships, roles, events, tools, etc. Returns the
+    /// params, memberships, roles, events, outlets, etc. Returns the
     /// number of keys deleted.
     ///
     /// See spec section 17.3 on context cleanup via `delete_prefix`.
@@ -1306,9 +1306,9 @@ mod tests {
             event_log_merkle_root: [0u8; 32],
             executed_proposals: std::collections::HashSet::new(),
             ttl_remaining_secs: Some(300),
-            registered_tools: Vec::new(),
+            registered_outlets: Vec::new(),
             read_exclusion_list: std::collections::HashSet::new(),
-            tool_interfaces: Vec::new(),
+            outlet_interfaces: Vec::new(),
             threshold_signers: Vec::new(),
             threshold_value: 0,
             pruning_policy: None,

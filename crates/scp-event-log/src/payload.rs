@@ -434,7 +434,7 @@ mod tests {
             app_did: "did:key:app".to_owned(),
             app_name: "Scheduler".to_owned(),
             app_version: "1.2.3".to_owned(),
-            capabilities: vec!["tool:invoke:*".to_owned(), "message:send".to_owned()],
+            capabilities: vec!["outlet:call:*".to_owned(), "message:send".to_owned()],
         };
         let encoded = encode_payload(&p).unwrap();
         assert_positional_array(&encoded.data, 4);

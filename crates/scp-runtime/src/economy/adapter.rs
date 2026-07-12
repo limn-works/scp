@@ -772,7 +772,7 @@ impl PaymentAdapter for CountingPaymentAdapter {
             payee: auth.payee.clone(),
             amount: auth.amount,
             currency: auth.currency,
-            action_type: PaidActionType::ToolInvoke,
+            action_type: PaidActionType::OutletCall,
             context_id: None,
             adapter_id: "counting".to_owned(),
             adapter_proof: Vec::new(),

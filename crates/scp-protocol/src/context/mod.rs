@@ -17,13 +17,13 @@ pub mod membership;
 pub mod memory_scope;
 pub mod metadata;
 pub mod nesting;
+pub mod outlets;
 pub mod params;
 pub mod policy;
 pub mod promotion;
 pub mod roles;
 pub mod state_machine;
 pub mod templates;
-pub mod tools;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -55,8 +55,8 @@ pub use nesting::{compute_ceiling_intersection, validate_child_ttl, validate_nes
 pub use params::{
     BridgeCapability, BridgeDirectionality, BridgeMetadata, Capability, CeilingPolicy, ContextMode,
     ContextParams, FieldVisibility, GovernanceModel, MemoryScope, MetadataVisibilityPolicy,
-    MigrationSource, ProjectionOverride, ProjectionPolicy, ProjectionRule, PromotionPolicy,
-    PublicMetadata, RoleDefinition, RuntimeMetadata, TemplateId, ToolRegistration,
+    MigrationSource, OutletRegistration, ProjectionOverride, ProjectionPolicy, ProjectionRule,
+    PromotionPolicy, PublicMetadata, RoleDefinition, RuntimeMetadata, TemplateId,
     decode_protocol_version, encode_protocol_version,
 };
 pub use roles::{
@@ -71,7 +71,7 @@ pub use templates::{TemplateError, template_params, validate_against_template};
 /// Hashes an arbitrary label to a deterministic 32-byte array using SHA-256.
 ///
 /// This is the **raw routing / synthetic-label primitive ONLY**. It is the
-/// correct tool for hashing non-context labels — broadcast routing ids and
+/// correct outlet for hashing non-context labels — broadcast routing ids and
 /// synthetic pseudo-contexts (e.g. the `"identity-private-state"` recovery
 /// label) that are never a real canonical context id. SHA-256 gives a fixed
 /// output size, uniform distribution, and no input-length leakage.
@@ -165,7 +165,7 @@ pub enum ContextState {
     /// are in progress. If any step fails, the context is dropped without
     /// reaching `Active`.
     Creating,
-    /// Context is fully operational. Messages, tool invocations, and membership
+    /// Context is fully operational. Messages, outlet invocations, and membership
     /// changes are permitted according to the context's roles and capabilities.
     Active,
     /// Context closure has been initiated. Members have a window to process
@@ -179,7 +179,7 @@ pub enum ContextState {
     /// window. See spec section 5.10.
     Expired,
     /// Context migration has been approved and the source context is in a
-    /// read-only grace period (§5.11A.4). No new messages, tool invocations,
+    /// read-only grace period (§5.11A.4). No new messages, outlet invocations,
     /// or governance actions (except migration cancellation) are accepted.
     /// Members can still read existing content.
     MigratingOut,
@@ -377,17 +377,17 @@ pub enum ContextError {
     /// Defense-in-depth cap: a burst of operations above the token
     /// bucket capacity is rejected regardless of cost, even when no
     /// economic policy is configured. Applies to the messaging, join,
-    /// and tool invoke paths. Mapped to the canonical `SCP-ECON-12090`
+    /// and outlet invoke paths. Mapped to the canonical `SCP-ECON-12090`
     /// code through the bridge error translators.
     ///
     /// `resource` identifies which path tripped the limit (`"send"`,
-    /// `"join"`, or `"tool_invoke"`) so callers can apply path-specific
+    /// `"join"`, or `"outlet_invoke"`) so callers can apply path-specific
     /// back-off strategies. Untyped `PermissionDenied` predated this
     /// variant; the three call sites were migrated as part of D4.
     #[error("SCP-ECON-12090: rate limit exceeded on {resource}: {message}")]
     RateLimited {
         /// The path that tripped the limit (e.g., `"send"`, `"join"`,
-        /// `"tool_invoke"`).
+        /// `"outlet_invoke"`).
         resource: String,
         /// Human-readable explanation of the bucket state.
         message: String,
@@ -395,7 +395,7 @@ pub enum ContextError {
         /// next call, when the tripped limiter can compute it (the §6.2.0.2
         /// sliding-window saga paths populate this from
         /// `RateLimit::retry_after_secs`). `None` for the token-bucket hard
-        /// rate limit (`join` / `send` / `tool_invoke`), which has no exact
+        /// rate limit (`join` / `send` / `outlet_invoke`), which has no exact
         /// refill instant to surface. Carried so a typed caller (e.g. the §6.2.4 saga
         /// boundary that lifts this into
         /// `SagaAbortReason::RateLimited { retry_after_ms }`) reads the hint

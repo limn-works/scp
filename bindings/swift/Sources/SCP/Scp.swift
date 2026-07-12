@@ -844,12 +844,12 @@ public extension SCP {
     }
 
     /// Forwards to ``Scp/mcpClientInvoke`` on ``inner``.
-    func mcpClientInvoke(handle: String, toolName: String, inputJson: String, contextId: String, invokerDid: String) async throws -> McpInvokeResult {
-        try await inner.mcpClientInvoke(handle: handle, toolName: toolName, inputJson: inputJson, contextId: contextId, invokerDid: invokerDid)
+    func mcpClientInvoke(handle: String, outletName: String, inputJson: String, contextId: String, invokerDid: String) async throws -> McpInvokeResult {
+        try await inner.mcpClientInvoke(handle: handle, outletName: outletName, inputJson: inputJson, contextId: contextId, invokerDid: invokerDid)
     }
 
     /// Forwards to ``Scp/mcpClientListTools`` on ``inner``.
-    func mcpClientListTools(handle: String) async throws -> [McpToolInfo] {
+    func mcpClientListTools(handle: String) async throws -> [McpOutletInfo] {
         try await inner.mcpClientListTools(handle: handle)
     }
 
@@ -1176,62 +1176,62 @@ public extension SCP {
         try await inner.tombstoneMigratedContext(handle: handle)
     }
 
-    /// Forwards to ``Scp/toolInterfaceAccept`` on ``inner``.
-    func toolInterfaceAccept(handle: ContextHandle, interfaceJson: String) async throws -> String {
-        try await inner.toolInterfaceAccept(handle: handle, interfaceJson: interfaceJson)
+    /// Forwards to ``Scp/outletInterfaceAccept`` on ``inner``.
+    func outletInterfaceAccept(handle: ContextHandle, interfaceJson: String) async throws -> String {
+        try await inner.outletInterfaceAccept(handle: handle, interfaceJson: interfaceJson)
     }
 
-    /// Forwards to ``Scp/toolInterfaceExpose`` on ``inner``.
-    func toolInterfaceExpose(handle: ContextHandle, toolId: String, targetContextId: String, rateLimitJson: String?) async throws -> String {
-        try await inner.toolInterfaceExpose(handle: handle, toolId: toolId, targetContextId: targetContextId, rateLimitJson: rateLimitJson)
+    /// Forwards to ``Scp/outletInterfaceExpose`` on ``inner``.
+    func outletInterfaceExpose(handle: ContextHandle, outletId: String, targetContextId: String, rateLimitJson: String?) async throws -> String {
+        try await inner.outletInterfaceExpose(handle: handle, outletId: outletId, targetContextId: targetContextId, rateLimitJson: rateLimitJson)
     }
 
-    /// Forwards to ``Scp/toolInterfaceRevoke`` on ``inner``.
-    func toolInterfaceRevoke(handle: ContextHandle, interfaceIdHex: String) async throws -> String {
-        try await inner.toolInterfaceRevoke(handle: handle, interfaceIdHex: interfaceIdHex)
+    /// Forwards to ``Scp/outletInterfaceRevoke`` on ``inner``.
+    func outletInterfaceRevoke(handle: ContextHandle, interfaceIdHex: String) async throws -> String {
+        try await inner.outletInterfaceRevoke(handle: handle, interfaceIdHex: interfaceIdHex)
     }
 
-    /// Forwards to ``Scp/toolInvoke`` on ``inner``.
-    func toolInvoke(handle: ContextHandle, toolId: String, inputJson: String, identity: Identity, ucanToken: String?, proofTokens: [String]?, spendingUcanJwt: String?) async throws -> String {
-        try await inner.toolInvoke(handle: handle, toolId: toolId, inputJson: inputJson, identity: identity, ucanToken: ucanToken, proofTokens: proofTokens, spendingUcanJwt: spendingUcanJwt)
+    /// Forwards to ``Scp/outletInvoke`` on ``inner``.
+    func outletInvoke(handle: ContextHandle, outletId: String, inputJson: String, identity: Identity, ucanToken: String?, proofTokens: [String]?, spendingUcanJwt: String?) async throws -> String {
+        try await inner.outletInvoke(handle: handle, outletId: outletId, inputJson: inputJson, identity: identity, ucanToken: ucanToken, proofTokens: proofTokens, spendingUcanJwt: spendingUcanJwt)
     }
 
-    /// Forwards to ``Scp/toolInvokeCrossContext`` on ``inner``.
-    func toolInvokeCrossContext(sourceHandle: ContextHandle, targetHandle: ContextHandle, toolId: String, inputJson: String, identity: Identity, ucanToken: String, chainDepth: UInt8, proofTokens: [String]?) async throws -> String {
-        try await inner.toolInvokeCrossContext(sourceHandle: sourceHandle, targetHandle: targetHandle, toolId: toolId, inputJson: inputJson, identity: identity, ucanToken: ucanToken, chainDepth: chainDepth, proofTokens: proofTokens)
+    /// Forwards to ``Scp/outletInvokeCrossContext`` on ``inner``.
+    func outletInvokeCrossContext(sourceHandle: ContextHandle, targetHandle: ContextHandle, outletId: String, inputJson: String, identity: Identity, ucanToken: String, chainDepth: UInt8, proofTokens: [String]?) async throws -> String {
+        try await inner.outletInvokeCrossContext(sourceHandle: sourceHandle, targetHandle: targetHandle, outletId: outletId, inputJson: inputJson, identity: identity, ucanToken: ucanToken, chainDepth: chainDepth, proofTokens: proofTokens)
     }
 
     // swiftlint:disable function_parameter_count
-    /// Forwards to ``Scp/toolInvokeCrossContextSaga`` on ``inner``.
-    func toolInvokeCrossContextSaga(sourceHandle: ContextHandle, targetHandle: ContextHandle, callerDid: String, toolRegistrationId: String, inputJson: String, assertedNonceHex: String, timestampMs: UInt64, chainDepth: UInt8, ucanProofId: String?) async throws -> SagaResult {
-        try await inner.toolInvokeCrossContextSaga(sourceHandle: sourceHandle, targetHandle: targetHandle, callerDid: callerDid, toolRegistrationId: toolRegistrationId, inputJson: inputJson, assertedNonceHex: assertedNonceHex, timestampMs: timestampMs, chainDepth: chainDepth, ucanProofId: ucanProofId)
+    /// Forwards to ``Scp/outletInvokeCrossContextSaga`` on ``inner``.
+    func outletInvokeCrossContextSaga(sourceHandle: ContextHandle, targetHandle: ContextHandle, callerDid: String, outletRegistrationId: String, inputJson: String, assertedNonceHex: String, timestampMs: UInt64, chainDepth: UInt8, ucanProofId: String?) async throws -> SagaResult {
+        try await inner.outletInvokeCrossContextSaga(sourceHandle: sourceHandle, targetHandle: targetHandle, callerDid: callerDid, outletRegistrationId: outletRegistrationId, inputJson: inputJson, assertedNonceHex: assertedNonceHex, timestampMs: timestampMs, chainDepth: chainDepth, ucanProofId: ucanProofId)
     }
 
     // swiftlint:enable function_parameter_count
 
-    /// Forwards to ``Scp/toolRegister`` on ``inner``.
-    func toolRegister(handle: ContextHandle, definition: ToolDefinition) async throws -> String {
-        try await inner.toolRegister(handle: handle, definition: definition)
+    /// Forwards to ``Scp/outletRegister`` on ``inner``.
+    func outletRegister(handle: ContextHandle, definition: OutletDefinition) async throws -> String {
+        try await inner.outletRegister(handle: handle, definition: definition)
     }
 
-    /// Forwards to ``Scp/toolSessionClose`` on ``inner``.
-    func toolSessionClose(handle: ContextHandle, sessionId: String) async throws {
-        try await inner.toolSessionClose(handle: handle, sessionId: sessionId)
+    /// Forwards to ``Scp/outletSessionClose`` on ``inner``.
+    func outletSessionClose(handle: ContextHandle, sessionId: String) async throws {
+        try await inner.outletSessionClose(handle: handle, sessionId: sessionId)
     }
 
-    /// Forwards to ``Scp/toolSessionCreate`` on ``inner``.
-    func toolSessionCreate(handle: ContextHandle, toolId: String, sourceContextId: String, ttlSeconds: UInt64?) async throws -> String {
-        try await inner.toolSessionCreate(handle: handle, toolId: toolId, sourceContextId: sourceContextId, ttlSeconds: ttlSeconds)
+    /// Forwards to ``Scp/outletSessionCreate`` on ``inner``.
+    func outletSessionCreate(handle: ContextHandle, outletId: String, sourceContextId: String, ttlSeconds: UInt64?) async throws -> String {
+        try await inner.outletSessionCreate(handle: handle, outletId: outletId, sourceContextId: sourceContextId, ttlSeconds: ttlSeconds)
     }
 
-    /// Forwards to ``Scp/toolSessionInvoke`` on ``inner``.
-    func toolSessionInvoke(handle: ContextHandle, sessionId: String, inputJson: String, identity: Identity, ucanToken: String, proofTokens: [String]?) async throws -> String {
-        try await inner.toolSessionInvoke(handle: handle, sessionId: sessionId, inputJson: inputJson, identity: identity, ucanToken: ucanToken, proofTokens: proofTokens)
+    /// Forwards to ``Scp/outletSessionInvoke`` on ``inner``.
+    func outletSessionInvoke(handle: ContextHandle, sessionId: String, inputJson: String, identity: Identity, ucanToken: String, proofTokens: [String]?) async throws -> String {
+        try await inner.outletSessionInvoke(handle: handle, sessionId: sessionId, inputJson: inputJson, identity: identity, ucanToken: ucanToken, proofTokens: proofTokens)
     }
 
-    /// Forwards to ``Scp/toolVerify`` on ``inner``.
-    func toolVerify(handle: ContextHandle, toolId: String) async throws -> ToolVerificationResult {
-        try await inner.toolVerify(handle: handle, toolId: toolId)
+    /// Forwards to ``Scp/outletVerify`` on ``inner``.
+    func outletVerify(handle: ContextHandle, outletId: String) async throws -> OutletVerificationResult {
+        try await inner.outletVerify(handle: handle, outletId: outletId)
     }
 
     /// Forwards to ``Scp/transportConnect`` on ``inner``.

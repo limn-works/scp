@@ -440,7 +440,7 @@ impl AddressResolver {
                     return Ok(results);
                 }
 
-                // Then check all contexts with discovery tools.
+                // Then check all contexts with discovery outlets.
                 for (scope, context_id) in known_contexts {
                     let handle_results =
                         handle_querier.lookup_handle(context_id, &name, None).await;
@@ -500,7 +500,7 @@ impl Default for AddressResolver {
 /// and domain handle resolution.
 #[allow(async_fn_in_trait)]
 pub trait HandleQuerier {
-    /// Looks up a handle in a context with discovery tools.
+    /// Looks up a handle in a context with discovery outlets.
     ///
     /// Returns resolution results from the specified context.
     async fn lookup_handle(
@@ -518,7 +518,7 @@ pub trait HandleQuerier {
     /// Looks up an attestation-backed handle via reverse-lookup.
     ///
     /// Returns resolution results from attestation indexes in known
-    /// contexts with discovery tools.
+    /// contexts with discovery outlets.
     async fn lookup_attestation_handle(
         &self,
         handle: &str,

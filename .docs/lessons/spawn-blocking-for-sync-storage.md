@@ -49,7 +49,7 @@ alongside the `crates/scp-ffi/**` prefix), *not* an inline directive: it carries
 `// ci-allow`. Individual sites elsewhere opt out with the gate's **inline allow-list
 directive** (`// ci-allow: block-on: <reason>`) — e.g. `shutdown_all_contexts_sync`'s FFI
 sync-shutdown path; the remaining still-counted sites (`lifecycle_helpers.rs`'s
-`flush_all_contexts_sync` pair, `store/trust.rs`, the `tools_helpers` `_legacy` slack, and
+`flush_all_contexts_sync` pair, `store/trust.rs`, the `outlets_helpers` `_legacy` slack, and
 the `scp-node` HTTP handler) are simply **ratchet-baselined** and driven toward zero
 (`ratchet/block-in-place-count.json`). At the current commit the `scp-transport`
 `provider.rs` / `relay_persistence.rs` bridges are **gone** (count `0` — the `block_in_place`

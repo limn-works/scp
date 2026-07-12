@@ -24,7 +24,7 @@ mandatory-config API rule.
 
 **Single bridge module**: All `#[uniffi::export]` free functions live in
 `bridge.rs` -- function groups for identity, context lifecycle, membership
-queries, governance, broadcast, TTL, tools, UCAN, event log, transport,
+queries, governance, broadcast, TTL, outlets, UCAN, event log, transport,
 discovery, provenance, trust, and sync.
 
 **Callback interfaces**: Platform-specific operations are injected from
@@ -45,7 +45,7 @@ futures.
 counter. `scp_shutdown(timeout_secs)` blocks until all handles are released.
 
 **Error mapping**: `ScpError` enum with variants (`Identity`, `Context`,
-`Permission`, `Crypto`, `Transport`, `Tool`, `Validation`), each carrying a
+`Permission`, `Crypto`, `Transport`, `Outlet`, `Validation`), each carrying a
 `message` and structured `code` (`SCP-{CATEGORY}-{NUMBER}`).
 
 ## Modules

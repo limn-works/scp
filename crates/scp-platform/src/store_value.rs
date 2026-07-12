@@ -133,7 +133,7 @@ pub fn from_stored_value_bytes<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, S
 ///
 /// Rejects strings containing `/`, `\`, `..`, or null bytes to prevent storage
 /// path-traversal attacks. Every component interpolated into a storage key
-/// (DIDs, context ids, tool ids, …) must pass through this gate before being
+/// (DIDs, context ids, outlet ids, …) must pass through this gate before being
 /// formatted into a key.
 ///
 /// # Errors

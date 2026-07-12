@@ -8,12 +8,14 @@ pub mod aggregate;
 pub mod attestation;
 pub mod capability_registry;
 pub mod capability_uri;
+pub mod caveats;
 pub mod challenge;
 pub mod consequence;
 pub mod custody_violation;
 pub mod participation;
 pub mod renewal;
 pub mod sybil;
+pub mod ucan;
 
 // Re-exports for backward compatibility.
 pub use admission::{
@@ -25,6 +27,12 @@ pub use attestation::{
     verify_attestation_with_revocation,
 };
 pub use capability_uri::{CapabilityUri, CapabilityUriError};
+pub use caveats::{
+    AttenuationViolation, CAVEAT_MINT_LIMIT_EXCEEDED_CODE, CaveatMintError, CaveatSerError,
+    CheckInvocationError, DaysOfWeekMask, HoursOfDayMask, InvocationCaveats,
+    MAX_INPUT_SCHEMA_BYTES, MAX_INPUT_SCHEMA_DEPTH, MAX_LIST_ENTRIES, MAX_POPULATED_CAVEATS,
+    MAX_RATE_WINDOW_SECS, MaskWidthError, RateWindow, assert_mask_widths,
+};
 pub use challenge::{
     ChallengeRequest, ChallengeResponse, ChallengeSigner, ChallengeType, ChallengeVerification,
     canonical_challenge_verification_bytes, issue_challenge, verify_challenge_response,
@@ -43,6 +51,7 @@ pub use sybil::{
     EarnedCapacityLevel, FreshnessWeight, IdentityDepthAssessment, TrustSignal,
     TrustSignalCategory, evaluate_earned_capacity,
 };
+pub use ucan::outlet_kind_for_stem;
 
 use std::collections::HashMap;
 
@@ -54,11 +63,11 @@ use scp_did::DID;
 // Type aliases
 // ---------------------------------------------------------------------------
 
-/// A tool identifier string.
+/// A outlet identifier string.
 ///
-/// Matches the `ToolId` type alias in `context::roles`, but redefined here
+/// Matches the `OutletId` type alias in `context::roles`, but redefined here
 /// to avoid coupling the trust module to the context module's internals.
-pub type ToolId = String;
+pub type OutletId = String;
 
 // ---------------------------------------------------------------------------
 // TrustError
@@ -339,8 +348,8 @@ pub enum AttestationType {
     IdentityLink,
     /// Delegates a capability to another DID.
     CapabilityDelegation,
-    /// Attests to the integrity of a tool.
-    ToolIntegrity,
+    /// Attests to the integrity of a outlet.
+    OutletIntegrity,
     /// Attests to an agent's capability.
     AgentCapability,
     /// A general endorsement.
@@ -359,7 +368,7 @@ pub const fn attestation_type_tag(at: &AttestationType) -> u16 {
     match at {
         AttestationType::IdentityLink => 0,
         AttestationType::CapabilityDelegation => 1,
-        AttestationType::ToolIntegrity => 2,
+        AttestationType::OutletIntegrity => 2,
         AttestationType::AgentCapability => 3,
         AttestationType::Endorsement => 4,
         AttestationType::RoleAssignment => 5,

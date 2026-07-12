@@ -72,8 +72,8 @@ function fakeParticipationRecord(
     participationDurationSecs: 0,
     governanceActionsAgainst: 0,
     governanceActionsBy: 0,
-    toolInvocationCount: 0,
-    toolInvocationCountAnchored: false,
+    outletInvocationCount: 0,
+    outletInvocationCountAnchored: false,
     contextCreationCount: 0,
     roleProgressionCount: 0,
     attestationCount: 0,
@@ -134,7 +134,7 @@ describe("scp.ucanEvaluate — structured read-only diagnostic", () => {
       timeBoundsValid: true,
     }));
 
-    const result = await scp.ucanEvaluate("handle", "token-a", "did:dht:agent", "tool:invoke:*");
+    const result = await scp.ucanEvaluate("handle", "token-a", "did:dht:agent", "outlet:call:*");
     expect(result).toEqual({
       tokensValid: true,
       signaturesValid: false,
@@ -259,7 +259,7 @@ describe("scp.evaluateTrust — Layer 1 AND-combination + Layer 2 behavioral", (
         participationDurationSecs: 300,
         governanceActionsAgainst: 2,
         governanceActionsBy: 1,
-        toolInvocationCount: 2,
+        outletInvocationCount: 2,
         contextCreationCount: 1,
         roleProgressionCount: 3,
         attestationCount: 0,
@@ -272,9 +272,9 @@ describe("scp.evaluateTrust — Layer 1 AND-combination + Layer 2 behavioral", (
     expect(result.behavioralRecord.participationDurationSecs).toBe(300);
     expect(result.behavioralRecord.governanceActionsAgainst).toBe(2);
     expect(result.behavioralRecord.governanceActionsBy).toBe(1);
-    expect(result.behavioralRecord.toolInvocationCount).toBe(2);
-    // tool_invocation_count is NOT Merkle-anchored until ADR-051.
-    expect(result.behavioralRecord.toolInvocationCountAnchored).toBe(false);
+    expect(result.behavioralRecord.outletInvocationCount).toBe(2);
+    // outlet_invocation_count is NOT Merkle-anchored until ADR-051.
+    expect(result.behavioralRecord.outletInvocationCountAnchored).toBe(false);
     expect(result.behavioralRecord.contextCreationCount).toBe(1);
     expect(result.behavioralRecord.roleProgressionCount).toBe(3);
     // attestation_count is a credential-layer fact; evaluateTrust passes no
@@ -335,7 +335,7 @@ describe("scp.evaluateTrust — Layer 1 AND-combination + Layer 2 behavioral", (
     expect(record.subjectDid).toBe("did:dht:alice");
     expect(record.participationDurationSecs).toBe(42);
     expect(record.attestationCount).toBe(5);
-    expect(record.toolInvocationCountAnchored).toBe(false);
+    expect(record.outletInvocationCountAnchored).toBe(false);
     // attestationCount is credential-layer, never Merkle-anchored.
     expect(record.attestationCountAnchored).toBe(false);
   });
@@ -356,8 +356,8 @@ describe("scp.evaluateTrust — Layer 1 AND-combination + Layer 2 behavioral", (
     expect(record.participationDurationSecs).toBe(0);
     expect(record.governanceActionsAgainst).toBe(0);
     expect(record.governanceActionsBy).toBe(0);
-    expect(record.toolInvocationCount).toBe(0);
-    expect(record.toolInvocationCountAnchored).toBe(false);
+    expect(record.outletInvocationCount).toBe(0);
+    expect(record.outletInvocationCountAnchored).toBe(false);
     expect(record.contextCreationCount).toBe(0);
     expect(record.roleProgressionCount).toBe(0);
     expect(record.attestationCount).toBe(0);
@@ -525,7 +525,7 @@ describe("scp.verifyParticipationRequirements — participation admission (§7.3
 
     const requirements: readonly RequireParticipation[] = [
       {
-        fact: "ToolInvocationCount",
+        fact: "OutletInvocationCount",
         threshold: { AtLeast: 100 },
         maxAgeSecs: 86_400,
         minContexts: 2,
@@ -541,7 +541,7 @@ describe("scp.verifyParticipationRequirements — participation admission (§7.3
       "did:dht:subject",
       JSON.stringify([
         {
-          fact: "ToolInvocationCount",
+          fact: "OutletInvocationCount",
           threshold: { AtLeast: 100 },
           max_age_secs: 86_400,
           min_contexts: 2,
@@ -580,8 +580,8 @@ function makeProfile(overrides: Partial<ParticipationProfile> = {}): Participati
     participationDurationSecs: 3_600,
     governanceActionsAgainst: 0,
     governanceActionsBy: 1,
-    toolInvocationCount: 150,
-    toolInvocationCountAnchored: false,
+    outletInvocationCount: 150,
+    outletInvocationCountAnchored: false,
     contextCreationCount: 2,
     roleProgressionCount: 3,
     attestationCount: 4,
@@ -642,8 +642,8 @@ describe("encodeParticipationProfile", () => {
         participation_duration_secs: 3_600,
         governance_actions_against: 0,
         governance_actions_by: 1,
-        tool_invocation_count: 150,
-        tool_invocation_count_anchored: false,
+        outlet_invocation_count: 150,
+        outlet_invocation_count_anchored: false,
         context_creation_count: 2,
         role_progression_count: 3,
         attestation_count: 4,

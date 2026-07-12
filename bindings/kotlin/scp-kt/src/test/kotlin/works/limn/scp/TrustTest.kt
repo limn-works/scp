@@ -70,8 +70,8 @@ class TrustTest {
                 participationDurationSecs = 3600uL,
                 governanceActionsAgainst = 1uL,
                 governanceActionsBy = 2uL,
-                toolInvocationCount = 5uL,
-                toolInvocationCountAnchored = false,
+                outletInvocationCount = 5uL,
+                outletInvocationCountAnchored = false,
                 contextCreationCount = 1uL,
                 roleProgressionCount = 3uL,
                 attestationCount = 4uL,
@@ -84,8 +84,8 @@ class TrustTest {
         assertEquals(3600uL, record.participationDurationSecs)
         assertEquals(1uL, record.governanceActionsAgainst)
         assertEquals(2uL, record.governanceActionsBy)
-        assertEquals(5uL, record.toolInvocationCount)
-        assertFalse(record.toolInvocationCountAnchored)
+        assertEquals(5uL, record.outletInvocationCount)
+        assertFalse(record.outletInvocationCountAnchored)
         assertEquals(1uL, record.contextCreationCount)
         assertEquals(3uL, record.roleProgressionCount)
         assertEquals(4uL, record.attestationCount)
@@ -101,8 +101,8 @@ class TrustTest {
         assertEquals(0uL, record.participationDurationSecs)
         assertEquals(0uL, record.governanceActionsAgainst)
         assertEquals(0uL, record.governanceActionsBy)
-        assertEquals(0uL, record.toolInvocationCount)
-        assertFalse(record.toolInvocationCountAnchored)
+        assertEquals(0uL, record.outletInvocationCount)
+        assertFalse(record.outletInvocationCountAnchored)
         assertEquals(0uL, record.contextCreationCount)
         assertEquals(0uL, record.roleProgressionCount)
         assertEquals(0uL, record.attestationCount)

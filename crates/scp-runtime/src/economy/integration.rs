@@ -125,7 +125,7 @@ pub struct ActionEnvelope {
     /// Payment authorization, if this action requires payment.
     /// `None` for free actions.
     pub authorization: Option<PaymentAuthorization>,
-    /// Opaque action payload (message content, tool invocation, etc.).
+    /// Opaque action payload (message content, outlet invocation, etc.).
     pub payload: Vec<u8>,
 }
 
@@ -524,7 +524,7 @@ mod tests {
             cost_schedule: CostSchedule {
                 currency: usd(),
                 per_message: Some(Amount(10)),
-                per_tool_invoke: Some(Amount(50)),
+                per_outlet_call: Some(Amount(50)),
                 per_join: None,
                 per_period: None,
                 per_byte_stored: None,

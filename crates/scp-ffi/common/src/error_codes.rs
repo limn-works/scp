@@ -13,7 +13,7 @@
 //! | `SCP-PERM-`   | 3000--3999  |
 //! | `SCP-CRYPTO-` | 4000--4999  |
 //! | `SCP-TRANS-`  | 5000--5999  |
-//! | `SCP-TOOL-`   | 6000--6999  |
+//! | `SCP-OUTLET-`   | 6000--6999  |
 //! | `SCP-VALID-`  | 7000--7999  |
 //! | `SCP-STORAGE-`| 8000--8999  |
 //! | `SCP-ATTEST-` | 9000--9999  |
@@ -643,59 +643,59 @@ pub const TRANS_5063: &str = "SCP-TRANS-5063";
 pub const TRANS_5070: &str = "SCP-TRANS-5070";
 
 // -------------------------------------------------------------------------
-// Tool (SCP-TOOL- 6000--6999)
+// Outlet (SCP-OUTLET- 6000--6999)
 // -------------------------------------------------------------------------
 
-/// Generic tool error.
-pub const TOOL_6001: &str = "SCP-TOOL-6001";
-/// Tool not found.
-pub const TOOL_6002: &str = "SCP-TOOL-6002";
-/// Tool registration error.
-pub const TOOL_6003: &str = "SCP-TOOL-6003";
-/// Tool invocation error.
-pub const TOOL_6004: &str = "SCP-TOOL-6004";
-/// Tool verification error.
-pub const TOOL_6005: &str = "SCP-TOOL-6005";
-/// Tool capability error.
-pub const TOOL_6006: &str = "SCP-TOOL-6006";
-/// Tool interface error.
-pub const TOOL_6007: &str = "SCP-TOOL-6007";
-/// Tool schema error.
-pub const TOOL_6008: &str = "SCP-TOOL-6008";
-/// Tool handler error.
-pub const TOOL_6009: &str = "SCP-TOOL-6009";
-/// Tool interface establish error.
-pub const TOOL_6010: &str = "SCP-TOOL-6010";
-/// Tool interface query error.
-pub const TOOL_6011: &str = "SCP-TOOL-6011";
-/// Tool interface list error.
-pub const TOOL_6012: &str = "SCP-TOOL-6012";
-/// Tool signer error.
-pub const TOOL_6013: &str = "SCP-TOOL-6013";
-/// Tool register error.
-pub const TOOL_6014: &str = "SCP-TOOL-6014";
-/// Tool deregister error.
-pub const TOOL_6015: &str = "SCP-TOOL-6015";
-/// Tool invoke capability error.
-pub const TOOL_6017: &str = "SCP-TOOL-6017";
-/// Tool invoke schema validation error.
-pub const TOOL_6018: &str = "SCP-TOOL-6018";
-/// Tool invoke result error.
-pub const TOOL_6019: &str = "SCP-TOOL-6019";
-/// Tool invoke handler error.
-pub const TOOL_6020: &str = "SCP-TOOL-6020";
-/// Tool invoke timeout error.
-pub const TOOL_6021: &str = "SCP-TOOL-6021";
-/// Tool verify register error.
-pub const TOOL_6030: &str = "SCP-TOOL-6030";
-/// Tool verify not found error.
-pub const TOOL_6031: &str = "SCP-TOOL-6031";
-/// Tool verify invoke schema error.
-pub const TOOL_6032: &str = "SCP-TOOL-6032";
-/// Tool verify invoke not found error.
-pub const TOOL_6033: &str = "SCP-TOOL-6033";
-/// Tool verify output schema error.
-pub const TOOL_6035: &str = "SCP-TOOL-6035";
+/// Generic outlet error.
+pub const OUTLET_6001: &str = "SCP-OUTLET-6001";
+/// Outlet not found.
+pub const OUTLET_6002: &str = "SCP-OUTLET-6002";
+/// Outlet registration error.
+pub const OUTLET_6003: &str = "SCP-OUTLET-6003";
+/// Outlet invocation error.
+pub const OUTLET_6004: &str = "SCP-OUTLET-6004";
+/// Outlet verification error.
+pub const OUTLET_6005: &str = "SCP-OUTLET-6005";
+/// Outlet capability error.
+pub const OUTLET_6006: &str = "SCP-OUTLET-6006";
+/// Outlet interface error.
+pub const OUTLET_6007: &str = "SCP-OUTLET-6007";
+/// Outlet schema error.
+pub const OUTLET_6008: &str = "SCP-OUTLET-6008";
+/// Outlet handler error.
+pub const OUTLET_6009: &str = "SCP-OUTLET-6009";
+/// Outlet interface establish error.
+pub const OUTLET_6010: &str = "SCP-OUTLET-6010";
+/// Outlet interface query error.
+pub const OUTLET_6011: &str = "SCP-OUTLET-6011";
+/// Outlet interface list error.
+pub const OUTLET_6012: &str = "SCP-OUTLET-6012";
+/// Outlet signer error.
+pub const OUTLET_6013: &str = "SCP-OUTLET-6013";
+/// Outlet register error.
+pub const OUTLET_6014: &str = "SCP-OUTLET-6014";
+/// Outlet deregister error.
+pub const OUTLET_6015: &str = "SCP-OUTLET-6015";
+/// Outlet invoke capability error.
+pub const OUTLET_6017: &str = "SCP-OUTLET-6017";
+/// Outlet invoke schema validation error.
+pub const OUTLET_6018: &str = "SCP-OUTLET-6018";
+/// Outlet invoke result error.
+pub const OUTLET_6019: &str = "SCP-OUTLET-6019";
+/// Outlet invoke handler error.
+pub const OUTLET_6020: &str = "SCP-OUTLET-6020";
+/// Outlet invoke timeout error.
+pub const OUTLET_6021: &str = "SCP-OUTLET-6021";
+/// Outlet verify register error.
+pub const OUTLET_6030: &str = "SCP-OUTLET-6030";
+/// Outlet verify not found error.
+pub const OUTLET_6031: &str = "SCP-OUTLET-6031";
+/// Outlet verify invoke schema error.
+pub const OUTLET_6032: &str = "SCP-OUTLET-6032";
+/// Outlet verify invoke not found error.
+pub const OUTLET_6033: &str = "SCP-OUTLET-6033";
+/// Outlet verify output schema error.
+pub const OUTLET_6035: &str = "SCP-OUTLET-6035";
 
 // -------------------------------------------------------------------------
 // Validation (SCP-VALID- 7000--7999)
@@ -774,21 +774,21 @@ pub const VALID_7031: &str = "SCP-VALID-7031";
 pub const VALID_7032: &str = "SCP-VALID-7032";
 /// MCP context validation error.
 pub const VALID_7033: &str = "SCP-VALID-7033";
-/// MCP tool validation error.
+/// MCP outlet validation error.
 pub const VALID_7034: &str = "SCP-VALID-7034";
-/// Tool register input validation error.
+/// Outlet register input validation error.
 pub const VALID_7035: &str = "SCP-VALID-7035";
-/// Tool register schema validation error.
+/// Outlet register schema validation error.
 pub const VALID_7036: &str = "SCP-VALID-7036";
-/// Tool invoke input validation error.
+/// Outlet invoke input validation error.
 pub const VALID_7037: &str = "SCP-VALID-7037";
-/// Tool verify input validation error.
+/// Outlet verify input validation error.
 pub const VALID_7038: &str = "SCP-VALID-7038";
 /// Event log input validation error.
 pub const VALID_7040: &str = "SCP-VALID-7040";
-/// Tool verify register output validation.
+/// Outlet verify register output validation.
 pub const VALID_7041: &str = "SCP-VALID-7041";
-/// Tool verify output validation error.
+/// Outlet verify output validation error.
 pub const VALID_7042: &str = "SCP-VALID-7042";
 /// Transport connect validation error.
 pub const VALID_7043: &str = "SCP-VALID-7043";
@@ -1023,7 +1023,7 @@ pub const ECON_12095: &str = "SCP-ECON-12095";
 pub const ECON_12096: &str = "SCP-ECON-12096";
 
 // -------------------------------------------------------------------------
-// Cross-context tool-invocation saga (SCP-SAGA- 13000--13999)
+// Cross-context outlet-invocation saga (SCP-SAGA- 13000--13999)
 // -------------------------------------------------------------------------
 //
 // The §6.2.4 / ADR-049 §3a saga terminal codes the FFI saga surface maps the

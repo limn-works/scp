@@ -101,7 +101,7 @@ impl<T> Outcome<T> {
 /// canonical sketch never silently coarsens an error a caller's
 /// `Outcome`-inspecting code might switch on; any other variant collapses to a
 /// `CryptoFailed` carrying the `Display` text (lossless for logging). Hoisted to
-/// one definition so the saga and tools handlers cannot diverge on which
+/// one definition so the saga and outlets handlers cannot diverge on which
 /// variants survive (a `ContextError`-not-`Clone` workaround that had drifted
 /// into two divergent copies).
 #[must_use]

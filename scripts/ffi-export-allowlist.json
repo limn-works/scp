@@ -274,10 +274,10 @@
       "reason": "Getter for a timestamp field on a result type."
     },
     {
-      "name": "tools",
+      "name": "outlets",
       "path": "crates/scp-ffi/src/context.rs",
       "kind": "getter",
-      "reason": "Getter for a tool list on a result type."
+      "reason": "Getter for an outlet list on a result type."
     },
     {
       "name": "ttl",
@@ -418,10 +418,10 @@
       "reason": "Blocks until a registered MCP server handle finishes (ADR-015; spec \u00a78). PyO3-only helper for the Python MCP server runtime; NAPI has no equivalent server host. Not a cross-bridge parity op."
     },
     {
-      "name": "py_register_tool_handler",
+      "name": "py_register_outlet_handler",
       "path": "crates/scp-ffi/src/mcp.rs",
       "kind": "bridge-specific",
-      "reason": "Synchronous in-process tool-handler registration (mcp_register_tool_handler; SCP-212, ADR-010). Python-only by design per .docs/standards/sdk-capability-matrix.json MCP domain (register_tool_handler: python=true, ts/kt/swift=false): NAPI wires handlers via its own callback model and do not export this op. Not a parity gap."
+      "reason": "Synchronous in-process outlet-handler registration (mcp_register_outlet_handler; SCP-212, ADR-010). Python-only by design per .docs/standards/sdk-capability-matrix.json MCP domain (register_outlet_handler: python=true, ts/kt/swift=false): NAPI wires handlers via its own callback model and do not export this op. Not a parity gap."
     },
     {
       "name": "py_registry_cleanup",
@@ -593,15 +593,15 @@
     },
     {
       "name": "__repr__",
-      "path": "crates/scp-ffi/src/tools.rs",
+      "path": "crates/scp-ffi/src/outlets.rs",
       "kind": "dunder",
       "reason": "Python debug-representation dunder on bridge result types; not a protocol operation."
     },
     {
       "name": "new",
-      "path": "crates/scp-ffi/src/tools.rs",
+      "path": "crates/scp-ffi/src/outlets.rs",
       "kind": "lifecycle",
-      "reason": "PyScp constructor; instance lifecycle, not a parity operation."
+      "reason": "OutletRegistration result-type constructor; instance lifecycle, not a parity operation."
     },
     {
       "name": "__repr__",

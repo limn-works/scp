@@ -2,7 +2,7 @@
 
 > `@limn-works/scp-ts` -- Shared Context Protocol for TypeScript
 
-Cryptographic identity, encrypted contexts, capability-based auth, and tool invocation for AI agents. Runs on Bun/Node via a native addon; in the browser, the SDK is a remote thin client.
+Cryptographic identity, encrypted contexts, capability-based auth, and outlet invocation for AI agents. Runs on Bun/Node via a native addon; in the browser, the SDK is a remote thin client.
 
 ## Install
 
@@ -68,8 +68,8 @@ See [`examples/`](./examples/) for runnable scripts:
 | File | Description |
 |------|-------------|
 | `basic-messaging.ts` | Create identity, context, send/receive messages |
-| `tool-invocation.ts` | Register and invoke a tool with test vectors |
-| `mcp-integration.ts` | Expose SCP tools via MCP JSON-RPC server |
+| `outlet-invocation.ts` | Register and invoke a outlet with test vectors |
+| `mcp-integration.ts` | Expose SCP outlets via MCP JSON-RPC server |
 | `multi-agent.ts` | Coordinate multiple agents in a shared context |
 | `node-demo.ts` | End-to-end NAPI demo: identity, context, messaging, membership |
 

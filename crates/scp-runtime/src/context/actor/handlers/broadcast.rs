@@ -35,7 +35,7 @@ use std::time::Duration;
 
 use scp_protocol::context::ContextError;
 use scp_protocol::crypto::ucan::validate::{
-    DEFAULT_CLOCK_SKEW_TOLERANCE_SECS, InMemoryProofResolver, ValidationContext,
+    DEFAULT_CLOCK_SKEW_TOLERANCE_SECS, InMemoryProofResolver, NoCaveatResolver, ValidationContext,
 };
 use tokio::sync::oneshot;
 
@@ -173,10 +173,10 @@ async fn handle_subscribe_broadcast(
     // carries a single token, not a proof bundle, so a subscriber cannot even
     // supply parent proofs), and there is NO intra-context `messages:read`
     // delegation proof store — the only runtime proof store, `xctx_ucan_proofs`,
-    // is the CROSS-context tool-invocation saga store (empty outside an active
-    // saga) and holds `tool_invoke` proofs, NOT read grants. So we deliberately
+    // is the CROSS-context outlet-invocation saga store (empty outside an active
+    // saga) and holds `outlet_invoke` proofs, NOT read grants. So we deliberately
     // do NOT clone `xctx_ucan_proofs` here (that would risk cross-contaminating a
-    // read-grant validation with unrelated tool proofs). `verify_delegation_chain`
+    // read-grant validation with unrelated outlet proofs). `verify_delegation_chain`
     // no-ops on a root token's empty `prf`, so this empty resolver is never
     // consulted on the supported path; an out-of-spec DELEGATED grant instead
     // fails closed (`DelegationChainBroken`) — the correct rejection.
@@ -228,6 +228,7 @@ async fn handle_subscribe_broadcast(
         presenting_agent_did: p.subscriber_did.as_ref(),
         clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
         clock: deps.clock.as_ref(),
+        caveat_resolver: &NoCaveatResolver,
     };
 
     let subscribe_fut = async {
@@ -890,6 +891,7 @@ mod tests {
             }],
             prf: vec![],
             fct: None,
+            nb: None,
         };
 
         let header_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap());

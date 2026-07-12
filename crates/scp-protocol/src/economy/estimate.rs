@@ -109,7 +109,7 @@ mod tests {
             Some(Amount(0))
         );
         assert_eq!(
-            estimate_cost(None, &PaidActionType::ToolInvoke, &metrics),
+            estimate_cost(None, &PaidActionType::OutletCall, &metrics),
             Some(Amount(0))
         );
         assert_eq!(
@@ -137,7 +137,7 @@ mod tests {
             cost_schedule: CostSchedule {
                 currency: usd(),
                 per_message: Some(Amount(10)),
-                per_tool_invoke: Some(Amount(50)),
+                per_outlet_call: Some(Amount(50)),
                 per_join: None,
                 per_period: None,
                 per_byte_stored: None,
@@ -153,7 +153,7 @@ mod tests {
             Some(Amount(10))
         );
         assert_eq!(
-            estimate_cost(Some(&policy), &PaidActionType::ToolInvoke, &metrics),
+            estimate_cost(Some(&policy), &PaidActionType::OutletCall, &metrics),
             Some(Amount(50))
         );
         // No per_join cost configured -> 0.
@@ -170,7 +170,7 @@ mod tests {
             cost_schedule: CostSchedule {
                 currency: usd(),
                 per_message: Some(Amount(10)),
-                per_tool_invoke: None,
+                per_outlet_call: None,
                 per_join: None,
                 per_period: None,
                 per_byte_stored: None,
@@ -205,7 +205,7 @@ mod tests {
             cost_schedule: CostSchedule {
                 currency: usd(),
                 per_message: Some(Amount(1)),
-                per_tool_invoke: None,
+                per_outlet_call: None,
                 per_join: None,
                 per_period: None,
                 per_byte_stored: None,

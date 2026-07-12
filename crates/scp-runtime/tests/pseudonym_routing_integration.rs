@@ -5,7 +5,7 @@
     clippy::large_futures,
     // Test-only recording transport: `send_message` is a synchronous trait
     // method, so a plain `std::sync::Mutex` (never held across `.await`) is the
-    // right tool. The runtime's actor path bans it (ADR-049); test fixtures are
+    // right outlet. The runtime's actor path bans it (ADR-049); test fixtures are
     // explicitly exempt. See crates/scp-runtime/clippy.toml.
     clippy::disallowed_types
 )]
@@ -140,11 +140,11 @@ fn signing_key_for_did(did: &DID) -> ed25519_dalek::SigningKey {
 
 fn ceiling() -> Vec<Capability> {
     vec![
-        Capability::new("messages:read"),
-        Capability::new("messages:write"),
-        Capability::new("governance:propose"),
-        Capability::new("governance:vote"),
-        Capability::new("role:assign"),
+        Capability::new("messages:read").expect("known capability"),
+        Capability::new("messages:write").expect("known capability"),
+        Capability::new("governance:propose").expect("known capability"),
+        Capability::new("governance:vote").expect("known capability"),
+        Capability::new("role:assign").expect("known capability"),
     ]
 }
 

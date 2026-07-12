@@ -6,11 +6,11 @@ reconciled. For the *admission* question — "should this even be a saga?" — r
 
 ## One saga survives
 
-There is exactly one cross-context saga in the system: **cross-context tool invocation**
+There is exactly one cross-context saga in the system: **cross-context outlet invocation**
 (spec §6.2.4). Three other arms that ADR-049 originally enumerated (custody handover,
 standing-pair creation, broadcast hosting) were category errors and were withdrawn — see
 the admission lesson. So everything below is written for the single surviving arm: the
-caller's economy reservation and the target's tool execution must be **both-or-neither**
+caller's economy reservation and the target's outlet execution must be **both-or-neither**
 across two distinct context-actors.
 
 ## The FSM
@@ -48,16 +48,16 @@ The design deliberately keeps two separate durable records:
 
 The per-phase handlers run on the participant actors (`context/actor/handlers/saga.rs`):
 
-- **Prepare-A** (`prepare_a`, caller actor) — validates the caller holds `tool:interface`
+- **Prepare-A** (`prepare_a`, caller actor) — validates the caller holds `outlet:interface`
   and is an allowed caller, **stages** (does not apply) the rate-limit decrement + escrow
   reservation, Class-S sync-persists fail-closed, and replies the `Send` reservation
   handles for the FSM to hold (RAII release on abort).
 - **Prepare-B** (`prepare_b`, target actor) — re-runs the full §7 validation *re-bound* to
-  the carried `caller_did` + `tool_registration_id` (the confused-deputy defense),
+  the carried `caller_did` + `outlet_registration_id` (the confused-deputy defense),
   captures B-controlled provenance, stages the prepared record, Class-S sync-persists
   fail-closed, then replies.
 - **Commit** — split `commit_b_reserve` → supervisor executes → `commit_b_settle`
-  (B records `ToolInvoked`, signs the receipt, durably captures output keyed by `SagaId`)
+  (B records `OutletInvoked`, signs the receipt, durably captures output keyed by `SagaId`)
   and `commit_a` (A re-acks from the durable witness, settles escrow). Every commit step is
   **idempotent by `SagaId`** — a replayed Commit short-circuits.
 - **Abort** (`abort`) — releases the staged reservations, from the live RAII carrier or the

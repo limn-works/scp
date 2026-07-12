@@ -66,7 +66,7 @@ pub struct ParticipationRecord {
     pub context_id: ContextId,
     pub participation_count: u64,
     pub participation_duration_seconds: u64,
-    pub tool_invocations: HashMap<ToolId, u64>,
+    pub outlet_invocations: HashMap<OutletId, u64>,
     pub governance_actions_by: Vec<GovernanceActionSummary>,
     pub governance_actions_against: Vec<GovernanceActionSummary>,
     pub role_history: Vec<RoleTransition>,
@@ -94,7 +94,7 @@ pub struct Attestation {
 pub enum AttestationType {
     IdentityLink,
     CapabilityDelegation,
-    ToolIntegrity,
+    OutletIntegrity,
     AgentCapability,
     Endorsement,
     RoleAssignment,
@@ -129,7 +129,7 @@ pub struct ConsequenceRule {
 
 pub enum ConsequenceTrigger {
     MessageVelocity,
-    ToolRateExceeded,
+    OutletRateExceeded,
     WarningCount,
     Custom(String),
 }
@@ -158,7 +158,7 @@ pub struct TrustInput {
 
 2. **`compute_participation_record(event_log, subject_did) -> Result<ParticipationRecord, TrustError>`**
    - Scans event log entries for the subject DID.
-   - Computes: participation count/duration, tool invocations by type/frequency, governance actions against/by identity, role progression, attestation history, context creation history.
+   - Computes: participation count/duration, outlet invocations by type/frequency, governance actions against/by identity, role progression, attestation history, context creation history.
    - Captures the Merkle root at computation time for verifiability.
    - Pure computation — no side effects, no storage.
 
@@ -181,7 +181,7 @@ pub struct TrustInput {
 6. **`evaluate_consequence_rules(rules, event_log, subject_did) -> Vec<TriggeredConsequence>`**
    - Checks each rule's trigger condition against event log data within the rule's time window.
    - Message velocity threshold -> capability suspension.
-   - Tool rate threshold -> access revocation.
+   - Outlet rate threshold -> access revocation.
    - Warning count -> role demotion.
    - Returns list of triggered consequences with the triggering evidence.
 
@@ -360,7 +360,7 @@ pub struct RelayDeletionRequest {
 
 ### Context
 
-Provenance is a core protocol principle (§1, tenet 1): "All non-private data carries verifiable origin metadata." Spec §7.7 defines the provenance format (§7.7.1) and quality evaluation tiers (§7.7.2). Provenance is attached automatically by the protocol when data crosses context boundaries through protocol mechanisms (tool interfaces §6.2, structured messages). The absence of provenance is itself a signal — data introduced without protocol-level origin tracking evaluates as lowest quality.
+Provenance is a core protocol principle (§1, tenet 1): "All non-private data carries verifiable origin metadata." Spec §7.7 defines the provenance format (§7.7.1) and quality evaluation tiers (§7.7.2). Provenance is attached automatically by the protocol when data crosses context boundaries through protocol mechanisms (outlet interfaces §6.2, structured messages). The absence of provenance is itself a signal — data introduced without protocol-level origin tracking evaluates as lowest quality.
 
 ### Decision
 
@@ -368,7 +368,7 @@ Implement `scp-core/provenance/` module. `DataProvenance` struct is attached aut
 
 ### Rationale
 
-- **Automatic attachment over manual tagging:** Agents should not need to remember to tag provenance. The protocol attaches it at tool interface boundaries and cross-context message boundaries. Manual tagging is error-prone and inconsistent.
+- **Automatic attachment over manual tagging:** Agents should not need to remember to tag provenance. The protocol attaches it at outlet interface boundaries and cross-context message boundaries. Manual tagging is error-prone and inconsistent.
 - **Quality tiers over binary trust:** Provenance quality is a spectrum (§7.7.2). `PersistentVerifiable` (source still verifiable) is stronger than `EphemeralKnownParties` (source keys destroyed, parties known) which is stronger than `NoProvenance` (unknown origin). Agents use quality in their trust evaluation.
 - **Chain depth limit:** Unlimited cross-context hops create accountability laundering — data traverses enough contexts that its origin becomes meaningless. The context-configurable default of 8 hops bounds this (raised from 3, no protocol hard max per ADR-043).
 
@@ -381,7 +381,7 @@ Implement `scp-core/provenance/` module. `DataProvenance` struct is attached aut
 
 ### Dependencies
 
-- **ADR-010 (Tool Invocation):** Provenance attaches at tool interface boundaries during cross-context calls.
+- **ADR-010 (Outlet Invocation):** Provenance attaches at outlet interface boundaries during cross-context calls.
 - **ADR-011 (Event Log):** Provenance records are events in both source and target context logs.
 
 ### Acceptance Criteria
@@ -430,7 +430,7 @@ pub enum ProvenanceQuality {
 ```
 
 2. **`attach_provenance(source_context, target_context, data) -> DataProvenance`**
-   - Called automatically on cross-context tool interface calls.
+   - Called automatically on cross-context outlet interface calls.
    - Populates all fields from source context state.
    - Increments `chain_depth` from any existing provenance on the data.
    - Populates `counterparties` from source context membership roster at time of data flow.
@@ -476,24 +476,24 @@ pub enum ProvenanceQuality {
 
 ---
 
-## ADR-020: Tool-Interface Discovery
+## ADR-020: Outlet-Interface Discovery
 
 **Status:** Decided
 
 ### Context
 
-Spec §6.2.2 defines two-tier discovery: DID document capabilities (direct lookup, zero setup) and contexts with discovery tools (searchable registries, community-operated). DID documents contain a `SCPCapabilities` service entry that lists an agent's capabilities — resolvable by anyone who knows the DID. These are standard SCP contexts with open join policies and standardized tool schemas for search, registration, and deregistration. Two-tier membership (§6.2.2B) separates writers (MLS members, bounded) from readers (DID-authenticated, unbounded).
+Spec §6.2.2 defines two-tier discovery: DID document capabilities (direct lookup, zero setup) and contexts with discovery outlets (searchable registries, community-operated). DID documents contain a `SCPCapabilities` service entry that lists an agent's capabilities — resolvable by anyone who knows the DID. These are standard SCP contexts with open join policies and standardized outlet schemas for search, registration, and deregistration. Two-tier membership (§6.2.2B) separates writers (MLS members, bounded) from readers (DID-authenticated, unbounded).
 
 ### Decision
 
-Implement `scp-core/discovery/` module. DID document capability resolution via did:dht (ADR-003). Contexts with discovery tools as standard SCP contexts with standardized tool schemas. Two-tier membership: writer (MLS, bounded at 500) + reader (DID-authenticated, unbounded). SDK provides unified search that merges local cache, DID resolution, and context queries.
+Implement `scp-core/discovery/` module. DID document capability resolution via did:dht (ADR-003). Contexts with discovery outlets as standard SCP contexts with standardized outlet schemas. Two-tier membership: writer (MLS, bounded at 500) + reader (DID-authenticated, unbounded). SDK provides unified search that merges local cache, DID resolution, and context queries.
 
 ### Rationale
 
-- **Two-tier membership over MLS-only:** MLS groups have practical size limits (~500 members for acceptable performance). Contexts may serve thousands of readers. Separating writers (who process registrations as MLS application messages) from readers (who query via tool endpoints without MLS join) scales discovery beyond MLS group limits.
-- **DID document capabilities over central registry:** Any agent can publish capabilities in their DID document — zero setup, zero registration, zero dependency on contexts with discovery tools. Contexts add searchability for agents that don't know each other's DIDs.
-- **Standard schemas as conventions, not mandates:** The `agent_search`, `agent_register`, `agent_deregister` schemas are conventions that contexts with discovery tools follow for interoperability. Custom tools (reputation scoring, category browsing, geographic filtering) are allowed beyond the standard set.
-- **Bootstrap defaults as DNS root analogues:** SDK ships with configurable default bootstrap context IDs, analogous to DNS root servers. Users can add custom contexts with discovery tools. If defaults are unreachable, direct DID resolution still works.
+- **Two-tier membership over MLS-only:** MLS groups have practical size limits (~500 members for acceptable performance). Contexts may serve thousands of readers. Separating writers (who process registrations as MLS application messages) from readers (who query via outlet endpoints without MLS join) scales discovery beyond MLS group limits.
+- **DID document capabilities over central registry:** Any agent can publish capabilities in their DID document — zero setup, zero registration, zero dependency on contexts with discovery outlets. Contexts add searchability for agents that don't know each other's DIDs.
+- **Standard schemas as conventions, not mandates:** The `agent_search`, `agent_register`, `agent_deregister` schemas are conventions that contexts with discovery outlets follow for interoperability. Custom outlets (reputation scoring, category browsing, geographic filtering) are allowed beyond the standard set.
+- **Bootstrap defaults as DNS root analogues:** SDK ships with configurable default bootstrap context IDs, analogous to DNS root servers. Users can add custom contexts with discovery outlets. If defaults are unreachable, direct DID resolution still works.
 
 ### Implementation
 
@@ -504,7 +504,7 @@ Implement `scp-core/discovery/` module. DID document capability resolution via d
 ### Dependencies
 
 - **ADR-003 (DID):** DID document resolution for capability lookup. `SCPCapabilities` service extraction.
-- **ADR-010 (Tool Registration/Invocation):** Contexts use standard tool schemas. Registration/search are tool invocations.
+- **ADR-010 (Outlet Registration/Invocation):** Contexts use standard outlet schemas. Registration/search are outlet invocations.
 - **ADR-008 (Context Lifecycle):** These are standard SCP contexts with specific configuration.
 
 ### Acceptance Criteria
@@ -552,7 +552,7 @@ pub struct DiscoveryBootstrap {
 }
 ```
 
-**Standard tool schemas (conventions, not mandates — per §6.2.2B):**
+**Standard outlet schemas (conventions, not mandates — per §6.2.2B):**
 
 ```
 agent_search(query) -> { results: [{ did, capabilities, participation_summary }] }
@@ -563,13 +563,13 @@ agent_deregister(did) -> { removed }
 2. **DID document capability resolution:**
    - `resolve_capabilities(did) -> Result<CapabilityEntry, DiscoveryError>`: Resolve DID via did:dht, extract `SCPCapabilities` from service array, cache in local contact index. Resolution returns all verification methods including the optional `#agent` VM (ADR-039), enabling callers to determine whether a DID has agent delegation enabled.
 
-3. **Context standard tools:**
+3. **Context standard outlets:**
    - `agent_search`, `agent_register`, `agent_deregister` implemented per schema.
-   - Custom tools (reputation scoring, category browsing, geographic filtering) allowed beyond standard.
+   - Custom outlets (reputation scoring, category browsing, geographic filtering) allowed beyond standard.
 
 4. **Two-tier membership:**
    - Writer tier: MLS members, bounded at 500, process registrations as MLS application messages.
-   - Reader tier: DID-authenticated, unbounded, query via tool endpoints without MLS join.
+   - Reader tier: DID-authenticated, unbounded, query via outlet endpoints without MLS join.
 
 5. **Registration flow:**
    - Reader sends DID-signed request.
@@ -577,12 +577,12 @@ agent_deregister(did) -> { removed }
    - Registrant does NOT become MLS member.
 
 6. **Self-service updates:**
-   - Registered agents update entries via DID-authenticated requests to tool endpoints.
+   - Registered agents update entries via DID-authenticated requests to outlet endpoints.
    - Writers verify DID matches entry owner before applying update.
 
 7. **`unified_search(query, known_contexts) -> Result<DiscoveryResult, DiscoveryError>`**
    - Local contact cache (instant).
-   - Each known context (parallel tool calls).
+   - Each known context (parallel outlet calls).
    - Merge, deduplicate, rank results.
    - Returns results with provenance per entry.
 
@@ -609,7 +609,7 @@ agent_deregister(did) -> { removed }
 |------|---------|
 | `mod.rs` | Module root, `DiscoveryQuery`, `DiscoveryResult`, re-exports |
 | `did_capabilities.rs` | `resolve_capabilities`, DID document `SCPCapabilities` extraction, local contact cache |
-| `context.rs` | Context standard tool implementations (`agent_search`, `agent_register`, `agent_deregister`) |
+| `context.rs` | Context standard outlet implementations (`agent_search`, `agent_register`, `agent_deregister`) |
 | `search.rs` | `unified_search`, result merging, deduplication, ranking |
 | `bootstrap.rs` | `DiscoveryBootstrap`, default context configuration, auto-query logic |
 
@@ -637,7 +637,7 @@ Implement the FFI bridge as the `crates/scp-ffi/uniffi/` crate using UniFFI proc
 - **UniFFI over cbindgen/manual FFI:** UniFFI generates idiomatic Swift and Kotlin bindings (classes, enums, async functions, error types) from a single definition. cbindgen generates C headers requiring manual wrapper code in each target language. Manual FFI would mean maintaining two separate hand-written binding layers. UniFFI eliminates this duplication and the consistency bugs it creates.
 - **UniFFI over SwiftBridgeModule/KotlinBridge custom solutions:** Project-specific bridge generators would require building and maintaining custom tooling. UniFFI is battle-tested (Firefox, Application Services, and the broader Mozilla ecosystem), actively maintained, and has established patterns for async bridging, error handling, and callback interfaces.
 - **Flat function surface mirroring ADR-013:** The bridge layer is deliberately flat (no deep class hierarchies). Each exported function maps to one Rust function. The idiomatic Swift API (actors, `AsyncSequence`, property wrappers) and idiomatic Kotlin API (coroutines, `Flow`, extension functions) are built in the pure language wrapper layers (Swift SDK, Kotlin SDK), not in the FFI bridge. This keeps the bridge thin and testable, matching the ADR-013 pattern where PyO3 exposes flat functions and the Python SDK wraps them.
-- **Opaque objects for crypto state, records for data:** SCP types like `Identity`, `ContextHandle`, and transport connections hold crypto state (MLS group secrets, signing keys, session keys) that must not be serialized across the FFI boundary. They are exposed as opaque UniFFI objects with method accessors. Pure data types (`Message`, `ToolDefinition`, `ContextParams`) are exposed as UniFFI records (value types), which become Swift structs and Kotlin data classes.
+- **Opaque objects for crypto state, records for data:** SCP types like `Identity`, `ContextHandle`, and transport connections hold crypto state (MLS group secrets, signing keys, session keys) that must not be serialized across the FFI boundary. They are exposed as opaque UniFFI objects with method accessors. Pure data types (`Message`, `OutletDefinition`, `ContextParams`) are exposed as UniFFI records (value types), which become Swift structs and Kotlin data classes.
 - **Callback interfaces for platform injection:** `KeyCustody`, `PushProvider`, and `Storage` traits require platform-specific implementations (Secure Enclave on iOS, Android Keystore on Android, APNs vs FCM). UniFFI callback interfaces allow Swift and Kotlin code to implement these traits, which are then called from Rust. This preserves the dependency inversion architecture (ADR-006) across the FFI boundary.
 - **Native async over blocking wrappers:** UniFFI supports `async fn` in exported interfaces, generating Swift `async` functions and Kotlin `suspend` functions. This eliminates the need for blocking wrappers with `Dispatchers.IO` (as described in scaffold/kotlin.md as the fallback pattern). The Rust tokio runtime runs in background threads; UniFFI's async machinery bridges between the runtimes.
 
@@ -661,7 +661,7 @@ Implement the FFI bridge as the `crates/scp-ffi/uniffi/` crate using UniFFI proc
 ### Dependencies
 
 - **All Phase 1 ADRs (ADR-001 through ADR-007):** The bridge exposes MLS operations, envelope creation, DID identity, transport, sender keys, and platform adapters to Swift and Kotlin.
-- **All Phase 2 ADRs (ADR-008 through ADR-012):** The bridge exposes context lifecycle, role/UCAN enforcement, tool registration/invocation, event log queries, and multi-transport routing to Swift and Kotlin.
+- **All Phase 2 ADRs (ADR-008 through ADR-012):** The bridge exposes context lifecycle, role/UCAN enforcement, outlet registration/invocation, event log queries, and multi-transport routing to Swift and Kotlin.
 - **ADR-013 (PyO3 Bridge):** Establishes the FFI pattern. The UniFFI bridge mirrors the same logical API surface: same function set, same type categories (opaque vs value), same error hierarchy. ADR-013 is the reference implementation; ADR-021 must expose an equivalent surface.
 - **ADR-006 (Platform Abstraction):** Platform traits (`KeyCustody`, `PushProvider`, `Storage`, `DeviceAttestationProvider`) are exposed as callback interfaces. Swift implementations use Keychain/APNs/DCAppAttestService; Kotlin implementations use Android Keystore/SharedPreferences/FCM/Play Integrity.
 
@@ -715,10 +715,10 @@ Implement the FFI bridge as the `crates/scp-ffi/uniffi/` crate using UniFFI proc
    - `context_subscribe(handle, listener) -> void` — registers a callback interface for incoming messages (UniFFI callback; the Swift/Kotlin SDK layers convert this to `AsyncSequence` / `Flow<Message>` respectively).
    - `ContextHandle` is an opaque object interface exposing: `context_id() -> String`, `state() -> String`.
 
-4. **Tool bridge functions:**
-   - `tool_register(handle, registration) -> String` — registers a tool (returns tool ID).
-   - `tool_invoke(handle, tool_id, input_json, identity) -> String` — invokes a tool (returns JSON string output).
-   - `tool_verify(handle, tool_id) -> ToolVerificationResult` — verifies a tool against test vectors.
+4. **Outlet bridge functions:**
+   - `outlet_register(handle, registration) -> String` — registers an outlet (returns outlet ID).
+   - `outlet_invoke(handle, outlet_id, input_json, identity) -> String` — invokes an outlet (returns JSON string output).
+   - `outlet_verify(handle, outlet_id) -> OutletVerificationResult` — verifies an outlet against test vectors.
 
 5. **Transport bridge functions:**
    - `transport_connect(relay_url) -> void` — connects to an SCP relay.
@@ -744,7 +744,7 @@ Implement the FFI bridge as the `crates/scp-ffi/uniffi/` crate using UniFFI proc
        Permission { message: String, code: String },
        Crypto { message: String, code: String },
        Transport { message: String, code: String },
-       Tool { message: String, code: String },
+       Outlet { message: String, code: String },
        Validation { message: String, code: String },
    }
    ```
@@ -773,8 +773,8 @@ Implement the FFI bridge as the `crates/scp-ffi/uniffi/` crate using UniFFI proc
     | `ContextParams` | `#[derive(uniffi::Record)]` | `struct ContextParams` | `data class ContextParams` |
     | `Message` | `#[derive(uniffi::Record)]` | `struct Message` | `data class Message` |
     | `DIDDocument` | `#[derive(uniffi::Record)]` | `struct DIDDocument` | `data class DIDDocument` |
-    | `ToolDefinition` | `#[derive(uniffi::Record)]` | `struct ToolDefinition` | `data class ToolDefinition` |
-    | `ToolVerificationResult` | `#[derive(uniffi::Record)]` | `struct ToolVerificationResult` | `data class ToolVerificationResult` |
+    | `OutletDefinition` | `#[derive(uniffi::Record)]` | `struct OutletDefinition` | `data class OutletDefinition` |
+    | `OutletVerificationResult` | `#[derive(uniffi::Record)]` | `struct OutletVerificationResult` | `data class OutletVerificationResult` |
     | `TransportStatus` | `#[derive(uniffi::Record)]` | `struct TransportStatus` | `data class TransportStatus` |
     | `Event` | `#[derive(uniffi::Record)]` | `struct Event` | `data class Event` |
     | `Proof` | `#[derive(uniffi::Record)]` | `struct Proof` | `data class Proof` |
@@ -922,7 +922,7 @@ The ADR-013 PyO3 bridge and ADR-021 UniFFI bridge established the project-wide F
 
 - The two FFI bridges (wasm-bindgen for browser, napi-rs for Bun/Node) and their Rust crate structure.
 - Runtime detection logic in `internal/bridge.ts` — how the correct backend is selected at import time without top-level await.
-- The public API surface for the `@limn-works/scp-ts` package: `Identity`, `Context`, `Tools`, `EventLog`, `Transport`, `UCAN`, `MCP` modules.
+- The public API surface for the `@limn-works/scp-ts` package: `Identity`, `Context`, `Outlets`, `EventLog`, `Transport`, `UCAN`, `MCP` modules.
 - Error mapping from Rust `Result<T, E>` to the TypeScript `ScpError` hierarchy.
 - Streaming: `AsyncIterable<Message>` for message receive, `Symbol.asyncDispose` for resource lifecycle.
 - Build pipeline: tsup for ESM/CJS bundles, wasm-pack for browser WASM, napi-rs CLI for native addon.
@@ -998,7 +998,7 @@ src/
   index.ts              # Re-exports: Identity, Context, ScpError subtypes, types
   identity.ts           # Identity class — delegates to bridge
   context.ts            # Context class (AsyncDisposable) — delegates to bridge
-  tools.ts              # ToolDefinition, TestVector interfaces
+  outlets.ts              # OutletDefinition, TestVector interfaces
   trust.ts              # evaluateTrust(), TrustEvaluation
   event-log.ts          # EventLog class, Event, Proof, Checkpoint
   errors.ts             # ScpError hierarchy
@@ -1180,7 +1180,7 @@ export class ContextError extends ScpError { override name = "ContextError" as c
 export class UcanPermissionError extends ScpError { override name = "UcanPermissionError" as const; } // named to avoid shadowing the JS global `PermissionError`
 export class CryptoError extends ScpError { override name = "CryptoError" as const; }
 export class TransportError extends ScpError { override name = "TransportError" as const; }
-export class ToolError extends ScpError { override name = "ToolError" as const; }
+export class OutletError extends ScpError { override name = "OutletError" as const; }
 export class ValidationError extends ScpError { override name = "ValidationError" as const; }
 ```
 
@@ -1236,7 +1236,7 @@ Rust errors from both bridge crates are mapped to these classes via the bridge l
 ### Dependencies
 
 - **All Phase 1 ADRs (ADR-001 through ADR-007):** Both FFI bridges expose MLS operations, envelope creation, DID identity, transport, sender keys, and platform adapters to TypeScript.
-- **All Phase 2 ADRs (ADR-008 through ADR-012):** Both bridges expose context lifecycle, role/UCAN enforcement, tool registration/invocation, event log queries, and multi-transport routing to TypeScript.
+- **All Phase 2 ADRs (ADR-008 through ADR-012):** Both bridges expose context lifecycle, role/UCAN enforcement, outlet registration/invocation, event log queries, and multi-transport routing to TypeScript.
 - **All Phase 3 ADRs (ADR-013 through ADR-016):** The Python SDK validates the FFI surface and establishes the logical API shape that TypeScript mirrors. ADR-013 (PyO3) is the canonical reference for the flat-function FFI pattern; this ADR follows the same structure.
 - **ADR-021 (UniFFI Bridge):** ADR-021 establishes the same logical API surface for Swift/Kotlin. The TypeScript bridge exposes the same function set, same type categories (opaque handles vs plain data records), and same error hierarchy. ADR-021 is the immediate predecessor ADR; the TypeScript implementation must expose an equivalent surface.
 - **ADR-006 (Platform Abstraction):** Browser-specific platform adapters (WebCrypto for `KeyCustody`, wa-sqlite for `Storage`) are injected into the WASM bridge via wasm-bindgen closures. Node/Bun uses the `scp-platform` in-process implementations via the napi bridge.
@@ -1285,13 +1285,13 @@ Rust errors from both bridge crates are mapped to these classes via the bridge l
    - `await using ctx` triggers `ctx.leave()` on scope exit (tests via spy on `leave`).
    - `ctx.close()` terminates the context; subsequent `ctx.send()` throws `ContextError`.
 
-4. **Tool API:**
+4. **Outlet API:**
    ```typescript
-   const toolId = await ctx.invokeTool("tool-id", { input: "value" }, identity);
+   const outletId = await ctx.invokeOutlet("outlet-id", { input: "value" }, identity);
    ```
-   - `ctx.invokeTool(toolId, input, identity)` invokes a registered tool and returns JSON output.
-   - Invoking a non-existent tool throws `ToolError` with code `SCP-TOOL-6001`.
-   - Tool registration: `await ctx.registerTool(toolDefinition)` returns a tool ID string.
+   - `ctx.invokeOutlet(outletId, input, identity)` invokes a registered outlet and returns JSON output.
+   - Invoking a non-existent outlet throws `OutletError` with code `SCP-OUTLET-6001`.
+   - Outlet registration: `await ctx.registerOutlet(outletDefinition)` returns an outlet ID string.
 
 5. **UCAN API:**
    ```typescript
@@ -1354,7 +1354,7 @@ Rust errors from both bridge crates are mapped to these classes via the bridge l
     - CI matrix builds napi artifacts for Linux x64/arm64, macOS arm64/x64, Windows x64.
 
 14. **Conformance:**
-    - `tests/conformance/conformance.test.ts` loads cross-language JSON fixtures from `tests/conformance/` and passes all categories: identity, context, messaging, tools, UCAN, transport, event log, error handling.
+    - `tests/conformance/conformance.test.ts` loads cross-language JSON fixtures from `tests/conformance/` and passes all categories: identity, context, messaging, outlets, UCAN, transport, event log, error handling.
     - Conformance pass rate is 100% in both Bun and Node.js 22 LTS environments.
 
 15. **Publishing:**
@@ -1388,7 +1388,7 @@ Rust errors from both bridge crates are mapped to these classes via the bridge l
 | `bindings/typescript/src/identity.ts` | `Identity` class — delegates to bridge; `DIDDocument` type |
 | `bindings/typescript/src/context.ts` | `Context` class (`AsyncDisposable`); `AsyncIterable<Message>` receive generator |
 | `bindings/typescript/src/errors.ts` | `ScpError` hierarchy (7 subclasses) |
-| `bindings/typescript/src/types.ts` | `ContextParams`, `Message`, `Provenance`, `Capability`, `ToolDefinition`, `UcanToken`, shared types |
+| `bindings/typescript/src/types.ts` | `ContextParams`, `Message`, `Provenance`, `Capability`, `OutletDefinition`, `UcanToken`, shared types |
 | `bindings/typescript/src/index.ts` | Public re-exports |
 
 **Test files (~8 files):**
@@ -1397,7 +1397,7 @@ Rust errors from both bridge crates are mapped to these classes via the bridge l
 |------|---------|
 | `bindings/typescript/tests/identity.test.ts` | Identity create, load, resolve, rotate |
 | `bindings/typescript/tests/context.test.ts` | Context lifecycle, send/receive, disposal |
-| `bindings/typescript/tests/tools.test.ts` | Tool registration and invocation |
+| `bindings/typescript/tests/outlets.test.ts` | Outlet registration and invocation |
 | `bindings/typescript/tests/ucan.test.ts` | UCAN mint, validate, revoke, delegate |
 | `bindings/typescript/tests/transport.test.ts` | Connect, status |
 | `bindings/typescript/tests/event-log.test.ts` | Query, verify, checkpoint |
@@ -1558,7 +1558,7 @@ Initial protocol registry defines 28 challenge capabilities across 10 categories
 | Category | Capabilities |
 |----------|-------------|
 | Safety & Security | `prompt-injection-resistance/v1`, `content-safety/v1`, `privacy-compliance/v1`, `credential-handling/v1` |
-| Schema & Protocol Compliance | `schema-validation/v1`, `tool-schema-compliance/v1`, `output-format-compliance/v1` |
+| Schema & Protocol Compliance | `schema-validation/v1`, `outlet-schema-compliance/v1`, `output-format-compliance/v1` |
 | Behavioral Compliance | `rate-limit-compliance/v1`, `instruction-adherence/v1`, `context-policy-adherence/v1`, `graceful-degradation/v1` |
 | Operational | `latency-compliance/v1` (param: `max_ms`), `idempotency/v1`, `multilingual/v1` (param: `languages`) |
 | Spending / Commerce | `spending-compliance/v1`, `cost-awareness/v1` |
@@ -1619,7 +1619,7 @@ Protocol-level feature flags for node roles. Not challenge-testable — these de
 ### Dependencies
 
 - **ADR-017 (Trust Engine):** Challenge-response protocol that verifies capabilities.
-- **ADR-020 (Tool-Interface Discovery):** DID document capability advertising that uses the URI format.
+- **ADR-020 (Outlet-Interface Discovery):** DID document capability advertising that uses the URI format.
 - **ADR-003 (DID Creation):** DID-scoped custom capabilities require DID resolution.
 - **ADR-008 (Context Lifecycle):** Context admission requirements reference capability URIs.
 
@@ -1647,17 +1647,17 @@ Protocol-level feature flags for node roles. Not challenge-testable — these de
 
 ### Context
 
-SCP's human-readable addressing system (§22) defines handle tools (`handle_register`, `handle_lookup`, `handle_deregister`) that map human-readable names to DIDs or context IDs within a context's handle registry. The addressing system also defines "scopes" — the part after `@` in addresses like `alice@cooking-community` — which currently resolve via a client-side mapping of scope names to context IDs (§22.3.2). There is no protocol-level mechanism to register, look up, or deregister scope-to-context mappings.
+SCP's human-readable addressing system (§22) defines handle outlets (`handle_register`, `handle_lookup`, `handle_deregister`) that map human-readable names to DIDs or context IDs within a context's handle registry. The addressing system also defines "scopes" — the part after `@` in addresses like `alice@cooking-community` — which currently resolve via a client-side mapping of scope names to context IDs (§22.3.2). There is no protocol-level mechanism to register, look up, or deregister scope-to-context mappings.
 
 Scope registration is needed so that contexts can be discovered by human-readable names. For example, a user typing `alice@cooking-community` needs to resolve `cooking-community` to a context ID before they can resolve `alice` within that context's handle registry. This is a two-hop resolution: scope name to context ID, then handle name to DID.
 
-The existing handle tools already support `HandleTarget::Context`, which maps a handle name to a context ID plus relay URLs. Scope registration is functionally identical to handle registration with two constraints: (1) the target must be a context, not an identity; (2) scope names must not contain dots, since dots are the syntactic discriminator between scope-based and domain-based resolution (§22.8.1).
+The existing handle outlets already support `HandleTarget::Context`, which maps a handle name to a context ID plus relay URLs. Scope registration is functionally identical to handle registration with two constraints: (1) the target must be a context, not an identity; (2) scope names must not contain dots, since dots are the syntactic discriminator between scope-based and domain-based resolution (§22.8.1).
 
 ### Decision
 
-Scope registration uses **independent structs for all types**, with separate storage. Three scope tools — `scope_register`, `scope_lookup`, `scope_deregister` — mirror the corresponding handle tool logic with two constraints enforced at the registry level:
+Scope registration uses **independent structs for all types**, with separate storage. Three scope outlets — `scope_register`, `scope_lookup`, `scope_deregister` — mirror the corresponding handle outlet logic with two constraints enforced at the registry level:
 
-1. **Context-only targets.** `ScopeTarget` is context-only by construction — it has no identity variant. Scope names map to contexts, not to individual DIDs. Identity resolution within a context uses handle tools directly.
+1. **Context-only targets.** `ScopeTarget` is context-only by construction — it has no identity variant. Scope names map to contexts, not to individual DIDs. Identity resolution within a context uses handle outlets directly.
 
 2. **No dots in scope names.** `validate_scope_name()` enforces the charset `[a-z0-9-]` (matching §22.3.2 normalization output), max 64 characters, no leading or trailing hyphens. Dots are forbidden because the presence of a dot in the scope portion of an address is the syntactic discriminator that routes resolution to the domain path (§22.8.1). Underscores are excluded to match the normalization output of §22.3.2, which strips non-alphanumeric characters except hyphens.
 
@@ -1685,17 +1685,17 @@ Callers always use the `Scope*` names because scope operations are conceptually 
 - `validate_scope_name()` (no dots, `[a-z0-9-]`, max 64 chars)
 - Context-only targets (`ScopeTarget` is context-only by construction)
 
-These constraints are built into the registry, not just the tool wrapper.
+These constraints are built into the registry, not just the outlet wrapper.
 
-Separate tool names (`scope_*` vs `handle_*`) provide semantic separation at the API surface: scope tools are "the phone book for namespaces" (mapping scope names to context IDs), while handle tools are "the phone book for participants" (mapping names to DIDs or contexts within a single namespace).
+Separate outlet names (`scope_*` vs `handle_*`) provide semantic separation at the API surface: scope outlets are "the phone book for namespaces" (mapping scope names to context IDs), while handle outlets are "the phone book for participants" (mapping names to DIDs or contexts within a single namespace).
 
-See §22.3.5 for the detailed tool schemas, `validate_scope_name()` rules, resolution flow, hosting model, and authorization model.
+See §22.3.5 for the detailed outlet schemas, `validate_scope_name()` rules, resolution flow, hosting model, and authorization model.
 
 ### Alternatives Considered
 
 1. **Shared types / type aliases.** Scope output types (`ScopeRegisterResult`, `ScopeLookupResult`, `ScopeDeregisterResult`, `ScopeEntry`, `ScopeMetadata`) defined as type aliases for the corresponding handle types, with thin wrapper structs only for inputs (where field names differ). Rejected because type aliases create semantic coupling between scope and handle types — changes to handle types silently propagate to scope types, the `ScopeTarget` context-only constraint cannot be expressed at the type level (requiring runtime rejection of `HandleTarget::Identity`), and the conceptual independence of scope types is obscured. Independent structs make each scope type self-documenting and allow `ScopeTarget` to be context-only by construction.
 
-2. **Shared `HandleRegistry` storage (no separate `ScopeRegistry`).** Scope tools operate on the same `HandleRegistry` instances as handle tools. Rejected because shared storage creates cross-type namespace collision — a handle registration for "cooking-community" would block a scope registration for the same name. Separate storage eliminates this by construction. The storage separation also makes it clear at the data level that scope entries and handle entries are independent namespaces.
+2. **Shared `HandleRegistry` storage (no separate `ScopeRegistry`).** Scope outlets operate on the same `HandleRegistry` instances as handle outlets. Rejected because shared storage creates cross-type namespace collision — a handle registration for "cooking-community" would block a scope registration for the same name. Separate storage eliminates this by construction. The storage separation also makes it clear at the data level that scope entries and handle entries are independent namespaces.
 
 3. **SDK-local-only scope mapping.** No protocol-level scope registration. Each SDK maintains a local map of scope names to context IDs, populated by bootstrap defaults and manual configuration. Rejected because this provides no protocol-level conflict detection (two contexts claiming the same scope name), no multi-registry resolution (checking multiple registries for the same scope), and no mechanism for contexts to advertise their scope names to the network.
 
@@ -1705,7 +1705,7 @@ See §22.3.5 for the detailed tool schemas, `validate_scope_name()` rules, resol
 - **Separate storage eliminates cross-type collision.** Scope entries and handle entries occupy independent namespaces. A handle "cooking-community" and a scope "cooking-community" coexist without conflict. This is enforced by construction (separate `HashMap` instances), not by convention.
 - **Independent structs provide type-level safety and semantic clarity.** `ScopeTarget` is context-only by construction (no identity variant), eliminating the need for runtime target-type rejection. Callers use `ScopeRegisterParams`, `ScopeEntry`, etc. — never raw handle types. Each scope type is self-documenting and independently evolvable.
 - **Atomic updates eliminate TOCTOU risk.** Same-owner re-registration atomically updates the existing entry, avoiding the deregister/reregister race window where another registrant could claim the name between the two operations.
-- **Separate tool names provide semantic clarity.** Users and agents think of scope lookup ("find me the cooking community") differently from handle lookup ("find me Alice in the cooking community"). Separate tool names reflect this mental model.
+- **Separate outlet names provide semantic clarity.** Users and agents think of scope lookup ("find me the cooking community") differently from handle lookup ("find me Alice in the cooking community"). Separate outlet names reflect this mental model.
 - **DNS analogy.** DNS domain registration is a convention on top of the DNS record system — a domain name is a record that maps to an IP address, with constraints (registrar governance, TLD rules, conflict resolution). Scope registration is the same: a convention on handle records with constraints (context-only targets, no-dot names, registry governance), with separate storage (like separate zone files).
 
 ### Implementation
@@ -1720,10 +1720,10 @@ See §22.3.5 for the detailed tool schemas, `validate_scope_name()` rules, resol
 
 | File | Purpose |
 |------|---------|
-| `crates/scp-core/src/discovery/scope.rs` | New — independent structs (`ScopeRegisterParams`, `ScopeLookupParams`, `ScopeDeregisterParams`, `ScopeRegisterResult`, `ScopeLookupResult`, `ScopeDeregisterResult`, `ScopeEntry`, `ScopeMetadata`, `ScopeTarget`, `ScopeRegisterStatus`), `ScopeRegistry` struct with own `HashMap<String, ScopeEntry>`, `validate_scope_name()`, scope tool logic, tool constants |
+| `crates/scp-core/src/discovery/scope.rs` | New — independent structs (`ScopeRegisterParams`, `ScopeLookupParams`, `ScopeDeregisterParams`, `ScopeRegisterResult`, `ScopeLookupResult`, `ScopeDeregisterResult`, `ScopeEntry`, `ScopeMetadata`, `ScopeTarget`, `ScopeRegisterStatus`), `ScopeRegistry` struct with own `HashMap<String, ScopeEntry>`, `validate_scope_name()`, scope outlet logic, outlet constants |
 | `crates/scp-ffi/src/` | PyO3 bridge — `scope_register`, `scope_lookup`, `scope_deregister` |
-| `crates/scp-ffi/napi/` | NAPI bridge — scope tool wrappers |
-| `crates/scp-ffi/uniffi/` | UniFFI bridge — scope tool wrappers |
+| `crates/scp-ffi/napi/` | NAPI bridge — scope outlet wrappers |
+| `crates/scp-ffi/uniffi/` | UniFFI bridge — scope outlet wrappers |
 | `bindings/python/` | Python SDK wrapper |
 | `bindings/typescript/` | TypeScript SDK wrapper |
 | `bindings/swift/` | Swift SDK wrapper |
@@ -1731,9 +1731,9 @@ See §22.3.5 for the detailed tool schemas, `validate_scope_name()` rules, resol
 
 ### Security Considerations
 
-#### Inherited Handle-Tool Threats
+#### Inherited Handle-Outlet Threats
 
-Scope tools inherit all handle-tool security properties (see §22.3.1 for the DID-signed request scheme and full threat analysis) because they mirror handle tool logic. The scope-specific difference: a malicious relay URL in a scope entry has **namespace-wide blast radius** — it affects every address resolved through that scope, not just a single identity lookup.
+Scope outlets inherit all handle-outlet security properties (see §22.3.1 for the DID-signed request scheme and full threat analysis) because they mirror handle outlet logic. The scope-specific difference: a malicious relay URL in a scope entry has **namespace-wide blast radius** — it affects every address resolved through that scope, not just a single identity lookup.
 
 **Cross-type namespace collision: eliminated.** Because `ScopeRegistry` uses separate storage from `HandleRegistry`, a handle registration cannot block, shadow, or interfere with a scope registration (and vice versa). Each registry enforces its own constraints independently.
 
@@ -1768,15 +1768,15 @@ Scope registries, as first-hop resolution points, see resolution metadata for ev
 
 ### Dependencies
 
-- **ADR-020 (Tool-Interface Discovery):** Scope tools are registered in contexts that use the same discovery infrastructure.
-- **ADR-010 (Tool Registration/Invocation):** Scope tools follow the standard tool registration and invocation protocol.
+- **ADR-020 (Outlet-Interface Discovery):** Scope outlets are registered in contexts that use the same discovery infrastructure.
+- **ADR-010 (Outlet Registration/Invocation):** Scope outlets follow the standard outlet registration and invocation protocol.
 - **ADR-008 (Context Lifecycle):** The hosting context's governance controls scope registration authorization.
 - **ADR-034 (WASM Bridge Constraints):** The WASM bridge re-implements scope constraint logic locally per ADR-034 (AC #8).
-- **§22 (Human-Readable Addressing):** Scope tools extend the handle tool convention defined in §22.3.1.
+- **§22 (Human-Readable Addressing):** Scope outlets extend the handle outlet convention defined in §22.3.1.
 
 ### Acceptance Criteria
 
-1. **Scope tool constants.** Three tool constants: `TOOL_SCOPE_REGISTER`, `TOOL_SCOPE_LOOKUP`, `TOOL_SCOPE_DEREGISTER`. Each mirrors the corresponding handle tool logic with the constraints below.
+1. **Scope outlet constants.** Three outlet constants: `OUTLET_SCOPE_REGISTER`, `OUTLET_SCOPE_LOOKUP`, `OUTLET_SCOPE_DEREGISTER`. Each mirrors the corresponding handle outlet logic with the constraints below.
 
 2. **`validate_scope_name(name: &str) -> Result<(), AddressingError>`:** Validates that the name matches `[a-z0-9-]`, is 1-64 characters, and has no leading or trailing hyphens. Rejects names containing periods (dots) or underscores.
 

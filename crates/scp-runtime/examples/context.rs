@@ -49,8 +49,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Capability::RoleAssign,
             Capability::MemberInvite,
             Capability::MemberRemove,
-            Capability::ToolRegister,
-            Capability::ToolInvokeAll,
+            Capability::OutletRegister,
+            Capability::OutletCallAll,
         ],
         ..ContextParams::default()
     };

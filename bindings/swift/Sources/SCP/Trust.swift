@@ -145,7 +145,7 @@ public nonisolated struct CapabilityValidation: Sendable, Equatable {
 /// TypeScript SDK `BehavioralRecord`, and the Rust `ParticipationFacts` 1:1.
 ///
 /// The six leaf-derived facts (participation duration, governance actions
-/// against/by, context creation, role progression, tool invocation count) come
+/// against/by, context creation, role progression, outlet invocation count) come
 /// from the context's convergent Merkle event log. `attestationCount` is the
 /// one exception: it is a credential-layer fact (§7.4), NOT event-log-derived,
 /// NOT covered by `eventLogRoot`, and **verifier-relative** (two agents may
@@ -164,13 +164,13 @@ public nonisolated struct BehavioralRecord: Sendable, Equatable {
     /// Count of governance actions initiated by this identity.
     public let governanceActionsBy: UInt64
 
-    /// Total tool invocations across all tool types.
-    public let toolInvocationCount: UInt64
+    /// Total outlet invocations across all outlet types.
+    public let outletInvocationCount: UInt64
 
-    /// Whether ``toolInvocationCount`` is anchored in the canonical Merkle log.
-    /// `false` until ADR-051 makes `ToolInvoked` a convergent leaf — consumers
+    /// Whether ``outletInvocationCount`` is anchored in the canonical Merkle log.
+    /// `false` until ADR-051 makes `OutletInvoked` a convergent leaf — consumers
     /// MUST NOT treat the count as Merkle-proven while this is `false`.
-    public let toolInvocationCountAnchored: Bool
+    public let outletInvocationCountAnchored: Bool
 
     /// Number of contexts created by the subject (`ChildContextCreated`).
     public let contextCreationCount: UInt64
@@ -185,7 +185,7 @@ public nonisolated struct BehavioralRecord: Sendable, Equatable {
     /// Whether ``attestationCount`` is anchored in / verifiable against a
     /// context Merkle root. Always `false`: it is a credential-layer,
     /// verifier-relative fact (§7.4), never a context-event-log count (§7.3.2).
-    /// The parallel of ``toolInvocationCountAnchored``.
+    /// The parallel of ``outletInvocationCountAnchored``.
     public let attestationCountAnchored: Bool
 
     /// Unix timestamp (seconds) when the record was computed.
@@ -204,8 +204,8 @@ public nonisolated struct BehavioralRecord: Sendable, Equatable {
         participationDurationSecs: UInt64,
         governanceActionsAgainst: UInt64,
         governanceActionsBy: UInt64,
-        toolInvocationCount: UInt64,
-        toolInvocationCountAnchored: Bool,
+        outletInvocationCount: UInt64,
+        outletInvocationCountAnchored: Bool,
         contextCreationCount: UInt64,
         roleProgressionCount: UInt64,
         attestationCount: UInt64,
@@ -217,8 +217,8 @@ public nonisolated struct BehavioralRecord: Sendable, Equatable {
         self.participationDurationSecs = participationDurationSecs
         self.governanceActionsAgainst = governanceActionsAgainst
         self.governanceActionsBy = governanceActionsBy
-        self.toolInvocationCount = toolInvocationCount
-        self.toolInvocationCountAnchored = toolInvocationCountAnchored
+        self.outletInvocationCount = outletInvocationCount
+        self.outletInvocationCountAnchored = outletInvocationCountAnchored
         self.contextCreationCount = contextCreationCount
         self.roleProgressionCount = roleProgressionCount
         self.attestationCount = attestationCount
@@ -234,8 +234,8 @@ public nonisolated struct BehavioralRecord: Sendable, Equatable {
             participationDurationSecs: record.participationDurationSecs,
             governanceActionsAgainst: record.governanceActionsAgainst,
             governanceActionsBy: record.governanceActionsBy,
-            toolInvocationCount: record.toolInvocationCount,
-            toolInvocationCountAnchored: record.toolInvocationCountAnchored,
+            outletInvocationCount: record.outletInvocationCount,
+            outletInvocationCountAnchored: record.outletInvocationCountAnchored,
             contextCreationCount: record.contextCreationCount,
             roleProgressionCount: record.roleProgressionCount,
             attestationCount: record.attestationCount,
@@ -255,8 +255,8 @@ public nonisolated struct BehavioralRecord: Sendable, Equatable {
             participationDurationSecs: 0,
             governanceActionsAgainst: 0,
             governanceActionsBy: 0,
-            toolInvocationCount: 0,
-            toolInvocationCountAnchored: false,
+            outletInvocationCount: 0,
+            outletInvocationCountAnchored: false,
             contextCreationCount: 0,
             roleProgressionCount: 0,
             attestationCount: 0,
@@ -954,8 +954,8 @@ public nonisolated enum ParticipationFact: String, Codable, Sendable, Equatable,
     case governanceActionsAgainst = "GovernanceActionsAgainst"
     /// Count of governance actions initiated by the identity.
     case governanceActionsBy = "GovernanceActionsBy"
-    /// Total tool invocations across all tool types.
-    case toolInvocationCount = "ToolInvocationCount"
+    /// Total outlet invocations across all outlet types.
+    case outletInvocationCount = "OutletInvocationCount"
     /// Number of contexts created.
     case contextCreationCount = "ContextCreationCount"
     /// Number of role transitions.
@@ -1096,14 +1096,14 @@ public nonisolated struct ParticipationProfile: Codable, Sendable, Equatable {
     public let governanceActionsAgainst: UInt64
     /// Count of governance actions initiated by this identity.
     public let governanceActionsBy: UInt64
-    /// Total tool invocations across all tool types.
-    public let toolInvocationCount: UInt64
-    /// Whether ``toolInvocationCount`` is anchored in the canonical Merkle log.
-    /// `false` until ADR-051 makes `ToolInvoked` a convergent leaf — consumers
+    /// Total outlet invocations across all outlet types.
+    public let outletInvocationCount: UInt64
+    /// Whether ``outletInvocationCount`` is anchored in the canonical Merkle log.
+    /// `false` until ADR-051 makes `OutletInvoked` a convergent leaf — consumers
     /// MUST NOT treat the count as Merkle-proven while this is `false`. The flag
     /// is part of the signed preimage, so it cannot be stripped from a signed
     /// profile.
-    public let toolInvocationCountAnchored: Bool
+    public let outletInvocationCountAnchored: Bool
     /// Number of contexts created.
     public let contextCreationCount: UInt64
     /// Number of role transitions.
@@ -1126,8 +1126,8 @@ public nonisolated struct ParticipationProfile: Codable, Sendable, Equatable {
         participationDurationSecs: UInt64,
         governanceActionsAgainst: UInt64,
         governanceActionsBy: UInt64,
-        toolInvocationCount: UInt64,
-        toolInvocationCountAnchored: Bool,
+        outletInvocationCount: UInt64,
+        outletInvocationCountAnchored: Bool,
         contextCreationCount: UInt64,
         roleProgressionCount: UInt64,
         attestationCount: UInt64,
@@ -1140,8 +1140,8 @@ public nonisolated struct ParticipationProfile: Codable, Sendable, Equatable {
         self.participationDurationSecs = participationDurationSecs
         self.governanceActionsAgainst = governanceActionsAgainst
         self.governanceActionsBy = governanceActionsBy
-        self.toolInvocationCount = toolInvocationCount
-        self.toolInvocationCountAnchored = toolInvocationCountAnchored
+        self.outletInvocationCount = outletInvocationCount
+        self.outletInvocationCountAnchored = outletInvocationCountAnchored
         self.contextCreationCount = contextCreationCount
         self.roleProgressionCount = roleProgressionCount
         self.attestationCount = attestationCount
@@ -1156,8 +1156,8 @@ public nonisolated struct ParticipationProfile: Codable, Sendable, Equatable {
         case participationDurationSecs = "participation_duration_secs"
         case governanceActionsAgainst = "governance_actions_against"
         case governanceActionsBy = "governance_actions_by"
-        case toolInvocationCount = "tool_invocation_count"
-        case toolInvocationCountAnchored = "tool_invocation_count_anchored"
+        case outletInvocationCount = "outlet_invocation_count"
+        case outletInvocationCountAnchored = "outlet_invocation_count_anchored"
         case contextCreationCount = "context_creation_count"
         case roleProgressionCount = "role_progression_count"
         case attestationCount = "attestation_count"
@@ -1522,8 +1522,8 @@ public nonisolated enum AttestationType: String, Codable, Sendable, Equatable, C
     case identityLink = "IdentityLink"
     /// Delegates a capability to another DID.
     case capabilityDelegation = "CapabilityDelegation"
-    /// Attests to the integrity of a tool.
-    case toolIntegrity = "ToolIntegrity"
+    /// Attests to the integrity of a outlet.
+    case outletIntegrity = "OutletIntegrity"
     /// Attests to an agent's capability.
     case agentCapability = "AgentCapability"
     /// A general endorsement.

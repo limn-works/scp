@@ -9,7 +9,7 @@ import XCTest
 /// The suite links the Rust binary built with `allow_in_memory_custody`, so
 /// reservation, the sealed-invitation producer, and the join-side custody /
 /// validation gates run against the real engine (like `ScpClassTests` /
-/// `ToolSagaTests`). `inviteMember` under a `SingleAdmin` context whose admin
+/// `OutletSagaTests`). `inviteMember` under a `SingleAdmin` context whose admin
 /// holds `governance:propose` (the only capability the invite gate enforces)
 /// seals unilaterally in-process
 /// (the 0xFF02-capable invitee `KeyPackage` comes from `reserveKeyPackage`), so

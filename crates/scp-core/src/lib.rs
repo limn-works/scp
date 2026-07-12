@@ -120,16 +120,17 @@ pub mod context {
         pub use scp_protocol::context::governance::*;
         pub use scp_runtime::context::governance::timeout;
     }
-    pub mod tools {
-        pub use scp_protocol::context::tools::*;
-        pub use scp_runtime::context::tools::invoke;
-        pub use scp_runtime::context::tools::invoke::{
-            InvocationError, has_tool_invoke_capability, invoke_tool,
-            invoke_tool_with_cancellation, validate_tool_invocation_ucan,
+    pub mod outlets {
+        pub use scp_protocol::context::outlets::*;
+        pub use scp_runtime::context::outlets::invoke;
+        pub use scp_runtime::context::outlets::invoke::{
+            InvocationError, has_outlet_call_capability, has_outlet_invocation_capability,
+            has_outlet_query_capability, invoke_outlet, invoke_outlet_with_cancellation,
+            validate_outlet_invocation_ucan,
         };
-        pub use scp_runtime::context::tools::session;
-        pub use scp_runtime::context::tools::session::{
-            DEFAULT_SESSION_CAP_PER_CALLER, SessionStore, ToolSession, cleanup_expired,
+        pub use scp_runtime::context::outlets::session;
+        pub use scp_runtime::context::outlets::session::{
+            DEFAULT_SESSION_CAP_PER_CALLER, OutletSession, SessionStore, cleanup_expired,
             create_session, invoke_session,
         };
     }

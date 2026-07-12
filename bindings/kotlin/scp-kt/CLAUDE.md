@@ -36,7 +36,7 @@ The single dispatcher gateway for all FFI calls. All SDK domain classes (Scp.kt,
 | `CoroutineBridge` | Central bridge with injectable dispatchers and domain sub-bridges |
 | `IdentityBridge` | `create()`, `load()`, `resolve()` |
 | `ContextBridge` | `create()`, `join()`, `leave()`, `close()`, `send()`, `subscribe()` |
-| `ToolBridge` | `register()`, `invoke()`, `verify()` |
+| `OutletBridge` | `register()`, `invoke()`, `verify()` |
 | `UcanBridge` | `validate()`, `mint()`, `revoke()`, `delegate()` |
 | `InfraBridge` | `eventLogQuery()`, `eventLogVerify()`, `transportConnect()`, `transportStatus()` |
 | `NativeBindings` | Composite interface for UniFFI-generated functions (swap impl when NativeLib.kt is generated) |
@@ -69,7 +69,7 @@ Two-tier streaming architecture per ADR-028:
 
 ### detekt TooManyFunctions (threshold: 30)
 
-The `NativeBindings` interface has 19 methods (one per UniFFI function). It is split into 5 domain sub-interfaces (`IdentityBindings`, `ContextBindings`, `ToolBindings`, `UcanBindings`, `InfraBindings`) with `NativeBindings` as the composite. The test stub `StubNativeBindings` uses `@Suppress("TooManyFunctions")` since it must implement all 19. The file-level threshold is 30 (set in `detekt.yml` per `standards/kotlin.md`).
+The `NativeBindings` interface has 19 methods (one per UniFFI function). It is split into 5 domain sub-interfaces (`IdentityBindings`, `ContextBindings`, `OutletBindings`, `UcanBindings`, `InfraBindings`) with `NativeBindings` as the composite. The test stub `StubNativeBindings` uses `@Suppress("TooManyFunctions")` since it must implement all 19. The file-level threshold is 30 (set in `detekt.yml` per `standards/kotlin.md`).
 
 ### ktlint vs detekt line length conflict
 
@@ -147,7 +147,7 @@ Cross-platform conformance test suite (SCP-120) validating the Kotlin SDK API co
 | `IdentityConformanceTest` | create, load, resolve |
 | `ContextConformanceTest` | create, join, leave, close, state machine transitions |
 | `MessagingConformanceTest` | send, receive (Flow subscription), sequence ordering |
-| `ToolsConformanceTest` | register, invoke, verify test vectors |
+| `OutletsConformanceTest` | register, invoke, verify test vectors |
 | `UcanConformanceTest` | validate, mint, revoke, delegate, nonce replay, ceiling enforcement |
 | `TransportConformanceTest` | connect, status |
 | `EventLogConformanceTest` | query, verify proof |

@@ -86,22 +86,22 @@ pub enum ConsequenceTrigger {
     /// time window. Counted from `EventType::MessageSent` events.
     MessageVelocity,
 
-    /// The subject invoked tools at a rate exceeding the threshold within the
-    /// time window. Counted from `EventType::ToolInvoked` events.
+    /// The subject invoked outlets at a rate exceeding the threshold within the
+    /// time window. Counted from `EventType::OutletInvoked` events.
     ///
     /// # Currently dormant / non-functional
     ///
     /// This trigger cannot fire today. It keys on
-    /// `EventType::ToolInvoked`, but per-author `ToolInvoked` is no longer
-    /// durably logged and there is no corresponding `ContextEvent::ToolInvoked`
-    /// variant, so no convergent tool-invocation signal exists in the interim.
-    /// A configured `ToolRateExceeded` rule is therefore a no-op until a
-    /// convergent tool-rate input arrives with the ADR-051 causal-DAG ordering.
+    /// `EventType::OutletInvoked`, but per-author `OutletInvoked` is no longer
+    /// durably logged and there is no corresponding `ContextEvent::OutletInvoked`
+    /// variant, so no convergent outlet-invocation signal exists in the interim.
+    /// A configured `OutletRateExceeded` rule is therefore a no-op until a
+    /// convergent outlet-rate input arrives with the ADR-051 causal-DAG ordering.
     /// The variant is retained (removing it is an API change, out of scope) so
-    /// rules remain expressible against the eventual convergent signal. Tool
+    /// rules remain expressible against the eventual convergent signal. Outlet
     /// flooding remains bounded in the interim by the independent hard rate
     /// limit, which does not depend on this trigger.
-    ToolRateExceeded,
+    OutletRateExceeded,
 
     /// The subject accumulated warnings (governance actions against them)
     /// exceeding the threshold within the time window. Counted from
@@ -128,7 +128,7 @@ pub enum ConsequenceTrigger {
 ///   `Custom` (matched against convergent governance-action events). These
 ///   auto-derive identically on every honest member from the convergent log, so
 ///   their consequence leaf converges and is durable.
-/// - **Non-convergent triggers** — `MessageVelocity` and `ToolRateExceeded`. A
+/// - **Non-convergent triggers** — `MessageVelocity` and `OutletRateExceeded`. A
 ///   *rate* (count ÷ time) needs a convergent clock, which the protocol neither
 ///   has (no operator / transport-independent / offline) nor needs. Rate-limiting
 ///   is local flow control (§23.16.8), not a recorded consequence; a durable
@@ -143,7 +143,7 @@ pub enum ConsequenceTrigger {
 pub const fn is_convergent_trigger(trigger: &ConsequenceTrigger) -> bool {
     match trigger {
         ConsequenceTrigger::WarningCount | ConsequenceTrigger::Custom(_) => true,
-        ConsequenceTrigger::MessageVelocity | ConsequenceTrigger::ToolRateExceeded => false,
+        ConsequenceTrigger::MessageVelocity | ConsequenceTrigger::OutletRateExceeded => false,
     }
 }
 
@@ -182,7 +182,7 @@ pub fn convergent_consequence_timestamp(consequence: &TriggeredConsequence) -> u
 pub fn trigger_kind_str(trigger: &ConsequenceTrigger) -> String {
     match trigger {
         ConsequenceTrigger::MessageVelocity => "MessageVelocity".to_owned(),
-        ConsequenceTrigger::ToolRateExceeded => "ToolRateExceeded".to_owned(),
+        ConsequenceTrigger::OutletRateExceeded => "OutletRateExceeded".to_owned(),
         ConsequenceTrigger::WarningCount => "WarningCount".to_owned(),
         ConsequenceTrigger::Custom(key) => format!("Custom:{key}"),
     }
@@ -435,7 +435,7 @@ pub struct ConsequenceRule {
     /// ([`is_convergent_trigger`]): a **convergent** trigger (`WarningCount`,
     /// `Custom`) anchors on the convergent event-log timestamp so its durable
     /// leaf is byte-identical across skewed members (§9.9.3); a
-    /// **non-convergent** trigger (`MessageVelocity`, `ToolRateExceeded`)
+    /// **non-convergent** trigger (`MessageVelocity`, `OutletRateExceeded`)
     /// anchors on the evaluating member's local clock, as local flow control.
     pub window: Duration,
 }
@@ -590,7 +590,8 @@ fn validate_severity_shape(
                          index {i}",
                     )));
                 }
-                // Validate Custom(name) / ToolInvoke(id) payload strings.
+                // Validate Custom(name) / OutletQuery(id) / OutletCall(id)
+                // payload strings.
                 if let Capability::Custom(name) = cap {
                     if name.is_empty() {
                         return Err(ConsequenceValidationError(format!(
@@ -602,15 +603,26 @@ fn validate_severity_shape(
                         &format!("SuspendCapability[{i}] Custom"),
                         MAX_CONSEQUENCE_STRING_LEN,
                     )?;
-                } else if let Capability::ToolInvoke(tool_id) = cap {
-                    if tool_id.is_empty() {
+                } else if let Capability::OutletQuery(outlet_id) = cap {
+                    if outlet_id.is_empty() {
                         return Err(ConsequenceValidationError(format!(
-                            "SuspendCapability[{i}] ToolInvoke has empty tool_id",
+                            "SuspendCapability[{i}] OutletQuery has empty outlet_id",
                         )));
                     }
                     validate_consequence_string(
-                        tool_id,
-                        &format!("SuspendCapability[{i}] ToolInvoke"),
+                        outlet_id,
+                        &format!("SuspendCapability[{i}] OutletQuery"),
+                        MAX_CONSEQUENCE_STRING_LEN,
+                    )?;
+                } else if let Capability::OutletCall(outlet_id) = cap {
+                    if outlet_id.is_empty() {
+                        return Err(ConsequenceValidationError(format!(
+                            "SuspendCapability[{i}] OutletCall has empty outlet_id",
+                        )));
+                    }
+                    validate_consequence_string(
+                        outlet_id,
+                        &format!("SuspendCapability[{i}] OutletCall"),
                         MAX_CONSEQUENCE_STRING_LEN,
                     )?;
                 }
@@ -761,10 +773,10 @@ pub fn merge_consequence_events(
     for entry in log_entries {
         let event_type = match entry.event_type {
             // DORMANT: per ADR-051 §6 / the phase-2.md ADR-011 amendment
-            // exclusion taxonomy §2, `MessageSent` / `ToolInvoked` are
+            // exclusion taxonomy §2, `MessageSent` / `OutletInvoked` are
             // per-author, non-convergent events no longer appended to the
             // durable log — Source 1 will not yield them in the interim.
-            // Velocity / tool-rate evaluation continues to read them from
+            // Velocity / outlet-rate evaluation continues to read them from
             // the receive buffer (Source 2, below), which is correct and
             // intended (local, per-receiver flow control needs no
             // convergence). These arms re-activate when ADR-051 §2's causal
@@ -773,8 +785,8 @@ pub fn merge_consequence_events(
             EventType::MemberJoined => EventType::MemberJoined,
             EventType::MemberLeft => EventType::MemberLeft,
             EventType::RoleAssigned => EventType::RoleAssigned,
-            EventType::ToolRegistered | EventType::ToolRemoved | EventType::ToolInvoked => {
-                EventType::ToolInvoked
+            EventType::OutletRegistered | EventType::OutletRemoved | EventType::OutletInvoked => {
+                EventType::OutletInvoked
             }
             EventType::GovernanceAction
             | EventType::GovernanceProposalCreated
@@ -933,7 +945,7 @@ pub fn merge_consequence_events(
 /// - `now` -- The current time as a Unix timestamp in seconds, read from the
 ///   evaluating member's **local** clock. Used to compute the evidence window
 ///   boundary for **non-convergent** triggers ([`is_convergent_trigger`] is
-///   `false`: `MessageVelocity`, `ToolRateExceeded`), which are local flow
+///   `false`: `MessageVelocity`, `OutletRateExceeded`), which are local flow
 ///   control and never mint a durable leaf, so a local-clock window is sound.
 /// - `convergent_now` -- The convergent window anchor (Unix seconds) used for
 ///   **convergent** triggers ([`is_convergent_trigger`] is `true`: `WarningCount`,
@@ -1021,8 +1033,8 @@ fn matches_trigger(trigger: &ConsequenceTrigger, event: &Event, subject_did: &st
         ConsequenceTrigger::MessageVelocity => {
             event.actor_did == subject_did && event.event_type == EventType::MessageSent
         }
-        ConsequenceTrigger::ToolRateExceeded => {
-            event.actor_did == subject_did && event.event_type == EventType::ToolInvoked
+        ConsequenceTrigger::OutletRateExceeded => {
+            event.actor_did == subject_did && event.event_type == EventType::OutletInvoked
         }
         ConsequenceTrigger::WarningCount => {
             // Governance actions targeting the subject (actor is someone else,
@@ -1208,13 +1220,13 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // 2. Tool rate threshold triggers suspension
+    // 2. Outlet rate threshold triggers suspension
     // -----------------------------------------------------------------------
 
     #[test]
-    fn tool_rate_triggers_suspend_all() {
+    fn outlet_rate_triggers_suspend_all() {
         let rules = vec![ConsequenceRule {
-            trigger: ConsequenceTrigger::ToolRateExceeded,
+            trigger: ConsequenceTrigger::OutletRateExceeded,
             action: suspend_all(),
             threshold: 5,
             window: Duration::from_mins(2),
@@ -1223,11 +1235,11 @@ mod tests {
         let events: Vec<Event> = (0..5)
             .map(|i| {
                 make_event(
-                    EventType::ToolInvoked,
+                    EventType::OutletInvoked,
                     "did:key:alice",
                     900 + i,
                     i,
-                    b"some-tool".to_vec(),
+                    b"some-outlet".to_vec(),
                 )
             })
             .collect();
@@ -1556,7 +1568,7 @@ mod tests {
                 window: Duration::from_mins(1),
             },
             ConsequenceRule {
-                trigger: ConsequenceTrigger::ToolRateExceeded,
+                trigger: ConsequenceTrigger::OutletRateExceeded,
                 action: suspend_all(),
                 threshold: 1,
                 window: Duration::from_mins(1),
@@ -1567,11 +1579,11 @@ mod tests {
             make_event(EventType::MessageSent, "did:key:alice", 950, 0, vec![]),
             make_event(EventType::MessageSent, "did:key:alice", 960, 1, vec![]),
             make_event(
-                EventType::ToolInvoked,
+                EventType::OutletInvoked,
                 "did:key:alice",
                 970,
                 2,
-                b"tool-x".to_vec(),
+                b"outlet-x".to_vec(),
             ),
         ];
 
@@ -1851,19 +1863,19 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_empty_tool_invoke_payload() {
+    fn validate_rejects_empty_outlet_call_payload() {
         let rule = ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
             action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
-                capabilities: vec![Capability::ToolInvoke(String::new())],
+                capabilities: vec![Capability::OutletCall(String::new())],
             }),
             threshold: 1,
             window: Duration::from_mins(1),
         };
         let err = rule.validate().unwrap_err();
         assert!(
-            err.to_string().contains("ToolInvoke has empty tool_id"),
-            "should reject empty tool_id, got: {err}"
+            err.to_string().contains("OutletCall has empty outlet_id"),
+            "should reject empty outlet_id, got: {err}"
         );
     }
 
@@ -2181,11 +2193,11 @@ mod tests {
     }
 
     #[test]
-    fn b2_suspend_custom_tool_invoke_is_respected() {
+    fn b2_suspend_custom_outlet_call_is_respected() {
         let rule = ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
             action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
-                capabilities: vec![Capability::ToolInvoke("calculator".to_owned())],
+                capabilities: vec![Capability::OutletCall("calculator".to_owned())],
             }),
             threshold: 1,
             window: Duration::from_mins(1),
@@ -2198,7 +2210,7 @@ mod tests {
         };
         assert_eq!(
             capabilities,
-            &vec![Capability::ToolInvoke("calculator".to_owned())]
+            &vec![Capability::OutletCall("calculator".to_owned())]
         );
     }
 
@@ -2207,7 +2219,7 @@ mod tests {
         let caps = vec![
             Capability::MessagesWrite,
             Capability::GovernanceVote,
-            Capability::ToolInvoke("calculator".to_owned()),
+            Capability::OutletCall("calculator".to_owned()),
             Capability::Custom("rate_limit_bypass".to_owned()),
         ];
         let rule = ConsequenceRule {

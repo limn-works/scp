@@ -339,7 +339,7 @@ async fn classify_action_categories() {
 
     // Category B resources.
     assert_eq!(classify_action("messages"), ActionCategory::CategoryB);
-    assert_eq!(classify_action("tool_invoke"), ActionCategory::CategoryB);
+    assert_eq!(classify_action("outlet_call"), ActionCategory::CategoryB);
     assert_eq!(classify_action("member"), ActionCategory::CategoryB);
     assert_eq!(classify_action("role"), ActionCategory::CategoryB);
     assert_eq!(classify_action("context"), ActionCategory::CategoryB);

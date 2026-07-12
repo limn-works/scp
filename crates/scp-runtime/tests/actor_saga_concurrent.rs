@@ -10,7 +10,7 @@
 //!
 //! # Determinism
 //!
-//! The sole production saga, `CrossContextToolInvocation`, is wired, but
+//! The sole production saga, `CrossContextOutletInvocation`, is wired, but
 //! driving it through `start_saga` (no executor / signing key) over contexts
 //! with NO co-resident actors aborts INSTANTLY at Prepare-A with a typed error
 //! — the PreparingA → Aborting → Aborted arm — too fast to hold "in flight" by
@@ -86,14 +86,14 @@ fn test_supervisor() -> Arc<Supervisor> {
     ))
 }
 
-/// A cross-context tool-invocation saga over the given caller/target
+/// A cross-context outlet-invocation saga over the given caller/target
 /// contexts. Its participant context set is `{caller, target}`. The
 /// envelope fields are placeholders — these gating tests never reach
 /// Prepare-B (no co-resident actors), so only the two context ids (the
 /// reservation key) are load-bearing.
 ///
 /// The variant is construction-sealed against production callers (only
-/// `start_cross_context_tool_invocation_saga` can build it there); this gating
+/// `start_cross_context_outlet_invocation_saga` can build it there); this gating
 /// test reaches it through the `test`/`testing`-gated
 /// [`SagaInput::test_cross_context_for_gating`] constructor, which fills the
 /// same placeholders.
@@ -102,7 +102,7 @@ fn cross_context(caller: [u8; 32], target: [u8; 32]) -> SagaInput {
 }
 
 /// Assert a saga terminated at a NON-busy terminal. Driving a
-/// `CrossContextToolInvocation` through `start_saga` (no executor / signing
+/// `CrossContextOutletInvocation` through `start_saga` (no executor / signing
 /// key) aborts at Prepare-A with `InvalidState` (the executor-context misuse
 /// guard, SCP-SAGA-13051) — BEFORE the co-resident lookup — so the FSM never
 /// reaches `ContextNotRegistered` here. Any non-busy terminal (`InvalidState`,
@@ -196,14 +196,14 @@ async fn overlapping_participant_sets_reject_busy() {
     );
 }
 
-/// A `TestForceNeedsRepair` saga and a `CrossContextToolInvocation` saga that
+/// A `TestForceNeedsRepair` saga and a `CrossContextOutletInvocation` saga that
 /// touch the SAME context serialize — overlap detection is purely
 /// set-membership, not saga-type.
 ///
 /// This genuinely crosses saga TYPES. Every variant reserves the raw-digest hex
 /// (`hex::encode([u8; 32])`) of each context it spans. A held
 /// `TestForceNeedsRepair` saga over `{shared}` and a
-/// `CrossContextToolInvocation` over that SAME `shared` raw digest must collide.
+/// `CrossContextOutletInvocation` over that SAME `shared` raw digest must collide.
 /// If overlap detection keyed off the saga type rather than pure set-membership,
 /// the cross-context saga would not be rejected and this assertion would FAIL.
 #[tokio::test]

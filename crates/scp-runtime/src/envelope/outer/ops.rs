@@ -498,7 +498,7 @@ mod seal_open_tests {
     async fn seal_then_open_roundtrip_with_provenance() {
         let (mut alice_group, mut bob_group) = setup_mls_groups();
         let provenance = Provenance {
-            source: "test-tool".into(),
+            source: "test-outlet".into(),
             upstream_hash: Some("abc123".into()),
         };
         let inner = create_test_inner(

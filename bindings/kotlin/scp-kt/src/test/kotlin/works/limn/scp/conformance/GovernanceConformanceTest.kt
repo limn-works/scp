@@ -74,13 +74,13 @@ class GovernanceConformanceTest {
             }
 
         @Test
-        fun `tool_register requires tool management capability`() =
+        fun `outlet_register requires outlet management capability`() =
             runTest(testDispatcher) {
-                stubBindings.toolRegisterError =
+                stubBindings.outletRegisterError =
                     BridgeException("Insufficient capability", "SCP-PERM-3022")
                 val result =
                     dispatcher.dispatch(
-                        "tool_register",
+                        "outlet_register",
                         mapOf("context_handle" to "10", "definition" to "{}"),
                     )
                 assertEquals("SCP-PERM-3022", result["error"])
@@ -179,16 +179,16 @@ class GovernanceConformanceTest {
             }
 
         @Test
-        fun `tool error codes are reachable`() =
+        fun `outlet error codes are reachable`() =
             runTest(testDispatcher) {
-                stubBindings.toolInvokeError =
-                    BridgeException("test", "SCP-TOOL-6001")
+                stubBindings.outletInvokeError =
+                    BridgeException("test", "SCP-OUTLET-6001")
                 val result =
                     dispatcher.dispatch(
-                        "tool_invoke",
-                        mapOf("context_handle" to "1", "tool_id" to "t"),
+                        "outlet_invoke",
+                        mapOf("context_handle" to "1", "outlet_id" to "t"),
                     )
-                assertEquals("SCP-TOOL-6001", result["error"])
+                assertEquals("SCP-OUTLET-6001", result["error"])
             }
 
         @Test

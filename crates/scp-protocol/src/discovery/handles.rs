@@ -1,11 +1,11 @@
-//! Context handle tools: register, lookup, and deregister.
+//! Context handle outlets: register, lookup, and deregister.
 //!
-//! Implements §22.3.1 Handle Tools: three standard tool schemas for
+//! Implements §22.3.1 Handle Outlets: three standard outlet schemas for
 //! contexts that support human-readable handles. These follow the same two-tier
-//! architecture as existing discovery tools (§6.2.2B): writers (MLS members)
+//! architecture as existing discovery outlets (§6.2.2B): writers (MLS members)
 //! process registrations, readers (DID-authenticated, unbounded) perform lookups.
 //!
-//! Tool schemas:
+//! Outlet schemas:
 //! - `handle_register(handle, target, metadata?) -> { status, entry_id? }`
 //! - `handle_lookup(handle, type_filter?) -> { results }`
 //! - `handle_deregister(handle, did) -> { removed }`
@@ -26,14 +26,14 @@ use super::addressing::HandleTarget;
 // Constants
 // ---------------------------------------------------------------------------
 
-/// Standard tool name for handle registration.
-pub const TOOL_HANDLE_REGISTER: &str = "handle_register";
+/// Standard outlet name for handle registration.
+pub const OUTLET_HANDLE_REGISTER: &str = "handle_register";
 
-/// Standard tool name for handle lookup.
-pub const TOOL_HANDLE_LOOKUP: &str = "handle_lookup";
+/// Standard outlet name for handle lookup.
+pub const OUTLET_HANDLE_LOOKUP: &str = "handle_lookup";
 
-/// Standard tool name for handle deregistration.
-pub const TOOL_HANDLE_DEREGISTER: &str = "handle_deregister";
+/// Standard outlet name for handle deregistration.
+pub const OUTLET_HANDLE_DEREGISTER: &str = "handle_deregister";
 
 /// Maximum number of entries in a single handle registry (§22.3.1).
 const MAX_HANDLE_ENTRIES: usize = 10_000;
@@ -42,13 +42,13 @@ const MAX_HANDLE_ENTRIES: usize = 10_000;
 // HandleRegisterParams / HandleRegisterResult (§22.3.1)
 // ---------------------------------------------------------------------------
 
-/// Input parameters for the `handle_register` tool.
+/// Input parameters for the `handle_register` outlet.
 ///
-/// Registers a handle in a context with discovery tools. The registrant's DID is
+/// Registers a handle in a context with discovery outlets. The registrant's DID is
 /// authenticated via the DID-signed request. Handle uniqueness is enforced
 /// per local-part within the context namespace.
 ///
-/// See §22.3.1 Handle Tools.
+/// See §22.3.1 Handle Outlets.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HandleRegisterParams {
     /// The local-part to register (e.g., `"alice"`).
@@ -68,7 +68,7 @@ pub struct HandleMetadata {
     pub tags: Option<Vec<String>>,
 }
 
-/// Output of the `handle_register` tool.
+/// Output of the `handle_register` outlet.
 ///
 /// Returns an unambiguous status: `"registered"` on success, `"conflict"` when
 /// another DID already holds the requested handle, `"ownership_mismatch"` when
@@ -101,12 +101,12 @@ pub enum HandleRegisterStatus {
 // HandleLookupParams / HandleLookupResult (§22.3.1)
 // ---------------------------------------------------------------------------
 
-/// Input parameters for the `handle_lookup` tool.
+/// Input parameters for the `handle_lookup` outlet.
 ///
-/// Looks up a handle in a context with discovery tools. Available to readers
+/// Looks up a handle in a context with discovery outlets. Available to readers
 /// (DID-authenticated, unbounded tier).
 ///
-/// See §22.3.1 Handle Tools.
+/// See §22.3.1 Handle Outlets.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HandleLookupParams {
     /// The local-part to look up (e.g., `"alice"`).
@@ -125,7 +125,7 @@ pub enum HandleTypeFilter {
     Context,
 }
 
-/// Output of the `handle_lookup` tool.
+/// Output of the `handle_lookup` outlet.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HandleLookupResult {
     /// The lookup results.
@@ -156,12 +156,12 @@ pub struct HandleEntry {
 // HandleDeregisterParams / HandleDeregisterResult (§22.3.1)
 // ---------------------------------------------------------------------------
 
-/// Input parameters for the `handle_deregister` tool.
+/// Input parameters for the `handle_deregister` outlet.
 ///
 /// Removes a handle registration. The `did` field is explicit (not inferred
 /// from request signature) so the ownership check is visible in the interface.
 ///
-/// See §22.3.1 Handle Tools.
+/// See §22.3.1 Handle Outlets.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HandleDeregisterParams {
     /// The local-part to deregister.
@@ -170,7 +170,7 @@ pub struct HandleDeregisterParams {
     pub did: DID,
 }
 
-/// Output of the `handle_deregister` tool.
+/// Output of the `handle_deregister` outlet.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HandleDeregisterResult {
     /// Whether the handle was actually removed.
@@ -187,7 +187,7 @@ pub struct HandleDeregisterResult {
 /// Production implementations would back this with a persistent store and
 /// event log recording.
 ///
-/// See §22.3.1 Handle Tools and §22.3.2 Scope Naming.
+/// See §22.3.1 Handle Outlets and §22.3.2 Scope Naming.
 #[derive(Debug)]
 pub struct HandleRegistry {
     /// The context ID this registry belongs to.

@@ -213,7 +213,7 @@ class EconomyBridge internal constructor(
      * Estimates the cost for an action in a context.
      *
      * @param policyJson Economic policy JSON string (empty or "null" for free).
-     * @param actionType One of: "MessageSend", "ToolInvoke", "ContextJoin",
+     * @param actionType One of: "MessageSend", "OutletCall", "ContextJoin",
      *     "SubscriptionPeriod", "ByteStored".
      * @param metricsJson Observable metrics as JSON string.
      * @return Estimated cost, or null on overflow.

@@ -40,8 +40,8 @@ sealed class ConsequenceTrigger {
     /** Rate of [scp_event_log::EventType::MessageSent] events for the subject. */
     data object MessageVelocity : ConsequenceTrigger()
 
-    /** Rate of [scp_event_log::EventType::ToolInvoked] events for the subject. */
-    data object ToolRateExceeded : ConsequenceTrigger()
+    /** Rate of [scp_event_log::EventType::OutletInvoked] events for the subject. */
+    data object OutletRateExceeded : ConsequenceTrigger()
 
     /** Count of governance actions targeting the subject. */
     data object WarningCount : ConsequenceTrigger()
@@ -68,7 +68,7 @@ sealed class ConsequenceTrigger {
  */
 val CONSEQUENCE_TRIGGER_VARIANT_NAMES: List<String> = listOf(
     "MessageVelocity",
-    "ToolRateExceeded",
+    "OutletRateExceeded",
     "WarningCount",
     "Custom",
 )
@@ -96,7 +96,7 @@ enum class AccessScope(val rawValue: String) {
  * A capability that may be referenced inside [EnforcementSeverity.SuspendCapability].
  *
  * Mirrors `scp_protocol::context::roles::Capability`. The unit variants are
- * enumerated as [Unit]; payload-bearing variants ([ToolInvoke], [Custom]) carry
+ * enumerated as [Unit]; payload-bearing variants ([OutletCall], [Custom]) carry
  * their string field directly.
  */
 sealed class ConsequenceCapability {
@@ -112,12 +112,13 @@ sealed class ConsequenceCapability {
     }
 
     /**
-     * Tool invocation capability for a specific registered tool.
+     * Action-outlet invocation capability for a specific registered outlet.
      *
-     * Serializes as `{"ToolInvoke": "<id>"}` to match the Rust newtype.
+     * Mirrors `Capability::OutletCall(OutletId)`. Serializes as
+     * `{"OutletCall": "<id>"}` to match the Rust newtype.
      */
-    data class ToolInvoke(val toolId: String) : ConsequenceCapability() {
-        init { require(toolId.isNotEmpty()) { "ToolInvoke tool id must not be empty" } }
+    data class OutletCall(val outletId: String) : ConsequenceCapability() {
+        init { require(outletId.isNotEmpty()) { "OutletCall outlet id must not be empty" } }
     }
 
     /**
@@ -329,7 +330,7 @@ private fun encodeConsequenceRuleElement(rule: ConsequenceRule): JsonObject =
 
 private fun encodeTriggerElement(trigger: ConsequenceTrigger): JsonElement = when (trigger) {
     ConsequenceTrigger.MessageVelocity -> JsonPrimitive("MessageVelocity")
-    ConsequenceTrigger.ToolRateExceeded -> JsonPrimitive("ToolRateExceeded")
+    ConsequenceTrigger.OutletRateExceeded -> JsonPrimitive("OutletRateExceeded")
     ConsequenceTrigger.WarningCount -> JsonPrimitive("WarningCount")
     is ConsequenceTrigger.Custom -> buildJsonObject { put("Custom", trigger.key) }
 }
@@ -368,6 +369,6 @@ private fun encodeSeverityElement(severity: EnforcementSeverity): JsonElement = 
 
 private fun encodeCapabilityElement(capability: ConsequenceCapability): JsonElement = when (capability) {
     is ConsequenceCapability.Unit -> JsonPrimitive(capability.name)
-    is ConsequenceCapability.ToolInvoke -> buildJsonObject { put("ToolInvoke", capability.toolId) }
+    is ConsequenceCapability.OutletCall -> buildJsonObject { put("OutletCall", capability.outletId) }
     is ConsequenceCapability.Custom -> buildJsonObject { put("Custom", capability.name) }
 }

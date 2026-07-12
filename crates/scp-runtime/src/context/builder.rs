@@ -1160,7 +1160,7 @@ mod tests {
     /// id is a real 64-hex string (the shape `generate_context_id` produces:
     /// `hex(32 random bytes)`) keys its creation crypto under the **decoded
     /// digest**, NOT under `SHA-256(id)`. This is the load-bearing fix: the
-    /// §6.2.4 cross-context tool saga compares the wire `target_context_id`
+    /// §6.2.4 cross-context outlet saga compares the wire `target_context_id`
     /// (the raw digest) against `state.context_id`, and `state.context_id` is
     /// set by `context_id_to_bytes` of the same id — so the MLS group,
     /// sender key, and event log created here MUST live under that identical

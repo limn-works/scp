@@ -47,8 +47,8 @@ pub mod state;
 
 pub use commands::{
     BroadcastCommand, ContextCommand, EconomyCommand, GovernanceCommand, LifecycleCommand,
-    LifecycleControlCommand, MessagingCommand, QueriesCommand, SagaPhaseMessage, StandingCommand,
-    ToolsCommand, TrustRecoveryCommand, TtlCloseCommand,
+    LifecycleControlCommand, MessagingCommand, OutletsCommand, QueriesCommand, SagaPhaseMessage,
+    StandingCommand, TrustRecoveryCommand, TtlCloseCommand,
 };
 pub use deps::ActorDeps;
 pub use handle::{ContextActorHandle, SEND_TIMEOUT};
@@ -446,13 +446,13 @@ impl ContextActor {
                 // lookup-miss error.
                 handlers::ttl_close::dispatch(cell, deps, sub).await
             }
-            ContextCommand::Tools(sub) => {
-                // Phase 2A.4 -- tools domain migrated to the
+            ContextCommand::Outlets(sub) => {
+                // Phase 2A.4 -- outlets domain migrated to the
                 // actor-shape handler for mailbox-routed hard-rate
-                // helpers. `Supervisor::dispatch_tools_command` is
+                // helpers. `Supervisor::dispatch_outlets_command` is
                 // mailbox-first: a missing actor surfaces a typed
                 // error on the command's reply oneshot.
-                handlers::tools::dispatch(cell, deps, sub).await
+                handlers::outlets::dispatch(cell, deps, sub).await
             }
             // Phase 2A.10 — queries domain migrated to the actor-shape
             // handler. The actor's owned `state` + `deps.event_log` +

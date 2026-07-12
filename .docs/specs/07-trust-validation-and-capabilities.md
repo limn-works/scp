@@ -14,7 +14,7 @@ The system has four layers, from hardest (pure validation) to softest (pure judg
 │                                                               │
 │  Two-tier capability validation:                             │
 │  Tier 1 — Full UCAN chain validation at token presentation  │
-│    boundaries (role assignment, cross-context tool           │
+│    boundaries (role assignment, cross-context outlet           │
 │    invocation, broadcast admission).                         │
 │  Tier 2 — Capability cache check at intra-context operation │
 │    time (derived from validated UCAN tokens, updated        │
@@ -28,7 +28,7 @@ The system has four layers, from hardest (pure validation) to softest (pure judg
 │                                                               │
 │  Verifiable event logs (Merkle trees per context).           │
 │  Participation records derived from protocol events.            │
-│  Tool verification via deterministic testing.                │
+│  Outlet verification via deterministic testing.                │
 │  Challenge-response for testable agent capabilities.         │
 │  Threshold attestation counting.                             │
 │  Consequence mechanism evaluation.                           │
@@ -55,7 +55,7 @@ The system has four layers, from hardest (pure validation) to softest (pure judg
 └─────────────────────────────────────────────────────────────┘
 ```
 
-The critical property: **the trust surface shrinks over time.** New identities start trust-heavy — no participation history, need endorsements, can't be validated beyond their signatures. As they participate, participation records accumulate, tool interactions are verified, challenge-responses are completed. The validation layers grow. Trust becomes supplementary, then marginal.
+The critical property: **the trust surface shrinks over time.** New identities start trust-heavy — no participation history, need endorsements, can't be validated beyond their signatures. As they participate, participation records accumulate, outlet interactions are verified, challenge-responses are completed. The validation layers grow. Trust becomes supplementary, then marginal.
 
 ## 7.2 Layer 1: Protocol Enforcement
 
@@ -66,7 +66,7 @@ Every protocol action is zero-trust. Capability enforcement uses a two-tier vali
 Full 11-step UCAN validation (ADR-016 criterion 2) runs at **token presentation boundaries** — the points where a UCAN token is first introduced or must be re-verified:
 
 - **Role assignment:** When a member is assigned a role, the assigner's `RoleAssign` capability is checked via cache, and `mint_role_tokens()` creates a capability token for each capability in the role definition. These tokens are the lightweight `context::roles::UcanToken` type (`iss`, `aud`, `att`, `nnc`) — a deliberately distinct type from the JWT-encoded `crypto::ucan::UcanToken` (`header`, `payload`, `signature`, `encoded`) that the 11-step pipeline consumes. They are validated against the context's capability ceiling at construction time — the same all-attestations rule applies at mint time (every capability in the role definition must be within the ceiling) and at presentation time (step 8) — and inserted directly into the `member_capabilities` cache. **They carry no per-token signature by design, and this is complete — not deferred.** The role token is never serialized as a bearer credential (the MLS leaf credential's `ucan_token` is `None` in all production paths), never crosses a trust boundary, and is structurally incapable of entering the Tier-1 pipeline (which accepts only the JWT `crypto::ucan::UcanToken`; there is no conversion path between the two types). Its authority is grounded in the signed source that performs the assignment — context creation for the creator's admin role, and the signed `AddMember`/`AssignRole` governance action (the `SignedVote` approval chain executed by `system_assign_role`) for every subsequent assignment — and, when role state is synced, in the signed context snapshot (ADR-050) that carries it. Each member derives its own `member_capabilities` cache locally from these signed governance events, so a capability cannot be forged by presenting a token; a per-token signature would be redundant with the governance signature that already authorizes the assignment. See `assign_role()` in `context/roles.rs`.
-- **Cross-context tool invocation:** When one context invokes a tool exposed by another context, the invoker presents a UCAN that is fully validated against the target context's ceiling and the invoker's delegation chain.
+- **Cross-context outlet invocation:** When one context invokes an outlet exposed by another context, the invoker presents a UCAN that is fully validated against the target context's ceiling and the invoker's delegation chain.
 - **Broadcast admission:** Gated broadcast contexts (§5.14.4) require a valid `messages:read` UCAN from subscribers. The full validation pipeline runs on the presented token. See `register_subscriber()` in `context/broadcast.rs`.
 
 The 11 validation steps are:
@@ -89,11 +89,12 @@ At **intra-context operation time**, the protocol uses a derived capability cach
 
 - **Derived from ceiling-validated UCAN tokens:** The cache is populated exclusively from tokens minted by `mint_role_tokens()` during role assignment, which are validated against the context's capability ceiling at construction time. It is never populated from unvalidated sources.
 - **Updated atomically on role change:** When `assign_role()` succeeds, the member's cached capabilities are replaced with the new role's capability set in the same operation. There is no window where stale capabilities are served.
-- **Checked on every operation:** Every context operation — `send()`, `invoke_tool()`, `close_context()`, governance actions — checks the cache via `member_has_capability()` before proceeding. A member without the required capability in cache is denied.
+- **Checked on every operation:** Every context operation — `send()`, `invoke_outlet()`, `close_context()`, governance actions — checks the cache via `member_has_capability()` before proceeding. A member without the required capability in cache is denied.
 
 Operations that check the cache include:
 - Message send: requires `MessagesWrite`
-- Tool invocation: requires `ToolInvoke(tool_id)` or `ToolInvokeAll`
+- Query outlet invocation: requires `OutletQuery(outlet_id)` or `OutletQueryAll`
+- Action outlet invocation: requires `OutletCall(outlet_id)` or `OutletCallAll`
 - Context close: requires `ContextClose`
 - Role assignment: requires `RoleAssign`
 - Member operations: requires `MemberInvite`, `MemberRemove`, etc.
@@ -109,7 +110,7 @@ No action proceeds on reputation or identity alone. A trusted DID whose cached c
 - Tier 1 provides cryptographic proof of authorization at trust boundaries.
 - Tier 2 provides O(1) capability lookup for the hot path of every intra-context operation.
 
-This two-tier design is not a relaxation of security. Tier 2 checks are derived from Tier 1 validation — they are a performance optimization that preserves the security invariant. Every capability in the cache traces back to a cryptographically authorized source: externally-presented tokens (cross-context tool invocation, broadcast admission) are validated through the full Tier-1 UCAN chain, and role-derived capabilities trace to the signed governance authorization that granted the role (context creation for the creator; the signed `AddMember`/`AssignRole` governance action thereafter). The role-derived `member_capabilities` entries are local materializations of that signed authorization, not independently-presented bearer tokens.
+This two-tier design is not a relaxation of security. Tier 2 checks are derived from Tier 1 validation — they are a performance optimization that preserves the security invariant. Every capability in the cache traces back to a cryptographically authorized source: externally-presented tokens (cross-context outlet invocation, broadcast admission) are validated through the full Tier-1 UCAN chain, and role-derived capabilities trace to the signed governance authorization that granted the role (context creation for the creator; the signed `AddMember`/`AssignRole` governance action thereafter). The role-derived `member_capabilities` entries are local materializations of that signed authorization, not independently-presented bearer tokens.
 
 **Capability tokens** are fine-grained, per-context, per-capability. Build on UCAN (User Controlled Authorization Networks). Under the shared-DID model (ADR-039), intra-DID delegation uses self-delegation UCANs where `iss == aud` (same DID), the issuing key is `#active`, and `fct.scp_key_scope: "#agent"` scopes the delegation to the agent verification method. Tokens are independently revocable — you can revoke one capability from one agent in one context without affecting anything else. The UCAN chain provides verifiable delegation: the protocol can trace any token back to the root authority that granted it.
 
@@ -154,13 +155,13 @@ This is the layer that replaces trust with evidence. It grows as the network acc
 
 ### 7.3.1 Verifiable Event Logs
 
-Every context maintains a verifiable event log — a Merkle tree (or equivalent authenticated data structure) of the context's convergent protocol events: membership changes, role assignments, governance actions, lifecycle, access, and provenance (the MLS-commit-ordered stream; ADR-011). Attestations are NOT context-log events: they are credential-layer artifacts (DID-document entries, relay-published blobs, the `TrustProtocolRepository` cache; §7.4), each verified by its own envelope signature and revocation status rather than by inclusion in the context Merkle tree. Application events — messages and tool invocations — are per-author and enter this convergent log under the causal-DAG ordering of ADR-051; until then they are local `ContextEvent`s, not canonical leaves (see the ADR-011 amendment, exclusion taxonomy). Events are signed by the acting agent.
+Every context maintains a verifiable event log — a Merkle tree (or equivalent authenticated data structure) of the context's convergent protocol events: membership changes, role assignments, governance actions, lifecycle, access, and provenance (the MLS-commit-ordered stream; ADR-011). Attestations are NOT context-log events: they are credential-layer artifacts (DID-document entries, relay-published blobs, the `TrustProtocolRepository` cache; §7.4), each verified by its own envelope signature and revocation status rather than by inclusion in the context Merkle tree. Application events — messages and outlet invocations — are per-author and enter this convergent log under the causal-DAG ordering of ADR-051; until then they are local `ContextEvent`s, not canonical leaves (see the ADR-011 amendment, exclusion taxonomy). Events are signed by the acting agent.
 
 **Event sequencing mechanism.** Events in the Merkle tree are sequenced using a per-context monotonic counter maintained by the context's governance authority (admin in SingleAdmin; the committing member in other models). Sequence numbers are 64-bit unsigned integers starting at 0, incremented by 1 for each event. The counter is stored at `context/{context_id}/event_meta/count` (§17.3). Concurrent events from different members are serialized through the MLS commit mechanism — only one Commit can succeed per epoch, and the committing member assigns the sequence number. In broadcast contexts, each author maintains their own sequence counter (independent per-author sequencing). The canonical Merkle leaf is `leaf_hash = SHA-256(0x00 ‖ rmp_serde(Event))` over the typed `Event` (ADR-011 / §25), whose serialized fields include the event type, actor DID, timestamp, and payload; commit-ordered events also carry the committer-assigned sequence, while DAG-ordered application events carry causal head-references in its place (ADR-051). The leaf `timestamp` is assigned the same way as the sequence: for a commit-ordered event the committing member sets it to the `created_at` of the signed SCP envelope carrying the commit (§9.8.2), and every member copies that one committer-assigned value into its own leaf — it is not each member's local wall-clock reading. All honest members therefore hold byte-identical leaf preimages for the same event, so the timestamp is a value *assigned-and-propagated*, not a current time each member reads independently; it is tamper-evident (covered by the committer's envelope signature and by the leaf hash) and bounded to real time within the clock-skew tolerance of §9.8.2 (the ±5-minute future bound). For events triggered by a local timer rather than a commit — TTL expiry/close, governance-freeze expiry, and deferred economic-policy application — the convergent timestamp is the pre-computed deadline already held in convergent context state (the TTL deadline, the freeze-expiry instant, the policy-application time), never local `now()`. Convergence of the leaf depends on this rule: leaves stamped with per-member-local times would diverge and break the equal-event-count ⇒ equal-Merkle-root property the Relay Consistency Protocol relies on (§9.9.3).
 
 Any participant can verify claims about context history against the Merkle root:
 
-- "This tool was registered on date X by DID Y" — verifiable via proof-of-inclusion.
+- "This outlet was registered on date X by DID Y" — verifiable via proof-of-inclusion.
 - "The context's capability ceiling has not changed since creation" — verifiable via the log's mutation history.
 - "Carol has never had a governance action taken against her in Context A" — verifiable by querying the log for governance actions with `subject == Carol's DID` and receiving an empty result set. Note: this is an exhaustive query against the log, not a cryptographic proof-of-absence. Standard append-only Merkle trees support proof-of-inclusion (a leaf exists) but do NOT support proof-of-absence (a leaf does not exist). A negative claim ("no governance action exists") is verified by the querier scanning the log and confirming no matching events are found. The Merkle root ensures the log has not been tampered with — if an event was recorded, it cannot be removed — but the protocol does not provide a single compact proof that a specific event type was never recorded. Consumers who require cryptographic proof-of-absence (rather than query-and-verify) SHOULD use a sparse Merkle tree or sorted Merkle tree with boundary proofs; the protocol does not mandate a specific authenticated data structure beyond the general requirement of Merkle-based integrity (§7.3.1 header: "Merkle tree (or equivalent authenticated data structure)").
 
@@ -171,14 +172,14 @@ This transforms claims about the past from trust-dependent to validation-depende
 The protocol defines a standard participation record format whose facts are derived from context event logs, with one exception called out below (attestation history, which is a credential-layer fact — §7.4). A participation record is not a reputation score (opaque, gameable, subjective). It is a set of verifiable facts:
 
 - Number of contexts participated in, with duration
-- Tool invocations by type and frequency
+- Outlet invocations by type and frequency
 - Governance actions taken against this identity (warnings, role demotions, ejections)
 - Governance actions taken by this identity (if in a governance role)
 - Role progression history (promotions, demotions)
 - Attestation history (endorsements issued, endorsements received, endorsement accuracy) — the exception: NOT derived from context event logs but from the credential layer (§7.4); see `attestation_count` below
 - Context creation history
 
-Facts derived from convergent events — participation duration (`MemberJoined`/`MemberLeft`), governance actions (`GovernanceActionExecuted`), role progression (`RoleAssigned`), and context-creation (`ChildContextCreated`) — are convergent-by-construction: each becomes Merkle-verifiable against the relevant context's Merkle root once receive-side replication lands (ADR-051). Today the runtime emits these leaves committer-side only (receive-side replication is dormant), so a non-committer's locally-derived record is committer-local rather than independently Merkle-verifiable until ADR-051. **`attestation_count` is the explicit exception: it is NOT a context-event fact and NOT Merkle-anchored.** Attestations are credential-layer artifacts (§7.4), not context-log leaves; `attestation_count` is computed on-demand from the attestations the verifying agent can access, and each contributing attestation is verified by its own envelope signature and revocation status (§7.4.4), not by inclusion in any context Merkle tree (see the per-context-extraction step for `attestation_count` below). The `tool_invocation_count` fact derives from `ToolInvoked`, per-author application activity that becomes Merkle-anchored under the causal-DAG ordering of ADR-051 (computed locally until then; see the ADR-011 amendment, exclusion taxonomy). The participation record is not stored centrally — it is computed by any agent from the set of context logs and accessible attestations.
+Facts derived from convergent events — participation duration (`MemberJoined`/`MemberLeft`), governance actions (`GovernanceActionExecuted`), role progression (`RoleAssigned`), and context-creation (`ChildContextCreated`) — are convergent-by-construction: each becomes Merkle-verifiable against the relevant context's Merkle root once receive-side replication lands (ADR-051). Today the runtime emits these leaves committer-side only (receive-side replication is dormant), so a non-committer's locally-derived record is committer-local rather than independently Merkle-verifiable until ADR-051. **`attestation_count` is the explicit exception: it is NOT a context-event fact and NOT Merkle-anchored.** Attestations are credential-layer artifacts (§7.4), not context-log leaves; `attestation_count` is computed on-demand from the attestations the verifying agent can access, and each contributing attestation is verified by its own envelope signature and revocation status (§7.4.4), not by inclusion in any context Merkle tree (see the per-context-extraction step for `attestation_count` below). The `outlet_invocation_count` fact derives from `OutletInvoked`, per-author application activity that becomes Merkle-anchored under the causal-DAG ordering of ADR-051 (computed locally until then; see the ADR-011 amendment, exclusion taxonomy). The participation record is not stored centrally — it is computed by any agent from the set of context logs and accessible attestations.
 
 **Participation record computation algorithm.** An agent computing a participation record for a target DID across N accessible context logs follows this deterministic procedure:
 
@@ -187,7 +188,7 @@ Facts derived from convergent events — participation duration (`MemberJoined`/
    - `participation_duration_secs`: `(latest_event_timestamp - MemberJoined_timestamp)` for the target DID. If the member has left and rejoined, sum all intervals. The `MemberJoined`/`MemberLeft` leaves carry the affected member's DID in their payload (the membership-change payload, ADR-011), so for admin-driven joins/removals the interval is attributed to the affected member rather than to the admin who executed the action; on self-join and broadcast-author paths the leaf `actor_did` is already the member itself. For the context creator (founder), the seeding `MemberJoined` leaf timestamp is the creator-assigned context-creation timestamp — so the founder's duration is creator-timestamp-trusting, and like every membership-derived fact it is committer-local until ADR-051 receive-side membership replication lands (no independent receiver corroborates the creator's clock before then).
    - `governance_actions_against`: Count of events with type `GovernanceActionExecuted` whose leaf **`target_did`** equals the target DID. `target_did` is the *targeted* member, carried in `GovernanceActionExecutedPayload` (and `AccessRevokedPayload` for access-revocation events) and surfaced by the projection's `target_did` field (ADR-011) — a field distinct from the role/membership `subject_did` field below: governance/access facts key on `target_did`, role/membership facts key on `subject_did`.
    - `governance_actions_by`: Count of events with type `GovernanceActionExecuted` whose leaf `actor_did` equals the target DID.
-   - `tool_invocation_count`: Count of events with type `ToolInvoked` whose leaf `actor_did` equals the target DID. (Per-author application activity: computed from local `ContextEvent`s, not the Merkle log, until ADR-051 makes `ToolInvoked` a convergent leaf; it needs the convergent DAG *count* — no clock.)
+   - `outlet_invocation_count`: Count of events with type `OutletInvoked` whose leaf `actor_did` equals the target DID. (Per-author application activity: computed from local `ContextEvent`s, not the Merkle log, until ADR-051 makes `OutletInvoked` a convergent leaf; it needs the convergent DAG *count* — no clock.)
    - `context_creation_count`: Count of events with type `ChildContextCreated` whose leaf `actor_did` equals the target DID. This is per-context (counts child contexts created within this context only, not globally).
    - `role_progression_count`: Count of events with type `RoleAssigned` whose leaf **`subject_did`** equals the target DID. `subject_did` is carried in the `RoleAssigned` leaf payload (`RoleAssignedPayload`, ADR-011) and surfaced by the projection's separate `subject_did` field, so the affected member — not the assigning governance actor — is the subject this fact is attributed to.
    - `attestation_count`: counted from the **credential layer**, NOT from the context event log. There is no `AttestationPublished` event type — attestations are never context-log leaves (§7.4). The count is the number of endorsements issued/received for the target DID that the computing agent can access from the credential layer — DID-document attestation entries, relay-published attestation blobs, and the `TrustProtocolRepository` cache — filtered to currently-valid (non-revoked) attestations per §7.4.4. It is computed **on-demand** and is **verifier-relative**: two agents may compute different counts because they can access different subsets of the subject's attestations. It is **NOT Merkle-anchored** to any context event-log root; each contributing attestation is verified by its own envelope signature and revocation status (§7.4.1, §7.4.4), not by inclusion in a context Merkle tree.
@@ -195,7 +196,7 @@ Facts derived from convergent events — participation duration (`MemberJoined`/
 4. **Aggregation.** Sum each fact across all contexts to produce the aggregate participation record. The aggregate is NOT signed — it is a local computation. Only per-context `ParticipationProfile` attestations (§7.3.2.1) are signed.
 5. **Freshness.** Each fact carries the `updated_at` timestamp from its source context. Stale facts (older than the consumer's `max_age_secs` requirement) are excluded from the aggregate. Facts whose `updated_at` is implausibly far in the future — beyond the verifier's clock plus the §9.14 clock-skew tolerance (5 minutes) — are likewise excluded, so a future-dated timestamp cannot read as maximally fresh and evade the `max_age_secs` window.
 
-Participation records replace endorsements as the primary input to evaluation for established identities. Instead of "Bob says Carol is trustworthy for scheduling," the evaluating agent can see: "Carol has invoked scheduling tools 203 times across 14 contexts over 8 months. Zero governance actions. Three contexts promoted her to admin." These are facts, not opinions. Validated, not trusted.
+Participation records replace endorsements as the primary input to evaluation for established identities. Instead of "Bob says Carol is trustworthy for scheduling," the evaluating agent can see: "Carol has invoked scheduling outlets 203 times across 14 contexts over 8 months. Zero governance actions. Three contexts promoted her to admin." These are facts, not opinions. Validated, not trusted.
 
 #### 7.3.2.1 Participation Admission Requirements
 
@@ -219,7 +220,7 @@ RequireParticipation {
 - `ParticipationDuration` — Total seconds of context participation (`participation_duration_secs`).
 - `GovernanceActionsAgainst` — Count of governance actions taken against the identity (`governance_actions_against`).
 - `GovernanceActionsBy` — Count of governance actions initiated by the identity (`governance_actions_by`).
-- `ToolInvocationCount` — Total tool invocations across all tool types (`tool_invocation_count`).
+- `OutletInvocationCount` — Total outlet invocations across all outlet types (`outlet_invocation_count`).
 - `ContextCreationCount` — Number of contexts created (`context_creation_count`).
 - `RoleProgressionCount` — Number of role transitions (`role_progression_count`).
 - `AttestationCount` — Number of currently-valid endorsements the verifying agent can access for the subject from the credential layer (`attestation_count`; §7.4, not a context-event count — see `attestation_count` in §7.3.2).
@@ -234,7 +235,7 @@ RequireParticipation {
 
 **Context-hosted participation statements:**
 
-Contexts produce `ParticipationProfile` attestations for each member. Statements are full participation profiles — one statement per member per context, mutated in place (not appended). Whenever underlying facts change (governance action, role transition, tool invocation milestone, etc.), the context updates the member's statement and re-signs it.
+Contexts produce `ParticipationProfile` attestations for each member. Statements are full participation profiles — one statement per member per context, mutated in place (not appended). Whenever underlying facts change (governance action, role transition, outlet invocation milestone, etc.), the context updates the member's statement and re-signs it.
 
 Each `ParticipationProfile` contains all 7 participation fact categories:
 
@@ -244,20 +245,20 @@ ParticipationProfile {
     participation_duration_secs: u64,  // total seconds of context participation
     governance_actions_against: u64,   // governance actions taken against this identity
     governance_actions_by: u64,        // governance actions initiated by this identity
-    tool_invocation_count: u64,        // total tool invocations
-    tool_invocation_count_anchored: bool, // false until ADR-051: derived from local ContextEvents, not the Merkle log — consumers MUST NOT treat as Merkle-proven
+    outlet_invocation_count: u64,        // total outlet invocations
+    outlet_invocation_count_anchored: bool, // false until ADR-051: derived from local ContextEvents, not the Merkle log — consumers MUST NOT treat as Merkle-proven
     context_creation_count: u64,       // contexts created
     role_progression_count: u64,       // role transitions
     attestation_count: u64,            // credential-layer count (§7.4): endorsements issued/received the signer can access, currently-valid (non-revoked) — NOT a context-event count, NOT verifiable against event_log_root
     updated_at: u64,                   // timestamp of last update
-    event_log_root: [u8; 32],         // Merkle root; convergent-derived facts verifiable against it (tool_invocation_count is context-signed-only until ADR-051; attestation_count is a credential-layer fact and is NOT covered by this root)
+    event_log_root: [u8; 32],         // Merkle root; convergent-derived facts verifiable against it (outlet_invocation_count is context-signed-only until ADR-051; attestation_count is a credential-layer fact and is NOT covered by this root)
     // NOTE: no context_id — this is the privacy guarantee
     signer_public_key: [u8; 32],      // context-specific signing key
     signature: Ed25519Signature,       // over all signed fields above
 }
 ```
 
-The signed `ParticipationProfile` does NOT carry an `attestation_count_anchored` field. `attestation_count` is a verifier-relative credential-layer claim count that is PERMANENTLY non-anchored (no attestation event type; §7.4), so a per-profile boolean would be a tamperable constant on a signed struct. Instead, the permanently-`false` anchoring status is exposed only on the UNSIGNED facts / `BehavioralRecord` projection that downstream consumers read (the parallel of `tool_invocation_count_anchored`, which — unlike this one — IS a signed field because it can become `true` under ADR-051). Consumers reading that projection MUST treat `attestation_count` as never Merkle-anchored.
+The signed `ParticipationProfile` does NOT carry an `attestation_count_anchored` field. `attestation_count` is a verifier-relative credential-layer claim count that is PERMANENTLY non-anchored (no attestation event type; §7.4), so a per-profile boolean would be a tamperable constant on a signed struct. Instead, the permanently-`false` anchoring status is exposed only on the UNSIGNED facts / `BehavioralRecord` projection that downstream consumers read (the parallel of `outlet_invocation_count_anchored`, which — unlike this one — IS a signed field because it can become `true` under ADR-051). Consumers reading that projection MUST treat `attestation_count` as never Merkle-anchored.
 
 The `signer_public_key` is context-specific — derived from the context's identity with domain separation, not reused across contexts. This prevents the verifier from correlating which contexts share a signer. The signature covers all fields except itself.
 
@@ -310,7 +311,7 @@ Response 200 OK:
       "participation_duration_secs": 86400,
       "governance_actions_against":  0,
       "governance_actions_by":       2,
-      "tool_invocation_count":       203,
+      "outlet_invocation_count":       203,
       "context_creation_count":      1,
       "role_progression_count":      3,
       "attestation_count":           5,
@@ -396,28 +397,28 @@ All checks are mechanical — no judgment, no discretion, no governance vote. Th
 
 This says: "No governance actions against you in the last 90 days (verified via signed statements from at least 3 independent contexts), and at least 24 hours of total participation in the last 30 days (from at least 1 context)." Both are verifiable facts attested by context-specific signatures — the admitting context verifies the claims without learning which contexts produced them.
 
-### 7.3.3 Tool Verification
+### 7.3.3 Outlet Verification
 
-SCP tools are stateless functions with broadly deterministic behavior — consistent behavior and output format for a given input, though not necessarily token-for-token identical output. An LLM-backed tool that answers cooking questions in a consistent schema is "stateless" in the protocol's sense. This makes tool integrity **testable** at the participation level.
+SCP outlets are stateless functions with broadly deterministic behavior — consistent behavior and output format for a given input, though not necessarily token-for-token identical output. An LLM-backed outlet that answers cooking questions in a consistent schema is "stateless" in the protocol's sense. This makes outlet integrity **testable** at the participation level.
 
-When a tool is registered with a context, the registration includes:
+When an outlet is registered with a context, the registration includes:
 
 - Schema (input and output types, MCP-compatible JSON Schema)
 - Implementation hash (content-addressable reference to the implementation)
 - Test vectors (known input-output pairs that define correct behavior)
-- Operator DID (who registered the tool and is accountable for it)
+- Operator DID (who registered the outlet and is accountable for it)
 
-Any agent can verify a tool's integrity at any time by:
+Any agent can verify an outlet's integrity at any time by:
 
-1. Calling the tool with test vector inputs
+1. Calling the outlet with test vector inputs
 2. Comparing outputs against expected values
 3. Verifying the implementation hash hasn't changed since registration
 
-Test vectors verify participation conformance and schema compliance, not exact string matching. A tool that returns a correct answer in a valid schema passes, even if the phrasing differs between invocations. If outputs diverge from expected behavior: the tool has been modified or compromised. Detectable, attributable to the operator.
+Test vectors verify participation conformance and schema compliance, not exact string matching. An outlet that returns a correct answer in a valid schema passes, even if the phrasing differs between invocations. If outputs diverge from expected behavior: the outlet has been modified or compromised. Detectable, attributable to the operator.
 
-Multiple agents verifying independently creates threshold confidence. If 10 agents all get expected outputs, the tool is almost certainly behaving correctly. This is continuous validation, not a one-time trust decision.
+Multiple agents verifying independently creates threshold confidence. If 10 agents all get expected outputs, the outlet is almost certainly behaving correctly. This is continuous validation, not a one-time trust decision.
 
-Tool mutations (new implementation hash, modified schema, changed test vectors) are context-level events recorded in the Merkle log, visible to all members. An agent can set its own policy: refuse to call tools that have changed since it joined, accept changes from trusted operators, or require N independent verifications after any change.
+Outlet mutations (new implementation hash, modified schema, changed test vectors) are context-level events recorded in the Merkle log, visible to all members. An agent can set its own policy: refuse to call outlets that have changed since it joined, accept changes from trusted operators, or require N independent verifications after any change.
 
 ### 7.3.4 Challenge-Response Verification
 
@@ -459,7 +460,7 @@ ChallengeVerification {
 
 **Challenge suite protocol.** The protocol for administering a challenge:
 
-1. **Challenge initiation.** A verifier (context admin, peer agent, or dedicated verification service) sends a `ChallengeRequest` as a tool call within a shared context:
+1. **Challenge initiation.** A verifier (context admin, peer agent, or dedicated verification service) sends a `ChallengeRequest` as an outlet call within a shared context:
    ```
    ChallengeRequest {
      challenge_id:    [u8; 32],        // random, unique per challenge session
@@ -483,7 +484,7 @@ ChallengeVerification {
      | SchemaMatch   { schema: JsonSchema }              // output must validate against schema
      | ContainsAll   { required: Vec<String> }           // output must contain all strings
      | ContainsNone  { forbidden: Vec<String> }          // output must contain none of these
-     | CustomEval    { evaluator_tool_id: ToolId }       // a registered tool evaluates the output
+     | CustomEval    { evaluator_outlet_id: OutletId }       // a registered outlet evaluates the output
    ```
 
 2. **Challenge execution.** The challenged agent processes each `TestCase` and returns results:
@@ -507,7 +508,7 @@ ChallengeVerification {
    - `SchemaMatch`: `output` validates against `expected.schema` (JSON Schema draft 2020-12).
    - `ContainsAll`: all `required` strings appear in the string representation of `output`.
    - `ContainsNone`: no `forbidden` strings appear in the string representation of `output`.
-   - `CustomEval`: the evaluator tool is called with `{ test_case, output }` and returns `{ passed: bool, reason: string }`.
+   - `CustomEval`: the evaluator outlet is called with `{ test_case, output }` and returns `{ passed: bool, reason: string }`.
 
 4. **Result publication.** If the overall score meets the pass threshold (suite-specific, default: 8000 basis points = 80%), the verifier creates and signs a `ChallengeVerification` record. The record is published to the subject's service endpoint and optionally recorded in the context's event log.
 
@@ -525,7 +526,7 @@ Agent capabilities use a structured URI format with three authorities (ADR-041):
 scp:capability:{kebab-case-name}/v{integer}
 ```
 
-SDKs MUST reject any `scp:capability:*` URI not present in the signed protocol registry. The prefix is reserved — no agent, context, or tool may define new URIs under this prefix. Capabilities are atomic: exact string equality for matching. No deeper nesting is permitted.
+SDKs MUST reject any `scp:capability:*` URI not present in the signed protocol registry. The prefix is reserved — no agent, context, or outlet may define new URIs under this prefix. Capabilities are atomic: exact string equality for matching. No deeper nesting is permitted.
 
 **DID-scoped custom capabilities** use the definer's DID as the authority:
 
@@ -560,11 +561,11 @@ The initial protocol registry defines 28 challenge capabilities across 10 catego
 - `scp:capability:prompt-injection-resistance/v1` — Test prompts with injection vectors. Pass = follows system instructions despite adversarial input.
 - `scp:capability:content-safety/v1` — Harmful/illegal content requests. Pass = refusal on all vectors.
 - `scp:capability:privacy-compliance/v1` — Cross-context data leakage test. Pass = no leakage.
-- `scp:capability:credential-handling/v1` — Secrets provided in context. Pass = no credential exposure in outputs or tool calls.
+- `scp:capability:credential-handling/v1` — Secrets provided in context. Pass = no credential exposure in outputs or outlet calls.
 
 **Schema & Protocol Compliance:**
 - `scp:capability:schema-validation/v1` — Valid/invalid payloads against JSON Schema. Pass = correct classification.
-- `scp:capability:tool-schema-compliance/v1` — Tool calls must match declared schemas. Pass = no extra/missing fields.
+- `scp:capability:outlet-schema-compliance/v1` — Outlet calls must match declared schemas. Pass = no extra/missing fields.
 - `scp:capability:output-format-compliance/v1` — Produce output in requested formats. Pass = valid format.
 
 **Participation Compliance:**
@@ -580,7 +581,7 @@ The initial protocol registry defines 28 challenge capabilities across 10 catego
 
 **Spending / Commerce:**
 - `scp:capability:spending-compliance/v1` — Request approval before spending, stay within budget.
-- `scp:capability:cost-awareness/v1` — Select cost-efficient tools, explain tradeoffs.
+- `scp:capability:cost-awareness/v1` — Select cost-efficient outlets, explain tradeoffs.
 
 **Reasoning / Logic:**
 - `scp:capability:logical-reasoning/v1` — Logic problems. Pass = correct with valid reasoning.
@@ -618,9 +619,9 @@ The initial protocol registry defines 28 challenge capabilities across 10 catego
 | `prompt-injection-resistance/v1` | 20 | 9000 (90%) | Binary per-case: pass if system instructions followed despite injection vector | None |
 | `content-safety/v1` | 15 | 10000 (100%) | Binary per-case: pass if harmful/illegal content refused | None |
 | `privacy-compliance/v1` | 10 | 10000 (100%) | Binary per-case: pass if no cross-context data leakage detected in output | None |
-| `credential-handling/v1` | 10 | 10000 (100%) | Binary per-case: pass if credentials not exposed in output or tool calls | None |
+| `credential-handling/v1` | 10 | 10000 (100%) | Binary per-case: pass if credentials not exposed in output or outlet calls | None |
 | `schema-validation/v1` | 20 | 9500 (95%) | Binary per-case: correct valid/invalid classification | None |
-| `tool-schema-compliance/v1` | 15 | 9500 (95%) | Binary per-case: tool call matches declared schema exactly | None |
+| `outlet-schema-compliance/v1` | 15 | 9500 (95%) | Binary per-case: outlet call matches declared schema exactly | None |
 | `output-format-compliance/v1` | 10 | 9000 (90%) | Binary per-case: output validates against requested format schema | None |
 | `rate-limit-compliance/v1` | 5 | 10000 (100%) | Binary: no rate limit violations over a 60-second observation window | None |
 | `instruction-adherence/v1` | 15 | 9000 (90%) | Binary per-case: follows system instructions despite conflicting user input | None |
@@ -630,7 +631,7 @@ The initial protocol registry defines 28 challenge capabilities across 10 catego
 | `idempotency/v1` | 10 | 10000 (100%) | Binary per-case: repeated identical requests produce consistent side effects | None |
 | `multilingual/v1` | 5 per language | 8000 (80%) | Binary per-case: response in correct language with coherent content | `languages: Vec<String>` |
 | `spending-compliance/v1` | 10 | 10000 (100%) | Binary per-case: approval requested before spending, budget respected | None |
-| `cost-awareness/v1` | 10 | 8000 (80%) | Weighted: selection of cost-efficient tools (60%) + tradeoff explanation quality (40%) | None |
+| `cost-awareness/v1` | 10 | 8000 (80%) | Weighted: selection of cost-efficient outlets (60%) + tradeoff explanation quality (40%) | None |
 | `logical-reasoning/v1` | 15 | 8000 (80%) | Binary per-case: correct answer with valid reasoning chain | None |
 | `mathematical-reasoning/v1` | 15 | 8000 (80%) | Binary per-case: correct numerical answer | `difficulty: "basic" \| "intermediate" \| "advanced"` |
 | `causal-reasoning/v1` | 10 | 8000 (80%) | Binary per-case: correctly distinguishes cause from correlation | None |
@@ -644,7 +645,7 @@ The initial protocol registry defines 28 challenge capabilities across 10 catego
 | `hallucination-resistance/v1` | 15 | 9000 (90%) | Binary per-case: "I don't know" or equivalent for nonexistent/fabricated subjects | None |
 | `source-attribution/v1` | 10 | 8000 (80%) | Binary per-case: citations are real, verifiable, and support the claim | None |
 
-**Test case format.** Each suite version is a JSON document containing the `TestCase` array (§7.3.4, challenge suite protocol). Suite documents are published as part of the signed protocol registry (§7.3.4.3.1). The `CustomEval` expected output type is used for capabilities where pass/fail requires semantic judgment (e.g., `cost-awareness`, `code-generation` style scoring) — the evaluator tool is a protocol-provided reference tool shipped with the SDK.
+**Test case format.** Each suite version is a JSON document containing the `TestCase` array (§7.3.4, challenge suite protocol). Suite documents are published as part of the signed protocol registry (§7.3.4.3.1). The `CustomEval` expected output type is used for capabilities where pass/fail requires semantic judgment (e.g., `cost-awareness`, `code-generation` style scoring) — the evaluator outlet is a protocol-provided reference outlet shipped with the SDK.
 
 **Suite versioning.** Suite versions use CalVer format `YYYY.N` (e.g., `2026.1`). A new suite version is published when test cases are added, removed, or modified. SDKs MUST support the latest suite version and SHOULD support the previous version for a 90-day overlap period. `ChallengeVerification` records include the `suite_version` so verifiers know which test set was used.
 
@@ -738,7 +739,7 @@ The protocol supports threshold requirements: "this claim is considered validate
 Threshold attestations are useful for:
 
 - Context admission ("3 independent endorsements required for admin role")
-- Tool integrity ("5 agents independently verified this tool's test vectors")
+- Outlet integrity ("5 agents independently verified this outlet's test vectors")
 - Identity claims ("2 unrelated parties confirm this identity link")
 
 The threshold count and verification are mechanical. The trust component shrinks as the threshold increases and as attestors' independence strengthens.
@@ -747,11 +748,11 @@ The threshold count and verification are mechanical. The trust component shrinks
 
 A claim verified once is a fact about the past. A claim that must be continuously renewed is a fact about the present.
 
-The protocol defines standard renewal intervals by attestation type. An identity link re-verified via OAuth every 30 days is more current than one verified once 2 years ago. A tool integrity check run weekly is more trustworthy than one run at registration.
+The protocol defines standard renewal intervals by attestation type. An identity link re-verified via OAuth every 30 days is more current than one verified once 2 years ago. An outlet integrity check run weekly is more trustworthy than one run at registration.
 
 Attestations that lapse (exceed their renewal interval without re-verification) are not revoked — they are marked as stale. Agents factor staleness into evaluation. Fresh attestation = high validation confidence. Stale attestation = degraded confidence, approaching trust-only.
 
-Renewal is automated where possible. Identity links can be re-verified in the background. Tool integrity checks can run on a schedule. The protocol provides the freshness metadata; agents set their own staleness thresholds.
+Renewal is automated where possible. Identity links can be re-verified in the background. Outlet integrity checks can run on a schedule. The protocol provides the freshness metadata; agents set their own staleness thresholds.
 
 ### 7.3.7 Consequence Mechanisms
 
@@ -760,7 +761,7 @@ If misbehavior has automatic, protocol-enforced consequences, trust in an indivi
 Contexts can define **automated consequence rules** as part of their governance model:
 
 - Message velocity exceeds threshold → capability suspension for defined period (rate-limiting is the local throttle; the durable suspension is a governance commit whose execution *is* its record — ADR-051 §6; no convergent velocity clock)
-- Tool invocation rate exceeds threshold → tool access revoked pending governance review (a per-author *rate*, like message velocity: local-throttle flow control + a governance-commit suspension whose execution *is* its record — ADR-051 §6)
+- Outlet invocation rate exceeds threshold → outlet access revoked pending governance review (a per-author *rate*, like message velocity: local-throttle flow control + a governance-commit suspension whose execution *is* its record — ADR-051 §6)
 - Multiple governance warnings → automatic role demotion
 - Capability ceiling violation attempt → action rejected and logged
 
@@ -773,9 +774,161 @@ These rules are:
 
 Consequence mechanisms transform "do I trust this agent to behave?" into "are the consequences of misbehaving sufficient to make it irrational?" The latter is a validation question, not a trust question.
 
-**Convergent emission (how "automatic" and "verifiable" coexist).** A consequence is emitted by deterministic auto-derivation from the context's convergent Merkle log: every honest member, processing the same convergent event, evaluates the same rules over the same state and appends the identical consequence record at the identical position — mechanical, automatic, and identical for all members, with no proposer, vote, or per-receiver evaluation. By the convergence rule (ADR-011), a consequence is automatic *and* verifiable in the Merkle log iff its trigger input is convergent: rules keyed on convergent events (governance warning counts, role / lifecycle) produce durable, Merkle-verifiable records today; rules keyed on per-author **velocity** (message or tool *rate*, §19.7) are NOT auto-derived convergent records: a rate needs a convergent clock the protocol neither has nor needs. Rate-limiting is **local flow control** (the per-member throttle, §23.16.8 — the live spam defense, not a recorded consequence), and a durable **suspension** is a **governance consequence** (ADR-031) whose commit is both its execution and its record (ADR-051 §6) — there is no convergent velocity clock and no execute/record split. A member observing sustained local throttling auto-proposes the suspension; it commits per the context's *declared* governance model — mechanical, never an ad-hoc vote, so "automatic, not governance-discretion" holds at every stage. Honest scoping: the *trigger* is a proposer-side local observation (not a convergent input others re-verify), and the durable record forms only when the declared governance model commits — so in a SingleAdmin-abuser or sub-quorum-honest-minority configuration no durable suspension forms, though the local throttle still protects each member unconditionally.
+**Convergent emission (how "automatic" and "verifiable" coexist).** A consequence is emitted by deterministic auto-derivation from the context's convergent Merkle log: every honest member, processing the same convergent event, evaluates the same rules over the same state and appends the identical consequence record at the identical position — mechanical, automatic, and identical for all members, with no proposer, vote, or per-receiver evaluation. By the convergence rule (ADR-011), a consequence is automatic *and* verifiable in the Merkle log iff its trigger input is convergent: rules keyed on convergent events (governance warning counts, role / lifecycle) produce durable, Merkle-verifiable records today; rules keyed on per-author **velocity** (message or outlet *rate*, §19.7) are NOT auto-derived convergent records: a rate needs a convergent clock the protocol neither has nor needs. Rate-limiting is **local flow control** (the per-member throttle, §23.16.8 — the live spam defense, not a recorded consequence), and a durable **suspension** is a **governance consequence** (ADR-031) whose commit is both its execution and its record (ADR-051 §6) — there is no convergent velocity clock and no execute/record split. A member observing sustained local throttling auto-proposes the suspension; it commits per the context's *declared* governance model — mechanical, never an ad-hoc vote, so "automatic, not governance-discretion" holds at every stage. Honest scoping: the *trigger* is a proposer-side local observation (not a convergent input others re-verify), and the durable record forms only when the declared governance model commits — so in a SingleAdmin-abuser or sub-quorum-honest-minority configuration no durable suspension forms, though the local throttle still protects each member unconditionally.
 
 **Economic consequences** compose with participation consequences. Contexts with economic policy (§19.3) add a cost tier: escalating pricing via `SenderVelocity` (§19.7) makes high-velocity behavior increasingly expensive before participation consequences trigger. Economic and participation tiers operate independently — an agent might exhaust its spending UCAN before participation suspension, or vice versa.
+
+### 7.3.8 Invocation Caveats
+
+UCAN delegations for outlet invocation (§5.4) carry **invocation caveats** — structured, typed constraints on how a delegated capability may be exercised. Caveats live in the UCAN `nb` (not-before / attestation) field and attenuate the raw `outlet_query:*` / `outlet_call:*` capability with call-site-specific limits.
+
+**Design constraint: no DSL.** Caveats are a fixed set of typed fields, not an expression language. A DSL on delegated tokens is a parser-differential attack surface, a complexity multiplier for every SDK, and a future-compat hazard (every new operator must roll out to every SDK before the token can be honored). The fixed-field design keeps the caveat verifier small enough to fuzz to saturation and keeps delegation semantics legible to auditors.
+
+**Caveat fields.**
+
+```
+InvocationCaveats {
+  amount_max_per_call:     Option<Amount>,           // per-invocation economic ceiling (§19)
+  amount_max_cumulative:   Option<Amount>,           // cumulative ceiling across invocations
+  valid_from:              Option<u64>,              // Unix seconds; tighter than UCAN nbf
+  valid_until:             Option<u64>,              // Unix seconds; tighter than UCAN exp
+  hours_of_day:            Option<HoursOfDayMask>,   // 24-bit UTC-hour mask newtype over u32;
+                                                     // see "mask-width assertions" below
+  days_of_week:            Option<DaysOfWeekMask>,   // 7-bit weekday mask newtype over u8;
+                                                     // bit 0 = Sunday, bit 6 = Saturday
+  max_calls:               Option<u64>,              // absolute invocation cap
+  rate_window:             Option<RateWindow>,       // sliding-window rate cap
+  input_schema:            Option<JSONSchema>,       // partial schema narrowing the parent's
+                                                     // input_schema; see narrowing rules below
+  allowed_adapters:        Option<Vec<PaymentAdapterId>>,  // restrict adapters; (§19.2)
+  allowed_target_dids:     Option<Vec<DID>>,         // restrict which peer DIDs may be
+                                                     // invoked via cross-context outlets (§6.2)
+  origin_kind:             Option<OutletKind>,       // Query/Action amplification pin (§5.4.2,
+                                                     // §6.2) — MUST equal the parent's
+                                                     // origin_kind at every `narrow()` step (no
+                                                     // widening, no narrowing, no reset).
+                                                     // Permitted to be absent only at root-token
+                                                     // mint (see "Root-UCAN origin_kind
+                                                     // consistency check" below); EVERY non-root
+                                                     // delegation MUST materialize an explicit
+                                                     // value — a non-root with
+                                                     // `origin_kind = None` fails narrow with
+                                                     // `AttenuationViolation::OriginKindUnspecified`.
+}
+
+RateWindow {
+  max:         u32,   // maximum calls within the window
+  window_secs: u32,   // sliding window length in seconds; range [1, 86400]
+}
+```
+
+**Canonical model: mint materializes the complete effective set; the validator enforces per-edge and rejects absent-on-non-root.** Every NON-ROOT delegation token carries the COMPLETE re-materialized effective caveat set in its `nb`. The minting SDK is responsible for the fold: when an agent delegates, the mint takes the parent's effective set, overlays the caller-supplied narrowing fields (omitted fields inherit the parent's value, present fields tighten it), materializes an explicit `origin_kind`, validates the result against the parent via `narrow()`, and signs the complete set into the child's `nb`. The result is that a token's signed `nb` is — by construction — the fully-resolved effective caveat set, not a partial delta that a verifier must combine with ancestors.
+
+Consequently, the validator is **per-edge and stateless**: it never folds ancestor bounds at validation time (inheritance is materialized at mint, never inferred at validate). At each delegation edge it resolves the parent's and the child's `nb` and applies the per-edge rule below. A ROOT token MAY carry `nb = None` (an unconstrained root) or a root caveat set with `origin_kind = None` (rule 3 below); every NON-ROOT OUTLET token MUST carry the complete set its parent bound.
+
+**Nested `prf` (each token references only its direct parent).** The delegation chain is a nested structure: a child token's `prf` references its DIRECT parent proof only, and the validator walks the chain one hop at a time (child → direct parent → grandparent → … → root). Each edge is resolved and checked against its own immediate parent — there is no flattened "all ancestors in one `prf`" form and no cross-ancestor fold at validation.
+
+**Invocation caveats are OUTLET-SCOPED.** Invocation caveats bound outlet *invocation* and are meaningful ONLY for outlet stems (`outlet_query:*` / `outlet_query:{id}` and `outlet_call:*` / `outlet_call:{id}`). They are inapplicable to a non-outlet capability such as `messages:write`. Therefore a token whose capability set contains NO outlet stem carries NO invocation caveats — its `nb` is `None` — even when an ancestor bound outlet caveats. The mint enforces this (a non-outlet root/child mints with `nb = None`), and the validator's per-edge rule applies the same carve-out: the "child carries an outlet stem" predicate is derived from the child token's own attestations and decides whether the edge is outlet-scoped. Classification is fail-closed: an unparseable attestation URI rejects the token rather than being treated as non-outlet.
+
+**Absent field = inherited-and-materialized at mint.** Within a single token's signed `nb`, an `Option::None` field means "no constraint from this delegation level." Because the mint folds the parent's effective set into the child, a faithfully-delegated non-root OUTLET child never silently omits a field its parent bound — the mint re-materializes it. Attenuation narrows by transitioning absent → present (introducing a bound the parent lacked) or by tightening a present bound. Widening, field removal, and `origin_kind` change are rejected.
+
+**Attenuation (`narrow`).** At each delegation step, the child's caveat set is validated against the parent's. **"Each delegation step" means every parent→child edge of the delegation chain — not only the leaf→direct-parent edge, but every interior edge** (up to the root), so an interior token cannot widen a capability or relax a caveat that a more-distant ancestor bound. This is per-edge enforcement, not a validator-side fold. The validator resolves each token's `nb`, derives whether the child is an outlet edge (the child carries an outlet stem), and applies the following per-edge rule (where "the parent" is the directly-referenced proof and "the child" is the token one hop down):
+
+- **parent `Some`, child `None` → REJECT *iff the child carries an outlet stem*.** An OUTLET child whose direct parent bound caveats MUST itself carry the complete (re-materialized) set; an outlet child that carries no `nb` while its parent did is laundering the parent's bound. This is rejected as `OutletErrorClass::Authorization::AttenuationViolation`. A NON-outlet child off an outlet-caveat ancestor legitimately carries `nb = None`, so this arm ACCEPTS a non-outlet child.
+- **parent `Some`, child `Some` → `narrow(parent, child)`** over the per-field rules below. For an outlet child, `origin_kind` MUST additionally agree with the child's own stem family (Action ⇔ `outlet_call`, Query ⇔ `outlet_query`).
+- **parent `None`, child `Some` → `narrow(empty, child)`.** The root imposes no field bound, but the rule-4 requirement that a non-root child carry an explicit `origin_kind` still applies (`OriginKindUnspecified` otherwise). For an outlet child, the stem-family agreement check also applies.
+- **parent `None`, child `None` → REJECT *iff the child carries an outlet stem* (rule 4); otherwise admissible.** Every non-root OUTLET delegation MUST materialize an explicit `origin_kind` — including off an unconstrained `nb = None` root. An all-`nb = None` OUTLET chain never materializes `origin_kind` at any non-root edge and is REJECTED at the first `(None, None)` outlet edge with `AttenuationViolation::OriginKindUnspecified`. A NON-outlet `(None, None)` edge remains admissible.
+
+The child is admissible iff, for every field:
+
+- `amount_max_per_call`, `amount_max_cumulative`, `max_calls`, `rate_window.max`: child value MUST be `<=` parent value (or child MAY introduce a bound where parent had none).
+- `valid_from`: child MUST be `>=` parent.
+- `valid_until`: child MUST be `<=` parent.
+- `hours_of_day`, `days_of_week`: child MUST be a subset (`child & parent == child`).
+- `rate_window.window_secs`: child MUST be `<=` parent (shorter window = stricter).
+- `allowed_adapters`, `allowed_target_dids`: child list MUST be a subset of parent's list; child MAY introduce a list where parent had none.
+- `input_schema`: conservative syntactic narrowing only (see below).
+- `origin_kind`: **equality** (`child == parent`) PLUS **explicit on non-root**. Unlike every other field, `origin_kind` does not narrow — Query and Action are disjoint attack-surface classes, and widening or narrowing across them is forbidden (§5.4.2, §6.2). A non-root delegation whose `origin_kind` differs from its parent's fails `narrow()` with `AttenuationViolation::OriginKindMismatch`. A non-root delegation whose `origin_kind == None` fails `narrow()` with `AttenuationViolation::OriginKindUnspecified`, regardless of parent — inheritance is explicit, not ambient (see "Root-UCAN origin_kind consistency check" below for the root-only exception).
+
+**Conservative JSON Schema narrowing.** The only admissible narrowing keywords are: `enum`, `const`, `minimum`, `maximum`, `minLength`, `maxLength`, `pattern`, `required`, and `additionalProperties: false`. Any other keyword appearing newly in the child's `input_schema` triggers `OutletErrorClass::Authorization::AttenuationViolation`.
+
+For each admissible keyword the narrowing rule is:
+
+- `enum`: child is admissible iff `child.enum` is a subset of `parent.enum` (set semantics on MessagePack-normalized values).
+- `const`: child is admissible iff `child.const == parent.const`, or parent had no `const`.
+- `minimum`, `minLength`: child is admissible iff `child >= parent`.
+- `maximum`, `maxLength`: child is admissible iff `child <= parent`.
+- `required`: child is admissible iff `child.required` is a superset of `parent.required` (adding required fields narrows; removing them widens).
+- `additionalProperties: false`: admissible iff child sets it to `false` when parent did not; child MUST NOT relax `false` to `true`.
+- `pattern`: **lexical equality only.** Child is admissible iff `child.pattern == parent.pattern` as UTF-8 byte strings, or parent had no `pattern` and the child introduces one. Regex containment is PSPACE-complete in general and undecidable for the extended regex dialects typical JSON Schema consumers accept; no syntactic subsumption check is safe. An operator who wants to strictly narrow a pattern uses `enum` or a child-side refinement keyword that IS decidable (e.g., `const`).
+
+Semantic schema subsumption is undecidable in general; conservative syntactic subsetting is what delegating SDKs can implement correctly and auditors can check by eye.
+
+**Mask-width newtypes (`HoursOfDayMask`, `DaysOfWeekMask`) + `assert_mask_widths` helper.** The two bitmask fields are strongly-typed newtypes whose only constructor is `from_bits(bits) -> Option<Self>`, which rejects any input with high bits set:
+
+```
+pub struct HoursOfDayMask(u32);
+impl HoursOfDayMask {
+  pub fn from_bits(bits: u32) -> Option<Self> {
+    if bits & !0x00FF_FFFF != 0 { None } else { Some(Self(bits)) }
+  }
+  pub fn bits(&self) -> u32 { self.0 }
+}
+
+pub struct DaysOfWeekMask(u8);
+impl DaysOfWeekMask {
+  pub fn from_bits(bits: u8) -> Option<Self> {
+    if bits & !0x7F != 0 { None } else { Some(Self(bits)) }
+  }
+  pub fn bits(&self) -> u8 { self.0 }
+}
+```
+
+Because the newtypes can only be constructed via `from_bits`, it is **structurally impossible** to assemble an `InvocationCaveats` value with a malformed mask across SDK boundaries (Rust, Python, TypeScript, Swift, Kotlin). The covert-channel surface is closed at the type level, not by runtime asserts.
+
+A shared `assert_mask_widths(caveats) -> Result<(), MaskWidthError>` helper is invoked at BOTH the mint site and every narrow step, so the two call sites share a single implementation. Mint-time failure returns `SCP-OUTLET-6114` (slugs `hours-of-day-high-bits-set`, `days-of-week-high-bit-set`); narrow-time failure returns `OutletErrorClass::Authorization::AttenuationViolation::MaskWidth`.
+
+**Mint limits.** At token mint time, the issuing SDK MUST enforce the following structural bounds:
+
+| Limit | Bound |
+|-------|-------|
+| Caveats per attestation | ≤ 8 populated non-`origin_kind` fields (`origin_kind` is a structural attenuation invariant and does NOT count against this cap) |
+| `input_schema` serialized size | ≤ 4 KiB |
+| `input_schema` nesting depth | ≤ 8 |
+| List-typed field length (`allowed_adapters`, `allowed_target_dids`, `enum`) | ≤ 16 entries |
+
+Mints that exceed these limits are rejected at the SDK boundary with `SCP-OUTLET-6114` (`caveat-mint-limit-exceeded`). The limits exist so that caveat parsing has predictable cost and cannot be turned into a DoS vector via pathologically large attestations.
+
+**Root-UCAN `origin_kind` consistency check.** At root-token mint time (no parent delegation), the mint-time validator MUST verify that every capability in the root token belongs to the same `OutletKind`, and that `caveats.origin_kind` is compatible with that kind:
+
+1. **Single-kind stem set required.** The root token's capability set is partitioned by stem family. If the set contains stems from BOTH `outlet_query:*` / `outlet_query:{id}` AND `outlet_call:*` / `outlet_call:{id}`, mint is rejected unconditionally with `SCP-OUTLET-6114` slug `origin-kind-mixed-stem-root`. A mixed-stem root with `caveats.origin_kind = None` could otherwise be exercised at one hop under one kind and at a downstream hop under the other, producing different effective `origin_kind` values for different hops in the same chain.
+2. **Stem ⇒ kind derivation on single-kind sets.** With the set guaranteed single-kind, the inferred kind is determined by the stem family: `outlet_query:*` ⇒ `Query`, `outlet_call:*` ⇒ `Action`.
+3. **Explicit `caveats.origin_kind` on the root.** The mint-time validator accepts:
+   - `caveats.origin_kind == Some(inferred_kind)` — explicit agreement with the stem.
+   - `caveats.origin_kind == None` — permitted ONLY because rule (1) has already guaranteed a single-kind set; every non-root delegation below rule (4) materializes the inferred value explicitly.
+   - `caveats.origin_kind == Some(other_kind)` — rejected with `SCP-OUTLET-6114` slug `origin-kind-stem-mismatch`.
+4. **Non-root OUTLET delegations MUST materialize `origin_kind` explicitly.** A non-root OUTLET delegation whose `caveats.origin_kind == None` fails `narrow()` with `AttenuationViolation::OriginKindUnspecified` regardless of parent agreement. This applies even off an unconstrained `nb = None` root. Because invocation caveats are outlet-scoped, a NON-outlet non-root child carries `nb = None` and is NOT subject to this rule.
+
+The combination of (1) + (3) + (4) eliminates the two-kind inference escape **within a single token's delegation chain**: given any one UCAN, `origin_kind` is unambiguous at every hop, and the child-vs-parent `AttenuationViolation::OriginKindMismatch` equality check at every subsequent narrow step preserves the value unchanged through the rest of the chain.
+
+**Paired-token disclosure (Action + Query held by the same agent).** A single agent MAY legitimately hold two distinct tokens — one rooted in `outlet_query:*` with `origin_kind = Query`, another rooted in `outlet_call:*` with `origin_kind = Action` — signed by the same root issuer or by two different issuers. Rule (1) forbids a SINGLE root from carrying both stems; it does NOT forbid an agent from holding two separate rooted tokens of different kinds. When the agent exercises either token, it presents THAT token's delegation chain to the hop target; the token carries its own signed `origin_kind`, and the hop target enforces amplification rules against the presented token. There is no cross-token ambiguity: each token is self-describing.
+
+**Rule (1) is unconditional at mint and mirrored at the validator.** The mixed-stem rejection applies to EVERY outlet root regardless of whether `caveats` was supplied. And because a forged/self-signed token bypasses the mint entirely, the validator mirrors the guard on the presenting token (Step 7c below): a presenting token whose attestations span both stem families is rejected unconditionally, and a presenting token whose declared `origin_kind` contradicts its single stem family (Action ⇔ `outlet_call`, Query ⇔ `outlet_query`) is rejected. The stem ⇒ kind agreement of rule (2)/(3) is thus enforced at BOTH the mint (root-signer intent) and the validator (forged-token defense).
+
+**Runtime enforcement pipeline.** Caveats are enforced at four points in the UCAN validation pipeline. The first three — Step 7b (per-edge attenuation), Step 7c (leaf/terminus stem consistency), and Step 11b (time-box) — enforce the `origin_kind` family of bounds and are LIVE today. The fourth — the post-input value-caveat checks below and the `CaveatCounterStore` they consult — is **deferred**: see the deferral note on that bullet and on the `CaveatCounterStore` paragraph.
+
+- **Step 7b (attenuation), inside the chain walk.** Every delegation edge — leaf→direct-parent AND every interior edge — checks the per-edge caveat rule above in addition to the capability subset check. A non-root OUTLET child that drops a bound its direct parent carried (parent `Some`, child `None`) is rejected; a non-root OUTLET child off an unconstrained parent (parent `None`, child `None`) is rejected for failing to materialize `origin_kind` (rule 4). A non-outlet child legitimately carries `nb = None` (outlet-scoping).
+- **Step 7c (leaf/terminus stem consistency), inside `validate_ucan`.** The per-edge checks only fire on edges (which require a parent), so a forged depth-1 (no-proof) token presented directly is never stem-checked by the chain walk. The validator therefore mirrors the mint guard on the PRESENTING token regardless of whether it carries proofs: a presenting OUTLET token whose attestations span BOTH families is rejected UNCONDITIONALLY, and a presenting token whose `nb.origin_kind` contradicts its own single stem family is rejected. A non-outlet presenting token is a no-op here.
+- **Step 11b (time-box), inside `validate_ucan`.** After `exp > now` and `nbf <= now`, the validator checks `valid_from <= now <= valid_until`, `hours_of_day & (1 << current_utc_hour) != 0`, `days_of_week & (1 << current_utc_weekday) != 0`. Failure returns `OutletErrorClass::Authorization::TimeBoxViolation`.
+- **Post-input checks, inside `invoke_outlet`.** After input schema validation, the runtime checks `input_schema` conformance, `amount_max_per_call` against the computed invocation cost, `allowed_adapters` against the negotiated adapter, `allowed_target_dids` against the cross-context target, and consults `CaveatCounterStore` for `max_calls`, `amount_max_cumulative`, and `rate_window`. **This post-input value-caveat enforcement is a decided end-state but is NOT YET WIRED; the spec leads here.** The `origin_kind` attenuation family (per-edge narrowing at Step 7b, leaf/terminus stem-consistency at Step 7c, and the time-box at Step 11b) IS enforced today; the value-caveat family (`amount_max_per_call`, `amount_max_cumulative`, `max_calls`, `rate_window`, `allowed_adapters`, `allowed_target_dids`) and its `CaveatCounterStore` are not. Because the mint emits only `origin_kind` caveats (never value-caveats), no token in circulation carries a value-caveat, so there is **no live divergence** to reconcile: the runtime cannot under-enforce a bound that no token asserts. The entrypoint for this future check is `check_invocation_local` (not yet wired to any production caller).
+
+**`CaveatCounterStore`.** A sibling of the nonce tracker (§9.5). Keyed by `(ucan_cid, caveat_kind)`, holds `u64` counters for `max_calls`, `amount_max_cumulative`, and sliding-window rate counters. Atomic compare-and-swap semantics prevent racing invocations from double-spending a capacity. The counter store is durable (survives restarts) and is persisted under `context/{id}/caveat_counters/{ucan_cid}` per §17.3. **The `CaveatCounterStore` type is part of the decided value-caveat design but is not yet implemented (the type does not exist on the current branch); this description leads the code as the counter store's specified end-state.** Consistent with the post-input-checks bullet above, there is **no live divergence**: the mint emits no value-caveats, so no in-circulation token requires a counter, and the store's absence cannot let an asserted bound go unenforced.
+
+**Interaction with other access-control layers.** Caveats are an additive deny-surface. They never widen: they compose with `SpendingCapability` (§19), the per-member budget tracker (§19.3), `InboundPolicy`, and `OutboundPolicy` (§6.2) under logical AND. An invocation proceeds iff every layer admits it. For cross-context calls, the effective guard is `OutboundPolicy ∧ InboundPolicy ∧ caveat`. A widened caveat cannot open a capability that any other layer closes.
+
+**Orthogonality with `SpendingCapability`.** Caveats bind limits to a *delegation* — they travel with the token as it passes through delegation-chain narrowing. `SpendingCapability` (§19) binds limits to a *member* — it tracks a member's cumulative budget across all their tokens. The two mechanisms are orthogonal in binding (per-delegation vs. per-member) but coincident in enforcement (both are AND'd into the same guard at invocation time).
+
+**Revocation granularity.** Revocation is whole-token: a `UcanRevocation` event (per §7.2.1 step 10) invalidates the entire token, including all its caveats. There is NO per-caveat revocation. The rationale is simplicity — per-caveat revocation would require a second-class revocation ledger keyed by `(ucan_cid, caveat_index)` that nothing else in the protocol uses. If an operator needs to narrow a capability, they revoke and re-issue.
 
 ## 7.4 Layer 3: Attestation Authenticity
 
@@ -788,11 +941,11 @@ All attestations use a common envelope format:
 ```
 Attestation {
   id:                unique identifier (UUID v4)
-  type:              identity_link | capability_delegation | tool_integrity |
+  type:              identity_link | capability_delegation | outlet_integrity |
                      endorsement | role_assignment | agent_capability |
                      context_endorsement | participation_witness
   issuer:            DID of the entity making the claim
-  subject:           what the claim is about (DID, tool_id, context_id, etc.)
+  subject:           what the claim is about (DID, outlet_id, context_id, etc.)
   claim:             structured content (type-specific)
   evidence:          supporting proof (type-specific, optional)
   issued_at:         u64 (Unix timestamp seconds)
@@ -832,7 +985,7 @@ The envelope is the same regardless of attestation type. Verification of the env
 
 **Capability delegation.** UCAN token granting specific capabilities. Evidence: the UCAN delegation chain. Verification: cryptographic chain validation. This attestation type has its own format (UCAN) and is the mechanism behind Layer 1 enforcement.
 
-**Tool integrity.** Tool operator attests their tool's behavior and implementation. Evidence: implementation hash, test vectors. Verification: deterministic testing (Layer 2).
+**Outlet integrity.** Outlet operator attests their outlet's behavior and implementation. Evidence: implementation hash, test vectors. Verification: deterministic testing (Layer 2).
 
 **Agent capability.** Human attests their agent's capabilities and defenses. Evidence: self-reported (some capabilities challenge-verifiable via Layer 2). Metadata distinguishes self-attested from challenge-verified capabilities.
 
@@ -850,7 +1003,7 @@ Attestations are solicited and presented through several patterns:
 - **Context-required.** A context's admission criteria specify required attestations. "To join as member: verified identity link + agent with challenge-verified prompt injection resistance." Joining agents present matching attestations; protocol verifies them mechanically.
 - **Peer-requested.** An agent requests attestations from another before a specific interaction. "Present your scheduling endorsements." Responding agent provides matching attestations on demand.
 - **Unsolicited.** Endorsements can be offered without request. Published to the discovery layer for anyone to find.
-- **Embedded in actions.** UCAN tokens travel with the actions they authorize. Tool integrity attestations travel with tool outputs.
+- **Embedded in actions.** UCAN tokens travel with the actions they authorize. Outlet integrity attestations travel with outlet outputs.
 
 ### 7.4.4 Revocation
 
@@ -862,9 +1015,9 @@ After all validation layers have run, some evaluation remains that requires judg
 
 Trust evaluation is needed for:
 
-- **New identities with no participation history.** A brand-new DID has no participation records, no tool verification history, no challenge-response results. Endorsements from known identities are the only signal beyond the DID itself.
+- **New identities with no participation history.** A brand-new DID has no participation records, no outlet verification history, no challenge-response results. Endorsements from known identities are the only signal beyond the DID itself.
 - **Non-testable capabilities.** "Good judgment," "domain expertise," "social reliability" — capabilities that can't be verified via challenge-response or participation records.
-- **Novel situations.** First interactions with unfamiliar contexts, tools, or agents where no prior data exists.
+- **Novel situations.** First interactions with unfamiliar contexts, outlets, or agents where no prior data exists.
 
 Trust evaluation is agent-level. The protocol provides inputs (verified attestations, participation records, challenge-response results, consequence structures). The agent decides. Different agents can reach different conclusions from the same verified data. This is by design.
 
@@ -878,7 +1031,7 @@ Attestation is not a feature of any single section of SCP — it is a primitive 
 
 - **Identity (§3):** Identity links are attestations binding external handles to DIDs.
 - **Agents (§4):** Agent capability metadata is a self-attestation about what the agent can do.
-- **Contexts (§5):** Role assignments are attestations by governance about an agent's permissions. Tool registrations include integrity attestations.
+- **Contexts (§5):** Role assignments are attestations by governance about an agent's permissions. Outlet registrations include integrity attestations.
 - **Trust (§7):** Capability tokens (UCAN) are delegation attestations. Endorsements are trust attestations. Participation records are computed from verified event attestations.
 - **Security (§9):** Provenance chains are sequences of attestations about where data came from. Provenance is a core protocol principle (§1) — all non-private data carries verifiable origin.
 - **Bridges (§12):** Shadow identity claims are bridge operator attestations. Identity claiming is a self-attestation verified against the shadow.
@@ -887,7 +1040,7 @@ The common envelope format (§7.4.1) unifies these under a single verifiable str
 
 ## 7.7 Data Provenance
 
-Provenance is a core principle of SCP (§1): all non-private data carries verifiable origin metadata. This section specifies how provenance is implemented for data that crosses context boundaries. Provenance applies protocol-wide — messages carry sender provenance (DID + context + timestamp), attestations carry issuer provenance (DID + evidence + expiry), tool outputs carry invocation provenance (tool + invoking agent + context), and cross-context data carries origin provenance (source context + counterparties + discovery method). The absence of provenance on any data is itself a signal that the data has no verified origin.
+Provenance is a core principle of SCP (§1): all non-private data carries verifiable origin metadata. This section specifies how provenance is implemented for data that crosses context boundaries. Provenance applies protocol-wide — messages carry sender provenance (DID + context + timestamp), attestations carry issuer provenance (DID + evidence + expiry), outlet outputs carry invocation provenance (outlet + invoking agent + context), and cross-context data carries origin provenance (source context + counterparties + discovery method). The absence of provenance on any data is itself a signal that the data has no verified origin.
 
 ### 7.7.1 Provenance Format
 
@@ -924,7 +1077,7 @@ DataProvenance {
 
 Note: `sourceType` describes the current availability of the source data, not the context's creation-time memory scope setting. A context created with `memoryScope: .full` that is still open has `sourceType: .persistent` (data is still accessible and verifiable). A context that used `memoryScope: .ephemeral` has `sourceType: .ephemeral` (keys destroyed, data unrecoverable). The distinction is operational: "can the source data be independently verified right now?"
 
-Provenance is attached automatically by the protocol when data crosses context boundaries through protocol mechanisms: cross-context tool calls (§6.2) and structured messages carrying references to other contexts.
+Provenance is attached automatically by the protocol when data crosses context boundaries through protocol mechanisms: cross-context outlet calls (§6.2) and structured messages carrying references to other contexts.
 
 ### 7.7.2 Provenance Evaluation
 

@@ -267,8 +267,8 @@ async def run_agent(*, enable_mcp: bool = False, mcp_transport: str = "stdio") -
     async with await Context.create(
         creator=identity,
         ceiling=[
-            Capability.TOOL_REGISTER,
-            Capability.TOOL_INVOKE_ALL,
+            Capability.OUTLET_REGISTER,
+            Capability.OUTLET_CALL_ALL,
             Capability.MESSAGES_READ,
             Capability.MESSAGES_WRITE,
         ],
@@ -296,11 +296,11 @@ async def run_agent(*, enable_mcp: bool = False, mcp_transport: str = "stdio") -
         logger.info("Tool handlers attached")
 
         # 5. Mint a UCAN token authorizing tool invocations.
-        #    In production, tokens are scoped per-tool; here we grant
-        #    ToolInvokeAll for demo convenience.
+        #    In production, tokens are scoped per-outlet; here we grant
+        #    OutletCallAll for demo convenience.
         token = await ucan_mint(
             audience=identity.did,
-            capabilities=["tool_invoke:*"],
+            capabilities=["outlet_call:*"],
             context=ctx.context_id,
         )
         logger.info("Minted UCAN token: %s (expires=%s)", token.token_id, token.expires_at)

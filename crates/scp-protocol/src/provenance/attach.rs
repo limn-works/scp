@@ -103,7 +103,7 @@ pub struct PaymentInfo {
 
 /// Attaches provenance metadata when data crosses a context boundary.
 ///
-/// Called automatically by the protocol on cross-context tool interface calls
+/// Called automatically by the protocol on cross-context outlet interface calls
 /// and structured messages. Populates all [`DataProvenance`] fields from the
 /// source context state and increments `chain_depth` from any existing
 /// provenance on the data.

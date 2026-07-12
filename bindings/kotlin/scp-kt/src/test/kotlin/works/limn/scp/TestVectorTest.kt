@@ -1,6 +1,6 @@
 // TestVectorTest.kt — Unit tests for TestVector data class (#1096)
 //
-// Verifies that the TestVector type matches scp-core::context::tools::TestVector:
+// Verifies that the TestVector type matches scp-core::context::outlets::TestVector:
 // description, input, and expectedOutput fields are stored and forwarded correctly.
 //
 // Provenance: spec §7.3.3, ADR-010 (phase-2), issue #1096

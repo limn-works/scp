@@ -25,7 +25,7 @@
 //!   `identity_resolve`).
 //! - [`context`] — Context lifecycle (create, join, leave, close, send,
 //!   subscribe).
-//! - [`tools`] — Tool registration, invocation, and verification.
+//! - [`outlets`] — Outlet registration, invocation, and verification.
 //! - [`transport`] — Transport connection and status.
 //! - [`ucan`] — UCAN token management (validate, mint, revoke).
 //! - [`event_log`] — Event log queries and Merkle proofs.
@@ -130,12 +130,12 @@ pub mod event_log;
 pub mod identity;
 pub mod mcp;
 pub mod media;
+pub mod outlets;
 pub mod provenance;
 pub mod runtime;
 pub mod scp;
 pub mod scpid;
 pub mod sync;
-pub mod tools;
 pub mod transport;
 pub mod trust;
 pub mod ucan;

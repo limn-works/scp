@@ -101,14 +101,15 @@ pub use bridge::{
     Identity,
     McpAllowlistState,
     McpInvokeResult,
+    McpOutletInfo,
     McpServerConfig,
-    McpToolInfo,
     MemoryScope,
     Message,
+    OutletDefinition,
+    OutletKind,
+    OutletVerificationResult,
     Proof,
     ScpError,
-    ToolDefinition,
-    ToolVerificationResult,
     TransportManager,
     TransportStatus,
     TrustInput,
@@ -144,7 +145,7 @@ pub use bridge::{
     // Free functions — sync (#370)
     sync_classify_offline,
     sync_classify_offline_custom,
-    // Free functions — tools
+    // Free functions — outlets
     // Free functions — UCAN
 };
 // Phase D (#1695): `scpid_sign` free-function re-export deleted — use

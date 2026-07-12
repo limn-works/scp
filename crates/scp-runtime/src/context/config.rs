@@ -27,8 +27,8 @@ use std::time::Duration;
 
 use scp_did::DID;
 use scp_protocol::context::params::{
-    Capability, ContextParams, GovernanceModel, MemoryScope, RoleDefinition, TemplateId,
-    ToolRegistration,
+    Capability, ContextParams, GovernanceModel, MemoryScope, OutletRegistration, RoleDefinition,
+    TemplateId,
 };
 
 // ---------------------------------------------------------------------------
@@ -95,7 +95,7 @@ pub enum ContextCreation {
 /// Flat options-object for context creation (ADR-052 / construction.md).
 ///
 /// Carries the required [`ContextCreation`] choice plus the shared optional
-/// fields (`ttl`, `tools`). Lower it into protocol [`ContextParams`] with
+/// fields (`ttl`, `outlets`). Lower it into protocol [`ContextParams`] with
 /// [`ContextConfig::into_params`], or pass it directly to
 /// [`Supervisor::create`](crate::context::supervisor::Supervisor::create).
 ///
@@ -124,15 +124,15 @@ pub struct ContextConfig {
     /// duration. Templates that require a TTL reject `None`; templates that
     /// forbid a TTL reject `Some(_)` at creation (fail-loud).
     pub ttl: Option<Duration>,
-    /// Tool registrations available within the context. For the template path,
-    /// supplied tools override the template's own tools only when non-empty
+    /// Outlet registrations available within the context. For the template path,
+    /// supplied outlets override the template's own outlets only when non-empty
     /// (see [`ContextConfig::into_params`]).
-    pub tools: Vec<ToolRegistration>,
+    pub outlets: Vec<OutletRegistration>,
 }
 
 impl ContextConfig {
     /// Returns a [`ContextConfig`] with the required `creation` choice and
-    /// fail-safe defaults for the remaining fields (`ttl: None`, no tools).
+    /// fail-safe defaults for the remaining fields (`ttl: None`, no outlets).
     ///
     /// This is the M4 `defaults(required…)` factory: it takes the irreducible
     /// required field so the spread idiom
@@ -142,7 +142,7 @@ impl ContextConfig {
         Self {
             creation,
             ttl: None,
-            tools: Vec::new(),
+            outlets: Vec::new(),
         }
     }
 
@@ -154,11 +154,11 @@ impl ContextConfig {
     ///
     /// - **`Template`** — starts from [`ContextParams::from_template`] (the
     ///   canonical template resolution; templates return `ttl: None`), applies
-    ///   the config `ttl` override, and overrides `tools` **only when the caller
-    ///   supplied tools**. Empty `tools` leaves the template's own tools intact,
-    ///   so a template that disallows tools is not corrupted into a mismatch;
+    ///   the config `ttl` override, and overrides `outlets` **only when the caller
+    ///   supplied outlets**. Empty `outlets` leaves the template's own outlets intact,
+    ///   so a template that disallows outlets is not corrupted into a mismatch;
     ///   the protocol's `validate_against_template` then fails loud if supplied
-    ///   tools do not match a template that defines its own. The template's
+    ///   outlets do not match a template that defines its own. The template's
     ///   `template_id` is preserved. The bilateral `peer` is returned to the
     ///   caller.
     /// - **`Explicit`** — fills the four explicit fields and leaves
@@ -169,14 +169,14 @@ impl ContextConfig {
         let Self {
             creation,
             ttl,
-            tools,
+            outlets,
         } = self;
         match creation {
             ContextCreation::Template { template, peer } => {
                 let mut params = ContextParams::from_template(template);
                 params.ttl = ttl;
-                if !tools.is_empty() {
-                    params.tools = tools;
+                if !outlets.is_empty() {
+                    params.outlets = outlets;
                 }
                 (params, peer)
             }
@@ -191,7 +191,7 @@ impl ContextConfig {
                     roles,
                     governance,
                     memory_scope,
-                    tools,
+                    outlets,
                     ttl,
                     template_id: None,
                     ..ContextParams::default()
@@ -212,7 +212,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn template_no_ttl_no_tools_lowers_to_from_template() {
+    fn template_no_ttl_no_outlets_lowers_to_from_template() {
         // BilateralPersistent forbids a TTL, so `ttl: None` is the valid form.
         // The lowered params must equal the equivalent
         // `ContextParams::from_template` path — proving the front-end produces
@@ -276,11 +276,11 @@ mod tests {
     }
 
     #[test]
-    fn explicit_carries_ttl_and_tools() {
+    fn explicit_carries_ttl_and_outlets() {
         let ttl = Duration::from_hours(1);
         let config = ContextConfig {
             ttl: Some(ttl),
-            tools: Vec::new(),
+            outlets: Vec::new(),
             creation: ContextCreation::Explicit {
                 ceiling: vec![Capability::MessagesRead],
                 roles: vec![],
@@ -335,7 +335,7 @@ mod tests {
             peer: None,
         });
         assert_eq!(config.ttl, None);
-        assert!(config.tools.is_empty());
+        assert!(config.outlets.is_empty());
         match config.creation {
             ContextCreation::Template { template, peer } => {
                 assert_eq!(template, TemplateId::Coordination);

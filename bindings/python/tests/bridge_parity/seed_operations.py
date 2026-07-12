@@ -26,7 +26,7 @@ full rationale. Non-context ops (identity_create, scpid_sign error paths,
 transport_status) need no supervisor and keep the bare `SCP({"type": "in_memory"})` constructor.
 
 Current op library: 12 ops. The first 5 are the MVP per ADR-046;
-ops 6-10 cover tool registration, UCAN mint/validate-error, transport
+ops 6-10 cover outlet registration, UCAN mint/validate-error, transport
 status, and filtered event-log query; op 11 pins the
 unregistered-DID rejection code (SCP-IDENT-1001) across every bridge;
 the structured `ucan_evaluate` op pins the six-boolean
@@ -160,7 +160,7 @@ class OpContext:
         Storage-required model (ADR-049 / spec §17.6): the PyO3 runtime
         never defaults storage, and `PyBridgeInstance::new_py` (the bare
         `SCP({"type": "in_memory"})` constructor) carries no storage backend. Any context /
-        event-log / tool / UCAN-with-context op therefore needs a
+        event-log / outlet / UCAN-with-context op therefore needs a
         supervisor attached *with* a storage backend first, otherwise the
         supervisor build fails closed and the op surfaces SCP-CTX-2001.
 
@@ -574,22 +574,22 @@ OP_SIGN_MESSAGE = OpSpec(
 
 
 # ---------------------------------------------------------------------------
-# op 6: tool_register
+# op 6: outlet_register
 #
-# Register a single tool in a fresh context. The tool_id is derived
-# deterministically across all three bridges from the tool name via the
-# shared `format!("tool-{}", name.replace(' ', "-").to_lowercase())`
-# convention (see scp-ffi/src/tools.rs, scp-ffi/napi/src/tools.rs,
-# scp-ffi/uniffi/src/bridge.rs — all three
-# use the same format). That makes tool_id byte-exact for parity.
+# Register a single outlet in a fresh context. The outlet_id is derived
+# deterministically across all three bridges from the outlet name via the
+# shared `format!("outlet-{}", name.replace(' ', "-").to_lowercase())`
+# convention (see scp-ffi/common/src/outlet_id.rs, consumed by
+# scp-ffi/src, scp-ffi/napi/src, scp-ffi/uniffi/src/bridge.rs — all three
+# use the same format). That makes outlet_id byte-exact for parity.
 # ---------------------------------------------------------------------------
 
 
-# Ceiling must include `tool:register` to permit the registration action.
-_TOOL_CEILING = ["messages:read", "messages:write", "tool:register", "tool_invoke:*"]
-_TOOL_NAME = "parity_probe"
-_EXPECTED_TOOL_ID = f"tool-{_TOOL_NAME}"
-_TOOL_SCHEMA: dict[str, Any] = {
+# Ceiling must include `outlet:register` to permit the registration action.
+_OUTLET_CEILING = ["messages:read", "messages:write", "outlet:register", "outlet_call:*"]
+_OUTLET_NAME = "parity_probe"
+_EXPECTED_OUTLET_ID = f"outlet-{_OUTLET_NAME}"
+_OUTLET_SCHEMA: dict[str, Any] = {
     "input_schema": {
         "type": "object",
         "properties": {"x": {"type": "integer"}, "label": {"type": "string"}},
@@ -601,41 +601,43 @@ _TOOL_SCHEMA: dict[str, Any] = {
 }
 
 
-def _py_tool_register(ctx: OpContext) -> dict[str, Any]:
+def _py_outlet_register(ctx: OpContext) -> dict[str, Any]:
     scp, identity = ctx.attached_scp()
     handle = scp.context_create(
         identity.did,
-        {"name": "parity-tools", "mode": "encrypted", "ceiling": _TOOL_CEILING},
+        {"name": "parity-outlets", "mode": "encrypted", "ceiling": _OUTLET_CEILING},
     )
-    tool_id = scp.tool_register(
+    outlet_id = scp.outlet_register(
         handle.context_id,
         {
-            "name": _TOOL_NAME,
-            "description": "parity harness probe tool",
+            "name": _OUTLET_NAME,
+            "description": "parity harness probe outlet",
+            "kind": "action",
             "operator_did": identity.did,
-            "schema": _TOOL_SCHEMA,
+            "schema": _OUTLET_SCHEMA,
         },
     )
-    return {"tool_id": tool_id}
+    return {"outlet_id": outlet_id}
 
 
-OP_TOOL_REGISTER = OpSpec(
-    name="tool_register",
-    py_call=_py_tool_register,
+OP_OUTLET_REGISTER = OpSpec(
+    name="outlet_register",
+    py_call=_py_outlet_register,
     node_call={
-        "op": "tool_register",
+        "op": "outlet_register",
         "args": {
-            "name": _TOOL_NAME,
-            "description": "parity harness probe tool",
-            "schema": _TOOL_SCHEMA,
-            "ceiling": _TOOL_CEILING,
+            "name": _OUTLET_NAME,
+            "description": "parity harness probe outlet",
+            "kind": "action",
+            "schema": _OUTLET_SCHEMA,
+            "ceiling": _OUTLET_CEILING,
         },
     },
-    schema=OpSchema(fields=(FieldSpec("tool_id", "exact"),)),
-    # Spec-pin the derivation: `tool-{name-lowercased-spaces-to-dashes}`.
+    schema=OpSchema(fields=(FieldSpec("outlet_id", "exact"),)),
+    # Spec-pin the derivation: `outlet-{name-lowercased-spaces-to-dashes}`.
     # Joint drift (e.g. all bridges hash instead of format) would pass
     # parity step 3 but violate the shared convention; this locks it.
-    expected_values=(("tool_id", _EXPECTED_TOOL_ID),),
+    expected_values=(("outlet_id", _EXPECTED_OUTLET_ID),),
 )
 
 
@@ -1119,7 +1121,7 @@ SEED_OPS: tuple[OpSpec, ...] = (
     OP_INVALID_CAPABILITY,
     OP_EVENT_LOG_APPEND,
     OP_SIGN_MESSAGE,
-    OP_TOOL_REGISTER,
+    OP_OUTLET_REGISTER,
     OP_UCAN_MINT,
     OP_UCAN_VALIDATE_MALFORMED,
     OP_UCAN_EVALUATE_MALFORMED,

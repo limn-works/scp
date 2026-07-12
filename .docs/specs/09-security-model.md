@@ -4,9 +4,9 @@
 
 1. **Every action traces to a human.** No anonymous actors. No unaccountable software. Every action is distinguishable as human-direct (`#active`) or agent-autonomous (`#agent`) by the verification method used to sign it (ADR-039).
 2. **Agents are context-bound.** No protocol-level cross-context awareness or communication for agents.
-3. **Tools are stateless and non-agentic.** They compute, they don't act.
+3. **Outlets are stateless and non-agentic.** They compute, they don't act.
 4. **One agent per person per context.** No fleet multiplication within a space. Structurally enforced via DID document cardinality — exactly one `#agent` verification method per DID document (ADR-039).
-5. **Contexts are isolated by default.** No transitive exposure. Cross-context data flow only through two explicit, opt-in mechanisms: tool interfaces (asymmetric, §6.2) and multi-parent child contexts (symmetric, §5.13).
+5. **Contexts are isolated by default.** No transitive exposure. Cross-context data flow only through two explicit, opt-in mechanisms: outlet interfaces (asymmetric, §6.2) and multi-parent child contexts (symmetric, §5.13).
 6. **Role assignment is non-negotiable.** Agents cannot request elevated permissions.
 7. **Context metadata is transparent.** Full legibility before opt-in.
 8. **Apps are capability-scoped.** The SDK enforces declaration contracts — apps receive scoped handles that expose only declared capabilities. API calls exceeding declared capabilities are rejected at the call site (§8.4.2).
@@ -25,7 +25,7 @@ Per-field limits are defined where each field is specified: context names and de
 
 **Context spoofing.** Creating a context that impersonates a legitimate one. Mitigation: contexts are cryptographic entities; you opt into a key, not a name. Name-based spoofing is a client-layer problem.
 
-**Context poisoning.** Degrading a legitimate context from within. Mitigation: role-based permissions limit what members can do; governance model controls who can change configuration; context creators are accountable identities; automated consequence mechanisms (§7.3.7) enforce participation boundaries mechanically; verifiable event logs (§7.3.1) make all actions auditable; tool integrity verification (§7.3.3) detects compromised tools. Note: poisoning by a legitimate member acting within their permissions is attributable but not preventable at the protocol level — the protocol makes the poisoner identifiable and the damage legible, enabling governance response.
+**Context poisoning.** Degrading a legitimate context from within. Mitigation: role-based permissions limit what members can do; governance model controls who can change configuration; context creators are accountable identities; automated consequence mechanisms (§7.3.7) enforce participation boundaries mechanically; verifiable event logs (§7.3.1) make all actions auditable; outlet integrity verification (§7.3.3) detects compromised outlets. Note: poisoning by a legitimate member acting within their permissions is attributable but not preventable at the protocol level — the protocol makes the poisoner identifiable and the damage legible, enabling governance response.
 
 **Bait and switch.** Attractive context changes its purpose after gaining members. Mitigation: capability ceilings (potentially immutable) limit what a context can ever do. Expanding capabilities requires a new context with fresh opt-ins (if immutability is adopted).
 
@@ -33,64 +33,64 @@ Per-field limits are defined where each field is specified: context names and de
 
 **Permission creep.** Gradual expansion of what a context demands. Mitigation: capability ceilings. If mutable, mutations require governance approval and are visible to all members.
 
-**Metastatic growth (cancer).** Legitimate-looking cascading expansion through the network. Mitigation: agents can't cross contexts (primary defense); context participation rate limits per human; bridging only through governed tool interfaces (§6.2) or multi-parent child contexts (§5.13) — both require explicit governance consent. Nesting depth limits (§5.13.8) bound cascading expansion through child contexts. Ceiling intersection (§5.13.1) means each level of nesting can only narrow capabilities, converging on empty ceilings at depth.
+**Metastatic growth (cancer).** Legitimate-looking cascading expansion through the network. Mitigation: agents can't cross contexts (primary defense); context participation rate limits per human; bridging only through governed outlet interfaces (§6.2) or multi-parent child contexts (§5.13) — both require explicit governance consent. Nesting depth limits (§5.13.8) bound cascading expansion through child contexts. Ceiling intersection (§5.13.1) means each level of nesting can only narrow capabilities, converging on empty ceilings at depth.
 
 **Betrayer / insider threat.** Compromised accountable identity using legitimate trust to cause damage. Mitigation: granular revocation (per-capability, per-agent, per-context); damage contained to contexts the betrayer is in; agents can't carry damage across context boundaries.
 
-**Context infection.** Poisoned data flowing through legitimate cross-context mechanisms — tool interfaces (§6.2) or multi-parent child contexts (§5.13). Mitigation: content provenance via hash chains (data carries its origin context and chain path, §7.7.1); tool interface validation at receiving context; velocity limits on propagation (content bridged N times in M minutes is flagged); child context ceiling intersection (§5.13.1) limits what capabilities poisoned data can exploit at each nesting level. Protocol makes infection legible and traceable, can't permanently prevent it.
+**Context infection.** Poisoned data flowing through legitimate cross-context mechanisms — outlet interfaces (§6.2) or multi-parent child contexts (§5.13). Mitigation: content provenance via hash chains (data carries its origin context and chain path, §7.7.1); outlet interface validation at receiving context; velocity limits on propagation (content bridged N times in M minutes is flagged); child context ceiling intersection (§5.13.1) limits what capabilities poisoned data can exploit at each nesting level. Protocol makes infection legible and traceable, can't permanently prevent it.
 
 **Agent slot rental.** Someone with a trusted identity operating agents on another's instructions. Mitigation: one agent per context limits the value; earned capacity means new identities can't immediately scale; fleet coherence signals may detect behavior inconsistent with a single human's intent. Partially mitigated, not fully solved.
 
 **Malicious bridge operator.** A bridge operator (§12) who fabricates shadow messages, drops messages, injects false attestations, or correlates activity across contexts. Note: bridge connectors (translation infrastructure) are not MLS group members, but the bridge operator's DID IS an MLS group member admitted through context governance (§12.6.1) — the operator can read all MLS-encrypted messages. This is an inherent property of bidirectional bridging, which is why bridge admission is a governance decision visible in context metadata (§5.7). Mitigation: bridge provenance (§12.5) makes bridge-originated content distinguishable; bridge registration is per-context (§12.6) limiting correlation; context governance can revoke a bridge at any time (§12.2); attestation freshness checks (§7.4.4) limit false attestation lifetime. See §12.6.2 for the complete bridge threat model.
 
-### 9.2.1 Tool Interface Abuse Vectors and Mitigations
+### 9.2.1 Outlet Interface Abuse Vectors and Mitigations
 
-Information crosses context boundaries through two protocol-level mechanisms: tool interfaces (§6.2) for asymmetric, structured interactions and multi-parent child contexts (§5.13) for symmetric collaboration. All inter-agent coordination flows through these governed mechanisms. Tool interfaces concentrate structured cross-context data flow on a single, auditable surface. The following abuse patterns target that surface specifically. Nesting-related security properties are addressed in §5.13.1 (ceiling inheritance), §5.13.2 (eligibility enforcement), and §5.13.5 (lifecycle coupling).
+Information crosses context boundaries through two protocol-level mechanisms: outlet interfaces (§6.2) for asymmetric, structured interactions and multi-parent child contexts (§5.13) for symmetric collaboration. All inter-agent coordination flows through these governed mechanisms. Outlet interfaces concentrate structured cross-context data flow on a single, auditable surface. The following abuse patterns target that surface specifically. Nesting-related security properties are addressed in §5.13.1 (ceiling inheritance), §5.13.2 (eligibility enforcement), and §5.13.5 (lifecycle coupling).
 
-**1. Broad-schema tools as covert messaging channels.**
+**1. Broad-schema outlets as covert messaging channels.**
 
-*Attack:* A context exposes a tool with a deliberately broad schema — `input: { payload: string }, output: { response: string }` — creating a de facto free-form messaging channel that wears the governance mask of a "tool call." Both contexts opted in, the schema is valid, rate limits pass, provenance is attached, but the semantic constraint that tool calls carry structured, bounded data is gone.
+*Attack:* A context exposes an outlet with a deliberately broad schema — `input: { payload: string }, output: { response: string }` — creating a de facto free-form messaging channel that wears the governance mask of a "outlet call." Both contexts opted in, the schema is valid, rate limits pass, provenance is attached, but the semantic constraint that outlet calls carry structured, bounded data is gone.
 
-*Mitigation — minimum viable tool schema.* Tool schemas MUST satisfy structural constraints enforced at registration time (§5.4). The protocol rejects tool registrations that violate these constraints:
+*Mitigation — minimum viable outlet schema.* Outlet schemas MUST satisfy structural constraints enforced at registration time (§5.4). The protocol rejects outlet registrations that violate these constraints:
 
-- **No unbounded string-only interfaces.** A tool schema where both the input and output consist solely of unconstrained string or bytes fields is rejected. At least one input or output field must be a non-string primitive, enum, array with typed elements, or structured object. This prevents the degenerate case of arbitrary message pipes while permitting legitimate tools that accept or return text alongside structured data.
-- **Schema specificity floor.** Tool schemas must declare at least two distinct fields in either input or output (or both). A single-field `{ query: string } → { result: string }` interface is the minimum viable message pipe; requiring structural complexity makes it harder to masquerade.
-- **Schema is immutable per registration.** Modifying a tool's schema creates a new registration with a new implementation hash (§5.4). Counterparties that connected to the old schema must re-consent to the new one. This prevents gradual schema broadening after trust is established.
+- **No unbounded string-only interfaces.** An outlet schema where both the input and output consist solely of unconstrained string or bytes fields is rejected. At least one input or output field must be a non-string primitive, enum, array with typed elements, or structured object. This prevents the degenerate case of arbitrary message pipes while permitting legitimate outlets that accept or return text alongside structured data.
+- **Schema specificity floor.** Outlet schemas must declare at least two distinct fields in either input or output (or both). A single-field `{ query: string } → { result: string }` interface is the minimum viable message pipe; requiring structural complexity makes it harder to masquerade.
+- **Schema is immutable per registration.** Modifying an outlet's schema creates a new registration with a new implementation hash (§5.4). Counterparties that connected to the old schema must re-consent to the new one. This prevents gradual schema broadening after trust is established.
 
-These constraints don't prevent a sufficiently creative attacker from encoding arbitrary messages in structured fields (steganography). The defense is not impermeability — it's raising the cost and making the attempt legible. A tool schema that looks suspiciously like a messaging pipe (e.g., `{ message_type: enum, payload: string }`) is a signal that governance tools and participation analysis can flag.
+These constraints don't prevent a sufficiently creative attacker from encoding arbitrary messages in structured fields (steganography). The defense is not impermeability — it's raising the cost and making the attempt legible. An outlet schema that looks suspiciously like a messaging pipe (e.g., `{ message_type: enum, payload: string }`) is a signal that governance tools and participation analysis can flag.
 
 **2. Hub contexts as cross-context data aggregators.**
 
-*Attack:* A single context accumulates tool interfaces to many other contexts, becoming a hub that aggregates cross-context information flowing through its interfaces. Each interface is bilateral and governed, but the hub sees data from all of them — a surveillance context masquerading as infrastructure.
+*Attack:* A single context accumulates outlet interfaces to many other contexts, becoming a hub that aggregates cross-context information flowing through its interfaces. Each interface is bilateral and governed, but the hub sees data from all of them — a surveillance context masquerading as infrastructure.
 
 *Mitigation — interface count as observable metadata.*
 
-- **Interface count is visible in context metadata (§5.7).** The number of active inbound and outbound tool interfaces is part of a context's legible metadata. Before joining a context or connecting a tool interface to it, agents can see how many other interfaces it maintains. A context with 50 outbound interfaces is visibly different from one with 2 — and that visibility enables informed decisions.
+- **Interface count is visible in context metadata (§5.7).** The number of active inbound and outbound outlet interfaces is part of a context's legible metadata. Before joining a context or connecting an outlet interface to it, agents can see how many other interfaces it maintains. A context with 50 outbound interfaces is visibly different from one with 2 — and that visibility enables informed decisions.
 - **Behavioral topology signals.** The systemic defense philosophy (§9.4) applies: monitor structural metadata, not content. A context that rapidly accumulates interfaces, maintains interfaces to contexts in unrelated domains, or exhibits high-volume cross-interface data flow is topologically anomalous. These patterns are detectable by network-level participation analysis without inspecting content.
 - **Provenance chain depth.** Data flowing through a hub carries provenance (§7.7). If data enters the hub from Context A and exits to Context C, the provenance chain records both hops. Context C sees that data originated in A and passed through the hub. Deep provenance chains — data that has crossed multiple context boundaries — naturally attract additional scrutiny (§7.7.2). This is a feature, not a limitation: trust should degrade with indirection.
 
 *Design note:* This vector is partially inherent to any system that allows cross-boundary data flow. The protocol's contribution is making the aggregation visible and the data flow traceable, not preventing hub formation entirely. Legitimate service contexts (discovery registries, translation services) are hubs by design — the difference is that their interface patterns are consistent with their declared purpose.
 
-**3. Chained tool calls as amplification.**
+**3. Chained outlet calls as amplification.**
 
-*Attack:* Context A calls Context B's tool. B's implementation calls Context C's tool. C calls D. A single call from A cascades with potential exponential fanout. Each hop is independently rate-limited, but A's rate limit only constrains the first hop.
+*Attack:* Context A calls Context B's outlet. B's implementation calls Context C's outlet. C calls D. A single call from A cascades with potential exponential fanout. Each hop is independently rate-limited, but A's rate limit only constrains the first hop.
 
 *Mitigation — chain depth limit and provenance-based cost attribution.*
 
-- **Context-configurable chain depth limit.** Tool calls carry a `chain_depth` counter, incremented on each cross-context hop. Contexts configure a maximum via `max_chain_depth` in `ContextParams` (default: 8 hops, range [1, 255]). The effective limit is `context.max_chain_depth.unwrap_or(8)`. A tool call at the effective depth limit cannot trigger further cross-context tool calls. There is no protocol hard maximum — chain depth is a context concern, and provenance quality naturally degrades with depth (§24), providing the correct trust signal. The context-configurable limit allows stricter enforcement where desired (§24.4, ADR-043).
-- **Provenance carries chain depth.** The provenance record (§7.7.1) includes the chain depth at each hop. Receiving contexts see how many boundaries the data has crossed. This enables depth-aware trust evaluation: data at chain depth 1 (direct tool call) carries stronger provenance than data at chain depth 3 (three intermediaries).
-- **Per-window rate limiting across chains.** Each context enforces rate limits on both inbound and outbound tool calls within a sliding time window. A context that receives a burst of inbound tool calls (even from different source contexts) throttles proportionally. This prevents amplification where many chains converge on a single target. Economic rate limits (§19.7) complement participation rate limits — cost escalation via `SenderVelocity` makes high-velocity patterns increasingly expensive, providing an economic deterrent that operates independently of and in parallel with participation throttling.
+- **Context-configurable chain depth limit.** Outlet calls carry a `chain_depth` counter, incremented on each cross-context hop. Contexts configure a maximum via `max_chain_depth` in `ContextParams` (default: 8 hops, range [1, 255]). The effective limit is `context.max_chain_depth.unwrap_or(8)`. An outlet call at the effective depth limit cannot trigger further cross-context outlet calls. There is no protocol hard maximum — chain depth is a context concern, and provenance quality naturally degrades with depth (§24), providing the correct trust signal. The context-configurable limit allows stricter enforcement where desired (§24.4, ADR-043).
+- **Provenance carries chain depth.** The provenance record (§7.7.1) includes the chain depth at each hop. Receiving contexts see how many boundaries the data has crossed. This enables depth-aware trust evaluation: data at chain depth 1 (direct outlet call) carries stronger provenance than data at chain depth 3 (three intermediaries).
+- **Per-window rate limiting across chains.** Each context enforces rate limits on both inbound and outbound outlet calls within a sliding time window. A context that receives a burst of inbound outlet calls (even from different source contexts) throttles proportionally. This prevents amplification where many chains converge on a single target. Economic rate limits (§19.7) complement participation rate limits — cost escalation via `SenderVelocity` makes high-velocity patterns increasingly expensive, providing an economic deterrent that operates independently of and in parallel with participation throttling.
 - **Provenance degradation as trust signal.** Transitive provenance degradation is not a flaw — it is the protocol working as designed. Data from many degrees of separation away should be less trusted, the same way a message from a stranger deserves more scrutiny than one from a known contact. The chain depth in provenance gives the receiving agent the information to calibrate trust: "this data originated three hops away in a context I have no relationship with" is a meaningful signal. The protocol ensures this signal is always available; the agent decides how to weight it.
 
-**4. Stateful tool session resource exhaustion.**
+**4. Stateful outlet session resource exhaustion.**
 
-*Attack:* An attacker opens many stateful tool sessions (§6.2.1) against a target context, never closing them. Session state accumulates, exhausting the target's resources.
+*Attack:* An attacker opens many stateful outlet sessions (§6.2.1) against a target context, never closing them. Session state accumulates, exhausting the target's resources.
 
 *Mitigation — per-caller session cap and optional TTL.*
 
 - **Per-caller session cap.** A context limits the number of concurrent active sessions per calling context. Context-configurable via `ContextParams::session_cap` (default: 1000, range [1, u32 max]). Attempts to open additional sessions from the same caller are rejected until existing sessions close or expire. This is the primary resource exhaustion defense — it bounds the damage any single caller can inflict regardless of session duration.
-- **Optional TTL for time-bounded sessions.** The tool's context MAY set a TTL on sessions. When set, expired sessions are garbage-collected automatically. When not set, sessions persist for the context's lifetime — appropriate for app-hosted sessions (games, workspaces, collaborative tools) where the context is the lifecycle boundary.
-- **Session cost is borne by the tool's context.** Session state is internal to the tool's context. The tool's context chooses to offer stateful sessions, chooses whether to impose TTLs, and accepts the storage cost. This aligns incentives: contexts that offer sessions manage their own resource budget.
+- **Optional TTL for time-bounded sessions.** The outlet's context MAY set a TTL on sessions. When set, expired sessions are garbage-collected automatically. When not set, sessions persist for the context's lifetime — appropriate for app-hosted sessions (games, workspaces, collaborative tools) where the context is the lifecycle boundary.
+- **Session cost is borne by the outlet's context.** Session state is internal to the outlet's context. The outlet's context chooses to offer stateful sessions, chooses whether to impose TTLs, and accepts the storage cost. This aligns incentives: contexts that offer sessions manage their own resource budget.
 
 **5. Context proliferation for connectivity.**
 
@@ -112,50 +112,50 @@ The distinction that matters is between **meaningful proliferation** (standing c
 
 - **Auto-accept policies (§5.12.2)** handle the common case autonomously. For contexts matching a known template from a known DID with acceptable TTL, the SDK joins without human involvement. The human is only in the loop for novel or high-risk invitations.
 - **Invitation rate limiting.** The SDK rate-limits inbound invitations per source DID and globally. An attacker flooding invitations from multiple DIDs is bounded by the global rate limit. Invitations that exceed the rate limit are queued (not dropped) with decreasing priority.
-- **The bottleneck is intentional.** For novel relationships (strangers, unusual templates, tool-bearing contexts), human facilitation is the correct behavior — the protocol forces deliberate evaluation where trust hasn't been established. This is the security boundary working as designed, not a flaw. The same way a firewall throttles unknown connections, the human bridge throttles unknown relationships.
+- **The bottleneck is intentional.** For novel relationships (strangers, unusual templates, outlet-bearing contexts), human facilitation is the correct behavior — the protocol forces deliberate evaluation where trust hasn't been established. This is the security boundary working as designed, not a flaw. The same way a firewall throttles unknown connections, the human bridge throttles unknown relationships.
 
 **7. Governance capture over interface decisions.**
 
-*Concern:* Context admins unilaterally control which tool interfaces to expose and connect. In single-admin governance, members have no visibility into or veto over interface decisions.
+*Concern:* Context admins unilaterally control which outlet interfaces to expose and connect. In single-admin governance, members have no visibility into or veto over interface decisions.
 
 *Mitigation — event log transparency and governance evolution.*
 
-- **All interface operations are logged.** Tool interface creation, connection, disconnection, and modification are protocol events recorded in the verifiable event log (§7.3.1). Members can see every interface decision the admin has made, when, and to which contexts. No silent interface changes.
-- **Interface metadata is visible.** Active tool interfaces are part of context metadata (§5.7). Members see what interfaces exist before joining and while participating.
+- **All interface operations are logged.** Outlet interface creation, connection, disconnection, and modification are protocol events recorded in the verifiable event log (§7.3.1). Members can see every interface decision the admin has made, when, and to which contexts. No silent interface changes.
+- **Interface metadata is visible.** Active outlet interfaces are part of context metadata (§5.7). Members see what interfaces exist before joining and while participating.
 - **Governance evolution.** Single-admin governance is the Phase 2 minimum. The pluggable governance interface (§5.9) supports multi-sig, consensus, and voting models where interface decisions require member approval. Contexts that need member control over interfaces use governance models that provide it. This is not deferred — the governance interface is specified and multi-party models are implemented. ADR-031 (Phase 6, `.docs/adrs/phase-6.md`) specifies four governance engines: `SingleAdminEngine`, `ThresholdEngine` (M-of-N), `MajorityVoteEngine`, and `UnanimityEngine`. All are implemented (SCP-129 through SCP-133).
 - **Exit as veto.** Any member can leave a context at any time. If the admin connects the context to an interface the member disagrees with, the member leaves. In an environment where context creation is cheap (§5.12), members can create a new context without the objectionable interface and migrate — the social graph is portable (§8.3).
 
-**8. Caller/tool asymmetry in peer interactions.**
+**8. Caller/outlet asymmetry in peer interactions.**
 
-*Concern:* Tool calls have inherent caller/tool asymmetry. One side requests, the other responds. This forces symmetric interactions (negotiation, collaboration) into a client/server pattern.
+*Concern:* Outlet calls have inherent caller/outlet asymmetry. One side requests, the other responds. This forces symmetric interactions (negotiation, collaboration) into a client/server pattern.
 
-*Resolution — shared contexts provide symmetric interaction; tool calls serve asymmetric use cases.*
+*Resolution — shared contexts provide symmetric interaction; outlet calls serve asymmetric use cases.*
 
-This is not a flaw — it is correct role assignment. Tool calls are inherently asymmetric because cross-context data flow should be structured, directional, and governed. Symmetric peer interaction — two agents collaborating as equals — belongs in a shared context where both have equivalent roles and permissions.
+This is not a flaw — it is correct role assignment. Outlet calls are inherently asymmetric because cross-context data flow should be structured, directional, and governed. Symmetric peer interaction — two agents collaborating as equals — belongs in a shared context where both have equivalent roles and permissions.
 
 The protocol provides both patterns:
 
-- **Symmetric interaction:** Create a shared context (standing context or ephemeral). Both agents have messaging capability. Both can read and write. No caller/tool asymmetry.
-- **Asymmetric interaction:** One context exposes a tool to another. The tool provider is a service; the caller is a consumer. The asymmetry reflects the actual relationship.
+- **Symmetric interaction:** Create a shared context (standing context or ephemeral). Both agents have messaging capability. Both can read and write. No caller/outlet asymmetry.
+- **Asymmetric interaction:** One context exposes an outlet to another. The outlet provider is a service; the caller is a consumer. The asymmetry reflects the actual relationship.
 
-Stateful tool sessions (§6.2.1) partially bridge this: a multi-turn session allows both sides to influence the outcome iteratively. The tool provider responds with counterproposals; the caller adjusts. This isn't true symmetry, but it covers negotiation patterns within the governed tool call framework.
+Stateful outlet sessions (§6.2.1) partially bridge this: a multi-turn session allows both sides to influence the outcome iteratively. The outlet provider responds with counterproposals; the caller adjusts. This isn't true symmetry, but it covers negotiation patterns within the governed outlet call framework.
 
 If two agents need truly symmetric, ongoing interaction, the answer is unambiguous: share a context. Context creation is a runtime operation (§5.12.4). Standing contexts exist for exactly this purpose (§5.12.6).
 
 **9. Shadow channel incentivization.**
 
-*Concern:* The overhead of governed tool interfaces (mutual opt-in, schema declaration, governance approval, rate limits, provenance, audit logging) may be disproportionate for lightweight coordination, pushing agents to communicate through ungoverned channels (HTTP, direct API calls).
+*Concern:* The overhead of governed outlet interfaces (mutual opt-in, schema declaration, governance approval, rate limits, provenance, audit logging) may be disproportionate for lightweight coordination, pushing agents to communicate through ungoverned channels (HTTP, direct API calls).
 
 *Resolution — the overhead concern dissolves with standing contexts.*
 
-Lightweight coordination ("is your agent available?", "can you check something?", "here's a quick update") does not flow through tool interfaces. It flows through standing bilateral contexts — which have no per-message overhead beyond standard context messaging (encrypt, send, decrypt). There is no schema declaration, no governance approval, no tool registration. A message in a standing context is as lightweight as a message in any context.
+Lightweight coordination ("is your agent available?", "can you check something?", "here's a quick update") does not flow through outlet interfaces. It flows through standing bilateral contexts — which have no per-message overhead beyond standard context messaging (encrypt, send, decrypt). There is no schema declaration, no governance approval, no outlet registration. A message in a standing context is as lightweight as a message in any context.
 
-The governed tool interface overhead applies to formal cross-context data flow — where one context's tool is invoked by another context's agent. This overhead is appropriate for that use case because cross-context data flow carries real risk (§6.2) and should be auditable, rate-limited, and governed.
+The governed outlet interface overhead applies to formal cross-context data flow — where one context's outlet is invoked by another context's agent. This overhead is appropriate for that use case because cross-context data flow carries real risk (§6.2) and should be auditable, rate-limited, and governed.
 
 The two-tier model:
 
-- **Standing contexts** for lightweight, symmetric, low-ceremony communication. All the protocol's trust and encryption properties. No tool interface overhead.
-- **Tool interfaces** for formal, structured, asymmetric cross-context data exchange. Full governance, provenance, and auditability.
+- **Standing contexts** for lightweight, symmetric, low-ceremony communication. All the protocol's trust and encryption properties. No outlet interface overhead.
+- **Outlet interfaces** for formal, structured, asymmetric cross-context data exchange. Full governance, provenance, and auditability.
 
 This is analogous to the distinction between a text message and an API call. Both are communication; they have different overhead appropriate to their different risk profiles. The protocol provides both, and agents use whichever fits the interaction.
 
@@ -190,7 +190,7 @@ A sybil attacker creates many shallow identities. A real human accumulates deep,
 
 Three layers compose:
 
-1. **Earned capacity.** New identities start with limited capabilities — restricted context creation, limited participation slots, constrained tool invocation rates. Capacity grows through participation history, participation records, and time. Sybil accounts are cheap to create but expensive to make useful — each needs real participation history.
+1. **Earned capacity.** New identities start with limited capabilities — restricted context creation, limited participation slots, constrained outlet invocation rates. Capacity grows through participation history, participation records, and time. Sybil accounts are cheap to create but expensive to make useful — each needs real participation history.
 2. **Social and economic cost.** Real platform accounts, real money, real endorsements from established identities — each compounds the cost of maintaining sybil identities at scale. A sybil operator must sustain depth across every identity, not just breadth.
 3. **Context-level thresholds.** Contexts set their own admission requirements from available signals. A casual group chat might require nothing beyond a valid DID. A high-trust financial context might require multiple attestation types, months of participation history, independent endorsements, and economic activity. The protocol provides the verification data; contexts define their own thresholds.
 
@@ -205,7 +205,7 @@ The protocol defines baseline earned capacity parameters. Implementations MAY ov
 | `initial_context_creation_limit` | 3 | Maximum contexts a new identity (age < 7 days) can create. |
 | `initial_context_membership_limit` | 10 | Maximum contexts a new identity can join simultaneously. |
 | `initial_message_rate` | 60/hour | Maximum messages per hour across all contexts for a new identity. |
-| `initial_tool_invocation_rate` | 10/hour | Maximum tool invocations per hour for a new identity. |
+| `initial_outlet_invocation_rate` | 10/hour | Maximum outlet invocations per hour for a new identity. |
 | `capacity_growth_interval` | 7 days | Duration between capacity tier increases. |
 | `capacity_growth_factor` | 2x | Multiplier applied to all rate limits at each growth interval. |
 | `maximum_capacity_tier` | 5 | Number of growth intervals before capacity is uncapped (5 tiers = 35 days to full capacity). |
@@ -215,7 +215,7 @@ The protocol defines baseline earned capacity parameters. Implementations MAY ov
 
 **Capacity tier progression (at default values):**
 
-| Tier | Age | Context creation | Membership | Message rate | Tool rate |
+| Tier | Age | Context creation | Membership | Message rate | Outlet rate |
 |------|-----|-----------------|------------|-------------|-----------|
 | 0 (new) | 0-6d | 3 | 10 | 60/h | 10/h |
 | 1 | 7-13d | 6 | 20 | 120/h | 20/h |
@@ -238,11 +238,11 @@ Key principles:
 
 **Validate, minimize trust.** Every claim that can be mechanically verified should be. The four-layer trust model (§7.1) prioritizes protocol enforcement and participation validation over attestation authenticity and subjective trust. The trust surface shrinks as the network accumulates history.
 
-**Don't inspect content, inspect behavior topology.** Monitor structural metadata — growth rates, bridge activity patterns, context creation velocity, invitation patterns, tool invocation anomalies, governance action frequency — not what's being said. The protocol equivalent of metabolic signals, not thoughts.
+**Don't inspect content, inspect behavior topology.** Monitor structural metadata — growth rates, bridge activity patterns, context creation velocity, invitation patterns, outlet invocation anomalies, governance action frequency — not what's being said. The protocol equivalent of metabolic signals, not thoughts.
 
 **Consequences over character.** Where possible, replace "trust that actors will behave" with "verify that misbehavior is irrational given the consequences." Automated consequence mechanisms (§7.3.7) make participation boundaries mechanical rather than discretionary.
 
-**Observability is the immune system.** The protocol provides verifiable event logs, participation records, tool verification results, challenge-response outcomes, and attestation freshness data. These are the immune system's sensory apparatus. The actual immune response is an evolving network of agents and governance tools that consume this data and get better over time.
+**Observability is the immune system.** The protocol provides verifiable event logs, participation records, outlet verification results, challenge-response outcomes, and attestation freshness data. These are the immune system's sensory apparatus. The actual immune response is an evolving network of agents and governance tools that consume this data and get better over time.
 
 ### 9.4.1 Isolation Boundaries Enforced by Construction
 
@@ -285,7 +285,7 @@ The full list of sync-persisted operations (which is a superset of the downward-
 
 The cross-context saga coordinator writes phase transitions to a durable journal (§5.15.4, §17.16). Saga evidence carried in journal entries is classified as **secret-bearing** or **public**. Bearer artifacts (unrevoked proof tokens that would authorize action on their own; any future evidence that carries usable secret material) are secret-bearing; plan-level metadata and public identifiers are not.
 
-**No saga is secret-bearing today.** **The single defined saga** — cross-context tool invocation (§6.2.4) — is public-metadata-only: its journal and envelopes carry no bearer material (the tool invocation carries a UCAN *index*, not the token). (Standing-pair creation is **not** a saga and journals nothing — it is single-context async creation, §5.15.8.) This section is therefore the **contract any *future* secret-bearing saga MUST satisfy**, currently with **no instance**. The requirements below are normative for any such future saga.
+**No saga is secret-bearing today.** **The single defined saga** — cross-context outlet invocation (§6.2.4) — is public-metadata-only: its journal and envelopes carry no bearer material (the outlet invocation carries a UCAN *index*, not the token). (Standing-pair creation is **not** a saga and journals nothing — it is single-context async creation, §5.15.8.) This section is therefore the **contract any *future* secret-bearing saga MUST satisfy**, currently with **no instance**. The requirements below are normative for any such future saga.
 
 **Commitment construction.** Secret-bearing sagas MUST journal only a commitment — never the bearer bytes. The commitment is constructed as:
 
@@ -451,7 +451,7 @@ Note: the `claim` field is serialized as **canonical JSON per RFC 8785 (JCS)** �
 | 3 | `participation_duration_secs` | 8-byte BE u64 |
 | 4 | `governance_actions_against` | 8-byte BE u64 |
 | 5 | `governance_actions_by` | 8-byte BE u64 |
-| 6 | `tool_invocation_count` | 8-byte BE u64 |
+| 6 | `outlet_invocation_count` | 8-byte BE u64 |
 | 7 | `context_creation_count` | 8-byte BE u64 |
 | 8 | `role_progression_count` | 8-byte BE u64 |
 | 9 | `attestation_count` | 8-byte BE u64 |
@@ -487,7 +487,7 @@ Note: the `claim` field is serialized as **canonical JSON per RFC 8785 (JCS)** �
 | 3 | `action_bytes` | 4-byte BE length + canonical JSON serialization of `GovernanceAction` (compact, no whitespace) |
 | 4 | `timestamp` | 8-byte BE u64 |
 
-Note: The `ProposalId` is the SHA-256 output (32 bytes). It is deterministic for identical inputs and collision-resistant across contexts. The `action_bytes` field uses **canonical JSON** serialization of the `GovernanceAction` enum (externally tagged, compact format with no whitespace — equivalent to `json.dumps(separators=(',', ':'))` in Python). JSON is used rather than MessagePack because `GovernanceAction` is a complex 30-variant enum whose serialized form must be byte-identical across all SDK implementations. MessagePack has no canonical form standard and field ordering varies by library; JSON serialization is more predictable across languages and has RFC 8785 (JCS) as a formal canonicalization standard. This is consistent with all other cross-implementation canonical hashing in the protocol: handle tool signing (§22), app declarations (§8.4), DID documents (§18.1), and governance config hashing for multi-parent contexts (§5.13).
+Note: The `ProposalId` is the SHA-256 output (32 bytes). It is deterministic for identical inputs and collision-resistant across contexts. The `action_bytes` field uses **canonical JSON** serialization of the `GovernanceAction` enum (externally tagged, compact format with no whitespace — equivalent to `json.dumps(separators=(',', ':'))` in Python). JSON is used rather than MessagePack because `GovernanceAction` is a complex 30-variant enum whose serialized form must be byte-identical across all SDK implementations. MessagePack has no canonical form standard and field ordering varies by library; JSON serialization is more predictable across languages and has RFC 8785 (JCS) as a formal canonicalization standard. This is consistent with all other cross-implementation canonical hashing in the protocol: handle outlet signing (§22), app declarations (§8.4), DID documents (§18.1), and governance config hashing for multi-parent contexts (§5.13).
 
 **SignedVote** — domain: `"SCP-VOTE-V1:"`
 
@@ -726,7 +726,7 @@ The past-bound is relative, not absolute, to handle offline delivery: if Bob com
 
 Within a context, messages are ordered by: `(epoch, sender_generation_number, timestamp)`. This gives a total order per-sender and a causal order across senders — epoch boundaries are synchronization points.
 
-The canonical Merkle event log records the **convergent** (MLS-commit-ordered) events as a single-parent hash chain in append order; for that totally-ordered prefix, two events referencing the same parent indicate a fork — possible equivocation (§9.9). **Application events** (messages, tool invocations) are NOT part of this chain: in the interim they are excluded local `ContextEvent`s (ADR-011 amendment), and in the end state they are ordered by a **causal DAG** (ADR-051) in which multiple events legitimately reference a shared frontier and are deterministically linearized — concurrent branches are normal, not a fork.
+The canonical Merkle event log records the **convergent** (MLS-commit-ordered) events as a single-parent hash chain in append order; for that totally-ordered prefix, two events referencing the same parent indicate a fork — possible equivocation (§9.9). **Application events** (messages, outlet invocations) are NOT part of this chain: in the interim they are excluded local `ContextEvent`s (ADR-011 amendment), and in the end state they are ordered by a **causal DAG** (ADR-051) in which multiple events legitimately reference a shared frontier and are deterministically linearized — concurrent branches are normal, not a fork.
 
 **Interaction with relay ordering:** Relays do not guarantee message ordering. The SDK MUST re-order messages locally using `(epoch, generation, timestamp)` before presenting them to the application layer.
 
@@ -821,7 +821,7 @@ Checkpoints are sent as regular MLS application messages (encrypted, authenticat
 
 **Cryptographic equivocation test vs. application-layer heuristics.** The "divergence of more than 5 events" / "within tolerance" language on `eventCount` is an application-layer heuristic for distinguishing benign catch-up lag (a peer that is merely Behind or Ahead because it has not yet observed all in-flight events) from an alarm condition worth surfacing. It is NOT the cryptographic equivocation test. The cryptographic equivocation test is unambiguous and conservative: **equal `eventCount` with different `merkleRoot`**. Two honest members reporting the same event count but different roots cannot be reconciled by any ordering of in-flight messages — one of them was served a forged history. Implementations MUST NOT loosen the equal-count test (e.g., by tolerating root divergence within the 5-event window); the count tolerance applies only to deciding whether a count gap is alarming, never to weakening the equal-count-different-root signal.
 
-**Convergent-log requirement.** The equal-count/equal-root test is sound only if honest members build the *same* log. The canonical event log MUST therefore contain only **convergent** events — those every honest member derives identically from the MLS-commit-ordered stream (governance, membership, lifecycle, role, access, provenance, economic *governance* actions, compromise recovery, app-binding), as enumerated by the canonical `EventType` taxonomy (ADR-011). Attestations are NOT in this list: they are credential-layer artifacts (DID-document entries, relay-published blobs, the trust-protocol cache; §7.4), not context-log leaves — the equal-count/equal-root equivocation test is therefore unaffected by them. Per-recipient or detection signals (`MessageReceived`, `EquivocationDetected`) and routing-bootstrap signals (`PseudonymAnnounced`) are local `ContextEvent`s, never log entries. Per-author application activity (`MessageSent`, `ToolInvoked`, `PaymentReceived`) has no global order on its own and is brought into a convergent canonical order by the causal-DAG ordering of ADR-051; until that lands it is excluded from the canonical log (surfaced as a local `ContextEvent`), so the equal-count/equal-root invariant holds over the convergent subset. For the DAG-ordered application leaves specifically, the equivocation test is taken at **equal frontier** — a causally-stable cut — not equal scalar count: two honest members can have observed different in-flight application events, so equal count need not mean equal leaf set, and the `ConsistencyCheckpoint` therefore commits to the DAG frontier and roots are compared at equal frontier (ADR-051 §5). The totally-ordered commit prefix continues to use position directly. Soundness of the equal-count/equal-root test further requires that *every field* of a canonical leaf be convergent — including the `timestamp`. The leaf `timestamp` is the committer-assigned value (the `created_at` of the signed SCP envelope carrying the commit, copied by every member; §7.3.1, §9.8.2), not each member's local wall-clock reading. Were members to stamp leaves with per-member-local times, two honest members at the same event count would compute different roots with no equivocation present — a false positive that would force the equal-count test to be weakened, the outcome this section forbids. The committer-assigned timestamp keeps leaf bytes byte-identical across honest members while remaining tamper-evident and real-time-bounded within the ±5-minute future bound of §9.8.2. For timer-triggered events that carry no commit envelope (TTL expiry/close, governance-freeze expiry, deferred economic-policy application), the convergent value is the pre-computed deadline already in convergent context state, not local `now()`. This does not make timestamps authoritative over log order (§9.8.3): the order is the orderer; the timestamp is a convergent, bounded annotation carried on it.
+**Convergent-log requirement.** The equal-count/equal-root test is sound only if honest members build the *same* log. The canonical event log MUST therefore contain only **convergent** events — those every honest member derives identically from the MLS-commit-ordered stream (governance, membership, lifecycle, role, access, provenance, economic *governance* actions, compromise recovery, app-binding), as enumerated by the canonical `EventType` taxonomy (ADR-011). Attestations are NOT in this list: they are credential-layer artifacts (DID-document entries, relay-published blobs, the trust-protocol cache; §7.4), not context-log leaves — the equal-count/equal-root equivocation test is therefore unaffected by them. Per-recipient or detection signals (`MessageReceived`, `EquivocationDetected`) and routing-bootstrap signals (`PseudonymAnnounced`) are local `ContextEvent`s, never log entries. Per-author application activity (`MessageSent`, `OutletInvoked`, `PaymentReceived`) has no global order on its own and is brought into a convergent canonical order by the causal-DAG ordering of ADR-051; until that lands it is excluded from the canonical log (surfaced as a local `ContextEvent`), so the equal-count/equal-root invariant holds over the convergent subset. For the DAG-ordered application leaves specifically, the equivocation test is taken at **equal frontier** — a causally-stable cut — not equal scalar count: two honest members can have observed different in-flight application events, so equal count need not mean equal leaf set, and the `ConsistencyCheckpoint` therefore commits to the DAG frontier and roots are compared at equal frontier (ADR-051 §5). The totally-ordered commit prefix continues to use position directly. Soundness of the equal-count/equal-root test further requires that *every field* of a canonical leaf be convergent — including the `timestamp`. The leaf `timestamp` is the committer-assigned value (the `created_at` of the signed SCP envelope carrying the commit, copied by every member; §7.3.1, §9.8.2), not each member's local wall-clock reading. Were members to stamp leaves with per-member-local times, two honest members at the same event count would compute different roots with no equivocation present — a false positive that would force the equal-count test to be weakened, the outcome this section forbids. The committer-assigned timestamp keeps leaf bytes byte-identical across honest members while remaining tamper-evident and real-time-bounded within the ±5-minute future bound of §9.8.2. For timer-triggered events that carry no commit envelope (TTL expiry/close, governance-freeze expiry, deferred economic-policy application), the convergent value is the pre-computed deadline already in convergent context state, not local `now()`. This does not make timestamps authoritative over log order (§9.8.3): the order is the orderer; the timestamp is a convergent, bounded annotation carried on it.
 
 **Divergence resolution:** If Merkle roots diverge, members exchange event log proofs to identify the first divergent event. This reveals which relay served which version. The context's governance model handles the response.
 
@@ -896,7 +896,7 @@ This section specifies what the protocol protects, how it protects it, and what 
 ### 9.10.1 What Is Confidential
 
 - Message content (MLS encryption)
-- Context-internal state: roles, tools, governance actions, event log content (all encrypted within the MLS group)
+- Context-internal state: roles, outlets, governance actions, event log content (all encrypted within the MLS group)
 - Identity private state (encrypted to owner's key, §3.7)
 - UCAN token contents (within encrypted envelopes)
 - Sender identity, timestamps, sequence numbers, epoch, generation (all inside encrypted payload)
@@ -1018,7 +1018,7 @@ The `context_metadata_key` is a 32-byte symmetric key distributed as follows:
 
 - **At context creation:** The creator generates `context_metadata_key` and includes it in the context's initial parameters.
 - **In invitations:** The `context_metadata_key` is included in the invitation payload (which is encrypted to the invitee's public key). This allows prospective members to inspect context metadata before joining.
-- **In contexts with discovery tools:** Public or discoverable contexts publish their `context_metadata_key` in their context entry. This preserves the "legibility before opt-in" property for contexts that want to be found, while keeping non-discoverable contexts invisible to probing.
+- **In contexts with discovery outlets:** Public or discoverable contexts publish their `context_metadata_key` in their context entry. This preserves the "legibility before opt-in" property for contexts that want to be found, while keeping non-discoverable contexts invisible to probing.
 - **Rotation:** The `context_metadata_key` MAY be rotated via a governance action. On rotation, the context re-publishes metadata under the new routing ID and maintains the old routing ID for a grace period (2x blob TTL).
 
 **Derivation rule:** Contexts use the keyed `HMAC-SHA256(context_metadata_key, context_id || "scp-metadata-v2")` derivation. The unkeyed `SHA-256(context_id || "scp-metadata")` form is NOT used — it is publicly derivable and would reintroduce the enumeration oracle described above.
@@ -1609,11 +1609,11 @@ All domain separators are UTF-8 strings used as prefixes in canonical hash, sign
 | `"SCP-CHECKPOINT-V1:"` | Event log checkpoint hash | §11 |
 | `"SCP-EVENT-V1:"` | Event log entry hash | §11 |
 | `"SCP-EXPORT-ENTRY:"` | Context export chain hash | §5.13 |
-| `"SCP-TOOL-REGISTRATION-V1:"` | Tool registration integrity hash | §6.2 |
+| `"SCP-OUTLET-REGISTRATION-V2:"` | Outlet registration integrity hash | §6.2 |
 | `"SCP-KEY-DESTRUCTION-V1:"` | Key destruction proof | §9.15 |
 | `"SCP-CLAIM-V1:"` | Shadow identity claim validation | §12.3 |
 | `"SCP-RECEIPT-V1:"` | Payment receipt signing | §19.15.5 |
-| `"SCP-HANDLE-TOOL-V1:"` | Handle and scope tool request signing | §22.3.1, §22.3.5 |
+| `"SCP-HANDLE-OUTLET-V1:"` | Handle and scope outlet request signing | §22.3.1, §22.3.5 |
 | `"SCP-CHALLENGE-REQ-V1:"` | Trust challenge request signing | §7.4 |
 | `"SCP-CHALLENGE-RESP-V1:"` | Trust challenge response signing | §7.4 |
 | `"SCP-CHALLENGE-VERIFY-V1:"` | Trust challenge verification signing | §7.4 |
@@ -1626,7 +1626,7 @@ All domain separators are UTF-8 strings used as prefixes in canonical hash, sign
 | `"SCP-COMMIT-RANGE-RESP-V1:"` | Commit range response signing | §23.16.3 |
 | `"SCP-CONTEXT-SNAPSHOT-V1:"` | Tier-2 sync-delta context snapshot signing | §23.16.4 |
 | `"SCP-CONTEXT-EXPORT-V1:"` | Signed context export snapshot signing | §23.16.8 |
-| `"SCP-XCTX-RECEIPT-V1:"` | Cross-context tool receipt signing | §6.2.4 |
+| `"SCP-XCTX-RECEIPT-V1:"` | Cross-context outlet receipt signing | §6.2.4 |
 | `"SCP-XCTX-DIVERGENCE-V1:"` | Cross-context divergence marker signing | §6.2.4 |
 | `"SCP-INVITATION-BUNDLE-V1:"` | InvitationBundle signing — over the full genesis `ContextParams` (per-field JCS hashes) | §5.12.3.1 |
 | `"SCP-JOIN-RESPONSE-V1:"` | JoinResponse signing | §5.12.3.2 |
@@ -1699,12 +1699,12 @@ This section consolidates all HKDF labels, HPKE info prefixes, HMAC domain strin
 
 | Constant | Value | Notes | Spec Reference |
 |----------|-------|-------|----------------|
-| Max tool interfaces per context | 256 | Hard cap on registered tool interfaces | §6.2 |
+| Max outlet interfaces per context | 256 | Hard cap on registered outlet interfaces | §6.2 |
 | Ceiling change notification period | 259,200s (72h) | Members notified before ceiling change takes effect | §5.3.2 |
 | Freeze timeout | 172,800s (48h) | Frozen context auto-unfreezes after this period | §5.6 |
 | Default context verification window | 300s (5 min) | Grace period for context close verification | §5.6 |
-| Tool lifecycle default timeout | 30,000ms (30s) | Default tool invocation timeout | §6.2 |
-| Tool lifecycle max timeout | 300,000ms (5 min) | Hard protocol maximum for tool invocation timeout | §6.2 |
+| Outlet lifecycle default timeout | 30,000ms (30s) | Default outlet invocation timeout | §6.2 |
+| Outlet lifecycle max timeout | 300,000ms (5 min) | Hard protocol maximum for outlet invocation timeout | §6.2 |
 | Min active voters for fallback | 2 | Minimum voters for governance timeout fallback | §6.4 |
 | Max threshold signers | 64 | Maximum co-signers for multi-sig governance actions | §5.6 |
 | Max role name length | 64 bytes | Maximum length of custom role names | §5.6 |
@@ -1809,7 +1809,7 @@ This section consolidates all HKDF labels, HPKE info prefixes, HMAC domain strin
 | Petname cache TTL | 31,536,000s (1 year) | Resolution cache lifetime for petnames | §22.8.4 |
 | Attestation handle cache TTL | 86,400s (24h) | Resolution cache lifetime for attestation handles | §22.8.4 |
 | Discovery cache default capacity | 10,000 entries | Default capacity for the resolution cache | §22.8.4 |
-| Max context writers | 500 | Maximum writer members in a context with discovery tools | §22.3 |
+| Max context writers | 500 | Maximum writer members in a context with discovery outlets | §22.3 |
 | Push platform tag: APNS | `0x01` | Platform tag byte for Apple Push Notification Service | §10.7.1 |
 | Push platform tag: FCM | `0x02` | Platform tag byte for Firebase Cloud Messaging | §10.7.1 |
 | Push platform tag: WebPush | `0x03` | Platform tag byte for Web Push API | §10.7.1 |

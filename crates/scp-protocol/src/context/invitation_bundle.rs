@@ -284,7 +284,7 @@ impl InvitationBundle {
     ///
     /// Note: fields that exist only in `context_params` and have no
     /// `structural` counterpart — notably `consequence_rules` /
-    /// `consequence_config`, `economic_policy` detail, `tools` — cannot diverge
+    /// `consequence_config`, `economic_policy` detail, `outlets` — cannot diverge
     /// in this VIEW and are therefore not checked here; they are authenticated
     /// solely by the bundle signature over `genesis_params_hash`.
     ///
@@ -623,9 +623,12 @@ mod tests {
         // additional (default-empty) field is folded into the JCS canonical form
         // and thus into this digest — an intended encoding change, not a
         // regression.
+        // Regenerated again by the ADR-049 outlet rename: the `ContextParams`
+        // outlet-registration field's JCS key changed `tools` -> `outlets`,
+        // which is folded into the genesis params hash.
         assert_eq!(
             hex::encode(hash),
-            "222a69e8987a1619f0eee9d2c6c830bda19f5f675b7650ca665b1bd3b82906af",
+            "a6b5207312e3e26b9c9e91a99bde4b24d5e801619dc28f793049c0c0f1217120",
             "invitation bundle signing-hash KAT"
         );
     }

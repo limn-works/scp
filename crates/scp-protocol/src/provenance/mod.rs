@@ -1,7 +1,7 @@
 //! Data provenance types for SCP.
 //!
 //! Provenance is a core protocol principle (spec section 1, tenet 1): "All
-//! non-private data carries verifiable origin metadata." Every message, tool
+//! non-private data carries verifiable origin metadata." Every message, outlet
 //! output, attestation, and cross-context data transfer is traceable to its
 //! source. The absence of provenance is itself a signal.
 //!
@@ -186,7 +186,7 @@ impl Default for CounterpartyPolicy {
 /// Data provenance metadata (spec section 7.7.1).
 ///
 /// Attached automatically by the protocol when data crosses context boundaries
-/// through protocol mechanisms (tool interfaces, structured messages). Records
+/// through protocol mechanisms (outlet interfaces, structured messages). Records
 /// the full lineage of a piece of data: where it came from, who was involved,
 /// how it was discovered, and how many context hops it has traversed.
 ///

@@ -15,8 +15,8 @@ Tool interfaces are the right choice for service-style interactions: translation
 
 The bridge follows the bidirectional consent protocol (section 6.2.0.1):
 
-1. **Register a tool** in Context A using `register_tool`. The tool has a declared JSON schema for input and output.
-2. **Expose the tool** from Context A to Context B using `expose_tool`. This creates a `ToolInterface` with an `OutboundPolicy` (who can call, rate limits, payload size limits). The source side is now approved.
+1. **Register an outlet** in Context A using `register_outlet`. The outlet has a declared JSON schema for input and output.
+2. **Expose the outlet** from Context A to Context B using `expose_tool`. This creates an `OutletInterface` with an `OutboundPolicy` (who can call, rate limits, payload size limits). The source side is now approved.
 3. **Create an `InterfaceOffer`** via `create_interface_offer`. This captures the full tool schema and has a 7-day expiry. In production, a shared member carries the offer to Context B.
 4. **Accept the interface** in Context B using `accept_tool_interface`. This sets the `InboundPolicy` (allowed source roles, response size limits, spending UCAN requirements). Both sides are now approved.
 5. **Invoke across contexts** using `invoke_cross_context`. The bridge enforces:
@@ -25,8 +25,8 @@ The bridge follows the bidirectional consent protocol (section 6.2.0.1):
    - Per-interface rate limit (default 60 calls/min)
    - Per-caller rate limit (default 10 calls/min)
    - Outbound policy: allowed callers list, payload size limit
-   - Source context governance: invoker must hold `ToolInvokeAll` or `ToolInvoke(tool_id)` capability
-   - Target context governance: tool must exist in target registry
+   - Source context governance: invoker must hold `OutletCallAll` or `OutletCall(outlet_id)` capability
+   - Target context governance: outlet must exist in target registry
    - Inbound policy: response size limit
 6. **Event logging** -- both contexts receive a `CrossContextToolEvent` with a shared `request_id`, providing full provenance of every cross-context call.
 
@@ -42,11 +42,11 @@ cargo run
 
 ### Change the tool
 
-Replace the `ToolRegistration` in step 3 with your own tool schema and the executor closure in step 8 with your implementation. The schema must have at least two distinct fields in input or output (schema specificity floor, section 9.2.1).
+Replace the `OutletRegistration` in step 3 with your own outlet schema and the executor closure in step 8 with your implementation. The schema must have at least two distinct fields in input or output (schema specificity floor, section 9.2.1).
 
 ### Restrict callers
 
-Set `OutboundPolicy.allowed_callers` to a list of DIDs that may invoke the interface. When empty, any member with the `ToolInterface` capability can call.
+Set `OutboundPolicy.allowed_callers` to a list of DIDs that may invoke the interface. When empty, any member with the `OutletInterface` capability can call.
 
 ### Adjust rate limits
 

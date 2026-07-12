@@ -98,7 +98,7 @@ The core pattern throughout: **the spec describes what should happen but not how
 ### [5.3] Capability Categories Not Exhaustively Enumerated
 - **Category**: Missing wire format details
 - **Location**: §5.3, lines 25-35
-- **What's missing**: "Standard capability categories include:" followed by 8 categories. But the word "include" implies this is not exhaustive. The templates (§5.12.1) use additional capabilities not listed here: `toolInvokeAll`, `toolInvokeSpecific`, `toolRegister`, `memberInvite`, `roleAssign`, `contextClose`, `contextCreate`. Some appear in templates but not in the §5.3 enumeration. Is the full canonical list specified anywhere? What is the serialization format for capability names?
+- **What's missing**: "Standard capability categories include:" followed by 8 categories. But the word "include" implies this is not exhaustive. The templates (§5.12.1) use additional capabilities not listed here: `outletInvokeAll`, `outletInvokeSpecific`, `outletRegister`, `memberInvite`, `roleAssign`, `contextClose`, `contextCreate`. Some appear in templates but not in the §5.3 enumeration. Is the full canonical list specified anywhere? What is the serialization format for capability names?
 - **Why it matters**: Implementors need the complete, canonical list of capability identifiers. A capability ceiling containing an unknown identifier is a parse error — but there's no way to distinguish "unknown" from "valid but not listed in §5.3."
 - **Severity**: HIGH
 
@@ -109,24 +109,24 @@ The core pattern throughout: **the spec describes what should happen but not how
 - **Why it matters**: Without a defined notification protocol and waiting period, "notified and may leave" is unenforceable. An implementation could notify and immediately expand, giving members zero practical opportunity to leave.
 - **Severity**: HIGH
 
-### [5.4] Tool Registration Wire Format Not Defined
+### [5.4] Outlet Registration Wire Format Not Defined
 - **Category**: Missing wire format details
 - **Location**: §5.4, lines 55-63
-- **What's missing**: Tool registrations list 5 fields (schema, implementation hash, test vectors, operator DID, cost metadata) but don't specify: the serialization format for tool registrations, the schema for test vectors (what structure? how are inputs and outputs represented?), the hash algorithm for implementation hash, how cost metadata is serialized, or the maximum size of a tool registration.
-- **Why it matters**: Tools are a core protocol primitive. Two implementations serializing tool registrations differently would produce different implementation hashes and different event log entries.
+- **What's missing**: Outlet registrations list 5 fields (schema, implementation hash, test vectors, operator DID, cost metadata) but don't specify: the serialization format for outlet registrations, the schema for test vectors (what structure? how are inputs and outputs represented?), the hash algorithm for implementation hash, how cost metadata is serialized, or the maximum size of an outlet registration.
+- **Why it matters**: Outlets are a core protocol primitive. Two implementations serializing outlet registrations differently would produce different implementation hashes and different event log entries.
 - **Severity**: HIGH
 
-### [5.4] Tool Implementation Hash: Hash of What?
+### [5.4] Outlet Implementation Hash: Hash of What?
 - **Category**: Underspecified algorithms
 - **Location**: §5.4, line 58
-- **What's missing**: "Content-addressable reference to the tool's implementation." Hash of what bytes? The source code? A compiled binary? A serialized description? A tool that's a remote HTTP endpoint has no local implementation to hash. Is this the hash of the tool's schema + endpoint URL? Or the hash of the executable code? The spec doesn't say.
-- **Why it matters**: If the implementation hash is the integrity anchor for tool verification, the preimage must be precisely defined. Different implementations hashing different preimages will produce incompatible hashes.
+- **What's missing**: "Content-addressable reference to the outlet's implementation." Hash of what bytes? The source code? A compiled binary? A serialized description? An outlet that's a remote HTTP endpoint has no local implementation to hash. Is this the hash of the outlet's schema + endpoint URL? Or the hash of the executable code? The spec doesn't say.
+- **Why it matters**: If the implementation hash is the integrity anchor for outlet verification, the preimage must be precisely defined. Different implementations hashing different preimages will produce incompatible hashes.
 - **Severity**: HIGH
 
 ### [5.5] Observer Role Permissions Not Defined
 - **Category**: Missing wire format details
 - **Location**: §5.5, lines 65-80, and §5.12.1 line 254
-- **What's missing**: The `group-discussion` template includes an `observer` role, but its permission set is never defined. `admin` and `member` are used across templates but also lack formal permission set definitions. §5.5 says "roles determine which tools an agent can invoke, what data it can access" etc. but never provides the actual permission mappings for any role.
+- **What's missing**: The `group-discussion` template includes an `observer` role, but its permission set is never defined. `admin` and `member` are used across templates but also lack formal permission set definitions. §5.5 says "roles determine which outlets an agent can invoke, what data it can access" etc. but never provides the actual permission mappings for any role.
 - **Why it matters**: Templates are "protocol constants" (§5.12.1 line 317). If the observer role's permissions are undefined, two implementations will assign different permissions, making the template ID meaningless as a commitment.
 - **Severity**: HIGH
 
@@ -203,8 +203,8 @@ The core pattern throughout: **the spec describes what should happen but not how
 ### [5.11] Summary Content Not Specified
 - **Category**: Underspecified algorithms
 - **Location**: §5.11, line 204
-- **What's missing**: "The summary format is defined by the context (via tools or governance), not by the protocol." So the protocol defines a `Summary` memory scope but delegates the summary content entirely to context-specific tools. What if no tool is registered to produce summaries? Is there a default summary? Is the summary just "context existed from T1 to T2 with members [A, B]"? The protocol lifecycle hooks (pre-close summary generation) are referenced but never defined.
-- **Why it matters**: If `Summary` memory scope is a protocol-level feature, it needs at least a minimal default behavior when no context-specific summary tool is provided. Otherwise, `Summary` and `Ephemeral` are identical for contexts without summary tools.
+- **What's missing**: "The summary format is defined by the context (via outlets or governance), not by the protocol." So the protocol defines a `Summary` memory scope but delegates the summary content entirely to context-specific outlets. What if no outlet is registered to produce summaries? Is there a default summary? Is the summary just "context existed from T1 to T2 with members [A, B]"? The protocol lifecycle hooks (pre-close summary generation) are referenced but never defined.
+- **Why it matters**: If `Summary` memory scope is a protocol-level feature, it needs at least a minimal default behavior when no context-specific summary outlet is provided. Otherwise, `Summary` and `Ephemeral` are identical for contexts without summary outlets.
 - **Severity**: MEDIUM
 
 ### [5.11] Ephemeral Relay Deletion Request Format Not Specified
@@ -217,7 +217,7 @@ The core pattern throughout: **the spec describes what should happen but not how
 ### [5.12.1] Template `extends` Semantics Undefined
 - **Category**: Underspecified algorithms
 - **Location**: §5.12.1, lines 296-311
-- **What's missing**: The `paid-service` template says `extends: scp:template/tool-interface` and `paid-broadcast` says `extends: scp:template/gated-broadcast`. What does `extends` mean? Inheritance? Override? Merge? If a field in the extending template conflicts with the base template, which wins? Is `extends` a protocol mechanism or a documentation shorthand? The spec never defines `extends` semantics.
+- **What's missing**: The `paid-service` template says `extends: scp:template/outlet-interface` and `paid-broadcast` says `extends: scp:template/gated-broadcast`. What does `extends` mean? Inheritance? Override? Merge? If a field in the extending template conflicts with the base template, which wins? Is `extends` a protocol mechanism or a documentation shorthand? The spec never defines `extends` semantics.
 - **Why it matters**: Template composition is either a protocol-level feature (needing precise semantics) or a documentation convenience (needing no protocol support). If it's protocol-level, implementations must resolve `extends` chains identically. If it's documentation, say so explicitly.
 - **Severity**: MEDIUM
 
@@ -231,7 +231,7 @@ The core pattern throughout: **the spec describes what should happen but not how
 ### [5.12.2] Auto-Accept TrustRequirement `discovery_context` Undefined
 - **Category**: Underspecified algorithms
 - **Location**: §5.12.2, lines 335-338
-- **What's missing**: `discovery_context // DID is registered in a context with discovery tools I trust`. What makes a context with discovery tools "trusted"? Is trust in a context with discovery tools itself governed by auto-accept policies (circular)? How does the SDK evaluate this criterion at invitation-processing time — does it query the context? Cache context membership? What if the context is offline?
+- **What's missing**: `discovery_context // DID is registered in a context with discovery outlets I trust`. What makes a context with discovery outlets "trusted"? Is trust in a context with discovery outlets itself governed by auto-accept policies (circular)? How does the SDK evaluate this criterion at invitation-processing time — does it query the context? Cache context membership? What if the context is offline?
 - **Why it matters**: This is a potentially expensive runtime check (querying an external context) in the fast path of invitation processing. If the context is unreachable, does the auto-accept fail closed (reject) or fail open (prompt)?
 - **Severity**: LOW
 

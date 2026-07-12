@@ -38,7 +38,7 @@ use scp_did::SigningKeyId;
 /// attacks (changing a content message to a signaling message after signing).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MessageType {
-    /// Regular content message (chat, tool output, etc.).
+    /// Regular content message (chat, outlet output, etc.).
     #[default]
     Content,
 
@@ -107,7 +107,7 @@ impl MessageType {
 
 /// Provenance tracks the origin of message content.
 ///
-/// Records which tool generated it, which agent produced it, and any upstream
+/// Records which outlet generated it, which agent produced it, and any upstream
 /// references. The exact structure will be expanded in later phases; this
 /// provides a serializable placeholder. See spec section 7.7 for the full
 /// provenance model.

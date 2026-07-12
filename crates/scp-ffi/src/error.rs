@@ -78,10 +78,10 @@ pyo3::create_exception!(
     "Input validation failed (malformed data, schema mismatch, constraint violation)."
 );
 
-// Cross-context tool-invocation saga (§6.2.4, ADR-049 §3a) terminal errors.
+// Cross-context outlet-invocation saga (§6.2.4, ADR-049 §3a) terminal errors.
 //
 // These three exceptions surface the typed
-// `Supervisor::start_cross_context_tool_invocation_saga` terminal space
+// `Supervisor::start_cross_context_outlet_invocation_saga` terminal space
 // (`SagaError`) WITHOUT the caller having to parse a message string: each
 // carries the structured terminal datum the §6.2.4 / ADR-049 §3a contract
 // makes load-bearing as a positional Python exception argument (read from
@@ -109,7 +109,7 @@ pyo3::create_exception!(
     scp_sdk,
     SagaAbortedError,
     ScpError,
-    "A cross-context tool-invocation saga aborted at a Prepare phase (§6.2.4). \
+    "A cross-context outlet-invocation saga aborted at a Prepare phase (§6.2.4). \
      args = (message, code, retry_after_ms): retry_after_ms is an int of \
      milliseconds or None (never 0)."
 );
@@ -117,7 +117,7 @@ pyo3::create_exception!(
     scp_sdk,
     SagaNeedsRepairError,
     ScpError,
-    "A cross-context tool-invocation saga exhausted its Commit retries and may \
+    "A cross-context outlet-invocation saga exhausted its Commit retries and may \
      have diverged (ADR-049 §3a). args = (message, code, saga_id): saga_id is \
      the durable operator-repair handle."
 );
@@ -125,7 +125,7 @@ pyo3::create_exception!(
     scp_sdk,
     SagaBusyError,
     ScpError,
-    "A cross-context tool-invocation saga's participant context set overlapped \
+    "A cross-context outlet-invocation saga's participant context set overlapped \
      an in-flight saga (§5.15.4). args = (message, code, contended_context)."
 );
 
@@ -188,7 +188,7 @@ pub enum ScpPyError {
         /// Stable error code (e.g. `SCP-VALID-7001`).
         code: String,
     },
-    /// A §6.2.4 cross-context tool-invocation saga aborted at a Prepare phase.
+    /// A §6.2.4 cross-context outlet-invocation saga aborted at a Prepare phase.
     ///
     /// Maps to the Python `SagaAbortedError`. This terminal may be a permanent
     /// rejection OR a retryable transient (rate limit / participant actor
@@ -437,10 +437,10 @@ impl From<scp_identity::IdentityError> for ScpPyError {
 
 /// Extracts a leading `SCP-XXX-NNNN` error code from a message body, if any.
 ///
-/// `ContextManager::invoke_tool_with_economy` and several other paths
+/// `ContextManager::invoke_outlet_with_economy` and several other paths
 /// surface category-specific error codes inside `PermissionDenied(String)`
 /// (e.g. `"SCP-ECON-12010: budget exceeded for ..."`,
-/// `"SCP-TOOL-6080: context not active: ..."`). Without this parser the
+/// `"SCP-OUTLET-6080: context not active: ..."`). Without this parser the
 /// bridge would bucket every such error under the generic `SCP-CTX-2001`
 /// envelope and Python callers would have to string-match the message
 /// body. This helper preserves the existing typed-envelope contract by
@@ -542,15 +542,15 @@ impl From<scp_core::context::ContextError> for ScpPyError {
                 code: codes::CTX_2136.to_owned(),
             },
             // `PermissionDenied(String)` is the catch-all the runtime
-            // uses for tool-economy and tool-invocation failures
-            // (economy 12xxx, tool-invocation 6xxx). Recover the embedded
+            // uses for outlet-economy and outlet-invocation failures
+            // (economy 12xxx, outlet-invocation 6xxx). Recover the embedded
             // code prefix so callers can detect specific failures
-            // (budget exceeded, spending UCAN missing, tool not active,
+            // (budget exceeded, spending UCAN missing, outlet not active,
             // etc.) without string-matching the message body.
             CE::PermissionDenied(msg) => {
                 let code = extract_scp_code(msg).unwrap_or_else(|| codes::PERM_3001.to_owned());
                 // Permission/UCAN-class codes raise UcanError; everything
-                // else (tool, economy, context) raises ContextError so
+                // else (outlet, economy, context) raises ContextError so
                 // existing call sites that catch ContextError keep
                 // working.
                 if code.starts_with("SCP-PERM-") {
@@ -639,35 +639,35 @@ impl From<scp_core::context::promotion::PromotionError> for ScpPyError {
     }
 }
 
-// Tool errors → ScpPyError (tools category, matching napi/uniffi bridges)
+// Outlet errors → ScpPyError (outlets category, matching napi/uniffi bridges)
 
-impl From<scp_core::context::tools::ToolError> for ScpPyError {
-    fn from(e: scp_core::context::tools::ToolError) -> Self {
+impl From<scp_core::context::outlets::OutletError> for ScpPyError {
+    fn from(e: scp_core::context::outlets::OutletError) -> Self {
         Self::ContextError {
             message: format!(
-                "tool operation failed: {e} — check tool registration, permissions, and input schema"
+                "outlet operation failed: {e} — check outlet registration, permissions, and input schema"
             ),
-            code: codes::TOOL_6001.to_owned(),
+            code: codes::OUTLET_6001.to_owned(),
         }
     }
 }
 
-impl From<scp_core::context::tools::invoke::InvocationError> for ScpPyError {
-    fn from(e: scp_core::context::tools::invoke::InvocationError) -> Self {
+impl From<scp_core::context::outlets::invoke::InvocationError> for ScpPyError {
+    fn from(e: scp_core::context::outlets::invoke::InvocationError) -> Self {
         Self::ContextError {
             message: format!(
-                "tool invocation failed: {e} — verify tool ID, input, and caller permissions"
+                "outlet invocation failed: {e} — verify outlet ID, input, and caller permissions"
             ),
-            code: codes::TOOL_6002.to_owned(),
+            code: codes::OUTLET_6002.to_owned(),
         }
     }
 }
 
-impl From<scp_core::context::tools::schema::SchemaValidationError> for ScpPyError {
-    fn from(e: scp_core::context::tools::schema::SchemaValidationError) -> Self {
+impl From<scp_core::context::outlets::schema::SchemaValidationError> for ScpPyError {
+    fn from(e: scp_core::context::outlets::schema::SchemaValidationError) -> Self {
         Self::ValidationError {
             message: format!(
-                "schema validation failed: {e} — check input against the tool's JSON Schema"
+                "schema validation failed: {e} — check input against the outlet's JSON Schema"
             ),
             code: codes::VALID_7001.to_owned(),
         }

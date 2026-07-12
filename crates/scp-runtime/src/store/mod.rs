@@ -24,10 +24,10 @@ pub mod economy;
 pub mod event_log;
 pub mod identity;
 pub mod nonce;
+pub mod outlets;
 pub mod queue;
 pub mod tls;
 pub mod tofu;
-pub mod tools;
 pub mod transport;
 pub mod trust;
 pub mod ucan;
@@ -871,20 +871,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tool_store_rejects_traversal_tool_id() {
+    async fn outlet_store_rejects_traversal_outlet_id() {
         let store =
             ProtocolRepository::new_for_testing(scp_platform::testing::InMemoryStorage::new());
         let result = store
-            .store_tool("ctx-1", "../ucan_token/steal", b"bad")
+            .store_outlet("ctx-1", "../ucan_token/steal", b"bad")
             .await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
-    async fn tool_store_rejects_null_byte_session_id() {
+    async fn outlet_store_rejects_null_byte_session_id() {
         let store =
             ProtocolRepository::new_for_testing(scp_platform::testing::InMemoryStorage::new());
-        let result = store.store_tool_session("ctx-1", "sess\0ion", b"bad").await;
+        let result = store
+            .store_outlet_session("ctx-1", "sess\0ion", b"bad")
+            .await;
         assert!(result.is_err());
     }
 
@@ -924,9 +926,9 @@ mod tests {
         // Identity domain
         store.store_identity_document(&did, b"doc").await.unwrap();
 
-        // Tools domain
+        // Outlets domain
         store
-            .store_tool("ctx-valid", "tool-ok", b"reg")
+            .store_outlet("ctx-valid", "outlet-ok", b"reg")
             .await
             .unwrap();
 

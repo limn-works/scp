@@ -9,12 +9,13 @@
 //!
 //! Requires the `resolvers` feature (scp-core dependency).
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use scp_core::context::ContextParams;
 use scp_core::context::params::{
     CeilingPolicy, ConsequenceConfig, ContextMode, GovernanceModel, IncompleteVerificationPolicy,
-    MemoryScope, MetadataVisibilityPolicy, PromotionPolicy, RoleDefinition, ToolRegistration,
+    MemoryScope, MetadataVisibilityPolicy, OutletRegistration, PromotionPolicy, RoleDefinition,
 };
 use scp_core::context::roles::Capability;
 use scp_core::provenance::CounterpartyPolicy;
@@ -97,8 +98,8 @@ pub struct CommonContextParams {
     /// Used by `PyO3` bridge; others leave empty.
     pub roles: Vec<(String, Vec<String>)>,
 
-    /// Initial tool names. Used by `PyO3` bridge; others leave empty.
-    pub tools: Vec<String>,
+    /// Initial outlet names. Used by `PyO3` bridge; others leave empty.
+    pub outlets: Vec<String>,
 
     /// Optional template identifier (spec §5.14). Used by `PyO3` bridge.
     pub template_id: Option<String>,
@@ -123,7 +124,22 @@ pub fn build_context_params(params: &CommonContextParams) -> Result<ContextParam
         "broadcast" | "Broadcast" => ContextMode::Broadcast,
         _ => ContextMode::Encrypted,
     };
-    let ceiling: Vec<Capability> = params.ceiling.iter().map(Capability::new).collect();
+    // Strict §5.4.2.1 parser — malformed outlet stems (e.g. `outlet:invoke:foo`,
+    // `outlet_query:` empty suffix, `outlet_query:FOO` uppercase, suffix > 128
+    // bytes) reject at the FFI boundary rather than silently degrading to
+    // Custom. Per SCP-OUT-014 / ADR-049 §1, the deleted legacy outlet-invoke
+    // and pre-rename outlet-invoke stems have no transitional alias.
+    let ceiling: Vec<Capability> = params
+        .ceiling
+        .iter()
+        .map(|s| {
+            Capability::new(s).ok_or_else(|| {
+                format!(
+                    "invalid capability {s:?} in ceiling (fails §5.4.2.1 parser) (use \"outlet:call:*\" for actions, \"outlet:query:*\" for reads)"
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
     let ceiling_policy = match params.ceiling_policy.as_str() {
         "governed" => CeilingPolicy::Governed,
         _ => CeilingPolicy::Immutable,
@@ -154,8 +170,8 @@ pub fn build_context_params(params: &CommonContextParams) -> Result<ContextParam
         ceiling,
         ceiling_policy,
         promotion_policy,
-        roles: build_roles(&params.roles),
-        tools: build_tools(&params.tools),
+        roles: build_roles(&params.roles)?,
+        outlets: build_outlets(&params.outlets),
         ttl,
         memory_scope,
         governance,
@@ -270,34 +286,49 @@ fn parse_and_validate_consequences(
 }
 
 /// Converts role name/capabilities pairs into core `RoleDefinition` values.
-fn build_roles(roles: &[(String, Vec<String>)]) -> Vec<RoleDefinition> {
+fn build_roles(roles: &[(String, Vec<String>)]) -> Result<Vec<RoleDefinition>, String> {
     roles
         .iter()
-        .map(|(name, caps)| RoleDefinition {
-            name: name.clone(),
-            capabilities: caps.iter().map(Capability::new).collect(),
+        .map(|(name, caps)| {
+            let capabilities = caps
+                .iter()
+                .map(|s| {
+                    Capability::new(s).ok_or_else(|| {
+                        format!(
+                            "invalid capability {s:?} in role {name:?} (fails §5.4.2.1 parser) (use \"outlet:call:*\" for actions, \"outlet:query:*\" for reads)"
+                        )
+                    })
+                })
+                .collect::<Result<HashSet<_>, String>>()?;
+            Ok(RoleDefinition {
+                name: name.clone(),
+                capabilities,
+            })
         })
         .collect()
 }
 
-/// Converts tool name strings into core `ToolRegistration` values with
+/// Converts outlet name strings into core `OutletRegistration` values with
 /// placeholder schemas and metadata (matching the existing `PyO3` bridge
-/// behavior for bridge-level tool declarations).
-fn build_tools(tools: &[String]) -> Vec<ToolRegistration> {
-    tools
+/// behavior for bridge-level outlet declarations).
+fn build_outlets(outlets: &[String]) -> Vec<OutletRegistration> {
+    outlets
         .iter()
-        .map(|name| ToolRegistration {
-            tool_id: name.clone(),
+        .map(|name| OutletRegistration {
+            outlet_id: name.clone(),
+            kind: scp_core::context::outlets::OutletKind::default(),
             name: name.clone(),
             description: String::new(),
-            schema: scp_core::context::tools::ToolSchema {
+            schema: scp_core::context::outlets::OutletSchema {
                 input_schema: serde_json::Value::Object(serde_json::Map::default()),
                 output_schema: serde_json::Value::Object(serde_json::Map::default()),
+                aggregate_schema: None,
             },
             implementation_hash: [0u8; 32],
             test_vectors: vec![],
             operator_did: scp_did::DID("did:key:placeholder".to_owned()),
             cost: None,
+            message_catalog: Vec::new(),
             registered_at: 0,
             signature: Vec::new(),
         })
@@ -321,8 +352,8 @@ fn parse_template_id(tid: &str) -> Result<scp_core::context::params::TemplateId,
         "GroupDiscussion" => Ok(TemplateId::GroupDiscussion),
         "PublicBroadcast" => Ok(TemplateId::PublicBroadcast),
         "GatedBroadcast" => Ok(TemplateId::GatedBroadcast),
-        "scp:template/tool-interface" | "ToolInterfaceTemplate" => {
-            Ok(TemplateId::ToolInterfaceTemplate)
+        "scp:template/outlet-interface" | "OutletInterfaceTemplate" => {
+            Ok(TemplateId::OutletInterfaceTemplate)
         }
         "PaidService" | "scp:template/paid-service" => Ok(TemplateId::PaidService),
         "PaidBroadcast" | "scp:template/paid-broadcast" => Ok(TemplateId::PaidBroadcast),
@@ -333,7 +364,7 @@ fn parse_template_id(tid: &str) -> Result<scp_core::context::params::TemplateId,
         _ => Err(format!(
             "unknown template ID: {tid:?} — valid values: BilateralEphemeral, \
              BilateralPersistent, Coordination, GroupDiscussion, PublicBroadcast, \
-             GatedBroadcast, scp:template/tool-interface, PaidService, PaidBroadcast, \
+             GatedBroadcast, scp:template/outlet-interface, PaidService, PaidBroadcast, \
              HandleRegistry, scp:template/handle-registry, DiscoveryContext, \
              scp:template/discovery-context"
         )),
@@ -394,7 +425,7 @@ mod tests {
     #[test]
     fn ceiling_parsed() {
         let ctx = build_ok(&CommonContextParams {
-            ceiling: vec!["messages:write".to_owned(), "tools:invoke".to_owned()],
+            ceiling: vec!["messages:write".to_owned(), "outlet:call:*".to_owned()],
             ..Default::default()
         });
         assert_eq!(ctx.ceiling.len(), 2);
@@ -508,7 +539,7 @@ mod tests {
     #[test]
     fn template_id_parsed_serde_form() {
         let ctx = build_ok(&CommonContextParams {
-            template_id: Some("scp:template/tool-interface".to_owned()),
+            template_id: Some("scp:template/outlet-interface".to_owned()),
             ..Default::default()
         });
         assert!(ctx.template_id.is_some());
@@ -535,13 +566,13 @@ mod tests {
     }
 
     #[test]
-    fn tools_converted() {
+    fn outlets_converted() {
         let ctx = build_ok(&CommonContextParams {
-            tools: vec!["calculator".to_owned()],
+            outlets: vec!["calculator".to_owned()],
             ..Default::default()
         });
-        assert_eq!(ctx.tools.len(), 1);
-        assert_eq!(ctx.tools[0].name, "calculator");
+        assert_eq!(ctx.outlets.len(), 1);
+        assert_eq!(ctx.outlets[0].name, "calculator");
     }
 
     #[test]

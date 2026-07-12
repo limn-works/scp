@@ -17,7 +17,7 @@ Exception hierarchy::
     +-- UcanPermissionError   -- UCAN capability validation
     +-- CryptoError           -- Encryption, decryption, signature
     +-- TransportError        -- Network, relay, connection
-    +-- ToolError             -- Tool registration, invocation, verification
+    +-- OutletError           -- Outlet registration, invocation, verification
     +-- ValidationError       -- Input validation, schema, parameters
 
 Note: The permission error is named ``UcanPermissionError`` to avoid
@@ -88,10 +88,10 @@ class TransportError(ScpError):
     _default_code: str = "SCP-TRANS-5000"
 
 
-class ToolError(ScpError):
-    """Tool registration, invocation, or verification failure."""
+class OutletError(ScpError):
+    """Outlet registration, invocation, or verification failure."""
 
-    _default_code: str = "SCP-TOOL-6000"
+    _default_code: str = "SCP-OUTLET-6000"
 
 
 class ValidationError(ScpError):
@@ -101,11 +101,11 @@ class ValidationError(ScpError):
 
 
 # ---------------------------------------------------------------------------
-# Cross-context tool-invocation saga (§6.2.4 / ADR-049 §3a) terminal errors.
+# Cross-context outlet-invocation saga (§6.2.4 / ADR-049 §3a) terminal errors.
 # ---------------------------------------------------------------------------
 #
 # These three subclasses surface the typed terminal space of the §6.2.4
-# cross-context tool-invocation saga. Each carries the structured terminal
+# cross-context outlet-invocation saga. Each carries the structured terminal
 # datum the contract makes load-bearing as a NAMED attribute, read
 # structurally from the bridge exception's ``args`` (never re-parsed from
 # the message text). The bridge (``_scp_core``) raises exception classes
@@ -113,7 +113,7 @@ class ValidationError(ScpError):
 # bridge terminal into the matching SDK class below, preserving the datum.
 
 
-class SagaAbortedError(ToolError):
+class SagaAbortedError(OutletError):
     """A §6.2.4 saga aborted at a Prepare phase (authorization, freshness,
     rate limit, co-residency, or a transiently-unavailable participant actor).
 
@@ -141,7 +141,7 @@ class SagaAbortedError(ToolError):
         self.retry_after_ms: int | None = retry_after_ms
 
 
-class SagaNeedsRepairError(ToolError):
+class SagaNeedsRepairError(OutletError):
     """A §6.2.4 saga exhausted its Commit retries and may have diverged
     (a partial commit requiring operator repair).
 
@@ -162,7 +162,7 @@ class SagaNeedsRepairError(ToolError):
         self.saga_id: str = saga_id
 
 
-class SagaBusyError(ToolError):
+class SagaBusyError(OutletError):
     """A §6.2.4 saga's participant context set overlapped an in-flight saga
     (per-participant-context-set gating, §5.15.4).
 
@@ -231,7 +231,7 @@ BRIDGE_ERROR_MAP: dict[str, type[ScpError]] = {
     "UcanError": UcanPermissionError,
     "CryptoError": CryptoError,
     "TransportError": TransportError,
-    "ToolError": ToolError,
+    "OutletError": OutletError,
     "ValidationError": ValidationError,
 }
 
@@ -241,11 +241,11 @@ __all__ = [
     "ContextError",
     "CryptoError",
     "IdentityError",
+    "OutletError",
     "SagaAbortedError",
     "SagaBusyError",
     "SagaNeedsRepairError",
     "ScpError",
-    "ToolError",
     "TransportError",
     "UcanPermissionError",
     "ValidationError",

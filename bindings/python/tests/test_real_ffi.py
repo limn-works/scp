@@ -11,7 +11,7 @@ Run:
     source .venv/bin/activate
     PYTHONPATH=bindings/python pytest bindings/python/tests/test_real_ffi.py -v
 
-Covers: identity lifecycle, context lifecycle, membership, tools, UCAN,
+Covers: identity lifecycle, context lifecycle, membership, outlets, UCAN,
 event log, discovery, and provenance through real FFI.
 """
 
@@ -489,28 +489,29 @@ class TestContext:
 
 
 # ---------------------------------------------------------------------------
-# Tools
+# Outlets
 # ---------------------------------------------------------------------------
 
 
-class TestTools:
-    """Tool registration and verification through real FFI."""
+class TestOutlets:
+    """Outlet registration and verification through real FFI."""
 
     async def test_register_and_verify(self, scp: SCP):
         alice = await scp.identity_create(CustodyType.IN_MEMORY)
         handle = scp._native.context_create(
             alice.did,
             {
-                "ceiling": ["messages:read", "tool:invoke:*", "tool:register"],
+                "ceiling": ["messages:read", "outlet:call:*", "outlet:register"],
                 "memory_scope": "ephemeral",
                 "governance": "single_admin",
             },
         )
-        tool_id = scp._native.tool_register(
+        outlet_id = scp._native.outlet_register(
             handle.context_id,
             {
-                "name": "test_tool",
-                "description": "A test tool",
+                "name": "test_outlet",
+                "description": "A test outlet",
+                "kind": "action",
                 "operator_did": alice.did,
                 "schema": {
                     "input_schema": {
@@ -530,10 +531,10 @@ class TestTools:
                 },
             },
         )
-        assert tool_id
-        assert len(tool_id) > 0
+        assert outlet_id
+        assert len(outlet_id) > 0
 
-        result = scp._native.tool_verify(handle.context_id, tool_id)
+        result = scp._native.outlet_verify(handle.context_id, outlet_id)
         assert result.passed
 
 
@@ -893,7 +894,7 @@ class TestDiscovery:
 
     async def test_create_query(self):
         result = _scp_core.discovery_create_query(
-            ["tool:search"],
+            ["outlet:search"],
             ["rust"],
             None,
         )
@@ -1109,7 +1110,7 @@ class TestTrust:
             "ceiling_policy": "Immutable",
             "promotion_policy": "NoPromotion",
             "roles": [],
-            "tools": [],
+            "outlets": [],
             "ttl": None,
             "memory_scope": "Ephemeral",
             "governance": "SingleAdmin",
@@ -1137,8 +1138,8 @@ class TestTrust:
         # Credential-layer / anchoring invariants hold for both subjects.
         assert admin_record.attestation_count == 0
         assert member_record.attestation_count == 0
-        assert admin_record.tool_invocation_count_anchored is False
-        assert member_record.tool_invocation_count_anchored is False
+        assert admin_record.outlet_invocation_count_anchored is False
+        assert member_record.outlet_invocation_count_anchored is False
         # attestation_count is credential-layer (§7.4), never Merkle-anchored.
         assert admin_record.attestation_count_anchored is False
         assert member_record.attestation_count_anchored is False

@@ -36,10 +36,10 @@ use scp_protocol::context::governance::{
 use scp_protocol::context::membership::{
     ContextEvent, MembershipState, ReceiveBuffer, RedactedBytes,
 };
+use scp_protocol::context::outlets::interface::OutletInterface;
 use scp_protocol::context::params::GovernanceModel;
-use scp_protocol::context::params::ToolRegistration;
+use scp_protocol::context::params::OutletRegistration;
 use scp_protocol::context::roles::{Capability, ContextRoleState};
-use scp_protocol::context::tools::interface::ToolInterface;
 use scp_protocol::context::{ContextError, ContextParams, ContextState};
 use scp_protocol::economy::budget::MemberBudgetTracker;
 use scp_protocol::economy::types::EconomicPolicy;
@@ -49,11 +49,11 @@ use scp_protocol::trust::consequence::ConsequenceRule;
 // Protocol-level collection size limits (§5.9)
 // ---------------------------------------------------------------------------
 
-/// Maximum number of registered tools per context.
-pub(crate) const MAX_REGISTERED_TOOLS: usize = 256;
+/// Maximum number of registered outlets per context.
+pub(crate) const MAX_REGISTERED_OUTLETS: usize = 256;
 
-/// Maximum number of cross-context tool interfaces per context.
-pub(crate) const MAX_TOOL_INTERFACES: usize = 256;
+/// Maximum number of cross-context outlet interfaces per context.
+pub(crate) const MAX_OUTLET_INTERFACES: usize = 256;
 
 /// Maximum number of governance threshold signers per context.
 pub(crate) const MAX_THRESHOLD_SIGNERS: usize = 64;
@@ -495,10 +495,10 @@ pub enum GovernanceActionResult {
     MemberRemoved,
     /// A member's role was changed.
     RoleChanged,
-    /// A tool was registered in the context.
-    ToolRegistered,
-    /// A tool was removed from the context.
-    ToolRemoved,
+    /// A outlet was registered in the context.
+    OutletRegistered,
+    /// A outlet was removed from the context.
+    OutletRemoved,
     /// The capability ceiling was modified.
     CeilingModified,
     /// The context was closed.
@@ -517,8 +517,8 @@ pub enum GovernanceActionResult {
     ThresholdModified,
     /// A child context was created.
     ChildContextCreated,
-    /// A tool interface was established.
-    ToolInterfaceEstablished,
+    /// A outlet interface was established.
+    OutletInterfaceEstablished,
     /// A member was reset (ADR-029, Tier 3).
     MemberReset,
     /// A governance conflict was resolved (ADR-031 §7).
@@ -698,9 +698,9 @@ pub struct ContextSnapshot {
     /// Remaining TTL in seconds, if a TTL timer was active. `None` if no
     /// TTL was configured or the timer was not running.
     pub ttl_remaining_secs: Option<u64>,
-    /// Dynamically registered tools (beyond initial `ContextParams.tools`).
+    /// Dynamically registered outlets (beyond initial `ContextParams.outlets`).
     #[serde(default)]
-    pub registered_tools: Vec<ToolRegistration>,
+    pub registered_outlets: Vec<OutletRegistration>,
     /// Members excluded from future CEK wrapping (`Revoke { access: AccessScope::Write }`).
     /// These members won't receive new content keys but retain access to
     /// historical content encrypted before the revocation (ADR-038, §9.17).
@@ -709,9 +709,9 @@ pub struct ContextSnapshot {
     /// context-export digest is reproducible (§23.16.8, ADR-050).
     #[serde(default, with = "scp_protocol::serde_util::serde_sorted_set")]
     pub read_exclusion_list: HashSet<DID>,
-    /// Established cross-context tool interfaces (§6.2).
+    /// Established cross-context outlet interfaces (§6.2).
     #[serde(default)]
-    pub tool_interfaces: Vec<ToolInterface>,
+    pub outlet_interfaces: Vec<OutletInterface>,
     /// Governance threshold signers (for `ThresholdApproval` model).
     #[serde(default)]
     pub threshold_signers: Vec<DID>,
@@ -1039,23 +1039,23 @@ pub struct ContextSnapshot {
         crate::context::supervisor::saga_prepared_state::SagaPreparedStateSnapshot,
     >,
 
-    /// Target-side (B-owned) durable capture of COMMITTED cross-context tool
+    /// Target-side (B-owned) durable capture of COMMITTED cross-context outlet
     /// invocations, keyed by `SagaId` (spec §6.2.4 "Exactly-once execution with
     /// durable output capture"). **Class S** — synchronously-persisted,
     /// fail-closed, mirroring [`Self::saga_pending`].
     ///
     /// The live actor-side slot is
     /// [`PerContextState::xctx_committed_outputs`](crate::context::actor::state::PerContextState::xctx_committed_outputs).
-    /// Commit-B captures the tool output + signed receipt here BEFORE acking, so
+    /// Commit-B captures the outlet output + signed receipt here BEFORE acking, so
     /// a Commit replayed after a crash (§17.16.4) re-emits the stored output and
     /// re-signs nothing — it returns the IDENTICAL receipt. A coalesce-window
-    /// rollback of this capture would re-invoke the tool on replay, the exact
+    /// rollback of this capture would re-invoke the outlet on replay, the exact
     /// exactly-once violation the synchronous persist forecloses.
     ///
     /// Unlike `saga_pending` this carries no §9.4.3 non-derive barrier — the
     /// receipt + output are public protocol artifacts (no bearer bytes), so the
     /// snapshot stores the live
-    /// [`CommittedToolInvocation`](crate::context::supervisor::saga_prepared_state::CommittedToolInvocation)
+    /// [`CommittedOutletInvocation`](crate::context::supervisor::saga_prepared_state::CommittedOutletInvocation)
     /// directly. Same local-only coordination semantics: same-node restore
     /// REHYDRATES it; cross-node `import_context` / `strip_snapshot_for_public`
     /// DROP it to empty (a foreign saga must never drive local Commit replay).
@@ -1063,10 +1063,10 @@ pub struct ContextSnapshot {
     #[serde(default)]
     pub xctx_committed_outputs: HashMap<
         crate::context::supervisor::saga_journal::SagaId,
-        crate::context::supervisor::saga_prepared_state::CommittedToolInvocation,
+        crate::context::supervisor::saga_prepared_state::CommittedOutletInvocation,
     >,
 
-    /// Caller-side (A-owned) durable set of COMMITTED cross-context tool
+    /// Caller-side (A-owned) durable set of COMMITTED cross-context outlet
     /// invocations, keyed by `SagaId` (spec §6.2.4 "Commit", caller side;
     /// §17.16.4). **Class S** — synchronously-persisted, fail-closed, mirroring
     /// [`Self::saga_pending`].
@@ -1084,7 +1084,7 @@ pub struct ContextSnapshot {
         std::collections::HashSet<crate::context::supervisor::saga_journal::SagaId>,
 
     /// Caller-side (A-owned) durable reversal records for in-flight
-    /// cross-context tool-invocation Prepare-A reservations, keyed by `SagaId`
+    /// cross-context outlet-invocation Prepare-A reservations, keyed by `SagaId`
     /// (spec §6.2.4 "Reservation release on every terminal path"). **Class S** —
     /// synchronously-persisted, fail-closed, mirroring [`Self::saga_pending`].
     ///
@@ -1115,18 +1115,18 @@ pub struct ContextSnapshot {
     >,
 
     /// Target-side (B-owned) anti-replay nonce-dedup cache for cross-context
-    /// tool invocation (spec §6.2.4 "Freshness / anti-replay"). The serialized
+    /// outlet invocation (spec §6.2.4 "Freshness / anti-replay"). The serialized
     /// projection of
     /// [`PerContextState::xctx_nonce_dedup`](crate::context::actor::state::PerContextState::xctx_nonce_dedup):
     /// `{16-byte nonce → first-seen Unix secs}`.
     ///
     /// **Class S** — synchronously-persisted, fail-closed, mirroring
     /// [`Self::saga_pending`]. This cache is the ONLY gate against a replayed
-    /// `CrossContextToolInvoke` envelope re-submitted under a FRESH `SagaId`
+    /// `CrossContextOutletInvoke` envelope re-submitted under a FRESH `SagaId`
     /// within the 5-minute TTL (the `SagaId` idempotency witnesses and the
     /// `xctx_committed_outputs` short-circuit only catch a SAME-`SagaId` replay).
     /// If it reinitialized empty on restore, an actor crash inside the TTL window
-    /// would let an attacker re-run a charging tool (BLACK-624-01). Persisting it
+    /// would let an attacker re-run a charging outlet (BLACK-624-01). Persisting it
     /// makes Prepare-B's recorded-nonce rejection actually survive a restart —
     /// the recorded nonce is already deliberately KEPT on the reject path "for
     /// replay protection", and this is what makes that intent durable.
@@ -1237,10 +1237,10 @@ pub(crate) struct GovernanceState {
     pub(crate) pending_ceiling_modification: Option<PendingCeilingModification>,
     /// Pending economic policy change awaiting notification period (§19.3).
     pub(crate) pending_economic_policy_change: Option<PendingEconomicPolicyChange>,
-    /// Dynamically registered tools (beyond initial `ContextParams.tools`).
-    pub(crate) registered_tools: Vec<ToolRegistration>,
-    /// Established cross-context tool interfaces (§6.2).
-    pub(crate) tool_interfaces: Vec<ToolInterface>,
+    /// Dynamically registered outlets (beyond initial `ContextParams.outlets`).
+    pub(crate) registered_outlets: Vec<OutletRegistration>,
+    /// Established cross-context outlet interfaces (§6.2).
+    pub(crate) outlet_interfaces: Vec<OutletInterface>,
     /// Pruning policy override (ADR-030 §6).
     pub(crate) pruning_policy: Option<PruningPolicy>,
     /// Mutable economic policy (§19.3, ADR-033).
@@ -1596,8 +1596,8 @@ impl GovernanceState {
             deadlock: DeadlockDetectionState::default(),
             pending_ceiling_modification: None,
             pending_economic_policy_change: None,
-            registered_tools: Vec::new(),
-            tool_interfaces: Vec::new(),
+            registered_outlets: Vec::new(),
+            outlet_interfaces: Vec::new(),
             pruning_policy: None,
             economic_policy: None,
             budget_tracker: MemberBudgetTracker::new(),
@@ -1850,7 +1850,7 @@ pub(crate) fn create_governance_engine(
 /// ([`crate::context::supervisor::Supervisor::build_welcome_joiner_state`]).
 ///
 /// Both entrypoints stand up an identical fresh governance bucket — empty
-/// proposal/tool/ceiling/economy maps, the matrix-default hard rate limiter, a
+/// proposal/outlet/ceiling/economy maps, the matrix-default hard rate limiter, a
 /// 60-second velocity window, and a fresh spending-nonce tracker — differing
 /// only in the already-built `engine`, the initial `last_known_members` roster,
 /// and the `context_id`/`clock` the nonce tracker binds. Extracting the field
@@ -1883,8 +1883,8 @@ pub(crate) fn fresh_governance_state(
         deadlock: DeadlockDetectionState::default(),
         pending_ceiling_modification: None,
         pending_economic_policy_change: None,
-        registered_tools: Vec::new(),
-        tool_interfaces: Vec::new(),
+        registered_outlets: Vec::new(),
+        outlet_interfaces: Vec::new(),
         pruning_policy: None,
         message_pricing: crate::context::lifecycle_logic::derive_message_pricing(
             params.economic_policy.as_ref(),
@@ -2169,7 +2169,7 @@ pub(crate) fn require_migrating_out(handle: &ContextHandle) -> Result<(), Contex
 /// real context id the canonical bytes are the digest itself, recovered by
 /// **decoding** the hex — NOT by re-hashing the already-hex-encoded digest
 /// (which would double-hash and diverge from the raw digest the §6.2.4
-/// cross-context tool saga compares against on the wire).
+/// cross-context outlet saga compares against on the wire).
 ///
 /// Resolution rule:
 /// - If `context_id` is a canonical context id — exactly 64 characters, all
@@ -2251,7 +2251,7 @@ mod notification_window_backdating_tests {
             cost_schedule: CostSchedule {
                 currency: CurrencyCode(*b"USD\0"),
                 per_message: Some(Amount(1)),
-                per_tool_invoke: None,
+                per_outlet_call: None,
                 per_join: None,
                 per_period: None,
                 per_byte_stored: None,

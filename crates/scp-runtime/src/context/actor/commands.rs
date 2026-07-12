@@ -103,12 +103,12 @@ pub enum ContextCommand {
     Standing(StandingCommand),
     /// TTL close — timer-driven close path (spec §5.8).
     TtlClose(TtlCloseCommand),
-    /// Tools — hard-rate-limit consume / refund plus tool-economy
+    /// Outlets — hard-rate-limit consume / refund plus outlet-economy
     /// reserve / settle helpers that FFI bridges call from their
-    /// tool-dispatch paths (spec §19, rate limits §6.2.0.2). NOT a saga
-    /// initiator — the cross-context tool-invocation saga runs
+    /// outlet-dispatch paths (spec §19, rate limits §6.2.0.2). NOT a saga
+    /// initiator — the cross-context outlet-invocation saga runs
     /// supervisor-side, not over this mailbox.
-    Tools(ToolsCommand),
+    Outlets(OutletsCommand),
     /// Read-only queries. Handlers MUST NOT mutate state; the actor
     /// takes `&self.state` when dispatching this variant.
     Queries(QueriesCommand),
@@ -720,7 +720,7 @@ pub struct RestoreContextPayload {
 /// Neither is a saga entry point: standing-pair creation is single-context
 /// async creation (not a 2-phase saga; spec §5.15.8), and cross-identity
 /// context migration was withdrawn (ADR-049 §4). The sole cross-context saga
-/// is tool invocation (§6.2.4), driven from the supervisor, not this enum.
+/// is outlet invocation (§6.2.4), driven from the supervisor, not this enum.
 pub enum LifecycleCommand {
     /// Creates a new MLS-backed (or broadcast-mode) context. Mirrors
     /// [`Supervisor::create_context`](crate::context::supervisor::Supervisor::create_context).
@@ -1061,7 +1061,7 @@ pub type VoteOnProposalReply = oneshot::Sender<
 /// [`GovernanceCommand::ProposeGovernanceActionChecked`]. Boxed inside
 /// each variant so the enum's variant sizes stay uniform under
 /// `clippy::large_enum_variant` (GovernanceAction may embed large
-/// sub-structs like tool interfaces or ceiling modifications).
+/// sub-structs like outlet interfaces or ceiling modifications).
 pub struct ProposeGovernanceActionPayload {
     /// Context identifier string.
     pub context_id: String,
@@ -2176,14 +2176,14 @@ pub enum TtlCloseCommand {
     },
 }
 
-/// See [`ContextCommand::Tools`]. Real variants cover every public
-/// method on [`crate::context::tools_helpers`] EXCEPT
-/// [`Supervisor::invoke_tool_with_economy`](crate::context::supervisor::Supervisor::invoke_tool_with_economy)
-/// — that method is the cross-context tool-invocation entry and carries
+/// See [`ContextCommand::Outlets`]. Real variants cover every public
+/// method on [`crate::context::outlets_helpers`] EXCEPT
+/// [`Supervisor::invoke_outlet_with_economy`](crate::context::supervisor::Supervisor::invoke_outlet_with_economy)
+/// — that method is the cross-context outlet-invocation entry and carries
 /// a generic executor closure `F: FnOnce(Value) -> Fut` which cannot
 /// cross the actor mailbox. The cross-context saga itself is wired (§6.2.4,
 /// reached via
-/// [`Supervisor::start_cross_context_tool_invocation_saga`](crate::context::supervisor::Supervisor::start_cross_context_tool_invocation_saga), whose
+/// [`Supervisor::start_cross_context_outlet_invocation_saga`](crate::context::supervisor::Supervisor::start_cross_context_outlet_invocation_saga), whose
 /// borrowed (non-`'static`) [`SagaSigningKeys`](crate::context::supervisor::SagaSigningKeys)
 /// keep it off the `'static` mailbox); what remains
 /// deferred is its FFI export, pending per-participant-set saga gating
@@ -2191,13 +2191,13 @@ pub enum TtlCloseCommand {
 ///
 /// The migrated variants are the hard-rate-limit consume / refund
 /// helpers (async + sync + runtime-agnostic) that FFI bridges call from
-/// their own tool-dispatch paths. All 6 methods on
-/// [`crate::context::tools_helpers`] migrate here because they are the
-/// supervisor-observable tool surface.
-pub enum ToolsCommand {
+/// their own outlet-dispatch paths. All 6 methods on
+/// [`crate::context::outlets_helpers`] migrate here because they are the
+/// supervisor-observable outlet surface.
+pub enum OutletsCommand {
     /// Try to consume one hard-rate-limit token for the given
     /// `(context_id, did)` pair (async variant). Mirrors
-    /// [`tools_helpers::try_consume_hard_rate_limit`](crate::context::tools_helpers::try_consume_hard_rate_limit).
+    /// [`outlets_helpers::try_consume_hard_rate_limit`](crate::context::outlets_helpers::try_consume_hard_rate_limit).
     ///
     /// Reply carries `Ok(true)` iff a token was consumed or the context
     /// is unknown (pass-through contract on unknown contexts — matches
@@ -2215,7 +2215,7 @@ pub enum ToolsCommand {
     },
 
     /// Refund one hard-rate-limit token (async variant). Mirrors
-    /// [`tools_helpers::refund_hard_rate_limit`](crate::context::tools_helpers::refund_hard_rate_limit).
+    /// [`outlets_helpers::refund_hard_rate_limit`](crate::context::outlets_helpers::refund_hard_rate_limit).
     /// No-op on unknown context.
     RefundHardRateLimit {
         /// Context identifier string.
@@ -2226,16 +2226,16 @@ pub enum ToolsCommand {
         reply: oneshot::Sender<Result<(), ContextError>>,
     },
 
-    /// Phase 1 of the tool economy pipeline — economy reserve on
+    /// Phase 1 of the outlet economy pipeline — economy reserve on
     /// actor-owned state. Mirrors the first lock phase of the legacy
-    /// `invoke_tool_with_economy`: consume the hard rate limit, record
+    /// `invoke_outlet_with_economy`: consume the hard rate limit, record
     /// the velocity entry, run the economy pre-check, deduct budget,
     /// authorize the payment escrow. Replies with a `Send`
-    /// [`ToolEconomyReservation`](crate::context::tools_helpers::ToolEconomyReservation)
+    /// [`OutletEconomyReservation`](crate::context::outlets_helpers::OutletEconomyReservation)
     /// that the supervisor carries across the non-`Send` executor.
     ///
-    /// See [`crate::context::tools_helpers::reserve_tool_economy`].
-    ReserveToolEconomy {
+    /// See [`crate::context::outlets_helpers::reserve_outlet_economy`].
+    ReserveOutletEconomy {
         /// Context identifier string.
         context_id: String,
         /// Invoker DID.
@@ -2248,29 +2248,30 @@ pub enum ToolsCommand {
         now_secs: u64,
         /// Oneshot reply channel carrying the Phase-1 reservation.
         reply: oneshot::Sender<
-            Result<Box<crate::context::tools_helpers::ToolEconomyReservation>, ContextError>,
+            Result<Box<crate::context::outlets_helpers::OutletEconomyReservation>, ContextError>,
         >,
     },
 
-    /// Phase 3 of the tool economy pipeline — settle on actor-owned
+    /// Phase 3 of the outlet economy pipeline — settle on actor-owned
     /// state. On executor success runs post-invocation bookkeeping +
     /// consequence enforcement + payment capture; on executor failure
     /// voids the escrow and reverses budget / velocity / rate-limit.
     ///
-    /// See [`crate::context::tools_helpers::settle_tool_economy_capture`]
-    /// and [`crate::context::tools_helpers::rollback_tool_economy`].
-    SettleToolEconomy {
+    /// See [`crate::context::outlets_helpers::settle_outlet_economy_capture`]
+    /// and [`crate::context::outlets_helpers::rollback_outlet_economy`].
+    SettleOutletEconomy {
         /// Context identifier string.
         context_id: String,
         /// Invoker DID.
         invoker_did: scp_did::DID,
         /// Capture-or-rollback request carrying the in-flight ticket.
         /// Boxed so the variant payload stays pointer-sized.
-        request: Box<crate::context::tools_helpers::ToolSettleRequest>,
+        request: Box<crate::context::outlets_helpers::OutletSettleRequest>,
         /// Oneshot reply channel carrying the Phase-3 settle outcome
         /// (consequences + receipt + committed cost).
-        reply:
-            oneshot::Sender<Result<crate::context::tools_helpers::ToolSettleOutcome, ContextError>>,
+        reply: oneshot::Sender<
+            Result<crate::context::outlets_helpers::OutletSettleOutcome, ContextError>,
+        >,
     },
 }
 
@@ -2397,16 +2398,16 @@ pub enum QueriesCommand {
     },
     /// Established-interface predicate (spec §6.2.0.1 / §6.2.4 target-side
     /// authorize-before-reserve). `true` iff this actor's context holds a
-    /// bidirectionally-approved [`ToolInterface`](scp_protocol::context::tools::interface::ToolInterface)
+    /// bidirectionally-approved [`OutletInterface`](scp_protocol::context::outlets::interface::OutletInterface)
     /// whose `source_context` equals `source_context_hex`, `target_context`
-    /// equals `target_context_hex`, and `tool_id` equals `tool_registration_id`.
+    /// equals `target_context_hex`, and `outlet_id` equals `outlet_registration_id`.
     ///
     /// The supervisor consults the CALLER context's actor BEFORE reserving the
     /// `{caller, target}` participant-context set, so a caller cannot name a
     /// victim `target_context_id` it has no established interface with and
     /// thereby wedge the victim's saga slot (spec §6.2.4 "Target-context
     /// binding" rides the §6.2.0.1 standing consent — it does NOT create it).
-    HasEstablishedToolInterface {
+    HasEstablishedOutletInterface {
         /// Context identifier string (routing; the actor owns exactly one
         /// context).
         context_id: String,
@@ -2415,8 +2416,8 @@ pub enum QueriesCommand {
         source_context_hex: String,
         /// Target context id, lowercase 64-hex of the raw 32-byte digest.
         target_context_hex: String,
-        /// Context-local tool registration id (indexes the source registry).
-        tool_registration_id: String,
+        /// Context-local outlet registration id (indexes the source registry).
+        outlet_registration_id: String,
         /// Oneshot reply channel. `Ok(false)` iff the context is unknown or no
         /// matching both-approved interface exists.
         reply: oneshot::Sender<Result<bool, ContextError>>,
@@ -2559,22 +2560,22 @@ pub enum QueriesCommand {
 ///
 /// Carries the `Send` reservation handles the caller-context actor staged but
 /// did NOT apply: the escrow + outbound rate-limit reservation rolled into the
-/// existing [`ToolEconomyReservation`](crate::context::tools_helpers::ToolEconomyReservation).
+/// existing [`OutletEconomyReservation`](crate::context::outlets_helpers::OutletEconomyReservation).
 /// The supervisor FSM (slice 5) holds this across the saga; the
-/// [`ToolEconomyReservation`](crate::context::tools_helpers::ToolEconomyReservation)'s
+/// [`OutletEconomyReservation`](crate::context::outlets_helpers::OutletEconomyReservation)'s
 /// `#[must_use]` drop guard releases the held escrow/rate-limit on every
 /// terminal non-commit path (abort, timeout, panic — spec §6.2.4 "Reservation
 /// release on every terminal path"). On Commit-A the FSM settles it.
 ///
 /// **Not `Clone` / not `Serialize`.** The reservation is a single-owner RAII
 /// carrier — duplicating it would double-release the held ticket.
-#[must_use = "a PreparedAFields carries a ToolEconomyReservation that must be settled or released"]
+#[must_use = "a PreparedAFields carries a OutletEconomyReservation that must be settled or released"]
 pub struct PreparedAFields {
     /// The staged escrow + outbound rate-limit reservation (RAII release on
     /// not-commit). Produced via the existing
-    /// [`reserve_tool_economy`](crate::context::tools_helpers::reserve_tool_economy)
+    /// [`reserve_outlet_economy`](crate::context::outlets_helpers::reserve_outlet_economy)
     /// mechanism so Prepare-A reuses the single-context reserve/settle split.
-    pub reservation: crate::context::tools_helpers::ToolEconomyReservation,
+    pub reservation: crate::context::outlets_helpers::OutletEconomyReservation,
 }
 
 impl std::fmt::Debug for PreparedAFields {
@@ -2588,9 +2589,9 @@ impl std::fmt::Debug for PreparedAFields {
 /// Output of the Prepare-B handler (spec §6.2.4 "Prepare", target side).
 ///
 /// Confirms that the target-context actor staged the eight-field
-/// [`CrossContextToolInvocationPrepared`](crate::context::supervisor::saga_prepared_state::CrossContextToolInvocationPrepared)
+/// [`CrossContextOutletInvocationPrepared`](crate::context::supervisor::saga_prepared_state::CrossContextOutletInvocationPrepared)
 /// into `saga_pending` (with B-recorded `recorded_timestamp_ms` /
-/// `recorded_nonce` / `recorded_chain_depth`) and reserved the tool session,
+/// `recorded_nonce` / `recorded_chain_depth`) and reserved the outlet session,
 /// and surfaces the B-captured provenance values the supervisor needs to drive
 /// the Commit phase (slice 4) — so the FSM does not have to re-read B's staged
 /// slot to learn what B recorded.
@@ -2661,7 +2662,7 @@ impl From<ContextError> for SagaReject {
 /// **Not `Clone`.** [`Self::Prepared`] carries the `#[must_use]`
 /// [`PreparedAFields`] RAII reservation carrier.
 ///
-/// The `Prepared` variant is large (it embeds the `ToolEconomyReservation`
+/// The `Prepared` variant is large (it embeds the `OutletEconomyReservation`
 /// carrier) while `Rejected` is small — but boxing `Prepared` is the WRONG
 /// trade here: the value is created, sent over a `oneshot`, and immediately
 /// destructured by the FSM (never stored in a collection or moved in bulk), so
@@ -2675,7 +2676,7 @@ impl From<ContextError> for SagaReject {
 /// [`outcome::Outcome`](super::outcome::Outcome), the handler's Class-S
 /// persistence accounting. Do not conflate the two.
 #[allow(clippy::large_enum_variant)]
-#[must_use = "a PrepareAOutcome::Prepared carries a ToolEconomyReservation that must be settled or released"]
+#[must_use = "a PrepareAOutcome::Prepared carries a OutletEconomyReservation that must be settled or released"]
 #[derive(Debug)]
 pub enum PrepareAOutcome {
     /// Prepare-A passed: the staged outbound reservation handles.
@@ -2745,7 +2746,7 @@ pub(crate) use saga_reject;
 
 /// Reply payload for [`SagaPhaseMessage::CommitBReserve`] (spec §6.2.4
 /// "Commit", split-execution model). The Commit-B phase is two actor
-/// round-trips with the non-`Send` tool executor running supervisor-side in
+/// round-trips with the non-`Send` outlet executor running supervisor-side in
 /// between (the executor cannot cross the mailbox per ADR-049 §3). This is the
 /// first round-trip's reply: it tells the supervisor FSM whether to run the
 /// executor or short-circuit to the stored output.
@@ -2755,23 +2756,23 @@ pub(crate) use saga_reject;
 #[derive(Debug)]
 pub enum CommitBReserveOutcome {
     /// The staged prepared + session reservation are present and this
-    /// `SagaId`'s `ToolInvoked` has NOT yet been appended. The FSM MUST now run
-    /// the tool executor supervisor-side, capture the output, and call
+    /// `SagaId`'s `OutletInvoked` has NOT yet been appended. The FSM MUST now run
+    /// the outlet executor supervisor-side, capture the output, and call
     /// [`SagaPhaseMessage::CommitBSettle`].
     ReadyToExecute,
     /// Idempotent replay (spec §6.2.4 "Crash recovery §17.16.4"): this
-    /// `SagaId`'s `ToolInvoked` was already appended on a prior Commit-B. The
-    /// tool MUST NOT be re-invoked — the stored output + the original signed
+    /// `SagaId`'s `OutletInvoked` was already appended on a prior Commit-B. The
+    /// outlet MUST NOT be re-invoked — the stored output + the original signed
     /// receipt are re-emitted verbatim. The FSM skips the executor and treats
     /// this as a Commit-B success.
     AlreadyCommitted {
         /// The original signed receipt bytes (JCS of
-        /// [`CrossContextToolReceipt`](scp_protocol::context::tools::CrossContextToolReceipt)).
+        /// [`CrossContextOutletReceipt`](scp_protocol::context::outlets::CrossContextOutletReceipt)).
         receipt: Vec<u8>,
-        /// The captured tool output bytes (the receipt's `output_jcs`).
+        /// The captured outlet output bytes (the receipt's `output_jcs`).
         output_bytes: Vec<u8>,
-        /// The `SagaId`-stable `ToolInvoked` event-log entry id.
-        tool_invoked_event_id: String,
+        /// The `SagaId`-stable `OutletInvoked` event-log entry id.
+        outlet_invoked_event_id: String,
     },
 }
 
@@ -2781,16 +2782,16 @@ pub enum CommitBReserveOutcome {
 ///
 /// On a replayed `CommitBSettle` (output already captured for this `SagaId`)
 /// the SAME stored bytes are returned — byte-for-byte identical receipt and
-/// `tool_invoked_event_id` — and the tool is NOT re-invoked.
+/// `outlet_invoked_event_id` — and the outlet is NOT re-invoked.
 #[derive(Debug)]
 pub struct CommitBSettleOutcome {
     /// The target's signed receipt bytes (JCS of
-    /// [`CrossContextToolReceipt`](scp_protocol::context::tools::CrossContextToolReceipt)).
+    /// [`CrossContextOutletReceipt`](scp_protocol::context::outlets::CrossContextOutletReceipt)).
     pub receipt: Vec<u8>,
-    /// The captured tool output bytes the FSM forwards to Commit-A.
+    /// The captured outlet output bytes the FSM forwards to Commit-A.
     pub output_bytes: Vec<u8>,
-    /// The `SagaId`-stable `ToolInvoked` event-log entry id.
-    pub tool_invoked_event_id: String,
+    /// The `SagaId`-stable `OutletInvoked` event-log entry id.
+    pub outlet_invoked_event_id: String,
 }
 
 /// Reply-channel type alias for [`SagaPhaseMessage::CommitBReserve`].
@@ -2800,24 +2801,24 @@ pub type CommitBReserveReply = oneshot::Sender<Result<CommitBReserveOutcome, Con
 pub type CommitBSettleReply = oneshot::Sender<Result<CommitBSettleOutcome, ContextError>>;
 
 /// See [`ContextCommand::SagaPhase`]. The per-phase messages the supervisor
-/// FSM dispatches to a participant actor for a cross-context tool-invocation
+/// FSM dispatches to a participant actor for a cross-context outlet-invocation
 /// saga (spec §6.2.4). Each variant carries a typed `oneshot` reply.
 ///
 /// Every arm has a real handler body AND is driven end-to-end by the supervisor
 /// FSM: Prepare-A / Prepare-B, the split Commit
 /// ([`Self::CommitBReserve`] / [`Self::CommitBSettle`] / [`Self::CommitA`]),
 /// [`Self::Abort`], and [`Self::EmitDivergenceMarker`] are all dispatched by
-/// `start_cross_context_tool_invocation_saga`'s FSM over the two co-resident
+/// `start_cross_context_outlet_invocation_saga`'s FSM over the two co-resident
 /// participant actors. The dispatch `match` stays exhaustive so adding a phase
 /// is a compile error.
 #[non_exhaustive]
 pub enum SagaPhaseMessage {
     /// Prepare-A — runs on the LOCAL caller-context actor. Validates the
-    /// caller holds `tool:interface` and is in `OutboundPolicy.allowed_callers`,
+    /// caller holds `outlet:interface` and is in `OutboundPolicy.allowed_callers`,
     /// stages (not applies) the outbound rate-limit decrement + escrow
-    /// reservation of the tool's REGISTERED per-invocation cost (resolved from
-    /// the caller's economy policy / tool registry by
-    /// [`reserve_tool_economy`](crate::context::tools_helpers::reserve_tool_economy),
+    /// reservation of the outlet's REGISTERED per-invocation cost (resolved from
+    /// the caller's economy policy / outlet registry by
+    /// [`reserve_outlet_economy`](crate::context::outlets_helpers::reserve_outlet_economy),
     /// NOT any caller-asserted value), persists Class-S fail-closed, and replies
     /// the `Send` reservation handles.
     PrepareA {
@@ -2833,8 +2834,8 @@ pub enum SagaPhaseMessage {
         /// "Caller authentication"; the supervisor binds this, not the
         /// envelope).
         caller_did: scp_did::DID,
-        /// Context-local tool registration id being invoked at the target.
-        tool_registration_id: String,
+        /// Context-local outlet registration id being invoked at the target.
+        outlet_registration_id: String,
         /// Oneshot reply channel. A §6.2.4 policy reject rides
         /// `Ok(PrepareAOutcome::Rejected(SagaReject))` (carrying the structural
         /// `SCP-SAGA-13xxx` code); the `Err(ContextError)` channel carries only
@@ -2843,7 +2844,7 @@ pub enum SagaPhaseMessage {
     },
     /// Prepare-B — runs on the LOCAL target-context actor. Resolves the UCAN
     /// proof and re-runs §7 validation re-bound to `caller_did` +
-    /// `tool_registration_id` (confused-deputy defense), validates inbound
+    /// `outlet_registration_id` (confused-deputy defense), validates inbound
     /// policy / schema-specificity floor / target-context binding / freshness /
     /// chain-depth, captures B-controlled provenance, stages the eight-field
     /// prepared into `saga_pending`, persists Class-S fail-closed, and replies.
@@ -2858,12 +2859,12 @@ pub enum SagaPhaseMessage {
         /// Channel-authenticated caller DID (spec §6.2.4 "Caller
         /// authentication"). The confused-deputy re-bind audience.
         caller_did: scp_did::DID,
-        /// Context-local tool registration id (indexes B's own registry).
-        tool_registration_id: String,
+        /// Context-local outlet registration id (indexes B's own registry).
+        outlet_registration_id: String,
         /// UCAN proof reference — an INDEX into B's own UCAN store, never the
-        /// proof bytes (spec §6.2.4 normative (1)). `None` for an ungated tool.
+        /// proof bytes (spec §6.2.4 normative (1)). `None` for an ungated outlet.
         ucan_proof_id: Option<String>,
-        /// The invocation input — validated against the tool's registered
+        /// The invocation input — validated against the outlet's registered
         /// schema specificity floor (spec §9.2.1); never journaled.
         input: serde_json::Value,
         /// Caller-asserted chain depth — advisory/untrusted; used only for the
@@ -2897,7 +2898,7 @@ pub enum SagaPhaseMessage {
     /// `SagaId`. Idempotency (§6.2.4 / §17.16.4): if this `SagaId`'s output was
     /// already captured (a replayed Commit), it replies
     /// [`CommitBReserveOutcome::AlreadyCommitted`] with the STORED output +
-    /// receipt + event id and the FSM skips the executor — the tool is NEVER
+    /// receipt + event id and the FSM skips the executor — the outlet is NEVER
     /// re-invoked. Otherwise it replies [`CommitBReserveOutcome::ReadyToExecute`]
     /// and the FSM runs the executor, then calls [`Self::CommitBSettle`].
     ///
@@ -2913,9 +2914,9 @@ pub enum SagaPhaseMessage {
     /// side), called by the FSM with the executor's captured output.
     ///
     /// Durably captures the output keyed by `SagaId` (so a later replay
-    /// re-emits it), `SagaId`-idempotently appends `ToolInvoked` → a stable
-    /// `tool_invoked_event_id`, signs the
-    /// [`CrossContextToolReceipt`](scp_protocol::context::tools::CrossContextToolReceipt)
+    /// re-emits it), `SagaId`-idempotently appends `OutletInvoked` → a stable
+    /// `outlet_invoked_event_id`, signs the
+    /// [`CrossContextOutletReceipt`](scp_protocol::context::outlets::CrossContextOutletReceipt)
     /// over the
     /// staged `recorded_nonce` / `recorded_chain_depth` / `recorded_timestamp_ms`
     /// plus `output_hash` plus the event id using `target_signing_key`, Class-S
@@ -2925,7 +2926,7 @@ pub enum SagaPhaseMessage {
     CommitBSettle {
         /// Durable saga identifier.
         saga_id: crate::context::supervisor::saga_journal::SagaId,
-        /// The tool executor's captured output bytes (the FSM ran the executor
+        /// The outlet executor's captured output bytes (the FSM ran the executor
         /// supervisor-side between reserve and settle). Hashed into the
         /// receipt's `output_hash` and carried as the receipt's JCS output.
         output_bytes: Vec<u8>,
@@ -2940,7 +2941,7 @@ pub enum SagaPhaseMessage {
     },
     /// Commit-A — runs on the LOCAL caller-context actor. Settles the escrow
     /// reservation (§19.2.2), applies the staged outbound rate-limit decrement,
-    /// and records `CrossContextToolInvoked` referencing the target ctx id + the
+    /// and records `CrossContextOutletInvoked` referencing the target ctx id + the
     /// same `nonce` (spec §6.2.4 "Commit", caller side / "Dual event-log
     /// recording"). Class-S sync-persists fail-closed. Idempotent by `SagaId`:
     /// a replay re-acks without re-settling or re-appending.
@@ -2954,20 +2955,20 @@ pub enum SagaPhaseMessage {
         /// releases on every terminal non-commit path; Commit-A consumes it.
         reservation: Box<PreparedAFields>,
         /// Caller context id (raw 32-byte digest) — the actor's own context;
-        /// the `CrossContextToolInvoked` actor field.
+        /// the `CrossContextOutletInvoked` actor field.
         caller_context_id: [u8; 32],
         /// Caller DID — the channel-authenticated initiator (the event actor).
         caller_did: scp_did::DID,
         /// Target context id (raw 32-byte digest) — referenced by the
-        /// `CrossContextToolInvoked` record so an auditor can join it to B's log.
+        /// `CrossContextOutletInvoked` record so an auditor can join it to B's log.
         target_context_id: [u8; 32],
         /// The 16-byte correlation nonce — the SAME nonce B staged into
-        /// `ToolInvoked`; the join key between the two records (§6.2.4 "Dual
+        /// `OutletInvoked`; the join key between the two records (§6.2.4 "Dual
         /// event-log recording").
         nonce: [u8; 16],
         /// The target's signed receipt bytes captured at Commit-B.
         receipt: Vec<u8>,
-        /// The target's captured tool output bytes.
+        /// The target's captured outlet output bytes.
         output_bytes: Vec<u8>,
         /// Oneshot reply channel.
         reply: oneshot::Sender<Result<(), ContextError>>,
@@ -2980,7 +2981,7 @@ pub enum SagaPhaseMessage {
     /// command was delivered, the actor consumed the ticket), so a retry cannot
     /// re-send `CommitA` — but the witness lets the FSM resolve the saga to
     /// `Committed` instead of a spurious `NeedsRepair` (spec §17.16.4 "A re-acks
-    /// its `CrossContextToolInvoked` … as a no-op"; the witness IS that re-ack).
+    /// its `CrossContextOutletInvoked` … as a no-op"; the witness IS that re-ack).
     CommitACheckWitness {
         /// Durable saga identifier (the `xctx_committed_invocations` key).
         saga_id: crate::context::supervisor::saga_journal::SagaId,
@@ -2989,7 +2990,7 @@ pub enum SagaPhaseMessage {
     },
     /// Abort — runs on EITHER side's local actor. RAII-releases the staged
     /// reservations (escrow / outbound-RL on A — carried back via
-    /// `reservation`; tool-session on B — the staged `saga_pending` slot), clears
+    /// `reservation`; outlet-session on B — the staged `saga_pending` slot), clears
     /// the saga slot, Class-S sync-persists fail-closed, and acks. Idempotent
     /// no-op if the saga is already terminal (slot absent and no reservation).
     Abort {
@@ -2998,8 +2999,8 @@ pub enum SagaPhaseMessage {
         /// On the CALLER (A) side, the staged escrow + outbound-RL reservation
         /// the FSM holds, handed back so Abort can RAII-release it (rollback
         /// path). `None` on the TARGET (B) side, whose staged reservation lives
-        /// in `saga_pending` (the tool-session reservation is released by
-        /// clearing the slot — B stages no `ToolEconomyTicket` at Prepare-B).
+        /// in `saga_pending` (the outlet-session reservation is released by
+        /// clearing the slot — B stages no `OutletEconomyTicket` at Prepare-B).
         /// Boxed under `clippy::large_enum_variant`.
         reservation: Option<Box<PreparedAFields>>,
         /// Oneshot reply channel.
@@ -3016,12 +3017,12 @@ pub enum SagaPhaseMessage {
         /// The 16-byte correlation nonce joining the two event-log records.
         nonce: [u8; 16],
         /// Which side committed (caller or target).
-        committed_side: scp_protocol::context::tools::cross_context_saga::CommittedSide,
+        committed_side: scp_protocol::context::outlets::cross_context_saga::CommittedSide,
         /// The committed-side event id.
         committed_event_id: String,
         /// CONVERGENT committer-assigned leaf timestamp (seconds) for the
         /// divergence-marker leaf: B's staged `recorded_timestamp_ms / 1000` —
-        /// the same convergent instant the committed-side `ToolInvoked` leaf
+        /// the same convergent instant the committed-side `OutletInvoked` leaf
         /// carries (spec §6.2.4 *Recorded timestamp*). Passed per-call so the
         /// marker leaf is byte-identical across honest members (§9.9.3), never a
         /// per-member actor-local clock read.

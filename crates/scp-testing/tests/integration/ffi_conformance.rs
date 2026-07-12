@@ -34,7 +34,7 @@ use serde::Deserialize;
 // PyO3 bridge sources
 const PYO3_IDENTITY: &str = include_str!("../../../../crates/scp-ffi/src/identity.rs");
 const PYO3_CONTEXT: &str = include_str!("../../../../crates/scp-ffi/src/context.rs");
-const PYO3_TOOLS: &str = include_str!("../../../../crates/scp-ffi/src/tools.rs");
+const PYO3_OUTLETS: &str = include_str!("../../../../crates/scp-ffi/src/outlets.rs");
 const PYO3_UCAN: &str = include_str!("../../../../crates/scp-ffi/src/ucan.rs");
 const PYO3_EVENT_LOG: &str = include_str!("../../../../crates/scp-ffi/src/event_log.rs");
 const PYO3_TRANSPORT: &str = include_str!("../../../../crates/scp-ffi/src/transport.rs");
@@ -74,7 +74,7 @@ const UNIFFI_SCP: &str = include_str!("../../../../crates/scp-ffi/uniffi/src/scp
 // NAPI bridge sources
 const NAPI_IDENTITY: &str = include_str!("../../../../crates/scp-ffi/napi/src/identity.rs");
 const NAPI_CONTEXT: &str = include_str!("../../../../crates/scp-ffi/napi/src/context.rs");
-const NAPI_TOOLS: &str = include_str!("../../../../crates/scp-ffi/napi/src/tools.rs");
+const NAPI_OUTLETS: &str = include_str!("../../../../crates/scp-ffi/napi/src/outlets.rs");
 const NAPI_UCAN: &str = include_str!("../../../../crates/scp-ffi/napi/src/ucan.rs");
 const NAPI_EVENT_LOG: &str = include_str!("../../../../crates/scp-ffi/napi/src/event_log.rs");
 const NAPI_TRANSPORT: &str = include_str!("../../../../crates/scp-ffi/napi/src/transport.rs");
@@ -426,7 +426,7 @@ impl<'ast> Visit<'ast> for FnCollector {
 // fixtures (which test the cfg-gate semantics in isolation). Two scanners
 // with two purposes — do not collapse.
 //
-// The macros recognized are the ones each bridge's binding tool consumes:
+// The macros recognized are the ones each bridge's binding outlet consumes:
 //
 //   • PyO3:  free `pub fn` decorated `#[pyfunction]`,
 //            method inside `#[pymethods] impl <T> { ... }`.
@@ -436,7 +436,7 @@ impl<'ast> Visit<'ast> for FnCollector {
 //             method inside `#[uniffi::export] impl <T> { ... }` (or `#[uniffi::export(...)]`).
 //
 // Visibility rule: NOT enforced. The FFI macro is the export marker — every
-// SCP bridge tool (PyO3, NAPI, UniFFI) accepts the macro on
+// SCP bridge outlet (PyO3, NAPI, UniFFI) accepts the macro on
 // any visibility (pub, pub(crate), naked fn). PyO3 even has many real
 // examples of `#[pyfunction] fn name(...)` without `pub` — see
 // `runtime_is_initialized` / `version` / `shutdown_runtime` in
@@ -490,7 +490,7 @@ fn attrs_have_impl_block_ffi_export(attrs: &[syn::Attribute]) -> bool {
     false
 }
 
-/// Strict scanner: collects every fn name a bridge's binding tool would
+/// Strict scanner: collects every fn name a bridge's binding outlet would
 /// actually export. See module-level docs above for the export rules.
 fn collect_ffi_exported_fns(source: &str) -> HashSet<String> {
     let file = match syn::parse_file(source) {
@@ -576,7 +576,7 @@ type FnSetCacheKey = (usize, usize);
 type FnSetCache = Mutex<HashMap<FnSetCacheKey, &'static HashSet<String>>>;
 
 /// Returns a cached `HashSet<String>` of FFI-exported function names for the
-/// given source — the names a bridge's binding tool would actually expose.
+/// given source — the names a bridge's binding outlet would actually expose.
 /// Keyed by `(ptr, len)` of the `&'static str` so each `include_str!`-ed
 /// bridge file is parsed exactly once per test process.
 ///
@@ -661,7 +661,7 @@ fn pyo3_sources() -> Vec<&'static str> {
     vec![
         PYO3_IDENTITY,
         PYO3_CONTEXT,
-        PYO3_TOOLS,
+        PYO3_OUTLETS,
         PYO3_UCAN,
         PYO3_EVENT_LOG,
         PYO3_TRANSPORT,
@@ -683,7 +683,7 @@ fn napi_sources() -> Vec<&'static str> {
     vec![
         NAPI_IDENTITY,
         NAPI_CONTEXT,
-        NAPI_TOOLS,
+        NAPI_OUTLETS,
         NAPI_UCAN,
         NAPI_EVENT_LOG,
         NAPI_TRANSPORT,
@@ -710,7 +710,7 @@ fn napi_sources() -> Vec<&'static str> {
 /// exemptions. The `label` parameter controls the category name printed in
 /// failure messages — this is decoupled from the category in the tuple so
 /// callers can preserve historical wording (e.g. "UCAN" rather than "ucan",
-/// "tool" rather than "tools").
+/// "outlet" rather than "outlets").
 fn assert_category_coverage(label: &str, ops: &[&(&'static str, &'static str)]) {
     let pyo3_srcs = pyo3_sources();
     let napi_srcs = napi_sources();
@@ -1298,13 +1298,13 @@ fn ucan_category_coverage() {
     assert_category_coverage("UCAN", &ucan_ops);
 }
 
-/// Verifies tool operations are present across all bridges. Per-bridge
+/// Verifies outlet operations are present across all bridges. Per-bridge
 /// exemptions are sourced from `scripts/bridge-aliases.json`.
 #[test]
-fn tools_category_coverage() {
+fn outlets_category_coverage() {
     let ops = parity_operations();
-    let tool_ops: Vec<_> = ops.iter().filter(|(cat, _)| *cat == "tools").collect();
-    assert_category_coverage("tool", &tool_ops);
+    let outlet_ops: Vec<_> = ops.iter().filter(|(cat, _)| *cat == "outlets").collect();
+    assert_category_coverage("outlet", &outlet_ops);
 }
 
 /// Verifies broadcast operations are present across all bridges.
@@ -1382,7 +1382,7 @@ fn discovery_and_provenance_coverage() {
 // bridges + language SDK wrappers. `adjust_relay_price` implemented
 // Matrix-style aggregate pricing adjustment; the authoritative per-DID
 // escalation mechanism (spec §19.7) replaces it and is wired through
-// the existing `context_send_message` and `context_invoke_tool_with_economy`
+// the existing `context_send_message` and `context_invoke_outlet_with_economy`
 // paths, so no new parity operation was added in its place. This is a
 // legitimate removal; the ratchet is reset to the new floor. See commit
 // 2291102.
@@ -1405,8 +1405,8 @@ fn discovery_and_provenance_coverage() {
 // nonce) is exposed across all three bridges. Pure coverage
 // expansion, not a swap for the removed `economy_adjust_relay_price`.
 //
-// Subsequently RAISED 105 -> 106 by the `tool_invoke_cross_context_saga` op:
-// the §6.2.4 atomic cross-context tool-invocation saga (ADR-049 §3a), exposed
+// Subsequently RAISED 105 -> 106 by the `outlet_invoke_cross_context_saga` op:
+// the §6.2.4 atomic cross-context outlet-invocation saga (ADR-049 §3a), exposed
 // across all three native bridges (PyO3 / UniFFI / NAPI). Pure coverage
 // expansion, not a swap for the removed `economy_adjust_relay_price`.
 const MIN_PARITY_OPERATIONS: usize = 106;
@@ -1928,7 +1928,7 @@ fn syn_scanner_excludes_cfg_test_above_cfg_attr() {
 /// An attacker could declare `"napi": ["ghost_op"]` in `bridge-aliases.json`
 /// and define `pub fn ghost_op() {}` in `crates/scp-ffi/napi/src/` — the
 /// looser scanner would happily report the alias as resolved. The strict
-/// scanner refuses because the binding tool (napi-rs) never sees an
+/// scanner refuses because the binding outlet (napi-rs) never sees an
 /// undecorated fn.
 #[test]
 fn ffi_scanner_excludes_undecorated_pub_fn() {
@@ -2713,7 +2713,7 @@ struct AllowlistEntry {
     /// `<path>::<name>` is what the reverse gate matches on — mirroring the
     /// `path::fn` discipline of `scripts/pure-helpers-allowlist.txt`. A bare
     /// `name` match would silently exempt ANY future export sharing the name
-    /// (e.g. a genuine op named `tools`, which collides with the `tools`
+    /// (e.g. a genuine op named `outlets`, which collides with the `outlets`
     /// getter), recreating the hide-by-omission class this gate exists to kill.
     path: String,
     #[serde(default)]
@@ -2819,7 +2819,7 @@ fn pending_keys_for(bridge: &str) -> BTreeSet<String> {
 /// which are incomplete — the walk is authoritative).
 ///
 /// Qualification is what closes the bypass a reviewer proved: a bare-name
-/// allowlist (`tools` as a getter) would silently swallow a genuinely-new op
+/// allowlist (`outlets` as a getter) would silently swallow a genuinely-new op
 /// that happens to share the name but lives in a different file. Keyed on the
 /// full path, an entry exempts ONLY the specific fn it was written for.
 fn exported_qualified_under(root: &Path) -> BTreeSet<String> {
@@ -3191,8 +3191,8 @@ const fn is_op_ident_char(ch: char) -> bool {
 
 /// Every capability-matrix op name that appears in `reason` as a WHOLE-WORD
 /// token (not as a substring of a longer identifier). E.g. a reason naming
-/// `register_tool_handler` matches that op, but a reason naming
-/// `mcp_register_tool_handler` (a different, longer identifier) does NOT match
+/// `register_outlet_handler` matches that op, but a reason naming
+/// `mcp_register_outlet_handler` (a different, longer identifier) does NOT match
 /// the bare `register` op. This is what lets a `bridge-specific` reason name
 /// the precise matrix op it relies on for its one-bridge claim.
 fn matrix_ops_named_in(reason: &str) -> Vec<&'static str> {

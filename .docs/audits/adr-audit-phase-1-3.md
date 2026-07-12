@@ -229,28 +229,28 @@ That said, a line-by-line read reveals 47 distinct specification gaps. The most 
 - **Why it matters**: If the ceiling can change via governance (ADR-008), then ADR-009's security argument about immutable ceilings is invalid. The `check_ceiling` function must handle ceiling changes, including race conditions where a UCAN was minted under one ceiling and validated under a different one.
 - **Severity**: HIGH
 
-### [ADR-010] Tool Implementation Hash Has No Defined Hash Target
+### [ADR-010] Outlet Implementation Hash Has No Defined Hash Target
 
 - **Category**: Decisions without implementation guidance
 - **Location**: ADR-010, Acceptance Criterion 1 (phase-2.md:509)
-- **What's missing**: `implementation_hash: [u8; 32]` is "SHA-256 of implementation." But what exactly is hashed? The tool's source code? A compiled binary? A WASM module? A Docker image? The tool's response to a specific input? Without a defined hash target, the hash is meaningless for integrity verification -- two implementations of the same tool will produce different hashes.
-- **Why it matters**: Tool integrity verification (Criterion 5) compares implementation hashes over time. If the hash target is not canonical, hash changes do not reliably indicate implementation changes, and the entire tool integrity mechanism is cosmetic.
+- **What's missing**: `implementation_hash: [u8; 32]` is "SHA-256 of implementation." But what exactly is hashed? The outlet's source code? A compiled binary? A WASM module? A Docker image? The outlet's response to a specific input? Without a defined hash target, the hash is meaningless for integrity verification -- two implementations of the same outlet will produce different hashes.
+- **Why it matters**: Outlet integrity verification (Criterion 5) compares implementation hashes over time. If the hash target is not canonical, hash changes do not reliably indicate implementation changes, and the entire outlet integrity mechanism is cosmetic.
 - **Severity**: MEDIUM
 
-### [ADR-010] Cross-Context Tool Interface Has No Key Exchange
+### [ADR-010] Cross-Context Outlet Interface Has No Key Exchange
 
 - **Category**: Underspecified interfaces
 - **Location**: ADR-010, Acceptance Criterion 6 (phase-2.md:617-633)
-- **What's missing**: Cross-context tool invocation sends requests and responses between two separate MLS groups. But the two contexts have different MLS groups with different keys. How does the request/response travel between contexts? Through the transport layer? If so, how is it encrypted -- is it plaintext at the relay? Does it create a third MLS group for the interface? The ADR says "Both event logs record the call" but does not specify the transport mechanism.
-- **Why it matters**: Without a defined transport for cross-context communication, the security properties of tool interface calls are undefined. If requests traverse relays unencrypted, tool input/output is exposed to relay operators.
+- **What's missing**: Cross-context outlet invocation sends requests and responses between two separate MLS groups. But the two contexts have different MLS groups with different keys. How does the request/response travel between contexts? Through the transport layer? If so, how is it encrypted -- is it plaintext at the relay? Does it create a third MLS group for the interface? The ADR says "Both event logs record the call" but does not specify the transport mechanism.
+- **Why it matters**: Without a defined transport for cross-context communication, the security properties of outlet interface calls are undefined. If requests traverse relays unencrypted, outlet input/output is exposed to relay operators.
 - **Severity**: HIGH
 
-### [ADR-010] Tool Invocation Is Specified But Tool Execution Is Not
+### [ADR-010] Outlet Invocation Is Specified But Outlet Execution Is Not
 
 - **Category**: Decisions without implementation guidance
 - **Location**: ADR-010, Acceptance Criterion 3 (phase-2.md:538-539)
-- **What's missing**: "Calls the tool implementation." How? The ADR defines the request/response protocol, schema validation, event logging, and UCAN authorization. But it never specifies how a tool implementation is actually executed. Is it a function pointer? A WASM sandbox? A subprocess? An HTTP call? The `operator_did` field suggests the tool runs externally, but the execution boundary is not defined.
-- **Why it matters**: Tool execution is the actual security boundary. A tool that executes arbitrary code in the SDK process is fundamentally different from a sandboxed WASM module. The ADR specifies everything around the tool but not the tool itself.
+- **What's missing**: "Calls the outlet implementation." How? The ADR defines the request/response protocol, schema validation, event logging, and UCAN authorization. But it never specifies how an outlet implementation is actually executed. Is it a function pointer? A WASM sandbox? A subprocess? An HTTP call? The `operator_did` field suggests the outlet runs externally, but the execution boundary is not defined.
+- **Why it matters**: Outlet execution is the actual security boundary. An outlet that executes arbitrary code in the SDK process is fundamentally different from a sandboxed WASM module. The ADR specifies everything around the outlet but not the outlet itself.
 - **Severity**: MEDIUM
 
 ### [ADR-011] Absence Proof Sorted Index Is Not Part of Merkle Tree
@@ -297,7 +297,7 @@ That said, a line-by-line read reveals 47 distinct specification gaps. The most 
 
 - **Category**: Scope gaps
 - **Location**: ADR-013, Acceptance Criteria 1-8 (phase-3.md:70-158)
-- **What's missing**: The bridge exposes identity, context, tools, transport, UCAN, and event log operations. But sender key operations (ADR-007) are completely absent: no `py_sender_key_*` functions, no `PySenderKey` type, no block/unblock functions. The Python SDK cannot manage blocking, which is a core SCP feature.
+- **What's missing**: The bridge exposes identity, context, outlets, transport, UCAN, and event log operations. But sender key operations (ADR-007) are completely absent: no `py_sender_key_*` functions, no `PySenderKey` type, no block/unblock functions. The Python SDK cannot manage blocking, which is a core SCP feature.
 - **Why it matters**: Python SDK users cannot block other members, manage sender key epochs, or handle block notifications. This makes the Python SDK incomplete for the protocol's social features.
 - **Severity**: MEDIUM
 
@@ -361,7 +361,7 @@ That said, a line-by-line read reveals 47 distinct specification gaps. The most 
 
 - **Category**: Underspecified interfaces
 - **Location**: ADR-016, Criterion 2, Step 6 (phase-3.md:745)
-- **What's missing**: "Capability matching supports wildcards (scp:ctx:*/messages:write matches any context)." But wildcard semantics are not fully specified. Does `*` match only the context_id position, or can it appear in other positions? Does `scp:ctx:abc123/*` match all capabilities in a context? Does `scp:ctx:*/tool_invoke:*` match all tool invocations in all contexts? Is `*` the only wildcard, or are regex patterns supported?
+- **What's missing**: "Capability matching supports wildcards (scp:ctx:*/messages:write matches any context)." But wildcard semantics are not fully specified. Does `*` match only the context_id position, or can it appear in other positions? Does `scp:ctx:abc123/*` match all capabilities in a context? Does `scp:ctx:*/outlet:call:*` match all outlet invocations in all contexts? Is `*` the only wildcard, or are regex patterns supported?
 - **Why it matters**: Overly broad wildcard matching can accidentally grant unintended capabilities. An implementer who interprets `*` generously could create a privilege escalation path.
 - **Severity**: MEDIUM
 
@@ -469,7 +469,7 @@ ADR-009 and ADR-016 both claim to be normative for nonce format, and they specif
 
 ### Cross-Context Communication Has No Transport Specification
 
-ADR-010's cross-context tool interfaces and ADR-003's DID rotation events both need to send messages between different MLS groups. Neither ADR specifies the transport mechanism for cross-group communication. This is a fundamental architectural gap -- the protocol defines intra-context communication thoroughly but cross-context communication is hand-waved.
+ADR-010's cross-context outlet interfaces and ADR-003's DID rotation events both need to send messages between different MLS groups. Neither ADR specifies the transport mechanism for cross-group communication. This is a fundamental architectural gap -- the protocol defines intra-context communication thoroughly but cross-context communication is hand-waved.
 
 ### The CeilingPolicy::Governed vs. Immutable Ceiling Contradiction
 
@@ -504,6 +504,6 @@ ADR-008 introduces `CeilingPolicy::Governed` while ADR-009 repeatedly asserts ce
 8. Ceiling immutability contradicts CeilingPolicy::Governed
 9. Nonce format duplicated and conflicting between ADR-009/016
 10. UCAN CID computation not specified
-11. Cross-context tool interface has no key exchange/transport
+11. Cross-context outlet interface has no key exchange/transport
 12. SpendingCapability tracking state not specified
 13. Consistency checkpoint does not verify remote signature

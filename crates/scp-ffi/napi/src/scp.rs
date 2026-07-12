@@ -43,13 +43,13 @@ use crate::mcp::{
     NapiAllowlistState, NapiMcpClientHandle, NapiMcpInvokeResult, NapiMcpServerConfig,
     NapiMcpServerHandle, NapiMcpToolInfo,
 };
+use crate::outlets::{NapiOutletDefinition, NapiOutletVerificationResult};
 use crate::runtime::{NapiBridgeInstance, SqliteKeyMaterial, StorageConfig};
 #[cfg(feature = "server")]
 use crate::server::{NapiNodeHandle, NapiRelayHandle};
 use crate::sync::NapiSyncPolicy;
 #[cfg(feature = "allow_in_memory_custody")]
 use crate::testing::NapiFullStackNode;
-use crate::tools::{NapiToolDefinition, NapiToolVerificationResult};
 use crate::transport::{NapiReliabilityScore, NapiTransportManager, NapiTransportStatus};
 use crate::trust::{NapiAttestationVerificationResult, NapiChallengeResult, NapiTrustScoreResult};
 use crate::ucan::NapiUcanToken;
@@ -2047,7 +2047,7 @@ impl Scp {
     // #1549 Phase 4 PR 4 — sub-slice C: context operations on SCP.
     //
     // Each method delegates to the per-bridge-instance `_on` helpers in
-    // [`crate::context`] / [`crate::tools`], routing through `&*self.inner`
+    // [`crate::context`] / [`crate::outlets`], routing through `&*self.inner`
     // so operations are scoped to this `SCP`'s bridge instance. The
     // free-function façade that predated this migration was deleted in
     // the Phase 4 PR 4 demolition slice (ADR-048).
@@ -2860,26 +2860,26 @@ impl Scp {
         )
     }
 
-    // ===== sub-slice C: tools =====
+    // ===== sub-slice C: outlets =====
 
-    /// Per-instance equivalent of the free-function `tool_register`.
-    #[napi(js_name = "toolRegister")]
-    pub async fn tool_register(
+    /// Per-instance equivalent of the free-function `outlet_register`.
+    #[napi(js_name = "outletRegister")]
+    pub async fn outlet_register(
         &self,
         handle: &NapiContextHandle,
-        definition: NapiToolDefinition,
+        definition: NapiOutletDefinition,
     ) -> napi::Result<String> {
         crate::napi_check_handle!(&self.inner.core, handle);
-        crate::tools::tool_register_on(&self.inner, handle, definition).await
+        crate::outlets::outlet_register_on(&self.inner, handle, definition).await
     }
 
-    /// Per-instance equivalent of the free-function `tool_invoke`.
-    #[napi(js_name = "toolInvoke")]
+    /// Per-instance equivalent of the free-function `outlet_invoke`.
+    #[napi(js_name = "outletInvoke")]
     #[allow(clippy::too_many_arguments)]
-    pub async fn tool_invoke(
+    pub async fn outlet_invoke(
         &self,
         handle: &NapiContextHandle,
-        tool_id: String,
+        outlet_id: String,
         input_json: String,
         identity_did: String,
         ucan_token: String,
@@ -2887,10 +2887,10 @@ impl Scp {
         spending_ucan_jwt: Option<String>,
     ) -> napi::Result<String> {
         crate::napi_check_handle!(&self.inner.core, handle);
-        crate::tools::tool_invoke_on(
+        crate::outlets::outlet_invoke_on(
             &self.inner,
             handle,
-            tool_id,
+            outlet_id,
             input_json,
             identity_did,
             ucan_token,
@@ -2900,25 +2900,25 @@ impl Scp {
         .await
     }
 
-    /// Per-instance equivalent of the free-function `tool_verify`.
-    #[napi(js_name = "toolVerify")]
-    pub async fn tool_verify(
+    /// Per-instance equivalent of the free-function `outlet_verify`.
+    #[napi(js_name = "outletVerify")]
+    pub async fn outlet_verify(
         &self,
         handle: &NapiContextHandle,
-        tool_id: String,
-    ) -> napi::Result<NapiToolVerificationResult> {
+        outlet_id: String,
+    ) -> napi::Result<NapiOutletVerificationResult> {
         crate::napi_check_handle!(&self.inner.core, handle);
-        crate::tools::tool_verify_on(&self.inner, handle, tool_id).await
+        crate::outlets::outlet_verify_on(&self.inner, handle, outlet_id).await
     }
 
-    /// Per-instance equivalent of the free-function `tool_invoke_cross_context`.
-    #[napi(js_name = "toolInvokeCrossContext")]
+    /// Per-instance equivalent of the free-function `outlet_invoke_cross_context`.
+    #[napi(js_name = "outletInvokeCrossContext")]
     #[allow(clippy::too_many_arguments)]
-    pub async fn tool_invoke_cross_context(
+    pub async fn outlet_invoke_cross_context(
         &self,
         source_handle: &NapiContextHandle,
         target_handle: &NapiContextHandle,
-        tool_id: String,
+        outlet_id: String,
         input_json: String,
         invoker_did: String,
         ucan_token: String,
@@ -2926,11 +2926,11 @@ impl Scp {
         proof_tokens: Option<Vec<String>>,
     ) -> napi::Result<String> {
         crate::napi_check_handle!(&self.inner.core, source_handle, target_handle);
-        crate::tools::tool_invoke_cross_context_on(
+        crate::outlets::outlet_invoke_cross_context_on(
             &self.inner,
             source_handle,
             target_handle,
-            tool_id,
+            outlet_id,
             input_json,
             invoker_did,
             ucan_token,
@@ -2940,14 +2940,14 @@ impl Scp {
         .await
     }
 
-    /// Invokes a tool across context boundaries as an atomic two-phase saga
+    /// Invokes an outlet across context boundaries as an atomic two-phase saga
     /// (spec §6.2.4, ADR-049 §3a).
     ///
-    /// Unlike [`Self::tool_invoke_cross_context`] (the synchronous,
+    /// Unlike [`Self::outlet_invoke_cross_context`] (the synchronous,
     /// single-context-side path), this drives the full §6.2.4 cross-context
-    /// tool-invocation saga over the two CO-RESIDENT participant contexts
+    /// outlet-invocation saga over the two CO-RESIDENT participant contexts
     /// (caller = `source_handle`, target = `target_handle`): Prepare-A /
-    /// Prepare-B authorize and stage both sides, the tool executes EXACTLY ONCE
+    /// Prepare-B authorize and stage both sides, the outlet executes EXACTLY ONCE
     /// supervisor-side at Commit-B, and each side records its own event-log
     /// entry. Both contexts MUST be co-resident in this bridge instance.
     ///
@@ -2977,7 +2977,7 @@ impl Scp {
     /// The caller/target context-id axes are bound by the instance-affine
     /// handle pre-check: `source_handle` / `target_handle` must have been minted
     /// by THIS bridge instance (a foreign handle is rejected with
-    /// `SCP-PERM-3030`) before the supervisor membership / tool-interface gates
+    /// `SCP-PERM-3030`) before the supervisor membership / outlet-interface gates
     /// run.
     ///
     /// The receipt's signer-authorization — that the target key is
@@ -2990,21 +2990,21 @@ impl Scp {
     /// * `source_handle` — The initiating (caller) context handle.
     /// * `target_handle` — The executing (target) context handle.
     /// * `caller_did` — The initiator DID (bound to the bridge principal).
-    /// * `tool_registration_id` — The tool to invoke across the interface.
-    /// * `input_json` — Tool input as a JSON string (schema-checked target-side).
+    /// * `outlet_registration_id` — The outlet to invoke across the interface.
+    /// * `input_json` — Outlet input as a JSON string (schema-checked target-side).
     /// * `asserted_nonce_hex` — The 16-byte §6.2.4 envelope nonce as a 32-char
     ///   hex string (the freshness/dedup token).
     /// * `timestamp_ms` — Caller-asserted send time (Unix ms; freshness check),
     ///   passed as a JS `BigInt`.
     /// * `chain_depth` — Caller-asserted inbound provenance depth (advisory).
     /// * `ucan_proof_id` — Optional id of the spending UCAN proof, resolved
-    ///   target-side at Prepare-B. `null` for an ungated tool.
+    ///   target-side at Prepare-B. `null` for an ungated outlet.
     ///
     /// # Returns
     ///
-    /// A [`NapiSagaResult`](crate::tools::NapiSagaResult) on the committed
+    /// A [`NapiSagaResult`](crate::outlets::NapiSagaResult) on the committed
     /// terminal, carrying the supervisor-minted `saga_id`, the target's signed
-    /// receipt bytes, and the captured tool-output bytes. The `saga_id` is
+    /// receipt bytes, and the captured outlet-output bytes. The `saga_id` is
     /// supervisor-minted — it is never an input.
     ///
     /// # Errors
@@ -3016,24 +3016,24 @@ impl Scp {
     /// `retry_after_ms`), `SagaNeedsRepair` (Commit-retry exhausted —
     /// carries the durable `saga_id`), or `SagaBusy` (the participant context
     /// set overlapped an in-flight saga — §5.15.4). Rejects with a validation
-    /// error if an id/DID/tool-id is malformed or `asserted_nonce_hex` does not
+    /// error if an id/DID/outlet-id is malformed or `asserted_nonce_hex` does not
     /// decode to 16 bytes.
     ///
     /// See spec §6.2.4 and ADR-049 §3a.
-    #[napi(js_name = "toolInvokeCrossContextSaga")]
+    #[napi(js_name = "outletInvokeCrossContextSaga")]
     #[allow(clippy::too_many_arguments)]
-    pub async fn tool_invoke_cross_context_saga(
+    pub async fn outlet_invoke_cross_context_saga(
         &self,
         source_handle: &NapiContextHandle,
         target_handle: &NapiContextHandle,
         caller_did: String,
-        tool_registration_id: String,
+        outlet_registration_id: String,
         input_json: String,
         asserted_nonce_hex: String,
         timestamp_ms: napi::bindgen_prelude::BigInt,
         chain_depth: u8,
         ucan_proof_id: Option<String>,
-    ) -> napi::Result<crate::tools::NapiSagaResult> {
+    ) -> napi::Result<crate::outlets::NapiSagaResult> {
         crate::napi_check_handle!(&self.inner.core, source_handle, target_handle);
 
         // `timestamp_ms` crosses as a JS `BigInt`. `BigInt::get_u64` returns
@@ -3052,12 +3052,12 @@ impl Scp {
 
         // Box the impl future: the multi-phase saga it drives is large enough
         // to trip `clippy::large_futures` when inlined into this method.
-        Box::pin(crate::tools::tool_invoke_cross_context_saga_on(
+        Box::pin(crate::outlets::outlet_invoke_cross_context_saga_on(
             &self.inner,
             source_handle,
             target_handle,
             caller_did,
-            tool_registration_id,
+            outlet_registration_id,
             input_json,
             asserted_nonce_hex,
             timestamp_ms_u64,
@@ -3067,29 +3067,29 @@ impl Scp {
         .await
     }
 
-    /// Per-instance equivalent of the free-function `tool_session_create`.
-    #[napi(js_name = "toolSessionCreate")]
-    pub async fn tool_session_create(
+    /// Per-instance equivalent of the free-function `outlet_session_create`.
+    #[napi(js_name = "outletSessionCreate")]
+    pub async fn outlet_session_create(
         &self,
         handle: &NapiContextHandle,
-        tool_id: String,
+        outlet_id: String,
         source_context_id: String,
         ttl_seconds: Option<u32>,
     ) -> napi::Result<String> {
         crate::napi_check_handle!(&self.inner.core, handle);
-        crate::tools::tool_session_create_on(
+        crate::outlets::outlet_session_create_on(
             &self.inner,
             handle,
-            tool_id,
+            outlet_id,
             source_context_id,
             ttl_seconds,
         )
         .await
     }
 
-    /// Per-instance equivalent of the free-function `tool_session_invoke`.
-    #[napi(js_name = "toolSessionInvoke")]
-    pub async fn tool_session_invoke(
+    /// Per-instance equivalent of the free-function `outlet_session_invoke`.
+    #[napi(js_name = "outletSessionInvoke")]
+    pub async fn outlet_session_invoke(
         &self,
         handle: &NapiContextHandle,
         session_id: String,
@@ -3099,7 +3099,7 @@ impl Scp {
         proof_tokens: Option<Vec<String>>,
     ) -> napi::Result<String> {
         crate::napi_check_handle!(&self.inner.core, handle);
-        crate::tools::tool_session_invoke_on(
+        crate::outlets::outlet_session_invoke_on(
             &self.inner,
             handle,
             session_id,
@@ -3111,57 +3111,57 @@ impl Scp {
         .await
     }
 
-    /// Per-instance equivalent of the free-function `tool_session_close`.
-    #[napi(js_name = "toolSessionClose")]
-    pub async fn tool_session_close(
+    /// Per-instance equivalent of the free-function `outlet_session_close`.
+    #[napi(js_name = "outletSessionClose")]
+    pub async fn outlet_session_close(
         &self,
         handle: &NapiContextHandle,
         session_id: String,
     ) -> napi::Result<()> {
         crate::napi_check_handle!(&self.inner.core, handle);
-        crate::tools::tool_session_close_on(&self.inner, handle, session_id).await
+        crate::outlets::outlet_session_close_on(&self.inner, handle, session_id).await
     }
 
-    /// Per-instance equivalent of the free-function `tool_interface_expose`.
-    #[napi(js_name = "toolInterfaceExpose")]
-    pub async fn tool_interface_expose(
+    /// Per-instance equivalent of the free-function `outlet_interface_expose`.
+    #[napi(js_name = "outletInterfaceExpose")]
+    pub async fn outlet_interface_expose(
         &self,
         handle: &NapiContextHandle,
-        tool_id: String,
+        outlet_id: String,
         target_context_id: String,
         rate_limit_json: Option<String>,
     ) -> napi::Result<String> {
         crate::napi_check_handle!(&self.inner.core, handle);
-        crate::tools::tool_interface_expose_on(
+        crate::outlets::outlet_interface_expose_on(
             &self.inner,
             handle,
-            tool_id,
+            outlet_id,
             target_context_id,
             rate_limit_json,
         )
         .await
     }
 
-    /// Per-instance equivalent of the free-function `tool_interface_accept`.
-    #[napi(js_name = "toolInterfaceAccept")]
-    pub async fn tool_interface_accept(
+    /// Per-instance equivalent of the free-function `outlet_interface_accept`.
+    #[napi(js_name = "outletInterfaceAccept")]
+    pub async fn outlet_interface_accept(
         &self,
         handle: &NapiContextHandle,
         interface_json: String,
     ) -> napi::Result<String> {
         crate::napi_check_handle!(&self.inner.core, handle);
-        crate::tools::tool_interface_accept_on(&self.inner, handle, interface_json).await
+        crate::outlets::outlet_interface_accept_on(&self.inner, handle, interface_json).await
     }
 
-    /// Per-instance equivalent of the free-function `tool_interface_revoke`.
-    #[napi(js_name = "toolInterfaceRevoke")]
-    pub async fn tool_interface_revoke(
+    /// Per-instance equivalent of the free-function `outlet_interface_revoke`.
+    #[napi(js_name = "outletInterfaceRevoke")]
+    pub async fn outlet_interface_revoke(
         &self,
         handle: &NapiContextHandle,
         interface_id_hex: String,
     ) -> napi::Result<String> {
         crate::napi_check_handle!(&self.inner.core, handle);
-        crate::tools::tool_interface_revoke_on(&self.inner, handle, interface_id_hex).await
+        crate::outlets::outlet_interface_revoke_on(&self.inner, handle, interface_id_hex).await
     }
 
     // ====================================================================
@@ -3771,7 +3771,7 @@ impl Scp {
     pub async fn mcp_client_invoke(
         &self,
         handle: &NapiMcpClientHandle,
-        tool_name: String,
+        outlet_name: String,
         input_json: String,
         context_id: String,
         invoker_did: String,
@@ -3780,7 +3780,7 @@ impl Scp {
         crate::mcp::mcp_client_invoke_on(
             &self.inner,
             handle,
-            tool_name,
+            outlet_name,
             input_json,
             context_id,
             invoker_did,

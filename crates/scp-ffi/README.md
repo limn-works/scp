@@ -32,8 +32,8 @@ replaced the previously-shared `Arc<ContextManager>`, now deleted (ADR-049
 actor-per-context).
 
 **FfiBridgeState** (per-context, `OnceLock<DashMap<String, _>>`): FFI-only state
-that does not duplicate Supervisor state -- tool registry, event log, UCAN
-revocation list, nonce tracker, capability ceiling, tool handlers, message
+that does not duplicate Supervisor state -- outlet registry, event log, UCAN
+revocation list, nonce tracker, capability ceiling, outlet handlers, message
 channels.
 
 **Identity registry** (per-instance `Arc<DashMap<..>>` on `PyBridgeInstance`,
@@ -59,14 +59,14 @@ A single multi-threaded tokio runtime (`RUNTIME`, an `OnceLock<Runtime>` in
 | `error.rs` | `ScpPyError` to Python exception mapping |
 | `event_log.rs` | Merkle event log query and verify |
 | `identity.rs` | DID create, load, resolve, rotate, migrate |
-| `mcp.rs` | MCP server/client (stdio + SSE), tool handlers |
+| `mcp.rs` | MCP server/client (stdio + SSE), outlet handlers |
 | `media.rs` | Media session lifecycle and signaling |
 | `provenance.rs` | Provenance attach and chain verification |
 | `runtime.rs` | Per-instance state on `PyBridgeInstance` (supervisor slot, FFI bridge state, identity registry, transport, storage) |
 | `scpid.rs` | SCPID stateless DID authentication -- challenge, sign, verify (§3.11) |
 | `server.rs` | Relay / application-node server startup (wraps `scp-ffi-common::server`) |
 | `sync.rs` | Offline sync classification |
-| `tools.rs` | Tool register, invoke, verify |
+| `outlets.rs` | Outlet register, invoke, verify |
 | `transport.rs` | Relay connect, disconnect, status |
 | `trust.rs` | Trust evaluation |
 | `types.rs` | JSON <-> Python dict conversion |

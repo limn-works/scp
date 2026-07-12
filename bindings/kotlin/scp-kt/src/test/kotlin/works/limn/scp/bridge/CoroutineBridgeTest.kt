@@ -188,7 +188,7 @@ class CoroutineBridgeTest {
         @Test
         fun `discriminated-union variant names are pinned`() {
             assertEquals(
-                listOf("MessageVelocity", "ToolRateExceeded", "WarningCount", "Custom"),
+                listOf("MessageVelocity", "OutletRateExceeded", "WarningCount", "Custom"),
                 works.limn.scp.CONSEQUENCE_TRIGGER_VARIANT_NAMES,
             )
             assertEquals(
@@ -231,57 +231,57 @@ class CoroutineBridgeTest {
     }
 
     // -------------------------------------------------------------------
-    // Dispatcher assignment tests — tool, UCAN, infra operations
+    // Dispatcher assignment tests — outlet, UCAN, infra operations
     // -------------------------------------------------------------------
 
     @Nested
-    inner class ToolUcanInfraDispatcherTests {
+    inner class OutletUcanInfraDispatcherTests {
         @Test
-        fun `toolRegister dispatches on IO`() =
+        fun `outletRegister dispatches on IO`() =
             runTest(ioDispatcher) {
-                stubBindings.toolRegisterResult = "tool-001"
-                val result = bridge.tools.register(10L, """{"name":"test"}""")
-                assertEquals("tool-001", result)
+                stubBindings.outletRegisterResult = "outlet-001"
+                val result = bridge.outlets.register(10L, """{"name":"test"}""")
+                assertEquals("outlet-001", result)
             }
 
         @Test
-        fun `toolInvoke dispatches on IO`() =
+        fun `outletInvoke dispatches on IO`() =
             runTest(ioDispatcher) {
-                stubBindings.toolInvokeResult = """{"output":"ok"}"""
-                val result = bridge.tools.invoke(10L, "tool-001", """{"input":"data"}""", 1L, "ucan.token.sig")
+                stubBindings.outletInvokeResult = """{"output":"ok"}"""
+                val result = bridge.outlets.invoke(10L, "outlet-001", """{"input":"data"}""", 1L, "ucan.token.sig")
                 assertEquals("""{"output":"ok"}""", result)
             }
 
         @Test
-        fun `toolInvoke forwards identityHandle`() =
+        fun `outletInvoke forwards identityHandle`() =
             runTest(ioDispatcher) {
-                stubBindings.toolInvokeResult = """{"ok":true}"""
-                bridge.tools.invoke(10L, "tool-001", """{}""", 42L, null)
-                assertEquals(42L, stubBindings.lastToolInvokeIdentityHandle)
+                stubBindings.outletInvokeResult = """{"ok":true}"""
+                bridge.outlets.invoke(10L, "outlet-001", """{}""", 42L, null)
+                assertEquals(42L, stubBindings.lastOutletInvokeIdentityHandle)
             }
 
         @Test
-        fun `toolInvoke forwards ucanToken`() =
+        fun `outletInvoke forwards ucanToken`() =
             runTest(ioDispatcher) {
-                stubBindings.toolInvokeResult = """{"ok":true}"""
-                bridge.tools.invoke(10L, "tool-001", """{}""", 1L, "header.payload.signature")
-                assertEquals("header.payload.signature", stubBindings.lastToolInvokeUcanToken)
+                stubBindings.outletInvokeResult = """{"ok":true}"""
+                bridge.outlets.invoke(10L, "outlet-001", """{}""", 1L, "header.payload.signature")
+                assertEquals("header.payload.signature", stubBindings.lastOutletInvokeUcanToken)
             }
 
         @Test
-        fun `toolInvoke forwards non-null proofTokens`() =
+        fun `outletInvoke forwards non-null proofTokens`() =
             runTest(ioDispatcher) {
-                stubBindings.toolInvokeResult = """{"ok":true}"""
+                stubBindings.outletInvokeResult = """{"ok":true}"""
                 val proofs = listOf("proof1.token", "proof2.token")
-                bridge.tools.invoke(10L, "tool-001", """{}""", 1L, "ucan.tok", proofs)
-                assertEquals(proofs, stubBindings.lastToolInvokeProofTokens)
+                bridge.outlets.invoke(10L, "outlet-001", """{}""", 1L, "ucan.tok", proofs)
+                assertEquals(proofs, stubBindings.lastOutletInvokeProofTokens)
             }
 
         @Test
-        fun `toolVerify dispatches on IO`() =
+        fun `outletVerify dispatches on IO`() =
             runTest(ioDispatcher) {
-                stubBindings.toolVerifyResult = """{"tool_id":"tool-001","passed":true,"failures":[]}"""
-                val result = bridge.tools.verify(10L, "tool-001")
+                stubBindings.outletVerifyResult = """{"outlet_id":"outlet-001","passed":true,"failures":[]}"""
+                val result = bridge.outlets.verify(10L, "outlet-001")
                 assertTrue(result.contains("\"passed\":true"))
             }
 
@@ -376,20 +376,20 @@ class CoroutineBridgeTest {
     }
 
     // -------------------------------------------------------------------
-    // Dispatcher assignment tests — tool session + cross-context operations
+    // Dispatcher assignment tests — outlet session + cross-context operations
     // -------------------------------------------------------------------
 
     @Nested
-    inner class ToolSessionDispatcherTests {
+    inner class OutletSessionDispatcherTests {
         @Test
         fun `invokeCrossContext dispatches on IO and forwards all arguments`() =
             runTest(ioDispatcher) {
-                stubBindings.toolInvokeCrossContextResult = """{"output":"xctx"}"""
+                stubBindings.outletInvokeCrossContextResult = """{"output":"xctx"}"""
                 val result =
-                    bridge.tools.invokeCrossContext(
+                    bridge.outlets.invokeCrossContext(
                         1L,
                         2L,
-                        "tool-001",
+                        "outlet-001",
                         """{"query":"test"}""",
                         42L,
                         "ucan.tok.sig",
@@ -399,7 +399,7 @@ class CoroutineBridgeTest {
                 assertEquals("""{"output":"xctx"}""", result)
                 assertEquals(1L, stubBindings.lastCrossContextSourceHandle)
                 assertEquals(2L, stubBindings.lastCrossContextTargetHandle)
-                assertEquals("tool-001", stubBindings.lastCrossContextToolId)
+                assertEquals("outlet-001", stubBindings.lastCrossContextOutletId)
                 assertEquals("""{"query":"test"}""", stubBindings.lastCrossContextInputJson)
                 assertEquals(42L, stubBindings.lastCrossContextIdentityHandle)
                 assertEquals("ucan.tok.sig", stubBindings.lastCrossContextUcanToken)
@@ -410,10 +410,10 @@ class CoroutineBridgeTest {
         @Test
         fun `sessionCreate dispatches on IO and forwards arguments`() =
             runTest(ioDispatcher) {
-                stubBindings.toolSessionCreateResult = "session-abc"
-                val result = bridge.tools.sessionCreate(10L, "tool-001", "src-ctx", 3600L)
+                stubBindings.outletSessionCreateResult = "session-abc"
+                val result = bridge.outlets.sessionCreate(10L, "outlet-001", "src-ctx", 3600L)
                 assertEquals("session-abc", result)
-                assertEquals("tool-001", stubBindings.lastSessionCreateToolId)
+                assertEquals("outlet-001", stubBindings.lastSessionCreateOutletId)
                 assertEquals("src-ctx", stubBindings.lastSessionCreateSourceContextId)
                 assertEquals(3600L, stubBindings.lastSessionCreateTtlSeconds)
             }
@@ -421,16 +421,16 @@ class CoroutineBridgeTest {
         @Test
         fun `sessionCreate forwards null ttlSeconds`() =
             runTest(ioDispatcher) {
-                bridge.tools.sessionCreate(10L, "tool-001", "src-ctx", null)
+                bridge.outlets.sessionCreate(10L, "outlet-001", "src-ctx", null)
                 assertEquals(null, stubBindings.lastSessionCreateTtlSeconds)
             }
 
         @Test
         fun `sessionInvoke dispatches on IO and forwards all arguments`() =
             runTest(ioDispatcher) {
-                stubBindings.toolSessionInvokeResult = """{"out":"ok"}"""
+                stubBindings.outletSessionInvokeResult = """{"out":"ok"}"""
                 val result =
-                    bridge.tools.sessionInvoke(
+                    bridge.outlets.sessionInvoke(
                         10L,
                         "session-001",
                         """{"input":"data"}""",
@@ -449,8 +449,8 @@ class CoroutineBridgeTest {
         @Test
         fun `sessionClose dispatches on IO and forwards sessionId`() =
             runTest(ioDispatcher) {
-                bridge.tools.sessionClose(10L, "session-001")
-                assertTrue(stubBindings.toolSessionCloseCalled)
+                bridge.outlets.sessionClose(10L, "session-001")
+                assertTrue(stubBindings.outletSessionCloseCalled)
                 assertEquals("session-001", stubBindings.lastSessionCloseSessionId)
             }
     }
@@ -847,7 +847,7 @@ private fun h15TypedRulesFixture(): List<works.limn.scp.ConsequenceRule> {
             works.limn.scp.EnforcementSeverity.SuspendCapability(
                 listOf(
                     works.limn.scp.ConsequenceCapability.Unit("MessagesWrite"),
-                    works.limn.scp.ConsequenceCapability.ToolInvoke("calculator"),
+                    works.limn.scp.ConsequenceCapability.OutletCall("calculator"),
                     works.limn.scp.ConsequenceCapability.Custom("my-custom-cap"),
                 ),
             ),
@@ -893,8 +893,8 @@ private fun assertConsequenceRulesJson(rulesJson: String) {
         "Unit capability should serialize as bare string",
     )
     assertTrue(
-        rulesJson.contains("{\"ToolInvoke\":\"calculator\"}"),
-        "ToolInvoke newtype should serialize with the inner string",
+        rulesJson.contains("{\"OutletCall\":\"calculator\"}"),
+        "OutletCall newtype should serialize with the inner string",
     )
     assertTrue(
         rulesJson.contains("{\"Custom\":\"my-custom-cap\"}"),
@@ -953,11 +953,11 @@ class StubNativeBindings : NativeBindings {
     var lastMessageCallback: MessageCallback? = null
     var lastCancellationHandle: CancellationHandle? = null
 
-    // toolInvoke argument captures
-    var lastToolInvokeIdentityHandle: Long? = null
-    var lastToolInvokeUcanToken: String? = null
-    var lastToolInvokeProofTokens: List<String>? = null
-    var lastToolInvokeSpendingUcan: String? = null
+    // outletInvoke argument captures
+    var lastOutletInvokeIdentityHandle: Long? = null
+    var lastOutletInvokeUcanToken: String? = null
+    var lastOutletInvokeProofTokens: List<String>? = null
+    var lastOutletInvokeSpendingUcan: String? = null
 
     // Configurable results
     var identityCreateResult = 0L
@@ -968,9 +968,9 @@ class StubNativeBindings : NativeBindings {
     var contextSubscribeResult = 0L
     var lastConsequenceRulesJson: String? = null
     var lastConsequenceConfigJson: String? = null
-    var toolRegisterResult = ""
-    var toolInvokeResult = ""
-    var toolVerifyResult = """{"tool_id":"stub","passed":true,"failures":[]}"""
+    var outletRegisterResult = ""
+    var outletInvokeResult = ""
+    var outletVerifyResult = """{"outlet_id":"stub","passed":true,"failures":[]}"""
     var ucanMintResult = ""
     var ucanDelegateResult = ""
     var eventLogQueryResult = ""
@@ -1257,81 +1257,81 @@ class StubNativeBindings : NativeBindings {
         return broadcastPublishAssetsResult
     }
 
-    // Tool session argument captures
+    // Outlet session argument captures
     var lastCrossContextSourceHandle: Long? = null
     var lastCrossContextTargetHandle: Long? = null
-    var lastCrossContextToolId: String? = null
+    var lastCrossContextOutletId: String? = null
     var lastCrossContextInputJson: String? = null
     var lastCrossContextIdentityHandle: Long? = null
     var lastCrossContextUcanToken: String? = null
     var lastCrossContextChainDepth: Int? = null
     var lastCrossContextProofTokens: List<String>? = null
-    var toolInvokeCrossContextResult = """{"output":"cross"}"""
+    var outletInvokeCrossContextResult = """{"output":"cross"}"""
 
-    var lastSessionCreateToolId: String? = null
+    var lastSessionCreateOutletId: String? = null
     var lastSessionCreateSourceContextId: String? = null
     var lastSessionCreateTtlSeconds: Long? = null
-    var toolSessionCreateResult = "session-001"
+    var outletSessionCreateResult = "session-001"
 
     var lastSessionInvokeSessionId: String? = null
     var lastSessionInvokeInputJson: String? = null
     var lastSessionInvokeIdentityHandle: Long? = null
     var lastSessionInvokeUcanToken: String? = null
     var lastSessionInvokeProofTokens: List<String>? = null
-    var toolSessionInvokeResult = """{"output":"session"}"""
+    var outletSessionInvokeResult = """{"output":"session"}"""
 
-    var toolSessionCloseCalled = false
+    var outletSessionCloseCalled = false
     var lastSessionCloseSessionId: String? = null
 
-    override fun toolRegister(
+    override fun outletRegister(
         contextHandle: Long,
         definitionJson: String,
-    ): String = toolRegisterResult
+    ): String = outletRegisterResult
 
     @Suppress("LongParameterList")
-    override fun toolInvoke(
+    override fun outletInvoke(
         contextHandle: Long,
-        toolId: String,
+        outletId: String,
         inputJson: String,
         identityHandle: Long,
         ucanToken: String?,
         proofTokens: List<String>?,
         spendingUcan: String?,
     ): String {
-        lastToolInvokeIdentityHandle = identityHandle
-        lastToolInvokeUcanToken = ucanToken
-        lastToolInvokeProofTokens = proofTokens
-        lastToolInvokeSpendingUcan = spendingUcan
-        return toolInvokeResult
+        lastOutletInvokeIdentityHandle = identityHandle
+        lastOutletInvokeUcanToken = ucanToken
+        lastOutletInvokeProofTokens = proofTokens
+        lastOutletInvokeSpendingUcan = spendingUcan
+        return outletInvokeResult
     }
 
-    override fun toolVerify(
+    override fun outletVerify(
         contextHandle: Long,
-        toolId: String,
-    ): String = toolVerifyResult
+        outletId: String,
+    ): String = outletVerifyResult
 
-    override fun toolInterfaceExpose(
+    override fun outletInterfaceExpose(
         contextHandle: Long,
-        toolId: String,
+        outletId: String,
         targetContextId: String,
         rateLimitJson: String?,
     ): String = """{"interface_id":"iface-001"}"""
 
-    override fun toolInterfaceAccept(
+    override fun outletInterfaceAccept(
         contextHandle: Long,
         interfaceJson: String,
     ): String = """{"interface_id":"iface-001","approved_by_target":true}"""
 
-    override fun toolInterfaceRevoke(
+    override fun outletInterfaceRevoke(
         contextHandle: Long,
         interfaceIdHex: String,
     ): String = """{"revoked":true}"""
 
     @Suppress("LongParameterList")
-    override fun toolInvokeCrossContext(
+    override fun outletInvokeCrossContext(
         sourceContextHandle: Long,
         targetContextHandle: Long,
-        toolId: String,
+        outletId: String,
         inputJson: String,
         identityHandle: Long,
         ucanToken: String,
@@ -1340,44 +1340,44 @@ class StubNativeBindings : NativeBindings {
     ): String {
         lastCrossContextSourceHandle = sourceContextHandle
         lastCrossContextTargetHandle = targetContextHandle
-        lastCrossContextToolId = toolId
+        lastCrossContextOutletId = outletId
         lastCrossContextInputJson = inputJson
         lastCrossContextIdentityHandle = identityHandle
         lastCrossContextUcanToken = ucanToken
         lastCrossContextChainDepth = chainDepth
         lastCrossContextProofTokens = proofTokens
-        return toolInvokeCrossContextResult
+        return outletInvokeCrossContextResult
     }
 
-    var toolInvokeCrossContextSagaResult = """{"saga_id":"saga-stub"}"""
+    var outletInvokeCrossContextSagaResult = """{"saga_id":"saga-stub"}"""
 
     @Suppress("LongParameterList")
-    override fun toolInvokeCrossContextSaga(
+    override fun outletInvokeCrossContextSaga(
         sourceContextHandle: Long,
         targetContextHandle: Long,
         callerDid: String,
-        toolRegistrationId: String,
+        outletRegistrationId: String,
         inputJson: String,
         assertedNonceHex: String,
         timestampMs: Long,
         chainDepth: Int,
         ucanProofId: String?,
-    ): String = toolInvokeCrossContextSagaResult
+    ): String = outletInvokeCrossContextSagaResult
 
-    override fun toolSessionCreate(
+    override fun outletSessionCreate(
         contextHandle: Long,
-        toolId: String,
+        outletId: String,
         sourceContextId: String,
         ttlSeconds: Long?,
     ): String {
-        lastSessionCreateToolId = toolId
+        lastSessionCreateOutletId = outletId
         lastSessionCreateSourceContextId = sourceContextId
         lastSessionCreateTtlSeconds = ttlSeconds
-        return toolSessionCreateResult
+        return outletSessionCreateResult
     }
 
     @Suppress("LongParameterList")
-    override fun toolSessionInvoke(
+    override fun outletSessionInvoke(
         contextHandle: Long,
         sessionId: String,
         inputJson: String,
@@ -1390,14 +1390,14 @@ class StubNativeBindings : NativeBindings {
         lastSessionInvokeIdentityHandle = identityHandle
         lastSessionInvokeUcanToken = ucanToken
         lastSessionInvokeProofTokens = proofTokens
-        return toolSessionInvokeResult
+        return outletSessionInvokeResult
     }
 
-    override fun toolSessionClose(
+    override fun outletSessionClose(
         contextHandle: Long,
         sessionId: String,
     ) {
-        toolSessionCloseCalled = true
+        outletSessionCloseCalled = true
         lastSessionCloseSessionId = sessionId
     }
 

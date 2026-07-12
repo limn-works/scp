@@ -593,7 +593,7 @@ fn conf_012_nested_context() {
     assert!(intersection.contains(&Capability::MessagesRead));
     assert!(intersection.contains(&Capability::MessagesWrite));
     assert!(
-        !intersection.contains(&Capability::ToolInvokeAll),
+        !intersection.contains(&Capability::OutletCallAll),
         "child cannot exceed parent ceiling"
     );
 
@@ -1476,7 +1476,7 @@ fn conf_033_cost_schedule() {
     let schedule = CostSchedule {
         currency: CurrencyCode::from("USD"),
         per_message: Some(Amount::new(100)),
-        per_tool_invoke: Some(Amount::new(500)),
+        per_outlet_call: Some(Amount::new(500)),
         per_join: Some(Amount::new(1000)),
         per_period: None,
         per_byte_stored: None,

@@ -5,7 +5,7 @@
 //! # Trait
 //!
 //! [`SagaJournal`] is the supervisor's durable coordinator record for
-//! cross-actor sagas (the sole saga is cross-context tool invoke,
+//! cross-actor sagas (the sole saga is cross-context outlet invoke,
 //! §6.2.4). It exposes three operations per
 //! spec §17.16.1:
 //!

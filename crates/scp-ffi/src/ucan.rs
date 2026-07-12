@@ -330,6 +330,10 @@ impl crate::scp::PyScp {
                 presenting_agent_did: agent_did,
                 clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
                 clock: &scp_clock::SystemClock,
+                // Generic validate site: not an outlet-invocation path, so
+                // caveat resolution is a constant `None` (`NoCaveatResolver`).
+                // Only outlet-invocation sites use `TokenNbCaveatResolver`.
+                caveat_resolver: &scp_core::crypto::ucan::validate::NoCaveatResolver,
             };
 
             validate_ucan(&parsed_token, &required_cap, &mut ctx).map_err(ScpPyError::from)
@@ -461,6 +465,10 @@ impl crate::scp::PyScp {
                 presenting_agent_did: agent_did,
                 clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
                 clock: &scp_clock::SystemClock,
+                // Generic evaluate site: not an outlet-invocation path, so
+                // caveat resolution is a constant `None` (`NoCaveatResolver`).
+                // Only outlet-invocation sites use `TokenNbCaveatResolver`.
+                caveat_resolver: &scp_core::crypto::ucan::validate::NoCaveatResolver,
             };
 
             Ok(evaluate_ucan(&parsed_token, required_cap.as_ref(), &ctx))
@@ -784,7 +792,7 @@ pub(crate) fn build_proof_resolver(
     Ok(BridgeProofResolver { proofs })
 }
 
-/// Public alias for `build_proof_resolver` used by `tools.rs` and `mcp.rs`.
+/// Public alias for `build_proof_resolver` used by `outlets.rs` and `mcp.rs`.
 ///
 /// Accepts the same `Option<&[String]>` parameter as the internal function.
 pub(crate) fn build_proof_resolver_from_tokens(
@@ -939,6 +947,7 @@ mod tests {
                 att: vec![],
                 prf: vec![],
                 fct: None,
+                nb: None,
             },
             signature: vec![0u8; 64],
             encoded: "h.p.s".to_owned(),

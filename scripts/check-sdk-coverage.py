@@ -564,72 +564,73 @@ ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
         "kotlin": ["broadcastOpenKey"],
         "swift": ["broadcastOpenKey"],
     },
-    # Tools -- Kotlin/Swift use bare method names without domain prefix
-    ("Tools", "register"): {
-        "python": ["tool_register"],
-        "typescript": ["toolRegister"],
-        "kotlin": ["register"],
-        "swift": ["register"],
+    # Outlets -- all SDKs use the outlet-prefixed method name for the renamed
+    # outlet domain (outlet_register / outletRegister / ...).
+    ("Outlets", "register"): {
+        "python": ["outlet_register"],
+        "typescript": ["outletRegister"],
+        "kotlin": ["outletRegister"],
+        "swift": ["outletRegister"],
     },
-    ("Tools", "invoke"): {
-        "python": ["tool_invoke"],
-        "typescript": ["toolInvoke"],
-        "kotlin": ["invoke"],
-        "swift": ["invoke"],
+    ("Outlets", "invoke"): {
+        "python": ["outlet_invoke"],
+        "typescript": ["outletInvoke"],
+        "kotlin": ["outletInvoke"],
+        "swift": ["outletInvoke"],
     },
-    ("Tools", "verify"): {
-        "python": ["tool_verify"],
-        "typescript": ["toolVerify"],
-        "kotlin": ["verify"],
-        "swift": ["verify"],
+    ("Outlets", "verify"): {
+        "python": ["outlet_verify"],
+        "typescript": ["outletVerify"],
+        "kotlin": ["outletVerify"],
+        "swift": ["outletVerify"],
     },
-    ("Tools", "invoke_cross_context"): {
-        "python": ["tool_invoke_cross_context"],
-        "typescript": ["toolInvokeCrossContext"],
-        "kotlin": ["invokeCrossContext"],
-        "swift": ["toolInvokeCrossContext"],
+    ("Outlets", "invoke_cross_context"): {
+        "python": ["outlet_invoke_cross_context"],
+        "typescript": ["outletInvokeCrossContext"],
+        "kotlin": ["outletInvokeCrossContext"],
+        "swift": ["outletInvokeCrossContext"],
     },
-    ("Tools", "invoke_cross_context_saga"): {
-        "python": ["tool_invoke_cross_context_saga"],
-        "typescript": ["toolInvokeCrossContextSaga"],
-        "kotlin": ["invokeCrossContextSaga"],
-        "swift": ["toolInvokeCrossContextSaga"],
+    ("Outlets", "invoke_cross_context_saga"): {
+        "python": ["outlet_invoke_cross_context_saga"],
+        "typescript": ["outletInvokeCrossContextSaga"],
+        "kotlin": ["outletInvokeCrossContextSaga"],
+        "swift": ["outletInvokeCrossContextSaga"],
     },
-    ("Tools", "session_create"): {
-        "python": ["tool_session_create"],
-        "typescript": ["toolSessionCreate"],
-        "kotlin": ["sessionCreate"],
-        "swift": ["toolSessionCreate"],
+    ("Outlets", "session_create"): {
+        "python": ["outlet_session_create"],
+        "typescript": ["outletSessionCreate"],
+        "kotlin": ["outletSessionCreate"],
+        "swift": ["outletSessionCreate"],
     },
-    ("Tools", "session_invoke"): {
-        "python": ["tool_session_invoke"],
-        "typescript": ["toolSessionInvoke"],
-        "kotlin": ["sessionInvoke"],
-        "swift": ["toolSessionInvoke"],
+    ("Outlets", "session_invoke"): {
+        "python": ["outlet_session_invoke"],
+        "typescript": ["outletSessionInvoke"],
+        "kotlin": ["outletSessionInvoke"],
+        "swift": ["outletSessionInvoke"],
     },
-    ("Tools", "session_close"): {
-        "python": ["tool_session_close"],
-        "typescript": ["toolSessionClose"],
-        "kotlin": ["sessionClose"],
-        "swift": ["toolSessionClose"],
+    ("Outlets", "session_close"): {
+        "python": ["outlet_session_close"],
+        "typescript": ["outletSessionClose"],
+        "kotlin": ["outletSessionClose"],
+        "swift": ["outletSessionClose"],
     },
-    ("Tools", "interface_expose"): {
-        "python": ["tool_interface_expose"],
-        "typescript": ["toolInterfaceExpose"],
-        "kotlin": ["interfaceExpose"],
-        "swift": ["exposeToolInterface"],
+    ("Outlets", "interface_expose"): {
+        "python": ["outlet_interface_expose"],
+        "typescript": ["outletInterfaceExpose"],
+        "kotlin": ["outletInterfaceExpose"],
+        "swift": ["outletInterfaceExpose"],
     },
-    ("Tools", "interface_accept"): {
-        "python": ["tool_interface_accept"],
-        "typescript": ["toolInterfaceAccept"],
-        "kotlin": ["interfaceAccept"],
-        "swift": ["acceptToolInterface"],
+    ("Outlets", "interface_accept"): {
+        "python": ["outlet_interface_accept"],
+        "typescript": ["outletInterfaceAccept"],
+        "kotlin": ["outletInterfaceAccept"],
+        "swift": ["outletInterfaceAccept"],
     },
-    ("Tools", "interface_revoke"): {
-        "python": ["tool_interface_revoke"],
-        "typescript": ["toolInterfaceRevoke"],
-        "kotlin": ["interfaceRevoke"],
-        "swift": ["revokeToolInterface"],
+    ("Outlets", "interface_revoke"): {
+        "python": ["outlet_interface_revoke"],
+        "typescript": ["outletInterfaceRevoke"],
+        "kotlin": ["outletInterfaceRevoke"],
+        "swift": ["outletInterfaceRevoke"],
     },
     # Trust -- bare names in all SDKs
     ("Trust", "evaluate_trust"): {

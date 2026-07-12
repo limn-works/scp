@@ -7,10 +7,10 @@
 ## Problem
 
 When UniFFI generates real Swift bindings (`ScpBindings.swift`), they define types
-like `UcanToken`, `ScpError`, `ContextState`, `TransportStatus`, `ToolDefinition`,
-`ToolVerificationResult`, etc. The existing hand-written Swift wrapper files in
+like `UcanToken`, `ScpError`, `ContextState`, `TransportStatus`, `OutletDefinition`,
+`OutletVerificationResult`, etc. The existing hand-written Swift wrapper files in
 `Sources/SCP/` (`Ucan.swift`, `Errors.swift`, `Context.swift`, `Transport.swift`,
-`Tools.swift`, `Types.swift`) define the same types as placeholder structs/enums.
+`Outlets.swift`, `Types.swift`) define the same types as placeholder structs/enums.
 
 This causes "invalid redeclaration" and "ambiguous for type lookup" errors during
 `swift build`.
@@ -27,8 +27,8 @@ The key types that conflict:
 - `ContextState` (Context.swift vs ScpBindings.swift)
 - `ContextHandleProtocol` (Context.swift vs ScpBindings.swift)
 - `TransportStatus` (Transport.swift vs ScpBindings.swift)
-- `ToolDefinition` (Tools.swift vs ScpBindings.swift)
-- `ToolVerificationResult` (Tools.swift vs ScpBindings.swift)
+- `OutletDefinition` (Outlets.swift vs ScpBindings.swift)
+- `OutletVerificationResult` (Outlets.swift vs ScpBindings.swift)
 - `Message`, `Provenance`, `Capability` (Types.swift vs ScpBindings.swift)
 
 ## Key detail

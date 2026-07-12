@@ -4,15 +4,15 @@
 
 All interaction happens within contexts. There is no concept of off-context communication at the protocol level. A context is a bounded, governed space — a cryptographic entity with its own key material, event log (append-only Merkle tree), governance model, membership roster, and capability ceiling. Contexts operate in one of two modes: **Encrypted** (one MLS group per context, sender-side keys, full forward secrecy) or **Broadcast** (per-author broadcast keys, no MLS, mandatory subscriber registration). The mode is set at creation and is immutable. A group chat is a context. A collaborative quest is a context. A generated Discord alternative is a context. DMs are a two-party context. An entire app's backend is a context (or set of contexts).
 
-**Contexts are spaces, not actors.** They do not initiate, do not act, and have no agency. They hold the rules, the keys, and the audit trail. Agents (always bound to humans, §4) do the acting within them. Tools (§5.4) do the computing within them. The context itself is passive infrastructure.
+**Contexts are spaces, not actors.** They do not initiate, do not act, and have no agency. They hold the rules, the keys, and the audit trail. Agents (always bound to humans, §4) do the acting within them. Outlets (§5.4) do the computing within them. The context itself is passive infrastructure.
 
 **Contexts are runtime objects, not infrastructure to deploy.** Creating a context is a runtime operation (~5-15ms local computation, ~200ms wall clock with network — see §5.12.4). Contexts are created, used, and destroyed during normal application operation. They survive process restarts (state is persisted) but are created as fluidly as opening a connection.
 
-**Contexts are where apps live.** What people experience as "an app" is a composite: a context (or set of contexts) + members + tools + data (§8.1). Long-lived contexts with no TTL host persistent applications — games, workspaces, social platforms. Ephemeral contexts with TTL host bounded tasks. The context is the app's lifecycle boundary. Protocol state (membership, roles, trust) is portable and survives app death; app state is the app's concern (§8.3).
+**Contexts are where apps live.** What people experience as "an app" is a composite: a context (or set of contexts) + members + outlets + data (§8.1). Long-lived contexts with no TTL host persistent applications — games, workspaces, social platforms. Ephemeral contexts with TTL host bounded tasks. The context is the app's lifecycle boundary. Protocol state (membership, roles, trust) is portable and survives app death; app state is the app's concern (§8.3).
 
-**Every context contains:** a capability ceiling (§5.3), roles with permission sets (§5.5), a governance model (§5.9), tools (§5.4), an optional TTL (§5.10), a memory scope (§5.11), and transparent metadata visible before opt-in (§5.7). These are all declared at creation. Contexts may be created from well-known templates (§5.12) for common patterns or from explicit parameters. Contexts can have parent-child relationships (§5.13) for sub-spaces and governed cross-context bridges.
+**Every context contains:** a capability ceiling (§5.3), roles with permission sets (§5.5), a governance model (§5.9), outlets (§5.4), an optional TTL (§5.10), a memory scope (§5.11), and transparent metadata visible before opt-in (§5.7). These are all declared at creation. Contexts may be created from well-known templates (§5.12) for common patterns or from explicit parameters. Contexts can have parent-child relationships (§5.13) for sub-spaces and governed cross-context bridges.
 
-**Two protocol-level mechanisms allow information to cross context boundaries:** tool interfaces (§6.2) for asymmetric, structured, request/response interactions, and multi-parent child contexts (§5.13) for symmetric collaboration. Both require governance consent from all involved contexts. Agent isolation is absolute — no agent instance spans contexts (§6.1).
+**Two protocol-level mechanisms allow information to cross context boundaries:** outlet interfaces (§6.2) for asymmetric, structured, request/response interactions, and multi-parent child contexts (§5.13) for symmetric collaboration. Both require governance consent from all involved contexts. Agent isolation is absolute — no agent instance spans contexts (§6.1).
 
 ## 5.2 Creation
 
@@ -48,15 +48,16 @@ Context creation is a multi-step operation that can fail at any point. The proto
 
 ## 5.3 Capability Ceiling
 
-Every context declares a capability ceiling at creation: the maximum set of things that can happen in this space. This ceiling bounds what tools can do, what roles can grant, and what agents can exercise. Standard capability categories include:
+Every context declares a capability ceiling at creation: the maximum set of things that can happen in this space. This ceiling bounds what outlets can do, what roles can grant, and what agents can exercise. Standard capability categories include:
 
 - **`messaging`** — text and structured data exchange
-- **`tool invocation`** — executing context-registered tools
+- **`outlet:query`** — invoking context-registered Query outlets (§5.4.2)
+- **`outlet:call`** — invoking context-registered Action outlets (§5.4.2)
 - **`media:voice`** — real-time voice communication (§10.9.1)
 - **`media:video`** — real-time video communication (§10.9.1)
 - **`media:screen_share`** — screen sharing (§10.9.1)
 - **`bridging`** — bridge connector participation (§12)
-- **`tool:interface`** — cross-context tool interface exposure (§6.2)
+- **`outlet:interface`** — cross-context outlet interface exposure (§6.2)
 - **`context:child:create`** — creating child contexts (§5.13)
 - **`member:ban`** — governance-level member removal (ban/unban). Gates whether governance can execute `RevokeAccess` / `RestoreAccess` against members (§5.9). Without this capability in the ceiling, governance cannot ban members regardless of governance model.
 
@@ -81,9 +82,11 @@ The following is the complete enumeration of the **built-in** capability categor
 |----------|-------------|----------|
 | `messages:read` | Read messages in the context | Role permission |
 | `messages:write` | Send messages to the context | Role permission |
-| `tool:register` | Register new tools in the context | Role permission |
-| `tool:invoke:*` | Invoke any registered tool | Role permission |
-| `tool:invoke:{tool_id}` | Invoke a specific tool (parameterized) | Role permission |
+| `outlet:register` | Register new outlets in the context | Role permission |
+| `outlet:query:*` | Invoke any registered Query outlet (§5.4.2) | Role permission |
+| `outlet:query:{outlet_id}` | Invoke a specific Query outlet (parameterized) | Role permission |
+| `outlet:call:*` | Invoke any registered Action outlet (§5.4.2) | Role permission |
+| `outlet:call:{outlet_id}` | Invoke a specific Action outlet (parameterized) | Role permission |
 | `member:invite` | Invite new members to the context | Role permission |
 | `member:remove` | Remove members from the context | Role permission + governance |
 | `member:ban` | Ban members (revoke read access) | Role permission + governance |
@@ -92,14 +95,14 @@ The following is the complete enumeration of the **built-in** capability categor
 | `media:video` | Real-time video communication (§10.9.1) | Role permission |
 | `media:screen_share` | Screen sharing (§10.9.1) | Role permission |
 | `bridging` | Bridge connector participation (§12) | Role permission + governance |
-| `tool:interface` | Cross-context tool interface exposure (§6.2) | Role permission |
+| `outlet:interface` | Cross-context outlet interface exposure (§6.2) | Role permission |
 | `context:child:create` | Create child contexts (§5.13) | Role permission |
 | `governance:propose` | Submit governance proposals (§5.9) | Role permission |
 | `governance:vote` | Vote on governance proposals (§5.9) | Role permission |
 | `context:close` | Close context permanently (§5.4) | Role permission + governance |
 | `metadata:edit` | Edit context operational metadata (§5.7) | Role permission + governance |
 
-**Parameterized categories.** `tool:invoke:{tool_id}` is the only parameterized category — it restricts invocation to a specific tool. `tool:invoke:*` grants invocation of all registered tools. A `tool:invoke:*` wildcard ceiling entry **covers** all `tool:invoke:{tool_id}` capabilities (wildcard coverage; distinct from the parsing rule in §5.3.1.1, under which no wildcard is ever inferred from a non-wildcard string).
+**Parameterized categories.** `outlet:query:{outlet_id}` and `outlet:call:{outlet_id}` are the parameterized categories — they restrict invocation to a specific outlet. `outlet:query:*` grants invocation of all registered Query outlets; `outlet:call:*` grants invocation of all registered Action outlets. An `outlet:query:*` wildcard ceiling entry **covers** all `outlet:query:{outlet_id}` capabilities; an `outlet:call:*` wildcard ceiling entry **covers** all `outlet:call:{outlet_id}` capabilities (wildcard coverage; distinct from the parsing rule in §5.3.1.1, under which no wildcard is ever inferred from a non-wildcard string). The two stems are independent: `outlet:query:*` does NOT grant any `outlet:call:*` capability, and vice versa (§5.4.2 classification, §6.2 amplification rule).
 
 **Category validation.** At context creation, the SDK validates that every entry in the ceiling array is well-formed per the ceiling-entry grammar below (§5.3.1.1). Built-in categories are matched exactly (case-sensitive); custom capabilities are accepted only when well-formed. Any entry that is neither a recognized built-in category nor a well-formed custom capability causes creation to fail with `InvalidCeilingCategory` error. This prevents forward-compatibility issues where an old SDK creates a context with built-in categories it cannot enforce, and it forecloses ambiguous custom entries that would otherwise require silent interpretation.
 
@@ -107,15 +110,15 @@ The following is the complete enumeration of the **built-in** capability categor
 
 A ceiling entry is **exactly one** of the following well-formed shapes:
 
-1. **A built-in category** — one of the strings in the §5.3.1 table, matched exactly and case-sensitively (including the parameterized `tool:invoke:{tool_id}` and the resource wildcard `tool:invoke:*`).
+1. **A built-in category** — one of the strings in the §5.3.1 table, matched exactly and case-sensitively (including the parameterized `outlet:query:{outlet_id}` / `outlet:call:{outlet_id}` and the resource wildcards `outlet:query:*` / `outlet:call:*`).
 2. **A custom capability** of the form `{resource}:{action}` (§7.2) — the entry contains **exactly one** colon, and both `{resource}` and `{action}` are non-empty **kebab-case tokens**: lowercase ASCII alphanumerics and hyphens, `[a-z0-9-]+` (this charset is defined here — §5.3.1.1 is the authoritative definition — and is consistent with the kebab-case naming convention for capability URIs in §7.3.4.1). Neither token may contain a colon (`:`), an asterisk (`*`), whitespace, or any other character outside the kebab-case charset.
 3. **An explicit resource wildcard** of the form `{resource}:*` — grants every action under `{resource}`. Here `{resource}` is a non-empty kebab-case token (same `[a-z0-9-]+` charset, no `:`, no `*`, no whitespace) and the action segment is the **single literal `*`**. The `*` is permitted **only** as the entire action segment of a wildcard entry: an `*` appearing in the resource position (e.g. `*:read`), or as a substring of either token (e.g. `pay*ments`, `payments:wr*`), is malformed → `InvalidCeilingCategory`. A bare `*` or `*:*` therefore never names “all resources” — there is no resource wildcard.
 
 There is **no implicit or silent wildcard.** A wildcard must be written explicitly as `:*`.
 
-**No privileged-built-in collision.** A custom entry (shape 2 or shape 3 above) is valid only if it does not name a built-in capability under **any** spelling. A custom entry's string MUST NOT denote a built-in capability — neither a built-in's user-facing colon form (e.g. `tool:invoke:*`, `tool:invoke:{tool_id}`, `bridging`, `messages:read`) nor its canonical UCAN form (e.g. `tool_invoke:*`, `bridging:*`, `context_child:create`), including the parameterized `tool_invoke:{tool_id}` family for any concrete `tool_id`. A custom entry that names a built-in under any spelling MUST be rejected at context creation with `InvalidCeilingCategory` (e.g. a custom whose string is `bridging:*` — which denotes the `bridging` built-in — is rejected). This is enforced by **canonical resolution**, not by a denylist of forbidden spellings: an entry is admitted as a custom only if resolving its string through the protocol's single canonical capability parser (`Capability::new`, defined in code at `crates/scp-protocol/src/context/roles.rs`) does **not** yield a built-in capability. Because that parser is the sole authority on which strings denote built-ins — recognizing every built-in in both colon and UCAN spelling, and the parameterized `tool_invoke:{tool_id}` family for any id — the rule is **closed by construction**: it covers every built-in spelling uniformly and extends automatically to any built-in added later, with no spelling enumeration to maintain. Resolution is applied at the point a custom is admitted, rather than testing only the entry's projected UCAN string, because the masquerade it prevents — a custom that is a distinct ceiling entry yet presents a built-in's privilege when the ceiling is consumed for capability minting — arises specifically from a `Capability` custom value (including one materialized directly from an untrusted, deserialized ceiling that never passed through the colon parser at create time). The clause is stated here as the authoritative, normative invariant so the validator can cite §5.3.1.1 and a custom capability can never masquerade as a privileged built-in.
+**No privileged-built-in collision.** A custom entry (shape 2 or shape 3 above) is valid only if it does not name a built-in capability under **any** spelling. A custom entry's string MUST NOT denote a built-in capability — neither a built-in's user-facing colon form (e.g. `outlet:query:*`, `outlet:call:*`, `outlet:call:{outlet_id}`, `bridging`, `messages:read`) nor its canonical UCAN form (e.g. `outlet_query:*`, `outlet_call:*`, `bridging:*`, `context_child:create`), including the parameterized `outlet_query:{outlet_id}` / `outlet_call:{outlet_id}` families for any concrete `outlet_id`. A custom entry that names a built-in under any spelling MUST be rejected at context creation with `InvalidCeilingCategory` (e.g. a custom whose string is `bridging:*` — which denotes the `bridging` built-in — is rejected). This is enforced by **canonical resolution**, not by a denylist of forbidden spellings: an entry is admitted as a custom only if resolving its string through the protocol's single canonical capability parser (`Capability::new`, defined in code at `crates/scp-protocol/src/context/roles.rs`) does **not** yield a built-in capability. Because that parser is the sole authority on which strings denote built-ins — recognizing every built-in in both colon and UCAN spelling, and the parameterized `outlet_query:{outlet_id}` / `outlet_call:{outlet_id}` families for any id — the rule is **closed by construction**: it covers every built-in spelling uniformly and extends automatically to any built-in added later, with no spelling enumeration to maintain. Resolution is applied at the point a custom is admitted, rather than testing only the entry's projected UCAN string, because the masquerade it prevents — a custom that is a distinct ceiling entry yet presents a built-in's privilege when the ceiling is consumed for capability minting — arises specifically from a `Capability` custom value (including one materialized directly from an untrusted, deserialized ceiling that never passed through the colon parser at create time). The clause is stated here as the authoritative, normative invariant so the validator can cite §5.3.1.1 and a custom capability can never masquerade as a privileged built-in.
 
-**No built-in-resource wildcard shadow.** A custom **shape-3 wildcard** `{resource}:*` is additionally invalid when `{resource}` is the **resource token of any built-in capability** — i.e. the `{resource}` projection (the segment before the colon in a built-in's canonical UCAN form) of any built-in (e.g. `member`, `messages`, `media`, `tool`, `role`, `governance`, `context`, `metadata`). This set is defined by the built-in capabilities themselves — the resource token of each built-in — and is **generated** from them, never a hand-maintained enumeration, so it extends automatically as built-ins are added and cannot drift from the actual built-in set. Canonical resolution alone does not catch this case: a string such as `member:*` does **not** resolve to a built-in (there is no `member:*` built-in — only `member:invite`, `member:remove`, `member:ban`), so `Capability::new("member:*")` keeps it a `Custom` and the no-collision rule above admits it. Yet because ceiling wildcard coverage treats a stored `{resource}:*` entry as covering **every** action under `{resource}`, an admitted `member:*` would silently grant the privileged built-in actions in that family (e.g. `member:ban`, which gates the governance `Revoke` action — see §7) when the ceiling is consumed for capability minting. Such a custom wildcard MUST therefore be rejected at validation with `InvalidCeilingCategory`. This is **closed by construction** over the built-in resource-token set (the same `{resource}` projection that ceiling wildcard coverage matches against), not a hardcoded denylist, so it extends automatically to any built-in added later — consistent with the "no silent wildcard / a custom can never present built-in privilege" invariant above. A custom **non-wildcard** action under a built-in resource (shape 2 — e.g. `member:promote`, `messages:archive`) remains **valid**: it grants only itself via exact match and never the built-in actions. A custom wildcard over a **non-built-in** resource (e.g. `payments:*`, `a-b-c:*`) likewise remains **valid**.
+**No built-in-resource wildcard shadow.** A custom **shape-3 wildcard** `{resource}:*` is additionally invalid when `{resource}` is the **resource token of any built-in capability** — i.e. the `{resource}` projection (the segment before the colon in a built-in's canonical UCAN form) of any built-in (e.g. `member`, `messages`, `media`, `outlet_query`, `outlet_call`, `role`, `governance`, `context`, `metadata`). This set is defined by the built-in capabilities themselves — the resource token of each built-in — and is **generated** from them, never a hand-maintained enumeration, so it extends automatically as built-ins are added and cannot drift from the actual built-in set. Canonical resolution alone does not catch this case: a string such as `member:*` does **not** resolve to a built-in (there is no `member:*` built-in — only `member:invite`, `member:remove`, `member:ban`), so `Capability::new("member:*")` keeps it a `Custom` and the no-collision rule above admits it. Yet because ceiling wildcard coverage treats a stored `{resource}:*` entry as covering **every** action under `{resource}`, an admitted `member:*` would silently grant the privileged built-in actions in that family (e.g. `member:ban`, which gates the governance `Revoke` action — see §7) when the ceiling is consumed for capability minting. Such a custom wildcard MUST therefore be rejected at validation with `InvalidCeilingCategory`. This is **closed by construction** over the built-in resource-token set (the same `{resource}` projection that ceiling wildcard coverage matches against), not a hardcoded denylist, so it extends automatically to any built-in added later — consistent with the "no silent wildcard / a custom can never present built-in privilege" invariant above. A custom **non-wildcard** action under a built-in resource (shape 2 — e.g. `member:promote`, `messages:archive`) remains **valid**: it grants only itself via exact match and never the built-in actions. A custom wildcard over a **non-built-in** resource (e.g. `payments:*`, `a-b-c:*`) likewise remains **valid**.
 
 A **single-token custom with no action** (e.g. `payments` — no colon, no action segment) is **malformed** and MUST be rejected at context creation with `InvalidCeilingCategory`. It MUST NOT be silently interpreted as `payments:*` or any other capability — silent widening would defeat the legibility tenet (§5.7), under which members see the exact ceiling they opt into.
 
@@ -133,41 +136,53 @@ When a context uses the `governed` ceiling policy and a ceiling change is approv
 4. **Activation.** After the notification period expires, the new ceiling takes effect. A `CeilingChanged` event is recorded with the old ceiling hash, new ceiling, and the governance proposal ID.
 5. **Retroactive UCAN validation.** After ceiling change activation, UCANs that reference capabilities no longer in the ceiling are automatically invalidated. The SDK MUST re-validate all cached UCANs against the new ceiling on the next action attempt.
 
-## 5.4 Tools
+## 5.4 Outlets
 
-Contexts provide tools: stateless functions that agents invoke. Tools have no identity, no agency, no ability to initiate. They take input and return output. They are scoped to their context and cannot span contexts.
+Contexts provide **outlets**: stateless functions that agents invoke. Outlets have no identity, no agency, no ability to initiate. They take input and return output. They are scoped to their context and cannot span contexts.
 
-Tools are the protocol's answer to "what about bots?" — anything that would have been a bot in a traditional system is a tool in SCP. The critical difference: tools cannot act, only respond. All agency flows through accountable agents.
+Outlets are the protocol's answer to "what about bots?" — anything that would have been a bot in a traditional system is an outlet in SCP. The critical difference: outlets cannot act, only respond. All agency flows through accountable agents.
 
-Tool registrations include:
+**Terminology rationale.** The protocol uses "outlet" where ecosystems such as MCP and function-calling LLMs use "tool". The two words describe the same wire shape (stateless input→output functions gated by schema and capability) but carry different connotations. "Tool" is agent-centric — an instrument an agent wields. "Outlet" is context-centric — a socket the context exposes, which the context governs. SCP's security boundary is the context, not the agent, so the context-centric word is the one that matches the protocol's invariants. The rename is a hard break: there are no deprecation aliases, no migration period. External interop surfaces that use the MCP vocabulary (§8.5) translate lexically at the boundary in `scp-mcp`; inside SCP everything is an outlet.
 
+Outlet registrations include:
+
+- **Kind.** `OutletKind::Query` (read-only, idempotent, cacheable) or `OutletKind::Action` (may mutate, never cached). See §5.4.2. The default is `Action` — fail-safe.
 - **Schema.** Input and output types (MCP-compatible JSON Schema — see §8.5). Machine-readable, self-documenting.
-- **Implementation hash.** Content-addressable reference to the tool's implementation. Any change to the implementation produces a new hash.
-- **Test vectors.** Known input-output pairs that define correct behavior. Any agent can call the tool with test inputs and verify outputs match. This enables continuous integrity verification (§7.3.3).
-- **Operator DID.** The identity accountable for the tool. Tool misbehavior traces to this DID.
-- **Cost metadata (optional).** Per-invocation cost declared by the tool via a `ToolCost` struct (§5.4.1), additive with context-level costs (§19.3). A tool calling an external API can pass through its cost. Tool costs carry their own payee DID, which may differ from the context payee. Tools without cost metadata are free.
+- **Implementation hash.** Content-addressable reference to the outlet's implementation. Any change to the implementation produces a new hash.
+- **Test vectors.** Known input-output pairs that define correct behavior. Any agent can call the outlet with test inputs and verify outputs match. This enables continuous integrity verification (§7.3.3).
+- **Operator DID.** The identity accountable for the outlet. Outlet misbehavior traces to this DID.
+- **Cost metadata (optional).** Per-invocation cost declared by the outlet via an `OutletCost` struct (§5.4.1), additive with context-level costs (§19.3). An outlet calling an external API can pass through its cost. Outlet costs carry their own payee DID, which may differ from the context payee. Outlets without cost metadata are free. Query outlets MUST declare either no cost or a zero-amount cost (§5.4.2 structural floor).
 
-Tool mutations (implementation hash change, schema modification, test vector update) are recorded in the context's verifiable event log (§7.3.1). Silent tool modification is not possible — any change is visible to all context members.
+Outlet mutations (implementation hash change, schema modification, test vector update, kind change) are recorded in the context's verifiable event log (§7.3.1). Silent outlet modification is not possible — any change is visible to all context members.
 
-### 5.4.1 Tool Registration Wire Format
+### 5.4.1 Outlet Registration Wire Format
 
-Tool registrations are serialized as MessagePack (§17.5) and stored in the context's tool registry. The canonical structure:
+Outlet registrations are serialized as MessagePack (§17.5) and stored in the context's outlet registry. The canonical structure:
 
 ```
-ToolRegistration {
-  tool_id:          String,          // Unique within the context. Format: [a-z0-9_-], max 128 chars.
+OutletRegistration {
+  outlet_id:        String,          // Unique within the context. Format: [a-z0-9_-], max 128 chars.
+  kind:             OutletKind,      // Query or Action. See §5.4.2. Absent = Action (fail-safe).
   name:             String,          // Human-readable name. Max 256 UTF-8 bytes.
-  description:      String,          // Tool description. Max 4096 UTF-8 bytes.
-  operator_did:     DID,             // The identity accountable for this tool.
+  description:      String,          // Outlet description. Max 4096 UTF-8 bytes.
+  operator_did:     DID,             // The identity accountable for this outlet.
   schema: {
     input:          JSONSchema,      // MCP-compatible JSON Schema for input. Max 64 KiB serialized.
     output:         JSONSchema,      // MCP-compatible JSON Schema for output. Max 64 KiB serialized.
   },
-  implementation_hash: [u8; 32],    // SHA-256 of the tool's implementation artifact (see below).
+  implementation_hash: [u8; 32],    // SHA-256 of the outlet's implementation artifact (see below).
   test_vectors:     Vec<TestVector>, // Known input-output pairs. Min 0, max 100.
-  cost:             Option<ToolCost>, // Per-invocation cost (§19.3).
+  cost:             Option<OutletCost>, // Per-invocation cost (§19.3). Query outlets: amount == 0.
+  message_catalog:  Vec<MessageTemplate>, // Wire-time message catalog. ≤ 256 entries, each template
+                                     // ≤ 1 KiB UTF-8. Covered by the V2 signature preimage via
+                                     // `catalog_hash` (below).
   registered_at:    u64,             // Unix timestamp (seconds) of registration.
-  signature:        Ed25519Signature, // Operator DID signs all fields except signature.
+  signature:        Ed25519Signature, // Operator DID signs the V2 canonical digest below.
+}
+
+OutletKind {
+  Query,   // Read-only, idempotent, cacheable. ReadOnlyInvocation guard applies (§5.4.2).
+  Action,  // May mutate context state. Never cached.
 }
 
 TestVector {
@@ -177,7 +192,13 @@ TestVector {
   description:      String,          // Human-readable description of what this tests. Max 4096 UTF-8 bytes.
 }
 
-ToolCost {
+MessageTemplate {
+  key:              String,          // Catalog key. Regex `^[a-z][a-z0-9-]{0,63}(\.[a-z][a-z0-9-]{0,63})*$`.
+                                     // Unique within a catalog.
+  template:         String,          // Pure UTF-8 string. NO interpolation slots. Max 1024 bytes.
+}
+
+OutletCost {
   amount:           Amount,          // Cost per invocation in smallest currency unit.
   currency:         CurrencyCode,    // ISO 4217 or protocol-defined.
   payee:            DID,             // Who receives payment. May differ from operator_did.
@@ -185,22 +206,145 @@ ToolCost {
 }
 ```
 
-**Implementation hash target.** The `implementation_hash` is `SHA-256(canonical_artifact)` where `canonical_artifact` depends on the tool type:
+**Implementation hash target.** The `implementation_hash` is `SHA-256(canonical_artifact)` where `canonical_artifact` depends on the outlet type:
 
-| Tool type | Hash target | Description |
+| Outlet type | Hash target | Description |
 |-----------|-------------|-------------|
 | Statically deployed (WASM, container) | SHA-256 of the binary artifact | The compiled WASM module or container image digest. Deterministic builds ensure the hash is reproducible. |
 | Source-available | SHA-256 of the source archive | A tar.gz of the source tree, files sorted lexicographically, normalized line endings (LF). |
-| Remote service (API-backed) | SHA-256 of the OpenAPI/JSON Schema spec | The canonical JSON serialization (RFC 8785) of the tool's API specification. |
+| Remote service (API-backed) | SHA-256 of the OpenAPI/JSON Schema spec | The canonical JSON serialization (RFC 8785) of the outlet's API specification. |
 | LLM-backed (non-deterministic) | SHA-256 of the system prompt + model identifier | `SHA-256(model_id || ":" || system_prompt_utf8)`. Changes to the model or system prompt change the hash. |
 
 The hash target type is NOT stored in the registration — the operator chooses what constitutes their implementation artifact. The hash provides a change-detection mechanism, not a verification mechanism. Verifiers detect changes (hash differs from registration); they do not verify what the hash covers.
 
-**Signature scope.** The operator signs `SHA-256("SCP-TOOL-REGISTRATION-V1:" || tool_id || name || operator_did || schema_hash || implementation_hash || test_vectors_hash || cost_hash || registered_at)` where `schema_hash = SHA-256(MessagePack(schema))`, `test_vectors_hash = SHA-256(MessagePack(test_vectors))`, and `cost_hash = SHA-256(MessagePack(cost))` (or `SHA-256(0x00)` if absent).
+**Signature scope.** The operator signs
+
+```
+SHA-256(
+  "SCP-OUTLET-REGISTRATION-V2:"
+  || BE32(len(outlet_id)) || outlet_id
+  || kind_byte
+  || BE32(len(name)) || name
+  || description_hash
+  || BE32(len(operator_did)) || operator_did
+  || schema_hash
+  || implementation_hash
+  || test_vectors_hash
+  || cost_hash
+  || catalog_hash
+  || registered_at_be
+)
+```
+
+where:
+
+- `kind_byte` is `0x00` for Query and `0x01` for Action (fixed 1-byte width).
+- `BE32(n)` is `n` encoded as a 4-byte big-endian unsigned integer; this length prefix precedes every variable-length field (`outlet_id`, `name`, `operator_did`) so that concatenation is unambiguous and two registrations with different field splits can never produce the same preimage.
+- `description_hash = SHA-256(description_utf8_bytes)` (32 bytes, fixed width). The `description` field is operator-authored prose displayed to prospective invokers; committing `description_hash` into the V2 preimage binds the prose to the registration signature so a silent operator edit to `description` produces a diffable registration event.
+- `schema_hash = SHA-256(MessagePack(schema))` (32 bytes, fixed width).
+- `implementation_hash` is 32 bytes, fixed width.
+- `test_vectors_hash = SHA-256(MessagePack(test_vectors))` (32 bytes).
+- `cost_hash = SHA-256(MessagePack(cost))` (32 bytes), or `SHA-256(0x00)` (32 bytes) if absent. The sentinel preserves fixed width.
+- `catalog_hash = SHA-256(MessagePack(message_catalog))` (32 bytes, fixed width). `message_catalog` is the ordered `Vec<MessageTemplate>` defined above; MessagePack serialization of an empty vector produces a 1-byte value (`0x90`) so `catalog_hash` is always well-defined. Committing the catalog into the V2 preimage binds every operator-controlled string field at registration under the signature; the catalog is NOT covered by `schema_hash`, so a separate `catalog_hash` is required.
+- `registered_at_be` is `registered_at` encoded as an 8-byte big-endian unsigned integer.
+
+The `V2` suffix, the `kind_byte` inclusion, the mandatory length prefixes on every variable-length field, and the explicit `description_hash` + `catalog_hash` terms together constitute the break from the pre-rename `SCP-TOOL-REGISTRATION-V1` domain; pre-migration signatures are not honored. The length-prefix requirement closes the "split-shift" preimage-collision class that the unprefixed pre-rename concatenation admitted (where a suffix of `outlet_id` could be reinterpreted as a prefix of `name`).
+
+### 5.4.2 Outlet Classification (Query vs Action)
+
+Outlets declare their semantic class at registration time. Classification is structural, not advisory — the runtime enforces it. It is the basis of the capability split (§5.3.1): a Query outlet is invoked under the `outlet:query` / `outlet_query` capability family; an Action outlet under `outlet:call` / `outlet_call`.
+
+**`OutletKind::Query`** — read-only, idempotent, cacheable in principle.
+
+- **Structural floor at registration.** `cost == None || cost.amount == 0`. A Query outlet MUST NOT declare a positive per-invocation cost, and `cost.cost_formula` MUST be absent (a dynamic pricing formula on an idempotent read is not coherent). Declaring a positive cost or a pricing formula at registration is a validation failure (`OutletErrorClass::Protocol::QueryCostViolation`). Registrations that fail this check are rejected before they reach the event log.
+- **ReadOnlyInvocation guard at invocation.** The runtime invokes Query outlets through a `ReadOnlyInvocation` handle that denies writes to context state (messages, roles, registry, event log, governance, economic ledgers). Any attempt by an executor to mutate through this handle returns `OutletErrorClass::Protocol::QueryViolation`.
+- **Cacheability.** Query outlets are semantically cacheable (idempotent, invoker-independent result for fixed `(outlet_id, input, implementation_hash)`). A protocol-level shared cache is **deferred** (§5.4.3); every Query invocation currently executes live. The semantic property is stable — a future cache will not change what Query outlets are, only how the runtime exploits their properties.
+- **Query-with-declared-cost is forbidden.** An outlet registered with cost amount `> 0` MUST be `Action`. Operators who want a paid read-only interface (e.g., a metered data lookup) declare it as `Action`. The protocol contract is: a Query invocation is never billed.
+- **UCAN stem.** `outlet_query:{outlet_id}` or `outlet_query:*` (see §5.4.2.1 for parser semantics).
+- **Chain depth (§6.2).** Query cross-context calls use the full `ContextParams::max_chain_depth` budget (default 8, range [1, 255]).
+
+**`OutletKind::Action`** — may mutate, never cached.
+
+- No structural cost floor; Action outlets may declare any cost.
+- No ReadOnlyInvocation guard; Action executors may mutate context state through SDK-provided handles subject to role and capability checks.
+- Never cached. Each invocation runs fresh.
+- **UCAN stem.** `outlet_call:{outlet_id}` or `outlet_call:*` (see §5.4.2.1 for parser semantics).
+- **Chain depth.** Action cross-context calls use `max(1, max_chain_depth / 2)` as their budget. Default 4 when `max_chain_depth` is default 8.
+
+**Default.** `OutletKind::Action` is the default when `kind` is absent in an otherwise-valid registration (fail-safe). SDKs SHOULD surface `kind` as a required field in application APIs even though the wire format tolerates absence.
+
+**Chain amplification rule (§6.2).** A Query outlet invocation MUST NOT transitively invoke any Action outlet through cross-context hops. The reverse is permitted — an Action invocation MAY transitively invoke Query outlets. The runtime enforces this at the cross-context consent gate: on every hop, the runtime checks `hop.kind` against the originating request's `kind` and rejects Query→Action amplification with `OutletErrorClass::Authorization::AmplificationViolation`. This prevents a "free" read from being laundered into a paid write.
+
+**Misdeclaration signal.** Any invocation that trips `QueryViolation` at runtime (an executor attempted a write inside a ReadOnlyInvocation) is recorded as an operator-attributable signal: the `OutletVerified` event for that outlet carries `integrity_ok: false` with reason `query_misdeclaration`, and participation records (§7.3.2) attribute the failure to the outlet's `operator_did`.
+
+#### 5.4.2.1 UCAN Capability Stem Parser
+
+The two stems `outlet_query:` and `outlet_call:` are parsed with a fixed two-step algorithm:
+
+1. **Literal prefix match.** The parser accepts only the literal byte sequences `outlet_query:` or `outlet_call:` (case-sensitive, UTF-8). Any other prefix — including abbreviations, trailing-colon variations, or concatenations such as `outlet_query:call:foo` — is a `Capability::new` parse failure and MUST NOT be admitted as either stem. The colon is part of the stem, not a separator.
+2. **Opaque suffix with outlet_id validation.** Everything after the prefix is the suffix. The suffix is either `*` (wildcard, matching `Capability::OutletQueryAll` / `OutletCallAll`) or a single outlet_id matching the regex `^[a-z0-9_-]{1,128}$`. No further `:` characters appear in a valid suffix; a colon in the suffix fails parsing (this blocks the `outlet_query:call:foo` parser-differential where a naive split-on-colon implementation would accept it).
+
+Bridge and SDK parsers MUST apply this algorithm identically. The single canonical parser is `Capability::new` (`crates/scp-protocol/src/context/roles.rs`); every bridge routes through it.
+
+The underscore in the wire form is deliberate: UCAN resource strings historically use `-` or `_` to disambiguate prefix from suffix, and `outlet:query:` (two colons) would require three-way parsing that invites prefix-vs-suffix ambiguity. The SDK-facing display form `outlet:query:{id}` / `outlet:call:{id}` is a pretty-print alias; it round-trips through `Capability::new` and `Capability::to_string` but is not the wire form. Pre-rename `tool:invoke:` / `tool_invoke:` / `tool:register` / `tool:interface` strings are hard-rejected (SCP-OUT-014): the parser returns a parse failure rather than mapping them onto any outlet capability.
+
+### 5.4.3 Query Result Cache (Deferred)
+
+A shared operator-signed relay-hosted Query result cache was drafted during the outlet redesign but pulled from initial scope before merge. Concrete design questions blocked it — relay-side authentication and authorization boundaries for cache reads (the cache must be membership-gated but relays are not membership-aware); interaction with per-member pseudonym routing (§9.10.4), which prevents the relay from grouping hits on a single routing ID without leaking subscribership; and the billing semantics of a paid Query operator serving an unbounded cached audience. Until the cache ships, §5.4.2 marks Query as "cacheable" as a semantic property of the kind, not as a claim that a cache exists; every Query invocation executes live. Implementations MUST NOT silently add a cache layer — a cache-like optimization that is not specified here is a protocol divergence, because it changes what the outlet-invocation event records and what the operator signs for.
+
+### 5.4.4 Outlet Error Taxonomy
+
+Every outlet failure — at registration, authorization, input validation, execution, output validation, billing, transport, or governance — surfaces as a single typed envelope, the `OutletError`. The taxonomy is deliberately **compact**: a small, fixed set of numeric codes carries the machine-actionable class of failure, and a dot-separated **slug** carries the fine-grained distinction. New failure conditions are minted as new slugs under an existing code, not as new codes. This keeps the code space bounded and stable across protocol rounds while still letting operators and SDKs disambiguate to the exact condition.
+
+> **Provenance note.** This section documents the error registry the reference implementation ships in `crates/scp-protocol/src/context/outlets/error_codes.rs` and the envelope in `outlets/errors.rs`. It was authored to describe the shipped behavior faithfully; where §5.4.2 already names conditions (`query-cost-violation`, `query-violation`, `amplification-violation`), those names are the Protocol/Authorization-class slugs defined here.
+
+**Error classes.** Every `OutletError` carries exactly one of **eight** root classes (`OutletErrorClass`). The class is the coarse routing key; SDKs render it as a sealed type (Python subclass tree, TypeScript tagged union, Swift `enum`, Kotlin sealed class). On the wire the class is the lowercase variant name (`"protocol"`, `"authorization"`, …). Each class owns a contiguous decimal code sub-range inside the `SCP-OUTLET-6100..6199` block:
+
+| Class | Code range | Meaning |
+|-------|-----------|---------|
+| `Protocol` | `6100..6109` | Registration, validation, classification, session-lifecycle violations. |
+| `Authorization` | `6110..6119` | UCAN / caveat / capability / attenuation / amplification denials. |
+| `Input` | `6120..6129` | Input schema, size, type, range violations. |
+| `Execution` | `6130..6139` | Handler panic, timeout, non-determinism, credit/stream exhaustion, cancel-ack timeout. |
+| `Output` | `6140..6149` | Output schema, size, serialization violations. |
+| `Economic` | `6150..6159` | Budget, insufficient funds, adapter failure, pricing, escrow overflow. |
+| `Transport` | `6160..6169` | Relay unavailable, cross-context bridge failure, rate limiting, concurrency caps. |
+| `Governance` | `6170..6179` | Deregistration, suspension, ceiling exceeded, active consequence. |
+
+**The compact code registry.** Only fourteen codes are allocated across the `6100..6199` sub-block — the design target is "compact," roughly one to two codes per class. Every allocated code has a class, a canonical **default slug**, and a default retry policy:
+
+| Code | Class | Default slug | Default retry |
+|------|-------|--------------|---------------|
+| `SCP-OUTLET-6100` | `Protocol` | `protocol.violation` | Never |
+| `SCP-OUTLET-6101` | `Protocol` | `protocol.session-id-conflict` | Never |
+| `SCP-OUTLET-6110` | `Authorization` | `authorization.denied` | Never |
+| `SCP-OUTLET-6114` | `Authorization` | `attenuation.mask-width-violation` | Never |
+| `SCP-OUTLET-6115` | `Authorization` | `authorization.salt-rotation-unjustified` | Never |
+| `SCP-OUTLET-6120` | `Input` | `input.schema-violation` | Never |
+| `SCP-OUTLET-6130` | `Execution` | `execution.handler-panic` | Never |
+| `SCP-OUTLET-6131` | `Execution` | `execution.credit-exhausted` | Immediate |
+| `SCP-OUTLET-6133` | `Execution` | `execution.credit-stall` | Backoff 1s..30s |
+| `SCP-OUTLET-6135` | `Execution` | `execution.cancel-ack-timeout` | Never |
+| `SCP-OUTLET-6140` | `Output` | `output.schema-violation` | Never |
+| `SCP-OUTLET-6150` | `Economic` | `economic.insufficient-funds` | Never |
+| `SCP-OUTLET-6160` | `Transport` | `transport.relay-unavailable` | Backoff 1s..30s |
+| `SCP-OUTLET-6170` | `Governance` | `governance.outlet-deregistered` | Never |
+
+Every other code in `6100..6199` — the intra-class gaps (`6111`, `6132`, …) and the reserved tail `6180..6199` — is **unallocated**. The registry lookups (`error_code_to_class`, `error_code_to_default_slug`, `error_code_to_retry_policy`) return "none" for any unallocated or out-of-sub-block code. Reserving the gaps lets future conditions that genuinely need a distinct *code* (rather than a new slug under an existing code) take a stable number without renumbering.
+
+**Slugs.** The slug is the fine-grained condition name. It MUST match the regex `^[a-z][a-z0-9-]{0,63}(\.[a-z][a-z0-9-]{0,63})*$` — lowercase ASCII, dot-separated, each segment 1–64 characters and starting with a letter. Multi-segment slugs are normal (`transport.concurrent-streams-per-invoker`, `attenuation.mask-width-violation`). A slug's leading segment is normally the lowercased class name (`authorization.*` under `Authorization`, `execution.*` under `Execution`), so a slug maps deterministically back to its class via `slug_to_class`. Multiple slugs share one code: e.g. `SCP-OUTLET-6110` covers `authorization.denied`, `authorization.expired`, `authorization.revoked`, `authorization.missing`, `authorization.attenuation-violation`, and the caveat-enforcement slugs (`authorization.mint-limit-exceeded`, `authorization.time-box-violation`, `authorization.rate-exceeded`, `authorization.cumulative-exceeded`, `authorization.adapter-not-allowed`), while the distinct attenuation-invariant failures (`attenuation.*`) get their own code `SCP-OUTLET-6114` so operators can filter them apart from the catch-all denial.
+
+**Cross-class slug (exception).** `protocol.interface-spam-cost` carries a `protocol.` prefix but maps to the **`Economic`** class (code `SCP-OUTLET-6150`): the failure is an economic one (the §6.2.0.1 quadratic anti-spam fee was insufficient), but the *rule* that sets the fee lives at the protocol layer, so the slug keeps the rule's home for searchability while the class records the true semantics. It is the single slug whose leading segment does not equal its class name.
+
+**Query-oracle collapse (`authorization.denied`).** Code `SCP-OUTLET-6110` with slug `authorization.denied` is the deliberate collapse target for the query-oracle protection. A caller that lacks the disambiguating capability stem on a target outlet receives exactly this `(code, slug)` pair regardless of whether the outlet is registered, deregistered, or has never existed — the error is identical across all three, so a probing caller cannot use error variation to enumerate which outlets exist. Only a caller holding the requisite stems ever sees a differentiated slug (e.g. `authorization.attenuation-violation`). The *code* stays `SCP-OUTLET-6110` in every case; only the slug varies, and only for callers already authorized to see the distinction.
+
+**Retry guidance.** Every envelope carries a `RetryPolicy` (`Never`, `Immediate`, `After{delay}`, `WithBackoff{min,max}`) so a caller can decide to retry without re-classifying the error. Deterministic rejections (Protocol, Authorization, Input, Output, Economic, Governance, and broken-handler Execution faults) default to `Never` — retrying the same request reproduces the error. Idempotent credit exhaustion (`SCP-OUTLET-6131`) defaults to `Immediate` (the framework refreshes credits). Back-pressure conditions — credit-stall (`SCP-OUTLET-6133`) and transport faults (`SCP-OUTLET-6160`) — default to `WithBackoff` over `1s..30s`. Receivers MAY override the default from contextual signals (e.g. a `transport.rate-limited` envelope carrying a `retry_after_secs` hint).
+
+**Envelope wire form.** The `OutletError` serializes as a `MessagePack` map with numeric field tags: `1` code, `2` slug, `3` class, `4` message, `5` retry, `6` typed per-class detail, `8` cross-context source-chain, `11` `pad_nonce`, `12` `registration_event_id`. Tags `7`, `9`, `10` are reserved; tags `13+` are reserved for future extension. Any unknown tag (`7`/`9`/`10`/`13+`) is preserved verbatim and round-trips byte-identical, so an old SDK never drops a field a newer emitter added. The `detail` (tag 6) is a typed shape selected by the class (each class declares its expected detail shape; a class with no detail omits the tag, and a shape mismatch is rejected at construction). The `message` (tag 4) is `HMAC-SHA-256(outlet_message_key, catalog_key)[..32]` — the on-wire message is opaque to non-members, who cannot reverse it; members look up the registered `message_catalog` under the `registration_event_id` (tag 12) to recover the human-readable template. `pad_nonce` (tag 11) is a fresh per-envelope CSPRNG nonce that keys the pseudonymization of the cross-context hop trail; both `pad_nonce` and `registration_event_id` are emitted **unconditionally** (never omitted) so their presence cannot itself act as a side-channel oracle.
 
 ## 5.5 Roles
 
-Contexts define roles with specific permission sets within the capability ceiling. Roles determine which tools an agent can invoke, what data it can access, whether it can invite others, modify settings, etc.
+Contexts define roles with specific permission sets within the capability ceiling. Roles determine which outlets an agent can invoke, what data it can access, whether it can invite others, modify settings, etc.
 
 Properties of roles:
 
@@ -214,7 +358,7 @@ Properties of roles:
 - **Author** — holds `messages:write` UCAN. Can publish broadcast-key-encrypted content. Authors are bounded (added via `role:assigned` events with role `author`). Each author maintains their own broadcast key with an independent epoch counter.
 - **Subscriber** — holds `messages:read` (auto-granted on DID-authenticated registration in open broadcast contexts, or requiring an explicit admin-issued UCAN in gated broadcast contexts). Subscribers receive author broadcast keys on request. Subscribers are unbounded.
 
-The author/subscriber distinction mirrors the writer/reader two-tier model from contexts with discovery tools (§6.2.2B). Open broadcast subscriber registration follows the same DID-authenticated pattern as context reader-tier access.
+The author/subscriber distinction mirrors the writer/reader two-tier model from contexts with discovery outlets (§6.2.2B). Open broadcast subscriber registration follows the same DID-authenticated pattern as context reader-tier access.
 
 ### 5.5.1 Default Role Set
 
@@ -223,26 +367,26 @@ Every context has a minimum set of built-in roles. Context creators MAY define a
 | Role | Permissions | Description |
 |------|------------|-------------|
 | `admin` | All capabilities in ceiling + `member:invite` + `member:remove` + `role:assign` + `governance:propose` + `governance:vote` + `metadata:edit` | Full control. The context creator is always assigned this role at creation. |
-| `moderator` | `messages:read` + `messages:write` + `tool:invoke:*` + `member:remove` + `governance:propose` | Can moderate content and members but cannot change roles or governance structure. |
-| `member` | `messages:read` + `messages:write` + `tool:invoke:*` | Standard participant. Can read, write, and use tools. |
-| `observer` | `messages:read` | Read-only access. Cannot send messages, invoke tools, or participate in governance. Observers can see all content and membership but cannot create state. |
+| `moderator` | `messages:read` + `messages:write` + `outlet:query:*` + `outlet:call:*` + `member:remove` + `governance:propose` | Can moderate content and members but cannot change roles or governance structure. |
+| `member` | `messages:read` + `messages:write` + `outlet:query:*` + `outlet:call:*` | Standard participant. Can read, write, and invoke outlets. |
+| `observer` | `messages:read` | Read-only access. Cannot send messages, invoke outlets, or participate in governance. Observers can see all content and membership but cannot create state. |
 
 **Observer role permissions (detailed):**
 
 Observers can:
 - Read all messages in the context (subject to memory scope and access key restrictions).
 - View the member list, roles, and context metadata.
-- View tool registrations and their schemas.
+- View outlet registrations and their schemas.
 - View the event log (governance actions, membership changes).
 - Leave the context voluntarily.
 
 Observers cannot:
 - Send messages or reactions.
-- Invoke tools (no `tool:invoke:*` or `tool:invoke:{id}`).
+- Invoke outlets (no `outlet:query:*`, `outlet:call:*`, `outlet:query:{id}`, or `outlet:call:{id}`).
 - Invite members.
 - Propose or vote on governance actions.
 - Modify context metadata.
-- Register or deregister tools.
+- Register or deregister outlets.
 
 **Custom roles.** Context creators define custom roles by specifying a role name (string, max 64 chars, `[a-z0-9_-]`) and a permission set (subset of the ceiling). Custom role permissions MUST be a subset of the ceiling — a custom role cannot grant capabilities beyond the ceiling. Custom roles are stored in the context's role registry (`context/{id}/role/{role_name}` per §17.3) and visible in context metadata.
 
@@ -288,7 +432,7 @@ Structural fields are always public regardless of `MetadataVisibilityPolicy`. Th
 - Name
 - Description
 - Economic policy, if set (§19.3) — pricing, accepted adapters, payee
-- Active tool interface count (inbound and outbound, §6.2, §9.2.1)
+- Active outlet interface count (inbound and outbound, §6.2, §9.2.1)
 - For child contexts (§5.13): parent context IDs, parent metadata summaries, parent governance configuration, and the prospective member's eligibility basis (§5.13.6)
 
 Each operational field has a visibility of `PreJoin` (visible to anyone with the context_id) or `MemberOnly` (visible only to context members). The `MetadataVisibilityPolicy` is declared at context creation and follows the context's ceiling policy — immutable or governed via `ModifyCeiling`.
@@ -310,7 +454,7 @@ pub struct MetadataVisibilityPolicy {
     pub name: FieldVisibility,
     pub description: FieldVisibility,
     pub economic_policy: FieldVisibility,
-    pub tool_interface_count: FieldVisibility,
+    pub outlet_interface_count: FieldVisibility,
     pub child_context_info: FieldVisibility,
 }
 
@@ -442,8 +586,8 @@ Content access actions go through the context's governance model (propose/vote/e
 
 | Collection | Maximum | Rationale |
 |-----------|---------|-----------|
-| `registered_tools` | 256 per context | Tools are heavyweight registrations; 256 exceeds any practical context |
-| `tool_interfaces` | 256 per context | Cross-context interfaces are bilateral agreements; 256 exceeds any practical context |
+| `registered_outlets` | 256 per context | Outlets are heavyweight registrations; 256 exceeds any practical context |
+| `outlet_interfaces` | 256 per context | Cross-context interfaces are bilateral agreements; 256 exceeds any practical context |
 | `threshold_signers` | 64 per context | Signers participate in quorum; >64 is operationally impractical |
 | `suspended_capabilities[did]` | No artificial cap | Naturally bounded by ceiling cardinality — at most one entry per capability per member |
 | `read_exclusion_list` | No artificial cap | Naturally bounded by membership count — cannot exclude non-members from CEK wrapping |
@@ -519,7 +663,7 @@ Contexts gain a declared memory scope — what happens to the context's data whe
 
 Three scopes:
 
-**Ephemeral.** Context encryption keys are destroyed on close AND the SDK issues deletion requests to relays for all encrypted event data associated with the context. Content is physically unreadable (keys destroyed) and actively cleaned up (ciphertext deleted where relays comply). Durable metadata persists: who participated, when, the declared purpose, participation contributions (participation counts, tool invocations), and discovery provenance. An agent's local orchestration (above the protocol boundary) may retain information from the interaction, but any data the agent subsequently uses elsewhere carries provenance at the protocol level: "sourced from closed ephemeral context."
+**Ephemeral.** Context encryption keys are destroyed on close AND the SDK issues deletion requests to relays for all encrypted event data associated with the context. Content is physically unreadable (keys destroyed) and actively cleaned up (ciphertext deleted where relays comply). Durable metadata persists: who participated, when, the declared purpose, participation contributions (participation counts, outlet invocations), and discovery provenance. An agent's local orchestration (above the protocol boundary) may retain information from the interaction, but any data the agent subsequently uses elsewhere carries provenance at the protocol level: "sourced from closed ephemeral context."
 
 Relay deletion is best-effort — relays are untrusted infrastructure and cannot be forced to delete. Defense in depth: even if a relay retains the encrypted blobs, the keys are destroyed and the data is unreadable. Relay compliance with deletion requests is tracked as part of relay reliability scoring (§9.9.2) — relays that retain data they were asked to delete are scored lower and deprioritized for future context creation.
 
@@ -540,7 +684,7 @@ EphemeralDeletionRequest {
 
 The relay verifies the signature and MAY verify the close proof against its cached event log state. Relays SHOULD process deletion requests within 60 seconds. The relay responds with a `DeletionAcknowledgement` containing the count of blobs deleted. The SDK retries failed deletion requests with exponential backoff (initial 5s, max 300s, 5 retries) and records relay compliance for reliability scoring.
 
-**Summary.** Context produces a structured summary on close. Full content is destroyed (keys destroyed as with ephemeral). The summary persists with full provenance. Both parties can verify the summary against the event log before keys are destroyed. The summary format is defined by the context (via tools or governance), not by the protocol — the protocol provides the lifecycle hooks (pre-close summary generation, verification window, key destruction) but does not prescribe summary content.
+**Summary.** Context produces a structured summary on close. Full content is destroyed (keys destroyed as with ephemeral). The summary persists with full provenance. Both parties can verify the summary against the event log before keys are destroyed. The summary format is defined by the context (via outlets or governance), not by the protocol — the protocol provides the lifecycle hooks (pre-close summary generation, verification window, key destruction) but does not prescribe summary content.
 
 The **verification window** is the period between summary generation and key destruction during which members can verify the summary against the full event log. The verification window duration is 300 seconds (5 minutes). During this window: (a) the summary is published as a signed MLS application message, (b) all members can read the full event log and compare it against the summary, (c) any member can raise a `SummaryDisputed` event if the summary is inaccurate, (d) after 300 seconds with no dispute, key destruction proceeds automatically. If a dispute is raised, key destruction is paused until the dispute is resolved through governance. Disputes that are not resolved within 24 hours result in key destruction proceeding anyway — the 24-hour limit prevents indefinite postponement of an ephemeral context's destruction guarantee.
 
@@ -598,7 +742,7 @@ If `auto_invite` is true, the initiating admin sends bulk invitations to all cur
 After migration is approved, the source context enters a **read-only grace period**:
 
 - **Duration:** Configurable in the proposal. RECOMMENDED default: 7 days.
-- **Read-only semantics:** No new messages, tool invocations, or governance actions (except `ProposeContextMigration` cancellation) are accepted. Members can still read existing content and retrieve history.
+- **Read-only semantics:** No new messages, outlet invocations, or governance actions (except `ProposeContextMigration` cancellation) are accepted. Members can still read existing content and retrieve history.
 - **Purpose:** Gives all members time to discover the migration, evaluate the destination, join if desired, and retrieve any data they need from the source.
 - **Event log entry:** `ContextMigrationStarted { destination_id, grace_period_end }` is emitted when the grace period begins.
 
@@ -629,7 +773,7 @@ If the source context has child contexts (§5.13):
 
 ## 5.12 Context Templates and Lightweight Creation
 
-Context creation requires specifying a ceiling, roles, governance model, memory scope, TTL, and tools. For durable, bespoke contexts this is appropriate — the creator is designing a space. But contexts must also be cheap and disposable. If "spin up a quick context" requires manual configuration of six parameters, agents will route around the protocol for lightweight coordination. Context templates solve this.
+Context creation requires specifying a ceiling, roles, governance model, memory scope, TTL, and outlets. For durable, bespoke contexts this is appropriate — the creator is designing a space. But contexts must also be cheap and disposable. If "spin up a quick context" requires manual configuration of six parameters, agents will route around the protocol for lightweight coordination. Context templates solve this.
 
 ### 5.12.1 Well-Known Templates
 
@@ -642,8 +786,8 @@ Template: "scp:template/bilateral-ephemeral"
   governance:  single-admin
   memory_scope: ephemeral
   ttl:         required (creator sets duration, no default — forces intentionality)
-  tools:       none
-  metadata_visibility: { member_count: MemberOnly, context_age: MemberOnly, creator_identity: MemberOnly, name: PreJoin, description: MemberOnly, economic_policy: MemberOnly, tool_interface_count: MemberOnly, child_context_info: MemberOnly }
+  outlets:       none
+  metadata_visibility: { member_count: MemberOnly, context_age: MemberOnly, creator_identity: MemberOnly, name: PreJoin, description: MemberOnly, economic_policy: MemberOnly, outlet_interface_count: MemberOnly, child_context_info: MemberOnly }
 
 Template: "scp:template/bilateral-persistent"
   ceiling:     [messages:read, messages:write, member:ban]
@@ -651,17 +795,17 @@ Template: "scp:template/bilateral-persistent"
   governance:  single-admin
   memory_scope: full
   ttl:         none
-  tools:       none
-  metadata_visibility: { member_count: MemberOnly, context_age: MemberOnly, creator_identity: MemberOnly, name: PreJoin, description: MemberOnly, economic_policy: MemberOnly, tool_interface_count: MemberOnly, child_context_info: MemberOnly }
+  outlets:       none
+  metadata_visibility: { member_count: MemberOnly, context_age: MemberOnly, creator_identity: MemberOnly, name: PreJoin, description: MemberOnly, economic_policy: MemberOnly, outlet_interface_count: MemberOnly, child_context_info: MemberOnly }
 
 Template: "scp:template/coordination"
-  ceiling:     [messages:read, messages:write, tool:invoke:*, member:ban]
+  ceiling:     [messages:read, messages:write, outlet:query:*, outlet:call:*, member:ban]
   roles:       [admin (creator), member (joiner)]
   governance:  single-admin
   memory_scope: summary
   ttl:         required (creator sets duration)
-  tools:       creator-defined at creation
-  metadata_visibility: { member_count: MemberOnly, context_age: MemberOnly, creator_identity: MemberOnly, name: PreJoin, description: MemberOnly, economic_policy: MemberOnly, tool_interface_count: MemberOnly, child_context_info: MemberOnly }
+  outlets:       creator-defined at creation
+  metadata_visibility: { member_count: MemberOnly, context_age: MemberOnly, creator_identity: MemberOnly, name: PreJoin, description: MemberOnly, economic_policy: MemberOnly, outlet_interface_count: MemberOnly, child_context_info: MemberOnly }
 
 Template: "scp:template/group-discussion"
   ceiling:     [messages:read, messages:write, member:invite, member:ban]
@@ -669,15 +813,15 @@ Template: "scp:template/group-discussion"
   governance:  single-admin
   memory_scope: full
   ttl:         optional
-  tools:       none
-  metadata_visibility: { member_count: PreJoin, context_age: MemberOnly, creator_identity: PreJoin, name: PreJoin, description: PreJoin, economic_policy: MemberOnly, tool_interface_count: MemberOnly, child_context_info: MemberOnly }
+  outlets:       none
+  metadata_visibility: { member_count: PreJoin, context_age: MemberOnly, creator_identity: PreJoin, name: PreJoin, description: PreJoin, economic_policy: MemberOnly, outlet_interface_count: MemberOnly, child_context_info: MemberOnly }
 
 Template: "scp:template/public-broadcast"
   mode:          Broadcast
-  ceiling:       [messages:read, messages:write, tool:register, tool:invoke:*]
+  ceiling:       [messages:read, messages:write, outlet:register, outlet:query:*, outlet:call:*]
   roles:
     owner:       all capabilities in ceiling + member:invite, role:assign, context:close
-    author:      messages:write, messages:read, tool:invoke:*
+    author:      messages:write, messages:read, outlet:query:*, outlet:call:*
     subscriber:  messages:read (auto-granted on DID-authenticated registration)
   governance:    single-admin
   memory_scope:  full
@@ -687,10 +831,10 @@ Template: "scp:template/public-broadcast"
 
 Template: "scp:template/gated-broadcast"
   mode:          Broadcast
-  ceiling:       [messages:read, messages:write, tool:register, tool:invoke:*]
+  ceiling:       [messages:read, messages:write, outlet:register, outlet:query:*, outlet:call:*]
   roles:
     owner:       all capabilities in ceiling + member:invite, role:assign, context:close
-    author:      messages:write, messages:read, tool:invoke:*
+    author:      messages:write, messages:read, outlet:query:*, outlet:call:*
     subscriber:  messages:read (requires admin-issued UCAN)
   governance:    single-admin
   memory_scope:  full
@@ -698,23 +842,23 @@ Template: "scp:template/gated-broadcast"
   metadata_visibility: { member_count: MemberOnly, all others: PreJoin }
   projection_policy: { default_rule: Gated, overrides: [] }
 
-Template: "scp:template/tool-interface"
-  ceiling:       [messages:read, messages:write, tool:register, tool:invoke:*, member:ban]
+Template: "scp:template/outlet-interface"
+  ceiling:       [messages:read, messages:write, outlet:register, outlet:query:*, outlet:call:*, member:ban]
   roles:         [admin (creator), member (joiner)]
   governance:    single-admin
   memory_scope:  full
   ttl:           optional
-  tools:         creator-defined at creation
+  outlets:         creator-defined at creation
   metadata_visibility: all PreJoin
 
 Template: "scp:template/paid-service"
-  ceiling:       [messages:read, messages:write, tool:register, tool:invoke:*, member:ban]
+  ceiling:       [messages:read, messages:write, outlet:register, outlet:query:*, outlet:call:*, member:ban]
   ceiling_policy: immutable
   roles:         [admin (creator), member (joiner)]
   governance:    single-admin
   memory_scope:  full (receipts are provenance)
-  economic_policy: required — per_tool_invoke must be set at creation
-  extends:       scp:template/tool-interface
+  economic_policy: required — per_outlet_call must be set at creation
+  extends:       scp:template/outlet-interface
   ttl:           optional
   metadata_visibility: { economic_policy: PreJoin, member_count: MemberOnly, all others: PreJoin }
 
@@ -764,13 +908,13 @@ TrustRequirement:
 Example policy: "Auto-accept `bilateral-ephemeral` contexts from any DID on my allowlist, if TTL ≤ 10 minutes, at most 5 per hour."
 
 **Security properties:**
-- Policies never auto-accept contexts with tool capabilities (ceiling containing `tool:invoke:*`). Tool access always requires explicit confirmation. This is non-overridable.
+- Policies never auto-accept contexts with outlet-invocation capabilities (ceiling containing `outlet:query:*` or `outlet:call:*`). Outlet access always requires explicit confirmation. This is non-overridable.
 - Rate limiting prevents a compromised contact from flooding auto-accepts.
 - **Auto-accept is allowlist-only.** The sole auto-accept trigger is a DID on the operator's explicit `known_did` allowlist. Co-membership in a shared context and registration/discoverability in an open registry are **NOT** trust signals and never trigger auto-accept: inferring trust from either is unsound, and discovery is how strangers *reach* you, not whom you auto-trust (consistent with §09's "from a known DID"). The allowlist has **no self-clear path** — the candidate cannot add itself to the evaluating party's allowlist; allowlist membership is set by the evaluator, not the candidate.
 - **No-default auto-accept (normative).** There is **NO** default auto-accept policy. Absent an explicit, human-configured `AutoAcceptPolicy`, every invitation prompts the human (default-deny).
 - Auto-accept policies are enforced in the SDK, not the protocol. The protocol sees a normal context join. The policy just determines whether the SDK prompts the human or acts autonomously.
 
-**No auto-accept for tool-bearing contexts.** This is a hard rule, not a default. Any context whose ceiling includes `tool:invoke:*`, `tool:invoke:{tool_id}`, or any tool-related capability requires explicit human or agent confirmation regardless of auto-accept policies. The rationale: tool access is the capability that enables cross-context data flow (§6.2). Auto-accepting it would silently expand the agent's cross-context attack surface.
+**No auto-accept for outlet-bearing contexts.** This is a hard rule, not a default. Any context whose ceiling includes `outlet:query:*`, `outlet:call:*`, `outlet:query:{outlet_id}`, `outlet:call:{outlet_id}`, or any outlet-related capability requires explicit human or agent confirmation regardless of auto-accept policies. The rationale: outlet access is the capability that enables cross-context data flow (§6.2). Auto-accepting it would silently expand the agent's cross-context attack surface.
 
 **No auto-accept for paid contexts.** This is a hard rule, not a default. Any context with an `EconomicPolicy` requiring payment (non-empty `CostSchedule`) requires explicit confirmation regardless of auto-accept policies. Agents never silently incur costs. See §19.3.
 
@@ -793,7 +937,7 @@ sdk.create_context(params: ContextParams {
   governance: SingleAdmin,
   memory_scope: Ephemeral,
   ttl: Duration::minutes(5),
-  tools: [],
+  outlets: [],
   template_id: None,                  // No template — custom params
 }) → ContextHandle
 ```
@@ -820,7 +964,7 @@ InvitationBundle {
                                           // authority from: governance, ceiling, ceiling_policy,
                                           // roles, mode, ttl, memory_scope, economic_policy
                                           // (including payee), consequence_rules and the
-                                          // allow_automatic_access_revocation opt-in, tools, and
+                                          // allow_automatic_access_revocation opt-in, outlets, and
                                           // every other authority-relevant field. This is the
                                           // authenticated authority source (see Signature scope);
                                           // the joiner enforces from it, never from the lossy
@@ -846,7 +990,7 @@ MetadataSnapshot {
 }
 ```
 
-**Signature scope.** The creator signs `SHA-256("SCP-INVITATION-BUNDLE-V1:" || context_id || creator_did || relay_urls_hash || welcome_message_hash || key_material_hash || genesis_params_hash || metadata_snapshot_hash)`. The raw `context_id` and `creator_did` are encoded per the §9.5.1 length-prefixed rules (4-byte big-endian length prefix followed by UTF-8 bytes). Each `_hash` is the 32-byte SHA-256 output `SHA-256(canonical_json_jcs(field))` over the corresponding field — RFC 8785 (JCS) canonical JSON — inserted raw into the preimage (a fixed 32-byte value carries no length prefix, per §9.5.1). In particular `genesis_params_hash = SHA-256(canonical_json_jcs(context_params))` binds the **complete genesis `ContextParams`** into the signature, so the signature authenticates the full authority the joiner enforces — governance, ceiling, ceiling_policy, roles, mode, ttl, memory_scope, economic_policy (including payee), consequence_rules and the `allow_automatic_access_revocation` opt-in, tools, and every other authority-relevant field — not merely the lossy `metadata_snapshot` (which omits economic-policy detail and consequence rules). `metadata_snapshot_hash` remains signed so the display / auto-accept view cannot be tampered independently of the authority it must agree with. The signature uses the creator's Active Signing Key (`#active`).
+**Signature scope.** The creator signs `SHA-256("SCP-INVITATION-BUNDLE-V1:" || context_id || creator_did || relay_urls_hash || welcome_message_hash || key_material_hash || genesis_params_hash || metadata_snapshot_hash)`. The raw `context_id` and `creator_did` are encoded per the §9.5.1 length-prefixed rules (4-byte big-endian length prefix followed by UTF-8 bytes). Each `_hash` is the 32-byte SHA-256 output `SHA-256(canonical_json_jcs(field))` over the corresponding field — RFC 8785 (JCS) canonical JSON — inserted raw into the preimage (a fixed 32-byte value carries no length prefix, per §9.5.1). In particular `genesis_params_hash = SHA-256(canonical_json_jcs(context_params))` binds the **complete genesis `ContextParams`** into the signature, so the signature authenticates the full authority the joiner enforces — governance, ceiling, ceiling_policy, roles, mode, ttl, memory_scope, economic_policy (including payee), consequence_rules and the `allow_automatic_access_revocation` opt-in, outlets, and every other authority-relevant field — not merely the lossy `metadata_snapshot` (which omits economic-policy detail and consequence rules). `metadata_snapshot_hash` remains signed so the display / auto-accept view cannot be tampered independently of the authority it must agree with. The signature uses the creator's Active Signing Key (`#active`).
 
 **Canonicalization rationale.** Per-field hashes use RFC 8785 canonical JSON (JCS), matching the cross-implementation canonical-hashing mandate in §9.5 (§09-security-model.md) and the §5.13.3 `0xFF02` extension precedent. MessagePack has no canonical form standard — field ordering varies by library, so it cannot guarantee byte-identical output across independent SDK implementations; JCS provides a formal canonicalization standard that can. This ensures two implementations that serialize the same logical field produce identical signed bytes and therefore verify each other's signatures. (The bundle's MessagePack transport envelope is unaffected: the signed preimage is built from JCS field hashes, not from the MessagePack envelope bytes, so the transport encoding never enters the signature.)
 
@@ -854,7 +998,7 @@ MetadataSnapshot {
 1. Resolve `creator_did` and verify `signature` against the creator's `#active` public key.
 2. Verify `metadata_snapshot.structural` is consistent with `context_params`. Both are inside the same creator signature, so a divergence is a signed self-contradiction — reject. This blocks a creator from displaying benign structural values for the auto-accept check while enforcing hostile ones.
 3. Validate the structural authority (`metadata_snapshot.structural`, equivalently the corresponding `context_params` fields) against the invitee's auto-accept policy (§5.12.2).
-4. For the fields the `0xFF02` MLS group-context extension commits (the genesis `creator_did`, governance, ceiling, ceiling_policy, mode, parent lineage — §5.13.3), verify `context_params` and `creator_did` match the committed extension carried in `welcome_message`. In particular, the bundle's `creator_did` MUST equal the committed genesis `creator_did` (§5.13.3 rule 8): the bundle signature alone proves only that the SIGNER authored the bundle, not that the signer is the group's real creator/admin — an in-context member could sign a bundle naming an arbitrary `creator_did`, which is why the creator identity is anchored in the MLS-committed extension, not the signature. Authority for those fields is anchored in the MLS-committed extension; the bundle signature additionally authenticates the remaining genesis params (roles, ttl, memory_scope, economic_policy, consequence_rules, tools) that `0xFF02` does not commit.
+4. For the fields the `0xFF02` MLS group-context extension commits (the genesis `creator_did`, governance, ceiling, ceiling_policy, mode, parent lineage — §5.13.3), verify `context_params` and `creator_did` match the committed extension carried in `welcome_message`. In particular, the bundle's `creator_did` MUST equal the committed genesis `creator_did` (§5.13.3 rule 8): the bundle signature alone proves only that the SIGNER authored the bundle, not that the signer is the group's real creator/admin — an in-context member could sign a bundle naming an arbitrary `creator_did`, which is why the creator identity is anchored in the MLS-committed extension, not the signature. Authority for those fields is anchored in the MLS-committed extension; the bundle signature additionally authenticates the remaining genesis params (roles, ttl, memory_scope, economic_policy, consequence_rules, outlets) that `0xFF02` does not commit.
 5. If accepted, install authority from the verified `context_params` and process `welcome_message` via MLS to join the group (Encrypted contexts) or initialize subscriber state (Broadcast contexts).
 6. Use `context_metadata_key` to derive the metadata routing ID for ongoing metadata retrieval.
 
@@ -1055,7 +1199,7 @@ An agent typically has a standing context with every peer it communicates with r
 
 ## 5.13 Context Nesting
 
-Contexts can have parent-child relationships. A child context is a full context — its own MLS group, event log, governance, roles, tools, ceiling, and membership — that is structurally and cryptographically linked to one or more parent contexts. The parent relationship constrains the child (ceiling inheritance, lifecycle coupling, membership eligibility), is visible in metadata, and is bound into the child's MLS group identity so that lineage cannot be forged or rewritten after creation.
+Contexts can have parent-child relationships. A child context is a full context — its own MLS group, event log, governance, roles, outlets, ceiling, and membership — that is structurally and cryptographically linked to one or more parent contexts. The parent relationship constrains the child (ceiling inheritance, lifecycle coupling, membership eligibility), is visible in metadata, and is bound into the child's MLS group identity so that lineage cannot be forged or rewritten after creation.
 
 Nesting serves two distinct purposes depending on parent count:
 
@@ -1084,13 +1228,13 @@ Multi-parent chain:
 A child's capability ceiling is the intersection of all parent ceilings. This is enforced at creation time and is the hard security boundary that prevents capability escalation through nesting.
 
 ```
-Parent A ceiling: [messages:read, messages:write, tool:invoke:*, media]
-Parent B ceiling: [messages:read, messages:write, tool:invoke:*]
+Parent A ceiling: [messages:read, messages:write, outlet:query:*, outlet:call:*, media]
+Parent B ceiling: [messages:read, messages:write, outlet:query:*, outlet:call:*]
 
-Child ceiling ≤ intersection = [messages:read, messages:write, tool:invoke:*]
+Child ceiling ≤ intersection = [messages:read, messages:write, outlet:query:*, outlet:call:*]
 ```
 
-The child's ceiling can be equal to or narrower than the intersection — never broader. A child that only needs messaging can declare `[messages:read, messages:write]` even if the intersection would allow tools.
+The child's ceiling can be equal to or narrower than the intersection — never broader. A child that only needs messaging can declare `[messages:read, messages:write]` even if the intersection would allow outlets.
 
 If a parent has a `governed` ceiling policy (§5.3) and its ceiling is *reduced*, the child's ceiling is retrospectively reduced to maintain the intersection invariant. If this makes the child's ceiling empty (no capabilities remain), the child closes automatically. This cascade is logged in both the parent's and child's event logs. If a parent's ceiling is *expanded*, the child's ceiling does not automatically expand — the child's own ceiling policy governs.
 
@@ -1179,7 +1323,7 @@ Alice (in A + B) → sdk.create_child_context(
 
 **B. Coordinated creation across contexts.** Alice is in A with creation rights. Bob is in B with creation rights. Neither is in the other's context. They coordinate (via a bilateral context, shared context, or out-of-band) to create child C.
 
-Coordination uses an intrinsic tool call available within each context's governance. Alice invokes the child-creation tool in A with the proposed child params and the list of co-parents. A's governance evaluates and, if approved, publishes a **child creation proposal** — a signed, content-addressed record of the approved params. Bob does the same in B. The protocol matches proposals by their content hash: when all proposed parents have published matching proposals (identical child params), the child is created.
+Coordination uses an intrinsic outlet call available within each context's governance. Alice invokes the child-creation outlet in A with the proposed child params and the list of co-parents. A's governance evaluates and, if approved, publishes a **child creation proposal** — a signed, content-addressed record of the approved params. Bob does the same in B. The protocol matches proposals by their content hash: when all proposed parents have published matching proposals (identical child params), the child is created.
 
 **Proposal format and matching algorithm:**
 
@@ -1221,22 +1365,22 @@ All parents' SDKs subscribe to this routing address. When an SDK observes propos
 - A new coordination attempt requires new governance proposals in all parents — expired approvals are not reusable.
 
 ```
-Alice (in A) → invokes child creation tool → A's governance approves
+Alice (in A) → invokes child creation outlet → A's governance approves
              → A publishes proposal { match_hash, parent_list, approval_sig }
-Bob (in B)   → invokes child creation tool → B's governance approves
+Bob (in B)   → invokes child creation outlet → B's governance approves
              → B publishes proposal { match_hash, parent_list, approval_sig }
 SDK observes matching proposals from all parents
 → Child C created
 → Both Alice and Bob are initial members
 ```
 
-This reuses the existing tool call model — no new protocol primitive. The child creation tool is intrinsic to contexts that include the `context:child:createCreate` capability in their ceiling.
+This reuses the existing outlet call model — no new protocol primitive. The child creation outlet is intrinsic to contexts that include the `context:child:createCreate` capability in their ceiling.
 
 **C. Member proposal without creation rights.** Alice is in A but her role doesn't include creation rights. She proposes the child through A's governance (§5.9). A's governance evaluates and either approves or rejects the proposal. If approved, the governance itself authorizes the creation on A's behalf. Same process on B's side.
 
 **Creation protocol:**
 
-1. **Initiator constructs child params:** ceiling (must be ≤ intersection of parent ceilings), governance model, roles, TTL (must be ≤ minimum parent TTL if parents have TTLs), memory scope, tools, and the parent governance configuration (§5.13.4).
+1. **Initiator constructs child params:** ceiling (must be ≤ intersection of parent ceilings), governance model, roles, TTL (must be ≤ minimum parent TTL if parents have TTLs), memory scope, outlets, and the parent governance configuration (§5.13.4).
 2. **Governance proposal sent to each parent.** The proposal includes the full child params plus the list of all proposed parents. Each parent's governance evaluates independently.
 3. **All parents approve.** The child context is created. Creation is logged in every parent's event log and in the child's event log.
 4. **Any parent rejects.** Creation fails. No child is created. The rejection is not logged (the proposal never materialized).
@@ -1299,7 +1443,7 @@ ParentGovernanceConfig {
   can_restrict_ceiling:  Bool    // Can this parent further restrict the child's ceiling?
   requires_approval_for: [       // What child operations require this parent's approval?
     | governanceChange           // Child governance model changes
-    | toolRegistration           // New tools added to child
+    | outletRegistration           // New outlets added to child
     | ceilingChange              // Child ceiling modifications (only applicable if child has `governed` ceiling policy, §5.3)
     | membershipChange           // Members added/removed
   ]
@@ -1340,8 +1484,8 @@ Parent B config: { same as A }
 Parent A config: { can_close: true, can_evict: false, can_restrict: false,
                    requires_approval_for: [], on_sever: .cascade_close }
 Parent B config: { can_close: false, can_evict: false, can_restrict: true,
-                   requires_approval_for: [toolRegistration], on_sever: .cascade_close }
-// A can shut down the relationship. B controls the tools (it's the service provider).
+                   requires_approval_for: [outletRegistration], on_sever: .cascade_close }
+// A can shut down the relationship. B controls the outlets (it's the service provider).
 // If either severs, the child closes entirely.
 ```
 
@@ -1390,7 +1534,7 @@ Child context metadata (§5.7) includes all standard context metadata plus:
 - **Parent governance configuration.** What authority each parent has over the child (§5.13.4).
 - **Eligibility basis.** Which parent(s) the prospective member would join through.
 
-This means a member evaluating whether to join a child sees: "This is a child of contexts A and B. A has 30 members, single-admin governance, ceiling [msg, tools]. B has 15 members, multi-sig governance, ceiling [msg]. The child's ceiling is [msg]. Parent A can close the child unilaterally. Parent B cannot. If A severs, members from A only are evicted."
+This means a member evaluating whether to join a child sees: "This is a child of contexts A and B. A has 30 members, single-admin governance, ceiling [msg, outlets]. B has 15 members, multi-sig governance, ceiling [msg]. The child's ceiling is [msg]. Parent A can close the child unilaterally. Parent B cannot. If A severs, members from A only are evicted."
 
 Full legibility before opt-in applies to nesting relationships the same as everything else in the protocol. No hidden parent governance. No undisclosed co-parents.
 
@@ -1400,19 +1544,19 @@ Full legibility before opt-in applies to nesting relationships the same as every
 
 **Standing contexts.** A standing context (§5.12.6) between Alice and Bob can be modeled as a multi-parent child of whatever context(s) Alice and Bob share. This is not required — standing contexts remain lightweight bilateral contexts that work without nesting. But if structural governance over the standing context is desired (a parent context's governance should have authority over the channel), nesting provides that.
 
-**Tool interfaces.** Tool interfaces (§6.2) and multi-parent children serve different purposes and coexist:
+**Outlet interfaces.** Outlet interfaces (§6.2) and multi-parent children serve different purposes and coexist:
 
-| | Tool interface | Multi-parent child |
+| | Outlet interface | Multi-parent child |
 |---|---|---|
-| Relationship | Asymmetric (caller/tool) | Symmetric (peers) |
-| Data flow | Structured (schema-declared) | Full context (messages, tools, everything) |
+| Relationship | Asymmetric (caller/outlet) | Symmetric (peers) |
+| Data flow | Structured (schema-declared) | Full context (messages, outlets, everything) |
 | Governance | Both contexts govern each call | Configured at creation, child self-governs |
 | Duration | Per-call (or per-session) | Persistent (until closed or TTL) |
 | Use case | Service calls, data queries | Collaboration, negotiation, ongoing peer interaction |
 
-A context might use both: tool interfaces for structured service queries and a multi-parent child for ongoing collaboration with the same counterpart.
+A context might use both: outlet interfaces for structured service queries and a multi-parent child for ongoing collaboration with the same counterpart.
 
-**Provenance.** Data originating in a child context carries provenance (§7.7) that includes the child's parent lineage. When data from a child crosses another context boundary (via tool interface or further nesting), the provenance chain includes the child and its parents. This makes the trust basis structurally legible: "this data came from a child of A and B" tells the receiver more than "this data came from some context."
+**Provenance.** Data originating in a child context carries provenance (§7.7) that includes the child's parent lineage. When data from a child crosses another context boundary (via outlet interface or further nesting), the provenance chain includes the child and its parents. This makes the trust basis structurally legible: "this data came from a child of A and B" tells the receiver more than "this data came from some context."
 
 **Auto-accept and child contexts.** Child-context eligibility (§5.13.2) is a cryptographically-enforced **floor** on *who can reach you* with a child invitation — a child can only be offered by a context you are already a verified member of (relay-enforced, §5.13.2), not an SDK honor system. It is **not** a trust signal and does **not** trigger auto-accept. Auto-accepting a child invitation follows the same §5.12.2 rule as any other context: the inviter's DID MUST be on the operator's `known_did` allowlist, with the ceiling/TTL caps the policy specifies; otherwise the invitation prompts the human (default-deny). Co-membership in a parent is the floor that lets the invitation reach you, never a substitute for the allowlist.
 
@@ -1473,7 +1617,7 @@ Where `context_id` and `author_did` are UTF-8 bytes, each preceded by a 4-byte b
 
 ### 5.14.3 Subscriber Registration
 
-Broadcast contexts reuse the two-tier membership model from contexts with discovery tools (§6.2.2B):
+Broadcast contexts reuse the two-tier membership model from contexts with discovery outlets (§6.2.2B):
 
 - **Writer tier (authors):** Hold `messages:write` UCAN. Bounded. Manage content and key distribution.
 - **Reader tier (subscribers):** DID-authenticated (open) or UCAN-authenticated (gated). Unbounded. Receive author broadcast keys on request.
@@ -1635,7 +1779,7 @@ Reuses existing event types wherever possible. Only one genuinely new type:
 Broadcast contexts are discoverable through four mechanisms:
 
 1. **DID document service endpoint.** Authors MAY publish an `SCPBroadcastContext` service entry in their DID document with the context ID and relay URLs.
-2. **Contexts with discovery tools.** Authors register broadcast contexts via `agent_register` in contexts with discovery tools (§6.2.2B), with metadata indicating the context mode.
+2. **Contexts with discovery outlets.** Authors register broadcast contexts via `agent_register` in contexts with discovery outlets (§6.2.2B), with metadata indicating the context mode.
 3. **`.well-known/scp`.** Operators MAY list broadcast contexts in their `.well-known/scp` document (§18.3). Only broadcast context IDs may be listed — encrypted context IDs MUST NOT appear (§9.10 metadata privacy).
 4. **Out-of-band URI.** The universal context URI format (§18.4) is used for sharing context references: `scp://context/<context_id_hex>?relay=<url>&mode=broadcast`. The legacy format `scp://broadcast/<context_id_hex>?relay=<url>` is accepted as an alias and normalized to the universal format.
 
@@ -1695,7 +1839,7 @@ The security invariant governing which operations belong in the sync-persisted t
 
 ### 5.15.4 Cross-Context Operations Use Sagas
 
-Operations spanning **2+ distinct** contexts — currently just cross-context tool invocation (§6.2.4) — execute as coordinated sagas driven by a supervisor that never allows contexts to await each other directly. (Standing-pair creation, §5.15.8, is **not** a saga: a standing pair is one MLS context with two members, so it is single-context async creation synchronized by MLS + the event-log consistency layer, with no cross-context atomicity to coordinate.) Phase states and the predicates that select among their outgoing transitions:
+Operations spanning **2+ distinct** contexts — currently just cross-context outlet invocation (§6.2.4) — execute as coordinated sagas driven by a supervisor that never allows contexts to await each other directly. (Standing-pair creation, §5.15.8, is **not** a saga: a standing pair is one MLS context with two members, so it is single-context async creation synchronized by MLS + the event-log consistency layer, with no cross-context atomicity to coordinate.) Phase states and the predicates that select among their outgoing transitions:
 
 ```
 Initiated --[supervisor begins Prepare]--> PreparingA
@@ -1710,11 +1854,11 @@ Aborting   --[all participants ack Abort]--> Aborted (terminal)
 
 Each phase transition is synchronously persisted to a durable journal (§17.16) before any outbound effect of that phase — including the phase message dispatched to the next participating actor — is visible. Journal durability is the gate; the subsequent phase message and any other observer channel (§5.15.3) follow after the journal's durable acknowledgment. On process restart the supervisor replays unresolved journal entries.
 
-Concurrent sagas are serialized at the granularity of their **participant context set**, not supervisor-wide. A saga reserves the set of contexts it spans (one `saga_pending` slot per context-actor); a second saga whose participant set is disjoint proceeds concurrently, while a second saga whose participant set **overlaps** — shares **at least one** context with — an in-flight saga is rejected with a typed **saga-busy** error (the contended context's slot is already held; surfaced consistently across bindings). Overlap is non-empty participant-set intersection: sharing a single context is sufficient to conflict, so two sagas that share only one common context (e.g. two cross-context tool invocations that share a common target context) serialize at that shared context and never run concurrently. A `NeedsRepair` outcome **releases** the concurrency reservation: an operator action still resolves the divergence, but a stuck saga MUST NOT wedge unrelated sagas. (`NeedsRepair` is **FSM-terminal** — the automatic retry machine stops there, per the FSM above — but is **not a *resolved* state**: §17.16.1's unresolved-saga scan still loads it for crash-recovery and it is cleared only by operator repair or on the next process start (§17.16). A tool-invoke divergence (§6.2.4) can therefore stay unresolved until then — which is exactly why the concurrency reservation is released the moment the saga reaches `NeedsRepair`, rather than held until resolution.)
+Concurrent sagas are serialized at the granularity of their **participant context set**, not supervisor-wide. A saga reserves the set of contexts it spans (one `saga_pending` slot per context-actor); a second saga whose participant set is disjoint proceeds concurrently, while a second saga whose participant set **overlaps** — shares **at least one** context with — an in-flight saga is rejected with a typed **saga-busy** error (the contended context's slot is already held; surfaced consistently across bindings). Overlap is non-empty participant-set intersection: sharing a single context is sufficient to conflict, so two sagas that share only one common context (e.g. two cross-context outlet invocations that share a common target context) serialize at that shared context and never run concurrently. A `NeedsRepair` outcome **releases** the concurrency reservation: an operator action still resolves the divergence, but a stuck saga MUST NOT wedge unrelated sagas. (`NeedsRepair` is **FSM-terminal** — the automatic retry machine stops there, per the FSM above — but is **not a *resolved* state**: §17.16.1's unresolved-saga scan still loads it for crash-recovery and it is cleared only by operator repair or on the next process start (§17.16). An outlet-invoke divergence (§6.2.4) can therefore stay unresolved until then — which is exactly why the concurrency reservation is released the moment the saga reaches `NeedsRepair`, rather than held until resolution.)
 
 Commit retry budget: three retries (500 ms / 1 s / 2 s delays), then terminal `NeedsRepair` requiring operator action or process restart. No indefinite retry loop.
 
-There is currently **no** secret-bearing saga; §9.4.3 stands as the contract any future secret-bearing saga MUST satisfy. The single saga — cross-context tool invocation (§6.2.4) — is public-metadata-only: its journal and envelopes carry no bearer material (the tool invocation carries a UCAN *index*, not the token). It marks resolution with `secret_bearing=false`, so no synchronous on-disk evidence overwrite is required. (Standing-pair creation is not a saga and journals nothing — §5.15.8.)
+There is currently **no** secret-bearing saga; §9.4.3 stands as the contract any future secret-bearing saga MUST satisfy. The single saga — cross-context outlet invocation (§6.2.4) — is public-metadata-only: its journal and envelopes carry no bearer material (the outlet invocation carries a UCAN *index*, not the token). It marks resolution with `secret_bearing=false`, so no synchronous on-disk evidence overwrite is required. (Standing-pair creation is not a saga and journals nothing — §5.15.8.)
 
 ### 5.15.5 Governance is Single-Context
 
@@ -1744,7 +1888,7 @@ A **standing pair** is the `bilateral-persistent` context two identities create 
 - **Ok-return contract.** `Ok` means the **initiator's replica is created and the Welcome dispatched** — it does **NOT** imply the peer joined. Offline / slow / blocking / declining peers all yield the identical `Ok` (no synchronous confirmation).
 - **Send-gating caveat.** Any party that obtains its replica via Welcome-join can join and **decrypt** but **cannot SEND** until the Phase-2E spawn-from-Welcome entrypoint lands.
 
-> **Provenance (correction, 2026-06-18; length-prefix adopted 2026-06-24).** §5.15.8 was previously specified as a two-phase-commit cross-context saga (originally authored as the standing-pair saga). That was a miscategorization: a 2-member MLS group is one context, replica sync is MLS + the event-log consistency layer, and a saga coordinates atomicity across **2+ distinct** contexts sharing no sync protocol — which a standing pair is not. The sole genuine cross-context saga is §6.2.4 (cross-context tool invocation). See ADR-049 §3 / §3a / §3b. (The prior claim that unconditional length-prefix injectivity "would add no security" is **retracted**: the colon-join was always the sole structural isolation anchor for `derived_context_id`; the `group_id` removed in the saga-cut was the *saga's* separate MLS group identifier, not an isolation co-anchor.) **The length-prefix framing is now ADOPTED here (Alec 2026-06-24), not deferred:** the *Determinism precondition* derivation uses the §9.5.1 length-prefixed form, making injectivity unconditional and retiring the **colon-freedom method-admission dependence** (§3.8.1 RETAINS a method-admission gate for canonical *agreement* — what length-prefix retired is only the colon-freedom injectivity assumption) — see *Injectivity invariant* below. The code helper `derive_standing_context_digest` currently colon-joins and is updated to the length-prefixed form in the downstream standing-pair implementation PR; the spec leads here, and because the standing-pair creation path is not yet wired, there is **no live divergence** to reconcile.
+> **Provenance (correction, 2026-06-18; length-prefix adopted 2026-06-24).** §5.15.8 was previously specified as a two-phase-commit cross-context saga (originally authored as the standing-pair saga). That was a miscategorization: a 2-member MLS group is one context, replica sync is MLS + the event-log consistency layer, and a saga coordinates atomicity across **2+ distinct** contexts sharing no sync protocol — which a standing pair is not. The sole genuine cross-context saga is §6.2.4 (cross-context outlet invocation). See ADR-049 §3 / §3a / §3b. (The prior claim that unconditional length-prefix injectivity "would add no security" is **retracted**: the colon-join was always the sole structural isolation anchor for `derived_context_id`; the `group_id` removed in the saga-cut was the *saga's* separate MLS group identifier, not an isolation co-anchor.) **The length-prefix framing is now ADOPTED here (Alec 2026-06-24), not deferred:** the *Determinism precondition* derivation uses the §9.5.1 length-prefixed form, making injectivity unconditional and retiring the **colon-freedom method-admission dependence** (§3.8.1 RETAINS a method-admission gate for canonical *agreement* — what length-prefix retired is only the colon-freedom injectivity assumption) — see *Injectivity invariant* below. The code helper `derive_standing_context_digest` currently colon-joins and is updated to the length-prefixed form in the downstream standing-pair implementation PR; the spec leads here, and because the standing-pair creation path is not yet wired, there is **no live divergence** to reconcile.
 
 **Determinism precondition.** The id is a pure function of the two DIDs, **length-prefixed** per the §9.5.1 variable-length-bytes rule:
 ```
@@ -1775,7 +1919,7 @@ The bound-creator check (§9.7.1) requires **BOTH** the creator leaf's `ScpCrede
 1. **Initiator (A) creates the group.** A recomputes `derived_context_id` and validates: (a) it is not already Active under the id (else the *Get-or-create idempotency* path applies — bare existence is not auto-failure); (b) `peer_did` is canonically **distinct from A's own DID** (using §3.8.1 canonical form on both sides; a self-pair is rejected with the same generic/typed malformed-peer rejection as any malformed peer DID, disclosing nothing). **Sybil non-credit (normative, §9.3 cross-ref):** beyond the self-pair guard, a standing pair between **two distinct DIDs the same operator controls** MUST NOT count toward §9.3 earned-capacity participation records — otherwise a Sybil operator could self-deal two of their own DIDs into participation credit. This is the same **not-self-created** discriminator §9.3 applies to participation records (a participation record only counts from a context the counting identity did not itself create/admin); a two-party context both of whose members the operator controls is self-dealt and does not earn capacity for either. (c) the `bilateral-persistent` template params are well-formed (§5.12.1); (d) `peer_did` resolves to a well-formed DID document with an Active Signing Key (§3) and is not blocked; (e) A's provider holds no group under the id (the `Entry::Vacant` guard; collision ⇒ error). On success A creates a **1-leaf** MLS group plus a fresh sender key.
 2. **Add the peer.** A fetches B's published `KeyPackage` and `add_member`s B, producing a **Welcome**. B's KeyPackage single-use is enforced at B's *join* by the fused-join two-anchor mechanism (ADR-049 §9) — no Prepare-time reservation.
 3. **Publish / register (A).** A publishes the group, emits the **InvitationBundle** (carrying the MLS Welcome as its `welcome_message`, §5.12.3.1) to B's personal routing id (the §5.12.3.3 invitations routing id) asynchronously (A does not block on B), so it rides the §5.12.3.3 invitation-delivery path and inherits the InvitationBundle 7-day relay-retention TTL (`welcome_ttl`, default — read by the reaper, item (d)); registers the context **Active**, appends the creation to its event log, and records the peer via `register_standing_context`.
-4. **Peer (B) receives the Welcome and applies the consent gate on receipt** (*before* joining): (a0) **`derived_context_id` agreement (cross-party canonicalization check, defense-in-depth)** — B MUST **re-derive** the standing-pair `derived_context_id` from its **own** inputs (`local_did = B`, `peer_did = A`, each in §3.8.1 canonical form, sorted, length-prefixed per *Determinism precondition*) and verify it **equals** the context id the inbound InvitationBundle / Welcome binds. A mismatch — which can only arise from a DID-canonicalization divergence between A and B (e.g. an exotic did:web encoding the two sides normalize differently) — ⇒ **reject the Welcome (do NOT join)**, surfacing the same generic rejection as any other consent reject (no synchronous "Rejected" reply, per *Block-privacy* below). This is the **receive-side canonicalization backstop** §3.8.1's did:web residual relies on: it converts an **honest** DID-canonicalization divergence between A and B (the only way B's locally-derived id and the bundle's asserted `context_id` differ when A is honest) from a silent split-brain into a clean local rejection (routed through the generic consent-reject, leaking nothing). It is **not** a cryptographic cross-party agreement proof — `InvitationBundle.context_id` (§5.12.3.1) is a creator-asserted, creator-signed label, not a value bound to the DID pair, so a *malicious* A can always label the bundle with the id B will derive. Agreement against a dishonest creator on the collision path rests on the §9.7.1 bound-creator check and MLS membership binding (below), not on this equality test. **Non-mismatch resolution outcomes (a0).** If B cannot resolve or canonicalize `creator_did` (A's DID) at all — distinct from an id *mismatch* — the outcome is determined by the failure kind: a **transient** resolution failure (e.g. the DHT is momentarily unreachable) is a **retryable deferral**, NOT a permanent reject — B re-attempts within the `welcome_ttl` window rather than discarding the Welcome; a **permanent** un-canonicalizable-method case (a DID method that admits no canonical string form — the §3.8.1 fail-loud method-admission gate) is a **reject**. Neither path is ever a silent join: a still-pending transient deferral simply does not join yet, and a permanent failure rejects through the same generic consent-reject as a mismatch. (a) **block list** — refuse if A is globally blocked (§3.7.1 `is_globally_blocked`); (b) **default-deny for strangers (allowlist-or-prompt)** — a standing-pair Welcome from a **stranger** is **default-deny** (non-overridable, carrying the **same non-overridable intent** as §5.12.2's tool-bearing rule: a conformant SDK MUST NOT let an `AutoAcceptPolicy` override the deny), justified by the pair's `memory_scope: full` sensitivity (§5.12.1). It MAY be auto-joined **ONLY** if A's DID is on the operator's `known_did` allowlist (§5.12.2 — the sole auto-accept trigger); otherwise B joins **only after explicit human approval**. This default-deny is a **MUST on conformant implementations at the SDK consent-gate layer**, not protocol-layer enforcement. If B's policy configures an `AutoAcceptPolicy` whose `known_did` allowlist contains A, B MAY auto-join; else B joins only after explicit approval. The gate is applied by the **joining peer on Welcome receipt**, never as a synchronous Prepare-B reply: on accept B joins (single-use enforced at join), registers Active, appends, and runs `register_standing_context`; on reject B simply **never joins** — no synchronous "Rejected" reply.
+4. **Peer (B) receives the Welcome and applies the consent gate on receipt** (*before* joining): (a0) **`derived_context_id` agreement (cross-party canonicalization check, defense-in-depth)** — B MUST **re-derive** the standing-pair `derived_context_id` from its **own** inputs (`local_did = B`, `peer_did = A`, each in §3.8.1 canonical form, sorted, length-prefixed per *Determinism precondition*) and verify it **equals** the context id the inbound InvitationBundle / Welcome binds. A mismatch — which can only arise from a DID-canonicalization divergence between A and B (e.g. an exotic did:web encoding the two sides normalize differently) — ⇒ **reject the Welcome (do NOT join)**, surfacing the same generic rejection as any other consent reject (no synchronous "Rejected" reply, per *Block-privacy* below). This is the **receive-side canonicalization backstop** §3.8.1's did:web residual relies on: it converts an **honest** DID-canonicalization divergence between A and B (the only way B's locally-derived id and the bundle's asserted `context_id` differ when A is honest) from a silent split-brain into a clean local rejection (routed through the generic consent-reject, leaking nothing). It is **not** a cryptographic cross-party agreement proof — `InvitationBundle.context_id` (§5.12.3.1) is a creator-asserted, creator-signed label, not a value bound to the DID pair, so a *malicious* A can always label the bundle with the id B will derive. Agreement against a dishonest creator on the collision path rests on the §9.7.1 bound-creator check and MLS membership binding (below), not on this equality test. **Non-mismatch resolution outcomes (a0).** If B cannot resolve or canonicalize `creator_did` (A's DID) at all — distinct from an id *mismatch* — the outcome is determined by the failure kind: a **transient** resolution failure (e.g. the DHT is momentarily unreachable) is a **retryable deferral**, NOT a permanent reject — B re-attempts within the `welcome_ttl` window rather than discarding the Welcome; a **permanent** un-canonicalizable-method case (a DID method that admits no canonical string form — the §3.8.1 fail-loud method-admission gate) is a **reject**. Neither path is ever a silent join: a still-pending transient deferral simply does not join yet, and a permanent failure rejects through the same generic consent-reject as a mismatch. (a) **block list** — refuse if A is globally blocked (§3.7.1 `is_globally_blocked`); (b) **default-deny for strangers (allowlist-or-prompt)** — a standing-pair Welcome from a **stranger** is **default-deny** (non-overridable, carrying the **same non-overridable intent** as §5.12.2's outlet-bearing rule: a conformant SDK MUST NOT let an `AutoAcceptPolicy` override the deny), justified by the pair's `memory_scope: full` sensitivity (§5.12.1). It MAY be auto-joined **ONLY** if A's DID is on the operator's `known_did` allowlist (§5.12.2 — the sole auto-accept trigger); otherwise B joins **only after explicit human approval**. This default-deny is a **MUST on conformant implementations at the SDK consent-gate layer**, not protocol-layer enforcement. If B's policy configures an `AutoAcceptPolicy` whose `known_did` allowlist contains A, B MAY auto-join; else B joins only after explicit approval. The gate is applied by the **joining peer on Welcome receipt**, never as a synchronous Prepare-B reply: on accept B joins (single-use enforced at join), registers Active, appends, and runs `register_standing_context`; on reject B simply **never joins** — no synchronous "Rejected" reply.
 
 #### Threat model and operational contracts
 
@@ -1804,4 +1948,4 @@ The bound-creator check (§9.7.1) requires **BOTH** the creator leaf's `ScpCrede
 
 **`AlreadyExists` is not an existence oracle.** An `AlreadyExists` for an id the caller is **not a verified member of** MUST NOT return `Ok` (it would leak that a pair between two DIDs exists — the contact graph is private local bookkeeping, §5.12.6). The non-member path MUST return a response **indistinguishable in value AND timing** from the generic rejection any other failure returns — it MUST be constant-time with respect to existence, because an existence-dependent latency branch is itself a 1-bit oracle even when the returned value is identical. The typed `AlreadyExists`→`Ok` outcome is reserved **strictly** for verified-self-membership. **Implementer mechanism:** resolve membership **first**, then branch only on *membership* — a non-member and a no-such-context input traverse the same fixed-cost lookup work (`derived_context_id` resolution + membership check) and return the same generic rejection; existence MUST NOT be a branch the latency depends on. The §5.12.5 found-vs-create latency hint (`~0ms` found vs `~200ms` create) applies **only to a verified member's own pair** on the success path, never to the constant-time non-member path. **Reachability (defense-in-depth scope).** The non-member path is reachable **only** via a **raw-`derived_context_id`** join/resolve attempt, never via `standing_context(peer)` itself: `standing_context(peer)` derives the id from the **caller's own DID** + `peer` (sorted, length-prefixed, *Determinism precondition*), so the caller is a pair member **by construction** and cannot address a pair it is not in. The constant-time non-member defense thus guards a raw-`derived_context_id` entry point rather than the `standing_context(peer)` surface — and because `derived_context_id` is publicly computable from any two DIDs (see *Anti-spam* above), that raw entry point is a **concretely reachable** existence-probe surface: the value-AND-timing constant-time requirement on it is **load-bearing for any binding that accepts a raw context id**, not optional hardening.
 
-Cross-refs: §5.12.6 (standing contexts / contact graph; private local bookkeeping), §5.12.1 (`bilateral-persistent` template), §5.12.2 (`AutoAcceptPolicy` / `TrustRequirement` — allowlist-only), §5.12.3.3 (InvitationBundle relay-retention TTL), §5.12.5 (found-vs-create latency hint), §3.8.1 (canonical DID string form for deterministic derivation), §3.7.1 (block list / severance — sender-key rotation), §9.3 (Sybil resistance / earned capacity), §9.5.1 (length-prefix framing), §9.6.1 (did:dht self-certification / z-base-32 canonical form), §9.7.1 (MLS-to-SCP Concept Mapping — KeyPackage-signature / DID-VM binding rule), §9.16.3 (sender key rotation), §17 (event-log consistency / checkpoints), §6.2.4 (cross-context tool invocation saga), ADR-049 §3 / §3a / §9 / §10 / §Follow-ups (single-context async creation, not a saga; fused-join single-use; auto-revive; spawn-from-Welcome).
+Cross-refs: §5.12.6 (standing contexts / contact graph; private local bookkeeping), §5.12.1 (`bilateral-persistent` template), §5.12.2 (`AutoAcceptPolicy` / `TrustRequirement` — allowlist-only), §5.12.3.3 (InvitationBundle relay-retention TTL), §5.12.5 (found-vs-create latency hint), §3.8.1 (canonical DID string form for deterministic derivation), §3.7.1 (block list / severance — sender-key rotation), §9.3 (Sybil resistance / earned capacity), §9.5.1 (length-prefix framing), §9.6.1 (did:dht self-certification / z-base-32 canonical form), §9.7.1 (MLS-to-SCP Concept Mapping — KeyPackage-signature / DID-VM binding rule), §9.16.3 (sender key rotation), §17 (event-log consistency / checkpoints), §6.2.4 (cross-context outlet invocation saga), ADR-049 §3 / §3a / §9 / §10 / §Follow-ups (single-context async creation, not a saga; fused-join single-use; auto-revive; spawn-from-Welcome).

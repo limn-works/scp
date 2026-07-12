@@ -852,7 +852,9 @@ pub(crate) async fn context_create_on(
         ceiling: parsed
             .ceiling
             .iter()
-            .map(|s| scp_core::context::roles::Capability::new(s).ucan_capability_name())
+            .filter_map(|s| {
+                scp_core::context::roles::Capability::new(s).map(|c| c.ucan_capability_name())
+            })
             .collect(),
         ceiling_policy: parsed.ceiling_policy,
         ttl_seconds: parsed.ttl_seconds,
@@ -4977,8 +4979,26 @@ pub(crate) fn validate_capability_declaration_on(
     let decl: CapabilityDeclaration = serde_json::from_str(&declaration_json)
         .map_err(|e| NapiError::from_reason(format!("invalid declaration JSON: {e}")))?;
 
-    let ceiling: Vec<Capability> = ceiling_capabilities.iter().map(Capability::new).collect();
-    let role_caps: Vec<Capability> = role_capabilities.iter().map(Capability::new).collect();
+    let ceiling: Vec<Capability> = ceiling_capabilities
+        .iter()
+        .map(|s| {
+            Capability::new(s).ok_or_else(|| {
+                NapiError::from_reason(format!(
+                    "invalid capability {s:?} in ceiling (fails §5.4.2.1 parser) (use \"outlet:call:*\" for actions, \"outlet:query:*\" for reads)"
+                ))
+            })
+        })
+        .collect::<napi::Result<Vec<_>>>()?;
+    let role_caps: Vec<Capability> = role_capabilities
+        .iter()
+        .map(|s| {
+            Capability::new(s).ok_or_else(|| {
+                NapiError::from_reason(format!(
+                    "invalid capability {s:?} in role (fails §5.4.2.1 parser) (use \"outlet:call:*\" for actions, \"outlet:query:*\" for reads)"
+                ))
+            })
+        })
+        .collect::<napi::Result<Vec<_>>>()?;
 
     let handle = ContextHandle::new("validation-context".to_owned(), ContextParams::default());
 
@@ -5026,21 +5046,24 @@ pub(crate) fn check_scoped_capability_inner(
     granted_capabilities: Vec<String>,
     required_capability: String,
 ) -> bool {
-    use scp_core::context::roles::Capability;
+    use scp_core::context::roles::{Capability, CapabilityCeiling};
     use std::collections::HashSet;
 
-    let granted: HashSet<Capability> = granted_capabilities.iter().map(Capability::new).collect();
-    let required = Capability::new(&required_capability);
+    let granted: HashSet<Capability> = granted_capabilities
+        .iter()
+        .filter_map(Capability::new)
+        .collect();
+    // Fail-closed: malformed required capability -> deny.
+    let Some(required) = Capability::new(&required_capability) else {
+        return false;
+    };
 
-    if granted.contains(&required) {
-        return true;
-    }
-    if matches!(&required, Capability::ToolInvoke(_))
-        && granted.contains(&Capability::ToolInvokeAll)
-    {
-        return true;
-    }
-    false
+    // Single authority: `CapabilityCeiling::contains` handles exact matches plus
+    // the disjoint wildcard families — `OutletCallAll ⊇ OutletCall(id)` and
+    // `OutletQueryAll ⊇ OutletQuery(id)` — never widening across query/call
+    // (§5.4.2). Routing through it keeps this helper fail-closed and in lockstep
+    // with UCAN ceiling validation.
+    CapabilityCeiling::new(granted).contains(&required)
 }
 
 // ---------------------------------------------------------------------------
@@ -5365,8 +5388,8 @@ fn parse_template_id_napi(
         "GroupDiscussion" => Ok(TemplateId::GroupDiscussion),
         "PublicBroadcast" => Ok(TemplateId::PublicBroadcast),
         "GatedBroadcast" => Ok(TemplateId::GatedBroadcast),
-        "scp:template/tool-interface" | "ToolInterfaceTemplate" => {
-            Ok(TemplateId::ToolInterfaceTemplate)
+        "scp:template/outlet-interface" | "OutletInterfaceTemplate" => {
+            Ok(TemplateId::OutletInterfaceTemplate)
         }
         "PaidService" => Ok(TemplateId::PaidService),
         "PaidBroadcast" => Ok(TemplateId::PaidBroadcast),
@@ -5378,7 +5401,7 @@ fn parse_template_id_napi(
             message: format!(
                 "unknown template ID: {template_id:?} — valid values: BilateralEphemeral, \
                  BilateralPersistent, Coordination, GroupDiscussion, PublicBroadcast, \
-                 GatedBroadcast, scp:template/tool-interface, PaidService, PaidBroadcast, \
+                 GatedBroadcast, scp:template/outlet-interface, PaidService, PaidBroadcast, \
                  HandleRegistry, scp:template/handle-registry, DiscoveryContext, \
                  scp:template/discovery-context"
             ),
@@ -5896,7 +5919,7 @@ mod tests {
         let creator = DID("did:key:z6MkCreator".to_owned());
 
         let params = ContextParams {
-            ceiling: vec![Capability::new("role:assign")],
+            ceiling: vec![Capability::new("role:assign").expect("known capability")],
             ..ContextParams::default()
         };
 
@@ -5930,7 +5953,7 @@ mod tests {
         let ctx_id = format!("napi-elog-projection-{}", uuid::Uuid::new_v4());
         let creator = "did:key:z6MkNapiProjection";
         let params = ContextParams {
-            ceiling: vec![Capability::new("role:assign")],
+            ceiling: vec![Capability::new("role:assign").expect("known capability")],
             ..ContextParams::default()
         };
         test_dispatch_create_context(&bi, &ctx_id, params, DID(creator.to_owned())).await;
@@ -5980,7 +6003,7 @@ mod tests {
         let creator = "did:key:z6MkNapiSubjectActor";
         let subject_did = "did:key:z6MkNapiSubjectMember";
         let params = ContextParams {
-            ceiling: vec![Capability::new("role:assign")],
+            ceiling: vec![Capability::new("role:assign").expect("known capability")],
             ..ContextParams::default()
         };
         test_dispatch_create_context(&bi, &ctx_id, params, DID(creator.to_owned())).await;
@@ -6073,7 +6096,7 @@ mod tests {
         );
 
         // Direct set always rejects — must use governance (#728).
-        let json = r#"{"locked":false,"cost_schedule":{"currency":[85,83,68,0],"per_message":null,"per_tool_invoke":"100","per_join":null,"per_period":null,"per_byte_stored":null},"payment_adapters":[],"pricing_formula":null,"payee":"did:dht:z6MkTest"}"#;
+        let json = r#"{"locked":false,"cost_schedule":{"currency":[85,83,68,0],"per_message":null,"per_outlet_call":"100","per_join":null,"per_period":null,"per_byte_stored":null},"payment_adapters":[],"pricing_formula":null,"payee":"did:dht:z6MkTest"}"#;
         let result = context_set_economic_policy_on(&bi, &mut handle, json.to_owned());
         assert!(
             result.is_err(),
@@ -6113,7 +6136,7 @@ mod tests {
         let ctx_id = format!("napi-exec-forgery-{}", uuid::Uuid::new_v4());
         let creator = "did:key:z6MkNapiForgery1";
         let params = ContextParams {
-            ceiling: vec![Capability::new("role:assign")],
+            ceiling: vec![Capability::new("role:assign").expect("known capability")],
             ..ContextParams::default()
         };
         test_dispatch_create_context(&bi, &ctx_id, params, DID(creator.to_owned())).await;
@@ -6144,7 +6167,7 @@ mod tests {
         let creator = "did:key:z6MkNapiForgery2";
         let victim = "did:key:z6MkNapiVictimNeverAdded";
         let params = ContextParams {
-            ceiling: vec![Capability::new("role:assign")],
+            ceiling: vec![Capability::new("role:assign").expect("known capability")],
             ..ContextParams::default()
         };
         test_dispatch_create_context(&bi, &ctx_id, params, DID(creator.to_owned())).await;
@@ -6986,7 +7009,7 @@ mod tests {
         // `context:close` is required so the creator can close the context
         // before reimport (import needs a terminal state).
         let params = ContextParams {
-            ceiling: vec![Capability::new("context:close")],
+            ceiling: vec![Capability::new("context:close").expect("known capability")],
             ..ContextParams::default()
         };
         let handle = test_dispatch_create_context(&bi, &ctx_id, params, creator.clone()).await;
@@ -7067,7 +7090,7 @@ mod tests {
         let creator = DID("did:dht:z6MkNoCustodyExporter".to_owned());
         let ctx_id = format!("no-custody-export-{}", uuid::Uuid::new_v4());
         let params = ContextParams {
-            ceiling: vec![Capability::new("context:close")],
+            ceiling: vec![Capability::new("context:close").expect("known capability")],
             ..ContextParams::default()
         };
         let core_handle = test_dispatch_create_context(&bi, &ctx_id, params, creator.clone()).await;

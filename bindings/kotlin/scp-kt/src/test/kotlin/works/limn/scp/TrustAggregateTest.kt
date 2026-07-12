@@ -145,7 +145,7 @@ class TrustAggregateTest {
     fun `all eight attestation types carry the bare PascalCase wire name`() {
         assertEquals(
             setOf(
-                "IdentityLink", "CapabilityDelegation", "ToolIntegrity", "AgentCapability",
+                "IdentityLink", "CapabilityDelegation", "OutletIntegrity", "AgentCapability",
                 "Endorsement", "RoleAssignment", "ContextEndorsement", "ParticipationWitness",
             ),
             AttestationType.entries.map { it.wireName }.toSet(),

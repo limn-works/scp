@@ -5,7 +5,7 @@ Lessons from implementing SCP-221 (wire Swift SDK wrappers to UniFFI bridge).
 ## Context.handle must be internal, not private
 
 The `Context` actor's `handle` property was originally `private`. Extensions
-in other files (Tools.swift, etc.) need to cast `handle` to `ContextHandle`
+in other files (Outlets.swift, etc.) need to cast `handle` to `ContextHandle`
 for UniFFI bridge calls. Swift's `private` means file-scoped, so extensions
 in different files cannot access it. Changed to `internal`.
 
@@ -19,22 +19,22 @@ and enables async roundtrip testing without the XCFramework binary.
 
 Pattern:
 ```swift
-internal enum ToolBridge {
+internal enum OutletBridge {
     internal typealias InvokeFn = @Sendable (
-        _ handle: ContextHandle, _ toolId: String, ...
+        _ handle: ContextHandle, _ outletId: String, ...
     ) async throws -> String
 
-    internal static let defaultInvoke: InvokeFn = { handle, toolId, ... in
-        try await toolInvoke(handle: handle, toolId: toolId, ...)
+    internal static let defaultInvoke: InvokeFn = { handle, outletId, ... in
+        try await outletInvoke(handle: handle, outletId: outletId, ...)
     }
 }
 
 // Public API accepts optional bridge fn
-public func invokeTool(
-    _ tool: String,
+public func invokeOutlet(
+    _ outlet: String,
     input: Data,
-    invokeFn: ToolBridge.InvokeFn = ToolBridge.defaultInvoke
-) async throws -> ToolInvocationResult { ... }
+    invokeFn: OutletBridge.InvokeFn = OutletBridge.defaultInvoke
+) async throws -> OutletInvocationResult { ... }
 ```
 
 ## ContextHandle casting for bridge calls
@@ -65,7 +65,7 @@ Direct `try await bridgeFn(...)` is correct.
 
 ## Error code namespacing
 
-Tool extension error codes use `SCP-CTX-2001` (not `SCP-CTX-001`) to avoid
+Outlet extension error codes use `SCP-CTX-2001` (not `SCP-CTX-001`) to avoid
 collision with the existing codes in Context.swift. EventLog uses
 `SCP-CTX-2030`/`SCP-CTX-2031`. Transport uses `SCP-TRANS-5001`. MCP stubs
 use `SCP-MCP-10001` through `SCP-MCP-10004`.
@@ -107,7 +107,7 @@ behaviour in a real build. Two patterns to avoid:
 
 1. Production bridge defaults that create `noPointer:` instances as
    placeholder arguments (e.g., `let identity = Identity(noPointer: .init())`
-   inside `invokeTool`).
+   inside `invokeOutlet`).
 2. Legacy API wrappers that create `ContextHandle(noPointer: .init())` as
    a stand-in context handle (e.g., the `validate`/`mint`/`revoke` free
    functions in `Ucan.swift`).

@@ -1,6 +1,6 @@
 import Foundation
 
-// Message, ToolDefinition, and other core types are now defined by UniFFI in
+// Message, OutletDefinition, and other core types are now defined by UniFFI in
 // ScpBindings.swift. This file provides additional Swift-idiomatic convenience
 // types that do NOT conflict with UniFFI-generated types.
 
@@ -91,13 +91,66 @@ public nonisolated struct Capability: Sendable {
         self.name = name
         self.ceiling = ceiling
     }
+
+    // MARK: - Canonical capability strings
+
+    /// Canonical protocol capability strings.
+    ///
+    /// These are the SDK-facing colon-separated forms accepted by
+    /// `Capability::new` in Rust (e.g. `"messages:write"`, `"outlet:call:*"`) —
+    /// the shape used in context ceilings, role capability lists, and UCAN
+    /// capability arrays. Parameterised capabilities are built by
+    /// ``outletQuery(_:)`` and ``outletCall(_:)``.
+    ///
+    /// The pre-rename outlet-prefixed stems (invoke / register / interface) are
+    /// deleted with no transitional alias; the protocol hard-rejects them at
+    /// construction time (ADR-049 §1).
+    public enum Name {
+        public static let messagesRead = "messages:read"
+        public static let messagesWrite = "messages:write"
+        /// Query outlet capability — read-only; never billed.
+        public static let outletQueryAll = "outlet:query:*"
+        /// Action outlet capability — the outlet may mutate state and may incur cost (billable).
+        public static let outletCallAll = "outlet:call:*"
+        public static let outletRegister = "outlet:register"
+        public static let memberInvite = "member:invite"
+        public static let memberRemove = "member:remove"
+        public static let roleAssign = "role:assign"
+        public static let governancePropose = "governance:propose"
+        public static let governanceVote = "governance:vote"
+        public static let contextClose = "context:close"
+        public static let childContextCreate = "context:child:create"
+        public static let outletInterface = "outlet:interface"
+        public static let bridging = "bridging"
+        public static let mediaVoice = "media:voice"
+        public static let mediaVideo = "media:video"
+        public static let mediaScreenShare = "media:screen_share"
+        public static let memberBan = "member:ban"
+        public static let metadataEdit = "metadata:edit"
+    }
+
+    /// Builds the capability string for invoking a specific Query (read-only)
+    /// outlet. Query outlet capability — read-only; never billed.
+    /// Per spec §5.4.2.1 the `outletId` suffix must match
+    /// `^[a-z0-9_-]{1,128}$`.
+    public static func outletQuery(_ outletId: String) -> String {
+        "outlet:query:\(outletId)"
+    }
+
+    /// Builds the capability string for invoking a specific Action (mutating)
+    /// outlet. Action outlet capability — the outlet may mutate state and may
+    /// incur cost (billable). Per spec §5.4.2.1 the `outletId` suffix must
+    /// match `^[a-z0-9_-]{1,128}$`.
+    public static func outletCall(_ outletId: String) -> String {
+        "outlet:call:\(outletId)"
+    }
 }
 
 // MARK: - TestVector
 
-/// An input/output pair used for tool conformance testing.
+/// An input/output pair used for outlet conformance testing.
 ///
-/// Mirrors `scp_core::context::tools::TestVector`. Each vector carries a
+/// Mirrors `scp_core::context::outlets::TestVector`. Each vector carries a
 /// human-readable description of what it validates, plus the input and
 /// expected output as JSON strings.
 ///

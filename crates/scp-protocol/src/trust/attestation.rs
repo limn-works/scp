@@ -124,7 +124,7 @@ pub struct Attestation {
 /// Evidence supporting an attestation claim.
 ///
 /// The structure of evidence depends on the attestation type. For example,
-/// a `ToolIntegrity` attestation might include a hash of the tool binary,
+/// a `OutletIntegrity` attestation might include a hash of the outlet binary,
 /// while an `IdentityLink` attestation might include a signed challenge.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AttestationEvidence {
@@ -1243,14 +1243,14 @@ pub fn canonical_attestation_bytes(attestation: &Attestation) -> Result<Vec<u8>,
 /// Validates that evidence is present and appropriate for the attestation type.
 ///
 /// Some attestation types require evidence:
-/// - `ToolIntegrity` requires evidence (hash of the tool).
+/// - `OutletIntegrity` requires evidence (hash of the outlet).
 /// - `ParticipationWitness` requires evidence (log reference).
 ///
 /// Other types accept optional evidence without strict requirements.
 fn validate_evidence(attestation: &Attestation) -> Result<(), TrustError> {
     let requires_evidence = matches!(
         attestation.attestation_type,
-        AttestationType::ToolIntegrity | AttestationType::ParticipationWitness
+        AttestationType::OutletIntegrity | AttestationType::ParticipationWitness
     );
 
     if requires_evidence && attestation.evidence.is_none() {
@@ -1655,7 +1655,7 @@ mod tests {
     }
 
     #[test]
-    fn verify_attestation_requires_evidence_for_tool_integrity() {
+    fn verify_attestation_requires_evidence_for_outlet_integrity() {
         let (signing_key, pubkey_bytes) = test_keypair();
         let mut resolver = TestResolver::new();
         resolver.add_key("did:key:issuer", pubkey_bytes);
@@ -1663,7 +1663,7 @@ mod tests {
 
         let attestation = make_signed_attestation(
             &signing_key,
-            AttestationType::ToolIntegrity,
+            AttestationType::OutletIntegrity,
             "did:key:issuer",
             "did:key:subject",
             900,
@@ -1681,7 +1681,7 @@ mod tests {
     }
 
     #[test]
-    fn verify_attestation_accepts_tool_integrity_with_evidence() {
+    fn verify_attestation_accepts_outlet_integrity_with_evidence() {
         let (signing_key, pubkey_bytes) = test_keypair();
         let mut resolver = TestResolver::new();
         resolver.add_key("did:key:issuer", pubkey_bytes);
@@ -1694,7 +1694,7 @@ mod tests {
 
         let attestation = make_signed_attestation(
             &signing_key,
-            AttestationType::ToolIntegrity,
+            AttestationType::OutletIntegrity,
             "did:key:issuer",
             "did:key:subject",
             900,
@@ -2099,7 +2099,7 @@ mod tests {
     #[test]
     fn threshold_ignores_wrong_attestation_type() {
         let required_type = AttestationType::Endorsement;
-        let wrong_type = AttestationType::ToolIntegrity;
+        let wrong_type = AttestationType::OutletIntegrity;
 
         let attestors = vec![
             make_attestor(

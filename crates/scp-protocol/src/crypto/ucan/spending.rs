@@ -345,15 +345,15 @@ impl SpendingCapability {
 /// Validates the spending side of the AND-composition required by spec §19.5.
 ///
 /// Per spec §19.5, a paid action requires BOTH (a) an action capability
-/// (e.g., `messages:write`, `tool:invoke:*`, or a context-defined custom
+/// (e.g., `messages:write`, `outlet:call:*`, or a context-defined custom
 /// capability) AND (b) a valid `SpendingCapability`. The check is split
 /// across two layers of the runtime on purpose:
 ///
 /// 1. **Action capability** — verified UPSTREAM at the capability gate via
 ///    `ContextRoleState::member_has_capability`. See the `MessagesWrite`
 ///    check in `scp-runtime/src/context/manager/messaging.rs` (send path),
-///    and the `ToolInvoke` / `ToolInvokeAll` check in
-///    `scp-runtime/src/context/tools/invoke.rs` (tool path). A member whose
+///    and the `OutletCall` / `OutletCallAll` check in
+///    `scp-runtime/src/context/outlets/invoke.rs` (outlet path). A member whose
 ///    role does not grant the required capability is rejected at the gate,
 ///    before this function is ever called.
 ///
@@ -804,6 +804,7 @@ pub fn mint_spending_ucan_payload(
         att,
         prf: vec![],
         fct,
+        nb: None,
     })
 }
 
@@ -1066,11 +1067,16 @@ where
     // revocation, key scope, and aud/iss linkage. The returned root
     // issuer is then bound to the actor — sub-delegation cannot smuggle
     // in a different root.
+    // Spending UCANs carry `scp:spending:{id}` capability URIs, never outlet
+    // stems, so §7.3.8 invocation caveats never apply on this path. Pass the
+    // no-op `NoCaveatResolver` — the per-edge caveat narrow is inert (every
+    // token resolves to `None`, and no attestation is an outlet edge).
     let root_issuer = super::validate::verify_delegation_chain(
         token,
         did_resolver,
         proof_resolver,
         revocation_checker,
+        &super::validate::NoCaveatResolver,
         clock_skew_tolerance_secs,
         clock,
     )?;
@@ -1289,6 +1295,7 @@ mod tests {
                 att: vec![],
                 prf: vec![],
                 fct: None,
+                nb: None,
             },
             signature: vec![0u8; 64],
             encoded: String::new(),
@@ -1310,6 +1317,7 @@ mod tests {
                 att: vec![],
                 prf: vec![],
                 fct: Some(serde_json::json!({"other_key": "value"})),
+                nb: None,
             },
             signature: vec![0u8; 64],
             encoded: String::new(),
@@ -1389,6 +1397,7 @@ mod tests {
                 att: vec![],
                 prf: vec![],
                 fct: Some(serde_json::Value::Object(fct)),
+                nb: None,
             },
             signature: vec![0u8; 64],
             encoded: String::new(),
@@ -1763,6 +1772,7 @@ mod tests {
                     "spending_capability": serde_json::to_value(cap).unwrap(),
                     "scp_key_scope": "#agent"
                 })),
+                nb: None,
             },
             signature: vec![0u8; 64],
             encoded: String::new(),
@@ -1811,6 +1821,7 @@ mod tests {
                 }],
                 prf: vec![],
                 fct: None,
+                nb: None,
             },
             signature: vec![0u8; 64],
             encoded: String::new(),

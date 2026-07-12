@@ -364,114 +364,114 @@
       ]
     },
     {
-      "canonical": "tool_register",
-      "category": "tools",
+      "canonical": "outlet_register",
+      "category": "outlets",
       "pyo3": [
-        "py_tool_register",
-        "tool_register"
+        "py_outlet_register",
+        "outlet_register"
       ],
       "uniffi": [
-        "tool_register"
+        "outlet_register"
       ],
       "napi": [
-        "tool_register"
+        "outlet_register"
       ]
     },
     {
-      "canonical": "tool_invoke",
-      "category": "tools",
+      "canonical": "outlet_invoke",
+      "category": "outlets",
       "pyo3": [
-        "py_tool_invoke",
-        "tool_invoke"
+        "py_outlet_invoke",
+        "outlet_invoke"
       ],
       "uniffi": [
-        "tool_invoke"
+        "outlet_invoke"
       ],
       "napi": [
-        "tool_invoke"
+        "outlet_invoke"
       ]
     },
     {
-      "canonical": "tool_verify",
-      "category": "tools",
+      "canonical": "outlet_verify",
+      "category": "outlets",
       "pyo3": [
-        "py_tool_verify",
-        "tool_verify"
+        "py_outlet_verify",
+        "outlet_verify"
       ],
       "uniffi": [
-        "tool_verify"
+        "outlet_verify"
       ],
       "napi": [
-        "tool_verify"
+        "outlet_verify"
       ]
     },
     {
-      "canonical": "tool_invoke_cross_context",
-      "category": "tools",
+      "canonical": "outlet_invoke_cross_context",
+      "category": "outlets",
       "pyo3": [
-        "py_tool_invoke_cross_context",
-        "tool_invoke_cross_context"
+        "py_outlet_invoke_cross_context",
+        "outlet_invoke_cross_context"
       ],
       "uniffi": [
-        "tool_invoke_cross_context"
+        "outlet_invoke_cross_context"
       ],
       "napi": [
-        "tool_invoke_cross_context"
+        "outlet_invoke_cross_context"
       ]
     },
     {
-      "canonical": "tool_invoke_cross_context_saga",
-      "category": "tools",
+      "canonical": "outlet_invoke_cross_context_saga",
+      "category": "outlets",
       "pyo3": [
-        "tool_invoke_cross_context_saga"
+        "outlet_invoke_cross_context_saga"
       ],
       "uniffi": [
-        "tool_invoke_cross_context_saga"
+        "outlet_invoke_cross_context_saga"
       ],
       "napi": [
-        "tool_invoke_cross_context_saga"
+        "outlet_invoke_cross_context_saga"
       ]
     },
     {
-      "canonical": "tool_session_create",
-      "category": "tools",
+      "canonical": "outlet_session_create",
+      "category": "outlets",
       "pyo3": [
-        "py_tool_session_create",
-        "tool_session_create"
+        "py_outlet_session_create",
+        "outlet_session_create"
       ],
       "uniffi": [
-        "tool_session_create"
+        "outlet_session_create"
       ],
       "napi": [
-        "tool_session_create"
+        "outlet_session_create"
       ]
     },
     {
-      "canonical": "tool_session_invoke",
-      "category": "tools",
+      "canonical": "outlet_session_invoke",
+      "category": "outlets",
       "pyo3": [
-        "py_tool_session_invoke",
-        "tool_session_invoke"
+        "py_outlet_session_invoke",
+        "outlet_session_invoke"
       ],
       "uniffi": [
-        "tool_session_invoke"
+        "outlet_session_invoke"
       ],
       "napi": [
-        "tool_session_invoke"
+        "outlet_session_invoke"
       ]
     },
     {
-      "canonical": "tool_session_close",
-      "category": "tools",
+      "canonical": "outlet_session_close",
+      "category": "outlets",
       "pyo3": [
-        "py_tool_session_close",
-        "tool_session_close"
+        "py_outlet_session_close",
+        "outlet_session_close"
       ],
       "uniffi": [
-        "tool_session_close"
+        "outlet_session_close"
       ],
       "napi": [
-        "tool_session_close"
+        "outlet_session_close"
       ]
     },
     {
@@ -2456,42 +2456,42 @@
       ]
     },
     {
-      "canonical": "tool_interface_expose",
-      "category": "tools",
+      "canonical": "outlet_interface_expose",
+      "category": "outlets",
       "pyo3": [
-        "tool_interface_expose"
+        "outlet_interface_expose"
       ],
       "uniffi": [
-        "tool_interface_expose"
+        "outlet_interface_expose"
       ],
       "napi": [
-        "tool_interface_expose"
+        "outlet_interface_expose"
       ]
     },
     {
-      "canonical": "tool_interface_accept",
-      "category": "tools",
+      "canonical": "outlet_interface_accept",
+      "category": "outlets",
       "pyo3": [
-        "tool_interface_accept"
+        "outlet_interface_accept"
       ],
       "uniffi": [
-        "tool_interface_accept"
+        "outlet_interface_accept"
       ],
       "napi": [
-        "tool_interface_accept"
+        "outlet_interface_accept"
       ]
     },
     {
-      "canonical": "tool_interface_revoke",
-      "category": "tools",
+      "canonical": "outlet_interface_revoke",
+      "category": "outlets",
       "pyo3": [
-        "tool_interface_revoke"
+        "outlet_interface_revoke"
       ],
       "uniffi": [
-        "tool_interface_revoke"
+        "outlet_interface_revoke"
       ],
       "napi": [
-        "tool_interface_revoke"
+        "outlet_interface_revoke"
       ]
     },
     {

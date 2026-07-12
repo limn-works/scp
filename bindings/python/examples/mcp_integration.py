@@ -1,4 +1,4 @@
-"""MCP integration: expose SCP context tools via MCP server, connect as client.
+"""MCP integration: expose SCP context outlets via MCP server, connect as client.
 
 Phase 4 PR 5 (#1549) moved MCP operations onto :class:`scp_sdk.SCP`.
 Use :meth:`SCP.mcp_serve`, :meth:`SCP.mcp_client_connect_sse`,
@@ -16,29 +16,29 @@ async def main() -> None:
     with SCP(storage={"type": "in_memory"}) as scp:
         identity = await scp.identity_create(CustodyType.IN_MEMORY)
 
-        # Create a context with tool capabilities.
+        # Create a context with outlet capabilities.
         ctx = await scp.context_create(
             identity.did,
             {
                 "ceiling": [
                     Capability.MESSAGES_READ.value,
                     Capability.MESSAGES_WRITE.value,
-                    Capability.TOOL_INVOKE_ALL.value,
-                    Capability.TOOL_REGISTER.value,
+                    Capability.OUTLET_CALL_ALL.value,
+                    Capability.OUTLET_REGISTER.value,
                 ],
                 "memory_scope": MemoryScope.EPHEMERAL.value,
                 "governance": "single_admin",
             },
         )
 
-        # Start an MCP server exposing context tools on stdio.
+        # Start an MCP server exposing context outlets on stdio.
         server = await scp.mcp_serve(identity.did, [ctx.context_id], "stdio")
         print("MCP server running")
 
         # Or connect as an MCP client to an external server via SSE.
         client = await scp.mcp_client_connect_sse("http://localhost:8080/mcp")
-        tools = await scp.mcp_client_list_tools(client)
-        print(f"Remote server offers {len(tools)} tool(s)")
+        outlets = await scp.mcp_client_list_tools(client)
+        print(f"Remote server offers {len(outlets)} outlet(s)")
 
         result = await scp.mcp_client_invoke(
             client,

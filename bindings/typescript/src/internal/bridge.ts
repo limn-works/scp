@@ -27,10 +27,10 @@ import type {
   EventFilter,
   MemberRole,
   Message,
+  OutletDefinition,
+  OutletVerificationResult,
   Proof,
   SagaResult,
-  ToolDefinition,
-  ToolVerificationResult,
   TransportStatus,
   UcanToken,
 } from "../types";
@@ -277,34 +277,34 @@ export interface Bridge {
   // Drain events
   contextDrainEvents(handle: BridgeContextHandle): Promise<readonly string[]>;
 
-  // Tools
-  toolRegister(handle: BridgeContextHandle, definition: ToolDefinition): Promise<string>;
-  toolInvoke(
+  // Outlets
+  outletRegister(handle: BridgeContextHandle, definition: OutletDefinition): Promise<string>;
+  outletInvoke(
     handle: BridgeContextHandle,
-    toolId: string,
+    outletId: string,
     inputJson: string,
     identityDid: string,
     ucanToken: string,
     proofTokens?: readonly string[],
     spendingUcan?: string,
   ): Promise<string>;
-  toolVerify(handle: BridgeContextHandle, toolId: string): Promise<ToolVerificationResult>;
+  outletVerify(handle: BridgeContextHandle, outletId: string): Promise<OutletVerificationResult>;
 
   // Bidirectional consent protocol (§6.2.0.1)
-  toolInterfaceExpose(
+  outletInterfaceExpose(
     handle: BridgeContextHandle,
-    toolId: string,
+    outletId: string,
     targetContextId: string,
     rateLimitJson?: string,
   ): Promise<string>;
-  toolInterfaceAccept(handle: BridgeContextHandle, interfaceJson: string): Promise<string>;
-  toolInterfaceRevoke(handle: BridgeContextHandle, interfaceIdHex: string): Promise<string>;
+  outletInterfaceAccept(handle: BridgeContextHandle, interfaceJson: string): Promise<string>;
+  outletInterfaceRevoke(handle: BridgeContextHandle, interfaceIdHex: string): Promise<string>;
 
-  // Cross-context tool invocation (spec section 6.2)
-  toolInvokeCrossContext(
+  // Cross-context outlet invocation (spec section 6.2)
+  outletInvokeCrossContext(
     sourceHandle: BridgeContextHandle,
     targetHandle: BridgeContextHandle,
-    toolId: string,
+    outletId: string,
     inputJson: string,
     invokerDid: string,
     ucanToken: string,
@@ -312,12 +312,12 @@ export interface Bridge {
     proofTokens?: readonly string[],
   ): Promise<string>;
 
-  // The §6.2.4 atomic cross-context tool-invocation saga (ADR-049 §3a)
-  toolInvokeCrossContextSaga(
+  // The §6.2.4 atomic cross-context outlet-invocation saga (ADR-049 §3a)
+  outletInvokeCrossContextSaga(
     sourceHandle: BridgeContextHandle,
     targetHandle: BridgeContextHandle,
     callerDid: string,
-    toolRegistrationId: string,
+    outletRegistrationId: string,
     inputJson: string,
     assertedNonceHex: string,
     timestampMs: bigint,
@@ -325,14 +325,14 @@ export interface Bridge {
     ucanProofId?: string,
   ): Promise<SagaResult>;
 
-  // Stateful tool sessions (spec section 6.2.1)
-  toolSessionCreate(
+  // Stateful outlet sessions (spec section 6.2.1)
+  outletSessionCreate(
     handle: BridgeContextHandle,
-    toolId: string,
+    outletId: string,
     sourceContextId: string,
     ttlSeconds?: number,
   ): Promise<string>;
-  toolSessionInvoke(
+  outletSessionInvoke(
     handle: BridgeContextHandle,
     sessionId: string,
     inputJson: string,
@@ -340,7 +340,7 @@ export interface Bridge {
     ucanToken: string,
     proofTokens?: readonly string[],
   ): Promise<string>;
-  toolSessionClose(handle: BridgeContextHandle, sessionId: string): Promise<void>;
+  outletSessionClose(handle: BridgeContextHandle, sessionId: string): Promise<void>;
 
   // Transport
   transportConnect(relayUrl: string): Promise<BridgeTransportHandle>;

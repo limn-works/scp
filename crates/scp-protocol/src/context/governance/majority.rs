@@ -2364,7 +2364,7 @@ mod tests {
                 cost_schedule: crate::economy::types::CostSchedule {
                     currency: crate::economy::types::CurrencyCode::from("USD"),
                     per_message: Some(crate::economy::types::Amount::new(10)),
-                    per_tool_invoke: None,
+                    per_outlet_call: None,
                     per_join: None,
                     per_period: None,
                     per_byte_stored: None,
@@ -2390,7 +2390,7 @@ mod tests {
         let action = GovernanceAction::ApproveSpend {
             spender: bob(),
             amount: crate::economy::types::Amount::new(5000),
-            purpose: "tool budget".to_owned(),
+            purpose: "outlet budget".to_owned(),
         };
 
         let (proposal, _) = engine.propose(&alice(), action, &ctx, &sk_alice()).unwrap();

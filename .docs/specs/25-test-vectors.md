@@ -360,7 +360,7 @@ Note: The vectors above use abstract `data` leaves to pin the RFC 6962 tree cons
 
 ### Vector 32: Typed-Leaf KAT (closed `EventType` taxonomy)
 
-Each leaf is `SHA-256(0x00 || rmp_serde(Event))` over a canonical `scp_event_log::Event` whose `event_type` is one of the closed 77-variant `EventType` taxonomy (ADR-011 AC1 + typed-event unification Amendment + the cross-context-saga event model — Amendment §6 added `CrossContextToolInvoked` (tag 76) and spec §6.2.4 added `CrossContextDivergenceMarker` (tag 77)). The events are signed with a fixed Ed25519 key (RFC 8032 deterministic signatures), so the full-event MessagePack bytes — and therefore the leaf hashes — are reproducible across runs and implementations. Structured payloads are encoded with positional `rmp_serde::to_vec` of the per-variant payload struct (`scp_event_log::payload`); the two opaque payloads carry the documented `key=value;…` bytes shown.
+Each leaf is `SHA-256(0x00 || rmp_serde(Event))` over a canonical `scp_event_log::Event` whose `event_type` is one of the closed 77-variant `EventType` taxonomy (ADR-011 AC1 + typed-event unification Amendment + the cross-context-saga event model — Amendment §6 added `CrossContextOutletInvoked` (tag 76) and spec §6.2.4 added `CrossContextDivergenceMarker` (tag 77)). The events are signed with a fixed Ed25519 key (RFC 8032 deterministic signatures), so the full-event MessagePack bytes — and therefore the leaf hashes — are reproducible across runs and implementations. Structured payloads are encoded with positional `rmp_serde::to_vec` of the per-variant payload struct (`scp_event_log::payload`); the two opaque payloads carry the documented `key=value;…` bytes shown.
 
 ```
 Signing key seed (32 bytes): 0x0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20
@@ -372,7 +372,7 @@ Events (append order; each prev_hash = previous leaf hash, genesis = [0u8;32]):
 
   seq 0  AppBound                 ts 1700000000
          payload = rmp(AppBoundPayload{ app_did:"did:key:app", app_name:"Scheduler",
-                       app_version:"1.0.0", capabilities:["tool:invoke:*"] })
+                       app_version:"1.0.0", capabilities:["outlet:call:*"] })
          leaf = 0xe0c0691d264ca38d086375a0274afb630e9bbb906f2e12e0112adf4d1b4fcd38
 
   seq 1  SpendApproved            ts 1700000001
@@ -657,32 +657,32 @@ Result: did:pseudo:a1545542cd8834cc0599f07e5c730dee3005c01097dde63abf906110f1a8e
 
 The pseudonym is deterministic: the same (key, context, DID) triple always produces the same pseudonym. Different keys or contexts produce unrelated pseudonyms for the same DID.
 
-## 25.15 Tool Interface Offer ID Vectors (§6.2.0.1)
+## 25.15 Outlet Interface Offer ID Vectors (§6.2.0.1)
 
 Domain: `"SCP-OFFER-ID-V1:"`
 
-### Vector 28: Tool Interface Offer ID
+### Vector 28: Outlet Interface Offer ID
 
-`compute_offer_id` derives a deterministic 32-byte offer ID from the source context, tool ID, target context, and timestamp.
+`compute_offer_id` derives a deterministic 32-byte offer ID from the source context, outlet ID, target context, and timestamp.
 
 ```
 Input:
   source_context:  "source-ctx-01"
-  tool_id:         "tool-abc123"
+  outlet_id:         "outlet-abc123"
   target_context:  "target-ctx-02"
   timestamp:       1700000000
 
 Canonical hash input:
   "SCP-OFFER-ID-V1:"                            (16 bytes, no length prefix)
   || BE32(13) || "source-ctx-01"                 (4 + 13 = 17 bytes)
-  || BE32(11) || "tool-abc123"                   (4 + 11 = 15 bytes)
+  || BE32(13) || "outlet-abc123"                 (4 + 13 = 17 bytes)
   || BE32(13) || "target-ctx-02"                 (4 + 13 = 17 bytes)
   || BE64(1700000000)                            (8 bytes)
 
-Total: 16 + 17 + 15 + 17 + 8 = 73 bytes
+Total: 16 + 17 + 17 + 17 + 8 = 75 bytes
 
 Expected SHA-256:
-  0xb9f0cd497bede455c99c995c16eb2a0a2bc013a94cdd744dfd5ddbcd73791d53
+  0xea9ce09b497405e8c160c8d0d57067c726092866f6d1ec541e8e6081a5328733
 ```
 
 ## 25.16 Attestation ID Vectors (§3.5.2)

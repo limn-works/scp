@@ -55,9 +55,9 @@ use ed25519_dalek::Signer;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::params::{Capability, ContextParams, ToolRegistration};
-use super::roles::ToolId;
-use super::tools::interface::ToolInterface;
+use super::outlets::OutletId;
+use super::outlets::interface::OutletInterface;
+use super::params::{Capability, ContextParams, OutletRegistration};
 use crate::economy::antispam::HardRateLimitConfig;
 use crate::economy::types::{Amount, EconomicPolicy};
 use scp_did::{DID, SigningKeyId};
@@ -114,7 +114,7 @@ pub type ProposalId = [u8; 32];
 /// serialized form must be deterministic across all SDK implementations
 /// (Rust, Python, TypeScript, Kotlin, Swift). `MessagePack` has no canonical
 /// form standard. This is consistent with all other cross-implementation
-/// canonical hashing in the protocol: handle tool signing (§22), app
+/// canonical hashing in the protocol: handle outlet signing (§22), app
 /// declarations (§8), DID documents (§18), and
 /// `ParentGovernanceConfig::content_hash()` in nesting.rs. See §9.5.2.
 #[must_use]
@@ -359,7 +359,7 @@ pub struct SizeBasedPolicy {
 /// Event-type retention multipliers (ADR-030 §2c).
 ///
 /// Structural events (governance, membership) are retained longer than
-/// operational events (messages, tool invocations).
+/// operational events (messages, outlet invocations).
 ///
 /// Multipliers are expressed in basis points where 10000 = 1.0x multiplier.
 /// E.g. 30000 = 3.0x.
@@ -537,7 +537,7 @@ pub struct DeadlockJustification {
 /// these variants.
 ///
 /// The governance engine evaluates proposals containing these actions. This
-/// covers: membership, roles, settings, ceiling, content access, tool
+/// covers: membership, roles, settings, ceiling, content access, outlet
 /// interfaces, pruning, conflict resolution, and deadlock recovery.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum GovernanceAction {
@@ -565,15 +565,15 @@ pub enum GovernanceAction {
         /// The new role to assign.
         new_role: String,
     },
-    /// Register a new tool in the context.
-    RegisterTool {
-        /// The full tool registration descriptor.
-        registration: Box<ToolRegistration>,
+    /// Register a new outlet in the context.
+    RegisterOutlet {
+        /// The full outlet registration descriptor.
+        registration: Box<OutletRegistration>,
     },
-    /// Remove a tool from the context.
-    RemoveTool {
-        /// The identifier of the tool to remove.
-        tool_id: ToolId,
+    /// Remove a outlet from the context.
+    RemoveOutlet {
+        /// The identifier of the outlet to remove.
+        outlet_id: OutletId,
     },
     /// Modify the capability ceiling (only if `ceiling_policy` is `Governed`).
     ModifyCeiling {
@@ -658,10 +658,10 @@ pub enum GovernanceAction {
         /// The new threshold value.
         new_threshold: u32,
     },
-    /// Establish a tool interface with another context (§6.2).
-    EstablishToolInterface {
-        /// The tool interface to establish.
-        interface: ToolInterface,
+    /// Establish a outlet interface with another context (§6.2).
+    EstablishOutletInterface {
+        /// The outlet interface to establish.
+        interface: OutletInterface,
     },
     /// Governance-triggered member reset (ADR-029, Tier 3).
     ///
@@ -763,7 +763,7 @@ pub enum GovernanceAction {
     ///
     /// The hard rate limit is a token bucket layered on top of the
     /// per-DID economic escalation, enforced on messaging, join, and
-    /// tool invocation paths. Allows governance to tighten or loosen
+    /// outlet invocation paths. Allows governance to tighten or loosen
     /// the cap in response to observed abuse patterns without having
     /// to close and recreate the context.
     ///
@@ -791,8 +791,8 @@ impl GovernanceAction {
             Self::AddMember { .. } => "AddMember",
             Self::RemoveMember { .. } => "RemoveMember",
             Self::ChangeRole { .. } => "ChangeRole",
-            Self::RegisterTool { .. } => "RegisterTool",
-            Self::RemoveTool { .. } => "RemoveTool",
+            Self::RegisterOutlet { .. } => "RegisterOutlet",
+            Self::RemoveOutlet { .. } => "RemoveOutlet",
             Self::ModifyCeiling { .. } => "ModifyCeiling",
             Self::CloseContext { .. } => "CloseContext",
             Self::ExtendTtl { .. } => "ExtendTtl",
@@ -806,7 +806,7 @@ impl GovernanceAction {
             Self::AddSigner { .. } => "AddSigner",
             Self::RemoveSigner { .. } => "RemoveSigner",
             Self::ModifyThreshold { .. } => "ModifyThreshold",
-            Self::EstablishToolInterface { .. } => "EstablishToolInterface",
+            Self::EstablishOutletInterface { .. } => "EstablishOutletInterface",
             Self::ResetMember { .. } => "ResetMember",
             Self::ResolveConflict { .. } => "ResolveConflict",
             Self::PromoteContext => "PromoteContext",
@@ -853,8 +853,8 @@ impl GovernanceAction {
             // role-delta-dependent → conservatively excluded).
             Self::AddMember { .. }
             | Self::ChangeRole { .. }
-            | Self::RegisterTool { .. }
-            | Self::RemoveTool { .. }
+            | Self::RegisterOutlet { .. }
+            | Self::RemoveOutlet { .. }
             | Self::ModifyCeiling { .. }
             | Self::CloseContext { .. }
             | Self::ExtendTtl { .. }
@@ -865,7 +865,7 @@ impl GovernanceAction {
             | Self::AddSigner { .. }
             | Self::RemoveSigner { .. }
             | Self::ModifyThreshold { .. }
-            | Self::EstablishToolInterface { .. }
+            | Self::EstablishOutletInterface { .. }
             | Self::ResolveConflict { .. }
             | Self::PromoteContext
             | Self::RotateContentKeys { .. }
@@ -948,15 +948,15 @@ impl GovernanceAction {
             | Self::RemoveSigner { did } => Some(did),
             Self::TransferAdmin { new_admin } => Some(new_admin),
             Self::ApproveSpend { spender, .. } => Some(spender),
-            Self::RegisterTool { .. }
-            | Self::RemoveTool { .. }
+            Self::RegisterOutlet { .. }
+            | Self::RemoveOutlet { .. }
             | Self::ModifyCeiling { .. }
             | Self::CloseContext { .. }
             | Self::ExtendTtl { .. }
             | Self::CreateChildContext { .. }
             | Self::ModifyPruningPolicy { .. }
             | Self::ModifyThreshold { .. }
-            | Self::EstablishToolInterface { .. }
+            | Self::EstablishOutletInterface { .. }
             | Self::ResolveConflict { .. }
             | Self::PromoteContext
             | Self::RotateContentKeys { .. }
@@ -2235,7 +2235,7 @@ mod tests {
         actions
     }
 
-    /// Core governance actions (membership, tools, settings, access control).
+    /// Core governance actions (membership, outlets, settings, access control).
     fn governance_actions_core() -> Vec<GovernanceAction> {
         vec![
             GovernanceAction::AddMember {
@@ -2250,25 +2250,28 @@ mod tests {
                 did: bob(),
                 new_role: "observer".to_owned(),
             },
-            GovernanceAction::RegisterTool {
-                registration: Box::new(ToolRegistration {
-                    tool_id: "search".to_owned(),
+            GovernanceAction::RegisterOutlet {
+                registration: Box::new(OutletRegistration {
+                    outlet_id: "search".to_owned(),
+                    kind: crate::context::outlets::OutletKind::Action,
                     name: "search".to_owned(),
-                    description: "Search tool".to_owned(),
-                    schema: crate::context::tools::ToolSchema {
+                    description: "Search outlet".to_owned(),
+                    schema: crate::context::outlets::OutletSchema {
                         input_schema: serde_json::json!({"type": "object"}),
                         output_schema: serde_json::json!({"type": "object"}),
+                        aggregate_schema: None,
                     },
                     implementation_hash: [0u8; 32],
                     test_vectors: vec![],
+                    message_catalog: Vec::new(),
                     operator_did: "did:dht:z6MkTestOperator".into(),
                     cost: None,
                     registered_at: 0,
                     signature: Vec::new(),
                 }),
             },
-            GovernanceAction::RemoveTool {
-                tool_id: "search".to_owned(),
+            GovernanceAction::RemoveOutlet {
+                outlet_id: "search".to_owned(),
             },
             GovernanceAction::ModifyCeiling {
                 new_ceiling: vec![Capability::MessagesRead],
@@ -2304,17 +2307,17 @@ mod tests {
     /// Extended governance actions (signers, interfaces, structural,
     /// content access, economic).
     fn governance_actions_extended() -> Vec<GovernanceAction> {
-        use crate::context::tools::interface::ToolInterface;
+        use crate::context::outlets::interface::OutletInterface;
 
         vec![
             GovernanceAction::AddSigner { did: carol() },
             GovernanceAction::RemoveSigner { did: carol() },
             GovernanceAction::ModifyThreshold { new_threshold: 2 },
-            GovernanceAction::EstablishToolInterface {
-                interface: ToolInterface {
+            GovernanceAction::EstablishOutletInterface {
+                interface: OutletInterface {
                     source_context: "ctx-src".to_owned(),
                     target_context: "ctx-tgt".to_owned(),
-                    tool_id: "tool-1".to_owned(),
+                    outlet_id: "outlet-1".to_owned(),
                     rate_limit: None,
                     inbound_rate_limit: None,
                     per_caller_rate_limit: None,
@@ -2356,7 +2359,7 @@ mod tests {
                     cost_schedule: crate::economy::types::CostSchedule {
                         currency: crate::economy::types::CurrencyCode::from("USD"),
                         per_message: Some(Amount::new(1)),
-                        per_tool_invoke: None,
+                        per_outlet_call: None,
                         per_join: None,
                         per_period: None,
                         per_byte_stored: None,
@@ -2369,7 +2372,7 @@ mod tests {
             GovernanceAction::ApproveSpend {
                 spender: bob(),
                 amount: Amount::new(1000),
-                purpose: "tool costs".to_owned(),
+                purpose: "outlet costs".to_owned(),
             },
             GovernanceAction::LockEconomicPolicy,
             GovernanceAction::ProposeContextMigration {
@@ -2815,25 +2818,28 @@ mod tests {
                 did: bob(),
                 new_role: "observer".to_owned(),
             },
-            GovernanceAction::RegisterTool {
-                registration: Box::new(ToolRegistration {
-                    tool_id: "calc".to_owned(),
+            GovernanceAction::RegisterOutlet {
+                registration: Box::new(OutletRegistration {
+                    outlet_id: "calc".to_owned(),
+                    kind: crate::context::outlets::OutletKind::Action,
                     name: "calc".to_owned(),
-                    description: "Calculator tool".to_owned(),
-                    schema: crate::context::tools::ToolSchema {
+                    description: "Calculator outlet".to_owned(),
+                    schema: crate::context::outlets::OutletSchema {
                         input_schema: serde_json::json!({"type": "object"}),
                         output_schema: serde_json::json!({"type": "object"}),
+                        aggregate_schema: None,
                     },
                     implementation_hash: [0u8; 32],
                     test_vectors: vec![],
+                    message_catalog: Vec::new(),
                     operator_did: "did:dht:z6MkTestOperator".into(),
                     cost: None,
                     registered_at: 0,
                     signature: Vec::new(),
                 }),
             },
-            GovernanceAction::RemoveTool {
-                tool_id: "calc".to_owned(),
+            GovernanceAction::RemoveOutlet {
+                outlet_id: "calc".to_owned(),
             },
             GovernanceAction::ModifyCeiling {
                 new_ceiling: vec![Capability::MessagesRead, Capability::MessagesWrite],
@@ -2854,7 +2860,7 @@ mod tests {
                     cost_schedule: crate::economy::types::CostSchedule {
                         currency: crate::economy::types::CurrencyCode::from("USD"),
                         per_message: Some(crate::economy::types::Amount::new(1)),
-                        per_tool_invoke: None,
+                        per_outlet_call: None,
                         per_join: None,
                         per_period: None,
                         per_byte_stored: None,
@@ -2867,7 +2873,7 @@ mod tests {
             GovernanceAction::ApproveSpend {
                 spender: bob(),
                 amount: Amount::new(1000),
-                purpose: "tool costs".to_owned(),
+                purpose: "outlet costs".to_owned(),
             },
             GovernanceAction::LockEconomicPolicy,
         ];
@@ -3456,7 +3462,7 @@ mod tests {
             cost_schedule: crate::economy::types::CostSchedule {
                 currency: crate::economy::types::CurrencyCode::from("USD"),
                 per_message: Some(Amount::new(10)),
-                per_tool_invoke: Some(Amount::new(50)),
+                per_outlet_call: Some(Amount::new(50)),
                 per_join: None,
                 per_period: None,
                 per_byte_stored: None,
@@ -3493,7 +3499,7 @@ mod tests {
         let action = GovernanceAction::ApproveSpend {
             spender: bob(),
             amount: Amount::new(5000),
-            purpose: "tool invocation budget".to_owned(),
+            purpose: "outlet invocation budget".to_owned(),
         };
 
         let (proposal, events) = engine.propose(&admin, action, &ctx, &sk).unwrap();

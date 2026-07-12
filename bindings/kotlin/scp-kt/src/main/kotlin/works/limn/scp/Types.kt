@@ -14,6 +14,7 @@ import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonObject
 import works.limn.scp.bridge.BridgeException
+import uniffi.scp.OutletKind
 
 /**
  * Key custody method for identity key management (spec section 3.2).
@@ -23,6 +24,61 @@ import works.limn.scp.bridge.BridgeException
  *
  * @property rawValue Wire-format string passed to the FFI bridge.
  */
+/**
+ * Canonical protocol capability strings and parameterised constructors.
+ *
+ * These are the SDK-facing colon-separated forms accepted by `Capability::new`
+ * in Rust (e.g. `"messages:write"`, `"outlet:call:*"`) — the shape used in
+ * context ceilings, role capability lists, and UCAN capability arrays.
+ * Parameterised capabilities are plain strings built by [outletQuery] and
+ * [outletCall].
+ *
+ * The pre-rename outlet-prefixed stems (invoke / register / interface) are
+ * deleted with no transitional alias; the protocol hard-rejects them at
+ * construction time (ADR-049 §1).
+ */
+object Capability {
+    const val MESSAGES_READ = "messages:read"
+    const val MESSAGES_WRITE = "messages:write"
+
+    /** Query outlet capability — read-only; never billed. */
+    const val OUTLET_QUERY_ALL = "outlet:query:*"
+
+    /** Action outlet capability — the outlet may mutate state and may incur cost (billable). */
+    const val OUTLET_CALL_ALL = "outlet:call:*"
+    const val OUTLET_REGISTER = "outlet:register"
+    const val MEMBER_INVITE = "member:invite"
+    const val MEMBER_REMOVE = "member:remove"
+    const val ROLE_ASSIGN = "role:assign"
+    const val GOVERNANCE_PROPOSE = "governance:propose"
+    const val GOVERNANCE_VOTE = "governance:vote"
+    const val CONTEXT_CLOSE = "context:close"
+    const val CHILD_CONTEXT_CREATE = "context:child:create"
+    const val OUTLET_INTERFACE = "outlet:interface"
+    const val BRIDGING = "bridging"
+    const val MEDIA_VOICE = "media:voice"
+    const val MEDIA_VIDEO = "media:video"
+    const val MEDIA_SCREEN_SHARE = "media:screen_share"
+    const val MEMBER_BAN = "member:ban"
+    const val METADATA_EDIT = "metadata:edit"
+
+    /**
+     * Builds the capability string for invoking a specific Query (read-only)
+     * outlet. Query outlet capability — read-only; never billed.
+     * Per spec §5.4.2.1 the [outletId] suffix must match
+     * `^[a-z0-9_-]{1,128}$`.
+     */
+    fun outletQuery(outletId: String): String = "outlet:query:$outletId"
+
+    /**
+     * Builds the capability string for invoking a specific Action (mutating)
+     * outlet. Action outlet capability — the outlet may mutate state and may
+     * incur cost (billable). Per spec §5.4.2.1 the [outletId] suffix must
+     * match `^[a-z0-9_-]{1,128}$`.
+     */
+    fun outletCall(outletId: String): String = "outlet:call:$outletId"
+}
+
 enum class CustodyType(val rawValue: String) {
     /**
      * Platform-native secure storage (Keychain on macOS/iOS, Keystore
@@ -110,11 +166,11 @@ enum class ShadowStatus(val rawValue: String) {
 }
 
 // ---------------------------------------------------------------------------
-// Tool definitions (spec §5.4.1, ADR-010)
+// Outlet definitions (spec §5.4.1, ADR-010)
 // ---------------------------------------------------------------------------
 
 /**
- * Per-invocation cost metadata for a tool (spec section 5.4.1).
+ * Per-invocation cost metadata for an outlet (spec section 5.4.1).
  *
  * All monetary values are in the smallest currency unit (e.g., cents
  * for USD, satoshis for BTC).
@@ -124,10 +180,10 @@ enum class ShadowStatus(val rawValue: String) {
  *     native-integer money surface); unsigned by construction — a monetary
  *     amount is never negative.
  * @property currency ISO 4217 or protocol-defined currency code.
- * @property payee DID of the payment recipient. May differ from the tool operator.
+ * @property payee DID of the payment recipient. May differ from the outlet operator.
  * @property costFormula Optional pricing formula identifier for dynamic pricing (spec section 19.4).
  */
-data class ToolCost(
+data class OutletCost(
     val amount: ULong,
     val currency: String,
     val payee: String,
@@ -135,31 +191,37 @@ data class ToolCost(
 )
 
 /**
- * Definition of a tool that can be registered in an SCP context.
+ * Definition of an outlet that can be registered in an SCP context.
  *
- * Provides a typed Kotlin data class for constructing tool definitions
+ * Provides a typed Kotlin data class for constructing outlet definitions
  * that are serialized to JSON for the FFI bridge layer.
  *
- * See ADR-010 (Tool Registry) and spec section 5.4.1.
+ * See ADR-010 (Outlet Registry) and spec section 5.4.1.
  *
- * @property name Human-readable tool name.
- * @property description Tool description.
- * @property inputSchemaJson JSON Schema for tool input (as a JSON string).
- * @property outputSchemaJson JSON Schema for tool output (as a JSON string).
- * @property operatorDid DID of the tool operator (responsible party).
+ * @property name Human-readable outlet name.
+ * @property description Outlet description.
+ * @property kind Outlet semantic class (Query vs Action — spec §5.4.2). Selects
+ *   the UCAN capability stem required to invoke the outlet (`outlet_query:{id}`
+ *   for [OutletKind.QUERY], `outlet_call:{id}` for [OutletKind.ACTION]). Required —
+ *   [OutletKind.ACTION] is the fail-safe default an undeclared kind must never
+ *   silently adopt, so callers declare it explicitly.
+ * @property inputSchemaJson JSON Schema for outlet input (as a JSON string).
+ * @property outputSchemaJson JSON Schema for outlet output (as a JSON string).
+ * @property operatorDid DID of the outlet operator (responsible party).
  * @property testVectorsJson Test vectors for integrity verification (serialized as JSON string).
  * @property implementationHashHex SHA-256 hash of the implementation binary as hex string.
  * @property cost Optional per-invocation cost metadata (spec section 5.4.1).
  */
-data class ToolDefinition(
+data class OutletDefinition(
     val name: String,
     val description: String,
+    val kind: OutletKind,
     val inputSchemaJson: String,
     val outputSchemaJson: String,
     val operatorDid: String,
     val testVectorsJson: String? = null,
     val implementationHashHex: String? = null,
-    val cost: ToolCost? = null,
+    val cost: OutletCost? = null,
 ) {
     /**
      * Serializes this definition to a JSON string suitable for the FFI bridge.
@@ -172,6 +234,16 @@ data class ToolDefinition(
             buildJsonObject {
                 put("name", name)
                 put("description", description)
+                // §5.4.2 wire vocabulary: lowercase "query" / "action". The Rust
+                // OutletKind deserializes this exact spelling (serde
+                // rename_all = "lowercase").
+                put(
+                    "kind",
+                    when (kind) {
+                        OutletKind.QUERY -> "query"
+                        OutletKind.ACTION -> "action"
+                    },
+                )
                 put("input_schema_json", Json.parseToJsonElement(inputSchemaJson))
                 put("output_schema_json", Json.parseToJsonElement(outputSchemaJson))
                 put("operator_did", operatorDid)
@@ -247,10 +319,17 @@ class ScopedHandle internal constructor(
      */
     fun hasCapability(capability: String): Boolean {
         if (grantedCapabilities.contains(capability)) return true
-        // ToolInvokeAll covers any specific ToolInvoke
-        if (capability.startsWith("tool:invoke:") &&
-            capability != "tool:invoke:*" &&
-            grantedCapabilities.contains("tool:invoke:*")
+        // OutletCallAll covers any specific OutletCall.
+        if (capability.startsWith("outlet:call:") &&
+            capability != "outlet:call:*" &&
+            grantedCapabilities.contains("outlet:call:*")
+        ) {
+            return true
+        }
+        // OutletQueryAll covers any specific OutletQuery.
+        if (capability.startsWith("outlet:query:") &&
+            capability != "outlet:query:*" &&
+            grantedCapabilities.contains("outlet:query:*")
         ) {
             return true
         }
@@ -500,10 +579,10 @@ data class BatchPublishResult(
 // ---------------------------------------------------------------------------
 
 /**
- * A known input-output pair for tool conformance testing.
+ * A known input-output pair for outlet conformance testing.
  *
- * Mirrors `scp_core::context::tools::TestVector`. Any agent can invoke a
- * tool with test vector inputs and verify the output matches the expected
+ * Mirrors `scp_core::context::outlets::TestVector`. Any agent can invoke a
+ * outlet with test vector inputs and verify the output matches the expected
  * result.
  *
  * Provenance: spec §7.3.3, ADR-010 (phase-2)

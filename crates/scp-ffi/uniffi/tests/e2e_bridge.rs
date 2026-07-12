@@ -5,7 +5,7 @@
 //! the `allow_in_memory_custody` feature for in-memory key custody.
 //!
 //! Covers: identity lifecycle, context lifecycle, governance, broadcast,
-//! tools, UCAN, event log, discovery, sync classification, provenance,
+//! outlets, UCAN, event log, discovery, sync classification, provenance,
 //! bridge trust evaluation, and shutdown ordering.
 //!
 //! Run:
@@ -27,8 +27,9 @@ use scp_ffi_uniffi::{
     ContextParams,
     GovernanceModel,
     MemoryScope,
+    OutletDefinition,
+    OutletKind,
     Scp,
-    ToolDefinition,
     // Free functions — bridge trust
     bridge_evaluate_trust,
     // Free functions — discovery
@@ -54,7 +55,7 @@ fn full_capability_params() -> ContextParams {
         ceiling: vec![
             "messages:read".to_owned(),
             "messages:write".to_owned(),
-            "tool:invoke:*".to_owned(),
+            "outlet:call:*".to_owned(),
             "context:close".to_owned(),
             "member:invite".to_owned(),
             "member:remove".to_owned(),
@@ -81,7 +82,7 @@ fn default_encrypted_params() -> ContextParams {
         ceiling: vec![
             "messages:read".to_owned(),
             "messages:write".to_owned(),
-            "tool:invoke:*".to_owned(),
+            "outlet:call:*".to_owned(),
         ],
         ceiling_policy: CeilingPolicy::Immutable,
         governance: GovernanceModel::SingleAdmin,
@@ -685,11 +686,11 @@ async fn broadcast_lifecycle() {
 }
 
 // ---------------------------------------------------------------------------
-// Tools
+// Outlets
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn tool_register_and_verify() {
+async fn outlet_register_and_verify() {
     let scp = Scp::new_in_memory_for_test();
     let alice = scp
         .identity_create("in_memory".to_owned(), None)
@@ -700,9 +701,10 @@ async fn tool_register_and_verify() {
         .await
         .unwrap();
 
-    let definition = ToolDefinition {
+    let definition = OutletDefinition {
         name: "calculator".to_owned(),
-        description: "A simple calculator tool".to_owned(),
+        description: "A simple calculator outlet".to_owned(),
+        kind: OutletKind::Action,
         input_schema_json:
             r#"{"type":"object","properties":{"a":{"type":"number"},"b":{"type":"number"}}}"#
                 .to_owned(),
@@ -714,12 +716,15 @@ async fn tool_register_and_verify() {
         cost: None,
     };
 
-    let tool_id = scp.tool_register(handle.clone(), definition).await.unwrap();
-    assert!(!tool_id.is_empty(), "Tool ID should be non-empty");
+    let outlet_id = scp
+        .outlet_register(handle.clone(), definition)
+        .await
+        .unwrap();
+    assert!(!outlet_id.is_empty(), "Outlet ID should be non-empty");
 
-    // Verify the registered tool
-    let verification = scp.tool_verify(handle, tool_id).await.unwrap();
-    assert!(verification.passed, "Tool verification should pass");
+    // Verify the registered outlet
+    let verification = scp.outlet_verify(handle, outlet_id).await.unwrap();
+    assert!(verification.passed, "Outlet verification should pass");
 }
 
 // ---------------------------------------------------------------------------
@@ -843,7 +848,7 @@ async fn discovery_normalize_trims_whitespace() {
 async fn discovery_create_query_produces_json() {
     let _scp = Scp::new_in_memory_for_test();
     let result = discovery_create_query(
-        Some(vec!["tool:search".to_owned()]),
+        Some(vec!["outlet:search".to_owned()]),
         Some(vec!["rust".to_owned()]),
         None,
     )

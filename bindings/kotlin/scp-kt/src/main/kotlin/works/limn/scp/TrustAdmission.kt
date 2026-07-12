@@ -271,9 +271,9 @@ enum class ParticipationFact {
     @SerialName("GovernanceActionsBy")
     GOVERNANCE_ACTIONS_BY,
 
-    /** Total tool invocations across all tool types. */
-    @SerialName("ToolInvocationCount")
-    TOOL_INVOCATION_COUNT,
+    /** Total outlet invocations across all outlet types. */
+    @SerialName("OutletInvocationCount")
+    OUTLET_INVOCATION_COUNT,
 
     /** Number of contexts created. */
     @SerialName("ContextCreationCount")
@@ -418,10 +418,10 @@ data class RequireParticipation(
  *   this identity.
  * @property governanceActionsBy Count of governance actions initiated by this
  *   identity.
- * @property toolInvocationCount Total tool invocations across all tool types.
- * @property toolInvocationCountAnchored Whether [toolInvocationCount] is
+ * @property outletInvocationCount Total outlet invocations across all outlet types.
+ * @property outletInvocationCountAnchored Whether [outletInvocationCount] is
  *   anchored in the canonical Merkle log. `false` until ADR-051 makes
- *   `ToolInvoked` a convergent leaf — consumers MUST NOT treat the count as
+ *   `OutletInvoked` a convergent leaf — consumers MUST NOT treat the count as
  *   Merkle-proven while this is `false`. The flag is part of the signed
  *   preimage, so it cannot be stripped from a signed profile.
  * @property contextCreationCount Number of contexts created.
@@ -442,8 +442,8 @@ data class ParticipationProfile(
     @SerialName("participation_duration_secs") val participationDurationSecs: ULong,
     @SerialName("governance_actions_against") val governanceActionsAgainst: ULong,
     @SerialName("governance_actions_by") val governanceActionsBy: ULong,
-    @SerialName("tool_invocation_count") val toolInvocationCount: ULong,
-    @SerialName("tool_invocation_count_anchored") val toolInvocationCountAnchored: Boolean,
+    @SerialName("outlet_invocation_count") val outletInvocationCount: ULong,
+    @SerialName("outlet_invocation_count_anchored") val outletInvocationCountAnchored: Boolean,
     @SerialName("context_creation_count") val contextCreationCount: ULong,
     @SerialName("role_progression_count") val roleProgressionCount: ULong,
     @SerialName("attestation_count") val attestationCount: ULong,

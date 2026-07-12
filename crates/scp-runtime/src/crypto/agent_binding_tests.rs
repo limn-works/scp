@@ -27,7 +27,7 @@ mod tests {
     use scp_protocol::crypto::ucan::UcanError;
     use scp_protocol::crypto::ucan::validate::{
         DEFAULT_CLOCK_SKEW_TOLERANCE_SECS, InMemoryDidResolver, InMemoryRevocationChecker,
-        ValidationContext,
+        NoCaveatResolver, ValidationContext,
     };
 
     // -----------------------------------------------------------------------
@@ -234,11 +234,13 @@ mod tests {
             "ctx-test", "messages", "write",
         );
 
+        let caveat_resolver = NoCaveatResolver;
         let mut ctx = ValidationContext {
             did_resolver: &resolver,
             nonce_tracker: &mut nonce_tracker,
             revocation_checker: &revocation_checker,
             proof_resolver: &proof_resolver,
+            caveat_resolver: &caveat_resolver,
             ceiling: &ceiling,
             context_creator_did: &human_did,
             presenting_agent_did: &human_did,

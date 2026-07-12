@@ -430,9 +430,9 @@ fn media_session_lifecycle_with_ceiling_check_and_signaling() {
 
     // -- Step 1: Build a capability ceiling that includes media:voice --
     let ceiling = vec![
-        ParamCapability::new("messages:read"),
-        ParamCapability::new("messages:write"),
-        ParamCapability::new("media:voice"),
+        ParamCapability::new("messages:read").expect("known capability"),
+        ParamCapability::new("messages:write").expect("known capability"),
+        ParamCapability::new("media:voice").expect("known capability"),
     ];
 
     // Verify that the ceiling contains media:voice.

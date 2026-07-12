@@ -56,7 +56,7 @@ use serde::{Deserialize, Serialize};
 
 /// Prepared (Prepare-time) snapshot for an in-flight saga.
 ///
-/// The sole production saga is cross-context tool invocation (spec §6.2.4);
+/// The sole production saga is cross-context outlet invocation (spec §6.2.4);
 /// the other contemplated saga types (custody handover, standing-pair create,
 /// broadcast hosting handshake) were all withdrawn as category errors
 /// (ADR-049 §3/§3b), so today this carries a single variant.
@@ -73,33 +73,33 @@ use serde::{Deserialize, Serialize};
 /// **Non-derives.** No `Clone`, `Debug`, `Display`, `Serialize`,
 /// `Deserialize` — see module-level documentation for rationale.
 pub enum SagaPreparedState {
-    /// Cross-context tool invocation. The UCAN proof bytes are NOT carried
+    /// Cross-context outlet invocation. The UCAN proof bytes are NOT carried
     /// here — only the proof's identifier — to keep the prepared-state non-
     /// secret-bearing.
-    CrossContextToolInvocation(CrossContextToolInvocationPrepared),
+    CrossContextOutletInvocation(CrossContextOutletInvocationPrepared),
 }
 
 // ---------------------------------------------------------------------------
-// Cross-context tool invocation
+// Cross-context outlet invocation
 // ---------------------------------------------------------------------------
 
-/// Staged state for a cross-context tool-invocation saga.
+/// Staged state for a cross-context outlet-invocation saga.
 ///
 /// This is the **public-metadata journal projection** of the
-/// `CrossContextToolInvoke` envelope (spec §6.2.4 "Public-metadata
+/// `CrossContextOutletInvoke` envelope (spec §6.2.4 "Public-metadata
 /// journaling") — eight fields, all public.
 ///
 /// **Not bearer-bearing.** The UCAN proof bytes are NOT carried here;
 /// only the proof's identifier (token ID). The receiving actor re-resolves
 /// the proof from its own UCAN store at Commit time, re-running the full §7
-/// validation re-bound to `caller_did` plus `tool_registration_id`. This
+/// validation re-bound to `caller_did` plus `outlet_registration_id`. This
 /// keeps the prepared-state non-secret-bearing (`mark_resolved(secret_bearing
 /// = false)`); the §9.4.3 commitment path stays dormant.
 ///
 /// **B-controlled, replay-deterministic fields.** Three of the eight fields
 /// are staged at Prepare-B precisely so a Commit replayed after a crash —
 /// when B no longer holds the wire envelope — reproduces the signed
-/// `CrossContextToolReceipt` preimage byte-for-byte from durable state:
+/// `CrossContextOutletReceipt` preimage byte-for-byte from durable state:
 ///
 /// - `recorded_timestamp_ms` is B's OWN clock captured once at Prepare-B
 ///   (NOT the caller-asserted envelope `timestamp_ms`, which is untrusted
@@ -121,32 +121,32 @@ pub enum SagaPreparedState {
 /// This actor-side prepared state is deliberately NOT `Serialize` (the
 /// wrapping [`SagaPreparedState`] enum carries the §9.4.3 non-derive
 /// barrier). Journal evidence is produced via the explicit
-/// [`CrossContextToolInvocationPreparedWire`] mirror (`MessagePack` of the
+/// [`CrossContextOutletInvocationPreparedWire`] mirror (`MessagePack` of the
 /// public fields), reached through
-/// [`CrossContextToolInvocationPrepared::to_evidence_bytes`] /
-/// [`CrossContextToolInvocationPrepared::from_evidence_bytes`], mirroring
+/// [`CrossContextOutletInvocationPrepared::to_evidence_bytes`] /
+/// [`CrossContextOutletInvocationPrepared::from_evidence_bytes`], mirroring
 /// the `JournalEntryWire`/`EvidenceWire` discipline in
 /// [`crate::context::supervisor::saga_journal`].
-pub struct CrossContextToolInvocationPrepared {
+pub struct CrossContextOutletInvocationPrepared {
     /// Calling context ID — the raw 32-byte context-id digest (never a
     /// `"standing-"`-prefixed string), matching the id-form rule §6.2.4
     /// states for both context ids.
     pub caller_context_id: [u8; 32],
     /// Target context ID — B's own context, the context in which B executes
-    /// the tool (the verified `target_context` of the established interface,
+    /// the outlet (the verified `target_context` of the established interface,
     /// §6.2.4 "Target-context binding"). Raw 32-byte digest, same id-form as
     /// `caller_context_id`.
     pub target_context_id: [u8; 32],
     /// Calling DID.
     pub caller_did: DID,
-    /// Tool registration ID (target tool's stable identifier). Context-LOCAL
-    /// — it indexes B's own tool registry.
-    pub tool_registration_id: String,
+    /// Outlet registration ID (target outlet's stable identifier). Context-LOCAL
+    /// — it indexes B's own outlet registry.
+    pub outlet_registration_id: String,
     /// UCAN proof reference (token ID), NOT the proof bytes. Resolved
     /// against the receiving actor's UCAN store at Commit time.
     pub ucan_proof_id: String,
     /// B's wall-clock value captured ONCE at Prepare-B (§6.2.4 "Recorded
-    /// timestamp"). Both the Commit-time `ToolInvoked` record and the
+    /// timestamp"). Both the Commit-time `OutletInvoked` record and the
     /// receipt signature draw `timestamp_ms` from this single staged value;
     /// it is NOT the caller-asserted envelope `timestamp_ms`.
     pub recorded_timestamp_ms: u64,
@@ -163,10 +163,10 @@ pub struct CrossContextToolInvocationPrepared {
 }
 
 /// `Serialize`/`Deserialize` wire mirror of the **public** fields of
-/// [`CrossContextToolInvocationPrepared`], used to produce the journal
+/// [`CrossContextOutletInvocationPrepared`], used to produce the journal
 /// `evidence` (the `MessagePack` of the eight public journaled fields,
 /// §6.2.4 "Public-metadata journaling"). The actor-side
-/// [`CrossContextToolInvocationPrepared`] is deliberately non-`Serialize`
+/// [`CrossContextOutletInvocationPrepared`] is deliberately non-`Serialize`
 /// because the wrapping [`SagaPreparedState`] enum carries the §9.4.3
 /// non-derive barrier; this explicit mirror is the sanctioned serialization
 /// path, matching the `JournalEntryWire`/`EvidenceWire` discipline in
@@ -178,20 +178,20 @@ pub struct CrossContextToolInvocationPrepared {
 ///
 /// `dead_code` is allowed: this wire mirror and the `to_evidence_bytes` /
 /// `from_evidence_bytes` helpers below are the journal-evidence path for the
-/// cross-context tool-invocation saga, consumed when the saga dispatch
+/// cross-context outlet-invocation saga, consumed when the saga dispatch
 /// wiring lands in a follow-on PR. The unit tests exercise the round-trip
 /// now.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[allow(dead_code)]
-pub(in crate::context) struct CrossContextToolInvocationPreparedWire {
+pub(in crate::context) struct CrossContextOutletInvocationPreparedWire {
     /// The raw 32-byte caller context id.
     pub caller_context_id: [u8; 32],
     /// The raw 32-byte target context id.
     pub target_context_id: [u8; 32],
     /// `caller_did.0`.
     pub caller_did: String,
-    /// Context-local tool registration id.
-    pub tool_registration_id: String,
+    /// Context-local outlet registration id.
+    pub outlet_registration_id: String,
     /// UCAN proof reference (token id), not the proof bytes.
     pub ucan_proof_id: String,
     /// B's Prepare-B captured clock value.
@@ -203,9 +203,9 @@ pub(in crate::context) struct CrossContextToolInvocationPreparedWire {
 }
 
 #[allow(dead_code)] // evidence path consumed by the saga dispatch wiring PR
-impl CrossContextToolInvocationPrepared {
+impl CrossContextOutletInvocationPrepared {
     /// Encode the public prepared state to its journal `evidence` bytes —
-    /// `MessagePack` of the [`CrossContextToolInvocationPreparedWire`]
+    /// `MessagePack` of the [`CrossContextOutletInvocationPreparedWire`]
     /// mirror (§6.2.4 "Public-metadata journaling"). Classified **public**;
     /// the supervisor wraps these bytes in the standard `Zeroizing` envelope
     /// for uniformity only.
@@ -214,11 +214,11 @@ impl CrossContextToolInvocationPrepared {
     ///
     /// Returns the `rmp_serde` encode error string if serialization fails.
     pub(in crate::context) fn to_evidence_bytes(&self) -> Result<Vec<u8>, String> {
-        let wire = CrossContextToolInvocationPreparedWire {
+        let wire = CrossContextOutletInvocationPreparedWire {
             caller_context_id: self.caller_context_id,
             target_context_id: self.target_context_id,
             caller_did: self.caller_did.0.clone(),
-            tool_registration_id: self.tool_registration_id.clone(),
+            outlet_registration_id: self.outlet_registration_id.clone(),
             ucan_proof_id: self.ucan_proof_id.clone(),
             recorded_timestamp_ms: self.recorded_timestamp_ms,
             recorded_nonce: self.recorded_nonce,
@@ -235,13 +235,13 @@ impl CrossContextToolInvocationPrepared {
     /// Returns the `rmp_serde` decode error string if `bytes` is not a valid
     /// `MessagePack` encoding of the wire mirror.
     pub(in crate::context) fn from_evidence_bytes(bytes: &[u8]) -> Result<Self, String> {
-        let wire: CrossContextToolInvocationPreparedWire =
+        let wire: CrossContextOutletInvocationPreparedWire =
             rmp_serde::from_slice(bytes).map_err(|e| format!("decode: {e}"))?;
         Ok(Self {
             caller_context_id: wire.caller_context_id,
             target_context_id: wire.target_context_id,
             caller_did: DID(wire.caller_did),
-            tool_registration_id: wire.tool_registration_id,
+            outlet_registration_id: wire.outlet_registration_id,
             ucan_proof_id: wire.ucan_proof_id,
             recorded_timestamp_ms: wire.recorded_timestamp_ms,
             recorded_nonce: wire.recorded_nonce,
@@ -288,23 +288,23 @@ impl CrossContextToolInvocationPrepared {
 /// same discipline.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SagaPreparedStateSnapshot {
-    /// Mirror of [`SagaPreparedState::CrossContextToolInvocation`].
-    CrossContextToolInvocation(CrossContextToolInvocationSnapshot),
+    /// Mirror of [`SagaPreparedState::CrossContextOutletInvocation`].
+    CrossContextOutletInvocation(CrossContextOutletInvocationSnapshot),
 }
 
 /// Public snapshot payload for
-/// [`SagaPreparedState::CrossContextToolInvocation`] (§6.2.4 "Public-metadata
+/// [`SagaPreparedState::CrossContextOutletInvocation`] (§6.2.4 "Public-metadata
 /// journaling"; all eight fields public, not bearer-bearing).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CrossContextToolInvocationSnapshot {
+pub struct CrossContextOutletInvocationSnapshot {
     /// The raw 32-byte caller context id.
     pub caller_context_id: [u8; 32],
     /// The raw 32-byte target context id.
     pub target_context_id: [u8; 32],
     /// `caller_did.0`.
     pub caller_did: String,
-    /// Context-local tool registration id.
-    pub tool_registration_id: String,
+    /// Context-local outlet registration id.
+    pub outlet_registration_id: String,
     /// UCAN proof reference (token id), not the proof bytes.
     pub ucan_proof_id: String,
     /// B's Prepare-B captured clock value.
@@ -324,12 +324,12 @@ impl SagaPreparedStateSnapshot {
     #[must_use]
     pub fn from_prepared(prepared: &SagaPreparedState) -> Self {
         match prepared {
-            SagaPreparedState::CrossContextToolInvocation(inner) => {
-                Self::CrossContextToolInvocation(CrossContextToolInvocationSnapshot {
+            SagaPreparedState::CrossContextOutletInvocation(inner) => {
+                Self::CrossContextOutletInvocation(CrossContextOutletInvocationSnapshot {
                     caller_context_id: inner.caller_context_id,
                     target_context_id: inner.target_context_id,
                     caller_did: inner.caller_did.0.clone(),
-                    tool_registration_id: inner.tool_registration_id.clone(),
+                    outlet_registration_id: inner.outlet_registration_id.clone(),
                     ucan_proof_id: inner.ucan_proof_id.clone(),
                     recorded_timestamp_ms: inner.recorded_timestamp_ms,
                     recorded_nonce: inner.recorded_nonce,
@@ -345,73 +345,75 @@ impl SagaPreparedStateSnapshot {
     #[must_use]
     pub fn into_prepared(self) -> SagaPreparedState {
         match self {
-            Self::CrossContextToolInvocation(snap) => {
-                SagaPreparedState::CrossContextToolInvocation(CrossContextToolInvocationPrepared {
-                    caller_context_id: snap.caller_context_id,
-                    target_context_id: snap.target_context_id,
-                    caller_did: DID(snap.caller_did),
-                    tool_registration_id: snap.tool_registration_id,
-                    ucan_proof_id: snap.ucan_proof_id,
-                    recorded_timestamp_ms: snap.recorded_timestamp_ms,
-                    recorded_nonce: snap.recorded_nonce,
-                    recorded_chain_depth: snap.recorded_chain_depth,
-                })
+            Self::CrossContextOutletInvocation(snap) => {
+                SagaPreparedState::CrossContextOutletInvocation(
+                    CrossContextOutletInvocationPrepared {
+                        caller_context_id: snap.caller_context_id,
+                        target_context_id: snap.target_context_id,
+                        caller_did: DID(snap.caller_did),
+                        outlet_registration_id: snap.outlet_registration_id,
+                        ucan_proof_id: snap.ucan_proof_id,
+                        recorded_timestamp_ms: snap.recorded_timestamp_ms,
+                        recorded_nonce: snap.recorded_nonce,
+                        recorded_chain_depth: snap.recorded_chain_depth,
+                    },
+                )
             }
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Committed cross-context tool-invocation capture (spec §6.2.4)
+// Committed cross-context outlet-invocation capture (spec §6.2.4)
 // ---------------------------------------------------------------------------
 
-/// Durable, `SagaId`-keyed capture of a COMMITTED cross-context tool
+/// Durable, `SagaId`-keyed capture of a COMMITTED cross-context outlet
 /// invocation, held on the TARGET (B) actor (spec §6.2.4 "Exactly-once
 /// execution with durable output capture").
 ///
-/// The tool executes **exactly once**; its output + the signed
-/// [`CrossContextToolReceipt`] are captured here so a Commit replayed after a
+/// The outlet executes **exactly once**; its output + the signed
+/// [`CrossContextOutletReceipt`] are captured here so a Commit replayed after a
 /// crash (§17.16.4) re-emits the STORED output and re-emits the IDENTICAL
-/// signed receipt — **never re-invoking the tool** and never minting a fresh
-/// `tool_invoked_event_id`. Both the receipt and the raw output are reproduced
+/// signed receipt — **never re-invoking the outlet** and never minting a fresh
+/// `outlet_invoked_event_id`. Both the receipt and the raw output are reproduced
 /// byte-for-byte from this record.
 ///
 /// **Class S.** Held in
 /// [`PerContextState.xctx_committed_outputs`](crate::context::actor::state::PerContextState::xctx_committed_outputs)
 /// and synchronously persisted fail-closed (ADR-049 §9) the same way
 /// `saga_pending` is — a crash that rolled the capture back behind an acked
-/// Commit-B would let a replayed Commit re-invoke the tool, breaking the
+/// Commit-B would let a replayed Commit re-invoke the outlet, breaking the
 /// exactly-once guarantee.
 ///
-/// **Not bearer-bearing.** The receipt and tool output are public protocol
+/// **Not bearer-bearing.** The receipt and outlet output are public protocol
 /// artifacts (the receipt is the signed return-path response; the output is
-/// the tool result A already receives). There is no §9.4.3 secret here, so —
+/// the outlet result A already receives). There is no §9.4.3 secret here, so —
 /// unlike [`SagaPreparedState`] — this type derives `Serialize`/`Clone`
 /// directly and rides the public [`ContextSnapshot`](crate::context::state::ContextSnapshot)
 /// surface without a separate mirror.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CommittedToolInvocation {
+pub struct CommittedOutletInvocation {
     /// The target's signed receipt over the staged provenance + output hash +
     /// event id. Re-emitted verbatim on a replayed Commit so the signature
     /// preimage reproduces byte-for-byte.
-    pub receipt: scp_protocol::context::tools::cross_context_saga::CrossContextToolReceipt,
-    /// The captured tool output bytes — the receipt's `output_jcs`, stored
+    pub receipt: scp_protocol::context::outlets::cross_context_saga::CrossContextOutletReceipt,
+    /// The captured outlet output bytes — the receipt's `output_jcs`, stored
     /// alongside so a replay re-emits the exact output A originally received.
     #[serde(with = "scp_protocol::serde_util::serde_bounded_bytes")]
     pub output_bytes: Vec<u8>,
-    /// The `SagaId`-stable `ToolInvoked` event-log entry id (also carried on
+    /// The `SagaId`-stable `OutletInvoked` event-log entry id (also carried on
     /// the receipt; stored explicitly so a replay re-acks the same id without
     /// re-deriving it).
-    pub tool_invoked_event_id: String,
+    pub outlet_invoked_event_id: String,
 }
 
-/// Caller-side (A-owned) durable reversal record for a cross-context tool
+/// Caller-side (A-owned) durable reversal record for a cross-context outlet
 /// invocation's Prepare-A economy reservation (spec §6.2.4 "Reservation release
 /// on every terminal path").
 ///
 /// Prepare-A durably persists the caller's velocity / budget / hard-rate-limit
 /// deductions and authorizes the external payment escrow, but the live
-/// [`ToolEconomyReservation`](crate::context::tools_helpers::ToolEconomyReservation)
+/// [`OutletEconomyReservation`](crate::context::outlets_helpers::OutletEconomyReservation)
 /// RAII carrier that holds the means to reverse them lives ONLY in the
 /// supervisor's in-memory saga context — it dies with an actor/process crash.
 /// On a `PreparingB`-window crash the §17.16.4 recovery sweep re-drives the
@@ -431,7 +433,7 @@ pub struct CommittedToolInvocation {
 /// by construction and a saga is never double-reversed.
 ///
 /// **Reversal is unconditional on the crash path** — see
-/// [`reverse_caller_reservation_record`](crate::context::tools_helpers::reverse_caller_reservation_record).
+/// [`reverse_caller_reservation_record`](crate::context::outlets_helpers::reverse_caller_reservation_record).
 /// The record and the deductions it reverses are rehydrated from ONE consistent
 /// snapshot into the SAME restored context, so there is no "replaced instance"
 /// to confuse: routing by `context_id` plus keying every reversal by
@@ -462,7 +464,7 @@ pub struct CommittedToolInvocation {
 /// operator repair (via the carrier's `hold_external_for_repair`), so this
 /// record is never auto-reversed for it and the held escrow is never wrongly
 /// voided. Its compaction is therefore tied to saga-journal retention, like
-/// [`CommittedToolInvocation`] — a `NeedsRepair` saga's inert leftover record is
+/// [`CommittedOutletInvocation`] — a `NeedsRepair` saga's inert leftover record is
 /// pruned with the journal entry it belongs to.
 ///
 /// **Not bearer-bearing.** Every field is public economy metadata —
@@ -473,7 +475,7 @@ pub struct CommittedToolInvocation {
 /// so a persisted token could never match). There is no §9.4.3 secret, so this
 /// type derives `Serialize`/`Clone` directly and rides the public
 /// [`ContextSnapshot`](crate::context::state::ContextSnapshot) surface without a
-/// separate mirror, exactly like [`CommittedToolInvocation`].
+/// separate mirror, exactly like [`CommittedOutletInvocation`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CallerReservationRecord {
     /// The caller DID the reservation was made for — the key for budget /
@@ -483,7 +485,7 @@ pub struct CallerReservationRecord {
     /// Reversed via `budget_tracker.reverse_spend` on the crash-abort path.
     pub deducted_cost: Option<scp_protocol::economy::types::Amount>,
     /// Whether the hard-rate-limit token consumed at Prepare-A must be refunded
-    /// on reversal (mirrors `ToolEconomyTicket::needs_hard_rate_limit_refund`).
+    /// on reversal (mirrors `OutletEconomyTicket::needs_hard_rate_limit_refund`).
     pub needs_hard_rate_limit_refund: bool,
     /// Unix-seconds timestamp of the Prepare-A velocity entry. The velocity
     /// reversal removes the single entry recorded at this timestamp via
@@ -514,24 +516,24 @@ mod tests {
     }
 
     #[test]
-    fn cross_context_tool_invocation_constructs() {
+    fn cross_context_outlet_invocation_constructs() {
         let state =
-            SagaPreparedState::CrossContextToolInvocation(CrossContextToolInvocationPrepared {
+            SagaPreparedState::CrossContextOutletInvocation(CrossContextOutletInvocationPrepared {
                 caller_context_id: [5u8; 32],
                 target_context_id: [6u8; 32],
                 caller_did: alice(),
-                tool_registration_id: "calculator-v1".to_owned(),
+                outlet_registration_id: "calculator-v1".to_owned(),
                 ucan_proof_id: "ucan-token-abcdef".to_owned(),
                 recorded_timestamp_ms: 1_725_000_000_123,
                 recorded_nonce: [0xABu8; 16],
                 recorded_chain_depth: 3,
             });
         // Single-variant enum: the bind is irrefutable.
-        let SagaPreparedState::CrossContextToolInvocation(inner) = state;
+        let SagaPreparedState::CrossContextOutletInvocation(inner) = state;
         assert_eq!(inner.caller_context_id, [5u8; 32]);
         assert_eq!(inner.target_context_id, [6u8; 32]);
         assert_eq!(inner.caller_did, alice());
-        assert_eq!(inner.tool_registration_id, "calculator-v1");
+        assert_eq!(inner.outlet_registration_id, "calculator-v1");
         assert_eq!(inner.ucan_proof_id, "ucan-token-abcdef");
         assert_eq!(inner.recorded_timestamp_ms, 1_725_000_000_123);
         assert_eq!(inner.recorded_nonce, [0xABu8; 16]);
@@ -539,23 +541,23 @@ mod tests {
     }
 
     #[test]
-    fn cross_context_tool_invocation_evidence_round_trips_all_eight_fields() {
-        let original = CrossContextToolInvocationPrepared {
+    fn cross_context_outlet_invocation_evidence_round_trips_all_eight_fields() {
+        let original = CrossContextOutletInvocationPrepared {
             caller_context_id: [0x11u8; 32],
             target_context_id: [0x22u8; 32],
             caller_did: alice(),
-            tool_registration_id: "calculator-v1".to_owned(),
+            outlet_registration_id: "calculator-v1".to_owned(),
             ucan_proof_id: "ucan-token-abcdef".to_owned(),
             recorded_timestamp_ms: 1_725_000_000_123,
             recorded_nonce: [0xCDu8; 16],
             recorded_chain_depth: 7,
         };
         let bytes = original.to_evidence_bytes().unwrap();
-        let back = CrossContextToolInvocationPrepared::from_evidence_bytes(&bytes).unwrap();
+        let back = CrossContextOutletInvocationPrepared::from_evidence_bytes(&bytes).unwrap();
         assert_eq!(back.caller_context_id, original.caller_context_id);
         assert_eq!(back.target_context_id, original.target_context_id);
         assert_eq!(back.caller_did, original.caller_did);
-        assert_eq!(back.tool_registration_id, original.tool_registration_id);
+        assert_eq!(back.outlet_registration_id, original.outlet_registration_id);
         assert_eq!(back.ucan_proof_id, original.ucan_proof_id);
         assert_eq!(back.recorded_timestamp_ms, original.recorded_timestamp_ms);
         assert_eq!(back.recorded_nonce, original.recorded_nonce);
@@ -563,22 +565,22 @@ mod tests {
     }
 
     #[test]
-    fn cross_context_tool_invocation_wire_round_trips_via_messagepack() {
+    fn cross_context_outlet_invocation_wire_round_trips_via_messagepack() {
         // Exercises the explicit Wire mirror directly, matching the
         // §9.4.3 non-derive discipline: the live enum stays non-Serialize,
         // serialization flows only through the Wire type.
-        let wire = CrossContextToolInvocationPreparedWire {
+        let wire = CrossContextOutletInvocationPreparedWire {
             caller_context_id: [0x33u8; 32],
             target_context_id: [0x44u8; 32],
             caller_did: bob().0,
-            tool_registration_id: "translator-v2".to_owned(),
+            outlet_registration_id: "translator-v2".to_owned(),
             ucan_proof_id: "ucan-token-99".to_owned(),
             recorded_timestamp_ms: 42,
             recorded_nonce: [0xEEu8; 16],
             recorded_chain_depth: 255,
         };
         let bytes = rmp_serde::to_vec_named(&wire).unwrap();
-        let back: CrossContextToolInvocationPreparedWire = rmp_serde::from_slice(&bytes).unwrap();
+        let back: CrossContextOutletInvocationPreparedWire = rmp_serde::from_slice(&bytes).unwrap();
         assert_eq!(back, wire);
     }
 
@@ -596,21 +598,21 @@ mod tests {
     fn types_are_send_sync() {
         const fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<SagaPreparedState>();
-        assert_send_sync::<CrossContextToolInvocationPrepared>();
+        assert_send_sync::<CrossContextOutletInvocationPrepared>();
     }
 
     /// The Class-S snapshot mirror (ADR-049 §9 line 144) must serialize, then
     /// deserialize, then rehydrate to an identical live `SagaPreparedState`.
-    /// Same round-trip for the cross-context tool-invocation variant — all
+    /// Same round-trip for the cross-context outlet-invocation variant — all
     /// eight journaled fields must survive (§6.2.4 public-metadata journaling).
     #[test]
-    fn snapshot_mirror_round_trips_cross_context_tool() {
+    fn snapshot_mirror_round_trips_cross_context_outlet() {
         let prepared =
-            SagaPreparedState::CrossContextToolInvocation(CrossContextToolInvocationPrepared {
+            SagaPreparedState::CrossContextOutletInvocation(CrossContextOutletInvocationPrepared {
                 caller_context_id: [0x1Au8; 32],
                 target_context_id: [0x2Bu8; 32],
                 caller_did: alice(),
-                tool_registration_id: "calc-v2".to_owned(),
+                outlet_registration_id: "calc-v2".to_owned(),
                 ucan_proof_id: "ucan-xyz".to_owned(),
                 recorded_timestamp_ms: 1_700_111_222_333,
                 recorded_nonce: [0x9Eu8; 16],
@@ -621,11 +623,11 @@ mod tests {
         let back: SagaPreparedStateSnapshot = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(mirror, back);
         // Single-variant enum: the bind is irrefutable.
-        let SagaPreparedState::CrossContextToolInvocation(inner) = back.into_prepared();
+        let SagaPreparedState::CrossContextOutletInvocation(inner) = back.into_prepared();
         assert_eq!(inner.caller_context_id, [0x1Au8; 32]);
         assert_eq!(inner.target_context_id, [0x2Bu8; 32]);
         assert_eq!(inner.caller_did, alice());
-        assert_eq!(inner.tool_registration_id, "calc-v2");
+        assert_eq!(inner.outlet_registration_id, "calc-v2");
         assert_eq!(inner.ucan_proof_id, "ucan-xyz");
         assert_eq!(inner.recorded_timestamp_ms, 1_700_111_222_333);
         assert_eq!(inner.recorded_nonce, [0x9Eu8; 16]);

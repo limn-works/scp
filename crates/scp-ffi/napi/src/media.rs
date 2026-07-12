@@ -97,8 +97,17 @@ pub(crate) fn media_check_capability_on(
     let cap = parse_media_capability(&capability)?;
     let param_caps: Vec<scp_core::context::params::Capability> = ceiling
         .iter()
-        .map(scp_core::context::params::Capability::new)
-        .collect();
+        .map(|s| {
+            scp_core::context::params::Capability::new(s).ok_or_else(|| {
+                napi::Error::from(ScpNapiError::Validation {
+                    message: format!(
+                        "invalid capability {s:?} in ceiling (fails §5.4.2.1 parser) (use \"outlet:call:*\" for actions, \"outlet:query:*\" for reads)"
+                    ),
+                    code: codes::VALID_7000.to_owned(),
+                })
+            })
+        })
+        .collect::<napi::Result<Vec<_>>>()?;
     check_media_capability(&param_caps, &cap).map_err(media_error_to_napi)?;
     Ok(true)
 }
@@ -120,8 +129,17 @@ pub(crate) fn media_initiate_session_on(
 
     let param_caps: Vec<scp_core::context::params::Capability> = ceiling
         .iter()
-        .map(scp_core::context::params::Capability::new)
-        .collect();
+        .map(|s| {
+            scp_core::context::params::Capability::new(s).ok_or_else(|| {
+                napi::Error::from(ScpNapiError::Validation {
+                    message: format!(
+                        "invalid capability {s:?} in ceiling (fails §5.4.2.1 parser) (use \"outlet:call:*\" for actions, \"outlet:query:*\" for reads)"
+                    ),
+                    code: codes::VALID_7000.to_owned(),
+                })
+            })
+        })
+        .collect::<napi::Result<Vec<_>>>()?;
 
     #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
     let ts = timestamp as u64;

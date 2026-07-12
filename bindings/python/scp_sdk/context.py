@@ -482,7 +482,7 @@ class Context:
 
     Pure handle wrapper. The underlying ``PyContextHandle`` is produced by
     :meth:`scp_sdk.SCP.context_create` (and related factory methods). All
-    lifecycle, messaging, tool, broadcast, and governance operations now
+    lifecycle, messaging, outlet, broadcast, and governance operations now
     live on :class:`scp_sdk.SCP` — pass ``ctx._raw_handle`` into the
     per-op methods.
 
@@ -616,7 +616,7 @@ def template_get_params(template_id: str) -> dict[str, Any]:
     Args:
         template_id: One of ``BilateralEphemeral``, ``BilateralPersistent``,
             ``Coordination``, ``GroupDiscussion``, ``PublicBroadcast``,
-            ``GatedBroadcast``, ``scp:template/tool-interface``,
+            ``GatedBroadcast``, ``scp:template/outlet-interface``,
             ``PaidService``, ``PaidBroadcast``, ``HandleRegistry``.
 
     Returns:

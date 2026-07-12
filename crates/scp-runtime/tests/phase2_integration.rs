@@ -11,7 +11,7 @@
 //!
 //! - **ADR-008**: Context lifecycle state machine (create, join, expire).
 //! - **ADR-009**: UCAN-based role assignment and capability enforcement.
-//! - **ADR-010**: Tool registration and invocation with schema validation.
+//! - **ADR-010**: Outlet registration and invocation with schema validation.
 //! - **ADR-011**: Verifiable event log (Merkle tree) and consistency checkpoints.
 //! - **ADR-012**: Multi-transport routing (simulated via in-memory channels).
 //!
@@ -33,16 +33,16 @@ use scp_event_log::tree::{self, GENESIS_PREV_HASH};
 use scp_event_log::{Event, EventLog, EventPayload, EventType};
 use scp_platform::testing::InMemoryKeyCustody;
 use scp_platform::traits::{KeyCustody, KeyType};
+use scp_protocol::context::outlets::lifecycle::OutletStatus;
+use scp_protocol::context::outlets::registry::{
+    OutletRegistration, OutletRegistry, OutletSchema, register_outlet,
+};
 use scp_protocol::context::roles::{
     Capability, CapabilityCeiling, ContextRoleState, RoleDefinition, RoleError, assign_role,
 };
-use scp_protocol::context::tools::lifecycle::ToolStatus;
-use scp_protocol::context::tools::registry::{
-    ToolRegistration, ToolRegistry, ToolSchema, register_tool,
-};
 use scp_protocol::context::{ContextParams, ContextState, MemoryScope};
 use scp_runtime::context::ContextHandle;
-use scp_runtime::context::tools::invoke::{has_tool_invoke_capability, invoke_tool};
+use scp_runtime::context::outlets::invoke::{has_outlet_call_capability, invoke_outlet};
 use scp_runtime::event_log::KeyCustodySigner;
 
 // ---------------------------------------------------------------------------
@@ -182,7 +182,7 @@ impl RelayReliabilityTracker {
     }
 }
 
-/// Async calculator executor matching the tool's schema.
+/// Async calculator executor matching the outlet's schema.
 async fn calculator_executor(input: serde_json::Value) -> Result<serde_json::Value, String> {
     let operation = input
         .get("operation")
@@ -215,8 +215,8 @@ async fn phase2_end_to_end_integration() {
     // -----------------------------------------------------------------------
     // Step 1: Alice creates an identity and a context.
     //
-    // Context config: ceiling [messaging, tool_invoke], roles [admin, member],
-    // one tool "calculator", TTL 5 minutes, memory scope ephemeral.
+    // Context config: ceiling [messaging, outlet_call], roles [admin, member],
+    // one outlet "calculator", TTL 5 minutes, memory scope ephemeral.
     // -----------------------------------------------------------------------
 
     let (alice_vk, alice_sk) = test_keypair();
@@ -224,12 +224,12 @@ async fn phase2_end_to_end_integration() {
 
     let context_id = "ctx-phase2-integration";
 
-    // Define the capability ceiling: messaging + tool invocation.
+    // Define the capability ceiling: messaging + outlet invocation.
     let ceiling = CapabilityCeiling::new([
         Capability::MessagesRead,
         Capability::MessagesWrite,
-        Capability::ToolInvokeAll,
-        Capability::ToolRegister,
+        Capability::OutletCallAll,
+        Capability::OutletRegister,
         Capability::RoleAssign,
         Capability::MemberInvite,
         Capability::MemberRemove,
@@ -241,8 +241,8 @@ async fn phase2_end_to_end_integration() {
         ceiling: vec![
             Capability::MessagesRead,
             Capability::MessagesWrite,
-            Capability::ToolInvokeAll,
-            Capability::ToolRegister,
+            Capability::OutletCallAll,
+            Capability::OutletRegister,
             Capability::RoleAssign,
             Capability::MemberInvite,
             Capability::MemberRemove,
@@ -258,18 +258,21 @@ async fn phase2_end_to_end_integration() {
                 capabilities: HashSet::from([Capability::MessagesRead]),
             },
         ],
-        tools: vec![ToolRegistration {
-            tool_id: "calculator".to_owned(),
+        outlets: vec![OutletRegistration {
+            outlet_id: "calculator".to_owned(),
+            kind: scp_protocol::context::outlets::OutletKind::default(),
             name: "calculator".to_owned(),
-            description: "Calculator tool".to_owned(),
-            schema: ToolSchema {
+            description: "Calculator outlet".to_owned(),
+            schema: OutletSchema {
                 input_schema: serde_json::json!({"type": "object"}),
                 output_schema: serde_json::json!({"type": "object"}),
+                aggregate_schema: None,
             },
             implementation_hash: [0u8; 32],
             test_vectors: vec![],
             operator_did: "did:dht:z6MkTestOperator".into(),
             cost: None,
+            message_catalog: Vec::new(),
             registered_at: 0,
             signature: Vec::new(),
         }],
@@ -298,13 +301,14 @@ async fn phase2_end_to_end_integration() {
     )
     .expect("role state creation");
 
-    // Register the calculator tool.
-    let mut tool_registry = ToolRegistry::new();
-    let calc_registration = ToolRegistration {
-        tool_id: "calculator".to_owned(),
+    // Register the calculator outlet.
+    let mut outlet_registry = OutletRegistry::new();
+    let calc_registration = OutletRegistration {
+        outlet_id: "calculator".to_owned(),
+        kind: scp_protocol::context::outlets::OutletKind::default(),
         name: "Calculator".to_owned(),
         description: "A simple arithmetic calculator".to_owned(),
-        schema: ToolSchema {
+        schema: OutletSchema {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -319,22 +323,24 @@ async fn phase2_end_to_end_integration() {
                     "result": {"type": "number"}
                 }
             }),
+            aggregate_schema: None,
         },
         implementation_hash: [0xAB; 32],
         test_vectors: vec![],
         operator_did: alice_did.clone(),
         cost: None,
+        message_catalog: Vec::new(),
         registered_at: 0,
         signature: Vec::new(),
     };
-    let (tool_id, _tool_registered_event) = register_tool(
-        &mut tool_registry,
+    let (outlet_id, _outlet_registered_event) = register_outlet(
+        &mut outlet_registry,
         &role_state,
         calc_registration,
         &alice_did,
     )
-    .expect("tool registration");
-    assert_eq!(tool_id, "calculator");
+    .expect("outlet registration");
+    assert_eq!(outlet_id, "calculator");
 
     // Initialize event logs for Alice and Bob (they share the same log in this test
     // since both see the same events -- we maintain two copies to verify consistency).
@@ -358,8 +364,8 @@ async fn phase2_end_to_end_integration() {
     // Verify params are correct.
     assert_eq!(context.params().ttl, Some(Duration::from_mins(5)));
     assert_eq!(context.params().memory_scope, MemoryScope::Ephemeral);
-    assert_eq!(context.params().tools.len(), 1);
-    assert_eq!(context.params().tools[0].name, "calculator");
+    assert_eq!(context.params().outlets.len(), 1);
+    assert_eq!(context.params().outlets[0].name, "calculator");
 
     // -----------------------------------------------------------------------
     // Step 2: Context is assigned to 3 relays via TransportManager.
@@ -381,7 +387,7 @@ async fn phase2_end_to_end_integration() {
     let bob_did = did_from_pubkey(&bob_vk);
 
     // Bob discovers the context (the params are visible before joining per the
-    // legibility tenet). Bob inspects the ceiling, roles, tools, TTL, and
+    // legibility tenet). Bob inspects the ceiling, roles, outlets, TTL, and
     // memory scope before opting in.
     let discovered_params = context.params();
     assert!(
@@ -397,7 +403,7 @@ async fn phase2_end_to_end_integration() {
     assert!(
         discovered_params
             .ceiling
-            .contains(&Capability::ToolInvokeAll)
+            .contains(&Capability::OutletCallAll)
     );
 
     // Bob joins: add to member set.
@@ -418,7 +424,7 @@ async fn phase2_end_to_end_integration() {
 
     // -----------------------------------------------------------------------
     // Step 4: Bob is assigned the "member" role with UCAN tokens for
-    //         messages:read, messages:write, tool_invoke_all.
+    //         messages:read, messages:write, outlet_call_all.
     // -----------------------------------------------------------------------
 
     let bob_tokens = assign_role(
@@ -439,7 +445,7 @@ async fn phase2_end_to_end_integration() {
     // Verify Bob has the expected capabilities.
     assert!(role_state.member_has_capability(&bob_did, &Capability::MessagesRead));
     assert!(role_state.member_has_capability(&bob_did, &Capability::MessagesWrite));
-    assert!(role_state.member_has_capability(&bob_did, &Capability::ToolInvokeAll));
+    assert!(role_state.member_has_capability(&bob_did, &Capability::OutletCallAll));
 
     // Verify Bob does NOT have admin-level capabilities.
     assert!(!role_state.member_has_capability(&bob_did, &Capability::RoleAssign));
@@ -521,57 +527,57 @@ async fn phase2_end_to_end_integration() {
     assert_eq!(received[0], message_payload);
 
     // -----------------------------------------------------------------------
-    // Step 7: Bob invokes the "calculator" tool with input
+    // Step 7: Bob invokes the "calculator" outlet with input
     //         {"operation": "add", "a": 1, "b": 2}.
-    //         UCAN validates Bob has tool_invoke capability.
-    //         Tool returns {"result": 3}. Invocation is logged.
+    //         UCAN validates Bob has outlet_call capability.
+    //         Outlet returns {"result": 3}. Invocation is logged.
     // -----------------------------------------------------------------------
 
-    // Verify Bob has tool invoke capability.
-    assert!(has_tool_invoke_capability(
+    // Verify Bob has outlet invoke capability.
+    assert!(has_outlet_call_capability(
         &role_state,
         &bob_did,
         "calculator"
     ));
 
-    let tool_input = serde_json::json!({"operation": "add", "a": 1, "b": 2});
+    let outlet_input = serde_json::json!({"operation": "add", "a": 1, "b": 2});
 
-    let (tool_output, tool_invoked_event, _consequences, _receipt) = invoke_tool(
+    let (outlet_output, outlet_invoked_event, _consequences, _receipt) = invoke_outlet(
         &context,
-        &tool_registry,
+        &outlet_registry,
         &role_state,
         &"calculator".to_owned(),
-        tool_input,
+        outlet_input,
         &bob_did,
         None,
         calculator_executor,
-        None::<&mut scp_runtime::context::tools::invoke::ToolEconomyContext<'_>>,
+        None::<&mut scp_runtime::context::outlets::invoke::OutletEconomyContext<'_>>,
     )
     .await
-    .expect("tool invocation should succeed");
+    .expect("outlet invocation should succeed");
 
     // Verify the result.
     assert_eq!(
-        tool_output,
+        outlet_output,
         serde_json::json!({"result": 3.0}),
         "calculator should return 3 for 1 + 2"
     );
-    assert_eq!(tool_invoked_event.tool_id, "calculator");
-    assert_eq!(tool_invoked_event.invoker_did, bob_did);
-    assert_eq!(tool_invoked_event.status, ToolStatus::Success);
+    assert_eq!(outlet_invoked_event.outlet_id, "calculator");
+    assert_eq!(outlet_invoked_event.invoker_did, bob_did);
+    assert_eq!(outlet_invoked_event.status, OutletStatus::Success);
 
-    // Log the ToolInvoked event.
-    let tool_invoked_log_event = sign_event(
-        EventType::ToolInvoked,
+    // Log the OutletInvoked event.
+    let outlet_invoked_log_event = sign_event(
+        EventType::OutletInvoked,
         &bob_did,
         1_000_004,
         4,
-        serde_json::to_vec(&tool_invoked_event).expect("serialize tool event"),
+        serde_json::to_vec(&outlet_invoked_event).expect("serialize outlet event"),
         prev_hash,
         &bob_sk,
     );
-    prev_hash = append_and_hash(&mut alice_log, &tool_invoked_log_event);
-    append_and_hash(&mut bob_log, &tool_invoked_log_event);
+    prev_hash = append_and_hash(&mut alice_log, &outlet_invoked_log_event);
+    append_and_hash(&mut bob_log, &outlet_invoked_log_event);
 
     // -----------------------------------------------------------------------
     // Step 8: Bob attempts to assign a role (he's a member, not admin).
@@ -631,7 +637,7 @@ async fn phase2_end_to_end_integration() {
 
     // Both should have the same event count.
     assert_eq!(alice_checkpoint.event_count, bob_checkpoint.event_count);
-    assert_eq!(alice_checkpoint.event_count, 5); // created, joined, role, msg, tool
+    assert_eq!(alice_checkpoint.event_count, 5); // created, joined, role, msg, outlet
 
     // Merkle roots must match (both saw the same events in the same order).
     assert_eq!(
@@ -779,7 +785,7 @@ async fn phase2_end_to_end_integration() {
     // -----------------------------------------------------------------------
     // Summary: all 12 steps passed.
     //
-    //  1. Alice created identity + context (ceiling, roles, tool, TTL, ephemeral).
+    //  1. Alice created identity + context (ceiling, roles, outlet, TTL, ephemeral).
     //  2. Context assigned to 3 relays.
     //  3. Bob created identity, discovered context, joined.
     //  4. Bob assigned "member" role with UCAN tokens (read, write, invoke).

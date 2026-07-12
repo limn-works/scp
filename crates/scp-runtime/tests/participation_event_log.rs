@@ -179,7 +179,7 @@ fn make_checkpoint(
 
 /// Exercises participation record computation against a checkpoint Merkle root
 /// with 2 participants and 12 events covering `ContextCreated`, `MemberJoined`,
-/// `RoleAssigned`, `MessageSent`, `ToolInvoked`, `GovernanceAction`, `ToolVerified`.
+/// `RoleAssigned`, `MessageSent`, `OutletInvoked`, `GovernanceAction`, `OutletVerified`.
 ///
 /// This is the core assertion of SCP-125 AC6.
 #[tokio::test]
@@ -303,41 +303,41 @@ async fn participation_validation_works_with_checkpointed_log() {
         prev_hash,
     );
 
-    // Event 6: Alice invokes a tool.
+    // Event 6: Alice invokes a outlet.
     prev_hash = append(
         &mut log,
         &mut all_events,
-        EventType::ToolInvoked,
+        EventType::OutletInvoked,
         &did_alice,
         1_000_006,
         6,
-        b"search-tool".to_vec(),
+        b"search-outlet".to_vec(),
         &sk_alice,
         prev_hash,
     );
 
-    // Event 7: Alice invokes the same tool again.
+    // Event 7: Alice invokes the same outlet again.
     prev_hash = append(
         &mut log,
         &mut all_events,
-        EventType::ToolInvoked,
+        EventType::OutletInvoked,
         &did_alice,
         1_000_007,
         7,
-        b"search-tool".to_vec(),
+        b"search-outlet".to_vec(),
         &sk_alice,
         prev_hash,
     );
 
-    // Event 8: Bob invokes a different tool.
+    // Event 8: Bob invokes a different outlet.
     prev_hash = append(
         &mut log,
         &mut all_events,
-        EventType::ToolInvoked,
+        EventType::OutletInvoked,
         &did_bob,
         1_000_008,
         8,
-        b"execute-tool".to_vec(),
+        b"execute-outlet".to_vec(),
         &sk_bob,
         prev_hash,
     );
@@ -356,14 +356,14 @@ async fn participation_validation_works_with_checkpointed_log() {
         prev_hash,
     );
 
-    // Event 10: Alice verifies a tool. ToolVerified no longer feeds
+    // Event 10: Alice verifies a outlet. OutletVerified no longer feeds
     // attestation_history (that is a credential-layer fact, §7.4) — this event
     // exists only to advance the log; attestation_count is sourced from the
     // accessible-attestation arg (empty here ⇒ 0).
     prev_hash = append(
         &mut log,
         &mut all_events,
-        EventType::ToolVerified,
+        EventType::OutletVerified,
         &did_alice,
         1_000_010,
         10,
@@ -416,9 +416,9 @@ async fn participation_validation_works_with_checkpointed_log() {
     // Membership-interval duration: Alice's MemberJoined (1_000_001) is still
     // open at the end ⇒ latest event ts (1_000_011) - 1_000_001 = 10 seconds.
     assert_eq!(record.participation_duration_seconds, 10);
-    // Tool invocations: search-tool x2.
-    assert_eq!(record.tool_invocations.len(), 1);
-    assert_eq!(record.tool_invocations.get("search-tool"), Some(&2));
+    // Outlet invocations: search-outlet x2.
+    assert_eq!(record.outlet_invocations.len(), 1);
+    assert_eq!(record.outlet_invocations.get("search-outlet"), Some(&2));
     // Governance actions by Alice: 1 (targeting Bob).
     assert_eq!(record.governance_actions_by.len(), 1);
     // Governance actions against Alice: 0.
@@ -449,9 +449,12 @@ async fn participation_validation_works_with_checkpointed_log() {
     // Membership-interval duration: Bob's MemberJoined (1_000_002) is still open
     // at the end ⇒ latest event ts (1_000_011) - 1_000_002 = 9 seconds.
     assert_eq!(bob_record.participation_duration_seconds, 9);
-    // Bob's tool invocations: execute-tool x1.
-    assert_eq!(bob_record.tool_invocations.len(), 1);
-    assert_eq!(bob_record.tool_invocations.get("execute-tool"), Some(&1));
+    // Bob's outlet invocations: execute-outlet x1.
+    assert_eq!(bob_record.outlet_invocations.len(), 1);
+    assert_eq!(
+        bob_record.outlet_invocations.get("execute-outlet"),
+        Some(&1)
+    );
     // Bob is the projected target of Alice's adverse governance action.
     assert_eq!(bob_record.governance_actions_against.len(), 1);
     // Bob is the projected subject of the role assignment.

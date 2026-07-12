@@ -118,7 +118,7 @@ def discover(query: str) -> list[dict[str, Any]]:
     Returns:
         A list of result dicts. Each contains ``context_id`` and ``source``
         (``"local"`` / ``"relay"`` / ``"local+relay"``), ``relay_active``,
-        plus optional ``creator_did`` / ``member_count`` / ``tool_count``.
+        plus optional ``creator_did`` / ``member_count`` / ``outlet_count``.
 
     Raises:
         ValidationError: If the query is neither a DID nor an ``scp://`` URI.

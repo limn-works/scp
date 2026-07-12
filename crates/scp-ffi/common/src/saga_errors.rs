@@ -1,6 +1,6 @@
 //! Canonical `SagaError` decomposition shared by all FFI bridges.
 //!
-//! The §6.2.4 cross-context tool-invocation saga reaches one of three typed
+//! The §6.2.4 cross-context outlet-invocation saga reaches one of three typed
 //! terminals on failure (`Aborted` / `NeedsRepair` / `Busy`). Every bridge
 //! (`PyO3`, napi-rs, `UniFFI`) must turn that terminal into its OWN typed
 //! error variant, reading every structured datum STRUCTURALLY off the
@@ -28,7 +28,7 @@
 //! scp-core-dependent shared adapters. Only bridges that build against scp-core
 //! (and therefore drive the `Supervisor`) compile this module.
 //!
-//! Provenance: §6.2.4 (cross-context tool-invocation saga) + ADR-049 §3a
+//! Provenance: §6.2.4 (cross-context outlet-invocation saga) + ADR-049 §3a
 //! (atomic cross-context invocation, `RateLimited { retry_after_ms }` /
 //! `ParticipantUnavailable` / `Rejected` abort reasons, `NeedsRepair`
 //! operator-repair handle).

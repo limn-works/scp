@@ -71,7 +71,7 @@ Every acceptance criterion must be **machine-verifiable**: a test can be written
 | Bad | Why | Good |
 |-----|-----|------|
 | "it works correctly" | Untestable | "POST /api/x returns 200 with a JWT" |
-| "all functions are wired" | Vague quantity | "tool_register, tool_invoke, tool_verify call scp-core pipeline" |
+| "all functions are wired" | Vague quantity | "outlet_register, outlet_invoke, outlet_verify call scp-core pipeline" |
 | "async/await works" | No observable | "at least one async roundtrip test per module compiles and executes" |
 | "handles edge cases" | Which ones? | "rejects expired attestations (returns RenewalError::Expired)" |
 
