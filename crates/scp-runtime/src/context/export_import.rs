@@ -806,6 +806,12 @@ fn strip_snapshot_for_public(snapshot: &ContextSnapshot) -> Result<ContextSnapsh
         // B's freshness/replay cache has no authority on a foreign node and a
         // fresh node starts its own replay window — dropped from the export.
         xctx_nonce_dedup: HashMap::new(),
+        // §7.3.8 value-caveat counters are local-instance economic accounting
+        // with no authority on a foreign node — ALWAYS dropped from the public
+        // export (like the budget tracker and the xctx witnesses). A public
+        // snapshot is never imported back into a live encrypted context, so no
+        // spend/rate window is re-opened by stripping them here.
+        caveat_counters: HashMap::new(),
         // Broadcast per-author keys and block lists are sensitive access-control
         // state; a public-scope export is for pre-join observers, so it is
         // redacted here (mirrors the empty `read_exclusion_list` / `membership`).
@@ -1006,6 +1012,7 @@ mod tests {
             // B's freshness/replay cache has no authority on a foreign node and
             // a fresh node starts its own replay window — dropped from export.
             xctx_nonce_dedup: HashMap::new(),
+            caveat_counters: HashMap::new(),
             broadcast: None,
         }
     }

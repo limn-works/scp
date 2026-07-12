@@ -11763,6 +11763,8 @@ impl Supervisor {
                 xctx_nonce_dedup: scp_protocol::crypto::sender_keys::NonceDedup::with_ttl(
                     crate::context::actor::handlers::saga::SAGA_NONCE_DEDUP_TTL_SECS,
                 ),
+                // §7.3.8 value-caveat counters: a fresh joiner carries none.
+                caveat_counters: HashMap::new(),
             },
             pending_broadcast_publishes: HashMap::new(),
             // Transient join-handshake state; the fused join already consumed

@@ -70,6 +70,55 @@ use scp_did::DID;
 pub type OutletId = String;
 
 // ---------------------------------------------------------------------------
+// CaveatKind
+// ---------------------------------------------------------------------------
+
+/// The three counter-bearing §7.3.8 invocation caveats — the caveats whose
+/// enforcement requires durable per-`(context, ucan_cid)` accounting rather
+/// than a stateless local check.
+///
+/// The stateless caveats (`amount_max_per_call`, `allowed_adapters`,
+/// `allowed_target_dids`, `input_schema`, and the time-box / origin fields)
+/// are checked synchronously by
+/// [`InvocationCaveats::check_invocation_local`](crate::trust::caveats::InvocationCaveats::check_invocation_local)
+/// and are NOT modeled here — they consume no counter capacity.
+///
+/// Each variant maps to a stable wire slug via [`Self::as_str`]; the slugs are
+/// the §7.3.8 caveat field names (`maxCalls`, `amountMaxCumulative`,
+/// `rateWindow`) so error envelopes and persisted diagnostics name the caveat
+/// that fired unambiguously across every SDK.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum CaveatKind {
+    /// Absolute invocation cap (`max_calls`). Every admitted invocation
+    /// consumes one unit of capacity.
+    MaxCalls,
+    /// Cumulative economic ceiling (`amount_max_cumulative`). Each invocation
+    /// consumes its computed cost.
+    AmountCumulative,
+    /// Sliding-window rate cap (`rate_window`). Admission depends on the count
+    /// of timestamps already inside the active window, not on any amount.
+    RateWindow,
+}
+
+impl CaveatKind {
+    /// Returns the stable §7.3.8 wire slug for this caveat kind.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::MaxCalls => "maxCalls",
+            Self::AmountCumulative => "amountMaxCumulative",
+            Self::RateWindow => "rateWindow",
+        }
+    }
+}
+
+impl std::fmt::Display for CaveatKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // TrustError
 // ---------------------------------------------------------------------------
 

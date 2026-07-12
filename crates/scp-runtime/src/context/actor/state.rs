@@ -883,6 +883,27 @@ pub struct ClassSState {
         SagaId,
         crate::context::supervisor::saga_prepared_state::CallerReservationRecord,
     >,
+
+    /// §7.3.8 value-caveat runtime enforcement counters, keyed by the
+    /// invocation-authorizing UCAN's CID. One [`CaveatCounters`] record per
+    /// delegation holds the durable `max_calls` / `amount_max_cumulative` /
+    /// `rate_window` accounting the local synchronous caveat check
+    /// ([`InvocationCaveats::check_invocation_local`](scp_protocol::trust::caveats::InvocationCaveats::check_invocation_local))
+    /// cannot enforce on its own.
+    ///
+    /// **Class S — consumed capacity must NEVER un-consume.** A committed
+    /// consume rides the fail-closed Class-S persist (ADR-049 §9): it is
+    /// mutated ONLY inside a `commit_class_s_keep`-family closure, so a ≤50 ms
+    /// coalesce-window crash after the caller observed the invocation succeed
+    /// cannot roll the consume back and re-open the spend/rate window. The
+    /// `class_c_view()` (coalesced best-effort) path MUST NOT touch this map.
+    ///
+    /// **Not a `NonceDedup`-style bounded cache.** Entries accumulate one per
+    /// distinct invocation-authorizing UCAN CID observed in this context;
+    /// whole-token revocation is the eviction seam (a later slice). Same-node
+    /// restore rehydrates the map; cross-node public export strips it (a
+    /// foreign node starts its own accounting) — see the snapshot wiring.
+    pub(crate) caveat_counters: HashMap<String, crate::trust::caveat_counters::CaveatCounters>,
 }
 
 /// Lossless, `Clone`-able mirror of [`ClassSState`] (ADR-049 §9).
@@ -920,6 +941,9 @@ pub struct ClassSStateSnapshot {
         SagaId,
         crate::context::supervisor::saga_prepared_state::CallerReservationRecord,
     >,
+    /// Mirror of [`ClassSState::caveat_counters`]. [`CaveatCounters`] is
+    /// `Clone`, so this snapshots by direct clone (no projection needed).
+    pub(crate) caveat_counters: HashMap<String, crate::trust::caveat_counters::CaveatCounters>,
 }
 
 #[allow(
@@ -948,6 +972,7 @@ impl ClassSState {
             xctx_committed_outputs: self.xctx_committed_outputs.clone(),
             xctx_committed_invocations: self.xctx_committed_invocations.clone(),
             xctx_caller_reservations: self.xctx_caller_reservations.clone(),
+            caveat_counters: self.caveat_counters.clone(),
         }
     }
 
@@ -967,6 +992,7 @@ impl ClassSState {
         self.xctx_committed_outputs = snap.xctx_committed_outputs;
         self.xctx_committed_invocations = snap.xctx_committed_invocations;
         self.xctx_caller_reservations = snap.xctx_caller_reservations;
+        self.caveat_counters = snap.caveat_counters;
     }
 }
 
@@ -1446,6 +1472,7 @@ impl PerContextState {
                 xctx_committed_outputs: HashMap::new(),
                 xctx_committed_invocations: std::collections::HashSet::new(),
                 xctx_caller_reservations: std::collections::HashMap::new(),
+                caveat_counters: HashMap::new(),
             },
             pending_broadcast_publishes: HashMap::new(),
             welcome_scratchpad: None,
@@ -1715,6 +1742,7 @@ mod tests {
             xctx_committed_outputs,
             xctx_committed_invocations,
             xctx_caller_reservations,
+            caveat_counters,
         } = class_s;
 
         // Identity + lifetime.
@@ -1783,6 +1811,8 @@ mod tests {
         assert!(xctx_committed_invocations.is_empty());
         // No in-flight caller-side cross-context reservations on a fresh context.
         assert!(xctx_caller_reservations.is_empty());
+        // No §7.3.8 caveat counters recorded on a fresh context.
+        assert!(caveat_counters.is_empty());
         assert!(pending_broadcast_publishes.is_empty());
         assert!(welcome_scratchpad.is_none());
         assert_eq!(lifecycle_state, ContextLifecycleState::Open);
@@ -1837,6 +1867,7 @@ mod tests {
                     xctx_committed_outputs: _,
                     xctx_committed_invocations: _,
                     xctx_caller_reservations: _,
+                    caveat_counters: _,
                 },
             pending_broadcast_publishes: _,
             welcome_scratchpad: _,

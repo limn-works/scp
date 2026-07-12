@@ -1606,6 +1606,8 @@ pub async fn create_context(
             xctx_nonce_dedup: scp_protocol::crypto::sender_keys::NonceDedup::with_ttl(
                 crate::context::actor::handlers::saga::SAGA_NONCE_DEDUP_TTL_SECS,
             ),
+            // §7.3.8 value-caveat counters: fresh on create.
+            caveat_counters: HashMap::new(),
         },
         pending_broadcast_publishes: HashMap::new(),
         welcome_scratchpad: None,
@@ -2468,6 +2470,8 @@ pub async fn import_context(
             xctx_nonce_dedup: scp_protocol::crypto::sender_keys::NonceDedup::with_ttl(
                 crate::context::actor::handlers::saga::SAGA_NONCE_DEDUP_TTL_SECS,
             ),
+            // §7.3.8 value-caveat counters: fresh on create.
+            caveat_counters: HashMap::new(),
         },
         pending_broadcast_publishes: HashMap::new(),
         welcome_scratchpad: None,
@@ -3058,6 +3062,14 @@ pub async fn restore_context(
             // abort can reverse the caller deduction + void the escrow from the
             // record. Dropped on cross-node import (caller economy is local).
             xctx_caller_reservations: ctx_snapshot.xctx_caller_reservations,
+            // §7.3.8 Class S: same-node restore REHYDRATES the value-caveat
+            // counters so a consumed `max_calls` / `amount_max_cumulative` /
+            // `rate_window` cap survives a crash rather than un-consuming (which
+            // would re-open the spend/rate window). Pruning of the rate-window
+            // ring buffer runs lazily on the next consume against the restored
+            // wall clock, so a restart can only ever DROP stale timestamps —
+            // never widen a window. Cross-node public export strips this map.
+            caveat_counters: ctx_snapshot.caveat_counters,
         },
         pending_broadcast_publishes: HashMap::new(),
         welcome_scratchpad: None,
