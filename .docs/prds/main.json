@@ -4192,7 +4192,7 @@
       "sources": [
         {
           "file": ".docs/adrs/phase-4.md",
-          "section": "## ADR-020: Tool-Interface Discovery"
+          "section": "## ADR-020: Outlet-Interface Discovery"
         }
       ],
       "details": {
@@ -4260,7 +4260,7 @@
       "sources": [
         {
           "file": ".docs/adrs/phase-4.md",
-          "section": "## ADR-020: Tool-Interface Discovery"
+          "section": "## ADR-020: Outlet-Interface Discovery"
         }
       ],
       "details": {
@@ -4309,7 +4309,7 @@
       "sources": [
         {
           "file": ".docs/adrs/phase-4.md",
-          "section": "## ADR-020: Tool-Interface Discovery"
+          "section": "## ADR-020: Outlet-Interface Discovery"
         }
       ],
       "details": {
@@ -4348,7 +4348,7 @@
       "sources": [
         {
           "file": ".docs/adrs/phase-4.md",
-          "section": "## ADR-020: Tool-Interface Discovery"
+          "section": "## ADR-020: Outlet-Interface Discovery"
         }
       ],
       "details": {
