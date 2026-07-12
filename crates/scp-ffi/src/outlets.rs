@@ -520,16 +520,18 @@ fn outlet_invoke_impl(
     // owned Class-S counters to this invocation delegation's revocation CID.
     let invocation_ucan_token =
         scp_core::crypto::ucan::validate::parse_ucan(ucan_token).map_err(|e| {
-            ScpPyError::ucan(format!("invalid invocation UCAN for outlet '{outlet_id}': {e}"))
+            ScpPyError::ucan(format!(
+                "invalid invocation UCAN for outlet '{outlet_id}': {e}"
+            ))
         })?;
     let effective_caveats = {
         use scp_core::crypto::ucan::validate::CaveatResolver as _;
         scp_core::crypto::ucan::validate::TokenNbCaveatResolver
             .resolve_caveats(&invocation_ucan_token)
     };
-    let invocation_ucan_cid = effective_caveats
-        .as_ref()
-        .map(|_| scp_core::crypto::ucan::revoke::compute_revocation_cid(&invocation_ucan_token.encoded));
+    let invocation_ucan_cid = effective_caveats.as_ref().map(|_| {
+        scp_core::crypto::ucan::revoke::compute_revocation_cid(&invocation_ucan_token.encoded)
+    });
 
     // Snapshot the bridge-owned outlet registry and (optionally) the
     // registered handler closure BEFORE entering the runtime call. The

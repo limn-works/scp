@@ -676,9 +676,8 @@ pub async fn reserve_outlet_economy(
         // the correct fail-closed behaviour (cross-context targets are a later
         // slice).
         if let Some(caveats) = effective_caveats {
-            let negotiated_adapter: Option<PaymentAdapterRef> = payment_adapter
-                .as_ref()
-                .map(|a| a.adapter_id().to_owned());
+            let negotiated_adapter: Option<PaymentAdapterRef> =
+                payment_adapter.as_ref().map(|a| a.adapter_id().to_owned());
             if let Err(err) = caveats.check_invocation_local(
                 input,
                 action_cost,
@@ -2130,14 +2129,32 @@ mod tests {
         fn consume_caveat_counters_isolates_per_ucan_cid() {
             let mut counters: HashMap<String, CaveatCounters> = HashMap::new();
             let caveats = max_calls_caveats(1);
-            super::super::consume_caveat_counters(&mut counters, "cid-a", &caveats, Amount::new(0), 1)
-                .expect("cid-a first admits");
-            super::super::consume_caveat_counters(&mut counters, "cid-b", &caveats, Amount::new(0), 1)
-                .expect("cid-b is independent and admits");
+            super::super::consume_caveat_counters(
+                &mut counters,
+                "cid-a",
+                &caveats,
+                Amount::new(0),
+                1,
+            )
+            .expect("cid-a first admits");
+            super::super::consume_caveat_counters(
+                &mut counters,
+                "cid-b",
+                &caveats,
+                Amount::new(0),
+                1,
+            )
+            .expect("cid-b is independent and admits");
             assert_eq!(counters["cid-a"].max_calls_used, 1);
             assert_eq!(counters["cid-b"].max_calls_used, 1);
-            super::super::consume_caveat_counters(&mut counters, "cid-a", &caveats, Amount::new(0), 1)
-                .expect_err("cid-a second exceeds its cap");
+            super::super::consume_caveat_counters(
+                &mut counters,
+                "cid-a",
+                &caveats,
+                Amount::new(0),
+                1,
+            )
+            .expect_err("cid-a second exceeds its cap");
             assert_eq!(
                 counters["cid-b"].max_calls_used, 1,
                 "cid-b must be unaffected by cid-a's exhaustion"
@@ -2151,8 +2168,14 @@ mod tests {
         fn consume_caveat_counters_maps_exhaustion_to_authorization_slug() {
             let mut counters: HashMap<String, CaveatCounters> = HashMap::new();
             let caveats = max_calls_caveats(1);
-            super::super::consume_caveat_counters(&mut counters, "cid", &caveats, Amount::new(0), 1)
-                .expect("first admits");
+            super::super::consume_caveat_counters(
+                &mut counters,
+                "cid",
+                &caveats,
+                Amount::new(0),
+                1,
+            )
+            .expect("first admits");
             let err = super::super::consume_caveat_counters(
                 &mut counters,
                 "cid",
@@ -2374,13 +2397,26 @@ mod tests {
             let caveats = max_calls_caveats(1);
             let cid = "cid-mc";
             let input = serde_json::json!({});
-            reserve_step(&mut cell, &deps, Some(&caveats), Some(cid), &input, 1_700_000_100)
-                .await
-                .expect("first invocation within max_calls=1 must admit");
-            let err =
-                reserve_step(&mut cell, &deps, Some(&caveats), Some(cid), &input, 1_700_000_101)
-                    .await
-                    .expect_err("second invocation must exceed max_calls=1");
+            reserve_step(
+                &mut cell,
+                &deps,
+                Some(&caveats),
+                Some(cid),
+                &input,
+                1_700_000_100,
+            )
+            .await
+            .expect("first invocation within max_calls=1 must admit");
+            let err = reserve_step(
+                &mut cell,
+                &deps,
+                Some(&caveats),
+                Some(cid),
+                &input,
+                1_700_000_101,
+            )
+            .await
+            .expect_err("second invocation must exceed max_calls=1");
             assert!(
                 format!("{err}").contains("maxCalls"),
                 "reject must name the maxCalls caveat: {err}"
@@ -2403,12 +2439,26 @@ mod tests {
 
             let mut cell = ClassSCell::new(active_state());
             let caveats = max_calls_caveats(1);
-            reserve_step(&mut cell, &deps, Some(&caveats), Some("cid-src"), &input, 1_700_000_100)
-                .await
-                .expect("admit");
-            reserve_step(&mut cell, &deps, Some(&caveats), Some("cid-src"), &input, 1_700_000_101)
-                .await
-                .expect_err("cap enforced when sourced from the invocation caveats");
+            reserve_step(
+                &mut cell,
+                &deps,
+                Some(&caveats),
+                Some("cid-src"),
+                &input,
+                1_700_000_100,
+            )
+            .await
+            .expect("admit");
+            reserve_step(
+                &mut cell,
+                &deps,
+                Some(&caveats),
+                Some("cid-src"),
+                &input,
+                1_700_000_101,
+            )
+            .await
+            .expect_err("cap enforced when sourced from the invocation caveats");
 
             let mut cell2 = ClassSCell::new(active_state());
             for i in 0..3 {
@@ -2464,7 +2514,9 @@ mod tests {
                 1_700_000_101,
             )
             .await
-            .expect("conforming input within max_calls=1 must admit — the rejected call spent nothing");
+            .expect(
+                "conforming input within max_calls=1 must admit — the rejected call spent nothing",
+            );
             assert_eq!(
                 cell.class_s.caveat_counters[cid].max_calls_used, 1,
                 "the single slot was consumed only by the conforming call"
@@ -2484,13 +2536,26 @@ mod tests {
             });
             let cid = "cid-rw";
             let input = serde_json::json!({});
-            reserve_step(&mut cell, &deps, Some(&caveats), Some(cid), &input, 1_700_000_100)
-                .await
-                .expect("first within the rate window admits");
-            let err =
-                reserve_step(&mut cell, &deps, Some(&caveats), Some(cid), &input, 1_700_000_101)
-                    .await
-                    .expect_err("second within the same window exceeds max=1");
+            reserve_step(
+                &mut cell,
+                &deps,
+                Some(&caveats),
+                Some(cid),
+                &input,
+                1_700_000_100,
+            )
+            .await
+            .expect("first within the rate window admits");
+            let err = reserve_step(
+                &mut cell,
+                &deps,
+                Some(&caveats),
+                Some(cid),
+                &input,
+                1_700_000_101,
+            )
+            .await
+            .expect_err("second within the same window exceeds max=1");
             assert!(
                 format!("{err}").contains("rateWindow"),
                 "reject must name the rateWindow caveat: {err}"

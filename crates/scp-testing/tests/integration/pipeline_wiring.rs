@@ -742,12 +742,20 @@ fn send_message_calls_seal() {
 #[test]
 fn reserve_outlet_economy_enforces_value_caveats() {
     assert!(
-        fn_body_contains(MANAGER_SRC, "reserve_outlet_economy", "check_invocation_local"),
+        fn_body_contains(
+            MANAGER_SRC,
+            "reserve_outlet_economy",
+            "check_invocation_local"
+        ),
         "reserve_outlet_economy must run the §7.3.8 synchronous local caveat \
          check (check_invocation_local) before consuming counter capacity"
     );
     assert!(
-        fn_body_contains(MANAGER_SRC, "reserve_outlet_economy", "consume_caveat_counters"),
+        fn_body_contains(
+            MANAGER_SRC,
+            "reserve_outlet_economy",
+            "consume_caveat_counters"
+        ),
         "reserve_outlet_economy must consume the counter-bearing §7.3.8 caveats \
          (consume_caveat_counters)"
     );

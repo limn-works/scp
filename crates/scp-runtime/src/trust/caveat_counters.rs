@@ -300,7 +300,13 @@ mod tests {
         let err = c
             .try_consume(CaveatKind::MaxCalls, 1, 5, 0, 0)
             .expect_err("6th increment must reject");
-        assert_eq!(err, CounterExhausted::MaxCalls { would_be: 6, cap: 5 });
+        assert_eq!(
+            err,
+            CounterExhausted::MaxCalls {
+                would_be: 6,
+                cap: 5
+            }
+        );
         // Rejection did not mutate the counter.
         assert_eq!(c.max_calls_used, 5);
     }

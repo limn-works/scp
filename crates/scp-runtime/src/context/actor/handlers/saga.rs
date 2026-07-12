@@ -529,26 +529,26 @@ async fn prepare_a(
     )
     .await
     {
-            Ok(reservation) => reservation,
-            Err(err) => {
-                // reserve_outlet_economy rolls back its OWN staged bookkeeping on
-                // every failure branch, so no escrow/velocity/budget leaked — and
-                // its Class-S state is rolled back too, leaving nothing security-
-                // critical to durably land here. The §6.2.0.2 budget consumed above
-                // is NOT rolled back (non-refundable at initiation); persist so it
-                // durably lands, then reply. This is an already-failing terminal
-                // error: no success is acked and the only durable state is the soft
-                // Class-C anti-spam window increment, so best-effort — not fail-
-                // closed — is the honest intent; a persist failure just records the
-                // metric. `persist_state_best_effort` takes a SHARED
-                // `&PerContextState`, so this reads through the cell's `Deref`
-                // (`&*cell`) — no `state_mut()`.
-                persist_state_best_effort(&*cell, deps, &context_id_hex).await;
-                let sketch = outcome_error_sketch(&err);
-                let _ = reply.send(Err(err));
-                return Outcome::err_mutated(sketch);
-            }
-        };
+        Ok(reservation) => reservation,
+        Err(err) => {
+            // reserve_outlet_economy rolls back its OWN staged bookkeeping on
+            // every failure branch, so no escrow/velocity/budget leaked — and
+            // its Class-S state is rolled back too, leaving nothing security-
+            // critical to durably land here. The §6.2.0.2 budget consumed above
+            // is NOT rolled back (non-refundable at initiation); persist so it
+            // durably lands, then reply. This is an already-failing terminal
+            // error: no success is acked and the only durable state is the soft
+            // Class-C anti-spam window increment, so best-effort — not fail-
+            // closed — is the honest intent; a persist failure just records the
+            // metric. `persist_state_best_effort` takes a SHARED
+            // `&PerContextState`, so this reads through the cell's `Deref`
+            // (`&*cell`) — no `state_mut()`.
+            persist_state_best_effort(&*cell, deps, &context_id_hex).await;
+            let sketch = outcome_error_sketch(&err);
+            let _ = reply.send(Err(err));
+            return Outcome::err_mutated(sketch);
+        }
+    };
 
     // 4. Stage the DURABLE caller-reservation reversal record (spec §6.2.4
     //    "Reservation release on every terminal path"), keyed by `SagaId`,
