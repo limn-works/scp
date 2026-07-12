@@ -618,7 +618,7 @@ Swift 6.2 with `SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor` is the baseline, maki
 
 Implement the Swift SDK as the `SCP` Swift package at `bindings/swift/`. The package imports `ScpFFI.xcframework` (UniFFI-generated binary), re-exports it through `Sources/SCP/Internal/ScpBindings.swift`, and builds a pure Swift ergonomics layer in `Sources/SCP/`. The top-level entry point is `SCP` — an actor that initializes the identity and injects the Apple platform adapter. `SCPContext` is the primary interactive type — an actor exposing `AsyncStream<Message>` for streaming and a `close()` / `deinit` lifecycle.
 
-Actor isolation follows the Swift 6.2 approachable concurrency rules: data carrier types (`Message`, `DIDDocument`, `ToolDefinition`) are `nonisolated struct` and `Sendable` by definition. Interactive types (`SCP`, `SCPContext`, `SCPIdentity`) are custom actors. `SCPEventLog` and `SCPTransport` are `nonisolated` since they have no mutable state after construction. `SwiftUI` observation uses `@Observable` for SCP state containers (Swift 5.9+). Streaming uses `AsyncStream<Message>` (not Combine) — the right choice for Swift 6 structured concurrency. The SPM package is configured as a binary framework target with XCFramework checksum verification.
+Actor isolation follows the Swift 6.2 approachable concurrency rules: data carrier types (`Message`, `DIDDocument`, `OutletDefinition`) are `nonisolated struct` and `Sendable` by definition. Interactive types (`SCP`, `SCPContext`, `SCPIdentity`) are custom actors. `SCPEventLog` and `SCPTransport` are `nonisolated` since they have no mutable state after construction. `SwiftUI` observation uses `@Observable` for SCP state containers (Swift 5.9+). Streaming uses `AsyncStream<Message>` (not Combine) — the right choice for Swift 6 structured concurrency. The SPM package is configured as a binary framework target with XCFramework checksum verification.
 
 ### Rationale
 
@@ -626,7 +626,7 @@ Actor isolation follows the Swift 6.2 approachable concurrency rules: data carri
 - **`AsyncStream<Message>` over Combine:** Swift 6 strict concurrency treats Combine as a compatibility layer, not the forward path. `AsyncStream` integrates naturally with `for await` loops, structured concurrency cancellation, and `TaskGroup`. It requires zero imported frameworks and works identically on iOS, macOS, and in Swift package tests. Combine's `Publisher` → `AsyncSequence` bridging adds indirection without benefit.
 - **`@Observable` for SwiftUI state:** The `@Observable` macro (Swift 5.9+, iOS 17+) tracks property access at the granularity of individual properties rather than the whole object. This means `SCPContextState` annotated with `@Observable` triggers minimal view updates when only `memberCount` changes, not when `lastMessage` changes. Property wrappers like `@Published` (Combine) are legacy in this context.
 - **`deinit` + explicit `close()` for resource cleanup:** SCP contexts hold live crypto state (MLS group keys, sender AES-256 keys) that must be zeroed on deallocation. `close()` is the user-visible method for graceful teardown (leave the MLS group, flush the event log, close the transport connection). `deinit` is the safety net — it schedules a `Task { try? await close() }` to prevent resource leaks when a context object is dropped without explicit close. This matches the `Symbol.asyncDispose` pattern in the TypeScript SDK.
-- **`nonisolated struct` for DTOs:** Data carrier types (`Message`, `DIDDocument`, `ToolDefinition`, `Provenance`) are value types with no mutable state after construction. Marking them `nonisolated struct` makes all members inherit nonisolated context, satisfying Swift 6 `Sendable` without `@unchecked Sendable`. They cross actor boundaries freely as `Sendable` values.
+- **`nonisolated struct` for DTOs:** Data carrier types (`Message`, `DIDDocument`, `OutletDefinition`, `Provenance`) are value types with no mutable state after construction. Marking them `nonisolated struct` makes all members inherit nonisolated context, satisfying Swift 6 `Sendable` without `@unchecked Sendable`. They cross actor boundaries freely as `Sendable` values.
 - **`SCP.create()` as async factory, not `init`:** The identity initialization path (`identity_create()`) is async (involves key generation and DID registration). Swift actors cannot have `async init`. The factory pattern `await SCP.create()` is the idiomatic solution. `ApplePlatformAdapter.make()` is injected at creation time — the caller controls custody.
 - **SPM binary framework target:** XCFramework binary distribution via SPM `binaryTarget` with checksum verification gives consumers a single `Package.swift` dependency with no Rust toolchain requirement. Swift compiler verifies the binary against the declared checksum on resolution.
 - **Flat delegation pattern — no logic in Swift:** Every Swift SDK method calls exactly one UniFFI bridge function. Zero protocol logic lives in the Swift layer. This prevents divergence between the Rust engine and the Swift surface and ensures one implementation of every operation.
@@ -649,7 +649,7 @@ bindings/swift/
       SCP.swift                       # SCP actor — top-level entry point, identity + transport init
       Identity.swift                  # SCPIdentity actor, DIDDocument struct
       Context.swift                   # SCPContext actor, AsyncStream<Message>, lifecycle
-      Tools.swift                     # ToolDefinition, TestVector, OutletVerificationResult structs
+      Outlets.swift                     # OutletDefinition, TestVector, OutletVerificationResult structs
       Trust.swift                     # evaluateTrust(), TrustEvaluation struct
       EventLog.swift                  # SCPEventLog class (nonisolated), Event, Proof, Checkpoint
       Transport.swift                 # TransportConfig struct, transport connection helpers
@@ -669,7 +669,7 @@ bindings/swift/
     SCPTests/
       IdentityTests.swift
       ContextTests.swift
-      ToolsTests.swift
+      OutletsTests.swift
       UcanTests.swift
       TransportTests.swift
       EventLogTests.swift
@@ -801,7 +801,7 @@ public actor SCPIdentity {
 **`SCPContext` actor:**
 
 ```swift
-/// An active SCP context. Send messages, receive streams, invoke tools.
+/// An active SCP context. Send messages, receive streams, invoke outlets.
 /// Always `close()` when done. `deinit` schedules close as a safety net.
 public actor SCPContext {
     public let contextId: String
@@ -896,7 +896,7 @@ public enum ScpError: Error, Sendable {
     case permission(message: String, code: String)
     case crypto(message: String, code: String)
     case transport(message: String, code: String)
-    case tool(message: String, code: String)
+    case outlet(message: String, code: String)
     case validation(message: String, code: String)
 }
 
@@ -908,7 +908,7 @@ extension ScpError: LocalizedError {
         case .permission(let message, _): return message
         case .crypto(let message, _): return message
         case .transport(let message, _): return message
-        case .tool(let message, _): return message
+        case .outlet(let message, _): return message
         case .validation(let message, _): return message
         }
     }
@@ -920,7 +920,7 @@ extension ScpError: LocalizedError {
         case .permission(_, let code): return code
         case .crypto(_, let code): return code
         case .transport(_, let code): return code
-        case .tool(_, let code): return code
+        case .outlet(_, let code): return code
         case .validation(_, let code): return code
         }
     }
@@ -935,7 +935,7 @@ extension ScpError {
         case .permission(let message, let code): self = .permission(message: message, code: code)
         case .crypto(let message, let code): self = .crypto(message: message, code: code)
         case .transport(let message, let code): self = .transport(message: message, code: code)
-        case .tool(let message, let code): self = .tool(message: message, code: code)
+        case .outlet(let message, let code): self = .outlet(message: message, code: code)
         case .validation(let message, let code): self = .validation(message: message, code: code)
         }
     }
@@ -967,28 +967,28 @@ public nonisolated struct Message: Sendable {
 /// Context creation parameters.
 public nonisolated struct ContextParams: Sendable {
     public let ceiling: [String]
-    public let tools: [ToolDefinition]
+    public let outlets: [OutletDefinition]
     public let governance: GovernanceModel
     public let ttl: TimeInterval?
     public let memoryScope: MemoryScope
 
     public init(
         ceiling: [String],
-        tools: [ToolDefinition] = [],
+        outlets: [OutletDefinition] = [],
         governance: GovernanceModel = .singleAdmin,
         ttl: TimeInterval? = nil,
         memoryScope: MemoryScope = .full
     ) {
         self.ceiling = ceiling
-        self.tools = tools
+        self.outlets = outlets
         self.governance = governance
         self.ttl = ttl
         self.memoryScope = memoryScope
     }
 }
 
-/// A registered SCP tool definition.
-public nonisolated struct ToolDefinition: Sendable {
+/// A registered SCP outlet definition.
+public nonisolated struct OutletDefinition: Sendable {
     public let name: String
     public let description: String
     public let inputSchema: String      // JSON Schema string
@@ -1162,10 +1162,10 @@ private func makeMessageStream(handle: ContextHandle) -> AsyncStream<Message> {
    - `validateUcan(token:capability:contextId:)` throws `ScpError.permission` for an invalid or expired token.
    - `revokeUcan(identity:tokenId:)` does not throw for a valid token ID.
 
-8. **Tool operations:**
+8. **Outlet operations:**
 
    ```swift
-   let toolId = try await context.registerTool(ToolDefinition(
+   let outletId = try await context.registerTool(OutletDefinition(
        name: "summarize",
        description: "Summarize text",
        inputSchema: #"{"type":"object","properties":{"text":{"type":"string"}}}"#,
@@ -1174,7 +1174,7 @@ private func makeMessageStream(handle: ContextHandle) -> AsyncStream<Message> {
        testVectors: nil,
        implementationHash: nil
    ))
-   #expect(toolId.hasPrefix("tool-"))
+   #expect(outletId.hasPrefix("outlet-"))
    ```
 
 9. **Event log queries:**
@@ -1239,7 +1239,7 @@ private func makeMessageStream(handle: ContextHandle) -> AsyncStream<Message> {
 | `Sources/SCP/SCP.swift` | `SCP` actor — top-level entry point, `create()` factory, `createContext()`, `joinContext()` |
 | `Sources/SCP/Identity.swift` | `SCPIdentity` actor — DID, `load()`, `resolve()`, `rotateKey()` |
 | `Sources/SCP/Context.swift` | `SCPContext` actor — `send()`, `messages` stream, `invoke()`, `registerTool()`, `leave()`, `close()`, `deinit` |
-| `Sources/SCP/Tools.swift` | `ToolDefinition`, `TestVector`, `OutletVerificationResult` nonisolated structs |
+| `Sources/SCP/Outlets.swift` | `OutletDefinition`, `TestVector`, `OutletVerificationResult` nonisolated structs |
 | `Sources/SCP/Trust.swift` | `evaluateTrust()`, `TrustEvaluation` struct |
 | `Sources/SCP/EventLog.swift` | `SCPEventLog` (nonisolated class), `Event`, `Proof`, `Checkpoint` structs |
 | `Sources/SCP/Transport.swift` | `TransportConfig` struct, transport connection helpers |

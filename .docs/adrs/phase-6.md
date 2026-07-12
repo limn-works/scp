@@ -566,7 +566,7 @@ Implement the Kotlin SDK as the `works.limn:scp-kt` package at `bindings/kotlin/
 
 **Package:** `bindings/kotlin/` published as `works.limn:scp-kt` on Maven Central.
 
-**Dependencies from UniFFI:** `identityCreate()`, `identityLoad()`, `identityResolve()`, `contextCreate()`, `contextJoin()`, `contextLeave()`, `contextClose()`, `contextSend()`, `contextSubscribe()` (callback interface), `toolRegister()`, `toolInvoke()`, `toolVerify()`, `ucanValidate()`, `ucanMint()`, `ucanRevoke()`, `eventLogQuery()`, `eventLogVerify()`, `transportConnect()`, `transportStatus()`, and the `ScpError` enum — all from `internal/NativeLib.kt`.
+**Dependencies from UniFFI:** `identityCreate()`, `identityLoad()`, `identityResolve()`, `contextCreate()`, `contextJoin()`, `contextLeave()`, `contextClose()`, `contextSend()`, `contextSubscribe()` (callback interface), `outletRegister()`, `outletInvoke()`, `outletVerify()`, `ucanValidate()`, `ucanMint()`, `ucanRevoke()`, `eventLogQuery()`, `eventLogVerify()`, `transportConnect()`, `transportStatus()`, and the `ScpError` enum — all from `internal/NativeLib.kt`.
 
 **File layout:**
 
@@ -581,7 +581,7 @@ bindings/kotlin/
         Scp.kt                             # Scp class — top-level entry point, factory, context creation
         Identity.kt                        # Identity class, DIDDocument data class
         Context.kt                         # Context class, Flow<Message>, AutoCloseable lifecycle
-        Tools.kt                           # ToolDefinition, TestVector data classes
+        Outlets.kt                           # OutletDefinition, TestVector data classes
         Trust.kt                           # evaluateTrust(), TrustEvaluation data class
         EventLog.kt                        # EventLog class, Event, Proof, Checkpoint data classes
         Transport.kt                       # TransportConfig data class, transport helpers
@@ -601,7 +601,7 @@ bindings/kotlin/
       test/kotlin/works/limn/scp/
         IdentityTest.kt
         ContextTest.kt
-        ToolsTest.kt
+        OutletsTest.kt
         UcanTest.kt
         TransportTest.kt
         EventLogTest.kt
@@ -755,7 +755,7 @@ data class DIDDocument(
 
 ```kotlin
 /**
- * An active SCP context. Send messages, receive streams, invoke tools.
+ * An active SCP context. Send messages, receive streams, invoke outlets.
  * Always call close() when done. Use the use { } block or DisposableEffect in Compose.
  */
 class Context internal constructor(internal val handle: ContextHandle) : AutoCloseable {
@@ -790,14 +790,14 @@ class Context internal constructor(internal val handle: ContextHandle) : AutoClo
         awaitClose { handle.unsubscribe() }
     }.buffer(Channel.BUFFERED)
 
-    /** Invoke a registered tool in this context. Returns the tool output as JSON. */
-    suspend fun invokeTool(toolId: String, inputJson: String): String = withContext(Dispatchers.IO) {
-        handle.invokeTool(toolId, inputJson)
+    /** Invoke a registered outlet in this context. Returns the outlet output as JSON. */
+    suspend fun invokeOutlet(outletId: String, inputJson: String): String = withContext(Dispatchers.IO) {
+        handle.invokeOutlet(outletId, inputJson)
     }
 
-    /** Register a tool in this context. Returns the assigned tool ID. */
-    suspend fun registerTool(definition: ToolDefinition): String = withContext(Dispatchers.IO) {
-        handle.registerTool(definition.toRecord())
+    /** Register a outlet in this context. Returns the assigned outlet ID. */
+    suspend fun registerOutlet(definition: OutletDefinition): String = withContext(Dispatchers.IO) {
+        handle.registerOutlet(definition.toRecord())
     }
 
     /** Leave this context gracefully (member action). */
@@ -841,7 +841,7 @@ open class ScpException(
             is ScpError.Permission -> PermissionException(error.message, error.code)
             is ScpError.Crypto -> CryptoException(error.message, error.code)
             is ScpError.Transport -> TransportException(error.message, error.code)
-            is ScpError.Tool -> ToolException(error.message, error.code)
+            is ScpError.Outlet -> OutletException(error.message, error.code)
             is ScpError.Validation -> ValidationException(error.message, error.code)
         }
     }
@@ -852,7 +852,7 @@ class ContextException(message: String, code: String) : ScpException(message, co
 class PermissionException(message: String, code: String) : ScpException(message, code)
 class CryptoException(message: String, code: String) : ScpException(message, code)
 class TransportException(message: String, code: String) : ScpException(message, code)
-class ToolException(message: String, code: String) : ScpException(message, code)
+class OutletException(message: String, code: String) : ScpException(message, code)
 class ValidationException(message: String, code: String) : ScpException(message, code)
 ```
 
@@ -902,7 +902,7 @@ data class Message(
 /** Context creation parameters. */
 data class ContextParams(
     val ceiling: List<String>,
-    val tools: List<ToolDefinition> = emptyList(),
+    val outlets: List<OutletDefinition> = emptyList(),
     val governance: String = "single_admin",
     val ttlMs: Long? = null,
     val memoryScope: String = "full",
@@ -1159,17 +1159,17 @@ dependencies {
    - `ucanValidate(token, capability, contextId)` throws `PermissionException` for an invalid or expired token.
    - `ucanRevoke(identity, tokenId)` does not throw for a valid token ID.
 
-9. **Tool operations:**
+9. **Outlet operations:**
 
    ```kotlin
-   val toolId = context.registerTool(ToolDefinition(
+   val outletId = context.registerOutlet(OutletDefinition(
        name = "summarize",
        description = "Summarize text",
        inputSchema = mapOf("type" to "object", "properties" to mapOf("text" to mapOf("type" to "string"))),
        outputSchema = mapOf("type" to "object", "properties" to mapOf("summary" to mapOf("type" to "string"))),
        operator = scp.identity.did,
    ))
-   assertTrue(toolId.startsWith("tool-"))
+   assertTrue(outletId.startsWith("outlet-"))
    ```
 
 10. **Event log queries:**
@@ -1229,8 +1229,8 @@ dependencies {
 | `scp-kt/build.gradle.kts` | Gradle module build — dependencies, publishing, signing, ktlint, detekt |
 | `src/main/kotlin/works/limn/scp/Scp.kt` | `Scp` class — top-level entry point, `create()` factory, `createContext()`, `joinContext()` |
 | `src/main/kotlin/works/limn/scp/Identity.kt` | `Identity` class — `did`, `custodyType`, `load()`, `resolve()`, `rotateKey()`; `DIDDocument` data class |
-| `src/main/kotlin/works/limn/scp/Context.kt` | `Context` class — `send()`, `receiveFlow()`, `invokeTool()`, `registerTool()`, `leave()`, `closeContext()`, `AutoCloseable` |
-| `src/main/kotlin/works/limn/scp/Tools.kt` | `ToolDefinition`, `TestVector`, `OutletVerificationResult` data classes |
+| `src/main/kotlin/works/limn/scp/Context.kt` | `Context` class — `send()`, `receiveFlow()`, `invokeOutlet()`, `registerOutlet()`, `leave()`, `closeContext()`, `AutoCloseable` |
+| `src/main/kotlin/works/limn/scp/Outlets.kt` | `OutletDefinition`, `TestVector`, `OutletVerificationResult` data classes |
 | `src/main/kotlin/works/limn/scp/Trust.kt` | `evaluateTrust()`, `TrustEvaluation` data class |
 | `src/main/kotlin/works/limn/scp/EventLog.kt` | `EventLog` class, `Event`, `Proof`, `Checkpoint` data classes |
 | `src/main/kotlin/works/limn/scp/Transport.kt` | `TransportConfig` data class, transport helpers |
@@ -1253,7 +1253,7 @@ dependencies {
 
 Architecture.md §6 explicitly flags offline MLS re-sync as "the hardest unsolved problem" with High likelihood and High impact. Members offline for extended periods accumulate pending MLS proposals and Commits. The group state advances without them — epochs increment, sender keys rotate, members join and leave, governance actions execute. When the offline member reconnects, they must reconcile their stale local state with the group's current state. The difficulty is that MLS requires sequential epoch processing (each Commit depends on the previous epoch's key schedule), forward secrecy means old epoch keys are destroyed after the grace window (ADR-001 criterion 6), and relays are untrusted infrastructure that may or may not retain the full message history.
 
-SCP's design makes this simultaneously harder and easier than in traditional messaging systems. Harder: devices are full protocol participants (§10.2), not thin clients that can ask a server for the current state. There is no authoritative server — only relays holding encrypted blobs and peers holding decrypted state. Easier: the verifiable event log (ADR-011) provides a cryptographic mechanism for state reconciliation — two members can compare Merkle roots and prove exactly where their views diverge. The protocol's minimal state footprint (§10.3) means what needs syncing is small: membership, roles, tokens, tool registrations, governance, and event hashes — not content.
+SCP's design makes this simultaneously harder and easier than in traditional messaging systems. Harder: devices are full protocol participants (§10.2), not thin clients that can ask a server for the current state. There is no authoritative server — only relays holding encrypted blobs and peers holding decrypted state. Easier: the verifiable event log (ADR-011) provides a cryptographic mechanism for state reconciliation — two members can compare Merkle roots and prove exactly where their views diverge. The protocol's minimal state footprint (§10.3) means what needs syncing is small: membership, roles, tokens, outlet registrations, governance, and event hashes — not content.
 
 This ADR defines the offline/sync strategy across three time horizons (hours, days, weeks), resolves conflict semantics for concurrent offline operations, specifies the MLS epoch catch-up protocol, and defines when and how group state resets occur.
 
@@ -1414,7 +1414,7 @@ When a member has been offline for more than 7 days, or when the epoch catch-up 
 - Their DID and identity.
 - Their role in the context (the admin re-assigns the same role during re-add).
 - Their event log history up to the last known epoch.
-- Context metadata (params, tools, ceiling) — this is public and queryable via the metadata routing ID (ADR-004).
+- Context metadata (params, outlets, ceiling) — this is public and queryable via the metadata routing ID (ADR-004).
 
 ```rust
 pub struct ResetRequest {
@@ -1718,7 +1718,7 @@ QueueDrained {
 
 ### Context
 
-Every SCP context maintains an append-only Merkle event log (ADR-011) that records all protocol events — membership changes, governance actions, tool invocations, messages, role assignments, block notifications, and consistency checkpoints. The log is the foundation for participation validation (§7.3.1), equivocation detection (§9.9.3), and the trust model's Layer 2 (verifiable participation records, §7.3.2). Its append-only structure is what makes claims about context history verifiable rather than trust-dependent.
+Every SCP context maintains an append-only Merkle event log (ADR-011) that records all protocol events — membership changes, governance actions, outlet invocations, messages, role assignments, block notifications, and consistency checkpoints. The log is the foundation for participation validation (§7.3.1), equivocation detection (§9.9.3), and the trust model's Layer 2 (verifiable participation records, §7.3.2). Its append-only structure is what makes claims about context history verifiable rather than trust-dependent.
 
 The problem is that event logs grow without bound. A long-lived context with active participants accumulates millions of events. Each event is a leaf in the Merkle tree, with interior nodes stored for proof generation (ADR-011, key convention: `context/{context_id}/event/{seq:020d}` for events, `context/{context_id}/event_tree/{level}/{index}` for tree nodes — §17.3). On mobile devices with constrained storage, maintaining full history for every active context is unsustainable. A context with 1 million events at ~200 bytes per event plus Merkle tree overhead consumes hundreds of megabytes for a single context.
 
@@ -1796,8 +1796,8 @@ pub struct ContextStateSnapshot {
     pub memory_scope: MemoryScope,
     /// TTL remaining (None if no TTL or if persistent).
     pub ttl_remaining_secs: Option<u64>,
-    /// Registered tools.
-    pub tools: Vec<OutletRegistration>,
+    /// Registered outlets.
+    pub outlets: Vec<OutletRegistration>,
     /// Active sender key epochs per member.
     pub sender_key_epochs: Vec<(DID, u64)>,
     /// Current MLS epoch (None for Broadcast contexts).
@@ -1976,7 +1976,7 @@ When a member joins a context with a long history, or when a member's local stat
 
 1. **Obtain the latest checkpoint.** Query the context's event log (via relay QUERY or peer request) for the most recent `Checkpoint` event. Verify its signature against the admin's DID.
 2. **Verify checkpoint consistency.** Compute or request the current Merkle root from an online member (via consistency checkpoint exchange, ADR-011 criterion 8). Verify that the checkpoint event is included in the current log via standard inclusion proof.
-3. **Load state snapshot.** Deserialize the checkpoint's `ContextStateSnapshot`. This provides complete context state as of the checkpoint: membership, roles, governance, tools, ceilings, blocks, and sender key epochs.
+3. **Load state snapshot.** Deserialize the checkpoint's `ContextStateSnapshot`. This provides complete context state as of the checkpoint: membership, roles, governance, outlets, ceilings, blocks, and sender key epochs.
 4. **Replay post-checkpoint events.** Request events from `checkpoint_seq + 1` through the current event count. Verify each event against the Merkle tree (hash chain integrity, inclusion proof). Apply each event's state mutation to the snapshot.
 5. **Verify final state.** After replay, the reconstructed state should be consistent with the current Merkle root and the latest consistency checkpoint from online members.
 
@@ -2552,9 +2552,9 @@ pub enum GovernanceAction {
     RemoveMember { did: DID, reason: Option<String> },
     /// Change a member's role.
     ChangeRole { did: DID, new_role: RoleName },
-    /// Register a new tool.
+    /// Register a new outlet.
     RegisterOutlet { registration: OutletRegistration },
-    /// Remove a tool.
+    /// Remove a outlet.
     RemoveOutlet { outlet_id: OutletId },
     /// Modify the capability ceiling (only if ceiling_policy is Governed).
     ModifyCeiling { new_ceiling: Vec<Capability> },
@@ -2574,7 +2574,7 @@ pub enum GovernanceAction {
     ModifyThreshold { new_threshold: u32 },
     /// Create a child context (§5.13).
     CreateChildContext { params: Box<ContextParams> },
-    /// Establish a tool interface with another context (§6.2).
+    /// Establish a outlet interface with another context (§6.2).
     EstablishOutletInterface { interface: OutletInterface },
     /// Initiate governance-triggered member reset (ADR-029).
     ResetMember { did: DID, reason: String },
@@ -2721,7 +2721,7 @@ ADR-029 section 5c defines the conflict scenario: two admins both offline simult
 
 **Simultaneous commit (same sequence number).** If two conflicting proposals land at the exact same event log sequence (extremely rare — requires both to be appended in the same batch), the protocol enters a `GovernanceConflict` state:
 
-1. The context is frozen for new governance actions — no new proposals accepted EXCEPT `ResolveConflict`. Message sending and tool invocation continue normally.
+1. The context is frozen for new governance actions — no new proposals accepted EXCEPT `ResolveConflict`. Message sending and outlet invocation continue normally.
 2. A `GovernanceConflictDetected` event is emitted.
 3. Resolution requires an explicit `ResolveConflict` governance action from any DID with `GovernanceVote` capability. The resolution specifies which proposal wins. `ResolveConflict` is explicitly exempt from the governance freeze — it is the designated mechanism for lifting the freeze.
 4. The `ResolveConflict` action itself follows the context's governance model (requires threshold/majority/unanimity). This prevents unilateral conflict resolution.
@@ -2828,7 +2828,7 @@ ADR-029 section 5c already establishes Merkle log order as the authoritative ord
 
 **Why the fallback quorum for deadlock recovery:**
 
-Without a deadlock recovery mechanism, a Threshold(3-of-5) context where 3 signers lose their keys is permanently frozen — no governance action can ever pass. The fallback quorum (majority of remaining active voters) is the least disruptive recovery: it preserves the model type, requires majority agreement among the remaining participants, and is fully logged. The alternative — no recovery, context must be abandoned — wastes the context's history, tool registrations, and ongoing work. The 48-hour voting window for recovery proposals gives absent members extra time to return, reducing false deadlock detection.
+Without a deadlock recovery mechanism, a Threshold(3-of-5) context where 3 signers lose their keys is permanently frozen — no governance action can ever pass. The fallback quorum (majority of remaining active voters) is the least disruptive recovery: it preserves the model type, requires majority agreement among the remaining participants, and is fully logged. The alternative — no recovery, context must be abandoned — wastes the context's history, outlet registrations, and ongoing work. The 48-hour voting window for recovery proposals gives absent members extra time to return, reducing false deadlock detection.
 
 **Why the context creator remains the UCAN root:**
 
@@ -2849,7 +2849,7 @@ UCAN delegation chains require a single root issuer (ADR-016 step 4). Distributi
 
 ### Dependencies
 
-- **ADR-008 (Context Lifecycle):** The `ContextManager` delegates governance decisions to the `GovernanceEngine`. Context creation includes `GovernanceModelConfig` in `ContextParams`. The governance model constrains which context operations require proposals (all multi-admin operations) vs. which are immediate (message sending, tool invocation — these are UCAN-authorized, not governance-gated).
+- **ADR-008 (Context Lifecycle):** The `ContextManager` delegates governance decisions to the `GovernanceEngine`. Context creation includes `GovernanceModelConfig` in `ContextParams`. The governance model constrains which context operations require proposals (all multi-admin operations) vs. which are immediate (message sending, outlet invocation — these are UCAN-authorized, not governance-gated).
 - **ADR-009 (Roles/UCAN):** `GovernancePropose` and `GovernanceVote` are capabilities in the `Capability` enum. Governance UCAN tokens are minted at role assignment and validated on every `propose()`, `approve()`, and `reject()` call. The capability ceiling bounds governance capabilities the same as any other capability.
 - **ADR-011 (Event Log):** Governance proposals, votes, resolutions, conflicts, and deadlock recoveries are event log entries. The Merkle log provides the authoritative ordering for conflict resolution.
 - **ADR-016 (UCAN Validation):** The full 11-step UCAN validation pipeline applies to governance operations. Governance UCANs follow the same delegation chain, nonce uniqueness, and revocation rules as all other UCANs.
