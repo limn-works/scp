@@ -2214,8 +2214,7 @@ pub enum OutletsCommand {
         /// caveat set without forging the invocation UCAN. `None` when the
         /// invocation UCAN carried no caveats. Boxed to keep the variant payload
         /// pointer-sized.
-        caveat_binding:
-            Option<Box<crate::context::outlets_helpers::InvocationCaveatBinding>>,
+        caveat_binding: Option<Box<crate::context::outlets_helpers::InvocationCaveatBinding>>,
         /// The invocation input, checked against the caveat's `input_schema`
         /// by the §7.3.8 synchronous local gate. Boxed to keep the variant
         /// payload pointer-sized.

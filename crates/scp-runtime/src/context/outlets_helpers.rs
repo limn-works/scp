@@ -2081,6 +2081,7 @@ mod tests {
         use std::collections::HashMap;
         use std::sync::Arc;
 
+        use scp_clock::Clock as _;
         use scp_did::DID;
         use scp_protocol::crypto::ucan::validate::{CaveatResolver, TokenNbCaveatResolver};
         use scp_protocol::crypto::ucan::{UcanHeader, UcanPayload, UcanToken};
@@ -2679,6 +2680,347 @@ mod tests {
             assert_eq!(
                 cell.class_s.caveat_counters[cid].max_calls_used, 1,
                 "the consumed cap must be KEPT across the persist failure (no un-consume)"
+            );
+        }
+
+        // -------------------------------------------------------------------
+        // End-to-end enforcement via `reserve_outlet_economy` — PAID path
+        // -------------------------------------------------------------------
+        //
+        // The free-path tests above drive the counter consume through the
+        // dedicated `commit_class_s_keep` (outlets_helpers.rs ~919). The PAID
+        // path folds the counter consume into `commit_class_s_keep_compensating`
+        // (outlets_helpers.rs ~842-863) — a different combinator with its own
+        // budget/velocity compensation. This block exercises THAT path with a
+        // real `action_cost > 0` and a VALID signed spending UCAN.
+
+        /// Deterministic Ed25519 seed from a DID (mirrors the outlet-economy
+        /// wiring test's `did_to_seed` so signing and verification agree).
+        fn did_to_seed(did: &DID) -> [u8; 32] {
+            let mut s = [0u8; 32];
+            for (i, b) in did.as_ref().as_bytes().iter().enumerate() {
+                s[i % 32] ^= *b;
+            }
+            s
+        }
+
+        /// Signing key for `did` — the private half of what `mock_key_resolver`
+        /// returns, so a spending UCAN issued by `did` verifies against it.
+        fn signing_key_for_did(did: &DID) -> ed25519_dalek::SigningKey {
+            ed25519_dalek::SigningKey::from_bytes(&did_to_seed(did))
+        }
+
+        /// Key resolver that returns the verifying key `signing_key_for_did`
+        /// signs with. Wired into the paid deps so
+        /// `validate_spending_ucan_or_error` (called inside
+        /// `commit_class_s_keep_compensating`) can resolve the spending-UCAN
+        /// issuer DID → key and verify the Ed25519 signature. The free-path
+        /// `build_deps` uses a `|_, _| None` resolver, which would fail signature
+        /// verification — a paid test MUST supply real keys.
+        fn mock_key_resolver() -> scp_protocol::context::governance::KeyResolver {
+            Arc::new(|did: &DID, _kid: scp_did::SigningKeyId| {
+                Some(ed25519_dalek::SigningKey::from_bytes(&did_to_seed(did)).verifying_key())
+            })
+        }
+
+        /// A paid economic policy: a per-outlet-call cost > 0 makes
+        /// `economy_pre_check` return `action_cost > 0`, routing the reserve
+        /// through the PAID `commit_class_s_keep_compensating` branch.
+        fn paid_policy() -> scp_protocol::economy::types::EconomicPolicy {
+            use scp_protocol::economy::types::{CostSchedule, CurrencyCode, EconomicPolicy};
+            EconomicPolicy {
+                locked: false,
+                cost_schedule: CostSchedule {
+                    currency: CurrencyCode::from("USD"),
+                    per_message: None,
+                    per_outlet_call: Some(Amount::new(5)),
+                    per_join: None,
+                    per_period: None,
+                    per_byte_stored: None,
+                },
+                payment_adapters: vec![],
+                pricing_formula: None,
+                payee: DID::from("did:key:caveat-payee"),
+            }
+        }
+
+        /// Fully-signed spending UCAN bound to `actor_did` (iss == aud), valid at
+        /// wall-clock time. Mirrors the outlet-economy wiring test's
+        /// `signed_spending_ucan_for`: `kid: "#agent"` + `scp_key_scope: "#agent"`
+        /// fact, a `scp:spending:*` attenuation, a capability that comfortably
+        /// covers the per-call cost, and a FRESH single-use nonce (each call
+        /// generates a new one). The token is signed over the base64url
+        /// `header.payload` and `encoded` carries the full three-segment JWT so
+        /// `verify_signature` reconstructs the signing input.
+        fn signed_spending_ucan_for(actor_did: &DID) -> UcanToken {
+            use base64::Engine;
+            use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+            use scp_protocol::crypto::ucan::nonce::generate_nonce;
+            use scp_protocol::crypto::ucan::spending::{
+                Amount as SpendAmount, CurrencyCode as SpendCurrency, SpendingCapability,
+            };
+            use scp_protocol::crypto::ucan::{Attenuation, UcanHeader};
+
+            let cap = SpendingCapability {
+                max_per_action: SpendAmount(u64::MAX),
+                max_total: SpendAmount(u64::MAX),
+                currency: SpendCurrency::from_code("USD").expect("USD is a valid code"),
+                time_window: std::time::Duration::from_hours(1),
+                allowed_adapters: vec![],
+            };
+            let mut fct = serde_json::Map::new();
+            fct.insert(
+                "spending_capability".to_owned(),
+                cap.to_fact_value()
+                    .expect("capability serializes to a fact value"),
+            );
+            fct.insert(
+                "scp_key_scope".to_owned(),
+                serde_json::Value::String("#agent".to_owned()),
+            );
+
+            // Wall-clock times: the paid deps use a `SystemClock`, and the
+            // in-state spending-nonce tracker (built by `new_for_test_encrypted`)
+            // also uses `SystemClock`, so expiry + nonce-freshness both validate
+            // against real time.
+            let now = scp_clock::SystemClock.now_secs();
+            let header = UcanHeader::with_kid("#agent".to_owned());
+            let payload = UcanPayload {
+                iss: actor_did.as_ref().to_owned(),
+                aud: actor_did.as_ref().to_owned(),
+                exp: now + 3600,
+                nbf: Some(now.saturating_sub(60)),
+                nnc: generate_nonce(&scp_clock::SystemClock),
+                att: vec![Attenuation {
+                    with: "scp:spending:*".to_owned(),
+                    can: "spend".to_owned(),
+                }],
+                prf: vec![],
+                fct: Some(serde_json::Value::Object(fct)),
+                nb: None,
+            };
+
+            let header_json = serde_json::to_vec(&header).expect("header serializes");
+            let payload_json = serde_json::to_vec(&payload).expect("payload serializes");
+            let header_b64 = URL_SAFE_NO_PAD.encode(&header_json);
+            let payload_b64 = URL_SAFE_NO_PAD.encode(&payload_json);
+            let signing_input = format!("{header_b64}.{payload_b64}");
+            let signing_key = signing_key_for_did(actor_did);
+            let signature = ed25519_dalek::Signer::sign(&signing_key, signing_input.as_bytes());
+            let sig_b64 = URL_SAFE_NO_PAD.encode(signature.to_bytes());
+            let encoded = format!("{signing_input}.{sig_b64}");
+
+            UcanToken {
+                header,
+                payload,
+                signature: signature.to_bytes().to_vec(),
+                encoded,
+            }
+        }
+
+        /// Paid deps: a real-time `SystemClock` (so the spending UCAN's expiry
+        /// and nonce freshness validate against the same wall clock the in-state
+        /// nonce tracker uses) and a `mock_key_resolver` that resolves the
+        /// spending-UCAN issuer DID → verifying key. No payment adapter is
+        /// configured: the reserve's escrow authorization only runs when BOTH a
+        /// policy AND an adapter are present (`outlets_helpers.rs` ~948), so with no
+        /// adapter the escrow is skipped and the PAID
+        /// `commit_class_s_keep_compensating` (spending-nonce + budget + counter
+        /// consume) is exactly the path under test. This matches the committed
+        /// outlet-economy wiring reference, whose paid happy path also configures
+        /// no adapter and asserts `payment_receipt.is_none()`.
+        async fn build_deps_paid(
+            persistence: Box<dyn crate::context::persistence::ContextPersistence>,
+        ) -> ActorDeps {
+            use crate::context::supervisor::supervisor::Supervisor;
+            use scp_platform::testing::InMemoryStorage;
+
+            let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+                INVOKER.to_owned(),
+                Arc::new(scp_clock::SystemClock),
+            ));
+            let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
+                Box::new(crate::context::builder::NotConfiguredTransportProvider);
+            let event_log: Box<dyn crate::context::builder::ContextEventLogProvider> =
+                Box::new(crate::context::providers::MerkleEventLogProvider::new());
+            let key_resolver = mock_key_resolver();
+            let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
+                Arc::new(
+                    crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(
+                        Arc::new(InMemoryStorage::new()),
+                    ),
+                );
+            let clock: Arc<dyn scp_clock::Clock> = Arc::new(scp_clock::SystemClock);
+            let supervisor = Supervisor::with_providers(
+                crypto,
+                transport,
+                event_log,
+                key_resolver,
+                Some(persistence),
+                None,
+                None,
+                Some(clock),
+                mls_storage,
+            );
+            supervisor
+                .build_actor_deps(&DID(INVOKER.to_owned()))
+                .await
+                .expect("build_actor_deps")
+        }
+
+        /// `active_state()` plus a paid economic policy and a funded budget for
+        /// INVOKER, so `economy_pre_check` yields `action_cost > 0` and
+        /// `record_spend` succeeds on the paid branch.
+        fn paid_active_state() -> PerContextState {
+            let mut state = active_state();
+            state.governance.economic_policy = Some(paid_policy());
+            state
+                .governance
+                .budget_tracker
+                .grant(&DID(INVOKER.to_owned()), Amount::new(1_000));
+            state
+        }
+
+        /// Drive one PAID reserve step: thread a signed spending UCAN into the
+        /// `spending_ucan` slot (the free-path `reserve_step` passes `None`
+        /// there) alongside the counter-bearing caveat binding. On success,
+        /// consume the returned ticket (its `#[must_use]` Drop balance guard
+        /// would otherwise fire); with no payment adapter there is no escrow to
+        /// void, and the counter consume already committed as Class-S before the
+        /// ticket was built.
+        async fn paid_reserve_step(
+            cell: &mut ClassSCell,
+            deps: &ActorDeps,
+            spending: &UcanToken,
+            caveats: &InvocationCaveats,
+            cid: &str,
+            input: &serde_json::Value,
+            now: u64,
+        ) -> Result<(), ContextError> {
+            let binding = InvocationCaveatBinding {
+                caveats: caveats.clone(),
+                ucan_cid: cid.to_owned(),
+            };
+            let reservation = super::super::reserve_outlet_economy(
+                cell,
+                deps,
+                &ctx_key(),
+                &DID(INVOKER.to_owned()),
+                Some(spending),
+                Some(&binding),
+                input,
+                now,
+            )
+            .await?;
+            reservation.ticket.void_external_and_consume(None).await;
+            Ok(())
+        }
+
+        /// PAID-path caveat KAT (§7.3.8). Drives `reserve_outlet_economy` on the
+        /// PAID branch (`action_cost > 0` + a VALID signed spending UCAN) and
+        /// proves the counter consume folded into
+        /// `commit_class_s_keep_compensating` (outlets_helpers.rs ~842-863) is
+        /// live on that path:
+        ///
+        /// (a) a `max_calls = 1` caveat IS consumed on the paid path — after one
+        ///     successful paid reserve the owned Class-S counter reads
+        ///     `max_calls_used == 1`, and a SECOND paid reserve (same cid, a FRESH
+        ///     spending UCAN) rejects naming `maxCalls`.
+        ///
+        /// (b) On the `CounterExhausted` reject the paid-path compensation runs
+        ///     (outlets_helpers.rs ~852-862): the just-charged budget is rolled
+        ///     back inline while the spending nonce stays consumed (the closure
+        ///     returns Err AFTER `commit_spending_ucan_nonce`). The governance
+        ///     budget tracker is `pub(crate)` and thus observable from this test
+        ///     module, so the rollback is asserted directly — the invoker's
+        ///     remaining budget after the REJECTED second call equals its
+        ///     remaining budget after the first (ADMITTED) call, so only the one
+        ///     admitted charge stuck. The nonce's single-use is proven separately:
+        ///     re-presenting the first UCAN rejects on replay INSIDE
+        ///     `validate_spending_ucan_or_error` (which runs before the counter
+        ///     consume), so each paid reserve genuinely needs a distinct fresh
+        ///     spending UCAN.
+        #[tokio::test]
+        async fn reserve_paid_path_enforces_max_calls_and_compensates() {
+            let deps = build_deps_paid(Box::new(OkPersistence)).await;
+            let mut cell = ClassSCell::new(paid_active_state());
+            let invoker = DID(INVOKER.to_owned());
+            let caveats = max_calls_caveats(1);
+            let cid = "cid-paid-mc";
+            let input = serde_json::json!({});
+            // `now` here feeds the velocity / hard-rate / caveat bookkeeping; the
+            // spending UCAN's own expiry + nonce validate against the deps'
+            // `SystemClock`, independent of this value.
+            let now = scp_clock::SystemClock.now_secs();
+
+            let remaining_start = cell.governance.budget_tracker.remaining(&invoker).0;
+            assert_eq!(remaining_start, 1_000, "seeded invoker budget");
+
+            // FIRST paid reserve: valid signed UCAN, action_cost = 5 (> 0 → paid
+            // branch). The counter consume in `commit_class_s_keep_compensating`
+            // admits and consumes the single max_calls slot.
+            let spending1 = signed_spending_ucan_for(&invoker);
+            paid_reserve_step(&mut cell, &deps, &spending1, &caveats, cid, &input, now)
+                .await
+                .expect("first paid reserve within max_calls=1 must admit on the PAID branch");
+            assert_eq!(
+                cell.class_s.caveat_counters[cid].max_calls_used, 1,
+                "the PAID path consumed exactly one max_calls slot"
+            );
+            let remaining_after_first = cell.governance.budget_tracker.remaining(&invoker).0;
+            assert_eq!(
+                remaining_after_first,
+                remaining_start - 5,
+                "the first paid reserve charged the per_outlet_call cost (5) exactly once"
+            );
+
+            // SECOND paid reserve: a DISTINCT fresh spending UCAN (single-use
+            // nonce — reusing spending1 would reject on nonce replay, not the
+            // caveat). The max_calls slot is exhausted, so the counter consume —
+            // the LAST mutation in the paid closure — rejects with
+            // CounterExhausted (maxCalls).
+            let spending2 = signed_spending_ucan_for(&invoker);
+            let err = paid_reserve_step(&mut cell, &deps, &spending2, &caveats, cid, &input, now)
+                .await
+                .expect_err("second paid reserve must exceed max_calls=1");
+            assert!(
+                format!("{err}").contains("maxCalls"),
+                "the PAID-path reject must name the maxCalls caveat: {err}"
+            );
+
+            // (b) Compensation ran: the CounterExhausted reject rolled the
+            // just-charged budget back inline (outlets_helpers.rs ~852-862), so
+            // the net remaining budget is unchanged from after the first
+            // (admitted) charge — the rejected call left NO budget stuck.
+            let remaining_after_second = cell.governance.budget_tracker.remaining(&invoker).0;
+            assert_eq!(
+                remaining_after_second, remaining_after_first,
+                "the rejected paid reserve rolled back its budget charge (compensation) — \
+                 only the first, admitted call's charge stuck"
+            );
+            assert_eq!(
+                cell.class_s.caveat_counters[cid].max_calls_used, 1,
+                "a rejected paid reserve does not advance the exhausted counter past its cap"
+            );
+
+            // Single-use nonce: re-presenting the FIRST spending UCAN (its nonce
+            // was committed on the admitted call) rejects on replay INSIDE
+            // `validate_spending_ucan_or_error`, which runs BEFORE the counter
+            // consume in the paid closure — proving every paid reserve needs a
+            // distinct fresh spending UCAN, never a replay.
+            let err_replay =
+                paid_reserve_step(&mut cell, &deps, &spending1, &caveats, cid, &input, now)
+                    .await
+                    .expect_err(
+                        "re-presenting a consumed spending UCAN must reject on nonce replay",
+                    );
+            let replay_msg = format!("{err_replay}").to_lowercase();
+            assert!(
+                replay_msg.contains("scp-econ-12065")
+                    || replay_msg.contains("nonce")
+                    || replay_msg.contains("replay"),
+                "a reused spending-UCAN nonce must reject inside spending validation \
+                 (before the counter): {err_replay}"
             );
         }
     }
