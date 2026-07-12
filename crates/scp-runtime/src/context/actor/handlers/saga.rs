@@ -512,9 +512,23 @@ async fn prepare_a(
     let now_secs = deps.clock.now_secs();
     // `reserve_outlet_economy` is the spending-nonce-bearing leaf and takes the
     // cell; the prior `state` borrow has ended (NLL) so `cell` is free here.
-    let reservation =
-        match reserve_outlet_economy(cell, deps, &context_id_hex, caller_did, None, now_secs).await
-        {
+    // §7.3.8 value-caveat enforcement is scoped to single-shot SAME-context
+    // invocation. The cross-context saga Prepare-A leg is a later slice, so no
+    // effective caveats / ucan_cid are threaded here and the input is not
+    // schema-checked against a caveat (`Null`); the counter gate stays inert.
+    let reservation = match reserve_outlet_economy(
+        cell,
+        deps,
+        &context_id_hex,
+        caller_did,
+        None,
+        None,
+        None,
+        &serde_json::Value::Null,
+        now_secs,
+    )
+    .await
+    {
             Ok(reservation) => reservation,
             Err(err) => {
                 // reserve_outlet_economy rolls back its OWN staged bookkeeping on

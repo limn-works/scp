@@ -64,7 +64,9 @@ use scp_protocol::context::roles::ContextRoleState;
 use scp_protocol::crypto::ucan::UcanToken;
 use scp_protocol::economy::antispam::VelocityRollbackToken;
 use scp_protocol::economy::policy::ObservableMetrics;
-use scp_protocol::economy::types::Amount;
+use scp_protocol::economy::types::{Amount, PaymentAdapterRef};
+use scp_protocol::trust::CaveatKind;
+use scp_protocol::trust::caveats::InvocationCaveats;
 
 use crate::context::ContextHandle;
 use crate::context::actor::deps::ActorDeps;
@@ -489,6 +491,29 @@ impl std::fmt::Debug for OutletEconomyReservation {
 ///
 /// Propagates [`ContextError`] for rate-limit, budget, spending-UCAN, and
 /// escrow-authorization failures.
+/// # §7.3.8 value-caveat enforcement
+///
+/// When `effective_caveats` is `Some` (the invocation-authorizing UCAN carried
+/// a validated-narrowed `nb` caveat set, resolved runtime-side by the caller
+/// via `TokenNbCaveatResolver` — bridges cannot bypass it), this function runs
+/// the two-stage §7.3.8 gate:
+///
+/// 1. [`InvocationCaveats::check_invocation_local`] — the SYNCHRONOUS stateless
+///    checks (`input_schema` / `amount_max_per_call` / `allowed_adapters` /
+///    `allowed_target_dids`). Runs FIRST, so a bad schema / adapter / target /
+///    per-call amount rejects BEFORE any Class-S consume — velocity and the
+///    hard rate limit are refunded and no nonce / budget / counter capacity is
+///    spent.
+/// 2. [`consume_caveat_counters`] — the counter-bearing caps (`max_calls` /
+///    `amount_max_cumulative` / `rate_window`). Consumed as a Class-S mutation
+///    folded into the paid-path `commit_class_s_keep_compensating` (one persist
+///    per invocation) or a dedicated `commit_class_s_keep` on the free path.
+///    A consumed cap is KEPT on persist failure (ADR-049 §9) and KEPT across a
+///    later executor failure (attempt-based, not success-based).
+///
+/// `negotiated_adapter` is derived here from `deps.payment_adapter` (the
+/// adapter the paid path will use); `target_did` is `None` for this single-shot
+/// same-context slice (cross-context target threading is a later slice).
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub async fn reserve_outlet_economy(
     cell: &mut crate::context::actor::class_s::ClassSCell,
@@ -496,6 +521,9 @@ pub async fn reserve_outlet_economy(
     context_id: &str,
     invoker_did: &DID,
     spending_ucan: Option<&UcanToken>,
+    effective_caveats: Option<&InvocationCaveats>,
+    ucan_cid: Option<&str>,
+    input: &serde_json::Value,
     now_secs: u64,
 ) -> Result<OutletEconomyReservation, ContextError> {
     // ADR-049 §9 Class-S cell seam. The spending-nonce consume + budget charge
@@ -632,6 +660,38 @@ pub async fn reserve_outlet_economy(
                 "SCP-ECON-12060: paid action requires spending UCAN".to_owned(),
             ));
         }
+
+        // §7.3.8 SYNCHRONOUS caveat gate (stateless local checks). Runs HERE —
+        // after `action_cost` is known but BEFORE any Class-S consume (spending
+        // nonce, budget, or counter capacity) — so a bad `input_schema` /
+        // `amount_max_per_call` / `allowed_adapters` / `allowed_target_dids`
+        // rejects the invocation without spending anything. On rejection the
+        // velocity tick + hard-rate token consumed above are refunded inline
+        // (mirroring the missing-spending-UCAN arm), and NO counter is touched.
+        //
+        // `negotiated_adapter` is the adapter the paid path would use
+        // (`deps.payment_adapter.adapter_id()`); `target_did` is `None` for this
+        // single-shot same-context slice — a token whose `allowed_target_dids`
+        // is populated therefore cannot authorize a same-context call, which is
+        // the correct fail-closed behaviour (cross-context targets are a later
+        // slice).
+        if let Some(caveats) = effective_caveats {
+            let negotiated_adapter: Option<PaymentAdapterRef> = payment_adapter
+                .as_ref()
+                .map(|a| a.adapter_id().to_owned());
+            if let Err(err) = caveats.check_invocation_local(
+                input,
+                action_cost,
+                negotiated_adapter.as_ref(),
+                None,
+            ) {
+                let gov = view.governance_class_c_mut();
+                gov.velocity_tracker_mut()
+                    .rollback(invoker_did, velocity_token);
+                gov.hard_rate_limit_mut().refund(invoker_did);
+                return Err(check_invocation_error_to_context(&err));
+            }
+        }
         // `view` is dropped here, releasing `cell` for the combinator call.
     }
 
@@ -739,6 +799,41 @@ pub async fn reserve_outlet_economy(
                         )));
                     }
 
+                    // §7.3.8 counter-bearing caveat consume (Class-S), folded
+                    // into THIS combinator so the paid path persists exactly
+                    // once. It is the LAST mutation in the closure: on a
+                    // `CounterExhausted` reject the just-charged budget + velocity
+                    // are rolled back inline (the spending nonce stays consumed —
+                    // un-consuming it re-opens the replay window; a caller who
+                    // trips their own cap after presenting a valid spending UCAN
+                    // burns that nonce, an acceptable self-inflicted cost). The
+                    // consume is all-or-nothing across the three kinds, so a
+                    // partial increment never persists. On success the record
+                    // rides the fail-closed persist below and is KEPT on persist
+                    // failure (a consumed cap must never un-consume).
+                    if let (Some(caveats), Some(cid)) = (effective_caveats, ucan_cid)
+                        && caveats.has_counter_bearing_caveat()
+                        && let Err(err) = consume_caveat_counters(
+                            &mut state.class_s.caveat_counters,
+                            cid,
+                            caveats,
+                            action_cost,
+                            now_secs,
+                        )
+                    {
+                        if let Some(cost) = deducted_cost {
+                            state
+                                .governance
+                                .budget_tracker
+                                .reverse_spend(invoker_did, cost);
+                        }
+                        state
+                            .governance
+                            .velocity_tracker
+                            .rollback(invoker_did, velocity_token);
+                        return Err(err);
+                    }
+
                     // `value` = the deducted cost; `external` = the handle the
                     // persist-failure reversal needs to reverse the Class-C
                     // budget reservation.
@@ -781,6 +876,39 @@ pub async fn reserve_outlet_economy(
             }
         }
     } else {
+        // FREE path (`action_cost == 0`, no spending nonce / budget). A free
+        // outlet may still carry a counter-bearing caveat (`max_calls` /
+        // `rate_window`, or an `amount_max_cumulative` that consumes 0 but still
+        // asserts its cap), so the counter consume gets its OWN dedicated
+        // fail-closed `commit_class_s_keep` — KEEP on persist failure (a consumed
+        // cap must never un-consume). On reject / persist failure the velocity
+        // tick + hard-rate token are refunded (they were consumed in the Class-C
+        // pre-block above and, on this path, would otherwise ride only the
+        // best-effort coalesce persist).
+        if let (Some(caveats), Some(cid)) = (effective_caveats, ucan_cid)
+            && caveats.has_counter_bearing_caveat()
+        {
+            let consume_result = cell
+                .commit_class_s_keep(deps, context_id, |mut view| {
+                    let state = view.rest_mut();
+                    consume_caveat_counters(
+                        &mut state.class_s.caveat_counters,
+                        cid,
+                        caveats,
+                        action_cost,
+                        now_secs,
+                    )
+                })
+                .await;
+            if let Err(err) = consume_result {
+                let mut view = cell.class_c_view();
+                let gov = view.governance_class_c_mut();
+                gov.velocity_tracker_mut()
+                    .rollback(invoker_did, velocity_token);
+                gov.hard_rate_limit_mut().refund(invoker_did);
+                return Err(err);
+            }
+        }
         None
     };
 
@@ -1362,6 +1490,96 @@ pub async fn settle_outlet_economy(
     }
 }
 
+// ---------------------------------------------------------------------------
+// §7.3.8 value-caveat counter enforcement (reserve-phase helpers)
+// ---------------------------------------------------------------------------
+
+/// Atomically consumes every counter-bearing §7.3.8 caveat for one invocation
+/// against the owned Class-S [`CaveatCounters`](crate::trust::caveat_counters::CaveatCounters)
+/// record keyed by `ucan_cid`.
+///
+/// **All-or-nothing.** The consume is applied to a *clone* of the record and
+/// written back ONLY if every counter-bearing kind admits — so a rejection on
+/// the second/third kind never leaves the first kind's increment stranded in
+/// the map. On any [`CounterExhausted`](crate::trust::caveat_counters::CounterExhausted)
+/// the map is left unchanged and a mapped [`ContextError`] is returned BEFORE
+/// the caller persists (nothing consumed).
+///
+/// Callers invoke this ONLY inside a `commit_class_s_keep`-family closure
+/// (ADR-049 §9): a successful consume is Class-S and MUST ride the fail-closed
+/// persist so a coalesce-window crash cannot un-consume it.
+///
+/// Field→counter map (§7.3.8): `max_calls` = `try_consume(MaxCalls, 1, cap)`;
+/// `amount_max_cumulative` = `try_consume(AmountCumulative, action_cost, cap)`;
+/// `rate_window` = `try_consume(RateWindow, 0, max, window_secs)`.
+fn consume_caveat_counters(
+    counters: &mut std::collections::HashMap<String, crate::trust::caveat_counters::CaveatCounters>,
+    ucan_cid: &str,
+    caveats: &InvocationCaveats,
+    action_cost: Amount,
+    now_secs: u64,
+) -> Result<(), ContextError> {
+    let mut record = counters.get(ucan_cid).cloned().unwrap_or_default();
+
+    if let Some(cap) = caveats.max_calls {
+        record
+            .try_consume(CaveatKind::MaxCalls, 1, cap, 0, now_secs)
+            .map_err(|e| counter_exhausted_to_context(ucan_cid, &e))?;
+    }
+    if let Some(cap) = caveats.amount_max_cumulative {
+        record
+            .try_consume(
+                CaveatKind::AmountCumulative,
+                action_cost.value(),
+                cap.value(),
+                0,
+                now_secs,
+            )
+            .map_err(|e| counter_exhausted_to_context(ucan_cid, &e))?;
+    }
+    if let Some(rate_window) = caveats.rate_window {
+        record
+            .try_consume(
+                CaveatKind::RateWindow,
+                0,
+                u64::from(rate_window.max),
+                rate_window.window_secs,
+                now_secs,
+            )
+            .map_err(|e| counter_exhausted_to_context(ucan_cid, &e))?;
+    }
+
+    // Every counter-bearing kind admitted — commit the fully-updated record.
+    counters.insert(ucan_cid.to_owned(), record);
+    Ok(())
+}
+
+/// Maps a [`CounterExhausted`](crate::trust::caveat_counters::CounterExhausted)
+/// onto the Authorization-class [`InvocationError::CaveatViolation`] → typed
+/// [`ContextError`], naming the caveat kind that fired (slug) and the owning
+/// UCAN CID.
+fn counter_exhausted_to_context(
+    ucan_cid: &str,
+    err: &crate::trust::caveat_counters::CounterExhausted,
+) -> ContextError {
+    invocation_error_to_context(InvocationError::CaveatViolation {
+        slug: err.kind().as_str().to_owned(),
+        message: format!("ucan_cid={ucan_cid}: {err}"),
+    })
+}
+
+/// Maps a synchronous [`CheckInvocationError`](scp_protocol::trust::caveats::CheckInvocationError)
+/// onto the Authorization-class [`InvocationError::CaveatViolation`] → typed
+/// [`ContextError`], carrying the §5.4.4 / §7.3.8 slug for the rule that fired.
+fn check_invocation_error_to_context(
+    err: &scp_protocol::trust::caveats::CheckInvocationError,
+) -> ContextError {
+    invocation_error_to_context(InvocationError::CaveatViolation {
+        slug: err.slug().to_owned(),
+        message: err.to_string(),
+    })
+}
+
 fn invocation_error_to_context(err: InvocationError) -> ContextError {
     match err {
         InvocationError::ContextNotActive { current_state } => ContextError::PermissionDenied(
@@ -1395,6 +1613,12 @@ fn invocation_error_to_context(err: InvocationError) -> ContextError {
         } => ContextError::PermissionDenied(format!(
             "SCP-ECON-12010: budget exceeded for {did}: cost {cost}, remaining {remaining}"
         )),
+        // §7.3.8 caveat violations (synchronous local check or counter-bearing
+        // cap) surface as an Authorization-class permission denial; the slug
+        // names the exact caveat rule that fired (§5.4.4 / §7.3.8).
+        InvocationError::CaveatViolation { slug, message } => ContextError::PermissionDenied(
+            format!("SCP-OUTLET-6110: caveat violation [{slug}]: {message}"),
+        ),
     }
 }
 

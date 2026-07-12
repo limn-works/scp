@@ -10312,11 +10312,15 @@ impl Supervisor {
     ///
     /// [`ContextError::ContextNotRegistered`] when no actor is registered
     /// for `context_id`; otherwise any error the reserve handler emits.
+    #[allow(clippy::too_many_arguments)]
     async fn reserve_outlet_economy_via_actor(
         &self,
         context_id: &str,
         invoker_did: &DID,
         spending_ucan: Option<&scp_protocol::crypto::ucan::UcanToken>,
+        effective_caveats: Option<scp_protocol::trust::caveats::InvocationCaveats>,
+        ucan_cid: Option<String>,
+        input: serde_json::Value,
         now_secs: u64,
     ) -> Result<crate::context::outlets_helpers::OutletEconomyReservation, ContextError> {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
@@ -10324,6 +10328,9 @@ impl Supervisor {
             context_id: context_id.to_owned(),
             invoker_did: invoker_did.clone(),
             spending_ucan: spending_ucan.map(|u| Box::new(u.clone())),
+            effective_caveats: effective_caveats.map(Box::new),
+            ucan_cid,
+            input: Box::new(input),
             now_secs,
             reply: reply_tx,
         };
@@ -10443,6 +10450,27 @@ impl Supervisor {
             })?
             .now_secs();
 
+        // §7.3.8 value-caveat resolution — RUNTIME-SIDE, at the supervisor edge.
+        // The invocation-authorizing token in the single-shot same-context path
+        // is the presented `spending_ucan`; its signed `nb` field carries the
+        // VALIDATED-NARROWED effective caveats (a delegation inherits its
+        // parents' value-caveats through `narrow()`). Resolving here — via
+        // `TokenNbCaveatResolver`, from the token the runtime already holds —
+        // rather than accepting a caveat set from the FFI means no bridge can
+        // present a wider caveat set than the token it signs (there is no FFI
+        // signature to widen). The counter key is the token's revocation CID.
+        let (effective_caveats, ucan_cid) = spending_ucan.map_or((None, None), |token| {
+            use scp_protocol::crypto::ucan::validate::CaveatResolver as _;
+            let caveats = scp_protocol::crypto::ucan::validate::TokenNbCaveatResolver
+                .resolve_caveats(token);
+            let cid = scp_protocol::crypto::ucan::revoke::compute_revocation_cid(&token.encoded);
+            (caveats, Some(cid))
+        });
+        // The reserve phase needs the input to check it against the caveat's
+        // `input_schema`; the executor phase (below) consumes the original, so
+        // clone once for the reserve mailbox round-trip.
+        let reserve_input = input.clone();
+
         crate::context::outlets_helpers::invoke_outlet_with_economy(
             registry,
             outlet_id,
@@ -10455,6 +10483,9 @@ impl Supervisor {
                     context_id,
                     invoker_did,
                     spending_ucan,
+                    effective_caveats,
+                    ucan_cid,
+                    reserve_input,
                     now_secs,
                 )
             },
@@ -16127,6 +16158,7 @@ mod tests {
             xctx_committed_invocations: std::collections::HashSet::new(),
             xctx_caller_reservations: HashMap::new(),
             xctx_nonce_dedup: HashMap::new(),
+            caveat_counters: HashMap::new(),
             broadcast: None,
         }
     }

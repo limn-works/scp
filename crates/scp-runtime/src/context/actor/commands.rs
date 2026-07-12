@@ -2195,6 +2195,21 @@ pub enum OutletsCommand {
         /// Optional spending UCAN for paid actions (§19.5). Boxed so the
         /// variant payload stays pointer-sized.
         spending_ucan: Option<Box<scp_protocol::crypto::ucan::UcanToken>>,
+        /// §7.3.8 validated-narrowed effective invocation caveats, resolved
+        /// runtime-side (via `TokenNbCaveatResolver`) from the invocation-
+        /// authorizing UCAN's `nb` field at the supervisor edge — NOT accepted
+        /// from a bridge, so a bridge cannot bypass the caveat gate. `None`
+        /// when the authorizing token carried no caveats. Boxed to keep the
+        /// variant payload pointer-sized.
+        effective_caveats: Option<Box<scp_protocol::trust::caveats::InvocationCaveats>>,
+        /// CID of the invocation-authorizing UCAN, the key for this
+        /// delegation's owned Class-S caveat counters. `None` when no caveat-
+        /// bearing token was presented.
+        ucan_cid: Option<String>,
+        /// The invocation input, checked against the caveat's `input_schema`
+        /// by the §7.3.8 synchronous local gate. Boxed to keep the variant
+        /// payload pointer-sized.
+        input: Box<serde_json::Value>,
         /// Current Unix time in seconds — caller supplies to keep the
         /// handler deterministic.
         now_secs: u64,
