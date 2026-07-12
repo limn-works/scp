@@ -493,10 +493,13 @@ impl std::fmt::Debug for OutletEconomyReservation {
 /// escrow-authorization failures.
 /// # §7.3.8 value-caveat enforcement
 ///
-/// When `effective_caveats` is `Some` (the invocation-authorizing UCAN carried
-/// a validated-narrowed `nb` caveat set, resolved runtime-side by the caller
-/// via `TokenNbCaveatResolver` — bridges cannot bypass it), this function runs
-/// the two-stage §7.3.8 gate:
+/// When `effective_caveats` is `Some` (the VALIDATED INVOCATION UCAN — the
+/// token granting `outlet_call:*` / `outlet_query:*` — carried a
+/// validated-narrowed `nb` caveat set, resolved by the FFI bridge via
+/// `TokenNbCaveatResolver` at its `validate_outlet_invocation_ucan` site and
+/// threaded here as an internal runtime param; NOT sourced from `spending_ucan`,
+/// a separate §19.5 economy token), this function runs the two-stage §7.3.8
+/// gate:
 ///
 /// 1. [`InvocationCaveats::check_invocation_local`] — the SYNCHRONOUS stateless
 ///    checks (`input_schema` / `amount_max_per_call` / `allowed_adapters` /

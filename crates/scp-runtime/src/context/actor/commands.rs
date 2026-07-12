@@ -2195,16 +2195,23 @@ pub enum OutletsCommand {
         /// Optional spending UCAN for paid actions (§19.5). Boxed so the
         /// variant payload stays pointer-sized.
         spending_ucan: Option<Box<scp_protocol::crypto::ucan::UcanToken>>,
-        /// §7.3.8 validated-narrowed effective invocation caveats, resolved
-        /// runtime-side (via `TokenNbCaveatResolver`) from the invocation-
-        /// authorizing UCAN's `nb` field at the supervisor edge — NOT accepted
-        /// from a bridge, so a bridge cannot bypass the caveat gate. `None`
-        /// when the authorizing token carried no caveats. Boxed to keep the
-        /// variant payload pointer-sized.
+        /// §7.3.8 validated-narrowed effective invocation caveats, resolved by
+        /// the FFI bridge (via `TokenNbCaveatResolver`) from the `nb` field of
+        /// the VALIDATED INVOCATION UCAN — the token granting the
+        /// `outlet_call:*` / `outlet_query:*` capability, captured at the
+        /// bridge's `validate_outlet_invocation_ucan` site. NOT sourced from
+        /// `spending_ucan` (a separate §19.5 economy token whose `nb` carries
+        /// no invocation caveats). `narrow()` folds every parent's value-caveats
+        /// into the leaf, so the leaf `nb` IS the effective narrowed set. The
+        /// caveat bundle is an internal runtime-API param: the SDK-facing FFI
+        /// export signature is unchanged, so an external caller cannot widen the
+        /// caveat set without forging the invocation UCAN. `None` when the
+        /// invocation UCAN carried no caveats. Boxed to keep the variant payload
+        /// pointer-sized.
         effective_caveats: Option<Box<scp_protocol::trust::caveats::InvocationCaveats>>,
-        /// CID of the invocation-authorizing UCAN, the key for this
-        /// delegation's owned Class-S caveat counters. `None` when no caveat-
-        /// bearing token was presented.
+        /// Revocation CID of the invocation UCAN, the key for this delegation's
+        /// owned Class-S caveat counters. `None` when the invocation UCAN
+        /// carried no caveats.
         ucan_cid: Option<String>,
         /// The invocation input, checked against the caveat's `input_schema`
         /// by the §7.3.8 synchronous local gate. Boxed to keep the variant
