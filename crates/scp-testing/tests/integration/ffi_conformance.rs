@@ -58,6 +58,11 @@ const PYO3_SCP: &str = include_str!("../../../../crates/scp-ffi/src/scp.rs");
 // SCPID and site-projection canonicals can resolve.
 const PYO3_SCPID: &str = include_str!("../../../../crates/scp-ffi/src/scpid.rs");
 const PYO3_SERVER: &str = include_str!("../../../../crates/scp-ffi/src/server.rs");
+// Outlet-streaming surface (SCP-OUT-037): the `#[pymethods] impl PyScp`
+// `outlet_stream_*` methods live in their own file, separate from the
+// single-shot outlet ops in `outlets.rs`. Embedded so the streaming
+// canonicals resolve in the forward coverage tests.
+const PYO3_OUTLET_STREAM: &str = include_str!("../../../../crates/scp-ffi/src/outlet_stream.rs");
 
 // UniFFI bridge spans three files: the central `bridge.rs` (most ops),
 // `server.rs` (site-projection methods on the `Server` type), and `scp.rs`
@@ -70,6 +75,11 @@ const PYO3_SERVER: &str = include_str!("../../../../crates/scp-ffi/src/server.rs
 const UNIFFI_BRIDGE: &str = include_str!("../../../../crates/scp-ffi/uniffi/src/bridge.rs");
 const UNIFFI_SERVER: &str = include_str!("../../../../crates/scp-ffi/uniffi/src/server.rs");
 const UNIFFI_SCP: &str = include_str!("../../../../crates/scp-ffi/uniffi/src/scp.rs");
+// Outlet-streaming surface (SCP-OUT-037): the `#[uniffi::export] impl Scp`
+// `outlet_stream_*` async methods live in their own file. Embedded so the
+// streaming canonicals resolve in the forward coverage tests.
+const UNIFFI_OUTLET_STREAM: &str =
+    include_str!("../../../../crates/scp-ffi/uniffi/src/outlet_stream.rs");
 
 // NAPI bridge sources
 const NAPI_IDENTITY: &str = include_str!("../../../../crates/scp-ffi/napi/src/identity.rs");
@@ -644,6 +654,7 @@ fn uniffi_has_operation(canonical: &str) -> bool {
         source_has_fn(UNIFFI_BRIDGE, name)
             || source_has_fn(UNIFFI_SERVER, name)
             || source_has_fn(UNIFFI_SCP, name)
+            || source_has_fn(UNIFFI_OUTLET_STREAM, name)
     })
 }
 
@@ -676,6 +687,7 @@ fn pyo3_sources() -> Vec<&'static str> {
         PYO3_SCP,
         PYO3_SCPID,
         PYO3_SERVER,
+        PYO3_OUTLET_STREAM,
     ]
 }
 
@@ -1560,10 +1572,11 @@ fn every_alias_resolves_to_a_real_fn_or_exemption() {
                 source_has_fn(UNIFFI_BRIDGE, name)
                     || source_has_fn(UNIFFI_SERVER, name)
                     || source_has_fn(UNIFFI_SCP, name)
+                    || source_has_fn(UNIFFI_OUTLET_STREAM, name)
             });
             if !any_resolves {
                 phantom.push(format!(
-                    "uniffi:{} — none of the declared aliases {:?} resolve to `fn <name>(` in crates/scp-ffi/uniffi/src/{{bridge,server,scp}}.rs",
+                    "uniffi:{} — none of the declared aliases {:?} resolve to `fn <name>(` in crates/scp-ffi/uniffi/src/{{bridge,server,scp,outlet_stream}}.rs",
                     op.canonical, op.uniffi
                 ));
             }
