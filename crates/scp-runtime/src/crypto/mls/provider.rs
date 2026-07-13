@@ -98,15 +98,24 @@ use scp_protocol::crypto::sender_keys::{
 /// zeroize the intermediate `MlsCryptoSnapshot` struct after
 /// serialization/extraction to minimize the window where private keys
 /// exist as a structured, easily-extractable object in memory.
+// ADR-049 PR-7 (crypto-state move, prep A): visibility elevated from private to
+// `pub(crate)` (fields included) so the additive
+// [`crate::context::actor::PerContextState::export_crypto_state`] inherent method
+// can build the BYTE-IDENTICAL snapshot by moving this provider method's body
+// verbatim (Decision 6 / Decision 15(a)). This mirrors the earlier
+// `EpochState` / `TtlState` / `AccessControlState` / `GovernanceState` elevations
+// ("elevated from private to pub(crate) so the actor can carry it"). The struct
+// stays defined here; the provider retains its own `export_crypto_state` until
+// the atomic core (SCP-CRYPTOMOVE-001) deletes it.
 #[derive(Serialize, Deserialize)]
-struct MlsCryptoSnapshot {
+pub(crate) struct MlsCryptoSnapshot {
     /// The raw key-value pairs from the `OpenMLS` `MemoryStorage`.
     /// Each pair is `(key_bytes, value_bytes)`.
-    mls_storage_entries: Vec<(Vec<u8>, Vec<u8>)>,
+    pub(crate) mls_storage_entries: Vec<(Vec<u8>, Vec<u8>)>,
     /// The local member's AES-256 sender key (32 bytes).
-    local_sender_key: SenderKey,
+    pub(crate) local_sender_key: SenderKey,
     /// All sender keys for this context: `(sender_did, key)` pairs.
-    sender_key_entries: Vec<(String, SenderKey)>,
+    pub(crate) sender_key_entries: Vec<(String, SenderKey)>,
     /// Per-sender epoch high-water marks for this context:
     /// `(sender_did, epoch)` pairs.
     ///
@@ -130,42 +139,42 @@ struct MlsCryptoSnapshot {
     /// counter at snapshot time (bounded by `MAX_EPOCH_ADVANCE` in
     /// the receive path).
     #[serde(default)]
-    sender_key_epochs: Vec<(String, u64)>,
+    pub(crate) sender_key_epochs: Vec<(String, u64)>,
     /// The sender key epoch counter.
-    sender_key_epoch: u64,
+    pub(crate) sender_key_epoch: u64,
     /// The send-side message sequence counter.
     /// MIGRATION: `#[serde(default)]` — old snapshots deserialize as 0, which is
     /// the correct initial state. GCM nonces are random (`OsRng`), not counter-derived,
     /// so a sequence reset does not create nonce reuse.
     #[serde(default)]
-    send_sequence: u64,
+    pub(crate) send_sequence: u64,
     /// Remote members' X25519 wrapping public keys: `(did, pubkey)` pairs.
-    member_wrapping_keys: Vec<(String, [u8; 32])>,
+    pub(crate) member_wrapping_keys: Vec<(String, [u8; 32])>,
     /// The MLS signer (`SignatureKeyPair`) serialized via serde to bytes.
     /// `SignatureKeyPair` does not derive `Clone` without the `clonable`
     /// feature, so we serialize it separately and store the blob here.
-    signer_bytes: Vec<u8>,
+    pub(crate) signer_bytes: Vec<u8>,
     /// The MLS group ID bytes. Required to call `MlsGroup::load` on restore.
-    group_id: Vec<u8>,
+    pub(crate) group_id: Vec<u8>,
     /// Receive-side sequence tracking: `(sender_did, last_epoch, last_sequence)`.
     /// MIGRATION: `#[serde(default)]` — old snapshots deserialize with an empty
     /// tracker, so the first message from each sender is accepted unconditionally.
     /// MLS-level replay protection remains the primary defense; this tracker is
     /// defense-in-depth at the sender-key layer.
     #[serde(default)]
-    recv_sequence_tracker: Vec<(String, u64, u64)>,
+    pub(crate) recv_sequence_tracker: Vec<(String, u64, u64)>,
     /// The provider-level X25519 wrapping public key (§9.16.1).
     /// Persisted so remote members' HPKE-sealed sender key responses can
     /// still be decrypted after a restart. Without this, the restored
     /// provider would generate a fresh keypair whose public key doesn't
     /// match the one published in the MLS tree's `LeafNode` extension.
     #[serde(default)]
-    wrapping_public_key: [u8; 32],
+    pub(crate) wrapping_public_key: [u8; 32],
     /// The provider-level X25519 wrapping secret key (§9.16.1).
     /// Wrapped in a `Vec<u8>` for serde compatibility; the 32-byte key
     /// is re-wrapped in [`Zeroizing`] on restore.
     #[serde(default)]
-    wrapping_secret_key: Vec<u8>,
+    pub(crate) wrapping_secret_key: Vec<u8>,
 }
 
 // SECURITY: Manual Debug impl redacts all sensitive key material.
@@ -221,7 +230,11 @@ impl MlsCryptoSnapshot {
     /// bytes never linger un-zeroized in freed memory on ANY path (matches the
     /// parity guarantee the `scp-mls` and `scp-client` snapshots make via their
     /// own `Drop`s).
-    fn zeroize_secrets(&mut self) {
+    ///
+    /// ADR-049 PR-7 (prep A): `pub(crate)` so the additive
+    /// [`crate::context::actor::PerContextState::export_crypto_state`] verbatim
+    /// move can perform the identical end-of-function secret sweep.
+    pub(crate) fn zeroize_secrets(&mut self) {
         self.signer_bytes.zeroize();
         self.local_sender_key.zeroize();
         self.wrapping_secret_key.zeroize();

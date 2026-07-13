@@ -124,12 +124,23 @@ impl SendSequenceTracker {
     /// Reserve the next sequence number. Increments the high-water mark
     /// and returns the newly-issued number.
     ///
-    /// Wraps `u64`; per `SCP` protocol the protocol-level u64 ceiling is
-    /// far beyond any realistic per-context send rate (2^64 messages),
-    /// so wrap is impossible in practice. We `saturating_add` defensively
-    /// — a reservation request after saturation returns `u64::MAX`
-    /// repeatedly until the actor restarts; the impossible case fails
-    /// loudly rather than wrapping silently.
+    /// Per `SCP` protocol the u64 ceiling is far beyond any realistic
+    /// per-context send rate (2^64 messages), so reaching it is impossible in
+    /// practice. We `saturating_add` defensively — at `u64::MAX` a reservation
+    /// request returns `u64::MAX` repeatedly (the counter never wraps to `0`,
+    /// which would reuse an AAD sequence). This is a SATURATING floor, NOT a
+    /// fail-loud error: `reserve_next` itself does not signal overflow.
+    ///
+    /// Callers that need behavioral parity with the legacy
+    /// [`MlsCryptoProvider::seal`] overflow semantics (`send_sequence
+    /// .checked_add(1)?` — fail-closed, emit nothing at `u64::MAX`) MUST guard
+    /// the boundary at their own call site by checking [`Self::last_issued`]
+    /// `== u64::MAX` BEFORE reserving and erroring if so. The seal path
+    /// ([`crate::context::actor::PerContextState::seal`]) does exactly this;
+    /// the saturating behavior here is the RAII-rollback substrate, deliberately
+    /// non-erroring so `reserve` / `commit` stay infallible for the common path.
+    ///
+    /// [`MlsCryptoProvider::seal`]: crate::crypto::mls::provider::MlsCryptoProvider::seal
     pub const fn reserve_next(&mut self) -> u64 {
         self.last_issued = self.last_issued.saturating_add(1);
         self.last_issued
