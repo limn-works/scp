@@ -754,6 +754,17 @@ fn outlet_stream_grant_credit_impl(
     // of the DashMap shard guard so no ref is held across the block_on (the
     // DashMap-ref-across-await hazard). The monotonic grant counter is bumped
     // here under the guard (a sync atomic op) — the first grant gets seq 0.
+    //
+    // NOTE: `monotonic_seq` is assigned here under the DashMap guard, but the
+    // grant is APPLIED later under the SEPARATE per-handle lock. So two
+    // concurrent self-grants (same handle_id, same invoker) can be assigned
+    // seqs N and N+1 here, then apply in the opposite order under the handle
+    // lock — the runtime's `CreditTracker` then rejects the lower seq as
+    // `CreditReplay` (SCP-OUTLET-6110). This is fund-safe (the rejected grant's
+    // reserve is reversed on the apply-reject path below), only spuriously
+    // failing one of a racing pair; a well-behaved single-threaded caller never
+    // races its own grants. If strict FIFO grant admission is ever required,
+    // serialize seq-assign + apply under the handle lock.
     let (
         handle,
         context_id,
@@ -828,29 +839,48 @@ fn outlet_stream_grant_credit_impl(
             //    A reject here (InsufficientFunds / EscrowOverflow) leaves the
             //    credit window unchanged — no billing authorized.
             let reserved = supervisor
-                .outlet_stream_reserve_grant(&context_id, &invoker_did_typed, cost_per_chunk, grant)
+                .outlet_stream_reserve_grant(
+                    &context_id,
+                    &invoker_did_typed,
+                    request_id,
+                    cost_per_chunk,
+                    grant,
+                )
                 .await
                 .map_err(ScpPyError::from)?;
 
             // 3. Apply the signed grant against the debited hold. On rejection,
-            //    REVERSE the reserve so the debit is not stranded
-            //    (money-conservation). The reverse is infallible/saturating; a
-            //    reverse failure is logged-and-swallowed (the original grant
-            //    error is the caller-facing outcome).
+            //    REVERSE the reserve (CREDIT budget + un-bump the durable record,
+            //    atomically) so the debit is not stranded (money-conservation).
+            //    A `reverse_err` is logged-and-swallowed (the original grant
+            //    error is the caller-facing outcome) and is safe because the
+            //    reverse runs under `commit_class_s_keep`: its budget-credit and
+            //    record-un-bump are applied IN MEMORY regardless of the persist
+            //    outcome (the actor run loop retries the durable write), and
+            //    `outlet_stream_reverse_grant` only returns `Err` when the
+            //    context has no live actor — i.e. it is being torn down, so its
+            //    owned budget + record state are moot anyway. There is NO sweep
+            //    that would otherwise reconcile a stranded grant top-up.
             let apply = handle.lock().await.apply_credit_grant(&credit, reserved);
             match apply {
                 Ok(_new_total) => Ok(()),
                 Err(grant_err) => {
                     if let Err(reverse_err) = supervisor
-                        .outlet_stream_reverse_grant(&context_id, &invoker_did_typed, reserved)
+                        .outlet_stream_reverse_grant(
+                            &context_id,
+                            &invoker_did_typed,
+                            request_id,
+                            reserved,
+                        )
                         .await
                     {
                         tracing::warn!(
                             handle_id = %handle_id,
                             %reverse_err,
                             "outlet_stream_grant_credit: grant apply rejected AND the escrow \
-                             reverse failed — the debited hold is reconciled at stream close \
-                             by the settlement/reconcile sweep"
+                             reverse failed — reverse applied in memory (run loop retries the \
+                             persist); an Err here means the context has no live actor (being \
+                             torn down), so its budget + crash-recovery record are moot"
                         );
                     }
                     Err(ScpPyError::ContextError {

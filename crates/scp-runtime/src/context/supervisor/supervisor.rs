@@ -5321,6 +5321,13 @@ impl Supervisor {
             | OutletsCommand::ReverseStreamEscrow {
                 context_id, reply, ..
             }
+            // Grant reverse-on-reject: a missing actor means the context was
+            // torn down — the budget refund + record un-bump are MOOT (the
+            // torn-down state is gone). Reply the typed error (best-effort, like
+            // `ReverseStreamEscrow`).
+            | OutletsCommand::ReverseStreamGrantEscrow {
+                context_id, reply, ..
+            }
             // Fix-D: `PersistStreamReservation` shares the `Result<(),
             // ContextError>` reply shape. A missing actor means the just-reserved
             // context was torn down before the record could persist — reply the
@@ -10717,6 +10724,7 @@ impl Supervisor {
         &self,
         context_id: &str,
         invoker_did: &DID,
+        request_id: scp_protocol::context::outlets::stream::RequestId,
         cost_per_chunk: scp_protocol::economy::types::Amount,
         grant: u32,
     ) -> Result<scp_protocol::economy::types::Amount, ContextError> {
@@ -10724,6 +10732,7 @@ impl Supervisor {
         let cmd = OutletsCommand::ReserveStreamGrantEscrow {
             context_id: context_id.to_owned(),
             member_did: invoker_did.clone(),
+            request_id,
             cost_per_chunk,
             grant,
             reply: reply_tx,
@@ -10740,12 +10749,14 @@ impl Supervisor {
     /// [`Self::outlet_stream_reserve_grant`] when the subsequent credit-grant
     /// apply rejects (signature / replay / stream-closed).
     ///
-    /// Thin `pub` wrapper over [`Self::reverse_stream_escrow_via_actor`] (the
-    /// same `MemberBudgetTracker::reverse_spend` refund the open-path escrow
-    /// ticket uses) so the FFI bridge — which cannot reach the
-    /// `pub(in crate::context)` inner method — has a clean reserve/reverse pair.
-    /// `reverse_spend` is infallible / saturating, so a reverse after a race
-    /// that already refunded is a safe no-op.
+    /// Dispatches [`OutletsCommand::ReverseStreamGrantEscrow`], which CREDITS the
+    /// budget hold back AND un-bumps the durable crash-recovery record
+    /// (`reserved_escrow`) keyed by `request_id`, ATOMICALLY — the two legs must
+    /// move together or a crash between them would make the reconcile sweep
+    /// double-refund. This is DISTINCT from the open-path escrow ticket's
+    /// `reverse_stream_escrow` (budget only), because a grant that already bumped
+    /// the record must also un-bump it. Both operations are saturating, so a
+    /// reverse after a race that already refunded is a safe no-op.
     ///
     /// # Errors
     ///
@@ -10755,10 +10766,23 @@ impl Supervisor {
         &self,
         context_id: &str,
         invoker_did: &DID,
+        request_id: scp_protocol::context::outlets::stream::RequestId,
         amount: scp_protocol::economy::types::Amount,
     ) -> Result<(), ContextError> {
-        self.reverse_stream_escrow_via_actor(context_id, invoker_did, amount)
-            .await
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let cmd = OutletsCommand::ReverseStreamGrantEscrow {
+            context_id: context_id.to_owned(),
+            member_did: invoker_did.clone(),
+            request_id,
+            amount,
+            reply: reply_tx,
+        };
+        self.dispatch_outlets_command(cmd).await?;
+        reply_rx.await.map_err(|_| {
+            ContextError::TransportFailed(
+                "Supervisor::outlet_stream_reverse_grant — actor reply channel closed".to_owned(),
+            )
+        })?
     }
 
     /// Dispatch the Phase-3 [`OutletsCommand::SettleOutletEconomy`] to the
@@ -13682,6 +13706,7 @@ impl Supervisor {
             | OutletsCommand::ReserveOutletEconomy { context_id, .. }
             | OutletsCommand::ReserveOutletStreamEconomy { context_id, .. }
             | OutletsCommand::ReserveStreamGrantEscrow { context_id, .. }
+            | OutletsCommand::ReverseStreamGrantEscrow { context_id, .. }
             | OutletsCommand::ReserveStreamCaveatCounter { context_id, .. }
             | OutletsCommand::ReleaseStreamCaveatCounter { context_id, .. }
             | OutletsCommand::ReverseStreamEscrow { context_id, .. }

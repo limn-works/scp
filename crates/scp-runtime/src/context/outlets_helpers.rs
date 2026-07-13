@@ -1317,15 +1317,37 @@ pub async fn reserve_outlet_stream_economy(
 /// pump's `CreditTracker::max_billable`, so no quantity of grants can bill past
 /// the invoker's caveat ceiling regardless of how much escrow is held.
 ///
-/// # Money-conservation
+/// # Money-conservation + crash-recovery
 ///
 /// The debit is the ONLY authority for billing the granted chunks: the pump
 /// bills at most `reserved_top_up / cost_per_chunk` further Data chunks against
 /// this hold, and the unspent remainder is refunded at close by the same
 /// settlement path that refunds the open-time hold. If the grant apply then
 /// rejects, the caller MUST reverse this exact amount via
-/// [`ReverseStreamEscrow`](crate::context::actor::commands::OutletsCommand::ReverseStreamEscrow)
-/// so `billed + refund == reserved` holds across open + every grant.
+/// [`reverse_stream_grant_escrow`] so `billed + refund == reserved` holds across
+/// open + every grant.
+///
+/// The debit is paired ATOMICALLY (same fail-closed commit) with a bump of the
+/// durable crash-recovery record's
+/// [`reserved_escrow`](crate::context::outlets::invoke::StreamReservationRecord::reserved_escrow)
+/// keyed by `request_id`. Without this, a hard crash AFTER a grant would leave
+/// [`reconcile_stream_reservations`] refunding only the OPEN-time hold (the
+/// record still carries the open value) while the grant top-up — durably
+/// debited but tracked only in the ephemeral pump escrow ledger, which dies
+/// with the crash — is never refunded and no settle fires (billed = 0), so the
+/// invoker is permanently OVER-charged the cumulative grant. Bumping the record
+/// makes reconcile refund `open + Σgrants`. A stream that reserved zero escrow
+/// at open (declared estimate 0) persisted no record; the first grant CREATES
+/// one (escrow-only: empty `ucan_cid`, zero counter) so the top-up is still
+/// crash-covered.
+///
+/// [`commit_class_s_compensating`](crate::context::actor::class_s::ClassSCell::commit_class_s_compensating)
+/// (NOT the keep variant) is the correct combinator: on persist failure it
+/// SNAPSHOT-RESTORES the Class-S record bump AND runs the Class-C compensation
+/// to reverse the budget debit — both undone together, so a failed grant leaves
+/// budget and record consistent. The keep variant's Class-C-only compensation
+/// cannot reach the Class-S record, which would leave the record over-stating
+/// the reversed budget.
 ///
 /// # Errors
 ///
@@ -1336,6 +1358,7 @@ pub async fn reserve_stream_grant_escrow(
     deps: &ActorDeps,
     context_id: &str,
     member_did: &DID,
+    request_id: scp_protocol::context::outlets::stream::RequestId,
     cost_per_chunk: Amount,
     grant: u32,
 ) -> Result<Amount, ContextError> {
@@ -1355,20 +1378,23 @@ pub async fn reserve_stream_grant_escrow(
         ));
     };
 
-    // Gate + DEBIT under a fail-closed persist. The actor processes commands
-    // serially, so the check-and-debit is atomic without an external lock. The
-    // budget debit is Class-C; on persist failure the compensation reverses it
-    // (mirroring the open path's debit block). NO velocity / hard-rate token is
-    // consumed by a grant, so there is nothing to roll back on rejection beyond
-    // the (not-yet-applied) debit itself.
-    cell.commit_class_s_keep_compensating(
+    let generation = cell.generation;
+    let record_key = hex::encode(request_id);
+    let member_owned = member_did.clone();
+
+    // Gate + DEBIT the budget AND bump the durable crash-recovery record under
+    // ONE fail-closed persist. The actor processes commands serially, so the
+    // check-and-debit is atomic without an external lock. NO velocity /
+    // hard-rate token is consumed by a grant, so the only rollback needed on
+    // rejection is the (not-yet-applied) debit + record bump.
+    cell.commit_class_s_compensating(
         deps,
         context_id,
         |mut view| {
             let state = view.rest_mut();
-            let remaining = state.governance.budget_tracker.remaining(member_did);
+            let remaining = state.governance.budget_tracker.remaining(&member_owned);
             if reserved.value() > remaining.value() {
-                // Insufficient funds: reject BEFORE the debit.
+                // Insufficient funds: reject BEFORE the debit / record bump.
                 return Err(invocation_error_to_context(
                     OpenStreamRejection::InsufficientFunds.to_invocation_error(),
                 ));
@@ -1376,7 +1402,7 @@ pub async fn reserve_stream_grant_escrow(
             if state
                 .governance
                 .budget_tracker
-                .record_spend(member_did, reserved)
+                .record_spend(&member_owned, reserved)
                 .is_err()
             {
                 // Defensive: `record_spend` reject (budget drained after the
@@ -1386,20 +1412,85 @@ pub async fn reserve_stream_grant_escrow(
                     OpenStreamRejection::InsufficientFunds.to_invocation_error(),
                 ));
             }
+            // Bump the durable crash-recovery record so reconcile refunds
+            // `open + Σgrants` on a hard crash (Class-S). `or_insert_with`
+            // covers a stream that reserved zero escrow at open (no record was
+            // persisted) — the grant creates an escrow-only record.
+            let record = state
+                .class_s
+                .stream_reservations
+                .entry(record_key.clone())
+                .or_insert_with(
+                    || crate::context::outlets::invoke::StreamReservationRecord {
+                        invoker_did: member_owned.clone(),
+                        ucan_cid: String::new(),
+                        cost_per_chunk,
+                        amount_cumulative_reserved: 0,
+                        reserved_escrow: Amount::new(0),
+                        generation,
+                    },
+                );
+            record.reserved_escrow = record.reserved_escrow.saturating_add(reserved);
             // `value` = the reserved hold returned to the caller; `external` =
-            // the same hold the persist-failure reversal needs to reverse the
-            // Class-C budget debit.
+            // the same hold the persist-failure compensation reverses on the
+            // Class-C budget (the Class-S record bump is restored by the
+            // combinator's snapshot).
             Ok((reserved, reserved))
         },
-        // KEEP-direction (no Class-S mutation to restore). On persist failure
-        // reverse the Class-C budget debit the failed persist did not make
-        // durable.
+        // On persist failure the combinator has ALREADY snapshot-restored the
+        // Class-S record bump; this Class-C compensation reverses the budget
+        // debit the failed persist did not make durable.
         async |reserved: Amount, mut view, _deps| {
             view.governance_class_c_mut()
                 .budget_tracker_mut()
                 .reverse_spend(member_did, reserved);
         },
     )
+    .await
+}
+
+/// Reverse of [`reserve_stream_grant_escrow`] — CREDIT the budget hold back AND
+/// un-bump the durable crash-recovery record, atomically, when a grant apply is
+/// rejected (signature / replay / stream-closed) after the reserve debited.
+///
+/// Both legs must move together or a crash between them re-introduces the exact
+/// over-/under-charge asymmetry the reserve's atomic bump closes: crediting the
+/// budget while leaving the record bumped would make
+/// [`reconcile_stream_reservations`] double-refund the reversed hold. Both
+/// operations are saturating (`reverse_spend` / `saturating_sub`), so a
+/// double-reverse (a Drop-guard racing an explicit reverse) is a safe no-op.
+/// Run under [`commit_class_s_keep`](crate::context::actor::class_s::ClassSCell::commit_class_s_keep):
+/// a reverse must never un-reverse, so KEEP-on-persist-failure (the run loop
+/// retries the durable write) is the correct direction.
+///
+/// # Errors
+///
+/// [`ContextError::PersistenceFailed`] when the fail-closed persist does not
+/// land (the credit is KEEP'd in memory — the run loop retries).
+pub async fn reverse_stream_grant_escrow(
+    cell: &mut crate::context::actor::class_s::ClassSCell,
+    deps: &ActorDeps,
+    context_id: &str,
+    member_did: &DID,
+    request_id: scp_protocol::context::outlets::stream::RequestId,
+    amount: Amount,
+) -> Result<(), ContextError> {
+    if amount.value() == 0 {
+        return Ok(());
+    }
+    let member_owned = member_did.clone();
+    let record_key = hex::encode(request_id);
+    cell.commit_class_s_keep(deps, context_id, move |mut view| {
+        let state = view.rest_mut();
+        state
+            .governance
+            .budget_tracker
+            .reverse_spend(&member_owned, amount);
+        if let Some(record) = state.class_s.stream_reservations.get_mut(&record_key) {
+            record.reserved_escrow = record.reserved_escrow.saturating_sub(amount);
+        }
+        Ok(())
+    })
     .await
 }
 
@@ -4612,6 +4703,28 @@ mod tests {
         // reserve_stream_grant_escrow — §5.4.5 mid-stream GRANT top-up
         // -------------------------------------------------------------------
 
+        /// A fixed stream `request_id` keying the crash-recovery record the
+        /// grant reserve bumps.
+        const GRANT_REQ: scp_protocol::context::outlets::stream::RequestId = [7u8; 16];
+
+        /// Seeds a durable open-time crash-recovery record for `GRANT_REQ` with
+        /// `open_hold` escrow — mirrors what the open path persists once a stream
+        /// has debited an escrow hold. Lets the grant tests assert the record's
+        /// `reserved_escrow` tracks `open + Σgrants`.
+        fn seed_open_record(state: &mut PerContextState, open_hold: u64) {
+            state.class_s.stream_reservations.insert(
+                hex::encode(GRANT_REQ),
+                crate::context::outlets::invoke::StreamReservationRecord {
+                    invoker_did: invoker(),
+                    ucan_cid: String::new(),
+                    cost_per_chunk: Amount::new(10),
+                    amount_cumulative_reserved: 0,
+                    reserved_escrow: Amount::new(open_hold),
+                    generation: 0,
+                },
+            );
+        }
+
         async fn grant_reserve(
             cell: &mut ClassSCell,
             deps: &ActorDeps,
@@ -4623,6 +4736,7 @@ mod tests {
                 deps,
                 &ctx_key(),
                 &invoker(),
+                GRANT_REQ,
                 Amount::new(cost),
                 grant,
             )
@@ -4630,12 +4744,16 @@ mod tests {
         }
 
         /// Success: a grant DEBITS `cost_per_chunk × grant` from the invoker's
-        /// budget and returns exactly that hold — the amount the bridge threads
-        /// into `apply_credit_grant` as `reserved_top_up`.
+        /// budget, returns exactly that hold (the amount the bridge threads into
+        /// `apply_credit_grant` as `reserved_top_up`), AND bumps the durable
+        /// crash-recovery record's `reserved_escrow` by the same amount so a
+        /// hard crash refunds `open + grant`.
         #[tokio::test]
-        async fn grant_debits_incremental_escrow() {
+        async fn grant_debits_incremental_escrow_and_bumps_record() {
             let deps = build_deps(Box::new(OkPersistence)).await;
-            let mut cell = ClassSCell::new(member_state(1000));
+            let mut state = member_state(1000);
+            seed_open_record(&mut state, 50); // open-time hold
+            let mut cell = ClassSCell::new(state);
 
             let reserved = grant_reserve(&mut cell, &deps, 10, 4)
                 .await
@@ -4646,6 +4764,30 @@ mod tests {
                 cell.governance.budget_tracker.total_spent(&invoker()),
                 Amount::new(40),
                 "the 40-unit grant hold is DEBITED against the invoker's budget"
+            );
+            assert_eq!(
+                cell.class_s.stream_reservations[&hex::encode(GRANT_REQ)].reserved_escrow,
+                Amount::new(90),
+                "the crash-recovery record tracks open 50 + grant 40 = 90"
+            );
+        }
+
+        /// A grant on a stream that reserved ZERO escrow at open (no record was
+        /// persisted) CREATES an escrow-only record so the top-up is still
+        /// crash-covered.
+        #[tokio::test]
+        async fn grant_creates_record_when_open_reserved_nothing() {
+            let deps = build_deps(Box::new(OkPersistence)).await;
+            let mut cell = ClassSCell::new(member_state(1000)); // no seeded record
+
+            let _ = grant_reserve(&mut cell, &deps, 10, 3)
+                .await
+                .expect("grant reserve");
+
+            assert_eq!(
+                cell.class_s.stream_reservations[&hex::encode(GRANT_REQ)].reserved_escrow,
+                Amount::new(30),
+                "the first grant creates the record with reserved_escrow = grant 30"
             );
         }
 
@@ -4752,13 +4894,18 @@ mod tests {
         }
 
         /// A grant hold that a rejected apply must reverse round-trips to a net
-        /// ZERO debit: reserve DEBITS, then `reverse_stream_escrow` CREDITS the
-        /// same amount back — the money-conservation invariant the bridge upholds
-        /// on an apply rejection.
+        /// ZERO debit AND leaves the durable record un-bumped: reserve DEBITS +
+        /// bumps the record, then `reverse_stream_grant_escrow` CREDITS the
+        /// budget back AND un-bumps the record ATOMICALLY — the money-
+        /// conservation invariant the bridge upholds on an apply rejection. If
+        /// the reverse un-bumped only the budget, a crash after it would make
+        /// reconcile double-refund the still-bumped record.
         #[tokio::test]
-        async fn grant_reserve_then_reverse_conserves_budget() {
+        async fn grant_reserve_then_reverse_conserves_budget_and_record() {
             let deps = build_deps(Box::new(OkPersistence)).await;
-            let mut cell = ClassSCell::new(member_state(1000));
+            let mut state = member_state(1000);
+            seed_open_record(&mut state, 50);
+            let mut cell = ClassSCell::new(state);
 
             let reserved = grant_reserve(&mut cell, &deps, 10, 4)
                 .await
@@ -4768,24 +4915,96 @@ mod tests {
                 Amount::new(40),
                 "the grant hold is debited"
             );
+            assert_eq!(
+                cell.class_s.stream_reservations[&hex::encode(GRANT_REQ)].reserved_escrow,
+                Amount::new(90),
+                "the record is bumped to open 50 + grant 40"
+            );
 
-            super::super::reverse_stream_escrow(&mut cell, &deps, &ctx_key(), &invoker(), reserved)
-                .await
-                .expect("reverse the grant hold");
+            super::super::reverse_stream_grant_escrow(
+                &mut cell,
+                &deps,
+                &ctx_key(),
+                &invoker(),
+                GRANT_REQ,
+                reserved,
+            )
+            .await
+            .expect("reverse the grant hold");
 
             assert_eq!(
                 cell.governance.budget_tracker.total_spent(&invoker()),
                 Amount::new(0),
                 "reverse credits the full hold back — net-zero debit (billed + refund == reserved)"
             );
+            assert_eq!(
+                cell.class_s.stream_reservations[&hex::encode(GRANT_REQ)].reserved_escrow,
+                Amount::new(50),
+                "reverse un-bumps the record back to the open-time hold (no double-refund on crash)"
+            );
+        }
+
+        /// HARD-CRASH crash-recovery (HIGH — crypto): open (record persisted with
+        /// the open hold) → grant (budget + record both bumped) → simulate a hard
+        /// crash BEFORE any settle (the ephemeral pump escrow ledger is lost) →
+        /// the restore-time `reconcile_stream_reservations` sweep refunds
+        /// `open + grant`, so the invoker is NOT over-charged the grant top-up.
+        #[tokio::test]
+        async fn grant_then_hard_crash_reconcile_refunds_open_plus_grant() {
+            let deps = build_deps(Box::new(OkPersistence)).await;
+            let mut state = member_state(1000);
+            seed_open_record(&mut state, 50); // open-time escrow hold, durable
+            // The open hold was already debited at open; model that on the state
+            // before wrapping it in the cell.
+            state
+                .governance
+                .budget_tracker
+                .record_spend(&invoker(), Amount::new(50))
+                .expect("open-time debit");
+            let mut cell = ClassSCell::new(state);
+
+            // A grant tops up escrow by 10 × 4 = 40 (budget + durable record).
+            grant_reserve(&mut cell, &deps, 10, 4)
+                .await
+                .expect("grant reserve");
+            assert_eq!(
+                cell.governance.budget_tracker.total_spent(&invoker()),
+                Amount::new(90),
+                "open 50 + grant 40 debited"
+            );
+
+            // HARD CRASH before settle: the pump + its ephemeral escrow ledger
+            // vanish; only the durable record survives. Restore-time reconcile
+            // refunds the FULL record (billed unknown post-crash — service-
+            // rendered billing is captured elsewhere, so full refund is the
+            // conservative, no-over-charge choice).
+            let refunded =
+                super::super::reconcile_stream_reservations(&mut cell, &deps, &ctx_key())
+                    .await
+                    .expect("reconcile sweep");
+            assert_eq!(refunded, 1, "one unresolved record reconciled");
+
+            assert_eq!(
+                cell.governance.budget_tracker.total_spent(&invoker()),
+                Amount::new(0),
+                "reconcile refunds open 50 + grant 40 = 90 — the invoker is NOT over-charged \
+                 the grant top-up (the pre-fix bug refunded only the open 50)"
+            );
+            assert!(
+                cell.class_s.stream_reservations.is_empty(),
+                "the reconciled record is cleared"
+            );
         }
 
         /// A fail-closed persist failure during the grant debit reverses the
-        /// debit (the compensation path) — no funds are stranded.
+        /// debit AND restores the record bump (the `commit_class_s_compensating`
+        /// snapshot-restore path) — no funds stranded, record unchanged.
         #[tokio::test]
-        async fn grant_persist_failure_reverses_debit() {
+        async fn grant_persist_failure_reverses_debit_and_restores_record() {
             let deps = build_deps(Box::new(FailPersistence)).await;
-            let mut cell = ClassSCell::new(member_state(1000));
+            let mut state = member_state(1000);
+            seed_open_record(&mut state, 50);
+            let mut cell = ClassSCell::new(state);
 
             let err = grant_reserve(&mut cell, &deps, 10, 4)
                 .await
@@ -4794,6 +5013,11 @@ mod tests {
             assert!(
                 matches!(err, ContextError::PersistenceFailed(_)),
                 "a failed fail-closed persist surfaces PersistenceFailed: {err:?}"
+            );
+            assert_eq!(
+                cell.class_s.stream_reservations[&hex::encode(GRANT_REQ)].reserved_escrow,
+                Amount::new(50),
+                "the record bump is RESTORED on persist failure (back to the open hold)"
             );
             assert_eq!(
                 cell.governance.budget_tracker.total_spent(&invoker()),

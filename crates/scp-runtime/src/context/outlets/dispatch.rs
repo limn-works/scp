@@ -911,15 +911,15 @@ impl StreamSessionHandle {
     /// `reserved_top_up` is the `cost_per_chunk × grant` amount the caller
     /// (the FFI bridge) has ALREADY reserved (DEBITED) against the
     /// invoker's `MemberBudgetTracker` via
-    /// [`crate::context::manager::ContextManager::outlet_stream_reserve_grant`]
+    /// [`Supervisor::outlet_stream_reserve_grant`](crate::context::supervisor::Supervisor::outlet_stream_reserve_grant)
     /// BEFORE invoking this method (E2 remediation). The
     /// `InsufficientFunds` / `Overflow` decision therefore lives entirely in
-    /// the manager — the only lock holder. If THIS method rejects the
+    /// the actor — the only lock holder. If THIS method rejects the
     /// grant (signature / replay) after the caller already reserved, the
     /// caller MUST reverse the debit via
-    /// [`crate::context::manager::ContextManager::outlet_stream_reverse_spend`]
+    /// [`Supervisor::outlet_stream_reverse_grant`](crate::context::supervisor::Supervisor::outlet_stream_reverse_grant)
     /// — the §5.4.5 atomicity invariant is upheld jointly by the
-    /// (manager debit) → (handle apply) → (manager reverse on apply-reject)
+    /// (actor debit) → (handle apply) → (actor reverse on apply-reject)
     /// sequence.
     ///
     /// Wakes the pump via the grant notifier so a stalled executor can

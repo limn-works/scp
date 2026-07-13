@@ -2326,11 +2326,13 @@ pub enum OutletsCommand {
     /// credit window with NO corresponding debit (§5.4.5 "Credit-grant escrow
     /// top-up"). Unlike the open reserve it runs NO hard-rate / velocity /
     /// membership gate (those are admission-time concerns already paid at open);
-    /// it is purely the incremental escrow debit. Replies with the reserved
-    /// `Amount` the FFI bridge threads into
+    /// it is purely the incremental escrow debit, paired ATOMICALLY with a bump
+    /// of the durable crash-recovery record (keyed by `request_id`) so a hard
+    /// crash after a grant refunds `open + Σgrants`, not just the open hold.
+    /// Replies with the reserved `Amount` the FFI bridge threads into
     /// [`StreamSessionHandle::apply_credit_grant`](crate::context::outlets::dispatch::StreamSessionHandle::apply_credit_grant)
-    /// as `reserved_top_up`, and reverses via [`Self::ReverseStreamEscrow`] if
-    /// the grant apply then rejects (signature / replay / stream-closed).
+    /// as `reserved_top_up`, and reverses via [`Self::ReverseStreamGrantEscrow`]
+    /// if the grant apply then rejects (signature / replay / stream-closed).
     ///
     /// See [`crate::context::outlets_helpers::reserve_stream_grant_escrow`].
     ReserveStreamGrantEscrow {
@@ -2338,6 +2340,9 @@ pub enum OutletsCommand {
         context_id: String,
         /// The invoker (== the pinned stream invoker) whose budget is debited.
         member_did: scp_did::DID,
+        /// The stream's `request_id` — keys the durable crash-recovery record
+        /// whose `reserved_escrow` is bumped atomically with the debit.
+        request_id: scp_protocol::context::outlets::stream::RequestId,
         /// Per-Data-chunk cost. `Amount::new(0)` (Query / zero-cost) short-
         /// circuits to a zero hold with no balance consultation (spec: "For
         /// Query outlets and zero-cost outlets no top-up is performed").
@@ -2349,6 +2354,28 @@ pub enum OutletsCommand {
         /// `SCP-OUTLET-6120`/`6089`-class escrow rejection
         /// (`EscrowOverflow` / `InsufficientFunds`).
         reply: oneshot::Sender<Result<scp_protocol::economy::types::Amount, ContextError>>,
+    },
+
+    /// Reverse of [`Self::ReserveStreamGrantEscrow`] — CREDIT the grant hold back
+    /// AND un-bump the durable crash-recovery record, atomically, when a grant
+    /// apply is rejected after the reserve debited. Both legs move together so a
+    /// crash between them cannot make [`crate::context::outlets_helpers::reconcile_stream_reservations`]
+    /// double-refund the reversed hold. Both operations are saturating, so a
+    /// double-reverse is a safe no-op.
+    ///
+    /// See [`crate::context::outlets_helpers::reverse_stream_grant_escrow`].
+    ReverseStreamGrantEscrow {
+        /// Context identifier string.
+        context_id: String,
+        /// The invoker whose budget hold is being credited back.
+        member_did: scp_did::DID,
+        /// The stream's `request_id` — keys the durable crash-recovery record
+        /// whose `reserved_escrow` is un-bumped atomically with the credit.
+        request_id: scp_protocol::context::outlets::stream::RequestId,
+        /// The grant hold amount to return (saturating at `0`).
+        amount: scp_protocol::economy::types::Amount,
+        /// Oneshot reply carrying the persist / transport infra outcome.
+        reply: oneshot::Sender<Result<(), ContextError>>,
     },
 
     /// Off-mailbox streaming §7.3.8 value-caveat counter reservation on
