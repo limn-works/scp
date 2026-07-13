@@ -270,6 +270,7 @@ impl<'a> CloseOrchestrator<'a> {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    use scp_protocol::context::builder::ReceiveFloor;
 
     const TEST_DID: &str = "did:dht:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK";
 
@@ -449,7 +450,15 @@ mod tests {
         // The group MUST be present under the digest before destruction — proves
         // this is a real destroy, not a phantom no-op against an empty slot.
         let before = crypto
-            .export_crypto_state(&digest)
+            .export_crypto_state(
+                &digest,
+                crypto.export_sender_key_epochs(&digest),
+                crypto
+                    .export_recv_sequence_floors(&digest)
+                    .into_iter()
+                    .map(|(did, (epoch, sequence))| (did, ReceiveFloor { epoch, sequence }))
+                    .collect(),
+            )
             .expect("export under the decoded digest must not error");
         assert!(
             !before.is_empty(),
@@ -477,7 +486,15 @@ mod tests {
         // (a silent no-op) and the digest slot would still be populated — this
         // assertion FAILS in that case (the ADR-056 fail-open).
         let after_digest = crypto
-            .export_crypto_state(&digest)
+            .export_crypto_state(
+                &digest,
+                crypto.export_sender_key_epochs(&digest),
+                crypto
+                    .export_recv_sequence_floors(&digest)
+                    .into_iter()
+                    .map(|(did, (epoch, sequence))| (did, ReceiveFloor { epoch, sequence }))
+                    .collect(),
+            )
             .expect("export under the decoded digest must not error");
         assert!(
             after_digest.is_empty(),
@@ -489,7 +506,15 @@ mod tests {
         // Belt-and-suspenders: nothing was ever keyed under SHA-256(id), so that
         // slot is (and remains) empty regardless of the resolution path.
         let after_raw = crypto
-            .export_crypto_state(&raw_bytes)
+            .export_crypto_state(
+                &raw_bytes,
+                crypto.export_sender_key_epochs(&raw_bytes),
+                crypto
+                    .export_recv_sequence_floors(&raw_bytes)
+                    .into_iter()
+                    .map(|(did, (epoch, sequence))| (did, ReceiveFloor { epoch, sequence }))
+                    .collect(),
+            )
             .expect("export under SHA-256(id) must not error");
         assert!(
             after_raw.is_empty(),

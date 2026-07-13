@@ -48,6 +48,7 @@ use scp_mls::group::{self, SCP_CIPHERSUITE, ScpMlsGroup};
 use scp_mls::validate_key_package_lifetime;
 use scp_protocol::context::ContextError;
 use scp_protocol::context::builder::ContextCreationError;
+use scp_protocol::context::builder::ReceiveFloor;
 use scp_protocol::crypto::sender_keys::{
     MAX_EPOCH_ADVANCE, NonceDedup, SenderKey, SenderKeyDistributionMessage, SenderKeyResponse,
     SenderKeyStore, generate_sender_key, generate_wrapping_keypair,
@@ -2249,15 +2250,43 @@ impl MlsCryptoProvider {
     /// wrapping public keys.
     ///
     /// Returns an empty `Vec` if no crypto state exists for the given context
-    /// (e.g., mock providers or broadcast-only contexts).
+    /// (a context that was never keyed, or whose state has been destroyed).
     ///
-    /// The default implementation returns an empty `Vec` (no state to persist).
-    /// Production providers that manage MLS groups MUST override this.
+    /// The two floor collections — `sender_key_epochs` (per-sender epoch
+    /// high-water marks) and `recv_sequence_floors` (per-sender intra-epoch
+    /// `(epoch, sequence)` anti-replay floors) — are supplied by the caller
+    /// rather than read from this provider's stores. Callers source them from
+    /// the provider's own `export_sender_key_epochs` / `export_recv_sequence_floors`
+    /// twins, so the persisted values are byte-identical to the previous
+    /// internally-sourced ones. Threading them as parameters freezes this
+    /// signature so the later read-authority switch (ADR-049 PR-6) is a pure
+    /// source swap at the call sites, with no further ripple here.
+    ///
+    /// **Caller contract.** `sender_key_epochs` and `recv_sequence_floors` MUST
+    /// be sourced for the SAME `context_id` passed to this call. Nothing binds
+    /// them structurally — supplying another context's floors would silently
+    /// persist the wrong floors into this context's snapshot.
+    ///
+    /// **Guard-span invariant.** Sourcing the floors in the caller splits what
+    /// was a single read-guard span (floors + the rest of the snapshot, all read
+    /// under one `DashMap` shard guard here) into two reads: the caller's floor
+    /// read and this method's internal read of everything else. Byte-identity
+    /// across that split holds under the ADR-049 single-writer-actor invariant —
+    /// the persist paths run synchronously on the owning actor task, the sole
+    /// writer of this context's crypto state, so no concurrent writer mutates the
+    /// floors between the caller's read and this export. The atomic read-authority
+    /// core (PR-6) inherits this exact two-read structure; it is not a
+    /// pass-through-specific regression.
     ///
     /// # Errors
     ///
     /// Returns [`ContextError::CryptoFailed`] if serialization fails.
-    pub fn export_crypto_state(&self, context_id: &[u8; 32]) -> Result<Vec<u8>, ContextError> {
+    pub fn export_crypto_state(
+        &self,
+        context_id: &[u8; 32],
+        sender_key_epochs: Vec<(String, u64)>,
+        recv_sequence_floors: Vec<(String, ReceiveFloor)>,
+    ) -> Result<Vec<u8>, ContextError> {
         // One-shot test seam (see `force_export_failure`): induce an export
         // failure so the spawn-from-Welcome crypto-durability fail-closed branch
         // can be driven end-to-end. `swap(false)` fires exactly once, then the
@@ -2330,9 +2359,10 @@ impl MlsCryptoProvider {
         // that regresses below the persisted floor). Includes entries
         // for senders whose key has been removed but whose floor is
         // still retained — `remove` intentionally preserves the epoch
-        // as a high-water mark.
-        let sender_key_epochs: Vec<(String, u64)> =
-            state.sender_key_store.epochs_for_context(&ctx_id_hex);
+        // as a high-water mark. The values arrive via the `sender_key_epochs`
+        // parameter (caller-sourced from `export_sender_key_epochs`, which reads
+        // this same store) rather than being read here — see the guard-span
+        // invariant on this method.
 
         // Read the provider-level wrapping keypair for persistence.
         // ADR-049 commit 12c.9f: load through `ArcSwap` and copy the
@@ -2355,10 +2385,18 @@ impl MlsCryptoProvider {
             // Move signer bytes out of the Zeroizing wrapper and into the
             // snapshot. The wrapper is left holding an empty Vec (which it
             // will zeroize on drop — a no-op for an empty vec).
-            recv_sequence_tracker: state
-                .recv_sequence_tracker
-                .iter()
-                .map(|(did, (epoch, seq))| (did.clone(), *epoch, *seq))
+            //
+            // The receive-side floors arrive via the `recv_sequence_floors`
+            // parameter (caller-sourced from `export_recv_sequence_floors`, which
+            // iterates this same `recv_sequence_tracker`) rather than being read
+            // here — see the guard-span invariant on this method. The
+            // `ReceiveFloor` newtype is unpacked into the snapshot's persisted
+            // `(did, epoch, sequence)` triples with an explicit named-field bind
+            // (never a tuple `.into()`, which would reintroduce the
+            // epoch/sequence transposition hazard).
+            recv_sequence_tracker: recv_sequence_floors
+                .into_iter()
+                .map(|(did, rf)| (did, rf.epoch, rf.sequence))
                 .collect(),
             signer_bytes: std::mem::take(&mut signer_bytes),
             group_id,
@@ -3952,7 +3990,17 @@ mod tests {
     fn export_crypto_state_returns_empty_for_unknown_context() {
         let provider = make_provider();
         let unknown_ctx = [0xFFu8; 32];
-        let exported = provider.export_crypto_state(&unknown_ctx).unwrap();
+        let exported = provider
+            .export_crypto_state(
+                &unknown_ctx,
+                provider.export_sender_key_epochs(&unknown_ctx),
+                provider
+                    .export_recv_sequence_floors(&unknown_ctx)
+                    .into_iter()
+                    .map(|(did, (epoch, sequence))| (did, ReceiveFloor { epoch, sequence }))
+                    .collect(),
+            )
+            .unwrap();
         assert!(
             exported.is_empty(),
             "should return empty Vec for unknown context"
@@ -4019,7 +4067,17 @@ mod tests {
         };
 
         // Export crypto state.
-        let exported = provider.export_crypto_state(&ctx_id).unwrap();
+        let exported = provider
+            .export_crypto_state(
+                &ctx_id,
+                provider.export_sender_key_epochs(&ctx_id),
+                provider
+                    .export_recv_sequence_floors(&ctx_id)
+                    .into_iter()
+                    .map(|(did, (epoch, sequence))| (did, ReceiveFloor { epoch, sequence }))
+                    .collect(),
+            )
+            .unwrap();
         assert!(!exported.is_empty(), "exported state should be non-empty");
 
         // Create a fresh provider and restore the state.
@@ -4087,6 +4145,104 @@ mod tests {
         }
     }
 
+    /// Prep-D pass-through pin (ADR-049 PR-6): the floors that
+    /// `export_crypto_state` now takes as parameters must land in the exported
+    /// snapshot exactly as the provider's own `export_sender_key_epochs` /
+    /// `export_recv_sequence_floors` twins report them — the byte-preserving
+    /// no-op that freezes the signature ahead of the atomic read-authority swap.
+    ///
+    /// Whole-blob byte equality across an export → restore → export cycle is NOT
+    /// a sound assertion: `mls_storage_entries` and `member_wrapping_keys`
+    /// serialize from `HashMap` iteration, whose order is nondeterministic, so
+    /// the blob's byte layout legitimately varies run to run (the existing
+    /// `export_restore_crypto_state_roundtrip` test asserts field/functional
+    /// equality, not bytes, for the same reason). This test instead pins the one
+    /// property Prep D actually changes — that the per-sender epoch floors and
+    /// the intra-epoch `(epoch, sequence)` floors are threaded from the twins
+    /// into the snapshot with no loss and no epoch/sequence transposition — by
+    /// deserializing the blob and comparing those fields, as order-insensitive
+    /// sets, against the twin outputs.
+    #[test]
+    fn export_crypto_state_floor_params_land_in_snapshot_verbatim() {
+        let provider = make_provider();
+        let ctx_id = make_context_id();
+        provider.create_mls_group(&ctx_id).unwrap();
+        provider.generate_sender_key(&ctx_id).unwrap();
+
+        let bob = "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo";
+        let carol = "did:dht:z6MkCarolCarolCarolCarolCarolCarolCarolCa";
+
+        // Seed a per-sender epoch high-water floor (sender-key side) and two
+        // distinct intra-epoch recv floors so both twin outputs are non-empty
+        // and the set comparison actually exercises data.
+        {
+            let ctx_id_hex = hex::encode(ctx_id);
+            let mut entry = provider.contexts.get_mut(&ctx_id).unwrap();
+            let state = entry.value_mut();
+            state
+                .sender_key_store
+                .set_unchecked(&ctx_id_hex, bob, generate_sender_key());
+            state
+                .sender_key_store
+                .restore_epoch_high_water(&ctx_id_hex, bob, 7);
+            state.recv_sequence_tracker.insert(bob.to_owned(), (7, 3));
+            state.recv_sequence_tracker.insert(carol.to_owned(), (2, 9));
+        }
+
+        // Export with the exact production provider-sourced floor params.
+        let exported = provider
+            .export_crypto_state(
+                &ctx_id,
+                provider.export_sender_key_epochs(&ctx_id),
+                provider
+                    .export_recv_sequence_floors(&ctx_id)
+                    .into_iter()
+                    .map(|(did, (epoch, sequence))| (did, ReceiveFloor { epoch, sequence }))
+                    .collect(),
+            )
+            .unwrap();
+        assert!(!exported.is_empty(), "keyed context must export non-empty");
+
+        let snapshot: MlsCryptoSnapshot = rmp_serde::from_slice(&exported).unwrap();
+
+        // Sender-key epoch floors: blob field == twin report (as a set).
+        let snap_epochs: std::collections::BTreeSet<(String, u64)> =
+            snapshot.sender_key_epochs.iter().cloned().collect();
+        let twin_epochs: std::collections::BTreeSet<(String, u64)> = provider
+            .export_sender_key_epochs(&ctx_id)
+            .into_iter()
+            .collect();
+        assert_eq!(
+            snap_epochs, twin_epochs,
+            "sender-key epoch floors in the blob must equal the twin's report"
+        );
+        assert!(
+            twin_epochs.contains(&(bob.to_owned(), 7)),
+            "the seeded epoch floor must be present"
+        );
+
+        // Recv (epoch, sequence) floors: blob field == twin report (as a set),
+        // with epoch and sequence in the right positions (no transposition).
+        let snap_recv: std::collections::BTreeSet<(String, u64, u64)> =
+            snapshot.recv_sequence_tracker.iter().cloned().collect();
+        let twin_recv: std::collections::BTreeSet<(String, u64, u64)> = provider
+            .export_recv_sequence_floors(&ctx_id)
+            .into_iter()
+            .map(|(did, (epoch, sequence))| (did, epoch, sequence))
+            .collect();
+        assert_eq!(
+            snap_recv, twin_recv,
+            "recv (epoch, sequence) floors in the blob must equal the twin's \
+             report with no epoch/sequence transposition"
+        );
+        assert!(
+            snap_recv.contains(&(bob.to_owned(), 7, 3))
+                && snap_recv.contains(&(carol.to_owned(), 2, 9)),
+            "both seeded recv floors must round-trip with epoch and sequence \
+             in the correct positions"
+        );
+    }
+
     #[test]
     fn restore_preserves_sender_key_epoch_high_water_mark() {
         // Regression for #1608 rollback-protection across restart.
@@ -4129,7 +4285,17 @@ mod tests {
         }
 
         // Step 2: export snapshot.
-        let exported = provider.export_crypto_state(&ctx_id).unwrap();
+        let exported = provider
+            .export_crypto_state(
+                &ctx_id,
+                provider.export_sender_key_epochs(&ctx_id),
+                provider
+                    .export_recv_sequence_floors(&ctx_id)
+                    .into_iter()
+                    .map(|(did, (epoch, sequence))| (did, ReceiveFloor { epoch, sequence }))
+                    .collect(),
+            )
+            .unwrap();
         assert!(!exported.is_empty());
 
         // Step 3: simulate restart — fresh provider, restore state.
@@ -4240,7 +4406,17 @@ mod tests {
         }
 
         // Snapshot + restart.
-        let exported = provider.export_crypto_state(&ctx_id).unwrap();
+        let exported = provider
+            .export_crypto_state(
+                &ctx_id,
+                provider.export_sender_key_epochs(&ctx_id),
+                provider
+                    .export_recv_sequence_floors(&ctx_id)
+                    .into_iter()
+                    .map(|(did, (epoch, sequence))| (did, ReceiveFloor { epoch, sequence }))
+                    .collect(),
+            )
+            .unwrap();
         let provider2 = MlsCryptoProvider::new(TEST_DID.to_string(), Arc::new(SystemClock));
         provider2.restore_crypto_state(&ctx_id, &exported).unwrap();
 
@@ -4870,7 +5046,17 @@ mod tests {
         }
 
         // Export, then hand-edit the msgpack to drop the epoch map.
-        let exported = provider.export_crypto_state(&ctx_id).unwrap();
+        let exported = provider
+            .export_crypto_state(
+                &ctx_id,
+                provider.export_sender_key_epochs(&ctx_id),
+                provider
+                    .export_recv_sequence_floors(&ctx_id)
+                    .into_iter()
+                    .map(|(did, (epoch, sequence))| (did, ReceiveFloor { epoch, sequence }))
+                    .collect(),
+            )
+            .unwrap();
         let mut snapshot: MlsCryptoSnapshot = rmp_serde::from_slice(&exported).unwrap();
         snapshot.sender_key_epochs.clear();
         let legacy_bytes = rmp_serde::to_vec_named(&snapshot).unwrap();
@@ -4955,7 +5141,17 @@ mod tests {
 
         // Export, then strip the per-sender epoch map to simulate a
         // legacy snapshot.
-        let exported = provider.export_crypto_state(&ctx_id).unwrap();
+        let exported = provider
+            .export_crypto_state(
+                &ctx_id,
+                provider.export_sender_key_epochs(&ctx_id),
+                provider
+                    .export_recv_sequence_floors(&ctx_id)
+                    .into_iter()
+                    .map(|(did, (epoch, sequence))| (did, ReceiveFloor { epoch, sequence }))
+                    .collect(),
+            )
+            .unwrap();
         let mut snapshot: MlsCryptoSnapshot = rmp_serde::from_slice(&exported).unwrap();
         snapshot.sender_key_epochs.clear();
         let legacy_bytes = rmp_serde::to_vec_named(&snapshot).unwrap();
@@ -5014,7 +5210,17 @@ mod tests {
                 .set_unchecked(&ctx_id_hex, bob_did, generate_sender_key());
         }
 
-        let exported = provider.export_crypto_state(&ctx_id).unwrap();
+        let exported = provider
+            .export_crypto_state(
+                &ctx_id,
+                provider.export_sender_key_epochs(&ctx_id),
+                provider
+                    .export_recv_sequence_floors(&ctx_id)
+                    .into_iter()
+                    .map(|(did, (epoch, sequence))| (did, ReceiveFloor { epoch, sequence }))
+                    .collect(),
+            )
+            .unwrap();
         let mut snapshot: MlsCryptoSnapshot = rmp_serde::from_slice(&exported).unwrap();
         snapshot.sender_key_epochs.clear();
         let legacy_bytes = rmp_serde::to_vec_named(&snapshot).unwrap();
@@ -5042,7 +5248,17 @@ mod tests {
         provider.destroy_mls_group(&ctx_id).unwrap();
 
         // After destroy, export should return empty (context removed).
-        let exported = provider.export_crypto_state(&ctx_id).unwrap();
+        let exported = provider
+            .export_crypto_state(
+                &ctx_id,
+                provider.export_sender_key_epochs(&ctx_id),
+                provider
+                    .export_recv_sequence_floors(&ctx_id)
+                    .into_iter()
+                    .map(|(did, (epoch, sequence))| (did, ReceiveFloor { epoch, sequence }))
+                    .collect(),
+            )
+            .unwrap();
         assert!(
             exported.is_empty(),
             "destroyed group should export empty state"
@@ -5064,7 +5280,17 @@ mod tests {
         let ctx_id = make_context_id();
         provider.create_mls_group(&ctx_id).unwrap();
 
-        let exported = provider.export_crypto_state(&ctx_id).unwrap();
+        let exported = provider
+            .export_crypto_state(
+                &ctx_id,
+                provider.export_sender_key_epochs(&ctx_id),
+                provider
+                    .export_recv_sequence_floors(&ctx_id)
+                    .into_iter()
+                    .map(|(did, (epoch, sequence))| (did, ReceiveFloor { epoch, sequence }))
+                    .collect(),
+            )
+            .unwrap();
 
         // Restore into a fresh provider twice — second should overwrite cleanly.
         let provider2 = MlsCryptoProvider::new(TEST_DID.to_string(), Arc::new(SystemClock));
@@ -5092,7 +5318,17 @@ mod tests {
             state.mls_group.epoch().unwrap()
         };
 
-        let exported = provider.export_crypto_state(&ctx_id).unwrap();
+        let exported = provider
+            .export_crypto_state(
+                &ctx_id,
+                provider.export_sender_key_epochs(&ctx_id),
+                provider
+                    .export_recv_sequence_floors(&ctx_id)
+                    .into_iter()
+                    .map(|(did, (epoch, sequence))| (did, ReceiveFloor { epoch, sequence }))
+                    .collect(),
+            )
+            .unwrap();
 
         let provider2 = MlsCryptoProvider::new(TEST_DID.to_string(), Arc::new(SystemClock));
         provider2.restore_crypto_state(&ctx_id, &exported).unwrap();
@@ -5131,7 +5367,17 @@ mod tests {
         );
 
         // Export the crypto state.
-        let exported = provider.export_crypto_state(&ctx_id).unwrap();
+        let exported = provider
+            .export_crypto_state(
+                &ctx_id,
+                provider.export_sender_key_epochs(&ctx_id),
+                provider
+                    .export_recv_sequence_floors(&ctx_id)
+                    .into_iter()
+                    .map(|(did, (epoch, sequence))| (did, ReceiveFloor { epoch, sequence }))
+                    .collect(),
+            )
+            .unwrap();
         assert!(!exported.is_empty());
 
         // Create a fresh provider (simulates restart — gets a NEW random keypair).

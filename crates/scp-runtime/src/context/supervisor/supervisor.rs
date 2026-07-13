@@ -38,6 +38,7 @@ use dashmap::DashMap;
 use scp_clock::Clock;
 use scp_did::DID;
 use scp_protocol::context::ContextError;
+use scp_protocol::context::builder::ReceiveFloor;
 use scp_protocol::context::governance::KeyResolver;
 use scp_protocol::context::membership::ContextEvent;
 
@@ -11568,8 +11569,22 @@ impl Supervisor {
                     //     `Err` — nothing has been persisted yet, so there is no durable
                     //     snapshot to delete (strictly cleaner than persist-then-delete, same
                     //     fail-closed guarantee).
+                    // ADR-049 PR-6: floors threaded as parameters, still
+                    // provider-sourced from the `export_*` twins (byte-identical
+                    // to the prior internal read). The atomic read-authority core
+                    // swaps these to the supervisor registry.
                     if !crate::context::messaging_helpers::welcome_snapshot_crypto_is_durable(
-                        &deps.crypto.export_crypto_state(&context_id_bytes),
+                        &deps.crypto.export_crypto_state(
+                            &context_id_bytes,
+                            deps.crypto.export_sender_key_epochs(&context_id_bytes),
+                            deps.crypto
+                                .export_recv_sequence_floors(&context_id_bytes)
+                                .into_iter()
+                                .map(|(did, (epoch, sequence))| {
+                                    (did, ReceiveFloor { epoch, sequence })
+                                })
+                                .collect(),
+                        ),
                     ) {
                         let _ = deps.crypto.destroy_mls_group(&context_id_bytes);
                         return Err(ContextError::PersistenceFailed(format!(
@@ -18277,7 +18292,17 @@ mod tests {
         let mut snap = crate::context::manager_methods::snapshot_context(&state);
         // Capture the live crypto state (floor=5) into the persisted snapshot,
         // exactly as `persist_state_best_effort` does.
-        snap.mls_crypto_state = crypto.export_crypto_state(&ctx_id_bytes).unwrap();
+        snap.mls_crypto_state = crypto
+            .export_crypto_state(
+                &ctx_id_bytes,
+                crypto.export_sender_key_epochs(&ctx_id_bytes),
+                crypto
+                    .export_recv_sequence_floors(&ctx_id_bytes)
+                    .into_iter()
+                    .map(|(did, (epoch, sequence))| (did, ReceiveFloor { epoch, sequence }))
+                    .collect(),
+            )
+            .unwrap();
         assert!(
             !snap.mls_crypto_state.is_empty(),
             "snapshot must carry crypto state so the floor guard runs on respawn"
