@@ -47,10 +47,11 @@
 //!      per-context tracker and the per-origin-invoker counter on the
 //!      operator-scoped [`OriginAdmissionTracker`] (§05-contexts.md:448),
 //!      both under the sanctioned lock order,
-//!    - publishes the `chunks_billed` value into the
-//!      `OutletInvokedEvent` field and verifies it via
-//!      [`super::stream::verify_chunks_billed`] before handing the
-//!      event to the event-log appender.
+//!    - publishes the frontier-derived `chunks_billed` value into the
+//!      `OutletInvokedEvent` field; the event-local wire-invariant
+//!      `chunks_billed <= stream_chunk_count` is then enforced at the
+//!      event-log append boundary via
+//!      [`super::stream::verify_outlet_invoked_event_local`].
 //!
 //! See `.docs/specs/05-contexts.md` §5.4.5 for the spec source.
 
@@ -2229,8 +2230,8 @@ where
     // delivered stream. We therefore (i) pass `None` to the inner
     // `invoke_outlet`'s sink, (ii) snapshot input_hash + identifiers
     // before forwarding the input value, and (iii) emit the event
-    // ourselves in the pump settlement block over the outer
-    // `emitted_chunks` manifest.
+    // ourselves in the pump settlement block from the outer pump's
+    // incremental `MerkleFrontier` (manifest_root + manifest_billed).
     let input_hash = scp_protocol::context::outlets::lifecycle::sha256_json(&input);
     let event_context_id = context.context_id().to_owned();
     let event_outlet_id: OutletId = outlet_id.clone();
