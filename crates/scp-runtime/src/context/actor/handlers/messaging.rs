@@ -59,6 +59,9 @@ pub const HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
 /// actor-shape messaging helpers). The send-sequence tracker
 /// (`state.send_tracker`) is reserved internally inside
 /// [`handle_send_message`].
+// One arm per `MessagingCommand` variant — a flat match-dispatcher, not a
+// complex body (mirrors the `#[allow]` on `handlers::lifecycle::dispatch`).
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn dispatch(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
@@ -129,6 +132,23 @@ pub(crate) async fn dispatch(
             role,
             reply,
         } => handle_test_insert_member(cell, deps, &member_did, &role, reply),
+        #[cfg(feature = "testing")]
+        MessagingCommand::TestGrantMemberCapability {
+            context_id,
+            member_did,
+            capability,
+            reply,
+        } => {
+            handle_test_grant_member_capability(
+                cell,
+                deps,
+                &context_id,
+                &member_did,
+                &capability,
+                reply,
+            )
+            .await
+        }
         #[cfg(feature = "testing")]
         MessagingCommand::TestInstallAccessKey {
             context_id,
@@ -272,6 +292,75 @@ fn handle_test_insert_member(
         Err(e) => Outcome::err_mutated(outcome_error_sketch(e)),
     };
     let _ = reply.send(result);
+    outcome
+}
+
+/// Handle [`MessagingCommand::TestGrantMemberCapability`] (actor-shape,
+/// test-only).
+///
+/// Inserts `capability` into the member's §7.2.2 Tier-2
+/// `role_state.member_capabilities` cache — exactly as the runtime fixture
+/// `authorizing_role_state` grants `Capability::OutletCallAll`, and as the
+/// governance role-execution path does at `governance.rs` — but without the
+/// round-trip. The insert is a Class-S authority GROW that DELIBERATELY
+/// bypasses the capability ceiling (matching the fixture): the ceiling is
+/// downward-auth Class-S with no structural-view `&mut`, so this seam reaches
+/// `role_state.member_capabilities` through the whole-state
+/// [`commit_class_s_keep`](crate::context::actor::class_s::ClassSCell::commit_class_s_keep)
+/// combinator (fail-closed persist; the grant is KEPT in memory even if the
+/// durable write fails, and the run loop retries it). Rejects an inactive
+/// context (pre-mutation gate → clean `err`, `mutated:false`) and an
+/// unrecognized capability stem.
+#[cfg(feature = "testing")]
+async fn handle_test_grant_member_capability(
+    cell: &mut crate::context::actor::class_s::ClassSCell,
+    deps: &ActorDeps,
+    context_id: &str,
+    member_did: &scp_did::DID,
+    capability: &str,
+    reply: oneshot::Sender<Result<(), ContextError>>,
+) -> Outcome<()> {
+    use scp_protocol::context::roles::Capability;
+
+    if let Err(e) = crate::context::state::require_active(&cell.handle) {
+        let sketch = outcome_error_sketch(&e);
+        let _ = reply.send(Err(e));
+        return Outcome::err(sketch);
+    }
+    // Parse the capability stem BEFORE any mutation so an unrecognized stem is a
+    // clean `err`/`mutated:false` reject (nothing was written).
+    let Some(cap) = Capability::new(capability) else {
+        let err =
+            ContextError::MembershipFailed(format!("unrecognized capability stem '{capability}'"));
+        let sketch = outcome_error_sketch(&err);
+        let _ = reply.send(Err(err));
+        return Outcome::err(sketch);
+    };
+    let member = member_did.to_string();
+    let commit = cell.commit_class_s_keep(deps, context_id, move |mut view| {
+        view.rest_mut()
+            .role_state
+            .member_capabilities
+            .entry(member)
+            .or_default()
+            .insert(cap);
+        Ok(())
+    });
+    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, commit).await {
+        Ok(Ok(())) => (Outcome::ok_mutated(()), Ok(())),
+        Ok(Err(err)) => {
+            let sketch = outcome_error_sketch(&err);
+            (Outcome::err_mutated(sketch), Err(err))
+        }
+        Err(_elapsed) => {
+            let err = ContextError::TransportTimeout(format!(
+                "test_grant_member_capability exceeded {HANDLER_TIMEOUT:?} budget"
+            ));
+            let sketch = outcome_error_sketch(&err);
+            (Outcome::err_mutated(sketch), Err(err))
+        }
+    };
+    let _ = reply.send(reply_result);
     outcome
 }
 

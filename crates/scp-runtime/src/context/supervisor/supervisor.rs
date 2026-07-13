@@ -12934,6 +12934,46 @@ impl Supervisor {
         })?
     }
 
+    /// Grants a §7.2.2 Tier-2 capability (e.g. `"outlet_call:*"`) directly into
+    /// a member's `role_state.member_capabilities` cache, bypassing the
+    /// governance role-assignment round-trip — test-only.
+    ///
+    /// The runtime outlet-invocation gate requires the invoker to hold
+    /// `OutletCall(outlet_id)` / `OutletCallAll` (or the Query stem) in role
+    /// state as defense-in-depth alongside the UCAN gate, and the default
+    /// `admin` / `member` roles grant only `messages:*`. Single-node outlet
+    /// tests use this to authorize a member the same way the runtime fixture
+    /// `authorizing_role_state` does. Gated behind the `testing` feature —
+    /// never compiled into production builds, never reachable from any FFI
+    /// bridge.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::MembershipFailed`] if the context is inactive or the
+    ///   capability stem is unrecognized.
+    /// - [`ContextError::TransportFailed`] if the actor reply channel closes.
+    #[cfg(feature = "testing")]
+    pub async fn test_grant_member_capability(
+        &self,
+        context_id: &str,
+        member_did: DID,
+        capability: &str,
+    ) -> Result<(), ContextError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = MessagingCommand::TestGrantMemberCapability {
+            context_id: context_id.to_owned(),
+            member_did,
+            capability: capability.to_owned(),
+            reply: tx,
+        };
+        self.dispatch_command(context_id, cmd).await?;
+        rx.await.map_err(|_| {
+            ContextError::TransportFailed(
+                "Supervisor::test_grant_member_capability — actor reply channel closed".to_owned(),
+            )
+        })?
+    }
+
     /// Appends a typed event directly to the supervisor-owned event-log
     /// provider for `context_id` — test-only.
     ///

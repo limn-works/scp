@@ -2208,7 +2208,7 @@ fn outlet_stream_open_path_wired_and_control_plane_not_found() {
             "grant on an unknown handle is a clean not-found error"
         );
         assert!(
-            scp.outlet_stream_cancel(&bogus, &invoker)
+            scp.outlet_stream_cancel(py, &bogus, &invoker)
                 .unwrap_err()
                 .to_string()
                 .contains("no active outlet stream"),
@@ -2216,10 +2216,10 @@ fn outlet_stream_open_path_wired_and_control_plane_not_found() {
         );
         assert!(
             scp.outlet_stream_terminate(
+                py,
                 &bogus,
                 &invoker,
                 "authorization.revoked-mid-stream",
-                "SCP-OUTLET-6110",
                 "x",
             )
             .unwrap_err()
@@ -2227,31 +2227,24 @@ fn outlet_stream_open_path_wired_and_control_plane_not_found() {
             .contains("no active outlet stream"),
             "terminate on an unknown handle is a clean not-found error"
         );
+        // An unknown handle is a DISTINCT error, NOT a `None` terminal — a
+        // stale/typo'd handle must never masquerade as a clean stream end.
         assert!(
-            scp.outlet_stream_poll_next(&bogus).unwrap().is_none(),
-            "poll on an unknown handle is a clean None"
+            scp.outlet_stream_poll_next(py, &bogus)
+                .unwrap_err()
+                .to_string()
+                .contains("no active outlet stream"),
+            "poll on an unknown handle is a distinct not-found error, not None"
         );
 
-        // The terminate slug/code guards are pure input validation (reachable
-        // without a live stream): an unknown slug and a code that disagrees with
-        // its slug both fail closed as validation errors.
+        // The terminate slug guard is pure input validation (reachable without a
+        // live stream): an unknown slug fails closed as a validation error. The
+        // canonical `code` is now derived internally from the slug, so there is
+        // no longer a caller-supplied code that could disagree with the slug.
         assert!(
-            scp.outlet_stream_terminate(&bogus, &invoker, "not.a.terminal.slug", "x", "y")
+            scp.outlet_stream_terminate(py, &bogus, &invoker, "not.a.terminal.slug", "y")
                 .is_err(),
             "an unknown terminate slug is rejected"
-        );
-        assert!(
-            scp.outlet_stream_terminate(
-                &bogus,
-                &invoker,
-                "authorization.revoked-mid-stream",
-                // In-range OUTLET code that disagrees with the slug's canonical
-                // code (SCP-OUTLET-6110) — the mismatch guard must reject it.
-                "SCP-OUTLET-6120",
-                "y",
-            )
-            .is_err(),
-            "a terminate code that disagrees with its slug is rejected"
         );
         let _ = stranger;
     });
@@ -2260,6 +2253,157 @@ fn outlet_stream_open_path_wired_and_control_plane_not_found() {
 /// The two pure protocol wrappers round-trip: `compute_caveats_binding`
 /// produces the 32-byte binding, and `verify_chunk_signature` rejects a chunk
 /// signed under a different key (fail-closed) while accepting a correctly
+/// GIL-deadlock regression (BLOCKER): a REAL Python outlet handler + a LIVE
+/// member-backed stream, driven through `outlet_stream_poll_next` to its
+/// terminal chunk.
+///
+/// # What this proves
+///
+/// The streaming pump runs the registered PYTHON handler on a detached tokio
+/// task; that handler REACQUIRES the GIL (`mcp.rs` `Python::with_gil`) to
+/// produce each chunk. `poll_next` blocks on the runtime awaiting that chunk.
+/// If `poll_next` held the GIL across its blocking `recv()` (the pre-fix bug),
+/// the consumer would park holding the GIL while the producer blocks trying to
+/// take it — a guaranteed interpreter deadlock, and THIS TEST WOULD HANG
+/// FOREVER. The `py.allow_threads` fix releases the GIL across `recv()`, so the
+/// producer runs, the chunk flows, and `poll_next` returns. Reaching the
+/// terminal chunk (rather than hanging) is the regression signal.
+///
+/// # Why it is now constructible
+///
+/// The invoker is made a real MEMBER via the `testing`-gated
+/// `Supervisor::test_insert_member`, so the open clears the §9.8.5 membership
+/// gate that rejects the delegated non-member in
+/// `outlet_stream_open_path_wired_and_control_plane_not_found`. The outlet is
+/// ZERO-cost (`build_outlet_reg` declares no `cost`), so no escrow / funding
+/// fixture is needed — the reserve is `Amount(0)`.
+#[cfg(feature = "testing")]
+#[test]
+fn outlet_stream_live_poll_next_drains_to_terminal_without_gil_deadlock() {
+    use scp_core::context::outlets::stream::{ChunkPayload, OutletStreamChunk};
+
+    Python::with_gil(|py| {
+        setup();
+        let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
+        let bi = scp.bridge_instance();
+
+        let creator = published_identity_did(py, &scp);
+        let invoker = published_identity_did(py, &scp);
+
+        runtime::init_context_manager_for_test(bi);
+        let ctx = {
+            let params = PyDict::new(py);
+            let handle = scp.context_create(&creator, &params.as_borrowed()).unwrap();
+            handle_context_id(py, &handle)
+        };
+
+        // Zero-cost outlet operated by the creator (co-resident custody signs
+        // chunks).
+        let reg = build_outlet_reg(py, "streaming_live", &creator);
+        let outlet_id = scp.outlet_register(&ctx, &reg.as_borrowed()).unwrap();
+
+        // Register a REAL PYTHON handler through the bridge's
+        // `mcp_register_outlet_handler` path — the closure that reacquires the
+        // GIL to produce the chunk (the producer side of the deadlock).
+        let handler: PyObject = py
+            .eval(c"lambda i: {'sum': 3, 'ok': 1}", None, None)
+            .unwrap()
+            .unbind();
+        scp.py_register_outlet_handler(py, &ctx, &outlet_id, handler)
+            .unwrap();
+
+        // Make the invoker a real member (clears the §9.8.5 membership gate) and
+        // grant it `OutletCallAll` (clears the runtime's role-state
+        // defense-in-depth capability gate — the default `member` role grants
+        // only `messages:*`). Both mirror the runtime fixture
+        // `authorizing_role_state`.
+        {
+            let rt = test_runtime();
+            let supervisor = runtime::supervisor(bi).unwrap().clone();
+            rt.block_on(supervisor.test_insert_member(
+                &ctx,
+                scp_did::DID(invoker.clone()),
+                "member",
+            ))
+            .expect("test_insert_member seeds the invoker as a member");
+            rt.block_on(supervisor.test_grant_member_capability(
+                &ctx,
+                scp_did::DID(invoker.clone()),
+                "outlet_call:*",
+            ))
+            .expect("grant OutletCallAll to the member invoker");
+        }
+
+        // Creator-issued outlet_call UCAN delegated to the member invoker.
+        let ucan = scp
+            .ucan_mint(&ctx, &invoker, vec!["outlet_call:*".to_owned()], None)
+            .unwrap();
+
+        let input = PyDict::new(py);
+        input.set_item("a", "1").unwrap();
+        input.set_item("b", "2").unwrap();
+
+        // OPEN — now succeeds (member + valid UCAN + zero cost), returning the
+        // hex StreamHandleId promptly (Commit transition, never block-until-
+        // terminal).
+        let handle_id = scp
+            .outlet_invoke_stream(
+                &ctx,
+                &outlet_id,
+                &input.as_borrowed(),
+                &invoker,
+                &ucan.encoded,
+                None,
+                None,
+                None,
+                // Single-shot handler → declare 1 billable chunk (must be
+                // <= credit_window; an unbounded default coerces to u32::MAX and
+                // trips SCP-OUTLET-6120 input.estimate-exceeds-bound).
+                Some(1),
+            )
+            .expect("member invoker opens a live stream");
+
+        // Drive poll_next to the terminal. Each poll PARKS on the runtime while
+        // the Python handler runs (reacquiring the GIL) — reaching the terminal
+        // instead of hanging is the proof the GIL is released across recv().
+        let mut saw_data = false;
+        let mut saw_terminal = false;
+        for _ in 0..16 {
+            let Some(bytes) = scp.outlet_stream_poll_next(py, &handle_id).unwrap() else {
+                // Abnormal terminal (channel closed without a terminal chunk).
+                break;
+            };
+            let chunk: OutletStreamChunk = serde_json::from_slice(&bytes).unwrap();
+            if matches!(chunk.payload, ChunkPayload::Data { .. }) {
+                saw_data = true;
+            }
+            if chunk.payload.is_terminal() {
+                saw_terminal = true;
+                break;
+            }
+        }
+
+        assert!(
+            saw_data,
+            "the pump forwarded the Python handler's Data chunk through poll_next"
+        );
+        assert!(
+            saw_terminal,
+            "poll_next reached the stream's terminal chunk without deadlocking on the GIL"
+        );
+
+        // The terminal chunk EVICTED the entry, so a further poll is a distinct
+        // not-found error (the stream is genuinely gone), never a silent None.
+        assert!(
+            scp.outlet_stream_poll_next(py, &handle_id)
+                .unwrap_err()
+                .to_string()
+                .contains("no active outlet stream"),
+            "the entry is evicted at the terminal chunk (no registry leak)"
+        );
+    });
+}
+
 /// signed one.
 #[test]
 fn outlet_stream_pure_wrappers_roundtrip() {

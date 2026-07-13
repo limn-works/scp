@@ -314,6 +314,16 @@ fn caller_not_invoker_err(caller_did: &str, invoker_did: &str) -> ScpPyError {
 /// its own async lock).
 type ControlHandle = Arc<tokio::sync::Mutex<StreamSessionHandle>>;
 
+/// The control-plane "no active outlet stream" rejection for an unknown,
+/// stale, typo'd, or already-evicted `handle_id`. Shared by every
+/// control-plane lookup ([`authorized_control`]) AND by
+/// [`outlet_stream_poll_next_impl`] so a bad handle is a DISTINCT error from a
+/// genuine terminal (which `poll_next` reports as `None`) — conflating the two
+/// would let a caller mistake a typo for a clean stream end.
+fn no_active_stream_err(handle_id: &str) -> ScpPyError {
+    ScpPyError::context(format!("no active outlet stream '{handle_id}'"))
+}
+
 /// Clones the `Arc`s OUT of the `DashMap` shard guard so no reference is held
 /// across the subsequent `block_on` (the DashMap-ref-across-await hazard).
 fn authorized_control(
@@ -324,7 +334,7 @@ fn authorized_control(
     let entry = bi
         .outlet_stream_registry
         .get(handle_id)
-        .ok_or_else(|| ScpPyError::context(format!("no active outlet stream '{handle_id}'")))?;
+        .ok_or_else(|| no_active_stream_err(handle_id))?;
     if caller_did != entry.invoker_did {
         return Err(caller_not_invoker_err(caller_did, &entry.invoker_did).into());
     }
@@ -554,9 +564,31 @@ fn context_outlet_invoke_stream_impl(
 
     // Detach the receiver (data plane) into its own lock so `poll_next` never
     // contends with the control plane.
-    let receiver = handle.receiver().ok_or_else(|| {
-        ScpPyError::context("stream handle returned without a chunk receiver".to_owned())
-    })?;
+    //
+    // INVARIANT: `open_outlet_stream` always returns a fresh handle whose
+    // receiver has NOT yet been taken (`StreamSessionHandle::receiver` is
+    // `self.receiver.take()`, called exactly once — here — per handle), so this
+    // is `Some` on the happy path. The `None` arm is therefore UNREACHABLE
+    // under the runtime's postcondition; it exists purely as a fund-safety
+    // backstop. `receiver()` is the ONLY fallible step AFTER the irreversible
+    // reserve+spawn, so a bare `?` here would strand a spawned, ALREADY-BILLING
+    // pump with no registry entry — nothing could ever drive `poll_next`,
+    // `cancel`, or `terminate` against it, and its escrow would never settle.
+    // Instead we force the pump to a terminal (which releases its escrow via
+    // the pump's close-time settlement) before surfacing the error.
+    let Some(receiver) = handle.receiver() else {
+        // Unreachable: wind the pump down so its debited escrow is refunded
+        // rather than stranded. `ContextClosedMidStream` is the least inaccurate
+        // terminal — from the caller's view the consumer substrate failed to
+        // attach.
+        let _ = handle.terminate_with_error(TerminateReason::ContextClosedMidStream, None);
+        return Err(ScpPyError::context(
+            "stream handle returned without a chunk receiver (runtime invariant \
+             violation) — pump terminated to release escrow"
+                .to_owned(),
+        )
+        .into());
+    };
 
     let handle_id = hex::encode(request_id);
     bi.outlet_stream_registry.insert(
@@ -579,31 +611,68 @@ fn context_outlet_invoke_stream_impl(
 
 /// Drains one chunk from a live stream, blocking on the global runtime until a
 /// chunk arrives or the stream closes. Returns the JSON-serialized
-/// [`OutletStreamChunk`] bytes, or `None` at the terminal (channel-closed)
-/// sentinel — at which point the entry is EVICTED. This is the primitive the
-/// Python SDK's async iterator wraps.
+/// [`OutletStreamChunk`] bytes, or `None` at the channel-closed sentinel. This
+/// is the primitive the Python SDK's async iterator wraps.
+///
+/// # GIL / deadlock (CRITICAL)
+///
+/// The blocking `recv()` is wrapped in [`Python::allow_threads`] so the Python
+/// GIL is RELEASED while `poll_next` parks. The streaming pump runs the
+/// context's registered Python outlet handler on a detached tokio task, and
+/// that handler REACQUIRES the GIL (`mcp.rs` `Python::with_gil`) to produce the
+/// very chunk this call awaits. If `poll_next` held the GIL across `recv()`,
+/// the consumer would park holding the GIL while the producer blocks trying to
+/// take it — a guaranteed interpreter deadlock on the happy path. Releasing the
+/// GIL here lets the producer run. Everything touching `Py`/`Bound` values
+/// (there is nothing here) stays OUTSIDE `allow_threads`; the closure returns a
+/// plain `Ungil` [`OutletStreamChunk`].
+///
+/// # Handle lifecycle
+///
+/// - **Unknown / evicted `handle_id`** → a DISTINCT [`no_active_stream_err`]
+///   (matching the control-plane "no active outlet stream" contract), NEVER
+///   `None` — a stale or typo'd handle must not masquerade as a clean terminal.
+/// - **Terminal chunk** (`End` / `Error{terminal:true}`) → returned to the
+///   caller AND the entry is EVICTED immediately, so a caller that reads the
+///   stream to its terminal but never performs the trailing `None`-drain does
+///   not leak the registry entry. A subsequent poll on the same handle then
+///   surfaces [`no_active_stream_err`] (the stream is genuinely gone).
+/// - **`None`** (channel closed with no terminal chunk — an abnormal close such
+///   as a pump panic dropping the sender) → the entry is evicted and `None` is
+///   returned as the terminal sentinel.
 fn outlet_stream_poll_next_impl(
+    py: Python<'_>,
     bi: &PyBridgeInstance,
     handle_id: &str,
 ) -> PyResult<Option<Vec<u8>>> {
     // Clone the receiver `Arc` OUT of the DashMap shard guard BEFORE the
     // blocking recv — never hold a DashMap ref across the `.await`
-    // (the DashMap-ref-across-await hazard).
+    // (the DashMap-ref-across-await hazard). An unknown handle is a distinct
+    // error, not a terminal.
     let receiver = {
         let Some(entry) = bi.outlet_stream_registry.get(handle_id) else {
-            return Ok(None);
+            return Err(no_active_stream_err(handle_id).into());
         };
         Arc::clone(&entry.receiver)
     };
     let rt = crate::runtime()?;
-    let chunk = rt.block_on(async { receiver.lock().await.recv().await });
+    // Release the GIL across the blocking recv (see the CRITICAL note above).
+    let chunk = py.allow_threads(|| rt.block_on(async { receiver.lock().await.recv().await }));
     if let Some(chunk) = chunk {
+        // Evict on the TERMINAL chunk so a run-to-terminal-without-draining
+        // caller cannot leak the entry. The pump releases the admission counter
+        // + escrow at the same terminal, so eviction here only reclaims the
+        // bridge-side registry slot.
+        if chunk.payload.is_terminal() {
+            bi.outlet_stream_registry.remove(handle_id);
+        }
         let bytes = serde_json::to_vec(&chunk)
             .map_err(|e| ScpPyError::context(format!("failed to serialize stream chunk: {e}")))?;
         Ok(Some(bytes))
     } else {
-        // Terminal: the pump dropped the sender. Evict so the handle + any
-        // residual control state drop with the entry.
+        // Abnormal terminal: the pump dropped the sender without a terminal
+        // chunk. Evict so the handle + any residual control state drop with the
+        // entry.
         bi.outlet_stream_registry.remove(handle_id);
         Ok(None)
     }
@@ -658,6 +727,7 @@ fn outlet_stream_grant_credit_impl(
 /// preimage internally. The cancel signer is the INVOKER's custody key (the
 /// runtime self-verifies the signature under the pinned `invoker_pk`).
 fn outlet_stream_cancel_impl(
+    py: Python<'_>,
     bi: &PyBridgeInstance,
     handle_id: &str,
     caller_did: &str,
@@ -672,14 +742,22 @@ fn outlet_stream_cancel_impl(
         caveats_binding,
     };
     let rt = crate::runtime()?;
-    rt.block_on(async {
-        handle
-            .lock()
-            .await
-            .apply_outlet_cancel_signed(&signer, &cancel_identity)
-            .await
-    })
-    .map_err(|e| ScpPyError::ContextError {
+    // Release the GIL across the runtime handle op (defense-in-depth). The
+    // cancel signs via custody (no GIL) and wakes the pump — which reacquires
+    // the GIL to produce its terminal chunk — so holding the GIL here while the
+    // woken pump blocks on it is the same deadlock surface as `poll_next`. The
+    // `StreamSignerError` inside the closure is `Ungil`; the caller-side signer
+    // resolution (its own `block_on` never touches Python) stays outside.
+    let cancel_result = py.allow_threads(|| {
+        rt.block_on(async {
+            handle
+                .lock()
+                .await
+                .apply_outlet_cancel_signed(&signer, &cancel_identity)
+                .await
+        })
+    });
+    cancel_result.map_err(|e| ScpPyError::ContextError {
         message: format!("stream cancel rejected: {e:?}"),
         code: cancel_error_to_code(&e).to_owned(),
     })?;
@@ -692,15 +770,36 @@ fn outlet_stream_cancel_impl(
 
 /// Forces a framework terminal chunk under the pinned operator key. CRITICAL
 /// #1: caller must be the pinned invoker. The `slug` selects a closed-set
-/// [`TerminateReason`] (free-form slugs/codes are rejected — attacker input
-/// cannot enter the provenance record); `code` MUST match the reason's
-/// canonical code; `message` is a non-canonical human suffix.
+/// [`TerminateReason`] (free-form slugs are rejected — attacker input cannot
+/// enter the provenance record); `message` is a non-canonical human suffix.
+///
+/// The canonical `code` is DERIVED internally from the reason
+/// ([`TerminateReason::code`]) — it is a pure function of `slug`, so accepting
+/// it as a parameter only created a way for a caller to disagree with the
+/// reason (and forced every SDK to hard-code the slug→code table). Dropping it
+/// makes the code unforgeable-by-construction and the signature agent-authable
+/// from `slug` alone.
+///
+/// # Auth asymmetry (co-resident threat model)
+///
+/// `terminate` authorizes on the CRITICAL #1 assertion ALONE (`caller_did ==
+/// pinned invoker`), whereas `grant_credit` carries an invoker Ed25519
+/// signature over the credit preimage and `cancel` self-verifies a
+/// custody-produced signature under the pinned `invoker_pk`. `terminate` needs
+/// no signature because the terminal chunk it forces is signed by the OPERATOR
+/// key (the framework-forced `Error{terminal:true}`), not attributed to the
+/// invoker, and it can only ever CLOSE the stream (it cannot bill, extend
+/// credit, or move the cancel-ack cursor). Under the co-resident single-tenant
+/// constraint (operator + invoker both locally hosted, per the module header)
+/// the assertion gate is sufficient: the only principal who could reach this
+/// bridge instance is already trusted to host both keys. The asymmetry is
+/// intentional, not an oversight.
 fn outlet_stream_terminate_impl(
+    py: Python<'_>,
     bi: &PyBridgeInstance,
     handle_id: &str,
     caller_did: &str,
     slug: &str,
-    code: &str,
     message: &str,
 ) -> PyResult<()> {
     validate::validate_did(caller_did)?;
@@ -709,24 +808,21 @@ fn outlet_stream_terminate_impl(
             "unknown terminate slug '{slug}' — must be a §5.4.4 stream-terminal slug"
         ))
     })?;
-    if code != reason.code() {
-        return Err(ScpPyError::validation(format!(
-            "terminate code '{code}' does not match slug '{slug}' canonical code '{}'",
-            reason.code()
-        ))
-        .into());
-    }
     let (handle, _ctx, _outlet, _binding) = authorized_control(bi, handle_id, caller_did)?;
     let message_override = (!message.is_empty()).then(|| message.to_owned());
     let rt = crate::runtime()?;
-    // `AlreadyPending` / `AlreadyTerminated` are the documented idempotent
-    // outcomes (the SDK treats them as "stream already closing") — surface
-    // both as success so a receiver-side recheck loop stops cleanly.
-    let _ = rt.block_on(async {
-        handle
-            .lock()
-            .await
-            .terminate_with_error(reason, message_override)
+    // Release the GIL across the runtime handle op (defense-in-depth; the forced
+    // terminal wakes the pump, which reacquires the GIL). `AlreadyPending` /
+    // `AlreadyTerminated` are the documented idempotent outcomes (the SDK treats
+    // them as "stream already closing") — surface both as success so a
+    // receiver-side recheck loop stops cleanly.
+    let _ = py.allow_threads(|| {
+        rt.block_on(async {
+            handle
+                .lock()
+                .await
+                .terminate_with_error(reason, message_override)
+        })
     });
     Ok(())
 }
@@ -843,8 +939,12 @@ impl crate::scp::PyScp {
     ///
     /// Raises `ContextError` if chunk serialization fails.
     #[pyo3(name = "outlet_stream_poll_next")]
-    pub fn outlet_stream_poll_next(&self, handle_id: &str) -> PyResult<Option<Vec<u8>>> {
-        outlet_stream_poll_next_impl(&self.inner, handle_id)
+    pub fn outlet_stream_poll_next(
+        &self,
+        py: Python<'_>,
+        handle_id: &str,
+    ) -> PyResult<Option<Vec<u8>>> {
+        outlet_stream_poll_next_impl(py, &self.inner, handle_id)
     }
 
     /// Applies an invoker-signed `OutletStreamCredit` grant (JSON bytes).
@@ -874,29 +974,34 @@ impl crate::scp::PyScp {
     /// `SCP-OUTLET-6160` (retryable) if the cursor advanced past the bounded
     /// retry budget.
     #[pyo3(name = "outlet_stream_cancel")]
-    pub fn outlet_stream_cancel(&self, handle_id: &str, caller_did: &str) -> PyResult<()> {
-        outlet_stream_cancel_impl(&self.inner, handle_id, caller_did)
+    pub fn outlet_stream_cancel(
+        &self,
+        py: Python<'_>,
+        handle_id: &str,
+        caller_did: &str,
+    ) -> PyResult<()> {
+        outlet_stream_cancel_impl(py, &self.inner, handle_id, caller_did)
     }
 
     /// Forces a framework terminal chunk. `slug` selects a closed-set
-    /// terminal reason; `code` must match its canonical code; `message` is a
-    /// human suffix.
+    /// terminal reason; the canonical `code` is derived internally from the
+    /// reason; `message` is a human suffix.
     ///
     /// # Errors
     ///
     /// Raises `ContextError` with `SCP-PERM-3001` if `caller_did` is not the
     /// pinned invoker; `ValidationError` if `slug` is not a stream-terminal
-    /// slug or `code` does not match it.
+    /// slug.
     #[pyo3(name = "outlet_stream_terminate")]
     pub fn outlet_stream_terminate(
         &self,
+        py: Python<'_>,
         handle_id: &str,
         caller_did: &str,
         slug: &str,
-        code: &str,
         message: &str,
     ) -> PyResult<()> {
-        outlet_stream_terminate_impl(&self.inner, handle_id, caller_did, slug, code, message)
+        outlet_stream_terminate_impl(py, &self.inner, handle_id, caller_did, slug, message)
     }
 
     /// Pure wrapper: verifies a chunk's operator signature (§5.4.5).

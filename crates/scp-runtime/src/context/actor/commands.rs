@@ -367,6 +367,39 @@ pub enum MessagingCommand {
         reply: oneshot::Sender<Result<(), ContextError>>,
     },
 
+    /// Grant a §7.2.2 Tier-2 capability directly into a member's
+    /// `role_state.member_capabilities` cache, bypassing the governance
+    /// role-assignment round-trip — test-only.
+    ///
+    /// The runtime's outlet-invocation gate
+    /// ([`has_outlet_invocation_capability`](crate::context::outlets::invoke::has_outlet_invocation_capability))
+    /// requires the invoker to hold `OutletCall(outlet_id)` / `OutletCallAll`
+    /// (or the Query stem) in role state as defense-in-depth alongside the
+    /// primary UCAN gate. The default `admin` / `member` roles grant only
+    /// `messages:*`, so a single-node test cannot drive a real outlet
+    /// invocation without granting the capability — and the genuine grant path
+    /// is a governance role-definition change requiring DID-document-published
+    /// identities (which in-memory test identities are not). This seam inserts
+    /// the capability the same way an executed role assignment would populate
+    /// the Tier-2 cache.
+    ///
+    /// Gated behind the `testing` feature — never compiled into production
+    /// builds, never reachable from any FFI bridge.
+    #[cfg(feature = "testing")]
+    TestGrantMemberCapability {
+        /// Context identifier.
+        context_id: String,
+        /// The member DID to grant the capability to.
+        member_did: scp_did::DID,
+        /// The capability stem (e.g. `"outlet_call:*"`), parsed via
+        /// [`Capability::new`](scp_protocol::context::roles::Capability::new).
+        capability: String,
+        /// Oneshot reply channel. Replies `Ok(())` once the capability is
+        /// cached, or `Err` if the context is unknown / inactive / the stem is
+        /// unrecognized.
+        reply: oneshot::Sender<Result<(), ContextError>>,
+    },
+
     /// Install a specific member's access key directly into the context's
     /// access key store (§9.17), bypassing the pull-based distribution protocol.
     ///
