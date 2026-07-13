@@ -693,45 +693,19 @@ async fn handle_reconcile_stream_reservations(
     // Nothing to reconcile — reply without a spurious durable write. The common
     // case: a clean restart where every stream settled cleanly (its record was
     // cleared at close).
-    let count = cell.class_s.stream_reservations.len();
-    if count == 0 {
+    if cell.class_s.stream_reservations.is_empty() {
         let _ = reply.send(Ok(0));
         return Outcome::ok(());
     }
 
-    let commit_fut = cell.commit_class_s_keep(deps, context_id, move |mut view| {
-        let state = view.rest_mut();
-        // Take the map out so the per-record reversal can borrow the sibling
-        // governance / caveat-counter state mutably without aliasing.
-        let records = std::mem::take(&mut state.class_s.stream_reservations);
-        for record in records.into_values() {
-            if record.reserved_escrow.value() > 0 {
-                // Refund the FULL open-time escrow hold — the pump is gone and
-                // the billed count is unknown. Saturating (`reverse_spend`), so a
-                // benign over-refund of an already-settled hold is a no-op.
-                state
-                    .governance
-                    .budget_tracker
-                    .reverse_spend(&record.invoker_did, record.reserved_escrow);
-            }
-            if record.amount_cumulative_reserved > 0 && !record.ucan_cid.is_empty() {
-                // Release the FULL cumulative reserve back to the counter.
-                state
-                    .class_s
-                    .caveat_counters
-                    .entry(record.ucan_cid)
-                    .or_default()
-                    .release(
-                        scp_protocol::trust::CaveatKind::AmountCumulative,
-                        record.amount_cumulative_reserved,
-                    );
-            }
-        }
-        Ok(())
-    });
+    // The refund/release/clear core lives in `outlets_helpers` (mirroring
+    // `settle_outlet_stream`), so it is unit-testable against a bare
+    // `ClassSCell` harness without standing up the full mailbox.
+    let commit_fut =
+        crate::context::outlets_helpers::reconcile_stream_reservations(cell, deps, context_id);
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, commit_fut).await {
-        Ok(Ok(())) => (Outcome::ok_mutated(()), Ok(count)),
+        Ok(Ok(count)) => (Outcome::ok_mutated(()), Ok(count)),
         Ok(Err(err)) => {
             // KEEP semantics: the in-memory releases + clear ARE applied even
             // though the persist failed — the run loop retries the durable write,

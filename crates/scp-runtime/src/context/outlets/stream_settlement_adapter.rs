@@ -198,10 +198,11 @@ mod tests {
     use crate::context::actor::state::PerContextState;
     use crate::context::outlets::dispatch::StreamEscrowRefundSink;
     use crate::context::outlets::invoke::{
-        EconomicPolicySnapshot, StreamSettlement, StreamSettlementSink,
+        EconomicPolicySnapshot, StreamReservationRecord, StreamSettlement, StreamSettlementSink,
     };
     use crate::context::outlets_helpers::{
-        StreamSettleOutcome, reverse_stream_escrow, settle_outlet_stream,
+        StreamSettleOutcome, reconcile_stream_reservations, reverse_stream_escrow,
+        settle_outlet_stream,
     };
     use crate::context::supervisor::supervisor::Supervisor;
     use crate::economy::adapter::{
@@ -511,6 +512,161 @@ mod tests {
         assert_eq!(
             cell.class_s.caveat_counters[UCAN_CID].amount_cumulative_used, 50,
             "counter untouched on a generation mismatch (reserves left for the sweep)"
+        );
+    }
+
+    /// Fix-D Part 1 (H8) — a generation MISMATCH on a stream whose off-mailbox
+    /// pump SURVIVED a crash-respawn STILL captures the §19.15.5 receipt for the
+    /// rendered bill (against the OPEN-TIME policy snapshot, since the live policy
+    /// may belong to a different context), while touching NO owned state: the
+    /// durable escrow hold + cumulative counter reserve are left intact for the
+    /// restore-time reconcile sweep.
+    #[tokio::test]
+    async fn generation_mismatch_with_snapshot_captures_rendered_bill() {
+        let captured = Arc::new(AtomicUsize::new(0));
+        let supervisor = build_supervisor(Some(counting(&captured)));
+        let deps = deps_for(&supervisor).await;
+
+        let mut state = member_state(100, 50);
+        // Live policy present — Part 1 MUST ignore it (wrong instance) and use
+        // the open-time SNAPSHOT instead.
+        state.governance.economic_policy = Some(policy());
+        let mut cell = ClassSCell::new(state);
+        let live_gen = cell.generation;
+
+        let snapshot = EconomicPolicySnapshot { policy: policy() };
+        let outcome = settle_outlet_stream(
+            &mut cell,
+            &deps,
+            settlement(30, 70, 3, 10, 50, Some(snapshot)),
+            live_gen.wrapping_add(1),
+        )
+        .await;
+
+        match outcome {
+            StreamSettleOutcome::CapturedWithoutMutation(Some(receipt)) => {
+                assert_eq!(
+                    receipt.amount,
+                    Amount::new(30),
+                    "the rendered bill is captured at the exact billed amount"
+                );
+            }
+            other => panic!("expected CapturedWithoutMutation(Some(receipt)), got {other:?}"),
+        }
+        assert_eq!(
+            captured.load(Ordering::SeqCst),
+            1,
+            "the rendered bill is captured even on a replaced instance (H8)"
+        );
+        assert_eq!(
+            cell.governance.budget_tracker.total_spent(&invoker()),
+            Amount::new(100),
+            "budget untouched on a generation mismatch (reserves left for the sweep)"
+        );
+        assert_eq!(
+            cell.class_s.caveat_counters[UCAN_CID].amount_cumulative_used, 50,
+            "counter untouched on a generation mismatch (reserves left for the sweep)"
+        );
+    }
+
+    /// Fix-D — a CLEAN settle (matching generation) CLEARS the crash-recovery
+    /// record in the same persist as the release/refund, so no stale record is
+    /// left for the reconcile sweep to double-release.
+    #[tokio::test]
+    async fn clean_settle_clears_recovery_record() {
+        let supervisor = build_supervisor(None);
+        let deps = deps_for(&supervisor).await;
+
+        let mut state = member_state(100, 50);
+        // A record persisted at open for this in-flight stream (keyed by the
+        // settlement's request_id `[3u8; 16]`).
+        state.class_s.stream_reservations.insert(
+            hex::encode([3u8; 16]),
+            StreamReservationRecord {
+                invoker_did: invoker(),
+                ucan_cid: UCAN_CID.to_owned(),
+                cost_per_chunk: Amount::new(10),
+                amount_cumulative_reserved: 50,
+                reserved_escrow: Amount::new(100),
+                generation: 0,
+            },
+        );
+        let mut cell = ClassSCell::new(state);
+        let live_gen = cell.generation;
+
+        let outcome = settle_outlet_stream(
+            &mut cell,
+            &deps,
+            settlement(30, 70, 3, 10, 50, None),
+            live_gen,
+        )
+        .await;
+
+        assert!(
+            matches!(outcome, StreamSettleOutcome::Settled(_)),
+            "a matching-generation settle runs on owned state"
+        );
+        assert!(
+            cell.class_s.stream_reservations.is_empty(),
+            "the clean settle cleared the crash-recovery record"
+        );
+    }
+
+    /// Fix-D — the restore-time reconcile sweep drains an ORPHANED record (its
+    /// pump survived a crash and its settle was dropped on the bumped
+    /// generation): it refunds the FULL escrow hold, releases the FULL cumulative
+    /// reserve, and clears the record. Runs regardless of generation.
+    #[tokio::test]
+    async fn reconcile_sweep_refunds_releases_and_clears() {
+        let supervisor = build_supervisor(None);
+        let deps = deps_for(&supervisor).await;
+
+        // Open-time state: escrow hold of 210 debited, cumulative counter at 350.
+        let mut state = member_state(210, 350);
+        state.class_s.stream_reservations.insert(
+            hex::encode([7u8; 16]),
+            StreamReservationRecord {
+                invoker_did: invoker(),
+                ucan_cid: UCAN_CID.to_owned(),
+                cost_per_chunk: Amount::new(7),
+                amount_cumulative_reserved: 350,
+                reserved_escrow: Amount::new(210),
+                // A STALE (pre-crash) generation — the sweep reconciles regardless
+                // (a restore overwrites the live generation with a fresh one).
+                generation: 99,
+            },
+        );
+        let mut cell = ClassSCell::new(state);
+
+        let reconciled = reconcile_stream_reservations(&mut cell, &deps, &ctx_key())
+            .await
+            .expect("reconcile persists");
+
+        assert_eq!(reconciled, 1, "one orphaned record reconciled");
+        assert_eq!(
+            cell.governance.budget_tracker.total_spent(&invoker()),
+            Amount::new(0),
+            "the FULL escrow hold (210) was refunded"
+        );
+        assert_eq!(
+            cell.class_s.caveat_counters[UCAN_CID].amount_cumulative_used, 0,
+            "the FULL cumulative reserve (350) was released"
+        );
+        assert!(
+            cell.class_s.stream_reservations.is_empty(),
+            "the reconciled record was cleared (no double-release on a later restart)"
+        );
+
+        // Idempotent: a second sweep (empty map) reconciles zero and does not
+        // over-refund / over-release.
+        let again = reconcile_stream_reservations(&mut cell, &deps, &ctx_key())
+            .await
+            .expect("second reconcile is a no-op");
+        assert_eq!(again, 0, "the second sweep finds no records");
+        assert_eq!(
+            cell.governance.budget_tracker.total_spent(&invoker()),
+            Amount::new(0),
+            "no over-refund on the idempotent re-run"
         );
     }
 

@@ -1608,6 +1608,76 @@ pub async fn settle_outlet_stream(
     }
 }
 
+/// Fix-D restore-time streaming crash-recovery sweep core, run inside the
+/// per-context actor on owned state.
+///
+/// Drains `ClassSState.stream_reservations` under ONE fail-closed
+/// [`commit_class_s_keep`](crate::context::actor::class_s::ClassSCell::commit_class_s_keep).
+/// For each unresolved record it REFUNDS the full `reserved_escrow` to the
+/// invoker's `MemberBudgetTracker` (`reverse_spend`, saturating) and RELEASES the
+/// full `amount_cumulative_reserved` back to the §7.3.8 `AmountCumulative` counter
+/// keyed by `ucan_cid` (`release`, saturating). The billed count is unknown once
+/// the pump is gone, so the FULL reserved amounts are returned — conservative:
+/// the invoker is never over-charged and the cumulative cap is never
+/// over-consumed (any bill for actually-rendered service was already captured by
+/// the generation-mismatch settle's
+/// [`CapturedWithoutMutation`](StreamSettleOutcome::CapturedWithoutMutation)
+/// path). Runs REGARDLESS of generation — a restore overwrites
+/// `PerContextState::generation` with a fresh spawn generation, and the reserves
+/// are this restored context's OWN state. The releases + the clear land in the
+/// SAME persist, so the sweep is idempotent across restarts.
+///
+/// Returns the number of records reconciled.
+///
+/// # Errors
+///
+/// [`ContextError::PersistenceFailed`] if the fail-closed persist did not land.
+/// The in-memory releases + clear are KEEP'd regardless (the run loop retries
+/// the durable write; a restart before it lands re-runs the sweep from the
+/// restored record — idempotent).
+pub(in crate::context) async fn reconcile_stream_reservations(
+    cell: &mut crate::context::actor::class_s::ClassSCell,
+    deps: &ActorDeps,
+    context_id: &str,
+) -> Result<usize, ContextError> {
+    let count = cell.class_s.stream_reservations.len();
+    if count == 0 {
+        return Ok(0);
+    }
+    cell.commit_class_s_keep(deps, context_id, move |mut view| {
+        let state = view.rest_mut();
+        // Take the map out so the per-record reversal can borrow the sibling
+        // governance / caveat-counter state mutably without aliasing.
+        let records = std::mem::take(&mut state.class_s.stream_reservations);
+        for record in records.into_values() {
+            if record.reserved_escrow.value() > 0 {
+                // Refund the FULL open-time escrow hold — the pump is gone and
+                // the billed count is unknown. Saturating (`reverse_spend`), so a
+                // benign over-refund of an already-settled hold is a no-op.
+                state
+                    .governance
+                    .budget_tracker
+                    .reverse_spend(&record.invoker_did, record.reserved_escrow);
+            }
+            if record.amount_cumulative_reserved > 0 && !record.ucan_cid.is_empty() {
+                // Release the FULL cumulative reserve back to the counter.
+                state
+                    .class_s
+                    .caveat_counters
+                    .entry(record.ucan_cid)
+                    .or_default()
+                    .release(
+                        CaveatKind::AmountCumulative,
+                        record.amount_cumulative_reserved,
+                    );
+            }
+        }
+        Ok(())
+    })
+    .await?;
+    Ok(count)
+}
+
 /// §5.4.5 open-time escrow REVERSAL on actor-owned state — the actor-mailbox
 /// port of the reference `ContextManager::outlet_stream_reverse_spend`.
 ///
@@ -3170,6 +3240,35 @@ mod tests {
             assert_eq!(rec.max_calls_used, 3);
             assert_eq!(rec.amount_cumulative_used, 42);
             assert_eq!(rec.rate_window_timestamps, vec![1, 2, 3]);
+        }
+
+        /// Fix-D: streaming reservation recovery records survive a Class-S
+        /// snapshot → clear → restore cycle (the ADR-049 §9 mirror rehydrates
+        /// them after a crash so the reconcile sweep can release the stranded
+        /// escrow hold + cumulative counter reserve).
+        #[test]
+        fn stream_reservations_survive_class_s_snapshot_round_trip() {
+            use crate::context::outlets::invoke::StreamReservationRecord;
+
+            let expected = StreamReservationRecord {
+                invoker_did: scp_did::DID::from("did:key:snap-invoker"),
+                ucan_cid: "cid-open".to_owned(),
+                cost_per_chunk: Amount::new(9),
+                amount_cumulative_reserved: 270,
+                reserved_escrow: Amount::new(180),
+                generation: 2,
+            };
+            let mut state = active_state();
+            state
+                .class_s
+                .stream_reservations
+                .insert("req-snap".to_owned(), expected.clone());
+
+            let snap = state.class_s.snapshot();
+            state.class_s.stream_reservations.clear();
+            assert!(state.class_s.stream_reservations.is_empty());
+            state.class_s.restore(snap);
+            assert_eq!(state.class_s.stream_reservations["req-snap"], expected);
         }
 
         // -------------------------------------------------------------------
