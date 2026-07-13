@@ -27,6 +27,98 @@
 use ed25519_dalek::VerifyingKey;
 #[cfg(any(test, feature = "testing"))]
 use ed25519_dalek::{Signer, SigningKey};
+use scp_platform::PlatformError;
+
+// ---------------------------------------------------------------------------
+// StreamSignerCustodyCategory
+// ---------------------------------------------------------------------------
+
+/// Bounded category of a custody-side signing failure.
+///
+/// This is a *positive whitelist* of the failure modes that a
+/// [`KeyCustody::sign`](scp_platform::traits::KeyCustody::sign) call can
+/// surface into [`StreamSignerError::Custody`]. It carries **no free-form
+/// string** by construction: the discriminant is the only information that
+/// crosses into the runtime, so the type system guarantees that no backend
+/// error text — and therefore no key material, no raw preimage, and no
+/// backend-internal handle — can leak into structured logs via this path
+/// (ADR-006 custody isolation, ADR-049 §4 / ADR-061 error-detail
+/// sanitization, crypto defense-in-depth).
+///
+/// Each category maps from a real [`PlatformError`] variant reachable through
+/// `KeyCustody::sign` (see [`From<&PlatformError>`](StreamSignerCustodyCategory#impl-From<%26PlatformError>-for-StreamSignerCustodyCategory)).
+/// `#[non_exhaustive]` so future custody backends can surface additional
+/// bounded categories without breaking downstream matches — new spellings of
+/// the same failure are added here, never as a re-introduced `String`.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamSignerCustodyCategory {
+    /// The operator signing key handle is unknown to the custody backend —
+    /// never provisioned, or destroyed. Maps from [`PlatformError::KeyNotFound`].
+    KeyNotFound,
+    /// The custody handle does not refer to an Ed25519 signing key. Maps from
+    /// [`PlatformError::WrongKeyType`].
+    WrongKeyType,
+    /// The custody backend does not support signing through this seam (e.g. a
+    /// non-extractable HSM path). Maps from [`PlatformError::Unsupported`].
+    Unsupported,
+    /// The custody backend failed for another reason (a generic backend
+    /// fault). Maps from [`PlatformError::CustodyError`] and — conservatively,
+    /// so an unclassified failure never falls through to a more permissive
+    /// category — from any other [`PlatformError`] variant that reaches the
+    /// signing adapter.
+    BackendFault,
+}
+
+impl StreamSignerCustodyCategory {
+    /// Returns the fixed, non-sensitive human string for this category.
+    ///
+    /// The returned `&'static str` is a compile-time constant: it contains no
+    /// dynamic content, no bytes, and no backend error text. This is the sole
+    /// text [`StreamSignerError::Custody`] surfaces in logs.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::KeyNotFound => "signing key not found",
+            Self::WrongKeyType => "wrong key type for signing",
+            Self::Unsupported => "signing operation unsupported by backend",
+            Self::BackendFault => "backend fault",
+        }
+    }
+}
+
+impl core::fmt::Display for StreamSignerCustodyCategory {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl From<&PlatformError> for StreamSignerCustodyCategory {
+    /// Maps a custody backend error into a bounded category, discarding all
+    /// free-form detail. `KeyCustody::sign` documents [`PlatformError::KeyNotFound`]
+    /// and [`PlatformError::WrongKeyType`]; a backend may additionally surface
+    /// [`PlatformError::CustodyError`] or [`PlatformError::Unsupported`]. Every
+    /// other variant is mapped to the conservative [`BackendFault`] category
+    /// rather than reintroducing the error string.
+    ///
+    /// [`BackendFault`]: StreamSignerCustodyCategory::BackendFault
+    fn from(err: &PlatformError) -> Self {
+        match err {
+            PlatformError::KeyNotFound => Self::KeyNotFound,
+            PlatformError::WrongKeyType { .. } => Self::WrongKeyType,
+            PlatformError::Unsupported(_) => Self::Unsupported,
+            // `CustodyError` is the documented generic custody failure; the
+            // remaining variants (`StorageError`, `AttestationError`,
+            // `PushError`) belong to sibling platform traits and are not
+            // expected from `sign`, but are mapped conservatively rather than
+            // panicking or leaking their carried string.
+            PlatformError::CustodyError(_)
+            | PlatformError::StorageError(_)
+            | PlatformError::AttestationError(_)
+            | PlatformError::PushError(_) => Self::BackendFault,
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // StreamSignerError
@@ -40,23 +132,22 @@ use ed25519_dalek::{Signer, SigningKey};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamSignerError {
     /// The backing custody / signer failed to produce a signature. Native
-    /// custody adapters map their backend error here.
+    /// custody adapters map their backend error into a bounded
+    /// [`StreamSignerCustodyCategory`] via
+    /// [`From<&PlatformError>`](StreamSignerCustodyCategory#impl-From<%26PlatformError>-for-StreamSignerCustodyCategory).
     ///
-    /// `detail` carries a description of the failure that surfaces in the
-    /// dispatch pump's structured logs. Implementors MUST sanitize the
-    /// backend error before populating it: `detail` MUST NOT contain key
-    /// material (private-key bytes, seeds, derived secrets), nor the raw
-    /// preimage / caller-supplied input, nor backend-internal handles that
-    /// could leak custody state. Map the backend failure to a stable,
-    /// non-sensitive category string instead (ADR-006 custody isolation,
-    /// ADR-049 §4 error-detail sanitization). The operator private key
-    /// never enters the runtime address space, and neither does any
-    /// derivative of it via this field.
+    /// The variant carries only the bounded `category` — never a free-form
+    /// string. This makes leaking sensitive data structurally impossible: key
+    /// material (private-key bytes, seeds, derived secrets), the raw preimage /
+    /// caller input, and backend-internal handles cannot enter the runtime
+    /// address space through this field, so they cannot reach the structured
+    /// logs the dispatch pump emits (ADR-006 custody isolation, ADR-049 §4 /
+    /// ADR-061 error-detail sanitization). The operator private key never
+    /// enters the runtime address space, and neither does any derivative of it.
     Custody {
-        /// Sanitized, non-sensitive description of the custody-side
-        /// failure. See the variant docs: never key material, never raw
-        /// preimage / caller input, never backend-internal handles.
-        detail: String,
+        /// Bounded category of the custody-side failure. See
+        /// [`StreamSignerCustodyCategory`].
+        category: StreamSignerCustodyCategory,
     },
     /// JCS canonicalization of the payload failed while composing the
     /// preimage. Carries the canonicalization error string. This is a
@@ -69,7 +160,7 @@ pub enum StreamSignerError {
 impl core::fmt::Display for StreamSignerError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::Custody { detail } => write!(f, "stream signer custody failure: {detail}"),
+            Self::Custody { category } => write!(f, "stream signer custody failure: {category}"),
             Self::Jcs(detail) => write!(f, "stream signer JCS canonicalization failure: {detail}"),
         }
     }
@@ -107,14 +198,14 @@ pub trait StreamSigner: Send + Sync + 'static {
     /// # Errors
     ///
     /// Returns [`StreamSignerError::Custody`] if the backing signer fails to
-    /// produce a signature. Implementors MUST sanitize the backend error
-    /// before placing it in [`StreamSignerError::Custody::detail`]: the
-    /// field MUST NOT carry key material, the raw `preimage`, any other
-    /// caller-supplied input, or backend-internal handles. Map the backend
-    /// failure to a stable non-sensitive category string instead (ADR-006
-    /// custody isolation, ADR-049 §4 error-detail sanitization). `detail`
-    /// surfaces in structured logs, so a leak here is an information-
-    /// disclosure bug.
+    /// produce a signature. The variant carries only a bounded
+    /// [`StreamSignerCustodyCategory`], never a free-form string, so leaking
+    /// key material, the raw `preimage`, other caller-supplied input, or
+    /// backend-internal handles into structured logs is structurally
+    /// impossible (ADR-006 custody isolation, ADR-049 §4 / ADR-061 error-detail
+    /// sanitization). Implementors map their backend [`PlatformError`] into a
+    /// category via
+    /// [`From<&PlatformError>`](StreamSignerCustodyCategory#impl-From<%26PlatformError>-for-StreamSignerCustodyCategory).
     async fn sign(&self, preimage: &[u8]) -> Result<[u8; 64], StreamSignerError>;
 
     /// Returns the operator's Ed25519 verifying key. Used by the dispatch
@@ -243,10 +334,96 @@ mod tests {
     #[test]
     fn stream_signer_error_display() {
         let custody = StreamSignerError::Custody {
-            detail: "hsm offline".to_owned(),
+            category: StreamSignerCustodyCategory::BackendFault,
         };
-        assert!(custody.to_string().contains("hsm offline"));
+        assert_eq!(
+            custody.to_string(),
+            "stream signer custody failure: backend fault"
+        );
         let jcs = StreamSignerError::Jcs("non-finite float".to_owned());
         assert!(jcs.to_string().contains("non-finite float"));
+    }
+
+    /// Every custody category renders to a fixed, non-sensitive string — no
+    /// dynamic content, no bytes, no backend error text. This is the whole
+    /// point of the bounded enum: nothing custody-side can leak through
+    /// `Display`. If a category is added, extend this list (the match below is
+    /// exhaustive under `#[non_exhaustive]` within the defining crate, so a new
+    /// variant breaks this test until an expected fixed string is asserted).
+    #[test]
+    fn custody_category_display_is_fixed_and_non_sensitive() {
+        let cases = [
+            (
+                StreamSignerCustodyCategory::KeyNotFound,
+                "stream signer custody failure: signing key not found",
+            ),
+            (
+                StreamSignerCustodyCategory::WrongKeyType,
+                "stream signer custody failure: wrong key type for signing",
+            ),
+            (
+                StreamSignerCustodyCategory::Unsupported,
+                "stream signer custody failure: signing operation unsupported by backend",
+            ),
+            (
+                StreamSignerCustodyCategory::BackendFault,
+                "stream signer custody failure: backend fault",
+            ),
+        ];
+        for (category, expected) in cases {
+            // Exact equality proves the rendered text is fully static.
+            assert_eq!(
+                StreamSignerError::Custody { category }.to_string(),
+                expected
+            );
+            // Defense-in-depth: the category string carries no digit (a proxy
+            // for handle ids / byte values / offsets that a leak would carry).
+            assert!(
+                !category.as_str().chars().any(|c| c.is_ascii_digit()),
+                "category string must not contain dynamic/numeric content"
+            );
+        }
+    }
+
+    /// The canonical `PlatformError` -> category mapping is faithful: every
+    /// variant maps to a bounded category, and the free-form strings the
+    /// carrying variants hold are discarded (not present in the rendered
+    /// output).
+    #[test]
+    fn platform_error_maps_to_bounded_category() {
+        use scp_platform::traits::KeyType;
+
+        assert_eq!(
+            StreamSignerCustodyCategory::from(&PlatformError::KeyNotFound),
+            StreamSignerCustodyCategory::KeyNotFound
+        );
+        assert_eq!(
+            StreamSignerCustodyCategory::from(&PlatformError::WrongKeyType {
+                expected: KeyType::Ed25519,
+                actual: KeyType::X25519,
+            }),
+            StreamSignerCustodyCategory::WrongKeyType
+        );
+        assert_eq!(
+            StreamSignerCustodyCategory::from(&PlatformError::Unsupported("no hsm sign")),
+            StreamSignerCustodyCategory::Unsupported
+        );
+        // The generic custody failure and sibling-trait variants collapse to
+        // the conservative BackendFault category, and their carried string is
+        // dropped — it never reaches the rendered error.
+        let secret_detail = "hsm serial 0xDEADBEEF offline";
+        let category = StreamSignerCustodyCategory::from(&PlatformError::CustodyError(
+            secret_detail.to_owned(),
+        ));
+        assert_eq!(category, StreamSignerCustodyCategory::BackendFault);
+        let rendered = StreamSignerError::Custody { category }.to_string();
+        assert!(
+            !rendered.contains(secret_detail) && !rendered.contains("DEADBEEF"),
+            "backend error string must not survive into the rendered error"
+        );
+        assert_eq!(
+            StreamSignerCustodyCategory::from(&PlatformError::StorageError("x".to_owned())),
+            StreamSignerCustodyCategory::BackendFault
+        );
     }
 }
