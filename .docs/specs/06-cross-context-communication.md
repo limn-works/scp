@@ -239,6 +239,8 @@ Outlet interfaces (§6.2) work with broadcast contexts. A broadcast context can 
 
 ### 6.2.4 Cross-Context Outlet Invocation Saga
 
+This is the **unary, transactional** outlet invocation mode (§6.2.5, ADR-061): a single response committed as `output_hash`, wrapped in the saga transaction envelope (exactly-once, receipt, crash recovery). The **streaming, transactional** mode (§6.2.5 *streaming saga*) reuses this same envelope, swapping the committed integrity artifact from `output_hash` to `stream_manifest_hash`.
+
 §6.2.0 establishes that both contexts' governance mediates a cross-context call; §6.2.0.1 establishes the standing `InterfaceEstablished` consent. This section specifies the per-invocation wire protocol once an interface exists: the call mutates two contexts (the caller's outbound rate-limit/spend plus event log; the target's outlet-session plus event log), so it executes as a saga (§5.15.4).
 
 **Scope.** This governs invocation over an established interface; it does NOT create the interface (§6.2.0.1 governance flow) and does NOT replace synchronous shared-member bridging (§6.2.0) for the colocated case. It is the distinct-actor, atomic-across-the-boundary case.
@@ -339,6 +341,31 @@ sig = Ed25519_sign(emitter,
 **Public-metadata journaling.** The journal records only the public `CrossContextOutletInvocationPrepared` (caller ctx id, `target_context_id`, caller DID, `outlet_registration_id`, `ucan_proof_id`, the B-captured `recorded_timestamp_ms`, the B-captured `nonce`, and the B-re-derived `recorded_chain_depth`) — never UCAN bytes, never input/output. The journaled values are B-controlled: B's clock value `recorded_timestamp_ms` (NOT the caller-asserted send-time `timestamp_ms`, which serves only the freshness check), B's **re-derived** `recorded_chain_depth` (NOT the caller-asserted advisory `chain_depth`), and B's **staged copy of the wire `nonce`** — the same 16 bytes the caller supplied (equal by design, since the `nonce` is a public correlation/dedup token, not a trust-bearing input: B both consults it against the dedup cache and stages this copy for the receipt and journal). For the timestamp and depth the journaled value genuinely differs from the caller-asserted envelope value; for the nonce the journaled value equals the wire value but is staged from B's own captured copy so a replayed Commit reproduces it from durable state. All eight journaled fields are public, non-secret-bearing values — `nonce` and `chain_depth` are public, not secrets — so the journal carries no bearer material; `mark_resolved(secret_bearing=false)`.
 
 Cross-refs: §6.2.0, §6.2.0.1, §5.15.4, §9.2.1, ADR-049 §3a (FFI Saga Surface).
+
+### 6.2.5 Outlet Invocation Modes (delivery × envelope)
+
+Outlet invocation is classified along **two orthogonal axes** — **delivery** and **envelope** — never by where it runs. "Cross-context" is a deployment location, **not** a mode discriminator (it correlates with, but is not identical to, the envelope axis). See **ADR-061** for the full decision, rationale, and rejected alternatives; this section is the normative summary.
+
+- **Delivery** (a §5.4 property of the response, applies even same-context):
+  - **unary** — a single response; committed integrity artifact `output_hash`.
+  - **streaming** — a sequence of operator-signed chunks (`SCP-OUTLET-CHUNK-SIG-V1`) with per-chunk credit/escrow; committed integrity artifact `stream_manifest_hash` (RFC-6962 Merkle root, bounded even for an unbounded stream).
+- **Envelope** (the transactional guarantees):
+  - **best-effort** — a bare invocation: no exactly-once, receipt, or crash recovery.
+  - **transactional (saga)** — the §5.15.4 / §6.2.4 saga: exactly-once, durable `SagaId`-keyed capture, signed receipt, dual event-log recording, crash recovery.
+
+The four canonical modes (all supported):
+
+| | **best-effort** | **transactional (saga)** |
+|---|---|---|
+| **unary** (→ `output_hash`) | **plain outlet invocation** — the base call | **outlet invocation saga** (§6.2.4) |
+| **streaming** (→ `stream_manifest_hash`) | **outlet stream** | **streaming saga** |
+
+- **plain outlet invocation** — unary, best-effort: the base `invoke_outlet` call.
+- **outlet invocation saga** — unary, transactional: §6.2.4; commits `output_hash`.
+- **outlet stream** — streaming, best-effort: signed chunk stream with credit, no transaction envelope.
+- **streaming saga** — streaming, transactional: the §6.2.4 envelope with its committed artifact swapped from `output_hash` to `stream_manifest_hash`, driving the chunk stream from the saga's Commit-triggers-execution slot. The only mode that is both streamed **and** exactly-once — required for a paid, metered LLM outlet that streams tokens while billing exactly-once across a mid-stream crash. The saga still commits **once** (over the bounded Merkle root); it does NOT two-phase-commit per chunk (that framing is rejected in ADR-061).
+
+**Naming (normative).** Discriminate by delivery (**unary** / **streaming**) and envelope (**best-effort** / **saga**). Never use "cross-context" as the discriminating qualifier for a mode. "unary"/"streaming" are the industry matched pair (cf. gRPC); "unary" names response cardinality, not an implementation.
 
 ## 6.3 The Human as Bridge
 
