@@ -1333,11 +1333,18 @@ pub enum StreamSettleOutcome {
 /// NEW instance respawned for the same `context_id` between reserve and settle
 /// (an import replace / node teardown+respawn). Releasing the cumulative counter
 /// or refunding budget against THIS instance's owned state would corrupt the
-/// WRONG context's economy. Unlike the unary settle there is NO external payment
-/// escrow to void (the §5.4.5 open-time hold is a budget-tracker debit only, not
-/// a payment-rail authorization), so on a mismatch the settlement is DROPPED
-/// silently — [`StreamSettleOutcome::Dropped`], touching nothing. `generation`
-/// is a Class-C structural field read through the cell `Deref`.
+/// WRONG context's economy. So on a mismatch the settlement does NOT touch owned
+/// state — it returns
+/// [`StreamSettleOutcome::CapturedWithoutMutation`](StreamSettleOutcome::CapturedWithoutMutation):
+/// it STILL captures the §19.15.5 receipt for rendered service against the
+/// open-time `economic_policy_snapshot` only (a payment-adapter call that mutates
+/// no owned Class-S state — H8 "service rendered is billed", matching the
+/// no-actor fallback), but SKIPS the cumulative-counter release and the budget
+/// refund. The unspent escrow and counter of the original (crash-restored)
+/// reservation are instead reconciled by the durable [`StreamReservationRecord`]
+/// and its restore sweep ([`reconcile_stream_reservations`]), which owns THIS
+/// context's own state. `generation` is a Class-C structural field read through
+/// the cell `Deref`.
 ///
 /// Order (matches the reference "release FIRST"): (1) RELEASE the unspent R4
 /// HIGH-1 cumulative-counter reserve back to the owned §7.3.8 `AmountCumulative`
@@ -1619,10 +1626,16 @@ pub async fn settle_outlet_stream(
 /// keyed by `ucan_cid` (`release`, saturating). The billed count is unknown once
 /// the pump is gone, so the FULL reserved amounts are returned — conservative:
 /// the invoker is never over-charged and the cumulative cap is never
-/// over-consumed (any bill for actually-rendered service was already captured by
-/// the generation-mismatch settle's
+/// over-consumed. Billing for rendered service is authoritative only where a
+/// settle actually fired: on a SOFT respawn the pump survived the actor restart
+/// and its close-time
 /// [`CapturedWithoutMutation`](StreamSettleOutcome::CapturedWithoutMutation)
-/// path). Runs REGARDLESS of generation — a restore overwrites
+/// settle captured the manifest-anchored bill before this sweep runs; on a HARD
+/// crash (the pump died with the process, no settle ever fired) no manifest
+/// reaches settle, so service rendered before the crash is un-billed — the
+/// operator absorbs it (the correct, invoker-favoring direction). Either way the
+/// sweep never bills; it only returns the unspent reserve. Runs REGARDLESS of
+/// generation — a restore overwrites
 /// `PerContextState::generation` with a fresh spawn generation, and the reserves
 /// are this restored context's OWN state. The releases + the clear land in the
 /// SAME persist, so the sweep is idempotent across restarts.
