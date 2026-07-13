@@ -409,7 +409,7 @@ jobs:
           # in-memory custody code paths are lint-checked. Mobile production
           # builds (iOS XCFramework, Android .aar) MUST NOT enable this
           # feature. See GitHub issue #88.
-          cargo clippy --workspace --all-targets --features scp-ffi-uniffi/allow_in_memory_custody,scp-ffi/allow_in_memory_custody,scp-ffi-napi/allow_in_memory_custody,scp-core/testing,scp-runtime/testing,scp-runtime/saga-witness-test-mint -- -D warnings
+          cargo clippy --workspace --all-targets --features scp-ffi-uniffi/allow_in_memory_custody,scp-ffi/allow_in_memory_custody,scp-ffi-napi/allow_in_memory_custody,scp-core/testing,scp-runtime/testing,scp-runtime/saga-witness-test-mint,scp-ffi/testing,scp-ffi/outlet-capability-test-grant -- -D warnings
           # The optional network transports (quic, http3, udp, coap) are not in
           # the default feature set and are not activated by --workspace, so the
           # sweep above never lints them. They rotted undetected for months
@@ -466,7 +466,7 @@ jobs:
           # in-memory custody tests run. Mobile production builds (iOS
           # XCFramework, Android .aar) MUST NOT enable this feature.
           # See GitHub issue #88.
-          cargo nextest run --workspace --features scp-ffi-uniffi/allow_in_memory_custody,scp-ffi/allow_in_memory_custody,scp-ffi-napi/allow_in_memory_custody,scp-core/testing,scp-runtime/testing,scp-runtime/saga-witness-test-mint
+          cargo nextest run --workspace --features scp-ffi-uniffi/allow_in_memory_custody,scp-ffi/allow_in_memory_custody,scp-ffi-napi/allow_in_memory_custody,scp-core/testing,scp-runtime/testing,scp-runtime/saga-witness-test-mint,scp-ffi/testing,scp-ffi/outlet-capability-test-grant
           # Test scp-transport with optional features that aren't enabled by
           # --workspace (combined includes rusqlite + scp-platform; local-cache
           # enables caching logic).
