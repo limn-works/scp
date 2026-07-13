@@ -1306,11 +1306,20 @@ pub async fn reserve_outlet_stream_economy(
 /// real settlement (which mutated owned state and owes a coalesced persist).
 #[derive(Debug)]
 pub enum StreamSettleOutcome {
-    /// The reservation's `generation` no longer matches the live actor — the
-    /// settlement was dropped without touching any state.
-    Dropped,
-    /// The settlement ran; the inner `Option` is the captured receipt (`None`
-    /// when nothing was billed / no adapter / capture failed).
+    /// The reservation's `generation` no longer matches the live actor (an
+    /// import-replace / crash-respawn between reserve and settle). Fix-D: the
+    /// settlement STILL captures the §19.15.5 receipt for service already
+    /// rendered (H8) against the open-time policy SNAPSHOT, but touches NO owned
+    /// state — releasing/refunding against this (possibly replaced) instance
+    /// would corrupt the wrong economy, and the durable reserves are left for
+    /// the restore-time reconcile sweep. The handler must NOT flag a mutation.
+    /// The inner `Option` is the captured receipt (`None` when nothing was
+    /// billed / no adapter / policy snapshot / capture failed).
+    CapturedWithoutMutation(Option<PaymentReceipt>),
+    /// The settlement ran on the matching live instance; it released/refunded
+    /// the owned reserves, CLEARED the crash-recovery record, and captured the
+    /// receipt. The inner `Option` is the captured receipt (`None` when nothing
+    /// was billed / no adapter / capture failed). Owed a coalesced persist.
     Settled(Option<PaymentReceipt>),
 }
 
@@ -1359,20 +1368,15 @@ pub async fn settle_outlet_stream(
     settlement: crate::context::outlets::invoke::StreamSettlement,
     generation: u64,
 ) -> StreamSettleOutcome {
-    if generation != cell.generation {
-        tracing::debug!(
-            context_id = %settlement.context_id,
-            reserved_generation = generation,
-            live_generation = cell.generation,
-            "outlet stream settlement landed on a replaced actor instance — dropping \
-             (no external escrow to void)"
-        );
-        return StreamSettleOutcome::Dropped;
-    }
-
+    // Destructure up front so the Fix-D generation-mismatch branch below can
+    // read the settlement for its snapshot-policy capture. `reserved`
+    // (= billed + refund) is the open-time escrow HOLD — it tells the clean
+    // path whether a crash-recovery record was persisted at open (only streams
+    // that held an escrow or a cumulative counter reserve persist one).
     let crate::context::outlets::invoke::StreamSettlement {
         context_id,
         invoker_did,
+        reserved,
         billed_amount,
         refund_amount,
         billed_count,
@@ -1400,6 +1404,77 @@ pub async fn settle_outlet_stream(
         .checked_mul(u64::from(billed_count))
         .unwrap_or(0);
     let billed_amount = Amount::new(billed_amount.value().min(derived_billed));
+
+    // Fix-D confused-deputy handling. The reservation was made against a
+    // specific actor-instance `generation`. If this actor's generation differs,
+    // the original instance was despawned and a NEW one respawned for the same
+    // `context_id` (crash-respawn or import-replace) between reserve and settle.
+    // We CANNOT distinguish those here, and releasing/refunding against THIS
+    // instance's owned state could corrupt the WRONG context's economy — so we
+    // touch NO owned state. But the service WAS rendered (H8), so we STILL
+    // capture the §19.15.5 receipt against the OPEN-TIME policy SNAPSHOT (never
+    // the live per-context policy — this may be a different context), via the
+    // supervisor payment adapter, exactly like the no-actor fallback in
+    // `settle_outlet_stream_via_actor`. The durable escrow hold + cumulative
+    // counter reserve are left in place: on a crash-restore the restore-time
+    // `ReconcileStreamReservations` sweep releases them from the persisted
+    // recovery record; on an import-replace they were already dropped with the
+    // replaced state (the record is stripped on export). Either way this path
+    // does NOT clear the record.
+    if generation != cell.generation {
+        tracing::debug!(
+            context_id = %context_id,
+            reserved_generation = generation,
+            live_generation = cell.generation,
+            "outlet stream settlement landed on a replaced actor instance — \
+             capturing the rendered bill against the open-time policy snapshot \
+             without touching owned state (Fix-D)"
+        );
+        let (Some(adapter), Some(policy)) = (
+            deps.payment_adapter.as_ref(),
+            economic_policy_snapshot.map(|snap| snap.policy),
+        ) else {
+            return StreamSettleOutcome::CapturedWithoutMutation(None);
+        };
+        if billed_amount.value() == 0 {
+            return StreamSettleOutcome::CapturedWithoutMutation(None);
+        }
+        return match authorize_and_capture_stream_billed(
+            adapter.as_ref(),
+            &policy,
+            &invoker_did,
+            billed_amount,
+            request_id,
+            &context_id,
+        )
+        .await
+        {
+            Ok(receipt) => {
+                tracing::debug!(
+                    request_id = %hex::encode(request_id),
+                    billed = billed_amount.value(),
+                    receipt_id = %hex::encode(receipt.receipt_id),
+                    "outlet stream settlement captured PaymentReceipt on a replaced \
+                     instance (reserves left for the reconcile sweep)"
+                );
+                StreamSettleOutcome::CapturedWithoutMutation(Some(receipt))
+            }
+            Err(err) => {
+                // H8: service rendered but capture failed on a replaced instance.
+                // There is no trustworthy owned receive buffer to emit a
+                // `PaymentCaptureFailed` event into here (this may be the wrong
+                // context) — log only; the reserve record stays for the sweep.
+                tracing::warn!(
+                    context_id = %context_id,
+                    "outlet stream settlement: payment capture failed on a replaced \
+                     instance: {err}"
+                );
+                StreamSettleOutcome::CapturedWithoutMutation(None)
+            }
+        };
+    }
+
+    // ---- Matching live instance: the clean close-time settlement. ----
 
     // The UNSPENT cumulative reserve to release: `reserved − billed_count ×
     // cost_per_chunk` (saturating). A degenerate `billed × cost` overflow FAILS
@@ -1430,7 +1505,14 @@ pub async fn settle_outlet_stream(
     // persist. Both are owned-state writes; combining them means either both
     // survive a coalesce-window crash or the KEEP'd in-memory mutation is
     // retried by the run loop.
-    if should_release || refund_amount.value() > 0 {
+    // Fix-D: a crash-recovery record was persisted at open IFF the stream held a
+    // durable escrow hold (`reserved > 0`) or a cumulative counter reserve. On
+    // this clean terminal the reserves are being released here, so the record
+    // must be CLEARED in the SAME persist — otherwise a later restart's
+    // reconcile sweep would see a stale record and double-release.
+    let record_persisted = reserved.value() > 0 || amount_cumulative_reserved > 0;
+    let request_key = hex::encode(request_id);
+    if should_release || refund_amount.value() > 0 || record_persisted {
         let invoker_for_commit = invoker_did.clone();
         let ucan_for_commit = ucan_cid.clone();
         let commit_result = cell
@@ -1449,6 +1531,12 @@ pub async fn settle_outlet_stream(
                         .governance
                         .budget_tracker
                         .reverse_spend(&invoker_for_commit, refund_amount);
+                }
+                if record_persisted {
+                    // Consumed on the clean terminal — the reserves this record
+                    // tracked were just released above, so the crash-recovery
+                    // sweep must never see it (double-release guard).
+                    state.class_s.stream_reservations.remove(&request_key);
                 }
                 Ok(())
             })

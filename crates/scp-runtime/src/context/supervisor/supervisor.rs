@@ -5320,7 +5320,24 @@ impl Supervisor {
             }
             | OutletsCommand::ReverseStreamEscrow {
                 context_id, reply, ..
+            }
+            // Fix-D: `PersistStreamReservation` shares the `Result<(),
+            // ContextError>` reply shape. A missing actor means the just-reserved
+            // context was torn down before the record could persist — reply the
+            // typed error; the open path logs it and proceeds (best-effort net).
+            | OutletsCommand::PersistStreamReservation {
+                context_id, reply, ..
             } => {
+                let err = ContextError::ContextNotRegistered(context_id);
+                let sketch = standing_outcome_error_sketch(&err);
+                let _ = reply.send(Err(err));
+                Outcome::err(sketch)
+            }
+            OutletsCommand::ReconcileStreamReservations { context_id, reply } => {
+                // Fix-D: the restore-time sweep targets a just-respawned actor; a
+                // missing actor here means the context was despawned again between
+                // restore and the sweep dispatch — reply the typed infra error
+                // (`Result<usize, _>` reply shape, distinct from the arm above).
                 let err = ContextError::ContextNotRegistered(context_id);
                 let sketch = standing_outcome_error_sketch(&err);
                 let _ = reply.send(Err(err));
@@ -10830,6 +10847,42 @@ impl Supervisor {
         })?
     }
 
+    /// Fix-D — dispatch the restore-time streaming crash-recovery sweep
+    /// ([`OutletsCommand::ReconcileStreamReservations`]) to a freshly-respawned
+    /// actor and await the reconciled-record count.
+    ///
+    /// Called once per context from the restore path
+    /// ([`restore_context`](crate::context::lifecycle_helpers)) after
+    /// `spawn_actor_with_state`, mirroring the post-restore TTL re-arm. The
+    /// handler refunds + releases the durable reserves of any stream whose
+    /// off-mailbox pump survived the crash (its close-time settle lands on the
+    /// bumped generation and is dropped) and clears the records. A context with
+    /// no in-flight streaming reservations reconciles zero (the common case).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError`] if the actor reply channel closes or the
+    /// dispatch misses (the just-respawned context was despawned again before
+    /// the sweep). Callers treat this best-effort — a miss leaves the records
+    /// for the next restart's sweep (idempotent).
+    pub(in crate::context) async fn reconcile_stream_reservations_via_actor(
+        &self,
+        context_id: &str,
+    ) -> Result<usize, ContextError> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let cmd = OutletsCommand::ReconcileStreamReservations {
+            context_id: context_id.to_owned(),
+            reply: reply_tx,
+        };
+        self.dispatch_outlets_command(cmd).await?;
+        reply_rx.await.map_err(|_| {
+            ContextError::TransportFailed(
+                "Supervisor::reconcile_stream_reservations_via_actor — actor reply channel closed"
+                    .to_owned(),
+            )
+        })?
+    }
+
     /// Dispatch the streaming open-time [`OutletsCommand::ReverseStreamEscrow`]
     /// to the target context's actor and await the persist outcome.
     ///
@@ -13476,6 +13529,8 @@ impl Supervisor {
             | OutletsCommand::ReserveStreamCaveatCounter { context_id, .. }
             | OutletsCommand::ReleaseStreamCaveatCounter { context_id, .. }
             | OutletsCommand::ReverseStreamEscrow { context_id, .. }
+            | OutletsCommand::PersistStreamReservation { context_id, .. }
+            | OutletsCommand::ReconcileStreamReservations { context_id, .. }
             | OutletsCommand::SettleOutletEconomy { context_id, .. } => context_id.as_str(),
             OutletsCommand::SettleOutletStream { settlement, .. } => settlement.context_id.as_str(),
         }

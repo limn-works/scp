@@ -3146,6 +3146,41 @@ pub async fn restore_context(
         .await
         .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
 
+    // Fix-D — restore-time streaming crash-recovery sweep. The actor is now
+    // resident with its Class-S state rehydrated (including any
+    // `stream_reservations` records). Drive the reconcile ON the freshly-
+    // respawned actor: it RELEASES the durable escrow hold + §7.3.8 cumulative
+    // counter reserve of any stream whose off-mailbox pump survived the crash
+    // (that pump's close-time settle now lands on the bumped generation and is
+    // dropped) and clears the records. This is the streaming analog of the
+    // §6.2.4 saga reconciliation, but scoped to the SAME restored context —
+    // streaming has no cross-context saga journal, and the reservation is this
+    // context's OWN owned state, so it runs regardless of generation. Best-
+    // effort: a dispatch miss (context despawned again) leaves the records for
+    // the next restart's sweep (idempotent) rather than failing the restore.
+    match deps
+        .supervisor
+        .reconcile_stream_reservations_via_actor(context_id)
+        .await
+    {
+        Ok(reconciled) if reconciled > 0 => {
+            tracing::info!(
+                context_id = %context_id,
+                reconciled,
+                "Fix-D: released stranded streaming reservations on restore \
+                 (pump survived a crash — escrow + cumulative counter reserve refunded)"
+            );
+        }
+        Ok(_) => {}
+        Err(err) => {
+            tracing::warn!(
+                context_id = %context_id,
+                "Fix-D: streaming reservation reconcile on restore failed \
+                 (records left for the next restart's sweep): {err}"
+            );
+        }
+    }
+
     // Governance timeouts (ADR-031 §5) are ACTOR-OWNED (ADR-049
     // Decision-1 / finding A3): the spawned actor's `reconcile_timers`
     // arms the 60 s interval while `Active` — no bootstrap install needed.

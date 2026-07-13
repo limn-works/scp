@@ -829,6 +829,23 @@ impl SupervisorHandle {
             );
         }
     }
+
+    /// Fix-D — dispatch the restore-time streaming crash-recovery sweep to a
+    /// freshly-respawned actor, delegating to
+    /// [`Supervisor::reconcile_stream_reservations_via_actor`](crate::context::supervisor::Supervisor::reconcile_stream_reservations_via_actor).
+    ///
+    /// # Errors
+    ///
+    /// Propagates the dispatch / reply-channel [`ContextError`] from the inner
+    /// supervisor (callers on the restore path treat it best-effort).
+    pub(in crate::context) async fn reconcile_stream_reservations_via_actor(
+        &self,
+        context_id: &str,
+    ) -> Result<usize, scp_protocol::context::ContextError> {
+        self.supervisor
+            .reconcile_stream_reservations_via_actor(context_id)
+            .await
+    }
 }
 
 // Explicit non-exposure check: ensure no public method returns

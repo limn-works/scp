@@ -2340,6 +2340,50 @@ where
     // runtime-generated id here would have made the binding check
     // structurally impossible.
     let request_id: RequestId = params.request_id;
+
+    // Fix-D — persist the durable crash-recovery record NOW: both open-time
+    // reservations are durable (the escrow hold was debited on the mailbox
+    // during `reserve_outlet_stream_economy`; the §7.3.8 cumulative counter was
+    // just reserved at Step 5.5 above), and the long-lived off-mailbox pump is
+    // about to spawn. The pump is a SEPARATE `tokio` task that SURVIVES an actor
+    // crash + respawn — its close-time settle then lands on the bumped
+    // generation and is dropped — so without this record the escrow hold +
+    // counter reserve would be stranded on a crash-restore. The restore-time
+    // `ReconcileStreamReservations` sweep releases them from this record; the
+    // clean close-time settle clears it. Only escrow-or-counter-bearing streams
+    // need a record (a zero-cost / Query stream holds no durable reserve).
+    //
+    // Awaited so the record is durable before the pump bills. Best-effort: a
+    // persist hiccup logs and PROCEEDS — the reserves are already durable and
+    // the pump's normal settle reconciles them in the common case; only a crash
+    // DURING this stream loses the recovery net (the pre-Fix-D behaviour) —
+    // rather than denying an otherwise-valid open. (A KEEP-persist error still
+    // leaves the record in memory for the run-loop coalesce, so only a true
+    // dispatch miss to the just-reserved live context loses it.)
+    if let Some(sink) = settlement_sink.as_ref()
+        && (params.reserved_escrow.value() > 0 || counter_commit.amount_cumulative_reserved > 0)
+    {
+        let record = super::invoke::StreamReservationRecord {
+            invoker_did: invoker_did.clone(),
+            ucan_cid: params.ucan_cid.clone(),
+            cost_per_chunk: params.cost_per_chunk,
+            amount_cumulative_reserved: counter_commit.amount_cumulative_reserved,
+            reserved_escrow: params.reserved_escrow,
+            // Stamped by the sink with the reservation's spawn-generation.
+            generation: 0,
+        };
+        if let Err(err) = sink
+            .persist_reservation(context.context_id(), request_id, record)
+            .await
+        {
+            tracing::warn!(
+                request_id = %hex::encode(request_id),
+                "Fix-D: streaming reservation recovery record persist failed \
+                 (crash-recovery net unavailable for this stream): {err}"
+            );
+        }
+    }
+
     let (outer_tx, outer_rx) = mpsc::channel::<OutletStreamChunk>(
         scp_protocol::context::outlets::stream::DEFAULT_CREDIT_WINDOW as usize,
     );
@@ -3647,6 +3691,23 @@ mod tests {
                     .settlement
                     .write()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(settlement);
+            }
+            fn persist_reservation<'a>(
+                &'a self,
+                _context_id: &str,
+                _request_id: scp_protocol::context::outlets::stream::RequestId,
+                _record: super::super::invoke::StreamReservationRecord,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<(), scp_protocol::context::ContextError>,
+                        > + Send
+                        + 'a,
+                >,
+            > {
+                // Test sink: no durable store — the crash-recovery record is
+                // exercised by the actor-backed integration tests, not here.
+                Box::pin(async { Ok(()) })
             }
         }
 

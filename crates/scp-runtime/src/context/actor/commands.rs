@@ -2402,6 +2402,54 @@ pub enum OutletsCommand {
         reply:
             oneshot::Sender<Result<Option<crate::economy::adapter::PaymentReceipt>, ContextError>>,
     },
+
+    /// Fix-D — durably persist the streaming crash-recovery
+    /// [`StreamReservationRecord`](crate::context::outlets::invoke::StreamReservationRecord)
+    /// on actor-owned Class-S state at pump open, AFTER both open-time
+    /// reservations (the §5.4.5 escrow hold + the §7.3.8 cumulative counter
+    /// reserve) are durable. Fired by
+    /// [`ActorStreamSettlementSink::persist_reservation`](crate::context::outlets::stream_settlement_adapter::ActorStreamSettlementSink)
+    /// from the off-mailbox open path.
+    ///
+    /// The handler inserts the record (keyed by the hex `request_id`) into
+    /// `ClassSState.stream_reservations` under a fail-closed `commit_class_s_keep`
+    /// (durable via the ADR-049 §9 snapshot), stamping the record's `generation`
+    /// with the live cell generation. The reply carries only the persist /
+    /// transport infrastructure outcome.
+    PersistStreamReservation {
+        /// Context identifier string.
+        context_id: String,
+        /// The stream `request_id` — the recovery record's key.
+        request_id: scp_protocol::context::outlets::stream::RequestId,
+        /// The crash-recovery record (boxed — a large economy payload).
+        record: Box<crate::context::outlets::invoke::StreamReservationRecord>,
+        /// Oneshot reply carrying the persist / transport infra outcome.
+        reply: oneshot::Sender<Result<(), ContextError>>,
+    },
+
+    /// Fix-D — restore-time crash-recovery sweep: reconcile every unresolved
+    /// streaming reservation recovery record on actor-owned Class-S state. Fired
+    /// once per context from the restore path
+    /// ([`restore_context`](crate::context::lifecycle_helpers)) after the actor
+    /// is respawned, mirroring the §6.2.4 saga-recovery reconciliation but
+    /// scoped to the SAME restored context (streaming has no cross-context saga
+    /// journal — the reservation is this context's own owned state).
+    ///
+    /// The handler drains `ClassSState.stream_reservations` under ONE fail-closed
+    /// `commit_class_s_keep`, and for each record REFUNDS the full `reserved_escrow`
+    /// to the invoker's budget tracker + RELEASES the full `amount_cumulative_reserved`
+    /// back to the §7.3.8 `AmountCumulative` counter (the billed count is unknown
+    /// once the pump is gone — full release is conservative, never over-charging),
+    /// then clears the map. Runs REGARDLESS of generation (a restore overwrites
+    /// `PerContextState::generation` with a fresh spawn generation; the reserves
+    /// are this restored context's OWN state). The reply carries the number of
+    /// records reconciled, or the persist / transport infra error.
+    ReconcileStreamReservations {
+        /// Context identifier string.
+        context_id: String,
+        /// Oneshot reply carrying the reconciled-record count, or the infra error.
+        reply: oneshot::Sender<Result<usize, ContextError>>,
+    },
 }
 
 /// See [`ContextCommand::Queries`]. Pure-read variants — handlers MUST

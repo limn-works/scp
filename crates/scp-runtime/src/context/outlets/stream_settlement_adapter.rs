@@ -142,6 +142,41 @@ impl StreamSettlementSink for ActorStreamSettlementSink {
             }
         });
     }
+
+    fn persist_reservation<'a>(
+        &'a self,
+        context_id: &str,
+        request_id: scp_protocol::context::outlets::stream::RequestId,
+        mut record: crate::context::outlets::invoke::StreamReservationRecord,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<(), scp_protocol::context::ContextError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        // Stamp the reservation's spawn-generation (this sink's captured
+        // generation is exactly the generation the reserve was made against).
+        record.generation = self.generation;
+        let supervisor = Arc::clone(&self.supervisor);
+        let context_id = context_id.to_owned();
+        Box::pin(async move {
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+            let cmd = crate::context::actor::commands::OutletsCommand::PersistStreamReservation {
+                context_id,
+                request_id,
+                record: Box::new(record),
+                reply: reply_tx,
+            };
+            supervisor.dispatch_outlets_command(cmd).await?;
+            reply_rx.await.map_err(|_| {
+                scp_protocol::context::ContextError::TransportFailed(
+                    "ActorStreamSettlementSink::persist_reservation — actor reply channel closed"
+                        .to_owned(),
+                )
+            })?
+        })
+    }
 }
 
 #[cfg(test)]
@@ -435,10 +470,13 @@ mod tests {
         );
     }
 
-    /// Confused-deputy guard: a generation MISMATCH drops the settlement and
-    /// touches NO owned state (no release, no refund, no capture).
+    /// Fix-D confused-deputy guard: a generation MISMATCH touches NO owned state
+    /// (no release, no refund). With no open-time policy SNAPSHOT there is
+    /// nothing to capture either, so the outcome is
+    /// `CapturedWithoutMutation(None)` and the durable reserves are left intact
+    /// for the restore-time reconcile sweep.
     #[tokio::test]
-    async fn generation_mismatch_drops_without_mutation() {
+    async fn generation_mismatch_captures_without_mutation() {
         let captured = Arc::new(AtomicUsize::new(0));
         let supervisor = build_supervisor(Some(counting(&captured)));
         let deps = deps_for(&supervisor).await;
@@ -457,22 +495,22 @@ mod tests {
         .await;
 
         assert!(
-            matches!(outcome, StreamSettleOutcome::Dropped),
-            "a generation mismatch drops the settlement"
+            matches!(outcome, StreamSettleOutcome::CapturedWithoutMutation(None)),
+            "a generation mismatch with no policy snapshot captures nothing and mutates nothing"
         );
         assert_eq!(
             captured.load(Ordering::SeqCst),
             0,
-            "no capture on a dropped settlement"
+            "no capture without an open-time policy snapshot on a replaced instance"
         );
         assert_eq!(
             cell.governance.budget_tracker.total_spent(&invoker()),
             Amount::new(100),
-            "budget untouched on drop"
+            "budget untouched on a generation mismatch (reserves left for the sweep)"
         );
         assert_eq!(
             cell.class_s.caveat_counters[UCAN_CID].amount_cumulative_used, 50,
-            "counter untouched on drop"
+            "counter untouched on a generation mismatch (reserves left for the sweep)"
         );
     }
 

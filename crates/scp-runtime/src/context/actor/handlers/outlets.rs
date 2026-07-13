@@ -174,6 +174,18 @@ pub(crate) async fn dispatch(
             generation,
             reply,
         } => handle_settle_outlet_stream(cell, deps, settlement, generation, reply).await,
+        OutletsCommand::PersistStreamReservation {
+            context_id,
+            request_id,
+            record,
+            reply,
+        } => {
+            handle_persist_stream_reservation(cell, deps, &context_id, request_id, record, reply)
+                .await
+        }
+        OutletsCommand::ReconcileStreamReservations { context_id, reply } => {
+            handle_reconcile_stream_reservations(cell, deps, &context_id, reply).await
+        }
     }
 }
 
@@ -326,10 +338,13 @@ async fn handle_reverse_stream_escrow(
 /// this handler maps its
 /// [`StreamSettleOutcome`](crate::context::outlets_helpers::StreamSettleOutcome)
 /// onto the reply + the actor
-/// [`Outcome`]. A DROP touched no state (`Outcome::ok` — no coalesced persist);
-/// a real settlement mutated owned state (`Outcome::ok_mutated`). The helper
-/// never returns `Err` (a persist failure is KEEP'd + logged, service-rendered
-/// capture runs regardless), so the reply always carries the billing outcome.
+/// [`Outcome`]. Fix-D: a generation-mismatch settle CAPTURES the receipt for
+/// rendered service but touches no owned state (`Outcome::ok` — no coalesced
+/// persist; the durable reserves are left for the restore-time reconcile
+/// sweep); a matching-instance settlement mutated owned state
+/// (`Outcome::ok_mutated`). Either way the reply carries the (possibly `None`)
+/// receipt. The helper never returns `Err` (a persist failure is KEEP'd +
+/// logged, service-rendered capture runs regardless).
 async fn handle_settle_outlet_stream(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
@@ -341,8 +356,12 @@ async fn handle_settle_outlet_stream(
     match crate::context::outlets_helpers::settle_outlet_stream(cell, deps, *settlement, generation)
         .await
     {
-        StreamSettleOutcome::Dropped => {
-            let _ = reply.send(Ok(None));
+        StreamSettleOutcome::CapturedWithoutMutation(receipt) => {
+            // Fix-D: generation mismatch — a receipt may have been captured for
+            // rendered service, but NO owned state was touched (the durable
+            // reserves are left for the restore-time reconcile sweep). Reply the
+            // receipt WITHOUT flagging a mutation (no coalesced persist).
+            let _ = reply.send(Ok(receipt));
             Outcome::ok(())
         }
         StreamSettleOutcome::Settled(receipt) => {
@@ -583,6 +602,147 @@ async fn handle_release_stream_caveat_counter(
         Err(_elapsed) => {
             let err = ContextError::TransportTimeout(format!(
                 "release_stream_caveat_counter exceeded {HANDLER_TIMEOUT:?} budget"
+            ));
+            let sketch = outcome_error_sketch(&err);
+            (Outcome::err_mutated(sketch), Err(err))
+        }
+    };
+
+    let _ = reply.send(reply_result);
+    outcome
+}
+
+/// Handle [`OutletsCommand::PersistStreamReservation`] — Fix-D durable
+/// crash-recovery record insert at pump open.
+///
+/// Inserts the
+/// [`StreamReservationRecord`](crate::context::outlets::invoke::StreamReservationRecord)
+/// (keyed by the hex `request_id`) into the owned `ClassSState.stream_reservations`
+/// under a fail-closed
+/// [`commit_class_s_keep`](crate::context::actor::class_s::ClassSCell::commit_class_s_keep)
+/// (durable via the ADR-049 §9 snapshot), stamping the record's `generation`
+/// with the live cell generation — the authoritative reservation generation,
+/// since this persist runs on the same instance the reserve did (absent a crash
+/// in between). The reply carries only the persist / transport infra outcome.
+async fn handle_persist_stream_reservation(
+    cell: &mut crate::context::actor::class_s::ClassSCell,
+    deps: &ActorDeps,
+    context_id: &str,
+    request_id: scp_protocol::context::outlets::stream::RequestId,
+    record: Box<crate::context::outlets::invoke::StreamReservationRecord>,
+    reply: oneshot::Sender<Result<(), ContextError>>,
+) -> Outcome<()> {
+    let key = hex::encode(request_id);
+    let mut record = *record;
+    // Stamp the authoritative live generation (diagnostic only — the reconcile
+    // sweep ignores generation).
+    record.generation = cell.generation;
+    let commit_fut = cell.commit_class_s_keep(deps, context_id, move |mut view| {
+        view.rest_mut()
+            .class_s
+            .stream_reservations
+            .insert(key, record);
+        Ok(())
+    });
+
+    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, commit_fut).await {
+        Ok(Ok(())) => (Outcome::ok_mutated(()), Ok(())),
+        Ok(Err(err)) => {
+            // KEEP semantics: the in-memory insert IS applied even though the
+            // persist failed — flag mutated so the run loop retries the write.
+            let sketch = outcome_error_sketch(&err);
+            (Outcome::err_mutated(sketch), Err(err))
+        }
+        Err(_elapsed) => {
+            let err = ContextError::TransportTimeout(format!(
+                "persist_stream_reservation exceeded {HANDLER_TIMEOUT:?} budget"
+            ));
+            let sketch = outcome_error_sketch(&err);
+            (Outcome::err_mutated(sketch), Err(err))
+        }
+    };
+
+    let _ = reply.send(reply_result);
+    outcome
+}
+
+/// Handle [`OutletsCommand::ReconcileStreamReservations`] — Fix-D restore-time
+/// crash-recovery sweep.
+///
+/// Drains `ClassSState.stream_reservations` under ONE fail-closed
+/// [`commit_class_s_keep`](crate::context::actor::class_s::ClassSCell::commit_class_s_keep).
+/// For each unresolved record it REFUNDS the full `reserved_escrow` to the
+/// invoker's `MemberBudgetTracker` (`reverse_spend`, saturating) and RELEASES the
+/// full `amount_cumulative_reserved` back to the §7.3.8 `AmountCumulative` counter
+/// keyed by `ucan_cid` (`release`, saturating). The billed count is unknown once
+/// the pump is gone, so the FULL reserved amounts are returned — conservative:
+/// the invoker is never over-charged and the cumulative cap is never
+/// over-consumed (any bill for actually-rendered service was already captured by
+/// the generation-mismatch settle's `CapturedWithoutMutation` path). Runs
+/// REGARDLESS of generation (a restore overwrites `PerContextState::generation`
+/// with a fresh spawn generation; the reserves are this restored context's OWN
+/// state). The releases + the clear land in the SAME persist, so the sweep is
+/// idempotent across restarts: a persist failure re-runs from the restored
+/// record; a success removes it.
+async fn handle_reconcile_stream_reservations(
+    cell: &mut crate::context::actor::class_s::ClassSCell,
+    deps: &ActorDeps,
+    context_id: &str,
+    reply: oneshot::Sender<Result<usize, ContextError>>,
+) -> Outcome<()> {
+    // Nothing to reconcile — reply without a spurious durable write. The common
+    // case: a clean restart where every stream settled cleanly (its record was
+    // cleared at close).
+    let count = cell.class_s.stream_reservations.len();
+    if count == 0 {
+        let _ = reply.send(Ok(0));
+        return Outcome::ok(());
+    }
+
+    let commit_fut = cell.commit_class_s_keep(deps, context_id, move |mut view| {
+        let state = view.rest_mut();
+        // Take the map out so the per-record reversal can borrow the sibling
+        // governance / caveat-counter state mutably without aliasing.
+        let records = std::mem::take(&mut state.class_s.stream_reservations);
+        for record in records.into_values() {
+            if record.reserved_escrow.value() > 0 {
+                // Refund the FULL open-time escrow hold — the pump is gone and
+                // the billed count is unknown. Saturating (`reverse_spend`), so a
+                // benign over-refund of an already-settled hold is a no-op.
+                state
+                    .governance
+                    .budget_tracker
+                    .reverse_spend(&record.invoker_did, record.reserved_escrow);
+            }
+            if record.amount_cumulative_reserved > 0 && !record.ucan_cid.is_empty() {
+                // Release the FULL cumulative reserve back to the counter.
+                state
+                    .class_s
+                    .caveat_counters
+                    .entry(record.ucan_cid)
+                    .or_default()
+                    .release(
+                        scp_protocol::trust::CaveatKind::AmountCumulative,
+                        record.amount_cumulative_reserved,
+                    );
+            }
+        }
+        Ok(())
+    });
+
+    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, commit_fut).await {
+        Ok(Ok(())) => (Outcome::ok_mutated(()), Ok(count)),
+        Ok(Err(err)) => {
+            // KEEP semantics: the in-memory releases + clear ARE applied even
+            // though the persist failed — the run loop retries the durable write,
+            // and a restart before it lands re-runs the sweep from the restored
+            // record (idempotent).
+            let sketch = outcome_error_sketch(&err);
+            (Outcome::err_mutated(sketch), Err(err))
+        }
+        Err(_elapsed) => {
+            let err = ContextError::TransportTimeout(format!(
+                "reconcile_stream_reservations exceeded {HANDLER_TIMEOUT:?} budget"
             ));
             let sketch = outcome_error_sketch(&err);
             (Outcome::err_mutated(sketch), Err(err))

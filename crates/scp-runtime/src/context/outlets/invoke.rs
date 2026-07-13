@@ -1627,9 +1627,10 @@ pub struct StreamSettlement {
     pub cost_per_chunk: scp_protocol::economy::types::Amount,
 }
 
-/// Durable crash-recovery record for an in-flight streaming reservation
-/// (Fix-D — the streaming analogue of §6.2.4
-/// [`CallerReservationRecord`](crate::context::supervisor::saga_prepared_state::CallerReservationRecord)).
+/// Durable crash-recovery record for an in-flight streaming reservation.
+///
+/// Fix-D — the streaming analogue of the §6.2.4
+/// [`CallerReservationRecord`](crate::context::supervisor::saga_prepared_state::CallerReservationRecord).
 ///
 /// **Why this exists.** A streaming open makes TWO durable reservations that
 /// the close-time settlement is responsible for releasing: (1) the §5.4.5
@@ -1732,6 +1733,30 @@ pub trait StreamSettlementSink: Send + Sync {
     /// Settles the stream's economics exactly once. MUST NOT block — spawn
     /// the async settlement onto a runtime handle.
     fn settle(&self, settlement: StreamSettlement);
+
+    /// Fix-D — durably persist the crash-recovery
+    /// [`StreamReservationRecord`] at pump open, AFTER both open-time
+    /// reservations (the §5.4.5 escrow hold + the §7.3.8 cumulative counter
+    /// reserve) are durable, keyed by the stream `request_id`. Unlike
+    /// [`settle`](Self::settle) this is AWAITED on the open path so the record
+    /// is durable before the pump bills — a crash mid-stream is then
+    /// reconciled at restore. The implementation stamps the record's
+    /// `generation` with the reservation's spawn-generation. Returns the
+    /// persist / transport infrastructure outcome. Dyn-safe boxed future (the
+    /// concrete impl routes onto the actor mailbox), mirroring
+    /// [`CaveatCounterApi`](crate::trust::CaveatCounterApi).
+    fn persist_reservation<'a>(
+        &'a self,
+        context_id: &str,
+        request_id: RequestId,
+        record: StreamReservationRecord,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<(), scp_protocol::context::ContextError>>
+                + Send
+                + 'a,
+        >,
+    >;
 }
 
 /// Read-only handle exposed to a [`OutletKind::Query`] outlet's executor.
