@@ -1633,7 +1633,7 @@ All domain separators are UTF-8 strings used as prefixes in canonical hash, sign
 | `"SCP-OUTLET-CAVEAT-BIND-V1:"` | Outlet-stream caveats-binding preimage (`ucan_cid`/`request_id`/`invoker_did`/`estimated_chunk_count`/narrowed caveats) | §5.4.5 |
 | `"SCP-OUTLET-CREDIT-V1:"` | Outlet-stream credit-grant signing preimage | §5.4.5 |
 | `"SCP-OUTLET-CANCEL-V1:"` | Outlet-stream cancel signing preimage | §5.4.5 |
-| `"SCP-XCTX-STREAM-RECEIPT-V1:"` | Cross-context streaming-saga receipt signing | §6.2.4 |
+| `"SCP-XCTX-STREAM-RECEIPT-V1:"` | Cross-context streaming-saga receipt signing | §6.2.5 |
 | `"SCP-INVITATION-BUNDLE-V1:"` | InvitationBundle signing — over the full genesis `ContextParams` (per-field JCS hashes) | §5.12.3.1 |
 | `"SCP-JOIN-RESPONSE-V1:"` | JoinResponse signing | §5.12.3.2 |
 | `"standing:"` / `"standing-"` | Standing-pair context-id derivation prefix — internal id construction over a §9.5.1 length-prefixed body, NOT a §9.5.1 signature-preimage separator (`"standing-"` is an output id-prefix) | §5.15.8 |

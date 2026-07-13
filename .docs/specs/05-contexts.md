@@ -344,7 +344,7 @@ Every other code in `6100..6199` — the intra-class gaps (`6111`, `6132`, …) 
 
 ### 5.4.5 Progressive Output (Streaming)
 
-Outlet invocations are streams by construction. A non-streaming invocation is the degenerate single-chunk case; there is no separate `OutletResponse` wire type.
+This section specifies the **streaming** delivery mode (§6.2.5, ADR-061). Streaming and unary are **distinct** invocation modes with distinct committed integrity artifacts: a unary invocation commits `output_hash`, a streaming invocation commits `stream_manifest_hash` — a unary call is **not** modeled as a degenerate one-chunk stream (ADR-061 supersedes that framing). The wire types below carry a streamed result.
 
 **Wire types.**
 

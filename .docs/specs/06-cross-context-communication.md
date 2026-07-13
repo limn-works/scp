@@ -355,7 +355,7 @@ Outlet invocation is classified along **two orthogonal axes** — **delivery** a
 
 The four canonical modes (all supported):
 
-| | **best-effort** | **transactional (saga)** |
+| | **best-effort** | **transactional** |
 |---|---|---|
 | **unary** (→ `output_hash`) | **plain outlet invocation** — the base call | **outlet invocation saga** (§6.2.4) |
 | **streaming** (→ `stream_manifest_hash`) | **outlet stream** | **streaming saga** |
@@ -365,7 +365,7 @@ The four canonical modes (all supported):
 - **outlet stream** — streaming, best-effort: signed chunk stream with credit, no transaction envelope.
 - **streaming saga** — streaming, transactional: the §6.2.4 envelope extended with a **seal phase** (ADR-061). The Commit-transition triggers the pump (it does NOT block for the stream); chunks forward to the caller as produced (no buffering) while being captured durably and incrementally (an O(log n) RFC-6962 Merkle frontier + credit ledger keyed by `SagaId` — a replay snapshot, not a bridge buffer). At **stream-close** the seal phase finalizes `stream_manifest_hash` from the frontier, signs the receipt, settles escrow, records both event logs, and reaches the `Committed` terminal. The saga commits **once, at close** (over the bounded Merkle root); it does NOT two-phase-commit per chunk (rejected in ADR-061). A mid-stream crash **seals the prefix and closes truncated, never resuming** the outlet (re-invoking an LLM yields different tokens). The stream lives in the seal phase, whose duration is bounded by the invoker's credit/escrow envelope — NOT the 30 s saga phase timeout (ADR-049 §3a). The streaming receipt uses a **distinct `SCP-XCTX-STREAM-RECEIPT-V1` separator** carrying the 32-byte manifest root directly (reproduced on replay from the `SagaId`-keyed durable capture, not from carried output bytes). What the envelope uniquely adds over *outlet stream* is cross-context atomic dual-log + signed receipt + escrow settlement — NOT the per-chunk billing (that is the Class-S credit ledger, shared with the best-effort mode). Required for a paid, cross-context, metered LLM outlet.
 
-**Naming (normative).** Discriminate by delivery (**unary** / **streaming**) and envelope (**best-effort** / **saga**). Never use "cross-context" as the discriminating qualifier for a mode. "unary"/"streaming" are the industry matched pair (cf. gRPC); "unary" names response cardinality, not an implementation.
+**Naming (normative).** Discriminate by delivery (**unary** / **streaming**) and envelope guarantee (**best-effort** / **transactional**) — never by mechanism ("saga" is the cross-context *realization* of the transactional guarantee, not the discriminator) and never by location ("cross-context"). "unary"/"streaming" are the industry matched pair (cf. gRPC); "unary" names response cardinality, not an implementation.
 
 ## 6.3 The Human as Bridge
 
