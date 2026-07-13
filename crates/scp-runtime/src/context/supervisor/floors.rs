@@ -23,6 +23,7 @@
 
 use std::collections::HashMap;
 
+use scp_protocol::context::ContextError;
 use scp_protocol::context::builder::ReceiveFloor;
 
 use super::supervisor::Supervisor;
@@ -156,6 +157,44 @@ impl std::fmt::Display for FloorAdvanceError {
 }
 
 impl std::error::Error for FloorAdvanceError {}
+
+/// Live receive-gating rejection → context error, for the PR-6 fail-closed
+/// seams (`open()` + the three receive helper seams, landing in later PR-6
+/// slices) that will call `check_and_advance_*(..)?` and must surface a
+/// [`ContextError`]. Additive here: no caller wires it in this slice.
+///
+/// ALL FOUR variants map uniformly to [`ContextError::CryptoFailed`]. This is a
+/// deliberate, reviewed choice — not a convenience default:
+///
+/// - `FloorAdvanceError` is the **live receive-gating** rejection type: a
+///   received sender-key epoch or recv `(epoch, sequence)` that fails the
+///   monotonicity / overshoot floor at the crypto-open seam. `CryptoFailed` is
+///   exactly what the live crypto path (`open()`, MLS decrypt) already returns,
+///   so mapping here preserves the existing FFI/SDK-bridged crypto-failure
+///   taxonomy — no new canonical code, no bridge-translator change. Concretely,
+///   the authoritative live `open()` path already maps the sender-key
+///   rollback/replay case (`SenderKeyError::EpochNotMonotonic`, surfaced by the
+///   provider's epoch check) to `ContextError::CryptoFailed`; mapping this
+///   follower-mirror analogue to anything else would make the follower seam
+///   MORE granular than the authoritative seam it mirrors.
+/// - It deliberately does **not** map to
+///   [`ContextError::SnapshotFloorRegression`]. That variant is
+///   *import-specific* (canonical code `SCP-CTX-2091`): it aggregates EVERY
+///   regressing sender into `per_sender_deltas: Vec<(String, u64, u64)>` and
+///   carries a `resource` class string. It is constructed directly by the
+///   snapshot import/merge path (`validate_and_merge_*`), which holds the full
+///   delta set. A per-variant `From` sees only ONE sender and no resource
+///   class, so producing `SnapshotFloorRegression` from it would fabricate a
+///   bogus single-element aggregate and misrepresent a live replay rejection as
+///   a snapshot-import regression.
+/// - `err.to_string()` preserves the [`Display`](std::fmt::Display) message
+///   (which sender, current vs proposed floor, ceiling) into `CryptoFailed`'s
+///   `String` payload, so the human-readable reason survives the conversion.
+impl From<FloorAdvanceError> for ContextError {
+    fn from(err: FloorAdvanceError) -> Self {
+        Self::CryptoFailed(err.to_string())
+    }
+}
 
 impl Supervisor {
     /// Atomically check-and-advance the per-sender **epoch** floor for `ctx`.
@@ -493,7 +532,7 @@ mod tests {
 
     use scp_protocol::crypto::sender_keys::MAX_EPOCH_ADVANCE;
 
-    use super::{FloorAdvanceError, ReceiveFloor, Supervisor};
+    use super::{ContextError, FloorAdvanceError, ReceiveFloor, Supervisor};
     use crate::context::supervisor::handle::SupervisorHandle;
 
     const CTX: [u8; 32] = [0xA5u8; 32];
@@ -641,6 +680,81 @@ mod tests {
                 MAX_EPOCH_ADVANCE
             )
             .is_ok()
+        );
+    }
+
+    // -- FloorAdvanceError → ContextError conversion (PR-6 seam) ----------------
+
+    #[test]
+    fn floor_advance_error_converts_to_crypto_failed_preserving_message() {
+        // Every FloorAdvanceError variant is a LIVE receive-gating rejection and
+        // MUST land as ContextError::CryptoFailed (never SnapshotFloorRegression),
+        // carrying the Display message so the human-readable reason survives.
+        let cases = [
+            FloorAdvanceError::SenderEpochNotMonotonic {
+                did: DID.to_owned(),
+                current: 7,
+                proposed: 4,
+            },
+            FloorAdvanceError::SenderEpochOvershoot {
+                did: DID.to_owned(),
+                ceiling: 10,
+                proposed: 99,
+            },
+            FloorAdvanceError::RecvSequenceNotMonotonic {
+                did: DID.to_owned(),
+                current: rf(3, 8),
+                proposed: rf(3, 2),
+            },
+            FloorAdvanceError::RecvSequenceOvershoot {
+                did: DID.to_owned(),
+                ceiling: 12,
+                proposed: 40,
+            },
+        ];
+
+        for err in cases {
+            let expected_message = err.to_string();
+
+            // Convert via the `From` impl (the shape the `?`-seams will use).
+            let ctx_err = ContextError::from(err.clone());
+            assert!(
+                matches!(ctx_err, ContextError::CryptoFailed(_)),
+                "expected CryptoFailed for {err:?}, got {ctx_err:?}"
+            );
+
+            // The Display message must be preserved verbatim in the payload —
+            // including the sender DID and the numeric floor facts.
+            let ContextError::CryptoFailed(payload) = &ctx_err else {
+                unreachable!("matched CryptoFailed above");
+            };
+            assert_eq!(
+                payload, &expected_message,
+                "CryptoFailed payload must be the FloorAdvanceError Display message"
+            );
+            assert!(
+                payload.contains(DID),
+                "payload must name the sender DID: {payload}"
+            );
+
+            // `.into()` at a `?`-style seam yields the same CryptoFailed.
+            let via_into: ContextError = err.into();
+            assert!(matches!(via_into, ContextError::CryptoFailed(_)));
+        }
+
+        // Spot-check that the specific numeric facts of a NotMonotonic rejection
+        // (proposed <= current) reach the payload, not just the DID.
+        let mono = FloorAdvanceError::SenderEpochNotMonotonic {
+            did: DID.to_owned(),
+            current: 7,
+            proposed: 4,
+        };
+        let ContextError::CryptoFailed(payload) = ContextError::from(mono) else {
+            unreachable!("SenderEpochNotMonotonic maps to CryptoFailed");
+        };
+        assert!(
+            payload.contains('7') && payload.contains('4'),
+            "proposed/current numbers must survive into the payload: {payload}"
         );
     }
 
