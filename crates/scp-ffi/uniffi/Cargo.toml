@@ -36,6 +36,14 @@ server = ["scp-ffi-common/server", "dep:scp-node"]
 # be enabled in production mobile builds; the parity harness (ADR-046)
 # enables it.
 testing = ["scp-core/testing"]
+# §5.4.5 streaming-outlet live-flow test seam (SCP-OUT-037, C8b). Enables
+# `Supervisor::test_grant_member_capability` — an AUTHORITY-ESCALATION primitive
+# deliberately NOT folded into `testing` (which leaks into every
+# `allow_in_memory_custody` build and would compile the custody-escape-hatch into
+# a released Swift/Kotlin SDK). Mirrors scp-ffi / scp-ffi-napi's
+# `outlet-capability-test-grant`; enabled ONLY by the outlet-stream live-poll
+# test, and the seam has ZERO FFI/SDK exports.
+outlet-capability-test-grant = ["scp-core/outlet-capability-test-grant"]
 
 [dependencies]
 uniffi = { version = "0.29", features = ["tokio", "cli"] }

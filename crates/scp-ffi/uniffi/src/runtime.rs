@@ -350,6 +350,16 @@ pub struct UniffiBridgeInstance {
     /// Dropping the `Arc` on shutdown zeroizes any retained bridge
     /// credential keys via the store's `Zeroizing` fields.
     pub(crate) credential_store: Arc<scp_core::bridge::credentials::InMemoryCredentialStore>,
+
+    /// Per-instance §5.4.5 streaming-outlet registry, keyed by the stream's
+    /// `request_id` hex (`StreamHandleId`). Mirrors the `PyO3` reference bridge's
+    /// `PyBridgeInstance::outlet_stream_registry` and the NAPI bridge's
+    /// `NapiBridgeInstance::outlet_stream_registry` — a per-instance field, NOT a
+    /// `static` (`check-no-bridge-globals.sh` / `check-handle-affinity.sh` forbid
+    /// the alternative). A stream opened on one instance is invisible to another;
+    /// instance shutdown drops every live stream (and its billing pump `Arc`) via
+    /// [`BridgeInstanceCore::bridge_specific_shutdown`].
+    pub(crate) outlet_stream_registry: Arc<DashMap<String, crate::outlet_stream::StreamEntry>>,
 }
 
 impl UniffiBridgeInstance {
@@ -383,6 +393,7 @@ impl UniffiBridgeInstance {
             credential_store: Arc::new(
                 scp_core::bridge::credentials::InMemoryCredentialStore::new(),
             ),
+            outlet_stream_registry: Arc::new(DashMap::new()),
         }
     }
 
@@ -415,6 +426,7 @@ impl UniffiBridgeInstance {
             credential_store: Arc::new(
                 scp_core::bridge::credentials::InMemoryCredentialStore::new(),
             ),
+            outlet_stream_registry: Arc::new(DashMap::new()),
         }
     }
 
@@ -557,6 +569,7 @@ impl UniffiBridgeInstance {
             credential_store: Arc::new(
                 scp_core::bridge::credentials::InMemoryCredentialStore::new(),
             ),
+            outlet_stream_registry: Arc::new(DashMap::new()),
         }
     }
 
@@ -1190,6 +1203,9 @@ impl BridgeInstanceCore for UniffiBridgeInstance {
         // shutdown-hook closure) in #1549 Phase 4 PR 2 commit 4.
         self.mcp_server_registry.clear();
         self.mcp_client_registry.clear();
+        // Drop every live streaming-outlet session (and its billing pump `Arc`)
+        // on shutdown, matching the PyO3 / NAPI bridges.
+        self.outlet_stream_registry.clear();
         // Clear identity-link-attestation and context-handle registries.
         // Migrated off module-level `OnceLock` statics in bridge.rs in
         // #1549 Phase 4 PR 2 commit 6. Dropping `Arc<ContextHandle>`
